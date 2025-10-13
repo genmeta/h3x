@@ -4,3 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-trait = "0.1"
+bytes = "1"
+bon = "3"
+either = "1"
+futures = "0.3"
+http = "1"
+nom = "8"
+pin-project-lite = "0.2"
+snafu = "0.8"
+tokio = "1"
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+
+
+gm-quic = { path = "../gm-quic/gm-quic" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "test-util", "io-util"] }
