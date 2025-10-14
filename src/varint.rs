@@ -7,11 +7,10 @@ use std::{
 };
 
 use bytes::BufMut;
-use futures::io::AsyncRead;
 use nom::{IResult, Parser, bits::streaming::take, combinator::flat_map, error::Error};
-use snafu::Snafu;
+use tokio::io::AsyncBufRead;
 
-use crate::codec::DecodeStreamError;
+use crate::codec::{DecodeError, DecodeStreamError};
 
 /// An integer less than 2^62
 ///
@@ -299,18 +298,12 @@ impl DecodingVarint {
     }
 }
 
-#[derive(Debug, Snafu)]
-pub enum DecodeVarIntError {
-    #[snafu(display("Incomplete varint, need {needed} more bytes",))]
-    Incomplete { needed: u8 },
-}
-
 impl DecodingVarint {
     pub fn poll_decode(
         &mut self,
-        reader: &mut (impl AsyncRead + Unpin),
+        reader: &mut (impl AsyncBufRead + Unpin),
         cx: &mut Context<'_>,
-    ) -> Poll<Result<VarInt, DecodeStreamError<DecodeVarIntError>>> {
+    ) -> Poll<Result<VarInt, DecodeStreamError>> {
         let required_bytes = if self.read == 0 {
             1
         } else {
@@ -325,15 +318,19 @@ impl DecodingVarint {
 
         if self.read != required_bytes {
             let needed = required_bytes - self.read;
-            let mut buf = &mut self.buf[self.read as usize..][..needed as usize];
-            match ready!(Pin::new(&mut *reader).poll_read(cx, &mut buf))
+            match ready!(Pin::new(&mut *reader).poll_fill_buf(cx))
                 .map_err(DecodeStreamError::from_io_error)?
             {
                 // no data read(EOF)
-                0 => {
-                    return Poll::Ready(Err(DecodeVarIntError::Incomplete { needed }.into()));
+                [] => {
+                    return Poll::Ready(Err(DecodeError::Incomplete.into()));
                 }
-                read => self.read += read as u8,
+                buf => {
+                    let read = buf.len().min(needed as usize);
+                    self.buf[self.read as usize..][..needed as usize].copy_from_slice(&buf[..read]);
+                    self.read += read as u8;
+                    Pin::new(&mut *reader).consume(read);
+                }
             }
             return self.poll_decode(reader, cx);
         }
@@ -356,9 +353,9 @@ impl VarintDecoder {
 
     pub fn poll_decode(
         &mut self,
-        reader: &mut (impl AsyncRead + Unpin),
+        reader: &mut (impl AsyncBufRead + Unpin),
         cx: &mut Context<'_>,
-    ) -> Poll<Result<VarInt, DecodeStreamError<DecodeVarIntError>>> {
+    ) -> Poll<Result<VarInt, DecodeStreamError>> {
         match self {
             VarintDecoder::Decoding(decoding) => {
                 let varint = ready!(decoding.poll_decode(reader, cx))?;

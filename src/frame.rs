@@ -6,13 +6,11 @@ use std::{
 
 use bytes::Bytes;
 use futures::{Stream, ready};
-use snafu::Snafu;
-use tokio::io;
 
 use crate::{
-    codec::{DecodeStreamError, StreamReader},
+    codec::{DecodeError, DecodeStreamError, StreamReader},
     error::StreamError,
-    varint::{DecodeVarIntError, VarInt, VarintDecoder},
+    varint::{VarInt, VarintDecoder},
 };
 
 pin_project_lite::pin_project! {
@@ -36,18 +34,6 @@ pin_project_lite::pin_project! {
     }
 }
 
-#[derive(Debug, Snafu)]
-pub enum DecodeFrameError {
-    #[snafu(transparent)]
-    VarInt { source: DecodeVarIntError },
-}
-
-impl From<DecodeFrameError> for io::Error {
-    fn from(error: DecodeFrameError) -> Self {
-        io::Error::other(error)
-    }
-}
-
 impl<S> FrameDecoder<S>
 where
     S: Stream<Item = Result<Bytes, StreamError>>,
@@ -64,15 +50,12 @@ where
     pub fn poll_type(
         self: Pin<&mut Self>,
         cx: &mut Context,
-    ) -> Poll<Result<VarInt, DecodeStreamError<DecodeFrameError>>> {
+    ) -> Poll<Result<VarInt, DecodeStreamError>> {
         let mut project = self.project();
-        project
-            .r#type
-            .poll_decode(&mut project.stream, cx)
-            .map_err(|error| error.map_err(DecodeFrameError::from))
+        project.r#type.poll_decode(&mut project.stream, cx)
     }
 
-    pub async fn r#type(&mut self) -> Result<VarInt, DecodeStreamError<DecodeFrameError>>
+    pub async fn r#type(&mut self) -> Result<VarInt, DecodeStreamError>
     where
         S: Unpin,
     {
@@ -82,16 +65,13 @@ where
     pub fn poll_length(
         mut self: Pin<&mut Self>,
         cx: &mut Context,
-    ) -> Poll<Result<VarInt, DecodeStreamError<DecodeFrameError>>> {
+    ) -> Poll<Result<VarInt, DecodeStreamError>> {
         ready!(self.as_mut().poll_type(cx)?);
         let mut project = self.project();
-        project
-            .length
-            .poll_decode(&mut project.stream, cx)
-            .map_err(|error| error.map_err(DecodeFrameError::from))
+        project.length.poll_decode(&mut project.stream, cx)
     }
 
-    pub async fn length(&mut self) -> Result<VarInt, DecodeStreamError<DecodeFrameError>>
+    pub async fn length(&mut self) -> Result<VarInt, DecodeStreamError>
     where
         S: Unpin,
     {
@@ -117,7 +97,7 @@ where
         Self::new(self.stream)
     }
 
-    pub fn complete(self) -> Result<(), DecodeFrameError> {
+    pub fn complete(self) -> Result<(), DecodeError> {
         self.check_frame_completely_decoded_and_read();
         Ok(())
     }
@@ -127,7 +107,7 @@ impl<S> Stream for FrameDecoder<S>
 where
     S: Stream<Item = Result<Bytes, StreamError>>,
 {
-    type Item = Result<Bytes, DecodeStreamError<DecodeFrameError>>;
+    type Item = Result<Bytes, DecodeStreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // When length is ready, type is also ready, its ok to collect data

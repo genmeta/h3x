@@ -8,23 +8,13 @@ use std::{
 
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{AsyncBufRead, AsyncRead};
-use snafu::Snafu;
 
-use crate::codec::DecodeStreamError;
+use crate::codec::{DecodeError, DecodeStreamError};
 
 pub struct DecodingInteger {
     n: u8,
     i: u64,
     m: u32,
-}
-
-#[derive(Debug, Snafu)]
-#[snafu(context(suffix(Integer)))]
-pub enum DecodeIntegerError {
-    #[snafu(display("Integer too large(overflow u64)"))]
-    Overflow,
-    #[snafu(display("Stream closed before integer was fully decoded"))]
-    Incomplete,
 }
 
 impl DecodingInteger {
@@ -57,7 +47,7 @@ impl DecodingInteger {
         &mut self,
         stream: &mut (impl AsyncRead + Unpin),
         cx: &mut Context<'_>,
-    ) -> Poll<Result<u64, DecodeStreamError<DecodeIntegerError>>> {
+    ) -> Poll<Result<u64, DecodeStreamError>> {
         debug_assert!(
             !(self.m == 0 && self.i < (1u64 << self.n) - 1),
             "No need to decode"
@@ -68,17 +58,17 @@ impl DecodingInteger {
             match ready!(Pin::new(&mut *stream).poll_read(cx, &mut buf))
                 .map_err(DecodeStreamError::from_io_error)?
             {
-                0 => return Poll::Ready(Err(DecodeIntegerError::Incomplete.into())),
+                0 => return Poll::Ready(Err(DecodeError::Incomplete.into())),
                 i => debug_assert!(i == 1),
             };
 
             let addend = (buf[0] as u64 & 127)
                 .checked_shl(self.m)
-                .ok_or(DecodeIntegerError::Overflow)?;
+                .ok_or(DecodeError::IntegerOverflow)?;
             self.i = self
                 .i
                 .checked_add(addend)
-                .ok_or(DecodeIntegerError::Overflow)?;
+                .ok_or(DecodeError::IntegerOverflow)?;
             self.m += 7;
 
             match (buf[0] & 128) == 0 {
@@ -110,7 +100,7 @@ impl IntegerDecoder {
         &mut self,
         stream: &mut (impl AsyncRead + Unpin),
         cx: &mut Context<'_>,
-    ) -> Poll<Result<u64, DecodeStreamError<DecodeIntegerError>>> {
+    ) -> Poll<Result<u64, DecodeStreamError>> {
         match &mut *self {
             Self::Decoded(i) => Poll::Ready(Ok(*i)),
             Self::Decoding(decoding) => {
@@ -120,13 +110,6 @@ impl IntegerDecoder {
             }
         }
     }
-}
-
-#[derive(Debug, Snafu)]
-#[snafu(context(suffix(String)))]
-pub enum DecodeStringError {
-    Incomplete,
-    Padding,
 }
 
 pub struct DecodingLiteral {
@@ -146,13 +129,13 @@ impl DecodingLiteral {
         &mut self,
         stream: &mut (impl AsyncBufRead + Unpin),
         cx: &mut Context,
-    ) -> Poll<Result<Bytes, DecodeStreamError<DecodeStringError>>> {
+    ) -> Poll<Result<Bytes, DecodeStreamError>> {
         while self.length > self.buf.len() as u64 {
             let remaining = (self.length - self.buf.len() as u64) as usize;
             let chunk = ready!(Pin::new(&mut *stream).poll_fill_buf(cx))
                 .map_err(DecodeStreamError::from_io_error)?;
             if chunk.is_empty() {
-                return Poll::Ready(Err(DecodeStringError::Incomplete.into()));
+                return Poll::Ready(Err(DecodeError::Incomplete.into()));
             }
             let read = chunk.len().min(remaining);
             self.buf.extend_from_slice(&chunk[..read]);
@@ -782,14 +765,14 @@ impl DecodingHuffman {
         &mut self,
         stream: &mut (impl AsyncBufRead + Unpin),
         cx: &mut Context,
-    ) -> Poll<Result<Bytes, DecodeStreamError<DecodeStringError>>> {
+    ) -> Poll<Result<Bytes, DecodeStreamError>> {
         loop {
             // more data can be decoded
             while self.read.end > self.read.start && self.decoding <= 24 {
                 let chunk = ready!(Pin::new(&mut *stream).poll_fill_buf(cx))
                     .map_err(DecodeStreamError::from_io_error)?;
                 match chunk {
-                    [] => return Poll::Ready(Err(DecodeStringError::Incomplete.into())),
+                    [] => return Poll::Ready(Err(DecodeError::Incomplete.into())),
                     chunk => {
                         // Avoid buffer overflow
                         let read = ((self.read.end - self.read.start) as usize)
@@ -818,20 +801,12 @@ impl DecodingHuffman {
             if self.read.start == self.read.end {
                 // no more data to read
                 if self.buffer.leading_ones() as u8 != self.decoding {
-                    return Poll::Ready(Err(DecodeStringError::Padding.into()));
+                    return Poll::Ready(Err(DecodeError::HuffmanPadding.into()));
                 }
                 return Poll::Ready(Ok(self.decoded.split().freeze()));
             }
         }
     }
-}
-
-#[derive(Debug, Snafu)]
-pub enum DecodeLengthStringError {
-    #[snafu(transparent)]
-    Integer { source: DecodeIntegerError },
-    #[snafu(transparent)]
-    String { source: DecodeStringError },
 }
 
 pub enum DecodingLengthString {
@@ -864,31 +839,25 @@ impl DecodingLengthString {
         &mut self,
         stream: &mut (impl AsyncBufRead + Unpin),
         cx: &mut Context,
-    ) -> Poll<Result<Bytes, DecodeStreamError<DecodeLengthStringError>>> {
+    ) -> Poll<Result<Bytes, DecodeStreamError>> {
         match self {
             DecodingLengthString::Literal { length, string } => {
                 if string.is_none() {
-                    let len = ready!(length.poll_decode(stream, cx))
-                        .map_err(|error| error.map_err(DecodeLengthStringError::from))?;
+                    let len = ready!(length.poll_decode(stream, cx))?;
                     *string = Some(DecodingLiteral::new(len));
                 }
                 match string {
-                    Some(string) => string
-                        .poll_decode(stream, cx)
-                        .map_err(|error| error.map_err(DecodeLengthStringError::from)),
+                    Some(string) => string.poll_decode(stream, cx),
                     None => unreachable!(),
                 }
             }
             DecodingLengthString::Huffman { length, string } => {
                 if string.is_none() {
-                    let len = ready!(length.poll_decode(stream, cx))
-                        .map_err(|error| error.map_err(DecodeLengthStringError::from))?;
+                    let len = ready!(length.poll_decode(stream, cx))?;
                     *string = Some(DecodingHuffman::new(len));
                 }
                 match string {
-                    Some(string) => string
-                        .poll_decode(stream, cx)
-                        .map_err(|error| error.map_err(DecodeLengthStringError::from)),
+                    Some(string) => string.poll_decode(stream, cx),
                     None => unreachable!(),
                 }
             }

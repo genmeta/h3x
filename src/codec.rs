@@ -1,10 +1,9 @@
 use std::{
-    error::Error,
     pin::Pin,
     task::{Context, Poll, ready},
 };
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use futures::Stream;
 use snafu::Snafu;
 use tokio::io::{self, ReadBuf};
@@ -20,9 +19,9 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl<S> StreamReader<S>
+impl<S, E> StreamReader<S>
 where
-    S: Stream<Item = Result<Bytes, StreamError>>,
+    S: Stream<Item = Result<Bytes, E>>,
 {
     pub const fn new(stream: S) -> Self {
         Self {
@@ -38,7 +37,7 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         cap: Option<usize>,
-    ) -> Poll<Option<Result<Bytes, StreamError>>> {
+    ) -> Poll<Option<Result<Bytes, E>>> {
         let mut project = self.as_mut().project();
         while project.chunk.is_empty() {
             *project.chunk = match ready!(project.stream.as_mut().poll_next(cx)?) {
@@ -62,7 +61,7 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         cap: Option<usize>,
-    ) -> Poll<Option<Result<Bytes, StreamError>>> {
+    ) -> Poll<Option<Result<Bytes, E>>> {
         let chunk = self.as_mut().poll_chunk(cx, cap);
         if let Poll::Ready(Some(Ok(chunk))) = &chunk {
             self.consume(chunk.len());
@@ -75,20 +74,21 @@ where
     }
 }
 
-impl<S> Stream for StreamReader<S>
+impl<S, E> Stream for StreamReader<S>
 where
-    S: Stream<Item = Result<Bytes, StreamError>>,
+    S: Stream<Item = Result<Bytes, E>>,
 {
-    type Item = Result<Bytes, StreamError>;
+    type Item = Result<Bytes, E>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_consume_chunk(cx, None)
     }
 }
 
-impl<S> tokio::io::AsyncRead for StreamReader<S>
+impl<S, E> tokio::io::AsyncRead for StreamReader<S>
 where
-    S: Stream<Item = Result<Bytes, StreamError>>,
+    S: Stream<Item = Result<Bytes, E>>,
+    io::Error: From<E>,
 {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -105,47 +105,10 @@ where
     }
 }
 
-impl<S> tokio::io::AsyncBufRead for StreamReader<S>
+impl<S, E> tokio::io::AsyncBufRead for StreamReader<S>
 where
-    S: Stream<Item = Result<Bytes, StreamError>>,
-{
-    fn poll_fill_buf(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
-        // Ensure we have some data in the chunk
-        if ready!(self.as_mut().poll_chunk(cx, None)?).is_none() {
-            return Poll::Ready(Ok(&[]));
-        }
-
-        // Note: slice to avoid auto-deref makes local borrow checker unhappy
-        Poll::Ready(Ok(&self.project().chunk[..]))
-    }
-
-    fn consume(self: Pin<&mut Self>, amt: usize) {
-        StreamReader::consume(self, amt);
-    }
-}
-
-impl<S> futures::io::AsyncRead for StreamReader<S>
-where
-    S: Stream<Item = Result<Bytes, StreamError>>,
-{
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        let mut chunk = match ready!(self.poll_consume_chunk(cx, Some(buf.len()))?) {
-            Some(chunk) => chunk,
-            None => return Poll::Ready(Ok(0)),
-        };
-        chunk.copy_to_slice(&mut buf[..chunk.len()]);
-        debug_assert!(chunk.is_empty(), "all data in chunk should be consumed");
-        Poll::Ready(Ok(chunk.len()))
-    }
-}
-
-impl<S> futures::io::AsyncBufRead for StreamReader<S>
-where
-    S: Stream<Item = Result<Bytes, StreamError>>,
+    S: Stream<Item = Result<Bytes, E>>,
+    io::Error: From<E>,
 {
     fn poll_fill_buf(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         // Ensure we have some data in the chunk
@@ -163,35 +126,36 @@ where
 }
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub), context(suffix(Decode)))]
+pub enum DecodeError {
+    #[snafu(display("Stream ended unexpectedly"))]
+    Incomplete,
+    #[snafu(display("Integer too large(overflow u64)"))]
+    IntegerOverflow,
+    #[snafu(display("Huffman padding error"))]
+    HuffmanPadding,
+}
+
+#[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
-pub enum DecodeStreamError<E: Error + 'static> {
+pub enum DecodeStreamError {
     #[snafu(display("Stream error"))]
     Stream { source: StreamError },
     #[snafu(transparent)]
-    Custom { source: E },
+    Decode { source: DecodeError },
 }
 
-impl<E: Error + 'static> DecodeStreamError<E> {
-    pub fn from_io_error(source: io::Error) -> Self
-    where
-        E: Send + Sync,
-    {
+impl DecodeStreamError {
+    pub fn from_io_error(source: io::Error) -> Self {
         match source.downcast::<StreamError>() {
             Ok(source) => DecodeStreamError::Stream { source },
-            Err(source) => match source.downcast::<E>() {
-                Ok(source) => DecodeStreamError::Custom { source },
-                Err(_source) => unreachable!("io::Error is not from StreamReader nor custom error"),
+            Err(source) => match source.downcast::<DecodeError>() {
+                Ok(source) => DecodeStreamError::Decode { source },
+                Err(source) => match source.downcast::<Self>() {
+                    Ok(source) => source,
+                    Err(_) => unreachable!("io::Error is not from StreamReader nor Decode Error"),
+                },
             },
-        }
-    }
-
-    pub fn map_err<E2>(self, f: impl FnOnce(E) -> E2) -> DecodeStreamError<E2>
-    where
-        E2: Error + 'static,
-    {
-        match self {
-            DecodeStreamError::Stream { source } => DecodeStreamError::Stream { source },
-            DecodeStreamError::Custom { source } => DecodeStreamError::Custom { source: f(source) },
         }
     }
 }
