@@ -2,15 +2,16 @@ use std::{
     cmp::Ordering,
     convert::TryFrom,
     fmt,
+    ops::Range,
     pin::Pin,
     task::{Context, Poll, ready},
 };
 
 use bytes::BufMut;
 use nom::{IResult, Parser, bits::streaming::take, combinator::flat_map, error::Error};
-use tokio::io::AsyncBufRead;
+use tokio::io::{AsyncBufRead, AsyncWrite};
 
-use crate::codec::{DecodeError, DecodeStreamError};
+use crate::codec::error::{DecodeError, DecodeStreamError, EncodeError, EncodeStreamError};
 
 /// An integer less than 2^62
 ///
@@ -318,9 +319,7 @@ impl DecodingVarint {
 
         if self.read != required_bytes {
             let needed = required_bytes - self.read;
-            match ready!(Pin::new(&mut *reader).poll_fill_buf(cx))
-                .map_err(DecodeStreamError::from_io_error)?
-            {
+            match ready!(Pin::new(&mut *reader).poll_fill_buf(cx))? {
                 // no data read(EOF)
                 [] => {
                     return Poll::Ready(Err(DecodeError::Incomplete.into()));
@@ -381,6 +380,49 @@ impl VarintDecoder {
 impl Default for VarintDecoder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub enum VarintEncoder {
+    Encoding { buf: [u8; 8], encoding: Range<u8> },
+    Encoded,
+}
+
+impl VarintEncoder {
+    pub fn new(varint: VarInt) -> Self {
+        let mut buf = [0u8; 8];
+        let mut buf_slice = &mut buf[..];
+        buf_slice.put_varint(&varint);
+        let n = 8 - buf_slice.len();
+        Self::Encoding {
+            buf,
+            encoding: 0..n as u8,
+        }
+    }
+
+    pub fn poll_encode(
+        &mut self,
+        stream: &mut (impl AsyncWrite + Unpin),
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), EncodeStreamError>> {
+        let VarintEncoder::Encoding { buf, encoding } = self else {
+            return Poll::Ready(Ok(()));
+        };
+
+        while encoding.start < encoding.end {
+            let buf = &buf[encoding.start as usize..encoding.end as usize];
+            match ready!(Pin::new(&mut *stream).poll_write(cx, buf)?) {
+                0 => return Poll::Ready(Err(EncodeError::WriteZero.into())),
+                n => encoding.start += n as u8,
+            }
+        }
+
+        *self = VarintEncoder::Encoded;
+        Poll::Ready(Ok(()))
+    }
+
+    pub fn is_encoded(&self) -> bool {
+        matches!(self, VarintEncoder::Encoded)
     }
 }
 

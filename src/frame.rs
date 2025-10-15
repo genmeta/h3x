@@ -8,7 +8,10 @@ use bytes::Bytes;
 use futures::{Stream, ready};
 
 use crate::{
-    codec::{DecodeError, DecodeStreamError, StreamReader},
+    codec::{
+        SinkWriter, StreamReader,
+        error::{DecodeError, DecodeStreamError},
+    },
     error::StreamError,
     varint::{VarInt, VarintDecoder},
 };
@@ -128,6 +131,26 @@ where
         }
 
         Poll::Ready(chunk.map(Ok))
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Asynchronous HTTP3 frame encoder.
+    ///
+    /// All frames have the following format:
+    ///
+    /// ``` plaintext
+    /// HTTP/3 Frame Format {
+    ///   Type (i),
+    ///   Length (i),
+    ///   Frame Payload (..),
+    /// }
+    /// ```
+    pub struct FrameEncoder<S> {
+        r#type: VarintDecoder,
+        length: VarintDecoder,
+        #[pin]
+        stream: SinkWriter<S>,
     }
 }
 
