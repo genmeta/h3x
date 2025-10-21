@@ -1,17 +1,9 @@
-use std::{
-    cmp::Ordering,
-    convert::TryFrom,
-    fmt,
-    ops::Range,
-    pin::Pin,
-    task::{Context, Poll, ready},
-};
+use std::{cmp::Ordering, convert::TryFrom, fmt};
 
-use bytes::BufMut;
 use nom::{IResult, Parser, bits::streaming::take, combinator::flat_map, error::Error};
-use tokio::io::{AsyncBufRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::codec::error::{DecodeError, DecodeStreamError, EncodeError, EncodeStreamError};
+use crate::codec::error::{DecodeStreamError, EncodeStreamError};
 
 /// An integer less than 2^62
 ///
@@ -213,290 +205,37 @@ pub fn be_varint(input: &[u8]) -> IResult<&[u8], VarInt> {
     .map(|((buf, _), value)| (buf, VarInt(value)))
 }
 
-/// A [`bytes::BufMut`] extension trait, makes buffer more friendly to write VarInt.
-pub trait WriteVarInt: BufMut {
-    /// Write a variable-length integer.
-    ///
-    /// `put_varint` will write the smallest number of bytes needed to represent the value.
-    /// `encode_varint` will write the specified number of bytes, and panic if the specified number of bytes
-    /// is less than the smallest number of bytes needed to repressent the value.
-    ///
-    /// # Example
-    /// ```rust
-    /// use bytes::BufMut;
-    /// use qbase::varint::{EncodeBytes, VarInt, WriteVarInt};
-    ///
-    /// let val = VarInt::from_u32(1);
-    /// let mut encode_buf = [0u8; 8];
-    ///
-    /// let mut buf = &mut encode_buf[..];
-    /// buf.put_varint(&val);
-    /// assert_eq!(buf.len(), 7);
-    /// assert_eq!(encode_buf[0..1], [0x01]);
-    ///
-    /// let mut buf = &mut encode_buf[..];
-    /// buf.encode_varint(&val, EncodeBytes::Two);
-    /// assert_eq!(buf.len(), 6);
-    /// assert_eq!(encode_buf[0..2], [0x40, 0x01]);
-    /// ```
-    fn put_varint(&mut self, value: &VarInt);
-
-    /// Write a variable-length integer with specified number of bytes.
-    fn encode_varint(&mut self, value: &VarInt, nbytes: EncodeBytes);
+pub async fn decode_varint(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> Result<VarInt, DecodeStreamError> {
+    let first_byte = stream.read_u8().await?;
+    let len = match first_byte >> 6 {
+        0b00 => 1,
+        0b01 => 2,
+        0b10 => 4,
+        0b11 => 8,
+        _ => unreachable!(),
+    };
+    let mut buf = [first_byte, 0, 0, 0, 0, 0, 0, 0];
+    stream.read_exact(&mut buf[1..len]).await?;
+    Ok(be_varint(&buf[..len]).unwrap().1)
 }
 
-// 所有的BufMut都可以调用put_varint来写入VarInt了
-impl<T: BufMut> WriteVarInt for T {
-    fn put_varint(&mut self, value: &VarInt) {
-        let x = value.0;
-        if x < 1u64 << 6 {
-            self.put_u8(x as u8);
-        } else if x < 1u64 << 14 {
-            self.put_u16((0b01 << 14) | x as u16);
-        } else if x < 1u64 << 30 {
-            self.put_u32((0b10 << 30) | x as u32);
-        } else if x < 1u64 << 62 {
-            self.put_u64((0b11 << 62) | x);
-        } else {
-            unreachable!("malformed VarInt")
-        }
-    }
-
-    fn encode_varint(&mut self, value: &VarInt, nbytes: EncodeBytes) {
-        match nbytes {
-            EncodeBytes::One => {
-                assert!(value.0 < 1u64 << 6);
-                self.put_u8(value.0 as u8);
-            }
-            EncodeBytes::Two => {
-                assert!(value.0 < 1u64 << 14);
-                self.put_u16((0b01 << 14) | value.0 as u16);
-            }
-            EncodeBytes::Four => {
-                assert!(value.0 < 1u64 << 30);
-                self.put_u32((0b10 << 30) | value.0 as u32);
-            }
-            EncodeBytes::Eight => {
-                assert!(value.0 < 1u64 << 62);
-                self.put_u64((0b11 << 62) | value.0);
-            }
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct DecodingVarint {
-    buf: [u8; 8],
-    read: u8,
-}
-
-impl DecodingVarint {
-    pub const fn new() -> Self {
-        Self {
-            buf: [0u8; 8],
-            read: 0,
-        }
-    }
-}
-
-impl DecodingVarint {
-    pub fn poll_decode(
-        &mut self,
-        reader: &mut (impl AsyncBufRead + Unpin),
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<VarInt, DecodeStreamError>> {
-        let required_bytes = if self.read == 0 {
-            1
-        } else {
-            match self.buf[0] >> 6 {
-                0b00 => 1,
-                0b01 => 2,
-                0b10 => 4,
-                0b11 => 8,
-                _ => unreachable!(),
-            }
-        };
-
-        if self.read != required_bytes {
-            let needed = required_bytes - self.read;
-            match ready!(Pin::new(&mut *reader).poll_fill_buf(cx))? {
-                // no data read(EOF)
-                [] => {
-                    return Poll::Ready(Err(DecodeError::Incomplete.into()));
-                }
-                buf => {
-                    let read = buf.len().min(needed as usize);
-                    self.buf[self.read as usize..][..needed as usize].copy_from_slice(&buf[..read]);
-                    self.read += read as u8;
-                    Pin::new(&mut *reader).consume(read);
-                }
-            }
-            return self.poll_decode(reader, cx);
-        }
-
-        debug_assert!(self.read == required_bytes);
-        let (_, varint) = be_varint(&self.buf[..self.read as usize]).unwrap();
-        Poll::Ready(Ok(varint))
-    }
-}
-
-pub enum VarintDecoder {
-    Decoding(DecodingVarint),
-    Decoded(VarInt),
-}
-
-impl VarintDecoder {
-    pub const fn new() -> Self {
-        Self::Decoding(DecodingVarint::new())
-    }
-
-    pub fn poll_decode(
-        &mut self,
-        reader: &mut (impl AsyncBufRead + Unpin),
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<VarInt, DecodeStreamError>> {
-        match self {
-            VarintDecoder::Decoding(decoding) => {
-                let varint = ready!(decoding.poll_decode(reader, cx))?;
-                *self = VarintDecoder::Decoded(varint);
-                Poll::Ready(Ok(varint))
-            }
-            VarintDecoder::Decoded(varint) => Poll::Ready(Ok(*varint)),
-        }
-    }
-
-    pub fn is_decoded(&self) -> bool {
-        matches!(self, VarintDecoder::Decoded(_))
-    }
-
-    pub fn decoded(&self) -> Option<VarInt> {
-        match self {
-            VarintDecoder::Decoded(varint) => Some(*varint),
-            VarintDecoder::Decoding(_) => None,
-        }
-    }
-}
-
-impl Default for VarintDecoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub enum VarintEncoder {
-    Encoding { buf: [u8; 8], encoding: Range<u8> },
-    Encoded,
-}
-
-impl VarintEncoder {
-    pub fn new(varint: VarInt) -> Self {
-        let mut buf = [0u8; 8];
-        let mut buf_slice = &mut buf[..];
-        buf_slice.put_varint(&varint);
-        let n = 8 - buf_slice.len();
-        Self::Encoding {
-            buf,
-            encoding: 0..n as u8,
-        }
-    }
-
-    pub fn poll_encode(
-        &mut self,
-        stream: &mut (impl AsyncWrite + Unpin),
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), EncodeStreamError>> {
-        let VarintEncoder::Encoding { buf, encoding } = self else {
-            return Poll::Ready(Ok(()));
-        };
-
-        while encoding.start < encoding.end {
-            let buf = &buf[encoding.start as usize..encoding.end as usize];
-            match ready!(Pin::new(&mut *stream).poll_write(cx, buf)?) {
-                0 => return Poll::Ready(Err(EncodeError::WriteZero.into())),
-                n => encoding.start += n as u8,
-            }
-        }
-
-        *self = VarintEncoder::Encoded;
-        Poll::Ready(Ok(()))
-    }
-
-    pub fn is_encoded(&self) -> bool {
-        matches!(self, VarintEncoder::Encoded)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{EncodeBytes, VarInt, WriteVarInt};
-
-    #[test]
-    fn test_be_varint() {
-        {
-            let buf = &[0b00000001u8, 0x01][..];
-            let r = super::be_varint(buf);
-            assert_eq!(r, Ok((&[0x01][..], VarInt(1))));
-        }
-        {
-            let buf = &[0b01000000u8, 0x06u8][..];
-            let r = super::be_varint(buf);
-            assert_eq!(r, Ok((&[][..], VarInt(6))));
-        }
-        {
-            let buf = &[0b10000000u8, 1, 1, 1][..];
-            let r = super::be_varint(buf);
-            assert_eq!(r, Ok((&[][..], VarInt(0x010101))));
-        }
-        {
-            let buf = &[0b11000000u8, 1, 1, 1, 1, 1, 1, 1][..];
-            let r = super::be_varint(buf);
-            assert_eq!(r, Ok((&[][..], VarInt(0x01010101010101))));
-        }
-        {
-            let buf = &[0b11000000u8, 0x06u8][..];
-            let r = super::be_varint(buf);
-            assert_eq!(r, Err(nom::Err::Incomplete(nom::Needed::new(6))));
-        }
-    }
-
-    fn assert_put_varint_eq(val: u64, expected: &[u8]) {
-        let val = VarInt::from_u64(val).unwrap();
-        let mut buf = vec![];
-        buf.put_varint(&val);
-        assert_eq!(buf, expected);
-    }
-
-    #[test]
-    fn test_put_varint() {
-        assert_put_varint_eq(0x0000_0000_0000_0000, &[0]);
-        assert_put_varint_eq(0x0000_0000_0000_003F, &[0x3F]);
-        assert_put_varint_eq(0x0000_0000_0000_0040, &[0x40, 0x40]);
-        assert_put_varint_eq(0x0000_0000_0000_3FFF, &[0x7F, 0xFF]);
-        assert_put_varint_eq(0x0000_0000_0000_4000, &[0x80, 0x00, 0x40, 0x00]);
-        assert_put_varint_eq(0x0000_0000_3FFF_FFFF, &[0xBF, 0xFF, 0xFF, 0xFF]);
-        assert_put_varint_eq(
-            0x0000_0000_4000_0000,
-            &[0xC0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00],
-        );
-        assert_put_varint_eq(
-            0x3FFF_FFFF_FFFF_FFFF,
-            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
-        );
-    }
-
-    #[test]
-    fn test_encode_varint() {
-        let val = VarInt::from_u32(1);
-        let mut encode_buf = [0u8; 8];
-
-        let mut buf = &mut encode_buf[..];
-        buf.put_varint(&val);
-        assert_eq!(buf.len(), 7);
-        assert_eq!(encode_buf[0..1], [0x01]);
-
-        let mut buf = &mut encode_buf[..];
-        buf.encode_varint(&val, EncodeBytes::Two);
-        assert_eq!(buf.len(), 6);
-        assert_eq!(encode_buf[0..2], [0x40, 0x01]);
-    }
+pub async fn encode_varint(
+    stream: &mut (impl AsyncWrite + Unpin),
+    varint: VarInt,
+) -> Result<(), EncodeStreamError> {
+    let x = varint.0;
+    if x < 1u64 << 6 {
+        stream.write_u8(x as u8).await?;
+    } else if x < 1u64 << 14 {
+        stream.write_u16((0b01 << 14) | x as u16).await?;
+    } else if x < 1u64 << 30 {
+        stream.write_u32((0b10 << 30) | x as u32).await?;
+    } else if x < 1u64 << 62 {
+        stream.write_u64((0b11 << 62) | x).await?;
+    } else {
+        unreachable!("malformed VarInt")
+    };
+    Ok(())
 }

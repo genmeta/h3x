@@ -30,7 +30,7 @@ where
     /// Poll a chunk of data from the stream without consuming it.
     ///
     /// If `cap` is `Some`, it will return at most `cap` bytes.
-    pub fn poll_chunk(
+    pub fn poll_peek_bytes(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         cap: Option<usize>,
@@ -51,15 +51,31 @@ where
         Poll::Ready(Some(Ok(project.chunk.slice(..at))))
     }
 
+    pub fn poll_peek_chunk(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        cap: Option<usize>,
+    ) -> Poll<Result<&[u8], E>> {
+        // Ensure we have some data in the chunk
+        if ready!(self.as_mut().poll_peek_bytes(cx, None)?).is_none() {
+            return Poll::Ready(Ok(&[]));
+        }
+
+        // Note: slice to avoid auto-deref makes local borrow checker unhappy
+        let chunk = &self.project().chunk[..];
+        let chunk = &chunk[..chunk.len().min(cap.unwrap_or(usize::MAX))];
+        Poll::Ready(Ok(chunk))
+    }
+
     /// Poll a chunk of data from the stream and consume it.
     ///
     /// If `cap` is `Some`, it will return at most `cap` bytes.
-    pub fn poll_consume_chunk(
+    pub fn poll_consume_bytes(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         cap: Option<usize>,
     ) -> Poll<Option<Result<Bytes, E>>> {
-        let chunk = self.as_mut().poll_chunk(cx, cap);
+        let chunk = self.as_mut().poll_peek_bytes(cx, cap);
         if let Poll::Ready(Some(Ok(chunk))) = &chunk {
             self.consume(chunk.len());
         }
@@ -78,7 +94,7 @@ where
     type Item = Result<Bytes, E>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.poll_consume_chunk(cx, None)
+        self.poll_consume_bytes(cx, None)
     }
 }
 
@@ -92,7 +108,7 @@ where
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let chunk = match ready!(self.poll_consume_chunk(cx, Some(buf.remaining()))?) {
+        let chunk = match ready!(self.poll_consume_bytes(cx, Some(buf.remaining()))?) {
             Some(chunk) => chunk,
             None => return Poll::Ready(Ok(())),
         };
@@ -107,14 +123,8 @@ where
     S: Stream<Item = Result<Bytes, E>>,
     io::Error: From<E>,
 {
-    fn poll_fill_buf(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
-        // Ensure we have some data in the chunk
-        if ready!(self.as_mut().poll_chunk(cx, None)?).is_none() {
-            return Poll::Ready(Ok(&[]));
-        }
-
-        // Note: slice to avoid auto-deref makes local borrow checker unhappy
-        Poll::Ready(Ok(&self.project().chunk[..]))
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        self.poll_peek_chunk(cx, None).map_err(io::Error::from)
     }
 
     fn consume(self: Pin<&mut Self>, amt: usize) {

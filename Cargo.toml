@@ -12,6 +12,7 @@ futures = "0.3"
 http = "1"
 httlib-huffman = { path = "../httlib-rs/huffman" }
 nom = "8"
+nom-bufreader = "0.2"
 ouroboros = "0.18"
 pin-project-lite = "0.2"
 snafu = "0.8"

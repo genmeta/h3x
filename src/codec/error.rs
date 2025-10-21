@@ -17,6 +17,17 @@ pub enum DecodeError {
     InvalidValue,
 }
 
+impl From<DecodeError> for io::Error {
+    fn from(error: DecodeError) -> Self {
+        let kind = match error {
+            DecodeError::Incomplete => io::ErrorKind::UnexpectedEof,
+            DecodeError::IntegerOverflow => io::ErrorKind::InvalidData,
+            DecodeError::InvalidValue => io::ErrorKind::InvalidData,
+        };
+        io::Error::new(kind, error)
+    }
+}
+
 impl From<httlib_huffman::DecoderError> for DecodeError {
     fn from(error: httlib_huffman::DecoderError) -> Self {
         match error {
@@ -28,10 +39,19 @@ impl From<httlib_huffman::DecoderError> for DecodeError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum DecodeStreamError {
-    #[snafu(context(name(DecodeStream)), display("Stream error"))]
+    #[snafu(transparent)]
     Stream { source: StreamError },
     #[snafu(transparent)]
     Decode { source: DecodeError },
+}
+
+impl From<DecodeStreamError> for io::Error {
+    fn from(value: DecodeStreamError) -> Self {
+        match value {
+            DecodeStreamError::Stream { source } => io::Error::from(source),
+            DecodeStreamError::Decode { source } => io::Error::from(source),
+        }
+    }
 }
 
 impl From<io::Error> for DecodeStreamError {
@@ -44,9 +64,16 @@ impl From<io::Error> for DecodeStreamError {
             Ok(error) => return DecodeStreamError::Decode { source: error },
             Err(source) => source,
         };
-        match source.downcast::<DecodeStreamError>() {
-            Ok(error) => error,
-            Err(_) => unreachable!("io::Error is not from StreamReader, Encoder nor Decoder"),
+        let source = match source.downcast::<DecodeStreamError>() {
+            Ok(error) => return error,
+            Err(source) => source,
+        };
+        if source.kind() == io::ErrorKind::UnexpectedEof {
+            DecodeStreamError::Decode {
+                source: DecodeError::Incomplete,
+            }
+        } else {
+            unreachable!("io::Error is not from StreamReader nor Decoder")
         }
     }
 }
@@ -71,7 +98,7 @@ impl From<httlib_huffman::EncoderError> for EncodeError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum EncodeStreamError {
-    #[snafu(context(name(EncodeStream)), display("Stream error"))]
+    #[snafu(transparent)]
     Stream { source: StreamError },
     #[snafu(transparent)]
     Encode { source: EncodeError },

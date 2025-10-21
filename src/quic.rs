@@ -21,10 +21,10 @@ pub trait QuicConnection {
     async fn accept_uni(&mut self) -> Result<Self::StreamReader, ConnectionError>;
 }
 
-pub trait WriteStream: Sink<Bytes, Error = StreamError> {
+pub trait WriteStream: Sink<Bytes, Error = StreamError> + Unpin {
     fn reset(&mut self, code: u64);
 }
 
-pub trait ReadStream: Stream<Item = Result<Bytes, StreamError>> {
+pub trait ReadStream: Stream<Item = Result<Bytes, StreamError>> + Unpin {
     fn stop_sending(&mut self, code: u64);
 }

@@ -1,5 +1,4 @@
 pub mod error;
-pub(crate) mod util;
 
 mod reader;
 mod writer;
