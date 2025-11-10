@@ -17,10 +17,11 @@ use crate::codec::error::{DecodeStreamError, EncodeStreamError};
 ///       return I
 /// ```
 pub async fn decode_integer(
-    stream: &mut (impl AsyncRead + Unpin),
+    stream: impl AsyncRead,
     prefix: u8,
     n: u8,
 ) -> Result<u64, DecodeStreamError> {
+    tokio::pin!(stream);
     let mut i = prefix as u64 & ((1 << n) - 1);
     if i < (1 << n) - 1 {
         Ok(i)
@@ -52,11 +53,12 @@ pub async fn decode_integer(
 ///     encode I on 8 bits
 /// ```
 pub async fn encode_integer(
-    stream: &mut (impl AsyncWrite + Unpin),
+    stream: impl AsyncWrite,
     prefix: u8,
     n: u8,
     mut i: u64,
 ) -> Result<(), EncodeStreamError> {
+    tokio::pin!(stream);
     let limit = (1 << n) - 1;
     if i < limit as u64 {
         stream.write_u8(prefix | i as u8).await?;

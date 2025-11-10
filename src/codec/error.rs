@@ -1,8 +1,8 @@
-use std::io;
+use std::{convert::Infallible, error::Error, io};
 
 use snafu::Snafu;
 
-use crate::error::StreamError;
+use crate::error::{Code, ErrorWithCode, HasErrorCode, StreamError};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(DecodeSanfu)))]
@@ -14,7 +14,10 @@ pub enum DecodeError {
     // #[snafu(display("Huffman padding error"))]
     // HuffmanPadding,
     #[snafu(display("Invalid Huffman code"))]
-    InvalidValue,
+    InvalidHuffmanCode,
+    /// e.g: eval Base (https://datatracker.ietf.org/doc/html/rfc9204#section-4.5.1.2)
+    #[snafu(display("Arithmetic overflow while decoding"))]
+    ArithmeticOverflow,
 }
 
 impl From<DecodeError> for io::Error {
@@ -22,7 +25,9 @@ impl From<DecodeError> for io::Error {
         let kind = match error {
             DecodeError::Incomplete => io::ErrorKind::UnexpectedEof,
             DecodeError::IntegerOverflow => io::ErrorKind::InvalidData,
-            DecodeError::InvalidValue => io::ErrorKind::InvalidData,
+            DecodeError::InvalidHuffmanCode | DecodeError::ArithmeticOverflow => {
+                io::ErrorKind::InvalidData
+            }
         };
         io::Error::new(kind, error)
     }
@@ -31,7 +36,7 @@ impl From<DecodeError> for io::Error {
 impl From<httlib_huffman::DecoderError> for DecodeError {
     fn from(error: httlib_huffman::DecoderError) -> Self {
         match error {
-            httlib_huffman::DecoderError::InvalidInput => DecodeError::InvalidValue,
+            httlib_huffman::DecoderError::InvalidInput => DecodeError::InvalidHuffmanCode,
         }
     }
 }
@@ -43,6 +48,16 @@ pub enum DecodeStreamError {
     Stream { source: StreamError },
     #[snafu(transparent)]
     Decode { source: DecodeError },
+    #[snafu(transparent)]
+    Code { source: ErrorWithCode },
+}
+
+impl<E: HasErrorCode + Error + Send + Sync + 'static> From<E> for DecodeStreamError {
+    fn from(value: E) -> Self {
+        DecodeStreamError::Code {
+            source: value.into(),
+        }
+    }
 }
 
 impl From<DecodeStreamError> for io::Error {
@@ -50,6 +65,7 @@ impl From<DecodeStreamError> for io::Error {
         match value {
             DecodeStreamError::Stream { source } => io::Error::from(source),
             DecodeStreamError::Decode { source } => io::Error::from(source),
+            DecodeStreamError::Code { source } => io::Error::from(source),
         }
     }
 }
@@ -64,6 +80,20 @@ impl From<io::Error> for DecodeStreamError {
             Ok(error) => return DecodeStreamError::Decode { source: error },
             Err(source) => source,
         };
+        let source = match source.downcast::<Code>() {
+            Ok(error) => {
+                return DecodeStreamError::Code {
+                    source: error.into(),
+                };
+            }
+            Err(source) => source,
+        };
+        let source = match source.downcast::<ErrorWithCode>() {
+            Ok(error) => {
+                return DecodeStreamError::Code { source: error };
+            }
+            Err(source) => source,
+        };
         let source = match source.downcast::<DecodeStreamError>() {
             Ok(error) => return error,
             Err(source) => source,
@@ -73,7 +103,7 @@ impl From<io::Error> for DecodeStreamError {
                 source: DecodeError::Incomplete,
             }
         } else {
-            unreachable!("io::Error is not from StreamReader nor Decoder")
+            panic!("io::Error is not from StreamReader nor Decoder")
         }
     }
 }
@@ -85,6 +115,19 @@ pub enum EncodeError {
     WriteZero,
     #[snafu(display("Invalid input"))]
     InvalidInput,
+    #[snafu(display("Frame payload too large"))]
+    FramePayloadTooLarge,
+}
+
+impl From<EncodeError> for io::Error {
+    fn from(error: EncodeError) -> Self {
+        let kind = match error {
+            EncodeError::WriteZero => io::ErrorKind::WriteZero,
+            EncodeError::InvalidInput => io::ErrorKind::InvalidInput,
+            EncodeError::FramePayloadTooLarge => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, error)
+    }
 }
 
 impl From<httlib_huffman::EncoderError> for EncodeError {
@@ -102,6 +145,32 @@ pub enum EncodeStreamError {
     Stream { source: StreamError },
     #[snafu(transparent)]
     Encode { source: EncodeError },
+    #[snafu(transparent)]
+    Code { source: ErrorWithCode },
+}
+
+impl From<EncodeStreamError> for io::Error {
+    fn from(value: EncodeStreamError) -> Self {
+        match value {
+            EncodeStreamError::Stream { source } => source.into(),
+            EncodeStreamError::Encode { source } => source.into(),
+            EncodeStreamError::Code { source } => source.into(),
+        }
+    }
+}
+
+impl From<Infallible> for EncodeStreamError {
+    fn from(value: Infallible) -> Self {
+        match value {}
+    }
+}
+
+impl From<Code> for EncodeStreamError {
+    fn from(value: Code) -> Self {
+        EncodeStreamError::Code {
+            source: value.into(),
+        }
+    }
 }
 
 impl From<io::Error> for EncodeStreamError {
@@ -114,9 +183,23 @@ impl From<io::Error> for EncodeStreamError {
             Ok(error) => return EncodeStreamError::Encode { source: error },
             Err(source) => source,
         };
+        let source = match source.downcast::<Code>() {
+            Ok(error) => {
+                return EncodeStreamError::Code {
+                    source: error.into(),
+                };
+            }
+            Err(source) => source,
+        };
+        let source = match source.downcast::<ErrorWithCode>() {
+            Ok(error) => {
+                return EncodeStreamError::Code { source: error };
+            }
+            Err(source) => source,
+        };
         match source.downcast::<EncodeStreamError>() {
             Ok(error) => error,
-            Err(_) => unreachable!("io::Error is not from StreamReader, Encoder nor Decoder"),
+            Err(_) => panic!("io::Error is not from StreamReader, Encoder nor Decoder"),
         }
     }
 }

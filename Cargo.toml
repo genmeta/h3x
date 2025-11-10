@@ -10,7 +10,9 @@ bon = "3"
 either = "1"
 futures = "0.3"
 http = "1"
-httlib-huffman = { path = "../httlib-rs/huffman" }
+http-body = "1"
+# httlib-huffman = { path = "../httlib-rs/huffman" }
+httlib-huffman = "0.3"
 nom = "8"
 nom-bufreader = "0.2"
 ouroboros = "0.18"

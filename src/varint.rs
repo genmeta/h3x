@@ -182,15 +182,6 @@ pub mod err {
 
 /// Parse a variable-length integer from the input buffer,
 /// [nom](https://docs.rs/nom/latest/nom/) parser style.
-///
-/// ## Example
-/// ```
-/// use qbase::varint::be_varint;
-///
-/// let input = &[0b01000000, 0x01][..];
-/// let result = be_varint(input);
-/// assert_eq!(result, Ok((&[][..], 1u32.into())));
-/// ```
 pub fn be_varint(input: &[u8]) -> IResult<&[u8], VarInt> {
     flat_map(take(2usize), |prefix: u8| {
         take::<&[u8], u64, usize, Error<(&[u8], usize)>>((8 << prefix) - 2)
@@ -205,9 +196,8 @@ pub fn be_varint(input: &[u8]) -> IResult<&[u8], VarInt> {
     .map(|((buf, _), value)| (buf, VarInt(value)))
 }
 
-pub async fn decode_varint(
-    stream: &mut (impl AsyncRead + Unpin),
-) -> Result<VarInt, DecodeStreamError> {
+pub async fn decode_varint(stream: impl AsyncRead) -> Result<VarInt, DecodeStreamError> {
+    tokio::pin!(stream);
     let first_byte = stream.read_u8().await?;
     let len = match first_byte >> 6 {
         0b00 => 1,
@@ -222,9 +212,10 @@ pub async fn decode_varint(
 }
 
 pub async fn encode_varint(
-    stream: &mut (impl AsyncWrite + Unpin),
+    stream: impl AsyncWrite,
     varint: VarInt,
 ) -> Result<(), EncodeStreamError> {
+    tokio::pin!(stream);
     let x = varint.0;
     if x < 1u64 << 6 {
         stream.write_u8(x as u8).await?;
