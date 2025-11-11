@@ -7,12 +7,8 @@ use std::{
 
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt, stream};
-use http::{HeaderMap, HeaderName, HeaderValue, header};
-use snafu::{Snafu, ensure, whatever};
-use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt},
-    sync::Mutex as AsyncMutex,
-};
+use snafu::Snafu;
+use tokio::{io::AsyncBufRead, sync::Mutex as AsyncMutex};
 
 use crate::{
     codec::{
@@ -108,7 +104,7 @@ impl DecoderState {
         &mut self,
         new_capacity: u64,
     ) -> Result<(), QPackEncoderStreamError> {
-        if new_capacity > self.settings.max_table_capacity() {
+        if new_capacity > self.settings.qpack_max_table_capacity().into_inner() {
             return Err(QPackEncoderStreamError::SetDynamicTableCapacityExceeded);
         }
         self.dynamic_table.capacity = new_capacity;

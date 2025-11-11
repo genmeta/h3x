@@ -51,9 +51,16 @@ mod tests {
         let (decoder_stream_tx, decoder_stream_rx) = channel();
         let (response_stream, request_stream) = mock_stream_pair(0);
 
-        let settings = Settings::default();
-        let encoder = Arc::new(Encoder::new(settings, encoder_stream_tx, decoder_stream_rx));
-        let decoder = Arc::new(Decoder::new(settings, decoder_stream_tx, encoder_stream_rx));
+        let encoder = Arc::new(Encoder::new(
+            Settings::default(),
+            encoder_stream_tx,
+            decoder_stream_rx,
+        ));
+        let decoder = Arc::new(Decoder::new(
+            Settings::default(),
+            decoder_stream_tx,
+            encoder_stream_rx,
+        ));
 
         let request = Request::builder()
             .method("POST")

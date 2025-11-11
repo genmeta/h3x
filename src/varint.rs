@@ -1,9 +1,11 @@
 use std::{cmp::Ordering, convert::TryFrom, fmt};
 
-use nom::{IResult, Parser, bits::streaming::take, combinator::flat_map, error::Error};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::codec::error::{DecodeStreamError, EncodeStreamError};
+use crate::codec::{
+    error::{DecodeStreamError, EncodeStreamError},
+    util::{DecodeFrom, EncodeInto},
+};
 
 /// An integer less than 2^62
 ///
@@ -142,12 +144,6 @@ impl TryFrom<usize> for VarInt {
     }
 }
 
-impl nom::ToUsize for VarInt {
-    fn to_usize(&self) -> usize {
-        self.0 as usize
-    }
-}
-
 impl PartialEq<u64> for VarInt {
     fn eq(&self, other: &u64) -> bool {
         self.0.eq(other)
@@ -180,53 +176,33 @@ pub mod err {
     }
 }
 
-/// Parse a variable-length integer from the input buffer,
-/// [nom](https://docs.rs/nom/latest/nom/) parser style.
-pub fn be_varint(input: &[u8]) -> IResult<&[u8], VarInt> {
-    flat_map(take(2usize), |prefix: u8| {
-        take::<&[u8], u64, usize, Error<(&[u8], usize)>>((8 << prefix) - 2)
-    })
-    .parse((input, 0))
-    .map_err(|err| match err {
-        nom::Err::Incomplete(needed) => {
-            nom::Err::Incomplete(needed.map(|n| n.get().div_ceil(8) - input.len()))
-        }
-        _ => unreachable!(),
-    })
-    .map(|((buf, _), value)| (buf, VarInt(value)))
+impl<S: AsyncBufRead> DecodeFrom<S> for VarInt {
+    async fn decode_from(stream: S) -> Result<Self, DecodeStreamError> {
+        tokio::pin!(stream);
+        let first_byte = stream.read_u8().await?;
+        let len = 2usize.pow(first_byte as u32 >> 6);
+        let mut buf = [first_byte & 0b0011_1111, 0, 0, 0, 0, 0, 0, 0];
+        stream.read_exact(&mut buf[1..len]).await?;
+        let value = u64::from_be_bytes(buf) >> (8 * (8 - len));
+        Ok(VarInt(value))
+    }
 }
 
-pub async fn decode_varint(stream: impl AsyncRead) -> Result<VarInt, DecodeStreamError> {
-    tokio::pin!(stream);
-    let first_byte = stream.read_u8().await?;
-    let len = match first_byte >> 6 {
-        0b00 => 1,
-        0b01 => 2,
-        0b10 => 4,
-        0b11 => 8,
-        _ => unreachable!(),
-    };
-    let mut buf = [first_byte, 0, 0, 0, 0, 0, 0, 0];
-    stream.read_exact(&mut buf[1..len]).await?;
-    Ok(be_varint(&buf[..len]).unwrap().1)
-}
-
-pub async fn encode_varint(
-    stream: impl AsyncWrite,
-    varint: VarInt,
-) -> Result<(), EncodeStreamError> {
-    tokio::pin!(stream);
-    let x = varint.0;
-    if x < 1u64 << 6 {
-        stream.write_u8(x as u8).await?;
-    } else if x < 1u64 << 14 {
-        stream.write_u16((0b01 << 14) | x as u16).await?;
-    } else if x < 1u64 << 30 {
-        stream.write_u32((0b10 << 30) | x as u32).await?;
-    } else if x < 1u64 << 62 {
-        stream.write_u64((0b11 << 62) | x).await?;
-    } else {
-        unreachable!("malformed VarInt")
-    };
-    Ok(())
+impl<S: AsyncWrite> EncodeInto<S> for VarInt {
+    async fn encode_into(self, stream: S) -> Result<(), EncodeStreamError> {
+        let VarInt(x) = self;
+        tokio::pin!(stream);
+        if x < 1u64 << 6 {
+            stream.write_u8(x as u8).await?;
+        } else if x < 1u64 << 14 {
+            stream.write_u16((0b01 << 14) | x as u16).await?;
+        } else if x < 1u64 << 30 {
+            stream.write_u32((0b10 << 30) | x as u32).await?;
+        } else if x < 1u64 << 62 {
+            stream.write_u64((0b11 << 62) | x).await?;
+        } else {
+            unreachable!("malformed VarInt")
+        };
+        Ok(())
+    }
 }

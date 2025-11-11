@@ -6,7 +6,6 @@ use std::{
 
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt, stream};
-use gm_quic::qbase::packet::header;
 use snafu::Snafu;
 use tokio::{io::AsyncWrite, sync::Mutex as AsyncMutex};
 
@@ -14,9 +13,9 @@ use crate::{
     codec::{
         BufSinkWriter, Feed,
         error::{DecodeStreamError, EncodeStreamError},
-        util::{EncodeInto, encode_all_into},
+        util::{EncodeInto, encode_all},
     },
-    error::{Code, H3CriticalStreamClosed, HasErrorCode, StreamError},
+    error::{Code, H3CriticalStreamClosed, HasErrorCode},
     frame::Frame,
     qpack::{
         dynamic::DynamicTable,
@@ -27,7 +26,7 @@ use crate::{
         r#static,
         strategy::Encode,
     },
-    quic::{GetStreamId, WriteStream},
+    quic::GetStreamId,
 };
 
 #[derive(Debug)]
@@ -162,7 +161,7 @@ impl EncoderState {
 
     pub fn set_max_table_capacity(&mut self, new_capacity: u64) {
         assert!(
-            new_capacity < self.settings.max_table_capacity(),
+            new_capacity < self.settings.qpack_max_table_capacity().into_inner(),
             "The encoder MUST NOT set a dynamic table capacity that exceeds SETTINGS_QPACK_MAX_TABLE_CAPACITY"
         );
         self.dynamic_table.capacity = new_capacity;
@@ -372,8 +371,7 @@ where
                 // encode EncodedFieldSectionPrefix
                 field_section_prefix.encode_into(&mut frame_writer).await?;
                 // encode FieldLineRepresentations
-                encode_all_into(stream::iter(field_line_representations), &mut frame_writer)
-                    .await?;
+                encode_all(stream::iter(field_line_representations), &mut frame_writer).await?;
                 // make sure all data are written
                 frame_writer.flush().await?;
             }

@@ -15,7 +15,7 @@ use crate::{
         util::{DecodeFrom, EncodeInto},
     },
     quic::{GetStreamId, StopSending},
-    varint::{self, VARINT_MAX, VarInt, decode_varint, encode_varint},
+    varint::{self, VARINT_MAX, VarInt},
 };
 
 pin_project_lite::pin_project! {
@@ -200,8 +200,8 @@ where
 {
     async fn encode_into(self, stream: S) -> Result<(), EncodeStreamError> {
         tokio::pin!(stream);
-        encode_varint(stream.as_mut(), self.r#type).await?;
-        encode_varint(stream.as_mut(), self.length).await?;
+        self.r#type.encode_into(&mut stream).await?;
+        self.length.encode_into(&mut stream).await?;
         for mut bytes in self.payload {
             stream.feed(bytes.copy_to_bytes(bytes.remaining())).await?;
         }
@@ -218,8 +218,8 @@ where
     DecodeStreamError: From<S::Error>,
 {
     async fn decode_from(mut pin_stream: Pin<P>) -> Result<Self, DecodeStreamError> {
-        let r#type = decode_varint(pin_stream.as_mut()).await?;
-        let length = decode_varint(pin_stream.as_mut()).await?;
+        let r#type = VarInt::decode_from(pin_stream.as_mut()).await?;
+        let length = VarInt::decode_from(pin_stream.as_mut()).await?;
         let payload = FixedLengthReader::new(pin_stream, length.into_inner());
         Ok(Frame {
             r#type,

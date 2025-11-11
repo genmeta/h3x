@@ -1,4 +1,5 @@
-use futures::{Stream, StreamExt, stream};
+use bytes::Bytes;
+use futures::{Sink, SinkExt, Stream, StreamExt, stream};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 use crate::codec::error::{DecodeStreamError, EncodeStreamError};
@@ -9,6 +10,17 @@ pub(crate) trait DecodeFrom<S>: Sized {
 
 pub(crate) trait EncodeInto<S>: Sized {
     async fn encode_into(self, stream: S) -> Result<(), EncodeStreamError>;
+}
+
+impl<S: Sink<Bytes>> EncodeInto<S> for Bytes
+where
+    EncodeStreamError: From<S::Error>,
+{
+    async fn encode_into(self, stream: S) -> Result<(), EncodeStreamError> {
+        tokio::pin!(stream);
+        stream.feed(self).await?;
+        Ok(())
+    }
 }
 
 pub fn decode_stream<Item, S>(stream: S) -> impl Stream<Item = Result<Item, DecodeStreamError>>
@@ -25,7 +37,7 @@ where
     })
 }
 
-pub async fn encode_all_into<item, S>(
+pub async fn encode_all<item, S>(
     items: impl Stream<Item = item>,
     mut stream: S,
 ) -> Result<(), EncodeStreamError>
