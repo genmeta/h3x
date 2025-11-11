@@ -2,7 +2,10 @@ use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt, stream};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
-use crate::codec::error::{DecodeStreamError, EncodeStreamError};
+use crate::{
+    codec::error::{DecodeStreamError, EncodeStreamError},
+    qpack::strategy::Encode,
+};
 
 pub(crate) trait DecodeFrom<S>: Sized {
     async fn decode_from(stream: S) -> Result<Self, DecodeStreamError>;
@@ -23,7 +26,7 @@ where
     }
 }
 
-pub fn decode_stream<Item, S>(stream: S) -> impl Stream<Item = Result<Item, DecodeStreamError>>
+pub fn decoder<Item, S>(stream: S) -> impl Stream<Item = Result<Item, DecodeStreamError>>
 where
     S: AsyncBufRead + Unpin,
     Item: for<'s> DecodeFrom<&'s mut S>,
@@ -37,16 +40,11 @@ where
     })
 }
 
-pub async fn encode_all<item, S>(
-    items: impl Stream<Item = item>,
-    mut stream: S,
-) -> Result<(), EncodeStreamError>
-where
-    item: for<'s> EncodeInto<&'s mut S>,
-{
-    tokio::pin!(items);
-    while let Some(item) = items.next().await {
+pub fn encoder<T: for<'s> EncodeInto<&'s mut S>, S>(
+    stream: S,
+) -> impl Sink<T, Error = EncodeStreamError> {
+    futures::sink::unfold(stream, |mut stream, item: T| async move {
         item.encode_into(&mut stream).await?;
-    }
-    Ok(())
+        Ok(stream)
+    })
 }

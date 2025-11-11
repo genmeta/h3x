@@ -1,7 +1,6 @@
 use std::{
     future::poll_fn,
     mem,
-    ops::DerefMut,
     pin::Pin,
     task::{Context, Poll, ready},
 };
@@ -12,6 +11,7 @@ use tokio::io::{self, AsyncWrite};
 
 use crate::quic::{CancelStream, GetStreamId, WriteStream};
 
+// TODO: improve this
 enum SinkWriterBuffer {
     Buffering(BytesMut),
     // empty: no data to flush

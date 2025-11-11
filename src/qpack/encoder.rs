@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ops::DerefMut,
-    pin::Pin,
+    pin::{Pin, pin},
 };
 
 use bytes::Bytes;
@@ -13,7 +13,7 @@ use crate::{
     codec::{
         BufSinkWriter, Feed,
         error::{DecodeStreamError, EncodeStreamError},
-        util::{EncodeInto, encode_all},
+        util::{EncodeInto, encoder},
     },
     error::{Code, H3CriticalStreamClosed, HasErrorCode},
     frame::Frame,
@@ -371,7 +371,11 @@ where
                 // encode EncodedFieldSectionPrefix
                 field_section_prefix.encode_into(&mut frame_writer).await?;
                 // encode FieldLineRepresentations
-                encode_all(stream::iter(field_line_representations), &mut frame_writer).await?;
+                let mut representations =
+                    stream::iter(field_line_representations.into_iter().map(Ok));
+                pin!(encoder(&mut frame_writer))
+                    .send_all(&mut representations)
+                    .await?;
                 // make sure all data are written
                 frame_writer.flush().await?;
             }

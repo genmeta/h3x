@@ -1,26 +1,29 @@
 use std::{ops::Deref, pin::Pin};
 
 use bytes::Bytes;
-use futures::{Sink, Stream};
+use futures::{Sink, Stream, future::BoxFuture};
 
 use crate::error::{ConnectionError, StreamError};
 
-#[async_trait::async_trait]
-pub trait QuicConnection {
+pub trait QuicConnect {
     type StreamWriter: WriteStream;
     type StreamReader: ReadStream;
 
-    async fn open_bi(
-        &mut self,
-    ) -> Result<(Self::StreamWriter, Self::StreamReader), ConnectionError>;
+    fn open_bi(
+        self: Pin<&mut Self>,
+    ) -> BoxFuture<'static, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>>;
 
-    async fn open_uni(&mut self) -> Result<Self::StreamWriter, ConnectionError>;
+    fn open_uni(
+        self: Pin<&mut Self>,
+    ) -> BoxFuture<'static, Result<Self::StreamWriter, ConnectionError>>;
 
-    async fn accept_bi(
-        &mut self,
-    ) -> Result<(Self::StreamWriter, Self::StreamReader), ConnectionError>;
+    fn accept_bi(
+        self: Pin<&mut Self>,
+    ) -> BoxFuture<'static, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>>;
 
-    async fn accept_uni(&mut self) -> Result<Self::StreamReader, ConnectionError>;
+    fn accept_uni(
+        self: Pin<&mut Self>,
+    ) -> BoxFuture<'static, Result<Self::StreamReader, ConnectionError>>;
 }
 
 pub trait GetStreamId {

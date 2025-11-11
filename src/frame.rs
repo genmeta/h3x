@@ -210,17 +210,17 @@ where
     }
 }
 
-impl<P, S> DecodeFrom<Pin<P>> for Frame<FixedLengthReader<P>>
+impl<S> DecodeFrom<BufStreamReader<S>> for Frame<FixedLengthReader<BufStreamReader<S>>>
 where
-    S: TryStream<Ok = Bytes> + ?Sized,
-    P: DerefMut<Target = BufStreamReader<S>>,
+    S: TryStream<Ok = Bytes>,
+    BufStreamReader<S>: Unpin,
     io::Error: From<S::Error>,
     DecodeStreamError: From<S::Error>,
 {
-    async fn decode_from(mut pin_stream: Pin<P>) -> Result<Self, DecodeStreamError> {
-        let r#type = VarInt::decode_from(pin_stream.as_mut()).await?;
-        let length = VarInt::decode_from(pin_stream.as_mut()).await?;
-        let payload = FixedLengthReader::new(pin_stream, length.into_inner());
+    async fn decode_from(mut stream: BufStreamReader<S>) -> Result<Self, DecodeStreamError> {
+        let r#type = VarInt::decode_from(&mut stream).await?;
+        let length = VarInt::decode_from(&mut stream).await?;
+        let payload = FixedLengthReader::new(stream, length.into_inner());
         Ok(Frame {
             r#type,
             length,
@@ -269,10 +269,10 @@ impl<S: StopSending + ?Sized> StopSending for Frame<S> {
     }
 }
 
-impl<P, S> Frame<FixedLengthReader<P>>
+impl<S> Frame<FixedLengthReader<BufStreamReader<S>>>
 where
-    P: DerefMut<Target = BufStreamReader<S>>,
-    S: TryStream<Ok = Bytes> + ?Sized,
+    S: TryStream<Ok = Bytes>,
+    BufStreamReader<S>: Unpin,
     io::Error: From<S::Error>,
     DecodeStreamError: From<S::Error>,
 {
@@ -283,7 +283,7 @@ where
         );
 
         let mut stream = self.payload.into_inner();
-        match stream.as_mut().has_remaining().await {
+        match Pin::new(&mut stream).has_remaining().await {
             Ok(true) => Some(Frame::decode_from(stream).await),
             Ok(false) => None,
             Err(error) => Some(Err(error.into())),
@@ -328,7 +328,6 @@ mod tests {
             0x05, // Length: 5
             b'W', b'o', b'r', b'l', b'd', // Payload: "World"
         ]));
-        tokio::pin!(stream);
 
         let mut frame1 = Frame::decode_from(stream).await.unwrap();
         assert_eq!(frame1.r#type().into_inner(), 0);
@@ -352,7 +351,6 @@ mod tests {
             // 0x05, // Length: 5
             // b'H', b'e', b'l', b'l', b'o', // Payload: "Hello"
         ]));
-        tokio::pin!(stream);
 
         assert!(matches!(
             Frame::decode_from(stream).await,
@@ -369,7 +367,6 @@ mod tests {
                  // 0x05, // Length: 5
                  // b'H', b'e', b'l', b'l', b'o', // Payload: "Hello"
         ]));
-        tokio::pin!(stream);
 
         assert!(matches!(
             Frame::decode_from(stream).await,
@@ -386,7 +383,6 @@ mod tests {
             0x05, // Length: 5
             b'H', b'e', b'l', b'l', /* b'o', */ // Payload: "Hello"
         ]));
-        tokio::pin!(stream);
 
         let mut frame1 = Frame::decode_from(stream).await.unwrap();
         assert_eq!(frame1.r#type().into_inner(), 0);
@@ -415,7 +411,6 @@ mod tests {
 
         let decode = tokio::spawn(async move {
             let stream = BufStreamReader::new(stream);
-            tokio::pin!(stream);
 
             let mut frame1 = Frame::decode_from(stream).await.unwrap();
             assert_eq!(frame1.r#type().into_inner(), 0);

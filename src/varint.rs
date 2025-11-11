@@ -46,7 +46,7 @@ impl VarInt {
     /// Construct a `VarInt` from a [`u64`].
     /// Succeeds if `x` < 2^62.
     pub const fn from_u64(value: u64) -> Result<Self, err::Overflow> {
-        if value < (1 << 62) {
+        if value < VARINT_MAX {
             Ok(Self(value))
         } else {
             Err(err::Overflow { value: value as _ })
@@ -65,7 +65,7 @@ impl VarInt {
     /// Construct a `VarInt` from a [`u128`].
     /// Succeeds if `x` < 2^62.
     pub fn from_u128(value: u128) -> Result<Self, err::Overflow> {
-        if value < (1 << 62) {
+        if value < VARINT_MAX as u128 {
             Ok(Self(value as _))
         } else {
             Err(err::Overflow { value })
@@ -73,7 +73,7 @@ impl VarInt {
     }
 
     /// Extract the integer value
-    pub fn into_inner(self) -> u64 {
+    pub const fn into_inner(self) -> u64 {
         self.0
     }
 

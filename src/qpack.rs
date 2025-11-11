@@ -15,15 +15,14 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use futures::{Sink, SinkExt, Stream, StreamExt};
+    use futures::SinkExt;
     use http::Request;
     use tokio::{io::AsyncReadExt, sync::Notify, time};
 
     use crate::{
         codec::{
             BufSinkWriter, BufStreamReader,
-            error::{DecodeStreamError, EncodeStreamError},
-            util::{DecodeFrom, EncodeInto},
+            util::{DecodeFrom, EncodeInto, decoder, encoder},
         },
         frame::Frame,
         qpack::{
@@ -34,33 +33,80 @@ mod tests {
             strategy::{HuffmanAlways, StaticEncoder},
         },
         quic::test::mock_stream_pair,
+        stream::{FutureStream, UnidirectionalStream},
     };
-
-    fn channel<T>() -> (
-        impl Sink<T, Error = EncodeStreamError>,
-        impl Stream<Item = Result<T, DecodeStreamError>>,
-    ) {
-        let (sink, stream) = futures::channel::mpsc::channel(8);
-        (sink.sink_map_err(|_e| unreachable!()), stream.map(Ok))
-    }
 
     #[tokio::test]
     async fn r#static() {
         let encode_strategy = StaticEncoder::new(HuffmanAlways);
-        let (encoder_stream_tx, encoder_stream_rx) = channel();
-        let (decoder_stream_tx, decoder_stream_rx) = channel();
-        let (response_stream, request_stream) = mock_stream_pair(0);
 
-        let encoder = Arc::new(Encoder::new(
-            Settings::default(),
-            encoder_stream_tx,
-            decoder_stream_rx,
-        ));
-        let decoder = Arc::new(Decoder::new(
-            Settings::default(),
-            decoder_stream_tx,
-            encoder_stream_rx,
-        ));
+        // stream id is unused in this test
+        let (encoder_stream_reader, encoder_stream_writer) = mock_stream_pair(1);
+        let (decoder_stream_reader, decoder_stream_writer) = mock_stream_pair(2);
+
+        let init_encoder = tokio::spawn(async move {
+            let encoder_stream = UnidirectionalStream::new(
+                UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE,
+                BufSinkWriter::new(encoder_stream_writer),
+            )
+            .await
+            .unwrap();
+            println!("Sent encoder stream type");
+
+            let decoder_stream = Box::pin(FutureStream::from(async move {
+                let decoder_stream =
+                    UnidirectionalStream::decode_from(BufStreamReader::new(decoder_stream_reader))
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    decoder_stream.r#type(),
+                    UnidirectionalStream::QPACK_DECODER_STREAM_TYPE
+                );
+                println!("Received decoder stream type");
+                decoder_stream
+            }));
+
+            Arc::new(Encoder::new(
+                Settings::default(),
+                Box::pin(encoder(encoder_stream)),
+                Box::pin(decoder(decoder_stream)),
+            ))
+        });
+
+        let init_decoder = tokio::spawn(async move {
+            let decoder_stream = UnidirectionalStream::new(
+                UnidirectionalStream::QPACK_DECODER_STREAM_TYPE,
+                BufSinkWriter::new(decoder_stream_writer),
+            )
+            .await
+            .unwrap();
+            println!("Sent decoder stream type");
+
+            let encoder_stream = Box::pin(FutureStream::from(async move {
+                let encoder_stream =
+                    UnidirectionalStream::decode_from(BufStreamReader::new(encoder_stream_reader))
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    encoder_stream.r#type(),
+                    UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE
+                );
+                println!("Received encoder stream type");
+                encoder_stream
+            }));
+
+            Arc::new(Decoder::new(
+                Settings::default(),
+                Box::pin(encoder(decoder_stream)),
+                Box::pin(decoder(encoder_stream)),
+            ))
+        });
+
+        let (encoder, decoder) = time::timeout(time::Duration::from_secs(1), async move {
+            tokio::try_join!(init_encoder, init_decoder).unwrap()
+        })
+        .await
+        .expect("Test timedout");
 
         let request = Request::builder()
             .method("POST")
@@ -78,6 +124,7 @@ mod tests {
         let received = Arc::new(Notify::new());
         let received_rx = received.clone();
 
+        let (response_stream, request_stream) = mock_stream_pair(0);
         let request = tokio::spawn(async move {
             let mut request_stream = BufSinkWriter::new(request_stream);
 
@@ -99,7 +146,6 @@ mod tests {
         let response = tokio::spawn(async move {
             let response_stream = MessageStreamReader::new(response_stream, decoder.clone());
             let response_stream = BufStreamReader::new(response_stream);
-            tokio::pin!(response_stream);
 
             let mut frame = Frame::decode_from(response_stream).await.unwrap();
             assert_eq!(frame.r#type(), Frame::HEADERS_FRAME_TYPE);

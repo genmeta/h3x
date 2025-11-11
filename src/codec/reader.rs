@@ -1,6 +1,5 @@
 use std::{
     future::poll_fn,
-    ops::DerefMut,
     pin::Pin,
     task::{Context, Poll, ready},
 };
@@ -134,15 +133,18 @@ impl<S: StopSending> StopSending for BufStreamReader<S> {
 }
 
 pin_project_lite::pin_project! {
-    pub struct FixedLengthReader<P> {
+    pub struct FixedLengthReader<P: ?Sized> {
         remaining: u64,
         #[pin]
-        stream: Pin<P>,
+        stream: P,
     }
 }
 
-impl<P> FixedLengthReader<P> {
-    pub const fn new(stream: Pin<P>, length: u64) -> Self {
+impl<P: ?Sized> FixedLengthReader<P> {
+    pub const fn new(stream: P, length: u64) -> Self
+    where
+        P: Sized,
+    {
         Self {
             stream,
             remaining: length,
@@ -153,15 +155,15 @@ impl<P> FixedLengthReader<P> {
         self.remaining
     }
 
-    pub fn into_inner(self) -> Pin<P> {
+    pub fn into_inner(self) -> P
+    where
+        P: Sized,
+    {
         self.stream
     }
 }
 
-impl<P> AsyncRead for FixedLengthReader<P>
-where
-    P: DerefMut<Target: AsyncRead>,
-{
+impl<R: AsyncRead + ?Sized> AsyncRead for FixedLengthReader<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -192,10 +194,7 @@ where
     }
 }
 
-impl<P> AsyncBufRead for FixedLengthReader<P>
-where
-    P: DerefMut<Target: AsyncBufRead>,
-{
+impl<R: AsyncBufRead + ?Sized> AsyncBufRead for FixedLengthReader<R> {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
         let project = self.project();
         if *project.remaining == 0 {
@@ -217,49 +216,39 @@ where
     }
 }
 
-impl<P, S> Stream for FixedLengthReader<P>
+impl<S> Stream for FixedLengthReader<BufStreamReader<S>>
 where
-    P: DerefMut<Target = BufStreamReader<S>>,
     S: TryStream<Ok = Bytes> + ?Sized,
     DecodeStreamError: From<S::Error>,
 {
     type Item = Result<Bytes, DecodeStreamError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let project = self.project();
+        let mut project = self.project();
         if *project.remaining == 0 {
             return Poll::Ready(None);
         }
-        let mut stream = project.stream.as_deref_mut();
-        match ready!(stream.as_mut().poll_bytes(cx)?) {
+        match ready!(project.stream.as_mut().poll_bytes(cx)?) {
             bytes if bytes.is_empty() => Poll::Ready(Some(Err(DecodeError::Incomplete.into()))),
             bytes => {
                 let len = bytes.len().min(*project.remaining as usize);
                 let bytes = bytes.slice(..len);
                 *project.remaining -= len as u64;
-                stream.consume(len);
+                project.stream.consume(len);
                 Poll::Ready(Some(Ok(bytes)))
             }
         }
     }
 }
 
-impl<P, S> GetStreamId for FixedLengthReader<P>
-where
-    P: DerefMut<Target = BufStreamReader<S>>,
-    S: GetStreamId,
-{
+impl<S: GetStreamId + ?Sized> GetStreamId for FixedLengthReader<S> {
     fn stream_id(&self) -> u64 {
         self.stream.stream_id()
     }
 }
 
-impl<P, S> StopSending for FixedLengthReader<P>
-where
-    P: DerefMut<Target = BufStreamReader<S>>,
-    S: StopSending,
-{
+impl<S: StopSending + ?Sized> StopSending for FixedLengthReader<S> {
     fn stop_sending(self: Pin<&mut Self>, code: u64) {
-        self.project().stream.as_deref_mut().stop_sending(code);
+        self.project().stream.stop_sending(code);
     }
 }

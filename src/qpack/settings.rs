@@ -1,15 +1,16 @@
 use std::{
     collections::{BTreeMap, btree_map},
     iter,
+    pin::pin,
 };
 
-use futures::{TryStreamExt, stream};
+use futures::{SinkExt, TryStreamExt, stream};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 
 use crate::{
     codec::{
-        error::DecodeStreamError,
-        util::{DecodeFrom, EncodeInto, decode_stream, encode_all},
+        error::{DecodeStreamError, EncodeStreamError},
+        util::{DecodeFrom, EncodeInto, decoder, encoder},
     },
     varint::VarInt,
 };
@@ -53,12 +54,11 @@ impl Setting {
     /// to be accepted.
     ///
     /// https://datatracker.ietf.org/doc/html/rfc9114#name-header-size-constraints
-    ///
+    // TODO: implement this setting
+    pub const MAX_FIELD_SECTION_SIZE_ID: VarInt = VarInt::from_u32(0x06);
     /// The default value is unlimited. See Section 4.2.2 for usage.
     ///
     /// https://datatracker.ietf.org/doc/html/rfc9114#section-7.2.4.1-2.2.1
-    // TODO: implement this setting
-    pub const MAX_FIELD_SECTION_SIZE_ID: VarInt = VarInt::from_u32(0x06);
     pub const MAX_FIELD_SECTION_SIZE_DEFAULT_VALUE: Option<VarInt> = None;
 
     /// To bound the memory requirements of the decoder, the decoder limits
@@ -70,12 +70,11 @@ impl Setting {
     /// Section 4.3.1.
     ///
     /// https://datatracker.ietf.org/doc/html/rfc9204#section-3.2.3-1
-    ///
+    pub const QPACK_MAX_TABLE_CAPACITY_ID: VarInt = VarInt::from_u32(0x01);
     /// The default value is zero. See Section 3.2 for usage. This is the
     /// equivalent of the SETTINGS_HEADER_TABLE_SIZE from HTTP/2.
     ///
     /// https://datatracker.ietf.org/doc/html/rfc9204#section-5-2.2.1
-    pub const QPACK_MAX_TABLE_CAPACITY_ID: VarInt = VarInt::from_u32(0x01);
     pub const QPACK_MAX_TABLE_CAPACITY_DEFAULT_VALUE: VarInt = VarInt::from_u32(0);
 
     /// The decoder specifies an upper bound on the number of streams that
@@ -87,11 +86,10 @@ impl Setting {
     /// QPACK_DECOMPRESSION_FAILED.
     ///
     /// https://datatracker.ietf.org/doc/html/rfc9204#section-2.1.2-4
-    ///
+    pub const QPACK_BLOCKED_STREAMS_ID: VarInt = VarInt::from_u32(0x07);
     /// The default value is zero. See Section 2.1.2.
     ///
     /// https://datatracker.ietf.org/doc/html/rfc9204#section-5-2.4.1
-    pub const QPACK_BLOCKED_STREAMS_ID: VarInt = VarInt::from_u32(0x07);
     pub const QPACK_BLOCKED_STREAMS_DEFAULT_VALUE: VarInt = VarInt::from_u32(0);
 }
 
@@ -105,7 +103,7 @@ impl<S: AsyncBufRead> DecodeFrom<S> for Setting {
 }
 
 impl<S: AsyncWrite> EncodeInto<S> for Setting {
-    async fn encode_into(self, stream: S) -> Result<(), crate::codec::error::EncodeStreamError> {
+    async fn encode_into(self, stream: S) -> Result<(), EncodeStreamError> {
         tokio::pin!(stream);
         self.id.encode_into(stream.as_mut()).await?;
         self.value.encode_into(stream.as_mut()).await?;
@@ -177,7 +175,7 @@ impl FromIterator<Setting> for Settings {
 impl<S: AsyncBufRead> DecodeFrom<S> for Settings {
     async fn decode_from(stream: S) -> Result<Self, DecodeStreamError> {
         tokio::pin!(stream);
-        let stream = decode_stream(stream);
+        let stream = decoder(stream);
         tokio::pin!(stream);
 
         let mut settings = Settings::default();
@@ -189,8 +187,11 @@ impl<S: AsyncBufRead> DecodeFrom<S> for Settings {
 }
 
 impl<S: AsyncWrite> EncodeInto<S> for Settings {
-    async fn encode_into(self, stream: S) -> Result<(), crate::codec::error::EncodeStreamError> {
+    async fn encode_into(self, stream: S) -> Result<(), EncodeStreamError> {
         tokio::pin!(stream);
-        encode_all(stream::iter(self.into_iter()), &mut stream).await
+        let mut encoder = pin!(encoder(stream));
+        let mut settings = stream::iter(self.into_iter().map(Ok));
+        encoder.send_all(&mut settings).await?;
+        Ok(())
     }
 }

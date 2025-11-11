@@ -14,7 +14,7 @@ use crate::{
     codec::{
         Feed,
         error::{DecodeStreamError, EncodeStreamError},
-        util::{DecodeFrom, decode_stream},
+        util::{DecodeFrom, decoder},
     },
     error::{Code, H3CriticalStreamClosed, HasErrorCode, StreamError},
     qpack::{
@@ -333,18 +333,17 @@ where
         self.receive_instruction_until(prefix.required_insert_count)
             .await?;
 
-        let header_section =
-            FieldSection::decode_from(decode_stream(stream).map(|representation| {
-                representation.and_then(|representation| {
-                    decompression_field_line_representation(
-                        &representation,
-                        prefix.base,
-                        &self.state.lock().unwrap().dynamic_table,
-                    )
-                    .map_err(DecodeStreamError::from)
-                })
-            }))
-            .await?;
+        let header_section = FieldSection::decode_from(decoder(stream).map(|representation| {
+            representation.and_then(|representation| {
+                decompression_field_line_representation(
+                    &representation,
+                    prefix.base,
+                    &self.state.lock().unwrap().dynamic_table,
+                )
+                .map_err(DecodeStreamError::from)
+            })
+        }))
+        .await?;
 
         self.emit(DecoderInstruction::SectionAcknowledgment { stream_id });
         _ = self.flush_instructions().await;
