@@ -4,22 +4,29 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-async-trait = "0.1"
 bytes = "1"
 bon = "3"
 either = "1"
 futures = "0.3"
 http = "1"
 http-body = "1"
+http-body-util = "0.1"
 # httlib-huffman = { path = "../httlib-rs/huffman" }
 httlib-huffman = "0.3"
 pin-project-lite = "0.2"
 snafu = "0.8"
 tokio = "1"
 tokio-util = { version = "0.7", features = ["codec", "io"] }
-
+tracing = "0.1"
 
 gm-quic = { path = "../gm-quic/gm-quic" }
 
 [dev-dependencies]
+tracing-subscriber = "0.3"
+axum = "0.8"
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "logging",
+] }
 tokio = { version = "1", features = ["macros", "test-util", "io-util"] }
+tower = "0.5"

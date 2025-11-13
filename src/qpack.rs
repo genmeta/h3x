@@ -1,3 +1,9 @@
+use std::pin::Pin;
+
+use futures::{Sink, stream::BoxStream};
+
+use crate::codec::error::{DecodeStreamError, EncodeStreamError};
+
 pub mod decoder;
 pub mod dynamic;
 pub mod encoder;
@@ -9,6 +15,11 @@ pub mod settings;
 pub mod r#static;
 pub mod strategy;
 pub mod string;
+
+pub type BoxInstructionStream<'a, Instruction> =
+    BoxStream<'a, Result<Instruction, DecodeStreamError>>;
+pub type BoxSink<'a, Item, Err> = Pin<Box<dyn Sink<Item, Error = Err> + Send + 'a>>;
+pub type BoxInstructionSink<'a, Instruction> = BoxSink<'a, Instruction, EncodeStreamError>;
 
 #[cfg(test)]
 mod tests {
@@ -24,6 +35,7 @@ mod tests {
             BufSinkWriter, BufStreamReader,
             util::{DecodeFrom, EncodeInto, decoder, encoder},
         },
+        error::ConnectionError,
         frame::Frame,
         qpack::{
             decoder::{Decoder, MessageStreamReader},
@@ -33,7 +45,8 @@ mod tests {
             strategy::{HuffmanAlways, StaticEncoder},
         },
         quic::test::mock_stream_pair,
-        stream::{FutureStream, UnidirectionalStream},
+        stream::{TryFutureStream, UnidirectionalStream},
+        varint::VarInt,
     };
 
     #[tokio::test]
@@ -41,8 +54,8 @@ mod tests {
         let encode_strategy = StaticEncoder::new(HuffmanAlways);
 
         // stream id is unused in this test
-        let (encoder_stream_reader, encoder_stream_writer) = mock_stream_pair(1);
-        let (decoder_stream_reader, decoder_stream_writer) = mock_stream_pair(2);
+        let (encoder_stream_reader, encoder_stream_writer) = mock_stream_pair(VarInt::from_u32(1));
+        let (decoder_stream_reader, decoder_stream_writer) = mock_stream_pair(VarInt::from_u32(2));
 
         let init_encoder = tokio::spawn(async move {
             let encoder_stream = UnidirectionalStream::new(
@@ -53,7 +66,7 @@ mod tests {
             .unwrap();
             println!("Sent encoder stream type");
 
-            let decoder_stream = Box::pin(FutureStream::from(async move {
+            let decoder_stream = Box::pin(TryFutureStream::from(async move {
                 let decoder_stream =
                     UnidirectionalStream::decode_from(BufStreamReader::new(decoder_stream_reader))
                         .await
@@ -63,7 +76,7 @@ mod tests {
                     UnidirectionalStream::QPACK_DECODER_STREAM_TYPE
                 );
                 println!("Received decoder stream type");
-                decoder_stream
+                Ok::<_, ConnectionError>(decoder_stream)
             }));
 
             Arc::new(Encoder::new(
@@ -82,7 +95,7 @@ mod tests {
             .unwrap();
             println!("Sent decoder stream type");
 
-            let encoder_stream = Box::pin(FutureStream::from(async move {
+            let encoder_stream = Box::pin(TryFutureStream::from(async move {
                 let encoder_stream =
                     UnidirectionalStream::decode_from(BufStreamReader::new(encoder_stream_reader))
                         .await
@@ -92,7 +105,7 @@ mod tests {
                     UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE
                 );
                 println!("Received encoder stream type");
-                encoder_stream
+                Ok::<_, ConnectionError>(encoder_stream)
             }));
 
             Arc::new(Decoder::new(
@@ -124,7 +137,7 @@ mod tests {
         let received = Arc::new(Notify::new());
         let received_rx = received.clone();
 
-        let (response_stream, request_stream) = mock_stream_pair(0);
+        let (response_stream, request_stream) = mock_stream_pair(VarInt::from_u32(0));
         let request = tokio::spawn(async move {
             let mut request_stream = BufSinkWriter::new(request_stream);
 

@@ -12,6 +12,7 @@ use crate::{
         error::{DecodeStreamError, EncodeStreamError},
         util::{DecodeFrom, EncodeInto, decoder, encoder},
     },
+    error::{Code, ErrorWithCode, H3CriticalStreamClosed},
     varint::VarInt,
 };
 
@@ -179,7 +180,11 @@ impl<S: AsyncBufRead> DecodeFrom<S> for Settings {
         tokio::pin!(stream);
 
         let mut settings = Settings::default();
-        while let Some(Setting { id, value }) = stream.try_next().await? {
+        while let Some(Setting { id, value }) = stream
+            .try_next()
+            .await
+            .map_err(|error| error.map_stream_reset(|_| H3CriticalStreamClosed::Control.into()))?
+        {
             settings.set(id, value);
         }
         Ok(settings)
@@ -191,7 +196,12 @@ impl<S: AsyncWrite> EncodeInto<S> for Settings {
         tokio::pin!(stream);
         let mut encoder = pin!(encoder(stream));
         let mut settings = stream::iter(self.into_iter().map(Ok));
-        encoder.send_all(&mut settings).await?;
-        Ok(())
+        encoder.send_all(&mut settings).await.map_err(|error| {
+            error
+                .map_stream_reset(|_| H3CriticalStreamClosed::Control.into())
+                .map_encode_error(|encode_error| {
+                    ErrorWithCode::new(Code::H3_INTERNAL_ERROR, Some(encode_error)).into()
+                })
+        })
     }
 }

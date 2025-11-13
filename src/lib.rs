@@ -5,5 +5,6 @@ mod frame;
 mod message;
 mod qpack;
 mod quic;
+mod set_once;
 mod stream;
 mod varint;

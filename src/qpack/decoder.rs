@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     pin::Pin,
     sync::{Arc, Mutex as SyncMutex},
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use bytes::Bytes;
@@ -25,7 +25,8 @@ use crate::{
         settings::Settings,
         r#static,
     },
-    quic::{GetStreamId, ReadStream, StopSending},
+    quic::{GetStreamId, GetStreamIdExt, ReadStream, StopSending},
+    varint::VarInt,
 };
 
 #[derive(Debug)]
@@ -59,7 +60,9 @@ pub enum QPackEncoderStreamError {
 }
 
 impl HasErrorCode for QPackEncoderStreamError {
-    const CODE: Code = Code::QPACK_ENCODER_STREAM_ERROR;
+    fn code(&self) -> Code {
+        Code::QPACK_ENCODER_STREAM_ERROR
+    }
 }
 
 impl DecoderState {
@@ -306,7 +309,9 @@ pub enum InvalidDynamicTableReference {
 }
 
 impl HasErrorCode for InvalidDynamicTableReference {
-    const CODE: Code = Code::QPACK_DECOMPRESSION_FAILED;
+    fn code(&self) -> Code {
+        Code::QPACK_DECOMPRESSION_FAILED
+    }
 }
 
 impl<Ds, Es> Decoder<Ds, Es>
@@ -328,10 +333,18 @@ where
         stream: impl AsyncBufRead + GetStreamId,
     ) -> Result<FieldSection, DecodeStreamError> {
         tokio::pin!(stream);
-        let stream_id = stream.stream_id();
+        let stream_id = stream.stream_id().await?.into_inner();
+        tracing::info!("Decoding QPACK header block from stream {}", stream_id);
         let prefix = EncodedFieldSectionPrefix::decode_from(stream.as_mut()).await?;
+        tracing::info!(
+            "Decoded QPACK header block prefix from stream {}: required_insert_count={}, base={}",
+            stream_id,
+            prefix.required_insert_count,
+            prefix.base
+        );
         self.receive_instruction_until(prefix.required_insert_count)
             .await?;
+        tracing::info!("Decoding header section");
 
         let header_section = FieldSection::decode_from(decoder(stream).map(|representation| {
             representation.and_then(|representation| {
@@ -345,6 +358,7 @@ where
         }))
         .await?;
 
+        tracing::info!("Acknowledge sectioning {{ stream_id: {stream_id} }}",);
         self.emit(DecoderInstruction::SectionAcknowledgment { stream_id });
         _ = self.flush_instructions().await;
 
@@ -378,7 +392,7 @@ where
                     return Ok(());
                 }
                 let instruction = encoder_stream.next().await;
-                instruction.ok_or(H3CriticalStreamClosed::QPackEncoderStream)??
+                instruction.ok_or(H3CriticalStreamClosed::QPackEncoder)??
             };
 
             let mut state = self.state.lock().unwrap();
@@ -415,39 +429,45 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl<S: ReadStream, Ds, Es> MessageStreamReader<S, Ds, Es> {
-    pub const fn new(stream: S, decoder: Arc<Decoder<Ds, Es>>) -> Self {
+impl<S: ReadStream + Unpin, Ds, Es> MessageStreamReader<S, Ds, Es> {
+    pub fn new(stream: S, decoder: Arc<Decoder<Ds, Es>>) -> Self {
         Self { stream, decoder }
     }
 }
 
 impl<S: ReadStream, Ds, Es> StopSending for MessageStreamReader<S, Ds, Es> {
-    fn stop_sending(self: Pin<&mut Self>, code: u64) {
+    fn poll_stop_sending(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
         let mut project = self.project();
-        project.stream.as_mut().stop_sending(code);
+        let stream_id = ready!(project.stream.as_mut().poll_stream_id(cx))?.into_inner();
+        ready!(project.stream.poll_stop_sending(cx, code))?;
         project
             .decoder
-            .emit(DecoderInstruction::StreamCancellation {
-                stream_id: project.stream.stream_id(),
-            });
+            .emit(DecoderInstruction::StreamCancellation { stream_id });
+        Poll::Ready(Ok(()))
     }
 }
 
 impl<S: ReadStream, Ds, Es> GetStreamId for MessageStreamReader<S, Ds, Es> {
-    fn stream_id(&self) -> u64 {
-        self.stream.stream_id()
+    fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>> {
+        self.project().stream.poll_stream_id(cx)
     }
 }
 
 impl<S: ReadStream, Ds, Es> Stream for MessageStreamReader<S, Ds, Es> {
     type Item = S::Item;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.as_mut().project().stream.poll_next(cx) {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut project = self.project();
+        let stream_id = ready!(project.stream.as_mut().poll_stream_id(cx))?.into_inner();
+        match project.stream.poll_next(cx) {
             poll @ Poll::Ready(Some(Err(StreamError::Reset { .. }))) => {
-                self.decoder.emit(DecoderInstruction::StreamCancellation {
-                    stream_id: self.stream.stream_id(),
-                });
+                project
+                    .decoder
+                    .emit(DecoderInstruction::StreamCancellation { stream_id });
                 poll
             }
             poll => poll,

@@ -1,11 +1,10 @@
 use std::{
-    ops::DerefMut,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use bytes::{Buf, Bytes};
-use futures::{Sink, SinkExt, Stream, TryStream};
+use futures::{Sink, SinkExt, Stream, StreamExt, TryStream, sink};
 use tokio::io::{self, AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
@@ -14,6 +13,7 @@ use crate::{
         error::{DecodeStreamError, EncodeError, EncodeStreamError},
         util::{DecodeFrom, EncodeInto},
     },
+    error::StreamError,
     quic::{GetStreamId, StopSending},
     varint::{self, VARINT_MAX, VarInt},
 };
@@ -87,15 +87,30 @@ impl<P: ?Sized> Frame<P> {
         })
     }
 
-    pub fn r#type(&self) -> VarInt {
+    pub const fn r#type(&self) -> VarInt {
         self.r#type
     }
 
-    pub fn length(&self) -> VarInt {
+    /// Frame types of the format 0x1f * N + 0x21 for non-negative integer
+    /// values of N are reserved to exercise the requirement that unknown
+    /// types be ignored (Section 9). These frames have no semantics, and
+    /// they MAY be sent on any stream where frames are allowed to be sent.
+    /// This enables their use for application-layer padding. Endpoints MUST
+    /// NOT consider these frames to have any meaning upon receipt.
+    ///
+    /// The payload and length of the frames are selected in any manner the
+    /// implementation chooses.
+    ///
+    /// https://datatracker.ietf.org/doc/html/rfc9114#name-reserved-frame-types
+    pub const fn is_reversed_frame(&self) -> bool {
+        (self.r#type.into_inner() >= 0x21) && (self.r#type.into_inner() - 0x21).is_multiple_of(0x1f)
+    }
+
+    pub const fn length(&self) -> VarInt {
         self.length
     }
 
-    pub fn payload(&self) -> &P {
+    pub const fn payload(&self) -> &P {
         &self.payload
     }
 
@@ -258,14 +273,18 @@ impl<S: Stream + ?Sized> Stream for Frame<S> {
 }
 
 impl<S: GetStreamId + ?Sized> GetStreamId for Frame<S> {
-    fn stream_id(&self) -> u64 {
-        self.payload.stream_id()
+    fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>> {
+        self.project().payload.poll_stream_id(cx)
     }
 }
 
 impl<S: StopSending + ?Sized> StopSending for Frame<S> {
-    fn stop_sending(self: Pin<&mut Self>, code: u64) {
-        self.project().payload.stop_sending(code)
+    fn poll_stop_sending(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
+        self.project().payload.poll_stop_sending(cx, code)
     }
 }
 
@@ -276,11 +295,13 @@ where
     io::Error: From<S::Error>,
     DecodeStreamError: From<S::Error>,
 {
-    pub async fn into_next_frame(self) -> Option<Result<Self, DecodeStreamError>> {
-        assert!(
-            self.payload.remaining() == 0,
-            "Current frame should be completed read before decoding next one"
-        );
+    pub async fn into_next_frame(mut self) -> Option<Result<Self, DecodeStreamError>> {
+        if self.payload.remaining() > 0 {
+            let drain = sink::drain().sink_map_err(|never| match never {});
+            if let Err(error) = (&mut self.payload).forward(drain).await {
+                return Some(Err(error));
+            }
+        }
 
         let mut stream = self.payload.into_inner();
         match Pin::new(&mut stream).has_remaining().await {

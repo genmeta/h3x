@@ -2,9 +2,12 @@ use std::{convert::Infallible, error::Error, io};
 
 use snafu::Snafu;
 
-use crate::error::{Code, ErrorWithCode, HasErrorCode, StreamError};
+use crate::{
+    error::{Code, ConnectionError, ErrorWithCode, HasErrorCode, StreamError},
+    varint::VarInt,
+};
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub), context(suffix(DecodeSanfu)))]
 pub enum DecodeError {
     #[snafu(display("Stream ended unexpectedly"))]
@@ -41,7 +44,7 @@ impl From<httlib_huffman::DecoderError> for DecodeError {
     }
 }
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
 pub enum DecodeStreamError {
     #[snafu(transparent)]
@@ -60,6 +63,33 @@ impl<E: HasErrorCode + Error + Send + Sync + 'static> From<E> for DecodeStreamEr
     }
 }
 
+impl DecodeStreamError {
+    pub fn map_stream_reset(self, map: impl FnOnce(VarInt) -> Self) -> Self {
+        match self {
+            DecodeStreamError::Stream {
+                source: StreamError::Reset { code },
+            } => map(code),
+            error => error,
+        }
+    }
+
+    pub fn map_incomplete(self, map: impl FnOnce() -> Self) -> Self {
+        match self {
+            DecodeStreamError::Decode {
+                source: DecodeError::Incomplete,
+            } => map(),
+            error => error,
+        }
+    }
+
+    pub fn map_decode_error(self, map: impl FnOnce(DecodeError) -> Self) -> Self {
+        match self {
+            DecodeStreamError::Decode { source } => map(source),
+            error => error,
+        }
+    }
+}
+
 impl From<DecodeStreamError> for io::Error {
     fn from(value: DecodeStreamError) -> Self {
         match value {
@@ -70,8 +100,32 @@ impl From<DecodeStreamError> for io::Error {
     }
 }
 
+impl From<ConnectionError> for DecodeStreamError {
+    fn from(value: ConnectionError) -> Self {
+        DecodeStreamError::Stream {
+            source: value.into(),
+        }
+    }
+}
+
+impl From<Code> for DecodeStreamError {
+    fn from(value: Code) -> Self {
+        DecodeStreamError::Code {
+            source: value.into(),
+        }
+    }
+}
+
 impl From<io::Error> for DecodeStreamError {
     fn from(source: io::Error) -> Self {
+        let source = match source.downcast::<ConnectionError>() {
+            Ok(error) => {
+                return DecodeStreamError::Stream {
+                    source: error.into(),
+                };
+            }
+            Err(source) => source,
+        };
         let source = match source.downcast::<StreamError>() {
             Ok(error) => return DecodeStreamError::Stream { source: error },
             Err(source) => source,
@@ -103,12 +157,12 @@ impl From<io::Error> for DecodeStreamError {
                 source: DecodeError::Incomplete,
             }
         } else {
-            panic!("io::Error is not from StreamReader nor Decoder")
+            panic!("io::Error({source:?}) is not from StreamReader nor Decoder")
         }
     }
 }
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub), context(suffix(EncodeSanfu)))]
 pub enum EncodeError {
     #[snafu(display("Zero byte written while encoding"))]
@@ -138,7 +192,7 @@ impl From<httlib_huffman::EncoderError> for EncodeError {
     }
 }
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
 pub enum EncodeStreamError {
     #[snafu(transparent)]
@@ -149,12 +203,46 @@ pub enum EncodeStreamError {
     Code { source: ErrorWithCode },
 }
 
+impl<E: HasErrorCode + Error + Send + Sync + 'static> From<E> for EncodeStreamError {
+    fn from(value: E) -> Self {
+        EncodeStreamError::Code {
+            source: value.into(),
+        }
+    }
+}
+
+impl EncodeStreamError {
+    pub fn map_stream_reset(self, map: impl FnOnce(VarInt) -> Self) -> Self {
+        match self {
+            EncodeStreamError::Stream {
+                source: StreamError::Reset { code },
+            } => map(code),
+            error => error,
+        }
+    }
+
+    pub fn map_encode_error(self, map: impl FnOnce(EncodeError) -> Self) -> Self {
+        match self {
+            EncodeStreamError::Encode { source } => map(source),
+            error => error,
+        }
+    }
+}
+
 impl From<EncodeStreamError> for io::Error {
     fn from(value: EncodeStreamError) -> Self {
         match value {
             EncodeStreamError::Stream { source } => source.into(),
             EncodeStreamError::Encode { source } => source.into(),
             EncodeStreamError::Code { source } => source.into(),
+        }
+    }
+}
+
+impl From<ConnectionError> for EncodeStreamError {
+    fn from(value: ConnectionError) -> Self {
+        EncodeStreamError::Stream {
+            source: value.into(),
         }
     }
 }
@@ -175,6 +263,14 @@ impl From<Code> for EncodeStreamError {
 
 impl From<io::Error> for EncodeStreamError {
     fn from(source: io::Error) -> Self {
+        let source = match source.downcast::<ConnectionError>() {
+            Ok(error) => {
+                return EncodeStreamError::Stream {
+                    source: error.into(),
+                };
+            }
+            Err(source) => source,
+        };
         let source = match source.downcast::<StreamError>() {
             Ok(error) => return EncodeStreamError::Stream { source: error },
             Err(source) => source,

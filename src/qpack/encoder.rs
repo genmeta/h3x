@@ -26,7 +26,7 @@ use crate::{
         r#static,
         strategy::Encode,
     },
-    quic::GetStreamId,
+    quic::{GetStreamId, GetStreamIdExt},
 };
 
 #[derive(Debug)]
@@ -71,7 +71,9 @@ pub enum QPackDecoderStreamError {
 }
 
 impl HasErrorCode for QPackDecoderStreamError {
-    const CODE: Code = Code::QPACK_DECODER_STREAM_ERROR;
+    fn code(&self) -> Code {
+        Code::QPACK_DECODER_STREAM_ERROR
+    }
 }
 
 impl EncoderState {
@@ -331,6 +333,10 @@ where
         }
     }
 
+    pub async fn apply_settings(&self, settings: Settings) {
+        self.state.lock().await.settings = settings;
+    }
+
     pub async fn encode<E>(
         &self,
         field_section: impl IntoIterator<Item = FieldLine>,
@@ -340,7 +346,8 @@ where
     where
         EncodeStreamError: From<E>,
     {
-        let stream_id = stream.stream_id();
+        tokio::pin!(stream);
+        let stream_id = stream.stream_id().await?.into_inner();
         let mut fields = field_section.into_iter();
 
         let (field_section_prefix, field_line_representations, instructions);
@@ -412,7 +419,7 @@ where
         let instruction = {
             let mut decoder_stream = self.decoder_stream.lock().await;
             let instruction = decoder_stream.next().await;
-            instruction.ok_or(H3CriticalStreamClosed::QPackDecoderStream)??
+            instruction.ok_or(H3CriticalStreamClosed::QPackDecoder)??
         };
         let mut state = self.state.lock().await;
         match instruction {

@@ -9,7 +9,11 @@ use bytes::{Bytes, BytesMut};
 use futures::{Sink, Stream, StreamExt};
 use tokio::io::{self, AsyncWrite};
 
-use crate::quic::{CancelStream, GetStreamId, WriteStream};
+use crate::{
+    error::StreamError,
+    quic::{CancelStream, GetStreamId, WriteStream},
+    varint::VarInt,
+};
 
 // TODO: improve this
 enum SinkWriterBuffer {
@@ -184,14 +188,18 @@ where
 }
 
 impl<S: CancelStream + ?Sized> CancelStream for BufSinkWriter<S> {
-    fn cancel(self: Pin<&mut Self>, code: u64) {
-        self.project().stream.cancel(code)
+    fn poll_cancel(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
+        self.project().stream.poll_cancel(cx, code)
     }
 }
 
-impl<S: WriteStream + ?Sized> GetStreamId for BufSinkWriter<S> {
-    fn stream_id(&self) -> u64 {
-        self.stream.stream_id()
+impl<S: GetStreamId + ?Sized> GetStreamId for BufSinkWriter<S> {
+    fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>> {
+        self.project().stream.poll_stream_id(cx)
     }
 }
 

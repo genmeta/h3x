@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use futures::{Sink, stream};
+use futures::Sink;
 use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite};
 
 use crate::{
@@ -7,10 +7,12 @@ use crate::{
         error::{DecodeError, DecodeStreamError, EncodeStreamError},
         util::{DecodeFrom, EncodeInto},
     },
+    error::{Code, ErrorWithCode},
     qpack::{
         integer::{decode_integer, encode_integer},
         string::{decode_string, encode_string},
     },
+    varint::err,
 };
 
 ///
@@ -202,71 +204,80 @@ where
     S: AsyncBufRead,
 {
     async fn decode_from(stream: S) -> Result<Self, DecodeStreamError> {
-        tokio::pin!(stream);
-        let prefix = stream.read_u8().await?;
-        match prefix {
-            prefix if prefix & 0b1000_0000 == 0b1000_0000 => {
-                // Indexed Field Line
-                let is_static = (prefix & 0b0100_0000) != 0;
-                let index = decode_integer(stream, prefix, 6).await?;
-                Ok(FieldLineRepresentation::IndexedFieldLine { is_static, index })
-            }
-            prefix if prefix & 0b1111_0000 == 0b0001_0000 => {
-                // Indexed Field Line with Post-Base Index
-                let index = decode_integer(stream, prefix, 4).await?;
-                Ok(FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex { index })
-            }
-            prefix if prefix & 0b1100_0000 == 0b0100_0000 => {
-                // Literal Field Line with Name Reference
-                let no_dynamic = (prefix & 0b0010_0000) != 0;
-                let is_static = (prefix & 0b0001_0000) != 0;
-                let name_index = decode_integer(stream.as_mut(), prefix, 4).await?;
-                let value_prefix = stream.read_u8().await?;
-                let (huffman, value) = decode_string(stream.as_mut(), value_prefix, 1 + 7).await?;
-                Ok(FieldLineRepresentation::LiteralFieldLineWithNameReference {
-                    no_dynamic,
-                    is_static,
-                    name_index,
-                    huffman,
-                    value,
-                })
-            }
-            prefix if prefix & 0b1110_0000 == 0b0010_0000 => {
-                // Literal Field Line with Literal Name
-                let no_dynamic = (prefix & 0b0001_0000) != 0;
-                let name_prefix = prefix;
-                let (name_huffman, name) =
-                    decode_string(stream.as_mut(), name_prefix, 1 + 3).await?;
-                let value_prefix = stream.read_u8().await?;
-                let (value_huffman, value) =
-                    decode_string(stream.as_mut(), value_prefix, 1 + 7).await?;
-                Ok(FieldLineRepresentation::LiteralFieldLineWithLiteralName {
-                    no_dynamic,
-                    name_huffman,
-                    name,
-                    value_huffman,
-                    value,
-                })
-            }
-            prefix if prefix & 0b1111_0000 == 0b0000_0000 => {
-                // Literal Field Line with Post-Base Name Reference
-                let no_dynamic = (prefix & 0b0000_1000) != 0;
-                let name_index = decode_integer(stream.as_mut(), prefix, 3).await?;
-                let value_prefix = stream.read_u8().await?;
-                let (huffman, value) = decode_string(stream.as_mut(), value_prefix, 1 + 7).await?;
-                Ok(
-                    FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
+        let decode = async move {
+            tokio::pin!(stream);
+            let prefix = stream.read_u8().await?;
+            match prefix {
+                prefix if prefix & 0b1000_0000 == 0b1000_0000 => {
+                    // Indexed Field Line
+                    let is_static = (prefix & 0b0100_0000) != 0;
+                    let index = decode_integer(stream, prefix, 6).await?;
+                    Ok(FieldLineRepresentation::IndexedFieldLine { is_static, index })
+                }
+                prefix if prefix & 0b1111_0000 == 0b0001_0000 => {
+                    // Indexed Field Line with Post-Base Index
+                    let index = decode_integer(stream, prefix, 4).await?;
+                    Ok(FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex { index })
+                }
+                prefix if prefix & 0b1100_0000 == 0b0100_0000 => {
+                    // Literal Field Line with Name Reference
+                    let no_dynamic = (prefix & 0b0010_0000) != 0;
+                    let is_static = (prefix & 0b0001_0000) != 0;
+                    let name_index = decode_integer(stream.as_mut(), prefix, 4).await?;
+                    let value_prefix = stream.read_u8().await?;
+                    let (huffman, value) =
+                        decode_string(stream.as_mut(), value_prefix, 1 + 7).await?;
+                    Ok(FieldLineRepresentation::LiteralFieldLineWithNameReference {
                         no_dynamic,
+                        is_static,
                         name_index,
                         huffman,
                         value,
-                    },
-                )
+                    })
+                }
+                prefix if prefix & 0b1110_0000 == 0b0010_0000 => {
+                    // Literal Field Line with Literal Name
+                    let no_dynamic = (prefix & 0b0001_0000) != 0;
+                    let name_prefix = prefix;
+                    let (name_huffman, name) =
+                        decode_string(stream.as_mut(), name_prefix, 1 + 3).await?;
+                    let value_prefix = stream.read_u8().await?;
+                    let (value_huffman, value) =
+                        decode_string(stream.as_mut(), value_prefix, 1 + 7).await?;
+                    Ok(FieldLineRepresentation::LiteralFieldLineWithLiteralName {
+                        no_dynamic,
+                        name_huffman,
+                        name,
+                        value_huffman,
+                        value,
+                    })
+                }
+                prefix if prefix & 0b1111_0000 == 0b0000_0000 => {
+                    // Literal Field Line with Post-Base Name Reference
+                    let no_dynamic = (prefix & 0b0000_1000) != 0;
+                    let name_index = decode_integer(stream.as_mut(), prefix, 3).await?;
+                    let value_prefix = stream.read_u8().await?;
+                    let (huffman, value) =
+                        decode_string(stream.as_mut(), value_prefix, 1 + 7).await?;
+                    Ok(
+                        FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
+                            no_dynamic,
+                            name_index,
+                            huffman,
+                            value,
+                        },
+                    )
+                }
+                prefix => unreachable!(
+                    "unreachable branch(LiteralFieldLineWithPostBaseNameReference should match all other cases)(prefix={prefix:#010b})",
+                ),
             }
-            prefix => unreachable!(
-                "unreachable branch(LiteralFieldLineWithPostBaseNameReference should match all other cases)(prefix={prefix:#010b})",
-            ),
-        }
+        };
+        decode.await.map_err(|error: DecodeStreamError| {
+            error.map_decode_error(|decode_error| {
+                ErrorWithCode::new(Code::H3_MESSAGE_ERROR, Some(decode_error)).into()
+            })
+        })
     }
 }
 

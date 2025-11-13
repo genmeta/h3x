@@ -1,11 +1,11 @@
 use bytes::Bytes;
-use futures::{Stream, TryStreamExt, stream::Iter};
-use gm_quic::qbase::packet::header::Header;
+use futures::{Stream, TryStreamExt};
 use http::{
-    HeaderMap,
+    HeaderMap, Method, StatusCode, Uri,
     header::{self, HeaderName, HeaderValue},
-    request, response,
-    uri::Scheme,
+    request::{self, Request},
+    response::{self, Response},
+    uri::{Authority, PathAndQuery, Scheme},
 };
 use snafu::{Snafu, ensure};
 
@@ -67,14 +67,14 @@ impl PseudoHeaders {
                 authority,
                 path,
             } => match name {
-                b":method" => &method,
-                b":scheme" => &scheme,
-                b":authority" => &authority,
-                b":path" => &path,
+                b":method" => method,
+                b":scheme" => scheme,
+                b":authority" => authority,
+                b":path" => path,
                 _ => unreachable!(),
             },
             PseudoHeaders::Response { status } => match name {
-                b":status" => &status,
+                b":status" => status,
                 _ => unreachable!(),
             },
         }
@@ -110,18 +110,28 @@ pub enum InvalidHeaderSection {
     DuplicatePseudoHeader { name: Bytes },
     #[snafu(display("Field section contains both request and response pseudo-header fields"))]
     DualKindedPseudoHeader,
-    #[snafu(display("field section too large"))]
+    #[snafu(display("Request Pseudo-header field in response"))]
+    RequestPseudoHeaderInResponse,
+    #[snafu(display("Response Pseudo-header field in request"))]
+    ResponsePseudoHeaderInRequest,
+    #[snafu(display("Field section contains pseudo-header fields in tailers"))]
+    PseudoHeaderInTailers,
+    #[snafu(display("Field section too large"))]
     FieldSectionTooLarge,
     #[snafu(display("Invalid header name"))]
     InvalidHeaderName,
     #[snafu(display("Invalid header value"))]
     InvalidHeaderValue,
-    #[snafu(display("Incomplete request pseudo-headers"))]
-    IncompleteRequestPseudoHeaders,
+    #[snafu(display("Absence of mandatory pseudo-header fields"))]
+    AbsenceOfMandatoryPseudoHeaders,
+    #[snafu(transparent)]
+    InvalidMessage { source: http::Error },
 }
 
 impl HasErrorCode for InvalidHeaderSection {
-    const CODE: Code = Code::QPACK_DECOMPRESSION_FAILED;
+    fn code(&self) -> Code {
+        Code::H3_MESSAGE_ERROR
+    }
 }
 
 impl From<header::MaxSizeReached> for InvalidHeaderSection {
@@ -144,8 +154,39 @@ impl From<header::InvalidHeaderValue> for InvalidHeaderSection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldSection {
-    pub pseudo_headers: PseudoHeaders,
-    pub header_map: HeaderMap,
+    pseudo_headers: PseudoHeaders,
+    header_map: HeaderMap,
+}
+
+impl FieldSection {
+    pub fn try_into_trailers(self) -> Result<HeaderMap, InvalidHeaderSection> {
+        match self.pseudo_headers {
+            PseudoHeaders::Request {
+                method,
+                scheme,
+                authority,
+                path,
+            } => {
+                ensure!(
+                    method.is_none() && scheme.is_none() && authority.is_none() && path.is_none(),
+                    PseudoHeaderInTailersSnafu
+                );
+            }
+            PseudoHeaders::Response { status } => {
+                ensure!(status.is_none(), PseudoHeaderInTailersSnafu);
+            }
+        }
+        Ok(self.header_map)
+    }
+}
+
+impl From<HeaderMap> for FieldSection {
+    fn from(header_map: HeaderMap) -> Self {
+        Self {
+            pseudo_headers: PseudoHeaders::empty_request(),
+            header_map,
+        }
+    }
 }
 
 fn is_request_pseudo_header(name: &[u8]) -> bool {
@@ -166,7 +207,9 @@ where
 
         let mut pseudo_header = None;
         let mut header_map = HeaderMap::new();
-        while let Some(FieldLine { name, value }) = stream.try_next().await? {
+        while let Some(FieldLine { name, value }) = stream.try_next().await.map_err(|error| {
+            DecodeStreamError::from(error).map_incomplete(|| Code::H3_FRAME_ERROR.into())
+        })? {
             match name.as_ref() {
                 pseudo if pseudo.starts_with(b":") && is_request_pseudo_header(&name) => {
                     ensure!(
@@ -221,7 +264,7 @@ where
 
         Ok(Self {
             pseudo_headers: pseudo_header
-                .ok_or(InvalidHeaderSection::IncompleteRequestPseudoHeaders)?,
+                .ok_or(InvalidHeaderSection::AbsenceOfMandatoryPseudoHeaders)?,
             header_map,
         })
     }
@@ -265,6 +308,43 @@ impl TryFrom<request::Parts> for FieldSection {
     }
 }
 
+impl TryFrom<FieldSection> for request::Parts {
+    type Error = InvalidHeaderSection;
+
+    fn try_from(value: FieldSection) -> Result<Self, Self::Error> {
+        let PseudoHeaders::Request {
+            method,
+            scheme,
+            authority,
+            path,
+        } = value.pseudo_headers
+        else {
+            return Err(InvalidHeaderSection::ResponsePseudoHeaderInRequest);
+        };
+
+        let mut uri = Uri::builder();
+        if let Some(scheme) = scheme {
+            uri = uri.scheme(Scheme::try_from(scheme.as_bytes()).map_err(http::Error::from)?);
+        }
+        if let Some(authority) = authority {
+            uri = uri.authority(Authority::from_maybe_shared(authority).map_err(http::Error::from)?)
+        }
+        if let Some(path) = path {
+            uri = uri
+                .path_and_query(PathAndQuery::from_maybe_shared(path).map_err(http::Error::from)?);
+        }
+        let uri = uri.build()?;
+        let method = method.ok_or(InvalidHeaderSection::AbsenceOfMandatoryPseudoHeaders)?;
+
+        let request = Request::builder()
+            .uri(uri)
+            .method(Method::from_bytes(method.as_bytes()).map_err(http::Error::from)?)
+            .body(())?;
+
+        Ok(request.into_parts().0)
+    }
+}
+
 impl TryFrom<response::Parts> for FieldSection {
     type Error = InvalidHeaderSection;
 
@@ -275,6 +355,22 @@ impl TryFrom<response::Parts> for FieldSection {
             },
             header_map: response.headers,
         })
+    }
+}
+
+impl TryFrom<FieldSection> for response::Parts {
+    type Error = InvalidHeaderSection;
+
+    fn try_from(value: FieldSection) -> Result<Self, Self::Error> {
+        let PseudoHeaders::Response { status } = value.pseudo_headers else {
+            return Err(InvalidHeaderSection::RequestPseudoHeaderInResponse);
+        };
+
+        let status = status.ok_or(InvalidHeaderSection::AbsenceOfMandatoryPseudoHeaders)?;
+        let status = StatusCode::from_bytes(status.as_bytes()).map_err(http::Error::from)?;
+
+        let response = Response::builder().status(status).body(())?;
+        Ok(response.into_parts().0)
     }
 }
 

@@ -1,11 +1,8 @@
 use bytes::Bytes;
-use futures::{Sink, SinkExt, Stream, StreamExt, stream};
+use futures::{Sink, SinkExt, Stream, stream};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
-use crate::{
-    codec::error::{DecodeStreamError, EncodeStreamError},
-    qpack::strategy::Encode,
-};
+use crate::codec::error::{DecodeStreamError, EncodeStreamError};
 
 pub(crate) trait DecodeFrom<S>: Sized {
     async fn decode_from(stream: S) -> Result<Self, DecodeStreamError>;

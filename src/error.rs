@@ -1,10 +1,10 @@
-use std::{borrow::Cow, error::Error, io};
+use std::{borrow::Cow, error::Error, io, sync::Arc};
 
 use snafu::Snafu;
 
-use crate::varint::VarInt;
+use crate::{stream::UnidirectionalStream, varint::VarInt};
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
 pub enum StreamError {
     #[snafu(transparent)]
@@ -12,55 +12,89 @@ pub enum StreamError {
         source: ConnectionError,
     },
     Reset {
-        code: u64,
+        code: VarInt,
     },
-    #[snafu(transparent)]
-    Unknown {
-        source: Box<dyn Error + Send + Sync>,
-    },
+}
+
+impl StreamError {
+    /// Returns `true` if the stream error is [`Reset`].
+    ///
+    /// [`Reset`]: StreamError::Reset
+    #[must_use]
+    pub fn is_reset(&self) -> bool {
+        matches!(self, Self::Reset { .. })
+    }
 }
 
 impl From<StreamError> for io::Error {
     fn from(value: StreamError) -> Self {
         match value {
-            e @ (StreamError::Connection { .. } | StreamError::Reset { .. }) => {
-                io::Error::new(io::ErrorKind::BrokenPipe, e)
-            }
-            StreamError::Unknown { source } => io::Error::other(source),
+            error @ StreamError::Reset { .. } => io::Error::new(io::ErrorKind::BrokenPipe, error),
+            StreamError::Connection { source } => io::Error::from(source),
         }
     }
 }
 
 impl From<io::Error> for StreamError {
     fn from(value: io::Error) -> Self {
-        match value.downcast::<Self>() {
-            Ok(error) => error,
-            Err(error) => StreamError::Unknown {
-                source: Box::new(error),
-            },
-        }
+        value
+            .downcast::<Self>()
+            .expect("io::Error is not StreamError")
     }
 }
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, Snafu, Clone)]
+#[snafu(visibility(pub))]
+pub struct TransportError {
+    pub kind: VarInt,
+    pub frame_type: VarInt,
+    pub reason: Cow<'static, str>,
+}
+
+#[derive(Debug, Snafu, Clone)]
+#[snafu(visibility(pub))]
+pub struct ApplicationError {
+    pub code: Code,
+    pub reason: Cow<'static, str>,
+}
+
+#[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
 pub enum ConnectionError {
-    Transport {
-        code: Code,
-        reason: Cow<'static, str>,
-    },
-    Application {
-        code: Code,
-        reason: Cow<'static, str>,
-    },
+    #[snafu(transparent)]
+    Transport { source: TransportError },
+    #[snafu(transparent)]
+    Application { source: ApplicationError },
+}
+
+impl From<ConnectionError> for io::Error {
+    fn from(value: ConnectionError) -> Self {
+        io::Error::new(io::ErrorKind::BrokenPipe, value)
+    }
+}
+
+impl ConnectionError {
+    pub const fn is_transport(&self) -> bool {
+        matches!(self, ConnectionError::Transport { .. })
+    }
+
+    pub const fn is_application(&self) -> bool {
+        matches!(self, ConnectionError::Application { .. })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Code(VarInt);
 
+impl Code {
+    pub const fn into_inner(self) -> VarInt {
+        self.0
+    }
+}
+
 impl std::fmt::Display for Code {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        write!(f, "Code {}", self.0)
     }
 }
 
@@ -69,6 +103,15 @@ impl std::error::Error for Code {}
 impl From<Code> for io::Error {
     fn from(value: Code) -> Self {
         io::Error::other(value)
+    }
+}
+
+impl From<Code> for ApplicationError {
+    fn from(value: Code) -> Self {
+        ApplicationError {
+            code: value,
+            reason: Cow::Borrowed(""),
+        }
     }
 }
 
@@ -103,6 +146,18 @@ impl Code {
     /// The client's stream terminated without containing a fully formed request.
     pub const H3_REQUEST_INCOMPLETE: Self = Self(VarInt::from_u32(0x010d));
     /// An HTTP message was malformed and cannot be processed.
+    ///
+    /// A malformed request or response is one that is an otherwise valid sequence of frames but is invalid due to:
+    ///
+    /// - the presence of prohibited fields or pseudo-header fields,
+    /// - the absence of mandatory pseudo-header fields,
+    /// - invalid values for pseudo-header fields,
+    /// - pseudo-header fields after fields,
+    /// - an invalid sequence of HTTP messages,
+    /// - the inclusion of uppercase field names, or
+    /// - the inclusion of invalid characters in field names or values.
+    ///
+    /// https://datatracker.ietf.org/doc/html/rfc9114#name-malformed-requests-and-resp
     pub const H3_MESSAGE_ERROR: Self = Self(VarInt::from_u32(0x010e));
     /// The TCP connection established in response to a CONNECT request was reset or abnormally closed.
     pub const H3_CONNECT_ERROR: Self = Self(VarInt::from_u32(0x010f));
@@ -129,30 +184,48 @@ impl Code {
 #[derive(Debug, Snafu)]
 pub enum H3CriticalStreamClosed {
     #[snafu(display("QPack encoder stream closed unexpectedly"))]
-    QPackEncoderStream,
+    QPackEncoder,
     #[snafu(display("QPack decoder stream closed unexpectedly"))]
-    QPackDecoderStream,
+    QPackDecoder,
+    #[snafu(display("Control stream closed unexpectedly"))]
+    Control,
 }
 
 impl HasErrorCode for H3CriticalStreamClosed {
-    const CODE: Code = Code::H3_CLOSED_CRITICAL_STREAM;
+    fn code(&self) -> Code {
+        Code::H3_CLOSED_CRITICAL_STREAM
+    }
 }
 
-pub(crate) trait HasErrorCode {
-    const CODE: Code;
+#[derive(Debug, Snafu, Clone, Copy)]
+pub enum H3FrameUnexpected {
+    #[snafu(display("Received subsequent SETTINGS frame"))]
+    DuplicateSettings,
 }
 
-#[derive(Debug)]
+impl HasErrorCode for H3FrameUnexpected {
+    fn code(&self) -> Code {
+        Code::H3_FRAME_UNEXPECTED
+    }
+}
+
+pub trait HasErrorCode {
+    fn code(&self) -> Code {
+        Code::H3_CLOSED_CRITICAL_STREAM
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ErrorWithCode {
     pub code: Code,
-    pub source: Option<Box<dyn Error + Send + Sync>>,
+    pub source: Option<Arc<dyn Error + Send + Sync>>,
 }
 
 impl ErrorWithCode {
     pub fn new(code: Code, source: Option<impl Error + Send + Sync + 'static>) -> Self {
         Self {
             code,
-            source: source.map(|s| Box::new(s) as Box<dyn Error + Send + Sync>),
+            source: source.map(|s| Arc::new(s) as Arc<dyn Error + Send + Sync>),
         }
     }
 }
@@ -167,14 +240,32 @@ impl From<Code> for ErrorWithCode {
 }
 
 impl<E: HasErrorCode + Error + Send + Sync + 'static> From<E> for ErrorWithCode {
-    fn from(value: E) -> Self {
-        Self::new(E::CODE, Some(value))
+    fn from(error: E) -> Self {
+        Self::new(error.code(), Some(error))
     }
 }
 
 impl From<ErrorWithCode> for io::Error {
     fn from(value: ErrorWithCode) -> Self {
         io::Error::other(value)
+    }
+}
+
+impl From<&ErrorWithCode> for ApplicationError {
+    fn from(value: &ErrorWithCode) -> Self {
+        ApplicationError {
+            code: value.code,
+            reason: match &value.source {
+                Some(source) => Cow::Owned(source.to_string()),
+                None => Cow::Borrowed(""),
+            },
+        }
+    }
+}
+
+impl From<ErrorWithCode> for ApplicationError {
+    fn from(value: ErrorWithCode) -> Self {
+        ApplicationError::from(&value)
     }
 }
 
@@ -190,5 +281,38 @@ impl std::error::Error for ErrorWithCode {
         self.source
             .as_ref()
             .map(|source| &**source as &(dyn Error + 'static))
+    }
+}
+
+pub trait ResultExt<Ok, Err> {
+    fn with_code<C>(self, code: C) -> Result<Ok, ErrorWithCode>
+    where
+        C: Into<Code>;
+}
+
+pub trait OptionExt<T> {
+    fn ok_or_code<C>(self, code: C) -> Result<T, ErrorWithCode>
+    where
+        C: Into<Code>;
+}
+
+impl<Ok, Err> ResultExt<Ok, Err> for Result<Ok, Err>
+where
+    Err: Error + Send + Sync + 'static,
+{
+    fn with_code<C>(self, code: C) -> Result<Ok, ErrorWithCode>
+    where
+        C: Into<Code>,
+    {
+        self.map_err(|e| ErrorWithCode::new(code.into(), Some(e)))
+    }
+}
+
+impl<T> OptionExt<T> for Option<T> {
+    fn ok_or_code<C>(self, code: C) -> Result<T, ErrorWithCode>
+    where
+        C: Into<Code>,
+    {
+        self.ok_or_else(|| ErrorWithCode::from(code.into()))
     }
 }

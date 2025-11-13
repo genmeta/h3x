@@ -1,9 +1,22 @@
-use std::{ops::Deref, pin::Pin};
+mod gm_quic;
+
+use std::{
+    borrow::Cow,
+    ops::DerefMut,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use bytes::Bytes;
-use futures::{Sink, Stream, future::BoxFuture};
+use futures::{
+    Sink, Stream,
+    future::{BoxFuture, poll_fn},
+};
 
-use crate::error::{ConnectionError, StreamError};
+use crate::{
+    error::{Code, ConnectionError, StreamError},
+    varint::VarInt,
+};
 
 pub trait QuicConnect {
     type StreamWriter: WriteStream;
@@ -24,41 +37,96 @@ pub trait QuicConnect {
     fn accept_uni(
         self: Pin<&mut Self>,
     ) -> BoxFuture<'static, Result<Self::StreamReader, ConnectionError>>;
+
+    fn close(self: Pin<&mut Self>, code: Code, reason: Cow<'static, str>);
 }
 
 pub trait GetStreamId {
-    fn stream_id(&self) -> u64;
-}
-
-impl<S: ?Sized> GetStreamId for &S
-where
-    S: GetStreamId,
-{
-    fn stream_id(&self) -> u64 {
-        S::stream_id(self)
-    }
-}
-
-impl<S: ?Sized> GetStreamId for &mut S
-where
-    S: GetStreamId,
-{
-    fn stream_id(&self) -> u64 {
-        S::stream_id(self)
-    }
+    fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>>;
 }
 
 impl<P> GetStreamId for Pin<P>
 where
-    P: Deref<Target: GetStreamId>,
+    P: DerefMut<Target: GetStreamId>,
 {
-    fn stream_id(&self) -> u64 {
-        <P::Target>::stream_id(self.deref())
+    fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>> {
+        <P::Target as GetStreamId>::poll_stream_id(self.as_deref_mut(), cx)
+    }
+}
+
+impl<S> GetStreamId for &mut S
+where
+    S: GetStreamId + Unpin + ?Sized,
+{
+    fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>> {
+        S::poll_stream_id(Pin::new(self.get_mut()), cx)
+    }
+}
+
+pub trait GetStreamIdExt {
+    async fn stream_id(&mut self) -> Result<VarInt, StreamError>
+    where
+        Self: Unpin;
+}
+
+impl<T: GetStreamId + ?Sized> GetStreamIdExt for T {
+    async fn stream_id(&mut self) -> Result<VarInt, StreamError>
+    where
+        Self: Unpin,
+    {
+        let mut pin = Pin::new(self);
+        poll_fn(|cx| pin.as_mut().poll_stream_id(cx)).await
     }
 }
 
 pub trait StopSending {
-    fn stop_sending(self: Pin<&mut Self>, code: u64);
+    fn poll_stop_sending(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>>;
+}
+
+impl<P> StopSending for Pin<P>
+where
+    P: DerefMut<Target: StopSending>,
+{
+    fn poll_stop_sending(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
+        <P::Target as StopSending>::poll_stop_sending(self.as_deref_mut(), cx, code)
+    }
+}
+
+impl<S> StopSending for &mut S
+where
+    S: StopSending + Unpin + ?Sized,
+{
+    fn poll_stop_sending(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
+        S::poll_stop_sending(Pin::new(self.get_mut()), cx, code)
+    }
+}
+
+pub trait StopSendingExt {
+    async fn stop_sending(&mut self, code: VarInt) -> Result<(), StreamError>
+    where
+        Self: Unpin;
+}
+
+impl<T: StopSending + ?Sized> StopSendingExt for T {
+    async fn stop_sending(&mut self, code: VarInt) -> Result<(), StreamError>
+    where
+        Self: Unpin,
+    {
+        let mut pin = Pin::new(self);
+        poll_fn(|cx| pin.as_mut().poll_stop_sending(cx, code)).await
+    }
 }
 
 pub trait ReadStream:
@@ -72,7 +140,53 @@ impl<S: StopSending + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + 
 }
 
 pub trait CancelStream {
-    fn cancel(self: Pin<&mut Self>, code: u64);
+    fn poll_cancel(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>>;
+}
+
+impl<S> CancelStream for &mut S
+where
+    S: CancelStream + Unpin + ?Sized,
+{
+    fn poll_cancel(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
+        S::poll_cancel(Pin::new(self.get_mut()), cx, code)
+    }
+}
+
+impl<P> CancelStream for Pin<P>
+where
+    P: DerefMut<Target: CancelStream>,
+{
+    fn poll_cancel(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
+        <P::Target as CancelStream>::poll_cancel(self.as_deref_mut(), cx, code)
+    }
+}
+
+pub trait CancelStreamExt {
+    async fn cancel(&mut self, code: VarInt) -> Result<(), StreamError>
+    where
+        Self: Unpin;
+}
+
+impl<T: CancelStream + ?Sized> CancelStreamExt for T {
+    async fn cancel(&mut self, code: VarInt) -> Result<(), StreamError>
+    where
+        Self: Unpin,
+    {
+        let mut pin = Pin::new(self);
+        poll_fn(|cx| pin.as_mut().poll_cancel(cx, code)).await
+    }
 }
 
 pub trait WriteStream: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> {}
@@ -83,6 +197,7 @@ impl<S: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + ?Sized> 
 pub mod test {
     use std::{
         pin::Pin,
+        sync::Arc,
         task::{Context, Poll, ready},
     };
 
@@ -93,21 +208,14 @@ pub mod test {
     use crate::{
         error::StreamError,
         quic::{CancelStream, GetStreamId, StopSending},
+        varint::VarInt,
     };
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum SenderResetState {
-        None,
-        ResetPending(u64),
-        ResetSent(u64),
-    }
 
     pin_project_lite::pin_project! {
         pub struct MockStreamWriter<S: ?Sized> {
-            stream_id: u64,
-            reset: SenderResetState,
+            stream_id: VarInt,
             #[pin]
-            stop_sending: oneshot::Receiver<u64>,
+            stop_sending: oneshot::Receiver<VarInt>,
             #[pin]
             stream: S,
         }
@@ -121,21 +229,37 @@ pub mod test {
 
     pub enum Packet {
         Stream(Bytes),
-        Reset(u64),
+        Reset(VarInt),
     }
 
     impl<S: ?Sized> GetStreamId for MockStreamWriter<S> {
-        fn stream_id(&self) -> u64 {
-            self.stream_id
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, StreamError>> {
+            Ok(self.stream_id).into()
         }
     }
 
-    impl<S: ?Sized> CancelStream for MockStreamWriter<S> {
-        fn cancel(self: Pin<&mut Self>, code: u64) {
-            let project = self.project();
-            if matches!(project.reset, SenderResetState::None) {
-                *project.reset = SenderResetState::ResetPending(code);
-            }
+    impl<S: Sink<Packet> + ?Sized> CancelStream for MockStreamWriter<S>
+    where
+        StreamError: From<S::Error>,
+    {
+        // fn poll_cancel(self: Pin<&mut Self>, code: VarInt) {
+        //     let project = self.project();
+        //     if matches!(project.reset, SenderResetState::None) {
+        //         *project.reset = SenderResetState::ResetPending(code);
+        //     }
+        // }
+        fn poll_cancel(
+            self: Pin<&mut Self>,
+            cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), StreamError>> {
+            let mut project = self.project();
+            ready!(project.stream.as_mut().poll_ready(cx)?);
+            project.stream.as_mut().start_send(Packet::Reset(code))?;
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -146,98 +270,34 @@ pub mod test {
         type Error = StreamError;
 
         fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            let mut project = self.project();
-            loop {
-                match *project.reset {
-                    SenderResetState::ResetPending(code) => {
-                        ready!(project.stream.as_mut().poll_ready(cx)?);
-                        project.stream.as_mut().start_send(Packet::Reset(code))?;
-                        *project.reset = SenderResetState::ResetSent(code);
-                        return Poll::Ready(Ok(()));
-                    }
-                    SenderResetState::ResetSent(code) => {
-                        return Poll::Ready(Err(StreamError::Reset { code }));
-                    }
-                    _ => {}
-                }
-                if let SenderResetState::None = *project.reset
-                    && let Poll::Ready(Ok(code)) = project.stop_sending.as_mut().poll(cx)
-                {
-                    *project.reset = SenderResetState::ResetPending(code);
-                    continue;
-                }
-
-                ready!(project.stream.as_mut().poll_ready(cx)?);
-                return Poll::Ready(Ok(()));
-            }
+            self.project().stream.poll_ready(cx).map_err(From::from)
         }
 
         fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-            let project = self.project();
-            match *project.reset {
-                SenderResetState::ResetPending(_) => panic!(),
-                SenderResetState::ResetSent(_) => Err(StreamError::Reset { code: 0 }),
-                SenderResetState::None => project
-                    .stream
-                    .start_send(Packet::Stream(item))
-                    .map_err(From::from),
-            }
+            self.project()
+                .stream
+                .start_send(Packet::Stream(item))
+                .map_err(From::from)
         }
 
         fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            let mut project = self.project();
-            loop {
-                match *project.reset {
-                    SenderResetState::ResetPending(code) => {
-                        ready!(project.stream.as_mut().poll_ready(cx)?);
-                        project.stream.as_mut().start_send(Packet::Reset(code))?;
-                        *project.reset = SenderResetState::ResetSent(code);
-                    }
-                    SenderResetState::None => {
-                        if let Poll::Ready(Ok(code)) = project.stop_sending.as_mut().poll(cx) {
-                            *project.reset = SenderResetState::ResetPending(code);
-                            continue;
-                        }
-                    }
-                    SenderResetState::ResetSent(_) => todo!(),
-                }
-                ready!(project.stream.as_mut().poll_flush(cx)?);
-                return Poll::Ready(Ok(()));
-            }
+            self.project().stream.poll_flush(cx).map_err(From::from)
         }
 
         fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            let mut project = self.project();
-            loop {
-                match *project.reset {
-                    SenderResetState::ResetPending(code) => {
-                        ready!(project.stream.as_mut().poll_ready(cx)?);
-                        project.stream.as_mut().start_send(Packet::Reset(code))?;
-                        *project.reset = SenderResetState::ResetSent(code);
-                    }
-                    SenderResetState::None => {
-                        if let Poll::Ready(Ok(code)) = project.stop_sending.as_mut().poll(cx) {
-                            *project.reset = SenderResetState::ResetPending(code);
-                            continue;
-                        }
-                    }
-                    SenderResetState::ResetSent(_) => todo!(),
-                }
-                ready!(project.stream.as_mut().poll_close(cx)?);
-                return Poll::Ready(Ok(()));
-            }
+            self.project().stream.poll_close(cx).map_err(From::from)
         }
     }
 
     enum ReceiverResetState {
         None,
-        ResetReceived(u64),
+        ResetReceived(VarInt),
     }
 
     pin_project_lite::pin_project! {
         pub struct MockStreamReader<S: ?Sized> {
-            stream_id: u64,
-            stop_sending_tx: Option<oneshot::Sender<u64>>,
+            stream_id: VarInt,
+            stop_sending_tx: Option<oneshot::Sender<VarInt>>,
             reset: ReceiverResetState,
             #[pin]
             stream: S,
@@ -251,16 +311,25 @@ pub mod test {
     }
 
     impl<S: ?Sized> GetStreamId for MockStreamReader<S> {
-        fn stream_id(&self) -> u64 {
-            self.stream_id
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
         }
     }
 
     impl<S: ?Sized> StopSending for MockStreamReader<S> {
-        fn stop_sending(self: Pin<&mut Self>, code: u64) {
-            if let Some(tx) = self.project().stop_sending_tx.take() {
+        fn poll_stop_sending(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), StreamError>> {
+            let project = self.project();
+            if let Some(tx) = project.stop_sending_tx.take() {
                 let _ = tx.send(code);
             }
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -285,7 +354,7 @@ pub mod test {
     }
 
     pub fn mock_stream_pair(
-        stream_id: u64,
+        stream_id: VarInt,
     ) -> (
         MockStreamReader<impl Stream<Item = Result<Packet, StreamError>>>,
         MockStreamWriter<impl Sink<Packet, Error = StreamError>>,
@@ -295,10 +364,9 @@ pub mod test {
 
         let writer = MockStreamWriter {
             stream_id,
-            reset: SenderResetState::None,
             stop_sending: stop_sending_rx,
-            stream: packet_tx.sink_map_err(|error| StreamError::Unknown {
-                source: Box::new(error),
+            stream: packet_tx.sink_map_err(|_| StreamError::Reset {
+                code: VarInt::from_u32(0),
             }),
         };
 
@@ -314,7 +382,7 @@ pub mod test {
 
     #[tokio::test]
     async fn pair() {
-        let (mut reader, mut writer) = mock_stream_pair(42);
+        let (mut reader, mut writer) = mock_stream_pair(VarInt::from_u32(37));
 
         let file = include_bytes!("./quic.rs");
         let send = async {

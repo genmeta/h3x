@@ -10,7 +10,9 @@ use tokio::io::{self, AsyncBufRead, AsyncRead, ReadBuf};
 
 use crate::{
     codec::error::{DecodeError, DecodeStreamError},
+    error::StreamError,
     quic::{GetStreamId, StopSending},
+    varint::VarInt,
 };
 
 pin_project_lite::pin_project! {
@@ -120,23 +122,27 @@ where
     }
 }
 
-impl<S: GetStreamId> GetStreamId for BufStreamReader<S> {
-    fn stream_id(&self) -> u64 {
-        self.stream.stream_id()
+impl<S: GetStreamId + ?Sized> GetStreamId for BufStreamReader<S> {
+    fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>> {
+        self.project().stream.poll_stream_id(cx)
     }
 }
 
-impl<S: StopSending> StopSending for BufStreamReader<S> {
-    fn stop_sending(self: Pin<&mut Self>, code: u64) {
-        self.project().stream.stop_sending(code);
+impl<S: StopSending + ?Sized> StopSending for BufStreamReader<S> {
+    fn poll_stop_sending(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
+        self.project().stream.poll_stop_sending(cx, code)
     }
 }
 
 pin_project_lite::pin_project! {
-    pub struct FixedLengthReader<P: ?Sized> {
+    pub struct FixedLengthReader<S: ?Sized> {
         remaining: u64,
         #[pin]
-        stream: P,
+        stream: S,
     }
 }
 
@@ -242,13 +248,17 @@ where
 }
 
 impl<S: GetStreamId + ?Sized> GetStreamId for FixedLengthReader<S> {
-    fn stream_id(&self) -> u64 {
-        self.stream.stream_id()
+    fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>> {
+        self.project().stream.poll_stream_id(cx)
     }
 }
 
 impl<S: StopSending + ?Sized> StopSending for FixedLengthReader<S> {
-    fn stop_sending(self: Pin<&mut Self>, code: u64) {
-        self.project().stream.stop_sending(code);
+    fn poll_stop_sending(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
+        self.project().stream.poll_stop_sending(cx, code)
     }
 }
