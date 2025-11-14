@@ -59,7 +59,7 @@ impl PseudoHeaders {
         PseudoHeaders::Response { status: None }
     }
 
-    fn get<'s>(&'s self, name: &[u8]) -> &'s Option<HeaderValue> {
+    pub fn get<'s>(&'s self, name: &[u8]) -> &'s Option<HeaderValue> {
         match self {
             PseudoHeaders::Request {
                 method,
@@ -80,7 +80,7 @@ impl PseudoHeaders {
         }
     }
 
-    fn get_mut<'s>(&'s mut self, name: &[u8]) -> &'s mut Option<HeaderValue> {
+    pub fn get_mut<'s>(&'s mut self, name: &[u8]) -> &'s mut Option<HeaderValue> {
         match self {
             PseudoHeaders::Request {
                 method,

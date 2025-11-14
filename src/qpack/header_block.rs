@@ -12,7 +12,6 @@ use crate::{
         integer::{decode_integer, encode_integer},
         string::{decode_string, encode_string},
     },
-    varint::err,
 };
 
 ///

@@ -141,10 +141,16 @@ mod tests {
         let request = tokio::spawn(async move {
             let mut request_stream = BufSinkWriter::new(request_stream);
 
-            encoder
+            let header_frame = encoder
                 .encode(field_section, &encode_strategy, &mut request_stream)
                 .await
                 .unwrap();
+            tokio::try_join!(
+                header_frame.encode_into(&mut request_stream),
+                encoder.flush_instructions()
+            )
+            .unwrap();
+
             println!("Header frame sent");
 
             let frame_payload = [Bytes::from_static(body.as_bytes())];

@@ -2,7 +2,7 @@ use std::{borrow::Cow, error::Error, io, sync::Arc};
 
 use snafu::Snafu;
 
-use crate::{stream::UnidirectionalStream, varint::VarInt};
+use crate::varint::VarInt;
 
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
@@ -281,38 +281,5 @@ impl std::error::Error for ErrorWithCode {
         self.source
             .as_ref()
             .map(|source| &**source as &(dyn Error + 'static))
-    }
-}
-
-pub trait ResultExt<Ok, Err> {
-    fn with_code<C>(self, code: C) -> Result<Ok, ErrorWithCode>
-    where
-        C: Into<Code>;
-}
-
-pub trait OptionExt<T> {
-    fn ok_or_code<C>(self, code: C) -> Result<T, ErrorWithCode>
-    where
-        C: Into<Code>;
-}
-
-impl<Ok, Err> ResultExt<Ok, Err> for Result<Ok, Err>
-where
-    Err: Error + Send + Sync + 'static,
-{
-    fn with_code<C>(self, code: C) -> Result<Ok, ErrorWithCode>
-    where
-        C: Into<Code>,
-    {
-        self.map_err(|e| ErrorWithCode::new(code.into(), Some(e)))
-    }
-}
-
-impl<T> OptionExt<T> for Option<T> {
-    fn ok_or_code<C>(self, code: C) -> Result<T, ErrorWithCode>
-    where
-        C: Into<Code>,
-    {
-        self.ok_or_else(|| ErrorWithCode::from(code.into()))
     }
 }

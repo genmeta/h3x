@@ -11,7 +11,7 @@ use tokio::io::{self, AsyncWrite};
 
 use crate::{
     error::StreamError,
-    quic::{CancelStream, GetStreamId, WriteStream},
+    quic::{CancelStream, GetStreamId},
     varint::VarInt,
 };
 

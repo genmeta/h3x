@@ -7,7 +7,7 @@ use std::{
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt, stream};
 use snafu::Snafu;
-use tokio::{io::AsyncWrite, sync::Mutex as AsyncMutex};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     codec::{
@@ -337,21 +337,17 @@ where
         self.state.lock().await.settings = settings;
     }
 
-    pub async fn encode<E>(
+    pub async fn encode(
         &self,
         field_section: impl IntoIterator<Item = FieldLine>,
         strategy: &(impl Encode + ?Sized),
-        stream: impl AsyncWrite + Sink<Bytes, Error = E> + GetStreamId,
-    ) -> Result<(), EncodeStreamError>
-    where
-        EncodeStreamError: From<E>,
-    {
+        stream: impl GetStreamId,
+    ) -> Result<Frame<Vec<Bytes>>, EncodeStreamError> {
         tokio::pin!(stream);
         let stream_id = stream.stream_id().await?.into_inner();
         let mut fields = field_section.into_iter();
 
         let (field_section_prefix, field_line_representations, instructions);
-
         {
             let mut state = self.state.lock().await;
 
@@ -370,30 +366,21 @@ where
                 .push_back(max_referenced_index);
         };
 
-        let emit_field_section = async {
-            let mut header_frame = Frame::new::<Bytes>(Frame::HEADERS_FRAME_TYPE, vec![]).unwrap();
+        let mut header_frame = Frame::new::<Bytes>(Frame::HEADERS_FRAME_TYPE, vec![]).unwrap();
+        {
+            let mut frame_writer = BufSinkWriter::new(&mut header_frame);
+            // encode EncodedFieldSectionPrefix
+            field_section_prefix.encode_into(&mut frame_writer).await?;
+            // encode FieldLineRepresentations
+            let mut representations = stream::iter(field_line_representations.into_iter().map(Ok));
+            pin!(encoder(&mut frame_writer))
+                .send_all(&mut representations)
+                .await?;
+            // make sure all data are written
+            frame_writer.flush().await?;
+        }
 
-            {
-                let mut frame_writer = BufSinkWriter::new(&mut header_frame);
-                // encode EncodedFieldSectionPrefix
-                field_section_prefix.encode_into(&mut frame_writer).await?;
-                // encode FieldLineRepresentations
-                let mut representations =
-                    stream::iter(field_line_representations.into_iter().map(Ok));
-                pin!(encoder(&mut frame_writer))
-                    .send_all(&mut representations)
-                    .await?;
-                // make sure all data are written
-                frame_writer.flush().await?;
-            }
-
-            header_frame.encode_into(stream).await?;
-
-            Ok::<(), EncodeStreamError>(())
-        };
-
-        tokio::try_join!(emit_field_section, self.flush_instructions())?;
-        Ok(())
+        Ok(header_frame)
     }
 
     fn pending_instructions(&self) -> impl Stream<Item = EncoderInstruction> + '_ {

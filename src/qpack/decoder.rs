@@ -334,17 +334,9 @@ where
     ) -> Result<FieldSection, DecodeStreamError> {
         tokio::pin!(stream);
         let stream_id = stream.stream_id().await?.into_inner();
-        tracing::info!("Decoding QPACK header block from stream {}", stream_id);
         let prefix = EncodedFieldSectionPrefix::decode_from(stream.as_mut()).await?;
-        tracing::info!(
-            "Decoded QPACK header block prefix from stream {}: required_insert_count={}, base={}",
-            stream_id,
-            prefix.required_insert_count,
-            prefix.base
-        );
         self.receive_instruction_until(prefix.required_insert_count)
             .await?;
-        tracing::info!("Decoding header section");
 
         let header_section = FieldSection::decode_from(decoder(stream).map(|representation| {
             representation.and_then(|representation| {
@@ -358,7 +350,6 @@ where
         }))
         .await?;
 
-        tracing::info!("Acknowledge sectioning {{ stream_id: {stream_id} }}",);
         self.emit(DecoderInstruction::SectionAcknowledgment { stream_id });
         _ = self.flush_instructions().await;
 

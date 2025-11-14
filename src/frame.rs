@@ -13,7 +13,7 @@ use crate::{
         error::{DecodeStreamError, EncodeError, EncodeStreamError},
         util::{DecodeFrom, EncodeInto},
     },
-    error::StreamError,
+    error::{Code, ErrorWithCode, StreamError},
     quic::{GetStreamId, StopSending},
     varint::{self, VARINT_MAX, VarInt},
 };
@@ -233,30 +233,58 @@ where
     DecodeStreamError: From<S::Error>,
 {
     async fn decode_from(mut stream: BufStreamReader<S>) -> Result<Self, DecodeStreamError> {
-        let r#type = VarInt::decode_from(&mut stream).await?;
-        let length = VarInt::decode_from(&mut stream).await?;
-        let payload = FixedLengthReader::new(stream, length.into_inner());
-        Ok(Frame {
-            r#type,
-            length,
-            payload,
+        let decode = async move {
+            let r#type = VarInt::decode_from(&mut stream).await?;
+            let length = VarInt::decode_from(&mut stream).await?;
+            let payload = FixedLengthReader::new(stream, length.into_inner());
+            Ok(Frame {
+                r#type,
+                length,
+                payload,
+            })
+        };
+
+        decode.await.map_err(|error: DecodeStreamError| {
+            error.map_decode_error(|decode_error| {
+                ErrorWithCode::new(Code::H3_FRAME_ERROR, Some(decode_error)).into()
+            })
         })
     }
 }
 
-impl<R: AsyncRead + ?Sized> AsyncRead for Frame<R> {
+impl<S> AsyncRead for Frame<FixedLengthReader<BufStreamReader<S>>>
+where
+    S: TryStream<Ok = Bytes>,
+    io::Error: From<S::Error>,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        self.project().payload.poll_read(cx, buf)
+        self.project().payload.poll_read(cx, buf).map_err(|error| {
+            DecodeStreamError::from(error)
+                .map_decode_error(|decode_error| {
+                    ErrorWithCode::new(Code::H3_FRAME_ERROR, Some(decode_error)).into()
+                })
+                .into()
+        })
     }
 }
 
-impl<R: AsyncBufRead + ?Sized> AsyncBufRead for Frame<R> {
+impl<S> AsyncBufRead for Frame<FixedLengthReader<BufStreamReader<S>>>
+where
+    S: TryStream<Ok = Bytes>,
+    io::Error: From<S::Error>,
+{
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
-        self.project().payload.poll_fill_buf(cx)
+        self.project().payload.poll_fill_buf(cx).map_err(|error| {
+            DecodeStreamError::from(error)
+                .map_decode_error(|decode_error| {
+                    ErrorWithCode::new(Code::H3_FRAME_ERROR, Some(decode_error)).into()
+                })
+                .into()
+        })
     }
 
     fn consume(self: Pin<&mut Self>, amt: usize) {
@@ -264,11 +292,19 @@ impl<R: AsyncBufRead + ?Sized> AsyncBufRead for Frame<R> {
     }
 }
 
-impl<S: Stream + ?Sized> Stream for Frame<S> {
-    type Item = S::Item;
+impl<S: Stream + ?Sized> Stream for Frame<FixedLengthReader<BufStreamReader<S>>>
+where
+    S: TryStream<Ok = Bytes>,
+    DecodeStreamError: From<S::Error>,
+{
+    type Item = Result<Bytes, DecodeStreamError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.project().payload.poll_next(cx)
+        self.project().payload.poll_next(cx).map_err(|error| {
+            error.map_decode_error(|decode_error| {
+                ErrorWithCode::new(Code::H3_FRAME_ERROR, Some(decode_error)).into()
+            })
+        })
     }
 }
 

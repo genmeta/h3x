@@ -67,15 +67,10 @@ impl Stream for StreamReader {
     type Item = Result<Bytes, StreamError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        tracing::info!("Polling next on stream {}", self.stream_id);
-        let stream_id = self.stream_id;
         self.project()
             .reader
             .poll_next(cx)
-            .map_ok(|bytes| {
-                tracing::info!("Read {} bytes from stream {stream_id}", bytes.len());
-                bytes
-            })
+            .map_ok(|bytes| bytes)
             .map_err(convert_stream_error)
     }
 
@@ -90,10 +85,6 @@ impl StopSending for StreamReader {
         _: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), StreamError>> {
-        tracing::warn!(
-            "Stream {} request peer to stop sending with code {code}",
-            self.stream_id
-        );
         gm_quic::prelude::StopSending::stop(&mut self.get_mut().reader, code.into_inner());
         Poll::Ready(Ok(()))
     }
@@ -124,7 +115,6 @@ impl Sink<Bytes> for StreamWriter {
     }
 
     fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        tracing::info!("Sending {} bytes to stream {}", item.len(), self.stream_id);
         self.project()
             .writer
             .start_send(item)
@@ -132,7 +122,6 @@ impl Sink<Bytes> for StreamWriter {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        tracing::info!("Flushing stream {}", self.stream_id);
         self.project()
             .writer
             .poll_flush(cx)
@@ -140,7 +129,6 @@ impl Sink<Bytes> for StreamWriter {
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        tracing::info!("Closing stream {}", self.stream_id);
         self.project()
             .writer
             .poll_close(cx)
@@ -154,7 +142,6 @@ impl CancelStream for StreamWriter {
         _: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), StreamError>> {
-        tracing::warn!("Stream {} canceled with code {code}", self.stream_id);
         gm_quic::prelude::CancelStream::cancel(&mut self.get_mut().writer, code.into_inner());
         Poll::Ready(Ok(()))
     }
@@ -177,7 +164,6 @@ impl super::QuicConnect for Arc<gm_quic::prelude::Connection> {
                 .map_err(convert_connection_error)?
                 .expect("TODO: handle stream_id run out");
             let stream_id = convert_varint(stream_id.into());
-            tracing::debug!("Opened bidirectional stream {}", stream_id);
 
             Ok((
                 StreamReader { stream_id, reader },
@@ -198,7 +184,6 @@ impl super::QuicConnect for Arc<gm_quic::prelude::Connection> {
                 .map_err(convert_connection_error)?
                 .expect("TODO: handle stream_id run out");
             let stream_id = convert_varint(stream_id.into());
-            tracing::debug!("Opened unidirectional stream {}", stream_id);
 
             Ok(StreamWriter { stream_id, writer })
         }
@@ -215,7 +200,6 @@ impl super::QuicConnect for Arc<gm_quic::prelude::Connection> {
                 .await
                 .map_err(convert_connection_error)?;
             let stream_id = convert_varint(stream_id.into());
-            tracing::debug!("Accepted bidirectional stream {}", stream_id);
 
             Ok((
                 StreamReader { stream_id, reader },
@@ -235,7 +219,6 @@ impl super::QuicConnect for Arc<gm_quic::prelude::Connection> {
                 .await
                 .map_err(convert_connection_error)?;
             let stream_id = convert_varint(stream_id.into());
-            tracing::debug!("Accepted unidirectional stream {}", stream_id);
 
             Ok(StreamReader { stream_id, reader })
         }
@@ -317,7 +300,7 @@ mod tests {
     #[tokio::test]
     async fn simple_axum_server() {
         _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::ERROR)
+            .with_max_level(tracing::Level::INFO)
             .try_init();
 
         let (listeners, server_listen) = quic_listeners();
@@ -335,7 +318,9 @@ mod tests {
                     .await
                     .unwrap();
 
-                let (request, response_sender) = connection.response().await.unwrap();
+                let (mut response_sender, request_reader) = connection.accept().await.unwrap();
+                let request = request_reader.read_request().await.unwrap();
+                tracing::info!("Received request: {} {}", request.method(), request.uri());
 
                 let response = router
                     .as_service()
@@ -346,33 +331,42 @@ mod tests {
                     .await
                     .unwrap();
 
-                response_sender.send(response).unwrap();
+                response_sender.send_response(response).await.unwrap();
+                tracing::info!("Sent response");
+                response_sender.shutdown().await.unwrap();
 
                 std::future::pending::<()>().await
             }
             .instrument(tracing::info_span!("server")),
         );
 
-        let client = quic_client();
+        async move {
+            let client = quic_client();
 
-        let connection = client.connect("localhost", [server_listen]).unwrap();
-        let connection = Connection::new(Settings::default(), connection)
-            .await
-            .unwrap();
+            let connection = client.connect("localhost", [server_listen]).unwrap();
+            let connection = Connection::new(Settings::default(), connection)
+                .await
+                .unwrap();
 
-        let response = connection
-            .request(
-                Request::builder()
-                    .uri("/hello_world")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            let request = Request::builder()
+                .uri("/hello_world")
+                .body(Body::empty())
+                .unwrap();
+            let (mut request_writer, response_reader) = connection.open().await.unwrap();
 
-        let response = response.into_body().collect().await.unwrap().to_bytes();
+            request_writer.send_request(request).await.unwrap();
+            tracing::info!("Sent request");
+            request_writer.shutdown().await.unwrap();
 
-        println!("Response: {}", std::str::from_utf8(&response).unwrap());
-        assert_eq!(&response[..], HELLO_GENMETA.as_bytes());
+            let mut response_reader = response_reader.await.unwrap();
+            let response = response_reader.read_response().await.unwrap().unwrap();
+            tracing::info!("Sent request");
+            let response = response.into_body().collect().await.unwrap().to_bytes();
+
+            println!("Response: {}", std::str::from_utf8(&response).unwrap());
+            assert_eq!(&response[..], HELLO_GENMETA.as_bytes());
+        }
+        .instrument(tracing::info_span!("client"))
+        .await;
     }
 }
