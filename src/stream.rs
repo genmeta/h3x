@@ -14,7 +14,7 @@ use crate::{
         error::{DecodeStreamError, EncodeStreamError},
         util::{DecodeFrom, EncodeInto},
     },
-    error::{Code, ErrorWithCode, H3CriticalStreamClosed, HasErrorCode, StreamError},
+    error::{Code, H3CriticalStreamClosed, HasErrorCode, StreamError},
     quic::{CancelStream, GetStreamId, StopSending},
     varint::VarInt,
 };

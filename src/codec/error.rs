@@ -1,9 +1,9 @@
-use std::{convert::Infallible, error::Error, io};
+use std::{convert::Infallible, error::Error, io, sync::Arc};
 
 use snafu::Snafu;
 
 use crate::{
-    error::{Code, ConnectionError, ErrorWithCode, HasErrorCode, StreamError},
+    error::{ConnectionError, HasErrorCode, StreamError},
     varint::VarInt,
 };
 
@@ -52,13 +52,15 @@ pub enum DecodeStreamError {
     #[snafu(transparent)]
     Decode { source: DecodeError },
     #[snafu(transparent)]
-    Code { source: ErrorWithCode },
+    Code {
+        source: Arc<dyn HasErrorCode + Send + Sync>,
+    },
 }
 
 impl<E: HasErrorCode + Error + Send + Sync + 'static> From<E> for DecodeStreamError {
     fn from(value: E) -> Self {
         DecodeStreamError::Code {
-            source: value.into(),
+            source: Arc::new(value),
         }
     }
 }
@@ -95,7 +97,7 @@ impl From<DecodeStreamError> for io::Error {
         match value {
             DecodeStreamError::Stream { source } => io::Error::from(source),
             DecodeStreamError::Decode { source } => io::Error::from(source),
-            DecodeStreamError::Code { source } => io::Error::from(source),
+            DecodeStreamError::Code { source } => io::Error::other(source),
         }
     }
 }
@@ -103,14 +105,6 @@ impl From<DecodeStreamError> for io::Error {
 impl From<ConnectionError> for DecodeStreamError {
     fn from(value: ConnectionError) -> Self {
         DecodeStreamError::Stream {
-            source: value.into(),
-        }
-    }
-}
-
-impl From<Code> for DecodeStreamError {
-    fn from(value: Code) -> Self {
-        DecodeStreamError::Code {
             source: value.into(),
         }
     }
@@ -134,15 +128,7 @@ impl From<io::Error> for DecodeStreamError {
             Ok(error) => return DecodeStreamError::Decode { source: error },
             Err(source) => source,
         };
-        let source = match source.downcast::<Code>() {
-            Ok(error) => {
-                return DecodeStreamError::Code {
-                    source: error.into(),
-                };
-            }
-            Err(source) => source,
-        };
-        let source = match source.downcast::<ErrorWithCode>() {
+        let source = match source.downcast::<Arc<dyn HasErrorCode + Send + Sync>>() {
             Ok(error) => {
                 return DecodeStreamError::Code { source: error };
             }
@@ -200,13 +186,15 @@ pub enum EncodeStreamError {
     #[snafu(transparent)]
     Encode { source: EncodeError },
     #[snafu(transparent)]
-    Code { source: ErrorWithCode },
+    Code {
+        source: Arc<dyn HasErrorCode + Send + Sync>,
+    },
 }
 
 impl<E: HasErrorCode + Error + Send + Sync + 'static> From<E> for EncodeStreamError {
     fn from(value: E) -> Self {
         EncodeStreamError::Code {
-            source: value.into(),
+            source: Arc::new(value),
         }
     }
 }
@@ -232,9 +220,9 @@ impl EncodeStreamError {
 impl From<EncodeStreamError> for io::Error {
     fn from(value: EncodeStreamError) -> Self {
         match value {
-            EncodeStreamError::Stream { source } => source.into(),
-            EncodeStreamError::Encode { source } => source.into(),
-            EncodeStreamError::Code { source } => source.into(),
+            EncodeStreamError::Stream { source } => io::Error::from(source),
+            EncodeStreamError::Encode { source } => io::Error::from(source),
+            EncodeStreamError::Code { source } => io::Error::other(source),
         }
     }
 }
@@ -250,14 +238,6 @@ impl From<ConnectionError> for EncodeStreamError {
 impl From<Infallible> for EncodeStreamError {
     fn from(value: Infallible) -> Self {
         match value {}
-    }
-}
-
-impl From<Code> for EncodeStreamError {
-    fn from(value: Code) -> Self {
-        EncodeStreamError::Code {
-            source: value.into(),
-        }
     }
 }
 
@@ -279,15 +259,7 @@ impl From<io::Error> for EncodeStreamError {
             Ok(error) => return EncodeStreamError::Encode { source: error },
             Err(source) => source,
         };
-        let source = match source.downcast::<Code>() {
-            Ok(error) => {
-                return EncodeStreamError::Code {
-                    source: error.into(),
-                };
-            }
-            Err(source) => source,
-        };
-        let source = match source.downcast::<ErrorWithCode>() {
+        let source = match source.downcast::<Arc<dyn HasErrorCode + Send + Sync>>() {
             Ok(error) => {
                 return EncodeStreamError::Code { source: error };
             }

@@ -7,7 +7,7 @@ use crate::{
         error::{DecodeError, DecodeStreamError, EncodeStreamError},
         util::{DecodeFrom, EncodeInto},
     },
-    error::{Code, ErrorWithCode},
+    error::Code,
     qpack::{
         integer::{decode_integer, encode_integer},
         string::{decode_string, encode_string},
@@ -273,9 +273,7 @@ where
             }
         };
         decode.await.map_err(|error: DecodeStreamError| {
-            error.map_decode_error(|decode_error| {
-                ErrorWithCode::new(Code::H3_MESSAGE_ERROR, Some(decode_error)).into()
-            })
+            error.map_decode_error(|decode_error| Code::H3_MESSAGE_ERROR.with(decode_error).into())
         })
     }
 }

@@ -1,4 +1,4 @@
-use std::{borrow::Cow, error::Error, io, sync::Arc};
+use std::{borrow::Cow, error::Error, fmt::Display, io, sync::Arc};
 
 use snafu::Snafu;
 
@@ -90,28 +90,23 @@ impl Code {
     pub const fn into_inner(self) -> VarInt {
         self.0
     }
+
+    pub const fn with<E: Error>(self, source: E) -> CodeWith<E> {
+        CodeWith { code: self, source }
+    }
 }
 
-impl std::fmt::Display for Code {
+impl Display for Code {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Code {}", self.0)
     }
 }
 
-impl std::error::Error for Code {}
+impl Error for Code {}
 
-impl From<Code> for io::Error {
-    fn from(value: Code) -> Self {
-        io::Error::other(value)
-    }
-}
-
-impl From<Code> for ApplicationError {
-    fn from(value: Code) -> Self {
-        ApplicationError {
-            code: value,
-            reason: Cow::Borrowed(""),
-        }
+impl HasErrorCode for Code {
+    fn code(&self) -> Code {
+        *self
     }
 }
 
@@ -181,6 +176,30 @@ impl Code {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeWith<E: Error> {
+    code: Code,
+    source: E,
+}
+
+impl<E: Error> Display for CodeWith<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.source, f)
+    }
+}
+
+impl<E: Error + 'static> Error for CodeWith<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl<E: Error + 'static> HasErrorCode for CodeWith<E> {
+    fn code(&self) -> Code {
+        self.code
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum H3CriticalStreamClosed {
     #[snafu(display("QPack encoder stream closed unexpectedly"))]
@@ -209,77 +228,7 @@ impl HasErrorCode for H3FrameUnexpected {
     }
 }
 
-pub trait HasErrorCode {
-    fn code(&self) -> Code {
-        Code::H3_CLOSED_CRITICAL_STREAM
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ErrorWithCode {
-    pub code: Code,
-    pub source: Option<Arc<dyn Error + Send + Sync>>,
-}
-
-impl ErrorWithCode {
-    pub fn new(code: Code, source: Option<impl Error + Send + Sync + 'static>) -> Self {
-        Self {
-            code,
-            source: source.map(|s| Arc::new(s) as Arc<dyn Error + Send + Sync>),
-        }
-    }
-}
-
-impl From<Code> for ErrorWithCode {
-    fn from(value: Code) -> Self {
-        Self {
-            code: value,
-            source: None,
-        }
-    }
-}
-
-impl<E: HasErrorCode + Error + Send + Sync + 'static> From<E> for ErrorWithCode {
-    fn from(error: E) -> Self {
-        Self::new(error.code(), Some(error))
-    }
-}
-
-impl From<ErrorWithCode> for io::Error {
-    fn from(value: ErrorWithCode) -> Self {
-        io::Error::other(value)
-    }
-}
-
-impl From<&ErrorWithCode> for ApplicationError {
-    fn from(value: &ErrorWithCode) -> Self {
-        ApplicationError {
-            code: value.code,
-            reason: match &value.source {
-                Some(source) => Cow::Owned(source.to_string()),
-                None => Cow::Borrowed(""),
-            },
-        }
-    }
-}
-
-impl From<ErrorWithCode> for ApplicationError {
-    fn from(value: ErrorWithCode) -> Self {
-        ApplicationError::from(&value)
-    }
-}
-
-impl std::fmt::Display for ErrorWithCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.code)?;
-        Ok(())
-    }
-}
-
-impl std::error::Error for ErrorWithCode {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|source| &**source as &(dyn Error + 'static))
-    }
+// TODO: use Error::provide api in the future
+pub trait HasErrorCode: Error {
+    fn code(&self) -> Code;
 }

@@ -12,7 +12,7 @@ use crate::{
         error::{DecodeStreamError, EncodeStreamError},
         util::{DecodeFrom, EncodeInto, decoder, encoder},
     },
-    error::{Code, ErrorWithCode, H3CriticalStreamClosed},
+    error::{Code, H3CriticalStreamClosed},
     varint::VarInt,
 };
 
@@ -199,9 +199,7 @@ impl<S: AsyncWrite> EncodeInto<S> for Settings {
         encoder.send_all(&mut settings).await.map_err(|error| {
             error
                 .map_stream_reset(|_| H3CriticalStreamClosed::Control.into())
-                .map_encode_error(|encode_error| {
-                    ErrorWithCode::new(Code::H3_INTERNAL_ERROR, Some(encode_error)).into()
-                })
+                .map_encode_error(|encode_error| Code::H3_INTERNAL_ERROR.with(encode_error).into())
         })
     }
 }

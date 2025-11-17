@@ -16,8 +16,7 @@ use crate::{
         util::{DecodeFrom, EncodeInto, decoder, encoder},
     },
     error::{
-        ApplicationError, Code, ConnectionError, H3CriticalStreamClosed, H3FrameUnexpected,
-        StreamError,
+        Code, ConnectionError, H3CriticalStreamClosed, H3FrameUnexpected, HasErrorCode, StreamError,
     },
     frame::Frame,
     message::{MessageReader, MessageWriter},
@@ -71,44 +70,36 @@ impl<C: QuicConnect + Unpin> State<C> {
         { Pin::new(self.quic_connection().deref_mut()).accept_uni() }.await
     }
 
-    pub fn close(&self, error: ApplicationError) {
-        if self
-            .error
-            .set_with(|| ConnectionError::from(error.clone()))
-            .is_err()
-        {
+    pub fn close(&self, error: &(impl HasErrorCode + ?Sized)) {
+        if self.error.peek().is_some() {
             return;
         }
-        Pin::new(self.quic_connection().deref_mut()).close(error.code, error.reason)
+        Pin::new(self.quic_connection().deref_mut()).close(error.code(), error.to_string().into())
     }
 
-    pub fn handle_encode_stream_error(&self, error: EncodeStreamError) {
+    pub async fn handle_encode_stream_error(&self, error: EncodeStreamError) -> StreamError {
         match error {
-            EncodeStreamError::Stream { source } => match source {
-                StreamError::Connection { source } => _ = self.error.set(source),
-                StreamError::Reset { .. } => {
-                    unreachable!("Reset should be converted before this point")
-                }
-            },
+            EncodeStreamError::Stream { source } => source,
             EncodeStreamError::Encode { .. } => {
-                unreachable!("Encode error should be converted before this point")
+                unreachable!("Decode error should be converted before this point")
             }
-            EncodeStreamError::Code { source } => self.close(ApplicationError::from(source)),
+            EncodeStreamError::Code { source } => {
+                self.close(source.as_ref());
+                self.error().await.into()
+            }
         }
     }
 
-    pub fn handle_decode_stream_error(&self, error: DecodeStreamError) {
+    pub async fn handle_decode_stream_error(&self, error: DecodeStreamError) -> StreamError {
         match error {
-            DecodeStreamError::Stream { source } => match source {
-                StreamError::Connection { source } => _ = self.error.set(source),
-                StreamError::Reset { .. } => {
-                    unreachable!("Reset should be converted before this point")
-                }
-            },
+            DecodeStreamError::Stream { source } => source,
             DecodeStreamError::Decode { .. } => {
                 unreachable!("Decode error should be converted before this point")
             }
-            DecodeStreamError::Code { source } => self.close(ApplicationError::from(source)),
+            DecodeStreamError::Code { source } => {
+                self.close(source.as_ref());
+                self.error().await.into()
+            }
         }
     }
 
@@ -373,21 +364,10 @@ where
             ) {
                 Ok(_) => unreachable!(),
                 Err(error) => match error {
-                    DecodeStreamError::Stream { source } => match source {
-                        StreamError::Connection { source } => match source {
-                            ConnectionError::Transport { .. } => _ = conn_state.error.set(source),
-                            ConnectionError::Application { source } => conn_state.close(source),
-                        },
-                        StreamError::Reset { .. } => {
-                            unreachable!("stream reset should already be converted")
-                        }
-                    },
-                    DecodeStreamError::Decode { .. } => {
-                        unreachable!("decode error should already be converted")
-                    }
-                    DecodeStreamError::Code { source } => {
-                        conn_state.close(ApplicationError::from(source))
-                    }
+                    DecodeStreamError::Stream {
+                        source: StreamError::Connection { source },
+                    } => _ = conn_state.error.set(source),
+                    error => _ = conn_state.handle_decode_stream_error(error).await,
                 },
             }
         };
@@ -399,7 +379,7 @@ where
         let mut control_stream = match UnidirectionalStream::new_control_stream(uni_stream).await {
             Ok(control_stream) => control_stream,
             Err(error) => {
-                state.handle_encode_stream_error(error);
+                state.handle_encode_stream_error(error).await;
                 return Err(state.error().await);
             }
         };
@@ -407,7 +387,7 @@ where
         match settings.encode_into(&mut control_stream).await {
             Ok(()) => {}
             Err(error) => {
-                state.handle_encode_stream_error(error);
+                state.handle_encode_stream_error(error).await;
                 return Err(state.error().await);
             }
         }
@@ -472,6 +452,6 @@ where
 
 impl<C: QuicConnect + Unpin> Drop for Connection<C> {
     fn drop(&mut self) {
-        self.state.close(ApplicationError::from(Code::H3_NO_ERROR));
+        self.state.close(&Code::H3_NO_ERROR);
     }
 }

@@ -17,14 +17,14 @@ use crate::{
         util::{DecodeFrom, EncodeInto},
     },
     connection::{BoxStreamReader, QPackDecoder, QPackEncoder, State},
-    error::{ApplicationError, Code, ErrorWithCode, StreamError},
+    error::{ApplicationError, Code, HasErrorCode, StreamError},
     frame::Frame,
     qpack::{
         field_section::FieldSection,
         strategy::{HuffmanAlways, StaticEncoder},
     },
     quic::{CancelStream, CancelStreamExt, GetStreamId, GetStreamIdExt, QuicConnect, StopSending},
-    varint::VarInt,
+    varint::{VarInt, err},
 };
 
 pub struct MessageWriter<C: QuicConnect + Unpin> {
@@ -110,20 +110,19 @@ impl<C: QuicConnect + Unpin> MessageWriter<C> {
         }
     }
 
-    async fn handle_error(&self, error: ErrorWithCode) -> StreamError {
-        self.conenction_state.close(ApplicationError::from(error));
+    async fn handle_error(&self, error: &(impl HasErrorCode + ?Sized)) -> StreamError {
+        self.conenction_state.close(error);
         self.conenction_state.error().await.into()
     }
 
     async fn handle_encode_stream_error(&self, error: EncodeStreamError) -> StreamError {
-        match error {
-            EncodeStreamError::Stream { source } => source,
-            EncodeStreamError::Encode { source } => {
-                let error = ErrorWithCode::new(Code::H3_FRAME_ERROR, Some(source));
-                self.handle_error(error).await
-            }
-            EncodeStreamError::Code { source } => self.handle_error(source).await,
-        }
+        self.conenction_state
+            .handle_encode_stream_error(
+                error.map_encode_error(|encode_error| {
+                    Code::H3_FRAME_ERROR.with(encode_error).into()
+                }),
+            )
+            .await
     }
 
     async fn send_header(&mut self, field_section: FieldSection) -> Result<(), EncodeStreamError> {
@@ -286,7 +285,7 @@ where
         let frame = match Frame::decode_from(stream).await {
             Ok(frame) => frame,
             Err(DecodeStreamError::Code { source }) => {
-                connecttion_state.close(ApplicationError::from(source));
+                connecttion_state.close(source.as_ref());
                 return Err(connecttion_state.error().await.into());
             }
             Err(DecodeStreamError::Decode { .. }) => unreachable!(),
@@ -301,20 +300,19 @@ where
         })
     }
 
-    async fn handle_error(&self, error: ErrorWithCode) -> StreamError {
-        self.connecttion_state.close(ApplicationError::from(error));
+    async fn handle_error(&self, error: &(impl HasErrorCode + ?Sized)) -> StreamError {
+        self.connecttion_state.close(error);
         self.connecttion_state.error().await.into()
     }
 
     async fn handle_decode_stream_error(&self, error: DecodeStreamError) -> StreamError {
-        match error {
-            DecodeStreamError::Stream { source } => source,
-            DecodeStreamError::Decode { source } => {
-                let error = ErrorWithCode::new(Code::H3_INTERNAL_ERROR, Some(source));
-                self.handle_error(error).await
-            }
-            DecodeStreamError::Code { source } => self.handle_error(source).await,
-        }
+        self.connecttion_state
+            .handle_decode_stream_error(
+                error.map_decode_error(|decode_error| {
+                    Code::H3_MESSAGE_ERROR.with(decode_error).into()
+                }),
+            )
+            .await
     }
 
     pub async fn next_frame(
@@ -327,8 +325,7 @@ where
                 && frame.r#type() != Frame::DATA_FRAME_TYPE
                 && !frame.is_reversed_frame()
             {
-                let error = Code::H3_FRAME_UNEXPECTED.into();
-                return Some(Err(self.handle_error(error).await));
+                return Some(Err(self.handle_error(&Code::H3_FRAME_UNEXPECTED).await));
             }
 
             if frame.payload().remaining() == 0 || frame.is_reversed_frame() {
@@ -383,7 +380,7 @@ where
     {
         match self.next_frame().await.transpose()? {
             Some(_frame) => {}
-            None => return Err(self.handle_error(Code::H3_MESSAGE_ERROR.into()).await),
+            None => return Err(self.handle_error(&Code::H3_FRAME_UNEXPECTED).await),
         }
         match Request::decode_from(&mut self).await {
             Ok(request) => Ok(request),
@@ -403,7 +400,7 @@ where
             Some(Ok(_frame)) => {}
             Some(Err(error)) => return Some(Err(error)),
             None if !final_message_received => {
-                return Some(Err(self.handle_error(Code::H3_MESSAGE_ERROR.into()).await));
+                return Some(Err(self.handle_error(&Code::H3_FRAME_UNEXPECTED).await));
             }
             None => return None,
         }

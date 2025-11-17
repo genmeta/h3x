@@ -23,7 +23,7 @@ where
     }
 }
 
-pub fn decoder<Item, S>(stream: S) -> impl Stream<Item = Result<Item, DecodeStreamError>>
+pub(crate) fn decoder<Item, S>(stream: S) -> impl Stream<Item = Result<Item, DecodeStreamError>>
 where
     S: AsyncBufRead + Unpin,
     Item: for<'s> DecodeFrom<&'s mut S>,
@@ -37,7 +37,7 @@ where
     })
 }
 
-pub fn encoder<T: for<'s> EncodeInto<&'s mut S>, S>(
+pub(crate) fn encoder<T: for<'s> EncodeInto<&'s mut S>, S>(
     stream: S,
 ) -> impl Sink<T, Error = EncodeStreamError> {
     futures::sink::unfold(stream, |mut stream, item: T| async move {

@@ -13,7 +13,7 @@ use crate::{
         error::{DecodeStreamError, EncodeError, EncodeStreamError},
         util::{DecodeFrom, EncodeInto},
     },
-    error::{Code, ErrorWithCode, StreamError},
+    error::{Code, StreamError},
     quic::{GetStreamId, StopSending},
     varint::{self, VARINT_MAX, VarInt},
 };
@@ -245,9 +245,7 @@ where
         };
 
         decode.await.map_err(|error: DecodeStreamError| {
-            error.map_decode_error(|decode_error| {
-                ErrorWithCode::new(Code::H3_FRAME_ERROR, Some(decode_error)).into()
-            })
+            error.map_decode_error(|decode_error| Code::H3_FRAME_ERROR.with(decode_error).into())
         })
     }
 }
@@ -264,9 +262,7 @@ where
     ) -> Poll<io::Result<()>> {
         self.project().payload.poll_read(cx, buf).map_err(|error| {
             DecodeStreamError::from(error)
-                .map_decode_error(|decode_error| {
-                    ErrorWithCode::new(Code::H3_FRAME_ERROR, Some(decode_error)).into()
-                })
+                .map_decode_error(|decode_error| Code::H3_FRAME_ERROR.with(decode_error).into())
                 .into()
         })
     }
@@ -280,9 +276,7 @@ where
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         self.project().payload.poll_fill_buf(cx).map_err(|error| {
             DecodeStreamError::from(error)
-                .map_decode_error(|decode_error| {
-                    ErrorWithCode::new(Code::H3_FRAME_ERROR, Some(decode_error)).into()
-                })
+                .map_decode_error(|decode_error| Code::H3_FRAME_ERROR.with(decode_error).into())
                 .into()
         })
     }
@@ -301,9 +295,7 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.project().payload.poll_next(cx).map_err(|error| {
-            error.map_decode_error(|decode_error| {
-                ErrorWithCode::new(Code::H3_FRAME_ERROR, Some(decode_error)).into()
-            })
+            error.map_decode_error(|decode_error| Code::H3_FRAME_ERROR.with(decode_error).into())
         })
     }
 }
