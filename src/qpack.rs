@@ -2,8 +2,9 @@ use std::pin::Pin;
 
 use futures::{Sink, stream::BoxStream};
 
-use crate::codec::error::{DecodeStreamError, EncodeStreamError};
+use crate::error::Error;
 
+pub mod algorithm;
 pub mod decoder;
 pub mod dynamic;
 pub mod encoder;
@@ -13,13 +14,11 @@ pub mod instruction;
 pub mod integer;
 pub mod settings;
 pub mod r#static;
-pub mod strategy;
 pub mod string;
 
-pub type BoxInstructionStream<'a, Instruction> =
-    BoxStream<'a, Result<Instruction, DecodeStreamError>>;
+pub type BoxInstructionStream<'a, Instruction> = BoxStream<'a, Result<Instruction, Error>>;
 pub type BoxSink<'a, Item, Err> = Pin<Box<dyn Sink<Item, Error = Err> + Send + 'a>>;
-pub type BoxInstructionSink<'a, Instruction> = BoxSink<'a, Instruction, EncodeStreamError>;
+pub type BoxInstructionSink<'a, Instruction> = BoxSink<'a, Instruction, Error>;
 
 #[cfg(test)]
 mod tests {
@@ -32,17 +31,17 @@ mod tests {
 
     use crate::{
         codec::{
-            BufSinkWriter, BufStreamReader,
+            SinkWriter, StreamReader,
             util::{DecodeFrom, EncodeInto, decoder, encoder},
         },
         error::ConnectionError,
         frame::Frame,
         qpack::{
+            algorithm::{HuffmanAlways, StaticEncoder},
             decoder::{Decoder, MessageStreamReader},
             encoder::Encoder,
             field_section::FieldSection,
             settings::Settings,
-            strategy::{HuffmanAlways, StaticEncoder},
         },
         quic::test::mock_stream_pair,
         stream::{TryFutureStream, UnidirectionalStream},
@@ -60,7 +59,7 @@ mod tests {
         let init_encoder = tokio::spawn(async move {
             let encoder_stream = UnidirectionalStream::new(
                 UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE,
-                BufSinkWriter::new(encoder_stream_writer),
+                SinkWriter::new(encoder_stream_writer),
             )
             .await
             .unwrap();
@@ -68,7 +67,7 @@ mod tests {
 
             let decoder_stream = Box::pin(TryFutureStream::from(async move {
                 let decoder_stream =
-                    UnidirectionalStream::decode_from(BufStreamReader::new(decoder_stream_reader))
+                    UnidirectionalStream::decode_from(StreamReader::new(decoder_stream_reader))
                         .await
                         .unwrap();
                 assert_eq!(
@@ -89,7 +88,7 @@ mod tests {
         let init_decoder = tokio::spawn(async move {
             let decoder_stream = UnidirectionalStream::new(
                 UnidirectionalStream::QPACK_DECODER_STREAM_TYPE,
-                BufSinkWriter::new(decoder_stream_writer),
+                SinkWriter::new(decoder_stream_writer),
             )
             .await
             .unwrap();
@@ -97,7 +96,7 @@ mod tests {
 
             let encoder_stream = Box::pin(TryFutureStream::from(async move {
                 let encoder_stream =
-                    UnidirectionalStream::decode_from(BufStreamReader::new(encoder_stream_reader))
+                    UnidirectionalStream::decode_from(StreamReader::new(encoder_stream_reader))
                         .await
                         .unwrap();
                 assert_eq!(
@@ -139,17 +138,13 @@ mod tests {
 
         let (response_stream, request_stream) = mock_stream_pair(VarInt::from_u32(0));
         let request = tokio::spawn(async move {
-            let mut request_stream = BufSinkWriter::new(request_stream);
+            let mut request_stream = SinkWriter::new(request_stream);
 
             let header_frame = encoder
                 .encode(field_section, &encode_strategy, &mut request_stream)
                 .await
                 .unwrap();
-            tokio::try_join!(
-                header_frame.encode_into(&mut request_stream),
-                encoder.flush_instructions()
-            )
-            .unwrap();
+            header_frame.encode_into(&mut request_stream).await.unwrap();
 
             println!("Header frame sent");
 
@@ -164,7 +159,7 @@ mod tests {
 
         let response = tokio::spawn(async move {
             let response_stream = MessageStreamReader::new(response_stream, decoder.clone());
-            let response_stream = BufStreamReader::new(response_stream);
+            let response_stream = StreamReader::new(response_stream);
 
             let mut frame = Frame::decode_from(response_stream).await.unwrap();
             assert_eq!(frame.r#type(), Frame::HEADERS_FRAME_TYPE);

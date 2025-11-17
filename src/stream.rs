@@ -10,11 +10,8 @@ use snafu::Snafu;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
-    codec::{
-        error::{DecodeStreamError, EncodeStreamError},
-        util::{DecodeFrom, EncodeInto},
-    },
-    error::{Code, H3CriticalStreamClosed, HasErrorCode, StreamError},
+    codec::util::{DecodeFrom, EncodeInto},
+    error::{Code, Error, H3CriticalStreamClosed, HasErrorCode, StreamError},
     quic::{CancelStream, GetStreamId, StopSending},
     varint::VarInt,
 };
@@ -39,8 +36,11 @@ pin_project_lite::pin_project! {
 }
 
 impl<S: AsyncBufRead + Unpin> DecodeFrom<S> for UnidirectionalStream<S> {
-    async fn decode_from(mut stream: S) -> Result<Self, DecodeStreamError> {
-        let r#type = VarInt::decode_from(&mut stream).await?;
+    type Error = Error;
+    async fn decode_from(mut stream: S) -> Result<Self, Error> {
+        let r#type = VarInt::decode_from(&mut stream).await.map_err(|error| {
+            error.map_decode_error(|error| Code::H3_GENERAL_PROTOCOL_ERROR.with(error).into())
+        })?;
         Ok(UnidirectionalStream { r#type, stream })
     }
 }
@@ -79,7 +79,7 @@ impl UnidirectionalStream<()> {
 }
 
 impl<S: ?Sized> UnidirectionalStream<S> {
-    pub async fn new(r#type: VarInt, mut stream: S) -> Result<Self, EncodeStreamError>
+    pub async fn new(r#type: VarInt, mut stream: S) -> Result<Self, Error>
     where
         S: AsyncWrite + Unpin + Sized,
     {
@@ -95,7 +95,7 @@ impl<S: ?Sized> UnidirectionalStream<S> {
         self.stream
     }
 
-    pub async fn new_qpack_encoder_stream(stream: S) -> Result<Self, EncodeStreamError>
+    pub async fn new_qpack_encoder_stream(stream: S) -> Result<Self, Error>
     where
         S: AsyncWrite + Unpin + Sized,
     {
@@ -110,7 +110,7 @@ impl<S: ?Sized> UnidirectionalStream<S> {
         self.r#type.into_inner() == UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE.into_inner()
     }
 
-    pub async fn new_qpack_decoder_stream(stream: S) -> Result<Self, EncodeStreamError>
+    pub async fn new_qpack_decoder_stream(stream: S) -> Result<Self, Error>
     where
         S: AsyncWrite + Unpin + Sized,
     {
@@ -125,7 +125,7 @@ impl<S: ?Sized> UnidirectionalStream<S> {
         self.r#type.into_inner() == UnidirectionalStream::QPACK_DECODER_STREAM_TYPE.into_inner()
     }
 
-    pub async fn new_control_stream(stream: S) -> Result<Self, EncodeStreamError>
+    pub async fn new_control_stream(stream: S) -> Result<Self, Error>
     where
         S: AsyncWrite + Unpin + Sized,
     {
@@ -135,7 +135,7 @@ impl<S: ?Sized> UnidirectionalStream<S> {
     }
 
     pub const fn is_control_stream(&self) -> bool {
-        self.r#type.into_inner() == UnidirectionalStream::CONTROL_STREAM_TYPE.into_inner()
+        self.r#type().into_inner() == UnidirectionalStream::CONTROL_STREAM_TYPE.into_inner()
     }
 
     pub const fn r#type(&self) -> VarInt {
@@ -152,10 +152,12 @@ impl<S: ?Sized> UnidirectionalStream<S> {
     ///
     /// https://datatracker.ietf.org/doc/html/rfc9114#name-reserved-stream-types
     pub const fn is_reserved_stream(&self) -> bool {
-        (self.r#type.into_inner() >= 0x21) && (self.r#type.into_inner() - 0x21).is_multiple_of(0x1f)
+        (self.r#type().into_inner() >= 0x21)
+            && (self.r#type.into_inner() - 0x21).is_multiple_of(0x1f)
     }
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Snafu, Clone, Copy)]
 pub enum H3StreamCreationError {
     #[snafu(display("Control stream already exists"))]
@@ -465,162 +467,3 @@ where
         ready!(self.poll_try_stream(cx)?).poll_close(cx)
     }
 }
-
-// pin_project_lite::pin_project! {
-//     /// A critical stream is a stream that, upon encountering an I/O error,
-//     /// causes the connection to be closed with H3_CLOSED_CRITICAL_STREAM.
-//     pub struct CriticalStream<S: ?Sized> {
-//         #[pin]
-//         stream: S,
-//     }
-// }
-
-// impl<S> CriticalStream<S> {
-//     pub const fn new(stream: S) -> Self {
-//         Self { stream }
-//     }
-// }
-
-// impl<S: ?Sized> CriticalStream<S> {
-//     fn r#try<'s, T: 's, E>(
-//         self: Pin<&'s mut Self>,
-//         f: impl FnOnce(Pin<&'s mut S>) -> Result<T, E>,
-//     ) -> Result<T, E>
-//     where
-//         E: TryInto<StreamError, Error = E> + From<StreamError> + From<Code>,
-//     {
-//         let project = self.project();
-//         let code = Code::H3_CLOSED_CRITICAL_STREAM;
-//         f(project.stream).map_err(|error| match error.try_into() {
-//             Ok(stream_error) => match stream_error {
-//                 StreamError::Reset { .. } => E::from(code),
-//                 stream_error => E::from(stream_error),
-//             },
-//             Err(error) => error,
-//         })
-//     }
-
-//     fn poll_try<'s, T: 's, E: Error + Send + Sync + 'static>(
-//         self: Pin<&'s mut Self>,
-//         cx: &mut Context<'_>,
-//         f: impl FnOnce(Pin<&'s mut S>, &mut Context<'_>) -> Poll<Result<T, StreamError>>,
-//     ) -> Poll<Result<T, StreamError>> {
-//         let project = self.project();
-//         let code = Code::H3_CLOSED_CRITICAL_STREAM;
-//         f(project.stream, cx).map_err(|error| match error {
-//             StreamError::Reset { .. } => StreamError::Connection {
-//                 source: ApplicationError::from(code).into(),
-//             },
-//             error => error,
-//         })
-//     }
-
-//     fn poll_try_io<'s, T: 's>(
-//         self: Pin<&'s mut Self>,
-//         cx: &mut Context<'_>,
-//         f: impl FnOnce(Pin<&'s mut S>, &mut Context<'_>) -> Poll<io::Result<T>>,
-//     ) -> Poll<io::Result<T>> {
-//         self.poll_try(cx, |stream, cx| f(stream, cx).map_err(StreamError::from))
-//             .map_err(io::Error::other)
-//     }
-// }
-
-// impl<C: QuicConnect + Unpin, S: GetStreamId + ?Sized> GetStreamId for CriticalStream<C, S> {
-//     fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<u64, StreamError>> {
-//         self.poll_try(cx, |stream, cx| stream.poll_stream_id(cx))
-//     }
-// }
-
-// impl<C: QuicConnect + Unpin, S: StopSending + ?Sized> StopSending for CriticalStream<C, S> {
-//     fn poll_stop_sending(
-//         self: Pin<&mut Self>,
-//         cx: &mut Context,
-//         code: VarInt,
-//     ) -> Poll<Result<(), StreamError>> {
-//         self.poll_try(cx, |stream, cx| stream.poll_stop_sending(cx, code))
-//     }
-// }
-
-// impl<C: QuicConnect + Unpin, S: AsyncRead + ?Sized> AsyncRead for CriticalStream<C, S> {
-//     fn poll_read(
-//         self: Pin<&mut Self>,
-//         cx: &mut Context<'_>,
-//         buf: &mut ReadBuf<'_>,
-//     ) -> Poll<io::Result<()>> {
-//         self.poll_try_io(cx, |stream, cx| stream.poll_read(cx, buf))
-//     }
-// }
-
-// impl<C: QuicConnect + Unpin, S: AsyncBufRead + ?Sized> AsyncBufRead for CriticalStream<C, S> {
-//     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
-//         self.poll_try_io(cx, |stream, cx| stream.poll_fill_buf(cx))
-//     }
-
-//     fn consume(self: Pin<&mut Self>, amt: usize) {
-//         self.project().stream.consume(amt);
-//     }
-// }
-
-// impl<T, E, C, S> Stream for CriticalStream<C, S>
-// where
-//     E: Error + Send + Sync + 'static,
-//     C: QuicConnect + Unpin,
-//     S: Stream<Item = Result<T, E>> + ?Sized,
-// {
-//     type Item = Result<T, ErrorWithCode>;
-
-//     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-//         self.poll_try(cx, |stream, cx| {
-//             stream.poll_next(cx).map(|option| option.transpose())
-//         })
-//         .map(|result| result.transpose())
-//     }
-// }
-
-// impl<C: QuicConnect + Unpin, S: CancelStream + ?Sized> CancelStream for CriticalStream<C, S> {
-//     fn poll_cancel(self: Pin<&mut Self>, code: VarInt) {
-//         self.project().stream.poll_cancel(code)
-//     }
-// }
-
-// impl<C: QuicConnect + Unpin, S: AsyncWrite + ?Sized> AsyncWrite for CriticalStream<C, S> {
-//     fn poll_write(
-//         self: Pin<&mut Self>,
-//         cx: &mut Context<'_>,
-//         buf: &[u8],
-//     ) -> Poll<io::Result<usize>> {
-//         self.poll_try_io(cx, |stream, cx| stream.poll_write(cx, buf))
-//     }
-
-//     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-//         self.poll_try_io(cx, |stream, cx| stream.poll_flush(cx))
-//     }
-
-//     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-//         self.poll_try_io(cx, |stream, cx| stream.poll_shutdown(cx))
-//     }
-// }
-
-// impl<T, C, S> Sink<T> for CriticalStream<C, S>
-// where
-//     C: QuicConnect + Unpin,
-//     S: Sink<T, Error: Error + Send + Sync + 'static>,
-// {
-//     type Error = ErrorWithCode;
-
-//     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-//         self.poll_try(cx, |stream, cx| stream.poll_ready(cx))
-//     }
-
-//     fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
-//         self.r#try(|stream| stream.start_send(item))
-//     }
-
-//     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-//         self.poll_try(cx, |stream, cx| stream.poll_flush(cx))
-//     }
-
-//     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-//         self.poll_try(cx, |stream, cx| stream.poll_close(cx))
-//     }
-// }

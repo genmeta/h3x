@@ -5,7 +5,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes};
 use futures::{Sink, Stream, StreamExt};
 use tokio::io::{self, AsyncWrite};
 
@@ -15,51 +15,6 @@ use crate::{
     varint::VarInt,
 };
 
-// TODO: improve this
-enum SinkWriterBuffer {
-    Buffering(BytesMut),
-    // empty: no data to flush
-    Flushing(Bytes),
-}
-
-impl SinkWriterBuffer {
-    pub const fn new() -> Self {
-        Self::Flushing(Bytes::new())
-    }
-
-    pub fn buffer(&mut self) -> &mut Bytes {
-        match self {
-            SinkWriterBuffer::Buffering(bytes) => {
-                let bytes = mem::take(bytes).freeze();
-                *self = SinkWriterBuffer::Flushing(bytes.clone());
-                self.buffer()
-            }
-            SinkWriterBuffer::Flushing(bytes) => bytes,
-        }
-    }
-
-    pub fn writeable(&self) -> bool {
-        match self {
-            SinkWriterBuffer::Buffering(..) => true,
-            SinkWriterBuffer::Flushing(bytes) => bytes.is_empty(),
-        }
-    }
-
-    pub fn buffer_mut(&mut self) -> &mut BytesMut {
-        match self {
-            SinkWriterBuffer::Buffering(bytes) => bytes,
-            SinkWriterBuffer::Flushing(bytes) => {
-                debug_assert!(
-                    bytes.is_empty(),
-                    "Flushing buffer should be empty when switch to buffering state"
-                );
-                *self = SinkWriterBuffer::Buffering(BytesMut::new());
-                self.buffer_mut()
-            }
-        }
-    }
-}
-
 pin_project_lite::pin_project! {
     /// Sink writer that support both [`Sink`] and [`AsyncWrite`] interface.
     ///
@@ -68,14 +23,14 @@ pin_project_lite::pin_project! {
     /// or [`Self::flush_buffer`] to flush the buffer to the underlying sink.
     ///
     /// [`SinkWriter`]: tokio_util::io::SinkWriter
-    pub struct BufSinkWriter<S: ?Sized> {
-        buffer: SinkWriterBuffer,
+    pub struct SinkWriter<S: ?Sized> {
+        buffer: Bytes,
         #[pin]
         stream: S,
     }
 }
 
-impl<S> BufSinkWriter<S>
+impl<S> SinkWriter<S>
 where
     S: Sink<Bytes> + ?Sized,
 {
@@ -85,7 +40,7 @@ where
     {
         Self {
             stream,
-            buffer: SinkWriterBuffer::new(),
+            buffer: Bytes::new(),
         }
     }
 
@@ -94,32 +49,16 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), S::Error>> {
         let mut project = self.as_mut().project();
-        let buffer = project.buffer.buffer();
-        while !buffer.is_empty() {
+        while !project.buffer.is_empty() {
             ready!(project.stream.as_mut().poll_ready(cx)?);
-            let bytes = buffer.clone();
+            let bytes = mem::take(project.buffer);
             project.stream.as_mut().start_send(bytes)?;
-            buffer.clear();
         }
         Poll::Ready(Ok(()))
     }
 
-    pub async fn flush_buffer(&mut self) -> Result<(), S::Error>
-    where
-        S: Unpin,
-    {
-        poll_fn(|cx| Pin::new(&mut *self).poll_flush_buffer(cx)).await
-    }
-
-    pub fn poll_buffer(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<&mut BytesMut, S::Error>> {
-        while !self.buffer.writeable() {
-            ready!(self.as_mut().poll_flush_buffer(cx)?);
-        }
-
-        Poll::Ready(Ok(self.project().buffer.buffer_mut()))
+    pub async fn flush_buffer(mut self: Pin<&mut Self>) -> Result<(), S::Error> {
+        poll_fn(|cx| self.as_mut().poll_flush_buffer(cx)).await
     }
 
     pub fn into_inner(self) -> S
@@ -130,7 +69,7 @@ where
     }
 }
 
-impl<S> Sink<Bytes> for BufSinkWriter<S>
+impl<S> Sink<Bytes> for SinkWriter<S>
 where
     S: Sink<Bytes> + ?Sized,
 {
@@ -142,12 +81,11 @@ where
 
     fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
         let project = self.project();
-        let buffer = project.buffer.buffer();
         debug_assert!(
-            buffer.is_empty(),
+            project.buffer.is_empty(),
             "poll_ready must be called before start_send"
         );
-        *buffer = item;
+        *project.buffer = item;
         Ok(())
     }
 
@@ -163,7 +101,7 @@ where
     }
 }
 
-impl<S> AsyncWrite for BufSinkWriter<S>
+impl<S> AsyncWrite for SinkWriter<S>
 where
     S: Sink<Bytes> + ?Sized,
     io::Error: From<S::Error>,
@@ -173,8 +111,24 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let buffer = ready!(self.as_mut().poll_buffer(cx)?);
-        buffer.extend_from_slice(buf);
+        let project = self.as_mut().project();
+
+        // optimize: try to write into the internal buffer without flushing
+        if project.buffer.len() + buf.len() < 8 * 1024 {
+            match mem::take(project.buffer).try_into_mut() {
+                Ok(mut bytes_mut) => {
+                    bytes_mut.put(buf);
+                    *project.buffer = bytes_mut.freeze();
+                    return Poll::Ready(Ok(buf.len()));
+                }
+                Err(bytes) => {
+                    *project.buffer = bytes;
+                }
+            }
+        }
+        ready!(self.as_mut().poll_flush_buffer(cx)?);
+        *self.project().buffer = Bytes::copy_from_slice(buf);
+
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -187,7 +141,7 @@ where
     }
 }
 
-impl<S: CancelStream + ?Sized> CancelStream for BufSinkWriter<S> {
+impl<S: CancelStream + ?Sized> CancelStream for SinkWriter<S> {
     fn poll_cancel(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -197,7 +151,7 @@ impl<S: CancelStream + ?Sized> CancelStream for BufSinkWriter<S> {
     }
 }
 
-impl<S: GetStreamId + ?Sized> GetStreamId for BufSinkWriter<S> {
+impl<S: GetStreamId + ?Sized> GetStreamId for SinkWriter<S> {
     fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>> {
         self.project().stream.poll_stream_id(cx)
     }
@@ -259,7 +213,10 @@ where
 
     fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
         let project = self.project();
-        assert!(project.item.is_none(), "item is None");
+        assert!(
+            project.item.is_none(),
+            "start_send called before poll_ready"
+        );
         *project.item = Some(item);
         Ok(())
     }

@@ -13,10 +13,9 @@ use tokio::{io::AsyncBufRead, sync::Mutex as AsyncMutex};
 use crate::{
     codec::{
         Feed,
-        error::{DecodeStreamError, EncodeStreamError},
         util::{DecodeFrom, decoder},
     },
-    error::{Code, H3CriticalStreamClosed, HasErrorCode, StreamError},
+    error::{Code, Error, H3CriticalStreamClosed, HasErrorCode, StreamError},
     qpack::{
         dynamic::DynamicTable,
         field_section::{FieldLine, FieldSection},
@@ -316,9 +315,8 @@ impl HasErrorCode for InvalidDynamicTableReference {
 
 impl<Ds, Es> Decoder<Ds, Es>
 where
-    Ds: Sink<DecoderInstruction> + Unpin,
-    EncodeStreamError: From<<Ds as Sink<DecoderInstruction>>::Error>,
-    Es: Stream<Item = Result<EncoderInstruction, DecodeStreamError>> + Unpin,
+    Ds: Sink<DecoderInstruction, Error = Error> + Unpin,
+    Es: Stream<Item = Result<EncoderInstruction, Error>> + Unpin,
 {
     pub fn new(settings: Settings, decoder_stream: Ds, encoder_stream: Es) -> Self {
         Self {
@@ -331,7 +329,7 @@ where
     pub async fn decode(
         &self,
         stream: impl AsyncBufRead + GetStreamId,
-    ) -> Result<FieldSection, DecodeStreamError> {
+    ) -> Result<FieldSection, Error> {
         tokio::pin!(stream);
         let stream_id = stream.stream_id().await?.into_inner();
         let prefix = EncodedFieldSectionPrefix::decode_from(stream.as_mut()).await?;
@@ -345,7 +343,7 @@ where
                     prefix.base,
                     &self.state.lock().unwrap().dynamic_table,
                 )
-                .map_err(DecodeStreamError::from)
+                .map_err(Error::from)
             })
         }))
         .await?;
@@ -360,7 +358,7 @@ where
         std::iter::from_fn(move || self.state.lock().unwrap().pending_instructions.pop_front())
     }
 
-    pub async fn flush_instructions(&self) -> Result<(), EncodeStreamError> {
+    pub async fn flush_instructions(&self) -> Result<(), Error> {
         let mut decoder_stream = self.decoder_stream.lock().await;
         let mut decoder_stream = Pin::new(&mut *decoder_stream);
         let instructions = stream::iter(self.pending_instructions());
@@ -369,10 +367,7 @@ where
         Ok(())
     }
 
-    pub async fn receive_instruction_until(
-        &self,
-        known_received_count: u64,
-    ) -> Result<(), DecodeStreamError> {
+    pub async fn receive_instruction_until(&self, known_received_count: u64) -> Result<(), Error> {
         loop {
             if self.known_received_count() >= known_received_count {
                 return Ok(());

@@ -11,20 +11,19 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     codec::{
-        BufSinkWriter, Feed,
-        error::{DecodeStreamError, EncodeStreamError},
+        Feed, SinkWriter,
         util::{EncodeInto, encoder},
     },
-    error::{Code, H3CriticalStreamClosed, HasErrorCode},
+    error::{Code, Error, H3CriticalStreamClosed, HasErrorCode},
     frame::Frame,
     qpack::{
+        algorithm::Algorithm,
         dynamic::DynamicTable,
         field_section::FieldLine,
         header_block::FieldLineRepresentation,
         instruction::{DecoderInstruction, EncoderInstruction},
         settings::Settings,
         r#static,
-        strategy::Encode,
     },
     quic::{GetStreamId, GetStreamIdExt},
 };
@@ -321,9 +320,8 @@ pub(crate) fn get_dynamic_references<'r>(
 
 impl<Es, Ds> Encoder<Es, Ds>
 where
-    Es: Sink<EncoderInstruction> + Unpin,
-    EncodeStreamError: From<<Es as Sink<EncoderInstruction>>::Error>,
-    Ds: Stream<Item = Result<DecoderInstruction, DecodeStreamError>> + Unpin,
+    Es: Sink<EncoderInstruction, Error = Error> + Unpin,
+    Ds: Stream<Item = Result<DecoderInstruction, Error>> + Unpin,
 {
     pub fn new(settings: Settings, encoder_stream: Es, decoder_stream: Ds) -> Self {
         Self {
@@ -339,21 +337,19 @@ where
 
     pub async fn encode(
         &self,
-        field_section: impl IntoIterator<Item = FieldLine>,
-        strategy: &(impl Encode + ?Sized),
+        field_section: impl IntoIterator<Item = FieldLine> + Send,
+        algorithm: &(impl Algorithm + ?Sized),
         stream: impl GetStreamId,
-    ) -> Result<Frame<Vec<Bytes>>, EncodeStreamError> {
+    ) -> Result<Frame<Vec<Bytes>>, Error> {
         tokio::pin!(stream);
         let stream_id = stream.stream_id().await?.into_inner();
-        let mut fields = field_section.into_iter();
 
-        let (field_section_prefix, field_line_representations, instructions);
+        let (field_section_prefix, field_line_representations);
         {
             let mut state = self.state.lock().await;
 
             (field_section_prefix, field_line_representations) =
-                strategy.encode(&mut state, &mut fields).await;
-            instructions = std::mem::take(&mut state.pending_instructions);
+                algorithm.compress(&mut state, field_section).await;
 
             let max_referenced_index = get_dynamic_references(&field_line_representations)
                 .max()
@@ -368,7 +364,8 @@ where
 
         let mut header_frame = Frame::new::<Bytes>(Frame::HEADERS_FRAME_TYPE, vec![]).unwrap();
         {
-            let mut frame_writer = BufSinkWriter::new(&mut header_frame);
+            let mut frame_writer =
+                SinkWriter::new((&mut header_frame).sink_map_err(|error| match error {}));
             // encode EncodedFieldSectionPrefix
             field_section_prefix.encode_into(&mut frame_writer).await?;
             // encode FieldLineRepresentations
@@ -393,7 +390,7 @@ where
         })
     }
 
-    pub async fn flush_instructions(&self) -> Result<(), EncodeStreamError> {
+    pub async fn flush_instructions(&self) -> Result<(), Error> {
         let mut encoder_stream = self.encoder_stream.lock().await;
         let mut encoder_stream = Pin::new(encoder_stream.deref_mut());
         let instructions = self.pending_instructions();
@@ -402,7 +399,7 @@ where
         Ok(())
     }
 
-    pub async fn receive_instruction(&self) -> Result<(), DecodeStreamError> {
+    pub async fn receive_instruction(&self) -> Result<(), Error> {
         let instruction = {
             let mut decoder_stream = self.decoder_stream.lock().await;
             let instruction = decoder_stream.next().await;

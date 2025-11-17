@@ -6,8 +6,9 @@ use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite};
 use crate::{
     codec::{
         FixedLengthReader,
-        error::{DecodeError, DecodeStreamError, EncodeError, EncodeStreamError},
+        error::{DecodeError, DecodeStreamError},
     },
+    error::StreamError,
     qpack::integer::{decode_integer, encode_integer},
 };
 
@@ -34,16 +35,13 @@ pub async fn decode_string(
     }
 }
 
-pub async fn encode_string<E>(
-    stream: impl AsyncWrite + Sink<Bytes, Error = E>,
+pub async fn encode_string(
+    stream: impl AsyncWrite + Sink<Bytes, Error = StreamError>,
     mut prefix: u8,
     n: u8,
     huffman: bool,
     data: Bytes,
-) -> Result<(), EncodeStreamError>
-where
-    EncodeStreamError: From<E>,
-{
+) -> Result<(), StreamError> {
     tokio::pin!(stream);
     // set H bit
     prefix |= (huffman as u8) << (n - 1);
@@ -51,7 +49,8 @@ where
     match huffman {
         true => {
             let mut encoded_data = vec![];
-            httlib_huffman::encode(&data, &mut encoded_data).map_err(EncodeError::from)?;
+            httlib_huffman::encode(&data, &mut encoded_data)
+                .expect("Invalid header value sequence");
             encode_integer(stream.as_mut(), prefix, n - 1, encoded_data.len() as u64).await?;
             stream.send(Bytes::from_owner(encoded_data)).await?;
             Ok(())

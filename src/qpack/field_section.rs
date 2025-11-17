@@ -10,8 +10,8 @@ use http::{
 use snafu::{Snafu, ensure};
 
 use crate::{
-    codec::{error::DecodeStreamError, util::DecodeFrom},
-    error::{Code, HasErrorCode},
+    codec::util::DecodeFrom,
+    error::{Code, Error, HasErrorCode},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -197,19 +197,18 @@ fn is_response_pseudo_header(name: &[u8]) -> bool {
     matches!(name, b":status")
 }
 
-impl<S, E> DecodeFrom<S> for FieldSection
+impl<S> DecodeFrom<S> for FieldSection
 where
-    S: Stream<Item = Result<FieldLine, E>>,
-    DecodeStreamError: From<E>,
+    S: Stream<Item = Result<FieldLine, Error>>,
 {
-    async fn decode_from(stream: S) -> Result<Self, DecodeStreamError> {
+    type Error = Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Error> {
         tokio::pin!(stream);
 
         let mut pseudo_header = None;
         let mut header_map = HeaderMap::new();
-        while let Some(FieldLine { name, value }) = stream.try_next().await.map_err(|error| {
-            DecodeStreamError::from(error).map_incomplete(|| Code::H3_FRAME_ERROR.into())
-        })? {
+        while let Some(FieldLine { name, value }) = stream.try_next().await? {
             match name.as_ref() {
                 pseudo if pseudo.starts_with(b":") && is_request_pseudo_header(&name) => {
                     ensure!(

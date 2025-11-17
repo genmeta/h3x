@@ -1,6 +1,6 @@
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::codec::error::{DecodeStreamError, EncodeStreamError};
+use crate::{codec::error::DecodeStreamError, error::StreamError};
 
 /// Pseudocode to decode an integer I is as follows:
 ///
@@ -57,7 +57,7 @@ pub async fn encode_integer(
     prefix: u8,
     n: u8,
     mut i: u64,
-) -> Result<(), EncodeStreamError> {
+) -> Result<(), StreamError> {
     tokio::pin!(stream);
     let limit = (1 << n) - 1;
     if i < limit as u64 {

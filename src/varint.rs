@@ -2,9 +2,12 @@ use std::{cmp::Ordering, convert::TryFrom, fmt};
 
 use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::codec::{
-    error::{DecodeStreamError, EncodeStreamError},
-    util::{DecodeFrom, EncodeInto},
+use crate::{
+    codec::{
+        error::DecodeStreamError,
+        util::{DecodeFrom, EncodeInto},
+    },
+    error::StreamError,
 };
 
 /// An integer less than 2^62
@@ -177,6 +180,7 @@ pub mod err {
 }
 
 impl<S: AsyncBufRead> DecodeFrom<S> for VarInt {
+    type Error = DecodeStreamError;
     async fn decode_from(stream: S) -> Result<Self, DecodeStreamError> {
         tokio::pin!(stream);
         let first_byte = stream.read_u8().await?;
@@ -189,7 +193,9 @@ impl<S: AsyncBufRead> DecodeFrom<S> for VarInt {
 }
 
 impl<S: AsyncWrite> EncodeInto<S> for VarInt {
-    async fn encode_into(self, stream: S) -> Result<(), EncodeStreamError> {
+    type Error = StreamError;
+
+    async fn encode_into(self, stream: S) -> Result<(), StreamError> {
         let VarInt(x) = self;
         tokio::pin!(stream);
         if x < 1u64 << 6 {

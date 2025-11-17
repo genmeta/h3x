@@ -11,12 +11,12 @@ use tracing::Instrument;
 
 use crate::{
     codec::{
-        BufSinkWriter, BufStreamReader,
-        error::{DecodeStreamError, EncodeStreamError},
+        SinkWriter, StreamReader,
         util::{DecodeFrom, EncodeInto, decoder, encoder},
     },
     error::{
-        Code, ConnectionError, H3CriticalStreamClosed, H3FrameUnexpected, HasErrorCode, StreamError,
+        Code, ConnectionError, Error, H3CriticalStreamClosed, H3FrameUnexpected, HasErrorCode,
+        StreamError,
     },
     frame::Frame,
     message::{MessageReader, MessageWriter},
@@ -77,28 +77,18 @@ impl<C: QuicConnect + Unpin> State<C> {
         Pin::new(self.quic_connection().deref_mut()).close(error.code(), error.to_string().into())
     }
 
-    pub async fn handle_encode_stream_error(&self, error: EncodeStreamError) -> StreamError {
+    pub async fn handle_error(&self, error: Error) -> StreamError {
         match error {
-            EncodeStreamError::Stream { source } => source,
-            EncodeStreamError::Encode { .. } => {
-                unreachable!("Decode error should be converted before this point")
-            }
-            EncodeStreamError::Code { source } => {
+            Error::Stream { source } => match source {
+                StreamError::Connection { source } => {
+                    _ = self.error.set_with(|| source);
+                    self.error.get().await.into()
+                }
+                StreamError::Reset { .. } => source,
+            },
+            Error::Code { source } => {
                 self.close(source.as_ref());
-                self.error().await.into()
-            }
-        }
-    }
-
-    pub async fn handle_decode_stream_error(&self, error: DecodeStreamError) -> StreamError {
-        match error {
-            DecodeStreamError::Stream { source } => source,
-            DecodeStreamError::Decode { .. } => {
-                unreachable!("Decode error should be converted before this point")
-            }
-            DecodeStreamError::Code { source } => {
-                self.close(source.as_ref());
-                self.error().await.into()
+                self.error.get().await.into()
             }
         }
     }
@@ -116,8 +106,8 @@ impl<C: QuicConnect + Unpin> State<C> {
     }
 }
 
-pub type BoxStreamWriter<C> = BufSinkWriter<Pin<Box<<C as QuicConnect>::StreamWriter>>>;
-pub type BoxStreamReader<C> = BufStreamReader<Pin<Box<<C as QuicConnect>::StreamReader>>>;
+pub type BoxStreamWriter<C> = SinkWriter<Pin<Box<<C as QuicConnect>::StreamWriter>>>;
+pub type BoxStreamReader<C> = StreamReader<Pin<Box<<C as QuicConnect>::StreamReader>>>;
 
 pub type QPackEncoder = Encoder<
     BoxInstructionSink<'static, EncoderInstruction>,
@@ -162,12 +152,12 @@ where
             let conn_state = state.clone();
             let qpack_encoder_inst_sender = Box::pin(TryFutureStream::from(Box::pin(async move {
                 // open QPACK encoder stream
-                let uni_stream = Box::pin(BufSinkWriter::new(conn_state.open_uni().await?));
+                let uni_stream = Box::pin(SinkWriter::new(conn_state.open_uni().await?));
                 // send encoder stream type
                 let encoder_stream =
                     UnidirectionalStream::new_qpack_encoder_stream(uni_stream).await?;
                 // turn into EncoderInstruction sink
-                Ok::<_, EncodeStreamError>(encoder::<EncoderInstruction, _>(encoder_stream))
+                Ok::<_, Error>(encoder(encoder_stream))
             })));
 
             let connection_error = state.error();
@@ -190,12 +180,12 @@ where
             let conn_state = state.clone();
             let qpack_decoder_inst_sender = Box::pin(TryFutureStream::from(async move {
                 // open QPACK encoder stream
-                let uni_stream = Box::pin(BufSinkWriter::new(conn_state.open_uni().await?));
+                let uni_stream = Box::pin(SinkWriter::new(conn_state.open_uni().await?));
                 // send encoder stream type
                 let decoder_stream =
                     UnidirectionalStream::new_qpack_decoder_stream(uni_stream).await?;
                 // turn into DecoderInstruction sink
-                Ok::<_, EncodeStreamError>(encoder(decoder_stream))
+                Ok::<_, Error>(encoder(decoder_stream))
             }));
 
             let connection_error = state.error();
@@ -213,14 +203,6 @@ where
             ))
         };
 
-        let apply_remote_settings = {
-            let qpack_encoder = qpack_encoder.clone();
-            let remote_settings = state.remote_settings.get();
-            async move { qpack_encoder.apply_settings(remote_settings.await).await }
-        };
-        let apply_remote_settings =
-            AbortOnDropHandle::new(tokio::spawn(apply_remote_settings.in_current_span()));
-
         let conn_state = state.clone();
         let accept_uni = async move {
             let mut qpack_encoder_inst_receiver_tx = Some(qpack_encoder_inst_receiver_tx);
@@ -228,7 +210,7 @@ where
             let mut control_stream_tx = Some(control_stream_tx);
             loop {
                 let uni_stream = conn_state.accept_uni().await?;
-                let uni_stream = BufStreamReader::new(Box::pin(uni_stream));
+                let uni_stream = StreamReader::new(Box::pin(uni_stream));
                 if let Ok(mut uni_stream) = UnidirectionalStream::decode_from(uni_stream).await {
                     // Only one control stream per peer is permitted; receipt of a second
                     // stream claiming to be a control stream MUST be treated as a connection
@@ -246,12 +228,12 @@ where
                         let tx = qpack_encoder_inst_receiver_tx
                             .take()
                             .ok_or(H3StreamCreationError::DuplicateQpackEncoderStream)?;
-                        _ = tx.send(decoder::<EncoderInstruction, _>(uni_stream))
+                        _ = tx.send(decoder(uni_stream))
                     } else if uni_stream.is_qpack_decoder_stream() {
                         let tx = qpack_decoder_inst_receiver_tx
                             .take()
                             .ok_or(H3StreamCreationError::DuplicateQpackDecoderStream)?;
-                        _ = tx.send(decoder::<DecoderInstruction, _>(uni_stream))
+                        _ = tx.send(decoder(uni_stream))
                     } else if uni_stream.is_reserved_stream() {
                         // The payload and length of the stream are selected in any manner the
                         // sending implementation chooses. When sending a reserved stream type,
@@ -278,15 +260,16 @@ where
             }
 
             #[allow(unreachable_code)]
-            Ok::<_, DecodeStreamError>(())
+            Ok::<_, Error>(())
         };
         let accept_uni_task = AbortOnDropHandle::new(tokio::spawn(accept_uni.in_current_span()));
 
+        let encoder = qpack_encoder.clone();
         let conn_state = state.clone();
         let handle_control = async move {
             let control_stream = tokio::select! {
                 Ok(control_stream) = control_stream_rx => control_stream.into_inner(),
-                _error = conn_state.error() => return Ok::<_, DecodeStreamError>(()),
+                _error = conn_state.error() => return Ok::<_, Error>(()),
             };
 
             // SETTINGS frames always apply to an entire HTTP/3 connection, never a
@@ -303,7 +286,8 @@ where
             }
             let settings = Settings::decode_from(&mut settings_frame).await?;
             tracing::debug!("Remote settings applied: {:?}", settings);
-            conn_state.remote_settings.set(settings).unwrap();
+            conn_state.remote_settings.set(settings.clone()).unwrap();
+            encoder.apply_settings(settings.clone()).await;
 
             let mut next_frame = settings_frame
                 .into_next_frame()
@@ -327,59 +311,40 @@ where
                 }
             }
         };
-        let handle_control = async move {
-            handle_control.await.map_err(|error| {
-                error
-                    .map_stream_reset(|_| H3CriticalStreamClosed::Control.into())
-                    .map_incomplete(|| H3CriticalStreamClosed::Control.into())
-            })
-        };
         let handle_control_stream =
             AbortOnDropHandle::new(tokio::spawn(handle_control.in_current_span()));
 
         let encoder = qpack_encoder.clone();
-        let reveice_decoder_instructions = async move {
+        let receive_decoder_instructions = async move {
             loop {
                 encoder.receive_instruction().await?
             }
 
             #[allow(unreachable_code)]
-            Ok::<_, DecodeStreamError>(())
-        };
-        let receive_decoder_instructions = async move {
-            reveice_decoder_instructions.await.map_err(|error| {
-                error.map_stream_reset(|_| H3CriticalStreamClosed::QPackDecoder.into())
-            })
+            Ok::<_, Error>(())
         };
         let receive_decoder_instructions =
             AbortOnDropHandle::new(tokio::spawn(receive_decoder_instructions.in_current_span()));
 
         let conn_state = state.clone();
         let task = async move {
-            let _move = apply_remote_settings;
             match tokio::try_join!(
                 accept_uni_task.map(Result::unwrap),
                 handle_control_stream.map(Result::unwrap),
                 receive_decoder_instructions.map(Result::unwrap)
             ) {
                 Ok(_) => unreachable!(),
-                Err(error) => match error {
-                    DecodeStreamError::Stream {
-                        source: StreamError::Connection { source },
-                    } => _ = conn_state.error.set(source),
-                    error => _ = conn_state.handle_decode_stream_error(error).await,
-                },
+                Err(error) => _ = conn_state.handle_error(error).await,
             }
         };
-        let task = AbortOnDropHandle::new(tokio::spawn(task.in_current_span()));
 
         // open control stream
-        let uni_stream = BufSinkWriter::new(Box::pin(state.open_uni().await?));
+        let uni_stream = SinkWriter::new(Box::pin(state.open_uni().await?));
         // send control stream type
         let mut control_stream = match UnidirectionalStream::new_control_stream(uni_stream).await {
             Ok(control_stream) => control_stream,
             Err(error) => {
-                state.handle_encode_stream_error(error).await;
+                state.handle_error(error).await;
                 return Err(state.error().await);
             }
         };
@@ -387,7 +352,7 @@ where
         match settings.encode_into(&mut control_stream).await {
             Ok(()) => {}
             Err(error) => {
-                state.handle_encode_stream_error(error).await;
+                state.handle_error(error).await;
                 return Err(state.error().await);
             }
         }
@@ -397,7 +362,7 @@ where
             qpack_encoder,
             qpack_decoder,
             control_stream: AsyncMutex::new(control_stream),
-            task,
+            task: AbortOnDropHandle::new(tokio::spawn(task.in_current_span())),
         })
     }
 
@@ -415,12 +380,12 @@ where
             MessageWriter::new(
                 self.state.clone(),
                 self.qpack_encoder.clone(),
-                BufSinkWriter::new(Box::pin(writer)),
+                SinkWriter::new(Box::pin(writer)),
             ),
             MessageReader::new(
                 self.state.clone(),
                 self.qpack_decoder.clone(),
-                BufStreamReader::new(Box::pin(reader)),
+                StreamReader::new(Box::pin(reader)),
             ),
         ))
     }
@@ -431,12 +396,12 @@ where
             MessageWriter::new(
                 self.state.clone(),
                 self.qpack_encoder.clone(),
-                BufSinkWriter::new(Box::pin(writer)),
+                SinkWriter::new(Box::pin(writer)),
             ),
             MessageReader::new(
                 self.state.clone(),
                 self.qpack_decoder.clone(),
-                BufStreamReader::new(Box::pin(reader)),
+                StreamReader::new(Box::pin(reader)),
             )
             .await?,
         ))

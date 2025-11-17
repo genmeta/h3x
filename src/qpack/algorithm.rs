@@ -29,14 +29,12 @@ impl HuffmanStrategize for HuffmanNever {
     }
 }
 
-pub trait Encode {
-    type Encode<'s>: Future<Output = (EncodedFieldSectionPrefix, Vec<FieldLineRepresentation>)> + 's;
-
-    fn encode<'s>(
+pub trait Algorithm {
+    fn compress(
         &self,
-        state: &'s mut EncoderState,
-        entries: &'s mut dyn Iterator<Item = FieldLine>,
-    ) -> Self::Encode<'s>;
+        state: &mut EncoderState,
+        entries: impl IntoIterator<Item = FieldLine> + Send,
+    ) -> impl Future<Output = (EncodedFieldSectionPrefix, Vec<FieldLineRepresentation>)> + Send;
 }
 
 pub struct StaticEncoder<HS> {
@@ -49,17 +47,15 @@ impl<HS> StaticEncoder<HS> {
     }
 }
 
-impl<HS> Encode for StaticEncoder<HS>
+impl<HS> Algorithm for StaticEncoder<HS>
 where
-    HS: HuffmanStrategize,
+    HS: HuffmanStrategize + Send + Sync,
 {
-    type Encode<'s> = std::future::Ready<(EncodedFieldSectionPrefix, Vec<FieldLineRepresentation>)>;
-
-    fn encode<'s>(
+    async fn compress(
         &self,
-        _state: &'s mut EncoderState,
-        entries: &'s mut dyn Iterator<Item = FieldLine>,
-    ) -> Self::Encode<'s> {
+        _state: &mut EncoderState,
+        entries: impl IntoIterator<Item = FieldLine> + Send,
+    ) -> (EncodedFieldSectionPrefix, Vec<FieldLineRepresentation>) {
         let prefix = EncodedFieldSectionPrefix {
             required_insert_count: 0,
             base: 0,
@@ -94,6 +90,6 @@ where
                 })
             }
         }
-        std::future::ready((prefix, representations))
+        (prefix, representations)
     }
 }

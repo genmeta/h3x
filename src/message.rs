@@ -1,5 +1,5 @@
 use std::{
-    error::Error,
+    error::Error as StdError,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, ready},
@@ -12,43 +12,48 @@ use http_body_util::{BodyExt, StreamBody, combinators::UnsyncBoxBody};
 
 use crate::{
     codec::{
-        BufSinkWriter, FixedLengthReader,
-        error::{DecodeStreamError, EncodeStreamError},
+        FixedLengthReader, SinkWriter,
         util::{DecodeFrom, EncodeInto},
     },
     connection::{BoxStreamReader, QPackDecoder, QPackEncoder, State},
-    error::{ApplicationError, Code, HasErrorCode, StreamError},
+    error::{Code, Error, StreamError},
     frame::Frame,
     qpack::{
+        algorithm::{HuffmanAlways, StaticEncoder},
         field_section::FieldSection,
-        strategy::{HuffmanAlways, StaticEncoder},
     },
     quic::{CancelStream, CancelStreamExt, GetStreamId, GetStreamIdExt, QuicConnect, StopSending},
-    varint::{VarInt, err},
+    varint::VarInt,
 };
 
 pub struct MessageWriter<C: QuicConnect + Unpin> {
     conenction_state: Arc<State<C>>,
     encoder: Arc<QPackEncoder>,
-    stream: BufSinkWriter<Pin<Box<C::StreamWriter>>>,
+    stream: SinkWriter<Pin<Box<C::StreamWriter>>>,
 }
 
 impl<C: QuicConnect + Unpin> EncodeInto<&mut MessageWriter<C>> for request::Parts {
-    async fn encode_into(self, writer: &mut MessageWriter<C>) -> Result<(), EncodeStreamError> {
+    type Error = Error;
+
+    async fn encode_into(self, writer: &mut MessageWriter<C>) -> Result<(), Error> {
         writer.send_header(self.try_into()?).await
     }
 }
 
 impl<C: QuicConnect + Unpin> EncodeInto<&mut MessageWriter<C>> for response::Parts {
-    async fn encode_into(self, writer: &mut MessageWriter<C>) -> Result<(), EncodeStreamError> {
+    type Error = Error;
+
+    async fn encode_into(self, writer: &mut MessageWriter<C>) -> Result<(), Error> {
         writer.send_header(self.try_into()?).await
     }
 }
 
 impl<C: QuicConnect + Unpin, B: Buf> EncodeInto<&mut MessageWriter<C>> for http_body::Frame<B> {
-    async fn encode_into(self, writer: &mut MessageWriter<C>) -> Result<(), EncodeStreamError> {
+    type Error = Error;
+
+    async fn encode_into(self, writer: &mut MessageWriter<C>) -> Result<(), Error> {
         match self.into_data() {
-            Ok(bytes) => writer.send_data([bytes]).await,
+            Ok(bytes) => writer.send_data([bytes]).await.map_err(Error::from),
             Err(frame) => match frame.into_trailers() {
                 Ok(tailers) => writer.send_header(tailers.into()).await,
                 Err(_) => panic!("currently, only data and trailers can be sent"),
@@ -60,9 +65,11 @@ impl<C: QuicConnect + Unpin, B: Buf> EncodeInto<&mut MessageWriter<C>> for http_
 impl<C, B> EncodeInto<&mut MessageWriter<C>> for Request<B>
 where
     C: QuicConnect + Unpin,
-    B: http_body::Body<Data: Buf, Error: Error>,
+    B: http_body::Body<Data: Buf, Error: StdError>,
 {
-    async fn encode_into(self, writer: &mut MessageWriter<C>) -> Result<(), EncodeStreamError> {
+    type Error = Error;
+
+    async fn encode_into(self, writer: &mut MessageWriter<C>) -> Result<(), Error> {
         let (parts, body) = self.into_parts();
         parts.encode_into(writer).await?;
         tokio::pin!(body);
@@ -79,9 +86,11 @@ where
 impl<C, B> EncodeInto<&mut MessageWriter<C>> for Response<B>
 where
     C: QuicConnect + Unpin,
-    B: http_body::Body<Data: Buf, Error: Error>,
+    B: http_body::Body<Data: Buf, Error: StdError>,
 {
-    async fn encode_into(self, writer: &mut MessageWriter<C>) -> Result<(), EncodeStreamError> {
+    type Error = Error;
+
+    async fn encode_into(self, writer: &mut MessageWriter<C>) -> Result<(), Error> {
         let (parts, body) = self.into_parts();
         parts.encode_into(writer).await?;
 
@@ -101,7 +110,7 @@ impl<C: QuicConnect + Unpin> MessageWriter<C> {
     pub fn new(
         conenction_state: Arc<State<C>>,
         encoder: Arc<QPackEncoder>,
-        stream: BufSinkWriter<Pin<Box<C::StreamWriter>>>,
+        stream: SinkWriter<Pin<Box<C::StreamWriter>>>,
     ) -> Self {
         Self {
             conenction_state,
@@ -110,36 +119,18 @@ impl<C: QuicConnect + Unpin> MessageWriter<C> {
         }
     }
 
-    async fn handle_error(&self, error: &(impl HasErrorCode + ?Sized)) -> StreamError {
-        self.conenction_state.close(error);
-        self.conenction_state.error().await.into()
-    }
-
-    async fn handle_encode_stream_error(&self, error: EncodeStreamError) -> StreamError {
-        self.conenction_state
-            .handle_encode_stream_error(
-                error.map_encode_error(|encode_error| {
-                    Code::H3_FRAME_ERROR.with(encode_error).into()
-                }),
-            )
-            .await
-    }
-
-    async fn send_header(&mut self, field_section: FieldSection) -> Result<(), EncodeStreamError> {
+    async fn send_header(&mut self, field_section: FieldSection) -> Result<(), Error> {
         const STRATEGY: StaticEncoder<HuffmanAlways> = StaticEncoder::new(HuffmanAlways);
         let stream = &mut self.stream;
         let frame = self
             .encoder
             .encode(field_section, &STRATEGY, stream)
             .await?;
-        tokio::try_join!(
-            frame.encode_into(&mut self.stream),
-            self.encoder.flush_instructions()
-        )?;
+        frame.encode_into(&mut self.stream).await?;
         Ok(())
     }
 
-    pub async fn send_data<P, B>(&mut self, payload: P) -> Result<(), EncodeStreamError>
+    pub async fn send_data<P, B>(&mut self, payload: P) -> Result<(), StreamError>
     where
         for<'c> &'c P: IntoIterator<Item = &'c B>,
         P: IntoIterator<Item = B>,
@@ -152,21 +143,21 @@ impl<C: QuicConnect + Unpin> MessageWriter<C> {
 
     pub async fn send_request<B>(&mut self, request: Request<B>) -> Result<(), StreamError>
     where
-        B: http_body::Body<Data: Buf, Error: Error>,
+        B: http_body::Body<Data: Buf, Error: StdError>,
     {
         match request.encode_into(self).await {
             Ok(()) => Ok(()),
-            Err(error) => Err(self.handle_encode_stream_error(error).await),
+            Err(error) => Err(self.conenction_state.handle_error(error).await),
         }
     }
 
     pub async fn send_response<B>(&mut self, response: Response<B>) -> Result<(), StreamError>
     where
-        B: http_body::Body<Data: Buf, Error: Error>,
+        B: http_body::Body<Data: Buf, Error: StdError>,
     {
         match response.encode_into(self).await {
             Ok(()) => Ok(()),
-            Err(error) => Err(self.handle_encode_stream_error(error).await),
+            Err(error) => Err(self.conenction_state.handle_error(error).await),
         }
     }
 
@@ -201,7 +192,9 @@ pub struct MessageReader<C: QuicConnect> {
 }
 
 impl<C: QuicConnect + Unpin> DecodeFrom<&mut MessageReader<C>> for response::Parts {
-    async fn decode_from(reader: &mut MessageReader<C>) -> Result<Self, DecodeStreamError> {
+    type Error = Error;
+
+    async fn decode_from(reader: &mut MessageReader<C>) -> Result<Self, Error> {
         let header_frame = reader.frame.as_mut().unwrap();
         if header_frame.r#type() != Frame::HEADERS_FRAME_TYPE {
             return Err(Code::H3_FRAME_UNEXPECTED.into());
@@ -213,7 +206,9 @@ impl<C: QuicConnect + Unpin> DecodeFrom<&mut MessageReader<C>> for response::Par
 }
 
 impl<C: QuicConnect + Unpin> DecodeFrom<&mut MessageReader<C>> for request::Parts {
-    async fn decode_from(reader: &mut MessageReader<C>) -> Result<Self, DecodeStreamError> {
+    type Error = Error;
+
+    async fn decode_from(reader: &mut MessageReader<C>) -> Result<Self, Error> {
         let header_frame = reader.frame.as_mut().unwrap();
         if header_frame.r#type() != Frame::HEADERS_FRAME_TYPE {
             return Err(Code::H3_FRAME_UNEXPECTED.into());
@@ -225,7 +220,9 @@ impl<C: QuicConnect + Unpin> DecodeFrom<&mut MessageReader<C>> for request::Part
 }
 
 impl<C: QuicConnect + Unpin> DecodeFrom<&mut MessageReader<C>> for http_body::Frame<Bytes> {
-    async fn decode_from(reader: &mut MessageReader<C>) -> Result<Self, DecodeStreamError> {
+    type Error = Error;
+
+    async fn decode_from(reader: &mut MessageReader<C>) -> Result<Self, Error> {
         let frame = reader.frame.as_mut().unwrap();
         match frame.r#type() {
             Frame::DATA_FRAME_TYPE => {
@@ -247,7 +244,9 @@ where
     C: QuicConnect + Send + Unpin + 'static,
     C::StreamReader: Send + Sync,
 {
-    async fn decode_from(reader: &mut MessageReader<C>) -> Result<Self, DecodeStreamError> {
+    type Error = Error;
+
+    async fn decode_from(reader: &mut MessageReader<C>) -> Result<Self, Error> {
         let parts = request::Parts::decode_from(reader).await?;
         let body = reader.final_message_body().boxed_unsync();
         Ok(Request::from_parts(parts, body))
@@ -259,7 +258,9 @@ where
     C: QuicConnect + Send + Unpin + 'static,
     C::StreamReader: Send + Sync,
 {
-    async fn decode_from(reader: &mut MessageReader<C>) -> Result<Self, DecodeStreamError> {
+    type Error = Error;
+
+    async fn decode_from(reader: &mut MessageReader<C>) -> Result<Self, Error> {
         let parts = response::Parts::decode_from(reader).await?;
         let body = match parts.status.is_informational() {
             true => http_body_util::Empty::new()
@@ -284,12 +285,7 @@ where
         let stream_id = stream.stream_id().await?;
         let frame = match Frame::decode_from(stream).await {
             Ok(frame) => frame,
-            Err(DecodeStreamError::Code { source }) => {
-                connecttion_state.close(source.as_ref());
-                return Err(connecttion_state.error().await.into());
-            }
-            Err(DecodeStreamError::Decode { .. }) => unreachable!(),
-            Err(DecodeStreamError::Stream { source }) => return Err(source),
+            Err(error) => return Err(connecttion_state.handle_error(error).await),
         };
         Ok(Self {
             connecttion_state,
@@ -298,21 +294,6 @@ where
             stream_id,
             final_message_received: false,
         })
-    }
-
-    async fn handle_error(&self, error: &(impl HasErrorCode + ?Sized)) -> StreamError {
-        self.connecttion_state.close(error);
-        self.connecttion_state.error().await.into()
-    }
-
-    async fn handle_decode_stream_error(&self, error: DecodeStreamError) -> StreamError {
-        self.connecttion_state
-            .handle_decode_stream_error(
-                error.map_decode_error(|decode_error| {
-                    Code::H3_MESSAGE_ERROR.with(decode_error).into()
-                }),
-            )
-            .await
     }
 
     pub async fn next_frame(
@@ -325,7 +306,8 @@ where
                 && frame.r#type() != Frame::DATA_FRAME_TYPE
                 && !frame.is_reversed_frame()
             {
-                return Some(Err(self.handle_error(&Code::H3_FRAME_UNEXPECTED).await));
+                let error = Code::H3_FRAME_UNEXPECTED;
+                return Some(Err(self.connecttion_state.handle_error(error.into()).await));
             }
 
             if frame.payload().remaining() == 0 || frame.is_reversed_frame() {
@@ -334,7 +316,9 @@ where
                         self.frame = frame;
                         continue;
                     }
-                    Err(error) => return Some(Err(self.handle_decode_stream_error(error).await)),
+                    Err(error) => {
+                        return Some(Err(self.connecttion_state.handle_error(error).await));
+                    }
                 }
             }
 
@@ -364,7 +348,7 @@ where
             match http_body::Frame::decode_from(&mut body).await {
                 Ok(frame) => Some((Ok(frame), body)),
                 Err(error) => {
-                    let error = body.handle_decode_stream_error(error).await;
+                    let error = body.connecttion_state.handle_error(error).await;
                     Some((Err(error), body))
                 }
             }
@@ -380,11 +364,14 @@ where
     {
         match self.next_frame().await.transpose()? {
             Some(_frame) => {}
-            None => return Err(self.handle_error(&Code::H3_FRAME_UNEXPECTED).await),
+            None => {
+                let error = Code::H3_FRAME_UNEXPECTED.into();
+                return Err(self.connecttion_state.handle_error(error).await);
+            }
         }
         match Request::decode_from(&mut self).await {
             Ok(request) => Ok(request),
-            Err(error) => Err(self.handle_decode_stream_error(error).await),
+            Err(error) => Err(self.connecttion_state.handle_error(error).await),
         }
     }
 
@@ -400,13 +387,14 @@ where
             Some(Ok(_frame)) => {}
             Some(Err(error)) => return Some(Err(error)),
             None if !final_message_received => {
-                return Some(Err(self.handle_error(&Code::H3_FRAME_UNEXPECTED).await));
+                let error = Code::H3_MESSAGE_ERROR.into();
+                return Some(Err(self.connecttion_state.handle_error(error).await));
             }
             None => return None,
         }
         match Response::decode_from(self).await {
             Ok(response) => Some(Ok(response)),
-            Err(error) => Some(Err(self.handle_decode_stream_error(error).await)),
+            Err(error) => Some(Err(self.connecttion_state.handle_error(error).await)),
         }
     }
 }

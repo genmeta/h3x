@@ -4,10 +4,10 @@ use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite};
 
 use crate::{
     codec::{
-        error::{DecodeError, DecodeStreamError, EncodeStreamError},
+        error::{DecodeError, DecodeStreamError},
         util::{DecodeFrom, EncodeInto},
     },
-    error::Code,
+    error::{Code, Error, StreamError},
     qpack::{
         integer::{decode_integer, encode_integer},
         string::{decode_string, encode_string},
@@ -57,35 +57,41 @@ impl<S> DecodeFrom<S> for EncodedFieldSectionPrefix
 where
     S: AsyncBufRead,
 {
-    async fn decode_from(stream: S) -> Result<Self, DecodeStreamError> {
-        tokio::pin!(stream);
+    type Error = Error;
 
-        let ric_prefix = stream.read_u8().await?;
-        let required_insert_count = decode_integer(stream.as_mut(), ric_prefix, 8).await?;
-        let db_prefix = stream.read_u8().await?;
-        let sign = db_prefix & 0b1000_0000;
-        let delta_base = decode_integer(stream.as_mut(), db_prefix & 0b0111_1111, 7).await?;
-        // The value of Base MUST NOT be negative. Though the protocol might
-        // operate correctly with a negative Base using post-Base indexing, it
-        // is unnecessary and inefficient. An endpoint MUST treat a field block
-        // with a Sign bit of 1 as invalid if the value of Required Insert Count
-        // is less than or equal to the value of Delta Base.
-        //
-        // https://datatracker.ietf.org/doc/html/rfc9204#section-4.5.1.2-5
-        let base = if sign == 0 {
-            required_insert_count
-                .checked_add(delta_base)
-                .ok_or(DecodeError::ArithmeticOverflow)?
-        } else {
-            required_insert_count
-                .checked_sub(delta_base)
-                .ok_or(DecodeError::ArithmeticOverflow)?
-                .checked_sub(1)
-                .ok_or(DecodeError::ArithmeticOverflow)?
+    async fn decode_from(stream: S) -> Result<Self, Error> {
+        let decode = async move {
+            tokio::pin!(stream);
+            let ric_prefix = stream.read_u8().await?;
+            let required_insert_count = decode_integer(stream.as_mut(), ric_prefix, 8).await?;
+            let db_prefix = stream.read_u8().await?;
+            let sign = db_prefix & 0b1000_0000;
+            let delta_base = decode_integer(stream.as_mut(), db_prefix & 0b0111_1111, 7).await?;
+            // The value of Base MUST NOT be negative. Though the protocol might
+            // operate correctly with a negative Base using post-Base indexing, it
+            // is unnecessary and inefficient. An endpoint MUST treat a field block
+            // with a Sign bit of 1 as invalid if the value of Required Insert Count
+            // is less than or equal to the value of Delta Base.
+            //
+            // https://datatracker.ietf.org/doc/html/rfc9204#section-4.5.1.2-5
+            let base = if sign == 0 {
+                required_insert_count
+                    .checked_add(delta_base)
+                    .ok_or(DecodeError::ArithmeticOverflow)?
+            } else {
+                required_insert_count
+                    .checked_sub(delta_base)
+                    .ok_or(DecodeError::ArithmeticOverflow)?
+                    .checked_sub(1)
+                    .ok_or(DecodeError::ArithmeticOverflow)?
+            };
+            Ok(EncodedFieldSectionPrefix {
+                required_insert_count,
+                base,
+            })
         };
-        Ok(EncodedFieldSectionPrefix {
-            required_insert_count,
-            base,
+        decode.await.map_err(|error: DecodeStreamError| {
+            error.map_decode_error(|decode_error| Code::H3_MESSAGE_ERROR.with(decode_error).into())
         })
     }
 }
@@ -94,7 +100,9 @@ impl<S> EncodeInto<S> for EncodedFieldSectionPrefix
 where
     S: AsyncWrite,
 {
-    async fn encode_into(self, stream: S) -> Result<(), EncodeStreamError> {
+    type Error = StreamError;
+
+    async fn encode_into(self, stream: S) -> Result<(), StreamError> {
         tokio::pin!(stream);
         let ric_prefix = 0;
         encode_integer(stream.as_mut(), ric_prefix, 8, self.required_insert_count).await?;
@@ -202,7 +210,9 @@ impl<S> DecodeFrom<S> for FieldLineRepresentation
 where
     S: AsyncBufRead,
 {
-    async fn decode_from(stream: S) -> Result<Self, DecodeStreamError> {
+    type Error = Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Error> {
         let decode = async move {
             tokio::pin!(stream);
             let prefix = stream.read_u8().await?;
@@ -280,10 +290,11 @@ where
 
 impl<S> EncodeInto<S> for FieldLineRepresentation
 where
-    S: AsyncWrite + Sink<Bytes>,
-    EncodeStreamError: From<<S as Sink<Bytes>>::Error>,
+    S: AsyncWrite + Sink<Bytes, Error = StreamError>,
 {
-    async fn encode_into(self, stream: S) -> Result<(), EncodeStreamError> {
+    type Error = Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), Error> {
         tokio::pin!(stream);
         match self {
             FieldLineRepresentation::IndexedFieldLine { is_static, index } => {

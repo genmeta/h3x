@@ -17,14 +17,14 @@ use crate::{
 
 pin_project_lite::pin_project! {
     /// Adapter that converts a `Stream` of `Bytes` into a `TryBufStream`
-    pub struct BufStreamReader<S: ?Sized> {
+    pub struct StreamReader<S: ?Sized> {
         chunk: Bytes,
         #[pin]
         stream: S,
     }
 }
 
-impl<S> BufStreamReader<S>
+impl<S> StreamReader<S>
 where
     S: TryStream<Ok = Bytes> + ?Sized,
 {
@@ -67,7 +67,7 @@ where
     }
 }
 
-impl<S: TryStream<Ok = Bytes> + ?Sized> Stream for BufStreamReader<S> {
+impl<S: TryStream<Ok = Bytes> + ?Sized> Stream for StreamReader<S> {
     type Item = Result<Bytes, S::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -79,7 +79,7 @@ impl<S: TryStream<Ok = Bytes> + ?Sized> Stream for BufStreamReader<S> {
     }
 }
 
-impl<S> AsyncRead for BufStreamReader<S>
+impl<S> AsyncRead for StreamReader<S>
 where
     S: TryStream<Ok = Bytes> + ?Sized,
     io::Error: From<S::Error>,
@@ -106,7 +106,7 @@ where
     }
 }
 
-impl<S> AsyncBufRead for BufStreamReader<S>
+impl<S> AsyncBufRead for StreamReader<S>
 where
     S: TryStream<Ok = Bytes> + ?Sized,
     io::Error: From<S::Error>,
@@ -122,13 +122,13 @@ where
     }
 }
 
-impl<S: GetStreamId + ?Sized> GetStreamId for BufStreamReader<S> {
+impl<S: GetStreamId + ?Sized> GetStreamId for StreamReader<S> {
     fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>> {
         self.project().stream.poll_stream_id(cx)
     }
 }
 
-impl<S: StopSending + ?Sized> StopSending for BufStreamReader<S> {
+impl<S: StopSending + ?Sized> StopSending for StreamReader<S> {
     fn poll_stop_sending(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -222,7 +222,7 @@ impl<R: AsyncBufRead + ?Sized> AsyncBufRead for FixedLengthReader<R> {
     }
 }
 
-impl<S> Stream for FixedLengthReader<BufStreamReader<S>>
+impl<S> Stream for FixedLengthReader<StreamReader<S>>
 where
     S: TryStream<Ok = Bytes> + ?Sized,
     DecodeStreamError: From<S::Error>,

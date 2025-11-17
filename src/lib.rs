@@ -1,10 +1,10 @@
-pub mod codec;
+mod codec;
 pub mod connection;
 pub mod error;
-pub mod frame;
+mod frame;
 pub mod message;
 pub mod qpack;
 pub mod quic;
-pub mod set_once;
-pub mod stream;
+mod set_once;
+mod stream;
 pub mod varint;

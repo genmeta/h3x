@@ -1,8 +1,76 @@
-use std::{borrow::Cow, error::Error, fmt::Display, io, sync::Arc};
+use std::{borrow::Cow, error::Error as StdError, fmt::Display, io, sync::Arc};
 
 use snafu::Snafu;
 
 use crate::varint::VarInt;
+
+#[derive(Debug, Snafu, Clone)]
+pub enum Error {
+    #[snafu(transparent)]
+    Stream { source: StreamError },
+    #[snafu(transparent)]
+    Code {
+        source: Arc<dyn HasErrorCode + Send + Sync>,
+    },
+}
+
+impl From<ConnectionError> for Error {
+    fn from(value: ConnectionError) -> Self {
+        Self::Stream {
+            source: value.into(),
+        }
+    }
+}
+
+impl Error {
+    pub fn map_stream_reset(self, map: impl FnOnce(VarInt) -> Self) -> Self {
+        match self {
+            Error::Stream {
+                source: StreamError::Reset { code },
+            } => map(code),
+            error => error,
+        }
+    }
+}
+
+impl<E: HasErrorCode + StdError + Send + Sync + 'static> From<E> for Error {
+    fn from(value: E) -> Self {
+        Error::Code {
+            source: Arc::new(value),
+        }
+    }
+}
+
+impl From<Error> for io::Error {
+    fn from(value: Error) -> Self {
+        io::Error::other(value)
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(source: io::Error) -> Self {
+        let source = match source.downcast::<ConnectionError>() {
+            Ok(error) => {
+                return Error::Stream {
+                    source: error.into(),
+                };
+            }
+            Err(source) => source,
+        };
+        let source = match source.downcast::<StreamError>() {
+            Ok(error) => return Error::Stream { source: error },
+            Err(source) => source,
+        };
+        let source = match source.downcast::<Arc<dyn HasErrorCode + Send + Sync + 'static>>() {
+            Ok(error) => return Error::Code { source: error },
+            Err(source) => source,
+        };
+        match source.downcast::<Error>() {
+            Ok(error) => return error,
+            Err(source) => panic!("io::Error({source:?}) is neither from StreamReader nor Decoder"),
+        };
+    }
+}
 
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
@@ -91,7 +159,7 @@ impl Code {
         self.0
     }
 
-    pub const fn with<E: Error>(self, source: E) -> CodeWith<E> {
+    pub const fn with<E: StdError>(self, source: E) -> CodeWith<E> {
         CodeWith { code: self, source }
     }
 }
@@ -102,7 +170,7 @@ impl Display for Code {
     }
 }
 
-impl Error for Code {}
+impl StdError for Code {}
 
 impl HasErrorCode for Code {
     fn code(&self) -> Code {
@@ -177,24 +245,24 @@ impl Code {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CodeWith<E: Error> {
+pub struct CodeWith<E: StdError> {
     code: Code,
     source: E,
 }
 
-impl<E: Error> Display for CodeWith<E> {
+impl<E: StdError> Display for CodeWith<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.source, f)
     }
 }
 
-impl<E: Error + 'static> Error for CodeWith<E> {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
+impl<E: StdError + 'static> StdError for CodeWith<E> {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         Some(&self.source)
     }
 }
 
-impl<E: Error + 'static> HasErrorCode for CodeWith<E> {
+impl<E: StdError + 'static> HasErrorCode for CodeWith<E> {
     fn code(&self) -> Code {
         self.code
     }
@@ -229,6 +297,6 @@ impl HasErrorCode for H3FrameUnexpected {
 }
 
 // TODO: use Error::provide api in the future
-pub trait HasErrorCode: Error {
+pub trait HasErrorCode: StdError {
     fn code(&self) -> Code;
 }

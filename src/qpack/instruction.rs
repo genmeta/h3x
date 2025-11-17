@@ -4,10 +4,10 @@ use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite};
 
 use crate::{
     codec::{
-        error::{DecodeStreamError, EncodeStreamError},
+        error::{DecodeError, DecodeStreamError},
         util::{DecodeFrom, EncodeInto},
     },
-    error::H3CriticalStreamClosed,
+    error::{Code, Error, H3CriticalStreamClosed, StreamError},
     qpack::{
         integer::{decode_integer, encode_integer},
         string::{decode_string, encode_string},
@@ -67,7 +67,8 @@ pub enum EncoderInstruction {
 }
 
 impl<S: AsyncBufRead> DecodeFrom<S> for EncoderInstruction {
-    async fn decode_from(stream: S) -> Result<Self, DecodeStreamError> {
+    type Error = Error;
+    async fn decode_from(stream: S) -> Result<Self, Error> {
         let decode = async move {
             tokio::pin!(stream);
             let prefix = stream.read_u8().await?;
@@ -114,20 +115,30 @@ impl<S: AsyncBufRead> DecodeFrom<S> for EncoderInstruction {
                 _ => unreachable!("unreachable branch(Duplicate should match all other cases)"),
             }
         };
-        decode.await.map_err(|error: DecodeStreamError| {
-            error
-                .map_stream_reset(|_| H3CriticalStreamClosed::QPackEncoder.into())
-                .map_incomplete(|| H3CriticalStreamClosed::QPackEncoder.into())
-        })
+        decode
+            .await
+            .map_err(|error: DecodeStreamError| match error {
+                DecodeStreamError::Stream { source } if source.is_reset() => {
+                    H3CriticalStreamClosed::QPackEncoder.into()
+                }
+                DecodeStreamError::Stream { source } => source.into(),
+                DecodeStreamError::Decode {
+                    source: DecodeError::Incomplete,
+                } => H3CriticalStreamClosed::QPackEncoder.into(),
+                DecodeStreamError::Decode { source } => {
+                    Code::H3_GENERAL_PROTOCOL_ERROR.with(source).into()
+                }
+            })
     }
 }
 
-impl<S, E> EncodeInto<S> for EncoderInstruction
+impl<S> EncodeInto<S> for EncoderInstruction
 where
-    S: AsyncWrite + Sink<Bytes, Error = E>,
-    EncodeStreamError: From<E>,
+    S: AsyncWrite + Sink<Bytes, Error = StreamError>,
 {
-    async fn encode_into(self, stream: S) -> Result<(), EncodeStreamError> {
+    type Error = Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), Error> {
         let encode = async move {
             tokio::pin!(stream);
             match self {
@@ -166,8 +177,9 @@ where
                 }
             }
         };
-        encode.await.map_err(|error| {
-            error.map_stream_reset(|_| H3CriticalStreamClosed::QPackEncoder.into())
+        encode.await.map_err(|error: StreamError| match error {
+            StreamError::Connection { .. } => error.into(),
+            StreamError::Reset { .. } => H3CriticalStreamClosed::QPackEncoder.into(),
         })
     }
 }
@@ -201,7 +213,9 @@ impl<S> DecodeFrom<S> for DecoderInstruction
 where
     S: AsyncBufRead,
 {
-    async fn decode_from(stream: S) -> Result<Self, DecodeStreamError> {
+    type Error = Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Error> {
         let decode = async move {
             tokio::pin!(stream);
             let prefix = stream.read_u8().await?;
@@ -223,11 +237,20 @@ where
                 ),
             }
         };
-        decode.await.map_err(|error: DecodeStreamError| {
-            error
-                .map_stream_reset(|_| H3CriticalStreamClosed::QPackEncoder.into())
-                .map_incomplete(|| H3CriticalStreamClosed::QPackEncoder.into())
-        })
+        decode
+            .await
+            .map_err(|error: DecodeStreamError| match error {
+                DecodeStreamError::Stream { source } if source.is_reset() => {
+                    H3CriticalStreamClosed::QPackEncoder.into()
+                }
+                DecodeStreamError::Stream { source } => source.into(),
+                DecodeStreamError::Decode {
+                    source: DecodeError::Incomplete,
+                } => H3CriticalStreamClosed::QPackEncoder.into(),
+                DecodeStreamError::Decode { source } => {
+                    Code::H3_GENERAL_PROTOCOL_ERROR.with(source).into()
+                }
+            })
     }
 }
 
@@ -235,7 +258,9 @@ impl<S> EncodeInto<S> for DecoderInstruction
 where
     S: AsyncWrite,
 {
-    async fn encode_into(self, stream: S) -> Result<(), EncodeStreamError> {
+    type Error = Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), Error> {
         let encode = async move {
             tokio::pin!(stream);
             match self {
@@ -253,8 +278,9 @@ where
                 }
             }
         };
-        encode.await.map_err(|error| {
-            error.map_stream_reset(|_| H3CriticalStreamClosed::QPackEncoder.into())
+        encode.await.map_err(|error: StreamError| match error {
+            StreamError::Connection { .. } => error.into(),
+            StreamError::Reset { .. } => H3CriticalStreamClosed::QPackEncoder.into(),
         })
     }
 }

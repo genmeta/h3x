@@ -9,11 +9,11 @@ use tokio::io::{self, AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
     codec::{
-        BufStreamReader, FixedLengthReader,
-        error::{DecodeStreamError, EncodeError, EncodeStreamError},
+        FixedLengthReader, StreamReader,
+        error::DecodeStreamError,
         util::{DecodeFrom, EncodeInto},
     },
-    error::{Code, StreamError},
+    error::{Code, Error, StreamError},
     quic::{GetStreamId, StopSending},
     varint::{self, VARINT_MAX, VarInt},
 };
@@ -142,12 +142,12 @@ impl<P: AsyncWrite + ?Sized> AsyncWrite for Frame<P> {
         let project = self.project();
         match project.length.into_inner().checked_add(buf.len() as u64) {
             Some(new_length) if new_length > VARINT_MAX => {
-                return Poll::Ready(Err(io::Error::from(EncodeError::FramePayloadTooLarge)));
+                panic!("Frame too large")
             }
             Some(new_length) => {
                 *project.length = VarInt::from_u64(new_length).unwrap();
             }
-            None => return Poll::Ready(Err(io::Error::from(EncodeError::FramePayloadTooLarge))),
+            None => panic!("Frame too large"),
         }
 
         project.payload.poll_write(cx, buf)
@@ -162,17 +162,11 @@ impl<P: AsyncWrite + ?Sized> AsyncWrite for Frame<P> {
     }
 }
 
-impl<P: Sink<B> + ?Sized, B: Buf> Sink<B> for Frame<P>
-where
-    EncodeStreamError: From<P::Error>,
-{
-    type Error = EncodeStreamError;
+impl<P: Sink<B> + ?Sized, B: Buf> Sink<B> for Frame<P> {
+    type Error = P::Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project()
-            .payload
-            .poll_ready(cx)
-            .map_err(EncodeStreamError::from)
+        self.project().payload.poll_ready(cx)
     }
 
     fn start_send(self: Pin<&mut Self>, item: B) -> Result<(), Self::Error> {
@@ -180,29 +174,23 @@ where
         let len = item.remaining() as u64;
         match project.length.into_inner().checked_add(len) {
             Some(new_length) if new_length > VARINT_MAX => {
-                return Err(EncodeError::FramePayloadTooLarge.into());
+                panic!("Frame too large")
             }
             Some(new_length) => {
                 *project.length = VarInt::from_u64(new_length).unwrap();
             }
-            None => return Err(EncodeError::FramePayloadTooLarge.into()),
+            None => panic!("Frame too large"),
         }
         project.payload.start_send(item)?;
         Ok(())
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project()
-            .payload
-            .poll_flush(cx)
-            .map_err(EncodeStreamError::from)
+        self.project().payload.poll_flush(cx)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project()
-            .payload
-            .poll_close(cx)
-            .map_err(EncodeStreamError::from)
+        self.project().payload.poll_close(cx)
     }
 }
 
@@ -210,10 +198,11 @@ impl<C, B, S> EncodeInto<S> for Frame<C>
 where
     C: IntoIterator<Item = B>,
     B: Buf,
-    S: AsyncWrite + Sink<Bytes>,
-    EncodeStreamError: From<S::Error>,
+    S: AsyncWrite + Sink<Bytes, Error = StreamError>,
 {
-    async fn encode_into(self, stream: S) -> Result<(), EncodeStreamError> {
+    type Error = StreamError;
+
+    async fn encode_into(self, stream: S) -> Result<(), StreamError> {
         tokio::pin!(stream);
         self.r#type.encode_into(&mut stream).await?;
         self.length.encode_into(&mut stream).await?;
@@ -225,14 +214,14 @@ where
     }
 }
 
-impl<S> DecodeFrom<BufStreamReader<S>> for Frame<FixedLengthReader<BufStreamReader<S>>>
+impl<S> DecodeFrom<StreamReader<S>> for Frame<FixedLengthReader<StreamReader<S>>>
 where
-    S: TryStream<Ok = Bytes>,
-    BufStreamReader<S>: Unpin,
-    io::Error: From<S::Error>,
-    DecodeStreamError: From<S::Error>,
+    S: TryStream<Ok = Bytes, Error = StreamError>,
+    StreamReader<S>: Unpin,
 {
-    async fn decode_from(mut stream: BufStreamReader<S>) -> Result<Self, DecodeStreamError> {
+    type Error = Error;
+
+    async fn decode_from(mut stream: StreamReader<S>) -> Result<Self, Error> {
         let decode = async move {
             let r#type = VarInt::decode_from(&mut stream).await?;
             let length = VarInt::decode_from(&mut stream).await?;
@@ -250,7 +239,7 @@ where
     }
 }
 
-impl<S> AsyncRead for Frame<FixedLengthReader<BufStreamReader<S>>>
+impl<S> AsyncRead for Frame<FixedLengthReader<StreamReader<S>>>
 where
     S: TryStream<Ok = Bytes>,
     io::Error: From<S::Error>,
@@ -268,7 +257,7 @@ where
     }
 }
 
-impl<S> AsyncBufRead for Frame<FixedLengthReader<BufStreamReader<S>>>
+impl<S> AsyncBufRead for Frame<FixedLengthReader<StreamReader<S>>>
 where
     S: TryStream<Ok = Bytes>,
     io::Error: From<S::Error>,
@@ -286,12 +275,11 @@ where
     }
 }
 
-impl<S: Stream + ?Sized> Stream for Frame<FixedLengthReader<BufStreamReader<S>>>
+impl<S: Stream + ?Sized> Stream for Frame<FixedLengthReader<StreamReader<S>>>
 where
-    S: TryStream<Ok = Bytes>,
-    DecodeStreamError: From<S::Error>,
+    S: TryStream<Ok = Bytes, Error = StreamError>,
 {
-    type Item = Result<Bytes, DecodeStreamError>;
+    type Item = Result<Bytes, Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.project().payload.poll_next(cx).map_err(|error| {
@@ -316,18 +304,18 @@ impl<S: StopSending + ?Sized> StopSending for Frame<S> {
     }
 }
 
-impl<S> Frame<FixedLengthReader<BufStreamReader<S>>>
+impl<S> Frame<FixedLengthReader<StreamReader<S>>>
 where
-    S: TryStream<Ok = Bytes>,
-    BufStreamReader<S>: Unpin,
-    io::Error: From<S::Error>,
-    DecodeStreamError: From<S::Error>,
+    S: TryStream<Ok = Bytes, Error = StreamError>,
+    StreamReader<S>: Unpin,
 {
-    pub async fn into_next_frame(mut self) -> Option<Result<Self, DecodeStreamError>> {
+    pub async fn into_next_frame(mut self) -> Option<Result<Self, Error>> {
         if self.payload.remaining() > 0 {
             let drain = sink::drain().sink_map_err(|never| match never {});
             if let Err(error) = (&mut self.payload).forward(drain).await {
-                return Some(Err(error));
+                return Some(Err(error.map_decode_error(|decode_error| {
+                    Code::H3_FRAME_ERROR.with(decode_error).into()
+                })));
             }
         }
 
@@ -347,7 +335,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{BufSinkWriter, error::DecodeError},
+        codec::{SinkWriter, error::DecodeError},
         error::StreamError,
     };
 
@@ -369,7 +357,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_data_frames() {
-        let stream = BufStreamReader::new(to_pre_byte_stream(vec![
+        let stream = StreamReader::new(to_pre_byte_stream(vec![
             0x00, // Type: DATA
             0x05, // Length: 5
             b'H', b'e', b'l', b'l', b'o', // Payload: "Hello"
@@ -395,7 +383,7 @@ mod tests {
 
     #[tokio::test]
     async fn incomplete_type() {
-        let stream = BufStreamReader::new(to_pre_byte_stream(vec![
+        let stream = StreamReader::new(to_pre_byte_stream(vec![
             // 0x00, // Type: DATA
             // 0x05, // Length: 5
             // b'H', b'e', b'l', b'l', b'o', // Payload: "Hello"
@@ -403,15 +391,13 @@ mod tests {
 
         assert!(matches!(
             Frame::decode_from(stream).await,
-            Err(DecodeStreamError::Decode {
-                source: DecodeError::Incomplete
-            })
+            Err(Error::Code { source }) if source.code() == Code::H3_FRAME_ERROR
         ));
     }
 
     #[tokio::test]
     async fn incomplete_length() {
-        let stream = BufStreamReader::new(to_pre_byte_stream(vec![
+        let stream = StreamReader::new(to_pre_byte_stream(vec![
             0x00, // Type: DATA
                  // 0x05, // Length: 5
                  // b'H', b'e', b'l', b'l', b'o', // Payload: "Hello"
@@ -419,15 +405,13 @@ mod tests {
 
         assert!(matches!(
             Frame::decode_from(stream).await,
-            Err(DecodeStreamError::Decode {
-                source: DecodeError::Incomplete
-            })
+            Err(Error::Code { source }) if source.code() == Code::H3_FRAME_ERROR
         ));
     }
 
     #[tokio::test]
     async fn incomplete_payload() {
-        let stream = BufStreamReader::new(to_pre_byte_stream(vec![
+        let stream = StreamReader::new(to_pre_byte_stream(vec![
             0x00, // Type: DATA
             0x05, // Length: 5
             b'H', b'e', b'l', b'l', /* b'o', */ // Payload: "Hello"
@@ -459,7 +443,7 @@ mod tests {
         let (sink, stream) = channel();
 
         let decode = tokio::spawn(async move {
-            let stream = BufStreamReader::new(stream);
+            let stream = StreamReader::new(stream);
 
             let mut frame1 = Frame::decode_from(stream).await.unwrap();
             assert_eq!(frame1.r#type().into_inner(), 0);
@@ -476,7 +460,7 @@ mod tests {
             assert_eq!(frame2.r#type().into_inner(), 0);
         });
         let encode = tokio::spawn(async move {
-            let mut sink = BufSinkWriter::new(sink);
+            let mut sink = SinkWriter::new(sink);
 
             let frame1 = Frame::new(VarInt::from_u32(0), [Bytes::from_static(b"Hello")]).unwrap();
             assert!(frame1.r#type().into_inner() == 0);
@@ -491,7 +475,7 @@ mod tests {
             assert!(frame2.payload()[0].as_ref() == b"World");
             frame2.encode_into(&mut sink).await.unwrap();
 
-            sink.flush_buffer().await.unwrap();
+            Pin::new(&mut sink).flush_buffer().await.unwrap();
         });
         tokio::try_join!(encode, decode).unwrap();
     }

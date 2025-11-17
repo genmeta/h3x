@@ -9,10 +9,10 @@ use tokio::io::{AsyncBufRead, AsyncWrite};
 
 use crate::{
     codec::{
-        error::{DecodeStreamError, EncodeStreamError},
+        error::{DecodeError, DecodeStreamError},
         util::{DecodeFrom, EncodeInto, decoder, encoder},
     },
-    error::{Code, H3CriticalStreamClosed},
+    error::{Code, Error, H3CriticalStreamClosed, StreamError},
     varint::VarInt,
 };
 
@@ -95,20 +95,45 @@ impl Setting {
 }
 
 impl<S: AsyncBufRead> DecodeFrom<S> for Setting {
-    async fn decode_from(stream: S) -> Result<Self, DecodeStreamError> {
-        tokio::pin!(stream);
-        let id = VarInt::decode_from(stream.as_mut()).await?;
-        let value = VarInt::decode_from(stream.as_mut()).await?;
-        Ok(Setting { id, value })
+    type Error = Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Error> {
+        let decode = async move {
+            tokio::pin!(stream);
+            let id = VarInt::decode_from(stream.as_mut()).await?;
+            let value = VarInt::decode_from(stream.as_mut()).await?;
+            Ok(Setting { id, value })
+        };
+        decode
+            .await
+            .map_err(|error: DecodeStreamError| match error {
+                DecodeStreamError::Stream { source } if source.is_reset() => {
+                    H3CriticalStreamClosed::Control.into()
+                }
+                DecodeStreamError::Stream { source } => source.into(),
+                DecodeStreamError::Decode {
+                    source: DecodeError::Incomplete,
+                } => H3CriticalStreamClosed::Control.into(),
+                DecodeStreamError::Decode { source } => {
+                    Code::H3_GENERAL_PROTOCOL_ERROR.with(source).into()
+                }
+            })
     }
 }
 
 impl<S: AsyncWrite> EncodeInto<S> for Setting {
-    async fn encode_into(self, stream: S) -> Result<(), EncodeStreamError> {
-        tokio::pin!(stream);
-        self.id.encode_into(stream.as_mut()).await?;
-        self.value.encode_into(stream.as_mut()).await?;
-        Ok(())
+    type Error = Error;
+    async fn encode_into(self, stream: S) -> Result<(), Error> {
+        let encode = async move {
+            tokio::pin!(stream);
+            self.id.encode_into(stream.as_mut()).await?;
+            self.value.encode_into(stream.as_mut()).await?;
+            Ok(())
+        };
+        encode.await.map_err(|error: StreamError| match error {
+            StreamError::Reset { .. } => H3CriticalStreamClosed::Control.into(),
+            StreamError::Connection { .. } => error.into(),
+        })
     }
 }
 
@@ -174,17 +199,15 @@ impl FromIterator<Setting> for Settings {
 }
 
 impl<S: AsyncBufRead> DecodeFrom<S> for Settings {
-    async fn decode_from(stream: S) -> Result<Self, DecodeStreamError> {
+    type Error = Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Error> {
         tokio::pin!(stream);
         let stream = decoder(stream);
         tokio::pin!(stream);
 
         let mut settings = Settings::default();
-        while let Some(Setting { id, value }) = stream
-            .try_next()
-            .await
-            .map_err(|error| error.map_stream_reset(|_| H3CriticalStreamClosed::Control.into()))?
-        {
+        while let Some(Setting { id, value }) = stream.try_next().await? {
             settings.set(id, value);
         }
         Ok(settings)
@@ -192,14 +215,12 @@ impl<S: AsyncBufRead> DecodeFrom<S> for Settings {
 }
 
 impl<S: AsyncWrite> EncodeInto<S> for Settings {
-    async fn encode_into(self, stream: S) -> Result<(), EncodeStreamError> {
+    type Error = Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), Error> {
         tokio::pin!(stream);
         let mut encoder = pin!(encoder(stream));
         let mut settings = stream::iter(self.into_iter().map(Ok));
-        encoder.send_all(&mut settings).await.map_err(|error| {
-            error
-                .map_stream_reset(|_| H3CriticalStreamClosed::Control.into())
-                .map_encode_error(|encode_error| Code::H3_INTERNAL_ERROR.with(encode_error).into())
-        })
+        encoder.send_all(&mut settings).await
     }
 }
