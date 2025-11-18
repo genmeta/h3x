@@ -245,7 +245,7 @@ mod tests {
     use tracing::Instrument;
 
     use super::*;
-    use crate::{connection::Connection, qpack::settings::Settings};
+    use crate::{connection::Connection, settings::Settings};
 
     const CA_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/ca.cert");
     const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");

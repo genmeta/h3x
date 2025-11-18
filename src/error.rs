@@ -1,4 +1,6 @@
-use std::{borrow::Cow, error::Error as StdError, fmt::Display, io, sync::Arc};
+use std::{
+    borrow::Cow, convert::Infallible, error::Error as StdError, fmt::Display, io, sync::Arc,
+};
 
 use snafu::Snafu;
 
@@ -66,9 +68,9 @@ impl From<io::Error> for Error {
             Err(source) => source,
         };
         match source.downcast::<Error>() {
-            Ok(error) => return error,
+            Ok(error) => error,
             Err(source) => panic!("io::Error({source:?}) is neither from StreamReader nor Decoder"),
-        };
+        }
     }
 }
 
@@ -100,6 +102,12 @@ impl From<StreamError> for io::Error {
             error @ StreamError::Reset { .. } => io::Error::new(io::ErrorKind::BrokenPipe, error),
             StreamError::Connection { source } => io::Error::from(source),
         }
+    }
+}
+
+impl From<Infallible> for StreamError {
+    fn from(value: Infallible) -> Self {
+        match value {}
     }
 }
 
@@ -284,6 +292,7 @@ impl HasErrorCode for H3CriticalStreamClosed {
     }
 }
 
+// todo: more error variants instead of direct Code::H3_FRAME_UNEXPECTED usage
 #[derive(Debug, Snafu, Clone, Copy)]
 pub enum H3FrameUnexpected {
     #[snafu(display("Received subsequent SETTINGS frame"))]

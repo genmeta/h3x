@@ -8,6 +8,7 @@ use futures::{Sink, SinkExt, Stream, StreamExt, TryStream, sink};
 use tokio::io::{self, AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
+    buflist::BufList,
     codec::{
         FixedLengthReader, StreamReader,
         error::DecodeStreamError,
@@ -68,18 +69,11 @@ impl<P: ?Sized> Frame<P> {
     /// Create a new frame.
     ///
     /// Length is calculated from the payload
-    pub fn new<B>(r#type: VarInt, payload: P) -> Result<Self, varint::err::Overflow>
+    pub fn new(r#type: VarInt, payload: P) -> Result<Self, varint::err::Overflow>
     where
-        for<'c> &'c P: IntoIterator<Item = &'c B>,
-        B: Buf,
-        P: Sized,
+        P: Buf + Sized,
     {
-        let length = (&payload)
-            .into_iter()
-            .map(|b| b.remaining() as u64)
-            .sum::<u64>();
-        let length = VarInt::from_u64(length)?;
-
+        let length = VarInt::try_from(payload.remaining())?;
         Ok(Self {
             r#type,
             length,
@@ -194,20 +188,20 @@ impl<P: Sink<B> + ?Sized, B: Buf> Sink<B> for Frame<P> {
     }
 }
 
-impl<C, B, S> EncodeInto<S> for Frame<C>
+impl<P, S> EncodeInto<S> for Frame<P>
 where
-    C: IntoIterator<Item = B>,
-    B: Buf,
+    P: Buf,
     S: AsyncWrite + Sink<Bytes, Error = StreamError>,
 {
     type Error = StreamError;
 
-    async fn encode_into(self, stream: S) -> Result<(), StreamError> {
+    async fn encode_into(mut self, stream: S) -> Result<(), StreamError> {
         tokio::pin!(stream);
         self.r#type.encode_into(&mut stream).await?;
         self.length.encode_into(&mut stream).await?;
-        for mut bytes in self.payload {
-            stream.feed(bytes.copy_to_bytes(bytes.remaining())).await?;
+        while self.payload.has_remaining() {
+            let bytes = self.payload.copy_to_bytes(self.payload.chunk().len());
+            stream.feed(bytes).await?;
         }
 
         Ok(())
@@ -352,7 +346,7 @@ mod tests {
 
     #[test]
     fn new_frame() {
-        Frame::new(Frame::DATA_FRAME_TYPE, [Bytes::new()]).unwrap();
+        Frame::new(Frame::DATA_FRAME_TYPE, Bytes::new()).unwrap();
     }
 
     #[tokio::test]
@@ -462,17 +456,16 @@ mod tests {
         let encode = tokio::spawn(async move {
             let mut sink = SinkWriter::new(sink);
 
-            let frame1 = Frame::new(VarInt::from_u32(0), [Bytes::from_static(b"Hello")]).unwrap();
+            let frame1 = Frame::new(VarInt::from_u32(0), Bytes::from_static(b"Hello")).unwrap();
             assert!(frame1.r#type().into_inner() == 0);
             assert!(frame1.length().into_inner() == 5);
-            assert!(frame1.payload()[0].as_ref() == b"Hello");
+            assert!(frame1.payload().as_ref() == b"Hello");
             frame1.encode_into(&mut sink).await.unwrap();
 
-            let frame2 =
-                Frame::new(VarInt::from_u32(0), vec![Bytes::from_static(b"World")]).unwrap();
+            let frame2 = Frame::new(VarInt::from_u32(0), Bytes::from_static(b"World")).unwrap();
             assert!(frame2.r#type().into_inner() == 0);
             assert!(frame2.length().into_inner() == 5);
-            assert!(frame2.payload()[0].as_ref() == b"World");
+            assert!(frame2.payload().as_ref() == b"World");
             frame2.encode_into(&mut sink).await.unwrap();
 
             Pin::new(&mut sink).flush_buffer().await.unwrap();

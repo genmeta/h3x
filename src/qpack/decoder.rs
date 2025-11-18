@@ -13,7 +13,7 @@ use tokio::{io::AsyncBufRead, sync::Mutex as AsyncMutex};
 use crate::{
     codec::{
         Feed,
-        util::{DecodeFrom, decoder},
+        util::{DecodeFrom, decode_stream},
     },
     error::{Code, Error, H3CriticalStreamClosed, HasErrorCode, StreamError},
     qpack::{
@@ -21,10 +21,10 @@ use crate::{
         field_section::{FieldLine, FieldSection},
         header_block::{EncodedFieldSectionPrefix, FieldLineRepresentation},
         instruction::{DecoderInstruction, EncoderInstruction},
-        settings::Settings,
         r#static,
     },
     quic::{GetStreamId, GetStreamIdExt, ReadStream, StopSending},
+    settings::Settings,
     varint::VarInt,
 };
 
@@ -336,17 +336,18 @@ where
         self.receive_instruction_until(prefix.required_insert_count)
             .await?;
 
-        let header_section = FieldSection::decode_from(decoder(stream).map(|representation| {
-            representation.and_then(|representation| {
-                decompression_field_line_representation(
-                    &representation,
-                    prefix.base,
-                    &self.state.lock().unwrap().dynamic_table,
-                )
-                .map_err(Error::from)
-            })
-        }))
-        .await?;
+        let header_section =
+            FieldSection::decode_from(decode_stream(stream).map(|representation| {
+                representation.and_then(|representation| {
+                    decompression_field_line_representation(
+                        &representation,
+                        prefix.base,
+                        &self.state.lock().unwrap().dynamic_table,
+                    )
+                    .map_err(Error::from)
+                })
+            }))
+            .await?;
 
         self.emit(DecoderInstruction::SectionAcknowledgment { stream_id });
         _ = self.flush_instructions().await;

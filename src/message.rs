@@ -53,7 +53,7 @@ impl<C: QuicConnect + Unpin, B: Buf> EncodeInto<&mut MessageWriter<C>> for http_
 
     async fn encode_into(self, writer: &mut MessageWriter<C>) -> Result<(), Error> {
         match self.into_data() {
-            Ok(bytes) => writer.send_data([bytes]).await.map_err(Error::from),
+            Ok(bytes) => writer.send_data(bytes).await.map_err(Error::from),
             Err(frame) => match frame.into_trailers() {
                 Ok(tailers) => writer.send_header(tailers.into()).await,
                 Err(_) => panic!("currently, only data and trailers can be sent"),
@@ -130,12 +130,7 @@ impl<C: QuicConnect + Unpin> MessageWriter<C> {
         Ok(())
     }
 
-    pub async fn send_data<P, B>(&mut self, payload: P) -> Result<(), StreamError>
-    where
-        for<'c> &'c P: IntoIterator<Item = &'c B>,
-        P: IntoIterator<Item = B>,
-        B: Buf,
-    {
+    pub async fn send_data(&mut self, payload: impl Buf) -> Result<(), StreamError> {
         let frame =
             Frame::new(Frame::DATA_FRAME_TYPE, payload).expect("DATA frame paylod too large");
         frame.encode_into(&mut self.stream).await

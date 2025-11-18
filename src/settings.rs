@@ -8,11 +8,13 @@ use futures::{SinkExt, TryStreamExt, stream};
 use tokio::io::{AsyncBufRead, AsyncWrite};
 
 use crate::{
+    buflist::BufList,
     codec::{
         error::{DecodeError, DecodeStreamError},
-        util::{DecodeFrom, EncodeInto, decoder, encoder},
+        util::{DecodeFrom, EncodeInto, decode_stream, encode_sink},
     },
     error::{Code, Error, H3CriticalStreamClosed, StreamError},
+    frame::Frame,
     varint::VarInt,
 };
 
@@ -143,6 +145,14 @@ pub struct Settings {
 }
 
 impl Settings {
+    pub async fn encode(&self) -> Frame<BufList> {
+        let mut frame = Frame::new(Frame::SETTINGS_FRAME_TYPE, BufList::new()).unwrap();
+        self.encode_into(&mut frame).await.unwrap();
+        frame
+    }
+}
+
+impl Settings {
     pub fn max_field_section_size(&self) -> Option<VarInt> {
         self.get(Setting::MAX_FIELD_SECTION_SIZE_ID)
     }
@@ -170,7 +180,7 @@ impl Settings {
         }
     }
 
-    pub fn set(&mut self, id: VarInt, value: VarInt) {
+    pub fn set(&mut self, Setting { id, value }: Setting) {
         self.map.insert(id, value);
     }
 }
@@ -184,6 +194,19 @@ impl IntoIterator for Settings {
         self.map
             .into_iter()
             .map(|(id, value)| Setting { id, value })
+    }
+}
+
+impl<'s> IntoIterator for &'s Settings {
+    type Item = Setting;
+
+    type IntoIter = iter::Map<
+        btree_map::Iter<'s, VarInt, VarInt>,
+        for<'v> fn((&'v VarInt, &'v VarInt)) -> Setting,
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter().map(|(&id, &value)| Setting { id, value })
     }
 }
 
@@ -203,14 +226,27 @@ impl<S: AsyncBufRead> DecodeFrom<S> for Settings {
 
     async fn decode_from(stream: S) -> Result<Self, Error> {
         tokio::pin!(stream);
-        let stream = decoder(stream);
+
+        let stream = decode_stream(stream);
         tokio::pin!(stream);
 
         let mut settings = Settings::default();
-        while let Some(Setting { id, value }) = stream.try_next().await? {
-            settings.set(id, value);
+        while let Some(setting) = stream.try_next().await? {
+            settings.set(setting);
         }
+        // when None return by next(), frame is exhausted, no need for extra check
         Ok(settings)
+    }
+}
+
+impl<S: AsyncWrite> EncodeInto<S> for &Settings {
+    type Error = Error;
+
+    async fn encode_into(self, stream: S) -> Result<(), Error> {
+        tokio::pin!(stream);
+        let mut encoder = pin!(encode_sink(stream));
+        let mut settings = stream::iter(self.into_iter().map(Ok));
+        encoder.send_all(&mut settings).await
     }
 }
 
@@ -218,9 +254,6 @@ impl<S: AsyncWrite> EncodeInto<S> for Settings {
     type Error = Error;
 
     async fn encode_into(self, stream: S) -> Result<(), Error> {
-        tokio::pin!(stream);
-        let mut encoder = pin!(encoder(stream));
-        let mut settings = stream::iter(self.into_iter().map(Ok));
-        encoder.send_all(&mut settings).await
+        (&self).encode_into(stream).await
     }
 }

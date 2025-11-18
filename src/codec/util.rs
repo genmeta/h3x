@@ -24,7 +24,7 @@ impl<S: Sink<Bytes>> EncodeInto<S> for Bytes {
     }
 }
 
-pub(crate) fn decoder<Item, E, S>(stream: S) -> impl Stream<Item = Result<Item, E>>
+pub(crate) fn decode_stream<Item, E, S>(stream: S) -> impl Stream<Item = Result<Item, E>>
 where
     E: From<io::Error>,
     Item: for<'s> DecodeFrom<&'s mut S, Error = E>,
@@ -39,7 +39,7 @@ where
     })
 }
 
-pub(crate) fn encoder<Item, E, S>(stream: S) -> impl Sink<Item, Error = E>
+pub(crate) fn encode_sink<Item, E, S>(stream: S) -> impl Sink<Item, Error = E>
 where
     Item: for<'s> EncodeInto<&'s mut S, Error = E>,
 {

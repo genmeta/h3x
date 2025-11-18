@@ -26,7 +26,7 @@ pin_project_lite::pin_project! {
     pub struct SinkWriter<S: ?Sized> {
         buffer: Bytes,
         #[pin]
-        stream: S,
+        sink: S,
     }
 }
 
@@ -34,12 +34,12 @@ impl<S> SinkWriter<S>
 where
     S: Sink<Bytes> + ?Sized,
 {
-    pub const fn new(stream: S) -> Self
+    pub const fn new(sink: S) -> Self
     where
         S: Sized,
     {
         Self {
-            stream,
+            sink,
             buffer: Bytes::new(),
         }
     }
@@ -50,9 +50,9 @@ where
     ) -> Poll<Result<(), S::Error>> {
         let mut project = self.as_mut().project();
         while !project.buffer.is_empty() {
-            ready!(project.stream.as_mut().poll_ready(cx)?);
+            ready!(project.sink.as_mut().poll_ready(cx)?);
             let bytes = mem::take(project.buffer);
-            project.stream.as_mut().start_send(bytes)?;
+            project.sink.as_mut().start_send(bytes)?;
         }
         Poll::Ready(Ok(()))
     }
@@ -65,7 +65,7 @@ where
     where
         S: Sized,
     {
-        self.stream
+        self.sink
     }
 }
 
@@ -97,7 +97,7 @@ where
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         ready!(self.as_mut().poll_flush_buffer(cx)?);
-        self.project().stream.poll_close(cx)
+        self.project().sink.poll_close(cx)
     }
 }
 
@@ -147,13 +147,13 @@ impl<S: CancelStream + ?Sized> CancelStream for SinkWriter<S> {
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), StreamError>> {
-        self.project().stream.poll_cancel(cx, code)
+        self.project().sink.poll_cancel(cx, code)
     }
 }
 
 impl<S: GetStreamId + ?Sized> GetStreamId for SinkWriter<S> {
     fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>> {
-        self.project().stream.poll_stream_id(cx)
+        self.project().sink.poll_stream_id(cx)
     }
 }
 
@@ -162,7 +162,7 @@ pin_project_lite::pin_project! {
     pub struct Feed<S, T> {
         item: Option<T>,
         #[pin]
-        stream: S,
+        sink: S,
     }
 }
 
@@ -170,13 +170,13 @@ impl<S, T> Feed<S, T>
 where
     S: Sink<T>,
 {
-    pub const fn new(stream: S) -> Self {
-        Self { stream, item: None }
+    pub const fn new(sink: S) -> Self {
+        Self { sink, item: None }
     }
 
     pub async fn ready(self: Pin<&mut Self>) -> Result<(), S::Error> {
         let mut project = self.project();
-        poll_fn(|cx| project.stream.as_mut().poll_ready(cx)).await
+        poll_fn(|cx| project.sink.as_mut().poll_ready(cx)).await
     }
 
     pub async fn send_all(
@@ -204,9 +204,9 @@ where
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut project = self.as_mut().project();
         while project.item.is_some() {
-            ready!(project.stream.as_mut().poll_ready(cx)?);
+            ready!(project.sink.as_mut().poll_ready(cx)?);
             let item = project.item.take().expect("item is Some");
-            project.stream.as_mut().start_send(item)?;
+            project.sink.as_mut().start_send(item)?;
         }
         Poll::Ready(Ok(()))
     }
@@ -223,11 +223,11 @@ where
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         ready!(self.as_mut().poll_ready(cx)?);
-        self.project().stream.poll_flush(cx)
+        self.project().sink.poll_flush(cx)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         ready!(self.as_mut().poll_ready(cx)?);
-        self.project().stream.poll_close(cx)
+        self.project().sink.poll_close(cx)
     }
 }

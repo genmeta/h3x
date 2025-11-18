@@ -12,7 +12,6 @@ pub mod field_section;
 pub mod header_block;
 pub mod instruction;
 pub mod integer;
-pub mod settings;
 pub mod r#static;
 pub mod string;
 
@@ -32,7 +31,7 @@ mod tests {
     use crate::{
         codec::{
             SinkWriter, StreamReader,
-            util::{DecodeFrom, EncodeInto, decoder, encoder},
+            util::{DecodeFrom, EncodeInto, decode_stream, encode_sink},
         },
         error::ConnectionError,
         frame::Frame,
@@ -41,9 +40,9 @@ mod tests {
             decoder::{Decoder, MessageStreamReader},
             encoder::Encoder,
             field_section::FieldSection,
-            settings::Settings,
         },
         quic::test::mock_stream_pair,
+        settings::Settings,
         stream::{TryFutureStream, UnidirectionalStream},
         varint::VarInt,
     };
@@ -80,8 +79,8 @@ mod tests {
 
             Arc::new(Encoder::new(
                 Settings::default(),
-                Box::pin(encoder(encoder_stream)),
-                Box::pin(decoder(decoder_stream)),
+                Box::pin(encode_sink(encoder_stream)),
+                Box::pin(decode_stream(decoder_stream)),
             ))
         });
 
@@ -109,8 +108,8 @@ mod tests {
 
             Arc::new(Decoder::new(
                 Settings::default(),
-                Box::pin(encoder(decoder_stream)),
-                Box::pin(decoder(encoder_stream)),
+                Box::pin(encode_sink(decoder_stream)),
+                Box::pin(decode_stream(encoder_stream)),
             ))
         });
 
@@ -148,7 +147,7 @@ mod tests {
 
             println!("Header frame sent");
 
-            let frame_payload = [Bytes::from_static(body.as_bytes())];
+            let frame_payload = Bytes::from_static(body.as_bytes());
             let frame = Frame::new(Frame::DATA_FRAME_TYPE, frame_payload).unwrap();
             frame.encode_into(&mut request_stream).await.unwrap();
             request_stream.flush().await.unwrap();

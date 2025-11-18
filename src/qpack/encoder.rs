@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ops::DerefMut,
-    pin::{Pin, pin},
+    pin::Pin,
 };
 
 use bytes::Bytes;
@@ -10,10 +10,8 @@ use snafu::Snafu;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
-    codec::{
-        Feed, SinkWriter,
-        util::{EncodeInto, encoder},
-    },
+    buflist::BufList,
+    codec::{Feed, util::EncodeInto},
     error::{Code, Error, H3CriticalStreamClosed, HasErrorCode},
     frame::Frame,
     qpack::{
@@ -22,10 +20,10 @@ use crate::{
         field_section::FieldLine,
         header_block::FieldLineRepresentation,
         instruction::{DecoderInstruction, EncoderInstruction},
-        settings::Settings,
         r#static,
     },
     quic::{GetStreamId, GetStreamIdExt},
+    settings::Settings,
 };
 
 #[derive(Debug)]
@@ -340,7 +338,7 @@ where
         field_section: impl IntoIterator<Item = FieldLine> + Send,
         algorithm: &(impl Algorithm + ?Sized),
         stream: impl GetStreamId,
-    ) -> Result<Frame<Vec<Bytes>>, Error> {
+    ) -> Result<Frame<BufList>, Error> {
         tokio::pin!(stream);
         let stream_id = stream.stream_id().await?.into_inner();
 
@@ -362,19 +360,12 @@ where
                 .push_back(max_referenced_index);
         };
 
-        let mut header_frame = Frame::new::<Bytes>(Frame::HEADERS_FRAME_TYPE, vec![]).unwrap();
-        {
-            let mut frame_writer =
-                SinkWriter::new((&mut header_frame).sink_map_err(|error| match error {}));
-            // encode EncodedFieldSectionPrefix
-            field_section_prefix.encode_into(&mut frame_writer).await?;
-            // encode FieldLineRepresentations
-            let mut representations = stream::iter(field_line_representations.into_iter().map(Ok));
-            pin!(encoder(&mut frame_writer))
-                .send_all(&mut representations)
+        let mut header_frame = Frame::new(Frame::HEADERS_FRAME_TYPE, BufList::new()).unwrap();
+        field_section_prefix.encode_into(&mut header_frame).await?;
+        for field_line_representation in field_line_representations {
+            field_line_representation
+                .encode_into(&mut header_frame)
                 .await?;
-            // make sure all data are written
-            frame_writer.flush().await?;
         }
 
         Ok(header_frame)

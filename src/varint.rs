@@ -196,8 +196,8 @@ impl<S: AsyncWrite> EncodeInto<S> for VarInt {
     type Error = StreamError;
 
     async fn encode_into(self, stream: S) -> Result<(), StreamError> {
-        let VarInt(x) = self;
         tokio::pin!(stream);
+        let VarInt(x) = self;
         if x < 1u64 << 6 {
             stream.write_u8(x as u8).await?;
         } else if x < 1u64 << 14 {

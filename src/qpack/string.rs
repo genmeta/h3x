@@ -35,13 +35,16 @@ pub async fn decode_string(
     }
 }
 
-pub async fn encode_string(
-    stream: impl AsyncWrite + Sink<Bytes, Error = StreamError>,
+pub async fn encode_string<E>(
+    stream: impl AsyncWrite + Sink<Bytes, Error = E>,
     mut prefix: u8,
     n: u8,
     huffman: bool,
     data: Bytes,
-) -> Result<(), StreamError> {
+) -> Result<(), StreamError>
+where
+    StreamError: From<E>,
+{
     tokio::pin!(stream);
     // set H bit
     prefix |= (huffman as u8) << (n - 1);

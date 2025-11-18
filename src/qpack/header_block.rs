@@ -288,9 +288,10 @@ where
     }
 }
 
-impl<S> EncodeInto<S> for FieldLineRepresentation
+impl<S, E> EncodeInto<S> for FieldLineRepresentation
 where
-    S: AsyncWrite + Sink<Bytes, Error = StreamError>,
+    S: AsyncWrite + Sink<Bytes, Error = E>,
+    StreamError: From<E>,
 {
     type Error = Error;
 

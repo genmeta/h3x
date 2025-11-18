@@ -3,7 +3,7 @@ use std::io;
 use snafu::Snafu;
 
 use crate::{
-    error::{ConnectionError, Error, StreamError},
+    error::{Code, ConnectionError, Error, StreamError},
     varint::VarInt,
 };
 
@@ -66,6 +66,21 @@ impl DecodeStreamError {
     pub fn map_decode_error(self, map: impl FnOnce(DecodeError) -> Error) -> Error {
         match self {
             DecodeStreamError::Decode { source } => map(source),
+            DecodeStreamError::Stream { source } => Error::Stream { source },
+        }
+    }
+
+    pub fn map_stream_closed(self, stream_closed: impl FnOnce() -> Error) -> Error {
+        match self {
+            DecodeStreamError::Decode {
+                source: DecodeError::Incomplete,
+            } => stream_closed(),
+            DecodeStreamError::Stream {
+                source: StreamError::Reset { .. },
+            } => stream_closed(),
+            DecodeStreamError::Decode { source } => {
+                Code::H3_GENERAL_PROTOCOL_ERROR.with(source).into()
+            }
             DecodeStreamError::Stream { source } => Error::Stream { source },
         }
     }

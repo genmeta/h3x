@@ -4,10 +4,10 @@ use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite};
 
 use crate::{
     codec::{
-        error::{DecodeError, DecodeStreamError},
+        error::DecodeStreamError,
         util::{DecodeFrom, EncodeInto},
     },
-    error::{Code, Error, H3CriticalStreamClosed, StreamError},
+    error::{Error, H3CriticalStreamClosed, StreamError},
     qpack::{
         integer::{decode_integer, encode_integer},
         string::{decode_string, encode_string},
@@ -115,20 +115,9 @@ impl<S: AsyncBufRead> DecodeFrom<S> for EncoderInstruction {
                 _ => unreachable!("unreachable branch(Duplicate should match all other cases)"),
             }
         };
-        decode
-            .await
-            .map_err(|error: DecodeStreamError| match error {
-                DecodeStreamError::Stream { source } if source.is_reset() => {
-                    H3CriticalStreamClosed::QPackEncoder.into()
-                }
-                DecodeStreamError::Stream { source } => source.into(),
-                DecodeStreamError::Decode {
-                    source: DecodeError::Incomplete,
-                } => H3CriticalStreamClosed::QPackEncoder.into(),
-                DecodeStreamError::Decode { source } => {
-                    Code::H3_GENERAL_PROTOCOL_ERROR.with(source).into()
-                }
-            })
+        decode.await.map_err(|error: DecodeStreamError| {
+            error.map_stream_closed(|| H3CriticalStreamClosed::QPackEncoder.into())
+        })
     }
 }
 
@@ -237,20 +226,9 @@ where
                 ),
             }
         };
-        decode
-            .await
-            .map_err(|error: DecodeStreamError| match error {
-                DecodeStreamError::Stream { source } if source.is_reset() => {
-                    H3CriticalStreamClosed::QPackEncoder.into()
-                }
-                DecodeStreamError::Stream { source } => source.into(),
-                DecodeStreamError::Decode {
-                    source: DecodeError::Incomplete,
-                } => H3CriticalStreamClosed::QPackEncoder.into(),
-                DecodeStreamError::Decode { source } => {
-                    Code::H3_GENERAL_PROTOCOL_ERROR.with(source).into()
-                }
-            })
+        decode.await.map_err(|error: DecodeStreamError| {
+            error.map_stream_closed(|| H3CriticalStreamClosed::QPackDecoder.into())
+        })
     }
 }
 
