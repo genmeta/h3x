@@ -1,13 +1,17 @@
-use bytes::Bytes;
+use std::{convert::Infallible, pin::pin};
+
+use bytes::{Buf, Bytes};
 use futures::Sink;
-use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 use crate::{
+    buflist::BufList,
     codec::{
+        Decode, Encode, EncodeExt,
         error::{DecodeError, DecodeStreamError},
-        util::{DecodeFrom, EncodeInto},
     },
     error::{Code, Error, StreamError},
+    frame::Frame,
     qpack::{
         integer::{decode_integer, encode_integer},
         string::{decode_string, encode_string},
@@ -53,15 +57,12 @@ pub struct EncodedFieldSectionPrefix {
     pub base: u64,
 }
 
-impl<S> DecodeFrom<S> for EncodedFieldSectionPrefix
-where
-    S: AsyncBufRead,
-{
+impl<S: AsyncRead> Decode<EncodedFieldSectionPrefix> for S {
     type Error = Error;
 
-    async fn decode_from(stream: S) -> Result<Self, Error> {
+    async fn decode(self) -> Result<EncodedFieldSectionPrefix, Self::Error> {
         let decode = async move {
-            tokio::pin!(stream);
+            let mut stream = pin!(self);
             let ric_prefix = stream.read_u8().await?;
             let required_insert_count = decode_integer(stream.as_mut(), ric_prefix, 8).await?;
             let db_prefix = stream.read_u8().await?;
@@ -96,26 +97,25 @@ where
     }
 }
 
-impl<S> EncodeInto<S> for EncodedFieldSectionPrefix
-where
-    S: AsyncWrite,
-{
+impl<S: AsyncWrite> Encode<EncodedFieldSectionPrefix> for S {
+    type Output = ();
+
     type Error = StreamError;
 
-    async fn encode_into(self, stream: S) -> Result<(), StreamError> {
-        tokio::pin!(stream);
+    async fn encode(self, item: EncodedFieldSectionPrefix) -> Result<Self::Output, Self::Error> {
+        let mut stream = pin!(self);
         let ric_prefix = 0;
-        encode_integer(stream.as_mut(), ric_prefix, 8, self.required_insert_count).await?;
+        encode_integer(stream.as_mut(), ric_prefix, 8, item.required_insert_count).await?;
         // if Sign == 0:
         //    Base = ReqInsertCount + DeltaBase
         //    -> DeltaBase = Base - ReqInsertCount (Base >= ReqInsertCount)
         // else:
         //    Base = ReqInsertCount - DeltaBase - 1
         //    -> DeltaBase = ReqInsertCount - Base - 1 (Base < ReqInsertCount)
-        let (sign, db_value) = if self.base >= self.required_insert_count {
-            (false, self.base - self.required_insert_count)
+        let (sign, db_value) = if item.base >= item.required_insert_count {
+            (false, item.base - item.required_insert_count)
         } else {
-            (true, self.required_insert_count - self.base - 1)
+            (true, item.required_insert_count - item.base - 1)
         };
         let db_prefix = if sign { 0b1000_0000 } else { 0b0000_0000 };
         encode_integer(stream.as_mut(), db_prefix, 7, db_value).await?;
@@ -206,15 +206,12 @@ pub enum FieldLineRepresentation {
     },
 }
 
-impl<S> DecodeFrom<S> for FieldLineRepresentation
-where
-    S: AsyncBufRead,
-{
+impl<S: AsyncRead> Decode<FieldLineRepresentation> for S {
     type Error = Error;
 
-    async fn decode_from(stream: S) -> Result<Self, Error> {
+    async fn decode(self) -> Result<FieldLineRepresentation, Self::Error> {
         let decode = async move {
-            tokio::pin!(stream);
+            let mut stream = pin!(self);
             let prefix = stream.read_u8().await?;
             match prefix {
                 prefix if prefix & 0b1000_0000 == 0b1000_0000 => {
@@ -288,16 +285,18 @@ where
     }
 }
 
-impl<S, E> EncodeInto<S> for FieldLineRepresentation
+impl<S, E> Encode<FieldLineRepresentation> for S
 where
     S: AsyncWrite + Sink<Bytes, Error = E>,
     StreamError: From<E>,
 {
+    type Output = ();
+
     type Error = Error;
 
-    async fn encode_into(self, stream: S) -> Result<(), Error> {
-        tokio::pin!(stream);
-        match self {
+    async fn encode(self, repr: FieldLineRepresentation) -> Result<Self::Output, Self::Error> {
+        let mut stream = pin!(self);
+        match repr {
             FieldLineRepresentation::IndexedFieldLine { is_static, index } => {
                 let mut prefix = 0b1000_0000;
                 if is_static {
@@ -354,5 +353,31 @@ where
             }
         }
         Ok(())
+    }
+}
+
+impl Encode<(EncodedFieldSectionPrefix, Vec<FieldLineRepresentation>)> for BufList {
+    type Output = Frame<BufList>;
+
+    type Error = Infallible;
+
+    async fn encode(
+        self,
+        (field_section_prefix, field_line_representations): (
+            EncodedFieldSectionPrefix,
+            Vec<FieldLineRepresentation>,
+        ),
+    ) -> Result<Self::Output, Self::Error> {
+        assert!(!self.has_remaining());
+        let mut header_frame = Frame::new(Frame::HEADERS_FRAME_TYPE, BufList::new()).unwrap();
+
+        header_frame.encode_one(field_section_prefix).await.unwrap();
+        for field_line_representation in field_line_representations {
+            header_frame
+                .encode_one(field_line_representation)
+                .await
+                .unwrap();
+        }
+        Ok(header_frame)
     }
 }

@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use futures::{Sink, SinkExt};
 use httlib_huffman::DecoderSpeed;
-use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 use crate::{
     codec::{
@@ -13,7 +13,7 @@ use crate::{
 };
 
 pub async fn decode_string(
-    stream: impl AsyncBufRead,
+    stream: impl AsyncRead,
     prefix: u8,
     n: u8,
 ) -> Result<(bool, Bytes), DecodeStreamError> {

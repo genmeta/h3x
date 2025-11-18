@@ -10,7 +10,7 @@ use crate::{
 #[derive(Debug, Snafu, Clone, Copy, PartialEq, Eq)]
 #[snafu(visibility(pub), context(suffix(DecodeSanfu)))]
 pub enum DecodeError {
-    #[snafu(display("Stream ended unexpectedly"))]
+    #[snafu(display("Stream closed unexpectedly"))]
     Incomplete,
     #[snafu(display("Integer too large(overflow u64)"))]
     IntegerOverflow,

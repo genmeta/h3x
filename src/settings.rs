@@ -1,19 +1,18 @@
 use std::{
     collections::{BTreeMap, btree_map},
+    convert::Infallible,
     iter,
     pin::pin,
 };
 
-use futures::{SinkExt, TryStreamExt, stream};
-use tokio::io::{AsyncBufRead, AsyncWrite};
+use bytes::Buf;
+use futures::TryStreamExt;
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 
 use crate::{
     buflist::BufList,
-    codec::{
-        error::{DecodeError, DecodeStreamError},
-        util::{DecodeFrom, EncodeInto, decode_stream, encode_sink},
-    },
-    error::{Code, Error, H3CriticalStreamClosed, StreamError},
+    codec::{Decode, DecodeExt, Encode, EncodeExt, error::DecodeStreamError},
+    error::{Error, H3CriticalStreamClosed, StreamError},
     frame::Frame,
     varint::VarInt,
 };
@@ -96,40 +95,32 @@ impl Setting {
     pub const QPACK_BLOCKED_STREAMS_DEFAULT_VALUE: VarInt = VarInt::from_u32(0);
 }
 
-impl<S: AsyncBufRead> DecodeFrom<S> for Setting {
+impl<S: AsyncRead> Decode<Setting> for S {
     type Error = Error;
 
-    async fn decode_from(stream: S) -> Result<Self, Error> {
+    async fn decode(self) -> Result<Setting, Self::Error> {
         let decode = async move {
-            tokio::pin!(stream);
-            let id = VarInt::decode_from(stream.as_mut()).await?;
-            let value = VarInt::decode_from(stream.as_mut()).await?;
+            let mut stream = pin!(self);
+            let id = stream.decode_one().await?;
+            let value = stream.decode_one().await?;
             Ok(Setting { id, value })
         };
-        decode
-            .await
-            .map_err(|error: DecodeStreamError| match error {
-                DecodeStreamError::Stream { source } if source.is_reset() => {
-                    H3CriticalStreamClosed::Control.into()
-                }
-                DecodeStreamError::Stream { source } => source.into(),
-                DecodeStreamError::Decode {
-                    source: DecodeError::Incomplete,
-                } => H3CriticalStreamClosed::Control.into(),
-                DecodeStreamError::Decode { source } => {
-                    Code::H3_GENERAL_PROTOCOL_ERROR.with(source).into()
-                }
-            })
+        decode.await.map_err(|error: DecodeStreamError| {
+            error.map_stream_closed(|| H3CriticalStreamClosed::Control.into())
+        })
     }
 }
 
-impl<S: AsyncWrite> EncodeInto<S> for Setting {
+impl<S: AsyncWrite> Encode<Setting> for S {
+    type Output = ();
+
     type Error = Error;
-    async fn encode_into(self, stream: S) -> Result<(), Error> {
+
+    async fn encode(self, Setting { id, value }: Setting) -> Result<Self::Output, Self::Error> {
         let encode = async move {
-            tokio::pin!(stream);
-            self.id.encode_into(stream.as_mut()).await?;
-            self.value.encode_into(stream.as_mut()).await?;
+            let mut stream = pin!(self);
+            stream.as_mut().encode_one(id).await?;
+            stream.as_mut().encode_one(value).await?;
             Ok(())
         };
         encode.await.map_err(|error: StreamError| match error {
@@ -144,11 +135,45 @@ pub struct Settings {
     map: BTreeMap<VarInt, VarInt>,
 }
 
-impl Settings {
-    pub async fn encode(&self) -> Frame<BufList> {
-        let mut frame = Frame::new(Frame::SETTINGS_FRAME_TYPE, BufList::new()).unwrap();
-        self.encode_into(&mut frame).await.unwrap();
-        frame
+impl<S> Decode<Settings> for &mut Frame<S>
+where
+    for<'f> &'f mut Frame<S>: AsyncBufRead,
+{
+    type Error = Error;
+
+    async fn decode(self) -> Result<Settings, Self::Error> {
+        assert!(self.r#type() == Frame::SETTINGS_FRAME_TYPE);
+        let mut stream = pin!(self.into_decode_stream::<Setting, Error>());
+        let mut settings = Settings::default();
+        while let Some(setting) = stream.try_next().await? {
+            settings.set(setting);
+        }
+        Ok(settings)
+    }
+}
+
+impl Encode<&Settings> for BufList {
+    type Output = Frame<BufList>;
+
+    type Error = Infallible;
+
+    async fn encode(self, settings: &Settings) -> Result<Self::Output, Self::Error> {
+        assert!(!self.has_remaining());
+        let mut frame = Frame::new(Frame::SETTINGS_FRAME_TYPE, self).unwrap();
+        for setting in settings {
+            frame.encode_one(setting).await.unwrap();
+        }
+        Ok(frame)
+    }
+}
+
+impl Encode<Settings> for BufList {
+    type Output = Frame<BufList>;
+
+    type Error = Infallible;
+
+    async fn encode(self, settings: Settings) -> Result<Self::Output, Self::Error> {
+        self.encode(&settings).await
     }
 }
 
@@ -218,42 +243,5 @@ impl FromIterator<Setting> for Settings {
                 .map(|Setting { id, value }| (id, value))
                 .collect::<BTreeMap<_, _>>(),
         }
-    }
-}
-
-impl<S: AsyncBufRead> DecodeFrom<S> for Settings {
-    type Error = Error;
-
-    async fn decode_from(stream: S) -> Result<Self, Error> {
-        tokio::pin!(stream);
-
-        let stream = decode_stream(stream);
-        tokio::pin!(stream);
-
-        let mut settings = Settings::default();
-        while let Some(setting) = stream.try_next().await? {
-            settings.set(setting);
-        }
-        // when None return by next(), frame is exhausted, no need for extra check
-        Ok(settings)
-    }
-}
-
-impl<S: AsyncWrite> EncodeInto<S> for &Settings {
-    type Error = Error;
-
-    async fn encode_into(self, stream: S) -> Result<(), Error> {
-        tokio::pin!(stream);
-        let mut encoder = pin!(encode_sink(stream));
-        let mut settings = stream::iter(self.into_iter().map(Ok));
-        encoder.send_all(&mut settings).await
-    }
-}
-
-impl<S: AsyncWrite> EncodeInto<S> for Settings {
-    type Error = Error;
-
-    async fn encode_into(self, stream: S) -> Result<(), Error> {
-        (&self).encode_into(stream).await
     }
 }

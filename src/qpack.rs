@@ -29,10 +29,7 @@ mod tests {
     use tokio::{io::AsyncReadExt, sync::Notify, time};
 
     use crate::{
-        codec::{
-            SinkWriter, StreamReader,
-            util::{DecodeFrom, EncodeInto, decode_stream, encode_sink},
-        },
+        codec::{DecodeExt, EncodeExt, SinkWriter, StreamReader},
         error::ConnectionError,
         frame::Frame,
         qpack::{
@@ -49,6 +46,9 @@ mod tests {
 
     #[tokio::test]
     async fn r#static() {
+        _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
         let encode_strategy = StaticEncoder::new(HuffmanAlways);
 
         // stream id is unused in this test
@@ -62,25 +62,25 @@ mod tests {
             )
             .await
             .unwrap();
-            println!("Sent encoder stream type");
+            tracing::info!("Sent encoder stream type");
 
             let decoder_stream = Box::pin(TryFutureStream::from(async move {
-                let decoder_stream =
-                    UnidirectionalStream::decode_from(StreamReader::new(decoder_stream_reader))
-                        .await
-                        .unwrap();
+                let decoder_stream = StreamReader::new(decoder_stream_reader)
+                    .into_decoded::<UnidirectionalStream<_>>()
+                    .await
+                    .unwrap();
                 assert_eq!(
                     decoder_stream.r#type(),
                     UnidirectionalStream::QPACK_DECODER_STREAM_TYPE
                 );
-                println!("Received decoder stream type");
+                tracing::info!("Received decoder stream type");
                 Ok::<_, ConnectionError>(decoder_stream)
             }));
 
             Arc::new(Encoder::new(
                 Settings::default(),
-                Box::pin(encode_sink(encoder_stream)),
-                Box::pin(decode_stream(decoder_stream)),
+                Box::pin((encoder_stream).into_encode_sink()),
+                Box::pin((decoder_stream).into_decode_stream()),
             ))
         });
 
@@ -91,25 +91,25 @@ mod tests {
             )
             .await
             .unwrap();
-            println!("Sent decoder stream type");
+            tracing::info!("Sent decoder stream type");
 
             let encoder_stream = Box::pin(TryFutureStream::from(async move {
-                let encoder_stream =
-                    UnidirectionalStream::decode_from(StreamReader::new(encoder_stream_reader))
-                        .await
-                        .unwrap();
+                let encoder_stream = StreamReader::new(encoder_stream_reader)
+                    .into_decoded::<UnidirectionalStream<_>>()
+                    .await
+                    .unwrap();
                 assert_eq!(
                     encoder_stream.r#type(),
                     UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE
                 );
-                println!("Received encoder stream type");
+                tracing::info!("Received encoder stream type");
                 Ok::<_, ConnectionError>(encoder_stream)
             }));
 
             Arc::new(Decoder::new(
                 Settings::default(),
-                Box::pin(encode_sink(decoder_stream)),
-                Box::pin(decode_stream(encoder_stream)),
+                Box::pin((decoder_stream).into_encode_sink()),
+                Box::pin((encoder_stream).into_decode_stream()),
             ))
         });
 
@@ -143,15 +143,15 @@ mod tests {
                 .encode(field_section, &encode_strategy, &mut request_stream)
                 .await
                 .unwrap();
-            header_frame.encode_into(&mut request_stream).await.unwrap();
+            request_stream.encode_one(header_frame).await.unwrap();
 
-            println!("Header frame sent");
+            tracing::info!("Header frame sent");
 
             let frame_payload = Bytes::from_static(body.as_bytes());
-            let frame = Frame::new(Frame::DATA_FRAME_TYPE, frame_payload).unwrap();
-            frame.encode_into(&mut request_stream).await.unwrap();
+            let data_frame = Frame::new(Frame::DATA_FRAME_TYPE, frame_payload).unwrap();
+            request_stream.encode_one(data_frame).await.unwrap();
             request_stream.flush().await.unwrap();
-            println!("Data frame sent");
+            tracing::info!("Data frame sent");
 
             received_rx.notified().await;
         });
@@ -160,20 +160,20 @@ mod tests {
             let response_stream = MessageStreamReader::new(response_stream, decoder.clone());
             let response_stream = StreamReader::new(response_stream);
 
-            let mut frame = Frame::decode_from(response_stream).await.unwrap();
+            let mut frame = response_stream.into_decoded::<Frame<_>>().await.unwrap();
             assert_eq!(frame.r#type(), Frame::HEADERS_FRAME_TYPE);
             let field_section = decoder.decode(&mut frame).await.unwrap();
             assert_eq!(field_section, expected_field_section);
-            println!("Decoded field section: {:?}", field_section);
+            tracing::info!(?field_section, "Decoded field section",);
 
             frame = frame.into_next_frame().await.unwrap().unwrap();
             assert_eq!(frame.r#type(), Frame::DATA_FRAME_TYPE);
-            println!("Got data frame, reading");
+            tracing::info!("Got data frame, reading");
 
             let mut data = Vec::new();
             frame.read_to_end(&mut data).await.unwrap();
             assert_eq!(data, body.as_bytes());
-            println!("Read data frame");
+            tracing::info!("Read data frame");
 
             received.notify_one();
         });

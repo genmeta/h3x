@@ -11,10 +11,7 @@ use tracing::Instrument;
 
 use crate::{
     buflist::BufList,
-    codec::{
-        Feed, SinkWriter, StreamReader,
-        util::{DecodeFrom, decode_stream, encode_sink},
-    },
+    codec::{DecodeExt, Encode, EncodeExt, Feed, SinkWriter, StreamReader},
     error::{
         Code, ConnectionError, Error, H3CriticalStreamClosed, H3FrameUnexpected, HasErrorCode,
         StreamError,
@@ -191,7 +188,7 @@ impl<C: QuicConnect + Unpin> Connection<C> {
                 let encoder_stream =
                     UnidirectionalStream::new_qpack_encoder_stream(uni_stream).await?;
                 // turn into EncoderInstruction sink
-                Ok::<_, Error>(encode_sink(encoder_stream))
+                Ok::<_, Error>(encoder_stream.into_encode_sink())
             })));
 
             let connection_error = state.error();
@@ -219,7 +216,7 @@ impl<C: QuicConnect + Unpin> Connection<C> {
                 let decoder_stream =
                     UnidirectionalStream::new_qpack_decoder_stream(uni_stream).await?;
                 // turn into DecoderInstruction sink
-                Ok::<_, Error>(encode_sink(decoder_stream))
+                Ok::<_, Error>(decoder_stream.into_encode_sink())
             }));
 
             let connection_error = state.error();
@@ -245,7 +242,9 @@ impl<C: QuicConnect + Unpin> Connection<C> {
             loop {
                 let uni_stream = conn_state.accept_uni().await?;
                 let uni_stream = StreamReader::new(Box::pin(uni_stream));
-                if let Ok(mut uni_stream) = UnidirectionalStream::decode_from(uni_stream).await {
+                if let Ok(mut uni_stream) =
+                    uni_stream.into_decoded::<UnidirectionalStream<_>>().await
+                {
                     // Only one control stream per peer is permitted; receipt of a second
                     // stream claiming to be a control stream MUST be treated as a connection
                     // error of type H3_STREAM_CREATION_ERROR.
@@ -262,12 +261,12 @@ impl<C: QuicConnect + Unpin> Connection<C> {
                         let tx = qpack_encoder_inst_receiver_tx
                             .take()
                             .ok_or(H3StreamCreationError::DuplicateQpackEncoderStream)?;
-                        _ = tx.send(decode_stream(uni_stream))
+                        _ = tx.send(uni_stream.into_decode_stream())
                     } else if uni_stream.is_qpack_decoder_stream() {
                         let tx = qpack_decoder_inst_receiver_tx
                             .take()
                             .ok_or(H3StreamCreationError::DuplicateQpackDecoderStream)?;
-                        _ = tx.send(decode_stream(uni_stream))
+                        _ = tx.send(uni_stream.into_decode_stream())
                     } else if uni_stream.is_reserved_stream() {
                         // The payload and length of the stream are selected in any manner the
                         // sending implementation chooses. When sending a reserved stream type,
@@ -314,11 +313,11 @@ impl<C: QuicConnect + Unpin> Connection<C> {
             // error of type H3_FRAME_UNEXPECTED.
             //
             // https://datatracker.ietf.org/doc/html/rfc9114#frame-settings
-            let mut settings_frame = Frame::decode_from(control_stream).await?;
+            let mut settings_frame = control_stream.into_decoded::<Frame<_>>().await?;
             if settings_frame.r#type() != Frame::SETTINGS_FRAME_TYPE {
                 return Err(Code::H3_MISSING_SETTINGS.into());
             }
-            let settings = Settings::decode_from(&mut settings_frame).await?;
+            let settings = settings_frame.decode_one::<Settings>().await?;
             tracing::debug!("Remote settings applied: {:?}", settings);
             conn_state.peer_settings.set(settings.clone()).unwrap();
             encoder.apply_settings(settings.clone()).await;
@@ -333,7 +332,7 @@ impl<C: QuicConnect + Unpin> Connection<C> {
                 if frame.r#type() == Frame::SETTINGS_FRAME_TYPE {
                     return Err(H3FrameUnexpected::DuplicateSettings.into());
                 } else if frame.r#type() == Frame::GOAWAY_FRAME_TYPE {
-                    let goaway = Goaway::decode_from(&mut frame).await?;
+                    let goaway = frame.decode_one::<Goaway>().await?;
                     // An endpoint MAY send multiple GOAWAY frames indicating different
                     // identifiers, but the identifier in each frame MUST NOT be greater
                     // than the identifier in any previous frame, since clients might
@@ -388,11 +387,12 @@ impl<C: QuicConnect + Unpin> Connection<C> {
         // send control stream type
         let mut control_stream = match UnidirectionalStream::new_control_stream(uni_stream).await {
             Ok(control_stream) => {
-                let control_frame_sink =
-                    encode_sink(control_stream).sink_map_err(|stream_error| match stream_error {
+                let control_frame_sink = control_stream.into_encode_sink().sink_map_err(
+                    |stream_error| match stream_error {
                         StreamError::Reset { .. } => H3CriticalStreamClosed::Control.into(),
                         stream_error => stream_error.into(),
-                    });
+                    },
+                );
                 Feed::new(Box::pin(control_frame_sink) as BoxSink<_, _>)
             }
             Err(error) => {
@@ -400,7 +400,7 @@ impl<C: QuicConnect + Unpin> Connection<C> {
                 return Err(state.error().await);
             }
         };
-        let settings_frame = state.local_settings.encode().await;
+        let settings_frame = BufList::new().encode(&state.local_settings).await.unwrap();
         match control_stream.send(settings_frame).await {
             Ok(()) => {}
             Err(error) => {
@@ -471,7 +471,10 @@ impl<C: QuicConnect + Unpin> Connection<C> {
 
     pub async fn goaway(&self, goaway: Goaway) -> Result<(), StreamError> {
         let mut control_stream = self.control_stream.lock().await;
-        match control_stream.send(goaway.encode().await).await {
+        match control_stream
+            .send(BufList::new().encode(goaway).await.unwrap())
+            .await
+        {
             Ok(()) => Ok(()),
             Err(error) => Err(self.state.handle_error(error).await),
         }

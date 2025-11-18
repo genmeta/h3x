@@ -1,14 +1,8 @@
-use std::{cmp::Ordering, convert::TryFrom, fmt};
+use std::{cmp::Ordering, convert::TryFrom, fmt, pin::pin};
 
-use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{
-    codec::{
-        error::DecodeStreamError,
-        util::{DecodeFrom, EncodeInto},
-    },
-    error::StreamError,
-};
+use crate::codec::{Decode, Encode};
 
 /// An integer less than 2^62
 ///
@@ -179,10 +173,11 @@ pub mod err {
     }
 }
 
-impl<S: AsyncBufRead> DecodeFrom<S> for VarInt {
-    type Error = DecodeStreamError;
-    async fn decode_from(stream: S) -> Result<Self, DecodeStreamError> {
-        tokio::pin!(stream);
+impl<S: AsyncRead> Decode<VarInt> for S {
+    type Error = io::Error;
+
+    async fn decode(self) -> io::Result<VarInt> {
+        let mut stream = pin!(self);
         let first_byte = stream.read_u8().await?;
         let len = 2usize.pow(first_byte as u32 >> 6);
         let mut buf = [first_byte & 0b0011_1111, 0, 0, 0, 0, 0, 0, 0];
@@ -192,12 +187,13 @@ impl<S: AsyncBufRead> DecodeFrom<S> for VarInt {
     }
 }
 
-impl<S: AsyncWrite> EncodeInto<S> for VarInt {
-    type Error = StreamError;
+impl<S: AsyncWrite> Encode<VarInt> for S {
+    type Output = ();
 
-    async fn encode_into(self, stream: S) -> Result<(), StreamError> {
-        tokio::pin!(stream);
-        let VarInt(x) = self;
+    type Error = io::Error;
+
+    async fn encode(self, VarInt(x): VarInt) -> Result<Self::Output, Self::Error> {
+        let mut stream = pin!(self);
         if x < 1u64 << 6 {
             stream.write_u8(x as u8).await?;
         } else if x < 1u64 << 14 {

@@ -11,10 +11,7 @@ use snafu::Snafu;
 use tokio::{io::AsyncBufRead, sync::Mutex as AsyncMutex};
 
 use crate::{
-    codec::{
-        Feed,
-        util::{DecodeFrom, decode_stream},
-    },
+    codec::{Decode, DecodeExt, Feed},
     error::{Code, Error, H3CriticalStreamClosed, HasErrorCode, StreamError},
     qpack::{
         dynamic::DynamicTable,
@@ -332,22 +329,22 @@ where
     ) -> Result<FieldSection, Error> {
         tokio::pin!(stream);
         let stream_id = stream.stream_id().await?.into_inner();
-        let prefix = EncodedFieldSectionPrefix::decode_from(stream.as_mut()).await?;
+        let prefix: EncodedFieldSectionPrefix = stream.as_mut().decode_one().await?;
         self.receive_instruction_until(prefix.required_insert_count)
             .await?;
 
-        let header_section =
-            FieldSection::decode_from(decode_stream(stream).map(|representation| {
-                representation.and_then(|representation| {
-                    decompression_field_line_representation(
-                        &representation,
-                        prefix.base,
-                        &self.state.lock().unwrap().dynamic_table,
-                    )
-                    .map_err(Error::from)
-                })
-            }))
-            .await?;
+        let representations = stream.into_decode_stream::<FieldLineRepresentation, Error>();
+        let field_lines = representations.map(|representation| {
+            representation.and_then(|representation| {
+                decompression_field_line_representation(
+                    &representation,
+                    prefix.base,
+                    &self.state.lock().unwrap().dynamic_table,
+                )
+                .map_err(Error::from)
+            })
+        });
+        let header_section = field_lines.decode().await?;
 
         self.emit(DecoderInstruction::SectionAcknowledgment { stream_id });
         _ = self.flush_instructions().await;

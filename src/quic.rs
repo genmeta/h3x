@@ -272,10 +272,16 @@ pub mod test {
             self.project().stream.poll_ready(cx).map_err(From::from)
         }
 
-        fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+        fn start_send(self: Pin<&mut Self>, bytes: Bytes) -> Result<(), Self::Error> {
+            tracing::debug!(
+                ?bytes,
+                stream_id = self.stream_id.into_inner(),
+                "MockStreamWriter send {} bytes",
+                bytes.len()
+            );
             self.project()
                 .stream
-                .start_send(Packet::Stream(item))
+                .start_send(Packet::Stream(bytes))
                 .map_err(From::from)
         }
 
@@ -342,7 +348,15 @@ pub mod test {
                     return Poll::Ready(Some(Err(StreamError::Reset { code })));
                 }
                 match ready!(project.stream.as_mut().poll_next(cx)?) {
-                    Some(Packet::Stream(bytes)) => return Poll::Ready(Some(Ok(bytes))),
+                    Some(Packet::Stream(bytes)) => {
+                        tracing::debug!(
+                            ?bytes,
+                            stream_id = project.stream_id.into_inner(),
+                            "MockStreamReader received {} bytes",
+                            bytes.len()
+                        );
+                        return Poll::Ready(Some(Ok(bytes)));
+                    }
                     Some(Packet::Reset(code)) => {
                         *project.reset = ReceiverResetState::ResetReceived(code);
                     }

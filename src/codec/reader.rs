@@ -24,6 +24,12 @@ pin_project_lite::pin_project! {
     }
 }
 
+impl<S: ?Sized> AsMut<StreamReader<S>> for StreamReader<S> {
+    fn as_mut(&mut self) -> &mut StreamReader<S> {
+        self
+    }
+}
+
 impl<S> StreamReader<S>
 where
     S: TryStream<Ok = Bytes> + ?Sized,
@@ -146,6 +152,12 @@ pin_project_lite::pin_project! {
     }
 }
 
+impl<S: ?Sized> AsMut<FixedLengthReader<S>> for FixedLengthReader<S> {
+    fn as_mut(&mut self) -> &mut FixedLengthReader<S> {
+        self
+    }
+}
+
 impl<P: ?Sized> FixedLengthReader<P> {
     pub const fn new(stream: P, length: u64) -> Self
     where
@@ -224,8 +236,7 @@ impl<R: AsyncBufRead + ?Sized> AsyncBufRead for FixedLengthReader<R> {
 
 impl<S> Stream for FixedLengthReader<StreamReader<S>>
 where
-    S: TryStream<Ok = Bytes> + ?Sized,
-    DecodeStreamError: From<S::Error>,
+    S: TryStream<Ok = Bytes, Error = StreamError> + ?Sized,
 {
     type Item = Result<Bytes, DecodeStreamError>;
 

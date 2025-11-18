@@ -1,12 +1,11 @@
+use std::pin::pin;
+
 use bytes::Bytes;
 use futures::Sink;
 use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite};
 
 use crate::{
-    codec::{
-        error::DecodeStreamError,
-        util::{DecodeFrom, EncodeInto},
-    },
+    codec::{Decode, Encode, error::DecodeStreamError},
     error::{Error, H3CriticalStreamClosed, StreamError},
     qpack::{
         integer::{decode_integer, encode_integer},
@@ -66,11 +65,12 @@ pub enum EncoderInstruction {
     Duplicate { index: u64 },
 }
 
-impl<S: AsyncBufRead> DecodeFrom<S> for EncoderInstruction {
+impl<S: AsyncBufRead> Decode<EncoderInstruction> for S {
     type Error = Error;
-    async fn decode_from(stream: S) -> Result<Self, Error> {
+
+    async fn decode(self) -> Result<EncoderInstruction, Self::Error> {
         let decode = async move {
-            tokio::pin!(stream);
+            let mut stream = pin!(self);
             let prefix = stream.read_u8().await?;
             match prefix {
                 prefix if prefix & 0b1110_0000 == 0b0010_0000 => {
@@ -121,19 +121,22 @@ impl<S: AsyncBufRead> DecodeFrom<S> for EncoderInstruction {
     }
 }
 
-impl<S> EncodeInto<S> for EncoderInstruction
+impl<S> Encode<EncoderInstruction> for S
 where
     S: AsyncWrite + Sink<Bytes, Error = StreamError>,
 {
+    type Output = ();
+
     type Error = Error;
 
-    async fn encode_into(self, stream: S) -> Result<(), Error> {
+    async fn encode(self, inst: EncoderInstruction) -> Result<Self::Output, Self::Error> {
         let encode = async move {
-            tokio::pin!(stream);
-            match self {
+            let mut stream = pin!(self);
+            match inst {
                 EncoderInstruction::SetDynamicTableCapacity { capacity } => {
                     let prefix = 0b0010_0000;
-                    encode_integer(stream, prefix, 5, capacity).await
+                    encode_integer(stream, prefix, 5, capacity).await?;
+                    Ok(())
                 }
                 EncoderInstruction::InsertWithNameReference {
                     is_static,
@@ -162,7 +165,8 @@ where
                 }
                 EncoderInstruction::Duplicate { index } => {
                     let prefix = 0b0000_0000;
-                    encode_integer(stream.as_mut(), prefix, 5, index).await
+                    encode_integer(stream.as_mut(), prefix, 5, index).await?;
+                    Ok(())
                 }
             }
         };
@@ -198,15 +202,12 @@ pub enum DecoderInstruction {
     InsertCountIncrement { increment: u64 },
 }
 
-impl<S> DecodeFrom<S> for DecoderInstruction
-where
-    S: AsyncBufRead,
-{
+impl<S: AsyncBufRead> Decode<DecoderInstruction> for S {
     type Error = Error;
 
-    async fn decode_from(stream: S) -> Result<Self, Error> {
+    async fn decode(self) -> Result<DecoderInstruction, Error> {
         let decode = async move {
-            tokio::pin!(stream);
+            let mut stream = pin!(self);
             let prefix = stream.read_u8().await?;
             match prefix {
                 prefix if prefix & 0b1000_0000 == 0b1000_0000 => {
@@ -232,27 +233,32 @@ where
     }
 }
 
-impl<S> EncodeInto<S> for DecoderInstruction
+impl<S> Encode<DecoderInstruction> for S
 where
     S: AsyncWrite,
 {
+    type Output = ();
+
     type Error = Error;
 
-    async fn encode_into(self, stream: S) -> Result<(), Error> {
+    async fn encode(self, inst: DecoderInstruction) -> Result<Self::Output, Self::Error> {
         let encode = async move {
-            tokio::pin!(stream);
-            match self {
+            let mut stream = pin!(self);
+            match inst {
                 DecoderInstruction::SectionAcknowledgment { stream_id } => {
                     let prefix = 0b1000_0000;
-                    encode_integer(stream.as_mut(), prefix, 7, stream_id).await
+                    encode_integer(stream.as_mut(), prefix, 7, stream_id).await?;
+                    Ok(())
                 }
                 DecoderInstruction::StreamCancellation { stream_id } => {
                     let prefix = 0b0100_0000;
-                    encode_integer(stream.as_mut(), prefix, 6, stream_id).await
+                    encode_integer(stream.as_mut(), prefix, 6, stream_id).await?;
+                    Ok(())
                 }
                 DecoderInstruction::InsertCountIncrement { increment } => {
                     let prefix = 0b0000_0000;
-                    encode_integer(stream.as_mut(), prefix, 6, increment).await
+                    encode_integer(stream.as_mut(), prefix, 6, increment).await?;
+                    Ok(())
                 }
             }
         };

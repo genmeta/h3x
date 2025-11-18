@@ -11,7 +11,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     buflist::BufList,
-    codec::{Feed, util::EncodeInto},
+    codec::{Encode, Feed},
     error::{Code, Error, H3CriticalStreamClosed, HasErrorCode},
     frame::Frame,
     qpack::{
@@ -360,13 +360,9 @@ where
                 .push_back(max_referenced_index);
         };
 
-        let mut header_frame = Frame::new(Frame::HEADERS_FRAME_TYPE, BufList::new()).unwrap();
-        field_section_prefix.encode_into(&mut header_frame).await?;
-        for field_line_representation in field_line_representations {
-            field_line_representation
-                .encode_into(&mut header_frame)
-                .await?;
-        }
+        let Ok(header_frame) = BufList::new()
+            .encode((field_section_prefix, field_line_representations))
+            .await;
 
         Ok(header_frame)
     }

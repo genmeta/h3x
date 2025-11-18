@@ -10,7 +10,7 @@ use snafu::Snafu;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
-    codec::util::{DecodeFrom, EncodeInto},
+    codec::{Decode, DecodeExt, EncodeExt, error::DecodeStreamError},
     error::{Code, Error, H3CriticalStreamClosed, HasErrorCode, StreamError},
     quic::{CancelStream, GetStreamId, StopSending},
     varint::VarInt,
@@ -35,13 +35,18 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl<S: AsyncBufRead + Unpin> DecodeFrom<S> for UnidirectionalStream<S> {
+impl<S: AsyncRead + Unpin> Decode<UnidirectionalStream<S>> for S {
     type Error = Error;
-    async fn decode_from(mut stream: S) -> Result<Self, Error> {
-        let r#type = VarInt::decode_from(&mut stream).await.map_err(|error| {
-            error.map_decode_error(|error| Code::H3_GENERAL_PROTOCOL_ERROR.with(error).into())
+
+    async fn decode(mut self) -> Result<UnidirectionalStream<S>, Self::Error> {
+        let r#type = self.decode_one::<VarInt>().await.map_err(|error| {
+            DecodeStreamError::from(error)
+                .map_decode_error(|error| Code::H3_GENERAL_PROTOCOL_ERROR.with(error).into())
         })?;
-        Ok(UnidirectionalStream { r#type, stream })
+        Ok(UnidirectionalStream {
+            r#type,
+            stream: self,
+        })
     }
 }
 
@@ -83,7 +88,7 @@ impl<S: ?Sized> UnidirectionalStream<S> {
     where
         S: AsyncWrite + Unpin + Sized,
     {
-        r#type.encode_into(&mut stream).await?;
+        stream.encode_one(r#type).await?;
         stream.flush().await?;
         Ok(Self { r#type, stream })
     }

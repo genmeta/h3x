@@ -1,3 +1,5 @@
+use std::pin::pin;
+
 use bytes::Bytes;
 use futures::{Stream, TryStreamExt};
 use http::{
@@ -10,7 +12,7 @@ use http::{
 use snafu::{Snafu, ensure};
 
 use crate::{
-    codec::util::DecodeFrom,
+    codec::Decode,
     error::{Code, Error, HasErrorCode},
 };
 
@@ -197,14 +199,11 @@ fn is_response_pseudo_header(name: &[u8]) -> bool {
     matches!(name, b":status")
 }
 
-impl<S> DecodeFrom<S> for FieldSection
-where
-    S: Stream<Item = Result<FieldLine, Error>>,
-{
+impl<S: Stream<Item = Result<FieldLine, Error>>> Decode<FieldSection> for S {
     type Error = Error;
 
-    async fn decode_from(stream: S) -> Result<Self, Error> {
-        tokio::pin!(stream);
+    async fn decode(self) -> Result<FieldSection, Self::Error> {
+        let mut stream = pin!(self);
 
         let mut pseudo_header = None;
         let mut header_map = HeaderMap::new();
@@ -261,7 +260,7 @@ where
             }
         }
 
-        Ok(Self {
+        Ok(FieldSection {
             pseudo_headers: pseudo_header
                 .ok_or(InvalidHeaderSection::AbsenceOfMandatoryPseudoHeaders)?,
             header_map,

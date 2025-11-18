@@ -1,5 +1,5 @@
 use std::{
-    pin::Pin,
+    pin::{Pin, pin},
     task::{Context, Poll},
 };
 
@@ -8,12 +8,7 @@ use futures::{Sink, SinkExt, Stream, StreamExt, TryStream, sink};
 use tokio::io::{self, AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
-    buflist::BufList,
-    codec::{
-        FixedLengthReader, StreamReader,
-        error::DecodeStreamError,
-        util::{DecodeFrom, EncodeInto},
-    },
+    codec::{Decode, DecodeExt, Encode, FixedLengthReader, StreamReader, error::DecodeStreamError},
     error::{Code, Error, StreamError},
     quic::{GetStreamId, StopSending},
     varint::{self, VARINT_MAX, VarInt},
@@ -188,38 +183,35 @@ impl<P: Sink<B> + ?Sized, B: Buf> Sink<B> for Frame<P> {
     }
 }
 
-impl<P, S> EncodeInto<S> for Frame<P>
-where
-    P: Buf,
-    S: AsyncWrite + Sink<Bytes, Error = StreamError>,
-{
+impl<P: Buf, S: AsyncWrite + Sink<Bytes, Error = StreamError>> Encode<Frame<P>> for S {
+    type Output = ();
+
     type Error = StreamError;
 
-    async fn encode_into(mut self, stream: S) -> Result<(), StreamError> {
-        tokio::pin!(stream);
-        self.r#type.encode_into(&mut stream).await?;
-        self.length.encode_into(&mut stream).await?;
-        while self.payload.has_remaining() {
-            let bytes = self.payload.copy_to_bytes(self.payload.chunk().len());
-            stream.feed(bytes).await?;
+    async fn encode(self, mut frame: Frame<P>) -> Result<Self::Output, Self::Error> {
+        let mut stream = pin!(self);
+        stream.as_mut().encode(frame.r#type).await?;
+        stream.as_mut().encode(frame.length).await?;
+        while frame.payload.has_remaining() {
+            let bytes = frame.payload.copy_to_bytes(frame.payload.chunk().len());
+            stream.as_mut().feed(bytes).await?;
         }
-
         Ok(())
     }
 }
 
-impl<S> DecodeFrom<StreamReader<S>> for Frame<FixedLengthReader<StreamReader<S>>>
+impl<S> Decode<Frame<FixedLengthReader<StreamReader<S>>>> for StreamReader<S>
 where
     S: TryStream<Ok = Bytes, Error = StreamError>,
     StreamReader<S>: Unpin,
 {
     type Error = Error;
 
-    async fn decode_from(mut stream: StreamReader<S>) -> Result<Self, Error> {
+    async fn decode(mut self) -> Result<Frame<FixedLengthReader<StreamReader<S>>>, Self::Error> {
         let decode = async move {
-            let r#type = VarInt::decode_from(&mut stream).await?;
-            let length = VarInt::decode_from(&mut stream).await?;
-            let payload = FixedLengthReader::new(stream, length.into_inner());
+            let r#type = self.decode_one::<VarInt>().await?;
+            let length = self.decode_one::<VarInt>().await?;
+            let payload = FixedLengthReader::new(self, length.into_inner());
             Ok(Frame {
                 r#type,
                 length,
@@ -257,11 +249,7 @@ where
     io::Error: From<S::Error>,
 {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
-        self.project().payload.poll_fill_buf(cx).map_err(|error| {
-            DecodeStreamError::from(error)
-                .map_decode_error(|decode_error| Code::H3_FRAME_ERROR.with(decode_error).into())
-                .into()
-        })
+        self.project().payload.poll_fill_buf(cx)
     }
 
     fn consume(self: Pin<&mut Self>, amt: usize) {
@@ -273,12 +261,10 @@ impl<S: Stream + ?Sized> Stream for Frame<FixedLengthReader<StreamReader<S>>>
 where
     S: TryStream<Ok = Bytes, Error = StreamError>,
 {
-    type Item = Result<Bytes, Error>;
+    type Item = Result<Bytes, DecodeStreamError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.project().payload.poll_next(cx).map_err(|error| {
-            error.map_decode_error(|decode_error| Code::H3_FRAME_ERROR.with(decode_error).into())
-        })
+        self.project().payload.poll_next(cx)
     }
 }
 
@@ -315,7 +301,7 @@ where
 
         let mut stream = self.payload.into_inner();
         match Pin::new(&mut stream).has_remaining().await {
-            Ok(true) => Some(Frame::decode_from(stream).await),
+            Ok(true) => Some(stream.into_decoded().await),
             Ok(false) => None,
             Err(error) => Some(Err(error.into())),
         }
@@ -329,7 +315,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{SinkWriter, error::DecodeError},
+        codec::{EncodeExt, SinkWriter, error::DecodeError},
         error::StreamError,
     };
 
@@ -360,7 +346,7 @@ mod tests {
             b'W', b'o', b'r', b'l', b'd', // Payload: "World"
         ]));
 
-        let mut frame1 = Frame::decode_from(stream).await.unwrap();
+        let mut frame1: Frame<_> = stream.into_decoded().await.unwrap();
         assert_eq!(frame1.r#type().into_inner(), 0);
         assert_eq!(frame1.length().into_inner(), 5);
         let mut payload = vec![];
@@ -384,7 +370,7 @@ mod tests {
         ]));
 
         assert!(matches!(
-            Frame::decode_from(stream).await,
+            stream.into_decoded::<Frame<_>>().await,
             Err(Error::Code { source }) if source.code() == Code::H3_FRAME_ERROR
         ));
     }
@@ -398,7 +384,7 @@ mod tests {
         ]));
 
         assert!(matches!(
-            Frame::decode_from(stream).await,
+            stream.into_decoded::<Frame<_>>().await,
             Err(Error::Code { source }) if source.code() == Code::H3_FRAME_ERROR
         ));
     }
@@ -411,15 +397,17 @@ mod tests {
             b'H', b'e', b'l', b'l', /* b'o', */ // Payload: "Hello"
         ]));
 
-        let mut frame1 = Frame::decode_from(stream).await.unwrap();
+        let mut frame1 = stream.into_decoded::<Frame<_>>().await.unwrap();
         assert_eq!(frame1.r#type().into_inner(), 0);
         assert_eq!(frame1.length().into_inner(), 5);
         let mut payload = vec![];
         assert!(matches!(
-            DecodeStreamError::from(frame1.read_to_end(&mut payload).await.unwrap_err()),
-            DecodeStreamError::Decode {
-                source: DecodeError::Incomplete
-            }
+            Error::from(frame1.read_to_end(&mut payload).await.unwrap_err()),
+            Error::Code { source } if source.code() == Code::H3_FRAME_ERROR &&
+                matches!(
+                    source.source().unwrap().downcast_ref::<DecodeError>(),
+                    Some(DecodeError::Incomplete)
+                )
         ));
         assert_eq!(payload.as_slice(), b"Hell")
     }
@@ -439,7 +427,7 @@ mod tests {
         let decode = tokio::spawn(async move {
             let stream = StreamReader::new(stream);
 
-            let mut frame1 = Frame::decode_from(stream).await.unwrap();
+            let mut frame1 = stream.into_decoded::<Frame<_>>().await.unwrap();
             assert_eq!(frame1.r#type().into_inner(), 0);
             assert_eq!(frame1.length().into_inner(), 5);
             let mut payload = vec![];
@@ -460,13 +448,13 @@ mod tests {
             assert!(frame1.r#type().into_inner() == 0);
             assert!(frame1.length().into_inner() == 5);
             assert!(frame1.payload().as_ref() == b"Hello");
-            frame1.encode_into(&mut sink).await.unwrap();
+            sink.encode_one(frame1).await.unwrap();
 
             let frame2 = Frame::new(VarInt::from_u32(0), Bytes::from_static(b"World")).unwrap();
             assert!(frame2.r#type().into_inner() == 0);
             assert!(frame2.length().into_inner() == 5);
             assert!(frame2.payload().as_ref() == b"World");
-            frame2.encode_into(&mut sink).await.unwrap();
+            sink.encode_one(frame2).await.unwrap();
 
             Pin::new(&mut sink).flush_buffer().await.unwrap();
         });

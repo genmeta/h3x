@@ -1,6 +1,17 @@
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{codec::error::DecodeStreamError, error::StreamError};
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Integer(u64);
+
+impl Integer {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(&self) -> u64 {
+        self.0
+    }
+}
 
 /// Pseudocode to decode an integer I is as follows:
 ///
@@ -16,11 +27,7 @@ use crate::{codec::error::DecodeStreamError, error::StreamError};
 ///       while B & 128 == 128
 ///       return I
 /// ```
-pub async fn decode_integer(
-    stream: impl AsyncRead,
-    prefix: u8,
-    n: u8,
-) -> Result<u64, DecodeStreamError> {
+pub async fn decode_integer(stream: impl AsyncRead, prefix: u8, n: u8) -> io::Result<u64> {
     tokio::pin!(stream);
     let mut i = prefix as u64 & ((1 << n) - 1);
     if i < (1 << n) - 1 {
@@ -57,7 +64,7 @@ pub async fn encode_integer(
     prefix: u8,
     n: u8,
     mut i: u64,
-) -> Result<(), StreamError> {
+) -> io::Result<()> {
     tokio::pin!(stream);
     let limit = (1 << n) - 1;
     if i < limit as u64 {

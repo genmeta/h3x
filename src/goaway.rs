@@ -1,8 +1,11 @@
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
+use std::convert::Infallible;
+
+use bytes::Buf;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 use crate::{
     buflist::BufList,
-    codec::util::{DecodeFrom, EncodeInto},
+    codec::{Decode, DecodeExt, Encode, EncodeExt, error::DecodeStreamError},
     error::{Code, Error, H3CriticalStreamClosed},
     frame::Frame,
     varint::VarInt,
@@ -26,40 +29,41 @@ impl Goaway {
     pub const fn stream_id(&self) -> VarInt {
         self.stream_id
     }
-
-    pub async fn encode(&self) -> Frame<BufList> {
-        let mut frame = Frame::new(Frame::GOAWAY_FRAME_TYPE, BufList::new()).unwrap();
-        self.encode_into(&mut frame).await.unwrap();
-        frame
-    }
 }
 
-impl<S: AsyncBufRead> DecodeFrom<S> for Goaway {
+impl<S> Decode<Goaway> for &mut Frame<S>
+where
+    for<'f> &'f mut Frame<S>: AsyncBufRead,
+{
     type Error = Error;
 
-    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
-        tokio::pin!(stream);
-        let stream_id = VarInt::decode_from(stream.as_mut())
-            .await
-            .map_err(|error| error.map_stream_closed(|| H3CriticalStreamClosed::Control.into()))?;
+    async fn decode(mut self) -> Result<Goaway, Self::Error> {
+        assert!(self.r#type() == Frame::GOAWAY_FRAME_TYPE);
+        let stream_id = self.decode_one::<VarInt>().await.map_err(|error| {
+            DecodeStreamError::from(error)
+                .map_stream_closed(|| H3CriticalStreamClosed::Control.into())
+        })?;
+
         // ensure frame is exhausted
-        if !stream.fill_buf().await?.is_empty() {
+        if !self.fill_buf().await?.is_empty() {
             // TODO: error kind
             return Err(Code::H3_GENERAL_PROTOCOL_ERROR.into());
         };
 
-        Ok(Self { stream_id })
+        Ok(Goaway { stream_id })
     }
 }
 
-impl<S: AsyncWrite> EncodeInto<S> for Goaway {
-    type Error = Error;
+impl Encode<Goaway> for BufList {
+    type Output = Frame<BufList>;
 
-    async fn encode_into(self, stream: S) -> Result<(), Self::Error> {
-        match self.stream_id.encode_into(stream).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.is_reset() => Err(H3CriticalStreamClosed::Control.into()),
-            Err(error) => Err(error.into()),
-        }
+    type Error = Infallible;
+
+    async fn encode(self, goaway: Goaway) -> Result<Self::Output, Self::Error> {
+        assert!(!self.has_remaining());
+
+        let mut frame = Frame::new(Frame::GOAWAY_FRAME_TYPE, self).unwrap();
+        frame.encode_one(goaway.stream_id).await.unwrap();
+        Ok(frame)
     }
 }
