@@ -13,7 +13,7 @@ use crate::{
     codec::{Decode, DecodeExt, DecodeStreamError, EncodeExt},
     connection::StreamError,
     error::{Code, H3CriticalStreamClosed, HasErrorCode},
-    quic::{self, CancelStream, GetStreamId, StopSending},
+    quic::{self, CancelStream, GetStreamId, StopStream},
     varint::VarInt,
 };
 
@@ -189,13 +189,13 @@ impl<S: GetStreamId + ?Sized> GetStreamId for UnidirectionalStream<S> {
     }
 }
 
-impl<S: StopSending + ?Sized> StopSending for UnidirectionalStream<S> {
-    fn poll_stop_sending(
+impl<S: StopStream + ?Sized> StopStream for UnidirectionalStream<S> {
+    fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        self.project().stream.poll_stop_sending(cx, code)
+        self.project().stream.poll_stop(cx, code)
     }
 }
 

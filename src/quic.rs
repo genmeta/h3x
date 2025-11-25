@@ -8,10 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{
-    Sink, Stream,
-    future::{BoxFuture, poll_fn},
-};
+use futures::{Sink, Stream, future::BoxFuture};
 use snafu::Snafu;
 
 use crate::{error::Code, varint::VarInt};
@@ -103,7 +100,7 @@ impl ConnectionError {
     }
 }
 
-pub trait Connect: Close {
+pub trait ManageStream {
     type StreamWriter: WriteStream;
     type StreamReader: ReadStream;
 
@@ -150,78 +147,92 @@ where
     }
 }
 
-pub trait GetStreamIdExt {
-    async fn stream_id(&mut self) -> Result<VarInt, StreamError>
-    where
-        Self: Unpin;
-}
-
-impl<T: GetStreamId + ?Sized> GetStreamIdExt for T {
-    async fn stream_id(&mut self) -> Result<VarInt, StreamError>
-    where
-        Self: Unpin,
-    {
-        let mut pin = Pin::new(self);
-        poll_fn(|cx| pin.as_mut().poll_stream_id(cx)).await
+pin_project_lite::pin_project! {
+    pub struct StreamId<S: ?Sized>{
+        #[pin]
+        stream: S
     }
 }
 
-pub trait StopSending {
-    fn poll_stop_sending(
+impl<S: GetStreamId + ?Sized> Future for StreamId<S> {
+    type Output = Result<VarInt, StreamError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let project = self.project();
+        project.stream.poll_stream_id(cx)
+    }
+}
+
+pub trait GetStreamIdExt {
+    fn stream_id(&mut self) -> StreamId<&mut Self> {
+        StreamId { stream: self }
+    }
+}
+
+impl<T: GetStreamId + ?Sized> GetStreamIdExt for T {}
+
+pub trait StopStream {
+    fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), StreamError>>;
 }
 
-impl<P> StopSending for Pin<P>
+impl<P> StopStream for Pin<P>
 where
-    P: DerefMut<Target: StopSending>,
+    P: DerefMut<Target: StopStream>,
 {
-    fn poll_stop_sending(
+    fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), StreamError>> {
-        <P::Target as StopSending>::poll_stop_sending(self.as_deref_mut(), cx, code)
+        <P::Target as StopStream>::poll_stop(self.as_deref_mut(), cx, code)
     }
 }
 
-impl<S> StopSending for &mut S
+impl<S> StopStream for &mut S
 where
-    S: StopSending + Unpin + ?Sized,
+    S: StopStream + Unpin + ?Sized,
 {
-    fn poll_stop_sending(
+    fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), StreamError>> {
-        S::poll_stop_sending(Pin::new(self.get_mut()), cx, code)
+        S::poll_stop(Pin::new(self.get_mut()), cx, code)
     }
 }
 
-pub trait StopSendingExt {
-    async fn stop_sending(&mut self, code: VarInt) -> Result<(), StreamError>
-    where
-        Self: Unpin;
-}
-
-impl<T: StopSending + ?Sized> StopSendingExt for T {
-    async fn stop_sending(&mut self, code: VarInt) -> Result<(), StreamError>
-    where
-        Self: Unpin,
-    {
-        let mut pin = Pin::new(self);
-        poll_fn(|cx| pin.as_mut().poll_stop_sending(cx, code)).await
+pin_project_lite::pin_project! {
+    pub struct Stop<S: ?Sized>{
+        code: VarInt,
+        #[pin]
+        stream: S
     }
 }
 
-pub trait ReadStream:
-    StopSending + GetStreamId + Stream<Item = Result<Bytes, StreamError>>
-{
+impl<S: StopStream + ?Sized> Future for Stop<S> {
+    type Output = Result<(), StreamError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let project = self.project();
+        project.stream.poll_stop(cx, *project.code)
+    }
 }
 
-impl<S: StopSending + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + ?Sized> ReadStream
+pub trait StopStreamExt {
+    fn stop(&mut self, code: VarInt) -> Stop<&mut Self> {
+        Stop { code, stream: self }
+    }
+}
+
+impl<T: StopStream + ?Sized> StopStreamExt for T {}
+
+pub trait ReadStream: StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> {}
+
+impl<S: StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + ?Sized> ReadStream
     for S
 {
 }
@@ -260,21 +271,30 @@ where
     }
 }
 
-pub trait CancelStreamExt {
-    async fn cancel(&mut self, code: VarInt) -> Result<(), StreamError>
-    where
-        Self: Unpin;
-}
-
-impl<T: CancelStream + ?Sized> CancelStreamExt for T {
-    async fn cancel(&mut self, code: VarInt) -> Result<(), StreamError>
-    where
-        Self: Unpin,
-    {
-        let mut pin = Pin::new(self);
-        poll_fn(|cx| pin.as_mut().poll_cancel(cx, code)).await
+pin_project_lite::pin_project! {
+    pub struct Cancel<S:?Sized>{
+        code: VarInt,
+        #[pin]
+        stream: S
     }
 }
+
+impl<S: CancelStream + ?Sized> Future for Cancel<S> {
+    type Output = Result<(), StreamError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let project = self.project();
+        project.stream.poll_cancel(cx, *project.code)
+    }
+}
+
+pub trait CancelStreamExt {
+    fn cancel(&mut self, code: VarInt) -> Cancel<&mut Self> {
+        Cancel { code, stream: self }
+    }
+}
+
+impl<T: CancelStream + ?Sized> CancelStreamExt for T {}
 
 pub trait WriteStream: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> {}
 
@@ -292,7 +312,7 @@ pub mod test {
     use tokio::sync::oneshot;
 
     use crate::{
-        quic::{CancelStream, GetStreamId, StopSending, StreamError},
+        quic::{CancelStream, GetStreamId, StopStream, StreamError},
         varint::VarInt,
     };
 
@@ -410,8 +430,8 @@ pub mod test {
         }
     }
 
-    impl<S: ?Sized> StopSending for MockStreamReader<S> {
-        fn poll_stop_sending(
+    impl<S: ?Sized> StopStream for MockStreamReader<S> {
+        fn poll_stop(
             self: Pin<&mut Self>,
             _cx: &mut Context,
             code: VarInt,

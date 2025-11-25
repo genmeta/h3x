@@ -21,7 +21,7 @@ use crate::{
         instruction::{DecoderInstruction, EncoderInstruction},
         r#static,
     },
-    quic::{self, GetStreamId, GetStreamIdExt, ReadStream, StopSending},
+    quic::{self, GetStreamId, GetStreamIdExt, ReadStream, StopStream},
     varint::VarInt,
 };
 
@@ -423,15 +423,15 @@ impl<S: ReadStream + Unpin, Ds, Es> MessageStreamReader<S, Ds, Es> {
     }
 }
 
-impl<S: ReadStream, Ds, Es> StopSending for MessageStreamReader<S, Ds, Es> {
-    fn poll_stop_sending(
+impl<S: ReadStream, Ds, Es> StopStream for MessageStreamReader<S, Ds, Es> {
+    fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
         let mut project = self.project();
         let stream_id = ready!(project.stream.as_mut().poll_stream_id(cx))?.into_inner();
-        ready!(project.stream.poll_stop_sending(cx, code))?;
+        ready!(project.stream.poll_stop(cx, code))?;
         project
             .decoder
             .emit(DecoderInstruction::StreamCancellation { stream_id });

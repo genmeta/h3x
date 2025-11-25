@@ -11,7 +11,7 @@ use crate::{
     connection::StreamError,
     error::Code,
     frame::Frame,
-    quic::{self, GetStreamId, StopSending},
+    quic::{self, GetStreamId, StopStream},
     varint::VarInt,
 };
 
@@ -158,12 +158,12 @@ impl<S: GetStreamId + ?Sized> GetStreamId for FrameStream<S> {
     }
 }
 
-impl<S: StopSending + ?Sized> StopSending for FrameStream<S> {
-    fn poll_stop_sending(
+impl<S: StopStream + ?Sized> StopStream for FrameStream<S> {
+    fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        self.project().stream.poll_stop_sending(cx, code)
+        self.project().stream.poll_stop(cx, code)
     }
 }

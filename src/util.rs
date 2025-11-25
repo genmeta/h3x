@@ -13,7 +13,7 @@ use tokio::{
 };
 
 use crate::{
-    quic::{self, CancelStream, GetStreamId, StopSending},
+    quic::{self, CancelStream, GetStreamId, StopStream},
     varint::VarInt,
 };
 
@@ -203,19 +203,19 @@ where
     }
 }
 
-impl<S, E, F> StopSending for TryFutureStream<S, E, F>
+impl<S, E, F> StopStream for TryFutureStream<S, E, F>
 where
-    S: StopSending,
+    S: StopStream,
     E: Clone,
     quic::StreamError: From<E>,
     F: Future<Output = Result<S, E>>,
 {
-    fn poll_stop_sending(
+    fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        ready!(self.poll_try_stream(cx)?).poll_stop_sending(cx, code)
+        ready!(self.poll_try_stream(cx)?).poll_stop(cx, code)
     }
 }
 

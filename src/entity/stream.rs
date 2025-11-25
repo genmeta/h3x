@@ -22,10 +22,7 @@ use crate::{
         algorithm::{HuffmanAlways, StaticCompressAlgo},
         field_section::FieldSection,
     },
-    quic::{
-        self, CancelStream, CancelStreamExt, GetStreamId, GetStreamIdExt, StopSending,
-        StopSendingExt,
-    },
+    quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
     varint::VarInt,
 };
 
@@ -59,7 +56,7 @@ impl Stream for MockStream {
     }
 }
 
-impl CancelStream for MockStream {
+impl quic::CancelStream for MockStream {
     fn poll_cancel(
         self: Pin<&mut Self>,
         _cx: &mut Context,
@@ -69,8 +66,8 @@ impl CancelStream for MockStream {
     }
 }
 
-impl StopSending for MockStream {
-    fn poll_stop_sending(
+impl quic::StopStream for MockStream {
+    fn poll_stop(
         self: Pin<&mut Self>,
         _cx: &mut Context,
         _code: VarInt,
@@ -79,7 +76,7 @@ impl StopSending for MockStream {
     }
 }
 
-impl GetStreamId for MockStream {
+impl quic::GetStreamId for MockStream {
     fn poll_stream_id(
         self: Pin<&mut Self>,
         _cx: &mut Context,
@@ -178,7 +175,7 @@ impl ReadStream {
             goaway = peer_goaway => match goaway {
                 Ok(()) => {
                     // FIXME: which code should be used?
-                    _ = self.stream.stop_sending(Code::H3_NO_ERROR.into()).await;
+                    _ = self.stream.stop(Code::H3_NO_ERROR.into()).await;
                     Err(StreamError::Goaway)
                 }
                 Err(error) => Err(error.into())
@@ -412,7 +409,7 @@ impl ReadStream {
     }
 
     pub async fn stop(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
-        self.stop_sending(code).await
+        self.stream.stop(code).await
     }
 
     pub fn take(&mut self) -> Self {
@@ -425,13 +422,13 @@ impl ReadStream {
     }
 }
 
-impl StopSending for ReadStream {
-    fn poll_stop_sending(
+impl quic::StopStream for ReadStream {
+    fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        Pin::new(&mut self.get_mut().stream).poll_stop_sending(cx, code)
+        Pin::new(&mut self.get_mut().stream).poll_stop(cx, code)
     }
 }
 

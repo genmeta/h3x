@@ -30,7 +30,7 @@ use crate::{
         encoder::Encoder,
         instruction::{DecoderInstruction, EncoderInstruction},
     },
-    quic::{self, StopSendingExt},
+    quic::{self, StopStreamExt},
     util::{SetOnce, TryFutureStream, Watch},
     varint::VarInt,
 };
@@ -135,7 +135,7 @@ impl<C: ?Sized> ConnectionState<C> {
     }
 }
 
-impl<C: quic::Connect + Unpin + ?Sized> ConnectionState<C> {
+impl<C: quic::ManageStream + Unpin + ?Sized> ConnectionState<C> {
     async fn open_bi(&self) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
         { Pin::new(self.quic_connection().deref_mut()).open_bi() }.await
     }
@@ -272,8 +272,8 @@ impl<C: quic::Close + Unpin + ?Sized> ConnectionState<C> {
     }
 }
 
-pub type BoxStreamWriter<C> = SinkWriter<Pin<Box<<C as quic::Connect>::StreamWriter>>>;
-pub type BoxStreamReader<C> = StreamReader<Pin<Box<<C as quic::Connect>::StreamReader>>>;
+pub type BoxStreamWriter<C> = SinkWriter<Pin<Box<<C as quic::ManageStream>::StreamWriter>>>;
+pub type BoxStreamReader<C> = StreamReader<Pin<Box<<C as quic::ManageStream>::StreamReader>>>;
 
 pub type QPackEncoder = Encoder<
     BoxInstructionSink<'static, EncoderInstruction>,
@@ -287,7 +287,7 @@ pub type QPackDecoder = Decoder<
 
 type FrameSink = Feed<BoxSink<'static, Frame<BufList>, StreamError>, Frame<BufList>>;
 
-pub struct Connection<C: quic::Connect + Unpin> {
+pub struct Connection<C: quic::ManageStream + quic::Close + Unpin> {
     state: Arc<ConnectionState<C>>,
     qpack_encoder: Arc<QPackEncoder>,
     qpack_decoder: Arc<QPackDecoder>,
@@ -296,7 +296,7 @@ pub struct Connection<C: quic::Connect + Unpin> {
 }
 
 // #[bon::bon]
-impl<C: quic::Connect + Unpin> Connection<C> {
+impl<C: quic::ManageStream + quic::Close + Unpin> Connection<C> {
     // #[builder]
     pub async fn new(
         // #[builder(default)]
@@ -411,7 +411,7 @@ impl<C: quic::Connect + Unpin> Connection<C> {
                         // a reserved error code (Section 8.1) SHOULD be used.
                         //
                         // https://datatracker.ietf.org/doc/html/rfc9114#section-6.2.3-2
-                        _ = uni_stream.stop_sending(Code::H3_NO_ERROR.value()).await;
+                        _ = uni_stream.stop(Code::H3_NO_ERROR.value()).await;
                     } else {
                         // If the stream header indicates a stream type that is not supported by
                         // the recipient, the remainder of the stream cannot be consumed as the
@@ -422,7 +422,7 @@ impl<C: quic::Connect + Unpin> Connection<C> {
                         // 8.1). The recipient MUST NOT consider unknown stream types to be a
                         // connection error of any kind.
                         _ = uni_stream
-                            .stop_sending(Code::H3_STREAM_CREATION_ERROR.value())
+                            .stop(Code::H3_STREAM_CREATION_ERROR.value())
                             .await;
                     }
                 }
@@ -584,7 +584,7 @@ impl<C: quic::Connect + Unpin> Connection<C> {
     }
 }
 
-impl<C: quic::Connect + Unpin> Drop for Connection<C> {
+impl<C: quic::ManageStream + quic::Close + Unpin> Drop for Connection<C> {
     fn drop(&mut self) {
         self.close(&Code::H3_NO_ERROR);
     }

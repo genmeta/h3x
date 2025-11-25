@@ -10,7 +10,7 @@ use tokio::io::{self, AsyncBufRead, AsyncRead, ReadBuf};
 
 use crate::{
     codec::error::{DecodeError, DecodeStreamError},
-    quic::{GetStreamId, StopSending, StreamError},
+    quic::{GetStreamId, StopStream, StreamError},
     varint::VarInt,
 };
 
@@ -127,13 +127,13 @@ impl<S: GetStreamId + ?Sized> GetStreamId for StreamReader<S> {
     }
 }
 
-impl<S: StopSending + ?Sized> StopSending for StreamReader<S> {
-    fn poll_stop_sending(
+impl<S: StopStream + ?Sized> StopStream for StreamReader<S> {
+    fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), StreamError>> {
-        self.project().stream.poll_stop_sending(cx, code)
+        self.project().stream.poll_stop(cx, code)
     }
 }
 
@@ -285,12 +285,12 @@ impl<S: GetStreamId + ?Sized> GetStreamId for FixedLengthReader<S> {
     }
 }
 
-impl<S: StopSending + ?Sized> StopSending for FixedLengthReader<S> {
-    fn poll_stop_sending(
+impl<S: StopStream + ?Sized> StopStream for FixedLengthReader<S> {
+    fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), StreamError>> {
-        self.project().stream.poll_stop_sending(cx, code)
+        self.project().stream.poll_stop(cx, code)
     }
 }

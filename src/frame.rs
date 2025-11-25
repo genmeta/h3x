@@ -15,7 +15,7 @@ use crate::{
     codec::{Decode, DecodeExt, DecodeStreamError, Encode, FixedLengthReader, StreamReader},
     connection::StreamError,
     error::Code,
-    quic::{self, GetStreamId, StopSending},
+    quic::{self, GetStreamId, StopStream},
     varint::{self, VARINT_MAX, VarInt},
 };
 
@@ -275,13 +275,13 @@ impl<P: GetStreamId + ?Sized> GetStreamId for Frame<P> {
     }
 }
 
-impl<P: StopSending + ?Sized> StopSending for Frame<P> {
-    fn poll_stop_sending(
+impl<P: StopStream + ?Sized> StopStream for Frame<P> {
+    fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        self.project().payload.poll_stop_sending(cx, code)
+        self.project().payload.poll_stop(cx, code)
     }
 }
 
