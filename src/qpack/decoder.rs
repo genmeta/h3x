@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    pin::Pin,
+    pin::{Pin, pin},
     sync::{Arc, Mutex as SyncMutex},
     task::{Context, Poll, ready},
 };
@@ -12,7 +12,8 @@ use tokio::{io::AsyncBufRead, sync::Mutex as AsyncMutex};
 
 use crate::{
     codec::{Decode, DecodeExt, Feed},
-    error::{Code, Error, H3CriticalStreamClosed, HasErrorCode, StreamError},
+    connection::{StreamError, settings::Settings},
+    error::{Code, H3CriticalStreamClosed, HasErrorCode},
     qpack::{
         dynamic::DynamicTable,
         field_section::{FieldLine, FieldSection},
@@ -20,8 +21,7 @@ use crate::{
         instruction::{DecoderInstruction, EncoderInstruction},
         r#static,
     },
-    quic::{GetStreamId, GetStreamIdExt, ReadStream, StopSending},
-    settings::Settings,
+    quic::{self, GetStreamId, GetStreamIdExt, ReadStream, StopSending},
     varint::VarInt,
 };
 
@@ -312,8 +312,8 @@ impl HasErrorCode for InvalidDynamicTableReference {
 
 impl<Ds, Es> Decoder<Ds, Es>
 where
-    Ds: Sink<DecoderInstruction, Error = Error> + Unpin,
-    Es: Stream<Item = Result<EncoderInstruction, Error>> + Unpin,
+    Ds: Sink<DecoderInstruction, Error = StreamError> + Unpin,
+    Es: Stream<Item = Result<EncoderInstruction, StreamError>> + Unpin,
 {
     pub fn new(settings: Settings, decoder_stream: Ds, encoder_stream: Es) -> Self {
         Self {
@@ -325,15 +325,16 @@ where
 
     pub async fn decode(
         &self,
-        stream: impl AsyncBufRead + GetStreamId,
-    ) -> Result<FieldSection, Error> {
-        tokio::pin!(stream);
-        let stream_id = stream.stream_id().await?.into_inner();
-        let prefix: EncodedFieldSectionPrefix = stream.as_mut().decode_one().await?;
+        header_frame: impl AsyncBufRead + GetStreamId,
+    ) -> Result<FieldSection, StreamError> {
+        let mut header_frame = pin!(header_frame);
+        let stream_id = header_frame.stream_id().await?.into_inner();
+        let prefix: EncodedFieldSectionPrefix = header_frame.as_mut().decode_one().await?;
         self.receive_instruction_until(prefix.required_insert_count)
             .await?;
 
-        let representations = stream.into_decode_stream::<FieldLineRepresentation, Error>();
+        let representations =
+            header_frame.into_decode_stream::<FieldLineRepresentation, StreamError>();
         let field_lines = representations.map(|representation| {
             representation.and_then(|representation| {
                 decompression_field_line_representation(
@@ -341,7 +342,7 @@ where
                     prefix.base,
                     &self.state.lock().unwrap().dynamic_table,
                 )
-                .map_err(Error::from)
+                .map_err(StreamError::from)
             })
         });
         let header_section = field_lines.decode().await?;
@@ -356,7 +357,7 @@ where
         std::iter::from_fn(move || self.state.lock().unwrap().pending_instructions.pop_front())
     }
 
-    pub async fn flush_instructions(&self) -> Result<(), Error> {
+    pub async fn flush_instructions(&self) -> Result<(), StreamError> {
         let mut decoder_stream = self.decoder_stream.lock().await;
         let mut decoder_stream = Pin::new(&mut *decoder_stream);
         let instructions = stream::iter(self.pending_instructions());
@@ -365,7 +366,10 @@ where
         Ok(())
     }
 
-    pub async fn receive_instruction_until(&self, known_received_count: u64) -> Result<(), Error> {
+    pub async fn receive_instruction_until(
+        &self,
+        known_received_count: u64,
+    ) -> Result<(), StreamError> {
         loop {
             if self.known_received_count() >= known_received_count {
                 return Ok(());
@@ -424,7 +428,7 @@ impl<S: ReadStream, Ds, Es> StopSending for MessageStreamReader<S, Ds, Es> {
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
-    ) -> Poll<Result<(), StreamError>> {
+    ) -> Poll<Result<(), quic::StreamError>> {
         let mut project = self.project();
         let stream_id = ready!(project.stream.as_mut().poll_stream_id(cx))?.into_inner();
         ready!(project.stream.poll_stop_sending(cx, code))?;
@@ -436,7 +440,10 @@ impl<S: ReadStream, Ds, Es> StopSending for MessageStreamReader<S, Ds, Es> {
 }
 
 impl<S: ReadStream, Ds, Es> GetStreamId for MessageStreamReader<S, Ds, Es> {
-    fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>> {
+    fn poll_stream_id(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Result<VarInt, quic::StreamError>> {
         self.project().stream.poll_stream_id(cx)
     }
 }
@@ -448,7 +455,7 @@ impl<S: ReadStream, Ds, Es> Stream for MessageStreamReader<S, Ds, Es> {
         let mut project = self.project();
         let stream_id = ready!(project.stream.as_mut().poll_stream_id(cx))?.into_inner();
         match project.stream.poll_next(cx) {
-            poll @ Poll::Ready(Some(Err(StreamError::Reset { .. }))) => {
+            poll @ Poll::Ready(Some(Err(quic::StreamError::Reset { .. }))) => {
                 project
                     .decoder
                     .emit(DecoderInstruction::StreamCancellation { stream_id });

@@ -2,10 +2,7 @@ use std::io;
 
 use snafu::Snafu;
 
-use crate::{
-    error::{Code, ConnectionError, Error, StreamError},
-    varint::VarInt,
-};
+use crate::{connection, error::Code, quic, varint::VarInt};
 
 #[derive(Debug, Snafu, Clone, Copy, PartialEq, Eq)]
 #[snafu(visibility(pub), context(suffix(DecodeSanfu)))]
@@ -48,7 +45,7 @@ impl From<httlib_huffman::DecoderError> for DecodeError {
 #[snafu(visibility(pub))]
 pub enum DecodeStreamError {
     #[snafu(transparent)]
-    Stream { source: StreamError },
+    Stream { source: quic::StreamError },
     #[snafu(transparent)]
     Decode { source: DecodeError },
 }
@@ -57,31 +54,37 @@ impl DecodeStreamError {
     pub fn map_stream_reset(self, map: impl FnOnce(VarInt) -> Self) -> Self {
         match self {
             DecodeStreamError::Stream {
-                source: StreamError::Reset { code },
+                source: quic::StreamError::Reset { code },
             } => map(code),
             error => error,
         }
     }
 
-    pub fn map_decode_error(self, map: impl FnOnce(DecodeError) -> Error) -> Error {
+    pub fn map_decode_error(
+        self,
+        map: impl FnOnce(DecodeError) -> connection::StreamError,
+    ) -> connection::StreamError {
         match self {
             DecodeStreamError::Decode { source } => map(source),
-            DecodeStreamError::Stream { source } => Error::Stream { source },
+            DecodeStreamError::Stream { source } => connection::StreamError::Quic { source },
         }
     }
 
-    pub fn map_stream_closed(self, stream_closed: impl FnOnce() -> Error) -> Error {
+    pub fn map_stream_closed(
+        self,
+        stream_closed: impl FnOnce() -> connection::StreamError,
+    ) -> connection::StreamError {
         match self {
             DecodeStreamError::Decode {
                 source: DecodeError::Incomplete,
             } => stream_closed(),
             DecodeStreamError::Stream {
-                source: StreamError::Reset { .. },
+                source: quic::StreamError::Reset { .. },
             } => stream_closed(),
             DecodeStreamError::Decode { source } => {
                 Code::H3_GENERAL_PROTOCOL_ERROR.with(source).into()
             }
-            DecodeStreamError::Stream { source } => Error::Stream { source },
+            DecodeStreamError::Stream { source } => connection::StreamError::Quic { source },
         }
     }
 }
@@ -95,8 +98,8 @@ impl From<DecodeStreamError> for io::Error {
     }
 }
 
-impl From<ConnectionError> for DecodeStreamError {
-    fn from(value: ConnectionError) -> Self {
+impl From<quic::ConnectionError> for DecodeStreamError {
+    fn from(value: quic::ConnectionError) -> Self {
         DecodeStreamError::Stream {
             source: value.into(),
         }
@@ -105,7 +108,7 @@ impl From<ConnectionError> for DecodeStreamError {
 
 impl From<io::Error> for DecodeStreamError {
     fn from(source: io::Error) -> Self {
-        let source = match source.downcast::<ConnectionError>() {
+        let source = match source.downcast::<quic::ConnectionError>() {
             Ok(error) => {
                 return DecodeStreamError::Stream {
                     source: error.into(),
@@ -113,7 +116,7 @@ impl From<io::Error> for DecodeStreamError {
             }
             Err(source) => source,
         };
-        let source = match source.downcast::<StreamError>() {
+        let source = match source.downcast::<quic::StreamError>() {
             Ok(error) => return DecodeStreamError::Stream { source: error },
             Err(source) => source,
         };

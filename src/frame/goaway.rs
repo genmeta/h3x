@@ -5,8 +5,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 use crate::{
     buflist::BufList,
-    codec::{Decode, DecodeExt, Encode, EncodeExt, error::DecodeStreamError},
-    error::{Code, Error, H3CriticalStreamClosed},
+    codec::{Decode, DecodeExt, DecodeStreamError, Encode, EncodeExt},
+    connection::StreamError,
+    error::{Code, H3CriticalStreamClosed},
     frame::Frame,
     varint::VarInt,
 };
@@ -35,7 +36,7 @@ impl<S> Decode<Goaway> for &mut Frame<S>
 where
     for<'f> &'f mut Frame<S>: AsyncBufRead,
 {
-    type Error = Error;
+    type Error = StreamError;
 
     async fn decode(mut self) -> Result<Goaway, Self::Error> {
         assert!(self.r#type() == Frame::GOAWAY_FRAME_TYPE);

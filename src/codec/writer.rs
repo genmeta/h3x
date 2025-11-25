@@ -10,8 +10,7 @@ use futures::{Sink, Stream, StreamExt};
 use tokio::io::{self, AsyncWrite};
 
 use crate::{
-    error::StreamError,
-    quic::{CancelStream, GetStreamId},
+    quic::{CancelStream, GetStreamId, StreamError},
     varint::VarInt,
 };
 

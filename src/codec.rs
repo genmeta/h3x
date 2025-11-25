@@ -1,8 +1,9 @@
-pub mod error;
+mod error;
 
 mod reader;
 mod writer;
 
+pub use error::{DecodeError, DecodeStreamError};
 use futures::{Sink, stream::Stream};
 pub use reader::{FixedLengthReader, StreamReader};
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt};

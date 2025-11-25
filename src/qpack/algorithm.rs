@@ -37,17 +37,17 @@ pub trait Algorithm {
     ) -> impl Future<Output = (EncodedFieldSectionPrefix, Vec<FieldLineRepresentation>)> + Send;
 }
 
-pub struct StaticEncoder<HS> {
+pub struct StaticCompressAlgo<HS> {
     huffman_strategize: HS,
 }
 
-impl<HS> StaticEncoder<HS> {
+impl<HS> StaticCompressAlgo<HS> {
     pub const fn new(huffman_strategize: HS) -> Self {
         Self { huffman_strategize }
     }
 }
 
-impl<HS> Algorithm for StaticEncoder<HS>
+impl<HS> Algorithm for StaticCompressAlgo<HS>
 where
     HS: HuffmanStrategize + Send + Sync,
 {

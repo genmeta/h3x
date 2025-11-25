@@ -11,9 +11,11 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 
 use crate::{
     buflist::BufList,
-    codec::{Decode, DecodeExt, Encode, EncodeExt, error::DecodeStreamError},
-    error::{Error, H3CriticalStreamClosed, StreamError},
+    codec::{Decode, DecodeExt, DecodeStreamError, Encode, EncodeExt},
+    connection::StreamError,
+    error::H3CriticalStreamClosed,
     frame::Frame,
+    quic,
     varint::VarInt,
 };
 
@@ -96,7 +98,7 @@ impl Setting {
 }
 
 impl<S: AsyncRead> Decode<Setting> for S {
-    type Error = Error;
+    type Error = StreamError;
 
     async fn decode(self) -> Result<Setting, Self::Error> {
         let decode = async move {
@@ -114,7 +116,7 @@ impl<S: AsyncRead> Decode<Setting> for S {
 impl<S: AsyncWrite> Encode<Setting> for S {
     type Output = ();
 
-    type Error = Error;
+    type Error = StreamError;
 
     async fn encode(self, Setting { id, value }: Setting) -> Result<Self::Output, Self::Error> {
         let encode = async move {
@@ -123,10 +125,12 @@ impl<S: AsyncWrite> Encode<Setting> for S {
             stream.as_mut().encode_one(value).await?;
             Ok(())
         };
-        encode.await.map_err(|error: StreamError| match error {
-            StreamError::Reset { .. } => H3CriticalStreamClosed::Control.into(),
-            StreamError::Connection { .. } => error.into(),
-        })
+        encode
+            .await
+            .map_err(|error: quic::StreamError| match error {
+                quic::StreamError::Reset { .. } => H3CriticalStreamClosed::Control.into(),
+                quic::StreamError::Connection { .. } => error.into(),
+            })
     }
 }
 
@@ -139,11 +143,11 @@ impl<S> Decode<Settings> for &mut Frame<S>
 where
     for<'f> &'f mut Frame<S>: AsyncBufRead,
 {
-    type Error = Error;
+    type Error = StreamError;
 
     async fn decode(self) -> Result<Settings, Self::Error> {
         assert!(self.r#type() == Frame::SETTINGS_FRAME_TYPE);
-        let mut stream = pin!(self.into_decode_stream::<Setting, Error>());
+        let mut stream = pin!(self.into_decode_stream::<Setting, StreamError>());
         let mut settings = Settings::default();
         while let Some(setting) = stream.try_next().await? {
             settings.set(setting);

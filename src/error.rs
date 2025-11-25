@@ -1,166 +1,23 @@
-use std::{
-    borrow::Cow, convert::Infallible, error::Error as StdError, fmt::Display, io, sync::Arc,
-};
+use std::{error::Error as StdError, fmt::Display};
 
 use snafu::Snafu;
 
 use crate::varint::VarInt;
 
-#[derive(Debug, Snafu, Clone)]
-pub enum Error {
-    #[snafu(transparent)]
-    Stream { source: StreamError },
-    #[snafu(transparent)]
-    Code {
-        source: Arc<dyn HasErrorCode + Send + Sync>,
-    },
-}
-
-impl From<ConnectionError> for Error {
-    fn from(value: ConnectionError) -> Self {
-        Self::Stream {
-            source: value.into(),
-        }
-    }
-}
-
-impl Error {
-    pub fn map_stream_reset(self, map: impl FnOnce(VarInt) -> Self) -> Self {
-        match self {
-            Error::Stream {
-                source: StreamError::Reset { code },
-            } => map(code),
-            error => error,
-        }
-    }
-}
-
-impl<E: HasErrorCode + StdError + Send + Sync + 'static> From<E> for Error {
-    fn from(value: E) -> Self {
-        Error::Code {
-            source: Arc::new(value),
-        }
-    }
-}
-
-impl From<Error> for io::Error {
-    fn from(value: Error) -> Self {
-        io::Error::other(value)
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(source: io::Error) -> Self {
-        let source = match source.downcast::<ConnectionError>() {
-            Ok(error) => {
-                return Error::Stream {
-                    source: error.into(),
-                };
-            }
-            Err(source) => source,
-        };
-        let source = match source.downcast::<StreamError>() {
-            Ok(error) => return Error::Stream { source: error },
-            Err(source) => source,
-        };
-        let source = match source.downcast::<Arc<dyn HasErrorCode + Send + Sync + 'static>>() {
-            Ok(error) => return Error::Code { source: error },
-            Err(source) => source,
-        };
-        match source.downcast::<Error>() {
-            Ok(error) => error,
-            Err(source) => panic!("io::Error({source:?}) is neither from StreamReader nor Decoder"),
-        }
-    }
-}
-
-#[derive(Debug, Snafu, Clone)]
-#[snafu(visibility(pub))]
-pub enum StreamError {
-    #[snafu(transparent)]
-    Connection {
-        source: ConnectionError,
-    },
-    Reset {
-        code: VarInt,
-    },
-}
-
-impl StreamError {
-    /// Returns `true` if the stream error is [`Reset`].
-    ///
-    /// [`Reset`]: StreamError::Reset
-    #[must_use]
-    pub fn is_reset(&self) -> bool {
-        matches!(self, Self::Reset { .. })
-    }
-}
-
-impl From<StreamError> for io::Error {
-    fn from(value: StreamError) -> Self {
-        match value {
-            error @ StreamError::Reset { .. } => io::Error::new(io::ErrorKind::BrokenPipe, error),
-            StreamError::Connection { source } => io::Error::from(source),
-        }
-    }
-}
-
-impl From<Infallible> for StreamError {
-    fn from(value: Infallible) -> Self {
-        match value {}
-    }
-}
-
-impl From<io::Error> for StreamError {
-    fn from(value: io::Error) -> Self {
-        value
-            .downcast::<Self>()
-            .expect("io::Error is not StreamError")
-    }
-}
-
-#[derive(Debug, Snafu, Clone)]
-#[snafu(visibility(pub))]
-pub struct TransportError {
-    pub kind: VarInt,
-    pub frame_type: VarInt,
-    pub reason: Cow<'static, str>,
-}
-
-#[derive(Debug, Snafu, Clone)]
-#[snafu(visibility(pub))]
-pub struct ApplicationError {
-    pub code: Code,
-    pub reason: Cow<'static, str>,
-}
-
-#[derive(Debug, Snafu, Clone)]
-#[snafu(visibility(pub))]
-pub enum ConnectionError {
-    #[snafu(transparent)]
-    Transport { source: TransportError },
-    #[snafu(transparent)]
-    Application { source: ApplicationError },
-}
-
-impl From<ConnectionError> for io::Error {
-    fn from(value: ConnectionError) -> Self {
-        io::Error::new(io::ErrorKind::BrokenPipe, value)
-    }
-}
-
-impl ConnectionError {
-    pub const fn is_transport(&self) -> bool {
-        matches!(self, ConnectionError::Transport { .. })
-    }
-
-    pub const fn is_application(&self) -> bool {
-        matches!(self, ConnectionError::Application { .. })
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Code(VarInt);
+
+impl From<VarInt> for Code {
+    fn from(value: VarInt) -> Self {
+        Self(value)
+    }
+}
+
+impl From<Code> for VarInt {
+    fn from(value: Code) -> Self {
+        value.0
+    }
+}
 
 impl Code {
     pub const fn into_inner(self) -> VarInt {

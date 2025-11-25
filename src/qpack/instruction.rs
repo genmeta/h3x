@@ -5,12 +5,14 @@ use futures::Sink;
 use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite};
 
 use crate::{
-    codec::{Decode, Encode, error::DecodeStreamError},
-    error::{Error, H3CriticalStreamClosed, StreamError},
+    codec::{Decode, DecodeStreamError, Encode},
+    connection::StreamError,
+    error::H3CriticalStreamClosed,
     qpack::{
         integer::{decode_integer, encode_integer},
         string::{decode_string, encode_string},
     },
+    quic,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,7 +68,7 @@ pub enum EncoderInstruction {
 }
 
 impl<S: AsyncBufRead> Decode<EncoderInstruction> for S {
-    type Error = Error;
+    type Error = StreamError;
 
     async fn decode(self) -> Result<EncoderInstruction, Self::Error> {
         let decode = async move {
@@ -123,11 +125,11 @@ impl<S: AsyncBufRead> Decode<EncoderInstruction> for S {
 
 impl<S> Encode<EncoderInstruction> for S
 where
-    S: AsyncWrite + Sink<Bytes, Error = StreamError>,
+    S: AsyncWrite + Sink<Bytes, Error = quic::StreamError>,
 {
     type Output = ();
 
-    type Error = Error;
+    type Error = StreamError;
 
     async fn encode(self, inst: EncoderInstruction) -> Result<Self::Output, Self::Error> {
         let encode = async move {
@@ -170,10 +172,12 @@ where
                 }
             }
         };
-        encode.await.map_err(|error: StreamError| match error {
-            StreamError::Connection { .. } => error.into(),
-            StreamError::Reset { .. } => H3CriticalStreamClosed::QPackEncoder.into(),
-        })
+        encode
+            .await
+            .map_err(|error: quic::StreamError| match error {
+                quic::StreamError::Connection { .. } => error.into(),
+                quic::StreamError::Reset { .. } => H3CriticalStreamClosed::QPackEncoder.into(),
+            })
     }
 }
 
@@ -203,9 +207,9 @@ pub enum DecoderInstruction {
 }
 
 impl<S: AsyncBufRead> Decode<DecoderInstruction> for S {
-    type Error = Error;
+    type Error = StreamError;
 
-    async fn decode(self) -> Result<DecoderInstruction, Error> {
+    async fn decode(self) -> Result<DecoderInstruction, StreamError> {
         let decode = async move {
             let mut stream = pin!(self);
             let prefix = stream.read_u8().await?;
@@ -239,7 +243,7 @@ where
 {
     type Output = ();
 
-    type Error = Error;
+    type Error = StreamError;
 
     async fn encode(self, inst: DecoderInstruction) -> Result<Self::Output, Self::Error> {
         let encode = async move {
@@ -262,9 +266,11 @@ where
                 }
             }
         };
-        encode.await.map_err(|error: StreamError| match error {
-            StreamError::Connection { .. } => error.into(),
-            StreamError::Reset { .. } => H3CriticalStreamClosed::QPackEncoder.into(),
-        })
+        encode
+            .await
+            .map_err(|error: quic::StreamError| match error {
+                quic::StreamError::Connection { .. } => error.into(),
+                quic::StreamError::Reset { .. } => H3CriticalStreamClosed::QPackEncoder.into(),
+            })
     }
 }

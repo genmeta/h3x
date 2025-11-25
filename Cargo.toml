@@ -11,7 +11,6 @@ futures = "0.3"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
-# httlib-huffman = { path = "../httlib-rs/huffman" }
 httlib-huffman = "0.3"
 pin-project-lite = "0.2"
 snafu = "0.8"

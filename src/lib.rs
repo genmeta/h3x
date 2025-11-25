@@ -1,13 +1,12 @@
 mod buflist;
+pub mod client;
 mod codec;
 pub mod connection;
+pub mod entity;
 pub mod error;
 mod frame;
-mod goaway;
-pub mod message;
 pub mod qpack;
 pub mod quic;
-pub mod settings;
-mod stream;
+pub mod server;
 mod util;
 pub mod varint;

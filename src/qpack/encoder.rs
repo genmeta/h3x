@@ -12,7 +12,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::{
     buflist::BufList,
     codec::{Encode, Feed},
-    error::{Code, Error, H3CriticalStreamClosed, HasErrorCode},
+    connection::{StreamError, settings::Settings},
+    error::{Code, H3CriticalStreamClosed, HasErrorCode},
     frame::Frame,
     qpack::{
         algorithm::Algorithm,
@@ -23,7 +24,6 @@ use crate::{
         r#static,
     },
     quic::{GetStreamId, GetStreamIdExt},
-    settings::Settings,
 };
 
 #[derive(Debug)]
@@ -318,8 +318,8 @@ pub(crate) fn get_dynamic_references<'r>(
 
 impl<Es, Ds> Encoder<Es, Ds>
 where
-    Es: Sink<EncoderInstruction, Error = Error> + Unpin,
-    Ds: Stream<Item = Result<DecoderInstruction, Error>> + Unpin,
+    Es: Sink<EncoderInstruction, Error = StreamError> + Unpin,
+    Ds: Stream<Item = Result<DecoderInstruction, StreamError>> + Unpin,
 {
     pub fn new(settings: Settings, encoder_stream: Es, decoder_stream: Ds) -> Self {
         Self {
@@ -338,7 +338,7 @@ where
         field_section: impl IntoIterator<Item = FieldLine> + Send,
         algorithm: &(impl Algorithm + ?Sized),
         stream: impl GetStreamId,
-    ) -> Result<Frame<BufList>, Error> {
+    ) -> Result<Frame<BufList>, StreamError> {
         tokio::pin!(stream);
         let stream_id = stream.stream_id().await?.into_inner();
 
@@ -377,7 +377,7 @@ where
         })
     }
 
-    pub async fn flush_instructions(&self) -> Result<(), Error> {
+    pub async fn flush_instructions(&self) -> Result<(), StreamError> {
         let mut encoder_stream = self.encoder_stream.lock().await;
         let mut encoder_stream = Pin::new(encoder_stream.deref_mut());
         let instructions = self.pending_instructions();
@@ -386,7 +386,7 @@ where
         Ok(())
     }
 
-    pub async fn receive_instruction(&self) -> Result<(), Error> {
+    pub async fn receive_instruction(&self) -> Result<(), StreamError> {
         let instruction = {
             let mut decoder_stream = self.decoder_stream.lock().await;
             let instruction = decoder_stream.next().await;

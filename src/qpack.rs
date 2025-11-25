@@ -1,9 +1,3 @@
-use std::pin::Pin;
-
-use futures::{Sink, stream::BoxStream};
-
-use crate::error::Error;
-
 pub mod algorithm;
 pub mod decoder;
 pub mod dynamic;
@@ -15,9 +9,15 @@ pub mod integer;
 pub mod r#static;
 pub mod string;
 
-pub type BoxInstructionStream<'a, Instruction> = BoxStream<'a, Result<Instruction, Error>>;
+use std::pin::Pin;
+
+use futures::{Sink, stream::BoxStream};
+
+use crate::connection::StreamError;
+
+pub type BoxInstructionStream<'a, Instruction> = BoxStream<'a, Result<Instruction, StreamError>>;
 pub type BoxSink<'a, Item, Err> = Pin<Box<dyn Sink<Item, Error = Err> + Send + 'a>>;
-pub type BoxInstructionSink<'a, Instruction> = BoxSink<'a, Instruction, Error>;
+pub type BoxInstructionSink<'a, Instruction> = BoxSink<'a, Instruction, StreamError>;
 
 #[cfg(test)]
 mod tests {
@@ -30,17 +30,16 @@ mod tests {
 
     use crate::{
         codec::{DecodeExt, EncodeExt, SinkWriter, StreamReader},
-        error::ConnectionError,
-        frame::Frame,
+        connection::{settings::Settings, stream::UnidirectionalStream},
+        frame::{Frame, stream::FrameStream},
         qpack::{
-            algorithm::{HuffmanAlways, StaticEncoder},
+            algorithm::{HuffmanAlways, StaticCompressAlgo},
             decoder::{Decoder, MessageStreamReader},
             encoder::Encoder,
             field_section::FieldSection,
         },
-        quic::test::mock_stream_pair,
-        settings::Settings,
-        stream::{TryFutureStream, UnidirectionalStream},
+        quic::{ConnectionError, test::mock_stream_pair},
+        util::TryFutureStream,
         varint::VarInt,
     };
 
@@ -49,7 +48,7 @@ mod tests {
         _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
-        let encode_strategy = StaticEncoder::new(HuffmanAlways);
+        let encode_strategy = StaticCompressAlgo::new(HuffmanAlways);
 
         // stream id is unused in this test
         let (encoder_stream_reader, encoder_stream_writer) = mock_stream_pair(VarInt::from_u32(1));
@@ -140,7 +139,7 @@ mod tests {
             let mut request_stream = SinkWriter::new(request_stream);
 
             let header_frame = encoder
-                .encode(field_section, &encode_strategy, &mut request_stream)
+                .encode(field_section.iter(), &encode_strategy, &mut request_stream)
                 .await
                 .unwrap();
             request_stream.encode_one(header_frame).await.unwrap();
@@ -158,15 +157,15 @@ mod tests {
 
         let response = tokio::spawn(async move {
             let response_stream = MessageStreamReader::new(response_stream, decoder.clone());
-            let response_stream = StreamReader::new(response_stream);
 
-            let mut frame = response_stream.into_decoded::<Frame<_>>().await.unwrap();
+            let mut frame_stream = FrameStream::new(StreamReader::new(response_stream));
+            let frame = frame_stream.next_frame().await.unwrap().unwrap();
             assert_eq!(frame.r#type(), Frame::HEADERS_FRAME_TYPE);
-            let field_section = decoder.decode(&mut frame).await.unwrap();
+            let field_section = decoder.decode(frame).await.unwrap();
             assert_eq!(field_section, expected_field_section);
             tracing::info!(?field_section, "Decoded field section",);
 
-            frame = frame.into_next_frame().await.unwrap().unwrap();
+            let mut frame = frame_stream.next_frame().await.unwrap().unwrap();
             assert_eq!(frame.r#type(), Frame::DATA_FRAME_TYPE);
             tracing::info!("Got data frame, reading");
 

@@ -10,8 +10,7 @@ use tokio::io::{self, AsyncBufRead, AsyncRead, ReadBuf};
 
 use crate::{
     codec::error::{DecodeError, DecodeStreamError},
-    error::StreamError,
-    quic::{GetStreamId, StopSending},
+    quic::{GetStreamId, StopSending, StreamError},
     varint::VarInt,
 };
 
@@ -21,12 +20,6 @@ pin_project_lite::pin_project! {
         chunk: Bytes,
         #[pin]
         stream: S,
-    }
-}
-
-impl<S: ?Sized> AsMut<StreamReader<S>> for StreamReader<S> {
-    fn as_mut(&mut self) -> &mut StreamReader<S> {
-        self
     }
 }
 
@@ -152,16 +145,10 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl<S: ?Sized> AsMut<FixedLengthReader<S>> for FixedLengthReader<S> {
-    fn as_mut(&mut self) -> &mut FixedLengthReader<S> {
-        self
-    }
-}
-
-impl<P: ?Sized> FixedLengthReader<P> {
-    pub const fn new(stream: P, length: u64) -> Self
+impl<S: ?Sized> FixedLengthReader<S> {
+    pub const fn new(stream: S, length: u64) -> Self
     where
-        P: Sized,
+        S: Sized,
     {
         Self {
             stream,
@@ -169,15 +156,23 @@ impl<P: ?Sized> FixedLengthReader<P> {
         }
     }
 
+    pub const fn renew(&mut self, remaining: u64) {
+        self.remaining = remaining
+    }
+
     pub fn remaining(&self) -> u64 {
         self.remaining
     }
 
-    pub fn into_inner(self) -> P
+    pub fn into_inner(self) -> S
     where
-        P: Sized,
+        S: Sized,
     {
         self.stream
+    }
+
+    pub fn stream_mut(&mut self) -> &mut S {
+        &mut self.stream
     }
 }
 
@@ -236,7 +231,8 @@ impl<R: AsyncBufRead + ?Sized> AsyncBufRead for FixedLengthReader<R> {
 
 impl<S> Stream for FixedLengthReader<StreamReader<S>>
 where
-    S: TryStream<Ok = Bytes, Error = StreamError> + ?Sized,
+    S: TryStream<Ok = Bytes> + ?Sized,
+    DecodeStreamError: From<S::Error>,
 {
     type Item = Result<Bytes, DecodeStreamError>;
 
@@ -252,6 +248,31 @@ where
                 let bytes = bytes.slice(..len);
                 *project.remaining -= len as u64;
                 project.stream.consume(len);
+                Poll::Ready(Some(Ok(bytes)))
+            }
+        }
+    }
+}
+
+impl<S> Stream for FixedLengthReader<&mut StreamReader<S>>
+where
+    S: TryStream<Ok = Bytes> + Unpin + ?Sized,
+    DecodeStreamError: From<S::Error>,
+{
+    type Item = Result<Bytes, DecodeStreamError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.remaining == 0 {
+            return Poll::Ready(None);
+        }
+        match ready!(Pin::new(&mut *this.stream).poll_bytes(cx)?) {
+            bytes if bytes.is_empty() => Poll::Ready(Some(Err(DecodeError::Incomplete.into()))),
+            bytes => {
+                let len = bytes.len().min(this.remaining as usize);
+                let bytes = bytes.slice(..len);
+                this.remaining -= len as u64;
+                Pin::new(&mut *this.stream).consume(len);
                 Poll::Ready(Some(Ok(bytes)))
             }
         }

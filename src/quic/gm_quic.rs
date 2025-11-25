@@ -147,8 +147,14 @@ impl CancelStream for StreamWriter {
     }
 }
 
+impl super::Close for Arc<gm_quic::prelude::Connection> {
+    fn close(self: Pin<&mut Self>, code: Code, reason: Cow<'static, str>) {
+        _ = gm_quic::prelude::Connection::close(&self, reason, code.into_inner().into_inner());
+    }
+}
+
 // TOOD: remove Arc
-impl super::QuicConnect for Arc<gm_quic::prelude::Connection> {
+impl super::Connect for Arc<gm_quic::prelude::Connection> {
     type StreamWriter = StreamWriter;
 
     type StreamReader = StreamReader;
@@ -224,34 +230,32 @@ impl super::QuicConnect for Arc<gm_quic::prelude::Connection> {
         }
         .boxed()
     }
-
-    fn close(self: Pin<&mut Self>, code: Code, reason: Cow<'static, str>) {
-        _ = gm_quic::prelude::Connection::close(&self, reason, code.into_inner().into_inner());
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
 
-    use axum::{body::Body, routing::get};
+    use bytes::BytesMut;
     use gm_quic::prelude::{
         BindUri, QuicClient, QuicIO, QuicListeners,
         handy::{ToCertificate, ToPrivateKey},
     };
-    use http::Request;
-    use http_body_util::BodyExt;
-    use tower::{Service, ServiceExt};
+    use http::{StatusCode, Uri};
     use tracing::Instrument;
 
     use super::*;
-    use crate::{connection::Connection, settings::Settings};
+    use crate::connection::{Connection, settings::Settings};
 
     const CA_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/ca.cert");
     const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");
     const SERVER_KEY: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
 
-    const HELLO_GENMETA: &str = "Hello, genemta network!";
+    fn init_tracing() {
+        _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+    }
 
     fn quic_client() -> QuicClient {
         let mut roots = rustls::RootCertStore::empty();
@@ -298,44 +302,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simple_axum_server() {
-        _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .try_init();
+    async fn message2() {
+        init_tracing();
 
         let (listeners, server_listen) = quic_listeners();
 
         tokio::spawn(
             async move {
-                async fn hello_world() -> &'static str {
-                    HELLO_GENMETA
+                let (connection, ..) = listeners.accept().await?;
+
+                let connection = Connection::new(Settings::default(), connection).await?;
+
+                let unresolved_request = connection.accept_request().await?;
+
+                let (request, mut response) = unresolved_request.await?;
+
+                let Some(user_agent) = request.header("User-Agent") else {
+                    response
+                        .set_status(StatusCode::NOT_FOUND)
+                        .set_header("A", "B")?
+                        .end()
+                        .await?;
+                    return Ok(());
+                };
+
+                if user_agent != "h3x-test-client" {
+                    response.set_status(StatusCode::NOT_FOUND).end().await?;
+                    return Ok(());
                 }
 
-                let mut router = axum::Router::new().route("/hello_world", get(hello_world));
+                response.set_status(StatusCode::OK).end().await?;
 
-                let (connection, ..) = listeners.accept().await.unwrap();
-                let connection = Connection::new(Settings::default(), connection)
-                    .await
-                    .unwrap();
-
-                let (mut response_sender, request_reader) = connection.accept().await.unwrap();
-                let request = request_reader.read_request().await.unwrap();
-                tracing::info!("Received request: {} {}", request.method(), request.uri());
-
-                let response = router
-                    .as_service()
-                    .ready()
-                    .await
-                    .unwrap()
-                    .call(request)
-                    .await
-                    .unwrap();
-
-                response_sender.send_response(response).await.unwrap();
-                tracing::info!("Sent response");
-                response_sender.shutdown().await.unwrap();
-
-                std::future::pending::<()>().await
+                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
             }
             .instrument(tracing::info_span!("server")),
         );
@@ -347,26 +345,24 @@ mod tests {
             let connection = Connection::new(Settings::default(), connection)
                 .await
                 .unwrap();
+            let uri = Uri::try_from("/hello_world").unwrap();
 
-            let request = Request::builder()
-                .uri("/hello_world")
-                .body(Body::empty())
-                .unwrap();
-            let (mut request_writer, response_reader) = connection.open().await.unwrap();
+            let (_, mut response) = (connection.get(uri).await?)
+                .set_header("User-Agent", "h3x-test-client")?
+                .set_body(Bytes::copy_from_slice(b"Hello from client"))
+                .await?;
 
-            request_writer.send_request(request).await.unwrap();
-            tracing::info!("Sent request");
-            request_writer.shutdown().await.unwrap();
+            if response.status() != StatusCode::OK {
+                panic!("Unexpected response status: {}", response.status());
+            }
 
-            let mut response_reader = response_reader.await.unwrap();
-            let response = response_reader.read_response().await.unwrap().unwrap();
-            tracing::info!("Sent request");
-            let response = response.into_body().collect().await.unwrap().to_bytes();
+            let body: BytesMut = response.read_all().await?;
+            println!("Response: {}", std::str::from_utf8(&body).unwrap());
 
-            println!("Response: {}", std::str::from_utf8(&response).unwrap());
-            assert_eq!(&response[..], HELLO_GENMETA.as_bytes());
+            Ok::<(), Box<dyn std::error::Error>>(())
         }
         .instrument(tracing::info_span!("client"))
-        .await;
+        .await
+        .unwrap();
     }
 }

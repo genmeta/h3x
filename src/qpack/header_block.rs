@@ -6,16 +6,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 use crate::{
     buflist::BufList,
-    codec::{
-        Decode, Encode, EncodeExt,
-        error::{DecodeError, DecodeStreamError},
-    },
-    error::{Code, Error, StreamError},
+    codec::{Decode, DecodeError, DecodeStreamError, Encode, EncodeExt},
+    connection::StreamError,
+    error::Code,
     frame::Frame,
     qpack::{
         integer::{decode_integer, encode_integer},
         string::{decode_string, encode_string},
     },
+    quic,
 };
 
 ///
@@ -58,7 +57,7 @@ pub struct EncodedFieldSectionPrefix {
 }
 
 impl<S: AsyncRead> Decode<EncodedFieldSectionPrefix> for S {
-    type Error = Error;
+    type Error = StreamError;
 
     async fn decode(self) -> Result<EncodedFieldSectionPrefix, Self::Error> {
         let decode = async move {
@@ -100,7 +99,7 @@ impl<S: AsyncRead> Decode<EncodedFieldSectionPrefix> for S {
 impl<S: AsyncWrite> Encode<EncodedFieldSectionPrefix> for S {
     type Output = ();
 
-    type Error = StreamError;
+    type Error = quic::StreamError;
 
     async fn encode(self, item: EncodedFieldSectionPrefix) -> Result<Self::Output, Self::Error> {
         let mut stream = pin!(self);
@@ -207,7 +206,7 @@ pub enum FieldLineRepresentation {
 }
 
 impl<S: AsyncRead> Decode<FieldLineRepresentation> for S {
-    type Error = Error;
+    type Error = StreamError;
 
     async fn decode(self) -> Result<FieldLineRepresentation, Self::Error> {
         let decode = async move {
@@ -288,11 +287,11 @@ impl<S: AsyncRead> Decode<FieldLineRepresentation> for S {
 impl<S, E> Encode<FieldLineRepresentation> for S
 where
     S: AsyncWrite + Sink<Bytes, Error = E>,
-    StreamError: From<E>,
+    quic::StreamError: From<E>,
 {
     type Output = ();
 
-    type Error = Error;
+    type Error = StreamError;
 
     async fn encode(self, repr: FieldLineRepresentation) -> Result<Self::Output, Self::Error> {
         let mut stream = pin!(self);

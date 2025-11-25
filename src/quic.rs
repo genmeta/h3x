@@ -1,7 +1,7 @@
-mod gm_quic;
-
 use std::{
     borrow::Cow,
+    convert::Infallible,
+    io,
     ops::DerefMut,
     pin::Pin,
     task::{Context, Poll},
@@ -12,13 +12,98 @@ use futures::{
     Sink, Stream,
     future::{BoxFuture, poll_fn},
 };
+use snafu::Snafu;
 
-use crate::{
-    error::{Code, ConnectionError, StreamError},
-    varint::VarInt,
-};
+use crate::{error::Code, varint::VarInt};
 
-pub trait QuicConnect {
+// mod gm_quic;
+
+#[derive(Debug, Snafu, Clone)]
+#[snafu(visibility(pub))]
+pub enum StreamError {
+    #[snafu(transparent)]
+    Connection {
+        source: ConnectionError,
+    },
+    Reset {
+        code: VarInt,
+    },
+}
+
+impl StreamError {
+    /// Returns `true` if the stream error is [`Reset`].
+    ///
+    /// [`Reset`]: StreamError::Reset
+    #[must_use]
+    pub fn is_reset(&self) -> bool {
+        matches!(self, Self::Reset { .. })
+    }
+}
+
+impl From<StreamError> for io::Error {
+    fn from(value: StreamError) -> Self {
+        match value {
+            error @ StreamError::Reset { .. } => io::Error::new(io::ErrorKind::BrokenPipe, error),
+            StreamError::Connection { source } => io::Error::from(source),
+        }
+    }
+}
+
+impl From<Infallible> for StreamError {
+    fn from(value: Infallible) -> Self {
+        match value {}
+    }
+}
+
+impl From<io::Error> for StreamError {
+    fn from(value: io::Error) -> Self {
+        value
+            .downcast::<Self>()
+            .expect("io::Error is not StreamError")
+    }
+}
+
+#[derive(Debug, Snafu, Clone)]
+#[snafu(visibility(pub))]
+pub struct TransportError {
+    pub kind: VarInt,
+    pub frame_type: VarInt,
+    pub reason: Cow<'static, str>,
+}
+
+#[derive(Debug, Snafu, Clone)]
+#[snafu(visibility(pub))]
+pub struct ApplicationError {
+    pub code: Code,
+    pub reason: Cow<'static, str>,
+}
+
+#[derive(Debug, Snafu, Clone)]
+#[snafu(visibility(pub))]
+pub enum ConnectionError {
+    #[snafu(transparent)]
+    Transport { source: TransportError },
+    #[snafu(transparent)]
+    Application { source: ApplicationError },
+}
+
+impl From<ConnectionError> for io::Error {
+    fn from(value: ConnectionError) -> Self {
+        io::Error::new(io::ErrorKind::BrokenPipe, value)
+    }
+}
+
+impl ConnectionError {
+    pub const fn is_transport(&self) -> bool {
+        matches!(self, ConnectionError::Transport { .. })
+    }
+
+    pub const fn is_application(&self) -> bool {
+        matches!(self, ConnectionError::Application { .. })
+    }
+}
+
+pub trait Connect: Close {
     type StreamWriter: WriteStream;
     type StreamReader: ReadStream;
 
@@ -37,7 +122,9 @@ pub trait QuicConnect {
     fn accept_uni(
         self: Pin<&mut Self>,
     ) -> BoxFuture<'static, Result<Self::StreamReader, ConnectionError>>;
+}
 
+pub trait Close {
     fn close(self: Pin<&mut Self>, code: Code, reason: Cow<'static, str>);
 }
 
@@ -205,8 +292,7 @@ pub mod test {
     use tokio::sync::oneshot;
 
     use crate::{
-        error::StreamError,
-        quic::{CancelStream, GetStreamId, StopSending},
+        quic::{CancelStream, GetStreamId, StopSending, StreamError},
         varint::VarInt,
     };
 

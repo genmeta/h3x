@@ -1,10 +1,16 @@
 use std::{
+    error::Error as StdError,
+    io,
     ops::DerefMut,
-    pin::Pin,
+    pin::{Pin, pin},
     sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard},
 };
 
-use futures::{FutureExt, SinkExt, channel::oneshot, future};
+pub mod settings;
+pub mod stream;
+
+use futures::{FutureExt, SinkExt, Stream, StreamExt, channel::oneshot, future};
+use snafu::Snafu;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
@@ -12,68 +18,150 @@ use tracing::Instrument;
 use crate::{
     buflist::BufList,
     codec::{DecodeExt, Encode, EncodeExt, Feed, SinkWriter, StreamReader},
-    error::{
-        Code, ConnectionError, Error, H3CriticalStreamClosed, H3FrameUnexpected, HasErrorCode,
-        StreamError,
+    connection::{
+        settings::Settings,
+        stream::{H3StreamCreationError, UnidirectionalStream},
     },
-    frame::Frame,
-    goaway::Goaway,
-    message::{MessageReader, MessageWriter},
+    error::{Code, H3CriticalStreamClosed, H3FrameUnexpected, HasErrorCode},
+    frame::{Frame, goaway::Goaway},
     qpack::{
         BoxInstructionSink, BoxInstructionStream, BoxSink,
         decoder::Decoder,
         encoder::Encoder,
         instruction::{DecoderInstruction, EncoderInstruction},
     },
-    quic::{QuicConnect, StopSendingExt},
-    settings::Settings,
-    stream::{H3StreamCreationError, TryFutureStream, UnidirectionalStream},
-    util::{SetOnce, Watch},
+    quic::{self, StopSendingExt},
+    util::{SetOnce, TryFutureStream, Watch},
     varint::VarInt,
 };
 
-pub struct State<C> {
-    quic_connection: SyncMutex<C>,
-
-    error: SetOnce<ConnectionError>,
-    local_settings: Settings,
-    peer_settings: SetOnce<Settings>,
-    peer_goaway: Watch<Goaway>,
-    max_received_stream_id: Watch<VarInt>,
+#[derive(Debug, Snafu, Clone)]
+pub enum StreamError {
+    #[snafu(transparent)]
+    Quic { source: quic::StreamError },
+    #[snafu(transparent)]
+    Code {
+        source: Arc<dyn HasErrorCode + Send + Sync>,
+    },
 }
 
-impl<C: QuicConnect + Unpin> State<C> {
-    fn new(quic: C, local_settings: Settings) -> Self {
+impl From<quic::ConnectionError> for StreamError {
+    fn from(value: quic::ConnectionError) -> Self {
+        Self::Quic {
+            source: value.into(),
+        }
+    }
+}
+
+impl StreamError {
+    pub fn map_stream_reset(self, map: impl FnOnce(VarInt) -> Self) -> Self {
+        match self {
+            StreamError::Quic {
+                source: quic::StreamError::Reset { code },
+            } => map(code),
+            error => error,
+        }
+    }
+}
+
+impl<E: HasErrorCode + StdError + Send + Sync + 'static> From<E> for StreamError {
+    fn from(value: E) -> Self {
+        StreamError::Code {
+            source: Arc::new(value),
+        }
+    }
+}
+
+impl From<StreamError> for io::Error {
+    fn from(value: StreamError) -> Self {
+        io::Error::other(value)
+    }
+}
+
+impl From<io::Error> for StreamError {
+    fn from(source: io::Error) -> Self {
+        let source = match source.downcast::<quic::ConnectionError>() {
+            Ok(error) => {
+                return StreamError::Quic {
+                    source: error.into(),
+                };
+            }
+            Err(source) => source,
+        };
+        let source = match source.downcast::<quic::StreamError>() {
+            Ok(error) => return StreamError::Quic { source: error },
+            Err(source) => source,
+        };
+        let source = match source.downcast::<Arc<dyn HasErrorCode + Send + Sync + 'static>>() {
+            Ok(error) => return StreamError::Code { source: error },
+            Err(source) => source,
+        };
+        match source.downcast::<StreamError>() {
+            Ok(error) => error,
+            Err(source) => panic!("io::Error({source:?}) is neither from StreamReader nor Decoder"),
+        }
+    }
+}
+
+pub struct ConnectionState<C: ?Sized> {
+    error: SetOnce<quic::ConnectionError>,
+    local_settings: Settings,
+    peer_settings: SetOnce<Settings>,
+    local_goaway: Watch<Goaway>,
+    peer_goaway: Watch<Goaway>,
+    max_received_request_stream_id: Watch<VarInt>,
+
+    quic_connection: SyncMutex<C>,
+}
+
+impl<C: ?Sized> ConnectionState<C> {
+    fn new(quic: C, local_settings: Settings) -> Self
+    where
+        C: Sized,
+    {
         Self {
             quic_connection: SyncMutex::new(quic),
             error: SetOnce::new(),
             local_settings,
             peer_settings: SetOnce::new(),
+            local_goaway: Watch::new(),
             peer_goaway: Watch::new(),
-            max_received_stream_id: Watch::new(),
+            max_received_request_stream_id: Watch::new(),
         }
     }
 
     fn quic_connection<'c>(&'c self) -> SyncMutexGuard<'c, C> {
         self.quic_connection.lock().unwrap()
     }
+}
 
-    async fn open_bi(&self) -> Result<(C::StreamReader, C::StreamWriter), ConnectionError> {
+impl<C: quic::Connect + Unpin + ?Sized> ConnectionState<C> {
+    async fn open_bi(&self) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
         { Pin::new(self.quic_connection().deref_mut()).open_bi() }.await
     }
 
-    async fn open_uni(&self) -> Result<C::StreamWriter, ConnectionError> {
+    async fn open_uni(&self) -> Result<C::StreamWriter, quic::ConnectionError> {
         { Pin::new(self.quic_connection().deref_mut()).open_uni() }.await
     }
 
-    async fn accept_bi(&self) -> Result<(C::StreamReader, C::StreamWriter), ConnectionError> {
+    async fn accept_bi(&self) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
         { Pin::new(self.quic_connection().deref_mut()).accept_bi() }.await
     }
 
-    async fn accept_uni(&self) -> Result<C::StreamReader, ConnectionError> {
+    async fn accept_uni(&self) -> Result<C::StreamReader, quic::ConnectionError> {
         { Pin::new(self.quic_connection().deref_mut()).accept_uni() }.await
     }
+}
 
+#[derive(Debug, Snafu, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionGoaway {
+    #[snafu(display("Local goaway"))]
+    Local,
+    #[snafu(display("Peer goaway"))]
+    Peer,
+}
+
+impl<C: quic::Close + Unpin + ?Sized> ConnectionState<C> {
     pub fn close(&self, error: &(impl HasErrorCode + ?Sized)) {
         if self.error.peek().is_some() {
             return;
@@ -81,16 +169,16 @@ impl<C: QuicConnect + Unpin> State<C> {
         Pin::new(self.quic_connection().deref_mut()).close(error.code(), error.to_string().into())
     }
 
-    pub async fn handle_error(&self, error: Error) -> StreamError {
+    pub async fn handle_error(&self, error: StreamError) -> quic::StreamError {
         match error {
-            Error::Stream { source } => match source {
-                StreamError::Connection { source } => {
+            StreamError::Quic { source } => match source {
+                quic::StreamError::Connection { source } => {
                     _ = self.error.set_with(|| source);
                     self.error().await.into()
                 }
-                StreamError::Reset { .. } => source,
+                quic::StreamError::Reset { .. } => source,
             },
-            Error::Code { source } => {
+            StreamError::Code { source } => {
                 self.close(source.as_ref());
                 self.error().await.into()
             }
@@ -101,13 +189,15 @@ impl<C: QuicConnect + Unpin> State<C> {
         &self.local_settings
     }
 
-    pub fn error(&self) -> impl Future<Output = ConnectionError> + use<C> {
+    pub fn error(&self) -> impl Future<Output = quic::ConnectionError> + use<C> {
         self.error
             .get()
             .map(|option| option.expect("connection closed without error"))
     }
 
-    fn peer_settings(&self) -> impl Future<Output = Result<Settings, ConnectionError>> + use<C> {
+    pub fn peer_settings(
+        &self,
+    ) -> impl Future<Output = Result<Settings, quic::ConnectionError>> + use<C> {
         let error = self.error();
         self.peer_settings.get().then(|option| match option {
             Some(settings) => future::ready(Ok(settings)).left_future(),
@@ -115,11 +205,18 @@ impl<C: QuicConnect + Unpin> State<C> {
         })
     }
 
-    fn max_received_stream_id(
+    pub fn accpet_stream(
         &self,
-    ) -> impl Future<Output = Result<VarInt, ConnectionError>> + use<C> {
+        stream_id: VarInt,
+    ) -> Result<(), crate::entity::stream::StreamError> {
+        todo!()
+    }
+
+    pub fn max_received_stream_id(
+        &self,
+    ) -> impl Future<Output = Result<VarInt, quic::ConnectionError>> + use<C> {
         let error = self.error();
-        self.max_received_stream_id
+        self.max_received_request_stream_id
             .get()
             .then(|option| match option {
                 Some(stream_id) => future::ready(Ok(stream_id)).left_future(),
@@ -127,17 +224,56 @@ impl<C: QuicConnect + Unpin> State<C> {
             })
     }
 
-    fn peer_goaway(&self) -> impl Future<Output = Result<Goaway, ConnectionError>> + use<C> {
-        let error = self.error();
-        self.peer_goaway.get().then(|option| match option {
-            Some(goaway) => future::ready(Ok(goaway)).left_future(),
-            None => error.map(Err).right_future(),
+    pub fn peer_goawaies(
+        &self,
+    ) -> impl Stream<Item = Result<Goaway, quic::ConnectionError>> + use<C> {
+        futures::stream::unfold(self.peer_goaway.clone(), |peer_goaway| {
+            (peer_goaway.get()).map(|goaway| goaway.map(|goaway| (Ok(goaway), peer_goaway)))
         })
+        .chain(self.error().map(Err).into_stream())
+    }
+
+    pub fn local_goaway(&self) -> Result<Option<Goaway>, quic::ConnectionError> {
+        if let Some(error) = self.error.peek() {
+            return Err(error.clone());
+        }
+        Ok(self.local_goaway.peek())
+    }
+
+    pub fn accept_request(&self, stream_id: VarInt) -> Result<(), ConnectionGoaway> {
+        let local_goaway = self.local_goaway.lock();
+        let mut max_received_request_stream_id = self.max_received_request_stream_id.lock();
+
+        let goaway_stream_id = local_goaway
+            .as_ref()
+            .map(|goaway| goaway.stream_id())
+            .unwrap_or(VarInt::from_u32(0));
+        if goaway_stream_id >= stream_id {
+            Err(ConnectionGoaway::Local)
+        } else {
+            max_received_request_stream_id.replace(stream_id);
+            Ok(())
+        }
+    }
+
+    pub fn goaway(&self) -> Goaway {
+        let mut local_goaway = self.local_goaway.lock();
+        let max_received_request_stream_id = self.max_received_request_stream_id.lock();
+
+        let max_received_request_stream_id = max_received_request_stream_id
+            .as_ref()
+            .copied()
+            .unwrap_or(VarInt::from_u32(0));
+
+        let goaway = Goaway::new(max_received_request_stream_id);
+        local_goaway.replace(goaway);
+
+        goaway
     }
 }
 
-pub type BoxStreamWriter<C> = SinkWriter<Pin<Box<<C as QuicConnect>::StreamWriter>>>;
-pub type BoxStreamReader<C> = StreamReader<Pin<Box<<C as QuicConnect>::StreamReader>>>;
+pub type BoxStreamWriter<C> = SinkWriter<Pin<Box<<C as quic::Connect>::StreamWriter>>>;
+pub type BoxStreamReader<C> = StreamReader<Pin<Box<<C as quic::Connect>::StreamReader>>>;
 
 pub type QPackEncoder = Encoder<
     BoxInstructionSink<'static, EncoderInstruction>,
@@ -149,10 +285,10 @@ pub type QPackDecoder = Decoder<
     BoxInstructionStream<'static, EncoderInstruction>,
 >;
 
-type FrameSink = Feed<BoxSink<'static, Frame<BufList>, Error>, Frame<BufList>>;
+type FrameSink = Feed<BoxSink<'static, Frame<BufList>, StreamError>, Frame<BufList>>;
 
-pub struct Connection<C: QuicConnect + Unpin> {
-    state: Arc<State<C>>,
+pub struct Connection<C: quic::Connect + Unpin> {
+    state: Arc<ConnectionState<C>>,
     qpack_encoder: Arc<QPackEncoder>,
     qpack_decoder: Arc<QPackDecoder>,
     control_stream: AsyncMutex<FrameSink>,
@@ -160,19 +296,19 @@ pub struct Connection<C: QuicConnect + Unpin> {
 }
 
 // #[bon::bon]
-impl<C: QuicConnect + Unpin> Connection<C> {
+impl<C: quic::Connect + Unpin> Connection<C> {
     // #[builder]
     pub async fn new(
         // #[builder(default)]
         settings: Settings,
         quic: C,
-    ) -> Result<Self, ConnectionError>
+    ) -> Result<Self, quic::ConnectionError>
     where
         C: Send + 'static,
         C::StreamReader: Send + 'static,
         C::StreamWriter: Send + 'static,
     {
-        let state = Arc::new(State::new(quic, settings));
+        let state = Arc::new(ConnectionState::new(quic, settings));
 
         let (qpack_encoder_inst_receiver_tx, qpack_encoder_inst_receiver_rx) = oneshot::channel();
         let (qpack_decoder_inst_receiver_tx, qpack_decoder_inst_receiver_rx) = oneshot::channel();
@@ -188,7 +324,7 @@ impl<C: QuicConnect + Unpin> Connection<C> {
                 let encoder_stream =
                     UnidirectionalStream::new_qpack_encoder_stream(uni_stream).await?;
                 // turn into EncoderInstruction sink
-                Ok::<_, Error>(encoder_stream.into_encode_sink())
+                Ok::<_, StreamError>(encoder_stream.into_encode_sink())
             })));
 
             let connection_error = state.error();
@@ -216,7 +352,7 @@ impl<C: QuicConnect + Unpin> Connection<C> {
                 let decoder_stream =
                     UnidirectionalStream::new_qpack_decoder_stream(uni_stream).await?;
                 // turn into DecoderInstruction sink
-                Ok::<_, Error>(decoder_stream.into_encode_sink())
+                Ok::<_, StreamError>(decoder_stream.into_encode_sink())
             }));
 
             let connection_error = state.error();
@@ -293,7 +429,7 @@ impl<C: QuicConnect + Unpin> Connection<C> {
             }
 
             #[allow(unreachable_code)]
-            Ok::<_, Error>(())
+            Ok::<_, StreamError>(())
         };
         let accept_uni_task = AbortOnDropHandle::new(tokio::spawn(accept_uni.in_current_span()));
 
@@ -302,8 +438,9 @@ impl<C: QuicConnect + Unpin> Connection<C> {
         let handle_control = async move {
             let control_stream = tokio::select! {
                 Ok(control_stream) = control_stream_rx => control_stream.into_inner(),
-                _error = conn_state.error() => return Ok::<_, Error>(()),
+                _error = conn_state.error() => return Ok::<_, StreamError>(()),
             };
+            let mut control_frame_stream = pin!(control_stream.into_decode_stream::<Frame<_>, _>());
 
             // SETTINGS frames always apply to an entire HTTP/3 connection, never a
             // single stream. A SETTINGS frame MUST be sent as the first frame of
@@ -313,7 +450,10 @@ impl<C: QuicConnect + Unpin> Connection<C> {
             // error of type H3_FRAME_UNEXPECTED.
             //
             // https://datatracker.ietf.org/doc/html/rfc9114#frame-settings
-            let mut settings_frame = control_stream.into_decoded::<Frame<_>>().await?;
+            let mut settings_frame = control_frame_stream
+                .next()
+                .await
+                .ok_or(H3CriticalStreamClosed::Control)??;
             if settings_frame.r#type() != Frame::SETTINGS_FRAME_TYPE {
                 return Err(Code::H3_MISSING_SETTINGS.into());
             }
@@ -322,12 +462,12 @@ impl<C: QuicConnect + Unpin> Connection<C> {
             conn_state.peer_settings.set(settings.clone()).unwrap();
             encoder.apply_settings(settings.clone()).await;
 
-            let mut frame = settings_frame
-                .into_next_frame()
-                .await
-                .ok_or(H3CriticalStreamClosed::Control)??;
-
             loop {
+                let mut frame = control_frame_stream
+                    .next()
+                    .await
+                    .ok_or(H3CriticalStreamClosed::Control)??;
+
                 // https://datatracker.ietf.org/doc/html/rfc9114#frame-settings
                 if frame.r#type() == Frame::SETTINGS_FRAME_TYPE {
                     return Err(H3FrameUnexpected::DuplicateSettings.into());
@@ -348,10 +488,8 @@ impl<C: QuicConnect + Unpin> Connection<C> {
                 }
                 // https://datatracker.ietf.org/doc/html/rfc9114#name-reserved-frame-types
                 else if frame.is_reversed_frame() {
-                    frame = frame
-                        .into_next_frame()
-                        .await
-                        .ok_or(H3CriticalStreamClosed::Control)??;
+                    // skip the frame
+                    continue;
                 }
             }
         };
@@ -365,7 +503,7 @@ impl<C: QuicConnect + Unpin> Connection<C> {
             }
 
             #[allow(unreachable_code)]
-            Ok::<_, Error>(())
+            Ok::<_, StreamError>(())
         };
         let receive_decoder_instructions =
             AbortOnDropHandle::new(tokio::spawn(receive_decoder_instructions.in_current_span()));
@@ -389,7 +527,7 @@ impl<C: QuicConnect + Unpin> Connection<C> {
             Ok(control_stream) => {
                 let control_frame_sink = control_stream.into_encode_sink().sink_map_err(
                     |stream_error| match stream_error {
-                        StreamError::Reset { .. } => H3CriticalStreamClosed::Control.into(),
+                        quic::StreamError::Reset { .. } => H3CriticalStreamClosed::Control.into(),
                         stream_error => stream_error.into(),
                     },
                 );
@@ -418,58 +556,19 @@ impl<C: QuicConnect + Unpin> Connection<C> {
         })
     }
 
-    pub async fn open(
-        &self,
-    ) -> Result<
-        (
-            MessageWriter<C>,
-            impl Future<Output = Result<MessageReader<C>, StreamError>>,
-        ),
-        StreamError,
-    > {
-        let (reader, writer) = self.state.open_bi().await?;
-        let writer = MessageWriter::new(
-            self.state.clone(),
-            self.qpack_encoder.clone(),
-            SinkWriter::new(Box::pin(writer)),
-        );
-        let reader = MessageReader::new(
-            self.state.clone(),
-            self.qpack_decoder.clone(),
-            StreamReader::new(Box::pin(reader)),
-        );
-        Ok((writer, reader))
-    }
-
-    pub async fn accept(&self) -> Result<(MessageWriter<C>, MessageReader<C>), StreamError> {
-        let (reader, writer) = self.state.accept_bi().await?;
-        let writer = MessageWriter::new(
-            self.state.clone(),
-            self.qpack_encoder.clone(),
-            SinkWriter::new(Box::pin(writer)),
-        );
-        let reader = MessageReader::new(
-            self.state.clone(),
-            self.qpack_decoder.clone(),
-            StreamReader::new(Box::pin(reader)),
-        )
-        .await?;
-        Ok((writer, reader))
-    }
-
-    pub async fn peer_settings(&self) -> Result<Settings, ConnectionError> {
+    pub async fn peer_settings(&self) -> Result<Settings, quic::ConnectionError> {
         self.state.peer_settings().await
     }
 
-    pub async fn max_received_stream_id(&self) -> Result<VarInt, ConnectionError> {
+    pub async fn max_received_stream_id(&self) -> Result<VarInt, quic::ConnectionError> {
         self.state.max_received_stream_id().await
     }
 
-    pub async fn peer_goaway(&self) -> Result<Goaway, ConnectionError> {
-        self.state.peer_goaway().await
+    pub fn peer_goawaies(&self) -> impl Stream<Item = Result<Goaway, quic::ConnectionError>> {
+        self.state.peer_goawaies()
     }
 
-    pub async fn goaway(&self, goaway: Goaway) -> Result<(), StreamError> {
+    pub async fn goaway(&self, goaway: Goaway) -> Result<(), quic::StreamError> {
         let mut control_stream = self.control_stream.lock().await;
         match control_stream
             .send(BufList::new().encode(goaway).await.unwrap())
@@ -485,7 +584,7 @@ impl<C: QuicConnect + Unpin> Connection<C> {
     }
 }
 
-impl<C: QuicConnect + Unpin> Drop for Connection<C> {
+impl<C: quic::Connect + Unpin> Drop for Connection<C> {
     fn drop(&mut self) {
         self.close(&Code::H3_NO_ERROR);
     }

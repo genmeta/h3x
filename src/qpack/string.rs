@@ -4,12 +4,9 @@ use httlib_huffman::DecoderSpeed;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 use crate::{
-    codec::{
-        FixedLengthReader,
-        error::{DecodeError, DecodeStreamError},
-    },
-    error::StreamError,
+    codec::{DecodeError, DecodeStreamError, FixedLengthReader},
     qpack::integer::{decode_integer, encode_integer},
+    quic::StreamError,
 };
 
 pub async fn decode_string(
