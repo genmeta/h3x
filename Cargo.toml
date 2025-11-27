@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 bytes = "1"
 bon = "3"
+dashmap = "6"
 either = "1"
 futures = "0.3"
 http = "1"
@@ -17,6 +18,7 @@ snafu = "0.8"
 tokio = "1"
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tracing = "0.1"
+matchit = "0.9"
 
 gm-quic = { path = "../gm-quic/gm-quic" }
 

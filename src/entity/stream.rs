@@ -1,6 +1,6 @@
 use std::{
     io, mem,
-    pin::Pin,
+    pin::{Pin, pin},
     sync::Arc,
     task::{Context, Poll},
 };
@@ -159,7 +159,7 @@ impl ReadStream {
         });
 
         // TODO: Is there any better way to move ownership of the stream.
-        Ok(async move { peer_goaway.boxed().fuse().select_next_some().await })
+        Ok(async move { pin!(peer_goaway).fuse().select_next_some().await })
     }
 
     pub async fn try_io<T>(
@@ -481,7 +481,7 @@ impl WriteStream {
         });
 
         // TODO: Is there any better way to move ownership of the stream.
-        Ok(async move { peer_goaway.boxed().fuse().select_next_some().await })
+        Ok(async move { pin!(peer_goaway).fuse().select_next_some().await })
     }
 
     pub async fn try_io<T>(
@@ -543,7 +543,7 @@ impl WriteStream {
             return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse.into());
         }
 
-        entity.enbale_streaming()?;
+        entity.enable_streaming()?;
 
         match entity.stage {
             EntityStage::Header => {

@@ -3,13 +3,14 @@ use std::mem;
 use bytes::{Buf, Bytes};
 use futures::future::BoxFuture;
 use http::{
-    HeaderMap, HeaderValue,
+    HeaderMap, HeaderValue, Method, Uri,
     header::{AsHeaderName, IntoHeaderName},
+    uri::{Authority, PathAndQuery, Scheme},
 };
 
 use crate::{
     entity::{
-        Entity,
+        Entity, EntityStage, IllegalEntityOperator,
         stream::{ReadStream, StreamError, WriteStream},
     },
     varint::VarInt,
@@ -21,8 +22,17 @@ pub struct UnresolvedRequest {
 }
 
 impl UnresolvedRequest {
-    pub fn streaming(self) -> Self {
-        self
+    pub(super) fn new(read_stream: ReadStream, write_stream: WriteStream) -> Self {
+        Self {
+            request: Request {
+                entity: Entity::unresolved_request(),
+                stream: read_stream,
+            },
+            response: Response {
+                entity: Entity::unresolved_response(),
+                stream: write_stream,
+            },
+        }
     }
 
     pub async fn resolve(mut self) -> Result<(Request, Response), StreamError> {
@@ -50,8 +60,48 @@ pub struct Request {
 }
 
 impl Request {
+    pub fn method(&self) -> Method {
+        self.entity.header().method()
+    }
+
+    pub fn set_method(&mut self, new: Method) {
+        self.entity.header_mut().set_method(new);
+    }
+
+    pub fn scheme(&self) -> Option<Scheme> {
+        self.entity.header().scheme()
+    }
+
+    pub fn set_scheme(&mut self, new: Scheme) {
+        self.entity.header_mut().set_scheme(new);
+    }
+
+    pub fn authority(&self) -> Option<Authority> {
+        self.entity.header().authority()
+    }
+
+    pub fn set_authority(&mut self, new: Authority) {
+        self.entity.header_mut().set_authority(new);
+    }
+
+    pub fn path(&self) -> Option<PathAndQuery> {
+        self.entity.header().path()
+    }
+
+    pub fn set_path(&mut self, new: PathAndQuery) {
+        self.entity.header_mut().set_path(new);
+    }
+
+    pub fn uri(&self) -> Uri {
+        self.entity.header().uri()
+    }
+
     pub fn headers(&self) -> &http::HeaderMap {
         &self.entity.header().header_map
+    }
+
+    pub fn headers_mut(&mut self) -> Result<&mut http::HeaderMap, StreamError> {
+        Ok(&mut self.entity.header_mut().header_map)
     }
 
     pub fn header(&self, name: impl AsHeaderName) -> Option<&HeaderValue> {
@@ -82,7 +132,10 @@ impl Response {
     }
 
     pub fn headers_mut(&mut self) -> Result<&mut http::HeaderMap, StreamError> {
-        Ok(&mut self.entity.header_mut()?.header_map)
+        if self.entity.stage() > EntityStage::Header {
+            return Err(IllegalEntityOperator::ModifyHeaderAfterSent.into());
+        }
+        Ok(&mut self.entity.header_mut().header_map)
     }
 
     pub fn set_header(
@@ -95,7 +148,10 @@ impl Response {
     }
 
     pub fn set_status(&mut self, status: http::StatusCode) -> Result<&mut Self, StreamError> {
-        self.entity.header_mut()?.set_status(status);
+        if self.entity.stage() > EntityStage::Header {
+            return Err(IllegalEntityOperator::ModifyHeaderAfterSent.into());
+        }
+        self.entity.header_mut().set_status(status);
         Ok(self)
     }
 
@@ -105,6 +161,12 @@ impl Response {
     }
 
     pub fn set_body(&mut self, content: impl Buf) -> Result<&mut Self, StreamError> {
+        if self.entity.stage() > EntityStage::Body {
+            return Err(IllegalEntityOperator::ModifyBodyAfterSent.into());
+        }
+        if self.entity.stage() == EntityStage::Body {
+            return Err(IllegalEntityOperator::ReplaceBodyWhileSending.into());
+        }
         self.entity.set_body(content)?;
         Ok(self)
     }
@@ -116,17 +178,28 @@ impl Response {
         Ok(self)
     }
 
+    pub fn trailers(&self) -> &HeaderMap {
+        self.entity.trailers()
+    }
+
+    pub fn trailers_mut(&mut self) -> Result<&mut HeaderMap, StreamError> {
+        if self.entity.stage() > EntityStage::Trailer {
+            return Err(IllegalEntityOperator::ModifyTrailerAfterSent.into());
+        }
+        Ok(self.entity.trailers_mut()?)
+    }
+
     pub fn set_trailer(
         &mut self,
         name: impl IntoHeaderName,
         value: HeaderValue,
     ) -> Result<&mut Self, StreamError> {
-        self.entity.trailers_mut()?.insert(name, value);
+        self.trailers_mut()?.insert(name, value);
         Ok(self)
     }
 
     pub fn set_trailers(&mut self, map: HeaderMap) -> Result<&mut Self, StreamError> {
-        *self.entity.trailers_mut()? = map;
+        *self.trailers_mut()? = map;
         Ok(self)
     }
 
@@ -142,8 +215,9 @@ impl Response {
 impl Drop for Response {
     fn drop(&mut self) {
         if !self.entity.is_complete() {
+            // Its ok to take: Response will not be used after drop
             let stream = self.stream.take();
-            let entity = mem::replace(&mut self.entity, Entity::unresolved_request());
+            let entity = mem::replace(&mut self.entity, Entity::unresolved_response());
             let mut response = Response { entity, stream };
             tokio::spawn(async move { response.close().await });
         }

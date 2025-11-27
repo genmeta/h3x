@@ -1,6 +1,9 @@
+pub mod identity;
+
 use std::{
     borrow::Cow,
     convert::Infallible,
+    error::Error,
     io,
     ops::DerefMut,
     pin::Pin,
@@ -12,8 +15,6 @@ use futures::{Sink, Stream, future::BoxFuture};
 use snafu::Snafu;
 
 use crate::{error::Code, varint::VarInt};
-
-// mod gm_quic;
 
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
@@ -100,6 +101,20 @@ impl ConnectionError {
     }
 }
 
+pub trait Connect {
+    type Connection: ManageStream + identity::WithIdentity + Close + Unpin;
+    type Error: Error + 'static;
+
+    fn connect(&self, host: &str) -> BoxFuture<'static, Result<Self::Connection, Self::Error>>;
+}
+
+pub trait Listen {
+    type Connection: ManageStream + identity::WithIdentity + Close + Unpin;
+    type Error: Error + 'static;
+
+    fn accept(&self) -> BoxFuture<'static, Result<(Self::Connection, String), Self::Error>>;
+}
+
 pub trait ManageStream {
     type StreamWriter: WriteStream;
     type StreamReader: ReadStream;
@@ -121,8 +136,80 @@ pub trait ManageStream {
     ) -> BoxFuture<'static, Result<Self::StreamReader, ConnectionError>>;
 }
 
+impl<P: DerefMut<Target: ManageStream>> ManageStream for Pin<P> {
+    type StreamWriter = <P::Target as ManageStream>::StreamWriter;
+
+    type StreamReader = <P::Target as ManageStream>::StreamReader;
+
+    fn open_bi(
+        self: Pin<&mut Self>,
+    ) -> BoxFuture<'static, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> {
+        <P::Target as ManageStream>::open_bi(self.as_deref_mut())
+    }
+
+    fn open_uni(
+        self: Pin<&mut Self>,
+    ) -> BoxFuture<'static, Result<Self::StreamWriter, ConnectionError>> {
+        <P::Target as ManageStream>::open_uni(self.as_deref_mut())
+    }
+
+    fn accept_bi(
+        self: Pin<&mut Self>,
+    ) -> BoxFuture<'static, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> {
+        <P::Target as ManageStream>::accept_bi(self.as_deref_mut())
+    }
+
+    fn accept_uni(
+        self: Pin<&mut Self>,
+    ) -> BoxFuture<'static, Result<Self::StreamReader, ConnectionError>> {
+        <P::Target as ManageStream>::accept_uni(self.as_deref_mut())
+    }
+}
+
+impl<M: ManageStream + Unpin + ?Sized> ManageStream for &mut M {
+    type StreamWriter = M::StreamWriter;
+
+    type StreamReader = M::StreamReader;
+
+    fn open_bi(
+        self: Pin<&mut Self>,
+    ) -> BoxFuture<'static, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> {
+        M::open_bi(Pin::new(self.get_mut()))
+    }
+
+    fn open_uni(
+        self: Pin<&mut Self>,
+    ) -> BoxFuture<'static, Result<Self::StreamWriter, ConnectionError>> {
+        M::open_uni(Pin::new(self.get_mut()))
+    }
+
+    fn accept_bi(
+        self: Pin<&mut Self>,
+    ) -> BoxFuture<'static, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> {
+        M::accept_bi(Pin::new(self.get_mut()))
+    }
+
+    fn accept_uni(
+        self: Pin<&mut Self>,
+    ) -> BoxFuture<'static, Result<Self::StreamReader, ConnectionError>> {
+        M::accept_uni(Pin::new(self.get_mut()))
+    }
+}
+
 pub trait Close {
     fn close(self: Pin<&mut Self>, code: Code, reason: Cow<'static, str>);
+}
+
+impl<P: DerefMut<Target: Close>> Close for Pin<P> {
+    fn close(self: Pin<&mut Self>, code: Code, reason: Cow<'static, str>) {
+        <P::Target as Close>::close(self.as_deref_mut(), code, reason)
+    }
+}
+
+impl<P: Close + Unpin + ?Sized> Close for &mut P {
+    fn close(self: Pin<&mut Self>, code: Code, reason: Cow<'static, str>) {
+        P::close(Pin::new(self.get_mut()), code, reason)
+    }
 }
 
 pub trait GetStreamId {

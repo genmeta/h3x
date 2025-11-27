@@ -12,13 +12,14 @@ use crate::{
     qpack::field_section::{FieldSection, PseudoHeaders},
 };
 
+#[derive(Debug, Clone)]
 enum Body {
     Streaming,
     Chunked(Cursor<BufList>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum EntityStage {
+pub enum EntityStage {
     Header = 0,
     Body = 1,
     Trailer = 2,
@@ -53,6 +54,7 @@ pub enum IllegalEntityOperator {
     MissingFinalResponse,
 }
 
+#[derive(Debug, Clone)]
 pub struct Entity {
     header: FieldSection,
     body: Body,
@@ -105,6 +107,16 @@ impl Entity {
         )
     }
 
+    pub fn enable_streaming(&mut self) -> Result<(), IllegalEntityOperator> {
+        if let Body::Chunked(_) = &self.body {
+            if self.stage != EntityStage::Header {
+                return Err(IllegalEntityOperator::SwitchBodyModeAfterSent);
+            }
+            self.body = Body::Streaming;
+        }
+        Ok(())
+    }
+
     pub fn chunked_body(&mut self) -> Result<&mut Cursor<BufList>, IllegalEntityOperator> {
         if let Body::Streaming = &self.body {
             if self.stage != EntityStage::Header {
@@ -118,16 +130,6 @@ impl Entity {
         }
     }
 
-    pub fn enbale_streaming(&mut self) -> Result<(), IllegalEntityOperator> {
-        if let Body::Chunked(_) = &self.body {
-            if self.stage != EntityStage::Header {
-                return Err(IllegalEntityOperator::SwitchBodyModeAfterSent);
-            }
-            self.body = Body::Streaming;
-        }
-        Ok(())
-    }
-
     pub fn is_interim_response(&self) -> bool {
         self.is_response() && self.header().status().is_informational()
     }
@@ -136,11 +138,8 @@ impl Entity {
         todo!("checks for pseudo headers")
     }
 
-    pub fn header_mut(&mut self) -> Result<&mut FieldSection, IllegalEntityOperator> {
-        if self.stage != EntityStage::Header {
-            return Err(IllegalEntityOperator::ModifyHeaderAfterSent);
-        }
-        Ok(&mut self.header)
+    pub fn header_mut(&mut self) -> &mut FieldSection {
+        &mut self.header
     }
 
     pub fn header(&self) -> &FieldSection {
@@ -160,12 +159,6 @@ impl Entity {
         if self.is_interim_response() {
             return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse);
         }
-        if self.stage >= EntityStage::Trailer {
-            return Err(IllegalEntityOperator::ModifyBodyAfterSent);
-        }
-        if self.stage == EntityStage::Body {
-            return Err(IllegalEntityOperator::ReplaceBodyWhileSending);
-        }
 
         let mut buflist = BufList::new();
         while content.has_remaining() {
@@ -176,7 +169,7 @@ impl Entity {
         Ok(())
     }
 
-    pub fn trailers(&mut self) -> &HeaderMap {
+    pub fn trailers(&self) -> &HeaderMap {
         &self.trailer.header_map
     }
 
@@ -184,13 +177,14 @@ impl Entity {
         if self.is_interim_response() {
             return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse);
         }
-        if self.stage > EntityStage::Trailer {
-            return Err(IllegalEntityOperator::ModifyTrailerAfterSent);
-        }
         Ok(&mut self.trailer.header_map)
     }
 
+    pub fn stage(&self) -> EntityStage {
+        self.stage
+    }
+
     pub fn is_complete(&self) -> bool {
-        self.stage == EntityStage::Complete
+        self.stage() == EntityStage::Complete
     }
 }

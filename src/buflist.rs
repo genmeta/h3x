@@ -12,7 +12,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{Sink, Stream};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct BufList {
     bufs: VecDeque<Bytes>,
 }
@@ -187,6 +187,7 @@ impl Stream for BufList {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Cursor<B = BufList> {
     offset: (usize, usize), // (buf index, offset in buf)
     buflist: B,

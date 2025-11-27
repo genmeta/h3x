@@ -1,74 +1,93 @@
-use std::{mem, pin::Pin, sync::Arc};
+use std::{error::Error, mem};
 
 use bytes::{Buf, Bytes};
-use futures::{Stream, future::BoxFuture, stream};
+use futures::{Stream, stream};
 use http::{
     HeaderMap, HeaderValue, Method, Uri,
     header::{IntoHeaderName, InvalidHeaderValue},
     uri::{Authority, PathAndQuery, Scheme},
 };
+use snafu::Snafu;
 use tokio::io::AsyncBufRead;
 
 use crate::{
     codec::StreamReader,
-    connection::{ConnectionState, QPackDecoder, QPackEncoder},
+    endpoint::{client::Client, pool::ConnectError},
     entity::{
-        Entity,
+        Entity, EntityStage, IllegalEntityOperator,
         stream::{ReadStream, StreamError, WriteStream},
     },
-    qpack::field_section::FieldSection,
     quic,
     varint::VarInt,
 };
 
-type PendingStream = BoxFuture<
-    'static,
-    Result<
-        (
-            Pin<Box<dyn quic::ReadStream + Send>>,
-            Pin<Box<dyn quic::WriteStream + Send>>,
-        ),
-        quic::ConnectionError,
-    >,
->;
-
-pub struct PendingRequest {
-    stream: PendingStream,
+#[derive(Clone)]
+pub struct PendingRequest<'c, C: quic::Connect> {
+    client: &'c Client<C>,
     request: Entity,
-    // response: Entity
-    encoder: Arc<QPackEncoder>,
-    decoder: Arc<QPackDecoder>,
-    connection: Arc<ConnectionState<dyn quic::Close + Unpin + Send>>,
 }
 
-impl PendingRequest {
-    fn header_mut(&mut self) -> &mut FieldSection {
-        self.request
-            .header_mut()
-            .expect("Request in Header stage as it unsend")
+impl<'c, C: quic::Connect + std::fmt::Debug> std::fmt::Debug for PendingRequest<'c, C>
+where
+    C::Connection: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRequest")
+            .field("client", &self.client)
+            .field("request", &self.request)
+            .finish()
+    }
+}
+
+#[derive(Debug, Snafu)]
+pub enum RequestError<E: Error + 'static> {
+    #[snafu(transparent)]
+    Connect { source: ConnectError<E> },
+    #[snafu(transparent)]
+    Stream { source: StreamError },
+}
+
+impl<C: quic::Connect> Client<C> {
+    pub fn new_request(&self) -> PendingRequest<'_, C> {
+        let mut request = Entity::unresolved_request();
+        _ = request.enable_streaming();
+        PendingRequest {
+            client: self,
+            request,
+        }
+    }
+}
+
+impl<C: quic::Connect> PendingRequest<'_, C> {
+    pub fn headers_mut(&mut self) -> &mut HeaderMap {
+        &mut self.request.header_mut().header_map
     }
 
-    pub fn headers_mut(&mut self) -> &mut HeaderMap {
-        &mut self.header_mut().header_map
+    pub fn scheme(&self) -> Option<Scheme> {
+        self.request.header().scheme()
     }
 
     pub fn set_scheme(mut self, scheme: Scheme) -> Self {
-        self.header_mut().set_scheme(scheme);
+        self.request.header_mut().set_scheme(scheme);
         self
     }
 
+    pub fn authority(&self) -> Option<Authority> {
+        self.request.header().authority()
+    }
+
     pub fn set_authority(mut self, authority: Authority) -> Self {
-        self.header_mut().set_authority(authority);
+        self.request.header_mut().set_authority(authority);
         self
     }
 
     pub fn set_path(mut self, path: PathAndQuery) -> Self {
-        self.header_mut().set_path(path);
+        self.request.header_mut().set_path(path);
         self
     }
 
     pub fn set_uri(mut self, uri: Uri) -> Self {
-        self.header_mut().set_uri(uri);
+        self.request.header_mut().set_uri(uri);
         self
     }
 
@@ -93,19 +112,41 @@ impl PendingRequest {
             .expect("Request in Header stage as it unsend");
         self
     }
+}
 
-    pub async fn r#do(mut self, method: Method) -> Result<(Request, Response), StreamError> {
-        self.header_mut().set_method(method);
+impl<C: quic::Connect> PendingRequest<'_, C>
+where
+    C::Connection: Send + 'static,
+    <C::Connection as quic::ManageStream>::StreamReader: Send,
+    <C::Connection as quic::ManageStream>::StreamWriter: Send,
+{
+    pub async fn r#do(
+        mut self,
+        method: Method,
+    ) -> Result<(Request, Response), RequestError<C::Error>> {
+        self.request.header_mut().set_method(method);
 
-        let (reader, writer) = self.stream.await.map_err(quic::StreamError::from)?;
+        let authority = self
+            .request
+            .header()
+            .authority()
+            .expect("TODO: validate reqeust pseudo headers");
+        let host = authority.host();
+        let connection = self.client.connect(host).await?;
+
+        let (read_stream, write_stream) = connection
+            .open_request_stream()
+            .await
+            .map_err(StreamError::from)?;
+
         let mut response = Response {
             entity: Entity::unresolved_response(),
-            stream: ReadStream::new(reader, self.decoder, self.connection.clone()),
+            stream: read_stream,
         };
 
         let mut request = Request {
-            entity: Entity::unresolved_request(),
-            stream: WriteStream::new(writer, self.encoder, self.connection.clone()),
+            entity: self.request,
+            stream: write_stream,
         };
 
         let do_request = async {
@@ -131,23 +172,23 @@ impl PendingRequest {
         Ok((request, response))
     }
 
-    pub async fn options(self) -> Result<(Request, Response), StreamError> {
+    pub async fn options(self) -> Result<(Request, Response), RequestError<C::Error>> {
         self.r#do(Method::OPTIONS).await
     }
 
-    pub async fn get(self) -> Result<(Request, Response), StreamError> {
+    pub async fn get(self) -> Result<(Request, Response), RequestError<C::Error>> {
         self.r#do(Method::GET).await
     }
 
-    pub async fn post(self) -> Result<(Request, Response), StreamError> {
+    pub async fn post(self) -> Result<(Request, Response), RequestError<C::Error>> {
         self.r#do(Method::POST).await
     }
 
-    pub async fn put(self) -> Result<(Request, Response), StreamError> {
+    pub async fn put(self) -> Result<(Request, Response), RequestError<C::Error>> {
         self.r#do(Method::PUT).await
     }
 
-    pub async fn head(self) -> Result<(Request, Response), StreamError> {
+    pub async fn head(self) -> Result<(Request, Response), RequestError<C::Error>> {
         self.r#do(Method::HEAD).await
     }
 }
@@ -194,8 +235,28 @@ impl Request {
         Ok(self)
     }
 
+    pub fn trailers(&self) -> &HeaderMap {
+        self.entity.trailers()
+    }
+
+    pub fn trailers_mut(&mut self) -> Result<&mut HeaderMap, StreamError> {
+        if self.entity.stage() > EntityStage::Trailer {
+            return Err(IllegalEntityOperator::ModifyTrailerAfterSent.into());
+        }
+        Ok(self.entity.trailers_mut()?)
+    }
+
+    pub fn set_trailer(
+        &mut self,
+        name: impl IntoHeaderName,
+        value: HeaderValue,
+    ) -> Result<&mut Self, StreamError> {
+        self.trailers_mut()?.insert(name, value);
+        Ok(self)
+    }
+
     pub fn set_trailers(&mut self, map: HeaderMap) -> Result<&mut Self, StreamError> {
-        *self.entity.trailers_mut()? = map;
+        *self.trailers_mut()? = map;
         Ok(self)
     }
 
@@ -211,6 +272,7 @@ impl Request {
 impl Drop for Request {
     fn drop(&mut self) {
         if !self.entity.is_complete() {
+            // Its ok to take: Request will not be used after drop
             let stream = self.stream.take();
             let entity = mem::replace(&mut self.entity, Entity::unresolved_request());
             let mut request = Request { entity, stream };
@@ -225,6 +287,11 @@ pub struct Response {
 }
 
 impl Response {
+    pub fn streaming(mut self) -> Result<Self, StreamError> {
+        self.entity.enable_streaming()?;
+        Ok(self)
+    }
+
     pub async fn next_response(&mut self) -> Result<&mut Self, StreamError> {
         self.stream.read_header(&mut self.entity).await?;
         Ok(self)

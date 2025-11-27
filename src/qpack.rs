@@ -39,7 +39,7 @@ mod tests {
             field_section::FieldSection,
         },
         quic::{ConnectionError, test::mock_stream_pair},
-        util::TryFutureStream,
+        util::try_future_stream::TryFutureStream,
         varint::VarInt,
     };
 
@@ -127,7 +127,7 @@ mod tests {
             .unwrap();
 
         let (parts, body) = request.into_parts();
-        let field_section = FieldSection::try_from(parts).unwrap();
+        let field_section = FieldSection::from(parts);
 
         let expected_field_section = field_section.clone();
 
