@@ -1,7 +1,6 @@
 use std::{
     error::Error as StdError,
     fmt::Debug,
-    future::poll_fn,
     io,
     ops::DerefMut,
     pin::{Pin, pin},
@@ -13,7 +12,10 @@ pub mod stream;
 
 use bytes::Bytes;
 use futures::{
-    FutureExt, SinkExt, Stream, StreamExt, channel::oneshot, future, stream::FusedStream,
+    FutureExt, SinkExt, Stream, StreamExt,
+    channel::oneshot,
+    future::{self, BoxFuture},
+    stream::FusedStream,
 };
 use snafu::Snafu;
 use tokio::sync::Mutex as AsyncMutex;
@@ -36,8 +38,8 @@ use crate::{
         encoder::Encoder,
         instruction::{DecoderInstruction, EncoderInstruction},
     },
-    quic::{self, StopStreamExt, identity},
-    util::{set_once::SetOnce, try_future_stream::TryFutureStream, watch::Watch},
+    quic::{self, GetStreamIdExt, StopStreamExt},
+    util::{set_once::SetOnce, try_future::TryFuture, watch::Watch},
     varint::VarInt,
 };
 
@@ -109,10 +111,11 @@ impl From<io::Error> for StreamError {
     }
 }
 
+#[derive(Debug)]
 pub struct ConnectionState<C: ?Sized> {
     error: SetOnce<quic::ConnectionError>,
-    local_settings: Settings,
-    peer_settings: SetOnce<Settings>,
+    local_settings: Arc<Settings>,
+    peer_settings: SetOnce<Arc<Settings>>,
     local_goaway: Watch<Goaway>,
     peer_goaway: Watch<Goaway>,
     max_received_request_stream_id: Watch<VarInt>,
@@ -121,7 +124,7 @@ pub struct ConnectionState<C: ?Sized> {
 }
 
 impl<C: ?Sized> ConnectionState<C> {
-    fn new(quic: C, local_settings: Settings) -> Self
+    fn new(quic: C, local_settings: Arc<Settings>) -> Self
     where
         C: Sized,
     {
@@ -201,21 +204,18 @@ impl<C: quic::Close + Unpin + ?Sized> ConnectionState<C> {
             .map(|option| option.expect("connection closed without error"))
     }
 
+    pub fn settings(&self) -> Arc<Settings> {
+        self.local_settings.clone()
+    }
+
     pub fn peer_settings(
         &self,
-    ) -> impl Future<Output = Result<Settings, quic::ConnectionError>> + use<C> {
+    ) -> impl Future<Output = Result<Arc<Settings>, quic::ConnectionError>> + use<C> {
         let error = self.error();
         self.peer_settings.get().then(|option| match option {
             Some(settings) => future::ready(Ok(settings)).left_future(),
             None => error.map(Err).right_future(),
         })
-    }
-
-    pub fn accpet_stream(
-        &self,
-        stream_id: VarInt,
-    ) -> Result<(), crate::entity::stream::StreamError> {
-        todo!()
     }
 
     pub fn max_received_stream_id(
@@ -244,22 +244,6 @@ impl<C: quic::Close + Unpin + ?Sized> ConnectionState<C> {
         Ok(self.local_goaway.peek())
     }
 
-    pub fn accept_request(&self, stream_id: VarInt) -> Result<(), ConnectionGoaway> {
-        let local_goaway = self.local_goaway.lock();
-        let mut max_received_request_stream_id = self.max_received_request_stream_id.lock();
-
-        let goaway_stream_id = local_goaway
-            .get()
-            .map(|goaway| goaway.stream_id())
-            .unwrap_or(VarInt::from_u32(0));
-        if goaway_stream_id >= stream_id {
-            Err(ConnectionGoaway::Local)
-        } else {
-            max_received_request_stream_id.set(stream_id);
-            Ok(())
-        }
-    }
-
     pub fn goaway(&self) -> Goaway {
         let mut local_goaway = self.local_goaway.lock();
         let max_received_request_stream_id = self.max_received_request_stream_id.lock();
@@ -273,6 +257,84 @@ impl<C: quic::Close + Unpin + ?Sized> ConnectionState<C> {
         local_goaway.set(goaway);
 
         goaway
+    }
+}
+
+#[derive(Debug, Snafu, Clone)]
+#[snafu(module)]
+pub enum InitialRequestStreamError {
+    #[snafu(transparent)]
+    Quic { source: quic::StreamError },
+    #[snafu(transparent)]
+    Goaway { source: ConnectionGoaway },
+}
+
+impl From<quic::ConnectionError> for InitialRequestStreamError {
+    fn from(error: quic::ConnectionError) -> Self {
+        Self::Quic {
+            source: error.into(),
+        }
+    }
+}
+
+#[derive(Debug, Snafu, Clone)]
+#[snafu(module)]
+pub enum AcceptRequestStreamError {
+    #[snafu(transparent)]
+    Quic { source: quic::StreamError },
+    #[snafu(transparent)]
+    Goaway { source: ConnectionGoaway },
+}
+
+impl From<quic::ConnectionError> for AcceptRequestStreamError {
+    fn from(error: quic::ConnectionError) -> Self {
+        Self::Quic {
+            source: error.into(),
+        }
+    }
+}
+
+impl<C: quic::Close + quic::ManageStream + Unpin + ?Sized> ConnectionState<C> {
+    pub async fn initial_request_stream(
+        &self,
+    ) -> Result<(Pin<Box<C::StreamReader>>, Pin<Box<C::StreamWriter>>), InitialRequestStreamError>
+    {
+        let (reader, writer) = self.open_bi().await?;
+        let mut reader = Box::pin(reader);
+        let writer = Box::pin(writer);
+        let stream_id = reader.stream_id().await?;
+
+        if let Some(goaway) = self.peer_goaway.peek()
+            && goaway.stream_id() >= stream_id
+        {
+            return Err(ConnectionGoaway::Peer.into());
+        }
+
+        Ok((reader, writer))
+    }
+
+    pub async fn accept_request_stream(
+        &self,
+    ) -> Result<(Pin<Box<C::StreamReader>>, Pin<Box<C::StreamWriter>>), AcceptRequestStreamError>
+    {
+        let (reader, writer) = self.accept_bi().await?;
+        let mut reader = Box::pin(reader);
+        let writer = Box::pin(writer);
+        let stream_id = reader.stream_id().await?;
+
+        let local_goaway = self.local_goaway.lock();
+        let mut max_received_request_stream_id = self.max_received_request_stream_id.lock();
+
+        let goaway_stream_id = local_goaway
+            .get()
+            .map(|goaway| goaway.stream_id())
+            .unwrap_or(VarInt::from_u32(0));
+        if goaway_stream_id >= stream_id {
+            return Err(ConnectionGoaway::Local.into());
+        }
+
+        max_received_request_stream_id.set(stream_id);
+        Ok((reader, writer))
     }
 }
 
@@ -291,7 +353,7 @@ pub type QPackDecoder = Decoder<
 
 type FrameSink = Feed<BoxSink<'static, Frame<BufList>, StreamError>, Frame<BufList>>;
 
-pub struct Connection<C: quic::ManageStream + quic::Close + Unpin + ?Sized> {
+pub struct Connection<C: quic::Connection + ?Sized> {
     state: Arc<ConnectionState<C>>,
     qpack_encoder: Arc<QPackEncoder>,
     qpack_decoder: Arc<QPackDecoder>,
@@ -299,24 +361,22 @@ pub struct Connection<C: quic::ManageStream + quic::Close + Unpin + ?Sized> {
     task: AbortOnDropHandle<()>,
 }
 
-impl<C: quic::ManageStream + quic::Close + Unpin + ?Sized> Debug for Connection<C> {
+impl<C: quic::Connection + ?Sized + Debug> Debug for Connection<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Connection").finish()
+        f.debug_struct("Connection")
+            .field("state", &self.state)
+            .field("qpack_encoder", &"...")
+            .field("qpack_decoder", &"...")
+            .field("control_stream", &"...")
+            .field("task", &self.task)
+            .finish()
     }
 }
 
-// #[bon::bon]
-impl<C: quic::ManageStream + quic::Close + Unpin + ?Sized> Connection<C> {
-    // #[builder]
-    pub async fn new(
-        // #[builder(default)]
-        settings: Settings,
-        quic: C,
-    ) -> Result<Self, quic::ConnectionError>
+impl<C: quic::Connection + ?Sized> Connection<C> {
+    pub async fn new(settings: Arc<Settings>, quic: C) -> Result<Self, quic::ConnectionError>
     where
-        C: Send + 'static + Sized,
-        C::StreamReader: Send + 'static,
-        C::StreamWriter: Send + 'static,
+        C: Sized,
     {
         let state = Arc::new(ConnectionState::new(quic, settings));
 
@@ -327,7 +387,7 @@ impl<C: quic::ManageStream + quic::Close + Unpin + ?Sized> Connection<C> {
         let qpack_encoder = {
             // lazily open QPACK encoder stream. if the dynamic table is never used, the stream is never opened.
             let conn_state = state.clone();
-            let qpack_encoder_inst_sender = Box::pin(TryFutureStream::from(Box::pin(async move {
+            let qpack_encoder_inst_sender = Box::pin(TryFuture::from(Box::pin(async move {
                 // open QPACK encoder stream
                 let uni_stream = Box::pin(SinkWriter::new(conn_state.open_uni().await?));
                 // send encoder stream type
@@ -338,7 +398,7 @@ impl<C: quic::ManageStream + quic::Close + Unpin + ?Sized> Connection<C> {
             })));
 
             let connection_error = state.error();
-            let qpack_decoder_inst_receiver = Box::pin(TryFutureStream::from(async move {
+            let qpack_decoder_inst_receiver = Box::pin(TryFuture::from(async move {
                 tokio::select! {
                     Ok(inst_stream) = qpack_decoder_inst_receiver_rx => Ok(inst_stream),
                     error = connection_error => Err(error),
@@ -346,7 +406,7 @@ impl<C: quic::ManageStream + quic::Close + Unpin + ?Sized> Connection<C> {
             }));
 
             Arc::new(Encoder::new(
-                Settings::default(),
+                Arc::<Settings>::default(),
                 qpack_encoder_inst_sender as BoxInstructionSink<'static, EncoderInstruction>,
                 qpack_decoder_inst_receiver as BoxInstructionStream<'static, DecoderInstruction>,
             ))
@@ -355,7 +415,7 @@ impl<C: quic::ManageStream + quic::Close + Unpin + ?Sized> Connection<C> {
         let qpack_decoder = {
             // lazily open QPACK decoder stream. if the dynamic table is never used by peer, the stream is never opened.
             let conn_state = state.clone();
-            let qpack_decoder_inst_sender = Box::pin(TryFutureStream::from(async move {
+            let qpack_decoder_inst_sender = Box::pin(TryFuture::from(async move {
                 // open QPACK encoder stream
                 let uni_stream = Box::pin(SinkWriter::new(conn_state.open_uni().await?));
                 // send encoder stream type
@@ -366,7 +426,7 @@ impl<C: quic::ManageStream + quic::Close + Unpin + ?Sized> Connection<C> {
             }));
 
             let connection_error = state.error();
-            let qpack_encoder_inst_receiver = Box::pin(TryFutureStream::from(async move {
+            let qpack_encoder_inst_receiver = Box::pin(TryFuture::from(async move {
                 tokio::select! {
                     Ok(inst_stream) = qpack_encoder_inst_receiver_rx => Ok(inst_stream),
                     error = connection_error => Err(error),
@@ -467,7 +527,7 @@ impl<C: quic::ManageStream + quic::Close + Unpin + ?Sized> Connection<C> {
             if settings_frame.r#type() != Frame::SETTINGS_FRAME_TYPE {
                 return Err(Code::H3_MISSING_SETTINGS.into());
             }
-            let settings = settings_frame.decode_one::<Settings>().await?;
+            let settings = Arc::new(settings_frame.decode_one::<Settings>().await?);
             tracing::debug!("Remote settings applied: {:?}", settings);
             conn_state.peer_settings.set(settings.clone()).unwrap();
             encoder.apply_settings(settings.clone()).await;
@@ -548,7 +608,10 @@ impl<C: quic::ManageStream + quic::Close + Unpin + ?Sized> Connection<C> {
                 return Err(state.error().await);
             }
         };
-        let settings_frame = BufList::new().encode(&state.local_settings).await.unwrap();
+        let settings_frame = BufList::new()
+            .encode(state.local_settings.as_ref())
+            .await
+            .unwrap();
         match control_stream.send(settings_frame).await {
             Ok(()) => {}
             Err(error) => {
@@ -566,58 +629,16 @@ impl<C: quic::ManageStream + quic::Close + Unpin + ?Sized> Connection<C> {
         })
     }
 
-    pub async fn peer_settings(&self) -> Result<Settings, quic::ConnectionError> {
+    pub fn settings(&self) -> Arc<Settings> {
+        self.state.local_settings.clone()
+    }
+
+    pub async fn peer_settings(&self) -> Result<Arc<Settings>, quic::ConnectionError> {
         self.state.peer_settings().await
     }
 
     pub async fn max_received_stream_id(&self) -> Result<VarInt, quic::ConnectionError> {
         self.state.max_received_stream_id().await
-    }
-
-    pub async fn open_request_stream(
-        &self,
-    ) -> Result<(entity::stream::ReadStream, entity::stream::WriteStream), quic::StreamError>
-    where
-        C: Send + Sized + 'static,
-        C::StreamReader: Send + 'static,
-        C::StreamWriter: Send + 'static,
-    {
-        let (reader, writer) = self.state.open_bi().await?;
-        Ok((
-            entity::stream::ReadStream::new(
-                Box::pin(reader),
-                self.qpack_decoder.clone(),
-                self.state.clone(),
-            ),
-            entity::stream::WriteStream::new(
-                Box::pin(writer),
-                self.qpack_encoder.clone(),
-                self.state.clone(),
-            ),
-        ))
-    }
-
-    pub async fn accept_request_stream(
-        &self,
-    ) -> Result<(entity::stream::ReadStream, entity::stream::WriteStream), quic::StreamError>
-    where
-        C: Send + Sized + 'static,
-        C::StreamReader: Send + 'static,
-        C::StreamWriter: Send + 'static,
-    {
-        let (reader, writer) = self.state.accept_bi().await?;
-        Ok((
-            entity::stream::ReadStream::new(
-                Box::pin(reader),
-                self.qpack_decoder.clone(),
-                self.state.clone(),
-            ),
-            entity::stream::WriteStream::new(
-                Box::pin(writer),
-                self.qpack_encoder.clone(),
-                self.state.clone(),
-            ),
-        ))
     }
 
     pub fn peer_goawaies(&self) -> impl Stream<Item = Result<Goaway, quic::ConnectionError>> {
@@ -642,19 +663,65 @@ impl<C: quic::ManageStream + quic::Close + Unpin + ?Sized> Connection<C> {
     pub async fn closed(&self) -> quic::ConnectionError {
         self.state.error().await
     }
-}
 
-impl<C: quic::ManageStream + identity::WithIdentity + quic::Close + Unpin + ?Sized> Connection<C> {
-    pub async fn cert(&self) -> Result<Bytes, quic::ConnectionError> {
-        poll_fn(|cx| Pin::new(self.state.quic_connection().deref_mut()).poll_cert(cx)).await
+    pub fn local_cert(&self) -> Result<Bytes, quic::ConnectionError> {
+        Pin::new(self.state.quic_connection().deref_mut()).local_cert()
     }
 
-    pub async fn name(&self) -> Result<String, quic::ConnectionError> {
-        poll_fn(|cx| Pin::new(self.state.quic_connection().deref_mut()).poll_name(cx)).await
+    pub fn local_name(&self) -> Result<String, quic::ConnectionError> {
+        Pin::new(self.state.quic_connection().deref_mut()).local_name()
+    }
+
+    pub fn peer_cert(&self) -> BoxFuture<'static, Result<Bytes, quic::ConnectionError>> {
+        Pin::new(self.state.quic_connection().deref_mut()).peer_cert()
+    }
+
+    pub fn peer_name(&self) -> BoxFuture<'static, Result<String, quic::ConnectionError>> {
+        Pin::new(self.state.quic_connection().deref_mut()).peer_name()
     }
 }
 
-impl<C: quic::ManageStream + quic::Close + Unpin + ?Sized> Drop for Connection<C> {
+impl<C: quic::Connection /* + Sized */> Connection<C> {
+    pub async fn open_request_stream(
+        &self,
+    ) -> Result<(entity::stream::ReadStream, entity::stream::WriteStream), InitialRequestStreamError>
+    {
+        let (stream_reader, stream_writer) = self.state.initial_request_stream().await?;
+        Ok((
+            entity::stream::ReadStream::new(
+                stream_reader,
+                self.qpack_decoder.clone(),
+                self.state.clone(),
+            ),
+            entity::stream::WriteStream::new(
+                stream_writer,
+                self.qpack_encoder.clone(),
+                self.state.clone(),
+            ),
+        ))
+    }
+
+    pub async fn accept_request_stream(
+        &self,
+    ) -> Result<(entity::stream::ReadStream, entity::stream::WriteStream), AcceptRequestStreamError>
+    {
+        let (stream_reader, stream_writer) = self.state.accept_request_stream().await?;
+        Ok((
+            entity::stream::ReadStream::new(
+                stream_reader,
+                self.qpack_decoder.clone(),
+                self.state.clone(),
+            ),
+            entity::stream::WriteStream::new(
+                stream_writer,
+                self.qpack_encoder.clone(),
+                self.state.clone(),
+            ),
+        ))
+    }
+}
+
+impl<C: quic::Connection + ?Sized> Drop for Connection<C> {
     fn drop(&mut self) {
         self.close(&Code::H3_NO_ERROR);
     }

@@ -14,7 +14,11 @@ use bytes::Bytes;
 use futures::{Sink, Stream, future::BoxFuture};
 use snafu::Snafu;
 
-use crate::{error::Code, varint::VarInt};
+use crate::{
+    error::Code,
+    quic::identity::{WithLocalIdentity, WithPeerIdentity},
+    varint::VarInt,
+};
 
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
@@ -102,17 +106,27 @@ impl ConnectionError {
 }
 
 pub trait Connect {
-    type Connection: ManageStream + identity::WithIdentity + Close + Unpin;
+    type Connection: Connection;
     type Error: Error + 'static;
 
     fn connect(&self, host: &str) -> BoxFuture<'static, Result<Self::Connection, Self::Error>>;
 }
 
 pub trait Listen {
-    type Connection: ManageStream + identity::WithIdentity + Close + Unpin;
+    type Connection: Connection;
     type Error: Error + 'static;
 
-    fn accept(&self) -> BoxFuture<'static, Result<(Self::Connection, String), Self::Error>>;
+    fn accept(&self) -> BoxFuture<'static, Result<Self::Connection, Self::Error>>;
+}
+
+pub trait Connection:
+    ManageStream + WithLocalIdentity + WithPeerIdentity + Close + Unpin + Send + 'static
+{
+}
+
+impl<C: ManageStream + WithLocalIdentity + WithPeerIdentity + Close + Unpin + Send + 'static>
+    Connection for C
+{
 }
 
 pub trait ManageStream {
@@ -317,10 +331,14 @@ pub trait StopStreamExt {
 
 impl<T: StopStream + ?Sized> StopStreamExt for T {}
 
-pub trait ReadStream: StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> {}
+pub trait ReadStream:
+    StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + Send + 'static
+{
+}
 
-impl<S: StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + ?Sized> ReadStream
-    for S
+impl<
+    S: StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + Send + ?Sized + 'static,
+> ReadStream for S
 {
 }
 
@@ -383,9 +401,15 @@ pub trait CancelStreamExt {
 
 impl<T: CancelStream + ?Sized> CancelStreamExt for T {}
 
-pub trait WriteStream: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> {}
+pub trait WriteStream:
+    CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + 'static
+{
+}
 
-impl<S: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + ?Sized> WriteStream for S {}
+impl<S: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + ?Sized + 'static>
+    WriteStream for S
+{
+}
 
 #[cfg(test)]
 pub mod test {
@@ -437,12 +461,6 @@ pub mod test {
     where
         StreamError: From<S::Error>,
     {
-        // fn poll_cancel(self: Pin<&mut Self>, code: VarInt) {
-        //     let project = self.project();
-        //     if matches!(project.reset, SenderResetState::None) {
-        //         *project.reset = SenderResetState::ResetPending(code);
-        //     }
-        // }
         fn poll_cancel(
             self: Pin<&mut Self>,
             cx: &mut Context,

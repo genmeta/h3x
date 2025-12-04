@@ -1,43 +1,43 @@
 use std::sync::Arc;
 
 use crate::{
-    connection::Connection,
-    endpoint::pool::{ConnectError, Pool},
+    connection::{Connection, settings::Settings},
+    endpoint::pool::{self, Pool},
     quic,
 };
 
 mod entity;
 
+#[derive(Debug, Clone)]
 pub struct Client<C: quic::Connect> {
+    pool: Pool<C::Connection>,
     connector: C,
-    pool: Arc<Pool<C::Connection>>,
-}
-
-impl<C: quic::Connect + std::fmt::Debug> std::fmt::Debug for Client<C> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Client")
-            .field("connector", &self.connector)
-            .field("pool", &self.pool)
-            .finish()
-    }
+    settings: Arc<Settings>,
 }
 
 #[bon::bon]
-impl<C: quic::Connect> Client<C>
-where
-    C::Connection: Send + 'static,
-    <C::Connection as quic::ManageStream>::StreamReader: Send,
-    <C::Connection as quic::ManageStream>::StreamWriter: Send,
-{
+impl<C: quic::Connect> Client<C> {
     #[builder]
-    pub fn new(pool: Arc<Pool<C::Connection>>, connector: C) -> Self {
-        Self { connector, pool }
+    pub fn new(
+        #[builder(default)] pool: Pool<C::Connection>,
+        connector: C,
+        #[builder(default)] settings: Arc<Settings>,
+    ) -> Self {
+        Self {
+            pool,
+            connector,
+            settings,
+        }
     }
 
     pub async fn connect(
         &self,
         name: &str,
-    ) -> Result<Arc<Connection<C::Connection>>, ConnectError<C::Error>> {
-        self.pool.reuse_or_connect(&self.connector, name).await
+    ) -> Result<Arc<Connection<C::Connection>>, pool::ConnectError<C::Error>> {
+        self.pool
+            .reuse_or_connect_with(name, self.settings.clone(), async |name| {
+                self.connector.connect(name).await
+            })
+            .await
     }
 }

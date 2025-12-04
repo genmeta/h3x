@@ -14,7 +14,10 @@ use super::Body;
 use crate::{
     buflist::{BufList, Cursor},
     codec::{EncodeExt, SinkWriter, StreamReader},
-    connection::{self, ConnectionState, QPackDecoder, QPackEncoder},
+    connection::{
+        self, ConnectionGoaway, ConnectionState, InitialRequestStreamError, QPackDecoder,
+        QPackEncoder,
+    },
     entity::{Entity, EntityStage, IllegalEntityOperator},
     error::Code,
     frame::{Frame, stream::FrameStream},
@@ -88,14 +91,11 @@ impl quic::GetStreamId for MockStream {
 #[derive(Debug, Snafu)]
 pub enum StreamError {
     #[snafu(transparent)]
-    Quic {
-        source: quic::StreamError,
-    },
-    Goaway,
+    Quic { source: quic::StreamError },
     #[snafu(transparent)]
-    IllegalEntityOperator {
-        source: IllegalEntityOperator,
-    },
+    Goaway { source: ConnectionGoaway },
+    #[snafu(transparent)]
+    IllegalEntityOperator { source: IllegalEntityOperator },
 }
 
 impl From<quic::ConnectionError> for StreamError {
@@ -106,11 +106,20 @@ impl From<quic::ConnectionError> for StreamError {
     }
 }
 
+impl From<InitialRequestStreamError> for StreamError {
+    fn from(error: InitialRequestStreamError) -> Self {
+        match error {
+            InitialRequestStreamError::Quic { source } => Self::Quic { source },
+            InitialRequestStreamError::Goaway { source } => Self::Goaway { source },
+        }
+    }
+}
+
 impl From<StreamError> for io::Error {
     fn from(error: StreamError) -> Self {
         let kind = match error {
             StreamError::Quic { .. } => io::ErrorKind::BrokenPipe,
-            StreamError::Goaway => io::ErrorKind::ConnectionRefused,
+            StreamError::Goaway { .. } => io::ErrorKind::Other,
             StreamError::IllegalEntityOperator { .. } => io::ErrorKind::InvalidInput,
         };
         io::Error::new(kind, error)
@@ -176,7 +185,7 @@ impl ReadStream {
                 Ok(()) => {
                     // FIXME: which code should be used?
                     _ = self.stream.stop(Code::H3_NO_ERROR.into()).await;
-                    Err(StreamError::Goaway)
+                    Err(ConnectionGoaway::Peer.into())
                 }
                 Err(error) => Err(error.into())
             }
@@ -498,7 +507,7 @@ impl WriteStream {
                 Ok(()) => {
                     // FIXME: which code should be used?
                     _ = self.stream.cancel(Code::H3_NO_ERROR.into()).await;
-                    Err(StreamError::Goaway)
+                    Err(ConnectionGoaway::Peer.into())
                 }
                 Err(error) => Err(error.into())
             }

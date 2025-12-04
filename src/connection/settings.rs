@@ -134,7 +134,7 @@ impl<S: AsyncWrite> Encode<Setting> for S {
     }
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Settings {
     map: BTreeMap<VarInt, VarInt>,
 }

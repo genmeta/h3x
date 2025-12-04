@@ -39,7 +39,7 @@ mod tests {
             field_section::FieldSection,
         },
         quic::{ConnectionError, test::mock_stream_pair},
-        util::try_future_stream::TryFutureStream,
+        util::try_future::TryFuture,
         varint::VarInt,
     };
 
@@ -63,7 +63,7 @@ mod tests {
             .unwrap();
             tracing::info!("Sent encoder stream type");
 
-            let decoder_stream = Box::pin(TryFutureStream::from(async move {
+            let decoder_stream = Box::pin(TryFuture::from(async move {
                 let decoder_stream = StreamReader::new(decoder_stream_reader)
                     .into_decoded::<UnidirectionalStream<_>>()
                     .await
@@ -77,7 +77,7 @@ mod tests {
             }));
 
             Arc::new(Encoder::new(
-                Settings::default(),
+                Arc::<Settings>::default(),
                 Box::pin((encoder_stream).into_encode_sink()),
                 Box::pin((decoder_stream).into_decode_stream()),
             ))
@@ -92,7 +92,7 @@ mod tests {
             .unwrap();
             tracing::info!("Sent decoder stream type");
 
-            let encoder_stream = Box::pin(TryFutureStream::from(async move {
+            let encoder_stream = Box::pin(TryFuture::from(async move {
                 let encoder_stream = StreamReader::new(encoder_stream_reader)
                     .into_decoded::<UnidirectionalStream<_>>()
                     .await

@@ -43,6 +43,13 @@ impl<T> Watch<T> {
         }
     }
 
+    pub fn with(value: T) -> Self {
+        Self {
+            value: Arc::new(SyncMutex::new(Some(value))),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
     pub fn lock(&self) -> Value<'_, T> {
         Value {
             guard: self.value.lock().unwrap(),

@@ -6,6 +6,7 @@ use std::{
 
 use tokio::sync::{Notify, futures::OwnedNotified};
 
+#[derive(Debug)]
 pub struct SetOnce<T> {
     value: Arc<SyncMutex<Option<T>>>,
     notify: Arc<Notify>,

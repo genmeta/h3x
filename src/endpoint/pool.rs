@@ -1,7 +1,7 @@
 use std::{
     error::Error,
     pin::pin,
-    sync::{Arc, Mutex as SyncMutex},
+    sync::{Arc, LazyLock, Mutex as SyncMutex},
 };
 
 use dashmap::DashMap;
@@ -11,27 +11,24 @@ use tokio::{sync::Mutex as AsyncMutex, task::JoinSet};
 
 use crate::{
     connection::{Connection, settings::Settings},
-    quic::{self, identity, identity::WithIdentityExt},
+    quic,
     util::watch::Watch,
 };
 
-pub struct PoolEntry<C: quic::ManageStream + quic::Close + identity::WithIdentity + Unpin> {
+#[derive(Debug)]
+pub struct ReuseableConnection<C: quic::Connection> {
     connection: Watch<Arc<Connection<C>>>,
     connect: AsyncMutex<()>,
 }
 
-impl<C: quic::ManageStream + quic::Close + identity::WithIdentity + Unpin> std::fmt::Debug
-    for PoolEntry<C>
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PoolEntry")
-            .field("connection", &self.connection)
-            .field("connect", &self.connect)
-            .finish()
+impl<C: quic::Connection> ReuseableConnection<C> {
+    pub fn with(connection: Arc<Connection<C>>) -> Self {
+        Self {
+            connection: Watch::with(connection),
+            connect: AsyncMutex::new(()),
+        }
     }
-}
 
-impl<C: quic::ManageStream + quic::Close + identity::WithIdentity + Unpin> PoolEntry<C> {
     pub fn pending() -> Self {
         Self {
             connection: Watch::new(),
@@ -39,12 +36,22 @@ impl<C: quic::ManageStream + quic::Close + identity::WithIdentity + Unpin> PoolE
         }
     }
 
-    pub async fn reuse_or_connect<E>(
+    pub fn peek(&self) -> Option<Arc<Connection<C>>> {
+        self.connection.peek()
+    }
+
+    pub fn reuse(&self) -> Option<Arc<Connection<C>>> {
+        let connection = self.peek();
+        // TDOO: check whether the connection is still valid
+        connection
+    }
+
+    pub async fn reuse_or_initial<E>(
         &self,
-        mut try_connect: impl AsyncFnMut() -> Result<Connection<C>, E>,
+        mut try_initial: impl AsyncFnMut() -> Result<Arc<Connection<C>>, E>,
     ) -> Result<Arc<Connection<C>>, E> {
-        if let Some(raw_connection) = self.connection.peek() {
-            return Ok(raw_connection);
+        if let Some(connection) = self.reuse() {
+            return Ok(connection);
         }
 
         let mut connections = pin!(self.connection.watch());
@@ -54,7 +61,7 @@ impl<C: quic::ManageStream + quic::Close + identity::WithIdentity + Unpin> PoolE
                 biased;
                 _guard = self.connect.lock() => {
                     // its ok to replace the connection, reference of replaced connection still in task until closed
-                    self.connection.set(Arc::new(try_connect().await?));
+                    self.connection.set(try_initial().await?);
                 }
                 connection = connections.next() => {
                     let Some(connection) = connection else {
@@ -69,80 +76,106 @@ impl<C: quic::ManageStream + quic::Close + identity::WithIdentity + Unpin> PoolE
     }
 }
 
-pub struct Pool<C: quic::ManageStream + quic::Close + identity::WithIdentity + Unpin> {
-    settings: Settings,
-    connections: Arc<DashMap<String, PoolEntry<C>>>,
-    tasks: SyncMutex<JoinSet<()>>,
+type ConnectionIdentifier = (String, Arc<Settings>);
+
+#[derive(Debug)]
+pub struct Pool<C: quic::Connection> {
+    connections: Arc<DashMap<ConnectionIdentifier, ReuseableConnection<C>>>,
+    tasks: Arc<SyncMutex<JoinSet<()>>>,
 }
 
-impl<C: quic::ManageStream + quic::Close + identity::WithIdentity + Unpin> std::fmt::Debug
-    for Pool<C>
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pool")
-            .field("settings", &self.settings)
-            .field("connections", &self.connections)
-            .field("tasks", &self.tasks)
-            .finish()
+impl<C: quic::Connection> Clone for Pool<C> {
+    fn clone(&self) -> Self {
+        Self {
+            connections: self.connections.clone(),
+            tasks: self.tasks.clone(),
+        }
     }
 }
 
-impl<C: quic::ManageStream + quic::Close + identity::WithIdentity + Unpin> Pool<C> {
-    fn new(settings: Settings) -> Self {
+impl<C: quic::Connection> Pool<C> {
+    pub fn empty() -> Self {
         Self {
-            settings,
-            connections: Arc::default(),
-            tasks: SyncMutex::default(),
+            connections: Default::default(),
+            tasks: Default::default(),
         }
+    }
+
+    pub fn global() -> &'static Self {
+        use std::any::{Any, TypeId};
+
+        static POOLS: LazyLock<DashMap<TypeId, &'static (dyn Any + Send + Sync)>> =
+            LazyLock::new(DashMap::new);
+        POOLS
+            .entry(TypeId::of::<C>())
+            .or_insert_with(|| Box::leak(Box::new(Pool::<C>::empty())))
+            .downcast_ref::<Pool<C>>()
+            .expect("TypeId collision")
+    }
+}
+
+impl<C: quic::Connection> Default for Pool<C> {
+    fn default() -> Self {
+        Self::global().clone()
     }
 }
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum ConnectError<E: Error + 'static> {
-    #[snafu(display("Failed to establish QUIC connection"))]
-    QuicConnect { source: E },
-    #[snafu(display("Failed to initial HTTP3 connection"))]
-    H3Connect { source: quic::ConnectionError },
+    #[snafu(display("Failed to initial QUIC connection"))]
+    Connector { source: E },
+    #[snafu(transparent)]
+    H3 { source: quic::ConnectionError },
+    #[snafu(display("Peer name mismatch: expected {expected}, actual {actual}"))]
+    IncorrectIdentify { expected: String, actual: String },
 }
 
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-pub enum AcceptError<E: Error + 'static> {
-    #[snafu(display("Failed to establish QUIC connection"))]
-    QuicConnect { source: E },
-    #[snafu(display("Failed to identify connection"))]
-    Identify { source: quic::ConnectionError },
-    #[snafu(display("Failed to initial HTTP3 connection"))]
-    H3Connect { source: quic::ConnectionError },
-}
-
-impl<C: quic::ManageStream + quic::Close + identity::WithIdentity + Unpin> Pool<C> {
-    fn insert<E>(
+impl<C: quic::Connection> Pool<C> {
+    pub async fn reuse_or_connect_with<E: Error + 'static>(
         &self,
-        name: &str,
-        result: Result<Arc<Connection<C>>, E>,
-    ) -> Result<Arc<Connection<C>>, E>
-    where
-        C: Send + 'static,
-    {
+        peer_name: &str,
+        settings: Arc<Settings>,
+        mut connector: impl AsyncFnMut(&str) -> Result<C, E>,
+    ) -> Result<Arc<Connection<C>>, ConnectError<E>> {
+        let peer_name = peer_name.to_string();
+        let result = self
+            .connections
+            .entry((peer_name.clone(), settings.clone()))
+            .or_insert_with(ReuseableConnection::pending)
+            .downgrade()
+            .reuse_or_initial(async || {
+                let connection = (connector)(&peer_name)
+                    .await
+                    .context(connect_error::ConnectorSnafu)?;
+                let connection = Connection::new(settings.clone(), connection).await?;
+                let actual_peer_name = connection.peer_name().await?;
+                if actual_peer_name != peer_name {
+                    return connect_error::IncorrectIdentifySnafu {
+                        expected: peer_name.to_string(),
+                        actual: actual_peer_name,
+                    }
+                    .fail();
+                }
+
+                Ok(Arc::new(connection))
+            })
+            .await;
+
         match &result {
-            Ok(h3_connection) => {
-                let name = name.to_string();
+            Ok(connection) => {
+                let connection = connection.clone();
                 let connections = self.connections.clone();
-                let h3_connection = h3_connection.clone();
                 self.tasks.lock().unwrap().spawn(async move {
-                    h3_connection.closed().await;
-                    connections.remove_if(&name, |_, PoolEntry { connection, .. }| {
-                        connection.peek().is_none_or(|exist_connection| {
-                            Arc::ptr_eq(&exist_connection, &h3_connection)
-                        })
+                    connection.closed().await;
+                    connections.remove_if(&(peer_name, settings), |_, connection| {
+                        connection.reuse().is_none()
                     });
                 });
             }
             Err(..) => {
                 self.connections
-                    .remove_if(name, |_, PoolEntry { connection, .. }| {
+                    .remove_if(&(peer_name, settings), |_, connection| {
                         connection.peek().is_none()
                     });
             }
@@ -151,62 +184,15 @@ impl<C: quic::ManageStream + quic::Close + identity::WithIdentity + Unpin> Pool<
         result
     }
 
-    pub async fn reuse_or_connect<Q>(
+    pub async fn try_insert<E>(
         &self,
-        connector: &Q,
-        name: &str,
-    ) -> Result<Arc<Connection<C>>, ConnectError<Q::Error>>
-    where
-        Q: quic::Connect<Connection = C>,
-        C: Send + 'static,
-        C::StreamReader: Send,
-        C::StreamWriter: Send,
-    {
-        let result = self
-            .connections
-            .entry(name.to_string())
-            .or_insert_with(PoolEntry::pending)
-            .downgrade()
-            .reuse_or_connect(async move || {
-                let quic_connection = connector
-                    .connect(name)
-                    .await
-                    .context(connect_error::QuicConnectSnafu)?;
-                Connection::new(self.settings.clone(), quic_connection)
-                    .await
-                    .context(connect_error::H3ConnectSnafu)
-            })
-            .await;
-
-        self.insert(name, result)
-    }
-
-    pub async fn accept_one<Q>(
-        &self,
-        acceptor: &Q,
-    ) -> Result<(Arc<Connection<C>>, String), AcceptError<Q::Error>>
-    where
-        Q: quic::Listen<Connection = C>,
-        C: Send + 'static,
-        C::StreamReader: Send,
-        C::StreamWriter: Send,
-    {
-        let (mut quic_connection, connected_server) = acceptor
-            .accept()
-            .await
-            .context(accept_error::QuicConnectSnafu)?;
-
-        let name = quic_connection
-            .name()
-            .await
-            .context(accept_error::IdentifySnafu)?;
-
-        let result = Connection::new(self.settings.clone(), quic_connection)
-            .await
-            .context(accept_error::H3ConnectSnafu)
-            .map(Arc::new);
-
-        self.insert(&name, result)
-            .map(|connection| (connection, connected_server))
+        connection: Arc<Connection<C>>,
+    ) -> Result<(), quic::ConnectionError> {
+        let peer_name = connection.peer_name().await?;
+        let settings = connection.settings().clone();
+        self.connections
+            .entry((peer_name, settings))
+            .or_insert(ReuseableConnection::with(connection));
+        Ok(())
     }
 }

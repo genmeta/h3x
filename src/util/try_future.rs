@@ -14,58 +14,71 @@ use crate::{
 
 pin_project_lite::pin_project! {
     /// A lazily opened stream.
-    #[project = FutureStreamProj]
-    #[project_ref = FutureStreamProjRef]
-    pub enum TryFutureStream<S, E, F> {
+    #[project = TryFutureProj]
+    #[project_ref = TryFutureProjRef]
+    pub enum TryFuture<T, E, F> {
         Future { #[pin] future: F },
-        Stream { #[pin] stream: S },
+        Stream { #[pin] stream: T },
         Error { error: E },
     }
 }
 
-impl<S, E, F: Future<Output = Result<S, E>>> From<F> for TryFutureStream<S, E, F> {
+impl<S, E, F: Future<Output = Result<S, E>>> From<F> for TryFuture<S, E, F> {
     fn from(future: F) -> Self {
-        TryFutureStream::Future { future }
+        TryFuture::Future { future }
     }
 }
 
-impl<S, E, F> TryFutureStream<S, E, F> {
-    fn poll_try_stream<'s>(
+impl<T, E, F> TryFuture<T, E, F> {
+    fn poll<'s>(
         mut self: Pin<&'s mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Pin<&'s mut S>, E>>
+    ) -> Poll<Result<Pin<&'s mut T>, E>>
     where
-        F: Future<Output = Result<S, E>>,
+        F: Future<Output = Result<T, E>>,
         E: Clone,
     {
         match self.as_mut().project() {
-            FutureStreamProj::Future { future, .. } => {
+            TryFutureProj::Future { future, .. } => {
                 match ready!(future.poll(cx)) {
-                    Ok(stream) => self.set(TryFutureStream::Stream { stream }),
-                    Err(error) => self.set(TryFutureStream::Error { error }),
+                    Ok(stream) => self.set(TryFuture::Stream { stream }),
+                    Err(error) => self.set(TryFuture::Error { error }),
                 };
-                self.poll_try_stream(cx)
+                self.poll(cx)
             }
-            FutureStreamProj::Stream { .. } | FutureStreamProj::Error { .. } => {
+            TryFutureProj::Stream { .. } | TryFutureProj::Error { .. } => {
                 // as_mut() returns short-lived Pin<&mut Self>, so we need to re-project without as_mut()
-                Poll::Ready(self.pin_stream_mut().unwrap())
+                Poll::Ready(self.try_peek_mut().unwrap())
             }
         }
     }
 
-    fn pin_stream_mut(self: Pin<&mut Self>) -> Option<Result<Pin<&mut S>, E>>
+    fn try_peek_mut(self: Pin<&mut Self>) -> Option<Result<Pin<&mut T>, E>>
     where
         E: Clone,
     {
         match self.project() {
-            FutureStreamProj::Future { .. } => None,
-            FutureStreamProj::Stream { stream } => Some(Ok(stream)),
-            FutureStreamProj::Error { error } => Some(Err(error.clone())),
+            TryFutureProj::Future { .. } => None,
+            TryFutureProj::Stream { stream } => Some(Ok(stream)),
+            TryFutureProj::Error { error } => Some(Err(error.clone())),
         }
     }
 }
 
-impl<S, E, F> GetStreamId for TryFutureStream<S, E, F>
+impl<T, E, F> Future for TryFuture<T, E, F>
+where
+    F: Future<Output = Result<T, E>>,
+    T: Clone,
+    E: Clone,
+{
+    type Output = Result<T, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        TryFuture::poll(self, cx).map(|result| result.map(|t| t.clone()))
+    }
+}
+
+impl<S, E, F> GetStreamId for TryFuture<S, E, F>
 where
     S: GetStreamId,
     E: Clone,
@@ -76,11 +89,11 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<Result<VarInt, quic::StreamError>> {
-        ready!(self.poll_try_stream(cx)?).poll_stream_id(cx)
+        ready!(self.poll(cx)?).poll_stream_id(cx)
     }
 }
 
-impl<S, E, F> StopStream for TryFutureStream<S, E, F>
+impl<S, E, F> StopStream for TryFuture<S, E, F>
 where
     S: StopStream,
     E: Clone,
@@ -92,11 +105,11 @@ where
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        ready!(self.poll_try_stream(cx)?).poll_stop(cx, code)
+        ready!(self.poll(cx)?).poll_stop(cx, code)
     }
 }
 
-impl<S, E, F> AsyncRead for TryFutureStream<S, E, F>
+impl<S, E, F> AsyncRead for TryFuture<S, E, F>
 where
     S: AsyncRead,
     E: Clone,
@@ -108,32 +121,32 @@ where
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        ready!(self.poll_try_stream(cx)?).poll_read(cx, buf)
+        ready!(self.poll(cx)?).poll_read(cx, buf)
     }
 }
 
-impl<S, E, F> AsyncBufRead for TryFutureStream<S, E, F>
+impl<R, E, F> AsyncBufRead for TryFuture<R, E, F>
 where
-    S: AsyncBufRead,
+    R: AsyncBufRead,
     E: Clone + Debug,
     io::Error: From<E>,
-    F: Future<Output = Result<S, E>>,
+    F: Future<Output = Result<R, E>>,
 {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
-        ready!(self.poll_try_stream(cx)?).poll_fill_buf(cx)
+        ready!(self.poll(cx)?).poll_fill_buf(cx)
     }
 
     fn consume(self: Pin<&mut Self>, amt: usize) {
-        self.pin_stream_mut()
+        self.try_peek_mut()
             .expect("consume before read")
             .expect("consume on error")
             .consume(amt);
     }
 }
 
-impl<S, E, F, T, SE> Stream for TryFutureStream<S, E, F>
+impl<S, E, F, Item, SE> Stream for TryFuture<S, E, F>
 where
-    S: Stream<Item = Result<T, SE>>,
+    S: Stream<Item = Result<Item, SE>>,
     E: Clone,
     SE: From<E>,
     F: Future<Output = Result<S, E>>,
@@ -141,7 +154,7 @@ where
     type Item = S::Item;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        ready!(self.poll_try_stream(cx)?).poll_next(cx)
+        ready!(self.poll(cx)?).poll_next(cx)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -149,7 +162,7 @@ where
     }
 }
 
-impl<S, E, F> CancelStream for TryFutureStream<S, E, F>
+impl<S, E, F> CancelStream for TryFuture<S, E, F>
 where
     S: CancelStream,
     E: Clone,
@@ -161,58 +174,58 @@ where
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        ready!(self.poll_try_stream(cx)?).poll_cancel(cx, code)
+        ready!(self.poll(cx)?).poll_cancel(cx, code)
     }
 }
 
-impl<S, E, F> AsyncWrite for TryFutureStream<S, E, F>
+impl<W, E, F> AsyncWrite for TryFuture<W, E, F>
 where
-    S: AsyncWrite,
+    W: AsyncWrite,
     E: Clone,
     io::Error: From<E>,
-    F: Future<Output = Result<S, E>>,
+    F: Future<Output = Result<W, E>>,
 {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        ready!(self.poll_try_stream(cx)?).poll_write(cx, buf)
+        ready!(self.poll(cx)?).poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        ready!(self.poll_try_stream(cx)?).poll_flush(cx)
+        ready!(self.poll(cx)?).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        ready!(self.poll_try_stream(cx)?).poll_shutdown(cx)
+        ready!(self.poll(cx)?).poll_shutdown(cx)
     }
 }
 
-impl<E, S, F, T> Sink<T> for TryFutureStream<S, E, F>
+impl<E, W, F, Item> Sink<Item> for TryFuture<W, E, F>
 where
-    S: Sink<T>,
+    W: Sink<Item>,
     E: Clone,
-    S::Error: From<E>,
-    F: Future<Output = Result<S, E>>,
+    W::Error: From<E>,
+    F: Future<Output = Result<W, E>>,
 {
-    type Error = S::Error;
+    type Error = W::Error;
 
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
-        ready!(self.poll_try_stream(cx)?).poll_ready(cx)
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), W::Error>> {
+        ready!(self.poll(cx)?).poll_ready(cx)
     }
 
-    fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), S::Error> {
-        self.pin_stream_mut()
+    fn start_send(self: Pin<&mut Self>, item: Item) -> Result<(), W::Error> {
+        self.try_peek_mut()
             .expect("start_send before poll_ready completed")?
             .start_send(item)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
-        ready!(self.poll_try_stream(cx)?).poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), W::Error>> {
+        ready!(self.poll(cx)?).poll_flush(cx)
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
-        ready!(self.poll_try_stream(cx)?).poll_close(cx)
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), W::Error>> {
+        ready!(self.poll(cx)?).poll_close(cx)
     }
 }

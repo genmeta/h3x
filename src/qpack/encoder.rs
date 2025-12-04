@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ops::DerefMut,
     pin::Pin,
+    sync::Arc,
 };
 
 use bytes::Bytes;
@@ -28,7 +29,7 @@ use crate::{
 
 #[derive(Debug)]
 pub struct EncoderState {
-    pub(crate) settings: Settings,
+    pub(crate) settings: Arc<Settings>,
     pub(crate) dynamic_table: DynamicTable,
     /// Multiple entries may have the same name. The encoder can choose to use the most appropriate one.
     // ∀ n: Bytes: entries[name_indices[n]].name == n
@@ -44,7 +45,7 @@ pub struct EncoderState {
 }
 
 impl EncoderState {
-    pub const fn new(settings: Settings) -> Self {
+    pub const fn new(settings: Arc<Settings>) -> Self {
         Self {
             settings,
             dynamic_table: DynamicTable::new(),
@@ -321,7 +322,7 @@ where
     Es: Sink<EncoderInstruction, Error = StreamError> + Unpin,
     Ds: Stream<Item = Result<DecoderInstruction, StreamError>> + Unpin,
 {
-    pub fn new(settings: Settings, encoder_stream: Es, decoder_stream: Ds) -> Self {
+    pub fn new(settings: Arc<Settings>, encoder_stream: Es, decoder_stream: Ds) -> Self {
         Self {
             state: AsyncMutex::new(EncoderState::new(settings)),
             encoder_stream: AsyncMutex::new(Feed::new(encoder_stream)),
@@ -329,7 +330,7 @@ where
         }
     }
 
-    pub async fn apply_settings(&self, settings: Settings) {
+    pub async fn apply_settings(&self, settings: Arc<Settings>) {
         self.state.lock().await.settings = settings;
     }
 

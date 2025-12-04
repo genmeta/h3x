@@ -1,91 +1,58 @@
-use std::{
-    ops::DerefMut,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::{ops::DerefMut, pin::Pin};
 
 use bytes::Bytes;
+use futures::future::BoxFuture;
 
 use crate::quic::ConnectionError;
 
-pub trait WithIdentity {
-    fn poll_cert(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Bytes, ConnectionError>>;
+pub trait WithLocalIdentity {
+    fn local_cert(self: Pin<&mut Self>) -> Result<Bytes, ConnectionError>;
 
-    fn poll_name(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<String, ConnectionError>>;
+    fn local_name(self: Pin<&mut Self>) -> Result<String, ConnectionError>;
 }
 
-impl<P: DerefMut<Target: WithIdentity>> WithIdentity for Pin<P> {
-    fn poll_cert(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Bytes, ConnectionError>> {
-        <P::Target as WithIdentity>::poll_cert(self.as_deref_mut(), cx)
+impl<P: DerefMut<Target: WithLocalIdentity>> WithLocalIdentity for Pin<P> {
+    fn local_cert(self: Pin<&mut Self>) -> Result<Bytes, ConnectionError> {
+        <P::Target as WithLocalIdentity>::local_cert(self.as_deref_mut())
     }
 
-    fn poll_name(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<String, ConnectionError>> {
-        <P::Target as WithIdentity>::poll_name(self.as_deref_mut(), cx)
-    }
-}
-
-impl<I: WithIdentity + Unpin + ?Sized> WithIdentity for &mut I {
-    fn poll_cert(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Bytes, ConnectionError>> {
-        I::poll_cert(Pin::new(self.get_mut()), cx)
-    }
-
-    fn poll_name(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<String, ConnectionError>> {
-        I::poll_name(Pin::new(self.get_mut()), cx)
+    fn local_name(self: Pin<&mut Self>) -> Result<String, ConnectionError> {
+        <P::Target as WithLocalIdentity>::local_name(self.as_deref_mut())
     }
 }
 
-pin_project_lite::pin_project! {
-    pub struct Cert<I: ?Sized> {
-        #[pin]
-        with_identity: I,
+impl<I: WithLocalIdentity + Unpin + ?Sized> WithLocalIdentity for &mut I {
+    fn local_cert(self: Pin<&mut Self>) -> Result<Bytes, ConnectionError> {
+        I::local_cert(Pin::new(self.get_mut()))
+    }
+
+    fn local_name(self: Pin<&mut Self>) -> Result<String, ConnectionError> {
+        I::local_name(Pin::new(self.get_mut()))
     }
 }
 
-impl<I: WithIdentity + ?Sized> Future for Cert<I> {
-    type Output = Result<Bytes, ConnectionError>;
+pub trait WithPeerIdentity {
+    fn peer_cert(self: Pin<&mut Self>) -> BoxFuture<'static, Result<Bytes, ConnectionError>>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
-        self.project().with_identity.poll_cert(cx)
+    fn peer_name(self: Pin<&mut Self>) -> BoxFuture<'static, Result<String, ConnectionError>>;
+}
+
+impl<P: DerefMut<Target: WithPeerIdentity>> WithPeerIdentity for Pin<P> {
+    fn peer_cert(self: Pin<&mut Self>) -> BoxFuture<'static, Result<Bytes, ConnectionError>> {
+        <P::Target as WithPeerIdentity>::peer_cert(self.as_deref_mut())
+    }
+
+    fn peer_name(self: Pin<&mut Self>) -> BoxFuture<'static, Result<String, ConnectionError>> {
+        <P::Target as WithPeerIdentity>::peer_name(self.as_deref_mut())
     }
 }
 
-pin_project_lite::pin_project! {
-    pub struct Name<I: ?Sized> {
-        #[pin]
-        with_identity: I,
-    }
-}
-
-impl<I: WithIdentity + ?Sized> Future for Name<I> {
-    type Output = Result<String, ConnectionError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
-        self.project().with_identity.poll_name(cx)
-    }
-}
-
-fn assert_future<Output, F: Future<Output = Output>>(f: F) -> F {
-    f
-}
-
-pub trait WithIdentityExt: WithIdentity {
-    fn cert(&mut self) -> Cert<&mut Self>
-    where
-        Self: Unpin,
-    {
-        assert_future::<Result<Bytes, ConnectionError>, _>(Cert {
-            with_identity: self,
-        })
+impl<I: WithPeerIdentity + Unpin + ?Sized> WithPeerIdentity for &mut I {
+    fn peer_cert(self: Pin<&mut Self>) -> BoxFuture<'static, Result<Bytes, ConnectionError>> {
+        I::peer_cert(Pin::new(self.get_mut()))
     }
 
-    fn name(&mut self) -> Name<&mut Self>
-    where
-        Self: Unpin,
-    {
-        assert_future::<Result<String, ConnectionError>, _>(Name {
-            with_identity: self,
-        })
+    fn peer_name(self: Pin<&mut Self>) -> BoxFuture<'static, Result<String, ConnectionError>> {
+        I::peer_name(Pin::new(self.get_mut()))
     }
 }
-
-impl<I: WithIdentity + ?Sized> WithIdentityExt for I {}

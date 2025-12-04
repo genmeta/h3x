@@ -3,77 +3,65 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::task::JoinSet;
 
 use crate::{
-    connection::Connection,
-    endpoint::{
-        pool::{AcceptError, Pool},
-        server::entity::UnresolvedRequest,
-    },
-    quic::{self},
+    connection::{Connection, settings::Settings},
+    endpoint::{pool::Pool, server::entity::UnresolvedRequest},
+    quic,
 };
 
 mod entity;
 mod route;
+mod service;
 
-pub struct Server<L: quic::Listen> {
+#[derive(Debug, Clone)]
+pub struct Servers<L: quic::Listen> {
+    pool: Pool<L::Connection>,
     acceptor: L,
-    pool: Arc<Pool<L::Connection>>,
+    settings: Arc<Settings>,
     router: HashMap<String, route::Router>,
 }
 
-impl<L: quic::Listen> Server<L> {
-    pub fn new(acceptor: L, pool: Arc<Pool<L::Connection>>) -> Self {
+#[bon::bon]
+impl<L: quic::Listen> Servers<L> {
+    #[builder]
+    pub fn new(
+        #[builder(default)] pool: Pool<L::Connection>,
+        acceptor: L,
+        #[builder(default)] settings: Arc<Settings>,
+    ) -> Self {
         Self {
-            acceptor,
             pool,
+            acceptor,
+            settings,
             router: HashMap::new(),
         }
     }
 
-    pub fn register(&mut self, domain: impl Into<String>, router: route::Router) -> &mut Self {
+    pub fn serve(mut self, domain: impl Into<String>, router: route::Router) -> Self {
         self.router.insert(domain.into(), router);
         self
     }
 
-    pub async fn run(&self) -> Result<(), L::Error>
-    where
-        L::Connection: Send + 'static,
-        <L::Connection as quic::ManageStream>::StreamReader: Send,
-        <L::Connection as quic::ManageStream>::StreamWriter: Send,
-    {
-        struct AbortAllOnDropSet<T: 'static>(JoinSet<T>);
-
-        impl<T: 'static> Default for AbortAllOnDropSet<T> {
-            fn default() -> Self {
-                Self(JoinSet::new())
-            }
-        }
-
-        impl<T: 'static> std::ops::Deref for AbortAllOnDropSet<T> {
-            type Target = JoinSet<T>;
-
-            fn deref(&self) -> &Self::Target {
-                &self.0
-            }
-        }
-
-        impl<T: 'static> std::ops::DerefMut for AbortAllOnDropSet<T> {
-            fn deref_mut(&mut self) -> &mut Self::Target {
-                &mut self.0
-            }
-        }
-
-        impl<T: 'static> Drop for AbortAllOnDropSet<T> {
-            fn drop(&mut self) {
-                self.0.abort_all();
-            }
-        }
-
-        let mut tasks = AbortAllOnDropSet::default();
+    pub async fn run(&self) -> L::Error {
+        let mut tasks = JoinSet::default();
         let router = Arc::new(self.router.clone());
 
-        let mut spawn_route_task = |connection: Arc<Connection<_>>, connected_server: String| {
+        loop {
+            let connection = match self.acceptor.accept().await {
+                Ok(connection) => connection,
+                Err(error) => break error,
+            };
+
+            let settings = self.settings.clone();
             let router = router.clone();
             tasks.spawn(async move {
+                let Ok(connection) = Connection::new(settings, connection).await else {
+                    // failed to initial h3 connection
+                    return;
+                };
+                let Ok(connected_server) = connection.local_name() else {
+                    // connection already closed
+                    return;
+                };
                 let Some(router) = router.get(&connected_server) else {
                     todo!("fallback: connected server not exist");
                 };
@@ -83,16 +71,6 @@ impl<L: quic::Listen> Server<L> {
                     router.handle(req, rsp).await;
                 }
             });
-        };
-
-        loop {
-            match self.pool.accept_one(&self.acceptor).await {
-                Ok((connection, connected_server)) => {
-                    spawn_route_task(connection, connected_server)
-                }
-                Err(AcceptError::QuicConnect { source }) => return Err(source),
-                Err(_) => { /* Ignore other errors  */ }
-            }
         }
     }
 }
