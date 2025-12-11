@@ -4,10 +4,10 @@ use bytes::{Buf, Bytes};
 use futures::{Stream, stream};
 use http::{
     HeaderMap, HeaderValue, Method, Uri,
-    header::{IntoHeaderName, InvalidHeaderValue},
+    header::{AsHeaderName, IntoHeaderName, InvalidHeaderValue},
     uri::{Authority, PathAndQuery, Scheme},
 };
-use snafu::Snafu;
+use snafu::{Report, Snafu};
 use tokio::io::AsyncBufRead;
 
 use crate::{
@@ -17,6 +17,7 @@ use crate::{
         Entity, EntityStage, IllegalEntityOperator,
         stream::{ReadStream, StreamError, WriteStream},
     },
+    qpack::field_section::FieldSection,
     quic,
     varint::VarInt,
 };
@@ -120,10 +121,12 @@ where
     <C::Connection as quic::ManageStream>::StreamReader: Send,
     <C::Connection as quic::ManageStream>::StreamWriter: Send,
 {
+    #[tracing::instrument(level = "debug", target = "h3x::client", name = "do_request", skip_all)]
     pub async fn r#do(
         mut self,
         method: Method,
     ) -> Result<(Request, Response), RequestError<C::Error>> {
+        tracing::debug!(request_header = ?self.request.header());
         self.request.header_mut().set_method(method);
 
         let authority = self
@@ -131,15 +134,17 @@ where
             .header()
             .authority()
             .expect("TODO: validate reqeust pseudo headers");
-        let host = authority.host();
-        let connection = self.client.connect(host).await?;
+
+        tracing::debug!(%authority, "Connect, once?");
+        let connection = self.client.connect(authority.clone()).await?;
+        tracing::debug!(%authority, "Connected");
 
         let (read_stream, write_stream) = connection
             .open_request_stream()
             .await
             .map_err(StreamError::from)?;
 
-        let mut response = Response {
+        let response = Response {
             entity: Entity::unresolved_response(),
             stream: read_stream,
         };
@@ -149,24 +154,9 @@ where
             stream: write_stream,
         };
 
-        let do_request = async {
-            request.stream.send_header(&mut request.entity).await?;
-            // non-streaming body: application called `set_body`
-            if !request.entity.is_streaming() {
-                request
-                    .stream
-                    .send_chunked_body(&mut request.entity)
-                    .await?
-            }
-            Ok::<_, StreamError>(())
-        };
+        request.stream.send_header(&mut request.entity).await?;
+        tracing::debug!("Request header sent");
 
-        let read_response_header = async {
-            response.stream.read_header(&mut response.entity).await?;
-            Ok::<_, StreamError>(())
-        };
-
-        tokio::try_join!(do_request, read_response_header,)?;
         debug_assert!(response.entity.is_response(), "Checked in read_header");
 
         Ok((request, response))
@@ -273,10 +263,18 @@ impl Drop for Request {
     fn drop(&mut self) {
         if !self.entity.is_complete() {
             // Its ok to take: Request will not be used after drop
-            let stream = self.stream.take();
-            let entity = mem::replace(&mut self.entity, Entity::unresolved_request());
-            let mut request = Request { entity, stream };
-            tokio::spawn(async move { request.close().await });
+            let mut stream = self.stream.take();
+            let mut entity = mem::replace(&mut self.entity, Entity::unresolved_request());
+            tokio::spawn(async move {
+                if let Err(StreamError::IllegalEntityOperator { source }) =
+                    stream.close(&mut entity).await
+                {
+                    tracing::warn!(
+                        target: "h3x::client",
+                        "Request stream cannot be closed properly: {}", Report::from_error(source)
+                    );
+                }
+            });
         }
     }
 }
@@ -297,8 +295,27 @@ impl Response {
         Ok(self)
     }
 
-    pub fn status(&self) -> http::StatusCode {
-        self.entity.header().status()
+    async fn entity_header(&mut self) -> Result<&FieldSection, StreamError> {
+        if self.entity.is_complete() {
+            return Ok(self.entity.header());
+        }
+        self.stream.read_header(&mut self.entity).await?;
+        Ok(self.entity.header())
+    }
+
+    pub async fn status(&mut self) -> Result<http::StatusCode, StreamError> {
+        Ok(self.entity_header().await?.status())
+    }
+
+    pub async fn headers(&mut self) -> Result<&HeaderMap, StreamError> {
+        Ok(&self.entity_header().await?.header_map)
+    }
+
+    pub async fn header(
+        &mut self,
+        name: impl AsHeaderName,
+    ) -> Result<Option<&HeaderValue>, StreamError> {
+        Ok(self.headers().await?.get(name))
     }
 
     pub async fn read_all(&mut self) -> Result<impl Buf, StreamError> {

@@ -8,7 +8,7 @@ use std::{
 use bytes::{Buf, Bytes};
 use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt, future};
 use http::HeaderMap;
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 
 use super::Body;
 use crate::{
@@ -18,12 +18,12 @@ use crate::{
         self, ConnectionGoaway, ConnectionState, InitialRequestStreamError, QPackDecoder,
         QPackEncoder,
     },
-    entity::{Entity, EntityStage, IllegalEntityOperator},
+    entity::{Entity, EntityStage, IllegalEntityOperator, SendMalformedPseudoHeaderSnafu},
     error::Code,
     frame::{Frame, stream::FrameStream},
     qpack::{
         algorithm::{HuffmanAlways, StaticCompressAlgo},
-        field_section::FieldSection,
+        field_section::{FieldSection, MalformedHeaderSection},
     },
     quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
     varint::VarInt,
@@ -35,19 +35,19 @@ impl Sink<Bytes> for MockStream {
     type Error = quic::StreamError;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        unreachable!()
+        panic!("Stream used after dropped");
     }
 
     fn start_send(self: Pin<&mut Self>, _: Bytes) -> Result<(), Self::Error> {
-        unreachable!()
+        panic!("Stream used after dropped");
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        unreachable!()
+        panic!("Stream used after dropped");
     }
 
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        unreachable!()
+        panic!("Stream used after dropped");
     }
 }
 
@@ -55,7 +55,7 @@ impl Stream for MockStream {
     type Item = Result<Bytes, quic::StreamError>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        unreachable!()
+        panic!("Stream used after dropped");
     }
 }
 
@@ -65,7 +65,7 @@ impl quic::CancelStream for MockStream {
         _cx: &mut Context,
         _code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        unreachable!()
+        panic!("Stream used after dropped");
     }
 }
 
@@ -75,7 +75,7 @@ impl quic::StopStream for MockStream {
         _cx: &mut Context,
         _code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        unreachable!()
+        panic!("Stream used after dropped");
     }
 }
 
@@ -84,7 +84,7 @@ impl quic::GetStreamId for MockStream {
         self: Pin<&mut Self>,
         _cx: &mut Context,
     ) -> Poll<Result<VarInt, quic::StreamError>> {
-        unreachable!()
+        panic!("Stream used after dropped");
     }
 }
 
@@ -128,20 +128,20 @@ impl From<StreamError> for io::Error {
 
 pub struct ReadStream {
     stream: FrameStream<Pin<Box<dyn quic::ReadStream + Send>>>,
-    decoder: Arc<QPackDecoder>,
-    connection: Arc<ConnectionState<dyn quic::Close + Unpin + Send>>,
+    qpack_decoder: Arc<QPackDecoder>,
+    connection: Arc<ConnectionState<dyn quic::Close + Send + Sync>>,
 }
 
 impl ReadStream {
     pub fn new(
         stream: Pin<Box<dyn quic::ReadStream + Send>>,
-        decoder: Arc<QPackDecoder>,
-        connection: Arc<ConnectionState<dyn quic::Close + Unpin + Send>>,
+        qpack_decoder: Arc<QPackDecoder>,
+        connection: Arc<ConnectionState<dyn quic::Close + Send + Sync>>,
     ) -> Self {
-        let stream = FrameStream::new(StreamReader::new(stream));
+        let frame_stream = FrameStream::new(StreamReader::new(stream));
         Self {
-            stream,
-            decoder,
+            stream: frame_stream,
+            qpack_decoder,
             connection,
         }
     }
@@ -167,7 +167,7 @@ impl ReadStream {
             })
         });
 
-        // TODO: Is there any better way to move ownership of the stream.
+        // TODO: Is there any better way to move ownership of the stream than async block?.
         Ok(async move { pin!(peer_goaway).fuse().select_next_some().await })
     }
 
@@ -205,25 +205,40 @@ impl ReadStream {
         }
 
         entity.header = self
-            .try_io(async move |this| {
+            .try_io(async |this| {
                 let frame = match this.stream.next_unreserved_frame().await.transpose()? {
                     Some(frame) if frame.r#type() != Frame::HEADERS_FRAME_TYPE => {
                         return Err(Code::H3_FRAME_UNEXPECTED.into());
                     }
                     Some(frame) => frame,
-                    None => {
-                        let error = Code::H3_MESSAGE_ERROR.into();
-                        return Err(this.connection.handle_error(error).await.into());
-                    }
+                    None => return Err(Code::H3_MESSAGE_ERROR.into()),
                 };
-                this.decoder.decode(frame).await
+                let header = this.qpack_decoder.decode(frame).await?;
+
+                this.stream.consume_current_frame().await?;
+                debug_assert!(this.stream.frame().is_none());
+
+                header.check_pseudo()?;
+                if entity.header.is_request_header() {
+                    if !header.is_request_header() {
+                        return Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders.into());
+                    }
+                } else {
+                    debug_assert!(entity.header.is_response_header());
+                    if !header.is_response_header() {
+                        return Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders.into());
+                    }
+                }
+                Ok(header)
             })
             .await?;
 
+        // check header complete/valid
+
         if entity.is_interim_response() {
-            entity.stage = EntityStage::Header
+            entity.stage = EntityStage::Header;
         } else {
-            entity.stage = EntityStage::Body
+            entity.stage = EntityStage::Body;
         }
         Ok(&entity.header)
     }
@@ -231,7 +246,7 @@ impl ReadStream {
     async fn read_next_body(&mut self, entity: &mut Entity) -> Option<Result<Bytes, StreamError>> {
         match entity.stage {
             EntityStage::Header => {
-                while entity.is_interim_response() {
+                while entity.stage == EntityStage::Header {
                     match self.read_header(entity).await {
                         Ok(..) => (),
                         Err(error) => return Some(Err(error)),
@@ -242,20 +257,31 @@ impl ReadStream {
             EntityStage::Body => {}
             EntityStage::Trailer | EntityStage::Complete => {
                 match &mut entity.body {
-                    Body::Streaming => return None,
-                    Body::Chunked(cursor) => {
-                        if cursor.has_remaining() {
-                            return Some(Ok(cursor.copy_to_bytes(cursor.chunk().len())));
+                    Body::Streaming { .. } => return None,
+                    Body::Chunked { buflist } => {
+                        if buflist.has_remaining() {
+                            return Some(Ok(buflist.copy_to_bytes(buflist.chunk().len())));
                         }
                     }
                 };
             }
         }
 
-        self.try_io(async move |this| {
+        let try_read_next_body = self.try_io(async |this| {
             loop {
                 match this.stream.frame().transpose()? {
+                    None => match this.stream.next_unreserved_frame().await.transpose()? {
+                        Some(_next_frame) => continue,
+                        None => {
+                            debug_assert!(this.stream.frame().is_none());
+                            entity.stage = EntityStage::Complete;
+                            return Ok(None);
+                        }
+                    },
                     Some(frame) if frame.r#type() == Frame::HEADERS_FRAME_TYPE => {
+                        debug_assert!(this.stream.frame().is_some_and(|frame| {
+                            frame.is_ok_and(|frame| frame.r#type() == Frame::HEADERS_FRAME_TYPE)
+                        }));
                         entity.stage = EntityStage::Trailer;
                         return Ok(None);
                     }
@@ -265,24 +291,25 @@ impl ReadStream {
                     Some(mut frame) => match frame.try_next().await {
                         Ok(Some(bytes)) => return Ok(Some(bytes)),
                         Ok(None) => {
-                            this.stream.decode_next_unreserved_frame().await;
+                            this.stream.consume_current_frame().await?;
+                            debug_assert!(this.stream.frame().is_none());
                             continue;
                         }
                         Err(error) => {
-                            return Err(error.map_decode_error(|error| {
-                                Code::H3_FRAME_ERROR.with(error).into()
-                            }));
+                            let error = error
+                                .map_decode_error(|error| Code::H3_FRAME_ERROR.with(error).into());
+                            return Err(error);
                         }
                     },
-                    None => {
-                        entity.stage = EntityStage::Complete;
-                        return Ok(None);
-                    }
                 };
             }
-        })
-        .await
-        .transpose()
+        });
+
+        match try_read_next_body.await {
+            Ok(Some(bytes)) => Some(Ok(bytes)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        }
     }
 
     pub async fn read_all<'e>(
@@ -339,36 +366,39 @@ impl ReadStream {
         }
 
         match &mut entity.body {
-            Body::Streaming => {
+            Body::Streaming { .. } => {
                 let mut buflist = BufList::new();
-                loop {
-                    let Some(next) = self.read_next_body(entity).await else {
-                        break;
-                    };
-                    buflist.write(next?);
+                while let Some(body_part) = self.read_next_body(entity).await.transpose()? {
+                    buflist.write(body_part);
                 }
                 Ok(Buffer::Owned(buflist))
             }
-            Body::Chunked(..) => {
-                loop {
-                    let Some(next) = self.read_next_body(entity).await else {
-                        break;
-                    };
-                    entity.chunked_body().expect("Check above").write(next?);
+            Body::Chunked { .. } => {
+                while let Some(body_part) = self.read_next_body(entity).await.transpose()? {
+                    entity.chunked_body().expect("Checked").write(body_part);
                 }
-                Ok(Buffer::Borrow(entity.chunked_body().expect("Check above")))
+                Ok(Buffer::Borrow(entity.chunked_body().expect("Checked")))
             }
         }
     }
 
     pub async fn read(&mut self, entity: &mut Entity) -> Option<Result<Bytes, StreamError>> {
-        match &entity.body {
-            Body::Streaming => self.read_next_body(entity).await,
-            Body::Chunked(..) => match self.read_all(entity).await {
-                Ok(body) if !body.has_remaining() => None,
-                Ok(mut body) => Some(Ok(body.copy_to_bytes(body.chunk().len()))),
-                Err(error) => Some(Err(error)),
-            },
+        loop {
+            match &mut entity.body {
+                Body::Streaming { .. } => return self.read_next_body(entity).await,
+                Body::Chunked { buflist } => {
+                    if buflist.has_remaining() {
+                        return Some(Ok(buflist.copy_to_bytes(buflist.chunk().len())));
+                    }
+                    match self.read_next_body(entity).await? {
+                        Ok(body_part) => {
+                            entity.chunked_body().expect("Checked").write(body_part);
+                            continue;
+                        }
+                        Err(error) => return Some(Err(error)),
+                    }
+                }
+            }
         }
     }
 
@@ -378,17 +408,17 @@ impl ReadStream {
     ) -> Result<&'e HeaderMap, StreamError> {
         match entity.stage {
             EntityStage::Header | EntityStage::Body => {
-                // consume the full body
-                if entity.is_streaming() {
-                    // read and discard body
-                    while let Some(next) = self.read_next_body(entity).await {
-                        next?;
+                match &entity.body {
+                    Body::Streaming { .. } => {
+                        // read and discard body
+                        while let Some(_body_part) =
+                            self.read_next_body(entity).await.transpose()?
+                        {}
                     }
-                } else {
-                    // read and buffer body
-                    self.read_all(entity).await?;
+                    Body::Chunked { .. } => {
+                        self.read_all(entity).await?;
+                    }
                 }
-                debug_assert_eq!(entity.stage, EntityStage::Trailer);
             }
             EntityStage::Trailer => {}
             EntityStage::Complete => return Ok(entity.trailers()),
@@ -396,22 +426,25 @@ impl ReadStream {
 
         entity.trailer = self
             .try_io(async |this| {
-                let frame = match this.stream.next_unreserved_frame().await.transpose()? {
+                let frame = match this.stream.frame().transpose()? {
                     Some(frame) if frame.r#type() != Frame::HEADERS_FRAME_TYPE => {
                         return Err(Code::H3_FRAME_UNEXPECTED.into());
                     }
                     Some(frame) => frame,
-                    None => return Err(Code::H3_MESSAGE_ERROR.into()),
+                    // no trailer
+                    None => return Ok(FieldSection::trailer(HeaderMap::new())),
                 };
 
-                if entity.is_interim_response() {
-                    return Err(Code::H3_FRAME_UNEXPECTED.into());
+                let trailer = this.qpack_decoder.decode(frame).await?;
+                if !trailer.is_trailer() {
+                    return Err(MalformedHeaderSection::PseudoHeadersInTrailer.into());
                 }
-
-                this.decoder.decode(frame).await
+                this.stream.consume_current_frame().await?;
+                Ok(trailer)
             })
             .await?;
 
+        debug_assert!(self.stream.frame().is_none());
         entity.stage = EntityStage::Complete;
 
         Ok(entity.trailers())
@@ -425,7 +458,7 @@ impl ReadStream {
         let mock_stream = FrameStream::new(StreamReader::new(Box::pin(MockStream) as Pin<Box<_>>));
         Self {
             stream: mem::replace(&mut self.stream, mock_stream),
-            decoder: self.decoder.clone(),
+            qpack_decoder: self.qpack_decoder.clone(),
             connection: self.connection.clone(),
         }
     }
@@ -443,8 +476,8 @@ impl quic::StopStream for ReadStream {
 
 pub struct WriteStream {
     stream: SinkWriter<Pin<Box<dyn quic::WriteStream + Send>>>,
-    encoder: Arc<QPackEncoder>,
-    connection: Arc<ConnectionState<dyn quic::Close + Unpin + Send>>,
+    qpack_encoder: Arc<QPackEncoder>,
+    connection: Arc<ConnectionState<dyn quic::Close + Send + Sync>>,
 }
 
 const DEFAULT_COMPRESS_ALGO: StaticCompressAlgo<HuffmanAlways> =
@@ -453,13 +486,13 @@ const DEFAULT_COMPRESS_ALGO: StaticCompressAlgo<HuffmanAlways> =
 impl WriteStream {
     pub fn new(
         stream: Pin<Box<dyn quic::WriteStream + Send>>,
-        encoder: Arc<QPackEncoder>,
-        connection: Arc<ConnectionState<dyn quic::Close + Unpin + Send>>,
+        qpack_encoder: Arc<QPackEncoder>,
+        connection: Arc<ConnectionState<dyn quic::Close + Send + Sync>>,
     ) -> Self {
         let stream = SinkWriter::new(stream);
         Self {
             stream,
-            encoder,
+            qpack_encoder,
             connection,
         }
     }
@@ -489,7 +522,7 @@ impl WriteStream {
             })
         });
 
-        // TODO: Is there any better way to move ownership of the stream.
+        // TODO: Is there any better way to move ownership of the stream than async block?.
         Ok(async move { pin!(peer_goaway).fuse().select_next_some().await })
     }
 
@@ -521,15 +554,16 @@ impl WriteStream {
             EntityStage::Body | EntityStage::Trailer | EntityStage::Complete => return Ok(()),
         }
 
-        if !entity.is_header_complete() {
-            return Err(IllegalEntityOperator::SendIncompleteHeader.into());
-        }
+        entity
+            .header
+            .check_pseudo()
+            .context(SendMalformedPseudoHeaderSnafu)?;
 
         let field_lines = entity.header.iter();
         let algo = &DEFAULT_COMPRESS_ALGO;
         self.try_io(async move |this| {
             let stream = &mut this.stream;
-            let frame = this.encoder.encode(field_lines, algo, stream).await?;
+            let frame = this.qpack_encoder.encode(field_lines, algo, stream).await?;
             this.send_frame(frame).await?;
             Ok(())
         })
@@ -591,12 +625,12 @@ impl WriteStream {
             }
         }
 
-        let Body::Chunked(content) = &mut entity.body else {
+        let Body::Chunked { buflist } = &mut entity.body else {
             return Err(IllegalEntityOperator::ModifyBodyAfterSent.into());
         };
 
-        while content.has_remaining() {
-            let bytes = content.copy_to_bytes(content.chunk().len());
+        while buflist.has_remaining() {
+            let bytes = buflist.copy_to_bytes(buflist.chunk().len());
             let frame = Frame::new(Frame::DATA_FRAME_TYPE, bytes)
                 .map_err(|_| IllegalEntityOperator::DataFramePayloadTooLarge)?;
             self.try_io(async |this| Ok(this.send_frame(frame).await?))
@@ -614,7 +648,7 @@ impl WriteStream {
         // prepare
         match entity.stage {
             EntityStage::Header | EntityStage::Body => {
-                if matches!(entity.body, Body::Chunked(..)) {
+                if entity.is_chunked() {
                     self.send_chunked_body(entity).await?;
                     debug_assert_eq!(entity.stage, EntityStage::Trailer);
                 } else {
@@ -632,7 +666,7 @@ impl WriteStream {
         let algo = &DEFAULT_COMPRESS_ALGO;
         self.try_io(async move |this| {
             let stream = &mut this.stream;
-            let frame = this.encoder.encode(field_lines, algo, stream).await?;
+            let frame = this.qpack_encoder.encode(field_lines, algo, stream).await?;
             this.send_frame(frame).await?;
             Ok(())
         })
@@ -645,13 +679,12 @@ impl WriteStream {
     async fn send_pending_sections(&mut self, entity: &mut Entity) -> Result<(), StreamError> {
         match entity.stage {
             EntityStage::Header | EntityStage::Body => {
-                if matches!(entity.body, Body::Chunked(..)) {
+                if entity.is_chunked() {
                     self.send_chunked_body(entity).await?;
                     debug_assert_eq!(entity.stage, EntityStage::Trailer);
                 } else {
                     self.send_header(entity).await?;
                     debug_assert_eq!(entity.stage, EntityStage::Body);
-                    // no body or streaming body already sent
                 }
             }
             EntityStage::Trailer => {
@@ -675,9 +708,6 @@ impl WriteStream {
     }
 
     pub async fn close(&mut self, entity: &mut Entity) -> Result<(), StreamError> {
-        if entity.is_interim_response() {
-            return Err(IllegalEntityOperator::MissingFinalResponse.into());
-        }
         self.send_pending_sections(entity).await?;
         self.try_io(async move |this| Ok(this.stream.close().await?))
             .await?;
@@ -693,7 +723,7 @@ impl WriteStream {
         let mock_stream = SinkWriter::new(Box::pin(MockStream) as Pin<Box<_>>);
         Self {
             stream: mem::replace(&mut self.stream, mock_stream),
-            encoder: self.encoder.clone(),
+            qpack_encoder: self.qpack_encoder.clone(),
             connection: self.connection.clone(),
         }
     }

@@ -4,7 +4,7 @@ use http::StatusCode;
 
 use crate::endpoint::server::{
     entity::{Request, Response},
-    service::{BoxService, BoxServiceFuture, Service, box_service},
+    service::{BoxService, BoxServiceFuture, IntoBoxService, Service, box_service},
 };
 
 async fn default_fallback(_request: Request, mut response: Response) {
@@ -27,12 +27,9 @@ impl Default for RouterInner {
 }
 
 impl RouterInner {
-    fn register<H>(&mut self, path: &str, handler: H)
-    where
-        H: Service<Future: Send + 'static> + Clone + Send + Sync + 'static,
-    {
+    fn route(&mut self, path: &str, service: impl IntoBoxService) {
         self.router
-            .insert(path, box_service(handler))
+            .insert(path, service.into_box_service())
             .expect("Failed to register route");
     }
 
@@ -54,6 +51,10 @@ pub struct Router {
 }
 
 impl Router {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     fn inner_ref(&self) -> &RouterInner {
         &self.inner
     }
@@ -62,11 +63,13 @@ impl Router {
         Arc::make_mut(&mut self.inner)
     }
 
-    pub fn register<H>(mut self, path: &str, handler: H) -> Self
-    where
-        H: Service<Future: Send + 'static> + Clone + Send + Sync + 'static,
-    {
-        self.inner_mut().register(path, handler);
+    pub fn route(mut self, path: &str, service: impl IntoBoxService) -> Self {
+        self.inner_mut().route(path, service.into_box_service());
+        self
+    }
+
+    pub fn fallback(mut self, service: impl IntoBoxService) -> Self {
+        self.inner_mut().fallback = service.into_box_service();
         self
     }
 

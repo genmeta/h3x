@@ -288,6 +288,9 @@ impl Buf for Cursor {
     }
 
     fn copy_to_bytes(&mut self, len: usize) -> Bytes {
+        if len == 0 {
+            return Bytes::new();
+        }
         assert!(
             self.remaining() >= len,
             "copy_to_bytes beyond buffer length"

@@ -1,5 +1,3 @@
-mod client;
-mod pool;
-mod server;
-
-pub struct Endpoint {}
+pub mod client;
+pub mod pool;
+pub mod server;

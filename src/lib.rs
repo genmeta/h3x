@@ -1,3 +1,4 @@
+pub mod agent;
 mod buflist;
 mod codec;
 pub mod connection;

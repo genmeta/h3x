@@ -108,12 +108,8 @@ impl From<quic::ConnectionError> for DecodeStreamError {
 
 impl From<io::Error> for DecodeStreamError {
     fn from(source: io::Error) -> Self {
-        let source = match source.downcast::<quic::ConnectionError>() {
-            Ok(error) => {
-                return DecodeStreamError::Stream {
-                    source: error.into(),
-                };
-            }
+        let source = match source.downcast::<DecodeStreamError>() {
+            Ok(error) => return error,
             Err(source) => source,
         };
         let source = match source.downcast::<quic::StreamError>() {
@@ -124,9 +120,12 @@ impl From<io::Error> for DecodeStreamError {
             Ok(error) => return DecodeStreamError::Decode { source: error },
             Err(source) => source,
         };
-
-        let source = match source.downcast::<DecodeStreamError>() {
-            Ok(error) => return error,
+        let source = match source.downcast::<quic::ConnectionError>() {
+            Ok(error) => {
+                return DecodeStreamError::Stream {
+                    source: error.into(),
+                };
+            }
             Err(source) => source,
         };
         if source.kind() == io::ErrorKind::UnexpectedEof {

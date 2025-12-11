@@ -240,11 +240,7 @@ impl<P: AsyncRead + ?Sized> AsyncRead for Frame<P> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        self.project().payload.poll_read(cx, buf).map_err(|error| {
-            DecodeStreamError::from(error)
-                .map_decode_error(|decode_error| Code::H3_FRAME_ERROR.with(decode_error).into())
-                .into()
-        })
+        self.project().payload.poll_read(cx, buf)
     }
 }
 

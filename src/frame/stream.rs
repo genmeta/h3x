@@ -1,4 +1,5 @@
 use std::{
+    io,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -40,7 +41,11 @@ where
         }
     }
 
-    fn stream(&mut self) -> &mut StreamReader<S> {
+    pub fn stream(&self) -> &StreamReader<S> {
+        self.stream.stream()
+    }
+
+    fn stream_mut(&mut self) -> &mut StreamReader<S> {
         self.stream.stream_mut()
     }
 
@@ -57,10 +62,7 @@ where
         }
     }
 
-    pub async fn decode_next_frame(&mut self)
-    where
-        S: Unpin,
-    {
+    pub async fn consume_current_frame(&mut self) -> Result<(), StreamError> {
         let map_decode_stream_error = |error: DecodeStreamError| {
             error.map_decode_error(|decode_error| Code::H3_FRAME_ERROR.with(decode_error).into())
         };
@@ -69,50 +71,55 @@ where
             Some(Ok(mut frame)) => {
                 let mut drain = sink::drain().sink_map_err(|never| match never {});
                 let result = (&mut frame).forward(&mut drain).await;
-                if let Err(error) = result {
-                    self.frame = Some(Err(map_decode_stream_error(error)));
-                    return;
+                if let Err(error) = result.map_err(map_decode_stream_error) {
+                    self.frame = Some(Err(error.clone()));
+                    return Err(error);
                 }
+                self.frame = None;
+                Ok(())
             }
-            Some(Err(..)) => return,
-            None => {}
+            Some(Err(error)) => Err(error.clone()),
+            None => Ok(()),
         }
+    }
 
-        match Pin::new(self.stream()).has_remaining().await {
-            Ok(has_remaining) => {
-                if !has_remaining {
-                    self.frame = None;
-                    return;
-                }
+    pub async fn decode_next_frame(&mut self)
+    where
+        S: Unpin,
+    {
+        let try_decode_next_frame = async {
+            self.consume_current_frame().await?;
+            if !Pin::new(self.stream_mut()).has_remaining().await? {
+                return Ok(None);
+            }
+
+            let convert_decode_varint_error = |error: io::Error| {
+                DecodeStreamError::from(error)
+                    .map_decode_error(|decode_error| Code::H3_FRAME_ERROR.with(decode_error).into())
+            };
+            let r#type = (self.stream_mut().decode_one::<VarInt>().await)
+                .map_err(convert_decode_varint_error)?;
+            let length = (self.stream_mut().decode_one::<VarInt>().await)
+                .map_err(convert_decode_varint_error)?;
+            Ok(Some(Frame {
+                r#type,
+                length,
+                payload: (),
+            }))
+        };
+
+        match try_decode_next_frame.await {
+            Ok(Some(frame)) => {
+                self.stream.renew(frame.length.into_inner());
+                self.frame = Some(Ok(frame));
+            }
+            Ok(None) => {
+                self.frame = None;
             }
             Err(error) => {
-                self.frame = Some(Err(error.into()));
-                return;
+                self.frame = Some(Err(error));
             }
         }
-
-        let r#type = match self.stream().decode_one::<VarInt>().await {
-            Ok(r#type) => r#type,
-            Err(error) => {
-                let error = map_decode_stream_error(DecodeStreamError::from(error));
-                self.frame = Some(Err(error));
-                return;
-            }
-        };
-        let length = match self.stream().decode_one::<VarInt>().await {
-            Ok(length) => length,
-            Err(error) => {
-                let error = map_decode_stream_error(DecodeStreamError::from(error));
-                self.frame = Some(Err(error));
-                return;
-            }
-        };
-        self.frame = Some(Ok(Frame {
-            r#type,
-            length,
-            payload: (),
-        }));
-        self.stream.renew(length.into_inner());
     }
 
     pub async fn next_frame(
@@ -130,8 +137,7 @@ where
         S: Unpin,
     {
         loop {
-            self.decode_next_frame().await;
-            match self.frame() {
+            match self.next_frame().await {
                 Some(Ok(frame)) if frame.is_reversed_frame() => continue,
                 _decoded => break,
             }

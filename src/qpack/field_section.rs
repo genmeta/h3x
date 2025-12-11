@@ -98,7 +98,7 @@ impl PseudoHeaders {
 }
 
 #[derive(Debug, Snafu)]
-pub enum InvalidHeaderSection {
+pub enum MalformedHeaderSection {
     #[snafu(display("Invalid pseudo-header field with name {name:?}"))]
     InvalidPseudoHeader { name: Bytes },
     #[snafu(display("Duplicate pseudo-header field with name {name:?}"))]
@@ -110,64 +110,81 @@ pub enum InvalidHeaderSection {
     #[snafu(display("Response Pseudo-header field in request"))]
     ResponsePseudoHeaderInRequest,
     #[snafu(display("Field section contains pseudo-header fields in tailers"))]
-    PseudoHeaderInTailers,
+    PseudoHeadersInTrailer,
     #[snafu(display("Field section too large"))]
     FieldSectionTooLarge,
+    #[snafu(display(
+        "Empty :authority or Host header field for scheme with mandatory authority component"
+    ))]
+    EmptyAuthorityOrHost,
+    #[snafu(display("Invalid Host header field: invalid ascii"))]
+    InvalidHostHeader,
+    #[snafu(display("Mismatch between :authority and Host header fields"))]
+    AuthorityHostMismatch,
     #[snafu(display("Absence of mandatory pseudo-header fields"))]
     AbsenceOfMandatoryPseudoHeaders,
+    #[snafu(display("Unexpected :scheme pseudo-header for CONNECT request"))]
+    UnexpectedSchemeForConnectRequest,
+    #[snafu(display("Unexpected :path pseudo-header for CONNECT request"))]
+    UnexpectedPathForConnectRequest,
+    #[snafu(display("Missing :authority pseudo-header for CONNECT request"))]
+    MissingAuthorityForConnectRequest,
+    #[snafu(display("Missing port for CONNECT :authority pseudo-header"))]
+    MissingPortForConnectAuthority,
+
     #[snafu(transparent)]
     InvalidMessage { source: http::Error },
 }
 
-impl HasErrorCode for InvalidHeaderSection {
+impl HasErrorCode for MalformedHeaderSection {
     fn code(&self) -> Code {
         Code::H3_MESSAGE_ERROR
     }
 }
 
-impl From<method::InvalidMethod> for InvalidHeaderSection {
+impl From<method::InvalidMethod> for MalformedHeaderSection {
     fn from(error: method::InvalidMethod) -> Self {
-        InvalidHeaderSection::InvalidMessage {
+        MalformedHeaderSection::InvalidMessage {
             source: error.into(),
         }
     }
 }
 
-impl From<uri::InvalidUri> for InvalidHeaderSection {
+impl From<uri::InvalidUri> for MalformedHeaderSection {
     fn from(error: uri::InvalidUri) -> Self {
-        InvalidHeaderSection::InvalidMessage {
+        MalformedHeaderSection::InvalidMessage {
             source: error.into(),
         }
     }
 }
 
-impl From<status::InvalidStatusCode> for InvalidHeaderSection {
+impl From<status::InvalidStatusCode> for MalformedHeaderSection {
     fn from(error: status::InvalidStatusCode) -> Self {
-        InvalidHeaderSection::InvalidMessage {
+        MalformedHeaderSection::InvalidMessage {
             source: error.into(),
         }
     }
 }
 
-impl From<header::MaxSizeReached> for InvalidHeaderSection {
+impl From<header::MaxSizeReached> for MalformedHeaderSection {
     fn from(error: header::MaxSizeReached) -> Self {
-        InvalidHeaderSection::InvalidMessage {
+        MalformedHeaderSection::InvalidMessage {
             source: error.into(),
         }
     }
 }
 
-impl From<header::InvalidHeaderName> for InvalidHeaderSection {
+impl From<header::InvalidHeaderName> for MalformedHeaderSection {
     fn from(error: header::InvalidHeaderName) -> Self {
-        InvalidHeaderSection::InvalidMessage {
+        MalformedHeaderSection::InvalidMessage {
             source: error.into(),
         }
     }
 }
 
-impl From<header::InvalidHeaderValue> for InvalidHeaderSection {
+impl From<header::InvalidHeaderValue> for MalformedHeaderSection {
     fn from(error: header::InvalidHeaderValue) -> Self {
-        InvalidHeaderSection::InvalidMessage {
+        MalformedHeaderSection::InvalidMessage {
             source: error.into(),
         }
     }
@@ -196,6 +213,121 @@ impl FieldSection {
 
     pub fn iter(&self) -> Iter<'_> {
         IntoIterator::into_iter(self)
+    }
+
+    pub fn is_request_header(&self) -> bool {
+        matches!(self.pseudo_headers, Some(PseudoHeaders::Request { .. }))
+    }
+
+    pub fn is_response_header(&self) -> bool {
+        matches!(self.pseudo_headers, Some(PseudoHeaders::Response { .. }))
+    }
+
+    pub fn is_trailer(&self) -> bool {
+        self.pseudo_headers.is_none()
+    }
+
+    pub fn check_pseudo(&self) -> Result<(), MalformedHeaderSection> {
+        let Some(pseudo_headers) = self.pseudo_headers.as_ref() else {
+            return Ok(());
+        };
+        match pseudo_headers {
+            PseudoHeaders::Request {
+                method,
+                scheme,
+                authority,
+                path,
+            } => {
+                // All HTTP/3 requests MUST include exactly one value for the :method,
+                // :scheme, and :path pseudo-header fields, unless the request is a
+                // CONNECT request; see Section 4.4.
+                let Some(method) = method else {
+                    return Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders);
+                };
+
+                if method != Method::CONNECT {
+                    let Some(scheme) = scheme else {
+                        return Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders);
+                    };
+                    let Some(_path) = path else {
+                        return Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders);
+                    };
+
+                    // If the :scheme pseudo-header field identifies a scheme that has a
+                    // mandatory authority component (including "http" and "https"), the
+                    // request MUST contain either an :authority pseudo-header field or a
+                    // Host header field. If these fields are present, they MUST NOT be
+                    // empty. If both fields are present, they MUST contain the same value.
+                    // If the scheme does not have a mandatory authority component and none
+                    // is provided in the request target, the request MUST NOT contain the
+                    // :authority pseudo-header or Host header fields.
+                    if scheme == &Scheme::HTTP || scheme == &Scheme::HTTPS {
+                        match (authority, self.header_map.get("host")) {
+                            (Some(authority), Some(host)) => {
+                                let host = host
+                                    .to_str()
+                                    .map_err(|_| MalformedHeaderSection::InvalidHostHeader)?;
+                                if authority.as_str().is_empty() || host.is_empty() {
+                                    return Err(MalformedHeaderSection::EmptyAuthorityOrHost);
+                                }
+                                if authority.as_str() != host {
+                                    return Err(MalformedHeaderSection::AuthorityHostMismatch);
+                                }
+                            }
+                            (Some(authority), None) => {
+                                if authority.as_str().is_empty() {
+                                    return Err(MalformedHeaderSection::EmptyAuthorityOrHost);
+                                }
+                            }
+                            (None, Some(host)) => {
+                                let host = host
+                                    .to_str()
+                                    .map_err(|_| MalformedHeaderSection::InvalidHostHeader)?;
+                                if host.is_empty() {
+                                    return Err(MalformedHeaderSection::EmptyAuthorityOrHost);
+                                }
+                            }
+                            (None, None) => {
+                                return Err(
+                                    MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders,
+                                );
+                            }
+                        }
+                    }
+
+                    Ok(())
+                } else {
+                    // A CONNECT request MUST be constructed as follows:
+                    //
+                    // * The :method pseudo-header field is set to "CONNECT"
+                    //
+                    // * The :scheme and :path pseudo-header fields are omitted
+                    //
+                    // * The :authority pseudo-header field contains the host and port to
+                    //   connect to (equivalent to the authority-form of the request-target
+                    //   of CONNECT requests; see Section 7.1 of [HTTP]).
+                    if scheme.is_some() {
+                        return Err(MalformedHeaderSection::UnexpectedSchemeForConnectRequest);
+                    }
+                    if path.is_some() {
+                        return Err(MalformedHeaderSection::UnexpectedPathForConnectRequest);
+                    }
+                    let Some(authority) = authority else {
+                        return Err(MalformedHeaderSection::MissingAuthorityForConnectRequest);
+                    };
+                    if authority.port().is_none() {
+                        return Err(MalformedHeaderSection::MissingPortForConnectAuthority);
+                    }
+                    Ok(())
+                }
+            }
+            PseudoHeaders::Response { status } => {
+                let Some(_status) = status else {
+                    return Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders);
+                };
+                Ok(())
+            }
+        }
     }
 
     pub fn method(&self) -> Method {
@@ -307,12 +439,12 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                     let method = match &mut pseudo {
                         PseudoHeaders::Request { method, .. } => method,
                         PseudoHeaders::Response { .. } => {
-                            return Err(InvalidHeaderSection::DualKindedPseudoHeader.into());
+                            return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
                         }
                     };
                     ensure!(method.is_none(), DuplicatePseudoHeaderSnafu { name });
                     *method =
-                        Some(Method::from_bytes(&value[..]).map_err(InvalidHeaderSection::from)?);
+                        Some(Method::from_bytes(&value[..]).map_err(MalformedHeaderSection::from)?);
                     pseudo_headers = Some(pseudo)
                 }
                 b":scheme" => {
@@ -322,12 +454,12 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                     let scheme = match &mut pseudo {
                         PseudoHeaders::Request { scheme, .. } => scheme,
                         PseudoHeaders::Response { .. } => {
-                            return Err(InvalidHeaderSection::DualKindedPseudoHeader.into());
+                            return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
                         }
                     };
                     ensure!(scheme.is_none(), DuplicatePseudoHeaderSnafu { name });
                     *scheme =
-                        Some(Scheme::try_from(&value[..]).map_err(InvalidHeaderSection::from)?);
+                        Some(Scheme::try_from(&value[..]).map_err(MalformedHeaderSection::from)?);
                     pseudo_headers = Some(pseudo)
                 }
                 b":authority" => {
@@ -337,12 +469,13 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                     let authority = match &mut pseudo {
                         PseudoHeaders::Request { authority, .. } => authority,
                         PseudoHeaders::Response { .. } => {
-                            return Err(InvalidHeaderSection::DualKindedPseudoHeader.into());
+                            return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
                         }
                     };
                     ensure!(authority.is_none(), DuplicatePseudoHeaderSnafu { name });
                     *authority = Some(
-                        Authority::from_maybe_shared(value).map_err(InvalidHeaderSection::from)?,
+                        Authority::from_maybe_shared(value)
+                            .map_err(MalformedHeaderSection::from)?,
                     );
                     pseudo_headers = Some(pseudo)
                 }
@@ -354,17 +487,17 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                     let scheme = match &mut pseudo {
                         PseudoHeaders::Request { path, .. } => path,
                         PseudoHeaders::Response { .. } => {
-                            return Err(InvalidHeaderSection::DualKindedPseudoHeader.into());
+                            return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
                         }
                     };
                     ensure!(scheme.is_none(), DuplicatePseudoHeaderSnafu { name });
                     *scheme = Some(
                         PathAndQuery::from_maybe_shared(value)
-                            .map_err(InvalidHeaderSection::from)?,
+                            .map_err(MalformedHeaderSection::from)?,
                     );
                     pseudo_headers = Some(pseudo)
                 }
-                b"status" => {
+                b":status" => {
                     let mut pseudo = pseudo_headers
                         .take()
                         .unwrap_or(PseudoHeaders::unresolved_response());
@@ -372,26 +505,27 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                     let status = match &mut pseudo {
                         PseudoHeaders::Response { status, .. } => status,
                         PseudoHeaders::Request { .. } => {
-                            return Err(InvalidHeaderSection::DualKindedPseudoHeader.into());
+                            return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
                         }
                     };
                     ensure!(status.is_none(), DuplicatePseudoHeaderSnafu { name });
-                    *status =
-                        Some(StatusCode::try_from(&value[..]).map_err(InvalidHeaderSection::from)?);
+                    *status = Some(
+                        StatusCode::try_from(&value[..]).map_err(MalformedHeaderSection::from)?,
+                    );
                     pseudo_headers = Some(pseudo)
                 }
 
                 invalid_pseudo if invalid_pseudo.starts_with(b":") => {
-                    return Err(InvalidHeaderSection::InvalidPseudoHeader { name }.into());
+                    return Err(MalformedHeaderSection::InvalidPseudoHeader { name }.into());
                 }
                 name => {
                     header_map
                         .try_append(
-                            HeaderName::from_bytes(name).map_err(InvalidHeaderSection::from)?,
+                            HeaderName::from_bytes(name).map_err(MalformedHeaderSection::from)?,
                             HeaderValue::from_maybe_shared(value)
-                                .map_err(InvalidHeaderSection::from)?,
+                                .map_err(MalformedHeaderSection::from)?,
                         )
-                        .map_err(InvalidHeaderSection::from)?;
+                        .map_err(MalformedHeaderSection::from)?;
                 }
             }
         }
@@ -413,7 +547,7 @@ impl From<request::Parts> for FieldSection {
 }
 
 impl TryFrom<FieldSection> for request::Parts {
-    type Error = InvalidHeaderSection;
+    type Error = MalformedHeaderSection;
 
     fn try_from(value: FieldSection) -> Result<Self, Self::Error> {
         let PseudoHeaders::Request {
@@ -423,9 +557,9 @@ impl TryFrom<FieldSection> for request::Parts {
             path,
         } = value
             .pseudo_headers
-            .ok_or(InvalidHeaderSection::AbsenceOfMandatoryPseudoHeaders)?
+            .ok_or(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders)?
         else {
-            return Err(InvalidHeaderSection::ResponsePseudoHeaderInRequest);
+            return Err(MalformedHeaderSection::ResponsePseudoHeaderInRequest);
         };
 
         let mut uri = Uri::builder();
@@ -439,7 +573,7 @@ impl TryFrom<FieldSection> for request::Parts {
             uri = uri.path_and_query(path);
         }
         let uri = uri.build()?;
-        let method = method.ok_or(InvalidHeaderSection::AbsenceOfMandatoryPseudoHeaders)?;
+        let method = method.ok_or(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders)?;
         let mut request = Request::builder().uri(uri).method(method).body(())?;
         *request.headers_mut() = value.header_map;
 
@@ -457,17 +591,17 @@ impl From<response::Parts> for FieldSection {
 }
 
 impl TryFrom<FieldSection> for response::Parts {
-    type Error = InvalidHeaderSection;
+    type Error = MalformedHeaderSection;
 
     fn try_from(value: FieldSection) -> Result<Self, Self::Error> {
         let PseudoHeaders::Response { status } = value
             .pseudo_headers
-            .ok_or(InvalidHeaderSection::AbsenceOfMandatoryPseudoHeaders)?
+            .ok_or(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders)?
         else {
-            return Err(InvalidHeaderSection::RequestPseudoHeaderInResponse);
+            return Err(MalformedHeaderSection::RequestPseudoHeaderInResponse);
         };
 
-        let status = status.ok_or(InvalidHeaderSection::AbsenceOfMandatoryPseudoHeaders)?;
+        let status = status.ok_or(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders)?;
         let response = Response::builder().status(status).body(())?;
         Ok(response.into_parts().0)
     }

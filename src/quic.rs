@@ -1,6 +1,7 @@
-pub mod identity;
+mod gm_quic;
 
 use std::{
+    any::Any,
     borrow::Cow,
     convert::Infallible,
     error::Error,
@@ -15,8 +16,8 @@ use futures::{Sink, Stream, future::BoxFuture};
 use snafu::Snafu;
 
 use crate::{
+    agent::{LocalAgent, RemoteAgent},
     error::Code,
-    quic::identity::{WithLocalIdentity, WithPeerIdentity},
     varint::VarInt,
 };
 
@@ -24,12 +25,9 @@ use crate::{
 #[snafu(visibility(pub))]
 pub enum StreamError {
     #[snafu(transparent)]
-    Connection {
-        source: ConnectionError,
-    },
-    Reset {
-        code: VarInt,
-    },
+    Connection { source: ConnectionError },
+    #[snafu(display("Stream reset with code {code}"))]
+    Reset { code: VarInt },
 }
 
 impl StreamError {
@@ -107,25 +105,25 @@ impl ConnectionError {
 
 pub trait Connect {
     type Connection: Connection;
-    type Error: Error + 'static;
+    type Error: Error + Any;
 
-    fn connect(&self, host: &str) -> BoxFuture<'static, Result<Self::Connection, Self::Error>>;
+    fn connect(&self, target: &str) -> BoxFuture<'_, Result<Self::Connection, Self::Error>>;
 }
 
 pub trait Listen {
     type Connection: Connection;
-    type Error: Error + 'static;
+    type Error: Error + Any;
 
-    fn accept(&self) -> BoxFuture<'static, Result<Self::Connection, Self::Error>>;
+    fn accept(&self) -> BoxFuture<'_, Result<Self::Connection, Self::Error>>;
 }
 
 pub trait Connection:
-    ManageStream + WithLocalIdentity + WithPeerIdentity + Close + Unpin + Send + 'static
+    ManageStream + WithLocalAgent + WithRemoteAgent + Close + Send + Sync + Any
 {
 }
 
-impl<C: ManageStream + WithLocalIdentity + WithPeerIdentity + Close + Unpin + Send + 'static>
-    Connection for C
+impl<C: ManageStream + WithLocalAgent + WithRemoteAgent + Close + Send + Sync + Any> Connection
+    for C
 {
 }
 
@@ -133,97 +131,30 @@ pub trait ManageStream {
     type StreamWriter: WriteStream;
     type StreamReader: ReadStream;
 
+    #[allow(clippy::type_complexity)]
     fn open_bi(
-        self: Pin<&mut Self>,
-    ) -> BoxFuture<'static, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>>;
+        &self,
+    ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>>;
 
-    fn open_uni(
-        self: Pin<&mut Self>,
-    ) -> BoxFuture<'static, Result<Self::StreamWriter, ConnectionError>>;
+    fn open_uni(&self) -> BoxFuture<'_, Result<Self::StreamWriter, ConnectionError>>;
 
+    #[allow(clippy::type_complexity)]
     fn accept_bi(
-        self: Pin<&mut Self>,
-    ) -> BoxFuture<'static, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>>;
+        &self,
+    ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>>;
 
-    fn accept_uni(
-        self: Pin<&mut Self>,
-    ) -> BoxFuture<'static, Result<Self::StreamReader, ConnectionError>>;
+    fn accept_uni(&self) -> BoxFuture<'_, Result<Self::StreamReader, ConnectionError>>;
+}
+pub trait WithLocalAgent {
+    fn local_agent(&self) -> BoxFuture<'_, Result<Option<LocalAgent>, ConnectionError>>;
 }
 
-impl<P: DerefMut<Target: ManageStream>> ManageStream for Pin<P> {
-    type StreamWriter = <P::Target as ManageStream>::StreamWriter;
-
-    type StreamReader = <P::Target as ManageStream>::StreamReader;
-
-    fn open_bi(
-        self: Pin<&mut Self>,
-    ) -> BoxFuture<'static, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> {
-        <P::Target as ManageStream>::open_bi(self.as_deref_mut())
-    }
-
-    fn open_uni(
-        self: Pin<&mut Self>,
-    ) -> BoxFuture<'static, Result<Self::StreamWriter, ConnectionError>> {
-        <P::Target as ManageStream>::open_uni(self.as_deref_mut())
-    }
-
-    fn accept_bi(
-        self: Pin<&mut Self>,
-    ) -> BoxFuture<'static, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> {
-        <P::Target as ManageStream>::accept_bi(self.as_deref_mut())
-    }
-
-    fn accept_uni(
-        self: Pin<&mut Self>,
-    ) -> BoxFuture<'static, Result<Self::StreamReader, ConnectionError>> {
-        <P::Target as ManageStream>::accept_uni(self.as_deref_mut())
-    }
-}
-
-impl<M: ManageStream + Unpin + ?Sized> ManageStream for &mut M {
-    type StreamWriter = M::StreamWriter;
-
-    type StreamReader = M::StreamReader;
-
-    fn open_bi(
-        self: Pin<&mut Self>,
-    ) -> BoxFuture<'static, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> {
-        M::open_bi(Pin::new(self.get_mut()))
-    }
-
-    fn open_uni(
-        self: Pin<&mut Self>,
-    ) -> BoxFuture<'static, Result<Self::StreamWriter, ConnectionError>> {
-        M::open_uni(Pin::new(self.get_mut()))
-    }
-
-    fn accept_bi(
-        self: Pin<&mut Self>,
-    ) -> BoxFuture<'static, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> {
-        M::accept_bi(Pin::new(self.get_mut()))
-    }
-
-    fn accept_uni(
-        self: Pin<&mut Self>,
-    ) -> BoxFuture<'static, Result<Self::StreamReader, ConnectionError>> {
-        M::accept_uni(Pin::new(self.get_mut()))
-    }
+pub trait WithRemoteAgent {
+    fn remote_agent(&self) -> BoxFuture<'_, Result<Option<RemoteAgent>, ConnectionError>>;
 }
 
 pub trait Close {
-    fn close(self: Pin<&mut Self>, code: Code, reason: Cow<'static, str>);
-}
-
-impl<P: DerefMut<Target: Close>> Close for Pin<P> {
-    fn close(self: Pin<&mut Self>, code: Code, reason: Cow<'static, str>) {
-        <P::Target as Close>::close(self.as_deref_mut(), code, reason)
-    }
-}
-
-impl<P: Close + Unpin + ?Sized> Close for &mut P {
-    fn close(self: Pin<&mut Self>, code: Code, reason: Cow<'static, str>) {
-        P::close(Pin::new(self.get_mut()), code, reason)
-    }
+    fn close(&self, code: Code, reason: Cow<'static, str>);
 }
 
 pub trait GetStreamId {
@@ -332,13 +263,12 @@ pub trait StopStreamExt {
 impl<T: StopStream + ?Sized> StopStreamExt for T {}
 
 pub trait ReadStream:
-    StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + Send + 'static
+    StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + Send + Any
 {
 }
 
-impl<
-    S: StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + Send + ?Sized + 'static,
-> ReadStream for S
+impl<S: StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + Send + ?Sized + Any>
+    ReadStream for S
 {
 }
 
@@ -402,11 +332,11 @@ pub trait CancelStreamExt {
 impl<T: CancelStream + ?Sized> CancelStreamExt for T {}
 
 pub trait WriteStream:
-    CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + 'static
+    CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + Any
 {
 }
 
-impl<S: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + ?Sized + 'static>
+impl<S: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + ?Sized + Any>
     WriteStream for S
 {
 }

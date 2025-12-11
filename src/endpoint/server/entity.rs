@@ -7,6 +7,7 @@ use http::{
     header::{AsHeaderName, IntoHeaderName},
     uri::{Authority, PathAndQuery, Scheme},
 };
+use snafu::Report;
 
 use crate::{
     entity::{
@@ -57,6 +58,8 @@ impl IntoFuture for UnresolvedRequest {
 pub struct Request {
     entity: Entity,
     stream: ReadStream,
+    // agent: RemoteAgent,
+    // parameters: Parameters
 }
 
 impl Request {
@@ -121,9 +124,12 @@ impl Request {
     }
 }
 
+// TODO: check whether request completion or not in drop?
+
 pub struct Response {
     entity: Entity,
     stream: WriteStream,
+    // agent: LocalAgent
 }
 
 impl Response {
@@ -215,11 +221,19 @@ impl Response {
 impl Drop for Response {
     fn drop(&mut self) {
         if !self.entity.is_complete() {
-            // Its ok to take: Response will not be used after drop
-            let stream = self.stream.take();
-            let entity = mem::replace(&mut self.entity, Entity::unresolved_response());
-            let mut response = Response { entity, stream };
-            tokio::spawn(async move { response.close().await });
+            // It's ok to take: Response will not be used after drop
+            let mut stream = self.stream.take();
+            let mut entity = mem::replace(&mut self.entity, Entity::unresolved_response());
+            tokio::spawn(async move {
+                if let Err(StreamError::IllegalEntityOperator { source }) =
+                    stream.close(&mut entity).await
+                {
+                    tracing::warn!(
+                        target: "h3x::server",
+                        "Response stream cannot be closed properly: {}", Report::from_error(source)
+                    );
+                }
+            });
         }
     }
 }

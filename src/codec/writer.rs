@@ -60,6 +60,10 @@ where
         poll_fn(|cx| self.as_mut().poll_flush_buffer(cx)).await
     }
 
+    pub fn sink(&self) -> &S {
+        &self.sink
+    }
+
     pub fn into_inner(self) -> S
     where
         S: Sized,

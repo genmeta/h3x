@@ -32,6 +32,14 @@ impl<H: Service + Any + Clone + Send + Sync> CloneableService for H {
     }
 }
 
+pub trait IntoBoxService: Service<Future: Send + 'static> + Clone + Send + Sync + 'static {
+    fn into_box_service(self) -> BoxService {
+        box_service(self)
+    }
+}
+
+impl<S: Service<Future: Send + 'static> + Clone + Send + Sync + 'static> IntoBoxService for S {}
+
 pub type BoxServiceFuture = BoxFuture<'static, ()>;
 
 pub struct BoxService(Box<dyn CloneableService<Future = BoxServiceFuture> + Send + Sync>);

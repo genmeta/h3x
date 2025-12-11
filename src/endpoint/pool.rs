@@ -6,7 +6,7 @@ use std::{
 
 use dashmap::DashMap;
 use futures::StreamExt;
-use snafu::{ResultExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::{sync::Mutex as AsyncMutex, task::JoinSet};
 
 use crate::{
@@ -50,26 +50,22 @@ impl<C: quic::Connection> ReuseableConnection<C> {
         &self,
         mut try_initial: impl AsyncFnMut() -> Result<Arc<Connection<C>>, E>,
     ) -> Result<Arc<Connection<C>>, E> {
-        if let Some(connection) = self.reuse() {
-            return Ok(connection);
-        }
-
         let mut connections = pin!(self.connection.watch());
 
         loop {
+            if let Some(connection) = self.reuse() {
+                return Ok(connection);
+            }
             tokio::select! {
                 biased;
+                _new_conn = connections.next() => {
+                    tracing::debug!("Entry updated, try to reuse connection");
+                    continue;
+                }
                 _guard = self.connect.lock() => {
                     // its ok to replace the connection, reference of replaced connection still in task until closed
-                    self.connection.set(try_initial().await?);
-                }
-                connection = connections.next() => {
-                    let Some(connection) = connection else {
-                        // this should not happen as the watch never closes
-                        continue;
-                    };
-                    // todo: test whether to reuse the connection or reconnect
-                    return Ok(connection)
+                    let connection = try_initial().await?;
+                    self.connection.set(connection.clone());
                 }
             }
         }
@@ -116,7 +112,7 @@ impl<C: quic::Connection> Pool<C> {
 
 impl<C: quic::Connection> Default for Pool<C> {
     fn default() -> Self {
-        Self::global().clone()
+        Self::empty()
     }
 }
 
@@ -127,8 +123,23 @@ pub enum ConnectError<E: Error + 'static> {
     Connector { source: E },
     #[snafu(transparent)]
     H3 { source: quic::ConnectionError },
-    #[snafu(display("Peer name mismatch: expected {expected}, actual {actual}"))]
-    IncorrectIdentify { expected: String, actual: String },
+    #[snafu(display("Peer name mismatch: expected {expected}, actual {}", match actual {
+        Some(name) => name,
+        None => "<anonymous>", 
+    }))]
+    IncorrectIdentify {
+        expected: String,
+        actual: Option<String>,
+    },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum InsertError {
+    #[snafu(transparent)]
+    Quic { source: quic::ConnectionError },
+    #[snafu(display("Peer does not provide identity"))]
+    MissingIdentify,
 }
 
 impl<C: quic::Connection> Pool<C> {
@@ -136,7 +147,7 @@ impl<C: quic::Connection> Pool<C> {
         &self,
         peer_name: &str,
         settings: Arc<Settings>,
-        mut connector: impl AsyncFnMut(&str) -> Result<C, E>,
+        mut try_connect: impl AsyncFnMut() -> Result<C, E>,
     ) -> Result<Arc<Connection<C>>, ConnectError<E>> {
         let peer_name = peer_name.to_string();
         let result = self
@@ -145,15 +156,16 @@ impl<C: quic::Connection> Pool<C> {
             .or_insert_with(ReuseableConnection::pending)
             .downgrade()
             .reuse_or_initial(async || {
-                let connection = (connector)(&peer_name)
+                let connection = (try_connect)()
                     .await
                     .context(connect_error::ConnectorSnafu)?;
                 let connection = Connection::new(settings.clone(), connection).await?;
-                let actual_peer_name = connection.peer_name().await?;
-                if actual_peer_name != peer_name {
+                let remote_agent = connection.remote_agent().await?;
+                let actual_peer_name = remote_agent.as_ref().map(|agent| agent.name());
+                if actual_peer_name.as_ref() != Some(&peer_name.as_ref()) {
                     return connect_error::IncorrectIdentifySnafu {
                         expected: peer_name.to_string(),
-                        actual: actual_peer_name,
+                        actual: actual_peer_name.map(ToOwned::to_owned),
                     }
                     .fail();
                 }
@@ -184,14 +196,14 @@ impl<C: quic::Connection> Pool<C> {
         result
     }
 
-    pub async fn try_insert<E>(
-        &self,
-        connection: Arc<Connection<C>>,
-    ) -> Result<(), quic::ConnectionError> {
-        let peer_name = connection.peer_name().await?;
+    pub async fn try_insert(&self, connection: Arc<Connection<C>>) -> Result<(), InsertError> {
+        let remote_agent = connection
+            .remote_agent()
+            .await?
+            .context(insert_error::MissingIdentifySnafu)?;
         let settings = connection.settings().clone();
         self.connections
-            .entry((peer_name, settings))
+            .entry((remote_agent.name().to_owned(), settings))
             .or_insert(ReuseableConnection::with(connection));
         Ok(())
     }

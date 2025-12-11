@@ -52,6 +52,10 @@ where
         Poll::Ready(Ok(project.chunk))
     }
 
+    pub fn stream(&self) -> &S {
+        &self.stream
+    }
+
     pub fn consume(self: Pin<&mut Self>, amt: usize) {
         _ = self.project().chunk.split_to(amt)
     }
@@ -169,6 +173,10 @@ impl<S: ?Sized> FixedLengthReader<S> {
         S: Sized,
     {
         self.stream
+    }
+
+    pub fn stream(&self) -> &S {
+        &self.stream
     }
 
     pub fn stream_mut(&mut self) -> &mut S {

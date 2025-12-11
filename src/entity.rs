@@ -9,13 +9,13 @@ use snafu::Snafu;
 
 use crate::{
     buflist::{BufList, Cursor},
-    qpack::field_section::{FieldSection, PseudoHeaders},
+    qpack::field_section::{FieldSection, MalformedHeaderSection, PseudoHeaders},
 };
 
 #[derive(Debug, Clone)]
 enum Body {
-    Streaming,
-    Chunked(Cursor<BufList>),
+    Streaming { received: u64 },
+    Chunked { buflist: Cursor<BufList> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -26,29 +26,29 @@ pub enum EntityStage {
     Complete = 3,
 }
 
-#[derive(Debug, Snafu, Clone)]
+#[derive(Debug, Snafu)]
 pub enum IllegalEntityOperator {
-    #[snafu(display("Header cannot be modified: Header section already sent"))]
+    #[snafu(display("Header section cannot be modified after sent"))]
     ModifyHeaderAfterSent,
-    #[snafu(display("Entity with incomplete pseudo headers cannot be sent"))]
-    SendIncompleteHeader,
+    #[snafu(display("Malformed pseudo header section cannot be sent"))]
+    SendMalformedPseudoHeader { source: MalformedHeaderSection },
     #[snafu(display("Body cannot be modified: Body is sending"))]
     ModifyBodyAfterSent,
-    #[snafu(display("Buffered body be replaced: Body is sending"))]
+    #[snafu(display("Chunked cannot be modified while sending"))]
     ReplaceBodyWhileSending,
-    #[snafu(display("Cannot perform chunked operation on streaming entity body"))]
+    #[snafu(display("Chunked body operation cannot be performed on streaming entity body"))]
     ChunkedOperatorOnStreamingBody,
-    #[snafu(display("Cannot perform streaming operation on chunked entity body"))]
+    #[snafu(display("Streaming body operation cannot be performed on chunked entity body"))]
     StreamingOperatorOnChunkedBody,
-    #[snafu(display("Cannot switch body mode after body started sending"))]
-    SwitchBodyModeAfterSent,
+    #[snafu(display("Body mode cannot be changed which sending"))]
+    ChangeBodyModeInTransport,
     #[snafu(display("Header frame payload too large, maybe too may header fields"))]
     HeaderFramePayloadTooLarge,
     #[snafu(display("Data frame payload too large, try smaller chunk size"))]
     DataFramePayloadTooLarge,
-    #[snafu(display("Trailer cannot be modified: Trailer section already sent"))]
+    #[snafu(display("Trailer section cannot be modified after sent"))]
     ModifyTrailerAfterSent,
-    #[snafu(display("Cannot set body or trailer sections for interim response"))]
+    #[snafu(display("Body or trailer sections cannot be set for interim response"))]
     SendBodyOrTrailerForInterimResponse,
     #[snafu(display("Response stream cannot be closed without final response"))]
     MissingFinalResponse,
@@ -75,7 +75,9 @@ impl Entity {
     pub fn unresolved_request() -> Self {
         Self {
             header: FieldSection::header(PseudoHeaders::unresolved_request(), HeaderMap::default()),
-            body: Body::Chunked(Cursor::new(BufList::new())),
+            body: Body::Chunked {
+                buflist: Cursor::new(BufList::new()),
+            },
             trailer: FieldSection::trailer(HeaderMap::default()),
             stage: EntityStage::Header,
         }
@@ -87,7 +89,9 @@ impl Entity {
                 PseudoHeaders::unresolved_response(),
                 HeaderMap::default(),
             ),
-            body: Body::Chunked(Cursor::new(BufList::new())),
+            body: Body::Chunked {
+                buflist: Cursor::new(BufList::new()),
+            },
             trailer: FieldSection::trailer(HeaderMap::default()),
             stage: EntityStage::Header,
         }
@@ -108,34 +112,34 @@ impl Entity {
     }
 
     pub fn enable_streaming(&mut self) -> Result<(), IllegalEntityOperator> {
-        if let Body::Chunked(_) = &self.body {
-            if self.stage != EntityStage::Header {
-                return Err(IllegalEntityOperator::SwitchBodyModeAfterSent);
+        if let Body::Chunked { buflist } = &self.body {
+            match self.stage {
+                EntityStage::Header => {}
+                EntityStage::Body if !buflist.inner().has_remaining() => {}
+                _ => return Err(IllegalEntityOperator::ChangeBodyModeInTransport),
             }
-            self.body = Body::Streaming;
+
+            self.body = Body::Streaming { received: 0 }
         }
         Ok(())
     }
 
     pub fn chunked_body(&mut self) -> Result<&mut Cursor<BufList>, IllegalEntityOperator> {
-        if let Body::Streaming = &self.body {
-            if self.stage != EntityStage::Header {
-                return Err(IllegalEntityOperator::SwitchBodyModeAfterSent);
+        if let Body::Streaming { received } = &self.body {
+            match self.stage {
+                EntityStage::Header => { /* Ok to change mode: body unused */ }
+                EntityStage::Body if *received == 0 => { /* Ok to change mode: body unused */ }
+                _ => return Err(IllegalEntityOperator::ChangeBodyModeInTransport),
             }
-            self.body = Body::Chunked(Cursor::new(BufList::new()));
         }
         match &mut self.body {
-            Body::Streaming => unreachable!(),
-            Body::Chunked(cursor) => Ok(cursor),
+            Body::Streaming { .. } => unreachable!(),
+            Body::Chunked { buflist } => Ok(buflist),
         }
     }
 
     pub fn is_interim_response(&self) -> bool {
         self.is_response() && self.header().status().is_informational()
-    }
-
-    pub fn is_header_complete(&self) -> bool {
-        todo!("checks for pseudo headers")
     }
 
     pub fn header_mut(&mut self) -> &mut FieldSection {
@@ -147,11 +151,11 @@ impl Entity {
     }
 
     pub fn is_streaming(&self) -> bool {
-        matches!(self.body, Body::Streaming)
+        matches!(self.body, Body::Streaming { .. })
     }
 
     pub fn is_chunked(&self) -> bool {
-        matches!(self.body, Body::Chunked(_))
+        matches!(self.body, Body::Chunked { .. })
     }
 
     /// Set body to buffer mode with given content
@@ -164,7 +168,9 @@ impl Entity {
         while content.has_remaining() {
             buflist.write(content.copy_to_bytes(content.chunk().len()));
         }
-        self.body = Body::Chunked(Cursor::new(buflist));
+        self.body = Body::Chunked {
+            buflist: Cursor::new(buflist),
+        };
 
         Ok(())
     }
