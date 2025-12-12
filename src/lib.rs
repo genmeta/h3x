@@ -1,12 +1,14 @@
 pub mod agent;
 mod buflist;
+pub mod client;
 mod codec;
 pub mod connection;
-pub mod endpoint;
 pub mod entity;
 pub mod error;
 mod frame;
+pub mod pool;
 pub mod qpack;
 pub mod quic;
+pub mod server;
 mod util;
 pub mod varint;

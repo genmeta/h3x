@@ -6,8 +6,8 @@ use tracing::Instrument;
 
 use crate::{
     connection::{Connection, settings::Settings},
-    endpoint::pool::Pool,
     error::Code,
+    pool::Pool,
     quic::{self, GetStreamIdExt},
 };
 
@@ -17,8 +17,7 @@ mod route;
 mod service;
 
 pub use entity::{Request, Response, UnresolvedRequest};
-pub use method::MethodRouter;
-pub use route::Router;
+pub use route::{MethodRouter, Router};
 pub use service::{
     BoxService, BoxServiceFuture, ErasedService, IntoBoxService, Service, box_service,
 };

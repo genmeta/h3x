@@ -11,12 +11,13 @@ use snafu::{Report, Snafu};
 use tokio::io::AsyncBufRead;
 
 use crate::{
+    client::Client,
     codec::StreamReader,
-    endpoint::{client::Client, pool::ConnectError},
     entity::{
         Entity, EntityStage, IllegalEntityOperator,
         stream::{ReadStream, StreamError, WriteStream},
     },
+    pool::ConnectError,
     qpack::field_section::{FieldSection, MalformedHeaderSection},
     quic,
     varint::VarInt,

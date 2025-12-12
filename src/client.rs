@@ -4,7 +4,7 @@ use http::uri::Authority;
 
 use crate::{
     connection::{Connection, settings::Settings},
-    endpoint::pool::{self, Pool},
+    pool::{self, Pool},
     quic,
 };
 

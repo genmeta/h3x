@@ -41,9 +41,6 @@ where
         }
     }
 
-    pub fn stream(&self) -> &StreamReader<S> {
-        self.stream.stream()
-    }
 
     fn stream_mut(&mut self) -> &mut StreamReader<S> {
         self.stream.stream_mut()

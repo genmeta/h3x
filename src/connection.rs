@@ -33,9 +33,8 @@ use crate::{
     frame::{Frame, goaway::Goaway},
     qpack::{
         BoxInstructionSink, BoxInstructionStream, BoxSink,
-        decoder::Decoder,
-        encoder::Encoder,
-        instruction::{DecoderInstruction, EncoderInstruction},
+        decoder::{Decoder, DecoderInstruction},
+        encoder::{Encoder, EncoderInstruction},
     },
     quic::{self, GetStreamIdExt, StopStreamExt},
     util::{set_once::SetOnce, try_future::TryFuture, watch::Watch},

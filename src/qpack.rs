@@ -3,7 +3,6 @@ pub mod decoder;
 pub mod dynamic;
 pub mod encoder;
 pub mod field_section;
-pub mod header_block;
 pub mod instruction;
 pub mod integer;
 pub mod r#static;

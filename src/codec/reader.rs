@@ -164,21 +164,6 @@ impl<S: ?Sized> FixedLengthReader<S> {
         self.remaining = remaining
     }
 
-    pub fn remaining(&self) -> u64 {
-        self.remaining
-    }
-
-    pub fn into_inner(self) -> S
-    where
-        S: Sized,
-    {
-        self.stream
-    }
-
-    pub fn stream(&self) -> &S {
-        &self.stream
-    }
-
     pub fn stream_mut(&mut self) -> &mut S {
         &mut self.stream
     }

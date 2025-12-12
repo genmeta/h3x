@@ -312,7 +312,7 @@ mod tests {
     use http::StatusCode;
     use tracing::Instrument;
 
-    use crate::endpoint::{
+    use crate::{
         client::Client,
         server::{self, Router, Servers},
     };
