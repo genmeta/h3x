@@ -47,7 +47,7 @@ where
 
         // ensure frame is exhausted
         if !self.fill_buf().await?.is_empty() {
-            // TODO: error kind
+            // FIXME: which error kind?
             return Err(Code::H3_GENERAL_PROTOCOL_ERROR.into());
         };
 

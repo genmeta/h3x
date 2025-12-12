@@ -18,7 +18,6 @@ use crate::{
 
 pin_project_lite::pin_project! {
     pub struct FrameStream<S: ?Sized> {
-        // TODO: this is actually a flatten self reference state
         // frame: Option<Result<Frame<FixedLengthReader<&'this mut StreamReader<S>>>, Error>>,
         frame: Option<Result<Frame<()>, StreamError>>,
         #[pin]
@@ -40,7 +39,6 @@ where
             frame: None,
         }
     }
-
 
     fn stream_mut(&mut self) -> &mut StreamReader<S> {
         self.stream.stream_mut()

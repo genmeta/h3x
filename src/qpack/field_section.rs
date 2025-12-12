@@ -171,8 +171,7 @@ pub enum FieldLineRepresentation {
         ///
         /// https://datatracker.ietf.org/doc/html/rfc9204#section-4.5.4-3
         //
-        // TODO: implement this?
-        no_dynamic: bool,
+        never_dynamic: bool,
         is_static: bool,
         name_index: u64,
         huffman: bool,
@@ -189,7 +188,7 @@ pub enum FieldLineRepresentation {
     /// +-------------------------------+
     /// ```
     LiteralFieldLineWithPostBaseNameReference {
-        no_dynamic: bool,
+        never_dynamic: bool,
         name_index: u64,
         huffman: bool,
         value: Bytes,
@@ -207,7 +206,7 @@ pub enum FieldLineRepresentation {
     /// +-------------------------------+
     /// ```
     LiteralFieldLineWithLiteralName {
-        no_dynamic: bool,
+        never_dynamic: bool,
         name_huffman: bool,
         name: Bytes,
         value_huffman: bool,
@@ -236,14 +235,14 @@ impl<S: AsyncRead> Decode<FieldLineRepresentation> for S {
                 }
                 prefix if prefix & 0b1100_0000 == 0b0100_0000 => {
                     // Literal Field Line with Name Reference
-                    let no_dynamic = (prefix & 0b0010_0000) != 0;
+                    let never_dynamic = (prefix & 0b0010_0000) != 0;
                     let is_static = (prefix & 0b0001_0000) != 0;
                     let name_index = decode_integer(stream.as_mut(), prefix, 4).await?;
                     let value_prefix = stream.read_u8().await?;
                     let (huffman, value) =
                         decode_string(stream.as_mut(), value_prefix, 1 + 7).await?;
                     Ok(FieldLineRepresentation::LiteralFieldLineWithNameReference {
-                        no_dynamic,
+                        never_dynamic,
                         is_static,
                         name_index,
                         huffman,
@@ -252,7 +251,7 @@ impl<S: AsyncRead> Decode<FieldLineRepresentation> for S {
                 }
                 prefix if prefix & 0b1110_0000 == 0b0010_0000 => {
                     // Literal Field Line with Literal Name
-                    let no_dynamic = (prefix & 0b0001_0000) != 0;
+                    let never_dynamic = (prefix & 0b0001_0000) != 0;
                     let name_prefix = prefix;
                     let (name_huffman, name) =
                         decode_string(stream.as_mut(), name_prefix, 1 + 3).await?;
@@ -260,7 +259,7 @@ impl<S: AsyncRead> Decode<FieldLineRepresentation> for S {
                     let (value_huffman, value) =
                         decode_string(stream.as_mut(), value_prefix, 1 + 7).await?;
                     Ok(FieldLineRepresentation::LiteralFieldLineWithLiteralName {
-                        no_dynamic,
+                        never_dynamic,
                         name_huffman,
                         name,
                         value_huffman,
@@ -269,14 +268,14 @@ impl<S: AsyncRead> Decode<FieldLineRepresentation> for S {
                 }
                 prefix if prefix & 0b1111_0000 == 0b0000_0000 => {
                     // Literal Field Line with Post-Base Name Reference
-                    let no_dynamic = (prefix & 0b0000_1000) != 0;
+                    let never_dynamic = (prefix & 0b0000_1000) != 0;
                     let name_index = decode_integer(stream.as_mut(), prefix, 3).await?;
                     let value_prefix = stream.read_u8().await?;
                     let (huffman, value) =
                         decode_string(stream.as_mut(), value_prefix, 1 + 7).await?;
                     Ok(
                         FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
-                            no_dynamic,
+                            never_dynamic,
                             name_index,
                             huffman,
                             value,
@@ -317,14 +316,14 @@ where
                 encode_integer(stream, 0b0001_0000, 4, index).await?;
             }
             FieldLineRepresentation::LiteralFieldLineWithNameReference {
-                no_dynamic,
+                never_dynamic,
                 is_static,
                 name_index,
                 huffman,
                 value,
             } => {
                 let mut prefix = 0b0100_0000;
-                if no_dynamic {
+                if never_dynamic {
                     prefix |= 0b0010_0000;
                 }
                 if is_static {
@@ -334,27 +333,27 @@ where
                 encode_string(stream.as_mut(), 0, 1 + 7, huffman, value).await?;
             }
             FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
-                no_dynamic,
+                never_dynamic,
                 name_index,
                 huffman,
                 value,
             } => {
                 let mut prefix = 0b0000_0000;
-                if no_dynamic {
+                if never_dynamic {
                     prefix |= 0b0000_1000;
                 }
                 encode_integer(stream.as_mut(), prefix, 3, name_index).await?;
                 encode_string(stream.as_mut(), 0, 1 + 7, huffman, value).await?;
             }
             FieldLineRepresentation::LiteralFieldLineWithLiteralName {
-                no_dynamic,
+                never_dynamic,
                 name_huffman,
                 name,
                 value_huffman,
                 value,
             } => {
                 let mut prefix = 0b0010_0000;
-                if no_dynamic {
+                if never_dynamic {
                     prefix |= 0b0001_0000;
                 }
                 encode_string(stream.as_mut(), prefix, 1 + 3, name_huffman, name).await?;

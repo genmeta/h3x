@@ -1,19 +1,16 @@
 use std::{error::Error, mem};
 
 use bytes::{Buf, Bytes};
-use futures::{Stream, stream};
 use http::{
     HeaderMap, HeaderValue, Method, Uri,
-    header::{AsHeaderName, IntoHeaderName, InvalidHeaderValue},
+    header::{AsHeaderName, IntoHeaderName},
     uri::{Authority, PathAndQuery, Scheme},
 };
 use snafu::{Report, Snafu};
-use tokio::io::AsyncBufRead;
 
 use crate::{
     agent::{LocalAgent, RemoteAgent},
     client::Client,
-    codec::StreamReader,
     connection::InitialRequestStreamError,
     entity::{
         Entity, EntityStage, IllegalEntityOperator,
@@ -73,21 +70,14 @@ impl<C: quic::Connect> Client<C> {
 }
 
 impl<C: quic::Connect> PendingRequest<'_, C> {
-    pub fn headers_mut(&mut self) -> &mut HeaderMap {
-        &mut self.request.header_mut().header_map
-    }
-
-    pub fn scheme(&self) -> Option<Scheme> {
-        self.request.header().scheme()
+    pub fn set_method(mut self, method: Method) -> Self {
+        self.request.header_mut().set_method(method);
+        self
     }
 
     pub fn set_scheme(mut self, scheme: Scheme) -> Self {
         self.request.header_mut().set_scheme(scheme);
         self
-    }
-
-    pub fn authority(&self) -> Option<Authority> {
-        self.request.header().authority()
     }
 
     pub fn set_authority(mut self, authority: Authority) -> Self {
@@ -105,14 +95,13 @@ impl<C: quic::Connect> PendingRequest<'_, C> {
         self
     }
 
-    pub fn set_header(
-        mut self,
-        name: impl IntoHeaderName,
-        value: impl TryInto<HeaderValue, Error = InvalidHeaderValue>,
-    ) -> Result<Self, InvalidHeaderValue> {
-        let value = value.try_into()?;
+    pub fn headers_mut(&mut self) -> &mut HeaderMap {
+        &mut self.request.header_mut().header_map
+    }
+
+    pub fn set_header(mut self, name: impl IntoHeaderName, value: HeaderValue) -> Self {
         self.headers_mut().insert(name, value);
-        Ok(self)
+        self
     }
 
     pub fn set_headers(mut self, headers: HeaderMap) -> Self {
@@ -124,6 +113,22 @@ impl<C: quic::Connect> PendingRequest<'_, C> {
         self.request
             .set_body(body)
             .expect("Request in Header stage as it unsend");
+        self
+    }
+
+    pub fn trailers_mut(&mut self) -> &mut HeaderMap {
+        self.request
+            .trailers_mut()
+            .expect("Request never be interim_response")
+    }
+
+    pub fn set_trailer(mut self, name: impl IntoHeaderName, value: HeaderValue) -> Self {
+        self.trailers_mut().insert(name, value);
+        self
+    }
+
+    pub fn set_trailers(mut self, trailers: HeaderMap) -> Self {
+        *self.trailers_mut() = trailers;
         self
     }
 }
@@ -376,28 +381,6 @@ impl Response {
 
     pub async fn read(&mut self) -> Option<Result<Bytes, StreamError>> {
         self.stream.read(&mut self.entity).await
-    }
-
-    pub fn as_stream(&mut self) -> impl Stream<Item = Result<Bytes, StreamError>> + '_ {
-        stream::unfold(self, |response| async {
-            let result = response.read().await?;
-            Some((result, response))
-        })
-    }
-
-    pub fn into_stream(self) -> impl Stream<Item = Result<Bytes, StreamError>> {
-        stream::unfold(self, |mut response| async {
-            let result = response.read().await?;
-            Some((result, response))
-        })
-    }
-
-    pub fn as_reader(&mut self) -> impl AsyncBufRead + '_ {
-        StreamReader::new(self.as_stream())
-    }
-
-    pub fn into_reader(self) -> impl AsyncBufRead {
-        StreamReader::new(self.into_stream())
     }
 
     pub async fn trailers(&mut self) -> Result<&HeaderMap, StreamError> {

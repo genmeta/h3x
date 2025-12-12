@@ -575,10 +575,6 @@ impl WriteStream {
         entity: &mut Entity,
         mut content: impl Buf,
     ) -> Result<(), StreamError> {
-        entity
-            .header
-            .check_pseudo()
-            .context(SendMalformedPseudoHeaderSnafu)?;
         if entity.is_interim_response() {
             return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse.into());
         }
@@ -607,10 +603,6 @@ impl WriteStream {
     }
 
     pub async fn send_chunked_body(&mut self, entity: &mut Entity) -> Result<(), StreamError> {
-        entity
-            .header
-            .check_pseudo()
-            .context(SendMalformedPseudoHeaderSnafu)?;
         if entity.is_interim_response() {
             return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse.into());
         }

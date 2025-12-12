@@ -24,9 +24,9 @@ impl BufList {
         }
     }
 
-    pub fn write(&mut self, buf: Bytes) {
-        if !buf.is_empty() {
-            self.bufs.push_back(buf);
+    pub fn write(&mut self, mut buf: impl Buf) {
+        while buf.has_remaining() {
+            self.bufs.push_back(buf.copy_to_bytes(buf.chunk().len()));
         }
     }
 }
@@ -201,7 +201,7 @@ impl Cursor {
         }
     }
 
-    pub fn write(&mut self, buf: Bytes) {
+    pub fn write(&mut self, buf: impl Buf) {
         self.buflist.write(buf);
     }
 

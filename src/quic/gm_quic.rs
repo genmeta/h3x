@@ -264,6 +264,10 @@ impl quic::Listen for gm_quic::prelude::QuicListeners {
     fn accept(&self) -> BoxFuture<'_, Result<Self::Connection, Self::Error>> {
         self.accept().map_ok(|(connection, ..)| connection).boxed()
     }
+
+    fn shutdown(&self) {
+        self.shutdown();
+    }
 }
 
 impl quic::Listen for Arc<gm_quic::prelude::QuicListeners> {
@@ -276,6 +280,10 @@ impl quic::Listen for Arc<gm_quic::prelude::QuicListeners> {
             .accept()
             .map_ok(|(connection, ..)| connection)
             .boxed()
+    }
+
+    fn shutdown(&self) {
+        self.as_ref().shutdown();
     }
 }
 

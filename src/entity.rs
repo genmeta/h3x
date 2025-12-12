@@ -98,17 +98,11 @@ impl Entity {
     }
 
     pub fn is_request(&self) -> bool {
-        matches!(
-            self.header.pseudo_headers,
-            Some(PseudoHeaders::Request { .. })
-        )
+        self.header.is_request_header()
     }
 
     pub fn is_response(&self) -> bool {
-        matches!(
-            self.header.pseudo_headers,
-            Some(PseudoHeaders::Response { .. })
-        )
+        self.header.is_response_header()
     }
 
     pub fn enable_streaming(&mut self) -> Result<(), IllegalEntityOperator> {
@@ -139,7 +133,9 @@ impl Entity {
     }
 
     pub fn is_interim_response(&self) -> bool {
-        self.is_response() && self.header().status().is_informational()
+        self.is_response()
+            && self.header().check_pseudo().is_ok()
+            && self.header().status().is_informational()
     }
 
     pub fn header_mut(&mut self) -> &mut FieldSection {

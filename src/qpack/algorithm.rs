@@ -71,7 +71,7 @@ where
                     representations.push(
                         FieldLineRepresentation::LiteralFieldLineWithNameReference {
                             // TODO: implement this
-                            no_dynamic: true,
+                            never_dynamic: true,
                             is_static: true,
                             name_index: name_index as u64,
                             huffman: self.huffman_strategize.encode_with_huffman(false, &value),
@@ -81,7 +81,7 @@ where
                 }
             } else {
                 representations.push(FieldLineRepresentation::LiteralFieldLineWithLiteralName {
-                    no_dynamic: true,
+                    never_dynamic: true,
                     name_huffman: self.huffman_strategize.encode_with_huffman(true, &name),
                     name: name.clone(),
                     value_huffman: self.huffman_strategize.encode_with_huffman(false, &value),

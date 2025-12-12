@@ -137,8 +137,6 @@ impl Request {
     }
 }
 
-// TODO: check whether request completion or not in drop?
-
 pub struct Response {
     entity: Entity,
     stream: WriteStream,

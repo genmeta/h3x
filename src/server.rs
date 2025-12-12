@@ -72,6 +72,7 @@ impl<L: quic::Listen> Servers<L> {
                     // failed to initial h3 connection
                     return;
                 };
+
                 tracing::debug!("Accepted new H3 connection");
                 let Ok(local_agent) = connection.local_agent().await else {
                     // connection already closed
@@ -87,10 +88,11 @@ impl<L: quic::Listen> Servers<L> {
                     connection.close(&Code::H3_INTERNAL_ERROR);
                     return;
                 };
-                tracing::Span::current().record("server_name", local_agent.name());
 
+                tracing::Span::current().record("server_name", local_agent.name());
                 let connection = Arc::new(connection);
                 _ = pool.try_insert(connection.clone());
+                // TODO: router with authority?
                 let Some(router) = router.get(local_agent.name()) else {
                     tracing::debug!("fallback");
                     todo!("fallback: connected server not exist");
@@ -99,56 +101,91 @@ impl<L: quic::Listen> Servers<L> {
                 let mut connection_tasks = JoinSet::new();
 
                 loop {
-                    let (mut rs, wr) = match connection.accept_request_stream().await {
-                        Ok(pair) => {
-                            tracing::debug!("Accepted incoming request stream");
-                            pair
-                        }
-                        Err(error) => {
-                            tracing::debug!(
-                                error = %Report::from_error(error),
-                                "Failed to accept incoming request"
-                            );
-                            break;
-                        }
-                    };
+                    let (mut read_stream, write_stream) =
+                        match connection.accept_request_stream().await {
+                            Ok(pair) => {
+                                tracing::debug!("Accepted incoming request stream");
+                                pair
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    error = %Report::from_error(error),
+                                    "Failed to accept incoming request"
+                                );
+                                break;
+                            }
+                        };
 
-                    let stream_id = match rs.stream_id().await {
+                    let stream_id = match read_stream.stream_id().await {
                         Ok(stream_id) => stream_id,
                         Err(error) => {
                             tracing::debug!(
                                 error = %Report::from_error(error),
-                                "Failed to get stream ID for incoming request"
+                                "Failed to acquire incoming request stream ID"
                             );
                             continue;
                         }
                     };
 
                     let router = router.clone();
-                    let la = local_agent.clone();
-                    let ra = remote_agent.clone();
+                    let unresolved_request = UnresolvedRequest::new(
+                        read_stream,
+                        write_stream,
+                        local_agent.clone(),
+                        remote_agent.clone(),
+                    );
                     let span = tracing::info_span!("handle_request", stream_id = %stream_id);
                     let handle_request = async move {
                         tracing::debug!("Resolving incoming request");
-                        let (req, rsp) =
-                            match UnresolvedRequest::new(rs, wr, la, ra).resolve().await {
-                                Ok(pair) => pair,
-                                Err(error) => {
-                                    tracing::debug!(
-                                        error = %Report::from_error(error),
-                                        "Failed to resolve incoming request"
-                                    );
-                                    return;
-                                }
-                            };
-                        tracing::debug!(request=?req.headers(), "Resolved new request");
-                        // FIXME: downcast into Router to avoid cloning
-                        router.clone().handle(req, rsp).await;
+                        let (req, rsp) = match unresolved_request.resolve().await {
+                            Ok(pair) => pair,
+                            Err(error) => {
+                                tracing::debug!(
+                                    error = %Report::from_error(error),
+                                    "Failed to resolve incoming request"
+                                );
+                                return;
+                            }
+                        };
+
+                        tracing::debug!(method = %req.method(), uri = %req.uri(), "Resolved new request");
+                        match router.downcast_ref::<Router>() {
+                            Some(router) => router.handle(req, rsp).await,
+                            None => router.clone().handle(req, rsp).await,
+                        }
                     };
                     connection_tasks.spawn(handle_request.instrument(span));
                 }
             };
             tasks.spawn(handle_connection.instrument(span));
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.acceptor.shutdown();
+    }
+}
+
+#[cfg(feature = "gm-quic")]
+mod gm_quic {
+    use ::gm_quic::prelude::{BindUri, QuicListeners, ServerError, handy};
+
+    use super::*;
+
+    impl Servers<QuicListeners> {
+        pub fn with_server(
+            self,
+            server_name: impl Into<String>,
+            cert_chain: impl handy::ToCertificate,
+            private_key: impl handy::ToPrivateKey,
+            bind_uris: impl IntoIterator<Item = impl Into<BindUri>>,
+            ocsp: impl Into<Option<Vec<u8>>>,
+            router: impl IntoBoxService,
+        ) -> Result<Self, ServerError> {
+            let server_name = server_name.into();
+            self.acceptor
+                .add_server(&server_name, cert_chain, private_key, bind_uris, ocsp)?;
+            Ok(self.serve(server_name, router))
         }
     }
 }

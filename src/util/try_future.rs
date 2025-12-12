@@ -7,10 +7,7 @@ use std::{
 use futures::{Sink, Stream};
 use tokio::io::{self, AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{
-    quic::{self, CancelStream, GetStreamId, StopStream},
-    varint::VarInt,
-};
+use crate::{quic, varint::VarInt};
 
 pin_project_lite::pin_project! {
     /// A lazily opened stream.
@@ -78,9 +75,9 @@ where
     }
 }
 
-impl<S, E, F> GetStreamId for TryFuture<S, E, F>
+impl<S, E, F> quic::GetStreamId for TryFuture<S, E, F>
 where
-    S: GetStreamId,
+    S: quic::GetStreamId,
     E: Clone,
     quic::StreamError: From<E>,
     F: Future<Output = Result<S, E>>,
@@ -93,9 +90,9 @@ where
     }
 }
 
-impl<S, E, F> StopStream for TryFuture<S, E, F>
+impl<S, E, F> quic::StopStream for TryFuture<S, E, F>
 where
-    S: StopStream,
+    S: quic::StopStream,
     E: Clone,
     quic::StreamError: From<E>,
     F: Future<Output = Result<S, E>>,
@@ -162,9 +159,9 @@ where
     }
 }
 
-impl<S, E, F> CancelStream for TryFuture<S, E, F>
+impl<S, E, F> quic::CancelStream for TryFuture<S, E, F>
 where
-    S: CancelStream,
+    S: quic::CancelStream,
     E: Clone,
     quic::StreamError: From<E>,
     F: Future<Output = Result<S, E>>,

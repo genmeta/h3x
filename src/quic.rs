@@ -117,6 +117,8 @@ pub trait Listen {
     type Error: Error + Any;
 
     fn accept(&self) -> BoxFuture<'_, Result<Self::Connection, Self::Error>>;
+
+    fn shutdown(&self);
 }
 
 pub trait Connection:

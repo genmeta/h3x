@@ -1,5 +1,5 @@
 pub mod agent;
-mod buflist;
+pub mod buflist;
 pub mod client;
 mod codec;
 pub mod connection;

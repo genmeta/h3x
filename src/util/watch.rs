@@ -69,13 +69,6 @@ impl<T> Watch<T> {
         guard.clone()
     }
 
-    pub fn get(&self) -> Get<T> {
-        Get {
-            notified: self.notify.clone().notified_owned(),
-            value: self.value.clone(),
-        }
-    }
-
     pub fn watch(&self) -> Watcher<T> {
         Watcher {
             notified: self.notify.clone().notified_owned(),
