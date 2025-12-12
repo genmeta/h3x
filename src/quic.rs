@@ -65,6 +65,7 @@ impl From<io::Error> for StreamError {
 
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
+#[snafu(display("Transport error({kind:x} in frame {frame_type:x}): {reason}",))]
 pub struct TransportError {
     pub kind: VarInt,
     pub frame_type: VarInt,
@@ -73,6 +74,7 @@ pub struct TransportError {
 
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
+#[snafu(display("Application error({code}): {reason}",))]
 pub struct ApplicationError {
     pub code: Code,
     pub reason: Cow<'static, str>,

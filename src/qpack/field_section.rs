@@ -11,7 +11,7 @@ use http::{
     status,
     uri::{self, Authority, PathAndQuery, Scheme},
 };
-use snafu::{Snafu, ensure};
+use snafu::{OptionExt, Snafu, ensure};
 
 use crate::{
     codec::Decode,
@@ -98,6 +98,7 @@ impl PseudoHeaders {
 }
 
 #[derive(Debug, Snafu)]
+#[snafu(module, visibility(pub))]
 pub enum MalformedHeaderSection {
     #[snafu(display("Invalid pseudo-header field with name {name:?}"))]
     InvalidPseudoHeader { name: Bytes },
@@ -122,7 +123,7 @@ pub enum MalformedHeaderSection {
     #[snafu(display("Mismatch between :authority and Host header fields"))]
     AuthorityHostMismatch,
     #[snafu(display("Absence of mandatory pseudo-header fields"))]
-    AbsenceOfMandatoryPseudoHeaders,
+    AbsenceOfMandatoryPseudoHeaders { backtrace: snafu::Backtrace },
     #[snafu(display("Unexpected :scheme pseudo-header for CONNECT request"))]
     UnexpectedSchemeForConnectRequest,
     #[snafu(display("Unexpected :path pseudo-header for CONNECT request"))]
@@ -242,15 +243,17 @@ impl FieldSection {
                 // :scheme, and :path pseudo-header fields, unless the request is a
                 // CONNECT request; see Section 4.4.
                 let Some(method) = method else {
-                    return Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders);
+                    return malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu.fail();
                 };
 
                 if method != Method::CONNECT {
                     let Some(scheme) = scheme else {
-                        return Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders);
+                        return malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu
+                            .fail();
                     };
                     let Some(_path) = path else {
-                        return Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders);
+                        return malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu
+                            .fail();
                     };
 
                     // If the :scheme pseudo-header field identifies a scheme that has a
@@ -288,9 +291,7 @@ impl FieldSection {
                                 }
                             }
                             (None, None) => {
-                                return Err(
-                                    MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders,
-                                );
+                                return malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu.fail();
                             }
                         }
                     }
@@ -323,7 +324,7 @@ impl FieldSection {
             }
             PseudoHeaders::Response { status } => {
                 let Some(_status) = status else {
-                    return Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders);
+                    return malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu.fail();
                 };
                 Ok(())
             }
@@ -442,7 +443,10 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                             return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
                         }
                     };
-                    ensure!(method.is_none(), DuplicatePseudoHeaderSnafu { name });
+                    ensure!(
+                        method.is_none(),
+                        malformed_header_section::DuplicatePseudoHeaderSnafu { name }
+                    );
                     *method =
                         Some(Method::from_bytes(&value[..]).map_err(MalformedHeaderSection::from)?);
                     pseudo_headers = Some(pseudo)
@@ -457,7 +461,10 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                             return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
                         }
                     };
-                    ensure!(scheme.is_none(), DuplicatePseudoHeaderSnafu { name });
+                    ensure!(
+                        scheme.is_none(),
+                        malformed_header_section::DuplicatePseudoHeaderSnafu { name }
+                    );
                     *scheme =
                         Some(Scheme::try_from(&value[..]).map_err(MalformedHeaderSection::from)?);
                     pseudo_headers = Some(pseudo)
@@ -472,7 +479,10 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                             return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
                         }
                     };
-                    ensure!(authority.is_none(), DuplicatePseudoHeaderSnafu { name });
+                    ensure!(
+                        authority.is_none(),
+                        malformed_header_section::DuplicatePseudoHeaderSnafu { name }
+                    );
                     *authority = Some(
                         Authority::from_maybe_shared(value)
                             .map_err(MalformedHeaderSection::from)?,
@@ -490,7 +500,10 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                             return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
                         }
                     };
-                    ensure!(scheme.is_none(), DuplicatePseudoHeaderSnafu { name });
+                    ensure!(
+                        scheme.is_none(),
+                        malformed_header_section::DuplicatePseudoHeaderSnafu { name }
+                    );
                     *scheme = Some(
                         PathAndQuery::from_maybe_shared(value)
                             .map_err(MalformedHeaderSection::from)?,
@@ -508,7 +521,10 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                             return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
                         }
                     };
-                    ensure!(status.is_none(), DuplicatePseudoHeaderSnafu { name });
+                    ensure!(
+                        status.is_none(),
+                        malformed_header_section::DuplicatePseudoHeaderSnafu { name }
+                    );
                     *status = Some(
                         StatusCode::try_from(&value[..]).map_err(MalformedHeaderSection::from)?,
                     );
@@ -557,7 +573,7 @@ impl TryFrom<FieldSection> for request::Parts {
             path,
         } = value
             .pseudo_headers
-            .ok_or(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders)?
+            .context(malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu)?
         else {
             return Err(MalformedHeaderSection::ResponsePseudoHeaderInRequest);
         };
@@ -573,7 +589,9 @@ impl TryFrom<FieldSection> for request::Parts {
             uri = uri.path_and_query(path);
         }
         let uri = uri.build()?;
-        let method = method.ok_or(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders)?;
+        let method =
+            method.context(malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu)?;
+
         let mut request = Request::builder().uri(uri).method(method).body(())?;
         *request.headers_mut() = value.header_map;
 
@@ -596,12 +614,13 @@ impl TryFrom<FieldSection> for response::Parts {
     fn try_from(value: FieldSection) -> Result<Self, Self::Error> {
         let PseudoHeaders::Response { status } = value
             .pseudo_headers
-            .ok_or(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders)?
+            .context(malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu)?
         else {
             return Err(MalformedHeaderSection::RequestPseudoHeaderInResponse);
         };
 
-        let status = status.ok_or(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders)?;
+        let status =
+            status.context(malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu)?;
         let response = Response::builder().status(status).body(())?;
         Ok(response.into_parts().0)
     }

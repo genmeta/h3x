@@ -159,6 +159,18 @@ impl fmt::Display for VarInt {
     }
 }
 
+impl fmt::LowerHex for VarInt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::UpperHex for VarInt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Error module for VarInt
 pub mod err {
     use std::fmt::Debug;

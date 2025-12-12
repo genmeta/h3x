@@ -7,7 +7,6 @@ use http::{
     header::{AsHeaderName, IntoHeaderName},
     uri::{Authority, PathAndQuery, Scheme},
 };
-use snafu::Report;
 
 use crate::{
     entity::{
@@ -19,7 +18,7 @@ use crate::{
 
 pub struct UnresolvedRequest {
     request: Request,
-    response: Response,
+    response: WriteStream,
 }
 
 impl UnresolvedRequest {
@@ -29,10 +28,7 @@ impl UnresolvedRequest {
                 entity: Entity::unresolved_request(),
                 stream: read_stream,
             },
-            response: Response {
-                entity: Entity::unresolved_response(),
-                stream: write_stream,
-            },
+            response: write_stream,
         }
     }
 
@@ -41,7 +37,11 @@ impl UnresolvedRequest {
             .stream
             .read_header(&mut self.request.entity)
             .await?;
-        Ok((self.request, self.response))
+        let response = Response {
+            entity: Entity::unresolved_response(),
+            stream: self.response,
+        };
+        Ok((self.request, response))
     }
 }
 
@@ -154,9 +154,6 @@ impl Response {
     }
 
     pub fn set_status(&mut self, status: http::StatusCode) -> Result<&mut Self, StreamError> {
-        if self.entity.stage() > EntityStage::Header {
-            return Err(IllegalEntityOperator::ModifyHeaderAfterSent.into());
-        }
         self.entity.header_mut().set_status(status);
         Ok(self)
     }
@@ -224,13 +221,17 @@ impl Drop for Response {
             // It's ok to take: Response will not be used after drop
             let mut stream = self.stream.take();
             let mut entity = mem::replace(&mut self.entity, Entity::unresolved_response());
+            tracing::debug!(
+                target: "h3x::server", ?entity,
+                "Response is dropped before completion, closing the stream"
+            );
             tokio::spawn(async move {
                 if let Err(StreamError::IllegalEntityOperator { source }) =
                     stream.close(&mut entity).await
                 {
                     tracing::warn!(
                         target: "h3x::server",
-                        "Response stream cannot be closed properly: {}", Report::from_error(source)
+                        "Response stream cannot be closed properly: {:?}", source
                     );
                 }
             });

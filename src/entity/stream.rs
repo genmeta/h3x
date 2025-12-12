@@ -23,7 +23,7 @@ use crate::{
     frame::{Frame, stream::FrameStream},
     qpack::{
         algorithm::{HuffmanAlways, StaticCompressAlgo},
-        field_section::{FieldSection, MalformedHeaderSection},
+        field_section::{FieldSection, MalformedHeaderSection, malformed_header_section},
     },
     quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
     varint::VarInt,
@@ -221,12 +221,12 @@ impl ReadStream {
                 header.check_pseudo()?;
                 if entity.header.is_request_header() {
                     if !header.is_request_header() {
-                        return Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders.into());
+                        malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu.fail()?;
                     }
                 } else {
                     debug_assert!(entity.header.is_response_header());
                     if !header.is_response_header() {
-                        return Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders.into());
+                        malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu.fail()?;
                     }
                 }
                 Ok(header)
@@ -464,13 +464,12 @@ impl ReadStream {
     }
 }
 
-impl quic::StopStream for ReadStream {
-    fn poll_stop(
+impl quic::GetStreamId for ReadStream {
+    fn poll_stream_id(
         self: Pin<&mut Self>,
         cx: &mut Context,
-        code: VarInt,
-    ) -> Poll<Result<(), quic::StreamError>> {
-        Pin::new(&mut self.get_mut().stream).poll_stop(cx, code)
+    ) -> Poll<Result<VarInt, quic::StreamError>> {
+        Pin::new(&mut self.get_mut().stream).poll_stream_id(cx)
     }
 }
 
@@ -531,6 +530,12 @@ impl WriteStream {
         f: impl AsyncFnOnce(&mut Self) -> Result<T, connection::StreamError>,
     ) -> Result<T, StreamError> {
         let peer_goaway = self.peer_goaway().await?;
+        let f = async move |this: &mut Self| {
+            let value = f(this).await?;
+            // ensure all data are written into the underlying QUIC stream
+            this.stream.flush_buffer().await?;
+            Ok(value)
+        };
         tokio::select! {
             result = f(self) => match result {
                 Ok(value) => Ok(value),
@@ -582,10 +587,13 @@ impl WriteStream {
         entity: &mut Entity,
         mut content: impl Buf,
     ) -> Result<(), StreamError> {
+        entity
+            .header
+            .check_pseudo()
+            .context(SendMalformedPseudoHeaderSnafu)?;
         if entity.is_interim_response() {
             return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse.into());
         }
-
         entity.enable_streaming()?;
 
         match entity.stage {
@@ -611,9 +619,14 @@ impl WriteStream {
     }
 
     pub async fn send_chunked_body(&mut self, entity: &mut Entity) -> Result<(), StreamError> {
+        entity
+            .header
+            .check_pseudo()
+            .context(SendMalformedPseudoHeaderSnafu)?;
         if entity.is_interim_response() {
             return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse.into());
         }
+
         match entity.stage {
             EntityStage::Header => {
                 self.send_header(entity).await?;
@@ -703,7 +716,7 @@ impl WriteStream {
 
     pub async fn flush(&mut self, entity: &mut Entity) -> Result<(), StreamError> {
         self.send_pending_sections(entity).await?;
-        self.try_io(async move |this| Ok(this.stream.flush().await?))
+        self.try_io(async move |this| Ok(this.stream.flush_inner().await?))
             .await
     }
 
@@ -726,5 +739,14 @@ impl WriteStream {
             qpack_encoder: self.qpack_encoder.clone(),
             connection: self.connection.clone(),
         }
+    }
+}
+
+impl quic::GetStreamId for WriteStream {
+    fn poll_stream_id(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Result<VarInt, quic::StreamError>> {
+        Pin::new(&mut self.get_mut().stream).poll_stream_id(cx)
     }
 }

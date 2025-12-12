@@ -285,6 +285,7 @@ impl quic::Connect for gm_quic::prelude::QuicClient {
     type Error = gm_quic::prelude::ConnectServerError;
 
     fn connect(&self, name: &str) -> BoxFuture<'_, Result<Self::Connection, Self::Error>> {
+        tracing::debug!(target: "h3x::client", "Connecting to {name} via gm_quic");
         self.connect(name).boxed()
     }
 }
@@ -374,7 +375,7 @@ mod tests {
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
     #[tokio::test]
-    async fn simple_echo() -> Result<(), BoxError> {
+    async fn simpl_server() -> Result<(), BoxError> {
         init_tracing();
 
         let (quic_listeners, listen_addr) = quic_listeners();
@@ -392,15 +393,31 @@ mod tests {
                 resp.close().await.unwrap();
                 tracing::info!("Echo done");
             };
+            let health_service = async |_req: server::Request, mut resp: server::Response| {
+                tracing::info!("Health service called");
+                resp.set_status(StatusCode::OK)
+                    .unwrap()
+                    .set_body(b"Hello, World!".as_slice())
+                    .unwrap()
+                    .close()
+                    .await
+                    .unwrap();
+                tracing::info!("Health done");
+            };
             servers
-                .serve("localhost", Router::new().route("/echo", echo_service))
+                .serve(
+                    "localhost",
+                    Router::new()
+                        .post("/echo", echo_service)
+                        .get("/health", health_service),
+                )
                 .run()
                 .await;
             Ok::<_, BoxError>(())
         }
         .instrument(tracing::info_span!("server"));
 
-        let client = async move {
+        let client_echo = async {
             let port = listen_addr.port();
             let (mut req, mut resp) = client
                 .new_request()
@@ -419,10 +436,53 @@ mod tests {
             let response = response.copy_to_bytes(response.remaining());
             assert!(response.as_ref() == content);
 
-            quic_listeners.shutdown();
             Ok::<_, BoxError>(())
         }
-        .instrument(tracing::info_span!("client"));
+        .instrument(tracing::info_span!("client_echo"));
+
+        let client_health = async {
+            let port = listen_addr.port();
+            let (_req, mut resp) = client
+                .new_request()
+                .set_uri(format!("https://localhost:{port}/health").parse()?)
+                .get()
+                .await?;
+            tracing::info!("Request header sent");
+
+            assert_eq!(resp.status().await?, StatusCode::OK);
+            let mut response = resp.read_all().await?;
+            tracing::info!("Response received");
+            let response = response.copy_to_bytes(response.remaining());
+            assert!(response.as_ref() == b"Hello, World!");
+
+            Ok::<_, BoxError>(())
+        }
+        .instrument(tracing::info_span!("client_health"));
+
+        let client_fallback = async {
+            let port = listen_addr.port();
+            let (_req, mut resp) = client
+                .new_request()
+                .set_uri(format!("https://localhost:{port}/not_found").parse()?)
+                .get()
+                .await?;
+            tracing::info!("Request header sent");
+
+            assert_eq!(resp.status().await?, StatusCode::NOT_FOUND);
+            let mut response = resp.read_all().await?;
+            tracing::info!("Response received");
+            let response = response.copy_to_bytes(response.remaining());
+            assert!(response.is_empty());
+
+            Ok::<_, BoxError>(())
+        }
+        .instrument(tracing::info_span!("client_fallback"));
+
+        let client = async {
+            tokio::try_join!(client_echo, client_health, client_fallback)?;
+            quic_listeners.shutdown();
+            Ok::<_, BoxError>(())
+        };
 
         tokio::try_join!(client, server)?;
         Ok(())

@@ -17,7 +17,7 @@ use crate::{
         Entity, EntityStage, IllegalEntityOperator,
         stream::{ReadStream, StreamError, WriteStream},
     },
-    qpack::field_section::FieldSection,
+    qpack::field_section::{FieldSection, MalformedHeaderSection},
     quic,
     varint::VarInt,
 };
@@ -46,6 +46,10 @@ pub enum RequestError<E: Error + 'static> {
     Connect { source: ConnectError<E> },
     #[snafu(transparent)]
     Stream { source: StreamError },
+    #[snafu(transparent)]
+    MalformedHeader { source: MalformedHeaderSection },
+    #[snafu(display("Expected HTTPS scheme"))]
+    NotHttpsScheme,
 }
 
 impl<C: quic::Connect> Client<C> {
@@ -121,21 +125,31 @@ where
     <C::Connection as quic::ManageStream>::StreamReader: Send,
     <C::Connection as quic::ManageStream>::StreamWriter: Send,
 {
-    #[tracing::instrument(level = "debug", target = "h3x::client", name = "do_request", skip_all)]
+    #[tracing::instrument(
+        level = "debug",
+        target = "h3x::client",
+        name = "do_request",
+        skip_all,
+        err
+    )]
     pub async fn r#do(
         mut self,
         method: Method,
     ) -> Result<(Request, Response), RequestError<C::Error>> {
-        tracing::debug!(request_header = ?self.request.header());
         self.request.header_mut().set_method(method);
+        self.request.header().check_pseudo()?;
+        if self.request.header().scheme() != Some(Scheme::HTTPS) {
+            return Err(RequestError::NotHttpsScheme);
+        }
 
-        let authority = self
-            .request
-            .header()
-            .authority()
-            .expect("TODO: validate reqeust pseudo headers");
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::Span::current()
+                .record("method", self.request.header().method().as_str())
+                .record("uri", self.request.header().uri().to_string());
+        }
 
-        tracing::debug!(%authority, "Connect, once?");
+        let authority = self.request.header().authority().expect("Checked");
+
         let connection = self.client.connect(authority.clone()).await?;
         tracing::debug!(%authority, "Connected");
 

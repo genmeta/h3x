@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use snafu::Report;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
@@ -7,16 +8,20 @@ use crate::{
     connection::{Connection, settings::Settings},
     endpoint::pool::Pool,
     error::Code,
-    quic,
+    quic::{self, GetStreamIdExt},
 };
 
 mod entity;
+mod method;
 mod route;
 mod service;
 
 pub use entity::{Request, Response, UnresolvedRequest};
+pub use method::MethodRouter;
 pub use route::Router;
-pub use service::{BoxService, BoxServiceFuture, IntoBoxService, Service, box_service};
+pub use service::{
+    BoxService, BoxServiceFuture, ErasedService, IntoBoxService, Service, box_service,
+};
 
 #[derive(Debug, Clone)]
 pub struct Servers<L: quic::Listen> {
@@ -60,7 +65,8 @@ impl<L: quic::Listen> Servers<L> {
             let pool = self.pool.clone();
             let settings = self.settings.clone();
             let router = router.clone();
-            let span = tracing::info_span!("handle_connection", server_name = "<unresolved>");
+            let span =
+                tracing::info_span!("handle_connection", server_name = tracing::field::Empty);
             let handle_connection = async move {
                 tracing::debug!("Accepted new QUIC connection");
                 let Ok(connection) = Connection::new(settings, connection).await else {
@@ -79,7 +85,6 @@ impl<L: quic::Listen> Servers<L> {
                     return;
                 };
                 tracing::Span::current().record("server_name", local_agent.name());
-                tracing::debug!("resolving incoming requests...");
 
                 let connection = Arc::new(connection);
                 _ = pool.try_insert(connection.clone());
@@ -91,26 +96,50 @@ impl<L: quic::Listen> Servers<L> {
                 let mut connection_tasks = JoinSet::new();
 
                 loop {
-                    let (rs, ws) = match connection.accept_request_stream().await {
-                        Ok(pair) => pair,
+                    let (mut rs, ws) = match connection.accept_request_stream().await {
+                        Ok(pair) => {
+                            tracing::debug!("Accepted incoming request stream");
+                            pair
+                        }
                         Err(error) => {
-                            tracing::debug!(%error, "Failed to accept incoming request");
+                            tracing::debug!(
+                                error = %Report::from_error(error),
+                                "Failed to accept incoming request"
+                            );
                             break;
                         }
                     };
+
+                    let stream_id = match rs.stream_id().await {
+                        Ok(stream_id) => stream_id,
+                        Err(error) => {
+                            tracing::debug!(
+                                error = %Report::from_error(error),
+                                "Failed to get stream ID for incoming request"
+                            );
+                            continue;
+                        }
+                    };
+
                     let router = router.clone();
-                    connection_tasks.spawn(async move {
+                    let span = tracing::info_span!("handle_request", stream_id = %stream_id);
+                    let handle_request = async move {
+                        tracing::debug!("Resolving incoming request");
                         let (req, rsp) = match UnresolvedRequest::new(rs, ws).resolve().await {
                             Ok(pair) => pair,
                             Err(error) => {
-                                tracing::debug!(%error, "Failed to resolve incoming request");
+                                tracing::debug!(
+                                    error = %Report::from_error(error),
+                                    "Failed to resolve incoming request"
+                                );
                                 return;
                             }
                         };
                         tracing::debug!(request=?req.headers(), "Resolved new request");
-                        // FIXME: downcast into Router
+                        // FIXME: downcast into Router to avoid cloning
                         router.clone().handle(req, rsp).await;
-                    });
+                    };
+                    connection_tasks.spawn(handle_request.instrument(span));
                 }
             };
             tasks.spawn(handle_connection.instrument(span));

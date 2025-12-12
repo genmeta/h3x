@@ -41,8 +41,23 @@ pub trait IntoBoxService: Service<Future: Send + 'static> + Clone + Send + Sync 
 impl<S: Service<Future: Send + 'static> + Clone + Send + Sync + 'static> IntoBoxService for S {}
 
 pub type BoxServiceFuture = BoxFuture<'static, ()>;
+type DynService = dyn CloneableService<Future = BoxServiceFuture> + Send + Sync;
 
-pub struct BoxService(Box<dyn CloneableService<Future = BoxServiceFuture> + Send + Sync>);
+// transparent wrapper to erase the concrete type of Service
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct ErasedService<S: ?Sized>(S);
+
+impl<S: Service<Future: Send + 'static> + ?Sized> Service for ErasedService<S> {
+    type Future = BoxServiceFuture;
+
+    #[inline]
+    fn handle(&mut self, request: Request, response: Response) -> Self::Future {
+        Box::pin(self.0.handle(request, response))
+    }
+}
+
+pub struct BoxService(Box<DynService>);
 
 impl std::fmt::Debug for BoxService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -52,17 +67,29 @@ impl std::fmt::Debug for BoxService {
 
 impl BoxService {
     pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
-        (self.0.as_ref() as &dyn Any).downcast_ref()
+        (self.0.as_ref() as &dyn Any)
+            .downcast_ref::<ErasedService<T>>()
+            .map(|ErasedService(s)| s)
     }
 
     pub fn downcast_mut<T: Any>(&mut self) -> Option<&mut T> {
-        (self.0.as_mut() as &mut dyn Any).downcast_mut()
+        (self.0.as_mut() as &mut dyn Any)
+            .downcast_mut::<ErasedService<T>>()
+            .map(|ErasedService(s)| s)
     }
 
     pub fn downcast<T: Any>(self) -> Result<Box<T>, BoxService> {
-        match (self.0.as_ref() as &dyn Any).is::<T>() {
-            // SAFETY: checked by is::<T>()
-            true => Ok(unsafe { (self.0 as Box<dyn Any>).downcast().unwrap_unchecked() }),
+        match (self.0.as_ref() as &dyn Any).is::<ErasedService<T>>() {
+            true => {
+                // SAFETY: checked by is::<T>()
+                let erased_service = unsafe {
+                    (self.0 as Box<dyn Any>)
+                        .downcast::<ErasedService<T>>()
+                        .unwrap_unchecked()
+                };
+                // SAFETY: ErasedService<T> is a transparent wrapper around T
+                Ok(unsafe { std::mem::transmute::<Box<ErasedService<T>>, Box<T>>(erased_service) })
+            }
             false => Err(self),
         }
     }
@@ -86,16 +113,5 @@ pub fn box_service<S>(service: S) -> BoxService
 where
     S: Service<Future: Send + 'static> + Clone + Send + Sync + 'static,
 {
-    #[derive(Clone, Copy)]
-    struct ErasedService<S>(S);
-
-    impl<S: Service<Future: Send + 'static>> Service for ErasedService<S> {
-        type Future = BoxServiceFuture;
-
-        fn handle(&mut self, request: Request, response: Response) -> Self::Future {
-            Box::pin(self.0.handle(request, response))
-        }
-    }
-
     BoxService(Box::new(ErasedService(service)))
 }

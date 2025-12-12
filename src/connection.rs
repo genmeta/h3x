@@ -536,7 +536,10 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
             }
             let settings = Arc::new(settings_frame.decode_one::<Settings>().await?);
             tracing::debug!("Remote settings applied: {:?}", settings);
-            conn_state.peer_settings.set(settings.clone()).unwrap();
+            conn_state
+                .peer_settings
+                .set(settings.clone())
+                .expect("duplicate peer settings");
             encoder.apply_settings(settings.clone()).await;
 
             loop {
@@ -615,12 +618,16 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
                 return Err(state.error().await);
             }
         };
-        let settings_frame = BufList::new()
-            .encode(state.local_settings.as_ref())
-            .await
-            .unwrap();
+        let Ok(settings_frame) = BufList::new().encode(state.local_settings.as_ref()).await;
         match control_stream.send(settings_frame).await {
-            Ok(()) => {}
+            Ok(()) => (),
+            Err(error) => {
+                state.handle_error(error).await;
+                return Err(state.error().await);
+            }
+        }
+        match control_stream.flush().await {
+            Ok(()) => (),
             Err(error) => {
                 state.handle_error(error).await;
                 return Err(state.error().await);
@@ -654,10 +661,8 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
 
     pub async fn goaway(&self, goaway: Goaway) -> Result<(), quic::StreamError> {
         let mut control_stream = self.control_stream.lock().await;
-        match control_stream
-            .send(BufList::new().encode(goaway).await.unwrap())
-            .await
-        {
+        let Ok(goaway_frame) = BufList::new().encode(goaway).await;
+        match control_stream.send(goaway_frame).await {
             Ok(()) => Ok(()),
             Err(error) => Err(self.state.handle_error(error).await),
         }

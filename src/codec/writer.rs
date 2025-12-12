@@ -56,8 +56,26 @@ where
         Poll::Ready(Ok(()))
     }
 
-    pub async fn flush_buffer(mut self: Pin<&mut Self>) -> Result<(), S::Error> {
-        poll_fn(|cx| self.as_mut().poll_flush_buffer(cx)).await
+    pub async fn flush_buffer(&mut self) -> Result<(), S::Error>
+    where
+        S: Unpin,
+    {
+        poll_fn(|cx| Pin::new(&mut *self).poll_flush_buffer(cx)).await
+    }
+
+    pub fn poll_flush_inner(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), S::Error>> {
+        ready!(self.as_mut().poll_flush_buffer(cx)?);
+        self.project().sink.poll_flush(cx)
+    }
+
+    pub async fn flush_inner(&mut self) -> Result<(), S::Error>
+    where
+        S: Unpin,
+    {
+        poll_fn(|cx| Pin::new(&mut *self).poll_flush_inner(cx)).await
     }
 
     pub fn sink(&self) -> &S {

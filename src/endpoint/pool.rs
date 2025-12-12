@@ -53,6 +53,7 @@ impl<C: quic::Connection> ReuseableConnection<C> {
         let mut connections = pin!(self.connection.watch());
 
         loop {
+            tracing::debug!("(Re)trying to reuse connection");
             if let Some(connection) = self.reuse() {
                 return Ok(connection);
             }
@@ -63,8 +64,10 @@ impl<C: quic::Connection> ReuseableConnection<C> {
                     continue;
                 }
                 _guard = self.connect.lock() => {
+                    tracing::debug!("Acquired connection lock, try to initial connection");
                     // its ok to replace the connection, reference of replaced connection still in task until closed
                     let connection = try_initial().await?;
+                    tracing::debug!("Initialed new connection, gogogo");
                     self.connection.set(connection.clone());
                 }
             }
@@ -73,10 +76,11 @@ impl<C: quic::Connection> ReuseableConnection<C> {
 }
 
 type ConnectionIdentifier = (String, Arc<Settings>);
+type ReuseableConnections<C> = DashMap<(String, Arc<Settings>), Arc<ReuseableConnection<C>>>;
 
 #[derive(Debug)]
 pub struct Pool<C: quic::Connection> {
-    connections: Arc<DashMap<ConnectionIdentifier, ReuseableConnection<C>>>,
+    connections: Arc<ReuseableConnections<C>>,
     tasks: Arc<SyncMutex<JoinSet<()>>>,
 }
 
@@ -143,23 +147,35 @@ pub enum InsertError {
 }
 
 impl<C: quic::Connection> Pool<C> {
+    fn try_release(connections: Arc<ReuseableConnections<C>>, identify: ConnectionIdentifier) {
+        tokio::task::spawn_blocking(move || {
+            (connections.as_ref())
+                .remove_if(&identify, |_, connection| connection.reuse().is_none());
+        });
+    }
+
     pub async fn reuse_or_connect_with<E: Error + 'static>(
         &self,
-        peer_name: &str,
+        server: &str,
         settings: Arc<Settings>,
         mut try_connect: impl AsyncFnMut() -> Result<C, E>,
     ) -> Result<Arc<Connection<C>>, ConnectError<E>> {
-        let peer_name = peer_name.to_string();
-        let result = self
+        let peer_name = server.to_string();
+        let reuseable_connection = self
             .connections
             .entry((peer_name.clone(), settings.clone()))
-            .or_insert_with(ReuseableConnection::pending)
-            .downgrade()
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()))
+            .clone();
+        // break borrow of dashmap::Entry to avoid deadlock
+        let result = reuseable_connection
             .reuse_or_initial(async || {
+                tracing::debug!("Trying to connect to {server}");
                 let connection = (try_connect)()
                     .await
                     .context(connect_error::ConnectorSnafu)?;
+                tracing::debug!("QUIC connection established, try to upgrade to H3");
                 let connection = Connection::new(settings.clone(), connection).await?;
+                tracing::debug!("H3 connection established, verifying peer identity");
                 let remote_agent = connection.remote_agent().await?;
                 let actual_peer_name = remote_agent.as_ref().map(|agent| agent.name());
                 if actual_peer_name.as_ref() != Some(&peer_name.as_ref()) {
@@ -180,16 +196,12 @@ impl<C: quic::Connection> Pool<C> {
                 let connections = self.connections.clone();
                 self.tasks.lock().unwrap().spawn(async move {
                     connection.closed().await;
-                    connections.remove_if(&(peer_name, settings), |_, connection| {
-                        connection.reuse().is_none()
-                    });
+                    Self::try_release(connections, (peer_name, settings));
                 });
             }
             Err(..) => {
-                self.connections
-                    .remove_if(&(peer_name, settings), |_, connection| {
-                        connection.peek().is_none()
-                    });
+                let connections = self.connections.clone();
+                Self::try_release(connections, (peer_name.clone(), settings.clone()));
             }
         }
 
@@ -204,7 +216,7 @@ impl<C: quic::Connection> Pool<C> {
         let settings = connection.settings().clone();
         self.connections
             .entry((remote_agent.name().to_owned(), settings))
-            .or_insert(ReuseableConnection::with(connection));
+            .or_insert(Arc::new(ReuseableConnection::with(connection)));
         Ok(())
     }
 }

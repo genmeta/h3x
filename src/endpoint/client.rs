@@ -40,9 +40,9 @@ impl<C: quic::Connect> Client<C> {
     ) -> Result<Arc<Connection<C::Connection>>, pool::ConnectError<C::Error>> {
         let host_port = server
             .as_str()
-            .rsplit('@')
-            .next()
-            .expect("split always has at least 1 item");
+            .rsplit_once('@')
+            .map(|(_username_password, host_port)| host_port)
+            .unwrap_or(server.as_str());
         let connect = async || self.connector.connect(host_port).await;
         self.pool
             .reuse_or_connect_with(server.host(), self.settings.clone(), connect)

@@ -7,7 +7,7 @@ use std::{
 
 use futures::{Sink, Stream};
 use snafu::Snafu;
-use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
     codec::{Decode, DecodeExt, DecodeStreamError, EncodeExt},
@@ -90,7 +90,6 @@ impl<S: ?Sized> UnidirectionalStream<S> {
         S: AsyncWrite + Unpin + Sized,
     {
         stream.encode_one(r#type).await?;
-        stream.flush().await?;
         Ok(Self { r#type, stream })
     }
 
