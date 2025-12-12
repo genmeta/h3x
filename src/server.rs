@@ -77,6 +77,10 @@ impl<L: quic::Listen> Servers<L> {
                     // connection already closed
                     return;
                 };
+                let Ok(remote_agent) = connection.remote_agent().await else {
+                    // connection already closed
+                    return;
+                };
                 let Some(local_agent) = local_agent else {
                     tracing::debug!("Close incoming connection due to missing SNI");
                     // no SNI
@@ -95,7 +99,7 @@ impl<L: quic::Listen> Servers<L> {
                 let mut connection_tasks = JoinSet::new();
 
                 loop {
-                    let (mut rs, ws) = match connection.accept_request_stream().await {
+                    let (mut rs, wr) = match connection.accept_request_stream().await {
                         Ok(pair) => {
                             tracing::debug!("Accepted incoming request stream");
                             pair
@@ -121,19 +125,22 @@ impl<L: quic::Listen> Servers<L> {
                     };
 
                     let router = router.clone();
+                    let la = local_agent.clone();
+                    let ra = remote_agent.clone();
                     let span = tracing::info_span!("handle_request", stream_id = %stream_id);
                     let handle_request = async move {
                         tracing::debug!("Resolving incoming request");
-                        let (req, rsp) = match UnresolvedRequest::new(rs, ws).resolve().await {
-                            Ok(pair) => pair,
-                            Err(error) => {
-                                tracing::debug!(
-                                    error = %Report::from_error(error),
-                                    "Failed to resolve incoming request"
-                                );
-                                return;
-                            }
-                        };
+                        let (req, rsp) =
+                            match UnresolvedRequest::new(rs, wr, la, ra).resolve().await {
+                                Ok(pair) => pair,
+                                Err(error) => {
+                                    tracing::debug!(
+                                        error = %Report::from_error(error),
+                                        "Failed to resolve incoming request"
+                                    );
+                                    return;
+                                }
+                            };
                         tracing::debug!(request=?req.headers(), "Resolved new request");
                         // FIXME: downcast into Router to avoid cloning
                         router.clone().handle(req, rsp).await;

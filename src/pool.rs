@@ -41,9 +41,15 @@ impl<C: quic::Connection> ReuseableConnection<C> {
     }
 
     pub fn reuse(&self) -> Option<Arc<Connection<C>>> {
-        let connection = self.peek();
-        // TDOO: check whether the connection is still valid
-        connection
+        let connection = self.peek()?;
+        // peer goaway, connection cannot be reused: cannot open new streams
+        if let Some(peer_goaway) = connection.peer_goaway()
+            && let Some(max_received_stream_id) = connection.max_received_stream_id()
+            && peer_goaway.stream_id() <= max_received_stream_id
+        {
+            return None;
+        }
+        Some(connection)
     }
 
     pub async fn reuse_or_initial<E>(

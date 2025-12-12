@@ -14,10 +14,7 @@ use super::Body;
 use crate::{
     buflist::{BufList, Cursor},
     codec::{EncodeExt, SinkWriter, StreamReader},
-    connection::{
-        self, ConnectionGoaway, ConnectionState, InitialRequestStreamError, QPackDecoder,
-        QPackEncoder,
-    },
+    connection::{self, ConnectionGoaway, ConnectionState, QPackDecoder, QPackEncoder},
     entity::{Entity, EntityStage, IllegalEntityOperator, SendMalformedPseudoHeaderSnafu},
     error::Code,
     frame::{Frame, stream::FrameStream},
@@ -102,15 +99,6 @@ impl From<quic::ConnectionError> for StreamError {
     fn from(value: quic::ConnectionError) -> Self {
         Self::Quic {
             source: value.into(),
-        }
-    }
-}
-
-impl From<InitialRequestStreamError> for StreamError {
-    fn from(error: InitialRequestStreamError) -> Self {
-        match error {
-            InitialRequestStreamError::Quic { source } => Self::Quic { source },
-            InitialRequestStreamError::Goaway { source } => Self::Goaway { source },
         }
     }
 }

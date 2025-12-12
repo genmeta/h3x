@@ -114,7 +114,8 @@ pub struct ConnectionState<C: ?Sized> {
     peer_settings: SetOnce<Arc<Settings>>,
     local_goaway: Watch<Goaway>,
     peer_goaway: Watch<Goaway>,
-    max_received_request_stream_id: Watch<VarInt>,
+    max_initialized_stream_id: Watch<VarInt>,
+    max_received_stream_id: Watch<VarInt>,
 
     quic_connection: C,
 }
@@ -131,7 +132,8 @@ impl<C: ?Sized> ConnectionState<C> {
             peer_settings: SetOnce::new(),
             local_goaway: Watch::new(),
             peer_goaway: Watch::new(),
-            max_received_request_stream_id: Watch::new(),
+            max_initialized_stream_id: Watch::new(),
+            max_received_stream_id: Watch::new(),
         }
     }
 }
@@ -223,18 +225,6 @@ impl<C: quic::Close + ?Sized> ConnectionState<C> {
         })
     }
 
-    pub fn max_received_stream_id(
-        &self,
-    ) -> impl Future<Output = Result<VarInt, quic::ConnectionError>> + use<C> {
-        let error = self.error();
-        self.max_received_request_stream_id
-            .get()
-            .then(|option| match option {
-                Some(stream_id) => future::ready(Ok(stream_id)).left_future(),
-                None => error.map(Err).right_future(),
-            })
-    }
-
     pub fn peer_goawaies(
         &self,
     ) -> impl FusedStream<Item = Result<Goaway, quic::ConnectionError>> + use<C> {
@@ -251,14 +241,14 @@ impl<C: quic::Close + ?Sized> ConnectionState<C> {
 
     pub fn goaway(&self) -> Goaway {
         let mut local_goaway = self.local_goaway.lock();
-        let max_received_request_stream_id = self.max_received_request_stream_id.lock();
+        let max_received_stream_id = self.max_received_stream_id.lock();
 
-        let max_received_request_stream_id = max_received_request_stream_id
+        let max_received_stream_id = max_received_stream_id
             .get()
             .copied()
             .unwrap_or(VarInt::from_u32(0));
 
-        let goaway = Goaway::new(max_received_request_stream_id);
+        let goaway = Goaway::new(max_received_stream_id);
         local_goaway.set(goaway);
 
         goaway
@@ -308,7 +298,14 @@ impl<C: quic::Close + quic::ManageStream + ?Sized> ConnectionState<C> {
         let mut reader = Box::pin(reader);
         let writer = Box::pin(writer);
         let stream_id = reader.stream_id().await?;
-
+        {
+            let mut max_initialized_stream_id = self.max_initialized_stream_id.lock();
+            max_initialized_stream_id.set(
+                max_initialized_stream_id
+                    .get()
+                    .map_or(stream_id, |current| *current.max(&stream_id)),
+            );
+        }
         if let Some(goaway) = self.peer_goaway.peek()
             && goaway.stream_id() >= stream_id
         {
@@ -331,10 +328,9 @@ impl<C: quic::Close + quic::ManageStream + ?Sized> ConnectionState<C> {
             None => Ok((reader, writer)),
             Some(goaway) if goaway.stream_id() >= stream_id => Err(ConnectionGoaway::Local.into()),
             Some(..) => {
-                // update max received request stream id
-                let mut max_received_request_stream_id = self.max_received_request_stream_id.lock();
-                max_received_request_stream_id.set(
-                    max_received_request_stream_id
+                let mut max_received_stream_id = self.max_received_stream_id.lock();
+                max_received_stream_id.set(
+                    max_received_stream_id
                         .get()
                         .map_or(stream_id, |current| *current.max(&stream_id)),
                 );
@@ -650,8 +646,16 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
         self.state.peer_settings().await
     }
 
-    pub async fn max_received_stream_id(&self) -> Result<VarInt, quic::ConnectionError> {
-        self.state.max_received_stream_id().await
+    pub fn max_received_stream_id(&self) -> Option<VarInt> {
+        self.state.max_received_stream_id.peek()
+    }
+
+    pub fn max_initialized_stream_id(&self) -> Option<VarInt> {
+        self.state.max_initialized_stream_id.peek()
+    }
+
+    pub fn peer_goaway(&self) -> Option<Goaway> {
+        self.state.peer_goaway.peek()
     }
 
     pub fn peer_goawaies(&self) -> impl Stream<Item = Result<Goaway, quic::ConnectionError>> {
@@ -686,7 +690,7 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
     }
 }
 
-impl<C: quic::Connection /* + Sized */> Connection<C> {
+impl<C: quic::Connection /* TODO: + ?Sized */> Connection<C> {
     pub async fn open_request_stream(
         &self,
     ) -> Result<(entity::stream::ReadStream, entity::stream::WriteStream), InitialRequestStreamError>

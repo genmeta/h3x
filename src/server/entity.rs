@@ -9,6 +9,7 @@ use http::{
 };
 
 use crate::{
+    agent::{LocalAgent, RemoteAgent},
     entity::{
         Entity, EntityStage, IllegalEntityOperator,
         stream::{ReadStream, StreamError, WriteStream},
@@ -17,31 +18,40 @@ use crate::{
 };
 
 pub struct UnresolvedRequest {
-    request: Request,
-    response: WriteStream,
+    request_stream: ReadStream,
+    remote_agent: Option<RemoteAgent>,
+    response_stream: WriteStream,
+    local_agent: LocalAgent,
 }
 
 impl UnresolvedRequest {
-    pub(super) fn new(read_stream: ReadStream, write_stream: WriteStream) -> Self {
+    pub(super) fn new(
+        read_stream: ReadStream,
+        write_stream: WriteStream,
+        local_agent: LocalAgent,
+        remote_agent: Option<RemoteAgent>,
+    ) -> Self {
         Self {
-            request: Request {
-                entity: Entity::unresolved_request(),
-                stream: read_stream,
-            },
-            response: write_stream,
+            request_stream: read_stream,
+            remote_agent,
+            response_stream: write_stream,
+            local_agent,
         }
     }
 
-    pub async fn resolve(mut self) -> Result<(Request, Response), StreamError> {
-        self.request
-            .stream
-            .read_header(&mut self.request.entity)
-            .await?;
+    pub async fn resolve(self) -> Result<(Request, Response), StreamError> {
+        let mut request = Request {
+            entity: Entity::unresolved_request(),
+            stream: self.request_stream,
+            agent: self.remote_agent,
+        };
+        request.stream.read_header(&mut request.entity).await?;
         let response = Response {
             entity: Entity::unresolved_response(),
-            stream: self.response,
+            stream: self.response_stream,
+            agent: self.local_agent,
         };
-        Ok((self.request, response))
+        Ok((request, response))
     }
 }
 
@@ -58,8 +68,7 @@ impl IntoFuture for UnresolvedRequest {
 pub struct Request {
     entity: Entity,
     stream: ReadStream,
-    // agent: RemoteAgent,
-    // parameters: Parameters
+    agent: Option<RemoteAgent>,
 }
 
 impl Request {
@@ -122,6 +131,10 @@ impl Request {
     pub async fn trailers(&mut self) -> Result<&HeaderMap, StreamError> {
         self.stream.read_trailer(&mut self.entity).await
     }
+
+    pub fn agent(&self) -> Option<&RemoteAgent> {
+        self.agent.as_ref()
+    }
 }
 
 // TODO: check whether request completion or not in drop?
@@ -129,7 +142,7 @@ impl Request {
 pub struct Response {
     entity: Entity,
     stream: WriteStream,
-    // agent: LocalAgent
+    agent: LocalAgent,
 }
 
 impl Response {
@@ -212,6 +225,10 @@ impl Response {
 
     pub async fn cancel(&mut self, code: VarInt) -> Result<(), StreamError> {
         self.stream.cancel(code).await
+    }
+
+    pub fn agent(&self) -> &LocalAgent {
+        &self.agent
     }
 }
 

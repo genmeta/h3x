@@ -11,8 +11,10 @@ use snafu::{Report, Snafu};
 use tokio::io::AsyncBufRead;
 
 use crate::{
+    agent::{LocalAgent, RemoteAgent},
     client::Client,
     codec::StreamReader,
+    connection::InitialRequestStreamError,
     entity::{
         Entity, EntityStage, IllegalEntityOperator,
         stream::{ReadStream, StreamError, WriteStream},
@@ -46,11 +48,17 @@ pub enum RequestError<E: Error + 'static> {
     #[snafu(transparent)]
     Connect { source: ConnectError<E> },
     #[snafu(transparent)]
-    Stream { source: StreamError },
+    Stream { source: quic::StreamError },
     #[snafu(transparent)]
     MalformedHeader { source: MalformedHeaderSection },
     #[snafu(display("Expected HTTPS scheme"))]
     NotHttpsScheme,
+}
+
+impl<E: Error + 'static> From<quic::ConnectionError> for RequestError<E> {
+    fn from(error: quic::ConnectionError) -> Self {
+        quic::StreamError::from(error).into()
+    }
 }
 
 impl<C: quic::Connect> Client<C> {
@@ -151,30 +159,53 @@ where
 
         let authority = self.request.header().authority().expect("Checked");
 
-        let connection = self.client.connect(authority.clone()).await?;
-        tracing::debug!(%authority, "Connected");
+        loop {
+            let connection = self.client.connect(authority.clone()).await?;
+            tracing::debug!(%authority, "Connected");
 
-        let (read_stream, write_stream) = connection
-            .open_request_stream()
-            .await
-            .map_err(StreamError::from)?;
+            let (read_stream, mut write_stream) = match connection.open_request_stream().await {
+                Ok(pair) => pair,
+                Err(InitialRequestStreamError::Quic { source: error }) => return Err(error.into()),
+                Err(InitialRequestStreamError::Goaway { .. }) => {
+                    tracing::debug!("Connection goaway, retrying...");
+                    continue;
+                }
+            };
 
-        let response = Response {
-            entity: Entity::unresolved_response(),
-            stream: read_stream,
-        };
+            let local_agent = connection.local_agent().await?;
+            let remote_agent = connection
+                .remote_agent()
+                .await?
+                .expect("chekced by Client::connect");
 
-        let mut request = Request {
-            entity: self.request,
-            stream: write_stream,
-        };
+            let response = Response {
+                entity: Entity::unresolved_response(),
+                stream: read_stream,
+                agent: remote_agent,
+            };
 
-        request.stream.send_header(&mut request.entity).await?;
-        tracing::debug!("Request header sent");
-
-        debug_assert!(response.entity.is_response(), "Checked in read_header");
-
-        Ok((request, response))
+            match write_stream.send_header(&mut self.request).await {
+                Ok(()) => {
+                    let request = Request {
+                        entity: self.request,
+                        stream: write_stream,
+                        agent: local_agent,
+                    };
+                    tracing::debug!("Request header sent");
+                    return Ok((request, response));
+                }
+                Err(StreamError::IllegalEntityOperator { .. }) => {
+                    unreachable!("Header should be checked before sending")
+                }
+                Err(StreamError::Quic { source }) => {
+                    return Err(source.into());
+                }
+                Err(StreamError::Goaway { .. }) => {
+                    tracing::debug!("Connection goaway, retrying...");
+                    continue;
+                }
+            }
+        }
     }
 
     pub async fn options(self) -> Result<(Request, Response), RequestError<C::Error>> {
@@ -201,6 +232,7 @@ where
 pub struct Request {
     entity: Entity,
     stream: WriteStream,
+    agent: Option<LocalAgent>,
 }
 
 impl Request {
@@ -272,6 +304,10 @@ impl Request {
     pub async fn cancel(&mut self, code: VarInt) -> Result<(), StreamError> {
         self.stream.cancel(code).await
     }
+
+    pub fn agent(&self) -> Option<&LocalAgent> {
+        self.agent.as_ref()
+    }
 }
 
 impl Drop for Request {
@@ -297,6 +333,7 @@ impl Drop for Request {
 pub struct Response {
     entity: Entity,
     stream: ReadStream,
+    agent: RemoteAgent,
 }
 
 impl Response {
@@ -365,5 +402,9 @@ impl Response {
 
     pub async fn trailers(&mut self) -> Result<&HeaderMap, StreamError> {
         self.stream.read_trailer(&mut self.entity).await
+    }
+
+    pub fn agent(&self) -> &RemoteAgent {
+        &self.agent
     }
 }
