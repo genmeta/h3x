@@ -16,8 +16,10 @@ pub trait Service {
     ) -> Self::Future<'s>;
 }
 
+/// A helper trait to allow using async closures as services.
 pub trait ServiceFn<'s> {
     type Future: Future<Output = ()> + 's;
+
     fn call(&mut self, req: &'s mut Request, res: &'s mut Response) -> Self::Future;
 }
 
@@ -158,11 +160,4 @@ impl Clone for BoxService {
 
 pub fn box_service(service: impl IntoBoxService) -> BoxService {
     service.into_box_service()
-}
-
-pub fn service_fn<F>(f: F) -> F
-where
-    F: for<'s> ServiceFn<'s>,
-{
-    f
 }

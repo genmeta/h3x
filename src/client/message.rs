@@ -1,4 +1,4 @@
-use std::{error::Error, mem};
+use std::error::Error;
 
 use bytes::{Buf, Bytes};
 use http::{
@@ -7,6 +7,7 @@ use http::{
     uri::{Authority, PathAndQuery, Scheme},
 };
 use snafu::{Report, Snafu};
+use tracing::Instrument;
 
 use crate::{
     agent::{LocalAgent, RemoteAgent},
@@ -313,24 +314,31 @@ impl Request {
     pub fn agent(&self) -> Option<&LocalAgent> {
         self.agent.as_ref()
     }
+
+    /// Async drop the request properly
+    pub(crate) fn drop(&mut self) -> Option<impl Future<Output = ()> + Send + use<>> {
+        if self.entity.is_complete() || self.entity.is_destroyed() {
+            return None;
+        }
+        let mut stream = self.stream.take();
+        let mut entity = self.entity.take();
+        Some(async move {
+            if let Err(StreamError::IllegalEntityOperator { source }) =
+                stream.close(&mut entity).await
+            {
+                tracing::warn!(
+                    target: "h3x::client", error = %Report::from_error(source),
+                    "Request stream cannot be closed properly"
+                );
+            }
+        })
+    }
 }
 
 impl Drop for Request {
     fn drop(&mut self) {
-        if !self.entity.is_complete() {
-            // Its ok to take: Request will not be used after drop
-            let mut stream = self.stream.take();
-            let mut entity = mem::replace(&mut self.entity, Message::unresolved_request());
-            tokio::spawn(async move {
-                if let Err(StreamError::IllegalEntityOperator { source }) =
-                    stream.close(&mut entity).await
-                {
-                    tracing::warn!(
-                        target: "h3x::client",
-                        "Request stream cannot be closed properly: {}", Report::from_error(source)
-                    );
-                }
-            });
+        if let Some(future) = self.drop() {
+            tokio::spawn(future.in_current_span());
         }
     }
 }

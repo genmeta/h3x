@@ -1,5 +1,3 @@
-#![feature(impl_trait_in_assoc_type)]
-
 pub mod agent;
 pub mod buflist;
 pub mod client;

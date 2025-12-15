@@ -17,14 +17,16 @@ mod service;
 
 pub use message::{Request, Response, UnresolvedRequest};
 pub use route::{MethodRouter, Router};
-pub use service::{BoxService, BoxServiceFuture, IntoBoxService, Service, box_service, service_fn};
+pub use service::{BoxService, BoxServiceFuture, IntoBoxService, Service, box_service};
+
+pub use crate::message::stream::StreamError;
 
 #[derive(Debug, Clone)]
 pub struct Servers<L: quic::Listen> {
     pool: Pool<L::Connection>,
     acceptor: L,
     settings: Arc<Settings>,
-    router: HashMap<String, BoxService>,
+    router: Arc<HashMap<String, BoxService>>,
 }
 
 #[bon::bon]
@@ -39,18 +41,25 @@ impl<L: quic::Listen> Servers<L> {
             pool,
             acceptor,
             settings,
-            router: HashMap::new(),
+            router: Arc::new(HashMap::new()),
         }
     }
 
+    fn router_mut(&mut self) -> &mut HashMap<String, BoxService> {
+        Arc::make_mut(&mut self.router)
+    }
+
     pub fn serve(mut self, domain: impl Into<String>, router: impl IntoBoxService) -> Self {
-        self.router.insert(domain.into(), router.into_box_service());
+        self.router_mut()
+            .insert(domain.into(), router.into_box_service());
         self
     }
 
+    // async fn handle_incoming_connection()
+
     pub async fn run(&self) -> L::Error {
         let mut tasks = JoinSet::default();
-        let router = Arc::new(self.router.clone());
+        let router = self.router.clone();
 
         loop {
             let connection = match self.acceptor.accept().await {
@@ -91,8 +100,12 @@ impl<L: quic::Listen> Servers<L> {
                 _ = pool.try_insert(connection.clone());
                 // TODO: router with authority?
                 let Some(service) = router.get(local_agent.name()) else {
-                    tracing::debug!("fallback");
-                    todo!("fallback: connected server not exist");
+                    tracing::debug!(
+                        "Close incoming connection due to missing service for {}",
+                        local_agent.name()
+                    );
+                    connection.close(&Code::H3_NO_ERROR);
+                    return;
                 };
 
                 let mut connection_tasks = JoinSet::new();
@@ -131,7 +144,12 @@ impl<L: quic::Listen> Servers<L> {
                         local_agent.clone(),
                         remote_agent.clone(),
                     );
-                    let span = tracing::info_span!("handle_request", stream_id = %stream_id);
+                    let span = tracing::info_span!(
+                        "handle_request",
+                        stream_id = %stream_id,
+                        method = tracing::field::Empty,
+                        uri = tracing::field::Empty
+                    );
                     let handle_request = async move {
                         tracing::debug!("Resolving incoming request");
                         let (mut req, mut rsp) = match unresolved_request.resolve().await {
@@ -145,10 +163,18 @@ impl<L: quic::Listen> Servers<L> {
                             }
                         };
 
-                        tracing::debug!(method = %req.method(), uri = %req.uri(), "Resolved new request");
+                        tracing::Span::current()
+                            .record("method", req.method().as_str())
+                            .record("uri", req.uri().to_string());
+                        tracing::debug!("Resolved new request");
                         match service.downcast_ref::<Router>() {
                             Some(router) => router.serve(&mut req, &mut rsp).await,
                             None => service.serve(&mut req, &mut rsp).await,
+                        }
+                        // Drop response in place to avoid spawning another tokio task
+                        // FIXME: remove this when async drop is stablized (https://github.com/rust-lang/rust/issues/126482)
+                        if let Some(drop_future) = rsp.drop() {
+                            drop_future.await;
                         }
                     };
                     connection_tasks.spawn(handle_request.instrument(span));

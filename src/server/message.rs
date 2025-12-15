@@ -1,5 +1,3 @@
-use std::mem;
-
 use bytes::{Buf, Bytes};
 use futures::future::BoxFuture;
 use http::{
@@ -7,6 +5,8 @@ use http::{
     header::{AsHeaderName, IntoHeaderName},
     uri::{Authority, PathAndQuery, Scheme},
 };
+use snafu::Report;
+use tracing::Instrument;
 
 use crate::{
     agent::{LocalAgent, RemoteAgent},
@@ -228,28 +228,32 @@ impl Response {
     pub fn agent(&self) -> &LocalAgent {
         &self.agent
     }
+
+    /// Async drop the response properly
+    pub(crate) fn drop(&mut self) -> Option<impl Future<Output = ()> + Send + use<>> {
+        if self.entity.is_complete() || self.entity.is_destroyed() {
+            return None;
+        }
+        // It's ok to take: Response will not be used after drop
+        let mut stream = self.stream.take();
+        let mut entity = self.entity.take();
+        Some(async move {
+            if let Err(StreamError::IllegalEntityOperator { source }) =
+                stream.close(&mut entity).await
+            {
+                tracing::warn!(
+                    target: "h3x::server", error = %Report::from_error(source),
+                    "Response stream cannot be closed properly",
+                );
+            }
+        })
+    }
 }
 
 impl Drop for Response {
     fn drop(&mut self) {
-        if !self.entity.is_complete() {
-            // It's ok to take: Response will not be used after drop
-            let mut stream = self.stream.take();
-            let mut entity = mem::replace(&mut self.entity, Message::unresolved_response());
-            tracing::debug!(
-                target: "h3x::server", ?entity,
-                "Response is dropped before completion, closing the stream"
-            );
-            tokio::spawn(async move {
-                if let Err(StreamError::IllegalEntityOperator { source }) =
-                    stream.close(&mut entity).await
-                {
-                    tracing::warn!(
-                        target: "h3x::server",
-                        "Response stream cannot be closed properly: {:?}", source
-                    );
-                }
-            });
+        if let Some(future) = self.drop() {
+            tokio::spawn(future.in_current_span());
         }
     }
 }

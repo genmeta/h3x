@@ -10,24 +10,7 @@ use crate::server::{
 };
 
 async fn default_fallback(_request: &mut Request, response: &mut Response) {
-    _ = async { response.set_status(StatusCode::NOT_FOUND)?.close().await }.await;
-}
-
-/// A wrapper struct to make `default_fallback` implement `Service`.
-/// This is needed because async closures don't work well with HRTB.
-#[derive(Debug, Clone, Copy)]
-struct DefaultFallbackService;
-
-impl Service for DefaultFallbackService {
-    type Future<'s> = impl Future<Output = ()> + Send + 's;
-
-    fn serve<'s>(
-        &'s mut self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> Self::Future<'s> {
-        default_fallback(request, response)
-    }
+    _ = response.set_status(StatusCode::NOT_FOUND)
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +60,7 @@ impl Default for RouterInner {
     fn default() -> Self {
         Self {
             router: Default::default(),
-            fallback: Fallback::new(box_service(DefaultFallbackService)),
+            fallback: Fallback::new(box_service(default_fallback)),
         }
     }
 }
@@ -213,6 +196,7 @@ impl Service for Router {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodRouter<S> {
+    // most used methods are stored separately for faster access
     options: Option<S>,
     get: Option<S>,
     post: Option<S>,
@@ -222,7 +206,9 @@ pub struct MethodRouter<S> {
     trace: Option<S>,
     connect: Option<S>,
     patch: Option<S>,
-    extension: HashMap<Method, S>,
+    // other
+    extensions: HashMap<Method, S>,
+    // fallback service when no method match
     fallback: S,
 }
 
@@ -238,7 +224,7 @@ impl<S> MethodRouter<S> {
             trace: None,
             connect: None,
             patch: None,
-            extension: HashMap::new(),
+            extensions: HashMap::new(),
             fallback,
         }
     }
@@ -254,7 +240,7 @@ impl<S> MethodRouter<S> {
             Method::TRACE => self.trace.as_ref(),
             Method::CONNECT => self.connect.as_ref(),
             Method::PATCH => self.patch.as_ref(),
-            _ => self.extension.get(&method),
+            _ => self.extensions.get(&method),
         }
     }
 
@@ -269,7 +255,7 @@ impl<S> MethodRouter<S> {
             Method::TRACE => self.trace.as_mut(),
             Method::CONNECT => self.connect.as_mut(),
             Method::PATCH => self.patch.as_mut(),
-            _ => self.extension.get_mut(&method),
+            _ => self.extensions.get_mut(&method),
         }
     }
 
@@ -284,7 +270,7 @@ impl<S> MethodRouter<S> {
             Method::TRACE => self.trace = Some(service),
             Method::CONNECT => self.connect = Some(service),
             Method::PATCH => self.patch = Some(service),
-            _ => _ = self.extension.insert(method, service),
+            _ => _ = self.extensions.insert(method, service),
         }
     }
 
@@ -319,7 +305,7 @@ where
             Method::CONNECT => self.connect.as_mut().unwrap_or(&mut self.fallback),
             Method::PATCH => self.patch.as_mut().unwrap_or(&mut self.fallback),
             _ => self
-                .extension
+                .extensions
                 .get_mut(&method)
                 .unwrap_or(&mut self.fallback),
         };

@@ -26,62 +26,66 @@ use crate::{
     varint::VarInt,
 };
 
-pub struct MockStream;
+fn message_used_after_dropped() -> ! {
+    unreachable!("Message used after destroyed, this is a bug");
+}
 
-impl Sink<Bytes> for MockStream {
+pub struct DestroiedStream;
+
+impl Sink<Bytes> for DestroiedStream {
     type Error = quic::StreamError;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        panic!("Stream used after dropped");
+        message_used_after_dropped()
     }
 
     fn start_send(self: Pin<&mut Self>, _: Bytes) -> Result<(), Self::Error> {
-        panic!("Stream used after dropped");
+        message_used_after_dropped()
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        panic!("Stream used after dropped");
+        message_used_after_dropped()
     }
 
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        panic!("Stream used after dropped");
+        message_used_after_dropped()
     }
 }
 
-impl Stream for MockStream {
+impl Stream for DestroiedStream {
     type Item = Result<Bytes, quic::StreamError>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        panic!("Stream used after dropped");
+        message_used_after_dropped()
     }
 }
 
-impl quic::CancelStream for MockStream {
+impl quic::CancelStream for DestroiedStream {
     fn poll_cancel(
         self: Pin<&mut Self>,
         _cx: &mut Context,
         _code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        panic!("Stream used after dropped");
+        message_used_after_dropped()
     }
 }
 
-impl quic::StopStream for MockStream {
+impl quic::StopStream for DestroiedStream {
     fn poll_stop(
         self: Pin<&mut Self>,
         _cx: &mut Context,
         _code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        panic!("Stream used after dropped");
+        message_used_after_dropped()
     }
 }
 
-impl quic::GetStreamId for MockStream {
+impl quic::GetStreamId for DestroiedStream {
     fn poll_stream_id(
         self: Pin<&mut Self>,
         _cx: &mut Context,
     ) -> Poll<Result<VarInt, quic::StreamError>> {
-        panic!("Stream used after dropped");
+        message_used_after_dropped()
     }
 }
 
@@ -190,6 +194,7 @@ impl ReadStream {
             MessageStage::Body | MessageStage::Trailer | MessageStage::Complete => {
                 return Ok(&message.header);
             }
+            MessageStage::Dropped => message_used_after_dropped(),
         }
 
         message.header = self
@@ -256,6 +261,7 @@ impl ReadStream {
                     }
                 };
             }
+            MessageStage::Dropped => message_used_after_dropped(),
         }
 
         let try_read_next_body = self.try_io(async |this| {
@@ -414,6 +420,7 @@ impl ReadStream {
             }
             MessageStage::Trailer => {}
             MessageStage::Complete => return Ok(message.trailers()),
+            MessageStage::Dropped => message_used_after_dropped(),
         }
 
         message.trailer = self
@@ -447,9 +454,9 @@ impl ReadStream {
     }
 
     pub fn take(&mut self) -> Self {
-        let mock_stream = FrameStream::new(StreamReader::new(Box::pin(MockStream) as Pin<Box<_>>));
+        let stream = FrameStream::new(StreamReader::new(Box::pin(DestroiedStream) as Pin<Box<_>>));
         Self {
-            stream: mem::replace(&mut self.stream, mock_stream),
+            stream: mem::replace(&mut self.stream, stream),
             qpack_decoder: self.qpack_decoder.clone(),
             connection: self.connection.clone(),
         }
@@ -549,6 +556,7 @@ impl WriteStream {
             MessageStage::Header => {}
             // header already sent
             MessageStage::Body | MessageStage::Trailer | MessageStage::Complete => return Ok(()),
+            MessageStage::Dropped => message_used_after_dropped(),
         }
 
         message
@@ -593,6 +601,7 @@ impl WriteStream {
             MessageStage::Trailer | MessageStage::Complete => {
                 return Err(IllegalEntityOperator::ModifyBodyAfterSent.into());
             }
+            MessageStage::Dropped => message_used_after_dropped(),
         }
 
         while content.has_remaining() {
@@ -620,6 +629,7 @@ impl WriteStream {
             MessageStage::Trailer | MessageStage::Complete => {
                 return Err(IllegalEntityOperator::ModifyBodyAfterSent.into());
             }
+            MessageStage::Dropped => message_used_after_dropped(),
         }
 
         let Body::Chunked { buflist } = &mut message.body else {
@@ -656,6 +666,7 @@ impl WriteStream {
             }
             MessageStage::Trailer => {}
             MessageStage::Complete => return Ok(()),
+            MessageStage::Dropped => message_used_after_dropped(),
         }
 
         // TODO: check FieldLines size
@@ -693,9 +704,14 @@ impl WriteStream {
                 }
             }
             MessageStage::Complete => {}
+            MessageStage::Dropped => message_used_after_dropped(),
         }
 
         Ok(())
+    }
+
+    pub async fn send(&mut self, message: &mut Message) -> Result<(), StreamError> {
+        self.send_pending_sections(message).await
     }
 
     pub async fn flush(&mut self, message: &mut Message) -> Result<(), StreamError> {
@@ -717,9 +733,9 @@ impl WriteStream {
     }
 
     pub fn take(&mut self) -> Self {
-        let mock_stream = SinkWriter::new(Box::pin(MockStream) as Pin<Box<_>>);
+        let stream = SinkWriter::new(Box::pin(DestroiedStream) as Pin<Box<_>>);
         Self {
-            stream: mem::replace(&mut self.stream, mock_stream),
+            stream: mem::replace(&mut self.stream, stream),
             qpack_encoder: self.qpack_encoder.clone(),
             connection: self.connection.clone(),
         }

@@ -1,5 +1,7 @@
 pub mod stream;
 
+use std::mem;
+
 use bytes::Buf;
 use http::{
     HeaderMap,
@@ -20,10 +22,16 @@ enum Body {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MessageStage {
+    /// Receiving/Sending header section, including interim response headers
     Header = 0,
+    /// Receiving/Sending entity body
     Body = 1,
+    /// Receiving/Sending trailer section
     Trailer = 2,
+    /// Message is completely sent/received
     Complete = 3,
+    /// Message struct is dropped and cannot be used anymore
+    Dropped = 4,
 }
 
 #[derive(Debug, Snafu)]
@@ -188,5 +196,20 @@ impl Message {
 
     pub fn is_complete(&self) -> bool {
         self.stage() == MessageStage::Complete
+    }
+
+    pub fn is_destroyed(&self) -> bool {
+        self.stage() == MessageStage::Dropped
+    }
+
+    pub fn take(&mut self) -> Self {
+        let message = if self.is_request() {
+            mem::replace(self, Self::unresolved_request())
+        } else {
+            mem::replace(self, Self::unresolved_response())
+        };
+        self.stage = MessageStage::Dropped;
+
+        message
     }
 }

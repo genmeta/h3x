@@ -12,6 +12,8 @@ mod message;
 
 pub use message::{PendingRequest, Request, RequestError, Response};
 
+pub use crate::message::stream::StreamError;
+
 #[derive(Debug, Clone)]
 pub struct Client<C: quic::Connect> {
     pool: Pool<C::Connection>,

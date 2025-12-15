@@ -377,12 +377,10 @@ mod tests {
         assert_eq!(frame1.length().into_inner(), 5);
         let mut payload = vec![];
         assert!(matches!(
-            StreamError::from(frame1.read_to_end(&mut payload).await.unwrap_err()),
-            StreamError::Code { source } if source.code() == Code::H3_FRAME_ERROR &&
-                matches!(
-                    source.source().unwrap().downcast_ref::<DecodeError>(),
-                    Some(DecodeError::Incomplete)
-                )
+            DecodeStreamError::from(frame1.read_to_end(&mut payload).await.unwrap_err()),
+            DecodeStreamError::Decode {
+                source: DecodeError::Incomplete
+            }
         ));
         assert_eq!(payload.as_slice(), b"Hell")
     }
