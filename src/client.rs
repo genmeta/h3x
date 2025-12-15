@@ -8,9 +8,9 @@ use crate::{
     quic,
 };
 
-mod entity;
+mod message;
 
-pub use entity::{PendingRequest, Request, RequestError, Response};
+pub use message::{PendingRequest, Request, RequestError, Response};
 
 #[derive(Debug, Clone)]
 pub struct Client<C: quic::Connect> {
@@ -45,7 +45,7 @@ impl<C: quic::Connect> Client<C> {
             .unwrap_or(server.as_str());
         let connect = async || self.connector.connect(host_port).await;
         self.pool
-            .reuse_or_connect_with(server.host(), self.settings.clone(), connect)
+            .reuse_or_connect_with(server.clone(), self.settings.clone(), connect)
             .await
     }
 }

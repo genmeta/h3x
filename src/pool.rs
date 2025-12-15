@@ -6,6 +6,7 @@ use std::{
 
 use dashmap::DashMap;
 use futures::StreamExt;
+use http::uri::Authority;
 use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::{sync::Mutex as AsyncMutex, task::JoinSet};
 
@@ -81,8 +82,8 @@ impl<C: quic::Connection> ReuseableConnection<C> {
     }
 }
 
-type ConnectionIdentifier = (String, Arc<Settings>);
-type ReuseableConnections<C> = DashMap<(String, Arc<Settings>), Arc<ReuseableConnection<C>>>;
+type ConnectionIdentifier = (Authority, Arc<Settings>);
+type ReuseableConnections<C> = DashMap<ConnectionIdentifier, Arc<ReuseableConnection<C>>>;
 
 #[derive(Debug)]
 pub struct Pool<C: quic::Connection> {
@@ -150,6 +151,8 @@ pub enum InsertError {
     Quic { source: quic::ConnectionError },
     #[snafu(display("Peer does not provide identity"))]
     MissingIdentify,
+    #[snafu(display("Peer provided invalid identity(cannot be parsed as Authority"))]
+    InvalidIdentify,
 }
 
 impl<C: quic::Connection> Pool<C> {
@@ -162,14 +165,13 @@ impl<C: quic::Connection> Pool<C> {
 
     pub async fn reuse_or_connect_with<E: Error + 'static>(
         &self,
-        server: &str,
+        server: Authority,
         settings: Arc<Settings>,
         mut try_connect: impl AsyncFnMut() -> Result<C, E>,
     ) -> Result<Arc<Connection<C>>, ConnectError<E>> {
-        let peer_name = server.to_string();
         let reuseable_connection = self
             .connections
-            .entry((peer_name.clone(), settings.clone()))
+            .entry((server.clone(), settings.clone()))
             .or_insert_with(|| Arc::new(ReuseableConnection::pending()))
             .clone();
         // break borrow of dashmap::Entry to avoid deadlock
@@ -184,9 +186,9 @@ impl<C: quic::Connection> Pool<C> {
                 tracing::debug!("H3 connection established, verifying peer identity");
                 let remote_agent = connection.remote_agent().await?;
                 let actual_peer_name = remote_agent.as_ref().map(|agent| agent.name());
-                if actual_peer_name.as_ref() != Some(&peer_name.as_ref()) {
+                if actual_peer_name.as_ref() != Some(&server.host()) {
                     return connect_error::IncorrectIdentifySnafu {
-                        expected: peer_name.to_string(),
+                        expected: server.host().to_string(),
                         actual: actual_peer_name.map(ToOwned::to_owned),
                     }
                     .fail();
@@ -202,12 +204,11 @@ impl<C: quic::Connection> Pool<C> {
                 let connections = self.connections.clone();
                 self.tasks.lock().unwrap().spawn(async move {
                     connection.closed().await;
-                    Self::try_release(connections, (peer_name, settings));
+                    Self::try_release(connections, (server, settings));
                 });
             }
             Err(..) => {
-                let connections = self.connections.clone();
-                Self::try_release(connections, (peer_name.clone(), settings.clone()));
+                Self::try_release(self.connections.clone(), (server, settings));
             }
         }
 
@@ -220,8 +221,13 @@ impl<C: quic::Connection> Pool<C> {
             .await?
             .context(insert_error::MissingIdentifySnafu)?;
         let settings = connection.settings().clone();
+        let authority = remote_agent
+            .name()
+            .parse()
+            .ok()
+            .context(insert_error::InvalidIdentifySnafu)?;
         self.connections
-            .entry((remote_agent.name().to_owned(), settings))
+            .entry((authority, settings))
             .or_insert(Arc::new(ReuseableConnection::with(connection)));
         Ok(())
     }

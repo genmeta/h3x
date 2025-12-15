@@ -28,9 +28,9 @@ use crate::{
         settings::Settings,
         stream::{H3StreamCreationError, UnidirectionalStream},
     },
-    entity,
     error::{Code, H3CriticalStreamClosed, H3FrameUnexpected, HasErrorCode},
     frame::{Frame, goaway::Goaway},
+    message,
     qpack::{
         BoxInstructionSink, BoxInstructionStream, BoxSink,
         decoder::{Decoder, DecoderInstruction},
@@ -693,16 +693,18 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
 impl<C: quic::Connection /* TODO: + ?Sized */> Connection<C> {
     pub async fn open_request_stream(
         &self,
-    ) -> Result<(entity::stream::ReadStream, entity::stream::WriteStream), InitialRequestStreamError>
-    {
+    ) -> Result<
+        (message::stream::ReadStream, message::stream::WriteStream),
+        InitialRequestStreamError,
+    > {
         let (stream_reader, stream_writer) = self.state.initial_request_stream().await?;
         Ok((
-            entity::stream::ReadStream::new(
+            message::stream::ReadStream::new(
                 stream_reader,
                 self.qpack_decoder.clone(),
                 self.state.clone(),
             ),
-            entity::stream::WriteStream::new(
+            message::stream::WriteStream::new(
                 stream_writer,
                 self.qpack_encoder.clone(),
                 self.state.clone(),
@@ -712,16 +714,16 @@ impl<C: quic::Connection /* TODO: + ?Sized */> Connection<C> {
 
     pub async fn accept_request_stream(
         &self,
-    ) -> Result<(entity::stream::ReadStream, entity::stream::WriteStream), AcceptRequestStreamError>
+    ) -> Result<(message::stream::ReadStream, message::stream::WriteStream), AcceptRequestStreamError>
     {
         let (stream_reader, stream_writer) = self.state.accept_request_stream().await?;
         Ok((
-            entity::stream::ReadStream::new(
+            message::stream::ReadStream::new(
                 stream_reader,
                 self.qpack_decoder.clone(),
                 self.state.clone(),
             ),
-            entity::stream::WriteStream::new(
+            message::stream::WriteStream::new(
                 stream_writer,
                 self.qpack_encoder.clone(),
                 self.state.clone(),

@@ -2,12 +2,12 @@ use std::any::Any;
 
 use futures::future::BoxFuture;
 
-use crate::server::entity::{Request, Response};
+use crate::server::{Request, Response};
 
 pub trait Service {
     type Future: Future<Output = ()>;
 
-    fn handle(&mut self, request: Request, response: Response) -> Self::Future;
+    fn serve(&mut self, request: Request, response: Response) -> Self::Future;
 }
 
 impl<Fn, Fut> Service for Fn
@@ -17,7 +17,7 @@ where
 {
     type Future = Fut;
 
-    fn handle(&mut self, request: Request, response: Response) -> Self::Future {
+    fn serve(&mut self, request: Request, response: Response) -> Self::Future {
         (self)(request, response)
     }
 }
@@ -52,8 +52,8 @@ impl<S: Service<Future: Send + 'static> + ?Sized> Service for ErasedService<S> {
     type Future = BoxServiceFuture;
 
     #[inline]
-    fn handle(&mut self, request: Request, response: Response) -> Self::Future {
-        Box::pin(self.0.handle(request, response))
+    fn serve(&mut self, request: Request, response: Response) -> Self::Future {
+        Box::pin(self.0.serve(request, response))
     }
 }
 
@@ -98,8 +98,8 @@ impl BoxService {
 impl Service for BoxService {
     type Future = BoxServiceFuture;
 
-    fn handle(&mut self, request: Request, response: Response) -> Self::Future {
-        self.0.handle(request, response)
+    fn serve(&mut self, request: Request, response: Response) -> Self::Future {
+        self.0.serve(request, response)
     }
 }
 

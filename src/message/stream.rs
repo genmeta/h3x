@@ -15,9 +15,9 @@ use crate::{
     buflist::{BufList, Cursor},
     codec::{EncodeExt, SinkWriter, StreamReader},
     connection::{self, ConnectionGoaway, ConnectionState, QPackDecoder, QPackEncoder},
-    entity::{Entity, EntityStage, IllegalEntityOperator, SendMalformedPseudoHeaderSnafu},
     error::Code,
     frame::{Frame, stream::FrameStream},
+    message::{IllegalEntityOperator, Message, MessageStage, SendMalformedPseudoHeaderSnafu},
     qpack::{
         algorithm::{HuffmanAlways, StaticCompressAlgo},
         field_section::{FieldSection, MalformedHeaderSection, malformed_header_section},
@@ -182,17 +182,17 @@ impl ReadStream {
 
     pub async fn read_header<'e>(
         &mut self,
-        entity: &'e mut Entity,
+        message: &'e mut Message,
     ) -> Result<&'e FieldSection, StreamError> {
-        match entity.stage {
-            EntityStage::Header => {}
+        match message.stage {
+            MessageStage::Header => {}
             // header already read
-            EntityStage::Body | EntityStage::Trailer | EntityStage::Complete => {
-                return Ok(&entity.header);
+            MessageStage::Body | MessageStage::Trailer | MessageStage::Complete => {
+                return Ok(&message.header);
             }
         }
 
-        entity.header = self
+        message.header = self
             .try_io(async |this| {
                 let frame = match this.stream.next_unreserved_frame().await.transpose()? {
                     Some(frame) if frame.r#type() != Frame::HEADERS_FRAME_TYPE => {
@@ -207,12 +207,12 @@ impl ReadStream {
                 debug_assert!(this.stream.frame().is_none());
 
                 header.check_pseudo()?;
-                if entity.header.is_request_header() {
+                if message.header.is_request_header() {
                     if !header.is_request_header() {
                         malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu.fail()?;
                     }
                 } else {
-                    debug_assert!(entity.header.is_response_header());
+                    debug_assert!(message.header.is_response_header());
                     if !header.is_response_header() {
                         malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu.fail()?;
                     }
@@ -223,28 +223,31 @@ impl ReadStream {
 
         // check header complete/valid
 
-        if entity.is_interim_response() {
-            entity.stage = EntityStage::Header;
+        if message.is_interim_response() {
+            message.stage = MessageStage::Header;
         } else {
-            entity.stage = EntityStage::Body;
+            message.stage = MessageStage::Body;
         }
-        Ok(&entity.header)
+        Ok(&message.header)
     }
 
-    async fn read_next_body(&mut self, entity: &mut Entity) -> Option<Result<Bytes, StreamError>> {
-        match entity.stage {
-            EntityStage::Header => {
-                while entity.stage == EntityStage::Header {
-                    match self.read_header(entity).await {
+    async fn read_next_body(
+        &mut self,
+        message: &mut Message,
+    ) -> Option<Result<Bytes, StreamError>> {
+        match message.stage {
+            MessageStage::Header => {
+                while message.stage == MessageStage::Header {
+                    match self.read_header(message).await {
                         Ok(..) => (),
                         Err(error) => return Some(Err(error)),
                     }
                 }
-                debug_assert_eq!(entity.stage, EntityStage::Body);
+                debug_assert_eq!(message.stage, MessageStage::Body);
             }
-            EntityStage::Body => {}
-            EntityStage::Trailer | EntityStage::Complete => {
-                match &mut entity.body {
+            MessageStage::Body => {}
+            MessageStage::Trailer | MessageStage::Complete => {
+                match &mut message.body {
                     Body::Streaming { .. } => return None,
                     Body::Chunked { buflist } => {
                         if buflist.has_remaining() {
@@ -262,7 +265,7 @@ impl ReadStream {
                         Some(_next_frame) => continue,
                         None => {
                             debug_assert!(this.stream.frame().is_none());
-                            entity.stage = EntityStage::Complete;
+                            message.stage = MessageStage::Complete;
                             return Ok(None);
                         }
                     },
@@ -270,7 +273,7 @@ impl ReadStream {
                         debug_assert!(this.stream.frame().is_some_and(|frame| {
                             frame.is_ok_and(|frame| frame.r#type() == Frame::HEADERS_FRAME_TYPE)
                         }));
-                        entity.stage = EntityStage::Trailer;
+                        message.stage = MessageStage::Trailer;
                         return Ok(None);
                     }
                     Some(frame) if frame.r#type() != Frame::DATA_FRAME_TYPE => {
@@ -302,7 +305,7 @@ impl ReadStream {
 
     pub async fn read_all<'e>(
         &mut self,
-        entity: &'e mut Entity,
+        message: &'e mut Message,
     ) -> Result<impl Buf + 'e, StreamError> {
         enum Buffer<'e> {
             Owned(BufList),
@@ -353,34 +356,34 @@ impl ReadStream {
             }
         }
 
-        match &mut entity.body {
+        match &mut message.body {
             Body::Streaming { .. } => {
                 let mut buflist = BufList::new();
-                while let Some(body_part) = self.read_next_body(entity).await.transpose()? {
+                while let Some(body_part) = self.read_next_body(message).await.transpose()? {
                     buflist.write(body_part);
                 }
                 Ok(Buffer::Owned(buflist))
             }
             Body::Chunked { .. } => {
-                while let Some(body_part) = self.read_next_body(entity).await.transpose()? {
-                    entity.chunked_body().expect("Checked").write(body_part);
+                while let Some(body_part) = self.read_next_body(message).await.transpose()? {
+                    message.chunked_body().expect("Checked").write(body_part);
                 }
-                Ok(Buffer::Borrow(entity.chunked_body().expect("Checked")))
+                Ok(Buffer::Borrow(message.chunked_body().expect("Checked")))
             }
         }
     }
 
-    pub async fn read(&mut self, entity: &mut Entity) -> Option<Result<Bytes, StreamError>> {
+    pub async fn read(&mut self, message: &mut Message) -> Option<Result<Bytes, StreamError>> {
         loop {
-            match &mut entity.body {
-                Body::Streaming { .. } => return self.read_next_body(entity).await,
+            match &mut message.body {
+                Body::Streaming { .. } => return self.read_next_body(message).await,
                 Body::Chunked { buflist } => {
                     if buflist.has_remaining() {
                         return Some(Ok(buflist.copy_to_bytes(buflist.chunk().len())));
                     }
-                    match self.read_next_body(entity).await? {
+                    match self.read_next_body(message).await? {
                         Ok(body_part) => {
-                            entity.chunked_body().expect("Checked").write(body_part);
+                            message.chunked_body().expect("Checked").write(body_part);
                             continue;
                         }
                         Err(error) => return Some(Err(error)),
@@ -392,27 +395,28 @@ impl ReadStream {
 
     pub async fn read_trailer<'e>(
         &mut self,
-        entity: &'e mut Entity,
+        message: &'e mut Message,
     ) -> Result<&'e HeaderMap, StreamError> {
-        match entity.stage {
-            EntityStage::Header | EntityStage::Body => {
-                match &entity.body {
+        match message.stage {
+            MessageStage::Header | MessageStage::Body => {
+                match &message.body {
                     Body::Streaming { .. } => {
                         // read and discard body
                         while let Some(_body_part) =
-                            self.read_next_body(entity).await.transpose()?
-                        {}
+                            self.read_next_body(message).await.transpose()?
+                        {
+                        }
                     }
                     Body::Chunked { .. } => {
-                        self.read_all(entity).await?;
+                        self.read_all(message).await?;
                     }
                 }
             }
-            EntityStage::Trailer => {}
-            EntityStage::Complete => return Ok(entity.trailers()),
+            MessageStage::Trailer => {}
+            MessageStage::Complete => return Ok(message.trailers()),
         }
 
-        entity.trailer = self
+        message.trailer = self
             .try_io(async |this| {
                 let frame = match this.stream.frame().transpose()? {
                     Some(frame) if frame.r#type() != Frame::HEADERS_FRAME_TYPE => {
@@ -433,9 +437,9 @@ impl ReadStream {
             .await?;
 
         debug_assert!(self.stream.frame().is_none());
-        entity.stage = EntityStage::Complete;
+        message.stage = MessageStage::Complete;
 
-        Ok(entity.trailers())
+        Ok(message.trailers())
     }
 
     pub async fn stop(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
@@ -540,19 +544,19 @@ impl WriteStream {
         }
     }
 
-    pub async fn send_header(&mut self, entity: &mut Entity) -> Result<(), StreamError> {
-        match entity.stage {
-            EntityStage::Header => {}
+    pub async fn send_header(&mut self, message: &mut Message) -> Result<(), StreamError> {
+        match message.stage {
+            MessageStage::Header => {}
             // header already sent
-            EntityStage::Body | EntityStage::Trailer | EntityStage::Complete => return Ok(()),
+            MessageStage::Body | MessageStage::Trailer | MessageStage::Complete => return Ok(()),
         }
 
-        entity
+        message
             .header
             .check_pseudo()
             .context(SendMalformedPseudoHeaderSnafu)?;
 
-        let field_lines = entity.header.iter();
+        let field_lines = message.header.iter();
         let algo = &DEFAULT_COMPRESS_ALGO;
         self.try_io(async move |this| {
             let stream = &mut this.stream;
@@ -562,31 +566,31 @@ impl WriteStream {
         })
         .await?;
 
-        if entity.is_interim_response() {
-            entity.stage = EntityStage::Header
+        if message.is_interim_response() {
+            message.stage = MessageStage::Header
         } else {
-            entity.stage = EntityStage::Body
+            message.stage = MessageStage::Body
         }
         Ok(())
     }
 
     pub async fn send_streaming_body(
         &mut self,
-        entity: &mut Entity,
+        message: &mut Message,
         mut content: impl Buf,
     ) -> Result<(), StreamError> {
-        if entity.is_interim_response() {
+        if message.is_interim_response() {
             return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse.into());
         }
-        entity.enable_streaming()?;
+        message.enable_streaming()?;
 
-        match entity.stage {
-            EntityStage::Header => {
-                self.send_header(entity).await?;
-                debug_assert_eq!(entity.stage, EntityStage::Body);
+        match message.stage {
+            MessageStage::Header => {
+                self.send_header(message).await?;
+                debug_assert_eq!(message.stage, MessageStage::Body);
             }
-            EntityStage::Body => {}
-            EntityStage::Trailer | EntityStage::Complete => {
+            MessageStage::Body => {}
+            MessageStage::Trailer | MessageStage::Complete => {
                 return Err(IllegalEntityOperator::ModifyBodyAfterSent.into());
             }
         }
@@ -602,23 +606,23 @@ impl WriteStream {
         Ok(())
     }
 
-    pub async fn send_chunked_body(&mut self, entity: &mut Entity) -> Result<(), StreamError> {
-        if entity.is_interim_response() {
+    pub async fn send_chunked_body(&mut self, message: &mut Message) -> Result<(), StreamError> {
+        if message.is_interim_response() {
             return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse.into());
         }
 
-        match entity.stage {
-            EntityStage::Header => {
-                self.send_header(entity).await?;
-                debug_assert_eq!(entity.stage, EntityStage::Body);
+        match message.stage {
+            MessageStage::Header => {
+                self.send_header(message).await?;
+                debug_assert_eq!(message.stage, MessageStage::Body);
             }
-            EntityStage::Body => {}
-            EntityStage::Trailer | EntityStage::Complete => {
+            MessageStage::Body => {}
+            MessageStage::Trailer | MessageStage::Complete => {
                 return Err(IllegalEntityOperator::ModifyBodyAfterSent.into());
             }
         }
 
-        let Body::Chunked { buflist } = &mut entity.body else {
+        let Body::Chunked { buflist } = &mut message.body else {
             return Err(IllegalEntityOperator::ModifyBodyAfterSent.into());
         };
 
@@ -630,32 +634,32 @@ impl WriteStream {
                 .await?;
         }
 
-        entity.stage = EntityStage::Trailer;
+        message.stage = MessageStage::Trailer;
         Ok(())
     }
 
-    pub async fn send_trailer(&mut self, entity: &mut Entity) -> Result<(), StreamError> {
-        if entity.is_interim_response() {
+    pub async fn send_trailer(&mut self, message: &mut Message) -> Result<(), StreamError> {
+        if message.is_interim_response() {
             return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse.into());
         }
         // prepare
-        match entity.stage {
-            EntityStage::Header | EntityStage::Body => {
-                if entity.is_chunked() {
-                    self.send_chunked_body(entity).await?;
-                    debug_assert_eq!(entity.stage, EntityStage::Trailer);
+        match message.stage {
+            MessageStage::Header | MessageStage::Body => {
+                if message.is_chunked() {
+                    self.send_chunked_body(message).await?;
+                    debug_assert_eq!(message.stage, MessageStage::Trailer);
                 } else {
-                    self.send_header(entity).await?;
-                    debug_assert_eq!(entity.stage, EntityStage::Body);
+                    self.send_header(message).await?;
+                    debug_assert_eq!(message.stage, MessageStage::Body);
                     // no body or streaming body already sent
                 }
             }
-            EntityStage::Trailer => {}
-            EntityStage::Complete => return Ok(()),
+            MessageStage::Trailer => {}
+            MessageStage::Complete => return Ok(()),
         }
 
         // TODO: check FieldLines size
-        let field_lines = entity.trailer.iter();
+        let field_lines = message.trailer.iter();
         let algo = &DEFAULT_COMPRESS_ALGO;
         self.try_io(async move |this| {
             let stream = &mut this.stream;
@@ -664,44 +668,44 @@ impl WriteStream {
             Ok(())
         })
         .await?;
-        entity.stage = EntityStage::Complete;
+        message.stage = MessageStage::Complete;
 
         Ok(())
     }
 
-    async fn send_pending_sections(&mut self, entity: &mut Entity) -> Result<(), StreamError> {
-        match entity.stage {
-            EntityStage::Header | EntityStage::Body => {
-                if entity.is_chunked() {
-                    self.send_chunked_body(entity).await?;
-                    debug_assert_eq!(entity.stage, EntityStage::Trailer);
+    async fn send_pending_sections(&mut self, message: &mut Message) -> Result<(), StreamError> {
+        match message.stage {
+            MessageStage::Header | MessageStage::Body => {
+                if message.is_chunked() {
+                    self.send_chunked_body(message).await?;
+                    debug_assert_eq!(message.stage, MessageStage::Trailer);
                 } else {
-                    self.send_header(entity).await?;
-                    debug_assert_eq!(entity.stage, EntityStage::Body);
+                    self.send_header(message).await?;
+                    debug_assert_eq!(message.stage, MessageStage::Body);
                 }
             }
-            EntityStage::Trailer => {
-                if !entity.trailers().is_empty() {
-                    self.send_trailer(entity).await?;
-                    debug_assert_eq!(entity.stage, EntityStage::Complete)
+            MessageStage::Trailer => {
+                if !message.trailers().is_empty() {
+                    self.send_trailer(message).await?;
+                    debug_assert_eq!(message.stage, MessageStage::Complete)
                 } else {
                     // no trailer to send
                 }
             }
-            EntityStage::Complete => {}
+            MessageStage::Complete => {}
         }
 
         Ok(())
     }
 
-    pub async fn flush(&mut self, entity: &mut Entity) -> Result<(), StreamError> {
-        self.send_pending_sections(entity).await?;
+    pub async fn flush(&mut self, message: &mut Message) -> Result<(), StreamError> {
+        self.send_pending_sections(message).await?;
         self.try_io(async move |this| Ok(this.stream.flush_inner().await?))
             .await
     }
 
-    pub async fn close(&mut self, entity: &mut Entity) -> Result<(), StreamError> {
-        self.send_pending_sections(entity).await?;
+    pub async fn close(&mut self, message: &mut Message) -> Result<(), StreamError> {
+        self.send_pending_sections(message).await?;
         self.try_io(async move |this| Ok(this.stream.close().await?))
             .await?;
         Ok(())

@@ -10,8 +10,8 @@ use http::{
 
 use crate::{
     agent::{LocalAgent, RemoteAgent},
-    entity::{
-        Entity, EntityStage, IllegalEntityOperator,
+    message::{
+        IllegalEntityOperator, Message, MessageStage,
         stream::{ReadStream, StreamError, WriteStream},
     },
     varint::VarInt,
@@ -41,13 +41,13 @@ impl UnresolvedRequest {
 
     pub async fn resolve(self) -> Result<(Request, Response), StreamError> {
         let mut request = Request {
-            entity: Entity::unresolved_request(),
+            entity: Message::unresolved_request(),
             stream: self.request_stream,
             agent: self.remote_agent,
         };
         request.stream.read_header(&mut request.entity).await?;
         let response = Response {
-            entity: Entity::unresolved_response(),
+            entity: Message::unresolved_response(),
             stream: self.response_stream,
             agent: self.local_agent,
         };
@@ -66,7 +66,7 @@ impl IntoFuture for UnresolvedRequest {
 }
 
 pub struct Request {
-    entity: Entity,
+    entity: Message,
     stream: ReadStream,
     agent: Option<RemoteAgent>,
 }
@@ -138,7 +138,7 @@ impl Request {
 }
 
 pub struct Response {
-    entity: Entity,
+    entity: Message,
     stream: WriteStream,
     agent: LocalAgent,
 }
@@ -149,7 +149,7 @@ impl Response {
     }
 
     pub fn headers_mut(&mut self) -> Result<&mut http::HeaderMap, StreamError> {
-        if self.entity.stage() > EntityStage::Header {
+        if self.entity.stage() > MessageStage::Header {
             return Err(IllegalEntityOperator::ModifyHeaderAfterSent.into());
         }
         Ok(&mut self.entity.header_mut().header_map)
@@ -175,10 +175,10 @@ impl Response {
     }
 
     pub fn set_body(&mut self, content: impl Buf) -> Result<&mut Self, StreamError> {
-        if self.entity.stage() > EntityStage::Body {
+        if self.entity.stage() > MessageStage::Body {
             return Err(IllegalEntityOperator::ModifyBodyAfterSent.into());
         }
-        if self.entity.stage() == EntityStage::Body {
+        if self.entity.stage() == MessageStage::Body {
             return Err(IllegalEntityOperator::ReplaceBodyWhileSending.into());
         }
         self.entity.set_body(content)?;
@@ -197,7 +197,7 @@ impl Response {
     }
 
     pub fn trailers_mut(&mut self) -> Result<&mut HeaderMap, StreamError> {
-        if self.entity.stage() > EntityStage::Trailer {
+        if self.entity.stage() > MessageStage::Trailer {
             return Err(IllegalEntityOperator::ModifyTrailerAfterSent.into());
         }
         Ok(self.entity.trailers_mut()?)
@@ -235,7 +235,7 @@ impl Drop for Response {
         if !self.entity.is_complete() {
             // It's ok to take: Response will not be used after drop
             let mut stream = self.stream.take();
-            let mut entity = mem::replace(&mut self.entity, Entity::unresolved_response());
+            let mut entity = mem::replace(&mut self.entity, Message::unresolved_response());
             tracing::debug!(
                 target: "h3x::server", ?entity,
                 "Response is dropped before completion, closing the stream"

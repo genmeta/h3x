@@ -19,7 +19,7 @@ enum Body {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum EntityStage {
+pub enum MessageStage {
     Header = 0,
     Body = 1,
     Trailer = 2,
@@ -55,12 +55,12 @@ pub enum IllegalEntityOperator {
 }
 
 #[derive(Debug, Clone)]
-pub struct Entity {
+pub struct Message {
     header: FieldSection,
     body: Body,
     trailer: FieldSection,
 
-    stage: EntityStage,
+    stage: MessageStage,
 }
 
 #[derive(Debug, Snafu)]
@@ -71,7 +71,7 @@ pub enum InvalidHeader {
     Value { source: InvalidHeaderValue },
 }
 
-impl Entity {
+impl Message {
     pub fn unresolved_request() -> Self {
         Self {
             header: FieldSection::header(PseudoHeaders::unresolved_request(), HeaderMap::default()),
@@ -79,7 +79,7 @@ impl Entity {
                 buflist: Cursor::new(BufList::new()),
             },
             trailer: FieldSection::trailer(HeaderMap::default()),
-            stage: EntityStage::Header,
+            stage: MessageStage::Header,
         }
     }
 
@@ -93,7 +93,7 @@ impl Entity {
                 buflist: Cursor::new(BufList::new()),
             },
             trailer: FieldSection::trailer(HeaderMap::default()),
-            stage: EntityStage::Header,
+            stage: MessageStage::Header,
         }
     }
 
@@ -108,8 +108,8 @@ impl Entity {
     pub fn enable_streaming(&mut self) -> Result<(), IllegalEntityOperator> {
         if let Body::Chunked { buflist } = &self.body {
             match self.stage {
-                EntityStage::Header => {}
-                EntityStage::Body if !buflist.inner().has_remaining() => {}
+                MessageStage::Header => {}
+                MessageStage::Body if !buflist.inner().has_remaining() => {}
                 _ => return Err(IllegalEntityOperator::ChangeBodyModeInTransport),
             }
 
@@ -121,8 +121,8 @@ impl Entity {
     pub fn chunked_body(&mut self) -> Result<&mut Cursor<BufList>, IllegalEntityOperator> {
         if let Body::Streaming { received } = &self.body {
             match self.stage {
-                EntityStage::Header => { /* Ok to change mode: body unused */ }
-                EntityStage::Body if *received == 0 => { /* Ok to change mode: body unused */ }
+                MessageStage::Header => { /* Ok to change mode: body unused */ }
+                MessageStage::Body if *received == 0 => { /* Ok to change mode: body unused */ }
                 _ => return Err(IllegalEntityOperator::ChangeBodyModeInTransport),
             }
         }
@@ -182,11 +182,11 @@ impl Entity {
         Ok(&mut self.trailer.header_map)
     }
 
-    pub fn stage(&self) -> EntityStage {
+    pub fn stage(&self) -> MessageStage {
         self.stage
     }
 
     pub fn is_complete(&self) -> bool {
-        self.stage() == EntityStage::Complete
+        self.stage() == MessageStage::Complete
     }
 }

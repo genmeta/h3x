@@ -11,12 +11,12 @@ use crate::{
     quic::{self, GetStreamIdExt},
 };
 
-mod entity;
+mod message;
 mod method;
 mod route;
 mod service;
 
-pub use entity::{Request, Response, UnresolvedRequest};
+pub use message::{Request, Response, UnresolvedRequest};
 pub use route::{MethodRouter, Router};
 pub use service::{
     BoxService, BoxServiceFuture, ErasedService, IntoBoxService, Service, box_service,
@@ -150,8 +150,8 @@ impl<L: quic::Listen> Servers<L> {
 
                         tracing::debug!(method = %req.method(), uri = %req.uri(), "Resolved new request");
                         match router.downcast_ref::<Router>() {
-                            Some(router) => router.handle(req, rsp).await,
-                            None => router.clone().handle(req, rsp).await,
+                            Some(router) => router.serve(req, rsp).await,
+                            None => router.clone().serve(req, rsp).await,
                         }
                     };
                     connection_tasks.spawn(handle_request.instrument(span));

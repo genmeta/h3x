@@ -32,19 +32,19 @@ impl<S> Fallback<S> {
         self.0.read().unwrap().clone()
     }
 
-    pub fn handle(&self, request: Request, response: Response) -> S::Future
+    pub fn serve(&self, request: Request, response: Response) -> S::Future
     where
         S: Service + Clone,
     {
-        self.get().handle(request, response)
+        self.get().serve(request, response)
     }
 }
 
 impl<S: Service + Clone> Service for Fallback<S> {
     type Future = S::Future;
 
-    fn handle(&mut self, request: Request, response: Response) -> Self::Future {
-        self.get().handle(request, response)
+    fn serve(&mut self, request: Request, response: Response) -> Self::Future {
+        self.get().serve(request, response)
     }
 }
 
@@ -93,15 +93,15 @@ impl RouterInner {
         }
     }
 
-    fn handle(&self, request: Request, response: Response) -> BoxServiceFuture {
+    fn serve(&self, request: Request, response: Response) -> BoxServiceFuture {
         let Some(path_and_query) = request.path() else {
-            return self.fallback.clone().handle(request, response);
+            return self.fallback.clone().serve(request, response);
         };
         let Ok(endpoint) = self.router.at(path_and_query.path()) else {
-            return self.fallback.clone().handle(request, response);
+            return self.fallback.clone().serve(request, response);
         };
 
-        endpoint.value.clone().handle(request, response)
+        endpoint.value.clone().serve(request, response)
     }
 }
 
@@ -167,16 +167,16 @@ impl Router {
         self.on(Method::PATCH, path, service)
     }
 
-    pub fn handle(&self, request: Request, response: Response) -> BoxServiceFuture {
-        self.inner_ref().handle(request, response)
+    pub fn serve(&self, request: Request, response: Response) -> BoxServiceFuture {
+        self.inner_ref().serve(request, response)
     }
 }
 
 impl Service for Router {
     type Future = BoxServiceFuture;
 
-    fn handle(&mut self, request: Request, response: Response) -> Self::Future {
-        Router::handle(self, request, response)
+    fn serve(&mut self, request: Request, response: Response) -> Self::Future {
+        Router::serve(self, request, response)
     }
 }
 
@@ -268,10 +268,10 @@ where
 {
     type Future = S::Future;
 
-    fn handle(&mut self, request: super::Request, response: super::Response) -> Self::Future {
+    fn serve(&mut self, request: super::Request, response: super::Response) -> Self::Future {
         match self.service_mut(request.method()) {
-            Some(service) => service.handle(request, response),
-            None => self.fallback.handle(request, response),
+            Some(service) => service.serve(request, response),
+            None => self.fallback.serve(request, response),
         }
     }
 }

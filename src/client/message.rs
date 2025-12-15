@@ -12,8 +12,8 @@ use crate::{
     agent::{LocalAgent, RemoteAgent},
     client::Client,
     connection::InitialRequestStreamError,
-    entity::{
-        Entity, EntityStage, IllegalEntityOperator,
+    message::{
+        IllegalEntityOperator, Message, MessageStage,
         stream::{ReadStream, StreamError, WriteStream},
     },
     pool::ConnectError,
@@ -25,7 +25,7 @@ use crate::{
 #[derive(Clone)]
 pub struct PendingRequest<'c, C: quic::Connect> {
     client: &'c Client<C>,
-    request: Entity,
+    request: Message,
 }
 
 impl<'c, C: quic::Connect + std::fmt::Debug> std::fmt::Debug for PendingRequest<'c, C>
@@ -60,7 +60,7 @@ impl<E: Error + 'static> From<quic::ConnectionError> for RequestError<E> {
 
 impl<C: quic::Connect> Client<C> {
     pub fn new_request(&self) -> PendingRequest<'_, C> {
-        let mut request = Entity::unresolved_request();
+        let mut request = Message::unresolved_request();
         _ = request.enable_streaming();
         PendingRequest {
             client: self,
@@ -184,7 +184,7 @@ where
                 .expect("chekced by Client::connect");
 
             let response = Response {
-                entity: Entity::unresolved_response(),
+                entity: Message::unresolved_response(),
                 stream: read_stream,
                 agent: remote_agent,
             };
@@ -235,7 +235,7 @@ where
 }
 
 pub struct Request {
-    entity: Entity,
+    entity: Message,
     stream: WriteStream,
     agent: Option<LocalAgent>,
 }
@@ -282,7 +282,7 @@ impl Request {
     }
 
     pub fn trailers_mut(&mut self) -> Result<&mut HeaderMap, StreamError> {
-        if self.entity.stage() > EntityStage::Trailer {
+        if self.entity.stage() > MessageStage::Trailer {
             return Err(IllegalEntityOperator::ModifyTrailerAfterSent.into());
         }
         Ok(self.entity.trailers_mut()?)
@@ -320,7 +320,7 @@ impl Drop for Request {
         if !self.entity.is_complete() {
             // Its ok to take: Request will not be used after drop
             let mut stream = self.stream.take();
-            let mut entity = mem::replace(&mut self.entity, Entity::unresolved_request());
+            let mut entity = mem::replace(&mut self.entity, Message::unresolved_request());
             tokio::spawn(async move {
                 if let Err(StreamError::IllegalEntityOperator { source }) =
                     stream.close(&mut entity).await
@@ -336,7 +336,7 @@ impl Drop for Request {
 }
 
 pub struct Response {
-    entity: Entity,
+    entity: Message,
     stream: ReadStream,
     agent: RemoteAgent,
 }
