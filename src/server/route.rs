@@ -9,56 +9,75 @@ use crate::server::{
     BoxService, BoxServiceFuture, IntoBoxService, Request, Response, Service, box_service,
 };
 
-async fn default_fallback(_request: Request, mut response: Response) {
+async fn default_fallback(_request: &mut Request, response: &mut Response) {
     _ = async { response.set_status(StatusCode::NOT_FOUND)?.close().await }.await;
 }
 
-#[derive(Debug, Clone)]
-struct Fallback<S>(Arc<RwLock<S>>);
+/// A wrapper struct to make `default_fallback` implement `Service`.
+/// This is needed because async closures don't work well with HRTB.
+#[derive(Debug, Clone, Copy)]
+struct DefaultFallbackService;
 
-impl<S> Fallback<S> {
-    pub fn new(service: S) -> Self {
-        Self(Arc::new(RwLock::new(service)))
-    }
+impl Service for DefaultFallbackService {
+    type Future<'s> = impl Future<Output = ()> + Send + 's;
 
-    pub fn set(&mut self, service: S) {
-        *self.0.write().unwrap() = service;
-    }
-
-    pub fn get(&self) -> S
-    where
-        S: Clone,
-    {
-        self.0.read().unwrap().clone()
-    }
-
-    pub fn serve(&self, request: Request, response: Response) -> S::Future
-    where
-        S: Service + Clone,
-    {
-        self.get().serve(request, response)
+    fn serve<'s>(
+        &'s mut self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> Self::Future<'s> {
+        default_fallback(request, response)
     }
 }
 
-impl<S: Service + Clone> Service for Fallback<S> {
-    type Future = S::Future;
+#[derive(Debug, Clone)]
+struct Fallback(Arc<RwLock<BoxService>>);
 
-    fn serve(&mut self, request: Request, response: Response) -> Self::Future {
-        self.get().serve(request, response)
+impl Fallback {
+    pub fn new(service: BoxService) -> Self {
+        Self(Arc::new(RwLock::new(service)))
+    }
+
+    pub fn set(&mut self, service: BoxService) {
+        *self.0.write().unwrap() = service;
+    }
+
+    fn get(&self) -> BoxService {
+        self.0.read().unwrap().clone()
+    }
+
+    pub fn serve<'s>(
+        &self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> BoxServiceFuture<'s> {
+        self.get().serve_owned(request, response)
+    }
+}
+
+impl Service for Fallback {
+    type Future<'s> = BoxServiceFuture<'s>;
+
+    fn serve<'s>(
+        &'s mut self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> Self::Future<'s> {
+        Fallback::serve(self, request, response)
     }
 }
 
 #[derive(Debug, Clone)]
 struct RouterInner {
     router: matchit::Router<BoxService>,
-    fallback: Fallback<BoxService>, // Fal
+    fallback: Fallback,
 }
 
 impl Default for RouterInner {
     fn default() -> Self {
         Self {
             router: Default::default(),
-            fallback: Fallback::new(box_service(default_fallback)),
+            fallback: Fallback::new(box_service(DefaultFallbackService)),
         }
     }
 }
@@ -93,15 +112,19 @@ impl RouterInner {
         }
     }
 
-    fn serve(&self, request: Request, response: Response) -> BoxServiceFuture {
+    fn serve<'s>(
+        &self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> BoxServiceFuture<'s> {
         let Some(path_and_query) = request.path() else {
-            return self.fallback.clone().serve(request, response);
+            return self.fallback.serve(request, response);
         };
         let Ok(endpoint) = self.router.at(path_and_query.path()) else {
-            return self.fallback.clone().serve(request, response);
+            return self.fallback.serve(request, response);
         };
 
-        endpoint.value.clone().serve(request, response)
+        endpoint.value.serve_owned(request, response)
     }
 }
 
@@ -167,15 +190,23 @@ impl Router {
         self.on(Method::PATCH, path, service)
     }
 
-    pub fn serve(&self, request: Request, response: Response) -> BoxServiceFuture {
+    pub fn serve<'s>(
+        &self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> BoxServiceFuture<'s> {
         self.inner_ref().serve(request, response)
     }
 }
 
 impl Service for Router {
-    type Future = BoxServiceFuture;
+    type Future<'s> = BoxServiceFuture<'s>;
 
-    fn serve(&mut self, request: Request, response: Response) -> Self::Future {
+    fn serve<'s>(
+        &mut self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> Self::Future<'s> {
         Router::serve(self, request, response)
     }
 }
@@ -264,14 +295,34 @@ impl<S> MethodRouter<S> {
 
 impl<S> Service for MethodRouter<S>
 where
-    S: Service,
+    S: for<'s> Service<Future<'s>: Send>,
 {
-    type Future = S::Future;
+    type Future<'s>
+        = BoxServiceFuture<'s>
+    where
+        Self: 's;
 
-    fn serve(&mut self, request: super::Request, response: super::Response) -> Self::Future {
-        match self.service_mut(request.method()) {
-            Some(service) => service.serve(request, response),
-            None => self.fallback.serve(request, response),
-        }
+    fn serve<'s>(
+        &'s mut self,
+        request: &'s mut super::Request,
+        response: &'s mut super::Response,
+    ) -> Self::Future<'s> {
+        let method = request.method();
+        let service: &'s mut S = match method {
+            Method::OPTIONS => self.options.as_mut().unwrap_or(&mut self.fallback),
+            Method::GET => self.get.as_mut().unwrap_or(&mut self.fallback),
+            Method::POST => self.post.as_mut().unwrap_or(&mut self.fallback),
+            Method::PUT => self.put.as_mut().unwrap_or(&mut self.fallback),
+            Method::DELETE => self.delete.as_mut().unwrap_or(&mut self.fallback),
+            Method::HEAD => self.head.as_mut().unwrap_or(&mut self.fallback),
+            Method::TRACE => self.trace.as_mut().unwrap_or(&mut self.fallback),
+            Method::CONNECT => self.connect.as_mut().unwrap_or(&mut self.fallback),
+            Method::PATCH => self.patch.as_mut().unwrap_or(&mut self.fallback),
+            _ => self
+                .extension
+                .get_mut(&method)
+                .unwrap_or(&mut self.fallback),
+        };
+        Box::pin(service.serve(request, response))
     }
 }

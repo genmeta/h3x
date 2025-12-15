@@ -5,57 +5,102 @@ use futures::future::BoxFuture;
 use crate::server::{Request, Response};
 
 pub trait Service {
-    type Future: Future<Output = ()>;
+    type Future<'s>: Future<Output = ()>
+    where
+        Self: 's;
 
-    fn serve(&mut self, request: Request, response: Response) -> Self::Future;
+    fn serve<'s>(
+        &'s mut self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> Self::Future<'s>;
 }
 
-impl<Fn, Fut> Service for Fn
+pub trait ServiceFn<'s> {
+    type Future: Future<Output = ()> + 's;
+    fn call(&mut self, req: &'s mut Request, res: &'s mut Response) -> Self::Future;
+}
+
+impl<'s, F, Fut> ServiceFn<'s> for F
 where
-    Fn: FnMut(Request, Response) -> Fut,
-    Fut: Future<Output = ()>,
+    F: FnMut(&'s mut Request, &'s mut Response) -> Fut,
+    Fut: Future<Output = ()> + Send + 's,
 {
     type Future = Fut;
-
-    fn serve(&mut self, request: Request, response: Response) -> Self::Future {
-        (self)(request, response)
+    fn call(&mut self, req: &'s mut Request, res: &'s mut Response) -> Self::Future {
+        (self)(req, res)
     }
 }
 
-trait CloneableService: Service + Any {
-    fn clone_box(&self) -> Box<dyn CloneableService<Future = Self::Future> + Send + Sync>;
+impl<S> Service for S
+where
+    S: for<'s> ServiceFn<'s>,
+{
+    type Future<'s>
+        = <S as ServiceFn<'s>>::Future
+    where
+        Self: 's;
+
+    fn serve<'s>(
+        &'s mut self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> Self::Future<'s> {
+        self.call(request, response)
+    }
 }
 
-impl<H: Service + Any + Clone + Send + Sync> CloneableService for H {
-    fn clone_box(&self) -> Box<dyn CloneableService<Future = Self::Future> + Send + Sync> {
+trait CloneableService: Any {
+    fn serve<'s>(
+        &'s mut self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> BoxFuture<'s, ()>;
+
+    fn serve_owned<'s>(
+        &self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> BoxFuture<'s, ()>;
+
+    fn clone_box(&self) -> Box<dyn CloneableService + Send + Sync>;
+}
+
+impl<H: for<'s> Service<Future<'s>: Send> + Any + Clone + Send + Sync> CloneableService for H {
+    fn serve<'s>(
+        &'s mut self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> BoxFuture<'s, ()> {
+        Box::pin(self.serve(request, response))
+    }
+
+    fn serve_owned<'s>(
+        &self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> BoxFuture<'s, ()> {
+        let mut service = self.clone();
+        Box::pin(async move { service.serve(request, response).await })
+    }
+
+    fn clone_box(&self) -> Box<dyn CloneableService + Send + Sync> {
         Box::new(self.clone())
     }
 }
 
-pub trait IntoBoxService: Service<Future: Send + 'static> + Clone + Send + Sync + 'static {
+pub trait IntoBoxService:
+    for<'s> Service<Future<'s>: Send> + Clone + Send + Sync + 'static
+{
     fn into_box_service(self) -> BoxService {
-        box_service(self)
+        BoxService(Box::new(self))
     }
 }
 
-impl<S: Service<Future: Send + 'static> + Clone + Send + Sync + 'static> IntoBoxService for S {}
+impl<S: for<'s> Service<Future<'s>: Send> + Clone + Send + Sync + 'static> IntoBoxService for S {}
 
-pub type BoxServiceFuture = BoxFuture<'static, ()>;
-type DynService = dyn CloneableService<Future = BoxServiceFuture> + Send + Sync;
-
-// transparent wrapper to erase the concrete type of Service
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-pub struct ErasedService<S: ?Sized>(S);
-
-impl<S: Service<Future: Send + 'static> + ?Sized> Service for ErasedService<S> {
-    type Future = BoxServiceFuture;
-
-    #[inline]
-    fn serve(&mut self, request: Request, response: Response) -> Self::Future {
-        Box::pin(self.0.serve(request, response))
-    }
-}
+pub type BoxServiceFuture<'s> = BoxFuture<'s, ()>;
+type DynService = dyn CloneableService + Send + Sync;
 
 pub struct BoxService(Box<DynService>);
 
@@ -67,38 +112,40 @@ impl std::fmt::Debug for BoxService {
 
 impl BoxService {
     pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
-        (self.0.as_ref() as &dyn Any)
-            .downcast_ref::<ErasedService<T>>()
-            .map(|ErasedService(s)| s)
+        (self.0.as_ref() as &dyn Any).downcast_ref::<T>()
     }
 
     pub fn downcast_mut<T: Any>(&mut self) -> Option<&mut T> {
-        (self.0.as_mut() as &mut dyn Any)
-            .downcast_mut::<ErasedService<T>>()
-            .map(|ErasedService(s)| s)
+        (self.0.as_mut() as &mut dyn Any).downcast_mut::<T>()
     }
 
     pub fn downcast<T: Any>(self) -> Result<Box<T>, BoxService> {
-        match (self.0.as_ref() as &dyn Any).is::<ErasedService<T>>() {
+        match (self.0.as_ref() as &dyn Any).is::<T>() {
             true => {
                 // SAFETY: checked by is::<T>()
-                let erased_service = unsafe {
-                    (self.0 as Box<dyn Any>)
-                        .downcast::<ErasedService<T>>()
-                        .unwrap_unchecked()
-                };
-                // SAFETY: ErasedService<T> is a transparent wrapper around T
-                Ok(unsafe { std::mem::transmute::<Box<ErasedService<T>>, Box<T>>(erased_service) })
+                Ok(unsafe { (self.0 as Box<dyn Any>).downcast::<T>().unwrap_unchecked() })
             }
             false => Err(self),
         }
     }
+
+    pub fn serve_owned<'s>(
+        &self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> BoxServiceFuture<'s> {
+        self.0.serve_owned(request, response)
+    }
 }
 
 impl Service for BoxService {
-    type Future = BoxServiceFuture;
+    type Future<'s> = BoxServiceFuture<'s>;
 
-    fn serve(&mut self, request: Request, response: Response) -> Self::Future {
+    fn serve<'s>(
+        &'s mut self,
+        request: &'s mut Request,
+        response: &'s mut Response,
+    ) -> Self::Future<'s> {
         self.0.serve(request, response)
     }
 }
@@ -109,9 +156,13 @@ impl Clone for BoxService {
     }
 }
 
-pub fn box_service<S>(service: S) -> BoxService
+pub fn box_service(service: impl IntoBoxService) -> BoxService {
+    service.into_box_service()
+}
+
+pub fn service_fn<F>(f: F) -> F
 where
-    S: Service<Future: Send + 'static> + Clone + Send + Sync + 'static,
+    F: for<'s> ServiceFn<'s>,
 {
-    BoxService(Box::new(ErasedService(service)))
+    f
 }

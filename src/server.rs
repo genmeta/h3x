@@ -12,15 +12,12 @@ use crate::{
 };
 
 mod message;
-mod method;
 mod route;
 mod service;
 
 pub use message::{Request, Response, UnresolvedRequest};
 pub use route::{MethodRouter, Router};
-pub use service::{
-    BoxService, BoxServiceFuture, ErasedService, IntoBoxService, Service, box_service,
-};
+pub use service::{BoxService, BoxServiceFuture, IntoBoxService, Service, box_service, service_fn};
 
 #[derive(Debug, Clone)]
 pub struct Servers<L: quic::Listen> {
@@ -93,7 +90,7 @@ impl<L: quic::Listen> Servers<L> {
                 let connection = Arc::new(connection);
                 _ = pool.try_insert(connection.clone());
                 // TODO: router with authority?
-                let Some(router) = router.get(local_agent.name()) else {
+                let Some(service) = router.get(local_agent.name()) else {
                     tracing::debug!("fallback");
                     todo!("fallback: connected server not exist");
                 };
@@ -127,7 +124,7 @@ impl<L: quic::Listen> Servers<L> {
                         }
                     };
 
-                    let router = router.clone();
+                    let mut service = service.clone();
                     let unresolved_request = UnresolvedRequest::new(
                         read_stream,
                         write_stream,
@@ -137,7 +134,7 @@ impl<L: quic::Listen> Servers<L> {
                     let span = tracing::info_span!("handle_request", stream_id = %stream_id);
                     let handle_request = async move {
                         tracing::debug!("Resolving incoming request");
-                        let (req, rsp) = match unresolved_request.resolve().await {
+                        let (mut req, mut rsp) = match unresolved_request.resolve().await {
                             Ok(pair) => pair,
                             Err(error) => {
                                 tracing::debug!(
@@ -149,9 +146,9 @@ impl<L: quic::Listen> Servers<L> {
                         };
 
                         tracing::debug!(method = %req.method(), uri = %req.uri(), "Resolved new request");
-                        match router.downcast_ref::<Router>() {
-                            Some(router) => router.serve(req, rsp).await,
-                            None => router.clone().serve(req, rsp).await,
+                        match service.downcast_ref::<Router>() {
+                            Some(router) => router.serve(&mut req, &mut rsp).await,
+                            None => service.serve(&mut req, &mut rsp).await,
                         }
                     };
                     connection_tasks.spawn(handle_request.instrument(span));

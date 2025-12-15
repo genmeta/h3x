@@ -391,7 +391,7 @@ mod tests {
         let client = Client::builder().connector(quic_client()).build();
 
         let server = async move {
-            let echo_service = async |mut req: server::Request, mut resp: server::Response| {
+            let echo_service = async |req: &mut server::Request, resp: &mut server::Response| {
                 tracing::info!("Echo service called");
                 resp.set_status(StatusCode::OK).unwrap();
                 while let Some(body_part) = req.read().await.transpose().unwrap() {
@@ -401,7 +401,7 @@ mod tests {
                 resp.close().await.unwrap();
                 tracing::info!("Echo done");
             };
-            let health_service = async |_req: server::Request, mut resp: server::Response| {
+            let health_service = async |_req: &mut server::Request, resp: &mut server::Response| {
                 tracing::info!("Health service called");
                 resp.set_status(StatusCode::OK)
                     .unwrap()
