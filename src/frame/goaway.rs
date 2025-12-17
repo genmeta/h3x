@@ -41,8 +41,10 @@ where
     async fn decode(mut self) -> Result<Goaway, Self::Error> {
         assert!(self.r#type() == Frame::GOAWAY_FRAME_TYPE);
         let stream_id = self.decode_one::<VarInt>().await.map_err(|error| {
-            DecodeStreamError::from(error)
-                .map_stream_closed(|| H3CriticalStreamClosed::Control.into())
+            DecodeStreamError::from(error).map_stream_closed(
+                |_reset_code| H3CriticalStreamClosed::Control.into(),
+                |decode_error| Code::H3_FRAME_ERROR.with(decode_error).into(),
+            )
         })?;
 
         // ensure frame is exhausted
@@ -61,10 +63,16 @@ impl Encode<Goaway> for BufList {
     type Error = Infallible;
 
     async fn encode(self, goaway: Goaway) -> Result<Self::Output, Self::Error> {
-        assert!(!self.has_remaining());
+        assert!(
+            !self.has_remaining(),
+            "Only empty buflist can be used to encode frame"
+        );
 
         let mut frame = Frame::new(Frame::GOAWAY_FRAME_TYPE, self).unwrap();
-        frame.encode_one(goaway.stream_id).await.unwrap();
+        frame
+            .encode_one(goaway.stream_id)
+            .await
+            .expect("size of varint never exceeded 2^62-1");
         Ok(frame)
     }
 }

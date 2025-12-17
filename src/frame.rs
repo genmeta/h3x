@@ -12,7 +12,10 @@ use tokio::io::{self, AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
     buflist::BufList,
-    codec::{Decode, DecodeExt, DecodeStreamError, Encode, FixedLengthReader, StreamReader},
+    codec::{
+        Decode, DecodeExt, DecodeStreamError, Encode, EncodeError, EncodeStreamError,
+        FixedLengthReader, StreamReader,
+    },
     connection::StreamError,
     error::Code,
     quic::{self, GetStreamId, StopStream},
@@ -31,10 +34,9 @@ pin_project_lite::pin_project! {
     /// ```
     ///
     /// Frame Payload has a generic type `P`, it could be:
-    /// ### A sequence of bytes (such as `Vec<B>`, `[B]` where B: `[Buf]`).
+    /// ### A buffer that implements [`Buf`]
     ///
     /// Crate such a frame with [`Frame::new`], encode it to the stream with [`Frame::encode`].
-    ///
     ///
     /// ### A [Stream] of bytes
     ///
@@ -136,12 +138,12 @@ impl<P: AsyncWrite + ?Sized> AsyncWrite for Frame<P> {
         let project = self.project();
         match project.length.into_inner().checked_add(buf.len() as u64) {
             Some(new_length) if new_length > VARINT_MAX => {
-                panic!("Frame too large")
+                return Poll::Ready(Err(EncodeError::FramePayloadTooLarge.into()));
             }
             Some(new_length) => {
                 *project.length = VarInt::from_u64(new_length).unwrap();
             }
-            None => panic!("Frame too large"),
+            None => return Poll::Ready(Err(EncodeError::FramePayloadTooLarge.into())),
         }
 
         project.payload.poll_write(cx, buf)
@@ -156,11 +158,17 @@ impl<P: AsyncWrite + ?Sized> AsyncWrite for Frame<P> {
     }
 }
 
-impl<P: Sink<B> + ?Sized, B: Buf> Sink<B> for Frame<P> {
-    type Error = P::Error;
+impl<P: Sink<B> + ?Sized, B: Buf> Sink<B> for Frame<P>
+where
+    EncodeStreamError: From<P::Error>,
+{
+    type Error = EncodeStreamError;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project().payload.poll_ready(cx)
+        self.project()
+            .payload
+            .poll_ready(cx)
+            .map_err(EncodeStreamError::from)
     }
 
     fn start_send(self: Pin<&mut Self>, item: B) -> Result<(), Self::Error> {
@@ -168,23 +176,29 @@ impl<P: Sink<B> + ?Sized, B: Buf> Sink<B> for Frame<P> {
         let len = item.remaining() as u64;
         match project.length.into_inner().checked_add(len) {
             Some(new_length) if new_length > VARINT_MAX => {
-                panic!("Frame too large")
+                return Err(EncodeError::FramePayloadTooLarge.into());
             }
             Some(new_length) => {
                 *project.length = VarInt::from_u64(new_length).unwrap();
             }
-            None => panic!("Frame too large"),
+            None => return Err(EncodeError::FramePayloadTooLarge.into()),
         }
         project.payload.start_send(item)?;
         Ok(())
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project().payload.poll_flush(cx)
+        self.project()
+            .payload
+            .poll_flush(cx)
+            .map_err(EncodeStreamError::from)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project().payload.poll_close(cx)
+        self.project()
+            .payload
+            .poll_close(cx)
+            .map_err(EncodeStreamError::from)
     }
 }
 

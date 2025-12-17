@@ -1,4 +1,4 @@
-use std::{convert::Infallible, pin::pin};
+use std::pin::pin;
 
 use bytes::{Buf, Bytes};
 use futures::{Sink, Stream, TryStreamExt};
@@ -16,7 +16,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 use crate::{
     buflist::BufList,
-    codec::{Decode, DecodeError, DecodeStreamError, Encode, EncodeExt},
+    codec::{
+        Decode, DecodeError, DecodeStreamError, Encode, EncodeError, EncodeExt, EncodeStreamError,
+    },
     connection::StreamError,
     error::{Code, HasErrorCode},
     frame::Frame,
@@ -24,7 +26,6 @@ use crate::{
         integer::{decode_integer, encode_integer},
         string::{decode_string, encode_string},
     },
-    quic,
 };
 
 ///
@@ -109,7 +110,7 @@ impl<S: AsyncRead> Decode<EncodedFieldSectionPrefix> for S {
 impl<S: AsyncWrite> Encode<EncodedFieldSectionPrefix> for S {
     type Output = ();
 
-    type Error = quic::StreamError;
+    type Error = EncodeStreamError;
 
     async fn encode(self, item: EncodedFieldSectionPrefix) -> Result<Self::Output, Self::Error> {
         let mut stream = pin!(self);
@@ -296,11 +297,11 @@ impl<S: AsyncRead> Decode<FieldLineRepresentation> for S {
 impl<S, E> Encode<FieldLineRepresentation> for S
 where
     S: AsyncWrite + Sink<Bytes, Error = E>,
-    quic::StreamError: From<E>,
+    EncodeStreamError: From<E>,
 {
     type Output = ();
 
-    type Error = StreamError;
+    type Error = EncodeStreamError;
 
     async fn encode(self, repr: FieldLineRepresentation) -> Result<Self::Output, Self::Error> {
         let mut stream = pin!(self);
@@ -367,7 +368,7 @@ where
 impl Encode<(EncodedFieldSectionPrefix, Vec<FieldLineRepresentation>)> for BufList {
     type Output = Frame<BufList>;
 
-    type Error = Infallible;
+    type Error = EncodeError;
 
     async fn encode(
         self,
@@ -376,17 +377,28 @@ impl Encode<(EncodedFieldSectionPrefix, Vec<FieldLineRepresentation>)> for BufLi
             Vec<FieldLineRepresentation>,
         ),
     ) -> Result<Self::Output, Self::Error> {
-        assert!(!self.has_remaining());
-        let mut header_frame = Frame::new(Frame::HEADERS_FRAME_TYPE, BufList::new()).unwrap();
+        assert!(
+            !self.has_remaining(),
+            "Only empty buflist can be used to encode frame"
+        );
+        let mut header_frame = Frame::new(Frame::HEADERS_FRAME_TYPE, BufList::new())
+            .expect("Empty buflist has zero size");
 
-        header_frame.encode_one(field_section_prefix).await.unwrap();
-        for field_line_representation in field_line_representations {
-            header_frame
-                .encode_one(field_line_representation)
-                .await
-                .unwrap();
-        }
-        Ok(header_frame)
+        let encode = async move {
+            header_frame.encode_one(field_section_prefix).await?;
+            for field_line_representation in field_line_representations {
+                header_frame.encode_one(field_line_representation).await?;
+            }
+            Ok(header_frame)
+        };
+        encode
+            .await
+            .map_err(|error: EncodeStreamError| match error {
+                EncodeStreamError::Stream { .. } => {
+                    unreachable!("Stream error should not happen when encoding to BufList")
+                }
+                EncodeStreamError::Encode { source } => source,
+            })
     }
 }
 
@@ -475,6 +487,7 @@ pub enum MalformedHeaderSection {
     InvalidPseudoHeader { name: Bytes },
     #[snafu(display("Duplicate pseudo-header field with name {name:?}"))]
     DuplicatePseudoHeader { name: Bytes },
+    // TODO: merge this error into following two errors
     #[snafu(display("Field section contains both request and response pseudo-header fields"))]
     DualKindedPseudoHeader,
     #[snafu(display("Request Pseudo-header field in response"))]

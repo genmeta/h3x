@@ -26,7 +26,7 @@ use crate::{
 pub enum StreamError {
     #[snafu(transparent)]
     Connection { source: ConnectionError },
-    #[snafu(display("Stream reset with code {code}"))]
+    #[snafu(display("stream reset with code {code}"))]
     Reset { code: VarInt },
 }
 
@@ -55,17 +55,32 @@ impl From<Infallible> for StreamError {
     }
 }
 
+impl StreamError {
+    pub(crate) fn try_from(error: io::Error) -> Result<Self, io::Error> {
+        let source = match error.downcast::<Self>() {
+            Ok(error) => return Ok(error),
+            Err(error) => error,
+        };
+        source.downcast::<ConnectionError>().map(Self::from)
+    }
+}
+
 impl From<io::Error> for StreamError {
-    fn from(value: io::Error) -> Self {
-        value
-            .downcast::<Self>()
-            .expect("io::Error is not StreamError")
+    fn from(error: io::Error) -> Self {
+        match Self::try_from(error) {
+            Ok(error) => error,
+            Err(error) => {
+                unreachable!(
+                    "io::Error({error:?}) cannot be converted to quic::StreamError, this is a bug"
+                )
+            }
+        }
     }
 }
 
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
-#[snafu(display("Transport error({kind:x} in frame {frame_type:x}): {reason}",))]
+#[snafu(display("transport error ({kind:x} in frame {frame_type:x}): {reason}"))]
 pub struct TransportError {
     pub kind: VarInt,
     pub frame_type: VarInt,
@@ -74,7 +89,7 @@ pub struct TransportError {
 
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
-#[snafu(display("Application error({code}): {reason}",))]
+#[snafu(display("application error ({code}): {reason}"))]
 pub struct ApplicationError {
     pub code: Code,
     pub reason: Cow<'static, str>,

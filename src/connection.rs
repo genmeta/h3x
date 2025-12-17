@@ -86,23 +86,19 @@ impl From<StreamError> for io::Error {
 
 impl From<io::Error> for StreamError {
     fn from(source: io::Error) -> Self {
-        let source = match source.downcast::<StreamError>() {
+        let error = match source.downcast::<StreamError>() {
             Ok(error) => return error,
-            Err(source) => source,
+            Err(error) => error,
         };
-        let source = match source.downcast::<quic::StreamError>() {
-            Ok(error) => return StreamError::Quic { source: error },
-            Err(source) => source,
+        let error = match quic::StreamError::try_from(error) {
+            Ok(error) => return error.into(),
+            Err(error) => error,
         };
-        let source = match source.downcast::<Arc<dyn HasErrorCode + Send + Sync + 'static>>() {
-            Ok(error) => return StreamError::Code { source: error },
-            Err(source) => source,
-        };
-        match source.downcast::<quic::ConnectionError>() {
-            Ok(error) => StreamError::Quic {
-                source: error.into(),
-            },
-            Err(source) => panic!("io::Error({source:?}) is neither from StreamReader nor Decoder"),
+        match error.downcast::<Arc<dyn HasErrorCode + Send + Sync + 'static>>() {
+            Ok(error) => error.into(),
+            Err(error) => unreachable!(
+                "io::Error({error:?}) cannot be converted to connection::StreamError, this is a bug"
+            ),
         }
     }
 }

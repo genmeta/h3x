@@ -156,6 +156,7 @@ impl<E: StdError + 'static> HasErrorCode for CodeWith<E> {
     }
 }
 
+// TODO: add reset code info(if any)
 #[derive(Debug, Snafu)]
 pub enum H3CriticalStreamClosed {
     #[snafu(display("QPack encoder stream closed unexpectedly"))]

@@ -3,7 +3,7 @@ mod error;
 mod reader;
 mod writer;
 
-pub use error::{DecodeError, DecodeStreamError};
+pub use error::{DecodeError, DecodeStreamError, EncodeError, EncodeStreamError};
 use futures::{Sink, stream::Stream};
 pub use reader::{FixedLengthReader, StreamReader};
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt};

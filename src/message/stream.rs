@@ -13,13 +13,14 @@ use snafu::{ResultExt, Snafu};
 use super::Body;
 use crate::{
     buflist::{BufList, Cursor},
-    codec::{EncodeExt, SinkWriter, StreamReader},
+    codec::{EncodeError, EncodeExt, SinkWriter, StreamReader},
     connection::{self, ConnectionGoaway, ConnectionState, QPackDecoder, QPackEncoder},
     error::Code,
     frame::{Frame, stream::FrameStream},
-    message::{IllegalEntityOperator, Message, MessageStage, SendMalformedPseudoHeaderSnafu},
+    message::{MalformedPseudoHeaderSnafu, Message, MessageError, MessageStage},
     qpack::{
         algorithm::{HuffmanAlways, StaticCompressAlgo},
+        encoder::EncodeHeaderSectionError,
         field_section::{FieldSection, MalformedHeaderSection, malformed_header_section},
     },
     quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
@@ -96,7 +97,7 @@ pub enum StreamError {
     #[snafu(transparent)]
     Goaway { source: ConnectionGoaway },
     #[snafu(transparent)]
-    IllegalEntityOperator { source: IllegalEntityOperator },
+    MessageOperation { source: MessageError },
 }
 
 impl From<quic::ConnectionError> for StreamError {
@@ -112,7 +113,7 @@ impl From<StreamError> for io::Error {
         let kind = match error {
             StreamError::Quic { .. } => io::ErrorKind::BrokenPipe,
             StreamError::Goaway { .. } => io::ErrorKind::Other,
-            StreamError::IllegalEntityOperator { .. } => io::ErrorKind::InvalidInput,
+            StreamError::MessageOperation { .. } => io::ErrorKind::InvalidInput,
         };
         io::Error::new(kind, error)
     }
@@ -562,24 +563,35 @@ impl WriteStream {
         message
             .header
             .check_pseudo()
-            .context(SendMalformedPseudoHeaderSnafu)?;
+            .context(MalformedPseudoHeaderSnafu)?;
 
         let field_lines = message.header.iter();
         let algo = &DEFAULT_COMPRESS_ALGO;
-        self.try_io(async move |this| {
-            let stream = &mut this.stream;
-            let frame = this.qpack_encoder.encode(field_lines, algo, stream).await?;
-            this.send_frame(frame).await?;
-            Ok(())
-        })
-        .await?;
+        let result = self
+            .try_io(async move |this| {
+                let stream = &mut this.stream;
+                match this.qpack_encoder.encode(field_lines, algo, stream).await {
+                    Ok(frame) => Ok(Ok(this.send_frame(frame).await?)),
+                    Err(EncodeHeaderSectionError::Encode { source }) => Ok(Err(source)),
+                    Err(EncodeHeaderSectionError::Stream { source }) => Err(source),
+                }
+            })
+            .await?;
 
-        if message.is_interim_response() {
-            message.stage = MessageStage::Header
-        } else {
-            message.stage = MessageStage::Body
+        match result {
+            Ok(()) if message.is_interim_response() => {
+                message.stage = MessageStage::Header;
+                Ok(())
+            }
+            Ok(()) => {
+                message.stage = MessageStage::Body;
+                Ok(())
+            }
+            Err(EncodeError::FramePayloadTooLarge) => Err(MessageError::HeaderTooLarge.into()),
+            Err(EncodeError::HuffmanEncoding) => {
+                unreachable!("FieldSection contain invalid header name/value, this is a bug")
+            }
         }
-        Ok(())
     }
 
     pub async fn send_streaming_body(
@@ -588,7 +600,7 @@ impl WriteStream {
         mut content: impl Buf,
     ) -> Result<(), StreamError> {
         if message.is_interim_response() {
-            return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse.into());
+            return Err(MessageError::BodyOrTrailerOnInterimResponse.into());
         }
         message.enable_streaming()?;
 
@@ -599,7 +611,7 @@ impl WriteStream {
             }
             MessageStage::Body => {}
             MessageStage::Trailer | MessageStage::Complete => {
-                return Err(IllegalEntityOperator::ModifyBodyAfterSent.into());
+                return Err(MessageError::BodyAlreadySending.into());
             }
             MessageStage::Dropped => message_used_after_dropped(),
         }
@@ -607,7 +619,7 @@ impl WriteStream {
         while content.has_remaining() {
             let bytes = content.copy_to_bytes(content.chunk().len());
             let frame = Frame::new(Frame::DATA_FRAME_TYPE, bytes)
-                .map_err(|_| IllegalEntityOperator::DataFramePayloadTooLarge)?;
+                .map_err(|_| MessageError::DataFrameTooLarge)?;
             self.try_io(async |this| Ok(this.send_frame(frame).await?))
                 .await?;
         }
@@ -617,7 +629,7 @@ impl WriteStream {
 
     pub async fn send_chunked_body(&mut self, message: &mut Message) -> Result<(), StreamError> {
         if message.is_interim_response() {
-            return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse.into());
+            return Err(MessageError::BodyOrTrailerOnInterimResponse.into());
         }
 
         match message.stage {
@@ -627,19 +639,19 @@ impl WriteStream {
             }
             MessageStage::Body => {}
             MessageStage::Trailer | MessageStage::Complete => {
-                return Err(IllegalEntityOperator::ModifyBodyAfterSent.into());
+                return Err(MessageError::BodyAlreadySending.into());
             }
             MessageStage::Dropped => message_used_after_dropped(),
         }
 
         let Body::Chunked { buflist } = &mut message.body else {
-            return Err(IllegalEntityOperator::ModifyBodyAfterSent.into());
+            return Err(MessageError::BodyAlreadySending.into());
         };
 
         while buflist.has_remaining() {
             let bytes = buflist.copy_to_bytes(buflist.chunk().len());
             let frame = Frame::new(Frame::DATA_FRAME_TYPE, bytes)
-                .map_err(|_| IllegalEntityOperator::DataFramePayloadTooLarge)?;
+                .map_err(|_| MessageError::DataFrameTooLarge)?;
             self.try_io(async |this| Ok(this.send_frame(frame).await?))
                 .await?;
         }
@@ -650,7 +662,7 @@ impl WriteStream {
 
     pub async fn send_trailer(&mut self, message: &mut Message) -> Result<(), StreamError> {
         if message.is_interim_response() {
-            return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse.into());
+            return Err(MessageError::BodyOrTrailerOnInterimResponse.into());
         }
         // prepare
         match message.stage {
@@ -672,21 +684,38 @@ impl WriteStream {
         // TODO: check FieldLines size
         let field_lines = message.trailer.iter();
         let algo = &DEFAULT_COMPRESS_ALGO;
-        self.try_io(async move |this| {
-            let stream = &mut this.stream;
-            let frame = this.qpack_encoder.encode(field_lines, algo, stream).await?;
-            this.send_frame(frame).await?;
-            Ok(())
-        })
-        .await?;
-        message.stage = MessageStage::Complete;
 
-        Ok(())
+        let result = self
+            .try_io(async move |this| {
+                let stream = &mut this.stream;
+                match this.qpack_encoder.encode(field_lines, algo, stream).await {
+                    Ok(frame) => Ok(Ok(this.send_frame(frame).await?)),
+                    Err(EncodeHeaderSectionError::Encode { source }) => Ok(Err(source)),
+                    Err(EncodeHeaderSectionError::Stream { source }) => Err(source),
+                }
+            })
+            .await?;
+
+        match result {
+            Ok(()) => {
+                message.stage = MessageStage::Complete;
+                Ok(())
+            }
+            Err(error) => match error {
+                EncodeError::FramePayloadTooLarge => Err(MessageError::TrailerTooLarge.into()),
+                EncodeError::HuffmanEncoding => {
+                    unreachable!("FieldSection contain invalid header name/value, this is a bug")
+                }
+            },
+        }
     }
 
     async fn send_pending_sections(&mut self, message: &mut Message) -> Result<(), StreamError> {
         match message.stage {
             MessageStage::Header | MessageStage::Body => {
+                if message.is_interim_response() {
+                    return Err(MessageError::FinalResponseRequired.into());
+                }
                 if message.is_chunked() {
                     self.send_chunked_body(message).await?;
                     debug_assert_eq!(message.stage, MessageStage::Trailer);

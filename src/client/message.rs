@@ -14,7 +14,7 @@ use crate::{
     client::Client,
     connection::InitialRequestStreamError,
     message::{
-        IllegalEntityOperator, Message, MessageStage,
+        Message, MessageError, MessageStage,
         stream::{ReadStream, StreamError, WriteStream},
     },
     pool::ConnectError,
@@ -200,7 +200,7 @@ where
                     tracing::debug!("Request header sent");
                     return Ok((request, response));
                 }
-                Err(StreamError::IllegalEntityOperator { .. }) => {
+                Err(StreamError::MessageOperation { .. }) => {
                     unreachable!("Header should be checked before sending")
                 }
                 Err(StreamError::Quic { source }) => {
@@ -284,7 +284,7 @@ impl Request {
 
     pub fn trailers_mut(&mut self) -> Result<&mut HeaderMap, StreamError> {
         if self.entity.stage() > MessageStage::Trailer {
-            return Err(IllegalEntityOperator::ModifyTrailerAfterSent.into());
+            return Err(MessageError::TrailerAlreadySent.into());
         }
         Ok(self.entity.trailers_mut()?)
     }
@@ -323,9 +323,7 @@ impl Request {
         let mut stream = self.stream.take();
         let mut entity = self.entity.take();
         Some(async move {
-            if let Err(StreamError::IllegalEntityOperator { source }) =
-                stream.close(&mut entity).await
-            {
+            if let Err(StreamError::MessageOperation { source }) = stream.close(&mut entity).await {
                 tracing::warn!(
                     target: "h3x::client", error = %Report::from_error(source),
                     "Request stream cannot be closed properly"

@@ -15,12 +15,18 @@ use tokio::{
 
 use crate::{
     buflist::BufList,
-    codec::{Decode, DecodeStreamError, Encode, Feed},
+    codec::{Decode, DecodeStreamError, Encode, EncodeError, EncodeStreamError, Feed},
     connection::{StreamError, settings::Settings},
     error::{Code, H3CriticalStreamClosed, HasErrorCode},
     frame::Frame,
     qpack::{
-        algorithm::Algorithm, decoder::DecoderInstruction, dynamic::DynamicTable, field_section::{FieldLine, FieldLineRepresentation}, integer::{decode_integer, encode_integer}, r#static, string::{decode_string, encode_string}
+        algorithm::Algorithm,
+        decoder::DecoderInstruction,
+        dynamic::DynamicTable,
+        field_section::{FieldLine, FieldLineRepresentation},
+        integer::{decode_integer, encode_integer},
+        r#static,
+        string::{decode_string, encode_string},
     },
     quic::{self, GetStreamId, GetStreamIdExt},
 };
@@ -58,10 +64,10 @@ impl EncoderState {
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum QPackDecoderStreamError {
-    #[snafu(display("Acknowledging non-existent or non-blocking stream"))]
+    #[snafu(display("acknowledging non-existent or non-blocking stream"))]
     AcknowledgeNonExistSection { stream_id: u64 },
     #[snafu(display(
-        "Known received count increment overflow(known_received_count + increment > inserted_count )"
+        "known received count increment overflow (known_received_count + increment > inserted_count)"
     ))]
     IncrementKnownReceivedCountOverflow,
 }
@@ -315,6 +321,22 @@ pub(crate) fn get_dynamic_references<'r>(
         )
 }
 
+#[derive(Debug, Snafu)]
+pub enum EncodeHeaderSectionError {
+    #[snafu(transparent)]
+    Stream { source: StreamError },
+    #[snafu(transparent)]
+    Encode { source: EncodeError },
+}
+
+impl From<quic::StreamError> for EncodeHeaderSectionError {
+    fn from(error: quic::StreamError) -> Self {
+        EncodeHeaderSectionError::Stream {
+            source: error.into(),
+        }
+    }
+}
+
 impl<Es, Ds> Encoder<Es, Ds>
 where
     Es: Sink<EncoderInstruction, Error = StreamError> + Unpin,
@@ -337,7 +359,7 @@ where
         field_section: impl IntoIterator<Item = FieldLine> + Send,
         algorithm: &(impl Algorithm + ?Sized),
         stream: impl GetStreamId,
-    ) -> Result<Frame<BufList>, StreamError> {
+    ) -> Result<Frame<BufList>, EncodeHeaderSectionError> {
         tokio::pin!(stream);
         let stream_id = stream.stream_id().await?.into_inner();
 
@@ -359,9 +381,9 @@ where
                 .push_back(max_referenced_index);
         };
 
-        let Ok(header_frame) = BufList::new()
+        let header_frame = BufList::new()
             .encode((field_section_prefix, field_line_representations))
-            .await;
+            .await?;
 
         Ok(header_frame)
     }
@@ -510,7 +532,10 @@ impl<S: AsyncBufRead> Decode<EncoderInstruction> for S {
             }
         };
         decode.await.map_err(|error: DecodeStreamError| {
-            error.map_stream_closed(|| H3CriticalStreamClosed::QPackEncoder.into())
+            error.map_stream_closed(
+                |_reset_code| H3CriticalStreamClosed::QPackEncoder.into(),
+                |decode_error| Code::H3_FRAME_ERROR.with(decode_error).into(),
+            )
         })
     }
 }
@@ -564,11 +589,14 @@ where
                 }
             }
         };
-        encode
-            .await
-            .map_err(|error: quic::StreamError| match error {
-                quic::StreamError::Connection { .. } => error.into(),
-                quic::StreamError::Reset { .. } => H3CriticalStreamClosed::QPackEncoder.into(),
-            })
+        encode.await.map_err(|error: EncodeStreamError| {
+            error.map_stream_closed(
+                |_reset_code| H3CriticalStreamClosed::QPackEncoder.into(),
+                |encode_error| {
+                    tracing::error!("Failed to encode QPACK encoder instruction: {encode_error}, this is likely a bug");
+                    Code::H3_INTERNAL_ERROR.into()
+                },
+            )
+        })
     }
 }

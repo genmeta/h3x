@@ -11,7 +11,7 @@ use tracing::Instrument;
 use crate::{
     agent::{LocalAgent, RemoteAgent},
     message::{
-        IllegalEntityOperator, Message, MessageStage,
+        Message, MessageError, MessageStage,
         stream::{ReadStream, StreamError, WriteStream},
     },
     varint::VarInt,
@@ -150,7 +150,7 @@ impl Response {
 
     pub fn headers_mut(&mut self) -> Result<&mut http::HeaderMap, StreamError> {
         if self.entity.stage() > MessageStage::Header {
-            return Err(IllegalEntityOperator::ModifyHeaderAfterSent.into());
+            return Err(MessageError::HeaderAlreadySent.into());
         }
         Ok(&mut self.entity.header_mut().header_map)
     }
@@ -176,10 +176,10 @@ impl Response {
 
     pub fn set_body(&mut self, content: impl Buf) -> Result<&mut Self, StreamError> {
         if self.entity.stage() > MessageStage::Body {
-            return Err(IllegalEntityOperator::ModifyBodyAfterSent.into());
+            return Err(MessageError::BodyAlreadySending.into());
         }
         if self.entity.stage() == MessageStage::Body {
-            return Err(IllegalEntityOperator::ReplaceBodyWhileSending.into());
+            return Err(MessageError::BodyReplacementDuringSend.into());
         }
         self.entity.set_body(content)?;
         Ok(self)
@@ -198,7 +198,7 @@ impl Response {
 
     pub fn trailers_mut(&mut self) -> Result<&mut HeaderMap, StreamError> {
         if self.entity.stage() > MessageStage::Trailer {
-            return Err(IllegalEntityOperator::ModifyTrailerAfterSent.into());
+            return Err(MessageError::TrailerAlreadySent.into());
         }
         Ok(self.entity.trailers_mut()?)
     }
@@ -238,9 +238,7 @@ impl Response {
         let mut stream = self.stream.take();
         let mut entity = self.entity.take();
         Some(async move {
-            if let Err(StreamError::IllegalEntityOperator { source }) =
-                stream.close(&mut entity).await
-            {
+            if let Err(StreamError::MessageOperation { source }) = stream.close(&mut entity).await {
                 tracing::warn!(
                     target: "h3x::server", error = %Report::from_error(source),
                     "Response stream cannot be closed properly",

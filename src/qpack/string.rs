@@ -4,9 +4,8 @@ use httlib_huffman::DecoderSpeed;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 use crate::{
-    codec::{DecodeError, DecodeStreamError, FixedLengthReader},
+    codec::{DecodeError, DecodeStreamError, EncodeError, EncodeStreamError, FixedLengthReader},
     qpack::integer::{decode_integer, encode_integer},
-    quic::StreamError,
 };
 
 pub async fn decode_string(
@@ -38,9 +37,9 @@ pub async fn encode_string<E>(
     n: u8,
     huffman: bool,
     data: Bytes,
-) -> Result<(), StreamError>
+) -> Result<(), EncodeStreamError>
 where
-    StreamError: From<E>,
+    EncodeStreamError: From<E>,
 {
     tokio::pin!(stream);
     // set H bit
@@ -49,8 +48,7 @@ where
     match huffman {
         true => {
             let mut encoded_data = vec![];
-            httlib_huffman::encode(&data, &mut encoded_data)
-                .expect("Invalid header value sequence");
+            httlib_huffman::encode(&data, &mut encoded_data).map_err(EncodeError::from)?;
             encode_integer(stream.as_mut(), prefix, n - 1, encoded_data.len() as u64).await?;
             stream.send(Bytes::from_owner(encoded_data)).await?;
             Ok(())

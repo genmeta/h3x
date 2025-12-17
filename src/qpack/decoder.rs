@@ -522,7 +522,10 @@ impl<S: AsyncBufRead> Decode<DecoderInstruction> for S {
             }
         };
         decode.await.map_err(|error: DecodeStreamError| {
-            error.map_stream_closed(|| H3CriticalStreamClosed::QPackDecoder.into())
+            error.map_stream_closed(
+                |_reset_code| H3CriticalStreamClosed::QPackDecoder.into(),
+                |decode_error| Code::H3_FRAME_ERROR.with(decode_error).into(),
+            )
         })
     }
 }

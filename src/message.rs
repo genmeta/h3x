@@ -35,31 +35,46 @@ pub enum MessageStage {
 }
 
 #[derive(Debug, Snafu)]
-pub enum IllegalEntityOperator {
-    #[snafu(display("Header section cannot be modified after sent"))]
-    ModifyHeaderAfterSent,
-    #[snafu(display("Malformed pseudo header section cannot be sent"))]
-    SendMalformedPseudoHeader { source: MalformedHeaderSection },
-    #[snafu(display("Body cannot be modified: Body is sending"))]
-    ModifyBodyAfterSent,
-    #[snafu(display("Chunked cannot be modified while sending"))]
-    ReplaceBodyWhileSending,
-    #[snafu(display("Chunked body operation cannot be performed on streaming entity body"))]
-    ChunkedOperatorOnStreamingBody,
-    #[snafu(display("Streaming body operation cannot be performed on chunked entity body"))]
-    StreamingOperatorOnChunkedBody,
-    #[snafu(display("Body mode cannot be changed which sending"))]
-    ChangeBodyModeInTransport,
-    #[snafu(display("Header frame payload too large, maybe too may header fields"))]
-    HeaderFramePayloadTooLarge,
-    #[snafu(display("Data frame payload too large, try smaller chunk size"))]
-    DataFramePayloadTooLarge,
-    #[snafu(display("Trailer section cannot be modified after sent"))]
-    ModifyTrailerAfterSent,
-    #[snafu(display("Body or trailer sections cannot be set for interim response"))]
-    SendBodyOrTrailerForInterimResponse,
-    #[snafu(display("Response stream cannot be closed without final response"))]
-    MissingFinalResponse,
+pub enum MessageError {
+    // === 状态相关错误 ===
+    #[snafu(display("cannot modify header section after it has been sent"))]
+    HeaderAlreadySent,
+    #[snafu(display("cannot modify body while it is being sent"))]
+    BodyAlreadySending,
+    #[snafu(display("cannot replace body content while sending"))]
+    BodyReplacementDuringSend,
+    #[snafu(display("cannot modify trailer section after it has been sent"))]
+    TrailerAlreadySent,
+    #[snafu(display("cannot change body mode after transfer has started"))]
+    BodyModeChangeAfterTransferStarted,
+
+    // === 模式不匹配错误 ===
+    #[snafu(display("chunked body operation cannot be performed on streaming body"))]
+    ChunkedOperationOnStreamingBody,
+    #[snafu(display("streaming body operation cannot be performed on chunked body"))]
+    StreamingOperationOnChunkedBody,
+
+    // === 大小限制错误 ===
+    // #[snafu(display("header frame payload too large, maybe too many header fields"))]
+    // HeaderFrameTooLarge,
+    #[snafu(display(
+        "trailer section too large to fit into a single frame, maybe too many header fields"
+    ))]
+    HeaderTooLarge,
+    #[snafu(display(
+        "trailer section too large to fit into a single frame, maybe too many header fields"
+    ))]
+    TrailerTooLarge,
+    #[snafu(display("data frame payload too large, try smaller chunk size"))]
+    DataFrameTooLarge,
+
+    // === 协议语义错误 ===
+    #[snafu(display("cannot send malformed pseudo header section"))]
+    MalformedPseudoHeader { source: MalformedHeaderSection },
+    #[snafu(display("cannot set body or trailer for interim (1xx) response"))]
+    BodyOrTrailerOnInterimResponse,
+    #[snafu(display("cannot close response stream without sending a final response"))]
+    FinalResponseRequired,
 }
 
 #[derive(Debug, Clone)]
@@ -113,12 +128,12 @@ impl Message {
         self.header.is_response_header()
     }
 
-    pub fn enable_streaming(&mut self) -> Result<(), IllegalEntityOperator> {
+    pub fn enable_streaming(&mut self) -> Result<(), MessageError> {
         if let Body::Chunked { buflist } = &self.body {
             match self.stage {
                 MessageStage::Header => {}
                 MessageStage::Body if !buflist.inner().has_remaining() => {}
-                _ => return Err(IllegalEntityOperator::ChangeBodyModeInTransport),
+                _ => return Err(MessageError::BodyModeChangeAfterTransferStarted),
             }
 
             self.body = Body::Streaming { received: 0 }
@@ -126,12 +141,12 @@ impl Message {
         Ok(())
     }
 
-    pub fn chunked_body(&mut self) -> Result<&mut Cursor<BufList>, IllegalEntityOperator> {
+    pub fn chunked_body(&mut self) -> Result<&mut Cursor<BufList>, MessageError> {
         if let Body::Streaming { received } = &self.body {
             match self.stage {
                 MessageStage::Header => { /* Ok to change mode: body unused */ }
                 MessageStage::Body if *received == 0 => { /* Ok to change mode: body unused */ }
-                _ => return Err(IllegalEntityOperator::ChangeBodyModeInTransport),
+                _ => return Err(MessageError::BodyModeChangeAfterTransferStarted),
             }
         }
         match &mut self.body {
@@ -163,9 +178,9 @@ impl Message {
     }
 
     /// Set body to buffer mode with given content
-    pub fn set_body(&mut self, mut content: impl Buf) -> Result<(), IllegalEntityOperator> {
+    pub fn set_body(&mut self, mut content: impl Buf) -> Result<(), MessageError> {
         if self.is_interim_response() {
-            return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse);
+            return Err(MessageError::BodyOrTrailerOnInterimResponse);
         }
 
         let mut buflist = BufList::new();
@@ -183,9 +198,9 @@ impl Message {
         &self.trailer.header_map
     }
 
-    pub fn trailers_mut(&mut self) -> Result<&mut HeaderMap, IllegalEntityOperator> {
+    pub fn trailers_mut(&mut self) -> Result<&mut HeaderMap, MessageError> {
         if self.is_interim_response() {
-            return Err(IllegalEntityOperator::SendBodyOrTrailerForInterimResponse);
+            return Err(MessageError::BodyOrTrailerOnInterimResponse);
         }
         Ok(&mut self.trailer.header_map)
     }

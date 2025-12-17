@@ -13,7 +13,7 @@ use crate::{
     buflist::BufList,
     codec::{Decode, DecodeExt, DecodeStreamError, Encode, EncodeExt},
     connection::StreamError,
-    error::H3CriticalStreamClosed,
+    error::{Code, H3CriticalStreamClosed},
     frame::Frame,
     quic,
     varint::VarInt,
@@ -108,7 +108,10 @@ impl<S: AsyncRead> Decode<Setting> for S {
             Ok(Setting { id, value })
         };
         decode.await.map_err(|error: DecodeStreamError| {
-            error.map_stream_closed(|| H3CriticalStreamClosed::Control.into())
+            error.map_stream_closed(
+                |_reset_code| H3CriticalStreamClosed::Control.into(),
+                |decode_error| Code::H3_FRAME_ERROR.with(decode_error).into(),
+            )
         })
     }
 }
