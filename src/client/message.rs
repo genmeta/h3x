@@ -71,11 +71,6 @@ impl<C: quic::Connect> Client<C> {
 }
 
 impl<C: quic::Connect> PendingRequest<'_, C> {
-    pub fn set_method(mut self, method: Method) -> Self {
-        self.request.header_mut().set_method(method);
-        self
-    }
-
     pub fn set_scheme(mut self, scheme: Scheme) -> Self {
         self.request.header_mut().set_scheme(scheme);
         self

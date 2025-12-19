@@ -24,7 +24,7 @@ pub use crate::message::stream::StreamError;
 #[derive(Debug, Clone)]
 pub struct Servers<L: quic::Listen> {
     pool: Pool<L::Connection>,
-    acceptor: L,
+    listener: L,
     settings: Arc<Settings>,
     router: Arc<HashMap<String, BoxService>>,
 }
@@ -34,12 +34,12 @@ impl<L: quic::Listen> Servers<L> {
     #[builder]
     pub fn new(
         #[builder(default = Pool::global().clone())] pool: Pool<L::Connection>,
-        acceptor: L,
+        listener: L,
         #[builder(default)] settings: Arc<Settings>,
     ) -> Self {
         Self {
             pool,
-            acceptor,
+            listener,
             settings,
             router: Arc::new(HashMap::new()),
         }
@@ -62,7 +62,7 @@ impl<L: quic::Listen> Servers<L> {
         let router = self.router.clone();
 
         loop {
-            let connection = match self.acceptor.accept().await {
+            let connection = match self.listener.accept().await {
                 Ok(connection) => connection,
                 Err(error) => break error,
             };
@@ -185,7 +185,7 @@ impl<L: quic::Listen> Servers<L> {
     }
 
     pub fn shutdown(&self) {
-        self.acceptor.shutdown();
+        self.listener.shutdown();
     }
 }
 
@@ -206,7 +206,7 @@ mod gm_quic {
             router: impl IntoBoxService,
         ) -> Result<Self, ServerError> {
             let server_name = server_name.into();
-            self.acceptor
+            self.listener
                 .add_server(&server_name, cert_chain, private_key, bind_uris, ocsp)?;
             Ok(self.serve(server_name, router))
         }

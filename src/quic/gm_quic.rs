@@ -387,7 +387,7 @@ mod tests {
         init_tracing();
 
         let (quic_listeners, listen_addr) = quic_listeners();
-        let servers = Servers::builder().acceptor(quic_listeners.clone()).build();
+        let servers = Servers::builder().listener(quic_listeners.clone()).build();
         let client = Client::builder().connector(quic_client()).build();
 
         let server = async move {
@@ -496,3 +496,5 @@ mod tests {
         Ok(())
     }
 }
+
+

@@ -107,9 +107,14 @@ impl AsyncWrite for BufList {
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
         // optimize: try to write into the last bufs
-        if let Some(bytes) = self
-            .bufs
-            .pop_back_if(|bytes| bytes.len() + buf.len() <= 8 * 1024)
+
+        // TODO: use pop_back_if when stabilized in the next rust version
+        // if let Some(bytes) = self
+        //     .bufs
+        //     .pop_back_if(|bytes| bytes.len() + buf.len() <= 8 * 1024)
+        if let Some(bytes) = self.bufs.back()
+            && bytes.len() + buf.len() <= 8 * 1024
+            && let Some(bytes) = self.bufs.pop_back()
         {
             match bytes.try_into_mut() {
                 Ok(mut bytes_mut) => {
