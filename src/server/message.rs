@@ -12,7 +12,7 @@ use crate::{
     agent::{LocalAgent, RemoteAgent},
     message::{
         Message, MessageError, MessageStage,
-        stream::{ReadStream, StreamError, WriteStream},
+        stream::{ReadStream, ReadToStringError, StreamError, WriteStream},
     },
     varint::VarInt,
 };
@@ -41,11 +41,11 @@ impl UnresolvedRequest {
 
     pub async fn resolve(self) -> Result<(Request, Response), StreamError> {
         let mut request = Request {
-            entity: Message::unresolved_request(),
+            message: Message::unresolved_request(),
             stream: self.request_stream,
             agent: self.remote_agent,
         };
-        request.stream.read_header(&mut request.entity).await?;
+        request.stream.read_header(&mut request.message).await?;
         let response = Response {
             entity: Message::unresolved_response(),
             stream: self.response_stream,
@@ -66,70 +66,58 @@ impl IntoFuture for UnresolvedRequest {
 }
 
 pub struct Request {
-    entity: Message,
+    message: Message,
     stream: ReadStream,
     agent: Option<RemoteAgent>,
 }
 
 impl Request {
     pub fn method(&self) -> Method {
-        self.entity.header().method()
-    }
-
-    pub fn set_method(&mut self, new: Method) {
-        self.entity.header_mut().set_method(new);
+        self.message.header().method()
     }
 
     pub fn scheme(&self) -> Option<Scheme> {
-        self.entity.header().scheme()
-    }
-
-    pub fn set_scheme(&mut self, new: Scheme) {
-        self.entity.header_mut().set_scheme(new);
+        self.message.header().scheme()
     }
 
     pub fn authority(&self) -> Option<Authority> {
-        self.entity.header().authority()
-    }
-
-    pub fn set_authority(&mut self, new: Authority) {
-        self.entity.header_mut().set_authority(new);
+        self.message.header().authority()
     }
 
     pub fn path(&self) -> Option<PathAndQuery> {
-        self.entity.header().path()
-    }
-
-    pub fn set_path(&mut self, new: PathAndQuery) {
-        self.entity.header_mut().set_path(new);
+        self.message.header().path()
     }
 
     pub fn uri(&self) -> Uri {
-        self.entity.header().uri()
+        self.message.header().uri()
     }
 
     pub fn headers(&self) -> &http::HeaderMap {
-        &self.entity.header().header_map
-    }
-
-    pub fn headers_mut(&mut self) -> Result<&mut http::HeaderMap, StreamError> {
-        Ok(&mut self.entity.header_mut().header_map)
+        &self.message.header().header_map
     }
 
     pub fn header(&self, name: impl AsHeaderName) -> Option<&HeaderValue> {
         self.headers().get(name)
     }
 
-    pub async fn read_all(&mut self) -> Result<impl Buf, StreamError> {
-        self.stream.read_all(&mut self.entity).await
+    pub async fn read(&mut self) -> Option<Result<Bytes, StreamError>> {
+        self.stream.read(&mut self.message).await
     }
 
-    pub async fn read(&mut self) -> Option<Result<Bytes, StreamError>> {
-        self.stream.read(&mut self.entity).await
+    pub async fn read_all(&mut self) -> Result<impl Buf, StreamError> {
+        self.stream.read_all(&mut self.message).await
+    }
+
+    pub async fn read_to_bytes(&mut self) -> Result<Bytes, StreamError> {
+        self.stream.read_to_bytes(&mut self.message).await
+    }
+
+    pub async fn read_to_string(&mut self) -> Result<String, ReadToStringError> {
+        self.stream.read_to_string(&mut self.message).await
     }
 
     pub async fn trailers(&mut self) -> Result<&HeaderMap, StreamError> {
-        self.stream.read_trailer(&mut self.entity).await
+        self.stream.read_trailer(&mut self.message).await
     }
 
     pub fn agent(&self) -> Option<&RemoteAgent> {
@@ -162,6 +150,10 @@ impl Response {
     ) -> Result<&mut Self, StreamError> {
         self.headers_mut()?.insert(name, value);
         Ok(self)
+    }
+
+    pub fn status(&self) -> Option<http::StatusCode> {
+        Some(self.entity.header().status())
     }
 
     pub fn set_status(&mut self, status: http::StatusCode) -> Result<&mut Self, StreamError> {

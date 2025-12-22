@@ -12,7 +12,7 @@ mod message;
 
 pub use message::{PendingRequest, Request, RequestError, Response};
 
-pub use crate::message::stream::StreamError;
+pub use crate::message::stream::{ReadToStringError, StreamError};
 
 #[derive(Debug, Clone)]
 pub struct Client<C: quic::Connect> {

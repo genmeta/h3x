@@ -429,8 +429,7 @@ mod tests {
             let port = listen_addr.port();
             let (mut req, mut resp) = client
                 .new_request()
-                .set_uri(format!("https://localhost:{port}/echo").parse()?)
-                .post()
+                .post(format!("https://localhost:{port}/echo").parse()?)
                 .await?;
             tracing::info!("Request header sent");
 
@@ -438,7 +437,7 @@ mod tests {
             req.write(content).await?.close().await?;
             tracing::info!("Request sent");
 
-            assert_eq!(resp.status().await?, StatusCode::OK);
+            assert_eq!(resp.status(), StatusCode::OK);
             let mut response = resp.read_all().await?;
             tracing::info!("Response received");
             let response = response.copy_to_bytes(response.remaining());
@@ -452,12 +451,11 @@ mod tests {
             let port = listen_addr.port();
             let (_req, mut resp) = client
                 .new_request()
-                .set_uri(format!("https://localhost:{port}/health").parse()?)
-                .get()
+                .get(format!("https://localhost:{port}/health").parse()?)
                 .await?;
             tracing::info!("Request header sent");
 
-            assert_eq!(resp.status().await?, StatusCode::OK);
+            assert_eq!(resp.status(), StatusCode::OK);
             let mut response = resp.read_all().await?;
             tracing::info!("Response received");
             let response = response.copy_to_bytes(response.remaining());
@@ -471,12 +469,11 @@ mod tests {
             let port = listen_addr.port();
             let (_req, mut resp) = client
                 .new_request()
-                .set_uri(format!("https://localhost:{port}/not_found").parse()?)
-                .get()
+                .get(format!("https://localhost:{port}/not_found").parse()?)
                 .await?;
             tracing::info!("Request header sent");
 
-            assert_eq!(resp.status().await?, StatusCode::NOT_FOUND);
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
             let mut response = resp.read_all().await?;
             tracing::info!("Response received");
             let response = response.copy_to_bytes(response.remaining());
@@ -496,5 +493,3 @@ mod tests {
         Ok(())
     }
 }
-
-

@@ -483,38 +483,38 @@ impl PseudoHeaders {
 #[derive(Debug, Snafu)]
 #[snafu(module, visibility(pub))]
 pub enum MalformedHeaderSection {
-    #[snafu(display("Invalid pseudo-header field with name {name:?}"))]
+    #[snafu(display("invalid pseudo-header field with name {name:?}"))]
     InvalidPseudoHeader { name: Bytes },
-    #[snafu(display("Duplicate pseudo-header field with name {name:?}"))]
+    #[snafu(display("duplicate pseudo-header field with name {name:?}"))]
     DuplicatePseudoHeader { name: Bytes },
     // TODO: merge this error into following two errors
-    #[snafu(display("Field section contains both request and response pseudo-header fields"))]
-    DualKindedPseudoHeader,
-    #[snafu(display("Request Pseudo-header field in response"))]
+    #[snafu(display("field section contains both request and response pseudo-header fields"))]
+    MixedRequestResponsePseudoHeader,
+    #[snafu(display("request pseudo-header field in response"))]
     RequestPseudoHeaderInResponse,
-    #[snafu(display("Response Pseudo-header field in request"))]
+    #[snafu(display("response pseudo-header field in request"))]
     ResponsePseudoHeaderInRequest,
-    #[snafu(display("Field section contains pseudo-header fields in tailers"))]
-    PseudoHeadersInTrailer,
-    #[snafu(display("Field section too large"))]
+    #[snafu(display("field section contains pseudo-header fields in trailers"))]
+    PseudoHeaderInTrailer,
+    #[snafu(display("field section too large"))]
     FieldSectionTooLarge,
     #[snafu(display(
-        "Empty :authority or Host header field for scheme with mandatory authority component"
+        "empty :authority or host header field for scheme with mandatory authority component"
     ))]
     EmptyAuthorityOrHost,
-    #[snafu(display("Invalid Host header field: invalid ascii"))]
+    #[snafu(display("invalid host header field: invalid ASCII"))]
     InvalidHostHeader,
-    #[snafu(display("Mismatch between :authority and Host header fields"))]
+    #[snafu(display("mismatch between :authority and host header fields"))]
     AuthorityHostMismatch,
-    #[snafu(display("Absence of mandatory pseudo-header fields"))]
+    #[snafu(display("absence of mandatory pseudo-header fields"))]
     AbsenceOfMandatoryPseudoHeaders { backtrace: snafu::Backtrace },
-    #[snafu(display("Unexpected :scheme pseudo-header for CONNECT request"))]
+    #[snafu(display("unexpected :scheme pseudo-header for CONNECT request"))]
     UnexpectedSchemeForConnectRequest,
-    #[snafu(display("Unexpected :path pseudo-header for CONNECT request"))]
+    #[snafu(display("unexpected :path pseudo-header for CONNECT request"))]
     UnexpectedPathForConnectRequest,
-    #[snafu(display("Missing :authority pseudo-header for CONNECT request"))]
+    #[snafu(display("missing :authority pseudo-header for CONNECT request"))]
     MissingAuthorityForConnectRequest,
-    #[snafu(display("Missing port for CONNECT :authority pseudo-header"))]
+    #[snafu(display("missing port for CONNECT :authority pseudo-header"))]
     MissingPortForConnectAuthority,
 
     #[snafu(transparent)]
@@ -824,7 +824,9 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                     let method = match &mut pseudo {
                         PseudoHeaders::Request { method, .. } => method,
                         PseudoHeaders::Response { .. } => {
-                            return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
+                            return Err(
+                                MalformedHeaderSection::MixedRequestResponsePseudoHeader.into()
+                            );
                         }
                     };
                     ensure!(
@@ -842,7 +844,9 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                     let scheme = match &mut pseudo {
                         PseudoHeaders::Request { scheme, .. } => scheme,
                         PseudoHeaders::Response { .. } => {
-                            return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
+                            return Err(
+                                MalformedHeaderSection::MixedRequestResponsePseudoHeader.into()
+                            );
                         }
                     };
                     ensure!(
@@ -860,7 +864,9 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                     let authority = match &mut pseudo {
                         PseudoHeaders::Request { authority, .. } => authority,
                         PseudoHeaders::Response { .. } => {
-                            return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
+                            return Err(
+                                MalformedHeaderSection::MixedRequestResponsePseudoHeader.into()
+                            );
                         }
                     };
                     ensure!(
@@ -881,7 +887,9 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                     let scheme = match &mut pseudo {
                         PseudoHeaders::Request { path, .. } => path,
                         PseudoHeaders::Response { .. } => {
-                            return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
+                            return Err(
+                                MalformedHeaderSection::MixedRequestResponsePseudoHeader.into()
+                            );
                         }
                     };
                     ensure!(
@@ -902,7 +910,9 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                     let status = match &mut pseudo {
                         PseudoHeaders::Response { status, .. } => status,
                         PseudoHeaders::Request { .. } => {
-                            return Err(MalformedHeaderSection::DualKindedPseudoHeader.into());
+                            return Err(
+                                MalformedHeaderSection::MixedRequestResponsePseudoHeader.into()
+                            );
                         }
                     };
                     ensure!(

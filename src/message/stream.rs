@@ -119,6 +119,14 @@ impl From<StreamError> for io::Error {
     }
 }
 
+#[derive(Debug, Snafu)]
+pub enum ReadToStringError {
+    #[snafu(transparent)]
+    Stream { source: StreamError },
+    #[snafu(transparent)]
+    Utf8 { source: std::string::FromUtf8Error },
+}
+
 pub struct ReadStream {
     stream: FrameStream<Pin<Box<dyn quic::ReadStream + Send>>>,
     qpack_decoder: Arc<QPackDecoder>,
@@ -380,6 +388,23 @@ impl ReadStream {
         }
     }
 
+    pub async fn read_to_bytes(&mut self, message: &mut Message) -> Result<Bytes, StreamError> {
+        let mut bytes = self.read_all(message).await?;
+        Ok(bytes.copy_to_bytes(bytes.remaining()))
+    }
+
+    pub async fn read_to_string(
+        &mut self,
+        message: &mut Message,
+    ) -> Result<String, ReadToStringError> {
+        // TODO: preallocate buffer with content-length
+        let mut vec = vec![];
+        while let Some(bytes) = self.read(message).await.transpose()? {
+            vec.extend_from_slice(&bytes);
+        }
+        Ok(String::from_utf8(vec)?)
+    }
+
     pub async fn read(&mut self, message: &mut Message) -> Option<Result<Bytes, StreamError>> {
         loop {
             match &mut message.body {
@@ -437,7 +462,7 @@ impl ReadStream {
 
                 let trailer = this.qpack_decoder.decode(frame).await?;
                 if !trailer.is_trailer() {
-                    return Err(MalformedHeaderSection::PseudoHeadersInTrailer.into());
+                    return Err(MalformedHeaderSection::PseudoHeaderInTrailer.into());
                 }
                 this.stream.consume_current_frame().await?;
                 Ok(trailer)

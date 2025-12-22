@@ -19,7 +19,7 @@ pub use message::{Request, Response, UnresolvedRequest};
 pub use route::{MethodRouter, Router};
 pub use service::{BoxService, BoxServiceFuture, IntoBoxService, Service, box_service};
 
-pub use crate::message::stream::StreamError;
+pub use crate::message::stream::{ReadToStringError, StreamError};
 
 #[derive(Debug, Clone)]
 pub struct Servers<L: quic::Listen> {
