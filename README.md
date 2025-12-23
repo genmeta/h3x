@@ -15,55 +15,54 @@ High-performance asynchronous DHTTP/3 implementation in Rust.
 h3x integrates `gm_quic` by default. Initiate QUIC connections via `QuicClient` and listen QUIC connections via `QuicListeners`.
 
 ```rust
-use bytes::Buf;
+use gm_quic::prelude::BindUri;
 
-async fn client_example(
-    quic_connector: gm_quic::prelude::QuicClient,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut h3_client = h3x::client::Client::builder()
-        .connector(quic_connector)
+async fn client_example() -> Result<(), Box<dyn std::error::Error>> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(CA_CERT.to_certificate());
+    let h3_client = Client::builder()
+        .with_root_certificates(roots)
+        .without_identity()?
         .build();
 
     // Initiate GET request
     // The request stream is automatically closed when dropped
-    let (.., mut response) = h3_client
+    let (_, mut response) = h3_client
         .new_request()
-        .set_uri("https://localhost:4433/hello_world".parse()?)
-        .get()
+        .get("localhost:4433/hello_world".parse()?)
         .await?;
 
     // Check response status code
-    assert_eq!(response.status().await?, http::StatusCode::OK);
+    assert_eq!(response.status(), http::StatusCode::OK);
 
-    // Read response body
-    let mut response_bytes = response.read_all().await?;
-    let response_bytes = response_bytes.copy_to_bytes(response_bytes.remaining());
-    println!("Response: {:?}", response_bytes);
+    let text = response.read_to_string().await?;
+    println!("Response: {:?}", text);
 
     Ok(())
 }
 
-async fn server_example(
-    quic_listener: gm_quic::prelude::QuicListeners,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let servers = h3x::server::Servers::builder()
-        .listener(quic_listener)
+async fn server_example() -> Result<(), Box<dyn std::error::Error>> {
+    let app = h3x::server::builder()
+        .without_client_cert_verifier()?
         .build();
 
-    // Define handler function
-    let hello_world_service =
-        async |request: &mut h3x::server::Request, response: &mut h3x::server::Response| {
-            response
-                .set_status(http::StatusCode::OK)
-                .unwrap()
-                .set_body(&b"Hello, World!"[..])
-                .unwrap();
-        };
+    let hello_world = async |request: &mut h3x::server::Request,
+                             response: &mut h3x::server::Response| {
+        response
+            .set_status(http::StatusCode::OK)
+            .set_body(b"Hello, World!"[..]);
+    };
 
-    // Register router
-    let localhost_router = h3x::server::Router::new().get("/hello_world", hello_world_service);
-    // Start server
-    servers.serve("localhost", localhost_router).run().await;
+    app.add_server(
+        "localhost",
+        include_bytes!("tests/keychain/localhost/server.cert"),
+        include_bytes!("tests/keychain/localhost/server.key"),
+        None,
+        [BindUri::from("inet://[::1]:4433")],
+        h3x::server::Router::new().get("/hello_world", hello_world),
+    )?
+    .run()
+    .await;
 
     Ok(())
 }

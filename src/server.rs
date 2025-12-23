@@ -4,6 +4,7 @@ use snafu::Report;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
+pub use crate::message::stream::{ReadToStringError, StreamError};
 use crate::{
     connection::{Connection, settings::Settings},
     error::Code,
@@ -12,14 +13,17 @@ use crate::{
 };
 
 mod message;
-mod route;
-mod service;
-
 pub use message::{Request, Response, UnresolvedRequest};
+mod route;
 pub use route::{MethodRouter, Router};
+mod service;
 pub use service::{BoxService, BoxServiceFuture, IntoBoxService, Service, box_service};
 
-pub use crate::message::stream::{ReadToStringError, StreamError};
+#[cfg(feature = "gm-quic")]
+mod gm_quic;
+
+#[cfg(feature = "gm-quic")]
+pub use gm_quic::{BuildListenersError, GmQuicServersBuilder, GmQuicServersTlsBuilder};
 
 #[derive(Debug, Clone)]
 pub struct Servers<L: quic::Listen> {
@@ -31,8 +35,11 @@ pub struct Servers<L: quic::Listen> {
 
 #[bon::bon]
 impl<L: quic::Listen> Servers<L> {
-    #[builder]
-    pub fn new(
+    #[builder(
+        builder_type(vis = "pub"),
+        start_fn(name = from_quic_listener, vis = "pub")
+    )]
+    fn new(
         #[builder(default = Pool::global().clone())] pool: Pool<L::Connection>,
         listener: L,
         #[builder(default)] settings: Arc<Settings>,
@@ -45,17 +52,23 @@ impl<L: quic::Listen> Servers<L> {
         }
     }
 
+    pub fn quic_listener(&self) -> &L {
+        &self.listener
+    }
+
+    pub fn quic_listener_mut(&mut self) -> &mut L {
+        &mut self.listener
+    }
+
     fn router_mut(&mut self) -> &mut HashMap<String, BoxService> {
         Arc::make_mut(&mut self.router)
     }
 
-    pub fn serve(mut self, domain: impl Into<String>, router: impl IntoBoxService) -> Self {
+    pub fn serve(&mut self, domain: impl Into<String>, router: impl IntoBoxService) -> &mut Self {
         self.router_mut()
             .insert(domain.into(), router.into_box_service());
         self
     }
-
-    // async fn handle_incoming_connection()
 
     pub async fn run(&self) -> L::Error {
         let mut tasks = JoinSet::default();
@@ -190,25 +203,6 @@ impl<L: quic::Listen> Servers<L> {
 }
 
 #[cfg(feature = "gm-quic")]
-mod gm_quic {
-    use ::gm_quic::prelude::{BindUri, QuicListeners, ServerError, handy};
-
-    use super::*;
-
-    impl Servers<QuicListeners> {
-        pub fn with_server(
-            self,
-            server_name: impl Into<String>,
-            cert_chain: impl handy::ToCertificate,
-            private_key: impl handy::ToPrivateKey,
-            bind_uris: impl IntoIterator<Item = impl Into<BindUri>>,
-            ocsp: impl Into<Option<Vec<u8>>>,
-            router: impl IntoBoxService,
-        ) -> Result<Self, ServerError> {
-            let server_name = server_name.into();
-            self.listener
-                .add_server(&server_name, cert_chain, private_key, bind_uris, ocsp)?;
-            Ok(self.serve(server_name, router))
-        }
-    }
+pub fn builder() -> gm_quic::GmQuicServersTlsBuilder {
+    Servers::builder()
 }

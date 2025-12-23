@@ -310,11 +310,11 @@ impl quic::Connect for Arc<gm_quic::prelude::QuicClient> {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, sync::Arc};
+    use std::net::SocketAddr;
 
     use bytes::Buf;
     use gm_quic::prelude::{
-        BindUri, QuicClient, QuicIO, QuicListeners,
+        BindUri, QuicIO,
         handy::{ToCertificate, ToPrivateKey},
     };
     use http::StatusCode;
@@ -335,33 +335,48 @@ mod tests {
             .try_init();
     }
 
-    fn quic_client() -> QuicClient {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add_parsable_certificates(CA_CERT.to_certificate());
-        QuicClient::builder()
-            .with_root_certificates(roots)
-            .without_cert()
-            .enable_sslkeylog()
-            .build()
-    }
+    type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-    fn quic_listeners() -> (Arc<QuicListeners>, SocketAddr) {
-        let quic_listeners = QuicListeners::builder()
-            .unwrap()
-            .without_client_cert_verifier()
-            .listen(128);
+    #[tokio::test]
+    async fn simpl_server() -> Result<(), BoxError> {
+        init_tracing();
 
-        quic_listeners
-            .add_server(
-                "localhost",
-                SERVER_CERT.to_certificate(),
-                SERVER_KEY.to_private_key(),
-                [BindUri::from("inet://[::1]:0").alloc_port()],
-                None,
-            )
-            .unwrap();
+        let mut servers = Servers::builder().without_client_cert_verifier()?.build();
 
-        let listen_addr = quic_listeners
+        let echo_service = async |req: &mut server::Request, resp: &mut server::Response| {
+            tracing::info!("Echo service called");
+            resp.set_status(StatusCode::OK).unwrap();
+            while let Some(body_part) = req.read().await.transpose().unwrap() {
+                tracing::info!("Echoing back request body part({} bytes)", body_part.len());
+                resp.write(body_part).await.unwrap();
+            }
+            resp.close().await.unwrap();
+            tracing::info!("Echo done");
+        };
+        let health_service = async |_req: &mut server::Request, resp: &mut server::Response| {
+            tracing::info!("Health service called");
+            resp.set_status(StatusCode::OK)
+                .unwrap()
+                .set_body(b"Hello, World!".as_slice())
+                .unwrap()
+                .close()
+                .await
+                .unwrap();
+            tracing::info!("Health done");
+        };
+        servers.add_server(
+            "localhost",
+            SERVER_CERT.to_certificate(),
+            SERVER_KEY.to_private_key(),
+            None,
+            [BindUri::from("inet://[::1]:0").alloc_port()],
+            Router::new()
+                .post("/echo", echo_service)
+                .get("/health", health_service),
+        )?;
+
+        let listen_addr: SocketAddr = servers
+            .quic_listener()
             .get_server("localhost")
             .unwrap()
             .bind_interfaces()
@@ -375,52 +390,18 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
+
         tracing::info!(target: "test", "Listening on {listen_addr}");
 
-        (quic_listeners, listen_addr)
-    }
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(CA_CERT.to_certificate());
+        let client = Client::builder()
+            .with_root_certificates(roots)
+            .without_identity()?
+            .build();
 
-    type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
-    #[tokio::test]
-    async fn simpl_server() -> Result<(), BoxError> {
-        init_tracing();
-
-        let (quic_listeners, listen_addr) = quic_listeners();
-        let servers = Servers::builder().listener(quic_listeners.clone()).build();
-        let client = Client::builder().connector(quic_client()).build();
-
-        let server = async move {
-            let echo_service = async |req: &mut server::Request, resp: &mut server::Response| {
-                tracing::info!("Echo service called");
-                resp.set_status(StatusCode::OK).unwrap();
-                while let Some(body_part) = req.read().await.transpose().unwrap() {
-                    tracing::info!("Echoing back request body part({} bytes)", body_part.len());
-                    resp.write(body_part).await.unwrap();
-                }
-                resp.close().await.unwrap();
-                tracing::info!("Echo done");
-            };
-            let health_service = async |_req: &mut server::Request, resp: &mut server::Response| {
-                tracing::info!("Health service called");
-                resp.set_status(StatusCode::OK)
-                    .unwrap()
-                    .set_body(b"Hello, World!".as_slice())
-                    .unwrap()
-                    .close()
-                    .await
-                    .unwrap();
-                tracing::info!("Health done");
-            };
-            servers
-                .serve(
-                    "localhost",
-                    Router::new()
-                        .post("/echo", echo_service)
-                        .get("/health", health_service),
-                )
-                .run()
-                .await;
+        let server = async {
+            servers.run().await;
             Ok::<_, BoxError>(())
         }
         .instrument(tracing::info_span!("server"));
@@ -485,7 +466,7 @@ mod tests {
 
         let client = async {
             tokio::try_join!(client_echo, client_health, client_fallback)?;
-            quic_listeners.shutdown();
+            servers.shutdown();
             Ok::<_, BoxError>(())
         };
 
