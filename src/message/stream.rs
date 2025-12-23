@@ -8,7 +8,7 @@ use std::{
 use bytes::{Buf, Bytes};
 use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt, future};
 use http::HeaderMap;
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 
 use super::Body;
 use crate::{
@@ -17,7 +17,7 @@ use crate::{
     connection::{self, ConnectionGoaway, ConnectionState, QPackDecoder, QPackEncoder},
     error::Code,
     frame::{Frame, stream::FrameStream},
-    message::{MalformedPseudoHeaderSnafu, Message, MessageError, MessageStage},
+    message::{Message, MessageStage},
     qpack::{
         algorithm::{HuffmanAlways, StaticCompressAlgo},
         encoder::EncodeHeaderSectionError,
@@ -96,8 +96,18 @@ pub enum StreamError {
     Quic { source: quic::StreamError },
     #[snafu(transparent)]
     Goaway { source: ConnectionGoaway },
-    #[snafu(transparent)]
-    MessageOperation { source: MessageError },
+    #[snafu(display(
+        "header section too large to fit into a single frame, maybe too many header fields"
+    ))]
+    HeaderTooLarge,
+    #[snafu(display(
+        "trailer section too large to fit into a single frame, maybe too many header fields"
+    ))]
+    TrailerTooLarge,
+    #[snafu(display("data frame payload too large, try smaller chunk size"))]
+    DataFrameTooLarge,
+    #[snafu(display("HTTP/3 Message form peer is malformed"))]
+    MalformedIncomingMessage,
 }
 
 impl From<quic::ConnectionError> for StreamError {
@@ -113,7 +123,8 @@ impl From<StreamError> for io::Error {
         let kind = match error {
             StreamError::Quic { .. } => io::ErrorKind::BrokenPipe,
             StreamError::Goaway { .. } => io::ErrorKind::Other,
-            StreamError::MessageOperation { .. } => io::ErrorKind::InvalidInput,
+            StreamError::MalformedIncomingMessage => io::ErrorKind::InvalidData,
+            _ => io::ErrorKind::InvalidInput,
         };
         io::Error::new(kind, error)
     }
@@ -174,12 +185,20 @@ impl ReadStream {
 
     pub async fn try_io<T>(
         &mut self,
-        f: impl AsyncFnOnce(&mut Self) -> Result<T, connection::StreamError>,
+        message: &mut Message,
+        f: impl AsyncFnOnce(&mut Self, &mut Message) -> Result<T, connection::StreamError>,
     ) -> Result<T, StreamError> {
         let peer_goaway = self.peer_goaway().await?;
         tokio::select! {
-            result = f(self) => match result {
+            result = f(self, message) => match result {
                 Ok(value) => Ok(value),
+                Err(connection::StreamError::Quic { source }) => Err(source.into()),
+                // message from peer is malformed
+                Err(connection::StreamError::Code { source }) if source.code().is_known_stream_error() => {
+                    message.set_malformed();
+                    _ = self.stream.stop(source.code().into_inner()).await;
+                    Err(StreamError::MalformedIncomingMessage)
+                },
                 Err(error) => Err(self.connection.handle_error(error).await.into()),
             },
             goaway = peer_goaway => match goaway {
@@ -203,11 +222,14 @@ impl ReadStream {
             MessageStage::Body | MessageStage::Trailer | MessageStage::Complete => {
                 return Ok(&message.header);
             }
+            MessageStage::Malformed => {
+                return Err(StreamError::MalformedIncomingMessage);
+            }
             MessageStage::Dropped => message_used_after_dropped(),
         }
 
         message.header = self
-            .try_io(async |this| {
+            .try_io(message, async |this, message| {
                 let frame = match this.stream.next_unreserved_frame().await.transpose()? {
                     Some(frame) if frame.r#type() != Frame::HEADERS_FRAME_TYPE => {
                         return Err(Code::H3_FRAME_UNEXPECTED.into());
@@ -270,10 +292,11 @@ impl ReadStream {
                     }
                 };
             }
+            MessageStage::Malformed => return Some(Err(StreamError::MalformedIncomingMessage)),
             MessageStage::Dropped => message_used_after_dropped(),
         }
 
-        let try_read_next_body = self.try_io(async |this| {
+        let try_read_next_body = self.try_io(message, async |this, message| {
             loop {
                 match this.stream.frame().transpose()? {
                     None => match this.stream.next_unreserved_frame().await.transpose()? {
@@ -446,11 +469,12 @@ impl ReadStream {
             }
             MessageStage::Trailer => {}
             MessageStage::Complete => return Ok(message.trailers()),
+            MessageStage::Malformed => return Err(StreamError::MalformedIncomingMessage),
             MessageStage::Dropped => message_used_after_dropped(),
         }
 
         message.trailer = self
-            .try_io(async |this| {
+            .try_io(message, async |this, _| {
                 let frame = match this.stream.frame().transpose()? {
                     Some(frame) if frame.r#type() != Frame::HEADERS_FRAME_TYPE => {
                         return Err(Code::H3_FRAME_UNEXPECTED.into());
@@ -582,13 +606,15 @@ impl WriteStream {
             MessageStage::Header => {}
             // header already sent
             MessageStage::Body | MessageStage::Trailer | MessageStage::Complete => return Ok(()),
+            MessageStage::Malformed => {
+                return self.cancel(Code::H3_REQUEST_CANCELLED).await;
+            }
             MessageStage::Dropped => message_used_after_dropped(),
         }
 
-        message
-            .header
-            .check_pseudo()
-            .context(MalformedPseudoHeaderSnafu)?;
+        // if message.header.check_pseudo().is_err() {
+        //     // malformed message
+        // }
 
         let field_lines = message.header.iter();
         let algo = &DEFAULT_COMPRESS_ALGO;
@@ -612,7 +638,7 @@ impl WriteStream {
                 message.stage = MessageStage::Body;
                 Ok(())
             }
-            Err(EncodeError::FramePayloadTooLarge) => Err(MessageError::HeaderTooLarge.into()),
+            Err(EncodeError::FramePayloadTooLarge) => Err(StreamError::HeaderTooLarge),
             Err(EncodeError::HuffmanEncoding) => {
                 unreachable!("FieldSection contain invalid header name/value, this is a bug")
             }
@@ -624,10 +650,10 @@ impl WriteStream {
         message: &mut Message,
         mut content: impl Buf,
     ) -> Result<(), StreamError> {
-        if message.is_interim_response() {
-            return Err(MessageError::BodyOrTrailerOnInterimResponse.into());
-        }
-        message.enable_streaming()?;
+        // if message.is_interim_response() {
+        //     // malformed message
+        // }
+        // message.enable_streaming()?; // violate of set_body call
 
         match message.stage {
             MessageStage::Header => {
@@ -636,26 +662,33 @@ impl WriteStream {
             }
             MessageStage::Body => {}
             MessageStage::Trailer | MessageStage::Complete => {
-                return Err(MessageError::BodyAlreadySending.into());
+                /* this will cause H3_FRAME_UNEXPECTED error */
+            }
+            MessageStage::Malformed => {
+                return self.cancel(Code::H3_REQUEST_CANCELLED).await;
             }
             MessageStage::Dropped => message_used_after_dropped(),
         }
 
         while content.has_remaining() {
             let bytes = content.copy_to_bytes(content.chunk().len());
+            let len = bytes.len();
             let frame = Frame::new(Frame::DATA_FRAME_TYPE, bytes)
-                .map_err(|_| MessageError::DataFrameTooLarge)?;
+                .map_err(|_| StreamError::DataFrameTooLarge)?;
             self.try_io(async |this| Ok(this.send_frame(frame).await?))
                 .await?;
+            *message
+                .streaming_body()
+                .expect("call send_streaming_body on chunked body, this is a bug") += len as u64;
         }
 
         Ok(())
     }
 
     pub async fn send_chunked_body(&mut self, message: &mut Message) -> Result<(), StreamError> {
-        if message.is_interim_response() {
-            return Err(MessageError::BodyOrTrailerOnInterimResponse.into());
-        }
+        // if message.is_interim_response() {
+        //     // malformed message
+        // }
 
         match message.stage {
             MessageStage::Header => {
@@ -664,19 +697,22 @@ impl WriteStream {
             }
             MessageStage::Body => {}
             MessageStage::Trailer | MessageStage::Complete => {
-                return Err(MessageError::BodyAlreadySending.into());
+                /* this will cause H3_FRAME_UNEXPECTED error */
+            }
+            MessageStage::Malformed => {
+                return self.cancel(Code::H3_REQUEST_CANCELLED).await;
             }
             MessageStage::Dropped => message_used_after_dropped(),
         }
 
         let Body::Chunked { buflist } = &mut message.body else {
-            return Err(MessageError::BodyAlreadySending.into());
+            unreachable!("Call send_chunked_body on non-chunked body, this is a bug");
         };
 
         while buflist.has_remaining() {
             let bytes = buflist.copy_to_bytes(buflist.chunk().len());
             let frame = Frame::new(Frame::DATA_FRAME_TYPE, bytes)
-                .map_err(|_| MessageError::DataFrameTooLarge)?;
+                .map_err(|_| StreamError::DataFrameTooLarge)?;
             self.try_io(async |this| Ok(this.send_frame(frame).await?))
                 .await?;
         }
@@ -686,9 +722,6 @@ impl WriteStream {
     }
 
     pub async fn send_trailer(&mut self, message: &mut Message) -> Result<(), StreamError> {
-        if message.is_interim_response() {
-            return Err(MessageError::BodyOrTrailerOnInterimResponse.into());
-        }
         // prepare
         match message.stage {
             MessageStage::Header | MessageStage::Body => {
@@ -703,6 +736,9 @@ impl WriteStream {
             }
             MessageStage::Trailer => {}
             MessageStage::Complete => return Ok(()),
+            MessageStage::Malformed => {
+                return self.cancel(Code::H3_REQUEST_CANCELLED).await;
+            }
             MessageStage::Dropped => message_used_after_dropped(),
         }
 
@@ -727,7 +763,7 @@ impl WriteStream {
                 Ok(())
             }
             Err(error) => match error {
-                EncodeError::FramePayloadTooLarge => Err(MessageError::TrailerTooLarge.into()),
+                EncodeError::FramePayloadTooLarge => Err(StreamError::TrailerTooLarge),
                 EncodeError::HuffmanEncoding => {
                     unreachable!("FieldSection contain invalid header name/value, this is a bug")
                 }
@@ -738,8 +774,8 @@ impl WriteStream {
     async fn send_pending_sections(&mut self, message: &mut Message) -> Result<(), StreamError> {
         match message.stage {
             MessageStage::Header | MessageStage::Body => {
-                if message.is_interim_response() {
-                    return Err(MessageError::FinalResponseRequired.into());
+                if message.header().is_empty() {
+                    return Ok(());
                 }
                 if message.is_chunked() {
                     self.send_chunked_body(message).await?;
@@ -747,6 +783,11 @@ impl WriteStream {
                 } else {
                     self.send_header(message).await?;
                     debug_assert_eq!(message.stage, MessageStage::Body);
+                }
+
+                if !message.trailers().is_empty() {
+                    self.send_trailer(message).await?;
+                    debug_assert_eq!(message.stage, MessageStage::Complete)
                 }
             }
             MessageStage::Trailer => {
@@ -758,6 +799,9 @@ impl WriteStream {
                 }
             }
             MessageStage::Complete => {}
+            MessageStage::Malformed => {
+                return self.cancel(Code::H3_REQUEST_CANCELLED).await;
+            }
             MessageStage::Dropped => message_used_after_dropped(),
         }
 
@@ -781,8 +825,8 @@ impl WriteStream {
         Ok(())
     }
 
-    pub async fn cancel(&mut self, code: VarInt) -> Result<(), StreamError> {
-        self.try_io(async move |this| Ok(this.stream.cancel(code).await?))
+    pub async fn cancel(&mut self, code: Code) -> Result<(), StreamError> {
+        self.try_io(async move |this| Ok(this.stream.cancel(code.into_inner()).await?))
             .await
     }
 

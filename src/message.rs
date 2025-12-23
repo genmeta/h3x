@@ -16,7 +16,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 enum Body {
-    Streaming { received: u64 },
+    Streaming { count: u64 },
     Chunked { buflist: Cursor<BufList> },
 }
 
@@ -24,18 +24,22 @@ enum Body {
 pub enum MessageStage {
     /// Receiving/Sending header section, including interim response headers
     Header = 0,
-    /// Receiving/Sending entity body
+    /// Receiving/Sending message body
     Body = 1,
     /// Receiving/Sending trailer section
     Trailer = 2,
     /// Message is completely sent/received
     Complete = 3,
-    /// Message struct is dropped and cannot be used anymore
-    Dropped = 4,
+
+    /// Message struct is malformed
+    Malformed = 4,
+    /// Message struct is already taken/dropped
+    // State can be removed after async drop stablizes
+    Dropped = 5,
 }
 
 #[derive(Debug, Snafu)]
-pub enum MessageError {
+pub enum MalformedMessageError {
     // === 状态相关错误 ===
     #[snafu(display("cannot modify header section after it has been sent"))]
     HeaderAlreadySent,
@@ -54,20 +58,6 @@ pub enum MessageError {
     #[snafu(display("streaming body operation cannot be performed on chunked body"))]
     StreamingOperationOnChunkedBody,
 
-    // === 大小限制错误 ===
-    // #[snafu(display("header frame payload too large, maybe too many header fields"))]
-    // HeaderFrameTooLarge,
-    #[snafu(display(
-        "trailer section too large to fit into a single frame, maybe too many header fields"
-    ))]
-    HeaderTooLarge,
-    #[snafu(display(
-        "trailer section too large to fit into a single frame, maybe too many header fields"
-    ))]
-    TrailerTooLarge,
-    #[snafu(display("data frame payload too large, try smaller chunk size"))]
-    DataFrameTooLarge,
-
     // === 协议语义错误 ===
     #[snafu(display("cannot send malformed pseudo header section"))]
     MalformedPseudoHeader { source: MalformedHeaderSection },
@@ -75,6 +65,12 @@ pub enum MessageError {
     BodyOrTrailerOnInterimResponse,
     #[snafu(display("cannot close response stream without sending a final response"))]
     FinalResponseRequired,
+}
+
+impl From<MalformedHeaderSection> for MalformedMessageError {
+    fn from(source: MalformedHeaderSection) -> Self {
+        MalformedMessageError::MalformedPseudoHeader { source }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -128,25 +124,28 @@ impl Message {
         self.header.is_response_header()
     }
 
-    pub fn enable_streaming(&mut self) -> Result<(), MessageError> {
+    pub fn streaming_body(&mut self) -> Result<&mut u64, MalformedMessageError> {
         if let Body::Chunked { buflist } = &self.body {
             match self.stage {
                 MessageStage::Header => {}
                 MessageStage::Body if !buflist.inner().has_remaining() => {}
-                _ => return Err(MessageError::BodyModeChangeAfterTransferStarted),
+                _ => return Err(MalformedMessageError::BodyModeChangeAfterTransferStarted),
             }
 
-            self.body = Body::Streaming { received: 0 }
+            self.body = Body::Streaming { count: 0 }
         }
-        Ok(())
+        match &mut self.body {
+            Body::Streaming { count } => Ok(count),
+            Body::Chunked { .. } => unreachable!(),
+        }
     }
 
-    pub fn chunked_body(&mut self) -> Result<&mut Cursor<BufList>, MessageError> {
-        if let Body::Streaming { received } = &self.body {
+    pub fn chunked_body(&mut self) -> Result<&mut Cursor<BufList>, MalformedMessageError> {
+        if let Body::Streaming { count } = &self.body {
             match self.stage {
                 MessageStage::Header => { /* Ok to change mode: body unused */ }
-                MessageStage::Body if *received == 0 => { /* Ok to change mode: body unused */ }
-                _ => return Err(MessageError::BodyModeChangeAfterTransferStarted),
+                MessageStage::Body if *count == 0 => { /* Ok to change mode: body unused */ }
+                _ => return Err(MalformedMessageError::BodyModeChangeAfterTransferStarted),
             }
         }
         match &mut self.body {
@@ -178,11 +177,7 @@ impl Message {
     }
 
     /// Set body to buffer mode with given content
-    pub fn set_body(&mut self, mut content: impl Buf) -> Result<(), MessageError> {
-        if self.is_interim_response() {
-            return Err(MessageError::BodyOrTrailerOnInterimResponse);
-        }
-
+    pub fn set_body(&mut self, mut content: impl Buf) {
         let mut buflist = BufList::new();
         while content.has_remaining() {
             buflist.write(content.copy_to_bytes(content.chunk().len()));
@@ -190,19 +185,14 @@ impl Message {
         self.body = Body::Chunked {
             buflist: Cursor::new(buflist),
         };
-
-        Ok(())
     }
 
     pub fn trailers(&self) -> &HeaderMap {
         &self.trailer.header_map
     }
 
-    pub fn trailers_mut(&mut self) -> Result<&mut HeaderMap, MessageError> {
-        if self.is_interim_response() {
-            return Err(MessageError::BodyOrTrailerOnInterimResponse);
-        }
-        Ok(&mut self.trailer.header_map)
+    pub fn trailers_mut(&mut self) -> &mut HeaderMap {
+        &mut self.trailer.header_map
     }
 
     pub fn stage(&self) -> MessageStage {
@@ -213,8 +203,16 @@ impl Message {
         self.stage() == MessageStage::Complete
     }
 
-    pub fn is_destroyed(&self) -> bool {
+    pub fn is_dropped(&self) -> bool {
         self.stage() == MessageStage::Dropped
+    }
+
+    pub fn is_malformed(&self) -> bool {
+        self.stage() == MessageStage::Malformed
+    }
+
+    pub fn set_malformed(&mut self) {
+        self.stage = MessageStage::Malformed;
     }
 
     pub fn take(&mut self) -> Self {

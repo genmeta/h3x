@@ -312,7 +312,6 @@ impl quic::Connect for Arc<gm_quic::prelude::QuicClient> {
 mod tests {
     use std::net::SocketAddr;
 
-    use bytes::Buf;
     use gm_quic::prelude::{
         BindUri, QuicIO,
         handy::{ToCertificate, ToPrivateKey},
@@ -343,27 +342,28 @@ mod tests {
 
         let mut servers = Servers::builder().without_client_cert_verifier()?.build();
 
-        let echo_service = async |req: &mut server::Request, resp: &mut server::Response| {
+        #[tracing::instrument(skip_all)]
+        async fn echo_service(req: &mut server::Request, resp: &mut server::Response) {
             tracing::info!("Echo service called");
-            resp.set_status(StatusCode::OK).unwrap();
+            resp.set_status(StatusCode::OK);
             while let Some(body_part) = req.read().await.transpose().unwrap() {
                 tracing::info!("Echoing back request body part({} bytes)", body_part.len());
                 resp.write(body_part).await.unwrap();
             }
             resp.close().await.unwrap();
             tracing::info!("Echo done");
-        };
-        let health_service = async |_req: &mut server::Request, resp: &mut server::Response| {
+        }
+
+        #[tracing::instrument(skip_all)]
+        async fn health_service(_req: &mut server::Request, resp: &mut server::Response) {
             tracing::info!("Health service called");
             resp.set_status(StatusCode::OK)
-                .unwrap()
                 .set_body(b"Hello, World!".as_slice())
-                .unwrap()
                 .close()
                 .await
                 .unwrap();
             tracing::info!("Health done");
-        };
+        }
         servers.add_server(
             "localhost",
             SERVER_CERT.to_certificate(),
@@ -408,21 +408,17 @@ mod tests {
 
         let client_echo = async {
             let port = listen_addr.port();
-            let (mut req, mut resp) = client
+            let content = include_bytes!("./gm_quic.rs").as_slice();
+            let (.., mut resp) = client
                 .new_request()
+                .with_body(content)
                 .post(format!("https://localhost:{port}/echo").parse()?)
                 .await?;
-            tracing::info!("Request header sent");
-
-            let content = include_bytes!("./gm_quic.rs").as_slice();
-            req.write(content).await?.close().await?;
             tracing::info!("Request sent");
 
             assert_eq!(resp.status(), StatusCode::OK);
-            let mut response = resp.read_all().await?;
             tracing::info!("Response received");
-            let response = response.copy_to_bytes(response.remaining());
-            assert!(response.as_ref() == content);
+            assert!(resp.read_to_bytes().await? == content);
 
             Ok::<_, BoxError>(())
         }
@@ -430,17 +426,14 @@ mod tests {
 
         let client_health = async {
             let port = listen_addr.port();
-            let (_req, mut resp) = client
+            let (.., mut resp) = client
                 .new_request()
                 .get(format!("https://localhost:{port}/health").parse()?)
                 .await?;
-            tracing::info!("Request header sent");
+            tracing::info!("Request sent");
 
             assert_eq!(resp.status(), StatusCode::OK);
-            let mut response = resp.read_all().await?;
-            tracing::info!("Response received");
-            let response = response.copy_to_bytes(response.remaining());
-            assert!(response.as_ref() == b"Hello, World!");
+            assert!(resp.read_to_bytes().await? == b"Hello, World!"[..]);
 
             Ok::<_, BoxError>(())
         }
@@ -448,24 +441,21 @@ mod tests {
 
         let client_fallback = async {
             let port = listen_addr.port();
-            let (_req, mut resp) = client
+            let (.., mut resp) = client
                 .new_request()
                 .get(format!("https://localhost:{port}/not_found").parse()?)
                 .await?;
-            tracing::info!("Request header sent");
+            tracing::info!("Request sent");
 
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-            let mut response = resp.read_all().await?;
-            tracing::info!("Response received");
-            let response = response.copy_to_bytes(response.remaining());
-            assert!(response.is_empty());
+            assert!(resp.read_to_bytes().await?.is_empty());
 
             Ok::<_, BoxError>(())
         }
         .instrument(tracing::info_span!("client_fallback"));
 
         let client = async {
-            tokio::try_join!(client_echo, client_health, client_fallback)?;
+            tokio::try_join!(client_fallback, client_echo, client_health)?;
             servers.shutdown();
             Ok::<_, BoxError>(())
         };

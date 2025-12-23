@@ -130,6 +130,18 @@ impl Code {
     pub const fn value(&self) -> VarInt {
         self.0
     }
+
+    pub const fn is_known_stream_error(&self) -> bool {
+        matches!(
+            *self,
+            Code::H3_FRAME_UNEXPECTED
+                | Code::H3_MESSAGE_ERROR
+                | Code::H3_CONNECT_ERROR
+                | Code::H3_REQUEST_CANCELLED
+                | Code::H3_REQUEST_INCOMPLETE
+                | Code::H3_REQUEST_REJECTED
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

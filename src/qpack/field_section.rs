@@ -478,6 +478,18 @@ impl PseudoHeaders {
     pub const fn unresolved_response() -> Self {
         PseudoHeaders::Response { status: None }
     }
+
+    pub const fn is_empty(&self) -> bool {
+        match self {
+            PseudoHeaders::Request {
+                method,
+                scheme,
+                authority,
+                path,
+            } => method.is_none() && scheme.is_none() && authority.is_none() && path.is_none(),
+            PseudoHeaders::Response { status } => status.is_none(),
+        }
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -594,6 +606,13 @@ impl FieldSection {
             pseudo_headers: None,
             header_map,
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pseudo_headers
+            .as_ref()
+            .is_none_or(|pseudo_headers| pseudo_headers.is_empty())
+            && self.header_map.is_empty()
     }
 
     pub fn iter(&self) -> Iter<'_> {

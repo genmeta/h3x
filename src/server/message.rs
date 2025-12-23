@@ -10,11 +10,12 @@ use tracing::Instrument;
 
 use crate::{
     agent::{LocalAgent, RemoteAgent},
+    error::Code,
     message::{
-        Message, MessageError, MessageStage,
+        MalformedMessageError, Message, MessageStage,
         stream::{ReadStream, ReadToStringError, StreamError, WriteStream},
     },
-    varint::VarInt,
+    qpack::field_section::PseudoHeaders,
 };
 
 pub struct UnresolvedRequest {
@@ -47,7 +48,7 @@ impl UnresolvedRequest {
         };
         request.stream.read_header(&mut request.message).await?;
         let response = Response {
-            entity: Message::unresolved_response(),
+            message: Message::unresolved_response(),
             stream: self.response_stream,
             agent: self.local_agent,
         };
@@ -126,94 +127,151 @@ impl Request {
 }
 
 pub struct Response {
-    entity: Message,
+    message: Message,
     stream: WriteStream,
     agent: LocalAgent,
 }
 
 impl Response {
-    pub fn headers(&self) -> &http::HeaderMap {
-        &self.entity.header().header_map
-    }
-
-    pub fn headers_mut(&mut self) -> Result<&mut http::HeaderMap, StreamError> {
-        if self.entity.stage() > MessageStage::Header {
-            return Err(MessageError::HeaderAlreadySent.into());
-        }
-        Ok(&mut self.entity.header_mut().header_map)
-    }
-
-    pub fn set_header(
+    fn check_message_operation(
         &mut self,
-        name: impl IntoHeaderName,
-        value: HeaderValue,
-    ) -> Result<&mut Self, StreamError> {
-        self.headers_mut()?.insert(name, value);
-        Ok(self)
+        operation: &str,
+        operate: impl FnOnce(&mut Self) -> Result<(), MalformedMessageError>,
+    ) {
+        if self.message.is_malformed() {
+            tracing::warn!(
+                target: "h3x::server", operation,
+                "Response is malformed, operation will not affect the response stream",
+            );
+        }
+        if let Err(error) = operate(self) {
+            tracing::warn!(
+                target: "h3x::server", operation, error = %Report::from_error(error),
+                "Operation malformed the response message, response stream will be cancelled with H3_REQUEST_CANCELLED",
+            );
+            self.message.set_malformed();
+        }
+    }
+
+    pub fn headers(&self) -> &http::HeaderMap {
+        &self.message.header().header_map
+    }
+
+    pub fn headers_mut(&mut self) -> &mut http::HeaderMap {
+        self.check_message_operation("modify_headers", |this| {
+            if this.message.stage() > MessageStage::Header {
+                return Err(MalformedMessageError::HeaderAlreadySent);
+            }
+            Ok(())
+        });
+        &mut self.message.header_mut().header_map
+    }
+
+    pub fn set_header(&mut self, name: impl IntoHeaderName, value: HeaderValue) -> &mut Self {
+        self.headers_mut().insert(name, value);
+        self
     }
 
     pub fn status(&self) -> Option<http::StatusCode> {
-        Some(self.entity.header().status())
+        match self.message.header().pseudo_headers {
+            Some(PseudoHeaders::Response { ref status }) => *status,
+            _ => unreachable!(),
+        }
     }
 
-    pub fn set_status(&mut self, status: http::StatusCode) -> Result<&mut Self, StreamError> {
-        self.entity.header_mut().set_status(status);
-        Ok(self)
+    pub fn set_status(&mut self, status: http::StatusCode) -> &mut Self {
+        self.check_message_operation("set_status", |this| {
+            if this.message.stage() > MessageStage::Header {
+                return Err(MalformedMessageError::HeaderAlreadySent);
+            }
+            Ok(())
+        });
+        self.message.header_mut().set_status(status);
+        self
     }
 
     pub async fn flush(&mut self) -> Result<&mut Self, StreamError> {
-        self.stream.flush(&mut self.entity).await?;
+        self.check_message_operation("flush_response", |this| {
+            if !this.message.header().is_empty() {
+                this.message.header().check_pseudo()?;
+            }
+            Ok(())
+        });
+        self.stream.flush(&mut self.message).await?;
         Ok(self)
     }
 
-    pub fn set_body(&mut self, content: impl Buf) -> Result<&mut Self, StreamError> {
-        if self.entity.stage() > MessageStage::Body {
-            return Err(MessageError::BodyAlreadySending.into());
-        }
-        if self.entity.stage() == MessageStage::Body {
-            return Err(MessageError::BodyReplacementDuringSend.into());
-        }
-        self.entity.set_body(content)?;
-        Ok(self)
+    pub fn set_body(&mut self, content: impl Buf) -> &mut Self {
+        self.check_message_operation("write_chunked_body", |this| {
+            if this.message.is_interim_response() {
+                return Err(MalformedMessageError::BodyOrTrailerOnInterimResponse);
+            }
+            if this.message.stage() > MessageStage::Body {
+                return Err(MalformedMessageError::BodyAlreadySending);
+            }
+            if this.message.stage() == MessageStage::Body {
+                return Err(MalformedMessageError::BodyReplacementDuringSend);
+            }
+            this.message.chunked_body()?;
+            Ok(())
+        });
+        self.message.set_body(content);
+        self
     }
 
     pub async fn write(&mut self, content: impl Buf) -> Result<&mut Self, StreamError> {
+        self.check_message_operation("write_streaming_body", |this| {
+            if this.message.is_interim_response() {
+                return Err(MalformedMessageError::BodyOrTrailerOnInterimResponse);
+            }
+            this.message.streaming_body()?;
+            Ok(())
+        });
         self.stream
-            .send_streaming_body(&mut self.entity, content)
+            .send_streaming_body(&mut self.message, content)
             .await?;
         Ok(self)
     }
 
     pub fn trailers(&self) -> &HeaderMap {
-        self.entity.trailers()
+        self.message.trailers()
     }
 
-    pub fn trailers_mut(&mut self) -> Result<&mut HeaderMap, StreamError> {
-        if self.entity.stage() > MessageStage::Trailer {
-            return Err(MessageError::TrailerAlreadySent.into());
-        }
-        Ok(self.entity.trailers_mut()?)
+    pub fn trailers_mut(&mut self) -> &mut HeaderMap {
+        self.check_message_operation("modify_trailers", |this| {
+            if this.message.is_interim_response() {
+                return Err(MalformedMessageError::BodyOrTrailerOnInterimResponse);
+            }
+            if this.message.stage() > MessageStage::Trailer {
+                return Err(MalformedMessageError::TrailerAlreadySent);
+            }
+            Ok(())
+        });
+        self.message.trailers_mut()
     }
 
-    pub fn set_trailer(
-        &mut self,
-        name: impl IntoHeaderName,
-        value: HeaderValue,
-    ) -> Result<&mut Self, StreamError> {
-        self.trailers_mut()?.insert(name, value);
-        Ok(self)
+    pub fn set_trailer(&mut self, name: impl IntoHeaderName, value: HeaderValue) -> &mut Self {
+        self.trailers_mut().insert(name, value);
+        self
     }
 
-    pub fn set_trailers(&mut self, map: HeaderMap) -> Result<&mut Self, StreamError> {
-        *self.trailers_mut()? = map;
-        Ok(self)
+    pub fn set_trailers(&mut self, map: HeaderMap) -> &mut Self {
+        *self.trailers_mut() = map;
+        self
     }
 
     pub async fn close(&mut self) -> Result<(), StreamError> {
-        self.stream.close(&mut self.entity).await
+        self.check_message_operation("close_response", |this| {
+            this.message.header().check_pseudo()?;
+            if this.message.is_interim_response() {
+                return Err(MalformedMessageError::FinalResponseRequired);
+            }
+            Ok(())
+        });
+        self.stream.close(&mut self.message).await
     }
 
-    pub async fn cancel(&mut self, code: VarInt) -> Result<(), StreamError> {
+    pub async fn cancel(&mut self, code: Code) -> Result<(), StreamError> {
         self.stream.cancel(code).await
     }
 
@@ -223,19 +281,32 @@ impl Response {
 
     /// Async drop the response properly
     pub(crate) fn drop(&mut self) -> Option<impl Future<Output = ()> + Send + use<>> {
-        if self.entity.is_complete() || self.entity.is_destroyed() {
+        if self.message.is_complete() || self.message.is_dropped() {
             return None;
         }
         // It's ok to take: Response will not be used after drop
         let mut stream = self.stream.take();
-        let mut entity = self.entity.take();
-        Some(async move {
-            if let Err(StreamError::MessageOperation { source }) = stream.close(&mut entity).await {
+        let mut message = self.message.take();
+
+        if !message.is_malformed() {
+            let check = || {
+                message.header().check_pseudo()?;
+                if message.is_interim_response() {
+                    return Err(MalformedMessageError::FinalResponseRequired);
+                }
+                Ok(())
+            };
+            if let Err(error) = check() {
+                message.set_malformed();
                 tracing::warn!(
-                    target: "h3x::server", error = %Report::from_error(source),
-                    "Response stream cannot be closed properly",
+                    target: "h3x::server", error = %Report::from_error(error),
+                    "Response stream cannot be closed properly as its malformed",
                 );
             }
+        }
+
+        Some(async move {
+            _ = stream.close(&mut message).await;
         })
     }
 }

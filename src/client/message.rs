@@ -6,21 +6,21 @@ use http::{
     header::{AsHeaderName, IntoHeaderName},
     uri::{Authority, PathAndQuery, Scheme},
 };
-use snafu::{Report, Snafu};
+use snafu::{Report, ResultExt, Snafu};
 use tracing::Instrument;
 
 use crate::{
     agent::{LocalAgent, RemoteAgent},
     client::Client,
     connection::InitialRequestStreamError,
+    error::Code,
     message::{
-        Message, MessageError, MessageStage,
+        MalformedMessageError, Message, MessageStage,
         stream::{ReadStream, ReadToStringError, StreamError, WriteStream},
     },
     pool::ConnectError,
     qpack::field_section::MalformedHeaderSection,
     quic,
-    varint::VarInt,
 };
 
 #[derive(Clone)]
@@ -42,13 +42,26 @@ where
 }
 
 #[derive(Debug, Snafu)]
+#[snafu(module)]
 pub enum RequestError<E: Error + 'static> {
     #[snafu(transparent)]
     Connect { source: ConnectError<E> },
     #[snafu(transparent)]
     Stream { source: quic::StreamError },
-    #[snafu(transparent)]
-    MalformedHeader { source: MalformedHeaderSection },
+    #[snafu(display("Request cannot be send due to malformed header"))]
+    MalformedRequestHeader { source: MalformedHeaderSection },
+    #[snafu(display(
+        "header section too large to fit into a single frame, maybe too many header fields"
+    ))]
+    HeaderTooLarge,
+    #[snafu(display(
+        "trailer section too large to fit into a single frame, maybe too many header fields"
+    ))]
+    TrailerTooLarge,
+    #[snafu(display("data frame payload too large, try smaller chunk size"))]
+    DataFrameTooLarge,
+    #[snafu(display("Message from peer is malformed"))]
+    MalformedResponseMessage,
     #[snafu(display("Expected HTTPS scheme"))]
     NotHttpsScheme,
 }
@@ -62,7 +75,7 @@ impl<E: Error + 'static> From<quic::ConnectionError> for RequestError<E> {
 impl<C: quic::Connect> Client<C> {
     pub fn new_request(&self) -> PendingRequest<'_, C> {
         let mut request = Message::unresolved_request();
-        _ = request.enable_streaming();
+        _ = request.streaming_body();
         PendingRequest {
             client: self,
             request,
@@ -115,9 +128,7 @@ impl<C: quic::Connect> PendingRequest<'_, C> {
     }
 
     pub fn with_body(mut self, body: impl Buf) -> Self {
-        self.request
-            .set_body(body)
-            .expect("Request in Header stage as it unsend");
+        self.request.set_body(body);
         self
     }
 
@@ -126,9 +137,7 @@ impl<C: quic::Connect> PendingRequest<'_, C> {
     }
 
     pub fn trailers_mut(&mut self) -> &mut HeaderMap {
-        self.request
-            .trailers_mut()
-            .expect("Request never be interim_response")
+        self.request.trailers_mut()
     }
 
     pub fn with_trailer(mut self, name: impl IntoHeaderName, value: HeaderValue) -> Self {
@@ -157,7 +166,10 @@ where
         err
     )]
     pub async fn execute(mut self) -> Result<(Request, Response), RequestError<C::Error>> {
-        self.request.header().check_pseudo()?;
+        self.request
+            .header()
+            .check_pseudo()
+            .context(request_error::MalformedRequestHeaderSnafu)?;
         if self.request.header().scheme() != Some(Scheme::HTTPS) {
             return Err(RequestError::NotHttpsScheme);
         }
@@ -172,13 +184,13 @@ where
 
         loop {
             let connection = self.client.connect(authority.clone()).await?;
-            tracing::debug!(%authority, "Connected");
+            tracing::debug!(target: "h3x::client", %authority, "Connected");
 
             let (mut read_stream, mut write_stream) = match connection.open_request_stream().await {
                 Ok(pair) => pair,
                 Err(InitialRequestStreamError::Quic { source: error }) => return Err(error.into()),
                 Err(InitialRequestStreamError::Goaway { .. }) => {
-                    tracing::debug!("Connection goaway, retrying...");
+                    tracing::debug!(target: "h3x::client", "Connection goaway, retrying...");
                     continue;
                 }
             };
@@ -192,7 +204,7 @@ where
             let mut response = Message::unresolved_response();
 
             match tokio::try_join!(
-                write_stream.send_header(&mut self.request),
+                write_stream.send(&mut self.request),
                 read_stream.read_header(&mut response)
             ) {
                 Ok(..) => {
@@ -208,14 +220,23 @@ where
                     };
                     return Ok((request, response));
                 }
-                Err(StreamError::MessageOperation { .. }) => {
-                    unreachable!("Header should be checked before sending")
+                Err(StreamError::HeaderTooLarge) => {
+                    return Err(RequestError::HeaderTooLarge);
+                }
+                Err(StreamError::TrailerTooLarge) => {
+                    return Err(RequestError::TrailerTooLarge);
+                }
+                Err(StreamError::DataFrameTooLarge) => {
+                    return Err(RequestError::DataFrameTooLarge);
+                }
+                Err(StreamError::MalformedIncomingMessage) => {
+                    return Err(RequestError::MalformedResponseMessage);
                 }
                 Err(StreamError::Quic { source }) => {
                     return Err(source.into());
                 }
                 Err(StreamError::Goaway { .. }) => {
-                    tracing::debug!("Connection goaway, retrying...");
+                    tracing::debug!(target: "h3x::client", "Connection goaway, retrying...");
                     continue;
                 }
             }
@@ -305,7 +326,32 @@ impl Request {
         &self.message.header().header_map
     }
 
+    fn check_message_operation(
+        &mut self,
+        operation: &str,
+        operate: impl FnOnce(&mut Self) -> Result<(), MalformedMessageError>,
+    ) {
+        if self.message.is_malformed() {
+            tracing::warn!(
+                target: "h3x::client", operation,
+                "Request is malformed, operation will not affect the request stream",
+            );
+        }
+        if let Err(error) = operate(self) {
+            tracing::warn!(
+                target: "h3x::client", operation, error = %Report::from_error(error),
+                "Operation malformed the request message, request stream will be cancelled with H3_REQUEST_CANCELLED",
+            );
+            self.message.set_malformed();
+        }
+    }
+
     pub async fn write(&mut self, content: impl Buf) -> Result<&mut Self, StreamError> {
+        self.check_message_operation("write_streaming_body", |this| {
+            // header is checked in pending request
+            this.message.streaming_body()?;
+            Ok(())
+        });
         self.stream
             .send_streaming_body(&mut self.message, content)
             .await?;
@@ -313,6 +359,7 @@ impl Request {
     }
 
     pub async fn flush(&mut self) -> Result<&mut Self, StreamError> {
+        // header is checked in pending request
         self.stream.flush(&mut self.message).await?;
         Ok(self)
     }
@@ -321,32 +368,31 @@ impl Request {
         self.message.trailers()
     }
 
-    pub fn trailers_mut(&mut self) -> Result<&mut HeaderMap, StreamError> {
-        if self.message.stage() > MessageStage::Trailer {
-            return Err(MessageError::TrailerAlreadySent.into());
-        }
-        Ok(self.message.trailers_mut()?)
+    pub fn trailers_mut(&mut self) -> &mut HeaderMap {
+        self.check_message_operation("modify_trailers", |this| {
+            if this.message.stage() >= MessageStage::Trailer {
+                return Err(MalformedMessageError::TrailerAlreadySent);
+            }
+            Ok(())
+        });
+        self.message.trailers_mut()
     }
 
-    pub fn set_trailer(
-        &mut self,
-        name: impl IntoHeaderName,
-        value: HeaderValue,
-    ) -> Result<&mut Self, StreamError> {
-        self.trailers_mut()?.insert(name, value);
-        Ok(self)
+    pub fn set_trailer(&mut self, name: impl IntoHeaderName, value: HeaderValue) -> &mut Self {
+        self.trailers_mut().insert(name, value);
+        self
     }
 
-    pub fn set_trailers(&mut self, map: HeaderMap) -> Result<&mut Self, StreamError> {
-        *self.trailers_mut()? = map;
-        Ok(self)
+    pub fn set_trailers(&mut self, map: HeaderMap) -> &mut Self {
+        *self.trailers_mut() = map;
+        self
     }
 
     pub async fn close(&mut self) -> Result<(), StreamError> {
         self.stream.close(&mut self.message).await
     }
 
-    pub async fn cancel(&mut self, code: VarInt) -> Result<(), StreamError> {
+    pub async fn cancel(&mut self, code: Code) -> Result<(), StreamError> {
         self.stream.cancel(code).await
     }
 
@@ -356,19 +402,27 @@ impl Request {
 
     /// Async drop the request properly
     pub(crate) fn drop(&mut self) -> Option<impl Future<Output = ()> + Send + use<>> {
-        if self.message.is_complete() || self.message.is_destroyed() {
+        if self.message.is_complete() || self.message.is_dropped() {
             return None;
         }
         let mut stream = self.stream.take();
-        let mut entity = self.message.take();
-        Some(async move {
-            if let Err(StreamError::MessageOperation { source }) = stream.close(&mut entity).await {
-                tracing::warn!(
-                    target: "h3x::client", error = %Report::from_error(source),
-                    "Request stream cannot be closed properly"
-                );
-            }
-        })
+        let mut message = self.message.take();
+
+        // if !message.is_malformed() {
+        //     let check = || {
+        //         // There is no check that could fail
+        //         Ok(())
+        //     };
+        //     if let Err(error) = check() {
+        //         message.set_malformed();
+        //         tracing::warn!(
+        //             target: "h3x::client", error = %Report::from_error(error),
+        //             "Request stream cannot be closed properly as its malformed",
+        //         );
+        //     }
+        // }
+
+        Some(async move { _ = stream.close(&mut message).await })
     }
 }
 
@@ -387,11 +441,6 @@ pub struct Response {
 }
 
 impl Response {
-    pub fn streaming(mut self) -> Result<Self, StreamError> {
-        self.message.enable_streaming()?;
-        Ok(self)
-    }
-
     pub async fn next_response(&mut self) -> Result<&mut Self, StreamError> {
         self.stream.read_header(&mut self.message).await?;
         Ok(self)

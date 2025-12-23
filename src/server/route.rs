@@ -9,7 +9,8 @@ use crate::server::{
     BoxService, BoxServiceFuture, IntoBoxService, Request, Response, Service, box_service,
 };
 
-async fn default_fallback(_request: &mut Request, response: &mut Response) {
+#[tracing::instrument(skip_all)]
+pub async fn default_fallback(_request: &mut Request, response: &mut Response) {
     _ = response.set_status(StatusCode::NOT_FOUND)
 }
 

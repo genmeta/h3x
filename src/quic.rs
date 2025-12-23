@@ -80,7 +80,7 @@ impl From<io::Error> for StreamError {
 
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
-#[snafu(display("transport error ({kind:x} in frame {frame_type:x}): {reason}"))]
+#[snafu(display("transport error (0x{kind:x} in frame 0x{frame_type:x}): {reason}"))]
 pub struct TransportError {
     pub kind: VarInt,
     pub frame_type: VarInt,
