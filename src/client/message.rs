@@ -1,6 +1,7 @@
 use std::error::Error;
 
 use bytes::{Buf, Bytes};
+use futures::{Sink, Stream, sink, stream};
 use http::{
     HeaderMap, HeaderValue, Method, Uri,
     header::{AsHeaderName, IntoHeaderName},
@@ -364,6 +365,17 @@ impl Request {
         Ok(self)
     }
 
+    pub fn as_sink<B: Buf>(&mut self) -> impl Sink<B, Error = StreamError> {
+        sink::unfold(self, async |this, item: B| this.write(item).await)
+    }
+
+    pub fn into_sink<B: Buf>(self) -> impl Sink<B, Error = StreamError> {
+        sink::unfold(self, async |mut this, item: B| {
+            this.write(item).await?;
+            Ok(this)
+        })
+    }
+
     pub fn trailers(&self) -> &HeaderMap {
         self.message.trailers()
     }
@@ -472,6 +484,18 @@ impl Response {
 
     pub async fn read_to_string(&mut self) -> Result<String, ReadToStringError> {
         self.stream.read_to_string(&mut self.message).await
+    }
+
+    pub async fn as_stream(&mut self) -> impl Stream<Item = Result<Bytes, StreamError>> {
+        stream::unfold(self, async |this| {
+            this.read().await.map(|item| (item, this))
+        })
+    }
+
+    pub async fn into_stream(self) -> impl Stream<Item = Result<Bytes, StreamError>> {
+        stream::unfold(self, async |mut this| {
+            this.read().await.map(|item| (item, this))
+        })
     }
 
     pub async fn trailers(&mut self) -> Result<&HeaderMap, StreamError> {

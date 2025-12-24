@@ -1,5 +1,5 @@
 use bytes::{Buf, Bytes};
-use futures::future::BoxFuture;
+use futures::{Sink, Stream, future::BoxFuture, sink, stream};
 use http::{
     HeaderMap, HeaderValue, Method, Uri,
     header::{AsHeaderName, IntoHeaderName},
@@ -117,6 +117,18 @@ impl Request {
         self.stream.read_to_string(&mut self.message).await
     }
 
+    pub fn as_stream(&mut self) -> impl Stream<Item = Result<Bytes, StreamError>> {
+        stream::unfold(self, async |this| {
+            this.read().await.map(|item| (item, this))
+        })
+    }
+
+    pub fn into_stream(self) -> impl Stream<Item = Result<Bytes, StreamError>> {
+        stream::unfold(self, async |mut this| {
+            this.read().await.map(|item| (item, this))
+        })
+    }
+
     pub async fn trailers(&mut self) -> Result<&HeaderMap, StreamError> {
         self.stream.read_trailer(&mut self.message).await
     }
@@ -190,17 +202,6 @@ impl Response {
         self
     }
 
-    pub async fn flush(&mut self) -> Result<&mut Self, StreamError> {
-        self.check_message_operation("flush_response", |this| {
-            if !this.message.header().is_empty() {
-                this.message.header().check_pseudo()?;
-            }
-            Ok(())
-        });
-        self.stream.flush(&mut self.message).await?;
-        Ok(self)
-    }
-
     pub fn set_body(&mut self, content: impl Buf) -> &mut Self {
         self.check_message_operation("write_chunked_body", |this| {
             if this.message.is_interim_response() {
@@ -231,6 +232,28 @@ impl Response {
             .send_streaming_body(&mut self.message, content)
             .await?;
         Ok(self)
+    }
+
+    pub async fn flush(&mut self) -> Result<&mut Self, StreamError> {
+        self.check_message_operation("flush_response", |this| {
+            if !this.message.header().is_empty() {
+                this.message.header().check_pseudo()?;
+            }
+            Ok(())
+        });
+        self.stream.flush(&mut self.message).await?;
+        Ok(self)
+    }
+
+    pub fn as_sink<B: Buf>(&mut self) -> impl Sink<B, Error = StreamError> {
+        sink::unfold(self, async |this, item: B| this.write(item).await)
+    }
+
+    pub fn into_sink<B: Buf>(self) -> impl Sink<B, Error = StreamError> {
+        sink::unfold(self, async |mut this, item: B| {
+            this.write(item).await?;
+            Ok(this)
+        })
     }
 
     pub fn trailers(&self) -> &HeaderMap {
