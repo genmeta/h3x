@@ -216,6 +216,7 @@ impl Message {
     }
 
     pub fn take(&mut self) -> Self {
+        assert!(!self.is_dropped(), "cannot take a dropped message");
         let message = if self.is_request() {
             mem::replace(self, Self::unresolved_request())
         } else {
