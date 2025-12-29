@@ -1,7 +1,7 @@
 [package]
 name = "h3x"
 description = "High-performance zero-copy DHTTP/3 implementation"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 readme = "README.md"
 repository = "https://github.com/genmeta/h3x"
