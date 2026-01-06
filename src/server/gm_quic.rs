@@ -148,7 +148,7 @@ impl GmQuicServersBuilder {
 }
 
 impl Servers<Arc<QuicListeners>> {
-    pub fn add_server(
+    pub async fn add_server(
         &mut self,
         server_name: impl Into<String>,
         cert_chain: impl handy::ToCertificate,
@@ -159,7 +159,8 @@ impl Servers<Arc<QuicListeners>> {
     ) -> Result<&mut Self, ServerError> {
         let server_name = server_name.into();
         self.listener
-            .add_server(&server_name, cert_chain, private_key, bind_uris, ocsp)?;
+            .add_server(&server_name, cert_chain, private_key, bind_uris, ocsp)
+            .await?;
         Ok(self.serve(server_name, router))
     }
 }

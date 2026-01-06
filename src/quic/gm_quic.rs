@@ -364,16 +364,18 @@ mod tests {
                 .unwrap();
             tracing::info!("Health done");
         }
-        servers.add_server(
-            "localhost",
-            SERVER_CERT.to_certificate(),
-            SERVER_KEY.to_private_key(),
-            None,
-            [BindUri::from("inet://[::1]:0").alloc_port()],
-            Router::new()
-                .post("/echo", echo_service)
-                .get("/health", health_service),
-        )?;
+        servers
+            .add_server(
+                "localhost",
+                SERVER_CERT.to_certificate(),
+                SERVER_KEY.to_private_key(),
+                None,
+                [BindUri::from("inet://[::1]:0").alloc_port()],
+                Router::new()
+                    .post("/echo", echo_service)
+                    .get("/health", health_service),
+            )
+            .await?;
 
         let listen_addr: SocketAddr = servers
             .quic_listener()

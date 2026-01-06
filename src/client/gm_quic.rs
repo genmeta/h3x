@@ -172,8 +172,8 @@ impl GmQuicClientBuilder {
         self
     }
 
-    pub fn bind(mut self, uri: impl IntoIterator<Item = impl Into<BindUri>>) -> Self {
-        self.builder = self.builder.bind(uri);
+    pub async fn bind(mut self, uri: impl IntoIterator<Item = impl Into<BindUri>>) -> Self {
+        self.builder = self.builder.bind(uri).await;
         self
     }
 

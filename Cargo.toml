@@ -26,7 +26,7 @@ tracing = "0.1"
 matchit = "0.9"
 x509-parser = "0.18"
 
-gm-quic = { version = "0.4.0", optional = true }
+gm-quic = { path = "../gm-quic-traversal/gm-quic", optional = true }
 
 [features]
 default = ['gm-quic']
@@ -40,3 +40,4 @@ rustls = { version = "0.23", default-features = false, features = [
 snafu = "0.8"
 tokio = { version = "1", features = ["macros", "test-util", "io-util"] }
 tracing-subscriber = "0.3"
+
