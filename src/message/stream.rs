@@ -1036,18 +1036,26 @@ mod tower {
     }
 
     fn header_map_to_field_lines(headers: http::HeaderMap) -> impl Iterator<Item = FieldLine> {
-        headers.into_iter().scan(
-            const { HeaderName::from_static("") },
-            |last_name, (name, value)| {
-                if let Some(name) = name {
-                    *last_name = name.clone();
-                }
-                Some(FieldLine {
-                    name: Bytes::from_owner(last_name.clone()),
+        headers
+            .into_iter()
+            .scan(None::<HeaderName>, |last_name, (name, value)| {
+                let name = match name {
+                    Some(name) => {
+                        *last_name = Some(name.clone());
+                        name
+                    }
+                    None => match last_name.clone() {
+                        Some(name) => name,
+                        None => return Some(None),
+                    },
+                };
+
+                Some(Some(FieldLine {
+                    name: Bytes::from_owner(name),
                     value: Bytes::from_owner(value),
-                })
-            },
-        )
+                }))
+            })
+            .flatten()
     }
 
     fn hyper_request_parts_to_field_lines(
