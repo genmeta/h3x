@@ -25,6 +25,12 @@ mod gm_quic;
 #[cfg(feature = "gm-quic")]
 pub use gm_quic::{BuildListenersError, GmQuicServersBuilder, GmQuicServersTlsBuilder};
 
+#[cfg(feature = "tower")]
+mod tower;
+
+#[cfg(feature = "tower")]
+pub use tower::{TowerError, TowerService};
+
 #[derive(Debug, Clone)]
 pub struct Servers<L: quic::Listen> {
     pool: Pool<L::Connection>,
@@ -165,7 +171,7 @@ impl<L: quic::Listen> Servers<L> {
                     );
                     let handle_request = async move {
                         tracing::debug!("Resolving incoming request");
-                        let (mut req, mut rsp) = match unresolved_request.resolve().await {
+                        let (req, mut rsp) = match unresolved_request.resolve().await {
                             Ok(pair) => pair,
                             Err(error) => {
                                 tracing::debug!(
@@ -181,8 +187,8 @@ impl<L: quic::Listen> Servers<L> {
                             .record("uri", req.uri().to_string());
                         tracing::debug!("Resolved new request");
                         match service.downcast_ref::<Router>() {
-                            Some(router) => router.serve(&mut req, &mut rsp).await,
-                            None => service.serve(&mut req, &mut rsp).await,
+                            Some(router) => router.serve(req, &mut rsp).await,
+                            None => service.serve(req, &mut rsp).await,
                         }
                         // Drop response in place to avoid spawning another tokio task
                         // FIXME: remove this when async drop is stablized (https://github.com/rust-lang/rust/issues/126482)

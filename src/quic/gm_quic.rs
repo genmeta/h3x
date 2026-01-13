@@ -317,13 +317,13 @@ mod tests {
         handy::{ToCertificate, ToPrivateKey},
     };
     use http::StatusCode;
+    use serial_test::serial;
     use tracing::Instrument;
 
     use crate::{
         client::Client,
         server::{self, Router, Servers},
     };
-
     const CA_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/ca.cert");
     const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");
     const SERVER_KEY: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
@@ -337,13 +337,14 @@ mod tests {
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
     #[tokio::test]
+    #[serial]
     async fn simpl_server() -> Result<(), BoxError> {
         init_tracing();
 
         let mut servers = Servers::builder().without_client_cert_verifier()?.build();
 
         #[tracing::instrument(skip_all)]
-        async fn echo_service(req: &mut server::Request, resp: &mut server::Response) {
+        async fn echo_service(mut req: server::Request, resp: &mut server::Response) {
             tracing::info!("Echo service called");
             resp.set_status(StatusCode::OK);
             while let Some(body_part) = req.read().await.transpose().unwrap() {
@@ -355,7 +356,7 @@ mod tests {
         }
 
         #[tracing::instrument(skip_all)]
-        async fn health_service(_req: &mut server::Request, resp: &mut server::Response) {
+        async fn health_service(_req: server::Request, resp: &mut server::Response) {
             tracing::info!("Health service called");
             resp.set_status(StatusCode::OK)
                 .set_body(b"Hello, World!".as_slice())

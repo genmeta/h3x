@@ -10,7 +10,7 @@ use crate::server::{
 };
 
 #[tracing::instrument(skip_all)]
-pub async fn default_fallback(_request: &mut Request, response: &mut Response) {
+pub async fn default_fallback(_request: Request, response: &mut Response) {
     _ = response.set_status(StatusCode::NOT_FOUND)
 }
 
@@ -30,11 +30,7 @@ impl Fallback {
         self.0.read().unwrap().clone()
     }
 
-    pub fn serve<'s>(
-        &self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> BoxServiceFuture<'s> {
+    pub fn serve<'s>(&self, request: Request, response: &'s mut Response) -> BoxServiceFuture<'s> {
         self.get().serve_owned(request, response)
     }
 }
@@ -42,11 +38,7 @@ impl Fallback {
 impl Service for Fallback {
     type Future<'s> = BoxServiceFuture<'s>;
 
-    fn serve<'s>(
-        &'s mut self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> Self::Future<'s> {
+    fn serve<'s>(&'s mut self, request: Request, response: &'s mut Response) -> Self::Future<'s> {
         Fallback::serve(self, request, response)
     }
 }
@@ -96,11 +88,7 @@ impl RouterInner {
         }
     }
 
-    fn serve<'s>(
-        &self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> BoxServiceFuture<'s> {
+    fn serve<'s>(&self, request: Request, response: &'s mut Response) -> BoxServiceFuture<'s> {
         let Some(path_and_query) = request.path() else {
             return self.fallback.serve(request, response);
         };
@@ -174,11 +162,7 @@ impl Router {
         self.on(Method::PATCH, path, service)
     }
 
-    pub fn serve<'s>(
-        &self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> BoxServiceFuture<'s> {
+    pub fn serve<'s>(&self, request: Request, response: &'s mut Response) -> BoxServiceFuture<'s> {
         self.inner_ref().serve(request, response)
     }
 }
@@ -186,11 +170,7 @@ impl Router {
 impl Service for Router {
     type Future<'s> = BoxServiceFuture<'s>;
 
-    fn serve<'s>(
-        &mut self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> Self::Future<'s> {
+    fn serve<'s>(&mut self, request: Request, response: &'s mut Response) -> Self::Future<'s> {
         Router::serve(self, request, response)
     }
 }
@@ -291,7 +271,7 @@ where
 
     fn serve<'s>(
         &'s mut self,
-        request: &'s mut super::Request,
+        request: super::Request,
         response: &'s mut super::Response,
     ) -> Self::Future<'s> {
         let method = request.method();

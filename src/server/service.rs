@@ -9,27 +9,23 @@ pub trait Service {
     where
         Self: 's;
 
-    fn serve<'s>(
-        &'s mut self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> Self::Future<'s>;
+    fn serve<'s>(&'s mut self, request: Request, response: &'s mut Response) -> Self::Future<'s>;
 }
 
 /// A helper trait to allow using async closures as services.
 pub trait ServiceFn<'s> {
     type Future: Future<Output = ()> + 's;
 
-    fn call(&mut self, req: &'s mut Request, res: &'s mut Response) -> Self::Future;
+    fn call(&mut self, req: Request, res: &'s mut Response) -> Self::Future;
 }
 
 impl<'s, F, Fut> ServiceFn<'s> for F
 where
-    F: FnMut(&'s mut Request, &'s mut Response) -> Fut,
+    F: FnMut(Request, &'s mut Response) -> Fut,
     Fut: Future<Output = ()> + Send + 's,
 {
     type Future = Fut;
-    fn call(&mut self, req: &'s mut Request, res: &'s mut Response) -> Self::Future {
+    fn call(&mut self, req: Request, res: &'s mut Response) -> Self::Future {
         (self)(req, res)
     }
 }
@@ -43,45 +39,25 @@ where
     where
         Self: 's;
 
-    fn serve<'s>(
-        &'s mut self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> Self::Future<'s> {
+    fn serve<'s>(&'s mut self, request: Request, response: &'s mut Response) -> Self::Future<'s> {
         self.call(request, response)
     }
 }
 
 trait CloneableService: Any {
-    fn serve<'s>(
-        &'s mut self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> BoxFuture<'s, ()>;
+    fn serve<'s>(&'s mut self, request: Request, response: &'s mut Response) -> BoxFuture<'s, ()>;
 
-    fn serve_owned<'s>(
-        &self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> BoxFuture<'s, ()>;
+    fn serve_owned<'s>(&self, request: Request, response: &'s mut Response) -> BoxFuture<'s, ()>;
 
     fn clone_box(&self) -> Box<dyn CloneableService + Send + Sync>;
 }
 
 impl<H: for<'s> Service<Future<'s>: Send> + Any + Clone + Send + Sync> CloneableService for H {
-    fn serve<'s>(
-        &'s mut self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> BoxFuture<'s, ()> {
+    fn serve<'s>(&'s mut self, request: Request, response: &'s mut Response) -> BoxFuture<'s, ()> {
         Box::pin(self.serve(request, response))
     }
 
-    fn serve_owned<'s>(
-        &self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> BoxFuture<'s, ()> {
+    fn serve_owned<'s>(&self, request: Request, response: &'s mut Response) -> BoxFuture<'s, ()> {
         let mut service = self.clone();
         Box::pin(async move { service.serve(request, response).await })
     }
@@ -133,7 +109,7 @@ impl BoxService {
 
     pub fn serve_owned<'s>(
         &self,
-        request: &'s mut Request,
+        request: Request,
         response: &'s mut Response,
     ) -> BoxServiceFuture<'s> {
         self.0.serve_owned(request, response)
@@ -143,11 +119,7 @@ impl BoxService {
 impl Service for BoxService {
     type Future<'s> = BoxServiceFuture<'s>;
 
-    fn serve<'s>(
-        &'s mut self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> Self::Future<'s> {
+    fn serve<'s>(&'s mut self, request: Request, response: &'s mut Response) -> Self::Future<'s> {
         self.0.serve(request, response)
     }
 }
