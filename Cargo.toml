@@ -20,17 +20,24 @@ pin-project-lite = "0.2"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["logging"] }
 snafu = "0.8"
+thiserror = "1.0"
 tokio = "1"
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tracing = "0.1"
 matchit = "0.9"
 x509-parser = "0.18"
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
 
-gm-quic = { path = "../gm-quic-traversal/gm-quic", optional = true }
+gm-quic = { git = "https://github.com/genmeta/gm-quic.git", branch = "main", optional = true }
+axum = { version = "0.7", optional = true }
+tower = { version = "0.5", optional = true }
+http-body-util = { version = "0.1", optional = true }
 
 [features]
-default = ['gm-quic']
+default = ['gm-quic', 'axum']
 gm-quic = ['dep:gm-quic']
+axum = ['dep:axum', 'dep:tower', 'dep:http-body-util']
 
 [dev-dependencies]
 rustls = { version = "0.23", default-features = false, features = [
@@ -40,4 +47,7 @@ rustls = { version = "0.23", default-features = false, features = [
 snafu = "0.8"
 tokio = { version = "1", features = ["macros", "test-util", "io-util"] }
 tracing-subscriber = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serial_test = "3"
 

@@ -788,6 +788,14 @@ impl WriteStream {
                 if !message.trailers().is_empty() {
                     self.send_trailer(message).await?;
                     debug_assert_eq!(message.stage, MessageStage::Complete)
+                } else if message.is_chunked() {
+                    // Note: 修复死锁？
+                    // 当使用 with_body() 设置 chunked body 且没有 trailers 时，
+                    // 必须关闭流发送 FIN，否则服务端可能会永远等待 body 结束，
+                    // 而客户端在等待响应头，造成死锁。
+                    self.try_io(async move |this| Ok(this.stream.close().await?))
+                        .await?;
+                    message.stage = MessageStage::Complete;
                 }
             }
             MessageStage::Trailer => {

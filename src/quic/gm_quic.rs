@@ -317,13 +317,13 @@ mod tests {
         handy::{ToCertificate, ToPrivateKey},
     };
     use http::StatusCode;
+    use serial_test::serial;
     use tracing::Instrument;
 
     use crate::{
         client::Client,
         server::{self, Router, Servers},
     };
-
     const CA_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/ca.cert");
     const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");
     const SERVER_KEY: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
@@ -337,6 +337,7 @@ mod tests {
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
     #[tokio::test]
+    #[serial]
     async fn simpl_server() -> Result<(), BoxError> {
         init_tracing();
 
