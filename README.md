@@ -62,7 +62,8 @@ async fn server_example() -> Result<(), Box<dyn std::error::Error>> {
         None,
         [BindUri::from("inet://[::1]:4433")],
         h3x::server::Router::new().get("/hello_world", hello_world),
-    )?
+    )
+    .await?
     .run()
     .await;
 

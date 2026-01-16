@@ -25,6 +25,12 @@ mod gm_quic;
 #[cfg(feature = "gm-quic")]
 pub use gm_quic::{BuildListenersError, GmQuicServersBuilder, GmQuicServersTlsBuilder};
 
+#[cfg(feature = "axum")]
+mod axum;
+
+#[cfg(feature = "axum")]
+pub use axum::AxumService;
+
 #[derive(Debug, Clone)]
 pub struct Servers<L: quic::Listen> {
     pool: Pool<L::Connection>,

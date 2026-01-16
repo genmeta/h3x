@@ -220,6 +220,10 @@ impl Response {
         self
     }
 
+    pub async fn init_streaming(&mut self) -> Result<&mut Self, StreamError> {
+        self.write(Bytes::new()).await
+    }
+
     pub async fn write(&mut self, content: impl Buf) -> Result<&mut Self, StreamError> {
         self.check_message_operation("write_streaming_body", |this| {
             if this.message.is_interim_response() {
