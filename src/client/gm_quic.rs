@@ -3,12 +3,12 @@ use std::{sync::LazyLock, time::Duration};
 use ::gm_quic::{
     builder::QuicClientBuilder,
     prelude::{
-        BindUri, Connection, ProductStreamsConcurrencyController, QuicClient,
+        BindUri, Connection, ProductStreamsConcurrencyController, QuicClient, Resolve,
         handy::{ToCertificate, ToPrivateKey},
     },
     qbase::{param::ClientParameters, token::TokenSink},
-    qevent::telemetry::Log,
-    qinterface::factory::ProductQuicIO,
+    qevent::telemetry::QLog,
+    qinterface::io::ProductIO,
 };
 use rustls::{
     ClientConfig, RootCertStore,
@@ -59,6 +59,7 @@ pub struct GmQuicClientTlsBuilder {
     server_cert_verifier: ServerCertVerifier,
     client_identity: Option<(String, Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
     crypto_provider: Option<Arc<CryptoProvider>>,
+    resolver: Option<Arc<dyn Resolve + Send + Sync>>,
 }
 
 impl Client<QuicClient> {
@@ -67,6 +68,7 @@ impl Client<QuicClient> {
             server_cert_verifier: ServerCertVerifier::default(),
             client_identity: None,
             crypto_provider: None,
+            resolver: None,
         }
     }
 }
@@ -89,6 +91,11 @@ impl GmQuicClientTlsBuilder {
 
     pub fn without_server_cert_verification(mut self) -> Self {
         self.server_cert_verifier = ServerCertVerifier::None;
+        self
+    }
+
+    pub fn with_resolver(mut self, resolver: Arc<dyn Resolve + Send + Sync>) -> Self {
+        self.resolver = Some(resolver);
         self
     }
 
@@ -150,8 +157,13 @@ impl TryFrom<GmQuicClientTlsBuilder> for GmQuicClientBuilder {
             None => (tls_config_buider.with_no_client_auth(), None),
         };
 
+        let mut quic_builder = QuicClient::builder_with_tls(tls_config).with_alpns(vec!["h3"]);
+        if let Some(resolver) = builder.resolver {
+            quic_builder = quic_builder.with_resolver(resolver);
+        }
+
         Ok(GmQuicClientBuilder {
-            builder: QuicClient::builder_with_tls(tls_config).with_alpns(vec!["h3"]),
+            builder: quic_builder,
             client_name,
             pool: Pool::global().clone(),
             settings: Arc::default(),
@@ -167,7 +179,7 @@ pub struct GmQuicClientBuilder {
 }
 
 impl GmQuicClientBuilder {
-    pub fn with_iface_factory(mut self, factory: impl ProductQuicIO + 'static) -> Self {
+    pub fn with_iface_factory(mut self, factory: Arc<dyn ProductIO + 'static>) -> Self {
         self.builder = self.builder.with_iface_factory(factory);
         self
     }
@@ -189,7 +201,7 @@ impl GmQuicClientBuilder {
 
     pub fn with_streams_concurrency_strategy(
         mut self,
-        strategy_factory: impl ProductStreamsConcurrencyController + 'static,
+        strategy_factory: Arc<dyn ProductStreamsConcurrencyController>,
     ) -> Self {
         self.builder = self
             .builder
@@ -197,8 +209,13 @@ impl GmQuicClientBuilder {
         self
     }
 
-    pub fn with_qlog(mut self, logger: Arc<dyn Log + Send + Sync>) -> Self {
+    pub fn with_qlog(mut self, logger: Arc<dyn QLog + Send + Sync>) -> Self {
         self.builder = self.builder.with_qlog(logger);
+        self
+    }
+
+    pub fn with_resolver(mut self, resolver: Arc<dyn Resolve + Send + Sync>) -> Self {
+        self.builder = self.builder.with_resolver(resolver);
         self
     }
 

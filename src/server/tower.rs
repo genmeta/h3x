@@ -284,12 +284,12 @@ mod tests {
                 BindUri,
                 handy::{ToCertificate, ToPrivateKey},
             },
-            qtraversal::nat::StunIO,
+            qtraversal::nat::iface::StunIO,
         };
 
         let mut servers = crate::server::Servers::builder()
             .without_client_cert_verifier()?
-            .build();
+            .build()?;
 
         servers
             .add_server(
@@ -312,7 +312,6 @@ mod tests {
             .unwrap()
             .1
             .borrow()
-            .unwrap()
             .local_addr()
             .unwrap();
 

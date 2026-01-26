@@ -10,12 +10,13 @@ keywords = ["async", "quic", "http3"]
 categories = ["network-programming", "asynchronous"]
 
 [dependencies]
+async-trait = "0.1"
 bon = "3"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 futures = "0.3"
-gm-quic = { git = "https://github.com/genmeta/gm-quic.git", branch = "main", optional = true }
+gm-quic = { path = "../gm-quic-traversal/gm-quic", optional = true }
 http = "1"
 http-body = { version = "1.0.1", optional = true }
 http-body-util = { version = "0.1", optional = true }

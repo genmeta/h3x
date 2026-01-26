@@ -23,7 +23,7 @@ pub use service::{BoxService, BoxServiceFuture, IntoBoxService, Service, box_ser
 mod gm_quic;
 
 #[cfg(feature = "gm-quic")]
-pub use gm_quic::{BuildListenersError, GmQuicServersBuilder, GmQuicServersTlsBuilder};
+pub use gm_quic::{GmQuicServersBuilder, GmQuicServersTlsBuilder};
 
 #[cfg(feature = "tower")]
 mod tower;

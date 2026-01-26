@@ -57,12 +57,7 @@ impl<C: quic::Connect> Client<C> {
         &self,
         server: Authority,
     ) -> Result<Arc<Connection<C::Connection>>, pool::ConnectError<C::Error>> {
-        let host_port = server
-            .as_str()
-            .rsplit_once('@')
-            .map(|(_username_password, host_port)| host_port)
-            .unwrap_or(server.as_str());
-        let connect = async || self.client.connect(host_port).await;
+        let connect = async || self.client.connect(&server).await;
         self.pool
             .reuse_or_connect_with(server.clone(), self.settings.clone(), connect)
             .await
