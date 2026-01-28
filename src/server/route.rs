@@ -25,29 +25,13 @@ impl Fallback {
     pub fn set(&mut self, service: BoxService) {
         *self.0.write().unwrap() = service;
     }
-
-    fn get(&self) -> BoxService {
-        self.0.read().unwrap().clone()
-    }
-
-    pub fn serve<'s>(
-        &self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> BoxServiceFuture<'s> {
-        self.get().serve_owned(request, response)
-    }
 }
 
 impl Service for Fallback {
     type Future<'s> = BoxServiceFuture<'s>;
 
-    fn serve<'s>(
-        &'s mut self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> Self::Future<'s> {
-        Fallback::serve(self, request, response)
+    fn serve<'s>(&self, request: &'s mut Request, response: &'s mut Response) -> Self::Future<'s> {
+        self.0.read().unwrap().serve(request, response)
     }
 }
 
@@ -108,7 +92,7 @@ impl RouterInner {
             return self.fallback.serve(request, response);
         };
 
-        endpoint.value.serve_owned(request, response)
+        endpoint.value.serve(request, response)
     }
 }
 
@@ -186,11 +170,7 @@ impl Router {
 impl Service for Router {
     type Future<'s> = BoxServiceFuture<'s>;
 
-    fn serve<'s>(
-        &mut self,
-        request: &'s mut Request,
-        response: &'s mut Response,
-    ) -> Self::Future<'s> {
+    fn serve<'s>(&self, request: &'s mut Request, response: &'s mut Response) -> Self::Future<'s> {
         Router::serve(self, request, response)
     }
 }
@@ -282,34 +262,29 @@ impl<S> MethodRouter<S> {
 
 impl<S> Service for MethodRouter<S>
 where
-    S: for<'s> Service<Future<'s>: Send>,
+    S: Clone + for<'s> Service<Future<'s>: Send> + Send + 'static,
 {
-    type Future<'s>
-        = BoxServiceFuture<'s>
-    where
-        Self: 's;
+    type Future<'s> = BoxServiceFuture<'s>;
 
     fn serve<'s>(
-        &'s mut self,
+        &self,
         request: &'s mut super::Request,
         response: &'s mut super::Response,
     ) -> Self::Future<'s> {
         let method = request.method();
-        let service: &'s mut S = match method {
-            Method::OPTIONS => self.options.as_mut().unwrap_or(&mut self.fallback),
-            Method::GET => self.get.as_mut().unwrap_or(&mut self.fallback),
-            Method::POST => self.post.as_mut().unwrap_or(&mut self.fallback),
-            Method::PUT => self.put.as_mut().unwrap_or(&mut self.fallback),
-            Method::DELETE => self.delete.as_mut().unwrap_or(&mut self.fallback),
-            Method::HEAD => self.head.as_mut().unwrap_or(&mut self.fallback),
-            Method::TRACE => self.trace.as_mut().unwrap_or(&mut self.fallback),
-            Method::CONNECT => self.connect.as_mut().unwrap_or(&mut self.fallback),
-            Method::PATCH => self.patch.as_mut().unwrap_or(&mut self.fallback),
-            _ => self
-                .extensions
-                .get_mut(&method)
-                .unwrap_or(&mut self.fallback),
-        };
-        Box::pin(service.serve(request, response))
+        let service = match method {
+            Method::OPTIONS => self.options.as_ref().unwrap_or(&self.fallback),
+            Method::GET => self.get.as_ref().unwrap_or(&self.fallback),
+            Method::POST => self.post.as_ref().unwrap_or(&self.fallback),
+            Method::PUT => self.put.as_ref().unwrap_or(&self.fallback),
+            Method::DELETE => self.delete.as_ref().unwrap_or(&self.fallback),
+            Method::HEAD => self.head.as_ref().unwrap_or(&self.fallback),
+            Method::TRACE => self.trace.as_ref().unwrap_or(&self.fallback),
+            Method::CONNECT => self.connect.as_ref().unwrap_or(&self.fallback),
+            Method::PATCH => self.patch.as_ref().unwrap_or(&self.fallback),
+            _ => self.extensions.get(&method).unwrap_or(&self.fallback),
+        }
+        .clone();
+        Box::pin(async move { service.serve(request, response).await })
     }
 }
