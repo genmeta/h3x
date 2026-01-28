@@ -150,7 +150,7 @@ impl<L: quic::Listen> Servers<L> {
                         }
                     };
 
-                    let mut service = service.clone();
+                    let service = service.clone();
                     let unresolved_request = UnresolvedRequest::new(
                         read_stream,
                         write_stream,
