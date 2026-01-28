@@ -25,6 +25,8 @@ pin_project_lite::pin_project! {
     }
 }
 
+pub type ReadableFrame<'s, S> = Frame<&'s mut FixedLengthReader<StreamReader<S>>>;
+
 impl<S: ?Sized> FrameStream<S>
 where
     S: TryStream<Ok = Bytes, Error = quic::StreamError>,
@@ -44,9 +46,7 @@ where
         self.stream.stream_mut()
     }
 
-    pub fn frame<'s: 'f, 'f>(
-        &'s mut self,
-    ) -> Option<Result<Frame<&'f mut FixedLengthReader<StreamReader<S>>>, StreamError>> {
+    pub fn frame<'s: 'f, 'f>(&'s mut self) -> Option<Result<ReadableFrame<'s, S>, StreamError>> {
         match self.frame.as_ref()? {
             Ok(frame) => Some(Ok(Frame {
                 r#type: frame.r#type,
@@ -117,9 +117,7 @@ where
         }
     }
 
-    pub async fn next_frame(
-        &mut self,
-    ) -> Option<Result<Frame<&mut FixedLengthReader<StreamReader<S>>>, StreamError>>
+    pub async fn next_frame(&mut self) -> Option<Result<ReadableFrame<'_, S>, StreamError>>
     where
         S: Unpin,
     {
@@ -141,7 +139,7 @@ where
 
     pub async fn next_unreserved_frame(
         &mut self,
-    ) -> Option<Result<Frame<&mut FixedLengthReader<StreamReader<S>>>, StreamError>>
+    ) -> Option<Result<ReadableFrame<'_, S>, StreamError>>
     where
         S: Unpin,
     {

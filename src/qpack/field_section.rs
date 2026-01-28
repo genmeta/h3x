@@ -434,6 +434,13 @@ pub enum PseudoHeaders {
 }
 
 impl PseudoHeaders {
+    pub const METHOD: &str = ":method";
+    pub const SCHEME: &str = ":scheme";
+    pub const AUTHORITY: &str = ":authority";
+    pub const PATH: &str = ":path";
+    pub const STATUS: &str = ":status";
+    pub const PROTOOCL: &str = ":protocol";
+
     pub fn request(method: Method, uri: Uri) -> Self {
         let uri = uri.into_parts();
         let path = match uri.path_and_query {
@@ -835,8 +842,8 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
         let mut pseudo_headers = None;
         let mut header_map = HeaderMap::new();
         while let Some(FieldLine { name, value }) = stream.try_next().await? {
-            match name.as_ref() {
-                b":method" => {
+            match name {
+                name if name == PseudoHeaders::METHOD => {
                     let mut pseudo = pseudo_headers
                         .take()
                         .unwrap_or(PseudoHeaders::unresolved_request());
@@ -856,7 +863,7 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                         Some(Method::from_bytes(&value[..]).map_err(MalformedHeaderSection::from)?);
                     pseudo_headers = Some(pseudo)
                 }
-                b":scheme" => {
+                name if name == PseudoHeaders::SCHEME => {
                     let mut pseudo = pseudo_headers
                         .take()
                         .unwrap_or(PseudoHeaders::unresolved_request());
@@ -876,7 +883,7 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                         Some(Scheme::try_from(&value[..]).map_err(MalformedHeaderSection::from)?);
                     pseudo_headers = Some(pseudo)
                 }
-                b":authority" => {
+                name if name == PseudoHeaders::AUTHORITY => {
                     let mut pseudo = pseudo_headers
                         .take()
                         .unwrap_or(PseudoHeaders::unresolved_request());
@@ -898,7 +905,7 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                     );
                     pseudo_headers = Some(pseudo)
                 }
-                b":path" => {
+                name if name == PseudoHeaders::PATH => {
                     let mut pseudo = pseudo_headers
                         .take()
                         .unwrap_or(PseudoHeaders::unresolved_request());
@@ -921,7 +928,7 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                     );
                     pseudo_headers = Some(pseudo)
                 }
-                b":status" => {
+                name if name == PseudoHeaders::STATUS => {
                     let mut pseudo = pseudo_headers
                         .take()
                         .unwrap_or(PseudoHeaders::unresolved_response());
@@ -944,13 +951,14 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for 
                     pseudo_headers = Some(pseudo)
                 }
 
-                invalid_pseudo if invalid_pseudo.starts_with(b":") => {
+                name if name.starts_with(b":") => {
                     return Err(MalformedHeaderSection::InvalidPseudoHeader { name }.into());
                 }
                 name => {
                     header_map
                         .try_append(
-                            HeaderName::from_bytes(name).map_err(MalformedHeaderSection::from)?,
+                            HeaderName::from_bytes(name.as_ref())
+                                .map_err(MalformedHeaderSection::from)?,
                             HeaderValue::from_maybe_shared(value)
                                 .map_err(MalformedHeaderSection::from)?,
                         )

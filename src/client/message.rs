@@ -205,8 +205,8 @@ where
             let mut response = Message::unresolved_response();
 
             match tokio::try_join!(
-                write_stream.send(&mut self.request),
-                read_stream.read_header(&mut response)
+                write_stream.send_message(&mut self.request),
+                read_stream.read_message_header(&mut response)
             ) {
                 Ok(..) => {
                     let request = Request {
@@ -354,14 +354,14 @@ impl Request {
             Ok(())
         });
         self.stream
-            .send_streaming_body(&mut self.message, content)
+            .send_message_streaming_body(&mut self.message, content)
             .await?;
         Ok(self)
     }
 
     pub async fn flush(&mut self) -> Result<&mut Self, StreamError> {
         // header is checked in pending request
-        self.stream.flush(&mut self.message).await?;
+        self.stream.flush_message(&mut self.message).await?;
         Ok(self)
     }
 
@@ -401,7 +401,7 @@ impl Request {
     }
 
     pub async fn close(&mut self) -> Result<(), StreamError> {
-        self.stream.close(&mut self.message).await
+        self.stream.close_message(&mut self.message).await
     }
 
     pub async fn cancel(&mut self, code: Code) -> Result<(), StreamError> {
@@ -434,7 +434,7 @@ impl Request {
         //     }
         // }
 
-        Some(async move { _ = stream.close(&mut message).await })
+        Some(async move { _ = stream.close_message(&mut message).await })
     }
 }
 
@@ -454,7 +454,7 @@ pub struct Response {
 
 impl Response {
     pub async fn next_response(&mut self) -> Result<&mut Self, StreamError> {
-        self.stream.read_header(&mut self.message).await?;
+        self.stream.read_message_header(&mut self.message).await?;
         Ok(self)
     }
 
@@ -471,19 +471,23 @@ impl Response {
     }
 
     pub async fn read(&mut self) -> Option<Result<Bytes, StreamError>> {
-        self.stream.read(&mut self.message).await
+        self.stream.read_message(&mut self.message).await
     }
 
     pub async fn read_all(&mut self) -> Result<impl Buf, StreamError> {
-        self.stream.read_all(&mut self.message).await
+        self.stream.read_message_full_body(&mut self.message).await
     }
 
     pub async fn read_to_bytes(&mut self) -> Result<Bytes, StreamError> {
-        self.stream.read_to_bytes(&mut self.message).await
+        self.stream
+            .read_message_body_to_bytes(&mut self.message)
+            .await
     }
 
     pub async fn read_to_string(&mut self) -> Result<String, ReadToStringError> {
-        self.stream.read_to_string(&mut self.message).await
+        self.stream
+            .read_message_body_to_string(&mut self.message)
+            .await
     }
 
     pub async fn as_stream(&mut self) -> impl Stream<Item = Result<Bytes, StreamError>> {
@@ -499,7 +503,7 @@ impl Response {
     }
 
     pub async fn trailers(&mut self) -> Result<&HeaderMap, StreamError> {
-        self.stream.read_trailer(&mut self.message).await
+        self.stream.read_message_trailer(&mut self.message).await
     }
 
     pub fn agent(&self) -> &RemoteAgent {
