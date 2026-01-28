@@ -46,7 +46,10 @@ impl UnresolvedRequest {
             stream: self.request_stream,
             agent: self.remote_agent,
         };
-        request.stream.read_header(&mut request.message).await?;
+        request
+            .stream
+            .read_message_header(&mut request.message)
+            .await?;
         let response = Response {
             message: Message::unresolved_response(),
             stream: self.response_stream,
@@ -102,19 +105,23 @@ impl Request {
     }
 
     pub async fn read(&mut self) -> Option<Result<Bytes, StreamError>> {
-        self.stream.read(&mut self.message).await
+        self.stream.read_message(&mut self.message).await
     }
 
     pub async fn read_all(&mut self) -> Result<impl Buf, StreamError> {
-        self.stream.read_all(&mut self.message).await
+        self.stream.read_message_full_body(&mut self.message).await
     }
 
     pub async fn read_to_bytes(&mut self) -> Result<Bytes, StreamError> {
-        self.stream.read_to_bytes(&mut self.message).await
+        self.stream
+            .read_message_body_to_bytes(&mut self.message)
+            .await
     }
 
     pub async fn read_to_string(&mut self) -> Result<String, ReadToStringError> {
-        self.stream.read_to_string(&mut self.message).await
+        self.stream
+            .read_message_body_to_string(&mut self.message)
+            .await
     }
 
     pub fn as_stream(&mut self) -> impl Stream<Item = Result<Bytes, StreamError>> {
@@ -130,7 +137,7 @@ impl Request {
     }
 
     pub async fn trailers(&mut self) -> Result<&HeaderMap, StreamError> {
-        self.stream.read_trailer(&mut self.message).await
+        self.stream.read_message_trailer(&mut self.message).await
     }
 
     pub fn agent(&self) -> Option<&RemoteAgent> {
@@ -229,7 +236,7 @@ impl Response {
             Ok(())
         });
         self.stream
-            .send_streaming_body(&mut self.message, content)
+            .send_message_streaming_body(&mut self.message, content)
             .await?;
         Ok(self)
     }
@@ -241,7 +248,7 @@ impl Response {
             }
             Ok(())
         });
-        self.stream.flush(&mut self.message).await?;
+        self.stream.flush_message(&mut self.message).await?;
         Ok(self)
     }
 
@@ -291,7 +298,7 @@ impl Response {
             }
             Ok(())
         });
-        self.stream.close(&mut self.message).await
+        self.stream.close_message(&mut self.message).await
     }
 
     pub async fn cancel(&mut self, code: Code) -> Result<(), StreamError> {
@@ -329,7 +336,7 @@ impl Response {
         }
 
         Some(async move {
-            _ = stream.close(&mut message).await;
+            _ = stream.close_message(&mut message).await;
         })
     }
 }
