@@ -426,7 +426,7 @@ mod tests {
 
         let client_echo = async {
             let port = listen_addr.port();
-            let content = include_bytes!("./gm_quic.rs").as_slice();
+            let content = include_bytes!("./quic.rs").as_slice();
             let (.., mut resp) = client
                 .new_request()
                 .with_body(content)

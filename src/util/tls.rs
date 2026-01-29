@@ -57,7 +57,7 @@ impl rustls::client::danger::ServerCertVerifier for DangerousServerCertVerifier 
 #[snafu(module)]
 pub enum InvalidIdentity {
     #[snafu(transparent)]
-    TLS { source: rustls::Error },
+    Tls { source: rustls::Error },
     #[snafu(display("certificate for identity cannot be parsed"))]
     InvalidCertificated {
         source: x509_parser::nom::Err<x509_parser::error::X509Error>,

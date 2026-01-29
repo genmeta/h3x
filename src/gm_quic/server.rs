@@ -1,10 +1,10 @@
-use std::time::Duration;
+use std::{error::Error, sync::Arc, time::Duration};
 
 use ::gm_quic::{
     builder::QuicListenersBuilder,
     prelude::{
-        AuthClient, BindUri, Connection, ProductStreamsConcurrencyController, QuicListeners,
-        ServerError, handy,
+        AuthClient, BindUri, Connection, ListenError, ProductStreamsConcurrencyController,
+        QuicListeners, ServerError, handy,
     },
     qbase::{param::ServerParameters, token::TokenProvider},
     qevent::telemetry::QLog,
@@ -12,23 +12,29 @@ use ::gm_quic::{
 };
 use rustls::{crypto::CryptoProvider, server::danger::ClientCertVerifier};
 
-use super::*;
+use crate::{
+    connection::settings::Settings,
+    pool::Pool,
+    server::{Servers, UnresolvedRequest},
+};
 
-pub struct GmQuicServersTlsBuilder {
+pub struct H3ServersTlsBuilder {
     crypto_provider: Option<Arc<CryptoProvider>>,
     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
 }
 
-impl Servers<QuicListeners, ()> {
-    pub fn builder() -> GmQuicServersTlsBuilder {
-        GmQuicServersTlsBuilder {
+pub type H3Servers<S> = Servers<Arc<QuicListeners>, S>;
+
+impl H3Servers<()> {
+    pub fn builder() -> H3ServersTlsBuilder {
+        H3ServersTlsBuilder {
             crypto_provider: None,
             client_cert_verifier: None,
         }
     }
 }
 
-impl GmQuicServersTlsBuilder {
+impl H3ServersTlsBuilder {
     pub fn with_crypto_provider(mut self, crypto_provider: impl Into<Arc<CryptoProvider>>) -> Self {
         self.crypto_provider = Some(crypto_provider.into());
         self
@@ -37,21 +43,21 @@ impl GmQuicServersTlsBuilder {
     pub fn with_client_cert_verifier(
         mut self,
         client_cert_verifier: Arc<dyn ClientCertVerifier>,
-    ) -> Result<GmQuicServersBuilder, rustls::Error> {
+    ) -> Result<H3ServersBuilder, rustls::Error> {
         self.client_cert_verifier = Some(client_cert_verifier);
         self.try_into()
     }
 
-    pub fn without_client_cert_verifier(mut self) -> Result<GmQuicServersBuilder, rustls::Error> {
+    pub fn without_client_cert_verifier(mut self) -> Result<H3ServersBuilder, rustls::Error> {
         self.client_cert_verifier = None;
         self.try_into()
     }
 }
 
-impl TryFrom<GmQuicServersTlsBuilder> for GmQuicServersBuilder {
+impl TryFrom<H3ServersTlsBuilder> for H3ServersBuilder {
     type Error = rustls::Error;
 
-    fn try_from(builder: GmQuicServersTlsBuilder) -> Result<Self, Self::Error> {
+    fn try_from(builder: H3ServersTlsBuilder) -> Result<Self, Self::Error> {
         let listeners_builder = match builder.crypto_provider {
             Some(crypto_provider) => QuicListeners::builder_with_crypto_provider(crypto_provider),
             None => Ok(QuicListeners::builder()),
@@ -63,7 +69,7 @@ impl TryFrom<GmQuicServersTlsBuilder> for GmQuicServersBuilder {
             None => listeners_builder.without_client_cert_verifier(),
         }
         .with_alpns(vec!["h3"]);
-        Ok(GmQuicServersBuilder {
+        Ok(H3ServersBuilder {
             builder: listeners_builder,
             backlog: 1024,
             pool: Pool::global().clone(),
@@ -72,14 +78,14 @@ impl TryFrom<GmQuicServersTlsBuilder> for GmQuicServersBuilder {
     }
 }
 
-pub struct GmQuicServersBuilder {
+pub struct H3ServersBuilder {
     builder: QuicListenersBuilder<rustls::ServerConfig>,
     backlog: usize,
     pool: Pool<Connection>,
     settings: Arc<Settings>,
 }
 
-impl GmQuicServersBuilder {
+impl H3ServersBuilder {
     pub fn with_token_provider(mut self, token_provider: Arc<dyn TokenProvider>) -> Self {
         self.builder = self.builder.with_token_provider(token_provider);
         self
@@ -135,9 +141,7 @@ impl GmQuicServersBuilder {
         self
     }
 
-    pub fn build<S>(
-        self,
-    ) -> Result<Servers<Arc<QuicListeners>, S>, ::gm_quic::prelude::ListenError> {
+    pub fn build<S>(self) -> Result<H3Servers<S>, ListenError> {
         let listener = self.builder.listen(self.backlog)?;
         Ok(Servers::from_quic_listener()
             .listener(listener)
@@ -163,7 +167,7 @@ where
         router: S,
     ) -> Result<&mut Self, ServerError> {
         let server_name = server_name.into();
-        self.listener
+        self.quic_listener()
             .add_server(&server_name, cert_chain, private_key, bind_uris, ocsp)
             .await?;
         Ok(self.serve(server_name, router))

@@ -24,12 +24,6 @@ pub mod tower;
 #[cfg(feature = "http-body")]
 pub use tower::TowerService;
 
-#[cfg(feature = "gm-quic")]
-mod gm_quic;
-
-#[cfg(feature = "gm-quic")]
-pub use gm_quic::{GmQuicServersBuilder, GmQuicServersTlsBuilder};
-
 #[derive(Debug, Clone)]
 pub struct Servers<L: quic::Listen, S> {
     pool: Pool<L::Connection>,
@@ -210,9 +204,4 @@ where
     pub fn shutdown(&self) {
         self.listener.shutdown();
     }
-}
-
-#[cfg(feature = "gm-quic")]
-pub fn builder() -> gm_quic::GmQuicServersTlsBuilder {
-    Servers::builder()
 }
