@@ -1,12 +1,15 @@
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
+    task::{Context, Poll},
 };
 
+use futures::future::BoxFuture;
 use http::{Method, StatusCode};
 
 use crate::server::{
-    BoxService, BoxServiceFuture, IntoBoxService, Request, Response, Service, box_service,
+    BoxService, BoxServiceFuture, IntoBoxService, Request, Response, Service, StreamError,
+    UnresolvedRequest, box_service,
 };
 
 #[tracing::instrument(skip_all)]
@@ -172,6 +175,44 @@ impl Service for Router {
 
     fn serve<'s>(&self, request: &'s mut Request, response: &'s mut Response) -> Self::Future<'s> {
         Router::serve(self, request, response)
+    }
+}
+
+impl tower_service::Service<UnresolvedRequest> for Router {
+    type Response = ();
+
+    type Error = StreamError;
+
+    type Future = BoxFuture<'static, Result<(), StreamError>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        _ = cx;
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: UnresolvedRequest) -> Self::Future {
+        let router = self.clone();
+
+        Box::pin(async move {
+            let (mut request, mut response) = req.resolve().await?;
+
+            if tracing::Span::current().has_field("method") {
+                tracing::Span::current().record("method", request.method().as_str());
+            }
+            if tracing::Span::current().has_field("uri") {
+                tracing::Span::current().record("uri", request.uri().to_string());
+            }
+
+            router.serve(&mut request, &mut response).await;
+
+            // Drop response in place to avoid spawning another tokio task
+            // FIXME: remove this when async drop is stablized (https://github.com/rust-lang/rust/issues/126482)
+            if let Some(drop_future) = response.drop() {
+                drop_future.await;
+            }
+
+            Ok(())
+        })
     }
 }
 

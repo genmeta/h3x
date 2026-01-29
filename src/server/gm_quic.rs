@@ -20,7 +20,7 @@ pub struct GmQuicServersTlsBuilder {
     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
 }
 
-impl Servers<QuicListeners> {
+impl Servers<QuicListeners, ()> {
     pub fn builder() -> GmQuicServersTlsBuilder {
         GmQuicServersTlsBuilder {
             crypto_provider: None,
@@ -138,7 +138,7 @@ impl GmQuicServersBuilder {
         self
     }
 
-    pub fn build(self) -> Servers<Arc<QuicListeners>> {
+    pub fn build<S>(self) -> Servers<Arc<QuicListeners>, S> {
         Servers::from_quic_listener()
             .listener(self.builder.listen(self.backlog))
             .pool(self.pool)
@@ -147,7 +147,12 @@ impl GmQuicServersBuilder {
     }
 }
 
-impl Servers<Arc<QuicListeners>> {
+impl<S> Servers<Arc<QuicListeners>, S>
+where
+    S: tower_service::Service<UnresolvedRequest, Response = ()> + Clone + Send + Sync + 'static,
+    S::Future: Send,
+    S::Error: Into<Box<dyn Error + Send + Sync>>,
+{
     pub fn add_server(
         &mut self,
         server_name: impl Into<String>,
@@ -155,7 +160,7 @@ impl Servers<Arc<QuicListeners>> {
         private_key: impl handy::ToPrivateKey,
         ocsp: impl Into<Option<Vec<u8>>>,
         bind_uris: impl IntoIterator<Item = impl Into<BindUri>>,
-        router: impl IntoBoxService,
+        router: S,
     ) -> Result<&mut Self, ServerError> {
         let server_name = server_name.into();
         self.listener
