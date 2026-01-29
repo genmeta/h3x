@@ -14,3 +14,6 @@ pub mod quic;
 pub mod server;
 mod util;
 pub mod varint;
+
+#[cfg(feature = "gm-quic")]
+pub mod gm_quic;

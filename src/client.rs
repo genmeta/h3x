@@ -12,14 +12,6 @@ use crate::{
 mod message;
 pub use message::{PendingRequest, Request, RequestError, Response};
 
-#[cfg(feature = "gm-quic")]
-mod gm_quic;
-#[cfg(feature = "gm-quic")]
-pub use crate::{
-    client::gm_quic::{BuildClientError, GmQuicClientBuilder, GmQuicClientTlsBuilder},
-    util::tls::InvalidIdentity,
-};
-
 #[derive(Debug, Clone)]
 pub struct Client<C: quic::Connect> {
     pool: Pool<C::Connection>,
@@ -62,9 +54,4 @@ impl<C: quic::Connect> Client<C> {
             .reuse_or_connect_with(server.clone(), self.settings.clone(), connect)
             .await
     }
-}
-
-#[cfg(feature = "gm-quic")]
-pub fn builder() -> gm_quic::GmQuicClientTlsBuilder {
-    Client::builder()
 }

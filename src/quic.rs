@@ -1,5 +1,3 @@
-mod gm_quic;
-
 use std::{
     any::Any,
     borrow::Cow,

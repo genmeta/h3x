@@ -1,4 +1,7 @@
-use std::{sync::LazyLock, time::Duration};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use ::gm_quic::{
     builder::QuicClientBuilder,
@@ -18,8 +21,12 @@ use rustls::{
 };
 use snafu::{ResultExt, Snafu};
 
-use super::*;
-use crate::util::tls::{DangerousServerCertVerifier, verify_certficate_for_name};
+use crate::{
+    client::Client,
+    connection::settings::Settings,
+    pool::Pool,
+    util::tls::{DangerousServerCertVerifier, InvalidIdentity, verify_certficate_for_name},
+};
 
 fn default_root_cert_store() -> &'static Arc<RootCertStore> {
     static GENMETA_ROOT_CERT_STORE: LazyLock<Arc<RootCertStore>> = LazyLock::new(|| {
@@ -55,16 +62,18 @@ pub enum BuildClientError {
     },
 }
 
-pub struct GmQuicClientTlsBuilder {
+pub struct H3ClientTlsBuilder {
     server_cert_verifier: ServerCertVerifier,
     client_identity: Option<(String, Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
     crypto_provider: Option<Arc<CryptoProvider>>,
     resolver: Option<Arc<dyn Resolve + Send + Sync>>,
 }
 
-impl Client<QuicClient> {
-    pub fn builder() -> GmQuicClientTlsBuilder {
-        GmQuicClientTlsBuilder {
+pub type H3Client = Client<QuicClient>;
+
+impl H3Client {
+    pub fn builder() -> H3ClientTlsBuilder {
+        H3ClientTlsBuilder {
             server_cert_verifier: ServerCertVerifier::default(),
             client_identity: None,
             crypto_provider: None,
@@ -73,7 +82,7 @@ impl Client<QuicClient> {
     }
 }
 
-impl GmQuicClientTlsBuilder {
+impl H3ClientTlsBuilder {
     pub fn with_crypto_provider(mut self, crypto_provider: impl Into<Arc<CryptoProvider>>) -> Self {
         self.crypto_provider = Some(crypto_provider.into());
         self
@@ -104,7 +113,7 @@ impl GmQuicClientTlsBuilder {
         name: impl Into<String>,
         cert_chain: impl ToCertificate,
         private_key: impl ToPrivateKey,
-    ) -> Result<GmQuicClientBuilder, BuildClientError> {
+    ) -> Result<H3ClientBuilder, BuildClientError> {
         self.client_identity = Some((
             name.into(),
             cert_chain.to_certificate(),
@@ -113,16 +122,16 @@ impl GmQuicClientTlsBuilder {
         self.try_into()
     }
 
-    pub fn without_identity(mut self) -> Result<GmQuicClientBuilder, BuildClientError> {
+    pub fn without_identity(mut self) -> Result<H3ClientBuilder, BuildClientError> {
         self.client_identity = None;
         self.try_into()
     }
 }
 
-impl TryFrom<GmQuicClientTlsBuilder> for GmQuicClientBuilder {
+impl TryFrom<H3ClientTlsBuilder> for H3ClientBuilder {
     type Error = BuildClientError;
 
-    fn try_from(builder: GmQuicClientTlsBuilder) -> Result<Self, Self::Error> {
+    fn try_from(builder: H3ClientTlsBuilder) -> Result<Self, Self::Error> {
         const REQUIRED_TLS_VERSIONS: &[&rustls::SupportedProtocolVersion; 1] =
             &[&rustls::version::TLS13];
         let crypto_provider = builder
@@ -162,7 +171,7 @@ impl TryFrom<GmQuicClientTlsBuilder> for GmQuicClientBuilder {
             quic_builder = quic_builder.with_resolver(resolver);
         }
 
-        Ok(GmQuicClientBuilder {
+        Ok(H3ClientBuilder {
             builder: quic_builder,
             client_name,
             pool: Pool::global().clone(),
@@ -171,14 +180,14 @@ impl TryFrom<GmQuicClientTlsBuilder> for GmQuicClientBuilder {
     }
 }
 
-pub struct GmQuicClientBuilder {
+pub struct H3ClientBuilder {
     builder: QuicClientBuilder<rustls::ClientConfig>,
     client_name: Option<String>,
     pool: Pool<Connection>,
     settings: Arc<Settings>,
 }
 
-impl GmQuicClientBuilder {
+impl H3ClientBuilder {
     pub fn with_iface_factory(mut self, factory: Arc<dyn ProductIO + 'static>) -> Self {
         self.builder = self.builder.with_iface_factory(factory);
         self
@@ -244,15 +253,15 @@ impl GmQuicClientBuilder {
         self
     }
 
-    pub fn build(self) -> Client<QuicClient> {
+    pub fn build(self) -> H3Client {
         let client = match self.client_name {
             Some(client_name) => self.builder.with_name(client_name).build(),
             None => self.builder.build(),
         };
-        Client {
-            pool: self.pool,
-            client,
-            settings: self.settings,
-        }
+        Client::from_quic_client()
+            .pool(self.pool.clone())
+            .client(client)
+            .settings(self.settings.clone())
+            .build()
     }
 }
