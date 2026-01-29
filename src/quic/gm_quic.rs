@@ -292,9 +292,16 @@ impl quic::Connect for gm_quic::prelude::QuicClient {
 
     type Error = gm_quic::prelude::ConnectServerError;
 
-    fn connect(&self, name: &str) -> BoxFuture<'_, Result<Self::Connection, Self::Error>> {
-        tracing::debug!(target: "h3x::client", "Connecting to {name} via gm_quic");
-        self.connect(name).boxed()
+    fn connect<'a>(
+        &'a self,
+        server: &'a http::uri::Authority,
+    ) -> BoxFuture<'a, Result<Self::Connection, Self::Error>> {
+        let name = if let Some(port) = server.port_u16() {
+            format!("{}:{}", server.host(), port)
+        } else {
+            server.host().to_string()
+        };
+        async move { self.connect(&name).await }.boxed()
     }
 }
 
@@ -303,8 +310,16 @@ impl quic::Connect for Arc<gm_quic::prelude::QuicClient> {
 
     type Error = gm_quic::prelude::ConnectServerError;
 
-    fn connect(&self, name: &str) -> BoxFuture<'_, Result<Self::Connection, Self::Error>> {
-        self.as_ref().connect(name).boxed()
+    fn connect<'a>(
+        &'a self,
+        server: &'a http::uri::Authority,
+    ) -> BoxFuture<'a, Result<Self::Connection, Self::Error>> {
+        let name = if let Some(port) = server.port_u16() {
+            format!("{}:{}", server.host(), port)
+        } else {
+            server.host().to_string()
+        };
+        async move { self.as_ref().connect(&name).await }.boxed()
     }
 }
 
@@ -313,7 +328,7 @@ mod tests {
     use std::net::SocketAddr;
 
     use gm_quic::prelude::{
-        BindUri, QuicIO,
+        BindUri, QuicIO, RealAddr,
         handy::{ToCertificate, ToPrivateKey},
     };
     use http::StatusCode;
@@ -340,7 +355,7 @@ mod tests {
     async fn simpl_server() -> Result<(), BoxError> {
         init_tracing();
 
-        let mut servers = Servers::builder().without_client_cert_verifier()?.build();
+        let mut servers = Servers::builder().without_client_cert_verifier()?.build()?;
 
         #[tracing::instrument(skip_all)]
         async fn echo_service(req: &mut server::Request, resp: &mut server::Response) {
@@ -364,18 +379,20 @@ mod tests {
                 .unwrap();
             tracing::info!("Health done");
         }
-        servers.add_server(
-            "localhost",
-            SERVER_CERT.to_certificate(),
-            SERVER_KEY.to_private_key(),
-            None,
-            [BindUri::from("inet://[::1]:0").alloc_port()],
-            Router::new()
-                .post("/echo", echo_service)
-                .get("/health", health_service),
-        )?;
+        servers
+            .add_server(
+                "localhost",
+                SERVER_CERT.to_certificate(),
+                SERVER_KEY.to_private_key(),
+                None,
+                [BindUri::from("inet://127.0.0.1:0")],
+                Router::new()
+                    .post("/echo", echo_service)
+                    .get("/health", health_service),
+            )
+            .await?;
 
-        let listen_addr: SocketAddr = servers
+        let real_addr = servers
             .quic_listener()
             .get_server("localhost")
             .unwrap()
@@ -385,11 +402,12 @@ mod tests {
             .unwrap()
             .1
             .borrow()
-            .unwrap()
-            .real_addr()
-            .unwrap()
-            .try_into()
-            .unwrap();
+            .real_addr()?;
+
+        let listen_addr: SocketAddr = match real_addr {
+            RealAddr::Internet(addr) => addr,
+            _ => return Err(format!("unexpected listen real addr: {real_addr}").into()),
+        };
 
         tracing::info!(target: "test", "Listening on {listen_addr}");
 
@@ -460,7 +478,7 @@ mod tests {
             Ok::<_, BoxError>(())
         };
 
-        tokio::try_join!(client, server)?;
+        tokio::try_join!(server, client)?;
         Ok(())
     }
 }

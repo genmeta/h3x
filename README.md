@@ -46,7 +46,7 @@ async fn client_example() -> Result<(), Box<dyn std::error::Error>> {
 async fn server_example() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = h3x::server::builder()
         .without_client_cert_verifier()?
-        .build();
+        .build()?;
 
     let hello_world = async |request: &mut h3x::server::Request,
                              response: &mut h3x::server::Response| {
@@ -62,9 +62,10 @@ async fn server_example() -> Result<(), Box<dyn std::error::Error>> {
         None,
         [BindUri::from("inet://[::1]:4433")],
         h3x::server::Router::new().get("/hello_world", hello_world),
-    )?
-    .run()
-    .await;
+    )
+    .await?;
+
+    app.run().await;
 
     Ok(())
 }

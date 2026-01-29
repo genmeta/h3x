@@ -124,7 +124,10 @@ pub trait Connect {
     type Connection: Connection;
     type Error: Error + Any;
 
-    fn connect(&self, target: &str) -> BoxFuture<'_, Result<Self::Connection, Self::Error>>;
+    fn connect<'a>(
+        &'a self,
+        server: &'a http::uri::Authority,
+    ) -> BoxFuture<'a, Result<Self::Connection, Self::Error>>;
 }
 
 pub trait Listen {

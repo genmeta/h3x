@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-pub use ::gm_quic::prelude::BuildListenersError;
 use ::gm_quic::{
     builder::QuicListenersBuilder,
     prelude::{
@@ -8,8 +7,8 @@ use ::gm_quic::{
         ServerError, handy,
     },
     qbase::{param::ServerParameters, token::TokenProvider},
-    qevent::telemetry::Log,
-    qinterface::factory::ProductQuicIO,
+    qevent::telemetry::QLog,
+    qinterface::io::ProductIO,
 };
 use rustls::{crypto::CryptoProvider, server::danger::ClientCertVerifier};
 
@@ -38,26 +37,24 @@ impl GmQuicServersTlsBuilder {
     pub fn with_client_cert_verifier(
         mut self,
         client_cert_verifier: Arc<dyn ClientCertVerifier>,
-    ) -> Result<GmQuicServersBuilder, BuildListenersError> {
+    ) -> Result<GmQuicServersBuilder, rustls::Error> {
         self.client_cert_verifier = Some(client_cert_verifier);
         self.try_into()
     }
 
-    pub fn without_client_cert_verifier(
-        mut self,
-    ) -> Result<GmQuicServersBuilder, BuildListenersError> {
+    pub fn without_client_cert_verifier(mut self) -> Result<GmQuicServersBuilder, rustls::Error> {
         self.client_cert_verifier = None;
         self.try_into()
     }
 }
 
 impl TryFrom<GmQuicServersTlsBuilder> for GmQuicServersBuilder {
-    type Error = BuildListenersError;
+    type Error = rustls::Error;
 
     fn try_from(builder: GmQuicServersTlsBuilder) -> Result<Self, Self::Error> {
         let listeners_builder = match builder.crypto_provider {
             Some(crypto_provider) => QuicListeners::builder_with_crypto_provider(crypto_provider),
-            None => QuicListeners::builder(),
+            None => Ok(QuicListeners::builder()),
         }?;
         let listeners_builder = match builder.client_cert_verifier {
             Some(client_cert_verifier) => {
@@ -90,7 +87,7 @@ impl GmQuicServersBuilder {
 
     pub fn with_streams_concurrency_strategy(
         mut self,
-        strategy_factory: impl ProductStreamsConcurrencyController + 'static,
+        strategy_factory: Arc<dyn ProductStreamsConcurrencyController>,
     ) -> Self {
         self.builder = self
             .builder
@@ -108,12 +105,12 @@ impl GmQuicServersBuilder {
         self
     }
 
-    pub fn with_iface_factory(mut self, factory: impl ProductQuicIO + 'static) -> Self {
+    pub fn with_iface_factory(mut self, factory: Arc<dyn ProductIO + 'static>) -> Self {
         self.builder = self.builder.with_iface_factory(factory);
         self
     }
 
-    pub fn with_qlog(mut self, logger: Arc<dyn Log + Send + Sync>) -> Self {
+    pub fn with_qlog(mut self, logger: Arc<dyn QLog + Send + Sync>) -> Self {
         self.builder = self.builder.with_qlog(logger);
         self
     }
@@ -138,12 +135,15 @@ impl GmQuicServersBuilder {
         self
     }
 
-    pub fn build<S>(self) -> Servers<Arc<QuicListeners>, S> {
-        Servers::from_quic_listener()
-            .listener(self.builder.listen(self.backlog))
+    pub fn build<S>(
+        self,
+    ) -> Result<Servers<Arc<QuicListeners>, S>, ::gm_quic::prelude::ListenError> {
+        let listener = self.builder.listen(self.backlog)?;
+        Ok(Servers::from_quic_listener()
+            .listener(listener)
             .pool(self.pool)
             .settings(self.settings)
-            .build()
+            .build())
     }
 }
 
@@ -153,7 +153,7 @@ where
     S::Future: Send,
     S::Error: Into<Box<dyn Error + Send + Sync>>,
 {
-    pub fn add_server(
+    pub async fn add_server(
         &mut self,
         server_name: impl Into<String>,
         cert_chain: impl handy::ToCertificate,
@@ -164,7 +164,8 @@ where
     ) -> Result<&mut Self, ServerError> {
         let server_name = server_name.into();
         self.listener
-            .add_server(&server_name, cert_chain, private_key, bind_uris, ocsp)?;
+            .add_server(&server_name, cert_chain, private_key, bind_uris, ocsp)
+            .await?;
         Ok(self.serve(server_name, router))
     }
 }
