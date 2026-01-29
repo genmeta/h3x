@@ -33,9 +33,9 @@ http-body = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
 
 [features]
-default = ['gm-quic', 'tower']
+default = ['gm-quic', 'http-body']
 gm-quic = ['dep:gm-quic']
-tower = ['dep:http-body', 'dep:http-body-util']
+http-body = ['dep:http-body', 'dep:http-body-util']
 
 [dev-dependencies]
 rustls = { version = "0.23", default-features = false, features = [

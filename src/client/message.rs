@@ -408,6 +408,11 @@ impl Request {
         self.stream.cancel(code).await
     }
 
+    /// Low level access to the underlying write stream
+    pub fn write_stream(&mut self) -> &mut WriteStream {
+        &mut self.stream
+    }
+
     pub fn agent(&self) -> Option<&LocalAgent> {
         self.agent.as_ref()
     }
@@ -504,6 +509,11 @@ impl Response {
 
     pub async fn trailers(&mut self) -> Result<&HeaderMap, StreamError> {
         self.stream.read_message_trailer(&mut self.message).await
+    }
+
+    /// Low level access to the underlying read stream
+    pub fn read_stream(&mut self) -> &mut ReadStream {
+        &mut self.stream
     }
 
     pub fn agent(&self) -> &RemoteAgent {

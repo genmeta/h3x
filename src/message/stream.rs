@@ -928,8 +928,8 @@ impl quic::GetStreamId for WriteStream {
     }
 }
 
-#[cfg(feature = "tower")]
-mod tower {
+#[cfg(feature = "http-body")]
+pub mod http_body {
     use std::{error::Error, fmt::Display, pin::pin};
 
     use bytes::Bytes;
@@ -945,7 +945,7 @@ mod tower {
     };
 
     impl ReadStream {
-        fn as_hyper_body(
+        pub fn as_hyper_body(
             &mut self,
         ) -> StreamBody<impl Stream<Item = Result<Frame<Bytes>, StreamError>>> {
             StreamBody::new(stream::unfold(self, async |stream| {
@@ -1007,6 +1007,15 @@ mod tower {
     pub enum SendMesageError<E> {
         Stream { source: StreamError },
         Body { source: E },
+    }
+
+    impl<E> SendMesageError<E> {
+        pub fn map_body_error<E1>(self, f: impl FnOnce(E) -> E1) -> SendMesageError<E1> {
+            match self {
+                SendMesageError::Stream { source } => SendMesageError::Stream { source },
+                SendMesageError::Body { source } => SendMesageError::Body { source: f(source) },
+            }
+        }
     }
 
     impl<E: Display> Display for SendMesageError<E> {
