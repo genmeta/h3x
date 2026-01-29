@@ -19,27 +19,13 @@ use crate::{
 };
 
 pub struct UnresolvedRequest {
-    request_stream: ReadStream,
-    remote_agent: Option<RemoteAgent>,
-    response_stream: WriteStream,
-    local_agent: LocalAgent,
+    pub request_stream: ReadStream,
+    pub remote_agent: Option<RemoteAgent>,
+    pub response_stream: WriteStream,
+    pub local_agent: LocalAgent,
 }
 
 impl UnresolvedRequest {
-    pub(super) fn new(
-        read_stream: ReadStream,
-        write_stream: WriteStream,
-        local_agent: LocalAgent,
-        remote_agent: Option<RemoteAgent>,
-    ) -> Self {
-        Self {
-            request_stream: read_stream,
-            remote_agent,
-            response_stream: write_stream,
-            local_agent,
-        }
-    }
-
     pub async fn resolve(self) -> Result<(Request, Response), StreamError> {
         let mut request = Request {
             message: Message::unresolved_request(),
