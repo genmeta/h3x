@@ -11,7 +11,9 @@ use ::gm_quic::{
     },
     qbase::{param::ClientParameters, token::TokenSink},
     qevent::telemetry::QLog,
-    qinterface::io::ProductIO,
+    qinterface::{
+        component::route::QuicRouter, device::Devices, io::ProductIO, manager::InterfaceManager,
+    },
 };
 use rustls::{
     ClientConfig, RootCertStore,
@@ -188,8 +190,29 @@ pub struct H3ClientBuilder {
 }
 
 impl H3ClientBuilder {
+    pub fn physical_ifaces(mut self, physical_ifaces: &'static Devices) -> Self {
+        self.builder = self.builder.physical_ifaces(physical_ifaces);
+        self
+    }
+
+    pub fn with_resolver(mut self, resolver: Arc<dyn Resolve + Send + Sync>) -> Self {
+        self.builder = self.builder.with_resolver(resolver);
+        self
+    }
+
     pub fn with_iface_factory(mut self, factory: Arc<dyn ProductIO + 'static>) -> Self {
         self.builder = self.builder.with_iface_factory(factory);
+        self
+    }
+
+    /// Specify the interfaces manager for the client.
+    pub fn with_iface_manager(mut self, iface_manager: Arc<InterfaceManager>) -> Self {
+        self.builder = self.builder.with_iface_manager(iface_manager);
+        self
+    }
+
+    pub fn with_router(mut self, router: Arc<QuicRouter>) -> Self {
+        self.builder = self.builder.with_router(router);
         self
     }
 
@@ -220,11 +243,6 @@ impl H3ClientBuilder {
 
     pub fn with_qlog(mut self, logger: Arc<dyn QLog + Send + Sync>) -> Self {
         self.builder = self.builder.with_qlog(logger);
-        self
-    }
-
-    pub fn with_resolver(mut self, resolver: Arc<dyn Resolve + Send + Sync>) -> Self {
-        self.builder = self.builder.with_resolver(resolver);
         self
     }
 

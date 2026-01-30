@@ -4,11 +4,13 @@ use ::gm_quic::{
     builder::QuicListenersBuilder,
     prelude::{
         AuthClient, BindUri, Connection, ListenError, ProductStreamsConcurrencyController,
-        QuicListeners, ServerError, handy,
+        QuicListeners, Resolve, ServerError, handy,
     },
     qbase::{param::ServerParameters, token::TokenProvider},
     qevent::telemetry::QLog,
-    qinterface::io::ProductIO,
+    qinterface::{
+        component::route::QuicRouter, device::Devices, io::ProductIO, manager::InterfaceManager,
+    },
 };
 use rustls::{crypto::CryptoProvider, server::danger::ClientCertVerifier};
 
@@ -86,6 +88,27 @@ pub struct H3ServersBuilder {
 }
 
 impl H3ServersBuilder {
+    pub fn with_resolver(mut self, resolver: Arc<dyn Resolve + Send + Sync>) -> Self {
+        self.builder = self.builder.with_resolver(resolver);
+        self
+    }
+
+    pub fn with_iface_factory(mut self, factory: Arc<dyn ProductIO + 'static>) -> Self {
+        self.builder = self.builder.with_iface_factory(factory);
+        self
+    }
+
+    /// Specify the interfaces manager for the client.
+    pub fn with_iface_manager(mut self, iface_manager: Arc<InterfaceManager>) -> Self {
+        self.builder = self.builder.with_iface_manager(iface_manager);
+        self
+    }
+
+    pub fn with_router(mut self, router: Arc<QuicRouter>) -> Self {
+        self.builder = self.builder.with_router(router);
+        self
+    }
+
     pub fn with_token_provider(mut self, token_provider: Arc<dyn TokenProvider>) -> Self {
         self.builder = self.builder.with_token_provider(token_provider);
         self
@@ -111,8 +134,8 @@ impl H3ServersBuilder {
         self
     }
 
-    pub fn with_iface_factory(mut self, factory: Arc<dyn ProductIO + 'static>) -> Self {
-        self.builder = self.builder.with_iface_factory(factory);
+    pub fn physical_ifaces(mut self, physical_ifaces: &'static Devices) -> Self {
+        self.builder = self.builder.with_physical_ifaces(physical_ifaces);
         self
     }
 
@@ -141,7 +164,7 @@ impl H3ServersBuilder {
         self
     }
 
-    pub fn build<S>(self) -> Result<H3Servers<S>, ListenError> {
+    pub fn listen<S>(self) -> Result<H3Servers<S>, ListenError> {
         let listener = self.builder.listen(self.backlog)?;
         Ok(Servers::from_quic_listener()
             .listener(listener)

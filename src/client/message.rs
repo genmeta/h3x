@@ -463,7 +463,7 @@ impl Response {
         Ok(self)
     }
 
-    pub fn status(&mut self) -> http::StatusCode {
+    pub fn status(&self) -> http::StatusCode {
         self.message.header().status()
     }
 

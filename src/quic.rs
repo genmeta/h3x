@@ -11,6 +11,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::{Sink, Stream, future::BoxFuture};
+use http::uri::Authority;
 use snafu::Snafu;
 
 use crate::{
@@ -124,7 +125,7 @@ pub trait Connect {
 
     fn connect<'a>(
         &'a self,
-        server: &'a http::uri::Authority,
+        server: &'a Authority,
     ) -> BoxFuture<'a, Result<Self::Connection, Self::Error>>;
 }
 
