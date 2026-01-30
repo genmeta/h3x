@@ -15,14 +15,17 @@ High-performance asynchronous DHTTP/3 implementation in Rust.
 h3x integrates `gm_quic` by default. Initiate QUIC connections via `QuicClient` and listen QUIC connections via `QuicListeners`.
 
 ```rust
-use gm_quic::prelude::{BindUri, handy::ToCertificate};
+use h3x::gm_quic::{
+    H3Client, H3Servers,
+    prelude::{BindUri, handy::ToCertificate},
+};
 
 async fn client_example() -> Result<(), Box<dyn std::error::Error>> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add_parsable_certificates(
         include_bytes!("tests/keychain/localhost/ca.cert").to_certificate(),
     );
-    let h3_client = h3x::client::builder()
+    let h3_client = H3Client::builder()
         .with_root_certificates(roots)
         .without_identity()?
         .build();
@@ -44,9 +47,9 @@ async fn client_example() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn server_example() -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = h3x::server::builder()
+    let mut app = H3Servers::builder()
         .without_client_cert_verifier()?
-        .build()?;
+        .listen()?;
 
     let hello_world = async |request: &mut h3x::server::Request,
                              response: &mut h3x::server::Response| {
@@ -69,4 +72,5 @@ async fn server_example() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
 ```

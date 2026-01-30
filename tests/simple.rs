@@ -1,9 +1,7 @@
 mod common;
-use common::run;
+use common::*;
 use h3x::server::{self, Router};
 use tokio_util::task::AbortOnDropHandle;
-
-use crate::common::*;
 
 async fn hello_world_service(_: &mut server::Request, response: &mut server::Response) {
     response

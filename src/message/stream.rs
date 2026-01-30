@@ -930,76 +930,167 @@ impl quic::GetStreamId for WriteStream {
 
 #[cfg(feature = "http-body")]
 pub mod http_body {
-    use std::{error::Error, fmt::Display, pin::pin};
+    use std::{
+        error::Error,
+        fmt::Display,
+        mem,
+        ops::DerefMut,
+        pin::{Pin, pin},
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
 
     use bytes::Bytes;
     use futures::{Stream, TryFutureExt, stream};
     use http::HeaderName;
     use http_body::{Body, Frame};
     use http_body_util::{BodyExt, StreamBody};
+    use tokio::sync::oneshot;
 
     use super::{ReadStream, StreamError, WriteStream};
     use crate::{
+        connection,
         error::Code,
         qpack::field_section::{FieldLine, PseudoHeaders},
     };
 
+    #[derive(Clone)]
+    pub struct RemainReadStream {
+        rx: Arc<Mutex<oneshot::Receiver<ReadStream>>>,
+    }
+
+    impl RemainReadStream {
+        pub fn new(rx: oneshot::Receiver<ReadStream>) -> Self {
+            Self {
+                rx: Arc::new(Mutex::new(rx)),
+            }
+        }
+    }
+
+    impl Future for RemainReadStream {
+        type Output = Option<ReadStream>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let mut rx = self.get_mut().rx.lock().expect("poisoned mutex");
+            Pin::new(rx.deref_mut()).poll(cx).map(Result::ok)
+        }
+    }
+
     impl ReadStream {
+        pub async fn read_hyper_request_parts(
+            &mut self,
+        ) -> Result<http::request::Parts, StreamError> {
+            self.try_stream_io(async |stream| {
+                let Some(field_section) = stream.read_header_frame().await.transpose()? else {
+                    return Err(Code::H3_MESSAGE_ERROR.into());
+                };
+                Ok(http::request::Parts::try_from(field_section)?)
+            })
+            .await
+        }
+
+        pub async fn read_hyper_response_parts(
+            &mut self,
+        ) -> Result<http::response::Parts, StreamError> {
+            self.try_stream_io(async |stream| {
+                let Some(field_section) = stream.read_header_frame().await.transpose()? else {
+                    return Err(Code::H3_MESSAGE_ERROR.into());
+                };
+                Ok(http::response::Parts::try_from(field_section)?)
+            })
+            .await
+        }
+
+        pub async fn read_hyper_frame(
+            &mut self,
+        ) -> Option<Result<Frame<Bytes>, connection::StreamError>> {
+            match self.read_data_frame_chunk().await {
+                Some(data) => Some(data.map(Frame::data)),
+                None => match self.read_header_frame().await? {
+                    Ok(field_section) if !field_section.is_trailer() => {
+                        Some(Err(Code::H3_MESSAGE_ERROR.into()))
+                    }
+                    Ok(field_section) => Some(Ok(Frame::trailers(field_section.header_map))),
+                    Err(error) => Some(Err(error)),
+                },
+            }
+        }
+
         pub fn as_hyper_body(
             &mut self,
         ) -> StreamBody<impl Stream<Item = Result<Frame<Bytes>, StreamError>>> {
             StreamBody::new(stream::unfold(self, async |stream| {
                 let frame = stream
-                    .try_stream_io(async |stream| {
-                        match stream.read_data_frame_chunk().await.transpose()? {
-                            Some(data) => Ok(Some(Frame::data(data))),
-                            None => match stream.read_header_frame().await.transpose()? {
-                                Some(field_section) => {
-                                    if !field_section.is_trailer() {
-                                        return Err(Code::H3_MESSAGE_ERROR.into());
-                                    }
-                                    Ok(Some(Frame::trailers(field_section.header_map)))
-                                }
-                                None => Ok(None),
-                            },
-                        }
-                    })
+                    .try_stream_io(async |stream| stream.read_hyper_frame().await.transpose())
                     .await
-                    .transpose();
-                frame.map(|frame| (frame, stream))
+                    .transpose()?;
+                Some((frame, stream))
             }))
         }
 
-        pub async fn read_hyper_request(
-            &mut self,
-        ) -> Result<http::Request<impl Body<Data = Bytes, Error = StreamError>>, StreamError>
-        {
-            let parts = self
-                .try_stream_io(async |stream| {
-                    let Some(field_section) = stream.read_header_frame().await.transpose()? else {
-                        return Err(Code::H3_MESSAGE_ERROR.into());
-                    };
-                    Ok(http::request::Parts::try_from(field_section)?)
-                })
-                .await?;
-            let body = self.as_hyper_body();
-            Ok(http::Request::from_parts(parts, body))
-        }
+        pub fn take_hyper_body(
+            self,
+        ) -> (
+            StreamBody<impl Stream<Item = Result<Frame<Bytes>, StreamError>>>,
+            RemainReadStream,
+        ) {
+            let (next, rx) = oneshot::channel();
 
-        pub async fn read_hyper_response(
-            &mut self,
-        ) -> Result<http::Response<impl Body<Data = Bytes, Error = StreamError>>, StreamError>
-        {
-            let parts = self
-                .try_stream_io(async |stream| {
-                    let Some(field_section) = stream.read_header_frame().await.transpose()? else {
-                        return Err(Code::H3_MESSAGE_ERROR.into());
+            enum StageInner {
+                // http message content + http message trailer
+                Body {
+                    stream: ReadStream,
+                    next: oneshot::Sender<ReadStream>,
+                },
+                // tunnel
+                Next,
+            }
+
+            struct Stage(StageInner);
+
+            impl Stage {
+                fn new(stream: ReadStream, next: oneshot::Sender<ReadStream>) -> Self {
+                    Self(StageInner::Body { stream, next })
+                }
+
+                fn as_mut(&mut self) -> Option<&mut ReadStream> {
+                    match &mut self.0 {
+                        StageInner::Body { stream, .. } => Some(stream),
+                        StageInner::Next => None,
+                    }
+                }
+
+                fn next(&mut self) {
+                    if let StageInner::Body { stream, next } =
+                        mem::replace(&mut self.0, StageInner::Next)
+                    {
+                        _ = next.send(stream);
+                    }
+                }
+            }
+
+            impl Drop for Stage {
+                fn drop(&mut self) {
+                    self.next();
+                }
+            }
+
+            let body = StreamBody::new(stream::unfold(
+                Stage::new(self, next),
+                async |mut stream| {
+                    let frame = stream
+                        .as_mut()?
+                        .try_stream_io(async |stream| stream.read_hyper_frame().await.transpose())
+                        .await
+                        .transpose();
+                    let Some(frame) = frame else {
+                        stream.next();
+                        return None;
                     };
-                    Ok(http::response::Parts::try_from(field_section)?)
-                })
-                .await?;
-            let body = self.as_hyper_body();
-            Ok(http::Response::from_parts(parts, body))
+                    Some((frame, stream))
+                },
+            ));
+            (body, RemainReadStream::new(rx))
         }
     }
 

@@ -1,13 +1,13 @@
 use std::{
     error::Error,
     fmt::Display,
-    pin::Pin,
     task::{Context, Poll},
 };
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use futures::future::{self, BoxFuture};
-use http_body::{Body, Frame, SizeHint};
+use http_body::Body;
+use http_body_util::combinators::UnsyncBoxBody;
 use snafu::Report;
 
 use crate::{
@@ -15,62 +15,14 @@ use crate::{
     server::{Request, Response, UnresolvedRequest},
 };
 
-/// A boxed [`Body`] trait object that is !Sync.
-pub struct UnsyncBoxBody<'b, D, E> {
-    inner: Pin<Box<dyn Body<Data = D, Error = E> + Send + 'b>>,
-}
-
-// === UnsyncBoxBody ===
-impl<'b, D, E> UnsyncBoxBody<'b, D, E> {
-    /// Create a new `UnsyncBoxBody`.
-    pub fn new<B>(body: B) -> Self
-    where
-        B: Body<Data = D, Error = E> + Send + 'b,
-        D: Buf,
-    {
-        Self {
-            inner: Box::pin(body),
-        }
-    }
-}
-
-impl<D, E> std::fmt::Debug for UnsyncBoxBody<'_, D, E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UnsyncBoxBody").finish()
-    }
-}
-
-impl<D, E> Body for UnsyncBoxBody<'_, D, E>
-where
-    D: Buf,
-{
-    type Data = D;
-    type Error = E;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        self.inner.as_mut().poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct TowerService<S>(pub S);
 
 impl<S, RespBody> super::Service for TowerService<S>
 where
-    S: for<'s> tower_service::Service<
-            http::Request<UnsyncBoxBody<'s, Bytes, StreamError>>,
+    S: tower_service::Service<
+            http::Request<UnsyncBoxBody<Bytes, StreamError>>,
             Response = http::Response<RespBody>,
             Error: Error + Send,
             Future: Send,
@@ -89,20 +41,28 @@ where
                 return;
             }
 
+            let read_stream = req.read_stream().take();
+            let (body, remain) = read_stream.take_hyper_body();
+
             let request = http::Request::builder()
                 .method(req.method())
                 .uri(req.uri())
-                .body(UnsyncBoxBody::new(req.read_stream().as_hyper_body()));
-            let request = match request {
-                Ok(mut request) => {
-                    *request.headers_mut() = request.headers().clone();
-                    request
-                }
+                .body(UnsyncBoxBody::new(body));
+
+            let mut request = match request {
+                Ok(request) => request,
                 Err(error) => {
-                    tracing::error!(error = %Report::from_error(&error), "Failed to convert request to hyper request, this should not happen");
+                    tracing::error!(error = %Report::from_error(&error), "Failed to build hyper request, this should not happen");
                     return;
                 }
             };
+
+            *request.headers_mut() = request.headers().clone();
+            request.extensions_mut().insert(remain);
+            request.extensions_mut().insert(resp.agent().clone());
+            if let Some(remote_agent) = req.agent().cloned() {
+                request.extensions_mut().insert(remote_agent);
+            }
 
             match service.call(request).await {
                 Ok(response) => {
@@ -156,8 +116,8 @@ impl<S, B> From<SendMesageError<B>> for HandleRequestError<S, B> {
 
 impl<S, RespBody, ServiceE> tower_service::Service<UnresolvedRequest> for TowerService<S>
 where
-    S: for<'s> tower_service::Service<
-            http::Request<UnsyncBoxBody<'s, Bytes, StreamError>>,
+    S: tower_service::Service<
+            http::Request<UnsyncBoxBody<Bytes, StreamError>>,
             Response = http::Response<RespBody>,
             Error = ServiceE,
             Future: Send,
@@ -193,12 +153,16 @@ where
                 .await
                 .map_err(|source| HandleRequestError::Service { source })?;
 
-            let mut request = request_stream
-                .read_hyper_request()
+            let request_parts = request_stream
+                .read_hyper_request_parts()
                 .await
-                .map_err(|source| HandleRequestError::Stream { source })?
-                .map(UnsyncBoxBody::new);
+                .map_err(|source| HandleRequestError::Stream { source })?;
 
+            let (request_body, remain_stream) = request_stream.take_hyper_body();
+
+            let mut request =
+                http::Request::from_parts(request_parts, UnsyncBoxBody::new(request_body));
+            request.extensions_mut().insert(remain_stream);
             request.extensions_mut().insert(local_agent);
             if let Some(remote_agent) = remote_agent {
                 request.extensions_mut().insert(remote_agent);

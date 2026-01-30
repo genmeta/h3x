@@ -28,6 +28,7 @@ x509-parser = "0.18"
 tower-service = "0.3"
 
 gm-quic = { git = "https://github.com/genmeta/gm-quic.git", branch = "main", optional = true }
+# gm-quic = { path = "../gm-quic/gm-quic", optional = true }
 
 http-body = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
@@ -38,11 +39,27 @@ gm-quic = ['dep:gm-quic']
 http-body = ['dep:http-body', 'dep:http-body-util']
 
 [dev-dependencies]
+axum = { version = "0.8", default-features = false, features = [
+    'form', # (default)
+    # 'http1',    # (default)
+    'json',         # (default)
+    'matched-path', # (default)
+    'original-uri', # (default)
+    'query',        # (default)
+    'tokio',        # (default)
+    'tower-log',    # (default)
+    'tracing',      # (default)
+] }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "logging",
 ] }
 snafu = "0.8"
-tokio = { version = "1", features = ["macros", "test-util", "io-util"] }
+tokio = { version = "1", features = [
+    "macros",
+    "test-util",
+    "io-util",
+    "rt-multi-thread",
+] }
+tracing-appender = "0.2"
 tracing-subscriber = "0.3"
-
