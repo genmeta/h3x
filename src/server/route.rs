@@ -14,6 +14,7 @@ use crate::server::{
 
 #[tracing::instrument(skip_all)]
 pub async fn default_fallback(_request: &mut Request, response: &mut Response) {
+    tracing::debug!("Call default fallback service (404 Not Found)");
     _ = response.set_status(StatusCode::NOT_FOUND)
 }
 
@@ -34,6 +35,7 @@ impl Service for Fallback {
     type Future<'s> = BoxServiceFuture<'s>;
 
     fn serve<'s>(&self, request: &'s mut Request, response: &'s mut Response) -> Self::Future<'s> {
+        tracing::debug!("Call fallback service");
         self.0.read().unwrap().serve(request, response)
     }
 }
@@ -82,6 +84,10 @@ impl RouterInner {
             }
         }
     }
+}
+
+impl Service for RouterInner {
+    type Future<'s> = BoxServiceFuture<'s>;
 
     fn serve<'s>(
         &self,
@@ -89,12 +95,16 @@ impl RouterInner {
         response: &'s mut Response,
     ) -> BoxServiceFuture<'s> {
         let Some(path_and_query) = request.path() else {
+            tracing::debug!("Missing path in request URI, call fallback service");
             return self.fallback.serve(request, response);
         };
-        let Ok(endpoint) = self.router.at(path_and_query.path()) else {
+        let path = path_and_query.path();
+        let Ok(endpoint) = self.router.at(path) else {
+            tracing::debug!(path, "Path route: not found, call fallback service");
             return self.fallback.serve(request, response);
         };
 
+        tracing::debug!(path, "Path route found, call matched service");
         endpoint.value.serve(request, response)
     }
 }

@@ -24,7 +24,7 @@ pub mod tower;
 #[cfg(feature = "http-body")]
 pub use tower::TowerService;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Servers<L: quic::Listen, S> {
     pool: Pool<L::Connection>,
     listener: L,
