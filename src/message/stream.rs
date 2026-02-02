@@ -510,7 +510,7 @@ impl ReadStream {
                     }
                     match self.read_message_body_chunk(message).await? {
                         Ok(body_part) => {
-message.chunked_body().expect("checked").write(body_part);
+                            message.chunked_body().expect("checked").write(body_part);
                             continue;
                         }
                         Err(error) => return Some(Err(error)),
@@ -858,7 +858,11 @@ impl WriteStream {
                     debug_assert_eq!(message.stage, MessageStage::Trailer);
                 } else {
                     self.send_message_header(message).await?;
-                    debug_assert_eq!(message.stage, MessageStage::Body);
+                    if message.is_interim_response() {
+                        debug_assert!(message.stage == MessageStage::Header);
+                    } else {
+                        debug_assert!(message.stage == MessageStage::Body);
+                    }
                 }
 
                 if !message.trailers().is_empty() {
@@ -944,7 +948,7 @@ pub mod http_body {
     use futures::{Stream, TryFutureExt, stream};
     use http::HeaderName;
     use http_body::{Body, Frame};
-    use http_body_util::{BodyExt, StreamBody};
+    use http_body_util::{BodyExt, Either, Empty, StreamBody};
     use tokio::sync::oneshot;
 
     use super::{ReadStream, StreamError, WriteStream};
@@ -964,6 +968,12 @@ pub mod http_body {
             Self {
                 rx: Arc::new(Mutex::new(rx)),
             }
+        }
+
+        pub fn immediately(stream: ReadStream) -> Self {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(stream);
+            Self::new(rx)
         }
     }
 
@@ -1028,7 +1038,7 @@ pub mod http_body {
             }))
         }
 
-        pub fn take_hyper_body(
+        pub fn to_hyper_body(
             self,
         ) -> (
             StreamBody<impl Stream<Item = Result<Frame<Bytes>, StreamError>>>,
@@ -1036,7 +1046,7 @@ pub mod http_body {
         ) {
             let (next, rx) = oneshot::channel();
 
-            enum StageInner {
+            enum Stage {
                 // http message content + http message trailer
                 Body {
                     stream: ReadStream,
@@ -1046,32 +1056,22 @@ pub mod http_body {
                 Next,
             }
 
-            struct Stage(StageInner);
-
             impl Stage {
                 fn new(stream: ReadStream, next: oneshot::Sender<ReadStream>) -> Self {
-                    Self(StageInner::Body { stream, next })
+                    Stage::Body { stream, next }
                 }
 
                 fn as_mut(&mut self) -> Option<&mut ReadStream> {
-                    match &mut self.0 {
-                        StageInner::Body { stream, .. } => Some(stream),
-                        StageInner::Next => None,
+                    match self {
+                        Stage::Body { stream, .. } => Some(stream),
+                        Stage::Next => None,
                     }
                 }
 
                 fn next(&mut self) {
-                    if let StageInner::Body { stream, next } =
-                        mem::replace(&mut self.0, StageInner::Next)
-                    {
+                    if let Stage::Body { stream, next } = mem::replace(self, Stage::Next) {
                         _ = next.send(stream);
                     }
-                }
-            }
-
-            impl Drop for Stage {
-                fn drop(&mut self) {
-                    self.next();
                 }
             }
 
@@ -1091,6 +1091,32 @@ pub mod http_body {
                 },
             ));
             (body, RemainReadStream::new(rx))
+        }
+
+        pub async fn to_hyper_response(
+            mut self,
+        ) -> Result<
+            http::Response<
+                Either<
+                    StreamBody<impl Stream<Item = Result<Frame<Bytes>, StreamError>>>,
+                    Empty<Bytes>,
+                >,
+            >,
+            StreamError,
+        > {
+            let mut parts = self.read_hyper_response_parts().await?;
+            match parts.status.is_informational() {
+                true => {
+                    let body = Either::Right(Empty::new());
+                    parts.extensions.insert(RemainReadStream::immediately(self));
+                    Ok(http::Response::from_parts(parts, body))
+                }
+                false => {
+                    let (body, reamin) = self.to_hyper_body();
+                    parts.extensions.insert(reamin);
+                    Ok(http::Response::from_parts(parts, Either::Left(body)))
+                }
+            }
         }
     }
 
@@ -1242,10 +1268,7 @@ pub mod http_body {
             self.send_header(hyper_request_parts_to_field_lines(parts))
                 .map_err(|source| SendMesageError::Stream { source })
                 .await?;
-            self.send_hyper_body(body).await?;
-            self.close()
-                .await
-                .map_err(|source| SendMesageError::Stream { source })
+            self.send_hyper_body(body).await
         }
 
         pub async fn send_hyper_response<B: Body>(

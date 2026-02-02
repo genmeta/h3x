@@ -42,7 +42,7 @@ where
             }
 
             let read_stream = req.read_stream().take();
-            let (body, remain) = read_stream.take_hyper_body();
+            let (body, remain) = read_stream.to_hyper_body();
 
             let request = http::Request::builder()
                 .method(req.method())
@@ -158,7 +158,7 @@ where
                 .await
                 .map_err(|source| HandleRequestError::Stream { source })?;
 
-            let (request_body, remain_stream) = request_stream.take_hyper_body();
+            let (request_body, remain_stream) = request_stream.to_hyper_body();
 
             let mut request =
                 http::Request::from_parts(request_parts, UnsyncBoxBody::new(request_body));

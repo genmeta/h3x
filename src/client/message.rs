@@ -47,6 +47,8 @@ where
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum RequestError<E: Error + 'static> {
+    #[snafu(display("expected HTTPS scheme"))]
+    NotHttpsScheme,
     #[snafu(transparent)]
     Connect { source: ConnectError<E> },
     #[snafu(transparent)]
@@ -65,8 +67,6 @@ pub enum RequestError<E: Error + 'static> {
     DataFrameTooLarge,
     #[snafu(display("response from peer is malformed"))]
     MalformedResponse,
-    #[snafu(display("expected HTTPS scheme"))]
-    NotHttpsScheme,
 }
 
 impl<E: Error + 'static> From<quic::ConnectionError> for RequestError<E> {
