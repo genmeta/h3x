@@ -28,16 +28,18 @@ use crate::{
 pub struct PendingRequest<'c, C: quic::Connect> {
     client: &'c Client<C>,
     request: Message,
+    auto_close: bool,
 }
 
-impl<'c, C: quic::Connect + std::fmt::Debug> std::fmt::Debug for PendingRequest<'c, C>
+impl<'c, C: quic::Connect> std::fmt::Debug for PendingRequest<'c, C>
 where
-    C::Connection: std::fmt::Debug,
+    Client<C>: std::fmt::Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingRequest")
             .field("client", &self.client)
             .field("request", &self.request)
+            .field("auto_close", &self.auto_close)
             .finish()
     }
 }
@@ -49,7 +51,7 @@ pub enum RequestError<E: Error + 'static> {
     Connect { source: ConnectError<E> },
     #[snafu(transparent)]
     Stream { source: quic::StreamError },
-    #[snafu(display("Request cannot be send due to malformed header"))]
+    #[snafu(display("request cannot be send due to malformed header"))]
     MalformedRequestHeader { source: MalformedHeaderSection },
     #[snafu(display(
         "header section too large to fit into a single frame, maybe too many header fields"
@@ -61,9 +63,9 @@ pub enum RequestError<E: Error + 'static> {
     TrailerTooLarge,
     #[snafu(display("data frame payload too large, try smaller chunk size"))]
     DataFrameTooLarge,
-    #[snafu(display("Message from peer is malformed"))]
-    MalformedResponseMessage,
-    #[snafu(display("Expected HTTPS scheme"))]
+    #[snafu(display("response from peer is malformed"))]
+    MalformedResponse,
+    #[snafu(display("expected HTTPS scheme"))]
     NotHttpsScheme,
 }
 
@@ -75,11 +77,10 @@ impl<E: Error + 'static> From<quic::ConnectionError> for RequestError<E> {
 
 impl<C: quic::Connect> Client<C> {
     pub fn new_request(&self) -> PendingRequest<'_, C> {
-        let mut request = Message::unresolved_request();
-        _ = request.streaming_body();
         PendingRequest {
             client: self,
-            request,
+            request: Message::unresolved_request(),
+            auto_close: true,
         }
     }
 }
@@ -130,6 +131,14 @@ impl<C: quic::Connect> PendingRequest<'_, C> {
 
     pub fn with_body(mut self, body: impl Buf) -> Self {
         self.request.set_body(body);
+        self
+    }
+
+    /// Whether to automatically close the request stream when the pending request is chunked.
+    ///
+    /// Default is `true` to adapt most use cases.
+    pub fn auto_close(mut self, auto_close: bool) -> Self {
+        self.auto_close = auto_close;
         self
     }
 
@@ -202,10 +211,18 @@ where
                 .await?
                 .expect("chekced by Client::connect");
 
+            let send_request = async {
+                if self.auto_close && self.request.is_chunked() {
+                    write_stream.close_message(&mut self.request).await
+                } else {
+                    write_stream.send_message(&mut self.request).await
+                }
+            };
+
             let mut response = Message::unresolved_response();
 
-            match tokio::try_join!(
-                write_stream.send_message(&mut self.request),
+            return match tokio::try_join!(
+                send_request,
                 read_stream.read_message_header(&mut response)
             ) {
                 Ok(..) => {
@@ -221,26 +238,16 @@ where
                     };
                     return Ok((request, response));
                 }
-                Err(StreamError::HeaderTooLarge) => {
-                    return Err(RequestError::HeaderTooLarge);
-                }
-                Err(StreamError::TrailerTooLarge) => {
-                    return Err(RequestError::TrailerTooLarge);
-                }
-                Err(StreamError::DataFrameTooLarge) => {
-                    return Err(RequestError::DataFrameTooLarge);
-                }
-                Err(StreamError::MalformedIncomingMessage) => {
-                    return Err(RequestError::MalformedResponseMessage);
-                }
-                Err(StreamError::Quic { source }) => {
-                    return Err(source.into());
-                }
+                Err(StreamError::HeaderTooLarge) => Err(RequestError::HeaderTooLarge),
+                Err(StreamError::TrailerTooLarge) => Err(RequestError::TrailerTooLarge),
+                Err(StreamError::DataFrameTooLarge) => Err(RequestError::DataFrameTooLarge),
+                Err(StreamError::MalformedIncomingMessage) => Err(RequestError::MalformedResponse),
+                Err(StreamError::Quic { source }) => Err(source.into()),
                 Err(StreamError::Goaway { .. }) => {
                     tracing::debug!(target: "h3x::client", "Connection goaway, retrying...");
                     continue;
                 }
-            }
+            };
         }
     }
 

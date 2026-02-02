@@ -94,9 +94,7 @@ impl Message {
     pub fn unresolved_request() -> Self {
         Self {
             header: FieldSection::header(PseudoHeaders::unresolved_request(), HeaderMap::default()),
-            body: Body::Chunked {
-                buflist: Cursor::new(BufList::new()),
-            },
+            body: Body::Streaming { count: 0 },
             trailer: FieldSection::trailer(HeaderMap::default()),
             stage: MessageStage::Header,
         }
@@ -108,9 +106,7 @@ impl Message {
                 PseudoHeaders::unresolved_response(),
                 HeaderMap::default(),
             ),
-            body: Body::Chunked {
-                buflist: Cursor::new(BufList::new()),
-            },
+            body: Body::Streaming { count: 0 },
             trailer: FieldSection::trailer(HeaderMap::default()),
             stage: MessageStage::Header,
         }
