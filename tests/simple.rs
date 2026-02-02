@@ -21,52 +21,60 @@ fn hello_world() {
             .new_request()
             .get(format!("https://{host}/hello_world").parse().unwrap())
             .await
-            .expect("Failed to send request");
+            .expect("failed to send request");
 
         assert_eq!(response.status(), http::StatusCode::OK);
         let response = response
             .read_to_string()
             .await
-            .expect("Failed to read response body");
+            .expect("failed to read response body");
         assert_eq!(response, "Hello, World!");
     })
 }
 
-async fn echo_service(request: &mut server::Request, response: &mut server::Response) {
+async fn streaming_echo_service(request: &mut server::Request, response: &mut server::Response) {
     response.set_status(http::StatusCode::OK);
+    response.flush().await.expect("failed to flush response");
+
     while let Some(chunk) = request
         .read()
         .await
         .transpose()
-        .expect("Failed to read request body")
+        .expect("failed to read request body")
     {
         response
             .write(chunk)
             .await
-            .expect("Failed to write response body");
+            .expect("failed to write response body");
     }
 }
 
 #[test]
-fn echo() {
-    run("echo", async move {
-        let server = test_server(Router::new().post("/echo", echo_service)).await;
+fn streaming_echo() {
+    run("streaming_echo", async move {
+        let server = test_server(Router::new().post("/echo", streaming_echo_service)).await;
         let host = get_server_authority(&server);
         let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
 
         let client = test_client();
-        let (_, mut response) = client
+        let (mut request, mut response) = client
             .new_request()
-            .with_body(TEST_DATA)
             .post(format!("https://{host}/echo").parse().unwrap())
             .await
-            .expect("Failed to send request");
-
+            .expect("failed to send request");
         assert_eq!(response.status(), http::StatusCode::OK);
+
+        request
+            .write(TEST_DATA)
+            .await
+            .expect("failed to write body")
+            .close()
+            .await
+            .expect("failed to close stream");
         let response = response
             .read_to_bytes()
             .await
-            .expect("Failed to read response body");
+            .expect("failed to read response body");
         assert_eq!(response, TEST_DATA);
     })
 }
@@ -88,8 +96,40 @@ fn fallback() {
             .new_request()
             .get(format!("https://{host}/non_exist").parse().unwrap())
             .await
-            .expect("Failed to send request");
+            .expect("failed to send request");
 
         assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+    })
+}
+
+async fn echo_service(request: &mut server::Request, response: &mut server::Response) {
+    let body = request
+        .read_to_bytes()
+        .await
+        .expect("failed to read request body");
+    response.set_status(http::StatusCode::OK).set_body(body);
+}
+
+#[test]
+fn auto_close() {
+    run("auto_close", async move {
+        let server = test_server(Router::new().post("/echo", echo_service)).await;
+        let host = get_server_authority(&server);
+        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
+
+        let client = test_client();
+        let (_, mut response) = client
+            .new_request()
+            .with_body(TEST_DATA)
+            .post(format!("https://{host}/echo").parse().unwrap())
+            .await
+            .expect("failed to send request");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let response = response
+            .read_to_bytes()
+            .await
+            .expect("failed to read response body");
+        assert_eq!(response, TEST_DATA);
     })
 }

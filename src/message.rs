@@ -143,6 +143,10 @@ impl Message {
                 MessageStage::Body if *count == 0 => { /* Ok to change mode: body unused */ }
                 _ => return Err(MalformedMessageError::BodyModeChangeAfterTransferStarted),
             }
+
+            self.body = Body::Chunked {
+                buflist: Cursor::new(BufList::new()),
+            };
         }
         match &mut self.body {
             Body::Streaming { .. } => unreachable!(),
