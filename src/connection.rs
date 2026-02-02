@@ -166,9 +166,9 @@ impl<C: quic::WithRemoteAgent + ?Sized> ConnectionState<C> {
 
 #[derive(Debug, Snafu, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionGoaway {
-    #[snafu(display("Local goaway"))]
+    #[snafu(display("local goaway"))]
     Local,
-    #[snafu(display("Peer goaway"))]
+    #[snafu(display("peer goaway"))]
     Peer,
 }
 

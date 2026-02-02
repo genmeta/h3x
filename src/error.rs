@@ -171,11 +171,11 @@ impl<E: StdError + 'static> HasErrorCode for CodeWith<E> {
 // TODO: add reset code info(if any)
 #[derive(Debug, Snafu)]
 pub enum H3CriticalStreamClosed {
-    #[snafu(display("QPack encoder stream closed unexpectedly"))]
+    #[snafu(display("qpack encoder stream closed unexpectedly"))]
     QPackEncoder,
-    #[snafu(display("QPack decoder stream closed unexpectedly"))]
+    #[snafu(display("qpack decoder stream closed unexpectedly"))]
     QPackDecoder,
-    #[snafu(display("Control stream closed unexpectedly"))]
+    #[snafu(display("control stream closed unexpectedly"))]
     Control,
 }
 
@@ -188,7 +188,7 @@ impl HasErrorCode for H3CriticalStreamClosed {
 // todo: more error variants instead of direct Code::H3_FRAME_UNEXPECTED usage
 #[derive(Debug, Snafu, Clone, Copy)]
 pub enum H3FrameUnexpected {
-    #[snafu(display("Received subsequent SETTINGS frame"))]
+    #[snafu(display("received subsequent SETTINGS frame"))]
     DuplicateSettings,
 }
 

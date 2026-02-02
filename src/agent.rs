@@ -17,7 +17,7 @@ pub struct LocalAgent {
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum SignError {
-    #[snafu(display("Unsupported signature scheme {scheme:?}"))]
+    #[snafu(display("unsupported signature scheme {scheme:?}"))]
     UnsupportedScheme { scheme: SignatureScheme },
     #[snafu(transparent)]
     Crypto { source: rustls::Error },
@@ -70,7 +70,7 @@ pub struct RemoteAgent {
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum VerifyError {
-    #[snafu(display("Unsupported signature scheme {scheme:?}"))]
+    #[snafu(display("unsupported signature scheme {scheme:?}"))]
     UnsupportedScheme { scheme: SignatureScheme },
 }
 

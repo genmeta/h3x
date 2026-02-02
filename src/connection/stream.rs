@@ -165,11 +165,11 @@ impl<S: ?Sized> UnidirectionalStream<S> {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Snafu, Clone, Copy)]
 pub enum H3StreamCreationError {
-    #[snafu(display("Control stream already exists"))]
+    #[snafu(display("control stream already exists"))]
     DuplicateControlStream,
-    #[snafu(display("QPack encoder stream already exists"))]
+    #[snafu(display("qPack encoder stream already exists"))]
     DuplicateQpackEncoderStream,
-    #[snafu(display("QPack decoder stream already exists"))]
+    #[snafu(display("qPack decoder stream already exists"))]
     DuplicateQpackDecoderStream,
 }
 

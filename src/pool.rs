@@ -130,11 +130,11 @@ impl<C: quic::Connection> Default for Pool<C> {
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum ConnectError<E: Error + 'static> {
-    #[snafu(display("Failed to initial QUIC connection"))]
+    #[snafu(display("failed to initial QUIC connection"))]
     Connector { source: E },
     #[snafu(transparent)]
     H3 { source: quic::ConnectionError },
-    #[snafu(display("Peer name mismatch: expected {expected}, actual {}", match actual {
+    #[snafu(display("peer name mismatch: expected {expected}, actual {}", match actual {
         Some(name) => name,
         None => "<anonymous>", 
     }))]
@@ -149,9 +149,9 @@ pub enum ConnectError<E: Error + 'static> {
 pub enum InsertError {
     #[snafu(transparent)]
     Quic { source: quic::ConnectionError },
-    #[snafu(display("Peer does not provide identity"))]
+    #[snafu(display("peer does not provide identity"))]
     MissingIdentify,
-    #[snafu(display("Peer provided invalid identity(cannot be parsed as Authority"))]
+    #[snafu(display("peer provided invalid identity(cannot be parsed as Authority"))]
     InvalidIdentify,
 }
 

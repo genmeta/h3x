@@ -50,13 +50,13 @@ impl DecoderState {
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum QPackEncoderStreamError {
-    #[snafu(display("Setting dynamic table capacity exceeded maximum allowed"))]
+    #[snafu(display("setting dynamic table capacity exceeded maximum allowed"))]
     SetDynamicTableCapacityExceeded,
-    #[snafu(display("No evictable entry for insertion, cannot insert new entry"))]
+    #[snafu(display("no evictable entry for insertion, cannot insert new entry"))]
     NoEvictableEntryForInsertion,
-    #[snafu(display("Referenced static table entry {index} not existed"))]
+    #[snafu(display("referenced static table entry {index} not existed"))]
     ReferencedStaticEntryNotExisted { index: u64 },
-    #[snafu(display("Referenced dynamic table entry {index} not existed"))]
+    #[snafu(display("referenced dynamic table entry {index} not existed"))]
     ReferencedDynamicEntryNotExisted { index: u64 },
 }
 
@@ -301,11 +301,11 @@ pub(crate) fn decompression_field_line_representation(
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum InvalidDynamicTableReference {
-    #[snafu(display("Reference index overflow"))]
+    #[snafu(display("reference index overflow"))]
     IndexOverflow,
-    #[snafu(display("Referenced static table entry {index} not existed"))]
+    #[snafu(display("referenced static table entry {index} not existed"))]
     ReferencedStaticEntryNotExisted { index: u64 },
-    #[snafu(display("Referenced dynamic table entry {index} not existed"))]
+    #[snafu(display("referenced dynamic table entry {index} not existed"))]
     ReferencedDynamicEntryNotExisted { index: u64 },
 }
 

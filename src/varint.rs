@@ -179,7 +179,7 @@ pub mod err {
 
     /// Overflow error indicating that a value exceeds 2^62
     #[derive(Debug, Copy, Clone, Eq, PartialEq, Snafu)]
-    #[snafu(display("Value({value}) too large for varint encoding"))]
+    #[snafu(display("value({value}) too large for varint encoding"))]
     pub struct Overflow {
         pub(super) value: u128,
     }
