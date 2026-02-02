@@ -115,7 +115,7 @@ mod tests {
             tokio::try_join!(init_encoder, init_decoder).unwrap()
         })
         .await
-        .expect("Test timedout");
+        .expect("test timedout");
 
         let request = Request::builder()
             .method("POST")
@@ -180,6 +180,6 @@ mod tests {
             tokio::try_join!(request, response).unwrap()
         })
         .await
-        .expect("Test timedout");
+        .expect("test timedout");
     }
 }

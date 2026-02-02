@@ -20,11 +20,11 @@ fn axum_hello_world() {
         let connection = client
             .connect(host.clone())
             .await
-            .expect("Failed to connect to server");
+            .expect("failed to connect to server");
         let (mut read_stream, mut write_stream) = connection
             .open_request_stream()
             .await
-            .expect("Failed to open request stream");
+            .expect("failed to open request stream");
 
         // TODO: hign level API
         write_stream
@@ -33,10 +33,10 @@ fn axum_hello_world() {
                     .method("GET")
                     .uri(format!("https://{host}/hello_world",))
                     .body(Body::empty())
-                    .expect("Failed to build request"),
+                    .expect("failed to build request"),
             )
             .await
-            .expect("Failed to send request");
+            .expect("failed to send request");
 
         let response_parts = read_stream
             .read_hyper_response_parts()
@@ -50,7 +50,7 @@ fn axum_hello_world() {
             .as_hyper_body()
             .collect()
             .await
-            .expect("Failed to read body");
+            .expect("failed to read body");
 
         let response = http::Response::from_parts(response_parts, body.to_bytes());
 

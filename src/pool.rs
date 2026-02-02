@@ -117,7 +117,7 @@ impl<C: quic::Connection> Pool<C> {
             .entry(TypeId::of::<C>())
             .or_insert_with(|| Box::leak(Box::new(Pool::<C>::empty())))
             .downcast_ref::<Pool<C>>()
-            .expect("TypeId collision")
+            .expect("type id collision")
     }
 }
 

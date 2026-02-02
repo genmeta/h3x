@@ -167,9 +167,9 @@ impl<S: ?Sized> UnidirectionalStream<S> {
 pub enum H3StreamCreationError {
     #[snafu(display("control stream already exists"))]
     DuplicateControlStream,
-    #[snafu(display("qPack encoder stream already exists"))]
+    #[snafu(display("qpack encoder stream already exists"))]
     DuplicateQpackEncoderStream,
-    #[snafu(display("qPack decoder stream already exists"))]
+    #[snafu(display("qpack decoder stream already exists"))]
     DuplicateQpackDecoderStream,
 }
 

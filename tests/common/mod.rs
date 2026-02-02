@@ -25,6 +25,8 @@ use tracing_subscriber::{
     Layer, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
 };
 
+pub const TEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub fn run<F: Future>(test_name: &'static str, future: F) -> F::Output {
     static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -55,7 +57,7 @@ pub fn run<F: Future>(test_name: &'static str, future: F) -> F::Output {
     RT.block_on(async move {
         LazyLock::force(&TRACING);
         let test = future.instrument(tracing::info_span!("test", test_name));
-        match time::timeout(Duration::from_secs(60), test).await {
+        match time::timeout(TEST_TIMEOUT, test).await {
             Ok(output) => output,
             Err(_timedout) => panic!("test timed out"),
         }
@@ -73,7 +75,7 @@ pub fn test_client() -> H3Client {
     H3Client::builder()
         .with_root_certificates(roots)
         .without_identity()
-        .expect("Failed to initialize client tls")
+        .expect("failed to initialize client tls")
         .with_router(Arc::new(QuicRouter::new()))
         .build()
 }
@@ -86,10 +88,10 @@ where
 {
     let mut servers = H3Servers::builder()
         .without_client_cert_verifier()
-        .expect("Failed to initialize server tls")
+        .expect("failed to initialize server tls")
         .with_router(Arc::new(QuicRouter::new()))
         .listen()
-        .expect("Failed to listen");
+        .expect("failed to listen");
     servers
         .add_server(
             "localhost",
@@ -103,7 +105,7 @@ where
             router,
         )
         .await
-        .expect("Failed to add server");
+        .expect("failed to add server");
     servers
 }
 
@@ -111,23 +113,23 @@ pub fn get_server_addr<S>(servers: &H3Servers<S>) -> RealAddr {
     let localhost = servers
         .quic_listener()
         .get_server("localhost")
-        .expect("Server localhost must be registered");
+        .expect("server localhost must be registered");
     let (_bind_uri, localhost_bind_interface) = localhost
         .bind_interfaces()
         .into_iter()
         .next()
-        .expect("Server localhost must have at least one bind interface");
+        .expect("server localhost must have at least one bind interface");
     localhost_bind_interface
         .borrow()
         .real_addr()
-        .expect("Bind interface must have local addr")
+        .expect("bind interface must have local addr")
 }
 
 pub fn get_server_authority<S>(servers: &H3Servers<S>) -> Authority {
     match get_server_addr(servers) {
         RealAddr::Internet(socket_addr) => {
             Authority::from_maybe_shared(Vec::from(format!("localhost:{}", socket_addr.port())))
-                .expect("Failed to parse authority")
+                .expect("failed to parse authority")
         }
         _ => unimplemented!("Only Internet addresses are supported now"),
     }

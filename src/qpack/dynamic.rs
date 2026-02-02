@@ -65,7 +65,7 @@ impl DynamicTable {
     pub fn evict(&mut self) -> (u64, FieldLine) {
         assert!(self.evictable(), "No evictable entry exist");
         let absolute_index = self.dropped_count;
-        let entry = self.entries.pop_front().expect("No entry exist");
+        let entry = self.entries.pop_front().expect("no entry exists");
         self.size -= entry.size();
         self.dropped_count += 1;
 

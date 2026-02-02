@@ -382,7 +382,7 @@ impl Encode<(EncodedFieldSectionPrefix, Vec<FieldLineRepresentation>)> for BufLi
             "Only empty buflist can be used to encode frame"
         );
         let mut header_frame = Frame::new(Frame::HEADERS_FRAME_TYPE, BufList::new())
-            .expect("Empty buflist has zero size");
+            .expect("empty buflist has zero size");
 
         let encode = async move {
             header_frame.encode_one(field_section_prefix).await?;

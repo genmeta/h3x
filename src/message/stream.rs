@@ -470,9 +470,9 @@ impl ReadStream {
                 while let Some(body_part) =
                     self.read_message_body_chunk(message).await.transpose()?
                 {
-                    message.chunked_body().expect("Checked").write(body_part);
+                    message.chunked_body().expect("checked").write(body_part);
                 }
-                Ok(Buffer::Borrow(message.chunked_body().expect("Checked")))
+                Ok(Buffer::Borrow(message.chunked_body().expect("checked")))
             }
         }
     }
@@ -510,7 +510,7 @@ impl ReadStream {
                     }
                     match self.read_message_body_chunk(message).await? {
                         Ok(body_part) => {
-                            message.chunked_body().expect("Checked").write(body_part);
+message.chunked_body().expect("checked").write(body_part);
                             continue;
                         }
                         Err(error) => return Some(Err(error)),

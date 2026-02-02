@@ -59,7 +59,7 @@ impl RouterInner {
     fn route(&mut self, path: &str, service: impl IntoBoxService) {
         self.router
             .insert(path, service.into_box_service())
-            .expect("Failed to register route");
+            .expect("failed to register route");
     }
 
     pub fn on(&mut self, method: Method, path: &str, service: impl IntoBoxService) {

@@ -190,7 +190,7 @@ where
                 .record("uri", self.request.header().uri().to_string());
         }
 
-        let authority = self.request.header().authority().expect("Checked");
+        let authority = self.request.header().authority().expect("checked");
 
         loop {
             let connection = self.client.connect(authority.clone()).await?;

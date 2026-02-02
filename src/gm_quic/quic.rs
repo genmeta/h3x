@@ -173,7 +173,7 @@ impl quic::ManageStream for gm_quic::prelude::Connection {
     {
         self.open_bi_stream()
             .map_ok(|stream| {
-                let (stream_id, (reader, writer)) = stream.expect("TODO: handle stream id run out");
+                let (stream_id, (reader, writer)) = stream.expect("todo: handle stream id run out");
                 let stream_id = convert_varint(stream_id.into());
                 let reader = StreamReader { stream_id, reader };
                 let writer = StreamWriter { stream_id, writer };
@@ -186,7 +186,7 @@ impl quic::ManageStream for gm_quic::prelude::Connection {
     fn open_uni(&self) -> BoxFuture<'_, Result<Self::StreamWriter, quic::ConnectionError>> {
         self.open_uni_stream()
             .map_ok(|stream| {
-                let (stream_id, writer) = stream.expect("TODO: handle stream id run out");
+                let (stream_id, writer) = stream.expect("todo: handle stream id run out");
                 let stream_id = convert_varint(stream_id.into());
                 StreamWriter { stream_id, writer }
             })
