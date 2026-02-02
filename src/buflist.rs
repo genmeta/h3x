@@ -206,6 +206,10 @@ impl Cursor {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.offset = (0, 0);
+    }
+
     pub fn write(&mut self, buf: impl Buf) {
         self.buflist.write(buf);
     }

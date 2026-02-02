@@ -215,6 +215,17 @@ impl Message {
         self.stage = MessageStage::Malformed;
     }
 
+    /// Reset the message to unsent state
+    pub fn to_unsend(mut self) -> Self {
+        assert!(!self.is_dropped(), "cannot unsend a dropped message");
+        self.stage = MessageStage::Header;
+        // reset cursor
+        if let Body::Chunked { buflist } = &mut self.body {
+            buflist.reset();
+        }
+        self
+    }
+
     pub fn take(&mut self) -> Self {
         assert!(!self.is_dropped(), "cannot take a dropped message");
         let message = if self.is_request() {

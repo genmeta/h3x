@@ -185,9 +185,13 @@ where
         }
 
         if tracing::enabled!(tracing::Level::DEBUG) {
-            tracing::Span::current()
-                .record("method", self.request.header().method().as_str())
-                .record("uri", self.request.header().uri().to_string());
+            let span = tracing::Span::current();
+            if !span.has_field("method") {
+                span.record("method", self.request.header().method().as_str());
+            }
+            if !span.has_field("uri") {
+                span.record("uri", self.request.header().uri().to_string());
+            }
         }
 
         let authority = self.request.header().authority().expect("checked");
@@ -244,6 +248,7 @@ where
                 Err(StreamError::MalformedIncomingMessage) => Err(RequestError::MalformedResponse),
                 Err(StreamError::Quic { source }) => Err(source.into()),
                 Err(StreamError::Goaway { .. }) => {
+                    self.request = self.request.to_unsend();
                     tracing::debug!(target: "h3x::client", "Connection goaway, retrying...");
                     continue;
                 }
