@@ -23,7 +23,7 @@ use crate::{
         algorithm::Algorithm,
         decoder::DecoderInstruction,
         dynamic::DynamicTable,
-        field_section::{FieldLine, FieldLineRepresentation},
+        field::{FieldLine, FieldLineRepresentation},
         integer::{decode_integer, encode_integer},
         r#static,
         string::{decode_string, encode_string},

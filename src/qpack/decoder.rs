@@ -20,9 +20,7 @@ use crate::{
     qpack::{
         dynamic::DynamicTable,
         encoder::EncoderInstruction,
-        field_section::{
-            EncodedFieldSectionPrefix, FieldLine, FieldLineRepresentation, FieldSection,
-        },
+        field::{EncodedFieldSectionPrefix, FieldLine, FieldLineRepresentation, FieldSection},
         integer::{decode_integer, encode_integer},
         r#static,
     },

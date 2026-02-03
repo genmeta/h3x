@@ -1,13 +1,16 @@
 use std::{error::Error, fmt::Display, pin::pin};
 
-use bytes::Bytes;
 use futures::TryFutureExt;
-use http::HeaderName;
 use http_body::Body;
 use http_body_util::BodyExt;
 
 use super::{StreamError, WriteStream};
-use crate::qpack::field_section::{FieldLine, PseudoHeaders};
+use crate::{
+    hyper::header_map_to_field_lines,
+    qpack::field::hyper::{
+        hyper_request_parts_to_field_lines, hyper_response_parts_to_field_lines,
+    },
+};
 
 #[derive(Debug)]
 pub enum SendMesageError<E> {
@@ -40,80 +43,6 @@ impl<E: Error> Error for SendMesageError<E> {
             SendMesageError::Body { source } => source.source(),
         }
     }
-}
-
-struct AsRefStrToAsStrBytes<T: ?Sized>(T);
-
-impl<T: AsRef<str> + ?Sized> AsRef<[u8]> for AsRefStrToAsStrBytes<T> {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_ref().as_bytes()
-    }
-}
-
-fn header_map_to_field_lines(headers: http::HeaderMap) -> impl Iterator<Item = FieldLine> {
-    headers
-        .into_iter()
-        .scan(None::<HeaderName>, |last_name, (name, value)| {
-            let name = match name {
-                Some(name) => {
-                    *last_name = Some(name.clone());
-                    name
-                }
-                None => match last_name.clone() {
-                    Some(name) => name,
-                    None => return Some(None),
-                },
-            };
-
-            Some(Some(FieldLine {
-                name: Bytes::from_owner(name),
-                value: Bytes::from_owner(value),
-            }))
-        })
-        .flatten()
-}
-
-fn hyper_request_parts_to_field_lines(
-    parts: http::request::Parts,
-) -> impl Iterator<Item = FieldLine> {
-    let uri_parts = parts.uri.into_parts();
-    let pseudo_headers = [
-        Some(FieldLine {
-            name: Bytes::from_static(PseudoHeaders::METHOD.as_bytes()),
-            value: Bytes::from_owner(AsRefStrToAsStrBytes(parts.method)),
-        }),
-        uri_parts.scheme.map(|scheme| FieldLine {
-            name: Bytes::from_static(PseudoHeaders::SCHEME.as_bytes()),
-            value: Bytes::from_owner(AsRefStrToAsStrBytes(scheme)),
-        }),
-        uri_parts.authority.map(|authority| FieldLine {
-            name: Bytes::from_static(PseudoHeaders::AUTHORITY.as_bytes()),
-            value: Bytes::from_owner(AsRefStrToAsStrBytes(authority)),
-        }),
-        uri_parts.path_and_query.map(|path| FieldLine {
-            name: Bytes::from_static(PseudoHeaders::PATH.as_bytes()),
-            value: Bytes::copy_from_slice(path.as_str().as_bytes()),
-        }),
-    ];
-
-    pseudo_headers
-        .into_iter()
-        .flatten()
-        .chain(header_map_to_field_lines(parts.headers))
-}
-
-fn hyper_response_parts_to_field_lines(
-    parts: http::response::Parts,
-) -> impl Iterator<Item = FieldLine> {
-    let pseudo_headers = [Some(FieldLine {
-        name: Bytes::from_static(PseudoHeaders::STATUS.as_bytes()),
-        value: Bytes::copy_from_slice(parts.status.as_str().as_bytes()),
-    })];
-
-    pseudo_headers
-        .into_iter()
-        .flatten()
-        .chain(header_map_to_field_lines(parts.headers))
 }
 
 impl WriteStream {

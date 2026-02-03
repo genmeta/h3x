@@ -8,9 +8,10 @@ use axum::{
 };
 use bytes::Bytes;
 use common::*;
-use futures::SinkExt;
 use h3x::{
-    message::stream::{ReadStream, hyper::tunnel},
+    hyper::upgrade,
+    message::stream::ReadStream,
+    qpack::field::Protocol,
     server::{self, TowerService},
 };
 use http::{Request, StatusCode};
@@ -158,7 +159,7 @@ async fn mock_connect_service(request: axum::extract::Request) -> Result<(), Sta
     }
 
     tokio::spawn(async move {
-        let (read_stream, write_stream) = tunnel::on(request)
+        let (read_stream, write_stream) = upgrade::on(request)
             .await
             .expect("failed to establish tunnel");
         tracing::info!("tunnel established to {host}:{port}");
@@ -192,7 +193,81 @@ async fn mock_connect_service(request: axum::extract::Request) -> Result<(), Sta
 fn axum_connect() {
     run("axum_connect", async move {
         let router = Router::new()
-            .route("/connect", any(mock_connect_service))
+            .route("/", any(mock_connect_service))
+            .into_service();
+        let server = test_server(TowerService(router)).await;
+        let host = get_server_authority(&server);
+        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
+
+        let client = test_client();
+
+        let connection = client
+            .connect(host.clone())
+            .await
+            .expect("failed to connect to server");
+        let (mut read_stream, mut write_stream) = connection
+            .open_request_stream()
+            .await
+            .expect("failed to open request stream");
+
+        write_stream
+            .send_hyper_request(
+                // FIXME: correct way to build CONNECT request?
+                Request::connect("https://example.org:80")
+                    .body(Body::empty())
+                    .expect("failed to build request"),
+            )
+            .await
+            .expect("failed to send request");
+
+        let response = read_stream
+            .read_hyper_response_parts()
+            .await
+            .expect("failed to take response");
+        assert_eq!(response.status, StatusCode::OK);
+
+        let read_stream = pin!(read_stream.into_bytes_stream());
+        let mut read_stream = StreamReader::new(read_stream);
+        let write_stream = pin!(write_stream.into_bytes_sink::<Bytes>());
+        let mut write_stream = SinkWriter::new(CopyToBytes::new(write_stream));
+
+        write_stream
+            .write_all(CONNECTED_REQUEST.as_bytes())
+            .await
+            .expect("failed to write to tunnel");
+        write_stream
+            .shutdown()
+            .await
+            .expect("failed to close write stream");
+        tracing::info!("Sent connected request");
+
+        let mut buf = Vec::new();
+        read_stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("failed to read from tunnel");
+
+        assert_eq!(&buf[..], CONNECTED_RESPONSE.as_bytes());
+    });
+}
+
+async fn extend_connect_service(request: axum::extract::Request) -> Result<(), StatusCode> {
+    let protocol = request
+        .extensions()
+        .get::<Protocol>()
+        .map(|p| p.as_str())
+        .unwrap_or("");
+    if protocol != "h3x-test" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    mock_connect_service(request).await
+}
+
+#[test]
+fn axum_extend_connect() {
+    run("axum_extend_connect", async move {
+        let router = Router::new()
+            .route("/connect", any(extend_connect_service))
             .into_service();
         let server = test_server(TowerService(router)).await;
         let host = get_server_authority(&server);
@@ -212,6 +287,7 @@ fn axum_connect() {
         write_stream
             .send_hyper_request(
                 Request::connect("https://example.org:80/connect")
+                    .extension(hyper::ext::Protocol::from_static("h3x-test")) // use extension API to set :protocol header
                     .body(Body::empty())
                     .expect("failed to build request"),
             )

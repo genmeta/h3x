@@ -17,3 +17,6 @@ pub mod varint;
 
 #[cfg(feature = "gm-quic")]
 pub mod gm_quic;
+
+#[cfg(feature = "hyper")]
+pub mod hyper;

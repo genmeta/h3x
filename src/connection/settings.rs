@@ -7,13 +7,14 @@ use std::{
 
 use bytes::Buf;
 use futures::TryStreamExt;
+use snafu::Snafu;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 
 use crate::{
     buflist::BufList,
     codec::{Decode, DecodeExt, DecodeStreamError, Encode, EncodeExt},
     connection::StreamError,
-    error::{Code, H3CriticalStreamClosed},
+    error::{Code, H3CriticalStreamClosed, HasErrorCode},
     frame::Frame,
     quic,
     varint::VarInt,
@@ -65,6 +66,13 @@ impl Setting {
     /// https://datatracker.ietf.org/doc/html/rfc9114#section-7.2.4.1-2.2.1
     pub const MAX_FIELD_SECTION_SIZE_DEFAULT_VALUE: Option<VarInt> = None;
 
+    pub const fn max_field_section_size(value: VarInt) -> Self {
+        Self {
+            id: Self::MAX_FIELD_SECTION_SIZE_ID,
+            value,
+        }
+    }
+
     /// To bound the memory requirements of the decoder, the decoder limits
     /// the maximum value the encoder is permitted to set for the dynamic
     /// table capacity. In HTTP/3, this limit is determined by the value of
@@ -81,6 +89,13 @@ impl Setting {
     /// https://datatracker.ietf.org/doc/html/rfc9204#section-5-2.2.1
     pub const QPACK_MAX_TABLE_CAPACITY_DEFAULT_VALUE: VarInt = VarInt::from_u32(0);
 
+    pub const fn qpack_max_table_capacity(value: VarInt) -> Self {
+        Self {
+            id: Self::QPACK_MAX_TABLE_CAPACITY_ID,
+            value,
+        }
+    }
+
     /// The decoder specifies an upper bound on the number of streams that
     /// can be blocked using the SETTINGS_QPACK_BLOCKED_STREAMS setting; see
     /// Section 5. An encoder MUST limit the number of streams that could
@@ -95,6 +110,65 @@ impl Setting {
     ///
     /// https://datatracker.ietf.org/doc/html/rfc9204#section-5-2.4.1
     pub const QPACK_BLOCKED_STREAMS_DEFAULT_VALUE: VarInt = VarInt::from_u32(0);
+
+    pub const fn qpack_blocked_streams(value: VarInt) -> Self {
+        Self {
+            id: Self::QPACK_BLOCKED_STREAMS_ID,
+            value,
+        }
+    }
+
+    /// [RFC8441] defines a mechanism for running the WebSocket Protocol
+    /// [RFC6455] over a single stream of an HTTP/2 connection. It defines an
+    /// Extended CONNECT method that specifies a new ":protocol" pseudo-
+    /// header field and new semantics for the ":path" and ":authority"
+    /// pseudo-header fields. It also defines a new HTTP/2 setting sent by a
+    /// server to allow the client to use Extended CONNECT.
+    ///
+    /// The semantics of the pseudo-header fields and setting are identical
+    /// to those in HTTP/2 as defined in [RFC8441]. Appendix A.3 of [HTTP/3]
+    /// requires that HTTP/3 settings be registered separately for HTTP/3.
+    /// The SETTINGS_ENABLE_CONNECT_PROTOCOL value is 0x08 (decimal 8), as in
+    /// HTTP/2.
+    ///
+    /// https://datatracker.ietf.org/doc/html/rfc9220#name-websockets-upgrade-over-htt
+    pub const ENABLE_CONNECT_PROTOCOL_ID: VarInt = VarInt::from_u32(0x08);
+    pub const ENABLE_CONNECT_PROTOCOL_DEFAULT_VALUE: Option<VarInt> = None;
+
+    pub const fn enable_connect_protocol(enabled: bool) -> Self {
+        Self {
+            id: Self::ENABLE_CONNECT_PROTOCOL_ID,
+            value: VarInt::from_u32(enabled as u32),
+        }
+    }
+
+    pub fn check(&self) -> Result<(), InvalidSettingValue> {
+        if self.id == Self::ENABLE_CONNECT_PROTOCOL_ID
+            && self.value != VarInt::from_u32(0)
+            && self.value != VarInt::from_u32(1)
+        {
+            return Err(InvalidSettingValue::ConnectProtocol { value: self.value });
+        }
+        Ok(())
+    }
+}
+
+impl From<(VarInt, VarInt)> for Setting {
+    fn from((id, value): (VarInt, VarInt)) -> Self {
+        Self::new(id, value)
+    }
+}
+
+#[derive(Snafu, Debug, Clone, Copy)]
+pub enum InvalidSettingValue {
+    #[snafu(display("The value of the ENABLE_CONNECT_PROTOCOL setting must be 0 or 1"))]
+    ConnectProtocol { value: VarInt },
+}
+
+impl HasErrorCode for InvalidSettingValue {
+    fn code(&self) -> Code {
+        Code::H3_SETTINGS_ERROR
+    }
 }
 
 impl<S: AsyncRead> Decode<Setting> for S {
@@ -107,12 +181,15 @@ impl<S: AsyncRead> Decode<Setting> for S {
             let value = stream.decode_one().await?;
             Ok(Setting { id, value })
         };
-        decode.await.map_err(|error: DecodeStreamError| {
+        let setting = decode.await.map_err(|error: DecodeStreamError| {
             error.map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::Control.into(),
                 |decode_error| Code::H3_FRAME_ERROR.with(decode_error).into(),
             )
-        })
+        })?;
+
+        setting.check()?;
+        Ok(setting)
     }
 }
 
@@ -197,6 +274,11 @@ impl Settings {
         self.get(Setting::QPACK_BLOCKED_STREAMS_ID).unwrap()
     }
 
+    pub fn enable_connect_protocol(&self) -> bool {
+        self.get(Setting::ENABLE_CONNECT_PROTOCOL_ID)
+            .is_some_and(|value| value == VarInt::from_u32(1))
+    }
+
     pub fn get(&self, id: VarInt) -> Option<VarInt> {
         match self.map.get(&id).copied() {
             None if id == Setting::MAX_FIELD_SECTION_SIZE_ID => {
@@ -207,6 +289,9 @@ impl Settings {
             }
             None if id == Setting::QPACK_BLOCKED_STREAMS_ID => {
                 Some(Setting::QPACK_BLOCKED_STREAMS_DEFAULT_VALUE)
+            }
+            None if id == Setting::ENABLE_CONNECT_PROTOCOL_ID => {
+                Setting::ENABLE_CONNECT_PROTOCOL_DEFAULT_VALUE
             }
             option => option,
         }
@@ -250,5 +335,12 @@ impl FromIterator<Setting> for Settings {
                 .map(|Setting { id, value }| (id, value))
                 .collect::<BTreeMap<_, _>>(),
         }
+    }
+}
+
+impl Extend<Setting> for Settings {
+    fn extend<T: IntoIterator<Item = Setting>>(&mut self, iter: T) {
+        self.map
+            .extend(iter.into_iter().map(|Setting { id, value }| (id, value)));
     }
 }

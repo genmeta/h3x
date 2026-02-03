@@ -2,7 +2,7 @@ pub mod algorithm;
 pub mod decoder;
 pub mod dynamic;
 pub mod encoder;
-pub mod field_section;
+pub mod field;
 pub mod instruction;
 pub mod integer;
 pub mod r#static;
@@ -35,7 +35,7 @@ mod tests {
             algorithm::{HuffmanAlways, StaticCompressAlgo},
             decoder::{Decoder, MessageStreamReader},
             encoder::Encoder,
-            field_section::FieldSection,
+            field::FieldSection,
         },
         quic::{ConnectionError, test::mock_stream_pair},
         util::try_future::TryFuture,

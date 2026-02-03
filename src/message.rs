@@ -11,7 +11,7 @@ use snafu::Snafu;
 
 use crate::{
     buflist::{BufList, Cursor},
-    qpack::field_section::{FieldSection, MalformedHeaderSection, PseudoHeaders},
+    qpack::field::{FieldSection, MalformedHeaderSection, PseudoHeaders},
 };
 
 #[derive(Debug, Clone)]

@@ -23,16 +23,14 @@ use crate::{
     qpack::{
         algorithm::{HuffmanAlways, StaticCompressAlgo},
         encoder::EncodeHeaderSectionError,
-        field_section::{
-            FieldLine, FieldSection, MalformedHeaderSection, malformed_header_section,
-        },
+        field::{FieldLine, FieldSection, MalformedHeaderSection, malformed_header_section},
     },
     quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
     varint::VarInt,
 };
 
-#[cfg(feature = "http-body")]
-pub mod hyper;
+#[cfg(feature = "hyper")]
+pub(crate) mod hyper;
 mod unfold;
 
 fn message_used_after_dropped() -> ! {
@@ -602,7 +600,7 @@ pub struct WriteStream {
     connection: Arc<ConnectionState<dyn quic::Close + Send + Sync>>,
 }
 
-const DEFAULT_COMPRESS_ALGO: StaticCompressAlgo<HuffmanAlways> =
+pub const DEFAULT_COMPRESS_ALGO: StaticCompressAlgo<HuffmanAlways> =
     StaticCompressAlgo::new(HuffmanAlways);
 
 impl WriteStream {

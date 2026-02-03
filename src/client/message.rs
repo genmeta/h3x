@@ -20,7 +20,7 @@ use crate::{
         stream::{ReadStream, ReadToStringError, StreamError, WriteStream},
     },
     pool::ConnectError,
-    qpack::field_section::MalformedHeaderSection,
+    qpack::field::MalformedHeaderSection,
     quic,
 };
 

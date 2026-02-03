@@ -15,7 +15,7 @@ use crate::{
         MalformedMessageError, Message, MessageStage,
         stream::{ReadStream, ReadToStringError, StreamError, WriteStream},
     },
-    qpack::field_section::PseudoHeaders,
+    qpack::field::PseudoHeaders,
 };
 
 pub struct UnresolvedRequest {

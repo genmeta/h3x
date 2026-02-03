@@ -19,9 +19,10 @@ mod route;
 pub use route::{MethodRouter, Router};
 mod service;
 pub use service::{BoxService, BoxServiceFuture, IntoBoxService, Service, box_service};
-#[cfg(feature = "http-body")]
+
+#[cfg(feature = "hyper")]
 pub mod tower;
-#[cfg(feature = "http-body")]
+#[cfg(feature = "hyper")]
 pub use tower::TowerService;
 
 #[derive(Debug)]

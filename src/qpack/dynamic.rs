@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::qpack::field_section::FieldLine;
+use crate::qpack::field::FieldLine;
 
 #[derive(Debug)]
 pub struct DynamicTable {

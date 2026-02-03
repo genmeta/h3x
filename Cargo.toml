@@ -32,11 +32,12 @@ gm-quic = { git = "https://github.com/genmeta/gm-quic.git", branch = "main", opt
 
 http-body = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["http2"] }
 
 [features]
-default = ['gm-quic', 'http-body']
+default = ['gm-quic', 'hyper']
 gm-quic = ['dep:gm-quic']
-http-body = ['dep:http-body', 'dep:http-body-util']
+hyper = ['dep:http-body', 'dep:http-body-util']
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = [

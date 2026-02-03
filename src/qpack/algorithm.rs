@@ -2,7 +2,7 @@ use bytes::Bytes;
 
 use crate::qpack::{
     encoder::EncoderState,
-    field_section::{EncodedFieldSectionPrefix, FieldLine, FieldLineRepresentation},
+    field::{EncodedFieldSectionPrefix, FieldLine, FieldLineRepresentation},
     r#static,
 };
 
