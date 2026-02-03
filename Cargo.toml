@@ -49,6 +49,7 @@ axum = { version = "0.8", default-features = false, features = [
     'tokio',        # (default)
     'tower-log',    # (default)
     'tracing',      # (default)
+    'macros',       # for debug_handler
 ] }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",

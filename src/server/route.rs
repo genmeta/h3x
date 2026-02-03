@@ -178,6 +178,25 @@ impl Router {
     ) -> BoxServiceFuture<'s> {
         self.inner_ref().serve(request, response)
     }
+
+    #[tracing::instrument(skip(self, req), fields(method = tracing::field::Empty, uri = tracing::field::Empty))]
+    pub async fn handle(&self, req: UnresolvedRequest) -> Result<(), StreamError> {
+        let (mut request, mut response) = req.resolve().await?;
+
+        tracing::Span::current()
+            .record("method", request.method().as_str())
+            .record("uri", request.uri().to_string());
+
+        self.serve(&mut request, &mut response).await;
+
+        // Drop response in place to avoid spawning another tokio task
+        // FIXME: remove this when async drop is stablized (https://github.com/rust-lang/rust/issues/126482)
+        if let Some(drop_future) = response.drop() {
+            drop_future.await;
+        }
+
+        Ok(())
+    }
 }
 
 impl Service for Router {
@@ -202,27 +221,7 @@ impl tower_service::Service<UnresolvedRequest> for Router {
 
     fn call(&mut self, req: UnresolvedRequest) -> Self::Future {
         let router = self.clone();
-
-        Box::pin(async move {
-            let (mut request, mut response) = req.resolve().await?;
-
-            if tracing::Span::current().has_field("method") {
-                tracing::Span::current().record("method", request.method().as_str());
-            }
-            if tracing::Span::current().has_field("uri") {
-                tracing::Span::current().record("uri", request.uri().to_string());
-            }
-
-            router.serve(&mut request, &mut response).await;
-
-            // Drop response in place to avoid spawning another tokio task
-            // FIXME: remove this when async drop is stablized (https://github.com/rust-lang/rust/issues/126482)
-            if let Some(drop_future) = response.drop() {
-                drop_future.await;
-            }
-
-            Ok(())
-        })
+        Box::pin(async move { router.handle(req).await })
     }
 }
 

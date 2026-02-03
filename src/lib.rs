@@ -3,10 +3,10 @@
 pub mod agent;
 pub mod buflist;
 pub mod client;
-mod codec;
+pub mod codec;
 pub mod connection;
 pub mod error;
-mod frame;
+pub mod frame;
 pub mod message;
 pub mod pool;
 pub mod qpack;

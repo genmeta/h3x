@@ -1,13 +1,25 @@
 mod common;
-use axum::{Router, body::Body, routing::get};
+use std::pin::pin;
+
+use axum::{
+    Router,
+    body::Body,
+    routing::{any, get},
+};
+use bytes::Bytes;
 use common::*;
+use futures::SinkExt;
 use h3x::{
-    message::stream::http_body::RemainReadStream,
+    message::stream::{ReadStream, hyper::tunnel},
     server::{self, TowerService},
 };
-use http::Request;
-use http_body_util::BodyExt;
-use tokio_util::task::AbortOnDropHandle;
+use http::{Request, StatusCode};
+use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::{
+    io::{CopyToBytes, SinkWriter, StreamReader},
+    task::AbortOnDropHandle,
+};
 
 #[test]
 fn axum_hello_world() {
@@ -43,7 +55,7 @@ fn axum_hello_world() {
             .expect("failed to send request");
 
         let response = read_stream
-            .to_hyper_response()
+            .into_hyper_response()
             .await
             .expect("failed to take response");
 
@@ -105,18 +117,19 @@ fn interim_response() {
             .expect("failed to send request");
 
         let mut response = read_stream
-            .to_hyper_response()
+            .into_hyper_response()
             .await
-            .expect("failed to take response");
+            .expect("failed to take response")
+            .map(UnsyncBoxBody::new);
 
         while response.status().is_informational()
-            && let Some(remain) = response.extensions().get::<RemainReadStream>().cloned()
+            && let Some(remain) = ReadStream::extract_from(&mut response).await
         {
-            let read_stream = remain.await.expect("failed to get remain stream");
-            response = read_stream
-                .to_hyper_response()
+            response = remain
+                .into_hyper_response()
                 .await
-                .expect("failed to take response");
+                .expect("failed to take response")
+                .map(UnsyncBoxBody::new);
         }
 
         assert_eq!(response.status(), http::StatusCode::OK);
@@ -128,4 +141,110 @@ fn interim_response() {
 
         assert_eq!(&body[..], b"37");
     })
+}
+
+const CONNECTED_REQUEST: &str = "GET / HTTP/1.1\r\nHost: example.org\r\nConnection: close\r\n\r\n";
+const CONNECTED_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello";
+
+#[axum::debug_handler]
+async fn mock_connect_service(request: axum::extract::Request) -> Result<(), StatusCode> {
+    let (Some(host), Some(port)) = (request.uri().host(), request.uri().port_u16()) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let host = host.to_string();
+
+    if host != "example.org" || port != 80 {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    tokio::spawn(async move {
+        let (read_stream, write_stream) = tunnel::on(request)
+            .await
+            .expect("failed to establish tunnel");
+        tracing::info!("tunnel established to {host}:{port}");
+        let read_stream = pin!(read_stream.into_bytes_stream());
+        let mut read_stream = StreamReader::new(read_stream);
+        let write_stream = pin!(write_stream.into_bytes_sink::<Bytes>());
+        let mut write_stream = SinkWriter::new(CopyToBytes::new(write_stream));
+
+        let mut buf = Vec::with_capacity(CONNECTED_REQUEST.len());
+        read_stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("failed to read from tunnel");
+        tracing::info!(request = %String::from_utf8_lossy(&buf), "Tunnel received request");
+
+        assert_eq!(&buf[..], CONNECTED_REQUEST.as_bytes());
+        write_stream
+            .write_all(CONNECTED_RESPONSE.as_bytes())
+            .await
+            .expect("failed to write to tunnel");
+        write_stream
+            .shutdown()
+            .await
+            .expect("failed to close write stream");
+    });
+
+    Ok(())
+}
+
+#[test]
+fn axum_connect() {
+    run("axum_connect", async move {
+        let router = Router::new()
+            .route("/connect", any(mock_connect_service))
+            .into_service();
+        let server = test_server(TowerService(router)).await;
+        let host = get_server_authority(&server);
+        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
+
+        let client = test_client();
+
+        let connection = client
+            .connect(host.clone())
+            .await
+            .expect("failed to connect to server");
+        let (mut read_stream, mut write_stream) = connection
+            .open_request_stream()
+            .await
+            .expect("failed to open request stream");
+
+        write_stream
+            .send_hyper_request(
+                Request::connect("https://example.org:80/connect")
+                    .body(Body::empty())
+                    .expect("failed to build request"),
+            )
+            .await
+            .expect("failed to send request");
+
+        let response = read_stream
+            .read_hyper_response_parts()
+            .await
+            .expect("failed to take response");
+        assert_eq!(response.status, StatusCode::OK);
+
+        let read_stream = pin!(read_stream.into_bytes_stream());
+        let mut read_stream = StreamReader::new(read_stream);
+        let write_stream = pin!(write_stream.into_bytes_sink::<Bytes>());
+        let mut write_stream = SinkWriter::new(CopyToBytes::new(write_stream));
+
+        write_stream
+            .write_all(CONNECTED_REQUEST.as_bytes())
+            .await
+            .expect("failed to write to tunnel");
+        write_stream
+            .shutdown()
+            .await
+            .expect("failed to close write stream");
+        tracing::info!("Sent connected request");
+
+        let mut buf = Vec::new();
+        read_stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("failed to read from tunnel");
+
+        assert_eq!(&buf[..], CONNECTED_RESPONSE.as_bytes());
+    });
 }

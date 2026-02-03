@@ -47,8 +47,6 @@ where
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum RequestError<E: Error + 'static> {
-    #[snafu(display("expected HTTPS scheme"))]
-    NotHttpsScheme,
     #[snafu(transparent)]
     Connect { source: ConnectError<E> },
     #[snafu(transparent)]
@@ -180,9 +178,6 @@ where
             .header()
             .check_pseudo()
             .context(request_error::MalformedRequestHeaderSnafu)?;
-        if self.request.header().scheme() != Some(Scheme::HTTPS) {
-            return Err(RequestError::NotHttpsScheme);
-        }
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             let span = tracing::Span::current();
@@ -342,7 +337,7 @@ impl Request {
     fn check_message_operation(
         &mut self,
         operation: &str,
-        operate: impl FnOnce(&mut Self) -> Result<(), MalformedMessageError>,
+        check: impl FnOnce(&mut Self) -> Result<(), MalformedMessageError>,
     ) {
         if self.message.is_malformed() {
             tracing::warn!(
@@ -350,7 +345,7 @@ impl Request {
                 "Request is malformed, operation will not affect the request stream",
             );
         }
-        if let Err(error) = operate(self) {
+        if let Err(error) = check(self) {
             tracing::warn!(
                 target: "h3x::client", operation, error = %Report::from_error(error),
                 "Operation malformed the request message, request stream will be cancelled with H3_REQUEST_CANCELLED",

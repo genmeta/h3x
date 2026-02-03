@@ -1,3 +1,5 @@
+#![allow(async_fn_in_trait)]
+
 mod error;
 
 mod reader;
@@ -9,7 +11,7 @@ pub use reader::{FixedLengthReader, StreamReader};
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt};
 pub use writer::{Feed, SinkWriter};
 
-pub(crate) trait Encode<T>: Sized {
+pub trait Encode<T>: Sized {
     type Output;
     type Error;
 
@@ -42,13 +44,13 @@ pub trait EncodeExt {
 
 impl<T: ?Sized> EncodeExt for T {}
 
-pub(crate) trait Decode<T>: Sized {
+pub trait Decode<T>: Sized {
     type Error;
 
     async fn decode(self) -> Result<T, Self::Error>;
 }
 
-pub(crate) trait DecodeExt {
+pub trait DecodeExt {
     async fn decode_one<'s, T>(&'s mut self) -> Result<T, <&'s mut Self as Decode<T>>::Error>
     where
         &'s mut Self: Decode<T>,

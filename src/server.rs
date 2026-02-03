@@ -159,17 +159,12 @@ where
                     response_stream: write_stream,
                     local_agent: local_agent.clone(),
                 };
-                let span = tracing::info_span!(
-                    "handle_request",
-                    stream_id = %stream_id,
-                    method = tracing::field::Empty,
-                    uri = tracing::field::Empty
-                );
 
                 let handle_request = async move {
                     if let Err(error) = future::poll_fn(|cx| service.poll_ready(cx)).await {
                         let error = error.into();
                         tracing::debug!(
+                            stream_id = %stream_id,
                             error = %Report::from_error(error.as_ref()),
                             "Service not ready to handle incoming request"
                         );
@@ -179,12 +174,13 @@ where
                     if let Err(error) = service.call(unresolved_request).await {
                         let error = error.into();
                         tracing::debug!(
+                            stream_id = %stream_id,
                             error = %Report::from_error(error.as_ref()),
                             "Failed to handle incoming request"
                         );
                     }
                 };
-                connection_tasks.spawn(handle_request.instrument(span));
+                connection_tasks.spawn(handle_request.in_current_span());
             }
         }
         .instrument(span)
