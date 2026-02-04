@@ -5,11 +5,9 @@ use http_body::Body;
 use http_body_util::BodyExt;
 
 use super::{StreamError, WriteStream};
-use crate::{
-    hyper::header_map_to_field_lines,
-    qpack::field::hyper::{
-        hyper_request_parts_to_field_lines, hyper_response_parts_to_field_lines,
-    },
+use crate::qpack::field::hyper::{
+    header_map_to_field_lines, hyper_request_parts_to_field_lines,
+    hyper_response_parts_to_field_lines,
 };
 
 #[derive(Debug)]

@@ -1,7 +1,7 @@
 use std::error::Error;
 
 use bytes::{Buf, Bytes};
-use futures::{Sink, Stream, sink, stream};
+use futures::{Sink, Stream, TryFutureExt, sink, stream};
 use http::{
     HeaderMap, HeaderValue, Method, Uri,
     header::{AsHeaderName, IntoHeaderName},
@@ -13,7 +13,7 @@ use tracing::Instrument;
 use crate::{
     agent::{LocalAgent, RemoteAgent},
     client::Client,
-    connection::InitialRequestStreamError,
+    connection::OpenRequestStreamError,
     error::Code,
     message::{
         MalformedMessageError, Message, MessageStage,
@@ -49,8 +49,10 @@ where
 pub enum RequestError<E: Error + 'static> {
     #[snafu(transparent)]
     Connect { source: ConnectError<E> },
-    #[snafu(transparent)]
-    Stream { source: quic::StreamError },
+    #[snafu(display("request stream error"))]
+    RequestStream { source: quic::StreamError },
+    #[snafu(display("response stream error"))]
+    ResponseStream { source: quic::StreamError },
     #[snafu(display("request cannot be send due to malformed header"))]
     MalformedRequestHeader { source: MalformedHeaderSection },
     #[snafu(display(
@@ -65,12 +67,6 @@ pub enum RequestError<E: Error + 'static> {
     DataFrameTooLarge,
     #[snafu(display("response from peer is malformed"))]
     MalformedResponse,
-}
-
-impl<E: Error + 'static> From<quic::ConnectionError> for RequestError<E> {
-    fn from(error: quic::ConnectionError) -> Self {
-        quic::StreamError::from(error).into()
-    }
 }
 
 impl<C: quic::Connect> Client<C> {
@@ -170,8 +166,7 @@ where
         level = "debug",
         target = "h3x::client",
         name = "execute_request",
-        skip_all,
-        err
+        skip_all
     )]
     pub async fn execute(mut self) -> Result<(Request, Response), RequestError<C::Error>> {
         self.request
@@ -197,18 +192,22 @@ where
 
             let (mut read_stream, mut write_stream) = match connection.open_request_stream().await {
                 Ok(pair) => pair,
-                Err(InitialRequestStreamError::Quic { source: error }) => return Err(error.into()),
-                Err(InitialRequestStreamError::Goaway { .. }) => {
+                Err(OpenRequestStreamError::RequestStream { source }) => {
+                    return Err(RequestError::RequestStream { source });
+                }
+                Err(OpenRequestStreamError::Goaway { .. }) => {
                     tracing::debug!(target: "h3x::client", "Connection goaway, retrying...");
                     continue;
                 }
             };
 
-            let local_agent = connection.local_agent().await?;
-            let remote_agent = connection
-                .remote_agent()
-                .await?
-                .expect("chekced by Client::connect");
+            let Ok(local_agent) = connection.local_agent().await else {
+                continue;
+            };
+            let Ok(remote_agent) = connection.remote_agent().await else {
+                continue;
+            };
+            let remote_agent = remote_agent.expect("chekced by Client::connect");
 
             let send_request = async {
                 if self.auto_close && self.request.is_chunked() {
@@ -220,9 +219,17 @@ where
 
             let mut response = Message::unresolved_response();
 
+            #[derive(Debug, PartialEq)]
+            enum Stream {
+                Request,
+                Response,
+            }
+
             return match tokio::try_join!(
-                send_request,
-                read_stream.read_message_header(&mut response)
+                send_request.map_err(|e| (Stream::Request, e)),
+                read_stream
+                    .read_message_header(&mut response)
+                    .map_err(|e| (Stream::Response, e)),
             ) {
                 Ok(..) => {
                     let request = Request {
@@ -237,12 +244,27 @@ where
                     };
                     return Ok((request, response));
                 }
-                Err(StreamError::HeaderTooLarge) => Err(RequestError::HeaderTooLarge),
-                Err(StreamError::TrailerTooLarge) => Err(RequestError::TrailerTooLarge),
-                Err(StreamError::DataFrameTooLarge) => Err(RequestError::DataFrameTooLarge),
-                Err(StreamError::MalformedIncomingMessage) => Err(RequestError::MalformedResponse),
-                Err(StreamError::Quic { source }) => Err(source.into()),
-                Err(StreamError::Goaway { .. }) => {
+                Err((stream, StreamError::HeaderTooLarge)) => {
+                    debug_assert_eq!(stream, Stream::Response);
+                    Err(RequestError::HeaderTooLarge)
+                }
+                Err((stream, StreamError::TrailerTooLarge)) => {
+                    debug_assert_eq!(stream, Stream::Response);
+                    Err(RequestError::TrailerTooLarge)
+                }
+                Err((stream, StreamError::DataFrameTooLarge)) => {
+                    debug_assert_eq!(stream, Stream::Request);
+                    Err(RequestError::DataFrameTooLarge)
+                }
+                Err((stream, StreamError::MalformedIncomingMessage)) => {
+                    debug_assert_eq!(stream, Stream::Response);
+                    Err(RequestError::MalformedResponse)
+                }
+                Err((stream, StreamError::Quic { source })) => match stream {
+                    Stream::Request => Err(RequestError::RequestStream { source }),
+                    Stream::Response => Err(RequestError::ResponseStream { source }),
+                },
+                Err((.., StreamError::Goaway { .. })) => {
                     self.request = self.request.to_unsend();
                     tracing::debug!(target: "h3x::client", "Connection goaway, retrying...");
                     continue;

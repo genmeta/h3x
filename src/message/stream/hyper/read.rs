@@ -8,12 +8,12 @@ use futures::stream;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Empty, StreamBody};
 
-use super::{ReadStream, RemainStream, StreamError};
+use super::{ReadStream, StreamError, upgrade::RemainStream};
 use crate::{connection, error::Code};
 
 pin_project_lite::pin_project! {
     #[project = EitherProj]
-    enum Either<L, R> {
+    pub enum Either<L, R> {
         Left { #[pin] body: L },
         Right { #[pin] body: R }
     }
@@ -148,15 +148,5 @@ impl ReadStream {
                 Ok(http::Response::from_parts(parts, Either::left(body)))
             }
         }
-    }
-
-    pub async fn into_hyper_empty_response(
-        mut self,
-    ) -> Result<http::Response<impl Body<Data = Bytes, Error = StreamError> + Send>, StreamError>
-    {
-        let mut parts = self.read_hyper_response_parts().await?;
-        parts.extensions.insert(RemainStream::immediately(self));
-        let body = Empty::new().map_err(|n| match n {});
-        Ok(http::Response::from_parts(parts, body))
     }
 }

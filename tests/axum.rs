@@ -10,7 +10,6 @@ use bytes::Bytes;
 use common::*;
 use h3x::{
     hyper::upgrade,
-    message::stream::ReadStream,
     qpack::field::Protocol,
     server::{self, TowerService},
 };
@@ -38,14 +37,9 @@ fn axum_hello_world() {
             .connect(host.clone())
             .await
             .expect("failed to connect to server");
-        let (read_stream, mut write_stream) = connection
-            .open_request_stream()
-            .await
-            .expect("failed to open request stream");
 
-        // TODO: hign level API
-        write_stream
-            .send_hyper_request(
+        let response = connection
+            .execute_hyper_request(
                 Request::builder()
                     .method("GET")
                     .uri(format!("https://{host}/hello_world",))
@@ -53,12 +47,8 @@ fn axum_hello_world() {
                     .expect("failed to build request"),
             )
             .await
-            .expect("failed to send request");
-
-        let response = read_stream
-            .into_hyper_response()
-            .await
-            .expect("failed to take response");
+            .expect("failed to execute request")
+            .map(UnsyncBoxBody::new);
 
         let body = response
             .collect()
@@ -103,35 +93,16 @@ fn interim_response() {
             .connect(host.clone())
             .await
             .expect("failed to connect to server");
-        let (read_stream, mut write_stream) = connection
-            .open_request_stream()
-            .await
-            .expect("failed to open request stream");
 
-        write_stream
-            .send_hyper_request(
+        let response = connection
+            .execute_hyper_request(
                 Request::get(format!("https://{host}/ultimate_answer"))
                     .body(Body::empty())
                     .expect("failed to build request"),
             )
             .await
-            .expect("failed to send request");
-
-        let mut response = read_stream
-            .into_hyper_response()
-            .await
-            .expect("failed to take response")
+            .expect("failed to execute request")
             .map(UnsyncBoxBody::new);
-
-        while response.status().is_informational()
-            && let Some(remain) = ReadStream::extract_from(&mut response).await
-        {
-            response = remain
-                .into_hyper_response()
-                .await
-                .expect("failed to take response")
-                .map(UnsyncBoxBody::new);
-        }
 
         assert_eq!(response.status(), http::StatusCode::OK);
         let body = response
@@ -205,31 +176,28 @@ fn axum_connect() {
             .connect(host.clone())
             .await
             .expect("failed to connect to server");
-        let (mut read_stream, mut write_stream) = connection
-            .open_request_stream()
-            .await
-            .expect("failed to open request stream");
 
-        write_stream
-            .send_hyper_request(
+        let response = connection
+            .execute_hyper_request(
                 // FIXME: correct way to build CONNECT request?
                 Request::connect("https://example.org:80")
                     .body(Body::empty())
                     .expect("failed to build request"),
             )
             .await
-            .expect("failed to send request");
+            .expect("failed to execute request")
+            .map(UnsyncBoxBody::new);
 
-        let response = read_stream
-            .read_hyper_response_parts()
-            .await
-            .expect("failed to take response");
-        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let read_stream = pin!(read_stream.into_bytes_stream());
-        let mut read_stream = StreamReader::new(read_stream);
-        let write_stream = pin!(write_stream.into_bytes_sink::<Bytes>());
-        let mut write_stream = SinkWriter::new(CopyToBytes::new(write_stream));
+        let Some((read_stream, write_stream)) = upgrade::on(response).await else {
+            panic!("failed to upgrade to tunnel");
+        };
+
+        let mut read_stream = pin!(StreamReader::new(read_stream.into_bytes_stream()));
+        let mut write_stream = pin!(SinkWriter::new(CopyToBytes::new(
+            write_stream.into_bytes_sink::<Bytes>()
+        )));
 
         write_stream
             .write_all(CONNECTED_REQUEST.as_bytes())

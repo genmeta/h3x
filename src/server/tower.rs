@@ -15,7 +15,7 @@ use tracing::Instrument;
 use crate::{
     message::stream::{
         StreamError,
-        hyper::{RemainStream, SendMesageError},
+        hyper::{upgrade::RemainStream, write::SendMesageError},
     },
     server::{Request, Response, UnresolvedRequest},
 };

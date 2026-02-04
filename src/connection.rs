@@ -253,16 +253,16 @@ impl<C: quic::Close + ?Sized> ConnectionState<C> {
 
 #[derive(Debug, Snafu, Clone)]
 #[snafu(module)]
-pub enum InitialRequestStreamError {
+pub enum OpenRequestStreamError {
     #[snafu(transparent)]
-    Quic { source: quic::StreamError },
+    RequestStream { source: quic::StreamError },
     #[snafu(transparent)]
     Goaway { source: ConnectionGoaway },
 }
 
-impl From<quic::ConnectionError> for InitialRequestStreamError {
+impl From<quic::ConnectionError> for OpenRequestStreamError {
     fn from(error: quic::ConnectionError) -> Self {
-        Self::Quic {
+        Self::RequestStream {
             source: error.into(),
         }
     }
@@ -286,9 +286,9 @@ impl From<quic::ConnectionError> for AcceptRequestStreamError {
 }
 
 impl<C: quic::Close + quic::ManageStream + ?Sized> ConnectionState<C> {
-    pub async fn initial_request_stream(
+    pub async fn open_request_stream(
         &self,
-    ) -> Result<(Pin<Box<C::StreamReader>>, Pin<Box<C::StreamWriter>>), InitialRequestStreamError>
+    ) -> Result<(Pin<Box<C::StreamReader>>, Pin<Box<C::StreamWriter>>), OpenRequestStreamError>
     {
         let (reader, writer) = self.open_bi().await?;
         let mut reader = Box::pin(reader);
@@ -689,11 +689,9 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
 impl<C: quic::Connection /* TODO: + ?Sized */> Connection<C> {
     pub async fn open_request_stream(
         &self,
-    ) -> Result<
-        (message::stream::ReadStream, message::stream::WriteStream),
-        InitialRequestStreamError,
-    > {
-        let (stream_reader, stream_writer) = self.state.initial_request_stream().await?;
+    ) -> Result<(message::stream::ReadStream, message::stream::WriteStream), OpenRequestStreamError>
+    {
+        let (stream_reader, stream_writer) = self.state.open_request_stream().await?;
         Ok((
             message::stream::ReadStream::new(
                 stream_reader,

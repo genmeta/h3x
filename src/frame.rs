@@ -333,8 +333,8 @@ mod tests {
             b'W', b'o', b'r', b'l', b'd', // Payload: "World"
         ]));
 
-        let mut stream = FrameStream::new(stream);
-        let mut frame1 = stream.next_frame().await.unwrap().unwrap();
+        let mut stream = pin!(FrameStream::new(stream));
+        let mut frame1 = stream.as_mut().next_frame().await.unwrap().unwrap();
         assert_eq!(frame1.r#type().into_inner(), 0);
         assert_eq!(frame1.length().into_inner(), 5);
         let mut payload = vec![];
@@ -385,7 +385,7 @@ mod tests {
             b'H', b'e', b'l', b'l', /* b'o', */ // Payload: "Hello"
         ]));
 
-        let mut stream = FrameStream::new(stream);
+        let stream = pin!(FrameStream::new(stream));
         let mut frame1 = stream.next_frame().await.unwrap().unwrap();
         assert_eq!(frame1.r#type().into_inner(), 0);
         assert_eq!(frame1.length().into_inner(), 5);
@@ -414,8 +414,8 @@ mod tests {
         let decode = tokio::spawn(async move {
             let stream = StreamReader::new(stream);
 
-            let mut stream = FrameStream::new(stream);
-            let mut frame1 = stream.next_frame().await.unwrap().unwrap();
+            let mut stream = pin!(FrameStream::new(stream));
+            let mut frame1 = stream.as_mut().next_frame().await.unwrap().unwrap();
             assert_eq!(frame1.r#type().into_inner(), 0);
             assert_eq!(frame1.length().into_inner(), 5);
             let mut payload = vec![];

@@ -149,8 +149,8 @@ impl<C: ManageStream + WithLocalAgent + WithRemoteAgent + Close + Send + Sync + 
 }
 
 pub trait ManageStream {
-    type StreamWriter: WriteStream;
-    type StreamReader: ReadStream;
+    type StreamWriter: WriteStream + Unpin;
+    type StreamReader: ReadStream + Unpin;
 
     #[allow(clippy::type_complexity)]
     fn open_bi(

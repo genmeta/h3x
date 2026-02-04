@@ -84,7 +84,8 @@ impl<S: Send + 'static, B: Body + Unpin> Sealed<S> for &mut http::Response<B> {
 
 pub trait HasRemainingStream<S>: Sealed<S> {}
 
-impl<S, R: Sealed<S>> HasRemainingStream<S> for R {}
+impl<R: Sealed<ReadStream>> HasRemainingStream<ReadStream> for R {}
+impl<R: Sealed<WriteStream>> HasRemainingStream<WriteStream> for R {}
 
 impl ReadStream {
     /// Extract the remaining ReadStream from hyper Request/Response.

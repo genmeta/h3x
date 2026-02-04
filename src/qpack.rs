@@ -20,7 +20,7 @@ pub type BoxInstructionSink<'a, Instruction> = BoxSink<'a, Instruction, StreamEr
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{pin::pin, sync::Arc};
 
     use bytes::Bytes;
     use futures::SinkExt;
@@ -157,8 +157,8 @@ mod tests {
         let response = tokio::spawn(async move {
             let response_stream = MessageStreamReader::new(response_stream, decoder.clone());
 
-            let mut frame_stream = FrameStream::new(StreamReader::new(response_stream));
-            let frame = frame_stream.next_frame().await.unwrap().unwrap();
+            let mut frame_stream = pin!(FrameStream::new(StreamReader::new(response_stream)));
+            let frame = frame_stream.as_mut().next_frame().await.unwrap().unwrap();
             assert_eq!(frame.r#type(), Frame::HEADERS_FRAME_TYPE);
             let field_section = decoder.decode(frame).await.unwrap();
             assert_eq!(field_section, expected_field_section);

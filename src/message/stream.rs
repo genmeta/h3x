@@ -124,6 +124,15 @@ impl From<quic::ConnectionError> for StreamError {
     }
 }
 
+impl From<connection::OpenRequestStreamError> for StreamError {
+    fn from(value: connection::OpenRequestStreamError) -> Self {
+        match value {
+            connection::OpenRequestStreamError::RequestStream { source } => Self::Quic { source },
+            connection::OpenRequestStreamError::Goaway { source } => Self::Goaway { source },
+        }
+    }
+}
+
 impl From<StreamError> for io::Error {
     fn from(error: StreamError) -> Self {
         let kind = match error {
@@ -222,8 +231,8 @@ impl ReadStream {
         &mut self,
     ) -> Option<Result<ReadableFrame<'_, BoxQuicStream>, connection::StreamError>> {
         loop {
-            match self.stream.frame() {
-                None => match self.stream.next_unreserved_frame().await? {
+            match Pin::new(&mut self.stream).frame() {
+                None => match Pin::new(&mut self.stream).next_unreserved_frame().await? {
                     Ok(_next_frame) => continue,
                     Err(error) => return Some(Err(error)),
                 },
@@ -232,7 +241,7 @@ impl ReadStream {
                         || frame.r#type() == Frame::DATA_FRAME_TYPE =>
                 {
                     // avoid rust bc bug
-                    return self.stream.frame();
+                    return Pin::new(&mut self.stream).frame();
                 }
                 Some(Ok(_frame)) => return Some(Err(Code::H3_FRAME_UNEXPECTED.into())),
                 Some(Err(error)) => return Some(Err(error)),
@@ -249,7 +258,7 @@ impl ReadStream {
                     match frame.try_next().await {
                         Ok(Some(bytes)) => return Some(Ok(bytes)),
                         Ok(None) => {
-                            _ = self.stream.consume_current_frame().await;
+                            _ = Pin::new(&mut self.stream).consume_current_frame().await;
                             continue;
                         }
                         Err(error) => {
@@ -270,13 +279,13 @@ impl ReadStream {
     ) -> Option<Result<FieldSection, connection::StreamError>> {
         match self.peek_frame().await {
             Some(Ok(frame)) if frame.r#type() == Frame::HEADERS_FRAME_TYPE => {
-                let frame = match self.stream.frame()? {
+                let frame = match Pin::new(&mut self.stream).frame()? {
                     Ok(frame) => frame,
                     Err(error) => return Some(Err(error)),
                 };
                 match self.qpack_decoder.decode(frame).await {
                     Ok(field_section) => {
-                        _ = self.stream.consume_current_frame().await;
+                        _ = Pin::new(&mut self.stream).consume_current_frame().await;
                         Some(Ok(field_section))
                     }
                     Err(error) => Some(Err(error)),
@@ -565,7 +574,7 @@ impl ReadStream {
             })
             .await?;
 
-        debug_assert!(self.stream.frame().is_none());
+        debug_assert!(Pin::new(&mut self.stream).frame().is_none());
         message.stage = MessageStage::Complete;
 
         Ok(message.trailers())

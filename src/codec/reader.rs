@@ -160,12 +160,16 @@ impl<S: ?Sized> FixedLengthReader<S> {
         }
     }
 
-    pub const fn renew(&mut self, remaining: u64) {
-        self.remaining = remaining
+    pub fn renew(self: Pin<&mut Self>, remaining: u64) {
+        *self.project().remaining = remaining
     }
 
     pub fn stream_mut(&mut self) -> &mut S {
         &mut self.stream
+    }
+
+    pub fn project_stream_mut(self: Pin<&mut Self>) -> Pin<&mut S> {
+        self.project().stream
     }
 }
 
@@ -249,7 +253,7 @@ where
 
 impl<S> Stream for FixedLengthReader<&mut StreamReader<S>>
 where
-    S: TryStream<Ok = Bytes> + Unpin + ?Sized,
+    S: TryStream<Ok = Bytes> + ?Sized,
     DecodeStreamError: From<S::Error>,
 {
     type Item = Result<Bytes, DecodeStreamError>;
@@ -259,13 +263,19 @@ where
         if this.remaining == 0 {
             return Poll::Ready(None);
         }
-        match ready!(Pin::new(&mut *this.stream).poll_bytes(cx)?) {
+        // SAFETY: The StreamReader is pinned as part of FixedLengthReader,
+        // and we're accessing it through a pinned reference. This is safe
+        // because the lifetime is tied to `self`, ensuring the reference
+        // remains valid for the duration of the poll.
+        match ready!(unsafe { Pin::new_unchecked(&mut *this.stream) }.poll_bytes(cx)?) {
             bytes if bytes.is_empty() => Poll::Ready(Some(Err(DecodeError::Incomplete.into()))),
             bytes => {
                 let len = bytes.len().min(this.remaining as usize);
                 let bytes = bytes.slice(..len);
                 this.remaining -= len as u64;
-                Pin::new(&mut *this.stream).consume(len);
+                // SAFETY: Same reasoning as above - StreamReader is pinned
+                // through FixedLengthReader's pinning.
+                unsafe { Pin::new_unchecked(&mut *this.stream) }.consume(len);
                 Poll::Ready(Some(Ok(bytes)))
             }
         }
