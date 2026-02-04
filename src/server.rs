@@ -20,11 +20,6 @@ pub use route::{MethodRouter, Router};
 mod service;
 pub use service::{BoxService, BoxServiceFuture, IntoBoxService, Service, box_service};
 
-#[cfg(feature = "hyper")]
-pub mod tower;
-#[cfg(feature = "hyper")]
-pub use tower::TowerService;
-
 #[derive(Debug)]
 pub struct Servers<L: quic::Listen, S> {
     pool: Pool<L::Connection>,

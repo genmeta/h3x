@@ -9,9 +9,9 @@ use axum::{
 use bytes::Bytes;
 use common::*;
 use h3x::{
-    hyper::upgrade,
+    hyper::{server::TowerService, upgrade},
     qpack::field::Protocol,
-    server::{self, TowerService},
+    server,
 };
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
@@ -130,14 +130,10 @@ async fn mock_connect_service(request: axum::extract::Request) -> Result<(), Sta
     }
 
     tokio::spawn(async move {
-        let (read_stream, write_stream) = upgrade::on(request)
+        let (mut read_stream, mut write_stream) = upgrade::on(request)
             .await
             .expect("failed to establish tunnel");
         tracing::info!("tunnel established to {host}:{port}");
-        let read_stream = pin!(read_stream.into_bytes_stream());
-        let mut read_stream = StreamReader::new(read_stream);
-        let write_stream = pin!(write_stream.into_bytes_sink::<Bytes>());
-        let mut write_stream = SinkWriter::new(CopyToBytes::new(write_stream));
 
         let mut buf = Vec::with_capacity(CONNECTED_REQUEST.len());
         read_stream
@@ -190,14 +186,9 @@ fn axum_connect() {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let Some((read_stream, write_stream)) = upgrade::on(response).await else {
+        let Some((mut read_stream, mut write_stream)) = upgrade::on(response).await else {
             panic!("failed to upgrade to tunnel");
         };
-
-        let mut read_stream = pin!(StreamReader::new(read_stream.into_bytes_stream()));
-        let mut write_stream = pin!(SinkWriter::new(CopyToBytes::new(
-            write_stream.into_bytes_sink::<Bytes>()
-        )));
 
         write_stream
             .write_all(CONNECTED_REQUEST.as_bytes())
