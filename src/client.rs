@@ -49,9 +49,8 @@ impl<C: quic::Connect> Client<C> {
         &self,
         server: Authority,
     ) -> Result<Arc<Connection<C::Connection>>, pool::ConnectError<C::Error>> {
-        let connect = async || self.client.connect(&server).await;
         self.pool
-            .reuse_or_connect_with(server.clone(), self.settings.clone(), connect)
+            .reuse_or_connect_with(&self.client, self.settings.clone(), server)
             .await
     }
 }

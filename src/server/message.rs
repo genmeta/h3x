@@ -126,6 +126,10 @@ impl Request {
         self.stream.read_message_trailer(&mut self.message).await
     }
 
+    pub async fn stop(&mut self, code: Code) -> Result<(), StreamError> {
+        self.stream.stop(code).await
+    }
+
     /// Low level access to the underlying read stream
     pub fn read_stream(&mut self) -> &mut ReadStream {
         &mut self.stream

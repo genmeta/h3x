@@ -580,8 +580,9 @@ impl ReadStream {
         Ok(message.trailers())
     }
 
-    pub async fn stop(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
-        self.stream.stop(code).await
+    pub async fn stop(&mut self, code: Code) -> Result<(), StreamError> {
+        self.try_stream_io(async move |this| Ok(this.stream.stop(code.into_inner()).await?))
+            .await
     }
 
     pub fn take(&mut self) -> Self {
@@ -600,6 +601,16 @@ impl quic::GetStreamId for ReadStream {
         cx: &mut Context,
     ) -> Poll<Result<VarInt, quic::StreamError>> {
         Pin::new(&mut self.get_mut().stream).poll_stream_id(cx)
+    }
+}
+
+impl quic::StopStream for ReadStream {
+    fn poll_stop(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        Pin::new(&mut self.get_mut().stream).poll_stop(cx, code)
     }
 }
 
@@ -940,5 +951,15 @@ impl quic::GetStreamId for WriteStream {
         cx: &mut Context,
     ) -> Poll<Result<VarInt, quic::StreamError>> {
         Pin::new(&mut self.get_mut().stream).poll_stream_id(cx)
+    }
+}
+
+impl quic::CancelStream for WriteStream {
+    fn poll_cancel(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        Pin::new(&mut self.get_mut().stream).poll_cancel(cx, code)
     }
 }

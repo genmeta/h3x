@@ -5,10 +5,11 @@ use std::{
 };
 
 use dashmap::DashMap;
-use futures::StreamExt;
+use futures::{StreamExt, never::Never};
 use http::uri::Authority;
 use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::{sync::Mutex as AsyncMutex, task::JoinSet};
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::{
     connection::{Connection, settings::Settings},
@@ -19,21 +20,17 @@ use crate::{
 #[derive(Debug)]
 pub struct ReuseableConnection<C: quic::Connection> {
     connection: Watch<Arc<Connection<C>>>,
-    connect: AsyncMutex<()>,
+    task: AsyncMutex<Option<AbortOnDropHandle<()>>>,
 }
 
-impl<C: quic::Connection> ReuseableConnection<C> {
-    pub fn with(connection: Arc<Connection<C>>) -> Self {
-        Self {
-            connection: Watch::with(connection),
-            connect: AsyncMutex::new(()),
-        }
-    }
+type ConnectionIdentifier = (Authority, Arc<Settings>);
+type ReuseableConnections<C> = DashMap<ConnectionIdentifier, Arc<ReuseableConnection<C>>>;
 
+impl<C: quic::Connection> ReuseableConnection<C> {
     pub fn pending() -> Self {
         Self {
             connection: Watch::new(),
-            connect: AsyncMutex::new(()),
+            task: AsyncMutex::new(None),
         }
     }
 
@@ -53,37 +50,30 @@ impl<C: quic::Connection> ReuseableConnection<C> {
         Some(connection)
     }
 
-    pub async fn reuse_or_initial<E>(
-        &self,
-        mut try_initial: impl AsyncFnMut() -> Result<Arc<Connection<C>>, E>,
-    ) -> Result<Arc<Connection<C>>, E> {
-        let mut connections = pin!(self.connection.watch());
+    pub async fn insert(&self, connection: Arc<Connection<C>>, task: AbortOnDropHandle<()>) {
+        self.insert_with(async || (connection, task)).await
+    }
 
-        loop {
-            tracing::debug!("(Re)trying to reuse connection");
-            if let Some(connection) = self.reuse() {
-                return Ok(connection);
-            }
-            tokio::select! {
-                biased;
-                _new_conn = connections.next() => {
-                    tracing::debug!("Entry updated, try to reuse connection");
-                    continue;
-                }
-                _guard = self.connect.lock() => {
-                    tracing::debug!("Acquired connection lock, try to initial connection");
-                    // its ok to replace the connection, reference of replaced connection still in task until closed
-                    let connection = try_initial().await?;
-                    tracing::debug!("Initialed new connection, gogogo");
-                    self.connection.set(connection.clone());
-                }
-            }
-        }
+    pub async fn insert_with(
+        &self,
+        f: impl AsyncFnOnce() -> (Arc<Connection<C>>, AbortOnDropHandle<()>),
+    ) {
+        self.try_insert_with::<Never>(async || Ok(f().await))
+            .await
+            .ok();
+    }
+
+    pub async fn try_insert_with<E>(
+        &self,
+        f: impl AsyncFnOnce() -> Result<(Arc<Connection<C>>, AbortOnDropHandle<()>), E>,
+    ) -> Result<(), E> {
+        let mut task_guard = self.task.lock().await;
+        let (connection, task) = f().await?;
+        self.connection.set(connection);
+        *task_guard = Some(task);
+        Ok(())
     }
 }
-
-type ConnectionIdentifier = (Authority, Arc<Settings>);
-type ReuseableConnections<C> = DashMap<ConnectionIdentifier, Arc<ReuseableConnection<C>>>;
 
 #[derive(Debug)]
 pub struct Pool<C: quic::Connection> {
@@ -163,40 +153,78 @@ impl<C: quic::Connection> Pool<C> {
         });
     }
 
-    pub async fn reuse_or_connect_with<E: Error + 'static>(
+    pub async fn reuse_or_connect_with<Client>(
         &self,
-        server: Authority,
+        connector: &Client,
         settings: Arc<Settings>,
-        mut try_connect: impl AsyncFnMut() -> Result<C, E>,
-    ) -> Result<Arc<Connection<C>>, ConnectError<E>> {
+        server: Authority,
+    ) -> Result<Arc<Connection<C>>, ConnectError<Client::Error>>
+    where
+        Client: quic::Connect<Connection = C> + ?Sized,
+    {
         let reuseable_connection = self
             .connections
             .entry((server.clone(), settings.clone()))
             .or_insert_with(|| Arc::new(ReuseableConnection::pending()))
             .clone();
         // break borrow of dashmap::Entry to avoid deadlock
-        let result = reuseable_connection
-            .reuse_or_initial(async || {
-                tracing::debug!("Trying to connect to {server}");
-                let connection = (try_connect)()
-                    .await
-                    .context(connect_error::ConnectorSnafu)?;
-                tracing::debug!("QUIC connection established, try to upgrade to H3");
-                let connection = Connection::new(settings.clone(), connection).await?;
-                tracing::debug!("H3 connection established, verifying peer identity");
-                let remote_agent = connection.remote_agent().await?;
-                let actual_peer_name = remote_agent.as_ref().map(|agent| agent.name());
-                if actual_peer_name.as_ref() != Some(&server.host()) {
-                    return connect_error::IncorrectIdentifySnafu {
-                        expected: server.host().to_string(),
-                        actual: actual_peer_name.map(ToOwned::to_owned),
-                    }
-                    .fail();
+
+        let result = {
+            let mut connections = pin!(reuseable_connection.connection.watch());
+
+            loop {
+                tracing::debug!("(Re)trying to reuse connection");
+                if let Some(connection) = reuseable_connection.reuse() {
+                    tracing::debug!("Found reusable connection, gogogo");
+                    break Ok(connection);
                 }
 
-                Ok(Arc::new(connection))
-            })
-            .await;
+                let try_connect = async || {
+                    let quic_conn = connector
+                        .connect(&server)
+                        .await
+                        .context(connect_error::ConnectorSnafu)?;
+
+                    tracing::debug!("QUIC connection established, start H3 handshake");
+                    let connection = Connection::new(settings.clone(), quic_conn).await?;
+                    tracing::debug!("H3 connection established, verifying peer identity");
+                    let remote_agent = connection.remote_agent().await?;
+                    let actual_peer_name = remote_agent.as_ref().map(|agent| agent.name());
+                    if actual_peer_name.as_ref() != Some(&server.host()) {
+                        return connect_error::IncorrectIdentifySnafu {
+                            expected: server.host().to_string(),
+                            actual: actual_peer_name.map(ToOwned::to_owned),
+                        }
+                        .fail();
+                    }
+
+                    let connection = Arc::new(connection);
+                    // its ok to replace the connection, reference of replaced connection still in task until closed
+                    let task = AbortOnDropHandle::new(tokio::spawn({
+                        let connection = connection.clone();
+                        let connections = self.connections.clone();
+                        let server = server.clone();
+                        let settings = settings.clone();
+                        async move {
+                            connection.closed().await;
+                            Self::try_release(connections, (server, settings));
+                        }
+                    }));
+                    Ok((connection, task))
+                };
+
+                tokio::select! {
+                    biased;
+                    _new_conn = connections.next() => {
+                        tracing::debug!("Entry updated, try to reuse connection");
+                    }
+                    result = reuseable_connection.try_insert_with(try_connect) => {
+                        result?;
+                        tracing::debug!("New connection inserted");
+                    }
+                }
+            }
+        };
 
         match &result {
             Ok(connection) => {
@@ -221,14 +249,29 @@ impl<C: quic::Connection> Pool<C> {
             .await?
             .context(insert_error::MissingIdentifySnafu)?;
         let settings = connection.settings().clone();
-        let authority = remote_agent
+        let client = remote_agent
             .name()
             .parse()
             .ok()
             .context(insert_error::InvalidIdentifySnafu)?;
-        self.connections
-            .entry((authority, settings))
-            .or_insert(Arc::new(ReuseableConnection::with(connection)));
+
+        let identity = (client, settings);
+        let reuseable_connection = self
+            .connections
+            .entry(identity.clone())
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()))
+            .clone();
+
+        let connections = self.connections.clone();
+        reuseable_connection
+            .insert(
+                connection.clone(),
+                AbortOnDropHandle::new(tokio::spawn(async move {
+                    connection.closed().await;
+                    Self::try_release(connections, identity);
+                })),
+            )
+            .await;
         Ok(())
     }
 }

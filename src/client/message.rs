@@ -155,7 +155,7 @@ impl<C: quic::Connect> PendingRequest<'_, C> {
     }
 }
 
-impl<C: quic::Connect> PendingRequest<'_, C>
+impl<'a, C: quic::Connect + Sync> PendingRequest<'a, C>
 where
     C::Connection: Send + 'static,
     <C::Connection as quic::ManageStream>::StreamReader: Send,
@@ -186,6 +186,7 @@ where
 
         let authority = self.request.header().authority().expect("checked");
 
+        #[allow(clippy::never_loop)]
         loop {
             let connection = self.client.connect(authority.clone()).await?;
             tracing::debug!(target: "h3x::client", %authority, "Connected");
@@ -538,6 +539,10 @@ impl Response {
 
     pub async fn trailers(&mut self) -> Result<&HeaderMap, StreamError> {
         self.stream.read_message_trailer(&mut self.message).await
+    }
+
+    pub async fn stop(&mut self, code: Code) -> Result<(), StreamError> {
+        self.stream.stop(code).await
     }
 
     /// Low level access to the underlying read stream

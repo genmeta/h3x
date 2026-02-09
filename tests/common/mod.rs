@@ -8,7 +8,7 @@ use std::{
 
 use gm_quic::{
     prelude::{
-        BindUri, QuicIO, RealAddr,
+        BindUri, BoundAddr, QuicIO,
         handy::{ToCertificate, ToPrivateKey},
     },
     qinterface::component::route::QuicRouter,
@@ -109,7 +109,7 @@ where
     servers
 }
 
-pub fn get_server_addr<S>(servers: &H3Servers<S>) -> RealAddr {
+pub fn get_server_addr<S>(servers: &H3Servers<S>) -> BoundAddr {
     let localhost = servers
         .quic_listener()
         .get_server("localhost")
@@ -121,13 +121,13 @@ pub fn get_server_addr<S>(servers: &H3Servers<S>) -> RealAddr {
         .expect("server localhost must have at least one bind interface");
     localhost_bind_interface
         .borrow()
-        .real_addr()
+        .bound_addr()
         .expect("bind interface must have local addr")
 }
 
 pub fn get_server_authority<S>(servers: &H3Servers<S>) -> Authority {
     match get_server_addr(servers) {
-        RealAddr::Internet(socket_addr) => {
+        BoundAddr::Internet(socket_addr) => {
             Authority::from_maybe_shared(Vec::from(format!("localhost:{}", socket_addr.port())))
                 .expect("failed to parse authority")
         }
