@@ -31,7 +31,7 @@ use crate::{
 
 #[cfg(feature = "hyper")]
 pub(crate) mod hyper;
-mod unfold;
+pub(crate) mod unfold;
 
 fn message_used_after_dropped() -> ! {
     unreachable!("Message used after destroyed, this is a bug");

@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use futures::{Stream, stream};
+use futures::{Stream, StreamExt, stream};
 
 use super::super::{ReadStream, StreamError};
 
@@ -15,6 +15,7 @@ impl ReadStream {
                 Err(error) => Some((Err(error), this)),
             }
         })
+        .fuse()
     }
 
     pub fn into_bytes_stream(
@@ -30,5 +31,6 @@ impl ReadStream {
                 Err(error) => Some((Err(error), this)),
             }
         })
+        .fuse()
     }
 }

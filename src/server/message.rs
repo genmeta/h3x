@@ -1,5 +1,5 @@
 use bytes::{Buf, Bytes};
-use futures::{Sink, Stream, future::BoxFuture, sink, stream};
+use futures::{Sink, Stream, StreamExt, future::BoxFuture};
 use http::{
     HeaderMap, HeaderValue, Method, Uri,
     header::{AsHeaderName, IntoHeaderName},
@@ -110,16 +110,18 @@ impl Request {
             .await
     }
 
-    pub fn as_stream(&mut self) -> impl Stream<Item = Result<Bytes, StreamError>> {
-        stream::unfold(self, async |this| {
+    pub async fn as_stream(&mut self) -> impl Stream<Item = Result<Bytes, StreamError>> {
+        futures::stream::unfold(self, async |this| {
             this.read().await.map(|item| (item, this))
         })
+        .fuse()
     }
 
-    pub fn into_stream(self) -> impl Stream<Item = Result<Bytes, StreamError>> {
-        stream::unfold(self, async |mut this| {
+    pub async fn into_stream(self) -> impl Stream<Item = Result<Bytes, StreamError>> {
+        futures::stream::unfold(self, async |mut this| {
             this.read().await.map(|item| (item, this))
         })
+        .fuse()
     }
 
     pub async fn trailers(&mut self) -> Result<&HeaderMap, StreamError> {
@@ -248,14 +250,42 @@ impl Response {
     }
 
     pub fn as_sink<B: Buf>(&mut self) -> impl Sink<B, Error = StreamError> {
-        sink::unfold(self, async |this, item: B| this.write(item).await)
+        crate::message::stream::unfold::write::unfold(
+            self,
+            async |request: &mut Self, buf: B| {
+                request.write(buf).await?;
+                Ok(request)
+            },
+            async |request: &mut Self| {
+                request.flush().await?;
+                Ok(request)
+            },
+            async |request: &mut Self| {
+                request.close().await?;
+                Ok(request)
+            },
+        )
     }
 
     pub fn into_sink<B: Buf>(self) -> impl Sink<B, Error = StreamError> {
-        sink::unfold(self, async |mut this, item: B| {
-            this.write(item).await?;
-            Ok(this)
-        })
+        crate::message::stream::unfold::write::unfold(
+            self,
+            async |request: Self, buf: B| {
+                let mut request = request;
+                request.write(buf).await?;
+                Ok(request)
+            },
+            async |request: Self| {
+                let mut request = request;
+                request.flush().await?;
+                Ok(request)
+            },
+            async |request: Self| {
+                let mut request = request;
+                request.close().await?;
+                Ok(request)
+            },
+        )
     }
 
     pub fn trailers(&self) -> &HeaderMap {

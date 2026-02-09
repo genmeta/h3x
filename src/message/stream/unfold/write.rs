@@ -66,7 +66,7 @@ impl<T, S, F, C> UnfoldState<T, S, F, C> {
 pin_project_lite::pin_project! {
     #[derive(Debug)]
     #[must_use = "sinks do nothing unless polled"]
-    struct Unfold<T, S, F, C, SF, FF, CF> {
+    pub struct Unfold<T, S, F, C, SF, FF, CF> {
         send: S,
         flush: F,
         close: C,
@@ -132,7 +132,7 @@ where
     }
 }
 
-fn unfold<T, S, F, C, SF, FF, CF, Item, E>(
+pub fn unfold<T, S, F, C, SF, FF, CF, Item, E>(
     init: T,
     send: S,
     flush: F,

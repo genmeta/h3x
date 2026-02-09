@@ -4,7 +4,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::stream;
+use futures::{StreamExt, stream};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Empty, StreamBody};
 
@@ -97,23 +97,29 @@ impl ReadStream {
     }
 
     pub fn as_hyper_body(&mut self) -> impl Body<Data = Bytes, Error = StreamError> + Send {
-        StreamBody::new(stream::unfold(self, async |stream| {
-            let frame = stream
-                .try_stream_io(async |stream| stream.read_hyper_frame().await.transpose())
-                .await
-                .transpose()?;
-            Some((frame, stream))
-        }))
+        StreamBody::new(
+            stream::unfold(self, async |stream| {
+                let frame = stream
+                    .try_stream_io(async |stream| stream.read_hyper_frame().await.transpose())
+                    .await
+                    .transpose()?;
+                Some((frame, stream))
+            })
+            .fuse(),
+        )
     }
 
     pub fn into_hyper_body(self) -> impl Body<Data = Bytes, Error = StreamError> + Send {
-        StreamBody::new(stream::unfold(self, async |mut stream| {
-            let frame = stream
-                .try_stream_io(async |stream| stream.read_hyper_frame().await.transpose())
-                .await
-                .transpose()?;
-            Some((frame, stream))
-        }))
+        StreamBody::new(
+            stream::unfold(self, async |mut stream| {
+                let frame = stream
+                    .try_stream_io(async |stream| stream.read_hyper_frame().await.transpose())
+                    .await
+                    .transpose()?;
+                Some((frame, stream))
+            })
+            .fuse(),
+        )
     }
 
     pub async fn into_hyper_request(
