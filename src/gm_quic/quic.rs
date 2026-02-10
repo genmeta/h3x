@@ -287,24 +287,6 @@ impl quic::Listen for Arc<gm_quic::prelude::QuicListeners> {
     }
 }
 
-impl quic::Connect for gm_quic::prelude::QuicClient {
-    type Connection = gm_quic::prelude::Connection;
-
-    type Error = gm_quic::prelude::ConnectServerError;
-
-    fn connect<'a>(
-        &'a self,
-        server: &'a http::uri::Authority,
-    ) -> BoxFuture<'a, Result<Self::Connection, Self::Error>> {
-        let name = if let Some(port) = server.port_u16() {
-            format!("{}:{}", server.host(), port)
-        } else {
-            server.host().to_string()
-        };
-        async move { self.connect(&name).await }.boxed()
-    }
-}
-
 impl quic::Connect for Arc<gm_quic::prelude::QuicClient> {
     type Connection = gm_quic::prelude::Connection;
 
@@ -319,6 +301,6 @@ impl quic::Connect for Arc<gm_quic::prelude::QuicClient> {
         } else {
             server.host().to_string()
         };
-        async move { self.as_ref().connect(&name).await }.boxed()
+        async move { self.connect(&name).await }.boxed()
     }
 }

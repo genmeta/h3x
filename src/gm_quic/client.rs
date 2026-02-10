@@ -71,7 +71,7 @@ pub struct H3ClientTlsBuilder {
     resolver: Option<Arc<dyn Resolve + Send + Sync>>,
 }
 
-pub type H3Client = Client<QuicClient>;
+pub type H3Client = Client<Arc<QuicClient>>;
 
 impl H3Client {
     pub fn builder() -> H3ClientTlsBuilder {
@@ -278,7 +278,7 @@ impl H3ClientBuilder {
         };
         Client::from_quic_client()
             .pool(self.pool.clone())
-            .client(client)
+            .client(Arc::new(client))
             .settings(self.settings.clone())
             .build()
     }
