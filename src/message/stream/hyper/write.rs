@@ -73,6 +73,14 @@ impl WriteStream {
         Ok(())
     }
 
+    pub async fn send_hyper_request_parts(
+        &mut self,
+        parts: http::request::Parts,
+    ) -> Result<(), StreamError> {
+        self.send_header(hyper_request_parts_to_field_lines(parts))
+            .await
+    }
+
     pub async fn send_hyper_request<B: Body>(
         &mut self,
         request: http::Request<B>,
@@ -82,6 +90,14 @@ impl WriteStream {
             .map_err(|source| SendMesageError::Stream { source })
             .await?;
         self.send_hyper_body(body).await
+    }
+
+    pub async fn send_hyper_response_parts(
+        &mut self,
+        parts: http::response::Parts,
+    ) -> Result<(), StreamError> {
+        self.send_header(hyper_response_parts_to_field_lines(parts))
+            .await
     }
 
     pub async fn send_hyper_response<B: Body>(
