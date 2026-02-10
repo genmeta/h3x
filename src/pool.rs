@@ -1,14 +1,14 @@
 use std::{
     error::Error,
     pin::pin,
-    sync::{Arc, LazyLock, Mutex as SyncMutex},
+    sync::{Arc, LazyLock},
 };
 
 use dashmap::DashMap;
 use futures::{StreamExt, never::Never};
 use http::uri::Authority;
 use snafu::{OptionExt, ResultExt, Snafu};
-use tokio::{sync::Mutex as AsyncMutex, task::JoinSet};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::{
@@ -78,14 +78,12 @@ impl<C: quic::Connection> ReuseableConnection<C> {
 #[derive(Debug)]
 pub struct Pool<C: quic::Connection> {
     connections: Arc<ReuseableConnections<C>>,
-    tasks: Arc<SyncMutex<JoinSet<()>>>,
 }
 
 impl<C: quic::Connection> Clone for Pool<C> {
     fn clone(&self) -> Self {
         Self {
             connections: self.connections.clone(),
-            tasks: self.tasks.clone(),
         }
     }
 }
@@ -94,7 +92,6 @@ impl<C: quic::Connection> Pool<C> {
     pub fn empty() -> Self {
         Self {
             connections: Default::default(),
-            tasks: Default::default(),
         }
     }
 
@@ -146,13 +143,14 @@ pub enum InsertError {
 }
 
 impl<C: quic::Connection> Pool<C> {
-    fn try_release(connections: Arc<ReuseableConnections<C>>, identify: ConnectionIdentifier) {
+    fn spawn_try_release(self, identify: ConnectionIdentifier) {
         tokio::task::spawn_blocking(move || {
-            (connections.as_ref())
+            (self.connections.as_ref())
                 .remove_if(&identify, |_, connection| connection.reuse().is_none());
         });
     }
 
+    #[tracing::instrument(level = "debug", skip(self, connector), err)]
     pub async fn reuse_or_connect_with<Client>(
         &self,
         connector: &Client,
@@ -184,9 +182,8 @@ impl<C: quic::Connection> Pool<C> {
                         .connect(&server)
                         .await
                         .context(connect_error::ConnectorSnafu)?;
-
-                    tracing::debug!("QUIC connection established, start H3 handshake");
                     let connection = Connection::new(settings.clone(), quic_conn).await?;
+
                     tracing::debug!("H3 connection established, verifying peer identity");
                     let remote_agent = connection.remote_agent().await?;
                     let actual_peer_name = remote_agent.as_ref().map(|agent| agent.name());
@@ -202,12 +199,12 @@ impl<C: quic::Connection> Pool<C> {
                     // its ok to replace the connection, reference of replaced connection still in task until closed
                     let task = AbortOnDropHandle::new(tokio::spawn({
                         let connection = connection.clone();
-                        let connections = self.connections.clone();
+                        let pool = self.clone();
                         let server = server.clone();
                         let settings = settings.clone();
                         async move {
                             connection.closed().await;
-                            Self::try_release(connections, (server, settings));
+                            pool.spawn_try_release((server, settings));
                         }
                     }));
                     Ok((connection, task))
@@ -227,17 +224,8 @@ impl<C: quic::Connection> Pool<C> {
         };
 
         match &result {
-            Ok(connection) => {
-                let connection = connection.clone();
-                let connections = self.connections.clone();
-                self.tasks.lock().unwrap().spawn(async move {
-                    connection.closed().await;
-                    Self::try_release(connections, (server, settings));
-                });
-            }
-            Err(..) => {
-                Self::try_release(self.connections.clone(), (server, settings));
-            }
+            Ok(..) => tracing::debug!("Connection ready to use"),
+            Err(..) => self.clone().spawn_try_release((server, settings)),
         }
 
         result
@@ -262,13 +250,13 @@ impl<C: quic::Connection> Pool<C> {
             .or_insert_with(|| Arc::new(ReuseableConnection::pending()))
             .clone();
 
-        let connections = self.connections.clone();
+        let pool = self.clone();
         reuseable_connection
             .insert(
                 connection.clone(),
                 AbortOnDropHandle::new(tokio::spawn(async move {
                     connection.closed().await;
-                    Self::try_release(connections, identity);
+                    pool.spawn_try_release(identity);
                 })),
             )
             .await;
