@@ -590,6 +590,7 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
                 Err(error) => _ = conn_state.handle_error(error).await,
             }
         };
+        let task = AbortOnDropHandle::new(tokio::spawn(task.in_current_span()));
 
         // open control stream
         let uni_stream = SinkWriter::new(Box::pin(state.open_uni().await?));
@@ -630,7 +631,7 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
             qpack_encoder,
             qpack_decoder,
             control_stream: AsyncMutex::new(control_stream),
-            task: AbortOnDropHandle::new(tokio::spawn(task.in_current_span())),
+            task,
         })
     }
 
@@ -667,6 +668,7 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
         }
     }
 
+    // TODO: close with handy way(code + reason)
     pub fn close(&self, error: &(impl HasErrorCode + ?Sized)) {
         self.state.close(error);
     }
