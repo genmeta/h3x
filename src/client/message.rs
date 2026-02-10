@@ -166,7 +166,11 @@ where
         level = "debug",
         target = "h3x::client",
         name = "execute_request",
-        skip_all
+        skip_all,
+        fields(
+            method = %self.request.header().method(),
+            uri = %self.request.header().uri(),
+        )
     )]
     pub async fn execute(mut self) -> Result<(Request, Response), RequestError<C::Error>> {
         self.request
