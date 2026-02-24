@@ -74,6 +74,9 @@ impl<S: TryStream<Ok = Bytes> + ?Sized> Stream for StreamReader<S> {
     type Item = Result<Bytes, S::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if !self.chunk.is_empty() {
+            return Poll::Ready(Some(Ok(self.project().chunk.split_off(0))));
+        }
         self.project().stream.try_poll_next(cx)
     }
 
@@ -92,20 +95,14 @@ where
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        loop {
-            let chunk = match ready!(self.as_mut().poll_bytes(cx)?) {
-                chunk if chunk.is_empty() => return Poll::Ready(Ok(())),
-                chunk => chunk,
-            };
-
+        let chunk = ready!(self.as_mut().poll_bytes(cx)?);
+        if !chunk.is_empty() {
             let cap = buf.remaining().min(chunk.len());
             buf.put_slice(&chunk[..cap]);
             self.as_mut().consume(cap);
-
-            if buf.remaining() == 0 {
-                return Poll::Ready(Ok(()));
-            }
         }
+
+        Poll::Ready(Ok(()))
     }
 }
 
