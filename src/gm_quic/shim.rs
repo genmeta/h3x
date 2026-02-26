@@ -137,10 +137,13 @@ impl Sink<Bytes> for StreamWriter {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project()
-            .writer
-            .poll_flush(cx)
-            .map_err(convert_stream_error)
+        // FIXME: gm-quic StreamWriter::poll_flush pending until all data acked, which is very bad for h3x.
+        // self.project()
+        //     .writer
+        //     .poll_flush(cx)
+        //     .map_err(convert_stream_error)
+        _ = cx;
+        Poll::Ready(Ok(()))
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {

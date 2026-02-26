@@ -195,7 +195,7 @@ impl H3ClientBuilder {
         self
     }
 
-    pub fn with_resolver(mut self, resolver: Arc<dyn Resolve + Send + Sync>) -> Self {
+    pub fn with_resolver(mut self, resolver: Arc<dyn Resolve>) -> Self {
         self.builder = self.builder.with_resolver(resolver);
         self
     }

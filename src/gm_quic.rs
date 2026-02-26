@@ -1,6 +1,6 @@
 mod client;
-mod quic;
 mod server;
+mod shim;
 
 pub use client::*;
 pub use gm_quic::*;
