@@ -110,10 +110,9 @@ where
         Ok(())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // ready!(self.as_mut().poll_flush_buffer(cx)?);
-        // self.project().stream.poll_flush(cx)
-        self.poll_flush_buffer(cx)
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        ready!(self.as_mut().poll_flush_buffer(cx)?);
+        self.project().sink.poll_flush(cx)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
