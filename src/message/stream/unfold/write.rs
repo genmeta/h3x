@@ -6,10 +6,11 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use futures::Sink;
 
 use super::super::{StreamError, WriteStream};
+use crate::codec::SinkWriter;
 
 pin_project_lite::pin_project! {
     #[project = UnfoldStateProj]
@@ -165,6 +166,10 @@ impl WriteStream {
         )
     }
 
+    pub fn as_writer(&mut self) -> SinkWriter<impl Sink<Bytes, Error = StreamError>> {
+        SinkWriter::new(self.as_bytes_sink())
+    }
+
     pub fn into_bytes_sink<B: Buf>(self) -> impl Sink<B, Error = StreamError> {
         unfold(
             self,
@@ -172,5 +177,9 @@ impl WriteStream {
             async |mut stream: WriteStream| stream.flush().await.map(|_| stream),
             async |mut stream: WriteStream| stream.close().await.map(|_| stream),
         )
+    }
+
+    pub fn into_writer(self) -> SinkWriter<impl Sink<Bytes, Error = StreamError>> {
+        SinkWriter::new(self.into_bytes_sink())
     }
 }

@@ -2,6 +2,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 
 use super::super::{ReadStream, StreamError};
+use crate::codec::StreamReader;
 
 impl ReadStream {
     pub fn as_bytes_stream(&mut self) -> impl Stream<Item = Result<Bytes, StreamError>> {
@@ -18,6 +19,10 @@ impl ReadStream {
         .fuse()
     }
 
+    pub fn as_reader(&mut self) -> StreamReader<impl Stream<Item = Result<Bytes, StreamError>>> {
+        StreamReader::new(self.as_bytes_stream())
+    }
+
     pub fn into_bytes_stream(
         self,
     ) -> impl Stream<Item = Result<Bytes, StreamError>> + Send + 'static {
@@ -32,5 +37,11 @@ impl ReadStream {
             }
         })
         .fuse()
+    }
+
+    pub fn into_reader(
+        self,
+    ) -> StreamReader<impl Stream<Item = Result<Bytes, StreamError>> + Send + 'static> {
+        StreamReader::new(self.into_bytes_stream())
     }
 }

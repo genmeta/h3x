@@ -68,6 +68,16 @@ where
         })
         .await
     }
+
+    pub fn map_stream<S1>(self, f: impl FnOnce(S) -> S1) -> StreamReader<S1>
+    where
+        S: Sized,
+    {
+        StreamReader {
+            chunk: self.chunk,
+            stream: f(self.stream),
+        }
+    }
 }
 
 impl<S: TryStream<Ok = Bytes> + ?Sized> Stream for StreamReader<S> {

@@ -88,6 +88,16 @@ where
     {
         self.sink
     }
+
+    pub fn map_sink<S1>(self, f: impl FnOnce(S) -> S1) -> SinkWriter<S1>
+    where
+        S: Sized,
+    {
+        SinkWriter {
+            buffer: self.buffer,
+            sink: f(self.sink),
+        }
+    }
 }
 
 impl<S> Sink<Bytes> for SinkWriter<S>
