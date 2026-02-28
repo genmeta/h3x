@@ -8,7 +8,7 @@ use std::{
 
 use gm_quic::{
     prelude::{
-        BindUri, BoundAddr, QuicIO,
+        BindUri, BoundAddr, IO,
         handy::{ToCertificate, ToPrivateKey},
     },
     qinterface::component::route::QuicRouter,

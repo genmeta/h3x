@@ -304,6 +304,6 @@ impl quic::Connect for Arc<gm_quic::prelude::QuicClient> {
         } else {
             server.host().to_string()
         };
-        async move { self.connect(&name).await }.boxed()
+        async move { gm_quic::prelude::QuicClient::connect(self, &name).await }.boxed()
     }
 }
