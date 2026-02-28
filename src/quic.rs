@@ -20,6 +20,10 @@ use crate::{
     varint::VarInt,
 };
 
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
 pub enum StreamError {
@@ -77,23 +81,37 @@ impl From<io::Error> for StreamError {
     }
 }
 
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
 #[snafu(display("transport error (0x{kind:x} in frame 0x{frame_type:x}): {reason}"))]
 pub struct TransportError {
     pub kind: VarInt,
     pub frame_type: VarInt,
+    #[cfg_attr(feature = "rkyv", rkyv(with = rkyv::with::AsOwned))]
     pub reason: Cow<'static, str>,
 }
 
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
 #[snafu(display("application error ({code}): {reason}"))]
 pub struct ApplicationError {
     pub code: Code,
+    #[cfg_attr(feature = "rkyv", rkyv(with = rkyv::with::AsOwned))]
     pub reason: Cow<'static, str>,
 }
 
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
 pub enum ConnectionError {
