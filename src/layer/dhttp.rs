@@ -5,23 +5,27 @@
 //! the layered stream routing architecture.
 
 use std::{
-    any::Any,
-    pin::Pin,
+    pin::{Pin, pin},
     sync::{Arc, Mutex, OnceLock},
 };
 
-use futures::{channel::oneshot, future::BoxFuture};
+use futures::{SinkExt, StreamExt, channel::oneshot, future::BoxFuture};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::task::AbortOnDropHandle;
+use tracing::Instrument;
 
 use crate::{
-    codec::StreamReader,
+    buflist::BufList,
+    codec::{DecodeExt, Encode, EncodeExt, Feed, SinkWriter, StreamReader},
     connection::{
-        FrameSink, QPackDecoder, QPackEncoder, StreamError,
+        ConnectionState, FrameSink, QPackEncoder, StreamError,
         settings::Settings,
         stream::{H3StreamCreationError, UnidirectionalStream},
     },
-    frame::goaway::Goaway,
+    error::{Code, H3CriticalStreamClosed, H3FrameUnexpected},
+    frame::{Frame, goaway::Goaway},
     layer::{PeekableBiStream, PeekableUniStream, ProtocolLayer, StreamVerdict},
+    qpack::BoxSink,
     quic::{self, ConnectionError},
     util::{set_once::SetOnce, watch::Watch},
     varint::VarInt,
@@ -68,33 +72,23 @@ impl DHttpLayerState {
 ///
 /// Implements [`ProtocolLayer`] to handle HTTP/3 stream identification and
 /// initialization. This layer recognizes HTTP/3 unidirectional stream types
-/// (control, QPACK encoder, QPACK decoder, push, reserved) and accepts all
+/// (control, push, reserved) and accepts all
 /// bidirectional streams as HTTP/3 request streams.
 pub struct DHttpLayer {
     /// Shared HTTP/3 protocol state.
     state: Arc<DHttpLayerState>,
 
-    /// QPACK encoder, set once during connection initialization.
-    qpack_encoder: OnceLock<Arc<QPackEncoder>>,
-    /// QPACK decoder, set once during connection initialization.
-    qpack_decoder: OnceLock<Arc<QPackDecoder>>,
     /// Control stream frame sink, set once during connection initialization.
     control_stream: OnceLock<AsyncMutex<FrameSink>>,
 
     /// Oneshot sender for dispatching the peer's control stream.
     control_stream_tx: Mutex<Option<oneshot::Sender<UniStreamReader>>>,
-    /// Oneshot sender for dispatching the peer's QPACK encoder instruction stream.
-    qpack_encoder_inst_tx: Mutex<Option<oneshot::Sender<UniStreamReader>>>,
-    /// Oneshot sender for dispatching the peer's QPACK decoder instruction stream.
-    qpack_decoder_inst_tx: Mutex<Option<oneshot::Sender<UniStreamReader>>>,
 }
 
 impl std::fmt::Debug for DHttpLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DHttpLayer")
             .field("state", &self.state)
-            .field("qpack_encoder", &"...")
-            .field("qpack_decoder", &"...")
             .field("control_stream", &"...")
             .finish()
     }
@@ -105,12 +99,8 @@ impl DHttpLayer {
     pub fn new(local_settings: Arc<Settings>) -> Self {
         Self {
             state: Arc::new(DHttpLayerState::new(local_settings)),
-            qpack_encoder: OnceLock::new(),
-            qpack_decoder: OnceLock::new(),
             control_stream: OnceLock::new(),
             control_stream_tx: Mutex::new(None),
-            qpack_encoder_inst_tx: Mutex::new(None),
-            qpack_decoder_inst_tx: Mutex::new(None),
         }
     }
 
@@ -149,32 +139,10 @@ impl DHttpLayer {
         self.state.peer_goaway.peek()
     }
 
-    /// Returns the QPACK encoder, if initialized.
-    #[must_use]
-    pub fn qpack_encoder(&self) -> Option<&Arc<QPackEncoder>> {
-        self.qpack_encoder.get()
-    }
-
-    /// Returns the QPACK decoder, if initialized.
-    #[must_use]
-    pub fn qpack_decoder(&self) -> Option<&Arc<QPackDecoder>> {
-        self.qpack_decoder.get()
-    }
-
     /// Returns the control stream frame sink, if initialized.
     #[must_use]
     pub fn control_stream(&self) -> Option<&AsyncMutex<FrameSink>> {
         self.control_stream.get()
-    }
-
-    /// Sets the QPACK encoder. Returns `Err` if already set.
-    pub fn set_qpack_encoder(&self, encoder: Arc<QPackEncoder>) -> Result<(), Arc<QPackEncoder>> {
-        self.qpack_encoder.set(encoder)
-    }
-
-    /// Sets the QPACK decoder. Returns `Err` if already set.
-    pub fn set_qpack_decoder(&self, decoder: Arc<QPackDecoder>) -> Result<(), Arc<QPackDecoder>> {
-        self.qpack_decoder.set(decoder)
     }
 
     /// Sets the control stream frame sink. Returns `Err` if already set.
@@ -184,91 +152,15 @@ impl DHttpLayer {
     ) -> Result<(), AsyncMutex<FrameSink>> {
         self.control_stream.set(sink)
     }
-
-    /// Installs the oneshot dispatch channels for incoming peer streams.
+    /// Installs the oneshot dispatch channel for the incoming peer control stream.
     ///
-    /// These channels are used by `accept_uni` to dispatch accepted streams
-    /// to the appropriate handlers (control stream, QPACK instruction streams).
-    pub fn set_dispatch_channels(
-        &self,
-        control_tx: oneshot::Sender<UniStreamReader>,
-        qpack_encoder_inst_tx: oneshot::Sender<UniStreamReader>,
-        qpack_decoder_inst_tx: oneshot::Sender<UniStreamReader>,
-    ) {
+    /// This channel is used by `accept_uni` to dispatch the accepted control
+    /// stream to the appropriate handler.
+    pub fn set_control_dispatch_channel(&self, control_tx: oneshot::Sender<UniStreamReader>) {
         *self
             .control_stream_tx
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(control_tx);
-        *self
-            .qpack_encoder_inst_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(qpack_encoder_inst_tx);
-        *self
-            .qpack_decoder_inst_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(qpack_decoder_inst_tx);
-    }
-
-    /// Checks whether a VarInt stream type is a known HTTP/3 unidirectional
-    /// stream type.
-    ///
-    /// Known types: control (0x00), push (0x01), QPACK encoder (0x02),
-    /// QPACK decoder (0x03), and reserved types (0x21 + N * 0x1f).
-    fn is_h3_uni_stream_type(stream_type: VarInt) -> bool {
-        let raw = stream_type.into_inner();
-        matches!(
-            stream_type,
-            _ if stream_type == UnidirectionalStream::CONTROL_STREAM_TYPE
-                || stream_type == UnidirectionalStream::PUSH_STREAM_TYPE
-                || stream_type == UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE
-                || stream_type == UnidirectionalStream::QPACK_DECODER_STREAM_TYPE
-        ) || (raw >= 0x21 && (raw - 0x21).is_multiple_of(0x1f))
-    }
-
-    /// Attempts to read a VarInt from the peeked bytes of a
-    /// [`PeekableUniStream`].
-    ///
-    /// Returns `Some(varint)` if a complete VarInt could be decoded from the
-    /// peeked data, `None` if not enough data is available yet.
-    fn try_decode_varint_from_peek(data: &[u8]) -> Option<(VarInt, usize)> {
-        if data.is_empty() {
-            return None;
-        }
-        // VarInt encoding: first 2 bits of the first byte indicate length
-        let first_byte = data[0];
-        let len = 1 << (first_byte >> 6);
-        if data.len() < len {
-            return None;
-        }
-        // Decode the VarInt from the first `len` bytes
-        let value = match len {
-            1 => u64::from(first_byte & 0x3f),
-            2 => {
-                let mut buf = [0u8; 2];
-                buf.copy_from_slice(&data[..2]);
-                buf[0] &= 0x3f;
-                u64::from(u16::from_be_bytes(buf))
-            }
-            4 => {
-                let mut buf = [0u8; 4];
-                buf.copy_from_slice(&data[..4]);
-                buf[0] &= 0x3f;
-                u64::from(u32::from_be_bytes(buf))
-            }
-            8 => {
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&data[..8]);
-                buf[0] &= 0x3f;
-                u64::from_be_bytes(buf)
-            }
-            _ => return None,
-        };
-        // VarInt::from_u64 returns Err for values >= 2^62, but valid encodings
-        // cannot exceed that, so this is safe.
-        match VarInt::from_u64(value) {
-            Ok(v) => Some((v, len)),
-            Err(_) => None,
-        }
     }
 
     /// Dispatches an accepted unidirectional stream to the appropriate handler
@@ -288,27 +180,118 @@ impl DHttpLayer {
                 .take()
                 .ok_or(H3StreamCreationError::DuplicateControlStream)?;
             let _ = tx.send(stream);
-        } else if stream_type == UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE {
-            let tx = self
-                .qpack_encoder_inst_tx
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-                .ok_or(H3StreamCreationError::DuplicateQpackEncoderStream)?;
-            let _ = tx.send(stream);
-        } else if stream_type == UnidirectionalStream::QPACK_DECODER_STREAM_TYPE {
-            let tx = self
-                .qpack_decoder_inst_tx
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-                .ok_or(H3StreamCreationError::DuplicateQpackDecoderStream)?;
-            let _ = tx.send(stream);
         }
         // Push streams (0x01) and reserved streams are accepted but not dispatched.
         // Reserved streams have no semantics per RFC 9114 §6.2.3.
         // Push streams are currently not supported (TODO).
         Ok(())
+    }
+
+    /// Initializes the DHTTP/3 layer with real protocol logic.
+    ///
+    /// Opens the outgoing control stream, sends the SETTINGS frame, stores
+    /// the control stream, sets up the control dispatch channel, and spawns
+    /// the `handle_control` background task for processing incoming control frames.
+    ///
+    /// Returns a handle to the background task for supervisor management.
+    pub async fn init_dhttp<C: quic::Connection>(
+        &self,
+        state: &Arc<ConnectionState<C>>,
+        qpack_encoder: Arc<QPackEncoder>,
+    ) -> Result<AbortOnDropHandle<Result<(), StreamError>>, ConnectionError> {
+        // Set up dispatch channel for incoming peer control stream
+        let (control_stream_tx, control_stream_rx) = oneshot::channel();
+        self.set_control_dispatch_channel(control_stream_tx);
+
+        // Open outgoing control stream
+        let uni_stream = SinkWriter::new(Box::pin(state.open_uni().await?));
+        // Send control stream type header
+        let mut control_stream = match UnidirectionalStream::new_control_stream(uni_stream).await {
+            Ok(control_stream) => {
+                let control_frame_sink = control_stream.into_encode_sink().sink_map_err(
+                    |stream_error| match stream_error {
+                        quic::StreamError::Reset { .. } => H3CriticalStreamClosed::Control.into(),
+                        stream_error => stream_error.into(),
+                    },
+                );
+                Feed::new(Box::pin(control_frame_sink) as BoxSink<_, _>)
+            }
+            Err(error) => {
+                state.handle_error(error).await;
+                return Err(state.error().await);
+            }
+        };
+
+        // Send SETTINGS frame on the control stream
+        let Ok(settings_frame) = BufList::new().encode(state.local_settings()).await;
+        match control_stream.send(settings_frame).await {
+            Ok(()) => (),
+            Err(error) => {
+                state.handle_error(error).await;
+                return Err(state.error().await);
+            }
+        }
+        match control_stream.flush().await {
+            Ok(()) => (),
+            Err(error) => {
+                state.handle_error(error).await;
+                return Err(state.error().await);
+            }
+        }
+
+        // Store control stream in self
+        let _ = self.set_control_stream(AsyncMutex::new(control_stream));
+
+        // Spawn handle_control background task
+        let conn_state = state.clone();
+        let handle_control = async move {
+            let control_stream = tokio::select! {
+                Ok(control_stream) = control_stream_rx => control_stream,
+                _error = conn_state.error() => return Ok::<_, StreamError>(()),
+            };
+            let mut control_frame_stream = pin!(control_stream.into_decode_stream::<Frame<_>, _>());
+
+            // First frame MUST be SETTINGS.
+            let mut settings_frame = control_frame_stream
+                .next()
+                .await
+                .ok_or(H3CriticalStreamClosed::Control)??;
+            if settings_frame.r#type() != Frame::SETTINGS_FRAME_TYPE {
+                return Err(Code::H3_MISSING_SETTINGS.into());
+            }
+            let settings = Arc::new(settings_frame.decode_one::<Settings>().await?);
+            tracing::debug!("Remote settings applied: {:?}", settings);
+            conn_state
+                .peer_settings
+                .set(settings.clone())
+                .map_err(|_| Code::H3_FRAME_UNEXPECTED)?;
+            qpack_encoder.apply_settings(settings.clone()).await;
+
+            loop {
+                let mut frame = control_frame_stream
+                    .next()
+                    .await
+                    .ok_or(H3CriticalStreamClosed::Control)??;
+
+                if frame.r#type() == Frame::SETTINGS_FRAME_TYPE {
+                    return Err(H3FrameUnexpected::DuplicateSettings.into());
+                } else if frame.r#type() == Frame::GOAWAY_FRAME_TYPE {
+                    let goaway = frame.decode_one::<Goaway>().await?;
+                    if let Some(previous_goaway) = conn_state.peer_goaway.peek()
+                        && goaway.stream_id() > previous_goaway.stream_id()
+                    {
+                        return Err(Code::H3_ID_ERROR.into());
+                    }
+                    _ = conn_state.peer_goaway.set(goaway)
+                } else if frame.is_reversed_frame() {
+                    continue;
+                }
+            }
+        };
+        let handle_control_task =
+            AbortOnDropHandle::new(tokio::spawn(handle_control.in_current_span()));
+
+        Ok(handle_control_task)
     }
 }
 
@@ -318,10 +301,7 @@ impl<C: Send + Sync + 'static> ProtocolLayer<C> for DHttpLayer {
     }
 
     fn init(&self, _quic: &C) -> BoxFuture<'_, Result<(), ConnectionError>> {
-        // Initialization of control stream, QPACK encoder/decoder streams
-        // is done by Connection::new() which calls set_qpack_encoder/decoder,
-        // set_control_stream, and set_dispatch_channels on DHttpLayer.
-        // This method is a no-op in T5.
+        // Initialization is done via `init_dhttp()` called from `Connection::new()`.
         Box::pin(async { Ok(()) })
     }
 
@@ -330,104 +310,60 @@ impl<C: Send + Sync + 'static> ProtocolLayer<C> for DHttpLayer {
         mut stream: PeekableUniStream,
     ) -> BoxFuture<'_, Result<StreamVerdict<PeekableUniStream>, ConnectionError>> {
         Box::pin(async move {
-            // Fill the peek buffer so we can inspect the stream type VarInt.
-            // If the stream is already exhausted before we can read the type,
-            // pass it through (unknown/empty stream).
-            let has_data = stream
-                .fill_peek_buf()
-                .await
-                .map_err(|e| -> ConnectionError {
-                    let _ = e;
-                    crate::quic::TransportSnafu {
-                        kind: VarInt::from_u32(0),
-                        frame_type: VarInt::from_u32(0),
-                        reason: "stream read error during type peek",
-                    }
-                    .build()
-                    .into()
-                })?;
-
-            if !has_data {
-                // Empty stream — not an HTTP/3 stream we recognize.
-                // Reset cursor and pass through.
-                stream.reset();
-                return Ok(StreamVerdict::Passed(stream));
-            }
-
-            // Try to decode the stream type VarInt from peeked data.
-            // We may need multiple fill_peek_buf calls if the VarInt spans
-            // multiple chunks.
-            loop {
-                let data = stream.peek_slice();
-                if let Some((stream_type, consumed)) = Self::try_decode_varint_from_peek(data) {
-                    if Self::is_h3_uni_stream_type(stream_type) {
-                        // This is an HTTP/3 stream type. Commit the peeked bytes
-                        // (consume the type VarInt) and accept the stream.
-                        stream.consume(consumed);
-                        stream.commit();
-
-                        // Convert back to StreamReader for dispatch.
-                        let stream_reader = stream.into_stream_reader();
-
-                        // Dispatch the stream to the appropriate handler.
-                        self.dispatch_uni_stream(stream_type, stream_reader)
-                            .map_err(|e| -> ConnectionError {
-                                match e {
-                                    StreamError::Code { source } => crate::quic::TransportSnafu {
-                                        kind: source.code().value(),
-                                        frame_type: VarInt::from_u32(0),
-                                        reason: source.to_string().leak() as &'static str,
-                                    }
-                                    .build()
-                                    .into(),
-                                    StreamError::Quic { source } => match source {
-                                        quic::StreamError::Connection { source } => source,
-                                        quic::StreamError::Reset { .. } => {
-                                            crate::quic::TransportSnafu {
-                                                kind: VarInt::from_u32(0),
-                                                frame_type: VarInt::from_u32(0),
-                                                reason: "stream reset during dispatch",
-                                            }
-                                            .build()
-                                            .into()
-                                        }
-                                    },
-                                }
-                            })?;
-
-                        return Ok(StreamVerdict::Accepted);
-                    }
-                    // Not an HTTP/3 stream type. Reset the cursor so the
-                    // next layer can re-read the type VarInt.
+            // Use the standard codec pattern to decode the stream type VarInt.
+            // decode_one::<VarInt>() uses AsyncRead internally, which calls
+            // poll_bytes on the PeekableStreamReader, advancing the cursor.
+            let stream_type: VarInt = match stream.decode_one::<VarInt>().await {
+                Ok(v) => v,
+                Err(_) => {
+                    // Failed to decode (stream exhausted or malformed).
+                    // Reset cursor and pass through to the next layer.
                     stream.reset();
                     return Ok(StreamVerdict::Passed(stream));
                 }
+            };
 
-                // Not enough data to decode the VarInt yet. Try to get more.
-                // First consume what we have so far to advance cursor, then
-                // try to fill more data.
-                let current_len = data.len();
-                stream.consume(current_len);
-                let has_more = stream
-                    .fill_peek_buf()
-                    .await
+            // Check if the decoded stream type is a known HTTP/3 type.
+            let raw = stream_type.into_inner();
+            let is_h3_type = stream_type == UnidirectionalStream::CONTROL_STREAM_TYPE
+                || stream_type == UnidirectionalStream::PUSH_STREAM_TYPE
+                || (raw >= 0x21 && (raw - 0x21).is_multiple_of(0x1f));
+
+            if is_h3_type {
+                // Commit the peeked bytes (the VarInt) — makes the read permanent.
+                stream.commit();
+                let stream_reader = stream.into_stream_reader();
+
+                // Dispatch the stream to the appropriate handler.
+                self.dispatch_uni_stream(stream_type, stream_reader)
                     .map_err(|e| -> ConnectionError {
-                        let _ = e;
-                        crate::quic::TransportSnafu {
-                            kind: VarInt::from_u32(0),
-                            frame_type: VarInt::from_u32(0),
-                            reason: "stream read error during type peek",
+                        match e {
+                            StreamError::Code { source } => crate::quic::TransportSnafu {
+                                kind: source.code().value(),
+                                frame_type: VarInt::from_u32(0),
+                                reason: source.to_string().leak() as &'static str,
+                            }
+                            .build()
+                            .into(),
+                            StreamError::Quic { source } => match source {
+                                quic::StreamError::Connection { source } => source,
+                                quic::StreamError::Reset { .. } => crate::quic::TransportSnafu {
+                                    kind: VarInt::from_u32(0),
+                                    frame_type: VarInt::from_u32(0),
+                                    reason: "stream reset during dispatch",
+                                }
+                                .build()
+                                .into(),
+                            },
                         }
-                        .build()
-                        .into()
                     })?;
 
-                if !has_more {
-                    // Stream ended before we could read a complete VarInt.
-                    // Reset and pass through.
-                    stream.reset();
-                    return Ok(StreamVerdict::Passed(stream));
-                }
+                Ok(StreamVerdict::Accepted)
+            } else {
+                // Not an HTTP/3 stream type. Reset cursor so the next layer
+                // can re-read the stream type VarInt.
+                stream.reset();
+                Ok(StreamVerdict::Passed(stream))
             }
         })
     }
@@ -440,15 +376,11 @@ impl<C: Send + Sync + 'static> ProtocolLayer<C> for DHttpLayer {
         // Accept them unconditionally.
         Box::pin(async { Ok(StreamVerdict::Accepted) })
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{pin::Pin, sync::Arc};
+    use std::{any::Any, pin::Pin, sync::Arc};
 
     use bytes::Bytes;
 
@@ -536,113 +468,17 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(layer.local_settings(), &settings));
     }
 
-    #[test]
-    fn test_is_h3_uni_stream_type() {
-        // Control stream: 0x00
-        assert!(DHttpLayer::is_h3_uni_stream_type(VarInt::from_u32(0x00)));
-        // Push stream: 0x01
-        assert!(DHttpLayer::is_h3_uni_stream_type(VarInt::from_u32(0x01)));
-        // QPACK encoder: 0x02
-        assert!(DHttpLayer::is_h3_uni_stream_type(VarInt::from_u32(0x02)));
-        // QPACK decoder: 0x03
-        assert!(DHttpLayer::is_h3_uni_stream_type(VarInt::from_u32(0x03)));
-        // Reserved: 0x21
-        assert!(DHttpLayer::is_h3_uni_stream_type(VarInt::from_u32(0x21)));
-        // Reserved: 0x21 + 0x1f = 0x40
-        assert!(DHttpLayer::is_h3_uni_stream_type(VarInt::from_u32(0x40)));
-        // Unknown: 0x04 (not a known type, not reserved)
-        assert!(!DHttpLayer::is_h3_uni_stream_type(VarInt::from_u32(0x04)));
-        // Unknown: 0x20 (not reserved pattern)
-        assert!(!DHttpLayer::is_h3_uni_stream_type(VarInt::from_u32(0x20)));
-        // Unknown: 0x10
-        assert!(!DHttpLayer::is_h3_uni_stream_type(VarInt::from_u32(0x10)));
-    }
-
-    #[test]
-    fn test_try_decode_varint() {
-        // 1-byte VarInt: value 0x00 (control stream type)
-        let data = [0x00];
-        let result = DHttpLayer::try_decode_varint_from_peek(&data);
-        assert_eq!(result, Some((VarInt::from_u32(0x00), 1)));
-
-        // 1-byte VarInt: value 0x01 (push stream type)
-        let data = [0x01];
-        let result = DHttpLayer::try_decode_varint_from_peek(&data);
-        assert_eq!(result, Some((VarInt::from_u32(0x01), 1)));
-
-        // 1-byte VarInt: value 0x02 (QPACK encoder)
-        let data = [0x02];
-        let result = DHttpLayer::try_decode_varint_from_peek(&data);
-        assert_eq!(result, Some((VarInt::from_u32(0x02), 1)));
-
-        // 1-byte VarInt: value 0x03 (QPACK decoder)
-        let data = [0x03];
-        let result = DHttpLayer::try_decode_varint_from_peek(&data);
-        assert_eq!(result, Some((VarInt::from_u32(0x03), 1)));
-
-        // Empty data
-        let data: [u8; 0] = [];
-        let result = DHttpLayer::try_decode_varint_from_peek(&data);
-        assert_eq!(result, None);
-
-        // 2-byte VarInt: 0x40, 0x21 → value 0x21 (reserved stream type)
-        let data = [0x40, 0x21];
-        let result = DHttpLayer::try_decode_varint_from_peek(&data);
-        assert_eq!(result, Some((VarInt::from_u32(0x21), 2)));
-
-        // Incomplete 2-byte VarInt (only 1 byte available)
-        let data = [0x40];
-        let result = DHttpLayer::try_decode_varint_from_peek(&data);
-        assert_eq!(result, None);
-    }
-
     #[tokio::test]
     async fn test_accept_uni_control_stream() {
         let _guard = tracing_subscriber::fmt::try_init();
         let layer = DHttpLayer::with_default_settings();
 
-        // Install dispatch channels so accept_uni can dispatch
+        // Install dispatch channel so accept_uni can dispatch
         let (control_tx, _control_rx) = futures::channel::oneshot::channel();
-        let (qpack_enc_tx, _qpack_enc_rx) = futures::channel::oneshot::channel();
-        let (qpack_dec_tx, _qpack_dec_rx) = futures::channel::oneshot::channel();
-        layer.set_dispatch_channels(control_tx, qpack_enc_tx, qpack_dec_tx);
+        layer.set_control_dispatch_channel(control_tx);
 
         // Stream type 0x00 = control stream (1-byte VarInt)
         let stream = peekable_uni_from_chunks(vec![&[0x00], b"hello"]);
-        let result = ProtocolLayer::<()>::accept_uni(&layer, stream).await;
-        assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), StreamVerdict::Accepted));
-    }
-
-    #[tokio::test]
-    async fn test_accept_uni_qpack_encoder_stream() {
-        let _guard = tracing_subscriber::fmt::try_init();
-        let layer = DHttpLayer::with_default_settings();
-
-        let (control_tx, _control_rx) = futures::channel::oneshot::channel();
-        let (qpack_enc_tx, _qpack_enc_rx) = futures::channel::oneshot::channel();
-        let (qpack_dec_tx, _qpack_dec_rx) = futures::channel::oneshot::channel();
-        layer.set_dispatch_channels(control_tx, qpack_enc_tx, qpack_dec_tx);
-
-        // Stream type 0x02 = QPACK encoder stream
-        let stream = peekable_uni_from_chunks(vec![&[0x02]]);
-        let result = ProtocolLayer::<()>::accept_uni(&layer, stream).await;
-        assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), StreamVerdict::Accepted));
-    }
-
-    #[tokio::test]
-    async fn test_accept_uni_qpack_decoder_stream() {
-        let _guard = tracing_subscriber::fmt::try_init();
-        let layer = DHttpLayer::with_default_settings();
-
-        let (control_tx, _control_rx) = futures::channel::oneshot::channel();
-        let (qpack_enc_tx, _qpack_enc_rx) = futures::channel::oneshot::channel();
-        let (qpack_dec_tx, _qpack_dec_rx) = futures::channel::oneshot::channel();
-        layer.set_dispatch_channels(control_tx, qpack_enc_tx, qpack_dec_tx);
-
-        // Stream type 0x03 = QPACK decoder stream
-        let stream = peekable_uni_from_chunks(vec![&[0x03]]);
         let result = ProtocolLayer::<()>::accept_uni(&layer, stream).await;
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), StreamVerdict::Accepted));
@@ -654,9 +490,7 @@ mod tests {
         let layer = DHttpLayer::with_default_settings();
 
         let (control_tx, _control_rx) = futures::channel::oneshot::channel();
-        let (qpack_enc_tx, _qpack_enc_rx) = futures::channel::oneshot::channel();
-        let (qpack_dec_tx, _qpack_dec_rx) = futures::channel::oneshot::channel();
-        layer.set_dispatch_channels(control_tx, qpack_enc_tx, qpack_dec_tx);
+        layer.set_control_dispatch_channel(control_tx);
 
         // Stream type 0x01 = push stream
         let stream = peekable_uni_from_chunks(vec![&[0x01]]);
@@ -671,9 +505,7 @@ mod tests {
         let layer = DHttpLayer::with_default_settings();
 
         let (control_tx, _control_rx) = futures::channel::oneshot::channel();
-        let (qpack_enc_tx, _qpack_enc_rx) = futures::channel::oneshot::channel();
-        let (qpack_dec_tx, _qpack_dec_rx) = futures::channel::oneshot::channel();
-        layer.set_dispatch_channels(control_tx, qpack_enc_tx, qpack_dec_tx);
+        layer.set_control_dispatch_channel(control_tx);
 
         // Stream type 0x21 = reserved (0x21 + 0*0x1f)
         // 0x21 as 2-byte VarInt: 0x40, 0x21
@@ -719,10 +551,11 @@ mod tests {
     }
 
     #[test]
-    fn test_as_any_downcast() {
+    fn test_trait_upcasting_downcast() {
         let _guard = tracing_subscriber::fmt::try_init();
         let layer = DHttpLayer::with_default_settings();
-        let any_ref = ProtocolLayer::<()>::as_any(&layer);
+        let layer_ref: &dyn ProtocolLayer<()> = &layer;
+        let any_ref: &dyn Any = layer_ref;
         assert!(any_ref.downcast_ref::<DHttpLayer>().is_some());
     }
 }

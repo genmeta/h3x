@@ -6,7 +6,7 @@ use crate::{codec::peekable::PeekableStreamReader, quic::ConnectionError};
 
 /// Protocol layer trait for handling QUIC streams in a layered architecture.
 /// Layers can inspect, accept, or pass through streams to underlying layers.
-pub trait ProtocolLayer<C: ?Sized>: Send + Sync + 'static {
+pub trait ProtocolLayer<C: ?Sized>: Any + Send + Sync {
     /// Returns the name of this protocol layer.
     fn name(&self) -> &'static str;
 
@@ -26,9 +26,6 @@ pub trait ProtocolLayer<C: ?Sized>: Send + Sync + 'static {
         &self,
         stream: PeekableBiStream,
     ) -> BoxFuture<'_, Result<StreamVerdict<PeekableBiStream>, ConnectionError>>;
-
-    /// Returns this layer as a dynamic Any reference for downcasting.
-    fn as_any(&self) -> &dyn Any;
 }
 
 /// Verdict for stream handling in protocol layers.
@@ -50,3 +47,4 @@ pub type PeekableBiStream = (
 );
 
 pub mod dhttp;
+pub mod qpack;
