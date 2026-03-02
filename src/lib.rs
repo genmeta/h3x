@@ -7,12 +7,12 @@ pub mod codec;
 pub mod connection;
 pub mod error;
 pub mod frame;
+pub mod layer;
 pub mod message;
 pub mod pool;
 pub mod qpack;
 pub mod quic;
 pub mod server;
-pub mod layer;
 mod util;
 pub mod varint;
 

@@ -172,10 +172,7 @@ where
     ///
     /// Returns `Ok(false)` if the stream is exhausted.
     pub async fn fill_peek_buf(&mut self) -> Result<bool, S::Error> {
-        poll_fn(|cx| {
-            self.poll_bytes(cx).map_ok(|bytes| !bytes.is_empty())
-        })
-        .await
+        poll_fn(|cx| self.poll_bytes(cx).map_ok(|bytes| !bytes.is_empty())).await
     }
 
     /// Checks whether there are more bytes available (either buffered or
@@ -211,9 +208,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use bytes::Bytes;
     use futures::stream;
+
+    use super::*;
 
     /// Helper: create a `StreamReader` from byte chunks.
     fn stream_reader_from_chunks(
