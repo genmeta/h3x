@@ -6,7 +6,7 @@ use crate::{codec::peekable::PeekableStreamReader, quic::ConnectionError};
 
 /// Protocol layer trait for handling QUIC streams in a layered architecture.
 /// Layers can inspect, accept, or pass through streams to underlying layers.
-pub trait ProtocolLayer<C>: Send + Sync + 'static {
+pub trait ProtocolLayer<C: ?Sized>: Send + Sync + 'static {
     /// Returns the name of this protocol layer.
     fn name(&self) -> &'static str;
 
