@@ -12,6 +12,7 @@ pub mod pool;
 pub mod qpack;
 pub mod quic;
 pub mod server;
+pub mod layer;
 mod util;
 pub mod varint;
 
