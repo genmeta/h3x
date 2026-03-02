@@ -4,6 +4,7 @@ mod error;
 
 mod reader;
 mod writer;
+pub mod peekable;
 
 pub use error::{DecodeError, DecodeStreamError, EncodeError, EncodeStreamError};
 use futures::{Sink, stream::Stream};
