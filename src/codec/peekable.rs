@@ -6,6 +6,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::TryStream;
+use tokio::io::{self, AsyncBufRead, AsyncRead, ReadBuf};
 
 use crate::codec::StreamReader;
 
@@ -206,6 +207,40 @@ where
     }
 }
 
+impl<S> AsyncRead for PeekableStreamReader<S>
+where
+    S: TryStream<Ok = Bytes> + Unpin,
+    io::Error: From<S::Error>,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let chunk = ready!(self.as_mut().get_mut().poll_bytes(cx)?);
+        if !chunk.is_empty() {
+            let cap = buf.remaining().min(chunk.len());
+            buf.put_slice(&chunk[..cap]);
+            self.get_mut().consume(cap);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S> AsyncBufRead for PeekableStreamReader<S>
+where
+    S: TryStream<Ok = Bytes> + Unpin,
+    io::Error: From<S::Error>,
+{
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        self.get_mut().poll_bytes(cx).map_err(io::Error::from)
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        PeekableStreamReader::consume(self.get_mut(), amt);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -365,5 +400,75 @@ mod tests {
         // has_remaining should return false
         let has = peekable.has_remaining().await.unwrap();
         assert!(!has);
+    }
+
+    #[tokio::test]
+    async fn test_async_buf_read_fill_and_consume() {
+        use tokio::io::AsyncBufReadExt;
+
+        let _guard = tracing_subscriber::fmt::try_init();
+        let sr = stream_reader_from_chunks(vec![b"hello", b" world"]);
+        let mut peekable = PeekableStreamReader::new(sr);
+
+        // poll_fill_buf via AsyncBufRead returns peeked data
+        let buf = peekable.fill_buf().await.unwrap();
+        assert_eq!(buf, b"hello");
+
+        // AsyncBufRead::consume advances cursor but doesn't commit
+        AsyncBufReadExt::consume(&mut peekable, 5);
+        assert_eq!(peekable.peeked(), 5);
+
+        // Reset still works — cursor rollback
+        peekable.reset();
+        assert_eq!(peekable.peeked(), 0);
+
+        // Re-read the same data after reset
+        let buf = peekable.fill_buf().await.unwrap();
+        assert_eq!(buf, b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_async_read_poll_read() {
+        use tokio::io::AsyncReadExt;
+
+        let _guard = tracing_subscriber::fmt::try_init();
+        let sr = stream_reader_from_chunks(vec![b"hello", b" world"]);
+        let mut peekable = PeekableStreamReader::new(sr);
+
+        // Read via AsyncRead
+        let mut buf = [0u8; 5];
+        peekable.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+
+        // Cursor has advanced by 5
+        assert_eq!(peekable.peeked(), 5);
+
+        // Read next chunk
+        let mut buf = [0u8; 6];
+        peekable.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b" world");
+    }
+
+    #[tokio::test]
+    async fn test_decode_one_varint() {
+        use crate::{codec::DecodeExt, varint::VarInt};
+
+        let _guard = tracing_subscriber::fmt::try_init();
+        // 1-byte VarInt 0x02 = QPACK encoder stream type
+        let sr = stream_reader_from_chunks(vec![b"\x02rest"]);
+        let mut peekable = PeekableStreamReader::new(sr);
+
+        let v: VarInt = peekable.decode_one::<VarInt>().await.unwrap();
+        assert_eq!(v, VarInt::from_u32(0x02));
+
+        // Cursor advanced past the VarInt (1 byte)
+        assert_eq!(peekable.peeked(), 1);
+
+        // Reset rolls back so we can re-read the VarInt
+        peekable.reset();
+        assert_eq!(peekable.peeked(), 0);
+
+        let v2: VarInt = peekable.decode_one::<VarInt>().await.unwrap();
+        assert_eq!(v2, VarInt::from_u32(0x02));
     }
 }
