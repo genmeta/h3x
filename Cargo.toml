@@ -28,8 +28,8 @@ x509-parser = "0.18"
 tower-service = "0.3"
 rkyv = { version = "0.8", optional = true }
 
-gm-quic = { git = "https://github.com/genmeta/gm-quic.git", branch = "main", optional = true }
-# gm-quic = { path = "../gm-quic/gm-quic", optional = true }
+# gm-quic = { git = "https://github.com/genmeta/gm-quic.git", branch = "main", optional = true }
+gm-quic = { path = "../gm-quic/gm-quic", optional = true }
 
 http-body = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
