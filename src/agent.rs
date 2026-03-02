@@ -1,18 +1,12 @@
-use std::sync::Arc;
+use std::fmt::Debug;
 
+use futures::future::BoxFuture;
 use rustls::{
     SignatureScheme,
     pki_types::{CertificateDer, SubjectPublicKeyInfoDer},
-    sign::{CertifiedKey, SigningKey},
 };
 use snafu::Snafu;
 use x509_parser::prelude::FromDer;
-
-#[derive(Debug, Clone)]
-pub struct LocalAgent {
-    name: Arc<str>,
-    certified_key: Arc<CertifiedKey>,
-}
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
@@ -23,50 +17,6 @@ pub enum SignError {
     Crypto { source: rustls::Error },
 }
 
-impl LocalAgent {
-    pub fn new(name: Arc<str>, certified_key: Arc<CertifiedKey>) -> Self {
-        Self {
-            name,
-            certified_key,
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn cert_chain(&self) -> &[CertificateDer<'static>] {
-        &self.certified_key.cert
-    }
-
-    pub fn public_key(&self) -> SubjectPublicKeyInfoDer<'_> {
-        public_key(self.cert_chain())
-    }
-
-    pub fn sign_algorithm(&self) -> rustls::SignatureAlgorithm {
-        self.certified_key.key.algorithm()
-    }
-
-    pub fn sign(&self, scheme: SignatureScheme, data: &[u8]) -> Result<Vec<u8>, SignError> {
-        sign(self.certified_key.key.as_ref(), scheme, data)
-    }
-
-    pub fn verify(
-        &self,
-        scheme: SignatureScheme,
-        data: &[u8],
-        signature: &[u8],
-    ) -> Result<bool, VerifyError> {
-        verify(self.public_key(), scheme, data, signature)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RemoteAgent {
-    name: Arc<str>,
-    cert: Arc<[CertificateDer<'static>]>,
-}
-
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum VerifyError {
@@ -74,34 +24,51 @@ pub enum VerifyError {
     UnsupportedScheme { scheme: SignatureScheme },
 }
 
-impl RemoteAgent {
-    pub fn new(name: Arc<str>, cert: Arc<[CertificateDer<'static>]>) -> Self {
-        Self { name, cert }
+pub trait LocalAgent: Send + Sync + Debug {
+    fn name(&self) -> &str;
+    fn cert_chain(&self) -> &[CertificateDer<'static>];
+    fn sign_algorithm(&self) -> rustls::SignatureAlgorithm;
+    fn sign(
+        &self,
+        scheme: SignatureScheme,
+        data: &[u8],
+    ) -> BoxFuture<'_, Result<Vec<u8>, SignError>>;
+
+    fn public_key(&self) -> SubjectPublicKeyInfoDer<'_> {
+        extract_public_key(self.cert_chain())
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn cert_chain(&self) -> &[CertificateDer<'static>] {
-        &self.cert
-    }
-
-    pub fn public_key(&self) -> SubjectPublicKeyInfoDer<'_> {
-        public_key(self.cert_chain())
-    }
-
-    pub fn verify(
+    fn verify(
         &self,
         scheme: SignatureScheme,
         data: &[u8],
         signature: &[u8],
-    ) -> Result<bool, VerifyError> {
-        verify(self.public_key(), scheme, data, signature)
+    ) -> BoxFuture<'_, Result<bool, VerifyError>> {
+        let result = verify_signature(self.public_key(), scheme, data, signature);
+        Box::pin(std::future::ready(result))
     }
 }
 
-fn public_key<'d>(cert_chain: &'d [CertificateDer<'d>]) -> SubjectPublicKeyInfoDer<'d> {
+pub trait RemoteAgent: Send + Sync + Debug {
+    fn name(&self) -> &str;
+    fn cert_chain(&self) -> &[CertificateDer<'static>];
+
+    fn public_key(&self) -> SubjectPublicKeyInfoDer<'_> {
+        extract_public_key(self.cert_chain())
+    }
+
+    fn verify(
+        &self,
+        scheme: SignatureScheme,
+        data: &[u8],
+        signature: &[u8],
+    ) -> BoxFuture<'_, Result<bool, VerifyError>> {
+        let result = verify_signature(self.public_key(), scheme, data, signature);
+        Box::pin(std::future::ready(result))
+    }
+}
+
+pub fn extract_public_key<'d>(cert_chain: &'d [CertificateDer<'d>]) -> SubjectPublicKeyInfoDer<'d> {
     use x509_parser::prelude::*;
 
     match x509_parser::certificate::X509Certificate::from_der(&cert_chain[0]) {
@@ -114,8 +81,8 @@ fn public_key<'d>(cert_chain: &'d [CertificateDer<'d>]) -> SubjectPublicKeyInfoD
     }
 }
 
-fn sign(
-    key: &(impl SigningKey + ?Sized),
+pub fn sign_with_key(
+    key: &(impl rustls::sign::SigningKey + ?Sized),
     scheme: SignatureScheme,
     data: &[u8],
 ) -> Result<Vec<u8>, SignError> {
@@ -126,7 +93,7 @@ fn sign(
     Ok(signer.sign(data)?)
 }
 
-fn verify(
+pub fn verify_signature(
     spki: SubjectPublicKeyInfoDer,
     scheme: SignatureScheme,
     data: &[u8],

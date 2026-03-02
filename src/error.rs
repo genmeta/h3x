@@ -4,7 +4,10 @@ use snafu::Snafu;
 
 use crate::varint::VarInt;
 
-#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Code(VarInt);
 

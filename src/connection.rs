@@ -21,7 +21,7 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
 use crate::{
-    agent::{LocalAgent, RemoteAgent},
+    agent,
     buflist::BufList,
     codec::{DecodeExt, Encode, EncodeExt, Feed, SinkWriter, StreamReader},
     connection::{
@@ -152,15 +152,31 @@ impl<C: quic::ManageStream + ?Sized> ConnectionState<C> {
     }
 }
 
-impl<C: quic::WithLocalAgent + ?Sized> ConnectionState<C> {
-    fn local_agent(&self) -> BoxFuture<'_, Result<Option<LocalAgent>, quic::ConnectionError>> {
-        self.quic_connection.local_agent()
+impl<C: quic::WithLocalAgent + Sync + ?Sized> ConnectionState<C> {
+    fn local_agent(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::LocalAgent>>, quic::ConnectionError>> {
+        Box::pin(async {
+            Ok(self
+                .quic_connection
+                .local_agent()
+                .await?
+                .map(|a| Arc::new(a) as Arc<dyn agent::LocalAgent>))
+        })
     }
 }
 
-impl<C: quic::WithRemoteAgent + ?Sized> ConnectionState<C> {
-    fn remote_agent(&self) -> BoxFuture<'_, Result<Option<RemoteAgent>, quic::ConnectionError>> {
-        self.quic_connection.remote_agent()
+impl<C: quic::WithRemoteAgent + Sync + ?Sized> ConnectionState<C> {
+    fn remote_agent(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::RemoteAgent>>, quic::ConnectionError>> {
+        Box::pin(async {
+            Ok(self
+                .quic_connection
+                .remote_agent()
+                .await?
+                .map(|a| Arc::new(a) as Arc<dyn agent::RemoteAgent>))
+        })
     }
 }
 
@@ -677,13 +693,15 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
         self.state.error().await
     }
 
-    pub fn local_agent(&self) -> BoxFuture<'_, Result<Option<LocalAgent>, quic::ConnectionError>> {
+    pub fn local_agent(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::LocalAgent>>, quic::ConnectionError>> {
         self.state.local_agent()
     }
 
     pub fn remote_agent(
         &self,
-    ) -> BoxFuture<'_, Result<Option<RemoteAgent>, quic::ConnectionError>> {
+    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::RemoteAgent>>, quic::ConnectionError>> {
         self.state.remote_agent()
     }
 }

@@ -1,4 +1,4 @@
-use std::error::Error;
+use std::{error::Error, sync::Arc};
 
 use bytes::{Buf, Bytes};
 use futures::{Sink, Stream, StreamExt, TryFutureExt};
@@ -11,7 +11,7 @@ use snafu::{Report, ResultExt, Snafu};
 use tracing::Instrument;
 
 use crate::{
-    agent::{LocalAgent, RemoteAgent},
+    agent,
     client::Client,
     connection::OpenRequestStreamError,
     error::Code,
@@ -333,7 +333,7 @@ where
 pub struct Request {
     message: Message,
     stream: WriteStream,
-    agent: Option<LocalAgent>,
+    agent: Option<Arc<dyn agent::LocalAgent>>,
 }
 
 impl Request {
@@ -475,7 +475,7 @@ impl Request {
         &mut self.stream
     }
 
-    pub fn agent(&self) -> Option<&LocalAgent> {
+    pub fn agent(&self) -> Option<&Arc<dyn agent::LocalAgent>> {
         self.agent.as_ref()
     }
 
@@ -516,7 +516,7 @@ impl Drop for Request {
 pub struct Response {
     message: Message,
     stream: ReadStream,
-    agent: RemoteAgent,
+    agent: Arc<dyn agent::RemoteAgent>,
 }
 
 impl Response {
@@ -584,7 +584,7 @@ impl Response {
         &mut self.stream
     }
 
-    pub fn agent(&self) -> &RemoteAgent {
+    pub fn agent(&self) -> &Arc<dyn agent::RemoteAgent> {
         &self.agent
     }
 }

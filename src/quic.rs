@@ -14,11 +14,7 @@ use futures::{Sink, Stream, future::BoxFuture};
 use http::uri::Authority;
 use snafu::Snafu;
 
-use crate::{
-    agent::{LocalAgent, RemoteAgent},
-    error::Code,
-    varint::VarInt,
-};
+use crate::{agent, error::Code, varint::VarInt};
 
 #[cfg_attr(
     feature = "rkyv",
@@ -185,11 +181,13 @@ pub trait ManageStream {
     fn accept_uni(&self) -> BoxFuture<'_, Result<Self::StreamReader, ConnectionError>>;
 }
 pub trait WithLocalAgent {
-    fn local_agent(&self) -> BoxFuture<'_, Result<Option<LocalAgent>, ConnectionError>>;
+    type LocalAgent: agent::LocalAgent + 'static;
+    fn local_agent(&self) -> BoxFuture<'_, Result<Option<Self::LocalAgent>, ConnectionError>>;
 }
 
 pub trait WithRemoteAgent {
-    fn remote_agent(&self) -> BoxFuture<'_, Result<Option<RemoteAgent>, ConnectionError>>;
+    type RemoteAgent: agent::RemoteAgent + 'static;
+    fn remote_agent(&self) -> BoxFuture<'_, Result<Option<Self::RemoteAgent>, ConnectionError>>;
 }
 
 pub trait Close {

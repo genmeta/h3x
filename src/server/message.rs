@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use bytes::{Buf, Bytes};
 use futures::{Sink, Stream, StreamExt, future::BoxFuture};
 use http::{
@@ -9,7 +11,7 @@ use snafu::Report;
 use tracing::Instrument;
 
 use crate::{
-    agent::{LocalAgent, RemoteAgent},
+    agent,
     error::Code,
     message::{
         MalformedMessageError, Message, MessageStage,
@@ -20,9 +22,9 @@ use crate::{
 
 pub struct UnresolvedRequest {
     pub request_stream: ReadStream,
-    pub remote_agent: Option<RemoteAgent>,
+    pub remote_agent: Option<Arc<dyn agent::RemoteAgent>>,
     pub response_stream: WriteStream,
-    pub local_agent: LocalAgent,
+    pub local_agent: Arc<dyn agent::LocalAgent>,
 }
 
 impl UnresolvedRequest {
@@ -58,7 +60,7 @@ impl IntoFuture for UnresolvedRequest {
 pub struct Request {
     message: Message,
     stream: ReadStream,
-    agent: Option<RemoteAgent>,
+    agent: Option<Arc<dyn agent::RemoteAgent>>,
 }
 
 impl Request {
@@ -137,7 +139,7 @@ impl Request {
         &mut self.stream
     }
 
-    pub fn agent(&self) -> Option<&RemoteAgent> {
+    pub fn agent(&self) -> Option<&Arc<dyn agent::RemoteAgent>> {
         self.agent.as_ref()
     }
 }
@@ -145,7 +147,7 @@ impl Request {
 pub struct Response {
     message: Message,
     stream: WriteStream,
-    agent: LocalAgent,
+    agent: Arc<dyn agent::LocalAgent>,
 }
 
 impl Response {
@@ -335,7 +337,7 @@ impl Response {
         &mut self.stream
     }
 
-    pub fn agent(&self) -> &LocalAgent {
+    pub fn agent(&self) -> &Arc<dyn agent::LocalAgent> {
         &self.agent
     }
 

@@ -7,10 +7,10 @@ use std::{
 
 use bytes::Bytes;
 use futures::{FutureExt, Sink, Stream, TryFutureExt, future::BoxFuture};
-use rustls::{pki_types::CertificateDer, sign::CertifiedKey};
+use rustls::{SignatureScheme, pki_types::CertificateDer, sign::CertifiedKey};
 
 use crate::{
-    agent::{LocalAgent, RemoteAgent},
+    agent::{self, SignError},
     error::Code,
     quic,
     quic::CancelStream,
@@ -223,14 +223,66 @@ impl quic::ManageStream for gm_quic::prelude::Connection {
     }
 }
 
+#[derive(Debug)]
+pub struct GmQuicLocalAgent {
+    name: Arc<str>,
+    certified_key: Arc<CertifiedKey>,
+}
+
+impl agent::LocalAgent for GmQuicLocalAgent {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn cert_chain(&self) -> &[CertificateDer<'static>] {
+        self.certified_key.cert.as_slice()
+    }
+
+    fn sign_algorithm(&self) -> rustls::SignatureAlgorithm {
+        self.certified_key.key.algorithm()
+    }
+
+    fn sign(
+        &self,
+        scheme: SignatureScheme,
+        data: &[u8],
+    ) -> BoxFuture<'_, Result<Vec<u8>, SignError>> {
+        let result = agent::sign_with_key(self.certified_key.key.as_ref(), scheme, data);
+        Box::pin(std::future::ready(result))
+    }
+}
+
+#[derive(Debug)]
+pub struct GmQuicRemoteAgent {
+    name: Arc<str>,
+    cert_chain: Arc<[CertificateDer<'static>]>,
+}
+
+impl agent::RemoteAgent for GmQuicRemoteAgent {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn cert_chain(&self) -> &[CertificateDer<'static>] {
+        &self.cert_chain
+    }
+}
+
 impl quic::WithLocalAgent for gm_quic::prelude::Connection {
-    fn local_agent(&self) -> BoxFuture<'_, Result<Option<LocalAgent>, quic::ConnectionError>> {
+    type LocalAgent = GmQuicLocalAgent;
+
+    fn local_agent(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<GmQuicLocalAgent>, quic::ConnectionError>> {
         self.local_agent()
             .map_ok(|local_agent| {
                 local_agent.map(|local_agent| {
                     let name = AsRef::<Arc<str>>::as_ref(&local_agent).clone();
                     let certified_key = AsRef::<Arc<CertifiedKey>>::as_ref(&local_agent).clone();
-                    LocalAgent::new(name, certified_key)
+                    GmQuicLocalAgent {
+                        name,
+                        certified_key,
+                    }
                 })
             })
             .map_err(convert_connection_error)
@@ -239,13 +291,17 @@ impl quic::WithLocalAgent for gm_quic::prelude::Connection {
 }
 
 impl quic::WithRemoteAgent for gm_quic::prelude::Connection {
-    fn remote_agent(&self) -> BoxFuture<'_, Result<Option<RemoteAgent>, quic::ConnectionError>> {
+    type RemoteAgent = GmQuicRemoteAgent;
+
+    fn remote_agent(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<GmQuicRemoteAgent>, quic::ConnectionError>> {
         self.remote_agent()
             .map_ok(|remote_agent| {
                 remote_agent.map(|remote_agent| {
                     let name = AsRef::<Arc<str>>::as_ref(&remote_agent).clone();
-                    let cert = AsRef::<Arc<[CertificateDer]>>::as_ref(&remote_agent).clone();
-                    RemoteAgent::new(name, cert)
+                    let cert_chain = AsRef::<Arc<[CertificateDer]>>::as_ref(&remote_agent).clone();
+                    GmQuicRemoteAgent { name, cert_chain }
                 })
             })
             .map_err(convert_connection_error)
