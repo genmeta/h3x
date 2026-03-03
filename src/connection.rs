@@ -415,7 +415,13 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
 
                 let mut accepted = false;
                 for layer in &layers_for_routing {
-                    let stream = peekable.take().expect("stream consumed unexpectedly");
+                    // Invariant: `peekable` is always `Some` here because `Passed`
+                    // returns the stream and `Accepted` breaks out of the loop.
+                    let stream = peekable.take().ok_or(StreamError::Quic {
+                        source: quic::StreamError::Reset {
+                            code: Code::H3_INTERNAL_ERROR.value(),
+                        },
+                    })?;
                     match layer.accept_uni(stream).await? {
                         StreamVerdict::Accepted => {
                             accepted = true;

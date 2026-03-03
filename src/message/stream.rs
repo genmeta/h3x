@@ -189,13 +189,19 @@ impl ReadStream {
         // different HTTP connection. A client that is unable to retry
         // requests loses all requests that are in flight when the server
         // closes the connection.
-        let peer_goaway = self.connection.peer_goawaies().filter_map(move |result| {
-            future::ready(match result {
-                Ok(goaway) if stream_id >= goaway.stream_id() => Some(Ok(())),
-                Ok(..) => None,
-                Err(error) => Some(Err(error)),
-            })
-        });
+        let peer_goaway = self
+            .connection
+            .peer_goawaies()
+            .ok_or(quic::StreamError::Reset {
+                code: Code::H3_INTERNAL_ERROR.value(),
+            })?
+            .filter_map(move |result| {
+                future::ready(match result {
+                    Ok(goaway) if stream_id >= goaway.stream_id() => Some(Ok(())),
+                    Ok(..) => None,
+                    Err(error) => Some(Err(error)),
+                })
+            });
 
         // TODO: Is there any better way to move ownership of the stream than async block?.
         Ok(async move { pin!(peer_goaway).fuse().select_next_some().await })
@@ -215,7 +221,7 @@ impl ReadStream {
                     _ = self.stream.stop(source.code().into_inner()).await;
                     Err(StreamError::MalformedIncomingMessage)
                 },
-                Err(error) => Err(self.connection.handle_error(error).await.into()),
+                Err(error) => Err(self.connection.handle_error(error).await.unwrap_or(quic::StreamError::Reset { code: Code::H3_INTERNAL_ERROR.value() }).into()),
             },
             goaway = peer_goaway => match goaway {
                 Ok(()) => {
@@ -655,13 +661,19 @@ impl WriteStream {
         // different HTTP connection. A client that is unable to retry
         // requests loses all requests that are in flight when the server
         // closes the connection.
-        let peer_goaway = self.connection.peer_goawaies().filter_map(move |result| {
-            future::ready(match result {
-                Ok(goaway) if stream_id >= goaway.stream_id() => Some(Ok(())),
-                Ok(..) => None,
-                Err(error) => Some(Err(error)),
-            })
-        });
+        let peer_goaway = self
+            .connection
+            .peer_goawaies()
+            .ok_or(quic::StreamError::Reset {
+                code: Code::H3_INTERNAL_ERROR.value(),
+            })?
+            .filter_map(move |result| {
+                future::ready(match result {
+                    Ok(goaway) if stream_id >= goaway.stream_id() => Some(Ok(())),
+                    Ok(..) => None,
+                    Err(error) => Some(Err(error)),
+                })
+            });
 
         // TODO: Is there any better way to move ownership of the stream than async block?.
         Ok(async move { pin!(peer_goaway).fuse().select_next_some().await })
@@ -681,7 +693,7 @@ impl WriteStream {
         tokio::select! {
             result = f(self) => match result {
                 Ok(value) => Ok(value),
-                Err(error) => Err(self.connection.handle_error(error).await.into()),
+                Err(error) => Err(self.connection.handle_error(error).await.unwrap_or(quic::StreamError::Reset { code: Code::H3_INTERNAL_ERROR.value() }).into()),
             },
             goaway = peer_goaway => match goaway {
                 Ok(()) => {

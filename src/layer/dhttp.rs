@@ -144,22 +144,22 @@ impl DHttpLayer {
     }
 
     /// Returns a stream of peer GOAWAY frames, delegating to the stored ConnectionState.
+    ///
+    /// Returns `None` if the layer has not been initialized via `init_dhttp()`.
     pub fn peer_goawaies(
         &self,
-    ) -> impl FusedStream<Item = Result<Goaway, quic::ConnectionError>> + use<> {
-        self.conn_state
-            .get()
-            .expect("DHttpLayer not initialized before use")
-            .peer_goawaies()
+    ) -> Option<impl FusedStream<Item = Result<Goaway, quic::ConnectionError>> + use<>> {
+        self.conn_state.get().map(|state| state.peer_goawaies())
     }
 
     /// Handles a stream-level error, delegating to the stored ConnectionState.
-    pub async fn handle_error(&self, error: StreamError) -> quic::StreamError {
-        self.conn_state
-            .get()
-            .expect("DHttpLayer not initialized before use")
-            .handle_error(error)
-            .await
+    ///
+    /// Returns `None` if the layer has not been initialized via `init_dhttp()`.
+    pub async fn handle_error(&self, error: StreamError) -> Option<quic::StreamError> {
+        match self.conn_state.get() {
+            Some(state) => Some(state.handle_error(error).await),
+            None => None,
+        }
     }
     /// Returns the control stream frame sink, if initialized.
     #[must_use]
