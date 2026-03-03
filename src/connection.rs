@@ -218,7 +218,7 @@ impl<C: quic::Close + ?Sized> ConnectionState<C> {
     pub fn error(&self) -> impl Future<Output = quic::ConnectionError> + use<C> {
         self.error
             .get()
-            .map(|option| option.expect("connection closed without error"))
+            .map(|option| option.unwrap_or_else(|| unreachable!("connection closed without error")))
     }
 
     pub fn settings(&self) -> Arc<Settings> {
@@ -453,10 +453,15 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
         // Supervisor task: join all background tasks
         let conn_state = state.clone();
         let task = async move {
+            let unwrap_task = |r: Result<_, tokio::task::JoinError>| match r {
+                Ok(val) => val,
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(e) => unreachable!("background task cancelled: {e}"),
+            };
             match tokio::try_join!(
-                accept_uni_task.map(Result::unwrap),
-                handle_control_stream.map(Result::unwrap),
-                receive_decoder_instructions.map(Result::unwrap)
+                accept_uni_task.map(unwrap_task),
+                handle_control_stream.map(unwrap_task),
+                receive_decoder_instructions.map(unwrap_task)
             ) {
                 Ok(_) => unreachable!(),
                 Err(error) => _ = conn_state.handle_error(error).await,
