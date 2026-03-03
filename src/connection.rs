@@ -552,6 +552,13 @@ impl<C: quic::Connection /* TODO: + ?Sized */> Connection<C> {
         &self,
     ) -> Result<(message::stream::ReadStream, message::stream::WriteStream), OpenRequestStreamError>
     {
+        let dhttp = self
+            .layer::<DHttpLayer>()
+            .ok_or(OpenRequestStreamError::RequestStream {
+                source: quic::StreamError::Reset {
+                    code: Code::H3_INTERNAL_ERROR.value(),
+                },
+            })?;
         let qpack = self
             .layer::<QPackLayer>()
             .ok_or(OpenRequestStreamError::RequestStream {
@@ -577,8 +584,8 @@ impl<C: quic::Connection /* TODO: + ?Sized */> Connection<C> {
             })?
             .clone();
         Ok((
-            message::stream::ReadStream::new(stream_reader, qpack_decoder, self.state.clone()),
-            message::stream::WriteStream::new(stream_writer, qpack_encoder, self.state.clone()),
+            message::stream::ReadStream::new(stream_reader, qpack_decoder, dhttp.clone()),
+            message::stream::WriteStream::new(stream_writer, qpack_encoder, dhttp),
         ))
     }
 
@@ -586,6 +593,13 @@ impl<C: quic::Connection /* TODO: + ?Sized */> Connection<C> {
         &self,
     ) -> Result<(message::stream::ReadStream, message::stream::WriteStream), AcceptRequestStreamError>
     {
+        let dhttp = self
+            .layer::<DHttpLayer>()
+            .ok_or(AcceptRequestStreamError::Quic {
+                source: quic::StreamError::Reset {
+                    code: Code::H3_INTERNAL_ERROR.value(),
+                },
+            })?;
         let qpack = self
             .layer::<QPackLayer>()
             .ok_or(AcceptRequestStreamError::Quic {
@@ -611,8 +625,8 @@ impl<C: quic::Connection /* TODO: + ?Sized */> Connection<C> {
             })?
             .clone();
         Ok((
-            message::stream::ReadStream::new(stream_reader, qpack_decoder, self.state.clone()),
-            message::stream::WriteStream::new(stream_writer, qpack_encoder, self.state.clone()),
+            message::stream::ReadStream::new(stream_reader, qpack_decoder, dhttp.clone()),
+            message::stream::WriteStream::new(stream_writer, qpack_encoder, dhttp),
         ))
     }
 }

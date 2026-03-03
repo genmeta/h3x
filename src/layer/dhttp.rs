@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use futures::{SinkExt, StreamExt, channel::oneshot, future::BoxFuture};
+use futures::{SinkExt, StreamExt, channel::oneshot, future::BoxFuture, stream::FusedStream};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
@@ -83,6 +83,9 @@ pub struct DHttpLayer {
 
     /// Oneshot sender for dispatching the peer's control stream.
     control_stream_tx: Mutex<Option<oneshot::Sender<UniStreamReader>>>,
+
+    /// Erased connection state for peer goaway / error delegation.
+    conn_state: OnceLock<Arc<ConnectionState<dyn quic::Close + Send + Sync>>>,
 }
 
 impl std::fmt::Debug for DHttpLayer {
@@ -101,6 +104,7 @@ impl DHttpLayer {
             state: Arc::new(DHttpLayerState::new(local_settings)),
             control_stream: OnceLock::new(),
             control_stream_tx: Mutex::new(None),
+            conn_state: OnceLock::new(),
         }
     }
 
@@ -139,6 +143,24 @@ impl DHttpLayer {
         self.state.peer_goaway.peek()
     }
 
+    /// Returns a stream of peer GOAWAY frames, delegating to the stored ConnectionState.
+    pub fn peer_goawaies(
+        &self,
+    ) -> impl FusedStream<Item = Result<Goaway, quic::ConnectionError>> + use<> {
+        self.conn_state
+            .get()
+            .expect("DHttpLayer not initialized before use")
+            .peer_goawaies()
+    }
+
+    /// Handles a stream-level error, delegating to the stored ConnectionState.
+    pub async fn handle_error(&self, error: StreamError) -> quic::StreamError {
+        self.conn_state
+            .get()
+            .expect("DHttpLayer not initialized before use")
+            .handle_error(error)
+            .await
+    }
     /// Returns the control stream frame sink, if initialized.
     #[must_use]
     pub fn control_stream(&self) -> Option<&AsyncMutex<FrameSink>> {
@@ -199,6 +221,10 @@ impl DHttpLayer {
         state: &Arc<ConnectionState<C>>,
         qpack_encoder: Arc<QPackEncoder>,
     ) -> Result<AbortOnDropHandle<Result<(), StreamError>>, ConnectionError> {
+        // Store erased connection state so ReadStream/WriteStream can delegate through us.
+        let erased: Arc<ConnectionState<dyn quic::Close + Send + Sync>> = state.clone();
+        let _ = self.conn_state.set(erased);
+
         // Set up dispatch channel for incoming peer control stream
         let (control_stream_tx, control_stream_rx) = oneshot::channel();
         self.set_control_dispatch_channel(control_stream_tx);

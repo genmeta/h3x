@@ -13,12 +13,13 @@ use snafu::Snafu;
 use crate::{
     buflist::{BufList, Cursor},
     codec::{EncodeError, EncodeExt, SinkWriter, StreamReader},
-    connection::{self, ConnectionGoaway, ConnectionState, QPackDecoder, QPackEncoder},
+    connection::{self, ConnectionGoaway, QPackDecoder, QPackEncoder},
     error::Code,
     frame::{
         Frame,
         stream::{FrameStream, ReadableFrame},
     },
+    layer::dhttp::DHttpLayer,
     message::{Body, Message, MessageStage},
     qpack::{
         algorithm::{HuffmanAlways, StaticCompressAlgo},
@@ -158,14 +159,14 @@ type BoxQuicStream = Pin<Box<dyn quic::ReadStream + Send>>;
 pub struct ReadStream {
     stream: FrameStream<BoxQuicStream>,
     qpack_decoder: Arc<QPackDecoder>,
-    connection: Arc<ConnectionState<dyn quic::Close + Send + Sync>>,
+    connection: Arc<DHttpLayer>,
 }
 
 impl ReadStream {
     pub fn new(
         stream: Pin<Box<dyn quic::ReadStream + Send>>,
         qpack_decoder: Arc<QPackDecoder>,
-        connection: Arc<ConnectionState<dyn quic::Close + Send + Sync>>,
+        connection: Arc<DHttpLayer>,
     ) -> Self {
         let frame_stream = FrameStream::new(StreamReader::new(stream));
         Self {
@@ -617,7 +618,7 @@ impl quic::StopStream for ReadStream {
 pub struct WriteStream {
     stream: SinkWriter<Pin<Box<dyn quic::WriteStream + Send>>>,
     qpack_encoder: Arc<QPackEncoder>,
-    connection: Arc<ConnectionState<dyn quic::Close + Send + Sync>>,
+    connection: Arc<DHttpLayer>,
 }
 
 pub const DEFAULT_COMPRESS_ALGO: StaticCompressAlgo<HuffmanAlways> =
@@ -627,7 +628,7 @@ impl WriteStream {
     pub fn new(
         stream: Pin<Box<dyn quic::WriteStream + Send>>,
         qpack_encoder: Arc<QPackEncoder>,
-        connection: Arc<ConnectionState<dyn quic::Close + Send + Sync>>,
+        connection: Arc<DHttpLayer>,
     ) -> Self {
         let stream = SinkWriter::new(stream);
         Self {
