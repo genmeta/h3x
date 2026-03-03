@@ -20,7 +20,7 @@ use std::{
 use bytes::Bytes;
 use futures::{Stream, future::BoxFuture};
 use h3x::{
-    codec::{DecodeExt, peekable::PeekableStreamReader, StreamReader},
+    codec::{DecodeExt, StreamReader, peekable::PeekableStreamReader},
     layer::{PeekableBiStream, PeekableUniStream, ProtocolLayer, StreamVerdict},
     quic::{self, ConnectionError, GetStreamId, StopStream},
     varint::VarInt,
@@ -435,8 +435,14 @@ async fn routing_loop_no_layer_accepts_fallback() {
 async fn routing_loop_three_layers() {
     let _guard = tracing_subscriber::fmt::try_init();
 
-    let qpack = MockLayer::new("qpack", vec![VarInt::from_u32(0x02), VarInt::from_u32(0x03)]);
-    let dhttp = MockLayer::new("dhttp", vec![VarInt::from_u32(0x00), VarInt::from_u32(0x01)]);
+    let qpack = MockLayer::new(
+        "qpack",
+        vec![VarInt::from_u32(0x02), VarInt::from_u32(0x03)],
+    );
+    let dhttp = MockLayer::new(
+        "dhttp",
+        vec![VarInt::from_u32(0x00), VarInt::from_u32(0x01)],
+    );
     let custom = MockLayer::new("custom", vec![VarInt::from_u32(0x10)]);
     let layers: Vec<&dyn ProtocolLayer<()>> = vec![&qpack, &dhttp, &custom];
 
