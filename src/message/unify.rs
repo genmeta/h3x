@@ -8,7 +8,7 @@ use http::{
 use snafu::Snafu;
 
 use crate::{
-    buflist::{BufList, Cursor},
+    buflist::{BufList, BuflistCursor},
     codec::EncodeError,
     connection,
     error::Code,
@@ -23,7 +23,7 @@ use crate::{
 #[derive(Debug, Clone)]
 enum Body {
     Streaming { count: u64 },
-    Chunked { buflist: Cursor<BufList> },
+    Chunked { buflist: BuflistCursor },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -142,7 +142,7 @@ impl Message {
         }
     }
 
-    pub fn chunked_body(&mut self) -> Result<&mut Cursor<BufList>, MalformedMessageError> {
+    pub fn chunked_body(&mut self) -> Result<&mut BuflistCursor, MalformedMessageError> {
         if let Body::Streaming { count } = &self.body {
             match self.stage {
                 MessageStage::Header => { /* Ok to change mode: body unused */ }
@@ -151,7 +151,7 @@ impl Message {
             }
 
             self.body = Body::Chunked {
-                buflist: Cursor::new(BufList::new()),
+                buflist: BuflistCursor::new(BufList::new()),
             };
         }
         match &mut self.body {
@@ -189,7 +189,7 @@ impl Message {
             buflist.write(content.copy_to_bytes(content.chunk().len()));
         }
         self.body = Body::Chunked {
-            buflist: Cursor::new(buflist),
+            buflist: BuflistCursor::new(buflist),
         };
     }
 
@@ -384,7 +384,7 @@ impl ReadStream {
     ) -> Result<impl Buf + 'e, MessageStreamError> {
         enum Buffer<'e> {
             Owned(BufList),
-            Borrow(&'e mut Cursor<BufList>),
+            Borrow(&'e mut BuflistCursor),
         }
 
         impl Buf for Buffer<'_> {

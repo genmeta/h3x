@@ -296,7 +296,6 @@ impl DHttpProtocol {
             Err(_) => {
                 // Stream closed or error before we could read a frame type.
                 // Cannot determine protocol — pass to the next layer.
-                reader.reset();
                 return Ok(StreamVerdict::Passed((reader, writer)));
             }
         };
@@ -304,7 +303,7 @@ impl DHttpProtocol {
         if Self::is_http3_frame_type(frame_type) {
             // This is an HTTP/3 request stream. Reset the peek cursor so the
             // frame type can be re-read by FrameStream during request processing.
-            reader.reset();
+            Pin::new(&mut reader).reset();
             let reader = reader
                 .into_stream_reader()
                 .map_stream(|b| b as BoxDynQuicStreeamReader);
@@ -319,7 +318,6 @@ impl DHttpProtocol {
         } else {
             // Not an HTTP/3 frame type. Reset cursor so the next protocol
             // layer can re-read the first bytes.
-            reader.reset();
             Ok(StreamVerdict::Passed((reader, writer)))
         }
     }
@@ -334,10 +332,8 @@ impl DHttpProtocol {
     /// Reserved: 0x1f * N + 0x21 for non-negative integer N
     const fn is_http3_frame_type(frame_type: VarInt) -> bool {
         let raw = frame_type.into_inner();
-        matches!(
-            raw,
-            0x00 | 0x01 | 0x03 | 0x04 | 0x05 | 0x07 | 0x0d
-        ) || (raw >= 0x21 && (raw - 0x21).is_multiple_of(0x1f))
+        matches!(raw, 0x00 | 0x01 | 0x03 | 0x04 | 0x05 | 0x07 | 0x0d)
+            || (raw >= 0x21 && (raw - 0x21).is_multiple_of(0x1f))
     }
 }
 
