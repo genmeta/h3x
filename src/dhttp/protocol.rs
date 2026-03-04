@@ -210,7 +210,7 @@ impl std::fmt::Debug for DHttpProtocol {
 }
 
 impl DHttpProtocol {
-    async fn max_unresolved_request_streams(&self) -> usize {
+    pub async fn max_unresolved_request_streams(&self) -> usize {
         self.unresolved_request_streams.capacity()
     }
 
@@ -264,7 +264,7 @@ impl DHttpProtocol {
             // push ID.
             //
             // https://datatracker.ietf.org/doc/html/rfc9114#section-4.6-3
-            return Err(H3IdError::PushIdExceedsLimit.into());
+            Err(H3IdError::PushIdExceedsLimit.into())
         } else if raw >= 0x21 && (raw - 0x21).is_multiple_of(0x1f) {
             // Reserved unidirectional stream types are accepted but ignored.
             stream.stop(Code::H3_NO_ERROR.into_inner()).await?;
@@ -290,7 +290,7 @@ impl DHttpProtocol {
             let item = (reader, writer);
             if let Some(mut unresolved) = self.unresolved_request_streams.send(item) {
                 let code = Code::H3_REQUEST_REJECTED.into_inner();
-                tokio::join!(unresolved.0.stop(code), unresolved.1.cancel(code));
+                _ = tokio::join!(unresolved.0.stop(code), unresolved.1.cancel(code));
             }
             return Ok(StreamVerdict::Accepted);
         }
@@ -479,7 +479,7 @@ impl<C: quic::Close + quic::ManageStream + Send + Sync + ?Sized> ConnectionState
         let (reader, writer) = self.quic_connection().open_bi().await?;
         let (mut reader, writer) = (Box::pin(reader), Box::pin(writer));
         self.dhttp()
-            .on_initialed_message_stream(reader.stream_id().await?);
+            .on_initialed_message_stream(reader.stream_id().await?)?;
         Ok((StreamReader::new(reader), SinkWriter::new(writer)))
     }
 
