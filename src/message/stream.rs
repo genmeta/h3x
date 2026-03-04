@@ -1,5 +1,5 @@
 use std::{
-    mem,
+    io, mem,
     pin::{Pin, pin},
     sync::Arc,
     task::{Context, Poll},
@@ -124,6 +124,12 @@ impl From<quic::ConnectionError> for MessageStreamError {
         Self::Quic {
             source: value.into(),
         }
+    }
+}
+
+impl From<MessageStreamError> for io::Error {
+    fn from(error: MessageStreamError) -> Self {
+        io::Error::other(error)
     }
 }
 

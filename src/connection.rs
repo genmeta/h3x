@@ -290,7 +290,7 @@ impl<C: quic::Connection + ?Sized> ConnectionState<C> {
                     // https://datatracker.ietf.org/doc/html/rfc9114#section-9-4
                     Ok(StreamVerdict::Passed((mut stream_reader, mut stream_writer))) => {
                         let code = Code::H3_STREAM_CREATION_ERROR.into_inner();
-                        tokio::join!(stream_reader.stop(code), stream_writer.cancel(code))
+                        _ = tokio::join!(stream_reader.stop(code), stream_writer.cancel(code))
                     }
                     Err(stream_error) => {
                         state.quic.handle_stream_error(stream_error).await;
