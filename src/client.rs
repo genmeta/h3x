@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use http::uri::Authority;
 
-pub use crate::message::stream::{ReadToStringError, StreamError};
+pub use crate::message::{stream::MessageStreamError, unify::ReadToStringError};
 use crate::{
-    connection::{Connection, settings::Settings},
+    connection::Connection,
+    dhttp::settings::Settings,
     pool::{self, Pool},
     quic,
 };

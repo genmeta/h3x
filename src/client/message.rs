@@ -11,17 +11,16 @@ use snafu::{Report, ResultExt, Snafu};
 use tracing::Instrument;
 
 use crate::{
-    agent,
     client::Client,
-    connection::OpenRequestStreamError,
+    dhttp::protocol::InitialRawMessageStreamError,
     error::Code,
     message::{
-        MalformedMessageError, Message, MessageStage,
-        stream::{ReadStream, ReadToStringError, StreamError, WriteStream},
+        stream::{InitialMessageStreamError, MessageStreamError, ReadStream, WriteStream},
+        unify::{MalformedMessageError, Message, MessageStage, ReadToStringError},
     },
     pool::ConnectError,
     qpack::field::MalformedHeaderSection,
-    quic,
+    quic::{self, agent},
 };
 
 #[derive(Clone)]
@@ -49,6 +48,8 @@ where
 pub enum RequestError<E: Error + 'static> {
     #[snafu(transparent)]
     Connect { source: ConnectError<E> },
+    #[snafu(transparent)]
+    Connection { source: quic::ConnectionError },
     #[snafu(display("request stream error"))]
     RequestStream { source: quic::StreamError },
     #[snafu(display("response stream error"))]
@@ -190,19 +191,29 @@ where
 
         let authority = self.request.header().authority().expect("checked");
 
-        #[allow(clippy::never_loop)]
         loop {
             let connection = self.client.connect(authority.clone()).await?;
             tracing::debug!(target: "h3x::client", %authority, "Connected");
 
-            let (mut read_stream, mut write_stream) = match connection.open_request_stream().await {
+            let (mut read_stream, mut write_stream) = match connection
+                .initial_message_stream()
+                .await
+            {
                 Ok(pair) => pair,
-                Err(OpenRequestStreamError::RequestStream { source }) => {
-                    return Err(RequestError::RequestStream { source });
-                }
-                Err(OpenRequestStreamError::Goaway { .. }) => {
-                    tracing::debug!(target: "h3x::client", "Connection goaway, retrying...");
-                    continue;
+                Err(InitialMessageStreamError::InitialRawStream { source }) => match source {
+                    InitialRawMessageStreamError::Connection { source } => {
+                        return Err(source.into());
+                    }
+                    InitialRawMessageStreamError::ResponseStream { source } => {
+                        return Err(RequestError::ResponseStream { source });
+                    }
+                    InitialRawMessageStreamError::Goaway { .. } => {
+                        tracing::debug!(target: "h3x::client", "Connection goaway, retrying...");
+                        continue;
+                    }
+                },
+                Err(InitialMessageStreamError::QPackProtocolDisabled { .. }) => {
+                    unreachable!("Clinet always initial QPack protocol")
                 }
             };
 
@@ -249,27 +260,27 @@ where
                     };
                     return Ok((request, response));
                 }
-                Err((stream, StreamError::HeaderTooLarge)) => {
+                Err((stream, MessageStreamError::HeaderTooLarge)) => {
                     debug_assert_eq!(stream, Stream::Response);
                     Err(RequestError::HeaderTooLarge)
                 }
-                Err((stream, StreamError::TrailerTooLarge)) => {
+                Err((stream, MessageStreamError::TrailerTooLarge)) => {
                     debug_assert_eq!(stream, Stream::Response);
                     Err(RequestError::TrailerTooLarge)
                 }
-                Err((stream, StreamError::DataFrameTooLarge)) => {
+                Err((stream, MessageStreamError::DataFrameTooLarge)) => {
                     debug_assert_eq!(stream, Stream::Request);
                     Err(RequestError::DataFrameTooLarge)
                 }
-                Err((stream, StreamError::MalformedIncomingMessage)) => {
+                Err((stream, MessageStreamError::MalformedIncomingMessage)) => {
                     debug_assert_eq!(stream, Stream::Response);
                     Err(RequestError::MalformedResponse)
                 }
-                Err((stream, StreamError::Quic { source })) => match stream {
+                Err((stream, MessageStreamError::Quic { source })) => match stream {
                     Stream::Request => Err(RequestError::RequestStream { source }),
                     Stream::Response => Err(RequestError::ResponseStream { source }),
                 },
-                Err((.., StreamError::Goaway { .. })) => {
+                Err((.., MessageStreamError::Goaway { .. })) => {
                     self.request = self.request.to_unsend();
                     tracing::debug!(target: "h3x::client", "Connection goaway, retrying...");
                     continue;
@@ -381,7 +392,7 @@ impl Request {
         }
     }
 
-    pub async fn write(&mut self, content: impl Buf) -> Result<&mut Self, StreamError> {
+    pub async fn write(&mut self, content: impl Buf) -> Result<&mut Self, MessageStreamError> {
         self.check_message_operation("write_streaming_body", |this| {
             // header is checked in pending request
             this.message.streaming_body()?;
@@ -393,13 +404,13 @@ impl Request {
         Ok(self)
     }
 
-    pub async fn flush(&mut self) -> Result<&mut Self, StreamError> {
+    pub async fn flush(&mut self) -> Result<&mut Self, MessageStreamError> {
         // header is checked in pending request
         self.stream.flush_message(&mut self.message).await?;
         Ok(self)
     }
 
-    pub fn as_sink<B: Buf>(&mut self) -> impl Sink<B, Error = StreamError> {
+    pub fn as_sink<B: Buf>(&mut self) -> impl Sink<B, Error = MessageStreamError> {
         crate::message::stream::unfold::write::unfold(
             self,
             async |request: &mut Self, buf: B| {
@@ -417,7 +428,7 @@ impl Request {
         )
     }
 
-    pub fn into_sink<B: Buf>(self) -> impl Sink<B, Error = StreamError> {
+    pub fn into_sink<B: Buf>(self) -> impl Sink<B, Error = MessageStreamError> {
         crate::message::stream::unfold::write::unfold(
             self,
             async |request: Self, buf: B| {
@@ -462,11 +473,11 @@ impl Request {
         self
     }
 
-    pub async fn close(&mut self) -> Result<(), StreamError> {
+    pub async fn close(&mut self) -> Result<(), MessageStreamError> {
         self.stream.close_message(&mut self.message).await
     }
 
-    pub async fn cancel(&mut self, code: Code) -> Result<(), StreamError> {
+    pub async fn cancel(&mut self, code: Code) -> Result<(), MessageStreamError> {
         self.stream.cancel(code).await
     }
 
@@ -520,7 +531,7 @@ pub struct Response {
 }
 
 impl Response {
-    pub async fn next_response(&mut self) -> Result<&mut Self, StreamError> {
+    pub async fn next_response(&mut self) -> Result<&mut Self, MessageStreamError> {
         self.stream.read_message_header(&mut self.message).await?;
         Ok(self)
     }
@@ -537,15 +548,15 @@ impl Response {
         self.headers().get(name)
     }
 
-    pub async fn read(&mut self) -> Option<Result<Bytes, StreamError>> {
+    pub async fn read(&mut self) -> Option<Result<Bytes, MessageStreamError>> {
         self.stream.read_message(&mut self.message).await
     }
 
-    pub async fn read_all(&mut self) -> Result<impl Buf, StreamError> {
+    pub async fn read_all(&mut self) -> Result<impl Buf, MessageStreamError> {
         self.stream.read_message_full_body(&mut self.message).await
     }
 
-    pub async fn read_to_bytes(&mut self) -> Result<Bytes, StreamError> {
+    pub async fn read_to_bytes(&mut self) -> Result<Bytes, MessageStreamError> {
         self.stream
             .read_message_body_to_bytes(&mut self.message)
             .await
@@ -557,25 +568,25 @@ impl Response {
             .await
     }
 
-    pub async fn as_stream(&mut self) -> impl Stream<Item = Result<Bytes, StreamError>> {
+    pub async fn as_stream(&mut self) -> impl Stream<Item = Result<Bytes, MessageStreamError>> {
         futures::stream::unfold(self, async |this| {
             this.read().await.map(|item| (item, this))
         })
         .fuse()
     }
 
-    pub async fn into_stream(self) -> impl Stream<Item = Result<Bytes, StreamError>> {
+    pub async fn into_stream(self) -> impl Stream<Item = Result<Bytes, MessageStreamError>> {
         futures::stream::unfold(self, async |mut this| {
             this.read().await.map(|item| (item, this))
         })
         .fuse()
     }
 
-    pub async fn trailers(&mut self) -> Result<&HeaderMap, StreamError> {
+    pub async fn trailers(&mut self) -> Result<&HeaderMap, MessageStreamError> {
         self.stream.read_message_trailer(&mut self.message).await
     }
 
-    pub async fn stop(&mut self, code: Code) -> Result<(), StreamError> {
+    pub async fn stop(&mut self, code: Code) -> Result<(), MessageStreamError> {
         self.stream.stop(code).await
     }
 
