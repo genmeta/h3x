@@ -7,13 +7,13 @@ pub mod upgrade {
     pub use crate::message::stream::hyper::upgrade::HasRemainingStream;
     use crate::{
         codec,
-        message::stream::{ReadStream, StreamError, WriteStream, hyper::upgrade::Sealed},
+        message::stream::{MessageStreamError, ReadStream, WriteStream, hyper::upgrade::Sealed},
     };
 
     pub type StreamReader =
-        codec::StreamReader<Pin<Box<dyn Stream<Item = Result<Bytes, StreamError>> + Send>>>;
+        codec::StreamReader<Pin<Box<dyn Stream<Item = Result<Bytes, MessageStreamError>> + Send>>>;
     pub type StreamWriter =
-        codec::SinkWriter<Pin<Box<dyn Sink<Bytes, Error = StreamError> + Send>>>;
+        codec::SinkWriter<Pin<Box<dyn Sink<Bytes, Error = MessageStreamError> + Send>>>;
 
     pub async fn on(
         mut message: impl HasRemainingStream<ReadStream> + HasRemainingStream<WriteStream>,

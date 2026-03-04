@@ -14,7 +14,7 @@ use tracing::Instrument;
 
 use crate::{
     message::stream::{
-        StreamError,
+        MessageStreamError,
         hyper::{upgrade::RemainStream, write::SendMesageError},
     },
     server::{Request, Response, UnresolvedRequest},
@@ -27,7 +27,7 @@ pub struct TowerService<S>(pub S);
 impl<S, RespBody> crate::server::Service for TowerService<S>
 where
     S: tower_service::Service<
-            http::Request<UnsyncBoxBody<Bytes, StreamError>>,
+            http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,
             Response = http::Response<RespBody>,
             Error: Error + Send,
             Future: Send,
@@ -101,7 +101,7 @@ where
 
 #[derive(Debug)]
 pub enum HandleRequestError<S, B> {
-    Stream { source: StreamError },
+    Stream { source: MessageStreamError },
     Service { source: S },
     Body { source: B },
 }
@@ -138,7 +138,7 @@ impl<S, B> From<SendMesageError<B>> for HandleRequestError<S, B> {
 impl<S, RespBody, ServiceE> tower_service::Service<UnresolvedRequest> for TowerService<S>
 where
     S: tower_service::Service<
-            http::Request<UnsyncBoxBody<Bytes, StreamError>>,
+            http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,
             Response = http::Response<RespBody>,
             Error = ServiceE,
             Future: Send,
@@ -229,7 +229,7 @@ pub struct HyperService<S>(pub S);
 impl<S, RespBody> crate::server::Service for HyperService<S>
 where
     S: hyper::service::Service<
-            http::Request<UnsyncBoxBody<Bytes, StreamError>>,
+            http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,
             Response = http::Response<RespBody>,
             Error: Error + Send,
             Future: Send,
@@ -299,7 +299,7 @@ where
 impl<S, RespBody, ServiceE> tower_service::Service<UnresolvedRequest> for HyperService<S>
 where
     S: hyper::service::Service<
-            http::Request<UnsyncBoxBody<Bytes, StreamError>>,
+            http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,
             Response = http::Response<RespBody>,
             Error = ServiceE,
             Future: Send,
