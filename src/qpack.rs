@@ -5,18 +5,9 @@ pub mod encoder;
 pub mod field;
 pub mod instruction;
 pub mod integer;
+pub mod protocol;
 pub mod r#static;
 pub mod string;
-
-use std::pin::Pin;
-
-use futures::{Sink, stream::BoxStream};
-
-use crate::connection::StreamError;
-
-pub type BoxInstructionStream<'a, Instruction> = BoxStream<'a, Result<Instruction, StreamError>>;
-pub type BoxSink<'a, Item, Err> = Pin<Box<dyn Sink<Item, Error = Err> + Send + 'a>>;
-pub type BoxInstructionSink<'a, Instruction> = BoxSink<'a, Instruction, StreamError>;
 
 #[cfg(test)]
 mod tests {
@@ -29,7 +20,8 @@ mod tests {
 
     use crate::{
         codec::{DecodeExt, EncodeExt, SinkWriter, StreamReader},
-        connection::{settings::Settings, stream::UnidirectionalStream},
+        connection::stream::UnidirectionalStream,
+        dhttp::settings::Settings,
         frame::{Frame, stream::FrameStream},
         qpack::{
             algorithm::{HuffmanAlways, StaticCompressAlgo},
@@ -54,7 +46,7 @@ mod tests {
         let (decoder_stream_reader, decoder_stream_writer) = mock_stream_pair(VarInt::from_u32(2));
 
         let init_encoder = tokio::spawn(async move {
-            let encoder_stream = UnidirectionalStream::new(
+            let encoder_stream = UnidirectionalStream::initial(
                 UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE,
                 SinkWriter::new(encoder_stream_writer),
             )
@@ -83,7 +75,7 @@ mod tests {
         });
 
         let init_decoder = tokio::spawn(async move {
-            let decoder_stream = UnidirectionalStream::new(
+            let decoder_stream = UnidirectionalStream::initial(
                 UnidirectionalStream::QPACK_DECODER_STREAM_TYPE,
                 SinkWriter::new(decoder_stream_writer),
             )
@@ -105,7 +97,7 @@ mod tests {
             }));
 
             Arc::new(Decoder::new(
-                Settings::default(),
+                Arc::new(Settings::default()),
                 Box::pin((decoder_stream).into_encode_sink()),
                 Box::pin((encoder_stream).into_decode_stream()),
             ))

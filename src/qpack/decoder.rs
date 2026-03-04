@@ -15,7 +15,8 @@ use tokio::{
 
 use crate::{
     codec::{Decode, DecodeExt, DecodeStreamError, Encode, Feed},
-    connection::{StreamError, settings::Settings},
+    connection::StreamError,
+    dhttp::settings::Settings,
     error::{Code, H3CriticalStreamClosed, HasErrorCode},
     qpack::{
         dynamic::DynamicTable,
@@ -30,13 +31,13 @@ use crate::{
 
 #[derive(Debug)]
 pub struct DecoderState {
-    pub(crate) settings: Settings,
+    pub(crate) settings: Arc<Settings>,
     pub(crate) dynamic_table: DynamicTable,
     pub(crate) pending_instructions: VecDeque<DecoderInstruction>,
 }
 
 impl DecoderState {
-    pub const fn new(settings: Settings) -> Self {
+    pub const fn new(settings: Arc<Settings>) -> Self {
         Self {
             settings,
             dynamic_table: DynamicTable::new(),
@@ -318,7 +319,7 @@ where
     Ds: Sink<DecoderInstruction, Error = StreamError> + Unpin,
     Es: Stream<Item = Result<EncoderInstruction, StreamError>> + Unpin,
 {
-    pub fn new(settings: Settings, decoder_stream: Ds, encoder_stream: Es) -> Self {
+    pub fn new(settings: Arc<Settings>, decoder_stream: Ds, encoder_stream: Es) -> Self {
         Self {
             state: SyncMutex::new(DecoderState::new(settings)),
             decoder_stream: AsyncMutex::new(Feed::new(decoder_stream)),

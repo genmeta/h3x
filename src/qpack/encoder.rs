@@ -16,7 +16,8 @@ use tokio::{
 use crate::{
     buflist::BufList,
     codec::{Decode, DecodeStreamError, Encode, EncodeError, EncodeStreamError, Feed},
-    connection::{StreamError, settings::Settings},
+    connection::StreamError,
+    dhttp::settings::Settings,
     error::{Code, H3CriticalStreamClosed, HasErrorCode},
     frame::Frame,
     qpack::{
