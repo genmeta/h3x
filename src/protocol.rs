@@ -85,7 +85,10 @@ impl<C: quic::Connection + ?Sized> Protocols<C> {
         for layer in self.layers.values() {
             match layer.accept_bi(conn, stream).await? {
                 StreamVerdict::Accepted => return Ok(StreamVerdict::Accepted),
-                StreamVerdict::Passed(passed) => stream = passed,
+                StreamVerdict::Passed(mut passed) => {
+                    passed.0.reset();
+                    stream = passed
+                }
             }
         }
         Ok(StreamVerdict::Passed(stream))

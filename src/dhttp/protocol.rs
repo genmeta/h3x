@@ -280,22 +280,64 @@ impl DHttpProtocol {
         &self,
         (mut reader, writer): BoxPeekableBiStream<C>,
     ) -> Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError> {
-        if let Ok(stream_type) = reader.decode_one::<VarInt>().await
-            && stream_type == Frame::DATA_FRAME_TYPE
-        {
+        // HTTP/3 bidirectional streams are request streams (RFC 9114 §4.1).
+        // The first bytes on a request stream are HTTP/3 frames, starting with
+        // a frame type VarInt. We peek the first VarInt to determine whether
+        // this stream belongs to HTTP/3 or to another protocol (e.g.,
+        // WebTransport uses signal value 0x41 which is NOT a valid HTTP/3
+        // frame type).
+        //
+        // Known HTTP/3 frame types and reserved types (0x1f*N+0x21) are
+        // accepted. Note that reserved frames MAY appear before HEADERS on a
+        // request stream (RFC 9114 §7.2.8). Everything else is passed to the
+        // next protocol layer.
+        let frame_type = match reader.decode_one::<VarInt>().await {
+            Ok(v) => v,
+            Err(_) => {
+                // Stream closed or error before we could read a frame type.
+                // Cannot determine protocol — pass to the next layer.
+                reader.reset();
+                return Ok(StreamVerdict::Passed((reader, writer)));
+            }
+        };
+
+        if Self::is_http3_frame_type(frame_type) {
+            // This is an HTTP/3 request stream. Reset the peek cursor so the
+            // frame type can be re-read by FrameStream during request processing.
+            reader.reset();
             let reader = reader
                 .into_stream_reader()
                 .map_stream(|b| b as BoxDynQuicStreeamReader);
             let writer = writer.map_sink(|b| b as BoxDynQuicStreamWriter);
             let item = (reader, writer);
             if let Some(mut unresolved) = self.unresolved_request_streams.send(item) {
+                // Ring channel is full — reject the oldest unresolved request.
                 let code = Code::H3_REQUEST_REJECTED.into_inner();
                 _ = tokio::join!(unresolved.0.stop(code), unresolved.1.cancel(code));
             }
-            return Ok(StreamVerdict::Accepted);
+            Ok(StreamVerdict::Accepted)
+        } else {
+            // Not an HTTP/3 frame type. Reset cursor so the next protocol
+            // layer can re-read the first bytes.
+            reader.reset();
+            Ok(StreamVerdict::Passed((reader, writer)))
         }
-        // All bidirectional streams are accepted as HTTP/3 request streams.
-        Ok(StreamVerdict::Passed((reader, writer)))
+    }
+
+    /// Returns `true` if the given VarInt is a known HTTP/3 frame type or a
+    /// reserved frame type (RFC 9114 §7.2.8).
+    ///
+    /// Known frame types (RFC 9114 §11.1):
+    /// - 0x00 DATA, 0x01 HEADERS, 0x03 CANCEL_PUSH, 0x04 SETTINGS,
+    ///   0x05 PUSH_PROMISE, 0x07 GOAWAY, 0x0d MAX_PUSH_ID
+    ///
+    /// Reserved: 0x1f * N + 0x21 for non-negative integer N
+    const fn is_http3_frame_type(frame_type: VarInt) -> bool {
+        let raw = frame_type.into_inner();
+        matches!(
+            raw,
+            0x00 | 0x01 | 0x03 | 0x04 | 0x05 | 0x07 | 0x0d
+        ) || (raw >= 0x21 && (raw - 0x21).is_multiple_of(0x1f))
     }
 }
 
@@ -498,10 +540,10 @@ impl<C: quic::Close + quic::ManageStream + Send + Sync + ?Sized> ConnectionState
             connection_error = self.closed() => return Err(connection_error.into()),
             // TODO: goaway branch
         };
-        let (mut reader, writer) = (Box::pin(reader), Box::pin(writer));
+        let mut reader = Box::pin(reader);
         self.dhttp()
             .on_accepted_message_stream(reader.stream_id().await?)?;
-        Ok((StreamReader::new(reader), SinkWriter::new(writer)))
+        Ok((StreamReader::new(reader), writer))
     }
 }
 
