@@ -1,16 +1,34 @@
 #![allow(async_fn_in_trait)]
 
-mod error;
+use std::pin::Pin;
 
-pub mod peekable;
+use crate::quic;
+
+mod error;
 mod reader;
 mod writer;
 
 pub use error::{DecodeError, DecodeStreamError, EncodeError, EncodeStreamError};
 use futures::{Sink, stream::Stream};
-pub use reader::{FixedLengthReader, StreamReader};
+pub use reader::{FixedLengthReader, PeekableStreamReader, StreamReader};
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt};
 pub use writer::{Feed, SinkWriter};
+
+pub type BoxStreamWriter<C> = SinkWriter<Pin<Box<<C as quic::ManageStream>::StreamWriter>>>;
+pub type BoxStreamReader<C> = StreamReader<Pin<Box<<C as quic::ManageStream>::StreamReader>>>;
+
+/// Type alias for a `StreamReader` wrapping a boxed unidirectional read stream.
+pub type BoxQuicStreamReader<C> = StreamReader<Pin<Box<<C as quic::ManageStream>::StreamReader>>>;
+
+/// Type alias for a peekable unidirectional stream.
+pub type BoxPeekableUniStream<C> =
+    PeekableStreamReader<Pin<Box<<C as quic::ManageStream>::StreamReader>>>;
+
+/// Type alias for a peekable bidirectional stream pair.
+pub type BoxPeekableBiStream<C> = (
+    PeekableStreamReader<Pin<Box<<C as quic::ManageStream>::StreamReader>>>,
+    SinkWriter<Pin<Box<<C as quic::ManageStream>::StreamWriter>>>,
+);
 
 pub trait Encode<T>: Sized {
     type Output;
