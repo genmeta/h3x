@@ -1,3 +1,4 @@
+pub mod ring_channel;
 pub mod set_once;
 pub mod tls;
 pub mod try_future;

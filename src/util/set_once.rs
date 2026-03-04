@@ -12,6 +12,15 @@ pub struct SetOnce<T> {
     notify: Arc<Notify>,
 }
 
+impl<T> Clone for SetOnce<T> {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value.clone(),
+            notify: self.notify.clone(),
+        }
+    }
+}
+
 impl<T> SetOnce<T> {
     pub fn new() -> Self {
         Self {
@@ -46,7 +55,7 @@ impl<T> SetOnce<T> {
     pub fn get(&self) -> Get<T> {
         Get {
             notified: self.notify.clone().notified_owned(),
-            value: self.value.clone(),
+            set_once: self.clone(),
         }
     }
 }
@@ -55,7 +64,7 @@ pin_project_lite::pin_project! {
     pub struct Get<T> {
         #[pin]
         notified: OwnedNotified,
-        value: Arc<SyncMutex<Option<T>>>,
+        set_once: SetOnce<T>,
     }
 }
 
@@ -63,8 +72,17 @@ impl<T: Clone> Future for Get<T> {
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let project = self.project();
-        ready!(project.notified.poll(cx));
-        Poll::Ready(project.value.lock().unwrap().clone())
+        let mut project = self.project();
+        loop {
+            project.notified.as_mut().enable();
+
+            match project.set_once.peek() {
+                Some(value) => return Poll::Ready(Some(value)),
+                None => ready!(project.notified.as_mut().poll(cx)),
+            }
+
+            let notify = project.set_once.notify.clone();
+            project.notified.set(notify.notified_owned());
+        }
     }
 }
