@@ -4,7 +4,7 @@ use futures::TryFutureExt;
 use http_body::Body;
 use http_body_util::BodyExt;
 
-use super::{StreamError, WriteStream};
+use super::{MessageStreamError, WriteStream};
 use crate::qpack::field::hyper::{
     header_map_to_field_lines, hyper_request_parts_to_field_lines,
     hyper_response_parts_to_field_lines,
@@ -12,7 +12,7 @@ use crate::qpack::field::hyper::{
 
 #[derive(Debug)]
 pub enum SendMesageError<E> {
-    Stream { source: StreamError },
+    Stream { source: MessageStreamError },
     Body { source: E },
 }
 
@@ -76,7 +76,7 @@ impl WriteStream {
     pub async fn send_hyper_request_parts(
         &mut self,
         parts: http::request::Parts,
-    ) -> Result<(), StreamError> {
+    ) -> Result<(), MessageStreamError> {
         self.send_header(hyper_request_parts_to_field_lines(parts))
             .await
     }
@@ -95,7 +95,7 @@ impl WriteStream {
     pub async fn send_hyper_response_parts(
         &mut self,
         parts: http::response::Parts,
-    ) -> Result<(), StreamError> {
+    ) -> Result<(), MessageStreamError> {
         self.send_header(hyper_response_parts_to_field_lines(parts))
             .await
     }

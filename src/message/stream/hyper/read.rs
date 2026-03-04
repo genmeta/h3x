@@ -8,7 +8,7 @@ use futures::{StreamExt, stream};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Empty, StreamBody};
 
-use super::{ReadStream, StreamError, upgrade::RemainStream};
+use super::{MessageStreamError, ReadStream, upgrade::RemainStream};
 use crate::{connection, error::Code};
 
 pin_project_lite::pin_project! {
@@ -59,7 +59,9 @@ impl<L: Body, R: Body<Data = L::Data, Error = L::Error>> Body for Either<L, R> {
 }
 
 impl ReadStream {
-    pub async fn read_hyper_request_parts(&mut self) -> Result<http::request::Parts, StreamError> {
+    pub async fn read_hyper_request_parts(
+        &mut self,
+    ) -> Result<http::request::Parts, MessageStreamError> {
         self.try_stream_io(async |stream| {
             let Some(field_section) = stream.read_header_frame().await.transpose()? else {
                 return Err(Code::H3_MESSAGE_ERROR.into());
@@ -71,7 +73,7 @@ impl ReadStream {
 
     pub async fn read_hyper_response_parts(
         &mut self,
-    ) -> Result<http::response::Parts, StreamError> {
+    ) -> Result<http::response::Parts, MessageStreamError> {
         self.try_stream_io(async |stream| {
             let Some(field_section) = stream.read_header_frame().await.transpose()? else {
                 return Err(Code::H3_MESSAGE_ERROR.into());
@@ -96,7 +98,7 @@ impl ReadStream {
         }
     }
 
-    pub fn as_hyper_body(&mut self) -> impl Body<Data = Bytes, Error = StreamError> + Send {
+    pub fn as_hyper_body(&mut self) -> impl Body<Data = Bytes, Error = MessageStreamError> + Send {
         StreamBody::new(
             stream::unfold(self, async |stream| {
                 let frame = stream
@@ -109,7 +111,7 @@ impl ReadStream {
         )
     }
 
-    pub fn into_hyper_body(self) -> impl Body<Data = Bytes, Error = StreamError> + Send {
+    pub fn into_hyper_body(self) -> impl Body<Data = Bytes, Error = MessageStreamError> + Send {
         StreamBody::new(
             stream::unfold(self, async |mut stream| {
                 let frame = stream
@@ -124,8 +126,10 @@ impl ReadStream {
 
     pub async fn into_hyper_request(
         mut self,
-    ) -> Result<http::Request<impl Body<Data = Bytes, Error = StreamError> + Send>, StreamError>
-    {
+    ) -> Result<
+        http::Request<impl Body<Data = Bytes, Error = MessageStreamError> + Send>,
+        MessageStreamError,
+    > {
         let mut parts = self.read_hyper_request_parts().await?;
         if parts.method == http::Method::CONNECT {
             parts.extensions.insert(RemainStream::immediately(self));
@@ -139,8 +143,10 @@ impl ReadStream {
 
     pub async fn into_hyper_response(
         mut self,
-    ) -> Result<http::Response<impl Body<Data = Bytes, Error = StreamError> + Send>, StreamError>
-    {
+    ) -> Result<
+        http::Response<impl Body<Data = Bytes, Error = MessageStreamError> + Send>,
+        MessageStreamError,
+    > {
         let mut parts = self.read_hyper_response_parts().await?;
         match parts.status.is_informational() {
             true => {
