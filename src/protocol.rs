@@ -2,6 +2,7 @@ use std::{
     any::{Any, TypeId},
     collections::HashMap,
     fmt::Debug,
+    pin::Pin,
     sync::Arc,
 };
 
@@ -66,7 +67,7 @@ impl<C: quic::Connection + ?Sized> Protocols<C> {
             match layer.accept_uni(conn, stream).await? {
                 StreamVerdict::Accepted => return Ok(StreamVerdict::Accepted),
                 StreamVerdict::Passed(mut passed) => {
-                    passed.reset();
+                    Pin::new(&mut passed).reset();
                     stream = passed
                 }
             }
@@ -86,7 +87,7 @@ impl<C: quic::Connection + ?Sized> Protocols<C> {
             match layer.accept_bi(conn, stream).await? {
                 StreamVerdict::Accepted => return Ok(StreamVerdict::Accepted),
                 StreamVerdict::Passed(mut passed) => {
-                    passed.0.reset();
+                    Pin::new(&mut passed.0).reset();
                     stream = passed
                 }
             }

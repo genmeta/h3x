@@ -193,12 +193,12 @@ impl Stream for BufList {
 }
 
 #[derive(Debug, Clone)]
-pub struct Cursor<B = BufList> {
+pub struct BuflistCursor {
     offset: (usize, usize), // (buf index, offset in buf)
-    buflist: B,
+    buflist: BufList,
 }
 
-impl Cursor {
+impl BuflistCursor {
     pub fn new(buflist: BufList) -> Self {
         Self {
             offset: (0, 0),
@@ -206,53 +206,32 @@ impl Cursor {
         }
     }
 
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.offset = (0, 0);
+    }
+
+    pub fn commit(&mut self) {
+        self.buflist.bufs.drain(..self.offset.0);
+        if let Some(front) = self.buflist.bufs.front_mut() {
+            front.advance(self.offset.1);
+        }
+        self.reset();
     }
 
     pub fn write(&mut self, buf: impl Buf) {
         self.buflist.write(buf);
     }
 
-    pub fn iter(&self) -> CursorIter<'_> {
+    pub fn iter(&self) -> BuflistCursorIter<'_> {
         self.into_iter()
     }
 
-    pub fn inner(&self) -> &BufList {
+    pub const fn inner(&self) -> &BufList {
         &self.buflist
     }
 }
 
-type CursorIter<'c> = iter::Chain<
-    iter::Once<Bytes>,
-    iter::Map<iter::Skip<vec_deque::Iter<'c, Bytes>>, for<'b> fn(&'b Bytes) -> Bytes>,
->;
-
-impl<'c> IntoIterator for &'c Cursor {
-    type Item = Bytes;
-
-    type IntoIter = CursorIter<'c>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        let unindexed = self.buflist.bufs.iter().skip(self.offset.0 + 1);
-        let unindexed = unindexed.map(Bytes::clone as for<'a> fn(&'a Bytes) -> Bytes);
-
-        if self.offset.0 >= self.buflist.bufs.len() {
-            iter::once(Bytes::new()).chain(unindexed)
-        } else {
-            let first_buf = self.buflist.bufs[self.offset.0].slice(self.offset.1..);
-            iter::once(first_buf).chain(unindexed)
-        }
-    }
-}
-
-impl Extend<Bytes> for Cursor {
-    fn extend<T: IntoIterator<Item = Bytes>>(&mut self, iter: T) {
-        self.buflist.extend(iter);
-    }
-}
-
-impl Buf for Cursor {
+impl Buf for BuflistCursor {
     fn remaining(&self) -> usize {
         self.iter().map(|b| b.len()).sum()
     }
@@ -314,5 +293,34 @@ impl Buf for Cursor {
         let mut bytes_mut = BytesMut::with_capacity(len);
         bytes_mut.put(self.take(len));
         bytes_mut.freeze()
+    }
+}
+
+type BuflistCursorIter<'c> = iter::Chain<
+    iter::Once<Bytes>,
+    iter::Map<iter::Skip<vec_deque::Iter<'c, Bytes>>, for<'b> fn(&'b Bytes) -> Bytes>,
+>;
+
+impl<'c> IntoIterator for &'c BuflistCursor {
+    type Item = Bytes;
+
+    type IntoIter = BuflistCursorIter<'c>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let unindexed = self.buflist.bufs.iter().skip(self.offset.0 + 1);
+        let unindexed = unindexed.map(Bytes::clone as for<'a> fn(&'a Bytes) -> Bytes);
+
+        if self.offset.0 >= self.buflist.bufs.len() {
+            iter::once(Bytes::new()).chain(unindexed)
+        } else {
+            let first_buf = self.buflist.bufs[self.offset.0].slice(self.offset.1..);
+            iter::once(first_buf).chain(unindexed)
+        }
+    }
+}
+
+impl Extend<Bytes> for BuflistCursor {
+    fn extend<T: IntoIterator<Item = Bytes>>(&mut self, iter: T) {
+        self.buflist.extend(iter);
     }
 }
