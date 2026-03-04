@@ -172,6 +172,23 @@ impl<E: StdError + 'static> HasErrorCode for CodeWith<E> {
     }
 }
 
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Snafu, Clone, Copy)]
+pub enum H3StreamCreationError {
+    #[snafu(display("control stream already exists"))]
+    DuplicateControlStream,
+    #[snafu(display("qpack encoder stream already exists"))]
+    DuplicateQpackEncoderStream,
+    #[snafu(display("qpack decoder stream already exists"))]
+    DuplicateQpackDecoderStream,
+}
+
+impl HasErrorCode for H3StreamCreationError {
+    fn code(&self) -> Code {
+        Code::H3_STREAM_CREATION_ERROR
+    }
+}
+
 // TODO: add reset code info(if any)
 #[derive(Debug, Snafu)]
 pub enum H3CriticalStreamClosed {
@@ -205,4 +222,16 @@ impl HasErrorCode for H3FrameUnexpected {
 // TODO: use Error::provide api in the future
 pub trait HasErrorCode: StdError {
     fn code(&self) -> Code;
+}
+
+#[derive(Debug, Snafu, Clone, Copy)]
+pub enum H3IdError {
+    #[snafu(display("push ID exceeds limit"))]
+    PushIdExceedsLimit,
+}
+
+impl HasErrorCode for H3IdError {
+    fn code(&self) -> Code {
+        Code::H3_ID_ERROR
+    }
 }
