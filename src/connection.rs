@@ -1,41 +1,21 @@
 use std::{
-    any::{Any, TypeId},
-    collections::HashMap,
-    error::Error as StdError,
-    fmt::Debug,
-    io,
-    pin::Pin,
-    sync::Arc,
+    any::Any, error::Error as StdError, fmt::Debug, io, marker::PhantomData, ops, sync::Arc,
 };
 
-pub mod settings;
 pub mod stream;
 
-use futures::{
-    FutureExt, SinkExt, Stream, StreamExt,
-    future::{self, BoxFuture},
-    stream::FusedStream,
-};
+use futures::FutureExt;
 use snafu::Snafu;
-use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
 use crate::{
-    agent,
-    buflist::BufList,
-    codec::{Encode, Feed, SinkWriter, StreamReader, peekable::PeekableStreamReader},
-    connection::settings::Settings,
+    codec::{PeekableStreamReader, SinkWriter, StreamReader},
+    dhttp::{protocol::DHttpProtocolFactory, settings::Settings},
     error::{Code, HasErrorCode},
-    frame::{Frame, goaway::Goaway},
-    layer::{ProtocolLayer, StreamVerdict, dhttp::DHttpLayer, qpack::QPackLayer},
-    message,
-    qpack::{
-        BoxInstructionSink, BoxInstructionStream, BoxSink,
-        decoder::{Decoder, DecoderInstruction},
-        encoder::{Encoder, EncoderInstruction},
-    },
-    quic::{self, GetStreamIdExt, StopStreamExt},
-    util::{set_once::SetOnce, watch::Watch},
+    protocol::{InitProtocols, ProductProtocol, Protocols, StreamVerdict},
+    qpack::protocol::QPackProtocolFactory,
+    quic::{self, CancelStreamExt, StopStreamExt, agent},
+    util::set_once::SetOnce,
     varint::VarInt,
 };
 
@@ -102,79 +82,42 @@ impl From<io::Error> for StreamError {
 }
 
 #[derive(Debug)]
-pub struct ConnectionState<C: ?Sized> {
+pub struct QuicConnection<C: ?Sized> {
     error: SetOnce<quic::ConnectionError>,
-    local_settings: Arc<Settings>,
-    pub(crate) peer_settings: SetOnce<Arc<Settings>>,
-    local_goaway: Watch<Goaway>,
-    pub(crate) peer_goaway: Watch<Goaway>,
-    max_initialized_stream_id: Watch<VarInt>,
-    max_received_stream_id: Watch<VarInt>,
-
-    quic_connection: C,
+    inner: C,
 }
 
-impl<C: ?Sized> ConnectionState<C> {
-    fn new(quic: C, local_settings: Arc<Settings>) -> Self
+impl<C: ?Sized> QuicConnection<C> {
+    fn new(quic: C) -> Self
     where
         C: Sized,
     {
         Self {
-            quic_connection: quic,
+            inner: quic,
             error: SetOnce::new(),
-            local_settings,
-            peer_settings: SetOnce::new(),
-            local_goaway: Watch::new(),
-            peer_goaway: Watch::new(),
-            max_initialized_stream_id: Watch::new(),
-            max_received_stream_id: Watch::new(),
         }
     }
 }
 
-impl<C: quic::ManageStream + ?Sized> ConnectionState<C> {
-    async fn open_bi(&self) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
-        { self.quic_connection.open_bi() }.await
-    }
-
-    pub(crate) async fn open_uni(&self) -> Result<C::StreamWriter, quic::ConnectionError> {
-        { self.quic_connection.open_uni() }.await
-    }
-
-    async fn accept_bi(&self) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
-        { self.quic_connection.accept_bi() }.await
-    }
-
-    async fn accept_uni(&self) -> Result<C::StreamReader, quic::ConnectionError> {
-        { self.quic_connection.accept_uni() }.await
-    }
-}
-
-impl<C: quic::WithLocalAgent + Sync + ?Sized> ConnectionState<C> {
-    fn local_agent(
+impl<C: quic::ManageStream + ?Sized> QuicConnection<C> {
+    pub async fn open_bi(
         &self,
-    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::LocalAgent>>, quic::ConnectionError>> {
-        Box::pin(async {
-            Ok(self
-                .quic_connection
-                .local_agent()
-                .await?
-                .map(|a| Arc::new(a) as Arc<dyn agent::LocalAgent>))
-        })
+    ) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
+        { self.inner.open_bi() }.await
     }
-}
 
-impl<C: quic::WithRemoteAgent + Sync + ?Sized> ConnectionState<C> {
-    fn remote_agent(
+    pub async fn open_uni(&self) -> Result<C::StreamWriter, quic::ConnectionError> {
+        { self.inner.open_uni() }.await
+    }
+
+    pub async fn accept_bi(
         &self,
-    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::RemoteAgent>>, quic::ConnectionError>> {
-        Box::pin(async {
-            Ok(self
-                .quic_connection
-                .remote_agent()
-                .await?
-                .map(|a| Arc::new(a) as Arc<dyn agent::RemoteAgent>))
-        })
+    ) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
+        { self.inner.accept_bi() }.await
+    }
+
+    pub async fn accept_uni(&self) -> Result<C::StreamReader, quic::ConnectionError> {
+        { self.inner.accept_uni() }.await
     }
 }
 
@@ -186,21 +129,27 @@ pub enum ConnectionGoaway {
     Peer,
 }
 
-impl<C: quic::Close + ?Sized> ConnectionState<C> {
+impl<C: quic::Close + ?Sized> QuicConnection<C> {
     pub fn close(&self, error: &(impl HasErrorCode + ?Sized)) {
         if self.error.peek().is_some() {
             return;
         }
-        self.quic_connection
-            .close(error.code(), error.to_string().into())
+        self.inner.close(error.code(), error.to_string().into())
     }
 
-    pub async fn handle_error(&self, error: StreamError) -> quic::StreamError {
+    pub async fn handle_connection_error(
+        &self,
+        error: quic::ConnectionError,
+    ) -> quic::ConnectionError {
+        _ = self.error.set_with(|| error);
+        self.error().await
+    }
+
+    pub async fn handle_stream_error(&self, error: StreamError) -> quic::StreamError {
         match error {
             StreamError::Quic { source } => match source {
                 quic::StreamError::Connection { source } => {
-                    _ = self.error.set_with(|| source);
-                    self.error().await.into()
+                    self.handle_connection_error(source).await.into()
                 }
                 quic::StreamError::Reset { .. } => source,
             },
@@ -211,176 +160,216 @@ impl<C: quic::Close + ?Sized> ConnectionState<C> {
         }
     }
 
-    pub(crate) fn local_settings(&self) -> &Settings {
-        &self.local_settings
-    }
-
-    pub fn error(&self) -> impl Future<Output = quic::ConnectionError> + use<C> {
+    pub fn error(&self) -> impl Future<Output = quic::ConnectionError> + Send + use<C> {
         self.error
             .get()
             .map(|option| option.unwrap_or_else(|| unreachable!("connection closed without error")))
     }
-
-    pub fn settings(&self) -> Arc<Settings> {
-        self.local_settings.clone()
-    }
-
-    pub fn peer_settings(
-        &self,
-    ) -> impl Future<Output = Result<Arc<Settings>, quic::ConnectionError>> + use<C> {
-        let error = self.error();
-        self.peer_settings.get().then(|option| match option {
-            Some(settings) => future::ready(Ok(settings)).left_future(),
-            None => error.map(Err).right_future(),
-        })
-    }
-
-    pub fn peer_goawaies(
-        &self,
-    ) -> impl FusedStream<Item = Result<Goaway, quic::ConnectionError>> + use<C> {
-        let goawaies = self.peer_goaway.watch().map(Ok);
-        goawaies.chain(self.error().map(Err).into_stream())
-    }
-
-    pub fn local_goaway(&self) -> Result<Option<Goaway>, quic::ConnectionError> {
-        if let Some(error) = self.error.peek() {
-            return Err(error.clone());
-        }
-        Ok(self.local_goaway.peek())
-    }
-
-    pub fn goaway(&self) -> Goaway {
-        let mut local_goaway = self.local_goaway.lock();
-        let max_received_stream_id = self.max_received_stream_id.lock();
-
-        let max_received_stream_id = max_received_stream_id
-            .get()
-            .copied()
-            .unwrap_or(VarInt::from_u32(0));
-
-        let goaway = Goaway::new(max_received_stream_id);
-        local_goaway.set(goaway);
-
-        goaway
-    }
 }
 
-#[derive(Debug, Snafu, Clone)]
-#[snafu(module)]
-pub enum OpenRequestStreamError {
-    #[snafu(transparent)]
-    RequestStream { source: quic::StreamError },
-    #[snafu(transparent)]
-    Goaway { source: ConnectionGoaway },
+pub struct ConnectionBuilder<C: Any + ?Sized> {
+    protocols_initializers: Vec<Box<dyn InitProtocols<C>>>,
+    _connection: PhantomData<C>,
 }
 
-impl From<quic::ConnectionError> for OpenRequestStreamError {
-    fn from(error: quic::ConnectionError) -> Self {
-        Self::RequestStream {
-            source: error.into(),
-        }
+impl<C: quic::Connection + ?Sized> ConnectionBuilder<C> {
+    pub fn new(settings: Arc<Settings>) -> Self {
+        let builder = Self {
+            protocols_initializers: Vec::new(),
+            _connection: PhantomData,
+        };
+        builder.protocol(DHttpProtocolFactory::new(settings))
     }
-}
 
-#[derive(Debug, Snafu, Clone)]
-#[snafu(module)]
-pub enum AcceptRequestStreamError {
-    #[snafu(transparent)]
-    Quic { source: quic::StreamError },
-    #[snafu(transparent)]
-    Goaway { source: ConnectionGoaway },
-}
-
-impl From<quic::ConnectionError> for AcceptRequestStreamError {
-    fn from(error: quic::ConnectionError) -> Self {
-        Self::Quic {
-            source: error.into(),
-        }
+    pub fn protocol<F: ProductProtocol<C>>(mut self, facroty: F) -> Self {
+        self.protocols_initializers.push(Box::new(facroty));
+        self
     }
-}
 
-impl<C: quic::Close + quic::ManageStream + ?Sized> ConnectionState<C> {
-    pub async fn open_request_stream(
-        &self,
-    ) -> Result<(Pin<Box<C::StreamReader>>, Pin<Box<C::StreamWriter>>), OpenRequestStreamError>
+    pub async fn build(&self, quic: C) -> Result<Connection<C>, quic::ConnectionError>
+    where
+        C: Sized,
     {
-        let (reader, writer) = self.open_bi().await?;
-        let mut reader = Box::pin(reader);
-        let writer = Box::pin(writer);
-        let stream_id = reader.stream_id().await?;
-        {
-            let mut max_initialized_stream_id = self.max_initialized_stream_id.lock();
-            max_initialized_stream_id.set(
-                max_initialized_stream_id
-                    .get()
-                    .map_or(stream_id, |current| *current.max(&stream_id)),
-            );
-        }
-        if let Some(goaway) = self.peer_goaway.peek()
-            && goaway.stream_id() >= stream_id
-        {
-            return Err(ConnectionGoaway::Peer.into());
+        let quic = Arc::new(QuicConnection::new(quic));
+        let mut protocols = Protocols::new();
+
+        for initializer in &self.protocols_initializers {
+            initializer.init_protocols(&quic, &mut protocols).await?;
         }
 
-        Ok((reader, writer))
+        let protocols = Arc::new(protocols);
+        let state = ConnectionState { quic, protocols };
+        tokio::spawn(ConnectionState::accept_uni_stream_task(state.clone()).in_current_span());
+        tokio::spawn(ConnectionState::accept_bi_stream_task(state.clone()).in_current_span());
+
+        Ok(Connection(state))
+    }
+}
+
+#[derive(Debug)]
+pub struct ConnectionState<C: ?Sized> {
+    quic: Arc<QuicConnection<C>>,
+    protocols: Arc<Protocols<C>>,
+}
+
+impl<C: ?Sized> ConnectionState<C> {
+    pub fn quic_connection(&self) -> &Arc<QuicConnection<C>> {
+        &self.quic
     }
 
-    pub async fn accept_request_stream(
-        &self,
-    ) -> Result<(Pin<Box<C::StreamReader>>, Pin<Box<C::StreamWriter>>), AcceptRequestStreamError>
-    {
-        let (reader, writer) = self.accept_bi().await?;
-        let mut reader = Box::pin(reader);
-        let writer = Box::pin(writer);
-        let stream_id = reader.stream_id().await?;
+    pub fn protocol<P: Any>(&self) -> Option<&P> {
+        self.protocols.get::<P>()
+    }
+}
 
-        match self.local_goaway.peek() {
-            None => Ok((reader, writer)),
-            Some(goaway) if goaway.stream_id() >= stream_id => Err(ConnectionGoaway::Local.into()),
-            Some(..) => {
-                let mut max_received_stream_id = self.max_received_stream_id.lock();
-                max_received_stream_id.set(
-                    max_received_stream_id
-                        .get()
-                        .map_or(stream_id, |current| *current.max(&stream_id)),
-                );
-                Ok((reader, writer))
+impl<C: quic::Close + ?Sized> ConnectionState<C> {
+    pub fn closed(&self) -> impl Future<Output = quic::ConnectionError> + Send + use<C> {
+        self.quic.error()
+    }
+
+    // TODO: close with handy way(code + reason)
+    pub fn close(&self, error: &(impl HasErrorCode + ?Sized)) {
+        self.quic.close(error);
+    }
+}
+
+impl<C: quic::WithLocalAgent + ?Sized> ConnectionState<C> {
+    pub async fn local_agent(
+        &self,
+    ) -> Result<Option<Arc<dyn agent::LocalAgent>>, quic::ConnectionError> {
+        self.quic
+            .inner
+            .local_agent()
+            .await
+            .map(|option| option.map(|a| Arc::new(a) as Arc<dyn agent::LocalAgent>))
+    }
+}
+
+impl<C: quic::WithRemoteAgent + ?Sized> ConnectionState<C> {
+    pub async fn remote_agent(
+        &self,
+    ) -> Result<Option<Arc<dyn agent::RemoteAgent>>, quic::ConnectionError> {
+        self.quic
+            .inner
+            .remote_agent()
+            .await
+            .map(|option| option.map(|a| Arc::new(a) as Arc<dyn agent::RemoteAgent>))
+    }
+}
+
+impl<C: quic::Connection + ?Sized> ConnectionState<C> {
+    async fn accept_bi_stream_task(state: Self) {
+        let task = async {
+            loop {
+                let (stream_reader, stream_writer) = match state.quic.accept_bi().await {
+                    Ok(bi_stream) => bi_stream,
+                    Err(error) => {
+                        state.quic.handle_connection_error(error).await;
+                        return;
+                    }
+                };
+                let stream_reader = StreamReader::new(Box::pin(stream_reader));
+                let stream_writer = SinkWriter::new(Box::pin(stream_writer));
+                let peekable_bi_stream = (PeekableStreamReader::new(stream_reader), stream_writer);
+
+                match state
+                    .protocols
+                    .accept_bi(&state.quic, peekable_bi_stream)
+                    .await
+                {
+                    Ok(StreamVerdict::Accepted) => continue,
+                    // If the stream header indicates a stream type that is not supported by
+                    // the recipient, the remainder of the stream cannot be consumed as the
+                    // semantics are unknown. Recipients of unknown stream types MUST
+                    // either abort reading of the stream or discard incoming data without
+                    // further processing. If reading is aborted, the recipient SHOULD use
+                    // the H3_STREAM_CREATION_ERROR error code or a reserved error code
+                    // (Section 8.1). The recipient MUST NOT consider unknown stream types
+                    // to be a connection error of any kind.
+                    //
+                    // https://datatracker.ietf.org/doc/html/rfc9114#section-9-4
+                    Ok(StreamVerdict::Passed((mut stream_reader, mut stream_writer))) => {
+                        let code = Code::H3_STREAM_CREATION_ERROR.into_inner();
+                        tokio::join!(stream_reader.stop(code), stream_writer.cancel(code))
+                    }
+                    Err(stream_error) => {
+                        state.quic.handle_stream_error(stream_error).await;
+                        continue;
+                    }
+                };
             }
+        };
+        tokio::select! {
+            _ = task => {},
+            _ = state.quic.error() => {},
+        }
+    }
+
+    async fn accept_uni_stream_task(state: Self) {
+        let task = async {
+            loop {
+                let stream_reader = match state.quic.accept_uni().await {
+                    Ok(uni_stream) => uni_stream,
+                    Err(error) => {
+                        state.quic.handle_connection_error(error).await;
+                        return;
+                    }
+                };
+                let stream_reader = StreamReader::new(Box::pin(stream_reader));
+                let peekable_uni_stream = PeekableStreamReader::new(stream_reader);
+
+                match state
+                    .protocols
+                    .accept_uni(&state.quic, peekable_uni_stream)
+                    .await
+                {
+                    Ok(StreamVerdict::Accepted) => continue,
+                    // If the stream header indicates a stream type that is not supported by
+                    // the recipient, the remainder of the stream cannot be consumed as the
+                    // semantics are unknown. Recipients of unknown stream types MUST
+                    // either abort reading of the stream or discard incoming data without
+                    // further processing. If reading is aborted, the recipient SHOULD use
+                    // the H3_STREAM_CREATION_ERROR error code or a reserved error code
+                    // (Section 8.1). The recipient MUST NOT consider unknown stream types
+                    // to be a connection error of any kind.
+                    //
+                    // https://datatracker.ietf.org/doc/html/rfc9114#section-9-4
+                    Ok(StreamVerdict::Passed(mut stream_reader)) => {
+                        let code = Code::H3_STREAM_CREATION_ERROR.into_inner();
+                        let _ = stream_reader.stop(code).await;
+                    }
+                    Err(stream_error) => {
+                        state.quic.handle_stream_error(stream_error).await;
+                        continue;
+                    }
+                };
+            }
+        };
+        tokio::select! {
+            _ = task => {},
+            _ = state.quic.error() => {},
         }
     }
 }
 
-pub type BoxStreamWriter<C> = SinkWriter<Pin<Box<<C as quic::ManageStream>::StreamWriter>>>;
-pub type BoxStreamReader<C> = StreamReader<Pin<Box<<C as quic::ManageStream>::StreamReader>>>;
-
-pub type QPackEncoder = Encoder<
-    BoxInstructionSink<'static, EncoderInstruction>,
-    BoxInstructionStream<'static, DecoderInstruction>,
->;
-
-pub type QPackDecoder = Decoder<
-    BoxInstructionSink<'static, DecoderInstruction>,
-    BoxInstructionStream<'static, EncoderInstruction>,
->;
-
-pub type FrameSink = Feed<BoxSink<'static, Frame<BufList>, StreamError>, Frame<BufList>>;
-
-pub struct Connection<C: quic::Connection + ?Sized> {
-    state: Arc<ConnectionState<C>>,
-    layers: HashMap<TypeId, Arc<dyn ProtocolLayer<C>>>,
-    task: AbortOnDropHandle<()>,
+impl<C: ?Sized> Clone for ConnectionState<C> {
+    fn clone(&self) -> Self {
+        Self {
+            quic: self.quic.clone(),
+            protocols: self.protocols.clone(),
+        }
+    }
 }
 
-impl<C: quic::Connection + ?Sized + Debug> Debug for Connection<C> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Connection")
-            .field("state", &self.state)
-            .field(
-                "layers",
-                &self.layers.values().map(|l| l.name()).collect::<Vec<_>>(),
-            )
-            .field("task", &self.task)
-            .finish()
+#[derive(Debug)]
+pub struct Connection<C: quic::Connection + ?Sized>(ConnectionState<C>);
+
+impl<C: quic::Connection + ?Sized> ops::Deref for Connection<C> {
+    type Target = ConnectionState<C>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
@@ -389,256 +378,22 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
     where
         C: Sized,
     {
-        let state = Arc::new(ConnectionState::new(quic, settings.clone()));
+        let quic = Arc::new(QuicConnection::new(quic));
+        let mut protocols = Protocols::new();
 
-        // Create layers
-        let dhttp_layer = Arc::new(DHttpLayer::new(settings));
-        let qpack_layer = Arc::new(QPackLayer::new());
+        DHttpProtocolFactory::new(settings)
+            .init_protocols(&quic, &mut protocols)
+            .await?;
+        QPackProtocolFactory::new()
+            .init_protocols(&quic, &mut protocols)
+            .await?;
 
-        // Initialize QPackLayer first (creates encoder/decoder)
-        let (qpack_encoder, receive_decoder_instructions) = qpack_layer.init_qpack(&state);
-        // Initialize DHttpLayer (opens control stream, sends SETTINGS, spawns handle_control)
-        let handle_control_stream = dhttp_layer.init_dhttp(&state, qpack_encoder).await?;
+        let protocols = Arc::new(protocols);
+        let state = ConnectionState { quic, protocols };
+        tokio::spawn(ConnectionState::accept_uni_stream_task(state.clone()).in_current_span());
+        tokio::spawn(ConnectionState::accept_bi_stream_task(state.clone()).in_current_span());
 
-        // Layer-based routing loop: iterate layers for each incoming uni stream
-        let conn_state = state.clone();
-        let layers_for_routing: Vec<Arc<dyn ProtocolLayer<C>>> = vec![
-            qpack_layer.clone() as Arc<dyn ProtocolLayer<C>>,
-            dhttp_layer.clone() as Arc<dyn ProtocolLayer<C>>,
-        ];
-        let accept_uni = async move {
-            loop {
-                let uni_stream = conn_state.accept_uni().await?;
-                let uni_stream: Pin<Box<dyn crate::quic::ReadStream + Send>> = Box::pin(uni_stream);
-                let stream_reader = StreamReader::new(uni_stream);
-                let mut peekable = Some(PeekableStreamReader::new(stream_reader));
-
-                let mut accepted = false;
-                for layer in &layers_for_routing {
-                    // Invariant: `peekable` is always `Some` here because `Passed`
-                    // returns the stream and `Accepted` breaks out of the loop.
-                    let stream = peekable.take().ok_or(StreamError::Quic {
-                        source: quic::StreamError::Reset {
-                            code: Code::H3_INTERNAL_ERROR.value(),
-                        },
-                    })?;
-                    match layer.accept_uni(stream).await? {
-                        StreamVerdict::Accepted => {
-                            accepted = true;
-                            break;
-                        }
-                        StreamVerdict::Passed(returned_stream) => {
-                            peekable = Some(returned_stream);
-                        }
-                    }
-                }
-
-                if !accepted {
-                    // No layer accepted the stream — stop it with H3_STREAM_CREATION_ERROR.
-                    // https://datatracker.ietf.org/doc/html/rfc9114#section-6.2-7
-                    if let Some(stream) = peekable {
-                        let mut stream_reader = stream.into_stream_reader();
-                        let _ = stream_reader
-                            .stop(Code::H3_STREAM_CREATION_ERROR.value())
-                            .await;
-                    }
-                }
-            }
-
-            #[allow(unreachable_code)]
-            Ok::<_, StreamError>(())
-        };
-        let accept_uni_task = AbortOnDropHandle::new(tokio::spawn(accept_uni.in_current_span()));
-
-        // Supervisor task: join all background tasks
-        let conn_state = state.clone();
-        let task = async move {
-            let unwrap_task = |r: Result<_, tokio::task::JoinError>| match r {
-                Ok(val) => val,
-                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-                Err(e) => unreachable!("background task cancelled: {e}"),
-            };
-            match tokio::try_join!(
-                accept_uni_task.map(unwrap_task),
-                handle_control_stream.map(unwrap_task),
-                receive_decoder_instructions.map(unwrap_task)
-            ) {
-                Ok(_) => unreachable!(),
-                Err(error) => _ = conn_state.handle_error(error).await,
-            }
-        };
-        let task = AbortOnDropHandle::new(tokio::spawn(task.in_current_span()));
-
-        // Build unified layer map for typed access
-        let mut layers = HashMap::new();
-        layers.insert(
-            TypeId::of::<QPackLayer>(),
-            qpack_layer.clone() as Arc<dyn ProtocolLayer<C>>,
-        );
-        layers.insert(
-            TypeId::of::<DHttpLayer>(),
-            dhttp_layer.clone() as Arc<dyn ProtocolLayer<C>>,
-        );
-
-        Ok(Self {
-            state,
-            layers,
-            task,
-        })
-    }
-
-    /// Returns a typed reference to a registered protocol layer.
-    ///
-    /// Uses `TypeId`-based lookup in the layer map, then downcasts to `Arc<L>`.
-    pub fn layer<L: ProtocolLayer<C>>(&self) -> Option<Arc<L>> {
-        self.layers.get(&TypeId::of::<L>()).and_then(|layer| {
-            let any: Arc<dyn Any + Send + Sync> = layer.clone();
-            any.downcast::<L>().ok()
-        })
-    }
-
-    pub fn settings(&self) -> Arc<Settings> {
-        self.state.local_settings.clone()
-    }
-
-    pub async fn peer_settings(&self) -> Result<Arc<Settings>, quic::ConnectionError> {
-        self.state.peer_settings().await
-    }
-
-    pub fn max_received_stream_id(&self) -> Option<VarInt> {
-        self.state.max_received_stream_id.peek()
-    }
-
-    pub fn max_initialized_stream_id(&self) -> Option<VarInt> {
-        self.state.max_initialized_stream_id.peek()
-    }
-
-    pub fn peer_goaway(&self) -> Option<Goaway> {
-        self.state.peer_goaway.peek()
-    }
-
-    pub fn peer_goawaies(&self) -> impl Stream<Item = Result<Goaway, quic::ConnectionError>> {
-        self.state.peer_goawaies()
-    }
-
-    // TODO: close with handy way(code + reason)
-    pub fn close(&self, error: &(impl HasErrorCode + ?Sized)) {
-        self.state.close(error);
-    }
-
-    pub async fn closed(&self) -> quic::ConnectionError {
-        self.state.error().await
-    }
-
-    pub fn local_agent(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::LocalAgent>>, quic::ConnectionError>> {
-        self.state.local_agent()
-    }
-
-    pub fn remote_agent(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::RemoteAgent>>, quic::ConnectionError>> {
-        self.state.remote_agent()
-    }
-}
-
-impl<C: quic::Connection /* TODO: + ?Sized */> Connection<C> {
-    pub async fn goaway(&self, goaway: Goaway) -> Result<(), quic::StreamError> {
-        let dhttp = self.layer::<DHttpLayer>().ok_or(quic::StreamError::Reset {
-            code: Code::H3_INTERNAL_ERROR.value(),
-        })?;
-        let control_stream_lock = dhttp.control_stream().ok_or(quic::StreamError::Reset {
-            code: Code::H3_INTERNAL_ERROR.value(),
-        })?;
-        let mut control_stream = control_stream_lock.lock().await;
-        let Ok(goaway_frame) = BufList::new().encode(goaway).await;
-        match control_stream.send(goaway_frame).await {
-            Ok(()) => Ok(()),
-            Err(error) => Err(self.state.handle_error(error).await),
-        }
-    }
-
-    pub async fn open_request_stream(
-        &self,
-    ) -> Result<(message::stream::ReadStream, message::stream::WriteStream), OpenRequestStreamError>
-    {
-        let dhttp = self
-            .layer::<DHttpLayer>()
-            .ok_or(OpenRequestStreamError::RequestStream {
-                source: quic::StreamError::Reset {
-                    code: Code::H3_INTERNAL_ERROR.value(),
-                },
-            })?;
-        let qpack = self
-            .layer::<QPackLayer>()
-            .ok_or(OpenRequestStreamError::RequestStream {
-                source: quic::StreamError::Reset {
-                    code: Code::H3_INTERNAL_ERROR.value(),
-                },
-            })?;
-        let (stream_reader, stream_writer) = self.state.open_request_stream().await?;
-        let qpack_decoder = qpack
-            .qpack_decoder()
-            .ok_or(OpenRequestStreamError::RequestStream {
-                source: quic::StreamError::Reset {
-                    code: Code::H3_INTERNAL_ERROR.value(),
-                },
-            })?
-            .clone();
-        let qpack_encoder = qpack
-            .qpack_encoder()
-            .ok_or(OpenRequestStreamError::RequestStream {
-                source: quic::StreamError::Reset {
-                    code: Code::H3_INTERNAL_ERROR.value(),
-                },
-            })?
-            .clone();
-        Ok((
-            message::stream::ReadStream::new(stream_reader, qpack_decoder, dhttp.clone()),
-            message::stream::WriteStream::new(stream_writer, qpack_encoder, dhttp),
-        ))
-    }
-
-    pub async fn accept_request_stream(
-        &self,
-    ) -> Result<(message::stream::ReadStream, message::stream::WriteStream), AcceptRequestStreamError>
-    {
-        let dhttp = self
-            .layer::<DHttpLayer>()
-            .ok_or(AcceptRequestStreamError::Quic {
-                source: quic::StreamError::Reset {
-                    code: Code::H3_INTERNAL_ERROR.value(),
-                },
-            })?;
-        let qpack = self
-            .layer::<QPackLayer>()
-            .ok_or(AcceptRequestStreamError::Quic {
-                source: quic::StreamError::Reset {
-                    code: Code::H3_INTERNAL_ERROR.value(),
-                },
-            })?;
-        let (stream_reader, stream_writer) = self.state.accept_request_stream().await?;
-        let qpack_decoder = qpack
-            .qpack_decoder()
-            .ok_or(AcceptRequestStreamError::Quic {
-                source: quic::StreamError::Reset {
-                    code: Code::H3_INTERNAL_ERROR.value(),
-                },
-            })?
-            .clone();
-        let qpack_encoder = qpack
-            .qpack_encoder()
-            .ok_or(AcceptRequestStreamError::Quic {
-                source: quic::StreamError::Reset {
-                    code: Code::H3_INTERNAL_ERROR.value(),
-                },
-            })?
-            .clone();
-        Ok((
-            message::stream::ReadStream::new(stream_reader, qpack_decoder, dhttp.clone()),
-            message::stream::WriteStream::new(stream_writer, qpack_encoder, dhttp),
-        ))
+        Ok(Connection(state))
     }
 }
 

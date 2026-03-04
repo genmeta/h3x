@@ -1,18 +1,16 @@
 use std::{
-    fmt::Debug,
     io,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use futures::{Sink, Stream};
-use snafu::Snafu;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
     codec::{Decode, DecodeExt, DecodeStreamError, EncodeExt},
     connection::StreamError,
-    error::{Code, H3CriticalStreamClosed, HasErrorCode},
+    error::Code,
     quic::{self, CancelStream, GetStreamId, StopStream},
     varint::VarInt,
 };
@@ -39,25 +37,12 @@ pin_project_lite::pin_project! {
 impl<S: AsyncRead + Unpin> Decode<UnidirectionalStream<S>> for S {
     type Error = StreamError;
 
-    async fn decode(mut self) -> Result<UnidirectionalStream<S>, Self::Error> {
-        let r#type = self.decode_one::<VarInt>().await.map_err(|error| {
-            DecodeStreamError::from(error)
-                .map_decode_error(|error| Code::H3_GENERAL_PROTOCOL_ERROR.with(error).into())
-        })?;
-        Ok(UnidirectionalStream {
-            r#type,
-            stream: self,
-        })
+    async fn decode(self) -> Result<UnidirectionalStream<S>, Self::Error> {
+        UnidirectionalStream::accept(self).await
     }
 }
 
 impl UnidirectionalStream<()> {
-    /// A control stream is indicated by a stream type of 0x00. Data on this
-    ///  stream consists of HTTP/3 frames, as defined in Section 7.2.
-    ///
-    /// https://datatracker.ietf.org/doc/html/rfc9114#name-control-streams
-    pub const CONTROL_STREAM_TYPE: VarInt = VarInt::from_u32(0x00);
-
     /// A push stream is indicated by a stream type of 0x01, followed by the
     /// push ID of the promise that it fulfills, encoded as a variable-length
     /// integer. The remaining data on this stream consists of HTTP/3 frames,
@@ -68,24 +53,10 @@ impl UnidirectionalStream<()> {
     ///
     /// https://datatracker.ietf.org/doc/html/rfc9114#name-push-streams
     pub const PUSH_STREAM_TYPE: VarInt = VarInt::from_u32(0x01);
-
-    /// An encoder stream is a unidirectional stream of type 0x02. It
-    /// carries an unframed sequence of encoder instructions from encoder
-    /// to decoder.
-    ///
-    /// https://datatracker.ietf.org/doc/html/rfc9204#section-4.2-2.1
-    pub const QPACK_ENCODER_STREAM_TYPE: VarInt = VarInt::from_u32(0x02);
-
-    /// A decoder stream is a unidirectional stream of type 0x03. It
-    /// carries an unframed sequence of decoder instructions from decoder
-    /// to encoder.
-    ///
-    /// https://datatracker.ietf.org/doc/html/rfc9204#section-4.2-2.2
-    pub const QPACK_DECODER_STREAM_TYPE: VarInt = VarInt::from_u32(0x03);
 }
 
 impl<S: ?Sized> UnidirectionalStream<S> {
-    pub async fn new(r#type: VarInt, mut stream: S) -> Result<Self, StreamError>
+    pub async fn initial(r#type: VarInt, mut stream: S) -> Result<Self, StreamError>
     where
         S: AsyncWrite + Unpin + Sized,
     {
@@ -93,54 +64,22 @@ impl<S: ?Sized> UnidirectionalStream<S> {
         Ok(Self { r#type, stream })
     }
 
+    pub async fn accept(mut stream: S) -> Result<Self, StreamError>
+    where
+        S: AsyncRead + Unpin + Sized,
+    {
+        let r#type = stream.decode_one::<VarInt>().await.map_err(|error| {
+            DecodeStreamError::from(error)
+                .map_decode_error(|error| Code::H3_GENERAL_PROTOCOL_ERROR.with(error).into())
+        })?;
+        Ok(UnidirectionalStream { r#type, stream })
+    }
+
     pub fn into_inner(self) -> S
     where
         S: Sized,
     {
         self.stream
-    }
-
-    pub async fn new_qpack_encoder_stream(stream: S) -> Result<Self, StreamError>
-    where
-        S: AsyncWrite + Unpin + Sized,
-    {
-        Self::new(UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE, stream)
-            .await
-            .map_err(|error| {
-                error.map_stream_reset(|_| H3CriticalStreamClosed::QPackEncoder.into())
-            })
-    }
-
-    pub const fn is_qpack_encoder_stream(&self) -> bool {
-        self.r#type.into_inner() == UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE.into_inner()
-    }
-
-    pub async fn new_qpack_decoder_stream(stream: S) -> Result<Self, StreamError>
-    where
-        S: AsyncWrite + Unpin + Sized,
-    {
-        Self::new(UnidirectionalStream::QPACK_DECODER_STREAM_TYPE, stream)
-            .await
-            .map_err(|error| {
-                error.map_stream_reset(|_| H3CriticalStreamClosed::QPackDecoder.into())
-            })
-    }
-
-    pub const fn is_qpack_decoder_stream(&self) -> bool {
-        self.r#type.into_inner() == UnidirectionalStream::QPACK_DECODER_STREAM_TYPE.into_inner()
-    }
-
-    pub async fn new_control_stream(stream: S) -> Result<Self, StreamError>
-    where
-        S: AsyncWrite + Unpin + Sized,
-    {
-        Self::new(UnidirectionalStream::CONTROL_STREAM_TYPE, stream)
-            .await
-            .map_err(|error| error.map_stream_reset(|_| H3CriticalStreamClosed::Control.into()))
-    }
-
-    pub const fn is_control_stream(&self) -> bool {
-        self.r#type().into_inner() == UnidirectionalStream::CONTROL_STREAM_TYPE.into_inner()
     }
 
     pub const fn r#type(&self) -> VarInt {
@@ -159,23 +98,6 @@ impl<S: ?Sized> UnidirectionalStream<S> {
     pub const fn is_reserved_stream(&self) -> bool {
         (self.r#type().into_inner() >= 0x21)
             && (self.r#type.into_inner() - 0x21).is_multiple_of(0x1f)
-    }
-}
-
-#[allow(clippy::enum_variant_names)]
-#[derive(Debug, Snafu, Clone, Copy)]
-pub enum H3StreamCreationError {
-    #[snafu(display("control stream already exists"))]
-    DuplicateControlStream,
-    #[snafu(display("qpack encoder stream already exists"))]
-    DuplicateQpackEncoderStream,
-    #[snafu(display("qpack decoder stream already exists"))]
-    DuplicateQpackDecoderStream,
-}
-
-impl HasErrorCode for H3StreamCreationError {
-    fn code(&self) -> Code {
-        Code::H3_STREAM_CREATION_ERROR
     }
 }
 
