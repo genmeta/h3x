@@ -14,7 +14,9 @@ use futures::{Sink, Stream, future::BoxFuture};
 use http::uri::Authority;
 use snafu::Snafu;
 
-use crate::{agent, error::Code, varint::VarInt};
+pub mod agent;
+
+use crate::{error::Code, varint::VarInt};
 
 #[cfg_attr(
     feature = "rkyv",
