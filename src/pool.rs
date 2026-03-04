@@ -11,11 +11,7 @@ use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::{
-    connection::{Connection, settings::Settings},
-    quic,
-    util::watch::Watch,
-};
+use crate::{connection::Connection, dhttp::settings::Settings, quic, util::watch::Watch};
 
 #[derive(Debug)]
 pub struct ReuseableConnection<C: quic::Connection> {
@@ -41,7 +37,7 @@ impl<C: quic::Connection> ReuseableConnection<C> {
     pub fn reuse(&self) -> Option<Arc<Connection<C>>> {
         let connection = self.peek()?;
         // peer goaway, connection cannot be reused: cannot open new streams
-        if let Some(peer_goaway) = connection.peer_goaway()
+        if let Some(peer_goaway) = connection.peek_peer_goaway()
             && let Some(max_received_stream_id) = connection.max_received_stream_id()
             && peer_goaway.stream_id() <= max_received_stream_id
         {
