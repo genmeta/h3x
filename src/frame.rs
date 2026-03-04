@@ -219,6 +219,27 @@ impl<P: Buf, S: AsyncWrite + Sink<Bytes, Error = quic::StreamError>> Encode<Fram
     }
 }
 
+impl<P1, P> Decode<Frame<P1>> for Frame<P>
+where
+    P: Decode<P1>,
+{
+    type Error = P::Error;
+
+    async fn decode(self) -> Result<Frame<P1>, Self::Error> {
+        let Frame {
+            r#type,
+            length,
+            payload,
+        } = self;
+        let payload = payload.decode().await?;
+        Ok(Frame {
+            r#type,
+            length,
+            payload,
+        })
+    }
+}
+
 impl<S> Decode<Frame<BufList>> for &mut StreamReader<S>
 where
     S: TryStream<Ok = Bytes, Error = quic::StreamError> + Unpin,
