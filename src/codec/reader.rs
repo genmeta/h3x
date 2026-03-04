@@ -484,26 +484,28 @@ where
     }
 
     /// Consumes this `PeekableStreamReader` and returns the underlying
-    /// `StreamReader`, preserving any unconsumed buffered data.
+    /// `StreamReader`, preserving all buffered data.
     ///
     /// The current cursor position is first committed (bytes before cursor
-    /// are discarded). Any remaining buffered bytes that were pulled from
-    /// the underlying stream but not yet consumed are preserved via
-    /// `map_stream`, which carries the `StreamReader`'s internal partial
-    /// chunk forward.
-    ///
-    /// **Important**: Bytes buffered by peeking beyond the cursor are dropped
-    /// because `StreamReader`'s private fields prevent re-injection. Callers
-    /// should either:
-    /// - `commit()` all consumed data, or
-    /// - `reset()` before calling this (to avoid losing any uncommitted data
-    ///   that was merely inspected but not consumed).
+    /// are discarded). Any remaining buffered bytes (beyond the cursor) are
+    /// concatenated and prepended to the `StreamReader`'s internal chunk,
+    /// ensuring no data is lost.
     pub fn into_stream_reader(mut self) -> StreamReader<S> {
         self.commit();
-        // After commit, self.buffered may still contain bytes that were
-        // pulled from the stream during peek but lie beyond the old cursor.
-        // These are dropped here. map_stream(|s| s) preserves the
-        // StreamReader's existing internal chunk (if any).
+        // After commit, self.buffered contains bytes that were pulled from
+        // the stream during peek but lie beyond the old cursor. These must
+        // be preserved by prepending them to the StreamReader's chunk.
+        if !self.buffered.is_empty() {
+            let stream_chunk = std::mem::take(&mut self.stream.chunk);
+            let total_len: usize = self.buffered.iter().map(|b| b.len()).sum::<usize>()
+                + stream_chunk.len();
+            let mut combined = bytes::BytesMut::with_capacity(total_len);
+            for buf in &self.buffered {
+                combined.extend_from_slice(buf);
+            }
+            combined.extend_from_slice(&stream_chunk);
+            self.stream.chunk = combined.freeze();
+        }
         self.stream.map_stream(|s| s)
     }
 }
