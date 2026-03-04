@@ -4,10 +4,10 @@ use http_body::Body;
 use http_body_util::{BodyExt, Empty};
 
 use crate::{
-    connection::{Connection, OpenRequestStreamError},
+    connection::Connection,
     hyper::SendMesageError,
     message::stream::{
-        StreamError,
+        InitialMessageStreamError, MessageStreamError,
         hyper::{read::Either, upgrade::RemainStream},
     },
     quic,
@@ -15,15 +15,15 @@ use crate::{
 
 #[derive(Debug)]
 pub enum RequestError<E> {
-    OpenStream { source: OpenRequestStreamError },
+    InitialStream { source: InitialMessageStreamError },
     SendRequest { source: SendMesageError<E> },
-    ReceiveResponse { source: StreamError },
+    ReceiveResponse { source: MessageStreamError },
 }
 
-impl<E> From<OpenRequestStreamError> for RequestError<E> {
+impl<E> From<InitialMessageStreamError> for RequestError<E> {
     #[track_caller]
-    fn from(source: OpenRequestStreamError) -> Self {
-        RequestError::OpenStream { source }
+    fn from(source: InitialMessageStreamError) -> Self {
+        RequestError::InitialStream { source }
     }
 }
 
@@ -34,9 +34,9 @@ impl<E> From<SendMesageError<E>> for RequestError<E> {
     }
 }
 
-impl<E> From<StreamError> for RequestError<E> {
+impl<E> From<MessageStreamError> for RequestError<E> {
     #[track_caller]
-    fn from(source: StreamError) -> Self {
+    fn from(source: MessageStreamError) -> Self {
         RequestError::ReceiveResponse { source }
     }
 }
@@ -45,7 +45,7 @@ impl<E: Error + 'static> std::fmt::Display for RequestError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         #[allow(unused_variables)]
         match self {
-            RequestError::OpenStream { source, .. } => source.fmt(f),
+            RequestError::InitialStream { source, .. } => source.fmt(f),
             RequestError::SendRequest { source, .. } => source.fmt(f),
             RequestError::ReceiveResponse { source, .. } => source.fmt(f),
         }
@@ -55,7 +55,7 @@ impl<E: Error + 'static> std::fmt::Display for RequestError<E> {
 impl<E: Error + 'static> Error for RequestError<E> {
     fn source(&self) -> ::core::option::Option<&(dyn ::snafu::Error + 'static)> {
         match *self {
-            RequestError::OpenStream { ref source, .. } => source.source(),
+            RequestError::InitialStream { ref source, .. } => source.source(),
             RequestError::SendRequest { ref source, .. } => source.source(),
             RequestError::ReceiveResponse { ref source, .. } => source.source(),
         }
@@ -68,10 +68,10 @@ impl<C: quic::Connection> Connection<C> {
         &self,
         request: http::Request<B>,
     ) -> Result<
-        http::Response<impl Body<Data = bytes::Bytes, Error = StreamError> + use<B, C>>,
+        http::Response<impl Body<Data = bytes::Bytes, Error = MessageStreamError> + use<B, C>>,
         RequestError<B::Error>,
     > {
-        let (mut read_stream, mut write_stream) = self.open_request_stream().await?;
+        let (mut read_stream, mut write_stream) = self.initial_message_stream().await?;
         let is_connect = request.method() == http::Method::CONNECT;
         write_stream.send_hyper_request(request).await?;
 
