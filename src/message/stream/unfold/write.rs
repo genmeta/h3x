@@ -9,7 +9,7 @@ use std::{
 use bytes::{Buf, Bytes};
 use futures::Sink;
 
-use super::super::{StreamError, WriteStream};
+use super::super::{MessageStreamError, WriteStream};
 use crate::codec::SinkWriter;
 
 pin_project_lite::pin_project! {
@@ -157,7 +157,7 @@ where
 }
 
 impl WriteStream {
-    pub fn as_bytes_sink<B: Buf>(&mut self) -> impl Sink<B, Error = StreamError> {
+    pub fn as_bytes_sink<B: Buf>(&mut self) -> impl Sink<B, Error = MessageStreamError> {
         unfold(
             self,
             async |stream: &mut WriteStream, buf: B| stream.send_data(buf).await.map(|_| stream),
@@ -166,11 +166,11 @@ impl WriteStream {
         )
     }
 
-    pub fn as_writer(&mut self) -> SinkWriter<impl Sink<Bytes, Error = StreamError>> {
+    pub fn as_writer(&mut self) -> SinkWriter<impl Sink<Bytes, Error = MessageStreamError>> {
         SinkWriter::new(self.as_bytes_sink())
     }
 
-    pub fn into_bytes_sink<B: Buf>(self) -> impl Sink<B, Error = StreamError> {
+    pub fn into_bytes_sink<B: Buf>(self) -> impl Sink<B, Error = MessageStreamError> {
         unfold(
             self,
             async |mut stream: WriteStream, buf: B| stream.send_data(buf).await.map(|_| stream),
@@ -179,7 +179,7 @@ impl WriteStream {
         )
     }
 
-    pub fn into_writer(self) -> SinkWriter<impl Sink<Bytes, Error = StreamError>> {
+    pub fn into_writer(self) -> SinkWriter<impl Sink<Bytes, Error = MessageStreamError>> {
         SinkWriter::new(self.into_bytes_sink())
     }
 }
