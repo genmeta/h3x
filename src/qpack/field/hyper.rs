@@ -165,7 +165,8 @@ impl TryFrom<FieldSection> for response::Parts {
 
         let status =
             status.context(malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu)?;
-        let response = Response::builder().status(status).body(())?;
+        let mut response = Response::builder().status(status).body(())?;
+        *response.headers_mut() = value.header_map;
         Ok(response.into_parts().0)
     }
 }
