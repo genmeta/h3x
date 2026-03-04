@@ -1,15 +1,15 @@
 #![doc = include_str!("../README.md")]
 
-pub mod agent;
 pub mod buflist;
 pub mod client;
 pub mod codec;
 pub mod connection;
+pub mod dhttp;
 pub mod error;
 pub mod frame;
-pub mod layer;
 pub mod message;
 pub mod pool;
+pub mod protocol;
 pub mod qpack;
 pub mod quic;
 pub mod server;
