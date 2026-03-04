@@ -15,7 +15,7 @@ use ::gm_quic::{
 use rustls::{crypto::CryptoProvider, server::danger::ClientCertVerifier};
 
 use crate::{
-    connection::settings::Settings,
+    dhttp::settings::Settings,
     pool::Pool,
     server::{Servers, UnresolvedRequest},
 };

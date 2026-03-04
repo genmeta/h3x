@@ -25,7 +25,7 @@ use snafu::{ResultExt, Snafu};
 
 use crate::{
     client::Client,
-    connection::settings::Settings,
+    dhttp::settings::Settings,
     pool::Pool,
     util::tls::{DangerousServerCertVerifier, InvalidIdentity, verify_certficate_for_name},
 };
