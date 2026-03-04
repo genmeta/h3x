@@ -10,10 +10,12 @@ use futures::{FutureExt, Sink, Stream, TryFutureExt, future::BoxFuture};
 use rustls::{SignatureScheme, pki_types::CertificateDer, sign::CertifiedKey};
 
 use crate::{
-    agent::{self, SignError},
     error::Code,
     quic,
-    quic::CancelStream,
+    quic::{
+        CancelStream,
+        agent::{self, SignError},
+    },
     varint::VarInt,
 };
 
