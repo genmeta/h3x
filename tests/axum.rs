@@ -239,7 +239,7 @@ fn axum_extend_connect() {
             .await
             .expect("failed to connect to server");
         let (mut read_stream, mut write_stream) = connection
-            .open_request_stream()
+            .initial_message_stream()
             .await
             .expect("failed to open request stream");
 
