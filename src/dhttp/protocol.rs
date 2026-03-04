@@ -168,7 +168,7 @@ impl DHttpState {
 
 type FrameSink = Feed<BoxSink<'static, Frame<BufList>, StreamError>, Frame<BufList>>;
 
-pub type BoxDynQuicStreeamReader = Pin<Box<dyn quic::ReadStream + Send>>;
+pub type BoxDynQuicStreamReader = Pin<Box<dyn quic::ReadStream + Send>>;
 pub type BoxDynQuicStreamWriter = Pin<Box<dyn quic::WriteStream + Send>>;
 
 /// DHTTP/3 protocol layer.
@@ -187,7 +187,7 @@ pub struct DHttpProtocol {
     handle_control_stream: SetOnce<AbortOnDropHandle<()>>,
 
     unresolved_request_streams: RingChannel<(
-        StreamReader<BoxDynQuicStreeamReader>,
+        StreamReader<BoxDynQuicStreamReader>,
         SinkWriter<BoxDynQuicStreamWriter>,
     )>,
 }
@@ -306,7 +306,7 @@ impl DHttpProtocol {
             Pin::new(&mut reader).reset();
             let reader = reader
                 .into_stream_reader()
-                .map_stream(|b| b as BoxDynQuicStreeamReader);
+                .map_stream(|b| b as BoxDynQuicStreamReader);
             let writer = writer.map_sink(|b| b as BoxDynQuicStreamWriter);
             let item = (reader, writer);
             if let Some(mut unresolved) = self.unresolved_request_streams.send(item) {
@@ -509,7 +509,7 @@ impl<C: quic::Close + quic::ManageStream + Send + Sync + ?Sized> ConnectionState
         &self,
     ) -> Result<
         (
-            StreamReader<BoxDynQuicStreeamReader>,
+            StreamReader<BoxDynQuicStreamReader>,
             SinkWriter<BoxDynQuicStreamWriter>,
         ),
         InitialRawMessageStreamError,
@@ -525,7 +525,7 @@ impl<C: quic::Close + quic::ManageStream + Send + Sync + ?Sized> ConnectionState
         &self,
     ) -> Result<
         (
-            StreamReader<BoxDynQuicStreeamReader>,
+            StreamReader<BoxDynQuicStreamReader>,
             SinkWriter<BoxDynQuicStreamWriter>,
         ),
         AcceptRawMessageStreamError,

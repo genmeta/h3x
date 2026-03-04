@@ -13,7 +13,7 @@ use crate::{
     codec::{EncodeError, EncodeExt, SinkWriter, StreamReader},
     connection::{self, ConnectionGoaway, ConnectionState, QuicConnection},
     dhttp::protocol::{
-        AcceptRawMessageStreamError, BoxDynQuicStreamWriter, BoxDynQuicStreeamReader, DHttpState,
+        AcceptRawMessageStreamError, BoxDynQuicStreamWriter, BoxDynQuicStreamReader, DHttpState,
         InitialRawMessageStreamError,
     },
     error::Code,
@@ -134,7 +134,7 @@ impl From<MessageStreamError> for io::Error {
 }
 
 pub struct ReadStream {
-    pub(super) stream: FrameStream<BoxDynQuicStreeamReader>,
+    pub(super) stream: FrameStream<BoxDynQuicStreamReader>,
     pub(super) qpack_decoder: Arc<QPackDecoder>,
     pub(super) connection: Arc<QuicConnection<dyn quic::Close + Send + Sync>>,
     dhttp_state: Arc<DHttpState>,
@@ -142,7 +142,7 @@ pub struct ReadStream {
 
 impl ReadStream {
     pub fn new(
-        stream: StreamReader<BoxDynQuicStreeamReader>,
+        stream: StreamReader<BoxDynQuicStreamReader>,
         qpack_decoder: Arc<QPackDecoder>,
         connection: Arc<QuicConnection<dyn quic::Close + Send + Sync>>,
         dhttp_state: Arc<DHttpState>,
@@ -217,7 +217,7 @@ impl ReadStream {
 
     pub async fn peek_frame(
         &mut self,
-    ) -> Option<Result<ReadableFrame<'_, BoxDynQuicStreeamReader>, connection::StreamError>> {
+    ) -> Option<Result<ReadableFrame<'_, BoxDynQuicStreamReader>, connection::StreamError>> {
         loop {
             match Pin::new(&mut self.stream).frame() {
                 None => match Pin::new(&mut self.stream).next_unreserved_frame().await? {
