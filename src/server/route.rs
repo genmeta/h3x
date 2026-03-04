@@ -8,7 +8,7 @@ use futures::future::BoxFuture;
 use http::{Method, StatusCode};
 
 use crate::server::{
-    BoxService, BoxServiceFuture, IntoBoxService, Request, Response, Service, StreamError,
+    BoxService, BoxServiceFuture, IntoBoxService, MessageStreamError, Request, Response, Service,
     UnresolvedRequest, box_service,
 };
 
@@ -180,7 +180,7 @@ impl Router {
     }
 
     #[tracing::instrument(skip(self, req), fields(method = tracing::field::Empty, uri = tracing::field::Empty))]
-    pub async fn handle(&self, req: UnresolvedRequest) -> Result<(), StreamError> {
+    pub async fn handle(&self, req: UnresolvedRequest) -> Result<(), MessageStreamError> {
         let (mut request, mut response) = req.resolve().await?;
 
         tracing::Span::current()
@@ -210,9 +210,9 @@ impl Service for Router {
 impl tower_service::Service<UnresolvedRequest> for Router {
     type Response = ();
 
-    type Error = StreamError;
+    type Error = MessageStreamError;
 
-    type Future = BoxFuture<'static, Result<(), StreamError>>;
+    type Future = BoxFuture<'static, Result<(), MessageStreamError>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         _ = cx;

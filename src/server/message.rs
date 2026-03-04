@@ -11,13 +11,13 @@ use snafu::Report;
 use tracing::Instrument;
 
 use crate::{
-    agent,
     error::Code,
     message::{
-        MalformedMessageError, Message, MessageStage,
-        stream::{ReadStream, ReadToStringError, StreamError, WriteStream},
+        stream::{MessageStreamError, ReadStream, WriteStream},
+        unify::{MalformedMessageError, Message, MessageStage, ReadToStringError},
     },
     qpack::field::PseudoHeaders,
+    quic::agent,
 };
 
 pub struct UnresolvedRequest {
@@ -28,7 +28,7 @@ pub struct UnresolvedRequest {
 }
 
 impl UnresolvedRequest {
-    pub async fn resolve(self) -> Result<(Request, Response), StreamError> {
+    pub async fn resolve(self) -> Result<(Request, Response), MessageStreamError> {
         let mut request = Request {
             message: Message::unresolved_request(),
             stream: self.request_stream,
@@ -48,7 +48,7 @@ impl UnresolvedRequest {
 }
 
 impl IntoFuture for UnresolvedRequest {
-    type Output = Result<(Request, Response), StreamError>;
+    type Output = Result<(Request, Response), MessageStreamError>;
 
     type IntoFuture = BoxFuture<'static, Self::Output>;
 
@@ -92,15 +92,15 @@ impl Request {
         self.headers().get(name)
     }
 
-    pub async fn read(&mut self) -> Option<Result<Bytes, StreamError>> {
+    pub async fn read(&mut self) -> Option<Result<Bytes, MessageStreamError>> {
         self.stream.read_message(&mut self.message).await
     }
 
-    pub async fn read_all(&mut self) -> Result<impl Buf, StreamError> {
+    pub async fn read_all(&mut self) -> Result<impl Buf, MessageStreamError> {
         self.stream.read_message_full_body(&mut self.message).await
     }
 
-    pub async fn read_to_bytes(&mut self) -> Result<Bytes, StreamError> {
+    pub async fn read_to_bytes(&mut self) -> Result<Bytes, MessageStreamError> {
         self.stream
             .read_message_body_to_bytes(&mut self.message)
             .await
@@ -112,25 +112,25 @@ impl Request {
             .await
     }
 
-    pub async fn as_stream(&mut self) -> impl Stream<Item = Result<Bytes, StreamError>> {
+    pub async fn as_stream(&mut self) -> impl Stream<Item = Result<Bytes, MessageStreamError>> {
         futures::stream::unfold(self, async |this| {
             this.read().await.map(|item| (item, this))
         })
         .fuse()
     }
 
-    pub async fn into_stream(self) -> impl Stream<Item = Result<Bytes, StreamError>> {
+    pub async fn into_stream(self) -> impl Stream<Item = Result<Bytes, MessageStreamError>> {
         futures::stream::unfold(self, async |mut this| {
             this.read().await.map(|item| (item, this))
         })
         .fuse()
     }
 
-    pub async fn trailers(&mut self) -> Result<&HeaderMap, StreamError> {
+    pub async fn trailers(&mut self) -> Result<&HeaderMap, MessageStreamError> {
         self.stream.read_message_trailer(&mut self.message).await
     }
 
-    pub async fn stop(&mut self, code: Code) -> Result<(), StreamError> {
+    pub async fn stop(&mut self, code: Code) -> Result<(), MessageStreamError> {
         self.stream.stop(code).await
     }
 
@@ -226,7 +226,7 @@ impl Response {
         self
     }
 
-    pub async fn write(&mut self, content: impl Buf) -> Result<&mut Self, StreamError> {
+    pub async fn write(&mut self, content: impl Buf) -> Result<&mut Self, MessageStreamError> {
         self.check_message_operation("write_streaming_body", |this| {
             if this.message.is_interim_response() {
                 return Err(MalformedMessageError::BodyOrTrailerOnInterimResponse);
@@ -240,7 +240,7 @@ impl Response {
         Ok(self)
     }
 
-    pub async fn flush(&mut self) -> Result<&mut Self, StreamError> {
+    pub async fn flush(&mut self) -> Result<&mut Self, MessageStreamError> {
         self.check_message_operation("flush_response", |this| {
             if !this.message.header().is_empty() {
                 this.message.header().check_pseudo()?;
@@ -251,7 +251,7 @@ impl Response {
         Ok(self)
     }
 
-    pub fn as_sink<B: Buf>(&mut self) -> impl Sink<B, Error = StreamError> {
+    pub fn as_sink<B: Buf>(&mut self) -> impl Sink<B, Error = MessageStreamError> {
         crate::message::stream::unfold::write::unfold(
             self,
             async |request: &mut Self, buf: B| {
@@ -269,7 +269,7 @@ impl Response {
         )
     }
 
-    pub fn into_sink<B: Buf>(self) -> impl Sink<B, Error = StreamError> {
+    pub fn into_sink<B: Buf>(self) -> impl Sink<B, Error = MessageStreamError> {
         crate::message::stream::unfold::write::unfold(
             self,
             async |request: Self, buf: B| {
@@ -317,7 +317,7 @@ impl Response {
         self
     }
 
-    pub async fn close(&mut self) -> Result<(), StreamError> {
+    pub async fn close(&mut self) -> Result<(), MessageStreamError> {
         self.check_message_operation("close_response", |this| {
             this.message.header().check_pseudo()?;
             if this.message.is_interim_response() {
@@ -328,7 +328,7 @@ impl Response {
         self.stream.close_message(&mut self.message).await
     }
 
-    pub async fn cancel(&mut self, code: Code) -> Result<(), StreamError> {
+    pub async fn cancel(&mut self, code: Code) -> Result<(), MessageStreamError> {
         self.stream.cancel(code).await
     }
 
