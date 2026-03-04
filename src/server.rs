@@ -5,9 +5,13 @@ use snafu::Report;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-pub use crate::message::stream::{ReadStream, ReadToStringError, StreamError, WriteStream};
+pub use crate::message::{
+    stream::{MessageStreamError, ReadStream, WriteStream},
+    unify::ReadToStringError,
+};
 use crate::{
-    connection::{Connection, settings::Settings},
+    connection::Connection,
+    dhttp::settings::Settings,
     error::Code,
     pool::Pool,
     quic::{self, GetStreamIdExt},
@@ -122,7 +126,7 @@ where
             let mut connection_tasks = JoinSet::new();
 
             loop {
-                let (mut read_stream, write_stream) = match connection.accept_request_stream().await
+                let (mut read_stream, write_stream) = match connection.accept_message_stream().await
                 {
                     Ok(pair) => {
                         tracing::debug!("Accepted incoming request stream");
