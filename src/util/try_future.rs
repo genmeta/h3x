@@ -15,7 +15,7 @@ pin_project_lite::pin_project! {
     #[project_ref = TryFutureProjRef]
     pub enum TryFuture<T, E, F> {
         Future { #[pin] future: F },
-        Stream { #[pin] stream: T },
+        Value { #[pin] value: T },
         Error { error: E },
     }
 }
@@ -38,12 +38,12 @@ impl<T, E, F> TryFuture<T, E, F> {
         match self.as_mut().project() {
             TryFutureProj::Future { future, .. } => {
                 match ready!(future.poll(cx)) {
-                    Ok(stream) => self.set(TryFuture::Stream { stream }),
+                    Ok(value) => self.set(TryFuture::Value { value }),
                     Err(error) => self.set(TryFuture::Error { error }),
                 };
                 self.poll(cx)
             }
-            TryFutureProj::Stream { .. } | TryFutureProj::Error { .. } => {
+            TryFutureProj::Value { .. } | TryFutureProj::Error { .. } => {
                 // as_mut() returns short-lived Pin<&mut Self>, so we need to re-project without as_mut()
                 Poll::Ready(self.try_peek_mut().unwrap())
             }
@@ -56,7 +56,7 @@ impl<T, E, F> TryFuture<T, E, F> {
     {
         match self.project() {
             TryFutureProj::Future { .. } => None,
-            TryFutureProj::Stream { stream } => Some(Ok(stream)),
+            TryFutureProj::Value { value } => Some(Ok(value)),
             TryFutureProj::Error { error } => Some(Err(error.clone())),
         }
     }
