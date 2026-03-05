@@ -6,7 +6,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{FutureExt, Sink, Stream, TryFutureExt, future::BoxFuture};
+use futures::{
+    FutureExt, Sink, Stream, TryFutureExt,
+    future::{self, BoxFuture},
+};
 use rustls::{SignatureScheme, pki_types::CertificateDer, sign::CertifiedKey};
 
 use crate::{
@@ -326,8 +329,9 @@ impl quic::Listen for gm_quic::prelude::QuicListeners {
         self.accept().map_ok(|(connection, ..)| connection).boxed()
     }
 
-    fn shutdown(&self) {
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), Self::Error>> {
         self.shutdown();
+        Box::pin(future::always_ready(|| Ok(())))
     }
 }
 
@@ -343,8 +347,9 @@ impl quic::Listen for Arc<gm_quic::prelude::QuicListeners> {
             .boxed()
     }
 
-    fn shutdown(&self) {
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), Self::Error>> {
         self.as_ref().shutdown();
+        Box::pin(future::always_ready(|| Ok(())))
     }
 }
 

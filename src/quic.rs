@@ -137,7 +137,7 @@ pub trait Listen {
 
     fn accept(&self) -> BoxFuture<'_, Result<Self::Connection, Self::Error>>;
 
-    fn shutdown(&self);
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), Self::Error>>;
 }
 
 pub trait Connection:
@@ -151,8 +151,8 @@ impl<C: ManageStream + WithLocalAgent + WithRemoteAgent + Close + Send + Sync + 
 }
 
 pub trait ManageStream {
-    type StreamWriter: WriteStream + Unpin;
     type StreamReader: ReadStream + Unpin;
+    type StreamWriter: WriteStream + Unpin;
 
     #[allow(clippy::type_complexity)]
     fn open_bi(
