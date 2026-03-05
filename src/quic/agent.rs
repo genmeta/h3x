@@ -26,8 +26,11 @@ pub enum VerifyError {
 
 pub trait LocalAgent: Send + Sync + Debug {
     fn name(&self) -> &str;
+
     fn cert_chain(&self) -> &[CertificateDer<'static>];
+
     fn sign_algorithm(&self) -> rustls::SignatureAlgorithm;
+
     fn sign(
         &self,
         scheme: SignatureScheme,

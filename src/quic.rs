@@ -18,10 +18,7 @@ pub mod agent;
 
 use crate::{error::Code, varint::VarInt};
 
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
 pub enum StreamError {
@@ -79,10 +76,7 @@ impl From<io::Error> for StreamError {
     }
 }
 
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
 #[snafu(display("transport error (0x{kind:x} in frame 0x{frame_type:x}): {reason}"))]
@@ -92,10 +86,7 @@ pub struct TransportError {
     pub reason: Cow<'static, str>,
 }
 
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
 #[snafu(display("application error ({code}): {reason}"))]
@@ -104,10 +95,7 @@ pub struct ApplicationError {
     pub reason: Cow<'static, str>,
 }
 
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Snafu, Clone)]
 #[snafu(visibility(pub))]
 pub enum ConnectionError {

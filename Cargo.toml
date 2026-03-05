@@ -29,33 +29,47 @@ tracing = "0.1"
 matchit = "0.9"
 x509-parser = "0.18"
 tower-service = "0.3"
-serde = { version = "1", features = ["derive"], optional = true }
 
+# feature gm-quic
 # gm-quic = { git = "https://github.com/genmeta/gm-quic.git", branch = "main", optional = true }
 gm-quic = { path = "../gm-quic/gm-quic", optional = true }
 
+# feature hyper
 http-body = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
-hyper = { version = "1", features = ["http2"] }
+hyper = { version = "1", features = ["http2"], optional = true }
+
+# feature serde
+serde = { version = "1", features = ["derive"], optional = true }
+
+# feature remoc
+remoc = { version = "0.18", default-features = false, optional = true, features = [
+    "remoc_macro",
+    "rtc",
+    "serde",
+    # TODO: remove this
+    "default-codec-postbag",
+] }
 
 [features]
-default = ['gm-quic', 'hyper']
-gm-quic = ['dep:gm-quic']
-hyper = ['dep:http-body', 'dep:http-body-util']
+default = ["gm-quic", "hyper", "remoc"]
+gm-quic = ["dep:gm-quic"]
+hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
+remoc = ["dep:remoc", "serde"]
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = [
-    'form', # (default)
-    # 'http1',    # (default)
-    'json',         # (default)
-    'matched-path', # (default)
-    'original-uri', # (default)
-    'query',        # (default)
-    'tokio',        # (default)
-    'tower-log',    # (default)
-    'tracing',      # (default)
-    'macros',       # for debug_handler
+    "form", # (default)
+    # "http1",    # (default)
+    "json",         # (default)
+    "matched-path", # (default)
+    "original-uri", # (default)
+    "query",        # (default)
+    "tokio",        # (default)
+    "tower-log",    # (default)
+    "tracing",      # (default)
+    "macros",       # for debug_handler
 ] }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",

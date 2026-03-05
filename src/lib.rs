@@ -20,3 +20,6 @@ pub mod gm_quic;
 
 #[cfg(feature = "hyper")]
 pub mod hyper;
+
+#[cfg(feature = "remoc")]
+pub mod remoc;
