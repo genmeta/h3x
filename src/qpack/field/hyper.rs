@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use http::{HeaderName, Request, Response, Uri, request, response};
+use http::{HeaderName, Request, Response, Uri, Version, request, response};
 use snafu::OptionExt;
 
 use super::{
@@ -132,7 +132,11 @@ impl TryFrom<FieldSection> for request::Parts {
         let method =
             method.context(malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu)?;
 
-        let mut request = Request::builder().uri(uri).method(method).body(())?;
+        let mut request = Request::builder()
+            .uri(uri)
+            .method(method)
+            .version(Version::HTTP_3)
+            .body(())?;
         *request.headers_mut() = value.header_map;
 
         if let Some(protocol) = protocol {
@@ -165,7 +169,10 @@ impl TryFrom<FieldSection> for response::Parts {
 
         let status =
             status.context(malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu)?;
-        let mut response = Response::builder().status(status).body(())?;
+        let mut response = Response::builder()
+            .status(status)
+            .version(Version::HTTP_3)
+            .body(())?;
         *response.headers_mut() = value.header_map;
         Ok(response.into_parts().0)
     }

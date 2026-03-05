@@ -12,6 +12,9 @@ use futures::Sink;
 use super::super::{MessageStreamError, WriteStream};
 use crate::codec::SinkWriter;
 
+pub type BoxStreamWriter<'s> =
+    SinkWriter<Pin<Box<dyn Sink<Bytes, Error = MessageStreamError> + Send + 's>>>;
+
 pin_project_lite::pin_project! {
     #[project = UnfoldStateProj]
     #[project_replace = UnfoldStateProjReplace]
@@ -170,6 +173,10 @@ impl WriteStream {
         SinkWriter::new(self.as_bytes_sink())
     }
 
+    pub fn as_box_writer(&mut self) -> BoxStreamWriter<'_> {
+        SinkWriter::new(Box::pin(self.as_bytes_sink()))
+    }
+
     pub fn into_bytes_sink<B: Buf>(self) -> impl Sink<B, Error = MessageStreamError> {
         unfold(
             self,
@@ -181,5 +188,9 @@ impl WriteStream {
 
     pub fn into_writer(self) -> SinkWriter<impl Sink<Bytes, Error = MessageStreamError>> {
         SinkWriter::new(self.into_bytes_sink())
+    }
+
+    pub fn into_box_writer(self) -> BoxStreamWriter<'static> {
+        SinkWriter::new(Box::pin(self.into_bytes_sink()))
     }
 }

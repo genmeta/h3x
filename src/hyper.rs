@@ -1,23 +1,15 @@
 pub mod upgrade {
-    use std::{future::poll_fn, pin::Pin};
+    use std::future::poll_fn;
 
-    use bytes::Bytes;
-    use futures::{Sink, Stream};
-
-    pub use crate::message::stream::hyper::upgrade::HasRemainingStream;
-    use crate::{
-        codec,
-        message::stream::{MessageStreamError, ReadStream, WriteStream, hyper::upgrade::Sealed},
+    use crate::message::stream::{ReadStream, WriteStream, hyper::upgrade::Sealed};
+    pub use crate::message::stream::{
+        hyper::upgrade::HasRemainingStream,
+        unfold::{read::BoxStreamReader, write::BoxStreamWriter},
     };
-
-    pub type StreamReader =
-        codec::StreamReader<Pin<Box<dyn Stream<Item = Result<Bytes, MessageStreamError>> + Send>>>;
-    pub type StreamWriter =
-        codec::SinkWriter<Pin<Box<dyn Sink<Bytes, Error = MessageStreamError> + Send>>>;
 
     pub async fn on(
         mut message: impl HasRemainingStream<ReadStream> + HasRemainingStream<WriteStream>,
-    ) -> Option<(StreamReader, StreamWriter)> {
+    ) -> Option<(BoxStreamReader<'static>, BoxStreamWriter<'static>)> {
         let write_stream = poll_fn(|cx| Sealed::<WriteStream>::poll_extract(&mut message, cx))
             .await?
             .await?;
@@ -25,8 +17,8 @@ pub mod upgrade {
             .await?
             .await?;
         Some((
-            StreamReader::new(Box::pin(read_stream.into_bytes_stream())),
-            StreamWriter::new(Box::pin(write_stream.into_bytes_sink())),
+            read_stream.into_box_reader(),
+            write_stream.into_box_writer(),
         ))
     }
 }
