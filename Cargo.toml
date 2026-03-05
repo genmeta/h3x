@@ -18,8 +18,11 @@ http = "1"
 httlib-huffman = "0.3"
 pin-project-lite = "0.2"
 ring = "0.17"
-rustls = { version = "0.23", default-features = false, features = ["logging", "std"] }
-snafu = "0.8"
+rustls = { version = "0.23", default-features = false, features = [
+    "logging",
+    "std",
+] }
+snafu = "0.9"
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
 tracing = "0.1"
@@ -58,7 +61,6 @@ rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "logging",
 ] }
-snafu = "0.8"
 tokio = { version = "1", features = [
     "macros",
     "test-util",
