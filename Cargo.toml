@@ -26,7 +26,7 @@ tracing = "0.1"
 matchit = "0.9"
 x509-parser = "0.18"
 tower-service = "0.3"
-rkyv = { version = "0.8", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 
 # gm-quic = { git = "https://github.com/genmeta/gm-quic.git", branch = "main", optional = true }
 gm-quic = { path = "../gm-quic/gm-quic", optional = true }
@@ -39,7 +39,7 @@ hyper = { version = "1", features = ["http2"] }
 default = ['gm-quic', 'hyper']
 gm-quic = ['dep:gm-quic']
 hyper = ['dep:http-body', 'dep:http-body-util']
-rkyv = ["dep:rkyv"]
+serde = ["dep:serde"]
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = [

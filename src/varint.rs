@@ -13,8 +13,8 @@ use crate::codec::{Decode, Encode};
 /// See [variable-length integers](https://www.rfc-editor.org/rfc/rfc9000.html#name-variable-length-integer-enc)
 /// of [QUIC](https://www.rfc-editor.org/rfc/rfc9000.html) for more details.
 #[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize)
 )]
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct VarInt(u64);
