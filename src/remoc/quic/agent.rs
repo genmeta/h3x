@@ -4,57 +4,59 @@ use rustls::{
     pki_types::{CertificateDer, SubjectPublicKeyInfoDer},
 };
 
-use crate::quic::agent::{self, SignError, VerifyError};
-
-use super::{
-    RemoteError, SerdeCertificateDer, SerdeSignatureAlgorithm, SerdeSignatureScheme,
+use super::serde_types::{
+    SerdeCertificateDer, SerdeSignatureAlgorithm, SerdeSignatureScheme,
     SerdeSubjectPublicKeyInfoDer,
+};
+use crate::quic::{
+    self,
+    agent::{self, SignError, VerifyError},
 };
 
 /// Remote trait for [`agent::LocalAgent`], exposing all 6 methods over remoc RTC.
 #[remoc::rtc::remote]
-pub trait RemoteLocalAgent: Send + Sync {
-    async fn name(&self) -> Result<String, RemoteError>;
-    async fn cert_chain(&self) -> Result<Vec<SerdeCertificateDer>, RemoteError>;
-    async fn sign_algorithm(&self) -> Result<SerdeSignatureAlgorithm, RemoteError>;
+pub trait LocalAgent: Send + Sync {
+    async fn name(&self) -> Result<String, quic::ConnectionError>;
+    async fn cert_chain(&self) -> Result<Vec<SerdeCertificateDer>, quic::ConnectionError>;
+    async fn sign_algorithm(&self) -> Result<SerdeSignatureAlgorithm, quic::ConnectionError>;
     async fn sign(
         &self,
         scheme: SerdeSignatureScheme,
         data: Vec<u8>,
-    ) -> Result<Vec<u8>, RemoteError>;
-    async fn public_key(&self) -> Result<SerdeSubjectPublicKeyInfoDer, RemoteError>;
+    ) -> Result<Vec<u8>, quic::ConnectionError>;
+    async fn public_key(&self) -> Result<SerdeSubjectPublicKeyInfoDer, quic::ConnectionError>;
     async fn verify(
         &self,
         scheme: SerdeSignatureScheme,
         data: Vec<u8>,
         signature: Vec<u8>,
-    ) -> Result<bool, RemoteError>;
+    ) -> Result<bool, quic::ConnectionError>;
 }
 
 /// Remote trait for [`agent::RemoteAgent`], exposing all 4 methods over remoc RTC.
 #[remoc::rtc::remote]
-pub trait RemoteRemoteAgent: Send + Sync {
-    async fn name(&self) -> Result<String, RemoteError>;
-    async fn cert_chain(&self) -> Result<Vec<SerdeCertificateDer>, RemoteError>;
-    async fn public_key(&self) -> Result<SerdeSubjectPublicKeyInfoDer, RemoteError>;
+pub trait RemoteAgent: Send + Sync {
+    async fn name(&self) -> Result<String, quic::ConnectionError>;
+    async fn cert_chain(&self) -> Result<Vec<SerdeCertificateDer>, quic::ConnectionError>;
+    async fn public_key(&self) -> Result<SerdeSubjectPublicKeyInfoDer, quic::ConnectionError>;
     async fn verify(
         &self,
         scheme: SerdeSignatureScheme,
         data: Vec<u8>,
         signature: Vec<u8>,
-    ) -> Result<bool, RemoteError>;
+    ) -> Result<bool, quic::ConnectionError>;
 }
 
 /// Client-side wrapper around [`RemoteLocalAgentClient`] that caches synchronous
 /// fields eagerly and implements [`agent::LocalAgent`].
-pub struct CachedRemoteLocalAgent {
-    client: RemoteLocalAgentClient,
+pub struct RemoteLocalAgent {
+    client: LocalAgentClient,
     name: String,
     cert_chain: Vec<CertificateDer<'static>>,
     sign_algorithm: rustls::SignatureAlgorithm,
 }
 
-impl std::fmt::Debug for CachedRemoteLocalAgent {
+impl std::fmt::Debug for RemoteLocalAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedRemoteLocalAgent")
             .field("name", &self.name)
@@ -63,13 +65,17 @@ impl std::fmt::Debug for CachedRemoteLocalAgent {
     }
 }
 
-impl CachedRemoteLocalAgent {
+impl RemoteLocalAgent {
     /// Create a new cached wrapper by eagerly fetching synchronous fields from
     /// the remote agent.
-    pub async fn new(client: RemoteLocalAgentClient) -> Result<Self, RemoteError> {
+    pub async fn new(client: LocalAgentClient) -> Result<Self, quic::ConnectionError> {
         let name = client.name().await?;
-        let cert_chain: Vec<CertificateDer<'static>> =
-            client.cert_chain().await?.into_iter().map(Into::into).collect();
+        let cert_chain: Vec<CertificateDer<'static>> = client
+            .cert_chain()
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect();
         let sign_algorithm: rustls::SignatureAlgorithm = client.sign_algorithm().await?.into();
         Ok(Self {
             client,
@@ -80,7 +86,7 @@ impl CachedRemoteLocalAgent {
     }
 }
 
-impl agent::LocalAgent for CachedRemoteLocalAgent {
+impl agent::LocalAgent for RemoteLocalAgent {
     fn name(&self) -> &str {
         &self.name
     }
@@ -128,14 +134,14 @@ impl agent::LocalAgent for CachedRemoteLocalAgent {
 
 /// Client-side wrapper around [`RemoteRemoteAgentClient`] that caches synchronous
 /// fields eagerly and implements [`agent::RemoteAgent`].
-pub struct CachedRemoteRemoteAgent {
+pub struct RemoteRemoteAgent {
     #[allow(dead_code)]
-    client: RemoteRemoteAgentClient,
+    client: RemoteAgentClient,
     name: String,
     cert_chain: Vec<CertificateDer<'static>>,
 }
 
-impl std::fmt::Debug for CachedRemoteRemoteAgent {
+impl std::fmt::Debug for RemoteRemoteAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedRemoteRemoteAgent")
             .field("name", &self.name)
@@ -143,13 +149,17 @@ impl std::fmt::Debug for CachedRemoteRemoteAgent {
     }
 }
 
-impl CachedRemoteRemoteAgent {
+impl RemoteRemoteAgent {
     /// Create a new cached wrapper by eagerly fetching synchronous fields from
     /// the remote agent.
-    pub async fn new(client: RemoteRemoteAgentClient) -> Result<Self, RemoteError> {
+    pub async fn new(client: RemoteAgentClient) -> Result<Self, quic::ConnectionError> {
         let name = client.name().await?;
-        let cert_chain: Vec<CertificateDer<'static>> =
-            client.cert_chain().await?.into_iter().map(Into::into).collect();
+        let cert_chain: Vec<CertificateDer<'static>> = client
+            .cert_chain()
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect();
         Ok(Self {
             client,
             name,
@@ -158,7 +168,7 @@ impl CachedRemoteRemoteAgent {
     }
 }
 
-impl agent::RemoteAgent for CachedRemoteRemoteAgent {
+impl agent::RemoteAgent for RemoteRemoteAgent {
     fn name(&self) -> &str {
         &self.name
     }
