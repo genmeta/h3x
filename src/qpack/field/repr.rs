@@ -10,8 +10,8 @@ use crate::{
         Decode, DecodeError, DecodeStreamError, Encode, EncodeError, EncodeExt, EncodeStreamError,
     },
     connection::StreamError,
+    dhttp::frame::Frame,
     error::Code,
-    frame::Frame,
     qpack::{
         integer::{decode_integer, encode_integer},
         string::{decode_string, encode_string},

@@ -27,13 +27,14 @@ use crate::{
         BoxPeekableBiStream, BoxPeekableUniStream, DecodeExt, Encode, EncodeExt, Feed, SinkWriter,
         StreamReader,
     },
-    connection::{
-        ConnectionGoaway, ConnectionState, QuicConnection, StreamError,
+    connection::{ConnectionGoaway, ConnectionState, QuicConnection, StreamError},
+    dhttp::{
+        frame::{Frame, stream::FrameStream},
+        goaway::Goaway,
+        settings::Settings,
         stream::UnidirectionalStream,
     },
-    dhttp::settings::Settings,
     error::{Code, H3CriticalStreamClosed, H3FrameUnexpected, H3IdError, H3StreamCreationError},
-    frame::{Frame, goaway::Goaway, stream::FrameStream},
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     quic::{self, CancelStreamExt, ConnectionError, GetStreamIdExt, StopStreamExt},
     util::{ring_channel::RingChannel, set_once::SetOnce, watch::Watch},

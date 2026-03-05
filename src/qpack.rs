@@ -20,9 +20,11 @@ mod tests {
 
     use crate::{
         codec::{DecodeExt, EncodeExt, SinkWriter, StreamReader},
-        connection::stream::UnidirectionalStream,
-        dhttp::settings::Settings,
-        frame::{Frame, stream::FrameStream},
+        dhttp::{
+            frame::{Frame, stream::FrameStream},
+            settings::Settings,
+            stream::UnidirectionalStream,
+        },
         qpack::{
             algorithm::{HuffmanAlways, StaticCompressAlgo},
             decoder::{Decoder, MessageStreamReader},

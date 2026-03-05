@@ -11,8 +11,8 @@ use crate::{
     buflist::{BufList, BuflistCursor},
     codec::EncodeError,
     connection,
+    dhttp::frame::Frame,
     error::Code,
-    frame::Frame,
     message::stream::{DEFAULT_COMPRESS_ALGO, MessageStreamError, ReadStream, WriteStream},
     qpack::{
         encoder::EncodeHeaderSectionError,

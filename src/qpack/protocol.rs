@@ -19,10 +19,10 @@ use crate::{
         BoxPeekableBiStream, BoxPeekableUniStream, BoxQuicStreamReader, DecodeExt, EncodeExt,
         SinkWriter,
     },
-    connection::{ConnectionState, QuicConnection, StreamError, stream::UnidirectionalStream},
-    dhttp::{protocol::DHttpProtocol, settings::Settings},
+    connection::{ConnectionState, QuicConnection, StreamError},
+    dhttp::{protocol::DHttpProtocol, settings::Settings, stream::UnidirectionalStream},
     error::{H3CriticalStreamClosed, H3StreamCreationError},
-    protocol::{ProductProtocol, Protocols, Protocol, StreamVerdict},
+    protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     qpack::{
         decoder::{Decoder, DecoderInstruction},
         encoder::{Encoder, EncoderInstruction},
