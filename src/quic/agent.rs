@@ -8,6 +8,8 @@ use rustls::{
 use snafu::Snafu;
 use x509_parser::prelude::FromDer;
 
+use crate::quic;
+
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum SignError {
@@ -15,6 +17,8 @@ pub enum SignError {
     UnsupportedScheme { scheme: SignatureScheme },
     #[snafu(transparent)]
     Crypto { source: rustls::Error },
+    #[snafu(transparent)]
+    Connection { source: quic::ConnectionError },
 }
 
 #[derive(Debug, Snafu)]
@@ -22,6 +26,8 @@ pub enum SignError {
 pub enum VerifyError {
     #[snafu(display("unsupported signature scheme {scheme:?}"))]
     UnsupportedScheme { scheme: SignatureScheme },
+    #[snafu(transparent)]
+    Connection { source: quic::ConnectionError },
 }
 
 pub trait LocalAgent: Send + Sync + Debug {
