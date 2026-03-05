@@ -10,8 +10,8 @@ use futures::{SinkExt, StreamExt, TryStream, sink};
 use crate::{
     codec::{DecodeExt, DecodeStreamError, FixedLengthReader, StreamReader},
     connection::StreamError,
+    dhttp::frame::Frame,
     error::Code,
-    frame::Frame,
     quic::{self, GetStreamId, StopStream},
     varint::VarInt,
 };

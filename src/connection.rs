@@ -2,8 +2,6 @@ use std::{
     any::Any, error::Error as StdError, fmt::Debug, io, marker::PhantomData, ops, sync::Arc,
 };
 
-pub mod stream;
-
 use futures::FutureExt;
 use snafu::Snafu;
 use tracing::Instrument;

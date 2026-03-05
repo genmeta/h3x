@@ -7,8 +7,8 @@ use crate::{
     buflist::BufList,
     codec::{Decode, DecodeExt, DecodeStreamError, Encode, EncodeExt},
     connection::StreamError,
+    dhttp::frame::Frame,
     error::{Code, H3CriticalStreamClosed},
-    frame::Frame,
     varint::VarInt,
 };
 

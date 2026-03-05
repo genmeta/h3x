@@ -17,9 +17,8 @@ use crate::{
     buflist::BufList,
     codec::{Decode, DecodeStreamError, Encode, EncodeError, EncodeStreamError, Feed},
     connection::StreamError,
-    dhttp::settings::Settings,
+    dhttp::{frame::Frame, settings::Settings},
     error::{Code, H3CriticalStreamClosed, HasErrorCode},
-    frame::Frame,
     qpack::{
         algorithm::Algorithm,
         decoder::DecoderInstruction,

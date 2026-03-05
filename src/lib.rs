@@ -6,7 +6,6 @@ pub mod codec;
 pub mod connection;
 pub mod dhttp;
 pub mod error;
-pub mod frame;
 pub mod message;
 pub mod pool;
 pub mod protocol;

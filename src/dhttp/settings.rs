@@ -13,9 +13,9 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use crate::{
     buflist::BufList,
     codec::{Decode, DecodeExt, DecodeStreamError, Encode, EncodeExt},
-    connection::{StreamError, stream::UnidirectionalStream},
+    connection::StreamError,
+    dhttp::{frame::Frame, stream::UnidirectionalStream},
     error::{Code, H3CriticalStreamClosed, HasErrorCode},
-    frame::Frame,
     quic,
     varint::VarInt,
 };

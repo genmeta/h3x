@@ -12,16 +12,18 @@ use snafu::Snafu;
 use crate::{
     codec::{EncodeError, EncodeExt, SinkWriter, StreamReader},
     connection::{self, ConnectionGoaway, ConnectionState, QuicConnection},
-    dhttp::protocol::{
-        AcceptRawMessageStreamError, BoxDynQuicStreamWriter, BoxDynQuicStreamReader, DHttpState,
-        InitialRawMessageStreamError,
+    dhttp::{
+        frame::{
+            Frame,
+            stream::{FrameStream, ReadableFrame},
+        },
+        goaway::Goaway,
+        protocol::{
+            AcceptRawMessageStreamError, BoxDynQuicStreamReader, BoxDynQuicStreamWriter,
+            DHttpState, InitialRawMessageStreamError,
+        },
     },
     error::Code,
-    frame::{
-        Frame,
-        goaway::Goaway,
-        stream::{FrameStream, ReadableFrame},
-    },
     qpack::{
         algorithm::{HuffmanAlways, StaticCompressAlgo},
         encoder::EncodeHeaderSectionError,

@@ -1,4 +1,3 @@
-pub mod goaway;
 pub mod stream;
 
 use std::{
@@ -324,7 +323,7 @@ mod tests {
     use super::*;
     use crate::{
         codec::{DecodeError, EncodeExt, SinkWriter},
-        frame::stream::FrameStream,
+        dhttp::frame::stream::FrameStream,
     };
 
     fn to_pre_byte_stream(
