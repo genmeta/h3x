@@ -191,3 +191,138 @@ impl agent::RemoteAgent for RemoteRemoteAgent {
         Box::pin(std::future::ready(result))
     }
 }
+
+/// Server-side wrapper that implements the remoc [`LocalAgent`] RTC trait
+/// for any local [`agent::LocalAgent`] implementation.
+///
+/// Uses generics instead of dynamic dispatch. Stores the agent directly
+/// since the RTC trait uses `&self` methods.
+pub struct LocalLocalAgent<A> {
+    inner: A,
+}
+
+impl<A> LocalLocalAgent<A> {
+    /// Wrap a local agent so it can be served over remoc RTC.
+    pub fn new(agent: A) -> Self {
+        Self { inner: agent }
+    }
+}
+
+impl<A> LocalAgent for LocalLocalAgent<A>
+where
+    A: agent::LocalAgent + Send + Sync,
+{
+    async fn name(&self) -> Result<String, quic::ConnectionError> {
+        Ok(self.inner.name().to_owned())
+    }
+
+    async fn cert_chain(&self) -> Result<Vec<SerdeCertificateDer>, quic::ConnectionError> {
+        Ok(self
+            .inner
+            .cert_chain()
+            .iter()
+            .cloned()
+            .map(SerdeCertificateDer::from)
+            .collect())
+    }
+
+    async fn sign_algorithm(&self) -> Result<SerdeSignatureAlgorithm, quic::ConnectionError> {
+        Ok(SerdeSignatureAlgorithm::from(self.inner.sign_algorithm()))
+    }
+
+    async fn sign(
+        &self,
+        scheme: SerdeSignatureScheme,
+        data: Vec<u8>,
+    ) -> Result<Vec<u8>, quic::ConnectionError> {
+        self.inner
+            .sign(SignatureScheme::from(scheme), &data)
+            .await
+            .map_err(|e| quic::ConnectionError::Transport {
+                source: quic::TransportError {
+                    kind: crate::varint::VarInt::from_u32(0x01),
+                    frame_type: crate::varint::VarInt::from_u32(0x00),
+                    reason: format!("sign error: {e}").into(),
+                },
+            })
+    }
+
+    async fn public_key(&self) -> Result<SerdeSubjectPublicKeyInfoDer, quic::ConnectionError> {
+        Ok(SerdeSubjectPublicKeyInfoDer::from(self.inner.public_key()))
+    }
+
+    async fn verify(
+        &self,
+        scheme: SerdeSignatureScheme,
+        data: Vec<u8>,
+        signature: Vec<u8>,
+    ) -> Result<bool, quic::ConnectionError> {
+        self.inner
+            .verify(SignatureScheme::from(scheme), &data, &signature)
+            .await
+            .map_err(|e| quic::ConnectionError::Transport {
+                source: quic::TransportError {
+                    kind: crate::varint::VarInt::from_u32(0x01),
+                    frame_type: crate::varint::VarInt::from_u32(0x00),
+                    reason: format!("verify error: {e}").into(),
+                },
+            })
+    }
+}
+
+/// Server-side wrapper that implements the remoc [`RemoteAgent`] RTC trait
+/// for any local [`agent::RemoteAgent`] implementation.
+///
+/// Uses generics instead of dynamic dispatch. Stores the agent directly
+/// since the RTC trait uses `&self` methods.
+pub struct LocalRemoteAgent<A> {
+    inner: A,
+}
+
+impl<A> LocalRemoteAgent<A> {
+    /// Wrap a remote agent so it can be served over remoc RTC.
+    pub fn new(agent: A) -> Self {
+        Self { inner: agent }
+    }
+}
+
+impl<A> RemoteAgent for LocalRemoteAgent<A>
+where
+    A: agent::RemoteAgent + Send + Sync,
+{
+    async fn name(&self) -> Result<String, quic::ConnectionError> {
+        Ok(self.inner.name().to_owned())
+    }
+
+    async fn cert_chain(&self) -> Result<Vec<SerdeCertificateDer>, quic::ConnectionError> {
+        Ok(self
+            .inner
+            .cert_chain()
+            .iter()
+            .cloned()
+            .map(SerdeCertificateDer::from)
+            .collect())
+    }
+
+    async fn public_key(&self) -> Result<SerdeSubjectPublicKeyInfoDer, quic::ConnectionError> {
+        Ok(SerdeSubjectPublicKeyInfoDer::from(self.inner.public_key()))
+    }
+
+    async fn verify(
+        &self,
+        scheme: SerdeSignatureScheme,
+        data: Vec<u8>,
+        signature: Vec<u8>,
+    ) -> Result<bool, quic::ConnectionError> {
+        self.inner
+            .verify(SignatureScheme::from(scheme), &data, &signature)
+            .await
+            .map_err(|e| quic::ConnectionError::Transport {
+                source: quic::TransportError {
+                    kind: crate::varint::VarInt::from_u32(0x01),
+                    frame_type: crate::varint::VarInt::from_u32(0x00),
+                    reason: format!("verify error: {e}").into(),
+                },
+            })
+    }
+}

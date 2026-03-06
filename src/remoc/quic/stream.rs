@@ -1,10 +1,13 @@
 use std::{
+    future::{Future, poll_fn},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll, ready},
 };
 
 use bytes::Bytes;
-use futures::{Sink, Stream, future::Either};
+use futures::{Sink, SinkExt, Stream, StreamExt, future::Either};
+use remoc::prelude::ServerSharedMut;
 use tokio_util::sync::CancellationToken;
 
 use crate::{quic, varint::VarInt};
@@ -185,6 +188,33 @@ pub async fn new_remote_read_stream(
             (client, res)
         },
     })
+}
+
+/// Serializable wrapper around a remoc-generated [`ReadStreamClient`].
+///
+/// Unlike [`RemoteQuicConnection`](super::RemoteQuicConnection) which directly
+/// implements the `quic::Connection` trait, `RemoteReadStream` requires an
+/// explicit [`into_quic`](Self::into_quic) conversion step because the standard
+/// `quic::ReadStream` trait uses poll-based methods (`Stream`, `StopStream`)
+/// that cannot directly bridge to the async RTC client methods.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct RemoteReadStream {
+    client: ReadStreamClient,
+}
+
+impl RemoteReadStream {
+    /// Create a new wrapper from a remoc-generated read stream client.
+    pub fn new(client: ReadStreamClient) -> Self {
+        Self { client }
+    }
+
+    /// Convert into a type implementing [`quic::ReadStream`].
+    ///
+    /// This async step is necessary because the poll-based `quic::ReadStream`
+    /// trait requires an initial `stream_id` query from the remote side.
+    pub async fn into_quic(self) -> Result<impl quic::ReadStream, quic::StreamError> {
+        new_remote_read_stream(self.client).await
+    }
 }
 
 /// Remote trait for writing to a QUIC stream over remoc RTC.
@@ -481,4 +511,159 @@ pub async fn new_remote_write_stream(
             (client, res)
         },
     })
+}
+
+/// Serializable wrapper around a remoc-generated [`WriteStreamClient`].
+///
+/// Unlike [`RemoteQuicConnection`](super::RemoteQuicConnection) which directly
+/// implements the `quic::Connection` trait, `RemoteWriteStream` requires an
+/// explicit [`into_quic`](Self::into_quic) conversion step because the standard
+/// `quic::WriteStream` trait uses poll-based methods (`Sink`, `CancelStream`)
+/// that cannot directly bridge to the async RTC client methods.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct RemoteWriteStream {
+    client: WriteStreamClient,
+}
+
+impl RemoteWriteStream {
+    /// Create a new wrapper from a remoc-generated write stream client.
+    pub fn new(client: WriteStreamClient) -> Self {
+        Self { client }
+    }
+
+    /// Convert into a type implementing [`quic::WriteStream`].
+    ///
+    /// This async step is necessary because the poll-based `quic::WriteStream`
+    /// trait requires an initial `stream_id` query from the remote side.
+    pub async fn into_quic(self) -> Result<impl quic::WriteStream, quic::StreamError> {
+        new_remote_write_stream(self.client).await
+    }
+}
+
+/// Server-side wrapper that implements the remoc [`ReadStream`] RTC trait
+/// for any local [`quic::ReadStream`] implementation.
+///
+/// Uses generics instead of dynamic dispatch. The inner stream is stored as
+/// `Pin<Box<S>>` to handle poll-based methods that require pinning.
+/// Since the RTC trait provides `&mut self`, exclusive access is guaranteed
+/// and no mutex is needed.
+pub struct LocalReadStream<S> {
+    inner: Pin<Box<S>>,
+}
+
+// SAFETY: `LocalReadStream` is only accessed through `&mut self` methods.
+// The RTC server wraps it in `RwLock` which provides synchronization.
+// The inner `Pin<Box<S>>` is never shared across threads without the lock.
+unsafe impl<S: Send> Sync for LocalReadStream<S> {}
+
+impl<S> LocalReadStream<S>
+where
+    S: quic::ReadStream + 'static,
+{
+    /// Wrap a local read stream so it can be served over remoc RTC.
+    pub fn new(stream: S) -> Self {
+        Self {
+            inner: Box::pin(stream),
+        }
+    }
+
+    /// Convert this local read stream into a serializable [`RemoteReadStream`]
+    /// and a future that serves the RTC connection.
+    ///
+    /// The returned future must be polled (e.g. spawned) for the remote stream
+    /// to function. When the future completes, the RTC serving session has ended.
+    pub fn into_remote(self) -> (RemoteReadStream, impl Future<Output = ()> + Send + 'static) {
+        let (server, client) =
+            ReadStreamServerSharedMut::new(Arc::new(tokio::sync::RwLock::new(self)), 1);
+        let remote = RemoteReadStream::new(client);
+        let fut = async move {
+            let _ = server.serve(true).await;
+        };
+        (remote, fut)
+    }
+}
+
+impl<S> ReadStream for LocalReadStream<S>
+where
+    S: quic::ReadStream + Send,
+{
+    async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError> {
+        poll_fn(|cx| self.inner.as_mut().poll_stream_id(cx)).await
+    }
+
+    async fn read(&mut self) -> Result<Option<Bytes>, quic::StreamError> {
+        self.inner.as_mut().next().await.transpose()
+    }
+
+    async fn stop(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
+        poll_fn(|cx| self.inner.as_mut().poll_stop(cx, code)).await
+    }
+}
+
+/// Server-side wrapper that implements the remoc [`WriteStream`] RTC trait
+/// for any local [`quic::WriteStream`] implementation.
+///
+/// Uses generics instead of dynamic dispatch. The inner stream is stored as
+/// `Pin<Box<S>>` to handle poll-based methods that require pinning.
+/// Since the RTC trait provides `&mut self`, exclusive access is guaranteed
+/// and no mutex is needed.
+pub struct LocalWriteStream<S> {
+    inner: Pin<Box<S>>,
+}
+
+// SAFETY: `LocalWriteStream` is only accessed through `&mut self` methods.
+// The RTC server wraps it in `RwLock` which provides synchronization.
+// The inner `Pin<Box<S>>` is never shared across threads without the lock.
+unsafe impl<S: Send> Sync for LocalWriteStream<S> {}
+
+impl<S> LocalWriteStream<S>
+where
+    S: quic::WriteStream + 'static,
+{
+    /// Wrap a local write stream so it can be served over remoc RTC.
+    pub fn new(stream: S) -> Self {
+        Self {
+            inner: Box::pin(stream),
+        }
+    }
+
+    /// Convert this local write stream into a serializable [`RemoteWriteStream`]
+    /// and a future that serves the RTC connection.
+    ///
+    /// The returned future must be polled (e.g. spawned) for the remote stream
+    /// to function. When the future completes, the RTC serving session has ended.
+    pub fn into_remote(self) -> (RemoteWriteStream, impl Future<Output = ()> + Send + 'static) {
+        let (server, client) =
+            WriteStreamServerSharedMut::new(Arc::new(tokio::sync::RwLock::new(self)), 1);
+        let remote = RemoteWriteStream::new(client);
+        let fut = async move {
+            let _ = server.serve(true).await;
+        };
+        (remote, fut)
+    }
+}
+
+impl<S> WriteStream for LocalWriteStream<S>
+where
+    S: quic::WriteStream + Send,
+{
+    async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError> {
+        poll_fn(|cx| self.inner.as_mut().poll_stream_id(cx)).await
+    }
+
+    async fn write(&mut self, data: Bytes) -> Result<(), quic::StreamError> {
+        self.inner.as_mut().send(data).await
+    }
+
+    async fn flush(&mut self) -> Result<(), quic::StreamError> {
+        poll_fn(|cx| self.inner.as_mut().poll_flush(cx)).await
+    }
+
+    async fn shutdown(&mut self) -> Result<(), quic::StreamError> {
+        poll_fn(|cx| self.inner.as_mut().poll_close(cx)).await
+    }
+
+    async fn cancel(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
+        poll_fn(|cx| self.inner.as_mut().poll_cancel(cx, code)).await
+    }
 }
