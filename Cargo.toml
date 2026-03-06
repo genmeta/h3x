@@ -47,12 +47,10 @@ remoc = { version = "0.18", default-features = false, optional = true, features 
     "remoc_macro",
     "rtc",
     "serde",
-    # TODO: remove this
-    "default-codec-postbag",
 ] }
 
 [features]
-default = ["gm-quic", "hyper", "remoc"]
+default = ["gm-quic", "hyper"]
 gm-quic = ["dep:gm-quic"]
 hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
