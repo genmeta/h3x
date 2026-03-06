@@ -387,7 +387,7 @@ impl FieldSection {
     }
 }
 
-impl<S: Stream<Item = Result<FieldLine, StreamError>>> Decode<FieldSection> for S {
+impl<S: Stream<Item = Result<FieldLine, StreamError>> + Send> Decode<FieldSection> for S {
     type Error = StreamError;
 
     async fn decode(self) -> Result<FieldSection, Self::Error> {

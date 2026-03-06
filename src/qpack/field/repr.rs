@@ -57,7 +57,7 @@ pub struct EncodedFieldSectionPrefix {
     pub base: u64,
 }
 
-impl<S: AsyncRead> Decode<EncodedFieldSectionPrefix> for S {
+impl<S: AsyncRead + Send> Decode<EncodedFieldSectionPrefix> for S {
     type Error = StreamError;
 
     async fn decode(self) -> Result<EncodedFieldSectionPrefix, Self::Error> {
@@ -97,7 +97,7 @@ impl<S: AsyncRead> Decode<EncodedFieldSectionPrefix> for S {
     }
 }
 
-impl<S: AsyncWrite> Encode<EncodedFieldSectionPrefix> for S {
+impl<S: AsyncWrite + Send> Encode<EncodedFieldSectionPrefix> for S {
     type Output = ();
 
     type Error = EncodeStreamError;
@@ -205,7 +205,7 @@ pub enum FieldLineRepresentation {
     },
 }
 
-impl<S: AsyncRead> Decode<FieldLineRepresentation> for S {
+impl<S: AsyncRead + Send> Decode<FieldLineRepresentation> for S {
     type Error = StreamError;
 
     async fn decode(self) -> Result<FieldLineRepresentation, Self::Error> {
@@ -286,7 +286,7 @@ impl<S: AsyncRead> Decode<FieldLineRepresentation> for S {
 
 impl<S, E> Encode<FieldLineRepresentation> for S
 where
-    S: AsyncWrite + Sink<Bytes, Error = E>,
+    S: AsyncWrite + Sink<Bytes, Error = E> + Send,
     EncodeStreamError: From<E>,
 {
     type Output = ();

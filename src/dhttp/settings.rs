@@ -171,7 +171,7 @@ impl HasErrorCode for InvalidSettingValue {
     }
 }
 
-impl<S: AsyncRead> Decode<Setting> for S {
+impl<S: AsyncRead + Send> Decode<Setting> for S {
     type Error = StreamError;
 
     async fn decode(self) -> Result<Setting, Self::Error> {
@@ -193,7 +193,7 @@ impl<S: AsyncRead> Decode<Setting> for S {
     }
 }
 
-impl<S: AsyncWrite> Encode<Setting> for S {
+impl<S: AsyncWrite + Send> Encode<Setting> for S {
     type Output = ();
 
     type Error = StreamError;
@@ -222,6 +222,7 @@ pub struct Settings {
 impl<S> Decode<Settings> for S
 where
     for<'s> &'s mut S: AsyncBufRead,
+    S: Send,
 {
     type Error = StreamError;
 
@@ -359,7 +360,7 @@ impl<S: ?Sized> UnidirectionalStream<S> {
 
     pub async fn initial_control_stream(stream: S) -> Result<Self, StreamError>
     where
-        S: AsyncWrite + Unpin + Sized,
+        S: AsyncWrite + Unpin + Sized + Send,
     {
         Self::initial(UnidirectionalStream::CONTROL_STREAM_TYPE, stream)
             .await

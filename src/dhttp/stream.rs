@@ -34,7 +34,7 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl<S: AsyncRead + Unpin> Decode<UnidirectionalStream<S>> for S {
+impl<S: AsyncRead + Unpin + Send> Decode<UnidirectionalStream<S>> for S {
     type Error = StreamError;
 
     async fn decode(self) -> Result<UnidirectionalStream<S>, Self::Error> {
@@ -58,7 +58,7 @@ impl UnidirectionalStream<()> {
 impl<S: ?Sized> UnidirectionalStream<S> {
     pub async fn initial(r#type: VarInt, mut stream: S) -> Result<Self, StreamError>
     where
-        S: AsyncWrite + Unpin + Sized,
+        S: AsyncWrite + Unpin + Sized + Send,
     {
         stream.encode_one(r#type).await?;
         Ok(Self { r#type, stream })
@@ -66,7 +66,7 @@ impl<S: ?Sized> UnidirectionalStream<S> {
 
     pub async fn accept(mut stream: S) -> Result<Self, StreamError>
     where
-        S: AsyncRead + Unpin + Sized,
+        S: AsyncRead + Unpin + Sized + Send,
     {
         let r#type = stream.decode_one::<VarInt>().await.map_err(|error| {
             DecodeStreamError::from(error)

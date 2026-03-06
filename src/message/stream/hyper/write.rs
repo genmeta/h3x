@@ -44,7 +44,10 @@ impl<E: Error> Error for SendMesageError<E> {
 }
 
 impl WriteStream {
-    async fn send_hyper_body<B: Body>(&mut self, body: B) -> Result<(), SendMesageError<B::Error>> {
+    async fn send_hyper_body<B: Body>(&mut self, body: B) -> Result<(), SendMesageError<B::Error>>
+    where
+        B::Data: Send,
+    {
         let mut body = pin!(body);
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(|source| SendMesageError::Body { source })?;
@@ -84,7 +87,10 @@ impl WriteStream {
     pub async fn send_hyper_request<B: Body>(
         &mut self,
         request: http::Request<B>,
-    ) -> Result<(), SendMesageError<B::Error>> {
+    ) -> Result<(), SendMesageError<B::Error>>
+    where
+        B::Data: Send,
+    {
         let (parts, body) = request.into_parts();
         self.send_header(hyper_request_parts_to_field_lines(parts))
             .map_err(|source| SendMesageError::Stream { source })
@@ -103,7 +109,10 @@ impl WriteStream {
     pub async fn send_hyper_response<B: Body>(
         &mut self,
         response: http::Response<B>,
-    ) -> Result<(), SendMesageError<B::Error>> {
+    ) -> Result<(), SendMesageError<B::Error>>
+    where
+        B::Data: Send,
+    {
         let (parts, body) = response.into_parts();
         self.send_header(hyper_response_parts_to_field_lines(parts))
             .map_err(|source| SendMesageError::Stream { source })

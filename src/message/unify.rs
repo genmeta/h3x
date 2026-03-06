@@ -569,7 +569,7 @@ impl WriteStream {
         Ok(())
     }
 
-    pub async fn send_data(&mut self, data: impl Buf) -> Result<(), MessageStreamError> {
+    pub async fn send_data(&mut self, data: impl Buf + Send) -> Result<(), MessageStreamError> {
         let frame = Frame::new(Frame::DATA_FRAME_TYPE, data)
             .map_err(|_| MessageStreamError::DataFrameTooLarge)?;
         self.try_stream_io(async |this| Ok(this.send_frame(frame).await?))
@@ -579,7 +579,7 @@ impl WriteStream {
     pub async fn send_message_streaming_body(
         &mut self,
         message: &mut Message,
-        content: impl Buf,
+        content: impl Buf + Send,
     ) -> Result<(), MessageStreamError> {
         // if message.is_interim_response() {
         //     // malformed message

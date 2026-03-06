@@ -481,7 +481,7 @@ pub enum EncoderInstruction {
     Duplicate { index: u64 },
 }
 
-impl<S: AsyncBufRead> Decode<EncoderInstruction> for S {
+impl<S: AsyncBufRead + Send> Decode<EncoderInstruction> for S {
     type Error = StreamError;
 
     async fn decode(self) -> Result<EncoderInstruction, Self::Error> {
@@ -542,7 +542,7 @@ impl<S: AsyncBufRead> Decode<EncoderInstruction> for S {
 
 impl<S> Encode<EncoderInstruction> for S
 where
-    S: AsyncWrite + Sink<Bytes, Error = quic::StreamError>,
+    S: AsyncWrite + Sink<Bytes, Error = quic::StreamError> + Send,
 {
     type Output = ();
 

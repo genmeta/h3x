@@ -201,17 +201,24 @@ where
     }
 }
 
-impl<P: Buf, S: AsyncWrite + Sink<Bytes, Error = quic::StreamError>> Encode<Frame<P>> for S {
+impl<P: Buf + Send, S: AsyncWrite + Sink<Bytes, Error = quic::StreamError> + Send> Encode<Frame<P>>
+    for S
+{
     type Output = ();
 
     type Error = quic::StreamError;
 
-    async fn encode(self, mut frame: Frame<P>) -> Result<Self::Output, Self::Error> {
+    async fn encode(self, frame: Frame<P>) -> Result<Self::Output, Self::Error> {
+        let Frame {
+            r#type,
+            length,
+            mut payload,
+        } = frame;
         let mut stream = pin!(self);
-        stream.as_mut().encode(frame.r#type).await?;
-        stream.as_mut().encode(frame.length).await?;
-        while frame.payload.has_remaining() {
-            let bytes = frame.payload.copy_to_bytes(frame.payload.chunk().len());
+        stream.as_mut().encode(r#type).await?;
+        stream.as_mut().encode(length).await?;
+        while payload.has_remaining() {
+            let bytes = payload.copy_to_bytes(payload.chunk().len());
             stream.as_mut().feed(bytes).await?;
         }
         Ok(())
@@ -220,7 +227,7 @@ impl<P: Buf, S: AsyncWrite + Sink<Bytes, Error = quic::StreamError>> Encode<Fram
 
 impl<P1, P> Decode<Frame<P1>> for Frame<P>
 where
-    P: Decode<P1>,
+    P: Decode<P1> + Send,
 {
     type Error = P::Error;
 
@@ -241,7 +248,7 @@ where
 
 impl<S> Decode<Frame<BufList>> for &mut StreamReader<S>
 where
-    S: TryStream<Ok = Bytes, Error = quic::StreamError> + Unpin,
+    S: TryStream<Ok = Bytes, Error = quic::StreamError> + Unpin + Send,
 {
     type Error = StreamError;
 

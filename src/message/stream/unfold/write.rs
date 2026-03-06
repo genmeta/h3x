@@ -160,7 +160,7 @@ where
 }
 
 impl WriteStream {
-    pub fn as_bytes_sink<B: Buf>(&mut self) -> impl Sink<B, Error = MessageStreamError> {
+    pub fn as_bytes_sink<B: Buf + Send>(&mut self) -> impl Sink<B, Error = MessageStreamError> {
         unfold(
             self,
             async |stream: &mut WriteStream, buf: B| stream.send_data(buf).await.map(|_| stream),
@@ -177,7 +177,7 @@ impl WriteStream {
         SinkWriter::new(Box::pin(self.as_bytes_sink()))
     }
 
-    pub fn into_bytes_sink<B: Buf>(self) -> impl Sink<B, Error = MessageStreamError> {
+    pub fn into_bytes_sink<B: Buf + Send>(self) -> impl Sink<B, Error = MessageStreamError> {
         unfold(
             self,
             async |mut stream: WriteStream, buf: B| stream.send_data(buf).await.map(|_| stream),

@@ -27,7 +27,7 @@ pin_project_lite::pin_project! {
 
 pub type ReadableFrame<'s, S> = Frame<Pin<&'s mut FixedLengthReader<StreamReader<S>>>>;
 
-impl<S: ?Sized> FrameStream<S>
+impl<S: ?Sized + Send> FrameStream<S>
 where
     S: TryStream<Ok = Bytes, Error = quic::StreamError>,
 {

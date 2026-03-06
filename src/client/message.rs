@@ -392,7 +392,10 @@ impl Request {
         }
     }
 
-    pub async fn write(&mut self, content: impl Buf) -> Result<&mut Self, MessageStreamError> {
+    pub async fn write(
+        &mut self,
+        content: impl Buf + Send,
+    ) -> Result<&mut Self, MessageStreamError> {
         self.check_message_operation("write_streaming_body", |this| {
             // header is checked in pending request
             this.message.streaming_body()?;
@@ -410,7 +413,7 @@ impl Request {
         Ok(self)
     }
 
-    pub fn as_sink<B: Buf>(&mut self) -> impl Sink<B, Error = MessageStreamError> {
+    pub fn as_sink<B: Buf + Send>(&mut self) -> impl Sink<B, Error = MessageStreamError> {
         crate::message::stream::unfold::write::unfold(
             self,
             async |request: &mut Self, buf: B| {
@@ -428,7 +431,7 @@ impl Request {
         )
     }
 
-    pub fn into_sink<B: Buf>(self) -> impl Sink<B, Error = MessageStreamError> {
+    pub fn into_sink<B: Buf + Send>(self) -> impl Sink<B, Error = MessageStreamError> {
         crate::message::stream::unfold::write::unfold(
             self,
             async |request: Self, buf: B| {

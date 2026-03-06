@@ -186,7 +186,7 @@ pub mod err {
     }
 }
 
-impl<S: AsyncRead> Decode<VarInt> for S {
+impl<S: AsyncRead + Send> Decode<VarInt> for S {
     type Error = io::Error;
 
     async fn decode(self) -> io::Result<VarInt> {
@@ -200,7 +200,7 @@ impl<S: AsyncRead> Decode<VarInt> for S {
     }
 }
 
-impl<S: AsyncWrite> Encode<VarInt> for S {
+impl<S: AsyncWrite + Send> Encode<VarInt> for S {
     type Output = ();
 
     type Error = io::Error;

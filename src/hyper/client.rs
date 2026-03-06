@@ -70,7 +70,10 @@ impl<C: quic::Connection> Connection<C> {
     ) -> Result<
         http::Response<impl Body<Data = bytes::Bytes, Error = MessageStreamError> + use<B, C>>,
         RequestError<B::Error>,
-    > {
+    >
+    where
+        B::Data: Send,
+    {
         let (mut read_stream, mut write_stream) = self.initial_message_stream().await?;
         let is_connect = request.method() == http::Method::CONNECT;
         write_stream.send_hyper_request(request).await?;

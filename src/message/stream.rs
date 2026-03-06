@@ -346,7 +346,10 @@ impl WriteStream {
         }
     }
 
-    pub async fn send_frame(&mut self, frame: Frame<impl Buf>) -> Result<(), quic::StreamError> {
+    pub async fn send_frame(
+        &mut self,
+        frame: Frame<impl Buf + Send>,
+    ) -> Result<(), quic::StreamError> {
         self.stream.encode_one(frame).await
     }
 

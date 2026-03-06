@@ -52,7 +52,7 @@ impl UnidirectionalStream<()> {
     pub const QPACK_DECODER_STREAM_TYPE: VarInt = VarInt::from_u32(0x03);
 }
 
-impl<S: ?Sized> UnidirectionalStream<S> {
+impl<S: ?Sized + Send> UnidirectionalStream<S> {
     pub const fn is_qpack_encoder_stream(&self) -> bool {
         self.r#type().into_inner() == UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE.into_inner()
     }

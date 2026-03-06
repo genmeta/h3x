@@ -35,6 +35,7 @@ impl Goaway {
 impl<S> Decode<Goaway> for &mut Frame<S>
 where
     for<'f> &'f mut Frame<S>: AsyncBufRead,
+    S: Send,
 {
     type Error = StreamError;
 

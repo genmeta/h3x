@@ -316,8 +316,8 @@ impl HasErrorCode for InvalidDynamicTableReference {
 
 impl<Ds, Es> Decoder<Ds, Es>
 where
-    Ds: Sink<DecoderInstruction, Error = StreamError> + Unpin,
-    Es: Stream<Item = Result<EncoderInstruction, StreamError>> + Unpin,
+    Ds: Sink<DecoderInstruction, Error = StreamError> + Unpin + Send,
+    Es: Stream<Item = Result<EncoderInstruction, StreamError>> + Unpin + Send,
 {
     pub fn new(settings: Arc<Settings>, decoder_stream: Ds, encoder_stream: Es) -> Self {
         Self {
@@ -329,7 +329,7 @@ where
 
     pub async fn decode(
         &self,
-        header_frame: impl AsyncBufRead + GetStreamId,
+        header_frame: impl AsyncBufRead + GetStreamId + Send,
     ) -> Result<FieldSection, StreamError> {
         let mut header_frame = pin!(header_frame);
         let stream_id = header_frame.stream_id().await?.into_inner();
@@ -495,7 +495,7 @@ pub enum DecoderInstruction {
     InsertCountIncrement { increment: u64 },
 }
 
-impl<S: AsyncBufRead> Decode<DecoderInstruction> for S {
+impl<S: AsyncBufRead + Send> Decode<DecoderInstruction> for S {
     type Error = StreamError;
 
     async fn decode(self) -> Result<DecoderInstruction, StreamError> {
@@ -531,7 +531,7 @@ impl<S: AsyncBufRead> Decode<DecoderInstruction> for S {
 
 impl<S> Encode<DecoderInstruction> for S
 where
-    S: AsyncWrite,
+    S: AsyncWrite + Send,
 {
     type Output = ();
 

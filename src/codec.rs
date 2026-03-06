@@ -1,6 +1,4 @@
-#![allow(async_fn_in_trait)]
-
-use std::pin::Pin;
+use std::{future::Future, pin::Pin};
 
 use crate::quic;
 
@@ -34,19 +32,21 @@ pub trait Encode<T>: Sized {
     type Output;
     type Error;
 
-    async fn encode(self, item: T) -> Result<Self::Output, Self::Error>;
+    fn encode(self, item: T) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
 }
 
 pub trait EncodeExt {
-    async fn encode_one<'s, T>(
+    fn encode_one<'s, T>(
         &'s mut self,
         item: T,
-    ) -> Result<<&'s mut Self as Encode<T>>::Output, <&'s mut Self as Encode<T>>::Error>
+    ) -> impl Future<
+        Output = Result<<&'s mut Self as Encode<T>>::Output, <&'s mut Self as Encode<T>>::Error>,
+    >
     where
         Self: Sized,
         &'s mut Self: Encode<T>,
     {
-        Encode::encode(self, item).await
+        Encode::encode(self, item)
     }
 
     fn into_encode_sink<T, Error>(self) -> impl Sink<T, Error = Error>
@@ -66,22 +66,24 @@ impl<T: ?Sized> EncodeExt for T {}
 pub trait Decode<T>: Sized {
     type Error;
 
-    async fn decode(self) -> Result<T, Self::Error>;
+    fn decode(self) -> impl Future<Output = Result<T, Self::Error>> + Send;
 }
 
 pub trait DecodeExt {
-    async fn decode_one<'s, T>(&'s mut self) -> Result<T, <&'s mut Self as Decode<T>>::Error>
+    fn decode_one<'s, T>(
+        &'s mut self,
+    ) -> impl Future<Output = Result<T, <&'s mut Self as Decode<T>>::Error>>
     where
         &'s mut Self: Decode<T>,
     {
-        Decode::decode(self).await
+        Decode::decode(self)
     }
 
-    async fn into_decoded<T>(self) -> Result<T, <Self as Decode<T>>::Error>
+    fn into_decoded<T>(self) -> impl Future<Output = Result<T, <Self as Decode<T>>::Error>>
     where
         Self: Decode<T>,
     {
-        Decode::decode(self).await
+        Decode::decode(self)
     }
 
     fn into_decode_stream<T, Error>(self) -> impl Stream<Item = Result<T, Error>>
