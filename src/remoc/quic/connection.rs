@@ -1,10 +1,16 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use futures::future::BoxFuture;
+use remoc::prelude::{ServerShared, ServerSharedMut};
+use tracing::Instrument;
 
 use super::{
-    agent::{LocalAgentClient, RemoteAgentClient, RemoteLocalAgent, RemoteRemoteAgent},
-    stream::{self, ReadStreamClient, WriteStreamClient},
+    agent::{
+        LocalAgentClient, LocalLocalAgent, LocalRemoteAgent, RemoteAgentClient, RemoteLocalAgent,
+        RemoteRemoteAgent,
+    },
+    stream::{self, LocalReadStream, LocalWriteStream, ReadStreamClient, WriteStreamClient},
+    task_set::TaskSet,
 };
 use crate::{
     dhttp::protocol::{BoxDynQuicStreamReader, BoxDynQuicStreamWriter},
@@ -54,6 +60,7 @@ pub trait Connection: Send + Sync {
 /// Wrapper around [`RemoteConnectionClient`] that implements the four quic
 /// connection traits ([`ManageStream`], [`WithLocalAgent`], [`WithRemoteAgent`],
 /// [`Close`]), satisfying the blanket [`Connection`](quic::Connection) impl.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct RemoteQuicConnection {
     client: ConnectionClient,
 }
@@ -164,8 +171,167 @@ impl quic::Close for RemoteQuicConnection {
         let client = self.client.clone();
         // Fire-and-forget: spawn a task to handle the async RPC.
         // The result is intentionally discarded since close is fire-and-forget.
-        tokio::spawn(async move {
-            let _ = client.close(code, reason).await;
-        });
+        tokio::spawn(
+            async move {
+                let _ = client.close(code, reason).await;
+            }
+            .in_current_span(),
+        );
+    }
+}
+
+/// Server-side wrapper that implements the remoc [`Connection`] RTC trait
+/// for any local [`quic::Connection`] implementation.
+///
+/// This allows a real QUIC connection to be served over remoc RTC,
+/// converting standard trait calls into RTC-compatible async methods.
+/// Each opened/accepted stream is wrapped and served as an individual RTC server.
+pub struct LocalQuicConnection<C> {
+    conn: C,
+    tasks: TaskSet,
+}
+
+impl<C> LocalQuicConnection<C> {
+    /// Wrap a local QUIC connection so it can be served over remoc RTC.
+    pub fn new(conn: C) -> Self {
+        Self {
+            conn,
+            tasks: TaskSet::new(),
+        }
+    }
+}
+
+impl<C> LocalQuicConnection<C>
+where
+    C: quic::Connection + 'static,
+{
+    /// Convert this local connection into a remote-accessible connection.
+    ///
+    /// Consumes `self` and returns:
+    /// - A [`RemoteQuicConnection`] that can be serialized and sent to a remote peer.
+    /// - A `Future` that must be polled to drive the RTC server and all spawned tasks.
+    ///   When this future is dropped, all associated tasks are cancelled.
+    pub fn into_remote(
+        self,
+    ) -> (
+        RemoteQuicConnection,
+        impl Future<Output = ()> + Send + 'static,
+    ) {
+        let (server, client) = ConnectionServerShared::new(Arc::new(self), 1);
+        let remote = RemoteQuicConnection::new(client);
+        let fut = async move {
+            let _ = server.serve(true).await;
+        };
+        (remote, fut)
+    }
+}
+
+/// Create a [`ReadStreamServerSharedMut`] for a local read stream
+/// and return the corresponding [`ReadStreamClient`] and a future to serve it.
+fn serve_read_stream(
+    reader: impl quic::ReadStream + 'static,
+) -> (ReadStreamClient, impl Future<Output = ()> + Send + 'static) {
+    let local = LocalReadStream::new(reader);
+    let (server, client) =
+        stream::ReadStreamServerSharedMut::new(Arc::new(tokio::sync::RwLock::new(local)), 1);
+    let fut = async move {
+        let _ = server.serve(true).await;
+    };
+    (client, fut)
+}
+
+/// Create a [`WriteStreamServerSharedMut`] for a local write stream
+/// and return the corresponding [`WriteStreamClient`] and a future to serve it.
+fn serve_write_stream(
+    writer: impl quic::WriteStream + 'static,
+) -> (WriteStreamClient, impl Future<Output = ()> + Send + 'static) {
+    let local = LocalWriteStream::new(writer);
+    let (server, client) =
+        stream::WriteStreamServerSharedMut::new(Arc::new(tokio::sync::RwLock::new(local)), 1);
+    let fut = async move {
+        let _ = server.serve(true).await;
+    };
+    (client, fut)
+}
+
+impl<C> Connection for LocalQuicConnection<C>
+where
+    C: quic::Connection + 'static,
+{
+    async fn open_bi(
+        &self,
+    ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError> {
+        let (reader, writer) = self.conn.open_bi().await?;
+        let (read_client, read_fut) = serve_read_stream(reader);
+        let (write_client, write_fut) = serve_write_stream(writer);
+        self.tasks.spawn(read_fut);
+        self.tasks.spawn(write_fut);
+        Ok((read_client, write_client))
+    }
+
+    async fn open_uni(&self) -> Result<WriteStreamClient, quic::ConnectionError> {
+        let writer = self.conn.open_uni().await?;
+        let (client, fut) = serve_write_stream(writer);
+        self.tasks.spawn(fut);
+        Ok(client)
+    }
+
+    async fn accept_bi(
+        &self,
+    ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError> {
+        let (reader, writer) = self.conn.accept_bi().await?;
+        let (read_client, read_fut) = serve_read_stream(reader);
+        let (write_client, write_fut) = serve_write_stream(writer);
+        self.tasks.spawn(read_fut);
+        self.tasks.spawn(write_fut);
+        Ok((read_client, write_client))
+    }
+
+    async fn accept_uni(&self) -> Result<ReadStreamClient, quic::ConnectionError> {
+        let reader = self.conn.accept_uni().await?;
+        let (client, fut) = serve_read_stream(reader);
+        self.tasks.spawn(fut);
+        Ok(client)
+    }
+
+    async fn local_agent(&self) -> Result<Option<LocalAgentClient>, quic::ConnectionError> {
+        let agent = self.conn.local_agent().await?;
+        match agent {
+            Some(a) => {
+                let local = LocalLocalAgent::new(a);
+                let (server, client) =
+                    super::agent::LocalAgentServerShared::new(Arc::new(local), 1);
+                self.tasks.spawn(async move {
+                    let _ = server.serve(true).await;
+                });
+                Ok(Some(client))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn remote_agent(&self) -> Result<Option<RemoteAgentClient>, quic::ConnectionError> {
+        let agent = self.conn.remote_agent().await?;
+        match agent {
+            Some(a) => {
+                let local = LocalRemoteAgent::new(a);
+                let (server, client) =
+                    super::agent::RemoteAgentServerShared::new(Arc::new(local), 1);
+                self.tasks.spawn(async move {
+                    let _ = server.serve(true).await;
+                });
+                Ok(Some(client))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn close(
+        &self,
+        code: Code,
+        reason: Cow<'static, str>,
+    ) -> Result<(), quic::ConnectionError> {
+        self.conn.close(code, reason);
+        Ok(())
     }
 }
