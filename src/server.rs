@@ -197,7 +197,7 @@ where
         }
     }
 
-    pub fn shutdown(&self) {
-        self.listener.shutdown();
+    pub async fn shutdown(&self) -> Result<(), L::Error> {
+        self.listener.shutdown().await
     }
 }
