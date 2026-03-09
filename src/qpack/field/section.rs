@@ -351,6 +351,20 @@ impl FieldSection {
         *path = Some(new);
     }
 
+    pub fn protocol(&self) -> Option<Protocol> {
+        let Some(PseudoHeaders::Request { protocol, .. }) = &self.pseudo_headers else {
+            panic!("FieldSection is not request headers")
+        };
+        protocol.clone()
+    }
+
+    pub fn set_protocol(&mut self, new: Protocol) {
+        let Some(PseudoHeaders::Request { protocol, .. }) = &mut self.pseudo_headers else {
+            panic!("FieldSection is not request headers")
+        };
+        *protocol = Some(new);
+    }
+
     pub fn uri(&self) -> Uri {
         let mut uri = uri::Parts::default();
         uri.scheme = self.scheme();

@@ -121,7 +121,7 @@ where
     pub async fn decode_next_unreserved_frame(mut self: Pin<&mut Self>) {
         loop {
             match self.as_mut().next_frame().await {
-                Some(Ok(frame)) if frame.is_reversed_frame() => continue,
+                Some(Ok(frame)) if frame.is_reserved_frame() => continue,
                 _decoded => break,
             }
         }

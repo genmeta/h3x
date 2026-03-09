@@ -59,20 +59,20 @@ pub enum InvalidIdentity {
     #[snafu(transparent)]
     Tls { source: rustls::Error },
     #[snafu(display("certificate for identity cannot be parsed"))]
-    InvalidCertificated {
+    InvalidCertificate {
         source: x509_parser::nom::Err<x509_parser::error::X509Error>,
     },
-    #[snafu(display("SAN extensions in certificate is invalid"))]
+    #[snafu(display("SAN extensions in certificate are invalid"))]
     InvalidSAN {
         source: x509_parser::error::X509Error,
     },
     #[snafu(display("certificate for identity is missing SAN extensions"))]
     MissingSAN,
-    #[snafu(display("identify name not found in certificate SAN"))]
+    #[snafu(display("identity name not found in certificate SAN"))]
     NameNotFound,
 }
 
-pub fn verify_certficate_for_name(
+pub fn verify_certificate_for_name(
     certificate: &CertificateDer<'static>,
     client_name: &str,
 ) -> Result<(), InvalidIdentity> {
@@ -80,7 +80,7 @@ pub fn verify_certficate_for_name(
 
     let cert = match x509_parser::parse_x509_certificate(certificate) {
         Ok((_remain, cert)) => cert,
-        Err(source) => return Err(InvalidIdentity::InvalidCertificated { source }),
+        Err(source) => return Err(InvalidIdentity::InvalidCertificate { source }),
     };
     let san = match cert.subject_alternative_name() {
         Ok(Some(san)) => san,

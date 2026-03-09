@@ -134,7 +134,7 @@ impl DHttpState {
         }
     }
 
-    fn on_initialed_message_stream(&self, stream_id: VarInt) -> Result<(), ConnectionGoaway> {
+    fn on_initialized_message_stream(&self, stream_id: VarInt) -> Result<(), ConnectionGoaway> {
         if let Some(goaway) = self.peer_goaway.peek()
             && goaway.stream_id() >= stream_id
         {
@@ -518,7 +518,7 @@ impl<C: quic::Close + quic::ManageStream + Send + Sync + ?Sized> ConnectionState
         let (reader, writer) = self.quic_connection().open_bi().await?;
         let (mut reader, writer) = (Box::pin(reader), Box::pin(writer));
         self.dhttp()
-            .on_initialed_message_stream(reader.stream_id().await?)?;
+            .on_initialized_message_stream(reader.stream_id().await?)?;
         Ok((StreamReader::new(reader), SinkWriter::new(writer)))
     }
 

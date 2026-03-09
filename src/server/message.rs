@@ -16,7 +16,7 @@ use crate::{
         stream::{MessageStreamError, ReadStream, WriteStream},
         unify::{MalformedMessageError, Message, MessageStage, ReadToStringError},
     },
-    qpack::field::PseudoHeaders,
+    qpack::field::{Protocol, PseudoHeaders},
     quic::agent,
 };
 
@@ -78,6 +78,10 @@ impl Request {
 
     pub fn path(&self) -> Option<PathAndQuery> {
         self.message.header().path()
+    }
+
+    pub fn protocol(&self) -> Option<Protocol> {
+        self.message.header().protocol()
     }
 
     pub fn uri(&self) -> Uri {

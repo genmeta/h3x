@@ -15,7 +15,7 @@ use crate::{
 };
 
 pin_project_lite::pin_project! {
-    /// Sink writer that support both [`Sink`] and [`AsyncWrite`] interface.
+    /// Sink writer that supports both [`Sink`] and [`AsyncWrite`] interfaces.
     ///
     /// Be different from [`SinkWriter`] in [`tokio-util`], this writer will buffer
     /// data written by `AsyncWrite` interface, and you may need to call [`Self::poll_flush_buffer`]
@@ -188,7 +188,7 @@ impl<S: GetStreamId + ?Sized> GetStreamId for SinkWriter<S> {
 }
 
 pin_project_lite::pin_project! {
-    /// A sink wrapper that guaranteed once `poll_ready` returns `Ready`, the item will not lost.
+    /// A sink wrapper that guarantees once `poll_ready` returns `Ready`, the item will not be lost.
     pub struct Feed<S, T> {
         item: Option<T>,
         #[pin]

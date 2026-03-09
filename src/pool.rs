@@ -113,7 +113,7 @@ impl<C: quic::Connection> Default for Pool<C> {
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum ConnectError<E: Error + 'static> {
-    #[snafu(display("failed to initial QUIC connection"))]
+    #[snafu(display("failed to initialize QUIC connection"))]
     Connector { source: E },
     #[snafu(transparent)]
     H3 { source: quic::ConnectionError },
@@ -121,7 +121,7 @@ pub enum ConnectError<E: Error + 'static> {
         Some(name) => name,
         None => "<anonymous>", 
     }))]
-    IncorrectIdentify {
+    IncorrectIdentity {
         expected: String,
         actual: Option<String>,
     },
@@ -133,9 +133,9 @@ pub enum InsertError {
     #[snafu(transparent)]
     Quic { source: quic::ConnectionError },
     #[snafu(display("peer does not provide identity"))]
-    MissingIdentify,
-    #[snafu(display("peer provided invalid identity(cannot be parsed as Authority"))]
-    InvalidIdentify,
+    MissingIdentity,
+    #[snafu(display("peer provided invalid identity (cannot be parsed as Authority)"))]
+    InvalidIdentity,
 }
 
 impl<C: quic::Connection> Pool<C> {
@@ -184,7 +184,7 @@ impl<C: quic::Connection> Pool<C> {
                     let remote_agent = connection.remote_agent().await?;
                     let actual_peer_name = remote_agent.as_ref().map(|agent| agent.name());
                     if actual_peer_name.as_ref() != Some(&server.host()) {
-                        return connect_error::IncorrectIdentifySnafu {
+                        return connect_error::IncorrectIdentitySnafu {
                             expected: server.host().to_string(),
                             actual: actual_peer_name.map(ToOwned::to_owned),
                         }
@@ -231,13 +231,13 @@ impl<C: quic::Connection> Pool<C> {
         let remote_agent = connection
             .remote_agent()
             .await?
-            .context(insert_error::MissingIdentifySnafu)?;
+            .context(insert_error::MissingIdentitySnafu)?;
         let settings = connection.settings().clone();
         let client = remote_agent
             .name()
             .parse()
             .ok()
-            .context(insert_error::InvalidIdentifySnafu)?;
+            .context(insert_error::InvalidIdentitySnafu)?;
 
         let identity = (client, settings);
         let reuseable_connection = self

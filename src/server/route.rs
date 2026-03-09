@@ -190,7 +190,7 @@ impl Router {
         self.serve(&mut request, &mut response).await;
 
         // Drop response in place to avoid spawning another tokio task
-        // FIXME: remove this when async drop is stablized (https://github.com/rust-lang/rust/issues/126482)
+        // FIXME: remove this when async drop is stabilized (https://github.com/rust-lang/rust/issues/126482)
         if let Some(drop_future) = response.drop() {
             drop_future.await;
         }

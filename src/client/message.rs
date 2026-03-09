@@ -19,7 +19,7 @@ use crate::{
         unify::{MalformedMessageError, Message, MessageStage, ReadToStringError},
     },
     pool::ConnectError,
-    qpack::field::MalformedHeaderSection,
+    qpack::field::{MalformedHeaderSection, Protocol},
     quic::{self, agent},
 };
 
@@ -54,7 +54,7 @@ pub enum RequestError<E: Error + 'static> {
     RequestStream { source: quic::StreamError },
     #[snafu(display("response stream error"))]
     ResponseStream { source: quic::StreamError },
-    #[snafu(display("request cannot be send due to malformed header"))]
+    #[snafu(display("request cannot be sent due to malformed header"))]
     MalformedRequestHeader { source: MalformedHeaderSection },
     #[snafu(display(
         "header section too large to fit into a single frame, maybe too many header fields"
@@ -98,6 +98,11 @@ impl<C: quic::Connect> PendingRequest<'_, C> {
 
     pub fn with_path(mut self, path: PathAndQuery) -> Self {
         self.request.header_mut().set_path(path);
+        self
+    }
+
+    pub fn with_protocol(mut self, protocol: Protocol) -> Self {
+        self.request.header_mut().set_protocol(protocol);
         self
     }
 
@@ -213,7 +218,7 @@ where
                     }
                 },
                 Err(InitialMessageStreamError::QPackProtocolDisabled { .. }) => {
-                    unreachable!("Clinet always initial QPack protocol")
+                    unreachable!("Client always initializes the QPack protocol")
                 }
             };
 
@@ -223,7 +228,7 @@ where
             let Ok(remote_agent) = connection.remote_agent().await else {
                 continue;
             };
-            let remote_agent = remote_agent.expect("chekced by Client::connect");
+            let remote_agent = remote_agent.expect("checked by Client::connect");
 
             let send_request = async {
                 if self.auto_close && self.request.is_chunked() {

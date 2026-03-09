@@ -179,8 +179,8 @@ impl<C: quic::Connection + ?Sized> ConnectionBuilder<C> {
         builder.protocol(DHttpProtocolFactory::new(settings))
     }
 
-    pub fn protocol<F: ProductProtocol<C>>(mut self, facroty: F) -> Self {
-        self.protocols_initializers.push(Box::new(facroty));
+    pub fn protocol<F: ProductProtocol<C>>(mut self, factory: F) -> Self {
+        self.protocols_initializers.push(Box::new(factory));
         self
     }
 

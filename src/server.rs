@@ -90,7 +90,7 @@ where
         async move {
             tracing::debug!("Accepted new QUIC connection");
             let Ok(connection) = Connection::new(settings, connection).await else {
-                // failed to initial h3 connection
+                // failed to initialize H3 connection
                 return;
             };
 

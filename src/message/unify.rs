@@ -40,7 +40,7 @@ pub enum MessageStage {
     /// Message struct is malformed
     Malformed = 4,
     /// Message struct is already taken/dropped
-    // State can be removed after async drop stablizes
+    // State can be removed after async drop stabilizes
     Dropped = 5,
 }
 

@@ -188,14 +188,14 @@ impl EncoderState {
             true => Bytes::from_static(
                 r#static::get_name(name_index)
                     .unwrap_or_else(|| {
-                        panic!("Referenced name index {name_index} not existed in the static table")
+                        panic!("Referenced name index {name_index} does not exist in the static table")
                     })
                     .as_bytes(),
             ),
             false => self
                 .get_entry(name_index)
                 .unwrap_or_else(|| {
-                    panic!("Referenced name index {name_index} not existed in the dynamic table")
+                    panic!("Referenced name index {name_index} does not exist in the dynamic table")
                 })
                 .name
                 .clone(),
@@ -239,7 +239,7 @@ impl EncoderState {
     pub fn duplicate(&mut self, index: u64) -> u64 {
         let duplicated_entry = self
             .get_entry(index)
-            .unwrap_or_else(|| panic!("Referenced entry {index} not existed in the dynamic table"))
+            .unwrap_or_else(|| panic!("Referenced entry {index} does not exist in the dynamic table"))
             .clone();
         while self.table_remaining() < duplicated_entry.size() {
             self.evict_entry();

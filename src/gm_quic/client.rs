@@ -27,7 +27,7 @@ use crate::{
     client::Client,
     dhttp::settings::Settings,
     pool::Pool,
-    util::tls::{DangerousServerCertVerifier, InvalidIdentity, verify_certficate_for_name},
+    util::tls::{DangerousServerCertVerifier, InvalidIdentity, verify_certificate_for_name},
 };
 
 fn default_root_cert_store() -> &'static Arc<RootCertStore> {
@@ -157,7 +157,7 @@ impl TryFrom<H3ClientTlsBuilder> for H3ClientBuilder {
 
         let (tls_config, client_name) = match builder.client_identity {
             Some((name, cert, key)) => {
-                verify_certficate_for_name(&cert[0], &name)
+                verify_certificate_for_name(&cert[0], &name)
                     .context(build_client_error::InvalidIdentitySnafu { name: &name })?;
                 let tls_config = tls_config_buider
                     .with_client_auth_cert(cert, key)
@@ -261,7 +261,7 @@ impl H3ClientBuilder {
         self
     }
 
-    pub fn with_conenction_pool(mut self, pool: Pool<Connection>) -> Self {
+    pub fn with_connection_pool(mut self, pool: Pool<Connection>) -> Self {
         self.pool = pool;
         self
     }

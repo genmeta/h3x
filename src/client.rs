@@ -38,7 +38,7 @@ impl<C: quic::Connect> Client<C> {
         }
     }
 
-    pub fn quic_clinet(&self) -> &C {
+    pub fn quic_client(&self) -> &C {
         &self.client
     }
 

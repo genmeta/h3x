@@ -97,7 +97,7 @@ impl<P: ?Sized> Frame<P> {
     /// implementation chooses.
     ///
     /// https://datatracker.ietf.org/doc/html/rfc9114#name-reserved-frame-types
-    pub const fn is_reversed_frame(&self) -> bool {
+    pub const fn is_reserved_frame(&self) -> bool {
         (self.r#type.into_inner() >= 0x21) && (self.r#type.into_inner() - 0x21).is_multiple_of(0x1f)
     }
 

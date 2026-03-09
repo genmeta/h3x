@@ -39,12 +39,12 @@ pub(crate) mod hyper;
 pub(crate) mod unfold;
 
 fn stream_used_after_dropped() -> ! {
-    panic!("message stream is used after dropped, this is a bug")
+    panic!("message stream is used after being dropped, this is a bug")
 }
 
-pub struct DestroiedStream;
+pub struct DestroyedStream;
 
-impl Sink<Bytes> for DestroiedStream {
+impl Sink<Bytes> for DestroyedStream {
     type Error = quic::StreamError;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -64,7 +64,7 @@ impl Sink<Bytes> for DestroiedStream {
     }
 }
 
-impl Stream for DestroiedStream {
+impl Stream for DestroyedStream {
     type Item = Result<Bytes, quic::StreamError>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -72,7 +72,7 @@ impl Stream for DestroiedStream {
     }
 }
 
-impl quic::CancelStream for DestroiedStream {
+impl quic::CancelStream for DestroyedStream {
     fn poll_cancel(
         self: Pin<&mut Self>,
         _cx: &mut Context,
@@ -82,7 +82,7 @@ impl quic::CancelStream for DestroiedStream {
     }
 }
 
-impl quic::StopStream for DestroiedStream {
+impl quic::StopStream for DestroyedStream {
     fn poll_stop(
         self: Pin<&mut Self>,
         _cx: &mut Context,
@@ -92,7 +92,7 @@ impl quic::StopStream for DestroiedStream {
     }
 }
 
-impl quic::GetStreamId for DestroiedStream {
+impl quic::GetStreamId for DestroyedStream {
     fn poll_stream_id(
         self: Pin<&mut Self>,
         _cx: &mut Context,
@@ -117,7 +117,7 @@ pub enum MessageStreamError {
     TrailerTooLarge,
     #[snafu(display("data frame payload too large, try smaller chunk size"))]
     DataFrameTooLarge,
-    #[snafu(display("HTTP/3 message form peer is malformed"))]
+    #[snafu(display("HTTP/3 message from peer is malformed"))]
     MalformedIncomingMessage,
 }
 
@@ -292,7 +292,7 @@ impl ReadStream {
     }
 
     pub fn take(&mut self) -> Self {
-        let stream = FrameStream::new(StreamReader::new(Box::pin(DestroiedStream) as Pin<Box<_>>));
+        let stream = FrameStream::new(StreamReader::new(Box::pin(DestroyedStream) as Pin<Box<_>>));
         Self {
             stream: mem::replace(&mut self.stream, stream),
             qpack_decoder: self.qpack_decoder.clone(),
@@ -453,7 +453,7 @@ impl WriteStream {
     }
 
     pub fn take(&mut self) -> Self {
-        let stream = SinkWriter::new(Box::pin(DestroiedStream) as Pin<Box<_>>);
+        let stream = SinkWriter::new(Box::pin(DestroyedStream) as Pin<Box<_>>);
         Self {
             stream: mem::replace(&mut self.stream, stream),
             qpack_encoder: self.qpack_encoder.clone(),
