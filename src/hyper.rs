@@ -27,7 +27,7 @@ pub mod ext {
     pub use crate::qpack::field::Protocol;
 }
 
-pub use crate::message::stream::hyper::write::SendMesageError;
+pub use crate::message::stream::hyper::write::SendMessageError;
 
 pub mod client;
 pub mod server;

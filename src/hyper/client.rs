@@ -5,7 +5,7 @@ use http_body_util::{BodyExt, Empty};
 
 use crate::{
     connection::Connection,
-    hyper::SendMesageError,
+    hyper::SendMessageError,
     message::stream::{
         InitialMessageStreamError, MessageStreamError,
         hyper::{read::Either, upgrade::RemainStream},
@@ -16,7 +16,7 @@ use crate::{
 #[derive(Debug)]
 pub enum RequestError<E> {
     InitialStream { source: InitialMessageStreamError },
-    SendRequest { source: SendMesageError<E> },
+    SendRequest { source: SendMessageError<E> },
     ReceiveResponse { source: MessageStreamError },
 }
 
@@ -27,9 +27,9 @@ impl<E> From<InitialMessageStreamError> for RequestError<E> {
     }
 }
 
-impl<E> From<SendMesageError<E>> for RequestError<E> {
+impl<E> From<SendMessageError<E>> for RequestError<E> {
     #[track_caller]
-    fn from(source: SendMesageError<E>) -> Self {
+    fn from(source: SendMessageError<E>) -> Self {
         RequestError::SendRequest { source }
     }
 }

@@ -15,7 +15,7 @@ use tracing::Instrument;
 use crate::{
     message::stream::{
         MessageStreamError,
-        hyper::{upgrade::RemainStream, write::SendMesageError},
+        hyper::{upgrade::RemainStream, write::SendMessageError},
     },
     server::{Request, Response, UnresolvedRequest},
 };
@@ -126,11 +126,11 @@ impl<S: Error, B: Error> Error for HandleRequestError<S, B> {
     }
 }
 
-impl<S, B> From<SendMesageError<B>> for HandleRequestError<S, B> {
-    fn from(source: SendMesageError<B>) -> Self {
+impl<S, B> From<SendMessageError<B>> for HandleRequestError<S, B> {
+    fn from(source: SendMessageError<B>) -> Self {
         match source {
-            SendMesageError::Stream { source } => HandleRequestError::Stream { source },
-            SendMesageError::Body { source } => HandleRequestError::Body { source },
+            SendMessageError::Stream { source } => HandleRequestError::Stream { source },
+            SendMessageError::Body { source } => HandleRequestError::Body { source },
         }
     }
 }
