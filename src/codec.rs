@@ -28,74 +28,80 @@ pub type BoxPeekableBiStream<C> = (
     SinkWriter<Pin<Box<<C as quic::ManageStream>::StreamWriter>>>,
 );
 
-pub trait Encode<T>: Sized {
+pub trait EncodeInto<S>: Sized {
     type Output;
     type Error;
 
-    fn encode(self, item: T) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
+    fn encode_into(
+        self,
+        stream: S,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
 }
 
 pub trait EncodeExt {
-    fn encode_one<'s, T>(
-        &'s mut self,
-        item: T,
-    ) -> impl Future<
-        Output = Result<<&'s mut Self as Encode<T>>::Output, <&'s mut Self as Encode<T>>::Error>,
-    >
+    fn encode<T>(self, item: T) -> impl Future<Output = Result<T::Output, T::Error>> + Send
     where
         Self: Sized,
-        &'s mut Self: Encode<T>,
+        T: EncodeInto<Self>,
     {
-        Encode::encode(self, item)
+        item.encode_into(self)
+    }
+
+    fn encode_one<'s, T>(&'s mut self, item: T) -> impl Future<Output = Result<T::Output, T::Error>>
+    where
+        Self: Sized,
+        T: EncodeInto<&'s mut Self>,
+    {
+        item.encode_into(self)
     }
 
     fn into_encode_sink<T, Error>(self) -> impl Sink<T, Error = Error>
     where
         Self: Sized,
-        for<'s> &'s mut Self: Encode<T, Error = Error>,
+        for<'s> T: EncodeInto<&'s mut Self, Error = Error>,
     {
-        futures::sink::unfold(self, |mut encoder, item| async move {
-            (&mut encoder).encode(item).await?;
+        futures::sink::unfold(self, |mut encoder, item: T| async move {
+            item.encode_into(&mut encoder).await?;
             Ok(encoder)
         })
     }
 }
 
-impl<T: ?Sized> EncodeExt for T {}
+impl<S: ?Sized> EncodeExt for S {}
 
-pub trait Decode<T>: Sized {
+pub trait DecodeFrom<S>: Sized {
     type Error;
 
-    fn decode(self) -> impl Future<Output = Result<T, Self::Error>> + Send;
+    fn decode_from(stream: S) -> impl Future<Output = Result<Self, Self::Error>> + Send;
 }
 
 pub trait DecodeExt {
-    fn decode_one<'s, T>(
-        &'s mut self,
-    ) -> impl Future<Output = Result<T, <&'s mut Self as Decode<T>>::Error>>
+    fn decode<T>(self) -> impl Future<Output = Result<T, T::Error>> + Send
     where
-        &'s mut Self: Decode<T>,
+        Self: Sized,
+        T: DecodeFrom<Self>,
     {
-        Decode::decode(self)
+        T::decode_from(self)
     }
 
-    fn into_decoded<T>(self) -> impl Future<Output = Result<T, <Self as Decode<T>>::Error>>
+    fn decode_one<'s, T>(&'s mut self) -> impl Future<Output = Result<T, T::Error>>
     where
-        Self: Decode<T>,
+        T: DecodeFrom<&'s mut Self>,
     {
-        Decode::decode(self)
+        T::decode_from(self)
     }
 
     fn into_decode_stream<T, Error>(self) -> impl Stream<Item = Result<T, Error>>
     where
         Self: Sized,
-        for<'s> &'s mut Self: Decode<T, Error = Error> + AsyncBufRead,
+        for<'s> T: DecodeFrom<&'s mut Self, Error = Error>,
+        for<'s> &'s mut Self: AsyncBufRead,
         Error: From<io::Error>,
     {
         futures::stream::unfold(self, |mut decoder| async move {
             match (&mut decoder).fill_buf().await {
                 Ok([]) => None,
-                Ok(..) => match (&mut decoder).decode().await {
+                Ok(..) => match T::decode_from(&mut decoder).await {
                     Ok(item) => Some((Ok(item), decoder)),
                     Err(e) => Some((Err(e), decoder)),
                 },
@@ -105,4 +111,4 @@ pub trait DecodeExt {
     }
 }
 
-impl<T: ?Sized> DecodeExt for T {}
+impl<S: ?Sized> DecodeExt for S {}
