@@ -92,12 +92,10 @@ pub struct QPackProtocol<C: quic::Connection + ?Sized> {
     /// Oneshot sender for dispatching the peer's QPACK encoder instruction stream.
     encoder_inst_receiver_tx: Mutex<Option<oneshot::Sender<BoxStreamReader<C>>>>,
     /// QPACK encoder, set during connection initialization.
-    /// QPACK encoder, set during connection initialization.
     pub encoder: Arc<QPackEncoder>,
 
     /// Oneshot sender for dispatching the peer's QPACK decoder instruction stream.
     decoder_inst_receiver_tx: Mutex<Option<oneshot::Sender<BoxStreamReader<C>>>>,
-    /// QPACK decoder, set during connection initialization.
     /// QPACK decoder, set during connection initialization.
     pub decoder: Arc<QPackDecoder>,
 }
