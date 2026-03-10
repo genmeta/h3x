@@ -16,7 +16,7 @@ use tracing::Instrument;
 
 use crate::{
     codec::{
-        BoxPeekableBiStream, BoxPeekableUniStream, BoxQuicStreamReader, DecodeExt, EncodeExt,
+        BoxPeekableBiStream, BoxPeekableUniStream, BoxStreamReader, DecodeExt, EncodeExt,
         SinkWriter,
     },
     connection::{ConnectionState, QuicConnection, StreamError},
@@ -90,12 +90,14 @@ pub type QPackDecoder = Decoder<
 /// (encoder 0x02, decoder 0x03) and passes all other streams through.
 pub struct QPackProtocol<C: quic::Connection + ?Sized> {
     /// Oneshot sender for dispatching the peer's QPACK encoder instruction stream.
-    encoder_inst_receiver_tx: Mutex<Option<oneshot::Sender<BoxQuicStreamReader<C>>>>,
+    encoder_inst_receiver_tx: Mutex<Option<oneshot::Sender<BoxStreamReader<C>>>>,
+    /// QPACK encoder, set during connection initialization.
     /// QPACK encoder, set during connection initialization.
     pub encoder: Arc<QPackEncoder>,
 
     /// Oneshot sender for dispatching the peer's QPACK decoder instruction stream.
-    decoder_inst_receiver_tx: Mutex<Option<oneshot::Sender<BoxQuicStreamReader<C>>>>,
+    decoder_inst_receiver_tx: Mutex<Option<oneshot::Sender<BoxStreamReader<C>>>>,
+    /// QPACK decoder, set during connection initialization.
     /// QPACK decoder, set during connection initialization.
     pub decoder: Arc<QPackDecoder>,
 }
@@ -192,9 +194,9 @@ impl QPackProtocolFactory {
 
         // Create dispatch channels for incoming peer QPACK streams
         let (encoder_inst_receiver_tx, encoder_inst_receiver_rx) =
-            oneshot::channel::<BoxQuicStreamReader<C>>();
+            oneshot::channel::<BoxStreamReader<C>>();
         let (decoder_inst_receiver_tx, decoder_inst_receiver_rx) =
-            oneshot::channel::<BoxQuicStreamReader<C>>();
+            oneshot::channel::<BoxStreamReader<C>>();
 
         // Create QPACK encoder with lazy streams
         let encoder = {

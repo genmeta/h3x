@@ -12,11 +12,7 @@ pub use reader::{FixedLengthReader, PeekableStreamReader, StreamReader};
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt};
 pub use writer::{Feed, SinkWriter};
 
-pub type BoxStreamWriter<C> = SinkWriter<Pin<Box<<C as quic::ManageStream>::StreamWriter>>>;
 pub type BoxStreamReader<C> = StreamReader<Pin<Box<<C as quic::ManageStream>::StreamReader>>>;
-
-/// Type alias for a `StreamReader` wrapping a boxed unidirectional read stream.
-pub type BoxQuicStreamReader<C> = StreamReader<Pin<Box<<C as quic::ManageStream>::StreamReader>>>;
 
 /// Type alias for a peekable unidirectional stream.
 pub type BoxPeekableUniStream<C> =

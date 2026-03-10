@@ -415,10 +415,6 @@ pin_project_lite::pin_project! {
         stream: S,
     }
 
-    impl<S: ReadStream, Ds, Es> PinnedDrop for MessageStreamReader<S, Ds, Es> {
-        fn drop(this: Pin<&mut Self>) {
-        }
-    }
 }
 
 impl<S: ReadStream + Unpin, Ds, Es> MessageStreamReader<S, Ds, Es> {
