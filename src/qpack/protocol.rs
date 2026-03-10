@@ -443,3 +443,41 @@ impl<C: quic::Connection + ?Sized> ConnectionState<C> {
 //         assert!(any_ref.downcast_ref::<QPackLayer>().is_some());
 //     }
 // }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        cmp::Ordering,
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
+
+    use super::*;
+
+    fn hash_of<T: Hash>(t: &T) -> u64 {
+        let mut h = DefaultHasher::new();
+        t.hash(&mut h);
+        h.finish()
+    }
+
+    #[test]
+    fn qpack_factory_all_equal() {
+        assert_eq!(QPackProtocolFactory::new(), QPackProtocolFactory::new());
+    }
+
+    #[test]
+    fn qpack_factory_same_hash() {
+        assert_eq!(
+            hash_of(&QPackProtocolFactory::new()),
+            hash_of(&QPackProtocolFactory::new()),
+        );
+    }
+
+    #[test]
+    fn qpack_factory_ordering_equal() {
+        assert_eq!(
+            QPackProtocolFactory::new().cmp(&QPackProtocolFactory::new()),
+            Ordering::Equal,
+        );
+    }
+}

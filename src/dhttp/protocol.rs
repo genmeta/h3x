@@ -63,6 +63,71 @@ pub struct DHttpState {
     pub max_received_stream_id: Watch<VarInt>,
 }
 
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+        sync::Arc,
+    };
+
+    use super::*;
+    use crate::dhttp::settings::{Setting, Settings};
+
+    fn hash_of<T: Hash>(t: &T) -> u64 {
+        let mut h = DefaultHasher::new();
+        t.hash(&mut h);
+        h.finish()
+    }
+
+    #[test]
+    fn dhttp_factory_same_settings_equal_hash() {
+        let s1 = Arc::new(Settings::default());
+        let s2 = Arc::new(Settings::default());
+
+        let f1 = DHttpProtocolFactory::new(s1);
+        let f2 = DHttpProtocolFactory::new(s2);
+
+        assert_eq!(hash_of(&f1), hash_of(&f2));
+    }
+
+    #[test]
+    fn dhttp_factory_different_settings_different_hash() {
+        let s_default = Settings::default();
+        let mut s_other = Settings::default();
+
+        s_other.set(Setting::enable_connect_protocol(true));
+
+        let f1 = DHttpProtocolFactory::new(Arc::new(s_default));
+        let f2 = DHttpProtocolFactory::new(Arc::new(s_other));
+
+        assert_ne!(hash_of(&f1), hash_of(&f2));
+    }
+
+    #[test]
+    fn dhttp_factory_same_settings_eq() {
+        let s1 = Arc::new(Settings::default());
+        let s2 = Arc::new(Settings::default());
+
+        let f1 = DHttpProtocolFactory::new(s1);
+        let f2 = DHttpProtocolFactory::new(s2);
+
+        assert_eq!(f1, f2);
+    }
+
+    #[test]
+    fn dhttp_factory_different_settings_not_eq() {
+        let s_default = Settings::default();
+        let mut s_other = Settings::default();
+        s_other.set(Setting::enable_connect_protocol(true));
+
+        let f1 = DHttpProtocolFactory::new(Arc::new(s_default));
+        let f2 = DHttpProtocolFactory::new(Arc::new(s_other));
+
+        assert_ne!(f1, f2);
+    }
+}
+
 impl DHttpState {
     /// Creates a new `DHttpLayerState` with the given local settings.
     fn new(local_settings: Arc<Settings>) -> Self {

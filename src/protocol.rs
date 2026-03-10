@@ -415,6 +415,24 @@ mod tests {
         assert_eq!(ab, ba.reverse());
     }
 
+    // Cross-type ordering test using real factories (DHttpProtocolFactory vs QPackProtocolFactory)
+    #[cfg(feature = "gm-quic")]
+    #[test]
+    fn identity_cmp_cross_type_real_factories() {
+        use crate::dhttp::settings::Settings;
+
+        let settings = Settings::default();
+        let d = crate::dhttp::protocol::DHttpProtocolFactory::new(Arc::new(settings));
+        let q = crate::qpack::protocol::QPackProtocolFactory::new();
+
+        let dq = cmp_via_identity::<C>(&d, &q as &dyn Any);
+        let qd = cmp_via_identity::<C>(&q, &d as &dyn Any);
+
+        // They must not be equal and ordering must be antisymmetric
+        assert_ne!(dq, Ordering::Equal);
+        assert_eq!(dq, qd.reverse());
+    }
+
     #[cfg(feature = "gm-quic")]
     #[test]
     fn identity_type_id_returns_concrete_type() {
