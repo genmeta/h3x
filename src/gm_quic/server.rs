@@ -15,7 +15,7 @@ use ::gm_quic::{
 use rustls::{crypto::CryptoProvider, server::danger::ClientCertVerifier};
 
 use crate::{
-    dhttp::settings::Settings,
+    connection::ConnectionBuilder,
     pool::Pool,
     server::{Servers, UnresolvedRequest},
 };
@@ -72,45 +72,45 @@ impl TryFrom<H3ServersTlsBuilder> for H3ServersBuilder {
         }
         .with_alpns(vec!["h3"]);
         Ok(H3ServersBuilder {
-            builder: listeners_builder,
+            listeners_builder,
             backlog: 1024,
             pool: Pool::global().clone(),
-            settings: Default::default(),
+            builder: Arc::new(ConnectionBuilder::new(Arc::default())),
         })
     }
 }
 
 pub struct H3ServersBuilder {
-    builder: QuicListenersBuilder<rustls::ServerConfig>,
+    listeners_builder: QuicListenersBuilder<rustls::ServerConfig>,
     backlog: usize,
     pool: Pool<Connection>,
-    settings: Arc<Settings>,
+    builder: Arc<ConnectionBuilder<Connection>>,
 }
 
 impl H3ServersBuilder {
     pub fn with_resolver(mut self, resolver: Arc<dyn Resolve + Send + Sync>) -> Self {
-        self.builder = self.builder.with_resolver(resolver);
+        self.listeners_builder = self.listeners_builder.with_resolver(resolver);
         self
     }
 
     pub fn with_iface_factory(mut self, factory: Arc<dyn ProductIO + 'static>) -> Self {
-        self.builder = self.builder.with_iface_factory(factory);
+        self.listeners_builder = self.listeners_builder.with_iface_factory(factory);
         self
     }
 
     /// Specify the interfaces manager for the client.
     pub fn with_iface_manager(mut self, iface_manager: Arc<InterfaceManager>) -> Self {
-        self.builder = self.builder.with_iface_manager(iface_manager);
+        self.listeners_builder = self.listeners_builder.with_iface_manager(iface_manager);
         self
     }
 
     pub fn with_router(mut self, router: Arc<QuicRouter>) -> Self {
-        self.builder = self.builder.with_router(router);
+        self.listeners_builder = self.listeners_builder.with_router(router);
         self
     }
 
     pub fn with_token_provider(mut self, token_provider: Arc<dyn TokenProvider>) -> Self {
-        self.builder = self.builder.with_token_provider(token_provider);
+        self.listeners_builder = self.listeners_builder.with_token_provider(token_provider);
         self
     }
 
@@ -118,44 +118,44 @@ impl H3ServersBuilder {
         mut self,
         strategy_factory: Arc<dyn ProductStreamsConcurrencyController>,
     ) -> Self {
-        self.builder = self
-            .builder
+        self.listeners_builder = self
+            .listeners_builder
             .with_streams_concurrency_strategy(strategy_factory);
         self
     }
 
     pub fn defer_idle_timeout(mut self, duration: Duration) -> Self {
-        self.builder = self.builder.defer_idle_timeout(duration);
+        self.listeners_builder = self.listeners_builder.defer_idle_timeout(duration);
         self
     }
 
     pub fn with_quic_parameters(mut self, parameters: ServerParameters) -> Self {
-        self.builder = self.builder.with_parameters(parameters);
+        self.listeners_builder = self.listeners_builder.with_parameters(parameters);
         self
     }
 
     pub fn physical_ifaces(mut self, physical_ifaces: &'static Devices) -> Self {
-        self.builder = self.builder.with_physical_ifaces(physical_ifaces);
+        self.listeners_builder = self.listeners_builder.with_physical_ifaces(physical_ifaces);
         self
     }
 
     pub fn with_qlog(mut self, logger: Arc<dyn QLog + Send + Sync>) -> Self {
-        self.builder = self.builder.with_qlog(logger);
+        self.listeners_builder = self.listeners_builder.with_qlog(logger);
         self
     }
 
     pub fn enable_anti_port_scan(mut self) -> Self {
-        self.builder = self.builder.enable_anti_port_scan();
+        self.listeners_builder = self.listeners_builder.enable_anti_port_scan();
         self
     }
 
     pub fn with_client_auther(mut self, client_auther: impl AuthClient + 'static) -> Self {
-        self.builder = self.builder.with_client_auther(client_auther);
+        self.listeners_builder = self.listeners_builder.with_client_auther(client_auther);
         self
     }
 
     pub fn enable_0rtt(mut self) -> Self {
-        self.builder = self.builder.enable_0rtt();
+        self.listeners_builder = self.listeners_builder.enable_0rtt();
         self
     }
 
@@ -164,12 +164,17 @@ impl H3ServersBuilder {
         self
     }
 
+    pub fn with_builder(mut self, builder: Arc<ConnectionBuilder<Connection>>) -> Self {
+        self.builder = builder;
+        self
+    }
+
     pub fn listen<S>(self) -> Result<H3Servers<S>, ListenError> {
-        let listener = self.builder.listen(self.backlog)?;
+        let listener = self.listeners_builder.listen(self.backlog)?;
         Ok(Servers::from_quic_listener()
             .listener(listener)
             .pool(self.pool)
-            .settings(self.settings)
+            .builder(self.builder)
             .build())
     }
 }

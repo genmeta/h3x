@@ -10,8 +10,7 @@ pub use crate::message::{
     unify::ReadToStringError,
 };
 use crate::{
-    connection::Connection,
-    dhttp::settings::Settings,
+    connection::ConnectionBuilder,
     error::Code,
     pool::Pool,
     quic::{self, GetStreamIdExt},
@@ -28,7 +27,7 @@ pub use service::{BoxService, BoxServiceFuture, IntoBoxService, Service, box_ser
 pub struct Servers<L: quic::Listen, S> {
     pool: Pool<L::Connection>,
     listener: L,
-    settings: Arc<Settings>,
+    builder: Arc<ConnectionBuilder<L::Connection>>,
     router: Arc<HashMap<String, S>>,
 }
 
@@ -44,12 +43,14 @@ where
     fn new(
         #[builder(default = Pool::global().clone())] pool: Pool<L::Connection>,
         listener: L,
-        #[builder(default)] settings: Arc<Settings>,
+        #[builder(default = Arc::new(ConnectionBuilder::new(Arc::default())))] builder: Arc<
+            ConnectionBuilder<L::Connection>,
+        >,
     ) -> Self {
         Self {
             pool,
             listener,
-            settings,
+            builder,
             router: Arc::new(HashMap::new()),
         }
     }
@@ -84,12 +85,18 @@ where
         connection: L::Connection,
     ) -> impl futures::Future<Output = ()> + Send + 'static {
         let pool = self.pool.clone();
-        let settings = self.settings.clone();
+        let builder = self.builder.clone();
+        let builder_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            builder.hash(&mut hasher);
+            hasher.finish()
+        };
         let router = self.router.clone();
         let span = tracing::info_span!("handle_connection", server_name = tracing::field::Empty);
         async move {
             tracing::debug!("Accepted new QUIC connection");
-            let Ok(connection) = Connection::new(settings, connection).await else {
+            let Ok(connection) = builder.build(connection).await else {
                 // failed to initialize H3 connection
                 return;
             };
@@ -112,7 +119,7 @@ where
 
             tracing::Span::current().record("server_name", local_agent.name());
             let connection = Arc::new(connection);
-            _ = pool.try_insert(connection.clone());
+            _ = pool.try_insert(connection.clone(), builder_hash);
             // TODO: router with authority?
             let Some(service) = router.get(local_agent.name()) else {
                 tracing::debug!(

@@ -25,7 +25,7 @@ use snafu::{ResultExt, Snafu};
 
 use crate::{
     client::Client,
-    dhttp::settings::Settings,
+    connection::ConnectionBuilder,
     pool::Pool,
     util::tls::{DangerousServerCertVerifier, InvalidIdentity, verify_certificate_for_name},
 };
@@ -174,60 +174,60 @@ impl TryFrom<H3ClientTlsBuilder> for H3ClientBuilder {
         }
 
         Ok(H3ClientBuilder {
-            builder: quic_builder,
+            quic_builder,
             client_name,
             pool: Pool::global().clone(),
-            settings: Arc::default(),
+            builder: Arc::new(ConnectionBuilder::new(Arc::default())),
         })
     }
 }
 
 pub struct H3ClientBuilder {
-    builder: QuicClientBuilder<rustls::ClientConfig>,
+    quic_builder: QuicClientBuilder<rustls::ClientConfig>,
     client_name: Option<String>,
     pool: Pool<Connection>,
-    settings: Arc<Settings>,
+    builder: Arc<ConnectionBuilder<Connection>>,
 }
 
 impl H3ClientBuilder {
     pub fn physical_ifaces(mut self, physical_ifaces: &'static Devices) -> Self {
-        self.builder = self.builder.physical_ifaces(physical_ifaces);
+        self.quic_builder = self.quic_builder.physical_ifaces(physical_ifaces);
         self
     }
 
     pub fn with_resolver(mut self, resolver: Arc<dyn Resolve>) -> Self {
-        self.builder = self.builder.with_resolver(resolver);
+        self.quic_builder = self.quic_builder.with_resolver(resolver);
         self
     }
 
     pub fn with_iface_factory(mut self, factory: Arc<dyn ProductIO + 'static>) -> Self {
-        self.builder = self.builder.with_iface_factory(factory);
+        self.quic_builder = self.quic_builder.with_iface_factory(factory);
         self
     }
 
     /// Specify the interfaces manager for the client.
     pub fn with_iface_manager(mut self, iface_manager: Arc<InterfaceManager>) -> Self {
-        self.builder = self.builder.with_iface_manager(iface_manager);
+        self.quic_builder = self.quic_builder.with_iface_manager(iface_manager);
         self
     }
 
     pub fn with_router(mut self, router: Arc<QuicRouter>) -> Self {
-        self.builder = self.builder.with_router(router);
+        self.quic_builder = self.quic_builder.with_router(router);
         self
     }
 
     pub async fn bind(mut self, uri: impl IntoIterator<Item = impl Into<BindUri>>) -> Self {
-        self.builder = self.builder.bind(uri).await;
+        self.quic_builder = self.quic_builder.bind(uri).await;
         self
     }
 
     pub fn defer_idle_timeout(mut self, duration: Duration) -> Self {
-        self.builder = self.builder.defer_idle_timeout(duration);
+        self.quic_builder = self.quic_builder.defer_idle_timeout(duration);
         self
     }
 
     pub fn with_quic_parameters(mut self, parameters: ClientParameters) -> Self {
-        self.builder = self.builder.with_parameters(parameters);
+        self.quic_builder = self.quic_builder.with_parameters(parameters);
         self
     }
 
@@ -235,29 +235,29 @@ impl H3ClientBuilder {
         mut self,
         strategy_factory: Arc<dyn ProductStreamsConcurrencyController>,
     ) -> Self {
-        self.builder = self
-            .builder
+        self.quic_builder = self
+            .quic_builder
             .with_streams_concurrency_strategy(strategy_factory);
         self
     }
 
     pub fn with_qlog(mut self, logger: Arc<dyn QLog + Send + Sync>) -> Self {
-        self.builder = self.builder.with_qlog(logger);
+        self.quic_builder = self.quic_builder.with_qlog(logger);
         self
     }
 
     pub fn with_token_sink(mut self, sink: Arc<dyn TokenSink>) -> Self {
-        self.builder = self.builder.with_token_sink(sink);
+        self.quic_builder = self.quic_builder.with_token_sink(sink);
         self
     }
 
     pub fn enable_sslkeylog(mut self) -> Self {
-        self.builder = self.builder.enable_sslkeylog();
+        self.quic_builder = self.quic_builder.enable_sslkeylog();
         self
     }
 
     pub fn enable_0rtt(mut self) -> Self {
-        self.builder = self.builder.enable_0rtt();
+        self.quic_builder = self.quic_builder.enable_0rtt();
         self
     }
 
@@ -265,21 +265,20 @@ impl H3ClientBuilder {
         self.pool = pool;
         self
     }
-
-    pub fn with_settings(mut self, settings: Arc<Settings>) -> Self {
-        self.settings = settings;
+    pub fn with_builder(mut self, builder: Arc<ConnectionBuilder<Connection>>) -> Self {
+        self.builder = builder;
         self
     }
 
     pub fn build(self) -> H3Client {
         let client = match self.client_name {
-            Some(client_name) => self.builder.with_name(client_name).build(),
-            None => self.builder.build(),
+            Some(client_name) => self.quic_builder.with_name(client_name).build(),
+            None => self.quic_builder.build(),
         };
         Client::from_quic_client()
             .pool(self.pool.clone())
             .client(Arc::new(client))
-            .settings(self.settings.clone())
+            .builder(self.builder.clone())
             .build()
     }
 }

@@ -1,5 +1,7 @@
 use std::{
+    collections::hash_map::DefaultHasher,
     error::Error,
+    hash::{Hash, Hasher},
     pin::pin,
     sync::{Arc, LazyLock},
 };
@@ -11,7 +13,11 @@ use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::{connection::Connection, dhttp::settings::Settings, quic, util::watch::Watch};
+use crate::{
+    connection::{Connection, ConnectionBuilder},
+    quic,
+    util::watch::Watch,
+};
 
 #[derive(Debug)]
 pub struct ReuseableConnection<C: quic::Connection> {
@@ -19,7 +25,7 @@ pub struct ReuseableConnection<C: quic::Connection> {
     task: AsyncMutex<Option<AbortOnDropHandle<()>>>,
 }
 
-type ConnectionIdentifier = (Authority, Arc<Settings>);
+type ConnectionIdentifier = (Authority, u64);
 type ReuseableConnections<C> = DashMap<ConnectionIdentifier, Arc<ReuseableConnection<C>>>;
 
 impl<C: quic::Connection> ReuseableConnection<C> {
@@ -150,15 +156,20 @@ impl<C: quic::Connection> Pool<C> {
     pub async fn reuse_or_connect_with<Client>(
         &self,
         connector: &Client,
-        settings: Arc<Settings>,
+        builder: Arc<ConnectionBuilder<C>>,
         server: Authority,
     ) -> Result<Arc<Connection<C>>, ConnectError<Client::Error>>
     where
         Client: quic::Connect<Connection = C> + ?Sized,
     {
+        let builder_hash = {
+            let mut hasher = DefaultHasher::new();
+            builder.hash(&mut hasher);
+            Hasher::finish(&hasher)
+        };
         let reuseable_connection = self
             .connections
-            .entry((server.clone(), settings.clone()))
+            .entry((server.clone(), builder_hash))
             .or_insert_with(|| Arc::new(ReuseableConnection::pending()))
             .clone();
         // break borrow of dashmap::Entry to avoid deadlock
@@ -178,7 +189,7 @@ impl<C: quic::Connection> Pool<C> {
                         .connect(&server)
                         .await
                         .context(connect_error::ConnectorSnafu)?;
-                    let connection = Connection::new(settings.clone(), quic_conn).await?;
+                    let connection = builder.build(quic_conn).await?;
 
                     tracing::debug!("H3 connection established, verifying peer identity");
                     let remote_agent = connection.remote_agent().await?;
@@ -197,10 +208,9 @@ impl<C: quic::Connection> Pool<C> {
                         let connection = connection.clone();
                         let pool = self.clone();
                         let server = server.clone();
-                        let settings = settings.clone();
                         async move {
                             connection.closed().await;
-                            pool.spawn_try_release((server, settings));
+                            pool.spawn_try_release((server, builder_hash));
                         }
                     }));
                     Ok((connection, task))
@@ -221,25 +231,29 @@ impl<C: quic::Connection> Pool<C> {
 
         match &result {
             Ok(..) => tracing::debug!("Connection ready to use"),
-            Err(..) => self.clone().spawn_try_release((server, settings)),
+            Err(..) => self.clone().spawn_try_release((server, builder_hash)),
         }
 
         result
     }
 
-    pub async fn try_insert(&self, connection: Arc<Connection<C>>) -> Result<(), InsertError> {
+    pub async fn try_insert(
+        &self,
+        connection: Arc<Connection<C>>,
+        builder_hash: u64,
+    ) -> Result<(), InsertError> {
         let remote_agent = connection
             .remote_agent()
             .await?
             .context(insert_error::MissingIdentitySnafu)?;
-        let settings = connection.settings().clone();
+
         let client = remote_agent
             .name()
             .parse()
             .ok()
             .context(insert_error::InvalidIdentitySnafu)?;
 
-        let identity = (client, settings);
+        let identity = (client, builder_hash);
         let reuseable_connection = self
             .connections
             .entry(identity.clone())

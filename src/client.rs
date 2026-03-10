@@ -4,8 +4,7 @@ use http::uri::Authority;
 
 pub use crate::message::{stream::MessageStreamError, unify::ReadToStringError};
 use crate::{
-    connection::Connection,
-    dhttp::settings::Settings,
+    connection::{Connection, ConnectionBuilder},
     pool::{self, Pool},
     quic,
 };
@@ -17,7 +16,7 @@ pub use message::{PendingRequest, Request, RequestError, Response};
 pub struct Client<C: quic::Connect> {
     pool: Pool<C::Connection>,
     client: C,
-    settings: Arc<Settings>,
+    builder: Arc<ConnectionBuilder<C::Connection>>,
 }
 
 #[bon::bon]
@@ -29,12 +28,14 @@ impl<C: quic::Connect> Client<C> {
     fn new(
         #[builder(default = Pool::global().clone())] pool: Pool<C::Connection>,
         client: C,
-        #[builder(default)] settings: Arc<Settings>,
+        #[builder(default = Arc::new(ConnectionBuilder::new(Arc::default())))] builder: Arc<
+            ConnectionBuilder<C::Connection>,
+        >,
     ) -> Self {
         Self {
             pool,
             client,
-            settings,
+            builder,
         }
     }
 
@@ -51,7 +52,7 @@ impl<C: quic::Connect> Client<C> {
         server: Authority,
     ) -> Result<Arc<Connection<C::Connection>>, pool::ConnectError<C::Error>> {
         self.pool
-            .reuse_or_connect_with(&self.client, self.settings.clone(), server)
+            .reuse_or_connect_with(&self.client, self.builder.clone(), server)
             .await
     }
 }
