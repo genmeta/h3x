@@ -65,6 +65,7 @@ impl<T> Watch<T> {
     pub fn watch(&self) -> Watcher<T> {
         Watcher {
             notified: self.notify.clone().notified_owned(),
+            notify: self.notify.clone(),
             value: self.value.clone(),
         }
     }
@@ -92,6 +93,7 @@ pin_project_lite::pin_project! {
     pub struct Watcher<T> {
         #[pin]
         notified: OwnedNotified,
+        notify: Arc<Notify>,
         value: Arc<SyncMutex<Option<T>>>
     }
 }
@@ -100,8 +102,11 @@ impl<T: Clone> Stream for Watcher<T> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let project = self.project();
-        ready!(project.notified.poll(cx));
-        Poll::Ready(project.value.lock().unwrap().clone())
+        let mut project = self.project();
+
+        ready!(project.notified.as_mut().poll(cx));
+        let value = project.value.lock().unwrap().clone();
+        project.notified.set(project.notify.clone().notified_owned());
+        Poll::Ready(value)
     }
 }
