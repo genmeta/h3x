@@ -1,5 +1,13 @@
 use std::{
-    any::Any, error::Error as StdError, fmt::Debug, io, marker::PhantomData, ops, sync::Arc,
+    any::Any,
+    collections::hash_map::DefaultHasher,
+    error::Error as StdError,
+    fmt::{self, Debug},
+    hash::{Hash, Hasher},
+    io,
+    marker::PhantomData,
+    ops,
+    sync::Arc,
 };
 
 use futures::FutureExt;
@@ -10,7 +18,7 @@ use crate::{
     codec::{PeekableStreamReader, SinkWriter, StreamReader},
     dhttp::{protocol::DHttpProtocolFactory, settings::Settings},
     error::{Code, HasErrorCode},
-    protocol::{InitProtocols, ProductProtocol, Protocols, StreamVerdict},
+    protocol::{InitProtocols, ProductProtocol, Protocols, StreamVerdict, type_id_as_u128},
     qpack::protocol::QPackProtocolFactory,
     quic::{self, CancelStreamExt, StopStreamExt, agent},
     util::set_once::SetOnce,
@@ -170,13 +178,23 @@ pub struct ConnectionBuilder<C: Any + ?Sized> {
     _connection: PhantomData<C>,
 }
 
+impl<C: Any + ?Sized> fmt::Debug for ConnectionBuilder<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionBuilder")
+            .field("protocols_count", &self.protocols_initializers.len())
+            .finish()
+    }
+}
+
 impl<C: quic::Connection + ?Sized> ConnectionBuilder<C> {
     pub fn new(settings: Arc<Settings>) -> Self {
         let builder = Self {
             protocols_initializers: Vec::new(),
             _connection: PhantomData,
         };
-        builder.protocol(DHttpProtocolFactory::new(settings))
+        builder
+            .protocol(DHttpProtocolFactory::new(settings))
+            .protocol(QPackProtocolFactory::new())
     }
 
     pub fn protocol<F: ProductProtocol<C>>(mut self, factory: F) -> Self {
@@ -203,6 +221,52 @@ impl<C: quic::Connection + ?Sized> ConnectionBuilder<C> {
         Ok(Connection(state))
     }
 }
+
+impl<C: quic::Connection + ?Sized> Hash for ConnectionBuilder<C> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let mut hashes: Vec<(u128, u64)> = self
+            .protocols_initializers
+            .iter()
+            .map(|f| {
+                let mut hasher = DefaultHasher::new();
+                f.identity_hash(&mut hasher);
+                (type_id_as_u128(f.identity_type_id()), hasher.finish())
+            })
+            .collect();
+        hashes.sort_by_key(|(tid, _)| *tid);
+        for (tid, h) in &hashes {
+            tid.hash(state);
+            h.hash(state);
+        }
+    }
+}
+
+impl<C: quic::Connection + ?Sized> PartialEq for ConnectionBuilder<C> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.protocols_initializers.len() != other.protocols_initializers.len() {
+            return false;
+        }
+        let sort_key = |f: &dyn InitProtocols<C>| type_id_as_u128(f.identity_type_id());
+        let mut self_sorted: Vec<_> = self
+            .protocols_initializers
+            .iter()
+            .map(|f| f.as_ref())
+            .collect();
+        let mut other_sorted: Vec<_> = other
+            .protocols_initializers
+            .iter()
+            .map(|f| f.as_ref())
+            .collect();
+        self_sorted.sort_by_key(|f| sort_key(*f));
+        other_sorted.sort_by_key(|f| sort_key(*f));
+        self_sorted
+            .iter()
+            .zip(other_sorted.iter())
+            .all(|(a, b)| a.identity_eq(b.as_any()))
+    }
+}
+
+impl<C: quic::Connection + ?Sized> Eq for ConnectionBuilder<C> {}
 
 #[derive(Debug)]
 pub struct ConnectionState<C: ?Sized> {
@@ -376,27 +440,151 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
     where
         C: Sized,
     {
-        let quic = Arc::new(QuicConnection::new(quic));
-        let mut protocols = Protocols::new();
-
-        DHttpProtocolFactory::new(settings)
-            .init_protocols(&quic, &mut protocols)
-            .await?;
-        QPackProtocolFactory::new()
-            .init_protocols(&quic, &mut protocols)
-            .await?;
-
-        let protocols = Arc::new(protocols);
-        let state = ConnectionState { quic, protocols };
-        tokio::spawn(ConnectionState::accept_uni_stream_task(state.clone()).in_current_span());
-        tokio::spawn(ConnectionState::accept_bi_stream_task(state.clone()).in_current_span());
-
-        Ok(Connection(state))
+        ConnectionBuilder::new(settings).build(quic).await
     }
 }
 
 impl<C: quic::Connection + ?Sized> Drop for Connection<C> {
     fn drop(&mut self) {
         self.close(&Code::H3_NO_ERROR);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+        sync::Arc,
+    };
+
+    use futures::future::BoxFuture;
+
+    use super::ConnectionBuilder;
+    use crate::{
+        codec::{BoxPeekableBiStream, BoxPeekableUniStream},
+        connection::{QuicConnection, StreamError},
+        dhttp::settings::{Setting, Settings},
+        protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
+        quic::{self, ConnectionError},
+        varint::VarInt,
+    };
+
+    fn hash_of<T: Hash>(val: &T) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        val.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Local mock protocol for builder tests.
+    #[derive(Debug)]
+    struct MockProtocol;
+
+    impl<C: quic::Connection + ?Sized> Protocol<C> for MockProtocol {
+        fn accept_uni<'a>(
+            &'a self,
+            _: &'a Arc<QuicConnection<C>>,
+            stream: BoxPeekableUniStream<C>,
+        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
+            Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
+        }
+
+        fn accept_bi<'a>(
+            &'a self,
+            _: &'a Arc<QuicConnection<C>>,
+            stream: BoxPeekableBiStream<C>,
+        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
+            Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
+        }
+    }
+
+    /// Local mock factory for builder tests.
+    #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+    struct MockFactory(u64);
+
+    impl<C: quic::Connection + ?Sized> ProductProtocol<C> for MockFactory {
+        type Protocol = MockProtocol;
+
+        fn init<'a>(
+            &'a self,
+            _: &'a Arc<QuicConnection<C>>,
+            _: &'a Protocols<C>,
+        ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
+            unimplemented!("not used in builder identity tests")
+        }
+    }
+
+    #[cfg(feature = "gm-quic")]
+    type C = gm_quic::prelude::Connection;
+
+    #[cfg(feature = "gm-quic")]
+    #[test]
+    fn builder_same_settings_equal_hash() {
+        let s = Arc::new(Settings::default());
+        let a = ConnectionBuilder::<C>::new(s.clone());
+        let b = ConnectionBuilder::<C>::new(s);
+        assert_eq!(hash_of(&a), hash_of(&b));
+    }
+
+    #[cfg(feature = "gm-quic")]
+    #[test]
+    fn builder_different_settings_different_hash() {
+        let s1 = Arc::new(Settings::default());
+        let mut s2_inner = Settings::default();
+        s2_inner.set(Setting::max_field_section_size(VarInt::from_u32(9999)));
+        let s2 = Arc::new(s2_inner);
+        let a = ConnectionBuilder::<C>::new(s1);
+        let b = ConnectionBuilder::<C>::new(s2);
+        assert_ne!(hash_of(&a), hash_of(&b));
+    }
+
+    #[cfg(feature = "gm-quic")]
+    #[test]
+    fn builder_extra_protocol_different_hash() {
+        let s = Arc::new(Settings::default());
+        let a = ConnectionBuilder::<C>::new(s.clone());
+        let b = ConnectionBuilder::<C>::new(s).protocol(MockFactory(42));
+        assert_ne!(hash_of(&a), hash_of(&b));
+    }
+
+    #[cfg(feature = "gm-quic")]
+    #[test]
+    fn builder_order_independent_hash() {
+        let s = Arc::new(Settings::default());
+        // a: DHttpProtocolFactory, QPackProtocolFactory, MockFactory (from new + protocol)
+        let a = ConnectionBuilder::<C>::new(s.clone()).protocol(MockFactory(7));
+        // b: MockFactory first, then DHttpProtocolFactory, QPackProtocolFactory
+        let b = {
+            let builder = ConnectionBuilder::<C> {
+                protocols_initializers: Vec::new(),
+                _connection: std::marker::PhantomData,
+            };
+            builder
+                .protocol(MockFactory(7))
+                .protocol(crate::dhttp::protocol::DHttpProtocolFactory::new(s))
+                .protocol(crate::qpack::protocol::QPackProtocolFactory::new())
+        };
+        assert_eq!(hash_of(&a), hash_of(&b));
+    }
+
+    #[cfg(feature = "gm-quic")]
+    #[test]
+    fn builder_same_settings_eq() {
+        let s = Arc::new(Settings::default());
+        let a = ConnectionBuilder::<C>::new(s.clone());
+        let b = ConnectionBuilder::<C>::new(s);
+        assert_eq!(a, b);
+    }
+
+    #[cfg(feature = "gm-quic")]
+    #[test]
+    fn builder_different_settings_not_eq() {
+        let s1 = Arc::new(Settings::default());
+        let mut s2_inner = Settings::default();
+        s2_inner.set(Setting::max_field_section_size(VarInt::from_u32(9999)));
+        let s2 = Arc::new(s2_inner);
+        let a = ConnectionBuilder::<C>::new(s1);
+        let b = ConnectionBuilder::<C>::new(s2);
+        assert_ne!(a, b);
     }
 }

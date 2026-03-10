@@ -110,8 +110,7 @@ pub trait ProductProtocol<C: quic::Connection + ?Sized>:
     ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>>;
 }
 
-#[allow(dead_code)]
-pub(crate) trait InitProtocols<C: quic::Connection + ?Sized> {
+pub(crate) trait InitProtocols<C: quic::Connection + ?Sized>: Send + Sync {
     fn init_protocols<'a>(
         &'a self,
         conn: &'a Arc<QuicConnection<C>>,
@@ -125,10 +124,14 @@ pub(crate) trait InitProtocols<C: quic::Connection + ?Sized> {
     fn identity_eq(&self, other: &dyn Any) -> bool;
 
     /// Ordering: by TypeId first, then by value within the same type.
+    #[allow(dead_code)]
     fn identity_cmp(&self, other: &dyn Any) -> Ordering;
 
     /// Returns the concrete TypeId.
     fn identity_type_id(&self) -> TypeId;
+
+    /// Returns self as `&dyn Any` for downcasting.
+    fn as_any(&self) -> &dyn Any;
 }
 
 impl<C: quic::Connection + ?Sized, P: ProductProtocol<C>> InitProtocols<C> for P {
@@ -173,6 +176,10 @@ impl<C: quic::Connection + ?Sized, P: ProductProtocol<C>> InitProtocols<C> for P
     fn identity_type_id(&self) -> TypeId {
         TypeId::of::<P>()
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 /// Extracts the TypeId from a `dyn Any` value.
@@ -182,15 +189,13 @@ fn identity_type_id_of(val: &dyn Any) -> TypeId {
 }
 
 /// Transmutes a TypeId to u128 for cross-type ordering.
-#[allow(dead_code)]
-fn type_id_as_u128(tid: TypeId) -> u128 {
+pub(crate) fn type_id_as_u128(tid: TypeId) -> u128 {
     // SAFETY: TypeId is currently a u128 on all platforms.
     // This is used only for deterministic ordering, not for safety-critical logic.
     unsafe { std::mem::transmute(tid) }
 }
 
 /// Adapter to use `&mut dyn Hasher` with `Hash::hash`.
-#[allow(dead_code)]
 struct DynHasher<'a>(&'a mut dyn Hasher);
 
 impl Hasher for DynHasher<'_> {
