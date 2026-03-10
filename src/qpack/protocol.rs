@@ -171,7 +171,7 @@ impl<C: quic::Connection + ?Sized> Protocol<C> for QPackProtocol<C> {
     }
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct QPackProtocolFactory {
     // No state for now, but can add config options here in the future.
 }

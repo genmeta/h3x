@@ -357,7 +357,7 @@ impl<C: quic::Connection + ?Sized> Protocol<C> for DHttpProtocol {
     }
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DHttpProtocolFactory {
     local_settings: Arc<Settings>,
 }
