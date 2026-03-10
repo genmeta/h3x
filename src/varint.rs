@@ -2,7 +2,7 @@ use std::{cmp::Ordering, convert::TryFrom, fmt, pin::pin};
 
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::codec::{Decode, Encode};
+use crate::codec::{DecodeFrom, EncodeInto};
 
 /// An integer less than 2^62
 ///
@@ -186,27 +186,28 @@ pub mod err {
     }
 }
 
-impl<S: AsyncRead + Send> Decode<VarInt> for S {
+impl<S: AsyncRead + Send> DecodeFrom<S> for VarInt {
     type Error = io::Error;
 
-    async fn decode(self) -> io::Result<VarInt> {
-        let mut stream = pin!(self);
+    async fn decode_from(stream: S) -> io::Result<Self> {
+        let mut stream = pin!(stream);
         let first_byte = stream.read_u8().await?;
         let len = 2usize.pow(first_byte as u32 >> 6);
         let mut buf = [first_byte & 0b0011_1111, 0, 0, 0, 0, 0, 0, 0];
         stream.read_exact(&mut buf[1..len]).await?;
         let value = u64::from_be_bytes(buf) >> (8 * (8 - len));
-        Ok(VarInt(value))
+        Ok(Self(value))
     }
 }
 
-impl<S: AsyncWrite + Send> Encode<VarInt> for S {
+impl<S: AsyncWrite + Send> EncodeInto<S> for VarInt {
     type Output = ();
 
     type Error = io::Error;
 
-    async fn encode(self, VarInt(x): VarInt) -> Result<Self::Output, Self::Error> {
-        let mut stream = pin!(self);
+    async fn encode_into(self, stream: S) -> Result<Self::Output, Self::Error> {
+        let VarInt(x) = self;
+        let mut stream = pin!(stream);
         if x < 1u64 << 6 {
             stream.write_u8(x as u8).await?;
         } else if x < 1u64 << 14 {

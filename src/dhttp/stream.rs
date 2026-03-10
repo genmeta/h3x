@@ -8,7 +8,7 @@ use futures::{Sink, Stream};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
-    codec::{Decode, DecodeExt, DecodeStreamError, EncodeExt},
+    codec::{DecodeExt, DecodeFrom, DecodeStreamError, EncodeExt},
     connection::StreamError,
     error::Code,
     quic::{self, CancelStream, GetStreamId, StopStream},
@@ -34,11 +34,11 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl<S: AsyncRead + Unpin + Send> Decode<UnidirectionalStream<S>> for S {
+impl<S: AsyncRead + Unpin + Send> DecodeFrom<S> for UnidirectionalStream<S> {
     type Error = StreamError;
 
-    async fn decode(self) -> Result<UnidirectionalStream<S>, Self::Error> {
-        UnidirectionalStream::accept(self).await
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        UnidirectionalStream::accept(stream).await
     }
 }
 

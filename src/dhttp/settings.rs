@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 
 use crate::{
     buflist::BufList,
-    codec::{Decode, DecodeExt, DecodeStreamError, Encode, EncodeExt},
+    codec::{DecodeExt, DecodeFrom, DecodeStreamError, EncodeExt, EncodeInto},
     connection::StreamError,
     dhttp::{frame::Frame, stream::UnidirectionalStream},
     error::{Code, H3CriticalStreamClosed, HasErrorCode},
@@ -171,12 +171,12 @@ impl HasErrorCode for InvalidSettingValue {
     }
 }
 
-impl<S: AsyncRead + Send> Decode<Setting> for S {
+impl<S: AsyncRead + Send> DecodeFrom<S> for Setting {
     type Error = StreamError;
 
-    async fn decode(self) -> Result<Setting, Self::Error> {
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let decode = async move {
-            let mut stream = pin!(self);
+            let mut stream = pin!(stream);
             let id = stream.decode_one().await?;
             let value = stream.decode_one().await?;
             Ok(Setting { id, value })
@@ -193,14 +193,15 @@ impl<S: AsyncRead + Send> Decode<Setting> for S {
     }
 }
 
-impl<S: AsyncWrite + Send> Encode<Setting> for S {
+impl<S: AsyncWrite + Send> EncodeInto<S> for Setting {
     type Output = ();
 
     type Error = StreamError;
 
-    async fn encode(self, Setting { id, value }: Setting) -> Result<Self::Output, Self::Error> {
+    async fn encode_into(self, stream: S) -> Result<Self::Output, Self::Error> {
+        let Setting { id, value } = self;
         let encode = async move {
-            let mut stream = pin!(self);
+            let mut stream = pin!(stream);
             stream.as_mut().encode_one(id).await?;
             stream.as_mut().encode_one(value).await?;
             Ok(())
@@ -219,15 +220,15 @@ pub struct Settings {
     map: BTreeMap<VarInt, VarInt>,
 }
 
-impl<S> Decode<Settings> for S
+impl<S> DecodeFrom<S> for Settings
 where
     for<'s> &'s mut S: AsyncBufRead,
     S: Send,
 {
     type Error = StreamError;
 
-    async fn decode(self) -> Result<Settings, Self::Error> {
-        let mut stream = pin!(self.into_decode_stream::<Setting, StreamError>());
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = pin!(stream.into_decode_stream::<Setting, StreamError>());
         let mut settings = Settings::default();
         while let Some(setting) = stream.try_next().await? {
             settings.set(setting);
@@ -236,28 +237,28 @@ where
     }
 }
 
-impl Encode<&Settings> for BufList {
+impl<'a> EncodeInto<BufList> for &'a Settings {
     type Output = Frame<BufList>;
 
     type Error = Infallible;
 
-    async fn encode(self, settings: &Settings) -> Result<Self::Output, Self::Error> {
-        assert!(!self.has_remaining());
-        let mut frame = Frame::new(Frame::SETTINGS_FRAME_TYPE, self).unwrap();
-        for setting in settings {
+    async fn encode_into(self, stream: BufList) -> Result<Self::Output, Self::Error> {
+        assert!(!stream.has_remaining());
+        let mut frame = Frame::new(Frame::SETTINGS_FRAME_TYPE, stream).unwrap();
+        for setting in self {
             frame.encode_one(setting).await.unwrap();
         }
         Ok(frame)
     }
 }
 
-impl Encode<Settings> for BufList {
+impl EncodeInto<BufList> for Settings {
     type Output = Frame<BufList>;
 
     type Error = Infallible;
 
-    async fn encode(self, settings: Settings) -> Result<Self::Output, Self::Error> {
-        self.encode(&settings).await
+    async fn encode_into(self, stream: BufList) -> Result<Self::Output, Self::Error> {
+        (&self).encode_into(stream).await
     }
 }
 

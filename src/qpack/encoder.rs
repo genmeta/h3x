@@ -15,7 +15,7 @@ use tokio::{
 
 use crate::{
     buflist::BufList,
-    codec::{Decode, DecodeStreamError, Encode, EncodeError, EncodeStreamError, Feed},
+    codec::{DecodeFrom, DecodeStreamError, EncodeError, EncodeInto, EncodeStreamError, Feed},
     connection::StreamError,
     dhttp::{frame::Frame, settings::Settings},
     error::{Code, H3CriticalStreamClosed, HasErrorCode},
@@ -481,12 +481,12 @@ pub enum EncoderInstruction {
     Duplicate { index: u64 },
 }
 
-impl<S: AsyncBufRead + Send> Decode<EncoderInstruction> for S {
+impl<S: AsyncBufRead + Send> DecodeFrom<S> for EncoderInstruction {
     type Error = StreamError;
 
-    async fn decode(self) -> Result<EncoderInstruction, Self::Error> {
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
         let decode = async move {
-            let mut stream = pin!(self);
+            let mut stream = pin!(stream);
             let prefix = stream.read_u8().await?;
             match prefix {
                 prefix if prefix & 0b1110_0000 == 0b0010_0000 => {
@@ -540,7 +540,7 @@ impl<S: AsyncBufRead + Send> Decode<EncoderInstruction> for S {
     }
 }
 
-impl<S> Encode<EncoderInstruction> for S
+impl<S> EncodeInto<S> for EncoderInstruction
 where
     S: AsyncWrite + Sink<Bytes, Error = quic::StreamError> + Send,
 {
@@ -548,9 +548,10 @@ where
 
     type Error = StreamError;
 
-    async fn encode(self, inst: EncoderInstruction) -> Result<Self::Output, Self::Error> {
+    async fn encode_into(self, stream: S) -> Result<Self::Output, Self::Error> {
+        let inst = self;
         let encode = async move {
-            let mut stream = pin!(self);
+            let mut stream = pin!(stream);
             match inst {
                 EncoderInstruction::SetDynamicTableCapacity { capacity } => {
                     let prefix = 0b0010_0000;

@@ -5,7 +5,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 use crate::{
     buflist::BufList,
-    codec::{Decode, DecodeExt, DecodeStreamError, Encode, EncodeExt},
+    codec::{DecodeExt, DecodeFrom, DecodeStreamError, EncodeExt, EncodeInto},
     connection::StreamError,
     dhttp::frame::Frame,
     error::{Code, H3CriticalStreamClosed},
@@ -32,16 +32,16 @@ impl Goaway {
     }
 }
 
-impl<S> Decode<Goaway> for &mut Frame<S>
+impl<S> DecodeFrom<&mut Frame<S>> for Goaway
 where
     for<'f> &'f mut Frame<S>: AsyncBufRead,
     S: Send,
 {
     type Error = StreamError;
 
-    async fn decode(mut self) -> Result<Goaway, Self::Error> {
-        assert!(self.r#type() == Frame::GOAWAY_FRAME_TYPE);
-        let stream_id = self.decode_one::<VarInt>().await.map_err(|error| {
+    async fn decode_from(stream: &mut Frame<S>) -> Result<Self, Self::Error> {
+        assert!(stream.r#type() == Frame::GOAWAY_FRAME_TYPE);
+        let stream_id = stream.decode_one::<VarInt>().await.map_err(|error| {
             DecodeStreamError::from(error).map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::Control.into(),
                 |decode_error| Code::H3_FRAME_ERROR.with(decode_error).into(),
@@ -49,7 +49,7 @@ where
         })?;
 
         // ensure frame is exhausted
-        if !self.fill_buf().await?.is_empty() {
+        if !stream.fill_buf().await?.is_empty() {
             // FIXME: which error kind?
             return Err(Code::H3_GENERAL_PROTOCOL_ERROR.into());
         };
@@ -58,20 +58,20 @@ where
     }
 }
 
-impl Encode<Goaway> for BufList {
+impl EncodeInto<BufList> for Goaway {
     type Output = Frame<BufList>;
 
     type Error = Infallible;
 
-    async fn encode(self, goaway: Goaway) -> Result<Self::Output, Self::Error> {
+    async fn encode_into(self, stream: BufList) -> Result<Self::Output, Self::Error> {
         assert!(
-            !self.has_remaining(),
+            !stream.has_remaining(),
             "Only empty buflist can be used to encode frame"
         );
 
-        let mut frame = Frame::new(Frame::GOAWAY_FRAME_TYPE, self).unwrap();
+        let mut frame = Frame::new(Frame::GOAWAY_FRAME_TYPE, stream).unwrap();
         frame
-            .encode_one(goaway.stream_id)
+            .encode_one(self.stream_id)
             .await
             .expect("size of varint never exceeded 2^62-1");
         Ok(frame)

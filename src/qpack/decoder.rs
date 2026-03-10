@@ -14,7 +14,7 @@ use tokio::{
 };
 
 use crate::{
-    codec::{Decode, DecodeExt, DecodeStreamError, Encode, Feed},
+    codec::{DecodeExt, DecodeFrom, DecodeStreamError, EncodeInto, Feed},
     connection::StreamError,
     dhttp::settings::Settings,
     error::{Code, H3CriticalStreamClosed, HasErrorCode},
@@ -495,12 +495,12 @@ pub enum DecoderInstruction {
     InsertCountIncrement { increment: u64 },
 }
 
-impl<S: AsyncBufRead + Send> Decode<DecoderInstruction> for S {
+impl<S: AsyncBufRead + Send> DecodeFrom<S> for DecoderInstruction {
     type Error = StreamError;
 
-    async fn decode(self) -> Result<DecoderInstruction, StreamError> {
+    async fn decode_from(stream: S) -> Result<Self, StreamError> {
         let decode = async move {
-            let mut stream = pin!(self);
+            let mut stream = pin!(stream);
             let prefix = stream.read_u8().await?;
             match prefix {
                 prefix if prefix & 0b1000_0000 == 0b1000_0000 => {
@@ -529,7 +529,7 @@ impl<S: AsyncBufRead + Send> Decode<DecoderInstruction> for S {
     }
 }
 
-impl<S> Encode<DecoderInstruction> for S
+impl<S> EncodeInto<S> for DecoderInstruction
 where
     S: AsyncWrite + Send,
 {
@@ -537,9 +537,10 @@ where
 
     type Error = StreamError;
 
-    async fn encode(self, inst: DecoderInstruction) -> Result<Self::Output, Self::Error> {
+    async fn encode_into(self, stream: S) -> Result<Self::Output, Self::Error> {
+        let inst = self;
         let encode = async move {
-            let mut stream = pin!(self);
+            let mut stream = pin!(stream);
             match inst {
                 DecoderInstruction::SectionAcknowledgment { stream_id } => {
                     let prefix = 0b1000_0000;
