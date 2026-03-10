@@ -587,4 +587,77 @@ mod tests {
         let b = ConnectionBuilder::<C>::new(s2);
         assert_ne!(a, b);
     }
+
+    /// Simulates pool key distinction: two builders with different protocol stacks
+    /// produce different hashes, so the pool stores them under separate keys.
+    #[cfg(feature = "gm-quic")]
+    #[test]
+    fn pool_key_different_builders_different_hash() {
+        let s = Arc::new(Settings::default());
+        let a = ConnectionBuilder::<C>::new(s.clone()).protocol(MockFactory(1));
+        let b = ConnectionBuilder::<C>::new(s).protocol(MockFactory(2));
+        // Pool computes hash via DefaultHasher the same way hash_of does.
+        // Different protocol stacks must yield different keys.
+        assert_ne!(hash_of(&a), hash_of(&b));
+    }
+
+    /// Simulates pool key reuse: two identical builders produce the same hash,
+    /// so the pool correctly groups them under one key for connection reuse.
+    #[cfg(feature = "gm-quic")]
+    #[test]
+    fn pool_key_same_builders_same_hash() {
+        let s = Arc::new(Settings::default());
+        let a = ConnectionBuilder::<C>::new(s.clone()).protocol(MockFactory(42));
+        let b = ConnectionBuilder::<C>::new(s).protocol(MockFactory(42));
+        assert_eq!(hash_of(&a), hash_of(&b));
+    }
+
+    /// Verifies hash determinism: hashing the same builder twice yields the same
+    /// value, and an identically-constructed builder also matches.
+    #[cfg(feature = "gm-quic")]
+    #[test]
+    fn builder_hash_determinism() {
+        let s = Arc::new(Settings::default());
+        let builder = ConnectionBuilder::<C>::new(s.clone()).protocol(MockFactory(99));
+        let h1 = hash_of(&builder);
+        let h2 = hash_of(&builder);
+        assert_eq!(
+            h1, h2,
+            "hashing the same builder twice must be deterministic"
+        );
+
+        // A second, identically-constructed builder must produce the same hash.
+        let builder2 = ConnectionBuilder::<C>::new(s).protocol(MockFactory(99));
+        assert_eq!(
+            h1,
+            hash_of(&builder2),
+            "identical builders must hash equally"
+        );
+    }
+
+    #[cfg(feature = "gm-quic")]
+    #[test]
+    fn builder_clone_like_rebuild_hash_determinism() {
+        let s = Arc::new(Settings::default());
+        let a = ConnectionBuilder::<C>::new(s.clone()).protocol(MockFactory(100));
+        let b = ConnectionBuilder::<C>::new(s).protocol(MockFactory(100));
+        assert_eq!(
+            hash_of(&a),
+            hash_of(&b),
+            "builders built via same steps must hash identically"
+        );
+    }
+
+    #[cfg(feature = "gm-quic")]
+    #[test]
+    fn builder_mock_factory_included_in_hash() {
+        let s = Arc::new(Settings::default());
+        let base = ConnectionBuilder::<C>::new(s.clone());
+        let with_mock = ConnectionBuilder::<C>::new(s).protocol(MockFactory(42));
+        assert_ne!(
+            hash_of(&base),
+            hash_of(&with_mock),
+            "adding MockFactory must change the hash"
+        );
+    }
 }

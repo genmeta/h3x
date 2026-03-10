@@ -273,3 +273,104 @@ impl<C: quic::Connection> Pool<C> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+        sync::Arc,
+    };
+
+    use futures::future::BoxFuture;
+
+    use crate::{
+        codec::{BoxPeekableBiStream, BoxPeekableUniStream},
+        connection::{ConnectionBuilder, QuicConnection, StreamError},
+        dhttp::settings::{Setting, Settings},
+        protocol::{ProductProtocol, Protocol, StreamVerdict},
+        quic::{self, ConnectionError},
+        varint::VarInt,
+    };
+
+    fn hash_of<T: Hash>(val: &T) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        val.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Local mock protocol for pool tests.
+    #[derive(Debug)]
+    struct MockProtocol;
+
+    impl<C: quic::Connection + ?Sized> Protocol<C> for MockProtocol {
+        fn accept_uni<'a>(
+            &'a self,
+            _: &'a Arc<QuicConnection<C>>,
+            stream: BoxPeekableUniStream<C>,
+        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
+            Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
+        }
+
+        fn accept_bi<'a>(
+            &'a self,
+            _: &'a Arc<QuicConnection<C>>,
+            stream: BoxPeekableBiStream<C>,
+        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
+            Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
+        }
+    }
+
+    /// Local mock factory for pool tests.
+    #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+    struct MockFactory(u64);
+
+    impl<C: quic::Connection + ?Sized> ProductProtocol<C> for MockFactory {
+        type Protocol = MockProtocol;
+
+        fn init<'a>(
+            &'a self,
+            _: &'a Arc<QuicConnection<C>>,
+            _: &'a crate::protocol::Protocols<C>,
+        ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
+            unimplemented!("not used in pool key tests")
+        }
+    }
+
+    #[cfg(feature = "gm-quic")]
+    type C = gm_quic::prelude::Connection;
+
+    #[cfg(feature = "gm-quic")]
+    #[test]
+    fn pool_key_different_builders_different_entries() {
+        let s1 = Arc::new(Settings::default());
+        let mut s2_inner = Settings::default();
+        s2_inner.set(Setting::max_field_section_size(VarInt::from_u32(9999)));
+        let s2 = Arc::new(s2_inner);
+
+        let builder_a = ConnectionBuilder::<C>::new(s1);
+        let builder_b = ConnectionBuilder::<C>::new(s2);
+
+        let key_a = hash_of(&builder_a);
+        let key_b = hash_of(&builder_b);
+        assert_ne!(
+            key_a, key_b,
+            "different protocol stacks must produce different pool keys"
+        );
+    }
+
+    #[cfg(feature = "gm-quic")]
+    #[test]
+    fn pool_key_same_builder_same_entry() {
+        let s = Arc::new(Settings::default());
+        let builder_a = ConnectionBuilder::<C>::new(s.clone());
+        let builder_b = ConnectionBuilder::<C>::new(s);
+
+        let key_a = hash_of(&builder_a);
+        let key_b = hash_of(&builder_b);
+        assert_eq!(
+            key_a, key_b,
+            "identical protocol stacks must produce the same pool key"
+        );
+    }
+}
