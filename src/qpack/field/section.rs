@@ -12,7 +12,7 @@ use snafu::{ResultExt, Snafu, ensure};
 
 use super::{FieldLine, Protocol, PseudoHeaders};
 use crate::{
-    codec::Decode,
+    codec::DecodeFrom,
     connection::StreamError,
     error::{Code, HasErrorCode},
 };
@@ -401,11 +401,11 @@ impl FieldSection {
     }
 }
 
-impl<S: Stream<Item = Result<FieldLine, StreamError>> + Send> Decode<FieldSection> for S {
+impl<S: Stream<Item = Result<FieldLine, StreamError>> + Send> DecodeFrom<S> for FieldSection {
     type Error = StreamError;
 
-    async fn decode(self) -> Result<FieldSection, Self::Error> {
-        let mut stream = pin!(self);
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        let mut stream = pin!(stream);
 
         let mut pseudo_headers = None;
         let mut header_map = HeaderMap::new();

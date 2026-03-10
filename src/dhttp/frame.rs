@@ -12,8 +12,8 @@ use tokio::io::{self, AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 use crate::{
     buflist::BufList,
     codec::{
-        Decode, DecodeExt, DecodeStreamError, Encode, EncodeError, EncodeStreamError,
-        FixedLengthReader, StreamReader,
+        DecodeExt, DecodeFrom, DecodeStreamError, EncodeError, EncodeExt, EncodeInto,
+        EncodeStreamError, FixedLengthReader, StreamReader,
     },
     connection::StreamError,
     error::Code,
@@ -201,20 +201,20 @@ where
     }
 }
 
-impl<P: Buf + Send, S: AsyncWrite + Sink<Bytes, Error = quic::StreamError> + Send> Encode<Frame<P>>
-    for S
+impl<P: Buf + Send, S: AsyncWrite + Sink<Bytes, Error = quic::StreamError> + Send> EncodeInto<S>
+    for Frame<P>
 {
     type Output = ();
 
     type Error = quic::StreamError;
 
-    async fn encode(self, frame: Frame<P>) -> Result<Self::Output, Self::Error> {
+    async fn encode_into(self, stream: S) -> Result<Self::Output, Self::Error> {
         let Frame {
             r#type,
             length,
             mut payload,
-        } = frame;
-        let mut stream = pin!(self);
+        } = self;
+        let mut stream = pin!(stream);
         stream.as_mut().encode(r#type).await?;
         stream.as_mut().encode(length).await?;
         while payload.has_remaining() {
@@ -225,19 +225,20 @@ impl<P: Buf + Send, S: AsyncWrite + Sink<Bytes, Error = quic::StreamError> + Sen
     }
 }
 
-impl<P1, P> Decode<Frame<P1>> for Frame<P>
+impl<P1, P> DecodeFrom<Frame<P>> for Frame<P1>
 where
-    P: Decode<P1> + Send,
+    P1: DecodeFrom<P> + Send,
+    P: Send,
 {
-    type Error = P::Error;
+    type Error = <P1 as DecodeFrom<P>>::Error;
 
-    async fn decode(self) -> Result<Frame<P1>, Self::Error> {
+    async fn decode_from(stream: Frame<P>) -> Result<Self, Self::Error> {
         let Frame {
             r#type,
             length,
             payload,
-        } = self;
-        let payload = payload.decode().await?;
+        } = stream;
+        let payload = P1::decode_from(payload).await?;
         Ok(Frame {
             r#type,
             length,
@@ -246,19 +247,19 @@ where
     }
 }
 
-impl<S> Decode<Frame<BufList>> for &mut StreamReader<S>
+impl<S> DecodeFrom<&mut StreamReader<S>> for Frame<BufList>
 where
     S: TryStream<Ok = Bytes, Error = quic::StreamError> + Unpin + Send,
 {
     type Error = StreamError;
 
-    async fn decode(self) -> Result<Frame<BufList>, Self::Error> {
+    async fn decode_from(stream: &mut StreamReader<S>) -> Result<Self, Self::Error> {
         let decode = async move {
-            let r#type = self.decode_one::<VarInt>().await?;
-            let length = self.decode_one::<VarInt>().await?;
+            let r#type = stream.decode_one::<VarInt>().await?;
+            let length = stream.decode_one::<VarInt>().await?;
 
             let mut payload = BufList::new();
-            let mut reader = FixedLengthReader::new(self, length.into_inner());
+            let mut reader = FixedLengthReader::new(stream, length.into_inner());
             while let Some(bytes) = reader.try_next().await? {
                 payload.write(bytes);
             }
