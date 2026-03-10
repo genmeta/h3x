@@ -18,6 +18,9 @@ pub enum DecodeError {
     /// e.g: eval Base (https://datatracker.ietf.org/doc/html/rfc9204#section-4.5.1.2)
     #[snafu(display("arithmetic overflow while decoding"))]
     ArithmeticOverflow,
+    /// RFC 9204 §4.5.1.1: RIC decode failure or invalid base
+    #[snafu(display("QPACK decompression failed"))]
+    DecompressionFailed,
 }
 
 impl From<DecodeError> for io::Error {
@@ -25,9 +28,9 @@ impl From<DecodeError> for io::Error {
         let kind = match error {
             DecodeError::Incomplete => io::ErrorKind::UnexpectedEof,
             DecodeError::IntegerOverflow => io::ErrorKind::InvalidData,
-            DecodeError::InvalidHuffmanCode | DecodeError::ArithmeticOverflow => {
-                io::ErrorKind::InvalidData
-            }
+            DecodeError::InvalidHuffmanCode
+            | DecodeError::ArithmeticOverflow
+            | DecodeError::DecompressionFailed => io::ErrorKind::InvalidData,
         };
         io::Error::new(kind, error)
     }

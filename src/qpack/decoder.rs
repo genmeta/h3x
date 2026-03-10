@@ -334,7 +334,31 @@ where
         let mut header_frame = pin!(header_frame);
         let stream_id = header_frame.stream_id().await?.into_inner();
         let prefix: EncodedFieldSectionPrefix = header_frame.as_mut().decode_one().await?;
-        self.receive_instruction_until(prefix.required_insert_count)
+
+        // RFC 9204 §4.5.1.1: Decode the wire-encoded insert count to true RIC
+        let (max_table_capacity, total_inserts) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.settings.qpack_max_table_capacity().into_inner(),
+                state.dynamic_table.inserted_count,
+            )
+        };
+        let required_insert_count = EncodedFieldSectionPrefix::decode_ric(
+            prefix.encoded_insert_count,
+            max_table_capacity,
+            total_inserts,
+        )
+        .map_err(|e| Code::QPACK_DECOMPRESSION_FAILED.with(e))?;
+
+        // RFC 9204 §4.5.1.2: Resolve the true base
+        let base = EncodedFieldSectionPrefix::resolve_base(
+            required_insert_count,
+            prefix.sign,
+            prefix.delta_base,
+        )
+        .map_err(|e| Code::QPACK_DECOMPRESSION_FAILED.with(e))?;
+
+        self.receive_instruction_until(required_insert_count)
             .await?;
 
         let representations =
@@ -343,7 +367,7 @@ where
             representation.and_then(|representation| {
                 decompression_field_line_representation(
                     &representation,
-                    prefix.base,
+                    base,
                     &self.state.lock().unwrap().dynamic_table,
                 )
                 .map_err(StreamError::from)

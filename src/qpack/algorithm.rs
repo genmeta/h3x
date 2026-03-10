@@ -28,6 +28,25 @@ impl HuffmanStrategize for HuffmanNever {
     }
 }
 
+/// Compresses HTTP field lines into QPACK representations.
+///
+/// This trait defines the interface for field line compression algorithms that convert
+/// HTTP field lines into QPACK-encoded representations suitable for transmission.
+///
+/// # The `never_dynamic` Contract
+///
+/// Implementations **MUST** respect the `never_dynamic` (N-bit) constraint per RFC 9204 §7.1.
+/// When compressing a field line, if the resulting representation has `never_dynamic: true`,
+/// the field **MUST NOT** be inserted into the dynamic table. Fields marked with the N-bit
+/// are intended for protecting field values that should not be put at risk by compression.
+///
+/// The `never_dynamic` flag appears in these representation types:
+/// - [`FieldLineRepresentation::LiteralFieldLineWithNameReference`]: `never_dynamic: bool`
+/// - [`FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference`]: `never_dynamic: bool`
+/// - [`FieldLineRepresentation::LiteralFieldLineWithLiteralName`]: `never_dynamic: bool`
+///
+/// # RFC Reference
+/// // RFC 9204 §7.1: Fields marked with N-bit MUST NOT be inserted into dynamic table
 pub trait Algorithm {
     fn compress(
         &self,
@@ -50,14 +69,25 @@ impl<HS> Algorithm for StaticCompressAlgo<HS>
 where
     HS: HuffmanStrategize + Send + Sync,
 {
+    /// Compresses field lines using only the static table and literal representations,
+    /// ensuring compliance with the `never_dynamic` contract.
+    ///
+    /// This implementation always sets `never_dynamic: true` on all field line representations
+    /// and never inserts field lines into the dynamic table. It either:
+    /// - Returns an indexed field line (both static and dynamic table lookups point to static table)
+    /// - Returns a literal field line with a static name reference (`never_dynamic: true`)
+    /// - Returns a literal field line with a literal name (`never_dynamic: true`)
+    ///
+    /// By design, this algorithm cannot violate the RFC 9204 §7.1 constraint.
     async fn compress(
         &self,
         _state: &mut EncoderState,
         entries: impl IntoIterator<Item = FieldLine> + Send,
     ) -> (EncodedFieldSectionPrefix, Vec<FieldLineRepresentation>) {
         let prefix = EncodedFieldSectionPrefix {
-            required_insert_count: 0,
-            base: 0,
+            encoded_insert_count: 0,
+            sign: false,
+            delta_base: 0,
         };
         let mut representations = Vec::new();
         for FieldLine { name, value } in entries {

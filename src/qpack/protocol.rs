@@ -71,6 +71,18 @@ impl<S: ?Sized + Send> UnidirectionalStream<S> {
     pub const fn is_qpack_decoder_stream(&self) -> bool {
         self.r#type().into_inner() == UnidirectionalStream::QPACK_DECODER_STREAM_TYPE.into_inner()
     }
+
+    // RFC 9204 §4.2: decoder stream type = 0x03
+    pub async fn initial_qpack_decoder_stream(stream: S) -> Result<Self, StreamError>
+    where
+        S: AsyncWrite + Unpin + Sized,
+    {
+        Self::initial(UnidirectionalStream::QPACK_DECODER_STREAM_TYPE, stream)
+            .await
+            .map_err(|error| {
+                error.map_stream_reset(|_| H3CriticalStreamClosed::QPackDecoder.into())
+            })
+    }
 }
 
 pub type QPackEncoder = Encoder<
@@ -233,7 +245,7 @@ impl QPackProtocolFactory {
             let decoder_inst_sender = Box::pin(TryFuture::from(async move {
                 let uni_stream = Box::pin(SinkWriter::new(conn_state.open_uni().await?));
                 let decoder_stream =
-                    UnidirectionalStream::initial_qpack_encoder_stream(uni_stream).await?;
+                    UnidirectionalStream::initial_qpack_decoder_stream(uni_stream).await?;
                 Ok::<_, StreamError>(decoder_stream.into_encode_sink())
             }));
 
@@ -478,6 +490,29 @@ mod tests {
         assert_eq!(
             QPackProtocolFactory::new().cmp(&QPackProtocolFactory::new()),
             Ordering::Equal,
+        );
+    }
+    #[test]
+    fn qpack_decoder_stream_type_is_0x03() {
+        assert_eq!(
+            UnidirectionalStream::<()>::QPACK_DECODER_STREAM_TYPE.into_inner(),
+            0x03,
+        );
+    }
+
+    #[test]
+    fn qpack_encoder_stream_type_is_0x02() {
+        assert_eq!(
+            UnidirectionalStream::<()>::QPACK_ENCODER_STREAM_TYPE.into_inner(),
+            0x02,
+        );
+    }
+
+    #[test]
+    fn qpack_stream_type_constants_are_distinct() {
+        assert_ne!(
+            UnidirectionalStream::<()>::QPACK_ENCODER_STREAM_TYPE.into_inner(),
+            UnidirectionalStream::<()>::QPACK_DECODER_STREAM_TYPE.into_inner(),
         );
     }
 }

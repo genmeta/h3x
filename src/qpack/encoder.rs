@@ -72,11 +72,30 @@ pub enum QPackDecoderStreamError {
         "known received count increment overflow (known_received_count + increment > inserted_count)"
     ))]
     IncrementKnownReceivedCountOverflow,
+    #[snafu(display("insert count increment of zero is not allowed"))]
+    IncrementZero,
 }
 
 impl HasErrorCode for QPackDecoderStreamError {
     fn code(&self) -> Code {
         Code::QPACK_DECODER_STREAM_ERROR
+    }
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum QPackEncoderError {
+    #[snafu(display(
+        "dynamic table capacity {capacity} exceeds SETTINGS_QPACK_MAX_TABLE_CAPACITY {max}"
+    ))]
+    CapacityExceedsMax { capacity: u64, max: u64 },
+    #[snafu(display("cannot evict entries: no evictable entries in dynamic table"))]
+    CannotEvict,
+}
+
+impl HasErrorCode for QPackEncoderError {
+    fn code(&self) -> Code {
+        Code::QPACK_ENCODER_STREAM_ERROR
     }
 }
 
@@ -165,18 +184,27 @@ impl EncoderState {
         (absolute_index, entry)
     }
 
-    pub fn set_max_table_capacity(&mut self, new_capacity: u64) {
-        assert!(
-            new_capacity < self.settings.qpack_max_table_capacity().into_inner(),
-            "The encoder MUST NOT set a dynamic table capacity that exceeds SETTINGS_QPACK_MAX_TABLE_CAPACITY"
-        );
+    pub fn set_max_table_capacity(&mut self, new_capacity: u64) -> Result<(), QPackEncoderError> {
+        // RFC 9204 §4.3.1: The encoder MUST NOT set a dynamic table capacity that exceeds SETTINGS_QPACK_MAX_TABLE_CAPACITY
+        let max = self.settings.qpack_max_table_capacity().into_inner();
+        if new_capacity > max {
+            return Err(QPackEncoderError::CapacityExceedsMax {
+                capacity: new_capacity,
+                max,
+            });
+        }
         self.dynamic_table.capacity = new_capacity;
         while self.table_size() > new_capacity {
+            // RFC 9204 §2.1.1: entries are evictable only when acknowledged
+            if !self.entries_evictable() {
+                return Err(QPackEncoderError::CannotEvict);
+            }
             self.evict_entry();
         }
         self.emit(EncoderInstruction::SetDynamicTableCapacity {
             capacity: new_capacity,
         });
+        Ok(())
     }
 
     pub fn insert_with_name_reference(
@@ -185,7 +213,7 @@ impl EncoderState {
         name_index: u64,
         huffman: bool,
         value: Bytes,
-    ) -> u64 {
+    ) -> Result<u64, QPackEncoderError> {
         let name = match is_static {
             true => Bytes::from_static(
                 r#static::get_name(name_index)
@@ -207,6 +235,10 @@ impl EncoderState {
 
         let entry = FieldLine { name, value };
         while self.table_remaining() < entry.size() {
+            // RFC 9204 §2.1.1: entries are evictable only when acknowledged
+            if !self.entries_evictable() {
+                return Err(QPackEncoderError::CannotEvict);
+            }
             self.evict_entry();
         }
         let new_entry_index = self.index(entry.clone());
@@ -216,7 +248,7 @@ impl EncoderState {
             huffman,
             value: entry.value,
         });
-        new_entry_index
+        Ok(new_entry_index)
     }
 
     pub fn insert_with_literal_name(
@@ -225,9 +257,13 @@ impl EncoderState {
         name: Bytes,
         value_huffman: bool,
         value: Bytes,
-    ) -> u64 {
+    ) -> Result<u64, QPackEncoderError> {
         let entry = FieldLine { name, value };
         while self.table_remaining() < entry.size() {
+            // RFC 9204 §2.1.1: entries are evictable only when acknowledged
+            if !self.entries_evictable() {
+                return Err(QPackEncoderError::CannotEvict);
+            }
             self.evict_entry();
         }
         let new_entry_index = self.index(entry.clone());
@@ -237,10 +273,10 @@ impl EncoderState {
             value_huffman,
             value: entry.value,
         });
-        new_entry_index
+        Ok(new_entry_index)
     }
 
-    pub fn duplicate(&mut self, index: u64) -> u64 {
+    pub fn duplicate(&mut self, index: u64) -> Result<u64, QPackEncoderError> {
         let duplicated_entry = self
             .get_entry(index)
             .unwrap_or_else(|| {
@@ -248,12 +284,16 @@ impl EncoderState {
             })
             .clone();
         while self.table_remaining() < duplicated_entry.size() {
+            // RFC 9204 §2.1.1: entries are evictable only when acknowledged
+            if !self.entries_evictable() {
+                return Err(QPackEncoderError::CannotEvict);
+            }
             self.evict_entry();
         }
         let new_entry_index = self.index(duplicated_entry);
         self.pending_instructions
             .push_back(EncoderInstruction::Duplicate { index });
-        new_entry_index
+        Ok(new_entry_index)
     }
 
     pub fn entries(&self) -> impl Iterator<Item = (u64, &FieldLine)> {
@@ -289,6 +329,10 @@ impl EncoderState {
         &mut self,
         increment: u64,
     ) -> Result<(), QPackDecoderStreamError> {
+        // RFC 9204 §4.4.3: An increment of 0 is a connection error of type QPACK_DECODER_STREAM_ERROR
+        if increment == 0 {
+            return Err(QPackDecoderStreamError::IncrementZero);
+        }
         if self.table_inserted_count() - self.table_known_received_count() < increment {
             return Err(QPackDecoderStreamError::IncrementKnownReceivedCountOverflow);
         }
@@ -376,15 +420,28 @@ where
             (field_section_prefix, field_line_representations) =
                 algorithm.compress(&mut state, field_section).await;
 
-            let max_referenced_index = get_dynamic_references(&field_line_representations)
-                .max()
-                .unwrap_or(0);
+            // RFC 9204 §2.1.2: An encoder MUST limit the number of streams that could
+            // be blocked at the peer to the value of SETTINGS_QPACK_BLOCKED_STREAMS.
+            let has_dynamic_refs = get_dynamic_references(&field_line_representations)
+                .next()
+                .is_some();
 
-            state
-                .blocking_streams
-                .entry(stream_id)
-                .or_default()
-                .push_back(max_referenced_index);
+            if has_dynamic_refs {
+                let already_tracked = state.blocking_streams.contains_key(&stream_id);
+                let peer_max = state.settings.qpack_blocked_streams().into_inner();
+                let at_limit = !already_tracked && state.blocking_streams.len() as u64 >= peer_max;
+
+                if !at_limit {
+                    let max_referenced_index = get_dynamic_references(&field_line_representations)
+                        .max()
+                        .unwrap_or(0);
+                    state
+                        .blocking_streams
+                        .entry(stream_id)
+                        .or_default()
+                        .push_back(max_referenced_index);
+                }
+            }
         };
 
         let header_frame = BufList::new()
@@ -605,5 +662,184 @@ where
                 },
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+
+    use crate::{
+        dhttp::settings::{Setting, Settings},
+        qpack::{
+            encoder::{
+                EncoderState, QPackDecoderStreamError, QPackEncoderError, get_dynamic_references,
+            },
+            field::FieldLineRepresentation,
+        },
+        varint::VarInt,
+    };
+
+    fn settings_with_capacity(capacity: u32) -> Arc<Settings> {
+        let mut settings = Settings::default();
+        settings.set(Setting::qpack_max_table_capacity(VarInt::from_u32(
+            capacity,
+        )));
+        settings.set(Setting::qpack_blocked_streams(VarInt::from_u32(10)));
+        Arc::new(settings)
+    }
+
+    // --- Fix 2: zero increment rejection ---
+
+    #[test]
+    fn on_insert_count_increment_zero_returns_err() {
+        let mut state = EncoderState::new(settings_with_capacity(256));
+        let result = state.on_insert_count_increment(0);
+        assert!(
+            matches!(result, Err(QPackDecoderStreamError::IncrementZero)),
+            "Expected IncrementZero, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn on_insert_count_increment_valid_returns_ok() {
+        let mut state = EncoderState::new(settings_with_capacity(256));
+        // Set up: capacity, then insert one entry so inserted_count == 1
+        state
+            .set_max_table_capacity(64)
+            .expect("set capacity failed");
+        state
+            .insert_with_literal_name(
+                false,
+                Bytes::from_static(b"x-custom"),
+                false,
+                Bytes::from_static(b"val"),
+            )
+            .expect("insert failed");
+        // inserted_count == 1, known_received_count == 0 → increment of 1 is valid
+        let result = state.on_insert_count_increment(1);
+        assert!(result.is_ok(), "Expected Ok, got {result:?}");
+    }
+
+    // --- Fix 3: panic→error for capacity ---
+
+    #[test]
+    fn set_max_table_capacity_exceeds_max_returns_err() {
+        let mut state = EncoderState::new(settings_with_capacity(50));
+        let result = state.set_max_table_capacity(100);
+        assert!(
+            matches!(
+                result,
+                Err(QPackEncoderError::CapacityExceedsMax {
+                    capacity: 100,
+                    max: 50
+                })
+            ),
+            "Expected CapacityExceedsMax, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn set_max_table_capacity_equal_to_max_returns_ok() {
+        let mut state = EncoderState::new(settings_with_capacity(50));
+        let result = state.set_max_table_capacity(50);
+        assert!(
+            result.is_ok(),
+            "Expected Ok for capacity == max, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn set_max_table_capacity_below_max_returns_ok() {
+        let mut state = EncoderState::new(settings_with_capacity(50));
+        let result = state.set_max_table_capacity(30);
+        assert!(
+            result.is_ok(),
+            "Expected Ok for capacity < max, got {result:?}"
+        );
+    }
+
+    // --- Fix 4: eviction guard ---
+
+    #[test]
+    fn insert_with_literal_name_cannot_evict_when_unacknowledged() {
+        // Fill the table with an entry that uses the full capacity
+        // known_received_count stays 0, so no entries are evictable
+        let mut state = EncoderState::new(settings_with_capacity(256));
+        state
+            .set_max_table_capacity(64)
+            .expect("set capacity failed");
+        // Entry size = name.len() + value.len() + 32 = 8 + 8 + 32 + 32 = 64 (fills table)
+        // name = b"xxxxxxxx" (8), value = b"yyyyyyyy" (8) → size = 48, not enough
+        // Use name = b"x" * 16 (16) + value = b"y" * 16 (16) → size = 64 (exact fill)
+        state
+            .insert_with_literal_name(
+                false,
+                Bytes::from(vec![b'x'; 16]),
+                false,
+                Bytes::from(vec![b'y'; 16]),
+            )
+            .expect("first insert failed");
+        // Table is now full; trying to insert another entry should fail with CannotEvict
+        let result = state.insert_with_literal_name(
+            false,
+            Bytes::from_static(b"overflow"),
+            false,
+            Bytes::from_static(b"data"),
+        );
+        assert!(
+            matches!(result, Err(QPackEncoderError::CannotEvict)),
+            "Expected CannotEvict, got {result:?}"
+        );
+    }
+
+    // --- Fix 7: blocked streams — get_dynamic_references ---
+
+    #[test]
+    fn get_dynamic_references_finds_dynamic_indexed_field() {
+        let reprs = vec![FieldLineRepresentation::IndexedFieldLine {
+            is_static: false,
+            index: 5,
+        }];
+        let refs: Vec<u64> = get_dynamic_references(&reprs).collect();
+        assert_eq!(refs, vec![5]);
+    }
+
+    #[test]
+    fn get_dynamic_references_ignores_static_indexed_field() {
+        let reprs = vec![FieldLineRepresentation::IndexedFieldLine {
+            is_static: true,
+            index: 5,
+        }];
+        let refs: Vec<u64> = get_dynamic_references(&reprs).collect();
+        assert!(refs.is_empty(), "Static references should be ignored");
+    }
+
+    #[test]
+    fn get_dynamic_references_finds_dynamic_name_reference() {
+        let reprs = vec![FieldLineRepresentation::LiteralFieldLineWithNameReference {
+            never_dynamic: false,
+            is_static: false,
+            name_index: 7,
+            huffman: false,
+            value: Bytes::from_static(b"val"),
+        }];
+        let refs: Vec<u64> = get_dynamic_references(&reprs).collect();
+        assert_eq!(refs, vec![7]);
+    }
+
+    #[test]
+    fn get_dynamic_references_empty_for_literal_name() {
+        let reprs = vec![FieldLineRepresentation::LiteralFieldLineWithLiteralName {
+            never_dynamic: false,
+            name_huffman: false,
+            name: Bytes::from_static(b"x-header"),
+            value_huffman: false,
+            value: Bytes::from_static(b"value"),
+        }];
+        let refs: Vec<u64> = get_dynamic_references(&reprs).collect();
+        assert!(refs.is_empty(), "Literal name has no dynamic reference");
     }
 }

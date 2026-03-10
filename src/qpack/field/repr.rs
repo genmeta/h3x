@@ -32,19 +32,13 @@ use crate::{
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodedFieldSectionPrefix {
-    pub required_insert_count: u64,
-    /// The Base is used to resolve references in the dynamic table as
-    /// described in Section 3.2.5.
+    pub encoded_insert_count: u64,
+    /// The Sign bit ('S' in Figure 12) and Delta Base encode the Base
+    /// relative to the Required Insert Count.
     ///
-    /// To save space, the Base is encoded relative to the Required Insert
-    /// Count using a one-bit Sign ('S' in Figure 12) and the Delta Base
-    /// value. A Sign bit of 0 indicates that the Base is greater than or
-    /// equal to the value of the Required Insert Count; the decoder adds the
-    /// value of Delta Base to the Required Insert Count to determine the
-    /// value of the Base. A Sign bit of 1 indicates that the Base is less
-    /// than the Required Insert Count; the decoder subtracts the value of
-    /// Delta Base from the Required Insert Count and also subtracts one to
-    /// determine the value of the Base. That is:
+    /// A Sign bit of 0 indicates that the Base is greater than or equal to
+    /// the Required Insert Count; a Sign bit of 1 indicates the Base is less
+    /// than the Required Insert Count.
     ///
     /// ``` fakecode
     /// if Sign == 0:
@@ -53,9 +47,8 @@ pub struct EncodedFieldSectionPrefix {
     ///    Base = ReqInsertCount - DeltaBase - 1
     /// ```
     /// https://datatracker.ietf.org/doc/html/rfc9204#section-4.5.1.2
-    // sign: bool,
-    // delta_base: u64,
-    pub base: u64,
+    pub sign: bool,
+    pub delta_base: u64,
 }
 
 impl<S: AsyncRead + Send> DecodeFrom<S> for EncodedFieldSectionPrefix {
@@ -65,31 +58,14 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for EncodedFieldSectionPrefix {
         let decode = async move {
             let mut stream = pin!(stream);
             let ric_prefix = stream.read_u8().await?;
-            let required_insert_count = decode_integer(stream.as_mut(), ric_prefix, 8).await?;
+            let encoded_insert_count = decode_integer(stream.as_mut(), ric_prefix, 8).await?;
             let db_prefix = stream.read_u8().await?;
-            let sign = db_prefix & 0b1000_0000;
+            let sign = db_prefix & 0b1000_0000 != 0;
             let delta_base = decode_integer(stream.as_mut(), db_prefix & 0b0111_1111, 7).await?;
-            // The value of Base MUST NOT be negative. Though the protocol might
-            // operate correctly with a negative Base using post-Base indexing, it
-            // is unnecessary and inefficient. An endpoint MUST treat a field block
-            // with a Sign bit of 1 as invalid if the value of Required Insert Count
-            // is less than or equal to the value of Delta Base.
-            //
-            // https://datatracker.ietf.org/doc/html/rfc9204#section-4.5.1.2-5
-            let base = if sign == 0 {
-                required_insert_count
-                    .checked_add(delta_base)
-                    .ok_or(DecodeError::ArithmeticOverflow)?
-            } else {
-                required_insert_count
-                    .checked_sub(delta_base)
-                    .ok_or(DecodeError::ArithmeticOverflow)?
-                    .checked_sub(1)
-                    .ok_or(DecodeError::ArithmeticOverflow)?
-            };
             Ok(EncodedFieldSectionPrefix {
-                required_insert_count,
-                base,
+                encoded_insert_count,
+                sign,
+                delta_base,
             })
         };
         decode.await.map_err(|error: DecodeStreamError| {
@@ -106,21 +82,69 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for EncodedFieldSectionPrefix {
     async fn encode_into(self, stream: S) -> Result<Self::Output, Self::Error> {
         let mut stream = pin!(stream);
         let ric_prefix = 0;
-        encode_integer(stream.as_mut(), ric_prefix, 8, self.required_insert_count).await?;
-        // if Sign == 0:
-        //    Base = ReqInsertCount + DeltaBase
-        //    -> DeltaBase = Base - ReqInsertCount (Base >= ReqInsertCount)
-        // else:
-        //    Base = ReqInsertCount - DeltaBase - 1
-        //    -> DeltaBase = ReqInsertCount - Base - 1 (Base < ReqInsertCount)
-        let (sign, db_value) = if self.base >= self.required_insert_count {
-            (false, self.base - self.required_insert_count)
-        } else {
-            (true, self.required_insert_count - self.base - 1)
-        };
-        let db_prefix = if sign { 0b1000_0000 } else { 0b0000_0000 };
-        encode_integer(stream.as_mut(), db_prefix, 7, db_value).await?;
+        encode_integer(stream.as_mut(), ric_prefix, 8, self.encoded_insert_count).await?;
+        let db_prefix = if self.sign { 0b1000_0000 } else { 0b0000_0000 };
+        encode_integer(stream.as_mut(), db_prefix, 7, self.delta_base).await?;
         Ok(())
+    }
+}
+
+impl EncodedFieldSectionPrefix {
+    /// RFC 9204 §4.5.1.1: Encode RequiredInsertCount to wire format
+    pub fn encode_ric(required_insert_count: u64, max_table_capacity: u64) -> u64 {
+        if required_insert_count == 0 {
+            0
+        } else {
+            let max_entries = max_table_capacity / 32;
+            (required_insert_count % (2 * max_entries)) + 1
+        }
+    }
+
+    /// RFC 9204 §4.5.1.1: Decode wire-encoded InsertCount to true RequiredInsertCount
+    pub fn decode_ric(
+        encoded_insert_count: u64,
+        max_table_capacity: u64,
+        total_number_of_inserts: u64,
+    ) -> Result<u64, DecodeError> {
+        if encoded_insert_count == 0 {
+            return Ok(0);
+        }
+        let max_entries = max_table_capacity / 32;
+        let full_range = 2 * max_entries;
+        if encoded_insert_count > full_range {
+            return Err(DecodeError::DecompressionFailed);
+        }
+        let max_value = total_number_of_inserts + max_entries;
+        let max_wrapped = (max_value / full_range) * full_range;
+        let mut ric = max_wrapped + encoded_insert_count - 1;
+        if ric > max_value {
+            if ric <= full_range {
+                return Err(DecodeError::DecompressionFailed);
+            }
+            ric -= full_range;
+        }
+        if ric == 0 {
+            return Err(DecodeError::DecompressionFailed);
+        }
+        Ok(ric)
+    }
+
+    /// RFC 9204 §4.5.1.2: Resolve the true base from decoded prefix and true RIC
+    pub fn resolve_base(
+        required_insert_count: u64,
+        sign: bool,
+        delta_base: u64,
+    ) -> Result<u64, DecodeError> {
+        if !sign {
+            required_insert_count
+                .checked_add(delta_base)
+                .ok_or(DecodeError::ArithmeticOverflow)
+        } else {
+            required_insert_count
+                .checked_sub(delta_base)
+                .and_then(|v| v.checked_sub(1))
+                .ok_or(DecodeError::ArithmeticOverflow)
+        }
     }
 }
 
@@ -385,5 +409,92 @@ impl EncodeInto<BufList> for (EncodedFieldSectionPrefix, Vec<FieldLineRepresenta
                 }
                 EncodeStreamError::Encode { source } => source,
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EncodedFieldSectionPrefix;
+    use crate::codec::DecodeError;
+
+    // --- Fix 6: RIC modular encoding ---
+
+    #[test]
+    fn test_encode_ric_zero() {
+        // RFC 9204 §4.5.1.1: RIC == 0 encodes as 0
+        assert_eq!(EncodedFieldSectionPrefix::encode_ric(0, 256), 0);
+    }
+
+    #[test]
+    fn test_encode_ric_nonzero() {
+        // max_table_capacity=256, MaxEntries=256/32=8, FullRange=16
+        // encode_ric(4, 256) = (4 % 16) + 1 = 5
+        assert_eq!(EncodedFieldSectionPrefix::encode_ric(4, 256), 5);
+    }
+
+    #[test]
+    fn test_decode_ric_zero() {
+        // encoded_insert_count == 0 → RIC == 0 (no dynamic references)
+        let result = EncodedFieldSectionPrefix::decode_ric(0, 256, 10);
+        assert_eq!(result, Ok(0));
+    }
+
+    #[test]
+    fn test_decode_ric_nonzero() {
+        // decode_ric(5, 256, 10) should return 4 (reverse of encode_ric(4, 256) == 5)
+        // MaxEntries=8, FullRange=16, max_value=10+8=18, max_wrapped=(18/16)*16=16
+        // ric = 16 + 5 - 1 = 20 > 18 → ric -= 16 → ric = 4
+        let result = EncodedFieldSectionPrefix::decode_ric(5, 256, 10);
+        assert_eq!(result, Ok(4));
+    }
+
+    #[test]
+    fn test_ric_roundtrip() {
+        // For RIC values 1, 4, 8, 15: encode then decode should recover original
+        // total_inserts must satisfy: ric <= total_inserts < ric + MaxEntries
+        // Use total_inserts = ric so constraint is met for all test values
+        let max_table_capacity = 256;
+        for ric in [1u64, 4, 8, 15] {
+            let total_inserts = ric; // ric <= total_inserts < ric + 8 satisfied
+            let encoded = EncodedFieldSectionPrefix::encode_ric(ric, max_table_capacity);
+            let decoded = EncodedFieldSectionPrefix::decode_ric(
+                encoded,
+                max_table_capacity,
+                total_inserts,
+            )
+            .unwrap_or_else(|e| {
+                panic!("decode_ric({encoded}, {max_table_capacity}, {total_inserts}) failed: {e:?}")
+            });
+            assert_eq!(decoded, ric, "roundtrip failed for ric={ric}");
+        }
+    }
+
+    #[test]
+    fn test_decode_ric_exceeds_full_range() {
+        // max_table_capacity=256 → MaxEntries=8, FullRange=16
+        // encoded_insert_count=17 > 16 → DecompressionFailed
+        let result = EncodedFieldSectionPrefix::decode_ric(17, 256, 10);
+        assert_eq!(result, Err(DecodeError::DecompressionFailed));
+    }
+
+    #[test]
+    fn test_resolve_base_positive() {
+        // sign=false: base = required_insert_count + delta_base = 5 + 3 = 8
+        let result = EncodedFieldSectionPrefix::resolve_base(5, false, 3);
+        assert_eq!(result, Ok(8));
+    }
+
+    #[test]
+    fn test_resolve_base_negative() {
+        // sign=true: base = required_insert_count - delta_base - 1 = 5 - 2 - 1 = 2
+        let result = EncodedFieldSectionPrefix::resolve_base(5, true, 2);
+        assert_eq!(result, Ok(2));
+    }
+
+    #[test]
+    fn test_resolve_base_overflow() {
+        // sign=true: 1 - 5 - 1 would underflow → ArithmeticOverflow
+        let result = EncodedFieldSectionPrefix::resolve_base(1, true, 5);
+        assert_eq!(result, Err(DecodeError::ArithmeticOverflow));
     }
 }
