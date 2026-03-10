@@ -500,7 +500,7 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>> + Send> DecodeFrom<S> for 
                         .take()
                         .unwrap_or(PseudoHeaders::unresolved_request());
 
-                    let scheme = match &mut pseudo {
+                    let path_field = match &mut pseudo {
                         PseudoHeaders::Request { path, .. } => path,
                         PseudoHeaders::Response { .. } => {
                             return Err(
@@ -509,10 +509,10 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>> + Send> DecodeFrom<S> for 
                         }
                     };
                     ensure!(
-                        scheme.is_none(),
+                        path_field.is_none(),
                         malformed_header_section::DuplicatePseudoHeaderSnafu { name }
                     );
-                    *scheme = Some(
+                    *path_field = Some(
                         PathAndQuery::from_maybe_shared(value)
                             .map_err(MalformedHeaderSection::from)?,
                     );
