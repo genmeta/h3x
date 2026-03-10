@@ -58,7 +58,7 @@ mod tests {
 
             let decoder_stream = Box::pin(TryFuture::from(async move {
                 let decoder_stream = StreamReader::new(decoder_stream_reader)
-                    .into_decoded::<UnidirectionalStream<_>>()
+                    .decode::<UnidirectionalStream<_>>()
                     .await
                     .unwrap();
                 assert_eq!(
@@ -87,7 +87,7 @@ mod tests {
 
             let encoder_stream = Box::pin(TryFuture::from(async move {
                 let encoder_stream = StreamReader::new(encoder_stream_reader)
-                    .into_decoded::<UnidirectionalStream<_>>()
+                    .decode::<UnidirectionalStream<_>>()
                     .await
                     .unwrap();
                 assert_eq!(
@@ -131,10 +131,14 @@ mod tests {
         let request = tokio::spawn(async move {
             let mut request_stream = SinkWriter::new(request_stream);
 
-            let header_frame = encoder
-                .encode(field_section.iter(), &encode_strategy, &mut request_stream)
-                .await
-                .unwrap();
+            let header_frame = Encoder::encode(
+                &*encoder,
+                field_section.iter(),
+                &encode_strategy,
+                &mut request_stream,
+            )
+            .await
+            .unwrap();
             request_stream.encode_one(header_frame).await.unwrap();
 
             tracing::info!("Header frame sent");
@@ -154,7 +158,7 @@ mod tests {
             let mut frame_stream = pin!(FrameStream::new(StreamReader::new(response_stream)));
             let frame = frame_stream.as_mut().next_frame().await.unwrap().unwrap();
             assert_eq!(frame.r#type(), Frame::HEADERS_FRAME_TYPE);
-            let field_section = decoder.decode(frame).await.unwrap();
+            let field_section = Decoder::decode(&*decoder, frame).await.unwrap();
             assert_eq!(field_section, expected_field_section);
             tracing::info!(?field_section, "Decoded field section",);
 

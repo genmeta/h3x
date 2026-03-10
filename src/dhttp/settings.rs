@@ -237,7 +237,7 @@ where
     }
 }
 
-impl<'a> EncodeInto<BufList> for &'a Settings {
+impl EncodeInto<BufList> for &Settings {
     type Output = Frame<BufList>;
 
     type Error = Infallible;

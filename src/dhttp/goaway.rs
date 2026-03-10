@@ -39,7 +39,7 @@ where
 {
     type Error = StreamError;
 
-    async fn decode_from(stream: &mut Frame<S>) -> Result<Self, Self::Error> {
+    async fn decode_from(mut stream: &mut Frame<S>) -> Result<Self, Self::Error> {
         assert!(stream.r#type() == Frame::GOAWAY_FRAME_TYPE);
         let stream_id = stream.decode_one::<VarInt>().await.map_err(|error| {
             DecodeStreamError::from(error).map_stream_closed(

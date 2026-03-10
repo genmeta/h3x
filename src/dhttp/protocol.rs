@@ -24,7 +24,7 @@ use tracing::Instrument;
 use crate::{
     buflist::BufList,
     codec::{
-        BoxPeekableBiStream, BoxPeekableUniStream, DecodeExt, Encode, EncodeExt, Feed, SinkWriter,
+        BoxPeekableBiStream, BoxPeekableUniStream, DecodeExt, EncodeExt, Feed, SinkWriter,
         StreamReader,
     },
     connection::{ConnectionGoaway, ConnectionState, QuicConnection, StreamError},

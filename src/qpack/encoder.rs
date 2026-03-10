@@ -15,7 +15,9 @@ use tokio::{
 
 use crate::{
     buflist::BufList,
-    codec::{DecodeFrom, DecodeStreamError, EncodeError, EncodeInto, EncodeStreamError, Feed},
+    codec::{
+        DecodeFrom, DecodeStreamError, EncodeError, EncodeExt, EncodeInto, EncodeStreamError, Feed,
+    },
     connection::StreamError,
     dhttp::{frame::Frame, settings::Settings},
     error::{Code, H3CriticalStreamClosed, HasErrorCode},
@@ -188,7 +190,9 @@ impl EncoderState {
             true => Bytes::from_static(
                 r#static::get_name(name_index)
                     .unwrap_or_else(|| {
-                        panic!("Referenced name index {name_index} does not exist in the static table")
+                        panic!(
+                            "Referenced name index {name_index} does not exist in the static table"
+                        )
                     })
                     .as_bytes(),
             ),
@@ -239,7 +243,9 @@ impl EncoderState {
     pub fn duplicate(&mut self, index: u64) -> u64 {
         let duplicated_entry = self
             .get_entry(index)
-            .unwrap_or_else(|| panic!("Referenced entry {index} does not exist in the dynamic table"))
+            .unwrap_or_else(|| {
+                panic!("Referenced entry {index} does not exist in the dynamic table")
+            })
             .clone();
         while self.table_remaining() < duplicated_entry.size() {
             self.evict_entry();

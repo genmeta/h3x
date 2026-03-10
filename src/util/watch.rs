@@ -106,7 +106,9 @@ impl<T: Clone> Stream for Watcher<T> {
 
         ready!(project.notified.as_mut().poll(cx));
         let value = project.value.lock().unwrap().clone();
-        project.notified.set(project.notify.clone().notified_owned());
+        project
+            .notified
+            .set(project.notify.clone().notified_owned());
         Poll::Ready(value)
     }
 }

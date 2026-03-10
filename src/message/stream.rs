@@ -26,7 +26,7 @@ use crate::{
     error::Code,
     qpack::{
         algorithm::{HuffmanAlways, StaticCompressAlgo},
-        encoder::EncodeHeaderSectionError,
+        encoder::{EncodeHeaderSectionError, Encoder},
         field::{FieldLine, FieldSection},
         protocol::{QPackDecoder, QPackEncoder, QPackProtocolDisabled},
     },
@@ -420,7 +420,7 @@ impl WriteStream {
         let result = self
             .try_stream_io(async move |this| {
                 let stream = &mut this.stream;
-                match this.qpack_encoder.encode(field_lines, algo, stream).await {
+                match Encoder::encode(&*this.qpack_encoder, field_lines, algo, stream).await {
                     Ok(frame) => Ok(Ok(this.send_frame(frame).await?)),
                     Err(EncodeHeaderSectionError::Encode { source }) => Ok(Err(source)),
                     Err(EncodeHeaderSectionError::Stream { source }) => Err(source),
