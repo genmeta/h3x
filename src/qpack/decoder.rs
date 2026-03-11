@@ -375,7 +375,9 @@ where
         });
         let header_section = field_lines.decode().await?;
 
-        self.emit(DecoderInstruction::SectionAcknowledgment { stream_id });
+        if required_insert_count > 0 {
+            self.emit(DecoderInstruction::SectionAcknowledgment { stream_id });
+        }
         _ = self.flush_instructions().await;
 
         Ok(header_section)
