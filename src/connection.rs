@@ -16,7 +16,7 @@ use tracing::Instrument;
 use crate::{
     codec::{PeekableStreamReader, SinkWriter, StreamReader},
     dhttp::{protocol::DHttpProtocolFactory, settings::Settings},
-    error::{Code, ErrorScope, H3Error, H3NoError},
+    error::{Code, ErrorScope, H3Error},
     protocol::{InitProtocols, ProductProtocol, Protocols, StreamVerdict, type_id_as_u128},
     qpack::protocol::QPackProtocolFactory,
     quic::{self, CancelStreamExt, StopStreamExt, agent},
@@ -250,8 +250,8 @@ impl<C: quic::Lifecycle + ?Sized> ConnectionState<C> {
         self.quic.closed()
     }
 
-    pub fn close(&self, error: &(impl H3Error + ?Sized)) {
-        self.quic.close(error.code(), error.to_string().into());
+    pub fn close(&self, code: Code, reason: impl Into<std::borrow::Cow<'static, str>>) {
+        self.quic.close(code, reason.into());
     }
 }
 
@@ -422,7 +422,7 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
 
 impl<C: quic::Connection + ?Sized> Drop for Connection<C> {
     fn drop(&mut self) {
-        self.close(&H3NoError);
+        self.close(Code::H3_NO_ERROR, "no error");
     }
 }
 
