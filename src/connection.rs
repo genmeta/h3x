@@ -1,7 +1,6 @@
 use std::{
     any::Any,
     collections::hash_map::DefaultHasher,
-    error::Error as StdError,
     fmt::{self, Debug},
     hash::{Hash, Hasher},
     io,
@@ -17,7 +16,7 @@ use tracing::Instrument;
 use crate::{
     codec::{PeekableStreamReader, SinkWriter, StreamReader},
     dhttp::{protocol::DHttpProtocolFactory, settings::Settings},
-    error::{Code, HasErrorCode},
+    error::{Code, ErrorScope, H3Error, H3NoError},
     protocol::{InitProtocols, ProductProtocol, Protocols, StreamVerdict, type_id_as_u128},
     qpack::protocol::QPackProtocolFactory,
     quic::{self, CancelStreamExt, StopStreamExt, agent},
@@ -30,7 +29,7 @@ pub enum StreamError {
     Quic { source: quic::StreamError },
     #[snafu(transparent)]
     Code {
-        source: Arc<dyn HasErrorCode + Send + Sync>,
+        source: Arc<dyn H3Error + Send + Sync>,
     },
 }
 
@@ -53,7 +52,7 @@ impl StreamError {
     }
 }
 
-impl<E: HasErrorCode + StdError + Send + Sync + 'static> From<E> for StreamError {
+impl<E: H3Error + Send + Sync + 'static> From<E> for StreamError {
     fn from(value: E) -> Self {
         StreamError::Code {
             source: Arc::new(value),
@@ -77,7 +76,7 @@ impl From<io::Error> for StreamError {
             Ok(error) => return error.into(),
             Err(error) => error,
         };
-        match error.downcast::<Arc<dyn HasErrorCode + Send + Sync + 'static>>() {
+        match error.downcast::<Arc<dyn H3Error + Send + Sync + 'static>>() {
             Ok(error) => error.into(),
             Err(error) => unreachable!(
                 "io::Error({error:?}) cannot be converted to connection::StreamError, this is a bug"
@@ -106,10 +105,15 @@ pub trait LifecycleExt: quic::Lifecycle + Sync {
                     }
                     quic::StreamError::Reset { .. } => source,
                 },
-                StreamError::Code { source } => {
-                    self.close(source.code(), source.to_string().into());
-                    self.closed().await.into()
-                }
+                StreamError::Code { source } => match source.scope() {
+                    ErrorScope::Stream => {
+                        quic::StreamError::Reset { code: source.code().into_inner() }
+                    }
+                    ErrorScope::Connection => {
+                        self.close(source.code(), source.to_string().into());
+                        self.closed().await.into()
+                    }
+                },
             }
         })
     }
@@ -246,8 +250,7 @@ impl<C: quic::Lifecycle + ?Sized> ConnectionState<C> {
         self.quic.closed()
     }
 
-    // TODO: close with handy way(code + reason)
-    pub fn close(&self, error: &(impl HasErrorCode + ?Sized)) {
+    pub fn close(&self, error: &(impl H3Error + ?Sized)) {
         self.quic.close(error.code(), error.to_string().into());
     }
 }
@@ -419,7 +422,7 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
 
 impl<C: quic::Connection + ?Sized> Drop for Connection<C> {
     fn drop(&mut self) {
-        self.close(&Code::H3_NO_ERROR);
+        self.close(&H3NoError);
     }
 }
 

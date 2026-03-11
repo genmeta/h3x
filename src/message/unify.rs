@@ -12,7 +12,7 @@ use crate::{
     codec::EncodeError,
     connection,
     dhttp::frame::Frame,
-    error::Code,
+    error::{Code, ErrorScope, H3FrameUnexpected, H3MessageError},
     message::stream::{DEFAULT_COMPRESS_ALGO, MessageStreamError, ReadStream, WriteStream},
     qpack::{
         encoder::EncodeHeaderSectionError,
@@ -266,7 +266,7 @@ impl ReadStream {
         self.try_stream_io(async move |this| {
             let result = f(this, message).await;
             if let Err(connection::StreamError::Code { source }) = &result
-                && source.code().is_known_stream_error()
+                && source.scope() == ErrorScope::Stream
             {
                 message.set_malformed();
             }
@@ -295,9 +295,9 @@ impl ReadStream {
             .try_message_io(message, async |this, message| {
                 let Some(field_section) = this.read_header_frame().await.transpose()? else {
                     if this.peek_frame().await.transpose()?.is_some() {
-                        return Err(Code::H3_FRAME_UNEXPECTED.into());
+                        return Err(H3FrameUnexpected::UnexpectedFrameType.into());
                     } else {
-                        return Err(Code::H3_MESSAGE_ERROR.into());
+                        return Err(H3MessageError::MissingHeaderSection.into());
                     }
                 };
 
@@ -524,7 +524,7 @@ impl ReadStream {
             .try_message_io(message, async |this, _| {
                 let Some(field_section) = this.read_header_frame().await.transpose()? else {
                     if this.peek_frame().await.transpose()?.is_some() {
-                        return Err(Code::H3_FRAME_UNEXPECTED.into());
+                        return Err(H3FrameUnexpected::UnexpectedFrameDuringTrailer.into());
                     } else {
                         // no trailer
                         return Ok(FieldSection::trailer(HeaderMap::new()));

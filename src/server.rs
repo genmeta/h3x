@@ -11,7 +11,7 @@ pub use crate::message::{
 };
 use crate::{
     connection::ConnectionBuilder,
-    error::Code,
+    error::{H3InternalError, H3NoError},
     pool::Pool,
     quic::{self, GetStreamIdExt},
 };
@@ -113,7 +113,7 @@ where
             let Some(local_agent) = local_agent else {
                 tracing::debug!("Close incoming connection due to missing SNI");
                 // no SNI
-                connection.close(&Code::H3_INTERNAL_ERROR);
+                connection.close(&H3InternalError::MissingServerName);
                 return;
             };
 
@@ -126,7 +126,7 @@ where
                     "Close incoming connection due to missing service for {}",
                     local_agent.name()
                 );
-                connection.close(&Code::H3_NO_ERROR);
+                connection.close(&H3NoError);
                 return;
             };
 

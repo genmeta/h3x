@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 use crate::{
     codec::{DecodeExt, DecodeFrom, DecodeStreamError, EncodeExt},
     connection::StreamError,
-    error::Code,
+    error::H3GeneralProtocolError,
     quic::{self, CancelStream, GetStreamId, StopStream},
     varint::VarInt,
 };
@@ -70,7 +70,7 @@ impl<S: ?Sized> UnidirectionalStream<S> {
     {
         let r#type = stream.decode_one::<VarInt>().await.map_err(|error| {
             DecodeStreamError::from(error)
-                .map_decode_error(|error| Code::H3_GENERAL_PROTOCOL_ERROR.with(error).into())
+                .map_decode_error(|error| H3GeneralProtocolError::Decode { source: error }.into())
         })?;
         Ok(UnidirectionalStream { r#type, stream })
     }

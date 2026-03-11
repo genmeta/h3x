@@ -23,7 +23,7 @@ use crate::{
             DHttpState, InitialRawMessageStreamError,
         },
     },
-    error::Code,
+    error::{Code, ErrorScope, H3FrameDecodeError, H3FrameUnexpected},
     qpack::{
         algorithm::{HuffmanAlways, StaticCompressAlgo},
         encoder::{EncodeHeaderSectionError, Encoder},
@@ -201,7 +201,7 @@ impl ReadStream {
                 Ok(value) => Ok(value),
                 Err(connection::StreamError::Quic { source }) => Err(source.into()),
                 // message from peer is malformed
-                Err(connection::StreamError::Code { source }) if source.code().is_known_stream_error() => {
+                Err(connection::StreamError::Code { source }) if source.scope() == ErrorScope::Stream => {
                     _ = self.stream.stop(source.code().into_inner()).await;
                     Err(quic::StreamError::Reset { code: source.code().into_inner() }.into())
                 },
@@ -234,7 +234,7 @@ impl ReadStream {
                     // avoid rust bc bug
                     return Pin::new(&mut self.stream).frame();
                 }
-                Some(Ok(_frame)) => return Some(Err(Code::H3_FRAME_UNEXPECTED.into())),
+                Some(Ok(_frame)) => return Some(Err(H3FrameUnexpected::UnexpectedFrameType.into())),
                 Some(Err(error)) => return Some(Err(error)),
             }
         }
@@ -254,7 +254,7 @@ impl ReadStream {
                         }
                         Err(error) => {
                             let error = error
-                                .map_decode_error(|error| Code::H3_FRAME_ERROR.with(error).into());
+                                .map_decode_error(|error| H3FrameDecodeError { source: error }.into());
                             return Some(Err(error));
                         }
                     }
@@ -401,6 +401,11 @@ impl WriteStream {
         tokio::select! {
             result = f(self) => match result {
                 Ok(value) => Ok(value),
+                Err(connection::StreamError::Quic { source }) => Err(source.into()),
+                Err(connection::StreamError::Code { source }) if source.scope() == ErrorScope::Stream => {
+                    _ = self.stream.cancel(source.code().into_inner()).await;
+                    Err(quic::StreamError::Reset { code: source.code().into_inner() }.into())
+                },
                 Err(error) => Err(self.connection.as_ref().handle_stream_error(error).await.into()),
             },
             goaway = peer_goaway => match goaway {

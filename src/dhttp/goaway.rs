@@ -8,7 +8,7 @@ use crate::{
     codec::{DecodeExt, DecodeFrom, DecodeStreamError, EncodeExt, EncodeInto},
     connection::StreamError,
     dhttp::frame::Frame,
-    error::{Code, H3CriticalStreamClosed},
+    error::{H3CriticalStreamClosed, H3FrameDecodeError, H3GeneralProtocolError},
     varint::VarInt,
 };
 
@@ -44,14 +44,14 @@ where
         let stream_id = stream.decode_one::<VarInt>().await.map_err(|error| {
             DecodeStreamError::from(error).map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::Control.into(),
-                |decode_error| Code::H3_FRAME_ERROR.with(decode_error).into(),
+                |decode_error| H3FrameDecodeError { source: decode_error }.into(),
             )
         })?;
 
         // ensure frame is exhausted
         if !stream.fill_buf().await?.is_empty() {
             // FIXME: which error kind?
-            return Err(Code::H3_GENERAL_PROTOCOL_ERROR.into());
+            return Err(H3GeneralProtocolError::TrailingPayload.into());
         };
 
         Ok(Goaway { stream_id })

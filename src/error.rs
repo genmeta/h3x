@@ -24,18 +24,6 @@ impl Code {
     pub const fn into_inner(self) -> VarInt {
         self.0
     }
-
-    pub const fn with<E: StdError>(self, source: E) -> CodeWith<E> {
-        CodeWith { code: self, source }
-    }
-}
-
-impl StdError for Code {}
-
-impl HasErrorCode for Code {
-    fn code(&self) -> Code {
-        *self
-    }
 }
 
 macro_rules! codes {
@@ -131,42 +119,6 @@ impl Code {
     pub const fn value(&self) -> VarInt {
         self.0
     }
-
-    pub const fn is_known_stream_error(&self) -> bool {
-        matches!(
-            *self,
-            Code::H3_FRAME_UNEXPECTED
-                | Code::H3_MESSAGE_ERROR
-                | Code::H3_CONNECT_ERROR
-                | Code::H3_REQUEST_CANCELLED
-                | Code::H3_REQUEST_INCOMPLETE
-                | Code::H3_REQUEST_REJECTED
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CodeWith<E: StdError> {
-    code: Code,
-    source: E,
-}
-
-impl<E: StdError> Display for CodeWith<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.source, f)
-    }
-}
-
-impl<E: StdError + 'static> StdError for CodeWith<E> {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        Some(&self.source)
-    }
-}
-
-impl<E: StdError + 'static> HasErrorCode for CodeWith<E> {
-    fn code(&self) -> Code {
-        self.code
-    }
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -180,9 +132,12 @@ pub enum H3StreamCreationError {
     DuplicateQpackDecoderStream,
 }
 
-impl HasErrorCode for H3StreamCreationError {
+impl H3Error for H3StreamCreationError {
     fn code(&self) -> Code {
         Code::H3_STREAM_CREATION_ERROR
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Connection
     }
 }
 
@@ -197,9 +152,12 @@ pub enum H3CriticalStreamClosed {
     Control,
 }
 
-impl HasErrorCode for H3CriticalStreamClosed {
+impl H3Error for H3CriticalStreamClosed {
     fn code(&self) -> Code {
         Code::H3_CLOSED_CRITICAL_STREAM
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Connection
     }
 }
 
@@ -208,27 +166,153 @@ impl HasErrorCode for H3CriticalStreamClosed {
 pub enum H3FrameUnexpected {
     #[snafu(display("received subsequent SETTINGS frame"))]
     DuplicateSettings,
+    #[snafu(display("unexpected frame type on request stream"))]
+    UnexpectedFrameType,
+    #[snafu(display("unexpected frame during trailer reading"))]
+    UnexpectedFrameDuringTrailer,
 }
-
-impl HasErrorCode for H3FrameUnexpected {
+impl H3Error for H3FrameUnexpected {
     fn code(&self) -> Code {
         Code::H3_FRAME_UNEXPECTED
     }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Connection
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorScope {
+    Stream,
+    Connection,
 }
 
 // TODO: use Error::provide api in the future
-pub trait HasErrorCode: StdError {
+pub trait H3Error: StdError {
     fn code(&self) -> Code;
+    fn scope(&self) -> ErrorScope;
+}
+
+#[derive(Debug, Snafu, Clone, Copy)]
+#[snafu(display("no error"))]
+pub struct H3NoError;
+
+impl H3Error for H3NoError {
+    fn code(&self) -> Code {
+        Code::H3_NO_ERROR
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Connection
+    }
+}
+
+#[derive(Debug, Snafu, Clone, Copy)]
+pub enum H3MessageError {
+    #[snafu(display("missing header section in HTTP message"))]
+    MissingHeaderSection,
+    #[snafu(display("unexpected headers frame in message body"))]
+    UnexpectedHeadersInBody,
+}
+
+impl H3Error for H3MessageError {
+    fn code(&self) -> Code {
+        Code::H3_MESSAGE_ERROR
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Stream
+    }
+}
+
+#[derive(Debug, Snafu, Clone, Copy)]
+#[snafu(display("no SETTINGS frame at beginning of control stream"))]
+pub struct H3MissingSettings;
+
+impl H3Error for H3MissingSettings {
+    fn code(&self) -> Code {
+        Code::H3_MISSING_SETTINGS
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Connection
+    }
+}
+
+#[derive(Debug, Snafu, Clone)]
+#[snafu(module)]
+pub enum H3GeneralProtocolError {
+    #[snafu(display("trailing payload in GOAWAY frame"))]
+    TrailingPayload,
+    #[snafu(display("protocol decode error: {source}"))]
+    Decode { source: crate::codec::DecodeError },
+}
+
+impl H3Error for H3GeneralProtocolError {
+    fn code(&self) -> Code {
+        Code::H3_GENERAL_PROTOCOL_ERROR
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Connection
+    }
+}
+
+#[derive(Debug, Snafu)]
+pub enum H3InternalError {
+    #[snafu(display("QPACK encoder encode failure: {source}"))]
+    QPackEncoderEncode { source: crate::codec::EncodeStreamError },
+    #[snafu(display("missing server name (SNI) on incoming connection"))]
+    MissingServerName,
+}
+
+impl H3Error for H3InternalError {
+    fn code(&self) -> Code {
+        Code::H3_INTERNAL_ERROR
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Connection
+    }
+}
+
+#[derive(Debug, Snafu, Clone)]
+#[snafu(display("frame decode error: {source}"))]
+pub struct H3FrameDecodeError {
+    pub source: crate::codec::DecodeError,
+}
+
+impl H3Error for H3FrameDecodeError {
+    fn code(&self) -> Code {
+        Code::H3_FRAME_ERROR
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Connection
+    }
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum QpackDecompressionFailed {
+    #[snafu(display("QPACK decompression decode error: {source}"))]
+    Decode { source: crate::codec::DecodeError },
+}
+
+impl H3Error for QpackDecompressionFailed {
+    fn code(&self) -> Code {
+        Code::QPACK_DECOMPRESSION_FAILED
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Connection
+    }
 }
 
 #[derive(Debug, Snafu, Clone, Copy)]
 pub enum H3IdError {
     #[snafu(display("push ID exceeds limit"))]
     PushIdExceedsLimit,
+    #[snafu(display("GOAWAY stream ID ordering violation"))]
+    GoawayStreamIdOrdering,
 }
-
-impl HasErrorCode for H3IdError {
+impl H3Error for H3IdError {
     fn code(&self) -> Code {
         Code::H3_ID_ERROR
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Connection
     }
 }

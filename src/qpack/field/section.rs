@@ -14,7 +14,7 @@ use super::{FieldLine, Protocol, PseudoHeaders};
 use crate::{
     codec::DecodeFrom,
     connection::StreamError,
-    error::{Code, HasErrorCode},
+    error::{Code, ErrorScope, H3Error},
 };
 
 #[derive(Debug, Snafu)]
@@ -62,9 +62,13 @@ pub enum MalformedHeaderSection {
     InvalidMessage { source: http::Error },
 }
 
-impl HasErrorCode for MalformedHeaderSection {
+
+impl H3Error for MalformedHeaderSection {
     fn code(&self) -> Code {
         Code::H3_MESSAGE_ERROR
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Stream
     }
 }
 

@@ -16,7 +16,7 @@ use crate::{
         EncodeStreamError, FixedLengthReader, StreamReader,
     },
     connection::StreamError,
-    error::Code,
+    error::H3FrameDecodeError,
     quic::{self, GetStreamId, StopStream},
     varint::{self, VARINT_MAX, VarInt},
 };
@@ -271,7 +271,7 @@ where
         };
 
         decode.await.map_err(|error: DecodeStreamError| {
-            error.map_decode_error(|decode_error| Code::H3_FRAME_ERROR.with(decode_error).into())
+            error.map_decode_error(|decode_error| H3FrameDecodeError { source: decode_error }.into())
         })
     }
 }
@@ -332,6 +332,7 @@ mod tests {
     use crate::{
         codec::{DecodeError, EncodeExt, SinkWriter},
         dhttp::frame::stream::FrameStream,
+        error::Code,
     };
 
     fn to_pre_byte_stream(

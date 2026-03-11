@@ -34,7 +34,7 @@ use crate::{
         settings::Settings,
         stream::UnidirectionalStream,
     },
-    error::{Code, H3CriticalStreamClosed, H3FrameUnexpected, H3IdError, H3StreamCreationError},
+    error::{Code, H3CriticalStreamClosed, H3FrameUnexpected, H3IdError, H3MissingSettings, H3StreamCreationError},
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     quic::{self, CancelStreamExt, ConnectionError, GetStreamIdExt, StopStreamExt},
     util::{ring_channel::RingChannel, set_once::SetOnce, watch::Watch},
@@ -169,7 +169,7 @@ impl DHttpState {
             .await
             .ok_or(H3CriticalStreamClosed::Control)??;
         if settings_frame.r#type() != Frame::SETTINGS_FRAME_TYPE {
-            return Err(Code::H3_MISSING_SETTINGS.into());
+            return Err(H3MissingSettings.into());
         }
         let settings = Arc::new(settings_frame.decode_one::<Settings>().await?);
         tracing::debug!(?settings, "Received remote settings");
@@ -190,7 +190,7 @@ impl DHttpState {
                 if let Some(previous_goaway) = self.peer_goaway.peek()
                     && goaway.stream_id() > previous_goaway.stream_id()
                 {
-                    return Err(Code::H3_ID_ERROR.into());
+                    return Err(H3IdError::GoawayStreamIdOrdering.into());
                 }
                 _ = self.peer_goaway.set(goaway)
             } else {

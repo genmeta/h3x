@@ -17,7 +17,7 @@ use crate::{
     codec::{DecodeExt, DecodeFrom, DecodeStreamError, EncodeInto, Feed},
     connection::StreamError,
     dhttp::settings::Settings,
-    error::{Code, H3CriticalStreamClosed, HasErrorCode},
+    error::{Code, ErrorScope, H3CriticalStreamClosed, H3Error, H3FrameDecodeError, QpackDecompressionFailed},
     qpack::{
         dynamic::DynamicTable,
         encoder::EncoderInstruction,
@@ -59,9 +59,13 @@ pub enum QPackEncoderStreamError {
     ReferencedDynamicEntryNotExisted { index: u64 },
 }
 
-impl HasErrorCode for QPackEncoderStreamError {
+
+impl H3Error for QPackEncoderStreamError {
     fn code(&self) -> Code {
         Code::QPACK_ENCODER_STREAM_ERROR
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Connection
     }
 }
 
@@ -308,9 +312,13 @@ pub enum InvalidDynamicTableReference {
     ReferencedDynamicEntryNotExisted { index: u64 },
 }
 
-impl HasErrorCode for InvalidDynamicTableReference {
+
+impl H3Error for InvalidDynamicTableReference {
     fn code(&self) -> Code {
         Code::QPACK_DECOMPRESSION_FAILED
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Connection
     }
 }
 
@@ -348,7 +356,7 @@ where
             max_table_capacity,
             total_inserts,
         )
-        .map_err(|e| Code::QPACK_DECOMPRESSION_FAILED.with(e))?;
+        .map_err(|e| StreamError::from(QpackDecompressionFailed::Decode { source: e }))?;
 
         // RFC 9204 §4.5.1.2: Resolve the true base
         let base = EncodedFieldSectionPrefix::resolve_base(
@@ -356,7 +364,7 @@ where
             prefix.sign,
             prefix.delta_base,
         )
-        .map_err(|e| Code::QPACK_DECOMPRESSION_FAILED.with(e))?;
+        .map_err(|e| StreamError::from(QpackDecompressionFailed::Decode { source: e }))?;
 
         self.receive_instruction_until(required_insert_count)
             .await?;
@@ -545,7 +553,7 @@ impl<S: AsyncBufRead + Send> DecodeFrom<S> for DecoderInstruction {
         decode.await.map_err(|error: DecodeStreamError| {
             error.map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::QPackDecoder.into(),
-                |decode_error| Code::H3_FRAME_ERROR.with(decode_error).into(),
+                |decode_error| H3FrameDecodeError { source: decode_error }.into(),
             )
         })
     }

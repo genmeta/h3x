@@ -9,7 +9,7 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Empty, StreamBody};
 
 use super::{MessageStreamError, ReadStream, upgrade::RemainStream};
-use crate::{connection, error::Code};
+use crate::{connection, error::H3MessageError};
 
 pin_project_lite::pin_project! {
     #[project = EitherProj]
@@ -64,7 +64,7 @@ impl ReadStream {
     ) -> Result<http::request::Parts, MessageStreamError> {
         self.try_stream_io(async |stream| {
             let Some(field_section) = stream.read_header_frame().await.transpose()? else {
-                return Err(Code::H3_MESSAGE_ERROR.into());
+                return Err(H3MessageError::MissingHeaderSection.into());
             };
             Ok(http::request::Parts::try_from(field_section)?)
         })
@@ -76,7 +76,7 @@ impl ReadStream {
     ) -> Result<http::response::Parts, MessageStreamError> {
         self.try_stream_io(async |stream| {
             let Some(field_section) = stream.read_header_frame().await.transpose()? else {
-                return Err(Code::H3_MESSAGE_ERROR.into());
+                return Err(H3MessageError::MissingHeaderSection.into());
             };
             Ok(http::response::Parts::try_from(field_section)?)
         })
@@ -90,7 +90,7 @@ impl ReadStream {
             Some(data) => Some(data.map(Frame::data)),
             None => match self.read_header_frame().await? {
                 Ok(field_section) if !field_section.is_trailer() => {
-                    Some(Err(Code::H3_MESSAGE_ERROR.into()))
+                    Some(Err(H3MessageError::UnexpectedHeadersInBody.into()))
                 }
                 Ok(field_section) => Some(Ok(Frame::trailers(field_section.header_map))),
                 Err(error) => Some(Err(error)),

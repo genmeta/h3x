@@ -20,7 +20,7 @@ use crate::{
     },
     connection::StreamError,
     dhttp::{frame::Frame, settings::Settings},
-    error::{Code, H3CriticalStreamClosed, HasErrorCode},
+    error::{Code, ErrorScope, H3CriticalStreamClosed, H3Error, H3FrameDecodeError, H3InternalError},
     qpack::{
         algorithm::Algorithm,
         decoder::DecoderInstruction,
@@ -76,9 +76,13 @@ pub enum QPackDecoderStreamError {
     IncrementZero,
 }
 
-impl HasErrorCode for QPackDecoderStreamError {
+
+impl H3Error for QPackDecoderStreamError {
     fn code(&self) -> Code {
         Code::QPACK_DECODER_STREAM_ERROR
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Connection
     }
 }
 
@@ -93,11 +97,6 @@ pub enum QPackEncoderError {
     CannotEvict,
 }
 
-impl HasErrorCode for QPackEncoderError {
-    fn code(&self) -> Code {
-        Code::QPACK_ENCODER_STREAM_ERROR
-    }
-}
 
 impl EncoderState {
     pub(crate) fn emit(&mut self, instruction: EncoderInstruction) {
@@ -597,7 +596,7 @@ impl<S: AsyncBufRead + Send> DecodeFrom<S> for EncoderInstruction {
         decode.await.map_err(|error: DecodeStreamError| {
             error.map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::QPackEncoder.into(),
-                |decode_error| Code::H3_FRAME_ERROR.with(decode_error).into(),
+                |decode_error| H3FrameDecodeError { source: decode_error }.into(),
             )
         })
     }
@@ -658,7 +657,7 @@ where
                 |_reset_code| H3CriticalStreamClosed::QPackEncoder.into(),
                 |encode_error| {
                     tracing::error!("Failed to encode QPACK encoder instruction: {encode_error}, this is likely a bug");
-                    Code::H3_INTERNAL_ERROR.into()
+                    H3InternalError::QPackEncoderEncode { source: EncodeStreamError::Encode { source: encode_error } }.into()
                 },
             )
         })

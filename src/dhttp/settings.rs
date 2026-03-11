@@ -15,7 +15,7 @@ use crate::{
     codec::{DecodeExt, DecodeFrom, DecodeStreamError, EncodeExt, EncodeInto},
     connection::StreamError,
     dhttp::{frame::Frame, stream::UnidirectionalStream},
-    error::{Code, H3CriticalStreamClosed, HasErrorCode},
+    error::{Code, ErrorScope, H3CriticalStreamClosed, H3Error, H3FrameDecodeError},
     quic,
     varint::VarInt,
 };
@@ -165,9 +165,13 @@ pub enum InvalidSettingValue {
     ConnectProtocol { value: VarInt },
 }
 
-impl HasErrorCode for InvalidSettingValue {
+
+impl H3Error for InvalidSettingValue {
     fn code(&self) -> Code {
         Code::H3_SETTINGS_ERROR
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Connection
     }
 }
 
@@ -184,7 +188,7 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for Setting {
         let setting = decode.await.map_err(|error: DecodeStreamError| {
             error.map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::Control.into(),
-                |decode_error| Code::H3_FRAME_ERROR.with(decode_error).into(),
+                |decode_error| H3FrameDecodeError { source: decode_error }.into(),
             )
         })?;
 
