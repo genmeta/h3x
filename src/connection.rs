@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
 };
 
-use futures::FutureExt;
+use futures::future::BoxFuture;
 use snafu::Snafu;
 use tracing::Instrument;
 
@@ -21,7 +21,6 @@ use crate::{
     protocol::{InitProtocols, ProductProtocol, Protocols, StreamVerdict, type_id_as_u128},
     qpack::protocol::QPackProtocolFactory,
     quic::{self, CancelStreamExt, StopStreamExt, agent},
-    util::set_once::SetOnce,
     varint::VarInt,
 };
 
@@ -87,78 +86,6 @@ impl From<io::Error> for StreamError {
     }
 }
 
-#[derive(Debug)]
-pub struct QuicConnection<C: ?Sized> {
-    error: SetOnce<quic::ConnectionError>,
-    inner: C,
-}
-
-impl<C: ?Sized> QuicConnection<C> {
-    fn new(quic: C) -> Self
-    where
-        C: Sized,
-    {
-        Self {
-            inner: quic,
-            error: SetOnce::new(),
-        }
-    }
-
-    /// Returns `true` if a connection error has been recorded.
-    ///
-    /// This is a cheap, non-blocking check used by the connection pool to
-    /// detect dead connections before attempting to reuse them.
-    pub fn is_closed(&self) -> bool {
-        self.error.is_set()
-    }
-}
-
-impl<C: quic::Check + ?Sized> QuicConnection<C> {
-    /// Actively probe the underlying QUIC connection to check if it is still usable.
-    ///
-    /// Unlike [`is_closed`](Self::is_closed), this queries the QUIC layer directly
-    /// and can detect silently-closed connections (e.g. idle timeout).
-    /// If a dead connection is detected, the error is recorded so that
-    /// [`is_closed`](Self::is_closed) and [`error`](Self::error) also reflect it.
-    pub fn check(&self) -> Result<(), quic::ConnectionError> {
-        let result = self.inner.check();
-        if let Err(ref error) = result {
-            _ = self.error.set_with(|| error.clone());
-        }
-        result
-    }
-}
-
-impl<C: quic::ManageStream + quic::Close + ?Sized> QuicConnection<C> {
-    pub async fn open_bi(
-        &self,
-    ) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
-        match { self.inner.open_bi() }.await {
-            Ok(streams) => Ok(streams),
-            Err(error) => Err(self.handle_connection_error(error).await),
-        }
-    }
-
-    pub async fn open_uni(&self) -> Result<C::StreamWriter, quic::ConnectionError> {
-        match { self.inner.open_uni() }.await {
-            Ok(stream) => Ok(stream),
-            Err(error) => Err(self.handle_connection_error(error).await),
-        }
-    }
-}
-
-impl<C: quic::ManageStream + ?Sized> QuicConnection<C> {
-    pub async fn accept_bi(
-        &self,
-    ) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
-        { self.inner.accept_bi() }.await
-    }
-
-    pub async fn accept_uni(&self) -> Result<C::StreamReader, quic::ConnectionError> {
-        { self.inner.accept_uni() }.await
-    }
-}
-
 #[derive(Debug, Snafu, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionGoaway {
     #[snafu(display("local goaway"))]
@@ -167,43 +94,36 @@ pub enum ConnectionGoaway {
     Peer,
 }
 
-impl<C: quic::Close + ?Sized> QuicConnection<C> {
-    pub fn close(&self, error: &(impl HasErrorCode + ?Sized)) {
-        if self.error.peek().is_some() {
-            return;
-        }
-        self.inner.close(error.code(), error.to_string().into())
+/// Extension trait providing error-handling helpers on any `Lifecycle` type.
+pub trait LifecycleExt: quic::Lifecycle + Sync {
+    /// Map h3-level StreamError to quic::StreamError, closing connection for connection-scope errors.
+    fn handle_stream_error(&self, error: StreamError) -> BoxFuture<'_, quic::StreamError> {
+        Box::pin(async move {
+            match error {
+                StreamError::Quic { source } => match source {
+                    quic::StreamError::Connection { source } => {
+                        self.handle_connection_error(source).await.into()
+                    }
+                    quic::StreamError::Reset { .. } => source,
+                },
+                StreamError::Code { source } => {
+                    self.close(source.code(), source.to_string().into());
+                    self.closed().await.into()
+                }
+            }
+        })
     }
 
-    pub async fn handle_connection_error(
+    /// Handle a connection-scope error. The connection is already dead.
+    fn handle_connection_error(
         &self,
         error: quic::ConnectionError,
-    ) -> quic::ConnectionError {
-        _ = self.error.set_with(|| error);
-        self.error().await
-    }
-
-    pub async fn handle_stream_error(&self, error: StreamError) -> quic::StreamError {
-        match error {
-            StreamError::Quic { source } => match source {
-                quic::StreamError::Connection { source } => {
-                    self.handle_connection_error(source).await.into()
-                }
-                quic::StreamError::Reset { .. } => source,
-            },
-            StreamError::Code { source } => {
-                self.close(source.as_ref());
-                self.error().await.into()
-            }
-        }
-    }
-
-    pub fn error(&self) -> impl Future<Output = quic::ConnectionError> + Send + use<C> {
-        self.error
-            .get()
-            .map(|option| option.unwrap_or_else(|| unreachable!("connection closed without error")))
+    ) -> BoxFuture<'_, quic::ConnectionError> {
+        Box::pin(async move { error })
     }
 }
+
+impl<T: quic::Lifecycle + Sync + ?Sized> LifecycleExt for T {}
 
 pub struct ConnectionBuilder<C: Any + ?Sized> {
     protocols_initializers: Vec<Box<dyn InitProtocols<C>>>,
@@ -238,7 +158,7 @@ impl<C: quic::Connection + ?Sized> ConnectionBuilder<C> {
     where
         C: Sized,
     {
-        let quic = Arc::new(QuicConnection::new(quic));
+        let quic = Arc::new(quic);
         let mut protocols = Protocols::new();
 
         for initializer in &self.protocols_initializers {
@@ -302,40 +222,51 @@ impl<C: quic::Connection + ?Sized> Eq for ConnectionBuilder<C> {}
 
 #[derive(Debug)]
 pub struct ConnectionState<C: ?Sized> {
-    quic: Arc<QuicConnection<C>>,
+    quic: Arc<C>,
     protocols: Arc<Protocols<C>>,
 }
 
 impl<C: ?Sized> ConnectionState<C> {
-    pub fn quic_connection(&self) -> &Arc<QuicConnection<C>> {
+    pub fn quic(&self) -> &Arc<C> {
         &self.quic
     }
 
     pub fn protocol<P: Any>(&self) -> Option<&P> {
         self.protocols.get::<P>()
     }
-
-    /// Returns `true` if the underlying QUIC connection has been closed.
-    pub fn is_closed(&self) -> bool {
-        self.quic.is_closed()
-    }
 }
 
-impl<C: quic::Check + ?Sized> ConnectionState<C> {
+impl<C: quic::Lifecycle + ?Sized> ConnectionState<C> {
     /// Actively probe the underlying QUIC connection to check if it is still usable.
     pub fn check(&self) -> Result<(), quic::ConnectionError> {
         self.quic.check()
     }
-}
 
-impl<C: quic::Close + ?Sized> ConnectionState<C> {
-    pub fn closed(&self) -> impl Future<Output = quic::ConnectionError> + Send + use<C> {
-        self.quic.error()
+    pub fn closed(&self) -> BoxFuture<'_, quic::ConnectionError> {
+        self.quic.closed()
     }
 
     // TODO: close with handy way(code + reason)
     pub fn close(&self, error: &(impl HasErrorCode + ?Sized)) {
-        self.quic.close(error);
+        self.quic.close(error.code(), error.to_string().into());
+    }
+}
+
+impl<C: quic::ManageStream + quic::Lifecycle + Sync + ?Sized> ConnectionState<C> {
+    pub async fn open_bi(
+        &self,
+    ) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
+        match { self.quic.open_bi() }.await {
+            Ok(streams) => Ok(streams),
+            Err(error) => Err(self.quic.handle_connection_error(error).await),
+        }
+    }
+
+    pub async fn open_uni(&self) -> Result<C::StreamWriter, quic::ConnectionError> {
+        match { self.quic.open_uni() }.await {
+            Ok(stream) => Ok(stream),
+            Err(error) => Err(self.quic.handle_connection_error(error).await),
+        }
     }
 }
 
@@ -344,7 +275,6 @@ impl<C: quic::WithLocalAgent + ?Sized> ConnectionState<C> {
         &self,
     ) -> Result<Option<Arc<dyn agent::LocalAgent>>, quic::ConnectionError> {
         self.quic
-            .inner
             .local_agent()
             .await
             .map(|option| option.map(|a| Arc::new(a) as Arc<dyn agent::LocalAgent>))
@@ -356,7 +286,6 @@ impl<C: quic::WithRemoteAgent + ?Sized> ConnectionState<C> {
         &self,
     ) -> Result<Option<Arc<dyn agent::RemoteAgent>>, quic::ConnectionError> {
         self.quic
-            .inner
             .remote_agent()
             .await
             .map(|option| option.map(|a| Arc::new(a) as Arc<dyn agent::RemoteAgent>))
@@ -407,7 +336,7 @@ impl<C: quic::Connection + ?Sized> ConnectionState<C> {
         };
         tokio::select! {
             _ = task => {},
-            _ = state.quic.error() => {},
+            _ = state.quic.closed() => {},
         }
     }
 
@@ -453,7 +382,7 @@ impl<C: quic::Connection + ?Sized> ConnectionState<C> {
         };
         tokio::select! {
             _ = task => {},
-            _ = state.quic.error() => {},
+            _ = state.quic.closed() => {},
         }
     }
 }
@@ -507,7 +436,7 @@ mod tests {
     use super::ConnectionBuilder;
     use crate::{
         codec::{BoxPeekableBiStream, BoxPeekableUniStream},
-        connection::{QuicConnection, StreamError},
+        connection::StreamError,
         dhttp::settings::{Setting, Settings},
         protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
         quic::{self, ConnectionError},
@@ -527,7 +456,7 @@ mod tests {
     impl<C: quic::Connection + ?Sized> Protocol<C> for MockProtocol {
         fn accept_uni<'a>(
             &'a self,
-            _: &'a Arc<QuicConnection<C>>,
+            _: &'a Arc<C>,
             stream: BoxPeekableUniStream<C>,
         ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
@@ -535,7 +464,7 @@ mod tests {
 
         fn accept_bi<'a>(
             &'a self,
-            _: &'a Arc<QuicConnection<C>>,
+            _: &'a Arc<C>,
             stream: BoxPeekableBiStream<C>,
         ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
@@ -551,7 +480,7 @@ mod tests {
 
         fn init<'a>(
             &'a self,
-            _: &'a Arc<QuicConnection<C>>,
+            _: &'a Arc<C>,
             _: &'a Protocols<C>,
         ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
             unimplemented!("not used in builder identity tests")

@@ -12,7 +12,7 @@ use futures::future::BoxFuture;
 
 use crate::{
     codec::{BoxPeekableBiStream, BoxPeekableUniStream},
-    connection::{QuicConnection, StreamError},
+    connection::StreamError,
     quic::{self, ConnectionError},
 };
 
@@ -59,7 +59,7 @@ impl<C: quic::Connection + ?Sized> Protocols<C> {
 
     pub(crate) async fn accept_uni<'a>(
         &'a self,
-        conn: &'a Arc<QuicConnection<C>>,
+        conn: &'a Arc<C>,
         mut stream: BoxPeekableUniStream<C>,
     ) -> Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>
     where
@@ -79,7 +79,7 @@ impl<C: quic::Connection + ?Sized> Protocols<C> {
 
     pub(crate) async fn accept_bi<'a>(
         &'a self,
-        conn: &'a Arc<QuicConnection<C>>,
+        conn: &'a Arc<C>,
         mut stream: BoxPeekableBiStream<C>,
     ) -> Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>
     where
@@ -105,7 +105,7 @@ pub trait ProductProtocol<C: quic::Connection + ?Sized>:
 
     fn init<'a>(
         &'a self,
-        conn: &'a Arc<QuicConnection<C>>,
+        conn: &'a Arc<C>,
         layers: &'a Protocols<C>,
     ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>>;
 }
@@ -113,7 +113,7 @@ pub trait ProductProtocol<C: quic::Connection + ?Sized>:
 pub(crate) trait InitProtocols<C: quic::Connection + ?Sized>: Send + Sync {
     fn init_protocols<'a>(
         &'a self,
-        conn: &'a Arc<QuicConnection<C>>,
+        conn: &'a Arc<C>,
         layers: &'a mut Protocols<C>,
     ) -> BoxFuture<'a, Result<(), ConnectionError>>;
 
@@ -137,7 +137,7 @@ pub(crate) trait InitProtocols<C: quic::Connection + ?Sized>: Send + Sync {
 impl<C: quic::Connection + ?Sized, P: ProductProtocol<C>> InitProtocols<C> for P {
     fn init_protocols<'a>(
         &'a self,
-        conn: &'a Arc<QuicConnection<C>>,
+        conn: &'a Arc<C>,
         layers: &'a mut Protocols<C>,
     ) -> BoxFuture<'a, Result<(), ConnectionError>> {
         Box::pin(async move {
@@ -215,7 +215,7 @@ pub trait Protocol<C: quic::Connection + ?Sized>: Any + Send + Sync + Debug {
     /// Returns whether the stream was accepted or should be passed to the next layer.
     fn accept_uni<'a>(
         &'a self,
-        connection: &'a Arc<QuicConnection<C>>,
+        connection: &'a Arc<C>,
         stream: BoxPeekableUniStream<C>,
     ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>>;
 
@@ -223,7 +223,7 @@ pub trait Protocol<C: quic::Connection + ?Sized>: Any + Send + Sync + Debug {
     /// Returns whether the stream was accepted or should be passed to the next layer.
     fn accept_bi<'a>(
         &'a self,
-        connection: &'a Arc<QuicConnection<C>>,
+        connection: &'a Arc<C>,
         stream: BoxPeekableBiStream<C>,
     ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>>;
 }
@@ -255,7 +255,7 @@ mod tests {
     impl<C: quic::Connection + ?Sized> Protocol<C> for MockProtocol {
         fn accept_uni<'a>(
             &'a self,
-            _: &'a Arc<QuicConnection<C>>,
+            _: &'a Arc<C>,
             stream: BoxPeekableUniStream<C>,
         ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
@@ -263,7 +263,7 @@ mod tests {
 
         fn accept_bi<'a>(
             &'a self,
-            _: &'a Arc<QuicConnection<C>>,
+            _: &'a Arc<C>,
             stream: BoxPeekableBiStream<C>,
         ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
@@ -279,7 +279,7 @@ mod tests {
 
         fn init<'a>(
             &'a self,
-            _: &'a Arc<QuicConnection<C>>,
+            _: &'a Arc<C>,
             _: &'a Protocols<C>,
         ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
             unimplemented!("not used in identity tests")
@@ -297,7 +297,7 @@ mod tests {
     impl<C: quic::Connection + ?Sized> Protocol<C> for MockProtocol2 {
         fn accept_uni<'a>(
             &'a self,
-            _: &'a Arc<QuicConnection<C>>,
+            _: &'a Arc<C>,
             stream: BoxPeekableUniStream<C>,
         ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
@@ -305,7 +305,7 @@ mod tests {
 
         fn accept_bi<'a>(
             &'a self,
-            _: &'a Arc<QuicConnection<C>>,
+            _: &'a Arc<C>,
             stream: BoxPeekableBiStream<C>,
         ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
@@ -317,7 +317,7 @@ mod tests {
 
         fn init<'a>(
             &'a self,
-            _: &'a Arc<QuicConnection<C>>,
+            _: &'a Arc<C>,
             _: &'a Protocols<C>,
         ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
             unimplemented!("not used in identity tests")

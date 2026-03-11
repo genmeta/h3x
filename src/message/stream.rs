@@ -11,7 +11,7 @@ use snafu::Snafu;
 
 use crate::{
     codec::{EncodeError, EncodeExt, SinkWriter, StreamReader},
-    connection::{self, ConnectionGoaway, ConnectionState, QuicConnection},
+    connection::{self, ConnectionGoaway, ConnectionState, LifecycleExt},
     dhttp::{
         frame::{
             Frame,
@@ -138,7 +138,7 @@ impl From<MessageStreamError> for io::Error {
 pub struct ReadStream {
     pub(super) stream: FrameStream<BoxDynQuicStreamReader>,
     pub(super) qpack_decoder: Arc<QPackDecoder>,
-    pub(super) connection: Arc<QuicConnection<dyn quic::Close + Send + Sync>>,
+    pub(super) connection: Arc<dyn quic::Lifecycle + Send + Sync>,
     dhttp_state: Arc<DHttpState>,
 }
 
@@ -146,7 +146,7 @@ impl ReadStream {
     pub fn new(
         stream: StreamReader<BoxDynQuicStreamReader>,
         qpack_decoder: Arc<QPackDecoder>,
-        connection: Arc<QuicConnection<dyn quic::Close + Send + Sync>>,
+        connection: Arc<dyn quic::Lifecycle + Send + Sync>,
         dhttp_state: Arc<DHttpState>,
     ) -> Self {
         let frame_stream = FrameStream::new(stream);
@@ -178,10 +178,11 @@ impl ReadStream {
             .peer_goaway
             .watch()
             .filter(move |goaway| future::ready(stream_id >= goaway.stream_id()));
-        let error = self.connection.error();
+        let conn = self.connection.clone();
 
         Ok(async move {
             let mut effective_peer_goaway = pin!(effective_peer_goaway.fuse());
+            let error = conn.closed();
             tokio::select! {
                 biased;
                 goaway = effective_peer_goaway.select_next_some() => Ok(goaway),
@@ -204,7 +205,7 @@ impl ReadStream {
                     _ = self.stream.stop(source.code().into_inner()).await;
                     Err(quic::StreamError::Reset { code: source.code().into_inner() }.into())
                 },
-                Err(error) => Err(self.connection.handle_stream_error(error).await.into()),
+                Err(error) => Err(self.connection.as_ref().handle_stream_error(error).await.into()),
             },
             goaway = peer_goaway => match goaway {
                 Ok(_goaway) => {
@@ -324,7 +325,7 @@ impl quic::StopStream for ReadStream {
 pub struct WriteStream {
     pub(super) stream: SinkWriter<BoxDynQuicStreamWriter>,
     pub(super) qpack_encoder: Arc<QPackEncoder>,
-    pub(super) connection: Arc<QuicConnection<dyn quic::Close + Send + Sync>>,
+    pub(super) connection: Arc<dyn quic::Lifecycle + Send + Sync>,
     dhttp_state: Arc<DHttpState>,
 }
 
@@ -335,7 +336,7 @@ impl WriteStream {
     pub fn new(
         stream: SinkWriter<BoxDynQuicStreamWriter>,
         qpack_encoder: Arc<QPackEncoder>,
-        connection: Arc<QuicConnection<dyn quic::Close + Send + Sync>>,
+        connection: Arc<dyn quic::Lifecycle + Send + Sync>,
         dhttp_state: Arc<DHttpState>,
     ) -> Self {
         Self {
@@ -373,10 +374,11 @@ impl WriteStream {
             .peer_goaway
             .watch()
             .filter(move |goaway| future::ready(stream_id >= goaway.stream_id()));
-        let error = self.connection.error();
+        let conn = self.connection.clone();
 
         Ok(async move {
             let mut effective_peer_goaway = pin!(effective_peer_goaway.fuse());
+            let error = conn.closed();
             tokio::select! {
                 biased;
                 goaway = effective_peer_goaway.select_next_some() => Ok(goaway),
@@ -399,7 +401,7 @@ impl WriteStream {
         tokio::select! {
             result = f(self) => match result {
                 Ok(value) => Ok(value),
-                Err(error) => Err(self.connection.handle_stream_error(error).await.into()),
+                Err(error) => Err(self.connection.as_ref().handle_stream_error(error).await.into()),
             },
             goaway = peer_goaway => match goaway {
                 Ok(_goaway) => {
@@ -511,13 +513,13 @@ impl<C: quic::Connection> ConnectionState<C> {
             ReadStream::new(
                 reader,
                 qpack.decoder.clone(),
-                self.quic_connection().clone(),
+                self.quic().clone() as Arc<dyn quic::Lifecycle + Send + Sync>,
                 dhttp.state.clone(),
             ),
             WriteStream::new(
                 writer,
                 qpack.encoder.clone(),
-                self.quic_connection().clone(),
+                self.quic().clone() as Arc<dyn quic::Lifecycle + Send + Sync>,
                 dhttp.state.clone(),
             ),
         ))
@@ -533,13 +535,13 @@ impl<C: quic::Connection> ConnectionState<C> {
             ReadStream::new(
                 reader,
                 qpack.decoder.clone(),
-                self.quic_connection().clone(),
+                self.quic().clone() as Arc<dyn quic::Lifecycle + Send + Sync>,
                 dhttp.state.clone(),
             ),
             WriteStream::new(
                 writer,
                 qpack.encoder.clone(),
-                self.quic_connection().clone(),
+                self.quic().clone() as Arc<dyn quic::Lifecycle + Send + Sync>,
                 dhttp.state.clone(),
             ),
         ))
