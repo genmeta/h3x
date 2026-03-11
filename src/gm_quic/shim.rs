@@ -314,15 +314,17 @@ impl quic::WithRemoteAgent for gm_quic::prelude::Connection {
     }
 }
 
-impl quic::Close for gm_quic::prelude::Connection {
+impl quic::Lifecycle for gm_quic::prelude::Connection {
     fn close(&self, code: Code, reason: Cow<'static, str>) {
         _ = gm_quic::prelude::Connection::close(self, reason, code.into_inner().into_inner());
     }
-}
 
-impl quic::Check for gm_quic::prelude::Connection {
     fn check(&self) -> Result<(), quic::ConnectionError> {
         self.validate().map_err(convert_connection_error)
+    }
+
+    fn closed(&self) -> BoxFuture<'_, quic::ConnectionError> {
+        Box::pin(gm_quic::prelude::Connection::terminated(self).map(convert_connection_error))
     }
 }
 

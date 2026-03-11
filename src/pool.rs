@@ -12,6 +12,7 @@ use http::uri::Authority;
 use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::task::AbortOnDropHandle;
+use tracing::Instrument;
 
 use crate::{
     connection::{Connection, ConnectionBuilder},
@@ -150,10 +151,13 @@ pub enum InsertError {
 
 impl<C: quic::Connection> Pool<C> {
     fn spawn_try_release(self, identify: ConnectionIdentifier) {
-        tokio::task::spawn_blocking(move || {
-            (self.connections.as_ref())
-                .remove_if(&identify, |_, connection| connection.reuse().is_none());
-        });
+        tokio::spawn(
+            async move {
+                (self.connections.as_ref())
+                    .remove_if(&identify, |_, connection| connection.reuse().is_none());
+            }
+            .in_current_span(),
+        );
     }
 
     #[tracing::instrument(level = "debug", skip(self, connector), err)]
@@ -290,7 +294,7 @@ mod tests {
 
     use crate::{
         codec::{BoxPeekableBiStream, BoxPeekableUniStream},
-        connection::{ConnectionBuilder, QuicConnection, StreamError},
+        connection::{ConnectionBuilder, StreamError},
         dhttp::settings::{Setting, Settings},
         protocol::{ProductProtocol, Protocol, StreamVerdict},
         quic::{self, ConnectionError},
@@ -310,7 +314,7 @@ mod tests {
     impl<C: quic::Connection + ?Sized> Protocol<C> for MockProtocol {
         fn accept_uni<'a>(
             &'a self,
-            _: &'a Arc<QuicConnection<C>>,
+            _: &'a Arc<C>,
             stream: BoxPeekableUniStream<C>,
         ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
@@ -318,7 +322,7 @@ mod tests {
 
         fn accept_bi<'a>(
             &'a self,
-            _: &'a Arc<QuicConnection<C>>,
+            _: &'a Arc<C>,
             stream: BoxPeekableBiStream<C>,
         ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
@@ -334,7 +338,7 @@ mod tests {
 
         fn init<'a>(
             &'a self,
-            _: &'a Arc<QuicConnection<C>>,
+            _: &'a Arc<C>,
             _: &'a crate::protocol::Protocols<C>,
         ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
             unimplemented!("not used in pool key tests")
