@@ -207,7 +207,16 @@ where
                 Ok(pair) => pair,
                 Err(InitialMessageStreamError::InitialRawStream { source }) => match source {
                     InitialRawMessageStreamError::Connection { source } => {
-                        return Err(source.into());
+                        // Connection may have been silently closed (e.g. idle timeout).
+                        // The error has been propagated to the SetOnce, so the pool
+                        // will no longer return this dead connection. Retry with a
+                        // fresh connection.
+                        tracing::debug!(
+                            target: "h3x::client",
+                            ?source,
+                            "Connection error on reused connection, retrying..."
+                        );
+                        continue;
                     }
                     InitialRawMessageStreamError::ResponseStream { source } => {
                         return Err(RequestError::ResponseStream { source });

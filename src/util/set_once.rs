@@ -29,6 +29,11 @@ impl<T> SetOnce<T> {
         }
     }
 
+    /// Returns `true` if the value has been set.
+    pub fn is_set(&self) -> bool {
+        self.value.lock().unwrap().is_some()
+    }
+
     pub fn set(&self, value: T) -> Result<(), T> {
         self.set_with(|| value).map_err(|f| f())
     }

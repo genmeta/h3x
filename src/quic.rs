@@ -141,12 +141,12 @@ pub trait Listen {
 }
 
 pub trait Connection:
-    ManageStream + WithLocalAgent + WithRemoteAgent + Close + Send + Sync + Any
+    ManageStream + WithLocalAgent + WithRemoteAgent + Close + Check + Send + Sync + Any
 {
 }
 
-impl<C: ManageStream + WithLocalAgent + WithRemoteAgent + Close + Send + Sync + Any> Connection
-    for C
+impl<C: ManageStream + WithLocalAgent + WithRemoteAgent + Close + Check + Send + Sync + Any>
+    Connection for C
 {
 }
 
@@ -180,6 +180,14 @@ pub trait WithRemoteAgent {
 
 pub trait Close {
     fn close(&self, code: Code, reason: Cow<'static, str>);
+}
+
+pub trait Check {
+    /// Check if the connection is still usable for reuse.
+    ///
+    /// Returns `Ok(())` if the connection is alive and can be reused,
+    /// or `Err(ConnectionError)` if the connection is dead.
+    fn check(&self) -> Result<(), ConnectionError>;
 }
 
 pub trait GetStreamId {

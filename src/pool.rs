@@ -42,6 +42,10 @@ impl<C: quic::Connection> ReuseableConnection<C> {
 
     pub fn reuse(&self) -> Option<Arc<Connection<C>>> {
         let connection = self.peek()?;
+        // proactively check if the QUIC connection is still alive
+        if connection.check().is_err() {
+            return None;
+        }
         // peer goaway, connection cannot be reused: cannot open new streams
         if let Some(peer_goaway) = connection.peek_peer_goaway()
             && let Some(max_received_stream_id) = connection.max_received_stream_id()

@@ -320,6 +320,12 @@ impl quic::Close for gm_quic::prelude::Connection {
     }
 }
 
+impl quic::Check for gm_quic::prelude::Connection {
+    fn check(&self) -> Result<(), quic::ConnectionError> {
+        self.validate().map_err(convert_connection_error)
+    }
+}
+
 impl quic::Listen for gm_quic::prelude::QuicListeners {
     type Connection = gm_quic::prelude::Connection;
 

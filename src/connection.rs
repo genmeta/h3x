@@ -103,19 +103,51 @@ impl<C: ?Sized> QuicConnection<C> {
             error: SetOnce::new(),
         }
     }
+
+    /// Returns `true` if a connection error has been recorded.
+    ///
+    /// This is a cheap, non-blocking check used by the connection pool to
+    /// detect dead connections before attempting to reuse them.
+    pub fn is_closed(&self) -> bool {
+        self.error.is_set()
+    }
 }
 
-impl<C: quic::ManageStream + ?Sized> QuicConnection<C> {
+impl<C: quic::Check + ?Sized> QuicConnection<C> {
+    /// Actively probe the underlying QUIC connection to check if it is still usable.
+    ///
+    /// Unlike [`is_closed`](Self::is_closed), this queries the QUIC layer directly
+    /// and can detect silently-closed connections (e.g. idle timeout).
+    /// If a dead connection is detected, the error is recorded so that
+    /// [`is_closed`](Self::is_closed) and [`error`](Self::error) also reflect it.
+    pub fn check(&self) -> Result<(), quic::ConnectionError> {
+        let result = self.inner.check();
+        if let Err(ref error) = result {
+            _ = self.error.set_with(|| error.clone());
+        }
+        result
+    }
+}
+
+impl<C: quic::ManageStream + quic::Close + ?Sized> QuicConnection<C> {
     pub async fn open_bi(
         &self,
     ) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
-        { self.inner.open_bi() }.await
+        match { self.inner.open_bi() }.await {
+            Ok(streams) => Ok(streams),
+            Err(error) => Err(self.handle_connection_error(error).await),
+        }
     }
 
     pub async fn open_uni(&self) -> Result<C::StreamWriter, quic::ConnectionError> {
-        { self.inner.open_uni() }.await
+        match { self.inner.open_uni() }.await {
+            Ok(stream) => Ok(stream),
+            Err(error) => Err(self.handle_connection_error(error).await),
+        }
     }
+}
 
+impl<C: quic::ManageStream + ?Sized> QuicConnection<C> {
     pub async fn accept_bi(
         &self,
     ) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
@@ -281,6 +313,18 @@ impl<C: ?Sized> ConnectionState<C> {
 
     pub fn protocol<P: Any>(&self) -> Option<&P> {
         self.protocols.get::<P>()
+    }
+
+    /// Returns `true` if the underlying QUIC connection has been closed.
+    pub fn is_closed(&self) -> bool {
+        self.quic.is_closed()
+    }
+}
+
+impl<C: quic::Check + ?Sized> ConnectionState<C> {
+    /// Actively probe the underlying QUIC connection to check if it is still usable.
+    pub fn check(&self) -> Result<(), quic::ConnectionError> {
+        self.quic.check()
     }
 }
 
