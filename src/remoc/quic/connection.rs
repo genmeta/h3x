@@ -55,11 +55,14 @@ pub trait Connection: Send + Sync {
         code: Code,
         reason: Cow<'static, str>,
     ) -> Result<(), quic::ConnectionError>;
+
+    /// Wait for the connection to close, returning the error that caused the closure.
+    async fn closed(&self) -> quic::ConnectionError;
 }
 
 /// Wrapper around [`RemoteConnectionClient`] that implements the four quic
 /// connection traits ([`ManageStream`], [`WithLocalAgent`], [`WithRemoteAgent`],
-/// [`Close`]), satisfying the blanket [`Connection`](quic::Connection) impl.
+/// [`Lifecycle`]), satisfying the blanket [`Connection`](quic::Connection) impl.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct RemoteQuicConnection {
     client: ConnectionClient,
@@ -166,7 +169,7 @@ impl quic::WithRemoteAgent for RemoteQuicConnection {
     }
 }
 
-impl quic::Close for RemoteQuicConnection {
+impl quic::Lifecycle for RemoteQuicConnection {
     fn close(&self, code: Code, reason: Cow<'static, str>) {
         let client = self.client.clone();
         // Fire-and-forget: spawn a task to handle the async RPC.
@@ -177,6 +180,29 @@ impl quic::Close for RemoteQuicConnection {
             }
             .in_current_span(),
         );
+    }
+
+    fn check(&self) -> Result<(), ConnectionError> {
+        // Remote connections cannot be synchronously checked;
+        // assume alive unless the RPC channel itself is broken.
+        Ok(())
+    }
+
+    fn closed(&self) -> BoxFuture<'_, ConnectionError> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            match client.closed().await {
+                Ok(err) => err,
+                // RPC channel broken = connection is dead
+                Err(_) => ConnectionError::Transport {
+                    source: quic::TransportError {
+                        kind: crate::varint::VarInt::from_u32(0),
+                        frame_type: crate::varint::VarInt::from_u32(0),
+                        reason: "remoc RTC channel broken".into(),
+                    },
+                },
+            }
+        })
     }
 }
 
@@ -333,5 +359,9 @@ where
     ) -> Result<(), quic::ConnectionError> {
         self.conn.close(code, reason);
         Ok(())
+    }
+
+    async fn closed(&self) -> quic::ConnectionError {
+        self.conn.closed().await
     }
 }

@@ -19,7 +19,7 @@ use crate::{
         BoxPeekableBiStream, BoxPeekableUniStream, BoxStreamReader, DecodeExt, EncodeExt,
         SinkWriter,
     },
-    connection::{ConnectionState, QuicConnection, StreamError},
+    connection::{ConnectionState, LifecycleExt, StreamError},
     dhttp::{protocol::DHttpProtocol, settings::Settings, stream::UnidirectionalStream},
     error::{H3CriticalStreamClosed, H3StreamCreationError},
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
@@ -166,7 +166,7 @@ impl<C: quic::Connection + ?Sized> QPackProtocol<C> {
 impl<C: quic::Connection + ?Sized> Protocol<C> for QPackProtocol<C> {
     fn accept_uni<'a>(
         &'a self,
-        connection: &'a Arc<QuicConnection<C>>,
+        connection: &'a Arc<C>,
         stream: BoxPeekableUniStream<C>,
     ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
         _ = connection;
@@ -175,7 +175,7 @@ impl<C: quic::Connection + ?Sized> Protocol<C> for QPackProtocol<C> {
 
     fn accept_bi<'a>(
         &'a self,
-        connection: &'a Arc<QuicConnection<C>>,
+        connection: &'a Arc<C>,
         stream: BoxPeekableBiStream<C>,
     ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
         _ = connection;
@@ -195,7 +195,7 @@ impl QPackProtocolFactory {
 
     pub async fn init<C: quic::Connection + ?Sized>(
         &self,
-        conn: &Arc<QuicConnection<C>>,
+        conn: &Arc<C>,
         layers: &Protocols<C>,
     ) -> Result<QPackProtocol<C>, ConnectionError> {
         let dhttp = layers
@@ -220,8 +220,9 @@ impl QPackProtocolFactory {
                 Ok::<_, StreamError>(encoder_stream.into_encode_sink())
             })));
 
-            let connection_error = conn.error();
+            let conn_clone = conn.clone();
             let decoder_inst_receiver = Box::pin(TryFuture::from(async move {
+                let connection_error = conn_clone.closed();
                 tokio::select! {
                     Ok(uni_stream_reader) = decoder_inst_receiver_rx => {
                         Ok(uni_stream_reader.into_decode_stream())
@@ -249,8 +250,9 @@ impl QPackProtocolFactory {
                 Ok::<_, StreamError>(decoder_stream.into_encode_sink())
             }));
 
-            let connection_error = conn.error();
+            let conn_clone = conn.clone();
             let encoder_inst_receiver = Box::pin(TryFuture::from(async move {
+                let connection_error = conn_clone.closed();
                 tokio::select! {
                     Ok(uni_stream_reader) = encoder_inst_receiver_rx => {
                         Ok(uni_stream_reader.into_decode_stream())
@@ -278,7 +280,7 @@ impl QPackProtocolFactory {
                     Err::<Never, _>(stream_error) = async { loop { encoder_clone.receive_instruction().await? } } => {
                         conn_state.handle_stream_error(stream_error).await;
                     }
-                    _connection_error = conn_state.error() => {
+                    _connection_error = conn_state.closed() => {
                         // Connection error occurred, background task will be aborted by the caller.
                     }
                 }
@@ -307,7 +309,7 @@ impl<C: quic::Connection + ?Sized> ProductProtocol<C> for QPackProtocolFactory {
 
     fn init<'a>(
         &'a self,
-        conn: &'a Arc<QuicConnection<C>>,
+        conn: &'a Arc<C>,
         layers: &'a Protocols<C>,
     ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
         Box::pin(self.init(conn, layers))

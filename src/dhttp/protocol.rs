@@ -27,7 +27,7 @@ use crate::{
         BoxPeekableBiStream, BoxPeekableUniStream, DecodeExt, EncodeExt, Feed, SinkWriter,
         StreamReader,
     },
-    connection::{ConnectionGoaway, ConnectionState, QuicConnection, StreamError},
+    connection::{ConnectionGoaway, ConnectionState, LifecycleExt, StreamError},
     dhttp::{
         frame::{Frame, stream::FrameStream},
         goaway::Goaway,
@@ -282,7 +282,7 @@ impl DHttpProtocol {
 
     async fn accept_uni<C: quic::Connection + ?Sized>(
         &self,
-        connection: &Arc<QuicConnection<C>>,
+        connection: &Arc<C>,
         mut stream: BoxPeekableUniStream<C>,
     ) -> Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError> {
         let Ok(stream_type) = stream.decode_one::<VarInt>().await else {
@@ -302,7 +302,7 @@ impl DHttpProtocol {
                         Err(stream_error) = state.handle_control_stream(stream.into_stream_reader()) => {
                             connection.handle_stream_error(stream_error).await;
                         }
-                        _connection_error = connection.error() => {
+                        _connection_error = connection.closed() => {
                             // Connection error occurred, likely due to shutdown. Just exit the task.
                         }
                     }
@@ -406,7 +406,7 @@ impl DHttpProtocol {
 impl<C: quic::Connection + ?Sized> Protocol<C> for DHttpProtocol {
     fn accept_uni<'a>(
         &'a self,
-        connection: &'a Arc<QuicConnection<C>>,
+        connection: &'a Arc<C>,
         stream: BoxPeekableUniStream<C>,
     ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
         Box::pin(self.accept_uni(connection, stream))
@@ -414,7 +414,7 @@ impl<C: quic::Connection + ?Sized> Protocol<C> for DHttpProtocol {
 
     fn accept_bi<'a>(
         &'a self,
-        connection: &'a Arc<QuicConnection<C>>,
+        connection: &'a Arc<C>,
         stream: BoxPeekableBiStream<C>,
     ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
         _ = connection;
@@ -434,7 +434,7 @@ impl DHttpProtocolFactory {
 
     pub async fn init<C: quic::Connection + ?Sized>(
         &self,
-        conn: &QuicConnection<C>,
+        conn: &Arc<C>,
     ) -> Result<DHttpProtocol, quic::ConnectionError> {
         let uni_stream = SinkWriter::new(Box::pin(conn.open_uni().await?));
         let mut control_stream = match UnidirectionalStream::initial_control_stream(uni_stream)
@@ -451,7 +451,7 @@ impl DHttpProtocolFactory {
             }
             Err(stream_error) => {
                 conn.handle_stream_error(stream_error).await;
-                return Err(conn.error().await);
+                return Err(conn.closed().await);
             }
         };
 
@@ -460,7 +460,7 @@ impl DHttpProtocolFactory {
             Ok(()) => (),
             Err(stream_error) => {
                 conn.handle_stream_error(stream_error).await;
-                return Err(conn.error().await);
+                return Err(conn.closed().await);
             }
         }
 
@@ -478,7 +478,7 @@ impl<C: quic::Connection + ?Sized> ProductProtocol<C> for DHttpProtocolFactory {
 
     fn init<'a>(
         &'a self,
-        conn: &'a Arc<QuicConnection<C>>,
+        conn: &'a Arc<C>,
         layers: &'a Protocols<C>,
     ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
         _ = layers;
@@ -510,10 +510,11 @@ impl<C: ?Sized> ConnectionState<C> {
     }
 }
 
-impl<C: quic::Close + ?Sized> ConnectionState<C> {
+impl<C: quic::Lifecycle + Sync + ?Sized> ConnectionState<C> {
     pub async fn peer_settings(
         &self,
-    ) -> impl Future<Output = Result<Arc<Settings>, quic::ConnectionError>> + Send + use<C> {
+    ) -> impl Future<Output = Result<Arc<Settings>, quic::ConnectionError>> + Send + use<'_, C>
+    {
         let error = self.closed();
         (self.dhttp().peer_settings.get()).then(|option| match option {
             Some(settings) => future::ready(Ok(settings)).left_future(),
@@ -523,7 +524,7 @@ impl<C: quic::Close + ?Sized> ConnectionState<C> {
 
     pub fn peer_goawaies(
         &self,
-    ) -> impl FusedStream<Item = Result<Goaway, quic::ConnectionError>> + Send + use<C> {
+    ) -> impl FusedStream<Item = Result<Goaway, quic::ConnectionError>> + Send + use<'_, C> {
         stream::select(
             self.dhttp().peer_goaway.watch().map(Ok),
             self.closed().map(Err).into_stream(),
@@ -539,9 +540,7 @@ impl<C: quic::Close + ?Sized> ConnectionState<C> {
         };
 
         if let Err(stream_error) = send_goaway.await {
-            self.quic_connection()
-                .handle_stream_error(stream_error)
-                .await;
+            self.quic().handle_stream_error(stream_error).await;
             return Err(self.closed().await);
         }
 
@@ -570,7 +569,7 @@ pub enum AcceptRawMessageStreamError {
     Goaway { source: ConnectionGoaway },
 }
 
-impl<C: quic::Close + quic::ManageStream + Send + Sync + ?Sized> ConnectionState<C> {
+impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync + ?Sized> ConnectionState<C> {
     pub async fn initial_raw_message_stream(
         &self,
     ) -> Result<
@@ -580,7 +579,7 @@ impl<C: quic::Close + quic::ManageStream + Send + Sync + ?Sized> ConnectionState
         ),
         InitialRawMessageStreamError,
     > {
-        let (reader, writer) = self.quic_connection().open_bi().await?;
+        let (reader, writer) = self.open_bi().await?;
         let (mut reader, writer) = (Box::pin(reader), Box::pin(writer));
         self.dhttp()
             .on_initialized_message_stream(reader.stream_id().await?)?;
