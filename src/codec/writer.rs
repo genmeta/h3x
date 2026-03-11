@@ -204,9 +204,8 @@ where
         Self { sink, item: None }
     }
 
-    pub async fn ready(self: Pin<&mut Self>) -> Result<(), S::Error> {
-        let mut project = self.project();
-        poll_fn(|cx| project.sink.as_mut().poll_ready(cx)).await
+    pub async fn ready(mut self: Pin<&mut Self>) -> Result<(), S::Error> {
+        poll_fn(|cx| self.as_mut().poll_ready(cx)).await
     }
 
     pub async fn send_all(
