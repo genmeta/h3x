@@ -14,6 +14,7 @@ use crate::{
     error::Code,
     pool::Pool,
     quic::{self, GetStreamIdExt},
+    stream_id::StreamId,
 };
 
 mod message;
@@ -168,6 +169,8 @@ where
                     remote_agent: remote_agent.clone(),
                     response_stream: write_stream,
                     local_agent: local_agent.clone(),
+                    stream_id: StreamId(stream_id),
+                    protocols: connection.protocols().clone(),
                 };
 
                 let handle_request = async move {

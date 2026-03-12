@@ -76,6 +76,8 @@ where
 
             *request.headers_mut() = request.headers().clone();
             request.extensions_mut().insert(resp.agent().clone());
+            request.extensions_mut().insert(req.stream_id());
+            request.extensions_mut().insert(req.protocols().clone());
             if let Some(remote_agent) = req.agent().cloned() {
                 request.extensions_mut().insert(remote_agent);
             }
@@ -166,6 +168,8 @@ where
             remote_agent,
             mut response_stream,
             local_agent,
+            stream_id,
+            protocols,
         }: UnresolvedRequest,
     ) -> Self::Future {
         let span = tracing::info_span!(
@@ -197,6 +201,8 @@ where
             if let Some(remote_agent) = remote_agent {
                 request.extensions_mut().insert(remote_agent);
             }
+            request.extensions_mut().insert(stream_id);
+            request.extensions_mut().insert(protocols);
             if is_connect {
                 request.extensions_mut().insert(remain_write_stream);
             }
@@ -273,6 +279,8 @@ where
 
             *request.headers_mut() = request.headers().clone();
             request.extensions_mut().insert(resp.agent().clone());
+            request.extensions_mut().insert(req.stream_id());
+            request.extensions_mut().insert(req.protocols().clone());
             if let Some(remote_agent) = req.agent().cloned() {
                 request.extensions_mut().insert(remote_agent);
             }
@@ -325,6 +333,8 @@ where
             remote_agent,
             mut response_stream,
             local_agent,
+            stream_id,
+            protocols,
         }: UnresolvedRequest,
     ) -> Self::Future {
         let span = tracing::info_span!(
@@ -352,6 +362,8 @@ where
             if let Some(remote_agent) = remote_agent {
                 request.extensions_mut().insert(remote_agent);
             }
+            request.extensions_mut().insert(stream_id);
+            request.extensions_mut().insert(protocols);
             if is_connect {
                 request.extensions_mut().insert(remain_write_stream);
             }

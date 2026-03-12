@@ -238,6 +238,10 @@ impl<C: ?Sized> ConnectionState<C> {
     pub fn protocol<P: Any>(&self) -> Option<&P> {
         self.protocols.get::<P>()
     }
+
+    pub fn protocols(&self) -> &Arc<Protocols> {
+        &self.protocols
+    }
 }
 
 impl<C: quic::Lifecycle + ?Sized> ConnectionState<C> {

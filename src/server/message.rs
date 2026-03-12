@@ -16,8 +16,10 @@ use crate::{
         stream::{MessageStreamError, ReadStream, WriteStream},
         unify::{MalformedMessageError, Message, MessageStage, ReadToStringError},
     },
+    protocol::Protocols,
     qpack::field::{Protocol, PseudoHeaders},
     quic::agent,
+    stream_id::StreamId,
 };
 
 pub struct UnresolvedRequest {
@@ -25,6 +27,8 @@ pub struct UnresolvedRequest {
     pub remote_agent: Option<Arc<dyn agent::RemoteAgent>>,
     pub response_stream: WriteStream,
     pub local_agent: Arc<dyn agent::LocalAgent>,
+    pub stream_id: StreamId,
+    pub protocols: Arc<Protocols>,
 }
 
 impl UnresolvedRequest {
@@ -33,6 +37,8 @@ impl UnresolvedRequest {
             message: Message::unresolved_request(),
             stream: self.request_stream,
             agent: self.remote_agent,
+            stream_id: self.stream_id,
+            protocols: self.protocols.clone(),
         };
         request
             .stream
@@ -42,9 +48,12 @@ impl UnresolvedRequest {
             message: Message::unresolved_response(),
             stream: self.response_stream,
             agent: self.local_agent,
+            stream_id: self.stream_id,
+            protocols: self.protocols,
         };
         Ok((request, response))
     }
+
 }
 
 impl IntoFuture for UnresolvedRequest {
@@ -61,6 +70,8 @@ pub struct Request {
     message: Message,
     stream: ReadStream,
     agent: Option<Arc<dyn agent::RemoteAgent>>,
+    stream_id: StreamId,
+    protocols: Arc<Protocols>,
 }
 
 impl Request {
@@ -146,12 +157,22 @@ impl Request {
     pub fn agent(&self) -> Option<&Arc<dyn agent::RemoteAgent>> {
         self.agent.as_ref()
     }
+
+    pub fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub fn protocols(&self) -> &Arc<Protocols> {
+        &self.protocols
+    }
 }
 
 pub struct Response {
     message: Message,
     stream: WriteStream,
     agent: Arc<dyn agent::LocalAgent>,
+    stream_id: StreamId,
+    protocols: Arc<Protocols>,
 }
 
 impl Response {
@@ -346,6 +367,14 @@ impl Response {
 
     pub fn agent(&self) -> &Arc<dyn agent::LocalAgent> {
         &self.agent
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub fn protocols(&self) -> &Arc<Protocols> {
+        &self.protocols
     }
 
     /// Async drop the response properly
