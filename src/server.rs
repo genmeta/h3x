@@ -113,7 +113,10 @@ where
             let Some(local_agent) = local_agent else {
                 tracing::debug!("Close incoming connection due to missing SNI");
                 // no SNI
-                connection.close(Code::H3_INTERNAL_ERROR, "missing server name (SNI) on incoming connection");
+                connection.close(
+                    Code::H3_INTERNAL_ERROR,
+                    "missing server name (SNI) on incoming connection",
+                );
                 return;
             };
 

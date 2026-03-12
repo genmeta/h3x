@@ -256,7 +256,9 @@ impl H3Error for H3GeneralProtocolError {
 #[derive(Debug, Snafu)]
 pub enum H3InternalError {
     #[snafu(display("QPACK encoder encode failure: {source}"))]
-    QPackEncoderEncode { source: crate::codec::EncodeStreamError },
+    QPackEncoderEncode {
+        source: crate::codec::EncodeStreamError,
+    },
     #[snafu(display("missing server name (SNI) on incoming connection"))]
     MissingServerName,
 }

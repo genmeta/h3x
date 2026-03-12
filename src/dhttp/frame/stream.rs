@@ -58,7 +58,12 @@ where
 
     pub async fn consume_current_frame(mut self: Pin<&mut Self>) -> Result<(), StreamError> {
         let map_decode_stream_error = |error: DecodeStreamError| {
-            error.map_decode_error(|decode_error| H3FrameDecodeError { source: decode_error }.into())
+            error.map_decode_error(|decode_error| {
+                H3FrameDecodeError {
+                    source: decode_error,
+                }
+                .into()
+            })
         };
 
         match self.as_mut().frame() {
@@ -86,8 +91,12 @@ where
             }
 
             let convert_decode_varint_error = |error: io::Error| {
-                DecodeStreamError::from(error)
-                .map_decode_error(|decode_error| H3FrameDecodeError { source: decode_error }.into())
+                DecodeStreamError::from(error).map_decode_error(|decode_error| {
+                    H3FrameDecodeError {
+                        source: decode_error,
+                    }
+                    .into()
+                })
             };
             let r#type =
                 (stream.decode_one::<VarInt>().await).map_err(convert_decode_varint_error)?;

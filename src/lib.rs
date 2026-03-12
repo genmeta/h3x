@@ -11,7 +11,9 @@ pub mod pool;
 pub mod protocol;
 pub mod qpack;
 pub mod quic;
+pub mod runtime;
 pub mod server;
+pub mod stream_id;
 mod util;
 pub mod varint;
 

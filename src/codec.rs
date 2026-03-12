@@ -24,6 +24,27 @@ pub type BoxPeekableBiStream<C> = (
     SinkWriter<Pin<Box<<C as quic::ManageStream>::StreamWriter>>>,
 );
 
+/// Raw erased read stream: a pinned, boxed trait object for `quic::ReadStream`.
+pub type BoxReadStream = Pin<Box<dyn quic::ReadStream + Send>>;
+
+/// Raw erased write stream: a pinned, boxed trait object for `quic::WriteStream`.
+pub type BoxWriteStream = Pin<Box<dyn quic::WriteStream + Send>>;
+
+/// Erased (non-generic) stream reader wrapping a boxed `ReadStream` trait object.
+pub type ErasedStreamReader = StreamReader<BoxReadStream>;
+
+/// Erased (non-generic) sink writer wrapping a boxed `WriteStream` trait object.
+pub type ErasedStreamWriter = SinkWriter<BoxWriteStream>;
+
+/// Erased (non-generic) peekable unidirectional stream reader.
+pub type ErasedPeekableUniStream = PeekableStreamReader<BoxReadStream>;
+
+/// Erased (non-generic) peekable bidirectional stream pair.
+pub type ErasedPeekableBiStream = (
+    PeekableStreamReader<BoxReadStream>,
+    SinkWriter<BoxWriteStream>,
+);
+
 pub trait EncodeInto<S>: Sized {
     type Output;
     type Error;

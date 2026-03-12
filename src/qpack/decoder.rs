@@ -17,7 +17,10 @@ use crate::{
     codec::{DecodeExt, DecodeFrom, DecodeStreamError, EncodeInto, Feed},
     connection::StreamError,
     dhttp::settings::Settings,
-    error::{Code, ErrorScope, H3CriticalStreamClosed, H3Error, H3FrameDecodeError, QpackDecompressionFailed},
+    error::{
+        Code, ErrorScope, H3CriticalStreamClosed, H3Error, H3FrameDecodeError,
+        QpackDecompressionFailed,
+    },
     qpack::{
         dynamic::DynamicTable,
         encoder::EncoderInstruction,
@@ -58,7 +61,6 @@ pub enum QPackEncoderStreamError {
     #[snafu(display("referenced dynamic table entry {index} does not exist"))]
     ReferencedDynamicEntryNotExisted { index: u64 },
 }
-
 
 impl H3Error for QPackEncoderStreamError {
     fn code(&self) -> Code {
@@ -312,7 +314,6 @@ pub enum InvalidDynamicTableReference {
     ReferencedDynamicEntryNotExisted { index: u64 },
 }
 
-
 impl H3Error for InvalidDynamicTableReference {
     fn code(&self) -> Code {
         Code::QPACK_DECOMPRESSION_FAILED
@@ -553,7 +554,12 @@ impl<S: AsyncBufRead + Send> DecodeFrom<S> for DecoderInstruction {
         decode.await.map_err(|error: DecodeStreamError| {
             error.map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::QPackDecoder.into(),
-                |decode_error| H3FrameDecodeError { source: decode_error }.into(),
+                |decode_error| {
+                    H3FrameDecodeError {
+                        source: decode_error,
+                    }
+                    .into()
+                },
             )
         })
     }

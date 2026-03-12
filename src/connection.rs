@@ -106,9 +106,9 @@ pub trait LifecycleExt: quic::Lifecycle + Sync {
                     quic::StreamError::Reset { .. } => source,
                 },
                 StreamError::Code { source } => match source.scope() {
-                    ErrorScope::Stream => {
-                        quic::StreamError::Reset { code: source.code().into_inner() }
-                    }
+                    ErrorScope::Stream => quic::StreamError::Reset {
+                        code: source.code().into_inner(),
+                    },
                     ErrorScope::Connection => {
                         self.close(source.code(), source.to_string().into());
                         self.closed().await.into()

@@ -165,7 +165,6 @@ pub enum InvalidSettingValue {
     ConnectProtocol { value: VarInt },
 }
 
-
 impl H3Error for InvalidSettingValue {
     fn code(&self) -> Code {
         Code::H3_SETTINGS_ERROR
@@ -188,7 +187,12 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for Setting {
         let setting = decode.await.map_err(|error: DecodeStreamError| {
             error.map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::Control.into(),
-                |decode_error| H3FrameDecodeError { source: decode_error }.into(),
+                |decode_error| {
+                    H3FrameDecodeError {
+                        source: decode_error,
+                    }
+                    .into()
+                },
             )
         })?;
 

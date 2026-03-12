@@ -20,7 +20,9 @@ use crate::{
     },
     connection::StreamError,
     dhttp::{frame::Frame, settings::Settings},
-    error::{Code, ErrorScope, H3CriticalStreamClosed, H3Error, H3FrameDecodeError, H3InternalError},
+    error::{
+        Code, ErrorScope, H3CriticalStreamClosed, H3Error, H3FrameDecodeError, H3InternalError,
+    },
     qpack::{
         algorithm::Algorithm,
         decoder::DecoderInstruction,
@@ -76,7 +78,6 @@ pub enum QPackDecoderStreamError {
     IncrementZero,
 }
 
-
 impl H3Error for QPackDecoderStreamError {
     fn code(&self) -> Code {
         Code::QPACK_DECODER_STREAM_ERROR
@@ -96,7 +97,6 @@ pub enum QPackEncoderError {
     #[snafu(display("cannot evict entries: no evictable entries in dynamic table"))]
     CannotEvict,
 }
-
 
 impl EncoderState {
     pub(crate) fn emit(&mut self, instruction: EncoderInstruction) {
@@ -596,7 +596,12 @@ impl<S: AsyncBufRead + Send> DecodeFrom<S> for EncoderInstruction {
         decode.await.map_err(|error: DecodeStreamError| {
             error.map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::QPackEncoder.into(),
-                |decode_error| H3FrameDecodeError { source: decode_error }.into(),
+                |decode_error| {
+                    H3FrameDecodeError {
+                        source: decode_error,
+                    }
+                    .into()
+                },
             )
         })
     }

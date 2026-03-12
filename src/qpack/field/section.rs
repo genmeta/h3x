@@ -62,7 +62,6 @@ pub enum MalformedHeaderSection {
     InvalidMessage { source: http::Error },
 }
 
-
 impl H3Error for MalformedHeaderSection {
     fn code(&self) -> Code {
         Code::H3_MESSAGE_ERROR

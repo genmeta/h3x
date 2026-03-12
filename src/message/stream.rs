@@ -234,7 +234,9 @@ impl ReadStream {
                     // avoid rust bc bug
                     return Pin::new(&mut self.stream).frame();
                 }
-                Some(Ok(_frame)) => return Some(Err(H3FrameUnexpected::UnexpectedFrameType.into())),
+                Some(Ok(_frame)) => {
+                    return Some(Err(H3FrameUnexpected::UnexpectedFrameType.into()));
+                }
                 Some(Err(error)) => return Some(Err(error)),
             }
         }
@@ -253,8 +255,9 @@ impl ReadStream {
                             continue;
                         }
                         Err(error) => {
-                            let error = error
-                                .map_decode_error(|error| H3FrameDecodeError { source: error }.into());
+                            let error = error.map_decode_error(|error| {
+                                H3FrameDecodeError { source: error }.into()
+                            });
                             return Some(Err(error));
                         }
                     }

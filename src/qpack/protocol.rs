@@ -16,7 +16,7 @@ use tracing::Instrument;
 
 use crate::{
     codec::{
-        BoxPeekableBiStream, BoxPeekableUniStream, BoxStreamReader, DecodeExt, EncodeExt,
+        self, BoxPeekableBiStream, BoxPeekableUniStream, DecodeExt, EncodeExt, ErasedStreamReader,
         SinkWriter,
     },
     connection::{ConnectionState, LifecycleExt, StreamError},
@@ -100,19 +100,19 @@ pub type QPackDecoder = Decoder<
 /// Implements [`Protocol`] to handle QPACK stream identification.
 /// This layer recognizes QPACK unidirectional stream types
 /// (encoder 0x02, decoder 0x03) and passes all other streams through.
-pub struct QPackProtocol<C: quic::Connection + ?Sized> {
+pub struct QPackProtocol {
     /// Oneshot sender for dispatching the peer's QPACK encoder instruction stream.
-    encoder_inst_receiver_tx: Mutex<Option<oneshot::Sender<BoxStreamReader<C>>>>,
+    encoder_inst_receiver_tx: Mutex<Option<oneshot::Sender<ErasedStreamReader>>>,
     /// QPACK encoder, set during connection initialization.
     pub encoder: Arc<QPackEncoder>,
 
     /// Oneshot sender for dispatching the peer's QPACK decoder instruction stream.
-    decoder_inst_receiver_tx: Mutex<Option<oneshot::Sender<BoxStreamReader<C>>>>,
+    decoder_inst_receiver_tx: Mutex<Option<oneshot::Sender<ErasedStreamReader>>>,
     /// QPACK decoder, set during connection initialization.
     pub decoder: Arc<QPackDecoder>,
 }
 
-impl<C: quic::Connection + ?Sized> std::fmt::Debug for QPackProtocol<C> {
+impl std::fmt::Debug for QPackProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QPackLayer")
             .field("encoder", &"...")
@@ -121,8 +121,8 @@ impl<C: quic::Connection + ?Sized> std::fmt::Debug for QPackProtocol<C> {
     }
 }
 
-impl<C: quic::Connection + ?Sized> QPackProtocol<C> {
-    async fn accept_uni(
+impl QPackProtocol {
+    async fn accept_uni<C: quic::Connection + ?Sized>(
         &self,
         mut stream: BoxPeekableUniStream<C>,
     ) -> Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError> {
@@ -131,7 +131,9 @@ impl<C: quic::Connection + ?Sized> QPackProtocol<C> {
         };
 
         if stream_type == UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE {
-            let uni_stream_reader = stream.into_stream_reader();
+            let uni_stream_reader = stream
+                .into_stream_reader()
+                .map_stream(|s| s as codec::BoxReadStream);
             _ = self
                 .encoder_inst_receiver_tx
                 .lock()
@@ -141,7 +143,9 @@ impl<C: quic::Connection + ?Sized> QPackProtocol<C> {
                 .send(uni_stream_reader);
             Ok(StreamVerdict::Accepted)
         } else if stream_type == UnidirectionalStream::QPACK_DECODER_STREAM_TYPE {
-            let uni_stream_reader = stream.into_stream_reader();
+            let uni_stream_reader = stream
+                .into_stream_reader()
+                .map_stream(|s| s as codec::BoxReadStream);
             _ = self
                 .decoder_inst_receiver_tx
                 .lock()
@@ -155,7 +159,7 @@ impl<C: quic::Connection + ?Sized> QPackProtocol<C> {
         }
     }
 
-    async fn accept_bi(
+    async fn accept_bi<C: quic::Connection + ?Sized>(
         &self,
         stream: BoxPeekableBiStream<C>,
     ) -> Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError> {
@@ -163,14 +167,14 @@ impl<C: quic::Connection + ?Sized> QPackProtocol<C> {
     }
 }
 
-impl<C: quic::Connection + ?Sized> Protocol<C> for QPackProtocol<C> {
+impl<C: quic::Connection + ?Sized> Protocol<C> for QPackProtocol {
     fn accept_uni<'a>(
         &'a self,
         connection: &'a Arc<C>,
         stream: BoxPeekableUniStream<C>,
     ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
         _ = connection;
-        Box::pin(self.accept_uni(stream))
+        Box::pin(self.accept_uni::<C>(stream))
     }
 
     fn accept_bi<'a>(
@@ -179,7 +183,7 @@ impl<C: quic::Connection + ?Sized> Protocol<C> for QPackProtocol<C> {
         stream: BoxPeekableBiStream<C>,
     ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
         _ = connection;
-        Box::pin(self.accept_bi(stream))
+        Box::pin(self.accept_bi::<C>(stream))
     }
 }
 
@@ -197,16 +201,16 @@ impl QPackProtocolFactory {
         &self,
         conn: &Arc<C>,
         layers: &Protocols<C>,
-    ) -> Result<QPackProtocol<C>, ConnectionError> {
+    ) -> Result<QPackProtocol, ConnectionError> {
         let dhttp = layers
             .get::<DHttpProtocol>()
             .expect("DHttpLayer must be initialized before QPackLayer");
 
         // Create dispatch channels for incoming peer QPACK streams
         let (encoder_inst_receiver_tx, encoder_inst_receiver_rx) =
-            oneshot::channel::<BoxStreamReader<C>>();
+            oneshot::channel::<ErasedStreamReader>();
         let (decoder_inst_receiver_tx, decoder_inst_receiver_rx) =
-            oneshot::channel::<BoxStreamReader<C>>();
+            oneshot::channel::<ErasedStreamReader>();
 
         // Create QPACK encoder with lazy streams
         let encoder = {
@@ -305,7 +309,7 @@ impl QPackProtocolFactory {
 }
 
 impl<C: quic::Connection + ?Sized> ProductProtocol<C> for QPackProtocolFactory {
-    type Protocol = QPackProtocol<C>;
+    type Protocol = QPackProtocol;
 
     fn init<'a>(
         &'a self,
@@ -322,7 +326,7 @@ pub struct QPackProtocolDisabled;
 
 impl<C: quic::Connection + ?Sized> ConnectionState<C> {
     #[inline]
-    pub fn qpack(&self) -> Result<&QPackProtocol<C>, QPackProtocolDisabled> {
+    pub fn qpack(&self) -> Result<&QPackProtocol, QPackProtocolDisabled> {
         self.protocol().ok_or(QPackProtocolDisabled)
     }
 }

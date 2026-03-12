@@ -24,8 +24,8 @@ use tracing::Instrument;
 use crate::{
     buflist::BufList,
     codec::{
-        BoxPeekableBiStream, BoxPeekableUniStream, DecodeExt, EncodeExt, Feed, SinkWriter,
-        StreamReader,
+        BoxPeekableBiStream, BoxPeekableUniStream, BoxReadStream, BoxWriteStream, DecodeExt,
+        EncodeExt, ErasedStreamReader, ErasedStreamWriter, Feed, SinkWriter, StreamReader,
     },
     connection::{ConnectionGoaway, ConnectionState, LifecycleExt, StreamError},
     dhttp::{
@@ -34,7 +34,10 @@ use crate::{
         settings::Settings,
         stream::UnidirectionalStream,
     },
-    error::{Code, H3CriticalStreamClosed, H3FrameUnexpected, H3IdError, H3MissingSettings, H3StreamCreationError},
+    error::{
+        Code, H3CriticalStreamClosed, H3FrameUnexpected, H3IdError, H3MissingSettings,
+        H3StreamCreationError,
+    },
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     quic::{self, CancelStreamExt, ConnectionError, GetStreamIdExt, StopStreamExt},
     util::{ring_channel::RingChannel, set_once::SetOnce, watch::Watch},
@@ -234,8 +237,8 @@ impl DHttpState {
 
 type FrameSink = Feed<BoxSink<'static, Frame<BufList>, StreamError>, Frame<BufList>>;
 
-pub type BoxDynQuicStreamReader = Pin<Box<dyn quic::ReadStream + Send>>;
-pub type BoxDynQuicStreamWriter = Pin<Box<dyn quic::WriteStream + Send>>;
+pub type BoxDynQuicStreamReader = BoxReadStream;
+pub type BoxDynQuicStreamWriter = BoxWriteStream;
 
 /// DHTTP/3 protocol layer.
 ///
@@ -252,10 +255,7 @@ pub struct DHttpProtocol {
 
     handle_control_stream: SetOnce<AbortOnDropHandle<()>>,
 
-    unresolved_request_streams: RingChannel<(
-        StreamReader<BoxDynQuicStreamReader>,
-        SinkWriter<BoxDynQuicStreamWriter>,
-    )>,
+    unresolved_request_streams: RingChannel<(ErasedStreamReader, ErasedStreamWriter)>,
 }
 
 impl ops::Deref for DHttpProtocol {
@@ -572,13 +572,7 @@ pub enum AcceptRawMessageStreamError {
 impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync + ?Sized> ConnectionState<C> {
     pub async fn initial_raw_message_stream(
         &self,
-    ) -> Result<
-        (
-            StreamReader<BoxDynQuicStreamReader>,
-            SinkWriter<BoxDynQuicStreamWriter>,
-        ),
-        InitialRawMessageStreamError,
-    > {
+    ) -> Result<(ErasedStreamReader, ErasedStreamWriter), InitialRawMessageStreamError> {
         let (reader, writer) = self.open_bi().await?;
         let (mut reader, writer) = (Box::pin(reader), Box::pin(writer));
         self.dhttp()
@@ -588,13 +582,7 @@ impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync + ?Sized> ConnectionS
 
     pub async fn accept_raw_message_stream(
         &self,
-    ) -> Result<
-        (
-            StreamReader<BoxDynQuicStreamReader>,
-            SinkWriter<BoxDynQuicStreamWriter>,
-        ),
-        AcceptRawMessageStreamError,
-    > {
+    ) -> Result<(ErasedStreamReader, ErasedStreamWriter), AcceptRawMessageStreamError> {
         let (reader, writer) = tokio::select! {
             biased;
             stream = self.dhttp().unresolved_request_streams.receive() => stream,

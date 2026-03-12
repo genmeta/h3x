@@ -271,7 +271,12 @@ where
         };
 
         decode.await.map_err(|error: DecodeStreamError| {
-            error.map_decode_error(|decode_error| H3FrameDecodeError { source: decode_error }.into())
+            error.map_decode_error(|decode_error| {
+                H3FrameDecodeError {
+                    source: decode_error,
+                }
+                .into()
+            })
         })
     }
 }

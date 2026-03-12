@@ -44,7 +44,12 @@ where
         let stream_id = stream.decode_one::<VarInt>().await.map_err(|error| {
             DecodeStreamError::from(error).map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::Control.into(),
-                |decode_error| H3FrameDecodeError { source: decode_error }.into(),
+                |decode_error| {
+                    H3FrameDecodeError {
+                        source: decode_error,
+                    }
+                    .into()
+                },
             )
         })?;
 

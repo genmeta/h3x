@@ -69,7 +69,12 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for EncodedFieldSectionPrefix {
             })
         };
         decode.await.map_err(|error: DecodeStreamError| {
-            error.map_decode_error(|decode_error| H3FrameDecodeError { source: decode_error }.into())
+            error.map_decode_error(|decode_error| {
+                H3FrameDecodeError {
+                    source: decode_error,
+                }
+                .into()
+            })
         })
     }
 }
@@ -304,7 +309,12 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for FieldLineRepresentation {
             }
         };
         decode.await.map_err(|error: DecodeStreamError| {
-            error.map_decode_error(|decode_error| H3FrameDecodeError { source: decode_error }.into())
+            error.map_decode_error(|decode_error| {
+                H3FrameDecodeError {
+                    source: decode_error,
+                }
+                .into()
+            })
         })
     }
 }
