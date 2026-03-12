@@ -1,3 +1,65 @@
+//! Protocol layer registry and stream dispatch.
+//!
+//! This module defines the [`Protocols`] registry and the [`Protocol`] trait that
+//! together form h3x's layered protocol architecture. Each QUIC connection creates
+//! exactly one [`Protocols`] instance during connection setup; this instance is
+//! **connection-scoped** and shared (via `Arc<Protocols>`) across every request on
+//! that connection.
+//!
+//! # Architecture
+//!
+//! ```text
+//! Connection setup (typed, generic over C)
+//!   └─ ProductProtocol<C>::init(conn)          // factory, runs once per protocol
+//!        └─ produces non-generic Protocol impl  // e.g. DHttpProtocol, QPackProtocol
+//!             └─ inserted into Protocols        // keyed by TypeId
+//! ```
+//!
+//! After initialization, the generic transport type `C` is erased. Runtime protocol
+//! objects store any connection capabilities they need internally (typically as
+//! `Arc<dyn ErasedConnection>` or equivalent trait objects).
+//!
+//! # Handler access pattern
+//!
+//! Handlers receive protocol access through [`crate::server::Request::protocols()`]
+//! and [`crate::server::Response::protocols()`], which return `&Arc<Protocols>`.
+//! Combined with [`crate::stream_id::StreamId`], a handler can derive
+//! per-request/session handles from the connection-scoped protocol state:
+//!
+//! ```ignore
+//! // Native h3x handler:
+//! let dhttp = request.protocols().get::<DHttpProtocol>().unwrap();
+//! let stream_id = request.stream_id();
+//!
+//! // Hypothetical extension protocol:
+//! let proto = request.protocols().get::<MyProtocol>().expect("MyProtocol required");
+//! let session = proto.create_session(request.stream_id());
+//! ```
+//!
+//! In hyper handlers, the same data is available via request extensions:
+//!
+//! ```ignore
+//! let stream_id = request.extensions().get::<StreamId>().unwrap();
+//! let protocols = request.extensions().get::<Arc<Protocols>>().unwrap();
+//! let proto = protocols.get::<MyProtocol>().unwrap();
+//! ```
+//!
+//! # Convention for new protocols
+//!
+//! When adding a new protocol layer:
+//!
+//! 1. The runtime struct (e.g. `MyProtocol`) must be **non-generic** and implement
+//!    [`Protocol`] + [`Any`](std::any::Any).
+//! 2. The factory struct (e.g. `MyProtocolFactory`) implements [`ProductProtocol<C>`]
+//!    to perform typed initialization against `Arc<C>`, then returns the non-generic
+//!    runtime protocol.
+//! 3. The runtime protocol is **connection-scoped**: created once, shared across all
+//!    streams. Per-request or per-session state should be produced by handler-facing
+//!    methods (e.g. `create_session(stream_id)`) rather than stored in [`Protocols`].
+//! 4. Erase transport-specific types at the boundary: use [`crate::codec::BoxReadStream`],
+//!    [`crate::codec::BoxWriteStream`], or [`crate::runtime::ErasedConnection`] to hold
+//!    connection capabilities without leaking generic `C`.
+
 use std::{
     any::{Any, TypeId},
     cmp::Ordering,
@@ -16,6 +78,27 @@ use crate::{
     quic::{self, ConnectionError},
 };
 
+/// Connection-scoped protocol registry.
+///
+/// Stores non-generic runtime protocol objects keyed by [`TypeId`]. A single instance
+/// is created during connection setup and shared (via `Arc<Protocols>`) with every
+/// request handler on that connection.
+///
+/// Protocol runtimes are **connection-scoped**: they live as long as the connection and
+/// are shared across all concurrent request streams. Handlers that need per-request or
+/// per-session state should derive it from the connection-scoped protocol using a method
+/// like `proto.create_session(stream_id)`, rather than inserting per-request objects here.
+///
+/// # Example
+///
+/// ```ignore
+/// // In a handler, access connection-scoped protocol state:
+/// let dhttp = request.protocols().get::<DHttpProtocol>().unwrap();
+///
+/// // For hypothetical extension protocols, derive per-stream handles:
+/// let proto = request.protocols().get::<MyProtocol>().expect("MyProtocol required");
+/// let session = proto.create_session(request.stream_id());
+/// ```
 pub struct Protocols {
     layers: HashMap<TypeId, Arc<dyn Protocol>>,
 }
@@ -43,6 +126,34 @@ impl Protocols {
         Self::default()
     }
 
+    /// Looks up a concrete protocol runtime by type.
+    ///
+    /// Returns a reference to the protocol if it was registered during connection
+    /// setup. This is the primary handler-facing API for protocol access.
+    ///
+    /// The lookup is based on [`TypeId`], so callers specify the exact concrete type
+    /// (e.g. `DHttpProtocol`, `QPackProtocol`). The returned reference borrows from
+    /// the connection-scoped `Arc<dyn Protocol>` and is valid for the lifetime of the
+    /// `Protocols` borrow.
+    ///
+    /// # Usage in native handlers
+    ///
+    /// ```ignore
+    /// let dhttp = request.protocols().get::<DHttpProtocol>().unwrap();
+    /// ```
+    ///
+    /// # Usage in hyper handlers
+    ///
+    /// ```ignore
+    /// let protocols = request.extensions().get::<Arc<Protocols>>().unwrap();
+    /// let dhttp = protocols.get::<DHttpProtocol>().unwrap();
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Never panics. Returns `None` if the protocol type was not registered.
+    /// The internal `expect` guards against `TypeId` hash collisions (a theoretical
+    /// impossibility) and is not reachable under normal operation.
     pub fn get<L: Any>(&self) -> Option<&L> {
         self.layers.get(&TypeId::of::<L>()).map(|layer| {
             (layer.as_ref() as &dyn Any)

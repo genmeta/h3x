@@ -158,10 +158,31 @@ impl Request {
         self.agent.as_ref()
     }
 
+    /// Returns the QUIC stream identifier for this request.
+    ///
+    /// The stream ID uniquely identifies the request stream within its QUIC connection.
+    /// Combined with [`protocols()`](Self::protocols), it serves as the per-stream key
+    /// for deriving protocol-specific session handles from connection-scoped protocol
+    /// state:
+    ///
+    /// ```ignore
+    /// let proto = request.protocols().get::<MyProtocol>().unwrap();
+    /// let session = proto.create_session(request.stream_id());
+    /// ```
     pub fn stream_id(&self) -> StreamId {
         self.stream_id
     }
 
+    /// Returns the connection-scoped protocol registry.
+    ///
+    /// The returned `Arc<Protocols>` is shared across all request handlers on the same
+    /// QUIC connection. Use [`Protocols::get`] to look up a concrete protocol runtime
+    /// by type, then derive per-request handles using [`stream_id()`](Self::stream_id):
+    ///
+    /// ```ignore
+    /// let dhttp = request.protocols().get::<DHttpProtocol>().unwrap();
+    /// let qpack = request.protocols().get::<QPackProtocol>();
+    /// ```
     pub fn protocols(&self) -> &Arc<Protocols> {
         &self.protocols
     }
@@ -369,10 +390,23 @@ impl Response {
         &self.agent
     }
 
+    /// Returns the QUIC stream identifier for this response.
+    ///
+    /// Same stream ID as the corresponding [`Request::stream_id`]. Useful when the
+    /// response handler needs to interact with connection-scoped protocols:
+    ///
+    /// ```ignore
+    /// let proto = response.protocols().get::<MyProtocol>().unwrap();
+    /// let session = proto.create_session(response.stream_id());
+    /// ```
     pub fn stream_id(&self) -> StreamId {
         self.stream_id
     }
 
+    /// Returns the connection-scoped protocol registry.
+    ///
+    /// Same `Arc<Protocols>` as [`Request::protocols`]. See [`Protocols::get`] for
+    /// typed protocol lookup.
     pub fn protocols(&self) -> &Arc<Protocols> {
         &self.protocols
     }

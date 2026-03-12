@@ -2,11 +2,29 @@ use std::fmt;
 
 use crate::varint::VarInt;
 
-/// Request-scoped stream identification metadata.
+/// Request-scoped stream identifier for protocol extension access.
 ///
-/// This is a simple newtype wrapper around `VarInt` used to represent stream IDs
-/// for request extensions. It is distinct from the protocol-specific `StreamId<S>`
-/// future type found in `quic.rs`.
+/// A lightweight newtype around [`VarInt`] representing the QUIC stream ID of the
+/// current request/response pair. Injected as a field in
+/// [`Request`](crate::server::Request) and [`Response`](crate::server::Response)
+/// (native path) or as a request extension (hyper path).
+///
+/// `StreamId` serves as the per-stream key when deriving protocol-specific session
+/// handles from connection-scoped protocol state stored in [`Protocols`](crate::protocol::Protocols):
+///
+/// ```ignore
+/// // Native handler:
+/// let proto = request.protocols().get::<MyProtocol>().unwrap();
+/// let session = proto.create_session(request.stream_id());
+///
+/// // Hyper handler:
+/// let stream_id = request.extensions().get::<StreamId>().unwrap();
+/// let protocols = request.extensions().get::<Arc<Protocols>>().unwrap();
+/// let session = protocols.get::<MyProtocol>().unwrap().create_session(*stream_id);
+/// ```
+///
+/// This type is distinct from the generic `StreamId<S>` future found in `quic.rs`,
+/// which is a pin-projected stream ID accessor for transport-level stream types.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StreamId(pub VarInt);
