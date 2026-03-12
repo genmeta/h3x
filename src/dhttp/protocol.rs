@@ -24,8 +24,9 @@ use tracing::Instrument;
 use crate::{
     buflist::BufList,
     codec::{
-        BoxPeekableBiStream, BoxPeekableUniStream, BoxReadStream, BoxWriteStream, DecodeExt,
-        EncodeExt, ErasedStreamReader, ErasedStreamWriter, Feed, SinkWriter, StreamReader,
+        BoxReadStream, BoxWriteStream, DecodeExt, EncodeExt, ErasedPeekableBiStream,
+        ErasedPeekableUniStream, ErasedStreamReader, ErasedStreamWriter, Feed, SinkWriter,
+        StreamReader,
     },
     connection::{ConnectionGoaway, ConnectionState, LifecycleExt, StreamError},
     dhttp::{
@@ -40,6 +41,7 @@ use crate::{
     },
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     quic::{self, CancelStreamExt, ConnectionError, GetStreamIdExt, StopStreamExt},
+    runtime::ErasedConnection,
     util::{ring_channel::RingChannel, set_once::SetOnce, watch::Watch},
     varint::VarInt,
 };
@@ -250,6 +252,9 @@ pub struct DHttpProtocol {
     /// DHTTP/3 protocol state.
     pub state: Arc<DHttpState>,
 
+    /// Erased connection for lifecycle operations.
+    pub connection: Arc<dyn ErasedConnection>,
+
     /// Control stream frame sink
     pub control_stream: AsyncMutex<FrameSink>,
 
@@ -280,11 +285,10 @@ impl DHttpProtocol {
         self.unresolved_request_streams.capacity()
     }
 
-    async fn accept_uni<C: quic::Connection + ?Sized>(
+    async fn accept_uni(
         &self,
-        connection: &Arc<C>,
-        mut stream: BoxPeekableUniStream<C>,
-    ) -> Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError> {
+        mut stream: ErasedPeekableUniStream,
+    ) -> Result<StreamVerdict<ErasedPeekableUniStream>, StreamError> {
         let Ok(stream_type) = stream.decode_one::<VarInt>().await else {
             return Ok(StreamVerdict::Passed(stream));
         };
@@ -293,7 +297,7 @@ impl DHttpProtocol {
 
         if stream_type == UnidirectionalStream::CONTROL_STREAM_TYPE {
             let state = self.state.clone();
-            let connection = connection.clone();
+            let connection = self.connection.clone();
 
             let init_handle_control_task = || {
                 let handle_control = async move {
@@ -342,10 +346,10 @@ impl DHttpProtocol {
         }
     }
 
-    async fn accept_bi<C: quic::Connection + ?Sized>(
+    async fn accept_bi(
         &self,
-        (mut reader, writer): BoxPeekableBiStream<C>,
-    ) -> Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError> {
+        (mut reader, writer): ErasedPeekableBiStream,
+    ) -> Result<StreamVerdict<ErasedPeekableBiStream>, StreamError> {
         // HTTP/3 bidirectional streams are request streams (RFC 9114 §4.1).
         // The first bytes on a request stream are HTTP/3 frames, starting with
         // a frame type VarInt. We peek the first VarInt to determine whether
@@ -370,10 +374,7 @@ impl DHttpProtocol {
             // This is an HTTP/3 request stream. Reset the peek cursor so the
             // frame type can be re-read by FrameStream during request processing.
             Pin::new(&mut reader).reset();
-            let reader = reader
-                .into_stream_reader()
-                .map_stream(|b| b as BoxDynQuicStreamReader);
-            let writer = writer.map_sink(|b| b as BoxDynQuicStreamWriter);
+            let reader = reader.into_stream_reader();
             let item = (reader, writer);
             if let Some(mut unresolved) = self.unresolved_request_streams.send(item) {
                 // Ring channel is full — reject the oldest unresolved request.
@@ -403,22 +404,19 @@ impl DHttpProtocol {
     }
 }
 
-impl<C: quic::Connection + ?Sized> Protocol<C> for DHttpProtocol {
+impl Protocol for DHttpProtocol {
     fn accept_uni<'a>(
         &'a self,
-        connection: &'a Arc<C>,
-        stream: BoxPeekableUniStream<C>,
-    ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
-        Box::pin(self.accept_uni(connection, stream))
+        stream: ErasedPeekableUniStream,
+    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
+        Box::pin(self.accept_uni(stream))
     }
 
     fn accept_bi<'a>(
         &'a self,
-        connection: &'a Arc<C>,
-        stream: BoxPeekableBiStream<C>,
-    ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
-        _ = connection;
-        Box::pin(self.accept_bi::<C>(stream))
+        stream: ErasedPeekableBiStream,
+    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
+        Box::pin(self.accept_bi(stream))
     }
 }
 
@@ -432,7 +430,7 @@ impl DHttpProtocolFactory {
         Self { local_settings }
     }
 
-    pub async fn init<C: quic::Connection + ?Sized>(
+    pub async fn init<C: quic::Connection>(
         &self,
         conn: &Arc<C>,
     ) -> Result<DHttpProtocol, quic::ConnectionError> {
@@ -464,8 +462,11 @@ impl DHttpProtocolFactory {
             }
         }
 
+        let connection: Arc<dyn ErasedConnection> = conn.clone();
+
         Ok(DHttpProtocol {
             state: Arc::new(DHttpState::new(self.local_settings.clone())),
+            connection,
             control_stream: AsyncMutex::new(control_stream),
             handle_control_stream: SetOnce::new(),
             unresolved_request_streams: RingChannel::new(32), // TODO: configurable capacity
@@ -473,13 +474,13 @@ impl DHttpProtocolFactory {
     }
 }
 
-impl<C: quic::Connection + ?Sized> ProductProtocol<C> for DHttpProtocolFactory {
+impl<C: quic::Connection> ProductProtocol<C> for DHttpProtocolFactory {
     type Protocol = DHttpProtocol;
 
     fn init<'a>(
         &'a self,
         conn: &'a Arc<C>,
-        layers: &'a Protocols<C>,
+        layers: &'a Protocols,
     ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
         _ = layers;
         Box::pin(self.init(conn))

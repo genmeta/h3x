@@ -14,7 +14,7 @@ use snafu::Snafu;
 use tracing::Instrument;
 
 use crate::{
-    codec::{PeekableStreamReader, SinkWriter, StreamReader},
+    codec::{self, PeekableStreamReader, SinkWriter, StreamReader},
     dhttp::{protocol::DHttpProtocolFactory, settings::Settings},
     error::{Code, ErrorScope, H3Error},
     protocol::{InitProtocols, ProductProtocol, Protocols, StreamVerdict, type_id_as_u128},
@@ -142,7 +142,7 @@ impl<C: Any + ?Sized> fmt::Debug for ConnectionBuilder<C> {
     }
 }
 
-impl<C: quic::Connection + ?Sized> ConnectionBuilder<C> {
+impl<C: quic::Connection> ConnectionBuilder<C> {
     pub fn new(settings: Arc<Settings>) -> Self {
         let builder = Self {
             protocols_initializers: Vec::new(),
@@ -227,7 +227,7 @@ impl<C: quic::Connection + ?Sized> Eq for ConnectionBuilder<C> {}
 #[derive(Debug)]
 pub struct ConnectionState<C: ?Sized> {
     quic: Arc<C>,
-    protocols: Arc<Protocols<C>>,
+    protocols: Arc<Protocols>,
 }
 
 impl<C: ?Sized> ConnectionState<C> {
@@ -306,15 +306,14 @@ impl<C: quic::Connection + ?Sized> ConnectionState<C> {
                         return;
                     }
                 };
-                let stream_reader = StreamReader::new(Box::pin(stream_reader));
-                let stream_writer = SinkWriter::new(Box::pin(stream_writer));
+                // Erase the concrete stream types before protocol dispatch.
+                let erased_reader = Box::pin(stream_reader) as codec::BoxReadStream;
+                let erased_writer = Box::pin(stream_writer) as codec::BoxWriteStream;
+                let stream_reader = StreamReader::new(erased_reader);
+                let stream_writer = SinkWriter::new(erased_writer);
                 let peekable_bi_stream = (PeekableStreamReader::new(stream_reader), stream_writer);
 
-                match state
-                    .protocols
-                    .accept_bi(&state.quic, peekable_bi_stream)
-                    .await
-                {
+                match state.protocols.accept_bi(peekable_bi_stream).await {
                     Ok(StreamVerdict::Accepted) => continue,
                     // If the stream header indicates a stream type that is not supported by
                     // the recipient, the remainder of the stream cannot be consumed as the
@@ -353,14 +352,12 @@ impl<C: quic::Connection + ?Sized> ConnectionState<C> {
                         return;
                     }
                 };
-                let stream_reader = StreamReader::new(Box::pin(stream_reader));
+                // Erase the concrete stream type before protocol dispatch.
+                let erased_reader = Box::pin(stream_reader) as codec::BoxReadStream;
+                let stream_reader = StreamReader::new(erased_reader);
                 let peekable_uni_stream = PeekableStreamReader::new(stream_reader);
 
-                match state
-                    .protocols
-                    .accept_uni(&state.quic, peekable_uni_stream)
-                    .await
-                {
+                match state.protocols.accept_uni(peekable_uni_stream).await {
                     Ok(StreamVerdict::Accepted) => continue,
                     // If the stream header indicates a stream type that is not supported by
                     // the recipient, the remainder of the stream cannot be consumed as the
@@ -438,7 +435,7 @@ mod tests {
 
     use super::ConnectionBuilder;
     use crate::{
-        codec::{BoxPeekableBiStream, BoxPeekableUniStream},
+        codec::{ErasedPeekableBiStream, ErasedPeekableUniStream},
         connection::StreamError,
         dhttp::settings::{Setting, Settings},
         protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
@@ -456,20 +453,18 @@ mod tests {
     #[derive(Debug)]
     struct MockProtocol;
 
-    impl<C: quic::Connection + ?Sized> Protocol<C> for MockProtocol {
+    impl Protocol for MockProtocol {
         fn accept_uni<'a>(
             &'a self,
-            _: &'a Arc<C>,
-            stream: BoxPeekableUniStream<C>,
-        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
+            stream: ErasedPeekableUniStream,
+        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
         }
 
         fn accept_bi<'a>(
             &'a self,
-            _: &'a Arc<C>,
-            stream: BoxPeekableBiStream<C>,
-        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
+            stream: ErasedPeekableBiStream,
+        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
         }
     }
@@ -484,7 +479,7 @@ mod tests {
         fn init<'a>(
             &'a self,
             _: &'a Arc<C>,
-            _: &'a Protocols<C>,
+            _: &'a Protocols,
         ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
             unimplemented!("not used in builder identity tests")
         }

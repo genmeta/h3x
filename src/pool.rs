@@ -293,7 +293,7 @@ mod tests {
     use futures::future::BoxFuture;
 
     use crate::{
-        codec::{BoxPeekableBiStream, BoxPeekableUniStream},
+        codec::{ErasedPeekableBiStream, ErasedPeekableUniStream},
         connection::{ConnectionBuilder, StreamError},
         dhttp::settings::{Setting, Settings},
         protocol::{ProductProtocol, Protocol, StreamVerdict},
@@ -311,20 +311,18 @@ mod tests {
     #[derive(Debug)]
     struct MockProtocol;
 
-    impl<C: quic::Connection + ?Sized> Protocol<C> for MockProtocol {
+    impl Protocol for MockProtocol {
         fn accept_uni<'a>(
             &'a self,
-            _: &'a Arc<C>,
-            stream: BoxPeekableUniStream<C>,
-        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
+            stream: ErasedPeekableUniStream,
+        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
         }
 
         fn accept_bi<'a>(
             &'a self,
-            _: &'a Arc<C>,
-            stream: BoxPeekableBiStream<C>,
-        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
+            stream: ErasedPeekableBiStream,
+        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
         }
     }
@@ -333,13 +331,13 @@ mod tests {
     #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
     struct MockFactory(u64);
 
-    impl<C: quic::Connection + ?Sized> ProductProtocol<C> for MockFactory {
+    impl<C: quic::Connection> ProductProtocol<C> for MockFactory {
         type Protocol = MockProtocol;
 
         fn init<'a>(
             &'a self,
             _: &'a Arc<C>,
-            _: &'a crate::protocol::Protocols<C>,
+            _: &'a crate::protocol::Protocols,
         ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
             unimplemented!("not used in pool key tests")
         }

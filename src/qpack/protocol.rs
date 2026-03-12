@@ -16,7 +16,7 @@ use tracing::Instrument;
 
 use crate::{
     codec::{
-        self, BoxPeekableBiStream, BoxPeekableUniStream, DecodeExt, EncodeExt, ErasedStreamReader,
+        DecodeExt, EncodeExt, ErasedPeekableBiStream, ErasedPeekableUniStream, ErasedStreamReader,
         SinkWriter,
     },
     connection::{ConnectionState, LifecycleExt, StreamError},
@@ -122,18 +122,16 @@ impl std::fmt::Debug for QPackProtocol {
 }
 
 impl QPackProtocol {
-    async fn accept_uni<C: quic::Connection + ?Sized>(
+    async fn accept_uni(
         &self,
-        mut stream: BoxPeekableUniStream<C>,
-    ) -> Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError> {
+        mut stream: ErasedPeekableUniStream,
+    ) -> Result<StreamVerdict<ErasedPeekableUniStream>, StreamError> {
         let Ok(stream_type) = stream.decode_one::<VarInt>().await else {
             return Ok(StreamVerdict::Passed(stream));
         };
 
         if stream_type == UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE {
-            let uni_stream_reader = stream
-                .into_stream_reader()
-                .map_stream(|s| s as codec::BoxReadStream);
+            let uni_stream_reader = stream.into_stream_reader();
             _ = self
                 .encoder_inst_receiver_tx
                 .lock()
@@ -143,9 +141,7 @@ impl QPackProtocol {
                 .send(uni_stream_reader);
             Ok(StreamVerdict::Accepted)
         } else if stream_type == UnidirectionalStream::QPACK_DECODER_STREAM_TYPE {
-            let uni_stream_reader = stream
-                .into_stream_reader()
-                .map_stream(|s| s as codec::BoxReadStream);
+            let uni_stream_reader = stream.into_stream_reader();
             _ = self
                 .decoder_inst_receiver_tx
                 .lock()
@@ -159,31 +155,27 @@ impl QPackProtocol {
         }
     }
 
-    async fn accept_bi<C: quic::Connection + ?Sized>(
+    async fn accept_bi(
         &self,
-        stream: BoxPeekableBiStream<C>,
-    ) -> Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError> {
+        stream: ErasedPeekableBiStream,
+    ) -> Result<StreamVerdict<ErasedPeekableBiStream>, StreamError> {
         Ok(StreamVerdict::Passed(stream))
     }
 }
 
-impl<C: quic::Connection + ?Sized> Protocol<C> for QPackProtocol {
+impl Protocol for QPackProtocol {
     fn accept_uni<'a>(
         &'a self,
-        connection: &'a Arc<C>,
-        stream: BoxPeekableUniStream<C>,
-    ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
-        _ = connection;
-        Box::pin(self.accept_uni::<C>(stream))
+        stream: ErasedPeekableUniStream,
+    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
+        Box::pin(self.accept_uni(stream))
     }
 
     fn accept_bi<'a>(
         &'a self,
-        connection: &'a Arc<C>,
-        stream: BoxPeekableBiStream<C>,
-    ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
-        _ = connection;
-        Box::pin(self.accept_bi::<C>(stream))
+        stream: ErasedPeekableBiStream,
+    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
+        Box::pin(self.accept_bi(stream))
     }
 }
 
@@ -197,10 +189,10 @@ impl QPackProtocolFactory {
         Self::default()
     }
 
-    pub async fn init<C: quic::Connection + ?Sized>(
+    pub async fn init<C: quic::Connection>(
         &self,
         conn: &Arc<C>,
-        layers: &Protocols<C>,
+        layers: &Protocols,
     ) -> Result<QPackProtocol, ConnectionError> {
         let dhttp = layers
             .get::<DHttpProtocol>()
@@ -308,13 +300,13 @@ impl QPackProtocolFactory {
     }
 }
 
-impl<C: quic::Connection + ?Sized> ProductProtocol<C> for QPackProtocolFactory {
+impl<C: quic::Connection> ProductProtocol<C> for QPackProtocolFactory {
     type Protocol = QPackProtocol;
 
     fn init<'a>(
         &'a self,
         conn: &'a Arc<C>,
-        layers: &'a Protocols<C>,
+        layers: &'a Protocols,
     ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
         Box::pin(self.init(conn, layers))
     }
@@ -324,7 +316,7 @@ impl<C: quic::Connection + ?Sized> ProductProtocol<C> for QPackProtocolFactory {
 #[snafu(display("qpack protocol is disabled"))]
 pub struct QPackProtocolDisabled;
 
-impl<C: quic::Connection + ?Sized> ConnectionState<C> {
+impl<C: ?Sized> ConnectionState<C> {
     #[inline]
     pub fn qpack(&self) -> Result<&QPackProtocol, QPackProtocolDisabled> {
         self.protocol().ok_or(QPackProtocolDisabled)

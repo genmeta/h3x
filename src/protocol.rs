@@ -11,16 +11,16 @@ use std::{
 use futures::future::BoxFuture;
 
 use crate::{
-    codec::{BoxPeekableBiStream, BoxPeekableUniStream},
+    codec::{ErasedPeekableBiStream, ErasedPeekableUniStream},
     connection::StreamError,
     quic::{self, ConnectionError},
 };
 
-pub struct Protocols<C: ?Sized> {
-    layers: HashMap<TypeId, Arc<dyn Protocol<C>>>,
+pub struct Protocols {
+    layers: HashMap<TypeId, Arc<dyn Protocol>>,
 }
 
-impl<C: ?Sized> Default for Protocols<C> {
+impl Default for Protocols {
     fn default() -> Self {
         Self {
             layers: Default::default(),
@@ -28,7 +28,7 @@ impl<C: ?Sized> Default for Protocols<C> {
     }
 }
 
-impl<C: ?Sized> Debug for Protocols<C> {
+impl Debug for Protocols {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut f = f.debug_list();
         for layer in self.layers.values() {
@@ -38,7 +38,7 @@ impl<C: ?Sized> Debug for Protocols<C> {
     }
 }
 
-impl<C: ?Sized> Protocols<C> {
+impl Protocols {
     pub fn new() -> Self {
         Self::default()
     }
@@ -50,23 +50,17 @@ impl<C: ?Sized> Protocols<C> {
                 .expect("TypeId collision for protocol layers, this is a bug")
         })
     }
-}
 
-impl<C: quic::Connection + ?Sized> Protocols<C> {
-    pub fn insert<L: Protocol<C>>(&mut self, layer: L) {
+    pub fn insert<L: Protocol>(&mut self, layer: L) {
         self.layers.insert(TypeId::of::<L>(), Arc::new(layer));
     }
 
     pub(crate) async fn accept_uni<'a>(
         &'a self,
-        conn: &'a Arc<C>,
-        mut stream: BoxPeekableUniStream<C>,
-    ) -> Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>
-    where
-        C: quic::Connection,
-    {
+        mut stream: ErasedPeekableUniStream,
+    ) -> Result<StreamVerdict<ErasedPeekableUniStream>, StreamError> {
         for layer in self.layers.values() {
-            match layer.accept_uni(conn, stream).await? {
+            match layer.accept_uni(stream).await? {
                 StreamVerdict::Accepted => return Ok(StreamVerdict::Accepted),
                 StreamVerdict::Passed(mut passed) => {
                     Pin::new(&mut passed).reset();
@@ -79,14 +73,10 @@ impl<C: quic::Connection + ?Sized> Protocols<C> {
 
     pub(crate) async fn accept_bi<'a>(
         &'a self,
-        conn: &'a Arc<C>,
-        mut stream: BoxPeekableBiStream<C>,
-    ) -> Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>
-    where
-        C: quic::Connection,
-    {
+        mut stream: ErasedPeekableBiStream,
+    ) -> Result<StreamVerdict<ErasedPeekableBiStream>, StreamError> {
         for layer in self.layers.values() {
-            match layer.accept_bi(conn, stream).await? {
+            match layer.accept_bi(stream).await? {
                 StreamVerdict::Accepted => return Ok(StreamVerdict::Accepted),
                 StreamVerdict::Passed(mut passed) => {
                     Pin::new(&mut passed.0).reset();
@@ -101,12 +91,12 @@ impl<C: quic::Connection + ?Sized> Protocols<C> {
 pub trait ProductProtocol<C: quic::Connection + ?Sized>:
     Any + Send + Sync + Hash + Eq + Ord
 {
-    type Protocol: Protocol<C>;
+    type Protocol: Protocol;
 
     fn init<'a>(
         &'a self,
         conn: &'a Arc<C>,
-        layers: &'a Protocols<C>,
+        layers: &'a Protocols,
     ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>>;
 }
 
@@ -114,7 +104,7 @@ pub(crate) trait InitProtocols<C: quic::Connection + ?Sized>: Send + Sync {
     fn init_protocols<'a>(
         &'a self,
         conn: &'a Arc<C>,
-        layers: &'a mut Protocols<C>,
+        layers: &'a mut Protocols,
     ) -> BoxFuture<'a, Result<(), ConnectionError>>;
 
     /// Hash using TypeId + self value for type-erased identity.
@@ -138,7 +128,7 @@ impl<C: quic::Connection + ?Sized, P: ProductProtocol<C>> InitProtocols<C> for P
     fn init_protocols<'a>(
         &'a self,
         conn: &'a Arc<C>,
-        layers: &'a mut Protocols<C>,
+        layers: &'a mut Protocols,
     ) -> BoxFuture<'a, Result<(), ConnectionError>> {
         Box::pin(async move {
             if layers
@@ -210,22 +200,20 @@ impl Hasher for DynHasher<'_> {
 
 /// Protocol layer trait for handling QUIC streams in a layered architecture.
 /// Layers can inspect, accept, or pass through streams to underlying layers.
-pub trait Protocol<C: quic::Connection + ?Sized>: Any + Send + Sync + Debug {
+pub trait Protocol: Any + Send + Sync + Debug {
     /// Handles an incoming unidirectional stream.
     /// Returns whether the stream was accepted or should be passed to the next layer.
     fn accept_uni<'a>(
         &'a self,
-        connection: &'a Arc<C>,
-        stream: BoxPeekableUniStream<C>,
-    ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>>;
+        stream: ErasedPeekableUniStream,
+    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>>;
 
     /// Handles an incoming bidirectional stream.
     /// Returns whether the stream was accepted or should be passed to the next layer.
     fn accept_bi<'a>(
         &'a self,
-        connection: &'a Arc<C>,
-        stream: BoxPeekableBiStream<C>,
-    ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>>;
+        stream: ErasedPeekableBiStream,
+    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>>;
 }
 
 /// Verdict for stream handling in protocol layers.
@@ -252,20 +240,18 @@ mod tests {
     #[derive(Debug)]
     struct MockProtocol;
 
-    impl<C: quic::Connection + ?Sized> Protocol<C> for MockProtocol {
+    impl Protocol for MockProtocol {
         fn accept_uni<'a>(
             &'a self,
-            _: &'a Arc<C>,
-            stream: BoxPeekableUniStream<C>,
-        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
+            stream: ErasedPeekableUniStream,
+        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
         }
 
         fn accept_bi<'a>(
             &'a self,
-            _: &'a Arc<C>,
-            stream: BoxPeekableBiStream<C>,
-        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
+            stream: ErasedPeekableBiStream,
+        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
         }
     }
@@ -280,7 +266,7 @@ mod tests {
         fn init<'a>(
             &'a self,
             _: &'a Arc<C>,
-            _: &'a Protocols<C>,
+            _: &'a Protocols,
         ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
             unimplemented!("not used in identity tests")
         }
@@ -294,20 +280,18 @@ mod tests {
     #[derive(Debug)]
     struct MockProtocol2;
 
-    impl<C: quic::Connection + ?Sized> Protocol<C> for MockProtocol2 {
+    impl Protocol for MockProtocol2 {
         fn accept_uni<'a>(
             &'a self,
-            _: &'a Arc<C>,
-            stream: BoxPeekableUniStream<C>,
-        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableUniStream<C>>, StreamError>> {
+            stream: ErasedPeekableUniStream,
+        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
         }
 
         fn accept_bi<'a>(
             &'a self,
-            _: &'a Arc<C>,
-            stream: BoxPeekableBiStream<C>,
-        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableBiStream<C>>, StreamError>> {
+            stream: ErasedPeekableBiStream,
+        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
         }
     }
@@ -318,7 +302,7 @@ mod tests {
         fn init<'a>(
             &'a self,
             _: &'a Arc<C>,
-            _: &'a Protocols<C>,
+            _: &'a Protocols,
         ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
             unimplemented!("not used in identity tests")
         }
