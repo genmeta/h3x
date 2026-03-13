@@ -66,7 +66,7 @@ impl std::fmt::Debug for CachedLocalAgent {
 impl CachedLocalAgent {
     /// Create a new cached wrapper by eagerly fetching synchronous fields from
     /// the remote agent.
-    pub async fn new(client: LocalAgentClient) -> Result<Self, quic::ConnectionError> {
+    pub async fn from_client(client: LocalAgentClient) -> Result<Self, quic::ConnectionError> {
         let name = client.name().await?;
         let cert_chain: Vec<CertificateDer<'static>> = client
             .cert_chain()
@@ -153,7 +153,7 @@ impl std::fmt::Debug for CachedRemoteAgent {
 impl CachedRemoteAgent {
     /// Create a new cached wrapper by eagerly fetching synchronous fields from
     /// the remote agent.
-    pub async fn new(client: RemoteAgentClient) -> Result<Self, quic::ConnectionError> {
+    pub async fn from_client(client: RemoteAgentClient) -> Result<Self, quic::ConnectionError> {
         let name = client.name().await?;
         let cert_chain: Vec<CertificateDer<'static>> = client
             .cert_chain()
@@ -300,16 +300,4 @@ where
                 },
             })
     }
-}
-
-pub async fn local_agent_from_client(
-    client: LocalAgentClient,
-) -> Result<CachedLocalAgent, quic::ConnectionError> {
-    CachedLocalAgent::new(client).await
-}
-
-pub async fn remote_agent_from_client(
-    client: RemoteAgentClient,
-) -> Result<CachedRemoteAgent, quic::ConnectionError> {
-    CachedRemoteAgent::new(client).await
 }

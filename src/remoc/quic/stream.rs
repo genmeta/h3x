@@ -174,27 +174,27 @@ where
     }
 }
 
-pub async fn new_remote_read_stream(
-    mut client: ReadStreamClient,
-) -> Result<impl quic::ReadStream, quic::StreamError> {
-    Ok(ReadStreamBridge {
-        stream_id: client.stream_id().await?,
-        state: ReadStreamBridgeState::Stream { stream: client },
-        read: |mut client: ReadStreamClient, token: CancellationToken| async move {
-            tokio::select! {
-                res = client.read() => Either::Left((client, res.transpose())),
-                _ = token.cancelled() => Either::Right(client),
-            }
-        },
-        stop: |mut client: ReadStreamClient, code| async move {
-            let res = client.stop(code).await;
-            (client, res)
-        },
-    })
-}
+impl ReadStreamClient {
+    pub async fn into_quic(mut self) -> Result<impl quic::ReadStream, quic::StreamError> {
+        Ok(ReadStreamBridge {
+            stream_id: self.stream_id().await?,
+            state: ReadStreamBridgeState::Stream { stream: self },
+            read: |mut client: ReadStreamClient, token: CancellationToken| async move {
+                tokio::select! {
+                    res = client.read() => Either::Left((client, res.transpose())),
+                    _ = token.cancelled() => Either::Right(client),
+                }
+            },
+            stop: |mut client: ReadStreamClient, code| async move {
+                let res = client.stop(code).await;
+                (client, res)
+            },
+        })
+    }
 
-pub fn read_stream_client_into_quic(client: ReadStreamClient) -> BoxDynQuicStreamReader {
-    Box::pin(TryFuture::from(new_remote_read_stream(client))) as BoxDynQuicStreamReader
+    pub fn into_boxed_quic(self) -> BoxDynQuicStreamReader {
+        Box::pin(TryFuture::from(self.into_quic())) as BoxDynQuicStreamReader
+    }
 }
 
 /// Remote trait for writing to a QUIC stream over remoc RTC.
@@ -462,39 +462,39 @@ where
     }
 }
 
-pub async fn new_remote_write_stream(
-    mut client: WriteStreamClient,
-) -> Result<impl quic::WriteStream, quic::StreamError> {
-    Ok(WriteStreamBridge {
-        stream_id: client.stream_id().await?,
-        state: WriteStreamBridgeState::Stream { stream: client },
-        write: |mut client: WriteStreamClient, token: CancellationToken, bytes| async move {
-            tokio::select! {
-                res = client.write(bytes) => Either::Left((client, res)),
-                _ = token.cancelled() => Either::Right(client),
-            }
-        },
-        flush: |mut client: WriteStreamClient, token: CancellationToken| async move {
-            tokio::select! {
-                res = client.flush() => Either::Left((client, res)),
-                _ = token.cancelled() => Either::Right(client),
-            }
-        },
-        shutdown: |mut client: WriteStreamClient, token: CancellationToken| async move {
-            tokio::select! {
-                res = client.shutdown() => Either::Left((client, res)),
-                _ = token.cancelled() => Either::Right(client),
-            }
-        },
-        cancel: |mut client: WriteStreamClient, code| async move {
-            let res = client.cancel(code).await;
-            (client, res)
-        },
-    })
-}
+impl WriteStreamClient {
+    pub async fn into_quic(mut self) -> Result<impl quic::WriteStream, quic::StreamError> {
+        Ok(WriteStreamBridge {
+            stream_id: self.stream_id().await?,
+            state: WriteStreamBridgeState::Stream { stream: self },
+            write: |mut client: WriteStreamClient, token: CancellationToken, bytes| async move {
+                tokio::select! {
+                    res = client.write(bytes) => Either::Left((client, res)),
+                    _ = token.cancelled() => Either::Right(client),
+                }
+            },
+            flush: |mut client: WriteStreamClient, token: CancellationToken| async move {
+                tokio::select! {
+                    res = client.flush() => Either::Left((client, res)),
+                    _ = token.cancelled() => Either::Right(client),
+                }
+            },
+            shutdown: |mut client: WriteStreamClient, token: CancellationToken| async move {
+                tokio::select! {
+                    res = client.shutdown() => Either::Left((client, res)),
+                    _ = token.cancelled() => Either::Right(client),
+                }
+            },
+            cancel: |mut client: WriteStreamClient, code| async move {
+                let res = client.cancel(code).await;
+                (client, res)
+            },
+        })
+    }
 
-pub fn write_stream_client_into_quic(client: WriteStreamClient) -> BoxDynQuicStreamWriter {
-    Box::pin(TryFuture::from(new_remote_write_stream(client))) as BoxDynQuicStreamWriter
+    pub fn into_boxed_quic(self) -> BoxDynQuicStreamWriter {
+        Box::pin(TryFuture::from(self.into_quic())) as BoxDynQuicStreamWriter
+    }
 }
 
 impl<S> ReadStream for Pin<Box<S>>

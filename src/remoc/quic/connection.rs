@@ -8,14 +8,8 @@ use remoc::{
 use tracing::Instrument;
 
 use super::{
-    agent::{
-        CachedLocalAgent, CachedRemoteAgent, LocalAgentClient, RemoteAgentClient,
-        local_agent_from_client, remote_agent_from_client,
-    },
-    stream::{
-        self, ReadStreamClient, WriteStreamClient, read_stream_client_into_quic,
-        write_stream_client_into_quic,
-    },
+    agent::{CachedLocalAgent, CachedRemoteAgent, LocalAgentClient, RemoteAgentClient},
+    stream::{self, ReadStreamClient, WriteStreamClient},
     task_set::TaskSet,
 };
 use crate::{
@@ -69,10 +63,7 @@ impl quic::ManageStream for ConnectionClient {
         let client = self.clone();
         Box::pin(async move {
             let (reader, writer) = Connection::open_bi(&client).await?;
-            Ok((
-                read_stream_client_into_quic(reader),
-                write_stream_client_into_quic(writer),
-            ))
+            Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
         })
     }
 
@@ -80,7 +71,7 @@ impl quic::ManageStream for ConnectionClient {
         let client = self.clone();
         Box::pin(async move {
             let writer = Connection::open_uni(&client).await?;
-            Ok(write_stream_client_into_quic(writer))
+            Ok(writer.into_boxed_quic())
         })
     }
 
@@ -90,10 +81,7 @@ impl quic::ManageStream for ConnectionClient {
         let client = self.clone();
         Box::pin(async move {
             let (reader, writer) = Connection::accept_bi(&client).await?;
-            Ok((
-                read_stream_client_into_quic(reader),
-                write_stream_client_into_quic(writer),
-            ))
+            Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
         })
     }
 
@@ -101,7 +89,7 @@ impl quic::ManageStream for ConnectionClient {
         let client = self.clone();
         Box::pin(async move {
             let reader = Connection::accept_uni(&client).await?;
-            Ok(read_stream_client_into_quic(reader))
+            Ok(reader.into_boxed_quic())
         })
     }
 }
@@ -113,7 +101,7 @@ impl quic::WithLocalAgent for ConnectionClient {
         let client = self.clone();
         Box::pin(async move {
             match Connection::local_agent(&client).await? {
-                Some(agent) => Ok(Some(local_agent_from_client(agent).await?)),
+                Some(agent) => Ok(Some(CachedLocalAgent::from_client(agent).await?)),
                 None => Ok(None),
             }
         })
@@ -127,7 +115,7 @@ impl quic::WithRemoteAgent for ConnectionClient {
         let client = self.clone();
         Box::pin(async move {
             match Connection::remote_agent(&client).await? {
-                Some(agent) => Ok(Some(remote_agent_from_client(agent).await?)),
+                Some(agent) => Ok(Some(CachedRemoteAgent::from_client(agent).await?)),
                 None => Ok(None),
             }
         })
