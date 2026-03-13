@@ -253,7 +253,7 @@ mod tests {
         let stream_id = VarInt::from_u32(7);
 
         state
-            .on_initialized_message_stream(stream_id)
+            .register_initialized_stream(stream_id)
             .expect("initialized stream should be accepted");
 
         assert_eq!(state.max_initialized_stream_id.peek(), Some(stream_id));
@@ -266,11 +266,82 @@ mod tests {
         let stream_id = VarInt::from_u32(9);
 
         state
-            .on_accepted_message_stream(stream_id)
+            .register_accepted_stream(stream_id)
             .expect("accepted stream should be accepted");
 
         assert_eq!(state.max_received_stream_id.peek(), Some(stream_id));
         assert_eq!(state.max_initialized_stream_id.peek(), None);
+    }
+
+    #[test]
+    fn initialized_stream_rejected_after_peer_goaway_latched() {
+        let state = DHttpState::new(Arc::new(Settings::default()));
+        state
+            .apply_peer_goaway(Goaway::new(VarInt::from_u32(13)))
+            .expect("first peer goaway should be accepted");
+
+        let error = state
+            .register_initialized_stream(VarInt::from_u32(11))
+            .err()
+            .expect("initialized stream must be rejected after peer goaway");
+
+        assert_eq!(error, ConnectionGoaway::Peer);
+    }
+
+    #[test]
+    fn apply_peer_goaway_rejects_increasing_stream_id_ordering() {
+        let state = DHttpState::new(Arc::new(Settings::default()));
+        state
+            .apply_peer_goaway(Goaway::new(VarInt::from_u32(20)))
+            .expect("first peer goaway should be accepted");
+
+        let error = state
+            .apply_peer_goaway(Goaway::new(VarInt::from_u32(21)))
+            .err()
+            .expect("increasing peer goaway stream id must be rejected");
+
+        assert!(matches!(
+            error,
+            StreamError::Code {
+                source
+            } if source.code() == Code::H3_ID_ERROR
+        ));
+    }
+
+    #[tokio::test]
+    async fn peer_goaway_covers_resolves_immediately_when_already_covered() {
+        let state = DHttpState::new(Arc::new(Settings::default()));
+        let goaway = Goaway::new(VarInt::from_u32(8));
+        state
+            .apply_peer_goaway(goaway)
+            .expect("peer goaway should be accepted");
+
+        let observed = state.peer_goaway_covers(VarInt::from_u32(10)).await;
+        assert_eq!(observed, goaway);
+    }
+
+    #[tokio::test]
+    async fn peer_goaway_covers_waits_until_covered_boundary() {
+        let state = Arc::new(DHttpState::new(Arc::new(Settings::default())));
+        let waiter_state = state.clone();
+        let waiter =
+            tokio::spawn(
+                async move { waiter_state.peer_goaway_covers(VarInt::from_u32(10)).await },
+            );
+
+        tokio::task::yield_now().await;
+        state
+            .apply_peer_goaway(Goaway::new(VarInt::from_u32(12)))
+            .expect("non-covering goaway should be accepted");
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        let covering = Goaway::new(VarInt::from_u32(9));
+        state
+            .apply_peer_goaway(covering)
+            .expect("covering goaway should be accepted");
+
+        assert_eq!(waiter.await.expect("join should succeed"), covering);
     }
 
     #[tokio::test]
@@ -428,7 +499,7 @@ impl DHttpState {
         }
     }
 
-    fn new_goaway(&self) -> Goaway {
+    pub(crate) fn begin_local_goaway(&self) -> Goaway {
         let mut local_goaway = self.local_goaway.lock();
         let max_received_stream_id = self.max_received_stream_id.lock();
 
@@ -441,6 +512,23 @@ impl DHttpState {
         local_goaway.set(goaway);
 
         goaway
+    }
+
+    pub(crate) fn apply_peer_goaway(&self, goaway: Goaway) -> Result<(), StreamError> {
+        let mut peer_goaway = self.peer_goaway.lock();
+        if let Some(previous_goaway) = peer_goaway.get().copied()
+            && goaway.stream_id() > previous_goaway.stream_id()
+        {
+            return Err(H3IdError::GoawayStreamIdOrdering.into());
+        }
+
+        tracing::debug!(
+            previous_stream_id = ?peer_goaway.get().map(|item| item.stream_id()),
+            new_stream_id = ?goaway.stream_id(),
+            "Received peer GOAWAY"
+        );
+        peer_goaway.set(goaway);
+        Ok(())
     }
 
     async fn handle_control_stream<S: quic::ReadStream>(
@@ -474,28 +562,22 @@ impl DHttpState {
                 return Err(H3FrameUnexpected::DuplicateSettings.into());
             } else if frame.r#type() == Frame::GOAWAY_FRAME_TYPE {
                 let goaway = frame.decode_one::<Goaway>().await?;
-                let previous_goaway = self.peer_goaway.peek();
-                if let Some(previous_goaway) = previous_goaway
-                    && goaway.stream_id() > previous_goaway.stream_id()
-                {
-                    return Err(H3IdError::GoawayStreamIdOrdering.into());
-                }
-                tracing::debug!(
-                    previous_stream_id = ?previous_goaway.map(|item| item.stream_id()),
-                    new_stream_id = ?goaway.stream_id(),
-                    "Received peer GOAWAY"
-                );
-                _ = self.peer_goaway.set(goaway)
+                self.apply_peer_goaway(goaway)?;
             } else {
                 // unknown frame type
             }
         }
     }
 
-    fn on_initialized_message_stream(&self, stream_id: VarInt) -> Result<(), ConnectionGoaway> {
-        if self.peer_goaway.peek().is_some() {
+    pub(crate) fn register_initialized_stream(
+        &self,
+        stream_id: VarInt,
+    ) -> Result<(), ConnectionGoaway> {
+        let peer_goaway = self.peer_goaway.lock();
+        if peer_goaway.get().is_some() {
             return Err(ConnectionGoaway::Peer);
         }
+
         let mut max_initialized_stream_id = self.max_initialized_stream_id.lock();
         max_initialized_stream_id.set(
             max_initialized_stream_id
@@ -506,8 +588,12 @@ impl DHttpState {
         Ok(())
     }
 
-    fn on_accepted_message_stream(&self, stream_id: VarInt) -> Result<(), ConnectionGoaway> {
-        if let Some(goaway) = self.local_goaway.peek()
+    pub(crate) fn register_accepted_stream(
+        &self,
+        stream_id: VarInt,
+    ) -> Result<(), ConnectionGoaway> {
+        let local_goaway = self.local_goaway.lock();
+        if let Some(goaway) = local_goaway.get().copied()
             && stream_id >= goaway.stream_id()
         {
             return Err(ConnectionGoaway::Local);
@@ -520,6 +606,21 @@ impl DHttpState {
         );
 
         Ok(())
+    }
+
+    pub(crate) async fn peer_goaway_covers(&self, stream_id: VarInt) -> Goaway {
+        if let Some(goaway) = self.peer_goaway.peek()
+            && stream_id >= goaway.stream_id()
+        {
+            return goaway;
+        }
+
+        let effective_peer_goaway = self
+            .peer_goaway
+            .watch()
+            .filter(move |goaway| future::ready(stream_id >= goaway.stream_id()));
+        let mut effective_peer_goaway = pin!(effective_peer_goaway.fuse());
+        effective_peer_goaway.select_next_some().await
     }
 }
 
@@ -836,7 +937,7 @@ impl<C: quic::Lifecycle + Sync + ?Sized> ConnectionState<C> {
         let send_goaway = async {
             let dhttp = self.dhttp();
             let mut control_stream = dhttp.control_stream.lock().await;
-            let Ok(goaway_frame) = BufList::new().encode(dhttp.new_goaway()).await;
+            let Ok(goaway_frame) = BufList::new().encode(dhttp.begin_local_goaway()).await;
             control_stream.send(goaway_frame).await
         };
 
@@ -877,7 +978,7 @@ impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync + ?Sized> ConnectionS
         let (reader, writer) = self.open_bi().await?;
         let (mut reader, writer) = (Box::pin(reader), Box::pin(writer));
         self.dhttp()
-            .on_initialized_message_stream(reader.stream_id().await?)?;
+            .register_initialized_stream(reader.stream_id().await?)?;
         Ok((StreamReader::new(reader), SinkWriter::new(writer)))
     }
 
@@ -891,7 +992,7 @@ impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync + ?Sized> ConnectionS
         };
         let mut reader = Box::pin(reader);
         let stream_id = reader.stream_id().await?;
-        match dhttp.on_accepted_message_stream(stream_id) {
+        match dhttp.register_accepted_stream(stream_id) {
             Ok(()) => Ok((StreamReader::new(reader), writer)),
             Err(ConnectionGoaway::Local) => {
                 let code = Code::H3_REQUEST_REJECTED.into_inner();
