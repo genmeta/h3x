@@ -10,12 +10,18 @@ use tokio::sync::{Notify, futures::OwnedNotified};
 
 #[derive(Debug, Clone)]
 pub struct Watch<T> {
-    value: Arc<SyncMutex<Option<T>>>,
+    state: Arc<SyncMutex<WatchState<T>>>,
     notify: Arc<Notify>,
 }
 
+#[derive(Debug)]
+struct WatchState<T> {
+    value: Option<T>,
+    version: u64,
+}
+
 pub struct Value<'w, T> {
-    guard: MutexGuard<'w, Option<T>>,
+    guard: MutexGuard<'w, WatchState<T>>,
     notify: Arc<Notify>,
 }
 
@@ -25,11 +31,12 @@ impl<'w, T> Value<'w, T> {
     }
 
     pub fn get(&self) -> Option<&T> {
-        self.guard.as_ref()
+        self.guard.value.as_ref()
     }
 
     pub fn replace(&mut self, value: T) -> Option<T> {
-        let old = self.guard.replace(value);
+        let old = self.guard.value.replace(value);
+        self.guard.version = self.guard.version.wrapping_add(1);
         self.notify.notify_waiters();
         old
     }
@@ -38,14 +45,17 @@ impl<'w, T> Value<'w, T> {
 impl<T> Watch<T> {
     pub fn new() -> Self {
         Self {
-            value: Arc::new(SyncMutex::new(None)),
+            state: Arc::new(SyncMutex::new(WatchState {
+                value: None,
+                version: 0,
+            })),
             notify: Arc::new(Notify::new()),
         }
     }
 
     pub fn lock(&self) -> Value<'_, T> {
         Value {
-            guard: self.value.lock().unwrap(),
+            guard: self.state.lock().unwrap(),
             notify: self.notify.clone(),
         }
     }
@@ -58,15 +68,16 @@ impl<T> Watch<T> {
     where
         T: Clone,
     {
-        let guard = self.value.lock().unwrap();
-        guard.clone()
+        let guard = self.state.lock().unwrap();
+        guard.value.clone()
     }
 
     pub fn watch(&self) -> Watcher<T> {
         Watcher {
             notified: self.notify.clone().notified_owned(),
             notify: self.notify.clone(),
-            value: self.value.clone(),
+            state: self.state.clone(),
+            seen_version: 0,
         }
     }
 }
@@ -75,7 +86,7 @@ pin_project_lite::pin_project! {
     pub struct Get<T> {
         #[pin]
         notified: OwnedNotified,
-        value: Arc<SyncMutex<Option<T>>>
+        state: Arc<SyncMutex<WatchState<T>>>
     }
 }
 
@@ -85,7 +96,7 @@ impl<T: Clone> Future for Get<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let project = self.project();
         ready!(project.notified.poll(cx));
-        Poll::Ready(project.value.lock().unwrap().clone())
+        Poll::Ready(project.state.lock().unwrap().value.clone())
     }
 }
 
@@ -94,7 +105,8 @@ pin_project_lite::pin_project! {
         #[pin]
         notified: OwnedNotified,
         notify: Arc<Notify>,
-        value: Arc<SyncMutex<Option<T>>>
+        state: Arc<SyncMutex<WatchState<T>>>,
+        seen_version: u64,
     }
 }
 
@@ -104,11 +116,90 @@ impl<T: Clone> Stream for Watcher<T> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut project = self.project();
 
-        ready!(project.notified.as_mut().poll(cx));
-        let value = project.value.lock().unwrap().clone();
-        project
-            .notified
-            .set(project.notify.clone().notified_owned());
-        Poll::Ready(value)
+        loop {
+            {
+                let state = project.state.lock().unwrap();
+                if state.version > *project.seen_version {
+                    *project.seen_version = state.version;
+                    if let Some(value) = state.value.clone() {
+                        return Poll::Ready(Some(value));
+                    }
+                }
+            }
+
+            ready!(project.notified.as_mut().poll(cx));
+            project
+                .notified
+                .set(project.notify.clone().notified_owned());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt;
+
+    use super::Watch;
+
+    #[tokio::test]
+    async fn set_before_watch_observes_current_value_immediately() {
+        let watch = Watch::new();
+        watch.set(7_u32);
+
+        let watcher = watch.watch();
+        let mut watcher = std::pin::pin!(watcher);
+        let value = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            watcher.as_mut().next(),
+        )
+        .await
+        .expect("watcher should immediately observe current value")
+        .expect("watch stream should yield a value");
+
+        assert_eq!(value, 7);
+    }
+
+    #[tokio::test]
+    async fn watch_before_set_observes_future_update() {
+        let watch = Watch::new();
+        let watcher = watch.watch();
+        let mut watcher = std::pin::pin!(watcher);
+
+        let watch_setter = watch.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            watch_setter.set(11_u32);
+        });
+
+        let value = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            watcher.as_mut().next(),
+        )
+        .await
+        .expect("watcher should observe a future update")
+        .expect("watch stream should yield a value");
+
+        assert_eq!(value, 11);
+    }
+
+    #[tokio::test]
+    async fn rapid_updates_can_coalesce_to_latest_value() {
+        let watch = Watch::new();
+        let watcher = watch.watch();
+        let mut watcher = std::pin::pin!(watcher);
+
+        watch.set(1_u32);
+        watch.set(2_u32);
+        watch.set(3_u32);
+
+        let value = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            watcher.as_mut().next(),
+        )
+        .await
+        .expect("watcher should observe an update")
+        .expect("watch stream should yield a value");
+
+        assert_eq!(value, 3);
     }
 }
