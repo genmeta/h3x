@@ -73,11 +73,126 @@ mod tests {
     use std::{
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
+        pin::Pin,
         sync::Arc,
+        task::{Context, Poll},
     };
 
+    use bytes::Bytes;
+    use futures::{Sink, Stream};
+
     use super::*;
-    use crate::dhttp::settings::{Setting, Settings};
+    use crate::{
+        codec::{BoxReadStream, BoxWriteStream, ErasedStreamReader, ErasedStreamWriter, SinkWriter, StreamReader},
+        connection::{tests::MockConnection, ConnectionState},
+        dhttp::settings::{Setting, Settings},
+        protocol::Protocols,
+        quic::{self, GetStreamIdExt},
+        runtime::ErasedConnection,
+    };
+
+    #[derive(Debug)]
+    struct TestReadStream {
+        stream_id: VarInt,
+    }
+
+    impl quic::GetStreamId for TestReadStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.get_mut().stream_id))
+        }
+    }
+
+    impl quic::StopStream for TestReadStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            _code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for TestReadStream {
+        type Item = Result<Bytes, quic::StreamError>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            Poll::Ready(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestWriteStream {
+        stream_id: VarInt,
+    }
+
+    impl quic::GetStreamId for TestWriteStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.get_mut().stream_id))
+        }
+    }
+
+    impl quic::CancelStream for TestWriteStream {
+        fn poll_cancel(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            _code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Sink<Bytes> for TestWriteStream {
+        type Error = quic::StreamError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Bytes) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn test_erased_streams(stream_id: u32) -> (ErasedStreamReader, ErasedStreamWriter) {
+        let stream_id = VarInt::from_u32(stream_id);
+        let reader = StreamReader::new(Box::pin(TestReadStream { stream_id }) as BoxReadStream);
+        let writer = SinkWriter::new(Box::pin(TestWriteStream { stream_id }) as BoxWriteStream);
+        (reader, writer)
+    }
+
+    fn test_connection_state() -> ConnectionState<MockConnection> {
+        let quic = Arc::new(MockConnection::new());
+        let erased_connection: Arc<dyn ErasedConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased_connection));
+        ConnectionState::new_for_test(quic, Arc::new(protocols))
+    }
 
     fn hash_of<T: Hash>(t: &T) -> u64 {
         let mut h = DefaultHasher::new();
@@ -156,6 +271,83 @@ mod tests {
 
         assert_eq!(state.max_received_stream_id.peek(), Some(stream_id));
         assert_eq!(state.max_initialized_stream_id.peek(), None);
+    }
+
+    #[tokio::test]
+    async fn accept_raw_message_stream_succeeds_before_peer_goaway_boundary() {
+        let state = test_connection_state();
+        state.dhttp().peer_goaway.set(Goaway::new(VarInt::from_u32(4)));
+        _ = state.dhttp().unresolved_request_streams.send(test_erased_streams(6));
+
+        let (mut reader, _writer) = state
+            .accept_raw_message_stream()
+            .await
+            .expect("stream should be accepted before peer goaway boundary");
+
+        assert_eq!(reader.stream_id().await.expect("stream id"), VarInt::from_u32(6));
+    }
+
+    #[tokio::test]
+    async fn accept_raw_message_stream_rejects_at_peer_goaway_boundary() {
+        let state = test_connection_state();
+        state.dhttp().peer_goaway.set(Goaway::new(VarInt::from_u32(9)));
+        _ = state.dhttp().unresolved_request_streams.send(test_erased_streams(9));
+
+        let error = state
+            .accept_raw_message_stream()
+            .await
+            .err()
+            .expect("stream should be rejected at peer goaway boundary");
+
+        assert!(matches!(
+            error,
+            AcceptRawMessageStreamError::Goaway {
+                source: ConnectionGoaway::Peer
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_raw_message_stream_returns_local_goaway_when_local_goaway_already_set() {
+        let state = test_connection_state();
+        state.dhttp().local_goaway.set(Goaway::new(VarInt::from_u32(7)));
+        _ = state.dhttp().unresolved_request_streams.send(test_erased_streams(11));
+
+        let error = state
+            .accept_raw_message_stream()
+            .await
+            .err()
+            .expect("local goaway should block accepting unresolved request streams");
+
+        assert!(matches!(
+            error,
+            AcceptRawMessageStreamError::Goaway {
+                source: ConnectionGoaway::Local
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_raw_message_stream_unblocks_on_peer_goaway_signal() {
+        let state = test_connection_state();
+        let wait_state = state.clone();
+
+        let accept_task = tokio::spawn(async move { wait_state.accept_raw_message_stream().await });
+        tokio::task::yield_now().await;
+        state.dhttp().peer_goaway.set(Goaway::new(VarInt::from_u32(3)));
+
+        let error = accept_task
+            .await
+            .expect("join should succeed")
+            .err()
+            .expect("peer goaway signal should stop waiting for new request streams");
+
+        assert!(matches!(
+            error,
+            AcceptRawMessageStreamError::Goaway {
+                source: ConnectionGoaway::Peer
+            }
+        ));
     }
 }
 
@@ -624,15 +816,23 @@ impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync + ?Sized> ConnectionS
     pub async fn accept_raw_message_stream(
         &self,
     ) -> Result<(ErasedStreamReader, ErasedStreamWriter), AcceptRawMessageStreamError> {
+        let dhttp = self.dhttp();
+        if dhttp.local_goaway.peek().is_some() {
+            return Err(ConnectionGoaway::Local.into());
+        }
+
+        let mut local_goaway = pin!(dhttp.local_goaway.watch());
+        let mut peer_goaway = pin!(dhttp.peer_goaway.watch());
+
         let (reader, writer) = tokio::select! {
             biased;
-            stream = self.dhttp().unresolved_request_streams.receive() => stream,
+            stream = dhttp.unresolved_request_streams.receive() => stream,
+            _goaway = local_goaway.next() => return Err(ConnectionGoaway::Local.into()),
+            _goaway = peer_goaway.next() => return Err(ConnectionGoaway::Peer.into()),
             connection_error = self.closed() => return Err(connection_error.into()),
-            // TODO: goaway branch
         };
         let mut reader = Box::pin(reader);
-        self.dhttp()
-            .on_accepted_message_stream(reader.stream_id().await?)?;
+        dhttp.on_accepted_message_stream(reader.stream_id().await?)?;
         Ok((StreamReader::new(reader), writer))
     }
 }
