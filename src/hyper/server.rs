@@ -68,8 +68,6 @@ where
                         remain_read_stream.clone(),
                         remain_write_stream.clone(),
                     ))
-                    .extension(remain_read_stream)
-                    .extension(remain_write_stream)
                     .body(UnsyncBoxBody::new(Empty::new().map_err(|n| match n {})))
             } else {
                 http::Request::builder()
@@ -224,14 +222,11 @@ where
             }
             request.extensions_mut().insert(stream_id);
             request.extensions_mut().insert(protocols);
-            if is_connect {
-                if let Some(remain_read_stream) = remain_read_stream {
-                    request.extensions_mut().insert(TakeoverSlot::new(
-                        remain_read_stream,
-                        remain_write_stream.clone(),
-                    ));
-                }
-                request.extensions_mut().insert(remain_write_stream);
+            if is_connect && let Some(remain_read_stream) = remain_read_stream {
+                request.extensions_mut().insert(TakeoverSlot::new(
+                    remain_read_stream,
+                    remain_write_stream.clone(),
+                ));
             }
 
             let response = service
@@ -295,8 +290,6 @@ where
                         remain_read_stream.clone(),
                         remain_write_stream.clone(),
                     ))
-                    .extension(remain_read_stream)
-                    .extension(remain_write_stream)
                     .body(UnsyncBoxBody::new(Empty::new().map_err(|n| match n {})))
             } else {
                 http::Request::builder()
@@ -409,14 +402,11 @@ where
             }
             request.extensions_mut().insert(stream_id);
             request.extensions_mut().insert(protocols);
-            if is_connect {
-                if let Some(remain_read_stream) = remain_read_stream {
-                    request.extensions_mut().insert(TakeoverSlot::new(
-                        remain_read_stream,
-                        remain_write_stream.clone(),
-                    ));
-                }
-                request.extensions_mut().insert(remain_write_stream);
+            if is_connect && let Some(remain_read_stream) = remain_read_stream {
+                request.extensions_mut().insert(TakeoverSlot::new(
+                    remain_read_stream,
+                    remain_write_stream.clone(),
+                ));
             }
 
             let response = service
