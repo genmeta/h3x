@@ -83,8 +83,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{BoxReadStream, BoxWriteStream, ErasedStreamReader, ErasedStreamWriter, SinkWriter, StreamReader},
-        connection::{tests::MockConnection, ConnectionState},
+        codec::{
+            BoxReadStream, BoxWriteStream, ErasedStreamReader, ErasedStreamWriter, SinkWriter,
+            StreamReader,
+        },
+        connection::{ConnectionState, tests::MockConnection},
         dhttp::settings::{Setting, Settings},
         protocol::Protocols,
         quic::{self, GetStreamIdExt},
@@ -118,10 +121,7 @@ mod tests {
     impl Stream for TestReadStream {
         type Item = Result<Bytes, quic::StreamError>;
 
-        fn poll_next(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             Poll::Ready(None)
         }
     }
@@ -276,22 +276,37 @@ mod tests {
     #[tokio::test]
     async fn accept_raw_message_stream_succeeds_before_peer_goaway_boundary() {
         let state = test_connection_state();
-        state.dhttp().peer_goaway.set(Goaway::new(VarInt::from_u32(4)));
-        _ = state.dhttp().unresolved_request_streams.send(test_erased_streams(6));
+        state
+            .dhttp()
+            .peer_goaway
+            .set(Goaway::new(VarInt::from_u32(4)));
+        _ = state
+            .dhttp()
+            .unresolved_request_streams
+            .send(test_erased_streams(6));
 
         let (mut reader, _writer) = state
             .accept_raw_message_stream()
             .await
             .expect("stream should be accepted before peer goaway boundary");
 
-        assert_eq!(reader.stream_id().await.expect("stream id"), VarInt::from_u32(6));
+        assert_eq!(
+            reader.stream_id().await.expect("stream id"),
+            VarInt::from_u32(6)
+        );
     }
 
     #[tokio::test]
     async fn accept_raw_message_stream_rejects_at_peer_goaway_boundary() {
         let state = test_connection_state();
-        state.dhttp().peer_goaway.set(Goaway::new(VarInt::from_u32(9)));
-        _ = state.dhttp().unresolved_request_streams.send(test_erased_streams(9));
+        state
+            .dhttp()
+            .peer_goaway
+            .set(Goaway::new(VarInt::from_u32(9)));
+        _ = state
+            .dhttp()
+            .unresolved_request_streams
+            .send(test_erased_streams(9));
 
         let error = state
             .accept_raw_message_stream()
@@ -310,8 +325,14 @@ mod tests {
     #[tokio::test]
     async fn accept_raw_message_stream_returns_local_goaway_when_local_goaway_already_set() {
         let state = test_connection_state();
-        state.dhttp().local_goaway.set(Goaway::new(VarInt::from_u32(7)));
-        _ = state.dhttp().unresolved_request_streams.send(test_erased_streams(11));
+        state
+            .dhttp()
+            .local_goaway
+            .set(Goaway::new(VarInt::from_u32(7)));
+        _ = state
+            .dhttp()
+            .unresolved_request_streams
+            .send(test_erased_streams(11));
 
         let error = state
             .accept_raw_message_stream()
@@ -334,7 +355,10 @@ mod tests {
 
         let accept_task = tokio::spawn(async move { wait_state.accept_raw_message_stream().await });
         tokio::task::yield_now().await;
-        state.dhttp().peer_goaway.set(Goaway::new(VarInt::from_u32(3)));
+        state
+            .dhttp()
+            .peer_goaway
+            .set(Goaway::new(VarInt::from_u32(3)));
 
         let error = accept_task
             .await
@@ -346,6 +370,32 @@ mod tests {
             error,
             AcceptRawMessageStreamError::Goaway {
                 source: ConnectionGoaway::Peer
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_raw_message_stream_unblocks_on_local_goaway_signal() {
+        let state = test_connection_state();
+        let wait_state = state.clone();
+
+        let accept_task = tokio::spawn(async move { wait_state.accept_raw_message_stream().await });
+        tokio::task::yield_now().await;
+        state
+            .dhttp()
+            .local_goaway
+            .set(Goaway::new(VarInt::from_u32(0)));
+
+        let error = accept_task
+            .await
+            .expect("join should succeed")
+            .err()
+            .expect("local goaway signal should stop waiting for new request streams");
+
+        assert!(matches!(
+            error,
+            AcceptRawMessageStreamError::Goaway {
+                source: ConnectionGoaway::Local
             }
         ));
     }
