@@ -1,4 +1,4 @@
-use std::{collections::HashMap, error::Error, sync::Arc};
+use std::{error::Error, sync::Arc};
 
 use futures::future::{self};
 use snafu::Report;
@@ -21,6 +21,8 @@ mod message;
 pub use message::{Request, Response, UnresolvedRequest};
 mod route;
 pub use route::{MethodRouter, Router};
+mod servers_router;
+pub use servers_router::{ServersRouter, ServersRouterDispatchError};
 mod service;
 pub use service::{BoxService, BoxServiceFuture, IntoBoxService, Service, box_service};
 
@@ -29,7 +31,7 @@ pub struct Servers<L: quic::Listen, S> {
     pool: Pool<L::Connection>,
     listener: L,
     builder: Arc<ConnectionBuilder<L::Connection>>,
-    router: Arc<HashMap<String, S>>,
+    service: S,
 }
 
 #[bon::bon]
@@ -44,6 +46,7 @@ where
     fn new(
         #[builder(default = Pool::global().clone())] pool: Pool<L::Connection>,
         listener: L,
+        service: S,
         #[builder(default = Arc::new(ConnectionBuilder::new(Arc::default())))] builder: Arc<
             ConnectionBuilder<L::Connection>,
         >,
@@ -52,7 +55,7 @@ where
             pool,
             listener,
             builder,
-            router: Arc::new(HashMap::new()),
+            service,
         }
     }
 
@@ -63,6 +66,14 @@ where
     pub fn quic_listener_mut(&mut self) -> &mut L {
         &mut self.listener
     }
+
+    pub fn service(&self) -> &S {
+        &self.service
+    }
+
+    pub fn service_mut(&mut self) -> &mut S {
+        &mut self.service
+    }
 }
 
 impl<L, S> Servers<L, S>
@@ -72,15 +83,6 @@ where
     S::Future: Send,
     S::Error: Into<Box<dyn Error + Send + Sync>>,
 {
-    fn router_mut(&mut self) -> &mut HashMap<String, S> {
-        Arc::make_mut(&mut self.router)
-    }
-
-    pub fn serve(&mut self, domain: impl Into<String>, router: S) -> &mut Self {
-        self.router_mut().insert(domain.into(), router);
-        self
-    }
-
     fn handle_incoming_connection(
         &self,
         connection: L::Connection,
@@ -93,7 +95,7 @@ where
             builder.hash(&mut hasher);
             hasher.finish()
         };
-        let router = self.router.clone();
+        let service = self.service.clone();
         let span = tracing::info_span!("handle_connection", server_name = tracing::field::Empty);
         async move {
             tracing::debug!("Accepted new QUIC connection");
@@ -124,16 +126,6 @@ where
             tracing::Span::current().record("server_name", local_agent.name());
             let connection = Arc::new(connection);
             _ = pool.try_insert(connection.clone(), builder_hash);
-            // TODO: router with authority?
-            let Some(service) = router.get(local_agent.name()) else {
-                tracing::debug!(
-                    "Close incoming connection due to missing service for {}",
-                    local_agent.name()
-                );
-                connection.close(Code::H3_NO_ERROR, "no error");
-                return;
-            };
-
             let mut connection_tasks = JoinSet::new();
 
             loop {
@@ -164,6 +156,7 @@ where
                 };
 
                 let mut service = service.clone();
+                let connection = connection.clone();
                 let unresolved_request = UnresolvedRequest {
                     request_stream: read_stream,
                     remote_agent: remote_agent.clone(),
@@ -186,6 +179,19 @@ where
 
                     if let Err(error) = service.call(unresolved_request).await {
                         let error = error.into();
+                        if error
+                            .as_ref()
+                            .downcast_ref::<ServersRouterDispatchError>()
+                            .is_some()
+                        {
+                            tracing::debug!(
+                                stream_id = %stream_id,
+                                error = %Report::from_error(error.as_ref()),
+                                "Close incoming connection due to missing service"
+                            );
+                            connection.close(Code::H3_NO_ERROR, "no error");
+                            return;
+                        }
                         tracing::debug!(
                             stream_id = %stream_id,
                             error = %Report::from_error(error.as_ref()),
