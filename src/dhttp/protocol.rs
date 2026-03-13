@@ -131,6 +131,32 @@ mod tests {
 
         assert_ne!(f1, f2);
     }
+
+    #[test]
+    fn initialized_stream_updates_initialized_only() {
+        let state = DHttpState::new(Arc::new(Settings::default()));
+        let stream_id = VarInt::from_u32(7);
+
+        state
+            .on_initialized_message_stream(stream_id)
+            .expect("initialized stream should be accepted");
+
+        assert_eq!(state.max_initialized_stream_id.peek(), Some(stream_id));
+        assert_eq!(state.max_received_stream_id.peek(), None);
+    }
+
+    #[test]
+    fn accepted_stream_updates_received_only() {
+        let state = DHttpState::new(Arc::new(Settings::default()));
+        let stream_id = VarInt::from_u32(9);
+
+        state
+            .on_accepted_message_stream(stream_id)
+            .expect("accepted stream should be accepted");
+
+        assert_eq!(state.max_received_stream_id.peek(), Some(stream_id));
+        assert_eq!(state.max_initialized_stream_id.peek(), None);
+    }
 }
 
 impl DHttpState {
@@ -210,9 +236,9 @@ impl DHttpState {
         {
             return Err(ConnectionGoaway::Peer);
         }
-        let mut max_received_stream_id = self.max_received_stream_id.lock();
-        max_received_stream_id.set(
-            max_received_stream_id
+        let mut max_initialized_stream_id = self.max_initialized_stream_id.lock();
+        max_initialized_stream_id.set(
+            max_initialized_stream_id
                 .get()
                 .map_or(stream_id, |current| *current.max(&stream_id)),
         );
