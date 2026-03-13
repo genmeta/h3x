@@ -186,9 +186,9 @@ fn axum_connect() {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let Some((mut read_stream, mut write_stream)) = upgrade::on(response).await else {
-            panic!("failed to upgrade to tunnel");
-        };
+        let (mut read_stream, mut write_stream) = upgrade::on(response)
+            .await
+            .expect("failed to upgrade to tunnel");
 
         write_stream
             .write_all(CONNECTED_REQUEST.as_bytes())
