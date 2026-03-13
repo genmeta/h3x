@@ -7,29 +7,9 @@ pub mod upgrade {
 
     pub async fn on(
         message: impl HasTakeover,
-    ) -> Option<(BoxStreamReader<'static>, BoxStreamWriter<'static>)> {
-        let pending = match takeover::take(message).await {
-            Ok(Some(pending)) => pending,
-            Ok(None) => return None,
-            Err(error) => {
-                tracing::debug!(
-                    ?error,
-                    "Compatibility upgrade::on mapped explicit takeover error to None"
-                );
-                return None;
-            }
-        };
-
-        match pending.wait().await {
-            Ok(streams) => Some(streams),
-            Err(error) => {
-                tracing::debug!(
-                    ?error,
-                    "Compatibility upgrade::on mapped takeover wait error to None"
-                );
-                None
-            }
-        }
+    ) -> Result<(BoxStreamReader<'static>, BoxStreamWriter<'static>), TakeoverError> {
+        let pending = takeover::take(message).await?;
+        pending.wait().await
     }
 }
 
@@ -39,9 +19,7 @@ pub mod takeover {
     use crate::message::stream::hyper::upgrade::TakeoverSealed;
     pub use crate::message::stream::hyper::upgrade::{HasTakeover, PendingTakeover, TakeoverError};
 
-    pub async fn take(
-        mut message: impl HasTakeover,
-    ) -> Result<Option<PendingTakeover>, TakeoverError> {
+    pub async fn take(mut message: impl HasTakeover) -> Result<PendingTakeover, TakeoverError> {
         poll_fn(|cx| TakeoverSealed::poll_takeover(&mut message, cx)).await
     }
 }
@@ -91,6 +69,9 @@ mod tests {
         ));
 
         let compat = upgrade::on(http::Request::new(ErrorBody)).await;
-        assert!(compat.is_none());
+        assert!(matches!(
+            compat,
+            Err(crate::message::stream::hyper::upgrade::TakeoverError::BodyNotReleased)
+        ));
     }
 }

@@ -1,5 +1,4 @@
 use std::{
-    future::poll_fn,
     ops::DerefMut,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -103,6 +102,7 @@ impl PendingTakeover {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TakeoverError {
+    Unsupported,
     AlreadyTaken,
     Aborted,
     BodyNotReleased,
@@ -112,7 +112,7 @@ pub trait TakeoverSealed {
     fn poll_takeover(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<PendingTakeover>, TakeoverError>>;
+    ) -> Poll<Result<PendingTakeover, TakeoverError>>;
 }
 
 fn poll_release_body<B: Body + Unpin>(
@@ -128,63 +128,6 @@ fn poll_release_body<B: Body + Unpin>(
     }
 }
 
-fn take_legacy_pair(
-    extensions: &mut http::Extensions,
-) -> Result<Option<PendingTakeover>, TakeoverError> {
-    let write = extensions.remove::<RemainStream<WriteStream>>();
-    let read = extensions.remove::<RemainStream<ReadStream>>();
-    match (read, write) {
-        (Some(read), Some(write)) => Ok(Some(PendingTakeover { read, write })),
-        (None, None) => Ok(None),
-        (read, write) => {
-            if let Some(read) = read {
-                extensions.insert(read);
-            }
-            if let Some(write) = write {
-                extensions.insert(write);
-            }
-            Ok(None)
-        }
-    }
-}
-
-pub trait Sealed<S> {
-    fn poll_extract(&mut self, cx: &mut Context<'_>) -> Poll<Option<RemainStream<S>>>;
-}
-
-impl<S: Send + 'static, B: Body + Unpin> Sealed<S> for http::Request<B> {
-    fn poll_extract(&mut self, cx: &mut Context<'_>) -> Poll<Option<RemainStream<S>>> {
-        while ready!(Pin::new(self.body_mut()).poll_frame(cx)).is_some() {}
-        Poll::Ready(self.extensions_mut().remove::<RemainStream<S>>())
-    }
-}
-
-impl<S: Send + 'static, B: Body + Unpin> Sealed<S> for http::Response<B> {
-    fn poll_extract(&mut self, cx: &mut Context<'_>) -> Poll<Option<RemainStream<S>>> {
-        while ready!(Pin::new(self.body_mut()).poll_frame(cx)).is_some() {}
-        Poll::Ready(self.extensions_mut().remove::<RemainStream<S>>())
-    }
-}
-
-impl<S: Send + 'static, B: Body + Unpin> Sealed<S> for &mut http::Request<B> {
-    fn poll_extract(&mut self, cx: &mut Context<'_>) -> Poll<Option<RemainStream<S>>> {
-        while ready!(Pin::new(self.body_mut()).poll_frame(cx)).is_some() {}
-        Poll::Ready(self.extensions_mut().remove::<RemainStream<S>>())
-    }
-}
-
-impl<S: Send + 'static, B: Body + Unpin> Sealed<S> for &mut http::Response<B> {
-    fn poll_extract(&mut self, cx: &mut Context<'_>) -> Poll<Option<RemainStream<S>>> {
-        while ready!(Pin::new(self.body_mut()).poll_frame(cx)).is_some() {}
-        Poll::Ready(self.extensions_mut().remove::<RemainStream<S>>())
-    }
-}
-
-pub trait HasRemainingStream<S>: Sealed<S> {}
-
-impl<R: Sealed<ReadStream>> HasRemainingStream<ReadStream> for R {}
-impl<R: Sealed<WriteStream>> HasRemainingStream<WriteStream> for R {}
-
 pub trait HasTakeover: TakeoverSealed {}
 
 impl<R: TakeoverSealed> HasTakeover for R {}
@@ -193,12 +136,12 @@ impl<B: Body + Unpin> TakeoverSealed for http::Request<B> {
     fn poll_takeover(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<PendingTakeover>, TakeoverError>> {
+    ) -> Poll<Result<PendingTakeover, TakeoverError>> {
         ready!(poll_release_body(self.body_mut(), cx))?;
         if let Some(slot) = self.extensions().get::<TakeoverSlot>() {
-            return Poll::Ready(slot.take().map(Some));
+            return Poll::Ready(slot.take());
         }
-        Poll::Ready(take_legacy_pair(self.extensions_mut()))
+        Poll::Ready(Err(TakeoverError::Unsupported))
     }
 }
 
@@ -206,12 +149,12 @@ impl<B: Body + Unpin> TakeoverSealed for http::Response<B> {
     fn poll_takeover(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<PendingTakeover>, TakeoverError>> {
+    ) -> Poll<Result<PendingTakeover, TakeoverError>> {
         ready!(poll_release_body(self.body_mut(), cx))?;
         if let Some(slot) = self.extensions().get::<TakeoverSlot>() {
-            return Poll::Ready(slot.take().map(Some));
+            return Poll::Ready(slot.take());
         }
-        Poll::Ready(take_legacy_pair(self.extensions_mut()))
+        Poll::Ready(Err(TakeoverError::Unsupported))
     }
 }
 
@@ -219,12 +162,12 @@ impl<B: Body + Unpin> TakeoverSealed for &mut http::Request<B> {
     fn poll_takeover(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<PendingTakeover>, TakeoverError>> {
+    ) -> Poll<Result<PendingTakeover, TakeoverError>> {
         ready!(poll_release_body(self.body_mut(), cx))?;
         if let Some(slot) = self.extensions().get::<TakeoverSlot>() {
-            return Poll::Ready(slot.take().map(Some));
+            return Poll::Ready(slot.take());
         }
-        Poll::Ready(take_legacy_pair(self.extensions_mut()))
+        Poll::Ready(Err(TakeoverError::Unsupported))
     }
 }
 
@@ -232,34 +175,19 @@ impl<B: Body + Unpin> TakeoverSealed for &mut http::Response<B> {
     fn poll_takeover(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<PendingTakeover>, TakeoverError>> {
+    ) -> Poll<Result<PendingTakeover, TakeoverError>> {
         ready!(poll_release_body(self.body_mut(), cx))?;
         if let Some(slot) = self.extensions().get::<TakeoverSlot>() {
-            return Poll::Ready(slot.take().map(Some));
+            return Poll::Ready(slot.take());
         }
-        Poll::Ready(take_legacy_pair(self.extensions_mut()))
-    }
-}
-
-impl ReadStream {
-    /// Extract the remaining ReadStream from hyper Request/Response.
-    ///
-    /// This method will consume all remaining body frames, then return the
-    /// RemainReadStream if exists.
-    pub async fn extract_from(mut message: impl HasRemainingStream<Self>) -> Option<Self> {
-        poll_fn(|cx| message.poll_extract(cx)).await?.await
-    }
-}
-
-impl WriteStream {
-    pub async fn extract_from(mut message: impl HasRemainingStream<Self>) -> Option<Self> {
-        poll_fn(|cx| message.poll_extract(cx)).await?.await
+        Poll::Ready(Err(TakeoverError::Unsupported))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        future::poll_fn,
         pin::Pin,
         task::{Context, Poll},
     };
@@ -285,10 +213,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn takeover_returns_none_for_unsupported_message() {
+    async fn takeover_returns_unsupported_for_unsupported_message() {
         let mut request = http::Request::new(http_body_util::Empty::<Bytes>::new());
         let result = poll_fn(|cx| request.poll_takeover(cx)).await;
-        assert!(matches!(result, Ok(None)));
+        assert!(matches!(result, Err(TakeoverError::Unsupported)));
+    }
+
+    #[tokio::test]
+    async fn takeover_returns_pending_when_slot_available() {
+        let mut request = http::Request::new(http_body_util::Empty::<Bytes>::new());
+        let (_read_tx, read) = RemainStream::<ReadStream>::pending();
+        let (_write_tx, write) = RemainStream::<WriteStream>::pending();
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(read, write));
+
+        let result = poll_fn(|cx| request.poll_takeover(cx)).await;
+        assert!(matches!(result, Ok(_)));
     }
 
     #[tokio::test]
@@ -301,7 +242,7 @@ mod tests {
             .insert(TakeoverSlot::new(read, write));
 
         let first = poll_fn(|cx| request.poll_takeover(cx)).await;
-        assert!(matches!(first, Ok(Some(_))));
+        assert!(matches!(first, Ok(_)));
 
         let second = poll_fn(|cx| request.poll_takeover(cx)).await;
         assert!(matches!(second, Err(TakeoverError::AlreadyTaken)));
@@ -318,8 +259,7 @@ mod tests {
 
         let pending = poll_fn(|cx| request.poll_takeover(cx))
             .await
-            .expect("takeover should succeed")
-            .expect("takeover should be supported");
+            .expect("takeover should succeed");
 
         drop(read_tx);
         drop(write_tx);
