@@ -47,11 +47,7 @@ impl<C: quic::Connection> ReuseableConnection<C> {
         if connection.check().is_err() {
             return None;
         }
-        // peer goaway, connection cannot be reused: cannot open new streams
-        if let Some(peer_goaway) = connection.peek_peer_goaway()
-            && let Some(max_received_stream_id) = connection.max_received_stream_id()
-            && peer_goaway.stream_id() <= max_received_stream_id
-        {
+        if connection.peek_peer_goaway().is_some() {
             return None;
         }
         Some(connection)
@@ -384,7 +380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reuse_returns_none_when_peer_goaway_blocks_new_streams() {
+    async fn pool_reuse_returns_none_after_peer_goaway_observed() {
         let quic = crate::connection::tests::MockConnection::new();
         quic.set_check_result(Ok(()));
 
@@ -395,8 +391,7 @@ mod tests {
         };
         let state = ConnectionState::new_for_test(Arc::new(quic), protocols);
         let dhttp = state.dhttp();
-        dhttp.max_received_stream_id.set(VarInt::from_u32(9));
-        dhttp.peer_goaway.set(Goaway::new(VarInt::from_u32(9)));
+        dhttp.peer_goaway.set(Goaway::new(VarInt::from_u32(123)));
 
         let reusable = reusable_connection(Connection::from_state_for_test(state)).await;
         assert!(reusable.reuse().is_none());
