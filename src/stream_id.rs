@@ -41,6 +41,20 @@ impl From<StreamId> for VarInt {
     }
 }
 
+impl StreamId {
+    pub const fn into_inner(self) -> u64 {
+        self.0.into_inner()
+    }
+}
+
+impl TryFrom<u64> for StreamId {
+    type Error = crate::varint::err::Overflow;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Ok(Self(VarInt::try_from(value)?))
+    }
+}
+
 impl fmt::Display for StreamId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
