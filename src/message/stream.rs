@@ -1,12 +1,12 @@
 use std::{
     io, mem,
-    pin::{Pin, pin},
+    pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
 
 use bytes::{Buf, Bytes};
-use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt, future};
+use futures::{Sink, SinkExt, Stream, TryStreamExt};
 use snafu::Snafu;
 
 use crate::{
@@ -17,7 +17,6 @@ use crate::{
             Frame,
             stream::{FrameStream, ReadableFrame},
         },
-        goaway::Goaway,
         protocol::{
             AcceptRawMessageStreamError, BoxDynQuicStreamReader, BoxDynQuicStreamWriter,
             DHttpState, InitialRawMessageStreamError,
@@ -158,34 +157,19 @@ impl ReadStream {
         }
     }
 
-    pub async fn peer_goaway(
+    pub async fn peer_goaway_covers(
         &mut self,
-    ) -> Result<
-        impl Future<Output = Result<Goaway, quic::ConnectionError>> + use<>,
-        quic::StreamError,
-    > {
+    ) -> Result<impl Future<Output = Result<(), quic::ConnectionError>> + use<>, quic::StreamError>
+    {
         let stream_id = self.stream.stream_id().await?;
-
-        // Upon receipt of a GOAWAY frame, if the client has already sent
-        // requests with a stream ID greater than or equal to the identifier
-        // contained in the GOAWAY frame, those requests will not be
-        // processed. Clients can safely retry unprocessed requests on a
-        // different HTTP connection. A client that is unable to retry
-        // requests loses all requests that are in flight when the server
-        // closes the connection.
-        let effective_peer_goaway = self
-            .dhttp_state
-            .peer_goaway
-            .watch()
-            .filter(move |goaway| future::ready(stream_id >= goaway.stream_id()));
+        let dhttp_state = self.dhttp_state.clone();
         let conn = self.connection.clone();
 
         Ok(async move {
-            let mut effective_peer_goaway = pin!(effective_peer_goaway.fuse());
             let error = conn.closed();
             tokio::select! {
                 biased;
-                goaway = effective_peer_goaway.select_next_some() => Ok(goaway),
+                _goaway = dhttp_state.peer_goaway_covers(stream_id) => Ok(()),
                 error = error => Err(error),
             }
         })
@@ -195,7 +179,7 @@ impl ReadStream {
         &mut self,
         f: impl AsyncFnOnce(&mut Self) -> Result<T, connection::StreamError>,
     ) -> Result<T, MessageStreamError> {
-        let peer_goaway = self.peer_goaway().await?;
+        let peer_goaway = self.peer_goaway_covers().await?;
         tokio::select! {
             result = f(self) => match result {
                 Ok(value) => Ok(value),
@@ -208,7 +192,7 @@ impl ReadStream {
                 Err(error) => Err(self.connection.as_ref().handle_stream_error(error).await.into()),
             },
             goaway = peer_goaway => match goaway {
-                Ok(_goaway) => {
+                Ok(()) => {
                     // FIXME: which code should be used?
                     _ = self.stream.stop(Code::H3_NO_ERROR.into()).await;
                     Err(ConnectionGoaway::Peer.into())
@@ -357,34 +341,19 @@ impl WriteStream {
         self.stream.encode_one(frame).await
     }
 
-    async fn peer_goaway(
+    async fn peer_goaway_covers(
         &mut self,
-    ) -> Result<
-        impl Future<Output = Result<Goaway, quic::ConnectionError>> + use<>,
-        quic::StreamError,
-    > {
+    ) -> Result<impl Future<Output = Result<(), quic::ConnectionError>> + use<>, quic::StreamError>
+    {
         let stream_id = self.stream.stream_id().await?;
-
-        // Upon receipt of a GOAWAY frame, if the client has already sent
-        // requests with a stream ID greater than or equal to the identifier
-        // contained in the GOAWAY frame, those requests will not be
-        // processed. Clients can safely retry unprocessed requests on a
-        // different HTTP connection. A client that is unable to retry
-        // requests loses all requests that are in flight when the server
-        // closes the connection.
-        let effective_peer_goaway = self
-            .dhttp_state
-            .peer_goaway
-            .watch()
-            .filter(move |goaway| future::ready(stream_id >= goaway.stream_id()));
+        let dhttp_state = self.dhttp_state.clone();
         let conn = self.connection.clone();
 
         Ok(async move {
-            let mut effective_peer_goaway = pin!(effective_peer_goaway.fuse());
             let error = conn.closed();
             tokio::select! {
                 biased;
-                goaway = effective_peer_goaway.select_next_some() => Ok(goaway),
+                _goaway = dhttp_state.peer_goaway_covers(stream_id) => Ok(()),
                 error = error => Err(error),
             }
         })
@@ -394,7 +363,7 @@ impl WriteStream {
         &mut self,
         f: impl AsyncFnOnce(&mut Self) -> Result<T, connection::StreamError>,
     ) -> Result<T, MessageStreamError> {
-        let peer_goaway = self.peer_goaway().await?;
+        let peer_goaway = self.peer_goaway_covers().await?;
         let f = async move |this: &mut Self| {
             let value = f(this).await?;
             // ensure all data are written into the underlying QUIC stream
@@ -412,7 +381,7 @@ impl WriteStream {
                 Err(error) => Err(self.connection.as_ref().handle_stream_error(error).await.into()),
             },
             goaway = peer_goaway => match goaway {
-                Ok(_goaway) => {
+                Ok(()) => {
                     // FIXME: which code should be used?
                     _ = self.stream.cancel(Code::H3_NO_ERROR.into()).await;
                     Err(ConnectionGoaway::Peer.into())
@@ -553,5 +522,240 @@ impl<C: quic::Connection> ConnectionState<C> {
                 dhttp.state.clone(),
             ),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+    };
+
+    use bytes::Bytes;
+    use futures::{Sink, SinkExt, Stream};
+
+    use super::{ReadStream, WriteStream};
+    use crate::{
+        codec::{SinkWriter, StreamReader},
+        connection::{ConnectionState, StreamError, tests::MockConnection},
+        dhttp::{goaway::Goaway, protocol::DHttpProtocol, settings::Settings},
+        protocol::Protocols,
+        qpack::protocol::{QPackDecoder, QPackEncoder},
+        quic,
+        runtime::ErasedConnection,
+        varint::VarInt,
+    };
+
+    fn qpack_decoder_sink()
+    -> Pin<Box<dyn Sink<crate::qpack::decoder::DecoderInstruction, Error = StreamError> + Send>>
+    {
+        Box::pin(
+            futures::sink::drain::<crate::qpack::decoder::DecoderInstruction>()
+                .sink_map_err(|never| match never {}),
+        )
+    }
+
+    fn qpack_decoder_stream() -> Pin<
+        Box<
+            dyn Stream<Item = Result<crate::qpack::encoder::EncoderInstruction, StreamError>>
+                + Send,
+        >,
+    > {
+        Box::pin(futures::stream::empty::<
+            Result<crate::qpack::encoder::EncoderInstruction, StreamError>,
+        >())
+    }
+
+    fn qpack_encoder_sink()
+    -> Pin<Box<dyn Sink<crate::qpack::encoder::EncoderInstruction, Error = StreamError> + Send>>
+    {
+        Box::pin(
+            futures::sink::drain::<crate::qpack::encoder::EncoderInstruction>()
+                .sink_map_err(|never| match never {}),
+        )
+    }
+
+    fn qpack_encoder_stream() -> Pin<
+        Box<
+            dyn Stream<Item = Result<crate::qpack::decoder::DecoderInstruction, StreamError>>
+                + Send,
+        >,
+    > {
+        Box::pin(futures::stream::empty::<
+            Result<crate::qpack::decoder::DecoderInstruction, StreamError>,
+        >())
+    }
+
+    #[derive(Debug)]
+    struct TestReadStream {
+        stream_id: VarInt,
+    }
+
+    impl quic::GetStreamId for TestReadStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.get_mut().stream_id))
+        }
+    }
+
+    impl quic::StopStream for TestReadStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            _code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for TestReadStream {
+        type Item = Result<Bytes, quic::StreamError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestWriteStream {
+        stream_id: VarInt,
+    }
+
+    impl quic::GetStreamId for TestWriteStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.get_mut().stream_id))
+        }
+    }
+
+    impl quic::CancelStream for TestWriteStream {
+        fn poll_cancel(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            _code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Sink<Bytes> for TestWriteStream {
+        type Error = quic::StreamError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Bytes) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_stream_try_stream_io_aborts_when_peer_goaway_covers_stream() {
+        let quic = Arc::new(MockConnection::new());
+        let erased_connection: Arc<dyn ErasedConnection> = quic.clone();
+        let connection: Arc<dyn quic::Lifecycle + Send + Sync> = quic.clone();
+
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased_connection));
+        let state = ConnectionState::new_for_test(quic.clone(), Arc::new(protocols));
+
+        let reader = StreamReader::new(Box::pin(TestReadStream {
+            stream_id: VarInt::from_u32(10),
+        }) as crate::codec::BoxReadStream);
+        let mut read_stream = ReadStream::new(
+            reader,
+            Arc::new(QPackDecoder::new(
+                Arc::new(Settings::default()),
+                qpack_decoder_sink(),
+                qpack_decoder_stream(),
+            )),
+            connection,
+            state.dhttp().state.clone(),
+        );
+
+        state
+            .dhttp()
+            .apply_peer_goaway(Goaway::new(VarInt::from_u32(9)))
+            .expect("peer goaway should be accepted");
+
+        let result = read_stream
+            .try_stream_io(async move |_this| {
+                futures::future::pending::<Result<(), crate::connection::StreamError>>().await
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(super::MessageStreamError::Goaway {
+                source: crate::connection::ConnectionGoaway::Peer
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_stream_try_stream_io_aborts_when_peer_goaway_covers_stream() {
+        let quic = Arc::new(MockConnection::new());
+        let erased_connection: Arc<dyn ErasedConnection> = quic.clone();
+        let connection: Arc<dyn quic::Lifecycle + Send + Sync> = quic.clone();
+
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased_connection));
+        let state = ConnectionState::new_for_test(quic.clone(), Arc::new(protocols));
+
+        let writer = SinkWriter::new(Box::pin(TestWriteStream {
+            stream_id: VarInt::from_u32(12),
+        }) as crate::codec::BoxWriteStream);
+        let mut write_stream = WriteStream::new(
+            writer,
+            Arc::new(QPackEncoder::new(
+                Arc::new(Settings::default()),
+                qpack_encoder_sink(),
+                qpack_encoder_stream(),
+            )),
+            connection,
+            state.dhttp().state.clone(),
+        );
+
+        state
+            .dhttp()
+            .apply_peer_goaway(Goaway::new(VarInt::from_u32(11)))
+            .expect("peer goaway should be accepted");
+
+        let result = write_stream
+            .try_stream_io(async move |_this| {
+                futures::future::pending::<Result<(), crate::connection::StreamError>>().await
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(super::MessageStreamError::Goaway {
+                source: crate::connection::ConnectionGoaway::Peer
+            })
+        ));
     }
 }
