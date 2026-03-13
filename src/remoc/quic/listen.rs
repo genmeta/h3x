@@ -25,7 +25,7 @@ pub trait Listen: Send + Sync {
     async fn shutdown(&self) -> Result<(), ListenError>;
 }
 
-pub fn serve_quic_listener<L>(
+pub(crate) fn serve_quic_listener<L>(
     listener: L,
 ) -> (ListenClient, impl Future<Output = ()> + Send + 'static)
 where

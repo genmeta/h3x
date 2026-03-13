@@ -25,7 +25,7 @@ pub trait RemoteConnect: Send + Sync {
     async fn connect(&self, server: SerdeAuthority) -> Result<ConnectionClient, ConnectError>;
 }
 
-pub fn serve_quic_connector<C>(
+pub(crate) fn serve_quic_connector<C>(
     connector: C,
 ) -> (
     RemoteConnectClient,
