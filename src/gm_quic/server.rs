@@ -17,7 +17,7 @@ use rustls::{crypto::CryptoProvider, server::danger::ClientCertVerifier};
 use crate::{
     connection::ConnectionBuilder,
     pool::Pool,
-    server::{Servers, UnresolvedRequest},
+    server::{Servers, ServersRouter, UnresolvedRequest},
 };
 
 pub struct H3ServersTlsBuilder {
@@ -25,7 +25,7 @@ pub struct H3ServersTlsBuilder {
     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
 }
 
-pub type H3Servers<S> = Servers<Arc<QuicListeners>, S>;
+pub type H3Servers<S> = Servers<Arc<QuicListeners>, ServersRouter<S>>;
 
 impl H3Servers<()> {
     pub fn builder() -> H3ServersTlsBuilder {
@@ -174,12 +174,13 @@ impl H3ServersBuilder {
         Ok(Servers::from_quic_listener()
             .listener(listener)
             .pool(self.pool)
+            .service(ServersRouter::new())
             .builder(self.builder)
             .build())
     }
 }
 
-impl<S> Servers<Arc<QuicListeners>, S>
+impl<S> Servers<Arc<QuicListeners>, ServersRouter<S>>
 where
     S: tower_service::Service<UnresolvedRequest, Response = ()> + Clone + Send + Sync + 'static,
     S::Future: Send,
@@ -198,6 +199,7 @@ where
         self.quic_listener()
             .add_server(&server_name, cert_chain, private_key, bind_uris, ocsp)
             .await?;
-        Ok(self.serve(server_name, router))
+        self.service_mut().serve(server_name, router);
+        Ok(self)
     }
 }
