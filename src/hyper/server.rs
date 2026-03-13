@@ -15,7 +15,10 @@ use tracing::Instrument;
 use crate::{
     message::stream::{
         MessageStreamError,
-        hyper::{upgrade::RemainStream, write::SendMessageError},
+        hyper::{
+            upgrade::{RemainStream, TakeoverSlot},
+            write::SendMessageError,
+        },
     },
     server::{Request, Response, UnresolvedRequest},
 };
@@ -46,24 +49,38 @@ where
                 return;
             }
 
-            let read_stream = req.read_stream().take();
+            let mut read_stream = Some(req.read_stream().take());
             let mut write_stream = resp.write_stream().take();
 
             let is_connect = req.method() == Method::CONNECT;
 
             let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
             let request = if is_connect {
+                let remain_read_stream = RemainStream::immediately(
+                    read_stream
+                        .take()
+                        .expect("connect request must have read stream"),
+                );
                 http::Request::builder()
                     .method(req.method())
                     .uri(req.uri())
-                    .extension(RemainStream::immediately(read_stream))
+                    .extension(TakeoverSlot::new(
+                        remain_read_stream.clone(),
+                        remain_write_stream.clone(),
+                    ))
+                    .extension(remain_read_stream)
                     .extension(remain_write_stream)
                     .body(UnsyncBoxBody::new(Empty::new().map_err(|n| match n {})))
             } else {
                 http::Request::builder()
                     .method(req.method())
                     .uri(req.uri())
-                    .body(UnsyncBoxBody::new(read_stream.into_hyper_body()))
+                    .body(UnsyncBoxBody::new(
+                        read_stream
+                            .take()
+                            .expect("non-connect request must have read stream")
+                            .into_hyper_body(),
+                    ))
             };
 
             let mut request = match request {
@@ -196,6 +213,10 @@ where
             tracing::debug!("Converted request stream to hyper request, serving...");
             let is_connect = request.method() == Method::CONNECT;
             let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
+            let remain_read_stream = request
+                .extensions()
+                .get::<RemainStream<crate::message::stream::ReadStream>>()
+                .cloned();
 
             request.extensions_mut().insert(local_agent);
             if let Some(remote_agent) = remote_agent {
@@ -204,6 +225,12 @@ where
             request.extensions_mut().insert(stream_id);
             request.extensions_mut().insert(protocols);
             if is_connect {
+                if let Some(remain_read_stream) = remain_read_stream {
+                    request.extensions_mut().insert(TakeoverSlot::new(
+                        remain_read_stream,
+                        remain_write_stream.clone(),
+                    ));
+                }
                 request.extensions_mut().insert(remain_write_stream);
             }
 
@@ -249,24 +276,38 @@ where
     fn serve<'s>(&self, req: &'s mut Request, resp: &'s mut Response) -> Self::Future<'s> {
         let service = self.0.clone();
         Box::pin(async move {
-            let read_stream = req.read_stream().take();
+            let mut read_stream = Some(req.read_stream().take());
             let mut write_stream = resp.write_stream().take();
 
             let is_connect = req.method() == Method::CONNECT;
 
             let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
             let request = if is_connect {
+                let remain_read_stream = RemainStream::immediately(
+                    read_stream
+                        .take()
+                        .expect("connect request must have read stream"),
+                );
                 http::Request::builder()
                     .method(req.method())
                     .uri(req.uri())
-                    .extension(RemainStream::immediately(read_stream))
+                    .extension(TakeoverSlot::new(
+                        remain_read_stream.clone(),
+                        remain_write_stream.clone(),
+                    ))
+                    .extension(remain_read_stream)
                     .extension(remain_write_stream)
                     .body(UnsyncBoxBody::new(Empty::new().map_err(|n| match n {})))
             } else {
                 http::Request::builder()
                     .method(req.method())
                     .uri(req.uri())
-                    .body(UnsyncBoxBody::new(read_stream.into_hyper_body()))
+                    .body(UnsyncBoxBody::new(
+                        read_stream
+                            .take()
+                            .expect("non-connect request must have read stream")
+                            .into_hyper_body(),
+                    ))
             };
 
             let mut request = match request {
@@ -357,6 +398,10 @@ where
             tracing::debug!("Converted request stream to hyper request, serving...");
             let is_connect = request.method() == Method::CONNECT;
             let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
+            let remain_read_stream = request
+                .extensions()
+                .get::<RemainStream<crate::message::stream::ReadStream>>()
+                .cloned();
 
             request.extensions_mut().insert(local_agent);
             if let Some(remote_agent) = remote_agent {
@@ -365,6 +410,12 @@ where
             request.extensions_mut().insert(stream_id);
             request.extensions_mut().insert(protocols);
             if is_connect {
+                if let Some(remain_read_stream) = remain_read_stream {
+                    request.extensions_mut().insert(TakeoverSlot::new(
+                        remain_read_stream,
+                        remain_write_stream.clone(),
+                    ));
+                }
                 request.extensions_mut().insert(remain_write_stream);
             }
 

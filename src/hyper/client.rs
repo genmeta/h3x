@@ -8,7 +8,10 @@ use crate::{
     hyper::SendMessageError,
     message::stream::{
         InitialMessageStreamError, MessageStreamError,
-        hyper::{read::Either, upgrade::RemainStream},
+        hyper::{
+            read::Either,
+            upgrade::{RemainStream, TakeoverSlot},
+        },
     },
     quic,
 };
@@ -93,9 +96,12 @@ impl<C: quic::Connection> Connection<C> {
             Either::left(read_stream.into_hyper_body())
         } else {
             let read_stream = RemainStream::immediately(read_stream);
-            response_parts.extensions.insert(read_stream);
             let write_stream = RemainStream::immediately(write_stream);
-            response_parts.extensions.insert(write_stream);
+            response_parts
+                .extensions
+                .insert(TakeoverSlot::new(read_stream.clone(), write_stream.clone()));
+            response_parts.extensions.insert(read_stream.clone());
+            response_parts.extensions.insert(write_stream.clone());
             Either::right(Empty::new().map_err(|never| match never {}))
         };
 

@@ -1,25 +1,48 @@
 pub mod upgrade {
-    use std::future::poll_fn;
-
-    use crate::message::stream::{ReadStream, WriteStream, hyper::upgrade::Sealed};
+    use crate::hyper::takeover;
     pub use crate::message::stream::{
-        hyper::upgrade::HasRemainingStream,
+        hyper::upgrade::{HasTakeover, TakeoverError},
         unfold::{read::BoxStreamReader, write::BoxStreamWriter},
     };
 
     pub async fn on(
-        mut message: impl HasRemainingStream<ReadStream> + HasRemainingStream<WriteStream>,
+        message: impl HasTakeover,
     ) -> Option<(BoxStreamReader<'static>, BoxStreamWriter<'static>)> {
-        let write_stream = poll_fn(|cx| Sealed::<WriteStream>::poll_extract(&mut message, cx))
-            .await?
-            .await?;
-        let read_stream = poll_fn(|cx| Sealed::<ReadStream>::poll_extract(&mut message, cx))
-            .await?
-            .await?;
-        Some((
-            read_stream.into_box_reader(),
-            write_stream.into_box_writer(),
-        ))
+        let pending = match takeover::take(message).await {
+            Ok(Some(pending)) => pending,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::debug!(
+                    ?error,
+                    "Compatibility upgrade::on mapped explicit takeover error to None"
+                );
+                return None;
+            }
+        };
+
+        match pending.wait().await {
+            Ok(streams) => Some(streams),
+            Err(error) => {
+                tracing::debug!(
+                    ?error,
+                    "Compatibility upgrade::on mapped takeover wait error to None"
+                );
+                None
+            }
+        }
+    }
+}
+
+pub mod takeover {
+    use std::future::poll_fn;
+
+    use crate::message::stream::hyper::upgrade::TakeoverSealed;
+    pub use crate::message::stream::hyper::upgrade::{HasTakeover, PendingTakeover, TakeoverError};
+
+    pub async fn take(
+        mut message: impl HasTakeover,
+    ) -> Result<Option<PendingTakeover>, TakeoverError> {
+        poll_fn(|cx| TakeoverSealed::poll_takeover(&mut message, cx)).await
     }
 }
 
@@ -31,3 +54,43 @@ pub use crate::message::stream::hyper::write::SendMessageError;
 
 pub mod client;
 pub mod server;
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use bytes::Bytes;
+    use http_body::{Body, Frame};
+
+    use super::{takeover, upgrade};
+
+    #[derive(Debug, Clone)]
+    struct ErrorBody;
+
+    impl Body for ErrorBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(Some(Err(std::io::Error::other("body error"))))
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_takeover_surfaces_error_where_compat_returns_none() {
+        let explicit = takeover::take(http::Request::new(ErrorBody)).await;
+        assert!(matches!(
+            explicit,
+            Err(crate::message::stream::hyper::upgrade::TakeoverError::BodyNotReleased)
+        ));
+
+        let compat = upgrade::on(http::Request::new(ErrorBody)).await;
+        assert!(compat.is_none());
+    }
+}
