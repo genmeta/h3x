@@ -290,14 +290,17 @@ mod tests {
         sync::Arc,
     };
 
-    use futures::future::BoxFuture;
+    use tokio_util::task::AbortOnDropHandle;
 
+    use super::ReuseableConnection;
     use crate::{
-        codec::{ErasedPeekableBiStream, ErasedPeekableUniStream},
-        connection::{ConnectionBuilder, StreamError},
-        dhttp::settings::{Setting, Settings},
-        protocol::{ProductProtocol, Protocol, StreamVerdict},
-        quic::{self, ConnectionError},
+        connection::{Connection, ConnectionBuilder, ConnectionState},
+        dhttp::{
+            goaway::Goaway,
+            protocol::DHttpProtocol,
+            settings::{Setting, Settings},
+        },
+        quic,
         varint::VarInt,
     };
 
@@ -305,42 +308,6 @@ mod tests {
         let mut hasher = DefaultHasher::new();
         val.hash(&mut hasher);
         hasher.finish()
-    }
-
-    /// Local mock protocol for pool tests.
-    #[derive(Debug)]
-    struct MockProtocol;
-
-    impl Protocol for MockProtocol {
-        fn accept_uni<'a>(
-            &'a self,
-            stream: ErasedPeekableUniStream,
-        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
-            Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
-        }
-
-        fn accept_bi<'a>(
-            &'a self,
-            stream: ErasedPeekableBiStream,
-        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
-            Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
-        }
-    }
-
-    /// Local mock factory for pool tests.
-    #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-    struct MockFactory(u64);
-
-    impl<C: quic::Connection> ProductProtocol<C> for MockFactory {
-        type Protocol = MockProtocol;
-
-        fn init<'a>(
-            &'a self,
-            _: &'a Arc<C>,
-            _: &'a crate::protocol::Protocols,
-        ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
-            unimplemented!("not used in pool key tests")
-        }
     }
 
     #[cfg(feature = "gm-quic")]
@@ -378,5 +345,60 @@ mod tests {
             key_a, key_b,
             "identical protocol stacks must produce the same pool key"
         );
+    }
+
+    fn test_connection_error(reason: &str) -> quic::ConnectionError {
+        quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(0x01),
+                frame_type: VarInt::from_u32(0x00),
+                reason: reason.to_owned().into(),
+            },
+        }
+    }
+
+    fn abort_handle() -> AbortOnDropHandle<()> {
+        AbortOnDropHandle::new(tokio::spawn(async {}))
+    }
+
+    async fn reusable_connection(
+        connection: Connection<crate::connection::tests::MockConnection>,
+    ) -> Arc<ReuseableConnection<crate::connection::tests::MockConnection>> {
+        let reusable = Arc::new(ReuseableConnection::pending());
+        reusable.insert(Arc::new(connection), abort_handle()).await;
+        reusable
+    }
+
+    #[tokio::test]
+    async fn reuse_returns_none_when_connection_is_unhealthy() {
+        let quic = crate::connection::tests::MockConnection::new();
+        quic.set_check_result(Err(test_connection_error("broken")));
+
+        let state = ConnectionState::new_for_test(
+            Arc::new(quic),
+            Arc::new(crate::protocol::Protocols::new()),
+        );
+        let reusable = reusable_connection(Connection::from_state_for_test(state)).await;
+
+        assert!(reusable.reuse().is_none());
+    }
+
+    #[tokio::test]
+    async fn reuse_returns_none_when_peer_goaway_blocks_new_streams() {
+        let quic = crate::connection::tests::MockConnection::new();
+        quic.set_check_result(Ok(()));
+
+        let protocols = {
+            let mut protocols = crate::protocol::Protocols::new();
+            protocols.insert(DHttpProtocol::new_for_test(Arc::new(quic.clone())));
+            Arc::new(protocols)
+        };
+        let state = ConnectionState::new_for_test(Arc::new(quic), protocols);
+        let dhttp = state.dhttp();
+        dhttp.max_received_stream_id.set(VarInt::from_u32(9));
+        dhttp.peer_goaway.set(Goaway::new(VarInt::from_u32(9)));
+
+        let reusable = reusable_connection(Connection::from_state_for_test(state)).await;
+        assert!(reusable.reuse().is_none());
     }
 }

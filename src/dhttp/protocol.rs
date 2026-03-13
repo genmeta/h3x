@@ -402,6 +402,20 @@ impl DHttpProtocol {
         matches!(raw, 0x00 | 0x01 | 0x03 | 0x04 | 0x05 | 0x07 | 0x0d)
             || (raw >= 0x21 && (raw - 0x21).is_multiple_of(0x1f))
     }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(connection: Arc<dyn ErasedConnection>) -> Self {
+        let sink: BoxSink<'static, Frame<BufList>, StreamError> =
+            Box::pin(futures::sink::drain().sink_map_err(|never| match never {}));
+
+        Self {
+            state: Arc::new(DHttpState::new(Arc::new(Settings::default()))),
+            connection,
+            control_stream: AsyncMutex::new(Feed::new(sink)),
+            handle_control_stream: SetOnce::new(),
+            unresolved_request_streams: RingChannel::new(32),
+        }
+    }
 }
 
 impl Protocol for DHttpProtocol {

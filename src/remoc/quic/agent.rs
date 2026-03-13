@@ -47,16 +47,14 @@ pub trait RemoteAgent: Send + Sync {
     ) -> Result<bool, quic::ConnectionError>;
 }
 
-/// Client-side wrapper around [`RemoteLocalAgentClient`] that caches synchronous
-/// fields eagerly and implements [`agent::LocalAgent`].
-pub struct RemoteLocalAgent {
+pub struct CachedLocalAgent {
     client: LocalAgentClient,
     name: String,
     cert_chain: Vec<CertificateDer<'static>>,
     sign_algorithm: rustls::SignatureAlgorithm,
 }
 
-impl std::fmt::Debug for RemoteLocalAgent {
+impl std::fmt::Debug for CachedLocalAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedRemoteLocalAgent")
             .field("name", &self.name)
@@ -65,7 +63,7 @@ impl std::fmt::Debug for RemoteLocalAgent {
     }
 }
 
-impl RemoteLocalAgent {
+impl CachedLocalAgent {
     /// Create a new cached wrapper by eagerly fetching synchronous fields from
     /// the remote agent.
     pub async fn new(client: LocalAgentClient) -> Result<Self, quic::ConnectionError> {
@@ -86,7 +84,7 @@ impl RemoteLocalAgent {
     }
 }
 
-impl agent::LocalAgent for RemoteLocalAgent {
+impl agent::LocalAgent for CachedLocalAgent {
     fn name(&self) -> &str {
         &self.name
     }
@@ -118,7 +116,7 @@ impl agent::LocalAgent for RemoteLocalAgent {
     }
 
     fn public_key(&self) -> SubjectPublicKeyInfoDer<'_> {
-        agent::extract_public_key(self.cert_chain())
+        agent::extract_public_key(quic::agent::LocalAgent::cert_chain(self))
     }
 
     fn verify(
@@ -127,21 +125,24 @@ impl agent::LocalAgent for RemoteLocalAgent {
         data: &[u8],
         signature: &[u8],
     ) -> BoxFuture<'_, Result<bool, VerifyError>> {
-        let result = agent::verify_signature(self.public_key(), scheme, data, signature);
+        let result = agent::verify_signature(
+            quic::agent::LocalAgent::public_key(self),
+            scheme,
+            data,
+            signature,
+        );
         Box::pin(std::future::ready(result))
     }
 }
 
-/// Client-side wrapper around [`RemoteRemoteAgentClient`] that caches synchronous
-/// fields eagerly and implements [`agent::RemoteAgent`].
-pub struct RemoteRemoteAgent {
+pub struct CachedRemoteAgent {
     #[allow(dead_code)]
     client: RemoteAgentClient,
     name: String,
     cert_chain: Vec<CertificateDer<'static>>,
 }
 
-impl std::fmt::Debug for RemoteRemoteAgent {
+impl std::fmt::Debug for CachedRemoteAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedRemoteRemoteAgent")
             .field("name", &self.name)
@@ -149,7 +150,7 @@ impl std::fmt::Debug for RemoteRemoteAgent {
     }
 }
 
-impl RemoteRemoteAgent {
+impl CachedRemoteAgent {
     /// Create a new cached wrapper by eagerly fetching synchronous fields from
     /// the remote agent.
     pub async fn new(client: RemoteAgentClient) -> Result<Self, quic::ConnectionError> {
@@ -168,7 +169,7 @@ impl RemoteRemoteAgent {
     }
 }
 
-impl agent::RemoteAgent for RemoteRemoteAgent {
+impl agent::RemoteAgent for CachedRemoteAgent {
     fn name(&self) -> &str {
         &self.name
     }
@@ -178,7 +179,7 @@ impl agent::RemoteAgent for RemoteRemoteAgent {
     }
 
     fn public_key(&self) -> SubjectPublicKeyInfoDer<'_> {
-        agent::extract_public_key(self.cert_chain())
+        agent::extract_public_key(quic::agent::RemoteAgent::cert_chain(self))
     }
 
     fn verify(
@@ -187,38 +188,26 @@ impl agent::RemoteAgent for RemoteRemoteAgent {
         data: &[u8],
         signature: &[u8],
     ) -> BoxFuture<'_, Result<bool, VerifyError>> {
-        let result = agent::verify_signature(self.public_key(), scheme, data, signature);
+        let result = agent::verify_signature(
+            quic::agent::RemoteAgent::public_key(self),
+            scheme,
+            data,
+            signature,
+        );
         Box::pin(std::future::ready(result))
     }
 }
 
-/// Server-side wrapper that implements the remoc [`LocalAgent`] RTC trait
-/// for any local [`agent::LocalAgent`] implementation.
-///
-/// Uses generics instead of dynamic dispatch. Stores the agent directly
-/// since the RTC trait uses `&self` methods.
-pub struct LocalLocalAgent<A> {
-    inner: A,
-}
-
-impl<A> LocalLocalAgent<A> {
-    /// Wrap a local agent so it can be served over remoc RTC.
-    pub fn new(agent: A) -> Self {
-        Self { inner: agent }
-    }
-}
-
-impl<A> LocalAgent for LocalLocalAgent<A>
+impl<A> LocalAgent for A
 where
     A: agent::LocalAgent + Send + Sync,
 {
     async fn name(&self) -> Result<String, quic::ConnectionError> {
-        Ok(self.inner.name().to_owned())
+        Ok(agent::LocalAgent::name(self).to_owned())
     }
 
     async fn cert_chain(&self) -> Result<Vec<SerdeCertificateDer>, quic::ConnectionError> {
         Ok(self
-            .inner
             .cert_chain()
             .iter()
             .cloned()
@@ -227,7 +216,9 @@ where
     }
 
     async fn sign_algorithm(&self) -> Result<SerdeSignatureAlgorithm, quic::ConnectionError> {
-        Ok(SerdeSignatureAlgorithm::from(self.inner.sign_algorithm()))
+        Ok(SerdeSignatureAlgorithm::from(
+            agent::LocalAgent::sign_algorithm(self),
+        ))
     }
 
     async fn sign(
@@ -235,8 +226,7 @@ where
         scheme: SerdeSignatureScheme,
         data: Vec<u8>,
     ) -> Result<Vec<u8>, quic::ConnectionError> {
-        self.inner
-            .sign(SignatureScheme::from(scheme), &data)
+        agent::LocalAgent::sign(self, SignatureScheme::from(scheme), &data)
             .await
             .map_err(|e| quic::ConnectionError::Transport {
                 source: quic::TransportError {
@@ -248,7 +238,9 @@ where
     }
 
     async fn public_key(&self) -> Result<SerdeSubjectPublicKeyInfoDer, quic::ConnectionError> {
-        Ok(SerdeSubjectPublicKeyInfoDer::from(self.inner.public_key()))
+        Ok(SerdeSubjectPublicKeyInfoDer::from(
+            agent::LocalAgent::public_key(self),
+        ))
     }
 
     async fn verify(
@@ -257,8 +249,7 @@ where
         data: Vec<u8>,
         signature: Vec<u8>,
     ) -> Result<bool, quic::ConnectionError> {
-        self.inner
-            .verify(SignatureScheme::from(scheme), &data, &signature)
+        agent::LocalAgent::verify(self, SignatureScheme::from(scheme), &data, &signature)
             .await
             .map_err(|e| quic::ConnectionError::Transport {
                 source: quic::TransportError {
@@ -270,33 +261,16 @@ where
     }
 }
 
-/// Server-side wrapper that implements the remoc [`RemoteAgent`] RTC trait
-/// for any local [`agent::RemoteAgent`] implementation.
-///
-/// Uses generics instead of dynamic dispatch. Stores the agent directly
-/// since the RTC trait uses `&self` methods.
-pub struct LocalRemoteAgent<A> {
-    inner: A,
-}
-
-impl<A> LocalRemoteAgent<A> {
-    /// Wrap a remote agent so it can be served over remoc RTC.
-    pub fn new(agent: A) -> Self {
-        Self { inner: agent }
-    }
-}
-
-impl<A> RemoteAgent for LocalRemoteAgent<A>
+impl<A> RemoteAgent for A
 where
     A: agent::RemoteAgent + Send + Sync,
 {
     async fn name(&self) -> Result<String, quic::ConnectionError> {
-        Ok(self.inner.name().to_owned())
+        Ok(agent::RemoteAgent::name(self).to_owned())
     }
 
     async fn cert_chain(&self) -> Result<Vec<SerdeCertificateDer>, quic::ConnectionError> {
         Ok(self
-            .inner
             .cert_chain()
             .iter()
             .cloned()
@@ -305,7 +279,9 @@ where
     }
 
     async fn public_key(&self) -> Result<SerdeSubjectPublicKeyInfoDer, quic::ConnectionError> {
-        Ok(SerdeSubjectPublicKeyInfoDer::from(self.inner.public_key()))
+        Ok(SerdeSubjectPublicKeyInfoDer::from(
+            agent::RemoteAgent::public_key(self),
+        ))
     }
 
     async fn verify(
@@ -314,8 +290,7 @@ where
         data: Vec<u8>,
         signature: Vec<u8>,
     ) -> Result<bool, quic::ConnectionError> {
-        self.inner
-            .verify(SignatureScheme::from(scheme), &data, &signature)
+        agent::RemoteAgent::verify(self, SignatureScheme::from(scheme), &data, &signature)
             .await
             .map_err(|e| quic::ConnectionError::Transport {
                 source: quic::TransportError {
@@ -325,4 +300,16 @@ where
                 },
             })
     }
+}
+
+pub async fn local_agent_from_client(
+    client: LocalAgentClient,
+) -> Result<CachedLocalAgent, quic::ConnectionError> {
+    CachedLocalAgent::new(client).await
+}
+
+pub async fn remote_agent_from_client(
+    client: RemoteAgentClient,
+) -> Result<CachedRemoteAgent, quic::ConnectionError> {
+    CachedRemoteAgent::new(client).await
 }

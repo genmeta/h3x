@@ -53,7 +53,6 @@ impl UnresolvedRequest {
         };
         Ok((request, response))
     }
-
 }
 
 impl IntoFuture for UnresolvedRequest {

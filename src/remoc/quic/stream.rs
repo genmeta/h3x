@@ -1,16 +1,19 @@
 use std::{
-    future::{Future, poll_fn},
+    future::poll_fn,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll, ready},
 };
 
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt, future::Either};
-use remoc::prelude::ServerSharedMut;
 use tokio_util::sync::CancellationToken;
 
-use crate::{quic, varint::VarInt};
+use crate::{
+    dhttp::protocol::{BoxDynQuicStreamReader, BoxDynQuicStreamWriter},
+    quic,
+    util::try_future::TryFuture,
+    varint::VarInt,
+};
 
 /// Remote trait for reading from a QUIC stream over remoc RTC.
 ///
@@ -24,9 +27,9 @@ pub trait ReadStream: Send + Sync {
 }
 
 pin_project_lite::pin_project! {
-    #[project = RemoteReadStreamStateProj]
-    #[project_replace = RemoteReadStreamStateReplace]
-    enum RemoteReadStreamState<St, RF, SF> {
+    #[project = ReadStreamBridgeStateProj]
+    #[project_replace = ReadStreamBridgeStateReplace]
+    enum ReadStreamBridgeState<St, RF, SF> {
         Stream {
             stream: St
         },
@@ -42,27 +45,27 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl<St, RF, SF> RemoteReadStreamState<St, RF, SF> {
+impl<St, RF, SF> ReadStreamBridgeState<St, RF, SF> {
     fn take_stream(self: Pin<&mut Self>) -> St {
-        match self.project_replace(RemoteReadStreamState::Empty) {
-            RemoteReadStreamStateReplace::Stream { stream } => stream,
+        match self.project_replace(ReadStreamBridgeState::Empty) {
+            ReadStreamBridgeStateReplace::Stream { stream } => stream,
             _ => unreachable!("invalid state for take_stream"),
         }
     }
 }
 
 pin_project_lite::pin_project! {
-    struct RemoteReadStreamInner<R, RF, S, SF> {
+    struct ReadStreamBridge<R, RF, S, SF> {
         stream_id: VarInt,
         #[pin]
-        state: RemoteReadStreamState<ReadStreamClient, RF, SF>,
+        state: ReadStreamBridgeState<ReadStreamClient, RF, SF>,
 
         read: R,
         stop: S,
     }
 }
 
-impl<R, RF, S, SF> quic::GetStreamId for RemoteReadStreamInner<R, RF, S, SF> {
+impl<R, RF, S, SF> quic::GetStreamId for ReadStreamBridge<R, RF, S, SF> {
     fn poll_stream_id(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -72,7 +75,7 @@ impl<R, RF, S, SF> quic::GetStreamId for RemoteReadStreamInner<R, RF, S, SF> {
     }
 }
 
-impl<R, RF, S, SF> Stream for RemoteReadStreamInner<R, RF, S, SF>
+impl<R, RF, S, SF> Stream for ReadStreamBridge<R, RF, S, SF>
 where
     R: Fn(ReadStreamClient, CancellationToken) -> RF,
     RF: Future<
@@ -92,38 +95,38 @@ where
 
         loop {
             match state.as_mut().project() {
-                RemoteReadStreamStateProj::Stream { .. } => {
+                ReadStreamBridgeStateProj::Stream { .. } => {
                     let stream = state.as_mut().take_stream();
                     let cancellation_token = CancellationToken::new();
-                    state.set(RemoteReadStreamState::Read {
+                    state.set(ReadStreamBridgeState::Read {
                         token: cancellation_token.clone(),
                         future: (project.read)(stream, cancellation_token),
                     });
                 }
-                RemoteReadStreamStateProj::Read { future, .. } => {
+                ReadStreamBridgeStateProj::Read { future, .. } => {
                     match ready!(future.poll(cx)) {
                         // completed without cancellation
                         Either::Left((stream, result)) => {
-                            state.set(RemoteReadStreamState::Stream { stream });
+                            state.set(ReadStreamBridgeState::Stream { stream });
                             return Poll::Ready(result);
                         }
                         Either::Right(stream) => {
-                            state.set(RemoteReadStreamState::Stream { stream });
+                            state.set(ReadStreamBridgeState::Stream { stream });
                         }
                     };
                 }
-                RemoteReadStreamStateProj::Stop { future, .. } => {
+                ReadStreamBridgeStateProj::Stop { future, .. } => {
                     let (stream, result) = ready!(future.poll(cx));
-                    state.set(RemoteReadStreamState::Stream { stream });
+                    state.set(ReadStreamBridgeState::Stream { stream });
                     result?;
                 }
-                RemoteReadStreamStateProj::Empty => unreachable!("invalid state for poll_next"),
+                ReadStreamBridgeStateProj::Empty => unreachable!("invalid state for poll_next"),
             };
         }
     }
 }
 
-impl<R, RF, S, SF> quic::StopStream for RemoteReadStreamInner<R, RF, S, SF>
+impl<R, RF, S, SF> quic::StopStream for ReadStreamBridge<R, RF, S, SF>
 where
     R: Fn(ReadStreamClient, CancellationToken) -> RF,
     RF: Future<
@@ -145,25 +148,25 @@ where
 
         loop {
             let stream = match state.as_mut().project() {
-                RemoteReadStreamStateProj::Stream { .. } => state.as_mut().take_stream(),
-                RemoteReadStreamStateProj::Read { future, token } => {
+                ReadStreamBridgeStateProj::Stream { .. } => state.as_mut().take_stream(),
+                ReadStreamBridgeStateProj::Read { future, token } => {
                     token.cancel();
                     let (Either::Left((stream, ..)) | Either::Right(stream)) =
                         ready!(future.poll(cx));
                     stream
                 }
-                RemoteReadStreamStateProj::Stop { future, code: sent } => {
+                ReadStreamBridgeStateProj::Stop { future, code: sent } => {
                     let (stream, result) = ready!(future.poll(cx));
                     if *sent == code {
-                        state.set(RemoteReadStreamState::Stream { stream });
+                        state.set(ReadStreamBridgeState::Stream { stream });
                         return Poll::Ready(result);
                     } else {
                         stream
                     }
                 }
-                RemoteReadStreamStateProj::Empty => unreachable!("invalid state for poll_stop"),
+                ReadStreamBridgeStateProj::Empty => unreachable!("invalid state for poll_stop"),
             };
-            state.set(RemoteReadStreamState::Stop {
+            state.set(ReadStreamBridgeState::Stop {
                 code,
                 future: (project.stop)(stream, code),
             })
@@ -174,9 +177,9 @@ where
 pub async fn new_remote_read_stream(
     mut client: ReadStreamClient,
 ) -> Result<impl quic::ReadStream, quic::StreamError> {
-    Ok(RemoteReadStreamInner {
+    Ok(ReadStreamBridge {
         stream_id: client.stream_id().await?,
-        state: RemoteReadStreamState::Stream { stream: client },
+        state: ReadStreamBridgeState::Stream { stream: client },
         read: |mut client: ReadStreamClient, token: CancellationToken| async move {
             tokio::select! {
                 res = client.read() => Either::Left((client, res.transpose())),
@@ -190,31 +193,8 @@ pub async fn new_remote_read_stream(
     })
 }
 
-/// Serializable wrapper around a remoc-generated [`ReadStreamClient`].
-///
-/// Unlike [`RemoteQuicConnection`](super::RemoteQuicConnection) which directly
-/// implements the `quic::Connection` trait, `RemoteReadStream` requires an
-/// explicit [`into_quic`](Self::into_quic) conversion step because the standard
-/// `quic::ReadStream` trait uses poll-based methods (`Stream`, `StopStream`)
-/// that cannot directly bridge to the async RTC client methods.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct RemoteReadStream {
-    client: ReadStreamClient,
-}
-
-impl RemoteReadStream {
-    /// Create a new wrapper from a remoc-generated read stream client.
-    pub fn new(client: ReadStreamClient) -> Self {
-        Self { client }
-    }
-
-    /// Convert into a type implementing [`quic::ReadStream`].
-    ///
-    /// This async step is necessary because the poll-based `quic::ReadStream`
-    /// trait requires an initial `stream_id` query from the remote side.
-    pub async fn into_quic(self) -> Result<impl quic::ReadStream, quic::StreamError> {
-        new_remote_read_stream(self.client).await
-    }
+pub fn read_stream_client_into_quic(client: ReadStreamClient) -> BoxDynQuicStreamReader {
+    Box::pin(TryFuture::from(new_remote_read_stream(client))) as BoxDynQuicStreamReader
 }
 
 /// Remote trait for writing to a QUIC stream over remoc RTC.
@@ -231,9 +211,9 @@ pub trait WriteStream: Send + Sync {
 }
 
 pin_project_lite::pin_project! {
-    #[project = RemoteWriteStreamStateProj]
-    #[project_replace = RemoteWriteStreamStateReplace]
-    enum RemoteWriteStreamState<St, WF, FF, SF, CF> {
+    #[project = WriteStreamBridgeStateProj]
+    #[project_replace = WriteStreamBridgeStateReplace]
+    enum WriteStreamBridgeState<St, WF, FF, SF, CF> {
         Stream {
             stream: St
         },
@@ -257,20 +237,20 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl<St, WF, FF, SF, CF> RemoteWriteStreamState<St, WF, FF, SF, CF> {
+impl<St, WF, FF, SF, CF> WriteStreamBridgeState<St, WF, FF, SF, CF> {
     fn take_stream(self: Pin<&mut Self>) -> St {
-        match self.project_replace(RemoteWriteStreamState::Empty) {
-            RemoteWriteStreamStateReplace::Stream { stream } => stream,
+        match self.project_replace(WriteStreamBridgeState::Empty) {
+            WriteStreamBridgeStateReplace::Stream { stream } => stream,
             _ => unreachable!("invalid state for take_stream, maybe poll_send before poll_ready"),
         }
     }
 }
 
 pin_project_lite::pin_project! {
-    struct RemoteWriteStreamInner<W, WF, F, FF, S, SF, C, CF> {
+    struct WriteStreamBridge<W, WF, F, FF, S, SF, C, CF> {
         stream_id: VarInt,
         #[pin]
-        state: RemoteWriteStreamState<WriteStreamClient, WF, FF, SF, CF>,
+        state: WriteStreamBridgeState<WriteStreamClient, WF, FF, SF, CF>,
 
         write: W,
         flush: F,
@@ -280,7 +260,7 @@ pin_project_lite::pin_project! {
 }
 
 impl<W, WF, F, FF, S, SF, C, CF> quic::GetStreamId
-    for RemoteWriteStreamInner<W, WF, F, FF, S, SF, C, CF>
+    for WriteStreamBridge<W, WF, F, FF, S, SF, C, CF>
 {
     fn poll_stream_id(
         self: Pin<&mut Self>,
@@ -291,7 +271,7 @@ impl<W, WF, F, FF, S, SF, C, CF> quic::GetStreamId
     }
 }
 
-impl<W, WF, F, FF, S, SF, C, CF> Sink<Bytes> for RemoteWriteStreamInner<W, WF, F, FF, S, SF, C, CF>
+impl<W, WF, F, FF, S, SF, C, CF> Sink<Bytes> for WriteStreamBridge<W, WF, F, FF, S, SF, C, CF>
 where
     W: Fn(WriteStreamClient, CancellationToken, Bytes) -> WF,
     WF: Future<
@@ -316,46 +296,46 @@ where
 
         loop {
             match state.as_mut().project() {
-                RemoteWriteStreamStateProj::Stream { .. } => return Poll::Ready(Ok(())),
-                RemoteWriteStreamStateProj::Write { future, .. } => {
+                WriteStreamBridgeStateProj::Stream { .. } => return Poll::Ready(Ok(())),
+                WriteStreamBridgeStateProj::Write { future, .. } => {
                     match ready!(future.poll(cx)) {
                         Either::Left((stream, result)) => {
-                            state.set(RemoteWriteStreamState::Stream { stream });
+                            state.set(WriteStreamBridgeState::Stream { stream });
                             result?;
                         }
                         Either::Right(stream) => {
-                            state.set(RemoteWriteStreamState::Stream { stream });
+                            state.set(WriteStreamBridgeState::Stream { stream });
                         }
                     };
                 }
-                RemoteWriteStreamStateProj::Flush { future, .. } => {
+                WriteStreamBridgeStateProj::Flush { future, .. } => {
                     match ready!(future.poll(cx)) {
                         Either::Left((stream, result)) => {
-                            state.set(RemoteWriteStreamState::Stream { stream });
+                            state.set(WriteStreamBridgeState::Stream { stream });
                             result?;
                         }
                         Either::Right(stream) => {
-                            state.set(RemoteWriteStreamState::Stream { stream });
+                            state.set(WriteStreamBridgeState::Stream { stream });
                         }
                     };
                 }
-                RemoteWriteStreamStateProj::Shutdown { future, .. } => {
+                WriteStreamBridgeStateProj::Shutdown { future, .. } => {
                     match ready!(future.poll(cx)) {
                         Either::Left((stream, result)) => {
-                            state.set(RemoteWriteStreamState::Stream { stream });
+                            state.set(WriteStreamBridgeState::Stream { stream });
                             result?;
                         }
                         Either::Right(stream) => {
-                            state.set(RemoteWriteStreamState::Stream { stream });
+                            state.set(WriteStreamBridgeState::Stream { stream });
                         }
                     };
                 }
-                RemoteWriteStreamStateProj::Cancel { future, .. } => {
+                WriteStreamBridgeStateProj::Cancel { future, .. } => {
                     let (stream, result) = ready!(future.poll(cx));
-                    state.set(RemoteWriteStreamState::Stream { stream });
+                    state.set(WriteStreamBridgeState::Stream { stream });
                     result?;
                 }
-                RemoteWriteStreamStateProj::Empty => unreachable!("invalid state for poll_ready"),
+                WriteStreamBridgeStateProj::Empty => unreachable!("invalid state for poll_ready"),
             };
         }
     }
@@ -366,7 +346,7 @@ where
 
         let stream = state.as_mut().take_stream();
         let cancellation_token = CancellationToken::new();
-        state.set(RemoteWriteStreamState::Write {
+        state.set(WriteStreamBridgeState::Write {
             token: cancellation_token.clone(),
             future: (project.write)(stream, cancellation_token, bytes),
         });
@@ -375,7 +355,7 @@ where
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         loop {
-            let is_flush = matches!(self.state, RemoteWriteStreamState::Flush { .. });
+            let is_flush = matches!(self.state, WriteStreamBridgeState::Flush { .. });
 
             ready!(self.as_mut().poll_ready(cx)?);
             if is_flush {
@@ -387,7 +367,7 @@ where
 
             let stream = state.as_mut().take_stream();
             let cancellation_token = CancellationToken::new();
-            state.set(RemoteWriteStreamState::Flush {
+            state.set(WriteStreamBridgeState::Flush {
                 token: cancellation_token.clone(),
                 future: (project.flush)(stream, cancellation_token),
             });
@@ -396,7 +376,7 @@ where
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         loop {
-            let is_shutdown = matches!(self.state, RemoteWriteStreamState::Flush { .. });
+            let is_shutdown = matches!(self.state, WriteStreamBridgeState::Flush { .. });
 
             ready!(self.as_mut().poll_ready(cx)?);
             if is_shutdown {
@@ -408,7 +388,7 @@ where
 
             let stream = state.as_mut().take_stream();
             let cancellation_token = CancellationToken::new();
-            state.set(RemoteWriteStreamState::Shutdown {
+            state.set(WriteStreamBridgeState::Shutdown {
                 token: cancellation_token.clone(),
                 future: (project.shutdown)(stream, cancellation_token),
             });
@@ -417,7 +397,7 @@ where
 }
 
 impl<W, WF, F, FF, S, SF, C, CF> quic::CancelStream
-    for RemoteWriteStreamInner<W, WF, F, FF, S, SF, C, CF>
+    for WriteStreamBridge<W, WF, F, FF, S, SF, C, CF>
 where
     W: Fn(WriteStreamClient, CancellationToken, Bytes) -> WF,
     WF: Future<
@@ -444,37 +424,37 @@ where
 
         loop {
             let stream = match state.as_mut().project() {
-                RemoteWriteStreamStateProj::Stream { .. } => state.as_mut().take_stream(),
-                RemoteWriteStreamStateProj::Write { future, token } => {
+                WriteStreamBridgeStateProj::Stream { .. } => state.as_mut().take_stream(),
+                WriteStreamBridgeStateProj::Write { future, token } => {
                     token.cancel();
                     let (Either::Left((stream, ..)) | Either::Right(stream)) =
                         ready!(future.poll(cx));
                     stream
                 }
-                RemoteWriteStreamStateProj::Flush { future, token } => {
+                WriteStreamBridgeStateProj::Flush { future, token } => {
                     token.cancel();
                     let (Either::Left((stream, ..)) | Either::Right(stream)) =
                         ready!(future.poll(cx));
                     stream
                 }
-                RemoteWriteStreamStateProj::Shutdown { future, token } => {
+                WriteStreamBridgeStateProj::Shutdown { future, token } => {
                     token.cancel();
                     let (Either::Left((stream, ..)) | Either::Right(stream)) =
                         ready!(future.poll(cx));
                     stream
                 }
-                RemoteWriteStreamStateProj::Cancel { future, code: sent } => {
+                WriteStreamBridgeStateProj::Cancel { future, code: sent } => {
                     let (stream, result) = ready!(future.poll(cx));
                     if *sent == code {
-                        state.set(RemoteWriteStreamState::Stream { stream });
+                        state.set(WriteStreamBridgeState::Stream { stream });
                         return Poll::Ready(result);
                     } else {
                         stream
                     }
                 }
-                RemoteWriteStreamStateProj::Empty => unreachable!("invalid state for poll_cancel"),
+                WriteStreamBridgeStateProj::Empty => unreachable!("invalid state for poll_cancel"),
             };
-            state.set(RemoteWriteStreamState::Cancel {
+            state.set(WriteStreamBridgeState::Cancel {
                 code,
                 future: (project.cancel)(stream, code),
             })
@@ -485,9 +465,9 @@ where
 pub async fn new_remote_write_stream(
     mut client: WriteStreamClient,
 ) -> Result<impl quic::WriteStream, quic::StreamError> {
-    Ok(RemoteWriteStreamInner {
+    Ok(WriteStreamBridge {
         stream_id: client.stream_id().await?,
-        state: RemoteWriteStreamState::Stream { stream: client },
+        state: WriteStreamBridgeState::Stream { stream: client },
         write: |mut client: WriteStreamClient, token: CancellationToken, bytes| async move {
             tokio::select! {
                 res = client.write(bytes) => Either::Left((client, res)),
@@ -513,157 +493,47 @@ pub async fn new_remote_write_stream(
     })
 }
 
-/// Serializable wrapper around a remoc-generated [`WriteStreamClient`].
-///
-/// Unlike [`RemoteQuicConnection`](super::RemoteQuicConnection) which directly
-/// implements the `quic::Connection` trait, `RemoteWriteStream` requires an
-/// explicit [`into_quic`](Self::into_quic) conversion step because the standard
-/// `quic::WriteStream` trait uses poll-based methods (`Sink`, `CancelStream`)
-/// that cannot directly bridge to the async RTC client methods.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct RemoteWriteStream {
-    client: WriteStreamClient,
+pub fn write_stream_client_into_quic(client: WriteStreamClient) -> BoxDynQuicStreamWriter {
+    Box::pin(TryFuture::from(new_remote_write_stream(client))) as BoxDynQuicStreamWriter
 }
 
-impl RemoteWriteStream {
-    /// Create a new wrapper from a remoc-generated write stream client.
-    pub fn new(client: WriteStreamClient) -> Self {
-        Self { client }
-    }
-
-    /// Convert into a type implementing [`quic::WriteStream`].
-    ///
-    /// This async step is necessary because the poll-based `quic::WriteStream`
-    /// trait requires an initial `stream_id` query from the remote side.
-    pub async fn into_quic(self) -> Result<impl quic::WriteStream, quic::StreamError> {
-        new_remote_write_stream(self.client).await
-    }
-}
-
-/// Server-side wrapper that implements the remoc [`ReadStream`] RTC trait
-/// for any local [`quic::ReadStream`] implementation.
-///
-/// Uses generics instead of dynamic dispatch. The inner stream is stored as
-/// `Pin<Box<S>>` to handle poll-based methods that require pinning.
-/// Since the RTC trait provides `&mut self`, exclusive access is guaranteed
-/// and no mutex is needed.
-pub struct LocalReadStream<S> {
-    inner: Pin<Box<S>>,
-}
-
-// SAFETY: `LocalReadStream` is only accessed through `&mut self` methods.
-// The RTC server wraps it in `RwLock` which provides synchronization.
-// The inner `Pin<Box<S>>` is never shared across threads without the lock.
-unsafe impl<S: Send> Sync for LocalReadStream<S> {}
-
-impl<S> LocalReadStream<S>
+impl<S> ReadStream for Pin<Box<S>>
 where
-    S: quic::ReadStream + 'static,
-{
-    /// Wrap a local read stream so it can be served over remoc RTC.
-    pub fn new(stream: S) -> Self {
-        Self {
-            inner: Box::pin(stream),
-        }
-    }
-
-    /// Convert this local read stream into a serializable [`RemoteReadStream`]
-    /// and a future that serves the RTC connection.
-    ///
-    /// The returned future must be polled (e.g. spawned) for the remote stream
-    /// to function. When the future completes, the RTC serving session has ended.
-    pub fn into_remote(self) -> (RemoteReadStream, impl Future<Output = ()> + Send + 'static) {
-        let (server, client) =
-            ReadStreamServerSharedMut::new(Arc::new(tokio::sync::RwLock::new(self)), 1);
-        let remote = RemoteReadStream::new(client);
-        let fut = async move {
-            let _ = server.serve(true).await;
-        };
-        (remote, fut)
-    }
-}
-
-impl<S> ReadStream for LocalReadStream<S>
-where
-    S: quic::ReadStream + Send,
+    S: quic::ReadStream + Send + Sync,
 {
     async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError> {
-        poll_fn(|cx| self.inner.as_mut().poll_stream_id(cx)).await
+        poll_fn(|cx| self.as_mut().poll_stream_id(cx)).await
     }
 
     async fn read(&mut self) -> Result<Option<Bytes>, quic::StreamError> {
-        self.inner.as_mut().next().await.transpose()
+        self.as_mut().next().await.transpose()
     }
 
     async fn stop(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
-        poll_fn(|cx| self.inner.as_mut().poll_stop(cx, code)).await
+        poll_fn(|cx| self.as_mut().poll_stop(cx, code)).await
     }
 }
-
-/// Server-side wrapper that implements the remoc [`WriteStream`] RTC trait
-/// for any local [`quic::WriteStream`] implementation.
-///
-/// Uses generics instead of dynamic dispatch. The inner stream is stored as
-/// `Pin<Box<S>>` to handle poll-based methods that require pinning.
-/// Since the RTC trait provides `&mut self`, exclusive access is guaranteed
-/// and no mutex is needed.
-pub struct LocalWriteStream<S> {
-    inner: Pin<Box<S>>,
-}
-
-// SAFETY: `LocalWriteStream` is only accessed through `&mut self` methods.
-// The RTC server wraps it in `RwLock` which provides synchronization.
-// The inner `Pin<Box<S>>` is never shared across threads without the lock.
-unsafe impl<S: Send> Sync for LocalWriteStream<S> {}
-
-impl<S> LocalWriteStream<S>
+impl<S> WriteStream for Pin<Box<S>>
 where
-    S: quic::WriteStream + 'static,
-{
-    /// Wrap a local write stream so it can be served over remoc RTC.
-    pub fn new(stream: S) -> Self {
-        Self {
-            inner: Box::pin(stream),
-        }
-    }
-
-    /// Convert this local write stream into a serializable [`RemoteWriteStream`]
-    /// and a future that serves the RTC connection.
-    ///
-    /// The returned future must be polled (e.g. spawned) for the remote stream
-    /// to function. When the future completes, the RTC serving session has ended.
-    pub fn into_remote(self) -> (RemoteWriteStream, impl Future<Output = ()> + Send + 'static) {
-        let (server, client) =
-            WriteStreamServerSharedMut::new(Arc::new(tokio::sync::RwLock::new(self)), 1);
-        let remote = RemoteWriteStream::new(client);
-        let fut = async move {
-            let _ = server.serve(true).await;
-        };
-        (remote, fut)
-    }
-}
-
-impl<S> WriteStream for LocalWriteStream<S>
-where
-    S: quic::WriteStream + Send,
+    S: quic::WriteStream + Send + Sync,
 {
     async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError> {
-        poll_fn(|cx| self.inner.as_mut().poll_stream_id(cx)).await
+        poll_fn(|cx| self.as_mut().poll_stream_id(cx)).await
     }
 
     async fn write(&mut self, data: Bytes) -> Result<(), quic::StreamError> {
-        self.inner.as_mut().send(data).await
+        self.as_mut().send(data).await
     }
 
     async fn flush(&mut self) -> Result<(), quic::StreamError> {
-        poll_fn(|cx| self.inner.as_mut().poll_flush(cx)).await
+        poll_fn(|cx| self.as_mut().poll_flush(cx)).await
     }
 
     async fn shutdown(&mut self) -> Result<(), quic::StreamError> {
-        poll_fn(|cx| self.inner.as_mut().poll_close(cx)).await
+        poll_fn(|cx| self.as_mut().poll_close(cx)).await
     }
 
     async fn cancel(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
-        poll_fn(|cx| self.inner.as_mut().poll_cancel(cx, code)).await
+        poll_fn(|cx| self.as_mut().poll_cancel(cx, code)).await
     }
 }

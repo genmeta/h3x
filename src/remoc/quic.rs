@@ -1,45 +1,53 @@
 //! Remote forwarding of `quic` traits via `remoc` RTC.
 //!
-//! This module provides remote-capable versions of all traits in [`crate::quic`],
-//! allowing QUIC connections, streams, and agent operations to be transparently
-//! forwarded over any `remoc`-compatible transport.
+//! This module exposes the raw remoc-generated RTC `*Client` and `*ServerShared*`
+//! types as the public API for the QUIC bridge.
 //!
-//! # Architecture
-//!
-//! The bridging is bidirectional:
-//!
-//! - **Client-side (Remote → Standard)**: `Remote*` wrappers take remoc RTC clients
-//!   and implement standard `quic::*` traits, allowing remote services to be used
-//!   as if they were local.
-//!
-//! - **Server-side (Standard → Remote)**: `Local*` wrappers take objects implementing
-//!   standard `quic::*` traits and implement remoc RTC traits, allowing local
-//!   implementations to be served over remoc.
+//! Local QUIC implementations are served by constructing the exported server types
+//! and spawning their `serve(true)` futures. Remote stream clients can be turned
+//! into poll-based `quic::ReadStream` / `quic::WriteStream` values through the
+//! explicit conversion helpers exported here.
 //!
 //! # Public API
 //!
-//! Only the bridging structs are re-exported. The internal remoc RTC traits
-//! are implementation details and not part of the public API.
+//! ## Raw RTC client handles
 //!
-//! ## Client-side (consuming remote services)
+//! These are the remoc-generated serializable client types. They are sent over
+//! the wire and used to make RPC calls to the remote side. Each is
+//! `Serialize + Deserialize`. The stream clients (`ReadStreamClient`,
+//! `WriteStreamClient`) are **not** `Clone` because their RTC traits have
+//! `&mut self` methods; the connection/connector/listener clients are `Clone`.
 //!
-//! - [`RemoteQuicConnection`] — implements `quic::Connection` via RTC
-//! - [`RemoteQuicListener`] — implements `quic::Listen` via RTC
-//! - [`RemoteQuicConnector`] — implements `quic::Connect` via RTC
-//! - [`RemoteReadStream`] — wraps `ReadStreamClient`, convert via [`into_quic`](RemoteReadStream::into_quic)
-//! - [`RemoteWriteStream`] — wraps `WriteStreamClient`, convert via [`into_quic`](RemoteWriteStream::into_quic)
-//! ## Server-side (serving local implementations)
+//! - [`ConnectionClient`] — RTC client for a remote QUIC connection
+//! - [`ReadStreamClient`] — RTC client for a remote readable QUIC stream
+//! - [`WriteStreamClient`] — RTC client for a remote writable QUIC stream
+//! - [`RemoteConnectClient`] — RTC client for a remote QUIC connector
+//! - [`ListenClient`] — RTC client for a remote QUIC listener
 //!
-//! - [`LocalQuicConnection`] — serves a `quic::Connection` over RTC
-//! - [`LocalQuicListener`] — serves a `quic::Listen` over RTC
-//! - [`LocalQuicConnector`] — serves a `quic::Connect` over RTC
-//! - [`LocalReadStream`] — serves a `quic::ReadStream` over RTC
-//! - [`LocalWriteStream`] — serves a `quic::WriteStream` over RTC
-//! ## Conversion
+//! ## Raw RTC server constructors
 //!
-//! Each `Local*` type provides an `into_remote(self)` method that converts it
-//! into the corresponding `Remote*` type plus a `Future` that drives the RTC server.
-//! The `Remote*` types implement `Serialize + Deserialize` for sending over the wire.
+//! These are the remoc-generated server types. Call `::new(Arc<...>, buffer)` to
+//! obtain a `(Server, Client)` pair, then spawn the server's `serve(true)` future.
+//!
+//! - [`ConnectionServerShared`] — serves a `Connection` RTC impl
+//! - [`ReadStreamServerSharedMut`] — serves a `ReadStream` RTC impl
+//! - [`WriteStreamServerSharedMut`] — serves a `WriteStream` RTC impl
+//! - [`RemoteConnectServerShared`] — serves a `RemoteConnect` RTC impl
+//! - [`ListenServerShared`] — serves a `Listen` RTC impl
+//!
+//! ## Conversion helpers
+//!
+//! Low-level async helpers for constructing poll-based `quic::ReadStream` /
+//! `quic::WriteStream` implementations directly from raw RTC clients:
+//!
+//! - [`new_remote_read_stream`] — convert a `ReadStreamClient` into a `quic::ReadStream`
+//! - [`new_remote_write_stream`] — convert a `WriteStreamClient` into a `quic::WriteStream`
+//! - [`read_stream_client_into_quic`] — convert a `ReadStreamClient` into a boxed
+//!   `quic::ReadStream` future adapter
+//! - [`write_stream_client_into_quic`] — convert a `WriteStreamClient` into a boxed
+//!   `quic::WriteStream` future adapter
+//! - [`local_agent_from_client`] — eagerly build the cached local-agent bridge
+//! - [`remote_agent_from_client`] — eagerly build the cached remote-agent bridge
 
 mod agent;
 mod connect;
@@ -50,11 +58,24 @@ mod serde_types;
 mod stream;
 mod task_set;
 
-// Client-side: Remote → Standard quic traits
-// Server-side: Standard quic traits → Remote
+// Raw remoc-generated RTC client types (serializable, sendable over the wire)
 pub use self::{
-    connect::{LocalQuicConnector, RemoteQuicConnector},
-    connection::{LocalQuicConnection, RemoteQuicConnection},
-    listen::{LocalQuicListener, RemoteQuicListener},
-    stream::{LocalReadStream, LocalWriteStream, RemoteReadStream, RemoteWriteStream},
+    agent::{
+        LocalAgentClient, LocalAgentServerShared, RemoteAgentClient, RemoteAgentServerShared,
+        local_agent_from_client, remote_agent_from_client,
+    },
+    connect::{ConnectError, RemoteConnectClient},
+    connection::ConnectionClient,
+    listen::{ListenClient, ListenError},
+    stream::{
+        ReadStreamClient, WriteStreamClient, new_remote_read_stream, new_remote_write_stream,
+        read_stream_client_into_quic, write_stream_client_into_quic,
+    },
+};
+// Raw remoc-generated RTC server constructor types
+pub use self::{
+    connect::RemoteConnectServerShared,
+    connection::ConnectionServerShared,
+    listen::ListenServerShared,
+    stream::{ReadStreamServerSharedMut, WriteStreamServerSharedMut},
 };

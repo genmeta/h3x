@@ -99,16 +99,9 @@ use crate::{
 /// let proto = request.protocols().get::<MyProtocol>().expect("MyProtocol required");
 /// let session = proto.create_session(request.stream_id());
 /// ```
+#[derive(Default)]
 pub struct Protocols {
     layers: HashMap<TypeId, Arc<dyn Protocol>>,
-}
-
-impl Default for Protocols {
-    fn default() -> Self {
-        Self {
-            layers: Default::default(),
-        }
-    }
 }
 
 impl Debug for Protocols {
@@ -166,8 +159,8 @@ impl Protocols {
         self.layers.insert(TypeId::of::<L>(), Arc::new(layer));
     }
 
-    pub(crate) async fn accept_uni<'a>(
-        &'a self,
+    pub(crate) async fn accept_uni(
+        &self,
         mut stream: ErasedPeekableUniStream,
     ) -> Result<StreamVerdict<ErasedPeekableUniStream>, StreamError> {
         for layer in self.layers.values() {
@@ -182,8 +175,8 @@ impl Protocols {
         Ok(StreamVerdict::Passed(stream))
     }
 
-    pub(crate) async fn accept_bi<'a>(
-        &'a self,
+    pub(crate) async fn accept_bi(
+        &self,
         mut stream: ErasedPeekableBiStream,
     ) -> Result<StreamVerdict<ErasedPeekableBiStream>, StreamError> {
         for layer in self.layers.values() {

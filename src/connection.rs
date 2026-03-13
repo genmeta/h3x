@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use snafu::Snafu;
 use tracing::Instrument;
 
@@ -20,6 +20,7 @@ use crate::{
     protocol::{InitProtocols, ProductProtocol, Protocols, StreamVerdict, type_id_as_u128},
     qpack::protocol::QPackProtocolFactory,
     quic::{self, CancelStreamExt, StopStreamExt, agent},
+    util::watch::Watch,
     varint::VarInt,
 };
 
@@ -170,7 +171,12 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
         }
 
         let protocols = Arc::new(protocols);
-        let state = ConnectionState { quic, protocols };
+        let state = ConnectionState {
+            quic,
+            protocols,
+            terminal_error: Watch::new(),
+        };
+        tokio::spawn(ConnectionState::observe_close_task(state.clone()).in_current_span());
         tokio::spawn(ConnectionState::accept_uni_stream_task(state.clone()).in_current_span());
         tokio::spawn(ConnectionState::accept_bi_stream_task(state.clone()).in_current_span());
 
@@ -228,6 +234,7 @@ impl<C: quic::Connection + ?Sized> Eq for ConnectionBuilder<C> {}
 pub struct ConnectionState<C: ?Sized> {
     quic: Arc<C>,
     protocols: Arc<Protocols>,
+    terminal_error: Watch<quic::ConnectionError>,
 }
 
 impl<C: ?Sized> ConnectionState<C> {
@@ -242,20 +249,63 @@ impl<C: ?Sized> ConnectionState<C> {
     pub fn protocols(&self) -> &Arc<Protocols> {
         &self.protocols
     }
+
+    fn record_terminal_error(&self, error: quic::ConnectionError) {
+        self.terminal_error.set(error);
+    }
 }
 
 impl<C: quic::Lifecycle + ?Sized> ConnectionState<C> {
-    /// Actively probe the underlying QUIC connection to check if it is still usable.
+    /// Returns locally observed connection health.
+    ///
+    /// This is a synchronous, deterministic view of whether this process has
+    /// already observed the connection to fail. Terminal errors are latched the
+    /// first time they are seen, so later `check()` calls do not rely on async RPC.
     pub fn check(&self) -> Result<(), quic::ConnectionError> {
-        self.quic.check()
+        if let Some(error) = self.terminal_error.peek() {
+            return Err(error);
+        }
+
+        match self.quic.check() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.record_terminal_error(error.clone());
+                Err(error)
+            }
+        }
     }
 
     pub fn closed(&self) -> BoxFuture<'_, quic::ConnectionError> {
-        self.quic.closed()
+        let terminal_error = self.terminal_error.clone();
+        if let Some(error) = terminal_error.peek() {
+            return futures::future::ready(error).boxed();
+        }
+
+        self.quic
+            .closed()
+            .map(move |error| {
+                terminal_error.set(error.clone());
+                error
+            })
+            .boxed()
     }
 
     pub fn close(&self, code: Code, reason: impl Into<std::borrow::Cow<'static, str>>) {
         self.quic.close(code, reason.into());
+    }
+
+    async fn observe_close_task(state: Self) {
+        let error = state.quic.closed().await;
+        state.record_terminal_error(error);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(quic: Arc<C>, protocols: Arc<Protocols>) -> Self {
+        Self {
+            quic,
+            protocols,
+            terminal_error: Watch::new(),
+        }
     }
 }
 
@@ -265,14 +315,22 @@ impl<C: quic::ManageStream + quic::Lifecycle + Sync + ?Sized> ConnectionState<C>
     ) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
         match { self.quic.open_bi() }.await {
             Ok(streams) => Ok(streams),
-            Err(error) => Err(self.quic.handle_connection_error(error).await),
+            Err(error) => {
+                let error = self.quic.handle_connection_error(error).await;
+                self.record_terminal_error(error.clone());
+                Err(error)
+            }
         }
     }
 
     pub async fn open_uni(&self) -> Result<C::StreamWriter, quic::ConnectionError> {
         match { self.quic.open_uni() }.await {
             Ok(stream) => Ok(stream),
-            Err(error) => Err(self.quic.handle_connection_error(error).await),
+            Err(error) => {
+                let error = self.quic.handle_connection_error(error).await;
+                self.record_terminal_error(error.clone());
+                Err(error)
+            }
         }
     }
 }
@@ -281,10 +339,13 @@ impl<C: quic::WithLocalAgent + ?Sized> ConnectionState<C> {
     pub async fn local_agent(
         &self,
     ) -> Result<Option<Arc<dyn agent::LocalAgent>>, quic::ConnectionError> {
-        self.quic
-            .local_agent()
-            .await
-            .map(|option| option.map(|a| Arc::new(a) as Arc<dyn agent::LocalAgent>))
+        match self.quic.local_agent().await {
+            Ok(option) => Ok(option.map(|a| Arc::new(a) as Arc<dyn agent::LocalAgent>)),
+            Err(error) => {
+                self.record_terminal_error(error.clone());
+                Err(error)
+            }
+        }
     }
 }
 
@@ -292,10 +353,13 @@ impl<C: quic::WithRemoteAgent + ?Sized> ConnectionState<C> {
     pub async fn remote_agent(
         &self,
     ) -> Result<Option<Arc<dyn agent::RemoteAgent>>, quic::ConnectionError> {
-        self.quic
-            .remote_agent()
-            .await
-            .map(|option| option.map(|a| Arc::new(a) as Arc<dyn agent::RemoteAgent>))
+        match self.quic.remote_agent().await {
+            Ok(option) => Ok(option.map(|a| Arc::new(a) as Arc<dyn agent::RemoteAgent>)),
+            Err(error) => {
+                self.record_terminal_error(error.clone());
+                Err(error)
+            }
+        }
     }
 }
 
@@ -306,7 +370,8 @@ impl<C: quic::Connection + ?Sized> ConnectionState<C> {
                 let (stream_reader, stream_writer) = match state.quic.accept_bi().await {
                     Ok(bi_stream) => bi_stream,
                     Err(error) => {
-                        state.quic.handle_connection_error(error).await;
+                        let error = state.quic.handle_connection_error(error).await;
+                        state.record_terminal_error(error);
                         return;
                     }
                 };
@@ -352,7 +417,8 @@ impl<C: quic::Connection + ?Sized> ConnectionState<C> {
                 let stream_reader = match state.quic.accept_uni().await {
                     Ok(uni_stream) => uni_stream,
                     Err(error) => {
-                        state.quic.handle_connection_error(error).await;
+                        let error = state.quic.handle_connection_error(error).await;
+                        state.record_terminal_error(error);
                         return;
                     }
                 };
@@ -396,6 +462,7 @@ impl<C: ?Sized> Clone for ConnectionState<C> {
         Self {
             quic: self.quic.clone(),
             protocols: self.protocols.clone(),
+            terminal_error: self.terminal_error.clone(),
         }
     }
 }
@@ -419,6 +486,11 @@ impl<C: quic::Connection + ?Sized> Connection<C> {
     {
         ConnectionBuilder::new(settings).build(quic).await
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_state_for_test(state: ConnectionState<C>) -> Self {
+        Self(state)
+    }
 }
 
 impl<C: quic::Connection + ?Sized> Drop for Connection<C> {
@@ -428,24 +500,274 @@ impl<C: quic::Connection + ?Sized> Drop for Connection<C> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         collections::hash_map::DefaultHasher,
+        future::pending,
         hash::{Hash, Hasher},
-        sync::Arc,
+        pin::Pin,
+        sync::{Arc, Mutex},
     };
 
-    use futures::future::BoxFuture;
+    use bytes::Bytes;
+    use futures::{Sink, future::BoxFuture, stream::Stream};
 
-    use super::ConnectionBuilder;
+    use super::{ConnectionBuilder, ConnectionState};
     use crate::{
         codec::{ErasedPeekableBiStream, ErasedPeekableUniStream},
         connection::StreamError,
         dhttp::settings::{Setting, Settings},
         protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
-        quic::{self, ConnectionError},
+        quic::{self, ConnectionError, agent},
         varint::VarInt,
     };
+
+    #[derive(Debug)]
+    pub(crate) struct TestLocalAgent;
+
+    impl agent::LocalAgent for TestLocalAgent {
+        fn name(&self) -> &str {
+            "test-local"
+        }
+
+        fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
+            &[]
+        }
+
+        fn sign_algorithm(&self) -> rustls::SignatureAlgorithm {
+            rustls::SignatureAlgorithm::ED25519
+        }
+
+        fn sign(
+            &self,
+            _scheme: rustls::SignatureScheme,
+            _data: &[u8],
+        ) -> BoxFuture<'_, Result<Vec<u8>, agent::SignError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct TestRemoteAgent;
+
+    impl agent::RemoteAgent for TestRemoteAgent {
+        fn name(&self) -> &str {
+            "test-remote"
+        }
+
+        fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
+            &[]
+        }
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct TestReadStream;
+
+    impl quic::GetStreamId for TestReadStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context,
+        ) -> std::task::Poll<Result<VarInt, quic::StreamError>> {
+            let _ = self;
+            std::task::Poll::Ready(Ok(VarInt::from_u32(0)))
+        }
+    }
+
+    impl quic::StopStream for TestReadStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context,
+            _code: VarInt,
+        ) -> std::task::Poll<Result<(), quic::StreamError>> {
+            let _ = self;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for TestReadStream {
+        type Item = Result<Bytes, quic::StreamError>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let _ = self;
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct TestWriteStream;
+
+    impl quic::GetStreamId for TestWriteStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context,
+        ) -> std::task::Poll<Result<VarInt, quic::StreamError>> {
+            let _ = self;
+            std::task::Poll::Ready(Ok(VarInt::from_u32(0)))
+        }
+    }
+
+    impl quic::CancelStream for TestWriteStream {
+        fn poll_cancel(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context,
+            _code: VarInt,
+        ) -> std::task::Poll<Result<(), quic::StreamError>> {
+            let _ = self;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Sink<Bytes> for TestWriteStream {
+        type Error = quic::StreamError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            let _ = self;
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Bytes) -> Result<(), Self::Error> {
+            let _ = self;
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            let _ = self;
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            let _ = self;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct MockConnectionState {
+        check_result: Mutex<Result<(), quic::ConnectionError>>,
+        closed_error: Mutex<Option<quic::ConnectionError>>,
+    }
+
+    impl Default for MockConnectionState {
+        fn default() -> Self {
+            Self {
+                check_result: Mutex::new(Ok(())),
+                closed_error: Mutex::new(None),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub(crate) struct MockConnection {
+        state: Arc<MockConnectionState>,
+    }
+
+    impl MockConnection {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        pub(crate) fn set_check_result(&self, result: Result<(), quic::ConnectionError>) {
+            *self.state.check_result.lock().unwrap() = result;
+        }
+
+        pub(crate) fn set_closed_error(&self, error: quic::ConnectionError) {
+            *self.state.closed_error.lock().unwrap() = Some(error);
+        }
+    }
+
+    impl quic::ManageStream for MockConnection {
+        type StreamReader = TestReadStream;
+        type StreamWriter = TestWriteStream;
+
+        fn open_bi(
+            &self,
+        ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>>
+        {
+            Box::pin(async { Err(test_connection_error("open_bi unavailable")) })
+        }
+
+        fn open_uni(&self) -> BoxFuture<'_, Result<Self::StreamWriter, ConnectionError>> {
+            Box::pin(async { Err(test_connection_error("open_uni unavailable")) })
+        }
+
+        fn accept_bi(
+            &self,
+        ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>>
+        {
+            Box::pin(async { Err(test_connection_error("accept_bi unavailable")) })
+        }
+
+        fn accept_uni(&self) -> BoxFuture<'_, Result<Self::StreamReader, ConnectionError>> {
+            Box::pin(async { Err(test_connection_error("accept_uni unavailable")) })
+        }
+    }
+
+    impl quic::WithLocalAgent for MockConnection {
+        type LocalAgent = TestLocalAgent;
+
+        fn local_agent(&self) -> BoxFuture<'_, Result<Option<Self::LocalAgent>, ConnectionError>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    impl quic::WithRemoteAgent for MockConnection {
+        type RemoteAgent = TestRemoteAgent;
+
+        fn remote_agent(
+            &self,
+        ) -> BoxFuture<'_, Result<Option<Self::RemoteAgent>, ConnectionError>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    impl quic::Lifecycle for MockConnection {
+        fn close(&self, _code: crate::error::Code, _reason: std::borrow::Cow<'static, str>) {}
+
+        fn check(&self) -> Result<(), ConnectionError> {
+            self.state.check_result.lock().unwrap().clone()
+        }
+
+        fn closed(&self) -> BoxFuture<'_, ConnectionError> {
+            let closed_error = self.state.closed_error.lock().unwrap().clone();
+            Box::pin(async move {
+                match closed_error {
+                    Some(error) => error,
+                    None => pending().await,
+                }
+            })
+        }
+    }
+
+    fn test_connection_error(reason: &str) -> quic::ConnectionError {
+        quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(0x01),
+                frame_type: VarInt::from_u32(0x00),
+                reason: reason.to_owned().into(),
+            },
+        }
+    }
+
+    fn assert_transport_reason(error: &quic::ConnectionError, expected_reason: &str) {
+        match error {
+            quic::ConnectionError::Transport { source } => {
+                assert_eq!(source.reason.as_ref(), expected_reason);
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
+    }
 
     fn hash_of<T: Hash>(val: &T) -> u64 {
         let mut hasher = DefaultHasher::new();
@@ -634,5 +956,23 @@ mod tests {
             hash_of(&with_mock),
             "adding MockFactory must change the hash"
         );
+    }
+
+    #[test]
+    fn check_latches_terminal_error_after_closed_is_observed() {
+        let quic = MockConnection::new();
+        let protocols = Arc::new(Protocols::new());
+        let state = ConnectionState::new_for_test(Arc::new(quic.clone()), protocols);
+        let expected = test_connection_error("closed");
+
+        quic.set_check_result(Ok(()));
+        quic.set_closed_error(expected.clone());
+
+        let observed = futures::executor::block_on(state.closed());
+        assert_transport_reason(&observed, "closed");
+
+        quic.set_check_result(Ok(()));
+        let check_error = state.check().expect_err("closed error should be latched");
+        assert_transport_reason(&check_error, "closed");
     }
 }
