@@ -61,7 +61,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_takeover_surfaces_error_where_compat_returns_none() {
+    async fn explicit_takeover_and_upgrade_on_both_surface_body_not_released() {
         let explicit = takeover::take(http::Request::new(ErrorBody)).await;
         assert!(matches!(
             explicit,
