@@ -37,7 +37,7 @@ pub trait Connection: Send + Sync {
     async fn closed(&self) -> Result<quic::ConnectionError, quic::ConnectionError>;
 }
 
-pub(crate) fn serve_quic_connection<C>(
+pub fn serve_quic_connection<C>(
     connection: C,
 ) -> (ConnectionClient, impl Future<Output = ()> + Send + 'static)
 where

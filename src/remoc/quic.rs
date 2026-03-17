@@ -3,10 +3,10 @@
 //! This module exposes raw remoc-generated RTC client and server constructor
 //! families as the public API for the QUIC bridge.
 //!
-//! Local QUIC implementations are served by constructing the exported server types
-//! and spawning their `serve(true)` futures. Remote stream clients can be turned
-//! into poll-based `quic::ReadStream` / `quic::WriteStream` values through
-//! conversion methods on the generated client types.
+//! Local QUIC connections can be published as [`ConnectionClient`] values with
+//! [`serve_quic_connection`]. Remote stream clients can still be turned into
+//! poll-based `quic::ReadStream` / `quic::WriteStream` values through conversion
+//! methods on the generated client types.
 //!
 //! # Public API
 //!
@@ -27,7 +27,8 @@
 //! ## Raw RTC server constructors
 //!
 //! These are the remoc-generated server types. Call `::new(Arc<...>, buffer)` to
-//! obtain a `(Server, Client)` pair, then spawn the server's `serve(true)` future.
+//! obtain a `(Server, Client)` pair, then spawn the server's `serve(true)` future
+//! from code that owns the corresponding internal RTC trait implementation.
 //!
 //! Exported server families include the generated `Server`, `ServerRef`,
 //! `ServerRefMut`, `ServerShared`, `ServerSharedMut`, and `ReqReceiver`
@@ -72,6 +73,7 @@ pub use self::{
     connection::{
         ConnectionClient, ConnectionReqReceiver, ConnectionServer, ConnectionServerRef,
         ConnectionServerRefMut, ConnectionServerShared, ConnectionServerSharedMut,
+        serve_quic_connection,
     },
     listen::{
         ListenClient, ListenError, ListenReqReceiver, ListenServer, ListenServerRef,
