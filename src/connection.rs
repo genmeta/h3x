@@ -501,10 +501,13 @@ impl<C: quic::Connection + ?Sized> Drop for Connection<C> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(feature = "gm-quic")]
     use std::{
         collections::hash_map::DefaultHasher,
-        future::pending,
         hash::{Hash, Hasher},
+    };
+    use std::{
+        future::pending,
         pin::Pin,
         sync::{Arc, Mutex},
     };
@@ -512,12 +515,18 @@ pub(crate) mod tests {
     use bytes::Bytes;
     use futures::{Sink, future::BoxFuture, stream::Stream};
 
-    use super::{ConnectionBuilder, ConnectionState};
+    #[cfg(feature = "gm-quic")]
+    use super::ConnectionBuilder;
+    use super::ConnectionState;
+    #[cfg(feature = "gm-quic")]
     use crate::{
         codec::{ErasedPeekableBiStream, ErasedPeekableUniStream},
         connection::StreamError,
         dhttp::settings::{Setting, Settings},
-        protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
+        protocol::{ProductProtocol, Protocol, StreamVerdict},
+    };
+    use crate::{
+        protocol::Protocols,
         quic::{self, ConnectionError, agent},
         varint::VarInt,
     };
@@ -769,6 +778,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(feature = "gm-quic")]
     fn hash_of<T: Hash>(val: &T) -> u64 {
         let mut hasher = DefaultHasher::new();
         val.hash(&mut hasher);
@@ -776,9 +786,11 @@ pub(crate) mod tests {
     }
 
     /// Local mock protocol for builder tests.
+    #[cfg(feature = "gm-quic")]
     #[derive(Debug)]
     struct MockProtocol;
 
+    #[cfg(feature = "gm-quic")]
     impl Protocol for MockProtocol {
         fn accept_uni<'a>(
             &'a self,
@@ -796,9 +808,11 @@ pub(crate) mod tests {
     }
 
     /// Local mock factory for builder tests.
+    #[cfg(feature = "gm-quic")]
     #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
     struct MockFactory(u64);
 
+    #[cfg(feature = "gm-quic")]
     impl<C: quic::Connection + ?Sized> ProductProtocol<C> for MockFactory {
         type Protocol = MockProtocol;
 

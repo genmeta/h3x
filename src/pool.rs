@@ -280,26 +280,29 @@ impl<C: quic::Connection> Pool<C> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    #[cfg(feature = "gm-quic")]
     use std::{
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
-        sync::Arc,
     };
 
     use tokio_util::task::AbortOnDropHandle;
 
     use super::ReuseableConnection;
+    #[cfg(feature = "gm-quic")]
     use crate::{
-        connection::{Connection, ConnectionBuilder, ConnectionState},
-        dhttp::{
-            goaway::Goaway,
-            protocol::DHttpProtocol,
-            settings::{Setting, Settings},
-        },
+        connection::ConnectionBuilder,
+        dhttp::settings::{Setting, Settings},
+    };
+    use crate::{
+        connection::{Connection, ConnectionState},
+        dhttp::{goaway::Goaway, protocol::DHttpProtocol},
         quic,
         varint::VarInt,
     };
 
+    #[cfg(feature = "gm-quic")]
     fn hash_of<T: Hash>(val: &T) -> u64 {
         let mut hasher = DefaultHasher::new();
         val.hash(&mut hasher);

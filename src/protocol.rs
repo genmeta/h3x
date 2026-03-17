@@ -329,7 +329,7 @@ pub enum StreamVerdict<S> {
     Passed(S),
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gm-quic"))]
 mod tests {
     use std::{
         any::Any, cmp::Ordering, collections::hash_map::DefaultHasher, hash::Hasher, sync::Arc,
