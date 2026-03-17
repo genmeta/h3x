@@ -9,7 +9,7 @@ pub mod protocol;
 pub mod r#static;
 pub mod string;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hyper"))]
 mod tests {
     use std::{pin::pin, sync::Arc};
 
