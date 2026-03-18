@@ -1,26 +1,21 @@
+#[doc(alias = "takeover")]
 pub mod upgrade {
-    use crate::hyper::takeover;
+    use std::future::poll_fn;
+
+    use crate::message::stream::hyper::upgrade::TakeoverSealed;
     pub use crate::message::stream::{
         hyper::upgrade::{HasTakeover, TakeoverError},
         unfold::{read::BoxStreamReader, write::BoxStreamWriter},
     };
 
+    #[doc(alias = "take")]
     pub async fn on(
-        message: impl HasTakeover,
+        mut message: impl HasTakeover,
     ) -> Result<(BoxStreamReader<'static>, BoxStreamWriter<'static>), TakeoverError> {
-        let pending = takeover::take(message).await?;
-        pending.wait().await
-    }
-}
-
-pub mod takeover {
-    use std::future::poll_fn;
-
-    use crate::message::stream::hyper::upgrade::TakeoverSealed;
-    pub use crate::message::stream::hyper::upgrade::{HasTakeover, PendingTakeover, TakeoverError};
-
-    pub async fn take(mut message: impl HasTakeover) -> Result<PendingTakeover, TakeoverError> {
-        poll_fn(|cx| TakeoverSealed::poll_takeover(&mut message, cx)).await
+        poll_fn(|cx| TakeoverSealed::poll_takeover(&mut message, cx))
+            .await?
+            .wait()
+            .await
     }
 }
 
@@ -43,7 +38,7 @@ mod tests {
     use bytes::Bytes;
     use http_body::{Body, Frame};
 
-    use super::{takeover, upgrade};
+    use super::upgrade;
 
     #[derive(Debug, Clone)]
     struct ErrorBody;
@@ -62,12 +57,6 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_takeover_and_upgrade_on_both_surface_body_not_released() {
-        let explicit = takeover::take(http::Request::new(ErrorBody)).await;
-        assert!(matches!(
-            explicit,
-            Err(crate::message::stream::hyper::upgrade::TakeoverError::BodyNotReleased)
-        ));
-
         let compat = upgrade::on(http::Request::new(ErrorBody)).await;
         assert!(matches!(
             compat,
