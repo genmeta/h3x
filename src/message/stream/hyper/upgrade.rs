@@ -229,7 +229,7 @@ mod tests {
             .insert(TakeoverSlot::new(read, write));
 
         let result = poll_fn(|cx| request.poll_takeover(cx)).await;
-        assert!(matches!(result, Ok(_)));
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -242,7 +242,7 @@ mod tests {
             .insert(TakeoverSlot::new(read, write));
 
         let first = poll_fn(|cx| request.poll_takeover(cx)).await;
-        assert!(matches!(first, Ok(_)));
+        assert!(first.is_ok());
 
         let second = poll_fn(|cx| request.poll_takeover(cx)).await;
         assert!(matches!(second, Err(TakeoverError::AlreadyTaken)));
