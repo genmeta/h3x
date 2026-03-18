@@ -282,8 +282,7 @@ mod tests {
 
         let error = state
             .register_initialized_stream(VarInt::from_u32(11))
-            .err()
-            .expect("initialized stream must be rejected after peer goaway");
+            .expect_err("initialized stream must be rejected after peer goaway");
 
         assert_eq!(error, ConnectionGoaway::Peer);
     }
@@ -297,8 +296,7 @@ mod tests {
 
         let error = state
             .apply_peer_goaway(Goaway::new(VarInt::from_u32(21)))
-            .err()
-            .expect("increasing peer goaway stream id must be rejected");
+            .expect_err("increasing peer goaway stream id must be rejected");
 
         assert!(matches!(
             error,
