@@ -216,6 +216,11 @@ impl H3ClientBuilder {
         self
     }
 
+    pub fn with_stun(mut self, server: impl Into<Arc<str>>) -> Self {
+        self.quic_builder = self.quic_builder.with_stun(server);
+        self
+    }
+
     pub async fn bind(mut self, uri: impl IntoIterator<Item = impl Into<BindUri>>) -> Self {
         self.quic_builder = self.quic_builder.bind(uri).await;
         self
