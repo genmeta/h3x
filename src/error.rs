@@ -95,7 +95,7 @@ codes! {
     /// - the inclusion of uppercase field names, or
     /// - the inclusion of invalid characters in field names or values.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9114#name-malformed-requests-and-resp
+    /// <https://datatracker.ietf.org/doc/html/rfc9114#name-malformed-requests-and-resp>
     pub const H3_MESSAGE_ERROR = 0x010e;
     /// The TCP connection established in response to a CONNECT request was reset or abnormally closed.
     pub const H3_CONNECT_ERROR = 0x010f;
@@ -121,6 +121,7 @@ impl Code {
     }
 }
 
+#[non_exhaustive]
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Snafu, Clone, Copy)]
 pub enum H3StreamCreationError {
@@ -142,6 +143,7 @@ impl H3Error for H3StreamCreationError {
 }
 
 // TODO: add reset code info(if any)
+#[non_exhaustive]
 #[derive(Debug, Snafu)]
 pub enum H3CriticalStreamClosed {
     #[snafu(display("qpack encoder stream closed unexpectedly"))]
@@ -162,6 +164,7 @@ impl H3Error for H3CriticalStreamClosed {
 }
 
 // todo: more error variants instead of direct Code::H3_FRAME_UNEXPECTED usage
+#[non_exhaustive]
 #[derive(Debug, Snafu, Clone, Copy)]
 pub enum H3FrameUnexpected {
     #[snafu(display("received subsequent SETTINGS frame"))]
@@ -205,6 +208,7 @@ impl H3Error for H3NoError {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Snafu, Clone, Copy)]
 pub enum H3MessageError {
     #[snafu(display("missing header section in HTTP message"))]
@@ -235,6 +239,7 @@ impl H3Error for H3MissingSettings {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Snafu, Clone)]
 #[snafu(module)]
 pub enum H3GeneralProtocolError {
@@ -253,6 +258,7 @@ impl H3Error for H3GeneralProtocolError {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Snafu)]
 pub enum H3InternalError {
     #[snafu(display("QPACK encoder encode failure: {source}"))]
@@ -303,6 +309,7 @@ impl H3Error for QpackDecompressionFailed {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Snafu, Clone, Copy)]
 pub enum H3IdError {
     #[snafu(display("push ID exceeds limit"))]

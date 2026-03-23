@@ -4,6 +4,7 @@ use snafu::Snafu;
 
 use crate::{connection, quic, varint::VarInt};
 
+#[non_exhaustive]
 #[derive(Debug, Snafu, Clone, Copy, PartialEq, Eq)]
 #[snafu(visibility(pub), module)]
 pub enum DecodeError {
@@ -15,7 +16,7 @@ pub enum DecodeError {
     // HuffmanPadding,
     #[snafu(display("invalid huffman code"))]
     InvalidHuffmanCode,
-    /// e.g: eval Base (https://datatracker.ietf.org/doc/html/rfc9204#section-4.5.1.2)
+    /// e.g: eval Base (<https://datatracker.ietf.org/doc/html/rfc9204#section-4.5.1.2>)
     #[snafu(display("arithmetic overflow while decoding"))]
     ArithmeticOverflow,
     /// RFC 9204 §4.5.1.1: RIC decode failure or invalid base
@@ -23,6 +24,11 @@ pub enum DecodeError {
     DecompressionFailed,
 }
 
+/// Converts `DecodeError` to `io::Error` for use across tokio I/O boundaries.
+///
+/// This is the forward direction of the codec error bridge. The original
+/// `DecodeError` is preserved as the inner error and can be recovered via
+/// `TryFrom<io::Error> for DecodeError` below.
 impl From<DecodeError> for io::Error {
     fn from(error: DecodeError) -> Self {
         let kind = match error {
@@ -44,6 +50,11 @@ impl From<httlib_huffman::DecoderError> for DecodeError {
     }
 }
 
+/// Recovers a `DecodeError` from `io::Error`.
+///
+/// Used in the codec layer when reading from `AsyncRead`-based streams that
+/// may propagate our own errors through `io::Error`. Also treats
+/// `UnexpectedEof` as `Incomplete` for QUIC stream termination.
 impl TryFrom<io::Error> for DecodeError {
     type Error = io::Error;
 
@@ -56,6 +67,7 @@ impl TryFrom<io::Error> for DecodeError {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Snafu, Clone)]
 pub enum DecodeStreamError {
     #[snafu(transparent)]
@@ -110,6 +122,10 @@ impl From<quic::ConnectionError> for DecodeStreamError {
     }
 }
 
+/// Recovers `DecodeStreamError` from `io::Error`.
+///
+/// Error recovery chain: tries quic::StreamError → DecodeError → Self (downcast).
+/// This is triggered in codec read paths where errors pass through AsyncRead.
 impl From<io::Error> for DecodeStreamError {
     fn from(error: io::Error) -> Self {
         let try_into = || {
@@ -132,6 +148,7 @@ impl From<io::Error> for DecodeStreamError {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Snafu, Clone, Copy, PartialEq, Eq)]
 #[snafu(visibility(pub), module)]
 pub enum EncodeError {
@@ -163,6 +180,7 @@ impl TryFrom<io::Error> for EncodeError {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Snafu, Clone)]
 pub enum EncodeStreamError {
     #[snafu(transparent)]
@@ -212,6 +230,10 @@ impl From<EncodeStreamError> for io::Error {
     }
 }
 
+/// Recovers `EncodeStreamError` from `io::Error`.
+///
+/// Error recovery chain: tries quic::StreamError → EncodeError → Self (downcast).
+/// This is triggered in codec write paths where errors pass through AsyncWrite.
 impl From<io::Error> for EncodeStreamError {
     fn from(error: io::Error) -> Self {
         let try_into = || {

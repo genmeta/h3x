@@ -60,12 +60,23 @@ impl<E: H3Error + Send + Sync + 'static> From<E> for StreamError {
     }
 }
 
+/// Error converting between `StreamError` and `io::Error`.
+///
+/// This conversion bridges h3x stream errors through tokio's io::Error boundary.
+/// The `io::Error` is constructed with `io::Error::other()`, preserving the original
+/// `StreamError` as the inner error for later recovery via downcast.
 impl From<StreamError> for io::Error {
     fn from(value: StreamError) -> Self {
         io::Error::other(value)
     }
 }
 
+/// Reverse conversion: recovers a `StreamError` from an `io::Error`.
+///
+/// This is used at codec/stream boundaries where errors pass through
+/// `io::Error`-based interfaces (e.g., `AsyncRead`/`AsyncWrite`).
+/// Recovery attempts: StreamError → quic::StreamError → H3Error (dyn).
+/// If none match, this is a logic error (unreachable).
 impl From<io::Error> for StreamError {
     fn from(source: io::Error) -> Self {
         let error = match source.downcast::<StreamError>() {
