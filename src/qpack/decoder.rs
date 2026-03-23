@@ -603,3 +603,191 @@ where
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+
+    use super::{DecoderInstruction, DecoderState};
+    use crate::{
+        dhttp::settings::{Setting, Settings},
+        qpack::r#static,
+        varint::VarInt,
+    };
+
+    fn test_settings(capacity: u32) -> Arc<Settings> {
+        let mut settings = Settings::default();
+        settings.set(Setting::qpack_max_table_capacity(VarInt::from_u32(
+            capacity,
+        )));
+        Arc::new(settings)
+    }
+
+    #[test]
+    fn decoder_state_default_construction() {
+        let state = DecoderState::new(test_settings(0));
+        assert_eq!(state.dynamic_table.capacity, 0);
+        assert_eq!(state.dynamic_table.inserted_count, 0);
+        assert_eq!(state.dynamic_table.known_received_count, 0);
+        assert!(state.pending_instructions.is_empty());
+    }
+
+    #[test]
+    fn emit_insert_count_increment() {
+        let mut state = DecoderState::new(test_settings(256));
+        state.emit(DecoderInstruction::InsertCountIncrement { increment: 1 });
+        assert_eq!(state.pending_instructions.len(), 1);
+        assert_eq!(
+            state.pending_instructions[0],
+            DecoderInstruction::InsertCountIncrement { increment: 1 }
+        );
+    }
+
+    #[test]
+    fn emit_merges_consecutive_insert_count_increments() {
+        let mut state = DecoderState::new(test_settings(256));
+        state.emit(DecoderInstruction::InsertCountIncrement { increment: 1 });
+        state.emit(DecoderInstruction::InsertCountIncrement { increment: 3 });
+        assert_eq!(state.pending_instructions.len(), 1);
+        assert_eq!(
+            state.pending_instructions[0],
+            DecoderInstruction::InsertCountIncrement { increment: 4 }
+        );
+    }
+
+    #[test]
+    fn emit_deduplicates_stream_cancellation() {
+        let mut state = DecoderState::new(test_settings(256));
+        state.emit(DecoderInstruction::StreamCancellation { stream_id: 42 });
+        state.emit(DecoderInstruction::StreamCancellation { stream_id: 42 });
+        assert_eq!(state.pending_instructions.len(), 1);
+    }
+
+    #[test]
+    fn emit_does_not_deduplicate_different_stream_cancellations() {
+        let mut state = DecoderState::new(test_settings(256));
+        state.emit(DecoderInstruction::StreamCancellation { stream_id: 1 });
+        state.emit(DecoderInstruction::StreamCancellation { stream_id: 2 });
+        assert_eq!(state.pending_instructions.len(), 2);
+    }
+
+    #[test]
+    fn emit_section_acknowledgment() {
+        let mut state = DecoderState::new(test_settings(256));
+        state.emit(DecoderInstruction::SectionAcknowledgment { stream_id: 10 });
+        assert_eq!(state.pending_instructions.len(), 1);
+        assert_eq!(
+            state.pending_instructions[0],
+            DecoderInstruction::SectionAcknowledgment { stream_id: 10 }
+        );
+    }
+
+    #[test]
+    fn set_dynamic_table_capacity_within_limit() {
+        let mut state = DecoderState::new(test_settings(256));
+        assert!(state.set_dynamic_table_capacity(128).is_ok());
+        assert_eq!(state.dynamic_table.capacity, 128);
+    }
+
+    #[test]
+    fn set_dynamic_table_capacity_exceeds_max() {
+        let mut state = DecoderState::new(test_settings(256));
+        assert!(state.set_dynamic_table_capacity(512).is_err());
+    }
+
+    #[test]
+    fn insert_with_literal_name() {
+        let mut state = DecoderState::new(test_settings(4096));
+        state.set_dynamic_table_capacity(4096).unwrap();
+        state
+            .insert_with_literal_name(
+                Bytes::from_static(b"x-custom"),
+                Bytes::from_static(b"value"),
+            )
+            .unwrap();
+        assert_eq!(state.dynamic_table.inserted_count, 1);
+        let entry = state.dynamic_table.get(0).unwrap();
+        assert_eq!(&entry.name[..], b"x-custom");
+        assert_eq!(&entry.value[..], b"value");
+    }
+
+    #[test]
+    fn insert_with_static_name_reference() {
+        let mut state = DecoderState::new(test_settings(4096));
+        state.set_dynamic_table_capacity(4096).unwrap();
+        // Index 0 in static table is ":authority"
+        state
+            .insert_with_name_reference(true, 0, Bytes::from_static(b"example.com"))
+            .unwrap();
+        let entry = state.dynamic_table.get(0).unwrap();
+        assert_eq!(&entry.name[..], b":authority");
+        assert_eq!(&entry.value[..], b"example.com");
+    }
+
+    #[test]
+    fn insert_fails_when_capacity_too_small() {
+        let mut state = DecoderState::new(test_settings(4096));
+        // Set capacity very small — a FieldLine has 32 bytes overhead + name + value
+        state.set_dynamic_table_capacity(10).unwrap();
+        let result =
+            state.insert_with_literal_name(Bytes::from_static(b"name"), Bytes::from_static(b"v"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn static_table_lookup() {
+        // Verify well-known static table entries
+        assert_eq!(r#static::get_name(0), Some(":authority"));
+        assert_eq!(r#static::get_name(1), Some(":path"));
+        assert_eq!(r#static::get(1), Some((":path", "/")));
+        assert!(r#static::get(99).is_none());
+    }
+
+    #[test]
+    fn decompression_static_indexed_field_line() {
+        use super::decompression_field_line_representation;
+        use crate::qpack::{dynamic::DynamicTable, field::FieldLineRepresentation};
+
+        let dt = DynamicTable::new();
+        let repr = FieldLineRepresentation::IndexedFieldLine {
+            is_static: true,
+            index: 1, // :path /
+        };
+        let fl = decompression_field_line_representation(&repr, 0, &dt).unwrap();
+        assert_eq!(&fl.name[..], b":path");
+        assert_eq!(&fl.value[..], b"/");
+    }
+
+    #[test]
+    fn decompression_literal_with_literal_name() {
+        use super::decompression_field_line_representation;
+        use crate::qpack::{dynamic::DynamicTable, field::FieldLineRepresentation};
+
+        let dt = DynamicTable::new();
+        let repr = FieldLineRepresentation::LiteralFieldLineWithLiteralName {
+            never_dynamic: false,
+            name_huffman: false,
+            value_huffman: false,
+            name: Bytes::from_static(b"x-test"),
+            value: Bytes::from_static(b"hello"),
+        };
+        let fl = decompression_field_line_representation(&repr, 0, &dt).unwrap();
+        assert_eq!(&fl.name[..], b"x-test");
+        assert_eq!(&fl.value[..], b"hello");
+    }
+
+    #[test]
+    fn decompression_invalid_static_index() {
+        use super::decompression_field_line_representation;
+        use crate::qpack::{dynamic::DynamicTable, field::FieldLineRepresentation};
+
+        let dt = DynamicTable::new();
+        let repr = FieldLineRepresentation::IndexedFieldLine {
+            is_static: true,
+            index: 9999,
+        };
+        assert!(decompression_field_line_representation(&repr, 0, &dt).is_err());
+    }
+}

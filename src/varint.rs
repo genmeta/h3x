@@ -222,3 +222,134 @@ impl<S: AsyncWrite + Send> EncodeInto<S> for VarInt {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::codec::{DecodeFrom, EncodeInto};
+
+    #[test]
+    fn from_u32_edge_values() {
+        assert_eq!(VarInt::from_u32(0).into_inner(), 0);
+        assert_eq!(VarInt::from_u32(1).into_inner(), 1);
+        assert_eq!(VarInt::from_u32(63).into_inner(), 63);
+        assert_eq!(VarInt::from_u32(64).into_inner(), 64);
+        assert_eq!(VarInt::from_u32(16383).into_inner(), 16383);
+        assert_eq!(VarInt::from_u32(16384).into_inner(), 16384);
+        assert_eq!(VarInt::from_u32(u32::MAX).into_inner(), u32::MAX as u64);
+    }
+
+    #[test]
+    fn from_u64_valid() {
+        assert!(VarInt::from_u64(0).is_ok());
+        assert!(VarInt::from_u64(1).is_ok());
+        assert!(VarInt::from_u64(63).is_ok());
+        assert!(VarInt::from_u64(16383).is_ok());
+        assert!(VarInt::from_u64(VARINT_MAX - 1).is_ok());
+    }
+
+    #[test]
+    fn from_u64_overflow() {
+        assert!(VarInt::from_u64(VARINT_MAX).is_err());
+        assert!(VarInt::from_u64(VARINT_MAX + 1).is_err());
+        assert!(VarInt::from_u64(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn into_inner_round_trip() {
+        for &v in &[0u64, 1, 63, 64, 16383, 16384, 1 << 30, VARINT_MAX - 1] {
+            let vi = VarInt::from_u64(v).unwrap();
+            assert_eq!(vi.into_inner(), v);
+        }
+    }
+
+    #[test]
+    fn ordering_and_equality() {
+        let a = VarInt::from_u32(10);
+        let b = VarInt::from_u32(20);
+        let c = VarInt::from_u32(10);
+        assert!(a < b);
+        assert!(b > a);
+        assert_eq!(a, c);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn partial_eq_and_ord_with_u64() {
+        let v = VarInt::from_u32(42);
+        assert_eq!(v, 42u64);
+        assert!(v < 100u64);
+        assert!(v > 10u64);
+    }
+
+    #[test]
+    fn encoding_size() {
+        assert_eq!(VarInt::from_u32(0).encoding_size(), 1);
+        assert_eq!(VarInt::from_u32(63).encoding_size(), 1);
+        assert_eq!(VarInt::from_u32(64).encoding_size(), 2);
+        assert_eq!(VarInt::from_u32(16383).encoding_size(), 2);
+        assert_eq!(VarInt::from_u32(16384).encoding_size(), 4);
+        assert_eq!(VarInt::from_u64((1 << 30) - 1).unwrap().encoding_size(), 4);
+        assert_eq!(VarInt::from_u64(1 << 30).unwrap().encoding_size(), 8);
+        assert_eq!(VarInt::MAX.encoding_size(), 8);
+    }
+
+    #[test]
+    fn from_conversions() {
+        let _ = VarInt::from(0u8);
+        let _ = VarInt::from(0u16);
+        let _ = VarInt::from(0u32);
+        assert!(VarInt::try_from(0u64).is_ok());
+        assert!(VarInt::try_from(VARINT_MAX).is_err());
+        assert!(VarInt::try_from(0u128).is_ok());
+        assert!(VarInt::try_from(VARINT_MAX as u128).is_err());
+    }
+
+    async fn encode_decode_round_trip(value: u64) {
+        let vi = VarInt::from_u64(value).unwrap();
+        let mut buf = Vec::new();
+        vi.encode_into(Cursor::new(&mut buf)).await.unwrap();
+        assert_eq!(buf.len(), vi.encoding_size());
+        let decoded = VarInt::decode_from(Cursor::new(&buf)).await.unwrap();
+        assert_eq!(decoded, vi);
+    }
+
+    #[tokio::test]
+    async fn encode_decode_1_byte() {
+        encode_decode_round_trip(0).await;
+        encode_decode_round_trip(1).await;
+        encode_decode_round_trip(37).await;
+        encode_decode_round_trip(63).await;
+    }
+
+    #[tokio::test]
+    async fn encode_decode_2_byte() {
+        encode_decode_round_trip(64).await;
+        encode_decode_round_trip(100).await;
+        encode_decode_round_trip(16383).await;
+    }
+
+    #[tokio::test]
+    async fn encode_decode_4_byte() {
+        encode_decode_round_trip(16384).await;
+        encode_decode_round_trip(1_000_000).await;
+        encode_decode_round_trip((1 << 30) - 1).await;
+    }
+
+    #[tokio::test]
+    async fn encode_decode_8_byte() {
+        encode_decode_round_trip(1 << 30).await;
+        encode_decode_round_trip(1 << 40).await;
+        encode_decode_round_trip(VARINT_MAX - 1).await;
+    }
+
+    #[test]
+    fn display_and_hex() {
+        let v = VarInt::from_u32(255);
+        assert_eq!(format!("{v}"), "255");
+        assert_eq!(format!("{v:x}"), "ff");
+        assert_eq!(format!("{v:X}"), "FF");
+    }
+}

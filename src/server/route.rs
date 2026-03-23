@@ -338,3 +338,133 @@ where
         Box::pin(async move { service.serve(request, response).await })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use http::Method;
+
+    use super::MethodRouter;
+
+    fn make_router() -> MethodRouter<&'static str> {
+        let mut router = MethodRouter::new("fallback");
+        router.set(Method::GET, "get_handler");
+        router.set(Method::POST, "post_handler");
+        router.set(Method::PUT, "put_handler");
+        router.set(Method::DELETE, "delete_handler");
+        router
+    }
+
+    #[test]
+    fn method_router_service_lookup() {
+        let router = make_router();
+        assert_eq!(router.service(Method::GET), Some(&"get_handler"));
+        assert_eq!(router.service(Method::POST), Some(&"post_handler"));
+        assert_eq!(router.service(Method::PUT), Some(&"put_handler"));
+        assert_eq!(router.service(Method::DELETE), Some(&"delete_handler"));
+    }
+
+    #[test]
+    fn method_router_unset_returns_none() {
+        let router = make_router();
+        assert_eq!(router.service(Method::PATCH), None);
+        assert_eq!(router.service(Method::HEAD), None);
+        assert_eq!(router.service(Method::OPTIONS), None);
+        assert_eq!(router.service(Method::TRACE), None);
+        assert_eq!(router.service(Method::CONNECT), None);
+    }
+
+    #[test]
+    fn method_router_fallback() {
+        let router = make_router();
+        assert_eq!(router.fallback, "fallback");
+    }
+
+    #[test]
+    fn method_router_set_all_standard_methods() {
+        let mut router = MethodRouter::new("fb");
+        router.set(Method::OPTIONS, "opt");
+        router.set(Method::GET, "get");
+        router.set(Method::POST, "post");
+        router.set(Method::PUT, "put");
+        router.set(Method::DELETE, "del");
+        router.set(Method::HEAD, "head");
+        router.set(Method::TRACE, "trace");
+        router.set(Method::CONNECT, "connect");
+        router.set(Method::PATCH, "patch");
+
+        assert_eq!(router.service(Method::OPTIONS), Some(&"opt"));
+        assert_eq!(router.service(Method::GET), Some(&"get"));
+        assert_eq!(router.service(Method::POST), Some(&"post"));
+        assert_eq!(router.service(Method::PUT), Some(&"put"));
+        assert_eq!(router.service(Method::DELETE), Some(&"del"));
+        assert_eq!(router.service(Method::HEAD), Some(&"head"));
+        assert_eq!(router.service(Method::TRACE), Some(&"trace"));
+        assert_eq!(router.service(Method::CONNECT), Some(&"connect"));
+        assert_eq!(router.service(Method::PATCH), Some(&"patch"));
+    }
+
+    #[test]
+    fn method_router_service_mut() {
+        let mut router = make_router();
+        if let Some(handler) = router.service_mut(Method::GET) {
+            *handler = "updated_get";
+        }
+        assert_eq!(router.service(Method::GET), Some(&"updated_get"));
+    }
+
+    #[test]
+    fn method_router_set_fallback() {
+        let mut router = make_router();
+        router.set_fallback("new_fallback");
+        assert_eq!(router.fallback, "new_fallback");
+    }
+
+    #[test]
+    fn method_router_overwrite() {
+        let mut router = make_router();
+        router.set(Method::GET, "overwritten");
+        assert_eq!(router.service(Method::GET), Some(&"overwritten"));
+    }
+
+    #[test]
+    fn router_builder_chain() {
+        use super::Router;
+
+        async fn dummy(_req: &mut super::Request, _resp: &mut super::Response) {}
+
+        // Just test that the builder pattern compiles and doesn't panic
+        let _router = Router::new()
+            .route("/exact", dummy)
+            .get("/api/users", dummy)
+            .post("/api/users", dummy)
+            .fallback(dummy);
+    }
+
+    #[test]
+    fn matchit_path_matching() {
+        // Directly test the underlying matchit router to verify path matching logic
+        let mut router = matchit::Router::new();
+        router.insert("/", "root").unwrap();
+        router.insert("/users", "users").unwrap();
+        router.insert("/users/{id}", "user_by_id").unwrap();
+        router.insert("/files/{*path}", "files_catch_all").unwrap();
+
+        // Exact matches
+        assert_eq!(*router.at("/").unwrap().value, "root");
+        assert_eq!(*router.at("/users").unwrap().value, "users");
+
+        // Parameterized match
+        let m = router.at("/users/42").unwrap();
+        assert_eq!(*m.value, "user_by_id");
+        assert_eq!(m.params.get("id"), Some("42"));
+
+        // Catch-all match
+        let m = router.at("/files/docs/readme.md").unwrap();
+        assert_eq!(*m.value, "files_catch_all");
+        assert_eq!(m.params.get("path"), Some("docs/readme.md"));
+
+        // No match
+        assert!(router.at("/nonexistent").is_err());
+        assert!(router.at("").is_err());
+    }
+}

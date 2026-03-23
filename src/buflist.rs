@@ -324,3 +324,131 @@ impl Extend<Bytes> for BuflistCursor {
         self.buflist.extend(iter);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::{Buf, Bytes};
+
+    use super::BufList;
+
+    #[test]
+    fn empty_buflist() {
+        let bl = BufList::new();
+        assert_eq!(bl.remaining(), 0);
+        assert!(!bl.has_remaining());
+        assert!(bl.chunk().is_empty());
+    }
+
+    #[test]
+    fn write_adds_data() {
+        let mut bl = BufList::new();
+        bl.write(Bytes::from_static(b"hello"));
+        assert_eq!(bl.remaining(), 5);
+        assert!(bl.has_remaining());
+        assert_eq!(bl.chunk(), b"hello");
+    }
+
+    #[test]
+    fn multiple_writes() {
+        let mut bl = BufList::new();
+        bl.write(Bytes::from_static(b"hello"));
+        bl.write(Bytes::from_static(b" world"));
+        assert_eq!(bl.remaining(), 11);
+        // chunk() returns only the first buffer segment
+        assert_eq!(bl.chunk(), b"hello");
+    }
+
+    #[test]
+    fn advance_within_first_chunk() {
+        let mut bl = BufList::new();
+        bl.write(Bytes::from_static(b"hello"));
+        bl.advance(2);
+        assert_eq!(bl.remaining(), 3);
+        assert_eq!(bl.chunk(), b"llo");
+    }
+
+    #[test]
+    fn advance_across_chunks() {
+        let mut bl = BufList::new();
+        bl.write(Bytes::from_static(b"abc"));
+        bl.write(Bytes::from_static(b"def"));
+        bl.advance(4);
+        assert_eq!(bl.remaining(), 2);
+        assert_eq!(bl.chunk(), b"ef");
+    }
+
+    #[test]
+    fn advance_to_exact_end() {
+        let mut bl = BufList::new();
+        bl.write(Bytes::from_static(b"abc"));
+        bl.write(Bytes::from_static(b"de"));
+        bl.advance(5);
+        assert_eq!(bl.remaining(), 0);
+        assert!(!bl.has_remaining());
+    }
+
+    #[test]
+    fn copy_to_bytes_single_chunk() {
+        let mut bl = BufList::new();
+        bl.write(Bytes::from_static(b"hello"));
+        let b = bl.copy_to_bytes(5);
+        assert_eq!(&b[..], b"hello");
+        assert_eq!(bl.remaining(), 0);
+    }
+
+    #[test]
+    fn copy_to_bytes_spanning_chunks() {
+        let mut bl = BufList::new();
+        bl.write(Bytes::from_static(b"ab"));
+        bl.write(Bytes::from_static(b"cd"));
+        let b = bl.copy_to_bytes(3);
+        assert_eq!(&b[..], b"abc");
+        assert_eq!(bl.remaining(), 1);
+        assert_eq!(bl.chunk(), b"d");
+    }
+
+    #[test]
+    fn from_iterator() {
+        let bl: BufList = vec![
+            Bytes::from_static(b"aaa"),
+            Bytes::from_static(b"bb"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(bl.remaining(), 5);
+    }
+
+    #[test]
+    fn extend_buflist() {
+        let mut bl = BufList::new();
+        bl.extend(vec![Bytes::from_static(b"x"), Bytes::from_static(b"yy")]);
+        assert_eq!(bl.remaining(), 3);
+    }
+
+    #[test]
+    fn sequential_reads() {
+        let mut bl = BufList::new();
+        bl.write(Bytes::from_static(b"ab"));
+        bl.write(Bytes::from_static(b"cd"));
+        bl.write(Bytes::from_static(b"ef"));
+
+        let c1 = bl.copy_to_bytes(2);
+        assert_eq!(&c1[..], b"ab");
+
+        let c2 = bl.copy_to_bytes(2);
+        assert_eq!(&c2[..], b"cd");
+
+        let c3 = bl.copy_to_bytes(2);
+        assert_eq!(&c3[..], b"ef");
+
+        assert_eq!(bl.remaining(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "advance beyond buffer length")]
+    fn advance_beyond_panics() {
+        let mut bl = BufList::new();
+        bl.write(Bytes::from_static(b"ab"));
+        bl.advance(3);
+    }
+}
