@@ -179,7 +179,7 @@ impl Protocol for QPackProtocol {
     }
 }
 
-#[derive(Default, Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct QPackProtocolFactory {
     // No state for now, but can add config options here in the future.
 }
@@ -457,7 +457,6 @@ impl<C: ?Sized> ConnectionState<C> {
 #[cfg(test)]
 mod tests {
     use std::{
-        cmp::Ordering,
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
     };
@@ -483,13 +482,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn qpack_factory_ordering_equal() {
-        assert_eq!(
-            QPackProtocolFactory::new().cmp(&QPackProtocolFactory::new()),
-            Ordering::Equal,
-        );
-    }
     #[test]
     fn qpack_decoder_stream_type_is_0x03() {
         assert_eq!(

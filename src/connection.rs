@@ -1,6 +1,5 @@
 use std::{
     any::Any,
-    collections::hash_map::DefaultHasher,
     fmt::{self, Debug},
     hash::{Hash, Hasher},
     io,
@@ -17,7 +16,7 @@ use crate::{
     codec::{self, PeekableStreamReader, SinkWriter, StreamReader},
     dhttp::{protocol::DHttpProtocolFactory, settings::Settings},
     error::{Code, ErrorScope, H3Error},
-    protocol::{InitProtocols, ProductProtocol, Protocols, StreamVerdict, type_id_as_u128},
+    protocol::{InitProtocols, ProductProtocol, Protocols, StreamVerdict, compute_factory_identity},
     qpack::protocol::QPackProtocolFactory,
     quic::{self, CancelStreamExt, StopStreamExt, agent},
     util::watch::Watch,
@@ -131,7 +130,7 @@ pub trait LifecycleExt: quic::Lifecycle + Sync {
 impl<T: quic::Lifecycle + Sync + ?Sized> LifecycleExt for T {}
 
 pub struct ConnectionBuilder<C: Any + ?Sized> {
-    protocols_initializers: Vec<Box<dyn InitProtocols<C>>>,
+    protocols_initializers: Vec<(u64, Box<dyn InitProtocols<C>>)>,
     _connection: PhantomData<C>,
 }
 
@@ -155,7 +154,8 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
     }
 
     pub fn protocol<F: ProductProtocol<C>>(mut self, factory: F) -> Self {
-        self.protocols_initializers.push(Box::new(factory));
+        let identity = compute_factory_identity::<C, F>(&factory);
+        self.protocols_initializers.push((identity, Box::new(factory)));
         self
     }
 
@@ -166,7 +166,7 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
         let quic = Arc::new(quic);
         let mut protocols = Protocols::new();
 
-        for initializer in &self.protocols_initializers {
+        for (_identity, initializer) in &self.protocols_initializers {
             initializer.init_protocols(&quic, &mut protocols).await?;
         }
 
@@ -186,19 +186,15 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
 
 impl<C: quic::Connection + ?Sized> Hash for ConnectionBuilder<C> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let mut hashes: Vec<(u128, u64)> = self
+        // Sort by identity hash for order-independent hashing
+        let mut identities: Vec<u64> = self
             .protocols_initializers
             .iter()
-            .map(|f| {
-                let mut hasher = DefaultHasher::new();
-                f.identity_hash(&mut hasher);
-                (type_id_as_u128(f.identity_type_id()), hasher.finish())
-            })
+            .map(|(id, _)| *id)
             .collect();
-        hashes.sort_by_key(|(tid, _)| *tid);
-        for (tid, h) in &hashes {
-            tid.hash(state);
-            h.hash(state);
+        identities.sort();
+        for id in &identities {
+            id.hash(state);
         }
     }
 }
@@ -208,23 +204,19 @@ impl<C: quic::Connection + ?Sized> PartialEq for ConnectionBuilder<C> {
         if self.protocols_initializers.len() != other.protocols_initializers.len() {
             return false;
         }
-        let sort_key = |f: &dyn InitProtocols<C>| type_id_as_u128(f.identity_type_id());
-        let mut self_sorted: Vec<_> = self
+        let mut self_ids: Vec<u64> = self
             .protocols_initializers
             .iter()
-            .map(|f| f.as_ref())
+            .map(|(id, _)| *id)
             .collect();
-        let mut other_sorted: Vec<_> = other
+        let mut other_ids: Vec<u64> = other
             .protocols_initializers
             .iter()
-            .map(|f| f.as_ref())
+            .map(|(id, _)| *id)
             .collect();
-        self_sorted.sort_by_key(|f| sort_key(*f));
-        other_sorted.sort_by_key(|f| sort_key(*f));
-        self_sorted
-            .iter()
-            .zip(other_sorted.iter())
-            .all(|(a, b)| a.identity_eq(b.as_any()))
+        self_ids.sort();
+        other_ids.sort();
+        self_ids == other_ids
     }
 }
 

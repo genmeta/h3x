@@ -819,7 +819,7 @@ impl Protocol for DHttpProtocol {
     }
 }
 
-#[derive(Default, Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct DHttpProtocolFactory {
     local_settings: Arc<Settings>,
 }
