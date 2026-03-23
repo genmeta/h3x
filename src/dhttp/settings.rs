@@ -42,7 +42,7 @@ impl Setting {
     /// the message header it will accept on an individual HTTP message. A
     /// server that receives a larger header section than it is willing to
     /// handle can send an HTTP 431 (Request Header Fields Too Large) status
-    /// code ([RFC6585]). A client can discard responses that it cannot
+    /// code (\[RFC6585\]). A client can discard responses that it cannot
     /// process. The size of a field list is calculated based on the
     /// uncompressed size of fields, including the length of the name and
     /// value in bytes plus an overhead of 32 bytes for each field.
@@ -53,7 +53,7 @@ impl Setting {
     /// received this parameter SHOULD NOT send an HTTP message header that
     /// exceeds the indicated size, as the peer will likely refuse to process
     /// it. However, an HTTP message can traverse one or more intermediaries
-    /// before reaching the origin server; see Section 3.7 of [HTTP].
+    /// before reaching the origin server; see Section 3.7 of \[HTTP\].
     /// Because this limit is applied separately by each implementation that
     /// processes the message, messages below this limit are not guaranteed
     /// to be accepted.
@@ -118,15 +118,15 @@ impl Setting {
         }
     }
 
-    /// [RFC8441] defines a mechanism for running the WebSocket Protocol
-    /// [RFC6455] over a single stream of an HTTP/2 connection. It defines an
+    /// \[RFC8441\] defines a mechanism for running the WebSocket Protocol
+    /// \[RFC6455\] over a single stream of an HTTP/2 connection. It defines an
     /// Extended CONNECT method that specifies a new ":protocol" pseudo-
     /// header field and new semantics for the ":path" and ":authority"
     /// pseudo-header fields. It also defines a new HTTP/2 setting sent by a
     /// server to allow the client to use Extended CONNECT.
     ///
     /// The semantics of the pseudo-header fields and setting are identical
-    /// to those in HTTP/2 as defined in [RFC8441]. Appendix A.3 of [HTTP/3]
+    /// to those in HTTP/2 as defined in \[RFC8441\]. Appendix A.3 of \[HTTP/3\]
     /// requires that HTTP/3 settings be registered separately for HTTP/3.
     /// The SETTINGS_ENABLE_CONNECT_PROTOCOL value is 0x08 (decimal 8), as in
     /// HTTP/2.

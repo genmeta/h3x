@@ -49,7 +49,7 @@
 //! When adding a new protocol layer:
 //!
 //! 1. The runtime struct (e.g. `MyProtocol`) must be **non-generic** and implement
-//!    [`Protocol`] + [`Any`](std::any::Any).
+//!    [`Protocol`] + [`Any`].
 //! 2. The factory struct (e.g. `MyProtocolFactory`) implements [`ProductProtocol<C>`]
 //!    to perform typed initialization against `Arc<C>`, then returns the non-generic
 //!    runtime protocol.

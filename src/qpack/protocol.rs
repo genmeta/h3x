@@ -1,6 +1,6 @@
 //! QPACK protocol layer implementation.
 //!
-//! [`QPackLayer`] encapsulates QPACK-specific logic for stream identification
+//! `QPackLayer` encapsulates QPACK-specific logic for stream identification
 //! and protocol state. It implements [`Protocol`] to participate in
 //! the layered stream routing architecture.
 

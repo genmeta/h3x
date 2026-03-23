@@ -1,6 +1,6 @@
 //! DHTTP/3 protocol layer implementation.
 //!
-//! [`DHttpLayer`] encapsulates all HTTP/3-specific logic for stream identification
+//! `DHttpLayer` encapsulates all HTTP/3-specific logic for stream identification
 //! and protocol initialization. It implements [`Protocol`] to participate in
 //! the layered stream routing architecture.
 
