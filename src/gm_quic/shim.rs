@@ -6,10 +6,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{
-    FutureExt, Sink, Stream, TryFutureExt,
-    future::{self, BoxFuture},
-};
+use futures::{Sink, Stream, future::BoxFuture};
 use rustls::{SignatureScheme, pki_types::CertificateDer, sign::CertifiedKey};
 
 use crate::{
@@ -43,7 +40,10 @@ pub fn convert_connection_error(error: gm_quic::prelude::Error) -> quic::Connect
         }
         gm_quic::prelude::Error::App(app_error) => {
             quic::ConnectionError::from(quic::ApplicationError {
-                code: Code::new(VarInt::try_from(app_error.error_code()).unwrap()),
+                code: Code::new(
+                    VarInt::try_from(app_error.error_code())
+                        .expect("QUIC application error code fits in VarInt range"),
+                ),
                 reason: app_error.reason().to_owned().into(),
             })
         }
@@ -56,7 +56,8 @@ pub fn convert_stream_error(error: gm_quic::prelude::StreamError) -> quic::Strea
             quic::StreamError::from(convert_connection_error(error))
         }
         gm_quic::prelude::StreamError::Reset(reset_stream_error) => quic::StreamError::Reset {
-            code: VarInt::try_from(reset_stream_error.error_code()).unwrap(),
+            code: VarInt::try_from(reset_stream_error.error_code())
+                .expect("QUIC reset error code fits in VarInt range"),
         },
         gm_quic::prelude::StreamError::EosSent => {
             unreachable!("h3x write data after shutdown")
@@ -171,73 +172,67 @@ impl CancelStream for StreamWriter {
     }
 }
 
-impl quic::ManageStream for gm_quic::prelude::Connection {
+impl quic::ManageStreamAsync for gm_quic::prelude::Connection {
     type StreamWriter = StreamWriter;
 
     type StreamReader = StreamReader;
 
-    fn open_bi(
+    async fn open_bi(
         &self,
-    ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError>>
-    {
-        self.open_bi_stream()
-            .map(|result| {
-                let stream = result.map_err(convert_connection_error)?;
-                let (stream_id, (reader, writer)) = stream.ok_or_else(|| {
-                    quic::ConnectionError::from(quic::TransportError {
-                        kind: VarInt::from_u32(0x04), // STREAM_LIMIT_ERROR
-                        frame_type: VarInt::from_u32(0),
-                        reason: "stream ID space exhausted".into(),
-                    })
-                })?;
-                let stream_id = convert_varint(stream_id.into());
-                let reader = StreamReader { stream_id, reader };
-                let writer = StreamWriter { stream_id, writer };
-                Ok((reader, writer))
+    ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+        let stream = self
+            .open_bi_stream()
+            .await
+            .map_err(convert_connection_error)?;
+        let (stream_id, (reader, writer)) = stream.ok_or_else(|| {
+            quic::ConnectionError::from(quic::TransportError {
+                kind: VarInt::from_u32(0x04), // STREAM_LIMIT_ERROR
+                frame_type: VarInt::from_u32(0),
+                reason: "stream ID space exhausted".into(),
             })
-            .boxed()
+        })?;
+        let stream_id = convert_varint(stream_id.into());
+        let reader = StreamReader { stream_id, reader };
+        let writer = StreamWriter { stream_id, writer };
+        Ok((reader, writer))
     }
 
-    fn open_uni(&self) -> BoxFuture<'_, Result<Self::StreamWriter, quic::ConnectionError>> {
-        self.open_uni_stream()
-            .map(|result| {
-                let stream = result.map_err(convert_connection_error)?;
-                let (stream_id, writer) = stream.ok_or_else(|| {
-                    quic::ConnectionError::from(quic::TransportError {
-                        kind: VarInt::from_u32(0x04), // STREAM_LIMIT_ERROR
-                        frame_type: VarInt::from_u32(0),
-                        reason: "stream ID space exhausted".into(),
-                    })
-                })?;
-                let stream_id = convert_varint(stream_id.into());
-                Ok(StreamWriter { stream_id, writer })
+    async fn open_uni(&self) -> Result<Self::StreamWriter, quic::ConnectionError> {
+        let stream = self
+            .open_uni_stream()
+            .await
+            .map_err(convert_connection_error)?;
+        let (stream_id, writer) = stream.ok_or_else(|| {
+            quic::ConnectionError::from(quic::TransportError {
+                kind: VarInt::from_u32(0x04), // STREAM_LIMIT_ERROR
+                frame_type: VarInt::from_u32(0),
+                reason: "stream ID space exhausted".into(),
             })
-            .boxed()
+        })?;
+        let stream_id = convert_varint(stream_id.into());
+        Ok(StreamWriter { stream_id, writer })
     }
 
-    fn accept_bi(
+    async fn accept_bi(
         &self,
-    ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError>>
-    {
-        self.accept_bi_stream()
-            .map_ok(|(stream_id, (reader, writer))| {
-                let stream_id = convert_varint(stream_id.into());
-                let reader = StreamReader { stream_id, reader };
-                let writer = StreamWriter { stream_id, writer };
-                (reader, writer)
-            })
-            .map_err(convert_connection_error)
-            .boxed()
+    ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+        let (stream_id, (reader, writer)) = self
+            .accept_bi_stream()
+            .await
+            .map_err(convert_connection_error)?;
+        let stream_id = convert_varint(stream_id.into());
+        let reader = StreamReader { stream_id, reader };
+        let writer = StreamWriter { stream_id, writer };
+        Ok((reader, writer))
     }
 
-    fn accept_uni(&self) -> BoxFuture<'_, Result<Self::StreamReader, quic::ConnectionError>> {
-        self.accept_uni_stream()
-            .map_ok(|(stream_id, reader)| {
-                let stream_id = convert_varint(stream_id.into());
-                StreamReader { stream_id, reader }
-            })
-            .map_err(convert_connection_error)
-            .boxed()
+    async fn accept_uni(&self) -> Result<Self::StreamReader, quic::ConnectionError> {
+        let (stream_id, reader) = self
+            .accept_uni_stream()
+            .await
+            .map_err(convert_connection_error)?;
+        let stream_id = convert_varint(stream_id.into());
+        Ok(StreamReader { stream_id, reader })
     }
 }
 
@@ -286,48 +281,42 @@ impl agent::RemoteAgent for GmQuicRemoteAgent {
     }
 }
 
-impl quic::WithLocalAgent for gm_quic::prelude::Connection {
+impl quic::WithLocalAgentAsync for gm_quic::prelude::Connection {
     type LocalAgent = GmQuicLocalAgent;
 
-    fn local_agent(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<GmQuicLocalAgent>, quic::ConnectionError>> {
-        self.local_agent()
-            .map_ok(|local_agent| {
-                local_agent.map(|local_agent| {
-                    let name = AsRef::<Arc<str>>::as_ref(&local_agent).clone();
-                    let certified_key = AsRef::<Arc<CertifiedKey>>::as_ref(&local_agent).clone();
-                    GmQuicLocalAgent {
-                        name,
-                        certified_key,
-                    }
-                })
-            })
-            .map_err(convert_connection_error)
-            .boxed()
+    async fn local_agent(&self) -> Result<Option<GmQuicLocalAgent>, quic::ConnectionError> {
+        let local_agent = self
+            .local_agent()
+            .await
+            .map_err(convert_connection_error)?;
+        Ok(local_agent.map(|local_agent| {
+            let name = AsRef::<Arc<str>>::as_ref(&local_agent).clone();
+            let certified_key = AsRef::<Arc<CertifiedKey>>::as_ref(&local_agent).clone();
+            GmQuicLocalAgent {
+                name,
+                certified_key,
+            }
+        }))
     }
 }
 
-impl quic::WithRemoteAgent for gm_quic::prelude::Connection {
+impl quic::WithRemoteAgentAsync for gm_quic::prelude::Connection {
     type RemoteAgent = GmQuicRemoteAgent;
 
-    fn remote_agent(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<GmQuicRemoteAgent>, quic::ConnectionError>> {
-        self.remote_agent()
-            .map_ok(|remote_agent| {
-                remote_agent.map(|remote_agent| {
-                    let name = AsRef::<Arc<str>>::as_ref(&remote_agent).clone();
-                    let cert_chain = AsRef::<Arc<[CertificateDer]>>::as_ref(&remote_agent).clone();
-                    GmQuicRemoteAgent { name, cert_chain }
-                })
-            })
-            .map_err(convert_connection_error)
-            .boxed()
+    async fn remote_agent(&self) -> Result<Option<GmQuicRemoteAgent>, quic::ConnectionError> {
+        let remote_agent = self
+            .remote_agent()
+            .await
+            .map_err(convert_connection_error)?;
+        Ok(remote_agent.map(|remote_agent| {
+            let name = AsRef::<Arc<str>>::as_ref(&remote_agent).clone();
+            let cert_chain = AsRef::<Arc<[CertificateDer]>>::as_ref(&remote_agent).clone();
+            GmQuicRemoteAgent { name, cert_chain }
+        }))
     }
 }
 
-impl quic::Lifecycle for gm_quic::prelude::Connection {
+impl quic::LifecycleAsync for gm_quic::prelude::Connection {
     fn close(&self, code: Code, reason: Cow<'static, str>) {
         _ = gm_quic::prelude::Connection::close(self, reason, code.into_inner().into_inner());
     }
@@ -336,58 +325,57 @@ impl quic::Lifecycle for gm_quic::prelude::Connection {
         self.validate().map_err(convert_connection_error)
     }
 
-    fn closed(&self) -> BoxFuture<'_, quic::ConnectionError> {
-        Box::pin(gm_quic::prelude::Connection::terminated(self).map(convert_connection_error))
+    async fn closed(&self) -> quic::ConnectionError {
+        convert_connection_error(gm_quic::prelude::Connection::terminated(self).await)
     }
 }
 
-impl quic::Listen for gm_quic::prelude::QuicListeners {
+impl quic::ListenAsync for gm_quic::prelude::QuicListeners {
     type Connection = gm_quic::prelude::Connection;
 
     type Error = gm_quic::prelude::ListenersShutdown;
 
-    fn accept(&self) -> BoxFuture<'_, Result<Self::Connection, Self::Error>> {
-        self.accept().map_ok(|(connection, ..)| connection).boxed()
+    async fn accept(&self) -> Result<Self::Connection, Self::Error> {
+        let (connection, ..) = gm_quic::prelude::QuicListeners::accept(self).await?;
+        Ok(connection)
     }
 
-    fn shutdown(&self) -> BoxFuture<'_, Result<(), Self::Error>> {
-        self.shutdown();
-        Box::pin(future::always_ready(|| Ok(())))
+    async fn shutdown(&self) -> Result<(), Self::Error> {
+        gm_quic::prelude::QuicListeners::shutdown(self);
+        Ok(())
     }
 }
 
-impl quic::Listen for Arc<gm_quic::prelude::QuicListeners> {
+impl quic::ListenAsync for Arc<gm_quic::prelude::QuicListeners> {
     type Connection = gm_quic::prelude::Connection;
 
     type Error = gm_quic::prelude::ListenersShutdown;
 
-    fn accept(&self) -> BoxFuture<'_, Result<Self::Connection, Self::Error>> {
-        self.as_ref()
-            .accept()
-            .map_ok(|(connection, ..)| connection)
-            .boxed()
+    async fn accept(&self) -> Result<Self::Connection, Self::Error> {
+        let (connection, ..) = self.as_ref().accept().await?;
+        Ok(connection)
     }
 
-    fn shutdown(&self) -> BoxFuture<'_, Result<(), Self::Error>> {
+    async fn shutdown(&self) -> Result<(), Self::Error> {
         self.as_ref().shutdown();
-        Box::pin(future::always_ready(|| Ok(())))
+        Ok(())
     }
 }
 
-impl quic::Connect for Arc<gm_quic::prelude::QuicClient> {
+impl quic::ConnectAsync for Arc<gm_quic::prelude::QuicClient> {
     type Connection = gm_quic::prelude::Connection;
 
     type Error = gm_quic::prelude::ConnectServerError;
 
-    fn connect<'a>(
-        &'a self,
-        server: &'a http::uri::Authority,
-    ) -> BoxFuture<'a, Result<Self::Connection, Self::Error>> {
+    async fn connect(
+        &self,
+        server: &http::uri::Authority,
+    ) -> Result<Self::Connection, Self::Error> {
         let name = if let Some(port) = server.port_u16() {
             format!("{}:{}", server.host(), port)
         } else {
             server.host().to_string()
         };
-        async move { gm_quic::prelude::QuicClient::connect(self, &name).await }.boxed()
+        gm_quic::prelude::QuicClient::connect(self, &name).await
     }
 }

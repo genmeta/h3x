@@ -3,6 +3,7 @@ use std::{
     borrow::Cow,
     convert::Infallible,
     error::Error,
+    future::Future,
     io,
     ops::DerefMut,
     pin::Pin,
@@ -131,6 +132,32 @@ pub trait Connect {
     ) -> BoxFuture<'a, Result<Self::Connection, Self::Error>>;
 }
 
+/// Async-native version of [`Connect`] using AFIT (`async fn`).
+///
+/// Implement this for concrete types; a blanket impl provides the
+/// [`Connect`] (BoxFuture) version automatically.
+pub trait ConnectAsync: Send + Sync {
+    type Connection: Connection;
+    type Error: Error + Any;
+
+    fn connect<'a>(
+        &'a self,
+        server: &'a Authority,
+    ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send + 'a;
+}
+
+impl<C: ConnectAsync> Connect for C {
+    type Connection = C::Connection;
+    type Error = C::Error;
+
+    fn connect<'a>(
+        &'a self,
+        server: &'a Authority,
+    ) -> BoxFuture<'a, Result<Self::Connection, Self::Error>> {
+        Box::pin(ConnectAsync::connect(self, server))
+    }
+}
+
 pub trait Listen {
     type Connection: Connection;
     type Error: Error + Any;
@@ -138,6 +165,29 @@ pub trait Listen {
     fn accept(&self) -> BoxFuture<'_, Result<Self::Connection, Self::Error>>;
 
     fn shutdown(&self) -> BoxFuture<'_, Result<(), Self::Error>>;
+}
+
+/// Async-native version of [`Listen`] using AFIT.
+pub trait ListenAsync: Send + Sync {
+    type Connection: Connection;
+    type Error: Error + Any;
+
+    fn accept(&self) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send + '_;
+
+    fn shutdown(&self) -> impl Future<Output = Result<(), Self::Error>> + Send + '_;
+}
+
+impl<L: ListenAsync> Listen for L {
+    type Connection = L::Connection;
+    type Error = L::Error;
+
+    fn accept(&self) -> BoxFuture<'_, Result<Self::Connection, Self::Error>> {
+        Box::pin(ListenAsync::accept(self))
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), Self::Error>> {
+        Box::pin(ListenAsync::shutdown(self))
+    }
 }
 
 pub trait Connection:
@@ -168,14 +218,93 @@ pub trait ManageStream {
 
     fn accept_uni(&self) -> BoxFuture<'_, Result<Self::StreamReader, ConnectionError>>;
 }
+
+/// Async-native version of [`ManageStream`] using AFIT.
+pub trait ManageStreamAsync: Send + Sync {
+    type StreamReader: ReadStream + Unpin;
+    type StreamWriter: WriteStream + Unpin;
+
+    fn open_bi(
+        &self,
+    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> + Send + '_;
+
+    fn open_uni(
+        &self,
+    ) -> impl Future<Output = Result<Self::StreamWriter, ConnectionError>> + Send + '_;
+
+    fn accept_bi(
+        &self,
+    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> + Send + '_;
+
+    fn accept_uni(
+        &self,
+    ) -> impl Future<Output = Result<Self::StreamReader, ConnectionError>> + Send + '_;
+}
+
+impl<M: ManageStreamAsync> ManageStream for M {
+    type StreamReader = M::StreamReader;
+    type StreamWriter = M::StreamWriter;
+
+    fn open_bi(
+        &self,
+    ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> {
+        Box::pin(ManageStreamAsync::open_bi(self))
+    }
+
+    fn open_uni(&self) -> BoxFuture<'_, Result<Self::StreamWriter, ConnectionError>> {
+        Box::pin(ManageStreamAsync::open_uni(self))
+    }
+
+    fn accept_bi(
+        &self,
+    ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> {
+        Box::pin(ManageStreamAsync::accept_bi(self))
+    }
+
+    fn accept_uni(&self) -> BoxFuture<'_, Result<Self::StreamReader, ConnectionError>> {
+        Box::pin(ManageStreamAsync::accept_uni(self))
+    }
+}
 pub trait WithLocalAgent {
     type LocalAgent: agent::LocalAgent + 'static;
     fn local_agent(&self) -> BoxFuture<'_, Result<Option<Self::LocalAgent>, ConnectionError>>;
 }
 
+/// Async-native version of [`WithLocalAgent`] using AFIT.
+pub trait WithLocalAgentAsync: Send + Sync {
+    type LocalAgent: agent::LocalAgent + 'static;
+    fn local_agent(
+        &self,
+    ) -> impl Future<Output = Result<Option<Self::LocalAgent>, ConnectionError>> + Send + '_;
+}
+
+impl<T: WithLocalAgentAsync> WithLocalAgent for T {
+    type LocalAgent = T::LocalAgent;
+
+    fn local_agent(&self) -> BoxFuture<'_, Result<Option<Self::LocalAgent>, ConnectionError>> {
+        Box::pin(WithLocalAgentAsync::local_agent(self))
+    }
+}
+
 pub trait WithRemoteAgent {
     type RemoteAgent: agent::RemoteAgent + 'static;
     fn remote_agent(&self) -> BoxFuture<'_, Result<Option<Self::RemoteAgent>, ConnectionError>>;
+}
+
+/// Async-native version of [`WithRemoteAgent`] using AFIT.
+pub trait WithRemoteAgentAsync: Send + Sync {
+    type RemoteAgent: agent::RemoteAgent + 'static;
+    fn remote_agent(
+        &self,
+    ) -> impl Future<Output = Result<Option<Self::RemoteAgent>, ConnectionError>> + Send + '_;
+}
+
+impl<T: WithRemoteAgentAsync> WithRemoteAgent for T {
+    type RemoteAgent = T::RemoteAgent;
+
+    fn remote_agent(&self) -> BoxFuture<'_, Result<Option<Self::RemoteAgent>, ConnectionError>> {
+        Box::pin(WithRemoteAgentAsync::remote_agent(self))
+    }
 }
 
 pub trait Lifecycle {
@@ -191,6 +320,31 @@ pub trait Lifecycle {
     ///
     /// Returns the error that caused the connection to terminate.
     fn closed(&self) -> BoxFuture<'_, ConnectionError>;
+}
+
+/// Async-native version of [`Lifecycle`] using AFIT.
+///
+/// Only `closed()` benefits from AFIT; `close()` and `check()` are synchronous.
+pub trait LifecycleAsync: Send + Sync {
+    fn close(&self, code: Code, reason: Cow<'static, str>);
+
+    fn check(&self) -> Result<(), ConnectionError>;
+
+    fn closed(&self) -> impl Future<Output = ConnectionError> + Send + '_;
+}
+
+impl<T: LifecycleAsync> Lifecycle for T {
+    fn close(&self, code: Code, reason: Cow<'static, str>) {
+        LifecycleAsync::close(self, code, reason)
+    }
+
+    fn check(&self) -> Result<(), ConnectionError> {
+        LifecycleAsync::check(self)
+    }
+
+    fn closed(&self) -> BoxFuture<'_, ConnectionError> {
+        Box::pin(LifecycleAsync::closed(self))
+    }
 }
 
 pub trait GetStreamId {
