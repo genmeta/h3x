@@ -5,13 +5,13 @@ pub mod upgrade {
     use crate::message::stream::hyper::upgrade::TakeoverSealed;
     pub use crate::message::stream::{
         hyper::upgrade::{HasTakeover, TakeoverError},
-        unfold::{read::BoxStreamReader, write::BoxStreamWriter},
+        unfold::{read::BoxMessageStreamReader, write::BoxMessageStreamWriter},
     };
 
     #[doc(alias = "take")]
     pub async fn on(
         mut message: impl HasTakeover,
-    ) -> Result<(BoxStreamReader<'static>, BoxStreamWriter<'static>), TakeoverError> {
+    ) -> Result<(BoxMessageStreamReader<'static>, BoxMessageStreamWriter<'static>), TakeoverError> {
         poll_fn(|cx| TakeoverSealed::poll_takeover(&mut message, cx))
             .await?
             .wait()

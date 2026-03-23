@@ -9,7 +9,7 @@ use http_body::Body;
 use tokio::sync::oneshot;
 
 use super::{ReadStream, WriteStream};
-use crate::message::stream::unfold::{read::BoxStreamReader, write::BoxStreamWriter};
+use crate::message::stream::unfold::{read::BoxMessageStreamReader, write::BoxMessageStreamWriter};
 
 pub struct RemainStream<S> {
     rx: Arc<Mutex<oneshot::Receiver<S>>>,
@@ -93,7 +93,7 @@ pub struct PendingTakeover {
 impl PendingTakeover {
     pub async fn wait(
         self,
-    ) -> Result<(BoxStreamReader<'static>, BoxStreamWriter<'static>), TakeoverError> {
+    ) -> Result<(BoxMessageStreamReader<'static>, BoxMessageStreamWriter<'static>), TakeoverError> {
         let write = self.write.await.ok_or(TakeoverError::Aborted)?;
         let read = self.read.await.ok_or(TakeoverError::Aborted)?;
         Ok((read.into_box_reader(), write.into_box_writer()))

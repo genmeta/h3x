@@ -6,7 +6,6 @@ use axum::{
     body::Body,
     routing::{any, get},
 };
-use bytes::Bytes;
 use common::*;
 use h3x::{
     hyper::{server::TowerService, upgrade},
@@ -261,7 +260,7 @@ fn axum_extend_connect() {
 
         let read_stream = pin!(read_stream.into_bytes_stream());
         let mut read_stream = StreamReader::new(read_stream);
-        let write_stream = pin!(write_stream.into_bytes_sink::<Bytes>());
+        let write_stream = pin!(write_stream.into_bytes_sink());
         let mut write_stream = SinkWriter::new(CopyToBytes::new(write_stream));
 
         write_stream
