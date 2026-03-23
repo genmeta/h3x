@@ -204,6 +204,10 @@ impl<R: AsyncRead + ?Sized> AsyncRead for FixedLengthReader<R> {
         match read {
             0 => Poll::Ready(Err(DecodeError::Incomplete.into())),
             read => {
+                // SAFETY: `poll_read` on the inner stream initializes exactly `read`
+                // bytes into the buffer. We must inform the ReadBuf that these bytes
+                // are now initialized. This is the standard AsyncRead pattern and
+                // ReadBuf::assume_init has no safe alternative in tokio's API.
                 unsafe {
                     buf.assume_init(read);
                 }
@@ -265,7 +269,7 @@ where
 
 impl<S> Stream for FixedLengthReader<&mut StreamReader<S>>
 where
-    S: TryStream<Ok = Bytes> + ?Sized,
+    S: TryStream<Ok = Bytes> + Unpin + ?Sized,
     DecodeStreamError: From<S::Error>,
 {
     type Item = Result<Bytes, DecodeStreamError>;
@@ -275,19 +279,14 @@ where
         if this.remaining == 0 {
             return Poll::Ready(None);
         }
-        // SAFETY: The StreamReader is pinned as part of FixedLengthReader,
-        // and we're accessing it through a pinned reference. This is safe
-        // because the lifetime is tied to `self`, ensuring the reference
-        // remains valid for the duration of the poll.
-        match ready!(unsafe { Pin::new_unchecked(&mut *this.stream) }.poll_bytes(cx)?) {
+        // Pin::new is safe here because StreamReader<S>: Unpin when S: Unpin
+        match ready!(Pin::new(&mut *this.stream).poll_bytes(cx)?) {
             bytes if bytes.is_empty() => Poll::Ready(Some(Err(DecodeError::Incomplete.into()))),
             bytes => {
                 let len = bytes.len().min(this.remaining as usize);
                 let bytes = bytes.slice(..len);
                 this.remaining -= len as u64;
-                // SAFETY: Same reasoning as above - StreamReader is pinned
-                // through FixedLengthReader's pinning.
-                unsafe { Pin::new_unchecked(&mut *this.stream) }.consume(len);
+                Pin::new(&mut *this.stream).consume(len);
                 Poll::Ready(Some(Ok(bytes)))
             }
         }

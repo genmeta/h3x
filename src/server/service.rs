@@ -88,10 +88,9 @@ impl BoxService {
 
     pub fn downcast<T: Any>(self) -> Result<Box<T>, BoxService> {
         match (self.0.as_ref() as &dyn Any).is::<T>() {
-            true => {
-                // SAFETY: checked by is::<T>()
-                Ok(unsafe { (self.0 as Box<dyn Any>).downcast::<T>().unwrap_unchecked() })
-            }
+            true => Ok((self.0 as Box<dyn Any>)
+                .downcast::<T>()
+                .expect("type checked by is::<T>()")),
             false => Err(self),
         }
     }

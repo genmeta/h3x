@@ -23,7 +23,8 @@ use crate::{
 };
 
 pub fn convert_varint(varint: gm_quic::prelude::VarInt) -> VarInt {
-    unsafe { VarInt::from_u64_unchecked(varint.into_inner()) }
+    // gm-quic's VarInt is already bounds-checked to RFC 9000 spec (< 2^62)
+    VarInt::from_u64(varint.into_inner()).expect("gm-quic VarInt is within valid range")
 }
 
 pub fn convert_connection_error(error: gm_quic::prelude::Error) -> quic::ConnectionError {

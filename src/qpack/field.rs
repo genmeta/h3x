@@ -53,8 +53,11 @@ impl AsRef<[u8]> for Protocol {
 
 impl AsRef<str> for Protocol {
     fn as_ref(&self) -> &str {
-        // SAFETY: Safe because we only construct Protocol from valid UTF-8
-        unsafe { std::str::from_utf8_unchecked(&self.token) }
+        // Protocol is always constructed from valid UTF-8:
+        // - TryFrom<Bytes> validates via str::from_utf8()
+        // - Protocol::new() takes &str
+        // - hyper integration validates via hyper::ext::Protocol (ASCII token)
+        std::str::from_utf8(&self.token).expect("Protocol token is valid UTF-8 by construction")
     }
 }
 
@@ -70,7 +73,7 @@ impl FieldLine {
     /// entry is calculated using the length of its name and value without
     /// Huffman encoding applied.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9204#section-3.2.1-2
+    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-3.2.1-2>
     pub fn size(&self) -> u64 {
         self.name.len() as u64 + self.value.len() as u64 + 32
     }
