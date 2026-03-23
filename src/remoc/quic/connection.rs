@@ -245,7 +245,7 @@ impl<C> ServedConnection<C> {
     }
 }
 
-fn serve_read_stream(
+pub fn serve_read_stream(
     reader: impl quic::ReadStream + 'static,
 ) -> (ReadStreamClient, impl Future<Output = ()> + Send + 'static) {
     let (server, client) = stream::ReadStreamServerSharedMut::new(
@@ -258,7 +258,7 @@ fn serve_read_stream(
     (client, fut)
 }
 
-fn serve_write_stream(
+pub fn serve_write_stream(
     writer: impl quic::WriteStream + 'static,
 ) -> (WriteStreamClient, impl Future<Output = ()> + Send + 'static) {
     let (server, client) = stream::WriteStreamServerSharedMut::new(

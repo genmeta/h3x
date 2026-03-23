@@ -58,6 +58,13 @@ where
         &self.stream
     }
 
+    pub fn into_inner(self) -> S
+    where
+        S: Sized,
+    {
+        self.stream
+    }
+
     pub fn consume(self: Pin<&mut Self>, amt: usize) {
         _ = self.project().chunk.split_to(amt)
     }
