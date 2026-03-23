@@ -181,25 +181,37 @@ impl quic::ManageStream for gm_quic::prelude::Connection {
     ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError>>
     {
         self.open_bi_stream()
-            .map_ok(|stream| {
-                let (stream_id, (reader, writer)) = stream.expect("todo: handle stream id run out");
+            .map(|result| {
+                let stream = result.map_err(convert_connection_error)?;
+                let (stream_id, (reader, writer)) = stream.ok_or_else(|| {
+                    quic::ConnectionError::from(quic::TransportError {
+                        kind: VarInt::from_u32(0x04), // STREAM_LIMIT_ERROR
+                        frame_type: VarInt::from_u32(0),
+                        reason: "stream ID space exhausted".into(),
+                    })
+                })?;
                 let stream_id = convert_varint(stream_id.into());
                 let reader = StreamReader { stream_id, reader };
                 let writer = StreamWriter { stream_id, writer };
-                (reader, writer)
+                Ok((reader, writer))
             })
-            .map_err(convert_connection_error)
             .boxed()
     }
 
     fn open_uni(&self) -> BoxFuture<'_, Result<Self::StreamWriter, quic::ConnectionError>> {
         self.open_uni_stream()
-            .map_ok(|stream| {
-                let (stream_id, writer) = stream.expect("todo: handle stream id run out");
+            .map(|result| {
+                let stream = result.map_err(convert_connection_error)?;
+                let (stream_id, writer) = stream.ok_or_else(|| {
+                    quic::ConnectionError::from(quic::TransportError {
+                        kind: VarInt::from_u32(0x04), // STREAM_LIMIT_ERROR
+                        frame_type: VarInt::from_u32(0),
+                        reason: "stream ID space exhausted".into(),
+                    })
+                })?;
                 let stream_id = convert_varint(stream_id.into());
-                StreamWriter { stream_id, writer }
+                Ok(StreamWriter { stream_id, writer })
             })
-            .map_err(convert_connection_error)
             .boxed()
     }
 

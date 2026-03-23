@@ -890,7 +890,7 @@ impl<C: ?Sized> ConnectionState<C> {
     #[doc(alias = "http")]
     pub fn dhttp(&self) -> &DHttpProtocol {
         self.protocol::<DHttpProtocol>()
-            .expect("DHttp protocol cannot be omitted")
+            .expect("DHttpProtocol is always initialized by ConnectionBuilder")
     }
 
     pub fn settings(&self) -> Arc<Settings> {

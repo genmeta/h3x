@@ -21,7 +21,7 @@ use crate::{
     },
     connection::{ConnectionState, LifecycleExt, StreamError},
     dhttp::{protocol::DHttpProtocol, settings::Settings, stream::UnidirectionalStream},
-    error::{H3CriticalStreamClosed, H3StreamCreationError},
+    error::{Code, H3CriticalStreamClosed, H3StreamCreationError},
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     qpack::{
         decoder::{Decoder, DecoderInstruction},
@@ -194,9 +194,12 @@ impl QPackProtocolFactory {
         conn: &Arc<C>,
         layers: &Protocols,
     ) -> Result<QPackProtocol, ConnectionError> {
-        let dhttp = layers
-            .get::<DHttpProtocol>()
-            .expect("DHttpLayer must be initialized before QPackLayer");
+        let dhttp = layers.get::<DHttpProtocol>().ok_or_else(|| {
+            ConnectionError::from(quic::ApplicationError {
+                code: Code::H3_INTERNAL_ERROR,
+                reason: "DHttpLayer must be initialized before QPackLayer".into(),
+            })
+        })?;
 
         // Create dispatch channels for incoming peer QPACK streams
         let (encoder_inst_receiver_tx, encoder_inst_receiver_rx) =
