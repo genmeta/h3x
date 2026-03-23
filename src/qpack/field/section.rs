@@ -302,7 +302,7 @@ impl FieldSection {
         let Some(PseudoHeaders::Request { method, .. }) = &self.pseudo_headers else {
             panic!("FieldSection is not request headers")
         };
-        method.clone().unwrap()
+        method.clone().expect("method is set for request headers")
     }
 
     pub fn set_method(&mut self, new: Method) {
@@ -373,7 +373,7 @@ impl FieldSection {
         uri.scheme = self.scheme();
         uri.authority = self.authority();
         uri.path_and_query = self.path();
-        Uri::from_parts(uri).unwrap()
+        Uri::from_parts(uri).expect("valid URI parts from request headers")
     }
 
     pub fn set_uri(&mut self, uri: Uri) {
@@ -393,7 +393,7 @@ impl FieldSection {
         let Some(PseudoHeaders::Response { status, .. }) = &self.pseudo_headers else {
             panic!("FieldSection is not response headers")
         };
-        status.unwrap()
+        status.expect("status is set for response headers")
     }
 
     pub fn set_status(&mut self, new: StatusCode) {

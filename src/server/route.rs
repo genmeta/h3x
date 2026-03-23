@@ -27,7 +27,7 @@ impl Fallback {
     }
 
     pub fn set(&mut self, service: BoxService) {
-        *self.0.write().unwrap() = service;
+        *self.0.write().expect("lock is not poisoned") = service;
     }
 }
 
@@ -36,7 +36,7 @@ impl Service for Fallback {
 
     fn serve<'s>(&self, request: &'s mut Request, response: &'s mut Response) -> Self::Future<'s> {
         tracing::debug!("Call fallback service");
-        self.0.read().unwrap().serve(request, response)
+        self.0.read().expect("lock is not poisoned").serve(request, response)
     }
 }
 

@@ -96,7 +96,7 @@ impl<P: ?Sized> Frame<P> {
     /// The payload and length of the frames are selected in any manner the
     /// implementation chooses.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9114#name-reserved-frame-types
+    /// <https://datatracker.ietf.org/doc/html/rfc9114#name-reserved-frame-types>
     pub const fn is_reserved_frame(&self) -> bool {
         (self.r#type.into_inner() >= 0x21) && (self.r#type.into_inner() - 0x21).is_multiple_of(0x1f)
     }
@@ -140,7 +140,7 @@ impl<P: AsyncWrite + ?Sized> AsyncWrite for Frame<P> {
                 return Poll::Ready(Err(EncodeError::FramePayloadTooLarge.into()));
             }
             Some(new_length) => {
-                *project.length = VarInt::from_u64(new_length).unwrap();
+                *project.length = VarInt::from_u64(new_length).expect("length checked to be within VarInt range");
             }
             None => return Poll::Ready(Err(EncodeError::FramePayloadTooLarge.into())),
         }
@@ -178,7 +178,7 @@ where
                 return Err(EncodeError::FramePayloadTooLarge.into());
             }
             Some(new_length) => {
-                *project.length = VarInt::from_u64(new_length).unwrap();
+                *project.length = VarInt::from_u64(new_length).expect("length checked to be within VarInt range");
             }
             None => return Err(EncodeError::FramePayloadTooLarge.into()),
         }

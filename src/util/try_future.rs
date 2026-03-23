@@ -45,7 +45,7 @@ impl<T, E, F> TryFuture<T, E, F> {
             }
             TryFutureProj::Value { .. } | TryFutureProj::Error { .. } => {
                 // as_mut() returns short-lived Pin<&mut Self>, so we need to re-project without as_mut()
-                Poll::Ready(self.try_peek_mut().unwrap())
+                Poll::Ready(self.try_peek_mut().expect("value or error is set after future resolves"))
             }
         }
     }

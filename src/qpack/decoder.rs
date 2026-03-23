@@ -208,13 +208,13 @@ pub struct Decoder<Ds, Es> {
 
 impl<Ds, Es> Decoder<Ds, Es> {
     pub(crate) fn emit(&self, instruction: DecoderInstruction) {
-        self.state.lock().unwrap().emit(instruction);
+        self.state.lock().expect("lock is not poisoned").emit(instruction);
     }
 
     pub(crate) fn known_received_count(&self) -> u64 {
         self.state
             .lock()
-            .unwrap()
+            .expect("lock is not poisoned")
             .dynamic_table
             .known_received_count
     }
@@ -346,7 +346,7 @@ where
 
         // RFC 9204 §4.5.1.1: Decode the wire-encoded insert count to true RIC
         let (max_table_capacity, total_inserts) = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock().expect("lock is not poisoned");
             (
                 state.settings.qpack_max_table_capacity().into_inner(),
                 state.dynamic_table.inserted_count,
@@ -377,7 +377,7 @@ where
                 decompression_field_line_representation(
                     &representation,
                     base,
-                    &self.state.lock().unwrap().dynamic_table,
+                    &self.state.lock().expect("lock is not poisoned").dynamic_table,
                 )
                 .map_err(StreamError::from)
             })
@@ -393,7 +393,7 @@ where
     }
 
     fn pending_instructions(&self) -> impl Iterator<Item = DecoderInstruction> {
-        std::iter::from_fn(move || self.state.lock().unwrap().pending_instructions.pop_front())
+        std::iter::from_fn(move || self.state.lock().expect("lock is not poisoned").pending_instructions.pop_front())
     }
 
     pub async fn flush_instructions(&self) -> Result<(), StreamError> {
@@ -422,7 +422,7 @@ where
                 instruction.ok_or(H3CriticalStreamClosed::QPackEncoder)??
             };
 
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().expect("lock is not poisoned");
             match instruction {
                 EncoderInstruction::SetDynamicTableCapacity { capacity } => {
                     state.set_dynamic_table_capacity(capacity)?

@@ -23,7 +23,7 @@ impl TaskSet {
     /// The future is automatically instrumented with the current tracing span
     /// via [`.in_current_span()`](tracing::Instrument::in_current_span).
     pub fn spawn(&self, fut: impl Future<Output = ()> + Send + 'static) {
-        let mut set = self.inner.lock().unwrap();
+        let mut set = self.inner.lock().expect("lock is not poisoned");
         // Drain all completed tasks before spawning a new one.
         while set.try_join_next().is_some() {}
         set.spawn(fut.in_current_span());

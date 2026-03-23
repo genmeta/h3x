@@ -31,13 +31,13 @@ impl<T> RingChannel<T> {
     }
 
     pub fn capacity(&self) -> usize {
-        self.ring.lock().unwrap().capacity()
+        self.ring.lock().expect("lock is not poisoned").capacity()
     }
 
     pub fn send(&self, item: T) -> Option<T> {
         let mut overflow = None;
         {
-            let mut guard = self.ring.lock().unwrap();
+            let mut guard = self.ring.lock().expect("lock is not poisoned");
             if guard.len() == guard.capacity() {
                 overflow = guard.pop_front();
             }
@@ -72,7 +72,7 @@ impl<T> Future for Receiver<T> {
         loop {
             project.notified.as_mut().enable();
 
-            match project.channel.ring.lock().unwrap().pop_front() {
+            match project.channel.ring.lock().expect("lock is not poisoned").pop_front() {
                 Some(item) => return Poll::Ready(item),
                 None => ready!(project.notified.as_mut().poll(cx)),
             };

@@ -55,7 +55,7 @@ impl<T> Watch<T> {
 
     pub fn lock(&self) -> Value<'_, T> {
         Value {
-            guard: self.state.lock().unwrap(),
+            guard: self.state.lock().expect("lock is not poisoned"),
             notify: self.notify.clone(),
         }
     }
@@ -68,7 +68,7 @@ impl<T> Watch<T> {
     where
         T: Clone,
     {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().expect("lock is not poisoned");
         guard.value.clone()
     }
 
@@ -96,7 +96,7 @@ impl<T: Clone> Future for Get<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let project = self.project();
         ready!(project.notified.poll(cx));
-        Poll::Ready(project.state.lock().unwrap().value.clone())
+        Poll::Ready(project.state.lock().expect("lock is not poisoned").value.clone())
     }
 }
 
@@ -118,7 +118,7 @@ impl<T: Clone> Stream for Watcher<T> {
 
         loop {
             {
-                let state = project.state.lock().unwrap();
+                let state = project.state.lock().expect("lock is not poisoned");
                 if state.version > *project.seen_version {
                     *project.seen_version = state.version;
                     if let Some(value) = state.value.clone() {

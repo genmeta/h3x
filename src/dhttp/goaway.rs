@@ -74,7 +74,7 @@ impl EncodeInto<BufList> for Goaway {
             "Only empty buflist can be used to encode frame"
         );
 
-        let mut frame = Frame::new(Frame::GOAWAY_FRAME_TYPE, stream).unwrap();
+        let mut frame = Frame::new(Frame::GOAWAY_FRAME_TYPE, stream).expect("empty BufList fits in VarInt");
         frame
             .encode_one(self.stream_id)
             .await

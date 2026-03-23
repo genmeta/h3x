@@ -31,7 +31,7 @@ impl<T> SetOnce<T> {
 
     /// Returns `true` if the value has been set.
     pub fn is_set(&self) -> bool {
-        self.value.lock().unwrap().is_some()
+        self.value.lock().expect("lock is not poisoned").is_some()
     }
 
     pub fn set(&self, value: T) -> Result<(), T> {
@@ -39,7 +39,7 @@ impl<T> SetOnce<T> {
     }
 
     pub fn set_with<F: FnOnce() -> T>(&self, f: F) -> Result<(), F> {
-        let mut guard = self.value.lock().unwrap();
+        let mut guard = self.value.lock().expect("lock is not poisoned");
         if guard.is_some() {
             return Err(f);
         }
@@ -53,7 +53,7 @@ impl<T> SetOnce<T> {
     where
         T: Clone,
     {
-        let guard = self.value.lock().unwrap();
+        let guard = self.value.lock().expect("lock is not poisoned");
         guard.clone()
     }
 

@@ -91,7 +91,7 @@ impl Buf for BufList {
         );
 
         if self.chunk().len() == len {
-            return self.bufs.pop_front().unwrap();
+            return self.bufs.pop_front().expect("non-empty by prior check");
         }
 
         let mut bytes_mut = BytesMut::with_capacity(len);
