@@ -27,7 +27,7 @@ use crate::{
 /// }
 /// ```
 ///
-/// https://datatracker.ietf.org/doc/html/rfc9114#name-settings
+/// <https://datatracker.ietf.org/doc/html/rfc9114#name-settings>
 pub struct Setting {
     pub id: VarInt,
     pub value: VarInt,
@@ -58,12 +58,12 @@ impl Setting {
     /// processes the message, messages below this limit are not guaranteed
     /// to be accepted.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9114#name-header-size-constraints
+    /// <https://datatracker.ietf.org/doc/html/rfc9114#name-header-size-constraints>
     // TODO: implement this setting
     pub const MAX_FIELD_SECTION_SIZE_ID: VarInt = VarInt::from_u32(0x06);
     /// The default value is unlimited. See Section 4.2.2 for usage.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9114#section-7.2.4.1-2.2.1
+    /// <https://datatracker.ietf.org/doc/html/rfc9114#section-7.2.4.1-2.2.1>
     pub const MAX_FIELD_SECTION_SIZE_DEFAULT_VALUE: Option<VarInt> = None;
 
     pub const fn max_field_section_size(value: VarInt) -> Self {
@@ -81,12 +81,12 @@ impl Setting {
     /// maximum, but it can choose to use a lower dynamic table capacity; see
     /// Section 4.3.1.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9204#section-3.2.3-1
+    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-3.2.3-1>
     pub const QPACK_MAX_TABLE_CAPACITY_ID: VarInt = VarInt::from_u32(0x01);
     /// The default value is zero. See Section 3.2 for usage. This is the
     /// equivalent of the SETTINGS_HEADER_TABLE_SIZE from HTTP/2.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9204#section-5-2.2.1
+    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-5-2.2.1>
     pub const QPACK_MAX_TABLE_CAPACITY_DEFAULT_VALUE: VarInt = VarInt::from_u32(0);
 
     pub const fn qpack_max_table_capacity(value: VarInt) -> Self {
@@ -104,11 +104,11 @@ impl Setting {
     /// to support, it MUST treat this as a connection error of type
     /// QPACK_DECOMPRESSION_FAILED.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9204#section-2.1.2-4
+    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-2.1.2-4>
     pub const QPACK_BLOCKED_STREAMS_ID: VarInt = VarInt::from_u32(0x07);
     /// The default value is zero. See Section 2.1.2.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9204#section-5-2.4.1
+    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-5-2.4.1>
     pub const QPACK_BLOCKED_STREAMS_DEFAULT_VALUE: VarInt = VarInt::from_u32(0);
 
     pub const fn qpack_blocked_streams(value: VarInt) -> Self {
@@ -131,7 +131,7 @@ impl Setting {
     /// The SETTINGS_ENABLE_CONNECT_PROTOCOL value is 0x08 (decimal 8), as in
     /// HTTP/2.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9220#name-websockets-upgrade-over-htt
+    /// <https://datatracker.ietf.org/doc/html/rfc9220#name-websockets-upgrade-over-htt>
     pub const ENABLE_CONNECT_PROTOCOL_ID: VarInt = VarInt::from_u32(0x08);
     pub const ENABLE_CONNECT_PROTOCOL_DEFAULT_VALUE: Option<VarInt> = None;
 
@@ -252,9 +252,13 @@ impl EncodeInto<BufList> for &Settings {
 
     async fn encode_into(self, stream: BufList) -> Result<Self::Output, Self::Error> {
         assert!(!stream.has_remaining());
-        let mut frame = Frame::new(Frame::SETTINGS_FRAME_TYPE, stream).unwrap();
+        let mut frame = Frame::new(Frame::SETTINGS_FRAME_TYPE, stream)
+            .expect("SETTINGS frame type is a valid VarInt");
         for setting in self {
-            frame.encode_one(setting).await.unwrap();
+            frame
+                .encode_one(setting)
+                .await
+                .expect("encoding a Setting into a BufList is infallible");
         }
         Ok(frame)
     }
@@ -271,23 +275,35 @@ impl EncodeInto<BufList> for Settings {
 }
 
 impl Settings {
+    /// Typed access to a setting value. The return type depends on the setting:
+    /// settings with defaults return `VarInt`, optional settings return `Option<VarInt>`.
+    pub fn get_typed<S: SettingId>(&self) -> S::Value {
+        S::get(self)
+    }
+
+    /// Raw access: returns the explicitly set value, or None if not present.
+    pub fn get_raw(&self, id: VarInt) -> Option<VarInt> {
+        self.map.get(&id).copied()
+    }
+
     pub fn max_field_section_size(&self) -> Option<VarInt> {
-        self.get(Setting::MAX_FIELD_SECTION_SIZE_ID)
+        self.get_typed::<MaxFieldSectionSize>()
     }
 
     pub fn qpack_max_table_capacity(&self) -> VarInt {
-        self.get(Setting::QPACK_MAX_TABLE_CAPACITY_ID).unwrap()
+        self.get_typed::<QpackMaxTableCapacity>()
     }
 
     pub fn qpack_blocked_streams(&self) -> VarInt {
-        self.get(Setting::QPACK_BLOCKED_STREAMS_ID).unwrap()
+        self.get_typed::<QpackBlockedStreams>()
     }
 
     pub fn enable_connect_protocol(&self) -> bool {
-        self.get(Setting::ENABLE_CONNECT_PROTOCOL_ID)
+        self.get_typed::<EnableConnectProtocol>()
             .is_some_and(|value| value == VarInt::from_u32(1))
     }
 
+    /// Legacy generic access with default-value fallback.
     pub fn get(&self, id: VarInt) -> Option<VarInt> {
         match self.map.get(&id).copied() {
             None if id == Setting::MAX_FIELD_SECTION_SIZE_ID => {
@@ -354,11 +370,99 @@ impl Extend<Setting> for Settings {
     }
 }
 
+/// Trait for typed HTTP/3 setting identifiers.
+///
+/// Each setting has an associated `Value` type that encodes whether a default
+/// exists: settings with defaults use `VarInt` (always returns a value),
+/// while optional settings use `Option<VarInt>`.
+pub trait SettingId {
+    /// The value type returned when querying this setting.
+    type Value;
+
+    /// The wire-format setting identifier (RFC 9114 / RFC 9204).
+    fn id() -> VarInt;
+
+    /// Extract the typed value from `Settings`, applying defaults if applicable.
+    fn get(settings: &Settings) -> Self::Value;
+}
+
+/// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (0x01). Default: 0.
+///
+/// <https://datatracker.ietf.org/doc/html/rfc9204#section-5>
+pub struct QpackMaxTableCapacity;
+
+impl SettingId for QpackMaxTableCapacity {
+    type Value = VarInt;
+
+    fn id() -> VarInt {
+        Setting::QPACK_MAX_TABLE_CAPACITY_ID
+    }
+
+    fn get(settings: &Settings) -> VarInt {
+        settings
+            .get_raw(Self::id())
+            .unwrap_or(Setting::QPACK_MAX_TABLE_CAPACITY_DEFAULT_VALUE)
+    }
+}
+
+/// `SETTINGS_QPACK_BLOCKED_STREAMS` (0x07). Default: 0.
+///
+/// <https://datatracker.ietf.org/doc/html/rfc9204#section-5>
+pub struct QpackBlockedStreams;
+
+impl SettingId for QpackBlockedStreams {
+    type Value = VarInt;
+
+    fn id() -> VarInt {
+        Setting::QPACK_BLOCKED_STREAMS_ID
+    }
+
+    fn get(settings: &Settings) -> VarInt {
+        settings
+            .get_raw(Self::id())
+            .unwrap_or(Setting::QPACK_BLOCKED_STREAMS_DEFAULT_VALUE)
+    }
+}
+
+/// `SETTINGS_MAX_FIELD_SECTION_SIZE` (0x06). No default (unlimited).
+///
+/// <https://datatracker.ietf.org/doc/html/rfc9114#section-7.2.4.1>
+pub struct MaxFieldSectionSize;
+
+impl SettingId for MaxFieldSectionSize {
+    type Value = Option<VarInt>;
+
+    fn id() -> VarInt {
+        Setting::MAX_FIELD_SECTION_SIZE_ID
+    }
+
+    fn get(settings: &Settings) -> Option<VarInt> {
+        settings.get_raw(Self::id())
+    }
+}
+
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x08). No default.
+///
+/// <https://datatracker.ietf.org/doc/html/rfc9220>
+pub struct EnableConnectProtocol;
+
+impl SettingId for EnableConnectProtocol {
+    type Value = Option<VarInt>;
+
+    fn id() -> VarInt {
+        Setting::ENABLE_CONNECT_PROTOCOL_ID
+    }
+
+    fn get(settings: &Settings) -> Option<VarInt> {
+        settings.get_raw(Self::id())
+    }
+}
+
 impl UnidirectionalStream<()> {
     /// A control stream is indicated by a stream type of 0x00. Data on this
     ///  stream consists of HTTP/3 frames, as defined in Section 7.2.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9114#name-control-streams
+    /// <https://datatracker.ietf.org/doc/html/rfc9114#name-control-streams>
     pub const CONTROL_STREAM_TYPE: VarInt = VarInt::from_u32(0x00);
 }
 
