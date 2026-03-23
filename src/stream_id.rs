@@ -1,6 +1,11 @@
 use std::fmt;
 
-use crate::varint::VarInt;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::{
+    codec::{DecodeFrom, EncodeInto},
+    varint::VarInt,
+};
 
 /// Request-scoped stream identifier for protocol extension access.
 ///
@@ -28,6 +33,23 @@ use crate::varint::VarInt;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StreamId(pub VarInt);
+
+impl<S: AsyncWrite + Send> EncodeInto<S> for StreamId {
+    type Output = ();
+    type Error = <VarInt as EncodeInto<S>>::Error;
+
+    async fn encode_into(self, stream: S) -> Result<Self::Output, Self::Error> {
+        self.0.encode_into(stream).await
+    }
+}
+
+impl<S: AsyncRead + Send> DecodeFrom<S> for StreamId {
+    type Error = <VarInt as DecodeFrom<S>>::Error;
+
+    async fn decode_from(stream: S) -> Result<Self, Self::Error> {
+        VarInt::decode_from(stream).await.map(Self)
+    }
+}
 
 impl From<VarInt> for StreamId {
     fn from(varint: VarInt) -> Self {
