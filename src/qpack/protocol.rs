@@ -41,14 +41,14 @@ impl UnidirectionalStream<()> {
     /// carries an unframed sequence of encoder instructions from encoder
     /// to decoder.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9204#section-4.2-2.1
+    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-4.2-2.1>
     pub const QPACK_ENCODER_STREAM_TYPE: VarInt = VarInt::from_u32(0x02);
 
     /// A decoder stream is a unidirectional stream of type 0x03. It
     /// carries an unframed sequence of decoder instructions from decoder
     /// to encoder.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9204#section-4.2-2.2
+    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-4.2-2.2>
     pub const QPACK_DECODER_STREAM_TYPE: VarInt = VarInt::from_u32(0x03);
 }
 
@@ -135,7 +135,7 @@ impl QPackProtocol {
             _ = self
                 .encoder_inst_receiver_tx
                 .lock()
-                .unwrap()
+                .expect("lock is not poisoned")
                 .take()
                 .ok_or(H3StreamCreationError::DuplicateQpackDecoderStream)?
                 .send(uni_stream_reader);
@@ -145,7 +145,7 @@ impl QPackProtocol {
             _ = self
                 .decoder_inst_receiver_tx
                 .lock()
-                .unwrap()
+                .expect("lock is not poisoned")
                 .take()
                 .ok_or(H3StreamCreationError::DuplicateQpackDecoderStream)?
                 .send(uni_stream_reader);
@@ -460,6 +460,7 @@ impl<C: ?Sized> ConnectionState<C> {
 #[cfg(test)]
 mod tests {
     use std::{
+        cmp::Ordering,
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
     };
@@ -485,6 +486,12 @@ mod tests {
         );
     }
 
+    #[test]
+    fn qpack_factory_eq_is_reflexive() {
+        let a = QPackProtocolFactory::new();
+        let b = QPackProtocolFactory::new();
+        assert_eq!(a, b);
+    }
     #[test]
     fn qpack_decoder_stream_type_is_0x03() {
         assert_eq!(
