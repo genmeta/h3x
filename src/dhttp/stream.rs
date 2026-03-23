@@ -51,7 +51,7 @@ impl UnidirectionalStream<()> {
     /// response, as defined in Section 4.1. Server push and push IDs are
     /// described in Section 4.6.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9114#name-push-streams
+    /// <https://datatracker.ietf.org/doc/html/rfc9114#name-push-streams>
     pub const PUSH_STREAM_TYPE: VarInt = VarInt::from_u32(0x01);
 }
 
@@ -94,7 +94,7 @@ impl<S: ?Sized> UnidirectionalStream<S> {
     /// Endpoints MUST NOT consider these streams to have any meaning upon
     /// receipt.
     ///
-    /// https://datatracker.ietf.org/doc/html/rfc9114#name-reserved-stream-types
+    /// <https://datatracker.ietf.org/doc/html/rfc9114#name-reserved-stream-types>
     pub const fn is_reserved_stream(&self) -> bool {
         (self.r#type().into_inner() >= 0x21)
             && (self.r#type.into_inner() - 0x21).is_multiple_of(0x1f)

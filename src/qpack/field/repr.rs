@@ -46,7 +46,7 @@ pub struct EncodedFieldSectionPrefix {
     /// else:
     ///    Base = ReqInsertCount - DeltaBase - 1
     /// ```
-    /// https://datatracker.ietf.org/doc/html/rfc9204#section-4.5.1.2
+    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-4.5.1.2>
     pub sign: bool,
     pub delta_base: u64,
 }
@@ -190,7 +190,7 @@ pub enum FieldLineRepresentation {
         /// bit is intended for protecting field values that are not to be put at
         /// risk by compressing them; see Section 7.1 for more details.
         ///
-        /// https://datatracker.ietf.org/doc/html/rfc9204#section-4.5.4-3
+        /// <https://datatracker.ietf.org/doc/html/rfc9204#section-4.5.4-3>
         //
         never_dynamic: bool,
         is_static: bool,

@@ -7,7 +7,7 @@ use super::Protocol;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PseudoHeaders {
-    /// https://datatracker.ietf.org/doc/html/rfc9114#name-request-pseudo-header-field
+    /// <https://datatracker.ietf.org/doc/html/rfc9114#name-request-pseudo-header-field>
     Request {
         method: Option<Method>,
         scheme: Option<Scheme>,
@@ -15,7 +15,7 @@ pub enum PseudoHeaders {
         path: Option<PathAndQuery>,
         protocol: Option<Protocol>,
     },
-    /// https://datatracker.ietf.org/doc/html/rfc9114#name-response-pseudo-header-fiel
+    /// <https://datatracker.ietf.org/doc/html/rfc9114#name-response-pseudo-header-fiel>
     Response { status: Option<StatusCode> },
 }
 
