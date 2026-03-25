@@ -33,10 +33,18 @@ pub async fn decode_integer(stream: impl AsyncRead, prefix: u8, n: u8) -> io::Re
     if i < (1 << n) - 1 {
         Ok(i)
     } else {
-        let mut m = 0;
+        let mut m = 0u32;
         loop {
             let b = stream.read_u8().await? as u64;
-            i += (b & 127) * 2u64.pow(m);
+            let power = 1u64.checked_shl(m).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "QPACK integer overflow")
+            })?;
+            let term = (b & 127).checked_mul(power).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "QPACK integer overflow")
+            })?;
+            i = i.checked_add(term).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "QPACK integer overflow")
+            })?;
             m += 7;
             if b & 128 == 128 {
                 continue;
