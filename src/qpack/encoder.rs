@@ -27,7 +27,7 @@ use crate::{
         algorithm::Algorithm,
         decoder::DecoderInstruction,
         dynamic::DynamicTable,
-        field::{FieldLine, FieldLineRepresentation},
+        field::FieldLine,
         integer::{decode_integer, encode_integer},
         r#static,
         string::{decode_string, encode_string},
@@ -359,30 +359,6 @@ pub struct Encoder<Es, Ds> {
     pub(crate) decoder_stream: AsyncMutex<Ds>,
 }
 
-pub(crate) fn get_dynamic_references<'r>(
-    field_line_representations: impl IntoIterator<Item = &'r FieldLineRepresentation>,
-) -> impl Iterator<Item = u64> {
-    field_line_representations
-        .into_iter()
-        .filter_map(
-            |field_line_representation| match field_line_representation {
-                FieldLineRepresentation::IndexedFieldLine {
-                    is_static, index, ..
-                } => (!is_static).then_some(*index),
-                FieldLineRepresentation::LiteralFieldLineWithNameReference {
-                    is_static,
-                    name_index,
-                    ..
-                } => (!is_static).then_some(*name_index),
-                FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
-                    name_index,
-                    ..
-                } => Some(*name_index),
-                _ => None,
-            },
-        )
-}
-
 #[derive(Debug, Snafu)]
 pub enum EncodeHeaderSectionError {
     #[snafu(transparent)]
@@ -429,30 +405,23 @@ where
         {
             let mut state = self.state.lock().await;
 
-            (field_section_prefix, field_line_representations) =
-                algorithm.compress(&mut state, field_section).await;
+            // RFC 9204 §2.1.2: Determine whether this stream may block the decoder.
+            let already_tracked = state.blocking_streams.contains_key(&stream_id);
+            let peer_max = state.settings.qpack_blocked_streams().into_inner();
+            let may_block = already_tracked || (state.blocking_streams.len() as u64) < peer_max;
 
-            // RFC 9204 §2.1.2: An encoder MUST limit the number of streams that could
-            // be blocked at the peer to the value of SETTINGS_QPACK_BLOCKED_STREAMS.
-            let has_dynamic_refs = get_dynamic_references(&field_line_representations)
-                .next()
-                .is_some();
+            let output = algorithm
+                .compress(&mut state, field_section, may_block)
+                .await;
+            field_section_prefix = output.prefix;
+            field_line_representations = output.representations;
 
-            if has_dynamic_refs {
-                let already_tracked = state.blocking_streams.contains_key(&stream_id);
-                let peer_max = state.settings.qpack_blocked_streams().into_inner();
-                let at_limit = !already_tracked && state.blocking_streams.len() as u64 >= peer_max;
-
-                if !at_limit {
-                    let max_referenced_index = get_dynamic_references(&field_line_representations)
-                        .max()
-                        .unwrap_or(0);
-                    state
-                        .blocking_streams
-                        .entry(stream_id)
-                        .or_default()
-                        .push_back(max_referenced_index);
-                }
+            if let Some(max_referenced_index) = output.max_referenced_index {
+                state
+                    .blocking_streams
+                    .entry(stream_id)
+                    .or_default()
+                    .push_back(max_referenced_index);
             }
         };
 
@@ -690,13 +659,35 @@ mod tests {
     use crate::{
         dhttp::settings::{QpackBlockedStreams, QpackMaxTableCapacity, Settings},
         qpack::{
-            encoder::{
-                EncoderState, QPackDecoderStreamError, QPackEncoderError, get_dynamic_references,
-            },
+            encoder::{EncoderState, QPackDecoderStreamError, QPackEncoderError},
             field::FieldLineRepresentation,
         },
         varint::VarInt,
     };
+
+    fn get_dynamic_references<'r>(
+        field_line_representations: impl IntoIterator<Item = &'r FieldLineRepresentation>,
+    ) -> impl Iterator<Item = u64> {
+        field_line_representations
+            .into_iter()
+            .filter_map(
+                |field_line_representation| match field_line_representation {
+                    FieldLineRepresentation::IndexedFieldLine {
+                        is_static, index, ..
+                    } => (!is_static).then_some(*index),
+                    FieldLineRepresentation::LiteralFieldLineWithNameReference {
+                        is_static,
+                        name_index,
+                        ..
+                    } => (!is_static).then_some(*name_index),
+                    FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
+                        name_index,
+                        ..
+                    } => Some(*name_index),
+                    _ => None,
+                },
+            )
+    }
 
     fn settings_with_capacity(capacity: u32) -> Arc<Settings> {
         let mut settings = Settings::default();
