@@ -1,4 +1,4 @@
-mod bridge;
+pub(super) mod bridge;
 
 pub mod quic;
 

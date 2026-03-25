@@ -50,9 +50,6 @@ pub trait MessageWriteStream: Send + Sync {
     async fn cancel(&mut self, code: VarInt) -> Result<(), quic::StreamError>;
 }
 
-
-
-
 // ---------------------------------------------------------------------------
 // Read bridge (MessageReadStreamClient → impl ReadMessageStream)
 // ---------------------------------------------------------------------------
