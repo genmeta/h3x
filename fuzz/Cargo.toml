@@ -71,3 +71,17 @@ path = "fuzz_targets/fuzz_unidirectional_stream.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_dhttp_settings"
+path = "fuzz_targets/fuzz_dhttp_settings.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_goaway"
+path = "fuzz_targets/fuzz_goaway.rs"
+test = false
+doc = false
+bench = false
