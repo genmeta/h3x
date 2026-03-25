@@ -117,7 +117,9 @@ where
                             never_dynamic: true,
                             is_static: true,
                             name_index: name_index as u64,
-                            huffman: self.huffman_strategize.should_encode_value_with_huffman(&value),
+                            huffman: self
+                                .huffman_strategize
+                                .should_encode_value_with_huffman(&value),
                             value: value.clone(),
                         },
                     )
@@ -125,9 +127,13 @@ where
             } else {
                 representations.push(FieldLineRepresentation::LiteralFieldLineWithLiteralName {
                     never_dynamic: true,
-                    name_huffman: self.huffman_strategize.should_encode_name_with_huffman(&name),
+                    name_huffman: self
+                        .huffman_strategize
+                        .should_encode_name_with_huffman(&name),
                     name: name.clone(),
-                    value_huffman: self.huffman_strategize.should_encode_value_with_huffman(&value),
+                    value_huffman: self
+                        .huffman_strategize
+                        .should_encode_value_with_huffman(&value),
                     value: value.clone(),
                 })
             }
@@ -223,21 +229,25 @@ where
                     state.insert_with_name_reference(
                         true,
                         static_idx as u64,
-                        self.huffman_strategize.should_encode_value_with_huffman(&value),
+                        self.huffman_strategize
+                            .should_encode_value_with_huffman(&value),
                         value.clone(),
                     )
                 } else if let Some(dyn_abs) = dynamic_name_abs {
                     state.insert_with_name_reference(
                         false,
                         dyn_abs,
-                        self.huffman_strategize.should_encode_value_with_huffman(&value),
+                        self.huffman_strategize
+                            .should_encode_value_with_huffman(&value),
                         value.clone(),
                     )
                 } else {
                     state.insert_with_literal_name(
-                        self.huffman_strategize.should_encode_name_with_huffman(&name),
+                        self.huffman_strategize
+                            .should_encode_name_with_huffman(&name),
                         name.clone(),
-                        self.huffman_strategize.should_encode_value_with_huffman(&value),
+                        self.huffman_strategize
+                            .should_encode_value_with_huffman(&value),
                         value.clone(),
                     )
                 };
@@ -260,7 +270,9 @@ where
                     never_dynamic,
                     is_static: true,
                     name_index: static_idx as u64,
-                    huffman: self.huffman_strategize.should_encode_value_with_huffman(&value),
+                    huffman: self
+                        .huffman_strategize
+                        .should_encode_value_with_huffman(&value),
                     value: value.clone(),
                 });
             } else if let Some(dyn_abs) = dynamic_name_abs {
@@ -271,7 +283,8 @@ where
                         dyn_abs,
                         base,
                         never_dynamic,
-                        self.huffman_strategize.should_encode_value_with_huffman(&value),
+                        self.huffman_strategize
+                            .should_encode_value_with_huffman(&value),
                         value.clone(),
                     );
                 } else {

@@ -4,20 +4,18 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt, future::Either};
 use tokio_util::sync::CancellationToken;
 
+use super::super::bridge;
+// Import original traits under aliases to avoid collision with the RTC traits
+// defined in this module (which share the same names).
+use crate::message::stream::{
+    ReadMessageStream as OrigReadMessageStream, WriteMessageStream as OrigWriteMessageStream,
+};
 use crate::{
     message::stream::{BoxMessageStreamReader, BoxMessageStreamWriter, MessageStreamError},
     quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
     util::try_future::TryFuture,
     varint::VarInt,
 };
-
-// Import original traits under aliases to avoid collision with the RTC traits
-// defined in this module (which share the same names).
-use crate::message::stream::{
-    ReadMessageStream as OrigReadMessageStream, WriteMessageStream as OrigWriteMessageStream,
-};
-
-use super::super::bridge;
 
 // ---------------------------------------------------------------------------
 // RTC traits

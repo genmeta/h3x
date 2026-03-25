@@ -2,14 +2,13 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt, future::Either};
 use tokio_util::sync::CancellationToken;
 
+use super::super::bridge;
 use crate::{
     dhttp::protocol::{BoxDynQuicStreamReader, BoxDynQuicStreamWriter},
     quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
     util::try_future::TryFuture,
     varint::VarInt,
 };
-
-use super::super::bridge;
 
 /// Remote trait for reading from a QUIC stream over remoc RTC.
 #[remoc::rtc::remote]
