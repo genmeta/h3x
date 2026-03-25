@@ -101,6 +101,11 @@ impl EncodedFieldSectionPrefix {
             0
         } else {
             let max_entries = max_table_capacity / 32;
+            // When max_entries == 0 the dynamic table is disabled; RIC must be 0.
+            // Caller violated this precondition, but we avoid panicking.
+            if max_entries == 0 {
+                return 1;
+            }
             (required_insert_count % (2 * max_entries)) + 1
         }
     }
@@ -115,13 +120,24 @@ impl EncodedFieldSectionPrefix {
             return Ok(0);
         }
         let max_entries = max_table_capacity / 32;
-        let full_range = 2 * max_entries;
+        if max_entries == 0 {
+            // Dynamic table disabled; non-zero encoded_insert_count is invalid.
+            return Err(DecodeError::DecompressionFailed);
+        }
+        let full_range = max_entries
+            .checked_mul(2)
+            .ok_or(DecodeError::ArithmeticOverflow)?;
         if encoded_insert_count > full_range {
             return Err(DecodeError::DecompressionFailed);
         }
-        let max_value = total_number_of_inserts + max_entries;
+        let max_value = total_number_of_inserts
+            .checked_add(max_entries)
+            .ok_or(DecodeError::ArithmeticOverflow)?;
         let max_wrapped = (max_value / full_range) * full_range;
-        let mut ric = max_wrapped + encoded_insert_count - 1;
+        let mut ric = max_wrapped
+            .checked_add(encoded_insert_count)
+            .and_then(|v| v.checked_sub(1))
+            .ok_or(DecodeError::ArithmeticOverflow)?;
         if ric > max_value {
             if ric <= full_range {
                 return Err(DecodeError::DecompressionFailed);
