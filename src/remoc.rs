@@ -1,3 +1,5 @@
+mod bridge;
+
 pub mod quic;
 
 #[cfg(feature = "remoc")]
