@@ -554,15 +554,10 @@ impl<S: AsyncBufRead + Send> DecodeFrom<S> for EncoderInstruction {
             let mut stream = pin!(stream);
             let prefix = stream.read_u8().await?;
             match prefix {
-                prefix if prefix & 0b1110_0000 == 0b0010_0000 => {
-                    let capacity = decode_integer(stream, prefix, 5).await?;
-                    Ok(EncoderInstruction::SetDynamicTableCapacity { capacity })
-                }
+                // 1xxxxxxx — Insert with Name Reference (6-bit prefix)
                 prefix if prefix & 0b1000_0000 == 0b1000_0000 => {
-                    // decode name index
                     let is_static = (prefix & 0b0100_0000) != 0;
                     let name_index = decode_integer(stream.as_mut(), prefix, 6).await?;
-                    // decode value
                     let value_prefix = stream.read_u8().await?;
                     let (huffman, value) =
                         decode_string(stream.as_mut(), value_prefix, 1 + 7).await?;
@@ -573,12 +568,11 @@ impl<S: AsyncBufRead + Send> DecodeFrom<S> for EncoderInstruction {
                         value,
                     })
                 }
-                prefix if prefix & 0b1110_0000 == 0b0100_0000 => {
-                    // decode name
+                // 01xxxxxx — Insert with Literal Name (5-bit name prefix)
+                prefix if prefix & 0b1100_0000 == 0b0100_0000 => {
                     let name_prefix = prefix;
                     let (name_huffman, name) =
                         decode_string(stream.as_mut(), name_prefix, 1 + 5).await?;
-                    // decode value
                     let value_prefix = stream.read_u8().await?;
                     let (value_huffman, value) =
                         decode_string(stream.as_mut(), value_prefix, 1 + 7).await?;
@@ -589,11 +583,16 @@ impl<S: AsyncBufRead + Send> DecodeFrom<S> for EncoderInstruction {
                         value,
                     })
                 }
-                prefix if prefix & 0b1110_0000 == 0b0000_0000 => {
+                // 001xxxxx — Set Dynamic Table Capacity (5-bit prefix)
+                prefix if prefix & 0b1110_0000 == 0b0010_0000 => {
+                    let capacity = decode_integer(stream, prefix, 5).await?;
+                    Ok(EncoderInstruction::SetDynamicTableCapacity { capacity })
+                }
+                // 000xxxxx — Duplicate (5-bit prefix)
+                _ => {
                     let index = decode_integer(stream, prefix, 5).await?;
                     Ok(EncoderInstruction::Duplicate { index })
                 }
-                _ => unreachable!("unreachable branch(Duplicate should match all other cases)"),
             }
         };
         decode.await.map_err(|error: DecodeStreamError| {

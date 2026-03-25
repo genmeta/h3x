@@ -287,8 +287,8 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for FieldLineRepresentation {
                         value,
                     })
                 }
-                prefix if prefix & 0b1111_0000 == 0b0000_0000 => {
-                    // Literal Field Line with Post-Base Name Reference
+                // 0000xxxx — Literal Field Line with Post-Base Name Reference
+                _ => {
                     let never_dynamic = (prefix & 0b0000_1000) != 0;
                     let name_index = decode_integer(stream.as_mut(), prefix, 3).await?;
                     let value_prefix = stream.read_u8().await?;
@@ -303,9 +303,6 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for FieldLineRepresentation {
                         },
                     )
                 }
-                prefix => unreachable!(
-                    "unreachable branch(LiteralFieldLineWithPostBaseNameReference should match all other cases)(prefix={prefix:#010b})",
-                ),
             }
         };
         decode.await.map_err(|error: DecodeStreamError| {

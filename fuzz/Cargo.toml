@@ -34,3 +34,24 @@ path = "fuzz_targets/fuzz_qpack_string.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_qpack_field"
+path = "fuzz_targets/fuzz_qpack_field.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_qpack_instruction"
+path = "fuzz_targets/fuzz_qpack_instruction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_dhttp_setting"
+path = "fuzz_targets/fuzz_dhttp_setting.rs"
+test = false
+doc = false
+bench = false

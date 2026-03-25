@@ -547,21 +547,21 @@ impl<S: AsyncBufRead + Send> DecodeFrom<S> for DecoderInstruction {
             let mut stream = pin!(stream);
             let prefix = stream.read_u8().await?;
             match prefix {
+                // 1xxxxxxx — Section Acknowledgment (7-bit prefix)
                 prefix if prefix & 0b1000_0000 == 0b1000_0000 => {
                     let stream_id = decode_integer(stream, prefix, 7).await?;
                     Ok(DecoderInstruction::SectionAcknowledgment { stream_id })
                 }
+                // 01xxxxxx — Stream Cancellation (6-bit prefix)
                 prefix if prefix & 0b1100_0000 == 0b0100_0000 => {
                     let stream_id = decode_integer(stream, prefix, 6).await?;
                     Ok(DecoderInstruction::StreamCancellation { stream_id })
                 }
-                prefix if prefix & 0b1100_0000 == 0b0000_0000 => {
+                // 00xxxxxx — Insert Count Increment (6-bit prefix)
+                _ => {
                     let increment = decode_integer(stream, prefix, 6).await?;
                     Ok(DecoderInstruction::InsertCountIncrement { increment })
                 }
-                _ => unreachable!(
-                    "unreachable branch(InsertCountIncrement should match all other cases)"
-                ),
             }
         };
         decode.await.map_err(|error: DecodeStreamError| {
