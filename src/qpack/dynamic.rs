@@ -34,10 +34,16 @@ impl DynamicTable {
     }
 
     pub fn get(&self, index: u64) -> Option<&FieldLine> {
+        if index < self.dropped_count {
+            return None;
+        }
         self.entries.get((index - self.dropped_count) as usize)
     }
 
     pub fn get_mut(&mut self, index: u64) -> Option<&mut FieldLine> {
+        if index < self.dropped_count {
+            return None;
+        }
         self.entries.get_mut((index - self.dropped_count) as usize)
     }
 

@@ -156,9 +156,9 @@ impl DecoderState {
             }
             self.dynamic_table.evict();
         }
-        let new_entry_index = self.dynamic_table.index(entry);
-        if new_entry_index > self.dynamic_table.known_received_count {
-            self.update_known_received_count(new_entry_index);
+        self.dynamic_table.index(entry);
+        if self.dynamic_table.inserted_count > self.dynamic_table.known_received_count {
+            self.update_known_received_count(self.dynamic_table.inserted_count);
         }
         Ok(())
     }
@@ -176,9 +176,9 @@ impl DecoderState {
             }
             self.dynamic_table.evict();
         }
-        let new_entry_index = self.dynamic_table.index(entry);
-        if new_entry_index > self.dynamic_table.known_received_count {
-            self.update_known_received_count(new_entry_index);
+        self.dynamic_table.index(entry);
+        if self.dynamic_table.inserted_count > self.dynamic_table.known_received_count {
+            self.update_known_received_count(self.dynamic_table.inserted_count);
         }
         Ok(())
     }
@@ -196,9 +196,9 @@ impl DecoderState {
             }
             self.dynamic_table.evict();
         }
-        let new_entry_index = self.dynamic_table.index(duplicated_entry);
-        if new_entry_index > self.dynamic_table.known_received_count {
-            self.update_known_received_count(new_entry_index);
+        self.dynamic_table.index(duplicated_entry);
+        if self.dynamic_table.inserted_count > self.dynamic_table.known_received_count {
+            self.update_known_received_count(self.dynamic_table.inserted_count);
         }
         Ok(())
     }
