@@ -969,7 +969,7 @@ pub enum AcceptRawMessageStreamError {
     Goaway { source: ConnectionGoaway },
 }
 
-impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync + ?Sized> ConnectionState<C> {
+impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync> ConnectionState<C> {
     pub async fn initial_raw_message_stream(
         &self,
     ) -> Result<(ErasedStreamReader, ErasedStreamWriter), InitialRawMessageStreamError> {

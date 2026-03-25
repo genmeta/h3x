@@ -37,6 +37,12 @@ impl From<remoc::rtc::CallError> for agent::VerifyError {
     }
 }
 
+impl From<remoc::rtc::CallError> for crate::message::stream::MessageStreamError {
+    fn from(error: remoc::rtc::CallError) -> Self {
+        quic::StreamError::from(error).into()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct StringError(String);
 

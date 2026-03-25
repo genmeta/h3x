@@ -96,6 +96,7 @@ impl From<io::Error> for StreamError {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Snafu, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionGoaway {
     #[snafu(display("local goaway"))]

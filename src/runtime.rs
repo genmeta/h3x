@@ -36,7 +36,7 @@ pub trait ErasedConnection: quic::Lifecycle + Send + Sync {
     ) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), quic::ConnectionError>>;
 }
 
-impl<C: quic::Connection + ?Sized> ErasedConnection for C {
+impl<C: quic::Connection> ErasedConnection for C {
     fn open_uni(&self) -> BoxFuture<'_, Result<BoxWriteStream, quic::ConnectionError>> {
         Box::pin(async {
             let writer = quic::ManageStream::open_uni(self).await?;

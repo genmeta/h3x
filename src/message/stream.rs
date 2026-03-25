@@ -100,6 +100,7 @@ impl quic::GetStreamId for DestroyedStream {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Snafu)]
 pub enum MessageStreamError {
     #[snafu(transparent)]

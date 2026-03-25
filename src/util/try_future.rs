@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use futures::{Sink, Stream};
+use futures::{stream::FusedStream, Sink, Stream};
 use tokio::io::{self, AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{quic, varint::VarInt};
@@ -156,6 +156,22 @@ where
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         (0, None)
+    }
+}
+
+impl<S, E, F, Item, SE> FusedStream for TryFuture<S, E, F>
+where
+    S: FusedStream<Item = Result<Item, SE>>,
+    E: Clone,
+    SE: From<E>,
+    F: Future<Output = Result<S, E>>,
+{
+    fn is_terminated(&self) -> bool {
+        match self {
+            TryFuture::Future { .. } => false,
+            TryFuture::Value { value } => value.is_terminated(),
+            TryFuture::Error { .. } => true,
+        }
     }
 }
 
