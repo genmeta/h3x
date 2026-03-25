@@ -274,6 +274,7 @@ where
         Box::pin(async move {
             let mut read_stream = Some(req.read_stream().take());
             let mut write_stream = resp.write_stream().take();
+            resp.mark_taken_over();
 
             let is_connect = req.method() == Method::CONNECT;
 
