@@ -1,8 +1,7 @@
-use std::{borrow::Cow, future::Future, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
-use futures::{SinkExt, StreamExt};
 use remoc::{
-    prelude::{ServerShared, ServerSharedMut},
+    prelude::{Server, ServerShared},
     rtc::Client as RemocClient,
 };
 use tracing::Instrument;
@@ -10,11 +9,10 @@ use tracing::Instrument;
 use super::{
     agent::{CachedLocalAgent, CachedRemoteAgent, LocalAgentClient, RemoteAgentClient},
     stream::{self, ReadStreamClient, WriteStreamClient},
-    task_set::TaskSet,
 };
 use crate::{
     error::Code,
-    quic::{self, CancelStreamExt, ConnectionError, GetStreamIdExt, StopStreamExt},
+    quic::{self, ConnectionError},
     varint::VarInt,
 };
 
@@ -37,76 +35,200 @@ pub trait Connection: Send + Sync {
     async fn closed(&self) -> Result<quic::ConnectionError, quic::ConnectionError>;
 }
 
-pub fn serve_quic_connection<C>(
-    connection: C,
-) -> (ConnectionClient, impl Future<Output = ()> + Send + 'static)
+// ---------------------------------------------------------------------------
+// Server side: blanket — any quic::Connection implements the RTC trait
+// ---------------------------------------------------------------------------
+
+impl<C> Connection for C
 where
     C: quic::Connection + 'static,
     C::LocalAgent: Send + Sync,
     C::RemoteAgent: Send + Sync,
 {
-    let (server, client) =
-        ConnectionServerShared::new(Arc::new(ServedConnection::new(connection)), 1);
-    let fut = async move {
-        let _ = server.serve(true).await;
-    };
-    (client, fut)
-}
-
-impl quic::ManageStream for ConnectionClient {
-    type StreamWriter = crate::dhttp::protocol::BoxDynQuicStreamWriter;
-    type StreamReader = crate::dhttp::protocol::BoxDynQuicStreamReader;
-
     async fn open_bi(
         &self,
-    ) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
-        let (reader, writer) = Connection::open_bi(self).await?;
-        Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
+    ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError> {
+        let (reader, writer) = quic::ManageStream::open_bi(self).await?;
+        let (rs, rc) = stream::ReadStreamServer::new(Box::pin(reader), 1);
+        tokio::spawn(
+            (async move {
+                let _ = rs.serve().await;
+            })
+            .in_current_span(),
+        );
+        let (ws, wc) = stream::WriteStreamServer::new(Box::pin(writer), 1);
+        tokio::spawn(
+            (async move {
+                let _ = ws.serve().await;
+            })
+            .in_current_span(),
+        );
+        Ok((rc, wc))
     }
 
-    async fn open_uni(&self) -> Result<Self::StreamWriter, ConnectionError> {
-        let writer = Connection::open_uni(self).await?;
-        Ok(writer.into_boxed_quic())
+    async fn open_uni(&self) -> Result<WriteStreamClient, quic::ConnectionError> {
+        let writer = quic::ManageStream::open_uni(self).await?;
+        let (ws, wc) = stream::WriteStreamServer::new(Box::pin(writer), 1);
+        tokio::spawn(
+            (async move {
+                let _ = ws.serve().await;
+            })
+            .in_current_span(),
+        );
+        Ok(wc)
     }
 
     async fn accept_bi(
         &self,
-    ) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
-        let (reader, writer) = Connection::accept_bi(self).await?;
+    ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError> {
+        let (reader, writer) = quic::ManageStream::accept_bi(self).await?;
+        let (rs, rc) = stream::ReadStreamServer::new(Box::pin(reader), 1);
+        tokio::spawn(
+            (async move {
+                let _ = rs.serve().await;
+            })
+            .in_current_span(),
+        );
+        let (ws, wc) = stream::WriteStreamServer::new(Box::pin(writer), 1);
+        tokio::spawn(
+            (async move {
+                let _ = ws.serve().await;
+            })
+            .in_current_span(),
+        );
+        Ok((rc, wc))
+    }
+
+    async fn accept_uni(&self) -> Result<ReadStreamClient, quic::ConnectionError> {
+        let reader = quic::ManageStream::accept_uni(self).await?;
+        let (rs, rc) = stream::ReadStreamServer::new(Box::pin(reader), 1);
+        tokio::spawn(
+            (async move {
+                let _ = rs.serve().await;
+            })
+            .in_current_span(),
+        );
+        Ok(rc)
+    }
+
+    async fn local_agent(&self) -> Result<Option<LocalAgentClient>, quic::ConnectionError> {
+        match quic::WithLocalAgent::local_agent(self).await? {
+            Some(agent) => {
+                let (server, client) =
+                    super::agent::LocalAgentServerShared::new(Arc::new(agent), 1);
+                tokio::spawn(
+                    (async move {
+                        let _ = server.serve(true).await;
+                    })
+                    .in_current_span(),
+                );
+                Ok(Some(client))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn remote_agent(&self) -> Result<Option<RemoteAgentClient>, quic::ConnectionError> {
+        match quic::WithRemoteAgent::remote_agent(self).await? {
+            Some(agent) => {
+                let (server, client) =
+                    super::agent::RemoteAgentServerShared::new(Arc::new(agent), 1);
+                tokio::spawn(
+                    (async move {
+                        let _ = server.serve(true).await;
+                    })
+                    .in_current_span(),
+                );
+                Ok(Some(client))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn close(
+        &self,
+        code: Code,
+        reason: Cow<'static, str>,
+    ) -> Result<(), quic::ConnectionError> {
+        quic::Lifecycle::close(self, code, reason);
+        Ok(())
+    }
+
+    async fn closed(&self) -> Result<quic::ConnectionError, quic::ConnectionError> {
+        Ok(quic::Lifecycle::closed(self).await)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client side: RemoteConnection wraps ConnectionClient → quic::Connection
+// ---------------------------------------------------------------------------
+
+/// A wrapper around [`ConnectionClient`] that implements [`quic::Connection`].
+///
+/// On the client side, use this to treat a received RTC connection handle as a
+/// local [`quic::Connection`] for the h3x protocol stack.
+pub struct RemoteConnection(ConnectionClient);
+
+impl RemoteConnection {
+    pub fn new(client: ConnectionClient) -> Self {
+        Self(client)
+    }
+
+    pub fn into_inner(self) -> ConnectionClient {
+        self.0
+    }
+}
+
+impl quic::ManageStream for RemoteConnection {
+    type StreamWriter = crate::dhttp::protocol::BoxDynQuicStreamWriter;
+    type StreamReader = crate::dhttp::protocol::BoxDynQuicStreamReader;
+
+    async fn open_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
+        let (reader, writer) = Connection::open_bi(&self.0).await?;
+        Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
+    }
+
+    async fn open_uni(&self) -> Result<Self::StreamWriter, ConnectionError> {
+        let writer = Connection::open_uni(&self.0).await?;
+        Ok(writer.into_boxed_quic())
+    }
+
+    async fn accept_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
+        let (reader, writer) = Connection::accept_bi(&self.0).await?;
         Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
     }
 
     async fn accept_uni(&self) -> Result<Self::StreamReader, ConnectionError> {
-        let reader = Connection::accept_uni(self).await?;
+        let reader = Connection::accept_uni(&self.0).await?;
         Ok(reader.into_boxed_quic())
     }
 }
 
-impl quic::WithLocalAgent for ConnectionClient {
+impl quic::WithLocalAgent for RemoteConnection {
     type LocalAgent = CachedLocalAgent;
 
     async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, ConnectionError> {
-        match Connection::local_agent(self).await? {
+        match Connection::local_agent(&self.0).await? {
             Some(agent) => Ok(Some(CachedLocalAgent::from_client(agent).await?)),
             None => Ok(None),
         }
     }
 }
 
-impl quic::WithRemoteAgent for ConnectionClient {
+impl quic::WithRemoteAgent for RemoteConnection {
     type RemoteAgent = CachedRemoteAgent;
 
     async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, ConnectionError> {
-        match Connection::remote_agent(self).await? {
+        match Connection::remote_agent(&self.0).await? {
             Some(agent) => Ok(Some(CachedRemoteAgent::from_client(agent).await?)),
             None => Ok(None),
         }
     }
 }
 
-impl quic::Lifecycle for ConnectionClient {
+impl quic::Lifecycle for RemoteConnection {
     fn close(&self, code: Code, reason: Cow<'static, str>) {
-        let client = self.clone();
+        let client = self.0.clone();
         tokio::spawn(
             async move {
                 let _ = Connection::close(&client, code, reason).await;
@@ -116,7 +238,7 @@ impl quic::Lifecycle for ConnectionClient {
     }
 
     fn check(&self) -> Result<(), ConnectionError> {
-        if RemocClient::is_closed(self) {
+        if RemocClient::is_closed(&self.0) {
             Err(quic::ConnectionError::Transport {
                 source: quic::TransportError {
                     kind: VarInt::from_u32(0x01),
@@ -130,206 +252,8 @@ impl quic::Lifecycle for ConnectionClient {
     }
 
     async fn closed(&self) -> ConnectionError {
-        match Connection::closed(self).await {
+        match Connection::closed(&self.0).await {
             Ok(error) | Err(error) => error,
         }
-    }
-}
-
-struct ServedConnection<C> {
-    connection: C,
-    tasks: TaskSet,
-}
-
-struct ServedReadStream<R> {
-    inner: tokio::sync::Mutex<std::pin::Pin<Box<R>>>,
-}
-
-impl<R> ServedReadStream<R> {
-    fn new(stream: R) -> Self {
-        Self {
-            inner: tokio::sync::Mutex::new(Box::pin(stream)),
-        }
-    }
-}
-
-impl<R> stream::ReadStream for ServedReadStream<R>
-where
-    R: quic::ReadStream + 'static,
-{
-    async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError> {
-        let mut stream = self.inner.lock().await;
-        stream.as_mut().stream_id().await
-    }
-
-    async fn read(&mut self) -> Result<Option<bytes::Bytes>, quic::StreamError> {
-        let mut stream = self.inner.lock().await;
-        stream.next().await.transpose()
-    }
-
-    async fn stop(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
-        let mut stream = self.inner.lock().await;
-        stream.as_mut().stop(code).await
-    }
-}
-
-struct ServedWriteStream<W> {
-    inner: tokio::sync::Mutex<std::pin::Pin<Box<W>>>,
-}
-
-impl<W> ServedWriteStream<W> {
-    fn new(stream: W) -> Self {
-        Self {
-            inner: tokio::sync::Mutex::new(Box::pin(stream)),
-        }
-    }
-}
-
-impl<W> stream::WriteStream for ServedWriteStream<W>
-where
-    W: quic::WriteStream + 'static,
-{
-    async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError> {
-        let mut stream = self.inner.lock().await;
-        stream.as_mut().stream_id().await
-    }
-
-    async fn write(&mut self, data: bytes::Bytes) -> Result<(), quic::StreamError> {
-        let mut stream = self.inner.lock().await;
-        stream.send(data).await
-    }
-
-    async fn flush(&mut self) -> Result<(), quic::StreamError> {
-        let mut stream = self.inner.lock().await;
-        SinkExt::flush(&mut *stream).await
-    }
-
-    async fn shutdown(&mut self) -> Result<(), quic::StreamError> {
-        let mut stream = self.inner.lock().await;
-        stream.close().await
-    }
-
-    async fn cancel(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
-        let mut stream = self.inner.lock().await;
-        stream.as_mut().cancel(code).await
-    }
-}
-
-impl<C> ServedConnection<C> {
-    fn new(connection: C) -> Self {
-        Self {
-            connection,
-            tasks: TaskSet::new(),
-        }
-    }
-}
-
-
-
-impl<C> Connection for ServedConnection<C>
-where
-    C: quic::Connection + 'static,
-    C::LocalAgent: Send + Sync,
-    C::RemoteAgent: Send + Sync,
-{
-    async fn open_bi(
-        &self,
-    ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError> {
-        let (reader, writer) = self.connection.open_bi().await?;
-        let (read_server, read_client) = stream::ReadStreamServerSharedMut::new(
-            Arc::new(tokio::sync::RwLock::new(ServedReadStream::new(reader))),
-            1,
-        );
-        let read_fut = async move { let _ = read_server.serve(true).await; };
-        let (write_server, write_client) = stream::WriteStreamServerSharedMut::new(
-            Arc::new(tokio::sync::RwLock::new(ServedWriteStream::new(writer))),
-            1,
-        );
-        let write_fut = async move { let _ = write_server.serve(true).await; };
-        self.tasks.spawn(read_fut);
-        self.tasks.spawn(write_fut);
-        Ok((read_client, write_client))
-    }
-
-    async fn open_uni(&self) -> Result<WriteStreamClient, quic::ConnectionError> {
-        let writer = self.connection.open_uni().await?;
-        let (server, client) = stream::WriteStreamServerSharedMut::new(
-            Arc::new(tokio::sync::RwLock::new(ServedWriteStream::new(writer))),
-            1,
-        );
-        let fut = async move { let _ = server.serve(true).await; };
-        self.tasks.spawn(fut);
-        Ok(client)
-    }
-
-    async fn accept_bi(
-        &self,
-    ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError> {
-        let (reader, writer) = self.connection.accept_bi().await?;
-        let (read_server, read_client) = stream::ReadStreamServerSharedMut::new(
-            Arc::new(tokio::sync::RwLock::new(ServedReadStream::new(reader))),
-            1,
-        );
-        let read_fut = async move { let _ = read_server.serve(true).await; };
-        let (write_server, write_client) = stream::WriteStreamServerSharedMut::new(
-            Arc::new(tokio::sync::RwLock::new(ServedWriteStream::new(writer))),
-            1,
-        );
-        let write_fut = async move { let _ = write_server.serve(true).await; };
-        self.tasks.spawn(read_fut);
-        self.tasks.spawn(write_fut);
-        Ok((read_client, write_client))
-    }
-
-    async fn accept_uni(&self) -> Result<ReadStreamClient, quic::ConnectionError> {
-        let reader = self.connection.accept_uni().await?;
-        let (server, client) = stream::ReadStreamServerSharedMut::new(
-            Arc::new(tokio::sync::RwLock::new(ServedReadStream::new(reader))),
-            1,
-        );
-        let fut = async move { let _ = server.serve(true).await; };
-        self.tasks.spawn(fut);
-        Ok(client)
-    }
-
-    async fn local_agent(&self) -> Result<Option<LocalAgentClient>, quic::ConnectionError> {
-        match self.connection.local_agent().await? {
-            Some(agent) => {
-                let (server, client) =
-                    super::agent::LocalAgentServerShared::new(Arc::new(agent), 1);
-                self.tasks.spawn(async move {
-                    let _ = server.serve(true).await;
-                });
-                Ok(Some(client))
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn remote_agent(&self) -> Result<Option<RemoteAgentClient>, quic::ConnectionError> {
-        match self.connection.remote_agent().await? {
-            Some(agent) => {
-                let (server, client) =
-                    super::agent::RemoteAgentServerShared::new(Arc::new(agent), 1);
-                self.tasks.spawn(async move {
-                    let _ = server.serve(true).await;
-                });
-                Ok(Some(client))
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn close(
-        &self,
-        code: Code,
-        reason: Cow<'static, str>,
-    ) -> Result<(), quic::ConnectionError> {
-        self.connection.close(code, reason);
-        Ok(())
-    }
-
-    async fn closed(&self) -> Result<quic::ConnectionError, quic::ConnectionError> {
-        Ok(self.connection.closed().await)
     }
 }

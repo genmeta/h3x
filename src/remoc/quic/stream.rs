@@ -56,7 +56,18 @@ pub trait WriteStream: Send {
 impl WriteStreamClient {
     pub async fn into_quic(mut self) -> Result<impl quic::WriteStream, quic::StreamError> {
         let stream_id = self.stream_id().await?;
-        Ok(bridge::WriteBridge::<_, quic::StreamError, _, _, _, _, _, _, _, _>::new(
+        Ok(bridge::WriteBridge::<
+            _,
+            quic::StreamError,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >::new(
             stream_id,
             self,
             |mut client: WriteStreamClient, token: CancellationToken, bytes| async move {
