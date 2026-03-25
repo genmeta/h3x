@@ -411,6 +411,13 @@ impl WriteStream {
             })
             .await?;
 
+        // Flush encoder instructions (dynamic table insertions) to the encoder stream.
+        // Encoder stream errors are connection-level: reset = connection error per RFC 9204.
+        if let Err(error) = self.qpack_encoder.flush_instructions().await {
+            let quic_error = self.connection.as_ref().handle_stream_error(error).await;
+            return Err(quic_error.into());
+        }
+
         match result {
             Ok(()) => Ok(()),
             Err(EncodeError::FramePayloadTooLarge) => Err(MessageStreamError::HeaderTooLarge),

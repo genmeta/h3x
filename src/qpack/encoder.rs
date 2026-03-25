@@ -393,7 +393,17 @@ where
     }
 
     pub async fn apply_settings(&self, settings: Arc<Settings>) {
-        self.state.lock().await.settings = settings;
+        {
+            let mut state = self.state.lock().await;
+            let peer_max_capacity = settings.qpack_max_table_capacity().into_inner();
+            state.settings = settings;
+            if peer_max_capacity > 0 && state.table_capacity() == 0 {
+                let _ = state.set_max_table_capacity(peer_max_capacity);
+            }
+        }
+        // Flush the SetDynamicTableCapacity instruction immediately so the
+        // decoder knows the new capacity before any header sections arrive.
+        let _ = self.flush_instructions().await;
     }
 
     pub async fn encode(
