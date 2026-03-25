@@ -221,6 +221,10 @@ impl Message {
         self.stage = MessageStage::Malformed;
     }
 
+    pub fn set_dropped(&mut self) {
+        self.stage = MessageStage::Dropped;
+    }
+
     /// Reset the message to unsent state
     pub fn to_unsend(mut self) -> Self {
         assert!(!self.is_dropped(), "cannot unsend a dropped message");

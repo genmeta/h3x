@@ -410,6 +410,14 @@ impl Response {
         &self.protocols
     }
 
+    /// Mark this response as taken over by a service adapter (e.g. [`TowerService`]).
+    ///
+    /// After calling this, the response's async drop becomes a no-op: the
+    /// service adapter is responsible for closing the stream.
+    pub(crate) fn mark_taken_over(&mut self) {
+        self.message.set_dropped();
+    }
+
     /// Async drop the response properly
     pub(crate) fn drop(&mut self) -> Option<impl Future<Output = ()> + Send + use<>> {
         if self.message.is_complete() || self.message.is_dropped() {

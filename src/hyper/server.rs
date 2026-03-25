@@ -51,6 +51,7 @@ where
 
             let mut read_stream = Some(req.read_stream().take());
             let mut write_stream = resp.write_stream().take();
+            resp.mark_taken_over();
 
             let is_connect = req.method() == Method::CONNECT;
 
@@ -89,7 +90,7 @@ where
                 }
             };
 
-            *request.headers_mut() = request.headers().clone();
+            *request.headers_mut() = req.headers().clone();
             request.extensions_mut().insert(resp.agent().clone());
             request.extensions_mut().insert(req.stream_id());
             request.extensions_mut().insert(req.protocols().clone());
@@ -311,7 +312,7 @@ where
                 }
             };
 
-            *request.headers_mut() = request.headers().clone();
+            *request.headers_mut() = req.headers().clone();
             request.extensions_mut().insert(resp.agent().clone());
             request.extensions_mut().insert(req.stream_id());
             request.extensions_mut().insert(req.protocols().clone());
