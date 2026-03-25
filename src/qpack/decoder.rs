@@ -229,13 +229,15 @@ pub(crate) fn decompression_field_line_representation(
     dynamic_table: &DynamicTable,
 ) -> Result<FieldLine, InvalidDynamicTableReference> {
     use InvalidDynamicTableReference::*;
-    let resolve_index = |index| base.checked_add(index).ok_or(IndexOverflow);
-    let resolve_post_base_index = |index| {
+    // RFC 9204 §3.2.5: relative_index → absolute = base - relative - 1
+    let resolve_relative = |index| {
         base.checked_sub(index)
             .ok_or(IndexOverflow)?
             .checked_sub(1)
             .ok_or(IndexOverflow)
     };
+    // RFC 9204 §3.2.6: post_base_index → absolute = base + post_base
+    let resolve_post_base = |index| base.checked_add(index).ok_or(IndexOverflow);
     match representation {
         FieldLineRepresentation::IndexedFieldLine { is_static, index } => match is_static {
             true => r#static::get(*index)
@@ -245,12 +247,12 @@ pub(crate) fn decompression_field_line_representation(
                 })
                 .ok_or(ReferencedStaticEntryNotExisted { index: *index }),
             false => dynamic_table
-                .get(resolve_index(*index)?)
+                .get(resolve_relative(*index)?)
                 .cloned()
                 .ok_or(ReferencedDynamicEntryNotExisted { index: *index }),
         },
         FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex { index } => {
-            let index = resolve_post_base_index(*index)?;
+            let index = resolve_post_base(*index)?;
             dynamic_table
                 .get(index)
                 .cloned()
@@ -271,7 +273,7 @@ pub(crate) fn decompression_field_line_representation(
                 value: value.clone(),
             }),
             false => {
-                let name_index = resolve_index(*name_index)?;
+                let name_index = resolve_relative(*name_index)?;
                 let name = &dynamic_table
                     .get(name_index)
                     .ok_or(ReferencedDynamicEntryNotExisted { index: name_index })?
@@ -287,7 +289,7 @@ pub(crate) fn decompression_field_line_representation(
             value,
             ..
         } => {
-            let name_index = resolve_post_base_index(*name_index)?;
+            let name_index = resolve_post_base(*name_index)?;
             let name = &dynamic_table
                 .get(name_index)
                 .ok_or(ReferencedDynamicEntryNotExisted { index: name_index })?
@@ -466,11 +468,25 @@ where
                     name_index,
                     value,
                     ..
-                } => state.insert_with_name_reference(is_static, name_index, value)?,
+                } => {
+                    // RFC 9204 §3.2.4: Encoder instruction relative index →
+                    // absolute = inserted_count - relative - 1
+                    let abs_index = if is_static {
+                        name_index
+                    } else {
+                        state.dynamic_table.inserted_count - name_index - 1
+                    };
+                    state.insert_with_name_reference(is_static, abs_index, value)?
+                }
                 EncoderInstruction::InsertWithLiteralName { name, value, .. } => {
                     state.insert_with_literal_name(name, value)?
                 }
-                EncoderInstruction::Duplicate { index } => state.duplicate(index)?,
+                EncoderInstruction::Duplicate { index } => {
+                    // RFC 9204 §3.2.4: Encoder instruction relative index →
+                    // absolute = inserted_count - relative - 1
+                    let abs_index = state.dynamic_table.inserted_count - index - 1;
+                    state.duplicate(abs_index)?
+                }
             }
         }
     }

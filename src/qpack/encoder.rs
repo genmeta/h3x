@@ -241,9 +241,16 @@ impl EncoderState {
             self.evict_entry();
         }
         let new_entry_index = self.index(entry.clone());
+        // RFC 9204 §3.2.4: Encoder instruction uses relative index.
+        // relative = new_entry_index - absolute_name_index - 1
+        let wire_name_index = if is_static {
+            name_index
+        } else {
+            new_entry_index - name_index - 1
+        };
         self.emit(EncoderInstruction::InsertWithNameReference {
             is_static,
-            name_index,
+            name_index: wire_name_index,
             huffman,
             value: entry.value,
         });
@@ -290,8 +297,11 @@ impl EncoderState {
             self.evict_entry();
         }
         let new_entry_index = self.index(duplicated_entry);
+        // RFC 9204 §3.2.4: Encoder instruction uses relative index.
+        // relative = new_entry_index - absolute_index - 1
+        let wire_index = new_entry_index - index - 1;
         self.pending_instructions
-            .push_back(EncoderInstruction::Duplicate { index });
+            .push_back(EncoderInstruction::Duplicate { index: wire_index });
         Ok(new_entry_index)
     }
 
