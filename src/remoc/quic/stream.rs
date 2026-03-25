@@ -1,16 +1,10 @@
-use std::{
-    future::poll_fn,
-    pin::Pin,
-    task::{Context, Poll},
-};
-
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt, future::Either};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     dhttp::protocol::{BoxDynQuicStreamReader, BoxDynQuicStreamWriter},
-    quic,
+    quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
     util::try_future::TryFuture,
     varint::VarInt,
 };
@@ -18,11 +12,8 @@ use crate::{
 use super::super::bridge;
 
 /// Remote trait for reading from a QUIC stream over remoc RTC.
-///
-/// All methods take `&self` so the generated client is `Clone` (remoc uses
-/// internal channels for mutation).
 #[remoc::rtc::remote]
-pub trait ReadStream: Send + Sync {
+pub trait ReadStream: Send {
     async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError>;
     async fn read(&mut self) -> Result<Option<Bytes>, quic::StreamError>;
     async fn stop(&mut self, code: VarInt) -> Result<(), quic::StreamError>;
@@ -53,11 +44,8 @@ impl ReadStreamClient {
 }
 
 /// Remote trait for writing to a QUIC stream over remoc RTC.
-///
-/// All methods take `&self` so the generated client is `Clone` (remoc uses
-/// internal channels for mutation).
 #[remoc::rtc::remote]
-pub trait WriteStream: Send + Sync {
+pub trait WriteStream: Send {
     async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError>;
     async fn write(&mut self, data: Bytes) -> Result<(), quic::StreamError>;
     async fn flush(&mut self) -> Result<(), quic::StreamError>;
@@ -101,43 +89,44 @@ impl WriteStreamClient {
     }
 }
 
-impl<S> ReadStream for Pin<Box<S>>
+impl<S> ReadStream for S
 where
-    S: quic::ReadStream + Send + Sync,
+    S: quic::ReadStream + Unpin + Send,
 {
     async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError> {
-        poll_fn(|cx| self.as_mut().poll_stream_id(cx)).await
+        GetStreamIdExt::stream_id(self).await
     }
 
     async fn read(&mut self) -> Result<Option<Bytes>, quic::StreamError> {
-        self.as_mut().next().await.transpose()
+        StreamExt::next(self).await.transpose()
     }
 
     async fn stop(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
-        poll_fn(|cx| self.as_mut().poll_stop(cx, code)).await
+        StopStreamExt::stop(self, code).await
     }
 }
-impl<S> WriteStream for Pin<Box<S>>
+
+impl<S> WriteStream for S
 where
-    S: quic::WriteStream + Send + Sync,
+    S: quic::WriteStream + Unpin + Send,
 {
     async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError> {
-        poll_fn(|cx| self.as_mut().poll_stream_id(cx)).await
+        GetStreamIdExt::stream_id(self).await
     }
 
     async fn write(&mut self, data: Bytes) -> Result<(), quic::StreamError> {
-        self.as_mut().send(data).await
+        SinkExt::send(self, data).await
     }
 
     async fn flush(&mut self) -> Result<(), quic::StreamError> {
-        poll_fn(|cx| self.as_mut().poll_flush(cx)).await
+        SinkExt::flush(self).await
     }
 
     async fn shutdown(&mut self) -> Result<(), quic::StreamError> {
-        poll_fn(|cx| self.as_mut().poll_close(cx)).await
+        SinkExt::close(self).await
     }
 
     async fn cancel(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
-        poll_fn(|cx| self.as_mut().poll_cancel(cx, code)).await
+        CancelStreamExt::cancel(self, code).await
     }
 }

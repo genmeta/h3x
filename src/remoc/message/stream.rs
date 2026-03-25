@@ -60,27 +60,26 @@ impl MessageReadStreamClient {
         mut self,
     ) -> Result<impl ReadMessageStream, quic::StreamError> {
         let stream_id = self.stream_id().await?;
-        Ok(bridge::ReadBridge::<_, MessageStreamError, _, _, _, _>::new(
-            stream_id,
-            self,
-            |mut client: MessageReadStreamClient,
-             token: CancellationToken| async move {
-                tokio::select! {
-                    res = client.read() => Either::Left((client, res.transpose())),
-                    _ = token.cancelled() => Either::Right(client),
-                }
-            },
-            |mut client: MessageReadStreamClient, code| async move {
-                let res = client.stop(code).await;
-                (client, res)
-            },
-        ))
+        Ok(
+            bridge::ReadBridge::<_, MessageStreamError, _, _, _, _>::new(
+                stream_id,
+                self,
+                |mut client: MessageReadStreamClient, token: CancellationToken| async move {
+                    tokio::select! {
+                        res = client.read() => Either::Left((client, res.transpose())),
+                        _ = token.cancelled() => Either::Right(client),
+                    }
+                },
+                |mut client: MessageReadStreamClient, code| async move {
+                    let res = client.stop(code).await;
+                    (client, res)
+                },
+            ),
+        )
     }
 
     /// Convert into a boxed [`ReadMessageStream`] (lazy — resolves on first poll).
-    pub fn into_boxed_message_stream(
-        self,
-    ) -> Pin<Box<dyn ReadMessageStream + Send + 'static>> {
+    pub fn into_boxed_message_stream(self) -> Pin<Box<dyn ReadMessageStream + Send + 'static>> {
         Box::pin(TryFuture::from(self.into_message_stream()))
     }
 
@@ -100,26 +99,33 @@ impl MessageWriteStreamClient {
         mut self,
     ) -> Result<impl WriteMessageStream, quic::StreamError> {
         let stream_id = self.stream_id().await?;
-        Ok(bridge::WriteBridge::<_, MessageStreamError, _, _, _, _, _, _, _, _>::new(
+        Ok(bridge::WriteBridge::<
+            _,
+            MessageStreamError,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >::new(
             stream_id,
             self,
-            |mut client: MessageWriteStreamClient,
-             token: CancellationToken,
-             bytes| async move {
+            |mut client: MessageWriteStreamClient, token: CancellationToken, bytes| async move {
                 tokio::select! {
                     res = client.write(bytes) => Either::Left((client, res)),
                     _ = token.cancelled() => Either::Right(client),
                 }
             },
-            |mut client: MessageWriteStreamClient,
-             token: CancellationToken| async move {
+            |mut client: MessageWriteStreamClient, token: CancellationToken| async move {
                 tokio::select! {
                     res = client.flush() => Either::Left((client, res)),
                     _ = token.cancelled() => Either::Right(client),
                 }
             },
-            |mut client: MessageWriteStreamClient,
-             token: CancellationToken| async move {
+            |mut client: MessageWriteStreamClient, token: CancellationToken| async move {
                 tokio::select! {
                     res = client.shutdown() => Either::Left((client, res)),
                     _ = token.cancelled() => Either::Right(client),
@@ -133,9 +139,7 @@ impl MessageWriteStreamClient {
     }
 
     /// Convert into a boxed [`WriteMessageStream`] (lazy — resolves on first poll).
-    pub fn into_boxed_message_stream(
-        self,
-    ) -> Pin<Box<dyn WriteMessageStream + Send + 'static>> {
+    pub fn into_boxed_message_stream(self) -> Pin<Box<dyn WriteMessageStream + Send + 'static>> {
         Box::pin(TryFuture::from(self.into_message_stream()))
     }
 
