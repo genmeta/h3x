@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 690350540567ed3fb5d2f5661567e3d3a43864541c3dabb4c7def1d5a239cde7 # shrinks to sections = [[FieldLine { name: b"\0", value: b"" }], [FieldLine { name: b"\0", value: b"\0" }]]
