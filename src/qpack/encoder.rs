@@ -143,6 +143,10 @@ impl EncoderState {
         self.value_indices.get(value)
     }
 
+    pub fn pending_instructions(&self) -> &VecDeque<EncoderInstruction> {
+        &self.pending_instructions
+    }
+
     pub(crate) fn index(&mut self, field_line: FieldLine) -> u64 {
         let index = self.dynamic_table.index(field_line.clone());
         // update name_indices

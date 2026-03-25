@@ -16,6 +16,7 @@ httlib-huffman = "0.3"
 
 [dependencies.h3x]
 path = ".."
+features = ["testing"]
 
 [[bin]]
 name = "fuzz_varint"
@@ -104,6 +105,20 @@ bench = false
 [[bin]]
 name = "fuzz_field_section"
 path = "fuzz_targets/fuzz_field_section.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_qpack_dynamic_roundtrip"
+path = "fuzz_targets/fuzz_qpack_dynamic_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_qpack_decoder_state"
+path = "fuzz_targets/fuzz_qpack_decoder_state.rs"
 test = false
 doc = false
 bench = false

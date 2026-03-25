@@ -56,6 +56,7 @@ gm-quic = ["dep:gm-quic"]
 hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
 remoc = ["dep:remoc", "serde", "bytes/serde"]
+testing = []
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = [

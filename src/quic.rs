@@ -527,7 +527,7 @@ impl<S: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + ?
 {
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod test {
     use std::{
         pin::Pin,
@@ -699,8 +699,18 @@ pub mod test {
         MockStreamReader<impl Stream<Item = Result<Packet, StreamError>>>,
         MockStreamWriter<impl Sink<Packet, Error = StreamError>>,
     ) {
+        mock_stream_pair_with_capacity(stream_id, 8)
+    }
+
+    pub fn mock_stream_pair_with_capacity(
+        stream_id: VarInt,
+        capacity: usize,
+    ) -> (
+        MockStreamReader<impl Stream<Item = Result<Packet, StreamError>>>,
+        MockStreamWriter<impl Sink<Packet, Error = StreamError>>,
+    ) {
         let (stop_sending_tx, stop_sending_rx) = oneshot::channel();
-        let (packet_tx, packet_rx) = futures::channel::mpsc::channel(8);
+        let (packet_tx, packet_rx) = futures::channel::mpsc::channel(capacity);
 
         let writer = MockStreamWriter {
             stream_id,

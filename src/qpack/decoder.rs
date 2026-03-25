@@ -47,6 +47,10 @@ impl DecoderState {
             pending_instructions: VecDeque::new(),
         }
     }
+
+    pub fn table_inserted_count(&self) -> u64 {
+        self.dynamic_table.inserted_count
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -198,6 +202,14 @@ impl DecoderState {
         }
         Ok(())
     }
+
+    pub fn decompress(
+        &self,
+        representation: &FieldLineRepresentation,
+        base: u64,
+    ) -> Result<FieldLine, InvalidDynamicTableReference> {
+        decompression_field_line_representation(representation, base, &self.dynamic_table)
+    }
 }
 
 pub struct Decoder<Ds, Es> {
@@ -223,7 +235,7 @@ impl<Ds, Es> Decoder<Ds, Es> {
     }
 }
 
-pub(crate) fn decompression_field_line_representation(
+pub fn decompression_field_line_representation(
     representation: &FieldLineRepresentation,
     base: u64,
     dynamic_table: &DynamicTable,
