@@ -140,7 +140,8 @@ impl<P: AsyncWrite + ?Sized> AsyncWrite for Frame<P> {
                 return Poll::Ready(Err(EncodeError::FramePayloadTooLarge.into()));
             }
             Some(new_length) => {
-                *project.length = VarInt::from_u64(new_length).expect("length checked to be within VarInt range");
+                *project.length =
+                    VarInt::from_u64(new_length).expect("length checked to be within VarInt range");
             }
             None => return Poll::Ready(Err(EncodeError::FramePayloadTooLarge.into())),
         }
@@ -178,7 +179,8 @@ where
                 return Err(EncodeError::FramePayloadTooLarge.into());
             }
             Some(new_length) => {
-                *project.length = VarInt::from_u64(new_length).expect("length checked to be within VarInt range");
+                *project.length =
+                    VarInt::from_u64(new_length).expect("length checked to be within VarInt range");
             }
             None => return Err(EncodeError::FramePayloadTooLarge.into()),
         }

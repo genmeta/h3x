@@ -16,7 +16,9 @@ use crate::{
     codec::{PeekableStreamReader, SinkWriter, StreamReader},
     dhttp::{protocol::DHttpProtocolFactory, settings::Settings},
     error::{Code, ErrorScope, H3Error},
-    protocol::{InitProtocols, ProductProtocol, Protocols, StreamVerdict, compute_factory_identity},
+    protocol::{
+        InitProtocols, ProductProtocol, Protocols, StreamVerdict, compute_factory_identity,
+    },
     qpack::protocol::QPackProtocolFactory,
     quic::{self, CancelStreamExt, StopStreamExt, agent},
     util::watch::Watch,
@@ -167,7 +169,8 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
 
     pub fn protocol<F: ProductProtocol<C>>(mut self, factory: F) -> Self {
         let identity = compute_factory_identity::<C, F>(&factory);
-        self.protocols_initializers.push((identity, Box::new(factory)));
+        self.protocols_initializers
+            .push((identity, Box::new(factory)));
         self
     }
 

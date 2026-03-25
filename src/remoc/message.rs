@@ -6,27 +6,30 @@
 //! data path. The QUIC-level control operations (`StopStream`, `CancelStream`,
 //! `GetStreamId`) still use [`quic::StreamError`].
 //!
+//! Any type implementing the original [`ReadMessageStream`] / [`WriteMessageStream`]
+//! traits automatically implements the RTC traits via blanket impls.
+//!
 //! # Public API
 //!
 //! ## RTC client handles (serializable, sendable over the wire)
 //!
-//! - [`MessageReadStreamClient`]
-//! - [`MessageWriteStreamClient`]
+//! - [`ReadMessageStreamClient`]
+//! - [`WriteMessageStreamClient`]
 //!
 //! ## Conversion methods (reconstruct poll-based streams from clients)
 //!
-//! - [`MessageReadStreamClient::into_message_stream`]
-//! - [`MessageReadStreamClient::into_boxed_message_stream`]
-//! - [`MessageReadStreamClient::into_box_reader`]
-//! - [`MessageWriteStreamClient::into_message_stream`]
-//! - [`MessageWriteStreamClient::into_boxed_message_stream`]
-//! - [`MessageWriteStreamClient::into_box_writer`]
+//! - [`ReadMessageStreamClient::into_message_stream`]
+//! - [`ReadMessageStreamClient::into_boxed_message_stream`]
+//! - [`ReadMessageStreamClient::into_box_reader`]
+//! - [`WriteMessageStreamClient::into_message_stream`]
+//! - [`WriteMessageStreamClient::into_boxed_message_stream`]
+//! - [`WriteMessageStreamClient::into_box_writer`]
 
 mod stream;
 
 pub use self::stream::{
-    MessageReadStreamClient, MessageReadStreamReqReceiver, MessageReadStreamServer,
-    MessageReadStreamServerRefMut, MessageReadStreamServerSharedMut, MessageWriteStreamClient,
-    MessageWriteStreamReqReceiver, MessageWriteStreamServer, MessageWriteStreamServerRefMut,
-    MessageWriteStreamServerSharedMut,
+    ReadMessageStreamClient, ReadMessageStreamReqReceiver, ReadMessageStreamServer,
+    ReadMessageStreamServerRefMut, ReadMessageStreamServerSharedMut, WriteMessageStreamClient,
+    WriteMessageStreamReqReceiver, WriteMessageStreamServer, WriteMessageStreamServerRefMut,
+    WriteMessageStreamServerSharedMut,
 };

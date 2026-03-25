@@ -72,7 +72,13 @@ impl<T> Future for Receiver<T> {
         loop {
             project.notified.as_mut().enable();
 
-            match project.channel.ring.lock().expect("lock is not poisoned").pop_front() {
+            match project
+                .channel
+                .ring
+                .lock()
+                .expect("lock is not poisoned")
+                .pop_front()
+            {
                 Some(item) => return Poll::Ready(item),
                 None => ready!(project.notified.as_mut().poll(cx)),
             };

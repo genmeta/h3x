@@ -152,7 +152,9 @@ pub trait ManageStream: Send + Sync {
 
     fn open_bi(
         &self,
-    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> + Send + '_;
+    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>>
+    + Send
+    + '_;
 
     fn open_uni(
         &self,
@@ -160,7 +162,9 @@ pub trait ManageStream: Send + Sync {
 
     fn accept_bi(
         &self,
-    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> + Send + '_;
+    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>>
+    + Send
+    + '_;
 
     fn accept_uni(
         &self,
@@ -527,7 +531,7 @@ impl<S: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + ?
 pub mod test {
     use std::{
         pin::Pin,
-    sync::Arc,
+        sync::Arc,
         task::{Context, Poll, ready},
     };
 

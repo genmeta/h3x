@@ -37,6 +37,9 @@ use crate::{
 pub(crate) mod hyper;
 pub(crate) mod unfold;
 
+pub use self::unfold::read::{BoxMessageStreamReader, ReadMessageStream};
+pub use self::unfold::write::{BoxMessageStreamWriter, WriteMessageStream};
+
 fn stream_used_after_dropped() -> ! {
     panic!("message stream is used after being dropped, this is a bug")
 }

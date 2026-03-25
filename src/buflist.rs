@@ -409,12 +409,9 @@ mod tests {
 
     #[test]
     fn from_iterator() {
-        let bl: BufList = vec![
-            Bytes::from_static(b"aaa"),
-            Bytes::from_static(b"bb"),
-        ]
-        .into_iter()
-        .collect();
+        let bl: BufList = vec![Bytes::from_static(b"aaa"), Bytes::from_static(b"bb")]
+            .into_iter()
+            .collect();
         assert_eq!(bl.remaining(), 5);
     }
 

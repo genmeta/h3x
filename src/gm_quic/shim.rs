@@ -285,10 +285,7 @@ impl quic::WithLocalAgent for gm_quic::prelude::Connection {
     type LocalAgent = GmQuicLocalAgent;
 
     async fn local_agent(&self) -> Result<Option<GmQuicLocalAgent>, quic::ConnectionError> {
-        let local_agent = self
-            .local_agent()
-            .await
-            .map_err(convert_connection_error)?;
+        let local_agent = self.local_agent().await.map_err(convert_connection_error)?;
         Ok(local_agent.map(|local_agent| {
             let name = AsRef::<Arc<str>>::as_ref(&local_agent).clone();
             let certified_key = AsRef::<Arc<CertifiedKey>>::as_ref(&local_agent).clone();

@@ -36,7 +36,10 @@ impl Service for Fallback {
 
     fn serve<'s>(&self, request: &'s mut Request, response: &'s mut Response) -> Self::Future<'s> {
         tracing::debug!("Call fallback service");
-        self.0.read().expect("lock is not poisoned").serve(request, response)
+        self.0
+            .read()
+            .expect("lock is not poisoned")
+            .serve(request, response)
     }
 }
 

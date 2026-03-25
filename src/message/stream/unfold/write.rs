@@ -163,9 +163,7 @@ where
 // QUIC control trait forwarding for Unfold
 // ---------------------------------------------------------------------------
 
-impl<T: GetStreamId + Unpin, S, F, C, SF, FF, CF> GetStreamId
-    for Unfold<T, S, F, C, SF, FF, CF>
-{
+impl<T: GetStreamId + Unpin, S, F, C, SF, FF, CF> GetStreamId for Unfold<T, S, F, C, SF, FF, CF> {
     fn poll_stream_id(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -178,9 +176,7 @@ impl<T: GetStreamId + Unpin, S, F, C, SF, FF, CF> GetStreamId
     }
 }
 
-impl<T: CancelStream + Unpin, S, F, C, SF, FF, CF> CancelStream
-    for Unfold<T, S, F, C, SF, FF, CF>
-{
+impl<T: CancelStream + Unpin, S, F, C, SF, FF, CF> CancelStream for Unfold<T, S, F, C, SF, FF, CF> {
     fn poll_cancel(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -248,9 +244,7 @@ impl WriteStream {
     pub fn into_bytes_sink(self) -> impl WriteMessageStream {
         unfold(
             self,
-            async |mut stream: WriteStream, buf: Bytes| {
-                stream.send_data(buf).await.map(|_| stream)
-            },
+            async |mut stream: WriteStream, buf: Bytes| stream.send_data(buf).await.map(|_| stream),
             async |mut stream: WriteStream| stream.flush().await.map(|_| stream),
             async |mut stream: WriteStream| stream.close().await.map(|_| stream),
         )

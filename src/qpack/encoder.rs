@@ -308,7 +308,10 @@ impl EncoderState {
         let Occupied(mut blocking_stream) = self.blocking_streams.entry(stream_id) else {
             return Err(QPackDecoderStreamError::AcknowledgeNonExistSection { stream_id });
         };
-        let max_referenced_index = blocking_stream.get_mut().pop_front().expect("blocking stream entry is non-empty");
+        let max_referenced_index = blocking_stream
+            .get_mut()
+            .pop_front()
+            .expect("blocking stream entry is non-empty");
         if blocking_stream.get().is_empty() {
             blocking_stream.remove();
         }

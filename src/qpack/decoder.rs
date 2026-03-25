@@ -208,7 +208,10 @@ pub struct Decoder<Ds, Es> {
 
 impl<Ds, Es> Decoder<Ds, Es> {
     pub(crate) fn emit(&self, instruction: DecoderInstruction) {
-        self.state.lock().expect("lock is not poisoned").emit(instruction);
+        self.state
+            .lock()
+            .expect("lock is not poisoned")
+            .emit(instruction);
     }
 
     pub(crate) fn known_received_count(&self) -> u64 {
@@ -377,7 +380,11 @@ where
                 decompression_field_line_representation(
                     &representation,
                     base,
-                    &self.state.lock().expect("lock is not poisoned").dynamic_table,
+                    &self
+                        .state
+                        .lock()
+                        .expect("lock is not poisoned")
+                        .dynamic_table,
                 )
                 .map_err(StreamError::from)
             })
@@ -393,7 +400,13 @@ where
     }
 
     fn pending_instructions(&self) -> impl Iterator<Item = DecoderInstruction> {
-        std::iter::from_fn(move || self.state.lock().expect("lock is not poisoned").pending_instructions.pop_front())
+        std::iter::from_fn(move || {
+            self.state
+                .lock()
+                .expect("lock is not poisoned")
+                .pending_instructions
+                .pop_front()
+        })
     }
 
     pub async fn flush_instructions(&self) -> Result<(), StreamError> {

@@ -96,7 +96,14 @@ impl<T: Clone> Future for Get<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let project = self.project();
         ready!(project.notified.poll(cx));
-        Poll::Ready(project.state.lock().expect("lock is not poisoned").value.clone())
+        Poll::Ready(
+            project
+                .state
+                .lock()
+                .expect("lock is not poisoned")
+                .value
+                .clone(),
+        )
     }
 }
 
