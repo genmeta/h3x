@@ -531,7 +531,6 @@ impl<S: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + ?
 pub mod test {
     use std::{
         pin::Pin,
-        sync::Arc,
         task::{Context, Poll, ready},
     };
 

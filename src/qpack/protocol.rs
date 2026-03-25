@@ -460,7 +460,6 @@ impl<C: ?Sized> ConnectionState<C> {
 #[cfg(test)]
 mod tests {
     use std::{
-        cmp::Ordering,
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
     };

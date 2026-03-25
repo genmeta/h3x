@@ -269,7 +269,7 @@ pub enum StreamVerdict<S> {
 
 #[cfg(all(test, feature = "gm-quic"))]
 mod tests {
-    use std::{collections::hash_map::DefaultHasher, hash::Hasher, sync::Arc};
+    use std::sync::Arc;
 
     use futures::future::BoxFuture;
 
