@@ -221,10 +221,12 @@ where
                 continue;
             }
 
-            // Step 3: Try insertion (if not sensitive, may_block allows, and entry fits)
+            // Step 3: Try insertion (if not sensitive and entry fits)
+            // When may_block=false, we still insert speculatively to populate the table
+            // for future field sections, but don't reference the new entry.
             let dynamic_name_abs = find_dynamic_name(state, &name);
 
-            if !never_dynamic && may_block && entry_fits_capacity(state, &name, &value) {
+            if !never_dynamic && entry_fits_capacity(state, &name, &value) {
                 let insert_result = if let Some(static_idx) = static_name_idx {
                     state.insert_with_name_reference(
                         true,
@@ -253,13 +255,17 @@ where
                 };
 
                 if let Ok(new_abs) = insert_result {
-                    track_ref(&mut max_ref, new_abs);
-                    representations.push(
-                        FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex {
-                            index: new_abs - base,
-                        },
-                    );
-                    continue;
+                    // Only reference the new post-base entry if blocking is allowed
+                    if may_block {
+                        track_ref(&mut max_ref, new_abs);
+                        representations.push(
+                            FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex {
+                                index: new_abs - base,
+                            },
+                        );
+                        continue;
+                    }
+                    // may_block=false: entry inserted but not referenced — fall through
                 }
                 // Insert failed (CannotEvict) — fall through to literal encoding
             }
@@ -609,13 +615,13 @@ mod tests {
     // --- may_block=false ---
 
     #[tokio::test]
-    async fn may_block_false_skips_insertion() {
+    async fn may_block_false_inserts_speculatively_without_reference() {
         let mut state = state_with_capacity(256);
         let output = do_compress(&mut state, vec![field_line("x-custom", "hello")], false).await;
 
+        // may_block=false: entry IS inserted speculatively but NOT referenced
         assert!(output.max_referenced_index.is_none());
-        // SetDynamicTableCapacity was inserted by state_with_capacity, but no field insertion
-        assert_eq!(state.table_inserted_count(), 0);
+        assert_eq!(state.table_inserted_count(), 1);
         assert!(matches!(
             output.representations[0],
             FieldLineRepresentation::LiteralFieldLineWithLiteralName { .. }
@@ -806,5 +812,158 @@ mod tests {
             output.representations[0],
             FieldLineRepresentation::LiteralFieldLineWithLiteralName { .. }
         ));
+    }
+
+    mod proptest_roundtrip {
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+        use proptest::prelude::*;
+
+        use crate::{
+            dhttp::settings::{QpackBlockedStreams, QpackMaxTableCapacity, Settings},
+            qpack::{
+                algorithm::{Algorithm, DynamicCompressAlgo, HuffmanNever},
+                decoder::DecoderState,
+                encoder::{EncoderInstruction, EncoderState},
+                field::{EncodedFieldSectionPrefix, FieldLine},
+            },
+            varint::VarInt,
+        };
+
+        fn settings_pair(capacity: u32) -> Arc<Settings> {
+            let mut settings = Settings::default();
+            settings.set(QpackMaxTableCapacity::setting(VarInt::from_u32(capacity)));
+            settings.set(QpackBlockedStreams::setting(VarInt::from_u32(100)));
+            Arc::new(settings)
+        }
+
+        fn apply_instructions(encoder: &mut EncoderState, decoder: &mut DecoderState) {
+            for instruction in encoder.pending_instructions() {
+                match instruction {
+                    EncoderInstruction::SetDynamicTableCapacity { capacity } => {
+                        let _ = decoder.set_dynamic_table_capacity(*capacity);
+                    }
+                    EncoderInstruction::InsertWithNameReference {
+                        is_static,
+                        name_index,
+                        value,
+                        ..
+                    } => {
+                        let abs_index = if *is_static {
+                            *name_index
+                        } else {
+                            decoder.table_inserted_count().wrapping_sub(name_index + 1)
+                        };
+                        let _ = decoder.insert_with_name_reference(
+                            *is_static,
+                            abs_index,
+                            value.clone(),
+                        );
+                    }
+                    EncoderInstruction::InsertWithLiteralName { name, value, .. } => {
+                        let _ = decoder.insert_with_literal_name(name.clone(), value.clone());
+                    }
+                    EncoderInstruction::Duplicate { index } => {
+                        let abs_index = decoder.table_inserted_count().wrapping_sub(index + 1);
+                        let _ = decoder.duplicate(abs_index);
+                    }
+                }
+            }
+            // Simulate flush: clear processed instructions
+            encoder.pending_instructions.clear();
+        }
+
+        fn verify_roundtrip(
+            settings: &Settings,
+            decoder: &DecoderState,
+            output: &super::CompressOutput,
+            original: &[FieldLine],
+        ) {
+            let max_table_capacity = settings.qpack_max_table_capacity().into_inner();
+            let total_inserts = decoder.table_inserted_count();
+
+            let required_insert_count = EncodedFieldSectionPrefix::decode_ric(
+                output.prefix.encoded_insert_count,
+                max_table_capacity,
+                total_inserts,
+            )
+            .expect("decode_ric failed");
+
+            let base = EncodedFieldSectionPrefix::resolve_base(
+                required_insert_count,
+                output.prefix.sign,
+                output.prefix.delta_base,
+            )
+            .expect("resolve_base failed");
+
+            let decoded: Vec<FieldLine> = output
+                .representations
+                .iter()
+                .map(|repr| decoder.decompress(repr, base).expect("decompress failed"))
+                .collect();
+
+            assert_eq!(decoded.len(), original.len());
+            for (orig, dec) in original.iter().zip(decoded.iter()) {
+                assert_eq!(orig.name, dec.name);
+                assert_eq!(orig.value, dec.value);
+            }
+        }
+
+        fn arb_field_line() -> impl Strategy<Value = FieldLine> {
+            (
+                prop::collection::vec(prop::num::u8::ANY, 1..32),
+                prop::collection::vec(prop::num::u8::ANY, 0..64),
+            )
+                .prop_map(|(name, value)| FieldLine {
+                    name: Bytes::from(name),
+                    value: Bytes::from(value),
+                })
+        }
+
+        fn arb_field_section() -> impl Strategy<Value = Vec<FieldLine>> {
+            prop::collection::vec(arb_field_line(), 1..8)
+        }
+
+        proptest! {
+            #[test]
+            fn single_section_roundtrip(field_lines in arb_field_section()) {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let settings = settings_pair(4096);
+                    let mut encoder = EncoderState::new(settings.clone());
+                    encoder.set_max_table_capacity(4096).unwrap();
+                    let mut decoder = DecoderState::new(settings.clone());
+                    decoder.set_dynamic_table_capacity(4096).unwrap();
+
+                    let algo = DynamicCompressAlgo::new(HuffmanNever);
+                    let output = algo.compress(&mut encoder, field_lines.clone(), true).await;
+                    apply_instructions(&mut encoder, &mut decoder);
+                    verify_roundtrip(&settings, &decoder, &output, &field_lines);
+                });
+            }
+
+            #[test]
+            fn multi_section_roundtrip(
+                sections in prop::collection::vec(arb_field_section(), 2..5),
+            ) {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let settings = settings_pair(4096);
+                    let mut encoder = EncoderState::new(settings.clone());
+                    encoder.set_max_table_capacity(4096).unwrap();
+                    let mut decoder = DecoderState::new(settings.clone());
+                    decoder.set_dynamic_table_capacity(4096).unwrap();
+
+                    let algo = DynamicCompressAlgo::new(HuffmanNever);
+
+                    for section in &sections {
+                        let output = algo.compress(&mut encoder, section.clone(), true).await;
+                        apply_instructions(&mut encoder, &mut decoder);
+                        verify_roundtrip(&settings, &decoder, &output, section);
+                    }
+                });
+            }
+        }
     }
 }
