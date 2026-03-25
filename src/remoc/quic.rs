@@ -73,7 +73,7 @@ pub use self::{
     connection::{
         ConnectionClient, ConnectionReqReceiver, ConnectionServer, ConnectionServerRef,
         ConnectionServerRefMut, ConnectionServerShared, ConnectionServerSharedMut,
-        serve_quic_connection, serve_read_stream, serve_write_stream,
+        serve_quic_connection,
     },
     listen::{
         ListenClient, ListenError, ListenReqReceiver, ListenServer, ListenServerRef,

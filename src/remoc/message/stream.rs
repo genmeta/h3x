@@ -1,13 +1,10 @@
 use std::{
-    future::poll_fn,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt, future::Either};
-use remoc::prelude::ServerSharedMut;
+use futures::future::Either;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -53,123 +50,8 @@ pub trait MessageWriteStream: Send + Sync {
     async fn cancel(&mut self, code: VarInt) -> Result<(), quic::StreamError>;
 }
 
-// ---------------------------------------------------------------------------
-// Served wrappers (server side — wrap a real stream behind a Mutex)
-// ---------------------------------------------------------------------------
 
-struct ServedMessageReadStream<R> {
-    inner: tokio::sync::Mutex<Pin<Box<R>>>,
-}
 
-impl<R> ServedMessageReadStream<R> {
-    fn new(stream: R) -> Self {
-        Self {
-            inner: tokio::sync::Mutex::new(Box::pin(stream)),
-        }
-    }
-}
-
-impl<R> MessageReadStream for ServedMessageReadStream<R>
-where
-    R: ReadMessageStream + 'static,
-{
-    async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError> {
-        let mut stream = self.inner.lock().await;
-        poll_fn(|cx| stream.as_mut().poll_stream_id(cx)).await
-    }
-
-    async fn read(&mut self) -> Result<Option<Bytes>, MessageStreamError> {
-        let mut stream = self.inner.lock().await;
-        stream.next().await.transpose()
-    }
-
-    async fn stop(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
-        let mut stream = self.inner.lock().await;
-        poll_fn(|cx| stream.as_mut().poll_stop(cx, code)).await
-    }
-}
-
-struct ServedMessageWriteStream<W> {
-    inner: tokio::sync::Mutex<Pin<Box<W>>>,
-}
-
-impl<W> ServedMessageWriteStream<W> {
-    fn new(stream: W) -> Self {
-        Self {
-            inner: tokio::sync::Mutex::new(Box::pin(stream)),
-        }
-    }
-}
-
-impl<W> MessageWriteStream for ServedMessageWriteStream<W>
-where
-    W: WriteMessageStream + 'static,
-{
-    async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError> {
-        let mut stream = self.inner.lock().await;
-        poll_fn(|cx| stream.as_mut().poll_stream_id(cx)).await
-    }
-
-    async fn write(&mut self, data: Bytes) -> Result<(), MessageStreamError> {
-        let mut stream = self.inner.lock().await;
-        stream.send(data).await
-    }
-
-    async fn flush(&mut self) -> Result<(), MessageStreamError> {
-        let mut stream = self.inner.lock().await;
-        SinkExt::flush(&mut *stream).await
-    }
-
-    async fn shutdown(&mut self) -> Result<(), MessageStreamError> {
-        let mut stream = self.inner.lock().await;
-        stream.close().await
-    }
-
-    async fn cancel(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
-        let mut stream = self.inner.lock().await;
-        poll_fn(|cx| stream.as_mut().poll_cancel(cx, code)).await
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Serve functions (create server+client pair)
-// ---------------------------------------------------------------------------
-
-pub fn serve_message_read_stream(
-    reader: impl ReadMessageStream + 'static,
-) -> (
-    MessageReadStreamClient,
-    impl Future<Output = ()> + Send + 'static,
-) {
-    let (server, client) = MessageReadStreamServerSharedMut::new(
-        Arc::new(tokio::sync::RwLock::new(
-            ServedMessageReadStream::new(reader),
-        )),
-        1,
-    );
-    let fut = async move {
-        let _ = server.serve(true).await;
-    };
-    (client, fut)
-}
-
-pub fn serve_message_write_stream(
-    writer: impl WriteMessageStream + 'static,
-) -> (
-    MessageWriteStreamClient,
-    impl Future<Output = ()> + Send + 'static,
-) {
-    let (server, client) = MessageWriteStreamServerSharedMut::new(
-        Arc::new(tokio::sync::RwLock::new(
-            ServedMessageWriteStream::new(writer),
-        )),
-        1,
-    );
-    let fut = async move {
-        let _ = server.serve(true).await;
-    };
-    (client, fut)
-}
 
 // ---------------------------------------------------------------------------
 // Read bridge (MessageReadStreamClient → impl ReadMessageStream)

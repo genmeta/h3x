@@ -13,11 +13,6 @@
 //! - [`MessageReadStreamClient`]
 //! - [`MessageWriteStreamClient`]
 //!
-//! ## Serve functions (create server+client pair from a real stream)
-//!
-//! - [`serve_message_read_stream`]
-//! - [`serve_message_write_stream`]
-//!
 //! ## Conversion methods (reconstruct poll-based streams from clients)
 //!
 //! - [`MessageReadStreamClient::into_message_stream`]
@@ -33,5 +28,5 @@ pub use self::stream::{
     MessageReadStreamClient, MessageReadStreamReqReceiver, MessageReadStreamServer,
     MessageReadStreamServerRefMut, MessageReadStreamServerSharedMut, MessageWriteStreamClient,
     MessageWriteStreamReqReceiver, MessageWriteStreamServer, MessageWriteStreamServerRefMut,
-    MessageWriteStreamServerSharedMut, serve_message_read_stream, serve_message_write_stream,
+    MessageWriteStreamServerSharedMut,
 };

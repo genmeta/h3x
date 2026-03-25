@@ -224,31 +224,7 @@ impl<C> ServedConnection<C> {
     }
 }
 
-pub fn serve_read_stream(
-    reader: impl quic::ReadStream + 'static,
-) -> (ReadStreamClient, impl Future<Output = ()> + Send + 'static) {
-    let (server, client) = stream::ReadStreamServerSharedMut::new(
-        Arc::new(tokio::sync::RwLock::new(ServedReadStream::new(reader))),
-        1,
-    );
-    let fut = async move {
-        let _ = server.serve(true).await;
-    };
-    (client, fut)
-}
 
-pub fn serve_write_stream(
-    writer: impl quic::WriteStream + 'static,
-) -> (WriteStreamClient, impl Future<Output = ()> + Send + 'static) {
-    let (server, client) = stream::WriteStreamServerSharedMut::new(
-        Arc::new(tokio::sync::RwLock::new(ServedWriteStream::new(writer))),
-        1,
-    );
-    let fut = async move {
-        let _ = server.serve(true).await;
-    };
-    (client, fut)
-}
 
 impl<C> Connection for ServedConnection<C>
 where
@@ -260,8 +236,16 @@ where
         &self,
     ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError> {
         let (reader, writer) = self.connection.open_bi().await?;
-        let (read_client, read_fut) = serve_read_stream(reader);
-        let (write_client, write_fut) = serve_write_stream(writer);
+        let (read_server, read_client) = stream::ReadStreamServerSharedMut::new(
+            Arc::new(tokio::sync::RwLock::new(ServedReadStream::new(reader))),
+            1,
+        );
+        let read_fut = async move { let _ = read_server.serve(true).await; };
+        let (write_server, write_client) = stream::WriteStreamServerSharedMut::new(
+            Arc::new(tokio::sync::RwLock::new(ServedWriteStream::new(writer))),
+            1,
+        );
+        let write_fut = async move { let _ = write_server.serve(true).await; };
         self.tasks.spawn(read_fut);
         self.tasks.spawn(write_fut);
         Ok((read_client, write_client))
@@ -269,7 +253,11 @@ where
 
     async fn open_uni(&self) -> Result<WriteStreamClient, quic::ConnectionError> {
         let writer = self.connection.open_uni().await?;
-        let (client, fut) = serve_write_stream(writer);
+        let (server, client) = stream::WriteStreamServerSharedMut::new(
+            Arc::new(tokio::sync::RwLock::new(ServedWriteStream::new(writer))),
+            1,
+        );
+        let fut = async move { let _ = server.serve(true).await; };
         self.tasks.spawn(fut);
         Ok(client)
     }
@@ -278,8 +266,16 @@ where
         &self,
     ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError> {
         let (reader, writer) = self.connection.accept_bi().await?;
-        let (read_client, read_fut) = serve_read_stream(reader);
-        let (write_client, write_fut) = serve_write_stream(writer);
+        let (read_server, read_client) = stream::ReadStreamServerSharedMut::new(
+            Arc::new(tokio::sync::RwLock::new(ServedReadStream::new(reader))),
+            1,
+        );
+        let read_fut = async move { let _ = read_server.serve(true).await; };
+        let (write_server, write_client) = stream::WriteStreamServerSharedMut::new(
+            Arc::new(tokio::sync::RwLock::new(ServedWriteStream::new(writer))),
+            1,
+        );
+        let write_fut = async move { let _ = write_server.serve(true).await; };
         self.tasks.spawn(read_fut);
         self.tasks.spawn(write_fut);
         Ok((read_client, write_client))
@@ -287,7 +283,11 @@ where
 
     async fn accept_uni(&self) -> Result<ReadStreamClient, quic::ConnectionError> {
         let reader = self.connection.accept_uni().await?;
-        let (client, fut) = serve_read_stream(reader);
+        let (server, client) = stream::ReadStreamServerSharedMut::new(
+            Arc::new(tokio::sync::RwLock::new(ServedReadStream::new(reader))),
+            1,
+        );
+        let fut = async move { let _ = server.serve(true).await; };
         self.tasks.spawn(fut);
         Ok(client)
     }
