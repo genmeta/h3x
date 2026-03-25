@@ -352,4 +352,27 @@ mod tests {
         assert_eq!(format!("{v:x}"), "ff");
         assert_eq!(format!("{v:X}"), "FF");
     }
+
+    mod proptest_roundtrip {
+        use std::io::Cursor;
+
+        use proptest::prelude::*;
+
+        use super::*;
+
+        proptest! {
+            #[test]
+            fn varint_encode_decode_roundtrip(value in 0u64..VARINT_MAX) {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let vi = VarInt::from_u64(value).unwrap();
+                    let mut buf = Vec::new();
+                    vi.encode_into(Cursor::new(&mut buf)).await.unwrap();
+                    let decoded = VarInt::decode_from(Cursor::new(&buf)).await.unwrap();
+                    prop_assert_eq!(decoded, vi);
+                    Ok(())
+                })?;
+            }
+        }
+    }
 }

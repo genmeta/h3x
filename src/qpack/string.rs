@@ -137,4 +137,55 @@ mod tests {
         let huff_byte = Buf::chunk(&writer2)[0];
         assert_eq!(huff_byte & 0x80, 0x80, "H bit should be 1 for huffman");
     }
+
+    mod proptest_roundtrip {
+        use bytes::{Buf, Bytes};
+        use proptest::prelude::*;
+
+        use super::*;
+        use crate::buflist::BufList;
+
+        proptest! {
+            #[test]
+            fn qpack_string_plain_roundtrip(data in proptest::collection::vec(any::<u8>(), 0..256)) {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let mut writer = BufList::new();
+                    encode_string(&mut writer, 0, 8, false, Bytes::from(data.clone()))
+                        .await
+                        .unwrap();
+                    let total = writer.remaining();
+                    let encoded = writer.copy_to_bytes(total);
+                    let (huffman, decoded) =
+                        decode_string(std::io::Cursor::new(&encoded[1..]), encoded[0], 8)
+                            .await
+                            .unwrap();
+                    prop_assert!(!huffman);
+                    prop_assert_eq!(&decoded[..], &data[..]);
+                    Ok(())
+                })?;
+            }
+
+            #[test]
+            fn qpack_string_huffman_roundtrip(data in proptest::collection::vec(0u8..128, 0..256)) {
+                // Huffman encoding only works on ASCII bytes
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let mut writer = BufList::new();
+                    encode_string(&mut writer, 0, 8, true, Bytes::from(data.clone()))
+                        .await
+                        .unwrap();
+                    let total = writer.remaining();
+                    let encoded = writer.copy_to_bytes(total);
+                    let (huffman, decoded) =
+                        decode_string(std::io::Cursor::new(&encoded[1..]), encoded[0], 8)
+                            .await
+                            .unwrap();
+                    prop_assert!(huffman);
+                    prop_assert_eq!(&decoded[..], &data[..]);
+                    Ok(())
+                })?;
+            }
+        }
+    }
 }

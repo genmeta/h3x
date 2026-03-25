@@ -520,4 +520,54 @@ mod tests {
         let result = EncodedFieldSectionPrefix::resolve_base(1, true, 5);
         assert_eq!(result, Err(DecodeError::ArithmeticOverflow));
     }
+
+    mod proptest_roundtrip {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        proptest! {
+            #[test]
+            fn ric_encode_decode_roundtrip(
+                required_insert_count in 1u64..10000,
+                max_table_capacity in 32u64..100000,
+            ) {
+                // Per RFC 9204 §4.5.1.1, the decoder's total_number_of_inserts
+                // must equal required_insert_count for a clean roundtrip, since
+                // the encoding uses modular arithmetic over 2*max_entries.
+                let total_number_of_inserts = required_insert_count;
+                let encoded = EncodedFieldSectionPrefix::encode_ric(
+                    required_insert_count,
+                    max_table_capacity,
+                );
+                let decoded = EncodedFieldSectionPrefix::decode_ric(
+                    encoded,
+                    max_table_capacity,
+                    total_number_of_inserts,
+                );
+                prop_assert_eq!(decoded, Ok(required_insert_count));
+            }
+
+            #[test]
+            fn resolve_base_positive_invariant(
+                ric in 1u64..=u64::MAX / 2,
+                delta in 0u64..=u64::MAX / 2,
+            ) {
+                let result = EncodedFieldSectionPrefix::resolve_base(ric, false, delta);
+                match ric.checked_add(delta) {
+                    Some(expected) => prop_assert_eq!(result, Ok(expected)),
+                    None => prop_assert_eq!(result, Err(DecodeError::ArithmeticOverflow)),
+                }
+            }
+
+            #[test]
+            fn resolve_base_negative_invariant(ric in 0u64..10000, delta in 0u64..10000) {
+                let result = EncodedFieldSectionPrefix::resolve_base(ric, true, delta);
+                match ric.checked_sub(delta).and_then(|v| v.checked_sub(1)) {
+                    Some(expected) => prop_assert_eq!(result, Ok(expected)),
+                    None => prop_assert_eq!(result, Err(DecodeError::ArithmeticOverflow)),
+                }
+            }
+        }
+    }
 }

@@ -188,4 +188,26 @@ mod tests {
             .unwrap();
         assert!(buf.len() > 1);
     }
+
+    mod proptest_roundtrip {
+        use std::io::Cursor;
+
+        use proptest::prelude::*;
+
+        use super::*;
+
+        proptest! {
+            #[test]
+            fn qpack_integer_roundtrip(n in 1u8..8, value in 0u64..=(u64::MAX >> 1)) {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let mut buf = Vec::new();
+                    encode_integer(Cursor::new(&mut buf), 0, n, value).await.unwrap();
+                    let decoded = decode_integer(Cursor::new(&buf[1..]), buf[0], n).await.unwrap();
+                    prop_assert_eq!(decoded, value);
+                    Ok(())
+                })?;
+            }
+        }
+    }
 }

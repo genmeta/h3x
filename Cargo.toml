@@ -82,3 +82,4 @@ tokio = { version = "1", features = [
 ] }
 tracing-appender = "0.2"
 tracing-subscriber = "0.3"
+proptest = "1"
