@@ -25,8 +25,8 @@ pub type BoxWriteStream = Pin<Box<dyn quic::WriteStream + Send + Unpin>>;
 /// which remains generic.
 ///
 /// Lifecycle methods (`close`, `check`, `closed`) are inherited from
-/// [`quic::Lifecycle`] via the supertrait bound.
-pub trait ErasedConnection: quic::Lifecycle + Send + Sync {
+/// [`quic::DynLifecycle`] via the supertrait bound.
+pub trait ErasedConnection: quic::DynLifecycle + Send + Sync {
     /// Open a unidirectional stream, returning a boxed write stream.
     fn open_uni(&self) -> BoxFuture<'_, Result<BoxWriteStream, quic::ConnectionError>>;
 

@@ -138,7 +138,7 @@ impl From<MessageStreamError> for io::Error {
 pub struct ReadStream {
     pub(super) stream: FrameStream<BoxDynQuicStreamReader>,
     pub(super) qpack_decoder: Arc<QPackDecoder>,
-    pub(super) connection: Arc<dyn quic::Lifecycle + Send + Sync>,
+    pub(super) connection: Arc<dyn quic::DynLifecycle + Send + Sync>,
     dhttp_state: Arc<DHttpState>,
 }
 
@@ -146,7 +146,7 @@ impl ReadStream {
     pub fn new(
         stream: StreamReader<BoxDynQuicStreamReader>,
         qpack_decoder: Arc<QPackDecoder>,
-        connection: Arc<dyn quic::Lifecycle + Send + Sync>,
+        connection: Arc<dyn quic::DynLifecycle + Send + Sync>,
         dhttp_state: Arc<DHttpState>,
     ) -> Self {
         let frame_stream = FrameStream::new(stream);
@@ -313,7 +313,7 @@ impl quic::StopStream for ReadStream {
 pub struct WriteStream {
     pub(super) stream: SinkWriter<BoxDynQuicStreamWriter>,
     pub(super) qpack_encoder: Arc<QPackEncoder>,
-    pub(super) connection: Arc<dyn quic::Lifecycle + Send + Sync>,
+    pub(super) connection: Arc<dyn quic::DynLifecycle + Send + Sync>,
     dhttp_state: Arc<DHttpState>,
 }
 
@@ -324,7 +324,7 @@ impl WriteStream {
     pub fn new(
         stream: SinkWriter<BoxDynQuicStreamWriter>,
         qpack_encoder: Arc<QPackEncoder>,
-        connection: Arc<dyn quic::Lifecycle + Send + Sync>,
+        connection: Arc<dyn quic::DynLifecycle + Send + Sync>,
         dhttp_state: Arc<DHttpState>,
     ) -> Self {
         Self {
@@ -491,13 +491,13 @@ impl<C: quic::Connection> ConnectionState<C> {
             ReadStream::new(
                 reader,
                 qpack.decoder.clone(),
-                self.quic().clone() as Arc<dyn quic::Lifecycle + Send + Sync>,
+                self.quic().clone() as Arc<dyn quic::DynLifecycle + Send + Sync>,
                 dhttp.state.clone(),
             ),
             WriteStream::new(
                 writer,
                 qpack.encoder.clone(),
-                self.quic().clone() as Arc<dyn quic::Lifecycle + Send + Sync>,
+                self.quic().clone() as Arc<dyn quic::DynLifecycle + Send + Sync>,
                 dhttp.state.clone(),
             ),
         ))
@@ -513,13 +513,13 @@ impl<C: quic::Connection> ConnectionState<C> {
             ReadStream::new(
                 reader,
                 qpack.decoder.clone(),
-                self.quic().clone() as Arc<dyn quic::Lifecycle + Send + Sync>,
+                self.quic().clone() as Arc<dyn quic::DynLifecycle + Send + Sync>,
                 dhttp.state.clone(),
             ),
             WriteStream::new(
                 writer,
                 qpack.encoder.clone(),
-                self.quic().clone() as Arc<dyn quic::Lifecycle + Send + Sync>,
+                self.quic().clone() as Arc<dyn quic::DynLifecycle + Send + Sync>,
                 dhttp.state.clone(),
             ),
         ))
@@ -678,7 +678,7 @@ mod tests {
     async fn read_stream_try_stream_io_aborts_when_peer_goaway_covers_stream() {
         let quic = Arc::new(MockConnection::new());
         let erased_connection: Arc<dyn ErasedConnection> = quic.clone();
-        let connection: Arc<dyn quic::Lifecycle + Send + Sync> = quic.clone();
+        let connection: Arc<dyn quic::DynLifecycle + Send + Sync> = quic.clone();
 
         let mut protocols = Protocols::new();
         protocols.insert(DHttpProtocol::new_for_test(erased_connection));
@@ -721,7 +721,7 @@ mod tests {
     async fn write_stream_try_stream_io_aborts_when_peer_goaway_covers_stream() {
         let quic = Arc::new(MockConnection::new());
         let erased_connection: Arc<dyn ErasedConnection> = quic.clone();
-        let connection: Arc<dyn quic::Lifecycle + Send + Sync> = quic.clone();
+        let connection: Arc<dyn quic::DynLifecycle + Send + Sync> = quic.clone();
 
         let mut protocols = Protocols::new();
         protocols.insert(DHttpProtocol::new_for_test(erased_connection));

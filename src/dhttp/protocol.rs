@@ -910,7 +910,7 @@ impl<C: ?Sized> ConnectionState<C> {
     }
 }
 
-impl<C: quic::Lifecycle + Sync + ?Sized> ConnectionState<C> {
+impl<C: quic::DynLifecycle + Sync + ?Sized> ConnectionState<C> {
     pub async fn peer_settings(
         &self,
     ) -> impl Future<Output = Result<Arc<Settings>, quic::ConnectionError>> + Send + use<'_, C>

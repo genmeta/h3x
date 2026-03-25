@@ -172,7 +172,7 @@ impl CancelStream for StreamWriter {
     }
 }
 
-impl quic::ManageStreamAsync for gm_quic::prelude::Connection {
+impl quic::ManageStream for gm_quic::prelude::Connection {
     type StreamWriter = StreamWriter;
 
     type StreamReader = StreamReader;
@@ -281,7 +281,7 @@ impl agent::RemoteAgent for GmQuicRemoteAgent {
     }
 }
 
-impl quic::WithLocalAgentAsync for gm_quic::prelude::Connection {
+impl quic::WithLocalAgent for gm_quic::prelude::Connection {
     type LocalAgent = GmQuicLocalAgent;
 
     async fn local_agent(&self) -> Result<Option<GmQuicLocalAgent>, quic::ConnectionError> {
@@ -300,7 +300,7 @@ impl quic::WithLocalAgentAsync for gm_quic::prelude::Connection {
     }
 }
 
-impl quic::WithRemoteAgentAsync for gm_quic::prelude::Connection {
+impl quic::WithRemoteAgent for gm_quic::prelude::Connection {
     type RemoteAgent = GmQuicRemoteAgent;
 
     async fn remote_agent(&self) -> Result<Option<GmQuicRemoteAgent>, quic::ConnectionError> {
@@ -316,7 +316,7 @@ impl quic::WithRemoteAgentAsync for gm_quic::prelude::Connection {
     }
 }
 
-impl quic::LifecycleAsync for gm_quic::prelude::Connection {
+impl quic::Lifecycle for gm_quic::prelude::Connection {
     fn close(&self, code: Code, reason: Cow<'static, str>) {
         _ = gm_quic::prelude::Connection::close(self, reason, code.into_inner().into_inner());
     }
@@ -330,7 +330,7 @@ impl quic::LifecycleAsync for gm_quic::prelude::Connection {
     }
 }
 
-impl quic::ListenAsync for gm_quic::prelude::QuicListeners {
+impl quic::Listen for gm_quic::prelude::QuicListeners {
     type Connection = gm_quic::prelude::Connection;
 
     type Error = gm_quic::prelude::ListenersShutdown;
@@ -346,7 +346,7 @@ impl quic::ListenAsync for gm_quic::prelude::QuicListeners {
     }
 }
 
-impl quic::ListenAsync for Arc<gm_quic::prelude::QuicListeners> {
+impl quic::Listen for Arc<gm_quic::prelude::QuicListeners> {
     type Connection = gm_quic::prelude::Connection;
 
     type Error = gm_quic::prelude::ListenersShutdown;
@@ -362,7 +362,7 @@ impl quic::ListenAsync for Arc<gm_quic::prelude::QuicListeners> {
     }
 }
 
-impl quic::ConnectAsync for Arc<gm_quic::prelude::QuicClient> {
+impl quic::Connect for Arc<gm_quic::prelude::QuicClient> {
     type Connection = gm_quic::prelude::Connection;
 
     type Error = gm_quic::prelude::ConnectServerError;

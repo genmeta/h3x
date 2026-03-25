@@ -164,7 +164,7 @@ impl<C: quic::Connection> Pool<C> {
         server: Authority,
     ) -> Result<Arc<Connection<C>>, ConnectError<Client::Error>>
     where
-        Client: quic::Connect<Connection = C> + ?Sized,
+        Client: quic::Connect<Connection = C>,
     {
         let builder_hash = {
             let mut hasher = DefaultHasher::new();

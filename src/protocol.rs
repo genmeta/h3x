@@ -191,7 +191,7 @@ impl Protocols {
     }
 }
 
-pub trait ProductProtocol<C: quic::Connection + ?Sized>: Any + Send + Sync + Hash + Eq {
+pub trait ProductProtocol<C: quic::DynConnection + ?Sized>: Any + Send + Sync + Hash + Eq {
     type Protocol: Protocol;
 
     fn init<'a>(
@@ -201,7 +201,7 @@ pub trait ProductProtocol<C: quic::Connection + ?Sized>: Any + Send + Sync + Has
     ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>>;
 }
 
-pub(crate) trait InitProtocols<C: quic::Connection + ?Sized>: Send + Sync {
+pub(crate) trait InitProtocols<C: quic::DynConnection + ?Sized>: Send + Sync {
     fn init_protocols<'a>(
         &'a self,
         conn: &'a Arc<C>,
@@ -209,7 +209,7 @@ pub(crate) trait InitProtocols<C: quic::Connection + ?Sized>: Send + Sync {
     ) -> BoxFuture<'a, Result<(), ConnectionError>>;
 }
 
-impl<C: quic::Connection + ?Sized, P: ProductProtocol<C>> InitProtocols<C> for P {
+impl<C: quic::DynConnection + ?Sized, P: ProductProtocol<C>> InitProtocols<C> for P {
     fn init_protocols<'a>(
         &'a self,
         conn: &'a Arc<C>,
@@ -231,7 +231,7 @@ impl<C: quic::Connection + ?Sized, P: ProductProtocol<C>> InitProtocols<C> for P
 
 /// Computes a deterministic identity hash for a `ProductProtocol` factory,
 /// combining its `TypeId` and value hash.
-pub(crate) fn compute_factory_identity<C: quic::Connection + ?Sized, F: ProductProtocol<C>>(
+pub(crate) fn compute_factory_identity<C: quic::DynConnection + ?Sized, F: ProductProtocol<C>>(
     factory: &F,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -300,7 +300,7 @@ mod tests {
     #[derive(Debug, Clone, Hash, PartialEq, Eq)]
     struct MockFactory(u64);
 
-    impl<C: quic::Connection + ?Sized> ProductProtocol<C> for MockFactory {
+    impl<C: quic::DynConnection + ?Sized> ProductProtocol<C> for MockFactory {
         type Protocol = MockProtocol;
 
         fn init<'a>(
@@ -336,7 +336,7 @@ mod tests {
         }
     }
 
-    impl<C: quic::Connection + ?Sized> ProductProtocol<C> for MockFactory2 {
+    impl<C: quic::DynConnection + ?Sized> ProductProtocol<C> for MockFactory2 {
         type Protocol = MockProtocol2;
 
         fn init<'a>(
@@ -348,7 +348,7 @@ mod tests {
         }
     }
 
-    fn compute_identity<C: quic::Connection + ?Sized, F: ProductProtocol<C>>(f: &F) -> u64 {
+    fn compute_identity<C: quic::DynConnection + ?Sized, F: ProductProtocol<C>>(f: &F) -> u64 {
         compute_factory_identity::<C, F>(f)
     }
 

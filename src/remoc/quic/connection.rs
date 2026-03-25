@@ -1,6 +1,6 @@
 use std::{borrow::Cow, future::Future, sync::Arc};
 
-use futures::{SinkExt, StreamExt, future::BoxFuture};
+use futures::{SinkExt, StreamExt};
 use remoc::{
     prelude::{ServerShared, ServerSharedMut},
     rtc::Client as RemocClient,
@@ -57,68 +57,50 @@ impl quic::ManageStream for ConnectionClient {
     type StreamWriter = crate::dhttp::protocol::BoxDynQuicStreamWriter;
     type StreamReader = crate::dhttp::protocol::BoxDynQuicStreamReader;
 
-    fn open_bi(
+    async fn open_bi(
         &self,
-    ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> {
-        let client = self.clone();
-        Box::pin(async move {
-            let (reader, writer) = Connection::open_bi(&client).await?;
-            Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
-        })
+    ) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
+        let (reader, writer) = Connection::open_bi(self).await?;
+        Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
     }
 
-    fn open_uni(&self) -> BoxFuture<'_, Result<Self::StreamWriter, ConnectionError>> {
-        let client = self.clone();
-        Box::pin(async move {
-            let writer = Connection::open_uni(&client).await?;
-            Ok(writer.into_boxed_quic())
-        })
+    async fn open_uni(&self) -> Result<Self::StreamWriter, ConnectionError> {
+        let writer = Connection::open_uni(self).await?;
+        Ok(writer.into_boxed_quic())
     }
 
-    fn accept_bi(
+    async fn accept_bi(
         &self,
-    ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> {
-        let client = self.clone();
-        Box::pin(async move {
-            let (reader, writer) = Connection::accept_bi(&client).await?;
-            Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
-        })
+    ) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
+        let (reader, writer) = Connection::accept_bi(self).await?;
+        Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
     }
 
-    fn accept_uni(&self) -> BoxFuture<'_, Result<Self::StreamReader, ConnectionError>> {
-        let client = self.clone();
-        Box::pin(async move {
-            let reader = Connection::accept_uni(&client).await?;
-            Ok(reader.into_boxed_quic())
-        })
+    async fn accept_uni(&self) -> Result<Self::StreamReader, ConnectionError> {
+        let reader = Connection::accept_uni(self).await?;
+        Ok(reader.into_boxed_quic())
     }
 }
 
 impl quic::WithLocalAgent for ConnectionClient {
     type LocalAgent = CachedLocalAgent;
 
-    fn local_agent(&self) -> BoxFuture<'_, Result<Option<Self::LocalAgent>, ConnectionError>> {
-        let client = self.clone();
-        Box::pin(async move {
-            match Connection::local_agent(&client).await? {
-                Some(agent) => Ok(Some(CachedLocalAgent::from_client(agent).await?)),
-                None => Ok(None),
-            }
-        })
+    async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, ConnectionError> {
+        match Connection::local_agent(self).await? {
+            Some(agent) => Ok(Some(CachedLocalAgent::from_client(agent).await?)),
+            None => Ok(None),
+        }
     }
 }
 
 impl quic::WithRemoteAgent for ConnectionClient {
     type RemoteAgent = CachedRemoteAgent;
 
-    fn remote_agent(&self) -> BoxFuture<'_, Result<Option<Self::RemoteAgent>, ConnectionError>> {
-        let client = self.clone();
-        Box::pin(async move {
-            match Connection::remote_agent(&client).await? {
-                Some(agent) => Ok(Some(CachedRemoteAgent::from_client(agent).await?)),
-                None => Ok(None),
-            }
-        })
+    async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, ConnectionError> {
+        match Connection::remote_agent(self).await? {
+            Some(agent) => Ok(Some(CachedRemoteAgent::from_client(agent).await?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -147,13 +129,10 @@ impl quic::Lifecycle for ConnectionClient {
         }
     }
 
-    fn closed(&self) -> BoxFuture<'_, ConnectionError> {
-        let client = self.clone();
-        Box::pin(async move {
-            match Connection::closed(&client).await {
-                Ok(error) | Err(error) => error,
-            }
-        })
+    async fn closed(&self) -> ConnectionError {
+        match Connection::closed(self).await {
+            Ok(error) | Err(error) => error,
+        }
     }
 }
 

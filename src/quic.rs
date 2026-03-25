@@ -7,6 +7,7 @@ use std::{
     io,
     ops::DerefMut,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -122,21 +123,7 @@ impl ConnectionError {
     }
 }
 
-pub trait Connect {
-    type Connection: Connection;
-    type Error: Error + Any;
-
-    fn connect<'a>(
-        &'a self,
-        server: &'a Authority,
-    ) -> BoxFuture<'a, Result<Self::Connection, Self::Error>>;
-}
-
-/// Async-native version of [`Connect`] using AFIT (`async fn`).
-///
-/// Implement this for concrete types; a blanket impl provides the
-/// [`Connect`] (BoxFuture) version automatically.
-pub trait ConnectAsync: Send + Sync {
+pub trait Connect: Send + Sync {
     type Connection: Connection;
     type Error: Error + Any;
 
@@ -146,29 +133,7 @@ pub trait ConnectAsync: Send + Sync {
     ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send + 'a;
 }
 
-impl<C: ConnectAsync> Connect for C {
-    type Connection = C::Connection;
-    type Error = C::Error;
-
-    fn connect<'a>(
-        &'a self,
-        server: &'a Authority,
-    ) -> BoxFuture<'a, Result<Self::Connection, Self::Error>> {
-        Box::pin(ConnectAsync::connect(self, server))
-    }
-}
-
-pub trait Listen {
-    type Connection: Connection;
-    type Error: Error + Any;
-
-    fn accept(&self) -> BoxFuture<'_, Result<Self::Connection, Self::Error>>;
-
-    fn shutdown(&self) -> BoxFuture<'_, Result<(), Self::Error>>;
-}
-
-/// Async-native version of [`Listen`] using AFIT.
-pub trait ListenAsync: Send + Sync {
+pub trait Listen: Send + Sync {
     type Connection: Connection;
     type Error: Error + Any;
 
@@ -177,50 +142,11 @@ pub trait ListenAsync: Send + Sync {
     fn shutdown(&self) -> impl Future<Output = Result<(), Self::Error>> + Send + '_;
 }
 
-impl<L: ListenAsync> Listen for L {
-    type Connection = L::Connection;
-    type Error = L::Error;
-
-    fn accept(&self) -> BoxFuture<'_, Result<Self::Connection, Self::Error>> {
-        Box::pin(ListenAsync::accept(self))
-    }
-
-    fn shutdown(&self) -> BoxFuture<'_, Result<(), Self::Error>> {
-        Box::pin(ListenAsync::shutdown(self))
-    }
-}
-
-pub trait Connection:
-    ManageStream + WithLocalAgent + WithRemoteAgent + Lifecycle + Send + Sync + Any
-{
-}
-
-impl<C: ManageStream + WithLocalAgent + WithRemoteAgent + Lifecycle + Send + Sync + Any> Connection
-    for C
-{
-}
-
-pub trait ManageStream {
-    type StreamReader: ReadStream + Unpin;
-    type StreamWriter: WriteStream + Unpin;
-
-    #[allow(clippy::type_complexity)]
-    fn open_bi(
-        &self,
-    ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>>;
-
-    fn open_uni(&self) -> BoxFuture<'_, Result<Self::StreamWriter, ConnectionError>>;
-
-    #[allow(clippy::type_complexity)]
-    fn accept_bi(
-        &self,
-    ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>>;
-
-    fn accept_uni(&self) -> BoxFuture<'_, Result<Self::StreamReader, ConnectionError>>;
-}
-
-/// Async-native version of [`ManageStream`] using AFIT.
-pub trait ManageStreamAsync: Send + Sync {
+/// AFIT version of stream management with concrete associated types.
+///
+/// Implement this for concrete connection types. A blanket impl provides
+/// [`DynManageStream`] automatically.
+pub trait ManageStream: Send + Sync {
     type StreamReader: ReadStream + Unpin;
     type StreamWriter: WriteStream + Unpin;
 
@@ -241,73 +167,116 @@ pub trait ManageStreamAsync: Send + Sync {
     ) -> impl Future<Output = Result<Self::StreamReader, ConnectionError>> + Send + '_;
 }
 
-impl<M: ManageStreamAsync> ManageStream for M {
-    type StreamReader = M::StreamReader;
-    type StreamWriter = M::StreamWriter;
+/// Type-erased read stream: `Pin<Box<dyn ReadStream + Send>>`.
+pub type BoxReadStream = Pin<Box<dyn ReadStream + Send>>;
 
-    fn open_bi(
-        &self,
-    ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> {
-        Box::pin(ManageStreamAsync::open_bi(self))
-    }
+/// Type-erased write stream: `Pin<Box<dyn WriteStream + Send>>`.
+pub type BoxWriteStream = Pin<Box<dyn WriteStream + Send>>;
 
-    fn open_uni(&self) -> BoxFuture<'_, Result<Self::StreamWriter, ConnectionError>> {
-        Box::pin(ManageStreamAsync::open_uni(self))
-    }
+/// Object-safe version of [`ManageStream`] with type-erased streams.
+///
+/// Stream types are fixed to [`BoxReadStream`] / [`BoxWriteStream`].
+/// A blanket impl is provided for all `T: ManageStream`.
+pub trait DynManageStream: Send + Sync {
+    #[allow(clippy::type_complexity)]
+    fn open_bi(&self) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), ConnectionError>>;
 
-    fn accept_bi(
-        &self,
-    ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>> {
-        Box::pin(ManageStreamAsync::accept_bi(self))
-    }
+    fn open_uni(&self) -> BoxFuture<'_, Result<BoxWriteStream, ConnectionError>>;
 
-    fn accept_uni(&self) -> BoxFuture<'_, Result<Self::StreamReader, ConnectionError>> {
-        Box::pin(ManageStreamAsync::accept_uni(self))
-    }
-}
-pub trait WithLocalAgent {
-    type LocalAgent: agent::LocalAgent + 'static;
-    fn local_agent(&self) -> BoxFuture<'_, Result<Option<Self::LocalAgent>, ConnectionError>>;
+    #[allow(clippy::type_complexity)]
+    fn accept_bi(&self) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), ConnectionError>>;
+
+    fn accept_uni(&self) -> BoxFuture<'_, Result<BoxReadStream, ConnectionError>>;
 }
 
-/// Async-native version of [`WithLocalAgent`] using AFIT.
-pub trait WithLocalAgentAsync: Send + Sync {
+impl<T: ManageStream> DynManageStream for T {
+    fn open_bi(&self) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), ConnectionError>> {
+        Box::pin(async {
+            let (r, w) = ManageStream::open_bi(self).await?;
+            Ok((Box::pin(r) as BoxReadStream, Box::pin(w) as BoxWriteStream))
+        })
+    }
+
+    fn open_uni(&self) -> BoxFuture<'_, Result<BoxWriteStream, ConnectionError>> {
+        Box::pin(async {
+            let w = ManageStream::open_uni(self).await?;
+            Ok(Box::pin(w) as BoxWriteStream)
+        })
+    }
+
+    fn accept_bi(&self) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), ConnectionError>> {
+        Box::pin(async {
+            let (r, w) = ManageStream::accept_bi(self).await?;
+            Ok((Box::pin(r) as BoxReadStream, Box::pin(w) as BoxWriteStream))
+        })
+    }
+
+    fn accept_uni(&self) -> BoxFuture<'_, Result<BoxReadStream, ConnectionError>> {
+        Box::pin(async {
+            let r = ManageStream::accept_uni(self).await?;
+            Ok(Box::pin(r) as BoxReadStream)
+        })
+    }
+}
+
+/// AFIT version of local agent access.
+pub trait WithLocalAgent: Send + Sync {
     type LocalAgent: agent::LocalAgent + 'static;
     fn local_agent(
         &self,
     ) -> impl Future<Output = Result<Option<Self::LocalAgent>, ConnectionError>> + Send + '_;
 }
 
-impl<T: WithLocalAgentAsync> WithLocalAgent for T {
-    type LocalAgent = T::LocalAgent;
+/// Object-safe version of [`WithLocalAgent`] with type-erased agent.
+pub trait DynWithLocalAgent: Send + Sync {
+    fn local_agent(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::LocalAgent>>, ConnectionError>>;
+}
 
-    fn local_agent(&self) -> BoxFuture<'_, Result<Option<Self::LocalAgent>, ConnectionError>> {
-        Box::pin(WithLocalAgentAsync::local_agent(self))
+impl<T: WithLocalAgent> DynWithLocalAgent for T {
+    fn local_agent(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::LocalAgent>>, ConnectionError>> {
+        Box::pin(async {
+            WithLocalAgent::local_agent(self)
+                .await
+                .map(|opt| opt.map(|a| Arc::new(a) as Arc<dyn agent::LocalAgent>))
+        })
     }
 }
 
-pub trait WithRemoteAgent {
-    type RemoteAgent: agent::RemoteAgent + 'static;
-    fn remote_agent(&self) -> BoxFuture<'_, Result<Option<Self::RemoteAgent>, ConnectionError>>;
-}
-
-/// Async-native version of [`WithRemoteAgent`] using AFIT.
-pub trait WithRemoteAgentAsync: Send + Sync {
+/// AFIT version of remote agent access.
+pub trait WithRemoteAgent: Send + Sync {
     type RemoteAgent: agent::RemoteAgent + 'static;
     fn remote_agent(
         &self,
     ) -> impl Future<Output = Result<Option<Self::RemoteAgent>, ConnectionError>> + Send + '_;
 }
 
-impl<T: WithRemoteAgentAsync> WithRemoteAgent for T {
-    type RemoteAgent = T::RemoteAgent;
+/// Object-safe version of [`WithRemoteAgent`] with type-erased agent.
+pub trait DynWithRemoteAgent: Send + Sync {
+    fn remote_agent(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::RemoteAgent>>, ConnectionError>>;
+}
 
-    fn remote_agent(&self) -> BoxFuture<'_, Result<Option<Self::RemoteAgent>, ConnectionError>> {
-        Box::pin(WithRemoteAgentAsync::remote_agent(self))
+impl<T: WithRemoteAgent> DynWithRemoteAgent for T {
+    fn remote_agent(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::RemoteAgent>>, ConnectionError>> {
+        Box::pin(async {
+            WithRemoteAgent::remote_agent(self)
+                .await
+                .map(|opt| opt.map(|a| Arc::new(a) as Arc<dyn agent::RemoteAgent>))
+        })
     }
 }
 
-pub trait Lifecycle {
+/// AFIT version of connection lifecycle management.
+///
+/// Only `closed()` benefits from AFIT; `close()` and `check()` are synchronous.
+pub trait Lifecycle: Send + Sync {
     fn close(&self, code: Code, reason: Cow<'static, str>);
 
     /// Check if the connection is still usable for reuse.
@@ -319,32 +288,55 @@ pub trait Lifecycle {
     /// Wait for the connection to close.
     ///
     /// Returns the error that caused the connection to terminate.
-    fn closed(&self) -> BoxFuture<'_, ConnectionError>;
+    fn closed(&self) -> impl Future<Output = ConnectionError> + Send + '_;
 }
 
-/// Async-native version of [`Lifecycle`] using AFIT.
-///
-/// Only `closed()` benefits from AFIT; `close()` and `check()` are synchronous.
-pub trait LifecycleAsync: Send + Sync {
+/// Object-safe version of [`Lifecycle`].
+pub trait DynLifecycle: Send + Sync {
     fn close(&self, code: Code, reason: Cow<'static, str>);
 
     fn check(&self) -> Result<(), ConnectionError>;
 
-    fn closed(&self) -> impl Future<Output = ConnectionError> + Send + '_;
+    fn closed(&self) -> BoxFuture<'_, ConnectionError>;
 }
 
-impl<T: LifecycleAsync> Lifecycle for T {
+impl<T: ?Sized + Lifecycle> DynLifecycle for T {
     fn close(&self, code: Code, reason: Cow<'static, str>) {
-        LifecycleAsync::close(self, code, reason)
+        Lifecycle::close(self, code, reason)
     }
 
     fn check(&self) -> Result<(), ConnectionError> {
-        LifecycleAsync::check(self)
+        Lifecycle::check(self)
     }
 
     fn closed(&self) -> BoxFuture<'_, ConnectionError> {
-        Box::pin(LifecycleAsync::closed(self))
+        Box::pin(Lifecycle::closed(self))
     }
+}
+
+/// Composite AFIT trait: a fully-featured connection.
+///
+/// Not object-safe due to associated types. Use [`DynConnection`] for
+/// type-erased usage.
+pub trait Connection:
+    ManageStream + WithLocalAgent + WithRemoteAgent + Lifecycle + Send + Sync + Any
+{
+}
+
+impl<C: ManageStream + WithLocalAgent + WithRemoteAgent + Lifecycle + Send + Sync + Any> Connection
+    for C
+{
+}
+
+/// Object-safe composite trait for type-erased connections.
+pub trait DynConnection:
+    DynManageStream + DynWithLocalAgent + DynWithRemoteAgent + DynLifecycle + Send + Sync + Any
+{
+}
+
+impl<C: DynManageStream + DynWithLocalAgent + DynWithRemoteAgent + DynLifecycle + Send + Sync + Any>
+    DynConnection for C
+{
 }
 
 pub trait GetStreamId {
@@ -535,6 +527,7 @@ impl<S: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + ?
 pub mod test {
     use std::{
         pin::Pin,
+    sync::Arc,
         task::{Context, Poll, ready},
     };
 

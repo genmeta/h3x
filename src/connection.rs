@@ -13,7 +13,7 @@ use snafu::Snafu;
 use tracing::Instrument;
 
 use crate::{
-    codec::{self, PeekableStreamReader, SinkWriter, StreamReader},
+    codec::{PeekableStreamReader, SinkWriter, StreamReader},
     dhttp::{protocol::DHttpProtocolFactory, settings::Settings},
     error::{Code, ErrorScope, H3Error},
     protocol::{InitProtocols, ProductProtocol, Protocols, StreamVerdict, compute_factory_identity},
@@ -106,7 +106,7 @@ pub enum ConnectionGoaway {
 }
 
 /// Extension trait providing error-handling helpers on any `Lifecycle` type.
-pub trait LifecycleExt: quic::Lifecycle + Sync {
+pub trait LifecycleExt: quic::DynLifecycle + Sync {
     /// Map h3-level StreamError to quic::StreamError, closing connection for connection-scope errors.
     fn handle_stream_error(&self, error: StreamError) -> BoxFuture<'_, quic::StreamError> {
         Box::pin(async move {
@@ -139,7 +139,7 @@ pub trait LifecycleExt: quic::Lifecycle + Sync {
     }
 }
 
-impl<T: quic::Lifecycle + Sync + ?Sized> LifecycleExt for T {}
+impl<T: quic::DynLifecycle + Sync + ?Sized> LifecycleExt for T {}
 
 pub struct ConnectionBuilder<C: Any + ?Sized> {
     protocols_initializers: Vec<(u64, Box<dyn InitProtocols<C>>)>,
@@ -196,7 +196,7 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
     }
 }
 
-impl<C: quic::Connection + ?Sized> Hash for ConnectionBuilder<C> {
+impl<C: Any + ?Sized> Hash for ConnectionBuilder<C> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Sort by identity hash for order-independent hashing
         let mut identities: Vec<u64> = self
@@ -211,7 +211,7 @@ impl<C: quic::Connection + ?Sized> Hash for ConnectionBuilder<C> {
     }
 }
 
-impl<C: quic::Connection + ?Sized> PartialEq for ConnectionBuilder<C> {
+impl<C: Any + ?Sized> PartialEq for ConnectionBuilder<C> {
     fn eq(&self, other: &Self) -> bool {
         if self.protocols_initializers.len() != other.protocols_initializers.len() {
             return false;
@@ -232,7 +232,7 @@ impl<C: quic::Connection + ?Sized> PartialEq for ConnectionBuilder<C> {
     }
 }
 
-impl<C: quic::Connection + ?Sized> Eq for ConnectionBuilder<C> {}
+impl<C: Any + ?Sized> Eq for ConnectionBuilder<C> {}
 
 #[derive(Debug)]
 pub struct ConnectionState<C: ?Sized> {
@@ -259,7 +259,7 @@ impl<C: ?Sized> ConnectionState<C> {
     }
 }
 
-impl<C: quic::Lifecycle + ?Sized> ConnectionState<C> {
+impl<C: quic::DynLifecycle + ?Sized> ConnectionState<C> {
     /// Returns locally observed connection health.
     ///
     /// This is a synchronous, deterministic view of whether this process has
@@ -313,7 +313,7 @@ impl<C: quic::Lifecycle + ?Sized> ConnectionState<C> {
     }
 }
 
-impl<C: quic::ManageStream + quic::Lifecycle + Sync + ?Sized> ConnectionState<C> {
+impl<C: quic::ManageStream + quic::Lifecycle + Sync> ConnectionState<C> {
     pub async fn open_bi(
         &self,
     ) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
@@ -339,12 +339,12 @@ impl<C: quic::ManageStream + quic::Lifecycle + Sync + ?Sized> ConnectionState<C>
     }
 }
 
-impl<C: quic::WithLocalAgent + ?Sized> ConnectionState<C> {
+impl<C: quic::DynWithLocalAgent + ?Sized> ConnectionState<C> {
     pub async fn local_agent(
         &self,
     ) -> Result<Option<Arc<dyn agent::LocalAgent>>, quic::ConnectionError> {
         match self.quic.local_agent().await {
-            Ok(option) => Ok(option.map(|a| Arc::new(a) as Arc<dyn agent::LocalAgent>)),
+            Ok(option) => Ok(option),
             Err(error) => {
                 self.record_terminal_error(error.clone());
                 Err(error)
@@ -353,12 +353,12 @@ impl<C: quic::WithLocalAgent + ?Sized> ConnectionState<C> {
     }
 }
 
-impl<C: quic::WithRemoteAgent + ?Sized> ConnectionState<C> {
+impl<C: quic::DynWithRemoteAgent + ?Sized> ConnectionState<C> {
     pub async fn remote_agent(
         &self,
     ) -> Result<Option<Arc<dyn agent::RemoteAgent>>, quic::ConnectionError> {
         match self.quic.remote_agent().await {
-            Ok(option) => Ok(option.map(|a| Arc::new(a) as Arc<dyn agent::RemoteAgent>)),
+            Ok(option) => Ok(option),
             Err(error) => {
                 self.record_terminal_error(error.clone());
                 Err(error)
@@ -367,7 +367,7 @@ impl<C: quic::WithRemoteAgent + ?Sized> ConnectionState<C> {
     }
 }
 
-impl<C: quic::Connection + ?Sized> ConnectionState<C> {
+impl<C: quic::DynConnection + ?Sized> ConnectionState<C> {
     async fn accept_bi_stream_task(state: Self) {
         let task = async {
             loop {
@@ -379,11 +379,8 @@ impl<C: quic::Connection + ?Sized> ConnectionState<C> {
                         return;
                     }
                 };
-                // Erase the concrete stream types before protocol dispatch.
-                let erased_reader = Box::pin(stream_reader) as codec::BoxReadStream;
-                let erased_writer = Box::pin(stream_writer) as codec::BoxWriteStream;
-                let stream_reader = StreamReader::new(erased_reader);
-                let stream_writer = SinkWriter::new(erased_writer);
+                let stream_reader = StreamReader::new(stream_reader);
+                let stream_writer = SinkWriter::new(stream_writer);
                 let peekable_bi_stream = (PeekableStreamReader::new(stream_reader), stream_writer);
 
                 match state.protocols.accept_bi(peekable_bi_stream).await {
@@ -426,9 +423,7 @@ impl<C: quic::Connection + ?Sized> ConnectionState<C> {
                         return;
                     }
                 };
-                // Erase the concrete stream type before protocol dispatch.
-                let erased_reader = Box::pin(stream_reader) as codec::BoxReadStream;
-                let stream_reader = StreamReader::new(erased_reader);
+                let stream_reader = StreamReader::new(stream_reader);
                 let peekable_uni_stream = PeekableStreamReader::new(stream_reader);
 
                 match state.protocols.accept_uni(peekable_uni_stream).await {
@@ -472,9 +467,9 @@ impl<C: ?Sized> Clone for ConnectionState<C> {
 }
 
 #[derive(Debug)]
-pub struct Connection<C: quic::Connection + ?Sized>(ConnectionState<C>);
+pub struct Connection<C: quic::DynConnection + ?Sized>(ConnectionState<C>);
 
-impl<C: quic::Connection + ?Sized> ops::Deref for Connection<C> {
+impl<C: quic::DynConnection + ?Sized> ops::Deref for Connection<C> {
     type Target = ConnectionState<C>;
 
     #[inline]
@@ -483,21 +478,20 @@ impl<C: quic::Connection + ?Sized> ops::Deref for Connection<C> {
     }
 }
 
-impl<C: quic::Connection + ?Sized> Connection<C> {
-    pub async fn new(settings: Arc<Settings>, quic: C) -> Result<Self, quic::ConnectionError>
-    where
-        C: Sized,
-    {
+impl<C: quic::Connection> Connection<C> {
+    pub async fn new(settings: Arc<Settings>, quic: C) -> Result<Self, quic::ConnectionError> {
         ConnectionBuilder::new(settings).build(quic).await
     }
+}
 
+impl<C: quic::DynConnection + ?Sized> Connection<C> {
     #[cfg(test)]
     pub(crate) fn from_state_for_test(state: ConnectionState<C>) -> Self {
         Self(state)
     }
 }
 
-impl<C: quic::Connection + ?Sized> Drop for Connection<C> {
+impl<C: quic::DynConnection + ?Sized> Drop for Connection<C> {
     fn drop(&mut self) {
         self.close(Code::H3_NO_ERROR, "no error");
     }
@@ -704,44 +698,40 @@ pub(crate) mod tests {
         type StreamReader = TestReadStream;
         type StreamWriter = TestWriteStream;
 
-        fn open_bi(
+        async fn open_bi(
             &self,
-        ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>>
-        {
-            Box::pin(async { Err(test_connection_error("open_bi unavailable")) })
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
+            Err(test_connection_error("open_bi unavailable"))
         }
 
-        fn open_uni(&self) -> BoxFuture<'_, Result<Self::StreamWriter, ConnectionError>> {
-            Box::pin(async { Err(test_connection_error("open_uni unavailable")) })
+        async fn open_uni(&self) -> Result<Self::StreamWriter, ConnectionError> {
+            Err(test_connection_error("open_uni unavailable"))
         }
 
-        fn accept_bi(
+        async fn accept_bi(
             &self,
-        ) -> BoxFuture<'_, Result<(Self::StreamReader, Self::StreamWriter), ConnectionError>>
-        {
-            Box::pin(async { Err(test_connection_error("accept_bi unavailable")) })
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
+            Err(test_connection_error("accept_bi unavailable"))
         }
 
-        fn accept_uni(&self) -> BoxFuture<'_, Result<Self::StreamReader, ConnectionError>> {
-            Box::pin(async { Err(test_connection_error("accept_uni unavailable")) })
+        async fn accept_uni(&self) -> Result<Self::StreamReader, ConnectionError> {
+            Err(test_connection_error("accept_uni unavailable"))
         }
     }
 
     impl quic::WithLocalAgent for MockConnection {
         type LocalAgent = TestLocalAgent;
 
-        fn local_agent(&self) -> BoxFuture<'_, Result<Option<Self::LocalAgent>, ConnectionError>> {
-            Box::pin(async { Ok(None) })
+        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, ConnectionError> {
+            Ok(None)
         }
     }
 
     impl quic::WithRemoteAgent for MockConnection {
         type RemoteAgent = TestRemoteAgent;
 
-        fn remote_agent(
-            &self,
-        ) -> BoxFuture<'_, Result<Option<Self::RemoteAgent>, ConnectionError>> {
-            Box::pin(async { Ok(None) })
+        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, ConnectionError> {
+            Ok(None)
         }
     }
 
@@ -752,14 +742,12 @@ pub(crate) mod tests {
             self.state.check_result.lock().unwrap().clone()
         }
 
-        fn closed(&self) -> BoxFuture<'_, ConnectionError> {
+        async fn closed(&self) -> ConnectionError {
             let closed_error = self.state.closed_error.lock().unwrap().clone();
-            Box::pin(async move {
-                match closed_error {
-                    Some(error) => error,
-                    None => pending().await,
-                }
-            })
+            match closed_error {
+                Some(error) => error,
+                None => pending().await,
+            }
         }
     }
 
@@ -817,7 +805,7 @@ pub(crate) mod tests {
     struct MockFactory(u64);
 
     #[cfg(feature = "gm-quic")]
-    impl<C: quic::Connection + ?Sized> ProductProtocol<C> for MockFactory {
+    impl<C: quic::DynConnection + ?Sized> ProductProtocol<C> for MockFactory {
         type Protocol = MockProtocol;
 
         fn init<'a>(
