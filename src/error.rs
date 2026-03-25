@@ -309,6 +309,22 @@ impl H3Error for QpackDecompressionFailed {
     }
 }
 
+#[derive(Debug, Snafu, Clone)]
+#[snafu(display("field section size {actual} exceeds limit {limit}"))]
+pub struct H3ExcessiveFieldSectionSize {
+    pub actual: u64,
+    pub limit: u64,
+}
+
+impl H3Error for H3ExcessiveFieldSectionSize {
+    fn code(&self) -> Code {
+        Code::H3_EXCESSIVE_LOAD
+    }
+    fn scope(&self) -> ErrorScope {
+        ErrorScope::Stream
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug, Snafu, Clone, Copy)]
 pub enum H3IdError {

@@ -16,7 +16,7 @@ pub async fn decode_string(
     tokio::pin!(stream);
     let huffman = (prefix >> (n - 1)) & 1 == 1;
     let length = decode_integer(stream.as_mut(), prefix, n - 1).await?;
-    let mut value = Vec::with_capacity(length as usize);
+    let mut value = Vec::with_capacity((length as usize).min(8192));
     FixedLengthReader::new(stream.as_mut(), length)
         .read_to_end(&mut value)
         .await?;

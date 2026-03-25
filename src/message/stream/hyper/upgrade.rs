@@ -100,9 +100,14 @@ impl PendingTakeover {
         ),
         TakeoverError,
     > {
+        let (read, write) = self.wait_raw().await?;
+        Ok((read.into_box_reader(), write.into_box_writer()))
+    }
+
+    pub async fn wait_raw(self) -> Result<(ReadStream, WriteStream), TakeoverError> {
         let write = self.write.await.ok_or(TakeoverError::Aborted)?;
         let read = self.read.await.ok_or(TakeoverError::Aborted)?;
-        Ok((read.into_box_reader(), write.into_box_writer()))
+        Ok((read, write))
     }
 }
 

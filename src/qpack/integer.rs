@@ -1,5 +1,7 @@
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::codec::DecodeError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Integer(u64);
 
@@ -36,15 +38,11 @@ pub async fn decode_integer(stream: impl AsyncRead, prefix: u8, n: u8) -> io::Re
         let mut m = 0u32;
         loop {
             let b = stream.read_u8().await? as u64;
-            let power = 1u64.checked_shl(m).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "QPACK integer overflow")
-            })?;
-            let term = (b & 127).checked_mul(power).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "QPACK integer overflow")
-            })?;
-            i = i.checked_add(term).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "QPACK integer overflow")
-            })?;
+            let power = 1u64.checked_shl(m).ok_or(DecodeError::IntegerOverflow)?;
+            let term = (b & 127)
+                .checked_mul(power)
+                .ok_or(DecodeError::IntegerOverflow)?;
+            i = i.checked_add(term).ok_or(DecodeError::IntegerOverflow)?;
             m += 7;
             if b & 128 == 128 {
                 continue;

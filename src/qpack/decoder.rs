@@ -373,11 +373,20 @@ where
         self.receive_instruction_until(required_insert_count)
             .await?;
 
+        let max_field_section_size = self
+            .state
+            .lock()
+            .expect("lock is not poisoned")
+            .settings
+            .max_field_section_size()
+            .map(|v| v.into_inner());
+
         let representations =
             header_frame.into_decode_stream::<FieldLineRepresentation, StreamError>();
+        let mut accumulated_size: u64 = 0;
         let field_lines = representations.map(|representation| {
             representation.and_then(|representation| {
-                decompression_field_line_representation(
+                let field_line = decompression_field_line_representation(
                     &representation,
                     base,
                     &self
@@ -386,7 +395,19 @@ where
                         .expect("lock is not poisoned")
                         .dynamic_table,
                 )
-                .map_err(StreamError::from)
+                .map_err(StreamError::from)?;
+
+                accumulated_size += field_line.size();
+                if let Some(limit) = max_field_section_size.filter(|&l| accumulated_size > l) {
+                    return Err(StreamError::from(
+                        crate::error::H3ExcessiveFieldSectionSize {
+                            actual: accumulated_size,
+                            limit,
+                        },
+                    ));
+                }
+
+                Ok(field_line)
             })
         });
         let header_section = field_lines.decode().await?;
