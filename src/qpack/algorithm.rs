@@ -7,13 +7,17 @@ use crate::qpack::{
 };
 
 pub trait HuffmanStrategize {
-    fn encode_with_huffman(&self, is_name: bool, bytes: &Bytes) -> bool;
+    fn should_encode_name_with_huffman(&self, name: &Bytes) -> bool;
+    fn should_encode_value_with_huffman(&self, value: &Bytes) -> bool;
 }
 
 pub struct HuffmanAlways;
 
 impl HuffmanStrategize for HuffmanAlways {
-    fn encode_with_huffman(&self, _is_name: bool, _bytes: &Bytes) -> bool {
+    fn should_encode_name_with_huffman(&self, _name: &Bytes) -> bool {
+        true
+    }
+    fn should_encode_value_with_huffman(&self, _value: &Bytes) -> bool {
         true
     }
 }
@@ -21,7 +25,10 @@ impl HuffmanStrategize for HuffmanAlways {
 pub struct HuffmanNever;
 
 impl HuffmanStrategize for HuffmanNever {
-    fn encode_with_huffman(&self, _is_name: bool, _bytes: &Bytes) -> bool {
+    fn should_encode_name_with_huffman(&self, _name: &Bytes) -> bool {
+        false
+    }
+    fn should_encode_value_with_huffman(&self, _value: &Bytes) -> bool {
         false
     }
 }
@@ -110,7 +117,7 @@ where
                             never_dynamic: true,
                             is_static: true,
                             name_index: name_index as u64,
-                            huffman: self.huffman_strategize.encode_with_huffman(false, &value),
+                            huffman: self.huffman_strategize.should_encode_value_with_huffman(&value),
                             value: value.clone(),
                         },
                     )
@@ -118,9 +125,9 @@ where
             } else {
                 representations.push(FieldLineRepresentation::LiteralFieldLineWithLiteralName {
                     never_dynamic: true,
-                    name_huffman: self.huffman_strategize.encode_with_huffman(true, &name),
+                    name_huffman: self.huffman_strategize.should_encode_name_with_huffman(&name),
                     name: name.clone(),
-                    value_huffman: self.huffman_strategize.encode_with_huffman(false, &value),
+                    value_huffman: self.huffman_strategize.should_encode_value_with_huffman(&value),
                     value: value.clone(),
                 })
             }
@@ -216,21 +223,21 @@ where
                     state.insert_with_name_reference(
                         true,
                         static_idx as u64,
-                        self.huffman_strategize.encode_with_huffman(false, &value),
+                        self.huffman_strategize.should_encode_value_with_huffman(&value),
                         value.clone(),
                     )
                 } else if let Some(dyn_abs) = dynamic_name_abs {
                     state.insert_with_name_reference(
                         false,
                         dyn_abs,
-                        self.huffman_strategize.encode_with_huffman(false, &value),
+                        self.huffman_strategize.should_encode_value_with_huffman(&value),
                         value.clone(),
                     )
                 } else {
                     state.insert_with_literal_name(
-                        self.huffman_strategize.encode_with_huffman(true, &name),
+                        self.huffman_strategize.should_encode_name_with_huffman(&name),
                         name.clone(),
-                        self.huffman_strategize.encode_with_huffman(false, &value),
+                        self.huffman_strategize.should_encode_value_with_huffman(&value),
                         value.clone(),
                     )
                 };
@@ -253,7 +260,7 @@ where
                     never_dynamic,
                     is_static: true,
                     name_index: static_idx as u64,
-                    huffman: self.huffman_strategize.encode_with_huffman(false, &value),
+                    huffman: self.huffman_strategize.should_encode_value_with_huffman(&value),
                     value: value.clone(),
                 });
             } else if let Some(dyn_abs) = dynamic_name_abs {
@@ -264,7 +271,7 @@ where
                         dyn_abs,
                         base,
                         never_dynamic,
-                        self.huffman_strategize.encode_with_huffman(false, &value),
+                        self.huffman_strategize.should_encode_value_with_huffman(&value),
                         value.clone(),
                     );
                 } else {
@@ -379,9 +386,9 @@ fn push_literal_name(
 ) {
     representations.push(FieldLineRepresentation::LiteralFieldLineWithLiteralName {
         never_dynamic,
-        name_huffman: hs.encode_with_huffman(true, &name),
+        name_huffman: hs.should_encode_name_with_huffman(&name),
         name,
-        value_huffman: hs.encode_with_huffman(false, &value),
+        value_huffman: hs.should_encode_value_with_huffman(&value),
         value,
     });
 }
