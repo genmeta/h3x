@@ -22,7 +22,7 @@ mod tests {
         codec::{DecodeExt, EncodeExt, SinkWriter, StreamReader},
         dhttp::{
             frame::{Frame, stream::FrameStream},
-            settings::Settings,
+            settings::{QpackBlockedStreams, QpackMaxTableCapacity, Settings},
             stream::UnidirectionalStream,
         },
         qpack::{
@@ -179,5 +179,147 @@ mod tests {
         })
         .await
         .expect("test timedout");
+    }
+
+    fn settings_with_dynamic_table() -> Arc<Settings> {
+        let mut settings = Settings::default();
+        settings.set(QpackMaxTableCapacity::setting(VarInt::from_u32(4096)));
+        settings.set(QpackBlockedStreams::setting(VarInt::from_u32(100)));
+        Arc::new(settings)
+    }
+
+    /// Direct roundtrip test: encode with DynamicCompressAlgo, then decode using
+    /// the decoder state. Bypasses mock streams to test the algorithm itself.
+    #[tokio::test]
+    async fn dynamic_roundtrip() {
+        use crate::qpack::{
+            algorithm::{Algorithm, DynamicCompressAlgo, HuffmanAlways},
+            decoder::{DecoderState, decompression_field_line_representation},
+            encoder::{EncoderInstruction, EncoderState},
+            field::{EncodedFieldSectionPrefix, FieldLine},
+        };
+
+        let settings = settings_with_dynamic_table();
+        let mut encoder_state = EncoderState::new(settings.clone());
+        encoder_state
+            .set_max_table_capacity(4096)
+            .expect("set capacity");
+
+        let mut decoder_state = DecoderState::new(settings.clone());
+        decoder_state.set_dynamic_table_capacity(4096).unwrap();
+
+        let algo = DynamicCompressAlgo::new(HuffmanAlways);
+
+        // Encode a set of field lines
+        let field_lines = vec![
+            FieldLine {
+                name: Bytes::from_static(b":method"),
+                value: Bytes::from_static(b"GET"),
+            },
+            FieldLine {
+                name: Bytes::from_static(b":path"),
+                value: Bytes::from_static(b"/api/v1/resource"),
+            },
+            FieldLine {
+                name: Bytes::from_static(b":authority"),
+                value: Bytes::from_static(b"example.com"),
+            },
+            FieldLine {
+                name: Bytes::from_static(b"x-custom-header"),
+                value: Bytes::from_static(b"custom-value"),
+            },
+            FieldLine {
+                name: Bytes::from_static(b"authorization"),
+                value: Bytes::from_static(b"Bearer token123"),
+            },
+        ];
+
+        let output = algo
+            .compress(&mut encoder_state, field_lines.clone(), true)
+            .await;
+
+        // Apply encoder instructions to decoder state
+        // (simulates instructions arriving via encoder stream)
+        for instruction in &encoder_state.pending_instructions {
+            match instruction {
+                EncoderInstruction::SetDynamicTableCapacity { capacity } => {
+                    decoder_state.set_dynamic_table_capacity(*capacity).unwrap();
+                }
+                EncoderInstruction::InsertWithNameReference {
+                    is_static,
+                    name_index,
+                    value,
+                    ..
+                } => {
+                    // Wire-format name_index: relative for dynamic, absolute for static
+                    let abs_index = if *is_static {
+                        *name_index
+                    } else {
+                        decoder_state.dynamic_table.inserted_count - name_index - 1
+                    };
+                    decoder_state
+                        .insert_with_name_reference(*is_static, abs_index, value.clone())
+                        .unwrap();
+                }
+                EncoderInstruction::InsertWithLiteralName { name, value, .. } => {
+                    decoder_state
+                        .insert_with_literal_name(name.clone(), value.clone())
+                        .unwrap();
+                }
+                EncoderInstruction::Duplicate { index } => {
+                    let abs_index = decoder_state.dynamic_table.inserted_count - index - 1;
+                    decoder_state.duplicate(abs_index).unwrap();
+                }
+            }
+        }
+
+        // Decode the RIC to get required_insert_count
+        let max_table_capacity = settings.qpack_max_table_capacity().into_inner();
+        let total_inserts = decoder_state.dynamic_table.inserted_count;
+        let required_insert_count = EncodedFieldSectionPrefix::decode_ric(
+            output.prefix.encoded_insert_count,
+            max_table_capacity,
+            total_inserts,
+        )
+        .expect("decode_ric");
+
+        // Resolve base
+        let base = EncodedFieldSectionPrefix::resolve_base(
+            required_insert_count,
+            output.prefix.sign,
+            output.prefix.delta_base,
+        )
+        .expect("resolve_base");
+
+        // Decompress each field line representation
+        let decoded: Vec<FieldLine> = output
+            .representations
+            .iter()
+            .map(|repr| {
+                decompression_field_line_representation(repr, base, &decoder_state.dynamic_table)
+                    .expect("decompress")
+            })
+            .collect();
+
+        assert_eq!(decoded.len(), field_lines.len());
+        for (original, decoded) in field_lines.iter().zip(decoded.iter()) {
+            assert_eq!(original.name, decoded.name, "name mismatch");
+            assert_eq!(original.value, decoded.value, "value mismatch");
+        }
+
+        // Verify dynamic table was used (entries were inserted)
+        assert!(
+            encoder_state.table_inserted_count() > 0,
+            "expected dynamic table insertions"
+        );
+
+        // Verify sensitive header was NOT inserted
+        // :method GET and accept */* are static matches, authorization is sensitive
+        // :path, :authority, x-custom-header should be inserted
+        assert_eq!(
+            encoder_state.table_inserted_count(),
+            3,
+            "expected 3 insertions (:path, :authority, x-custom-header)"
+        );
     }
 }
