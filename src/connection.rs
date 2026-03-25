@@ -523,7 +523,7 @@ pub(crate) mod tests {
     use crate::{
         codec::{ErasedPeekableBiStream, ErasedPeekableUniStream},
         connection::StreamError,
-        dhttp::settings::{Setting, Settings},
+        dhttp::settings::{MaxFieldSectionSize, Settings},
         protocol::{ProductProtocol, Protocol, StreamVerdict},
     };
     use crate::{
@@ -837,7 +837,7 @@ pub(crate) mod tests {
     fn builder_different_settings_different_hash() {
         let s1 = Arc::new(Settings::default());
         let mut s2_inner = Settings::default();
-        s2_inner.set(Setting::max_field_section_size(VarInt::from_u32(9999)));
+        s2_inner.set(MaxFieldSectionSize::setting(VarInt::from_u32(9999)));
         let s2 = Arc::new(s2_inner);
         let a = ConnectionBuilder::<C>::new(s1);
         let b = ConnectionBuilder::<C>::new(s2);
@@ -887,7 +887,7 @@ pub(crate) mod tests {
     fn builder_different_settings_not_eq() {
         let s1 = Arc::new(Settings::default());
         let mut s2_inner = Settings::default();
-        s2_inner.set(Setting::max_field_section_size(VarInt::from_u32(9999)));
+        s2_inner.set(MaxFieldSectionSize::setting(VarInt::from_u32(9999)));
         let s2 = Arc::new(s2_inner);
         let a = ConnectionBuilder::<C>::new(s1);
         let b = ConnectionBuilder::<C>::new(s2);

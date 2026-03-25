@@ -38,112 +38,8 @@ impl Setting {
         Self { id, value }
     }
 
-    /// An HTTP/3 implementation MAY impose a limit on the maximum size of
-    /// the message header it will accept on an individual HTTP message. A
-    /// server that receives a larger header section than it is willing to
-    /// handle can send an HTTP 431 (Request Header Fields Too Large) status
-    /// code (\[RFC6585\]). A client can discard responses that it cannot
-    /// process. The size of a field list is calculated based on the
-    /// uncompressed size of fields, including the length of the name and
-    /// value in bytes plus an overhead of 32 bytes for each field.
-    ///
-    /// If an implementation wishes to advise its peer of this limit, it can
-    /// be conveyed as a number of bytes in the
-    /// SETTINGS_MAX_FIELD_SECTION_SIZE parameter. An implementation that has
-    /// received this parameter SHOULD NOT send an HTTP message header that
-    /// exceeds the indicated size, as the peer will likely refuse to process
-    /// it. However, an HTTP message can traverse one or more intermediaries
-    /// before reaching the origin server; see Section 3.7 of \[HTTP\].
-    /// Because this limit is applied separately by each implementation that
-    /// processes the message, messages below this limit are not guaranteed
-    /// to be accepted.
-    ///
-    /// <https://datatracker.ietf.org/doc/html/rfc9114#name-header-size-constraints>
-    // TODO: implement this setting
-    pub const MAX_FIELD_SECTION_SIZE_ID: VarInt = VarInt::from_u32(0x06);
-    /// The default value is unlimited. See Section 4.2.2 for usage.
-    ///
-    /// <https://datatracker.ietf.org/doc/html/rfc9114#section-7.2.4.1-2.2.1>
-    pub const MAX_FIELD_SECTION_SIZE_DEFAULT_VALUE: Option<VarInt> = None;
-
-    pub const fn max_field_section_size(value: VarInt) -> Self {
-        Self {
-            id: Self::MAX_FIELD_SECTION_SIZE_ID,
-            value,
-        }
-    }
-
-    /// To bound the memory requirements of the decoder, the decoder limits
-    /// the maximum value the encoder is permitted to set for the dynamic
-    /// table capacity. In HTTP/3, this limit is determined by the value of
-    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY sent by the decoder; see Section 5.
-    /// The encoder MUST NOT set a dynamic table capacity that exceeds this
-    /// maximum, but it can choose to use a lower dynamic table capacity; see
-    /// Section 4.3.1.
-    ///
-    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-3.2.3-1>
-    pub const QPACK_MAX_TABLE_CAPACITY_ID: VarInt = VarInt::from_u32(0x01);
-    /// The default value is zero. See Section 3.2 for usage. This is the
-    /// equivalent of the SETTINGS_HEADER_TABLE_SIZE from HTTP/2.
-    ///
-    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-5-2.2.1>
-    pub const QPACK_MAX_TABLE_CAPACITY_DEFAULT_VALUE: VarInt = VarInt::from_u32(0);
-
-    pub const fn qpack_max_table_capacity(value: VarInt) -> Self {
-        Self {
-            id: Self::QPACK_MAX_TABLE_CAPACITY_ID,
-            value,
-        }
-    }
-
-    /// The decoder specifies an upper bound on the number of streams that
-    /// can be blocked using the SETTINGS_QPACK_BLOCKED_STREAMS setting; see
-    /// Section 5. An encoder MUST limit the number of streams that could
-    /// become blocked to the value of SETTINGS_QPACK_BLOCKED_STREAMS at all
-    /// times. If a decoder encounters more blocked streams than it promised
-    /// to support, it MUST treat this as a connection error of type
-    /// QPACK_DECOMPRESSION_FAILED.
-    ///
-    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-2.1.2-4>
-    pub const QPACK_BLOCKED_STREAMS_ID: VarInt = VarInt::from_u32(0x07);
-    /// The default value is zero. See Section 2.1.2.
-    ///
-    /// <https://datatracker.ietf.org/doc/html/rfc9204#section-5-2.4.1>
-    pub const QPACK_BLOCKED_STREAMS_DEFAULT_VALUE: VarInt = VarInt::from_u32(0);
-
-    pub const fn qpack_blocked_streams(value: VarInt) -> Self {
-        Self {
-            id: Self::QPACK_BLOCKED_STREAMS_ID,
-            value,
-        }
-    }
-
-    /// \[RFC8441\] defines a mechanism for running the WebSocket Protocol
-    /// \[RFC6455\] over a single stream of an HTTP/2 connection. It defines an
-    /// Extended CONNECT method that specifies a new ":protocol" pseudo-
-    /// header field and new semantics for the ":path" and ":authority"
-    /// pseudo-header fields. It also defines a new HTTP/2 setting sent by a
-    /// server to allow the client to use Extended CONNECT.
-    ///
-    /// The semantics of the pseudo-header fields and setting are identical
-    /// to those in HTTP/2 as defined in \[RFC8441\]. Appendix A.3 of \[HTTP/3\]
-    /// requires that HTTP/3 settings be registered separately for HTTP/3.
-    /// The SETTINGS_ENABLE_CONNECT_PROTOCOL value is 0x08 (decimal 8), as in
-    /// HTTP/2.
-    ///
-    /// <https://datatracker.ietf.org/doc/html/rfc9220#name-websockets-upgrade-over-htt>
-    pub const ENABLE_CONNECT_PROTOCOL_ID: VarInt = VarInt::from_u32(0x08);
-    pub const ENABLE_CONNECT_PROTOCOL_DEFAULT_VALUE: Option<VarInt> = None;
-
-    pub const fn enable_connect_protocol(enabled: bool) -> Self {
-        Self {
-            id: Self::ENABLE_CONNECT_PROTOCOL_ID,
-            value: VarInt::from_u32(enabled as u32),
-        }
-    }
-
     pub fn check(&self) -> Result<(), InvalidSettingValue> {
-        if self.id == Self::ENABLE_CONNECT_PROTOCOL_ID
+        if self.id == EnableConnectProtocol::ID
             && self.value != VarInt::from_u32(0)
             && self.value != VarInt::from_u32(1)
         {
@@ -276,50 +172,39 @@ impl EncodeInto<BufList> for Settings {
 
 impl Settings {
     /// Typed access to a setting value. The return type depends on the setting:
-    /// settings with defaults return `VarInt`, optional settings return `Option<VarInt>`.
-    pub fn get_typed<S: SettingId>(&self) -> S::Value {
-        S::get(self)
+    ///
+    /// - Concrete setting types (`QpackMaxTableCapacity`, `MaxFieldSectionSize`, …)
+    ///   apply defaults and return their associated `Value` type.
+    /// - A raw [`VarInt`] identifier returns `Option<VarInt>` with no default fallback.
+    ///
+    /// ```ignore
+    /// settings.get(QpackMaxTableCapacity)       // → VarInt (with default)
+    /// settings.get(MaxFieldSectionSize)          // → Option<VarInt>
+    /// settings.get(VarInt::from_u32(0x06))       // → Option<VarInt> (raw)
+    /// ```
+    pub fn get<S: SettingId>(&self, id: S) -> S::Value {
+        id.value_from(self)
     }
 
-    /// Raw access: returns the explicitly set value, or None if not present.
-    pub fn get_raw(&self, id: VarInt) -> Option<VarInt> {
+    fn get_raw(&self, id: VarInt) -> Option<VarInt> {
         self.map.get(&id).copied()
     }
 
     pub fn max_field_section_size(&self) -> Option<VarInt> {
-        self.get_typed::<MaxFieldSectionSize>()
+        self.get(MaxFieldSectionSize)
     }
 
     pub fn qpack_max_table_capacity(&self) -> VarInt {
-        self.get_typed::<QpackMaxTableCapacity>()
+        self.get(QpackMaxTableCapacity)
     }
 
     pub fn qpack_blocked_streams(&self) -> VarInt {
-        self.get_typed::<QpackBlockedStreams>()
+        self.get(QpackBlockedStreams)
     }
 
     pub fn enable_connect_protocol(&self) -> bool {
-        self.get_typed::<EnableConnectProtocol>()
+        self.get(EnableConnectProtocol)
             .is_some_and(|value| value == VarInt::from_u32(1))
-    }
-
-    /// Legacy generic access with default-value fallback.
-    pub fn get(&self, id: VarInt) -> Option<VarInt> {
-        match self.map.get(&id).copied() {
-            None if id == Setting::MAX_FIELD_SECTION_SIZE_ID => {
-                Setting::MAX_FIELD_SECTION_SIZE_DEFAULT_VALUE
-            }
-            None if id == Setting::QPACK_MAX_TABLE_CAPACITY_ID => {
-                Some(Setting::QPACK_MAX_TABLE_CAPACITY_DEFAULT_VALUE)
-            }
-            None if id == Setting::QPACK_BLOCKED_STREAMS_ID => {
-                Some(Setting::QPACK_BLOCKED_STREAMS_DEFAULT_VALUE)
-            }
-            None if id == Setting::ENABLE_CONNECT_PROTOCOL_ID => {
-                Setting::ENABLE_CONNECT_PROTOCOL_DEFAULT_VALUE
-            }
-            option => option,
-        }
     }
 
     pub fn set(&mut self, Setting { id, value }: Setting) {
@@ -380,81 +265,147 @@ pub trait SettingId {
     type Value;
 
     /// The wire-format setting identifier (RFC 9114 / RFC 9204).
-    fn id() -> VarInt;
+    fn id(&self) -> VarInt;
 
     /// Extract the typed value from `Settings`, applying defaults if applicable.
-    fn get(settings: &Settings) -> Self::Value;
+    fn value_from(&self, settings: &Settings) -> Self::Value;
+}
+
+/// Raw access by [`VarInt`] identifier — returns the explicitly set value, or
+/// `None` if not present. No default-value fallback is applied.
+impl SettingId for VarInt {
+    type Value = Option<VarInt>;
+
+    fn id(&self) -> VarInt {
+        *self
+    }
+
+    fn value_from(&self, settings: &Settings) -> Option<VarInt> {
+        settings.get_raw(*self)
+    }
 }
 
 /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (0x01). Default: 0.
 ///
+/// To bound the memory requirements of the decoder, the decoder limits the
+/// maximum value the encoder is permitted to set for the dynamic table
+/// capacity. In HTTP/3, this limit is determined by the value of
+/// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` sent by the decoder.
+///
 /// <https://datatracker.ietf.org/doc/html/rfc9204#section-5>
 pub struct QpackMaxTableCapacity;
+
+impl QpackMaxTableCapacity {
+    pub const ID: VarInt = VarInt::from_u32(0x01);
+    /// The default value is zero. See Section 3.2 for usage. This is the
+    /// equivalent of the `SETTINGS_HEADER_TABLE_SIZE` from HTTP/2.
+    pub const DEFAULT: VarInt = VarInt::from_u32(0);
+
+    pub const fn setting(value: VarInt) -> Setting {
+        Setting::new(Self::ID, value)
+    }
+}
 
 impl SettingId for QpackMaxTableCapacity {
     type Value = VarInt;
 
-    fn id() -> VarInt {
-        Setting::QPACK_MAX_TABLE_CAPACITY_ID
+    fn id(&self) -> VarInt {
+        Self::ID
     }
 
-    fn get(settings: &Settings) -> VarInt {
-        settings
-            .get_raw(Self::id())
-            .unwrap_or(Setting::QPACK_MAX_TABLE_CAPACITY_DEFAULT_VALUE)
+    fn value_from(&self, settings: &Settings) -> VarInt {
+        settings.get_raw(Self::ID).unwrap_or(Self::DEFAULT)
     }
 }
 
 /// `SETTINGS_QPACK_BLOCKED_STREAMS` (0x07). Default: 0.
 ///
-/// <https://datatracker.ietf.org/doc/html/rfc9204#section-5>
+/// The decoder specifies an upper bound on the number of streams that can
+/// be blocked using the `SETTINGS_QPACK_BLOCKED_STREAMS` setting. An
+/// encoder MUST limit the number of streams that could become blocked to
+/// the value of `SETTINGS_QPACK_BLOCKED_STREAMS` at all times.
+///
+/// <https://datatracker.ietf.org/doc/html/rfc9204#section-2.1.2-4>
 pub struct QpackBlockedStreams;
+
+impl QpackBlockedStreams {
+    pub const ID: VarInt = VarInt::from_u32(0x07);
+    /// The default value is zero. See Section 2.1.2.
+    pub const DEFAULT: VarInt = VarInt::from_u32(0);
+
+    pub const fn setting(value: VarInt) -> Setting {
+        Setting::new(Self::ID, value)
+    }
+}
 
 impl SettingId for QpackBlockedStreams {
     type Value = VarInt;
 
-    fn id() -> VarInt {
-        Setting::QPACK_BLOCKED_STREAMS_ID
+    fn id(&self) -> VarInt {
+        Self::ID
     }
 
-    fn get(settings: &Settings) -> VarInt {
-        settings
-            .get_raw(Self::id())
-            .unwrap_or(Setting::QPACK_BLOCKED_STREAMS_DEFAULT_VALUE)
+    fn value_from(&self, settings: &Settings) -> VarInt {
+        settings.get_raw(Self::ID).unwrap_or(Self::DEFAULT)
     }
 }
 
 /// `SETTINGS_MAX_FIELD_SECTION_SIZE` (0x06). No default (unlimited).
 ///
-/// <https://datatracker.ietf.org/doc/html/rfc9114#section-7.2.4.1>
+/// An HTTP/3 implementation MAY impose a limit on the maximum size of the
+/// message header it will accept on an individual HTTP message. The size
+/// of a field list is calculated based on the uncompressed size of fields,
+/// including the length of the name and value in bytes plus an overhead of
+/// 32 bytes for each field.
+///
+/// <https://datatracker.ietf.org/doc/html/rfc9114#name-header-size-constraints>
 pub struct MaxFieldSectionSize;
+
+impl MaxFieldSectionSize {
+    pub const ID: VarInt = VarInt::from_u32(0x06);
+
+    pub const fn setting(value: VarInt) -> Setting {
+        Setting::new(Self::ID, value)
+    }
+}
 
 impl SettingId for MaxFieldSectionSize {
     type Value = Option<VarInt>;
 
-    fn id() -> VarInt {
-        Setting::MAX_FIELD_SECTION_SIZE_ID
+    fn id(&self) -> VarInt {
+        Self::ID
     }
 
-    fn get(settings: &Settings) -> Option<VarInt> {
-        settings.get_raw(Self::id())
+    fn value_from(&self, settings: &Settings) -> Option<VarInt> {
+        settings.get_raw(Self::ID)
     }
 }
 
 /// `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x08). No default.
 ///
+/// Enables the Extended CONNECT method for WebSocket upgrades over HTTP/3.
+/// The value MUST be 0 or 1.
+///
 /// <https://datatracker.ietf.org/doc/html/rfc9220>
 pub struct EnableConnectProtocol;
+
+impl EnableConnectProtocol {
+    pub const ID: VarInt = VarInt::from_u32(0x08);
+
+    pub const fn setting(enabled: bool) -> Setting {
+        Setting::new(Self::ID, VarInt::from_u32(enabled as u32))
+    }
+}
 
 impl SettingId for EnableConnectProtocol {
     type Value = Option<VarInt>;
 
-    fn id() -> VarInt {
-        Setting::ENABLE_CONNECT_PROTOCOL_ID
+    fn id(&self) -> VarInt {
+        Self::ID
     }
 
-    fn get(settings: &Settings) -> Option<VarInt> {
-        settings.get_raw(Self::id())
+    fn value_from(&self, settings: &Settings) -> Option<VarInt> {
+        settings.get_raw(Self::ID)
     }
 }
 

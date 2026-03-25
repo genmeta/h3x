@@ -293,7 +293,7 @@ mod tests {
     #[cfg(feature = "gm-quic")]
     use crate::{
         connection::ConnectionBuilder,
-        dhttp::settings::{Setting, Settings},
+        dhttp::settings::{MaxFieldSectionSize, Settings},
     };
     use crate::{
         connection::{Connection, ConnectionState},
@@ -317,7 +317,7 @@ mod tests {
     fn pool_key_different_builders_different_entries() {
         let s1 = Arc::new(Settings::default());
         let mut s2_inner = Settings::default();
-        s2_inner.set(Setting::max_field_section_size(VarInt::from_u32(9999)));
+        s2_inner.set(MaxFieldSectionSize::setting(VarInt::from_u32(9999)));
         let s2 = Arc::new(s2_inner);
 
         let builder_a = ConnectionBuilder::<C>::new(s1);

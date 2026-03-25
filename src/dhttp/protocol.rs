@@ -88,7 +88,7 @@ mod tests {
             StreamReader,
         },
         connection::{ConnectionState, tests::MockConnection},
-        dhttp::settings::{Setting, Settings},
+        dhttp::settings::{EnableConnectProtocol, Settings},
         protocol::Protocols,
         quic::{self, GetStreamIdExt},
         runtime::ErasedConnection,
@@ -216,7 +216,7 @@ mod tests {
         let s_default = Settings::default();
         let mut s_other = Settings::default();
 
-        s_other.set(Setting::enable_connect_protocol(true));
+        s_other.set(EnableConnectProtocol::setting(true));
 
         let f1 = DHttpProtocolFactory::new(Arc::new(s_default));
         let f2 = DHttpProtocolFactory::new(Arc::new(s_other));
@@ -239,7 +239,7 @@ mod tests {
     fn dhttp_factory_different_settings_not_eq() {
         let s_default = Settings::default();
         let mut s_other = Settings::default();
-        s_other.set(Setting::enable_connect_protocol(true));
+        s_other.set(EnableConnectProtocol::setting(true));
 
         let f1 = DHttpProtocolFactory::new(Arc::new(s_default));
         let f2 = DHttpProtocolFactory::new(Arc::new(s_other));

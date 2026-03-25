@@ -678,7 +678,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::{
-        dhttp::settings::{Setting, Settings},
+        dhttp::settings::{QpackBlockedStreams, QpackMaxTableCapacity, Settings},
         qpack::{
             encoder::{
                 EncoderState, QPackDecoderStreamError, QPackEncoderError, get_dynamic_references,
@@ -690,10 +690,8 @@ mod tests {
 
     fn settings_with_capacity(capacity: u32) -> Arc<Settings> {
         let mut settings = Settings::default();
-        settings.set(Setting::qpack_max_table_capacity(VarInt::from_u32(
-            capacity,
-        )));
-        settings.set(Setting::qpack_blocked_streams(VarInt::from_u32(10)));
+        settings.set(QpackMaxTableCapacity::setting(VarInt::from_u32(capacity)));
+        settings.set(QpackBlockedStreams::setting(VarInt::from_u32(10)));
         Arc::new(settings)
     }
 

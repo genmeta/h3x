@@ -625,16 +625,14 @@ mod tests {
 
     use super::{DecoderInstruction, DecoderState};
     use crate::{
-        dhttp::settings::{Setting, Settings},
+        dhttp::settings::{QpackMaxTableCapacity, Settings},
         qpack::r#static,
         varint::VarInt,
     };
 
     fn test_settings(capacity: u32) -> Arc<Settings> {
         let mut settings = Settings::default();
-        settings.set(Setting::qpack_max_table_capacity(VarInt::from_u32(
-            capacity,
-        )));
+        settings.set(QpackMaxTableCapacity::setting(VarInt::from_u32(capacity)));
         Arc::new(settings)
     }
 
