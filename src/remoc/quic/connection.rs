@@ -4,6 +4,7 @@ use remoc::{
     prelude::{Server, ServerShared},
     rtc::Client as RemocClient,
 };
+use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use super::{
@@ -167,6 +168,11 @@ where
 ///
 /// On the client side, use this to treat a received RTC connection handle as a
 /// local [`quic::Connection`] for the h3x protocol stack.
+///
+/// Transparent serialization allows sending a `RemoteConnection` directly
+/// across process boundaries without unwrapping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct RemoteConnection(ConnectionClient);
 
 impl RemoteConnection {
@@ -176,6 +182,25 @@ impl RemoteConnection {
 
     pub fn into_inner(self) -> ConnectionClient {
         self.0
+    }
+}
+
+impl ConnectionClient {
+    /// Convert into a [`RemoteConnection`] that implements [`quic::Connection`].
+    pub fn into_quic(self) -> RemoteConnection {
+        RemoteConnection(self)
+    }
+}
+
+impl From<ConnectionClient> for RemoteConnection {
+    fn from(client: ConnectionClient) -> Self {
+        Self(client)
+    }
+}
+
+impl From<RemoteConnection> for ConnectionClient {
+    fn from(remote: RemoteConnection) -> Self {
+        remote.0
     }
 }
 
