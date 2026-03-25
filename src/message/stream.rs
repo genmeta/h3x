@@ -24,7 +24,7 @@ use crate::{
     },
     error::{Code, ErrorScope, H3FrameDecodeError, H3FrameUnexpected},
     qpack::{
-        algorithm::{HuffmanAlways, StaticCompressAlgo},
+        algorithm::{DynamicCompressAlgo, HuffmanAlways},
         encoder::{EncodeHeaderSectionError, Encoder},
         field::{FieldLine, FieldSection},
         protocol::{QPackDecoder, QPackEncoder, QPackProtocolDisabled},
@@ -320,8 +320,8 @@ pub struct WriteStream {
     dhttp_state: Arc<DHttpState>,
 }
 
-pub const DEFAULT_COMPRESS_ALGO: StaticCompressAlgo<HuffmanAlways> =
-    StaticCompressAlgo::new(HuffmanAlways);
+pub const DEFAULT_COMPRESS_ALGO: DynamicCompressAlgo<HuffmanAlways> =
+    DynamicCompressAlgo::new(HuffmanAlways);
 
 impl WriteStream {
     pub fn new(
