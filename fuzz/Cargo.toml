@@ -1,0 +1,36 @@
+[package]
+name = "h3x-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tokio = { version = "1", features = ["rt", "io-util"] }
+
+[dependencies.h3x]
+path = ".."
+
+[[bin]]
+name = "fuzz_varint"
+path = "fuzz_targets/fuzz_varint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_qpack_integer"
+path = "fuzz_targets/fuzz_qpack_integer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_qpack_string"
+path = "fuzz_targets/fuzz_qpack_string.rs"
+test = false
+doc = false
+bench = false
