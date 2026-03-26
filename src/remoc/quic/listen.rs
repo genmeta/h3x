@@ -21,7 +21,7 @@ pub enum ListenError {
 
 #[remoc::rtc::remote]
 pub trait Listen: Send + Sync {
-    async fn accept(&self) -> Result<ConnectionClient, ListenError>;
+    async fn accept(&mut self) -> Result<ConnectionClient, ListenError>;
     async fn shutdown(&self) -> Result<(), ListenError>;
 }
 
@@ -35,7 +35,7 @@ where
     <L::Connection as quic::WithLocalAgent>::LocalAgent: Send + Sync,
     <L::Connection as quic::WithRemoteAgent>::RemoteAgent: Send + Sync,
 {
-    async fn accept(&self) -> Result<ConnectionClient, ListenError> {
+    async fn accept(&mut self) -> Result<ConnectionClient, ListenError> {
         let connection = quic::Listen::accept(self)
             .await
             .map_err(|e| StringError::new(e.to_string()))?;
@@ -65,7 +65,7 @@ where
 ///
 /// Transparent serialization allows sending a `RemoteListener` directly
 /// across process boundaries without unwrapping.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RemoteListener(ListenClient);
 
@@ -102,8 +102,8 @@ impl quic::Listen for RemoteListener {
     type Connection = RemoteConnection;
     type Error = ListenError;
 
-    async fn accept(&self) -> Result<Self::Connection, Self::Error> {
-        let client = Listen::accept(&self.0).await?;
+    async fn accept(&mut self) -> Result<Self::Connection, Self::Error> {
+        let client = Listen::accept(&mut self.0).await?;
         Ok(RemoteConnection::from(client))
     }
 

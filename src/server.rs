@@ -205,7 +205,7 @@ where
         .instrument(span)
     }
 
-    pub async fn run(&self) -> L::Error {
+    pub async fn run(&mut self) -> L::Error {
         let mut tasks = JoinSet::default();
 
         loop {

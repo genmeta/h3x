@@ -26,7 +26,7 @@ fn axum_hello_world() {
         let router = Router::new()
             .route("/hello_world", get(|| async { "Hello, World!" }))
             .into_service();
-        let server = test_server(TowerService(router)).await;
+        let mut server = test_server(TowerService(router)).await;
         let host = get_server_authority(&server);
         let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
 
@@ -80,7 +80,7 @@ async fn interim_response_service(_request: &mut server::Request, response: &mut
 #[test]
 fn interim_response() {
     run("interim_response", async move {
-        let server =
+        let mut server =
             test_server(server::Router::new().get("/ultimate_answer", interim_response_service))
                 .await;
         let host = get_server_authority(&server);
@@ -161,7 +161,7 @@ fn axum_connect() {
         let router = Router::new()
             .route("/", any(mock_connect_service))
             .into_service();
-        let server = test_server(TowerService(router)).await;
+        let mut server = test_server(TowerService(router)).await;
         let host = get_server_authority(&server);
         let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
 
@@ -227,7 +227,7 @@ fn axum_extend_connect() {
         let router = Router::new()
             .route("/connect", any(extend_connect_service))
             .into_service();
-        let server = test_server(TowerService(router)).await;
+        let mut server = test_server(TowerService(router)).await;
         let host = get_server_authority(&server);
         let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
 

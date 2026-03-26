@@ -257,13 +257,13 @@ mod tests {
     #[tokio::test]
     async fn takeover_returns_already_taken_when_taken_twice() {
         let mut request = http::Request::new(http_body_util::Empty::<Bytes>::new());
-        let (_read_tx, read) = RemainStream::<ReadStream>::pending();
+        let read = RemainStream::<u32>::immediately(42);
         request.extensions_mut().insert(TakeoverSlot::new(read));
 
-        let first = poll_fn(|cx| HasTakeover::<ReadStream>::poll_takeover(&mut request, cx)).await;
+        let first = poll_fn(|cx| HasTakeover::<u32>::poll_takeover(&mut request, cx)).await;
         assert!(first.is_ok());
 
-        let second = poll_fn(|cx| HasTakeover::<ReadStream>::poll_takeover(&mut request, cx)).await;
+        let second = poll_fn(|cx| HasTakeover::<u32>::poll_takeover(&mut request, cx)).await;
         assert!(matches!(second, Err(TakeoverError::AlreadyTaken)));
     }
 

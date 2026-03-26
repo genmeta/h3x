@@ -332,7 +332,7 @@ impl quic::Listen for gm_quic::prelude::QuicListeners {
 
     type Error = gm_quic::prelude::ListenersShutdown;
 
-    async fn accept(&self) -> Result<Self::Connection, Self::Error> {
+    async fn accept(&mut self) -> Result<Self::Connection, Self::Error> {
         let (connection, ..) = gm_quic::prelude::QuicListeners::accept(self).await?;
         Ok(connection)
     }
@@ -348,7 +348,7 @@ impl quic::Listen for Arc<gm_quic::prelude::QuicListeners> {
 
     type Error = gm_quic::prelude::ListenersShutdown;
 
-    async fn accept(&self) -> Result<Self::Connection, Self::Error> {
+    async fn accept(&mut self) -> Result<Self::Connection, Self::Error> {
         let (connection, ..) = self.as_ref().accept().await?;
         Ok(connection)
     }

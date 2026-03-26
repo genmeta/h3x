@@ -21,7 +21,7 @@ async fn hello_world_service(_: &mut server::Request, response: &mut server::Res
 #[test]
 fn hello_world() {
     run("hello_world", async move {
-        let server = test_server(Router::new().get("/hello_world", hello_world_service)).await;
+        let mut server = test_server(Router::new().get("/hello_world", hello_world_service)).await;
         let host = get_server_authority(&server);
         let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
 
@@ -61,7 +61,7 @@ async fn streaming_echo_service(request: &mut server::Request, response: &mut se
 #[test]
 fn streaming_echo() {
     run("streaming_echo", async move {
-        let server = test_server(Router::new().post("/echo", streaming_echo_service)).await;
+        let mut server = test_server(Router::new().post("/echo", streaming_echo_service)).await;
         let host = get_server_authority(&server);
         let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
 
@@ -91,7 +91,7 @@ fn streaming_echo() {
 #[test]
 fn fallback() {
     run("fallback", async move {
-        let server = test_server(
+        let mut server = test_server(
             Router::new()
                 .get("/hello_world", hello_world_service)
                 .post("/hello_world", hello_world_service),
@@ -122,7 +122,7 @@ async fn echo_service(request: &mut server::Request, response: &mut server::Resp
 #[test]
 fn auto_close() {
     run("auto_close", async move {
-        let server = test_server(Router::new().post("/echo", echo_service)).await;
+        let mut server = test_server(Router::new().post("/echo", echo_service)).await;
         let host = get_server_authority(&server);
         let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
 
@@ -148,7 +148,7 @@ fn missing_server_name_closes_connection_with_no_error() {
     run(
         "missing_server_name_closes_connection_with_no_error",
         async move {
-            let servers: H3Servers<Router> = H3Servers::builder()
+            let mut servers: H3Servers<Router> = H3Servers::builder()
                 .without_client_cert_verifier()
                 .expect("failed to initialize server tls")
                 .with_router(Arc::new(

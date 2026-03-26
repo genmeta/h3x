@@ -137,7 +137,8 @@ pub trait Listen: Send + Sync {
     type Connection: Connection;
     type Error: Error + Any;
 
-    fn accept(&self) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send + '_;
+    fn accept(&mut self)
+    -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send + '_;
 
     fn shutdown(&self) -> impl Future<Output = Result<(), Self::Error>> + Send + '_;
 }
