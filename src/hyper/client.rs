@@ -95,11 +95,12 @@ impl<C: quic::Connection> Connection<C> {
         let body = if !is_connect {
             Either::left(read_stream.into_hyper_body())
         } else {
-            let read_stream = RemainStream::immediately(read_stream);
-            let write_stream = RemainStream::immediately(write_stream);
             response_parts
                 .extensions
-                .insert(TakeoverSlot::new(read_stream.clone(), write_stream.clone()));
+                .insert(TakeoverSlot::new(RemainStream::immediately(read_stream)));
+            response_parts
+                .extensions
+                .insert(TakeoverSlot::new(RemainStream::immediately(write_stream)));
             Either::right(Empty::new().map_err(|never| match never {}))
         };
 

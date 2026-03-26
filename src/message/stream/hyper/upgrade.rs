@@ -6,10 +6,10 @@ use std::{
 };
 
 use http_body::Body;
+use snafu::Snafu;
 use tokio::sync::oneshot;
 
 use super::{ReadStream, WriteStream};
-use crate::message::stream::{BoxMessageStreamReader, BoxMessageStreamWriter};
 
 pub struct RemainStream<S> {
     rx: Arc<Mutex<oneshot::Receiver<S>>>,
@@ -50,27 +50,31 @@ impl<S> Future for RemainStream<S> {
     }
 }
 
-#[derive(Clone)]
-pub struct TakeoverSlot {
-    state: Arc<Mutex<TakeoverState>>,
+pub struct TakeoverSlot<T> {
+    state: Arc<Mutex<TakeoverState<T>>>,
 }
 
-enum TakeoverState {
-    Available {
-        read: RemainStream<ReadStream>,
-        write: RemainStream<WriteStream>,
-    },
+impl<T> Clone for TakeoverSlot<T> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+        }
+    }
+}
+
+enum TakeoverState<T> {
+    Available { stream: RemainStream<T> },
     Taken,
 }
 
-impl TakeoverSlot {
-    pub fn new(read: RemainStream<ReadStream>, write: RemainStream<WriteStream>) -> Self {
+impl<T> TakeoverSlot<T> {
+    pub fn new(stream: RemainStream<T>) -> Self {
         Self {
-            state: Arc::new(Mutex::new(TakeoverState::Available { read, write })),
+            state: Arc::new(Mutex::new(TakeoverState::Available { stream })),
         }
     }
 
-    pub fn take(&self) -> Result<PendingTakeover, TakeoverError> {
+    pub fn take(&self) -> Result<PendingTakeover<T>, TakeoverError> {
         let mut guard = self.state.lock().expect("poisoned mutex");
         match &*guard {
             TakeoverState::Available { .. } => (),
@@ -79,63 +83,106 @@ impl TakeoverSlot {
 
         let state = std::mem::replace(&mut *guard, TakeoverState::Taken);
         match state {
-            TakeoverState::Available { read, write } => Ok(PendingTakeover { read, write }),
+            TakeoverState::Available { stream } => Ok(PendingTakeover { stream }),
             TakeoverState::Taken => Err(TakeoverError::AlreadyTaken),
         }
     }
 }
 
-pub struct PendingTakeover {
-    read: RemainStream<ReadStream>,
-    write: RemainStream<WriteStream>,
+pub struct PendingTakeover<T> {
+    stream: RemainStream<T>,
 }
 
-impl PendingTakeover {
-    pub async fn wait(
-        self,
-    ) -> Result<
-        (
-            BoxMessageStreamReader<'static>,
-            BoxMessageStreamWriter<'static>,
-        ),
-        TakeoverError,
-    > {
-        let (read, write) = self.wait_raw().await?;
-        Ok((read.into_box_reader(), write.into_box_writer()))
-    }
-
-    pub async fn wait_raw(self) -> Result<(ReadStream, WriteStream), TakeoverError> {
-        let write = self.write.await.ok_or(TakeoverError::Aborted)?;
-        let read = self.read.await.ok_or(TakeoverError::Aborted)?;
-        Ok((read, write))
+impl<T> PendingTakeover<T> {
+    pub async fn wait(self) -> Result<T, TakeoverError> {
+        self.stream.await.ok_or(TakeoverError::Aborted)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
 pub enum TakeoverError {
-    Unsupported,
+    #[snafu(display("stream already taken"))]
     AlreadyTaken,
+    #[snafu(display("stream provider was dropped before delivery"))]
     Aborted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
+#[snafu(module, visibility(pub))]
+pub enum UpgradeError {
+    #[snafu(display("failed to take over stream"))]
+    Takeover { source: TakeoverError },
+    #[snafu(display("upgrade incomplete, missing {missing} stream"))]
+    Incomplete { missing: MissingStream },
+    #[snafu(display("message body could not be released"))]
     BodyNotReleased,
 }
 
-pub trait TakeoverSealed {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingStream {
+    Read,
+    Write,
+    Both,
+}
+
+impl std::fmt::Display for MissingStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MissingStream::Read => f.write_str("read"),
+            MissingStream::Write => f.write_str("write"),
+            MissingStream::Both => f.write_str("read and write"),
+        }
+    }
+}
+
+impl From<TakeoverError> for UpgradeError {
+    fn from(source: TakeoverError) -> Self {
+        UpgradeError::Takeover { source }
+    }
+}
+
+pub(crate) trait TakeoverSealed {
     fn poll_takeover(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<PendingTakeover, TakeoverError>>;
+    ) -> Poll<
+        Result<(PendingTakeover<ReadStream>, PendingTakeover<WriteStream>), UpgradeError>,
+    >;
 }
 
 fn poll_release_body<B: Body + Unpin>(
     body: &mut B,
     cx: &mut Context<'_>,
-) -> Poll<Result<(), TakeoverError>> {
+) -> Poll<Result<(), UpgradeError>> {
     loop {
         match ready!(Pin::new(&mut *body).poll_frame(cx)) {
             Some(Ok(_)) => continue,
-            Some(Err(_)) => return Poll::Ready(Err(TakeoverError::BodyNotReleased)),
+            Some(Err(_)) => return Poll::Ready(Err(UpgradeError::BodyNotReleased)),
             None => return Poll::Ready(Ok(())),
         }
+    }
+}
+
+fn take_both_slots(
+    extensions: &http::Extensions,
+) -> Result<(PendingTakeover<ReadStream>, PendingTakeover<WriteStream>), UpgradeError> {
+    let read_slot = extensions.get::<TakeoverSlot<ReadStream>>();
+    let write_slot = extensions.get::<TakeoverSlot<WriteStream>>();
+    match (read_slot, write_slot) {
+        (Some(r), Some(w)) => {
+            let rp = r.take()?;
+            let wp = w.take()?;
+            Ok((rp, wp))
+        }
+        (Some(_), None) => Err(UpgradeError::Incomplete {
+            missing: MissingStream::Write,
+        }),
+        (None, Some(_)) => Err(UpgradeError::Incomplete {
+            missing: MissingStream::Read,
+        }),
+        (None, None) => Err(UpgradeError::Incomplete {
+            missing: MissingStream::Both,
+        }),
     }
 }
 
@@ -147,12 +194,11 @@ impl<B: Body + Unpin> TakeoverSealed for http::Request<B> {
     fn poll_takeover(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<PendingTakeover, TakeoverError>> {
+    ) -> Poll<
+        Result<(PendingTakeover<ReadStream>, PendingTakeover<WriteStream>), UpgradeError>,
+    > {
         ready!(poll_release_body(self.body_mut(), cx))?;
-        if let Some(slot) = self.extensions().get::<TakeoverSlot>() {
-            return Poll::Ready(slot.take());
-        }
-        Poll::Ready(Err(TakeoverError::Unsupported))
+        Poll::Ready(take_both_slots(self.extensions()))
     }
 }
 
@@ -160,12 +206,11 @@ impl<B: Body + Unpin> TakeoverSealed for http::Response<B> {
     fn poll_takeover(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<PendingTakeover, TakeoverError>> {
+    ) -> Poll<
+        Result<(PendingTakeover<ReadStream>, PendingTakeover<WriteStream>), UpgradeError>,
+    > {
         ready!(poll_release_body(self.body_mut(), cx))?;
-        if let Some(slot) = self.extensions().get::<TakeoverSlot>() {
-            return Poll::Ready(slot.take());
-        }
-        Poll::Ready(Err(TakeoverError::Unsupported))
+        Poll::Ready(take_both_slots(self.extensions()))
     }
 }
 
@@ -173,12 +218,11 @@ impl<B: Body + Unpin> TakeoverSealed for &mut http::Request<B> {
     fn poll_takeover(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<PendingTakeover, TakeoverError>> {
+    ) -> Poll<
+        Result<(PendingTakeover<ReadStream>, PendingTakeover<WriteStream>), UpgradeError>,
+    > {
         ready!(poll_release_body(self.body_mut(), cx))?;
-        if let Some(slot) = self.extensions().get::<TakeoverSlot>() {
-            return Poll::Ready(slot.take());
-        }
-        Poll::Ready(Err(TakeoverError::Unsupported))
+        Poll::Ready(take_both_slots(self.extensions()))
     }
 }
 
@@ -186,12 +230,11 @@ impl<B: Body + Unpin> TakeoverSealed for &mut http::Response<B> {
     fn poll_takeover(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<PendingTakeover, TakeoverError>> {
+    ) -> Poll<
+        Result<(PendingTakeover<ReadStream>, PendingTakeover<WriteStream>), UpgradeError>,
+    > {
         ready!(poll_release_body(self.body_mut(), cx))?;
-        if let Some(slot) = self.extensions().get::<TakeoverSlot>() {
-            return Poll::Ready(slot.take());
-        }
-        Poll::Ready(Err(TakeoverError::Unsupported))
+        Poll::Ready(take_both_slots(self.extensions()))
     }
 }
 
@@ -224,65 +267,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn takeover_returns_unsupported_for_unsupported_message() {
+    async fn upgrade_returns_incomplete_when_no_slots() {
         let mut request = http::Request::new(http_body_util::Empty::<Bytes>::new());
         let result = poll_fn(|cx| request.poll_takeover(cx)).await;
-        assert!(matches!(result, Err(TakeoverError::Unsupported)));
+        assert!(matches!(
+            result,
+            Err(UpgradeError::Incomplete {
+                missing: MissingStream::Both
+            })
+        ));
     }
 
     #[tokio::test]
-    async fn takeover_returns_pending_when_slot_available() {
+    async fn upgrade_returns_incomplete_when_only_read_slot() {
+        let mut request = http::Request::new(http_body_util::Empty::<Bytes>::new());
+        let (_read_tx, read) = RemainStream::<ReadStream>::pending();
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(read));
+
+        let result = poll_fn(|cx| request.poll_takeover(cx)).await;
+        assert!(matches!(
+            result,
+            Err(UpgradeError::Incomplete {
+                missing: MissingStream::Write
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn upgrade_returns_pending_when_both_slots_available() {
         let mut request = http::Request::new(http_body_util::Empty::<Bytes>::new());
         let (_read_tx, read) = RemainStream::<ReadStream>::pending();
         let (_write_tx, write) = RemainStream::<WriteStream>::pending();
         request
             .extensions_mut()
-            .insert(TakeoverSlot::new(read, write));
+            .insert(TakeoverSlot::new(read));
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(write));
 
         let result = poll_fn(|cx| request.poll_takeover(cx)).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn takeover_returns_already_taken_when_taken_twice() {
+    async fn upgrade_returns_already_taken_when_taken_twice() {
         let mut request = http::Request::new(http_body_util::Empty::<Bytes>::new());
         let (_read_tx, read) = RemainStream::<ReadStream>::pending();
         let (_write_tx, write) = RemainStream::<WriteStream>::pending();
         request
             .extensions_mut()
-            .insert(TakeoverSlot::new(read, write));
+            .insert(TakeoverSlot::new(read));
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(write));
 
         let first = poll_fn(|cx| request.poll_takeover(cx)).await;
         assert!(first.is_ok());
 
         let second = poll_fn(|cx| request.poll_takeover(cx)).await;
-        assert!(matches!(second, Err(TakeoverError::AlreadyTaken)));
+        assert!(matches!(
+            second,
+            Err(UpgradeError::Takeover {
+                source: TakeoverError::AlreadyTaken
+            })
+        ));
     }
 
     #[tokio::test]
-    async fn pending_takeover_wait_returns_aborted_when_write_not_ready() {
+    async fn pending_takeover_wait_returns_aborted_when_sender_dropped() {
         let mut request = http::Request::new(http_body_util::Empty::<Bytes>::new());
         let (read_tx, read) = RemainStream::<ReadStream>::pending();
         let (write_tx, write) = RemainStream::<WriteStream>::pending();
         request
             .extensions_mut()
-            .insert(TakeoverSlot::new(read, write));
+            .insert(TakeoverSlot::new(read));
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(write));
 
-        let pending = poll_fn(|cx| request.poll_takeover(cx))
+        let (read_pending, write_pending) = poll_fn(|cx| request.poll_takeover(cx))
             .await
             .expect("takeover should succeed");
 
         drop(read_tx);
         drop(write_tx);
 
-        let result = pending.wait().await;
+        let result = read_pending.wait().await;
+        assert!(matches!(result, Err(TakeoverError::Aborted)));
+        let result = write_pending.wait().await;
         assert!(matches!(result, Err(TakeoverError::Aborted)));
     }
 
     #[tokio::test]
-    async fn takeover_returns_body_not_released_on_body_error() {
+    async fn upgrade_returns_body_not_released_on_body_error() {
         let mut request = http::Request::new(ErrorBody);
         let result = poll_fn(|cx| request.poll_takeover(cx)).await;
-        assert!(matches!(result, Err(TakeoverError::BodyNotReleased)));
+        assert!(matches!(result, Err(UpgradeError::BodyNotReleased)));
     }
 }

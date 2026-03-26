@@ -2,10 +2,14 @@
 pub mod upgrade {
     use std::future::poll_fn;
 
-    use crate::message::stream::hyper::upgrade::TakeoverSealed;
+    use snafu::ResultExt;
+
+    use crate::message::stream::hyper::upgrade::{TakeoverSealed, upgrade_error};
     pub use crate::message::stream::{
         BoxMessageStreamReader, BoxMessageStreamWriter, ReadStream, WriteStream,
-        hyper::upgrade::{HasTakeover, PendingTakeover, TakeoverError},
+        hyper::upgrade::{
+            HasTakeover, MissingStream, PendingTakeover, TakeoverError, TakeoverSlot, UpgradeError,
+        },
     };
 
     #[doc(alias = "take")]
@@ -16,21 +20,19 @@ pub mod upgrade {
             BoxMessageStreamReader<'static>,
             BoxMessageStreamWriter<'static>,
         ),
-        TakeoverError,
+        UpgradeError,
     > {
-        poll_fn(|cx| TakeoverSealed::poll_takeover(&mut message, cx))
-            .await?
+        let (read_pending, write_pending) =
+            poll_fn(|cx| TakeoverSealed::poll_takeover(&mut message, cx)).await?;
+        let read = read_pending
             .wait()
             .await
-    }
-
-    pub async fn on_raw(
-        mut message: impl HasTakeover,
-    ) -> Result<(ReadStream, WriteStream), TakeoverError> {
-        poll_fn(|cx| TakeoverSealed::poll_takeover(&mut message, cx))
-            .await?
-            .wait_raw()
+            .context(upgrade_error::TakeoverSnafu)?;
+        let write = write_pending
+            .wait()
             .await
+            .context(upgrade_error::TakeoverSnafu)?;
+        Ok((read.into_box_reader(), write.into_box_writer()))
     }
 }
 
@@ -75,7 +77,7 @@ mod tests {
         let compat = upgrade::on(http::Request::new(ErrorBody)).await;
         assert!(matches!(
             compat,
-            Err(crate::message::stream::hyper::upgrade::TakeoverError::BodyNotReleased)
+            Err(crate::message::stream::hyper::upgrade::UpgradeError::BodyNotReleased)
         ));
     }
 }

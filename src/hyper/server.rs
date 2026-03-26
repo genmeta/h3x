@@ -14,7 +14,7 @@ use tracing::Instrument;
 
 use crate::{
     message::stream::{
-        MessageStreamError,
+        MessageStreamError, ReadStream,
         hyper::{
             upgrade::{RemainStream, TakeoverSlot},
             write::SendMessageError,
@@ -65,10 +65,8 @@ where
                 http::Request::builder()
                     .method(req.method())
                     .uri(req.uri())
-                    .extension(TakeoverSlot::new(
-                        remain_read_stream.clone(),
-                        remain_write_stream.clone(),
-                    ))
+                    .extension(TakeoverSlot::new(remain_read_stream))
+                    .extension(TakeoverSlot::new(remain_write_stream.clone()))
                     .body(UnsyncBoxBody::new(Empty::new().map_err(|n| match n {})))
             } else {
                 http::Request::builder()
@@ -212,10 +210,6 @@ where
             tracing::debug!("Converted request stream to hyper request, serving...");
             let is_connect = request.method() == Method::CONNECT;
             let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
-            let remain_read_stream = request
-                .extensions()
-                .get::<RemainStream<crate::message::stream::ReadStream>>()
-                .cloned();
 
             request.extensions_mut().insert(local_agent);
             if let Some(remote_agent) = remote_agent {
@@ -223,11 +217,15 @@ where
             }
             request.extensions_mut().insert(stream_id);
             request.extensions_mut().insert(protocols);
-            if is_connect && let Some(remain_read_stream) = remain_read_stream {
-                request.extensions_mut().insert(TakeoverSlot::new(
-                    remain_read_stream,
-                    remain_write_stream.clone(),
-                ));
+            if is_connect
+                && request
+                    .extensions()
+                    .get::<TakeoverSlot<ReadStream>>()
+                    .is_some()
+            {
+                request
+                    .extensions_mut()
+                    .insert(TakeoverSlot::new(remain_write_stream.clone()));
             }
 
             let response = service
@@ -288,10 +286,8 @@ where
                 http::Request::builder()
                     .method(req.method())
                     .uri(req.uri())
-                    .extension(TakeoverSlot::new(
-                        remain_read_stream.clone(),
-                        remain_write_stream.clone(),
-                    ))
+                    .extension(TakeoverSlot::new(remain_read_stream))
+                    .extension(TakeoverSlot::new(remain_write_stream.clone()))
                     .body(UnsyncBoxBody::new(Empty::new().map_err(|n| match n {})))
             } else {
                 http::Request::builder()
@@ -393,10 +389,6 @@ where
             tracing::debug!("Converted request stream to hyper request, serving...");
             let is_connect = request.method() == Method::CONNECT;
             let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
-            let remain_read_stream = request
-                .extensions()
-                .get::<RemainStream<crate::message::stream::ReadStream>>()
-                .cloned();
 
             request.extensions_mut().insert(local_agent);
             if let Some(remote_agent) = remote_agent {
@@ -404,11 +396,15 @@ where
             }
             request.extensions_mut().insert(stream_id);
             request.extensions_mut().insert(protocols);
-            if is_connect && let Some(remain_read_stream) = remain_read_stream {
-                request.extensions_mut().insert(TakeoverSlot::new(
-                    remain_read_stream,
-                    remain_write_stream.clone(),
-                ));
+            if is_connect
+                && request
+                    .extensions()
+                    .get::<TakeoverSlot<ReadStream>>()
+                    .is_some()
+            {
+                request
+                    .extensions_mut()
+                    .insert(TakeoverSlot::new(remain_write_stream.clone()));
             }
 
             let response = service

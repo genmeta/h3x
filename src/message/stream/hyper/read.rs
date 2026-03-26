@@ -8,7 +8,7 @@ use futures::{StreamExt, stream};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Empty, StreamBody};
 
-use super::{MessageStreamError, ReadStream, upgrade::RemainStream};
+use super::{MessageStreamError, ReadStream, upgrade::{RemainStream, TakeoverSlot}};
 use crate::{connection, error::H3MessageError};
 
 pin_project_lite::pin_project! {
@@ -132,7 +132,9 @@ impl ReadStream {
     > {
         let mut parts = self.read_hyper_request_parts().await?;
         if parts.method == http::Method::CONNECT {
-            parts.extensions.insert(RemainStream::immediately(self));
+            parts
+                .extensions
+                .insert(TakeoverSlot::new(RemainStream::immediately(self)));
             let body = Either::right(Empty::new().map_err(|n| match n {}));
             Ok(http::Request::from_parts(parts, body))
         } else {
