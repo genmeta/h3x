@@ -8,7 +8,10 @@ use futures::{StreamExt, stream};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Empty, StreamBody};
 
-use super::{MessageStreamError, ReadStream, upgrade::{RemainStream, TakeoverSlot}};
+use super::{
+    MessageStreamError, ReadStream,
+    upgrade::{RemainStream, TakeoverSlot},
+};
 use crate::{connection, error::H3MessageError};
 
 pin_project_lite::pin_project! {
