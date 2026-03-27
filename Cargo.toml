@@ -47,7 +47,6 @@ remoc = { version = "0.18", default-features = false, optional = true, features 
     "remoc_macro",
     "rtc",
     "serde",
-    "default-codec-json",
 ] }
 
 [features]
