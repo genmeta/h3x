@@ -34,6 +34,12 @@ impl<T: CancelStream + GetStreamId + Sink<Bytes, Error = MessageStreamError> + S
 /// Boxed stream writer with QUIC stream control traits preserved.
 pub type BoxMessageStreamWriter<'s> = SinkWriter<Pin<Box<dyn WriteMessageStream + 's>>>;
 
+impl From<WriteStream> for BoxMessageStreamWriter<'static> {
+    fn from(value: WriteStream) -> Self {
+        value.into_box_writer()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unfold – custom sink unfold that preserves QUIC traits
 // ---------------------------------------------------------------------------

@@ -37,6 +37,12 @@ impl<
 /// Boxed stream reader with QUIC stream control traits preserved.
 pub type BoxMessageStreamReader<'s> = StreamReader<Pin<Box<dyn ReadMessageStream + 's>>>;
 
+impl From<ReadStream> for BoxMessageStreamReader<'static> {
+    fn from(value: ReadStream) -> Self {
+        value.into_box_reader()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unfold – custom stream unfold that preserves QUIC traits
 // ---------------------------------------------------------------------------
