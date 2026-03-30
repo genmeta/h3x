@@ -31,8 +31,7 @@ x509-parser = "0.18"
 tower-service = "0.3"
 
 # feature gm-quic
-# gm-quic = { git = "https://github.com/genmeta/gm-quic.git", branch = "main", optional = true }
-gm-quic = { path = "../gm-quic/gm-quic", optional = true }
+gm-quic = { git = "ssh://git@github.com/genmeta/dquic.git", branch = "feat/v0.5", optional = true }
 
 # feature hyper
 http-body = { version = "1", optional = true }
