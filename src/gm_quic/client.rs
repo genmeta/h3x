@@ -35,12 +35,6 @@ fn default_root_cert_store() -> &'static Arc<RootCertStore> {
         let mut root_cert_store = RootCertStore::empty();
         root_cert_store
             .add_parsable_certificates(include_bytes!("../../genmeta-root.crt").to_certificate());
-        if let Some(pem) = std::env::var("H3X_EXTRA_CA_CERTS")
-            .ok()
-            .and_then(|p| std::fs::read(p).ok())
-        {
-            root_cert_store.add_parsable_certificates(pem.to_certificate());
-        }
         Arc::new(root_cert_store)
     });
     &GENMETA_ROOT_CERT_STORE
