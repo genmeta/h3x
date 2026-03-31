@@ -176,7 +176,7 @@ impl TryFrom<H3ClientTlsBuilder> for H3ClientBuilder {
         Ok(H3ClientBuilder {
             quic_builder,
             client_name,
-            pool: Pool::global().clone(),
+            pool: Pool::empty(),
             builder: Arc::new(ConnectionBuilder::new(Arc::default())),
         })
     }

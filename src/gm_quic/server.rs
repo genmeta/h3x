@@ -74,7 +74,7 @@ impl TryFrom<H3ServersTlsBuilder> for H3ServersBuilder {
         Ok(H3ServersBuilder {
             listeners_builder,
             backlog: 1024,
-            pool: Pool::global().clone(),
+            pool: Pool::empty(),
             builder: Arc::new(ConnectionBuilder::new(Arc::default())),
         })
     }

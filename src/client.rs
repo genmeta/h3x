@@ -26,7 +26,7 @@ impl<C: quic::Connect> Client<C> {
         start_fn(name = from_quic_client, vis = "pub")
     )]
     fn new(
-        #[builder(default = Pool::global().clone())] pool: Pool<C::Connection>,
+        #[builder(default = Pool::empty())] pool: Pool<C::Connection>,
         client: C,
         #[builder(default = Arc::new(ConnectionBuilder::new(Arc::default())))] builder: Arc<
             ConnectionBuilder<C::Connection>,

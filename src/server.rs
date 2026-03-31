@@ -44,7 +44,7 @@ where
         start_fn(name = from_quic_listener, vis = "pub")
     )]
     fn new(
-        #[builder(default = Pool::global().clone())] pool: Pool<L::Connection>,
+        #[builder(default = Pool::empty())] pool: Pool<L::Connection>,
         listener: L,
         service: S,
         #[builder(default = Arc::new(ConnectionBuilder::new(Arc::default())))] builder: Arc<
