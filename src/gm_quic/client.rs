@@ -1,7 +1,4 @@
-use std::{
-    sync::{Arc, LazyLock},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use ::gm_quic::{
     builder::QuicClientBuilder,
@@ -30,16 +27,6 @@ use crate::{
     util::tls::{DangerousServerCertVerifier, InvalidIdentity, verify_certificate_for_name},
 };
 
-fn default_root_cert_store() -> &'static Arc<RootCertStore> {
-    static GENMETA_ROOT_CERT_STORE: LazyLock<Arc<RootCertStore>> = LazyLock::new(|| {
-        let mut root_cert_store = RootCertStore::empty();
-        root_cert_store
-            .add_parsable_certificates(include_bytes!("../../genmeta-root.crt").to_certificate());
-        Arc::new(root_cert_store)
-    });
-    &GENMETA_ROOT_CERT_STORE
-}
-
 enum ServerCertVerifier {
     WebPki(Arc<WebPkiServerVerifier>),
     Roots(Arc<RootCertStore>),
@@ -48,7 +35,7 @@ enum ServerCertVerifier {
 
 impl Default for ServerCertVerifier {
     fn default() -> Self {
-        Self::Roots(default_root_cert_store().clone())
+        Self::Roots(Arc::new(RootCertStore::empty()))
     }
 }
 
