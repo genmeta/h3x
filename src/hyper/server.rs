@@ -102,6 +102,9 @@ where
                         tracing::debug!(error = %Report::from_error(error), "Failed to send response");
                     }
                     if is_connect {
+                        // Flush the buffered response so the client receives
+                        // it before the stream is handed to the upgrade layer.
+                        _ = write_stream.flush().await;
                         _ = remain_write_stream_tx.send(write_stream);
                     } else {
                         _ = write_stream.close().await;
@@ -235,6 +238,10 @@ where
 
             response_stream.send_hyper_response(response).await?;
             if is_connect {
+                response_stream
+                    .flush()
+                    .await
+                    .map_err(|source| HandleRequestError::Stream { source })?;
                 _ = remain_write_stream_tx.send(response_stream);
             } else {
                 response_stream
@@ -323,6 +330,7 @@ where
                         tracing::debug!(error = %Report::from_error(error), "Failed to send response");
                     }
                     if is_connect {
+                        _ = write_stream.flush().await;
                         _ = remain_write_stream_tx.send(write_stream);
                     } else {
                         _ = write_stream.close().await;
@@ -414,6 +422,10 @@ where
 
             response_stream.send_hyper_response(response).await?;
             if is_connect {
+                response_stream
+                    .flush()
+                    .await
+                    .map_err(|source| HandleRequestError::Stream { source })?;
                 _ = remain_write_stream_tx.send(response_stream);
             } else {
                 response_stream
