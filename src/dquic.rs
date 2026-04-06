@@ -3,5 +3,5 @@ mod server;
 mod shim;
 
 pub use client::*;
-pub use gm_quic::*;
+pub use dquic::*;
 pub use server::*;

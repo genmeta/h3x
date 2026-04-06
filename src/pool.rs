@@ -281,7 +281,7 @@ impl<C: quic::Connection> Pool<C> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     use std::{
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
@@ -290,7 +290,7 @@ mod tests {
     use tokio_util::task::AbortOnDropHandle;
 
     use super::ReuseableConnection;
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     use crate::{
         connection::ConnectionBuilder,
         dhttp::settings::{MaxFieldSectionSize, Settings},
@@ -302,17 +302,17 @@ mod tests {
         varint::VarInt,
     };
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     fn hash_of<T: Hash>(val: &T) -> u64 {
         let mut hasher = DefaultHasher::new();
         val.hash(&mut hasher);
         hasher.finish()
     }
 
-    #[cfg(feature = "gm-quic")]
-    type C = gm_quic::prelude::Connection;
+    #[cfg(feature = "dquic")]
+    type C = dquic::prelude::Connection;
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn pool_key_different_builders_different_entries() {
         let s1 = Arc::new(Settings::default());
@@ -331,7 +331,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn pool_key_same_builder_same_entry() {
         let s = Arc::new(Settings::default());

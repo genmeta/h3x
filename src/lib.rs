@@ -17,8 +17,8 @@ pub mod stream_id;
 mod util;
 pub mod varint;
 
-#[cfg(feature = "gm-quic")]
-pub mod gm_quic;
+#[cfg(feature = "dquic")]
+pub mod dquic;
 
 #[cfg(feature = "hyper")]
 pub mod hyper;

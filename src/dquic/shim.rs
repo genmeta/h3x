@@ -19,26 +19,26 @@ use crate::{
     varint::VarInt,
 };
 
-pub fn convert_varint(varint: gm_quic::prelude::VarInt) -> VarInt {
-    // gm-quic's VarInt is already bounds-checked to RFC 9000 spec (< 2^62)
-    VarInt::from_u64(varint.into_inner()).expect("gm-quic VarInt is within valid range")
+pub fn convert_varint(varint: dquic::prelude::VarInt) -> VarInt {
+    // dquic's VarInt is already bounds-checked to RFC 9000 spec (< 2^62)
+    VarInt::from_u64(varint.into_inner()).expect("dquic VarInt is within valid range")
 }
 
-pub fn convert_connection_error(error: gm_quic::prelude::Error) -> quic::ConnectionError {
+pub fn convert_connection_error(error: dquic::prelude::Error) -> quic::ConnectionError {
     match error {
-        gm_quic::prelude::Error::Quic(quic_error) => {
+        dquic::prelude::Error::Quic(quic_error) => {
             quic::ConnectionError::from(quic::TransportError {
                 kind: convert_varint(quic_error.kind().into()),
                 frame_type: match quic_error.frame_type() {
-                    gm_quic::qbase::error::ErrorFrameType::V1(frame_type) => {
+                    dquic::qbase::error::ErrorFrameType::V1(frame_type) => {
                         convert_varint(frame_type.into())
                     }
-                    gm_quic::qbase::error::ErrorFrameType::Ext(varint) => convert_varint(varint),
+                    dquic::qbase::error::ErrorFrameType::Ext(varint) => convert_varint(varint),
                 },
                 reason: quic_error.reason().to_owned().into(),
             })
         }
-        gm_quic::prelude::Error::App(app_error) => {
+        dquic::prelude::Error::App(app_error) => {
             quic::ConnectionError::from(quic::ApplicationError {
                 code: Code::new(
                     VarInt::try_from(app_error.error_code())
@@ -50,16 +50,16 @@ pub fn convert_connection_error(error: gm_quic::prelude::Error) -> quic::Connect
     }
 }
 
-pub fn convert_stream_error(error: gm_quic::prelude::StreamError) -> quic::StreamError {
+pub fn convert_stream_error(error: dquic::prelude::StreamError) -> quic::StreamError {
     match error {
-        gm_quic::prelude::StreamError::Connection(error) => {
+        dquic::prelude::StreamError::Connection(error) => {
             quic::StreamError::from(convert_connection_error(error))
         }
-        gm_quic::prelude::StreamError::Reset(reset_stream_error) => quic::StreamError::Reset {
+        dquic::prelude::StreamError::Reset(reset_stream_error) => quic::StreamError::Reset {
             code: VarInt::try_from(reset_stream_error.error_code())
                 .expect("QUIC reset error code fits in VarInt range"),
         },
-        gm_quic::prelude::StreamError::EosSent => {
+        dquic::prelude::StreamError::EosSent => {
             unreachable!("h3x write data after shutdown")
         }
     }
@@ -69,7 +69,7 @@ pin_project_lite::pin_project! {
     pub struct StreamReader {
         pub(super) stream_id: VarInt,
         #[pin]
-        pub(super) reader: gm_quic::prelude::StreamReader,
+        pub(super) reader: dquic::prelude::StreamReader,
     }
 }
 
@@ -104,7 +104,7 @@ impl quic::StopStream for StreamReader {
         _: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        gm_quic::prelude::StopSending::stop(&mut self.get_mut().reader, code.into_inner());
+        dquic::prelude::StopSending::stop(&mut self.get_mut().reader, code.into_inner());
         Poll::Ready(Ok(()))
     }
 }
@@ -113,7 +113,7 @@ pin_project_lite::pin_project! {
     pub struct StreamWriter {
         pub(super) stream_id: VarInt,
         #[pin]
-        pub(super) writer: gm_quic::prelude::StreamWriter,
+        pub(super) writer: dquic::prelude::StreamWriter,
     }
 }
 
@@ -144,7 +144,7 @@ impl Sink<Bytes> for StreamWriter {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // FIXME: gm-quic StreamWriter::poll_flush pending until all data acked, which is very bad for h3x.
+        // FIXME: dquic StreamWriter::poll_flush pending until all data acked, which is very bad for h3x.
         // self.project()
         //     .writer
         //     .poll_flush(cx)
@@ -167,12 +167,12 @@ impl CancelStream for StreamWriter {
         _: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        gm_quic::prelude::CancelStream::cancel(&mut self.get_mut().writer, code.into_inner());
+        dquic::prelude::CancelStream::cancel(&mut self.get_mut().writer, code.into_inner());
         Poll::Ready(Ok(()))
     }
 }
 
-impl quic::ManageStream for gm_quic::prelude::Connection {
+impl quic::ManageStream for dquic::prelude::Connection {
     type StreamWriter = StreamWriter;
 
     type StreamReader = StreamReader;
@@ -237,12 +237,12 @@ impl quic::ManageStream for gm_quic::prelude::Connection {
 }
 
 #[derive(Debug)]
-pub struct GmQuicLocalAgent {
+pub struct DquicLocalAgent {
     name: Arc<str>,
     certified_key: Arc<CertifiedKey>,
 }
 
-impl agent::LocalAgent for GmQuicLocalAgent {
+impl agent::LocalAgent for DquicLocalAgent {
     fn name(&self) -> &str {
         &self.name
     }
@@ -266,12 +266,12 @@ impl agent::LocalAgent for GmQuicLocalAgent {
 }
 
 #[derive(Debug)]
-pub struct GmQuicRemoteAgent {
+pub struct DquicRemoteAgent {
     name: Arc<str>,
     cert_chain: Arc<[CertificateDer<'static>]>,
 }
 
-impl agent::RemoteAgent for GmQuicRemoteAgent {
+impl agent::RemoteAgent for DquicRemoteAgent {
     fn name(&self) -> &str {
         &self.name
     }
@@ -281,15 +281,15 @@ impl agent::RemoteAgent for GmQuicRemoteAgent {
     }
 }
 
-impl quic::WithLocalAgent for gm_quic::prelude::Connection {
-    type LocalAgent = GmQuicLocalAgent;
+impl quic::WithLocalAgent for dquic::prelude::Connection {
+    type LocalAgent = DquicLocalAgent;
 
-    async fn local_agent(&self) -> Result<Option<GmQuicLocalAgent>, quic::ConnectionError> {
+    async fn local_agent(&self) -> Result<Option<DquicLocalAgent>, quic::ConnectionError> {
         let local_agent = self.local_agent().await.map_err(convert_connection_error)?;
         Ok(local_agent.map(|local_agent| {
             let name = AsRef::<Arc<str>>::as_ref(&local_agent).clone();
             let certified_key = AsRef::<Arc<CertifiedKey>>::as_ref(&local_agent).clone();
-            GmQuicLocalAgent {
+            DquicLocalAgent {
                 name,
                 certified_key,
             }
@@ -297,10 +297,10 @@ impl quic::WithLocalAgent for gm_quic::prelude::Connection {
     }
 }
 
-impl quic::WithRemoteAgent for gm_quic::prelude::Connection {
-    type RemoteAgent = GmQuicRemoteAgent;
+impl quic::WithRemoteAgent for dquic::prelude::Connection {
+    type RemoteAgent = DquicRemoteAgent;
 
-    async fn remote_agent(&self) -> Result<Option<GmQuicRemoteAgent>, quic::ConnectionError> {
+    async fn remote_agent(&self) -> Result<Option<DquicRemoteAgent>, quic::ConnectionError> {
         let remote_agent = self
             .remote_agent()
             .await
@@ -308,14 +308,14 @@ impl quic::WithRemoteAgent for gm_quic::prelude::Connection {
         Ok(remote_agent.map(|remote_agent| {
             let name = AsRef::<Arc<str>>::as_ref(&remote_agent).clone();
             let cert_chain = AsRef::<Arc<[CertificateDer]>>::as_ref(&remote_agent).clone();
-            GmQuicRemoteAgent { name, cert_chain }
+            DquicRemoteAgent { name, cert_chain }
         }))
     }
 }
 
-impl quic::Lifecycle for gm_quic::prelude::Connection {
+impl quic::Lifecycle for dquic::prelude::Connection {
     fn close(&self, code: Code, reason: Cow<'static, str>) {
-        _ = gm_quic::prelude::Connection::close(self, reason, code.into_inner().into_inner());
+        _ = dquic::prelude::Connection::close(self, reason, code.into_inner().into_inner());
     }
 
     fn check(&self) -> Result<(), quic::ConnectionError> {
@@ -323,30 +323,30 @@ impl quic::Lifecycle for gm_quic::prelude::Connection {
     }
 
     async fn closed(&self) -> quic::ConnectionError {
-        convert_connection_error(gm_quic::prelude::Connection::terminated(self).await)
+        convert_connection_error(dquic::prelude::Connection::terminated(self).await)
     }
 }
 
-impl quic::Listen for gm_quic::prelude::QuicListeners {
-    type Connection = gm_quic::prelude::Connection;
+impl quic::Listen for dquic::prelude::QuicListeners {
+    type Connection = dquic::prelude::Connection;
 
-    type Error = gm_quic::prelude::ListenersShutdown;
+    type Error = dquic::prelude::ListenersShutdown;
 
     async fn accept(&mut self) -> Result<Self::Connection, Self::Error> {
-        let (connection, ..) = gm_quic::prelude::QuicListeners::accept(self).await?;
+        let (connection, ..) = dquic::prelude::QuicListeners::accept(self).await?;
         Ok(connection)
     }
 
     async fn shutdown(&self) -> Result<(), Self::Error> {
-        gm_quic::prelude::QuicListeners::shutdown(self);
+        dquic::prelude::QuicListeners::shutdown(self);
         Ok(())
     }
 }
 
-impl quic::Listen for Arc<gm_quic::prelude::QuicListeners> {
-    type Connection = gm_quic::prelude::Connection;
+impl quic::Listen for Arc<dquic::prelude::QuicListeners> {
+    type Connection = dquic::prelude::Connection;
 
-    type Error = gm_quic::prelude::ListenersShutdown;
+    type Error = dquic::prelude::ListenersShutdown;
 
     async fn accept(&mut self) -> Result<Self::Connection, Self::Error> {
         let (connection, ..) = self.as_ref().accept().await?;
@@ -359,10 +359,10 @@ impl quic::Listen for Arc<gm_quic::prelude::QuicListeners> {
     }
 }
 
-impl quic::Connect for Arc<gm_quic::prelude::QuicClient> {
-    type Connection = gm_quic::prelude::Connection;
+impl quic::Connect for Arc<dquic::prelude::QuicClient> {
+    type Connection = dquic::prelude::Connection;
 
-    type Error = gm_quic::prelude::ConnectServerError;
+    type Error = dquic::prelude::ConnectServerError;
 
     async fn connect(
         &self,
@@ -373,6 +373,6 @@ impl quic::Connect for Arc<gm_quic::prelude::QuicClient> {
         } else {
             server.host().to_string()
         };
-        gm_quic::prelude::QuicClient::connect(self, &name).await
+        dquic::prelude::QuicClient::connect(self, &name).await
     }
 }

@@ -1,6 +1,6 @@
 use std::{error::Error, sync::Arc, time::Duration};
 
-use ::gm_quic::{
+use ::dquic::{
     builder::QuicListenersBuilder,
     prelude::{
         AuthClient, BindUri, Connection, ListenError, ProductStreamsConcurrencyController,

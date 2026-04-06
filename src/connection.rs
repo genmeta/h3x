@@ -502,7 +502,7 @@ impl<C: quic::DynConnection + ?Sized> Drop for Connection<C> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     use std::{
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
@@ -516,10 +516,10 @@ pub(crate) mod tests {
     use bytes::Bytes;
     use futures::{Sink, future::BoxFuture, stream::Stream};
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     use super::ConnectionBuilder;
     use super::ConnectionState;
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     use crate::{
         codec::{ErasedPeekableBiStream, ErasedPeekableUniStream},
         connection::StreamError,
@@ -773,7 +773,7 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     fn hash_of<T: Hash>(val: &T) -> u64 {
         let mut hasher = DefaultHasher::new();
         val.hash(&mut hasher);
@@ -781,11 +781,11 @@ pub(crate) mod tests {
     }
 
     /// Local mock protocol for builder tests.
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[derive(Debug)]
     struct MockProtocol;
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     impl Protocol for MockProtocol {
         fn accept_uni<'a>(
             &'a self,
@@ -803,11 +803,11 @@ pub(crate) mod tests {
     }
 
     /// Local mock factory for builder tests.
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
     struct MockFactory(u64);
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     impl<C: quic::DynConnection + ?Sized> ProductProtocol<C> for MockFactory {
         type Protocol = MockProtocol;
 
@@ -820,10 +820,10 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(feature = "gm-quic")]
-    type C = gm_quic::prelude::Connection;
+    #[cfg(feature = "dquic")]
+    type C = dquic::prelude::Connection;
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn builder_same_settings_equal_hash() {
         let s = Arc::new(Settings::default());
@@ -832,7 +832,7 @@ pub(crate) mod tests {
         assert_eq!(hash_of(&a), hash_of(&b));
     }
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn builder_different_settings_different_hash() {
         let s1 = Arc::new(Settings::default());
@@ -844,7 +844,7 @@ pub(crate) mod tests {
         assert_ne!(hash_of(&a), hash_of(&b));
     }
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn builder_extra_protocol_different_hash() {
         let s = Arc::new(Settings::default());
@@ -853,7 +853,7 @@ pub(crate) mod tests {
         assert_ne!(hash_of(&a), hash_of(&b));
     }
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn builder_order_independent_hash() {
         let s = Arc::new(Settings::default());
@@ -873,7 +873,7 @@ pub(crate) mod tests {
         assert_eq!(hash_of(&a), hash_of(&b));
     }
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn builder_same_settings_eq() {
         let s = Arc::new(Settings::default());
@@ -882,7 +882,7 @@ pub(crate) mod tests {
         assert_eq!(a, b);
     }
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn builder_different_settings_not_eq() {
         let s1 = Arc::new(Settings::default());
@@ -896,7 +896,7 @@ pub(crate) mod tests {
 
     /// Simulates pool key distinction: two builders with different protocol stacks
     /// produce different hashes, so the pool stores them under separate keys.
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn pool_key_different_builders_different_hash() {
         let s = Arc::new(Settings::default());
@@ -909,7 +909,7 @@ pub(crate) mod tests {
 
     /// Simulates pool key reuse: two identical builders produce the same hash,
     /// so the pool correctly groups them under one key for connection reuse.
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn pool_key_same_builders_same_hash() {
         let s = Arc::new(Settings::default());
@@ -920,7 +920,7 @@ pub(crate) mod tests {
 
     /// Verifies hash determinism: hashing the same builder twice yields the same
     /// value, and an identically-constructed builder also matches.
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn builder_hash_determinism() {
         let s = Arc::new(Settings::default());
@@ -941,7 +941,7 @@ pub(crate) mod tests {
         );
     }
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn builder_clone_like_rebuild_hash_determinism() {
         let s = Arc::new(Settings::default());
@@ -954,7 +954,7 @@ pub(crate) mod tests {
         );
     }
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn builder_mock_factory_included_in_hash() {
         let s = Arc::new(Settings::default());

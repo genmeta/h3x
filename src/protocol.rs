@@ -267,7 +267,7 @@ pub enum StreamVerdict<S> {
     Passed(S),
 }
 
-#[cfg(all(test, feature = "gm-quic"))]
+#[cfg(all(test, feature = "dquic"))]
 mod tests {
     use std::sync::Arc;
 
@@ -352,10 +352,10 @@ mod tests {
         compute_factory_identity::<C, F>(f)
     }
 
-    #[cfg(feature = "gm-quic")]
-    type C = gm_quic::prelude::Connection;
+    #[cfg(feature = "dquic")]
+    type C = dquic::prelude::Connection;
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn identity_hash_same_value_same_hash() {
         let a = MockFactory(42);
@@ -363,7 +363,7 @@ mod tests {
         assert_eq!(compute_identity::<C, _>(&a), compute_identity::<C, _>(&b));
     }
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn identity_hash_different_value_different_hash() {
         let a = MockFactory(1);
@@ -371,7 +371,7 @@ mod tests {
         assert_ne!(compute_identity::<C, _>(&a), compute_identity::<C, _>(&b));
     }
 
-    #[cfg(feature = "gm-quic")]
+    #[cfg(feature = "dquic")]
     #[test]
     fn identity_hash_different_type_different_hash() {
         let a = MockFactory(1);

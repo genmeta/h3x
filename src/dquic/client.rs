@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use ::gm_quic::{
+use ::dquic::{
     builder::QuicClientBuilder,
     prelude::{
         BindUri, Connection, ProductStreamsConcurrencyController, QuicClient, Resolve,
