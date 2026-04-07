@@ -245,7 +245,7 @@ impl H3Error for H3MissingSettings {
 pub enum H3GeneralProtocolError {
     #[snafu(display("trailing payload in GOAWAY frame"))]
     TrailingPayload,
-    #[snafu(display("protocol decode error: {source}"))]
+    #[snafu(display("protocol decode error"))]
     Decode { source: crate::codec::DecodeError },
 }
 
@@ -261,7 +261,7 @@ impl H3Error for H3GeneralProtocolError {
 #[non_exhaustive]
 #[derive(Debug, Snafu)]
 pub enum H3InternalError {
-    #[snafu(display("QPACK encoder encode failure: {source}"))]
+    #[snafu(display("QPACK encoder encode failure"))]
     QPackEncoderEncode {
         source: crate::codec::EncodeStreamError,
     },
@@ -279,7 +279,7 @@ impl H3Error for H3InternalError {
 }
 
 #[derive(Debug, Snafu, Clone)]
-#[snafu(display("frame decode error: {source}"))]
+#[snafu(display("frame decode error"))]
 pub struct H3FrameDecodeError {
     pub source: crate::codec::DecodeError,
 }
@@ -296,7 +296,7 @@ impl H3Error for H3FrameDecodeError {
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum QpackDecompressionFailed {
-    #[snafu(display("QPACK decompression decode error: {source}"))]
+    #[snafu(display("QPACK decompression decode error"))]
     Decode { source: crate::codec::DecodeError },
 }
 
