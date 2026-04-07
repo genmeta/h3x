@@ -2,10 +2,10 @@ mod common;
 use std::sync::Arc;
 
 use common::*;
-use gm_quic::prelude::handy::{ToCertificate, ToPrivateKey};
+use dquic::prelude::handy::{ToCertificate, ToPrivateKey};
 use h3x::{
+    dquic::H3Servers,
     error::Code,
-    gm_quic::H3Servers,
     quic,
     server::{self, Router},
     varint::VarInt,
@@ -152,7 +152,7 @@ fn missing_server_name_closes_connection_with_no_error() {
                 .without_client_cert_verifier()
                 .expect("failed to initialize server tls")
                 .with_router(Arc::new(
-                    gm_quic::qinterface::component::route::QuicRouter::new(),
+                    dquic::qinterface::component::route::QuicRouter::new(),
                 ))
                 .listen()
                 .expect("failed to listen");
@@ -163,8 +163,8 @@ fn missing_server_name_closes_connection_with_no_error() {
                     SERVER_CERT.to_certificate(),
                     SERVER_KEY.to_private_key(),
                     [
-                        gm_quic::prelude::BindUri::from("inet://127.0.0.1:0").alloc_port(),
-                        gm_quic::prelude::BindUri::from("inet://[::1]:0").alloc_port(),
+                        dquic::prelude::BindUri::from("inet://127.0.0.1:0").alloc_port(),
+                        dquic::prelude::BindUri::from("inet://[::1]:0").alloc_port(),
                     ],
                     None,
                 )

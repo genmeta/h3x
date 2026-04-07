@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use gm_quic::{
+use dquic::{
     prelude::{
         BindUri, BoundAddr, IO,
         handy::{ToCertificate, ToPrivateKey},
@@ -14,7 +14,7 @@ use gm_quic::{
     qinterface::component::route::QuicRouter,
 };
 use h3x::{
-    gm_quic::{H3Client, H3Servers},
+    dquic::{H3Client, H3Servers},
     server::UnresolvedRequest,
 };
 use http::uri::Authority;
