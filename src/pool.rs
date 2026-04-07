@@ -184,7 +184,7 @@ impl<C: quic::Connection> Pool<C> {
             loop {
                 tracing::debug!("(Re)trying to reuse connection");
                 if let Some(connection) = reuseable_connection.reuse() {
-                    tracing::debug!("Found reusable connection, gogogo");
+                    tracing::debug!("found reusable connection, gogogo");
                     break Ok(connection);
                 }
 
@@ -195,7 +195,7 @@ impl<C: quic::Connection> Pool<C> {
                         .context(connect_error::ConnectorSnafu)?;
                     let connection = builder.build(quic_conn).await?;
 
-                    tracing::debug!("H3 connection established, verifying peer identity");
+                    tracing::debug!("h3 connection established, verifying peer identity");
                     let remote_agent = connection.remote_agent().await?;
                     let actual_peer_name = remote_agent.as_ref().map(|agent| agent.name());
                     if actual_peer_name.as_ref() != Some(&server.host()) {
@@ -223,18 +223,18 @@ impl<C: quic::Connection> Pool<C> {
                 tokio::select! {
                     biased;
                     _new_conn = connections.next() => {
-                        tracing::debug!("Entry updated, try to reuse connection");
+                        tracing::debug!("entry updated, try to reuse connection");
                     }
                     result = reuseable_connection.try_insert_with(try_connect) => {
                         result?;
-                        tracing::debug!("New connection inserted");
+                        tracing::debug!("new connection inserted");
                     }
                 }
             }
         };
 
         match &result {
-            Ok(..) => tracing::debug!("Connection ready to use"),
+            Ok(..) => tracing::debug!("connection ready to use"),
             Err(..) => self.clone().spawn_try_release((server, builder_hash)),
         }
 

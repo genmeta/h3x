@@ -656,7 +656,7 @@ where
             error.map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::QPackEncoder.into(),
                 |encode_error| {
-                    tracing::error!("Failed to encode QPACK encoder instruction: {encode_error}, this is likely a bug");
+                    tracing::error!("failed to encode QPACK encoder instruction: {encode_error}, this is likely a bug");
                     H3InternalError::QPackEncoderEncode { source: EncodeStreamError::Encode { source: encode_error } }.into()
                 },
             )

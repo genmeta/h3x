@@ -98,13 +98,13 @@ where
         let service = self.service.clone();
         let span = tracing::info_span!("handle_connection", server_name = tracing::field::Empty);
         async move {
-            tracing::debug!("Accepted new QUIC connection");
+            tracing::debug!("accepted new QUIC connection");
             let Ok(connection) = builder.build(connection).await else {
                 // failed to initialize H3 connection
                 return;
             };
 
-            tracing::debug!("Accepted new H3 connection");
+            tracing::debug!("accepted new H3 connection");
             let Ok(local_agent) = connection.local_agent().await else {
                 // connection already closed
                 return;
@@ -114,7 +114,7 @@ where
                 return;
             };
             let Some(local_agent) = local_agent else {
-                tracing::debug!("Close incoming connection due to missing SNI");
+                tracing::debug!("close incoming connection due to missing SNI");
                 // no SNI
                 connection.close(
                     Code::H3_INTERNAL_ERROR,
@@ -132,13 +132,13 @@ where
                 let (mut read_stream, write_stream) = match connection.accept_message_stream().await
                 {
                     Ok(pair) => {
-                        tracing::debug!("Accepted incoming request stream");
+                        tracing::debug!("accepted incoming request stream");
                         pair
                     }
                     Err(error) => {
                         tracing::debug!(
                             error = %Report::from_error(error),
-                            "Failed to accept incoming request"
+                            "failed to accept incoming request"
                         );
                         break;
                     }

@@ -210,7 +210,7 @@ where
                 .record("method", request.method().as_str())
                 .record("uri", request.uri().to_string());
 
-            tracing::debug!("Converted request stream to hyper request, serving...");
+            tracing::debug!("converted request stream to hyper request, serving...");
             let is_connect = request.method() == Method::CONNECT;
             let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
 
@@ -394,7 +394,7 @@ where
                 .record("method", request.method().as_str())
                 .record("uri", request.uri().to_string());
 
-            tracing::debug!("Converted request stream to hyper request, serving...");
+            tracing::debug!("converted request stream to hyper request, serving...");
             let is_connect = request.method() == Method::CONNECT;
             let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
 
