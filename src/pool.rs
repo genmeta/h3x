@@ -216,6 +216,7 @@ impl<C: quic::Connection> Pool<C> {
                             connection.closed().await;
                             pool.spawn_try_release((server, builder_hash));
                         }
+                        .in_current_span()
                     }));
                     Ok((connection, task))
                 };
@@ -268,10 +269,13 @@ impl<C: quic::Connection> Pool<C> {
         reuseable_connection
             .insert(
                 connection.clone(),
-                AbortOnDropHandle::new(tokio::spawn(async move {
-                    connection.closed().await;
-                    pool.spawn_try_release(identity);
-                })),
+                AbortOnDropHandle::new(tokio::spawn(
+                    async move {
+                        connection.closed().await;
+                        pool.spawn_try_release(identity);
+                    }
+                    .in_current_span(),
+                )),
             )
             .await;
         Ok(())

@@ -7,7 +7,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream, StreamExt, stream};
-use snafu::Snafu;
+use snafu::{Report, Snafu};
 use tokio::{
     io::{AsyncBufRead, AsyncReadExt, AsyncWrite},
     sync::Mutex as AsyncMutex,
@@ -656,7 +656,7 @@ where
             error.map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::QPackEncoder.into(),
                 |encode_error| {
-                    tracing::error!("failed to encode QPACK encoder instruction: {encode_error}, this is likely a bug");
+                    tracing::error!(error = %Report::from_error(&encode_error), "this is likely a bug");
                     H3InternalError::QPackEncoderEncode { source: EncodeStreamError::Encode { source: encode_error } }.into()
                 },
             )
