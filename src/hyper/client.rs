@@ -3,6 +3,7 @@ use std::error::Error;
 use bytes::Bytes;
 use http_body::Body;
 use http_body_util::{BodyExt, Empty};
+use snafu::ResultExt;
 use tracing::Instrument;
 
 use crate::{
@@ -13,33 +14,34 @@ use crate::{
         hyper::{
             read::Either,
             upgrade::{RemainStream, TakeoverSlot},
+            write::send_message_error,
         },
     },
     quic,
 };
 
 #[derive(Debug)]
-pub enum RequestError<E> {
+pub enum RequestError<E: Error + 'static> {
     InitialStream { source: InitialMessageStreamError },
     SendRequest { source: SendMessageError<E> },
     ReceiveResponse { source: MessageStreamError },
 }
 
-impl<E> From<InitialMessageStreamError> for RequestError<E> {
+impl<E: Error + 'static> From<InitialMessageStreamError> for RequestError<E> {
     #[track_caller]
     fn from(source: InitialMessageStreamError) -> Self {
         RequestError::InitialStream { source }
     }
 }
 
-impl<E> From<SendMessageError<E>> for RequestError<E> {
+impl<E: Error + 'static> From<SendMessageError<E>> for RequestError<E> {
     #[track_caller]
     fn from(source: SendMessageError<E>) -> Self {
         RequestError::SendRequest { source }
     }
 }
 
-impl<E> From<MessageStreamError> for RequestError<E> {
+impl<E: Error + 'static> From<MessageStreamError> for RequestError<E> {
     #[track_caller]
     fn from(source: MessageStreamError) -> Self {
         RequestError::ReceiveResponse { source }
@@ -78,7 +80,7 @@ impl<C: quic::Connection> Connection<C> {
     >
     where
         B::Data: Send,
-        B::Error: Send,
+        B::Error: Error + Send + 'static,
     {
         let (mut read_stream, mut write_stream) = self.initial_message_stream().await?;
         let is_connect = request.method() == http::Method::CONNECT;
@@ -100,7 +102,7 @@ impl<C: quic::Connection> Connection<C> {
                         );
                     }
                 },);
-            send_result.map_err(|source| SendMessageError::Stream { source })?;
+            send_result.context(send_message_error::StreamSnafu)?;
             let mut response_parts = recv_result?;
 
             response_parts
@@ -117,7 +119,7 @@ impl<C: quic::Connection> Connection<C> {
             write_stream
                 .send_hyper_request_parts(parts)
                 .await
-                .map_err(|source| SendMessageError::Stream { source })?;
+                .context(send_message_error::StreamSnafu)?;
 
             // Spawn background task to send request body + close write stream.
             // Guard ensures stream cleanup on failure.

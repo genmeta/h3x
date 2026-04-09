@@ -1,8 +1,8 @@
-use std::{error::Error, fmt::Display, pin::pin};
+use std::pin::pin;
 
-use futures::TryFutureExt;
 use http_body::Body;
 use http_body_util::BodyExt;
+use snafu::{ResultExt, Snafu};
 
 use super::{MessageStreamError, WriteStream};
 use crate::qpack::field::hyper::{
@@ -10,35 +10,23 @@ use crate::qpack::field::hyper::{
     hyper_response_parts_to_field_lines,
 };
 
-#[derive(Debug)]
-pub enum SendMessageError<E> {
+#[derive(Debug, Snafu)]
+#[snafu(module, visibility(pub(crate)))]
+pub enum SendMessageError<E: std::error::Error + 'static> {
+    #[snafu(display("failed to send message on stream"))]
     Stream { source: MessageStreamError },
+    #[snafu(display("failed to read body frame"))]
     Body { source: E },
 }
 
-impl<E> SendMessageError<E> {
-    pub fn map_body_error<E1>(self, f: impl FnOnce(E) -> E1) -> SendMessageError<E1> {
+impl<E: std::error::Error + 'static> SendMessageError<E> {
+    pub fn map_body_error<E1: std::error::Error + 'static>(
+        self,
+        f: impl FnOnce(E) -> E1,
+    ) -> SendMessageError<E1> {
         match self {
             SendMessageError::Stream { source } => SendMessageError::Stream { source },
             SendMessageError::Body { source } => SendMessageError::Body { source: f(source) },
-        }
-    }
-}
-
-impl<E: Display> Display for SendMessageError<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SendMessageError::Stream { source } => source.fmt(f),
-            SendMessageError::Body { source } => source.fmt(f),
-        }
-    }
-}
-
-impl<E: Error> Error for SendMessageError<E> {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            SendMessageError::Stream { source } => source.source(),
-            SendMessageError::Body { source } => source.source(),
         }
     }
 }
@@ -50,15 +38,16 @@ impl WriteStream {
     ) -> Result<(), SendMessageError<B::Error>>
     where
         B::Data: Send,
+        B::Error: std::error::Error + 'static,
     {
         let mut body = pin!(body);
         while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|source| SendMessageError::Body { source })?;
+            let frame = frame.context(send_message_error::BodySnafu)?;
             let frame = match frame.into_data() {
                 Ok(data) => {
                     self.send_data(data)
-                        .map_err(|source| SendMessageError::Stream { source })
-                        .await?;
+                        .await
+                        .context(send_message_error::StreamSnafu)?;
                     continue;
                 }
                 Err(frame) => frame,
@@ -66,8 +55,8 @@ impl WriteStream {
             let frame = match frame.into_trailers() {
                 Ok(trailers) => {
                     self.send_header(header_map_to_field_lines(trailers))
-                        .map_err(|source| SendMessageError::Stream { source })
-                        .await?;
+                        .await
+                        .context(send_message_error::StreamSnafu)?;
                     break;
                 }
                 Err(frame) => frame,
@@ -93,11 +82,12 @@ impl WriteStream {
     ) -> Result<(), SendMessageError<B::Error>>
     where
         B::Data: Send,
+        B::Error: std::error::Error + 'static,
     {
         let (parts, body) = request.into_parts();
         self.send_header(hyper_request_parts_to_field_lines(parts))
-            .map_err(|source| SendMessageError::Stream { source })
-            .await?;
+            .await
+            .context(send_message_error::StreamSnafu)?;
         self.send_hyper_body(body).await
     }
 
@@ -115,11 +105,12 @@ impl WriteStream {
     ) -> Result<(), SendMessageError<B::Error>>
     where
         B::Data: Send,
+        B::Error: std::error::Error + 'static,
     {
         let (parts, body) = response.into_parts();
         self.send_header(hyper_response_parts_to_field_lines(parts))
-            .map_err(|source| SendMessageError::Stream { source })
-            .await?;
+            .await
+            .context(send_message_error::StreamSnafu)?;
         self.send_hyper_body(body).await
     }
 }

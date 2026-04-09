@@ -548,7 +548,7 @@ impl DHttpState {
             return Err(H3MissingSettings.into());
         }
         let settings = Arc::new(settings_frame.decode_one::<Settings>().await?);
-        tracing::debug!(?settings, "Received remote settings");
+        tracing::debug!(?settings, "received remote settings");
         self.peer_settings
             .set(settings)
             .expect("handle control task set once");

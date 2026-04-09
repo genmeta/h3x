@@ -1,6 +1,5 @@
 use std::{
     error::Error,
-    fmt::Display,
     task::{Context, Poll},
 };
 
@@ -9,7 +8,7 @@ use futures::future::{self, BoxFuture};
 use http::Method;
 use http_body::Body;
 use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
-use snafu::Report;
+use snafu::{Report, ResultExt, Snafu};
 use tracing::Instrument;
 
 use crate::{
@@ -37,7 +36,7 @@ where
         > + Clone
         + Send
         + 'static,
-    RespBody: Body<Data: Send, Error: Error + Send> + Send,
+    RespBody: Body<Data: Send, Error: Error + Send + 'static> + Send,
 {
     type Future<'s> = BoxFuture<'s, ()>;
 
@@ -45,7 +44,7 @@ where
         let mut service = self.0.clone();
         Box::pin(async move {
             if let Err(error) = future::poll_fn(|cx| service.poll_ready(cx)).await {
-                tracing::debug!(error = %Report::from_error(error), "Service cannot be ready");
+                tracing::debug!(error = %Report::from_error(error), "service cannot be ready");
                 return;
             }
 
@@ -83,7 +82,7 @@ where
             let mut request = match request {
                 Ok(request) => request,
                 Err(error) => {
-                    tracing::warn!(error = %Report::from_error(error), "Failed to convert request, skip serving");
+                    tracing::warn!(error = %Report::from_error(error), "failed to convert request, skip serving");
                     return;
                 }
             };
@@ -99,7 +98,7 @@ where
             match service.call(request).await {
                 Ok(response) => {
                     if let Err(error) = write_stream.send_hyper_response(response).await {
-                        tracing::debug!(error = %Report::from_error(error), "Failed to send response");
+                        tracing::debug!(error = %Report::from_error(error), "failed to send response");
                     }
                     if is_connect {
                         // Flush the buffered response so the client receives
@@ -111,41 +110,27 @@ where
                     }
                 }
                 Err(error) => {
-                    tracing::debug!(error = %Report::from_error(error), "Service failed")
+                    tracing::debug!(error = %Report::from_error(error), "service failed")
                 }
             }
         })
     }
 }
 
-#[derive(Debug)]
-pub enum HandleRequestError<S, B> {
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum HandleRequestError<S: Error + 'static, B: Error + 'static> {
+    #[snafu(display("failed to handle message stream"))]
     Stream { source: MessageStreamError },
+    #[snafu(display("service error"))]
     Service { source: S },
+    #[snafu(display("response body error"))]
     Body { source: B },
 }
 
-impl<S: Display, B: Display> Display for HandleRequestError<S, B> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HandleRequestError::Stream { source } => source.fmt(f),
-            HandleRequestError::Service { source } => source.fmt(f),
-            HandleRequestError::Body { source } => source.fmt(f),
-        }
-    }
-}
-
-impl<S: Error, B: Error> Error for HandleRequestError<S, B> {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            HandleRequestError::Stream { source } => source.source(),
-            HandleRequestError::Service { source } => source.source(),
-            HandleRequestError::Body { source } => source.source(),
-        }
-    }
-}
-
-impl<S, B> From<SendMessageError<B>> for HandleRequestError<S, B> {
+impl<S: Error + 'static, B: Error + 'static> From<SendMessageError<B>>
+    for HandleRequestError<S, B>
+{
     fn from(source: SendMessageError<B>) -> Self {
         match source {
             SendMessageError::Stream { source } => HandleRequestError::Stream { source },
@@ -164,7 +149,8 @@ where
         > + Clone
         + Send
         + 'static,
-    RespBody: Body<Data: Send, Error: Error + Send> + Send,
+    ServiceE: Error + 'static,
+    RespBody: Body<Data: Send, Error: Error + Send + 'static> + Send,
 {
     type Response = ();
 
@@ -199,12 +185,12 @@ where
         let future = async move {
             future::poll_fn(|cx| service.poll_ready(cx))
                 .await
-                .map_err(|source| HandleRequestError::Service { source })?;
+                .context(handle_request_error::ServiceSnafu)?;
 
             let mut request = request_stream
                 .into_hyper_request()
                 .await
-                .map_err(|source| HandleRequestError::Stream { source })?
+                .context(handle_request_error::StreamSnafu)?
                 .map(UnsyncBoxBody::new);
             tracing::Span::current()
                 .record("method", request.method().as_str())
@@ -234,20 +220,20 @@ where
             let response = service
                 .call(request)
                 .await
-                .map_err(|source| HandleRequestError::Service { source })?;
+                .context(handle_request_error::ServiceSnafu)?;
 
             response_stream.send_hyper_response(response).await?;
             if is_connect {
                 response_stream
                     .flush()
                     .await
-                    .map_err(|source| HandleRequestError::Stream { source })?;
+                    .context(handle_request_error::StreamSnafu)?;
                 _ = remain_write_stream_tx.send(response_stream);
             } else {
                 response_stream
                     .close()
                     .await
-                    .map_err(|source| HandleRequestError::Stream { source })?;
+                    .context(handle_request_error::StreamSnafu)?;
             }
 
             Ok(())
@@ -270,7 +256,7 @@ where
         > + Clone
         + Send
         + 'static,
-    RespBody: Body<Data: Send, Error: Error + Send> + Send,
+    RespBody: Body<Data: Send, Error: Error + Send + 'static> + Send,
 {
     type Future<'s> = BoxFuture<'s, ()>;
 
@@ -311,7 +297,7 @@ where
             let mut request = match request {
                 Ok(request) => request,
                 Err(error) => {
-                    tracing::warn!(error = %Report::from_error(error), "Failed to convert request, skip serving");
+                    tracing::warn!(error = %Report::from_error(error), "failed to convert request, skip serving");
                     return;
                 }
             };
@@ -327,7 +313,7 @@ where
             match service.call(request).await {
                 Ok(response) => {
                     if let Err(error) = write_stream.send_hyper_response(response).await {
-                        tracing::debug!(error = %Report::from_error(error), "Failed to send response");
+                        tracing::debug!(error = %Report::from_error(error), "failed to send response");
                     }
                     if is_connect {
                         _ = write_stream.flush().await;
@@ -337,7 +323,7 @@ where
                     }
                 }
                 Err(error) => {
-                    tracing::debug!(error = %Report::from_error(error), "Service failed")
+                    tracing::debug!(error = %Report::from_error(error), "service failed")
                 }
             }
         })
@@ -354,7 +340,8 @@ where
         > + Clone
         + Send
         + 'static,
-    RespBody: Body<Data: Send, Error: Error + Send> + Send,
+    ServiceE: Error + 'static,
+    RespBody: Body<Data: Send, Error: Error + Send + 'static> + Send,
 {
     type Response = ();
 
@@ -388,7 +375,7 @@ where
             let mut request = request_stream
                 .into_hyper_request()
                 .await
-                .map_err(|source| HandleRequestError::Stream { source })?
+                .context(handle_request_error::StreamSnafu)?
                 .map(UnsyncBoxBody::new);
             tracing::Span::current()
                 .record("method", request.method().as_str())
@@ -418,20 +405,20 @@ where
             let response = service
                 .call(request)
                 .await
-                .map_err(|source| HandleRequestError::Service { source })?;
+                .context(handle_request_error::ServiceSnafu)?;
 
             response_stream.send_hyper_response(response).await?;
             if is_connect {
                 response_stream
                     .flush()
                     .await
-                    .map_err(|source| HandleRequestError::Stream { source })?;
+                    .context(handle_request_error::StreamSnafu)?;
                 _ = remain_write_stream_tx.send(response_stream);
             } else {
                 response_stream
                     .close()
                     .await
-                    .map_err(|source| HandleRequestError::Stream { source })?;
+                    .context(handle_request_error::StreamSnafu)?;
             }
 
             Ok(())

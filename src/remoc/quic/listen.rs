@@ -36,6 +36,7 @@ where
     <L::Connection as quic::WithRemoteAgent>::RemoteAgent: Send + Sync,
 {
     async fn accept(&mut self) -> Result<ConnectionClient, ListenError> {
+        // lossy: cross-process serialization boundary
         let connection = quic::Listen::accept(self)
             .await
             .map_err(|e| StringError::new(e.to_string()))?;
@@ -50,6 +51,7 @@ where
     }
 
     async fn shutdown(&self) -> Result<(), ListenError> {
+        // lossy: cross-process serialization boundary
         quic::Listen::shutdown(self)
             .await
             .map_err(|e| StringError::new(e.to_string()))?;

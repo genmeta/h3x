@@ -109,6 +109,7 @@ impl agent::LocalAgent for CachedLocalAgent {
             client
                 .sign(serde_scheme, owned_data)
                 .await
+                // lossy: rustls API requires String for General error variant
                 .map_err(|e| SignError::Crypto {
                     source: rustls::Error::General(e.to_string()),
                 })
@@ -228,6 +229,7 @@ where
     ) -> Result<Vec<u8>, quic::ConnectionError> {
         agent::LocalAgent::sign(self, SignatureScheme::from(scheme), &data)
             .await
+            // lossy: TransportError.reason is a protocol string field
             .map_err(|e| quic::ConnectionError::Transport {
                 source: quic::TransportError {
                     kind: crate::varint::VarInt::from_u32(0x01),
@@ -251,6 +253,7 @@ where
     ) -> Result<bool, quic::ConnectionError> {
         agent::LocalAgent::verify(self, SignatureScheme::from(scheme), &data, &signature)
             .await
+            // lossy: TransportError.reason is a protocol string field
             .map_err(|e| quic::ConnectionError::Transport {
                 source: quic::TransportError {
                     kind: crate::varint::VarInt::from_u32(0x01),
@@ -292,6 +295,7 @@ where
     ) -> Result<bool, quic::ConnectionError> {
         agent::RemoteAgent::verify(self, SignatureScheme::from(scheme), &data, &signature)
             .await
+            // lossy: TransportError.reason is a protocol string field
             .map_err(|e| quic::ConnectionError::Transport {
                 source: quic::TransportError {
                     kind: crate::varint::VarInt::from_u32(0x01),

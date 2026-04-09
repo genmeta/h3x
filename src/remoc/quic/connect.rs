@@ -37,6 +37,7 @@ where
     <C::Connection as quic::WithRemoteAgent>::RemoteAgent: Send + Sync,
 {
     async fn connect(&self, server: SerdeAuthority) -> Result<ConnectionClient, ConnectError> {
+        // lossy: cross-process serialization boundary
         let authority = Authority::try_from(server).map_err(|e| StringError::new(e.to_string()))?;
         let connection = quic::Connect::connect(self, &authority)
             .await

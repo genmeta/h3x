@@ -198,7 +198,7 @@ where
 
         loop {
             let connection = self.client.connect(authority.clone()).await?;
-            tracing::debug!(target: "h3x::client", %authority, "Connected");
+            tracing::debug!(target: "h3x::client", %authority, "connected");
 
             let (mut read_stream, mut write_stream) = match connection
                 .initial_message_stream()
@@ -214,7 +214,7 @@ where
                         tracing::debug!(
                             target: "h3x::client",
                             ?source,
-                            "Connection error on reused connection, retrying..."
+                            "connection error on reused connection, retrying..."
                         );
                         continue;
                     }
@@ -222,7 +222,7 @@ where
                         return Err(RequestError::ResponseStream { source });
                     }
                     InitialRawMessageStreamError::Goaway { .. } => {
-                        tracing::debug!(target: "h3x::client", "Connection goaway, retrying...");
+                        tracing::debug!(target: "h3x::client", "connection goaway, retrying...");
                         continue;
                     }
                 },
@@ -296,7 +296,7 @@ where
                 },
                 Err((.., MessageStreamError::Goaway { .. })) => {
                     self.request = self.request.to_unsend();
-                    tracing::debug!(target: "h3x::client", "Connection goaway, retrying...");
+                    tracing::debug!(target: "h3x::client", "connection goaway, retrying...");
                     continue;
                 }
             };

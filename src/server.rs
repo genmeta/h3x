@@ -187,7 +187,7 @@ where
                             tracing::debug!(
                                 stream_id = %stream_id,
                                 error = %Report::from_error(error.as_ref()),
-                                "Close incoming connection due to missing service"
+                                "close incoming connection due to missing service"
                             );
                             connection.close(Code::H3_NO_ERROR, "no error");
                             return;

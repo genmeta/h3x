@@ -3,6 +3,8 @@ use crate::{
     varint::VarInt,
 };
 
+/// Lossy: remoc RPC errors must be serialized across process boundaries, so the
+/// original error type is stringified into a QUIC transport error reason.
 impl From<remoc::rtc::CallError> for quic::ConnectionError {
     fn from(error: remoc::rtc::CallError) -> Self {
         quic::ConnectionError::Transport {
@@ -43,6 +45,9 @@ impl From<remoc::rtc::CallError> for crate::message::stream::MessageStreamError 
     }
 }
 
+/// Lossy: errors are stringified for cross-process serialization via remoc RPC.
+/// The remoc `Listen`/`Connect` traits require `StringError` (a serializable
+/// wrapper) because the concrete error type is not known across the RPC boundary.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct StringError(String);
 
