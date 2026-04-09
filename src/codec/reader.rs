@@ -58,6 +58,10 @@ where
         &self.stream
     }
 
+    pub fn stream_mut(&mut self) -> &mut S {
+        &mut self.stream
+    }
+
     pub fn into_inner(self) -> S
     where
         S: Sized,

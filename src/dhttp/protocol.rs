@@ -24,8 +24,7 @@ use tracing::Instrument;
 use crate::{
     buflist::BufList,
     codec::{
-        BoxReadStream, BoxWriteStream, DecodeExt, EncodeExt, ErasedPeekableBiStream,
-        ErasedPeekableUniStream, ErasedStreamReader, ErasedStreamWriter, Feed, SinkWriter,
+        DecodeExt, EncodeExt, ErasedPeekableBiStream, ErasedPeekableUniStream, Feed, SinkWriter,
         StreamReader,
     },
     connection::{ConnectionGoaway, ConnectionState, LifecycleExt, StreamError},
@@ -39,6 +38,7 @@ use crate::{
         Code, H3CriticalStreamClosed, H3FrameUnexpected, H3IdError, H3MissingSettings,
         H3StreamCreationError,
     },
+    message::stream::guard,
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     quic::{self, CancelStreamExt, ConnectionError, GetStreamIdExt, StopStreamExt},
     runtime::ErasedConnection,
@@ -83,10 +83,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{
-            BoxReadStream, BoxWriteStream, ErasedStreamReader, ErasedStreamWriter, SinkWriter,
-            StreamReader,
-        },
+        codec::{BoxReadStream, BoxWriteStream, SinkWriter, StreamReader},
         connection::{ConnectionState, tests::MockConnection},
         dhttp::settings::{EnableConnectProtocol, Settings},
         protocol::Protocols,
@@ -179,10 +176,16 @@ mod tests {
         }
     }
 
-    fn test_erased_streams(stream_id: u32) -> (ErasedStreamReader, ErasedStreamWriter) {
+    fn test_erased_streams(stream_id: u32) -> (GuardedStreamReader, GuardedStreamWriter) {
         let stream_id = VarInt::from_u32(stream_id);
-        let reader = StreamReader::new(Box::pin(TestReadStream { stream_id }) as BoxReadStream);
-        let writer = SinkWriter::new(Box::pin(TestWriteStream { stream_id }) as BoxWriteStream);
+        let reader =
+            StreamReader::new(guard::GuardedQuicReader::new(
+                Box::pin(TestReadStream { stream_id }) as BoxReadStream,
+            ));
+        let writer =
+            SinkWriter::new(guard::GuardedQuicWriter::new(
+                Box::pin(TestWriteStream { stream_id }) as BoxWriteStream,
+            ));
         (reader, writer)
     }
 
@@ -624,8 +627,11 @@ impl DHttpState {
 
 type FrameSink = Feed<BoxSink<'static, Frame<BufList>, StreamError>, Frame<BufList>>;
 
-pub type BoxDynQuicStreamReader = BoxReadStream;
-pub type BoxDynQuicStreamWriter = BoxWriteStream;
+pub type BoxDynQuicStreamReader = guard::GuardedQuicReader;
+pub type BoxDynQuicStreamWriter = guard::GuardedQuicWriter;
+
+type GuardedStreamReader = StreamReader<BoxDynQuicStreamReader>;
+type GuardedStreamWriter = SinkWriter<BoxDynQuicStreamWriter>;
 
 /// DHTTP/3 protocol layer.
 ///
@@ -645,7 +651,7 @@ pub struct DHttpProtocol {
 
     handle_control_stream: SetOnce<AbortOnDropHandle<()>>,
 
-    unresolved_request_streams: RingChannel<(ErasedStreamReader, ErasedStreamWriter)>,
+    unresolved_request_streams: RingChannel<(GuardedStreamReader, GuardedStreamWriter)>,
 }
 
 impl ops::Deref for DHttpProtocol {
@@ -759,7 +765,10 @@ impl DHttpProtocol {
             // This is an HTTP/3 request stream. Reset the peek cursor so the
             // frame type can be re-read by FrameStream during request processing.
             Pin::new(&mut reader).reset();
-            let reader = reader.into_stream_reader();
+            let reader = reader
+                .into_stream_reader()
+                .map_stream(guard::GuardedQuicReader::new);
+            let writer = writer.map_sink(guard::GuardedQuicWriter::new);
             let item = (reader, writer);
             if let Some(mut unresolved) = self.unresolved_request_streams.send(item) {
                 // Ring channel is full — reject the oldest unresolved request.
@@ -972,26 +981,28 @@ pub enum AcceptRawMessageStreamError {
 impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync> ConnectionState<C> {
     pub async fn initial_raw_message_stream(
         &self,
-    ) -> Result<(ErasedStreamReader, ErasedStreamWriter), InitialRawMessageStreamError> {
+    ) -> Result<(GuardedStreamReader, GuardedStreamWriter), InitialRawMessageStreamError> {
         let (reader, writer) = self.open_bi().await?;
         let (mut reader, writer) = (Box::pin(reader), Box::pin(writer));
         self.dhttp()
             .register_initialized_stream(reader.stream_id().await?)?;
-        Ok((StreamReader::new(reader), SinkWriter::new(writer)))
+        Ok((
+            StreamReader::new(guard::GuardedQuicReader::new(reader)),
+            SinkWriter::new(guard::GuardedQuicWriter::new(writer)),
+        ))
     }
 
     pub async fn accept_raw_message_stream(
         &self,
-    ) -> Result<(ErasedStreamReader, ErasedStreamWriter), AcceptRawMessageStreamError> {
+    ) -> Result<(GuardedStreamReader, GuardedStreamWriter), AcceptRawMessageStreamError> {
         let dhttp = self.dhttp();
-        let (reader, mut writer) = tokio::select! {
+        let (mut reader, mut writer) = tokio::select! {
             stream = dhttp.unresolved_request_streams.receive() => stream,
             connection_error = self.closed() => return Err(connection_error.into()),
         };
-        let mut reader = Box::pin(reader);
         let stream_id = reader.stream_id().await?;
         match dhttp.register_accepted_stream(stream_id) {
-            Ok(()) => Ok((StreamReader::new(reader), writer)),
+            Ok(()) => Ok((reader, writer)),
             Err(ConnectionGoaway::Local) => {
                 let code = Code::H3_REQUEST_REJECTED.into_inner();
                 _ = tokio::join!(reader.stop(code), writer.cancel(code));

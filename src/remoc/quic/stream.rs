@@ -4,7 +4,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::bridge;
 use crate::{
+    codec::BoxReadStream,
     dhttp::protocol::{BoxDynQuicStreamReader, BoxDynQuicStreamWriter},
+    message::stream::guard,
     quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
     util::try_future::TryFuture,
     varint::VarInt,
@@ -38,7 +40,8 @@ impl ReadStreamClient {
     }
 
     pub fn into_boxed_quic(self) -> BoxDynQuicStreamReader {
-        Box::pin(TryFuture::from(self.into_quic())) as BoxDynQuicStreamReader
+        let raw: BoxReadStream = Box::pin(TryFuture::from(self.into_quic()));
+        guard::GuardedQuicReader::new(raw)
     }
 }
 
@@ -95,7 +98,8 @@ impl WriteStreamClient {
     }
 
     pub fn into_boxed_quic(self) -> BoxDynQuicStreamWriter {
-        Box::pin(TryFuture::from(self.into_quic())) as BoxDynQuicStreamWriter
+        let raw: crate::codec::BoxWriteStream = Box::pin(TryFuture::from(self.into_quic()));
+        guard::GuardedQuicWriter::new(raw)
     }
 }
 

@@ -1,12 +1,12 @@
 use std::{
-    io, mem,
+    io,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
 
 use bytes::{Buf, Bytes};
-use futures::{Sink, SinkExt, Stream, TryStreamExt};
+use futures::{SinkExt, TryStreamExt};
 use snafu::Snafu;
 
 use crate::{
@@ -34,6 +34,7 @@ use crate::{
 };
 
 #[cfg(feature = "hyper")]
+pub(crate) mod guard;
 pub(crate) mod hyper;
 pub(crate) mod unfold;
 
@@ -41,69 +42,6 @@ pub use self::unfold::{
     read::{BoxMessageStreamReader, ReadMessageStream},
     write::{BoxMessageStreamWriter, WriteMessageStream},
 };
-
-fn stream_used_after_dropped() -> ! {
-    panic!("message stream is used after being dropped, this is a bug")
-}
-
-pub struct DestroyedStream;
-
-impl Sink<Bytes> for DestroyedStream {
-    type Error = quic::StreamError;
-
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        stream_used_after_dropped()
-    }
-
-    fn start_send(self: Pin<&mut Self>, _: Bytes) -> Result<(), Self::Error> {
-        stream_used_after_dropped()
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        stream_used_after_dropped()
-    }
-
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        stream_used_after_dropped()
-    }
-}
-
-impl Stream for DestroyedStream {
-    type Item = Result<Bytes, quic::StreamError>;
-
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        stream_used_after_dropped()
-    }
-}
-
-impl quic::CancelStream for DestroyedStream {
-    fn poll_cancel(
-        self: Pin<&mut Self>,
-        _cx: &mut Context,
-        _code: VarInt,
-    ) -> Poll<Result<(), quic::StreamError>> {
-        stream_used_after_dropped()
-    }
-}
-
-impl quic::StopStream for DestroyedStream {
-    fn poll_stop(
-        self: Pin<&mut Self>,
-        _cx: &mut Context,
-        _code: VarInt,
-    ) -> Poll<Result<(), quic::StreamError>> {
-        stream_used_after_dropped()
-    }
-}
-
-impl quic::GetStreamId for DestroyedStream {
-    fn poll_stream_id(
-        self: Pin<&mut Self>,
-        _cx: &mut Context,
-    ) -> Poll<Result<VarInt, quic::StreamError>> {
-        stream_used_after_dropped()
-    }
-}
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Snafu)]
@@ -286,9 +224,9 @@ impl ReadStream {
     }
 
     pub fn take(&mut self) -> Self {
-        let stream = FrameStream::new(StreamReader::new(Box::pin(DestroyedStream) as Pin<Box<_>>));
+        let taken = self.stream.inner_mut().take();
         Self {
-            stream: mem::replace(&mut self.stream, stream),
+            stream: FrameStream::new(StreamReader::new(taken)),
             qpack_decoder: self.qpack_decoder.clone(),
             connection: self.connection.clone(),
             dhttp_state: self.dhttp_state.clone(),
@@ -445,9 +383,9 @@ impl WriteStream {
     }
 
     pub fn take(&mut self) -> Self {
-        let stream = SinkWriter::new(Box::pin(DestroyedStream) as Pin<Box<_>>);
+        let taken = self.stream.sink_mut().take();
         Self {
-            stream: mem::replace(&mut self.stream, stream),
+            stream: SinkWriter::new(taken),
             qpack_encoder: self.qpack_encoder.clone(),
             connection: self.connection.clone(),
             dhttp_state: self.dhttp_state.clone(),
@@ -549,7 +487,7 @@ mod tests {
     use bytes::Bytes;
     use futures::{Sink, SinkExt, Stream};
 
-    use super::{ReadStream, WriteStream};
+    use super::{ReadStream, WriteStream, guard};
     use crate::{
         codec::{SinkWriter, StreamReader},
         connection::{ConnectionState, StreamError, tests::MockConnection},
@@ -696,9 +634,10 @@ mod tests {
         protocols.insert(DHttpProtocol::new_for_test(erased_connection));
         let state = ConnectionState::new_for_test(quic.clone(), Arc::new(protocols));
 
-        let reader = StreamReader::new(Box::pin(TestReadStream {
+        let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TestReadStream {
             stream_id: VarInt::from_u32(10),
-        }) as crate::codec::BoxReadStream);
+        })
+            as crate::codec::BoxReadStream));
         let mut read_stream = ReadStream::new(
             reader,
             Arc::new(QPackDecoder::new(
@@ -739,9 +678,10 @@ mod tests {
         protocols.insert(DHttpProtocol::new_for_test(erased_connection));
         let state = ConnectionState::new_for_test(quic.clone(), Arc::new(protocols));
 
-        let writer = SinkWriter::new(Box::pin(TestWriteStream {
+        let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TestWriteStream {
             stream_id: VarInt::from_u32(12),
-        }) as crate::codec::BoxWriteStream);
+        })
+            as crate::codec::BoxWriteStream));
         let mut write_stream = WriteStream::new(
             writer,
             Arc::new(QPackEncoder::new(

@@ -44,7 +44,10 @@ impl<E: Error> Error for SendMessageError<E> {
 }
 
 impl WriteStream {
-    async fn send_hyper_body<B: Body>(&mut self, body: B) -> Result<(), SendMessageError<B::Error>>
+    pub(crate) async fn send_hyper_body<B: Body>(
+        &mut self,
+        body: B,
+    ) -> Result<(), SendMessageError<B::Error>>
     where
         B::Data: Send,
     {

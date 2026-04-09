@@ -82,6 +82,10 @@ where
         &self.sink
     }
 
+    pub fn sink_mut(&mut self) -> &mut S {
+        &mut self.sink
+    }
+
     pub fn into_inner(self) -> S
     where
         S: Sized,

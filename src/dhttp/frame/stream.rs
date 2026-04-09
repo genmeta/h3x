@@ -45,6 +45,13 @@ where
         self.project().stream.project_stream_mut()
     }
 
+    pub(crate) fn inner_mut(&mut self) -> &mut S
+    where
+        S: Sized,
+    {
+        self.stream.stream_mut().stream_mut()
+    }
+
     pub fn frame<'s>(self: Pin<&'s mut Self>) -> Option<Result<ReadableFrame<'s, S>, StreamError>> {
         match self.frame.as_ref()? {
             Ok(frame) => Some(Ok(Frame {
