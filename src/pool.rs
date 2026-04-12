@@ -182,7 +182,7 @@ impl<C: quic::Connection> Pool<C> {
             let mut connections = pin!(reuseable_connection.connection.watch());
 
             loop {
-                tracing::debug!("(Re)trying to reuse connection");
+                tracing::debug!("(re)trying to reuse connection");
                 if let Some(connection) = reuseable_connection.reuse() {
                     tracing::debug!("found reusable connection, gogogo");
                     break Ok(connection);

@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use futures::{Sink, channel::oneshot, future::BoxFuture, never::Never, stream::BoxStream};
+use futures::{Sink, channel::oneshot, future::BoxFuture, stream::BoxStream};
 use snafu::Snafu;
 use tokio::io::AsyncWrite;
 use tracing::Instrument;
@@ -267,32 +267,33 @@ impl QPackProtocolFactory {
             ))
         };
 
-        // Spawn receive_decoder_instructions background task
+        // Spawn decoder background task
         let encoder_clone = encoder.clone();
         let conn_state = conn.clone();
         let peer_settings = dhttp.peer_settings.clone();
 
-        let receive_decoder_instructions = async move {
-            let receive_instructions = async {
-                tokio::select! {
-                    biased;
-                    Err::<Never, _>(stream_error) = async { loop { encoder_clone.receive_instruction().await? } } => {
-                        conn_state.handle_stream_error(stream_error).await;
-                    }
-                    _connection_error = conn_state.closed() => {
-                        // Connection error occurred, background task will be aborted by the caller.
-                    }
-                }
-            };
-            let receive_peer_settings = async {
+        let decoder_task = async move {
+            let apply_peer_settings = async {
                 if let Some(settings) = peer_settings.get().await {
-                    encoder_clone.apply_settings(settings).await
+                    encoder_clone.apply_settings(settings).await;
                 }
             };
-            tokio::join!(biased; receive_instructions, receive_peer_settings);
+            let receive_instructions = async {
+                loop {
+                    if let Err(stream_error) = encoder_clone.receive_instruction().await {
+                        conn_state.handle_stream_error(stream_error).await;
+                        return;
+                    }
+                }
+            };
+            tokio::select! {
+                biased;
+                _ = async move { tokio::join!(biased; receive_instructions, apply_peer_settings) } => {}
+                _ = conn_state.closed() => {}
+            }
         };
 
-        tokio::spawn(receive_decoder_instructions.in_current_span());
+        tokio::spawn(decoder_task.in_current_span());
 
         Ok(QPackProtocol {
             encoder_inst_receiver_tx: Mutex::new(Some(encoder_inst_receiver_tx)),
