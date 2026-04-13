@@ -41,7 +41,6 @@ use crate::{
     message::stream::guard,
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     quic::{self, CancelStreamExt, ConnectionError, GetStreamIdExt, StopStreamExt},
-    runtime::ErasedConnection,
     util::{ring_channel::RingChannel, set_once::SetOnce, watch::Watch},
     varint::VarInt,
 };
@@ -88,7 +87,6 @@ mod tests {
         dhttp::settings::{EnableConnectProtocol, Settings},
         protocol::Protocols,
         quic::{self, GetStreamIdExt},
-        runtime::ErasedConnection,
     };
 
     #[derive(Debug)]
@@ -191,7 +189,7 @@ mod tests {
 
     fn test_connection_state() -> ConnectionState<MockConnection> {
         let quic = Arc::new(MockConnection::new());
-        let erased_connection: Arc<dyn ErasedConnection> = quic.clone();
+        let erased_connection: Arc<dyn quic::DynConnection> = quic.clone();
         let mut protocols = Protocols::new();
         protocols.insert(DHttpProtocol::new_for_test(erased_connection));
         ConnectionState::new_for_test(quic, Arc::new(protocols))
@@ -643,8 +641,8 @@ pub struct DHttpProtocol {
     /// DHTTP/3 protocol state.
     pub state: Arc<DHttpState>,
 
-    /// Erased connection for lifecycle operations.
-    pub connection: Arc<dyn ErasedConnection>,
+    /// Type-erased connection for lifecycle and stream operations.
+    pub connection: Arc<dyn quic::DynConnection>,
 
     /// Control stream frame sink
     pub control_stream: AsyncMutex<FrameSink>,
@@ -798,7 +796,7 @@ impl DHttpProtocol {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_for_test(connection: Arc<dyn ErasedConnection>) -> Self {
+    pub(crate) fn new_for_test(connection: Arc<dyn quic::DynConnection>) -> Self {
         let sink: BoxSink<'static, Frame<BufList>, StreamError> =
             Box::pin(futures::sink::drain().sink_map_err(|never| match never {}));
 
@@ -876,7 +874,7 @@ impl DHttpProtocolFactory {
             }
         }
 
-        let connection: Arc<dyn ErasedConnection> = conn.clone();
+        let connection: Arc<dyn quic::DynConnection> = conn.clone();
 
         Ok(DHttpProtocol {
             state: Arc::new(DHttpState::new(self.local_settings.clone())),
@@ -925,7 +923,7 @@ impl<C: ?Sized> ConnectionState<C> {
     }
 }
 
-impl<C: quic::DynLifecycle + Sync + ?Sized> ConnectionState<C> {
+impl<C: quic::DynLifecycle + Sync> ConnectionState<C> {
     pub async fn peer_settings(
         &self,
     ) -> impl Future<Output = Result<Arc<Settings>, quic::ConnectionError>> + Send + use<'_, C>

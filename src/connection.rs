@@ -142,16 +142,13 @@ pub trait LifecycleExt: quic::DynLifecycle + Sync {
 
 impl<T: quic::DynLifecycle + Sync + ?Sized> LifecycleExt for T {}
 
-struct IdentifiedInitializer<C: ?Sized> {
+struct IdentifiedInitializer<C> {
     identity: u64,
     init: Box<dyn InitProtocols<C>>,
 }
 
-impl<C: ?Sized> IdentifiedInitializer<C> {
-    fn new<F: ProductProtocol<C>>(factory: F) -> Self
-    where
-        C: quic::DynConnection,
-    {
+impl<C: quic::Connection> IdentifiedInitializer<C> {
+    fn new<F: ProductProtocol<C>>(factory: F) -> Self {
         let identity = compute_factory_identity::<C, F>(&factory);
         Self {
             identity,
@@ -160,38 +157,38 @@ impl<C: ?Sized> IdentifiedInitializer<C> {
     }
 }
 
-impl<C: ?Sized> Hash for IdentifiedInitializer<C> {
+impl<C> Hash for IdentifiedInitializer<C> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.identity.hash(state);
     }
 }
 
-impl<C: ?Sized> PartialEq for IdentifiedInitializer<C> {
+impl<C> PartialEq for IdentifiedInitializer<C> {
     fn eq(&self, other: &Self) -> bool {
         self.identity == other.identity
     }
 }
 
-impl<C: ?Sized> Eq for IdentifiedInitializer<C> {}
+impl<C> Eq for IdentifiedInitializer<C> {}
 
-impl<C: ?Sized> fmt::Debug for IdentifiedInitializer<C> {
+impl<C> fmt::Debug for IdentifiedInitializer<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&self.init, f)
     }
 }
 
-impl<C: ?Sized> fmt::Display for IdentifiedInitializer<C> {
+impl<C> fmt::Display for IdentifiedInitializer<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.init, f)
     }
 }
 
-pub struct ConnectionBuilder<C: Any + ?Sized> {
+pub struct ConnectionBuilder<C: Any> {
     initializers: Vec<IdentifiedInitializer<C>>,
     _connection: PhantomData<C>,
 }
 
-impl<C: Any + ?Sized> fmt::Debug for ConnectionBuilder<C> {
+impl<C: Any> fmt::Debug for ConnectionBuilder<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectionBuilder")
             .field("protocols", &self.initializers)
@@ -199,7 +196,7 @@ impl<C: Any + ?Sized> fmt::Debug for ConnectionBuilder<C> {
     }
 }
 
-impl<C: Any + ?Sized> fmt::Display for ConnectionBuilder<C> {
+impl<C: Any> fmt::Display for ConnectionBuilder<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ConnectionBuilder[")?;
         for (i, entry) in self.initializers.iter().enumerate() {
@@ -248,7 +245,7 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
     }
 }
 
-impl<C: Any + ?Sized> Hash for ConnectionBuilder<C> {
+impl<C: Any> Hash for ConnectionBuilder<C> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Sort by identity hash for order-independent hashing
         let mut identities: Vec<u64> = self
@@ -263,7 +260,7 @@ impl<C: Any + ?Sized> Hash for ConnectionBuilder<C> {
     }
 }
 
-impl<C: Any + ?Sized> PartialEq for ConnectionBuilder<C> {
+impl<C: Any> PartialEq for ConnectionBuilder<C> {
     fn eq(&self, other: &Self) -> bool {
         if self.initializers.len() != other.initializers.len() {
             return false;
@@ -284,7 +281,7 @@ impl<C: Any + ?Sized> PartialEq for ConnectionBuilder<C> {
     }
 }
 
-impl<C: Any + ?Sized> Eq for ConnectionBuilder<C> {}
+impl<C: Any> Eq for ConnectionBuilder<C> {}
 
 #[derive(Debug)]
 pub struct ConnectionState<C: ?Sized> {
@@ -306,7 +303,7 @@ impl<C: ?Sized> ConnectionState<C> {
     }
 }
 
-impl<C: quic::DynLifecycle + ?Sized> ConnectionState<C> {
+impl<C: quic::DynLifecycle> ConnectionState<C> {
     pub fn check(&self) -> Result<(), quic::ConnectionError> {
         self.quic.check()
     }
@@ -343,35 +340,41 @@ impl<C: quic::ManageStream + quic::Lifecycle + Sync> ConnectionState<C> {
     }
 }
 
-impl<C: quic::DynWithLocalAgent + ?Sized> ConnectionState<C> {
+impl<C: quic::WithLocalAgent> ConnectionState<C> {
     pub async fn local_agent(
         &self,
     ) -> Result<Option<Arc<dyn agent::LocalAgent>>, quic::ConnectionError> {
-        self.quic.local_agent().await
+        quic::WithLocalAgent::local_agent(&*self.quic)
+            .await
+            .map(|opt| opt.map(|a| Arc::new(a) as Arc<dyn agent::LocalAgent>))
     }
 }
 
-impl<C: quic::DynWithRemoteAgent + ?Sized> ConnectionState<C> {
+impl<C: quic::WithRemoteAgent> ConnectionState<C> {
     pub async fn remote_agent(
         &self,
     ) -> Result<Option<Arc<dyn agent::RemoteAgent>>, quic::ConnectionError> {
-        self.quic.remote_agent().await
+        quic::WithRemoteAgent::remote_agent(&*self.quic)
+            .await
+            .map(|opt| opt.map(|a| Arc::new(a) as Arc<dyn agent::RemoteAgent>))
     }
 }
 
-impl<C: quic::DynConnection + ?Sized> ConnectionState<C> {
+impl<C: quic::Connection> ConnectionState<C> {
     async fn accept_bi_stream_task(state: Self) {
         let task = async {
             loop {
-                let (stream_reader, stream_writer) = match state.quic.accept_bi().await {
+                let (reader, writer) = match quic::ManageStream::accept_bi(&*state.quic).await {
                     Ok(bi_stream) => bi_stream,
                     Err(error) => {
                         state.quic.handle_connection_error(error).await;
                         return;
                     }
                 };
-                let stream_reader = StreamReader::new(stream_reader);
-                let stream_writer = SinkWriter::new(stream_writer);
+                let stream_reader =
+                    StreamReader::new(Box::pin(reader) as crate::codec::BoxReadStream);
+                let stream_writer =
+                    SinkWriter::new(Box::pin(writer) as crate::codec::BoxWriteStream);
                 let peekable_bi_stream = (PeekableStreamReader::new(stream_reader), stream_writer);
 
                 match state.protocols.accept_bi(peekable_bi_stream).await {
@@ -406,14 +409,15 @@ impl<C: quic::DynConnection + ?Sized> ConnectionState<C> {
     async fn accept_uni_stream_task(state: Self) {
         let task = async {
             loop {
-                let stream_reader = match state.quic.accept_uni().await {
+                let stream_reader = match quic::ManageStream::accept_uni(&*state.quic).await {
                     Ok(uni_stream) => uni_stream,
                     Err(error) => {
                         state.quic.handle_connection_error(error).await;
                         return;
                     }
                 };
-                let stream_reader = StreamReader::new(stream_reader);
+                let stream_reader =
+                    StreamReader::new(Box::pin(stream_reader) as crate::codec::BoxReadStream);
                 let peekable_uni_stream = PeekableStreamReader::new(stream_reader);
 
                 match state.protocols.accept_uni(peekable_uni_stream).await {
@@ -456,9 +460,9 @@ impl<C: ?Sized> Clone for ConnectionState<C> {
 }
 
 #[derive(Debug)]
-pub struct Connection<C: quic::DynConnection + ?Sized>(ConnectionState<C>);
+pub struct Connection<C: quic::Connection>(ConnectionState<C>);
 
-impl<C: quic::DynConnection + ?Sized> ops::Deref for Connection<C> {
+impl<C: quic::Connection> ops::Deref for Connection<C> {
     type Target = ConnectionState<C>;
 
     #[inline]
@@ -473,14 +477,14 @@ impl<C: quic::Connection> Connection<C> {
     }
 }
 
-impl<C: quic::DynConnection + ?Sized> Connection<C> {
+impl<C: quic::Connection> Connection<C> {
     #[cfg(test)]
     pub(crate) fn from_state_for_test(state: ConnectionState<C>) -> Self {
         Self(state)
     }
 }
 
-impl<C: quic::DynConnection + ?Sized> Drop for Connection<C> {
+impl<C: quic::Connection> Drop for Connection<C> {
     fn drop(&mut self) {
         self.close(Code::H3_NO_ERROR, "no error");
     }
@@ -646,17 +650,9 @@ pub(crate) mod tests {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     pub(crate) struct MockConnectionState {
         terminal_error: crate::util::set_once::SetOnce<quic::ConnectionError>,
-    }
-
-    impl Default for MockConnectionState {
-        fn default() -> Self {
-            Self {
-                terminal_error: crate::util::set_once::SetOnce::new(),
-            }
-        }
     }
 
     #[derive(Debug, Clone, Default)]
@@ -794,7 +790,7 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "dquic")]
-    impl<C: quic::DynConnection + ?Sized> ProductProtocol<C> for MockFactory {
+    impl<C: quic::Connection> ProductProtocol<C> for MockFactory {
         type Protocol = MockProtocol;
 
         fn init<'a>(

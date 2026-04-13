@@ -17,7 +17,7 @@
 //!
 //! After initialization, the generic transport type `C` is erased. Runtime protocol
 //! objects store any connection capabilities they need internally (typically as
-//! `Arc<dyn ErasedConnection>` or equivalent trait objects).
+//! `Arc<dyn quic::DynConnection>` or equivalent trait objects).
 //!
 //! # Handler access pattern
 //!
@@ -57,7 +57,7 @@
 //!    streams. Per-request or per-session state should be produced by handler-facing
 //!    methods (e.g. `create_session(stream_id)`) rather than stored in [`Protocols`].
 //! 4. Erase transport-specific types at the boundary: use [`crate::codec::BoxReadStream`],
-//!    [`crate::codec::BoxWriteStream`], or [`crate::runtime::ErasedConnection`] to hold
+//!    [`crate::codec::BoxWriteStream`], or [`crate::quic::DynConnection`] to hold
 //!    connection capabilities without leaking generic `C`.
 
 use std::{
@@ -191,7 +191,7 @@ impl Protocols {
     }
 }
 
-pub trait ProductProtocol<C: quic::DynConnection + ?Sized>:
+pub trait ProductProtocol<C: quic::Connection>:
     Any + Send + Sync + Hash + Eq + fmt::Display + fmt::Debug
 {
     type Protocol: Protocol;
@@ -203,7 +203,7 @@ pub trait ProductProtocol<C: quic::DynConnection + ?Sized>:
     ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>>;
 }
 
-pub(crate) trait InitProtocols<C: quic::DynConnection + ?Sized>:
+pub(crate) trait InitProtocols<C: quic::Connection>:
     Send + Sync + fmt::Display + fmt::Debug
 {
     fn init_protocols<'a>(
@@ -213,7 +213,7 @@ pub(crate) trait InitProtocols<C: quic::DynConnection + ?Sized>:
     ) -> BoxFuture<'a, Result<(), ConnectionError>>;
 }
 
-impl<C: quic::DynConnection + ?Sized, P: ProductProtocol<C>> InitProtocols<C> for P {
+impl<C: quic::Connection, P: ProductProtocol<C>> InitProtocols<C> for P {
     fn init_protocols<'a>(
         &'a self,
         conn: &'a Arc<C>,
@@ -235,7 +235,7 @@ impl<C: quic::DynConnection + ?Sized, P: ProductProtocol<C>> InitProtocols<C> fo
 
 /// Computes a deterministic identity hash for a `ProductProtocol` factory,
 /// combining its `TypeId` and value hash.
-pub(crate) fn compute_factory_identity<C: quic::DynConnection + ?Sized, F: ProductProtocol<C>>(
+pub(crate) fn compute_factory_identity<C: quic::Connection, F: ProductProtocol<C>>(
     factory: &F,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -310,7 +310,7 @@ mod tests {
         }
     }
 
-    impl<C: quic::DynConnection + ?Sized> ProductProtocol<C> for MockFactory {
+    impl<C: quic::Connection> ProductProtocol<C> for MockFactory {
         type Protocol = MockProtocol;
 
         fn init<'a>(
@@ -352,7 +352,7 @@ mod tests {
         }
     }
 
-    impl<C: quic::DynConnection + ?Sized> ProductProtocol<C> for MockFactory2 {
+    impl<C: quic::Connection> ProductProtocol<C> for MockFactory2 {
         type Protocol = MockProtocol2;
 
         fn init<'a>(
@@ -364,7 +364,7 @@ mod tests {
         }
     }
 
-    fn compute_identity<C: quic::DynConnection + ?Sized, F: ProductProtocol<C>>(f: &F) -> u64 {
+    fn compute_identity<C: quic::Connection, F: ProductProtocol<C>>(f: &F) -> u64 {
         compute_factory_identity::<C, F>(f)
     }
 

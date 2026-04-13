@@ -495,7 +495,6 @@ mod tests {
         protocol::Protocols,
         qpack::protocol::{QPackDecoder, QPackEncoder},
         quic,
-        runtime::ErasedConnection,
         varint::VarInt,
     };
 
@@ -627,7 +626,7 @@ mod tests {
     #[tokio::test]
     async fn read_stream_try_stream_io_aborts_when_peer_goaway_covers_stream() {
         let quic = Arc::new(MockConnection::new());
-        let erased_connection: Arc<dyn ErasedConnection> = quic.clone();
+        let erased_connection: Arc<dyn quic::DynConnection> = quic.clone();
         let connection: Arc<dyn quic::DynLifecycle + Send + Sync> = quic.clone();
 
         let mut protocols = Protocols::new();
@@ -671,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn write_stream_try_stream_io_aborts_when_peer_goaway_covers_stream() {
         let quic = Arc::new(MockConnection::new());
-        let erased_connection: Arc<dyn ErasedConnection> = quic.clone();
+        let erased_connection: Arc<dyn quic::DynConnection> = quic.clone();
         let connection: Arc<dyn quic::DynLifecycle + Send + Sync> = quic.clone();
 
         let mut protocols = Protocols::new();
