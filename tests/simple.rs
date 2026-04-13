@@ -207,6 +207,13 @@ fn missing_server_name_closes_connection_with_no_error() {
                 } => {
                     assert_eq!(kind, VarInt::from_u32(0x0c));
                 }
+                // Stream reset with H3_NO_ERROR: race between GuardedQuicWriter drop
+                // (RESET_STREAM) and connection close (CONNECTION_CLOSE). Both are valid.
+                h3x::client::RequestError::ResponseStream {
+                    source: quic::StreamError::Reset { code },
+                } => {
+                    assert_eq!(code, Code::H3_NO_ERROR.into_inner());
+                }
                 other => panic!(
                     "expected response stream close from missing-server-name connection close, got: {other:?}"
                 ),
