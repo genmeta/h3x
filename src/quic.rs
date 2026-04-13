@@ -281,6 +281,23 @@ impl<T: WithRemoteAgent> DynWithRemoteAgent for T {
 /// AFIT version of connection lifecycle management.
 ///
 /// Only `closed()` benefits from AFIT; `close()` and `check()` are synchronous.
+///
+/// # Error latching contract
+///
+/// A connection has a single terminal error. Once **any** operation on the same
+/// connection — including [`ManageStream`], [`WithLocalAgent`],
+/// [`WithRemoteAgent`], or [`Lifecycle`] methods — returns a
+/// [`ConnectionError`] (directly, or wrapped in
+/// [`StreamError::Connection`]), the connection is considered dead and:
+///
+/// * [`check()`](Lifecycle::check) **must** return `Err` with the same error on
+///   every subsequent call.
+/// * [`closed()`](Lifecycle::closed) **must** resolve immediately (without
+///   blocking) and yield the same error.
+///
+/// Implementations are responsible for latching the first observed
+/// `ConnectionError` internally so that callers never see a transient "healthy"
+/// state after a failure has already been observed.
 pub trait Lifecycle: Send + Sync {
     fn close(&self, code: Code, reason: Cow<'static, str>);
 
@@ -288,11 +305,19 @@ pub trait Lifecycle: Send + Sync {
     ///
     /// Returns `Ok(())` if the connection is alive and can be reused,
     /// or `Err(ConnectionError)` if the connection is dead.
+    ///
+    /// Once this method (or any other connection operation) has returned
+    /// `Err(ConnectionError)`, all future calls **must** return `Err` with
+    /// the same error.
     fn check(&self) -> Result<(), ConnectionError>;
 
     /// Wait for the connection to close.
     ///
     /// Returns the error that caused the connection to terminate.
+    ///
+    /// This method **must** be idempotent: after the connection has terminated,
+    /// every call must resolve immediately and return the same error that
+    /// [`check()`](Lifecycle::check) would return.
     fn closed(&self) -> impl Future<Output = ConnectionError> + Send + '_;
 }
 

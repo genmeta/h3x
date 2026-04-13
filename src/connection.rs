@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use futures::{FutureExt, future::BoxFuture};
+use futures::future::BoxFuture;
 use snafu::Snafu;
 use tracing::Instrument;
 
@@ -21,7 +21,6 @@ use crate::{
     },
     qpack::protocol::QPackProtocolFactory,
     quic::{self, CancelStreamExt, StopStreamExt, agent},
-    util::watch::Watch,
     varint::VarInt,
 };
 
@@ -206,12 +205,7 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
         }
 
         let protocols = Arc::new(protocols);
-        let state = ConnectionState {
-            quic,
-            protocols,
-            terminal_error: Watch::new(),
-        };
-        tokio::spawn(ConnectionState::observe_close_task(state.clone()).in_current_span());
+        let state = ConnectionState { quic, protocols };
         tokio::spawn(ConnectionState::accept_uni_stream_task(state.clone()).in_current_span());
         tokio::spawn(ConnectionState::accept_bi_stream_task(state.clone()).in_current_span());
 
@@ -261,7 +255,6 @@ impl<C: Any + ?Sized> Eq for ConnectionBuilder<C> {}
 pub struct ConnectionState<C: ?Sized> {
     quic: Arc<C>,
     protocols: Arc<Protocols>,
-    terminal_error: Watch<quic::ConnectionError>,
 }
 
 impl<C: ?Sized> ConnectionState<C> {
@@ -276,63 +269,24 @@ impl<C: ?Sized> ConnectionState<C> {
     pub fn protocols(&self) -> &Arc<Protocols> {
         &self.protocols
     }
-
-    fn record_terminal_error(&self, error: quic::ConnectionError) {
-        self.terminal_error.set(error);
-    }
 }
 
 impl<C: quic::DynLifecycle + ?Sized> ConnectionState<C> {
-    /// Returns locally observed connection health.
-    ///
-    /// This is a synchronous, deterministic view of whether this process has
-    /// already observed the connection to fail. Terminal errors are latched the
-    /// first time they are seen, so later `check()` calls do not rely on async RPC.
     pub fn check(&self) -> Result<(), quic::ConnectionError> {
-        if let Some(error) = self.terminal_error.peek() {
-            return Err(error);
-        }
-
-        match self.quic.check() {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.record_terminal_error(error.clone());
-                Err(error)
-            }
-        }
+        self.quic.check()
     }
 
     pub fn closed(&self) -> BoxFuture<'_, quic::ConnectionError> {
-        let terminal_error = self.terminal_error.clone();
-        if let Some(error) = terminal_error.peek() {
-            return futures::future::ready(error).boxed();
-        }
-
-        self.quic
-            .closed()
-            .map(move |error| {
-                terminal_error.set(error.clone());
-                error
-            })
-            .boxed()
+        self.quic.closed()
     }
 
     pub fn close(&self, code: Code, reason: impl Into<std::borrow::Cow<'static, str>>) {
         self.quic.close(code, reason.into());
     }
 
-    async fn observe_close_task(state: Self) {
-        let error = state.quic.closed().await;
-        state.record_terminal_error(error);
-    }
-
     #[cfg(test)]
     pub(crate) fn new_for_test(quic: Arc<C>, protocols: Arc<Protocols>) -> Self {
-        Self {
-            quic,
-            protocols,
-            terminal_error: Watch::new(),
-        }
+        Self { quic, protocols }
     }
 }
 
@@ -342,22 +296,14 @@ impl<C: quic::ManageStream + quic::Lifecycle + Sync> ConnectionState<C> {
     ) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
         match { self.quic.open_bi() }.await {
             Ok(streams) => Ok(streams),
-            Err(error) => {
-                let error = self.quic.handle_connection_error(error).await;
-                self.record_terminal_error(error.clone());
-                Err(error)
-            }
+            Err(error) => Err(self.quic.handle_connection_error(error).await),
         }
     }
 
     pub async fn open_uni(&self) -> Result<C::StreamWriter, quic::ConnectionError> {
         match { self.quic.open_uni() }.await {
             Ok(stream) => Ok(stream),
-            Err(error) => {
-                let error = self.quic.handle_connection_error(error).await;
-                self.record_terminal_error(error.clone());
-                Err(error)
-            }
+            Err(error) => Err(self.quic.handle_connection_error(error).await),
         }
     }
 }
@@ -366,13 +312,7 @@ impl<C: quic::DynWithLocalAgent + ?Sized> ConnectionState<C> {
     pub async fn local_agent(
         &self,
     ) -> Result<Option<Arc<dyn agent::LocalAgent>>, quic::ConnectionError> {
-        match self.quic.local_agent().await {
-            Ok(option) => Ok(option),
-            Err(error) => {
-                self.record_terminal_error(error.clone());
-                Err(error)
-            }
-        }
+        self.quic.local_agent().await
     }
 }
 
@@ -380,13 +320,7 @@ impl<C: quic::DynWithRemoteAgent + ?Sized> ConnectionState<C> {
     pub async fn remote_agent(
         &self,
     ) -> Result<Option<Arc<dyn agent::RemoteAgent>>, quic::ConnectionError> {
-        match self.quic.remote_agent().await {
-            Ok(option) => Ok(option),
-            Err(error) => {
-                self.record_terminal_error(error.clone());
-                Err(error)
-            }
-        }
+        self.quic.remote_agent().await
     }
 }
 
@@ -397,8 +331,7 @@ impl<C: quic::DynConnection + ?Sized> ConnectionState<C> {
                 let (stream_reader, stream_writer) = match state.quic.accept_bi().await {
                     Ok(bi_stream) => bi_stream,
                     Err(error) => {
-                        let error = state.quic.handle_connection_error(error).await;
-                        state.record_terminal_error(error);
+                        state.quic.handle_connection_error(error).await;
                         return;
                     }
                 };
@@ -441,8 +374,7 @@ impl<C: quic::DynConnection + ?Sized> ConnectionState<C> {
                 let stream_reader = match state.quic.accept_uni().await {
                     Ok(uni_stream) => uni_stream,
                     Err(error) => {
-                        let error = state.quic.handle_connection_error(error).await;
-                        state.record_terminal_error(error);
+                        state.quic.handle_connection_error(error).await;
                         return;
                     }
                 };
@@ -484,7 +416,6 @@ impl<C: ?Sized> Clone for ConnectionState<C> {
         Self {
             quic: self.quic.clone(),
             protocols: self.protocols.clone(),
-            terminal_error: self.terminal_error.clone(),
         }
     }
 }
@@ -528,11 +459,7 @@ pub(crate) mod tests {
         fmt,
         hash::{Hash, Hasher},
     };
-    use std::{
-        future::pending,
-        pin::Pin,
-        sync::{Arc, Mutex},
-    };
+    use std::{future::pending, pin::Pin, sync::Arc};
 
     use bytes::Bytes;
     use futures::{Sink, future::BoxFuture, stream::Stream};
@@ -686,15 +613,13 @@ pub(crate) mod tests {
 
     #[derive(Debug)]
     pub(crate) struct MockConnectionState {
-        check_result: Mutex<Result<(), quic::ConnectionError>>,
-        closed_error: Mutex<Option<quic::ConnectionError>>,
+        terminal_error: crate::util::set_once::SetOnce<quic::ConnectionError>,
     }
 
     impl Default for MockConnectionState {
         fn default() -> Self {
             Self {
-                check_result: Mutex::new(Ok(())),
-                closed_error: Mutex::new(None),
+                terminal_error: crate::util::set_once::SetOnce::new(),
             }
         }
     }
@@ -709,12 +634,8 @@ pub(crate) mod tests {
             Self::default()
         }
 
-        pub(crate) fn set_check_result(&self, result: Result<(), quic::ConnectionError>) {
-            *self.state.check_result.lock().unwrap() = result;
-        }
-
-        pub(crate) fn set_closed_error(&self, error: quic::ConnectionError) {
-            *self.state.closed_error.lock().unwrap() = Some(error);
+        pub(crate) fn set_terminal_error(&self, error: quic::ConnectionError) {
+            let _ = self.state.terminal_error.set(error);
         }
     }
 
@@ -763,12 +684,14 @@ pub(crate) mod tests {
         fn close(&self, _code: crate::error::Code, _reason: std::borrow::Cow<'static, str>) {}
 
         fn check(&self) -> Result<(), ConnectionError> {
-            self.state.check_result.lock().unwrap().clone()
+            match self.state.terminal_error.peek() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
 
         async fn closed(&self) -> ConnectionError {
-            let closed_error = self.state.closed_error.lock().unwrap().clone();
-            match closed_error {
+            match self.state.terminal_error.get().await {
                 Some(error) => error,
                 None => pending().await,
             }
@@ -1002,14 +925,22 @@ pub(crate) mod tests {
         let state = ConnectionState::new_for_test(Arc::new(quic.clone()), protocols);
         let expected = test_connection_error("closed");
 
-        quic.set_check_result(Ok(()));
-        quic.set_closed_error(expected.clone());
+        // Initially healthy.
+        assert!(state.check().is_ok());
 
+        // Simulate connection death at the QUIC layer.
+        quic.set_terminal_error(expected.clone());
+
+        // check() sees the latched error.
+        let check_error = state.check().expect_err("should be dead");
+        assert_transport_reason(&check_error, "closed");
+
+        // closed() returns the same error immediately.
         let observed = futures::executor::block_on(state.closed());
         assert_transport_reason(&observed, "closed");
 
-        quic.set_check_result(Ok(()));
-        let check_error = state.check().expect_err("closed error should be latched");
-        assert_transport_reason(&check_error, "closed");
+        // Subsequent check() still returns the same error.
+        let check_again = state.check().expect_err("still dead");
+        assert_transport_reason(&check_again, "closed");
     }
 }

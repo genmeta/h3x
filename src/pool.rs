@@ -375,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn reuse_returns_none_when_connection_is_unhealthy() {
         let quic = crate::connection::tests::MockConnection::new();
-        quic.set_check_result(Err(test_connection_error("broken")));
+        quic.set_terminal_error(test_connection_error("broken"));
 
         let state = ConnectionState::new_for_test(
             Arc::new(quic),
@@ -389,7 +389,6 @@ mod tests {
     #[tokio::test]
     async fn pool_reuse_returns_none_after_peer_goaway_observed() {
         let quic = crate::connection::tests::MockConnection::new();
-        quic.set_check_result(Ok(()));
 
         let protocols = {
             let mut protocols = crate::protocol::Protocols::new();

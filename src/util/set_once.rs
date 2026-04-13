@@ -21,6 +21,12 @@ impl<T> Clone for SetOnce<T> {
     }
 }
 
+impl<T> Default for SetOnce<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> SetOnce<T> {
     pub fn new() -> Self {
         Self {
