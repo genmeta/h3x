@@ -142,22 +142,59 @@ pub trait LifecycleExt: quic::DynLifecycle + Sync {
 
 impl<T: quic::DynLifecycle + Sync + ?Sized> LifecycleExt for T {}
 
+struct IdentifiedInitializer<C: ?Sized> {
+    identity: u64,
+    init: Box<dyn InitProtocols<C>>,
+}
+
+impl<C: ?Sized> IdentifiedInitializer<C> {
+    fn new<F: ProductProtocol<C>>(factory: F) -> Self
+    where
+        C: quic::DynConnection,
+    {
+        let identity = compute_factory_identity::<C, F>(&factory);
+        Self {
+            identity,
+            init: Box::new(factory),
+        }
+    }
+}
+
+impl<C: ?Sized> Hash for IdentifiedInitializer<C> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.identity.hash(state);
+    }
+}
+
+impl<C: ?Sized> PartialEq for IdentifiedInitializer<C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl<C: ?Sized> Eq for IdentifiedInitializer<C> {}
+
+impl<C: ?Sized> fmt::Debug for IdentifiedInitializer<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.init, f)
+    }
+}
+
+impl<C: ?Sized> fmt::Display for IdentifiedInitializer<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.init, f)
+    }
+}
+
 pub struct ConnectionBuilder<C: Any + ?Sized> {
-    protocols_initializers: Vec<(u64, Box<dyn InitProtocols<C>>)>,
+    initializers: Vec<IdentifiedInitializer<C>>,
     _connection: PhantomData<C>,
 }
 
 impl<C: Any + ?Sized> fmt::Debug for ConnectionBuilder<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectionBuilder")
-            .field(
-                "protocols",
-                &self
-                    .protocols_initializers
-                    .iter()
-                    .map(|(_, init)| format!("{}", init))
-                    .collect::<Vec<_>>(),
-            )
+            .field("protocols", &self.initializers)
             .finish()
     }
 }
@@ -165,11 +202,11 @@ impl<C: Any + ?Sized> fmt::Debug for ConnectionBuilder<C> {
 impl<C: Any + ?Sized> fmt::Display for ConnectionBuilder<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ConnectionBuilder[")?;
-        for (i, (_, init)) in self.protocols_initializers.iter().enumerate() {
+        for (i, entry) in self.initializers.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{}", init)?;
+            write!(f, "{}", entry)?;
         }
         write!(f, "]")
     }
@@ -178,7 +215,7 @@ impl<C: Any + ?Sized> fmt::Display for ConnectionBuilder<C> {
 impl<C: quic::Connection> ConnectionBuilder<C> {
     pub fn new(settings: Arc<Settings>) -> Self {
         let builder = Self {
-            protocols_initializers: Vec::new(),
+            initializers: Vec::new(),
             _connection: PhantomData,
         };
         builder
@@ -187,9 +224,7 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
     }
 
     pub fn protocol<F: ProductProtocol<C>>(mut self, factory: F) -> Self {
-        let identity = compute_factory_identity::<C, F>(&factory);
-        self.protocols_initializers
-            .push((identity, Box::new(factory)));
+        self.initializers.push(IdentifiedInitializer::new(factory));
         self
     }
 
@@ -200,8 +235,8 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
         let quic = Arc::new(quic);
         let mut protocols = Protocols::new();
 
-        for (_identity, initializer) in &self.protocols_initializers {
-            initializer.init_protocols(&quic, &mut protocols).await?;
+        for entry in &self.initializers {
+            entry.init.init_protocols(&quic, &mut protocols).await?;
         }
 
         let protocols = Arc::new(protocols);
@@ -217,9 +252,9 @@ impl<C: Any + ?Sized> Hash for ConnectionBuilder<C> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Sort by identity hash for order-independent hashing
         let mut identities: Vec<u64> = self
-            .protocols_initializers
+            .initializers
             .iter()
-            .map(|(id, _)| *id)
+            .map(|entry| entry.identity)
             .collect();
         identities.sort();
         for id in &identities {
@@ -230,18 +265,18 @@ impl<C: Any + ?Sized> Hash for ConnectionBuilder<C> {
 
 impl<C: Any + ?Sized> PartialEq for ConnectionBuilder<C> {
     fn eq(&self, other: &Self) -> bool {
-        if self.protocols_initializers.len() != other.protocols_initializers.len() {
+        if self.initializers.len() != other.initializers.len() {
             return false;
         }
         let mut self_ids: Vec<u64> = self
-            .protocols_initializers
+            .initializers
             .iter()
-            .map(|(id, _)| *id)
+            .map(|entry| entry.identity)
             .collect();
         let mut other_ids: Vec<u64> = other
-            .protocols_initializers
+            .initializers
             .iter()
-            .map(|(id, _)| *id)
+            .map(|entry| entry.identity)
             .collect();
         self_ids.sort();
         other_ids.sort();
@@ -813,7 +848,7 @@ pub(crate) mod tests {
         // b: MockFactory first, then DHttpProtocolFactory, QPackProtocolFactory
         let b = {
             let builder = ConnectionBuilder::<C> {
-                protocols_initializers: Vec::new(),
+                initializers: Vec::new(),
                 _connection: std::marker::PhantomData,
             };
             builder
