@@ -5,7 +5,7 @@
 //! the layered stream routing architecture.
 
 use std::{
-    ops,
+    fmt, ops,
     pin::{Pin, pin},
     sync::Arc,
 };
@@ -831,6 +831,12 @@ impl Protocol for DHttpProtocol {
 #[derive(Default, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct DHttpProtocolFactory {
     local_settings: Arc<Settings>,
+}
+
+impl fmt::Display for DHttpProtocolFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DHTTP/3")
+    }
 }
 
 impl DHttpProtocolFactory {

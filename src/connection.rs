@@ -151,8 +151,28 @@ pub struct ConnectionBuilder<C: Any + ?Sized> {
 impl<C: Any + ?Sized> fmt::Debug for ConnectionBuilder<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectionBuilder")
-            .field("protocols_count", &self.protocols_initializers.len())
+            .field(
+                "protocols",
+                &self
+                    .protocols_initializers
+                    .iter()
+                    .map(|(_, init)| format!("{}", init))
+                    .collect::<Vec<_>>(),
+            )
             .finish()
+    }
+}
+
+impl<C: Any + ?Sized> fmt::Display for ConnectionBuilder<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ConnectionBuilder[")?;
+        for (i, (_, init)) in self.protocols_initializers.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{}", init)?;
+        }
+        write!(f, "]")
     }
 }
 
@@ -505,6 +525,7 @@ pub(crate) mod tests {
     #[cfg(feature = "dquic")]
     use std::{
         collections::hash_map::DefaultHasher,
+        fmt,
         hash::{Hash, Hasher},
     };
     use std::{
@@ -806,6 +827,13 @@ pub(crate) mod tests {
     #[cfg(feature = "dquic")]
     #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
     struct MockFactory(u64);
+
+    #[cfg(feature = "dquic")]
+    impl fmt::Display for MockFactory {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "MockFactory")
+        }
+    }
 
     #[cfg(feature = "dquic")]
     impl<C: quic::DynConnection + ?Sized> ProductProtocol<C> for MockFactory {

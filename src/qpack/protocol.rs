@@ -5,6 +5,7 @@
 //! the layered stream routing architecture.
 
 use std::{
+    fmt,
     pin::Pin,
     sync::{Arc, Mutex},
 };
@@ -182,6 +183,12 @@ impl Protocol for QPackProtocol {
 #[derive(Default, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct QPackProtocolFactory {
     // No state for now, but can add config options here in the future.
+}
+
+impl fmt::Display for QPackProtocolFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "QPACK")
+    }
 }
 
 impl QPackProtocolFactory {

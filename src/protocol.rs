@@ -63,7 +63,7 @@
 use std::{
     any::{Any, TypeId},
     collections::{HashMap, hash_map::DefaultHasher},
-    fmt::Debug,
+    fmt::{self, Debug},
     hash::{Hash, Hasher},
     pin::Pin,
     sync::Arc,
@@ -191,7 +191,9 @@ impl Protocols {
     }
 }
 
-pub trait ProductProtocol<C: quic::DynConnection + ?Sized>: Any + Send + Sync + Hash + Eq {
+pub trait ProductProtocol<C: quic::DynConnection + ?Sized>:
+    Any + Send + Sync + Hash + Eq + fmt::Display + fmt::Debug
+{
     type Protocol: Protocol;
 
     fn init<'a>(
@@ -201,7 +203,9 @@ pub trait ProductProtocol<C: quic::DynConnection + ?Sized>: Any + Send + Sync + 
     ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>>;
 }
 
-pub(crate) trait InitProtocols<C: quic::DynConnection + ?Sized>: Send + Sync {
+pub(crate) trait InitProtocols<C: quic::DynConnection + ?Sized>:
+    Send + Sync + fmt::Display + fmt::Debug
+{
     fn init_protocols<'a>(
         &'a self,
         conn: &'a Arc<C>,
@@ -300,6 +304,12 @@ mod tests {
     #[derive(Debug, Clone, Hash, PartialEq, Eq)]
     struct MockFactory(u64);
 
+    impl fmt::Display for MockFactory {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "MockFactory")
+        }
+    }
+
     impl<C: quic::DynConnection + ?Sized> ProductProtocol<C> for MockFactory {
         type Protocol = MockProtocol;
 
@@ -315,6 +325,12 @@ mod tests {
     /// Second mock for cross-type tests.
     #[derive(Debug, Clone, Hash, PartialEq, Eq)]
     struct MockFactory2(u64);
+
+    impl fmt::Display for MockFactory2 {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "MockFactory2")
+        }
+    }
 
     // Use a different protocol type to avoid TypeId collision on Protocol.
     #[derive(Debug)]
