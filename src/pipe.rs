@@ -45,24 +45,3 @@ pub use codec::{Frame, PipeCodec};
 pub use fd_channel::{FdChannel, RecvFdsError, SendFdsError};
 pub use reader::PipeReader;
 pub use writer::PipeWriter;
-
-use crate::{
-    quic::{self, ConnectionError},
-    util::set_once::SetOnce,
-};
-
-/// Return the latched connection error if available, otherwise a synthetic
-/// application error carrying `H3_CLOSED_CRITICAL_STREAM`.
-pub(crate) fn connection_error_or_fallback(
-    terminal: &SetOnce<ConnectionError>,
-    reason: &str,
-) -> ConnectionError {
-    terminal
-        .peek()
-        .unwrap_or_else(|| ConnectionError::Application {
-            source: quic::ApplicationError {
-                code: crate::error::Code::H3_CLOSED_CRITICAL_STREAM,
-                reason: reason.to_owned().into(),
-            },
-        })
-}

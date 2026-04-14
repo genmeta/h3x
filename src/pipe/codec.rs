@@ -7,10 +7,11 @@
 //! # Frame types
 //!
 //! ```text
-//! DATA       = type(varint 0x00) + length(varint) + payload
-//! STOP       = type(varint 0x01) + code(varint)
-//! CANCEL     = type(varint 0x02) + code(varint)
-//! CONN_CLOSED = type(varint 0x03)
+//! PULL        = type(varint 0x00)
+//! DATA        = type(varint 0x01) + length(varint) + payload
+//! STOP        = type(varint 0x02) + code(varint)
+//! CANCEL      = type(varint 0x03) + code(varint)
+//! CONN_CLOSED = type(varint 0x04)
 //! ```
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -19,14 +20,18 @@ use tokio_util::codec::{Decoder, Encoder};
 use crate::varint::VarInt;
 
 /// Frame type tags.
-const TAG_DATA: u8 = 0x00;
-const TAG_STOP: u8 = 0x01;
-const TAG_CANCEL: u8 = 0x02;
-const TAG_CONN_CLOSED: u8 = 0x03;
+const TAG_PULL: u8 = 0x00;
+const TAG_DATA: u8 = 0x01;
+const TAG_STOP: u8 = 0x02;
+const TAG_CANCEL: u8 = 0x03;
+const TAG_CONN_CLOSED: u8 = 0x04;
 
 /// Frames exchanged over a per-stream socketpair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
+    /// Flow-control signal — reader grants the writer permission to send one
+    /// DATA frame.
+    Pull,
     /// Stream data payload.
     Data(Bytes),
     /// STOP_SENDING — reader asks the remote writer to stop (carries error code).
@@ -117,7 +122,7 @@ impl Decoder for PipeCodec {
                     if src.is_empty() {
                         return Ok(None);
                     }
-                    // Peek at the tag byte (first byte is always a 1-byte varint for 0x00..0x03).
+                    // Peek at the tag byte (first byte is always a 1-byte varint for 0x00..0x04).
                     let tag = src[0];
                     match tag {
                         TAG_DATA => {
@@ -145,6 +150,10 @@ impl Decoder for PipeCodec {
                             let data = src.split_to(len).freeze();
                             // state stays Tag for next frame
                             return Ok(Some(Frame::Data(data)));
+                        }
+                        TAG_PULL => {
+                            src.advance(1);
+                            return Ok(Some(Frame::Pull));
                         }
                         TAG_STOP | TAG_CANCEL => {
                             self.state = DecodeState::Control { tag };
@@ -189,6 +198,10 @@ impl Encoder<Frame> for PipeCodec {
 
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), CodecError> {
         match item {
+            Frame::Pull => {
+                dst.reserve(1);
+                dst.put_u8(TAG_PULL);
+            }
             Frame::Data(data) => {
                 let len = VarInt::try_from(data.len()).map_err(|_| CodecError::VarIntOverflow)?;
                 dst.reserve(1 + len.encoding_size() + data.len());
@@ -241,6 +254,11 @@ mod tests {
     }
 
     #[test]
+    fn pull_frame_round_trip() {
+        round_trip(Frame::Pull);
+    }
+
+    #[test]
     fn stop_frame_round_trip() {
         round_trip(Frame::Stop(VarInt::from_u32(0x42)));
     }
@@ -267,6 +285,7 @@ mod tests {
         let mut buf = BytesMut::new();
 
         let frames = vec![
+            Frame::Pull,
             Frame::Data(Bytes::from_static(b"first")),
             Frame::Stop(VarInt::from_u32(1)),
             Frame::Data(Bytes::from_static(b"second")),

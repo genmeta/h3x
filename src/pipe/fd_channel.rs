@@ -1,4 +1,4 @@
-//! [`FdChannel`] — high-performance FD passing over `SOCK_SEQPACKET`.
+//! [`FdChannel`] — high-performance async FD passing over `SOCK_SEQPACKET`.
 //!
 //! Transfers file descriptors (pipe/socketpair endpoints) between processes via
 //! `SCM_RIGHTS` ancillary messages.  Each SEQPACKET message carries:
@@ -9,24 +9,43 @@
 //! The SEQPACKET message boundary naturally frames each (stream_id, fds) pair,
 //! so no additional length-delimited framing is needed.
 
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::{
+    io::{self, IoSlice, IoSliceMut},
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
+};
 
 use snafu::ResultExt;
+use tokio_seqpacket::{
+    UnixSeqpacket,
+    ancillary::{AddControlMessageError, AncillaryMessageWriter, OwnedAncillaryMessage},
+};
 
-use crate::varint::VarInt;
+use crate::{
+    codec::{DecodeFrom, EncodeInto},
+    varint::VarInt,
+};
 
 /// Maximum number of FDs per message (bidi stream = 2 socketpairs = 4 FDs).
 const MAX_FDS_PER_MSG: usize = 4;
 
 /// Maximum data payload per message (VarInt is at most 8 bytes).
-const MAX_DATA_LEN: usize = 8;
+const MAX_DATA_LEN: usize = VarInt::MAX_SIZE * 2;
+
+/// Ancillary buffer size: `CMSG_SPACE(MAX_FDS_PER_MSG * sizeof(RawFd))`.
+/// 64 bytes is more than enough for 4 file descriptors.
+const ANCILLARY_BUF_LEN: usize =
+    MAX_FDS_PER_MSG * std::mem::size_of::<std::os::unix::prelude::RawFd>();
 
 /// Error from [`FdChannel::send`].
 #[derive(Debug, snafu::Snafu)]
 #[snafu(module)]
 pub enum SendFdsError {
+    #[snafu(display("failed to encode stream id"))]
+    EncodeStreamId { source: io::Error },
+    #[snafu(display("failed to add file descriptors to ancillary message"))]
+    AddFds { source: AddControlMessageError },
     #[snafu(display("failed to send message via seqpacket"))]
-    Send { source: nix::Error },
+    Send { source: io::Error },
 }
 
 /// Error from [`FdChannel::recv`].
@@ -34,143 +53,88 @@ pub enum SendFdsError {
 #[snafu(module)]
 pub enum RecvFdsError {
     #[snafu(display("failed to receive message via seqpacket"))]
-    Recv { source: nix::Error },
-    #[snafu(display("failed to parse control messages"))]
-    ParseCmsg { source: nix::Error },
+    Recv { source: io::Error },
     #[snafu(display("no file descriptors in received message"))]
     NoFds,
-    #[snafu(display("incomplete varint in message data"))]
-    IncompleteVarInt,
+    #[snafu(display("failed to decode stream id"))]
+    DecodeStreamId { source: io::Error },
     #[snafu(display("channel closed by remote end"))]
     Closed,
-}
-
-/// Encode a QUIC VarInt into a small stack buffer, returning the number of
-/// bytes written.
-fn encode_varint(buf: &mut [u8; MAX_DATA_LEN], v: VarInt) -> usize {
-    let x = v.into_inner();
-    if x < (1 << 6) {
-        buf[0] = x as u8;
-        1
-    } else if x < (1 << 14) {
-        let val = (0b01u16 << 14) | x as u16;
-        buf[..2].copy_from_slice(&val.to_be_bytes());
-        2
-    } else if x < (1 << 30) {
-        let val = (0b10u32 << 30) | x as u32;
-        buf[..4].copy_from_slice(&val.to_be_bytes());
-        4
-    } else {
-        let val = (0b11u64 << 62) | x;
-        buf[..8].copy_from_slice(&val.to_be_bytes());
-        8
-    }
-}
-
-/// Decode a QUIC VarInt from a byte slice.
-fn decode_varint(buf: &[u8]) -> Result<VarInt, RecvFdsError> {
-    if buf.is_empty() {
-        return Err(RecvFdsError::IncompleteVarInt);
-    }
-    let first = buf[0];
-    let len = 1usize << (first >> 6);
-    if buf.len() < len {
-        return Err(RecvFdsError::IncompleteVarInt);
-    }
-    let mut raw = [0u8; 8];
-    raw[..len].copy_from_slice(&buf[..len]);
-    raw[0] &= 0x3f;
-    let value = u64::from_be_bytes(raw) >> (8 * (8 - len));
-    // SAFETY: value < 2^62 because we masked the two high bits.
-    Ok(unsafe { VarInt::from_u64_unchecked(value) })
 }
 
 /// A channel for passing file descriptors between processes using
 /// `SOCK_SEQPACKET` and `SCM_RIGHTS`.
 ///
-/// This type wraps a raw `OwnedFd` of a `SOCK_SEQPACKET` Unix socket.
+/// This type wraps a [`UnixSeqpacket`] socket from `tokio-seqpacket`.
 /// It does **not** create any FDs itself — it only transfers them.
 pub struct FdChannel {
-    fd: OwnedFd,
+    socket: UnixSeqpacket,
 }
 
 impl FdChannel {
-    /// Wrap an existing `SOCK_SEQPACKET` socket.
-    pub fn new(fd: OwnedFd) -> Self {
-        Self { fd }
+    /// Wrap an existing [`UnixSeqpacket`] socket.
+    pub fn new(socket: UnixSeqpacket) -> Self {
+        Self { socket }
+    }
+
+    /// Create a connected pair of `FdChannel`s.
+    pub fn pair() -> io::Result<(Self, Self)> {
+        let (a, b) = UnixSeqpacket::pair()?;
+        Ok((Self::new(a), Self::new(b)))
     }
 
     /// Send a stream ID and associated file descriptors.
-    ///
-    /// This is a **blocking** call. Wrap in `tokio::task::spawn_blocking` for
-    /// async usage, or use a dedicated blocking thread.
-    pub fn send(&self, stream_id: VarInt, fds: &[OwnedFd]) -> Result<(), SendFdsError> {
-        use std::io::IoSlice;
+    pub async fn send(&self, stream_id: VarInt, fds: &[impl AsFd]) -> Result<(), SendFdsError> {
+        let mut data_buf = Vec::with_capacity(MAX_DATA_LEN);
+        stream_id
+            .encode_into(&mut data_buf)
+            .await
+            .context(send_fds_error::EncodeStreamIdSnafu)?;
 
-        use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+        let mut ancillary_buf = [0u8; ANCILLARY_BUF_LEN];
+        let mut ancillary = AncillaryMessageWriter::new(&mut ancillary_buf);
+        let borrowed: Vec<BorrowedFd<'_>> = fds.iter().map(|f| f.as_fd()).collect();
+        ancillary
+            .add_fds(&borrowed)
+            .context(send_fds_error::AddFdsSnafu)?;
 
-        let mut data_buf = [0u8; MAX_DATA_LEN];
-        let data_len = encode_varint(&mut data_buf, stream_id);
-        let iov = [IoSlice::new(&data_buf[..data_len])];
-
-        let raw_fds: Vec<RawFd> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
-        let cmsg = [ControlMessage::ScmRights(&raw_fds)];
-
-        sendmsg::<()>(self.fd.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
+        let bufs = [IoSlice::new(&data_buf)];
+        self.socket
+            .send_vectored_with_ancillary(&bufs, &mut ancillary)
+            .await
             .context(send_fds_error::SendSnafu)?;
 
         Ok(())
     }
 
     /// Receive a stream ID and associated file descriptors.
-    ///
-    /// This is a **blocking** call. Wrap in `tokio::task::spawn_blocking` for
-    /// async usage.
-    pub fn recv(&self) -> Result<(VarInt, Vec<OwnedFd>), RecvFdsError> {
-        use std::io::IoSliceMut;
-
-        use nix::{
-            cmsg_space,
-            sys::socket::{ControlMessageOwned, MsgFlags, recvmsg},
-        };
-
+    pub async fn recv(&self) -> Result<(VarInt, Vec<OwnedFd>), RecvFdsError> {
         let mut data_buf = [0u8; MAX_DATA_LEN];
-        let mut cmsg_buf = cmsg_space!([RawFd; MAX_FDS_PER_MSG]);
+        let mut ancillary_buf = [0u8; ANCILLARY_BUF_LEN];
 
-        // Extract bytes count and FDs from the message, then release borrows
-        // on data_buf so we can read it for varint decoding.
-        let (nbytes, fds) = {
-            let mut iov = [IoSliceMut::new(&mut data_buf)];
-            let msg = recvmsg::<()>(
-                self.fd.as_raw_fd(),
-                &mut iov,
-                Some(&mut cmsg_buf),
-                MsgFlags::empty(),
-            )
+        let mut bufs = [IoSliceMut::new(&mut data_buf)];
+        let (nbytes, ancillary) = self
+            .socket
+            .recv_vectored_with_ancillary(&mut bufs, &mut ancillary_buf)
+            .await
             .context(recv_fds_error::RecvSnafu)?;
-
-            let nbytes = msg.bytes;
-
-            let mut fds = Vec::new();
-            for cmsg in msg.cmsgs().context(recv_fds_error::ParseCmsgSnafu)? {
-                if let ControlMessageOwned::ScmRights(received_fds) = cmsg {
-                    for raw_fd in received_fds {
-                        // SAFETY: the kernel just gave us this fd via SCM_RIGHTS.
-                        fds.push(unsafe { OwnedFd::from_raw_fd(raw_fd) });
-                    }
-                }
-            }
-
-            (nbytes, fds)
-        };
 
         if nbytes == 0 {
             return Err(RecvFdsError::Closed);
         }
 
-        let stream_id = decode_varint(&data_buf[..nbytes])?;
+        let mut fds = Vec::new();
+        for msg in ancillary.into_messages() {
+            if let OwnedAncillaryMessage::FileDescriptors(owned_fds) = msg {
+                fds.extend(owned_fds);
+            }
+        }
 
         snafu::ensure!(!fds.is_empty(), recv_fds_error::NoFdsSnafu);
+
+        let stream_id = VarInt::decode_from(&data_buf[..nbytes])
+            .await
+            .context(recv_fds_error::DecodeStreamIdSnafu)?;
 
         Ok((stream_id, fds))
     }
