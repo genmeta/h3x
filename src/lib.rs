@@ -22,5 +22,8 @@ pub mod dquic;
 #[cfg(feature = "hyper")]
 pub mod hyper;
 
+#[cfg(feature = "pipe")]
+pub mod pipe;
+
 #[cfg(feature = "remoc")]
 pub mod remoc;
