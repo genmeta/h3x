@@ -453,6 +453,7 @@ impl Response {
 impl Drop for Response {
     fn drop(&mut self) {
         if let Some(future) = self.drop() {
+            // Best-effort: send the end-of-stream marker before the response is dropped.
             tokio::spawn(future.in_current_span());
         }
     }

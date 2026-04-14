@@ -57,7 +57,7 @@ impl From<(VarInt, VarInt)> for Setting {
 
 #[derive(Snafu, Debug, Clone, Copy)]
 pub enum InvalidSettingValue {
-    #[snafu(display("The value of the ENABLE_CONNECT_PROTOCOL setting must be 0 or 1"))]
+    #[snafu(display("the value of the ENABLE_CONNECT_PROTOCOL setting must be 0 or 1"))]
     ConnectProtocol { value: VarInt },
 }
 

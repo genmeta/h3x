@@ -300,6 +300,7 @@ impl QPackProtocolFactory {
             }
         };
 
+        // Terminates when conn_state.closed() resolves or the instruction stream ends.
         tokio::spawn(decoder_task.in_current_span());
 
         Ok(QPackProtocol {

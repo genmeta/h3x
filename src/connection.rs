@@ -238,6 +238,7 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
 
         let protocols = Arc::new(protocols);
         let state = ConnectionState { quic, protocols };
+        // Terminates when the QUIC connection closes and stream acceptance returns an error.
         tokio::spawn(ConnectionState::accept_uni_stream_task(state.clone()).in_current_span());
         tokio::spawn(ConnectionState::accept_bi_stream_task(state.clone()).in_current_span());
 
