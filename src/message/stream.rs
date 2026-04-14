@@ -33,8 +33,8 @@ use crate::{
     varint::VarInt,
 };
 
-#[cfg(feature = "hyper")]
 pub(crate) mod guard;
+#[cfg(feature = "hyper")]
 pub(crate) mod hyper;
 pub(crate) mod unfold;
 
