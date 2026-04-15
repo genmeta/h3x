@@ -22,8 +22,12 @@ pub mod dquic;
 #[cfg(feature = "hyper")]
 pub mod hyper;
 
-#[cfg(feature = "pipe")]
-pub mod pipe;
+#[cfg(feature = "ipc")]
+pub mod ipc;
 
-#[cfg(feature = "remoc")]
-pub mod remoc;
+#[cfg(feature = "rpc")]
+pub mod rpc;
+
+/// Backwards-compatibility alias: the `remoc` module was renamed to [`rpc`].
+#[cfg(feature = "rpc")]
+pub use rpc as remoc;

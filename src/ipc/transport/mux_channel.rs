@@ -7,8 +7,8 @@ use std::{
     },
     pin::Pin,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
 };
@@ -30,6 +30,7 @@ const FRAME_TYPE_BYTES: u8 = 0x00;
 const FRAME_TYPE_FDS: u8 = 0x01;
 
 const MAX_FRAME_HEADER_LEN: usize = 1 + VarInt::MAX_SIZE;
+const MAX_FDS_FRAME_LEN: usize = 1 + VarInt::MAX_SIZE + VarInt::MAX_SIZE;
 const READ_CHUNK_LEN: usize = 8 * 1024;
 const MAX_FDS_PER_MESSAGE: usize = 8;
 
@@ -51,8 +52,6 @@ pub enum WaitFdsError {
     Closed,
     #[snafu(display("waiter already exists for stream id {id}"))]
     AlreadyWaiting { id: VarInt },
-    #[snafu(display("stream id {id} has already been consumed"))]
-    AlreadyConsumed { id: VarInt },
     #[snafu(display("fd waiter channel is closed unexpectedly"))]
     ChannelClosed,
 }
@@ -73,6 +72,8 @@ pub enum MuxSinkError {
     PollReady { source: io::Error },
     #[snafu(display("failed to send mux frame"))]
     Send { source: io::Error },
+    #[snafu(display("sink is not ready for start_send"))]
+    NotReady,
     #[snafu(display("write side is closed"))]
     Closed,
 }
@@ -126,24 +127,23 @@ impl MuxChannel {
             .try_clone_to_owned()
             .context(split_error::CloneFdSnafu)?;
 
-        let writer_shared = Arc::new(WriterShared {
+        let writer_core = Arc::new(WriterCore {
             next_id: AtomicU64::new(0),
-            queue: Mutex::new(VecDeque::new()),
-            closed: AtomicBool::new(false),
+            fd_queue: Mutex::new(VecDeque::new()),
         });
-        let registry = FdRegistry::new();
+        let registry_core = Arc::new(RegistryCore::new());
+        let registry = FdRegistry::from_core(&registry_core);
 
         let sink = MuxSink {
             fd: AsyncFd::new(write_fd).context(split_error::AsyncFdSnafu)?,
-            shared: writer_shared.clone(),
-            fd_sender: FdSender {
-                shared: writer_shared,
-            },
-            bytes_queue: VecDeque::new(),
+            core: Some(writer_core.clone()),
+            fd_sender: FdSender::from_core(&writer_core),
+            pending_bytes: None,
             current: None,
         };
         let stream = MuxStream {
             fd: AsyncFd::new(read_fd).context(split_error::AsyncFdSnafu)?,
+            registry_core,
             registry: registry.clone(),
             read_buf: BytesMut::new(),
             ancillary_queue: VecDeque::new(),
@@ -160,6 +160,17 @@ impl MuxChannel {
         let b = Self::from_fd(b.into())?;
         Ok((a, b))
     }
+
+    /// Create a socketpair and return `(local_channel, remote_fd)`.
+    ///
+    /// The local side is a ready-to-use [`MuxChannel`]; the remote `OwnedFd`
+    /// is intended to be sent to another process via [`FdSender::queue_fds`]
+    /// and reconstructed with [`MuxChannel::from_fd`] on the receiving end.
+    pub fn create_pair() -> io::Result<(Self, OwnedFd)> {
+        let (a, b) = StdUnixStream::pair()?;
+        let local = Self::from_fd(a.into())?;
+        Ok((local, b.into()))
+    }
 }
 
 #[derive(Debug)]
@@ -169,28 +180,31 @@ struct QueuedFds {
 }
 
 #[derive(Debug)]
-struct WriterShared {
+struct WriterCore {
     next_id: AtomicU64,
-    queue: Mutex<VecDeque<QueuedFds>>,
-    closed: AtomicBool,
+    fd_queue: Mutex<VecDeque<QueuedFds>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct FdSender {
-    shared: Arc<WriterShared>,
+    core: Weak<WriterCore>,
 }
 
 impl FdSender {
-    pub fn queue_fds(&self, fds: Vec<OwnedFd>) -> Result<VarInt, QueueFdsError> {
-        if self.shared.closed.load(Ordering::Acquire) {
-            return Err(QueueFdsError::Closed);
+    fn from_core(core: &Arc<WriterCore>) -> Self {
+        Self {
+            core: Arc::downgrade(core),
         }
+    }
+
+    pub fn queue_fds(&self, fds: Vec<OwnedFd>) -> Result<VarInt, QueueFdsError> {
         if fds.is_empty() {
             return Err(QueueFdsError::EmptyFds);
         }
 
-        let id_raw = self
-            .shared
+        let core = self.core.upgrade().ok_or(QueueFdsError::Closed)?;
+
+        let id_raw = core
             .next_id
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 let next = current.checked_add(1)?;
@@ -200,7 +214,7 @@ impl FdSender {
 
         let id = VarInt::from_u64(id_raw).map_err(|_| QueueFdsError::IdExhausted)?;
 
-        let mut queue = self.shared.queue.lock().expect("fd queue poisoned");
+        let mut queue = core.fd_queue.lock().expect("fd queue poisoned");
         queue.push_back(QueuedFds { id, fds });
 
         Ok(id)
@@ -210,9 +224,9 @@ impl FdSender {
 #[derive(Debug)]
 pub struct MuxSink {
     fd: AsyncFd<OwnedFd>,
-    shared: Arc<WriterShared>,
+    core: Option<Arc<WriterCore>>,
     fd_sender: FdSender,
-    bytes_queue: VecDeque<Bytes>,
+    pending_bytes: Option<Bytes>,
     current: Option<PendingWriteFrame>,
 }
 
@@ -221,24 +235,28 @@ impl MuxSink {
         self.fd_sender.clone()
     }
 
+    fn close_core(&mut self) {
+        self.core = None;
+        self.pending_bytes = None;
+        self.current = None;
+    }
+
+    fn core_ref(&self) -> Result<&Arc<WriterCore>, MuxSinkError> {
+        self.core.as_ref().ok_or(MuxSinkError::Closed)
+    }
+
     fn pop_next_frame(&mut self) -> Option<PendingWriteFrame> {
-        if let Some(queued_fds) = self
-            .shared
-            .queue
-            .lock()
-            .expect("fd queue poisoned")
-            .pop_front()
-        {
+        let core = self.core.as_ref()?;
+
+        if let Some(queued_fds) = core.fd_queue.lock().expect("fd queue poisoned").pop_front() {
             return Some(PendingWriteFrame::new_fds(queued_fds.id, queued_fds.fds));
         }
 
-        self.bytes_queue
-            .pop_front()
-            .map(PendingWriteFrame::new_bytes)
+        self.pending_bytes.take().map(PendingWriteFrame::new_bytes)
     }
 
     fn poll_flush_internal(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), MuxSinkError>> {
-        if self.shared.closed.load(Ordering::Acquire) {
+        if self.core.is_none() {
             return Poll::Ready(Err(MuxSinkError::Closed));
         }
 
@@ -260,14 +278,14 @@ impl MuxSink {
             let sent = match io_result {
                 Ok(Ok(sent)) => sent,
                 Ok(Err(source)) => {
-                    self.shared.closed.store(true, Ordering::Release);
+                    self.close_core();
                     return Poll::Ready(Err(MuxSinkError::Send { source }));
                 }
                 Err(_would_block) => return Poll::Pending,
             };
 
             if sent == 0 {
-                self.shared.closed.store(true, Ordering::Release);
+                self.close_core();
                 return Poll::Ready(Err(MuxSinkError::Send {
                     source: io::Error::new(io::ErrorKind::WriteZero, "sendmsg returned 0 bytes"),
                 }));
@@ -283,7 +301,7 @@ impl MuxSink {
 
 impl Drop for MuxSink {
     fn drop(&mut self) {
-        self.shared.closed.store(true, Ordering::Release);
+        self.close_core();
         let _ = shutdown(self.fd.get_ref().as_raw_fd(), Shutdown::Write);
     }
 }
@@ -296,10 +314,11 @@ impl Sink<Bytes> for MuxSink {
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        if self.shared.closed.load(Ordering::Acquire) {
-            return Err(MuxSinkError::Closed);
+        self.core_ref()?;
+        if self.pending_bytes.is_some() || self.current.is_some() {
+            return Err(MuxSinkError::NotReady);
         }
-        self.bytes_queue.push_back(item);
+        self.pending_bytes = Some(item);
         Ok(())
     }
 
@@ -309,8 +328,8 @@ impl Sink<Bytes> for MuxSink {
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let result = ready!(self.poll_flush_internal(cx));
-        self.shared.closed.store(true, Ordering::Release);
         if result.is_ok() {
+            self.close_core();
             let _ = shutdown(self.fd.get_ref().as_raw_fd(), Shutdown::Write);
         }
         Poll::Ready(result)
@@ -320,11 +339,15 @@ impl Sink<Bytes> for MuxSink {
 #[derive(Debug)]
 enum PendingWriteFrame {
     Bytes {
-        data: Vec<u8>,
-        written: usize,
+        header: [u8; MAX_FRAME_HEADER_LEN],
+        header_len: usize,
+        header_written: usize,
+        payload: Bytes,
+        payload_written: usize,
     },
     Fds {
-        data: Vec<u8>,
+        frame: [u8; MAX_FDS_FRAME_LEN],
+        frame_len: usize,
         written: usize,
         fds: Vec<OwnedFd>,
         include_ancillary: bool,
@@ -333,26 +356,63 @@ enum PendingWriteFrame {
 
 impl PendingWriteFrame {
     fn new_bytes(payload: Bytes) -> Self {
-        let data = encode_frame(FRAME_TYPE_BYTES, &payload);
-        Self::Bytes { data, written: 0 }
+        let payload_len =
+            VarInt::try_from(payload.len()).expect("payload length must fit into varint");
+
+        let mut header = [0u8; MAX_FRAME_HEADER_LEN];
+        header[0] = FRAME_TYPE_BYTES;
+        let varint_len = encode_varint_to_slice(&mut header[1..], payload_len);
+
+        Self::Bytes {
+            header,
+            header_len: 1 + varint_len,
+            header_written: 0,
+            payload,
+            payload_written: 0,
+        }
     }
 
     fn new_fds(id: VarInt, fds: Vec<OwnedFd>) -> Self {
-        let mut payload = [0u8; VarInt::MAX_SIZE];
-        let payload_len = encode_varint_to_slice(&mut payload, id);
-        let data = encode_frame(FRAME_TYPE_FDS, &payload[..payload_len]);
+        let mut id_buf = [0u8; VarInt::MAX_SIZE];
+        let id_len = encode_varint_to_slice(&mut id_buf, id);
+
+        let mut frame = [0u8; MAX_FDS_FRAME_LEN];
+        frame[0] = FRAME_TYPE_FDS;
+        let payload_len =
+            VarInt::try_from(id_len).expect("fd frame id length must fit into varint");
+        let len_len = encode_varint_to_slice(&mut frame[1..], payload_len);
+        let header_len = 1 + len_len;
+        frame[header_len..header_len + id_len].copy_from_slice(&id_buf[..id_len]);
 
         Self::Fds {
-            data,
+            frame,
+            frame_len: header_len + id_len,
             written: 0,
             fds,
             include_ancillary: true,
         }
     }
 
-    fn advance(&mut self, n: usize) {
+    fn advance(&mut self, mut n: usize) {
         match self {
-            Self::Bytes { written, .. } => *written += n,
+            Self::Bytes {
+                header_len,
+                header_written,
+                payload,
+                payload_written,
+                ..
+            } => {
+                let header_remaining = *header_len - *header_written;
+                let header_advance = n.min(header_remaining);
+                *header_written += header_advance;
+                n -= header_advance;
+
+                if n > 0 {
+                    let payload_remaining = payload.len().saturating_sub(*payload_written);
+                    let payload_advance = n.min(payload_remaining);
+                    *payload_written += payload_advance;
+                }
+            }
             Self::Fds {
                 written,
                 include_ancillary,
@@ -368,51 +428,78 @@ impl PendingWriteFrame {
 
     fn is_complete(&self) -> bool {
         match self {
-            Self::Bytes { data, written } => *written >= data.len(),
-            Self::Fds { data, written, .. } => *written >= data.len(),
+            Self::Bytes {
+                header_len,
+                header_written,
+                payload,
+                payload_written,
+                ..
+            } => *header_written >= *header_len && *payload_written >= payload.len(),
+            Self::Fds {
+                frame_len, written, ..
+            } => *written >= *frame_len,
         }
     }
 }
 
 fn send_frame(fd: RawFd, frame: &mut PendingWriteFrame) -> io::Result<usize> {
-    let (data, written, ancillary_fds) = match frame {
-        PendingWriteFrame::Bytes { data, written } => (&data[..], *written, None),
+    match frame {
+        PendingWriteFrame::Bytes {
+            header,
+            header_len,
+            header_written,
+            payload,
+            payload_written,
+        } => {
+            let mut iovecs = [io::IoSlice::new(&[]), io::IoSlice::new(&[])];
+            let mut iov_count = 0usize;
+
+            if *header_written < *header_len {
+                iovecs[iov_count] = io::IoSlice::new(&header[*header_written..*header_len]);
+                iov_count += 1;
+            }
+            if *payload_written < payload.len() {
+                iovecs[iov_count] = io::IoSlice::new(&payload[*payload_written..]);
+                iov_count += 1;
+            }
+
+            if iov_count == 0 {
+                return Ok(0);
+            }
+
+            let sent = sendmsg::<()>(fd, &iovecs[..iov_count], &[], MsgFlags::empty(), None)
+                .map_err(io::Error::from)?;
+            Ok(sent)
+        }
         PendingWriteFrame::Fds {
-            data,
+            frame,
+            frame_len,
             written,
             fds,
             include_ancillary,
         } => {
-            let ancillary = if *include_ancillary {
-                Some(fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>())
+            if *written >= *frame_len {
+                return Ok(0);
+            }
+
+            let iov = [io::IoSlice::new(&frame[*written..*frame_len])];
+            let sent = if *include_ancillary {
+                let raw_fds: Vec<RawFd> = fds.iter().map(AsRawFd::as_raw_fd).collect();
+                let cmsgs = [ControlMessage::ScmRights(&raw_fds)];
+                sendmsg::<()>(fd, &iov, &cmsgs, MsgFlags::empty(), None)
             } else {
-                None
-            };
-            (&data[..], *written, ancillary)
+                sendmsg::<()>(fd, &iov, &[], MsgFlags::empty(), None)
+            }
+            .map_err(io::Error::from)?;
+
+            Ok(sent)
         }
-    };
-
-    if written >= data.len() {
-        return Ok(0);
     }
-
-    let iov = [io::IoSlice::new(&data[written..])];
-
-    let sent = match ancillary_fds {
-        Some(raw_fds) => {
-            let cmsgs = [ControlMessage::ScmRights(&raw_fds)];
-            sendmsg::<()>(fd, &iov, &cmsgs, MsgFlags::empty(), None)
-        }
-        None => sendmsg::<()>(fd, &iov, &[], MsgFlags::empty(), None),
-    }
-    .map_err(io::Error::from)?;
-
-    Ok(sent)
 }
 
-#[derive(Clone, Debug)]
-pub struct FdRegistry {
-    inner: Arc<Mutex<RegistryState>>,
+#[derive(Debug)]
+struct RegistryCore {
+    state: Mutex<RegistryState>,
 }
 
 #[derive(Debug)]
@@ -425,39 +512,31 @@ struct RegistryState {
 enum RegistrySlot {
     Ready(Vec<OwnedFd>),
     Waiting(oneshot::Sender<Result<Vec<OwnedFd>, WaitFdsError>>),
-    Consumed,
 }
 
-impl FdRegistry {
+impl RegistryCore {
     fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(RegistryState {
+            state: Mutex::new(RegistryState {
                 slots: HashMap::new(),
                 closed: false,
-            })),
+            }),
         }
     }
 
-    pub async fn wait_fds(&self, id: VarInt) -> Result<Vec<OwnedFd>, WaitFdsError> {
+    async fn wait_fds(&self, id: VarInt) -> Result<Vec<OwnedFd>, WaitFdsError> {
         let rx = {
-            let mut state = self.inner.lock().expect("registry mutex poisoned");
+            let mut state = self.state.lock().expect("registry mutex poisoned");
             if state.closed {
                 return Err(WaitFdsError::Closed);
             }
 
             if let Some(existing) = state.slots.remove(&id) {
                 match existing {
-                    RegistrySlot::Ready(fds) => {
-                        state.slots.insert(id, RegistrySlot::Consumed);
-                        return Ok(fds);
-                    }
+                    RegistrySlot::Ready(fds) => return Ok(fds),
                     RegistrySlot::Waiting(waiter) => {
                         state.slots.insert(id, RegistrySlot::Waiting(waiter));
                         return Err(WaitFdsError::AlreadyWaiting { id });
-                    }
-                    RegistrySlot::Consumed => {
-                        state.slots.insert(id, RegistrySlot::Consumed);
-                        return Err(WaitFdsError::AlreadyConsumed { id });
                     }
                 }
             }
@@ -474,7 +553,7 @@ impl FdRegistry {
     }
 
     fn register_arrival(&self, id: VarInt, fds: Vec<OwnedFd>) -> Result<(), RegisterFdsError> {
-        let mut state = self.inner.lock().expect("registry mutex poisoned");
+        let mut state = self.state.lock().expect("registry mutex poisoned");
         if state.closed {
             return Err(RegisterFdsError::Closed);
         }
@@ -489,8 +568,6 @@ impl FdRegistry {
                 if let Err(payload) = waiter.send(Ok(fds)) {
                     let recovered_fds = payload.unwrap_or_default();
                     state.slots.insert(id, RegistrySlot::Ready(recovered_fds));
-                } else {
-                    state.slots.insert(id, RegistrySlot::Consumed);
                 }
                 Ok(())
             }
@@ -498,31 +575,53 @@ impl FdRegistry {
                 state.slots.insert(id, RegistrySlot::Ready(existing_fds));
                 Err(RegisterFdsError::DuplicateId { id })
             }
-            Some(RegistrySlot::Consumed) => {
-                state.slots.insert(id, RegistrySlot::Consumed);
-                Err(RegisterFdsError::DuplicateId { id })
-            }
         }
     }
 
     fn close(&self) {
-        let mut state = self.inner.lock().expect("registry mutex poisoned");
+        let mut state = self.state.lock().expect("registry mutex poisoned");
         if state.closed {
             return;
         }
         state.closed = true;
 
-        for slot in state.slots.values_mut() {
-            if let RegistrySlot::Waiting(waiter) = std::mem::replace(slot, RegistrySlot::Consumed) {
+        for (_, slot) in state.slots.drain() {
+            if let RegistrySlot::Waiting(waiter) = slot {
                 let _ = waiter.send(Err(WaitFdsError::Closed));
             }
         }
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct FdRegistry {
+    core: Weak<RegistryCore>,
+}
+
+impl FdRegistry {
+    fn from_core(core: &Arc<RegistryCore>) -> Self {
+        Self {
+            core: Arc::downgrade(core),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test() -> (Arc<RegistryCore>, Self) {
+        let core = Arc::new(RegistryCore::new());
+        let registry = Self::from_core(&core);
+        (core, registry)
+    }
+
+    pub async fn wait_fds(&self, id: VarInt) -> Result<Vec<OwnedFd>, WaitFdsError> {
+        let core = self.core.upgrade().ok_or(WaitFdsError::Closed)?;
+        core.wait_fds(id).await
+    }
+}
+
 #[derive(Debug)]
 pub struct MuxStream {
     fd: AsyncFd<OwnedFd>,
+    registry_core: Arc<RegistryCore>,
     registry: FdRegistry,
     read_buf: BytesMut,
     ancillary_queue: VecDeque<Vec<OwnedFd>>,
@@ -537,7 +636,7 @@ impl MuxStream {
 
 impl Drop for MuxStream {
     fn drop(&mut self) {
-        self.registry.close();
+        self.registry_core.close();
     }
 }
 
@@ -554,7 +653,7 @@ impl Stream for MuxStream {
                 Ok(frame) => frame,
                 Err(err) => {
                     self.closed = true;
-                    self.registry.close();
+                    self.registry_core.close();
                     return Poll::Ready(Some(Err(err)));
                 }
             } {
@@ -563,12 +662,12 @@ impl Stream for MuxStream {
                     DecodedFrame::Fds { id } => {
                         let Some(fds) = self.ancillary_queue.pop_front() else {
                             self.closed = true;
-                            self.registry.close();
+                            self.registry_core.close();
                             return Poll::Ready(Some(Err(MuxStreamError::MissingAncillaryFds)));
                         };
-                        if let Err(source) = self.registry.register_arrival(id, fds) {
+                        if let Err(source) = self.registry_core.register_arrival(id, fds) {
                             self.closed = true;
-                            self.registry.close();
+                            self.registry_core.close();
                             return Poll::Ready(Some(Err(MuxStreamError::RegisterFds { source })));
                         }
                         continue;
@@ -589,7 +688,7 @@ impl Stream for MuxStream {
                 Ok(Ok(result)) => result,
                 Ok(Err(source)) => {
                     self.closed = true;
-                    self.registry.close();
+                    self.registry_core.close();
                     return Poll::Ready(Some(Err(MuxStreamError::Recv { source })));
                 }
                 Err(_would_block) => return Poll::Pending,
@@ -597,7 +696,7 @@ impl Stream for MuxStream {
 
             if read == 0 {
                 self.closed = true;
-                self.registry.close();
+                self.registry_core.close();
                 return Poll::Ready(None);
             }
 
@@ -675,18 +774,6 @@ fn try_decode_frame(src: &mut BytesMut) -> Result<Option<DecodedFrame>, MuxStrea
         }
         _ => Err(MuxStreamError::UnknownFrameType { frame_type }),
     }
-}
-
-fn encode_frame(frame_type: u8, payload: &[u8]) -> Vec<u8> {
-    let payload_len = VarInt::try_from(payload.len()).expect("payload length must fit varint");
-    let mut out = Vec::with_capacity(MAX_FRAME_HEADER_LEN + payload.len());
-    out.push(frame_type);
-
-    let mut len_buf = [0u8; VarInt::MAX_SIZE];
-    let len_size = encode_varint_to_slice(&mut len_buf, payload_len);
-    out.extend_from_slice(&len_buf[..len_size]);
-    out.extend_from_slice(payload);
-    out
 }
 
 fn try_decode_varint_len(src: &[u8]) -> Result<Option<(usize, usize)>, MuxStreamError> {
@@ -827,16 +914,16 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_id_rejected_in_registry() {
-        let registry = FdRegistry::new();
+        let (registry_core, registry) = FdRegistry::new_for_test();
 
         let (fd1, _peer1) = StdUnixStream::pair().expect("pair1");
         let (fd2, _peer2) = StdUnixStream::pair().expect("pair2");
         let id = VarInt::from_u32(7);
 
-        registry
+        registry_core
             .register_arrival(id, vec![fd1.into()])
             .expect("first arrival");
-        let duplicate = registry.register_arrival(id, vec![fd2.into()]);
+        let duplicate = registry_core.register_arrival(id, vec![fd2.into()]);
         assert!(matches!(
             duplicate,
             Err(RegisterFdsError::DuplicateId { .. })
@@ -844,6 +931,32 @@ mod tests {
 
         let first = registry.wait_fds(id).await.expect("first still valid");
         assert_eq!(first.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_after_consumed_waits_for_next_arrival() {
+        let (registry_core, registry) = FdRegistry::new_for_test();
+        let id = VarInt::from_u32(9);
+
+        let (fd1, _peer1) = StdUnixStream::pair().expect("pair1");
+        registry_core
+            .register_arrival(id, vec![fd1.into()])
+            .expect("first arrival");
+        let first = registry.wait_fds(id).await.expect("first consume");
+        assert_eq!(first.len(), 1);
+
+        let reg2 = registry.clone();
+        let waiter = tokio::spawn(async move { reg2.wait_fds(id).await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        let (fd2, _peer2) = StdUnixStream::pair().expect("pair2");
+        registry_core
+            .register_arrival(id, vec![fd2.into()])
+            .expect("second arrival");
+
+        let second = waiter.await.expect("join").expect("second consume");
+        assert_eq!(second.len(), 1);
     }
 
     #[tokio::test]
@@ -882,5 +995,311 @@ mod tests {
             .await
             .expect("expected eof signal");
         assert!(eof.is_none());
+    }
+
+    #[tokio::test]
+    async fn fd_sender_closed_after_sink_drop() {
+        let ((sink_a, _stream_a), (_sink_b, _stream_b)) = make_pair();
+        let sender = sink_a.fd_sender();
+        drop(sink_a);
+
+        let (fd, _peer) = StdUnixStream::pair().expect("fd pair");
+        let result = sender.queue_fds(vec![fd.into()]);
+        assert!(matches!(result, Err(QueueFdsError::Closed)));
+    }
+
+    // -----------------------------------------------------------------------
+    // FdSender boundary tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn queue_fds_empty_vec_rejected() {
+        let ((sink_a, _stream_a), (_sink_b, _stream_b)) = make_pair();
+        let sender = sink_a.fd_sender();
+        let result = sender.queue_fds(vec![]);
+        assert!(matches!(result, Err(QueueFdsError::EmptyFds)));
+    }
+
+    #[tokio::test]
+    async fn queue_fds_multiple_fds_per_message() {
+        let ((mut sink_a, _stream_a), (_sink_b, mut stream_b)) = make_pair();
+        let registry = stream_b.fd_registry();
+
+        let (fd1, _p1) = StdUnixStream::pair().expect("pair1");
+        let (fd2, _p2) = StdUnixStream::pair().expect("pair2");
+        let (fd3, _p3) = StdUnixStream::pair().expect("pair3");
+        let id = sink_a
+            .fd_sender()
+            .queue_fds(vec![fd1.into(), fd2.into(), fd3.into()])
+            .expect("queue 3 fds");
+
+        sink_a.send(Bytes::new()).await.expect("drive flush");
+        let _ = stream_b
+            .next()
+            .await
+            .expect("stream item")
+            .expect("empty bytes");
+
+        let fds = registry.wait_fds(id).await.expect("wait fds");
+        assert_eq!(fds.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // FdRegistry boundary tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn wait_fds_already_waiting() {
+        let (registry_core, registry) = FdRegistry::new_for_test();
+        let id = VarInt::from_u32(1);
+
+        let reg2 = registry.clone();
+        let waiter = tokio::spawn(async move { reg2.wait_fds(id).await });
+        tokio::task::yield_now().await;
+
+        // Second wait on same ID should fail
+        let result = registry_core.wait_fds(id).await;
+        assert!(matches!(result, Err(WaitFdsError::AlreadyWaiting { .. })));
+
+        // Satisfy the first waiter to clean up
+        let (fd, _peer) = StdUnixStream::pair().expect("pair");
+        registry_core
+            .register_arrival(id, vec![fd.into()])
+            .expect("arrival");
+        waiter.await.expect("join").expect("wait result");
+    }
+
+    #[tokio::test]
+    async fn wait_fds_closed_registry() {
+        let (registry_core, registry) = FdRegistry::new_for_test();
+        registry_core.close();
+
+        let result = registry.wait_fds(VarInt::from_u32(0)).await;
+        assert!(matches!(result, Err(WaitFdsError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn wait_fds_close_while_waiting() {
+        let (registry_core, registry) = FdRegistry::new_for_test();
+        let id = VarInt::from_u32(42);
+
+        let reg = registry.clone();
+        let waiter = tokio::spawn(async move { reg.wait_fds(id).await });
+        tokio::task::yield_now().await;
+
+        registry_core.close();
+
+        let result = waiter.await.expect("join");
+        assert!(matches!(result, Err(WaitFdsError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn register_arrival_after_close() {
+        let (registry_core, _registry) = FdRegistry::new_for_test();
+        registry_core.close();
+
+        let (fd, _peer) = StdUnixStream::pair().expect("pair");
+        let result = registry_core.register_arrival(VarInt::from_u32(0), vec![fd.into()]);
+        assert!(matches!(result, Err(RegisterFdsError::Closed)));
+    }
+
+    // -----------------------------------------------------------------------
+    // MuxStream demux boundary tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn multiple_fd_ids_interleaved() {
+        let ((mut sink_a, _stream_a), (_sink_b, mut stream_b)) = make_pair();
+        let registry = stream_b.fd_registry();
+        let sender = sink_a.fd_sender();
+
+        let (fd1, _p1) = StdUnixStream::pair().expect("pair1");
+        let id1 = sender.queue_fds(vec![fd1.into()]).expect("queue 1");
+
+        sink_a
+            .send(Bytes::from_static(b"msg1"))
+            .await
+            .expect("send msg1");
+
+        let (fd2, _p2) = StdUnixStream::pair().expect("pair2");
+        let id2 = sender.queue_fds(vec![fd2.into()]).expect("queue 2");
+
+        sink_a
+            .send(Bytes::from_static(b"msg2"))
+            .await
+            .expect("send msg2");
+
+        let (fd3, _p3) = StdUnixStream::pair().expect("pair3");
+        let id3 = sender.queue_fds(vec![fd3.into()]).expect("queue 3");
+
+        sink_a
+            .send(Bytes::from_static(b"msg3"))
+            .await
+            .expect("send msg3");
+
+        // FD frames are demuxed internally; only bytes frames are yielded
+        let p1 = stream_b.next().await.expect("item1").expect("bytes1");
+        let p2 = stream_b.next().await.expect("item2").expect("bytes2");
+        let p3 = stream_b.next().await.expect("item3").expect("bytes3");
+        assert_eq!(p1, Bytes::from_static(b"msg1"));
+        assert_eq!(p2, Bytes::from_static(b"msg2"));
+        assert_eq!(p3, Bytes::from_static(b"msg3"));
+
+        let fds1 = registry.wait_fds(id1).await.expect("wait 1");
+        let fds2 = registry.wait_fds(id2).await.expect("wait 2");
+        let fds3 = registry.wait_fds(id3).await.expect("wait 3");
+        assert_eq!(fds1.len(), 1);
+        assert_eq!(fds2.len(), 1);
+        assert_eq!(fds3.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn large_payload_roundtrip() {
+        let ((mut sink_a, _stream_a), (_sink_b, mut stream_b)) = make_pair();
+
+        let large = Bytes::from(vec![0xAB; 128 * 1024]);
+        sink_a.send(large.clone()).await.expect("send large");
+
+        let received = stream_b.next().await.expect("item").expect("bytes");
+        assert_eq!(received, large);
+    }
+
+    #[tokio::test]
+    async fn consecutive_fd_frames() {
+        let ((mut sink_a, _stream_a), (_sink_b, mut stream_b)) = make_pair();
+        let registry = stream_b.fd_registry();
+        let sender = sink_a.fd_sender();
+
+        // Queue two FD frames back to back without bytes between
+        let (fd1, _p1) = StdUnixStream::pair().expect("pair1");
+        let (fd2, _p2) = StdUnixStream::pair().expect("pair2");
+        let id1 = sender.queue_fds(vec![fd1.into()]).expect("queue 1");
+        let id2 = sender.queue_fds(vec![fd2.into()]).expect("queue 2");
+
+        // A bytes frame drives the flush of both FD frames
+        sink_a
+            .send(Bytes::from_static(b"after"))
+            .await
+            .expect("send");
+
+        let payload = stream_b.next().await.expect("item").expect("bytes");
+        assert_eq!(payload, Bytes::from_static(b"after"));
+
+        let fds1 = registry.wait_fds(id1).await.expect("wait 1");
+        let fds2 = registry.wait_fds(id2).await.expect("wait 2");
+        assert_eq!(fds1.len(), 1);
+        assert_eq!(fds2.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fd_frame_without_ancillary_errors() {
+        // Craft a raw FD frame without SCM_RIGHTS ancillary data
+        let (raw_writer, reader) = StdUnixStream::pair().expect("pair");
+        let reader_ch = MuxChannel::from_fd(reader.into()).expect("from_fd");
+        let (_sink, mut stream) = reader_ch.split().expect("split");
+
+        // FD frame: type=0x01, length=1, payload=0x00 (varint id=0)
+        use std::io::Write;
+        (&raw_writer)
+            .write_all(&[FRAME_TYPE_FDS, 0x01, 0x00])
+            .expect("write");
+        drop(raw_writer);
+
+        let result = stream.next().await;
+        assert!(
+            matches!(result, Some(Err(MuxStreamError::MissingAncillaryFds))),
+            "expected MissingAncillaryFds, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_frame_type_rejected() {
+        let (raw_writer, reader) = StdUnixStream::pair().expect("pair");
+        let reader_ch = MuxChannel::from_fd(reader.into()).expect("from_fd");
+        let (_sink, mut stream) = reader_ch.split().expect("split");
+
+        // Unknown frame type 0xFF
+        use std::io::Write;
+        (&raw_writer).write_all(&[0xFF, 0x01, 0x00]).expect("write");
+        drop(raw_writer);
+
+        let result = stream.next().await;
+        assert!(
+            matches!(
+                result,
+                Some(Err(MuxStreamError::UnknownFrameType { frame_type: 0xFF }))
+            ),
+            "expected UnknownFrameType(0xFF), got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MuxSink boundary tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn send_after_close_errors() {
+        let ((mut sink_a, _stream_a), (_sink_b, _stream_b)) = make_pair();
+        sink_a.close().await.expect("close");
+
+        let result = sink_a.send(Bytes::from_static(b"after-close")).await;
+        assert!(matches!(result, Err(MuxSinkError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn fd_priority_over_bytes() {
+        use futures::future::poll_fn;
+
+        let ((mut sink_a, _stream_a), (_sink_b, mut stream_b)) = make_pair();
+        let registry = stream_b.fd_registry();
+
+        // Step 1: poll_ready + start_send to park pending bytes
+        poll_fn(|cx| Pin::new(&mut sink_a).poll_ready(cx))
+            .await
+            .expect("ready");
+        Pin::new(&mut sink_a)
+            .start_send(Bytes::from_static(b"after-fds"))
+            .expect("start_send");
+
+        // Step 2: queue FD — it should be flushed before the pending bytes
+        let (fd, _peer) = StdUnixStream::pair().expect("pair");
+        let fd_id = sink_a
+            .fd_sender()
+            .queue_fds(vec![fd.into()])
+            .expect("queue fds");
+
+        // Step 3: flush sends FD frame first, then bytes frame
+        sink_a.flush().await.expect("flush");
+
+        // Stream yields only bytes (FD is demuxed internally)
+        let payload = stream_b.next().await.expect("item").expect("bytes");
+        assert_eq!(payload, Bytes::from_static(b"after-fds"));
+
+        // FD should be available
+        let fds = registry.wait_fds(fd_id).await.expect("wait fds");
+        assert_eq!(fds.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_bytes_frame() {
+        let ((mut sink_a, _stream_a), (_sink_b, mut stream_b)) = make_pair();
+        sink_a.send(Bytes::new()).await.expect("send empty");
+
+        let payload = stream_b.next().await.expect("item").expect("bytes");
+        assert!(payload.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Close propagation tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stream_drop_propagates_registry_close() {
+        let ((_sink_a, _stream_a), (_sink_b, stream_b)) = make_pair();
+        let registry = stream_b.fd_registry();
+        drop(stream_b);
+
+        let result = registry.wait_fds(VarInt::from_u32(0)).await;
+        assert!(matches!(result, Err(WaitFdsError::Closed)));
     }
 }

@@ -60,8 +60,9 @@ default = ["dquic", "hyper"]
 dquic = ["dep:dquic"]
 hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
-remoc = ["dep:remoc", "serde", "bytes/serde"]
-pipe = ["dep:nix", "dep:tokio-seqpacket", "tokio/net"]
+rpc = ["dep:remoc", "serde", "bytes/serde"]
+remoc = ["rpc"]                                              # backwards-compatibility alias
+ipc = ["rpc", "dep:nix", "dep:tokio-seqpacket", "tokio/net"]
 testing = []
 
 [dev-dependencies]
@@ -90,3 +91,4 @@ tokio = { version = "1", features = [
 tracing-appender = "0.2"
 tracing-subscriber = "0.3"
 proptest = "1"
+remoc = { version = "0.18", features = ["default-codec-postbag"] }

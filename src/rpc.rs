@@ -2,5 +2,5 @@ pub(super) mod bridge;
 
 pub mod quic;
 
-#[cfg(feature = "remoc")]
+#[cfg(feature = "rpc")]
 pub mod message;

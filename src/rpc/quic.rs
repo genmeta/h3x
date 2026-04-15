@@ -46,7 +46,7 @@ mod connect;
 mod connection;
 mod error;
 mod listen;
-mod serde_types;
+pub(crate) mod serde_types;
 mod stream;
 
 // Raw remoc-generated RTC client types (serializable, sendable over the wire)
