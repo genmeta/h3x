@@ -49,15 +49,19 @@ remoc = { version = "0.18", default-features = false, optional = true, features 
 ] }
 
 # feature pipe
+nix = { version = "0.29", default-features = false, optional = true, features = [
+    "socket",
+    "uio",
+] }
 tokio-seqpacket = { version = "0.8", optional = true }
 
 [features]
-default = ["dquic", "hyper", "pipe"]
+default = ["dquic", "hyper"]
 dquic = ["dep:dquic"]
 hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
 remoc = ["dep:remoc", "serde", "bytes/serde"]
-pipe = ["dep:tokio-seqpacket", "tokio/net"]
+pipe = ["dep:nix", "dep:tokio-seqpacket", "tokio/net"]
 testing = []
 
 [dev-dependencies]

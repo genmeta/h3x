@@ -23,7 +23,7 @@
 //!
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │  Per-stream data pipe (SOCK_STREAM socketpair)              │
-//! │    • DATA / STOP / CANCEL / CONN_CLOSED framing             │
+//! │    • PUSH / PULL / STOP / CANCEL / CONN_CLOSED framing       │
 //! │    • PipeReader  → impl ReadStream                          │
 //! │    • PipeWriter  → impl WriteStream                         │
 //! └─────────────────────────────────────────────────────────────┘
@@ -38,10 +38,16 @@
 
 pub mod codec;
 pub mod fd_channel;
+pub mod mux_channel;
 pub mod reader;
+mod state;
 pub mod writer;
 
 pub use codec::{Frame, PipeCodec};
 pub use fd_channel::{FdChannel, RecvFdsError, SendFdsError};
+pub use mux_channel::{
+    FdRegistry, FdSender, MuxChannel, MuxSink, MuxSinkError, MuxStream, MuxStreamError,
+    QueueFdsError, RegisterFdsError, SplitError, WaitFdsError,
+};
 pub use reader::PipeReader;
 pub use writer::PipeWriter;

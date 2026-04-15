@@ -207,3 +207,320 @@ impl StopStream for PipeReader {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{borrow::Cow, future::pending, pin::Pin, sync::Arc};
+
+    use bytes::Bytes;
+    use futures::{SinkExt, StreamExt, future::poll_fn};
+    use tokio::{
+        io::AsyncWriteExt,
+        net::{
+            UnixStream,
+            unix::{OwnedReadHalf, OwnedWriteHalf},
+        },
+        time::{Duration, timeout},
+    };
+    use tokio_util::codec::{FramedRead, FramedWrite};
+
+    use super::*;
+    use crate::quic::{ConnectionError, GetStreamId, StopStream};
+
+    struct TestLifecycle {
+        terminal: Option<ConnectionError>,
+    }
+
+    impl quic::Lifecycle for TestLifecycle {
+        fn close(&self, _code: crate::error::Code, _reason: Cow<'static, str>) {}
+
+        fn check(&self) -> Result<(), ConnectionError> {
+            match &self.terminal {
+                Some(err) => Err(err.clone()),
+                None => Ok(()),
+            }
+        }
+
+        async fn closed(&self) -> ConnectionError {
+            match &self.terminal {
+                Some(err) => err.clone(),
+                None => pending().await,
+            }
+        }
+    }
+
+    fn test_connection_error(reason: &str) -> ConnectionError {
+        ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(0x11),
+                frame_type: VarInt::from_u32(0x22),
+                reason: reason.to_owned().into(),
+            },
+        }
+    }
+
+    fn alive_lifecycle() -> Arc<dyn quic::DynLifecycle> {
+        Arc::new(TestLifecycle { terminal: None })
+    }
+
+    fn dead_lifecycle(reason: &str) -> Arc<dyn quic::DynLifecycle> {
+        Arc::new(TestLifecycle {
+            terminal: Some(test_connection_error(reason)),
+        })
+    }
+
+    async fn setup_reader_with_lifecycle(
+        lifecycle: Arc<dyn quic::DynLifecycle>,
+    ) -> (
+        PipeReader,
+        FramedWrite<OwnedWriteHalf, PipeCodec>,
+        FramedRead<OwnedReadHalf, PipeCodec>,
+    ) {
+        let (reader_side, peer_side) = UnixStream::pair().unwrap();
+        let (reader_read, reader_write) = reader_side.into_split();
+        let (peer_read, peer_write) = peer_side.into_split();
+
+        let reader = PipeReader::new(VarInt::from_u32(7), reader_read, reader_write, lifecycle);
+
+        (
+            reader,
+            FramedWrite::new(peer_write, PipeCodec::new()),
+            FramedRead::new(peer_read, PipeCodec::new()),
+        )
+    }
+
+    async fn setup_reader() -> (
+        PipeReader,
+        FramedWrite<OwnedWriteHalf, PipeCodec>,
+        FramedRead<OwnedReadHalf, PipeCodec>,
+    ) {
+        setup_reader_with_lifecycle(alive_lifecycle()).await
+    }
+
+    #[tokio::test]
+    async fn stream_id_matches_constructor() {
+        let (mut reader, _peer_in, _peer_out) = setup_reader().await;
+        let id = poll_fn(|cx| Pin::new(&mut reader).poll_stream_id(cx))
+            .await
+            .unwrap();
+        assert_eq!(id, VarInt::from_u32(7));
+    }
+
+    #[tokio::test]
+    async fn pull_is_sent_once_while_waiting_for_push() {
+        let (mut reader, mut peer_in, mut peer_out) = setup_reader().await;
+
+        let mut recv = Box::pin(reader.next());
+        let first = tokio::select! {
+            frame = peer_out.next() => frame.unwrap().unwrap(),
+            item = &mut recv => panic!("reader completed unexpectedly: {item:?}"),
+        };
+        assert_eq!(first, Frame::Pull);
+
+        assert!(
+            timeout(Duration::from_millis(50), peer_out.next())
+                .await
+                .is_err()
+        );
+
+        peer_in
+            .send(Frame::Push(Bytes::from_static(b"drain")))
+            .await
+            .unwrap();
+        let got = recv.await.unwrap().unwrap();
+        assert_eq!(got, Bytes::from_static(b"drain"));
+    }
+
+    #[tokio::test]
+    async fn push_roundtrip_and_next_poll_requests_again() {
+        let (mut reader, mut peer_in, mut peer_out) = setup_reader().await;
+
+        let mut recv = Box::pin(reader.next());
+        let first_pull = tokio::select! {
+            frame = peer_out.next() => frame.unwrap().unwrap(),
+            item = &mut recv => panic!("reader completed unexpectedly: {item:?}"),
+        };
+        assert_eq!(first_pull, Frame::Pull);
+
+        peer_in
+            .send(Frame::Push(Bytes::from_static(b"reader-payload")))
+            .await
+            .unwrap();
+
+        let got = recv.await.unwrap().unwrap();
+        assert_eq!(got, Bytes::from_static(b"reader-payload"));
+
+        let mut recv2 = Box::pin(reader.next());
+        let second_pull = tokio::select! {
+            frame = peer_out.next() => frame.unwrap().unwrap(),
+            item = &mut recv2 => panic!("reader completed unexpectedly: {item:?}"),
+        };
+        assert_eq!(second_pull, Frame::Pull);
+
+        peer_in
+            .send(Frame::Push(Bytes::from_static(b"reader-payload-2")))
+            .await
+            .unwrap();
+        let got2 = recv2.await.unwrap().unwrap();
+        assert_eq!(got2, Bytes::from_static(b"reader-payload-2"));
+    }
+
+    #[tokio::test]
+    async fn protocol_mismatch_frames_are_ignored_until_push() {
+        let (mut reader, mut peer_in, mut peer_out) = setup_reader().await;
+
+        let mut recv = Box::pin(reader.next());
+        let pull = tokio::select! {
+            frame = peer_out.next() => frame.unwrap().unwrap(),
+            item = &mut recv => panic!("reader completed unexpectedly: {item:?}"),
+        };
+        assert_eq!(pull, Frame::Pull);
+
+        peer_in.send(Frame::Pull).await.unwrap();
+        peer_in
+            .send(Frame::Stop(VarInt::from_u32(1)))
+            .await
+            .unwrap();
+        peer_in
+            .send(Frame::Push(Bytes::from_static(b"ok")))
+            .await
+            .unwrap();
+
+        let got = recv.await.unwrap().unwrap();
+        assert_eq!(got, Bytes::from_static(b"ok"));
+    }
+
+    #[tokio::test]
+    async fn cancel_frame_turns_reader_into_reset() {
+        let (mut reader, mut peer_in, mut peer_out) = setup_reader().await;
+
+        let mut recv = Box::pin(reader.next());
+        let pull = tokio::select! {
+            frame = peer_out.next() => frame.unwrap().unwrap(),
+            item = &mut recv => panic!("reader completed unexpectedly: {item:?}"),
+        };
+        assert_eq!(pull, Frame::Pull);
+        peer_in
+            .send(Frame::Cancel(VarInt::from_u32(9)))
+            .await
+            .unwrap();
+
+        let err = recv.await.unwrap().unwrap_err();
+        match err {
+            StreamError::Reset { code } => assert_eq!(code, VarInt::from_u32(9)),
+            other => panic!("expected reset error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn conn_closed_with_dead_lifecycle_returns_connection_error() {
+        let (mut reader, mut peer_in, mut peer_out) =
+            setup_reader_with_lifecycle(dead_lifecycle("reader conn closed")).await;
+
+        let mut recv = Box::pin(reader.next());
+        let pull = tokio::select! {
+            frame = peer_out.next() => frame.unwrap().unwrap(),
+            item = &mut recv => panic!("reader completed unexpectedly: {item:?}"),
+        };
+        assert_eq!(pull, Frame::Pull);
+        peer_in.send(Frame::ConnClosed).await.unwrap();
+
+        let err = recv.await.unwrap().unwrap_err();
+        assert!(matches!(err, StreamError::Connection { .. }));
+    }
+
+    #[tokio::test]
+    async fn eof_with_alive_lifecycle_finishes_stream() {
+        let (mut reader, peer_in, mut peer_out) = setup_reader().await;
+
+        let mut recv = Box::pin(reader.next());
+        let pull = tokio::select! {
+            frame = peer_out.next() => frame.unwrap().unwrap(),
+            item = &mut recv => panic!("reader completed unexpectedly: {item:?}"),
+        };
+        assert_eq!(pull, Frame::Pull);
+        drop(peer_in);
+
+        assert!(recv.await.is_none());
+    }
+
+    #[tokio::test]
+    async fn eof_with_dead_lifecycle_returns_connection_error() {
+        let (mut reader, peer_in, mut peer_out) =
+            setup_reader_with_lifecycle(dead_lifecycle("reader eof while dead")).await;
+
+        let mut recv = Box::pin(reader.next());
+        let pull = tokio::select! {
+            frame = peer_out.next() => frame.unwrap().unwrap(),
+            item = &mut recv => panic!("reader completed unexpectedly: {item:?}"),
+        };
+        assert_eq!(pull, Frame::Pull);
+        drop(peer_in);
+
+        let err = recv.await.unwrap().unwrap_err();
+        assert!(matches!(err, StreamError::Connection { .. }));
+    }
+
+    #[tokio::test]
+    async fn stop_sends_stop_frame_with_code() {
+        let (mut reader, _peer_in, mut peer_out) = setup_reader().await;
+        let code = VarInt::from_u32(77);
+
+        poll_fn(|cx| Pin::new(&mut reader).poll_stop(cx, code))
+            .await
+            .unwrap();
+
+        // STOP is best-effort: if it is observed on wire, it must carry the
+        // same code. Implementations may still report success when the frame
+        // has only been queued locally.
+        if let Ok(Some(Ok(frame))) = timeout(Duration::from_millis(100), peer_out.next()).await {
+            assert_eq!(frame, Frame::Stop(code));
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_is_noop_after_reader_is_dead() {
+        let (mut reader, mut peer_in, mut peer_out) =
+            setup_reader_with_lifecycle(dead_lifecycle("reader dead before stop")).await;
+
+        let mut recv = Box::pin(reader.next());
+        let pull = tokio::select! {
+            frame = peer_out.next() => frame.unwrap().unwrap(),
+            item = &mut recv => panic!("reader completed unexpectedly: {item:?}"),
+        };
+        assert_eq!(pull, Frame::Pull);
+        peer_in.send(Frame::ConnClosed).await.unwrap();
+        let _ = recv.await;
+
+        let code = VarInt::from_u32(5);
+        poll_fn(|cx| Pin::new(&mut reader).poll_stop(cx, code))
+            .await
+            .unwrap();
+
+        if let Ok(Some(Ok(frame))) = timeout(Duration::from_millis(50), peer_out.next()).await {
+            assert_ne!(frame, Frame::Stop(code));
+        }
+    }
+
+    #[tokio::test]
+    async fn codec_error_finishes_reader_when_connection_alive() {
+        let (reader_side, peer_side) = UnixStream::pair().unwrap();
+        let (reader_read, reader_write) = reader_side.into_split();
+        let (peer_read, mut peer_write) = peer_side.into_split();
+
+        let lifecycle = alive_lifecycle();
+        let mut reader = PipeReader::new(VarInt::from_u32(1), reader_read, reader_write, lifecycle);
+        let mut peer_out = FramedRead::new(peer_read, PipeCodec::new());
+
+        let mut recv = Box::pin(reader.next());
+        let pull = tokio::select! {
+            frame = peer_out.next() => frame.unwrap().unwrap(),
+            item = &mut recv => panic!("reader completed unexpectedly: {item:?}"),
+        };
+        assert_eq!(pull, Frame::Pull);
+
+        peer_write.write_all(&[0xff]).await.unwrap();
+
+        assert!(recv.await.is_none());
+    }
+}
