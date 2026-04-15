@@ -8,108 +8,145 @@
 //!
 //! The writer may only send data after the peer reader has granted permission
 //! via a `PULL` frame.  The protocol is strictly serial: each `PULL` permits
-//! exactly one `DATA` frame.  `poll_ready` returns `Pending` when no `PULL`
+//! exactly one `PUSH` frame.  `poll_ready` returns `Pending` when no `PULL`
 //! has been received, and resumes once one arrives.
 //!
 //! # Flush / Close semantics
 //!
-//! - `poll_flush` — flushes the user-space codec buffer.
+//! - `poll_flush` — flushes the pending PUSH frame via vectored I/O.
 //! - `poll_close` — flushes remaining data, then shuts down the write half
 //!   (`SHUT_WR`), which the remote side observes as EOF (equivalent to QUIC FIN).
 
 use std::{
-    mem,
+    ops::ControlFlow,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
-use futures::{Sink, Stream, future::BoxFuture, ready};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio_util::codec::{FramedRead, FramedWrite};
+use futures::Sink;
+use tokio::{
+    io::AsyncWrite,
+    net::unix::{OwnedReadHalf, OwnedWriteHalf},
+};
+use tokio_util::codec::FramedRead;
 
-use super::codec::{Frame, PipeCodec};
+use super::{
+    codec::{Frame, PipeCodec, TAG_CANCEL, TAG_CONN_CLOSED},
+    state::{
+        PendingPush, PipeState, Step, Transition, check_lifecycle, drain, encode_control,
+        flush_pending,
+    },
+};
 use crate::{
-    quic::{self, CancelStream, ConnectionError, GetStreamId, StreamError},
+    quic::{self, CancelStream, GetStreamId, StreamError},
     varint::VarInt,
 };
 
-/// Signal from [`ActiveWriter::drain_control`] indicating what action the
-/// caller should take.
-enum ControlSignal {
-    /// No state-changing signal; continue normally.
-    Ok,
-    /// STOP received — finish with Reset.
-    Stop(VarInt),
-    /// CONN_CLOSED or read half broken — enter Closing.
-    Close,
-}
-
 /// Active-state fields for the writer.
-///
-/// Holds the socket halves and connection lifecycle handle.  These are only
-/// meaningful while the stream is alive; once the stream transitions to
-/// `Closing` or `Finished` they are dropped.
-struct ActiveWriter {
-    /// Whether a `PULL` frame has been received, granting permission to send
-    /// one `DATA` frame.
-    pulled: bool,
+struct WriterLive {
     read: FramedRead<OwnedReadHalf, PipeCodec>,
-    write: FramedWrite<OwnedWriteHalf, PipeCodec>,
-    connection: Arc<dyn quic::DynLifecycle>,
+    write: OwnedWriteHalf,
+    lifecycle: Arc<dyn quic::DynLifecycle>,
+    pulled: bool,
+    pending: Option<PendingPush>,
 }
 
-impl ActiveWriter {
-    /// Non-blocking drain of incoming control frames (PULL / STOP / CONN_CLOSED).
+impl WriterLive {
+    /// Drain inbound control frames and check the lifecycle.
     ///
-    /// Updates `pulled` on PULL and returns a signal on STOP / CONN_CLOSED.
-    fn drain_control(&mut self, cx: &mut Context<'_>) -> ControlSignal {
-        loop {
-            match Pin::new(&mut self.read).poll_next(cx) {
-                Poll::Ready(Some(Ok(Frame::Pull))) => {
-                    self.pulled = true;
-                }
-                Poll::Ready(Some(Ok(Frame::Stop(code)))) => {
-                    return ControlSignal::Stop(code);
-                }
-                Poll::Ready(Some(Ok(Frame::ConnClosed))) => {
-                    return ControlSignal::Close;
-                }
-                Poll::Ready(Some(Ok(_))) => {
-                    // DATA or CANCEL on a writer — ignore (protocol mismatch).
-                    continue;
-                }
-                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
-                    // Read half closed/errored — connection is likely dead.
-                    if self.connection.check().is_err() {
-                        return ControlSignal::Close;
-                    }
-                    return ControlSignal::Ok;
-                }
-                Poll::Pending => return ControlSignal::Ok,
+    /// - `PULL` → grant send permission
+    /// - `STOP(code)` → peer requests reset
+    /// - `CONN_CLOSED` → connection died
+    /// - others → ignore
+    ///
+    /// On read-close: if the connection is dead, sends best-effort `CONN_CLOSED`
+    /// (only when no partial DATA is in flight) and transitions to `ConnDied`.
+    fn drain_and_check(&mut self, cx: &mut Context<'_>) -> Step<()> {
+        let outcome = drain(&mut self.read, cx, |frame| match frame {
+            Frame::Pull => {
+                self.pulled = true;
+                ControlFlow::Continue(())
             }
+            Frame::Stop(code) => ControlFlow::Break(Transition::Reset(code)),
+            Frame::ConnClosed => ControlFlow::Break(Transition::ConnDied(self.lifecycle.clone())),
+            _ => ControlFlow::Continue(()),
+        });
+
+        outcome.resolve(|| {
+            if self.lifecycle.check().is_err() {
+                // Only send CONN_CLOSED if no partial DATA is in flight.
+                if self.pending.is_none() {
+                    let _ = Pin::new(&mut self.write).poll_write(cx, &[TAG_CONN_CLOSED]);
+                }
+                Step::Transition(Transition::ConnDied(self.lifecycle.clone()))
+            } else {
+                Step::Done(())
+            }
+        })
+    }
+
+    /// `poll_ready` step: drain control → check pulled + no pending data.
+    fn step_poll_ready(&mut self, cx: &mut Context<'_>) -> Step<()> {
+        let step = self.drain_and_check(cx);
+        step.and_then(|()| {
+            if self.pulled && self.pending.is_none() {
+                Step::Done(())
+            } else {
+                Step::Pending
+            }
+        })
+    }
+
+    /// `poll_flush` step: drain control → flush pending PUSH via vectored I/O.
+    fn step_poll_flush(&mut self, cx: &mut Context<'_>) -> Step<()> {
+        let step = self.drain_and_check(cx);
+        step.and_then(|()| flush_pending(&mut self.write, &self.lifecycle, &mut self.pending, cx))
+    }
+
+    /// `poll_close` step: flush pending data → shutdown write half (SHUT_WR).
+    fn step_poll_close(&mut self, cx: &mut Context<'_>) -> Step<()> {
+        let Self {
+            write,
+            lifecycle,
+            pending,
+            ..
+        } = self;
+        flush_pending(write, lifecycle, pending, cx).and_then(|()| {
+            match Pin::new(&mut *write).poll_shutdown(cx) {
+                Poll::Ready(Ok(())) => Step::Transition(Transition::Finish),
+                Poll::Ready(Err(e)) => {
+                    tracing::debug!(%e, "pipe write error during close shutdown");
+                    check_lifecycle(lifecycle, Step::Transition(Transition::Finish))
+                }
+                Poll::Pending => Step::Pending,
+            }
+        })
+    }
+
+    /// `poll_cancel` step: discard pending data → best-effort CANCEL → shutdown.
+    fn step_poll_cancel(&mut self, code: VarInt, cx: &mut Context<'_>) -> Step<()> {
+        self.pending = None;
+        let (buf, len) = encode_control(TAG_CANCEL, code);
+        let _ = Pin::new(&mut self.write).poll_write(cx, &buf[..len]);
+        match Pin::new(&mut self.write).poll_shutdown(cx) {
+            Poll::Ready(_) => Step::Transition(Transition::Finish),
+            Poll::Pending => Step::Pending,
         }
     }
 }
 
+// ── PipeWriter ──────────────────────────────────────────────────────────────
+
 /// Write half of a per-stream pipe.
 ///
-/// Sends DATA frames through the write half of the socketpair.
+/// Sends PUSH frames through the write half of the socketpair.
 /// Reads PULL/STOP/CONN_CLOSED frames from the read half for flow control
 /// and lifecycle signals.
 pub struct PipeWriter {
     stream_id: VarInt,
-    state: WriterState,
-}
-
-enum WriterState {
-    /// Normal operation.
-    Active(ActiveWriter),
-    /// Connection closed — waiting for the real terminal error.
-    Closing(BoxFuture<'static, ConnectionError>),
-    /// Stream has ended.  `Ok(())` = clean close, `Err` = error termination.
-    Finished(Result<(), StreamError>),
+    state: PipeState<WriterLive>,
 }
 
 impl PipeWriter {
@@ -122,122 +159,13 @@ impl PipeWriter {
     ) -> Self {
         Self {
             stream_id,
-            state: WriterState::Active(ActiveWriter {
-                pulled: false,
+            state: PipeState::Live(WriterLive {
                 read: FramedRead::new(read_half, PipeCodec::new()),
-                write: FramedWrite::new(write_half, PipeCodec::new()),
-                connection: lifecycle,
+                write: write_half,
+                lifecycle,
+                pulled: false,
+                pending: None,
             }),
-        }
-    }
-
-    /// Transition to `Closing` and start polling for the real connection error.
-    ///
-    /// Takes ownership of the `connection` handle from the `Active` state via
-    /// `mem::replace`, then polls `closed()`.  If `check()` already returns
-    /// an error, go straight to `Finished`.
-    fn enter_closing(&mut self, cx: &mut Context<'_>) {
-        let WriterState::Active(active) =
-            mem::replace(&mut self.state, WriterState::Finished(Ok(())))
-        else {
-            return;
-        };
-        let connection = active.connection;
-        if let Err(e) = connection.check() {
-            self.state = WriterState::Finished(Err(StreamError::Connection { source: e }));
-            return;
-        }
-        let mut fut: BoxFuture<'static, ConnectionError> =
-            Box::pin(async move { connection.closed().await });
-        match fut.as_mut().poll(cx) {
-            Poll::Ready(e) => {
-                self.state = WriterState::Finished(Err(StreamError::Connection { source: e }));
-            }
-            Poll::Pending => {
-                self.state = WriterState::Closing(fut);
-            }
-        }
-    }
-
-    /// Poll a non-Active state for the terminal `StreamError`.
-    ///
-    /// Drives `Closing` → `Finished` promotion, then returns the latched
-    /// error.  Returns `Pending` only when `Closing` future is not yet ready.
-    fn poll_terminal_error(&mut self, cx: &mut Context<'_>) -> Poll<StreamError> {
-        loop {
-            match &mut self.state {
-                WriterState::Active(_) => unreachable!("called in Active state"),
-                WriterState::Closing(fut) => {
-                    let e = ready!(fut.as_mut().poll(cx));
-                    self.state = WriterState::Finished(Err(StreamError::Connection { source: e }));
-                    continue;
-                }
-                WriterState::Finished(Err(e)) => return Poll::Ready(e.clone()),
-                WriterState::Finished(Ok(())) => {
-                    return Poll::Ready(StreamError::Reset {
-                        code: VarInt::default(),
-                    });
-                }
-            }
-        }
-    }
-
-    /// Ensure we are in `Active` state (draining control frames and checking
-    /// the lifecycle), then run `f`.  If the state has transitioned away from
-    /// `Active`, returns the terminal error instead.
-    fn with_active<T>(
-        &mut self,
-        cx: &mut Context<'_>,
-        f: impl FnOnce(&mut ActiveWriter, &mut Context<'_>) -> Poll<Result<T, StreamError>>,
-    ) -> Poll<Result<T, StreamError>> {
-        loop {
-            // ── Non-Active: resolve terminal error ──
-            if !matches!(self.state, WriterState::Active(_)) {
-                return Poll::Ready(Err(ready!(self.poll_terminal_error(cx))));
-            }
-
-            // ── Active: drain control frames ──
-            let signal = {
-                let WriterState::Active(active) = &mut self.state else {
-                    unreachable!();
-                };
-                active.drain_control(cx)
-            };
-            match signal {
-                ControlSignal::Stop(code) => {
-                    self.state = WriterState::Finished(Err(StreamError::Reset { code }));
-                    continue;
-                }
-                ControlSignal::Close => {
-                    self.enter_closing(cx);
-                    continue;
-                }
-                ControlSignal::Ok => {}
-            }
-
-            // ── Active: check lifecycle ──
-            let dead = {
-                let WriterState::Active(active) = &mut self.state else {
-                    unreachable!();
-                };
-                if active.connection.check().is_err() {
-                    let _ = Pin::new(&mut active.write).start_send(Frame::ConnClosed);
-                    let _ = Pin::new(&mut active.write).poll_flush(cx);
-                    true
-                } else {
-                    false
-                }
-            };
-            if dead {
-                self.enter_closing(cx);
-                continue;
-            }
-
-            // ── Active: run closure ──
-            let WriterState::Active(active) = &mut self.state else {
-                unreachable!();
-            };
-            return f(active, cx);
         }
     }
 }
@@ -256,84 +184,72 @@ impl Sink<Bytes> for PipeWriter {
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
         let this = self.get_mut();
-        this.with_active(cx, |active, cx| {
-            if !active.pulled {
-                return Poll::Pending;
+        loop {
+            if let Some(poll) = this.state.poll_non_live(cx) {
+                return poll.map(|r| {
+                    r.and(Err(StreamError::Reset {
+                        code: VarInt::default(),
+                    }))
+                });
             }
-            Pin::new(&mut active.write).poll_ready(cx).map_err(|e| {
-                tracing::debug!(%e, "pipe codec error on writer poll_ready");
-                active
-                    .connection
-                    .check()
-                    .expect_err("pipe IO failed but lifecycle check passed")
-                    .into()
-            })
-        })
+            let live = this.state.live_mut().unwrap();
+            match live.step_poll_ready(cx) {
+                Step::Done(()) => return Poll::Ready(Ok(())),
+                Step::Pending => return Poll::Pending,
+                Step::Transition(t) => this.state.apply(t, cx),
+            }
+        }
     }
 
     fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), StreamError> {
         let this = self.get_mut();
-        let WriterState::Active(active) = &mut this.state else {
+        let PipeState::Live(live) = &mut this.state else {
             return Err(StreamError::Reset {
                 code: VarInt::default(),
             });
         };
-        active.pulled = false;
-        Pin::new(&mut active.write)
-            .start_send(Frame::Data(item))
-            .map_err(|e| {
-                tracing::debug!(%e, "pipe codec error on writer start_send");
-                active
-                    .connection
-                    .check()
-                    .expect_err("pipe encode failed but lifecycle check passed")
-                    .into()
-            })
+        if !live.pulled || live.pending.is_some() {
+            return Err(StreamError::Reset {
+                code: VarInt::default(),
+            });
+        }
+        live.pending = Some(PendingPush::new(item)?);
+        live.pulled = false;
+        Ok(())
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
         let this = self.get_mut();
-        this.with_active(cx, |active, cx| {
-            Pin::new(&mut active.write).poll_flush(cx).map_err(|e| {
-                tracing::debug!(%e, "pipe codec error on writer poll_flush");
-                active
-                    .connection
-                    .check()
-                    .expect_err("pipe IO failed but lifecycle check passed")
-                    .into()
-            })
-        })
+        loop {
+            if let Some(poll) = this.state.poll_non_live(cx) {
+                return poll.map(|r| {
+                    r.and(Err(StreamError::Reset {
+                        code: VarInt::default(),
+                    }))
+                });
+            }
+            let live = this.state.live_mut().unwrap();
+            match live.step_poll_flush(cx) {
+                Step::Done(()) => return Poll::Ready(Ok(())),
+                Step::Pending => return Poll::Pending,
+                Step::Transition(t) => this.state.apply(t, cx),
+            }
+        }
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
         let this = self.get_mut();
-        let close_result = match &mut this.state {
-            WriterState::Active(active) => Pin::new(&mut active.write).poll_close(cx),
-            _ => return Poll::Ready(Ok(())),
-        };
-        match close_result {
-            Poll::Ready(Ok(())) => {
-                this.state = WriterState::Finished(Ok(()));
-                Poll::Ready(Ok(()))
+        loop {
+            if let Some(poll) = this.state.poll_non_live(cx) {
+                // Dead(Ok(())) = clean close succeeded; Dead(Err(_)) = already failed.
+                return poll;
             }
-            Poll::Ready(Err(e)) => {
-                tracing::debug!(%e, "pipe codec error on writer poll_close");
-                let WriterState::Active(active) =
-                    mem::replace(&mut this.state, WriterState::Finished(Ok(())))
-                else {
-                    unreachable!();
-                };
-                match active.connection.check() {
-                    Err(conn_err) => {
-                        this.state = WriterState::Finished(Err(StreamError::Connection {
-                            source: conn_err.clone(),
-                        }));
-                        Poll::Ready(Err(StreamError::Connection { source: conn_err }))
-                    }
-                    Ok(()) => Poll::Ready(Ok(())),
-                }
+            let live = this.state.live_mut().unwrap();
+            match live.step_poll_close(cx) {
+                Step::Done(()) => return Poll::Ready(Ok(())),
+                Step::Pending => return Poll::Pending,
+                Step::Transition(t) => this.state.apply(t, cx),
             }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -345,39 +261,156 @@ impl CancelStream for PipeWriter {
         code: VarInt,
     ) -> Poll<Result<(), StreamError>> {
         let this = self.get_mut();
-        let close_result = {
-            let WriterState::Active(active) = &mut this.state else {
+        loop {
+            if let Some(poll) = this.state.poll_non_live(cx) {
+                // Already dead — cancel is a no-op.
+                let _ = poll;
                 return Poll::Ready(Ok(()));
-            };
-            // Best-effort: ready → send CANCEL → close.
-            if Pin::new(&mut active.write).poll_ready(cx).is_ready() {
-                let _ = Pin::new(&mut active.write).start_send(Frame::Cancel(code));
             }
-            Pin::new(&mut active.write).poll_close(cx)
-        };
-        match close_result {
-            Poll::Ready(Ok(())) => {
-                this.state = WriterState::Finished(Ok(()));
-                Poll::Ready(Ok(()))
+            let live = this.state.live_mut().unwrap();
+            match live.step_poll_cancel(code, cx) {
+                Step::Done(()) => return Poll::Ready(Ok(())),
+                Step::Pending => return Poll::Pending,
+                Step::Transition(t) => this.state.apply(t, cx),
             }
-            Poll::Ready(Err(e)) => {
-                tracing::debug!(%e, "pipe codec error on writer poll_cancel");
-                let WriterState::Active(active) =
-                    mem::replace(&mut this.state, WriterState::Finished(Ok(())))
-                else {
-                    unreachable!();
-                };
-                match active.connection.check() {
-                    Err(conn_err) => {
-                        this.state = WriterState::Finished(Err(StreamError::Connection {
-                            source: conn_err.clone(),
-                        }));
-                        Poll::Ready(Err(StreamError::Connection { source: conn_err }))
-                    }
-                    Ok(()) => Poll::Ready(Ok(())),
-                }
-            }
-            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        borrow::Cow,
+        future::pending,
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+    };
+
+    use bytes::Bytes;
+    use futures::{Sink, SinkExt, StreamExt, future::poll_fn, task::noop_waker_ref};
+    use tokio::net::{
+        UnixStream,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    };
+    use tokio_util::codec::{FramedRead, FramedWrite};
+
+    use super::*;
+    use crate::quic::ConnectionError;
+
+    struct TestLifecycle;
+
+    impl quic::Lifecycle for TestLifecycle {
+        fn close(&self, _code: crate::error::Code, _reason: Cow<'static, str>) {}
+
+        fn check(&self) -> Result<(), ConnectionError> {
+            Ok(())
+        }
+
+        async fn closed(&self) -> ConnectionError {
+            pending().await
+        }
+    }
+
+    async fn setup_writer() -> (
+        PipeWriter,
+        FramedWrite<OwnedWriteHalf, PipeCodec>,
+        FramedRead<OwnedReadHalf, PipeCodec>,
+    ) {
+        let (writer_side, peer_side) = UnixStream::pair().unwrap();
+        let (writer_read, writer_write) = writer_side.into_split();
+        let (peer_read, peer_write) = peer_side.into_split();
+
+        let lifecycle: Arc<dyn quic::DynLifecycle> = Arc::new(TestLifecycle);
+        let writer = PipeWriter::new(VarInt::from_u32(1), writer_read, writer_write, lifecycle);
+
+        (
+            writer,
+            FramedWrite::new(peer_write, PipeCodec::new()),
+            FramedRead::new(peer_read, PipeCodec::new()),
+        )
+    }
+
+    fn poll_ready_once(writer: &mut PipeWriter) -> Poll<Result<(), StreamError>> {
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        Pin::new(writer).poll_ready(&mut cx)
+    }
+
+    #[tokio::test]
+    async fn poll_ready_pending_without_pull() {
+        let (mut writer, _peer_ctrl, _peer_data) = setup_writer().await;
+        assert!(poll_ready_once(&mut writer).is_pending());
+    }
+
+    #[tokio::test]
+    async fn pull_then_send_data_roundtrip() {
+        let (mut writer, mut peer_ctrl, mut peer_data) = setup_writer().await;
+
+        peer_ctrl.send(Frame::Pull).await.unwrap();
+
+        poll_fn(|cx| Pin::new(&mut writer).poll_ready(cx))
+            .await
+            .unwrap();
+        Pin::new(&mut writer)
+            .start_send(Bytes::from_static(b"hello pipe"))
+            .unwrap();
+        poll_fn(|cx| Pin::new(&mut writer).poll_flush(cx))
+            .await
+            .unwrap();
+
+        let frame = peer_data.next().await.unwrap().unwrap();
+        assert_eq!(frame, Frame::Push(Bytes::from_static(b"hello pipe")));
+    }
+
+    #[tokio::test]
+    async fn pull_permission_consumed_per_data_frame() {
+        let (mut writer, mut peer_ctrl, mut peer_data) = setup_writer().await;
+
+        peer_ctrl.send(Frame::Pull).await.unwrap();
+        poll_fn(|cx| Pin::new(&mut writer).poll_ready(cx))
+            .await
+            .unwrap();
+        Pin::new(&mut writer)
+            .start_send(Bytes::from_static(b"first"))
+            .unwrap();
+        poll_fn(|cx| Pin::new(&mut writer).poll_flush(cx))
+            .await
+            .unwrap();
+        let _ = peer_data.next().await.unwrap().unwrap();
+
+        assert!(poll_ready_once(&mut writer).is_pending());
+
+        peer_ctrl.send(Frame::Pull).await.unwrap();
+        poll_fn(|cx| Pin::new(&mut writer).poll_ready(cx))
+            .await
+            .unwrap();
+        Pin::new(&mut writer)
+            .start_send(Bytes::from_static(b"second"))
+            .unwrap();
+        poll_fn(|cx| Pin::new(&mut writer).poll_flush(cx))
+            .await
+            .unwrap();
+
+        let frame = peer_data.next().await.unwrap().unwrap();
+        assert_eq!(frame, Frame::Push(Bytes::from_static(b"second")));
+    }
+
+    #[tokio::test]
+    async fn stop_frame_turns_writer_into_reset() {
+        let (mut writer, mut peer_ctrl, _peer_data) = setup_writer().await;
+
+        peer_ctrl
+            .send(Frame::Stop(VarInt::from_u32(7)))
+            .await
+            .unwrap();
+
+        let err = poll_fn(|cx| Pin::new(&mut writer).poll_ready(cx))
+            .await
+            .unwrap_err();
+        match err {
+            StreamError::Reset { code } => assert_eq!(code, VarInt::from_u32(7)),
+            other => panic!("expected reset error, got {other:?}"),
         }
     }
 }

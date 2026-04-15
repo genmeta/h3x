@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! PULL        = type(varint 0x00)
-//! DATA        = type(varint 0x01) + length(varint) + payload
+//! PUSH        = type(varint 0x01) + length(varint) + payload
 //! STOP        = type(varint 0x02) + code(varint)
 //! CANCEL      = type(varint 0x03) + code(varint)
 //! CONN_CLOSED = type(varint 0x04)
@@ -20,20 +20,26 @@ use tokio_util::codec::{Decoder, Encoder};
 use crate::varint::VarInt;
 
 /// Frame type tags.
-const TAG_PULL: u8 = 0x00;
-const TAG_DATA: u8 = 0x01;
-const TAG_STOP: u8 = 0x02;
-const TAG_CANCEL: u8 = 0x03;
-const TAG_CONN_CLOSED: u8 = 0x04;
+pub(super) const TAG_PULL: u8 = 0x00;
+const TAG_PUSH: u8 = 0x01;
+pub(super) const TAG_STOP: u8 = 0x02;
+pub(super) const TAG_CANCEL: u8 = 0x03;
+pub(super) const TAG_CONN_CLOSED: u8 = 0x04;
+
+/// Maximum encoded header bytes for a PUSH frame: tag + varint length.
+pub(super) const PUSH_HEADER_MAX_LEN: usize = 1 + VarInt::MAX_SIZE;
+
+/// Maximum encoded bytes for a control frame: tag + varint code.
+pub(super) const CONTROL_MAX_LEN: usize = 1 + VarInt::MAX_SIZE;
 
 /// Frames exchanged over a per-stream socketpair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     /// Flow-control signal — reader grants the writer permission to send one
-    /// DATA frame.
+    /// PUSH frame.
     Pull,
     /// Stream data payload.
-    Data(Bytes),
+    Push(Bytes),
     /// STOP_SENDING — reader asks the remote writer to stop (carries error code).
     Stop(VarInt),
     /// RESET_STREAM — writer cancels the stream (carries error code).
@@ -87,6 +93,37 @@ fn encode_varint(buf: &mut BytesMut, v: VarInt) {
     }
 }
 
+pub(super) fn encode_varint_to_slice(dst: &mut [u8], v: VarInt) -> usize {
+    let x = v.into_inner();
+    if x < (1 << 6) {
+        dst[0] = x as u8;
+        1
+    } else if x < (1 << 14) {
+        let bytes = ((0b01 << 14) | x as u16).to_be_bytes();
+        dst[..2].copy_from_slice(&bytes);
+        2
+    } else if x < (1 << 30) {
+        let bytes = ((0b10 << 30) | x as u32).to_be_bytes();
+        dst[..4].copy_from_slice(&bytes);
+        4
+    } else {
+        let bytes = ((0b11 << 62) | x).to_be_bytes();
+        dst[..8].copy_from_slice(&bytes);
+        8
+    }
+}
+
+/// Encode PUSH frame header bytes (`TAG_PUSH + varint(payload_len)`).
+pub(super) fn encode_push_header(
+    payload_len: usize,
+) -> Result<([u8; PUSH_HEADER_MAX_LEN], usize), CodecError> {
+    let len = VarInt::try_from(payload_len).map_err(|_| CodecError::VarIntOverflow)?;
+    let mut header = [0u8; PUSH_HEADER_MAX_LEN];
+    header[0] = TAG_PUSH;
+    let varint_size = encode_varint_to_slice(&mut header[1..], len);
+    Ok((header, 1 + varint_size))
+}
+
 /// Minimal framing codec for the per-stream pipe protocol.
 #[derive(Debug, Default)]
 pub struct PipeCodec {
@@ -100,7 +137,7 @@ enum DecodeState {
     #[default]
     Tag,
     /// We have the tag and the payload length, waiting for payload bytes.
-    Data { len: usize },
+    Push { len: usize },
     /// Control frame (STOP/CANCEL): tag decoded, need varint code.
     Control { tag: u8 },
 }
@@ -125,7 +162,7 @@ impl Decoder for PipeCodec {
                     // Peek at the tag byte (first byte is always a 1-byte varint for 0x00..0x04).
                     let tag = src[0];
                     match tag {
-                        TAG_DATA => {
+                        TAG_PUSH => {
                             // Need tag + varint length. Try to decode the length varint
                             // starting right after the tag byte.
                             if src.len() < 2 {
@@ -140,16 +177,16 @@ impl Decoder for PipeCodec {
                             let header_size = 1 + vi_size;
                             let total = header_size + len;
                             if src.len() < total {
-                                // Consume the header so DecodeState::Data only waits for payload.
+                                // Consume the header so DecodeState::Push only waits for payload.
                                 src.advance(header_size);
                                 src.reserve(len.saturating_sub(src.len()));
-                                self.state = DecodeState::Data { len };
+                                self.state = DecodeState::Push { len };
                                 return Ok(None);
                             }
                             src.advance(header_size);
                             let data = src.split_to(len).freeze();
                             // state stays Tag for next frame
-                            return Ok(Some(Frame::Data(data)));
+                            return Ok(Some(Frame::Push(data)));
                         }
                         TAG_PULL => {
                             src.advance(1);
@@ -166,7 +203,7 @@ impl Decoder for PipeCodec {
                         _ => return Err(CodecError::UnknownTag { tag }),
                     }
                 }
-                DecodeState::Data { len } => {
+                DecodeState::Push { len } => {
                     // We already consumed the header; just wait for the payload.
                     if src.len() < len {
                         src.reserve(len - src.len());
@@ -174,7 +211,7 @@ impl Decoder for PipeCodec {
                     }
                     let data = src.split_to(len).freeze();
                     self.state = DecodeState::Tag;
-                    return Ok(Some(Frame::Data(data)));
+                    return Ok(Some(Frame::Push(data)));
                 }
                 DecodeState::Control { tag } => {
                     let Some((code, vi_size)) = try_decode_varint(src) else {
@@ -202,11 +239,10 @@ impl Encoder<Frame> for PipeCodec {
                 dst.reserve(1);
                 dst.put_u8(TAG_PULL);
             }
-            Frame::Data(data) => {
-                let len = VarInt::try_from(data.len()).map_err(|_| CodecError::VarIntOverflow)?;
-                dst.reserve(1 + len.encoding_size() + data.len());
-                dst.put_u8(TAG_DATA);
-                encode_varint(dst, len);
+            Frame::Push(data) => {
+                let (header, header_len) = encode_push_header(data.len())?;
+                dst.reserve(header_len + data.len());
+                dst.extend_from_slice(&header[..header_len]);
                 dst.extend_from_slice(&data);
             }
             Frame::Stop(code) => {
@@ -245,12 +281,12 @@ mod tests {
 
     #[test]
     fn data_frame_round_trip() {
-        round_trip(Frame::Data(Bytes::from_static(b"hello world")));
+        round_trip(Frame::Push(Bytes::from_static(b"hello world")));
     }
 
     #[test]
     fn empty_data_frame_round_trip() {
-        round_trip(Frame::Data(Bytes::new()));
+        round_trip(Frame::Push(Bytes::new()));
     }
 
     #[test]
@@ -276,7 +312,7 @@ mod tests {
     #[test]
     fn large_data_frame() {
         let data = Bytes::from(vec![0xab; 70_000]);
-        round_trip(Frame::Data(data));
+        round_trip(Frame::Push(data));
     }
 
     #[test]
@@ -286,9 +322,9 @@ mod tests {
 
         let frames = vec![
             Frame::Pull,
-            Frame::Data(Bytes::from_static(b"first")),
+            Frame::Push(Bytes::from_static(b"first")),
             Frame::Stop(VarInt::from_u32(1)),
-            Frame::Data(Bytes::from_static(b"second")),
+            Frame::Push(Bytes::from_static(b"second")),
             Frame::Cancel(VarInt::from_u32(2)),
             Frame::ConnClosed,
         ];
@@ -310,7 +346,7 @@ mod tests {
         let mut codec = PipeCodec::new();
         let mut buf = BytesMut::new();
         codec
-            .encode(Frame::Data(Bytes::from_static(b"abc")), &mut buf)
+            .encode(Frame::Push(Bytes::from_static(b"abc")), &mut buf)
             .unwrap();
 
         let full = buf.split();
@@ -324,7 +360,7 @@ mod tests {
         }
         partial.extend_from_slice(&full[full.len() - 1..]);
         let decoded = decoder.decode(&mut partial).unwrap().unwrap();
-        assert_eq!(decoded, Frame::Data(Bytes::from_static(b"abc")));
+        assert_eq!(decoded, Frame::Push(Bytes::from_static(b"abc")));
     }
 
     #[test]
@@ -332,5 +368,30 @@ mod tests {
         let mut decoder = PipeCodec::new();
         let mut buf = BytesMut::from(&[0xff][..]);
         assert!(decoder.decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn data_header_encoding_boundaries() {
+        let lens = [0usize, 63, 64, 16_383, 16_384, (1 << 30) - 1, 1 << 30];
+        for len in lens {
+            let (header, header_len) = encode_push_header(len).unwrap();
+            assert_eq!(header[0], TAG_PUSH);
+            let decoded = try_decode_varint(&header[1..header_len]).unwrap();
+            assert_eq!(decoded.0.into_inner(), len as u64);
+            assert_eq!(header_len, 1 + decoded.1);
+        }
+    }
+
+    #[test]
+    fn data_header_matches_frame_prefix() {
+        let payload = Bytes::from(vec![0x5a; 1024]);
+        let mut codec = PipeCodec::new();
+        let mut encoded = BytesMut::new();
+        codec
+            .encode(Frame::Push(payload.clone()), &mut encoded)
+            .unwrap();
+
+        let (header, header_len) = encode_push_header(payload.len()).unwrap();
+        assert_eq!(&encoded[..header_len], &header[..header_len]);
     }
 }
