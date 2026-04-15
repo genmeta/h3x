@@ -24,7 +24,7 @@ use tokio::{io::AsyncWrite, net::unix::OwnedReadHalf};
 use tokio_util::codec::FramedRead;
 
 use super::codec::{
-    CONTROL_MAX_LEN, Frame, PUSH_HEADER_MAX_LEN, PipeCodec, encode_push_header,
+    CONTROL_MAX_LEN, Frame, PUSH_HEADER_MAX_LEN, StreamCodec, encode_push_header,
     encode_varint_to_slice,
 };
 use crate::{
@@ -193,7 +193,7 @@ impl DrainOutcome {
 /// `ControlFlow::Continue(())` to keep draining or
 /// `ControlFlow::Break(Transition)` to stop immediately.
 pub(super) fn drain(
-    read: &mut FramedRead<OwnedReadHalf, PipeCodec>,
+    read: &mut FramedRead<OwnedReadHalf, StreamCodec>,
     cx: &mut Context<'_>,
     mut on_frame: impl FnMut(Frame) -> ControlFlow<Transition>,
 ) -> DrainOutcome {

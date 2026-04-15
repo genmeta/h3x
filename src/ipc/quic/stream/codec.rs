@@ -34,7 +34,7 @@ pub(super) const CONTROL_MAX_LEN: usize = 1 + VarInt::MAX_SIZE;
 
 /// Frames exchanged over a per-stream socketpair.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Frame {
+pub(super) enum Frame {
     /// Flow-control signal — reader grants the writer permission to send one
     /// PUSH frame.
     Pull,
@@ -51,7 +51,7 @@ pub enum Frame {
 /// Codec error.
 #[derive(Debug, snafu::Snafu)]
 #[snafu(module)]
-pub enum CodecError {
+pub(super) enum CodecError {
     #[snafu(transparent)]
     Io { source: std::io::Error },
     #[snafu(display("unknown frame tag: 0x{tag:02x}"))]
@@ -124,9 +124,9 @@ pub(super) fn encode_push_header(
     Ok((header, 1 + varint_size))
 }
 
-/// Minimal framing codec for the per-stream pipe protocol.
+/// Minimal framing codec for the per-stream IPC protocol.
 #[derive(Debug, Default)]
-pub struct PipeCodec {
+pub(super) struct StreamCodec {
     /// Partially decoded frame state: once we know the tag and payload length
     /// we store them here so we don't re-parse on the next `decode` call.
     state: DecodeState,
@@ -142,13 +142,13 @@ enum DecodeState {
     Control { tag: u8 },
 }
 
-impl PipeCodec {
+impl StreamCodec {
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl Decoder for PipeCodec {
+impl Decoder for StreamCodec {
     type Item = Frame;
     type Error = CodecError;
 
@@ -230,7 +230,7 @@ impl Decoder for PipeCodec {
     }
 }
 
-impl Encoder<Frame> for PipeCodec {
+impl Encoder<Frame> for StreamCodec {
     type Error = CodecError;
 
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), CodecError> {
@@ -269,11 +269,11 @@ mod tests {
     use super::*;
 
     fn round_trip(frame: Frame) {
-        let mut codec = PipeCodec::new();
+        let mut codec = StreamCodec::new();
         let mut buf = BytesMut::new();
         codec.encode(frame.clone(), &mut buf).unwrap();
 
-        let mut decoder = PipeCodec::new();
+        let mut decoder = StreamCodec::new();
         let decoded = decoder.decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded, frame);
         assert!(buf.is_empty());
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn multiple_frames_in_sequence() {
-        let mut codec = PipeCodec::new();
+        let mut codec = StreamCodec::new();
         let mut buf = BytesMut::new();
 
         let frames = vec![
@@ -333,7 +333,7 @@ mod tests {
             codec.encode(f.clone(), &mut buf).unwrap();
         }
 
-        let mut decoder = PipeCodec::new();
+        let mut decoder = StreamCodec::new();
         for expected in &frames {
             let decoded = decoder.decode(&mut buf).unwrap().unwrap();
             assert_eq!(&decoded, expected);
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn incremental_decode() {
-        let mut codec = PipeCodec::new();
+        let mut codec = StreamCodec::new();
         let mut buf = BytesMut::new();
         codec
             .encode(Frame::Push(Bytes::from_static(b"abc")), &mut buf)
@@ -352,7 +352,7 @@ mod tests {
         let full = buf.split();
 
         // Feed one byte at a time.
-        let mut decoder = PipeCodec::new();
+        let mut decoder = StreamCodec::new();
         let mut partial = BytesMut::new();
         for i in 0..full.len() - 1 {
             partial.extend_from_slice(&full[i..i + 1]);
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn unknown_tag_error() {
-        let mut decoder = PipeCodec::new();
+        let mut decoder = StreamCodec::new();
         let mut buf = BytesMut::from(&[0xff][..]);
         assert!(decoder.decode(&mut buf).is_err());
     }
@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn data_header_matches_frame_prefix() {
         let payload = Bytes::from(vec![0x5a; 1024]);
-        let mut codec = PipeCodec::new();
+        let mut codec = StreamCodec::new();
         let mut encoded = BytesMut::new();
         codec
             .encode(Frame::Push(payload.clone()), &mut encoded)

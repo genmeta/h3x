@@ -1,6 +1,6 @@
-//! [`PipeReader`] — per-stream socketpair read half with pull-based flow control.
+//! [`IpcReadStream`] — per-stream socketpair read half with pull-based flow control.
 //!
-//! Wraps the read direction of a `SOCK_STREAM` socketpair, decoding the pipe
+//! Wraps the read direction of a `SOCK_STREAM` socketpair, decoding the
 //! framing protocol and exposing it as `Stream<Item = Result<Bytes, StreamError>>` +
 //! [`StopStream`] + [`GetStreamId`], satisfying [`quic::ReadStream`].
 //!
@@ -21,12 +21,15 @@ use bytes::Bytes;
 use futures::Stream;
 use tokio::{
     io::AsyncWrite,
-    net::unix::{OwnedReadHalf, OwnedWriteHalf},
+    net::{
+        UnixStream,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    },
 };
 use tokio_util::codec::FramedRead;
 
 use super::{
-    codec::{Frame, PipeCodec, TAG_PULL, TAG_STOP},
+    codec::{Frame, StreamCodec, TAG_PULL, TAG_STOP},
     state::{PipeState, Step, Transition, check_lifecycle, encode_control},
 };
 use crate::{
@@ -39,7 +42,7 @@ struct ReaderLive {
     /// Whether a `PULL` frame has been sent and we are waiting for the
     /// corresponding `PUSH` reply.
     pulling: bool,
-    read: FramedRead<OwnedReadHalf, PipeCodec>,
+    read: FramedRead<OwnedReadHalf, StreamCodec>,
     write: OwnedWriteHalf,
     lifecycle: Arc<dyn quic::DynLifecycle>,
 }
@@ -117,31 +120,31 @@ impl ReaderLive {
     }
 }
 
-// ── PipeReader ──────────────────────────────────────────────────────────────
+// ── IpcReadStream ───────────────────────────────────────────────────────────
 
-/// Read half of a per-stream pipe.
+/// IPC read stream backed by a per-stream Unix socketpair.
 ///
 /// Reads PUSH/CANCEL/CONN_CLOSED frames from the socketpair.
 /// Sends PULL and STOP frames back through the write half of the same
 /// socketpair.
-pub struct PipeReader {
+pub struct IpcReadStream {
     stream_id: VarInt,
     state: PipeState<ReaderLive>,
 }
 
-impl PipeReader {
-    /// Create a new reader from the two halves of a `tokio::net::UnixStream`.
+impl IpcReadStream {
+    /// Create a new reader from a `tokio::net::UnixStream`.
     pub fn new(
         stream_id: VarInt,
-        read_half: OwnedReadHalf,
-        write_half: OwnedWriteHalf,
+        socket: UnixStream,
         lifecycle: Arc<dyn quic::DynLifecycle>,
     ) -> Self {
+        let (read_half, write_half) = socket.into_split();
         Self {
             stream_id,
             state: PipeState::Live(ReaderLive {
                 pulling: false,
-                read: FramedRead::new(read_half, PipeCodec::new()),
+                read: FramedRead::new(read_half, StreamCodec::new()),
                 write: write_half,
                 lifecycle,
             }),
@@ -168,7 +171,7 @@ impl PipeReader {
     }
 }
 
-impl GetStreamId for PipeReader {
+impl GetStreamId for IpcReadStream {
     fn poll_stream_id(
         self: Pin<&mut Self>,
         _cx: &mut Context,
@@ -177,7 +180,7 @@ impl GetStreamId for PipeReader {
     }
 }
 
-impl Stream for PipeReader {
+impl Stream for IpcReadStream {
     type Item = Result<Bytes, StreamError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -185,7 +188,7 @@ impl Stream for PipeReader {
     }
 }
 
-impl StopStream for PipeReader {
+impl StopStream for IpcReadStream {
     fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -272,27 +275,27 @@ mod tests {
     async fn setup_reader_with_lifecycle(
         lifecycle: Arc<dyn quic::DynLifecycle>,
     ) -> (
-        PipeReader,
-        FramedWrite<OwnedWriteHalf, PipeCodec>,
-        FramedRead<OwnedReadHalf, PipeCodec>,
+        IpcReadStream,
+        FramedWrite<OwnedWriteHalf, StreamCodec>,
+        FramedRead<OwnedReadHalf, StreamCodec>,
     ) {
         let (reader_side, peer_side) = UnixStream::pair().unwrap();
-        let (reader_read, reader_write) = reader_side.into_split();
+
         let (peer_read, peer_write) = peer_side.into_split();
 
-        let reader = PipeReader::new(VarInt::from_u32(7), reader_read, reader_write, lifecycle);
+        let reader = IpcReadStream::new(VarInt::from_u32(7), reader_side, lifecycle);
 
         (
             reader,
-            FramedWrite::new(peer_write, PipeCodec::new()),
-            FramedRead::new(peer_read, PipeCodec::new()),
+            FramedWrite::new(peer_write, StreamCodec::new()),
+            FramedRead::new(peer_read, StreamCodec::new()),
         )
     }
 
     async fn setup_reader() -> (
-        PipeReader,
-        FramedWrite<OwnedWriteHalf, PipeCodec>,
-        FramedRead<OwnedReadHalf, PipeCodec>,
+        IpcReadStream,
+        FramedWrite<OwnedWriteHalf, StreamCodec>,
+        FramedRead<OwnedReadHalf, StreamCodec>,
     ) {
         setup_reader_with_lifecycle(alive_lifecycle()).await
     }
@@ -505,12 +508,12 @@ mod tests {
     #[tokio::test]
     async fn codec_error_finishes_reader_when_connection_alive() {
         let (reader_side, peer_side) = UnixStream::pair().unwrap();
-        let (reader_read, reader_write) = reader_side.into_split();
+
         let (peer_read, mut peer_write) = peer_side.into_split();
 
         let lifecycle = alive_lifecycle();
-        let mut reader = PipeReader::new(VarInt::from_u32(1), reader_read, reader_write, lifecycle);
-        let mut peer_out = FramedRead::new(peer_read, PipeCodec::new());
+        let mut reader = IpcReadStream::new(VarInt::from_u32(1), reader_side, lifecycle);
+        let mut peer_out = FramedRead::new(peer_read, StreamCodec::new());
 
         let mut recv = Box::pin(reader.next());
         let pull = tokio::select! {

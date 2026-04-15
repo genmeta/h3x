@@ -17,17 +17,17 @@ use std::{
 
 use bytes::Bytes;
 use futures::{Sink, Stream, StreamExt, future::pending};
-use remoc::prelude::ServerShared;
+use remoc::prelude::{ServerShared, ServerSharedMut};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::{
     error::Code,
     ipc::{
-        capability::{
+        quic::{
+            IpcConnectServerShared, IpcListenServerSharedMut,
             connector::{ConnectAdapter, IpcConnector},
             listener::{IpcListener, ListenAdapter},
         },
-        rpc::{IpcConnectServerShared, IpcListenServerShared},
         transport::MuxChannel,
     },
     quic::{self, ConnectionError, StreamError, TransportError},
@@ -445,7 +445,7 @@ async fn setup_listen_pair() -> (
     IpcListener<remoc::codec::Default>,
     mpsc::Sender<Arc<StreamableConnection>>,
 ) {
-    use crate::ipc::rpc::listen::IpcListenClient;
+    use super::IpcListenClient;
 
     let (conn_tx, conn_rx) = mpsc::channel(4);
     let mock_listen = MockListen { rx: conn_rx };
@@ -471,7 +471,8 @@ async fn setup_listen_pair() -> (
         tokio::spawn(remoc_conn);
 
         let adapter = ListenAdapter::<_, remoc::codec::Default>::new(mock_listen, fd_sender);
-        let (server, listen_client) = IpcListenServerShared::new(Arc::new(adapter), 64);
+        let (server, listen_client) =
+            IpcListenServerSharedMut::new(Arc::new(tokio::sync::RwLock::new(adapter)), 64);
         tokio::spawn(async move {
             let _ = server.serve(true).await;
         });
@@ -520,7 +521,7 @@ async fn listen_accept_bootstrap() {
 
 #[tokio::test]
 async fn connect_roundtrip() {
-    use crate::ipc::rpc::connect::IpcConnectClient;
+    use super::IpcConnectClient;
 
     let (conn, _lc) = StreamableConnection::new();
     let mock_connect = MockConnect {

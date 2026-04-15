@@ -27,7 +27,3 @@ pub mod ipc;
 
 #[cfg(feature = "rpc")]
 pub mod rpc;
-
-/// Backwards-compatibility alias: the `remoc` module was renamed to [`rpc`].
-#[cfg(feature = "rpc")]
-pub use rpc as remoc;

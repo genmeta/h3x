@@ -1,4 +1,11 @@
-//! Connector-level capability adapters for IPC.
+//! Connector-level IPC adapters and RTC trait.
+//!
+//! # RTC trait
+//!
+//! [`IpcConnect`] defines the RPC interface for initiating outgoing connections.
+//! The server side calls [`quic::Connect::connect`], creates a new
+//! [`MuxChannel`] pair, queues the remote end's FD, and returns the
+//! [`VarInt`] registry ID.
 //!
 //! # Server side
 //!
@@ -27,24 +34,38 @@ use std::sync::Arc;
 
 use http::uri::Authority;
 use remoc::{self, RemoteSend, prelude::ServerShared};
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 use tracing::Instrument;
 
 use super::connection::{
     ConnectionAdapter, ConnectionBootstrap, IPC_ERROR_KIND, IPC_FRAME_TYPE, IpcConnectionHandle,
+    IpcConnectionServerShared,
 };
 use crate::{
-    ipc::{
-        rpc::{
-            IpcConnectionServerShared,
-            connect::{IpcConnect, IpcConnectClient},
-        },
-        transport::{FdRegistry, FdSender, MuxChannel, SplitError},
-    },
+    ipc::transport::{FdRegistry, FdSender, MuxChannel, SplitError},
     quic::{self, ConnectionError},
     rpc::quic::serde_types::SerdeAuthority,
     varint::VarInt,
 };
+
+// ---------------------------------------------------------------------------
+// IPC RTC trait for connector capability
+// ---------------------------------------------------------------------------
+
+/// Remote trait for IPC connector capability.
+///
+/// Each successful [`connect`](IpcConnect::connect) returns a [`VarInt`] ID
+/// that the caller can pass to
+/// [`FdRegistry::wait_fds`](crate::ipc::transport::FdRegistry::wait_fds) to
+/// obtain the [`MuxChannel`](crate::ipc::transport::MuxChannel) FD for the
+/// new connection.
+#[remoc::rtc::remote]
+pub trait IpcConnect: Send + Sync {
+    /// Connect to a remote server.
+    ///
+    /// Returns the FD-registry ID for the new connection's MuxChannel.
+    async fn connect(&self, server: SerdeAuthority) -> Result<VarInt, ConnectionError>;
+}
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -52,14 +73,19 @@ use crate::{
 
 /// Error from [`IpcConnector::connect`].
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum ConnectorError {
-    #[snafu(display("IPC connect RPC failed"))]
+    #[snafu(display("ipc connect rpc failed"))]
     Rpc { source: ConnectionError },
-    #[snafu(display("failed to retrieve MuxChannel FD: {message}"))]
-    WaitFds { message: String },
-    #[snafu(display("failed to reconstruct MuxChannel from FD"))]
+    #[snafu(display("failed to retrieve mux channel fd"))]
+    WaitFds {
+        source: crate::ipc::transport::WaitFdsError,
+    },
+    #[snafu(display("no fd received from registry"))]
+    EmptyFd,
+    #[snafu(display("failed to reconstruct mux channel from fd"))]
     FromFd { source: std::io::Error },
-    #[snafu(display("failed to split MuxChannel"))]
+    #[snafu(display("failed to split mux channel"))]
     Split { source: SplitError },
     #[snafu(display("failed to establish remoc connection: {message}"))]
     Remoc { message: String },
@@ -126,6 +152,7 @@ where
         // blocking here would deadlock.
         let (sink, stream) = server_mux.split().map_err(|e| connect_error(e, "split"))?;
 
+        // Inherent termination: exits when remoc handshake completes or fails.
         tokio::spawn(Self::setup_connection(connection, sink, stream).in_current_span());
 
         Ok(fd_id)
@@ -164,15 +191,20 @@ where
             {
                 Ok(v) => v,
                 Err(e) => {
-                    warn!(%e, "per-connection remoc handshake failed");
+                    warn!(
+                        error = %snafu::Report::from_error(e),
+                        "per-connection remoc handshake failed"
+                    );
                     return;
                 }
             };
+        // Inherent termination: exits when remoc ChMux closes.
         tokio::spawn(conn.in_current_span());
 
         // Create the ConnectionAdapter and wrap it as an IPC RPC server.
         let adapter = ConnectionAdapter::new(connection, conn_fd_sender);
         let (server, rpc_client) = IpcConnectionServerShared::new(Arc::new(adapter), 64);
+        // Inherent termination: exits when remoc ChMux closes.
         tokio::spawn(
             async move {
                 let _ = server.serve(true).await;
@@ -230,28 +262,19 @@ where
         // 1. RPC: ask the server side to connect and get the fd-registry ID.
         let fd_id = IpcConnect::connect(&self.rpc, SerdeAuthority::from(server))
             .await
-            .map_err(|source| ConnectorError::Rpc { source })?;
+            .context(RpcSnafu)?;
 
         // 2. Retrieve the MuxChannel FD.
         let fds = self
             .fd_registry
             .wait_fds(fd_id)
             .await
-            .map_err(|e| ConnectorError::WaitFds {
-                message: e.to_string(),
-            })?;
-        let fd = fds
-            .into_iter()
-            .next()
-            .ok_or_else(|| ConnectorError::WaitFds {
-                message: "no FD received".into(),
-            })?;
+            .context(WaitFdsSnafu)?;
+        let fd = fds.into_iter().next().ok_or(ConnectorError::EmptyFd)?;
 
         // 3. Reconstruct the MuxChannel and split it.
-        let mux = MuxChannel::from_fd(fd).map_err(|source| ConnectorError::FromFd { source })?;
-        let (sink, stream) = mux
-            .split()
-            .map_err(|source| ConnectorError::Split { source })?;
+        let mux = MuxChannel::from_fd(fd).context(FromFdSnafu)?;
+        let (sink, stream) = mux.split().context(SplitSnafu)?;
         let conn_fd_sender = sink.fd_sender();
         let conn_fd_registry = stream.fd_registry();
 
@@ -291,12 +314,13 @@ where
 // Error helper
 // ---------------------------------------------------------------------------
 
-fn connect_error(err: impl std::fmt::Display, context: &str) -> ConnectionError {
+fn connect_error(err: impl std::error::Error, context: &str) -> ConnectionError {
+    tracing::warn!(error = %snafu::Report::from_error(&err), context, "ipc connect error");
     ConnectionError::Transport {
         source: quic::TransportError {
             kind: IPC_ERROR_KIND,
             frame_type: IPC_FRAME_TYPE,
-            reason: format!("IPC connect {context}: {err}").into(),
+            reason: format!("ipc connect: {context}").into(),
         },
     }
 }

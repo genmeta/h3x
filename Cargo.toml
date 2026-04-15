@@ -41,8 +41,9 @@ hyper = { version = "1", features = ["http2"], optional = true }
 # feature serde
 serde = { version = "1", features = ["derive"], optional = true }
 
-# feature remoc
+# feature rpc (implemented with remoc crate)
 remoc = { version = "0.18", default-features = false, optional = true, features = [
+    "default-codec-postbag",
     "remoc_macro",
     "rtc",
     "serde",
@@ -53,7 +54,7 @@ nix = { version = "0.29", default-features = false, optional = true, features = 
     "socket",
     "uio",
 ] }
-tokio-seqpacket = { version = "0.8", optional = true }
+
 
 [features]
 default = ["dquic", "hyper"]
@@ -61,8 +62,7 @@ dquic = ["dep:dquic"]
 hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
 rpc = ["dep:remoc", "serde", "bytes/serde"]
-remoc = ["rpc"]                                              # backwards-compatibility alias
-ipc = ["rpc", "dep:nix", "dep:tokio-seqpacket", "tokio/net"]
+ipc = ["rpc", "dep:nix", "tokio/net"]
 testing = []
 
 [dev-dependencies]

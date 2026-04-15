@@ -1,7 +1,8 @@
-//! Remote forwarding of `quic` traits via `remoc` RTC.
+//! Remote forwarding of `quic` traits via RPC RTC.
 //!
-//! This module exposes raw remoc-generated RTC client and server constructor
+//! This module exposes raw RTC client and server constructor
 //! families as the public API for the QUIC bridge.
+//! The current RPC runtime implementation is backed by `remoc`.
 //!
 //! Any type implementing [`quic::Connection`] automatically implements the RTC
 //! [`Connection`] trait via a blanket impl. On the client side,
@@ -16,7 +17,7 @@
 //!
 //! ## Raw RTC client handles
 //!
-//! These are the remoc-generated serializable client types. They are sent over
+//! These are serializable RPC client types. They are sent over
 //! the wire and used to make RPC calls to the remote side.
 //!
 //! - [`ConnectionClient`] — RTC client for a remote QUIC connection

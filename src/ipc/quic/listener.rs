@@ -1,4 +1,11 @@
-//! Listener-level capability adapters for IPC.
+//! Listener-level IPC adapters and RTC trait.
+//!
+//! # RTC trait
+//!
+//! [`IpcListen`] defines the RPC interface for accepting incoming connections.
+//! The server side calls [`quic::Listen::accept`], creates a new
+//! [`MuxChannel`] pair, queues the remote end's FD, and returns the
+//! [`VarInt`] registry ID.
 //!
 //! # Server side
 //!
@@ -25,32 +32,49 @@
 use std::sync::Arc;
 
 use remoc::prelude::ServerShared;
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 use tracing::{Instrument, warn};
 
 use super::connection::{
     ConnectionAdapter, ConnectionBootstrap, IPC_ERROR_KIND, IPC_FRAME_TYPE, IpcConnectionHandle,
+    IpcConnectionServerShared,
 };
 use crate::{
-    ipc::{
-        rpc::{
-            connection::IpcConnectionServerShared,
-            listen::{IpcListen, IpcListenClient},
-        },
-        transport::{FdRegistry, FdSender, MuxChannel},
-    },
+    ipc::transport::{FdRegistry, FdSender, MuxChannel},
     quic::{self, ConnectionError},
     varint::VarInt,
 };
 
+// ---------------------------------------------------------------------------
+// IPC RTC trait for listener capability
+// ---------------------------------------------------------------------------
+
+/// Remote trait for IPC listener capability.
+///
+/// Each successful [`accept`](IpcListen::accept) returns a [`VarInt`] ID that
+/// the caller can pass to
+/// [`FdRegistry::wait_fds`](crate::ipc::transport::FdRegistry::wait_fds) to
+/// obtain the [`MuxChannel`](crate::ipc::transport::MuxChannel) FD for the
+/// new connection.
+#[remoc::rtc::remote]
+pub trait IpcListen: Send + Sync {
+    /// Accept an incoming connection.
+    ///
+    /// Returns the FD-registry ID for the new connection's MuxChannel.
+    async fn accept(&mut self) -> Result<VarInt, ConnectionError>;
+
+    /// Gracefully shut down the listener.
+    async fn shutdown(&self) -> Result<(), ConnectionError>;
+}
+
 /// Construct a [`ConnectionError::Transport`] with a formatted reason.
-fn ipc_listen_error(err: impl std::fmt::Display, context: &str) -> ConnectionError {
-    warn!(%err, context, "IPC listener error");
+fn ipc_listen_error(err: impl std::error::Error, context: &str) -> ConnectionError {
+    warn!(error = %snafu::Report::from_error(&err), context, "ipc listener error");
     ConnectionError::Transport {
         source: quic::TransportError {
             kind: IPC_ERROR_KIND,
             frame_type: IPC_FRAME_TYPE,
-            reason: format!("IPC {context}: {err}").into(),
+            reason: format!("ipc listen: {context}").into(),
         },
     }
 }
@@ -66,7 +90,7 @@ fn ipc_listen_error(err: impl std::fmt::Display, context: &str) -> ConnectionErr
 /// for the per-connection remoc channel.  h3x deliberately does not choose a
 /// codec; the downstream crate (e.g., gateway) picks one.
 pub struct ListenAdapter<L, Codec> {
-    inner: tokio::sync::Mutex<L>,
+    inner: L,
     fd_sender: FdSender,
     _codec: std::marker::PhantomData<Codec>,
 }
@@ -74,7 +98,7 @@ pub struct ListenAdapter<L, Codec> {
 impl<L, Codec> ListenAdapter<L, Codec> {
     pub fn new(inner: L, fd_sender: FdSender) -> Self {
         Self {
-            inner: tokio::sync::Mutex::new(inner),
+            inner,
             fd_sender,
             _codec: std::marker::PhantomData,
         }
@@ -86,12 +110,10 @@ where
     L: quic::Listen + 'static,
     Codec: remoc::codec::Codec,
 {
-    async fn accept(&self) -> Result<VarInt, ConnectionError> {
-        let mut inner = self.inner.lock().await;
-        let connection = quic::Listen::accept(&mut *inner)
+    async fn accept(&mut self) -> Result<VarInt, ConnectionError> {
+        let connection = quic::Listen::accept(&mut self.inner)
             .await
             .map_err(|e| ipc_listen_error(e, "accept"))?;
-        drop(inner); // release lock early — remaining work is per-connection
         let connection = Arc::new(connection);
 
         // Create a MuxChannel pair for this connection
@@ -112,14 +134,14 @@ where
             .split()
             .map_err(|e| ipc_listen_error(e, "split mux"))?;
 
+        // Inherent termination: exits when remoc handshake completes or fails.
         tokio::spawn(Self::setup_connection(connection, sink, stream).in_current_span());
 
         Ok(fd_id)
     }
 
     async fn shutdown(&self) -> Result<(), ConnectionError> {
-        let inner = self.inner.lock().await;
-        quic::Listen::shutdown(&*inner)
+        quic::Listen::shutdown(&self.inner)
             .await
             .map_err(|e| ipc_listen_error(e, "shutdown"))
     }
@@ -145,25 +167,28 @@ where
     ) {
         let conn_fd_sender = sink.fd_sender();
 
-        let (remoc_conn, mut tx, _rx) =
-            match remoc::Connect::framed::<_, _, ConnectionBootstrap, (), Codec>(
-                remoc::Cfg::default(),
-                sink,
-                stream,
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(%e, "per-connection remoc handshake failed");
-                    return;
-                }
-            };
+        let (remoc_conn, mut tx, _rx) = match remoc::Connect::framed::<
+            _,
+            _,
+            ConnectionBootstrap,
+            (),
+            Codec,
+        >(remoc::Cfg::default(), sink, stream)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %snafu::Report::from_error(e), "per-connection remoc handshake failed");
+                return;
+            }
+        };
+        // Inherent termination: exits when remoc ChMux closes.
         tokio::spawn(remoc_conn.in_current_span());
 
         // Create the ConnectionAdapter for this connection's stream management
         let adapter = ConnectionAdapter::new(connection, conn_fd_sender);
         let (server, rpc_client) = IpcConnectionServerShared::new(Arc::new(adapter), 64);
+        // Inherent termination: exits when remoc ChMux closes.
         tokio::spawn(
             async move {
                 let _ = server.serve(true).await;
@@ -197,17 +222,23 @@ pub struct IpcListener<Codec> {
 }
 
 /// Error from [`IpcListener`] operations.
-#[derive(Debug, Clone, Snafu)]
+#[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum IpcListenError {
-    #[snafu(display("IPC accept RPC failed: {source}"))]
+    #[snafu(display("ipc accept rpc failed"))]
     Rpc { source: ConnectionError },
-    #[snafu(display("failed to retrieve connection FD: {message}"))]
-    WaitFd { message: String },
-    #[snafu(display("failed to reconstruct MuxChannel: {message}"))]
-    FromFd { message: String },
-    #[snafu(display("failed to split client MuxChannel: {message}"))]
-    ClientSplit { message: String },
+    #[snafu(display("failed to retrieve connection fd"))]
+    WaitFd {
+        source: crate::ipc::transport::WaitFdsError,
+    },
+    #[snafu(display("no fd received from registry"))]
+    EmptyFd,
+    #[snafu(display("failed to reconstruct mux channel"))]
+    FromFd { source: std::io::Error },
+    #[snafu(display("failed to split client mux channel"))]
+    ClientSplit {
+        source: crate::ipc::transport::SplitError,
+    },
     #[snafu(display("failed to establish client remoc connection: {message}"))]
     ClientRemocConnect { message: String },
     #[snafu(display("failed to receive bootstrap: {message}"))]
@@ -220,7 +251,7 @@ impl From<IpcListenError> for ConnectionError {
             source: quic::TransportError {
                 kind: IPC_ERROR_KIND,
                 frame_type: IPC_FRAME_TYPE,
-                reason: err.to_string().into(),
+                reason: snafu::Report::from_error(err).to_string().into(),
             },
         }
     }
@@ -245,32 +276,19 @@ where
 
     async fn accept(&mut self) -> Result<IpcConnectionHandle, IpcListenError> {
         // 1. RPC: ask server to accept a new connection
-        let fd_id = IpcListen::accept(&self.rpc)
-            .await
-            .map_err(|e| IpcListenError::Rpc { source: e })?;
+        let fd_id = IpcListen::accept(&mut self.rpc).await.context(RpcSnafu)?;
 
         // 2. Retrieve the MuxChannel FD from the parent-level FdRegistry
         let fds = self
             .fd_registry
             .wait_fds(fd_id)
             .await
-            .map_err(|e| IpcListenError::WaitFd {
-                message: e.to_string(),
-            })?;
-        let fd = fds
-            .into_iter()
-            .next()
-            .ok_or_else(|| IpcListenError::WaitFd {
-                message: "no FD received".into(),
-            })?;
+            .context(WaitFdSnafu)?;
+        let fd = fds.into_iter().next().ok_or(IpcListenError::EmptyFd)?;
 
         // 3. Reconstruct MuxChannel and establish remoc connection
-        let mux = MuxChannel::from_fd(fd).map_err(|e| IpcListenError::FromFd {
-            message: e.to_string(),
-        })?;
-        let (sink, stream) = mux.split().map_err(|e| IpcListenError::ClientSplit {
-            message: e.to_string(),
-        })?;
+        let mux = MuxChannel::from_fd(fd).context(FromFdSnafu)?;
+        let (sink, stream) = mux.split().context(ClientSplitSnafu)?;
         let conn_fd_sender = sink.fd_sender();
         let conn_fd_registry = stream.fd_registry();
 
@@ -306,8 +324,6 @@ where
     }
 
     async fn shutdown(&self) -> Result<(), IpcListenError> {
-        IpcListen::shutdown(&self.rpc)
-            .await
-            .map_err(|e| IpcListenError::Rpc { source: e })
+        IpcListen::shutdown(&self.rpc).await.context(RpcSnafu)
     }
 }

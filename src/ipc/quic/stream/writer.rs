@@ -1,4 +1,4 @@
-//! [`PipeWriter`] — per-stream socketpair write half with pull-based flow control.
+//! [`IpcWriteStream`] — per-stream socketpair write half with pull-based flow control.
 //!
 //! Wraps the write direction of a `SOCK_STREAM` socketpair, encoding the pipe
 //! framing protocol and exposing it as `Sink<Bytes, Error = StreamError>` +
@@ -28,12 +28,15 @@ use bytes::Bytes;
 use futures::Sink;
 use tokio::{
     io::AsyncWrite,
-    net::unix::{OwnedReadHalf, OwnedWriteHalf},
+    net::{
+        UnixStream,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    },
 };
 use tokio_util::codec::FramedRead;
 
 use super::{
-    codec::{Frame, PipeCodec, TAG_CANCEL, TAG_CONN_CLOSED},
+    codec::{Frame, StreamCodec, TAG_CANCEL, TAG_CONN_CLOSED},
     state::{
         PendingPush, PipeState, Step, Transition, check_lifecycle, drain, encode_control,
         flush_pending,
@@ -46,7 +49,7 @@ use crate::{
 
 /// Active-state fields for the writer.
 struct WriterLive {
-    read: FramedRead<OwnedReadHalf, PipeCodec>,
+    read: FramedRead<OwnedReadHalf, StreamCodec>,
     write: OwnedWriteHalf,
     lifecycle: Arc<dyn quic::DynLifecycle>,
     pulled: bool,
@@ -137,30 +140,30 @@ impl WriterLive {
     }
 }
 
-// ── PipeWriter ──────────────────────────────────────────────────────────────
+// ── IpcWriteStream ──────────────────────────────────────────────────────────────
 
-/// Write half of a per-stream pipe.
+/// IPC write stream backed by a per-stream Unix socketpair.
 ///
 /// Sends PUSH frames through the write half of the socketpair.
 /// Reads PULL/STOP/CONN_CLOSED frames from the read half for flow control
 /// and lifecycle signals.
-pub struct PipeWriter {
+pub struct IpcWriteStream {
     stream_id: VarInt,
     state: PipeState<WriterLive>,
 }
 
-impl PipeWriter {
-    /// Create a new writer from the two halves of a `tokio::net::UnixStream`.
+impl IpcWriteStream {
+    /// Create a new writer from a `tokio::net::UnixStream`.
     pub fn new(
         stream_id: VarInt,
-        read_half: OwnedReadHalf,
-        write_half: OwnedWriteHalf,
+        socket: UnixStream,
         lifecycle: Arc<dyn quic::DynLifecycle>,
     ) -> Self {
+        let (read_half, write_half) = socket.into_split();
         Self {
             stream_id,
             state: PipeState::Live(WriterLive {
-                read: FramedRead::new(read_half, PipeCodec::new()),
+                read: FramedRead::new(read_half, StreamCodec::new()),
                 write: write_half,
                 lifecycle,
                 pulled: false,
@@ -170,7 +173,7 @@ impl PipeWriter {
     }
 }
 
-impl GetStreamId for PipeWriter {
+impl GetStreamId for IpcWriteStream {
     fn poll_stream_id(
         self: Pin<&mut Self>,
         _cx: &mut Context,
@@ -179,7 +182,7 @@ impl GetStreamId for PipeWriter {
     }
 }
 
-impl Sink<Bytes> for PipeWriter {
+impl Sink<Bytes> for IpcWriteStream {
     type Error = StreamError;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
@@ -254,7 +257,7 @@ impl Sink<Bytes> for PipeWriter {
     }
 }
 
-impl CancelStream for PipeWriter {
+impl CancelStream for IpcWriteStream {
     fn poll_cancel(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -346,32 +349,31 @@ mod tests {
     async fn setup_writer_with_lifecycle(
         lifecycle: Arc<dyn quic::DynLifecycle>,
     ) -> (
-        PipeWriter,
-        FramedWrite<OwnedWriteHalf, PipeCodec>,
-        FramedRead<OwnedReadHalf, PipeCodec>,
+        IpcWriteStream,
+        FramedWrite<OwnedWriteHalf, StreamCodec>,
+        FramedRead<OwnedReadHalf, StreamCodec>,
     ) {
         let (writer_side, peer_side) = UnixStream::pair().unwrap();
-        let (writer_read, writer_write) = writer_side.into_split();
         let (peer_read, peer_write) = peer_side.into_split();
 
-        let writer = PipeWriter::new(VarInt::from_u32(1), writer_read, writer_write, lifecycle);
+        let writer = IpcWriteStream::new(VarInt::from_u32(1), writer_side, lifecycle);
 
         (
             writer,
-            FramedWrite::new(peer_write, PipeCodec::new()),
-            FramedRead::new(peer_read, PipeCodec::new()),
+            FramedWrite::new(peer_write, StreamCodec::new()),
+            FramedRead::new(peer_read, StreamCodec::new()),
         )
     }
 
     async fn setup_writer() -> (
-        PipeWriter,
-        FramedWrite<OwnedWriteHalf, PipeCodec>,
-        FramedRead<OwnedReadHalf, PipeCodec>,
+        IpcWriteStream,
+        FramedWrite<OwnedWriteHalf, StreamCodec>,
+        FramedRead<OwnedReadHalf, StreamCodec>,
     ) {
         setup_writer_with_lifecycle(alive_lifecycle()).await
     }
 
-    fn poll_ready_once(writer: &mut PipeWriter) -> Poll<Result<(), StreamError>> {
+    fn poll_ready_once(writer: &mut IpcWriteStream) -> Poll<Result<(), StreamError>> {
         let waker = noop_waker_ref();
         let mut cx = Context::from_waker(waker);
         Pin::new(writer).poll_ready(&mut cx)
