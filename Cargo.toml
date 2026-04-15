@@ -42,8 +42,8 @@ hyper = { version = "1", features = ["http2"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 
 # feature rpc (implemented with remoc crate)
+# NOTE: no codec feature here — downstream chooses the codec
 remoc = { version = "0.18", default-features = false, optional = true, features = [
-    "default-codec-postbag",
     "remoc_macro",
     "rtc",
     "serde",
