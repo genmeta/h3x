@@ -74,6 +74,21 @@ where
     pub fn service_mut(&mut self) -> &mut S {
         &mut self.service
     }
+
+    /// Decompose this `Servers` into its constituent parts.
+    ///
+    /// Useful for recovering the listener after cancellation so it can be
+    /// reused without tearing down the underlying QUIC bindings.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Pool<L::Connection>,
+        L,
+        S,
+        Arc<ConnectionBuilder<L::Connection>>,
+    ) {
+        (self.pool, self.listener, self.service, self.builder)
+    }
 }
 
 impl<L, S> Servers<L, S>
@@ -200,6 +215,8 @@ where
                     }
                 };
                 connection_tasks.spawn(handle_request.in_current_span());
+                // Reap completed tasks to prevent unbounded growth
+                while connection_tasks.try_join_next().is_some() {}
             }
         }
         .instrument(span)
@@ -209,6 +226,8 @@ where
         let mut tasks = JoinSet::default();
 
         loop {
+            // Reap completed tasks to prevent unbounded growth
+            while tasks.try_join_next().is_some() {}
             match self.listener.accept().await {
                 Ok(connection) => tasks.spawn(self.handle_incoming_connection(connection)),
                 Err(error) => break error,

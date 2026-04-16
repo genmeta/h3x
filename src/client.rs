@@ -47,6 +47,17 @@ impl<C: quic::Connect> Client<C> {
         &mut self.client
     }
 
+    /// Decompose this `Client` into its constituent parts.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Pool<C::Connection>,
+        C,
+        Arc<ConnectionBuilder<C::Connection>>,
+    ) {
+        (self.pool, self.client, self.builder)
+    }
+
     pub async fn connect(
         &self,
         server: Authority,
