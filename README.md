@@ -7,8 +7,7 @@ High-performance asynchronous DHTTP/3 implementation in Rust.
 - **Zero-Copy**: Achieves full-link *zero-copy* from the QUIC layer to the application layer.
 - **Multipath QUIC**: Integrates the `dquic` implementation, featuring efficient transmission, robust authentication capabilities, and high extensibility.
 - **Hyper / Tower Compatibility** *(feature `hyper`, enabled by default)*: Provides `TowerService` and `HyperService` adapters to run existing Tower or hyper services (e.g. `axum`) over DHTTP/3. Since h3x cannot construct hyper's internal types, the `h3x::hyper` module provides its own alternatives for upgrade and protocol negotiation.
-- **RPC** *(feature `rpc`, experimental)*: RPC bridge for remote trait calls (RTC) over QUIC connections, backed by [`remoc`](https://crates.io/crates/remoc). Useful for forwarding QUIC-facing traits across async boundaries.
-- **IPC** *(feature `ipc`, experimental)*: Cross-process capability forwarding built on top of `rpc`. Adds Unix-socket transport and FD-passing data plane for multi-process (parent/worker) deployment. Depends on `rpc`.
+- **Remoc** *(feature `remoc`, experimental)*: Optional [`remoc`](https://crates.io/crates/remoc) integration for remote trait calls (RTC) over QUIC connections. This is an experimental feature and the API may change.
 - **Extended CONNECT**: Supports [Extended CONNECT (RFC9220)](https://datatracker.ietf.org/doc/html/rfc9220) for protocol tunneling over HTTP/3.
 - **Future Extensions**: Plans to support extensions such as [WebTransport over HTTP/3 (Draft)](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-14).
 
