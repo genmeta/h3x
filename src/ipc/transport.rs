@@ -1397,4 +1397,293 @@ mod tests {
         let result = registry.wait_fds(VarInt::from_u32(0)).await;
         assert!(matches!(result, Err(WaitFdsError::Closed)));
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 1: Validation path tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn queue_fds_too_many_rejected() {
+        let ((sink_a, _stream_a), (_sink_b, _stream_b)) = make_pair();
+        let sender = sink_a.fd_sender();
+
+        let (fd1, _p1) = StdUnixStream::pair().expect("pair1");
+        let (fd2, _p2) = StdUnixStream::pair().expect("pair2");
+        let (fd3, _p3) = StdUnixStream::pair().expect("pair3");
+        let (fd4, _p4) = StdUnixStream::pair().expect("pair4");
+        let (fd5, _p5) = StdUnixStream::pair().expect("pair5");
+
+        let result = sender.queue_fds(smallvec![
+            fd1.into(),
+            fd2.into(),
+            fd3.into(),
+            fd4.into(),
+            fd5.into(),
+        ]);
+        assert!(
+            matches!(result, Err(QueueFdsError::TooManyFds { count: 5 })),
+            "expected TooManyFds {{ count: 5 }}, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_fds_per_frame_roundtrip() {
+        let ((mut sink_a, _stream_a), (_sink_b, mut stream_b)) = make_pair();
+        let registry = stream_b.fd_registry();
+
+        let (fd1, _p1) = StdUnixStream::pair().expect("pair1");
+        let (fd2, _p2) = StdUnixStream::pair().expect("pair2");
+        let (fd3, _p3) = StdUnixStream::pair().expect("pair3");
+        let (fd4, _p4) = StdUnixStream::pair().expect("pair4");
+
+        let id = sink_a
+            .fd_sender()
+            .queue_fds(smallvec![fd1.into(), fd2.into(), fd3.into(), fd4.into()])
+            .expect("queue 4 fds");
+
+        sink_a.send(Bytes::new()).await.expect("drive flush");
+        let _ = stream_b
+            .next()
+            .await
+            .expect("stream item")
+            .expect("empty bytes");
+
+        let fds = registry.wait_fds(id).await.expect("wait fds");
+        assert_eq!(fds.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn fd_frame_fd_count_zero_rejected() {
+        let (raw_writer, reader) = StdUnixStream::pair().expect("pair");
+        let reader_ch = MuxChannel::from_fd(reader.into()).expect("from_fd");
+        let (_sink, mut stream) = reader_ch.split().expect("split");
+
+        // FD frame: type=0x01, payload_len=2, id=0x00, fd_count=0x00
+        use std::io::Write;
+        (&raw_writer)
+            .write_all(&[FRAME_TYPE_FDS, 0x02, 0x00, 0x00])
+            .expect("write");
+        drop(raw_writer);
+
+        let result = stream.next().await;
+        assert!(
+            matches!(result, Some(Err(MuxStreamError::InvalidFdsPayload))),
+            "expected InvalidFdsPayload, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fd_frame_fd_count_exceeds_max_rejected() {
+        let (raw_writer, reader) = StdUnixStream::pair().expect("pair");
+        let reader_ch = MuxChannel::from_fd(reader.into()).expect("from_fd");
+        let (_sink, mut stream) = reader_ch.split().expect("split");
+
+        // FD frame: type=0x01, payload_len=2, id=0x00, fd_count=0x05
+        use std::io::Write;
+        (&raw_writer)
+            .write_all(&[FRAME_TYPE_FDS, 0x02, 0x00, 0x05])
+            .expect("write");
+        drop(raw_writer);
+
+        let result = stream.next().await;
+        assert!(
+            matches!(result, Some(Err(MuxStreamError::InvalidFdsPayload))),
+            "expected InvalidFdsPayload, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fd_frame_trailing_bytes_rejected() {
+        let (raw_writer, reader) = StdUnixStream::pair().expect("pair");
+        let reader_ch = MuxChannel::from_fd(reader.into()).expect("from_fd");
+        let (_sink, mut stream) = reader_ch.split().expect("split");
+
+        // FD frame: type=0x01, payload_len=3, id=0x00, fd_count=0x01, extra=0xFF
+        // id(1 byte) + fd_count(1 byte) = 2 bytes, but payload_len says 3
+        use std::io::Write;
+        (&raw_writer)
+            .write_all(&[FRAME_TYPE_FDS, 0x03, 0x00, 0x01, 0xFF])
+            .expect("write");
+        drop(raw_writer);
+
+        let result = stream.next().await;
+        assert!(
+            matches!(result, Some(Err(MuxStreamError::InvalidFdsPayload))),
+            "expected InvalidFdsPayload, got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: Frame decoding boundary tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn incomplete_bytes_header_waits_for_more_data() {
+        let (raw_writer, reader) = StdUnixStream::pair().expect("pair");
+        let reader_ch = MuxChannel::from_fd(reader.into()).expect("from_fd");
+        let (_sink, mut stream) = reader_ch.split().expect("split");
+
+        // Write only the frame type byte; payload_len + payload missing.
+        use std::io::Write;
+        (&raw_writer)
+            .write_all(&[FRAME_TYPE_BYTES])
+            .expect("write type");
+
+        // Stream should not yield yet (incomplete header).
+        let poll = timeout(Duration::from_millis(50), stream.next()).await;
+        assert!(poll.is_err(), "expected timeout (incomplete header)");
+
+        // Now write the rest: payload_len=5, payload="hello"
+        (&raw_writer)
+            .write_all(&[0x05, b'h', b'e', b'l', b'l', b'o'])
+            .expect("write rest");
+        drop(raw_writer);
+
+        let payload = stream.next().await.expect("item").expect("bytes");
+        assert_eq!(payload, Bytes::from_static(b"hello"));
+
+        // EOF
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn varint_2byte_length_roundtrip() {
+        let ((mut sink_a, _stream_a), (_sink_b, mut stream_b)) = make_pair();
+
+        // 100 bytes → varint length needs 2 bytes (64..16383)
+        let data = Bytes::from(vec![0xAB; 100]);
+        sink_a.send(data.clone()).await.expect("send");
+
+        let received = stream_b.next().await.expect("item").expect("bytes");
+        assert_eq!(received, data);
+    }
+
+    #[tokio::test]
+    async fn fd_over_bytes_ordering_guarantee() {
+        let ((mut sink_a, _stream_a), (_sink_b, mut stream_b)) = make_pair();
+        let registry = stream_b.fd_registry();
+        let sender = sink_a.fd_sender();
+
+        // Interleave: FD, bytes, FD, bytes, FD, bytes
+        let mut fd_ids = Vec::new();
+        for i in 0..3 {
+            let (fd, _peer) = StdUnixStream::pair().expect("fd pair");
+            let id = sender.queue_fds(smallvec![fd.into()]).expect("queue fds");
+            fd_ids.push(id);
+
+            let msg = Bytes::from(format!("msg-{i}"));
+            sink_a.send(msg).await.expect("send");
+        }
+
+        // All 3 bytes frames arrive in order
+        for i in 0..3 {
+            let payload = stream_b.next().await.expect("item").expect("bytes");
+            assert_eq!(payload, Bytes::from(format!("msg-{i}")));
+        }
+
+        // All 3 FDs arrive
+        for &id in &fd_ids {
+            let fds = registry.wait_fds(id).await.expect("wait fds");
+            assert_eq!(fds.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_fds_and_bytes_stress() {
+        let ((mut sink_a, _stream_a), (_sink_b, mut stream_b)) = make_pair();
+        let registry = stream_b.fd_registry();
+        let sender = sink_a.fd_sender();
+
+        let rounds = 20;
+        let mut fd_ids = Vec::with_capacity(rounds);
+
+        for i in 0..rounds {
+            let (fd, _peer) = StdUnixStream::pair().expect("fd pair");
+            let id = sender.queue_fds(smallvec![fd.into()]).expect("queue fds");
+            fd_ids.push(id);
+            sink_a
+                .send(Bytes::from(format!("stress-{i}")))
+                .await
+                .expect("send");
+        }
+
+        // Drain all bytes frames
+        for i in 0..rounds {
+            let payload = stream_b.next().await.expect("item").expect("bytes");
+            assert_eq!(payload, Bytes::from(format!("stress-{i}")));
+        }
+
+        // All FDs accessible
+        for &id in &fd_ids {
+            let fds = registry.wait_fds(id).await.expect("wait fds");
+            assert_eq!(fds.len(), 1);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: Close / lifecycle tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn graceful_close_flushes_pending_fds() {
+        let ((mut sink_a, _stream_a), (_sink_b, mut stream_b)) = make_pair();
+        let registry = stream_b.fd_registry();
+
+        let (fd, _peer) = StdUnixStream::pair().expect("fd pair");
+        let id = sink_a
+            .fd_sender()
+            .queue_fds(smallvec![fd.into()])
+            .expect("queue fds");
+
+        // Also send a bytes frame so the stream yields something before EOF
+        sink_a
+            .send(Bytes::from_static(b"before-close"))
+            .await
+            .expect("send");
+
+        // close() should flush both pending FD frame and bytes, then shutdown
+        sink_a.close().await.expect("close");
+
+        // Drive the stream: the FD frame is consumed internally, bytes yielded
+        let payload = stream_b.next().await.expect("item").expect("bytes");
+        assert_eq!(payload, Bytes::from_static(b"before-close"));
+
+        // FD was registered during poll_next — wait_fds should succeed
+        let fds = registry.wait_fds(id).await.expect("wait fds");
+        assert_eq!(fds.len(), 1);
+
+        // Now EOF
+        let eof = stream_b.next().await;
+        assert!(eof.is_none(), "expected EOF after close");
+    }
+
+    #[tokio::test]
+    async fn stream_eof_after_sink_close() {
+        let ((mut sink_a, _stream_a), (_sink_b, mut stream_b)) = make_pair();
+
+        // Send some data, then close explicitly
+        sink_a
+            .send(Bytes::from_static(b"before-close"))
+            .await
+            .expect("send");
+        sink_a.close().await.expect("close");
+
+        let payload = stream_b.next().await.expect("item").expect("bytes");
+        assert_eq!(payload, Bytes::from_static(b"before-close"));
+
+        let eof = stream_b.next().await;
+        assert!(eof.is_none(), "expected EOF");
+    }
+
+    #[tokio::test]
+    async fn double_close_is_idempotent() {
+        let ((mut sink_a, _stream_a), (_sink_b, _stream_b)) = make_pair();
+
+        sink_a.close().await.expect("first close");
+        let result = sink_a.close().await;
+        assert!(
+            matches!(result, Err(MuxSinkError::Closed)),
+            "expected Closed on double close, got: {result:?}"
+        );
+    }
 }

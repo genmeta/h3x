@@ -211,9 +211,23 @@ struct BiStreamTestHandles {
     rx_from_writer: mpsc::Receiver<Bytes>,
 }
 
+/// Data-plane handle for a uni write stream (server opens, client reads).
+struct UniWriteTestHandles {
+    /// Receive data written by the client through the IPC bridge.
+    rx_from_writer: mpsc::Receiver<Bytes>,
+}
+
+/// Data-plane handle for a uni read stream (server accepts, client reads).
+struct UniReadTestHandles {
+    /// Send data into the mock QUIC reader (simulates incoming QUIC data).
+    tx_to_reader: mpsc::Sender<Bytes>,
+}
+
 struct StreamableConnection {
     lifecycle: Arc<TestLifecycle>,
     bidi_streams: Mutex<VecDeque<(ChannelReader, ChannelWriter)>>,
+    uni_write_streams: Mutex<VecDeque<ChannelWriter>>,
+    uni_read_streams: Mutex<VecDeque<ChannelReader>>,
 }
 
 impl StreamableConnection {
@@ -222,6 +236,8 @@ impl StreamableConnection {
         let conn = Arc::new(Self {
             lifecycle: lc.clone(),
             bidi_streams: Mutex::new(VecDeque::new()),
+            uni_write_streams: Mutex::new(VecDeque::new()),
+            uni_read_streams: Mutex::new(VecDeque::new()),
         });
         (conn, lc)
     }
@@ -245,6 +261,36 @@ impl StreamableConnection {
             rx_from_writer: writer_rx,
         }
     }
+
+    /// Pre-fill one uni write stream (for `open_uni`).
+    /// The mock returns a `ChannelWriter`; the test gets a receiver.
+    async fn push_uni_writer(&self) -> UniWriteTestHandles {
+        let stream_id = next_stream_id();
+        let (writer_tx, writer_rx) = mpsc::channel(64);
+        let writer = ChannelWriter {
+            stream_id,
+            tx: Some(writer_tx),
+        };
+        self.uni_write_streams.lock().await.push_back(writer);
+        UniWriteTestHandles {
+            rx_from_writer: writer_rx,
+        }
+    }
+
+    /// Pre-fill one uni read stream (for `accept_uni`).
+    /// The mock returns a `ChannelReader`; the test gets a sender.
+    async fn push_uni_reader(&self) -> UniReadTestHandles {
+        let stream_id = next_stream_id();
+        let (reader_tx, reader_rx) = mpsc::channel(64);
+        let reader = ChannelReader {
+            stream_id,
+            rx: reader_rx,
+        };
+        self.uni_read_streams.lock().await.push_back(reader);
+        UniReadTestHandles {
+            tx_to_reader: reader_tx,
+        }
+    }
 }
 
 impl quic::ManageStream for StreamableConnection {
@@ -260,7 +306,11 @@ impl quic::ManageStream for StreamableConnection {
     }
 
     async fn open_uni(&self) -> Result<ChannelWriter, ConnectionError> {
-        Err(test_connection_error("open_uni not implemented"))
+        self.uni_write_streams
+            .lock()
+            .await
+            .pop_front()
+            .ok_or_else(|| test_connection_error("no uni write streams available"))
     }
 
     async fn accept_bi(&self) -> Result<(ChannelReader, ChannelWriter), ConnectionError> {
@@ -268,7 +318,11 @@ impl quic::ManageStream for StreamableConnection {
     }
 
     async fn accept_uni(&self) -> Result<ChannelReader, ConnectionError> {
-        Err(test_connection_error("accept_uni not implemented"))
+        self.uni_read_streams
+            .lock()
+            .await
+            .pop_front()
+            .ok_or_else(|| test_connection_error("no uni read streams available"))
     }
 }
 
@@ -658,5 +712,81 @@ async fn open_bi_unavailable() {
 
     // open_bi should fail because no streams are in the queue
     let result = quic::ManageStream::open_bi(&handle).await;
+    assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Uni-directional stream tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn open_uni_data_transfer() {
+    let (mut listener, conn_tx) = setup_listen_pair().await;
+
+    let (conn, _lc) = StreamableConnection::new();
+    let mut test_handles = conn.push_uni_writer().await;
+    conn_tx.send(conn).await.unwrap();
+
+    let handle = quic::Listen::accept(&mut listener).await.unwrap();
+
+    // Open a uni stream — the client gets a writer
+    let mut writer = quic::ManageStream::open_uni(&handle).await.unwrap();
+
+    // Client → Server: PipeWriter → pipe → bridge → mock QUIC writer → test rx
+    use futures::SinkExt;
+    writer.send(Bytes::from_static(b"uni hello")).await.unwrap();
+
+    let received = test_handles.rx_from_writer.recv().await.unwrap();
+    assert_eq!(received.as_ref(), b"uni hello");
+}
+
+#[tokio::test]
+async fn accept_uni_data_transfer() {
+    let (mut listener, conn_tx) = setup_listen_pair().await;
+
+    let (conn, _lc) = StreamableConnection::new();
+    let test_handles = conn.push_uni_reader().await;
+    conn_tx.send(conn).await.unwrap();
+
+    let handle = quic::Listen::accept(&mut listener).await.unwrap();
+
+    // Accept a uni stream — the client gets a reader
+    let mut reader = quic::ManageStream::accept_uni(&handle).await.unwrap();
+
+    // Server → Client: inject data into mock QUIC reader → bridge → pipe → client
+    test_handles
+        .tx_to_reader
+        .send(Bytes::from_static(b"uni from server"))
+        .await
+        .unwrap();
+
+    let chunk = reader.next().await.unwrap().unwrap();
+    assert_eq!(chunk.as_ref(), b"uni from server");
+}
+
+#[tokio::test]
+async fn open_uni_unavailable() {
+    let (mut listener, conn_tx) = setup_listen_pair().await;
+
+    // No uni streams pre-filled
+    let (conn, _lc) = StreamableConnection::new();
+    conn_tx.send(conn).await.unwrap();
+
+    let handle = quic::Listen::accept(&mut listener).await.unwrap();
+
+    let result = quic::ManageStream::open_uni(&handle).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn accept_uni_unavailable() {
+    let (mut listener, conn_tx) = setup_listen_pair().await;
+
+    let (conn, _lc) = StreamableConnection::new();
+    conn_tx.send(conn).await.unwrap();
+
+    let handle = quic::Listen::accept(&mut listener).await.unwrap();
+
+    let result = quic::ManageStream::accept_uni(&handle).await;
     assert!(result.is_err());
 }
