@@ -54,6 +54,7 @@ nix = { version = "0.29", default-features = false, optional = true, features = 
     "socket",
     "uio",
 ] }
+smallvec = { version = "1", optional = true }
 
 
 [features]
@@ -62,7 +63,7 @@ dquic = ["dep:dquic"]
 hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
 rpc = ["dep:remoc", "serde", "bytes/serde"]
-ipc = ["rpc", "dep:nix", "tokio/net"]
+ipc = ["rpc", "dep:nix", "dep:smallvec", "tokio/net"]
 testing = []
 
 [dev-dependencies]

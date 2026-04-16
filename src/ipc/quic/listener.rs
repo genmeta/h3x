@@ -32,6 +32,7 @@
 use std::sync::Arc;
 
 use remoc::prelude::ServerShared;
+use smallvec::smallvec;
 use snafu::{ResultExt, Snafu};
 use tracing::{Instrument, warn};
 
@@ -123,7 +124,7 @@ where
         // Queue the client FD through the parent-level FdSender
         let fd_id = self
             .fd_sender
-            .queue_fds(vec![client_fd])
+            .queue_fds(smallvec![client_fd])
             .map_err(|e| ipc_listen_error(e, "queue fd"))?;
 
         // Split the server MuxChannel — the remoc handshake + bootstrap are

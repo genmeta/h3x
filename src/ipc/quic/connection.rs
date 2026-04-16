@@ -38,6 +38,7 @@ use std::{borrow::Cow, io, sync::Arc};
 use futures::{SinkExt, StreamExt};
 use remoc::prelude::ServerShared;
 use serde::{Deserialize, Serialize};
+use smallvec::smallvec;
 use tokio::net::UnixStream;
 use tracing::{Instrument, warn};
 
@@ -306,7 +307,7 @@ where
 
         let fd_id = self
             .fd_sender
-            .queue_fds(vec![cli_a_std.into(), cli_b_std.into()])
+            .queue_fds(smallvec![cli_a_std.into(), cli_b_std.into()])
             .map_err(|e| ipc_transport_error(e, "queue_fds"))?;
 
         // Bridge reader direction: real QUIC reader → IpcWriteStream on srv_a
@@ -333,7 +334,7 @@ where
         let cli_std = cli.into_std().map_err(|e| ipc_io_error(e, "into_std"))?;
         let fd_id = self
             .fd_sender
-            .queue_fds(vec![cli_std.into()])
+            .queue_fds(smallvec![cli_std.into()])
             .map_err(|e| ipc_transport_error(e, "queue_fds"))?;
 
         // IpcReadStream on srv → real QUIC writer
@@ -354,7 +355,7 @@ where
         let cli_std = cli.into_std().map_err(|e| ipc_io_error(e, "into_std"))?;
         let fd_id = self
             .fd_sender
-            .queue_fds(vec![cli_std.into()])
+            .queue_fds(smallvec![cli_std.into()])
             .map_err(|e| ipc_transport_error(e, "queue_fds"))?;
 
         // Real QUIC reader → IpcWriteStream on srv

@@ -15,24 +15,37 @@ use std::{
 
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{Sink, Stream, ready};
-use nix::{
-    cmsg_space,
-    sys::socket::{
-        ControlMessage, ControlMessageOwned, MsgFlags, Shutdown, recvmsg, sendmsg, shutdown,
-    },
+use nix::sys::socket::{
+    ControlMessage, ControlMessageOwned, MsgFlags, Shutdown, recvmsg, sendmsg, shutdown,
 };
+use smallvec::SmallVec;
 use snafu::ResultExt;
 use tokio::{io::unix::AsyncFd, sync::oneshot};
 
 use crate::varint::{VARINT_MAX, VarInt};
 
+/// Alias for a small-vec optimised FD collection.
+///
+/// Inline capacity 4 covers the common cases (uni = 1 FD, bidi = 2 FDs)
+/// without heap allocation.
+pub type FdVec = SmallVec<[OwnedFd; 4]>;
+
 const FRAME_TYPE_BYTES: u8 = 0x00;
 const FRAME_TYPE_FDS: u8 = 0x01;
 
 const MAX_FRAME_HEADER_LEN: usize = 1 + VarInt::MAX_SIZE;
-const MAX_FDS_FRAME_LEN: usize = 1 + VarInt::MAX_SIZE + VarInt::MAX_SIZE;
+const MAX_FDS_FRAME_LEN: usize = 1 + VarInt::MAX_SIZE + VarInt::MAX_SIZE + VarInt::MAX_SIZE;
 const READ_CHUNK_LEN: usize = 8 * 1024;
-const MAX_FDS_PER_MESSAGE: usize = 8;
+
+/// Maximum number of FDs allowed in a single FD frame.
+///
+/// Enforced on both the send side ([`FdSender::queue_fds`]) and the receive
+/// side ([`try_decode_frame`]) to bound the cmsg buffer required by
+/// [`recv_frame_data`].
+const MAX_FDS_PER_FRAME: usize = 4;
+
+/// Minimum wire bytes for an FD frame: type(1) + payload_len(1) + id(1) + fd_count(1).
+const MIN_FDS_FRAME_LEN: usize = 4;
 
 #[derive(Debug, snafu::Snafu)]
 #[snafu(module)]
@@ -41,6 +54,8 @@ pub enum QueueFdsError {
     Closed,
     #[snafu(display("fd list is empty"))]
     EmptyFds,
+    #[snafu(display("too many fds ({count}), max is {MAX_FDS_PER_FRAME}"))]
+    TooManyFds { count: usize },
     #[snafu(display("fd id space is exhausted"))]
     IdExhausted,
 }
@@ -146,7 +161,13 @@ impl MuxChannel {
             registry_core,
             registry: registry.clone(),
             read_buf: BytesMut::new(),
-            ancillary_queue: VecDeque::new(),
+            cmsg_buf: {
+                let per_msg = nix::sys::socket::cmsg_space::<[RawFd; MAX_FDS_PER_FRAME]>();
+                let max_msgs = READ_CHUNK_LEN / MIN_FDS_FRAME_LEN;
+                vec![0u8; max_msgs * per_msg]
+            },
+            pending_fds: VecDeque::new(),
+            pending_fd_frame: None,
             closed: false,
         };
 
@@ -176,7 +197,7 @@ impl MuxChannel {
 #[derive(Debug)]
 struct QueuedFds {
     id: VarInt,
-    fds: Vec<OwnedFd>,
+    fds: FdVec,
 }
 
 #[derive(Debug)]
@@ -197,9 +218,12 @@ impl FdSender {
         }
     }
 
-    pub fn queue_fds(&self, fds: Vec<OwnedFd>) -> Result<VarInt, QueueFdsError> {
+    pub fn queue_fds(&self, fds: FdVec) -> Result<VarInt, QueueFdsError> {
         if fds.is_empty() {
             return Err(QueueFdsError::EmptyFds);
+        }
+        if fds.len() > MAX_FDS_PER_FRAME {
+            return Err(QueueFdsError::TooManyFds { count: fds.len() });
         }
 
         let core = self.core.upgrade().ok_or(QueueFdsError::Closed)?;
@@ -346,10 +370,10 @@ enum PendingWriteFrame {
         payload_written: usize,
     },
     Fds {
-        frame: [u8; MAX_FDS_FRAME_LEN],
-        frame_len: usize,
-        written: usize,
-        fds: Vec<OwnedFd>,
+        header: [u8; MAX_FDS_FRAME_LEN],
+        header_len: usize,
+        header_written: usize,
+        payload: FdVec,
         include_ancillary: bool,
     },
 }
@@ -372,23 +396,30 @@ impl PendingWriteFrame {
         }
     }
 
-    fn new_fds(id: VarInt, fds: Vec<OwnedFd>) -> Self {
+    fn new_fds(id: VarInt, fds: FdVec) -> Self {
+        let fd_count = VarInt::try_from(fds.len()).expect("fd count must fit into varint");
+
         let mut id_buf = [0u8; VarInt::MAX_SIZE];
         let id_len = encode_varint_to_slice(&mut id_buf, id);
 
-        let mut frame = [0u8; MAX_FDS_FRAME_LEN];
-        frame[0] = FRAME_TYPE_FDS;
-        let payload_len =
-            VarInt::try_from(id_len).expect("fd frame id length must fit into varint");
-        let len_len = encode_varint_to_slice(&mut frame[1..], payload_len);
-        let header_len = 1 + len_len;
-        frame[header_len..header_len + id_len].copy_from_slice(&id_buf[..id_len]);
+        let mut fc_buf = [0u8; VarInt::MAX_SIZE];
+        let fc_len = encode_varint_to_slice(&mut fc_buf, fd_count);
+
+        let mut header = [0u8; MAX_FDS_FRAME_LEN];
+        header[0] = FRAME_TYPE_FDS;
+        let body_len = VarInt::try_from(id_len + fc_len)
+            .expect("fd frame payload length must fit into varint");
+        let len_len = encode_varint_to_slice(&mut header[1..], body_len);
+        let hdr_prefix = 1 + len_len;
+        header[hdr_prefix..hdr_prefix + id_len].copy_from_slice(&id_buf[..id_len]);
+        header[hdr_prefix + id_len..hdr_prefix + id_len + fc_len]
+            .copy_from_slice(&fc_buf[..fc_len]);
 
         Self::Fds {
-            frame,
-            frame_len: header_len + id_len,
-            written: 0,
-            fds,
+            header,
+            header_len: hdr_prefix + id_len + fc_len,
+            header_written: 0,
+            payload: fds,
             include_ancillary: true,
         }
     }
@@ -414,11 +445,11 @@ impl PendingWriteFrame {
                 }
             }
             Self::Fds {
-                written,
+                header_written,
                 include_ancillary,
                 ..
             } => {
-                *written += n;
+                *header_written += n;
                 if n > 0 {
                     *include_ancillary = false;
                 }
@@ -436,8 +467,10 @@ impl PendingWriteFrame {
                 ..
             } => *header_written >= *header_len && *payload_written >= payload.len(),
             Self::Fds {
-                frame_len, written, ..
-            } => *written >= *frame_len,
+                header_len,
+                header_written,
+                ..
+            } => *header_written >= *header_len,
         }
     }
 }
@@ -472,19 +505,20 @@ fn send_frame(fd: RawFd, frame: &mut PendingWriteFrame) -> io::Result<usize> {
             Ok(sent)
         }
         PendingWriteFrame::Fds {
-            frame,
-            frame_len,
-            written,
-            fds,
+            header,
+            header_len,
+            header_written,
+            payload,
             include_ancillary,
         } => {
-            if *written >= *frame_len {
+            if *header_written >= *header_len {
                 return Ok(0);
             }
 
-            let iov = [io::IoSlice::new(&frame[*written..*frame_len])];
+            let iov = [io::IoSlice::new(&header[*header_written..*header_len])];
             let sent = if *include_ancillary {
-                let raw_fds: Vec<RawFd> = fds.iter().map(AsRawFd::as_raw_fd).collect();
+                let raw_fds: SmallVec<[RawFd; 4]> =
+                    payload.iter().map(AsRawFd::as_raw_fd).collect();
                 let cmsgs = [ControlMessage::ScmRights(&raw_fds)];
                 sendmsg::<()>(fd, &iov, &cmsgs, MsgFlags::empty(), None)
             } else {
@@ -510,8 +544,8 @@ struct RegistryState {
 
 #[derive(Debug)]
 enum RegistrySlot {
-    Ready(Vec<OwnedFd>),
-    Waiting(oneshot::Sender<Result<Vec<OwnedFd>, WaitFdsError>>),
+    Ready(FdVec),
+    Waiting(oneshot::Sender<Result<FdVec, WaitFdsError>>),
 }
 
 impl RegistryCore {
@@ -524,7 +558,7 @@ impl RegistryCore {
         }
     }
 
-    async fn wait_fds(&self, id: VarInt) -> Result<Vec<OwnedFd>, WaitFdsError> {
+    async fn wait_fds(&self, id: VarInt) -> Result<FdVec, WaitFdsError> {
         let rx = {
             let mut state = self.state.lock().expect("registry mutex poisoned");
             if state.closed {
@@ -552,7 +586,7 @@ impl RegistryCore {
         }
     }
 
-    fn register_arrival(&self, id: VarInt, fds: Vec<OwnedFd>) -> Result<(), RegisterFdsError> {
+    fn register_arrival(&self, id: VarInt, fds: FdVec) -> Result<(), RegisterFdsError> {
         let mut state = self.state.lock().expect("registry mutex poisoned");
         if state.closed {
             return Err(RegisterFdsError::Closed);
@@ -566,7 +600,7 @@ impl RegistryCore {
             }
             Some(RegistrySlot::Waiting(waiter)) => {
                 if let Err(payload) = waiter.send(Ok(fds)) {
-                    let recovered_fds = payload.unwrap_or_default();
+                    let recovered_fds = payload.unwrap_or_else(|_| FdVec::new());
                     state.slots.insert(id, RegistrySlot::Ready(recovered_fds));
                 }
                 Ok(())
@@ -612,7 +646,7 @@ impl FdRegistry {
         (core, registry)
     }
 
-    pub async fn wait_fds(&self, id: VarInt) -> Result<Vec<OwnedFd>, WaitFdsError> {
+    pub async fn wait_fds(&self, id: VarInt) -> Result<FdVec, WaitFdsError> {
         let core = self.core.upgrade().ok_or(WaitFdsError::Closed)?;
         core.wait_fds(id).await
     }
@@ -624,7 +658,23 @@ pub struct MuxStream {
     registry_core: Arc<RegistryCore>,
     registry: FdRegistry,
     read_buf: BytesMut,
-    ancillary_queue: VecDeque<Vec<OwnedFd>>,
+    /// Heap-allocated cmsg buffer for `recvmsg()`, reused across calls.
+    ///
+    /// Sized for the worst case where every `MIN_FDS_FRAME_LEN` bytes in a
+    /// read chunk originates from a separate `sendmsg()` carrying
+    /// `MAX_FDS_PER_FRAME` FDs — on `SOCK_STREAM` the kernel may coalesce
+    /// all of them into a single `recvmsg()`.
+    cmsg_buf: Vec<u8>,
+    /// Flat queue of pending FDs received via SCM_RIGHTS.
+    ///
+    /// On SOCK_STREAM, the kernel may coalesce SCM_RIGHTS from multiple
+    /// sendmsg calls into a single control message.  Each FD frame includes
+    /// an `fd_count` field so the receiver can take the correct number of
+    /// FDs from this flat queue.
+    pending_fds: VecDeque<OwnedFd>,
+    /// An FD frame that has been decoded from the byte stream but whose
+    /// ancillary FDs have not yet arrived.
+    pending_fd_frame: Option<(VarInt, usize)>,
     closed: bool,
 }
 
@@ -649,78 +699,115 @@ impl Stream for MuxStream {
         }
 
         loop {
-            if let Some(frame) = match try_decode_frame(&mut self.read_buf) {
-                Ok(frame) => frame,
-                Err(err) => {
-                    self.closed = true;
-                    self.registry_core.close();
-                    return Poll::Ready(Some(Err(err)));
+            // 1. Complete any pending FD frame whose ancillary FDs have now arrived.
+            if let Some((id, fd_count)) = self.pending_fd_frame {
+                if self.pending_fds.len() >= fd_count {
+                    self.pending_fd_frame = None;
+                    let fds: FdVec = self.pending_fds.drain(..fd_count).collect();
+                    if let Err(source) = self.registry_core.register_arrival(id, fds) {
+                        self.closed = true;
+                        self.registry_core.close();
+                        return Poll::Ready(Some(Err(MuxStreamError::RegisterFds { source })));
+                    }
+                    continue;
                 }
-            } {
-                match frame {
-                    DecodedFrame::Bytes(payload) => return Poll::Ready(Some(Ok(payload))),
-                    DecodedFrame::Fds { id } => {
-                        let Some(fds) = self.ancillary_queue.pop_front() else {
-                            self.closed = true;
-                            self.registry_core.close();
-                            return Poll::Ready(Some(Err(MuxStreamError::MissingAncillaryFds)));
-                        };
-                        if let Err(source) = self.registry_core.register_arrival(id, fds) {
-                            self.closed = true;
-                            self.registry_core.close();
-                            return Poll::Ready(Some(Err(MuxStreamError::RegisterFds { source })));
+                // Still waiting for FDs — fall through to read more data.
+            } else {
+                // 2. Decode next frame from the byte buffer.
+                match try_decode_frame(&mut self.read_buf) {
+                    Ok(Some(DecodedFrame::Bytes(payload))) => {
+                        return Poll::Ready(Some(Ok(payload)));
+                    }
+                    Ok(Some(DecodedFrame::Fds { id, fd_count })) => {
+                        if self.pending_fds.len() >= fd_count {
+                            let fds: FdVec = self.pending_fds.drain(..fd_count).collect();
+                            if let Err(source) = self.registry_core.register_arrival(id, fds) {
+                                self.closed = true;
+                                self.registry_core.close();
+                                return Poll::Ready(Some(Err(MuxStreamError::RegisterFds {
+                                    source,
+                                })));
+                            }
+                            continue;
                         }
-                        continue;
+                        // FD frame decoded but ancillary not yet received.
+                        // Stash it and fall through to read more data.
+                        self.pending_fd_frame = Some((id, fd_count));
+                    }
+                    Ok(None) => {
+                        // Incomplete frame — fall through to read more data.
+                    }
+                    Err(err) => {
+                        self.closed = true;
+                        self.registry_core.close();
+                        return Poll::Ready(Some(Err(err)));
                     }
                 }
             }
 
-            let mut guard = match ready!(self.fd.poll_read_ready(cx)) {
+            // 3. Read more data (and ancillary FDs) from the socket.
+            // Reborrow to enable split field borrows (guard borrows fd, recv
+            // borrows cmsg_buf).
+            let this = &mut *self;
+            let mut guard = match ready!(this.fd.poll_read_ready(cx)) {
                 Ok(guard) => guard,
                 Err(source) => return Poll::Ready(Some(Err(MuxStreamError::PollReady { source }))),
             };
 
             let mut read_buf = [0u8; READ_CHUNK_LEN];
-            let io_result =
-                guard.try_io(|inner| recv_frame_data(inner.get_ref().as_raw_fd(), &mut read_buf));
+            let io_result = guard.try_io(|inner| {
+                recv_frame_data(
+                    inner.get_ref().as_raw_fd(),
+                    &mut read_buf,
+                    &mut this.cmsg_buf,
+                )
+            });
 
             let (read, ancillary) = match io_result {
                 Ok(Ok(result)) => result,
                 Ok(Err(source)) => {
-                    self.closed = true;
-                    self.registry_core.close();
+                    this.closed = true;
+                    this.registry_core.close();
                     return Poll::Ready(Some(Err(MuxStreamError::Recv { source })));
                 }
                 Err(_would_block) => return Poll::Pending,
             };
 
             if read == 0 {
-                self.closed = true;
-                self.registry_core.close();
+                this.closed = true;
+                this.registry_core.close();
+                if this.pending_fd_frame.is_some() {
+                    return Poll::Ready(Some(Err(MuxStreamError::MissingAncillaryFds)));
+                }
                 return Poll::Ready(None);
             }
 
             if !ancillary.is_empty() {
-                self.ancillary_queue.push_back(ancillary);
+                this.pending_fds.extend(ancillary);
             }
-            self.read_buf.extend_from_slice(&read_buf[..read]);
+            this.read_buf.extend_from_slice(&read_buf[..read]);
         }
     }
 }
 
-fn recv_frame_data(fd: RawFd, data_buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
+fn recv_frame_data(
+    fd: RawFd,
+    data_buf: &mut [u8],
+    cmsg_buf: &mut Vec<u8>,
+) -> io::Result<(usize, FdVec)> {
     let mut iov = [io::IoSliceMut::new(data_buf)];
-    let mut cmsg_buf = cmsg_space!([RawFd; MAX_FDS_PER_MESSAGE]);
 
-    let msg = recvmsg::<()>(
-        fd,
-        &mut iov,
-        Some(&mut cmsg_buf),
-        MsgFlags::MSG_CMSG_CLOEXEC,
-    )
-    .map_err(io::Error::from)?;
+    let msg = recvmsg::<()>(fd, &mut iov, Some(cmsg_buf), MsgFlags::MSG_CMSG_CLOEXEC)
+        .map_err(io::Error::from)?;
 
-    let mut fds = Vec::new();
+    if msg.flags.contains(MsgFlags::MSG_CTRUNC) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cmsg buffer overflow: ancillary data truncated (MSG_CTRUNC)",
+        ));
+    }
+
+    let mut fds = FdVec::new();
     let cmsgs = msg.cmsgs().map_err(io::Error::from)?;
     for cmsg in cmsgs {
         if let ControlMessageOwned::ScmRights(raw_fds) = cmsg {
@@ -738,7 +825,7 @@ fn recv_frame_data(fd: RawFd, data_buf: &mut [u8]) -> io::Result<(usize, Vec<Own
 #[derive(Debug)]
 enum DecodedFrame {
     Bytes(Bytes),
-    Fds { id: VarInt },
+    Fds { id: VarInt, fd_count: usize },
 }
 
 fn try_decode_frame(src: &mut BytesMut) -> Result<Option<DecodedFrame>, MuxStreamError> {
@@ -766,11 +853,18 @@ fn try_decode_frame(src: &mut BytesMut) -> Result<Option<DecodedFrame>, MuxStrea
     match frame_type {
         FRAME_TYPE_BYTES => Ok(Some(DecodedFrame::Bytes(payload))),
         FRAME_TYPE_FDS => {
-            let (id, consumed) = decode_varint_from_slice(&payload)?;
-            if consumed != payload.len() {
+            let (id, id_consumed) = decode_varint_from_slice(&payload)?;
+            let remaining = &payload[id_consumed..];
+            let (fd_count_vi, fc_consumed) = decode_varint_from_slice(remaining)?;
+            if id_consumed + fc_consumed != payload.len() {
                 return Err(MuxStreamError::InvalidFdsPayload);
             }
-            Ok(Some(DecodedFrame::Fds { id }))
+            let fd_count = usize::try_from(u64::from(fd_count_vi))
+                .map_err(|_| MuxStreamError::InvalidFdsPayload)?;
+            if fd_count == 0 || fd_count > MAX_FDS_PER_FRAME {
+                return Err(MuxStreamError::InvalidFdsPayload);
+            }
+            Ok(Some(DecodedFrame::Fds { id, fd_count }))
         }
         _ => Err(MuxStreamError::UnknownFrameType { frame_type }),
     }
@@ -837,6 +931,7 @@ fn encode_varint_to_slice(dst: &mut [u8], v: VarInt) -> usize {
 #[cfg(test)]
 mod tests {
     use futures::{SinkExt, StreamExt};
+    use smallvec::smallvec;
     use tokio::time::{Duration, timeout};
 
     use super::*;
@@ -873,7 +968,7 @@ mod tests {
         let (fd_a, _fd_b) = StdUnixStream::pair().expect("fd pair");
         let id = sink_a
             .fd_sender()
-            .queue_fds(vec![fd_a.into()])
+            .queue_fds(smallvec![fd_a.into()])
             .expect("queue fds");
 
         sink_a.send(Bytes::new()).await.expect("drive flush");
@@ -897,7 +992,7 @@ mod tests {
         let (fd_a, _fd_b) = StdUnixStream::pair().expect("fd pair");
         let id = sink_a
             .fd_sender()
-            .queue_fds(vec![fd_a.into()])
+            .queue_fds(smallvec![fd_a.into()])
             .expect("queue fds");
         assert_eq!(id, VarInt::from_u32(0));
 
@@ -921,9 +1016,9 @@ mod tests {
         let id = VarInt::from_u32(7);
 
         registry_core
-            .register_arrival(id, vec![fd1.into()])
+            .register_arrival(id, smallvec![fd1.into()])
             .expect("first arrival");
-        let duplicate = registry_core.register_arrival(id, vec![fd2.into()]);
+        let duplicate = registry_core.register_arrival(id, smallvec![fd2.into()]);
         assert!(matches!(
             duplicate,
             Err(RegisterFdsError::DuplicateId { .. })
@@ -940,7 +1035,7 @@ mod tests {
 
         let (fd1, _peer1) = StdUnixStream::pair().expect("pair1");
         registry_core
-            .register_arrival(id, vec![fd1.into()])
+            .register_arrival(id, smallvec![fd1.into()])
             .expect("first arrival");
         let first = registry.wait_fds(id).await.expect("first consume");
         assert_eq!(first.len(), 1);
@@ -952,7 +1047,7 @@ mod tests {
 
         let (fd2, _peer2) = StdUnixStream::pair().expect("pair2");
         registry_core
-            .register_arrival(id, vec![fd2.into()])
+            .register_arrival(id, smallvec![fd2.into()])
             .expect("second arrival");
 
         let second = waiter.await.expect("join").expect("second consume");
@@ -967,7 +1062,7 @@ mod tests {
         let (fd_a, _fd_b) = StdUnixStream::pair().expect("fd pair");
         let id = sink_a
             .fd_sender()
-            .queue_fds(vec![fd_a.into()])
+            .queue_fds(smallvec![fd_a.into()])
             .expect("queue fds");
 
         sink_a
@@ -1004,7 +1099,7 @@ mod tests {
         drop(sink_a);
 
         let (fd, _peer) = StdUnixStream::pair().expect("fd pair");
-        let result = sender.queue_fds(vec![fd.into()]);
+        let result = sender.queue_fds(smallvec![fd.into()]);
         assert!(matches!(result, Err(QueueFdsError::Closed)));
     }
 
@@ -1016,7 +1111,7 @@ mod tests {
     async fn queue_fds_empty_vec_rejected() {
         let ((sink_a, _stream_a), (_sink_b, _stream_b)) = make_pair();
         let sender = sink_a.fd_sender();
-        let result = sender.queue_fds(vec![]);
+        let result = sender.queue_fds(smallvec![]);
         assert!(matches!(result, Err(QueueFdsError::EmptyFds)));
     }
 
@@ -1030,7 +1125,7 @@ mod tests {
         let (fd3, _p3) = StdUnixStream::pair().expect("pair3");
         let id = sink_a
             .fd_sender()
-            .queue_fds(vec![fd1.into(), fd2.into(), fd3.into()])
+            .queue_fds(smallvec![fd1.into(), fd2.into(), fd3.into()])
             .expect("queue 3 fds");
 
         sink_a.send(Bytes::new()).await.expect("drive flush");
@@ -1064,7 +1159,7 @@ mod tests {
         // Satisfy the first waiter to clean up
         let (fd, _peer) = StdUnixStream::pair().expect("pair");
         registry_core
-            .register_arrival(id, vec![fd.into()])
+            .register_arrival(id, smallvec![fd.into()])
             .expect("arrival");
         waiter.await.expect("join").expect("wait result");
     }
@@ -1099,7 +1194,7 @@ mod tests {
         registry_core.close();
 
         let (fd, _peer) = StdUnixStream::pair().expect("pair");
-        let result = registry_core.register_arrival(VarInt::from_u32(0), vec![fd.into()]);
+        let result = registry_core.register_arrival(VarInt::from_u32(0), smallvec![fd.into()]);
         assert!(matches!(result, Err(RegisterFdsError::Closed)));
     }
 
@@ -1114,7 +1209,7 @@ mod tests {
         let sender = sink_a.fd_sender();
 
         let (fd1, _p1) = StdUnixStream::pair().expect("pair1");
-        let id1 = sender.queue_fds(vec![fd1.into()]).expect("queue 1");
+        let id1 = sender.queue_fds(smallvec![fd1.into()]).expect("queue 1");
 
         sink_a
             .send(Bytes::from_static(b"msg1"))
@@ -1122,7 +1217,7 @@ mod tests {
             .expect("send msg1");
 
         let (fd2, _p2) = StdUnixStream::pair().expect("pair2");
-        let id2 = sender.queue_fds(vec![fd2.into()]).expect("queue 2");
+        let id2 = sender.queue_fds(smallvec![fd2.into()]).expect("queue 2");
 
         sink_a
             .send(Bytes::from_static(b"msg2"))
@@ -1130,7 +1225,7 @@ mod tests {
             .expect("send msg2");
 
         let (fd3, _p3) = StdUnixStream::pair().expect("pair3");
-        let id3 = sender.queue_fds(vec![fd3.into()]).expect("queue 3");
+        let id3 = sender.queue_fds(smallvec![fd3.into()]).expect("queue 3");
 
         sink_a
             .send(Bytes::from_static(b"msg3"))
@@ -1173,8 +1268,8 @@ mod tests {
         // Queue two FD frames back to back without bytes between
         let (fd1, _p1) = StdUnixStream::pair().expect("pair1");
         let (fd2, _p2) = StdUnixStream::pair().expect("pair2");
-        let id1 = sender.queue_fds(vec![fd1.into()]).expect("queue 1");
-        let id2 = sender.queue_fds(vec![fd2.into()]).expect("queue 2");
+        let id1 = sender.queue_fds(smallvec![fd1.into()]).expect("queue 1");
+        let id2 = sender.queue_fds(smallvec![fd2.into()]).expect("queue 2");
 
         // A bytes frame drives the flush of both FD frames
         sink_a
@@ -1198,10 +1293,10 @@ mod tests {
         let reader_ch = MuxChannel::from_fd(reader.into()).expect("from_fd");
         let (_sink, mut stream) = reader_ch.split().expect("split");
 
-        // FD frame: type=0x01, length=1, payload=0x00 (varint id=0)
+        // FD frame: type=0x01, length=2, id=0x00, fd_count=0x01
         use std::io::Write;
         (&raw_writer)
-            .write_all(&[FRAME_TYPE_FDS, 0x01, 0x00])
+            .write_all(&[FRAME_TYPE_FDS, 0x02, 0x00, 0x01])
             .expect("write");
         drop(raw_writer);
 
@@ -1265,7 +1360,7 @@ mod tests {
         let (fd, _peer) = StdUnixStream::pair().expect("pair");
         let fd_id = sink_a
             .fd_sender()
-            .queue_fds(vec![fd.into()])
+            .queue_fds(smallvec![fd.into()])
             .expect("queue fds");
 
         // Step 3: flush sends FD frame first, then bytes frame
