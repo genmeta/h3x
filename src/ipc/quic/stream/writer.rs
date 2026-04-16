@@ -64,8 +64,10 @@ impl WriterLive {
     /// - `CONN_CLOSED` → connection died
     /// - others → ignore
     ///
-    /// On read-close: if the connection is dead, sends best-effort `CONN_CLOSED`
-    /// (only when no partial PUSH is in flight) and transitions to `ConnDied`.
+    /// On read-close: sends best-effort `CONN_CLOSED` (only when no partial
+    /// PUSH is in flight) and transitions to `ConnDied`.  The pipe EOF is
+    /// treated as authoritative — no more `PULL` frames can ever arrive —
+    /// even if `lifecycle.check()` has not yet been updated.
     fn drain_and_check(&mut self, cx: &mut Context<'_>) -> Step<()> {
         let outcome = drain(&mut self.read, cx, |frame| match frame {
             Frame::Pull => {
@@ -78,15 +80,14 @@ impl WriterLive {
         });
 
         outcome.resolve(|| {
-            if self.lifecycle.check().is_err() {
-                // Only send CONN_CLOSED if no partial PUSH is in flight.
-                if self.pending.is_none() {
-                    let _ = Pin::new(&mut self.write).poll_write(cx, &[TAG_CONN_CLOSED]);
-                }
-                Step::Transition(Transition::ConnDied(self.lifecycle.clone()))
-            } else {
-                Step::Done(())
+            // Pipe read half is closed: the peer bridge task has exited
+            // (either because the connection died or because it finished).
+            // No more PULL frames can ever arrive, so continuing would
+            // deadlock poll_ready.  Transition unconditionally.
+            if self.pending.is_none() {
+                let _ = Pin::new(&mut self.write).poll_write(cx, &[TAG_CONN_CLOSED]);
             }
+            Step::Transition(Transition::ConnDied(self.lifecycle.clone()))
         })
     }
 
