@@ -16,9 +16,7 @@ use crate::{
     codec::{PeekableStreamReader, SinkWriter, StreamReader},
     dhttp::{protocol::DHttpProtocolFactory, settings::Settings},
     error::{Code, ErrorScope, H3Error},
-    protocol::{
-        InitProtocols, ProductProtocol, Protocols, StreamVerdict, compute_factory_identity,
-    },
+    protocol::{IdentifiedProtocolInitializer, ProductProtocol, Protocols, StreamVerdict},
     qpack::protocol::QPackProtocolFactory,
     quic::{self, CancelStreamExt, StopStreamExt, agent},
     varint::VarInt,
@@ -142,49 +140,8 @@ pub trait LifecycleExt: quic::DynLifecycle + Sync {
 
 impl<T: quic::DynLifecycle + Sync + ?Sized> LifecycleExt for T {}
 
-struct IdentifiedInitializer<C> {
-    identity: u64,
-    init: Box<dyn InitProtocols<C>>,
-}
-
-impl<C: quic::Connection> IdentifiedInitializer<C> {
-    fn new<F: ProductProtocol<C>>(factory: F) -> Self {
-        let identity = compute_factory_identity::<C, F>(&factory);
-        Self {
-            identity,
-            init: Box::new(factory),
-        }
-    }
-}
-
-impl<C> Hash for IdentifiedInitializer<C> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.identity.hash(state);
-    }
-}
-
-impl<C> PartialEq for IdentifiedInitializer<C> {
-    fn eq(&self, other: &Self) -> bool {
-        self.identity == other.identity
-    }
-}
-
-impl<C> Eq for IdentifiedInitializer<C> {}
-
-impl<C> fmt::Debug for IdentifiedInitializer<C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.init, f)
-    }
-}
-
-impl<C> fmt::Display for IdentifiedInitializer<C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.init, f)
-    }
-}
-
 pub struct ConnectionBuilder<C: Any> {
-    initializers: Vec<IdentifiedInitializer<C>>,
+    initializers: Vec<IdentifiedProtocolInitializer<C>>,
     _connection: PhantomData<C>,
 }
 
@@ -221,7 +178,8 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
     }
 
     pub fn protocol<F: ProductProtocol<C>>(mut self, factory: F) -> Self {
-        self.initializers.push(IdentifiedInitializer::new(factory));
+        self.initializers
+            .push(IdentifiedProtocolInitializer::new(factory));
         self
     }
 
@@ -232,8 +190,8 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
         let quic = Arc::new(quic);
         let mut protocols = Protocols::new();
 
-        for entry in &self.initializers {
-            entry.init.init_protocols(&quic, &mut protocols).await?;
+        for initializer in &self.initializers {
+            initializer.init_protocols(&quic, &mut protocols).await?;
         }
 
         let protocols = Arc::new(protocols);
@@ -248,37 +206,15 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
 
 impl<C: Any> Hash for ConnectionBuilder<C> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Sort by identity hash for order-independent hashing
-        let mut identities: Vec<u64> = self
-            .initializers
-            .iter()
-            .map(|entry| entry.identity)
-            .collect();
-        identities.sort();
-        for id in &identities {
-            id.hash(state);
+        for initializer in &self.initializers {
+            initializer.hash(state);
         }
     }
 }
 
 impl<C: Any> PartialEq for ConnectionBuilder<C> {
     fn eq(&self, other: &Self) -> bool {
-        if self.initializers.len() != other.initializers.len() {
-            return false;
-        }
-        let mut self_ids: Vec<u64> = self
-            .initializers
-            .iter()
-            .map(|entry| entry.identity)
-            .collect();
-        let mut other_ids: Vec<u64> = other
-            .initializers
-            .iter()
-            .map(|entry| entry.identity)
-            .collect();
-        self_ids.sort();
-        other_ids.sort();
-        self_ids == other_ids
+        self.initializers == other.initializers
     }
 }
 
@@ -838,7 +774,7 @@ pub(crate) mod tests {
 
     #[cfg(feature = "dquic")]
     #[test]
-    fn builder_order_independent_hash() {
+    fn builder_different_order_different_hash() {
         let s = Arc::new(Settings::default());
         // a: DHttpProtocolFactory, QPackProtocolFactory, MockFactory (from new + protocol)
         let a = ConnectionBuilder::<C>::new(s.clone()).protocol(MockFactory(7));
@@ -853,7 +789,7 @@ pub(crate) mod tests {
                 .protocol(crate::dhttp::protocol::DHttpProtocolFactory::new(s))
                 .protocol(crate::qpack::protocol::QPackProtocolFactory::new())
         };
-        assert_eq!(hash_of(&a), hash_of(&b));
+        assert_ne!(hash_of(&a), hash_of(&b));
     }
 
     #[cfg(feature = "dquic")]

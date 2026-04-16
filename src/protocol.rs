@@ -65,6 +65,7 @@ use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     fmt::{self, Debug},
     hash::{Hash, Hasher},
+    ops,
     pin::Pin,
     sync::Arc,
 };
@@ -233,15 +234,58 @@ impl<C: quic::Connection, P: ProductProtocol<C>> InitProtocols<C> for P {
     }
 }
 
-/// Computes a deterministic identity hash for a `ProductProtocol` factory,
-/// combining its `TypeId` and value hash.
-pub(crate) fn compute_factory_identity<C: quic::Connection, F: ProductProtocol<C>>(
-    factory: &F,
-) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    TypeId::of::<F>().hash(&mut hasher);
-    factory.hash(&mut hasher);
-    hasher.finish()
+pub(crate) struct IdentifiedProtocolInitializer<C> {
+    identity: u64,
+    init: Box<dyn InitProtocols<C>>,
+}
+
+impl<C: quic::Connection> IdentifiedProtocolInitializer<C> {
+    pub fn new<F: ProductProtocol<C>>(factory: F) -> Self {
+        let identity = {
+            let mut hasher = DefaultHasher::new();
+            TypeId::of::<F>().hash(&mut hasher);
+            factory.hash(&mut hasher);
+            hasher.finish()
+        };
+        Self {
+            identity,
+            init: Box::new(factory),
+        }
+    }
+}
+
+impl<C> ops::Deref for IdentifiedProtocolInitializer<C> {
+    type Target = dyn InitProtocols<C>;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.init
+    }
+}
+
+impl<C> Hash for IdentifiedProtocolInitializer<C> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.identity.hash(state);
+    }
+}
+
+impl<C> PartialEq for IdentifiedProtocolInitializer<C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl<C> Eq for IdentifiedProtocolInitializer<C> {}
+
+impl<C> fmt::Debug for IdentifiedProtocolInitializer<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.init, f)
+    }
+}
+
+impl<C> fmt::Display for IdentifiedProtocolInitializer<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.init, f)
+    }
 }
 
 /// Protocol layer trait for handling QUIC streams in a layered architecture.
@@ -302,15 +346,15 @@ mod tests {
 
     /// Test-only mock protocol factory.
     #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-    struct MockFactory(u64);
+    struct MockFactoryFoo(u64);
 
-    impl fmt::Display for MockFactory {
+    impl fmt::Display for MockFactoryFoo {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(f, "MockFactory")
         }
     }
 
-    impl<C: quic::Connection> ProductProtocol<C> for MockFactory {
+    impl<C: quic::Connection> ProductProtocol<C> for MockFactoryFoo {
         type Protocol = MockProtocol;
 
         fn init<'a>(
@@ -324,9 +368,9 @@ mod tests {
 
     /// Second mock for cross-type tests.
     #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-    struct MockFactory2(u64);
+    struct MockFactoryBar(u64);
 
-    impl fmt::Display for MockFactory2 {
+    impl fmt::Display for MockFactoryBar {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(f, "MockFactory2")
         }
@@ -352,7 +396,7 @@ mod tests {
         }
     }
 
-    impl<C: quic::Connection> ProductProtocol<C> for MockFactory2 {
+    impl<C: quic::Connection> ProductProtocol<C> for MockFactoryBar {
         type Protocol = MockProtocol2;
 
         fn init<'a>(
@@ -364,8 +408,10 @@ mod tests {
         }
     }
 
-    fn compute_identity<C: quic::Connection, F: ProductProtocol<C>>(f: &F) -> u64 {
-        compute_factory_identity::<C, F>(f)
+    fn identity<C: quic::Connection, F: ProductProtocol<C>>(
+        f: F,
+    ) -> IdentifiedProtocolInitializer<C> {
+        IdentifiedProtocolInitializer::new(f)
     }
 
     #[cfg(feature = "dquic")]
@@ -374,24 +420,24 @@ mod tests {
     #[cfg(feature = "dquic")]
     #[test]
     fn identity_hash_same_value_same_hash() {
-        let a = MockFactory(42);
-        let b = MockFactory(42);
-        assert_eq!(compute_identity::<C, _>(&a), compute_identity::<C, _>(&b));
+        let a = MockFactoryFoo(42);
+        let b = MockFactoryFoo(42);
+        assert_eq!(identity::<C, _>(a), identity::<C, _>(b));
     }
 
     #[cfg(feature = "dquic")]
     #[test]
     fn identity_hash_different_value_different_hash() {
-        let a = MockFactory(1);
-        let b = MockFactory(2);
-        assert_ne!(compute_identity::<C, _>(&a), compute_identity::<C, _>(&b));
+        let a = MockFactoryFoo(1);
+        let b = MockFactoryFoo(2);
+        assert_ne!(identity::<C, _>(a), identity::<C, _>(b));
     }
 
     #[cfg(feature = "dquic")]
     #[test]
     fn identity_hash_different_type_different_hash() {
-        let a = MockFactory(1);
-        let b = MockFactory2(1);
-        assert_ne!(compute_identity::<C, _>(&a), compute_identity::<C, _>(&b));
+        let a = MockFactoryFoo(1);
+        let b = MockFactoryBar(1);
+        assert_ne!(identity::<C, _>(a), identity::<C, _>(b));
     }
 }
