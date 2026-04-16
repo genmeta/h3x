@@ -79,6 +79,7 @@ where
     ///
     /// Useful for recovering the listener after cancellation so it can be
     /// reused without tearing down the underlying QUIC bindings.
+    #[allow(clippy::type_complexity)]
     pub fn into_parts(
         self,
     ) -> (

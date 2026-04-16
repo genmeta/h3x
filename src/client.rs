@@ -48,6 +48,7 @@ impl<C: quic::Connect> Client<C> {
     }
 
     /// Decompose this `Client` into its constituent parts.
+    #[allow(clippy::type_complexity)]
     pub fn into_parts(
         self,
     ) -> (
