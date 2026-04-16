@@ -30,6 +30,7 @@ use crate::{
 enum ServerCertVerifier {
     WebPki(Arc<WebPkiServerVerifier>),
     Roots(Arc<RootCertStore>),
+    Custom(Arc<dyn rustls::client::danger::ServerCertVerifier>),
     None,
 }
 
@@ -87,6 +88,14 @@ impl H3ClientTlsBuilder {
         self
     }
 
+    pub fn with_server_cert_verifier(
+        mut self,
+        verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    ) -> Self {
+        self.server_cert_verifier = ServerCertVerifier::Custom(verifier);
+        self
+    }
+
     pub fn without_server_cert_verification(mut self) -> Self {
         self.server_cert_verifier = ServerCertVerifier::None;
         self
@@ -137,6 +146,9 @@ impl TryFrom<H3ClientTlsBuilder> for H3ClientBuilder {
             ServerCertVerifier::Roots(root_cert_store) => {
                 tls_config_buider.with_root_certificates(root_cert_store)
             }
+            ServerCertVerifier::Custom(verifier) => tls_config_buider
+                .dangerous()
+                .with_custom_certificate_verifier(verifier),
             ServerCertVerifier::None => tls_config_buider
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(DangerousServerCertVerifier)),

@@ -712,13 +712,23 @@ fn recv_frame_data(fd: RawFd, data_buf: &mut [u8]) -> io::Result<(usize, Vec<Own
     let mut iov = [io::IoSliceMut::new(data_buf)];
     let mut cmsg_buf = cmsg_space!([RawFd; MAX_FDS_PER_MESSAGE]);
 
-    let msg = recvmsg::<()>(
-        fd,
-        &mut iov,
-        Some(&mut cmsg_buf),
-        MsgFlags::MSG_CMSG_CLOEXEC,
-    )
-    .map_err(io::Error::from)?;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos"
+    ))]
+    let recv_flags = MsgFlags::empty();
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos"
+    )))]
+    let recv_flags = MsgFlags::MSG_CMSG_CLOEXEC;
+
+    let msg =
+        recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_buf), recv_flags).map_err(io::Error::from)?;
 
     let mut fds = Vec::new();
     let cmsgs = msg.cmsgs().map_err(io::Error::from)?;
