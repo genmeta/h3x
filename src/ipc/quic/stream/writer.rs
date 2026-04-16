@@ -90,10 +90,24 @@ impl WriterLive {
         })
     }
 
-    /// `poll_ready` step: drain control → check pulled + no pending data.
+    /// `poll_ready` step: drain control → eagerly flush pending → check pulled.
+    ///
+    /// Callers (e.g. `SinkWriter::poll_write`) may call `poll_ready` after
+    /// `start_send` without an intervening `poll_flush`.  To avoid deadlock
+    /// we eagerly flush pending PUSH data here, ensuring the bridge-writer
+    /// can receive it and send the next PULL.
     fn step_poll_ready(&mut self, cx: &mut Context<'_>) -> Step<()> {
         let step = self.drain_and_check(cx);
         step.and_then(|()| {
+            // Eagerly flush any pending PUSH — prevents deadlock when the
+            // caller skips poll_flush between start_send and poll_ready.
+            if self.pending.is_some() {
+                match flush_pending(&mut self.write, &self.lifecycle, &mut self.pending, cx) {
+                    Step::Transition(t) => return Step::Transition(t),
+                    Step::Pending | Step::Done(()) => {}
+                }
+            }
+
             if self.pulled && self.pending.is_none() {
                 Step::Done(())
             } else {
