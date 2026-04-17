@@ -35,7 +35,7 @@ mod tests {
             ConnectionError,
             test::{mock_stream_pair, mock_stream_pair_with_capacity},
         },
-        util::try_future::TryFuture,
+        util::deferred::Deferred,
         varint::VarInt,
     };
 
@@ -59,7 +59,7 @@ mod tests {
             .unwrap();
             tracing::trace!("sent encoder stream type");
 
-            let decoder_stream = Box::pin(TryFuture::from(async move {
+            let decoder_stream = Box::pin(Deferred::from(async move {
                 let decoder_stream = StreamReader::new(decoder_stream_reader)
                     .decode::<UnidirectionalStream<_>>()
                     .await
@@ -88,7 +88,7 @@ mod tests {
             .unwrap();
             tracing::trace!("sent decoder stream type");
 
-            let encoder_stream = Box::pin(TryFuture::from(async move {
+            let encoder_stream = Box::pin(Deferred::from(async move {
                 let encoder_stream = StreamReader::new(encoder_stream_reader)
                     .decode::<UnidirectionalStream<_>>()
                     .await
@@ -350,7 +350,7 @@ mod tests {
             .await
             .unwrap();
 
-            let decoder_stream = Box::pin(TryFuture::from(async move {
+            let decoder_stream = Box::pin(Deferred::from(async move {
                 let decoder_stream = StreamReader::new(decoder_stream_reader)
                     .decode::<UnidirectionalStream<_>>()
                     .await
@@ -377,7 +377,7 @@ mod tests {
             .await
             .unwrap();
 
-            let encoder_stream = Box::pin(TryFuture::from(async move {
+            let encoder_stream = Box::pin(Deferred::from(async move {
                 let encoder_stream = StreamReader::new(encoder_stream_reader)
                     .decode::<UnidirectionalStream<_>>()
                     .await

@@ -8,7 +8,7 @@ use crate::{
     dhttp::protocol::{BoxDynQuicStreamReader, BoxDynQuicStreamWriter},
     message::stream::guard,
     quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
-    util::try_future::TryFuture,
+    util::deferred::Deferred,
     varint::VarInt,
 };
 
@@ -40,7 +40,7 @@ impl ReadStreamClient {
     }
 
     pub fn into_boxed_quic(self) -> BoxDynQuicStreamReader {
-        let raw: BoxReadStream = Box::pin(TryFuture::from(self.into_quic()));
+        let raw: BoxReadStream = Box::pin(Deferred::from(self.into_quic()));
         guard::GuardedQuicReader::new(raw)
     }
 }
@@ -98,7 +98,7 @@ impl WriteStreamClient {
     }
 
     pub fn into_boxed_quic(self) -> BoxDynQuicStreamWriter {
-        let raw: crate::codec::BoxWriteStream = Box::pin(TryFuture::from(self.into_quic()));
+        let raw: crate::codec::BoxWriteStream = Box::pin(Deferred::from(self.into_quic()));
         guard::GuardedQuicWriter::new(raw)
     }
 }

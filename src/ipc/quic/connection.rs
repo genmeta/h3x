@@ -45,7 +45,11 @@ use tracing::{Instrument, debug};
 use super::stream::{IpcReadStream, IpcWriteStream};
 use crate::{
     error::Code,
-    ipc::transport::{FdRegistry, FdSender},
+    ipc::{
+        error::{IpcAcceptError, IpcOpenError, IpcPlumbingError},
+        handle::{IpcBiHandle, IpcUniHandle},
+        transport::{FdRegistry, FdSender},
+    },
     quic::{
         self, ConnectionError, DynLifecycle, GetStreamIdExt, ManageStream, ReadStream, StreamError,
         WriteStream,
@@ -57,6 +61,7 @@ use crate::{
             RemoteAgentClient, RemoteAgentServerShared,
         },
     },
+    util::deferred::Resolved,
     varint::VarInt,
 };
 
@@ -87,24 +92,25 @@ use crate::{
 pub trait IpcConnection: Send + Sync {
     /// Open a bidirectional stream.
     ///
-    /// Returns `(fd_registry_id, stream_id)`. The caller retrieves **2 FDs**
-    /// from the registry: one for the read pipe and one for the write pipe.
-    async fn open_bi(&self) -> Result<(VarInt, VarInt), ConnectionError>;
+    /// Returns `Resolved<IpcBiHandle, StreamError>` on success — the handle
+    /// may carry a stream error (e.g. stream_id retrieval failed) wrapped in
+    /// [`Resolved::Error`].  Infrastructure failures yield [`IpcOpenError`].
+    async fn open_bi(&self) -> Result<Resolved<IpcBiHandle, StreamError>, IpcOpenError>;
 
     /// Accept an incoming bidirectional stream.
     ///
-    /// Returns `(fd_registry_id, stream_id)`. The caller retrieves **2 FDs**.
-    async fn accept_bi(&self) -> Result<(VarInt, VarInt), ConnectionError>;
+    /// Returns `Resolved<IpcBiHandle, StreamError>` on success.
+    async fn accept_bi(&self) -> Result<Resolved<IpcBiHandle, StreamError>, IpcAcceptError>;
 
     /// Open a unidirectional (send-only) stream.
     ///
-    /// Returns `(fd_registry_id, stream_id)`. The caller retrieves **1 FD**.
-    async fn open_uni(&self) -> Result<(VarInt, VarInt), ConnectionError>;
+    /// Returns `Resolved<IpcUniHandle, StreamError>` on success.
+    async fn open_uni(&self) -> Result<Resolved<IpcUniHandle, StreamError>, IpcOpenError>;
 
     /// Accept an incoming unidirectional (receive-only) stream.
     ///
-    /// Returns `(fd_registry_id, stream_id)`. The caller retrieves **1 FD**.
-    async fn accept_uni(&self) -> Result<(VarInt, VarInt), ConnectionError>;
+    /// Returns `Resolved<IpcUniHandle, StreamError>` on success.
+    async fn accept_uni(&self) -> Result<Resolved<IpcUniHandle, StreamError>, IpcAcceptError>;
 
     /// Obtain the local agent (signing / identity) handle, if available.
     async fn local_agent(&self) -> Result<Option<LocalAgentClient>, ConnectionError>;
@@ -206,19 +212,19 @@ where
     M::LocalAgent: Send + Sync,
     M::RemoteAgent: Send + Sync,
 {
-    async fn open_bi(&self) -> Result<(VarInt, VarInt), ConnectionError> {
+    async fn open_bi(&self) -> Result<Resolved<IpcBiHandle, StreamError>, IpcOpenError> {
         self.open_bi_impl().await
     }
 
-    async fn accept_bi(&self) -> Result<(VarInt, VarInt), ConnectionError> {
+    async fn accept_bi(&self) -> Result<Resolved<IpcBiHandle, StreamError>, IpcAcceptError> {
         self.accept_bi_impl().await
     }
 
-    async fn open_uni(&self) -> Result<(VarInt, VarInt), ConnectionError> {
+    async fn open_uni(&self) -> Result<Resolved<IpcUniHandle, StreamError>, IpcOpenError> {
         self.open_uni_impl().await
     }
 
-    async fn accept_uni(&self) -> Result<(VarInt, VarInt), ConnectionError> {
+    async fn accept_uni(&self) -> Result<Resolved<IpcUniHandle, StreamError>, IpcAcceptError> {
         self.accept_uni_impl().await
     }
 
@@ -278,16 +284,30 @@ where
     M::LocalAgent: Send + Sync,
     M::RemoteAgent: Send + Sync,
 {
-    async fn open_bi_impl(&self) -> Result<(VarInt, VarInt), ConnectionError> {
-        let (mut reader, writer) = ManageStream::open_bi(self.inner.as_ref()).await?;
-        let stream_id = reader.stream_id().await.map_err(stream_error_to_conn)?;
+    async fn open_bi_impl(&self) -> Result<Resolved<IpcBiHandle, StreamError>, IpcOpenError> {
+        let (mut reader, writer) = ManageStream::open_bi(self.inner.as_ref())
+            .await
+            .map_err(|e| IpcOpenError::Connection { source: e })?;
+        let stream_id = match reader.stream_id().await {
+            Ok(id) => id,
+            Err(stream_err) => return Ok(Resolved::err(stream_err)),
+        };
         self.bridge_bi(reader, writer, stream_id)
+            .map(Resolved::ok)
+            .map_err(IpcOpenError::from)
     }
 
-    async fn accept_bi_impl(&self) -> Result<(VarInt, VarInt), ConnectionError> {
-        let (mut reader, writer) = ManageStream::accept_bi(self.inner.as_ref()).await?;
-        let stream_id = reader.stream_id().await.map_err(stream_error_to_conn)?;
+    async fn accept_bi_impl(&self) -> Result<Resolved<IpcBiHandle, StreamError>, IpcAcceptError> {
+        let (mut reader, writer) = ManageStream::accept_bi(self.inner.as_ref())
+            .await
+            .map_err(|e| IpcAcceptError::Connection { source: e })?;
+        let stream_id = match reader.stream_id().await {
+            Ok(id) => id,
+            Err(stream_err) => return Ok(Resolved::err(stream_err)),
+        };
         self.bridge_bi(reader, writer, stream_id)
+            .map(Resolved::ok)
+            .map_err(IpcAcceptError::from)
     }
 
     /// Shared logic for open_bi / accept_bi after obtaining the real streams.
@@ -296,77 +316,83 @@ where
         reader: M::StreamReader,
         writer: M::StreamWriter,
         stream_id: VarInt,
-    ) -> Result<(VarInt, VarInt), ConnectionError> {
+    ) -> Result<IpcBiHandle, IpcPlumbingError> {
         let lifecycle: Arc<dyn DynLifecycle> = self.inner.clone();
 
         // Socketpair for the reader direction: server IpcWriteStream ↔ client IpcReadStream
-        let (srv_a, cli_a) = UnixStream::pair().map_err(|e| ipc_io_error(e, "socketpair"))?;
+        let (srv_a, cli_a) = UnixStream::pair().map_err(|e| ipc_io_plumbing(e, "socketpair"))?;
         // Socketpair for the writer direction: server IpcReadStream ↔ client IpcWriteStream
-        let (srv_b, cli_b) = UnixStream::pair().map_err(|e| ipc_io_error(e, "socketpair"))?;
+        let (srv_b, cli_b) = UnixStream::pair().map_err(|e| ipc_io_plumbing(e, "socketpair"))?;
 
-        let cli_a_std = cli_a.into_std().map_err(|e| ipc_io_error(e, "into_std"))?;
-        let cli_b_std = cli_b.into_std().map_err(|e| ipc_io_error(e, "into_std"))?;
+        let cli_a_std = cli_a
+            .into_std()
+            .map_err(|e| ipc_io_plumbing(e, "into_std"))?;
+        let cli_b_std = cli_b
+            .into_std()
+            .map_err(|e| ipc_io_plumbing(e, "into_std"))?;
 
         let fd_id = self
             .fd_sender
             .queue_fds(smallvec![cli_a_std.into(), cli_b_std.into()])
-            .map_err(|e| ipc_transport_error(e, "queue_fds"))?;
+            .map_err(|e| ipc_io_plumbing(e, "queue_fds"))?;
 
-        // Bridge reader direction: real QUIC reader → IpcWriteStream on srv_a
         // Bridge reader direction: real QUIC reader → IpcWriteStream on srv_a
         let pipe_w = IpcWriteStream::new(stream_id, srv_a, lifecycle.clone());
-        // Inherent termination: exits when QUIC read stream or pipe closes.
         tokio::spawn(bridge_reader(reader, pipe_w).in_current_span());
 
-        // Bridge writer direction: IpcReadStream on srv_b → real QUIC writer
         // Bridge writer direction: IpcReadStream on srv_b → real QUIC writer
         let pipe_r = IpcReadStream::new(stream_id, srv_b, lifecycle);
-        // Inherent termination: exits when pipe read stream or QUIC write stream closes.
         tokio::spawn(bridge_writer(pipe_r, writer).in_current_span());
 
-        Ok((fd_id, stream_id))
+        Ok(IpcBiHandle { fd_id, stream_id })
     }
 
-    async fn open_uni_impl(&self) -> Result<(VarInt, VarInt), ConnectionError> {
-        let mut writer = ManageStream::open_uni(self.inner.as_ref()).await?;
-        let stream_id = writer.stream_id().await.map_err(stream_error_to_conn)?;
+    async fn open_uni_impl(&self) -> Result<Resolved<IpcUniHandle, StreamError>, IpcOpenError> {
+        let mut writer = ManageStream::open_uni(self.inner.as_ref())
+            .await
+            .map_err(|e| IpcOpenError::Connection { source: e })?;
+        let stream_id = match writer.stream_id().await {
+            Ok(id) => id,
+            Err(stream_err) => return Ok(Resolved::err(stream_err)),
+        };
         let lifecycle: Arc<dyn DynLifecycle> = self.inner.clone();
 
-        let (srv, cli) = UnixStream::pair().map_err(|e| ipc_io_error(e, "socketpair"))?;
-        let cli_std = cli.into_std().map_err(|e| ipc_io_error(e, "into_std"))?;
+        let (srv, cli) = UnixStream::pair().map_err(|e| ipc_io_plumbing(e, "socketpair"))?;
+        let cli_std = cli.into_std().map_err(|e| ipc_io_plumbing(e, "into_std"))?;
         let fd_id = self
             .fd_sender
             .queue_fds(smallvec![cli_std.into()])
-            .map_err(|e| ipc_transport_error(e, "queue_fds"))?;
+            .map_err(|e| ipc_io_plumbing(e, "queue_fds"))?;
 
-        // IpcReadStream on srv → real QUIC writer
         // IpcReadStream on srv → real QUIC writer
         let pipe_r = IpcReadStream::new(stream_id, srv, lifecycle);
-        // Inherent termination: exits when pipe read stream or QUIC write stream closes.
         tokio::spawn(bridge_writer(pipe_r, writer).in_current_span());
 
-        Ok((fd_id, stream_id))
+        Ok(Resolved::ok(IpcUniHandle { fd_id, stream_id }))
     }
 
-    async fn accept_uni_impl(&self) -> Result<(VarInt, VarInt), ConnectionError> {
-        let mut reader = ManageStream::accept_uni(self.inner.as_ref()).await?;
-        let stream_id = reader.stream_id().await.map_err(stream_error_to_conn)?;
+    async fn accept_uni_impl(&self) -> Result<Resolved<IpcUniHandle, StreamError>, IpcAcceptError> {
+        let mut reader = ManageStream::accept_uni(self.inner.as_ref())
+            .await
+            .map_err(|e| IpcAcceptError::Connection { source: e })?;
+        let stream_id = match reader.stream_id().await {
+            Ok(id) => id,
+            Err(stream_err) => return Ok(Resolved::err(stream_err)),
+        };
         let lifecycle: Arc<dyn DynLifecycle> = self.inner.clone();
 
-        let (srv, cli) = UnixStream::pair().map_err(|e| ipc_io_error(e, "socketpair"))?;
-        let cli_std = cli.into_std().map_err(|e| ipc_io_error(e, "into_std"))?;
+        let (srv, cli) = UnixStream::pair().map_err(|e| ipc_io_plumbing(e, "socketpair"))?;
+        let cli_std = cli.into_std().map_err(|e| ipc_io_plumbing(e, "into_std"))?;
         let fd_id = self
             .fd_sender
             .queue_fds(smallvec![cli_std.into()])
-            .map_err(|e| ipc_transport_error(e, "queue_fds"))?;
+            .map_err(|e| ipc_io_plumbing(e, "queue_fds"))?;
 
-        // Real QUIC reader → IpcWriteStream on srv
         // Real QUIC reader → IpcWriteStream on srv
         let pipe_w = IpcWriteStream::new(stream_id, srv, lifecycle);
-        // Inherent termination: exits when QUIC read stream or pipe closes.
         tokio::spawn(bridge_reader(reader, pipe_w).in_current_span());
 
-        Ok((fd_id, stream_id))
+        Ok(Resolved::ok(IpcUniHandle { fd_id, stream_id }))
     }
 }
 
@@ -393,8 +419,20 @@ pub struct IpcConnectionHandle {
 /// Caches the first observed terminal error and delegates close/closed to
 /// the IPC RPC.
 struct IpcLifecycle {
-    rpc: IpcConnectionClient,
+    connection: IpcConnectionClient,
     latch: ConnectionErrorLatch,
+}
+
+impl IpcLifecycle {
+    /// Latch a connection error (first-wins).
+    fn latch(&self, error: ConnectionError) -> ConnectionError {
+        self.latch.latch(error)
+    }
+
+    /// Lazy-latch: only calls `f` when no error is latched yet.
+    fn latch_with(&self, f: impl FnOnce() -> ConnectionError) -> ConnectionError {
+        self.latch.latch_with(f)
+    }
 }
 
 impl IpcConnectionHandle {
@@ -405,7 +443,7 @@ impl IpcConnectionHandle {
         conn_fd_sender: FdSender,
     ) -> Self {
         let lifecycle = Arc::new(IpcLifecycle {
-            rpc: rpc.clone(),
+            connection: rpc.clone(),
             latch: ConnectionErrorLatch::new(),
         });
         Self {
@@ -423,7 +461,7 @@ impl IpcConnectionHandle {
         fut: impl Future<Output = Result<T, ConnectionError>>,
     ) -> Result<T, ConnectionError> {
         quic::Lifecycle::check(self)?;
-        fut.await.map_err(|e| self.lifecycle.latch.latch(e))
+        fut.await.map_err(|e| self.lifecycle.latch(e))
     }
 
     /// Synthesize a transport error for IPC channel failures.
@@ -439,27 +477,79 @@ impl IpcConnectionHandle {
 }
 
 impl quic::ManageStream for IpcConnectionHandle {
-    type StreamReader = IpcReadStream;
-    type StreamWriter = IpcWriteStream;
+    type StreamReader = Resolved<IpcReadStream, StreamError>;
+    type StreamWriter = Resolved<IpcWriteStream, StreamError>;
 
-    async fn open_bi(&self) -> Result<(IpcReadStream, IpcWriteStream), ConnectionError> {
-        let (fd_id, stream_id) = self.guard(IpcConnection::open_bi(&self.rpc)).await?;
-        self.fds_to_bi(fd_id, stream_id).await
+    async fn open_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
+        quic::Lifecycle::check(self)?;
+        match IpcConnection::open_bi(&self.rpc).await {
+            Ok(resolved) => match resolved {
+                Resolved::Value { value: handle } => {
+                    let (r, w) = self.fds_to_bi(handle).await?;
+                    Ok((Resolved::ok(r), Resolved::ok(w)))
+                }
+                Resolved::Error { error } => {
+                    Ok((Resolved::err(error.clone()), Resolved::err(error)))
+                }
+            },
+            Err(IpcOpenError::Connection { source }) => Err(self.lifecycle.latch(source)),
+            Err(IpcOpenError::Plumbing { source }) => {
+                Err(self.lifecycle.latch_with(|| plumbing_to_conn(&source)))
+            }
+        }
     }
 
-    async fn accept_bi(&self) -> Result<(IpcReadStream, IpcWriteStream), ConnectionError> {
-        let (fd_id, stream_id) = self.guard(IpcConnection::accept_bi(&self.rpc)).await?;
-        self.fds_to_bi(fd_id, stream_id).await
+    async fn accept_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
+        quic::Lifecycle::check(self)?;
+        match IpcConnection::accept_bi(&self.rpc).await {
+            Ok(resolved) => match resolved {
+                Resolved::Value { value: handle } => {
+                    let (r, w) = self.fds_to_bi(handle).await?;
+                    Ok((Resolved::ok(r), Resolved::ok(w)))
+                }
+                Resolved::Error { error } => {
+                    Ok((Resolved::err(error.clone()), Resolved::err(error)))
+                }
+            },
+            Err(IpcAcceptError::Connection { source }) => Err(self.lifecycle.latch(source)),
+            Err(IpcAcceptError::Plumbing { source }) => {
+                Err(self.lifecycle.latch_with(|| plumbing_to_conn(&source)))
+            }
+        }
     }
 
-    async fn open_uni(&self) -> Result<IpcWriteStream, ConnectionError> {
-        let (fd_id, stream_id) = self.guard(IpcConnection::open_uni(&self.rpc)).await?;
-        self.fds_to_uni_writer(fd_id, stream_id).await
+    async fn open_uni(&self) -> Result<Self::StreamWriter, ConnectionError> {
+        quic::Lifecycle::check(self)?;
+        match IpcConnection::open_uni(&self.rpc).await {
+            Ok(resolved) => match resolved {
+                Resolved::Value { value: handle } => {
+                    let w = self.fds_to_uni_writer(handle).await?;
+                    Ok(Resolved::ok(w))
+                }
+                Resolved::Error { error } => Ok(Resolved::err(error)),
+            },
+            Err(IpcOpenError::Connection { source }) => Err(self.lifecycle.latch(source)),
+            Err(IpcOpenError::Plumbing { source }) => {
+                Err(self.lifecycle.latch_with(|| plumbing_to_conn(&source)))
+            }
+        }
     }
 
-    async fn accept_uni(&self) -> Result<IpcReadStream, ConnectionError> {
-        let (fd_id, stream_id) = self.guard(IpcConnection::accept_uni(&self.rpc)).await?;
-        self.fds_to_uni_reader(fd_id, stream_id).await
+    async fn accept_uni(&self) -> Result<Self::StreamReader, ConnectionError> {
+        quic::Lifecycle::check(self)?;
+        match IpcConnection::accept_uni(&self.rpc).await {
+            Ok(resolved) => match resolved {
+                Resolved::Value { value: handle } => {
+                    let r = self.fds_to_uni_reader(handle).await?;
+                    Ok(Resolved::ok(r))
+                }
+                Resolved::Error { error } => Ok(Resolved::err(error)),
+            },
+            Err(IpcAcceptError::Connection { source }) => Err(self.lifecycle.latch(source)),
+            Err(IpcAcceptError::Plumbing { source }) => {
+                Err(self.lifecycle.latch_with(|| plumbing_to_conn(&source)))
+            }
+        }
     }
 }
 
@@ -467,16 +557,16 @@ impl IpcConnectionHandle {
     /// Retrieve 2 FDs and construct a (IpcReadStream, IpcWriteStream) pair.
     async fn fds_to_bi(
         &self,
-        fd_id: VarInt,
-        stream_id: VarInt,
+        handle: IpcBiHandle,
     ) -> Result<(IpcReadStream, IpcWriteStream), ConnectionError> {
-        let fds = self
-            .fd_registry
-            .wait_fds(fd_id)
-            .await
-            .map_err(|e| self.lifecycle.latch.latch(ipc_transport_error(e, "wait_fds")))?;
+        let IpcBiHandle { fd_id, stream_id } = handle;
+        let fds = self.fd_registry.wait_fds(fd_id).await.map_err(|e| {
+            self.lifecycle
+                .latch
+                .latch(ipc_transport_error(e, "wait_fds"))
+        })?;
         if fds.len() != 2 {
-            return Err(self.lifecycle.latch.latch(ConnectionError::Transport {
+            return Err(self.lifecycle.latch(ConnectionError::Transport {
                 source: quic::TransportError {
                     kind: IPC_ERROR_KIND,
                     frame_type: IPC_FRAME_TYPE,
@@ -491,13 +581,21 @@ impl IpcConnectionHandle {
         let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
 
         // fd_a → reader pipe (matches server's IpcWriteStream on srv_a)
-        let sock_a = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd_a))
-            .map_err(|e| self.lifecycle.latch.latch(ipc_io_error(e, "UnixStream::from_std")))?;
+        let sock_a =
+            UnixStream::from_std(std::os::unix::net::UnixStream::from(fd_a)).map_err(|e| {
+                self.lifecycle
+                    .latch
+                    .latch(ipc_io_error(e, "UnixStream::from_std"))
+            })?;
         let reader = IpcReadStream::new(stream_id, sock_a, lifecycle.clone());
 
         // fd_b → writer pipe (matches server's IpcReadStream on srv_b)
-        let sock_b = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd_b))
-            .map_err(|e| self.lifecycle.latch.latch(ipc_io_error(e, "UnixStream::from_std")))?;
+        let sock_b =
+            UnixStream::from_std(std::os::unix::net::UnixStream::from(fd_b)).map_err(|e| {
+                self.lifecycle
+                    .latch
+                    .latch(ipc_io_error(e, "UnixStream::from_std"))
+            })?;
         let writer = IpcWriteStream::new(stream_id, sock_b, lifecycle);
 
         Ok((reader, writer))
@@ -506,16 +604,16 @@ impl IpcConnectionHandle {
     /// Retrieve 1 FD and construct a IpcWriteStream (for open_uni).
     async fn fds_to_uni_writer(
         &self,
-        fd_id: VarInt,
-        stream_id: VarInt,
+        handle: IpcUniHandle,
     ) -> Result<IpcWriteStream, ConnectionError> {
-        let fds = self
-            .fd_registry
-            .wait_fds(fd_id)
-            .await
-            .map_err(|e| self.lifecycle.latch.latch(ipc_transport_error(e, "wait_fds")))?;
+        let IpcUniHandle { fd_id, stream_id } = handle;
+        let fds = self.fd_registry.wait_fds(fd_id).await.map_err(|e| {
+            self.lifecycle
+                .latch
+                .latch(ipc_transport_error(e, "wait_fds"))
+        })?;
         if fds.len() != 1 {
-            return Err(self.lifecycle.latch.latch(ConnectionError::Transport {
+            return Err(self.lifecycle.latch(ConnectionError::Transport {
                 source: quic::TransportError {
                     kind: IPC_ERROR_KIND,
                     frame_type: IPC_FRAME_TYPE,
@@ -525,24 +623,27 @@ impl IpcConnectionHandle {
         }
         let fd = fds.into_iter().next().unwrap();
         let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
-        let sock = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd))
-            .map_err(|e| self.lifecycle.latch.latch(ipc_io_error(e, "UnixStream::from_std")))?;
+        let sock = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd)).map_err(|e| {
+            self.lifecycle
+                .latch
+                .latch(ipc_io_error(e, "UnixStream::from_std"))
+        })?;
         Ok(IpcWriteStream::new(stream_id, sock, lifecycle))
     }
 
     /// Retrieve 1 FD and construct a IpcReadStream (for accept_uni).
     async fn fds_to_uni_reader(
         &self,
-        fd_id: VarInt,
-        stream_id: VarInt,
+        handle: IpcUniHandle,
     ) -> Result<IpcReadStream, ConnectionError> {
-        let fds = self
-            .fd_registry
-            .wait_fds(fd_id)
-            .await
-            .map_err(|e| self.lifecycle.latch.latch(ipc_transport_error(e, "wait_fds")))?;
+        let IpcUniHandle { fd_id, stream_id } = handle;
+        let fds = self.fd_registry.wait_fds(fd_id).await.map_err(|e| {
+            self.lifecycle
+                .latch
+                .latch(ipc_transport_error(e, "wait_fds"))
+        })?;
         if fds.len() != 1 {
-            return Err(self.lifecycle.latch.latch(ConnectionError::Transport {
+            return Err(self.lifecycle.latch(ConnectionError::Transport {
                 source: quic::TransportError {
                     kind: IPC_ERROR_KIND,
                     frame_type: IPC_FRAME_TYPE,
@@ -552,8 +653,11 @@ impl IpcConnectionHandle {
         }
         let fd = fds.into_iter().next().unwrap();
         let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
-        let sock = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd))
-            .map_err(|e| self.lifecycle.latch.latch(ipc_io_error(e, "UnixStream::from_std")))?;
+        let sock = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd)).map_err(|e| {
+            self.lifecycle
+                .latch
+                .latch(ipc_io_error(e, "UnixStream::from_std"))
+        })?;
         Ok(IpcReadStream::new(stream_id, sock, lifecycle))
     }
 }
@@ -566,7 +670,7 @@ impl quic::WithLocalAgent for IpcConnectionHandle {
             Some(client) => Ok(Some(
                 CachedLocalAgent::from_client(client)
                     .await
-                    .map_err(|e| self.lifecycle.latch.latch(e))?,
+                    .map_err(|e| self.lifecycle.latch(e))?,
             )),
             None => Ok(None),
         }
@@ -581,7 +685,7 @@ impl quic::WithRemoteAgent for IpcConnectionHandle {
             Some(client) => Ok(Some(
                 CachedRemoteAgent::from_client(client)
                     .await
-                    .map_err(|e| self.lifecycle.latch.latch(e))?,
+                    .map_err(|e| self.lifecycle.latch(e))?,
             )),
             None => Ok(None),
         }
@@ -600,11 +704,11 @@ impl quic::Lifecycle for IpcConnectionHandle {
     }
 
     fn check(&self) -> Result<(), ConnectionError> {
-        self.lifecycle.check()
+        quic::Lifecycle::check(self.lifecycle.as_ref())
     }
 
     async fn closed(&self) -> ConnectionError {
-        self.lifecycle.closed().await
+        quic::Lifecycle::closed(self.lifecycle.as_ref()).await
     }
 }
 
@@ -612,7 +716,7 @@ impl quic::Lifecycle for IpcConnectionHandle {
 // Arc<dyn DynLifecycle> by IpcReadStream/IpcWriteStream on the client side.
 impl quic::Lifecycle for IpcLifecycle {
     fn close(&self, code: Code, reason: Cow<'static, str>) {
-        let rpc = self.rpc.clone();
+        let rpc = self.connection.clone();
         tokio::spawn(
             async move {
                 let _ = IpcConnection::close(&rpc, code, reason).await;
@@ -624,8 +728,10 @@ impl quic::Lifecycle for IpcLifecycle {
     fn check(&self) -> Result<(), ConnectionError> {
         self.latch.check()?;
 
-        if remoc::rtc::Client::is_closed(&self.rpc) {
-            return Err(self.latch.latch_with(IpcConnectionHandle::ipc_channel_error));
+        if remoc::rtc::Client::is_closed(&self.connection) {
+            return Err(self
+                .latch
+                .latch_with(IpcConnectionHandle::ipc_channel_error));
         }
 
         Ok(())
@@ -635,7 +741,7 @@ impl quic::Lifecycle for IpcLifecycle {
         if let Some(error) = self.latch.peek() {
             return error;
         }
-        let error = match IpcConnection::closed(&self.rpc).await {
+        let error = match IpcConnection::closed(&self.connection).await {
             Ok(error) => error,
             Err(_) => IpcConnectionHandle::ipc_channel_error(),
         };
@@ -678,19 +784,36 @@ fn ipc_transport_error(err: impl std::error::Error, context: &str) -> Connection
     }
 }
 
-/// Convert a [`StreamError`] to a [`ConnectionError`].
-///
-/// If the stream error wraps a connection error, extract it directly;
-/// otherwise synthesize a transport error.
-fn stream_error_to_conn(err: StreamError) -> ConnectionError {
-    match err {
-        StreamError::Connection { source } => source,
-        StreamError::Reset { code } => ConnectionError::Transport {
-            source: quic::TransportError {
-                kind: IPC_ERROR_KIND,
-                frame_type: IPC_FRAME_TYPE,
-                reason: format!("stream reset during ipc setup: {code}").into(),
-            },
+/// Convert an I/O error into an [`IpcPlumbingError`] (server side).
+fn ipc_io_plumbing(err: impl std::fmt::Display, context: &str) -> IpcPlumbingError {
+    debug!(error = %err, context, "ipc plumbing i/o error");
+    IpcPlumbingError::Io {
+        message: format!("{context}: {err}"),
+    }
+}
+
+/// Convert an [`IpcPlumbingError`] into a [`ConnectionError`] (client side).
+fn plumbing_to_conn(err: &IpcPlumbingError) -> ConnectionError {
+    ConnectionError::Transport {
+        source: quic::TransportError {
+            kind: IPC_ERROR_KIND,
+            frame_type: IPC_FRAME_TYPE,
+            reason: err.to_string().into(),
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IpcConnectionClient convenience
+// ---------------------------------------------------------------------------
+
+impl IpcConnectionClient {
+    /// Convert into an [`IpcConnectionHandle`].
+    pub fn into_handle(
+        self,
+        fd_registry: FdRegistry,
+        conn_fd_sender: FdSender,
+    ) -> IpcConnectionHandle {
+        IpcConnectionHandle::new(self, fd_registry, conn_fd_sender)
     }
 }

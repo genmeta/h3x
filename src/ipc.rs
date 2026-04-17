@@ -11,6 +11,8 @@
 //! - [`webtransport`] — IPC forwarding for WebTransport sessions.
 //! - [`transport`] — Multiplexed channel (MuxChannel) for RPC control and FD passing.
 
+pub mod error;
+pub mod handle;
 pub mod quic;
 pub mod transport;
 

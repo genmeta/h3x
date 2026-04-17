@@ -13,7 +13,7 @@ use crate::message::stream::{
 use crate::{
     message::stream::{BoxMessageStreamReader, BoxMessageStreamWriter, MessageStreamError},
     quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
-    util::try_future::TryFuture,
+    util::deferred::Deferred,
     varint::VarInt,
 };
 
@@ -121,7 +121,7 @@ impl ReadMessageStreamClient {
 
     /// Convert into a boxed [`OrigReadMessageStream`] (lazy — resolves on first poll).
     pub fn into_boxed_message_stream(self) -> Pin<Box<dyn OrigReadMessageStream + Send + 'static>> {
-        Box::pin(TryFuture::from(self.into_message_stream()))
+        Box::pin(Deferred::from(self.into_message_stream()))
     }
 
     /// Convert into a [`BoxMessageStreamReader`] (implements [`AsyncRead`](tokio::io::AsyncRead)).
@@ -183,7 +183,7 @@ impl WriteMessageStreamClient {
     pub fn into_boxed_message_stream(
         self,
     ) -> Pin<Box<dyn OrigWriteMessageStream + Send + 'static>> {
-        Box::pin(TryFuture::from(self.into_message_stream()))
+        Box::pin(Deferred::from(self.into_message_stream()))
     }
 
     /// Convert into a [`BoxMessageStreamWriter`] (implements [`AsyncWrite`](tokio::io::AsyncWrite)).

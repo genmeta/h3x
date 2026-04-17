@@ -29,7 +29,7 @@ use crate::{
         encoder::{Encoder, EncoderInstruction},
     },
     quic::{self, ConnectionError},
-    util::try_future::TryFuture,
+    util::deferred::Deferred,
     varint::VarInt,
 };
 
@@ -219,7 +219,7 @@ impl QPackProtocolFactory {
             // Lazily open QPACK encoder stream. If the dynamic table is never
             // used, the stream is never opened.
             let conn_state = conn.clone();
-            let encoder_inst_sender = Box::pin(TryFuture::from(Box::pin(async move {
+            let encoder_inst_sender = Box::pin(Deferred::from(Box::pin(async move {
                 let uni_stream = Box::pin(SinkWriter::new(conn_state.open_uni().await?));
                 let encoder_stream =
                     UnidirectionalStream::initial_qpack_encoder_stream(uni_stream).await?;
@@ -227,7 +227,7 @@ impl QPackProtocolFactory {
             })));
 
             let conn_clone = conn.clone();
-            let decoder_inst_receiver = Box::pin(TryFuture::from(async move {
+            let decoder_inst_receiver = Box::pin(Deferred::from(async move {
                 let connection_error = conn_clone.closed();
                 tokio::select! {
                     Ok(uni_stream_reader) = decoder_inst_receiver_rx => {
@@ -249,7 +249,7 @@ impl QPackProtocolFactory {
             // Lazily open QPACK decoder stream. If the dynamic table is never
             // used by peer, the stream is never opened.
             let conn_state = conn.clone();
-            let decoder_inst_sender = Box::pin(TryFuture::from(async move {
+            let decoder_inst_sender = Box::pin(Deferred::from(async move {
                 let uni_stream = Box::pin(SinkWriter::new(conn_state.open_uni().await?));
                 let decoder_stream =
                     UnidirectionalStream::initial_qpack_decoder_stream(uni_stream).await?;
@@ -257,7 +257,7 @@ impl QPackProtocolFactory {
             }));
 
             let conn_clone = conn.clone();
-            let encoder_inst_receiver = Box::pin(TryFuture::from(async move {
+            let encoder_inst_receiver = Box::pin(Deferred::from(async move {
                 let connection_error = conn_clone.closed();
                 tokio::select! {
                     Ok(uni_stream_reader) = encoder_inst_receiver_rx => {
