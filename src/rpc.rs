@@ -1,4 +1,5 @@
-pub(super) mod bridge;
+pub(crate) mod bridge;
+pub(crate) mod error;
 
 pub mod lifecycle;
 pub mod quic;

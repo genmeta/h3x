@@ -8,10 +8,9 @@ use tracing::Instrument;
 
 use super::{
     connection::{ConnectionClient, ConnectionServerShared, RemoteConnection},
-    error::StringError,
     serde_types::SerdeAuthority,
 };
-use crate::quic;
+use crate::{quic, rpc::error::StringError};
 
 #[derive(Debug, Snafu, Clone, Serialize, Deserialize)]
 pub enum ConnectError {

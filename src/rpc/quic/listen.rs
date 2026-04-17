@@ -5,11 +5,8 @@ use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 use tracing::Instrument;
 
-use super::{
-    connection::{ConnectionClient, ConnectionServerShared, RemoteConnection},
-    error::StringError,
-};
-use crate::quic;
+use super::connection::{ConnectionClient, ConnectionServerShared, RemoteConnection};
+use crate::{quic, rpc::error::StringError};
 
 #[derive(Debug, Snafu, Clone, Serialize, Deserialize)]
 pub enum ListenError {
