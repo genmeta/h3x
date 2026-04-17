@@ -178,7 +178,7 @@ where
         sink: crate::ipc::transport::MuxSink,
         stream: crate::ipc::transport::MuxStream,
     ) {
-        use tracing::warn;
+        use tracing::debug;
 
         let conn_fd_sender = sink.fd_sender();
 
@@ -192,7 +192,7 @@ where
             {
                 Ok(v) => v,
                 Err(e) => {
-                    warn!(
+                    debug!(
                         error = %snafu::Report::from_error(e),
                         "per-connection remoc handshake failed"
                     );
@@ -218,7 +218,7 @@ where
         };
 
         if tx.send(bootstrap).await.is_err() {
-            warn!("failed to send connection bootstrap: base channel closed");
+            debug!("failed to send connection bootstrap: base channel closed");
         }
     }
 }
@@ -316,7 +316,7 @@ where
 // ---------------------------------------------------------------------------
 
 fn connect_error(err: impl std::error::Error, context: &str) -> ConnectionError {
-    tracing::warn!(error = %snafu::Report::from_error(&err), context, "ipc connect error");
+    tracing::debug!(error = %snafu::Report::from_error(&err), context, "ipc connect error");
     ConnectionError::Transport {
         source: quic::TransportError {
             kind: IPC_ERROR_KIND,

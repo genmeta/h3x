@@ -182,9 +182,9 @@ impl<C: quic::Connection> Pool<C> {
             let mut connections = pin!(reuseable_connection.connection.watch());
 
             loop {
-                tracing::debug!("(re)trying to reuse connection");
+                tracing::trace!("(re)trying to reuse connection");
                 if let Some(connection) = reuseable_connection.reuse() {
-                    tracing::debug!("found reusable connection, gogogo");
+                    tracing::trace!("found reusable connection, gogogo");
                     break Ok(connection);
                 }
 
@@ -195,7 +195,7 @@ impl<C: quic::Connection> Pool<C> {
                         .context(connect_error::ConnectorSnafu)?;
                     let connection = builder.build(quic_conn).await?;
 
-                    tracing::debug!("h3 connection established, verifying peer identity");
+                    tracing::trace!("h3 connection established, verifying peer identity");
                     let remote_agent = connection.remote_agent().await?;
                     let actual_peer_name = remote_agent.as_ref().map(|agent| agent.name());
                     if actual_peer_name.as_ref() != Some(&server.host()) {
@@ -224,18 +224,18 @@ impl<C: quic::Connection> Pool<C> {
                 tokio::select! {
                     biased;
                     _new_conn = connections.next() => {
-                        tracing::debug!("entry updated, try to reuse connection");
+                        tracing::trace!("entry updated, try to reuse connection");
                     }
                     result = reuseable_connection.try_insert_with(try_connect) => {
                         result?;
-                        tracing::debug!("new connection inserted");
+                        tracing::trace!("new connection inserted");
                     }
                 }
             }
         };
 
         match &result {
-            Ok(..) => tracing::debug!("connection ready to use"),
+            Ok(..) => tracing::trace!("connection ready to use"),
             Err(..) => self.clone().spawn_try_release((server, builder_hash)),
         }
 

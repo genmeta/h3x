@@ -148,7 +148,7 @@ where
                 let (mut read_stream, write_stream) = match connection.accept_message_stream().await
                 {
                     Ok(pair) => {
-                        tracing::debug!("accepted incoming request stream");
+                        tracing::trace!("accepted incoming request stream");
                         pair
                     }
                     Err(error) => {

@@ -64,6 +64,7 @@ hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
 rpc = ["dep:remoc", "serde", "bytes/serde"]
 ipc = ["rpc", "dep:nix", "dep:smallvec", "tokio/net"]
+webtransport = []
 testing = []
 
 [dev-dependencies]

@@ -39,11 +39,15 @@ impl Setting {
     }
 
     pub fn check(&self) -> Result<(), InvalidSettingValue> {
-        if self.id == EnableConnectProtocol::ID
-            && self.value != VarInt::from_u32(0)
-            && self.value != VarInt::from_u32(1)
+        let is_bool_setting = self.id == EnableConnectProtocol::ID
+            || self.id == EnableWebTransport::ID
+            || self.id == H3Datagram::ID;
+        if is_bool_setting && self.value != VarInt::from_u32(0) && self.value != VarInt::from_u32(1)
         {
-            return Err(InvalidSettingValue::ConnectProtocol { value: self.value });
+            return Err(InvalidSettingValue::BoolSetting {
+                id: self.id,
+                value: self.value,
+            });
         }
         Ok(())
     }
@@ -57,8 +61,8 @@ impl From<(VarInt, VarInt)> for Setting {
 
 #[derive(Snafu, Debug, Clone, Copy)]
 pub enum InvalidSettingValue {
-    #[snafu(display("the value of the ENABLE_CONNECT_PROTOCOL setting must be 0 or 1"))]
-    ConnectProtocol { value: VarInt },
+    #[snafu(display("boolean setting {id} must have value 0 or 1, got {value}"))]
+    BoolSetting { id: VarInt, value: VarInt },
 }
 
 impl H3Error for InvalidSettingValue {
@@ -204,7 +208,14 @@ impl Settings {
 
     pub fn enable_connect_protocol(&self) -> bool {
         self.get(EnableConnectProtocol)
-            .is_some_and(|value| value == VarInt::from_u32(1))
+    }
+
+    pub fn enable_webtransport(&self) -> bool {
+        self.get(EnableWebTransport)
+    }
+
+    pub fn h3_datagram(&self) -> bool {
+        self.get(H3Datagram)
     }
 
     pub fn set(&mut self, Setting { id, value }: Setting) {
@@ -398,14 +409,75 @@ impl EnableConnectProtocol {
 }
 
 impl SettingId for EnableConnectProtocol {
-    type Value = Option<VarInt>;
+    type Value = bool;
 
     fn id(&self) -> VarInt {
         Self::ID
     }
 
-    fn value_from(&self, settings: &Settings) -> Option<VarInt> {
-        settings.get_raw(Self::ID)
+    fn value_from(&self, settings: &Settings) -> bool {
+        settings
+            .get_raw(Self::ID)
+            .is_some_and(|v| v == VarInt::from_u32(1))
+    }
+}
+
+/// `SETTINGS_ENABLE_WEBTRANSPORT` (0x2b603742). No default.
+///
+/// Enables WebTransport over HTTP/3. The value MUST be 0 or 1.
+/// Requires `SETTINGS_ENABLE_CONNECT_PROTOCOL` to also be enabled.
+///
+/// <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3>
+pub struct EnableWebTransport;
+
+impl EnableWebTransport {
+    pub const ID: VarInt = VarInt::from_u32(0x2b603742);
+
+    pub const fn setting(enabled: bool) -> Setting {
+        Setting::new(Self::ID, VarInt::from_u32(enabled as u32))
+    }
+}
+
+impl SettingId for EnableWebTransport {
+    type Value = bool;
+
+    fn id(&self) -> VarInt {
+        Self::ID
+    }
+
+    fn value_from(&self, settings: &Settings) -> bool {
+        settings
+            .get_raw(Self::ID)
+            .is_some_and(|v| v == VarInt::from_u32(1))
+    }
+}
+
+/// `H3_DATAGRAM` (0x33). No default.
+///
+/// Indicates support for HTTP/3 datagrams (RFC 9297). The value MUST be 0 or 1.
+///
+/// <https://datatracker.ietf.org/doc/html/rfc9297>
+pub struct H3Datagram;
+
+impl H3Datagram {
+    pub const ID: VarInt = VarInt::from_u32(0x33);
+
+    pub const fn setting(enabled: bool) -> Setting {
+        Setting::new(Self::ID, VarInt::from_u32(enabled as u32))
+    }
+}
+
+impl SettingId for H3Datagram {
+    type Value = bool;
+
+    fn id(&self) -> VarInt {
+        Self::ID
+    }
+
+    fn value_from(&self, settings: &Settings) -> bool {
+        settings
+            .get_raw(Self::ID)
+            .is_some_and(|v| v == VarInt::from_u32(1))
     }
 }
 

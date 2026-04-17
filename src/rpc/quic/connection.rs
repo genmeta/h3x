@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, future::Future, sync::Arc};
 
 use remoc::{
     prelude::{Server, ServerShared},
@@ -14,7 +14,7 @@ use super::{
 use crate::{
     error::Code,
     quic::{self, ConnectionError},
-    util::set_once::SetOnce,
+    rpc::lifecycle::ConnectionErrorLatch,
     varint::VarInt,
 };
 
@@ -177,14 +177,14 @@ where
 pub struct RemoteConnection {
     client: ConnectionClient,
     #[serde(skip)]
-    terminal_error: SetOnce<ConnectionError>,
+    latch: ConnectionErrorLatch,
 }
 
 impl RemoteConnection {
     pub fn new(client: ConnectionClient) -> Self {
         Self {
             client,
-            terminal_error: SetOnce::new(),
+            latch: ConnectionErrorLatch::new(),
         }
     }
 
@@ -192,15 +192,14 @@ impl RemoteConnection {
         self.client
     }
 
-    /// Record the first connection error. Subsequent calls are no-ops.
-    fn record_error(&self, error: &ConnectionError) {
-        let _ = self.terminal_error.set(error.clone());
-    }
-
-    /// Record a connection error and return it, for use in error paths.
-    fn latch_error(&self, error: ConnectionError) -> ConnectionError {
-        let _ = self.terminal_error.set(error.clone());
-        error
+    /// Guard an async operation: check lifecycle (including remoc channel
+    /// liveness), execute the future, and latch any error.
+    async fn guard<T>(
+        &self,
+        fut: impl Future<Output = Result<T, ConnectionError>>,
+    ) -> Result<T, ConnectionError> {
+        quic::Lifecycle::check(self)?;
+        fut.await.map_err(|e| self.latch.latch(e))
     }
 
     /// Synthesize a transport error for remoc channel failures.
@@ -239,30 +238,22 @@ impl quic::ManageStream for RemoteConnection {
     type StreamReader = crate::dhttp::protocol::BoxDynQuicStreamReader;
 
     async fn open_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
-        let (reader, writer) = Connection::open_bi(&self.client)
-            .await
-            .map_err(|e| self.latch_error(e))?;
+        let (reader, writer) = self.guard(Connection::open_bi(&self.client)).await?;
         Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
     }
 
     async fn open_uni(&self) -> Result<Self::StreamWriter, ConnectionError> {
-        let writer = Connection::open_uni(&self.client)
-            .await
-            .map_err(|e| self.latch_error(e))?;
+        let writer = self.guard(Connection::open_uni(&self.client)).await?;
         Ok(writer.into_boxed_quic())
     }
 
     async fn accept_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
-        let (reader, writer) = Connection::accept_bi(&self.client)
-            .await
-            .map_err(|e| self.latch_error(e))?;
+        let (reader, writer) = self.guard(Connection::accept_bi(&self.client)).await?;
         Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
     }
 
     async fn accept_uni(&self) -> Result<Self::StreamReader, ConnectionError> {
-        let reader = Connection::accept_uni(&self.client)
-            .await
-            .map_err(|e| self.latch_error(e))?;
+        let reader = self.guard(Connection::accept_uni(&self.client)).await?;
         Ok(reader.into_boxed_quic())
     }
 }
@@ -271,14 +262,11 @@ impl quic::WithLocalAgent for RemoteConnection {
     type LocalAgent = CachedLocalAgent;
 
     async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, ConnectionError> {
-        match Connection::local_agent(&self.client)
-            .await
-            .map_err(|e| self.latch_error(e))?
-        {
+        match self.guard(Connection::local_agent(&self.client)).await? {
             Some(agent) => Ok(Some(
                 CachedLocalAgent::from_client(agent)
                     .await
-                    .map_err(|e| self.latch_error(e))?,
+                    .map_err(|e| self.latch.latch(e))?,
             )),
             None => Ok(None),
         }
@@ -289,14 +277,11 @@ impl quic::WithRemoteAgent for RemoteConnection {
     type RemoteAgent = CachedRemoteAgent;
 
     async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, ConnectionError> {
-        match Connection::remote_agent(&self.client)
-            .await
-            .map_err(|e| self.latch_error(e))?
-        {
+        match self.guard(Connection::remote_agent(&self.client)).await? {
             Some(agent) => Ok(Some(
                 CachedRemoteAgent::from_client(agent)
                     .await
-                    .map_err(|e| self.latch_error(e))?,
+                    .map_err(|e| self.latch.latch(e))?,
             )),
             None => Ok(None),
         }
@@ -315,21 +300,17 @@ impl quic::Lifecycle for RemoteConnection {
     }
 
     fn check(&self) -> Result<(), ConnectionError> {
-        if let Some(error) = self.terminal_error.peek() {
-            return Err(error);
-        }
+        self.latch.check()?;
 
         if RemocClient::is_closed(&self.client) {
-            let error = Self::remoc_channel_error();
-            self.record_error(&error);
-            return Err(error);
+            return Err(self.latch.latch_with(Self::remoc_channel_error));
         }
 
         Ok(())
     }
 
     async fn closed(&self) -> ConnectionError {
-        if let Some(error) = self.terminal_error.peek() {
+        if let Some(error) = self.latch.peek() {
             return error;
         }
 
@@ -337,7 +318,6 @@ impl quic::Lifecycle for RemoteConnection {
             Ok(error) => error,
             Err(_) => Self::remoc_channel_error(),
         };
-        self.record_error(&error);
-        error
+        self.latch.latch(error)
     }
 }

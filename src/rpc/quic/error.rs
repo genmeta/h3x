@@ -1,6 +1,7 @@
 use crate::{
     quic::{self, agent},
     varint::VarInt,
+    webtransport,
 };
 
 /// Lossy: remoc RPC errors must be serialized across process boundaries, so the
@@ -42,6 +43,20 @@ impl From<remoc::rtc::CallError> for agent::VerifyError {
 impl From<remoc::rtc::CallError> for crate::message::stream::MessageStreamError {
     fn from(error: remoc::rtc::CallError) -> Self {
         quic::StreamError::from(error).into()
+    }
+}
+
+impl From<remoc::rtc::CallError> for webtransport::OpenStreamError {
+    fn from(error: remoc::rtc::CallError) -> Self {
+        webtransport::OpenStreamError::Open {
+            source: quic::ConnectionError::from(error),
+        }
+    }
+}
+
+impl From<remoc::rtc::CallError> for webtransport::Closed {
+    fn from(_error: remoc::rtc::CallError) -> Self {
+        webtransport::Closed
     }
 }
 

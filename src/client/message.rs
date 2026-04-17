@@ -198,7 +198,7 @@ where
 
         loop {
             let connection = self.client.connect(authority.clone()).await?;
-            tracing::debug!(target: "h3x::client", %authority, "connected");
+            tracing::trace!(target: "h3x::client", %authority, "connected");
 
             let (mut read_stream, mut write_stream) = match connection
                 .initial_message_stream()

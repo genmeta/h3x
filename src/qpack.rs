@@ -57,7 +57,7 @@ mod tests {
             )
             .await
             .unwrap();
-            tracing::info!("sent encoder stream type");
+            tracing::trace!("sent encoder stream type");
 
             let decoder_stream = Box::pin(TryFuture::from(async move {
                 let decoder_stream = StreamReader::new(decoder_stream_reader)
@@ -68,7 +68,7 @@ mod tests {
                     decoder_stream.r#type(),
                     UnidirectionalStream::QPACK_DECODER_STREAM_TYPE
                 );
-                tracing::info!("received decoder stream type");
+                tracing::trace!("received decoder stream type");
                 Ok::<_, ConnectionError>(decoder_stream)
             }));
 
@@ -86,7 +86,7 @@ mod tests {
             )
             .await
             .unwrap();
-            tracing::info!("sent decoder stream type");
+            tracing::trace!("sent decoder stream type");
 
             let encoder_stream = Box::pin(TryFuture::from(async move {
                 let encoder_stream = StreamReader::new(encoder_stream_reader)
@@ -97,7 +97,7 @@ mod tests {
                     encoder_stream.r#type(),
                     UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE
                 );
-                tracing::info!("received encoder stream type");
+                tracing::trace!("received encoder stream type");
                 Ok::<_, ConnectionError>(encoder_stream)
             }));
 
@@ -144,13 +144,13 @@ mod tests {
             .unwrap();
             request_stream.encode_one(header_frame).await.unwrap();
 
-            tracing::info!("header frame sent");
+            tracing::trace!("header frame sent");
 
             let frame_payload = Bytes::from_static(body.as_bytes());
             let data_frame = Frame::new(Frame::DATA_FRAME_TYPE, frame_payload).unwrap();
             request_stream.encode_one(data_frame).await.unwrap();
             request_stream.flush().await.unwrap();
-            tracing::info!("data frame sent");
+            tracing::trace!("data frame sent");
 
             received_rx.notified().await;
         });
@@ -163,16 +163,16 @@ mod tests {
             assert_eq!(frame.r#type(), Frame::HEADERS_FRAME_TYPE);
             let field_section = Decoder::decode(&*decoder, frame).await.unwrap();
             assert_eq!(field_section, expected_field_section);
-            tracing::info!(?field_section, "decoded field section",);
+            tracing::trace!(?field_section, "decoded field section",);
 
             let mut frame = frame_stream.next_frame().await.unwrap().unwrap();
             assert_eq!(frame.r#type(), Frame::DATA_FRAME_TYPE);
-            tracing::info!("got data frame, reading");
+            tracing::trace!("got data frame, reading");
 
             let mut data = Vec::new();
             frame.read_to_end(&mut data).await.unwrap();
             assert_eq!(data, body.as_bytes());
-            tracing::info!("read data frame");
+            tracing::trace!("read data frame");
 
             received.notify_one();
         });
@@ -433,17 +433,17 @@ mod tests {
             .await
             .unwrap();
             request_stream.encode_one(header_frame).await.unwrap();
-            tracing::info!("header frame sent (dynamic)");
+            tracing::trace!("header frame sent (dynamic)");
 
             // Flush encoder instructions through the real encoder stream
             encoder_clone.flush_instructions().await.unwrap();
-            tracing::info!("encoder instructions flushed");
+            tracing::trace!("encoder instructions flushed");
 
             let frame_payload = Bytes::from_static(body.as_bytes());
             let data_frame = Frame::new(Frame::DATA_FRAME_TYPE, frame_payload).unwrap();
             request_stream.encode_one(data_frame).await.unwrap();
             request_stream.flush().await.unwrap();
-            tracing::info!("data frame sent");
+            tracing::trace!("data frame sent");
 
             received_rx.notified().await;
         });
@@ -456,7 +456,7 @@ mod tests {
             assert_eq!(frame.r#type(), Frame::HEADERS_FRAME_TYPE);
             let field_section = Decoder::decode(&*decoder, frame).await.unwrap();
             assert_eq!(field_section, expected_field_section);
-            tracing::info!(?field_section, "decoded field section (dynamic)");
+            tracing::trace!(?field_section, "decoded field section (dynamic)");
 
             let mut frame = frame_stream.next_frame().await.unwrap().unwrap();
             assert_eq!(frame.r#type(), Frame::DATA_FRAME_TYPE);
@@ -464,7 +464,7 @@ mod tests {
             let mut data = Vec::new();
             frame.read_to_end(&mut data).await.unwrap();
             assert_eq!(data, body.as_bytes());
-            tracing::info!("read data frame");
+            tracing::trace!("read data frame");
 
             received.notify_one();
         });

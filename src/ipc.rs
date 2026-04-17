@@ -8,7 +8,11 @@
 //!
 //! - [`quic`] — RTC traits, server-side adapters, client-side wrappers, and
 //!   per-stream IPC read/write types.
+//! - [`webtransport`] — IPC forwarding for WebTransport sessions.
 //! - [`transport`] — Multiplexed channel (MuxChannel) for RPC control and FD passing.
 
 pub mod quic;
 pub mod transport;
+
+#[cfg(feature = "webtransport")]
+pub mod webtransport;

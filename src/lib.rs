@@ -27,3 +27,6 @@ pub mod ipc;
 
 #[cfg(feature = "rpc")]
 pub mod rpc;
+
+#[cfg(feature = "webtransport")]
+pub mod webtransport;

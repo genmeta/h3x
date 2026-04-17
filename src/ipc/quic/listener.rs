@@ -34,7 +34,7 @@ use std::sync::Arc;
 use remoc::prelude::ServerShared;
 use smallvec::smallvec;
 use snafu::{ResultExt, Snafu};
-use tracing::{Instrument, warn};
+use tracing::{Instrument, debug};
 
 use super::connection::{
     ConnectionAdapter, ConnectionBootstrap, IPC_ERROR_KIND, IPC_FRAME_TYPE, IpcConnectionHandle,
@@ -70,7 +70,7 @@ pub trait IpcListen: Send + Sync {
 
 /// Construct a [`ConnectionError::Transport`] with a formatted reason.
 fn ipc_listen_error(err: impl std::error::Error, context: &str) -> ConnectionError {
-    warn!(error = %snafu::Report::from_error(&err), context, "ipc listener error");
+    debug!(error = %snafu::Report::from_error(&err), context, "ipc listener error");
     ConnectionError::Transport {
         source: quic::TransportError {
             kind: IPC_ERROR_KIND,
@@ -179,7 +179,7 @@ where
         {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %snafu::Report::from_error(e), "per-connection remoc handshake failed");
+                debug!(error = %snafu::Report::from_error(e), "per-connection remoc handshake failed");
                 return;
             }
         };
@@ -202,7 +202,7 @@ where
             connection: rpc_client,
         };
         if tx.send(bootstrap).await.is_err() {
-            warn!("failed to send connection bootstrap: base channel closed");
+            debug!("failed to send connection bootstrap: base channel closed");
         }
     }
 }
