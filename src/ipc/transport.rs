@@ -790,6 +790,16 @@ impl Stream for MuxStream {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
+    use nix::fcntl::{F_GETFD, F_SETFD, FdFlag, fcntl};
+    let raw = fd.as_raw_fd();
+    let bits = fcntl(raw, F_GETFD).map_err(io::Error::from)?;
+    let new_flags = FdFlag::from_bits_truncate(bits) | FdFlag::FD_CLOEXEC;
+    fcntl(raw, F_SETFD(new_flags)).map_err(io::Error::from)?;
+    Ok(())
+}
+
 fn recv_frame_data(
     fd: RawFd,
     data_buf: &mut [u8],
@@ -797,8 +807,14 @@ fn recv_frame_data(
 ) -> io::Result<(usize, FdVec)> {
     let mut iov = [io::IoSliceMut::new(data_buf)];
 
-    let msg = recvmsg::<()>(fd, &mut iov, Some(cmsg_buf), MsgFlags::MSG_CMSG_CLOEXEC)
-        .map_err(io::Error::from)?;
+    // `MSG_CMSG_CLOEXEC` is Linux-only; on other Unix platforms we fall back to
+    // setting `FD_CLOEXEC` manually on each received fd below.
+    #[cfg(target_os = "linux")]
+    let recv_flags = MsgFlags::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let recv_flags = MsgFlags::empty();
+
+    let msg = recvmsg::<()>(fd, &mut iov, Some(cmsg_buf), recv_flags).map_err(io::Error::from)?;
 
     if msg.flags.contains(MsgFlags::MSG_CTRUNC) {
         return Err(io::Error::new(
@@ -814,6 +830,8 @@ fn recv_frame_data(
             for raw_fd in raw_fds {
                 // SAFETY: SCM_RIGHTS transfers ownership of a new fd to receiver.
                 let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+                #[cfg(not(target_os = "linux"))]
+                set_cloexec(&fd)?;
                 fds.push(fd);
             }
         }

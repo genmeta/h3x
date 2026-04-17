@@ -47,10 +47,12 @@ remoc = { version = "0.18", default-features = false, optional = true, features 
     "remoc_macro",
     "rtc",
     "serde",
+    "default-codec-bincode",
 ] }
 
 # feature pipe
 nix = { version = "0.29", default-features = false, optional = true, features = [
+    "fs",
     "socket",
     "uio",
 ] }
@@ -58,7 +60,7 @@ smallvec = { version = "1", optional = true }
 
 
 [features]
-default = ["dquic", "hyper"]
+default = ["dquic", "hyper", "ipc", "webtransport"]
 dquic = ["dep:dquic"]
 hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
@@ -66,6 +68,7 @@ rpc = ["dep:remoc", "serde", "bytes/serde"]
 ipc = ["rpc", "dep:nix", "dep:smallvec", "tokio/net"]
 webtransport = []
 testing = []
+
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = [
@@ -93,4 +96,4 @@ tokio = { version = "1", features = [
 tracing-appender = "0.2"
 tracing-subscriber = "0.3"
 proptest = "1"
-remoc = { version = "0.18", features = ["default-codec-postbag"] }
+# remoc = { version = "0.18", features = ["default-codec-bincode"] }
