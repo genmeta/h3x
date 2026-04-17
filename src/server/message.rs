@@ -414,6 +414,7 @@ impl Response {
     ///
     /// After calling this, the response's async drop becomes a no-op: the
     /// service adapter is responsible for closing the stream.
+    #[cfg(feature = "hyper")]
     pub(crate) fn mark_taken_over(&mut self) {
         self.message.set_dropped();
     }

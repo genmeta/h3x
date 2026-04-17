@@ -1,4 +1,4 @@
-use std::{borrow::Cow, future::Future, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
 use remoc::{
     prelude::{Server, ServerShared},
@@ -14,7 +14,7 @@ use super::{
 use crate::{
     error::Code,
     quic::{self, ConnectionError},
-    rpc::lifecycle::ConnectionErrorLatch,
+    rpc::lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt},
     varint::VarInt,
 };
 
@@ -192,16 +192,6 @@ impl RemoteConnection {
         self.client
     }
 
-    /// Guard an async operation: check lifecycle (including remoc channel
-    /// liveness), execute the future, and latch any error.
-    async fn guard<T>(
-        &self,
-        fut: impl Future<Output = Result<T, ConnectionError>>,
-    ) -> Result<T, ConnectionError> {
-        quic::Lifecycle::check(self)?;
-        fut.await.map_err(|e| self.latch.latch(e))
-    }
-
     /// Synthesize a transport error for remoc channel failures.
     fn remoc_channel_error() -> ConnectionError {
         quic::ConnectionError::Transport {
@@ -211,6 +201,12 @@ impl RemoteConnection {
                 reason: "remoc connection channel closed".into(),
             },
         }
+    }
+}
+
+impl HasLatch for RemoteConnection {
+    fn latch(&self) -> &ConnectionErrorLatch {
+        &self.latch
     }
 }
 
@@ -264,9 +260,7 @@ impl quic::WithLocalAgent for RemoteConnection {
     async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, ConnectionError> {
         match self.guard(Connection::local_agent(&self.client)).await? {
             Some(agent) => Ok(Some(
-                CachedLocalAgent::from_client(agent)
-                    .await
-                    .map_err(|e| self.latch.latch(e))?,
+                self.guard(CachedLocalAgent::from_client(agent)).await?,
             )),
             None => Ok(None),
         }
@@ -279,9 +273,7 @@ impl quic::WithRemoteAgent for RemoteConnection {
     async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, ConnectionError> {
         match self.guard(Connection::remote_agent(&self.client)).await? {
             Some(agent) => Ok(Some(
-                CachedRemoteAgent::from_client(agent)
-                    .await
-                    .map_err(|e| self.latch.latch(e))?,
+                self.guard(CachedRemoteAgent::from_client(agent)).await?,
             )),
             None => Ok(None),
         }
@@ -300,24 +292,17 @@ impl quic::Lifecycle for RemoteConnection {
     }
 
     fn check(&self) -> Result<(), ConnectionError> {
-        self.latch.check()?;
-
-        if RemocClient::is_closed(&self.client) {
-            return Err(self.latch.latch_with(Self::remoc_channel_error));
-        }
-
-        Ok(())
+        self.check_with_probe(|| {
+            RemocClient::is_closed(&self.client).then(Self::remoc_channel_error)
+        })
     }
 
     async fn closed(&self) -> ConnectionError {
-        if let Some(error) = self.latch.peek() {
-            return error;
-        }
-
-        let error = match Connection::closed(&self.client).await {
-            Ok(error) => error,
-            Err(_) => Self::remoc_channel_error(),
-        };
-        self.latch.latch(error)
+        self.resolve_closed(async {
+            Connection::closed(&self.client)
+                .await
+                .unwrap_or_else(|_| Self::remoc_channel_error())
+        })
+        .await
     }
 }

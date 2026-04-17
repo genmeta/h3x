@@ -180,40 +180,126 @@ mod lifecycle_ext {
     use snafu::ResultExt;
 
     use super::{Closed, OpenSnafu, OpenStreamError};
-    use crate::rpc::lifecycle::ConnectionErrorLatch;
+    use crate::{
+        quic::{self, ConnectionError},
+        rpc::lifecycle::LifecycleExt,
+    };
 
-    impl ConnectionErrorLatch {
-        /// Latch an [`OpenStreamError`] with first-wins semantics.
+    /// WebTransport-flavoured extension of [`LifecycleExt`].
+    ///
+    /// Adds check/guard helpers that surface [`OpenStreamError`] and
+    /// [`Closed`] instead of the raw [`ConnectionError`], while preserving
+    /// the lazy first-wins latching discipline.
+    ///
+    /// Like [`LifecycleExt`], this trait is sealed: it is automatically
+    /// implemented for any type that already satisfies [`LifecycleExt`].
+    #[allow(async_fn_in_trait)]
+    pub trait WtLifecycleExt: LifecycleExt {
+        /// Check liveness and surface any error as an [`OpenStreamError`].
+        fn check_open(&self) -> Result<(), OpenStreamError> {
+            quic::Lifecycle::check(self).context(OpenSnafu)
+        }
+
+        /// Check liveness and flatten any error into a [`Closed`].
+        fn check_accept(&self) -> Result<(), Closed> {
+            quic::Lifecycle::check(self).map_err(|_| Closed)
+        }
+
+        /// Guard an async open operation whose error is already an
+        /// [`OpenStreamError`].
         ///
-        /// If the error wraps a [`ConnectionError`](crate::quic::ConnectionError)
-        /// (the `Open` variant), the canonical (first) error is substituted.
-        /// Other variants pass through unmodified.
-        pub fn latch_open(&self, error: OpenStreamError) -> OpenStreamError {
-            match error {
-                OpenStreamError::Open { source } => OpenStreamError::Open {
-                    source: self.latch(source),
-                },
-                other => other,
-            }
-        }
-
-        /// Check the latch for open operations.
-        pub fn check_open(&self) -> Result<(), OpenStreamError> {
-            self.check().context(OpenSnafu)
-        }
-
-        /// Check the latch for accept operations.
-        pub fn check_accept(&self) -> Result<(), Closed> {
-            self.check().map_err(|_| Closed)
-        }
-
-        /// Guard an async open operation: check, execute, latch.
-        pub async fn guard_open<T>(
+        /// If the error wraps a [`ConnectionError`] (the `Open` variant), it
+        /// is latched lazily so the first such error becomes canonical; other
+        /// variants pass through untouched.
+        async fn guard_open<T>(
             &self,
             fut: impl Future<Output = Result<T, OpenStreamError>>,
         ) -> Result<T, OpenStreamError> {
             self.check_open()?;
-            fut.await.map_err(|e| self.latch_open(e))
+            match fut.await {
+                Ok(v) => Ok(v),
+                Err(OpenStreamError::Open { source }) => Err(OpenStreamError::Open {
+                    source: self.latch().latch_with(|| source),
+                }),
+                Err(other) => Err(other),
+            }
+        }
+
+        /// Guard an async open operation whose error must be lazily converted
+        /// to an [`OpenStreamError`].
+        ///
+        /// `map_err` is invoked only when the operation errored **and** no
+        /// error has been latched yet. If the resulting
+        /// [`OpenStreamError::Open`] carries a connection error, it is
+        /// substituted with the already-latched value (first wins).
+        async fn guard_open_with<T, E, M>(
+            &self,
+            fut: impl Future<Output = Result<T, E>>,
+            map_err: M,
+        ) -> Result<T, OpenStreamError>
+        where
+            M: FnOnce(E) -> OpenStreamError,
+        {
+            self.check_open()?;
+            match fut.await {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    if let Some(existing) = self.latch().peek() {
+                        return Err(OpenStreamError::Open { source: existing });
+                    }
+                    Err(match map_err(e) {
+                        OpenStreamError::Open { source } => OpenStreamError::Open {
+                            source: self.latch().latch_with(|| source),
+                        },
+                        other => other,
+                    })
+                }
+            }
+        }
+
+        /// Guard an async accept operation whose error is already a
+        /// [`Closed`].
+        async fn guard_accept<T>(
+            &self,
+            fut: impl Future<Output = Result<T, Closed>>,
+        ) -> Result<T, Closed> {
+            self.check_accept()?;
+            fut.await
+        }
+
+        /// Guard an async accept operation whose error carries richer
+        /// information than [`Closed`].
+        ///
+        /// `map_err` is invoked only when the operation errored **and** no
+        /// error has been latched yet. Returning `Some(error)` from it will
+        /// lazily install that error in the latch so later observers (on the
+        /// connection path) see a meaningful terminal cause; the caller
+        /// always sees a plain [`Closed`].
+        async fn guard_accept_err<T, E, M>(
+            &self,
+            fut: impl Future<Output = Result<T, E>>,
+            map_err: M,
+        ) -> Result<T, Closed>
+        where
+            M: FnOnce(E) -> Option<ConnectionError>,
+        {
+            self.check_accept()?;
+            match fut.await {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    if self.latch().peek().is_none()
+                        && let Some(error) = map_err(e)
+                    {
+                        let _ = self.latch().latch_with(|| error);
+                    }
+                    Err(Closed)
+                }
+            }
         }
     }
+
+    impl<T: LifecycleExt + ?Sized> WtLifecycleExt for T {}
 }
+
+#[cfg(feature = "rpc")]
+pub use lifecycle_ext::WtLifecycleExt;

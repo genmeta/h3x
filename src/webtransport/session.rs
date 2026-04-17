@@ -180,10 +180,6 @@ impl Drop for WebTransportSession {
 mod tests {
     use super::*;
 
-    const _: () = {
-        fn assert_send_sync<T: Send + Sync>() {}
-        fn check() {
-            assert_send_sync::<WebTransportSession>();
-        }
-    };
+    const fn assert_send_sync<T: Send + Sync>() {}
+    const _: () = assert_send_sync::<WebTransportSession>();
 }

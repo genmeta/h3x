@@ -7,18 +7,18 @@
 
 use std::sync::Arc;
 
-use remoc::rtc::Client as RemocClient;
+use remoc::{prelude::Server, rtc::Client as RemocClient};
 use tracing::Instrument;
 
 use super::super::{
-    lifecycle::ConnectionErrorLatch,
+    lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt},
     quic::{ReadStreamClient, ReadStreamServer, WriteStreamClient, WriteStreamServer},
 };
 use crate::{
-    codec::{BoxReadStream, BoxWriteStream},
+    message::stream::guard,
     quic::{self, ConnectionError, DynLifecycle},
     varint::VarInt,
-    webtransport::{self, Closed, OpenStreamError},
+    webtransport::{self, Closed, OpenStreamError, WtLifecycleExt},
 };
 
 // ---------------------------------------------------------------------------
@@ -124,7 +124,7 @@ impl WtSession for webtransport::WebTransportSession {
 /// The first connection error — whether from the parent or from the session's
 /// own remoc channel — is latched and returned on every subsequent operation,
 /// satisfying the QUIC connection-error consistency requirement.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RemoteWtSession {
     client: WtSessionClient,
     session_id: VarInt,
@@ -161,85 +161,71 @@ impl RemoteWtSession {
         }
     }
 
-    /// Check if the connection is dead.  Checks the local latch first,
-    /// then the parent lifecycle (syncing errors into the latch), then
-    /// the remoc channel.
+    /// Liveness probe combining parent lifecycle and remoc channel state.
+    fn probe(&self) -> Option<ConnectionError> {
+        if let Err(e) = DynLifecycle::check(self.parent.as_ref()) {
+            return Some(e);
+        }
+        if RemocClient::is_closed(&self.client) {
+            return Some(Self::remoc_channel_error());
+        }
+        None
+    }
+}
+
+impl HasLatch for RemoteWtSession {
+    fn latch(&self) -> &ConnectionErrorLatch {
+        &self.latch
+    }
+}
+
+impl quic::Lifecycle for RemoteWtSession {
+    fn close(&self, code: crate::error::Code, reason: std::borrow::Cow<'static, str>) {
+        DynLifecycle::close(self.parent.as_ref(), code, reason);
+    }
+
     fn check(&self) -> Result<(), ConnectionError> {
-        self.latch.check()?;
-        self.parent.check().map_err(|e| self.latch.latch(e))?;
-        if RemocClient::is_closed(&self.client) {
-            return Err(self.latch.latch_with(Self::remoc_channel_error));
-        }
-        Ok(())
+        self.check_with_probe(|| self.probe())
     }
 
-    /// Latch a [`Closed`] from an accept operation.  If the remoc channel
-    /// is actually dead, latch the channel error so future operations
-    /// return a consistent connection error.
-    fn latch_accept_error(&self, error: Closed) -> Closed {
-        if RemocClient::is_closed(&self.client) {
-            self.latch.latch_with(Self::remoc_channel_error);
-        }
-        error
-    }
-
-    /// Guard an async open operation: check lifecycle + remoc channel,
-    /// execute, latch errors.
-    async fn guard_open<T>(
-        &self,
-        fut: impl std::future::Future<Output = Result<T, OpenStreamError>>,
-    ) -> Result<T, OpenStreamError> {
-        self.latch.check_open()?;
-        self.parent.check().map_err(|e| OpenStreamError::Open {
-            source: self.latch.latch(e),
-        })?;
-        if RemocClient::is_closed(&self.client) {
-            return Err(OpenStreamError::Open {
-                source: self.latch.latch_with(Self::remoc_channel_error),
-            });
-        }
-        fut.await.map_err(|e| self.latch.latch_open(e))
-    }
-
-    /// Guard an async accept operation: check lifecycle + remoc channel,
-    /// execute, latch errors.
-    async fn guard_accept<T>(
-        &self,
-        fut: impl std::future::Future<Output = Result<T, Closed>>,
-    ) -> Result<T, Closed> {
-        self.check().map_err(|_| Closed)?;
-        fut.await.map_err(|e| self.latch_accept_error(e))
+    async fn closed(&self) -> ConnectionError {
+        self.resolve_closed(DynLifecycle::closed(self.parent.as_ref()))
+            .await
     }
 }
 
 impl webtransport::Session for RemoteWtSession {
-    type StreamReader = BoxReadStream;
-    type StreamWriter = BoxWriteStream;
+    type StreamReader = guard::GuardedQuicReader;
+    type StreamWriter = guard::GuardedQuicWriter;
 
     fn session_id(&self) -> VarInt {
         self.session_id
     }
 
-    async fn open_bi(&self) -> Result<(BoxReadStream, BoxWriteStream), OpenStreamError> {
+    async fn open_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), OpenStreamError> {
         let (reader, writer) = self.guard_open(WtSession::open_bi(&self.client)).await?;
         Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
     }
 
-    async fn open_uni(&self) -> Result<BoxWriteStream, OpenStreamError> {
+    async fn open_uni(&self) -> Result<Self::StreamWriter, OpenStreamError> {
         let writer = self.guard_open(WtSession::open_uni(&self.client)).await?;
         Ok(writer.into_boxed_quic())
     }
 
-    async fn accept_bi(&self) -> Result<(BoxReadStream, BoxWriteStream), Closed> {
+    async fn accept_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Closed> {
         let (reader, writer) = self
-            .guard_accept(WtSession::accept_bi(&self.client))
+            .guard_accept_err(WtSession::accept_bi(&self.client), |Closed| {
+                RemocClient::is_closed(&self.client).then(Self::remoc_channel_error)
+            })
             .await?;
         Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
     }
 
-    async fn accept_uni(&self) -> Result<BoxReadStream, Closed> {
+    async fn accept_uni(&self) -> Result<Self::StreamReader, Closed> {
         let reader = self
-            .guard_accept(WtSession::accept_uni(&self.client))
+            .guard_accept_err(WtSession::accept_uni(&self.client), |Closed| {
+                RemocClient::is_closed(&self.client).then(Self::remoc_channel_error)
+            })
             .await?;
         Ok(reader.into_boxed_quic())
     }

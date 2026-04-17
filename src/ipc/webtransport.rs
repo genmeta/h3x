@@ -52,9 +52,9 @@ use crate::{
         transport::{FdRegistry, FdSender},
     },
     quic::{self, ConnectionError, DynLifecycle, GetStreamIdExt},
-    rpc::lifecycle::ConnectionErrorLatch,
+    rpc::lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt},
     varint::VarInt,
-    webtransport::{self, Closed, OpenStreamError},
+    webtransport::{self, Closed, OpenStreamError, WtLifecycleExt},
 };
 
 // ---------------------------------------------------------------------------
@@ -388,29 +388,32 @@ impl WtSessionAdapter {
 /// Internal lifecycle state for [`IpcWtSessionHandle`].
 ///
 /// Delegates to the parent connection's lifecycle while maintaining a local
-/// error latch.  Implements [`quic::Lifecycle`] so it can be shared with
-/// [`IpcReadStream`] / [`IpcWriteStream`] as `Arc<dyn DynLifecycle>`.
+/// [`ConnectionErrorLatch`].  Implements [`quic::Lifecycle`] so it can be
+/// shared with [`IpcReadStream`] / [`IpcWriteStream`] as
+/// `Arc<dyn DynLifecycle>`.
 struct IpcWtLifecycle {
     parent: Arc<dyn DynLifecycle>,
     latch: ConnectionErrorLatch,
 }
 
+impl HasLatch for IpcWtLifecycle {
+    fn latch(&self) -> &ConnectionErrorLatch {
+        &self.latch
+    }
+}
+
 impl quic::Lifecycle for IpcWtLifecycle {
     fn close(&self, code: crate::error::Code, reason: std::borrow::Cow<'static, str>) {
-        self.parent.close(code, reason);
+        DynLifecycle::close(self.parent.as_ref(), code, reason);
     }
 
     fn check(&self) -> Result<(), ConnectionError> {
-        self.latch.check()?;
-        self.parent.check().map_err(|e| self.latch.latch(e))
+        self.check_with_probe(|| DynLifecycle::check(self.parent.as_ref()).err())
     }
 
     async fn closed(&self) -> ConnectionError {
-        if let Some(error) = self.latch.peek() {
-            return error;
-        }
-        let error = self.parent.closed().await;
-        self.latch.latch(error)
+        self.resolve_closed(async { DynLifecycle::closed(self.parent.as_ref()).await })
+            .await
     }
 }
 
@@ -451,71 +454,55 @@ impl IpcWtSessionHandle {
         }
     }
 
-    /// Guard an IPC open operation: check lifecycle, execute, latch errors.
+    /// Guard an IPC open operation: check lifecycle, execute, lazily latch
+    /// any resulting error.
     async fn guard_ipc_open<T>(
         &self,
         fut: impl Future<Output = Result<T, IpcWtOpenError>>,
     ) -> Result<T, OpenStreamError> {
-        self.lifecycle.latch.check_open()?;
         self.lifecycle
-            .parent
-            .check()
-            .map_err(|e| OpenStreamError::Open {
-                source: self.lifecycle.latch.latch(e),
-            })?;
-        fut.await.map_err(|e| match e {
-            IpcWtOpenError::Stream { source } => self.lifecycle.latch.latch_open(source),
-            IpcWtOpenError::Transport { source } => OpenStreamError::Open {
-                source: self
-                    .lifecycle
-                    .latch
-                    .latch_with(|| ipc_connection_error(&source)),
-            },
-        })
+            .guard_open_with(fut, |e| match e {
+                IpcWtOpenError::Stream { source } => source,
+                IpcWtOpenError::Transport { source } => OpenStreamError::Open {
+                    source: ipc_connection_error(&source),
+                },
+            })
+            .await
     }
 
-    /// Guard an IPC accept operation: check lifecycle, execute, latch errors.
+    /// Guard an IPC accept operation: check lifecycle, execute, lazily latch
+    /// any resulting transport error.
     async fn guard_ipc_accept<T>(
         &self,
         fut: impl Future<Output = Result<T, IpcWtAcceptError>>,
     ) -> Result<T, Closed> {
-        self.lifecycle.latch.check_accept()?;
-        self.lifecycle.parent.check().map_err(|e| {
-            self.lifecycle.latch.latch(e);
-            Closed
-        })?;
-        fut.await.map_err(|e| {
-            if let IpcWtAcceptError::Transport { source } = e {
-                self.lifecycle
-                    .latch
-                    .latch_with(|| ipc_connection_error(&source));
-            }
-            Closed
-        })
+        self.lifecycle
+            .guard_accept_err(fut, |e| match e {
+                IpcWtAcceptError::Closed => None,
+                IpcWtAcceptError::Transport { source } => Some(ipc_connection_error(&source)),
+            })
+            .await
     }
 
-    /// Log and latch an IPC plumbing error for open operations.
+    /// Log and lazily latch an IPC plumbing error for open operations.
     fn latch_open_transport(&self, err: impl std::error::Error, context: &str) -> OpenStreamError {
         debug!(error = %snafu::Report::from_error(&err), context, "ipc wt session error");
-        let plumbing = IpcPlumbingError::Io {
-            message: format!("ipc wt: {context}: {err}"),
-        };
-        let conn_err = self
-            .lifecycle
-            .latch
-            .latch_with(|| ipc_connection_error(&plumbing));
-        OpenStreamError::Open { source: conn_err }
+        let message = format!("ipc wt: {context}: {err}");
+        let source = self.lifecycle.latch().latch_with(|| {
+            let plumbing = IpcPlumbingError::Io { message };
+            ipc_connection_error(&plumbing)
+        });
+        OpenStreamError::Open { source }
     }
 
-    /// Log and latch an IPC plumbing error for accept operations.
+    /// Log and lazily latch an IPC plumbing error for accept operations.
     fn latch_accept_transport(&self, err: impl std::error::Error, context: &str) -> Closed {
         debug!(error = %snafu::Report::from_error(&err), context, "ipc wt session error");
-        let plumbing = IpcPlumbingError::Io {
-            message: format!("ipc wt: {context}: {err}"),
-        };
-        self.lifecycle
-            .latch
-            .latch_with(|| ipc_connection_error(&plumbing));
+        let message = format!("ipc wt: {context}: {err}");
+        let _ = self.lifecycle.latch().latch_with(|| {
+            let plumbing = IpcPlumbingError::Io { message };
+            ipc_connection_error(&plumbing)
+        });
         Closed
     }
 }

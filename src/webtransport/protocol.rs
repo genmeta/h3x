@@ -289,13 +289,9 @@ impl<C: quic::Connection> ProductProtocol<C> for WebTransportProtocolFactory {
 mod tests {
     use super::*;
 
+    const fn assert_send_sync<T: Send + Sync>() {}
     // WebTransportProtocol is Send + Sync (required for Protocol trait).
-    const _: () = {
-        fn assert_send_sync<T: Send + Sync>() {}
-        fn check() {
-            assert_send_sync::<WebTransportProtocol>();
-        }
-    };
+    const _: () = assert_send_sync::<WebTransportProtocol>();
 
     #[test]
     fn signal_values_are_correct() {
