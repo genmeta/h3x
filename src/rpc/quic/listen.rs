@@ -101,9 +101,9 @@ impl quic::Listen for RemoteListener {
     type Connection = RemoteConnection;
     type Error = ListenError;
 
-    async fn accept(&mut self) -> Result<Self::Connection, Self::Error> {
+    async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
         let client = Listen::accept(&mut self.0).await?;
-        Ok(RemoteConnection::from(client))
+        Ok(Arc::new(RemoteConnection::from(client)))
     }
 
     async fn shutdown(&self) -> Result<(), Self::Error> {

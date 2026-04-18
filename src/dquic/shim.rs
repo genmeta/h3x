@@ -332,7 +332,7 @@ impl quic::Listen for dquic::prelude::QuicListeners {
 
     type Error = dquic::prelude::ListenersShutdown;
 
-    async fn accept(&mut self) -> Result<Self::Connection, Self::Error> {
+    async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
         let (connection, ..) = dquic::prelude::QuicListeners::accept(self).await?;
         Ok(connection)
     }
@@ -348,7 +348,7 @@ impl quic::Listen for Arc<dquic::prelude::QuicListeners> {
 
     type Error = dquic::prelude::ListenersShutdown;
 
-    async fn accept(&mut self) -> Result<Self::Connection, Self::Error> {
+    async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
         let (connection, ..) = self.as_ref().accept().await?;
         Ok(connection)
     }
@@ -367,7 +367,7 @@ impl quic::Connect for Arc<dquic::prelude::QuicClient> {
     async fn connect(
         &self,
         server: &http::uri::Authority,
-    ) -> Result<Self::Connection, Self::Error> {
+    ) -> Result<Arc<Self::Connection>, Self::Error> {
         let name = if let Some(port) = server.port_u16() {
             format!("{}:{}", server.host(), port)
         } else {

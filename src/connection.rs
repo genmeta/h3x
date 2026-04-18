@@ -10,6 +10,8 @@ use std::{
 
 use futures::future::BoxFuture;
 use snafu::Snafu;
+use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
 use crate::{
@@ -140,6 +142,40 @@ pub trait LifecycleExt: quic::DynLifecycle + Sync {
 
 impl<T: quic::DynLifecycle + Sync + ?Sized> LifecycleExt for T {}
 
+/// RAII guard that closes the wrapped QUIC connection on drop.
+///
+/// Used during [`ConnectionBuilder::build`] so that a partially-constructed
+/// connection (init failed, or the future was cancelled) does not leak. On
+/// successful build the guard is [defused](Self::defuse) and ownership of the
+/// `Arc<C>` is transferred into the live `Connection<C>`.
+struct CloseOnDrop<C: ?Sized + quic::DynLifecycle>(Option<Arc<C>>);
+
+impl<C: ?Sized + quic::DynLifecycle> CloseOnDrop<C> {
+    fn new(quic: Arc<C>) -> Self {
+        Self(Some(quic))
+    }
+
+    fn defuse(mut self) -> Arc<C> {
+        self.0.take().expect("CloseOnDrop already defused")
+    }
+}
+
+impl<C: ?Sized + quic::DynLifecycle> ops::Deref for CloseOnDrop<C> {
+    type Target = Arc<C>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("CloseOnDrop already defused")
+    }
+}
+
+impl<C: ?Sized + quic::DynLifecycle> Drop for CloseOnDrop<C> {
+    fn drop(&mut self) {
+        if let Some(quic) = self.0.take() {
+            quic.close(Code::H3_NO_ERROR, "h3 build aborted".into());
+        }
+    }
+}
+
 pub struct ConnectionBuilder<C: Any> {
     initializers: Vec<IdentifiedProtocolInitializer<C>>,
     _connection: PhantomData<C>,
@@ -183,24 +219,39 @@ impl<C: quic::Connection> ConnectionBuilder<C> {
         self
     }
 
-    pub async fn build(&self, quic: C) -> Result<Connection<C>, quic::ConnectionError>
+    pub async fn build(&self, quic: Arc<C>) -> Result<Connection<C>, quic::ConnectionError>
     where
         C: Sized,
     {
-        let quic = Arc::new(quic);
+        // If any initializer fails (or this future is dropped before completion),
+        // close the underlying QUIC connection so it does not leak. Defused on
+        // success so the live `Connection<C>` keeps ownership.
+        let quic = CloseOnDrop::new(quic);
         let mut protocols = Protocols::new();
 
         for initializer in &self.initializers {
             initializer.init_protocols(&quic, &mut protocols).await?;
         }
 
+        let quic = quic.defuse();
         let protocols = Arc::new(protocols);
         let state = ConnectionState { quic, protocols };
         // Terminates when the QUIC connection closes and stream acceptance returns an error.
-        tokio::spawn(ConnectionState::accept_uni_stream_task(state.clone()).in_current_span());
-        tokio::spawn(ConnectionState::accept_bi_stream_task(state.clone()).in_current_span());
+        // Wrapped in `AbortOnDropHandle` so dropping the owning `Connection<C>` aborts the
+        // tasks immediately, breaking the strong-reference cycle that would otherwise keep
+        // the underlying QUIC connection alive.
+        let accept_uni: JoinHandle<()> =
+            tokio::spawn(ConnectionState::accept_uni_stream_task(state.clone()).in_current_span());
+        let accept_bi: JoinHandle<()> =
+            tokio::spawn(ConnectionState::accept_bi_stream_task(state.clone()).in_current_span());
 
-        Ok(Connection(state))
+        Ok(Connection {
+            state,
+            _accept_tasks: [
+                AbortOnDropHandle::new(accept_uni),
+                AbortOnDropHandle::new(accept_bi),
+            ],
+        })
     }
 }
 
@@ -397,19 +448,26 @@ impl<C: ?Sized> Clone for ConnectionState<C> {
 }
 
 #[derive(Debug)]
-pub struct Connection<C: quic::Connection>(ConnectionState<C>);
+pub struct Connection<C: quic::Connection> {
+    state: ConnectionState<C>,
+    /// Background stream-acceptance tasks, aborted when the `Connection<C>` is dropped.
+    /// The tasks each hold a clone of `ConnectionState<C>` (which contains `Arc<C>`),
+    /// so without abort-on-drop the strong reference cycle would keep the QUIC
+    /// connection alive long after the owner has released its handle.
+    _accept_tasks: [AbortOnDropHandle<()>; 2],
+}
 
 impl<C: quic::Connection> ops::Deref for Connection<C> {
     type Target = ConnectionState<C>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.state
     }
 }
 
 impl<C: quic::Connection> Connection<C> {
-    pub async fn new(settings: Arc<Settings>, quic: C) -> Result<Self, quic::ConnectionError> {
+    pub async fn new(settings: Arc<Settings>, quic: Arc<C>) -> Result<Self, quic::ConnectionError> {
         ConnectionBuilder::new(settings).build(quic).await
     }
 }
@@ -417,12 +475,20 @@ impl<C: quic::Connection> Connection<C> {
 impl<C: quic::Connection> Connection<C> {
     #[cfg(test)]
     pub(crate) fn from_state_for_test(state: ConnectionState<C>) -> Self {
-        Self(state)
+        let noop = || AbortOnDropHandle::new(tokio::spawn(async {}));
+        Self {
+            state,
+            _accept_tasks: [noop(), noop()],
+        }
     }
 }
 
 impl<C: quic::Connection> Drop for Connection<C> {
     fn drop(&mut self) {
+        // Send a graceful close before aborting the accept tasks. The accept tasks
+        // hold cloned `Arc<C>` references; aborting them via `AbortOnDropHandle`
+        // releases those references so the underlying QUIC connection can be
+        // dropped (and its own RAII close logic, if any, runs).
         self.close(Code::H3_NO_ERROR, "no error");
     }
 }

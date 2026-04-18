@@ -97,8 +97,11 @@ impl quic::Connect for RemoteConnector {
     type Connection = RemoteConnection;
     type Error = ConnectError;
 
-    async fn connect<'a>(&'a self, server: &'a Authority) -> Result<Self::Connection, Self::Error> {
+    async fn connect<'a>(
+        &'a self,
+        server: &'a Authority,
+    ) -> Result<Arc<Self::Connection>, Self::Error> {
         let client = Connect::connect(&self.0, SerdeAuthority::from(server)).await?;
-        Ok(RemoteConnection::from(client))
+        Ok(Arc::new(RemoteConnection::from(client)))
     }
 }

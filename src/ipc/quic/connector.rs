@@ -135,8 +135,6 @@ where
             .await
             .map_err(|e| connect_error(e, "connect"))?;
 
-        let connection = Arc::new(connection);
-
         // Create a MuxChannel pair for this connection.
         let (server_mux, client_fd) =
             MuxChannel::create_pair().map_err(|e| connect_error(e, "create_pair"))?;
@@ -259,7 +257,7 @@ where
     async fn connect<'a>(
         &'a self,
         server: &'a Authority,
-    ) -> Result<IpcConnectionHandle, ConnectorError> {
+    ) -> Result<Arc<IpcConnectionHandle>, ConnectorError> {
         // 1. RPC: ask the server side to connect and get the fd-registry ID.
         let fd_id = IpcConnect::connect(&self.rpc, SerdeAuthority::from(server))
             .await
@@ -303,11 +301,11 @@ where
         // creates socketpairs and sends FDs back to the server).
 
         // 6. Build the IpcConnectionHandle.
-        Ok(IpcConnectionHandle::new(
+        Ok(Arc::new(IpcConnectionHandle::new(
             bootstrap.connection,
             conn_fd_registry,
             conn_fd_sender,
-        ))
+        )))
     }
 }
 

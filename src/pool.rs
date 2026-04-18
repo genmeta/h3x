@@ -149,8 +149,13 @@ impl<C: quic::Connection> Pool<C> {
     fn spawn_try_release(self, identify: ConnectionIdentifier) {
         tokio::spawn(
             async move {
-                (self.connections.as_ref())
-                    .remove_if(&identify, |_, connection| connection.reuse().is_none());
+                (self.connections.as_ref()).remove_if(&identify, |_, connection| {
+                    // only drop the entry when no other waiter holds it; otherwise we would
+                    // orphan the waiters and let a concurrent caller create a parallel entry
+                    // at the same key, causing unbounded connection fission on persistent
+                    // handshake failures.
+                    Arc::strong_count(connection) == 1 && connection.reuse().is_none()
+                });
             }
             .in_current_span(),
         );

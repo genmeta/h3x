@@ -115,7 +115,6 @@ where
         let connection = quic::Listen::accept(&mut self.inner)
             .await
             .map_err(|e| ipc_listen_error(e, "accept"))?;
-        let connection = Arc::new(connection);
 
         // Create a MuxChannel pair for this connection
         let (server_mux, client_fd) =
@@ -275,7 +274,7 @@ where
     type Connection = IpcConnectionHandle;
     type Error = IpcListenError;
 
-    async fn accept(&mut self) -> Result<IpcConnectionHandle, IpcListenError> {
+    async fn accept(&mut self) -> Result<Arc<IpcConnectionHandle>, IpcListenError> {
         // 1. RPC: ask server to accept a new connection
         let fd_id = IpcListen::accept(&mut self.rpc).await.context(RpcSnafu)?;
 
@@ -317,11 +316,11 @@ where
             })?;
 
         // 5. Wrap as IpcConnectionHandle
-        Ok(IpcConnectionHandle::new(
+        Ok(Arc::new(IpcConnectionHandle::new(
             bootstrap.connection,
             conn_fd_registry,
             conn_fd_sender,
-        ))
+        )))
     }
 
     async fn shutdown(&self) -> Result<(), IpcListenError> {

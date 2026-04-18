@@ -399,7 +399,7 @@ struct MockListen {
 }
 
 impl quic::Listen for MockListen {
-    type Connection = Arc<StreamableConnection>;
+    type Connection = StreamableConnection;
     type Error = ConnectionError;
 
     async fn accept(&mut self) -> Result<Arc<StreamableConnection>, ConnectionError> {
@@ -414,56 +414,6 @@ impl quic::Listen for MockListen {
     }
 }
 
-// Arc<StreamableConnection> needs Connection trait blanket impls
-impl quic::ManageStream for Arc<StreamableConnection> {
-    type StreamReader = ChannelReader;
-    type StreamWriter = ChannelWriter;
-
-    async fn open_bi(&self) -> Result<(ChannelReader, ChannelWriter), ConnectionError> {
-        StreamableConnection::open_bi(self).await
-    }
-
-    async fn open_uni(&self) -> Result<ChannelWriter, ConnectionError> {
-        StreamableConnection::open_uni(self).await
-    }
-
-    async fn accept_bi(&self) -> Result<(ChannelReader, ChannelWriter), ConnectionError> {
-        StreamableConnection::accept_bi(self).await
-    }
-
-    async fn accept_uni(&self) -> Result<ChannelReader, ConnectionError> {
-        StreamableConnection::accept_uni(self).await
-    }
-}
-
-impl quic::Lifecycle for Arc<StreamableConnection> {
-    fn close(&self, code: Code, reason: Cow<'static, str>) {
-        StreamableConnection::close(self, code, reason);
-    }
-
-    fn check(&self) -> Result<(), ConnectionError> {
-        StreamableConnection::check(self)
-    }
-
-    async fn closed(&self) -> ConnectionError {
-        StreamableConnection::closed(self).await
-    }
-}
-
-impl quic::WithLocalAgent for Arc<StreamableConnection> {
-    type LocalAgent = NoAgent;
-    async fn local_agent(&self) -> Result<Option<NoAgent>, ConnectionError> {
-        Ok(None)
-    }
-}
-
-impl quic::WithRemoteAgent for Arc<StreamableConnection> {
-    type RemoteAgent = NoAgent;
-    async fn remote_agent(&self) -> Result<Option<NoAgent>, ConnectionError> {
-        Ok(None)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // MockConnect: connects to a pre-staged connection
 // ---------------------------------------------------------------------------
@@ -473,7 +423,7 @@ struct MockConnect {
 }
 
 impl quic::Connect for MockConnect {
-    type Connection = Arc<StreamableConnection>;
+    type Connection = StreamableConnection;
     type Error = ConnectionError;
 
     async fn connect<'a>(

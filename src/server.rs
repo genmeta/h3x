@@ -101,7 +101,7 @@ where
 {
     fn handle_incoming_connection(
         &self,
-        connection: L::Connection,
+        connection: Arc<L::Connection>,
     ) -> impl futures::Future<Output = ()> + Send + 'static {
         let pool = self.pool.clone();
         let builder = self.builder.clone();
