@@ -19,26 +19,52 @@ use crate::{
     protocol::Protocols,
     qpack::field::{Protocol, PseudoHeaders},
     quic::agent,
+    server::ServerConnection,
     stream_id::StreamId,
 };
 
+/// A request that has just been accepted on a QUIC stream but whose HTTP/3
+/// header frame has not yet been read.
+///
+/// All per-connection context (local/remote agents, protocol registry) is
+/// reachable through [`Self::connection`] — [`resolve`](Self::resolve)
+/// awaits those accessors once and hands back an eagerly-populated
+/// [`Request`]/[`Response`] pair.
 pub struct UnresolvedRequest {
-    pub request_stream: ReadStream,
-    pub remote_agent: Option<Arc<dyn agent::RemoteAgent>>,
-    pub response_stream: WriteStream,
-    pub local_agent: Arc<dyn agent::LocalAgent>,
+    /// QUIC stream identifier for this request.
     pub stream_id: StreamId,
-    pub protocols: Arc<Protocols>,
+    /// Incoming request stream — read by [`resolve`](Self::resolve) to pull
+    /// the HTTP/3 header frame.
+    pub read_stream: ReadStream,
+    /// Outgoing response stream — handed to the [`Response`] on resolve.
+    pub write_stream: WriteStream,
+    /// Owning h3 connection. Provides agents + protocol registry.
+    pub connection: Arc<dyn ServerConnection>,
 }
 
 impl UnresolvedRequest {
     pub async fn resolve(self) -> Result<(Request, Response), MessageStreamError> {
+        let UnresolvedRequest {
+            stream_id,
+            read_stream,
+            write_stream,
+            connection,
+        } = self;
+        // Agents are backed by a watch channel — fetching them per-request
+        // is effectively a clone once the handshake has completed.
+        let local_agent = connection
+            .local_agent()
+            .await?
+            .expect("server connection must have a local agent (SNI)");
+        let remote_agent = connection.remote_agent().await?;
+        let protocols = connection.protocols().clone();
+
         let mut request = Request {
             message: Message::unresolved_request(),
-            stream: self.request_stream,
-            agent: self.remote_agent,
-            stream_id: self.stream_id,
-            protocols: self.protocols.clone(),
+            stream: read_stream,
+            agent: remote_agent,
+            stream_id,
+            protocols: protocols.clone(),
         };
         request
             .stream
@@ -46,10 +72,10 @@ impl UnresolvedRequest {
             .await?;
         let response = Response {
             message: Message::unresolved_response(),
-            stream: self.response_stream,
-            agent: self.local_agent,
-            stream_id: self.stream_id,
-            protocols: self.protocols,
+            stream: write_stream,
+            agent: local_agent,
+            stream_id,
+            protocols,
         };
         Ok((request, response))
     }

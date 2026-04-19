@@ -71,14 +71,27 @@ where
     }
 
     fn call(&mut self, req: UnresolvedRequest) -> Self::Future {
-        let server_name = req.local_agent.name().to_string();
-        let Some(mut service) = self.router.get(server_name.as_str()).cloned() else {
-            return Box::pin(async move {
-                Err(ServersRouterDispatchError::MissingService { server_name }.into())
-            });
-        };
-
+        let router = self.router.clone();
         Box::pin(async move {
+            // Resolve the server name lazily from the connection instead of
+            // carrying it on `UnresolvedRequest`. The local agent watch is
+            // already populated by the time the first request arrives, so
+            // this is effectively a clone.
+            let local_agent = match req.connection.local_agent().await {
+                Ok(Some(agent)) => agent,
+                Ok(None) => {
+                    return Err(ServersRouterDispatchError::MissingService {
+                        server_name: String::new(),
+                    }
+                    .into());
+                }
+                Err(error) => return Err(Box::new(error) as _),
+            };
+            let server_name = local_agent.name().to_string();
+            let Some(mut service) = router.get(server_name.as_str()).cloned() else {
+                return Err(ServersRouterDispatchError::MissingService { server_name }.into());
+            };
+
             future::poll_fn(|cx| service.poll_ready(cx))
                 .await
                 .map_err(Into::into)?;

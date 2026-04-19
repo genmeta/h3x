@@ -167,12 +167,10 @@ where
     fn call(
         &mut self,
         UnresolvedRequest {
-            request_stream,
-            remote_agent,
-            mut response_stream,
-            local_agent,
             stream_id,
-            protocols,
+            read_stream,
+            write_stream: mut response_stream,
+            connection,
         }: UnresolvedRequest,
     ) -> Self::Future {
         let span = tracing::info_span!(
@@ -182,62 +180,80 @@ where
         );
 
         let mut service = self.0.clone();
-        let future = async move {
-            future::poll_fn(|cx| service.poll_ready(cx))
-                .await
-                .context(handle_request_error::ServiceSnafu)?;
-
-            let mut request = request_stream
-                .into_hyper_request()
-                .await
-                .context(handle_request_error::StreamSnafu)?
-                .map(UnsyncBoxBody::new);
-            tracing::Span::current()
-                .record("method", request.method().as_str())
-                .record("uri", request.uri().to_string());
-
-            tracing::trace!("converted request stream to hyper request, serving...");
-            let is_connect = request.method() == Method::CONNECT;
-            let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
-
-            request.extensions_mut().insert(local_agent);
-            if let Some(remote_agent) = remote_agent {
-                request.extensions_mut().insert(remote_agent);
-            }
-            request.extensions_mut().insert(stream_id);
-            request.extensions_mut().insert(protocols);
-            if is_connect
-                && request
-                    .extensions()
-                    .get::<TakeoverSlot<ReadStream>>()
-                    .is_some()
-            {
-                request
-                    .extensions_mut()
-                    .insert(TakeoverSlot::new(remain_write_stream.clone()));
-            }
-
-            let response = service
-                .call(request)
-                .await
-                .context(handle_request_error::ServiceSnafu)?;
-
-            response_stream.send_hyper_response(response).await?;
-            if is_connect {
-                response_stream
-                    .flush()
+        let future =
+            async move {
+                future::poll_fn(|cx| service.poll_ready(cx))
                     .await
-                    .context(handle_request_error::StreamSnafu)?;
-                _ = remain_write_stream_tx.send(response_stream);
-            } else {
-                response_stream
-                    .close()
-                    .await
-                    .context(handle_request_error::StreamSnafu)?;
-            }
+                    .context(handle_request_error::ServiceSnafu)?;
 
-            Ok(())
-        };
+                // Agents + protocols live on the owning connection; fetch them
+                // once per request. The local agent is guaranteed to exist on an
+                // accepted server connection (SNI check runs during accept).
+                let local_agent = connection
+                    .local_agent()
+                    .await
+                    .map_err(|source| HandleRequestError::Stream {
+                        source: MessageStreamError::from(source),
+                    })?
+                    .expect("accepted server connection must have a local agent");
+                let remote_agent = connection.remote_agent().await.map_err(|source| {
+                    HandleRequestError::Stream {
+                        source: MessageStreamError::from(source),
+                    }
+                })?;
+                let protocols = connection.protocols().clone();
+
+                let mut request = read_stream
+                    .into_hyper_request()
+                    .await
+                    .context(handle_request_error::StreamSnafu)?
+                    .map(UnsyncBoxBody::new);
+                tracing::Span::current()
+                    .record("method", request.method().as_str())
+                    .record("uri", request.uri().to_string());
+
+                tracing::trace!("converted request stream to hyper request, serving...");
+                let is_connect = request.method() == Method::CONNECT;
+                let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
+
+                request.extensions_mut().insert(local_agent);
+                if let Some(remote_agent) = remote_agent {
+                    request.extensions_mut().insert(remote_agent);
+                }
+                request.extensions_mut().insert(stream_id);
+                request.extensions_mut().insert(protocols);
+                if is_connect
+                    && request
+                        .extensions()
+                        .get::<TakeoverSlot<ReadStream>>()
+                        .is_some()
+                {
+                    request
+                        .extensions_mut()
+                        .insert(TakeoverSlot::new(remain_write_stream.clone()));
+                }
+
+                let response = service
+                    .call(request)
+                    .await
+                    .context(handle_request_error::ServiceSnafu)?;
+
+                response_stream.send_hyper_response(response).await?;
+                if is_connect {
+                    response_stream
+                        .flush()
+                        .await
+                        .context(handle_request_error::StreamSnafu)?;
+                    _ = remain_write_stream_tx.send(response_stream);
+                } else {
+                    response_stream
+                        .close()
+                        .await
+                        .context(handle_request_error::StreamSnafu)?;
+                }
+
+                Ok(())
+            };
         Box::pin(future.instrument(span))
     }
 }
@@ -356,12 +372,10 @@ where
     fn call(
         &mut self,
         UnresolvedRequest {
-            request_stream,
-            remote_agent,
-            mut response_stream,
-            local_agent,
             stream_id,
-            protocols,
+            read_stream,
+            write_stream: mut response_stream,
+            connection,
         }: UnresolvedRequest,
     ) -> Self::Future {
         let span = tracing::info_span!(
@@ -371,58 +385,73 @@ where
         );
 
         let service = self.0.clone();
-        let future = async move {
-            let mut request = request_stream
-                .into_hyper_request()
-                .await
-                .context(handle_request_error::StreamSnafu)?
-                .map(UnsyncBoxBody::new);
-            tracing::Span::current()
-                .record("method", request.method().as_str())
-                .record("uri", request.uri().to_string());
-
-            tracing::trace!("converted request stream to hyper request, serving...");
-            let is_connect = request.method() == Method::CONNECT;
-            let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
-
-            request.extensions_mut().insert(local_agent);
-            if let Some(remote_agent) = remote_agent {
-                request.extensions_mut().insert(remote_agent);
-            }
-            request.extensions_mut().insert(stream_id);
-            request.extensions_mut().insert(protocols);
-            if is_connect
-                && request
-                    .extensions()
-                    .get::<TakeoverSlot<ReadStream>>()
-                    .is_some()
-            {
-                request
-                    .extensions_mut()
-                    .insert(TakeoverSlot::new(remain_write_stream.clone()));
-            }
-
-            let response = service
-                .call(request)
-                .await
-                .context(handle_request_error::ServiceSnafu)?;
-
-            response_stream.send_hyper_response(response).await?;
-            if is_connect {
-                response_stream
-                    .flush()
+        let future =
+            async move {
+                let local_agent = connection
+                    .local_agent()
                     .await
-                    .context(handle_request_error::StreamSnafu)?;
-                _ = remain_write_stream_tx.send(response_stream);
-            } else {
-                response_stream
-                    .close()
-                    .await
-                    .context(handle_request_error::StreamSnafu)?;
-            }
+                    .map_err(|source| HandleRequestError::Stream {
+                        source: MessageStreamError::from(source),
+                    })?
+                    .expect("accepted server connection must have a local agent");
+                let remote_agent = connection.remote_agent().await.map_err(|source| {
+                    HandleRequestError::Stream {
+                        source: MessageStreamError::from(source),
+                    }
+                })?;
+                let protocols = connection.protocols().clone();
 
-            Ok(())
-        };
+                let mut request = read_stream
+                    .into_hyper_request()
+                    .await
+                    .context(handle_request_error::StreamSnafu)?
+                    .map(UnsyncBoxBody::new);
+                tracing::Span::current()
+                    .record("method", request.method().as_str())
+                    .record("uri", request.uri().to_string());
+
+                tracing::trace!("converted request stream to hyper request, serving...");
+                let is_connect = request.method() == Method::CONNECT;
+                let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
+
+                request.extensions_mut().insert(local_agent);
+                if let Some(remote_agent) = remote_agent {
+                    request.extensions_mut().insert(remote_agent);
+                }
+                request.extensions_mut().insert(stream_id);
+                request.extensions_mut().insert(protocols);
+                if is_connect
+                    && request
+                        .extensions()
+                        .get::<TakeoverSlot<ReadStream>>()
+                        .is_some()
+                {
+                    request
+                        .extensions_mut()
+                        .insert(TakeoverSlot::new(remain_write_stream.clone()));
+                }
+
+                let response = service
+                    .call(request)
+                    .await
+                    .context(handle_request_error::ServiceSnafu)?;
+
+                response_stream.send_hyper_response(response).await?;
+                if is_connect {
+                    response_stream
+                        .flush()
+                        .await
+                        .context(handle_request_error::StreamSnafu)?;
+                    _ = remain_write_stream_tx.send(response_stream);
+                } else {
+                    response_stream
+                        .close()
+                        .await
+                        .context(handle_request_error::StreamSnafu)?;
+                }
+
+                Ok(())
+            };
         Box::pin(future.instrument(span))
     }
 }
