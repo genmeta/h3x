@@ -146,7 +146,7 @@ struct QuicEndpointInner {
 }
 
 struct ServerState {
-    accept_rx: tokio::sync::Mutex<Option<Receiver<Arc<Connection>>>>,
+    accept_rx: Mutex<Option<Receiver<Arc<Connection>>>>,
     installed: AtomicBool,
     tx_keepalive: Mutex<Option<mpsc::Sender<Arc<Connection>>>>,
 }
@@ -171,7 +171,7 @@ impl QuicEndpoint {
                 client_tls: OnceLock::new(),
                 server_tls: OnceLock::new(),
                 server_state: ServerState {
-                    accept_rx: tokio::sync::Mutex::new(None),
+                    accept_rx: Mutex::new(None),
                     installed: AtomicBool::new(false),
                     tx_keepalive: Mutex::new(None),
                 },
@@ -355,7 +355,7 @@ impl QuicEndpoint {
         let backlog = self.server.own.backlog.max(1);
         let (tx, rx) = mpsc::channel(backlog);
 
-        *self.inner.server_state.accept_rx.blocking_lock() = Some(rx);
+        *self.inner.server_state.accept_rx.lock().unwrap() = Some(rx);
         *self.inner.server_state.tx_keepalive.lock().unwrap() = Some(tx.clone());
 
         let endpoint = self.clone();
@@ -366,7 +366,7 @@ impl QuicEndpoint {
                     endpoint.dispatch_initial_packet(packet, way, tls.clone(), tx.clone());
                 });
         if !installed {
-            *self.inner.server_state.accept_rx.blocking_lock() = None;
+            *self.inner.server_state.accept_rx.lock().unwrap() = None;
             *self.inner.server_state.tx_keepalive.lock().unwrap() = None;
             return Err(AcceptError::DispatcherInUse);
         }
@@ -549,9 +549,24 @@ impl quic::Listen for QuicEndpoint {
 
     async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
         self.ensure_server_dispatcher()?;
-        let mut guard = self.inner.server_state.accept_rx.lock().await;
-        let rx = guard.as_mut().ok_or(AcceptError::Shutdown)?;
-        rx.recv().await.ok_or(AcceptError::Shutdown)
+        // Temporarily take the receiver out so we do not hold any lock
+        // across `.await`. `accept` takes `&mut self`, so no two calls race.
+        let mut rx = self
+            .inner
+            .server_state
+            .accept_rx
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or(AcceptError::Shutdown)?;
+        let msg = rx.recv().await;
+        // Put the receiver back for the next call unless shutdown ran
+        // concurrently and already cleared the slot.
+        let mut guard = self.inner.server_state.accept_rx.lock().unwrap();
+        if guard.is_none() && self.inner.server_state.installed.load(Ordering::Acquire) {
+            *guard = Some(rx);
+        }
+        msg.ok_or(AcceptError::Shutdown)
     }
 
     async fn shutdown(&self) -> Result<(), Self::Error> {
@@ -562,7 +577,7 @@ impl quic::Listen for QuicEndpoint {
             .swap(false, Ordering::AcqRel)
         {
             self.network.quic_router().drain_connectless();
-            *self.inner.server_state.accept_rx.lock().await = None;
+            *self.inner.server_state.accept_rx.lock().unwrap() = None;
             *self.inner.server_state.tx_keepalive.lock().unwrap() = None;
         }
         Ok(())
