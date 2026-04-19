@@ -24,7 +24,11 @@ use crate::{
 ///
 /// // Hyper handler:
 /// let stream_id = request.extensions().get::<StreamId>().unwrap();
-/// let protocols = request.extensions().get::<Arc<Protocols>>().unwrap();
+/// let connection = request
+///     .extensions()
+///     .get::<Arc<ConnectionState<dyn DynConnection>>>()
+///     .unwrap();
+/// let protocols = connection.protocols();
 /// let session = protocols.get::<MyProtocol>().unwrap().create_session(*stream_id);
 /// ```
 ///

@@ -40,8 +40,11 @@
 //!
 //! ```ignore
 //! let stream_id = request.extensions().get::<StreamId>().unwrap();
-//! let protocols = request.extensions().get::<Arc<Protocols>>().unwrap();
-//! let proto = protocols.get::<MyProtocol>().unwrap();
+//! let connection = request
+//!     .extensions()
+//!     .get::<Arc<ConnectionState<dyn DynConnection>>>()
+//!     .unwrap();
+//! let proto = connection.protocols().get::<MyProtocol>().unwrap();
 //! ```
 //!
 //! # Convention for new protocols
@@ -138,8 +141,11 @@ impl Protocols {
     /// # Usage in hyper handlers
     ///
     /// ```ignore
-    /// let protocols = request.extensions().get::<Arc<Protocols>>().unwrap();
-    /// let dhttp = protocols.get::<DHttpProtocol>().unwrap();
+    /// let connection = request
+    ///     .extensions()
+    ///     .get::<Arc<ConnectionState<dyn DynConnection>>>()
+    ///     .unwrap();
+    /// let dhttp = connection.protocols().get::<DHttpProtocol>().unwrap();
     /// ```
     ///
     /// # Panics

@@ -115,3 +115,7 @@ tracing-appender = "0.2"
 tracing-subscriber = "0.3"
 proptest = "1"
 # remoc = { version = "0.18", features = ["default-codec-bincode"] }
+
+# TEMP: use local dquic for Phase 1 integration (do not commit)
+[patch.crates-io]
+dquic = { path = "../dquic/dquic" }
