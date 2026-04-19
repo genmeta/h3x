@@ -395,6 +395,34 @@ impl Network {
             })
             .collect()
     }
+
+    /// Look up the [`BindInterface`] currently registered for `bind_uri`.
+    ///
+    /// Returns `None` if the URI was never bound (directly or through
+    /// [`Network::add_binds`]) or if the interface was already released.
+    /// This is a thin wrapper around
+    /// [`InterfaceManager::get`](crate::dquic::qinterface::manager::InterfaceManager::get)
+    /// that keeps callers from having to reach into the manager directly.
+    #[must_use]
+    pub fn get_iface(&self, bind_uri: &BindUri) -> Option<BindInterface> {
+        self.iface_manager.get(bind_uri)
+    }
+
+    /// Snapshot of SNI names currently registered on this network.
+    ///
+    /// A name appears in the result iff at least one [`ServerBinding`]
+    /// (or a cache entry of a [`QuicEndpoint`](super::QuicEndpoint)) for
+    /// that name is still live. Names whose `Weak<SniEntry>` cannot be
+    /// upgraded — i.e. whose last binding was dropped but whose registry
+    /// slot has not yet been cleared by
+    /// [`SniGuard`](super::sni::SniGuard)'s `Drop` — are filtered out.
+    #[must_use]
+    pub fn registered_sni_names(&self) -> Vec<ServerName> {
+        self.sni_registry
+            .iter()
+            .filter_map(|kv| kv.value().upgrade().map(|_| kv.key().clone()))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

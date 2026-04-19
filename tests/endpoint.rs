@@ -395,3 +395,59 @@ fn two_sni_share_network_and_port() {
         drop(bindings);
     });
 }
+
+// ---------------------------------------------------------------------------
+// Introspection accessors (Phase 0)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_iface_returns_bound_interface() {
+    run("get_iface_returns_bound_interface", async move {
+        let network = test_network();
+        let uri = BindUri::from("inet://127.0.0.1:0");
+        let bound = network.bind(uri.clone()).await;
+        let expected_addr = bound.borrow().bound_addr().expect("bound addr");
+
+        let fetched = network
+            .get_iface(&uri)
+            .expect("iface must be retrievable via get_iface");
+        let fetched_addr = fetched.borrow().bound_addr().expect("bound addr");
+        assert_eq!(expected_addr, fetched_addr);
+
+        // Unknown URI yields None.
+        let unknown = BindUri::from("inet://127.0.0.1:1");
+        assert!(network.get_iface(&unknown).is_none());
+    });
+}
+
+#[test]
+fn registered_sni_names_tracks_live_bindings() {
+    run("registered_sni_names_tracks_live_bindings", async move {
+        let network = test_network();
+        assert!(network.registered_sni_names().is_empty());
+
+        let shared_config = ServerQuicConfig::default();
+        let alpha = network
+            .bind_server(named_with("alpha"), shared_config.clone())
+            .await
+            .expect("bind alpha");
+        let beta = network
+            .bind_server(named_with("beta"), shared_config.clone())
+            .await
+            .expect("bind beta");
+
+        let mut names = network.registered_sni_names();
+        names.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].as_ref(), "alpha");
+        assert_eq!(names[1].as_ref(), "beta");
+
+        drop(alpha);
+        let remaining = network.registered_sni_names();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].as_ref(), "beta");
+
+        drop(beta);
+        assert!(network.registered_sni_names().is_empty());
+    });
+}
