@@ -57,10 +57,29 @@ nix = { version = "0.29", default-features = false, optional = true, features = 
 ] }
 smallvec = { version = "1", optional = true }
 
+# feature endpoint
+derive_more = { version = "2", optional = true, features = [
+    "deref",
+    "deref_mut",
+    "from",
+    "into",
+] }
+either = { version = "1", optional = true }
+globset = { version = "0.4", optional = true }
+peg = { version = "0.8", optional = true }
+
 
 [features]
 default = ["dquic", "hyper"]
 dquic = ["dep:dquic"]
+endpoint = [
+    "dquic",
+    "dep:derive_more",
+    "dep:either",
+    "dep:globset",
+    "dep:peg",
+    "tokio/time",
+]
 hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
 rpc = ["dep:remoc", "serde", "bytes/serde"]

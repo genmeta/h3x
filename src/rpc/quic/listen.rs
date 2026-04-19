@@ -37,7 +37,7 @@ where
         let connection = quic::Listen::accept(self)
             .await
             .map_err(|e| StringError::new(e.to_string()))?;
-        let (server, client) = ConnectionServerShared::new(Arc::new(connection), 1);
+        let (server, client) = ConnectionServerShared::new(connection, 1);
         tokio::spawn(
             (async move {
                 let _ = server.serve(true).await;

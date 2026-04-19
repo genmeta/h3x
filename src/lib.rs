@@ -19,6 +19,9 @@ pub mod varint;
 #[cfg(feature = "dquic")]
 pub mod dquic;
 
+#[cfg(feature = "endpoint")]
+pub mod endpoint;
+
 #[cfg(feature = "hyper")]
 pub mod hyper;
 
