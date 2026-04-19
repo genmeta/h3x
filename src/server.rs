@@ -1,6 +1,6 @@
 use std::{error::Error, sync::Arc};
 
-use futures::future::{self, BoxFuture};
+use futures::future;
 use snafu::Report;
 use tokio::task::JoinSet;
 use tracing::Instrument;
@@ -10,11 +10,10 @@ pub use crate::message::{
     unify::ReadToStringError,
 };
 use crate::{
-    connection::{Connection, ConnectionBuilder, ConnectionState},
+    connection::ConnectionBuilder,
     error::Code,
     pool::Pool,
-    protocol::Protocols,
-    quic::{self, ConnectionError, GetStreamIdExt, agent},
+    quic::{self, GetStreamIdExt},
     stream_id::StreamId,
 };
 
@@ -26,50 +25,6 @@ mod servers_router;
 pub use servers_router::{ServersRouter, ServersRouterDispatchError};
 mod service;
 pub use service::{BoxService, BoxServiceFuture, IntoBoxService, Service, box_service};
-
-/// Type-erased view of a server-side h3 connection.
-///
-/// [`UnresolvedRequest`] carries an `Arc<dyn ServerConnection>` so the
-/// request-handling pipeline does not need to be parameterised over the
-/// underlying QUIC connection type. All accessors that used to live on
-/// [`UnresolvedRequest`] (agents, protocols) are reachable through this
-/// trait — they ultimately delegate to the wrapped
-/// [`Connection`](crate::connection::Connection)/[`ConnectionState`].
-///
-/// Agents are backed by a watch channel on the underlying QUIC connection,
-/// so re-fetching them per request is cheap.
-pub trait ServerConnection: Send + Sync + 'static {
-    /// Local TLS identity presented to the peer during the handshake.
-    fn local_agent(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::LocalAgent>>, ConnectionError>>;
-
-    /// Peer TLS identity, when client authentication is configured.
-    fn remote_agent(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::RemoteAgent>>, ConnectionError>>;
-
-    /// Connection-scoped protocol registry.
-    fn protocols(&self) -> &Arc<Protocols>;
-}
-
-impl<C: quic::Connection> ServerConnection for Connection<C> {
-    fn local_agent(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::LocalAgent>>, ConnectionError>> {
-        Box::pin(ConnectionState::local_agent(self))
-    }
-
-    fn remote_agent(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::RemoteAgent>>, ConnectionError>> {
-        Box::pin(ConnectionState::remote_agent(self))
-    }
-
-    fn protocols(&self) -> &Arc<Protocols> {
-        ConnectionState::protocols(self)
-    }
-}
 
 #[derive(Debug)]
 pub struct Servers<L: quic::Listen, S> {
@@ -218,7 +173,9 @@ where
                     stream_id: StreamId(stream_id),
                     read_stream,
                     write_stream,
-                    connection: connection.clone() as Arc<dyn ServerConnection>,
+                    // Erase the concrete `C` so the request-handling pipeline
+                    // stays monomorphic in the service type only.
+                    connection: Arc::new(connection.erase()),
                 };
 
                 let handle_request = async move {

@@ -271,10 +271,20 @@ impl<C: Any> PartialEq for ConnectionBuilder<C> {
 
 impl<C: Any> Eq for ConnectionBuilder<C> {}
 
-#[derive(Debug)]
 pub struct ConnectionState<C: ?Sized> {
     quic: Arc<C>,
     protocols: Arc<Protocols>,
+}
+
+// Manual `Debug` so that `ConnectionState<dyn DynConnection>` (which does not
+// implement `Debug`) is still formattable. `quic` is intentionally omitted
+// because most `dyn` connections do not implement `Debug`.
+impl<C: ?Sized> fmt::Debug for ConnectionState<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionState")
+            .field("protocols", &self.protocols)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<C: ?Sized> ConnectionState<C> {
@@ -291,7 +301,27 @@ impl<C: ?Sized> ConnectionState<C> {
     }
 }
 
-impl<C: quic::DynLifecycle> ConnectionState<C> {
+impl<C: quic::Connection> ConnectionState<C> {
+    /// Erase the concrete QUIC connection type, yielding a state that is
+    /// usable as `ConnectionState<dyn quic::DynConnection>`.
+    ///
+    /// Used on the server path so that [`UnresolvedRequest`](crate::server::UnresolvedRequest)
+    /// can carry a single type-erased connection handle regardless of the
+    /// underlying QUIC implementation.
+    #[must_use]
+    pub fn erase(&self) -> ConnectionState<dyn quic::DynConnection> {
+        // `Arc<C>` coerces to `Arc<dyn DynConnection>` because `C: Connection`
+        // implies `C: DynConnection + Sized + 'static` via the blanket impl in
+        // [`crate::quic`].
+        let quic: Arc<dyn quic::DynConnection> = self.quic.clone();
+        ConnectionState {
+            quic,
+            protocols: self.protocols.clone(),
+        }
+    }
+}
+
+impl<C: ?Sized + quic::DynLifecycle> ConnectionState<C> {
     pub fn check(&self) -> Result<(), quic::ConnectionError> {
         self.quic.check()
     }
@@ -328,23 +358,22 @@ impl<C: quic::ManageStream + quic::Lifecycle + Sync> ConnectionState<C> {
     }
 }
 
-impl<C: quic::WithLocalAgent> ConnectionState<C> {
+impl<C: ?Sized + quic::DynWithLocalAgent> ConnectionState<C> {
     pub async fn local_agent(
         &self,
     ) -> Result<Option<Arc<dyn agent::LocalAgent>>, quic::ConnectionError> {
-        quic::WithLocalAgent::local_agent(&*self.quic)
-            .await
-            .map(|opt| opt.map(|a| Arc::new(a) as Arc<dyn agent::LocalAgent>))
+        // Goes through the object-safe trait so that this impl applies
+        // uniformly to both sized `C: WithLocalAgent` (via the blanket impl)
+        // and `dyn DynConnection`.
+        quic::DynWithLocalAgent::local_agent(&*self.quic).await
     }
 }
 
-impl<C: quic::WithRemoteAgent> ConnectionState<C> {
+impl<C: ?Sized + quic::DynWithRemoteAgent> ConnectionState<C> {
     pub async fn remote_agent(
         &self,
     ) -> Result<Option<Arc<dyn agent::RemoteAgent>>, quic::ConnectionError> {
-        quic::WithRemoteAgent::remote_agent(&*self.quic)
-            .await
-            .map(|opt| opt.map(|a| Arc::new(a) as Arc<dyn agent::RemoteAgent>))
+        quic::DynWithRemoteAgent::remote_agent(&*self.quic).await
     }
 }
 

@@ -11,6 +11,7 @@ use snafu::Report;
 use tracing::Instrument;
 
 use crate::{
+    connection::ConnectionState,
     error::Code,
     message::{
         stream::{MessageStreamError, ReadStream, WriteStream},
@@ -18,8 +19,7 @@ use crate::{
     },
     protocol::Protocols,
     qpack::field::{Protocol, PseudoHeaders},
-    quic::agent,
-    server::ServerConnection,
+    quic::{self, agent},
     stream_id::StreamId,
 };
 
@@ -38,8 +38,11 @@ pub struct UnresolvedRequest {
     pub read_stream: ReadStream,
     /// Outgoing response stream — handed to the [`Response`] on resolve.
     pub write_stream: WriteStream,
-    /// Owning h3 connection. Provides agents + protocol registry.
-    pub connection: Arc<dyn ServerConnection>,
+    /// Owning h3 connection. Type-erased so the request-handling pipeline
+    /// stays independent of the concrete QUIC implementation; all accessors
+    /// that used to live on [`UnresolvedRequest`] (agents, protocol
+    /// registry) are reachable through the underlying [`ConnectionState`].
+    pub connection: Arc<ConnectionState<dyn quic::DynConnection>>,
 }
 
 impl UnresolvedRequest {
