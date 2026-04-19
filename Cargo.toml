@@ -58,6 +58,8 @@ nix = { version = "0.29", default-features = false, optional = true, features = 
 smallvec = { version = "1", optional = true }
 
 # feature endpoint
+arc-swap = { version = "1", optional = true }
+async-channel = { version = "2", optional = true }
 derive_more = { version = "2", optional = true, features = [
     "deref",
     "deref_mut",
@@ -70,10 +72,12 @@ peg = { version = "0.8", optional = true }
 
 
 [features]
-default = ["dquic", "hyper"]
+default = ["dquic", "hyper", "endpoint"]
 dquic = ["dep:dquic"]
 endpoint = [
     "dquic",
+    "dep:arc-swap",
+    "dep:async-channel",
     "dep:derive_more",
     "dep:either",
     "dep:globset",

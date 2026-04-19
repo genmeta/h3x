@@ -64,11 +64,9 @@ fn client_webpki_verifier() -> Arc<WebPkiServerVerifier> {
 fn test_network() -> Arc<Network> {
     // Each test uses its own `QuicRouter` so that parallel tests do not
     // stomp on each other's connectionless dispatcher.
-    Arc::new(
-        Network::builder()
-            .quic_router(Arc::new(QuicRouter::new()))
-            .build(),
-    )
+    Network::builder()
+        .quic_router(Arc::new(QuicRouter::new()))
+        .build()
 }
 
 #[test]
@@ -140,5 +138,123 @@ fn serve_and_connect_hello() {
             .await
             .expect("failed to read response body");
         assert_eq!(body, "hello from endpoint");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// bind_server semantics
+// ---------------------------------------------------------------------------
+
+fn named_with(name: &str) -> Arc<NamedIdentity> {
+    let certs: Vec<CertificateDer<'static>> = SERVER_CERT.to_certificate();
+    let key: PrivateKeyDer<'static> = SERVER_KEY.to_private_key();
+    Arc::new(NamedIdentity {
+        name: Arc::from(name),
+        certs,
+        key: Arc::new(key),
+    })
+}
+
+#[test]
+fn bind_server_sni_in_use() {
+    run("bind_server_sni_in_use", async move {
+        let network = test_network();
+        let a = named_with("localhost");
+        let b = named_with("localhost");
+        let _first = network
+            .bind_server(a, ServerQuicConfig::default())
+            .await
+            .expect("first bind succeeds");
+        let err = network
+            .bind_server(b, ServerQuicConfig::default())
+            .await
+            .expect_err("second bind with different identity must fail");
+        assert!(
+            matches!(err, h3x::endpoint::BindServerError::SniInUse { .. }),
+            "unexpected error: {err:?}"
+        );
+    });
+}
+
+#[test]
+fn bind_server_reuses_identity() {
+    run("bind_server_reuses_identity", async move {
+        let network = test_network();
+        let id = named_with("localhost");
+        let first = network
+            .bind_server(id.clone(), ServerQuicConfig::default())
+            .await
+            .expect("first bind succeeds");
+        let second = network
+            .bind_server(id.clone(), ServerQuicConfig::default())
+            .await
+            .expect("same identity must reuse binding");
+        assert_eq!(first.name, second.name);
+    });
+}
+
+#[test]
+fn bind_server_config_conflict() {
+    run("bind_server_config_conflict", async move {
+        let network = test_network();
+        let a = named_with("alpha");
+        let b = named_with("beta");
+
+        let cfg_a = ServerQuicConfig::default();
+        let cfg_b = {
+            let own = h3x::endpoint::ServerOnlyConfig {
+                alpns: vec![b"altproto".to_vec()],
+                ..Default::default()
+            };
+            ServerQuicConfig {
+                common: Arc::default(),
+                own: Arc::new(own),
+            }
+        };
+
+        let _held = network
+            .bind_server(a, cfg_a)
+            .await
+            .expect("first bind succeeds");
+        let err = network
+            .bind_server(b, cfg_b)
+            .await
+            .expect_err("incompatible server config must fail");
+        assert!(
+            matches!(err, h3x::endpoint::BindServerError::ServerConfigConflict),
+            "unexpected error: {err:?}"
+        );
+    });
+}
+
+#[test]
+fn bind_server_slot_auto_reset() {
+    run("bind_server_slot_auto_reset", async move {
+        let network = test_network();
+
+        let cfg_a = ServerQuicConfig::default();
+        let cfg_b = {
+            let own = h3x::endpoint::ServerOnlyConfig {
+                alpns: vec![b"altproto".to_vec()],
+                ..Default::default()
+            };
+            ServerQuicConfig {
+                common: Arc::default(),
+                own: Arc::new(own),
+            }
+        };
+
+        {
+            let _first = network
+                .bind_server(named_with("alpha"), cfg_a)
+                .await
+                .expect("first bind succeeds");
+        }
+        // After the binding drops the slot should clear, allowing a new
+        // incompatible config to install.
+        let _second = network
+            .bind_server(named_with("beta"), cfg_b)
+            .await
+            .expect("slot should auto-reset after last binding dropped");
     });
 }

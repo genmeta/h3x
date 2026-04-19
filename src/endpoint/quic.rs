@@ -1,34 +1,16 @@
-//! QUIC-only endpoint built directly on the [`qconnection`](crate::dquic::qconnection)
-//! builder API.
-//!
-//! [`QuicEndpoint`] pairs a shared [`Network`] with a TLS [`Identity`] and
-//! role-specific QUIC configuration. Each call to [`connect`](Self::connect)
-//! constructs a fresh [`Connection`] through the qconnection builder; for
-//! inbound traffic the endpoint installs a per-router connectionless
-//! dispatcher on first call to [`accept`](Self::accept).
-//!
-//! No `QuicClient` / `QuicListeners` instance is held internally — those types
-//! are deliberately not used so endpoint state is not coupled to a single
-//! pre-baked client/listener instance. TLS configurations are cached in
-//! [`OnceLock`](std::sync::OnceLock) so each endpoint builds them at most once.
+//! QUIC-only endpoint built on top of a shared [`Network`].
 
-use std::sync::{
-    Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use futures::StreamExt;
-use rustls::{
-    ClientConfig, ServerConfig, pki_types::PrivateKeyDer, server::ResolvesServerCert,
-    sign::CertifiedKey,
-};
+use rustls::{ClientConfig, pki_types::PrivateKeyDer};
 use snafu::{ResultExt, Snafu};
-use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
     config::{ClientQuicConfig, ServerCertVerifierChoice, ServerQuicConfig},
-    identity::Identity,
-    network::Network,
+    identity::{Identity, NamedIdentity},
+    network::{BindServerError, Network, ServerBinding},
 };
 use crate::{
     dquic::{
@@ -40,18 +22,13 @@ use crate::{
                 addr::{AddrKind, BoundAddr, EndpointAddr, SocketEndpointAddr},
                 route::{Link, Pathway},
             },
-            packet::{DataHeader, GetDcid, Packet, long::DataHeader as LongHeader},
         },
-        qinterface::{bind_uri::BindUri, component::route::Way, io::IO},
+        qinterface::{bind_uri::BindUri, io::IO},
         qresolve::Source,
     },
     quic,
     util::tls::DangerousServerCertVerifier,
 };
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
 
 /// Error building the client-side TLS configuration.
 #[derive(Debug, Snafu)]
@@ -59,71 +36,67 @@ use crate::{
 pub enum BuildClientTlsError {
     /// rustls failed to choose a supported protocol version.
     #[snafu(display("failed to select TLS protocol version"))]
-    Version { source: rustls::Error },
+    Version {
+        /// Underlying rustls error.
+        source: rustls::Error,
+    },
     /// rustls refused the provided client certificate / key.
     #[snafu(display("failed to load client authentication certificate"))]
-    ClientAuth { source: rustls::Error },
+    ClientAuth {
+        /// Underlying rustls error.
+        source: rustls::Error,
+    },
 }
 
-/// Error building the server-side TLS configuration.
-#[derive(Debug, Snafu)]
-#[snafu(module, visibility(pub))]
-pub enum BuildServerTlsError {
-    /// The endpoint identity is anonymous and cannot serve TLS.
-    #[snafu(display("cannot build server TLS with an anonymous identity"))]
-    Anonymous,
-    /// rustls failed to choose a supported protocol version.
-    #[snafu(display("failed to select TLS protocol version"))]
-    Version { source: rustls::Error },
-    /// Loading the private key material failed.
-    #[snafu(display("failed to load server private key"))]
-    LoadKey { source: rustls::Error },
-}
-
-/// Error returned by [`QuicEndpoint::connect`](quic::Connect::connect).
+/// Error returned by [`QuicEndpoint`] when opening an outbound connection.
 #[derive(Debug, Snafu)]
 #[snafu(module, visibility(pub))]
 pub enum ConnectError {
     /// Failed to build the client TLS configuration.
     #[snafu(display("failed to build client TLS config"))]
-    Tls { source: BuildClientTlsError },
+    Tls {
+        /// Underlying build error.
+        source: BuildClientTlsError,
+    },
     /// DNS resolution failed.
     #[snafu(display("dns lookup failed"))]
-    Dns { source: std::io::Error },
+    Dns {
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
     /// The resolver produced no reachable endpoint.
     #[snafu(display("no reachable endpoint found for server"))]
     NoReachableEndpoint,
     /// Failed to acquire a local interface for the discovered endpoint.
     #[snafu(display("failed to bind local interface"))]
-    BindInterface { source: std::io::Error },
+    BindInterface {
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
 }
 
-/// Error returned by [`QuicEndpoint::accept`](quic::Listen::accept).
+/// Error returned by [`QuicEndpoint`] when awaiting an inbound connection.
 #[derive(Debug, Snafu)]
 #[snafu(module, visibility(pub))]
 pub enum AcceptError {
-    /// Failed to build the server TLS configuration.
-    #[snafu(display("failed to build server TLS config"))]
-    Tls { source: BuildServerTlsError },
-    /// Another endpoint already owns the connectionless dispatcher of this
-    /// network's QUIC router.
-    #[snafu(display("connectionless dispatcher already installed on this network"))]
-    DispatcherInUse,
+    /// The endpoint's identity is anonymous — no SNI to register.
+    #[snafu(display("cannot accept connections on an anonymous identity"))]
+    ServerUnavailable,
+    /// Registering the identity on the network failed.
+    #[snafu(display("failed to bind server on network"))]
+    BindServer {
+        /// Underlying network error.
+        source: BindServerError,
+    },
     /// The endpoint has been shut down.
     #[snafu(display("endpoint has been shut down"))]
     Shutdown,
 }
 
-/// Back-compat alias — kept so public re-exports from `endpoint::mod` remain
-/// stable. Prefer [`ConnectError`] or [`AcceptError`] in new code.
+/// Back-compat alias.
 pub type EndpointError = ConnectError;
 
-// ---------------------------------------------------------------------------
-// QuicEndpoint
-// ---------------------------------------------------------------------------
-
-/// A QUIC-only endpoint.
-#[derive(Clone)]
+/// A QUIC-only endpoint backed by a shared [`Network`].
 pub struct QuicEndpoint {
     /// Shared network infrastructure.
     pub network: Arc<Network>,
@@ -135,20 +108,47 @@ pub struct QuicEndpoint {
     pub client: ClientQuicConfig,
     /// Server-side configuration.
     pub server: ServerQuicConfig,
-    /// Cached TLS configurations and server state.
-    inner: Arc<QuicEndpointInner>,
+    client_tls_cache: ArcSwapOption<CachedClientTls>,
+    server_binding_cache: ArcSwapOption<CachedServerBinding>,
 }
 
-struct QuicEndpointInner {
-    client_tls: OnceLock<Arc<ClientConfig>>,
-    server_tls: OnceLock<Arc<ServerConfig>>,
-    server_state: ServerState,
+struct CachedClientTls {
+    key: ClientCacheKey,
+    config: Arc<ClientConfig>,
 }
 
-struct ServerState {
-    accept_rx: Mutex<Option<Receiver<Arc<Connection>>>>,
-    installed: AtomicBool,
-    tx_keepalive: Mutex<Option<mpsc::Sender<Arc<Connection>>>>,
+#[derive(PartialEq, Eq)]
+struct ClientCacheKey {
+    identity_ptr: usize,
+    client_own_ptr: usize,
+    client_common_ptr: usize,
+}
+
+struct CachedServerBinding {
+    key: ServerCacheKey,
+    binding: ServerBinding,
+}
+
+#[derive(PartialEq, Eq)]
+struct ServerCacheKey {
+    network_ptr: usize,
+    identity_ptr: usize,
+    server_own_ptr: usize,
+    server_common_ptr: usize,
+}
+
+impl Clone for QuicEndpoint {
+    fn clone(&self) -> Self {
+        Self {
+            network: self.network.clone(),
+            identity: self.identity.clone(),
+            resolver: self.resolver.clone(),
+            client: self.client.clone(),
+            server: self.server.clone(),
+            client_tls_cache: ArcSwapOption::empty(),
+            server_binding_cache: ArcSwapOption::empty(),
+        }
+    }
 }
 
 impl QuicEndpoint {
@@ -167,43 +167,50 @@ impl QuicEndpoint {
             resolver,
             client,
             server,
-            inner: Arc::new(QuicEndpointInner {
-                client_tls: OnceLock::new(),
-                server_tls: OnceLock::new(),
-                server_state: ServerState {
-                    accept_rx: Mutex::new(None),
-                    installed: AtomicBool::new(false),
-                    tx_keepalive: Mutex::new(None),
-                },
-            }),
+            client_tls_cache: ArcSwapOption::empty(),
+            server_binding_cache: ArcSwapOption::empty(),
+        }
+    }
+
+    fn client_cache_key(&self) -> ClientCacheKey {
+        ClientCacheKey {
+            identity_ptr: identity_ptr(&self.identity),
+            client_own_ptr: Arc::as_ptr(&self.client.own) as usize,
+            client_common_ptr: Arc::as_ptr(&self.client.common) as usize,
+        }
+    }
+
+    fn server_cache_key(&self) -> ServerCacheKey {
+        ServerCacheKey {
+            network_ptr: Arc::as_ptr(&self.network) as usize,
+            identity_ptr: identity_ptr(&self.identity),
+            server_own_ptr: Arc::as_ptr(&self.server.own) as usize,
+            server_common_ptr: Arc::as_ptr(&self.server.common) as usize,
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// TLS construction (cached in OnceLock)
-// ---------------------------------------------------------------------------
+fn identity_ptr(identity: &Identity) -> usize {
+    match identity {
+        Identity::Anonymous => 0,
+        Identity::Named(id) => Arc::as_ptr(id) as usize,
+    }
+}
 
 impl QuicEndpoint {
     fn client_tls(&self) -> Result<Arc<ClientConfig>, BuildClientTlsError> {
-        if let Some(cfg) = self.inner.client_tls.get() {
-            return Ok(cfg.clone());
+        let key = self.client_cache_key();
+        if let Some(cached) = self.client_tls_cache.load_full()
+            && cached.key == key
+        {
+            return Ok(cached.config.clone());
         }
-        let cfg = self.build_client_tls()?;
-        let cfg = Arc::new(cfg);
-        // First writer wins; other threads get the same Arc back.
-        let stored = self.inner.client_tls.get_or_init(|| cfg.clone()).clone();
-        Ok(stored)
-    }
-
-    fn server_tls(&self) -> Result<Arc<ServerConfig>, BuildServerTlsError> {
-        if let Some(cfg) = self.inner.server_tls.get() {
-            return Ok(cfg.clone());
-        }
-        let cfg = self.build_server_tls()?;
-        let cfg = Arc::new(cfg);
-        let stored = self.inner.server_tls.get_or_init(|| cfg.clone()).clone();
-        Ok(stored)
+        let config = Arc::new(self.build_client_tls()?);
+        self.client_tls_cache.store(Some(Arc::new(CachedClientTls {
+            key,
+            config: config.clone(),
+        })));
+        Ok(config)
     }
 
     fn build_client_tls(&self) -> Result<ClientConfig, BuildClientTlsError> {
@@ -233,48 +240,7 @@ impl QuicEndpoint {
         tls.enable_early_data = self.client.common.enable_0rtt;
         Ok(tls)
     }
-
-    fn build_server_tls(&self) -> Result<ServerConfig, BuildServerTlsError> {
-        use build_server_tls_error::{LoadKeySnafu, VersionSnafu};
-
-        let named = match &self.identity {
-            Identity::Anonymous => return Err(BuildServerTlsError::Anonymous),
-            Identity::Named(id) => id.clone(),
-        };
-        const TLS13: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
-        let provider = ServerConfig::builder().crypto_provider().clone();
-        let builder = ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(TLS13)
-            .context(VersionSnafu)?;
-
-        let key = provider
-            .key_provider
-            .load_private_key(clone_key(&named.key))
-            .context(LoadKeySnafu)?;
-        let certified_key = Arc::new(CertifiedKey {
-            cert: named.certs.clone(),
-            key,
-            ocsp: None,
-        });
-        let resolver = Arc::new(SingleSniResolver {
-            name: named.name.clone(),
-            key: certified_key,
-        });
-
-        let mut tls = builder
-            .with_client_cert_verifier(self.server.own.client_cert_verifier.clone())
-            .with_cert_resolver(resolver);
-        tls.alpn_protocols.clone_from(&self.server.own.alpns);
-        if self.server.common.enable_0rtt {
-            tls.max_early_data_size = 0xffff_ffff;
-        }
-        Ok(tls)
-    }
 }
-
-// ---------------------------------------------------------------------------
-// Client-side construction
-// ---------------------------------------------------------------------------
 
 impl QuicEndpoint {
     fn build_client_connection(
@@ -297,12 +263,6 @@ impl QuicEndpoint {
             .run()
     }
 
-    /// Register a peer endpoint on the connection and (for direct endpoints)
-    /// bind a matching local interface and attach a path.
-    ///
-    /// Returns `true` when at least one direct [`Path`](crate::dquic::qconnection::path::Path)
-    /// was added. Agent endpoints return `false` — the puncher adds paths
-    /// asynchronously after STUN discovery.
     async fn setup_server_endpoint(
         &self,
         connection: &Connection,
@@ -339,120 +299,33 @@ impl QuicEndpoint {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Server-side: connectionless dispatcher
-// ---------------------------------------------------------------------------
-
 impl QuicEndpoint {
-    fn ensure_server_dispatcher(&self) -> Result<(), AcceptError> {
-        use accept_error::TlsSnafu;
+    async fn server_binding(&self) -> Result<ServerBinding, AcceptError> {
+        use accept_error::BindServerSnafu;
 
-        if self.inner.server_state.installed.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
-        let tls = self.server_tls().context(TlsSnafu)?;
-        let backlog = self.server.own.backlog.max(1);
-        let (tx, rx) = mpsc::channel(backlog);
-
-        *self.inner.server_state.accept_rx.lock().unwrap() = Some(rx);
-        *self.inner.server_state.tx_keepalive.lock().unwrap() = Some(tx.clone());
-
-        let endpoint = self.clone();
-        let installed =
-            self.network
-                .quic_router()
-                .on_connectless_packets(move |packet: Packet, way: Way| {
-                    endpoint.dispatch_initial_packet(packet, way, tls.clone(), tx.clone());
-                });
-        if !installed {
-            *self.inner.server_state.accept_rx.lock().unwrap() = None;
-            *self.inner.server_state.tx_keepalive.lock().unwrap() = None;
-            return Err(AcceptError::DispatcherInUse);
-        }
-        self.inner
-            .server_state
-            .installed
-            .store(true, Ordering::Release);
-        Ok(())
-    }
-
-    /// Handle a connectionless packet hot-path callback: extract the origin
-    /// DCID and spawn an async task that builds the connection, delivers the
-    /// initial packet, and publishes the accepted connection.
-    ///
-    /// All heavy work (TLS clone, Connection construction, deliver, server
-    /// name wait) happens inside [`tokio::spawn`] so the router callback
-    /// returns immediately.
-    fn dispatch_initial_packet(
-        &self,
-        packet: Packet,
-        way: Way,
-        tls: Arc<ServerConfig>,
-        tx: mpsc::Sender<Arc<Connection>>,
-    ) {
-        let origin_dcid = match &packet {
-            Packet::Data(data_packet) => match &data_packet.header {
-                DataHeader::Long(LongHeader::Initial(hdr)) => *hdr.dcid(),
-                DataHeader::Long(LongHeader::ZeroRtt(hdr)) => *hdr.dcid(),
-                _ => return,
-            },
-            _ => return,
+        let named = match &self.identity {
+            Identity::Anonymous => return Err(AcceptError::ServerUnavailable),
+            Identity::Named(id) => id.clone(),
         };
-        if origin_dcid.is_empty() {
-            return;
+        let key = self.server_cache_key();
+        if let Some(cached) = self.server_binding_cache.load_full()
+            && cached.key == key
+        {
+            return Ok(cached.binding.clone());
         }
-
-        let endpoint = self.clone();
-        tokio::spawn(async move {
-            // `Connection::run()` registers the DCID with the QUIC router
-            // *synchronously* before returning, so the subsequent `deliver`
-            // is guaranteed to route this very packet to the new connection
-            // rather than re-entering the connectionless dispatcher.
-            let connection = Connection::new_server(endpoint.server.own.token_provider.clone())
-                .with_parameters(endpoint.server.own.parameters.clone())
-                .with_client_auther(Box::new(endpoint.server.own.client_auther.clone()))
-                .with_tls_config((*tls).clone())
-                .with_streams_concurrency_strategy(
-                    endpoint.server.common.stream_strategy_factory.as_ref(),
-                )
-                .with_zero_rtt(tls.max_early_data_size == 0xffff_ffff)
-                .with_iface_factory(endpoint.network.io_factory().clone())
-                .with_iface_manager(endpoint.network.iface_manager().clone())
-                .with_quic_router(endpoint.network.quic_router().clone())
-                .with_locations(endpoint.network.locations().clone())
-                .with_defer_idle_timeout(endpoint.server.common.defer_idle_timeout)
-                .with_cids(origin_dcid)
-                .with_qlog(endpoint.server.common.qlogger.clone())
-                .run();
-
-            endpoint.network.quic_router().deliver(packet, way).await;
-            match connection.server_name().await {
-                Ok(_name) => {
-                    let _ = connection.subscribe_local_address();
-                    // Bounded send — drops the connection if the backlog is
-                    // saturated, matching dquic's semaphore-based backpressure.
-                    if tx.try_send(connection).is_err() {
-                        tracing::debug!(
-                            target: "h3x::endpoint",
-                            "accept backlog full or endpoint shut down, dropping connection"
-                        );
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        target: "h3x::endpoint",
-                        "failed to accept connection: {error}"
-                    );
-                }
-            }
-        });
+        let binding = self
+            .network
+            .bind_server(named as Arc<NamedIdentity>, self.server.clone())
+            .await
+            .context(BindServerSnafu)?;
+        self.server_binding_cache
+            .store(Some(Arc::new(CachedServerBinding {
+                key,
+                binding: binding.clone(),
+            })));
+        Ok(binding)
     }
 }
-
-// ---------------------------------------------------------------------------
-// trait impls
-// ---------------------------------------------------------------------------
 
 impl quic::Connect for QuicEndpoint {
     type Connection = Connection;
@@ -475,19 +348,9 @@ impl quic::Connect for QuicEndpoint {
 
         let connection = self.build_client_connection(&server_str, tls);
         if connection.subscribe_local_address().is_err() {
-            // connection already closed — return immediately (not a connect
-            // error, the caller will observe the closure via any subsequent
-            // stream/datagram operation).
             return Ok(connection);
         }
 
-        // Consume the DNS stream until we have at least one path added, or
-        // exhaust all endpoints.
-        //
-        // - `Ok(true)`  → direct path added, connection lifecycle started.
-        // - `Ok(false)` → agent endpoint registered; the puncher will build
-        //                 paths asynchronously after STUN. Counts as viable.
-        // - `Err(_)`    → remember the first probe failure as a fallback.
         let mut last_error: Option<ConnectError> = None;
         let mut any_viable = false;
 
@@ -514,9 +377,6 @@ impl quic::Connect for QuicEndpoint {
             return Err(last_error.unwrap_or(ConnectError::NoReachableEndpoint));
         }
 
-        // Background task: drain the rest of the DNS stream for late-arriving
-        // endpoints. Uses a `Weak<Connection>` so this task does not keep the
-        // connection alive when all external callers have dropped their Arc.
         tokio::spawn({
             let weak_connection = Arc::downgrade(&connection);
             let terminated = connection.terminated();
@@ -548,55 +408,20 @@ impl quic::Listen for QuicEndpoint {
     type Error = AcceptError;
 
     async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
-        self.ensure_server_dispatcher()?;
-        // Temporarily take the receiver out so we do not hold any lock
-        // across `.await`. `accept` takes `&mut self`, so no two calls race.
-        let mut rx = self
-            .inner
-            .server_state
-            .accept_rx
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or(AcceptError::Shutdown)?;
-        let msg = rx.recv().await;
-        // Put the receiver back for the next call unless shutdown ran
-        // concurrently and already cleared the slot.
-        let mut guard = self.inner.server_state.accept_rx.lock().unwrap();
-        if guard.is_none() && self.inner.server_state.installed.load(Ordering::Acquire) {
-            *guard = Some(rx);
-        }
-        msg.ok_or(AcceptError::Shutdown)
+        let binding = self.server_binding().await?;
+        binding.recv().await.ok_or(AcceptError::Shutdown)
     }
 
     async fn shutdown(&self) -> Result<(), Self::Error> {
-        if self
-            .inner
-            .server_state
-            .installed
-            .swap(false, Ordering::AcqRel)
-        {
-            self.network.quic_router().drain_connectless();
-            *self.inner.server_state.accept_rx.lock().unwrap() = None;
-            *self.inner.server_state.tx_keepalive.lock().unwrap() = None;
-        }
+        self.server_binding_cache.store(None);
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn clone_key(key: &Arc<PrivateKeyDer<'static>>) -> PrivateKeyDer<'static> {
     key.clone_key()
 }
 
-/// Pick a local [`BindUri`] for the given DNS [`Source`] and target endpoint.
-///
-/// Mirrors `QuicClient::bind_uri_for` so that mDNS endpoints bind on the
-/// discovering NIC and other sources fall back to a wildcard address matching
-/// the endpoint's family.
 fn bind_uri_for(source: &Source, ep: &EndpointAddr) -> BindUri {
     use std::str::FromStr;
 
@@ -619,23 +444,5 @@ fn bind_uri_for(source: &Source, ep: &EndpointAddr) -> BindUri {
                 .alloc_port(),
             _ => unreachable!("BLE and other address kinds are not supported yet"),
         },
-    }
-}
-
-/// rustls `ResolvesServerCert` that returns the configured certificate only
-/// when the client's SNI matches our identity name.
-///
-/// Comparison is ASCII-case-insensitive per RFC 6066 §3.
-#[derive(Debug)]
-struct SingleSniResolver {
-    name: Arc<str>,
-    key: Arc<CertifiedKey>,
-}
-
-impl ResolvesServerCert for SingleSniResolver {
-    fn resolve(&self, client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let sni = client_hello.server_name()?;
-        sni.eq_ignore_ascii_case(self.name.as_ref())
-            .then(|| self.key.clone())
     }
 }

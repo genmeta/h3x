@@ -20,6 +20,7 @@ pub mod h3;
 pub mod identity;
 pub mod network;
 pub mod quic;
+mod sni;
 
 pub use binds::{Bind, BindConflictError, BindHost, Binds};
 pub use config::{
@@ -27,6 +28,6 @@ pub use config::{
     ServerOnlyConfig, ServerQuicConfig,
 };
 pub use h3::H3Endpoint;
-pub use identity::{Identity, NamedIdentity};
-pub use network::{BindsGuard, Network, NetworkBuilder, ServerBinding};
+pub use identity::{Identity, NamedIdentity, ServerName};
+pub use network::{BindServerError, BindsGuard, Network, NetworkBuilder, ServerBinding};
 pub use quic::{AcceptError, ConnectError, EndpointError, QuicEndpoint};
