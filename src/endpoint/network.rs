@@ -479,24 +479,37 @@ impl Network {
             return;
         };
 
+        // IMPORTANT: construct the server `Connection` synchronously so that
+        // the CID route on the shared `QuicRouter` is installed before this
+        // function returns. Otherwise a second Initial packet with the same
+        // ODCID arriving during the async gap would still be dispatched as
+        // "connectionless", spawning another server `Connection` for the
+        // same ODCID — both would attempt to respond with Handshake packets
+        // derived from independent keying state, and the peer would decrypt
+        // later packets with the wrong keys (observed as
+        // "Invalid reserved bits" transport errors).
+        //
+        // Only the genuinely async work (packet delivery + waiting for the
+        // ClientHello / SNI resolution) is spawned below.
+        let cfg = &slot.config;
+        let connection = Connection::new_server(cfg.own.token_provider.clone())
+            .with_parameters(cfg.own.parameters.clone())
+            .with_client_auther(Box::new(cfg.own.client_auther.clone()))
+            .with_tls_config((*slot.rustls_config).clone())
+            .with_streams_concurrency_strategy(cfg.common.stream_strategy_factory.as_ref())
+            .with_zero_rtt(cfg.common.enable_0rtt)
+            .with_iface_factory(self.io_factory.clone())
+            .with_iface_manager(self.iface_manager.clone())
+            .with_quic_router(self.quic_router.clone())
+            .with_locations(self.locations.clone())
+            .with_defer_idle_timeout(cfg.common.defer_idle_timeout)
+            .with_cids(origin_dcid)
+            .with_qlog(cfg.common.qlogger.clone())
+            .run();
+
         let network = self.clone();
         let sni_registry = self.sni_registry.clone();
         let task = async move {
-            let cfg = &slot.config;
-            let connection = Connection::new_server(cfg.own.token_provider.clone())
-                .with_parameters(cfg.own.parameters.clone())
-                .with_client_auther(Box::new(cfg.own.client_auther.clone()))
-                .with_tls_config((*slot.rustls_config).clone())
-                .with_streams_concurrency_strategy(cfg.common.stream_strategy_factory.as_ref())
-                .with_zero_rtt(cfg.common.enable_0rtt)
-                .with_iface_factory(network.io_factory.clone())
-                .with_iface_manager(network.iface_manager.clone())
-                .with_quic_router(network.quic_router.clone())
-                .with_locations(network.locations.clone())
-                .with_defer_idle_timeout(cfg.common.defer_idle_timeout)
-                .with_cids(origin_dcid)
-                .with_qlog(cfg.common.qlogger.clone())
-                .run();
             network.quic_router.deliver(packet, way).await;
             match connection.server_name().await {
                 Ok(name) => {
