@@ -105,12 +105,6 @@ where
     ) -> impl futures::Future<Output = ()> + Send + 'static {
         let pool = self.pool.clone();
         let builder = self.builder.clone();
-        let builder_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            builder.hash(&mut hasher);
-            hasher.finish()
-        };
         let service = self.service.clone();
         let span = tracing::info_span!("handle_connection", server_name = tracing::field::Empty);
         async move {
@@ -137,7 +131,7 @@ where
 
             tracing::Span::current().record("server_name", local_agent.name());
             let connection = Arc::new(connection);
-            _ = pool.try_insert(connection.clone(), builder_hash);
+            _ = pool.try_insert(connection.clone(), builder.clone()).await;
             let mut connection_tasks = JoinSet::new();
 
             loop {

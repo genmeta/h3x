@@ -248,8 +248,21 @@ impl QuicEndpoint {
         server_name: &str,
         tls: Arc<ClientConfig>,
     ) -> Arc<Connection> {
+        // Propagate the endpoint's named identity into the QUIC transport
+        // `ClientName` parameter so the peer can populate its
+        // `remote_agent` (identity-based access control on the server
+        // relies on this).
+        let mut parameters = self.client.own.parameters.clone();
+        if let Identity::Named(named) = &self.identity {
+            parameters
+                .set(
+                    crate::dquic::qbase::param::ParameterId::ClientName,
+                    named.name.to_string(),
+                )
+                .expect("ClientName is a client-only string parameter");
+        }
         Connection::new_client(server_name.to_owned(), self.client.own.token_sink.clone())
-            .with_parameters(self.client.own.parameters.clone())
+            .with_parameters(parameters)
             .with_tls_config((*tls).clone())
             .with_streams_concurrency_strategy(self.client.common.stream_strategy_factory.as_ref())
             .with_zero_rtt(self.client.common.enable_0rtt)

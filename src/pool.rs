@@ -1,7 +1,5 @@
 use std::{
-    collections::hash_map::DefaultHasher,
     error::Error,
-    hash::{Hash, Hasher},
     pin::pin,
     sync::{Arc, LazyLock},
 };
@@ -26,8 +24,8 @@ pub struct ReuseableConnection<C: quic::Connection> {
     task: AsyncMutex<Option<AbortOnDropHandle<()>>>,
 }
 
-type ConnectionIdentifier = (Authority, u64);
-type ReuseableConnections<C> = DashMap<ConnectionIdentifier, Arc<ReuseableConnection<C>>>;
+type ConnectionIdentifier<C> = (Authority, Arc<ConnectionBuilder<C>>);
+type ReuseableConnections<C> = DashMap<ConnectionIdentifier<C>, Arc<ReuseableConnection<C>>>;
 
 impl<C: quic::Connection> ReuseableConnection<C> {
     pub fn pending() -> Self {
@@ -146,7 +144,7 @@ pub enum InsertError {
 }
 
 impl<C: quic::Connection> Pool<C> {
-    fn spawn_try_release(self, identify: ConnectionIdentifier) {
+    fn spawn_try_release(self, identify: ConnectionIdentifier<C>) {
         tokio::spawn(
             async move {
                 (self.connections.as_ref()).remove_if(&identify, |_, connection| {
@@ -171,14 +169,9 @@ impl<C: quic::Connection> Pool<C> {
     where
         Client: quic::Connect<Connection = C>,
     {
-        let builder_hash = {
-            let mut hasher = DefaultHasher::new();
-            builder.hash(&mut hasher);
-            Hasher::finish(&hasher)
-        };
         let reuseable_connection = self
             .connections
-            .entry((server.clone(), builder_hash))
+            .entry((server.clone(), builder.clone()))
             .or_insert_with(|| Arc::new(ReuseableConnection::pending()))
             .clone();
         // break borrow of dashmap::Entry to avoid deadlock
@@ -217,9 +210,10 @@ impl<C: quic::Connection> Pool<C> {
                         let connection = connection.clone();
                         let pool = self.clone();
                         let server = server.clone();
+                        let builder = builder.clone();
                         async move {
                             connection.closed().await;
-                            pool.spawn_try_release((server, builder_hash));
+                            pool.spawn_try_release((server, builder));
                         }
                         .in_current_span()
                     }));
@@ -241,7 +235,7 @@ impl<C: quic::Connection> Pool<C> {
 
         match &result {
             Ok(..) => tracing::trace!("connection ready to use"),
-            Err(..) => self.clone().spawn_try_release((server, builder_hash)),
+            Err(..) => self.clone().spawn_try_release((server, builder.clone())),
         }
 
         result
@@ -250,7 +244,7 @@ impl<C: quic::Connection> Pool<C> {
     pub async fn try_insert(
         &self,
         connection: Arc<Connection<C>>,
-        builder_hash: u64,
+        builder: Arc<ConnectionBuilder<C>>,
     ) -> Result<(), InsertError> {
         let remote_agent = connection
             .remote_agent()
@@ -263,7 +257,7 @@ impl<C: quic::Connection> Pool<C> {
             .ok()
             .context(insert_error::InvalidIdentitySnafu)?;
 
-        let identity = (client, builder_hash);
+        let identity = (client, builder.clone());
         let reuseable_connection = self
             .connections
             .entry(identity.clone())
