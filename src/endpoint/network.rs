@@ -163,7 +163,12 @@ impl<S: network_builder::IsComplete> NetworkBuilder<S> {
 
 struct BindsEntry {
     _reconcile: AbortOnDropHandle<()>,
-    bound_uris: Arc<Mutex<HashMap<String, BindUri>>>,
+    /// Live bindings keyed by [`BindUri::identity_key`]. Holds strong
+    /// [`BindInterface`] references so that the interfaces (and their
+    /// installed components) outlive the `add_binds` call — otherwise
+    /// each bound interface is immediately dropped and removed from the
+    /// [`InterfaceManager`].
+    bound: Arc<Mutex<HashMap<String, (BindUri, BindInterface)>>>,
 }
 
 impl Network {
@@ -318,40 +323,41 @@ impl Network {
         let monitor = self.devices.monitor();
         let initial_uris = binds.to_bind_uris(monitor.interfaces().keys().map(String::as_str))?;
 
-        let bound_uris = Arc::new(Mutex::new(
-            initial_uris
-                .iter()
-                .map(|uri| (uri.identity_key(), uri.clone()))
-                .collect::<HashMap<_, _>>(),
-        ));
-
+        // Bind every initial URI up-front and hold strong
+        // [`BindInterface`] references so the interfaces stay alive for
+        // the lifetime of the returned [`BindsGuard`].
+        let mut initial_bound: HashMap<String, (BindUri, BindInterface)> =
+            HashMap::with_capacity(initial_uris.len());
         for uri in &initial_uris {
-            self.bind(uri.clone()).await;
+            let iface = self.bind(uri.clone()).await;
+            initial_bound.insert(uri.identity_key(), (uri.clone(), iface));
         }
+        let bound = Arc::new(Mutex::new(initial_bound));
 
         let reconcile = {
             let network = self.clone();
-            let bound_uris_bind = bound_uris.clone();
+            let bound_bind = bound.clone();
             let bind_fn = move |uri: BindUri| {
                 let network = network.clone();
-                let bound_uris_bind = bound_uris_bind.clone();
+                let bound_bind = bound_bind.clone();
                 Box::pin(async move {
-                    network.bind(uri.clone()).await;
-                    bound_uris_bind
+                    let iface = network.bind(uri.clone()).await;
+                    bound_bind
                         .lock()
                         .unwrap()
-                        .insert(uri.identity_key(), uri);
+                        .insert(uri.identity_key(), (uri, iface));
                 })
                     as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
             };
 
             let iface_manager_unbind = self.iface_manager.clone();
-            let bound_uris_unbind = bound_uris.clone();
+            let bound_unbind = bound.clone();
             let unbind_fn = move |uri: BindUri| {
-                bound_uris_unbind
-                    .lock()
-                    .unwrap()
-                    .remove(&uri.identity_key());
+                // Drop the strong `BindInterface` held here before asking
+                // the manager to unbind; otherwise the interface would
+                // still be referenced by `bound` and `unbind` could not
+                // fully tear it down.
+                bound_unbind.lock().unwrap().remove(&uri.identity_key());
                 let iface_manager_unbind = iface_manager_unbind.clone();
                 tokio::spawn(async move {
                     iface_manager_unbind.unbind(uri).await;
@@ -366,7 +372,7 @@ impl Network {
             id,
             BindsEntry {
                 _reconcile: reconcile,
-                bound_uris: bound_uris.clone(),
+                bound: bound.clone(),
             },
         );
 
@@ -374,7 +380,7 @@ impl Network {
             id,
             registry: self.bind_registry.clone(),
             iface_manager: self.iface_manager.clone(),
-            bound_uris,
+            bound,
         })
     }
 
@@ -386,11 +392,34 @@ impl Network {
             .values()
             .flat_map(|entry| {
                 entry
-                    .bound_uris
+                    .bound
                     .lock()
                     .unwrap()
                     .values()
-                    .cloned()
+                    .map(|(uri, _)| uri.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Snapshot of the [`BindInterface`]s currently bound via
+    /// [`Network::add_binds`]. Prefer this over
+    /// [`current_bind_uris`](Self::current_bind_uris) +
+    /// [`get_iface`](Self::get_iface) when you need live interface
+    /// references: the latter pair races against interface drops and may
+    /// return fewer interfaces than were just bound.
+    #[must_use]
+    pub fn current_bind_interfaces(&self) -> Vec<BindInterface> {
+        let registry = self.bind_registry.lock().unwrap();
+        registry
+            .values()
+            .flat_map(|entry| {
+                entry
+                    .bound
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .map(|(_, iface)| iface.clone())
                     .collect::<Vec<_>>()
             })
             .collect()
@@ -707,18 +736,20 @@ pub struct BindsGuard {
     id: u64,
     registry: BindRegistry,
     iface_manager: Arc<InterfaceManager>,
-    bound_uris: Arc<Mutex<HashMap<String, BindUri>>>,
+    bound: Arc<Mutex<HashMap<String, (BindUri, BindInterface)>>>,
 }
 
 impl Drop for BindsGuard {
     fn drop(&mut self) {
         self.registry.lock().unwrap().remove(&self.id);
+        // Drop our strong references first so `unbind` can fully tear
+        // down each interface.
         let uris: Vec<BindUri> = self
-            .bound_uris
+            .bound
             .lock()
             .unwrap()
             .drain()
-            .map(|(_, uri)| uri)
+            .map(|(_, (uri, _iface))| uri)
             .collect();
         for uri in uris {
             let iface_manager = self.iface_manager.clone();
