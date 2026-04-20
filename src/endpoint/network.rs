@@ -51,7 +51,7 @@ use dashmap::DashMap;
 use futures::Stream;
 use rustls::{ServerConfig as RustlsServerConfig, sign::CertifiedKey};
 use snafu::{ResultExt, Snafu};
-use tokio::{sync::RwLock, task::JoinSet};
+use tokio::sync::RwLock;
 use tokio_util::task::AbortOnDropHandle;
 
 pub use super::sni::ServerBinding;
@@ -146,8 +146,6 @@ pub struct Network {
     sni_registry: SniRegistry,
     #[builder(skip = RwLock::new(Weak::new()))]
     server_slot: RwLock<Weak<sni::ServerSlotInner>>,
-    #[builder(skip = Mutex::new(JoinSet::new()))]
-    dispatcher_tasks: Mutex<JoinSet<()>>,
     #[builder(skip)]
     dispatcher_installed: OnceLock<()>,
 }
@@ -577,7 +575,11 @@ impl Network {
                 }
             }
         };
-        self.dispatcher_tasks.lock().unwrap().spawn(task);
+        // Detached: the Network lives for the process lifetime and these
+        // tasks are short-lived and self-contained. Previously these were
+        // pushed into a `JoinSet` that nothing ever drained, which leaked
+        // one task-output slot per incoming handshake.
+        tokio::spawn(task);
     }
 
     /// Register a server-side identity on this network.
