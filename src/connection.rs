@@ -17,67 +17,212 @@ use tracing::Instrument;
 use crate::{
     codec::{PeekableStreamReader, SinkWriter, StreamReader},
     dhttp::{protocol::DHttpProtocolFactory, settings::Settings},
-    error::{Code, ErrorScope, H3Error},
+    error::{Code, H3ConnectionError, H3StreamError},
     protocol::{IdentifiedProtocolInitializer, ProductProtocol, Protocols, StreamVerdict},
     qpack::protocol::QPackProtocolFactory,
     quic::{self, CancelStreamExt, StopStreamExt, agent},
     varint::VarInt,
 };
 
+/// H3 connection-level error: a QUIC transport/application error, or an
+/// H3-defined connection-scope protocol violation.
 #[derive(Debug, Snafu, Clone)]
-pub enum StreamError {
+pub enum ConnectionError {
     #[snafu(transparent)]
-    Quic { source: quic::StreamError },
-    #[snafu(transparent)]
-    Code {
-        source: Arc<dyn H3Error + Send + Sync>,
+    Quic { source: quic::ConnectionError },
+    #[snafu(display("h3 connection-scope protocol error"))]
+    #[snafu(context(false))]
+    H3 {
+        source: Arc<dyn H3ConnectionError + 'static>,
     },
 }
 
-impl From<quic::ConnectionError> for StreamError {
-    fn from(value: quic::ConnectionError) -> Self {
-        Self::Quic {
-            source: value.into(),
-        }
-    }
-}
-
-impl StreamError {
-    pub fn map_stream_reset(self, map: impl FnOnce(VarInt) -> Self) -> Self {
-        match self {
-            StreamError::Quic {
-                source: quic::StreamError::Reset { code },
-            } => map(code),
-            error => error,
-        }
-    }
-}
-
-impl<E: H3Error + Send + Sync + 'static> From<E> for StreamError {
+impl<E: H3ConnectionError + 'static> From<E> for ConnectionError {
     fn from(value: E) -> Self {
-        StreamError::Code {
+        ConnectionError::H3 {
             source: Arc::new(value),
         }
     }
 }
 
+impl From<ConnectionError> for io::Error {
+    fn from(value: ConnectionError) -> Self {
+        io::Error::new(io::ErrorKind::BrokenPipe, value)
+    }
+}
+
+/// Recovers a `ConnectionError` from `io::Error`.
+///
+/// Recovery chain: `ConnectionError` (downcast) → `quic::ConnectionError` →
+/// `Arc<dyn H3ConnectionError>`.
+impl From<io::Error> for ConnectionError {
+    fn from(source: io::Error) -> Self {
+        let error = match source.downcast::<ConnectionError>() {
+            Ok(error) => return error,
+            Err(error) => error,
+        };
+        let error = match error.downcast::<quic::ConnectionError>() {
+            Ok(error) => return Self::Quic { source: error },
+            Err(error) => error,
+        };
+        match error.downcast::<Arc<dyn H3ConnectionError + 'static>>() {
+            Ok(error) => Self::H3 { source: error },
+            Err(error) => unreachable!(
+                "io::Error({error:?}) cannot be converted to connection::ConnectionError, \
+                 this is a bug"
+            ),
+        }
+    }
+}
+
+/// Error observed on an H3 stream.
+///
+/// Three variants mirror the semantics of [`quic::StreamError`] but extended
+/// with H3-level protocol errors:
+///
+/// - `Connection` — the underlying connection failed (QUIC transport/application
+///   error, or H3 connection-scope protocol violation). This is the "connection
+///   error projected onto a stream-returning API" case.
+/// - `Reset` — the peer sent `RESET_STREAM` (or locally the stream was reset
+///   with a raw VarInt code).
+/// - `H3` — an H3 stream-scope protocol violation (e.g. malformed message).
+///
+/// # On the missing "pure stream error" type
+///
+/// Algebraically, `{Reset, H3}` forms a pure-stream subset distinct from
+/// `ConnectionError`. We deliberately did **not** introduce a dedicated type
+/// for that subset because:
+///
+/// 1. No current call site needs a type contract that excludes the
+///    `Connection` variant — every `match` on `StreamError` must handle it.
+/// 2. The quic layer below is itself flat (`Connection | Reset`); keeping the
+///    H3 layer flat preserves structural correspondence.
+/// 3. No natural domain term exists for the subset. Candidates considered and
+///    rejected for lack of fit: `PureStreamError`, `LocalStreamError`,
+///    `StreamFault`, `InStreamError`, `StreamScopeError`.
+///
+/// If a future consumer needs the contract ("this cannot be a connection
+/// error"), a 2-variant `{Reset, H3}` type can be added non-breakingly with
+/// `From<_> for StreamError` and `TryFrom<StreamError>` conversions.
+#[derive(Debug, Snafu, Clone)]
+pub enum StreamError {
+    #[snafu(transparent)]
+    Connection { source: ConnectionError },
+    #[snafu(display("stream reset with code {code}"))]
+    Reset { code: VarInt },
+    #[snafu(display("h3 stream-scope protocol error"))]
+    #[snafu(context(false))]
+    H3 {
+        source: Arc<dyn H3StreamError + 'static>,
+    },
+}
+
+impl StreamError {
+    pub fn map_stream_reset(self, map: impl FnOnce(VarInt) -> Self) -> Self {
+        match self {
+            StreamError::Reset { code } => map(code),
+            error => error,
+        }
+    }
+}
+
+impl From<quic::StreamError> for StreamError {
+    fn from(value: quic::StreamError) -> Self {
+        match value {
+            quic::StreamError::Connection { source } => Self::Connection {
+                source: source.into(),
+            },
+            quic::StreamError::Reset { code } => Self::Reset { code },
+        }
+    }
+}
+
+impl From<quic::ConnectionError> for StreamError {
+    fn from(value: quic::ConnectionError) -> Self {
+        Self::Connection {
+            source: value.into(),
+        }
+    }
+}
+
+impl<E: H3StreamError + 'static> From<E> for StreamError {
+    fn from(value: E) -> Self {
+        StreamError::H3 {
+            source: Arc::new(value),
+        }
+    }
+}
+
+/// Registry of [`H3ConnectionError`] types that are allowed to flow into
+/// stream-returning APIs. Each entry generates
+/// `impl From<$ty> for StreamError` that wraps the value into
+/// [`StreamError::Connection`] via [`ConnectionError::from`].
+///
+/// # Why a registry?
+///
+/// Rust coherence forbids two blanket impls
+/// `impl<E: H3StreamError> From<E> for StreamError` and
+/// `impl<E: H3ConnectionError> From<E> for StreamError` from coexisting
+/// because the compiler cannot prove the bounds are mutually exclusive.
+///
+/// Since stream-scope and connection-scope errors are both legitimately
+/// produced by stream-returning operations (a stream can fail with a
+/// connection-level protocol violation), we register each connection-scope
+/// H3 error type here explicitly. The registry acts as a documented opt-in:
+/// adding a new connection-scope H3 type to the registry is the type-level
+/// signal that it may be surfaced through a stream-returning API.
+///
+/// Alternative considered and rejected: requiring every call site to write
+/// `ConnectionError::from(e).into()`. Too noisy at `?` sites.
+macro_rules! h3_connection_error_into_stream_error {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl From<$ty> for StreamError {
+                fn from(value: $ty) -> Self {
+                    Self::Connection {
+                        source: ConnectionError::from(value),
+                    }
+                }
+            }
+        )+
+    };
+}
+
+h3_connection_error_into_stream_error!(
+    crate::error::H3NoError,
+    crate::error::H3StreamCreationError,
+    crate::error::H3CriticalStreamClosed,
+    crate::error::H3FrameUnexpected,
+    crate::error::H3MissingSettings,
+    crate::error::H3GeneralProtocolError,
+    crate::error::H3InternalError,
+    crate::error::H3FrameDecodeError,
+    crate::error::QpackDecompressionFailed,
+    crate::error::H3IdError,
+    crate::dhttp::settings::InvalidSettingValue,
+    crate::qpack::encoder::QPackDecoderStreamError,
+    crate::qpack::decoder::QPackEncoderStreamError,
+    crate::qpack::decoder::InvalidDynamicTableReference,
+);
+
 /// Error converting between `StreamError` and `io::Error`.
 ///
-/// This conversion bridges h3x stream errors through tokio's io::Error boundary.
-/// The `io::Error` is constructed with `io::Error::other()`, preserving the original
-/// `StreamError` as the inner error for later recovery via downcast.
+/// The `StreamError` is preserved as the inner error for later recovery via
+/// downcast. `Reset` maps to `BrokenPipe` to mirror `quic::StreamError`.
 impl From<StreamError> for io::Error {
     fn from(value: StreamError) -> Self {
-        io::Error::other(value)
+        match value {
+            error @ StreamError::Reset { .. } => io::Error::new(io::ErrorKind::BrokenPipe, error),
+            StreamError::Connection { source } => io::Error::from(source),
+            error @ StreamError::H3 { .. } => io::Error::other(error),
+        }
     }
 }
 
 /// Reverse conversion: recovers a `StreamError` from an `io::Error`.
 ///
-/// This is used at codec/stream boundaries where errors pass through
-/// `io::Error`-based interfaces (e.g., `AsyncRead`/`AsyncWrite`).
-/// Recovery attempts: StreamError → quic::StreamError → H3Error (dyn).
-/// If none match, this is a logic error (unreachable).
+/// Recovery chain: `StreamError` (downcast) → `quic::StreamError` →
+/// `ConnectionError` → `Arc<dyn H3StreamError>`.
 impl From<io::Error> for StreamError {
     fn from(source: io::Error) -> Self {
         let error = match source.downcast::<StreamError>() {
@@ -88,8 +233,14 @@ impl From<io::Error> for StreamError {
             Ok(error) => return error.into(),
             Err(error) => error,
         };
-        match error.downcast::<Arc<dyn H3Error + Send + Sync + 'static>>() {
-            Ok(error) => error.into(),
+        let error = match error.downcast::<ConnectionError>() {
+            Ok(error) => {
+                return Self::Connection { source: error };
+            }
+            Err(error) => error,
+        };
+        match error.downcast::<Arc<dyn H3StreamError + 'static>>() {
+            Ok(error) => Self::H3 { source: error },
             Err(error) => unreachable!(
                 "io::Error({error:?}) cannot be converted to connection::StreamError, this is a bug"
             ),
@@ -112,20 +263,18 @@ pub trait LifecycleExt: quic::DynLifecycle + Sync {
     fn handle_stream_error(&self, error: StreamError) -> BoxFuture<'_, quic::StreamError> {
         Box::pin(async move {
             match error {
-                StreamError::Quic { source } => match source {
-                    quic::StreamError::Connection { source } => {
-                        self.handle_connection_error(source).await.into()
-                    }
-                    quic::StreamError::Reset { .. } => source,
-                },
-                StreamError::Code { source } => match source.scope() {
-                    ErrorScope::Stream => quic::StreamError::Reset {
-                        code: source.code().into_inner(),
-                    },
-                    ErrorScope::Connection => {
-                        self.close(source.code(), source.to_string().into());
-                        self.closed().await.into()
-                    }
+                StreamError::Connection {
+                    source: ConnectionError::Quic { source },
+                } => self.handle_connection_error(source).await.into(),
+                StreamError::Connection {
+                    source: ConnectionError::H3 { source },
+                } => {
+                    self.close(source.code(), source.to_string().into());
+                    self.closed().await.into()
+                }
+                StreamError::Reset { code } => quic::StreamError::Reset { code },
+                StreamError::H3 { source } => quic::StreamError::Reset {
+                    code: source.code().into_inner(),
                 },
             }
         })

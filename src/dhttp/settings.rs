@@ -15,7 +15,7 @@ use crate::{
     codec::{DecodeExt, DecodeFrom, DecodeStreamError, EncodeExt, EncodeInto},
     connection::StreamError,
     dhttp::{frame::Frame, stream::UnidirectionalStream},
-    error::{Code, ErrorScope, H3CriticalStreamClosed, H3Error, H3FrameDecodeError},
+    error::{Code, H3ConnectionError, H3CriticalStreamClosed, H3FrameDecodeError},
     quic,
     varint::VarInt,
 };
@@ -65,12 +65,9 @@ pub enum InvalidSettingValue {
     BoolSetting { id: VarInt, value: VarInt },
 }
 
-impl H3Error for InvalidSettingValue {
+impl H3ConnectionError for InvalidSettingValue {
     fn code(&self) -> Code {
         Code::H3_SETTINGS_ERROR
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Connection
     }
 }
 

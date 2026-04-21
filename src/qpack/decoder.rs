@@ -18,7 +18,7 @@ use crate::{
     connection::StreamError,
     dhttp::settings::Settings,
     error::{
-        Code, ErrorScope, H3CriticalStreamClosed, H3Error, H3FrameDecodeError,
+        Code, H3ConnectionError, H3CriticalStreamClosed, H3FrameDecodeError,
         QpackDecompressionFailed,
     },
     qpack::{
@@ -66,12 +66,9 @@ pub enum QPackEncoderStreamError {
     ReferencedDynamicEntryNotExisted { index: u64 },
 }
 
-impl H3Error for QPackEncoderStreamError {
+impl H3ConnectionError for QPackEncoderStreamError {
     fn code(&self) -> Code {
         Code::QPACK_ENCODER_STREAM_ERROR
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Connection
     }
 }
 
@@ -331,12 +328,9 @@ pub enum InvalidDynamicTableReference {
     ReferencedDynamicEntryNotExisted { index: u64 },
 }
 
-impl H3Error for InvalidDynamicTableReference {
+impl H3ConnectionError for InvalidDynamicTableReference {
     fn code(&self) -> Code {
         Code::QPACK_DECOMPRESSION_FAILED
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Connection
     }
 }
 

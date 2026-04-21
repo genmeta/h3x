@@ -83,7 +83,7 @@ impl DecodeStreamError {
     ) -> connection::StreamError {
         match self {
             DecodeStreamError::Decode { source } => map(source),
-            DecodeStreamError::Stream { source } => connection::StreamError::Quic { source },
+            DecodeStreamError::Stream { source } => source.into(),
         }
     }
 
@@ -100,7 +100,7 @@ impl DecodeStreamError {
                 source: quic::StreamError::Reset { code },
             } => map_stream_closed(Some(code)),
             DecodeStreamError::Decode { source } => map_decode_error(source),
-            DecodeStreamError::Stream { source } => connection::StreamError::Quic { source },
+            DecodeStreamError::Stream { source } => source.into(),
         }
     }
 }
@@ -196,7 +196,7 @@ impl EncodeStreamError {
     ) -> connection::StreamError {
         match self {
             EncodeStreamError::Encode { source } => map(source),
-            EncodeStreamError::Stream { source } => connection::StreamError::Quic { source },
+            EncodeStreamError::Stream { source } => source.into(),
         }
     }
 
@@ -210,7 +210,7 @@ impl EncodeStreamError {
             EncodeStreamError::Stream {
                 source: quic::StreamError::Reset { code },
             } => map_stream_closed(code),
-            EncodeStreamError::Stream { source } => connection::StreamError::Quic { source },
+            EncodeStreamError::Stream { source } => source.into(),
         }
     }
 }

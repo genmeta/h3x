@@ -301,8 +301,8 @@ mod tests {
 
         assert!(matches!(
             error,
-            StreamError::Code {
-                source
+            StreamError::Connection {
+                source: crate::connection::ConnectionError::H3 { source },
             } if source.code() == Code::H3_ID_ERROR
         ));
     }

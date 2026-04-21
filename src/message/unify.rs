@@ -12,7 +12,7 @@ use crate::{
     codec::EncodeError,
     connection::{self, LifecycleExt},
     dhttp::frame::Frame,
-    error::{Code, ErrorScope, H3FrameUnexpected, H3MessageError},
+    error::{Code, H3FrameUnexpected, H3MessageError},
     message::stream::{DEFAULT_COMPRESS_ALGO, MessageStreamError, ReadStream, WriteStream},
     qpack::{
         encoder::EncodeHeaderSectionError,
@@ -269,9 +269,7 @@ impl ReadStream {
     ) -> Result<T, MessageStreamError> {
         self.try_stream_io(async move |this| {
             let result = f(this, message).await;
-            if let Err(connection::StreamError::Code { source }) = &result
-                && source.scope() == ErrorScope::Stream
-            {
+            if let Err(connection::StreamError::H3 { .. }) = &result {
                 message.set_malformed();
             }
             result

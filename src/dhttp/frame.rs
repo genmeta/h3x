@@ -395,7 +395,9 @@ mod tests {
 
         assert!(matches!(
             stream.decode_one::<Frame<_>>().await,
-            Err(StreamError::Code { source }) if source.code() == Code::H3_FRAME_ERROR
+            Err(StreamError::Connection {
+                source: crate::connection::ConnectionError::H3 { source },
+            }) if source.code() == Code::H3_FRAME_ERROR
         ));
     }
 
@@ -409,7 +411,9 @@ mod tests {
 
         assert!(matches!(
             stream.decode_one::<Frame<_>>().await,
-            Err(StreamError::Code { source }) if source.code() == Code::H3_FRAME_ERROR
+            Err(StreamError::Connection {
+                source: crate::connection::ConnectionError::H3 { source },
+            }) if source.code() == Code::H3_FRAME_ERROR
         ));
     }
 

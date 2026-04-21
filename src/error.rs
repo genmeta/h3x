@@ -133,12 +133,9 @@ pub enum H3StreamCreationError {
     DuplicateQpackDecoderStream,
 }
 
-impl H3Error for H3StreamCreationError {
+impl H3ConnectionError for H3StreamCreationError {
     fn code(&self) -> Code {
         Code::H3_STREAM_CREATION_ERROR
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Connection
     }
 }
 
@@ -154,12 +151,9 @@ pub enum H3CriticalStreamClosed {
     Control,
 }
 
-impl H3Error for H3CriticalStreamClosed {
+impl H3ConnectionError for H3CriticalStreamClosed {
     fn code(&self) -> Code {
         Code::H3_CLOSED_CRITICAL_STREAM
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Connection
     }
 }
 
@@ -174,37 +168,38 @@ pub enum H3FrameUnexpected {
     #[snafu(display("unexpected frame during trailer reading"))]
     UnexpectedFrameDuringTrailer,
 }
-impl H3Error for H3FrameUnexpected {
+impl H3ConnectionError for H3FrameUnexpected {
     fn code(&self) -> Code {
         Code::H3_FRAME_UNEXPECTED
     }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Connection
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorScope {
-    Stream,
-    Connection,
 }
 
 // TODO: use Error::provide api in the future
-pub trait H3Error: StdError {
+/// H3 error whose scope is a single stream (will cause `RESET_STREAM`).
+///
+/// Static scope dispatch: types that are always stream-scoped implement this
+/// trait and convert to [`crate::connection::StreamError`] via a blanket
+/// `From` impl.
+pub trait H3StreamError: StdError + Send + Sync {
     fn code(&self) -> Code;
-    fn scope(&self) -> ErrorScope;
+}
+
+/// H3 error whose scope is the whole connection (will cause `CONNECTION_CLOSE`).
+///
+/// Static scope dispatch: types that are always connection-scoped implement
+/// this trait and convert to [`crate::connection::ConnectionError`] via a
+/// blanket `From` impl.
+pub trait H3ConnectionError: StdError + Send + Sync {
+    fn code(&self) -> Code;
 }
 
 #[derive(Debug, Snafu, Clone, Copy)]
 #[snafu(display("no error"))]
 pub struct H3NoError;
 
-impl H3Error for H3NoError {
+impl H3ConnectionError for H3NoError {
     fn code(&self) -> Code {
         Code::H3_NO_ERROR
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Connection
     }
 }
 
@@ -217,12 +212,9 @@ pub enum H3MessageError {
     UnexpectedHeadersInBody,
 }
 
-impl H3Error for H3MessageError {
+impl H3StreamError for H3MessageError {
     fn code(&self) -> Code {
         Code::H3_MESSAGE_ERROR
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Stream
     }
 }
 
@@ -230,12 +222,9 @@ impl H3Error for H3MessageError {
 #[snafu(display("no SETTINGS frame at beginning of control stream"))]
 pub struct H3MissingSettings;
 
-impl H3Error for H3MissingSettings {
+impl H3ConnectionError for H3MissingSettings {
     fn code(&self) -> Code {
         Code::H3_MISSING_SETTINGS
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Connection
     }
 }
 
@@ -249,12 +238,9 @@ pub enum H3GeneralProtocolError {
     Decode { source: crate::codec::DecodeError },
 }
 
-impl H3Error for H3GeneralProtocolError {
+impl H3ConnectionError for H3GeneralProtocolError {
     fn code(&self) -> Code {
         Code::H3_GENERAL_PROTOCOL_ERROR
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Connection
     }
 }
 
@@ -269,12 +255,9 @@ pub enum H3InternalError {
     MissingServerName,
 }
 
-impl H3Error for H3InternalError {
+impl H3ConnectionError for H3InternalError {
     fn code(&self) -> Code {
         Code::H3_INTERNAL_ERROR
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Connection
     }
 }
 
@@ -284,12 +267,9 @@ pub struct H3FrameDecodeError {
     pub source: crate::codec::DecodeError,
 }
 
-impl H3Error for H3FrameDecodeError {
+impl H3ConnectionError for H3FrameDecodeError {
     fn code(&self) -> Code {
         Code::H3_FRAME_ERROR
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Connection
     }
 }
 
@@ -300,12 +280,9 @@ pub enum QpackDecompressionFailed {
     Decode { source: crate::codec::DecodeError },
 }
 
-impl H3Error for QpackDecompressionFailed {
+impl H3ConnectionError for QpackDecompressionFailed {
     fn code(&self) -> Code {
         Code::QPACK_DECOMPRESSION_FAILED
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Connection
     }
 }
 
@@ -316,12 +293,9 @@ pub struct H3ExcessiveFieldSectionSize {
     pub limit: u64,
 }
 
-impl H3Error for H3ExcessiveFieldSectionSize {
+impl H3StreamError for H3ExcessiveFieldSectionSize {
     fn code(&self) -> Code {
         Code::H3_EXCESSIVE_LOAD
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Stream
     }
 }
 
@@ -333,11 +307,8 @@ pub enum H3IdError {
     #[snafu(display("GOAWAY stream ID ordering violation"))]
     GoawayStreamIdOrdering,
 }
-impl H3Error for H3IdError {
+impl H3ConnectionError for H3IdError {
     fn code(&self) -> Code {
         Code::H3_ID_ERROR
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Connection
     }
 }

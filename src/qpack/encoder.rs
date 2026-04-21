@@ -20,9 +20,7 @@ use crate::{
     },
     connection::StreamError,
     dhttp::{frame::Frame, settings::Settings},
-    error::{
-        Code, ErrorScope, H3CriticalStreamClosed, H3Error, H3FrameDecodeError, H3InternalError,
-    },
+    error::{Code, H3ConnectionError, H3CriticalStreamClosed, H3FrameDecodeError, H3InternalError},
     qpack::{
         algorithm::Algorithm,
         decoder::DecoderInstruction,
@@ -78,12 +76,9 @@ pub enum QPackDecoderStreamError {
     IncrementZero,
 }
 
-impl H3Error for QPackDecoderStreamError {
+impl H3ConnectionError for QPackDecoderStreamError {
     fn code(&self) -> Code {
         Code::QPACK_DECODER_STREAM_ERROR
-    }
-    fn scope(&self) -> ErrorScope {
-        ErrorScope::Connection
     }
 }
 

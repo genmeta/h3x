@@ -22,7 +22,7 @@ use crate::{
             DHttpState, InitialRawMessageStreamError,
         },
     },
-    error::{Code, ErrorScope, H3FrameDecodeError, H3FrameUnexpected},
+    error::{Code, H3FrameDecodeError, H3FrameUnexpected},
     qpack::{
         algorithm::{DynamicCompressAlgo, HuffmanAlways},
         encoder::{EncodeHeaderSectionError, Encoder},
@@ -127,9 +127,11 @@ impl ReadStream {
         tokio::select! {
             result = f(self) => match result {
                 Ok(value) => Ok(value),
-                Err(connection::StreamError::Quic { source }) => Err(source.into()),
+                Err(connection::StreamError::Connection {
+                    source: connection::ConnectionError::Quic { source },
+                }) => Err(source.into()),
                 // message from peer is malformed
-                Err(connection::StreamError::Code { source }) if source.scope() == ErrorScope::Stream => {
+                Err(connection::StreamError::H3 { source }) => {
                     _ = self.stream.stop(source.code().into_inner()).await;
                     Err(quic::StreamError::Reset { code: source.code().into_inner() }.into())
                 },
@@ -317,8 +319,10 @@ impl WriteStream {
         tokio::select! {
             result = f(self) => match result {
                 Ok(value) => Ok(value),
-                Err(connection::StreamError::Quic { source }) => Err(source.into()),
-                Err(connection::StreamError::Code { source }) if source.scope() == ErrorScope::Stream => {
+                Err(connection::StreamError::Connection {
+                    source: connection::ConnectionError::Quic { source },
+                }) => Err(source.into()),
+                Err(connection::StreamError::H3 { source }) => {
                     _ = self.stream.cancel(source.code().into_inner()).await;
                     Err(quic::StreamError::Reset { code: source.code().into_inner() }.into())
                 },
