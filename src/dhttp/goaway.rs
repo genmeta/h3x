@@ -42,15 +42,14 @@ where
     async fn decode_from(mut stream: &mut Frame<S>) -> Result<Self, Self::Error> {
         assert!(stream.r#type() == Frame::GOAWAY_FRAME_TYPE);
         let stream_id = stream.decode_one::<VarInt>().await.map_err(|error| {
-            StreamDecodeError::from(error).map_stream_closed(
-                |_reset_code| H3CriticalStreamClosed::Control.into(),
-                |decode_error| {
+            StreamDecodeError::from(error)
+                .escalate_critical_close(|| H3CriticalStreamClosed::Control.into())
+                .into_stream_error(|decode_error| {
                     H3FrameDecodeError {
                         source: decode_error,
                     }
                     .into()
-                },
-            )
+                })
         })?;
 
         // ensure frame is exhausted

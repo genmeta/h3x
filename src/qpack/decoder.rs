@@ -608,15 +608,14 @@ impl<S: AsyncBufRead + Send> DecodeFrom<S> for DecoderInstruction {
             }
         };
         decode.await.map_err(|error: StreamDecodeError| {
-            error.map_stream_closed(
-                |_reset_code| H3CriticalStreamClosed::QPackDecoder.into(),
-                |decode_error| {
+            error
+                .escalate_critical_close(|| H3CriticalStreamClosed::QPackDecoder.into())
+                .into_stream_error(|decode_error| {
                     H3FrameDecodeError {
                         source: decode_error,
                     }
                     .into()
-                },
-            )
+                })
         })
     }
 }

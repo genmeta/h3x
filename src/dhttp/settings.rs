@@ -82,15 +82,14 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for Setting {
             Ok(Setting { id, value })
         };
         let setting = decode.await.map_err(|error: StreamDecodeError| {
-            error.map_stream_closed(
-                |_reset_code| H3CriticalStreamClosed::Control.into(),
-                |decode_error| {
+            error
+                .escalate_critical_close(|| H3CriticalStreamClosed::Control.into())
+                .into_stream_error(|decode_error| {
                     H3FrameDecodeError {
                         source: decode_error,
                     }
                     .into()
-                },
-            )
+                })
         })?;
 
         setting.check()?;

@@ -584,15 +584,14 @@ impl<S: AsyncBufRead + Send> DecodeFrom<S> for EncoderInstruction {
             }
         };
         decode.await.map_err(|error: StreamDecodeError| {
-            error.map_stream_closed(
-                |_reset_code| H3CriticalStreamClosed::QPackEncoder.into(),
-                |decode_error| {
+            error
+                .escalate_critical_close(|| H3CriticalStreamClosed::QPackEncoder.into())
+                .into_stream_error(|decode_error| {
                     H3FrameDecodeError {
                         source: decode_error,
                     }
                     .into()
-                },
-            )
+                })
         })
     }
 }
@@ -648,13 +647,17 @@ where
             }
         };
         encode.await.map_err(|error: StreamEncodeError| {
-            error.map_stream_closed(
-                |_reset_code| H3CriticalStreamClosed::QPackEncoder.into(),
-                |encode_error| {
+            error
+                .escalate_reset(|_code| H3CriticalStreamClosed::QPackEncoder.into())
+                .into_stream_error(|encode_error| {
                     tracing::error!(error = %Report::from_error(&encode_error), "this is likely a bug");
-                    H3InternalError::QPackEncoderEncode { source: StreamEncodeError::Encode { source: encode_error } }.into()
-                },
-            )
+                    H3InternalError::QPackEncoderEncode {
+                        source: StreamEncodeError::Encode {
+                            source: encode_error,
+                        },
+                    }
+                    .into()
+                })
         })
     }
 }

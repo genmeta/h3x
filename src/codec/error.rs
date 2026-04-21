@@ -161,25 +161,29 @@ impl StreamDecodeError {
         }
     }
 
-    /// Convert the codec-level error into a stream-level
-    /// [`connection::StreamError`], treating stream reset and premature EOF
-    /// ([`DecodeError::Incomplete`]) as "stream closed". Used on critical
-    /// streams (RFC 9114 §6.2.1) where both conditions are a connection-level
-    /// protocol violation.
-    pub fn map_stream_closed(
+    /// Escalate both peer-initiated reset and premature EOF
+    /// ([`DecodeError::Incomplete`]) into a single connection-level error.
+    ///
+    /// Use on critical streams (RFC 9114 §6.2.1: control stream, QPACK
+    /// encoder/decoder stream) where any form of stream closure before the
+    /// protocol-level end is itself a connection-level violation.
+    pub fn escalate_critical_close(
         self,
-        on_closed: impl FnOnce(Option<VarInt>) -> connection::StreamError,
-        on_decode: impl FnOnce(DecodeError) -> connection::StreamError,
-    ) -> connection::StreamError {
+        on_closed: impl FnOnce() -> connection::ConnectionError,
+    ) -> ConnectionDecodeError {
         match self {
+            StreamDecodeError::Connection { source } => {
+                ConnectionDecodeError::Connection { source }
+            }
+            StreamDecodeError::Reset { .. } => ConnectionDecodeError::Connection {
+                source: on_closed(),
+            },
             StreamDecodeError::Decode {
                 source: DecodeError::Incomplete,
-            } => on_closed(None),
-            StreamDecodeError::Reset { code } => on_closed(Some(code)),
-            StreamDecodeError::Connection { source } => {
-                connection::StreamError::Connection { source }
-            }
-            StreamDecodeError::Decode { source } => on_decode(source),
+            } => ConnectionDecodeError::Connection {
+                source: on_closed(),
+            },
+            StreamDecodeError::Decode { source } => ConnectionDecodeError::Decode { source },
         }
     }
 }
@@ -326,23 +330,6 @@ impl StreamEncodeError {
                 connection::StreamError::Connection { source }
             }
             StreamEncodeError::Reset { code } => connection::StreamError::Reset { code },
-            StreamEncodeError::Encode { source } => on_encode(source),
-        }
-    }
-
-    /// Convert the codec-level error into a stream-level
-    /// [`connection::StreamError`], treating stream reset as "stream closed".
-    /// Used on critical streams (RFC 9114 §6.2.1).
-    pub fn map_stream_closed(
-        self,
-        on_closed: impl FnOnce(VarInt) -> connection::StreamError,
-        on_encode: impl FnOnce(EncodeError) -> connection::StreamError,
-    ) -> connection::StreamError {
-        match self {
-            StreamEncodeError::Reset { code } => on_closed(code),
-            StreamEncodeError::Connection { source } => {
-                connection::StreamError::Connection { source }
-            }
             StreamEncodeError::Encode { source } => on_encode(source),
         }
     }
