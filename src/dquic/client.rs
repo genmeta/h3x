@@ -88,7 +88,7 @@ impl H3ClientTlsBuilder {
         self
     }
 
-    pub fn with_server_cert_verifier(
+    pub fn with_dangerous_server_cert_verifier(
         mut self,
         verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
     ) -> Self {
