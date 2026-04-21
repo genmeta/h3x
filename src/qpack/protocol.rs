@@ -288,7 +288,15 @@ impl QPackProtocolFactory {
             let receive_instructions = async {
                 loop {
                     if let Err(stream_error) = encoder_clone.receive_instruction().await {
-                        conn_state.handle_stream_error(stream_error).await;
+                        // The instruction stream is a QPACK critical stream;
+                        // any stream-scope failure on it is already promoted
+                        // to a connection-scope error by `receive_instruction`
+                        // (see `QPackEncoderStreamError`). We only need to
+                        // drive connection close for the connection-scope
+                        // case here.
+                        if let StreamError::Connection { source } = stream_error {
+                            conn_state.handle_connection_error(source).await;
+                        }
                         return;
                     }
                 }

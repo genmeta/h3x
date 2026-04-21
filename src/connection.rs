@@ -259,33 +259,36 @@ pub enum ConnectionGoaway {
 
 /// Extension trait providing error-handling helpers on any `Lifecycle` type.
 pub trait LifecycleExt: quic::DynLifecycle + Sync {
-    /// Map h3-level StreamError to quic::StreamError, closing connection for connection-scope errors.
-    fn handle_stream_error(&self, error: StreamError) -> BoxFuture<'_, quic::StreamError> {
-        Box::pin(async move {
-            match error {
-                StreamError::Connection {
-                    source: ConnectionError::Quic { source },
-                } => self.handle_connection_error(source).await.into(),
-                StreamError::Connection {
-                    source: ConnectionError::H3 { source },
-                } => {
-                    self.close(source.code(), source.to_string().into());
-                    self.closed().await.into()
-                }
-                StreamError::Reset { code } => quic::StreamError::Reset { code },
-                StreamError::H3 { source } => quic::StreamError::Reset {
-                    code: source.code().into_inner(),
-                },
-            }
-        })
-    }
-
-    /// Handle a connection-scope error. The connection is already dead.
+    /// Handle an H3 connection-scope error.
+    ///
+    /// - `ConnectionError::Quic` — the connection has already failed; just
+    ///   return the reported error unchanged.
+    /// - `ConnectionError::H3` — a freshly detected connection-scope H3
+    ///   protocol violation. Close the QUIC connection with the H3 error
+    ///   code (unless the connection is already closed) and await the
+    ///   definitive close reason.
+    ///
+    /// Callers never need to drive `self.close(...)` themselves for H3
+    /// errors; this helper is the single place where the side effect
+    /// happens.
     fn handle_connection_error(
         &self,
-        error: quic::ConnectionError,
+        error: ConnectionError,
     ) -> BoxFuture<'_, quic::ConnectionError> {
-        Box::pin(async move { error })
+        Box::pin(async move {
+            match error {
+                ConnectionError::Quic { source } => source,
+                ConnectionError::H3 { source } => {
+                    // Avoid a redundant `to_string()` allocation if the
+                    // connection has already closed.
+                    if let Err(error) = self.check() {
+                        return error;
+                    }
+                    self.close(source.code(), source.to_string().into());
+                    self.closed().await
+                }
+            }
+        })
     }
 }
 
@@ -495,14 +498,14 @@ impl<C: quic::ManageStream + quic::Lifecycle + Sync> ConnectionState<C> {
     ) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
         match { self.quic.open_bi() }.await {
             Ok(streams) => Ok(streams),
-            Err(error) => Err(self.quic.handle_connection_error(error).await),
+            Err(error) => Err(self.quic.handle_connection_error(error.into()).await),
         }
     }
 
     pub async fn open_uni(&self) -> Result<C::StreamWriter, quic::ConnectionError> {
         match { self.quic.open_uni() }.await {
             Ok(stream) => Ok(stream),
-            Err(error) => Err(self.quic.handle_connection_error(error).await),
+            Err(error) => Err(self.quic.handle_connection_error(error.into()).await),
         }
     }
 }
@@ -533,7 +536,7 @@ impl<C: quic::Connection> ConnectionState<C> {
                 let (reader, writer) = match quic::ManageStream::accept_bi(&*state.quic).await {
                     Ok(bi_stream) => bi_stream,
                     Err(error) => {
-                        state.quic.handle_connection_error(error).await;
+                        state.quic.handle_connection_error(error.into()).await;
                         return;
                     }
                 };
@@ -560,7 +563,14 @@ impl<C: quic::Connection> ConnectionState<C> {
                         _ = tokio::join!(stream_reader.stop(code), stream_writer.cancel(code))
                     }
                     Err(stream_error) => {
-                        state.quic.handle_stream_error(stream_error).await;
+                        // The stream has been consumed by protocol matching
+                        // and is no longer reachable here; we can only drive
+                        // connection close for connection-scope errors. For
+                        // stream-scope errors the stream itself is already
+                        // being torn down inside the protocol code.
+                        if let StreamError::Connection { source } = stream_error {
+                            state.quic.handle_connection_error(source).await;
+                        }
                         continue;
                     }
                 };
@@ -578,7 +588,7 @@ impl<C: quic::Connection> ConnectionState<C> {
                 let stream_reader = match quic::ManageStream::accept_uni(&*state.quic).await {
                     Ok(uni_stream) => uni_stream,
                     Err(error) => {
-                        state.quic.handle_connection_error(error).await;
+                        state.quic.handle_connection_error(error.into()).await;
                         return;
                     }
                 };
@@ -603,7 +613,10 @@ impl<C: quic::Connection> ConnectionState<C> {
                         let _ = stream_reader.stop(code).await;
                     }
                     Err(stream_error) => {
-                        state.quic.handle_stream_error(stream_error).await;
+                        // Same rationale as `accept_bi_stream_task`.
+                        if let StreamError::Connection { source } = stream_error {
+                            state.quic.handle_connection_error(source).await;
+                        }
                         continue;
                     }
                 };

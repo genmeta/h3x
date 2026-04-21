@@ -693,7 +693,15 @@ impl DHttpProtocol {
                     tokio::select! {
                         biased;
                         Err(stream_error) = state.handle_control_stream(stream.into_stream_reader()) => {
-                            connection.handle_stream_error(stream_error).await;
+                            // Only connection-scope errors have a meaningful
+                            // side effect (close the connection). Stream-scope
+                            // errors on the control stream are themselves a
+                            // connection-level violation that the protocol code
+                            // already signals via `H3_CLOSED_CRITICAL_STREAM`,
+                            // so there is nothing extra to do here.
+                            if let StreamError::Connection { source } = stream_error {
+                                connection.handle_connection_error(source).await;
+                            }
                         }
                         _connection_error = connection.closed() => {
                             // Connection error occurred, likely due to shutdown. Just exit the task.
@@ -860,7 +868,9 @@ impl DHttpProtocolFactory {
                 Feed::new(Box::pin(control_frame_sink) as BoxSink<_, _>)
             }
             Err(stream_error) => {
-                conn.handle_stream_error(stream_error).await;
+                if let StreamError::Connection { source } = stream_error {
+                    return Err(conn.handle_connection_error(source).await);
+                }
                 return Err(conn.closed().await);
             }
         };
@@ -869,7 +879,9 @@ impl DHttpProtocolFactory {
         match control_stream.send(settings_frame).await {
             Ok(()) => (),
             Err(stream_error) => {
-                conn.handle_stream_error(stream_error).await;
+                if let StreamError::Connection { source } = stream_error {
+                    return Err(conn.handle_connection_error(source).await);
+                }
                 return Err(conn.closed().await);
             }
         }
@@ -953,7 +965,9 @@ impl<C: quic::DynLifecycle + Sync> ConnectionState<C> {
         };
 
         if let Err(stream_error) = send_goaway.await {
-            self.quic().handle_stream_error(stream_error).await;
+            if let StreamError::Connection { source } = stream_error {
+                return Err(self.quic().handle_connection_error(source).await);
+            }
             return Err(self.closed().await);
         }
 

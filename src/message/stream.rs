@@ -133,15 +133,7 @@ impl ReadStream {
         tokio::select! {
             result = f(self) => match result {
                 Ok(value) => Ok(value),
-                Err(connection::StreamError::Connection {
-                    source: connection::ConnectionError::Quic { source },
-                }) => Err(source.into()),
-                // message from peer is malformed
-                Err(connection::StreamError::H3 { source }) => {
-                    _ = self.stream.stop(source.code().into_inner()).await;
-                    Err(quic::StreamError::Reset { code: source.code().into_inner() }.into())
-                },
-                Err(error) => Err(self.connection.as_ref().handle_stream_error(error).await.into()),
+                Err(error) => Err(self.handle_stream_error(error).await.into()),
             },
             goaway = peer_goaway => match goaway {
                 Ok(()) => {
@@ -150,6 +142,35 @@ impl ReadStream {
                     Err(ConnectionGoaway::Peer.into())
                 }
                 Err(error) => Err(error.into())
+            }
+        }
+    }
+
+    /// Resolve a stream-level H3 error into a `quic::StreamError`, performing
+    /// the correct side effect for each variant:
+    ///
+    /// - `Connection` — delegate to [`LifecycleExt::handle_connection_error`]
+    ///   so that a fresh H3 connection-scope violation closes the QUIC
+    ///   connection.
+    /// - `Reset` — nothing to do locally; the peer already reset the stream.
+    /// - `H3` — a freshly detected stream-scope protocol violation; issue
+    ///   `STOP_SENDING` on this reader so the peer observes the abort.
+    pub async fn handle_stream_error(
+        &mut self,
+        error: connection::StreamError,
+    ) -> quic::StreamError {
+        match error {
+            connection::StreamError::Connection { source } => self
+                .connection
+                .as_ref()
+                .handle_connection_error(source)
+                .await
+                .into(),
+            connection::StreamError::Reset { code } => quic::StreamError::Reset { code },
+            connection::StreamError::H3 { source } => {
+                let code = source.code().into_inner();
+                _ = self.stream.stop(code).await;
+                quic::StreamError::Reset { code }
             }
         }
     }
@@ -325,14 +346,7 @@ impl WriteStream {
         tokio::select! {
             result = f(self) => match result {
                 Ok(value) => Ok(value),
-                Err(connection::StreamError::Connection {
-                    source: connection::ConnectionError::Quic { source },
-                }) => Err(source.into()),
-                Err(connection::StreamError::H3 { source }) => {
-                    _ = self.stream.cancel(source.code().into_inner()).await;
-                    Err(quic::StreamError::Reset { code: source.code().into_inner() }.into())
-                },
-                Err(error) => Err(self.connection.as_ref().handle_stream_error(error).await.into()),
+                Err(error) => Err(self.handle_stream_error(error).await.into()),
             },
             goaway = peer_goaway => match goaway {
                 Ok(()) => {
@@ -341,6 +355,30 @@ impl WriteStream {
                     Err(ConnectionGoaway::Peer.into())
                 }
                 Err(error) => Err(error.into())
+            }
+        }
+    }
+
+    /// Resolve a stream-level H3 error into a `quic::StreamError`. See
+    /// [`ReadStream::handle_stream_error`] for semantics; the difference is
+    /// that `H3` errors issue `RESET_STREAM` (via `cancel`) on this writer
+    /// instead of `STOP_SENDING`.
+    pub async fn handle_stream_error(
+        &mut self,
+        error: connection::StreamError,
+    ) -> quic::StreamError {
+        match error {
+            connection::StreamError::Connection { source } => self
+                .connection
+                .as_ref()
+                .handle_connection_error(source)
+                .await
+                .into(),
+            connection::StreamError::Reset { code } => quic::StreamError::Reset { code },
+            connection::StreamError::H3 { source } => {
+                let code = source.code().into_inner();
+                _ = self.stream.cancel(code).await;
+                quic::StreamError::Reset { code }
             }
         }
     }
@@ -364,7 +402,7 @@ impl WriteStream {
         // Flush encoder instructions (dynamic table insertions) to the encoder stream.
         // Encoder stream errors are connection-level: reset = connection error per RFC 9204.
         if let Err(error) = self.qpack_encoder.flush_instructions().await {
-            let quic_error = self.connection.as_ref().handle_stream_error(error).await;
+            let quic_error = self.handle_stream_error(error).await;
             return Err(quic_error.into());
         }
 
