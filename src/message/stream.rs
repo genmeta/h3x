@@ -80,7 +80,24 @@ impl From<varint::err::Overflow> for MessageStreamError {
 
 impl From<MessageStreamError> for io::Error {
     fn from(error: MessageStreamError) -> Self {
-        io::Error::other(error)
+        use io::ErrorKind;
+
+        let kind = match &error {
+            // Delegate to the underlying QUIC stream error's kind mapping.
+            MessageStreamError::Quic { .. } => None,
+            MessageStreamError::Goaway { .. } => Some(ErrorKind::ConnectionAborted),
+            MessageStreamError::MalformedIncomingMessage => Some(ErrorKind::InvalidData),
+            MessageStreamError::HeaderTooLarge
+            | MessageStreamError::TrailerTooLarge
+            | MessageStreamError::DataFrameTooLarge { .. } => Some(ErrorKind::InvalidInput),
+        };
+        match kind {
+            Some(kind) => io::Error::new(kind, error),
+            None => match error {
+                MessageStreamError::Quic { source } => io::Error::from(source),
+                _ => unreachable!("non-Quic variants always resolve to a concrete kind"),
+            },
+        }
     }
 }
 
@@ -535,7 +552,7 @@ mod tests {
     use bytes::Bytes;
     use futures::{Sink, SinkExt, Stream};
 
-    use super::{ReadStream, WriteStream, guard};
+    use super::{MessageStreamError, ReadStream, WriteStream, guard};
     use crate::{
         codec::{SinkWriter, StreamReader},
         connection::{ConnectionState, StreamError, tests::MockConnection},
@@ -545,6 +562,45 @@ mod tests {
         quic,
         varint::VarInt,
     };
+
+    #[test]
+    fn io_error_kind_is_derived_per_variant() {
+        use std::io::ErrorKind;
+
+        fn assert_kind(error: MessageStreamError, expected: ErrorKind) {
+            let repr = format!("{error:?}");
+            let io_error = std::io::Error::from(error);
+            assert_eq!(io_error.kind(), expected, "unexpected kind for {repr}");
+        }
+
+        assert_kind(MessageStreamError::HeaderTooLarge, ErrorKind::InvalidInput);
+        assert_kind(MessageStreamError::TrailerTooLarge, ErrorKind::InvalidInput);
+        assert_kind(
+            MessageStreamError::DataFrameTooLarge {
+                source: crate::varint::VarInt::from_u64(1 << 63)
+                    .expect_err("value exceeds varint encoding"),
+            },
+            ErrorKind::InvalidInput,
+        );
+        assert_kind(
+            MessageStreamError::MalformedIncomingMessage,
+            ErrorKind::InvalidData,
+        );
+        assert_kind(
+            MessageStreamError::Goaway {
+                source: crate::connection::ConnectionGoaway::Peer,
+            },
+            ErrorKind::ConnectionAborted,
+        );
+        assert_kind(
+            MessageStreamError::Quic {
+                source: quic::StreamError::Reset {
+                    code: VarInt::from_u32(0),
+                },
+            },
+            ErrorKind::BrokenPipe,
+        );
+    }
 
     fn qpack_decoder_sink()
     -> Pin<Box<dyn Sink<crate::qpack::decoder::DecoderInstruction, Error = StreamError> + Send>>
