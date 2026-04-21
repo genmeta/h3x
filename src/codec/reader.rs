@@ -11,7 +11,7 @@ use tokio::io::{self, AsyncBufRead, AsyncRead, ReadBuf};
 
 use crate::{
     buflist::{BufList, BuflistCursor},
-    codec::error::{DecodeError, DecodeStreamError},
+    codec::error::{DecodeError, StreamDecodeError},
     quic,
     varint::VarInt,
 };
@@ -256,9 +256,9 @@ impl<R: AsyncBufRead + ?Sized> AsyncBufRead for FixedLengthReader<R> {
 impl<S> Stream for FixedLengthReader<StreamReader<S>>
 where
     S: TryStream<Ok = Bytes> + ?Sized,
-    DecodeStreamError: From<S::Error>,
+    StreamDecodeError: From<S::Error>,
 {
-    type Item = Result<Bytes, DecodeStreamError>;
+    type Item = Result<Bytes, StreamDecodeError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut project = self.project();
@@ -281,9 +281,9 @@ where
 impl<S> Stream for FixedLengthReader<&mut StreamReader<S>>
 where
     S: TryStream<Ok = Bytes> + Unpin + ?Sized,
-    DecodeStreamError: From<S::Error>,
+    StreamDecodeError: From<S::Error>,
 {
-    type Item = Result<Bytes, DecodeStreamError>;
+    type Item = Result<Bytes, StreamDecodeError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();

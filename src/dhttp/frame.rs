@@ -12,8 +12,8 @@ use tokio::io::{self, AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 use crate::{
     buflist::BufList,
     codec::{
-        DecodeExt, DecodeFrom, DecodeStreamError, EncodeError, EncodeExt, EncodeInto,
-        EncodeStreamError, FixedLengthReader, StreamReader,
+        DecodeExt, DecodeFrom, EncodeError, EncodeExt, EncodeInto, FixedLengthReader,
+        StreamDecodeError, StreamEncodeError, StreamReader,
     },
     connection::StreamError,
     error::H3FrameDecodeError,
@@ -160,15 +160,15 @@ impl<P: AsyncWrite + ?Sized> AsyncWrite for Frame<P> {
 
 impl<P: Sink<B> + ?Sized, B: Buf> Sink<B> for Frame<P>
 where
-    EncodeStreamError: From<P::Error>,
+    StreamEncodeError: From<P::Error>,
 {
-    type Error = EncodeStreamError;
+    type Error = StreamEncodeError;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.project()
             .payload
             .poll_ready(cx)
-            .map_err(EncodeStreamError::from)
+            .map_err(StreamEncodeError::from)
     }
 
     fn start_send(self: Pin<&mut Self>, item: B) -> Result<(), Self::Error> {
@@ -192,14 +192,14 @@ where
         self.project()
             .payload
             .poll_flush(cx)
-            .map_err(EncodeStreamError::from)
+            .map_err(StreamEncodeError::from)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.project()
             .payload
             .poll_close(cx)
-            .map_err(EncodeStreamError::from)
+            .map_err(StreamEncodeError::from)
     }
 }
 
@@ -272,8 +272,8 @@ where
             })
         };
 
-        decode.await.map_err(|error: DecodeStreamError| {
-            error.map_decode_error(|decode_error| {
+        decode.await.map_err(|error: StreamDecodeError| {
+            error.into_stream_error(|decode_error| {
                 H3FrameDecodeError {
                     source: decode_error,
                 }
@@ -303,8 +303,8 @@ impl<P: AsyncBufRead + ?Sized> AsyncBufRead for Frame<P> {
     }
 }
 
-impl<P: TryStream<Ok = Bytes, Error = DecodeStreamError> + ?Sized> Stream for Frame<P> {
-    type Item = Result<Bytes, DecodeStreamError>;
+impl<P: TryStream<Ok = Bytes, Error = StreamDecodeError> + ?Sized> Stream for Frame<P> {
+    type Item = Result<Bytes, StreamDecodeError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.project().payload.try_poll_next(cx)
@@ -431,8 +431,8 @@ mod tests {
         assert_eq!(frame1.length().into_inner(), 5);
         let mut payload = vec![];
         assert!(matches!(
-            DecodeStreamError::from(frame1.read_to_end(&mut payload).await.unwrap_err()),
-            DecodeStreamError::Decode {
+            StreamDecodeError::from(frame1.read_to_end(&mut payload).await.unwrap_err()),
+            StreamDecodeError::Decode {
                 source: DecodeError::Incomplete
             }
         ));

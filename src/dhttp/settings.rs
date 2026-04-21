@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 
 use crate::{
     buflist::BufList,
-    codec::{DecodeExt, DecodeFrom, DecodeStreamError, EncodeExt, EncodeInto},
+    codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto, StreamDecodeError},
     connection::StreamError,
     dhttp::{frame::Frame, stream::UnidirectionalStream},
     error::{Code, H3ConnectionError, H3CriticalStreamClosed, H3FrameDecodeError},
@@ -81,7 +81,7 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for Setting {
             let value = stream.decode_one().await?;
             Ok(Setting { id, value })
         };
-        let setting = decode.await.map_err(|error: DecodeStreamError| {
+        let setting = decode.await.map_err(|error: StreamDecodeError| {
             error.map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::Control.into(),
                 |decode_error| {

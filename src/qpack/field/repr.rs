@@ -7,8 +7,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use crate::{
     buflist::BufList,
     codec::{
-        DecodeError, DecodeFrom, DecodeStreamError, EncodeError, EncodeExt, EncodeInto,
-        EncodeStreamError,
+        DecodeError, DecodeFrom, EncodeError, EncodeExt, EncodeInto, StreamDecodeError,
+        StreamEncodeError,
     },
     connection::StreamError,
     dhttp::frame::Frame,
@@ -68,8 +68,8 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for EncodedFieldSectionPrefix {
                 delta_base,
             })
         };
-        decode.await.map_err(|error: DecodeStreamError| {
-            error.map_decode_error(|decode_error| {
+        decode.await.map_err(|error: StreamDecodeError| {
+            error.into_stream_error(|decode_error| {
                 H3FrameDecodeError {
                     source: decode_error,
                 }
@@ -82,7 +82,7 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for EncodedFieldSectionPrefix {
 impl<S: AsyncWrite + Send> EncodeInto<S> for EncodedFieldSectionPrefix {
     type Output = ();
 
-    type Error = EncodeStreamError;
+    type Error = StreamEncodeError;
 
     async fn encode_into(self, stream: S) -> Result<Self::Output, Self::Error> {
         let mut stream = pin!(stream);
@@ -321,8 +321,8 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for FieldLineRepresentation {
                 }
             }
         };
-        decode.await.map_err(|error: DecodeStreamError| {
-            error.map_decode_error(|decode_error| {
+        decode.await.map_err(|error: StreamDecodeError| {
+            error.into_stream_error(|decode_error| {
                 H3FrameDecodeError {
                     source: decode_error,
                 }
@@ -335,11 +335,11 @@ impl<S: AsyncRead + Send> DecodeFrom<S> for FieldLineRepresentation {
 impl<S, E> EncodeInto<S> for FieldLineRepresentation
 where
     S: AsyncWrite + Sink<Bytes, Error = E> + Send,
-    EncodeStreamError: From<E>,
+    StreamEncodeError: From<E>,
 {
     type Output = ();
 
-    type Error = EncodeStreamError;
+    type Error = StreamEncodeError;
 
     async fn encode_into(self, stream: S) -> Result<Self::Output, Self::Error> {
         let mut stream = pin!(stream);
@@ -426,11 +426,11 @@ impl EncodeInto<BufList> for (EncodedFieldSectionPrefix, Vec<FieldLineRepresenta
         };
         encode
             .await
-            .map_err(|error: EncodeStreamError| match error {
-                EncodeStreamError::Stream { .. } => {
-                    unreachable!("Stream error should not happen when encoding to BufList")
+            .map_err(|error: StreamEncodeError| match error {
+                StreamEncodeError::Connection { .. } | StreamEncodeError::Reset { .. } => {
+                    unreachable!("stream error should not happen when encoding to BufList")
                 }
-                EncodeStreamError::Encode { source } => source,
+                StreamEncodeError::Encode { source } => source,
             })
     }
 }

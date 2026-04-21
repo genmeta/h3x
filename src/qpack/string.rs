@@ -4,7 +4,7 @@ use httlib_huffman::DecoderSpeed;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 use crate::{
-    codec::{DecodeError, DecodeStreamError, EncodeError, EncodeStreamError, FixedLengthReader},
+    codec::{DecodeError, EncodeError, FixedLengthReader, StreamDecodeError, StreamEncodeError},
     qpack::integer::{decode_integer, encode_integer},
 };
 
@@ -12,7 +12,7 @@ pub async fn decode_string(
     stream: impl AsyncRead,
     prefix: u8,
     n: u8,
-) -> Result<(bool, Bytes), DecodeStreamError> {
+) -> Result<(bool, Bytes), StreamDecodeError> {
     tokio::pin!(stream);
     let huffman = (prefix >> (n - 1)) & 1 == 1;
     let length = decode_integer(stream.as_mut(), prefix, n - 1).await?;
@@ -37,9 +37,9 @@ pub async fn encode_string<E>(
     n: u8,
     huffman: bool,
     data: Bytes,
-) -> Result<(), EncodeStreamError>
+) -> Result<(), StreamEncodeError>
 where
-    EncodeStreamError: From<E>,
+    StreamEncodeError: From<E>,
 {
     tokio::pin!(stream);
     // set H bit

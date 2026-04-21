@@ -8,7 +8,7 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt, TryStream, sink};
 
 use crate::{
-    codec::{DecodeExt, DecodeStreamError, FixedLengthReader, StreamReader},
+    codec::{DecodeExt, FixedLengthReader, StreamDecodeError, StreamReader},
     connection::StreamError,
     dhttp::frame::Frame,
     error::H3FrameDecodeError,
@@ -64,8 +64,8 @@ where
     }
 
     pub async fn consume_current_frame(mut self: Pin<&mut Self>) -> Result<(), StreamError> {
-        let map_decode_stream_error = |error: DecodeStreamError| {
-            error.map_decode_error(|decode_error| {
+        let map_decode_stream_error = |error: StreamDecodeError| {
+            error.into_stream_error(|decode_error| {
                 H3FrameDecodeError {
                     source: decode_error,
                 }
@@ -98,7 +98,7 @@ where
             }
 
             let convert_decode_varint_error = |error: io::Error| {
-                DecodeStreamError::from(error).map_decode_error(|decode_error| {
+                StreamDecodeError::from(error).into_stream_error(|decode_error| {
                     H3FrameDecodeError {
                         source: decode_error,
                     }

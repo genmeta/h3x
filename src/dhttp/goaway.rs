@@ -5,7 +5,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 use crate::{
     buflist::BufList,
-    codec::{DecodeExt, DecodeFrom, DecodeStreamError, EncodeExt, EncodeInto},
+    codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto, StreamDecodeError},
     connection::StreamError,
     dhttp::frame::Frame,
     error::{H3CriticalStreamClosed, H3FrameDecodeError, H3GeneralProtocolError},
@@ -42,7 +42,7 @@ where
     async fn decode_from(mut stream: &mut Frame<S>) -> Result<Self, Self::Error> {
         assert!(stream.r#type() == Frame::GOAWAY_FRAME_TYPE);
         let stream_id = stream.decode_one::<VarInt>().await.map_err(|error| {
-            DecodeStreamError::from(error).map_stream_closed(
+            StreamDecodeError::from(error).map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::Control.into(),
                 |decode_error| {
                     H3FrameDecodeError {

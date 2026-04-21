@@ -8,7 +8,7 @@ use futures::{Sink, Stream};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
-    codec::{DecodeExt, DecodeFrom, DecodeStreamError, EncodeExt},
+    codec::{DecodeExt, DecodeFrom, EncodeExt, StreamDecodeError},
     connection::StreamError,
     error::H3GeneralProtocolError,
     quic::{self, CancelStream, GetStreamId, StopStream},
@@ -69,8 +69,8 @@ impl<S: ?Sized> UnidirectionalStream<S> {
         S: AsyncRead + Unpin + Sized + Send,
     {
         let r#type = stream.decode_one::<VarInt>().await.map_err(|error| {
-            DecodeStreamError::from(error)
-                .map_decode_error(|error| H3GeneralProtocolError::Decode { source: error }.into())
+            StreamDecodeError::from(error)
+                .into_stream_error(|error| H3GeneralProtocolError::Decode { source: error }.into())
         })?;
         Ok(UnidirectionalStream { r#type, stream })
     }

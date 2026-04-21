@@ -14,7 +14,7 @@ use tokio::{
 };
 
 use crate::{
-    codec::{DecodeExt, DecodeFrom, DecodeStreamError, EncodeInto, Feed},
+    codec::{DecodeExt, DecodeFrom, EncodeInto, Feed, StreamDecodeError},
     connection::StreamError,
     dhttp::settings::Settings,
     error::{
@@ -607,7 +607,7 @@ impl<S: AsyncBufRead + Send> DecodeFrom<S> for DecoderInstruction {
                 }
             }
         };
-        decode.await.map_err(|error: DecodeStreamError| {
+        decode.await.map_err(|error: StreamDecodeError| {
             error.map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::QPackDecoder.into(),
                 |decode_error| {

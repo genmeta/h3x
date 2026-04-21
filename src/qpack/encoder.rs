@@ -16,7 +16,7 @@ use tokio::{
 use crate::{
     buflist::BufList,
     codec::{
-        DecodeFrom, DecodeStreamError, EncodeError, EncodeExt, EncodeInto, EncodeStreamError, Feed,
+        DecodeFrom, EncodeError, EncodeExt, EncodeInto, Feed, StreamDecodeError, StreamEncodeError,
     },
     connection::StreamError,
     dhttp::{frame::Frame, settings::Settings},
@@ -583,7 +583,7 @@ impl<S: AsyncBufRead + Send> DecodeFrom<S> for EncoderInstruction {
                 }
             }
         };
-        decode.await.map_err(|error: DecodeStreamError| {
+        decode.await.map_err(|error: StreamDecodeError| {
             error.map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::QPackEncoder.into(),
                 |decode_error| {
@@ -647,12 +647,12 @@ where
                 }
             }
         };
-        encode.await.map_err(|error: EncodeStreamError| {
+        encode.await.map_err(|error: StreamEncodeError| {
             error.map_stream_closed(
                 |_reset_code| H3CriticalStreamClosed::QPackEncoder.into(),
                 |encode_error| {
                     tracing::error!(error = %Report::from_error(&encode_error), "this is likely a bug");
-                    H3InternalError::QPackEncoderEncode { source: EncodeStreamError::Encode { source: encode_error } }.into()
+                    H3InternalError::QPackEncoderEncode { source: StreamEncodeError::Encode { source: encode_error } }.into()
                 },
             )
         })

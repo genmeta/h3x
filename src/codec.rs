@@ -6,7 +6,10 @@ mod error;
 mod reader;
 mod writer;
 
-pub use error::{DecodeError, DecodeStreamError, EncodeError, EncodeStreamError};
+pub use error::{
+    ConnectionDecodeError, ConnectionEncodeError, DecodeError, EncodeError, StreamDecodeError,
+    StreamEncodeError,
+};
 use futures::{Sink, stream::Stream};
 pub use reader::{FixedLengthReader, PeekableStreamReader, StreamReader};
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt};

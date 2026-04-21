@@ -185,7 +185,7 @@ impl ReadStream {
                             continue;
                         }
                         Err(error) => {
-                            let error = error.map_decode_error(|error| {
+                            let error = error.into_stream_error(|error| {
                                 H3FrameDecodeError { source: error }.into()
                             });
                             return Some(Err(error));
