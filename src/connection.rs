@@ -274,8 +274,8 @@ pub trait LifecycleExt: quic::DynLifecycle + Sync {
     fn handle_connection_error(
         &self,
         error: ConnectionError,
-    ) -> BoxFuture<'_, quic::ConnectionError> {
-        Box::pin(async move {
+    ) -> impl Future<Output = quic::ConnectionError> + Send + '_ {
+        async move {
             match error {
                 ConnectionError::Quic { source } => source,
                 ConnectionError::H3 { source } => {
@@ -288,7 +288,7 @@ pub trait LifecycleExt: quic::DynLifecycle + Sync {
                     self.closed().await
                 }
             }
-        })
+        }
     }
 }
 
