@@ -652,9 +652,7 @@ where
                 .into_stream_error(|encode_error| {
                     tracing::error!(error = %Report::from_error(&encode_error), "this is likely a bug");
                     H3InternalError::QPackEncoderEncode {
-                        source: StreamEncodeError::Encode {
-                            source: encode_error,
-                        },
+                        source: encode_error,
                     }
                     .into()
                 })
