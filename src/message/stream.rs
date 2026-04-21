@@ -30,7 +30,7 @@ use crate::{
         protocol::{QPackDecoder, QPackEncoder, QPackProtocolDisabled},
     },
     quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
-    varint::VarInt,
+    varint::{self, VarInt},
 };
 
 pub(crate) mod guard;
@@ -59,7 +59,7 @@ pub enum MessageStreamError {
     ))]
     TrailerTooLarge,
     #[snafu(display("data frame payload too large, try smaller chunk size"))]
-    DataFrameTooLarge,
+    DataFrameTooLarge { source: varint::err::Overflow },
     #[snafu(display("HTTP/3 message from peer is malformed"))]
     MalformedIncomingMessage,
 }
@@ -69,6 +69,12 @@ impl From<quic::ConnectionError> for MessageStreamError {
         Self::Quic {
             source: value.into(),
         }
+    }
+}
+
+impl From<varint::err::Overflow> for MessageStreamError {
+    fn from(source: varint::err::Overflow) -> Self {
+        Self::DataFrameTooLarge { source }
     }
 }
 

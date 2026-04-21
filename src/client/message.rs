@@ -282,7 +282,7 @@ where
                     debug_assert_eq!(stream, Stream::Response);
                     Err(RequestError::TrailerTooLarge)
                 }
-                Err((stream, MessageStreamError::DataFrameTooLarge)) => {
+                Err((stream, MessageStreamError::DataFrameTooLarge { .. })) => {
                     debug_assert_eq!(stream, Stream::Request);
                     Err(RequestError::DataFrameTooLarge)
                 }

@@ -572,8 +572,7 @@ impl WriteStream {
     }
 
     pub async fn send_data(&mut self, data: impl Buf + Send) -> Result<(), MessageStreamError> {
-        let frame = Frame::new(Frame::DATA_FRAME_TYPE, data)
-            .map_err(|_| MessageStreamError::DataFrameTooLarge)?;
+        let frame = Frame::new(Frame::DATA_FRAME_TYPE, data)?;
         self.try_stream_io(async |this| Ok(this.send_frame(frame).await?))
             .await
     }
@@ -641,8 +640,7 @@ impl WriteStream {
 
         while buflist.has_remaining() {
             let bytes = buflist.copy_to_bytes(buflist.chunk().len());
-            let frame = Frame::new(Frame::DATA_FRAME_TYPE, bytes)
-                .map_err(|_| MessageStreamError::DataFrameTooLarge)?;
+            let frame = Frame::new(Frame::DATA_FRAME_TYPE, bytes)?;
             self.try_stream_io(async |this| Ok(this.send_frame(frame).await?))
                 .await?;
         }
