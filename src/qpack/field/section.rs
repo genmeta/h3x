@@ -116,6 +116,12 @@ impl From<header::InvalidHeaderValue> for MalformedHeaderSection {
     }
 }
 
+impl From<header::ToStrError> for MalformedHeaderSection {
+    fn from(_: header::ToStrError) -> Self {
+        MalformedHeaderSection::InvalidHostHeader
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldSection {
     pub(crate) pseudo_headers: Option<super::PseudoHeaders>,
@@ -229,9 +235,7 @@ impl FieldSection {
                     if scheme == &Scheme::HTTP || scheme == &Scheme::HTTPS {
                         match (authority, self.header_map.get("host")) {
                             (Some(authority), Some(host)) => {
-                                let host = host
-                                    .to_str()
-                                    .map_err(|_| MalformedHeaderSection::InvalidHostHeader)?;
+                                let host = host.to_str()?;
                                 if authority.as_str().is_empty() || host.is_empty() {
                                     return Err(MalformedHeaderSection::EmptyAuthorityOrHost);
                                 }
@@ -245,9 +249,7 @@ impl FieldSection {
                                 }
                             }
                             (None, Some(host)) => {
-                                let host = host
-                                    .to_str()
-                                    .map_err(|_| MalformedHeaderSection::InvalidHostHeader)?;
+                                let host = host.to_str()?;
                                 if host.is_empty() {
                                     return Err(MalformedHeaderSection::EmptyAuthorityOrHost);
                                 }
