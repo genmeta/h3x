@@ -1,4 +1,8 @@
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    str::FromStr,
+};
 
 use either::Either;
 use http::{
@@ -17,7 +21,7 @@ use crate::dquic::{
 ///
 /// See [module documentation](super) for the full syntax description.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Bind {
+pub struct BindPattern {
     /// The resolved scheme (`iface` or `inet`). Always present after parsing.
     pub scheme: BindUriScheme,
     /// Host part — exact name/IP or glob pattern (carries family if applicable).
@@ -29,11 +33,23 @@ pub struct Bind {
     pub path_and_query: Option<PathAndQuery>,
 }
 
+impl Hash for BindPattern {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.scheme.hash(state);
+        self.host.hash(state);
+        self.port.hash(state);
+        self.path_and_query
+            .as_ref()
+            .map(|pq| pq.as_str())
+            .hash(state);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Display
 // ---------------------------------------------------------------------------
 
-impl fmt::Display for Bind {
+impl fmt::Display for BindPattern {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}://", self.scheme)?;
         if let Some(family) = self.host.family() {
@@ -106,7 +122,7 @@ peg::parser! {
         // -- composite rules --
 
         /// `scheme://family.host:port/path?query`  (full form)
-        pub rule full() -> Bind
+        pub rule full() -> BindPattern
             = s:scheme()
               fam:(f:family() "." { f })?
               h:host_str()
@@ -119,11 +135,11 @@ peg::parser! {
                     .map(|s| s.parse::<PathAndQuery>())
                     .transpose()
                     .map_err(|_| "valid path-and-query")?;
-                Ok(Bind { scheme, host, port: p, path_and_query })
+                Ok(BindPattern { scheme, host, port: p, path_and_query })
             }
 
         /// `family.host:port/path?query`  (no scheme)
-        pub rule no_scheme() -> Bind
+        pub rule no_scheme() -> BindPattern
             = fam:(f:family() "." { f })?
               h:host_str()
               p:port()?
@@ -135,14 +151,14 @@ peg::parser! {
                     .map(|s| s.parse::<PathAndQuery>())
                     .transpose()
                     .map_err(|_| "valid path-and-query")?;
-                Ok(Bind { scheme, host, port: p, path_and_query })
+                Ok(BindPattern { scheme, host, port: p, path_and_query })
             }
 
         /// Top-level entry: bare IP first, then full form, then no-scheme.
         ///
         /// `bare_ip` has highest priority — its `{? ... }` semantic guard
         /// ensures only valid IP addresses match; everything else backtracks.
-        pub rule bind() -> Bind
+        pub rule bind() -> BindPattern
             = b:bare_ip() { b }
             / b:full() { b }
             / b:no_scheme() { b }
@@ -152,14 +168,14 @@ peg::parser! {
         /// Captures everything up to `/`, `?`, or `#` (or end of input) and
         /// validates it as an [`IpAddr`].  Falls back via PEG ordered choice
         /// if validation fails.
-        rule bare_ip() -> Bind
+        rule bare_ip() -> BindPattern
             = s:$([^ '/' | '?' | '#']+) pq:path_and_query()? {?
                 let addr = s.parse::<std::net::IpAddr>().or(Err("valid IP address"))?;
                 let path_and_query = pq
                     .map(|s| s.parse::<PathAndQuery>())
                     .transpose()
                     .map_err(|_| "valid path-and-query")?;
-                Ok(Bind {
+                Ok(BindPattern {
                     scheme: BindUriScheme::Inet,
                     host: BindHost::Ip { addr, repr: s.to_owned() },
                     port: None,
@@ -193,7 +209,7 @@ fn infer_scheme(explicit: Option<&str>, host: &BindHost) -> BindUriScheme {
 // FromStr
 // ---------------------------------------------------------------------------
 
-impl FromStr for Bind {
+impl FromStr for BindPattern {
     type Err = ParseError<LineCol>;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -202,10 +218,10 @@ impl FromStr for Bind {
 }
 
 // ---------------------------------------------------------------------------
-// Bind → BindUri expansion
+// BindPattern → BindUri expansion
 // ---------------------------------------------------------------------------
 
-impl Bind {
+impl BindPattern {
     /// Returns the effective port (defaults to 0 when omitted).
     #[must_use]
     pub fn effective_port(&self) -> u16 {
@@ -226,16 +242,12 @@ impl Bind {
         let uri_template = Uri::from_parts(uri_template)
             .expect("BUG: bind URI template built from valid scheme and path-and-query");
 
-        let port = self.effective_port();
         move |authority: Authority| {
             let mut uri_parts = uri_template.clone().into_parts();
             uri_parts.authority = Some(authority);
 
-            let mut bind_uri =
+            let bind_uri =
                 (Uri::from_parts(uri_parts).ok()).and_then(|uri| BindUri::try_from(uri).ok())?;
-            if port == 0 {
-                bind_uri = bind_uri.alloc_port();
-            }
             Some(bind_uri)
         }
     }

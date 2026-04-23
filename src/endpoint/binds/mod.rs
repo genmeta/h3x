@@ -25,7 +25,7 @@ pub use std::net::IpAddr;
 pub use collection::Binds;
 pub use error::BindConflictError;
 pub use host::BindHost;
-pub use pattern::Bind;
+pub use pattern::BindPattern;
 pub use setup::{
     BindSetup, setup_bind_interfaces, setup_bind_interfaces_with, watch_bind_interfaces,
 };

@@ -30,20 +30,17 @@
 //!
 //! ## Binds registry
 //!
-//! [`Network::add_binds`] expands a [`Binds`] pattern against the current
-//! device set, binds each resulting URI through the shared
-//! [`InterfaceManager`], and installs a background reconcile task that
-//! re-evaluates the pattern on device changes. The call returns a
-//! [`BindsGuard`] whose [`Drop`] impl cancels the reconcile task and unbinds
-//! any URIs that were opened by the entry.
+//! [`Network::bind`] registers a [`BindPattern`] with reference counting.
+//! Repeated calls with the same pattern increment the count; [`Network::unbind`]
+//! decrements it and tears down the bound interfaces only when the count
+//! reaches zero. A single background reconcile task (started at build time)
+//! watches for device changes and keeps every pattern's bound interfaces in
+//! sync.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map},
     net::SocketAddr,
-    sync::{
-        Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 use bon::Builder;
@@ -53,18 +50,20 @@ use rustls::{ServerConfig as RustlsServerConfig, sign::CertifiedKey};
 use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
 use tokio_util::task::AbortOnDropHandle;
+use tracing::Instrument;
 
 pub use super::sni::ServerBinding;
 use super::{
-    binds::{BindConflictError, Binds, watch_bind_interfaces},
+    binds::{BindHost, BindPattern},
     config::ServerQuicConfig,
-    identity::{NamedIdentity, ServerName},
+    identity::{Identity, ServerName},
     sni::{self, SniCertResolver, SniEntry, SniGuard},
 };
 use crate::dquic::{
     prelude::{
         Connection, Resolve,
         handy::{DEFAULT_IO_FACTORY, SystemResolver},
+        qconnection::builder::ConnectionFoundation,
     },
     qbase::packet::{DataHeader, GetDcid, Packet, long::DataHeader as LongHeader},
     qinterface::{
@@ -86,14 +85,13 @@ use crate::dquic::{
     },
 };
 
-type BindRegistry = Arc<Mutex<HashMap<u64, BindsEntry>>>;
 pub(crate) type SniRegistry = Arc<DashMap<ServerName, Weak<SniEntry>>>;
 
 /// Error returned by [`Network::bind_server`].
 #[derive(Debug, Snafu)]
 #[snafu(module, visibility(pub))]
 pub enum BindServerError {
-    /// Another [`NamedIdentity`] is already registered for the same SNI.
+    /// Another [`Identity`] is already registered for the same SNI.
     #[snafu(display("sni {name} is already bound to a different identity"))]
     SniInUse {
         /// SNI that is already registered.
@@ -126,28 +124,28 @@ pub enum BindServerError {
 #[builder(finish_fn = build_raw)]
 pub struct Network {
     #[builder(default = Arc::new(SystemResolver))]
-    pub(crate) stun_resolver: Arc<dyn Resolve + Send + Sync>,
-    pub(crate) stun_server: Option<Arc<str>>,
+    stun_resolver: Arc<dyn Resolve + Send + Sync>,
+    stun_server: Option<Arc<str>>,
     #[builder(default = Devices::global())]
-    pub(crate) devices: &'static Devices,
+    devices: &'static Devices,
     #[builder(default = Arc::new(DEFAULT_IO_FACTORY))]
-    pub(crate) io_factory: Arc<dyn ProductIO + 'static>,
+    io_factory: Arc<dyn ProductIO + 'static>,
     #[builder(default = InterfaceManager::global().clone())]
-    pub(crate) iface_manager: Arc<InterfaceManager>,
+    iface_manager: Arc<InterfaceManager>,
     #[builder(default = QuicRouter::global().clone())]
-    pub(crate) quic_router: Arc<QuicRouter>,
+    quic_router: Arc<QuicRouter>,
     #[builder(default = Arc::new(Locations::new()))]
-    pub(crate) locations: Arc<Locations>,
-    #[builder(skip = Arc::new(Mutex::new(HashMap::new())))]
-    bind_registry: BindRegistry,
-    #[builder(skip = Arc::new(AtomicU64::new(0)))]
-    next_bind_id: Arc<AtomicU64>,
+    locations: Arc<Locations>,
+    #[builder(skip = Mutex::new(HashMap::new()))]
+    bind_registry: Mutex<HashMap<BindPattern, BindsEntry>>,
     #[builder(skip = Arc::new(DashMap::new()))]
     sni_registry: SniRegistry,
     #[builder(skip = RwLock::new(Weak::new()))]
     server_slot: RwLock<Weak<sni::ServerSlotInner>>,
     #[builder(skip)]
     dispatcher_installed: OnceLock<()>,
+    #[builder(skip)]
+    _reconcile: OnceLock<AbortOnDropHandle<()>>,
 }
 
 impl<S: network_builder::IsComplete> NetworkBuilder<S> {
@@ -155,61 +153,65 @@ impl<S: network_builder::IsComplete> NetworkBuilder<S> {
     pub fn build(self) -> Arc<Network> {
         let network = Arc::new(self.build_raw());
         network.install_dispatcher();
+        network.start_reconcile();
         network
     }
 }
 
+type BoundMap = Arc<Mutex<HashMap<String, (BindUri, BindInterface)>>>;
+
 struct BindsEntry {
-    _reconcile: AbortOnDropHandle<()>,
+    refcount: usize,
     /// Live bindings keyed by [`BindUri::identity_key`]. Holds strong
     /// [`BindInterface`] references so that the interfaces (and their
-    /// installed components) outlive the `add_binds` call — otherwise
-    /// each bound interface is immediately dropped and removed from the
-    /// [`InterfaceManager`].
-    bound: Arc<Mutex<HashMap<String, (BindUri, BindInterface)>>>,
+    /// installed components) stay alive. The inner lock is separate from
+    /// the outer `bind_registry` mutex so the reconcile task can perform
+    /// async bind/unbind without holding the registry lock.
+    bound: BoundMap,
+}
+
+/// Expand a single [`BindPattern`] into concrete [`BindUri`]s given the
+/// current set of interface names.
+fn expand_pattern<'a>(
+    pattern: &BindPattern,
+    interfaces: impl IntoIterator<Item = &'a str>,
+) -> Vec<BindUri> {
+    let template = pattern.bind_uri_template();
+
+    // IP hosts produce a fixed URI independent of interface names.
+    if let BindHost::Ip { addr, .. } = &pattern.host {
+        let port = pattern.effective_port();
+        if let Ok(authority) = format!("{addr}:{port}").parse()
+            && let Some(uri) = template(authority)
+        {
+            return vec![uri];
+        }
+        return Vec::new();
+    }
+
+    // Glob / exact hosts are expanded per interface.
+    interfaces
+        .into_iter()
+        .flat_map(|iface_name| {
+            pattern
+                .bind_hosts_for_interface(iface_name)
+                .filter_map(&template)
+        })
+        .collect()
 }
 
 impl Network {
-    /// Accessor for the interface manager.
-    #[must_use]
-    pub fn iface_manager(&self) -> &Arc<InterfaceManager> {
-        &self.iface_manager
-    }
-
-    /// Accessor for the QUIC router.
-    #[must_use]
-    pub fn quic_router(&self) -> &Arc<QuicRouter> {
-        &self.quic_router
-    }
-
-    /// Accessor for the shared [`Locations`] table.
-    #[must_use]
-    pub fn locations(&self) -> &Arc<Locations> {
-        &self.locations
-    }
-
-    /// Accessor for the device tracker.
-    #[must_use]
-    pub fn devices(&self) -> &'static Devices {
-        self.devices
-    }
-
-    /// Accessor for the I/O factory.
-    #[must_use]
-    pub fn io_factory(&self) -> &Arc<dyn ProductIO + 'static> {
-        &self.io_factory
-    }
-
-    /// Accessor for the STUN server, if configured.
-    #[must_use]
-    pub fn stun_server(&self) -> Option<&Arc<str>> {
-        self.stun_server.as_ref()
-    }
-
-    /// Accessor for the resolver used when looking up STUN server addresses.
-    #[must_use]
-    pub fn stun_resolver(&self) -> &Arc<dyn Resolve + Send + Sync> {
-        &self.stun_resolver
+    /// Apply this network's infrastructure (IO factory, interface manager,
+    /// router and locations) to a connection builder.
+    pub(crate) fn configure_connection<F, T>(
+        &self,
+        builder: ConnectionFoundation<F, T>,
+    ) -> ConnectionFoundation<F, T> {
+        builder
+            .with_iface_factory(self.io_factory.clone())
+            .with_iface_manager(self.iface_manager.clone())
+            .with_quic_router(self.quic_router.clone())
+            .with_locations(self.locations.clone())
     }
 
     /// Bind the given URI on this network.
@@ -218,7 +220,7 @@ impl Network {
     /// [`InterfaceManager`], this also installs the QUIC packet routing,
     /// location tracking, STUN client and packet receive/deliver components
     /// on the interface so that QUIC packets actually flow.
-    pub async fn bind(&self, bind_uri: BindUri) -> BindInterface {
+    pub async fn bind_iface(&self, bind_uri: BindUri) -> BindInterface {
         let bind_iface = self
             .iface_manager
             .bind(bind_uri, self.io_factory.clone())
@@ -308,106 +310,91 @@ impl Network {
             .into_iter()
             .map(|bind_uri| {
                 let network = self.clone();
-                async move { network.bind(bind_uri.into()).await }
+                async move { network.bind_iface(bind_uri.into()).await }
             })
             .collect::<FuturesUnordered<_>>()
     }
 
-    /// Register a [`Binds`] pattern with this network.
-    pub async fn add_binds(
-        self: &Arc<Self>,
-        binds: &Binds,
-    ) -> Result<BindsGuard, Box<BindConflictError>> {
-        let monitor = self.devices.monitor();
-        let initial_uris = binds.to_bind_uris(monitor.interfaces().keys().map(String::as_str))?;
+    /// Register a [`BindPattern`] with this network (refcounted).
+    ///
+    /// If the same pattern is already registered, its reference count is
+    /// incremented and no new interfaces are bound. Otherwise the pattern
+    /// is expanded against the current device set and each resulting
+    /// [`BindUri`] is bound via [`bind_iface`](Self::bind_iface).
+    ///
+    /// A background reconcile task (started at build time) watches for
+    /// device changes and keeps the bound interfaces in sync.
+    pub async fn bind(self: &Arc<Self>, pattern: BindPattern) {
+        // Fast path: bump refcount if already registered.
+        {
+            let mut registry = self.bind_registry.lock().unwrap();
+            if let Some(entry) = registry.get_mut(&pattern) {
+                entry.refcount += 1;
+                return;
+            }
+        }
 
-        // Bind every initial URI up-front and hold strong
-        // [`BindInterface`] references so the interfaces stay alive for
-        // the lifetime of the returned [`BindsGuard`].
-        let mut initial_bound: HashMap<String, (BindUri, BindInterface)> =
-            HashMap::with_capacity(initial_uris.len());
-        for uri in &initial_uris {
-            let iface = self.bind(uri.clone()).await;
-            initial_bound.insert(uri.identity_key(), (uri.clone(), iface));
+        // Expand pattern and bind interfaces (without holding the lock).
+        let monitor = self.devices.monitor();
+        let uris = expand_pattern(&pattern, monitor.interfaces().keys().map(String::as_str));
+        let mut initial_bound = HashMap::with_capacity(uris.len());
+        for uri in uris {
+            let iface = self.bind_iface(uri.clone()).await;
+            initial_bound.insert(uri.identity_key(), (uri, iface));
         }
         let bound = Arc::new(Mutex::new(initial_bound));
 
-        let reconcile = {
-            let network = self.clone();
-            let bound_bind = bound.clone();
-            let bind_fn = move |uri: BindUri| {
-                let network = network.clone();
-                let bound_bind = bound_bind.clone();
-                Box::pin(async move {
-                    let iface = network.bind(uri.clone()).await;
-                    bound_bind
-                        .lock()
-                        .unwrap()
-                        .insert(uri.identity_key(), (uri, iface));
-                })
-                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-            };
+        // Re-lock and insert (double-check for concurrent bind of the
+        // same pattern).
+        let mut registry = self.bind_registry.lock().unwrap();
+        match registry.entry(pattern) {
+            hash_map::Entry::Occupied(mut e) => {
+                e.get_mut().refcount += 1;
+                // Another caller bound the same pattern concurrently.
+                // InterfaceManager deduplicates, so our BindInterfaces
+                // are safe to drop.
+            }
+            hash_map::Entry::Vacant(e) => {
+                e.insert(BindsEntry { refcount: 1, bound });
+            }
+        }
+    }
 
-            let iface_manager_unbind = self.iface_manager.clone();
-            let bound_unbind = bound.clone();
-            let unbind_fn = move |uri: BindUri| {
-                // Drop the strong `BindInterface` held here before asking
-                // the manager to unbind; otherwise the interface would
-                // still be referenced by `bound` and `unbind` could not
-                // fully tear it down.
-                bound_unbind.lock().unwrap().remove(&uri.identity_key());
-                let iface_manager_unbind = iface_manager_unbind.clone();
-                tokio::spawn(async move {
-                    iface_manager_unbind.unbind(uri).await;
-                });
-            };
-
-            watch_bind_interfaces(binds, monitor, initial_uris, bind_fn, unbind_fn)
+    /// Decrement the reference count for a [`BindPattern`].
+    ///
+    /// When the last reference is removed, the pattern's bound interfaces
+    /// are released asynchronously.
+    pub async fn unbind(self: &Arc<Self>, pattern: &BindPattern) {
+        let bound = {
+            let mut registry = self.bind_registry.lock().unwrap();
+            match registry.get_mut(pattern) {
+                Some(entry) => {
+                    entry.refcount -= 1;
+                    if entry.refcount > 0 {
+                        return;
+                    }
+                    registry.remove(pattern).unwrap().bound
+                }
+                None => return,
+            }
         };
 
-        let id = self.next_bind_id.fetch_add(1, Ordering::Relaxed);
-        self.bind_registry.lock().unwrap().insert(
-            id,
-            BindsEntry {
-                _reconcile: reconcile,
-                bound: bound.clone(),
-            },
-        );
-
-        Ok(BindsGuard {
-            id,
-            registry: self.bind_registry.clone(),
-            iface_manager: self.iface_manager.clone(),
-            bound,
-        })
+        // Release interfaces outside the lock.
+        let uris: Vec<BindUri> = bound
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, (uri, _))| uri)
+            .collect();
+        for uri in uris {
+            self.iface_manager.unbind(uri).await;
+        }
     }
 
-    /// Snapshot of the URIs currently bound via [`Network::add_binds`].
+    /// Snapshot of all [`BindInterface`]s currently bound via
+    /// [`bind`](Self::bind).
     #[must_use]
-    pub fn current_bind_uris(&self) -> Vec<BindUri> {
-        let registry = self.bind_registry.lock().unwrap();
-        registry
-            .values()
-            .flat_map(|entry| {
-                entry
-                    .bound
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .map(|(uri, _)| uri.clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
-    /// Snapshot of the [`BindInterface`]s currently bound via
-    /// [`Network::add_binds`]. Prefer this over
-    /// [`current_bind_uris`](Self::current_bind_uris) +
-    /// [`get_iface`](Self::get_iface) when you need live interface
-    /// references: the latter pair races against interface drops and may
-    /// return fewer interfaces than were just bound.
-    #[must_use]
-    pub fn current_bind_interfaces(&self) -> Vec<BindInterface> {
+    pub fn interfaces(&self) -> Vec<BindInterface> {
         let registry = self.bind_registry.lock().unwrap();
         registry
             .values()
@@ -421,18 +408,6 @@ impl Network {
                     .collect::<Vec<_>>()
             })
             .collect()
-    }
-
-    /// Look up the [`BindInterface`] currently registered for `bind_uri`.
-    ///
-    /// Returns `None` if the URI was never bound (directly or through
-    /// [`Network::add_binds`]) or if the interface was already released.
-    /// This is a thin wrapper around
-    /// [`InterfaceManager::get`](crate::dquic::qinterface::manager::InterfaceManager::get)
-    /// that keeps callers from having to reach into the manager directly.
-    #[must_use]
-    pub fn get_iface(&self, bind_uri: &BindUri) -> Option<BindInterface> {
-        self.iface_manager.get(bind_uri)
     }
 
     /// Snapshot of SNI names currently registered on this network.
@@ -449,6 +424,98 @@ impl Network {
             .iter()
             .filter_map(|kv| kv.value().upgrade().map(|_| kv.key().clone()))
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reconcile task
+// ---------------------------------------------------------------------------
+
+impl Network {
+    /// Start the single background reconcile task that watches for device
+    /// changes and keeps every registered [`BindPattern`]'s bound
+    /// interfaces in sync. Idempotent — subsequent calls are no-ops.
+    fn start_reconcile(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let devices = self.devices;
+        let handle = AbortOnDropHandle::new(tokio::spawn(
+            async move {
+                Self::reconcile_loop(weak, devices).await;
+            }
+            .instrument(tracing::Span::current()),
+        ));
+        let _ = self._reconcile.set(handle);
+    }
+
+    async fn reconcile_loop(weak: Weak<Self>, devices: &'static Devices) {
+        let mut monitor = devices.monitor();
+
+        while let Some((interfaces, _event)) = monitor.update().await {
+            let Some(network) = weak.upgrade() else {
+                return;
+            };
+
+            // Snapshot the desired vs current state under the registry lock.
+            let mut to_bind: Vec<(BindPattern, Vec<BindUri>)> = Vec::new();
+            let mut to_unbind: Vec<(BoundMap, Vec<BindUri>)> = Vec::new();
+            {
+                let registry = network.bind_registry.lock().unwrap();
+                for (pattern, entry) in registry.iter() {
+                    let desired: HashMap<String, BindUri> =
+                        expand_pattern(pattern, interfaces.keys().map(String::as_str))
+                            .into_iter()
+                            .map(|uri| (uri.identity_key(), uri))
+                            .collect();
+
+                    let bound = entry.bound.lock().unwrap();
+
+                    let unbind_uris: Vec<BindUri> = bound
+                        .iter()
+                        .filter(|(key, _)| !desired.contains_key(*key))
+                        .map(|(_, (uri, _))| uri.clone())
+                        .collect();
+
+                    let bind_uris: Vec<BindUri> = desired
+                        .into_iter()
+                        .filter(|(key, _)| !bound.contains_key(key))
+                        .map(|(_, uri)| uri)
+                        .collect();
+
+                    if !unbind_uris.is_empty() {
+                        to_unbind.push((entry.bound.clone(), unbind_uris));
+                    }
+                    if !bind_uris.is_empty() {
+                        to_bind.push((pattern.clone(), bind_uris));
+                    }
+                }
+            } // release registry lock
+
+            // Unbind removed interfaces.
+            for (bound, uris) in to_unbind {
+                for uri in uris {
+                    bound.lock().unwrap().remove(&uri.identity_key());
+                    network.iface_manager.unbind(uri).await;
+                }
+            }
+
+            // Bind new interfaces (double-check the pattern is still
+            // registered before inserting).
+            for (pattern, uris) in to_bind {
+                for uri in uris {
+                    let iface = network.bind_iface(uri.clone()).await;
+                    let registry = network.bind_registry.lock().unwrap();
+                    if let Some(entry) = registry.get(&pattern) {
+                        entry
+                            .bound
+                            .lock()
+                            .unwrap()
+                            .insert(uri.identity_key(), (uri, iface));
+                    }
+                    // If the pattern was removed while we were binding,
+                    // drop the interface silently.
+                }
+            }
+        }
     }
 }
 
@@ -590,16 +657,16 @@ impl Network {
     /// the inbound mpmc queue so concurrent receivers cooperate.
     pub async fn bind_server(
         self: &Arc<Self>,
-        named: Arc<NamedIdentity>,
+        identity: Arc<Identity>,
         server_config: ServerQuicConfig,
     ) -> Result<ServerBinding, BindServerError> {
-        let name = named.name.clone();
+        let name = identity.name.clone();
 
         // Reuse path: existing SNI registration with the same identity.
         if let Some(weak) = self.sni_registry.get(&name).map(|kv| kv.value().clone())
             && let Some(entry) = weak.upgrade()
         {
-            if !Arc::ptr_eq(&entry.named_identity, &named) {
+            if !Arc::ptr_eq(&entry.identity, &identity) {
                 return Err(BindServerError::SniInUse { name });
             }
             return Ok(ServerBinding {
@@ -636,7 +703,7 @@ impl Network {
             }
         };
 
-        let certified_key = build_certified_key(&named)?;
+        let certified_key = build_certified_key(&identity)?;
         let backlog = server_config.own.backlog.max(1);
         let (tx, rx) = async_channel::bounded(backlog);
 
@@ -645,7 +712,7 @@ impl Network {
             registry: Arc::downgrade(&self.sni_registry),
         });
         let entry = Arc::new(SniEntry {
-            named_identity: named,
+            identity,
             certified_key,
             incomings_tx: tx,
             incomings_rx: rx,
@@ -687,7 +754,7 @@ fn build_rustls_server_config(
     Ok(tls)
 }
 
-fn build_certified_key(named: &NamedIdentity) -> Result<Arc<CertifiedKey>, BindServerError> {
+fn build_certified_key(named: &Identity) -> Result<Arc<CertifiedKey>, BindServerError> {
     use bind_server_error::LoadKeySnafu;
 
     let provider = RustlsServerConfig::builder().crypto_provider().clone();
@@ -727,37 +794,4 @@ fn server_config_compatible(a: &ServerQuicConfig, b: &ServerQuicConfig) -> bool 
         && Arc::ptr_eq(&a.own.client_auther, &b.own.client_auther)
         && Arc::ptr_eq(&a.own.client_cert_verifier, &b.own.client_cert_verifier);
     common_eq && own_eq
-}
-
-// ---------------------------------------------------------------------------
-// BindsGuard
-// ---------------------------------------------------------------------------
-
-/// RAII guard returned by [`Network::add_binds`].
-pub struct BindsGuard {
-    id: u64,
-    registry: BindRegistry,
-    iface_manager: Arc<InterfaceManager>,
-    bound: Arc<Mutex<HashMap<String, (BindUri, BindInterface)>>>,
-}
-
-impl Drop for BindsGuard {
-    fn drop(&mut self) {
-        self.registry.lock().unwrap().remove(&self.id);
-        // Drop our strong references first so `unbind` can fully tear
-        // down each interface.
-        let uris: Vec<BindUri> = self
-            .bound
-            .lock()
-            .unwrap()
-            .drain()
-            .map(|(_, (uri, _iface))| uri)
-            .collect();
-        for uri in uris {
-            let iface_manager = self.iface_manager.clone();
-            tokio::spawn(async move {
-                iface_manager.unbind(uri).await;
-            });
-        }
-    }
 }

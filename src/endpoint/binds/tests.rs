@@ -9,7 +9,7 @@ use crate::dquic::{qbase::net::Family, qinterface::bind_uri::BindUriScheme};
 
 #[test]
 fn parse_full_iface_with_family() {
-    let b: Bind = "iface://v4.enp17s0:8080".parse().unwrap();
+    let b: BindPattern = "iface://v4.enp17s0:8080".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Iface);
     assert_eq!(b.host.family(), Some(Family::V4));
     assert_eq!(
@@ -22,7 +22,7 @@ fn parse_full_iface_with_family() {
 
 #[test]
 fn parse_full_iface_glob() {
-    let b: Bind = "iface://v4.en*:8080".parse().unwrap();
+    let b: BindPattern = "iface://v4.en*:8080".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Iface);
     assert_eq!(b.host.family(), Some(Family::V4));
     assert!(b.host.is_glob());
@@ -32,7 +32,7 @@ fn parse_full_iface_glob() {
 
 #[test]
 fn parse_iface_no_family() {
-    let b: Bind = "iface://enp17s0:8080".parse().unwrap();
+    let b: BindPattern = "iface://enp17s0:8080".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Iface);
     assert_eq!(b.host.family(), None);
     assert!(!b.host.is_glob());
@@ -42,7 +42,7 @@ fn parse_iface_no_family() {
 
 #[test]
 fn parse_iface_no_port() {
-    let b: Bind = "iface://v4.enp17s0".parse().unwrap();
+    let b: BindPattern = "iface://v4.enp17s0".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Iface);
     assert_eq!(b.host.family(), Some(Family::V4));
     assert_eq!(b.host.as_str(), "enp17s0");
@@ -51,7 +51,7 @@ fn parse_iface_no_port() {
 
 #[test]
 fn parse_inet() {
-    let b: Bind = "inet://127.0.0.1:8080".parse().unwrap();
+    let b: BindPattern = "inet://127.0.0.1:8080".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Inet);
     assert_eq!(b.host.family(), None);
     assert_eq!(b.host.as_str(), "127.0.0.1");
@@ -60,7 +60,7 @@ fn parse_inet() {
 
 #[test]
 fn parse_no_scheme_ip() {
-    let b: Bind = "127.0.0.1:8080".parse().unwrap();
+    let b: BindPattern = "127.0.0.1:8080".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Inet);
     assert_eq!(b.host.as_str(), "127.0.0.1");
     assert_eq!(b.port, Some(8080));
@@ -68,7 +68,7 @@ fn parse_no_scheme_ip() {
 
 #[test]
 fn parse_no_scheme_iface() {
-    let b: Bind = "enp17s0:8080".parse().unwrap();
+    let b: BindPattern = "enp17s0:8080".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Iface);
     assert_eq!(b.host.family(), None);
     assert_eq!(b.host.as_str(), "enp17s0");
@@ -77,7 +77,7 @@ fn parse_no_scheme_iface() {
 
 #[test]
 fn parse_no_scheme_with_family() {
-    let b: Bind = "v4.enp17s0:8080".parse().unwrap();
+    let b: BindPattern = "v4.enp17s0:8080".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Iface);
     assert_eq!(b.host.family(), Some(Family::V4));
     assert_eq!(b.host.as_str(), "enp17s0");
@@ -86,7 +86,7 @@ fn parse_no_scheme_with_family() {
 
 #[test]
 fn parse_glob_no_scheme() {
-    let b: Bind = "en*:8080".parse().unwrap();
+    let b: BindPattern = "en*:8080".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Iface);
     assert_eq!(b.host.family(), None);
     assert!(b.host.is_glob());
@@ -96,7 +96,7 @@ fn parse_glob_no_scheme() {
 
 #[test]
 fn parse_star_only() {
-    let b: Bind = "*".parse().unwrap();
+    let b: BindPattern = "*".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Iface);
     assert_eq!(b.host.family(), None);
     assert!(b.host.is_glob());
@@ -106,7 +106,7 @@ fn parse_star_only() {
 
 #[test]
 fn parse_star_with_port() {
-    let b: Bind = "*:8080".parse().unwrap();
+    let b: BindPattern = "*:8080".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Iface);
     assert_eq!(b.host.family(), None);
     assert!(b.host.is_glob());
@@ -115,7 +115,7 @@ fn parse_star_with_port() {
 
 #[test]
 fn parse_v4_star() {
-    let b: Bind = "v4.*".parse().unwrap();
+    let b: BindPattern = "v4.*".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Iface);
     assert_eq!(b.host.family(), Some(Family::V4));
     assert!(b.host.is_glob());
@@ -124,7 +124,7 @@ fn parse_v4_star() {
 
 #[test]
 fn parse_v6_star_with_port() {
-    let b: Bind = "v6.*:8080".parse().unwrap();
+    let b: BindPattern = "v6.*:8080".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Iface);
     assert_eq!(b.host.family(), Some(Family::V6));
     assert!(b.host.is_glob());
@@ -133,7 +133,7 @@ fn parse_v6_star_with_port() {
 
 #[test]
 fn parse_no_scheme_no_port() {
-    let b: Bind = "enp17s0".parse().unwrap();
+    let b: BindPattern = "enp17s0".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Iface);
     assert_eq!(b.host.family(), None);
     assert_eq!(b.host.as_str(), "enp17s0");
@@ -142,7 +142,7 @@ fn parse_no_scheme_no_port() {
 
 #[test]
 fn parse_with_path_and_query() {
-    let b: Bind = "iface://v4.en*:8080/?stun_server=stun.genmeta.net"
+    let b: BindPattern = "iface://v4.en*:8080/?stun_server=stun.genmeta.net"
         .parse()
         .unwrap();
     assert_eq!(b.scheme, BindUriScheme::Iface);
@@ -157,7 +157,7 @@ fn parse_with_path_and_query() {
 
 #[test]
 fn parse_with_query_only() {
-    let b: Bind = "iface://v4.enp17s0:8080?stun=true".parse().unwrap();
+    let b: BindPattern = "iface://v4.enp17s0:8080?stun=true".parse().unwrap();
     assert_eq!(b.path_and_query_str(), Some("?stun=true"));
 }
 
@@ -165,19 +165,19 @@ fn parse_with_query_only() {
 
 #[test]
 fn display_full() {
-    let b: Bind = "iface://v4.enp17s0:8080".parse().unwrap();
+    let b: BindPattern = "iface://v4.enp17s0:8080".parse().unwrap();
     assert_eq!(b.to_string(), "iface://v4.enp17s0:8080");
 }
 
 #[test]
 fn display_no_port() {
-    let b: Bind = "iface://v4.enp17s0".parse().unwrap();
+    let b: BindPattern = "iface://v4.enp17s0".parse().unwrap();
     assert_eq!(b.to_string(), "iface://v4.enp17s0");
 }
 
 #[test]
 fn display_no_family() {
-    let b: Bind = "iface://enp17s0:8080".parse().unwrap();
+    let b: BindPattern = "iface://enp17s0:8080".parse().unwrap();
     assert_eq!(b.to_string(), "iface://enp17s0:8080");
 }
 
@@ -248,13 +248,13 @@ fn classify_bracket_non_ip_as_glob() {
 
 #[test]
 fn families_both() {
-    let b: Bind = "enp17s0:8080".parse().unwrap();
+    let b: BindPattern = "enp17s0:8080".parse().unwrap();
     assert_eq!(b.host.families(), [Family::V4, Family::V6]);
 }
 
 #[test]
 fn families_v4_only() {
-    let b: Bind = "v4.enp17s0:8080".parse().unwrap();
+    let b: BindPattern = "v4.enp17s0:8080".parse().unwrap();
     assert_eq!(b.host.families(), [Family::V4]);
 }
 
@@ -262,14 +262,14 @@ fn families_v4_only() {
 
 #[test]
 fn expand_iface() {
-    let b: Bind = "iface://v4.enp17s0:8080".parse().unwrap();
+    let b: BindPattern = "iface://v4.enp17s0:8080".parse().unwrap();
     let uris: Vec<_> = b.to_bind_uris(["enp17s0"]).map(|u| u.to_string()).collect();
     assert_eq!(uris, vec!["iface://v4.enp17s0:8080/"]);
 }
 
 #[test]
 fn expand_both_families() {
-    let b: Bind = "iface://enp17s0:8080".parse().unwrap();
+    let b: BindPattern = "iface://enp17s0:8080".parse().unwrap();
     let uris: Vec<_> = b.to_bind_uris(["enp17s0"]).map(|u| u.to_string()).collect();
     assert_eq!(
         uris,
@@ -279,7 +279,7 @@ fn expand_both_families() {
 
 #[test]
 fn expand_auto_port() {
-    let b: Bind = "iface://v4.enp17s0".parse().unwrap();
+    let b: BindPattern = "iface://v4.enp17s0".parse().unwrap();
     let uris: Vec<_> = b.to_bind_uris(["enp17s0"]).map(|u| u.to_string()).collect();
     assert_eq!(uris.len(), 1);
     assert!(uris[0].starts_with("iface://v4.enp17s0:0/"));
@@ -287,14 +287,14 @@ fn expand_auto_port() {
 
 #[test]
 fn expand_inet() {
-    let b: Bind = "127.0.0.1:8080".parse().unwrap();
+    let b: BindPattern = "127.0.0.1:8080".parse().unwrap();
     let uris: Vec<_> = b.to_bind_uris([]).map(|u| u.to_string()).collect();
     assert_eq!(uris, vec!["inet://127.0.0.1:8080/"]);
 }
 
 #[test]
 fn expand_with_interfaces_glob() {
-    let b: Bind = "en*:8080".parse().unwrap();
+    let b: BindPattern = "en*:8080".parse().unwrap();
     let interfaces = ["enp17s0", "eno1", "wlan0", "lo"];
     let uris: Vec<_> = b.to_bind_uris(interfaces).collect();
     // en* matches enp17s0 and eno1, each with V4 + V6
@@ -303,7 +303,7 @@ fn expand_with_interfaces_glob() {
 
 #[test]
 fn expand_with_interfaces_star() {
-    let b: Bind = "*:8080".parse().unwrap();
+    let b: BindPattern = "*:8080".parse().unwrap();
     let interfaces = ["enp17s0", "wlan0"];
     let uris: Vec<_> = b.to_bind_uris(interfaces).collect();
     // * matches all, each with V4 + V6
@@ -312,7 +312,7 @@ fn expand_with_interfaces_star() {
 
 #[test]
 fn expand_path_and_query_passthrough() {
-    let b: Bind = "iface://v4.en*:8080/?stun_server=stun.genmeta.net"
+    let b: BindPattern = "iface://v4.en*:8080/?stun_server=stun.genmeta.net"
         .parse()
         .unwrap();
     let uris: Vec<_> = b.to_bind_uris(["enp17s0"]).map(|u| u.to_string()).collect();
@@ -324,7 +324,7 @@ fn expand_path_and_query_passthrough() {
 
 #[test]
 fn path_and_query_is_validated() {
-    let b: Bind = "iface://v4.en*:8080/?key=value".parse().unwrap();
+    let b: BindPattern = "iface://v4.en*:8080/?key=value".parse().unwrap();
     let pq = b.path_and_query.as_ref().unwrap();
     assert_eq!(pq, "/?key=value");
 }
@@ -333,7 +333,7 @@ fn path_and_query_is_validated() {
 
 #[test]
 fn parse_bare_ipv6_loopback() {
-    let b: Bind = "::1".parse().unwrap();
+    let b: BindPattern = "::1".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Inet);
     assert!(b.host.is_ip_addr());
     assert_eq!(b.host.as_str(), "::1");
@@ -343,7 +343,7 @@ fn parse_bare_ipv6_loopback() {
 
 #[test]
 fn parse_bare_ipv6_any() {
-    let b: Bind = "::".parse().unwrap();
+    let b: BindPattern = "::".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Inet);
     assert!(b.host.is_ip_addr());
     assert_eq!(b.host.as_str(), "::");
@@ -352,7 +352,7 @@ fn parse_bare_ipv6_any() {
 
 #[test]
 fn parse_bare_ipv6_full() {
-    let b: Bind = "2001:db8::1".parse().unwrap();
+    let b: BindPattern = "2001:db8::1".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Inet);
     assert!(b.host.is_ip_addr());
     assert_eq!(b.host.as_str(), "2001:db8::1");
@@ -362,7 +362,7 @@ fn parse_bare_ipv6_full() {
 #[test]
 fn parse_bare_ipv4() {
     // Bare IPv4 without port also works via the fast path
-    let b: Bind = "192.168.1.1".parse().unwrap();
+    let b: BindPattern = "192.168.1.1".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Inet);
     assert!(b.host.is_ip_addr());
     assert_eq!(b.host.as_str(), "192.168.1.1");
@@ -371,14 +371,14 @@ fn parse_bare_ipv4() {
 
 #[test]
 fn display_bare_ipv6() {
-    let b: Bind = "::1".parse().unwrap();
+    let b: BindPattern = "::1".parse().unwrap();
     // Display wraps IPv6 in brackets
     assert_eq!(b.to_string(), "inet://[::1]");
 }
 
 #[test]
 fn expand_bare_ipv6() {
-    let b: Bind = "::1".parse().unwrap();
+    let b: BindPattern = "::1".parse().unwrap();
     let uris: Vec<_> = b.to_bind_uris([]).map(|u| u.to_string()).collect();
     assert_eq!(uris.len(), 1);
     assert!(uris[0].starts_with("inet://[::1]:0/"));
@@ -388,7 +388,7 @@ fn expand_bare_ipv6() {
 
 #[test]
 fn parse_glob_bracket_class() {
-    let b: Bind = "[ew]*:8080".parse().unwrap();
+    let b: BindPattern = "[ew]*:8080".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Iface);
     assert!(b.host.is_glob());
     assert_eq!(b.host.as_str(), "[ew]*");
@@ -399,7 +399,7 @@ fn parse_glob_bracket_class() {
 
 #[test]
 fn parse_ipv6_full_scheme() {
-    let b: Bind = "inet://[::1]:8080".parse().unwrap();
+    let b: BindPattern = "inet://[::1]:8080".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Inet);
     assert_eq!(b.host.family(), None);
     assert_eq!(b.host.as_str(), "::1");
@@ -409,7 +409,7 @@ fn parse_ipv6_full_scheme() {
 
 #[test]
 fn parse_ipv6_no_scheme() {
-    let b: Bind = "[::1]:8080".parse().unwrap();
+    let b: BindPattern = "[::1]:8080".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Inet);
     assert_eq!(b.host.as_str(), "::1");
     assert_eq!(b.port, Some(8080));
@@ -417,7 +417,7 @@ fn parse_ipv6_no_scheme() {
 
 #[test]
 fn parse_ipv6_full_addr() {
-    let b: Bind = "inet://[2001:db8::1]:443".parse().unwrap();
+    let b: BindPattern = "inet://[2001:db8::1]:443".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Inet);
     assert_eq!(b.host.as_str(), "2001:db8::1");
     assert_eq!(b.port, Some(443));
@@ -426,7 +426,7 @@ fn parse_ipv6_full_addr() {
 
 #[test]
 fn parse_ipv6_link_local() {
-    let b: Bind = "[fe80::1]:8080".parse().unwrap();
+    let b: BindPattern = "[fe80::1]:8080".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Inet);
     assert_eq!(b.host.as_str(), "fe80::1");
     assert_eq!(b.port, Some(8080));
@@ -434,7 +434,7 @@ fn parse_ipv6_link_local() {
 
 #[test]
 fn parse_ipv6_any() {
-    let b: Bind = "inet://[::]:0".parse().unwrap();
+    let b: BindPattern = "inet://[::]:0".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Inet);
     assert_eq!(b.host.as_str(), "::");
     assert_eq!(b.port, Some(0));
@@ -442,7 +442,7 @@ fn parse_ipv6_any() {
 
 #[test]
 fn parse_ipv6_no_port() {
-    let b: Bind = "[::1]".parse().unwrap();
+    let b: BindPattern = "[::1]".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Inet);
     assert_eq!(b.host.as_str(), "::1");
     assert_eq!(b.port, None);
@@ -450,7 +450,7 @@ fn parse_ipv6_no_port() {
 
 #[test]
 fn parse_ipv6_with_path_and_query() {
-    let b: Bind = "inet://[::1]:8080/?key=value".parse().unwrap();
+    let b: BindPattern = "inet://[::1]:8080/?key=value".parse().unwrap();
     assert_eq!(b.scheme, BindUriScheme::Inet);
     assert_eq!(b.host.as_str(), "::1");
     assert_eq!(b.port, Some(8080));
@@ -460,26 +460,26 @@ fn parse_ipv6_with_path_and_query() {
 #[test]
 fn display_ipv6_roundtrip() {
     let input = "inet://[::1]:8080";
-    let b: Bind = input.parse().unwrap();
+    let b: BindPattern = input.parse().unwrap();
     assert_eq!(b.to_string(), input);
 }
 
 #[test]
 fn display_ipv6_full_addr() {
-    let b: Bind = "inet://[2001:db8::1]:443".parse().unwrap();
+    let b: BindPattern = "inet://[2001:db8::1]:443".parse().unwrap();
     assert_eq!(b.to_string(), "inet://[2001:db8::1]:443");
 }
 
 #[test]
 fn expand_ipv6() {
-    let b: Bind = "inet://[::1]:8080".parse().unwrap();
+    let b: BindPattern = "inet://[::1]:8080".parse().unwrap();
     let uris: Vec<_> = b.to_bind_uris([]).map(|u| u.to_string()).collect();
     assert_eq!(uris, vec!["inet://[::1]:8080/"]);
 }
 
 #[test]
 fn expand_ipv6_auto_port() {
-    let b: Bind = "[::1]".parse().unwrap();
+    let b: BindPattern = "[::1]".parse().unwrap();
     let uris: Vec<_> = b.to_bind_uris([]).map(|u| u.to_string()).collect();
     assert_eq!(uris.len(), 1);
     assert!(uris[0].starts_with("inet://[::1]:0/"));
@@ -488,13 +488,13 @@ fn expand_ipv6_auto_port() {
 #[test]
 fn family_ip_rejected() {
     // v4.127.0.0.1 is not a valid bind pattern
-    assert!("v4.127.0.0.1:8080".parse::<Bind>().is_err());
-    assert!("inet://v6.[::1]:8080".parse::<Bind>().is_err());
+    assert!("v4.127.0.0.1:8080".parse::<BindPattern>().is_err());
+    assert!("inet://v6.[::1]:8080".parse::<BindPattern>().is_err());
 }
 
 #[test]
 fn ipv6_host_is_ip_addr() {
-    let b: Bind = "[::1]:8080".parse().unwrap();
+    let b: BindPattern = "[::1]:8080".parse().unwrap();
     assert!(b.host.is_ip_addr());
     assert!(b.host.as_ip_addr().unwrap().is_ipv6());
 }
@@ -504,11 +504,11 @@ fn ipv6_host_is_ip_addr() {
 #[test]
 fn binds_new_and_deref() {
     let v = vec![
-        "iface://v4.enp17s0:8080".parse::<Bind>().unwrap(),
-        "127.0.0.1:443".parse::<Bind>().unwrap(),
+        "iface://v4.enp17s0:8080".parse::<BindPattern>().unwrap(),
+        "127.0.0.1:443".parse::<BindPattern>().unwrap(),
     ];
     let binds = Binds::new(v.clone());
-    // Deref to &[Bind]
+    // Deref to &[BindPattern]
     assert_eq!(binds.len(), 2);
     assert_eq!(&*binds, &v[..]);
 }
@@ -522,9 +522,9 @@ fn binds_deref_mut() {
 
 #[test]
 fn binds_from_into_vec() {
-    let v = vec!["*:8080".parse::<Bind>().unwrap()];
+    let v = vec!["*:8080".parse::<BindPattern>().unwrap()];
     let binds: Binds = v.clone().into();
-    let out: Vec<Bind> = binds.into();
+    let out: Vec<BindPattern> = binds.into();
     assert_eq!(out, v);
 }
 

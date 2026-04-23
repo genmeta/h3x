@@ -9,7 +9,7 @@ use snafu::{ResultExt, Snafu};
 
 use super::{
     config::{ClientQuicConfig, ServerCertVerifierChoice, ServerQuicConfig},
-    identity::{Identity, NamedIdentity},
+    identity::Identity,
     network::{BindServerError, Network, ServerBinding},
 };
 use crate::{
@@ -100,14 +100,14 @@ pub type EndpointError = ConnectError;
 pub struct QuicEndpoint {
     /// Shared network infrastructure.
     pub network: Arc<Network>,
-    /// TLS identity for this endpoint.
-    pub identity: Identity,
+    /// TLS identity for this endpoint (`None` for anonymous/client-only).
+    pub identity: Option<Arc<Identity>>,
     /// Resolver used when establishing outbound connections.
     pub resolver: Arc<dyn Resolve + Send + Sync>,
     /// Client-side configuration.
-    pub client: ClientQuicConfig,
+    pub client: Arc<ClientQuicConfig>,
     /// Server-side configuration.
-    pub server: ServerQuicConfig,
+    pub server: Arc<ServerQuicConfig>,
     client_tls_cache: ArcSwapOption<CachedClientTls>,
     server_binding_cache: ArcSwapOption<CachedServerBinding>,
 }
@@ -156,7 +156,7 @@ impl QuicEndpoint {
     #[must_use]
     pub fn new(
         network: Arc<Network>,
-        identity: Identity,
+        identity: Option<Arc<Identity>>,
         resolver: Arc<dyn Resolve + Send + Sync>,
         client: ClientQuicConfig,
         server: ServerQuicConfig,
@@ -165,11 +165,27 @@ impl QuicEndpoint {
             network,
             identity,
             resolver,
-            client,
-            server,
+            client: Arc::new(client),
+            server: Arc::new(server),
             client_tls_cache: ArcSwapOption::empty(),
             server_binding_cache: ArcSwapOption::empty(),
         }
+    }
+
+    /// Get a mutable reference to the client config, cloning if shared.
+    pub fn client_mut(&mut self) -> &mut ClientQuicConfig {
+        Arc::make_mut(&mut self.client)
+    }
+
+    /// Get a mutable reference to the server config, cloning if shared.
+    pub fn server_mut(&mut self) -> &mut ServerQuicConfig {
+        Arc::make_mut(&mut self.server)
+    }
+
+    /// Get a mutable reference to the identity, cloning if shared.
+    /// Returns `None` if the endpoint is anonymous.
+    pub fn identity_mut(&mut self) -> Option<&mut Identity> {
+        self.identity.as_mut().map(Arc::make_mut)
     }
 
     fn client_cache_key(&self) -> ClientCacheKey {
@@ -190,11 +206,8 @@ impl QuicEndpoint {
     }
 }
 
-fn identity_ptr(identity: &Identity) -> usize {
-    match identity {
-        Identity::Anonymous => 0,
-        Identity::Named(id) => Arc::as_ptr(id) as usize,
-    }
+fn identity_ptr(identity: &Option<Arc<Identity>>) -> usize {
+    identity.as_ref().map_or(0, |id| Arc::as_ptr(id) as usize)
 }
 
 impl QuicEndpoint {
@@ -231,8 +244,8 @@ impl QuicEndpoint {
                 .with_custom_certificate_verifier(v.clone()),
         };
         let mut tls = match &self.identity {
-            Identity::Anonymous => builder.with_no_client_auth(),
-            Identity::Named(id) => builder
+            None => builder.with_no_client_auth(),
+            Some(id) => builder
                 .with_client_auth_cert(id.certs.clone(), clone_key(&id.key))
                 .context(ClientAuthSnafu)?,
         };
@@ -253,7 +266,7 @@ impl QuicEndpoint {
         // `remote_agent` (identity-based access control on the server
         // relies on this).
         let mut parameters = self.client.own.parameters.clone();
-        if let Identity::Named(named) = &self.identity {
+        if let Some(named) = &self.identity {
             parameters
                 .set(
                     crate::dquic::qbase::param::ParameterId::ClientName,
@@ -261,15 +274,16 @@ impl QuicEndpoint {
                 )
                 .expect("ClientName is a client-only string parameter");
         }
-        Connection::new_client(server_name.to_owned(), self.client.own.token_sink.clone())
-            .with_parameters(parameters)
-            .with_tls_config((*tls).clone())
-            .with_streams_concurrency_strategy(self.client.common.stream_strategy_factory.as_ref())
-            .with_zero_rtt(self.client.common.enable_0rtt)
-            .with_iface_factory(self.network.io_factory().clone())
-            .with_iface_manager(self.network.iface_manager().clone())
-            .with_quic_router(self.network.quic_router().clone())
-            .with_locations(self.network.locations().clone())
+        let builder =
+            Connection::new_client(server_name.to_owned(), self.client.own.token_sink.clone())
+                .with_parameters(parameters)
+                .with_tls_config((*tls).clone())
+                .with_streams_concurrency_strategy(
+                    self.client.common.stream_strategy_factory.as_ref(),
+                )
+                .with_zero_rtt(self.client.common.enable_0rtt);
+        self.network
+            .configure_connection(builder)
             .with_defer_idle_timeout(self.client.common.defer_idle_timeout)
             .with_cids(ConnectionId::random_gen(8))
             .with_qlog(self.client.common.qlogger.clone())
@@ -287,7 +301,7 @@ impl QuicEndpoint {
         let _ = connection.add_peer_endpoint(server_ep, source.clone());
 
         let bind_uri = bind_uri_for(&source, &server_ep);
-        let iface = self.network.bind(bind_uri).await;
+        let iface = self.network.bind_iface(bind_uri).await;
 
         if matches!(
             server_ep,
@@ -317,8 +331,8 @@ impl QuicEndpoint {
         use accept_error::BindServerSnafu;
 
         let named = match &self.identity {
-            Identity::Anonymous => return Err(AcceptError::ServerUnavailable),
-            Identity::Named(id) => id.clone(),
+            None => return Err(AcceptError::ServerUnavailable),
+            Some(id) => id.clone(),
         };
         let key = self.server_cache_key();
         if let Some(cached) = self.server_binding_cache.load_full()
@@ -328,7 +342,7 @@ impl QuicEndpoint {
         }
         let binding = self
             .network
-            .bind_server(named as Arc<NamedIdentity>, self.server.clone())
+            .bind_server(named, (*self.server).clone())
             .await
             .context(BindServerSnafu)?;
         self.server_binding_cache

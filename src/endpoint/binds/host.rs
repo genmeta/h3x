@@ -1,4 +1,8 @@
-use std::{fmt, net::IpAddr};
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    net::IpAddr,
+};
 
 use globset::{Glob, GlobMatcher};
 
@@ -188,6 +192,25 @@ impl PartialEq for BindHost {
 }
 
 impl Eq for BindHost {}
+
+impl Hash for BindHost {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Ip { repr, .. } => repr.hash(state),
+            Self::Glob {
+                family, matcher, ..
+            } => {
+                family.hash(state);
+                matcher.glob().glob().hash(state);
+            }
+            Self::Exact { family, nic, .. } => {
+                family.hash(state);
+                nic.hash(state);
+            }
+        }
+    }
+}
 
 impl fmt::Debug for BindHost {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

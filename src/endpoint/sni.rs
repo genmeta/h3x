@@ -15,7 +15,7 @@ use rustls::{
     sign::CertifiedKey,
 };
 
-use super::identity::{NamedIdentity, ServerName};
+use super::identity::{Identity, ServerName};
 use crate::dquic::prelude::Connection;
 
 /// Per-SNI entry stored behind a `Weak` in the network's registry.
@@ -23,7 +23,7 @@ use crate::dquic::prelude::Connection;
 /// Holds an mpmc channel so multiple [`ServerBinding`] clones share the
 /// same inbound connection queue.
 pub(crate) struct SniEntry {
-    pub(crate) named_identity: Arc<NamedIdentity>,
+    pub(crate) identity: Arc<Identity>,
     pub(crate) certified_key: Arc<CertifiedKey>,
     pub(crate) incomings_tx: async_channel::Sender<Arc<Connection>>,
     pub(crate) incomings_rx: async_channel::Receiver<Arc<Connection>>,

@@ -24,8 +24,8 @@ use h3x::{
     client::Client,
     connection::ConnectionBuilder,
     endpoint::{
-        ClientOnlyConfig, ClientQuicConfig, H3Endpoint, Identity, NamedIdentity, Network,
-        QuicEndpoint, ServerCertVerifierChoice, ServerQuicConfig,
+        ClientOnlyConfig, ClientQuicConfig, H3Endpoint, Identity, Network, QuicEndpoint,
+        ServerCertVerifierChoice, ServerQuicConfig,
     },
     pool::Pool,
     server::{self, Router},
@@ -44,10 +44,10 @@ async fn hello_service(_: &mut server::Request, response: &mut server::Response)
         .set_body(&b"hello from endpoint"[..]);
 }
 
-fn named_server_identity() -> Identity {
+fn named_server_identity() -> Option<Arc<Identity>> {
     let certs: Vec<CertificateDer<'static>> = SERVER_CERT.to_certificate();
     let key: PrivateKeyDer<'static> = SERVER_KEY.to_private_key();
-    Identity::Named(Arc::new(NamedIdentity {
+    Some(Arc::new(Identity {
         name: Arc::from("localhost"),
         certs,
         key: Arc::new(key),
@@ -85,7 +85,9 @@ fn serve_and_connect_hello() {
             ClientQuicConfig::default(),
             ServerQuicConfig::default(),
         );
-        let bind_iface = network.bind(BindUri::from("inet://127.0.0.1:0")).await;
+        let bind_iface = network
+            .bind_iface(BindUri::from("inet://127.0.0.1:0"))
+            .await;
         let bound_addr = bind_iface
             .borrow()
             .bound_addr()
@@ -117,7 +119,7 @@ fn serve_and_connect_hello() {
         };
         let client_quic = QuicEndpoint::new(
             network.clone(),
-            Identity::Anonymous,
+            None,
             Arc::new(SystemResolver),
             client_quic_config,
             ServerQuicConfig::default(),
@@ -144,14 +146,90 @@ fn serve_and_connect_hello() {
     });
 }
 
+#[test]
+fn endpoint_get_convenience() {
+    run("endpoint_get_convenience", async move {
+        let network = test_network();
+
+        // --- Server ---
+        let server_quic = QuicEndpoint::new(
+            network.clone(),
+            named_server_identity(),
+            Arc::new(SystemResolver),
+            ClientQuicConfig::default(),
+            ServerQuicConfig::default(),
+        );
+        let bind_iface = network
+            .bind_iface(BindUri::from("inet://127.0.0.1:0"))
+            .await;
+        let bound_addr = bind_iface
+            .borrow()
+            .bound_addr()
+            .expect("bind interface must have a local address");
+        let port = match bound_addr {
+            BoundAddr::Internet(socket_addr) => socket_addr.port(),
+            _ => unreachable!("bound to inet://127.0.0.1"),
+        };
+
+        let server_endpoint = H3Endpoint::new(
+            server_quic,
+            Pool::empty(),
+            Arc::new(ConnectionBuilder::new(Arc::default())),
+        );
+        let router = Router::new().get("/hello", hello_service);
+        let _serve =
+            AbortOnDropHandle::new(tokio::spawn(
+                async move { server_endpoint.serve(router).await },
+            ));
+
+        // --- Client (using H3Endpoint::get convenience) ---
+        let client_own = ClientOnlyConfig {
+            verifier: ServerCertVerifierChoice::WebPki(client_webpki_verifier()),
+            ..Default::default()
+        };
+        let client_quic_config = ClientQuicConfig {
+            common: Arc::default(),
+            own: Arc::new(client_own),
+        };
+        let client_quic = QuicEndpoint::new(
+            network.clone(),
+            None,
+            Arc::new(SystemResolver),
+            client_quic_config,
+            ServerQuicConfig::default(),
+        );
+        let client_endpoint = H3Endpoint::new(
+            client_quic,
+            Pool::empty(),
+            Arc::new(ConnectionBuilder::new(Arc::default())),
+        );
+
+        let uri: http::Uri = format!("https://localhost:{port}/hello").parse().unwrap();
+        let (_request, mut response) = client_endpoint
+            .get(uri.clone())
+            .await
+            .expect("H3Endpoint::get failed");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = response
+            .read_to_string()
+            .await
+            .expect("failed to read response body");
+        assert_eq!(body, "hello from endpoint");
+
+        // Verify the request URI matches what we sent.
+        assert_eq!(_request.uri().to_string(), uri.to_string());
+    });
+}
+
 // ---------------------------------------------------------------------------
 // bind_server semantics
 // ---------------------------------------------------------------------------
 
-fn named_with(name: &str) -> Arc<NamedIdentity> {
+fn named_with(name: &str) -> Arc<Identity> {
     let certs: Vec<CertificateDer<'static>> = SERVER_CERT.to_certificate();
     let key: PrivateKeyDer<'static> = SERVER_KEY.to_private_key();
-    Arc::new(NamedIdentity {
+    Arc::new(Identity {
         name: Arc::from(name),
         certs,
         key: Arc::new(key),
@@ -314,7 +392,9 @@ async fn beta_service(_: &mut server::Request, response: &mut server::Response) 
 fn two_sni_share_network_and_port() {
     run("two_sni_share_network_and_port", async move {
         let network = test_network();
-        let bind_iface = network.bind(BindUri::from("inet://127.0.0.1:0")).await;
+        let bind_iface = network
+            .bind_iface(BindUri::from("inet://127.0.0.1:0"))
+            .await;
         let port = match bind_iface.borrow().bound_addr().unwrap() {
             BoundAddr::Internet(s) => s.port(),
             _ => unreachable!(),
@@ -343,7 +423,7 @@ fn two_sni_share_network_and_port() {
             bindings.push(binding);
             let quic = QuicEndpoint::new(
                 network.clone(),
-                Identity::Named(named),
+                Some(named),
                 resolver.clone(),
                 ClientQuicConfig::default(),
                 shared_server_config.clone(),
@@ -370,7 +450,7 @@ fn two_sni_share_network_and_port() {
         };
         let client_quic = QuicEndpoint::new(
             network.clone(),
-            Identity::Anonymous,
+            None,
             resolver.clone(),
             client_quic_config,
             ServerQuicConfig::default(),
@@ -401,22 +481,20 @@ fn two_sni_share_network_and_port() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn get_iface_returns_bound_interface() {
-    run("get_iface_returns_bound_interface", async move {
+fn bind_iface_returns_usable_interface() {
+    run("bind_iface_returns_usable_interface", async move {
         let network = test_network();
         let uri = BindUri::from("inet://127.0.0.1:0");
-        let bound = network.bind(uri.clone()).await;
-        let expected_addr = bound.borrow().bound_addr().expect("bound addr");
+        let bound = network.bind_iface(uri).await;
+        let addr = bound.borrow().bound_addr().expect("bound addr");
 
-        let fetched = network
-            .get_iface(&uri)
-            .expect("iface must be retrievable via get_iface");
-        let fetched_addr = fetched.borrow().bound_addr().expect("bound addr");
-        assert_eq!(expected_addr, fetched_addr);
-
-        // Unknown URI yields None.
-        let unknown = BindUri::from("inet://127.0.0.1:1");
-        assert!(network.get_iface(&unknown).is_none());
+        // The returned interface must have a valid internet address.
+        match addr {
+            BoundAddr::Internet(socket_addr) => {
+                assert!(socket_addr.port() > 0, "port must be assigned");
+            }
+            _ => panic!("expected internet address"),
+        }
     });
 }
 

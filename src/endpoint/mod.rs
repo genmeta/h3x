@@ -22,12 +22,14 @@ pub mod network;
 pub mod quic;
 mod sni;
 
-pub use binds::{Bind, BindConflictError, BindHost, Binds};
+pub use binds::{BindConflictError, BindHost, BindPattern, Binds};
 pub use config::{
     ClientOnlyConfig, ClientQuicConfig, CommonQuicConfig, ServerCertVerifierChoice,
     ServerOnlyConfig, ServerQuicConfig,
 };
 pub use h3::H3Endpoint;
-pub use identity::{Identity, NamedIdentity, ServerName};
-pub use network::{BindServerError, BindsGuard, Network, NetworkBuilder, ServerBinding};
+/// Top-level endpoint alias. Prefer this name in user-facing code.
+pub use h3::H3Endpoint as Endpoint;
+pub use identity::{Identity, ServerName};
+pub use network::{BindServerError, Network, NetworkBuilder, ServerBinding};
 pub use quic::{AcceptError, ConnectError, EndpointError, QuicEndpoint};

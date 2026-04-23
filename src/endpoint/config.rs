@@ -200,6 +200,18 @@ pub struct ClientQuicConfig {
     pub own: Arc<ClientOnlyConfig>,
 }
 
+impl ClientQuicConfig {
+    /// Get a mutable reference to the common config, cloning if shared.
+    pub fn common_mut(&mut self) -> &mut CommonQuicConfig {
+        Arc::make_mut(&mut self.common)
+    }
+
+    /// Get a mutable reference to the client-only config, cloning if shared.
+    pub fn own_mut(&mut self) -> &mut ClientOnlyConfig {
+        Arc::make_mut(&mut self.own)
+    }
+}
+
 /// Server-side QUIC configuration = common + server-only.
 #[derive(Debug, Clone, Default)]
 pub struct ServerQuicConfig {
@@ -207,4 +219,16 @@ pub struct ServerQuicConfig {
     pub common: Arc<CommonQuicConfig>,
     /// Server-specific values.
     pub own: Arc<ServerOnlyConfig>,
+}
+
+impl ServerQuicConfig {
+    /// Get a mutable reference to the common config, cloning if shared.
+    pub fn common_mut(&mut self) -> &mut CommonQuicConfig {
+        Arc::make_mut(&mut self.common)
+    }
+
+    /// Get a mutable reference to the server-only config, cloning if shared.
+    pub fn own_mut(&mut self) -> &mut ServerOnlyConfig {
+        Arc::make_mut(&mut self.own)
+    }
 }

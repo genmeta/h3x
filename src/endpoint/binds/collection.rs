@@ -6,23 +6,23 @@ use std::{
 use derive_more::{Deref, DerefMut, From, Into};
 use http::uri::{Authority, PathAndQuery, Scheme};
 
-use super::{Bind, BindConflictError, BindHost};
+use super::{BindConflictError, BindHost, BindPattern};
 use crate::dquic::qinterface::bind_uri::BindUri;
 
-/// A collection of [`Bind`] patterns, typically populated from CLI arguments.
+/// A collection of [`BindPattern`] patterns, typically populated from CLI arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Deref, DerefMut, From, Into)]
 pub struct Binds {
-    /// Bind patterns
-    binds: Vec<Bind>,
+    /// BindPattern patterns
+    binds: Vec<BindPattern>,
 }
 
 impl Binds {
-    /// Create a new [`Binds`] from a list of [`Bind`] patterns.
-    pub fn new(binds: Vec<Bind>) -> Self {
+    /// Create a new [`Binds`] from a list of [`BindPattern`] patterns.
+    pub fn new(binds: Vec<BindPattern>) -> Self {
         Self { binds }
     }
 
-    /// Expand all contained [`Bind`] patterns into concrete [`BindUri`]s,
+    /// Expand all contained [`BindPattern`] patterns into concrete [`BindUri`]s,
     /// checking for conflicting path-and-query on the same target.
     ///
     /// Two expanded URIs are considered "the same target" when their

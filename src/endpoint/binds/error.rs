@@ -1,7 +1,7 @@
 use http::uri::{Authority, PathAndQuery, Scheme};
 use snafu::Snafu;
 
-/// Error indicating that two [`Bind`](super::Bind) patterns expand to the same target
+/// Error indicating that two [`BindPattern`](super::BindPattern) patterns expand to the same target
 /// (identical IP + port, or identical family + NIC + port) but carry
 /// different path-and-query values.
 #[derive(Debug, Clone, Snafu)]
