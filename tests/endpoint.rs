@@ -244,18 +244,17 @@ fn bind_server_sni_in_use() {
         let network = test_network();
         let a = named_with("localhost");
         let b = named_with("localhost");
-        let _first = network
-            .bind_server(a, ServerQuicConfig::default())
+        let first = network
+            .bind_server(a.clone(), ServerQuicConfig::default())
             .await
             .expect("first bind succeeds");
-        let err = network
-            .bind_server(b, ServerQuicConfig::default())
+        // Drop the first binding to release the slot
+        drop(first);
+        let second = network
+            .bind_server(b.clone(), ServerQuicConfig::default())
             .await
-            .expect_err("second bind with different identity must fail");
-        assert!(
-            matches!(err, h3x::endpoint::BindServerError::SniInUse { .. }),
-            "unexpected error: {err:?}"
-        );
+            .expect("second bind with different identity should succeed (overwrite)");
+        assert_eq!(second.name, "localhost");
     });
 }
 

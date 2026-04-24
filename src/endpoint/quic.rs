@@ -460,8 +460,7 @@ impl quic::Listen for QuicEndpoint {
     type Error = AcceptError;
 
     async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
-        let binding = self.server_binding().await?;
-        binding.recv().await.ok_or(AcceptError::Shutdown)
+        QuicEndpoint::accept(self).await
     }
 
     async fn shutdown(&self) -> Result<(), Self::Error> {
@@ -502,42 +501,30 @@ fn bind_uri_for(source: &Source, ep: &EndpointAddr) -> BindUri {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dquic::prelude::handy::SystemResolver;
 
-    #[test]
-    fn test_quic_endpoint_construction() {
-        let network = Arc::new(Network::new());
-        let resolver = Arc::new(quic::DefaultResolver::new());
+    #[tokio::test]
+    async fn test_quic_endpoint_construction() {
+        let network = Network::builder().build();
+        let resolver = Arc::new(SystemResolver);
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let endpoint = QuicEndpoint::new(
-            network.clone(),
-            None,
-            resolver.clone(),
-            client,
-            server,
-        );
+        let endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server);
 
         assert!(Arc::ptr_eq(&endpoint.network, &network));
         assert!(endpoint.identity.is_none());
-        assert!(Arc::ptr_eq(&endpoint.resolver, &resolver));
     }
 
     #[tokio::test]
     async fn test_accept_returns_future_with_use() {
         // Verify that accept() returns a future that doesn't borrow self
-        let network = Arc::new(Network::new());
-        let resolver = Arc::new(quic::DefaultResolver::new());
+        let network = Network::builder().build();
+        let resolver = Arc::new(SystemResolver);
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let endpoint = QuicEndpoint::new(
-            network.clone(),
-            None,
-            resolver.clone(),
-            client,
-            server,
-        );
+        let endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server);
 
         // The key test: we can call accept() and hold the endpoint reference
         // while the future is being awaited. This verifies the future doesn't

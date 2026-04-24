@@ -803,44 +803,30 @@ mod tests {
     use crate::endpoint::identity::Identity;
 
     fn make_identity(name: &str) -> Arc<Identity> {
+        use dquic::prelude::handy::{ToCertificate, ToPrivateKey};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");
+        const SERVER_KEY: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
+
+        let certs: Vec<CertificateDer<'static>> = SERVER_CERT.to_certificate();
+        let key: PrivateKeyDer<'static> = SERVER_KEY.to_private_key();
+
         Arc::new(Identity {
             name: Arc::from(name),
-            certs: Arc::new(vec![]),
-            key: Arc::new(rustls::pki_types::PrivateKeyDer::Pkcs8(
-                b"dummy".to_vec().into(),
-            )),
+            certs: Arc::new(certs),
+            key: Arc::new(key),
             ocsp: Arc::new(None),
         })
     }
 
     fn make_server_config() -> ServerQuicConfig {
-        use std::sync::Arc;
-
-        use crate::endpoint::server::{CommonQuicConfig, ServerOnlyConfig};
-
-        ServerQuicConfig {
-            common: Arc::new(CommonQuicConfig {
-                defer_idle_timeout: false,
-                enable_0rtt: false,
-                enable_sslkeylog: false,
-                stream_strategy_factory: Arc::new(dquic::prelude::DefaultStreamStrategyFactory),
-                qlogger: Arc::new(None),
-            }),
-            own: Arc::new(ServerOnlyConfig {
-                alpns: vec![b"h3".to_vec()],
-                backlog: 32,
-                anti_port_scan: false,
-                parameters: Default::default(),
-                token_provider: Arc::new(dquic::prelude::DefaultTokenProvider),
-                client_auther: Arc::new(None),
-                client_cert_verifier: Arc::new(None),
-            }),
-        }
+        ServerQuicConfig::default()
     }
 
     #[tokio::test]
     async fn test_bind_server_overwrite() {
-        let network = Arc::new(Network::new());
+        let network = Network::builder().build();
         let identity_a = make_identity("test.example.com");
         let identity_b = make_identity("test.example.com");
         let config = make_server_config();
@@ -868,7 +854,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bind_server_same_identity_reuse() {
-        let network = Arc::new(Network::new());
+        let network = Network::builder().build();
         let identity = make_identity("test.example.com");
         let config = make_server_config();
 
