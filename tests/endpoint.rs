@@ -254,7 +254,7 @@ fn bind_server_sni_in_use() {
             .bind_server(b.clone(), ServerQuicConfig::default())
             .await
             .expect("second bind with different identity should succeed (overwrite)");
-        assert_eq!(second.name, "localhost");
+        assert_eq!(second.name, Arc::from("localhost"));
     });
 }
 
