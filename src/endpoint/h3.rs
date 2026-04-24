@@ -5,10 +5,11 @@
 //! underlying [`QuicEndpoint`] so it inherits the [`Connect`](crate::quic::Connect)
 //! and [`Listen`](crate::quic::Listen) trait impls.
 
-use std::{error::Error, ops::Deref, sync::Arc};
+use std::{error::Error, sync::Arc};
 
 use bytes::Buf;
 use http::uri::Authority;
+use tokio::sync::RwLock;
 
 use super::quic::{AcceptError, ConnectError, QuicEndpoint};
 use crate::{
@@ -21,12 +22,9 @@ use crate::{
 
 /// HTTP/3 endpoint.
 pub struct H3Endpoint {
-    /// Underlying QUIC endpoint.
-    pub quic: Arc<QuicEndpoint>,
-    /// Connection pool shared across HTTP/3 requests.
-    pub pool: Pool<Connection>,
-    /// Builder used to construct HTTP/3 connections on top of raw QUIC.
-    pub connection_builder: Arc<ConnectionBuilder<Connection>>,
+    quic: Arc<RwLock<QuicEndpoint>>,
+    pool: Pool<Connection>,
+    connection_builder: Arc<ConnectionBuilder<Connection>>,
 }
 
 impl H3Endpoint {
@@ -38,35 +36,10 @@ impl H3Endpoint {
         connection_builder: Arc<ConnectionBuilder<Connection>>,
     ) -> Self {
         Self {
-            quic: Arc::new(quic),
+            quic: Arc::new(RwLock::new(quic)),
             pool,
             connection_builder,
         }
-    }
-
-    /// Get a mutable reference to the QUIC endpoint, cloning if shared.
-    pub fn quic_mut(&mut self) -> &mut QuicEndpoint {
-        Arc::make_mut(&mut self.quic)
-    }
-}
-
-impl Clone for H3Endpoint {
-    fn clone(&self) -> Self {
-        // Reset the pool on Clone: each endpoint owns its own connection
-        // pool so parallel clients do not stomp on one another.
-        Self {
-            quic: self.quic.clone(),
-            pool: Pool::empty(),
-            connection_builder: self.connection_builder.clone(),
-        }
-    }
-}
-
-impl Deref for H3Endpoint {
-    type Target = QuicEndpoint;
-
-    fn deref(&self) -> &Self::Target {
-        &self.quic
     }
 }
 
@@ -96,8 +69,12 @@ impl H3Endpoint {
         S::Future: Send,
         S::Error: Into<Box<dyn Error + Send + Sync>>,
     {
+        let quic = match Arc::try_unwrap(self.quic) {
+            Ok(rwlock) => rwlock.into_inner(),
+            Err(arc) => arc.read().await.clone(),
+        };
         let mut servers = Servers::from_quic_listener()
-            .listener(Arc::unwrap_or_clone(self.quic))
+            .listener(quic)
             .service(service)
             .pool(self.pool)
             .builder(self.connection_builder)
@@ -106,27 +83,25 @@ impl H3Endpoint {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Convenience client methods
-// ---------------------------------------------------------------------------
-
 impl H3Endpoint {
     /// Obtain (or reuse) an HTTP/3 connection to `server` from the pool.
     pub async fn connect(
         &self,
         server: Authority,
     ) -> Result<Arc<H3Connection<Connection>>, pool::ConnectError<ConnectError>> {
+        let quic = self.quic.read().await.clone();
         self.pool
-            .reuse_or_connect_with(&*self.quic, self.connection_builder.clone(), server)
+            .reuse_or_connect_with(&quic, self.connection_builder.clone(), server)
             .await
     }
 
     /// Build a temporary [`Client`] that shares this endpoint's pool and
     /// configuration. Cheap — only Arc clones.
-    fn as_client(&self) -> Client<QuicEndpoint> {
+    async fn as_client(&self) -> Client<QuicEndpoint> {
+        let quic = self.quic.read().await.clone();
         Client::from_quic_client()
             .pool(self.pool.clone())
-            .client((*self.quic).clone())
+            .client(quic)
             .builder(self.connection_builder.clone())
             .build()
     }
@@ -136,7 +111,7 @@ impl H3Endpoint {
         &self,
         uri: http::Uri,
     ) -> Result<(client::Request, client::Response), client::RequestError<ConnectError>> {
-        let client = self.as_client();
+        let client = self.as_client().await;
         client.new_request().get(uri).await
     }
 
@@ -146,7 +121,33 @@ impl H3Endpoint {
         uri: http::Uri,
         body: impl Buf,
     ) -> Result<(client::Request, client::Response), client::RequestError<ConnectError>> {
-        let client = self.as_client();
+        let client = self.as_client().await;
         client.new_request().with_body(body).post(uri).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        dquic::prelude::handy::SystemResolver,
+        endpoint::{client::ClientQuicConfig, network::Network, server::ServerQuicConfig},
+    };
+
+    #[tokio::test]
+    async fn test_h3endpoint_rwlock_construction() {
+        let network = Network::builder().build();
+        let resolver = Arc::new(SystemResolver);
+        let client = ClientQuicConfig::default();
+        let server = ServerQuicConfig::default();
+
+        let quic = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server);
+        let pool = Pool::empty();
+        let builder = Arc::new(ConnectionBuilder::new(Arc::default()));
+
+        let endpoint = H3Endpoint::new(quic, pool, builder);
+
+        // Verify that we can read the QuicEndpoint through RwLock
+        let _quic_read = endpoint.quic.read().await;
     }
 }
