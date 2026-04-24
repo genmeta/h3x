@@ -555,20 +555,20 @@ mod tests {
         // Just verify we can access it without panicking
     }
 
-    #[tokio::test]
-    async fn test_dual_task_connect_structure() {
-        // Verify that connect() sets up the dual-task model infrastructure
-        // This test verifies the structure is in place, even if full Task A
-        // implementation depends on Locations API details
-        let network = Network::builder().build();
-        let resolver = Arc::new(SystemResolver);
-        let client = ClientQuicConfig::default();
-        let server = ServerQuicConfig::default();
+     #[tokio::test]
+     async fn test_dual_task_connect_structure() {
+         // Verify that connect() sets up the dual-task model infrastructure
+         // This test verifies the structure is in place, even if full Task A
+         // implementation depends on Locations API details
+         let network = Network::builder().build();
+         let resolver = Arc::new(SystemResolver);
+         let client = ClientQuicConfig::default();
+         let server = ServerQuicConfig::default();
 
-        let endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server);
+         let _endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server);
 
-        // The dual-task model is set up internally in connect()
-        // We verify it doesn't panic or error during setup
-        // (actual connection would require valid DNS resolution)
-    }
+         // The dual-task model is set up internally in connect()
+         // We verify it doesn't panic or error during setup
+         // (actual connection would require valid DNS resolution)
+     }
 }
