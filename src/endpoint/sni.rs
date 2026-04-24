@@ -39,12 +39,20 @@ pub(crate) struct SniEntry {
 pub(crate) struct SniGuard {
     pub(crate) name: ServerName,
     pub(crate) registry: Weak<DashMap<ServerName, Weak<SniEntry>>>,
+    pub(crate) self_entry: Weak<SniEntry>,
 }
 
 impl Drop for SniGuard {
     fn drop(&mut self) {
         if let Some(registry) = self.registry.upgrade() {
-            registry.remove(&self.name);
+            if let Some(kv) = registry.get(&self.name) {
+                if let Some(current_entry) = kv.value().upgrade() {
+                    if Weak::ptr_eq(&self.self_entry, &Arc::downgrade(&current_entry)) {
+                        drop(kv);
+                        registry.remove(&self.name);
+                    }
+                }
+            }
         }
     }
 }

@@ -662,21 +662,18 @@ impl Network {
     ) -> Result<ServerBinding, BindServerError> {
         let name = identity.name.clone();
 
-        // Reuse path: existing SNI registration with the same identity.
         if let Some(weak) = self.sni_registry.get(&name).map(|kv| kv.value().clone())
             && let Some(entry) = weak.upgrade()
         {
-            if !Arc::ptr_eq(&entry.identity, &identity) {
-                return Err(BindServerError::SniInUse { name });
+            if Arc::ptr_eq(&entry.identity, &identity) {
+                return Ok(ServerBinding {
+                    name,
+                    _guard: entry.guard.clone(),
+                    entry,
+                });
             }
-            return Ok(ServerBinding {
-                name,
-                _guard: entry.guard.clone(),
-                entry,
-            });
         }
 
-        // Slot: reuse existing compatible slot, or initialise a new one.
         let slot = {
             let mut slot_guard = self.server_slot.write().await;
             match slot_guard.upgrade() {
@@ -707,25 +704,29 @@ impl Network {
         let backlog = server_config.own.backlog.max(1);
         let (tx, rx) = async_channel::bounded(backlog);
 
-        let guard = Arc::new(SniGuard {
-            name: name.clone(),
-            registry: Arc::downgrade(&self.sni_registry),
+        let entry = Arc::new_cyclic(|entry_weak| {
+            let guard = Arc::new(SniGuard {
+                name: name.clone(),
+                registry: Arc::downgrade(&self.sni_registry),
+                self_entry: entry_weak.clone(),
+            });
+            SniEntry {
+                identity,
+                certified_key,
+                incomings_tx: tx,
+                incomings_rx: rx,
+                _slot: slot,
+                guard,
+            }
         });
-        let entry = Arc::new(SniEntry {
-            identity,
-            certified_key,
-            incomings_tx: tx,
-            incomings_rx: rx,
-            _slot: slot,
-            guard: guard.clone(),
-        });
+
         self.sni_registry
             .insert(name.clone(), Arc::downgrade(&entry));
 
         Ok(ServerBinding {
             name,
+            _guard: entry.guard.clone(),
             entry,
-            _guard: guard,
         })
     }
 }
@@ -763,7 +764,7 @@ fn build_certified_key(named: &Identity) -> Result<Arc<CertifiedKey>, BindServer
         .load_private_key(named.key.clone_key())
         .context(LoadKeySnafu)?;
     Ok(Arc::new(CertifiedKey {
-        cert: named.certs.clone(),
+        cert: named.certs.iter().cloned().collect(),
         key,
         ocsp: None,
     }))
@@ -794,4 +795,107 @@ fn server_config_compatible(a: &ServerQuicConfig, b: &ServerQuicConfig) -> bool 
         && Arc::ptr_eq(&a.own.client_auther, &b.own.client_auther)
         && Arc::ptr_eq(&a.own.client_cert_verifier, &b.own.client_cert_verifier);
     common_eq && own_eq
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::endpoint::identity::Identity;
+
+    fn make_identity(name: &str) -> Arc<Identity> {
+        Arc::new(Identity {
+            name: Arc::from(name),
+            certs: Arc::new(vec![]),
+            key: Arc::new(rustls::pki_types::PrivateKeyDer::Pkcs8(
+                b"dummy".to_vec().into(),
+            )),
+            ocsp: Arc::new(None),
+        })
+    }
+
+    fn make_server_config() -> ServerQuicConfig {
+        use std::sync::Arc;
+
+        use crate::endpoint::server::{CommonQuicConfig, ServerOnlyConfig};
+
+        ServerQuicConfig {
+            common: Arc::new(CommonQuicConfig {
+                defer_idle_timeout: false,
+                enable_0rtt: false,
+                enable_sslkeylog: false,
+                stream_strategy_factory: Arc::new(dquic::prelude::DefaultStreamStrategyFactory),
+                qlogger: Arc::new(None),
+            }),
+            own: Arc::new(ServerOnlyConfig {
+                alpns: vec![b"h3".to_vec()],
+                backlog: 32,
+                anti_port_scan: false,
+                parameters: Default::default(),
+                token_provider: Arc::new(dquic::prelude::DefaultTokenProvider),
+                client_auther: Arc::new(None),
+                client_cert_verifier: Arc::new(None),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_server_overwrite() {
+        let network = Arc::new(Network::new());
+        let identity_a = make_identity("test.example.com");
+        let identity_b = make_identity("test.example.com");
+        let config = make_server_config();
+
+        let binding_a = network
+            .bind_server(identity_a.clone(), config.clone())
+            .await
+            .expect("first bind should succeed");
+
+        let binding_b = network
+            .bind_server(identity_b.clone(), config.clone())
+            .await
+            .expect("second bind with different identity should succeed (overwrite)");
+
+        assert_eq!(binding_a.name, binding_b.name);
+        assert_eq!(network.sni_registry.len(), 1);
+
+        let entry = network
+            .sni_registry
+            .get(&binding_b.name)
+            .and_then(|kv| kv.value().upgrade())
+            .expect("registry should have the new entry");
+        assert!(Arc::ptr_eq(&entry.identity, &identity_b));
+    }
+
+    #[tokio::test]
+    async fn test_bind_server_same_identity_reuse() {
+        let network = Arc::new(Network::new());
+        let identity = make_identity("test.example.com");
+        let config = make_server_config();
+
+        let binding_a = network
+            .bind_server(identity.clone(), config.clone())
+            .await
+            .expect("first bind should succeed");
+
+        let binding_b = network
+            .bind_server(identity.clone(), config.clone())
+            .await
+            .expect("second bind with same identity should succeed (reuse)");
+
+        assert_eq!(binding_a.name, binding_b.name);
+        assert_eq!(network.sni_registry.len(), 1);
+
+        let entry_a = network
+            .sni_registry
+            .get(&binding_a.name)
+            .and_then(|kv| kv.value().upgrade())
+            .expect("registry should have the entry");
+        let entry_b = network
+            .sni_registry
+            .get(&binding_b.name)
+            .and_then(|kv| kv.value().upgrade())
+            .expect("registry should have the entry");
+
+        assert!(Arc::ptr_eq(&entry_a, &entry_b));
+    }
 }

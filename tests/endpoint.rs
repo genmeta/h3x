@@ -49,8 +49,9 @@ fn named_server_identity() -> Option<Arc<Identity>> {
     let key: PrivateKeyDer<'static> = SERVER_KEY.to_private_key();
     Some(Arc::new(Identity {
         name: Arc::from("localhost"),
-        certs,
+        certs: Arc::new(certs),
         key: Arc::new(key),
+        ocsp: Arc::new(None),
     }))
 }
 
@@ -231,8 +232,9 @@ fn named_with(name: &str) -> Arc<Identity> {
     let key: PrivateKeyDer<'static> = SERVER_KEY.to_private_key();
     Arc::new(Identity {
         name: Arc::from(name),
-        certs,
+        certs: Arc::new(certs),
         key: Arc::new(key),
+        ocsp: Arc::new(None),
     })
 }
 
