@@ -44,15 +44,13 @@ pub(crate) struct SniGuard {
 
 impl Drop for SniGuard {
     fn drop(&mut self) {
-        if let Some(registry) = self.registry.upgrade() {
-            if let Some(kv) = registry.get(&self.name) {
-                if let Some(current_entry) = kv.value().upgrade() {
-                    if Weak::ptr_eq(&self.self_entry, &Arc::downgrade(&current_entry)) {
-                        drop(kv);
-                        registry.remove(&self.name);
-                    }
-                }
-            }
+        if let Some(registry) = self.registry.upgrade()
+            && let Some(kv) = registry.get(&self.name)
+            && let Some(current_entry) = kv.value().upgrade()
+            && Weak::ptr_eq(&self.self_entry, &Arc::downgrade(&current_entry))
+        {
+            drop(kv);
+            registry.remove(&self.name);
         }
     }
 }

@@ -215,7 +215,7 @@ impl Network {
     }
 
     /// Get a reference to the network's locations (local address tracking).
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub(crate) fn locations(&self) -> &Locations {
         &self.locations
     }
@@ -670,14 +670,13 @@ impl Network {
 
         if let Some(weak) = self.sni_registry.get(&name).map(|kv| kv.value().clone())
             && let Some(entry) = weak.upgrade()
+            && Arc::ptr_eq(&entry.identity, &identity)
         {
-            if Arc::ptr_eq(&entry.identity, &identity) {
-                return Ok(ServerBinding {
-                    name,
-                    _guard: entry.guard.clone(),
-                    entry,
-                });
-            }
+            return Ok(ServerBinding {
+                name,
+                _guard: entry.guard.clone(),
+                entry,
+            });
         }
 
         let slot = {
