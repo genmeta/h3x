@@ -54,7 +54,7 @@ impl Drop for SniGuard {
 /// across all registered SNIs, and conflicting configurations are rejected
 /// at `bind_server` time.
 pub(crate) struct ServerSlotInner {
-    pub(crate) config: super::config::ServerQuicConfig,
+    pub(crate) config: super::server::ServerQuicConfig,
     pub(crate) rustls_config: Arc<rustls::ServerConfig>,
 }
 

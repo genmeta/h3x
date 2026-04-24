@@ -8,9 +8,10 @@ use rustls::{ClientConfig, pki_types::PrivateKeyDer};
 use snafu::{ResultExt, Snafu};
 
 use super::{
-    config::{ClientQuicConfig, ServerCertVerifierChoice, ServerQuicConfig},
+    client::{ClientQuicConfig, ServerCertVerifierChoice},
     identity::Identity,
     network::{BindServerError, Network, ServerBinding},
+    server::ServerQuicConfig,
 };
 use crate::{
     dquic::{

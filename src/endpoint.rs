@@ -15,21 +15,18 @@
 //! [`ConnectionBuilder`]: crate::connection::ConnectionBuilder
 
 pub mod binds;
-pub mod config;
+pub mod client;
 pub mod h3;
 pub mod identity;
 pub mod network;
 pub mod quic;
+pub mod server;
 mod sni;
 
 pub use binds::{BindConflictError, BindHost, BindPattern, Binds};
-pub use config::{
-    ClientOnlyConfig, ClientQuicConfig, CommonQuicConfig, ServerCertVerifierChoice,
-    ServerOnlyConfig, ServerQuicConfig,
-};
+pub use client::{ClientOnlyConfig, ClientQuicConfig, CommonQuicConfig, ServerCertVerifierChoice};
 pub use h3::H3Endpoint;
-/// Top-level endpoint alias. Prefer this name in user-facing code.
-pub use h3::H3Endpoint as Endpoint;
 pub use identity::{Identity, ServerName};
 pub use network::{BindServerError, Network, NetworkBuilder, ServerBinding};
 pub use quic::{AcceptError, ConnectError, EndpointError, QuicEndpoint};
+pub use server::{ServerOnlyConfig, ServerQuicConfig};

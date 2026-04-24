@@ -55,8 +55,8 @@ use tracing::Instrument;
 pub use super::sni::ServerBinding;
 use super::{
     binds::{BindHost, BindPattern},
-    config::ServerQuicConfig,
     identity::{Identity, ServerName},
+    server::ServerQuicConfig,
     sni::{self, SniCertResolver, SniEntry, SniGuard},
 };
 use crate::dquic::{
