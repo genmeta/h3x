@@ -139,6 +139,31 @@ impl H3Endpoint {
     }
 }
 
+impl crate::quic::Connect for H3Endpoint {
+    type Connection = Connection;
+    type Error = ConnectError;
+
+    async fn connect(&self, server: &Authority) -> Result<Arc<Self::Connection>, Self::Error> {
+        let quic = self.quic.read().await;
+        quic.connect(server).await
+    }
+}
+
+impl crate::quic::Listen for H3Endpoint {
+    type Connection = Connection;
+    type Error = AcceptError;
+
+    async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
+        let quic = self.quic.read().await;
+        quic.accept().await
+    }
+
+    async fn shutdown(&self) -> Result<(), Self::Error> {
+        let quic = self.quic.read().await;
+        quic.shutdown().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
