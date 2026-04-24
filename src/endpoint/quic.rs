@@ -6,6 +6,7 @@ use arc_swap::ArcSwapOption;
 use futures::StreamExt;
 use rustls::{ClientConfig, pki_types::PrivateKeyDer};
 use snafu::{ResultExt, Snafu};
+use tracing::Instrument;
 
 use super::{
     client::{ClientQuicConfig, ServerCertVerifierChoice},
@@ -312,6 +313,7 @@ impl QuicEndpoint {
 }
 
 impl QuicEndpoint {
+    #[expect(dead_code)]
     async fn server_binding(&self) -> Result<ServerBinding, AcceptError> {
         use accept_error::BindServerSnafu;
 
@@ -429,27 +431,31 @@ impl quic::Connect for QuicEndpoint {
             return Err(last_error.unwrap_or(ConnectError::NoReachableEndpoint));
         }
 
-        tokio::spawn({
-            let weak_connection = Arc::downgrade(&connection);
-            let terminated = connection.terminated();
-            let endpoint = self.clone();
-            async move {
-                tokio::pin!(terminated);
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = &mut terminated => break,
-                        next = server_eps.next() => {
-                            let Some((source, server_ep)) = next else { break };
-                            let Some(connection) = weak_connection.upgrade() else { break };
-                            let _ = endpoint
-                                .setup_server_endpoint(&connection, source, server_ep)
-                                .await;
+        // Task B: Continue processing DNS results in background
+        tokio::spawn(
+            {
+                let weak_connection = Arc::downgrade(&connection);
+                let terminated = connection.terminated();
+                let endpoint = self.clone();
+                async move {
+                    tokio::pin!(terminated);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = &mut terminated => break,
+                            next = server_eps.next() => {
+                                let Some((source, server_ep)) = next else { break };
+                                let Some(connection) = weak_connection.upgrade() else { break };
+                                let _ = endpoint
+                                    .setup_server_endpoint(&connection, source, server_ep)
+                                    .await;
+                            }
                         }
                     }
                 }
             }
-        });
+            .in_current_span(),
+        );
 
         Ok(connection)
     }
@@ -533,5 +539,13 @@ mod tests {
         // If this compiles and the future doesn't borrow self, we're good.
         // We don't actually await it since the endpoint has no identity.
         drop(fut);
+    }
+
+    #[tokio::test]
+    async fn test_network_locations_accessor() {
+        // Verify that Network::locations() accessor is available for Task A
+        let network = Network::builder().build();
+        let _locations = network.locations();
+        // Just verify we can access it without panicking
     }
 }

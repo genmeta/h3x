@@ -214,6 +214,12 @@ impl Network {
             .with_locations(self.locations.clone())
     }
 
+    /// Get a reference to the network's locations (local address tracking).
+    #[expect(dead_code)]
+    pub(crate) fn locations(&self) -> &Locations {
+        &self.locations
+    }
+
     /// Bind the given URI on this network.
     ///
     /// In addition to acquiring the underlying [`BindInterface`] from the
