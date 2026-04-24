@@ -81,6 +81,19 @@ impl H3Endpoint {
             .build();
         servers.run().await
     }
+
+    /// Update the OCSP staple via Arc-Cow chain.
+    ///
+    /// Updates the OCSP response that will be sent to new clients. Uses
+    /// `Arc::make_mut` to implement copy-on-write semantics: if the
+    /// underlying `QuicEndpoint` is shared, a clone is made before modification.
+    pub async fn update_ocsp(&self, ocsp: Option<Vec<u8>>) {
+        let mut guard = self.quic.write().await;
+        if let Some(identity) = guard.identity.as_mut() {
+            let id = Arc::make_mut(identity);
+            id.ocsp = Arc::new(ocsp);
+        }
+    }
 }
 
 impl H3Endpoint {
@@ -148,6 +161,26 @@ mod tests {
         let endpoint = H3Endpoint::new(quic, pool, builder);
 
         // Verify that we can read the QuicEndpoint through RwLock
+        let _quic_read = endpoint.quic.read().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_ocsp() {
+        let network = Network::builder().build();
+        let resolver = Arc::new(SystemResolver);
+        let client = ClientQuicConfig::default();
+        let server = ServerQuicConfig::default();
+
+        let quic = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server);
+        let pool = Pool::empty();
+        let builder = Arc::new(ConnectionBuilder::new(Arc::default()));
+
+        let endpoint = H3Endpoint::new(quic, pool, builder);
+
+        // Test update_ocsp with no identity (should not panic)
+        endpoint.update_ocsp(Some(vec![1, 2, 3])).await;
+
+        // Verify the endpoint is still functional
         let _quic_read = endpoint.quic.read().await;
     }
 }
