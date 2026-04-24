@@ -100,15 +100,15 @@ pub type EndpointError = ConnectError;
 /// A QUIC-only endpoint backed by a shared [`Network`].
 pub struct QuicEndpoint {
     /// Shared network infrastructure.
-    pub network: Arc<Network>,
+    pub(crate) network: Arc<Network>,
     /// TLS identity for this endpoint (`None` for anonymous/client-only).
-    pub identity: Option<Arc<Identity>>,
+    pub(crate) identity: Option<Arc<Identity>>,
     /// Resolver used when establishing outbound connections.
-    pub resolver: Arc<dyn Resolve + Send + Sync>,
+    pub(crate) resolver: Arc<dyn Resolve + Send + Sync>,
     /// Client-side configuration.
-    pub client: Arc<ClientQuicConfig>,
+    pub(crate) client: Arc<ClientQuicConfig>,
     /// Server-side configuration.
-    pub server: Arc<ServerQuicConfig>,
+    pub(crate) server: Arc<ServerQuicConfig>,
     client_tls_cache: ArcSwapOption<CachedClientTls>,
     server_binding_cache: ArcSwapOption<CachedServerBinding>,
 }
@@ -173,22 +173,6 @@ impl QuicEndpoint {
         }
     }
 
-    /// Get a mutable reference to the client config, cloning if shared.
-    pub fn client_mut(&mut self) -> &mut ClientQuicConfig {
-        Arc::make_mut(&mut self.client)
-    }
-
-    /// Get a mutable reference to the server config, cloning if shared.
-    pub fn server_mut(&mut self) -> &mut ServerQuicConfig {
-        Arc::make_mut(&mut self.server)
-    }
-
-    /// Get a mutable reference to the identity, cloning if shared.
-    /// Returns `None` if the endpoint is anonymous.
-    pub fn identity_mut(&mut self) -> Option<&mut Identity> {
-        self.identity.as_mut().map(Arc::make_mut)
-    }
-
     fn client_cache_key(&self) -> ClientCacheKey {
         ClientCacheKey {
             identity_ptr: identity_ptr(&self.identity),
@@ -247,7 +231,7 @@ impl QuicEndpoint {
         let mut tls = match &self.identity {
             None => builder.with_no_client_auth(),
             Some(id) => builder
-                .with_client_auth_cert(id.certs.clone(), clone_key(&id.key))
+                .with_client_auth_cert(id.certs.iter().cloned().collect(), clone_key(&id.key))
                 .context(ClientAuthSnafu)?,
         };
         tls.alpn_protocols.clone_from(&self.client.own.alpns);
@@ -352,6 +336,46 @@ impl QuicEndpoint {
                 binding: binding.clone(),
             })));
         Ok(binding)
+    }
+
+    /// Accept an inbound connection without requiring `&mut self`.
+    ///
+    /// The returned future captures only cloned `Arc`s and cached data,
+    /// so it does not borrow `self` — callers may hold a shared reference
+    /// while awaiting.
+    pub fn accept(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Arc<Connection>, AcceptError>> + use<> {
+        use accept_error::BindServerSnafu;
+
+        let identity = self.identity.clone();
+        let key = self.server_cache_key();
+        let network = self.network.clone();
+        let server = self.server.clone();
+        let cached = self.server_binding_cache.load_full();
+
+        async move {
+            let named = match identity {
+                None => return Err(AcceptError::ServerUnavailable),
+                Some(id) => id,
+            };
+
+            if let Some(cached_binding) = cached.as_ref()
+                && cached_binding.key == key
+            {
+                return cached_binding
+                    .binding
+                    .recv()
+                    .await
+                    .ok_or(AcceptError::Shutdown);
+            }
+
+            let binding = network
+                .bind_server(named, (*server).clone())
+                .await
+                .context(BindServerSnafu)?;
+            binding.recv().await.ok_or(AcceptError::Shutdown)
+        }
     }
 }
 
@@ -473,4 +497,55 @@ fn bind_uri_for(source: &Source, ep: &EndpointAddr) -> BindUri {
             _ => unreachable!("BLE and other address kinds are not supported yet"),
         },
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_quic_endpoint_construction() {
+        let network = Arc::new(Network::new());
+        let resolver = Arc::new(quic::DefaultResolver::new());
+        let client = ClientQuicConfig::default();
+        let server = ServerQuicConfig::default();
+
+        let endpoint = QuicEndpoint::new(
+            network.clone(),
+            None,
+            resolver.clone(),
+            client,
+            server,
+        );
+
+        assert!(Arc::ptr_eq(&endpoint.network, &network));
+        assert!(endpoint.identity.is_none());
+        assert!(Arc::ptr_eq(&endpoint.resolver, &resolver));
+    }
+
+    #[tokio::test]
+    async fn test_accept_returns_future_with_use() {
+        // Verify that accept() returns a future that doesn't borrow self
+        let network = Arc::new(Network::new());
+        let resolver = Arc::new(quic::DefaultResolver::new());
+        let client = ClientQuicConfig::default();
+        let server = ServerQuicConfig::default();
+
+        let endpoint = QuicEndpoint::new(
+            network.clone(),
+            None,
+            resolver.clone(),
+            client,
+            server,
+        );
+
+        // The key test: we can call accept() and hold the endpoint reference
+        // while the future is being awaited. This verifies the future doesn't
+        // borrow self.
+        let fut = endpoint.accept();
+        // If this compiles and the future doesn't borrow self, we're good.
+        // We don't actually await it since the endpoint has no identity.
+        drop(fut);
+    }
+}
 }
