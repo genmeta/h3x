@@ -2,3 +2,4 @@ Cargo.lock
 /target
 AGENTS.md
 .sisyphus/
+test_locations
