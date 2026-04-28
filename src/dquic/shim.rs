@@ -21,7 +21,7 @@ use crate::{
 
 pub fn convert_varint(varint: dquic::prelude::VarInt) -> VarInt {
     // dquic's VarInt is already bounds-checked to RFC 9000 spec (< 2^62)
-    VarInt::from_u64(varint.into_inner()).expect("dquic VarInt is within valid range")
+    VarInt::from_u64(varint.into_u64()).expect("dquic VarInt is within valid range")
 }
 
 pub fn convert_connection_error(error: dquic::prelude::Error) -> quic::ConnectionError {
@@ -334,7 +334,7 @@ impl quic::Listen for dquic::prelude::QuicListeners {
 
     async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
         let (connection, ..) = dquic::prelude::QuicListeners::accept(self).await?;
-        Ok(connection)
+        Ok(connection.into())
     }
 
     async fn shutdown(&self) -> Result<(), Self::Error> {
@@ -350,7 +350,7 @@ impl quic::Listen for Arc<dquic::prelude::QuicListeners> {
 
     async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
         let (connection, ..) = self.as_ref().accept().await?;
-        Ok(connection)
+        Ok(connection.into())
     }
 
     async fn shutdown(&self) -> Result<(), Self::Error> {
@@ -373,6 +373,8 @@ impl quic::Connect for Arc<dquic::prelude::QuicClient> {
         } else {
             server.host().to_string()
         };
-        dquic::prelude::QuicClient::connect(self, &name).await
+        dquic::prelude::QuicClient::connect(self, &name)
+            .await
+            .map(Into::into)
     }
 }

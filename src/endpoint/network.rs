@@ -550,7 +550,7 @@ impl Network {
                     });
                     match entry {
                         Some(entry) => {
-                            if entry.incomings_tx.try_send(connection).is_err() {
+                            if entry.incomings_tx.try_send(connection.into()).is_err() {
                                 tracing::debug!(
                                     target: "h3x::endpoint",
                                     name = %name,
@@ -646,7 +646,7 @@ impl Network {
         });
         let entry = Arc::new(SniEntry {
             named_identity: named,
-            certified_key,
+            certified_key: std::sync::RwLock::new(certified_key),
             incomings_tx: tx,
             incomings_rx: rx,
             _slot: slot,

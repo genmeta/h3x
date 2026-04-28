@@ -10,7 +10,7 @@ use peg::{error::ParseError, str::LineCol};
 use super::BindHost;
 use crate::dquic::{
     qbase::net::Family,
-    qinterface::bind_uri::{BindUri, BindUriScheme},
+    qinterface::bind_uri::{BindUri, Scheme},
 };
 
 /// A flexible bind pattern parsed from a string.
@@ -19,7 +19,7 @@ use crate::dquic::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bind {
     /// The resolved scheme (`iface` or `inet`). Always present after parsing.
-    pub scheme: BindUriScheme,
+    pub scheme: Scheme,
     /// Host part — exact name/IP or glob pattern (carries family if applicable).
     pub host: BindHost,
     /// Port number. `None` means default (0 = system-assigned).
@@ -160,7 +160,7 @@ peg::parser! {
                     .transpose()
                     .map_err(|_| "valid path-and-query")?;
                 Ok(Bind {
-                    scheme: BindUriScheme::Inet,
+                    scheme: Scheme::Inet,
                     host: BindHost::Ip { addr, repr: s.to_owned() },
                     port: None,
                     path_and_query,
@@ -174,18 +174,18 @@ peg::parser! {
 // ---------------------------------------------------------------------------
 
 /// Infer the bind scheme from an optional explicit scheme string and the host.
-fn infer_scheme(explicit: Option<&str>, host: &BindHost) -> BindUriScheme {
+fn infer_scheme(explicit: Option<&str>, host: &BindHost) -> Scheme {
     if let Some(s) = explicit {
         return match s.to_ascii_lowercase().as_str() {
-            "iface" => BindUriScheme::Iface,
-            "inet" => BindUriScheme::Inet,
-            _ => BindUriScheme::Iface,
+            "iface" => Scheme::Iface,
+            "inet" => Scheme::Inet,
+            _ => Scheme::Iface,
         };
     }
     if host.is_ip_addr() {
-        BindUriScheme::Inet
+        Scheme::Inet
     } else {
-        BindUriScheme::Iface
+        Scheme::Iface
     }
 }
 

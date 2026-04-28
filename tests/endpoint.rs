@@ -13,10 +13,10 @@ use std::sync::Arc;
 use common::{CA_CERT, SERVER_CERT, SERVER_KEY, run};
 use dquic::{
     prelude::{
-        BindUri, BoundAddr, IO,
+        BindUri, IO,
         handy::{ToCertificate, ToPrivateKey},
     },
-    qbase::net::addr::{EndpointAddr, SocketEndpointAddr},
+    qbase::net::addr::EndpointAddr,
     qinterface::{component::route::QuicRouter, manager::InterfaceManager},
     qresolve::{Resolve, ResolveFuture, Source, SystemResolver},
 };
@@ -90,10 +90,7 @@ fn serve_and_connect_hello() {
             .borrow()
             .bound_addr()
             .expect("bind interface must have a local address");
-        let port = match bound_addr {
-            BoundAddr::Internet(socket_addr) => socket_addr.port(),
-            _ => unreachable!("bound to inet://127.0.0.1"),
-        };
+        let port = bound_addr.port();
 
         let server_endpoint = H3Endpoint::new(
             server_quic,
@@ -281,7 +278,7 @@ impl std::fmt::Display for FixedResolver {
 impl Resolve for FixedResolver {
     fn lookup<'l>(&'l self, _name: &'l str) -> ResolveFuture<'l> {
         use futures::{FutureExt, StreamExt, stream};
-        let ep = EndpointAddr::Socket(SocketEndpointAddr::direct(self.0));
+        let ep = EndpointAddr::direct(self.0);
         let source = Source::System;
         async move { Ok(stream::iter(std::iter::once((source, ep))).boxed()) }.boxed()
     }
@@ -315,10 +312,7 @@ fn two_sni_share_network_and_port() {
     run("two_sni_share_network_and_port", async move {
         let network = test_network();
         let bind_iface = network.bind(BindUri::from("inet://127.0.0.1:0")).await;
-        let port = match bind_iface.borrow().bound_addr().unwrap() {
-            BoundAddr::Internet(s) => s.port(),
-            _ => unreachable!(),
-        };
+        let port = bind_iface.borrow().bound_addr().unwrap().port();
         let resolver: Arc<dyn Resolve + Send + Sync> =
             Arc::new(FixedResolver(format!("127.0.0.1:{port}").parse().unwrap()));
 

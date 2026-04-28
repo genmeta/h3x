@@ -7,7 +7,7 @@
 //! same SNI cooperatively drain inbound connections. Dropping the last
 //! strong reference unregisters the SNI entry from the network.
 
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, RwLock, Weak};
 
 use dashmap::DashMap;
 use rustls::{
@@ -24,7 +24,7 @@ use crate::dquic::prelude::Connection;
 /// same inbound connection queue.
 pub(crate) struct SniEntry {
     pub(crate) named_identity: Arc<NamedIdentity>,
-    pub(crate) certified_key: Arc<CertifiedKey>,
+    pub(crate) certified_key: RwLock<Arc<CertifiedKey>>,
     pub(crate) incomings_tx: async_channel::Sender<Arc<Connection>>,
     pub(crate) incomings_rx: async_channel::Receiver<Arc<Connection>>,
     /// Keeps the shared server slot alive for the lifetime of this entry.
@@ -96,6 +96,29 @@ impl ServerBinding {
     pub async fn recv(&self) -> Option<Arc<Connection>> {
         self.entry.incomings_rx.recv().await.ok()
     }
+
+    /// Update the stapled OCSP response for this server.
+    ///
+    /// The updated OCSP response only affects new TLS handshakes. Existing
+    /// connections remain unchanged until they reconnect.
+    pub fn update_ocsp(&self, ocsp: Option<Vec<u8>>) {
+        let current = self
+            .entry
+            .certified_key
+            .read()
+            .expect("certified key lock poisoned");
+        let new_key = CertifiedKey {
+            cert: current.cert.clone(),
+            key: current.key.clone(),
+            ocsp,
+        };
+        let mut guard = self
+            .entry
+            .certified_key
+            .write()
+            .expect("certified key lock poisoned");
+        *guard = Arc::new(new_key);
+    }
 }
 
 /// rustls `ResolvesServerCert` backed by the network's SNI registry.
@@ -122,7 +145,7 @@ impl ResolvesServerCert for SniCertResolver {
             if item.key().eq_ignore_ascii_case(sni)
                 && let Some(entry) = item.value().upgrade()
             {
-                return Some(entry.certified_key.clone());
+                return entry.certified_key.read().ok().map(|guard| guard.clone());
             }
         }
         None

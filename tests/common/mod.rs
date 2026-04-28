@@ -2,13 +2,14 @@
 
 use std::{
     error::Error,
+    net::SocketAddr,
     sync::{Arc, LazyLock},
     time::Duration,
 };
 
 use dquic::{
     prelude::{
-        BindUri, BoundAddr, IO,
+        BindUri, IO,
         handy::{ToCertificate, ToPrivateKey},
     },
     qinterface::component::route::QuicRouter,
@@ -109,7 +110,7 @@ where
     servers
 }
 
-pub fn get_server_addr<S>(servers: &H3Servers<S>) -> BoundAddr {
+pub fn get_server_addr<S>(servers: &H3Servers<S>) -> SocketAddr {
     let localhost = servers
         .quic_listener()
         .get_server("localhost")
@@ -126,11 +127,7 @@ pub fn get_server_addr<S>(servers: &H3Servers<S>) -> BoundAddr {
 }
 
 pub fn get_server_authority<S>(servers: &H3Servers<S>) -> Authority {
-    match get_server_addr(servers) {
-        BoundAddr::Internet(socket_addr) => {
-            Authority::from_maybe_shared(Vec::from(format!("localhost:{}", socket_addr.port())))
-                .expect("failed to parse authority")
-        }
-        _ => unimplemented!("Only Internet addresses are supported now"),
-    }
+    let socket_addr = get_server_addr(servers);
+    Authority::from_maybe_shared(Vec::from(format!("localhost:{}", socket_addr.port())))
+        .expect("failed to parse authority")
 }

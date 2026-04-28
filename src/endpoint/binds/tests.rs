@@ -1,16 +1,14 @@
 use std::net::IpAddr;
 
-use http::uri::Scheme;
-
 use super::*;
-use crate::dquic::{qbase::net::Family, qinterface::bind_uri::BindUriScheme};
+use crate::dquic::{qbase::net::Family, qinterface::bind_uri::Scheme};
 
 // -- Parsing tests --
 
 #[test]
 fn parse_full_iface_with_family() {
     let b: Bind = "iface://v4.enp17s0:8080".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Iface);
+    assert_eq!(b.scheme, Scheme::Iface);
     assert_eq!(b.host.family(), Some(Family::V4));
     assert_eq!(
         b.host,
@@ -23,7 +21,7 @@ fn parse_full_iface_with_family() {
 #[test]
 fn parse_full_iface_glob() {
     let b: Bind = "iface://v4.en*:8080".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Iface);
+    assert_eq!(b.scheme, Scheme::Iface);
     assert_eq!(b.host.family(), Some(Family::V4));
     assert!(b.host.is_glob());
     assert_eq!(b.host.as_str(), "en*");
@@ -33,7 +31,7 @@ fn parse_full_iface_glob() {
 #[test]
 fn parse_iface_no_family() {
     let b: Bind = "iface://enp17s0:8080".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Iface);
+    assert_eq!(b.scheme, Scheme::Iface);
     assert_eq!(b.host.family(), None);
     assert!(!b.host.is_glob());
     assert_eq!(b.host.as_str(), "enp17s0");
@@ -43,7 +41,7 @@ fn parse_iface_no_family() {
 #[test]
 fn parse_iface_no_port() {
     let b: Bind = "iface://v4.enp17s0".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Iface);
+    assert_eq!(b.scheme, Scheme::Iface);
     assert_eq!(b.host.family(), Some(Family::V4));
     assert_eq!(b.host.as_str(), "enp17s0");
     assert_eq!(b.port, None);
@@ -52,7 +50,7 @@ fn parse_iface_no_port() {
 #[test]
 fn parse_inet() {
     let b: Bind = "inet://127.0.0.1:8080".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Inet);
+    assert_eq!(b.scheme, Scheme::Inet);
     assert_eq!(b.host.family(), None);
     assert_eq!(b.host.as_str(), "127.0.0.1");
     assert_eq!(b.port, Some(8080));
@@ -61,7 +59,7 @@ fn parse_inet() {
 #[test]
 fn parse_no_scheme_ip() {
     let b: Bind = "127.0.0.1:8080".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Inet);
+    assert_eq!(b.scheme, Scheme::Inet);
     assert_eq!(b.host.as_str(), "127.0.0.1");
     assert_eq!(b.port, Some(8080));
 }
@@ -69,7 +67,7 @@ fn parse_no_scheme_ip() {
 #[test]
 fn parse_no_scheme_iface() {
     let b: Bind = "enp17s0:8080".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Iface);
+    assert_eq!(b.scheme, Scheme::Iface);
     assert_eq!(b.host.family(), None);
     assert_eq!(b.host.as_str(), "enp17s0");
     assert_eq!(b.port, Some(8080));
@@ -78,7 +76,7 @@ fn parse_no_scheme_iface() {
 #[test]
 fn parse_no_scheme_with_family() {
     let b: Bind = "v4.enp17s0:8080".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Iface);
+    assert_eq!(b.scheme, Scheme::Iface);
     assert_eq!(b.host.family(), Some(Family::V4));
     assert_eq!(b.host.as_str(), "enp17s0");
     assert_eq!(b.port, Some(8080));
@@ -87,7 +85,7 @@ fn parse_no_scheme_with_family() {
 #[test]
 fn parse_glob_no_scheme() {
     let b: Bind = "en*:8080".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Iface);
+    assert_eq!(b.scheme, Scheme::Iface);
     assert_eq!(b.host.family(), None);
     assert!(b.host.is_glob());
     assert_eq!(b.host.as_str(), "en*");
@@ -97,7 +95,7 @@ fn parse_glob_no_scheme() {
 #[test]
 fn parse_star_only() {
     let b: Bind = "*".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Iface);
+    assert_eq!(b.scheme, Scheme::Iface);
     assert_eq!(b.host.family(), None);
     assert!(b.host.is_glob());
     assert_eq!(b.host.as_str(), "*");
@@ -107,7 +105,7 @@ fn parse_star_only() {
 #[test]
 fn parse_star_with_port() {
     let b: Bind = "*:8080".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Iface);
+    assert_eq!(b.scheme, Scheme::Iface);
     assert_eq!(b.host.family(), None);
     assert!(b.host.is_glob());
     assert_eq!(b.port, Some(8080));
@@ -116,7 +114,7 @@ fn parse_star_with_port() {
 #[test]
 fn parse_v4_star() {
     let b: Bind = "v4.*".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Iface);
+    assert_eq!(b.scheme, Scheme::Iface);
     assert_eq!(b.host.family(), Some(Family::V4));
     assert!(b.host.is_glob());
     assert_eq!(b.port, None);
@@ -125,7 +123,7 @@ fn parse_v4_star() {
 #[test]
 fn parse_v6_star_with_port() {
     let b: Bind = "v6.*:8080".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Iface);
+    assert_eq!(b.scheme, Scheme::Iface);
     assert_eq!(b.host.family(), Some(Family::V6));
     assert!(b.host.is_glob());
     assert_eq!(b.port, Some(8080));
@@ -134,7 +132,7 @@ fn parse_v6_star_with_port() {
 #[test]
 fn parse_no_scheme_no_port() {
     let b: Bind = "enp17s0".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Iface);
+    assert_eq!(b.scheme, Scheme::Iface);
     assert_eq!(b.host.family(), None);
     assert_eq!(b.host.as_str(), "enp17s0");
     assert_eq!(b.port, None);
@@ -145,7 +143,7 @@ fn parse_with_path_and_query() {
     let b: Bind = "iface://v4.en*:8080/?stun_server=stun.genmeta.net"
         .parse()
         .unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Iface);
+    assert_eq!(b.scheme, Scheme::Iface);
     assert_eq!(b.host.family(), Some(Family::V4));
     assert!(b.host.is_glob());
     assert_eq!(b.port, Some(8080));
@@ -334,7 +332,7 @@ fn path_and_query_is_validated() {
 #[test]
 fn parse_bare_ipv6_loopback() {
     let b: Bind = "::1".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Inet);
+    assert_eq!(b.scheme, Scheme::Inet);
     assert!(b.host.is_ip_addr());
     assert_eq!(b.host.as_str(), "::1");
     assert_eq!(b.port, None);
@@ -344,7 +342,7 @@ fn parse_bare_ipv6_loopback() {
 #[test]
 fn parse_bare_ipv6_any() {
     let b: Bind = "::".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Inet);
+    assert_eq!(b.scheme, Scheme::Inet);
     assert!(b.host.is_ip_addr());
     assert_eq!(b.host.as_str(), "::");
     assert_eq!(b.port, None);
@@ -353,7 +351,7 @@ fn parse_bare_ipv6_any() {
 #[test]
 fn parse_bare_ipv6_full() {
     let b: Bind = "2001:db8::1".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Inet);
+    assert_eq!(b.scheme, Scheme::Inet);
     assert!(b.host.is_ip_addr());
     assert_eq!(b.host.as_str(), "2001:db8::1");
     assert_eq!(b.port, None);
@@ -363,7 +361,7 @@ fn parse_bare_ipv6_full() {
 fn parse_bare_ipv4() {
     // Bare IPv4 without port also works via the fast path
     let b: Bind = "192.168.1.1".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Inet);
+    assert_eq!(b.scheme, Scheme::Inet);
     assert!(b.host.is_ip_addr());
     assert_eq!(b.host.as_str(), "192.168.1.1");
     assert_eq!(b.port, None);
@@ -389,7 +387,7 @@ fn expand_bare_ipv6() {
 #[test]
 fn parse_glob_bracket_class() {
     let b: Bind = "[ew]*:8080".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Iface);
+    assert_eq!(b.scheme, Scheme::Iface);
     assert!(b.host.is_glob());
     assert_eq!(b.host.as_str(), "[ew]*");
     assert_eq!(b.port, Some(8080));
@@ -400,7 +398,7 @@ fn parse_glob_bracket_class() {
 #[test]
 fn parse_ipv6_full_scheme() {
     let b: Bind = "inet://[::1]:8080".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Inet);
+    assert_eq!(b.scheme, Scheme::Inet);
     assert_eq!(b.host.family(), None);
     assert_eq!(b.host.as_str(), "::1");
     assert_eq!(b.port, Some(8080));
@@ -410,7 +408,7 @@ fn parse_ipv6_full_scheme() {
 #[test]
 fn parse_ipv6_no_scheme() {
     let b: Bind = "[::1]:8080".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Inet);
+    assert_eq!(b.scheme, Scheme::Inet);
     assert_eq!(b.host.as_str(), "::1");
     assert_eq!(b.port, Some(8080));
 }
@@ -418,7 +416,7 @@ fn parse_ipv6_no_scheme() {
 #[test]
 fn parse_ipv6_full_addr() {
     let b: Bind = "inet://[2001:db8::1]:443".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Inet);
+    assert_eq!(b.scheme, Scheme::Inet);
     assert_eq!(b.host.as_str(), "2001:db8::1");
     assert_eq!(b.port, Some(443));
     assert!(b.host.is_ip_addr());
@@ -427,7 +425,7 @@ fn parse_ipv6_full_addr() {
 #[test]
 fn parse_ipv6_link_local() {
     let b: Bind = "[fe80::1]:8080".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Inet);
+    assert_eq!(b.scheme, Scheme::Inet);
     assert_eq!(b.host.as_str(), "fe80::1");
     assert_eq!(b.port, Some(8080));
 }
@@ -435,7 +433,7 @@ fn parse_ipv6_link_local() {
 #[test]
 fn parse_ipv6_any() {
     let b: Bind = "inet://[::]:0".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Inet);
+    assert_eq!(b.scheme, Scheme::Inet);
     assert_eq!(b.host.as_str(), "::");
     assert_eq!(b.port, Some(0));
 }
@@ -443,7 +441,7 @@ fn parse_ipv6_any() {
 #[test]
 fn parse_ipv6_no_port() {
     let b: Bind = "[::1]".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Inet);
+    assert_eq!(b.scheme, Scheme::Inet);
     assert_eq!(b.host.as_str(), "::1");
     assert_eq!(b.port, None);
 }
@@ -451,7 +449,7 @@ fn parse_ipv6_no_port() {
 #[test]
 fn parse_ipv6_with_path_and_query() {
     let b: Bind = "inet://[::1]:8080/?key=value".parse().unwrap();
-    assert_eq!(b.scheme, BindUriScheme::Inet);
+    assert_eq!(b.scheme, Scheme::Inet);
     assert_eq!(b.host.as_str(), "::1");
     assert_eq!(b.port, Some(8080));
     assert_eq!(b.path_and_query_str(), Some("/?key=value"));
@@ -557,7 +555,7 @@ fn binds_to_bind_uris_conflict_different_pq() {
         "iface://v4.enp17s0:8080/?stun=false".parse().unwrap(),
     ]);
     let err = binds.to_bind_uris(["enp17s0"]).unwrap_err();
-    assert_eq!(err.scheme, "iface".parse::<Scheme>().unwrap());
+    assert_eq!(err.scheme.as_str(), "iface");
     assert!(err.to_string().contains("conflicting"));
     assert!(err.to_string().contains("stun=true"));
     assert!(err.to_string().contains("stun=false"));

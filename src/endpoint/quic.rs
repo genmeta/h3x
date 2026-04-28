@@ -18,8 +18,8 @@ use crate::{
         qbase::{
             cid::ConnectionId,
             net::{
-                Family,
-                addr::{AddrKind, BoundAddr, EndpointAddr, SocketEndpointAddr},
+                AddrFamily, Family,
+                addr::EndpointAddr,
                 route::{Link, Pathway},
             },
         },
@@ -274,6 +274,7 @@ impl QuicEndpoint {
             .with_cids(ConnectionId::random_gen(8))
             .with_qlog(self.client.common.qlogger.clone())
             .run()
+            .into()
     }
 
     async fn setup_server_endpoint(
@@ -289,22 +290,16 @@ impl QuicEndpoint {
         let bind_uri = bind_uri_for(&source, &server_ep);
         let iface = self.network.bind(bind_uri).await;
 
-        if matches!(
-            server_ep,
-            EndpointAddr::Socket(SocketEndpointAddr::Agent { .. })
-        ) {
+        if matches!(server_ep, EndpointAddr::Agent { .. }) {
             return Ok(false);
         }
 
         let interface = iface.borrow();
         let bound_addr = interface.bound_addr().context(BindInterfaceSnafu)?;
-        if bound_addr.kind() != server_ep.addr_kind() {
+        if bound_addr.family() != server_ep.family() {
             return Ok(false);
         }
-        let dst = match server_ep {
-            EndpointAddr::Socket(s) => BoundAddr::Internet(*s),
-            EndpointAddr::Ble(_) => return Ok(false),
-        };
+        let dst = *server_ep;
         let link = Link::new(bound_addr, dst);
         let pathway = Pathway::new(bound_addr.into(), server_ep);
         let _ = connection.add_path(iface.bind_uri(), link, pathway);
@@ -448,14 +443,13 @@ fn bind_uri_for(source: &Source, ep: &EndpointAddr) -> BindUri {
                 .expect("iface URI should be valid")
                 .alloc_port()
         }
-        _ => match ep.addr_kind() {
-            AddrKind::Internet(Family::V4) => BindUri::from_str("inet://0.0.0.0:0")
+        _ => match ep.family() {
+            Family::V4 => BindUri::from_str("inet://0.0.0.0:0")
                 .expect("URL should be valid")
                 .alloc_port(),
-            AddrKind::Internet(Family::V6) => BindUri::from_str("inet://[::]:0")
+            Family::V6 => BindUri::from_str("inet://[::]:0")
                 .expect("URL should be valid")
                 .alloc_port(),
-            _ => unreachable!("BLE and other address kinds are not supported yet"),
         },
     }
 }
