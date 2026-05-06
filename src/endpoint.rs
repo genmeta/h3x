@@ -5,7 +5,7 @@
 //!
 //! - [`Network`] — process-shared infrastructure: interface manager, QUIC
 //!   router, STUN agent, SNI registry, and a reconcile task that keeps the
-//!   interface set in sync with user-supplied [`Binds`] patterns.
+//!   interface set in sync with user-supplied [`BindPattern`]s.
 //! - [`QuicEndpoint`] — a QUIC-only endpoint with fully public, per-field
 //!   cloneable configuration (identity, resolver, per-role configs). Holds
 //!   private caches that are invalidated lazily via `Arc::ptr_eq`.
@@ -23,10 +23,10 @@ pub mod quic;
 pub mod server;
 mod sni;
 
-pub use binds::{BindConflictError, BindHost, BindPattern, Binds};
+pub use binds::{BindHost, BindPattern};
 pub use client::{ClientOnlyConfig, ClientQuicConfig, CommonQuicConfig, ServerCertVerifierChoice};
 pub use h3::H3Endpoint;
 pub use identity::{Identity, ServerName};
-pub use network::{BindServerError, Network, NetworkBuilder, ServerBinding};
+pub use network::{BindServerError, Network, ServerBinding};
 pub use quic::{AcceptError, ConnectError, EndpointError, QuicEndpoint};
 pub use server::{ServerOnlyConfig, ServerQuicConfig};

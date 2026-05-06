@@ -14,21 +14,11 @@
 //!
 //! All extensions compose freely: `en*:8080`, `*`, `v4.*:8080`, `[ew]*`, `[::1]:8080`, etc.
 
-mod collection;
-mod error;
 mod host;
 mod pattern;
-pub mod setup;
 
-pub use std::net::IpAddr;
-
-pub use collection::Binds;
-pub use error::BindConflictError;
 pub use host::BindHost;
 pub use pattern::BindPattern;
-pub use setup::{
-    BindSetup, setup_bind_interfaces, setup_bind_interfaces_with, watch_bind_interfaces,
-};
 
 #[cfg(test)]
 mod tests;

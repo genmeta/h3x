@@ -13,7 +13,7 @@ use std::sync::Arc;
 use common::{CA_CERT, SERVER_CERT, SERVER_KEY, run};
 use dquic::{
     prelude::{
-        BindUri, BoundAddr, IO,
+        BoundAddr, IO,
         handy::{ToCertificate, ToPrivateKey},
     },
     qbase::net::addr::{EndpointAddr, SocketEndpointAddr},
@@ -86,9 +86,8 @@ fn serve_and_connect_hello() {
             ClientQuicConfig::default(),
             ServerQuicConfig::default(),
         );
-        let bind_iface = network
-            .bind_iface(BindUri::from("inet://127.0.0.1:0"))
-            .await;
+        network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
+        let bind_iface = network.interfaces().into_iter().next().unwrap();
         let bound_addr = bind_iface
             .borrow()
             .bound_addr()
@@ -160,9 +159,8 @@ fn endpoint_get_convenience() {
             ClientQuicConfig::default(),
             ServerQuicConfig::default(),
         );
-        let bind_iface = network
-            .bind_iface(BindUri::from("inet://127.0.0.1:0"))
-            .await;
+        network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
+        let bind_iface = network.interfaces().into_iter().next().unwrap();
         let bound_addr = bind_iface
             .borrow()
             .bound_addr()
@@ -393,9 +391,8 @@ async fn beta_service(_: &mut server::Request, response: &mut server::Response) 
 fn two_sni_share_network_and_port() {
     run("two_sni_share_network_and_port", async move {
         let network = test_network();
-        let bind_iface = network
-            .bind_iface(BindUri::from("inet://127.0.0.1:0"))
-            .await;
+        network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
+        let bind_iface = network.interfaces().into_iter().next().unwrap();
         let port = match bind_iface.borrow().bound_addr().unwrap() {
             BoundAddr::Internet(s) => s.port(),
             _ => unreachable!(),
@@ -485,8 +482,8 @@ fn two_sni_share_network_and_port() {
 fn bind_iface_returns_usable_interface() {
     run("bind_iface_returns_usable_interface", async move {
         let network = test_network();
-        let uri = BindUri::from("inet://127.0.0.1:0");
-        let bound = network.bind_iface(uri).await;
+        network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
+        let bound = network.interfaces().into_iter().next().unwrap();
         let addr = bound.borrow().bound_addr().expect("bound addr");
 
         // The returned interface must have a valid internet address.

@@ -1,4 +1,5 @@
 use std::{
+    cell::LazyCell,
     fmt,
     hash::{Hash, Hasher},
     str::FromStr,
@@ -222,19 +223,19 @@ impl FromStr for BindPattern {
 // ---------------------------------------------------------------------------
 
 impl BindPattern {
+    /// Returns the path-and-query as a string slice, if present.
+    #[must_use]
+    pub fn path_and_query_str(&self) -> Option<&str> {
+        self.path_and_query.as_ref().map(|pq| pq.as_str())
+    }
+
     /// Returns the effective port (defaults to 0 when omitted).
     #[must_use]
     pub fn effective_port(&self) -> u16 {
         self.port.unwrap_or(0)
     }
 
-    /// Returns the path-and-query as a `&str`.
-    #[must_use]
-    pub fn path_and_query_str(&self) -> Option<&str> {
-        self.path_and_query.as_ref().map(|pq| pq.as_str())
-    }
-
-    pub(crate) fn bind_uri_template(&self) -> impl Fn(Authority) -> Option<BindUri> + use<> {
+    pub(crate) fn template(&self) -> impl Fn(Authority) -> Option<BindUri> + use<> {
         let mut uri_template = Uri::from_static("iface://v4.lo:0/").into_parts();
         uri_template.scheme = Some(self.scheme.into());
         uri_template.path_and_query =
@@ -244,6 +245,7 @@ impl BindPattern {
 
         move |authority: Authority| {
             let mut uri_parts = uri_template.clone().into_parts();
+            // original authority is just a placeholder; replace it with the actual authority for every bind URI.
             uri_parts.authority = Some(authority);
 
             let bind_uri =
@@ -252,10 +254,7 @@ impl BindPattern {
         }
     }
 
-    pub(crate) fn bind_hosts_for_interface(
-        &self,
-        interface: &str,
-    ) -> impl Iterator<Item = Authority> {
+    pub(crate) fn match_interface_links(&self, interface: &str) -> impl Iterator<Item = Authority> {
         match &self.host {
             BindHost::Ip { .. } => Either::Left(std::iter::empty()),
             host if !host.matches(interface) => Either::Left(std::iter::empty()),
@@ -279,24 +278,26 @@ impl BindPattern {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let template = self.bind_uri_template();
+        let template = LazyCell::new(|| self.template());
         let port = self.effective_port();
         match &self.host {
             BindHost::Ip { addr, .. } => {
-                let authority: Authority = if addr.is_ipv6() {
+                let link: Authority = if addr.is_ipv6() {
                     format!("[{addr}]:{port}")
                 } else {
                     format!("{addr}:{port}")
                 }
                 .parse()
                 .expect("BUG: formatted IP address and port is a valid authority");
-                Either::Left(template(authority).into_iter())
+                Either::Left(template(link).into_iter())
             }
+            // WORKAROUND: clippy bug: https://github.com/rust-lang/rust-clippy/issues/16641 (not fixed)
+            #[allow(clippy::redundant_closure)]
             BindHost::Glob { .. } | BindHost::Exact { .. } => Either::Right(
                 interfaces
                     .into_iter()
-                    .flat_map(move |iface| self.bind_hosts_for_interface(iface))
-                    .flat_map(template),
+                    .flat_map(move |iface| self.match_interface_links(iface))
+                    .flat_map(move |link| template(link)),
             ),
         }
     }
