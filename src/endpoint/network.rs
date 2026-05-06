@@ -31,9 +31,10 @@
 //! ## Binds registry
 //!
 //! [`Network::bind`] registers a [`BindPattern`] with reference counting.
-//! Repeated calls with the same pattern increment the count; [`Network::unbind`]
-//! decrements it and tears down the bound interfaces only when the count
-//! reaches zero. A single background reconcile task (started at build time)
+//! Repeated calls with the same pattern increment the count; when every
+//! returned [`BindHandle`] is dropped or [`BindHandle::unbind`] is called,
+//! the count reaches zero and the bound interfaces are released.
+//! A single background reconcile task (started at build time)
 //! watches for device changes and keeps every pattern's bound interfaces in
 //! sync.
 
@@ -140,6 +141,55 @@ struct BindsEntry {
     /// the outer `bind_registry` mutex so the reconcile task can perform
     /// async bind/unbind without holding the registry lock.
     bound: Mutex<HashMap<String, (BindUri, BindInterface)>>,
+}
+
+/// RAII handle returned by [`Network::bind`].
+///
+/// The handle holds a reference-counted spot in the bind registry.
+/// When all handles for a pattern are dropped, the bound interfaces
+/// are released.
+///
+/// Prefer calling [`BindHandle::unbind`] to release synchronously.
+/// If the handle is dropped without calling `unbind()`, the release
+/// is spawned as a background task.
+pub struct BindHandle {
+    network: Arc<Network>,
+    pattern: BindPattern,
+    released: bool,
+}
+
+impl BindHandle {
+    /// Release the bind and clean up interfaces in the current task.
+    ///
+    /// This decrements the pattern's reference count and, when it
+    /// reaches zero, unregisters the entry and releases all associated
+    /// [`BindInterface`]s via the interface manager.
+    pub async fn unbind(mut self) {
+        self.released = true;
+        self.network.unbind(&self.pattern).await;
+    }
+
+    /// The [`BindPattern`] this handle was created for.
+    #[must_use]
+    pub fn pattern(&self) -> &BindPattern {
+        &self.pattern
+    }
+}
+
+impl Drop for BindHandle {
+    fn drop(&mut self) {
+        if !self.released {
+            // Inherent termination: unbind iterates over a finite set of
+            // URIs and calls iface_manager.unbind() for each, then exits.
+            let network = self.network.clone();
+            let pattern = self.pattern.clone();
+            tracing::warn!(
+                target: "h3x::endpoint",
+                "BindHandle dropped without unbind().await — spawning background cleanup"
+            );
+            tokio::spawn(async move { network.unbind(&pattern).await }.in_current_span());
+        }
+    }
 }
 
 impl Network {
@@ -287,22 +337,27 @@ impl Network {
         });
     }
 
-    /// Register a [`BindPattern`] with this network (refcounted).
+    /// Register a [`BindPattern`] with this network.
     ///
-    /// If the same pattern is already registered, its reference count is
-    /// incremented and no new interfaces are bound. Otherwise the pattern
-    /// is expanded against the current device set and each resulting
+    /// Returns a [`BindHandle`] that keeps the pattern registered for its
+    /// lifetime. If the same pattern is already registered, the reference
+    /// count is incremented and no new interfaces are bound. Otherwise the
+    /// pattern is expanded against the current device set and each resulting
     /// [`BindUri`] is bound via [`bind_iface`](Self::bind_iface).
     ///
-    /// A background reconcile task (started at build time) watches for
-    /// device changes and keeps the bound interfaces in sync.
-    pub async fn bind(self: &Arc<Self>, pattern: BindPattern) {
+    /// A background reconcile task watches for device changes and keeps the
+    /// bound interfaces in sync independently of the handle's lifecycle.
+    pub async fn bind(self: &Arc<Self>, pattern: BindPattern) -> BindHandle {
         // Fast path: bump refcount if already registered.
         {
             let mut registry = self.bind_registry.lock().unwrap();
             if let Some(entry) = registry.get_mut(&pattern) {
                 entry.refcount += 1;
-                return;
+                return BindHandle {
+                    network: self.clone(),
+                    pattern,
+                    released: false,
+                };
             }
         }
 
@@ -321,7 +376,7 @@ impl Network {
         // Re-lock and insert (double-check for concurrent bind of the
         // same pattern).
         let mut registry = self.bind_registry.lock().unwrap();
-        match registry.entry(pattern) {
+        match registry.entry(pattern.clone()) {
             hash_map::Entry::Occupied(mut e) => {
                 e.get_mut().refcount += 1;
                 // Another caller bound the same pattern concurrently.
@@ -332,13 +387,20 @@ impl Network {
                 e.insert(BindsEntry { refcount: 1, bound });
             }
         }
+        BindHandle {
+            network: self.clone(),
+            pattern,
+            released: false,
+        }
     }
 
     /// Decrement the reference count for a [`BindPattern`].
     ///
     /// When the last reference is removed, the pattern's bound interfaces
-    /// are released asynchronously.
-    pub async fn unbind(self: &Arc<Self>, pattern: &BindPattern) {
+    /// are released via the interface manager.
+    ///
+    /// Prefer [`BindHandle::unbind`] over calling this directly.
+    pub(crate) async fn unbind(self: &Arc<Self>, pattern: &BindPattern) {
         let bound = {
             let mut registry = self.bind_registry.lock().unwrap();
             match registry.get_mut(pattern) {

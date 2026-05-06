@@ -86,7 +86,7 @@ fn serve_and_connect_hello() {
             ClientQuicConfig::default(),
             ServerQuicConfig::default(),
         );
-        network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
+        let _bind = network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
         let bind_iface = network.interfaces().into_iter().next().unwrap();
         let bound_addr = bind_iface
             .borrow()
@@ -159,7 +159,7 @@ fn endpoint_get_convenience() {
             ClientQuicConfig::default(),
             ServerQuicConfig::default(),
         );
-        network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
+        let _bind = network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
         let bind_iface = network.interfaces().into_iter().next().unwrap();
         let bound_addr = bind_iface
             .borrow()
@@ -391,7 +391,7 @@ async fn beta_service(_: &mut server::Request, response: &mut server::Response) 
 fn two_sni_share_network_and_port() {
     run("two_sni_share_network_and_port", async move {
         let network = test_network();
-        network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
+        let _bind = network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
         let bind_iface = network.interfaces().into_iter().next().unwrap();
         let port = match bind_iface.borrow().bound_addr().unwrap() {
             BoundAddr::Internet(s) => s.port(),
@@ -482,7 +482,7 @@ fn two_sni_share_network_and_port() {
 fn bind_iface_returns_usable_interface() {
     run("bind_iface_returns_usable_interface", async move {
         let network = test_network();
-        network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
+        let _bind = network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
         let bound = network.interfaces().into_iter().next().unwrap();
         let addr = bound.borrow().bound_addr().expect("bound addr");
 
