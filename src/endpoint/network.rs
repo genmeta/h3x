@@ -584,7 +584,6 @@ impl Network {
                     Err(e) => {
                         let report = snafu::Report::from_error(&e);
                         tracing::debug!(
-                            target: "h3x::endpoint",
                             error = %report,
                             "failed to get server name"
                         );
@@ -599,7 +598,6 @@ impl Network {
                 {
                     if entry.incomings_tx.send(conn).await.is_err() {
                         tracing::debug!(
-                            target: "h3x::endpoint",
                             name = %sni,
                             "sni channel closed"
                         );
@@ -607,7 +605,6 @@ impl Network {
                     return;
                 }
                 tracing::debug!(
-                    target: "h3x::endpoint",
                     name = %sni,
                     "no endpoint registered for SNI"
                 );
