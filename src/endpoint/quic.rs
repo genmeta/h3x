@@ -232,8 +232,6 @@ impl QuicEndpoint {
             .run();
         Ok(connection)
     }
-
-
 }
 
 impl QuicEndpoint {
@@ -282,9 +280,9 @@ impl quic::Connect for QuicEndpoint {
         let server_str = full.rsplit_once('@').map_or(full, |(_, host)| host);
 
         let tls = self.client_tls().context(TlsSnafu)?;
-        let mut server_eps = self.resolver.lookup(&server_str).await.context(DnsSnafu)?;
+        let mut server_eps = self.resolver.lookup(server_str).await.context(DnsSnafu)?;
         let connection = self
-            .build_client_connection(&server_str, tls)
+            .build_client_connection(server_str, tls)
             .context(TlsSnafu)?;
 
         // Connect succeeds as long as at least one peer endpoint is registered.
@@ -371,17 +369,31 @@ impl QuicEndpoint {
         self.server_binding_cache.store(None);
     }
 
+    /// Modify the endpoint's identity via a closure.
+    ///
+    /// The closure receives `&mut Option<Arc<Identity>>` — it may inspect,
+    /// mutate, replace, or remove the identity. The identity is re-loaded
+    /// from the atomic swap after the closure returns.
+    pub fn modify_identity(&self, f: impl FnOnce(&mut Option<Arc<Identity>>)) {
+        let mut current = self.identity.load_full();
+        f(&mut current);
+        self.identity.store(current);
+        self.invalidate_caches();
+    }
+
     /// Update the OCSP staple for this endpoint's identity.
     ///
-    /// The next call to `accept()` or `connect()` will rebuild the relevant
-    /// TLS config with the new OCSP response.
+    /// Convenience wrapper around [`modify_identity`]. The next call to
+    /// `accept()` or `connect()` will rebuild the relevant TLS config
+    /// with the new OCSP response.
     pub fn update_ocsp(&self, ocsp: Option<Vec<u8>>) {
-        if let Some(current) = self.identity.load_full() {
-            let mut new_id = (*current).clone();
-            new_id.ocsp = Arc::new(ocsp);
-            self.identity.store(Some(Arc::new(new_id)));
-            self.invalidate_caches();
-        }
+        self.modify_identity(|id| {
+            if let Some(current) = id {
+                let mut new_id = (**current).clone();
+                new_id.ocsp = Arc::new(ocsp);
+                *id = Some(Arc::new(new_id));
+            }
+        });
     }
 
     /// Apply a modification to the client configuration.
@@ -398,8 +410,6 @@ impl QuicEndpoint {
         self.invalidate_caches();
     }
 }
-
-
 
 impl QuicEndpoint {
     /// Subscribe to local address changes filtered by bind_patterns.
