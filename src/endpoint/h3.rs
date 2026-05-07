@@ -170,7 +170,7 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let quic = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server);
+        let quic = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server, Arc::new(Vec::new()));
         let pool = Pool::empty();
         let builder = Arc::new(ConnectionBuilder::new(Arc::default()));
 
@@ -187,7 +187,7 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let quic = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server);
+        let quic = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server, Arc::new(Vec::new()));
         let pool = Pool::empty();
         let builder = Arc::new(ConnectionBuilder::new(Arc::default()));
 

@@ -1,6 +1,6 @@
 //! QUIC-only endpoint built on top of a shared [`Network`].
 
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 use arc_swap::ArcSwapOption;
 use futures::StreamExt;
@@ -147,14 +147,20 @@ impl QuicEndpoint {
         resolver: Arc<dyn Resolve + Send + Sync>,
         client: ClientQuicConfig,
         server: ServerQuicConfig,
+        bind_patterns: Arc<Vec<BindPattern>>,
     ) -> Self {
+        let bind_patterns = if bind_patterns.is_empty() {
+            Arc::new(vec![BindPattern::from_str("*").unwrap()])
+        } else {
+            bind_patterns
+        };
         Self {
             network,
             identity: ArcSwapOption::from(identity),
             resolver,
             client: Arc::new(client),
             server: Arc::new(server),
-            bind_patterns: Arc::new(Vec::new()),
+            bind_patterns,
             client_tls_cache: ArcSwapOption::empty(),
             server_binding_cache: ArcSwapOption::empty(),
         }
@@ -312,6 +318,7 @@ impl QuicEndpoint {
         let server = self.server.clone();
         let cached = self.server_binding_cache.load_full();
         let bind_patterns = self.bind_patterns.clone();
+        let endpoint = self.clone();
 
         async move {
             let named = match identity {
@@ -320,14 +327,18 @@ impl QuicEndpoint {
             };
 
             if let Some(cached_binding) = cached.as_ref() {
-                return cached_binding.recv().await.ok_or(AcceptError::Shutdown);
+                let conn = cached_binding.recv().await.ok_or(AcceptError::Shutdown)?;
+                endpoint.subscribe_local_address(&conn, &endpoint.bind_patterns);
+                return Ok(conn);
             }
 
             let binding = network
                 .bind_server(named, (*server).clone(), bind_patterns)
                 .await
                 .context(BindServerSnafu)?;
-            binding.recv().await.ok_or(AcceptError::Shutdown)
+            let conn = binding.recv().await.ok_or(AcceptError::Shutdown)?;
+            endpoint.subscribe_local_address(&conn, &endpoint.bind_patterns);
+            Ok(conn)
         }
     }
 }
@@ -356,9 +367,7 @@ impl quic::Connect for QuicEndpoint {
         let connection = self
             .build_client_connection(&server_str, tls)
             .context(TlsSnafu)?;
-        if connection.subscribe_local_address().is_err() {
-            return Ok(connection);
-        }
+        self.subscribe_local_address(&connection, &self.bind_patterns);
 
         let mut last_error: Option<ConnectError> = None;
         let mut any_viable = false;
@@ -510,6 +519,74 @@ fn bind_uri_for(source: &Source, ep: &EndpointAddr) -> BindUri {
     }
 }
 
+impl QuicEndpoint {
+    /// Subscribe to local address changes filtered by bind_patterns.
+    ///
+    /// Spawns a background task that observes [`Locations`] events and
+    /// only forwards those whose [`BindUri`] matches one of the
+    /// endpoint's [`BindPattern`]s.
+    fn subscribe_local_address(&self, conn: &Arc<Connection>, patterns: &[BindPattern]) {
+        use crate::dquic::qbase::net::addr::BleEndpontAddr;
+        use crate::dquic::qinterface::component::location::AddressEvent;
+
+        let mut observer = self.network.locations().subscribe();
+        let conn = conn.clone();
+        let patterns: Vec<BindPattern> = patterns.to_vec();
+
+        tokio::spawn(
+            async move {
+                // Inherent termination: loop exits when connection closes
+                // (terminated fires) or observer channel is dropped.
+                loop {
+                    tokio::select! {
+                        _ = conn.terminated() => break,
+                        event = observer.recv() => {
+                            let Some((bind_uri, event)) = event else { break };
+
+                            if !patterns.iter().any(|p| p.matches(&bind_uri)) {
+                                continue;
+                            }
+
+                            // Handle BoundAddr events (mirrors handle_address_event in traversal.rs)
+                            let event = match event.downcast::<std::io::Result<BoundAddr>>() {
+                                Ok(AddressEvent::Upsert(data)) => {
+                                    let Ok(bound_addr) = data.as_ref() else { continue; };
+                                    let endpoint_addr = match *bound_addr {
+                                        BoundAddr::Internet(addr) => {
+                                            EndpointAddr::Socket(SocketEndpointAddr::direct(addr))
+                                        }
+                                        BoundAddr::Bluetooth(addr) => {
+                                            EndpointAddr::Ble(BleEndpontAddr::new(addr))
+                                        }
+                                        _ => continue,
+                                    };
+                                    if let Err(e) = conn.add_local_endpoint(bind_uri.clone(), endpoint_addr) {
+                                        let report = snafu::Report::from_error(&e);
+                                        tracing::warn!(
+                                            target: "h3x::endpoint",
+                                            error = %report,
+                                            "failed to add local endpoint for filtered address"
+                                        );
+                                    }
+                                    continue;
+                                }
+                                Ok(AddressEvent::Remove(_)) | Ok(AddressEvent::Closed) => continue,
+                                Err(event) => event,
+                            };
+
+// ClientLocationData: skip (requires add_local_punch_address,
+// not exposed on Connection). For full NAT traversal,
+// use subscribe_local_address on the endpoint directly.
+                            let _ = event;
+                        }
+                    }
+                }
+            }
+            .in_current_span(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,7 +599,7 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server);
+        let endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server, Arc::new(Vec::new()));
 
         assert!(Arc::ptr_eq(&endpoint.network, &network));
         assert!(endpoint.identity.load_full().is_none());
@@ -536,7 +613,7 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server);
+        let endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server, Arc::new(Vec::new()));
 
         // The key test: we can call accept() and hold the endpoint reference
         // while the future is being awaited. This verifies the future doesn't
@@ -565,7 +642,7 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let _endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server);
+        let _endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server, Arc::new(Vec::new()));
 
         // The dual-task model is set up internally in connect()
         // We verify it doesn't panic or error during setup

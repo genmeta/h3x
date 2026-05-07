@@ -85,6 +85,7 @@ fn serve_and_connect_hello() {
             Arc::new(SystemResolver),
             ClientQuicConfig::default(),
             ServerQuicConfig::default(),
+            Arc::new(Vec::new()),
         );
         let _bind = network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
         let bind_iface = network.interfaces().into_iter().next().unwrap();
@@ -123,6 +124,7 @@ fn serve_and_connect_hello() {
             Arc::new(SystemResolver),
             client_quic_config,
             ServerQuicConfig::default(),
+            Arc::new(Vec::new()),
         );
         let client = Client::from_quic_client().client(client_quic).build();
 
@@ -158,6 +160,7 @@ fn endpoint_get_convenience() {
             Arc::new(SystemResolver),
             ClientQuicConfig::default(),
             ServerQuicConfig::default(),
+            Arc::new(Vec::new()),
         );
         let _bind = network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
         let bind_iface = network.interfaces().into_iter().next().unwrap();
@@ -196,6 +199,7 @@ fn endpoint_get_convenience() {
             Arc::new(SystemResolver),
             client_quic_config,
             ServerQuicConfig::default(),
+            Arc::new(Vec::new()),
         );
         let client_endpoint = H3Endpoint::new(
             client_quic,
@@ -437,6 +441,7 @@ fn two_sni_share_network_and_port() {
                 resolver.clone(),
                 ClientQuicConfig::default(),
                 shared_server_config.clone(),
+                Arc::new(Vec::new()),
             );
             let h3 = H3Endpoint::new(
                 quic,
@@ -464,6 +469,7 @@ fn two_sni_share_network_and_port() {
             resolver.clone(),
             client_quic_config,
             ServerQuicConfig::default(),
+            Arc::new(Vec::new()),
         );
         let client = Client::from_quic_client().client(client_quic).build();
 
