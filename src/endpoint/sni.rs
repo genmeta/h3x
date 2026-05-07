@@ -15,34 +15,39 @@ use rustls::{
     sign::CertifiedKey,
 };
 
-use super::identity::{Identity, ServerName};
+use super::{
+    binds::BindPattern,
+    identity::{Identity, ServerName},
+};
 use crate::dquic::prelude::Connection;
 
 /// Per-SNI entry stored behind a `Weak` in the network's registry.
 ///
 /// Holds an mpmc channel so multiple [`ServerBinding`] clones share the
 /// same inbound connection queue.
-pub(crate) struct SniEntry {
+pub(crate) struct ServerEntry {
     pub(crate) identity: Arc<Identity>,
     pub(crate) certified_key: Arc<CertifiedKey>,
     pub(crate) incomings_tx: async_channel::Sender<Arc<Connection>>,
     pub(crate) incomings_rx: async_channel::Receiver<Arc<Connection>>,
-    /// Keeps the shared server slot alive for the lifetime of this entry.
-    pub(crate) _slot: Arc<ServerSlotInner>,
+    /// Shared server-side QUIC/TLS configuration for this entry.
+    pub(crate) config: Arc<ServerConfig>,
     /// Shared guard — cloned into every `ServerBinding`. When the last
     /// clone drops, the entry is removed from `sni_registry`.
-    pub(crate) guard: Arc<SniGuard>,
+    pub(crate) guard: Arc<RegistryGuard>,
+    /// Bind patterns associated with this server entry.
+    pub(crate) bind_patterns: Arc<Vec<BindPattern>>,
 }
 
 /// RAII guard that removes an SNI entry from the registry when the last
 /// [`ServerBinding`] referencing it is dropped.
-pub(crate) struct SniGuard {
+pub(crate) struct RegistryGuard {
     pub(crate) name: ServerName,
-    pub(crate) registry: Weak<DashMap<ServerName, Weak<SniEntry>>>,
-    pub(crate) self_entry: Weak<SniEntry>,
+    pub(crate) registry: Weak<DashMap<ServerName, Weak<ServerEntry>>>,
+    pub(crate) self_entry: Weak<ServerEntry>,
 }
 
-impl Drop for SniGuard {
+impl Drop for RegistryGuard {
     fn drop(&mut self) {
         if let Some(registry) = self.registry.upgrade()
             && let Some(kv) = registry.get(&self.name)
@@ -59,7 +64,7 @@ impl Drop for SniGuard {
 /// [`Network`](super::Network) at any time; identical instances are shared
 /// across all registered SNIs, and conflicting configurations are rejected
 /// at `bind_server` time.
-pub(crate) struct ServerSlotInner {
+pub(crate) struct ServerConfig {
     pub(crate) config: super::server::ServerQuicConfig,
     pub(crate) rustls_config: Arc<rustls::ServerConfig>,
 }
@@ -70,18 +75,13 @@ pub(crate) struct ServerSlotInner {
 /// concurrently calling `recv` from multiple clones fans out inbound
 /// connections across the clones without duplicating work.
 pub struct ServerBinding {
-    /// Server name this binding was registered under.
-    pub name: ServerName,
-    pub(crate) entry: Arc<SniEntry>,
-    pub(crate) _guard: Arc<SniGuard>,
+    pub(crate) entry: Arc<ServerEntry>,
 }
 
 impl Clone for ServerBinding {
     fn clone(&self) -> Self {
         Self {
-            name: self.name.clone(),
             entry: self.entry.clone(),
-            _guard: self._guard.clone(),
         }
     }
 }
@@ -89,12 +89,17 @@ impl Clone for ServerBinding {
 impl std::fmt::Debug for ServerBinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerBinding")
-            .field("name", &self.name)
+            .field("name", &self.entry.identity.name)
             .finish_non_exhaustive()
     }
 }
 
 impl ServerBinding {
+    /// Return the server name this binding was registered under.
+    pub fn name(&self) -> &ServerName {
+        &self.entry.identity.name
+    }
+
     /// Receive the next accepted connection for this SNI.
     ///
     /// Returns `None` once the network is shut down or has no remaining
@@ -109,7 +114,7 @@ impl ServerBinding {
 /// SNI names are matched ASCII case-insensitively per RFC 6066 §3.
 #[derive(Clone)]
 pub(crate) struct SniCertResolver {
-    pub(crate) registry: Weak<DashMap<ServerName, Weak<SniEntry>>>,
+    pub(crate) registry: Weak<DashMap<ServerName, Weak<ServerEntry>>>,
 }
 
 impl std::fmt::Debug for SniCertResolver {

@@ -9,7 +9,6 @@ use std::{error::Error, sync::Arc};
 
 use bytes::Buf;
 use http::uri::Authority;
-use tokio::sync::RwLock;
 
 use super::quic::{AcceptError, ConnectError, QuicEndpoint};
 use crate::{
@@ -22,7 +21,7 @@ use crate::{
 
 /// HTTP/3 endpoint.
 pub struct H3Endpoint {
-    quic: Arc<RwLock<QuicEndpoint>>,
+    quic: Arc<QuicEndpoint>,
     pool: Pool<Connection>,
     connection_builder: Arc<ConnectionBuilder<Connection>>,
 }
@@ -36,7 +35,7 @@ impl H3Endpoint {
         connection_builder: Arc<ConnectionBuilder<Connection>>,
     ) -> Self {
         Self {
-            quic: Arc::new(RwLock::new(quic)),
+            quic: Arc::new(quic),
             pool,
             connection_builder,
         }
@@ -70,8 +69,8 @@ impl H3Endpoint {
         S::Error: Into<Box<dyn Error + Send + Sync>>,
     {
         let quic = match Arc::try_unwrap(self.quic) {
-            Ok(rwlock) => rwlock.into_inner(),
-            Err(arc) => arc.read().await.clone(),
+            Ok(quic) => quic,
+            Err(arc) => (*arc).clone(),
         };
         let mut servers = Servers::from_quic_listener()
             .listener(quic)
@@ -82,17 +81,12 @@ impl H3Endpoint {
         servers.run().await
     }
 
-    /// Update the OCSP staple via Arc-Cow chain.
+    /// Update the OCSP staple via the underlying [`QuicEndpoint`].
     ///
-    /// Updates the OCSP response that will be sent to new clients. Uses
-    /// `Arc::make_mut` to implement copy-on-write semantics: if the
-    /// underlying `QuicEndpoint` is shared, a clone is made before modification.
-    pub async fn update_ocsp(&self, ocsp: Option<Vec<u8>>) {
-        let mut guard = self.quic.write().await;
-        if let Some(identity) = guard.identity.as_mut() {
-            let id = Arc::make_mut(identity);
-            id.ocsp = Arc::new(ocsp);
-        }
+    /// Uses a double-clear cache-invalidation pattern; see
+    /// [`QuicEndpoint::update_ocsp`] for details.
+    pub fn update_ocsp(&self, ocsp: Option<Vec<u8>>) {
+        self.quic.update_ocsp(ocsp);
     }
 }
 
@@ -102,7 +96,7 @@ impl H3Endpoint {
         &self,
         server: Authority,
     ) -> Result<Arc<H3Connection<Connection>>, pool::ConnectError<ConnectError>> {
-        let quic = self.quic.read().await.clone();
+        let quic = (*self.quic).clone();
         self.pool
             .reuse_or_connect_with(&quic, self.connection_builder.clone(), server)
             .await
@@ -111,7 +105,7 @@ impl H3Endpoint {
     /// Build a temporary [`Client`] that shares this endpoint's pool and
     /// configuration. Cheap — only Arc clones.
     async fn as_client(&self) -> Client<QuicEndpoint> {
-        let quic = self.quic.read().await.clone();
+        let quic = (*self.quic).clone();
         Client::from_quic_client()
             .pool(self.pool.clone())
             .client(quic)
@@ -144,8 +138,7 @@ impl crate::quic::Connect for H3Endpoint {
     type Error = ConnectError;
 
     async fn connect(&self, server: &Authority) -> Result<Arc<Self::Connection>, Self::Error> {
-        let quic = self.quic.read().await;
-        quic.connect(server).await
+        self.quic.connect(server).await
     }
 }
 
@@ -154,13 +147,11 @@ impl crate::quic::Listen for H3Endpoint {
     type Error = AcceptError;
 
     async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
-        let quic = self.quic.read().await;
-        quic.accept().await
+        self.quic.accept().await
     }
 
     async fn shutdown(&self) -> Result<(), Self::Error> {
-        let quic = self.quic.read().await;
-        quic.shutdown().await
+        self.quic.shutdown().await
     }
 }
 
@@ -173,7 +164,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn test_h3endpoint_rwlock_construction() {
+    async fn test_h3endpoint_construction() {
         let network = Network::builder().build();
         let resolver = Arc::new(SystemResolver);
         let client = ClientQuicConfig::default();
@@ -185,8 +176,8 @@ mod tests {
 
         let endpoint = H3Endpoint::new(quic, pool, builder);
 
-        // Verify that we can read the QuicEndpoint through RwLock
-        let _quic_read = endpoint.quic.read().await;
+        // Verify that we can access the QuicEndpoint
+        let _quic = &endpoint.quic;
     }
 
     #[tokio::test]
@@ -203,9 +194,9 @@ mod tests {
         let endpoint = H3Endpoint::new(quic, pool, builder);
 
         // Test update_ocsp with no identity (should not panic)
-        endpoint.update_ocsp(Some(vec![1, 2, 3])).await;
+        endpoint.update_ocsp(Some(vec![1, 2, 3]));
 
         // Verify the endpoint is still functional
-        let _quic_read = endpoint.quic.read().await;
+        let _quic = &endpoint.quic;
     }
 }

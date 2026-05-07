@@ -243,16 +243,16 @@ fn bind_server_sni_in_use() {
         let a = named_with("localhost");
         let b = named_with("localhost");
         let first = network
-            .bind_server(a.clone(), ServerQuicConfig::default())
+            .bind_server(a.clone(), ServerQuicConfig::default(), Arc::new(Vec::new()))
             .await
             .expect("first bind succeeds");
         // Drop the first binding to release the slot
         drop(first);
         let second = network
-            .bind_server(b.clone(), ServerQuicConfig::default())
+            .bind_server(b.clone(), ServerQuicConfig::default(), Arc::new(Vec::new()))
             .await
             .expect("second bind with different identity should succeed (overwrite)");
-        assert_eq!(second.name, Arc::from("localhost"));
+        assert_eq!(second.name(), &Arc::from("localhost"));
     });
 }
 
@@ -262,14 +262,22 @@ fn bind_server_reuses_identity() {
         let network = test_network();
         let id = named_with("localhost");
         let first = network
-            .bind_server(id.clone(), ServerQuicConfig::default())
+            .bind_server(
+                id.clone(),
+                ServerQuicConfig::default(),
+                Arc::new(Vec::new()),
+            )
             .await
             .expect("first bind succeeds");
         let second = network
-            .bind_server(id.clone(), ServerQuicConfig::default())
+            .bind_server(
+                id.clone(),
+                ServerQuicConfig::default(),
+                Arc::new(Vec::new()),
+            )
             .await
             .expect("same identity must reuse binding");
-        assert_eq!(first.name, second.name);
+        assert_eq!(first.name(), second.name());
     });
 }
 
@@ -293,11 +301,11 @@ fn bind_server_config_conflict() {
         };
 
         let _held = network
-            .bind_server(a, cfg_a)
+            .bind_server(a, cfg_a, Arc::new(Vec::new()))
             .await
             .expect("first bind succeeds");
         let err = network
-            .bind_server(b, cfg_b)
+            .bind_server(b, cfg_b, Arc::new(Vec::new()))
             .await
             .expect_err("incompatible server config must fail");
         assert!(
@@ -326,14 +334,14 @@ fn bind_server_slot_auto_reset() {
 
         {
             let _first = network
-                .bind_server(named_with("alpha"), cfg_a)
+                .bind_server(named_with("alpha"), cfg_a, Arc::new(Vec::new()))
                 .await
                 .expect("first bind succeeds");
         }
         // After the binding drops the slot should clear, allowing a new
         // incompatible config to install.
         let _second = network
-            .bind_server(named_with("beta"), cfg_b)
+            .bind_server(named_with("beta"), cfg_b, Arc::new(Vec::new()))
             .await
             .expect("slot should auto-reset after last binding dropped");
     });
@@ -415,7 +423,11 @@ fn two_sni_share_network_and_port() {
             // where a client connects before the server task has polled
             // its first `accept()`).
             let binding = network
-                .bind_server(named.clone(), shared_server_config.clone())
+                .bind_server(
+                    named.clone(),
+                    shared_server_config.clone(),
+                    Arc::new(Vec::new()),
+                )
                 .await
                 .expect("eager bind_server");
             bindings.push(binding);
@@ -504,11 +516,19 @@ fn registered_sni_names_tracks_live_bindings() {
 
         let shared_config = ServerQuicConfig::default();
         let alpha = network
-            .bind_server(named_with("alpha"), shared_config.clone())
+            .bind_server(
+                named_with("alpha"),
+                shared_config.clone(),
+                Arc::new(Vec::new()),
+            )
             .await
             .expect("bind alpha");
         let beta = network
-            .bind_server(named_with("beta"), shared_config.clone())
+            .bind_server(
+                named_with("beta"),
+                shared_config.clone(),
+                Arc::new(Vec::new()),
+            )
             .await
             .expect("bind beta");
 

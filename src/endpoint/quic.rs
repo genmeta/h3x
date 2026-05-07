@@ -4,11 +4,12 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 use futures::StreamExt;
-use rustls::{ClientConfig, pki_types::PrivateKeyDer};
+use rustls::ClientConfig;
 use snafu::{ResultExt, Snafu};
 use tracing::Instrument;
 
 use super::{
+    binds::BindPattern,
     client::{ClientQuicConfig, ServerCertVerifierChoice},
     identity::Identity,
     network::{BindServerError, Network, ServerBinding},
@@ -47,6 +48,12 @@ pub enum BuildClientTlsError {
     ClientAuth {
         /// Underlying rustls error.
         source: rustls::Error,
+    },
+    /// Failed to set a transport parameter on the client parameters.
+    #[snafu(display("failed to set client name transport parameter"))]
+    SetParameter {
+        /// Underlying parameter error.
+        source: crate::dquic::qbase::param::error::Error,
     },
 }
 
@@ -103,50 +110,28 @@ pub struct QuicEndpoint {
     /// Shared network infrastructure.
     pub(crate) network: Arc<Network>,
     /// TLS identity for this endpoint (`None` for anonymous/client-only).
-    pub(crate) identity: Option<Arc<Identity>>,
+    pub(crate) identity: ArcSwapOption<Identity>,
     /// Resolver used when establishing outbound connections.
     pub(crate) resolver: Arc<dyn Resolve + Send + Sync>,
     /// Client-side configuration.
     pub(crate) client: Arc<ClientQuicConfig>,
     /// Server-side configuration.
     pub(crate) server: Arc<ServerQuicConfig>,
-    client_tls_cache: ArcSwapOption<CachedClientTls>,
-    server_binding_cache: ArcSwapOption<CachedServerBinding>,
-}
-
-struct CachedClientTls {
-    key: ClientCacheKey,
-    config: Arc<ClientConfig>,
-}
-
-#[derive(PartialEq, Eq)]
-struct ClientCacheKey {
-    identity_ptr: usize,
-    client_own_ptr: usize,
-    client_common_ptr: usize,
-}
-
-struct CachedServerBinding {
-    key: ServerCacheKey,
-    binding: ServerBinding,
-}
-
-#[derive(PartialEq, Eq)]
-struct ServerCacheKey {
-    network_ptr: usize,
-    identity_ptr: usize,
-    server_own_ptr: usize,
-    server_common_ptr: usize,
+    /// Bind patterns for interface filtering (shared by client and server roles).
+    pub(crate) bind_patterns: Arc<Vec<BindPattern>>,
+    client_tls_cache: ArcSwapOption<ClientConfig>,
+    server_binding_cache: ArcSwapOption<ServerBinding>,
 }
 
 impl Clone for QuicEndpoint {
     fn clone(&self) -> Self {
         Self {
             network: self.network.clone(),
-            identity: self.identity.clone(),
+            identity: ArcSwapOption::from(self.identity.load_full()),
             resolver: self.resolver.clone(),
             client: self.client.clone(),
             server: self.server.clone(),
+            bind_patterns: self.bind_patterns.clone(),
             client_tls_cache: ArcSwapOption::empty(),
             server_binding_cache: ArcSwapOption::empty(),
         }
@@ -165,50 +150,24 @@ impl QuicEndpoint {
     ) -> Self {
         Self {
             network,
-            identity,
+            identity: ArcSwapOption::from(identity),
             resolver,
             client: Arc::new(client),
             server: Arc::new(server),
+            bind_patterns: Arc::new(Vec::new()),
             client_tls_cache: ArcSwapOption::empty(),
             server_binding_cache: ArcSwapOption::empty(),
         }
     }
-
-    fn client_cache_key(&self) -> ClientCacheKey {
-        ClientCacheKey {
-            identity_ptr: identity_ptr(&self.identity),
-            client_own_ptr: Arc::as_ptr(&self.client.own) as usize,
-            client_common_ptr: Arc::as_ptr(&self.client.common) as usize,
-        }
-    }
-
-    fn server_cache_key(&self) -> ServerCacheKey {
-        ServerCacheKey {
-            network_ptr: Arc::as_ptr(&self.network) as usize,
-            identity_ptr: identity_ptr(&self.identity),
-            server_own_ptr: Arc::as_ptr(&self.server.own) as usize,
-            server_common_ptr: Arc::as_ptr(&self.server.common) as usize,
-        }
-    }
-}
-
-fn identity_ptr(identity: &Option<Arc<Identity>>) -> usize {
-    identity.as_ref().map_or(0, |id| Arc::as_ptr(id) as usize)
 }
 
 impl QuicEndpoint {
     fn client_tls(&self) -> Result<Arc<ClientConfig>, BuildClientTlsError> {
-        let key = self.client_cache_key();
-        if let Some(cached) = self.client_tls_cache.load_full()
-            && cached.key == key
-        {
-            return Ok(cached.config.clone());
+        if let Some(cached) = self.client_tls_cache.load_full() {
+            return Ok(cached);
         }
         let config = Arc::new(self.build_client_tls()?);
-        self.client_tls_cache.store(Some(Arc::new(CachedClientTls {
-            key,
-            config: config.clone(),
-        })));
+        self.client_tls_cache.store(Some(config.clone()));
         Ok(config)
     }
 
@@ -229,10 +188,10 @@ impl QuicEndpoint {
                 .dangerous()
                 .with_custom_certificate_verifier(v.clone()),
         };
-        let mut tls = match &self.identity {
+        let mut tls = match self.identity.load_full() {
             None => builder.with_no_client_auth(),
             Some(id) => builder
-                .with_client_auth_cert(id.certs.iter().cloned().collect(), clone_key(&id.key))
+                .with_client_auth_cert(id.certs.iter().cloned().collect(), id.key.clone_key())
                 .context(ClientAuthSnafu)?,
         };
         tls.alpn_protocols.clone_from(&self.client.own.alpns);
@@ -246,19 +205,21 @@ impl QuicEndpoint {
         &self,
         server_name: &str,
         tls: Arc<ClientConfig>,
-    ) -> Arc<Connection> {
+    ) -> Result<Arc<Connection>, BuildClientTlsError> {
+        use build_client_tls_error::SetParameterSnafu;
+
         // Propagate the endpoint's named identity into the QUIC transport
         // `ClientName` parameter so the peer can populate its
         // `remote_agent` (identity-based access control on the server
         // relies on this).
         let mut parameters = self.client.own.parameters.clone();
-        if let Some(named) = &self.identity {
+        if let Some(named) = self.identity.load_full() {
             parameters
                 .set(
                     crate::dquic::qbase::param::ParameterId::ClientName,
                     named.name.to_string(),
                 )
-                .expect("ClientName is a client-only string parameter");
+                .context(SetParameterSnafu)?;
         }
         let builder =
             Connection::new_client(server_name.to_owned(), self.client.own.token_sink.clone())
@@ -268,12 +229,14 @@ impl QuicEndpoint {
                     self.client.common.stream_strategy_factory.as_ref(),
                 )
                 .with_zero_rtt(self.client.common.enable_0rtt);
-        self.network
+        let connection = self
+            .network
             .configure_connection(builder)
             .with_defer_idle_timeout(self.client.common.defer_idle_timeout)
             .with_cids(ConnectionId::random_gen(8))
             .with_qlog(self.client.common.qlogger.clone())
-            .run()
+            .run();
+        Ok(connection)
     }
 
     async fn setup_server_endpoint(
@@ -317,26 +280,20 @@ impl QuicEndpoint {
     async fn server_binding(&self) -> Result<ServerBinding, AcceptError> {
         use accept_error::BindServerSnafu;
 
-        let named = match &self.identity {
+        let named = match self.identity.load_full() {
             None => return Err(AcceptError::ServerUnavailable),
-            Some(id) => id.clone(),
+            Some(id) => id,
         };
-        let key = self.server_cache_key();
-        if let Some(cached) = self.server_binding_cache.load_full()
-            && cached.key == key
-        {
-            return Ok(cached.binding.clone());
+        if let Some(cached) = self.server_binding_cache.load_full() {
+            return Ok(cached.as_ref().clone());
         }
         let binding = self
             .network
-            .bind_server(named, (*self.server).clone())
+            .bind_server(named, (*self.server).clone(), self.bind_patterns.clone())
             .await
             .context(BindServerSnafu)?;
         self.server_binding_cache
-            .store(Some(Arc::new(CachedServerBinding {
-                key,
-                binding: binding.clone(),
-            })));
+            .store(Some(Arc::new(binding.clone())));
         Ok(binding)
     }
 
@@ -350,11 +307,11 @@ impl QuicEndpoint {
     ) -> impl std::future::Future<Output = Result<Arc<Connection>, AcceptError>> + use<> {
         use accept_error::BindServerSnafu;
 
-        let identity = self.identity.clone();
-        let key = self.server_cache_key();
+        let identity = self.identity.load_full();
         let network = self.network.clone();
         let server = self.server.clone();
         let cached = self.server_binding_cache.load_full();
+        let bind_patterns = self.bind_patterns.clone();
 
         async move {
             let named = match identity {
@@ -362,18 +319,12 @@ impl QuicEndpoint {
                 Some(id) => id,
             };
 
-            if let Some(cached_binding) = cached.as_ref()
-                && cached_binding.key == key
-            {
-                return cached_binding
-                    .binding
-                    .recv()
-                    .await
-                    .ok_or(AcceptError::Shutdown);
+            if let Some(cached_binding) = cached.as_ref() {
+                return cached_binding.recv().await.ok_or(AcceptError::Shutdown);
             }
 
             let binding = network
-                .bind_server(named, (*server).clone())
+                .bind_server(named, (*server).clone(), bind_patterns)
                 .await
                 .context(BindServerSnafu)?;
             binding.recv().await.ok_or(AcceptError::Shutdown)
@@ -402,7 +353,9 @@ impl quic::Connect for QuicEndpoint {
 
         let mut server_eps = self.resolver.lookup(&server_str).await.context(DnsSnafu)?;
 
-        let connection = self.build_client_connection(&server_str, tls);
+        let connection = self
+            .build_client_connection(&server_str, tls)
+            .context(TlsSnafu)?;
         if connection.subscribe_local_address().is_err() {
             return Ok(connection);
         }
@@ -438,6 +391,9 @@ impl quic::Connect for QuicEndpoint {
         let _peer_addrs: Arc<Mutex<Vec<(EndpointAddr, Source)>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Task B: Continue processing DNS results in background
+        // Inherent termination: terminates when connection drops (terminated fires),
+        // DNS results exhaust (server_eps.next() returns None), or connection Arc
+        // is dropped (weak_connection upgrade fails).
         tokio::spawn(
             {
                 let weak_connection = Arc::downgrade(&connection);
@@ -481,8 +437,45 @@ impl quic::Listen for QuicEndpoint {
     }
 }
 
-fn clone_key(key: &Arc<PrivateKeyDer<'static>>) -> PrivateKeyDer<'static> {
-    key.clone_key()
+impl QuicEndpoint {
+    fn invalidate_caches(&self) {
+        self.client_tls_cache.store(None);
+        self.server_binding_cache.store(None);
+    }
+
+    /// Update the OCSP staple for this endpoint's identity.
+    ///
+    /// Uses a double-clear pattern to cover the race window between
+    /// identity replacement and cache invalidation. The next call to
+    /// `accept()` or `connect()` will rebuild the relevant TLS config
+    /// with the new OCSP response.
+    pub fn update_ocsp(&self, ocsp: Option<Vec<u8>>) {
+        if let Some(current) = self.identity.load_full() {
+            self.invalidate_caches();
+            let mut new_id = (*current).clone();
+            new_id.ocsp = Arc::new(ocsp);
+            self.identity.store(Some(Arc::new(new_id)));
+            self.invalidate_caches();
+        }
+    }
+
+    /// Apply a modification to the client configuration with double-clear
+    /// cache invalidation.
+    pub fn modify_client_config(&mut self, f: impl FnOnce(&mut ClientQuicConfig)) {
+        self.invalidate_caches();
+        let config = Arc::make_mut(&mut self.client);
+        f(config);
+        self.invalidate_caches();
+    }
+
+    /// Apply a modification to the server configuration with double-clear
+    /// cache invalidation.
+    pub fn modify_server_config(&mut self, f: impl FnOnce(&mut ServerQuicConfig)) {
+        self.invalidate_caches();
+        let config = Arc::make_mut(&mut self.server);
+        f(config);
+        self.invalidate_caches();
+    }
 }
 
 fn bind_uri_for(source: &Source, ep: &EndpointAddr) -> BindUri {
@@ -494,17 +487,24 @@ fn bind_uri_for(source: &Source, ep: &EndpointAddr) -> BindUri {
                 Family::V4 => "v4",
                 Family::V6 => "v6",
             };
+            // SAFETY: hardcoded constant URI pattern, always valid
             BindUri::from_str(&format!("iface://{f}.{nic}:0"))
                 .expect("iface URI should be valid")
                 .alloc_port()
         }
         _ => match ep.addr_kind() {
-            AddrKind::Internet(Family::V4) => BindUri::from_str("inet://0.0.0.0:0")
-                .expect("URL should be valid")
-                .alloc_port(),
-            AddrKind::Internet(Family::V6) => BindUri::from_str("inet://[::]:0")
-                .expect("URL should be valid")
-                .alloc_port(),
+            AddrKind::Internet(Family::V4) => {
+                // SAFETY: hardcoded constant URI, always valid
+                BindUri::from_str("inet://0.0.0.0:0")
+                    .expect("URL should be valid")
+                    .alloc_port()
+            }
+            AddrKind::Internet(Family::V6) => {
+                // SAFETY: hardcoded constant URI, always valid
+                BindUri::from_str("inet://[::]:0")
+                    .expect("URL should be valid")
+                    .alloc_port()
+            }
             _ => unreachable!("BLE and other address kinds are not supported yet"),
         },
     }
@@ -525,7 +525,7 @@ mod tests {
         let endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server);
 
         assert!(Arc::ptr_eq(&endpoint.network, &network));
-        assert!(endpoint.identity.is_none());
+        assert!(endpoint.identity.load_full().is_none());
     }
 
     #[tokio::test]

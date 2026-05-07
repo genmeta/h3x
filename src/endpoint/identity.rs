@@ -32,6 +32,31 @@ pub struct Identity {
     pub ocsp: Arc<Option<Vec<u8>>>,
 }
 
+impl Identity {
+    /// Build a [`CertifiedKey`] from this identity for use in rustls.
+    ///
+    /// The returned key is wrapped in [`Arc`] so it can be shared across
+    /// many TLS sessions.
+    pub(crate) fn build_certified_key(
+        &self,
+    ) -> Result<Arc<rustls::sign::CertifiedKey>, crate::endpoint::network::BindServerError> {
+        use snafu::ResultExt;
+
+        use crate::endpoint::network::bind_server_error::LoadKeySnafu;
+
+        let provider = rustls::ServerConfig::builder().crypto_provider().clone();
+        let key = provider
+            .key_provider
+            .load_private_key(self.key.clone_key())
+            .context(LoadKeySnafu)?;
+        Ok(Arc::new(rustls::sign::CertifiedKey {
+            cert: self.certs.iter().cloned().collect(),
+            key,
+            ocsp: self.ocsp.as_ref().clone(),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

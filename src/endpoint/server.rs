@@ -99,4 +99,60 @@ impl ServerQuicConfig {
     pub fn own_mut(&mut self) -> &mut ServerOnlyConfig {
         Arc::make_mut(&mut self.own)
     }
+
+    /// Returns `true` when `self` and `other` describe the same server configuration.
+    ///
+    /// Fast path: whole-[`Arc`] pointer equality for `common` and `own`.
+    /// Slow path: field-by-field comparison, using [`PartialEq`] where available
+    /// and [`Arc::ptr_eq`] for the trait-object members.
+    pub(crate) fn is_compatible_with(&self, other: &Self) -> bool {
+        if Arc::ptr_eq(&self.common, &other.common) && Arc::ptr_eq(&self.own, &other.own) {
+            return true;
+        }
+        let common_eq = self.common.defer_idle_timeout == other.common.defer_idle_timeout
+            && self.common.enable_0rtt == other.common.enable_0rtt
+            && self.common.enable_sslkeylog == other.common.enable_sslkeylog
+            && Arc::ptr_eq(
+                &self.common.stream_strategy_factory,
+                &other.common.stream_strategy_factory,
+            )
+            && Arc::ptr_eq(&self.common.qlogger, &other.common.qlogger);
+        let own_eq = self.own.alpns == other.own.alpns
+            && self.own.backlog == other.own.backlog
+            && self.own.anti_port_scan == other.own.anti_port_scan
+            && self.own.parameters == other.own.parameters
+            && Arc::ptr_eq(&self.own.token_provider, &other.own.token_provider)
+            && Arc::ptr_eq(&self.own.client_auther, &other.own.client_auther)
+            && Arc::ptr_eq(
+                &self.own.client_cert_verifier,
+                &other.own.client_cert_verifier,
+            );
+        common_eq && own_eq
+    }
+
+    /// Build the rustls server config shared across all SNIs registered on a
+    /// network. The resolver selects a [`CertifiedKey`] based on ClientHello SNI.
+    pub(crate) fn build_rustls_server_config(
+        &self,
+        resolver: crate::endpoint::sni::SniCertResolver,
+    ) -> Result<rustls::ServerConfig, crate::endpoint::network::BindServerError> {
+        use snafu::ResultExt;
+
+        use crate::endpoint::network::bind_server_error::VersionSnafu;
+
+        const TLS13: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+        let provider = rustls::ServerConfig::builder().crypto_provider().clone();
+        let builder = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(TLS13)
+            .context(VersionSnafu)?;
+
+        let mut tls = builder
+            .with_client_cert_verifier(self.own.client_cert_verifier.clone())
+            .with_cert_resolver(std::sync::Arc::new(resolver));
+        tls.alpn_protocols.clone_from(&self.own.alpns);
+        if self.common.enable_0rtt {
+            tls.max_early_data_size = 0xffff_ffff;
+        }
+        Ok(tls)
+    }
 }

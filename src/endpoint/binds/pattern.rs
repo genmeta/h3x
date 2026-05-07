@@ -235,6 +235,29 @@ impl BindPattern {
         self.port.unwrap_or(0)
     }
 
+    /// Check if a concrete [`BindUri`] could be produced by this pattern.
+    ///
+    /// Compares scheme, port, and host. Wildcard ports (None) match any port.
+    /// Glob/exact hosts use [`BindHost::matches`] for pattern matching.
+    #[must_use]
+    pub fn matches(&self, bind_uri: &BindUri) -> bool {
+        if self.scheme != bind_uri.scheme() {
+            return false;
+        }
+        if let Some(port) = self.port
+            && bind_uri.as_uri().port_u16() != Some(port)
+        {
+            return false;
+        }
+        let Some(host) = bind_uri.as_uri().host() else {
+            return false;
+        };
+        match &self.host {
+            BindHost::Ip { addr, .. } => host == addr.to_string(),
+            _ => self.host.matches(host),
+        }
+    }
+
     pub(crate) fn template(&self) -> impl Fn(Authority) -> Option<BindUri> + use<> {
         let mut uri_template = Uri::from_static("iface://v4.lo:0/").into_parts();
         uri_template.scheme = Some(self.scheme.into());
