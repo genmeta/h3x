@@ -232,8 +232,6 @@ impl QuicEndpoint {
             .run();
         Ok(connection)
     }
-
-
 }
 
 impl QuicEndpoint {
@@ -282,9 +280,9 @@ impl quic::Connect for QuicEndpoint {
         let server_str = full.rsplit_once('@').map_or(full, |(_, host)| host);
 
         let tls = self.client_tls().context(TlsSnafu)?;
-        let mut server_eps = self.resolver.lookup(&server_str).await.context(DnsSnafu)?;
+        let mut server_eps = self.resolver.lookup(server_str).await.context(DnsSnafu)?;
         let connection = self
-            .build_client_connection(&server_str, tls)
+            .build_client_connection(server_str, tls)
             .context(TlsSnafu)?;
 
         // Connect succeeds as long as at least one peer endpoint is registered.
@@ -410,8 +408,6 @@ impl QuicEndpoint {
         self.invalidate_caches();
     }
 }
-
-
 
 impl QuicEndpoint {
     /// Subscribe to local address changes filtered by bind_patterns.
