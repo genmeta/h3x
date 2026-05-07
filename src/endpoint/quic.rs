@@ -371,17 +371,29 @@ impl QuicEndpoint {
         self.server_binding_cache.store(None);
     }
 
+    /// Modify or replace the endpoint's identity.
+    ///
+    /// The closure receives `&mut Option<Arc<Identity>>` and may inspect,
+    /// mutate, set, or clear the identity. Caches are invalidated after
+    /// the closure returns so the next `accept()` or `connect()` will
+    /// rebuild TLS configs with the updated identity.
+    pub fn modify_identity(&self, f: impl FnOnce(&mut Option<Arc<Identity>>)) {
+        let mut current = self.identity.load_full();
+        f(&mut current);
+        self.identity.store(current);
+        self.invalidate_caches();
+    }
+
     /// Update the OCSP staple for this endpoint's identity.
     ///
-    /// The next call to `accept()` or `connect()` will rebuild the relevant
-    /// TLS config with the new OCSP response.
+    /// Convenience wrapper around [`modify_identity`]; no-op when there
+    /// is no identity set.
     pub fn update_ocsp(&self, ocsp: Option<Vec<u8>>) {
-        if let Some(current) = self.identity.load_full() {
-            let mut new_id = (*current).clone();
-            new_id.ocsp = Arc::new(ocsp);
-            self.identity.store(Some(Arc::new(new_id)));
-            self.invalidate_caches();
-        }
+        self.modify_identity(|id| {
+            if let Some(arc) = id.as_mut() {
+                Arc::make_mut(arc).ocsp = Arc::new(ocsp);
+            }
+        });
     }
 
     /// Apply a modification to the client configuration.
