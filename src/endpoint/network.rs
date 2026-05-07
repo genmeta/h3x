@@ -691,6 +691,7 @@ impl AuthClient for InterfaceAuthClient {
             .and_then(|item| item.value().upgrade());
 
         match entry {
+            None => ClientNameVerifyResult::SilentRefuse("no server registered for SNI".to_owned()),
             Some(entry) if entry.bind_patterns.is_empty() => ClientNameVerifyResult::Accept,
             Some(entry)
                 if entry
@@ -700,7 +701,9 @@ impl AuthClient for InterfaceAuthClient {
             {
                 ClientNameVerifyResult::Accept
             }
-            _ => ClientNameVerifyResult::SilentRefuse("interface not bound".to_owned()),
+            Some(_) => {
+                ClientNameVerifyResult::SilentRefuse("bind pattern mismatch".to_owned())
+            }
         }
     }
 
