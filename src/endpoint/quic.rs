@@ -282,7 +282,6 @@ impl QuicEndpoint {
 }
 
 impl QuicEndpoint {
-    #[expect(dead_code)]
     async fn server_binding(&self) -> Result<ServerBinding, AcceptError> {
         use accept_error::BindServerSnafu;
 
@@ -303,43 +302,12 @@ impl QuicEndpoint {
         Ok(binding)
     }
 
-    /// Accept an inbound connection without requiring `&mut self`.
-    ///
-    /// The returned future captures only cloned `Arc`s and cached data,
-    /// so it does not borrow `self` — callers may hold a shared reference
-    /// while awaiting.
-    pub fn accept(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Arc<Connection>, AcceptError>> + use<> {
-        use accept_error::BindServerSnafu;
-
-        let identity = self.identity.load_full();
-        let network = self.network.clone();
-        let server = self.server.clone();
-        let cached = self.server_binding_cache.load_full();
-        let bind_patterns = self.bind_patterns.clone();
-        let endpoint = self.clone();
-
-        async move {
-            let named = match identity {
-                None => return Err(AcceptError::ServerUnavailable),
-                Some(id) => id,
-            };
-
-            if let Some(cached_binding) = cached.as_ref() {
-                let conn = cached_binding.recv().await.ok_or(AcceptError::Shutdown)?;
-                endpoint.subscribe_local_address(&conn, &endpoint.bind_patterns);
-                return Ok(conn);
-            }
-
-            let binding = network
-                .bind_server(named, (*server).clone(), bind_patterns)
-                .await
-                .context(BindServerSnafu)?;
-            let conn = binding.recv().await.ok_or(AcceptError::Shutdown)?;
-            endpoint.subscribe_local_address(&conn, &endpoint.bind_patterns);
-            Ok(conn)
-        }
+    /// Accept an inbound connection, using the cached server binding.
+    pub async fn accept(&self) -> Result<Arc<Connection>, AcceptError> {
+        let binding = self.server_binding().await?;
+        let conn = binding.recv().await.ok_or(AcceptError::Shutdown)?;
+        self.subscribe_local_address(&conn, &self.bind_patterns);
+        Ok(conn)
     }
 }
 
@@ -367,8 +335,6 @@ impl quic::Connect for QuicEndpoint {
         let connection = self
             .build_client_connection(&server_str, tls)
             .context(TlsSnafu)?;
-        self.subscribe_local_address(&connection, &self.bind_patterns);
-
         let mut last_error: Option<ConnectError> = None;
         let mut any_viable = false;
 
@@ -428,6 +394,7 @@ impl quic::Connect for QuicEndpoint {
             .in_current_span(),
         );
 
+        self.subscribe_local_address(&connection, &self.bind_patterns);
         Ok(connection)
     }
 }
@@ -606,8 +573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_accept_returns_future_with_use() {
-        // Verify that accept() returns a future that doesn't borrow self
+    async fn test_accept_with_no_identity() {
         let network = Network::builder().build();
         let resolver = Arc::new(SystemResolver);
         let client = ClientQuicConfig::default();
@@ -615,13 +581,8 @@ mod tests {
 
         let endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server, Arc::new(Vec::new()));
 
-        // The key test: we can call accept() and hold the endpoint reference
-        // while the future is being awaited. This verifies the future doesn't
-        // borrow self.
-        let fut = endpoint.accept();
-        // If this compiles and the future doesn't borrow self, we're good.
-        // We don't actually await it since the endpoint has no identity.
-        drop(fut);
+        let result = endpoint.accept().await;
+        assert!(matches!(result, Err(AcceptError::ServerUnavailable)));
     }
 
     #[tokio::test]
