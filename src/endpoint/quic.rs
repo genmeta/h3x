@@ -348,13 +348,10 @@ impl QuicEndpoint {
 
     /// Update the OCSP staple for this endpoint's identity.
     ///
-    /// Uses a double-clear pattern to cover the race window between
-    /// identity replacement and cache invalidation. The next call to
-    /// `accept()` or `connect()` will rebuild the relevant TLS config
-    /// with the new OCSP response.
+    /// The next call to `accept()` or `connect()` will rebuild the relevant
+    /// TLS config with the new OCSP response.
     pub fn update_ocsp(&self, ocsp: Option<Vec<u8>>) {
         if let Some(current) = self.identity.load_full() {
-            self.invalidate_caches();
             let mut new_id = (*current).clone();
             new_id.ocsp = Arc::new(ocsp);
             self.identity.store(Some(Arc::new(new_id)));
@@ -362,19 +359,15 @@ impl QuicEndpoint {
         }
     }
 
-    /// Apply a modification to the client configuration with double-clear
-    /// cache invalidation.
+    /// Apply a modification to the client configuration.
     pub fn modify_client_config(&mut self, f: impl FnOnce(&mut ClientQuicConfig)) {
-        self.invalidate_caches();
         let config = Arc::make_mut(&mut self.client);
         f(config);
         self.invalidate_caches();
     }
 
-    /// Apply a modification to the server configuration with double-clear
-    /// cache invalidation.
+    /// Apply a modification to the server configuration.
     pub fn modify_server_config(&mut self, f: impl FnOnce(&mut ServerQuicConfig)) {
-        self.invalidate_caches();
         let config = Arc::make_mut(&mut self.server);
         f(config);
         self.invalidate_caches();
