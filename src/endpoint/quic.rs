@@ -340,6 +340,31 @@ impl quic::Listen for QuicEndpoint {
     }
 }
 
+impl quic::Connect for &QuicEndpoint {
+    type Connection = Connection;
+    type Error = ConnectError;
+
+    fn connect<'a>(
+        &'a self,
+        server: &'a http::uri::Authority,
+    ) -> impl Future<Output = Result<Arc<Self::Connection>, Self::Error>> + Send + 'a {
+        (**self).connect(server)
+    }
+}
+
+impl quic::Listen for &QuicEndpoint {
+    type Connection = Connection;
+    type Error = AcceptError;
+
+    async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
+        (**self).accept().await
+    }
+
+    async fn shutdown(&self) -> Result<(), Self::Error> {
+        (**self).shutdown().await
+    }
+}
+
 impl QuicEndpoint {
     fn invalidate_caches(&self) {
         self.client_tls_cache.store(None);

@@ -68,10 +68,7 @@ impl H3Endpoint {
         S::Future: Send,
         S::Error: Into<Box<dyn Error + Send + Sync>>,
     {
-        let quic = match Arc::try_unwrap(self.quic) {
-            Ok(quic) => quic,
-            Err(arc) => (*arc).clone(),
-        };
+        let quic = &*self.quic;
         let mut servers = Servers::from_quic_listener()
             .listener(quic)
             .service(service)
@@ -96,21 +93,13 @@ impl H3Endpoint {
         &self,
         server: Authority,
     ) -> Result<Arc<H3Connection<Connection>>, pool::ConnectError<ConnectError>> {
-        let quic = (*self.quic).clone();
         self.pool
-            .reuse_or_connect_with(&quic, self.connection_builder.clone(), server)
+            .reuse_or_connect_with(
+                &*self.quic,
+                self.connection_builder.clone(),
+                server,
+            )
             .await
-    }
-
-    /// Build a temporary [`Client`] that shares this endpoint's pool and
-    /// configuration. Cheap — only Arc clones.
-    async fn as_client(&self) -> Client<QuicEndpoint> {
-        let quic = (*self.quic).clone();
-        Client::from_quic_client()
-            .pool(self.pool.clone())
-            .client(quic)
-            .builder(self.connection_builder.clone())
-            .build()
     }
 
     /// Send a GET request to `uri`.
@@ -118,7 +107,11 @@ impl H3Endpoint {
         &self,
         uri: http::Uri,
     ) -> Result<(client::Request, client::Response), client::RequestError<ConnectError>> {
-        let client = self.as_client().await;
+        let client: Client<&QuicEndpoint> = Client::from_quic_client()
+            .pool(self.pool.clone())
+            .client(&*self.quic)
+            .builder(self.connection_builder.clone())
+            .build();
         client.new_request().get(uri).await
     }
 
@@ -128,7 +121,11 @@ impl H3Endpoint {
         uri: http::Uri,
         body: impl Buf,
     ) -> Result<(client::Request, client::Response), client::RequestError<ConnectError>> {
-        let client = self.as_client().await;
+        let client: Client<&QuicEndpoint> = Client::from_quic_client()
+            .pool(self.pool.clone())
+            .client(&*self.quic)
+            .builder(self.connection_builder.clone())
+            .build();
         client.new_request().with_body(body).post(uri).await
     }
 }
