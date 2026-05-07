@@ -1,6 +1,6 @@
 //! QUIC-only endpoint built on top of a shared [`Network`].
 
-use std::{str::FromStr, sync::Arc};
+use std::{any::Any, str::FromStr, sync::Arc};
 
 use arc_swap::ArcSwapOption;
 use futures::StreamExt;
@@ -22,6 +22,7 @@ use crate::{
             cid::ConnectionId,
             net::addr::{BoundAddr, EndpointAddr, SocketEndpointAddr},
         },
+        qinterface::bind_uri::BindUri,
     },
     quic,
     util::tls::DangerousServerCertVerifier,
@@ -259,7 +260,26 @@ impl QuicEndpoint {
     pub async fn accept(&self) -> Result<Arc<Connection>, AcceptError> {
         let binding = self.server_binding().await?;
         let conn = binding.recv().await.ok_or(AcceptError::Shutdown)?;
-        self.subscribe_local_address(&conn, &self.bind_patterns);
+        let mut observer = self.network.locations().subscribe();
+        let conn_c = conn.clone();
+        let patterns: Vec<BindPattern> = self.bind_patterns.iter().cloned().collect();
+        tokio::spawn(
+            async move {
+                loop {
+                    tokio::select! {
+                        _ = conn_c.terminated() => break,
+                        event = observer.recv() => {
+                            let Some((bind_uri, event)) = event else { break };
+                            if !patterns.iter().any(|p| p.matches(&bind_uri)) {
+                                continue;
+                            }
+                            QuicEndpoint::handle_local_addr_event(&conn_c, bind_uri, event);
+                        }
+                    }
+                }
+            }
+            .in_current_span(),
+        );
         Ok(conn)
     }
 }
@@ -274,8 +294,6 @@ impl quic::Connect for QuicEndpoint {
     ) -> Result<Arc<Self::Connection>, Self::Error> {
         use connect_error::{DnsSnafu, TlsSnafu};
 
-        // Strip optional userinfo from the authority (e.g. user@host:port → host:port).
-        // Uses as_str() instead of host() + port_u16() to preserve IPv6 brackets.
         let full = server.as_str();
         let server_str = full.rsplit_once('@').map_or(full, |(_, host)| host);
 
@@ -285,42 +303,67 @@ impl quic::Connect for QuicEndpoint {
             .build_client_connection(server_str, tls)
             .context(TlsSnafu)?;
 
-        // Connect succeeds as long as at least one peer endpoint is registered.
-        // Actual path establishment is handled asynchronously by the puncher
-        // when local endpoints become available via subscribe_local_address.
-        let Some((source, server_ep)) = server_eps.next().await else {
-            return Err(ConnectError::NoReachableEndpoint);
-        };
-        let _ = connection.add_peer_endpoint(server_ep, source);
+        // Two legs driving path establishment:
+        //   1. DNS results  → add_peer_endpoint
+        //   2. local ifaces → add_local_endpoint (via observer)
+        let mut observer = self.network.locations().subscribe();
+        let bind_patterns = self.bind_patterns.clone();
 
-        // Continue registering remaining DNS results in background.
-        // Inherent termination: terminates when connection drops (terminated fires),
-        // DNS results exhaust (server_eps.next() returns None), or connection Arc
-        // is dropped (weak_connection upgrade fails).
-        tokio::spawn(
-            {
-                let weak_connection = Arc::downgrade(&connection);
-                let terminated = connection.terminated();
-                async move {
-                    tokio::pin!(terminated);
-                    loop {
-                        tokio::select! {
-                            biased;
-                            _ = &mut terminated => break,
-                            next = server_eps.next() => {
-                                let Some((source, server_ep)) = next else { break };
-                                let Some(connection) = weak_connection.upgrade() else { break };
-                                let _ = connection.add_peer_endpoint(server_ep, source);
-                            }
-                        }
+        loop {
+            tokio::select! {
+                biased;
+                _ = connection.terminated() => {
+                    return Err(ConnectError::NoReachableEndpoint);
+                }
+                next = server_eps.next() => {
+                    if let Some((source, server_ep)) = next {
+                        let _ = connection.add_peer_endpoint(server_ep, source);
                     }
                 }
+                event = observer.recv() => {
+                    let Some((bind_uri, event)) = event else { break };
+                    if !bind_patterns.iter().any(|p| p.matches(&bind_uri)) {
+                        continue;
+                    }
+                    Self::handle_local_addr_event(&connection, bind_uri, event);
+                }
             }
-            .in_current_span(),
-        );
 
-        self.subscribe_local_address(&connection, &self.bind_patterns);
-        Ok(connection)
+            match connection.path_context() {
+                Ok(ctx) if !ctx.paths::<Vec<_>>().is_empty() => {
+                    let weak = Arc::downgrade(&connection);
+                    tokio::spawn(
+                        async move {
+                            loop {
+                                let Some(c) = weak.upgrade() else { break };
+                                tokio::select! {
+                                    biased;
+                                    _ = c.terminated() => break,
+                                    next = server_eps.next() => {
+                                        let Some((s, e)) = next else { break };
+                                        let Some(c) = weak.upgrade() else { break };
+                                        let _ = c.add_peer_endpoint(e, s);
+                                    }
+                                    event = observer.recv() => {
+                                        let Some((uri, e)) = event else { break };
+                                        let Some(c) = weak.upgrade() else { break };
+                                        if bind_patterns.iter().any(|p| p.matches(&uri)) {
+                                            Self::handle_local_addr_event(&c, uri, e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        .in_current_span(),
+                    );
+                    return Ok(connection);
+                }
+                Err(_) => return Err(ConnectError::NoReachableEndpoint),
+                _ => {} // no paths yet — continue loop
+            }
+        }
+
+        Err(ConnectError::NoReachableEndpoint)
     }
 }
 
@@ -410,71 +453,45 @@ impl QuicEndpoint {
 }
 
 impl QuicEndpoint {
-    /// Subscribe to local address changes filtered by bind_patterns.
-    ///
-    /// Spawns a background task that observes [`Locations`] events and
-    /// only forwards those whose [`BindUri`] matches one of the
-    /// endpoint's [`BindPattern`]s.
-    fn subscribe_local_address(&self, conn: &Arc<Connection>, patterns: &[BindPattern]) {
+    /// Handle a single local-address event: upsert → call add_local_endpoint.
+    fn handle_local_addr_event(
+        conn: &Connection,
+        bind_uri: BindUri,
+        event: crate::dquic::qinterface::component::location::AddressEvent<
+            dyn Any + Send + Sync,
+        >,
+    ) {
         use crate::dquic::{
-            qbase::net::addr::BleEndpontAddr, qinterface::component::location::AddressEvent,
+            qbase::net::addr::BleEndpontAddr,
+            qinterface::component::location::AddressEvent,
         };
 
-        let mut observer = self.network.locations().subscribe();
-        let conn = conn.clone();
-        let patterns: Vec<BindPattern> = patterns.to_vec();
-
-        tokio::spawn(
-            async move {
-                // Inherent termination: loop exits when connection closes
-                // (terminated fires) or observer channel is dropped.
-                loop {
-                    tokio::select! {
-                        _ = conn.terminated() => break,
-                        event = observer.recv() => {
-                            let Some((bind_uri, event)) = event else { break };
-
-                            if !patterns.iter().any(|p| p.matches(&bind_uri)) {
-                                continue;
-                            }
-
-                            // Handle BoundAddr events (mirrors handle_address_event in traversal.rs)
-                            let event = match event.downcast::<std::io::Result<BoundAddr>>() {
-                                Ok(AddressEvent::Upsert(data)) => {
-                                    let Ok(bound_addr) = data.as_ref() else { continue; };
-                                    let endpoint_addr = match *bound_addr {
-                                        BoundAddr::Internet(addr) => {
-                                            EndpointAddr::Socket(SocketEndpointAddr::direct(addr))
-                                        }
-                                        BoundAddr::Bluetooth(addr) => {
-                                            EndpointAddr::Ble(BleEndpontAddr::new(addr))
-                                        }
-                                        _ => continue,
-                                    };
-                                    if let Err(e) = conn.add_local_endpoint(bind_uri.clone(), endpoint_addr) {
-                                        let report = snafu::Report::from_error(&e);
-                                        tracing::warn!(
-                                            target: "h3x::endpoint",
-                                            error = %report,
-                                            "failed to add local endpoint for filtered address"
-                                        );
-                                    }
-                                    continue;
-                                }
-                                Ok(AddressEvent::Remove(_)) | Ok(AddressEvent::Closed) => continue,
-                                Err(event) => event,
-                            };
-
-// ClientLocationData: skip (requires add_local_punch_address,
-// not exposed on Connection). For full NAT traversal,
-// use subscribe_local_address on the endpoint directly.
-                            let _ = event;
-                        }
+        let event = match event.downcast::<std::io::Result<BoundAddr>>() {
+            Ok(AddressEvent::Upsert(data)) => {
+                let Ok(bound_addr) = data.as_ref() else { return };
+                let endpoint_addr = match *bound_addr {
+                    BoundAddr::Internet(addr) => {
+                        EndpointAddr::Socket(SocketEndpointAddr::direct(addr))
                     }
+                    BoundAddr::Bluetooth(addr) => {
+                        EndpointAddr::Ble(BleEndpontAddr::new(addr))
+                    }
+                    _ => return,
+                };
+                if let Err(e) = conn.add_local_endpoint(bind_uri, endpoint_addr) {
+                    let report = snafu::Report::from_error(&e);
+                    tracing::warn!(
+                        error = %report,
+                        "failed to add local endpoint"
+                    );
                 }
+                return;
             }
-            .in_current_span(),
-        );
+            Ok(AddressEvent::Remove(_)) | Ok(AddressEvent::Closed) => return,
+            Err(event) => event,
+        };
+        // ClientLocationData: not handled (requires add_local_punch_address).
+        let _ = event;
     }
 }
 
