@@ -20,14 +20,8 @@ use crate::{
         prelude::{Connection, Resolve},
         qbase::{
             cid::ConnectionId,
-            net::{
-                Family,
-                addr::{AddrKind, BoundAddr, EndpointAddr, SocketEndpointAddr},
-                route::{Link, Pathway},
-            },
+            net::addr::{BoundAddr, EndpointAddr, SocketEndpointAddr},
         },
-        qinterface::{bind_uri::BindUri, io::IO},
-        qresolve::Source,
     },
     quic,
     util::tls::DangerousServerCertVerifier,
@@ -76,12 +70,6 @@ pub enum ConnectError {
     /// The resolver produced no reachable endpoint.
     #[snafu(display("no reachable endpoint found for server"))]
     NoReachableEndpoint,
-    /// Failed to acquire a local interface for the discovered endpoint.
-    #[snafu(display("failed to bind local interface"))]
-    BindInterface {
-        /// Underlying I/O error.
-        source: std::io::Error,
-    },
 }
 
 /// Error returned by [`QuicEndpoint`] when awaiting an inbound connection.
@@ -245,40 +233,7 @@ impl QuicEndpoint {
         Ok(connection)
     }
 
-    async fn setup_server_endpoint(
-        &self,
-        connection: &Connection,
-        source: Source,
-        server_ep: EndpointAddr,
-    ) -> Result<bool, ConnectError> {
-        use connect_error::BindInterfaceSnafu;
 
-        let _ = connection.add_peer_endpoint(server_ep, source.clone());
-
-        let bind_uri = bind_uri_for(&source, &server_ep);
-        let iface = self.network.bind_iface(bind_uri).await;
-
-        if matches!(
-            server_ep,
-            EndpointAddr::Socket(SocketEndpointAddr::Agent { .. })
-        ) {
-            return Ok(false);
-        }
-
-        let interface = iface.borrow();
-        let bound_addr = interface.bound_addr().context(BindInterfaceSnafu)?;
-        if bound_addr.kind() != server_ep.addr_kind() {
-            return Ok(false);
-        }
-        let dst = match server_ep {
-            EndpointAddr::Socket(s) => BoundAddr::Internet(*s),
-            EndpointAddr::Ble(_) => return Ok(false),
-        };
-        let link = Link::new(bound_addr, dst);
-        let pathway = Pathway::new(bound_addr.into(), server_ep);
-        let _ = connection.add_path(iface.bind_uri(), link, pathway);
-        Ok(true)
-    }
 }
 
 impl QuicEndpoint {
@@ -319,8 +274,6 @@ impl quic::Connect for QuicEndpoint {
         &self,
         server: &http::uri::Authority,
     ) -> Result<Arc<Self::Connection>, Self::Error> {
-        use std::sync::Mutex;
-
         use connect_error::{DnsSnafu, TlsSnafu};
 
         let server_str = match server.port_u16() {
@@ -329,43 +282,20 @@ impl quic::Connect for QuicEndpoint {
         };
 
         let tls = self.client_tls().context(TlsSnafu)?;
-
         let mut server_eps = self.resolver.lookup(&server_str).await.context(DnsSnafu)?;
-
         let connection = self
             .build_client_connection(&server_str, tls)
             .context(TlsSnafu)?;
-        let mut last_error: Option<ConnectError> = None;
-        let mut any_viable = false;
 
-        while let Some((source, server_ep)) = server_eps.next().await {
-            match self
-                .setup_server_endpoint(&connection, source, server_ep)
-                .await
-            {
-                Ok(true) => {
-                    any_viable = true;
-                    last_error = None;
-                    break;
-                }
-                Ok(false) => {
-                    any_viable = true;
-                    last_error = None;
-                }
-                Err(error) => {
-                    last_error.get_or_insert(error);
-                }
-            }
-        }
-        if !any_viable {
-            return Err(last_error.unwrap_or(ConnectError::NoReachableEndpoint));
-        }
+        // Connect succeeds as long as at least one peer endpoint is registered.
+        // Actual path establishment is handled asynchronously by the puncher
+        // when local endpoints become available via subscribe_local_address.
+        let Some((source, server_ep)) = server_eps.next().await else {
+            return Err(ConnectError::NoReachableEndpoint);
+        };
+        let _ = connection.add_peer_endpoint(server_ep, source);
 
-        // Shared state for dual-task model
-        let _local_addrs: Arc<Mutex<Vec<(BindUri, Source)>>> = Arc::new(Mutex::new(Vec::new()));
-        let _peer_addrs: Arc<Mutex<Vec<(EndpointAddr, Source)>>> = Arc::new(Mutex::new(Vec::new()));
-
-        // Task B: Continue processing DNS results in background
+        // Continue registering remaining DNS results in background.
         // Inherent termination: terminates when connection drops (terminated fires),
         // DNS results exhaust (server_eps.next() returns None), or connection Arc
         // is dropped (weak_connection upgrade fails).
@@ -373,7 +303,6 @@ impl quic::Connect for QuicEndpoint {
             {
                 let weak_connection = Arc::downgrade(&connection);
                 let terminated = connection.terminated();
-                let endpoint = self.clone();
                 async move {
                     tokio::pin!(terminated);
                     loop {
@@ -383,9 +312,7 @@ impl quic::Connect for QuicEndpoint {
                             next = server_eps.next() => {
                                 let Some((source, server_ep)) = next else { break };
                                 let Some(connection) = weak_connection.upgrade() else { break };
-                                let _ = endpoint
-                                    .setup_server_endpoint(&connection, source, server_ep)
-                                    .await;
+                                let _ = connection.add_peer_endpoint(server_ep, source);
                             }
                         }
                     }
@@ -454,37 +381,7 @@ impl QuicEndpoint {
     }
 }
 
-fn bind_uri_for(source: &Source, ep: &EndpointAddr) -> BindUri {
-    use std::str::FromStr;
 
-    match source {
-        Source::Mdns { nic, family } => {
-            let f = match family {
-                Family::V4 => "v4",
-                Family::V6 => "v6",
-            };
-            // SAFETY: hardcoded constant URI pattern, always valid
-            BindUri::from_str(&format!("iface://{f}.{nic}:0"))
-                .expect("iface URI should be valid")
-                .alloc_port()
-        }
-        _ => match ep.addr_kind() {
-            AddrKind::Internet(Family::V4) => {
-                // SAFETY: hardcoded constant URI, always valid
-                BindUri::from_str("inet://0.0.0.0:0")
-                    .expect("URL should be valid")
-                    .alloc_port()
-            }
-            AddrKind::Internet(Family::V6) => {
-                // SAFETY: hardcoded constant URI, always valid
-                BindUri::from_str("inet://[::]:0")
-                    .expect("URL should be valid")
-                    .alloc_port()
-            }
-            _ => unreachable!("BLE and other address kinds are not supported yet"),
-        },
-    }
-}
 
 impl QuicEndpoint {
     /// Subscribe to local address changes filtered by bind_patterns.
@@ -493,8 +390,9 @@ impl QuicEndpoint {
     /// only forwards those whose [`BindUri`] matches one of the
     /// endpoint's [`BindPattern`]s.
     fn subscribe_local_address(&self, conn: &Arc<Connection>, patterns: &[BindPattern]) {
-        use crate::dquic::qbase::net::addr::BleEndpontAddr;
-        use crate::dquic::qinterface::component::location::AddressEvent;
+        use crate::dquic::{
+            qbase::net::addr::BleEndpontAddr, qinterface::component::location::AddressEvent,
+        };
 
         let mut observer = self.network.locations().subscribe();
         let conn = conn.clone();
@@ -566,7 +464,14 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server, Arc::new(Vec::new()));
+        let endpoint = QuicEndpoint::new(
+            network.clone(),
+            None,
+            resolver.clone(),
+            client,
+            server,
+            Arc::new(Vec::new()),
+        );
 
         assert!(Arc::ptr_eq(&endpoint.network, &network));
         assert!(endpoint.identity.load_full().is_none());
@@ -579,7 +484,14 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server, Arc::new(Vec::new()));
+        let endpoint = QuicEndpoint::new(
+            network.clone(),
+            None,
+            resolver.clone(),
+            client,
+            server,
+            Arc::new(Vec::new()),
+        );
 
         let result = endpoint.accept().await;
         assert!(matches!(result, Err(AcceptError::ServerUnavailable)));
@@ -603,7 +515,14 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let _endpoint = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server, Arc::new(Vec::new()));
+        let _endpoint = QuicEndpoint::new(
+            network.clone(),
+            None,
+            resolver.clone(),
+            client,
+            server,
+            Arc::new(Vec::new()),
+        );
 
         // The dual-task model is set up internally in connect()
         // We verify it doesn't panic or error during setup
