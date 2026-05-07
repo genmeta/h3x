@@ -69,6 +69,19 @@ impl std::fmt::Debug for CommonQuicConfig {
     }
 }
 
+impl PartialEq for CommonQuicConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.defer_idle_timeout == other.defer_idle_timeout
+            && self.enable_0rtt == other.enable_0rtt
+            && self.enable_sslkeylog == other.enable_sslkeylog
+            && Arc::ptr_eq(
+                &self.stream_strategy_factory,
+                &other.stream_strategy_factory,
+            )
+            && Arc::ptr_eq(&self.qlogger, &other.qlogger)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Client-only
 // ---------------------------------------------------------------------------
@@ -95,6 +108,17 @@ impl std::fmt::Debug for ServerCertVerifierChoice {
             Self::Dangerous => f.write_str("Dangerous"),
             Self::WebPki(_) => f.write_str("WebPki"),
             Self::Custom(_) => f.write_str("Custom"),
+        }
+    }
+}
+
+impl PartialEq for ServerCertVerifierChoice {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Dangerous, Self::Dangerous) => true,
+            (Self::WebPki(a), Self::WebPki(b)) => Arc::ptr_eq(a, b),
+            (Self::Custom(a), Self::Custom(b)) => Arc::ptr_eq(a, b),
+            _ => false,
         }
     }
 }
@@ -129,6 +153,15 @@ impl std::fmt::Debug for ClientSpecificConfig {
             .field("alpns", &self.alpns.len())
             .field("verifier", &self.verifier)
             .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ClientSpecificConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.parameters == other.parameters
+            && self.alpns == other.alpns
+            && Arc::ptr_eq(&self.token_sink, &other.token_sink)
+            && self.verifier == other.verifier
     }
 }
 

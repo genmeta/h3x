@@ -76,6 +76,18 @@ impl std::fmt::Debug for ServerSpecificConfig {
     }
 }
 
+impl PartialEq for ServerSpecificConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.alpns == other.alpns
+            && self.backlog == other.backlog
+            && self.anti_port_scan == other.anti_port_scan
+            && self.parameters == other.parameters
+            && Arc::ptr_eq(&self.token_provider, &other.token_provider)
+            && Arc::ptr_eq(&self.client_auther, &other.client_auther)
+            && Arc::ptr_eq(&self.client_cert_verifier, &other.client_cert_verifier)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Composite (common + own)
 // ---------------------------------------------------------------------------
@@ -103,31 +115,12 @@ impl ServerQuicConfig {
     /// Returns `true` when `self` and `other` describe the same server configuration.
     ///
     /// Fast path: whole-[`Arc`] pointer equality for `common` and `own`.
-    /// Slow path: field-by-field comparison, using [`PartialEq`] where available
-    /// and [`Arc::ptr_eq`] for the trait-object members.
+    /// Slow path: delegates to [`PartialEq`] on each sub-config.
     pub(crate) fn is_compatible_with(&self, other: &Self) -> bool {
         if Arc::ptr_eq(&self.common, &other.common) && Arc::ptr_eq(&self.own, &other.own) {
             return true;
         }
-        let common_eq = self.common.defer_idle_timeout == other.common.defer_idle_timeout
-            && self.common.enable_0rtt == other.common.enable_0rtt
-            && self.common.enable_sslkeylog == other.common.enable_sslkeylog
-            && Arc::ptr_eq(
-                &self.common.stream_strategy_factory,
-                &other.common.stream_strategy_factory,
-            )
-            && Arc::ptr_eq(&self.common.qlogger, &other.common.qlogger);
-        let own_eq = self.own.alpns == other.own.alpns
-            && self.own.backlog == other.own.backlog
-            && self.own.anti_port_scan == other.own.anti_port_scan
-            && self.own.parameters == other.own.parameters
-            && Arc::ptr_eq(&self.own.token_provider, &other.own.token_provider)
-            && Arc::ptr_eq(&self.own.client_auther, &other.own.client_auther)
-            && Arc::ptr_eq(
-                &self.own.client_cert_verifier,
-                &other.own.client_cert_verifier,
-            );
-        common_eq && own_eq
+        *self.common == *other.common && *self.own == *other.own
     }
 
     /// Build the rustls server config shared across all SNIs registered on a
