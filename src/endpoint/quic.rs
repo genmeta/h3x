@@ -261,19 +261,21 @@ impl QuicEndpoint {
         let binding = self.server_binding().await?;
         let conn = binding.recv().await.ok_or(AcceptError::Shutdown)?;
         let mut observer = self.network.locations().subscribe();
-        let conn_c = conn.clone();
+        let weak = Arc::downgrade(&conn);
         let patterns: Vec<BindPattern> = self.bind_patterns.iter().cloned().collect();
         tokio::spawn(
             async move {
                 loop {
+                    let Some(c) = weak.upgrade() else { break };
                     tokio::select! {
-                        _ = conn_c.terminated() => break,
+                        _ = c.terminated() => break,
                         event = observer.recv() => {
                             let Some((bind_uri, event)) = event else { break };
                             if !patterns.iter().any(|p| p.matches(&bind_uri)) {
                                 continue;
                             }
-                            QuicEndpoint::handle_local_addr_event(&conn_c, bind_uri, event);
+                            let Some(c) = weak.upgrade() else { break };
+                            QuicEndpoint::handle_local_addr_event(&c, bind_uri, event);
                         }
                     }
                 }
