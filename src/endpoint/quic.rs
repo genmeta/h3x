@@ -276,10 +276,10 @@ impl quic::Connect for QuicEndpoint {
     ) -> Result<Arc<Self::Connection>, Self::Error> {
         use connect_error::{DnsSnafu, TlsSnafu};
 
-        let server_str = match server.port_u16() {
-            Some(port) => format!("{}:{}", server.host(), port),
-            None => server.host().to_string(),
-        };
+        // Strip optional userinfo from the authority (e.g. user@host:port → host:port).
+        // Uses as_str() instead of host() + port_u16() to preserve IPv6 brackets.
+        let full = server.as_str();
+        let server_str = full.rsplit_once('@').map_or(full, |(_, host)| host);
 
         let tls = self.client_tls().context(TlsSnafu)?;
         let mut server_eps = self.resolver.lookup(&server_str).await.context(DnsSnafu)?;
