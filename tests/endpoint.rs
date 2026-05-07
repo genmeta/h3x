@@ -24,7 +24,7 @@ use h3x::{
     client::Client,
     connection::ConnectionBuilder,
     endpoint::{
-        ClientOnlyConfig, ClientQuicConfig, H3Endpoint, Identity, Network, QuicEndpoint,
+        ClientSpecificConfig, ClientQuicConfig, H3Endpoint, Identity, Network, QuicEndpoint,
         ServerCertVerifierChoice, ServerQuicConfig,
     },
     pool::Pool,
@@ -110,7 +110,7 @@ fn serve_and_connect_hello() {
             ));
 
         // --- Client ---
-        let client_own = ClientOnlyConfig {
+        let client_own = ClientSpecificConfig {
             verifier: ServerCertVerifierChoice::WebPki(client_webpki_verifier()),
             ..Default::default()
         };
@@ -185,7 +185,7 @@ fn endpoint_get_convenience() {
             ));
 
         // --- Client (using H3Endpoint::get convenience) ---
-        let client_own = ClientOnlyConfig {
+        let client_own = ClientSpecificConfig {
             verifier: ServerCertVerifierChoice::WebPki(client_webpki_verifier()),
             ..Default::default()
         };
@@ -294,7 +294,7 @@ fn bind_server_config_conflict() {
 
         let cfg_a = ServerQuicConfig::default();
         let cfg_b = {
-            let own = h3x::endpoint::ServerOnlyConfig {
+            let own = h3x::endpoint::ServerSpecificConfig {
                 alpns: vec![b"altproto".to_vec()],
                 ..Default::default()
             };
@@ -326,7 +326,7 @@ fn bind_server_slot_auto_reset() {
 
         let cfg_a = ServerQuicConfig::default();
         let cfg_b = {
-            let own = h3x::endpoint::ServerOnlyConfig {
+            let own = h3x::endpoint::ServerSpecificConfig {
                 alpns: vec![b"altproto".to_vec()],
                 ..Default::default()
             };
@@ -455,7 +455,7 @@ fn two_sni_share_network_and_port() {
 
         // Client with dangerous verifier (cert was issued for `localhost` so
         // webpki would reject `alpha`/`beta` even though they share material).
-        let client_own = ClientOnlyConfig {
+        let client_own = ClientSpecificConfig {
             verifier: ServerCertVerifierChoice::Dangerous,
             ..Default::default()
         };

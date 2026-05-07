@@ -1,7 +1,7 @@
 //! Client-side QUIC configuration for [`QuicEndpoint`](super::QuicEndpoint).
 //!
 //! Configuration is split between [`CommonQuicConfig`] (shared by both roles)
-//! and [`ClientOnlyConfig`] (client-specific).
+//! and [`ClientSpecificConfig`] (client-specific).
 //!
 //! [`ClientQuicConfig`] is a cheap-to-clone wrapper composed from
 //! `Arc<Common>` + `Arc<Own>`, so an endpoint clone shares these sub-trees
@@ -76,7 +76,7 @@ impl std::fmt::Debug for CommonQuicConfig {
 /// Strategy for verifying the server's TLS certificate.
 ///
 /// Kept as a small enum rather than a trait object so that
-/// [`ClientOnlyConfig::verifier`] composes cheaply. The `WebPki` and `Custom`
+/// [`ClientSpecificConfig::verifier`] composes cheaply. The `WebPki` and `Custom`
 /// variants wrap their verifier in an [`Arc`] for cheap cloning.
 #[derive(Clone, Default)]
 pub enum ServerCertVerifierChoice {
@@ -101,7 +101,7 @@ impl std::fmt::Debug for ServerCertVerifierChoice {
 
 /// Client-only configuration values.
 #[derive(Clone)]
-pub struct ClientOnlyConfig {
+pub struct ClientSpecificConfig {
     /// Transport parameters advertised by the client.
     pub parameters: ClientParameters,
     /// ALPN protocol identifiers to offer. Empty means no ALPN.
@@ -112,7 +112,7 @@ pub struct ClientOnlyConfig {
     pub verifier: ServerCertVerifierChoice,
 }
 
-impl Default for ClientOnlyConfig {
+impl Default for ClientSpecificConfig {
     fn default() -> Self {
         Self {
             parameters: client_parameters(),
@@ -123,9 +123,9 @@ impl Default for ClientOnlyConfig {
     }
 }
 
-impl std::fmt::Debug for ClientOnlyConfig {
+impl std::fmt::Debug for ClientSpecificConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientOnlyConfig")
+        f.debug_struct("ClientSpecificConfig")
             .field("alpns", &self.alpns.len())
             .field("verifier", &self.verifier)
             .finish_non_exhaustive()
@@ -142,7 +142,7 @@ pub struct ClientQuicConfig {
     /// Values shared by both roles.
     pub common: Arc<CommonQuicConfig>,
     /// Client-specific values.
-    pub own: Arc<ClientOnlyConfig>,
+    pub own: Arc<ClientSpecificConfig>,
 }
 
 impl ClientQuicConfig {
@@ -152,7 +152,7 @@ impl ClientQuicConfig {
     }
 
     /// Get a mutable reference to the client-only config, cloning if shared.
-    pub fn own_mut(&mut self) -> &mut ClientOnlyConfig {
+    pub fn own_mut(&mut self) -> &mut ClientSpecificConfig {
         Arc::make_mut(&mut self.own)
     }
 }

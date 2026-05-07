@@ -1,7 +1,7 @@
 //! Server-side QUIC configuration for [`QuicEndpoint`](super::QuicEndpoint).
 //!
 //! Configuration is split between [`CommonQuicConfig`] (shared by both roles)
-//! and [`ServerOnlyConfig`] (server-specific).
+//! and [`ServerSpecificConfig`] (server-specific).
 //!
 //! [`ServerQuicConfig`] is a cheap-to-clone wrapper composed from
 //! `Arc<Common>` + `Arc<Own>`, so an endpoint clone shares these sub-trees
@@ -31,7 +31,7 @@ use crate::dquic::{
 
 /// Server-only configuration values.
 #[derive(Clone)]
-pub struct ServerOnlyConfig {
+pub struct ServerSpecificConfig {
     /// Transport parameters advertised by the server.
     pub parameters: ServerParameters,
     /// ALPN protocol identifiers. Empty means no ALPN.
@@ -52,7 +52,7 @@ pub struct ServerOnlyConfig {
     pub anti_port_scan: bool,
 }
 
-impl Default for ServerOnlyConfig {
+impl Default for ServerSpecificConfig {
     fn default() -> Self {
         Self {
             parameters: server_parameters(),
@@ -66,9 +66,9 @@ impl Default for ServerOnlyConfig {
     }
 }
 
-impl std::fmt::Debug for ServerOnlyConfig {
+impl std::fmt::Debug for ServerSpecificConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServerOnlyConfig")
+        f.debug_struct("ServerSpecificConfig")
             .field("alpns", &self.alpns.len())
             .field("backlog", &self.backlog)
             .field("anti_port_scan", &self.anti_port_scan)
@@ -86,7 +86,7 @@ pub struct ServerQuicConfig {
     /// Values shared by both roles.
     pub common: Arc<CommonQuicConfig>,
     /// Server-specific values.
-    pub own: Arc<ServerOnlyConfig>,
+    pub own: Arc<ServerSpecificConfig>,
 }
 
 impl ServerQuicConfig {
@@ -96,7 +96,7 @@ impl ServerQuicConfig {
     }
 
     /// Get a mutable reference to the server-only config, cloning if shared.
-    pub fn own_mut(&mut self) -> &mut ServerOnlyConfig {
+    pub fn own_mut(&mut self) -> &mut ServerSpecificConfig {
         Arc::make_mut(&mut self.own)
     }
 
