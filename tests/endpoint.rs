@@ -25,7 +25,7 @@ use h3x::{
     connection::ConnectionBuilder,
     endpoint::{
         ClientSpecificConfig, ClientQuicConfig, H3Endpoint, Identity, Network, QuicEndpoint,
-        ServerCertVerifierChoice, ServerQuicConfig,
+        ServerCertVerifierChoice, ServerName, ServerQuicConfig,
     },
     pool::Pool,
     server::{self, Router},
@@ -48,7 +48,7 @@ fn named_server_identity() -> Option<Arc<Identity>> {
     let certs: Vec<CertificateDer<'static>> = SERVER_CERT.to_certificate();
     let key: PrivateKeyDer<'static> = SERVER_KEY.to_private_key();
     Some(Arc::new(Identity {
-        name: Arc::from("localhost"),
+        name: ServerName::new("localhost"),
         certs: Arc::new(certs),
         key: Arc::new(key),
         ocsp: Arc::new(None),
@@ -233,7 +233,7 @@ fn named_with(name: &str) -> Arc<Identity> {
     let certs: Vec<CertificateDer<'static>> = SERVER_CERT.to_certificate();
     let key: PrivateKeyDer<'static> = SERVER_KEY.to_private_key();
     Arc::new(Identity {
-        name: Arc::from(name),
+        name: ServerName::new(name),
         certs: Arc::new(certs),
         key: Arc::new(key),
         ocsp: Arc::new(None),
@@ -256,7 +256,7 @@ fn bind_server_sni_in_use() {
             .bind_server(b.clone(), ServerQuicConfig::default(), Arc::new(Vec::new()))
             .await
             .expect("second bind with different identity should succeed (overwrite)");
-        assert_eq!(second.name(), &Arc::from("localhost"));
+        assert_eq!(second.name().as_str(), "localhost");
     });
 }
 
@@ -539,15 +539,15 @@ fn registered_sni_names_tracks_live_bindings() {
             .expect("bind beta");
 
         let mut names = network.registered_sni_names();
-        names.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         assert_eq!(names.len(), 2);
-        assert_eq!(names[0].as_ref(), "alpha");
-        assert_eq!(names[1].as_ref(), "beta");
+        assert_eq!(names[0].as_str(), "alpha");
+        assert_eq!(names[1].as_str(), "beta");
 
         drop(alpha);
         let remaining = network.registered_sni_names();
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].as_ref(), "beta");
+        assert_eq!(remaining[0].as_str(), "beta");
 
         drop(beta);
         assert!(network.registered_sni_names().is_empty());

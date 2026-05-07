@@ -8,12 +8,65 @@
 //! The endpoint's identity selects between client-auth / server-auth paths
 //! and keys the SNI registry for inbound connection multiplexing.
 
-use std::sync::Arc;
+use std::{borrow::Borrow, hash::{Hash, Hasher}, ops::Deref, sync::Arc};
 
+use bytes::Bytes;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-/// Name used to advertise a server in TLS SNI.
-pub type ServerName = Arc<str>;
+/// Case-insensitive server name for SNI registry keys.
+///
+/// Always stored as ASCII lowercase so that [`DashMap`](dashmap::DashMap)
+/// keyed by [`ServerName`] supports O(1) lookup via `get::<str>(&sni)`.
+#[derive(Clone, Debug)]
+pub struct ServerName(Bytes);
+
+impl ServerName {
+    /// Construct a new [`ServerName`], normalising to ASCII lowercase.
+    pub fn new(name: &str) -> Self {
+        Self(Bytes::copy_from_slice(name.to_ascii_lowercase().as_bytes()))
+    }
+
+    /// Return the name as a `&str`.
+    pub fn as_str(&self) -> &str {
+        // SAFETY: constructed from valid ASCII via to_ascii_lowercase
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
+}
+
+impl Borrow<str> for ServerName {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Deref for ServerName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Hash delegates to `str::hash` so that [`DashMap`](dashmap::DashMap) lookups
+/// via `get::<str>(&sni)` land in the same bucket as stored [`ServerName`] keys.
+impl Hash for ServerName {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        <str as Hash>::hash(Borrow::<str>::borrow(self), state)
+    }
+}
+
+impl PartialEq for ServerName {
+    fn eq(&self, other: &Self) -> bool {
+        Borrow::<str>::borrow(self) == Borrow::<str>::borrow(other)
+    }
+}
+
+impl Eq for ServerName {}
+
+impl std::fmt::Display for ServerName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// A TLS identity backed by a certificate chain and its matching private key.
 ///
@@ -65,7 +118,7 @@ mod tests {
     fn test_certs_arc_sharing() {
         let certs = vec![];
         let id1 = Identity {
-            name: Arc::from("test"),
+            name: ServerName::new("test"),
             certs: Arc::new(certs),
             key: Arc::new(PrivateKeyDer::Pkcs8(b"dummy".to_vec().into())),
             ocsp: Arc::new(None),
@@ -80,7 +133,7 @@ mod tests {
     #[test]
     fn test_ocsp_default_none() {
         let id = Identity {
-            name: Arc::from("test"),
+            name: ServerName::new("test"),
             certs: Arc::new(vec![]),
             key: Arc::new(PrivateKeyDer::Pkcs8(b"dummy".to_vec().into())),
             ocsp: Arc::new(None),
@@ -91,7 +144,7 @@ mod tests {
     #[test]
     fn test_ocsp_update_independent() {
         let id1 = Identity {
-            name: Arc::from("test"),
+            name: ServerName::new("test"),
             certs: Arc::new(vec![]),
             key: Arc::new(PrivateKeyDer::Pkcs8(b"dummy".to_vec().into())),
             ocsp: Arc::new(None),

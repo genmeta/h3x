@@ -592,19 +592,19 @@ impl Network {
                     }
                 };
 
-                for item in sni_registry.iter() {
-                    if item.key().eq_ignore_ascii_case(&sni)
-                        && let Some(entry) = item.value().upgrade()
-                    {
-                        if entry.incomings_tx.send(conn).await.is_err() {
-                            tracing::debug!(
-                                target: "h3x::endpoint",
-                                name = %sni,
-                                "sni channel closed"
-                            );
-                        }
-                        return;
+                let sni_lower = sni.to_ascii_lowercase();
+                if let Some(entry) = sni_registry
+                    .get::<str>(&sni_lower)
+                    .and_then(|item| item.value().upgrade())
+                {
+                    if entry.incomings_tx.send(conn).await.is_err() {
+                        tracing::debug!(
+                            target: "h3x::endpoint",
+                            name = %sni,
+                            "sni channel closed"
+                        );
                     }
+                    return;
                 }
                 tracing::debug!(
                     target: "h3x::endpoint",
@@ -684,10 +684,10 @@ impl AuthClient for InterfaceAuthClient {
         _client_name: Option<&str>,
     ) -> ClientNameVerifyResult {
         let sni = server_agent.name();
+        let sni_lower = sni.to_ascii_lowercase();
         let entry = self
             .sni_registry
-            .iter()
-            .find(|item| item.key().eq_ignore_ascii_case(sni))
+            .get::<str>(&sni_lower)
             .and_then(|item| item.value().upgrade());
 
         match entry {
@@ -764,7 +764,7 @@ mod tests {
         let key: PrivateKeyDer<'static> = SERVER_KEY.to_private_key();
 
         Arc::new(Identity {
-            name: Arc::from(name),
+            name: ServerName::new(name),
             certs: Arc::new(certs),
             key: Arc::new(key),
             ocsp: Arc::new(None),

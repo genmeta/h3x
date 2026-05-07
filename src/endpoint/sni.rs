@@ -127,15 +127,10 @@ impl ResolvesServerCert for SniCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let registry = self.registry.upgrade()?;
         let sni = client_hello.server_name()?;
-        // DashMap keys are ASCII-normalised only if callers do so; we iterate
-        // to match case-insensitively.
-        for item in registry.iter() {
-            if item.key().eq_ignore_ascii_case(sni)
-                && let Some(entry) = item.value().upgrade()
-            {
-                return Some(entry.certified_key.clone());
-            }
-        }
-        None
+        let sni_lower = sni.to_ascii_lowercase();
+        registry
+            .get::<str>(&sni_lower)
+            .and_then(|item| item.value().upgrade())
+            .map(|entry| entry.certified_key.clone())
     }
 }
