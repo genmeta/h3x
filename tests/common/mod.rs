@@ -1,22 +1,11 @@
 #![allow(unused)]
 
 use std::{
-    error::Error,
     sync::{Arc, LazyLock},
     time::Duration,
 };
 
-use dquic::{
-    prelude::{
-        BindUri, BoundAddr, IO,
-        handy::{ToCertificate, ToPrivateKey},
-    },
-    qinterface::component::route::QuicRouter,
-};
-use h3x::{
-    dquic::{H3Client, H3Servers},
-    server::UnresolvedRequest,
-};
+use dquic::prelude::handy::{SystemResolver, ToCertificate, ToPrivateKey};
 use http::uri::Authority;
 use tokio::time;
 use tracing::{Instrument, level_filters::LevelFilter};
@@ -69,68 +58,47 @@ pub const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/se
 pub const SERVER_KEY: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
 pub const TEST_DATA: &[u8] = include_bytes!("mod.rs");
 
-pub fn test_client() -> H3Client {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add_parsable_certificates(CA_CERT.to_certificate());
-    H3Client::builder()
-        .with_root_certificates(roots)
-        .without_identity()
-        .expect("failed to initialize client tls")
-        .with_router(Arc::new(QuicRouter::new()))
-        .build()
+pub async fn test_client() -> h3x::dquic::H3Endpoint {
+    let quic = h3x::dquic::QuicEndpoint::new(
+        h3x::dquic::Network::builder().build(),
+        None,
+        Arc::new(SystemResolver),
+        h3x::dquic::ClientQuicConfig::default(),
+        h3x::dquic::ServerQuicConfig::default(),
+        Arc::new(vec![]),
+    )
+    .await;
+    let pool = h3x::pool::Pool::empty();
+    let builder = Arc::new(h3x::connection::ConnectionBuilder::new(Arc::new(
+        h3x::dhttp::settings::Settings::default(),
+    )));
+    h3x::endpoint::H3Endpoint::new(quic, pool, builder)
 }
 
-pub async fn test_server<S>(router: S) -> H3Servers<S>
-where
-    S: tower_service::Service<UnresolvedRequest, Response = ()> + Clone + Send + Sync + 'static,
-    S::Future: Send,
-    S::Error: Into<Box<dyn Error + Send + Sync>>,
-{
-    let mut servers = H3Servers::builder()
-        .without_client_cert_verifier()
-        .expect("failed to initialize server tls")
-        .with_router(Arc::new(QuicRouter::new()))
-        .listen()
-        .expect("failed to listen");
-    servers
-        .add_server(
-            "localhost",
-            SERVER_CERT.to_certificate(),
-            SERVER_KEY.to_private_key(),
-            None,
-            [
-                BindUri::from("inet://127.0.0.1:0").alloc_port(),
-                BindUri::from("inet://[::1]:0").alloc_port(),
-            ],
-            router,
-        )
-        .await
-        .expect("failed to add server");
-    servers
-}
-
-pub fn get_server_addr<S>(servers: &H3Servers<S>) -> BoundAddr {
-    let localhost = servers
-        .quic_listener()
-        .get_server("localhost")
-        .expect("server localhost must be registered");
-    let (_bind_uri, localhost_bind_interface) = localhost
-        .bind_interfaces()
-        .into_iter()
-        .next()
-        .expect("server localhost must have at least one bind interface");
-    localhost_bind_interface
-        .borrow()
-        .bound_addr()
-        .expect("bind interface must have local addr")
-}
-
-pub fn get_server_authority<S>(servers: &H3Servers<S>) -> Authority {
-    match get_server_addr(servers) {
-        BoundAddr::Internet(socket_addr) => {
-            Authority::from_maybe_shared(Vec::from(format!("localhost:{}", socket_addr.port())))
-                .expect("failed to parse authority")
-        }
-        _ => unimplemented!("Only Internet addresses are supported now"),
-    }
+pub async fn test_server() -> (h3x::dquic::H3Endpoint, Authority) {
+    let identity = Arc::new(h3x::dquic::Identity {
+        name: h3x::dquic::ServerName::new("localhost"),
+        certs: Arc::new(SERVER_CERT.to_certificate()),
+        key: Arc::new(SERVER_KEY.to_private_key()),
+        ocsp: Arc::new(None),
+    });
+    let quic = h3x::dquic::QuicEndpoint::new(
+        h3x::dquic::Network::builder().build(),
+        Some(identity),
+        Arc::new(SystemResolver),
+        h3x::dquic::ClientQuicConfig::default(),
+        h3x::dquic::ServerQuicConfig::default(),
+        Arc::new(vec![]),
+    )
+    .await;
+    let pool = h3x::pool::Pool::empty();
+    let builder = Arc::new(h3x::connection::ConnectionBuilder::new(Arc::new(
+        h3x::dhttp::settings::Settings::default(),
+    )));
+    let authority =
+        Authority::from_maybe_shared(Vec::from("localhost:0")).expect("failed to parse authority");
+    (
+        h3x::endpoint::H3Endpoint::new(quic, pool, builder),
+        authority,
+    )
 }

@@ -10,7 +10,7 @@ use common::*;
 use h3x::{
     hyper::{server::TowerService, upgrade},
     qpack::field::Protocol,
-    server,
+    endpoint::server,
 };
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
@@ -23,14 +23,13 @@ use tokio_util::{
 #[test]
 fn axum_hello_world() {
     run("axum_hello_world", async move {
-        let router = Router::new()
+        let router = TowerService(Router::new()
             .route("/hello_world", get(|| async { "Hello, World!" }))
-            .into_service();
-        let mut server = test_server(TowerService(router)).await;
-        let host = get_server_authority(&server);
-        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
+            .into_service());
+        let (server, host) = test_server().await;
+        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client();
+        let client = test_client().await;
 
         let connection = client
             .connect(host.clone())
@@ -80,13 +79,11 @@ async fn interim_response_service(_request: &mut server::Request, response: &mut
 #[test]
 fn interim_response() {
     run("interim_response", async move {
-        let mut server =
-            test_server(server::Router::new().get("/ultimate_answer", interim_response_service))
-                .await;
-        let host = get_server_authority(&server);
-        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
+        let router = server::Router::new().get("/ultimate_answer", interim_response_service);
+        let (server, host) = test_server().await;
+        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client();
+        let client = test_client().await;
 
         let connection = client
             .connect(host.clone())
@@ -158,14 +155,13 @@ async fn mock_connect_service(request: axum::extract::Request) -> Result<(), Sta
 #[test]
 fn axum_connect() {
     run("axum_connect", async move {
-        let router = Router::new()
+        let router = TowerService(Router::new()
             .route("/", any(mock_connect_service))
-            .into_service();
-        let mut server = test_server(TowerService(router)).await;
-        let host = get_server_authority(&server);
-        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
+            .into_service());
+        let (server, host) = test_server().await;
+        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client();
+        let client = test_client().await;
 
         let connection = client
             .connect(host.clone())
@@ -224,14 +220,13 @@ async fn extend_connect_service(request: axum::extract::Request) -> Result<(), S
 #[test]
 fn axum_extend_connect() {
     run("axum_extend_connect", async move {
-        let router = Router::new()
+        let router = TowerService(Router::new()
             .route("/connect", any(extend_connect_service))
-            .into_service();
-        let mut server = test_server(TowerService(router)).await;
-        let host = get_server_authority(&server);
-        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
+            .into_service());
+        let (server, host) = test_server().await;
+        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client();
+        let client = test_client().await;
 
         let connection = client
             .connect(host.clone())

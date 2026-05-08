@@ -1,13 +1,10 @@
 mod common;
-use std::sync::Arc;
 
 use common::*;
-use dquic::prelude::handy::{ToCertificate, ToPrivateKey};
 use h3x::{
-    dquic::H3Servers,
+    endpoint::server::{self, Router},
     error::Code,
     quic,
-    server::{self, Router},
     varint::VarInt,
 };
 use tokio_util::task::AbortOnDropHandle;
@@ -21,11 +18,12 @@ async fn hello_world_service(_: &mut server::Request, response: &mut server::Res
 #[test]
 fn hello_world() {
     run("hello_world", async move {
-        let mut server = test_server(Router::new().get("/hello_world", hello_world_service)).await;
-        let host = get_server_authority(&server);
-        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
+        let router = Router::new().get("/hello_world", hello_world_service);
+        let (server, host) = test_server().await;
+        let _serve =
+            AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client();
+        let client = test_client().await;
         let (_, mut response) = client
             .new_request()
             .get(format!("https://{host}/hello_world").parse().unwrap())
@@ -61,11 +59,12 @@ async fn streaming_echo_service(request: &mut server::Request, response: &mut se
 #[test]
 fn streaming_echo() {
     run("streaming_echo", async move {
-        let mut server = test_server(Router::new().post("/echo", streaming_echo_service)).await;
-        let host = get_server_authority(&server);
-        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
+        let router = Router::new().post("/echo", streaming_echo_service);
+        let (server, host) = test_server().await;
+        let _serve =
+            AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client();
+        let client = test_client().await;
         let (mut request, mut response) = client
             .new_request()
             .post(format!("https://{host}/echo").parse().unwrap())
@@ -91,16 +90,14 @@ fn streaming_echo() {
 #[test]
 fn fallback() {
     run("fallback", async move {
-        let mut server = test_server(
-            Router::new()
-                .get("/hello_world", hello_world_service)
-                .post("/hello_world", hello_world_service),
-        )
-        .await;
-        let host = get_server_authority(&server);
-        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
+        let router = Router::new()
+            .get("/hello_world", hello_world_service)
+            .post("/hello_world", hello_world_service);
+        let (server, host) = test_server().await;
+        let _serve =
+            AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client();
+        let client = test_client().await;
         let (_, response) = client
             .new_request()
             .get(format!("https://{host}/non_exist").parse().unwrap())
@@ -122,11 +119,12 @@ async fn echo_service(request: &mut server::Request, response: &mut server::Resp
 #[test]
 fn auto_close() {
     run("auto_close", async move {
-        let mut server = test_server(Router::new().post("/echo", echo_service)).await;
-        let host = get_server_authority(&server);
-        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.run().await }));
+        let router = Router::new().post("/echo", echo_service);
+        let (server, host) = test_server().await;
+        let _serve =
+            AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client();
+        let client = test_client().await;
         let (_, mut response) = client
             .new_request()
             .with_body(TEST_DATA)
@@ -148,33 +146,10 @@ fn missing_server_name_closes_connection_with_no_error() {
     run(
         "missing_server_name_closes_connection_with_no_error",
         async move {
-            let mut servers: H3Servers<Router> = H3Servers::builder()
-                .without_client_cert_verifier()
-                .expect("failed to initialize server tls")
-                .with_router(Arc::new(
-                    dquic::qinterface::component::route::QuicRouter::new(),
-                ))
-                .listen()
-                .expect("failed to listen");
-            servers
-                .quic_listener()
-                .add_server(
-                    "localhost",
-                    SERVER_CERT.to_certificate(),
-                    SERVER_KEY.to_private_key(),
-                    [
-                        dquic::prelude::BindUri::from("inet://127.0.0.1:0").alloc_port(),
-                        dquic::prelude::BindUri::from("inet://[::1]:0").alloc_port(),
-                    ],
-                    None,
-                )
-                .await
-                .expect("failed to add server");
+            let (server, host) = test_server().await;
+            let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.serve(Router::new()).await }));
 
-            let host = get_server_authority(&servers);
-            let _serve = AbortOnDropHandle::new(tokio::spawn(async move { servers.run().await }));
-
-            let client = test_client();
+            let client = test_client().await;
             let error = client
                 .new_request()
                 .get(
@@ -187,7 +162,7 @@ fn missing_server_name_closes_connection_with_no_error() {
                 .expect("request should fail with no matching server name");
 
             match error {
-                h3x::client::RequestError::ResponseStream {
+                h3x::endpoint::client::RequestError::ResponseStream {
                     source:
                         quic::StreamError::Connection {
                             source:
@@ -196,7 +171,7 @@ fn missing_server_name_closes_connection_with_no_error() {
                                 },
                         },
                 } => assert_eq!(code, Code::H3_NO_ERROR),
-                h3x::client::RequestError::ResponseStream {
+                h3x::endpoint::client::RequestError::ResponseStream {
                     source:
                         quic::StreamError::Connection {
                             source:
@@ -209,7 +184,7 @@ fn missing_server_name_closes_connection_with_no_error() {
                 }
                 // Stream reset with H3_NO_ERROR: race between GuardedQuicWriter drop
                 // (RESET_STREAM) and connection close (CONNECTION_CLOSE). Both are valid.
-                h3x::client::RequestError::ResponseStream {
+                h3x::endpoint::client::RequestError::ResponseStream {
                     source: quic::StreamError::Reset { code },
                 } => {
                     assert_eq!(code, Code::H3_NO_ERROR.into_inner());
