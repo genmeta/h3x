@@ -1,6 +1,3 @@
-use rustls::pki_types::CertificateDer;
-use snafu::Snafu;
-
 #[derive(Debug)]
 pub struct DangerousServerCertVerifier;
 
@@ -51,49 +48,4 @@ impl rustls::client::danger::ServerCertVerifier for DangerousServerCertVerifier 
             rustls::SignatureScheme::ED448,
         ]
     }
-}
-
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-pub enum InvalidIdentity {
-    #[snafu(transparent)]
-    Tls { source: rustls::Error },
-    #[snafu(display("certificate for identity cannot be parsed"))]
-    InvalidCertificate {
-        source: x509_parser::nom::Err<x509_parser::error::X509Error>,
-    },
-    #[snafu(display("SAN extensions in certificate are invalid"))]
-    InvalidSAN {
-        source: x509_parser::error::X509Error,
-    },
-    #[snafu(display("certificate for identity is missing SAN extensions"))]
-    MissingSAN,
-    #[snafu(display("identity name not found in certificate SAN"))]
-    NameNotFound,
-}
-
-pub fn verify_certificate_for_name(
-    certificate: &CertificateDer<'static>,
-    client_name: &str,
-) -> Result<(), InvalidIdentity> {
-    use x509_parser::prelude::*;
-
-    let cert = match x509_parser::parse_x509_certificate(certificate) {
-        Ok((_remain, cert)) => cert,
-        Err(source) => return Err(InvalidIdentity::InvalidCertificate { source }),
-    };
-    let san = match cert.subject_alternative_name() {
-        Ok(Some(san)) => san,
-        Ok(None) => return Err(InvalidIdentity::MissingSAN),
-        Err(source) => return Err(InvalidIdentity::InvalidSAN { source }),
-    };
-
-    if san.value.general_names.iter().any(|name| match name {
-        GeneralName::DNSName(name) => *name == client_name,
-        _ => false,
-    }) {
-        return Ok(());
-    }
-
-    Err(InvalidIdentity::NameNotFound)
 }
