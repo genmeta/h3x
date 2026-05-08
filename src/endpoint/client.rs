@@ -1,409 +1,616 @@
-//! Client-side QUIC configuration for [`QuicEndpoint`](super::QuicEndpoint).
-//!
-//! Configuration is split between [`CommonQuicConfig`] (shared by both roles)
-//! and [`ClientSpecificConfig`] (client-specific).
-//!
-//! [`ClientQuicConfig`] is a cheap-to-clone wrapper composed from
-//! `Arc<Common>` + `Arc<Own>`, so an endpoint clone shares these sub-trees
-//! efficiently and the endpoint's private TLS caches can reuse them across
-//! clones via `Arc::ptr_eq`.
-//!
-//! All types implement [`Default`] so that endpoints can be constructed
-//! without the caller having to hand-roll configuration values.
+use std::{error::Error, sync::Arc};
 
-use std::{sync::Arc, time::Duration};
+use bytes::{Buf, Bytes};
+use futures::{Sink, Stream, StreamExt, TryFutureExt};
+use http::{
+    HeaderMap, HeaderValue, Method, Uri,
+    header::{AsHeaderName, IntoHeaderName},
+    uri::{Authority, PathAndQuery, Scheme},
+};
+use snafu::{Report, ResultExt, Snafu};
+use tracing::Instrument;
 
-use rustls::client::{WebPkiServerVerifier, danger::ServerCertVerifier};
-
-use crate::dquic::{
-    prelude::{
-        ProductStreamsConcurrencyController,
-        handy::{ConsistentConcurrency, NoopLogger, client_parameters},
+use super::H3Endpoint;
+use crate::{
+    dhttp::protocol::InitialRawMessageStreamError,
+    error::Code,
+    message::{
+        stream::{InitialMessageStreamError, MessageStreamError, ReadStream, WriteStream},
+        unify::{MalformedMessageError, Message, MessageStage, ReadToStringError},
     },
-    qbase::{
-        param::ClientParameters,
-        token::{TokenSink, handy::NoopTokenRegistry},
-    },
-    qevent::telemetry::QLog,
+    pool::ConnectError,
+    qpack::field::{MalformedHeaderSection, Protocol},
+    quic::{self, agent},
 };
 
-// ---------------------------------------------------------------------------
-// Common
-// ---------------------------------------------------------------------------
-
-/// Configuration values that apply to both client and server roles.
 #[derive(Clone)]
-pub struct CommonQuicConfig {
-    /// How long the connection should keep sending probe packets after going
-    /// idle. `Duration::ZERO` (the default) disables deferred idle timeouts.
-    pub defer_idle_timeout: Duration,
-    /// Factory producing per-connection streams concurrency controllers.
-    pub stream_strategy_factory: Arc<dyn ProductStreamsConcurrencyController>,
-    /// QUIC-events logger (qlog). Defaults to a no-op logger.
-    pub qlogger: Arc<dyn QLog + Send + Sync>,
-    /// Whether 0-RTT should be enabled if the crypto context permits it.
-    pub enable_0rtt: bool,
-    /// Enable SSL key logging via `SSLKEYLOGFILE` for debugging captures.
-    pub enable_sslkeylog: bool,
+pub struct PendingRequest<'e, E: quic::Connect> {
+    endpoint: &'e H3Endpoint<E>,
+    request: Message,
+    auto_close: bool,
 }
 
-impl Default for CommonQuicConfig {
-    fn default() -> Self {
+impl<'e, E: quic::Connect> std::fmt::Debug for PendingRequest<'e, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRequest")
+            .field("endpoint", &format_args!("H3Endpoint<...>"))
+            .field("request", &self.request)
+            .field("auto_close", &self.auto_close)
+            .finish()
+    }
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum RequestError<E: Error + 'static> {
+    #[snafu(transparent)]
+    Connect { source: ConnectError<E> },
+    #[snafu(transparent)]
+    Connection { source: quic::ConnectionError },
+    #[snafu(display("request stream error"))]
+    RequestStream { source: quic::StreamError },
+    #[snafu(display("response stream error"))]
+    ResponseStream { source: quic::StreamError },
+    #[snafu(display("request cannot be sent due to malformed header"))]
+    MalformedRequestHeader { source: MalformedHeaderSection },
+    #[snafu(display(
+        "header section too large to fit into a single frame, maybe too many header fields"
+    ))]
+    HeaderTooLarge,
+    #[snafu(display(
+        "trailer section too large to fit into a single frame, maybe too many header fields"
+    ))]
+    TrailerTooLarge,
+    #[snafu(display("data frame payload too large, try smaller chunk size"))]
+    DataFrameTooLarge,
+    #[snafu(display("response from peer is malformed"))]
+    MalformedResponse,
+}
+
+impl<'e, E: quic::Connect> PendingRequest<'e, E> {
+    pub(crate) fn new(endpoint: &'e H3Endpoint<E>) -> Self {
         Self {
-            defer_idle_timeout: Duration::ZERO,
-            stream_strategy_factory: Arc::new(ConsistentConcurrency::new),
-            qlogger: Arc::new(NoopLogger),
-            enable_0rtt: false,
-            enable_sslkeylog: false,
+            endpoint,
+            request: Message::unresolved_request(),
+            auto_close: true,
         }
     }
 }
 
-impl std::fmt::Debug for CommonQuicConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CommonQuicConfig")
-            .field("defer_idle_timeout", &self.defer_idle_timeout)
-            .field("enable_0rtt", &self.enable_0rtt)
-            .field("enable_sslkeylog", &self.enable_sslkeylog)
-            .finish_non_exhaustive()
+impl<E: quic::Connect> PendingRequest<'_, E> {
+    pub fn with_method(mut self, method: Method) -> Self {
+        self.request.header_mut().set_method(method);
+        self
+    }
+
+    pub fn with_scheme(mut self, scheme: Scheme) -> Self {
+        self.request.header_mut().set_scheme(scheme);
+        self
+    }
+
+    pub fn with_authority(mut self, authority: Authority) -> Self {
+        self.request.header_mut().set_authority(authority);
+        self
+    }
+
+    pub fn with_path(mut self, path: PathAndQuery) -> Self {
+        self.request.header_mut().set_path(path);
+        self
+    }
+
+    pub fn with_protocol(mut self, protocol: Protocol) -> Self {
+        self.request.header_mut().set_protocol(protocol);
+        self
+    }
+
+    pub fn with_uri(mut self, uri: Uri) -> Self {
+        self.request.header_mut().set_uri(uri);
+        self
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        &self.request.header().header_map
+    }
+
+    pub fn headers_mut(&mut self) -> &mut HeaderMap {
+        &mut self.request.header_mut().header_map
+    }
+
+    pub fn with_header(mut self, name: impl IntoHeaderName, value: HeaderValue) -> Self {
+        self.headers_mut().insert(name, value);
+        self
+    }
+
+    pub fn with_headers(mut self, headers: HeaderMap) -> Self {
+        *self.headers_mut() = headers;
+        self
+    }
+
+    pub fn with_body(mut self, body: impl Buf) -> Self {
+        self.request.set_body(body);
+        self
+    }
+
+    /// Whether to automatically close the request stream when the pending request is chunked.
+    ///
+    /// Default is `true` to adapt most use cases.
+    pub fn auto_close(mut self, auto_close: bool) -> Self {
+        self.auto_close = auto_close;
+        self
+    }
+
+    pub fn trailers(&self) -> &HeaderMap {
+        self.request.trailers()
+    }
+
+    pub fn trailers_mut(&mut self) -> &mut HeaderMap {
+        self.request.trailers_mut()
+    }
+
+    pub fn with_trailer(mut self, name: impl IntoHeaderName, value: HeaderValue) -> Self {
+        self.trailers_mut().insert(name, value);
+        self
+    }
+
+    pub fn with_trailers(mut self, trailers: HeaderMap) -> Self {
+        *self.trailers_mut() = trailers;
+        self
     }
 }
 
-impl PartialEq for CommonQuicConfig {
-    fn eq(&self, other: &Self) -> bool {
-        self.defer_idle_timeout == other.defer_idle_timeout
-            && self.enable_0rtt == other.enable_0rtt
-            && self.enable_sslkeylog == other.enable_sslkeylog
-            && Arc::ptr_eq(
-                &self.stream_strategy_factory,
-                &other.stream_strategy_factory,
-            )
-            && Arc::ptr_eq(&self.qlogger, &other.qlogger)
+impl<'e, E: quic::Connect + Sync> PendingRequest<'e, E>
+where
+    E::Connection: Send + 'static,
+    <E::Connection as quic::ManageStream>::StreamReader: Send,
+    <E::Connection as quic::ManageStream>::StreamWriter: Send,
+{
+    /// Execute the request and return the response
+    #[tracing::instrument(
+        level = "debug",
+        target = "h3x::client",
+        name = "execute_request",
+        skip_all,
+        fields(
+            method = %self.request.header().method(),
+            uri = %self.request.header().uri(),
+        )
+    )]
+    pub async fn execute(mut self) -> Result<(Request, Response), RequestError<E::Error>> {
+        self.request
+            .header()
+            .check_pseudo()
+            .context(request_error::MalformedRequestHeaderSnafu)?;
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let span = tracing::Span::current();
+            if !span.has_field("method") {
+                span.record("method", self.request.header().method().as_str());
+            }
+            if !span.has_field("uri") {
+                span.record("uri", self.request.header().uri().to_string());
+            }
+        }
+
+        let authority = self.request.header().authority().expect("checked");
+
+        loop {
+            let connection = self.endpoint.connect(authority.clone()).await?;
+            tracing::trace!(target: "h3x::client", %authority, "connected");
+
+            let (mut read_stream, mut write_stream) = match connection
+                .initial_message_stream()
+                .await
+            {
+                Ok(pair) => pair,
+                Err(InitialMessageStreamError::InitialRawStream { source }) => match source {
+                    InitialRawMessageStreamError::Connection { source } => {
+                        // Connection may have been silently closed (e.g. idle timeout).
+                        // The error has been propagated to the SetOnce, so the pool
+                        // will no longer return this dead connection. Retry with a
+                        // fresh connection.
+                        tracing::debug!(
+                            target: "h3x::client",
+                            ?source,
+                            "connection error on reused connection, retrying..."
+                        );
+                        continue;
+                    }
+                    InitialRawMessageStreamError::ResponseStream { source } => {
+                        return Err(RequestError::ResponseStream { source });
+                    }
+                    InitialRawMessageStreamError::Goaway { .. } => {
+                        tracing::debug!(target: "h3x::client", "connection goaway, retrying...");
+                        continue;
+                    }
+                },
+                Err(InitialMessageStreamError::QPackProtocolDisabled { .. }) => {
+                    unreachable!("Client always initializes the QPack protocol")
+                }
+            };
+
+            let Ok(local_agent) = connection.local_agent().await else {
+                continue;
+            };
+            let Ok(remote_agent) = connection.remote_agent().await else {
+                continue;
+            };
+            let remote_agent = remote_agent.expect("checked by Client::connect");
+
+            let send_request = async {
+                if self.auto_close && self.request.is_chunked() {
+                    write_stream.close_message(&mut self.request).await
+                } else {
+                    write_stream.send_message(&mut self.request).await
+                }
+            };
+
+            let mut response = Message::unresolved_response();
+
+            #[derive(Debug, PartialEq)]
+            enum Stream {
+                Request,
+                Response,
+            }
+
+            return match tokio::try_join!(
+                send_request.map_err(|e| (Stream::Request, e)),
+                read_stream
+                    .read_message_header(&mut response)
+                    .map_err(|e| (Stream::Response, e)),
+            ) {
+                Ok(..) => {
+                    let request = Request {
+                        message: self.request,
+                        stream: write_stream,
+                        agent: local_agent,
+                    };
+                    let response = Response {
+                        message: response,
+                        stream: read_stream,
+                        agent: remote_agent,
+                    };
+                    return Ok((request, response));
+                }
+                Err((stream, MessageStreamError::HeaderTooLarge)) => {
+                    debug_assert_eq!(stream, Stream::Response);
+                    Err(RequestError::HeaderTooLarge)
+                }
+                Err((stream, MessageStreamError::TrailerTooLarge)) => {
+                    debug_assert_eq!(stream, Stream::Response);
+                    Err(RequestError::TrailerTooLarge)
+                }
+                Err((stream, MessageStreamError::DataFrameTooLarge { .. })) => {
+                    debug_assert_eq!(stream, Stream::Request);
+                    Err(RequestError::DataFrameTooLarge)
+                }
+                Err((stream, MessageStreamError::MalformedIncomingMessage)) => {
+                    debug_assert_eq!(stream, Stream::Response);
+                    Err(RequestError::MalformedResponse)
+                }
+                Err((stream, MessageStreamError::Quic { source })) => match stream {
+                    Stream::Request => Err(RequestError::RequestStream { source }),
+                    Stream::Response => Err(RequestError::ResponseStream { source }),
+                },
+                Err((.., MessageStreamError::Goaway { .. })) => {
+                    self.request = self.request.to_unsend();
+                    tracing::debug!(target: "h3x::client", "connection goaway, retrying...");
+                    continue;
+                }
+            };
+        }
+    }
+
+    pub async fn get(self, uri: Uri) -> Result<(Request, Response), RequestError<E::Error>> {
+        self.with_method(Method::GET).with_uri(uri).execute().await
+    }
+
+    pub async fn post(self, uri: Uri) -> Result<(Request, Response), RequestError<E::Error>> {
+        self.with_method(Method::POST).with_uri(uri).execute().await
+    }
+
+    pub async fn put(self, uri: Uri) -> Result<(Request, Response), RequestError<E::Error>> {
+        self.with_method(Method::PUT).with_uri(uri).execute().await
+    }
+
+    pub async fn delete(self, uri: Uri) -> Result<(Request, Response), RequestError<E::Error>> {
+        self.with_method(Method::DELETE)
+            .with_uri(uri)
+            .execute()
+            .await
+    }
+
+    pub async fn head(self, uri: Uri) -> Result<(Request, Response), RequestError<E::Error>> {
+        self.with_method(Method::HEAD).with_uri(uri).execute().await
+    }
+
+    pub async fn options(self, uri: Uri) -> Result<(Request, Response), RequestError<E::Error>> {
+        self.with_method(Method::OPTIONS)
+            .with_uri(uri)
+            .execute()
+            .await
+    }
+
+    pub async fn connect(self, uri: Uri) -> Result<(Request, Response), RequestError<E::Error>> {
+        self.with_method(Method::CONNECT)
+            .with_uri(uri)
+            .execute()
+            .await
+    }
+
+    pub async fn patch(self, uri: Uri) -> Result<(Request, Response), RequestError<E::Error>> {
+        self.with_method(Method::PATCH)
+            .with_uri(uri)
+            .execute()
+            .await
+    }
+
+    pub async fn trace(self, uri: Uri) -> Result<(Request, Response), RequestError<E::Error>> {
+        self.with_method(Method::TRACE)
+            .with_uri(uri)
+            .execute()
+            .await
     }
 }
 
-// ---------------------------------------------------------------------------
-// Client-only
-// ---------------------------------------------------------------------------
-
-/// Strategy for verifying the server's TLS certificate.
-///
-/// Kept as a small enum rather than a trait object so that
-/// [`ClientSpecificConfig::verifier`] composes cheaply. The `WebPki` and `Custom`
-/// variants wrap their verifier in an [`Arc`] for cheap cloning.
-#[derive(Clone, Default)]
-pub enum ServerCertVerifierChoice {
-    /// Accept any certificate. Intended for local testing only.
-    #[default]
-    Dangerous,
-    /// Verify against a compiled webpki verifier.
-    WebPki(Arc<WebPkiServerVerifier>),
-    /// Delegate to a caller-supplied verifier.
-    Custom(Arc<dyn ServerCertVerifier>),
+pub struct Request {
+    message: Message,
+    stream: WriteStream,
+    agent: Option<Arc<dyn agent::LocalAgent>>,
 }
 
-impl std::fmt::Debug for ServerCertVerifierChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Dangerous => f.debug_tuple("Dangerous").finish(),
-            Self::WebPki(_) => f.debug_tuple("WebPki").finish(),
-            Self::Custom(_) => f.debug_tuple("Custom").finish(),
+impl Request {
+    pub fn method(&self) -> Method {
+        self.message.header().method()
+    }
+
+    pub fn scheme(&self) -> Option<Scheme> {
+        self.message.header().scheme()
+    }
+
+    pub fn authority(&self) -> Option<Authority> {
+        self.message.header().authority()
+    }
+
+    pub fn path(&self) -> Option<PathAndQuery> {
+        self.message.header().path()
+    }
+
+    pub fn uri(&self) -> Uri {
+        self.message.header().uri()
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        &self.message.header().header_map
+    }
+
+    fn check_message_operation(
+        &mut self,
+        operation: &str,
+        check: impl FnOnce(&mut Self) -> Result<(), MalformedMessageError>,
+    ) {
+        if self.message.is_malformed() {
+            tracing::warn!(
+                target: "h3x::client", operation,
+                "Request is malformed, operation will not affect the request stream",
+            );
+        }
+        if let Err(error) = check(self) {
+            tracing::warn!(
+                target: "h3x::client", operation, error = %Report::from_error(error),
+                "Operation malformed the request message, request stream will be cancelled with H3_REQUEST_CANCELLED",
+            );
+            self.message.set_malformed();
+        }
+    }
+
+    pub async fn write(
+        &mut self,
+        content: impl Buf + Send,
+    ) -> Result<&mut Self, MessageStreamError> {
+        self.check_message_operation("write_streaming_body", |this| {
+            // header is checked in pending request
+            this.message.streaming_body()?;
+            Ok(())
+        });
+        self.stream
+            .send_message_streaming_body(&mut self.message, content)
+            .await?;
+        Ok(self)
+    }
+
+    pub async fn flush(&mut self) -> Result<&mut Self, MessageStreamError> {
+        // header is checked in pending request
+        self.stream.flush_message(&mut self.message).await?;
+        Ok(self)
+    }
+
+    pub fn as_sink<B: Buf + Send>(&mut self) -> impl Sink<B, Error = MessageStreamError> {
+        crate::message::stream::unfold::write::unfold(
+            self,
+            async |request: &mut Self, buf: B| {
+                request.write(buf).await?;
+                Ok(request)
+            },
+            async |request: &mut Self| {
+                request.flush().await?;
+                Ok(request)
+            },
+            async |request: &mut Self| {
+                request.close().await?;
+                Ok(request)
+            },
+        )
+    }
+
+    pub fn into_sink<B: Buf + Send>(self) -> impl Sink<B, Error = MessageStreamError> {
+        crate::message::stream::unfold::write::unfold(
+            self,
+            async |request: Self, buf: B| {
+                let mut request = request;
+                request.write(buf).await?;
+                Ok(request)
+            },
+            async |request: Self| {
+                let mut request = request;
+                request.flush().await?;
+                Ok(request)
+            },
+            async |request: Self| {
+                let mut request = request;
+                request.close().await?;
+                Ok(request)
+            },
+        )
+    }
+
+    pub fn trailers(&self) -> &HeaderMap {
+        self.message.trailers()
+    }
+
+    pub fn trailers_mut(&mut self) -> &mut HeaderMap {
+        self.check_message_operation("modify_trailers", |this| {
+            if this.message.stage() >= MessageStage::Trailer {
+                return Err(MalformedMessageError::TrailerAlreadySent);
+            }
+            Ok(())
+        });
+        self.message.trailers_mut()
+    }
+
+    pub fn set_trailer(&mut self, name: impl IntoHeaderName, value: HeaderValue) -> &mut Self {
+        self.trailers_mut().insert(name, value);
+        self
+    }
+
+    pub fn set_trailers(&mut self, map: HeaderMap) -> &mut Self {
+        *self.trailers_mut() = map;
+        self
+    }
+
+    pub async fn close(&mut self) -> Result<(), MessageStreamError> {
+        self.stream.close_message(&mut self.message).await
+    }
+
+    pub async fn cancel(&mut self, code: Code) -> Result<(), MessageStreamError> {
+        self.stream.cancel(code).await
+    }
+
+    /// Low level access to the underlying write stream
+    pub fn write_stream(&mut self) -> &mut WriteStream {
+        &mut self.stream
+    }
+
+    pub fn agent(&self) -> Option<&Arc<dyn agent::LocalAgent>> {
+        self.agent.as_ref()
+    }
+
+    /// Async drop the request properly
+    pub(crate) fn drop(&mut self) -> Option<impl Future<Output = ()> + Send + use<>> {
+        if self.message.is_complete() || self.message.is_dropped() {
+            return None;
+        }
+        let mut stream = self.stream.take();
+        let mut message = self.message.take();
+
+        // if !message.is_malformed() {
+        //     let check = || {
+        //         // There is no check that could fail
+        //         Ok(())
+        //     };
+        //     if let Err(error) = check() {
+        //         message.set_malformed();
+        //         tracing::warn!(
+        //             target: "h3x::client", error = %Report::from_error(error),
+        //             "Request stream cannot be closed properly as its malformed",
+        //         );
+        //     }
+        // }
+
+        Some(async move { _ = stream.close_message(&mut message).await })
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        if let Some(future) = self.drop() {
+            // Best-effort: send the end-of-stream marker before the request is dropped.
+            tokio::spawn(future.in_current_span());
         }
     }
 }
 
-impl PartialEq for ServerCertVerifierChoice {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Dangerous, Self::Dangerous) => true,
-            (Self::WebPki(a), Self::WebPki(b)) => Arc::ptr_eq(a, b),
-            (Self::Custom(a), Self::Custom(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        }
-    }
+pub struct Response {
+    message: Message,
+    stream: ReadStream,
+    agent: Arc<dyn agent::RemoteAgent>,
 }
 
-/// Client-only configuration values.
-#[derive(Clone)]
-pub struct ClientSpecificConfig {
-    /// Transport parameters advertised by the client.
-    pub parameters: ClientParameters,
-    /// ALPN protocol identifiers to offer. Empty means no ALPN.
-    pub alpns: Vec<Vec<u8>>,
-    /// Address validation token sink.
-    pub token_sink: Arc<dyn TokenSink>,
-    /// How the server's certificate should be verified.
-    pub verifier: ServerCertVerifierChoice,
-}
-
-impl Default for ClientSpecificConfig {
-    fn default() -> Self {
-        Self {
-            parameters: client_parameters(),
-            alpns: Vec::new(),
-            token_sink: Arc::new(NoopTokenRegistry),
-            verifier: ServerCertVerifierChoice::default(),
-        }
-    }
-}
-
-impl std::fmt::Debug for ClientSpecificConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientSpecificConfig")
-            .field("alpns", &self.alpns.len())
-            .field("verifier", &self.verifier)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PartialEq for ClientSpecificConfig {
-    fn eq(&self, other: &Self) -> bool {
-        self.parameters == other.parameters
-            && self.alpns == other.alpns
-            && Arc::ptr_eq(&self.token_sink, &other.token_sink)
-            && self.verifier == other.verifier
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Composite (common + own)
-// ---------------------------------------------------------------------------
-
-/// Client-side QUIC configuration = common + client-only.
-#[derive(Debug, Clone, Default)]
-pub struct ClientQuicConfig {
-    /// Values shared by both roles.
-    pub common: Arc<CommonQuicConfig>,
-    /// Client-specific values.
-    pub own: Arc<ClientSpecificConfig>,
-}
-
-impl ClientQuicConfig {
-    /// Get a mutable reference to the common config, cloning if shared.
-    pub fn common_mut(&mut self) -> &mut CommonQuicConfig {
-        Arc::make_mut(&mut self.common)
+impl Response {
+    pub async fn next_response(&mut self) -> Result<&mut Self, MessageStreamError> {
+        self.stream.read_message_header(&mut self.message).await?;
+        Ok(self)
     }
 
-    /// Get a mutable reference to the client-only config, cloning if shared.
-    pub fn own_mut(&mut self) -> &mut ClientSpecificConfig {
-        Arc::make_mut(&mut self.own)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use rustls::RootCertStore;
-
-    use super::*;
-    use crate::{dquic::prelude::handy::ToCertificate, util::tls::DangerousServerCertVerifier};
-
-    const CA_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/ca.cert");
-
-    fn root_store_with_ca() -> RootCertStore {
-        let mut store = RootCertStore::empty();
-        store.add_parsable_certificates(CA_CERT.to_certificate());
-        store
+    pub fn status(&self) -> http::StatusCode {
+        self.message.header().status()
     }
 
-    // -- CommonQuicConfig ---------------------------------------------------
-
-    #[test]
-    fn test_common_quic_config_default() {
-        let cfg = CommonQuicConfig::default();
-        assert_eq!(cfg.defer_idle_timeout, Duration::ZERO);
-        assert!(!cfg.enable_0rtt);
-        assert!(!cfg.enable_sslkeylog);
+    pub fn headers(&mut self) -> &HeaderMap {
+        &self.message.header().header_map
     }
 
-    #[test]
-    fn test_common_quic_config_partial_eq_same() {
-        let a = CommonQuicConfig::default();
-        let b = a.clone();
-        assert_eq!(a, b);
+    pub fn header(&mut self, name: impl AsHeaderName) -> Option<&HeaderValue> {
+        self.headers().get(name)
     }
 
-    #[test]
-    fn test_common_quic_config_partial_eq_different_timeout() {
-        let a = CommonQuicConfig::default();
-        let mut b = a.clone();
-        b.defer_idle_timeout = Duration::from_secs(30);
-        assert_ne!(a, b);
+    pub async fn read(&mut self) -> Option<Result<Bytes, MessageStreamError>> {
+        self.stream.read_message(&mut self.message).await
     }
 
-    #[test]
-    fn test_common_quic_config_clone() {
-        let a = CommonQuicConfig::default();
-        let b = a.clone();
-        // Clone shares the same Arcs
-        assert!(Arc::ptr_eq(
-            &a.stream_strategy_factory,
-            &b.stream_strategy_factory
-        ));
-        assert!(Arc::ptr_eq(&a.qlogger, &b.qlogger));
-        // Scalar values are copied
-        assert_eq!(a.defer_idle_timeout, b.defer_idle_timeout);
-        assert_eq!(a.enable_0rtt, b.enable_0rtt);
-        assert_eq!(a.enable_sslkeylog, b.enable_sslkeylog);
+    pub async fn read_all(&mut self) -> Result<impl Buf, MessageStreamError> {
+        self.stream.read_message_full_body(&mut self.message).await
     }
 
-    // -- ClientSpecificConfig -----------------------------------------------
-
-    #[test]
-    fn test_client_specific_config_default() {
-        let cfg = ClientSpecificConfig::default();
-        assert!(
-            matches!(cfg.verifier, ServerCertVerifierChoice::Dangerous),
-            "default verifier should be Dangerous"
-        );
-        assert!(cfg.alpns.is_empty(), "default alpns should be empty");
+    pub async fn read_to_bytes(&mut self) -> Result<Bytes, MessageStreamError> {
+        self.stream
+            .read_message_body_to_bytes(&mut self.message)
+            .await
     }
 
-    #[test]
-    fn test_client_specific_config_partial_eq() {
-        let a = ClientSpecificConfig::default();
-        let b = a.clone();
-        assert_eq!(a, b);
+    pub async fn read_to_string(&mut self) -> Result<String, ReadToStringError> {
+        self.stream
+            .read_message_body_to_string(&mut self.message)
+            .await
     }
 
-    #[test]
-    fn test_client_specific_config_clone() {
-        let a = ClientSpecificConfig::default();
-        let b = a.clone();
-        // Clone shares the same Arc for token_sink
-        assert!(Arc::ptr_eq(&a.token_sink, &b.token_sink));
-        // Vec is cloned, not shared
-        assert_eq!(a.alpns, b.alpns);
-        // Parameters are value-equal
-        assert_eq!(a.parameters, b.parameters);
-        // Verifier is equal (same variant/ptr)
-        assert_eq!(a.verifier, b.verifier);
+    pub async fn as_stream(&mut self) -> impl Stream<Item = Result<Bytes, MessageStreamError>> {
+        futures::stream::unfold(self, async |this| {
+            this.read().await.map(|item| (item, this))
+        })
+        .fuse()
     }
 
-    // -- ServerCertVerifierChoice -------------------------------------------
-
-    #[test]
-    fn test_verifier_choice_dangerous_eq() {
-        assert_eq!(
-            ServerCertVerifierChoice::Dangerous,
-            ServerCertVerifierChoice::Dangerous
-        );
+    pub async fn into_stream(self) -> impl Stream<Item = Result<Bytes, MessageStreamError>> {
+        futures::stream::unfold(self, async |mut this| {
+            this.read().await.map(|item| (item, this))
+        })
+        .fuse()
     }
 
-    #[test]
-    fn test_verifier_choice_dangerous_ne_webpki() {
-        let store = root_store_with_ca();
-        let webpki = WebPkiServerVerifier::builder(Arc::new(store))
-            .build()
-            .unwrap();
-        assert_ne!(
-            ServerCertVerifierChoice::Dangerous,
-            ServerCertVerifierChoice::WebPki(webpki)
-        );
+    pub async fn trailers(&mut self) -> Result<&HeaderMap, MessageStreamError> {
+        self.stream.read_message_trailer(&mut self.message).await
     }
 
-    #[test]
-    fn test_verifier_choice_webpki_same_arc_eq() {
-        let store = root_store_with_ca();
-        let webpki = WebPkiServerVerifier::builder(Arc::new(store))
-            .build()
-            .unwrap();
-        // webpki is already Arc<WebPkiServerVerifier>
-        // Two clones of the same Arc should be equal (ptr_eq)
-        let a = ServerCertVerifierChoice::WebPki(webpki.clone());
-        let b = ServerCertVerifierChoice::WebPki(webpki.clone());
-        assert_eq!(a, b);
+    pub async fn stop(&mut self, code: Code) -> Result<(), MessageStreamError> {
+        self.stream.stop(code).await
     }
 
-    #[test]
-    fn test_verifier_choice_webpki_different_arc_ne() {
-        let store1 = root_store_with_ca();
-        let store2 = root_store_with_ca();
-        let webpki1 = WebPkiServerVerifier::builder(Arc::new(store1))
-            .build()
-            .unwrap();
-        let webpki2 = WebPkiServerVerifier::builder(Arc::new(store2))
-            .build()
-            .unwrap();
-        assert_ne!(
-            ServerCertVerifierChoice::WebPki(webpki1),
-            ServerCertVerifierChoice::WebPki(webpki2)
-        );
+    /// Low level access to the underlying read stream
+    pub fn read_stream(&mut self) -> &mut ReadStream {
+        &mut self.stream
     }
 
-    #[test]
-    fn test_verifier_choice_custom_same_arc_eq() {
-        let verifier: Arc<dyn ServerCertVerifier> = Arc::new(DangerousServerCertVerifier);
-        let a = ServerCertVerifierChoice::Custom(verifier.clone());
-        let b = ServerCertVerifierChoice::Custom(verifier.clone());
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn test_verifier_choice_default_is_dangerous() {
-        assert_eq!(
-            ServerCertVerifierChoice::default(),
-            ServerCertVerifierChoice::Dangerous
-        );
-    }
-
-    // -- ClientQuicConfig ---------------------------------------------------
-
-    #[test]
-    fn test_client_quic_config_default() {
-        let cfg = ClientQuicConfig::default();
-        // Both Arcs are accessible
-        assert_eq!(cfg.common.defer_idle_timeout, Duration::ZERO);
-        assert!(
-            matches!(&cfg.own.verifier, ServerCertVerifierChoice::Dangerous),
-            "default own verifier should be Dangerous"
-        );
-    }
-
-    #[test]
-    fn test_client_quic_config_common_mut_clones_unique() {
-        let a = ClientQuicConfig::default();
-        let mut b = a.clone();
-        // Before mutation, both share the same Arc
-        assert!(Arc::ptr_eq(&a.common, &b.common));
-
-        // Mutate b via common_mut — should clone-on-write
-        b.common_mut().defer_idle_timeout = Duration::from_secs(99);
-
-        // Original is unchanged
-        assert_eq!(a.common.defer_idle_timeout, Duration::ZERO);
-        // b has the new value
-        assert_eq!(b.common.defer_idle_timeout, Duration::from_secs(99));
-        // Pointers are now different
-        assert_ne!(Arc::as_ptr(&a.common), Arc::as_ptr(&b.common));
-    }
-
-    #[test]
-    fn test_client_quic_config_own_mut_clones_unique() {
-        let a = ClientQuicConfig::default();
-        let mut b = a.clone();
-        // Before mutation, both share the same Arc
-        assert!(Arc::ptr_eq(&a.own, &b.own));
-
-        // Mutate b via own_mut — should clone-on-write
-        b.own_mut().alpns.push(b"h3".to_vec());
-
-        // Original is unchanged
-        assert!(a.own.alpns.is_empty());
-        // b has the new alpns
-        assert!(!b.own.alpns.is_empty());
-        // Pointers are now different
-        assert_ne!(Arc::as_ptr(&a.own), Arc::as_ptr(&b.own));
-    }
-
-    #[test]
-    fn test_client_quic_config_clone_shares_arcs() {
-        let a = ClientQuicConfig::default();
-        let b = a.clone();
-        assert!(Arc::ptr_eq(&a.common, &b.common));
-        assert!(Arc::ptr_eq(&a.own, &b.own));
+    pub fn agent(&self) -> &Arc<dyn agent::RemoteAgent> {
+        &self.agent
     }
 }

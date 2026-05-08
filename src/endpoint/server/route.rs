@@ -7,7 +7,7 @@ use std::{
 use futures::future::BoxFuture;
 use http::{Method, StatusCode};
 
-use crate::server::{
+use crate::endpoint::server::{
     BoxService, BoxServiceFuture, IntoBoxService, MessageStreamError, Request, Response, Service,
     UnresolvedRequest, box_service,
 };

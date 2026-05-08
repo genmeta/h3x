@@ -2,7 +2,7 @@ use std::any::Any;
 
 use futures::future::BoxFuture;
 
-use crate::server::{Request, Response};
+use crate::endpoint::server::{Request, Response};
 
 pub trait Service {
     type Future<'s>: Future<Output = ()>;

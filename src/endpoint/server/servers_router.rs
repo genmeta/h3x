@@ -7,7 +7,7 @@ use std::{
 use futures::future::{self, BoxFuture};
 use snafu::Snafu;
 
-use crate::server::UnresolvedRequest;
+use crate::endpoint::server::UnresolvedRequest;
 
 #[derive(Debug, Clone, Snafu)]
 #[snafu(visibility(pub))]
