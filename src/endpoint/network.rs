@@ -68,13 +68,16 @@ use crate::dquic::{
         bind_uri::BindUri,
         component::{
             location::{Locations, LocationsComponent},
-            route::{QuicRouter, Way},
+            route::{QuicRouter, QuicRouterComponent, Way},
         },
         device::Devices,
         io::ProductIO,
         manager::InterfaceManager,
     },
-    qtraversal::route::ReceiveAndDeliverPacketComponent,
+    qtraversal::{
+        nat::{client::StunClientsComponent, router::StunRouterComponent},
+        route::{ForwardersComponent, ReceiveAndDeliverPacketComponent},
+    },
 };
 
 pub(crate) type SniRegistry = Arc<DashMap<ServerName, Weak<ServerEntry>>>;
@@ -113,9 +116,7 @@ pub enum BindServerError {
 /// Used exclusively via [`Arc<Network>`]. [`Network::builder().build()`](Network::builder)
 /// returns an [`Arc`] directly after installing the SNI dispatcher on the router.
 pub struct Network {
-    #[expect(dead_code)]
     stun_resolver: Arc<dyn Resolve + Send + Sync>,
-    #[expect(dead_code)]
     stun_server: Option<Arc<str>>,
     devices: &'static Devices,
     io_factory: Arc<dyn ProductIO + 'static>,
@@ -295,13 +296,8 @@ impl Network {
                     };
                     return Ok(binding);
                 }
-                Some(_) => {
-                    drop(occupied);
-                    self.sni_registry.remove(&name);
-                }
-                None => {
-                    drop(occupied);
-                    self.sni_registry.remove(&name);
+                _ => {
+                    occupied.remove();
                 }
             },
             Entry::Vacant(_) => {}
@@ -375,12 +371,6 @@ impl Network {
     /// handles for a pattern are dropped (or [`BindHandle::unbind`] is
     /// called), the bound interfaces are released.
     pub async fn bind(self: &Arc<Self>, pattern: BindPattern) -> BindHandle {
-        let bind_uris: Vec<BindUri> = {
-            let iface_names: Vec<String> = self.devices.interfaces().keys().cloned().collect();
-            let iface_strs: Vec<&str> = iface_names.iter().map(|s| s.as_str()).collect();
-            pattern.to_bind_uris(iface_strs).collect()
-        };
-
         // Collect URIs that need binding while holding both locks, so the
         // refcount is incremented before we drop the locks and perform async
         // bind operations.
@@ -395,10 +385,9 @@ impl Network {
             entry.refcount += 1;
 
             let bound = entry.bound.lock().expect("bound mutex poisoned");
-            bind_uris
-                .iter()
+            pattern
+                .to_bind_uris(self.devices.interfaces().keys().map(String::as_str))
                 .filter(|uri| !bound.contains_key(&uri.identity_key()))
-                .cloned()
                 .collect()
         }; // locks dropped before await
 
@@ -410,14 +399,7 @@ impl Network {
                 .iface_manager
                 .bind(uri.clone(), self.io_factory.clone())
                 .await;
-            iface.insert_component_with(|iface| {
-                ReceiveAndDeliverPacketComponent::builder(iface.downgrade())
-                    .quic_router(self.quic_router.clone())
-                    .init()
-            });
-            iface.insert_component_with(|iface| {
-                LocationsComponent::new(iface.downgrade(), self.locations.clone())
-            });
+            self.init_iface_components(&iface);
             new_ifaces.push((uri.identity_key(), uri.clone(), iface));
         }
 
@@ -439,31 +421,83 @@ impl Network {
         }
     }
 
+    fn init_iface_components(&self, bind_iface: &BindInterface) {
+        let uri = bind_iface.bind_uri();
+        let stun_server = if let Some(server) = uri.stun_server() {
+            Some(Arc::from(server.into_owned()))
+        } else if let Some("false") = uri.prop(BindUri::STUN_PROP).as_deref() {
+            None
+        } else {
+            self.stun_server.clone()
+        };
+
+        bind_iface.with_components_mut(|components, iface| {
+            let router = components
+                .init_with(|| QuicRouterComponent::new(self.quic_router.clone()))
+                .router();
+
+            if let Some(stun_server) = stun_server {
+                let stun_router = components
+                    .init_with(|| StunRouterComponent::new(iface.downgrade()))
+                    .router();
+                let loc = components
+                    .init_with(|| {
+                        LocationsComponent::new(iface.downgrade(), self.locations.clone())
+                    })
+                    .clone();
+                let clients = components
+                    .init_with(|| {
+                        StunClientsComponent::new(
+                            iface.downgrade(),
+                            stun_router.clone(),
+                            self.stun_resolver.clone(),
+                            stun_server,
+                            Vec::new(),
+                            Some(loc),
+                        )
+                    })
+                    .clone();
+                let forwarder = components
+                    .init_with(|| ForwardersComponent::new_client(clients))
+                    .forwarder();
+                components.init_with(|| {
+                    ReceiveAndDeliverPacketComponent::builder(iface.downgrade())
+                        .quic_router(router)
+                        .stun_router(stun_router)
+                        .forwarder(forwarder)
+                        .init()
+                });
+            } else {
+                components.init_with(|| {
+                    LocationsComponent::new(iface.downgrade(), self.locations.clone())
+                });
+                components.init_with(|| {
+                    ReceiveAndDeliverPacketComponent::builder(iface.downgrade())
+                        .quic_router(router)
+                        .init()
+                });
+            }
+        });
+    }
+
     /// Release a previously registered [`BindPattern`] and its bound
     /// interfaces.
     pub(crate) async fn unbind(&self, pattern: &BindPattern) {
-        let to_close: Vec<BindInterface> = {
+        let bound = {
             let mut registry = self.bind_registry.lock().expect("bind_registry poisoned");
             if let hash_map::Entry::Occupied(mut entry) = registry.entry(pattern.clone()) {
                 entry.get_mut().refcount = entry.get().refcount.saturating_sub(1);
                 if entry.get().refcount == 0 {
-                    let removed = entry.remove();
-                    removed
-                        .bound
-                        .into_inner()
-                        .expect("bound mutex poisoned")
-                        .into_values()
-                        .map(|(_uri, iface)| iface)
-                        .collect()
+                    entry.remove().bound
                 } else {
-                    Vec::new()
+                    return;
                 }
             } else {
-                Vec::new()
+                return;
             }
         };
 
-        for iface in to_close {
+        for (_, (_, iface)) in bound.into_inner().expect("bound mutex poisoned") {
             iface.close().await.ok();
         }
     }
@@ -554,12 +588,10 @@ impl Network {
             .with_tls_config((*slot.rustls_config).clone());
 
         let foundation = network.configure_connection(foundation);
-        let foundation = foundation
+        let conn = foundation
             .with_streams_concurrency_strategy(slot.config.common.stream_strategy_factory.as_ref())
             .with_defer_idle_timeout(slot.config.common.defer_idle_timeout)
-            .with_zero_rtt(slot.config.common.enable_0rtt);
-
-        let conn = foundation
+            .with_zero_rtt(slot.config.common.enable_0rtt)
             .with_cids(origin_dcid)
             .with_qlog(slot.config.common.qlogger.clone())
             .run();
@@ -610,8 +642,10 @@ impl Network {
     /// Background task that reconciles bound interfaces with device changes.
     #[allow(clippy::type_complexity)]
     async fn run_reconcile(&self) {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            ticker.tick().await;
 
             let patterns: Vec<(BindPattern, HashMap<String, (BindUri, BindInterface)>)> = {
                 let registry = self.bind_registry.lock().expect("bind_registry poisoned");
@@ -625,29 +659,22 @@ impl Network {
             };
 
             for (pattern, mut bound) in patterns {
-                let iface_names: Vec<String> = self.devices.interfaces().keys().cloned().collect();
-                let iface_strs: Vec<&str> = iface_names.iter().map(|s| s.as_str()).collect();
-                let desired_uris: Vec<BindUri> = pattern.to_bind_uris(iface_strs).collect();
-
-                let desired_keys: std::collections::HashSet<String> =
-                    desired_uris.iter().map(|u| u.identity_key()).collect();
+                let desired_keys: std::collections::HashSet<String> = pattern
+                    .to_bind_uris(self.devices.interfaces().keys().map(String::as_str))
+                    .map(|u| u.identity_key())
+                    .collect();
                 bound.retain(|key, _| desired_keys.contains(key));
 
-                for uri in &desired_uris {
+                for uri in
+                    pattern.to_bind_uris(self.devices.interfaces().keys().map(String::as_str))
+                {
                     let key = uri.identity_key();
                     if let std::collections::hash_map::Entry::Vacant(e) = bound.entry(key) {
                         let iface = self
                             .iface_manager
                             .bind(uri.clone(), self.io_factory.clone())
                             .await;
-                        iface.insert_component_with(|iface| {
-                            ReceiveAndDeliverPacketComponent::builder(iface.downgrade())
-                                .quic_router(self.quic_router.clone())
-                                .init()
-                        });
-                        iface.insert_component_with(|iface| {
-                            LocationsComponent::new(iface.downgrade(), self.locations.clone())
-                        });
+                        self.init_iface_components(&iface);
                         e.insert((uri.clone(), iface));
                     }
                 }
