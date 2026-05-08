@@ -263,7 +263,7 @@ impl Network {
             && let Some(existing) = kv.value().upgrade()
             && Arc::ptr_eq(&existing.identity, &identity)
         {
-            let (_tx, rx) = async_channel::bounded(server_config.own.backlog);
+            let rx = existing.incomings_rx.clone();
             let binding = ServerBinding {
                 entry: Arc::new(ServerEntry {
                     identity: existing.identity.clone(),
@@ -289,7 +289,7 @@ impl Network {
                             identity: existing.identity.clone(),
                             certified_key: existing.certified_key.clone(),
                             incomings_tx: existing.incomings_tx.clone(),
-                            incomings_rx: async_channel::bounded(server_config.own.backlog).1,
+                            incomings_rx: existing.incomings_rx.clone(),
                             config: existing.config.clone(),
                             guard: existing.guard.clone(),
                             bind_patterns: bind_patterns.clone(),
@@ -1192,7 +1192,7 @@ mod tests {
         let resolver: Arc<dyn Resolve + Send + Sync> =
             Arc::new(FixedResolver(format!("127.0.0.1:{port}").parse().unwrap()));
 
-        let serve_handles: Vec<AbortOnDropHandle<()>> = Vec::new();
+        let mut serve_handles: Vec<AbortOnDropHandle<()>> = Vec::new();
         let mut bindings = Vec::new();
         // Share one config Arc across both servers; otherwise
         // `ServerQuicConfig::default()` yields fresh trait objects each
@@ -1224,16 +1224,15 @@ mod tests {
                 Arc::new(Vec::new()),
             )
             .await;
-            let _h3 = H3Endpoint::new(
+            let h3 = H3Endpoint::new(
                 quic,
                 Pool::empty(),
                 Arc::new(ConnectionBuilder::new(Arc::default())),
             );
-            // TODO: restore serve() when Phase 2 adds the method back
-            // serve_handles.push(AbortOnDropHandle::new(tokio::spawn(
-            //     async move { h3.serve(router).await }.in_current_span(),
-            // )));
-            drop(router);
+            serve_handles.push(AbortOnDropHandle::new(tokio::spawn(
+                async move { h3.serve(router).await.expect("serve failed"); }
+                    .in_current_span(),
+            )));
         }
 
         // Client with dangerous verifier (cert was issued for `localhost` so
