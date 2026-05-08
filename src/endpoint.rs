@@ -61,7 +61,11 @@ impl<T: quic::Connect> H3Endpoint<T> {
 
     /// Create a new pending HTTP request builder.
     pub fn new_request(&self) -> crate::endpoint::client::PendingRequest<'_, T> {
-        crate::endpoint::client::PendingRequest::new(self)
+        crate::endpoint::client::PendingRequest {
+            endpoint: self,
+            request: crate::message::unify::Message::unresolved_request(),
+            auto_close: true,
+        }
     }
 
     /// Convenience method to create a GET request for `uri`.

@@ -25,9 +25,9 @@ use crate::{
 
 #[derive(Clone)]
 pub struct PendingRequest<'e, E: quic::Connect> {
-    endpoint: &'e H3Endpoint<E>,
-    request: Message,
-    auto_close: bool,
+    pub(super) endpoint: &'e H3Endpoint<E>,
+    pub(super) request: Message,
+    pub(super) auto_close: bool,
 }
 
 impl<'e, E: quic::Connect> std::fmt::Debug for PendingRequest<'e, E> {
@@ -65,16 +65,6 @@ pub enum RequestError<E: Error + 'static> {
     DataFrameTooLarge,
     #[snafu(display("response from peer is malformed"))]
     MalformedResponse,
-}
-
-impl<'e, E: quic::Connect> PendingRequest<'e, E> {
-    pub(crate) fn new(endpoint: &'e H3Endpoint<E>) -> Self {
-        Self {
-            endpoint,
-            request: Message::unresolved_request(),
-            auto_close: true,
-        }
-    }
 }
 
 impl<E: quic::Connect> PendingRequest<'_, E> {
