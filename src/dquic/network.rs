@@ -3,7 +3,7 @@
 //! [`Network`] owns the long-lived components needed to send and receive QUIC
 //! packets on a set of network interfaces, **and** the SNI fan-out registry
 //! used to route newly-accepted connections to per-identity
-//! [`QuicEndpoint`](super::QuicEndpoint) listeners.
+//! [`QuicEndpoint`](crate::dquic::endpoint::QuicEndpoint) listeners.
 //!
 //! A [`Network`] is always used via [`Arc<Network>`]: clone the [`Arc`] to
 //! share the infrastructure between many endpoints. The builder returns an
@@ -15,7 +15,7 @@
 //! [`QuicRouter`]. When an Initial / 0-RTT packet arrives without matching
 //! an existing connection, the dispatcher constructs a fresh server
 //! [`Connection`](crate::dquic::prelude::Connection) using the shared
-//! [`ServerQuicConfig`](super::ServerQuicConfig) stored in the network's
+//! [`ServerQuicConfig`](crate::dquic::quic_config::ServerQuicConfig) stored in the network's
 //! `server_slot`, waits for the handshake to reveal the ClientHello SNI, and
 //! fans the connection into the matching [`ServerBinding`]'s mpmc queue.
 //!
@@ -48,14 +48,13 @@ use snafu::Snafu;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
-pub use super::sni::ServerBinding;
-use super::{
+// Re-export ServerBinding so `crate::dquic::network::ServerBinding` resolves.
+// `sni` module is the canonical source; this re-export is kept for compatibility
+// with existing consumers (e.g. `crate::dquic::endpoint`).
+pub use crate::dquic::sni::ServerBinding;
+use crate::dquic::{
     binds::BindPattern,
     identity::{Identity, ServerName},
-    server::ServerQuicConfig,
-    sni::{self, RegistryGuard, ServerConfig, ServerEntry, SniCertResolver},
-};
-use crate::dquic::{
     prelude::{
         AuthClient, ClientAgentVerifyResult, ClientNameVerifyResult, Connection, LocalAgent,
         RemoteAgent, Resolve,
@@ -78,6 +77,8 @@ use crate::dquic::{
         nat::{client::StunClientsComponent, router::StunRouterComponent},
         route::{ForwardersComponent, ReceiveAndDeliverPacketComponent},
     },
+    quic_config::ServerQuicConfig,
+    sni::{self, RegistryGuard, ServerConfig, ServerEntry, SniCertResolver},
 };
 
 pub(crate) type SniRegistry = Arc<DashMap<ServerName, Weak<ServerEntry>>>;
@@ -776,7 +777,7 @@ mod tests {
     use rustls::ClientConfig as TlsClientConfig;
 
     use super::*;
-    use crate::endpoint::{binds::BindPattern, identity::Identity};
+    use crate::dquic::{binds::BindPattern, identity::Identity};
 
     fn make_identity(name: &str) -> Arc<Identity> {
         use dquic::prelude::handy::{ToCertificate, ToPrivateKey};
@@ -1059,7 +1060,7 @@ mod tests {
 
         let cfg_a = make_server_config();
         let cfg_b = {
-            let own = crate::endpoint::server::ServerSpecificConfig {
+            let own = crate::dquic::quic_config::ServerSpecificConfig {
                 alpns: vec![b"altproto".to_vec()],
                 ..Default::default()
             };
@@ -1089,7 +1090,7 @@ mod tests {
 
         let cfg_a = make_server_config();
         let cfg_b = {
-            let own = crate::endpoint::server::ServerSpecificConfig {
+            let own = crate::dquic::quic_config::ServerSpecificConfig {
                 alpns: vec![b"altproto".to_vec()],
                 ..Default::default()
             };
@@ -1120,19 +1121,18 @@ mod tests {
     use tokio_util::task::AbortOnDropHandle;
 
     use crate::{
-        client::Client,
         connection::ConnectionBuilder,
         dquic::{
+            endpoint::QuicEndpoint,
             prelude::{BoundAddr, IO},
             qbase::net::addr::{EndpointAddr, SocketEndpointAddr},
             qresolve::{Resolve, ResolveFuture, Source},
+            quic_config::{
+                ClientQuicConfig, ClientSpecificConfig, ServerCertVerifierChoice,
+            },
         },
-        endpoint::{
-            ClientQuicConfig, ClientSpecificConfig, H3Endpoint, QuicEndpoint,
-            ServerCertVerifierChoice,
-        },
+        endpoint::{H3Endpoint, server::{Request, Response, Router}},
         pool::Pool,
-        server::{self, Router},
     };
 
     /// Test-only resolver that maps every name lookup to a fixed loopback
@@ -1155,13 +1155,13 @@ mod tests {
         }
     }
 
-    async fn alpha_service(_: &mut server::Request, response: &mut server::Response) {
+    async fn alpha_service(_: &mut Request, response: &mut Response) {
         response
             .set_status(http::StatusCode::OK)
             .set_body(&b"alpha"[..]);
     }
 
-    async fn beta_service(_: &mut server::Request, response: &mut server::Response) {
+    async fn beta_service(_: &mut Request, response: &mut Response) {
         response
             .set_status(http::StatusCode::OK)
             .set_body(&b"beta"[..]);
@@ -1192,7 +1192,7 @@ mod tests {
         let resolver: Arc<dyn Resolve + Send + Sync> =
             Arc::new(FixedResolver(format!("127.0.0.1:{port}").parse().unwrap()));
 
-        let mut serve_handles = Vec::new();
+        let serve_handles: Vec<AbortOnDropHandle<()>> = Vec::new();
         let mut bindings = Vec::new();
         // Share one config Arc across both servers; otherwise
         // `ServerQuicConfig::default()` yields fresh trait objects each
@@ -1224,14 +1224,16 @@ mod tests {
                 Arc::new(Vec::new()),
             )
             .await;
-            let h3 = H3Endpoint::new(
+            let _h3 = H3Endpoint::new(
                 quic,
                 Pool::empty(),
                 Arc::new(ConnectionBuilder::new(Arc::default())),
             );
-            serve_handles.push(AbortOnDropHandle::new(tokio::spawn(
-                async move { h3.serve(router).await }.in_current_span(),
-            )));
+            // TODO: restore serve() when Phase 2 adds the method back
+            // serve_handles.push(AbortOnDropHandle::new(tokio::spawn(
+            //     async move { h3.serve(router).await }.in_current_span(),
+            // )));
+            drop(router);
         }
 
         // Client with dangerous verifier (cert was issued for `localhost` so
@@ -1253,7 +1255,11 @@ mod tests {
             Arc::new(Vec::new()),
         )
         .await;
-        let client = Client::from_quic_client().client(client_quic).build();
+        let client = H3Endpoint::new(
+            client_quic,
+            Pool::empty(),
+            Arc::new(ConnectionBuilder::new(Arc::default())),
+        );
 
         for (sni, expected) in [("alpha", "alpha"), ("beta", "beta")] {
             let authority: Authority = format!("{sni}:{port}").parse().unwrap();

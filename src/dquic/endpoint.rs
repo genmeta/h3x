@@ -8,13 +8,10 @@ use rustls::ClientConfig;
 use snafu::{ResultExt, Snafu};
 use tracing::Instrument;
 
-use super::{
-    binds::BindPattern,
-    client::{ClientQuicConfig, ServerCertVerifierChoice},
-    identity::Identity,
-    network::{BindHandle, BindServerError, Network, ServerBinding},
-    server::ServerQuicConfig,
-};
+use crate::dquic::binds::BindPattern;
+use crate::dquic::identity::Identity;
+use crate::dquic::network::{BindHandle, BindServerError, Network, ServerBinding};
+use crate::dquic::quic_config::{ClientQuicConfig, ServerCertVerifierChoice, ServerQuicConfig};
 use crate::{
     dquic::{
         prelude::{Connection, Resolve},
@@ -499,7 +496,7 @@ mod tests {
     use super::*;
     use crate::{
         dquic::prelude::handy::SystemResolver,
-        endpoint::identity::{Identity, ServerName},
+        dquic::identity::{Identity, ServerName},
     };
 
     #[tokio::test]

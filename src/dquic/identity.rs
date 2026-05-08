@@ -97,10 +97,10 @@ impl Identity {
     /// many TLS sessions.
     pub(crate) fn build_certified_key(
         &self,
-    ) -> Result<Arc<rustls::sign::CertifiedKey>, crate::endpoint::network::BindServerError> {
+    ) -> Result<Arc<rustls::sign::CertifiedKey>, crate::dquic::network::BindServerError> {
         use snafu::ResultExt;
 
-        use crate::endpoint::network::bind_server_error::LoadKeySnafu;
+        use crate::dquic::network::bind_server_error::LoadKeySnafu;
 
         let provider = rustls::ServerConfig::builder().crypto_provider().clone();
         let key = provider
