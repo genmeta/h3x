@@ -1,7 +1,6 @@
 #![doc = include_str!("../README.md")]
 
 pub mod buflist;
-pub mod client;
 pub mod codec;
 pub mod connection;
 pub mod dhttp;
@@ -11,7 +10,6 @@ pub mod pool;
 pub mod protocol;
 pub mod qpack;
 pub mod quic;
-pub mod server;
 pub mod stream_id;
 mod util;
 pub mod varint;
@@ -19,7 +17,6 @@ pub mod varint;
 #[cfg(feature = "dquic")]
 pub mod dquic;
 
-#[cfg(feature = "endpoint")]
 pub mod endpoint;
 
 #[cfg(feature = "hyper")]

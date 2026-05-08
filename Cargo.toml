@@ -72,18 +72,8 @@ peg = { version = "0.8", optional = true }
 
 
 [features]
-default = ["dquic", "hyper", "endpoint"]
-dquic = ["dep:dquic"]
-endpoint = [
-    "dquic",
-    "dep:arc-swap",
-    "dep:async-channel",
-    "dep:derive_more",
-    "dep:either",
-    "dep:globset",
-    "dep:peg",
-    "tokio/time",
-]
+default = ["dquic", "hyper"]
+dquic = ["dep:dquic", "dep:arc-swap", "dep:async-channel", "dep:derive_more", "dep:either", "dep:globset", "dep:peg", "tokio/time"]
 hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
 rpc = ["dep:remoc", "serde", "bytes/serde"]
