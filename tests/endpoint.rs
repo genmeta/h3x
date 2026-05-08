@@ -22,7 +22,7 @@ use h3x::{
     client::Client,
     connection::ConnectionBuilder,
     endpoint::{
-        ClientSpecificConfig, ClientQuicConfig, H3Endpoint, Identity, Network, QuicEndpoint,
+        ClientQuicConfig, ClientSpecificConfig, H3Endpoint, Identity, Network, QuicEndpoint,
         ServerCertVerifierChoice, ServerName, ServerQuicConfig,
     },
     pool::Pool,
@@ -78,7 +78,8 @@ fn serve_and_connect_hello() {
             ClientQuicConfig::default(),
             ServerQuicConfig::default(),
             Arc::new(Vec::new()),
-        );
+        )
+        .await;
         let _bind = network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
         let bind_iface = network.interfaces().into_iter().next().unwrap();
         let bound_addr = bind_iface
@@ -117,7 +118,8 @@ fn serve_and_connect_hello() {
             client_quic_config,
             ServerQuicConfig::default(),
             Arc::new(Vec::new()),
-        );
+        )
+        .await;
         let client = Client::from_quic_client().client(client_quic).build();
 
         let authority: Authority = format!("localhost:{port}")
@@ -153,7 +155,8 @@ fn endpoint_get_convenience() {
             ClientQuicConfig::default(),
             ServerQuicConfig::default(),
             Arc::new(Vec::new()),
-        );
+        )
+        .await;
         let _bind = network.bind("inet://127.0.0.1:0".parse().unwrap()).await;
         let bind_iface = network.interfaces().into_iter().next().unwrap();
         let bound_addr = bind_iface
@@ -192,7 +195,8 @@ fn endpoint_get_convenience() {
             client_quic_config,
             ServerQuicConfig::default(),
             Arc::new(Vec::new()),
-        );
+        )
+        .await;
         let client_endpoint = H3Endpoint::new(
             client_quic,
             Pool::empty(),
@@ -217,7 +221,6 @@ fn endpoint_get_convenience() {
     });
 }
 
-
 // ---------------------------------------------------------------------------
 // Introspection accessors (Phase 0)
 // ---------------------------------------------------------------------------
@@ -239,5 +242,3 @@ fn bind_iface_returns_usable_interface() {
         }
     });
 }
-
-

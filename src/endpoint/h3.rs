@@ -140,7 +140,11 @@ impl H3Endpoint {
         uri: http::Uri,
         body: impl Buf,
     ) -> Result<(client::Request, client::Response), client::RequestError<ConnectError>> {
-        self.as_client().new_request().with_body(body).post(uri).await
+        self.as_client()
+            .new_request()
+            .with_body(body)
+            .post(uri)
+            .await
     }
 
     /// Send a PUT request to `uri` with `body`.
@@ -149,7 +153,11 @@ impl H3Endpoint {
         uri: http::Uri,
         body: impl Buf,
     ) -> Result<(client::Request, client::Response), client::RequestError<ConnectError>> {
-        self.as_client().new_request().with_body(body).put(uri).await
+        self.as_client()
+            .new_request()
+            .with_body(body)
+            .put(uri)
+            .await
     }
 
     /// Send a DELETE request to `uri`.
@@ -166,7 +174,11 @@ impl H3Endpoint {
         uri: http::Uri,
         body: impl Buf,
     ) -> Result<(client::Request, client::Response), client::RequestError<ConnectError>> {
-        self.as_client().new_request().with_body(body).patch(uri).await
+        self.as_client()
+            .new_request()
+            .with_body(body)
+            .patch(uri)
+            .await
     }
 
     /// Send a HEAD request to `uri`.
@@ -230,6 +242,10 @@ impl crate::quic::Listen for H3Endpoint {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use http::uri::Authority;
+
     use super::*;
     use crate::{
         connection::ConnectionBuilder,
@@ -238,8 +254,6 @@ mod tests {
         pool::Pool,
         quic::Connect,
     };
-    use http::uri::Authority;
-    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_h3endpoint_construction() {
@@ -248,7 +262,15 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let quic = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server, Arc::new(Vec::new()));
+        let quic = QuicEndpoint::new(
+            network.clone(),
+            None,
+            resolver.clone(),
+            client,
+            server,
+            Arc::new(Vec::new()),
+        )
+        .await;
         let pool = Pool::empty();
         let builder = Arc::new(ConnectionBuilder::new(Arc::default()));
 
@@ -265,7 +287,15 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let quic = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server, Arc::new(Vec::new()));
+        let quic = QuicEndpoint::new(
+            network.clone(),
+            None,
+            resolver.clone(),
+            client,
+            server,
+            Arc::new(Vec::new()),
+        )
+        .await;
         let pool = Pool::empty();
         let builder = Arc::new(ConnectionBuilder::new(Arc::default()));
 
@@ -287,7 +317,15 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let quic = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server, Arc::new(Vec::new()));
+        let quic = QuicEndpoint::new(
+            network.clone(),
+            None,
+            resolver.clone(),
+            client,
+            server,
+            Arc::new(Vec::new()),
+        )
+        .await;
         let pool = Pool::empty();
         let builder = Arc::new(ConnectionBuilder::new(Arc::default()));
 
@@ -313,21 +351,28 @@ mod tests {
             client,
             server,
             Arc::new(Vec::new()),
-        );
+        )
+        .await;
 
         // `connect()` should fail because no identity means no client auth cert
         // (the error depends on resolver behavior, so we just verify it doesn't panic)
         let authority: Authority = "example.com".parse().unwrap();
         let connect_result = quic.connect(&authority).await;
-        assert!(connect_result.is_err(), "connect without identity should fail");
+        assert!(
+            connect_result.is_err(),
+            "connect without identity should fail"
+        );
 
         // `accept()` should fail because no identity means no server binding
         let accept_result = quic.accept().await;
-        assert!(accept_result.is_err(), "accept without identity should fail");
+        assert!(
+            accept_result.is_err(),
+            "accept without identity should fail"
+        );
     }
 
-    #[test]
-    fn test_h3endpoint_as_client_has_correct_type() {
+    #[tokio::test]
+    async fn test_h3endpoint_as_client_has_correct_type() {
         // Tests that `as_client()` returns `Client<&QuicEndpoint>` (primarily a
         // compilation check — ensures the method signature typechecks as expected).
 
@@ -336,7 +381,15 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let quic = QuicEndpoint::new(network.clone(), None, resolver.clone(), client, server, Arc::new(Vec::new()));
+        let quic = QuicEndpoint::new(
+            network.clone(),
+            None,
+            resolver.clone(),
+            client,
+            server,
+            Arc::new(Vec::new()),
+        )
+        .await;
         let pool = Pool::empty();
         let builder = Arc::new(ConnectionBuilder::new(Arc::default()));
 

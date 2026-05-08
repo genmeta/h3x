@@ -24,9 +24,11 @@ pub mod server;
 mod sni;
 
 pub use binds::{BindHost, BindPattern};
-pub use client::{ClientSpecificConfig, ClientQuicConfig, CommonQuicConfig, ServerCertVerifierChoice};
+pub use client::{
+    ClientQuicConfig, ClientSpecificConfig, CommonQuicConfig, ServerCertVerifierChoice,
+};
 pub use h3::H3Endpoint;
 pub use identity::{Identity, ServerName};
 pub use network::{BindServerError, Network, ServerBinding};
 pub use quic::{AcceptError, ConnectError, EndpointError, QuicEndpoint};
-pub use server::{ServerSpecificConfig, ServerQuicConfig};
+pub use server::{ServerQuicConfig, ServerSpecificConfig};

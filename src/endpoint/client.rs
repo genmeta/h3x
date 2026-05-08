@@ -196,10 +196,10 @@ impl ClientQuicConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::dquic::prelude::handy::ToCertificate;
-    use crate::util::tls::DangerousServerCertVerifier;
     use rustls::RootCertStore;
+
+    use super::*;
+    use crate::{dquic::prelude::handy::ToCertificate, util::tls::DangerousServerCertVerifier};
 
     const CA_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/ca.cert");
 
@@ -296,8 +296,9 @@ mod tests {
     #[test]
     fn test_verifier_choice_dangerous_ne_webpki() {
         let store = root_store_with_ca();
-        let webpki =
-            WebPkiServerVerifier::builder(Arc::new(store)).build().unwrap();
+        let webpki = WebPkiServerVerifier::builder(Arc::new(store))
+            .build()
+            .unwrap();
         assert_ne!(
             ServerCertVerifierChoice::Dangerous,
             ServerCertVerifierChoice::WebPki(webpki)
@@ -307,8 +308,9 @@ mod tests {
     #[test]
     fn test_verifier_choice_webpki_same_arc_eq() {
         let store = root_store_with_ca();
-        let webpki =
-            WebPkiServerVerifier::builder(Arc::new(store)).build().unwrap();
+        let webpki = WebPkiServerVerifier::builder(Arc::new(store))
+            .build()
+            .unwrap();
         // webpki is already Arc<WebPkiServerVerifier>
         // Two clones of the same Arc should be equal (ptr_eq)
         let a = ServerCertVerifierChoice::WebPki(webpki.clone());
@@ -320,10 +322,12 @@ mod tests {
     fn test_verifier_choice_webpki_different_arc_ne() {
         let store1 = root_store_with_ca();
         let store2 = root_store_with_ca();
-        let webpki1 =
-            WebPkiServerVerifier::builder(Arc::new(store1)).build().unwrap();
-        let webpki2 =
-            WebPkiServerVerifier::builder(Arc::new(store2)).build().unwrap();
+        let webpki1 = WebPkiServerVerifier::builder(Arc::new(store1))
+            .build()
+            .unwrap();
+        let webpki2 = WebPkiServerVerifier::builder(Arc::new(store2))
+            .build()
+            .unwrap();
         assert_ne!(
             ServerCertVerifierChoice::WebPki(webpki1),
             ServerCertVerifierChoice::WebPki(webpki2)
@@ -332,8 +336,7 @@ mod tests {
 
     #[test]
     fn test_verifier_choice_custom_same_arc_eq() {
-        let verifier: Arc<dyn ServerCertVerifier> =
-            Arc::new(DangerousServerCertVerifier);
+        let verifier: Arc<dyn ServerCertVerifier> = Arc::new(DangerousServerCertVerifier);
         let a = ServerCertVerifierChoice::Custom(verifier.clone());
         let b = ServerCertVerifierChoice::Custom(verifier.clone());
         assert_eq!(a, b);
@@ -355,10 +358,7 @@ mod tests {
         // Both Arcs are accessible
         assert_eq!(cfg.common.defer_idle_timeout, Duration::ZERO);
         assert!(
-            matches!(
-                &cfg.own.verifier,
-                ServerCertVerifierChoice::Dangerous
-            ),
+            matches!(&cfg.own.verifier, ServerCertVerifierChoice::Dangerous),
             "default own verifier should be Dangerous"
         );
     }

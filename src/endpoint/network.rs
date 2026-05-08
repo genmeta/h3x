@@ -67,7 +67,7 @@ use crate::dquic::{
         BindInterface,
         bind_uri::BindUri,
         component::{
-            location::Locations,
+            location::{Locations, LocationsComponent},
             route::{QuicRouter, Way},
         },
         device::Devices,
@@ -168,7 +168,9 @@ impl Network {
         stun_server: Option<Arc<str>>,
         #[builder(default = Devices::global())] devices: &'static Devices,
         #[builder(default = Arc::new(DEFAULT_IO_FACTORY))] io_factory: Arc<dyn ProductIO + 'static>,
-        #[builder(default = Arc::new(InterfaceManager::new()))] iface_manager: Arc<InterfaceManager>,
+        #[builder(default = Arc::new(InterfaceManager::new()))] iface_manager: Arc<
+            InterfaceManager,
+        >,
         #[builder(default = Arc::new(QuicRouter::new()))] quic_router: Arc<QuicRouter>,
         #[builder(default = Arc::new(Locations::new()))] locations: Arc<Locations>,
     ) -> Arc<Self> {
@@ -413,6 +415,9 @@ impl Network {
                     .quic_router(self.quic_router.clone())
                     .init()
             });
+            iface.insert_component_with(|iface| {
+                LocationsComponent::new(iface.downgrade(), self.locations.clone())
+            });
             new_ifaces.push((uri.identity_key(), uri.clone(), iface));
         }
 
@@ -640,6 +645,9 @@ impl Network {
                                 .quic_router(self.quic_router.clone())
                                 .init()
                         });
+                        iface.insert_component_with(|iface| {
+                            LocationsComponent::new(iface.downgrade(), self.locations.clone())
+                        });
                         e.insert((uri.clone(), iface));
                     }
                 }
@@ -688,9 +696,7 @@ impl AuthClient for InterfaceAuthClient {
             {
                 ClientNameVerifyResult::Accept
             }
-            Some(_) => {
-                ClientNameVerifyResult::SilentRefuse("bind pattern mismatch".to_owned())
-            }
+            Some(_) => ClientNameVerifyResult::SilentRefuse("bind pattern mismatch".to_owned()),
         }
     }
 
@@ -737,12 +743,13 @@ impl Drop for BindHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::endpoint::binds::BindPattern;
-    use crate::endpoint::identity::Identity;
+    use std::str::FromStr;
+
     use dquic::prelude::handy::NoopTokenRegistry;
     use rustls::ClientConfig as TlsClientConfig;
-    use std::str::FromStr;
+
+    use super::*;
+    use crate::endpoint::{binds::BindPattern, identity::Identity};
 
     fn make_identity(name: &str) -> Arc<Identity> {
         use dquic::prelude::handy::{ToCertificate, ToPrivateKey};
@@ -1004,11 +1011,9 @@ mod tests {
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();
 
-        let builder = Connection::new_client(
-            "test.example.com".to_string(),
-            Arc::new(NoopTokenRegistry),
-        )
-        .with_tls_config(tls);
+        let builder =
+            Connection::new_client("test.example.com".to_string(), Arc::new(NoopTokenRegistry))
+                .with_tls_config(tls);
 
         let _foundation = network.configure_connection(builder);
     }
@@ -1083,19 +1088,25 @@ mod tests {
 
     // ── Helpers for two_sni_share_network_and_port ──
 
-    use crate::client::Client;
-    use crate::connection::ConnectionBuilder;
-    use crate::pool::Pool;
-    use crate::server::{self, Router};
-    use crate::endpoint::{
-        ClientQuicConfig, ClientSpecificConfig, H3Endpoint, QuicEndpoint, ServerCertVerifierChoice,
-    };
-    use crate::dquic::prelude::{BoundAddr, IO};
-    use crate::dquic::qbase::net::addr::{EndpointAddr, SocketEndpointAddr};
-    use crate::dquic::qresolve::{Resolve, ResolveFuture, Source};
     use futures::{FutureExt, StreamExt, stream};
     use http::uri::Authority;
     use tokio_util::task::AbortOnDropHandle;
+
+    use crate::{
+        client::Client,
+        connection::ConnectionBuilder,
+        dquic::{
+            prelude::{BoundAddr, IO},
+            qbase::net::addr::{EndpointAddr, SocketEndpointAddr},
+            qresolve::{Resolve, ResolveFuture, Source},
+        },
+        endpoint::{
+            ClientQuicConfig, ClientSpecificConfig, H3Endpoint, QuicEndpoint,
+            ServerCertVerifierChoice,
+        },
+        pool::Pool,
+        server::{self, Router},
+    };
 
     /// Test-only resolver that maps every name lookup to a fixed loopback
     /// endpoint. Lets tests dial arbitrary SNIs (e.g. `alpha`, `beta`) without
@@ -1184,7 +1195,8 @@ mod tests {
                 ClientQuicConfig::default(),
                 shared_server_config.clone(),
                 Arc::new(Vec::new()),
-            );
+            )
+            .await;
             let h3 = H3Endpoint::new(
                 quic,
                 Pool::empty(),
@@ -1212,7 +1224,8 @@ mod tests {
             client_quic_config,
             ServerQuicConfig::default(),
             Arc::new(Vec::new()),
-        );
+        )
+        .await;
         let client = Client::from_quic_client().client(client_quic).build();
 
         for (sni, expected) in [("alpha", "alpha"), ("beta", "beta")] {

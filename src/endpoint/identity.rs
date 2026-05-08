@@ -8,7 +8,12 @@
 //! The endpoint's identity selects between client-auth / server-auth paths
 //! and keys the SNI registry for inbound connection multiplexing.
 
-use std::{borrow::Borrow, hash::{Hash, Hasher}, ops::Deref, sync::Arc};
+use std::{
+    borrow::Borrow,
+    hash::{Hash, Hasher},
+    ops::Deref,
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -180,7 +185,10 @@ mod tests {
         use std::borrow::Borrow;
         let name = ServerName::new("BorrowTest");
         let s: &str = Borrow::<str>::borrow(&name);
-        assert_eq!(s, "borrowtest", "Borrow<str> should return the lowercased name");
+        assert_eq!(
+            s, "borrowtest",
+            "Borrow<str> should return the lowercased name"
+        );
     }
 
     #[test]
@@ -195,8 +203,10 @@ mod tests {
 
     #[test]
     fn test_server_name_hash_consistency() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        use std::{
+            collections::hash_map::DefaultHasher,
+            hash::{Hash, Hasher},
+        };
 
         let hash = |n: &ServerName| {
             let mut h = DefaultHasher::new();
@@ -206,7 +216,11 @@ mod tests {
 
         let a = ServerName::new("MiXeDcAsE");
         let b = ServerName::new("mixedcase");
-        assert_eq!(hash(&a), hash(&b), "same logical name should hash to same value regardless of input case");
+        assert_eq!(
+            hash(&a),
+            hash(&b),
+            "same logical name should hash to same value regardless of input case"
+        );
     }
 
     #[test]
@@ -228,8 +242,14 @@ mod tests {
         let id2 = id1.clone();
 
         assert_eq!(id1.name, id2.name, "cloned name should equal original");
-        assert!(Arc::ptr_eq(&id1.certs, &id2.certs), "certs should be Arc-shared after clone");
-        assert!(Arc::ptr_eq(&id1.key, &id2.key), "key should be Arc-shared after clone");
+        assert!(
+            Arc::ptr_eq(&id1.certs, &id2.certs),
+            "certs should be Arc-shared after clone"
+        );
+        assert!(
+            Arc::ptr_eq(&id1.key, &id2.key),
+            "key should be Arc-shared after clone"
+        );
     }
 
     #[test]

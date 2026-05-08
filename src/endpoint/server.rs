@@ -156,9 +156,9 @@ impl ServerQuicConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::Duration};
+
     use super::*;
-    use std::sync::Arc;
-    use std::time::Duration;
 
     #[test]
     fn test_server_specific_config_default() {
@@ -190,14 +190,8 @@ mod tests {
     fn test_server_specific_config_clone() {
         let a = ServerSpecificConfig::default();
         let b = a.clone();
-        assert!(Arc::ptr_eq(
-            &a.token_provider,
-            &b.token_provider,
-        ));
-        assert!(Arc::ptr_eq(
-            &a.client_auther,
-            &b.client_auther,
-        ));
+        assert!(Arc::ptr_eq(&a.token_provider, &b.token_provider,));
+        assert!(Arc::ptr_eq(&a.client_auther, &b.client_auther,));
         assert!(Arc::ptr_eq(
             &a.client_cert_verifier,
             &b.client_cert_verifier,
@@ -225,10 +219,7 @@ mod tests {
         a.common_mut().defer_idle_timeout = Duration::from_secs(42);
 
         assert_eq!(b.common.defer_idle_timeout, Duration::ZERO);
-        assert_eq!(
-            a.common.defer_idle_timeout,
-            Duration::from_secs(42),
-        );
+        assert_eq!(a.common.defer_idle_timeout, Duration::from_secs(42),);
         assert!(!Arc::ptr_eq(&a.common, &b.common));
     }
 

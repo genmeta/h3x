@@ -3,7 +3,7 @@
 use std::{any::Any, str::FromStr, sync::Arc};
 
 use arc_swap::ArcSwapOption;
-use futures::StreamExt;
+use futures::{StreamExt, future::join_all};
 use rustls::ClientConfig;
 use snafu::{ResultExt, Snafu};
 use tracing::Instrument;
@@ -12,7 +12,7 @@ use super::{
     binds::BindPattern,
     client::{ClientQuicConfig, ServerCertVerifierChoice},
     identity::Identity,
-    network::{BindServerError, Network, ServerBinding},
+    network::{BindHandle, BindServerError, Network, ServerBinding},
     server::ServerQuicConfig,
 };
 use crate::{
@@ -108,6 +108,7 @@ pub struct QuicEndpoint {
     pub(crate) server: Arc<ServerQuicConfig>,
     /// Bind patterns for interface filtering (shared by client and server roles).
     pub(crate) bind_patterns: Arc<Vec<BindPattern>>,
+    _binds: Arc<Vec<BindHandle>>,
     client_tls_cache: ArcSwapOption<ClientConfig>,
     server_binding_cache: ArcSwapOption<ServerBinding>,
 }
@@ -121,6 +122,7 @@ impl Clone for QuicEndpoint {
             client: self.client.clone(),
             server: self.server.clone(),
             bind_patterns: self.bind_patterns.clone(),
+            _binds: self._binds.clone(),
             client_tls_cache: ArcSwapOption::empty(),
             server_binding_cache: ArcSwapOption::empty(),
         }
@@ -129,8 +131,7 @@ impl Clone for QuicEndpoint {
 
 impl QuicEndpoint {
     /// Construct a new endpoint.
-    #[must_use]
-    pub fn new(
+    pub async fn new(
         network: Arc<Network>,
         identity: Option<Arc<Identity>>,
         resolver: Arc<dyn Resolve + Send + Sync>,
@@ -143,6 +144,8 @@ impl QuicEndpoint {
         } else {
             bind_patterns
         };
+        let binds: Vec<BindHandle> =
+            join_all(bind_patterns.iter().map(|p| network.bind(p.clone()))).await;
         Self {
             network,
             identity: ArcSwapOption::from(identity),
@@ -150,6 +153,7 @@ impl QuicEndpoint {
             client: Arc::new(client),
             server: Arc::new(server),
             bind_patterns,
+            _binds: Arc::new(binds),
             client_tls_cache: ArcSwapOption::empty(),
             server_binding_cache: ArcSwapOption::empty(),
         }
@@ -300,7 +304,8 @@ impl quic::Connect for QuicEndpoint {
         let server_str = full.rsplit_once('@').map_or(full, |(_, host)| host);
 
         let tls = self.client_tls().context(TlsSnafu)?;
-        let mut server_eps = self.resolver.lookup(server_str).await.context(DnsSnafu)?;
+        let mut server_eps =
+            futures::StreamExt::fuse(self.resolver.lookup(server_str).await.context(DnsSnafu)?);
         let connection = self
             .build_client_connection(server_str, tls)
             .context(TlsSnafu)?;
@@ -317,13 +322,10 @@ impl quic::Connect for QuicEndpoint {
                 _ = connection.terminated() => {
                     return Err(ConnectError::NoReachableEndpoint);
                 }
-                next = server_eps.next() => {
-                    if let Some((source, server_ep)) = next {
-                        let _ = connection.add_peer_endpoint(server_ep, source);
-                    }
+                Some((source, server_ep)) = server_eps.next() => {
+                    let _ = connection.add_peer_endpoint(server_ep, source);
                 }
-                event = observer.recv() => {
-                    let Some((bind_uri, event)) = event else { break };
+                Some((bind_uri, event)) = observer.recv() => {
                     if !bind_patterns.iter().any(|p| p.matches(&bind_uri)) {
                         continue;
                     }
@@ -341,13 +343,11 @@ impl quic::Connect for QuicEndpoint {
                                 tokio::select! {
                                     biased;
                                     _ = c.terminated() => break,
-                                    next = server_eps.next() => {
-                                        let Some((s, e)) = next else { break };
+                                    Some((s, e)) = server_eps.next() => {
                                         let Some(c) = weak.upgrade() else { break };
                                         let _ = c.add_peer_endpoint(e, s);
                                     }
-                                    event = observer.recv() => {
-                                        let Some((uri, e)) = event else { break };
+                                    Some((uri, e)) = observer.recv() => {
                                         let Some(c) = weak.upgrade() else { break };
                                         if bind_patterns.iter().any(|p| p.matches(&uri)) {
                                             Self::handle_local_addr_event(&c, uri, e);
@@ -364,8 +364,6 @@ impl quic::Connect for QuicEndpoint {
                 _ => {} // no paths yet — continue loop
             }
         }
-
-        Err(ConnectError::NoReachableEndpoint)
     }
 }
 
@@ -459,25 +457,22 @@ impl QuicEndpoint {
     fn handle_local_addr_event(
         conn: &Connection,
         bind_uri: BindUri,
-        event: crate::dquic::qinterface::component::location::AddressEvent<
-            dyn Any + Send + Sync,
-        >,
+        event: crate::dquic::qinterface::component::location::AddressEvent<dyn Any + Send + Sync>,
     ) {
         use crate::dquic::{
-            qbase::net::addr::BleEndpontAddr,
-            qinterface::component::location::AddressEvent,
+            qbase::net::addr::BleEndpontAddr, qinterface::component::location::AddressEvent,
         };
 
         let event = match event.downcast::<std::io::Result<BoundAddr>>() {
             Ok(AddressEvent::Upsert(data)) => {
-                let Ok(bound_addr) = data.as_ref() else { return };
+                let Ok(bound_addr) = data.as_ref() else {
+                    return;
+                };
                 let endpoint_addr = match *bound_addr {
                     BoundAddr::Internet(addr) => {
                         EndpointAddr::Socket(SocketEndpointAddr::direct(addr))
                     }
-                    BoundAddr::Bluetooth(addr) => {
-                        EndpointAddr::Ble(BleEndpontAddr::new(addr))
-                    }
+                    BoundAddr::Bluetooth(addr) => EndpointAddr::Ble(BleEndpontAddr::new(addr)),
                     _ => return,
                 };
                 if let Err(e) = conn.add_local_endpoint(bind_uri, endpoint_addr) {
@@ -499,12 +494,13 @@ impl QuicEndpoint {
 
 #[cfg(test)]
 mod tests {
+    use rustls::pki_types::PrivateKeyDer;
+
     use super::*;
     use crate::{
         dquic::prelude::handy::SystemResolver,
         endpoint::identity::{Identity, ServerName},
     };
-    use rustls::pki_types::PrivateKeyDer;
 
     #[tokio::test]
     async fn test_quic_endpoint_construction() {
@@ -520,7 +516,8 @@ mod tests {
             client,
             server,
             Arc::new(Vec::new()),
-        );
+        )
+        .await;
 
         assert!(Arc::ptr_eq(&endpoint.network, &network));
         assert!(endpoint.identity.load_full().is_none());
@@ -540,7 +537,8 @@ mod tests {
             client,
             server,
             Arc::new(Vec::new()),
-        );
+        )
+        .await;
 
         let result = endpoint.accept().await;
         assert!(matches!(result, Err(AcceptError::ServerUnavailable)));
@@ -571,7 +569,8 @@ mod tests {
             client,
             server,
             Arc::new(Vec::new()),
-        );
+        )
+        .await;
 
         // The dual-task model is set up internally in connect()
         // We verify it doesn't panic or error during setup
@@ -587,7 +586,7 @@ mod tests {
         }
     }
 
-    fn make_endpoint() -> QuicEndpoint {
+    async fn make_endpoint() -> QuicEndpoint {
         QuicEndpoint::new(
             Network::builder().build(),
             None,
@@ -596,11 +595,12 @@ mod tests {
             ServerQuicConfig::default(),
             Arc::new(Vec::new()),
         )
+        .await
     }
 
     #[tokio::test]
     async fn test_modify_identity_set() {
-        let endpoint = make_endpoint();
+        let endpoint = make_endpoint().await;
         assert!(endpoint.identity.load_full().is_none());
 
         let identity = make_identity("test.example.com");
@@ -613,7 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_modify_identity_clear() {
-        let endpoint = make_endpoint();
+        let endpoint = make_endpoint().await;
         let identity = make_identity("clear.me");
         endpoint.modify_identity(|id| *id = Some(Arc::new(identity)));
         assert!(endpoint.identity.load_full().is_some());
@@ -625,7 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_modify_identity_mutate() {
-        let endpoint = make_endpoint();
+        let endpoint = make_endpoint().await;
         let identity = make_identity("mutate.me");
         endpoint.modify_identity(|id| *id = Some(Arc::new(identity)));
         assert!(endpoint.identity.load_full().unwrap().ocsp.is_none());
@@ -642,7 +642,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_ocsp_with_identity() {
-        let endpoint = make_endpoint();
+        let endpoint = make_endpoint().await;
         let identity = make_identity("ocsp.example.com");
         endpoint.modify_identity(|id| *id = Some(Arc::new(identity)));
 
@@ -654,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_ocsp_without_identity_no_panic() {
-        let endpoint = make_endpoint();
+        let endpoint = make_endpoint().await;
         assert!(endpoint.identity.load_full().is_none());
 
         endpoint.update_ocsp(Some(vec![9, 8, 7]));
@@ -663,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_modify_client_config() {
-        let mut endpoint = make_endpoint();
+        let mut endpoint = make_endpoint().await;
         assert!(!endpoint.client.common.enable_0rtt);
 
         endpoint.modify_client_config(|c| c.common_mut().enable_0rtt = true);
@@ -673,7 +673,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_modify_server_config() {
-        let mut endpoint = make_endpoint();
+        let mut endpoint = make_endpoint().await;
         assert!(!endpoint.server.own.anti_port_scan);
 
         endpoint.modify_server_config(|c| c.own_mut().anti_port_scan = true);
@@ -683,7 +683,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_clone_preserves_identity() {
-        let endpoint = make_endpoint();
+        let endpoint = make_endpoint().await;
         let identity = make_identity("clone-preserve.test");
         endpoint.modify_identity(|id| *id = Some(Arc::new(identity)));
 
@@ -698,7 +698,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_clone_creates_independent_caches() {
-        let endpoint = make_endpoint();
+        let endpoint = make_endpoint().await;
         let identity = make_identity("independent.test");
         endpoint.modify_identity(|id| *id = Some(Arc::new(identity)));
 
@@ -730,7 +730,9 @@ mod tests {
         }
 
         let _ = |e: BuildClientTlsError| match e {
-            BuildClientTlsError::Version { .. } | BuildClientTlsError::ClientAuth { .. } | BuildClientTlsError::SetParameter { .. } => {}
+            BuildClientTlsError::Version { .. }
+            | BuildClientTlsError::ClientAuth { .. }
+            | BuildClientTlsError::SetParameter { .. } => {}
         };
     }
 
