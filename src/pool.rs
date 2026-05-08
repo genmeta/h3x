@@ -1,8 +1,4 @@
-use std::{
-    error::Error,
-    pin::pin,
-    sync::{Arc, LazyLock},
-};
+use std::{error::Error, pin::pin, sync::Arc};
 
 use dashmap::DashMap;
 use futures::{StreamExt, never::Never};
@@ -24,8 +20,8 @@ pub struct ReuseableConnection<C: quic::Connection> {
     task: AsyncMutex<Option<AbortOnDropHandle<()>>>,
 }
 
-type ConnectionIdentifier<C> = (Authority, Arc<ConnectionBuilder<C>>);
-type ReuseableConnections<C> = DashMap<ConnectionIdentifier<C>, Arc<ReuseableConnection<C>>>;
+type ConnectionIdentifier = Authority;
+type ReuseableConnections<C> = DashMap<ConnectionIdentifier, Arc<ReuseableConnection<C>>>;
 
 impl<C: quic::Connection> ReuseableConnection<C> {
     pub fn pending() -> Self {
@@ -95,18 +91,6 @@ impl<C: quic::Connection> Pool<C> {
             connections: Default::default(),
         }
     }
-
-    pub fn global() -> &'static Self {
-        use std::any::{Any, TypeId};
-
-        static POOLS: LazyLock<DashMap<TypeId, &'static (dyn Any + Send + Sync)>> =
-            LazyLock::new(DashMap::new);
-        POOLS
-            .entry(TypeId::of::<C>())
-            .or_insert_with(|| Box::leak(Box::new(Pool::<C>::empty())))
-            .downcast_ref::<Pool<C>>()
-            .expect("type id collision")
-    }
 }
 
 impl<C: quic::Connection> Default for Pool<C> {
@@ -144,7 +128,7 @@ pub enum InsertError {
 }
 
 impl<C: quic::Connection> Pool<C> {
-    fn spawn_try_release(self, identify: ConnectionIdentifier<C>) {
+    fn spawn_try_release(self, identify: Authority) {
         tokio::spawn(
             async move {
                 (self.connections.as_ref()).remove_if(&identify, |_, connection| {
@@ -171,7 +155,7 @@ impl<C: quic::Connection> Pool<C> {
     {
         let reuseable_connection = self
             .connections
-            .entry((server.clone(), builder.clone()))
+            .entry(server.clone())
             .or_insert_with(|| Arc::new(ReuseableConnection::pending()))
             .clone();
         // break borrow of dashmap::Entry to avoid deadlock
@@ -210,10 +194,9 @@ impl<C: quic::Connection> Pool<C> {
                         let connection = connection.clone();
                         let pool = self.clone();
                         let server = server.clone();
-                        let builder = builder.clone();
                         async move {
                             connection.closed().await;
-                            pool.spawn_try_release((server, builder));
+                            pool.spawn_try_release(server);
                         }
                         .in_current_span()
                     }));
@@ -235,29 +218,25 @@ impl<C: quic::Connection> Pool<C> {
 
         match &result {
             Ok(..) => tracing::trace!("connection ready to use"),
-            Err(..) => self.clone().spawn_try_release((server, builder.clone())),
+            Err(..) => self.clone().spawn_try_release(server),
         }
 
         result
     }
 
-    pub async fn try_insert(
-        &self,
-        connection: Arc<Connection<C>>,
-        builder: Arc<ConnectionBuilder<C>>,
-    ) -> Result<(), InsertError> {
+    pub async fn try_insert(&self, connection: Arc<Connection<C>>) -> Result<(), InsertError> {
         let remote_agent = connection
             .remote_agent()
             .await?
             .context(insert_error::MissingIdentitySnafu)?;
 
-        let client = remote_agent
+        let client: Authority = remote_agent
             .name()
             .parse()
             .ok()
             .context(insert_error::InvalidIdentitySnafu)?;
 
-        let identity = (client, builder.clone());
+        let identity = client;
         let reuseable_connection = self
             .connections
             .entry(identity.clone())
@@ -284,70 +263,17 @@ impl<C: quic::Connection> Pool<C> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    #[cfg(feature = "dquic")]
-    use std::{
-        collections::hash_map::DefaultHasher,
-        hash::{Hash, Hasher},
-    };
 
+    use http::uri::Authority;
     use tokio_util::task::AbortOnDropHandle;
 
-    use super::ReuseableConnection;
-    #[cfg(feature = "dquic")]
-    use crate::{
-        connection::ConnectionBuilder,
-        dhttp::settings::{MaxFieldSectionSize, Settings},
-    };
+    use super::{Pool, ReuseableConnection};
     use crate::{
         connection::{Connection, ConnectionState},
         dhttp::{goaway::Goaway, protocol::DHttpProtocol},
         quic,
         varint::VarInt,
     };
-
-    #[cfg(feature = "dquic")]
-    fn hash_of<T: Hash>(val: &T) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        val.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    #[cfg(feature = "dquic")]
-    type C = dquic::prelude::Connection;
-
-    #[cfg(feature = "dquic")]
-    #[test]
-    fn pool_key_different_builders_different_entries() {
-        let s1 = Arc::new(Settings::default());
-        let mut s2_inner = Settings::default();
-        s2_inner.set(MaxFieldSectionSize::setting(VarInt::from_u32(9999)));
-        let s2 = Arc::new(s2_inner);
-
-        let builder_a = ConnectionBuilder::<C>::new(s1);
-        let builder_b = ConnectionBuilder::<C>::new(s2);
-
-        let key_a = hash_of(&builder_a);
-        let key_b = hash_of(&builder_b);
-        assert_ne!(
-            key_a, key_b,
-            "different protocol stacks must produce different pool keys"
-        );
-    }
-
-    #[cfg(feature = "dquic")]
-    #[test]
-    fn pool_key_same_builder_same_entry() {
-        let s = Arc::new(Settings::default());
-        let builder_a = ConnectionBuilder::<C>::new(s.clone());
-        let builder_b = ConnectionBuilder::<C>::new(s);
-
-        let key_a = hash_of(&builder_a);
-        let key_b = hash_of(&builder_b);
-        assert_eq!(
-            key_a, key_b,
-            "identical protocol stacks must produce the same pool key"
-        );
-    }
 
     fn test_connection_error(reason: &str) -> quic::ConnectionError {
         quic::ConnectionError::Transport {
@@ -369,6 +295,43 @@ mod tests {
         let reusable = Arc::new(ReuseableConnection::pending());
         reusable.insert(Arc::new(connection), abort_handle()).await;
         reusable
+    }
+
+    #[test]
+    fn test_pool_key_is_authority_only() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let auth: Authority = "example.com:443".parse().unwrap();
+
+        pool.connections
+            .entry(auth.clone())
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+        pool.connections
+            .entry(auth)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+        assert_eq!(
+            pool.connections.len(),
+            1,
+            "builder must not affect pool key; only authority matters",
+        );
+    }
+
+    #[test]
+    fn test_pool_key_different_authority_different_entry() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let auth1: Authority = "example.com:443".parse().unwrap();
+        let auth2: Authority = "other.com:443".parse().unwrap();
+
+        pool.connections
+            .entry(auth1)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+        pool.connections
+            .entry(auth2)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+        assert_eq!(
+            pool.connections.len(),
+            2,
+            "different authorities must produce different pool entries",
+        );
     }
 
     #[tokio::test]
