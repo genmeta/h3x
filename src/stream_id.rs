@@ -11,7 +11,7 @@ use crate::{
 ///
 /// A lightweight newtype around [`VarInt`] representing the QUIC stream ID of the
 /// current request/response pair. Injected as a field in
-/// [`Request`](crate::server::Request) and [`Response`](crate::server::Response)
+/// [`Request`](crate::endpoint::server::Request) and [`Response`](crate::endpoint::server::Response)
 /// (native path) or as a request extension (hyper path).
 ///
 /// `StreamId` serves as the per-stream key when deriving protocol-specific session

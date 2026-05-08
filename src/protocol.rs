@@ -21,8 +21,8 @@
 //!
 //! # Handler access pattern
 //!
-//! Handlers receive protocol access through [`crate::server::Request::protocols()`]
-//! and [`crate::server::Response::protocols()`], which return `&Arc<Protocols>`.
+//! Handlers receive protocol access through [`crate::endpoint::server::Request::protocols()`]
+//! and [`crate::endpoint::server::Response::protocols()`], which return `&Arc<Protocols>`.
 //! Combined with [`crate::stream_id::StreamId`], a handler can derive
 //! per-request/session handles from the connection-scoped protocol state:
 //!

@@ -12,6 +12,7 @@ use snafu::{Report, ResultExt, Snafu};
 use tracing::Instrument;
 
 use crate::{
+    endpoint::server::{Request, Response, UnresolvedRequest},
     message::stream::{
         MessageStreamError, ReadStream,
         hyper::{
@@ -19,14 +20,13 @@ use crate::{
             write::SendMessageError,
         },
     },
-    server::{Request, Response, UnresolvedRequest},
 };
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct TowerService<S>(pub S);
 
-impl<S, RespBody> crate::server::Service for TowerService<S>
+impl<S, RespBody> crate::endpoint::server::Service for TowerService<S>
 where
     S: tower_service::Service<
             http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,
@@ -244,7 +244,7 @@ where
 #[repr(transparent)]
 pub struct HyperService<S>(pub S);
 
-impl<S, RespBody> crate::server::Service for HyperService<S>
+impl<S, RespBody> crate::endpoint::server::Service for HyperService<S>
 where
     S: hyper::service::Service<
             http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,

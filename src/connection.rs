@@ -457,7 +457,7 @@ impl<C: quic::Connection> ConnectionState<C> {
     /// Erase the concrete QUIC connection type, yielding a state that is
     /// usable as `ConnectionState<dyn quic::DynConnection>`.
     ///
-    /// Used on the server path so that [`UnresolvedRequest`](crate::server::UnresolvedRequest)
+    /// Used on the server path so that [`UnresolvedRequest`](crate::endpoint::server::UnresolvedRequest)
     /// can carry a single type-erased connection handle regardless of the
     /// underlying QUIC implementation.
     #[must_use]
