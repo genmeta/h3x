@@ -5,8 +5,10 @@ use std::{
     time::Duration,
 };
 
-use dquic::prelude::handy::{SystemResolver, ToCertificate, ToPrivateKey};
-use dquic::prelude::{BoundAddr, IO};
+use dquic::prelude::{
+    BoundAddr, IO,
+    handy::{SystemResolver, ToCertificate, ToPrivateKey},
+};
 use http::uri::Authority;
 use tokio::time;
 use tracing::{Instrument, level_filters::LevelFilter};
@@ -103,10 +105,16 @@ pub async fn test_server_with(
         Arc::new(SystemResolver),
         h3x::dquic::ClientQuicConfig::default(),
         h3x::dquic::ServerQuicConfig::default(),
-        Arc::new(vec![std::str::FromStr::from_str("inet://127.0.0.1:0").expect("valid pattern")]),
+        Arc::new(vec![
+            std::str::FromStr::from_str("inet://127.0.0.1:0").expect("valid pattern"),
+        ]),
     )
     .await;
-    let bind_iface = network.interfaces().into_iter().next().expect("no bound interface");
+    let bind_iface = network
+        .interfaces()
+        .into_iter()
+        .next()
+        .expect("no bound interface");
     let port = match bind_iface.borrow().bound_addr().expect("no bound addr") {
         BoundAddr::Internet(s) => s.port(),
         _ => panic!("expected internet address"),

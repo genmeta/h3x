@@ -1127,11 +1127,12 @@ mod tests {
             prelude::{BoundAddr, IO},
             qbase::net::addr::{EndpointAddr, SocketEndpointAddr},
             qresolve::{Resolve, ResolveFuture, Source},
-            quic_config::{
-                ClientQuicConfig, ClientSpecificConfig, ServerCertVerifierChoice,
-            },
+            quic_config::{ClientQuicConfig, ClientSpecificConfig, ServerCertVerifierChoice},
         },
-        endpoint::{H3Endpoint, server::{Request, Response, Router}},
+        endpoint::{
+            H3Endpoint,
+            server::{Request, Response, Router},
+        },
         pool::Pool,
     };
 
@@ -1230,8 +1231,10 @@ mod tests {
                 Arc::new(ConnectionBuilder::new(Arc::default())),
             );
             serve_handles.push(AbortOnDropHandle::new(tokio::spawn(
-                async move { h3.serve(router).await.expect("serve failed"); }
-                    .in_current_span(),
+                async move {
+                    h3.serve(router).await.expect("serve failed");
+                }
+                .in_current_span(),
             )));
         }
 

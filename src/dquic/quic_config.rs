@@ -13,8 +13,10 @@
 
 use std::{sync::Arc, time::Duration};
 
-use rustls::client::{WebPkiServerVerifier, danger::ServerCertVerifier};
-use rustls::server::{NoClientAuth, danger::ClientCertVerifier};
+use rustls::{
+    client::{WebPkiServerVerifier, danger::ServerCertVerifier},
+    server::{NoClientAuth, danger::ClientCertVerifier},
+};
 
 use crate::dquic::{
     prelude::{

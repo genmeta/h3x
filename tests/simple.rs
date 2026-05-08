@@ -150,11 +150,13 @@ fn missing_server_name_closes_connection_with_no_error() {
     run(
         "missing_server_name_closes_connection_with_no_error",
         async move {
-        let network = test_network().await;
-        let (server, host) = test_server_with(network.clone()).await;
-        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { let _ = server.serve(Router::new()).await; }));
+            let network = test_network().await;
+            let (server, host) = test_server_with(network.clone()).await;
+            let _serve = AbortOnDropHandle::new(tokio::spawn(async move {
+                let _ = server.serve(Router::new()).await;
+            }));
 
-        let client = test_client_with(network).await;
+            let client = test_client_with(network).await;
             let error = client
                 .new_request()
                 .get(
