@@ -69,98 +69,42 @@ impl<T: quic::Connect> H3Endpoint<T> {
     }
 
     /// Convenience method to create a GET request for `uri`.
-    pub fn get<U>(&self, uri: U) -> crate::endpoint::client::PendingRequest<'_, T>
-    where
-        U: TryInto<Uri>,
-        U::Error: Into<Box<dyn Error + Send + Sync>>,
-    {
-        let uri = uri
-            .try_into()
-            .unwrap_or_else(|e| panic!("invalid uri: {}", e.into()));
+    pub fn get(&self, uri: Uri) -> crate::endpoint::client::PendingRequest<'_, T> {
         self.new_request().with_method(Method::GET).with_uri(uri)
     }
 
     /// Convenience method to create a POST request for `uri`.
-    pub fn post<U>(&self, uri: U) -> crate::endpoint::client::PendingRequest<'_, T>
-    where
-        U: TryInto<Uri>,
-        U::Error: Into<Box<dyn Error + Send + Sync>>,
-    {
-        let uri = uri
-            .try_into()
-            .unwrap_or_else(|e| panic!("invalid uri: {}", e.into()));
+    pub fn post(&self, uri: Uri) -> crate::endpoint::client::PendingRequest<'_, T> {
         self.new_request().with_method(Method::POST).with_uri(uri)
     }
 
     /// Convenience method to create a PUT request for `uri`.
-    pub fn put<U>(&self, uri: U) -> crate::endpoint::client::PendingRequest<'_, T>
-    where
-        U: TryInto<Uri>,
-        U::Error: Into<Box<dyn Error + Send + Sync>>,
-    {
-        let uri = uri
-            .try_into()
-            .unwrap_or_else(|e| panic!("invalid uri: {}", e.into()));
+    pub fn put(&self, uri: Uri) -> crate::endpoint::client::PendingRequest<'_, T> {
         self.new_request().with_method(Method::PUT).with_uri(uri)
     }
 
     /// Convenience method to create a DELETE request for `uri`.
-    pub fn delete<U>(&self, uri: U) -> crate::endpoint::client::PendingRequest<'_, T>
-    where
-        U: TryInto<Uri>,
-        U::Error: Into<Box<dyn Error + Send + Sync>>,
-    {
-        let uri = uri
-            .try_into()
-            .unwrap_or_else(|e| panic!("invalid uri: {}", e.into()));
+    pub fn delete(&self, uri: Uri) -> crate::endpoint::client::PendingRequest<'_, T> {
         self.new_request().with_method(Method::DELETE).with_uri(uri)
     }
 
     /// Convenience method to create a PATCH request for `uri`.
-    pub fn patch<U>(&self, uri: U) -> crate::endpoint::client::PendingRequest<'_, T>
-    where
-        U: TryInto<Uri>,
-        U::Error: Into<Box<dyn Error + Send + Sync>>,
-    {
-        let uri = uri
-            .try_into()
-            .unwrap_or_else(|e| panic!("invalid uri: {}", e.into()));
+    pub fn patch(&self, uri: Uri) -> crate::endpoint::client::PendingRequest<'_, T> {
         self.new_request().with_method(Method::PATCH).with_uri(uri)
     }
 
     /// Convenience method to create a HEAD request for `uri`.
-    pub fn head<U>(&self, uri: U) -> crate::endpoint::client::PendingRequest<'_, T>
-    where
-        U: TryInto<Uri>,
-        U::Error: Into<Box<dyn Error + Send + Sync>>,
-    {
-        let uri = uri
-            .try_into()
-            .unwrap_or_else(|e| panic!("invalid uri: {}", e.into()));
+    pub fn head(&self, uri: Uri) -> crate::endpoint::client::PendingRequest<'_, T> {
         self.new_request().with_method(Method::HEAD).with_uri(uri)
     }
 
     /// Convenience method to create an OPTIONS request for `uri`.
-    pub fn options<U>(&self, uri: U) -> crate::endpoint::client::PendingRequest<'_, T>
-    where
-        U: TryInto<Uri>,
-        U::Error: Into<Box<dyn Error + Send + Sync>>,
-    {
-        let uri = uri
-            .try_into()
-            .unwrap_or_else(|e| panic!("invalid uri: {}", e.into()));
+    pub fn options(&self, uri: Uri) -> crate::endpoint::client::PendingRequest<'_, T> {
         self.new_request().with_method(Method::OPTIONS).with_uri(uri)
     }
 
     /// Convenience method to create a TRACE request for `uri`.
-    pub fn trace<U>(&self, uri: U) -> crate::endpoint::client::PendingRequest<'_, T>
-    where
-        U: TryInto<Uri>,
-        U::Error: Into<Box<dyn Error + Send + Sync>>,
-    {
-        let uri = uri
-            .try_into()
-            .unwrap_or_else(|e| panic!("invalid uri: {}", e.into()));
+    pub fn trace(&self, uri: Uri) -> crate::endpoint::client::PendingRequest<'_, T> {
         self.new_request().with_method(Method::TRACE).with_uri(uri)
     }
 }
