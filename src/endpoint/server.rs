@@ -149,3 +149,152 @@ impl ServerQuicConfig {
         Ok(tls)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn test_server_specific_config_default() {
+        let cfg = ServerSpecificConfig::default();
+        assert!(cfg.alpns.is_empty());
+        assert_eq!(cfg.backlog, 128);
+        assert!(!cfg.anti_port_scan);
+        assert_eq!(Arc::strong_count(&cfg.token_provider), 1);
+        assert_eq!(Arc::strong_count(&cfg.client_auther), 1);
+        assert_eq!(Arc::strong_count(&cfg.client_cert_verifier), 1);
+    }
+
+    #[test]
+    fn test_server_specific_config_partial_eq() {
+        let a = ServerSpecificConfig::default();
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_server_specific_config_partial_eq_different_alpns() {
+        let a = ServerSpecificConfig::default();
+        let mut b = a.clone();
+        b.alpns = vec![b"h3".to_vec()];
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_server_specific_config_clone() {
+        let a = ServerSpecificConfig::default();
+        let b = a.clone();
+        assert!(Arc::ptr_eq(
+            &a.token_provider,
+            &b.token_provider,
+        ));
+        assert!(Arc::ptr_eq(
+            &a.client_auther,
+            &b.client_auther,
+        ));
+        assert!(Arc::ptr_eq(
+            &a.client_cert_verifier,
+            &b.client_cert_verifier,
+        ));
+        assert_eq!(a.alpns, b.alpns);
+        assert_eq!(a.backlog, b.backlog);
+        assert_eq!(a.anti_port_scan, b.anti_port_scan);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_server_quic_config_default() {
+        let cfg = ServerQuicConfig::default();
+        assert_eq!(Arc::strong_count(&cfg.common), 1);
+        assert_eq!(Arc::strong_count(&cfg.own), 1);
+        let _defer: Duration = cfg.common.defer_idle_timeout;
+        let _backlog: usize = cfg.own.backlog;
+    }
+
+    #[test]
+    fn test_server_quic_config_common_mut_clones_unique() {
+        let mut a = ServerQuicConfig::default();
+        let b = a.clone();
+
+        a.common_mut().defer_idle_timeout = Duration::from_secs(42);
+
+        assert_eq!(b.common.defer_idle_timeout, Duration::ZERO);
+        assert_eq!(
+            a.common.defer_idle_timeout,
+            Duration::from_secs(42),
+        );
+        assert!(!Arc::ptr_eq(&a.common, &b.common));
+    }
+
+    #[test]
+    fn test_server_quic_config_own_mut_clones_unique() {
+        let mut a = ServerQuicConfig::default();
+        let b = a.clone();
+
+        a.own_mut().backlog = 256;
+
+        assert_eq!(b.own.backlog, 128);
+        assert_eq!(a.own.backlog, 256);
+        assert!(!Arc::ptr_eq(&a.own, &b.own));
+    }
+
+    #[test]
+    fn test_server_quic_config_clone_shares_arcs() {
+        let a = ServerQuicConfig::default();
+        let b = a.clone();
+        assert!(Arc::ptr_eq(&a.common, &b.common));
+        assert!(Arc::ptr_eq(&a.own, &b.own));
+    }
+
+    #[test]
+    fn test_server_quic_config_is_compatible_with_same_arc() {
+        let a = ServerQuicConfig::default();
+        let b = a.clone();
+        assert!(a.is_compatible_with(&b));
+    }
+
+    #[test]
+    fn test_server_quic_config_is_compatible_with_same_values() {
+        // After Arc::make_mut the outer Arcs differ, but the inner trait-object
+        // Arcs inside CommonQuicConfig retain pointer-equality because
+        // Arc<dyn Trait>::clone shares the allocation.  This means the
+        // slow-path PartialEq succeeds and the method still returns true.
+        let mut a = ServerQuicConfig::default();
+        let b = a.clone();
+        a.common_mut().defer_idle_timeout = Duration::from_secs(1);
+        a.common_mut().defer_idle_timeout = Duration::ZERO;
+
+        assert!(!Arc::ptr_eq(&a.common, &b.common));
+        assert!(a.is_compatible_with(&b));
+    }
+
+    #[test]
+    fn test_server_quic_config_is_compatible_with_different_alpns() {
+        let mut a = ServerQuicConfig::default();
+        let b = a.clone();
+        a.own_mut().alpns = vec![b"h3".to_vec()];
+        assert!(!a.is_compatible_with(&b));
+    }
+
+    #[test]
+    fn test_server_quic_config_is_compatible_with_different_backlog() {
+        let mut a = ServerQuicConfig::default();
+        let b = a.clone();
+        a.own_mut().backlog = 256;
+        assert!(!a.is_compatible_with(&b));
+    }
+
+    #[test]
+    fn test_server_quic_config_is_compatible_with_different_anti_port_scan() {
+        let mut a = ServerQuicConfig::default();
+        let b = a.clone();
+        a.own_mut().anti_port_scan = true;
+        assert!(!a.is_compatible_with(&b));
+    }
+}

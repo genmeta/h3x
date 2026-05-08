@@ -155,4 +155,104 @@ mod tests {
         assert!(id1.ocsp.is_none(), "id1.ocsp should remain None");
         assert!(id2.ocsp.is_some(), "id2.ocsp should be Some");
     }
+
+    #[test]
+    fn test_server_name_lowercase_normalization() {
+        let name = ServerName::new("LOCALHOST");
+        assert_eq!(name.as_str(), "localhost");
+    }
+
+    #[test]
+    fn test_server_name_display() {
+        let name = ServerName::new("MyHost");
+        assert_eq!(format!("{}", name), "myhost");
+    }
+
+    #[test]
+    fn test_server_name_deref() {
+        let name = ServerName::new("AbCdEfG");
+        let s: &str = &name;
+        assert_eq!(s, "abcdefg", "ServerName should deref to lowercased str");
+    }
+
+    #[test]
+    fn test_server_name_borrow() {
+        use std::borrow::Borrow;
+        let name = ServerName::new("BorrowTest");
+        let s: &str = Borrow::<str>::borrow(&name);
+        assert_eq!(s, "borrowtest", "Borrow<str> should return the lowercased name");
+    }
+
+    #[test]
+    fn test_server_name_eq() {
+        let a = ServerName::new("EXAMPLE");
+        let b = ServerName::new("example");
+        assert_eq!(a, b, "same name in different case should be equal");
+
+        let c = ServerName::new("other");
+        assert_ne!(a, c, "different names should not be equal");
+    }
+
+    #[test]
+    fn test_server_name_hash_consistency() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let hash = |n: &ServerName| {
+            let mut h = DefaultHasher::new();
+            n.hash(&mut h);
+            h.finish()
+        };
+
+        let a = ServerName::new("MiXeDcAsE");
+        let b = ServerName::new("mixedcase");
+        assert_eq!(hash(&a), hash(&b), "same logical name should hash to same value regardless of input case");
+    }
+
+    #[test]
+    fn test_server_name_clone() {
+        let name = ServerName::new("cloneable");
+        let cloned = name.clone();
+        assert_eq!(name, cloned, "cloned ServerName should equal the original");
+    }
+
+    #[test]
+    fn test_identity_clone_preserves_fields() {
+        let key = PrivateKeyDer::Pkcs8(b"dummy".to_vec().into());
+        let id1 = Identity {
+            name: ServerName::new("clone-test"),
+            certs: Arc::new(vec![]),
+            key: Arc::new(key),
+            ocsp: Arc::new(None),
+        };
+        let id2 = id1.clone();
+
+        assert_eq!(id1.name, id2.name, "cloned name should equal original");
+        assert!(Arc::ptr_eq(&id1.certs, &id2.certs), "certs should be Arc-shared after clone");
+        assert!(Arc::ptr_eq(&id1.key, &id2.key), "key should be Arc-shared after clone");
+    }
+
+    #[test]
+    fn test_identity_build_certified_key_with_valid_key() {
+        use dquic::prelude::handy::{ToCertificate, ToPrivateKey};
+
+        const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");
+        const SERVER_KEY: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
+
+        let certs = SERVER_CERT.to_certificate();
+        let key = SERVER_KEY.to_private_key();
+
+        let identity = Identity {
+            name: ServerName::new("localhost"),
+            certs: Arc::new(certs),
+            key: Arc::new(key),
+            ocsp: Arc::new(None),
+        };
+
+        let result = identity.build_certified_key();
+        assert!(
+            result.is_ok(),
+            "build_certified_key should succeed with valid key material"
+        );
+    }
 }
