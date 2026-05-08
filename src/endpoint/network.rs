@@ -168,10 +168,8 @@ impl Network {
         stun_server: Option<Arc<str>>,
         #[builder(default = Devices::global())] devices: &'static Devices,
         #[builder(default = Arc::new(DEFAULT_IO_FACTORY))] io_factory: Arc<dyn ProductIO + 'static>,
-        #[builder(default = InterfaceManager::global().clone())] iface_manager: Arc<
-            InterfaceManager,
-        >,
-        #[builder(default = QuicRouter::global().clone())] quic_router: Arc<QuicRouter>,
+        #[builder(default = Arc::new(InterfaceManager::new()))] iface_manager: Arc<InterfaceManager>,
+        #[builder(default = Arc::new(QuicRouter::new()))] quic_router: Arc<QuicRouter>,
         #[builder(default = Arc::new(Locations::new()))] locations: Arc<Locations>,
     ) -> Arc<Self> {
         let network = Arc::new(Network {

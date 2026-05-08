@@ -16,7 +16,6 @@ use dquic::{
         BoundAddr, IO,
         handy::{ToCertificate, ToPrivateKey},
     },
-    qinterface::{component::route::QuicRouter, manager::InterfaceManager},
     qresolve::SystemResolver,
 };
 use h3x::{
@@ -63,13 +62,7 @@ fn client_webpki_verifier() -> Arc<WebPkiServerVerifier> {
 }
 
 fn test_network() -> Arc<Network> {
-    // Each test uses its own `QuicRouter` AND `InterfaceManager` so that
-    // parallel tests do not share the global dispatcher or cross-route
-    // packets destined for other tests.
-    Network::builder()
-        .quic_router(Arc::new(QuicRouter::new()))
-        .iface_manager(Arc::new(InterfaceManager::new()))
-        .build()
+    Network::builder().build()
 }
 
 #[test]
