@@ -6,6 +6,7 @@ use std::{
 };
 
 use dquic::prelude::handy::{SystemResolver, ToCertificate, ToPrivateKey};
+use dquic::prelude::{BoundAddr, IO};
 use http::uri::Authority;
 use tokio::time;
 use tracing::{Instrument, level_filters::LevelFilter};
@@ -58,9 +59,17 @@ pub const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/se
 pub const SERVER_KEY: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
 pub const TEST_DATA: &[u8] = include_bytes!("mod.rs");
 
+pub async fn test_network() -> Arc<h3x::dquic::Network> {
+    h3x::dquic::Network::builder().build()
+}
+
 pub async fn test_client() -> h3x::dquic::H3Endpoint {
+    test_client_with(test_network().await).await
+}
+
+pub async fn test_client_with(network: Arc<h3x::dquic::Network>) -> h3x::dquic::H3Endpoint {
     let quic = h3x::dquic::QuicEndpoint::new(
-        h3x::dquic::Network::builder().build(),
+        network,
         None,
         Arc::new(SystemResolver),
         h3x::dquic::ClientQuicConfig::default(),
@@ -76,6 +85,12 @@ pub async fn test_client() -> h3x::dquic::H3Endpoint {
 }
 
 pub async fn test_server() -> (h3x::dquic::H3Endpoint, Authority) {
+    test_server_with(test_network().await).await
+}
+
+pub async fn test_server_with(
+    network: Arc<h3x::dquic::Network>,
+) -> (h3x::dquic::H3Endpoint, Authority) {
     let identity = Arc::new(h3x::dquic::Identity {
         name: h3x::dquic::ServerName::new("localhost"),
         certs: Arc::new(SERVER_CERT.to_certificate()),
@@ -83,20 +98,25 @@ pub async fn test_server() -> (h3x::dquic::H3Endpoint, Authority) {
         ocsp: Arc::new(None),
     });
     let quic = h3x::dquic::QuicEndpoint::new(
-        h3x::dquic::Network::builder().build(),
+        network.clone(),
         Some(identity),
         Arc::new(SystemResolver),
         h3x::dquic::ClientQuicConfig::default(),
         h3x::dquic::ServerQuicConfig::default(),
-        Arc::new(vec![]),
+        Arc::new(vec![std::str::FromStr::from_str("inet://127.0.0.1:0").expect("valid pattern")]),
     )
     .await;
+    let bind_iface = network.interfaces().into_iter().next().expect("no bound interface");
+    let port = match bind_iface.borrow().bound_addr().expect("no bound addr") {
+        BoundAddr::Internet(s) => s.port(),
+        _ => panic!("expected internet address"),
+    };
     let pool = h3x::pool::Pool::empty();
     let builder = Arc::new(h3x::connection::ConnectionBuilder::new(Arc::new(
         h3x::dhttp::settings::Settings::default(),
     )));
-    let authority =
-        Authority::from_maybe_shared(Vec::from("localhost:0")).expect("failed to parse authority");
+    let authority = Authority::from_maybe_shared(format!("localhost:{port}"))
+        .expect("failed to parse authority");
     (
         h3x::endpoint::H3Endpoint::new(quic, pool, builder),
         authority,

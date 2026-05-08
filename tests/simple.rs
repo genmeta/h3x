@@ -19,11 +19,12 @@ async fn hello_world_service(_: &mut server::Request, response: &mut server::Res
 fn hello_world() {
     run("hello_world", async move {
         let router = Router::new().get("/hello_world", hello_world_service);
-        let (server, host) = test_server().await;
+        let network = test_network().await;
+        let (server, host) = test_server_with(network.clone()).await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client().await;
+        let client = test_client_with(network).await;
         let (_, mut response) = client
             .new_request()
             .get(format!("https://{host}/hello_world").parse().unwrap())
@@ -60,11 +61,12 @@ async fn streaming_echo_service(request: &mut server::Request, response: &mut se
 fn streaming_echo() {
     run("streaming_echo", async move {
         let router = Router::new().post("/echo", streaming_echo_service);
-        let (server, host) = test_server().await;
+        let network = test_network().await;
+        let (server, host) = test_server_with(network.clone()).await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client().await;
+        let client = test_client_with(network).await;
         let (mut request, mut response) = client
             .new_request()
             .post(format!("https://{host}/echo").parse().unwrap())
@@ -93,11 +95,12 @@ fn fallback() {
         let router = Router::new()
             .get("/hello_world", hello_world_service)
             .post("/hello_world", hello_world_service);
-        let (server, host) = test_server().await;
+        let network = test_network().await;
+        let (server, host) = test_server_with(network.clone()).await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client().await;
+        let client = test_client_with(network).await;
         let (_, response) = client
             .new_request()
             .get(format!("https://{host}/non_exist").parse().unwrap())
@@ -120,11 +123,12 @@ async fn echo_service(request: &mut server::Request, response: &mut server::Resp
 fn auto_close() {
     run("auto_close", async move {
         let router = Router::new().post("/echo", echo_service);
-        let (server, host) = test_server().await;
+        let network = test_network().await;
+        let (server, host) = test_server_with(network.clone()).await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client().await;
+        let client = test_client_with(network).await;
         let (_, mut response) = client
             .new_request()
             .with_body(TEST_DATA)
@@ -146,10 +150,11 @@ fn missing_server_name_closes_connection_with_no_error() {
     run(
         "missing_server_name_closes_connection_with_no_error",
         async move {
-            let (server, host) = test_server().await;
-            let _serve = AbortOnDropHandle::new(tokio::spawn(async move { server.serve(Router::new()).await }));
+        let network = test_network().await;
+        let (server, host) = test_server_with(network.clone()).await;
+        let _serve = AbortOnDropHandle::new(tokio::spawn(async move { let _ = server.serve(Router::new()).await; }));
 
-            let client = test_client().await;
+        let client = test_client_with(network).await;
             let error = client
                 .new_request()
                 .get(
