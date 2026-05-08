@@ -500,7 +500,11 @@ impl QuicEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dquic::prelude::handy::SystemResolver;
+    use crate::{
+        dquic::prelude::handy::SystemResolver,
+        endpoint::identity::{Identity, ServerName},
+    };
+    use rustls::pki_types::PrivateKeyDer;
 
     #[tokio::test]
     async fn test_quic_endpoint_construction() {
@@ -572,5 +576,216 @@ mod tests {
         // The dual-task model is set up internally in connect()
         // We verify it doesn't panic or error during setup
         // (actual connection would require valid DNS resolution)
+    }
+
+    fn make_identity(name: &str) -> Identity {
+        Identity {
+            name: ServerName::new(name),
+            certs: Arc::new(vec![]),
+            key: Arc::new(PrivateKeyDer::Pkcs8(b"dummy-key-data".to_vec().into())),
+            ocsp: Arc::new(None),
+        }
+    }
+
+    fn make_endpoint() -> QuicEndpoint {
+        QuicEndpoint::new(
+            Network::builder().build(),
+            None,
+            Arc::new(SystemResolver),
+            ClientQuicConfig::default(),
+            ServerQuicConfig::default(),
+            Arc::new(Vec::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_modify_identity_set() {
+        let endpoint = make_endpoint();
+        assert!(endpoint.identity.load_full().is_none());
+
+        let identity = make_identity("test.example.com");
+        endpoint.modify_identity(|id| *id = Some(Arc::new(identity)));
+
+        let id = endpoint.identity.load_full();
+        assert!(id.is_some());
+        assert_eq!(id.unwrap().name.as_str(), "test.example.com");
+    }
+
+    #[tokio::test]
+    async fn test_modify_identity_clear() {
+        let endpoint = make_endpoint();
+        let identity = make_identity("clear.me");
+        endpoint.modify_identity(|id| *id = Some(Arc::new(identity)));
+        assert!(endpoint.identity.load_full().is_some());
+
+        endpoint.modify_identity(|id| *id = None);
+
+        assert!(endpoint.identity.load_full().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_modify_identity_mutate() {
+        let endpoint = make_endpoint();
+        let identity = make_identity("mutate.me");
+        endpoint.modify_identity(|id| *id = Some(Arc::new(identity)));
+        assert!(endpoint.identity.load_full().unwrap().ocsp.is_none());
+
+        endpoint.modify_identity(|id| {
+            if let Some(arc) = id.as_mut() {
+                Arc::make_mut(arc).ocsp = Arc::new(Some(vec![10, 20, 30]));
+            }
+        });
+
+        let id = endpoint.identity.load_full().unwrap();
+        assert_eq!(id.ocsp.as_deref(), Some(&[10u8, 20, 30][..]));
+    }
+
+    #[tokio::test]
+    async fn test_update_ocsp_with_identity() {
+        let endpoint = make_endpoint();
+        let identity = make_identity("ocsp.example.com");
+        endpoint.modify_identity(|id| *id = Some(Arc::new(identity)));
+
+        endpoint.update_ocsp(Some(vec![1, 2, 3]));
+
+        let id = endpoint.identity.load_full().unwrap();
+        assert_eq!(id.ocsp.as_deref(), Some(&[1u8, 2, 3][..]));
+    }
+
+    #[tokio::test]
+    async fn test_update_ocsp_without_identity_no_panic() {
+        let endpoint = make_endpoint();
+        assert!(endpoint.identity.load_full().is_none());
+
+        endpoint.update_ocsp(Some(vec![9, 8, 7]));
+        assert!(endpoint.identity.load_full().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_modify_client_config() {
+        let mut endpoint = make_endpoint();
+        assert!(!endpoint.client.common.enable_0rtt);
+
+        endpoint.modify_client_config(|c| c.common_mut().enable_0rtt = true);
+
+        assert!(endpoint.client.common.enable_0rtt);
+    }
+
+    #[tokio::test]
+    async fn test_modify_server_config() {
+        let mut endpoint = make_endpoint();
+        assert!(!endpoint.server.own.anti_port_scan);
+
+        endpoint.modify_server_config(|c| c.own_mut().anti_port_scan = true);
+
+        assert!(endpoint.server.own.anti_port_scan);
+    }
+
+    #[tokio::test]
+    async fn test_clone_preserves_identity() {
+        let endpoint = make_endpoint();
+        let identity = make_identity("clone-preserve.test");
+        endpoint.modify_identity(|id| *id = Some(Arc::new(identity)));
+
+        let cloned = endpoint.clone();
+        let orig_id = endpoint.identity.load_full().unwrap();
+        let cloned_id = cloned.identity.load_full().unwrap();
+
+        assert_eq!(orig_id.name.as_str(), cloned_id.name.as_str());
+        assert_eq!(orig_id.certs.len(), cloned_id.certs.len());
+        assert_eq!(orig_id.ocsp.as_deref(), cloned_id.ocsp.as_deref());
+    }
+
+    #[tokio::test]
+    async fn test_clone_creates_independent_caches() {
+        let endpoint = make_endpoint();
+        let identity = make_identity("independent.test");
+        endpoint.modify_identity(|id| *id = Some(Arc::new(identity)));
+
+        let cloned = endpoint.clone();
+
+        endpoint.modify_identity(|id| *id = None);
+        assert!(endpoint.identity.load_full().is_none());
+        assert!(cloned.identity.load_full().is_some());
+    }
+
+    #[test]
+    fn test_build_client_tls_error_variants() {
+        // Cannot construct BuildClientTlsError without real rustls errors;
+        // verify the enum definition compiles and variant names are correct.
+        let _ = |e: BuildClientTlsError| match e {
+            BuildClientTlsError::Version { .. } => "version",
+            BuildClientTlsError::ClientAuth { .. } => "client_auth",
+            BuildClientTlsError::SetParameter { .. } => "set_param",
+        };
+    }
+
+    #[test]
+    fn test_connect_error_variant_discrimination() {
+        let err = ConnectError::NoReachableEndpoint;
+        match &err {
+            ConnectError::Tls { .. } => panic!("expected NoReachableEndpoint, got Tls"),
+            ConnectError::Dns { .. } => panic!("expected NoReachableEndpoint, got Dns"),
+            ConnectError::NoReachableEndpoint => {}
+        }
+
+        let _ = |e: BuildClientTlsError| match e {
+            BuildClientTlsError::Version { .. } | BuildClientTlsError::ClientAuth { .. } | BuildClientTlsError::SetParameter { .. } => {}
+        };
+    }
+
+    #[test]
+    fn test_accept_error_variant_discrimination() {
+        let unavailable = AcceptError::ServerUnavailable;
+        match &unavailable {
+            AcceptError::ServerUnavailable => {}
+            AcceptError::BindServer { .. } => panic!("expected ServerUnavailable"),
+            AcceptError::Shutdown => panic!("expected ServerUnavailable"),
+        }
+
+        let shutdown = AcceptError::Shutdown;
+        match &shutdown {
+            AcceptError::Shutdown => {}
+            _ => panic!("expected Shutdown"),
+        }
+    }
+
+    #[test]
+    fn test_accept_error_server_unavailable_message() {
+        let err = AcceptError::ServerUnavailable;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot accept"),
+            "AcceptError::ServerUnavailable message should contain 'cannot accept', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_accept_error_shutdown_message() {
+        let err = AcceptError::Shutdown;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shut down"),
+            "AcceptError::Shutdown message should contain 'shut down', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_connect_error_display() {
+        let err = ConnectError::NoReachableEndpoint;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no reachable endpoint"),
+            "ConnectError::NoReachableEndpoint message should mention reachable endpoint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_endpoint_error_alias() {
+        let _: EndpointError = ConnectError::NoReachableEndpoint;
+        let _: ConnectError = EndpointError::NoReachableEndpoint;
+
+        fn _accept_endpoint_error(_: EndpointError) {}
+        fn _accept_connect_error(_: ConnectError) {}
     }
 }

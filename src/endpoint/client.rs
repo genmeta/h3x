@@ -105,9 +105,9 @@ pub enum ServerCertVerifierChoice {
 impl std::fmt::Debug for ServerCertVerifierChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Dangerous => f.write_str("Dangerous"),
-            Self::WebPki(_) => f.write_str("WebPki"),
-            Self::Custom(_) => f.write_str("Custom"),
+            Self::Dangerous => f.debug_tuple("Dangerous").finish(),
+            Self::WebPki(_) => f.debug_tuple("WebPki").finish(),
+            Self::Custom(_) => f.debug_tuple("Custom").finish(),
         }
     }
 }
@@ -187,5 +187,223 @@ impl ClientQuicConfig {
     /// Get a mutable reference to the client-only config, cloning if shared.
     pub fn own_mut(&mut self) -> &mut ClientSpecificConfig {
         Arc::make_mut(&mut self.own)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dquic::prelude::handy::ToCertificate;
+    use crate::util::tls::DangerousServerCertVerifier;
+    use rustls::RootCertStore;
+
+    const CA_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/ca.cert");
+
+    fn root_store_with_ca() -> RootCertStore {
+        let mut store = RootCertStore::empty();
+        store.add_parsable_certificates(CA_CERT.to_certificate());
+        store
+    }
+
+    // -- CommonQuicConfig ---------------------------------------------------
+
+    #[test]
+    fn test_common_quic_config_default() {
+        let cfg = CommonQuicConfig::default();
+        assert_eq!(cfg.defer_idle_timeout, Duration::ZERO);
+        assert!(!cfg.enable_0rtt);
+        assert!(!cfg.enable_sslkeylog);
+    }
+
+    #[test]
+    fn test_common_quic_config_partial_eq_same() {
+        let a = CommonQuicConfig::default();
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_common_quic_config_partial_eq_different_timeout() {
+        let a = CommonQuicConfig::default();
+        let mut b = a.clone();
+        b.defer_idle_timeout = Duration::from_secs(30);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_common_quic_config_clone() {
+        let a = CommonQuicConfig::default();
+        let b = a.clone();
+        // Clone shares the same Arcs
+        assert!(Arc::ptr_eq(
+            &a.stream_strategy_factory,
+            &b.stream_strategy_factory
+        ));
+        assert!(Arc::ptr_eq(&a.qlogger, &b.qlogger));
+        // Scalar values are copied
+        assert_eq!(a.defer_idle_timeout, b.defer_idle_timeout);
+        assert_eq!(a.enable_0rtt, b.enable_0rtt);
+        assert_eq!(a.enable_sslkeylog, b.enable_sslkeylog);
+    }
+
+    // -- ClientSpecificConfig -----------------------------------------------
+
+    #[test]
+    fn test_client_specific_config_default() {
+        let cfg = ClientSpecificConfig::default();
+        assert!(
+            matches!(cfg.verifier, ServerCertVerifierChoice::Dangerous),
+            "default verifier should be Dangerous"
+        );
+        assert!(cfg.alpns.is_empty(), "default alpns should be empty");
+    }
+
+    #[test]
+    fn test_client_specific_config_partial_eq() {
+        let a = ClientSpecificConfig::default();
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_client_specific_config_clone() {
+        let a = ClientSpecificConfig::default();
+        let b = a.clone();
+        // Clone shares the same Arc for token_sink
+        assert!(Arc::ptr_eq(&a.token_sink, &b.token_sink));
+        // Vec is cloned, not shared
+        assert_eq!(a.alpns, b.alpns);
+        // Parameters are value-equal
+        assert_eq!(a.parameters, b.parameters);
+        // Verifier is equal (same variant/ptr)
+        assert_eq!(a.verifier, b.verifier);
+    }
+
+    // -- ServerCertVerifierChoice -------------------------------------------
+
+    #[test]
+    fn test_verifier_choice_dangerous_eq() {
+        assert_eq!(
+            ServerCertVerifierChoice::Dangerous,
+            ServerCertVerifierChoice::Dangerous
+        );
+    }
+
+    #[test]
+    fn test_verifier_choice_dangerous_ne_webpki() {
+        let store = root_store_with_ca();
+        let webpki =
+            WebPkiServerVerifier::builder(Arc::new(store)).build().unwrap();
+        assert_ne!(
+            ServerCertVerifierChoice::Dangerous,
+            ServerCertVerifierChoice::WebPki(webpki)
+        );
+    }
+
+    #[test]
+    fn test_verifier_choice_webpki_same_arc_eq() {
+        let store = root_store_with_ca();
+        let webpki =
+            WebPkiServerVerifier::builder(Arc::new(store)).build().unwrap();
+        // webpki is already Arc<WebPkiServerVerifier>
+        // Two clones of the same Arc should be equal (ptr_eq)
+        let a = ServerCertVerifierChoice::WebPki(webpki.clone());
+        let b = ServerCertVerifierChoice::WebPki(webpki.clone());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_verifier_choice_webpki_different_arc_ne() {
+        let store1 = root_store_with_ca();
+        let store2 = root_store_with_ca();
+        let webpki1 =
+            WebPkiServerVerifier::builder(Arc::new(store1)).build().unwrap();
+        let webpki2 =
+            WebPkiServerVerifier::builder(Arc::new(store2)).build().unwrap();
+        assert_ne!(
+            ServerCertVerifierChoice::WebPki(webpki1),
+            ServerCertVerifierChoice::WebPki(webpki2)
+        );
+    }
+
+    #[test]
+    fn test_verifier_choice_custom_same_arc_eq() {
+        let verifier: Arc<dyn ServerCertVerifier> =
+            Arc::new(DangerousServerCertVerifier);
+        let a = ServerCertVerifierChoice::Custom(verifier.clone());
+        let b = ServerCertVerifierChoice::Custom(verifier.clone());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_verifier_choice_default_is_dangerous() {
+        assert_eq!(
+            ServerCertVerifierChoice::default(),
+            ServerCertVerifierChoice::Dangerous
+        );
+    }
+
+    // -- ClientQuicConfig ---------------------------------------------------
+
+    #[test]
+    fn test_client_quic_config_default() {
+        let cfg = ClientQuicConfig::default();
+        // Both Arcs are accessible
+        assert_eq!(cfg.common.defer_idle_timeout, Duration::ZERO);
+        assert!(
+            matches!(
+                &cfg.own.verifier,
+                ServerCertVerifierChoice::Dangerous
+            ),
+            "default own verifier should be Dangerous"
+        );
+    }
+
+    #[test]
+    fn test_client_quic_config_common_mut_clones_unique() {
+        let a = ClientQuicConfig::default();
+        let mut b = a.clone();
+        // Before mutation, both share the same Arc
+        assert!(Arc::ptr_eq(&a.common, &b.common));
+
+        // Mutate b via common_mut — should clone-on-write
+        b.common_mut().defer_idle_timeout = Duration::from_secs(99);
+
+        // Original is unchanged
+        assert_eq!(a.common.defer_idle_timeout, Duration::ZERO);
+        // b has the new value
+        assert_eq!(b.common.defer_idle_timeout, Duration::from_secs(99));
+        // Pointers are now different
+        assert_ne!(Arc::as_ptr(&a.common), Arc::as_ptr(&b.common));
+    }
+
+    #[test]
+    fn test_client_quic_config_own_mut_clones_unique() {
+        let a = ClientQuicConfig::default();
+        let mut b = a.clone();
+        // Before mutation, both share the same Arc
+        assert!(Arc::ptr_eq(&a.own, &b.own));
+
+        // Mutate b via own_mut — should clone-on-write
+        b.own_mut().alpns.push(b"h3".to_vec());
+
+        // Original is unchanged
+        assert!(a.own.alpns.is_empty());
+        // b has the new alpns
+        assert!(!b.own.alpns.is_empty());
+        // Pointers are now different
+        assert_ne!(Arc::as_ptr(&a.own), Arc::as_ptr(&b.own));
+    }
+
+    #[test]
+    fn test_client_quic_config_clone_shares_arcs() {
+        let a = ClientQuicConfig::default();
+        let b = a.clone();
+        assert!(Arc::ptr_eq(&a.common, &b.common));
+        assert!(Arc::ptr_eq(&a.own, &b.own));
     }
 }

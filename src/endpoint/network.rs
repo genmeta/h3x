@@ -225,7 +225,7 @@ impl Network {
     ///
     /// The caller continues to chain role-specific configuration after this
     /// call and finishes with `.with_cids(…)` / `.run()`.
-    pub fn configure_connection<F, T>(
+    pub(crate) fn configure_connection<F, T>(
         &self,
         builder: ConnectionFoundation<F, T>,
     ) -> ConnectionFoundation<F, T> {
@@ -237,17 +237,8 @@ impl Network {
     }
 
     /// Return a clone of the shared [`Locations`] component.
-    pub fn locations(&self) -> Arc<Locations> {
+    pub(crate) fn locations(&self) -> Arc<Locations> {
         self.locations.clone()
-    }
-
-    /// Bind a specific [`BindUri`] directly without going through the
-    /// pattern registry. Used internally by [`QuicEndpoint`] to acquire
-    /// ephemeral client-side interfaces.
-    pub(crate) async fn bind_iface(&self, bind_uri: BindUri) -> BindInterface {
-        self.iface_manager
-            .bind(bind_uri, self.io_factory.clone())
-            .await
     }
 
     /// Register a server identity on the network's SNI fan-out.
@@ -256,7 +247,7 @@ impl Network {
     /// must use a compatible [`ServerQuicConfig`] (or the exact same
     /// `Arc`).  Returns a [`ServerBinding`] handle that receives accepted
     /// connections for this SNI.
-    pub async fn bind_server(
+    pub(crate) async fn bind_server(
         self: &Arc<Self>,
         identity: Arc<Identity>,
         server_config: ServerQuicConfig,
@@ -494,7 +485,8 @@ impl Network {
     /// Only names with live [`ServerBinding`] handles are included; entries
     /// that have been dropped are automatically cleaned up by the [`RegistryGuard`]
     /// drop logic.
-    pub fn registered_sni_names(&self) -> Vec<ServerName> {
+    #[allow(dead_code, reason = "used in test module")]
+    pub(crate) fn registered_sni_names(&self) -> Vec<ServerName> {
         self.sni_registry
             .iter()
             .filter(|kv| kv.value().upgrade().is_some())
@@ -748,7 +740,11 @@ impl Drop for BindHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::endpoint::binds::BindPattern;
     use crate::endpoint::identity::Identity;
+    use dquic::prelude::handy::NoopTokenRegistry;
+    use rustls::ClientConfig as TlsClientConfig;
+    use std::str::FromStr;
 
     fn make_identity(name: &str) -> Arc<Identity> {
         use dquic::prelude::handy::{ToCertificate, ToPrivateKey};
@@ -831,5 +827,411 @@ mod tests {
             .expect("registry should have the entry");
 
         assert!(Arc::ptr_eq(&entry_a, &entry_b));
+    }
+
+    #[tokio::test]
+    async fn test_network_build() {
+        let network = Network::builder().build();
+        let _cloned = network.clone();
+    }
+
+    #[tokio::test]
+    async fn test_network_locations() {
+        let network = Network::builder().build();
+        let locations = network.locations();
+        let _cloned = locations.clone();
+    }
+
+    #[tokio::test]
+    async fn test_network_registered_sni_names_empty() {
+        let network = Network::builder().build();
+        assert!(
+            network.registered_sni_names().is_empty(),
+            "fresh network should have no registered sni names"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_network_registered_sni_names_after_bind() {
+        let network = Network::builder().build();
+        let identity = make_identity("alpha");
+        let config = make_server_config();
+
+        let _binding = network
+            .bind_server(identity, config, Arc::new(Vec::new()))
+            .await
+            .expect("bind should succeed");
+
+        let names = network.registered_sni_names();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].as_str(), "alpha");
+    }
+
+    #[tokio::test]
+    async fn test_network_registered_sni_names_after_drop() {
+        let network = Network::builder().build();
+        let identity = make_identity("alpha");
+        let config = make_server_config();
+
+        let binding = network
+            .bind_server(identity, config, Arc::new(Vec::new()))
+            .await
+            .expect("bind should succeed");
+
+        assert_eq!(network.registered_sni_names().len(), 1);
+        drop(binding);
+        assert!(
+            network.registered_sni_names().is_empty(),
+            "names should be empty after dropping the last binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_network_bind_server_with_identical_config_arc_reuse() {
+        let network = Network::builder().build();
+        let identity_a = make_identity("a");
+        let identity_b = make_identity("b");
+        let config = make_server_config();
+
+        let binding_a = network
+            .bind_server(identity_a.clone(), config.clone(), Arc::new(Vec::new()))
+            .await
+            .expect("first bind should succeed");
+
+        let binding_b = network
+            .bind_server(identity_b.clone(), config.clone(), Arc::new(Vec::new()))
+            .await
+            .expect("second bind with same config should succeed");
+
+        assert_eq!(binding_a.name().as_str(), "a");
+        assert_eq!(binding_b.name().as_str(), "b");
+
+        let names = network.registered_sni_names();
+        assert_eq!(names.len(), 2, "both names should be registered");
+        assert!(names.iter().any(|n| n.as_str() == "a"));
+        assert!(names.iter().any(|n| n.as_str() == "b"));
+    }
+
+    #[test]
+    fn test_bind_server_error_sni_in_use_display() {
+        let err = BindServerError::SniInUse {
+            name: ServerName::new("example.com"),
+        };
+        let display = format!("{err}");
+        assert!(
+            display.starts_with("sni "),
+            "Display should start with lowercase: {display}"
+        );
+        assert!(
+            display.contains("example.com"),
+            "Display should contain SNI name: {display}"
+        );
+        assert!(
+            !display.ends_with('.'),
+            "Display should not end with period"
+        );
+    }
+
+    #[test]
+    fn test_bind_server_error_server_config_conflict_display() {
+        let err = BindServerError::ServerConfigConflict;
+        let display = format!("{err}");
+        assert!(
+            display.contains("incompatible"),
+            "Display should contain 'incompatible': {display}"
+        );
+        assert!(
+            display.starts_with("network"),
+            "Display should start with lowercase: {display}"
+        );
+        assert!(
+            !display.ends_with('.'),
+            "Display should not end with period"
+        );
+    }
+
+    #[test]
+    fn test_bind_server_error_load_key_variant() {
+        fn assert_load_key_variant(e: rustls::Error) -> BindServerError {
+            BindServerError::LoadKey { source: e }
+        }
+        let _ = assert_load_key_variant;
+    }
+
+    #[test]
+    fn test_bind_server_error_version_variant() {
+        fn assert_version_variant(e: rustls::Error) -> BindServerError {
+            BindServerError::Version { source: e }
+        }
+        let _ = assert_version_variant;
+    }
+
+    #[tokio::test]
+    async fn test_server_binding_name() {
+        let network = Network::builder().build();
+        let identity = make_identity("example.com");
+        let config = make_server_config();
+
+        let binding = network
+            .bind_server(identity, config, Arc::new(Vec::new()))
+            .await
+            .expect("bind should succeed");
+
+        assert_eq!(binding.name().as_str(), "example.com");
+    }
+
+    #[tokio::test]
+    async fn test_server_binding_clone_name() {
+        let network = Network::builder().build();
+        let identity = make_identity("example.com");
+        let config = make_server_config();
+
+        let binding = network
+            .bind_server(identity, config, Arc::new(Vec::new()))
+            .await
+            .expect("bind should succeed");
+
+        let cloned = binding.clone();
+        assert_eq!(binding.name(), cloned.name());
+        assert_eq!(cloned.name().as_str(), "example.com");
+    }
+
+    #[tokio::test]
+    async fn test_network_configure_connection() {
+        let network = Network::builder().build();
+        let provider = TlsClientConfig::builder().crypto_provider().clone();
+        let tls = TlsClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3 should be supported")
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+
+        let builder = Connection::new_client(
+            "test.example.com".to_string(),
+            Arc::new(NoopTokenRegistry),
+        )
+        .with_tls_config(tls);
+
+        let _foundation = network.configure_connection(builder);
+    }
+
+    #[test]
+    fn test_bind_pattern_parsing() {
+        let pattern = BindPattern::from_str("127.0.0.1:8080").expect("valid pattern");
+        assert_eq!(pattern.port, Some(8080));
+    }
+
+    #[tokio::test]
+    async fn test_bind_server_config_conflict() {
+        let network = Network::builder().build();
+        let a = make_identity("alpha");
+        let b = make_identity("beta");
+
+        let cfg_a = make_server_config();
+        let cfg_b = {
+            let own = crate::endpoint::server::ServerSpecificConfig {
+                alpns: vec![b"altproto".to_vec()],
+                ..Default::default()
+            };
+            ServerQuicConfig {
+                common: Arc::default(),
+                own: Arc::new(own),
+            }
+        };
+
+        let _held = network
+            .bind_server(a, cfg_a, Arc::new(Vec::new()))
+            .await
+            .expect("first bind succeeds");
+        let err = network
+            .bind_server(b, cfg_b, Arc::new(Vec::new()))
+            .await
+            .expect_err("incompatible server config must fail");
+        assert!(
+            matches!(err, BindServerError::ServerConfigConflict),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bind_server_slot_auto_reset() {
+        let network = Network::builder().build();
+
+        let cfg_a = make_server_config();
+        let cfg_b = {
+            let own = crate::endpoint::server::ServerSpecificConfig {
+                alpns: vec![b"altproto".to_vec()],
+                ..Default::default()
+            };
+            ServerQuicConfig {
+                common: Arc::default(),
+                own: Arc::new(own),
+            }
+        };
+
+        {
+            let _first = network
+                .bind_server(make_identity("alpha"), cfg_a, Arc::new(Vec::new()))
+                .await
+                .expect("first bind succeeds");
+        }
+        // After the binding drops the slot should clear, allowing a new
+        // incompatible config to install.
+        let _second = network
+            .bind_server(make_identity("beta"), cfg_b, Arc::new(Vec::new()))
+            .await
+            .expect("slot should auto-reset after last binding dropped");
+    }
+
+    // ── Helpers for two_sni_share_network_and_port ──
+
+    use crate::client::Client;
+    use crate::connection::ConnectionBuilder;
+    use crate::pool::Pool;
+    use crate::server::{self, Router};
+    use crate::endpoint::{
+        ClientQuicConfig, ClientSpecificConfig, H3Endpoint, QuicEndpoint, ServerCertVerifierChoice,
+    };
+    use crate::dquic::prelude::{BoundAddr, IO};
+    use crate::dquic::qbase::net::addr::{EndpointAddr, SocketEndpointAddr};
+    use crate::dquic::qresolve::{Resolve, ResolveFuture, Source};
+    use futures::{FutureExt, StreamExt, stream};
+    use http::uri::Authority;
+    use tokio_util::task::AbortOnDropHandle;
+
+    /// Test-only resolver that maps every name lookup to a fixed loopback
+    /// endpoint. Lets tests dial arbitrary SNIs (e.g. `alpha`, `beta`) without
+    /// requiring `/etc/hosts` entries.
+    #[derive(Debug)]
+    struct FixedResolver(std::net::SocketAddr);
+
+    impl std::fmt::Display for FixedResolver {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FixedResolver({})", self.0)
+        }
+    }
+
+    impl Resolve for FixedResolver {
+        fn lookup<'l>(&'l self, _name: &'l str) -> ResolveFuture<'l> {
+            let ep = EndpointAddr::Socket(SocketEndpointAddr::direct(self.0));
+            let source = Source::System;
+            async move { Ok(stream::iter(std::iter::once((source, ep))).boxed()) }.boxed()
+        }
+    }
+
+    async fn alpha_service(_: &mut server::Request, response: &mut server::Response) {
+        response
+            .set_status(http::StatusCode::OK)
+            .set_body(&b"alpha"[..]);
+    }
+
+    async fn beta_service(_: &mut server::Request, response: &mut server::Response) {
+        response
+            .set_status(http::StatusCode::OK)
+            .set_body(&b"beta"[..]);
+    }
+
+    /// Two named servers (`alpha`, `beta`) share one [`Network`] and one listen
+    /// port. Both register distinct SNIs via the Network's SNI registry. A
+    /// client dialing `alpha:PORT` must receive the `alpha` handler's response,
+    /// and `beta:PORT` must receive `beta`'s. This exercises:
+    ///
+    /// * shared [`Network`] infrastructure (one bind port, one QuicRouter, one
+    ///   connectionless dispatcher);
+    /// * the Network's per-SNI mpmc fan-out (`sni_registry` + `bind_server`);
+    /// * rustls [`SniCertResolver`] picking the correct [`CertifiedKey`];
+    /// * [`QuicEndpoint::accept`] returning only connections destined for its
+    ///   own SNI.
+    #[tokio::test]
+    async fn test_two_sni_share_network_and_port() {
+        let network = Network::builder().build();
+        let _bind = network
+            .bind(BindPattern::from_str("inet://127.0.0.1:0").unwrap())
+            .await;
+        let bind_iface = network.interfaces().into_iter().next().unwrap();
+        let port = match bind_iface.borrow().bound_addr().unwrap() {
+            BoundAddr::Internet(s) => s.port(),
+            _ => unreachable!(),
+        };
+        let resolver: Arc<dyn Resolve + Send + Sync> =
+            Arc::new(FixedResolver(format!("127.0.0.1:{port}").parse().unwrap()));
+
+        let mut serve_handles = Vec::new();
+        let mut bindings = Vec::new();
+        // Share one config Arc across both servers; otherwise
+        // `ServerQuicConfig::default()` yields fresh trait objects each
+        // call and `server_config_compatible` rejects the second bind.
+        let shared_server_config = ServerQuicConfig::default();
+        let alpha_router = Router::new().get("/hello", alpha_service);
+        let beta_router = Router::new().get("/hello", beta_service);
+        for (name, router) in [("alpha", alpha_router), ("beta", beta_router)] {
+            let named = make_identity(name);
+            // Eagerly register so rustls' SniCertResolver sees both SNIs
+            // before the first ClientHello arrives (avoids a startup race
+            // where a client connects before the server task has polled
+            // its first `accept()`).
+            let binding = network
+                .bind_server(
+                    named.clone(),
+                    shared_server_config.clone(),
+                    Arc::new(Vec::new()),
+                )
+                .await
+                .expect("eager bind_server");
+            bindings.push(binding);
+            let quic = QuicEndpoint::new(
+                network.clone(),
+                Some(named),
+                resolver.clone(),
+                ClientQuicConfig::default(),
+                shared_server_config.clone(),
+                Arc::new(Vec::new()),
+            );
+            let h3 = H3Endpoint::new(
+                quic,
+                Pool::empty(),
+                Arc::new(ConnectionBuilder::new(Arc::default())),
+            );
+            serve_handles.push(AbortOnDropHandle::new(tokio::spawn(
+                async move { h3.serve(router).await }.in_current_span(),
+            )));
+        }
+
+        // Client with dangerous verifier (cert was issued for `localhost` so
+        // webpki would reject `alpha`/`beta` even though they share material).
+        let client_own = ClientSpecificConfig {
+            verifier: ServerCertVerifierChoice::Dangerous,
+            ..Default::default()
+        };
+        let client_quic_config = ClientQuicConfig {
+            common: Arc::default(),
+            own: Arc::new(client_own),
+        };
+        let client_quic = QuicEndpoint::new(
+            network.clone(),
+            None,
+            resolver.clone(),
+            client_quic_config,
+            ServerQuicConfig::default(),
+            Arc::new(Vec::new()),
+        );
+        let client = Client::from_quic_client().client(client_quic).build();
+
+        for (sni, expected) in [("alpha", "alpha"), ("beta", "beta")] {
+            let authority: Authority = format!("{sni}:{port}").parse().unwrap();
+            let uri: http::Uri = format!("https://{authority}/hello").parse().unwrap();
+            let (_req, mut resp) = client
+                .new_request()
+                .with_authority(authority)
+                .get(uri)
+                .await
+                .unwrap_or_else(|e| panic!("request for {sni} failed: {e:?}"));
+            assert_eq!(resp.status(), http::StatusCode::OK);
+            let body = resp.read_to_string().await.expect("read body");
+            assert_eq!(body, expected, "sni {sni} got wrong response");
+        }
+
+        drop(serve_handles);
+        drop(bindings);
     }
 }
