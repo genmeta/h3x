@@ -1225,7 +1225,7 @@ mod tests {
                 Arc::new(Vec::new()),
             )
             .await;
-            let h3 = H3Endpoint::new(
+            let mut h3 = H3Endpoint::new(
                 quic,
                 Pool::empty(),
                 Arc::new(ConnectionBuilder::new(Arc::default())),

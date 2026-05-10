@@ -1,4 +1,4 @@
-use std::{error::Error, sync::Arc};
+use std::{error::Error, marker::PhantomData, ops::Deref, sync::Arc};
 
 use bytes::{Buf, Bytes};
 use futures::{Sink, Stream, StreamExt, TryFutureExt};
@@ -24,13 +24,14 @@ use crate::{
 };
 
 #[derive(Clone)]
-pub struct PendingRequest<'e, E: quic::Connect> {
-    pub(super) endpoint: &'e H3Endpoint<E>,
+pub struct PendingRequest<E: quic::Connect, EP> {
+    pub(super) endpoint: EP,
     pub(super) request: Message,
     pub(super) auto_close: bool,
+    pub(super) _phantom: PhantomData<E>,
 }
 
-impl<'e, E: quic::Connect> std::fmt::Debug for PendingRequest<'e, E> {
+impl<E: quic::Connect, EP> std::fmt::Debug for PendingRequest<E, EP> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingRequest")
             .field("endpoint", &format_args!("H3Endpoint<...>"))
@@ -67,7 +68,7 @@ pub enum RequestError<E: Error + 'static> {
     MalformedResponse,
 }
 
-impl<E: quic::Connect> PendingRequest<'_, E> {
+impl<E: quic::Connect, EP> PendingRequest<E, EP> {
     pub fn with_method(mut self, method: Method) -> Self {
         self.request.header_mut().set_method(method);
         self
@@ -148,8 +149,9 @@ impl<E: quic::Connect> PendingRequest<'_, E> {
     }
 }
 
-impl<'e, E: quic::Connect + Sync> PendingRequest<'e, E>
+impl<E: quic::Connect + Sync, EP> PendingRequest<E, EP>
 where
+    EP: Deref<Target = H3Endpoint<E>>,
     E::Connection: Send + 'static,
     <E::Connection as quic::ManageStream>::StreamReader: Send,
     <E::Connection as quic::ManageStream>::StreamWriter: Send,

@@ -20,7 +20,7 @@ fn hello_world() {
     run("hello_world", async move {
         let router = Router::new().get("/hello_world", hello_world_service);
         let network = test_network().await;
-        let (server, host) = test_server_with(network.clone()).await;
+        let (mut server, host) = test_server_with(network.clone()).await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
@@ -62,7 +62,7 @@ fn streaming_echo() {
     run("streaming_echo", async move {
         let router = Router::new().post("/echo", streaming_echo_service);
         let network = test_network().await;
-        let (server, host) = test_server_with(network.clone()).await;
+        let (mut server, host) = test_server_with(network.clone()).await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
@@ -96,7 +96,7 @@ fn fallback() {
             .get("/hello_world", hello_world_service)
             .post("/hello_world", hello_world_service);
         let network = test_network().await;
-        let (server, host) = test_server_with(network.clone()).await;
+        let (mut server, host) = test_server_with(network.clone()).await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
@@ -124,7 +124,7 @@ fn auto_close() {
     run("auto_close", async move {
         let router = Router::new().post("/echo", echo_service);
         let network = test_network().await;
-        let (server, host) = test_server_with(network.clone()).await;
+        let (mut server, host) = test_server_with(network.clone()).await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
@@ -151,7 +151,7 @@ fn missing_server_name_closes_connection_with_no_error() {
         "missing_server_name_closes_connection_with_no_error",
         async move {
             let network = test_network().await;
-            let (server, host) = test_server_with(network.clone()).await;
+            let (mut server, host) = test_server_with(network.clone()).await;
             let _serve = AbortOnDropHandle::new(tokio::spawn(async move {
                 let _ = server.serve(Router::new()).await;
             }));

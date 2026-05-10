@@ -144,6 +144,30 @@ pub trait Listen: Send + Sync {
     fn shutdown(&self) -> impl Future<Output = Result<(), Self::Error>> + Send + '_;
 }
 
+impl<T: Connect> Connect for &T {
+    type Connection = T::Connection;
+    type Error = T::Error;
+
+    fn connect<'a>(
+        &'a self,
+        server: &'a Authority,
+    ) -> impl Future<Output = Result<Arc<Self::Connection>, Self::Error>> + Send + 'a {
+        (**self).connect(server)
+    }
+}
+
+impl<T: Connect> Connect for Arc<T> {
+    type Connection = T::Connection;
+    type Error = T::Error;
+
+    fn connect<'a>(
+        &'a self,
+        server: &'a Authority,
+    ) -> impl Future<Output = Result<Arc<Self::Connection>, Self::Error>> + Send + 'a {
+        self.as_ref().connect(server)
+    }
+}
+
 /// AFIT version of stream management with concrete associated types.
 ///
 /// Implement this for concrete connection types. A blanket impl provides

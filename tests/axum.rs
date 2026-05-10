@@ -29,7 +29,7 @@ fn axum_hello_world() {
                 .into_service(),
         );
         let network = test_network().await;
-        let (server, host) = test_server_with(network.clone()).await;
+        let (mut server, host) = test_server_with(network.clone()).await;
         let _serve = AbortOnDropHandle::new(tokio::spawn(async move {
             let _ = server.serve(router).await;
         }));
@@ -86,7 +86,7 @@ fn interim_response() {
     run("interim_response", async move {
         let router = server::Router::new().get("/ultimate_answer", interim_response_service);
         let network = test_network().await;
-        let (server, host) = test_server_with(network.clone()).await;
+        let (mut server, host) = test_server_with(network.clone()).await;
         let _serve = AbortOnDropHandle::new(tokio::spawn(async move {
             let _ = server.serve(router).await;
         }));
@@ -169,7 +169,7 @@ fn axum_connect() {
                 .into_service(),
         );
         let network = test_network().await;
-        let (server, host) = test_server_with(network.clone()).await;
+        let (mut server, host) = test_server_with(network.clone()).await;
         let _serve = AbortOnDropHandle::new(tokio::spawn(async move {
             let _ = server.serve(router).await;
         }));
@@ -239,7 +239,7 @@ fn axum_extend_connect() {
                 .into_service(),
         );
         let network = test_network().await;
-        let (server, host) = test_server_with(network.clone()).await;
+        let (mut server, host) = test_server_with(network.clone()).await;
         let _serve = AbortOnDropHandle::new(tokio::spawn(async move {
             let _ = server.serve(router).await;
         }));

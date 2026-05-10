@@ -8,18 +8,18 @@ use rustls::ClientConfig;
 use snafu::{ResultExt, Snafu};
 use tracing::Instrument;
 
-use crate::dquic::binds::BindPattern;
-use crate::dquic::identity::Identity;
-use crate::dquic::network::{BindHandle, BindServerError, Network, ServerBinding};
-use crate::dquic::quic_config::{ClientQuicConfig, ServerCertVerifierChoice, ServerQuicConfig};
 use crate::{
     dquic::{
+        binds::BindPattern,
+        identity::Identity,
+        network::{BindHandle, BindServerError, Network, ServerBinding},
         prelude::{Connection, Resolve},
         qbase::{
             cid::ConnectionId,
             net::addr::{BoundAddr, EndpointAddr, SocketEndpointAddr},
         },
         qinterface::bind_uri::BindUri,
+        quic_config::{ClientQuicConfig, ServerCertVerifierChoice, ServerQuicConfig},
     },
     quic,
     util::tls::DangerousServerCertVerifier,
@@ -378,18 +378,6 @@ impl quic::Listen for QuicEndpoint {
     }
 }
 
-impl quic::Connect for &QuicEndpoint {
-    type Connection = Connection;
-    type Error = ConnectError;
-
-    fn connect<'a>(
-        &'a self,
-        server: &'a http::uri::Authority,
-    ) -> impl Future<Output = Result<Arc<Self::Connection>, Self::Error>> + Send + 'a {
-        (**self).connect(server)
-    }
-}
-
 impl quic::Listen for &QuicEndpoint {
     type Connection = Connection;
     type Error = AcceptError;
@@ -494,9 +482,9 @@ mod tests {
     use rustls::pki_types::PrivateKeyDer;
 
     use super::*;
-    use crate::{
-        dquic::prelude::handy::SystemResolver,
-        dquic::identity::{Identity, ServerName},
+    use crate::dquic::{
+        identity::{Identity, ServerName},
+        prelude::handy::SystemResolver,
     };
 
     #[tokio::test]
