@@ -74,7 +74,7 @@ impl<C: quic::Connection> ReuseableConnection<C> {
 
 #[derive(Debug)]
 pub struct Pool<C: quic::Connection> {
-    connections: Arc<ReuseableConnections<C>>,
+    pub(crate) connections: Arc<ReuseableConnections<C>>,
 }
 
 impl<C: quic::Connection> Clone for Pool<C> {
@@ -90,6 +90,21 @@ impl<C: quic::Connection> Pool<C> {
         Self {
             connections: Default::default(),
         }
+    }
+
+    /// Clear all cached connections from the pool.
+    pub fn clear(&self) {
+        self.connections.clear();
+    }
+
+    /// Return the number of cached connections.
+    pub fn len(&self) -> usize {
+        self.connections.len()
+    }
+
+    /// Return `true` if the pool contains no connections.
+    pub fn is_empty(&self) -> bool {
+        self.connections.is_empty()
     }
 }
 
@@ -363,5 +378,42 @@ mod tests {
 
         let reusable = reusable_connection(Connection::from_state_for_test(state)).await;
         assert!(reusable.reuse().is_none());
+    }
+
+    #[test]
+    fn test_pool_len_empty() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn test_pool_clear_empty() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        pool.clear();
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn test_pool_clear_with_entries() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+
+        let auth1: Authority = "example.com:443".parse().unwrap();
+        let auth2: Authority = "other.com:443".parse().unwrap();
+        let auth3: Authority = "test.net:443".parse().unwrap();
+
+        pool.connections
+            .entry(auth1)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+        pool.connections
+            .entry(auth2)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+        pool.connections
+            .entry(auth3)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+
+        assert_eq!(pool.len(), 3, "should have 3 entries before clear");
+
+        pool.clear();
+        assert_eq!(pool.len(), 0, "should have 0 entries after clear");
     }
 }
