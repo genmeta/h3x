@@ -18,13 +18,10 @@ use rustls::server::{NoClientAuth, danger::ClientCertVerifier};
 use super::common::CommonQuicConfig;
 use crate::dquic::{
     network::bind_server_error::VersionSnafu,
-    prelude::{AuthClient, handy::server_parameters},
-    qbase::{
-        param::ServerParameters,
-        token::{TokenProvider, handy::NoopTokenRegistry},
-    },
-    qconnection::tls::AcceptAllClientAuther,
+    param::{ServerParameters, handy::server_parameters},
     sni::SniCertResolver,
+    tls::{AuthClient, handy::AcceptAllClientAuther},
+    token::{TokenProvider, handy::NoopTokenRegistry},
 };
 
 // ---------------------------------------------------------------------------

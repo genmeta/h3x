@@ -13,14 +13,11 @@ use crate::{
     dquic::{
         binds::BindPattern,
         client::{ClientQuicConfig, ServerCertVerifierChoice},
+        connection::Connection,
         identity::Identity,
+        net::{BindUri, BoundAddr, ConnectionId, EndpointAddr, SocketEndpointAddr},
         network::{BindHandle, BindServerError, Network, ServerBinding},
-        prelude::{Connection, Resolve},
-        qbase::{
-            cid::ConnectionId,
-            net::addr::{BoundAddr, EndpointAddr, SocketEndpointAddr},
-        },
-        qinterface::bind_uri::BindUri,
+        resolver::Resolve,
         server::ServerQuicConfig,
     },
     quic,
@@ -617,7 +614,7 @@ mod tests {
     use super::*;
     use crate::dquic::{
         identity::{Identity, ServerName},
-        prelude::handy::SystemResolver,
+        resolver::handy::SystemResolver,
     };
 
     #[tokio::test]
@@ -982,7 +979,7 @@ mod tests {
         use rustls::{pki_types::CertificateDer, sign::CertifiedKey};
 
         use crate::dquic::{
-            prelude::handy::{ToCertificate, ToPrivateKey},
+            cert::handy::{ToCertificate, ToPrivateKey},
             sni::{RegistryGuard, ServerConfig as SniServerConfig, ServerEntry},
         };
 

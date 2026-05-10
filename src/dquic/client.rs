@@ -17,11 +17,8 @@ use rustls::client::{WebPkiServerVerifier, danger::ServerCertVerifier};
 
 use super::common::CommonQuicConfig;
 use crate::dquic::{
-    prelude::handy::client_parameters,
-    qbase::{
-        param::ClientParameters,
-        token::{TokenSink, handy::NoopTokenRegistry},
-    },
+    param::{ClientParameters, handy::client_parameters},
+    token::{TokenSink, handy::NoopTokenRegistry},
 };
 
 // ---------------------------------------------------------------------------

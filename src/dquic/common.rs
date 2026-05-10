@@ -1,11 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::dquic::{
-    prelude::{
-        ProductStreamsConcurrencyController,
-        handy::{ConsistentConcurrency, NoopLogger},
-    },
-    qevent::telemetry::QLog,
+    log::{QLog, handy::NoopLogger},
+    stream::{ProductStreamsConcurrencyController, handy::ConsistentConcurrency},
 };
 
 // ---------------------------------------------------------------------------

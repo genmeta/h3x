@@ -14,16 +14,16 @@ pub use endpoint::*;
 pub use identity::*;
 pub use network::*;
 
-/// dquic parameter types — transport parameters, parameter IDs, value types
+/// dquic transport parameters — client/server/peer parameter sets, IDs, value types
 pub mod param {
     pub use dquic::qbase::param::{
         ClientParameters, ParameterId, ParameterValue, ParameterValueType, PeerParameters,
-        ServerParameters, error::Error as ParamError,
+        ServerParameters, error::Error as ParamError, preferred_address::PreferredAddress,
     };
 
     /// convenience constructors for parameters
     pub mod handy {
-        pub use dquic::prelude::handy::{client_parameters, server_parameters};
+        pub use dquic::qbase::param::handy::{client_parameters, server_parameters};
     }
 }
 
@@ -33,13 +33,15 @@ pub mod token {
 
     /// convenience token implementations
     pub mod handy {
-        pub use dquic::qbase::token::handy::NoopTokenRegistry;
+        pub use dquic::qbase::token::handy::*;
     }
 }
 
 /// dquic TLS / client authentication types
 pub mod tls {
-    pub use dquic::qconnection::tls::*;
+    pub use dquic::qconnection::tls::{
+        AuthClient, ClientAgentVerifyResult, ClientNameVerifyResult, LocalAgent, RemoteAgent,
+    };
 
     pub mod handy {
         pub use dquic::qconnection::tls::AcceptAllClientAuther;
@@ -48,44 +50,58 @@ pub mod tls {
 
 /// dquic stream concurrency types
 pub mod stream {
-    pub use dquic::{prelude::VarInt, qbase::sid::*};
+    pub use dquic::{
+        prelude::VarInt,
+        qbase::sid::{
+            ControlStreamsConcurrency, Dir, ProductStreamsConcurrencyController, StreamId,
+        },
+    };
 
     pub mod handy {
-        pub use dquic::prelude::handy::ConsistentConcurrency;
+        pub use dquic::qbase::sid::handy::*;
     }
 }
 
 /// dquic telemetry / logging types
 pub mod log {
-    pub use dquic::qevent::telemetry::*;
+    pub use dquic::qevent::telemetry::{ExportEvent, QLog, Span};
 
     pub mod handy {
-        pub use dquic::prelude::handy::NoopLogger;
+        pub use dquic::qevent::telemetry::handy::*;
     }
 }
 
 /// dquic DNS resolution types
 pub mod resolver {
-    pub use dquic::qresolve::*;
+    pub use dquic::qresolve::{
+        Publish, PublishFuture, Record, RecordStream, Resolve, ResolveFuture, ResolveResult, Source,
+    };
 
     pub mod handy {
-        pub use dquic::prelude::handy::SystemResolver;
+        pub use dquic::qresolve::SystemResolver;
     }
 }
 
-/// dquic network address / binding types
+/// dquic network address, binding, interface, and IO types
 pub mod net {
     pub use dquic::{
         prelude::{IO, IoExt},
         qbase::{
             cid::ConnectionId,
-            net::addr::{BoundAddr, EndpointAddr, SocketEndpointAddr},
+            net::addr::{BleEndpontAddr, BoundAddr, EndpointAddr, SocketEndpointAddr},
         },
-        qinterface::{BindInterface, bind_uri::BindUri, device::Devices, io::ProductIO},
+        qinterface::{
+            BindInterface,
+            bind_uri::{BindUri, ParseBindUriError},
+            component::{location::Locations, route::QuicRouter},
+            device::Devices,
+            io::ProductIO,
+            manager::InterfaceManager,
+        },
     };
 
     pub mod handy {
-        pub use dquic::prelude::handy::DEFAULT_IO_FACTORY;
+        pub use dquic::qinterface::io::handy::*;
     }
 }
 

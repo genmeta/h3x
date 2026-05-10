@@ -17,8 +17,8 @@ use rustls::{
 
 use crate::dquic::{
     binds::BindPattern,
+    connection::Connection,
     identity::{Identity, ServerName},
-    prelude::Connection,
 };
 
 /// Per-SNI entry stored behind a `Weak` in the network's registry.

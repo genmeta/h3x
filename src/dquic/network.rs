@@ -54,31 +54,29 @@ use tracing::Instrument;
 pub use crate::dquic::sni::ServerBinding;
 use crate::dquic::{
     binds::BindPattern,
+    connection::Connection,
     identity::{Identity, ServerName},
-    prelude::{
-        AuthClient, ClientAgentVerifyResult, ClientNameVerifyResult, Connection, LocalAgent,
-        RemoteAgent, Resolve,
-        handy::{DEFAULT_IO_FACTORY, SystemResolver},
-        qconnection::builder::ConnectionFoundation,
+    net::{
+        BindInterface, BindUri, Devices, InterfaceManager, Locations, ProductIO, QuicRouter,
+        handy::DEFAULT_IO_FACTORY,
     },
+    resolver::{Resolve, handy::SystemResolver},
+    server::ServerQuicConfig,
+    sni::{self, RegistryGuard, ServerConfig, ServerEntry, SniCertResolver},
+    tls::{AuthClient, ClientAgentVerifyResult, ClientNameVerifyResult, LocalAgent, RemoteAgent},
+};
+// Internal implementation types — not part of curated domain modules
+use crate::dquic::{
     qbase::packet::Packet,
-    qinterface::{
-        BindInterface,
-        bind_uri::BindUri,
-        component::{
-            location::{Locations, LocationsComponent},
-            route::{QuicRouter, QuicRouterComponent, Way},
-        },
-        device::Devices,
-        io::ProductIO,
-        manager::InterfaceManager,
+    qconnection::builder::ConnectionFoundation,
+    qinterface::component::{
+        location::LocationsComponent,
+        route::{QuicRouterComponent, Way},
     },
     qtraversal::{
         nat::{client::StunClientsComponent, router::StunRouterComponent},
         route::{ForwardersComponent, ReceiveAndDeliverPacketComponent},
     },
-    server::ServerQuicConfig,
-    sni::{self, RegistryGuard, ServerConfig, ServerEntry, SniCertResolver},
 };
 
 pub(crate) type SniRegistry = Arc<DashMap<ServerName, Weak<ServerEntry>>>;
