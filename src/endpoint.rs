@@ -35,6 +35,34 @@ pub struct H3Endpoint<T: quic::Connect> {
     pub(crate) builder: Arc<ConnectionBuilder<T::Connection>>,
 }
 
+/// RAII guard for mutable access to [`H3Endpoint`]'s QUIC transport.
+///
+/// On drop, clears the endpoint's connection pool via [`Pool::clear`],
+/// ensuring no stale connections remain after QUIC configuration changes.
+pub struct QuicMutGuard<'a, T: quic::Connect> {
+    quic: &'a mut T,
+    pool: &'a Pool<T::Connection>,
+}
+
+impl<'a, T: quic::Connect> std::ops::Deref for QuicMutGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        self.quic
+    }
+}
+
+impl<'a, T: quic::Connect> std::ops::DerefMut for QuicMutGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.quic
+    }
+}
+
+impl<'a, T: quic::Connect> Drop for QuicMutGuard<'a, T> {
+    fn drop(&mut self) {
+        self.pool.clear();
+    }
+}
+
 impl<T: quic::Connect> H3Endpoint<T> {
     /// Construct a new HTTP/3 endpoint.
     #[must_use]
@@ -47,6 +75,17 @@ impl<T: quic::Connect> H3Endpoint<T> {
             quic,
             pool,
             builder,
+        }
+    }
+
+    /// Obtain a mutable guard for the QUIC transport.
+    ///
+    /// The guard implements [`DerefMut`](std::ops::DerefMut) targeting `T`.
+    /// On drop, the connection pool is cleared via [`Pool::clear`].
+    pub fn quic_mut(&mut self) -> QuicMutGuard<'_, T> {
+        QuicMutGuard {
+            quic: &mut self.quic,
+            pool: &self.pool,
         }
     }
 
@@ -267,5 +306,119 @@ where
             let report = snafu::Report::from_error(boxed.as_ref());
             tracing::debug!(error = %report, "request handler returned error");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use http::uri::Authority;
+
+    use super::*;
+    use crate::{connection::tests::MockConnection, pool::ReuseableConnection};
+
+    /// Minimal quic::Connect implementation for testing QuicMutGuard.
+    struct MockConnect;
+
+    impl quic::Connect for MockConnect {
+        type Connection = MockConnection;
+        type Error = quic::ConnectionError;
+
+        async fn connect<'a>(
+            &'a self,
+            _server: &'a Authority,
+        ) -> Result<Arc<Self::Connection>, Self::Error> {
+            unreachable!("connect is not called in guard tests")
+        }
+    }
+
+    /// Verify that QuicMutGuard provides mutable access to the inner QUIC transport.
+    #[test]
+    fn test_quic_mut_guard_deref_mut() {
+        let mut quic = MockConnect;
+        let pool = Pool::<MockConnection>::empty();
+        let mut guard = QuicMutGuard {
+            quic: &mut quic,
+            pool: &pool,
+        };
+
+        // Verify Deref produces &MockConnect
+        let _reference: &MockConnect = &guard;
+        let _ = _reference;
+
+        // Verify DerefMut produces &mut MockConnect
+        let _mut_reference: &mut MockConnect = &mut guard;
+        let _ = _mut_reference;
+
+        drop(guard);
+    }
+
+    /// Verify that dropping QuicMutGuard clears the connection pool.
+    #[test]
+    fn test_quic_mut_guard_drop_clears_pool() {
+        let mut quic = MockConnect;
+        let pool = Pool::<MockConnection>::empty();
+
+        // Insert an entry into the pool to verify clearing
+        let auth: Authority = "example.com:443".parse().unwrap();
+        pool.connections
+            .entry(auth)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+
+        assert_eq!(pool.len(), 1);
+
+        {
+            let guard = QuicMutGuard {
+                quic: &mut quic,
+                pool: &pool,
+            };
+            // Guard holds reference; pool still has entries
+            assert_eq!(pool.len(), 1);
+            drop(guard);
+        } // guard dropped, pool.clear() called
+
+        assert_eq!(pool.len(), 0);
+    }
+
+    /// Verify that H3Endpoint::quic_mut provides mutable access to the inner
+    /// QUIC transport.
+    #[test]
+    fn test_quic_mut_access() {
+        let pool = Pool::<MockConnection>::empty();
+        let builder = Arc::new(ConnectionBuilder::new(Arc::new(
+            crate::dhttp::settings::Settings::default(),
+        )));
+        let mut h3 = H3Endpoint::new(MockConnect, pool, builder);
+
+        let guard = h3.quic_mut();
+        let _: &MockConnect = &guard; // verify Deref works
+        drop(guard);
+    }
+
+    /// Verify that dropping the guard from H3Endpoint::quic_mut clears the
+    /// connection pool.
+    #[test]
+    fn test_quic_mut_drop_clears_pool() {
+        let pool = Pool::<MockConnection>::empty();
+        let builder = Arc::new(ConnectionBuilder::new(Arc::new(
+            crate::dhttp::settings::Settings::default(),
+        )));
+        let mut h3 = H3Endpoint::new(MockConnect, pool, builder);
+
+        // Insert an entry into the pool
+        let auth: Authority = "example.com:443".parse().unwrap();
+        h3.pool
+            .connections
+            .entry(auth)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+
+        assert_eq!(h3.pool.len(), 1);
+
+        {
+            let _guard = h3.quic_mut();
+        } // guard dropped, pool.clear() called
+
+        assert_eq!(h3.pool.len(), 0);
     }
 }

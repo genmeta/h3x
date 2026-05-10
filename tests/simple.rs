@@ -150,7 +150,7 @@ fn missing_server_name_closes_connection_with_no_error() {
     use std::{net::SocketAddr, str::FromStr, sync::Arc};
 
     use dquic::prelude::{
-        BoundAddr, IO,
+        IO,
         handy::{SystemResolver, ToCertificate, ToPrivateKey},
     };
     use futures::{FutureExt, StreamExt, stream};
