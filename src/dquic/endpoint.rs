@@ -3,6 +3,7 @@
 use std::{any::Any, str::FromStr, sync::Arc};
 
 use arc_swap::ArcSwapOption;
+use bon::bon;
 use futures::{StreamExt, future::join_all};
 use rustls::ClientConfig;
 use snafu::{ResultExt, Snafu};
@@ -126,15 +127,19 @@ impl Clone for QuicEndpoint {
     }
 }
 
+#[bon]
 impl QuicEndpoint {
     /// Construct a new endpoint.
+    #[builder]
     pub async fn new(
         network: Arc<Network>,
         identity: Option<Arc<Identity>>,
-        resolver: Arc<dyn Resolve + Send + Sync>,
-        client: ClientQuicConfig,
-        server: ServerQuicConfig,
-        bind_patterns: Arc<Vec<BindPattern>>,
+        #[builder(default = Arc::new(crate::dquic::prelude::handy::SystemResolver))] resolver: Arc<
+            dyn Resolve + Send + Sync,
+        >,
+        #[builder(default)] client: ClientQuicConfig,
+        #[builder(default)] server: ServerQuicConfig,
+        #[builder(default = Arc::new(Vec::new()))] bind_patterns: Arc<Vec<BindPattern>>,
     ) -> Self {
         let bind_patterns = if bind_patterns.is_empty() {
             Arc::new(vec![BindPattern::from_str("*").unwrap()])
@@ -143,7 +148,7 @@ impl QuicEndpoint {
         };
         let binds: Vec<BindHandle> =
             join_all(bind_patterns.iter().map(|p| network.bind(p.clone()))).await;
-        Self {
+        let endpoint = Self {
             network,
             identity: ArcSwapOption::from(identity),
             resolver,
@@ -153,12 +158,15 @@ impl QuicEndpoint {
             _binds: Arc::new(binds),
             client_tls_cache: ArcSwapOption::empty(),
             server_binding_cache: ArcSwapOption::empty(),
-        }
+        };
+        endpoint.init_client();
+        endpoint.init_server().await;
+        endpoint
     }
 }
 
 impl QuicEndpoint {
-    fn client_tls(&self) -> Result<Arc<ClientConfig>, BuildClientTlsError> {
+    fn ensure_client(&self) -> Result<Arc<ClientConfig>, BuildClientTlsError> {
         if let Some(cached) = self.client_tls_cache.load_full() {
             return Ok(cached);
         }
@@ -237,7 +245,7 @@ impl QuicEndpoint {
 }
 
 impl QuicEndpoint {
-    async fn server_binding(&self) -> Result<ServerBinding, AcceptError> {
+    async fn ensure_server(&self) -> Result<ServerBinding, AcceptError> {
         use accept_error::BindServerSnafu;
 
         let named = match self.identity.load_full() {
@@ -257,9 +265,24 @@ impl QuicEndpoint {
         Ok(binding)
     }
 
+    /// Eagerly build the client TLS configuration so the first `connect()`
+    /// is fast. Silently ignores errors — the real error surfaces at
+    /// connection time.
+    fn init_client(&self) {
+        let _ = self.ensure_client();
+    }
+
+    /// Eagerly register the server SNI so `accept()` can return immediately.
+    /// No-op when no identity is configured. Silently ignores errors.
+    async fn init_server(&self) {
+        if self.identity.load_full().is_some() {
+            let _ = self.ensure_server().await;
+        }
+    }
+
     /// Accept an inbound connection, using the cached server binding.
     pub async fn accept(&self) -> Result<Arc<Connection>, AcceptError> {
-        let binding = self.server_binding().await?;
+        let binding = self.ensure_server().await?;
         let conn = binding.recv().await.ok_or(AcceptError::Shutdown)?;
         let mut observer = self.network.locations().subscribe();
         let weak = Arc::downgrade(&conn);
@@ -300,7 +323,7 @@ impl quic::Connect for QuicEndpoint {
         let full = server.as_str();
         let server_str = full.rsplit_once('@').map_or(full, |(_, host)| host);
 
-        let tls = self.client_tls().context(TlsSnafu)?;
+        let tls = self.ensure_client().context(TlsSnafu)?;
         let mut server_eps =
             futures::StreamExt::fuse(self.resolver.lookup(server_str).await.context(DnsSnafu)?);
         let connection = self
@@ -494,15 +517,13 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let endpoint = QuicEndpoint::new(
-            network.clone(),
-            None,
-            resolver.clone(),
-            client,
-            server,
-            Arc::new(Vec::new()),
-        )
-        .await;
+        let endpoint = QuicEndpoint::builder()
+            .network(network.clone())
+            .resolver(resolver.clone())
+            .client(client)
+            .server(server)
+            .build()
+            .await;
 
         assert!(Arc::ptr_eq(&endpoint.network, &network));
         assert!(endpoint.identity.load_full().is_none());
@@ -515,15 +536,13 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let endpoint = QuicEndpoint::new(
-            network.clone(),
-            None,
-            resolver.clone(),
-            client,
-            server,
-            Arc::new(Vec::new()),
-        )
-        .await;
+        let endpoint = QuicEndpoint::builder()
+            .network(network.clone())
+            .resolver(resolver.clone())
+            .client(client)
+            .server(server)
+            .build()
+            .await;
 
         let result = endpoint.accept().await;
         assert!(matches!(result, Err(AcceptError::ServerUnavailable)));
@@ -547,15 +566,13 @@ mod tests {
         let client = ClientQuicConfig::default();
         let server = ServerQuicConfig::default();
 
-        let _endpoint = QuicEndpoint::new(
-            network.clone(),
-            None,
-            resolver.clone(),
-            client,
-            server,
-            Arc::new(Vec::new()),
-        )
-        .await;
+        let _endpoint = QuicEndpoint::builder()
+            .network(network.clone())
+            .resolver(resolver.clone())
+            .client(client)
+            .server(server)
+            .build()
+            .await;
 
         // The dual-task model is set up internally in connect()
         // We verify it doesn't panic or error during setup
@@ -572,15 +589,13 @@ mod tests {
     }
 
     async fn make_endpoint() -> QuicEndpoint {
-        QuicEndpoint::new(
-            Network::builder().build(),
-            None,
-            Arc::new(SystemResolver),
-            ClientQuicConfig::default(),
-            ServerQuicConfig::default(),
-            Arc::new(Vec::new()),
-        )
-        .await
+        QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .resolver(Arc::new(SystemResolver))
+            .client(ClientQuicConfig::default())
+            .server(ServerQuicConfig::default())
+            .build()
+            .await
     }
 
     #[tokio::test]

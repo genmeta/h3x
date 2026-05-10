@@ -70,15 +70,11 @@ pub async fn test_client() -> h3x::dquic::H3Endpoint {
 }
 
 pub async fn test_client_with(network: Arc<h3x::dquic::Network>) -> h3x::dquic::H3Endpoint {
-    let quic = h3x::dquic::QuicEndpoint::new(
-        network,
-        None,
-        Arc::new(SystemResolver),
-        h3x::dquic::ClientQuicConfig::default(),
-        h3x::dquic::ServerQuicConfig::default(),
-        Arc::new(vec![]),
-    )
-    .await;
+    let quic = h3x::dquic::QuicEndpoint::builder()
+        .network(network)
+        .resolver(Arc::new(SystemResolver))
+        .build()
+        .await;
     let pool = h3x::pool::Pool::empty();
     let builder = Arc::new(h3x::connection::ConnectionBuilder::new(Arc::new(
         h3x::dhttp::settings::Settings::default(),
@@ -99,17 +95,15 @@ pub async fn test_server_with(
         key: Arc::new(SERVER_KEY.to_private_key()),
         ocsp: Arc::new(None),
     });
-    let quic = h3x::dquic::QuicEndpoint::new(
-        network.clone(),
-        Some(identity),
-        Arc::new(SystemResolver),
-        h3x::dquic::ClientQuicConfig::default(),
-        h3x::dquic::ServerQuicConfig::default(),
-        Arc::new(vec![
+    let quic = h3x::dquic::QuicEndpoint::builder()
+        .network(network.clone())
+        .identity(identity)
+        .resolver(Arc::new(SystemResolver))
+        .bind_patterns(Arc::new(vec![
             std::str::FromStr::from_str("inet://127.0.0.1:0").expect("valid pattern"),
-        ]),
-    )
-    .await;
+        ]))
+        .build()
+        .await;
     let bind_iface = network
         .interfaces()
         .into_iter()

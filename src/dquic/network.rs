@@ -1216,15 +1216,13 @@ mod tests {
                 .await
                 .expect("eager bind_server");
             bindings.push(binding);
-            let quic = QuicEndpoint::new(
-                network.clone(),
-                Some(named),
-                resolver.clone(),
-                ClientQuicConfig::default(),
-                shared_server_config.clone(),
-                Arc::new(Vec::new()),
-            )
-            .await;
+            let quic = QuicEndpoint::builder()
+                .network(network.clone())
+                .identity(named)
+                .resolver(resolver.clone())
+                .server(shared_server_config.clone())
+                .build()
+                .await;
             let mut h3 = H3Endpoint::new(
                 quic,
                 Pool::empty(),
@@ -1248,15 +1246,12 @@ mod tests {
             common: Arc::default(),
             own: Arc::new(client_own),
         };
-        let client_quic = QuicEndpoint::new(
-            network.clone(),
-            None,
-            resolver.clone(),
-            client_quic_config,
-            ServerQuicConfig::default(),
-            Arc::new(Vec::new()),
-        )
-        .await;
+        let client_quic = QuicEndpoint::builder()
+            .network(network.clone())
+            .resolver(resolver.clone())
+            .client(client_quic_config)
+            .build()
+            .await;
         let client = H3Endpoint::new(
             client_quic,
             Pool::empty(),
