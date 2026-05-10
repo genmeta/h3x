@@ -5,9 +5,10 @@ use std::{
     time::Duration,
 };
 
-use dquic::prelude::{
-    BoundAddr, IO,
-    handy::{SystemResolver, ToCertificate, ToPrivateKey},
+use h3x::dquic::{
+    cert::handy::{ToCertificate, ToPrivateKey},
+    net::{BoundAddr, IO},
+    resolver::handy::SystemResolver,
 };
 use http::uri::Authority;
 use tokio::time;

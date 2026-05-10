@@ -12,6 +12,7 @@ use tracing::Instrument;
 use crate::{
     dquic::{
         binds::BindPattern,
+        client::{ClientQuicConfig, ServerCertVerifierChoice},
         identity::Identity,
         network::{BindHandle, BindServerError, Network, ServerBinding},
         prelude::{Connection, Resolve},
@@ -20,7 +21,7 @@ use crate::{
             net::addr::{BoundAddr, EndpointAddr, SocketEndpointAddr},
         },
         qinterface::bind_uri::BindUri,
-        quic_config::{ClientQuicConfig, ServerCertVerifierChoice, ServerQuicConfig},
+        server::ServerQuicConfig,
     },
     quic,
     util::tls::DangerousServerCertVerifier,

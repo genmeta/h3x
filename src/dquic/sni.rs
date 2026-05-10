@@ -65,7 +65,7 @@ impl Drop for RegistryGuard {
 /// across all registered SNIs, and conflicting configurations are rejected
 /// at `bind_server` time.
 pub(crate) struct ServerConfig {
-    pub(crate) config: crate::dquic::quic_config::ServerQuicConfig,
+    pub(crate) config: crate::dquic::server::ServerQuicConfig,
     pub(crate) rustls_config: Arc<rustls::ServerConfig>,
 }
 

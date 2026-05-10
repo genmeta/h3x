@@ -15,7 +15,7 @@
 //! [`QuicRouter`]. When an Initial / 0-RTT packet arrives without matching
 //! an existing connection, the dispatcher constructs a fresh server
 //! [`Connection`](crate::dquic::prelude::Connection) using the shared
-//! [`ServerQuicConfig`](crate::dquic::quic_config::ServerQuicConfig) stored in the network's
+//! [`ServerQuicConfig`](crate::dquic::server::ServerQuicConfig) stored in the network's
 //! `server_slot`, waits for the handshake to reveal the ClientHello SNI, and
 //! fans the connection into the matching [`ServerBinding`]'s mpmc queue.
 //!
@@ -77,7 +77,7 @@ use crate::dquic::{
         nat::{client::StunClientsComponent, router::StunRouterComponent},
         route::{ForwardersComponent, ReceiveAndDeliverPacketComponent},
     },
-    quic_config::ServerQuicConfig,
+    server::ServerQuicConfig,
     sni::{self, RegistryGuard, ServerConfig, ServerEntry, SniCertResolver},
 };
 
@@ -1060,7 +1060,7 @@ mod tests {
 
         let cfg_a = make_server_config();
         let cfg_b = {
-            let own = crate::dquic::quic_config::ServerSpecificConfig {
+            let own = crate::dquic::server::ServerSpecificConfig {
                 alpns: vec![b"altproto".to_vec()],
                 ..Default::default()
             };
@@ -1090,7 +1090,7 @@ mod tests {
 
         let cfg_a = make_server_config();
         let cfg_b = {
-            let own = crate::dquic::quic_config::ServerSpecificConfig {
+            let own = crate::dquic::server::ServerSpecificConfig {
                 alpns: vec![b"altproto".to_vec()],
                 ..Default::default()
             };
@@ -1123,11 +1123,11 @@ mod tests {
     use crate::{
         connection::ConnectionBuilder,
         dquic::{
+            client::{ClientQuicConfig, ClientSpecificConfig, ServerCertVerifierChoice},
             endpoint::QuicEndpoint,
             prelude::{BoundAddr, IO},
             qbase::net::addr::{EndpointAddr, SocketEndpointAddr},
             qresolve::{Resolve, ResolveFuture, Source},
-            quic_config::{ClientQuicConfig, ClientSpecificConfig, ServerCertVerifierChoice},
         },
         endpoint::{
             H3Endpoint,
