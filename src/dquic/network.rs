@@ -1119,7 +1119,6 @@ mod tests {
     use tokio_util::task::AbortOnDropHandle;
 
     use crate::{
-        connection::ConnectionBuilder,
         dquic::{
             client::{ClientQuicConfig, ClientSpecificConfig, ServerCertVerifierChoice},
             endpoint::QuicEndpoint,
@@ -1131,7 +1130,6 @@ mod tests {
             H3Endpoint,
             server::{Request, Response, Router},
         },
-        pool::Pool,
     };
 
     /// Test-only resolver that maps every name lookup to a fixed loopback
@@ -1221,11 +1219,7 @@ mod tests {
                 .server(shared_server_config.clone())
                 .build()
                 .await;
-            let mut h3 = H3Endpoint::new(
-                quic,
-                Pool::empty(),
-                Arc::new(ConnectionBuilder::new(Arc::default())),
-            );
+            let mut h3 = H3Endpoint::new(quic);
             serve_handles.push(AbortOnDropHandle::new(tokio::spawn(
                 async move {
                     h3.serve(router).await.expect("serve failed");
@@ -1250,11 +1244,7 @@ mod tests {
             .client(client_quic_config)
             .build()
             .await;
-        let client = H3Endpoint::new(
-            client_quic,
-            Pool::empty(),
-            Arc::new(ConnectionBuilder::new(Arc::default())),
-        );
+        let client = H3Endpoint::new(client_quic);
 
         for (sni, expected) in [("alpha", "alpha"), ("beta", "beta")] {
             let authority: Authority = format!("{sni}:{port}").parse().unwrap();

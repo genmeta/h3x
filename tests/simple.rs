@@ -155,14 +155,12 @@ fn missing_server_name_closes_connection_with_no_error() {
     };
     use futures::{FutureExt, StreamExt, stream};
     use h3x::{
-        connection::ConnectionBuilder,
         dquic::{
             Identity, ServerName,
             qbase::net::addr::{EndpointAddr, SocketEndpointAddr},
             qresolve::{Resolve, ResolveFuture, Source},
         },
         endpoint::H3Endpoint,
-        pool::Pool,
     };
 
     #[derive(Debug)]
@@ -209,11 +207,7 @@ fn missing_server_name_closes_connection_with_no_error() {
                 dquic::prelude::BoundAddr::Internet(s) => s.port(),
                 _ => panic!("expected internet"),
             };
-            let mut server = H3Endpoint::new(
-                quic,
-                Pool::empty(),
-                Arc::new(ConnectionBuilder::new(Arc::default())),
-            );
+            let mut server = H3Endpoint::new(quic);
             let host: http::uri::Authority = format!("localhost:{port}")
                 .parse()
                 .expect("valid authority");
@@ -230,11 +224,7 @@ fn missing_server_name_closes_connection_with_no_error() {
                 )))
                 .build()
                 .await;
-            let client = H3Endpoint::new(
-                client_quic,
-                Pool::empty(),
-                Arc::new(ConnectionBuilder::new(Arc::default())),
-            );
+            let client = H3Endpoint::new(client_quic);
             let error = client
                 .new_request()
                 .get(

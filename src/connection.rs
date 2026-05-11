@@ -354,6 +354,12 @@ impl<C: Any> fmt::Display for ConnectionBuilder<C> {
     }
 }
 
+impl<C: quic::Connection> Default for ConnectionBuilder<C> {
+    fn default() -> Self {
+        Self::new(Arc::new(Settings::default()))
+    }
+}
+
 impl<C: quic::Connection> ConnectionBuilder<C> {
     pub fn new(settings: Arc<Settings>) -> Self {
         let builder = Self {

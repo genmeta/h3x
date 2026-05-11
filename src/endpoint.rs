@@ -8,6 +8,7 @@
 
 use std::{error::Error, future::Future, sync::Arc};
 
+use bon::bon;
 use http::{Method, Uri, uri::Authority};
 use tower_service::Service;
 use tracing::Instrument;
@@ -63,19 +64,27 @@ impl<'a, T: quic::Connect> Drop for QuicMutGuard<'a, T> {
     }
 }
 
+#[bon]
 impl<T: quic::Connect> H3Endpoint<T> {
     /// Construct a new HTTP/3 endpoint.
-    #[must_use]
+    #[builder]
     pub fn new(
         quic: T,
-        pool: Pool<T::Connection>,
-        builder: Arc<ConnectionBuilder<T::Connection>>,
+        #[builder(default)] pool: Pool<T::Connection>,
+        #[builder(default)] builder: Arc<ConnectionBuilder<T::Connection>>,
     ) -> Self {
         Self {
             quic,
             pool,
             builder,
         }
+    }
+}
+
+impl<T: quic::Connect> H3Endpoint<T> {
+    /// Construct a new HTTP/3 endpoint with default pool and builder.
+    pub fn new(quic: T) -> Self {
+        H3Endpoint::builder().quic(quic).build()
     }
 
     /// Obtain a mutable guard for the QUIC transport.
@@ -215,7 +224,11 @@ where
         let pool = this.pool.clone();
         let builder = this.builder.clone();
         async move {
-            let mut ref_ep = H3Endpoint::new(&this.quic, pool, builder);
+            let mut ref_ep = H3Endpoint::builder()
+                .quic(&this.quic)
+                .pool(pool)
+                .builder(builder)
+                .build();
             ref_ep.serve(service).await
         }
     }
@@ -385,11 +398,7 @@ mod tests {
     /// QUIC transport.
     #[test]
     fn test_quic_mut_access() {
-        let pool = Pool::<MockConnection>::empty();
-        let builder = Arc::new(ConnectionBuilder::new(Arc::new(
-            crate::dhttp::settings::Settings::default(),
-        )));
-        let mut h3 = H3Endpoint::new(MockConnect, pool, builder);
+        let mut h3 = H3Endpoint::new(MockConnect);
 
         let guard = h3.quic_mut();
         let _: &MockConnect = &guard; // verify Deref works
@@ -400,11 +409,7 @@ mod tests {
     /// connection pool.
     #[test]
     fn test_quic_mut_drop_clears_pool() {
-        let pool = Pool::<MockConnection>::empty();
-        let builder = Arc::new(ConnectionBuilder::new(Arc::new(
-            crate::dhttp::settings::Settings::default(),
-        )));
-        let mut h3 = H3Endpoint::new(MockConnect, pool, builder);
+        let mut h3 = H3Endpoint::new(MockConnect);
 
         // Insert an entry into the pool
         let auth: Authority = "example.com:443".parse().unwrap();

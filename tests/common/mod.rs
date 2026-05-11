@@ -76,11 +76,7 @@ pub async fn test_client_with(network: Arc<h3x::dquic::Network>) -> h3x::dquic::
         .resolver(Arc::new(SystemResolver))
         .build()
         .await;
-    let pool = h3x::pool::Pool::empty();
-    let builder = Arc::new(h3x::connection::ConnectionBuilder::new(Arc::new(
-        h3x::dhttp::settings::Settings::default(),
-    )));
-    h3x::endpoint::H3Endpoint::new(quic, pool, builder)
+    h3x::endpoint::H3Endpoint::new(quic)
 }
 
 pub async fn test_server() -> (h3x::dquic::H3Endpoint, Authority) {
@@ -114,14 +110,7 @@ pub async fn test_server_with(
         BoundAddr::Internet(s) => s.port(),
         _ => panic!("expected internet address"),
     };
-    let pool = h3x::pool::Pool::empty();
-    let builder = Arc::new(h3x::connection::ConnectionBuilder::new(Arc::new(
-        h3x::dhttp::settings::Settings::default(),
-    )));
     let authority = Authority::from_maybe_shared(format!("localhost:{port}"))
         .expect("failed to parse authority");
-    (
-        h3x::endpoint::H3Endpoint::new(quic, pool, builder),
-        authority,
-    )
+    (h3x::endpoint::H3Endpoint::new(quic), authority)
 }
