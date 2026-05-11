@@ -20,7 +20,7 @@ use crate::{
     },
     pool::ConnectError,
     qpack::field::{MalformedHeaderSection, Protocol},
-    quic::{self, agent},
+    quic::{self, agent, BoxReadStream, BoxWriteStream},
 };
 
 #[derive(Clone)]
@@ -66,6 +66,74 @@ pub enum RequestError<E: Error + 'static> {
     DataFrameTooLarge,
     #[snafu(display("response from peer is malformed"))]
     MalformedResponse,
+    #[snafu(transparent)]
+    Acquire { source: AcquireError },
+}
+
+#[derive(Debug, Clone, Snafu)]
+#[snafu(module)]
+pub enum InitError {
+    #[snafu(display("failed to connect to server"))]
+    Connect { source: Arc<dyn Error + Send + Sync + 'static> },
+    #[snafu(display("failed to open stream"))]
+    Stream { source: Arc<dyn Error + Send + Sync + 'static> },
+    #[snafu(display("init already consumed"))]
+    AlreadyConsumed,
+}
+
+impl InitError {
+    pub fn connect<E: Error + Send + Sync + 'static>(e: E) -> Self {
+        InitError::Connect { source: Arc::new(e) }
+    }
+    pub fn stream<E: Error + Send + Sync + 'static>(e: E) -> Self {
+        InitError::Stream { source: Arc::new(e) }
+    }
+}
+
+#[derive(Debug, Clone, Snafu)]
+#[snafu(module)]
+pub enum AcquireError {
+    #[snafu(display("resource already taken by another clone"))]
+    AlreadyTaken,
+}
+
+pub(crate) struct Arbiter<T: quic::Connect, EP: Deref<Target = H3Endpoint<T>>> {
+    pub(crate) message: std::sync::Mutex<Option<Message>>,
+    pub(crate) write_stream: std::sync::Mutex<Option<BoxWriteStream>>,
+    pub(crate) read_stream: std::sync::Mutex<Option<BoxReadStream>>,
+    pub(crate) init_state: tokio::sync::Mutex<Option<Result<(), Arc<InitError>>>>,
+    pub(crate) endpoint: EP,
+    pub(crate) authority: Authority,
+}
+
+impl<T: quic::Connect, EP: Deref<Target = H3Endpoint<T>>> Arbiter<T, EP> {
+    pub fn new(endpoint: EP, authority: Authority, message: Message) -> Self {
+        Arbiter {
+            message: std::sync::Mutex::new(Some(message)),
+            write_stream: std::sync::Mutex::new(None),
+            read_stream: std::sync::Mutex::new(None),
+            init_state: tokio::sync::Mutex::new(None),
+            endpoint,
+            authority,
+        }
+    }
+}
+
+impl<T: quic::Connect, EP: Deref<Target = H3Endpoint<T>>> Drop for Arbiter<T, EP> {
+    fn drop(&mut self) {
+        // get_mut on &mut self guarantees exclusive access - no lock needed
+        let msg = self.message.get_mut().unwrap().take();
+        let ws = self.write_stream.get_mut().unwrap().take();
+        if let (Some(mut msg), Some(mut ws)) = (msg, ws) {
+            // Both resources present → initialization happened → check if cleanup needed
+            if !msg.is_complete() && !msg.is_dropped() {
+                tokio::spawn(async move {
+                    let _ = ws.close_message(&mut msg).await;
+                }.in_current_span());
+            }
+        }
+        // read_stream dropped naturally if still present
+    }
 }
 
 impl<E: quic::Connect, EP> PendingRequest<E, EP> {

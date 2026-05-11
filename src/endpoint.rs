@@ -98,10 +98,12 @@ impl<T: quic::Connect> H3Endpoint<T> {
         }
     }
 
+    // https://reimi.pilot~/xxx
+
     /// Obtain (or reuse) an HTTP/3 connection to `server` from the pool.
     pub async fn connect(
         &self,
-        server: Authority,
+        server: Authority, // to &str
     ) -> Result<Arc<H3Connection<T::Connection>>, pool::ConnectError<T::Error>> {
         self.pool
             .reuse_or_connect_with(&self.quic, self.builder.clone(), server)
