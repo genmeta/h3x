@@ -103,7 +103,7 @@ pub struct QuicEndpoint {
     /// Server-side configuration.
     pub(crate) server: Arc<ServerQuicConfig>,
     /// Bind patterns for interface filtering (shared by client and server roles).
-    pub(crate) bind_patterns: Arc<Vec<BindPattern>>,
+    pub(crate) bind: Arc<Vec<BindPattern>>,
     _binds: Arc<Vec<BindHandle>>,
     client_tls_cache: ArcSwapOption<ClientConfig>,
     server_binding_cache: ArcSwapOption<ServerBinding>,
@@ -117,7 +117,7 @@ impl Clone for QuicEndpoint {
             resolver: self.resolver.clone(),
             client: self.client.clone(),
             server: self.server.clone(),
-            bind_patterns: self.bind_patterns.clone(),
+            bind: self.bind.clone(),
             _binds: self._binds.clone(),
             client_tls_cache: ArcSwapOption::empty(),
             server_binding_cache: ArcSwapOption::empty(),
@@ -193,22 +193,22 @@ impl QuicEndpoint {
         >,
         #[builder(default)] client: ClientQuicConfig,
         #[builder(default)] server: ServerQuicConfig,
-        #[builder(default = Arc::new(Vec::new()))] bind_patterns: Arc<Vec<BindPattern>>,
+        #[builder(default = Arc::new(Vec::new()))] bind: Arc<Vec<BindPattern>>,
     ) -> Self {
-        let bind_patterns = if bind_patterns.is_empty() {
+        let bind = if bind.is_empty() {
             Arc::new(vec![BindPattern::from_str("*").unwrap()])
         } else {
-            bind_patterns
+            bind
         };
         let binds: Vec<BindHandle> =
-            join_all(bind_patterns.iter().map(|p| network.bind(p.clone()))).await;
+            join_all(bind.iter().map(|p| network.bind(p.clone()))).await;
         let endpoint = Self {
             network,
             identity: ArcSwapOption::from(identity),
             resolver,
             client: Arc::new(client),
             server: Arc::new(server),
-            bind_patterns,
+            bind,
             _binds: Arc::new(binds),
             client_tls_cache: ArcSwapOption::empty(),
             server_binding_cache: ArcSwapOption::empty(),
@@ -237,7 +237,7 @@ impl QuicEndpoint {
         let builder = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(TLS13)
             .context(VersionSnafu)?;
-        let builder = match &self.client.own.verifier {
+        let builder = match &self.client.verifier {
             ServerCertVerifierChoice::Dangerous => builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(DangerousServerCertVerifier)),
@@ -252,8 +252,8 @@ impl QuicEndpoint {
                 .with_client_auth_cert(id.certs.iter().cloned().collect(), id.key.clone_key())
                 .context(ClientAuthSnafu)?,
         };
-        tls.alpn_protocols.clone_from(&self.client.own.alpns);
-        tls.enable_early_data = self.client.common.enable_0rtt;
+        tls.alpn_protocols.clone_from(&self.client.alpns);
+        tls.enable_early_data = self.client.enable_0rtt;
         Ok(tls)
     }
 }
@@ -270,7 +270,7 @@ impl QuicEndpoint {
         // `ClientName` parameter so the peer can populate its
         // `remote_agent` (identity-based access control on the server
         // relies on this).
-        let mut parameters = self.client.own.parameters.clone();
+        let mut parameters = self.client.parameters.clone();
         if let Some(named) = self.identity.load_full() {
             parameters
                 .set(
@@ -280,19 +280,19 @@ impl QuicEndpoint {
                 .context(SetParameterSnafu)?;
         }
         let builder =
-            Connection::new_client(server_name.to_owned(), self.client.own.token_sink.clone())
+            Connection::new_client(server_name.to_owned(), self.client.token_sink.clone())
                 .with_parameters(parameters)
                 .with_tls_config((*tls).clone())
                 .with_streams_concurrency_strategy(
-                    self.client.common.stream_strategy_factory.as_ref(),
+                    self.client.stream_strategy_factory.as_ref(),
                 )
-                .with_zero_rtt(self.client.common.enable_0rtt);
+                .with_zero_rtt(self.client.enable_0rtt);
         let connection = self
             .network
             .configure_connection(builder)
-            .with_defer_idle_timeout(self.client.common.defer_idle_timeout)
+            .with_defer_idle_timeout(self.client.defer_idle_timeout)
             .with_cids(ConnectionId::random_gen(8))
-            .with_qlog(self.client.common.qlogger.clone())
+            .with_qlog(self.client.qlogger.clone())
             .run();
         Ok(connection)
     }
@@ -311,7 +311,7 @@ impl QuicEndpoint {
         }
         let binding = self
             .network
-            .bind_server(named, (*self.server).clone(), self.bind_patterns.clone())
+            .bind_server(named, (*self.server).clone(), self.bind.clone())
             .await
             .context(BindServerSnafu)?;
         self.server_binding_cache
@@ -340,7 +340,7 @@ impl QuicEndpoint {
         let conn = binding.recv().await.ok_or(AcceptError::Shutdown)?;
         let mut observer = self.network.locations().subscribe();
         let weak = Arc::downgrade(&conn);
-        let patterns: Vec<BindPattern> = self.bind_patterns.iter().cloned().collect();
+        let patterns: Vec<BindPattern> = self.bind.iter().cloned().collect();
         tokio::spawn(
             async move {
                 loop {
@@ -388,7 +388,7 @@ impl quic::Connect for QuicEndpoint {
         //   1. DNS results  → add_peer_endpoint
         //   2. local ifaces → add_local_endpoint (via observer)
         let mut observer = self.network.locations().subscribe();
-        let bind_patterns = self.bind_patterns.clone();
+        let bind = self.bind.clone();
 
         loop {
             tokio::select! {
@@ -400,7 +400,7 @@ impl quic::Connect for QuicEndpoint {
                     let _ = connection.add_peer_endpoint(server_ep, source);
                 }
                 Some((bind_uri, event)) = observer.recv() => {
-                    if !bind_patterns.iter().any(|p| p.matches(&bind_uri)) {
+                    if !bind.iter().any(|p| p.matches(&bind_uri)) {
                         continue;
                     }
                     Self::handle_local_addr_event(&connection, bind_uri, event);
@@ -423,7 +423,7 @@ impl quic::Connect for QuicEndpoint {
                                     }
                                     Some((uri, e)) = observer.recv() => {
                                         let Some(c) = weak.upgrade() else { break };
-                                        if bind_patterns.iter().any(|p| p.matches(&uri)) {
+                                        if bind.iter().any(|p| p.matches(&uri)) {
                                             Self::handle_local_addr_event(&c, uri, e);
                                         }
                                     }
@@ -787,14 +787,14 @@ mod tests {
     #[tokio::test]
     async fn test_client_config_mut() {
         let mut endpoint = make_endpoint().await;
-        assert!(!endpoint.client.common.enable_0rtt);
+        assert!(!endpoint.client.enable_0rtt);
 
         {
             let mut guard = endpoint.client_config_mut();
-            guard.common_mut().enable_0rtt = true;
+            guard.enable_0rtt = true;
         } // guard dropped → cache invalidated
 
-        assert!(endpoint.client.common.enable_0rtt);
+        assert!(endpoint.client.enable_0rtt);
     }
 
     #[tokio::test]
@@ -815,14 +815,14 @@ mod tests {
     #[tokio::test]
     async fn test_server_config_mut() {
         let mut endpoint = make_endpoint().await;
-        assert!(!endpoint.server.own.anti_port_scan);
+        assert!(!endpoint.server.anti_port_scan);
 
         {
             let mut guard = endpoint.server_config_mut();
-            guard.own_mut().anti_port_scan = true;
+            guard.anti_port_scan = true;
         }
 
-        assert!(endpoint.server.own.anti_port_scan);
+        assert!(endpoint.server.anti_port_scan);
     }
 
     #[tokio::test]
@@ -965,9 +965,9 @@ mod tests {
                 config: &mut config,
                 cache: &cache,
             };
-            assert!(!guard.own.anti_port_scan);
-            guard.own_mut().anti_port_scan = true;
-            assert!(guard.own.anti_port_scan);
+            assert!(!guard.anti_port_scan);
+            guard.anti_port_scan = true;
+            assert!(guard.anti_port_scan);
         }
     }
 
@@ -1037,7 +1037,7 @@ mod tests {
             incomings_rx: rx,
             config: sni_config,
             guard: reg_guard,
-            bind_patterns: Arc::new(vec![]),
+            bind: Arc::new(vec![]),
         });
 
         let binding = ServerBinding { entry };
@@ -1176,9 +1176,9 @@ mod tests {
                 config: &mut config,
                 cache: &cache,
             };
-            guard.common_mut().enable_0rtt = true;
+            guard.enable_0rtt = true;
         }
-        assert!(config.common.enable_0rtt);
+        assert!(config.enable_0rtt);
     }
 
     #[test]
