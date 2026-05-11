@@ -270,7 +270,7 @@ impl Network {
                     incomings_rx: rx,
                     config: existing.config.clone(),
                     guard: existing.guard.clone(),
-                    bind_patterns: bind_patterns.clone(),
+                    bind: bind_patterns.clone(),
                 }),
             };
             return Ok(binding);
@@ -290,7 +290,7 @@ impl Network {
                             incomings_rx: existing.incomings_rx.clone(),
                             config: existing.config.clone(),
                             guard: existing.guard.clone(),
-                            bind_patterns: bind_patterns.clone(),
+                            bind: bind_patterns.clone(),
                         }),
                     };
                     return Ok(binding);
@@ -334,7 +334,7 @@ impl Network {
             }
         };
 
-        let (incomings_tx, incomings_rx) = async_channel::bounded(server_config.own.backlog);
+        let (incomings_tx, incomings_rx) = async_channel::bounded(server_config.backlog);
 
         let guard = Arc::new(RegistryGuard {
             name: name.clone(),
@@ -349,7 +349,7 @@ impl Network {
             incomings_rx,
             config: slot,
             guard: guard.clone(),
-            bind_patterns: bind_patterns.clone(),
+            bind: bind_patterns.clone(),
         });
 
         // Fix the guard's self_entry to point at the entry we just created.
@@ -575,24 +575,24 @@ impl Network {
         // === STEP 3: Build Connection synchronously — CID registered in QuicRouter NOW ===
         let sni_registry = network.sni_registry.clone();
 
-        let foundation = Connection::new_server(slot.config.own.token_provider.clone())
-            .with_parameters(slot.config.own.parameters.clone())
+        let foundation = Connection::new_server(slot.config.token_provider.clone())
+            .with_parameters(slot.config.parameters.clone())
             .with_client_auther(Box::new((
                 InterfaceAuthClient {
                     bind_uri: bind_uri.clone(),
                     sni_registry: sni_registry.clone(),
                 },
-                slot.config.own.client_auther.clone(),
+                slot.config.client_auther.clone(),
             )))
             .with_tls_config((*slot.rustls_config).clone());
 
         let foundation = network.configure_connection(foundation);
         let conn = foundation
-            .with_streams_concurrency_strategy(slot.config.common.stream_strategy_factory.as_ref())
-            .with_defer_idle_timeout(slot.config.common.defer_idle_timeout)
-            .with_zero_rtt(slot.config.common.enable_0rtt)
+            .with_streams_concurrency_strategy(slot.config.stream_strategy_factory.as_ref())
+            .with_defer_idle_timeout(slot.config.defer_idle_timeout)
+            .with_zero_rtt(slot.config.enable_0rtt)
             .with_cids(origin_dcid)
-            .with_qlog(slot.config.common.qlogger.clone())
+            .with_qlog(slot.config.qlogger.clone())
             .run();
 
         let quic_router = network.quic_router.clone();
@@ -713,10 +713,10 @@ impl AuthClient for InterfaceAuthClient {
 
         match entry {
             None => ClientNameVerifyResult::SilentRefuse("no server registered for SNI".to_owned()),
-            Some(entry) if entry.bind_patterns.is_empty() => ClientNameVerifyResult::Accept,
+            Some(entry) if entry.bind.is_empty() => ClientNameVerifyResult::Accept,
             Some(entry)
                 if entry
-                    .bind_patterns
+                    .bind
                     .iter()
                     .any(|p| p.matches(&self.bind_uri)) =>
             {
@@ -1058,13 +1058,9 @@ mod tests {
 
         let cfg_a = make_server_config();
         let cfg_b = {
-            let own = crate::dquic::server::ServerSpecificConfig {
+            ServerQuicConfig {
                 alpns: vec![b"altproto".to_vec()],
                 ..Default::default()
-            };
-            ServerQuicConfig {
-                common: Arc::default(),
-                own: Arc::new(own),
             }
         };
 
@@ -1088,13 +1084,9 @@ mod tests {
 
         let cfg_a = make_server_config();
         let cfg_b = {
-            let own = crate::dquic::server::ServerSpecificConfig {
+            ServerQuicConfig {
                 alpns: vec![b"altproto".to_vec()],
                 ..Default::default()
-            };
-            ServerQuicConfig {
-                common: Arc::default(),
-                own: Arc::new(own),
             }
         };
 
@@ -1120,7 +1112,7 @@ mod tests {
 
     use crate::{
         dquic::{
-            client::{ClientQuicConfig, ClientSpecificConfig, ServerCertVerifierChoice},
+            client::{ClientQuicConfig, ServerCertVerifierChoice},
             endpoint::QuicEndpoint,
             prelude::{BoundAddr, IO},
             qbase::net::addr::{EndpointAddr, SocketEndpointAddr},
@@ -1230,13 +1222,9 @@ mod tests {
 
         // Client with dangerous verifier (cert was issued for `localhost` so
         // webpki would reject `alpha`/`beta` even though they share material).
-        let client_own = ClientSpecificConfig {
+        let client_quic_config = ClientQuicConfig {
             verifier: ServerCertVerifierChoice::Dangerous,
             ..Default::default()
-        };
-        let client_quic_config = ClientQuicConfig {
-            common: Arc::default(),
-            own: Arc::new(client_own),
         };
         let client_quic = QuicEndpoint::builder()
             .network(network.clone())

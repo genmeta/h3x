@@ -36,7 +36,7 @@ pub(crate) struct ServerEntry {
     /// clone drops, the entry is removed from `sni_registry`.
     pub(crate) guard: Arc<RegistryGuard>,
     /// Bind patterns associated with this server entry.
-    pub(crate) bind_patterns: Arc<Vec<BindPattern>>,
+    pub(crate) bind: Arc<Vec<BindPattern>>,
 }
 
 /// RAII guard that removes an SNI entry from the registry when the last
