@@ -96,7 +96,7 @@ pub async fn test_server_with(
         .network(network.clone())
         .identity(identity)
         .resolver(Arc::new(SystemResolver))
-        .bind_patterns(Arc::new(vec![
+        .bind(Arc::new(vec![
             std::str::FromStr::from_str("inet://127.0.0.1:0").expect("valid pattern"),
         ]))
         .build()

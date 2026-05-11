@@ -197,7 +197,7 @@ fn missing_server_name_closes_connection_with_no_error() {
                 .network(network.clone())
                 .identity(identity)
                 .resolver(Arc::new(SystemResolver))
-                .bind_patterns(Arc::new(vec![
+                .bind(Arc::new(vec![
                     FromStr::from_str("inet://127.0.0.1:0").unwrap(),
                 ]))
                 .build()
