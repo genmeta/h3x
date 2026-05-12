@@ -19,7 +19,7 @@ use crate::{
         },
         protocol::{
             AcceptRawMessageStreamError, BoxDynQuicStreamReader, BoxDynQuicStreamWriter,
-            DHttpState, InitialRawMessageStreamError,
+            DHttpProtocol, InitialRawMessageStreamError,
         },
     },
     error::{Code, H3FrameDecodeError, H3FrameUnexpected},
@@ -104,24 +104,25 @@ impl From<MessageStreamError> for io::Error {
 pub struct ReadStream {
     pub(super) stream: FrameStream<BoxDynQuicStreamReader>,
     pub(super) qpack_decoder: Arc<QPackDecoder>,
-    pub(super) connection: Arc<dyn quic::DynLifecycle + Send + Sync>,
-    dhttp_state: Arc<DHttpState>,
+    pub(super) state: ConnectionState<dyn quic::DynConnection>,
 }
 
 impl ReadStream {
     pub fn new(
         stream: StreamReader<BoxDynQuicStreamReader>,
         qpack_decoder: Arc<QPackDecoder>,
-        connection: Arc<dyn quic::DynLifecycle + Send + Sync>,
-        dhttp_state: Arc<DHttpState>,
+        state: ConnectionState<dyn quic::DynConnection>,
     ) -> Self {
         let frame_stream = FrameStream::new(stream);
         Self {
             stream: frame_stream,
             qpack_decoder,
-            connection,
-            dhttp_state,
+            state,
         }
+    }
+
+    pub fn connection(&self) -> &Arc<dyn quic::DynConnection> {
+        self.state.quic()
     }
 
     pub async fn peer_goaway_covers(
@@ -129,11 +130,17 @@ impl ReadStream {
     ) -> Result<impl Future<Output = Result<(), quic::ConnectionError>> + use<>, quic::StreamError>
     {
         let stream_id = self.stream.stream_id().await?;
-        let dhttp_state = self.dhttp_state.clone();
-        let conn = self.connection.clone();
+        let state = self.state.clone();
 
         Ok(async move {
+            let conn = state.quic().clone();
             let error = conn.closed();
+            let dhttp_state = state
+                .protocols()
+                .get::<DHttpProtocol>()
+                .unwrap()
+                .state
+                .clone();
             tokio::select! {
                 biased;
                 _goaway = dhttp_state.peer_goaway_covers(stream_id) => Ok(()),
@@ -178,7 +185,8 @@ impl ReadStream {
     ) -> quic::StreamError {
         match error {
             connection::StreamError::Connection { source } => self
-                .connection
+                .state
+                .quic()
                 .as_ref()
                 .handle_connection_error(source)
                 .await
@@ -274,8 +282,7 @@ impl ReadStream {
         Self {
             stream: FrameStream::new(StreamReader::new(taken)),
             qpack_decoder: self.qpack_decoder.clone(),
-            connection: self.connection.clone(),
-            dhttp_state: self.dhttp_state.clone(),
+            state: self.state.clone(),
         }
     }
 }
@@ -302,8 +309,209 @@ impl quic::StopStream for ReadStream {
 pub struct WriteStream {
     pub(super) stream: SinkWriter<BoxDynQuicStreamWriter>,
     pub(super) qpack_encoder: Arc<QPackEncoder>,
-    pub(super) connection: Arc<dyn quic::DynLifecycle + Send + Sync>,
-    dhttp_state: Arc<DHttpState>,
+    pub(super) state: ConnectionState<dyn quic::DynConnection>,
+}
+
+#[cfg(test)]
+impl ReadStream {
+    pub(crate) fn new_for_test(stream_id: VarInt) -> Self {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+
+        use bytes::Bytes;
+        use futures::{Sink, Stream};
+
+        struct TestReader {
+            stream_id: VarInt,
+        }
+        impl quic::GetStreamId for TestReader {
+            fn poll_stream_id(
+                self: Pin<&mut Self>,
+                _cx: &mut Context,
+            ) -> Poll<Result<VarInt, quic::StreamError>> {
+                Poll::Ready(Ok(self.get_mut().stream_id))
+            }
+        }
+        impl quic::StopStream for TestReader {
+            fn poll_stop(
+                self: Pin<&mut Self>,
+                _cx: &mut Context,
+                _code: VarInt,
+            ) -> Poll<Result<(), quic::StreamError>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl Stream for TestReader {
+            type Item = Result<Bytes, quic::StreamError>;
+            fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                Poll::Ready(None)
+            }
+        }
+
+        fn dec_sink() -> Pin<
+            Box<
+                dyn Sink<
+                        crate::qpack::decoder::DecoderInstruction,
+                        Error = crate::connection::StreamError,
+                    > + Send,
+            >,
+        > {
+            Box::pin(
+                futures::sink::drain::<crate::qpack::decoder::DecoderInstruction>()
+                    .sink_map_err(|never| match never {}),
+            )
+        }
+        fn dec_stream() -> Pin<
+            Box<
+                dyn Stream<
+                        Item = Result<
+                            crate::qpack::encoder::EncoderInstruction,
+                            crate::connection::StreamError,
+                        >,
+                    > + Send,
+            >,
+        > {
+            Box::pin(futures::stream::empty::<
+                Result<crate::qpack::encoder::EncoderInstruction, crate::connection::StreamError>,
+            >())
+        }
+
+        let mock = Arc::new(crate::connection::tests::MockConnection::new());
+        let erased: Arc<dyn quic::DynConnection> = mock;
+
+        let mut protocols = crate::protocol::Protocols::new();
+        protocols.insert(crate::dhttp::protocol::DHttpProtocol::new_for_test(
+            erased.clone(),
+        ));
+        let state = crate::connection::ConnectionState::new_for_test(erased, Arc::new(protocols));
+
+        let reader =
+            StreamReader::new(guard::GuardedQuicReader::new(
+                Box::pin(TestReader { stream_id }) as crate::codec::BoxReadStream,
+            ));
+
+        ReadStream::new(
+            reader,
+            Arc::new(QPackDecoder::new(
+                Arc::new(crate::dhttp::settings::Settings::default()),
+                dec_sink(),
+                dec_stream(),
+            )),
+            state,
+        )
+    }
+}
+
+#[cfg(test)]
+impl WriteStream {
+    pub(crate) fn new_for_test(stream_id: VarInt) -> Self {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+
+        use bytes::Bytes;
+        use futures::{Sink, Stream};
+
+        struct TestWriter {
+            stream_id: VarInt,
+        }
+        impl quic::GetStreamId for TestWriter {
+            fn poll_stream_id(
+                self: Pin<&mut Self>,
+                _cx: &mut Context,
+            ) -> Poll<Result<VarInt, quic::StreamError>> {
+                Poll::Ready(Ok(self.get_mut().stream_id))
+            }
+        }
+        impl quic::CancelStream for TestWriter {
+            fn poll_cancel(
+                self: Pin<&mut Self>,
+                _cx: &mut Context,
+                _code: VarInt,
+            ) -> Poll<Result<(), quic::StreamError>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl Sink<Bytes> for TestWriter {
+            type Error = quic::StreamError;
+            fn poll_ready(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn start_send(self: Pin<&mut Self>, _item: Bytes) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_close(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn enc_sink() -> Pin<
+            Box<
+                dyn Sink<
+                        crate::qpack::encoder::EncoderInstruction,
+                        Error = crate::connection::StreamError,
+                    > + Send,
+            >,
+        > {
+            Box::pin(
+                futures::sink::drain::<crate::qpack::encoder::EncoderInstruction>()
+                    .sink_map_err(|never| match never {}),
+            )
+        }
+        fn enc_stream() -> Pin<
+            Box<
+                dyn Stream<
+                        Item = Result<
+                            crate::qpack::decoder::DecoderInstruction,
+                            crate::connection::StreamError,
+                        >,
+                    > + Send,
+            >,
+        > {
+            Box::pin(futures::stream::empty::<
+                Result<crate::qpack::decoder::DecoderInstruction, crate::connection::StreamError>,
+            >())
+        }
+
+        let mock = Arc::new(crate::connection::tests::MockConnection::new());
+        let erased: Arc<dyn quic::DynConnection> = mock;
+
+        let mut protocols = crate::protocol::Protocols::new();
+        protocols.insert(crate::dhttp::protocol::DHttpProtocol::new_for_test(
+            erased.clone(),
+        ));
+        let state = crate::connection::ConnectionState::new_for_test(erased, Arc::new(protocols));
+
+        let writer =
+            SinkWriter::new(guard::GuardedQuicWriter::new(
+                Box::pin(TestWriter { stream_id }) as crate::codec::BoxWriteStream,
+            ));
+
+        WriteStream::new(
+            writer,
+            Arc::new(QPackEncoder::new(
+                Arc::new(crate::dhttp::settings::Settings::default()),
+                enc_sink(),
+                enc_stream(),
+            )),
+            state,
+        )
+    }
 }
 
 pub const DEFAULT_COMPRESS_ALGO: DynamicCompressAlgo<HuffmanAlways> =
@@ -313,14 +521,12 @@ impl WriteStream {
     pub fn new(
         stream: SinkWriter<BoxDynQuicStreamWriter>,
         qpack_encoder: Arc<QPackEncoder>,
-        connection: Arc<dyn quic::DynLifecycle + Send + Sync>,
-        dhttp_state: Arc<DHttpState>,
+        state: ConnectionState<dyn quic::DynConnection>,
     ) -> Self {
         Self {
             stream,
             qpack_encoder,
-            connection,
-            dhttp_state,
+            state,
         }
     }
 
@@ -336,11 +542,17 @@ impl WriteStream {
     ) -> Result<impl Future<Output = Result<(), quic::ConnectionError>> + use<>, quic::StreamError>
     {
         let stream_id = self.stream.stream_id().await?;
-        let dhttp_state = self.dhttp_state.clone();
-        let conn = self.connection.clone();
+        let state = self.state.clone();
 
         Ok(async move {
+            let conn = state.quic().clone();
             let error = conn.closed();
+            let dhttp_state = state
+                .protocols()
+                .get::<DHttpProtocol>()
+                .unwrap()
+                .state
+                .clone();
             tokio::select! {
                 biased;
                 _goaway = dhttp_state.peer_goaway_covers(stream_id) => Ok(()),
@@ -386,7 +598,8 @@ impl WriteStream {
     ) -> quic::StreamError {
         match error {
             connection::StreamError::Connection { source } => self
-                .connection
+                .state
+                .quic()
                 .as_ref()
                 .handle_connection_error(source)
                 .await
@@ -452,8 +665,7 @@ impl WriteStream {
         Self {
             stream: SinkWriter::new(taken),
             qpack_encoder: self.qpack_encoder.clone(),
-            connection: self.connection.clone(),
-            dhttp_state: self.dhttp_state.clone(),
+            state: self.state.clone(),
         }
     }
 }
@@ -499,44 +711,24 @@ impl<C: quic::Connection> ConnectionState<C> {
     pub async fn initial_message_stream(
         &self,
     ) -> Result<(ReadStream, WriteStream), InitialMessageStreamError> {
+        let state = self.erase();
         let qpack = self.qpack()?;
-        let dhttp = self.dhttp();
         let (reader, writer) = self.initial_raw_message_stream().await?;
         Ok((
-            ReadStream::new(
-                reader,
-                qpack.decoder.clone(),
-                self.quic().clone() as Arc<dyn quic::DynLifecycle + Send + Sync>,
-                dhttp.state.clone(),
-            ),
-            WriteStream::new(
-                writer,
-                qpack.encoder.clone(),
-                self.quic().clone() as Arc<dyn quic::DynLifecycle + Send + Sync>,
-                dhttp.state.clone(),
-            ),
+            ReadStream::new(reader, qpack.decoder.clone(), state.clone()),
+            WriteStream::new(writer, qpack.encoder.clone(), state),
         ))
     }
 
     pub async fn accept_message_stream(
         &self,
     ) -> Result<(ReadStream, WriteStream), AcceptMessageStreamError> {
+        let state = self.erase();
         let qpack = self.qpack()?;
-        let dhttp = self.dhttp();
         let (reader, writer) = self.accept_raw_message_stream().await?;
         Ok((
-            ReadStream::new(
-                reader,
-                qpack.decoder.clone(),
-                self.quic().clone() as Arc<dyn quic::DynLifecycle + Send + Sync>,
-                dhttp.state.clone(),
-            ),
-            WriteStream::new(
-                writer,
-                qpack.encoder.clone(),
-                self.quic().clone() as Arc<dyn quic::DynLifecycle + Send + Sync>,
-                dhttp.state.clone(),
-            ),
+            ReadStream::new(reader, qpack.decoder.clone(), state.clone()),
+            WriteStream::new(writer, qpack.encoder.clone(), state),
         ))
     }
 }
@@ -729,13 +921,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_stream_try_stream_io_aborts_when_peer_goaway_covers_stream() {
-        let quic = Arc::new(MockConnection::new());
-        let erased_connection: Arc<dyn quic::DynConnection> = quic.clone();
-        let connection: Arc<dyn quic::DynLifecycle + Send + Sync> = quic.clone();
+        let erased: Arc<dyn quic::DynConnection> = Arc::new(MockConnection::new());
 
         let mut protocols = Protocols::new();
-        protocols.insert(DHttpProtocol::new_for_test(erased_connection));
-        let state = ConnectionState::new_for_test(quic.clone(), Arc::new(protocols));
+        protocols.insert(DHttpProtocol::new_for_test(erased.clone()));
+        let state = ConnectionState::new_for_test(erased, Arc::new(protocols));
 
         let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TestReadStream {
             stream_id: VarInt::from_u32(10),
@@ -748,8 +938,7 @@ mod tests {
                 qpack_decoder_sink(),
                 qpack_decoder_stream(),
             )),
-            connection,
-            state.dhttp().state.clone(),
+            state.clone(),
         );
 
         state
@@ -773,13 +962,11 @@ mod tests {
 
     #[tokio::test]
     async fn write_stream_try_stream_io_aborts_when_peer_goaway_covers_stream() {
-        let quic = Arc::new(MockConnection::new());
-        let erased_connection: Arc<dyn quic::DynConnection> = quic.clone();
-        let connection: Arc<dyn quic::DynLifecycle + Send + Sync> = quic.clone();
+        let erased: Arc<dyn quic::DynConnection> = Arc::new(MockConnection::new());
 
         let mut protocols = Protocols::new();
-        protocols.insert(DHttpProtocol::new_for_test(erased_connection));
-        let state = ConnectionState::new_for_test(quic.clone(), Arc::new(protocols));
+        protocols.insert(DHttpProtocol::new_for_test(erased.clone()));
+        let state = ConnectionState::new_for_test(erased, Arc::new(protocols));
 
         let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TestWriteStream {
             stream_id: VarInt::from_u32(12),
@@ -792,8 +979,7 @@ mod tests {
                 qpack_encoder_sink(),
                 qpack_encoder_stream(),
             )),
-            connection,
-            state.dhttp().state.clone(),
+            state.clone(),
         );
 
         state

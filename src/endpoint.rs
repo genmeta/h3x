@@ -15,8 +15,14 @@ use tracing::Instrument;
 
 use crate::{
     connection::{Connection as H3Connection, ConnectionBuilder},
-    endpoint::{client::PendingRequest, server::UnresolvedRequest},
-    message::stream::{ReadStream, WriteStream},
+    endpoint::{
+        client::{Arbiter, Request as ClientRequest},
+        server::UnresolvedRequest,
+    },
+    message::{
+        stream::{ReadStream, WriteStream},
+        unify::Message,
+    },
     pool::{self, Pool},
     quic::{self, GetStreamIdExt},
     stream_id::StreamId,
@@ -98,8 +104,6 @@ impl<T: quic::Connect> H3Endpoint<T> {
         }
     }
 
-    // https://reimi.pilot~/xxx
-
     /// Obtain (or reuse) an HTTP/3 connection to `server` from the pool.
     pub async fn connect(
         &self,
@@ -109,67 +113,93 @@ impl<T: quic::Connect> H3Endpoint<T> {
             .reuse_or_connect_with(&self.quic, self.builder.clone(), server)
             .await
     }
+}
 
-    /// Create a new pending HTTP request builder.
-    pub fn new_request(&self) -> PendingRequest<T, &Self> {
-        PendingRequest {
-            endpoint: self,
-            request: crate::message::unify::Message::unresolved_request(),
-            auto_close: true,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
-    /// Create a new pending HTTP request builder from a shared endpoint.
-    pub fn new_request_owned(self: &Arc<Self>) -> PendingRequest<T, Arc<Self>> {
-        PendingRequest {
-            endpoint: Arc::clone(self),
-            request: crate::message::unify::Message::unresolved_request(),
-            auto_close: true,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
+impl<T: quic::Connect> H3Endpoint<T>
+where
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
     /// Convenience method to create a GET request for `uri`.
-    pub fn get(&self, uri: Uri) -> PendingRequest<T, &Self> {
-        self.new_request().with_method(Method::GET).with_uri(uri)
+    ///
+    /// Requires the endpoint to be wrapped in [`Arc`] so the returned
+    /// [`Request`](client::Request) satisfies `'static` bounds for async use.
+    pub fn get(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
+        let authority = uri.authority().cloned().unwrap();
+        let mut msg = Message::unresolved_request();
+        msg.header_mut().set_method(Method::GET);
+        msg.header_mut().set_uri(uri);
+        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
+        ClientRequest::new(arbiter)
     }
 
     /// Convenience method to create a POST request for `uri`.
-    pub fn post(&self, uri: Uri) -> PendingRequest<T, &Self> {
-        self.new_request().with_method(Method::POST).with_uri(uri)
+    pub fn post(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
+        let authority = uri.authority().cloned().unwrap();
+        let mut msg = Message::unresolved_request();
+        msg.header_mut().set_method(Method::POST);
+        msg.header_mut().set_uri(uri);
+        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
+        ClientRequest::new(arbiter)
     }
 
     /// Convenience method to create a PUT request for `uri`.
-    pub fn put(&self, uri: Uri) -> PendingRequest<T, &Self> {
-        self.new_request().with_method(Method::PUT).with_uri(uri)
+    pub fn put(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
+        let authority = uri.authority().cloned().unwrap();
+        let mut msg = Message::unresolved_request();
+        msg.header_mut().set_method(Method::PUT);
+        msg.header_mut().set_uri(uri);
+        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
+        ClientRequest::new(arbiter)
     }
 
     /// Convenience method to create a DELETE request for `uri`.
-    pub fn delete(&self, uri: Uri) -> PendingRequest<T, &Self> {
-        self.new_request().with_method(Method::DELETE).with_uri(uri)
+    pub fn delete(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
+        let authority = uri.authority().cloned().unwrap();
+        let mut msg = Message::unresolved_request();
+        msg.header_mut().set_method(Method::DELETE);
+        msg.header_mut().set_uri(uri);
+        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
+        ClientRequest::new(arbiter)
     }
 
     /// Convenience method to create a PATCH request for `uri`.
-    pub fn patch(&self, uri: Uri) -> PendingRequest<T, &Self> {
-        self.new_request().with_method(Method::PATCH).with_uri(uri)
+    pub fn patch(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
+        let authority = uri.authority().cloned().unwrap();
+        let mut msg = Message::unresolved_request();
+        msg.header_mut().set_method(Method::PATCH);
+        msg.header_mut().set_uri(uri);
+        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
+        ClientRequest::new(arbiter)
     }
 
     /// Convenience method to create a HEAD request for `uri`.
-    pub fn head(&self, uri: Uri) -> PendingRequest<T, &Self> {
-        self.new_request().with_method(Method::HEAD).with_uri(uri)
+    pub fn head(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
+        let authority = uri.authority().cloned().unwrap();
+        let mut msg = Message::unresolved_request();
+        msg.header_mut().set_method(Method::HEAD);
+        msg.header_mut().set_uri(uri);
+        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
+        ClientRequest::new(arbiter)
     }
 
     /// Convenience method to create an OPTIONS request for `uri`.
-    pub fn options(&self, uri: Uri) -> PendingRequest<T, &Self> {
-        self.new_request()
-            .with_method(Method::OPTIONS)
-            .with_uri(uri)
+    pub fn options(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
+        let authority = uri.authority().cloned().unwrap();
+        let mut msg = Message::unresolved_request();
+        msg.header_mut().set_method(Method::OPTIONS);
+        msg.header_mut().set_uri(uri);
+        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
+        ClientRequest::new(arbiter)
     }
 
     /// Convenience method to create a TRACE request for `uri`.
-    pub fn trace(&self, uri: Uri) -> PendingRequest<T, &Self> {
-        self.new_request().with_method(Method::TRACE).with_uri(uri)
+    pub fn trace(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
+        let authority = uri.authority().cloned().unwrap();
+        let mut msg = Message::unresolved_request();
+        msg.header_mut().set_method(Method::TRACE);
+        msg.header_mut().set_uri(uri);
+        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
+        ClientRequest::new(arbiter)
     }
 }
 
@@ -275,20 +305,8 @@ where
                 return;
             }
         };
-        let dhttp = h3_conn.dhttp();
-
-        let read_stream = ReadStream::new(
-            reader,
-            qpack.decoder.clone(),
-            h3_conn.quic().clone() as Arc<dyn quic::DynLifecycle + Send + Sync>,
-            dhttp.state.clone(),
-        );
-        let write_stream = WriteStream::new(
-            writer,
-            qpack.encoder.clone(),
-            h3_conn.quic().clone() as Arc<dyn quic::DynLifecycle + Send + Sync>,
-            dhttp.state.clone(),
-        );
+        let read_stream = ReadStream::new(reader, qpack.decoder.clone(), (*erased).clone());
+        let write_stream = WriteStream::new(writer, qpack.encoder.clone(), (*erased).clone());
 
         let request = UnresolvedRequest {
             stream_id,
