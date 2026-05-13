@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     error::Error,
+    fmt::Display,
     future::IntoFuture,
     ops::{Deref, DerefMut},
     sync::{
@@ -32,6 +33,16 @@ use crate::{
     qpack::field::MalformedHeaderSection,
     quic::{self, agent},
 };
+
+/// Debug-only warning when a builder method is called on an already-consumed Request.
+/// In release builds this is a no-op.
+fn debug_warn_consumed(method: impl Display) {
+    #[cfg(debug_assertions)]
+    tracing::warn!(
+        %method,
+        "{method}() called on already-consumed Request -- no-op, will fail at .await"
+    );
+}
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
@@ -435,15 +446,18 @@ where
         }
     }
 
-    pub fn method(&self, method: Method) -> &Self {
+    pub fn set_method(&self, method: Method) -> &Self {
         if let Ok(mut message) = self.message() {
             message.header_mut().set_method(method);
+        } else {
+            debug_warn_consumed("method");
         }
         self
     }
 
-    pub fn uri(&self, uri: Uri) -> &Self {
+    pub fn set_uri(&self, uri: Uri) -> &Self {
         let Ok(mut message) = self.message() else {
+            debug_warn_consumed("uri");
             return self;
         };
         if let Some(auth) = uri.authority().cloned()
@@ -456,10 +470,85 @@ where
         self
     }
 
-    pub fn header(&self, name: impl IntoHeaderName, value: HeaderValue) -> &Self {
+    pub fn set_header(&self, name: impl IntoHeaderName, value: HeaderValue) -> &Self {
         if let Ok(mut message) = self.message() {
             message.header_mut().header_map.insert(name, value);
+        } else {
+            debug_warn_consumed("header");
         }
+        self
+    }
+
+    pub fn set_headers(&self, headers: HeaderMap) -> &Self {
+        if let Ok(mut message) = self.message() {
+            message.header_mut().header_map.extend(headers);
+        } else {
+            debug_warn_consumed("headers");
+        }
+        self
+    }
+
+    pub fn set_body(&self, content: impl Buf + Send) -> &Self {
+        if let Ok(mut message) = self.message() {
+            if let Ok(cursor) = message.chunked_body() {
+                cursor.write(content);
+            }
+        } else {
+            debug_warn_consumed("body");
+        }
+        self
+    }
+
+    pub fn set_trailer(&self, name: impl IntoHeaderName, value: HeaderValue) -> &Self {
+        if let Ok(mut message) = self.message() {
+            message.trailers_mut().insert(name, value);
+        } else {
+            debug_warn_consumed("trailer");
+        }
+        self
+    }
+
+    pub fn set_trailers(&self, trailers: HeaderMap) -> &Self {
+        if let Ok(mut message) = self.message() {
+            message.trailers_mut().extend(trailers);
+        } else {
+            debug_warn_consumed("trailers");
+        }
+        self
+    }
+
+    pub fn method(self, method: Method) -> Self {
+        self.set_method(method);
+        self
+    }
+
+    pub fn uri(self, uri: Uri) -> Self {
+        self.set_uri(uri);
+        self
+    }
+
+    pub fn header(self, name: impl IntoHeaderName, value: HeaderValue) -> Self {
+        self.set_header(name, value);
+        self
+    }
+
+    pub fn headers(self, headers: HeaderMap) -> Self {
+        self.set_headers(headers);
+        self
+    }
+
+    pub fn body(self, content: impl Buf + Send) -> Self {
+        self.set_body(content);
+        self
+    }
+
+    pub fn trailer(self, name: impl IntoHeaderName, value: HeaderValue) -> Self {
+        self.set_trailer(name, value);
+        self
+    }
+
+    pub fn trailers(self, trailers: HeaderMap) -> Self {
+        self.set_trailers(trailers);
         self
     }
 }
@@ -1333,7 +1422,7 @@ mod tests {
         let req = request_with_message(&arbiter);
 
         let uri: Uri = "https://sync.example.com/path".parse().expect("valid URI");
-        req.uri(uri);
+        req.set_uri(uri);
 
         let stored = arbiter.authority.lock().expect("lock poisoned").clone();
         assert_eq!(
@@ -1374,7 +1463,7 @@ mod tests {
         let uri: Uri = "https://different.example.com/path"
             .parse()
             .expect("valid URI");
-        req.uri(uri);
+        req.set_uri(uri);
 
         // Retrieve the message back and check it's malformed
         let msg_guard = req.message().expect("should be able to get message");

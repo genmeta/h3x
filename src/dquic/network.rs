@@ -1230,7 +1230,7 @@ mod tests {
             let authority: Authority = format!("{sni}:{port}").parse().unwrap();
             let uri: http::Uri = format!("https://{authority}/hello").parse().unwrap();
             let req = client.new_request();
-            req.method(Method::GET).uri(uri);
+            req.set_method(Method::GET).set_uri(uri);
             let mut resp = req
                 .await
                 .unwrap_or_else(|e| panic!("request for {sni} failed: {e:?}"));
