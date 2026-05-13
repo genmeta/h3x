@@ -76,7 +76,10 @@ default = ["dquic", "hyper"]
 dquic = ["dep:dquic", "dep:arc-swap", "dep:async-channel", "dep:derive_more", "dep:either", "dep:globset", "dep:peg", "tokio/time"]
 hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
+# EXPERIMENTAL — broken due to remoc 0.18 codec changes (--all-features SKIP)
+# Do not enable without also enabling a default-codec-* remoc feature.
 rpc = ["dep:remoc", "serde", "bytes/serde"]
+# EXPERIMENTAL — depends on broken rpc feature
 ipc = ["rpc", "dep:nix", "dep:smallvec", "tokio/net"]
 webtransport = []
 testing = []

@@ -1268,12 +1268,13 @@ mod tests {
 
         let req = request_with_message(&arbiter);
         let _clone = req.clone();
-        let req_arbiter = req.arbiter.borrow();
-        assert!(
-            Arc::strong_count(req_arbiter.as_ref().expect("arbiter should be Some")) >= 2,
-            "clone should increase Arc refcount"
-        );
-        drop(req_arbiter);
+        {
+            let req_arbiter = req.arbiter.borrow();
+            assert!(
+                Arc::strong_count(req_arbiter.as_ref().expect("arbiter should be Some")) >= 2,
+                "clone should increase Arc refcount"
+            );
+        }
 
         let result = req.await;
         assert!(
@@ -1314,12 +1315,13 @@ mod tests {
 
         let req = request_with_message(&arbiter);
         let _clone = req.clone();
-        let req_arbiter = req.arbiter.borrow();
-        assert!(
-            Arc::strong_count(req_arbiter.as_ref().expect("arbiter should be Some")) >= 2,
-            "clone should increase Arc refcount → split path"
-        );
-        drop(req_arbiter);
+        {
+            let req_arbiter = req.arbiter.borrow();
+            assert!(
+                Arc::strong_count(req_arbiter.as_ref().expect("arbiter should be Some")) >= 2,
+                "clone should increase Arc refcount → split path"
+            );
+        }
 
         // The split path is exercised via await; the exact error is
         // MessageStream (TestReader returns None) — that proves we entered
