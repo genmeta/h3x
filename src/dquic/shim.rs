@@ -21,7 +21,7 @@ use crate::{
 
 pub fn convert_varint(varint: dquic::prelude::VarInt) -> VarInt {
     // dquic's VarInt is already bounds-checked to RFC 9000 spec (< 2^62)
-    VarInt::from_u64(varint.into_inner()).expect("dquic VarInt is within valid range")
+    VarInt::from_u64(varint.into_u64()).expect("dquic VarInt is within valid range")
 }
 
 pub fn convert_connection_error(error: dquic::prelude::Error) -> quic::ConnectionError {

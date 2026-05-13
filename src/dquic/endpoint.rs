@@ -1,6 +1,6 @@
 //! QUIC-only endpoint built on top of a shared [`Network`].
 
-use std::{any::Any, str::FromStr, sync::Arc};
+use std::{any::Any, net::SocketAddr, str::FromStr, sync::Arc};
 
 use arc_swap::ArcSwapOption;
 use bon::bon;
@@ -15,7 +15,7 @@ use crate::{
         client::{ClientQuicConfig, ServerCertVerifierChoice},
         connection::Connection,
         identity::Identity,
-        net::{BindUri, BoundAddr, ConnectionId, EndpointAddr, SocketEndpointAddr},
+        net::{BindUri, ConnectionId, EndpointAddr},
         network::{BindHandle, BindServerError, Network, ServerBinding},
         resolver::Resolve,
         server::ServerQuicConfig,
@@ -571,22 +571,14 @@ impl QuicEndpoint {
         bind_uri: BindUri,
         event: crate::dquic::qinterface::component::location::AddressEvent<dyn Any + Send + Sync>,
     ) {
-        use crate::dquic::{
-            qbase::net::addr::BleEndpontAddr, qinterface::component::location::AddressEvent,
-        };
+        use crate::dquic::qinterface::component::location::AddressEvent;
 
-        let event = match event.downcast::<std::io::Result<BoundAddr>>() {
+        let event = match event.downcast::<std::io::Result<SocketAddr>>() {
             Ok(AddressEvent::Upsert(data)) => {
-                let Ok(bound_addr) = data.as_ref() else {
+                let Ok(addr) = *data.as_ref() else {
                     return;
                 };
-                let endpoint_addr = match *bound_addr {
-                    BoundAddr::Internet(addr) => {
-                        EndpointAddr::Socket(SocketEndpointAddr::direct(addr))
-                    }
-                    BoundAddr::Bluetooth(addr) => EndpointAddr::Ble(BleEndpontAddr::new(addr)),
-                    _ => return,
-                };
+                let endpoint_addr = EndpointAddr::direct(addr);
                 if let Err(e) = conn.add_local_endpoint(bind_uri, endpoint_addr) {
                     let report = snafu::Report::from_error(&e);
                     tracing::warn!(

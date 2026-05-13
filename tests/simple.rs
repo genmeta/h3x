@@ -170,7 +170,7 @@ fn missing_server_name_closes_connection_with_no_error() {
     use h3x::{
         dquic::{
             Identity, ServerName,
-            qbase::net::addr::{EndpointAddr, SocketEndpointAddr},
+            qbase::net::addr::EndpointAddr,
             qresolve::{Resolve, ResolveFuture, Source},
         },
         endpoint::H3Endpoint,
@@ -187,7 +187,7 @@ fn missing_server_name_closes_connection_with_no_error() {
 
     impl Resolve for FixedResolver {
         fn lookup<'l>(&'l self, _name: &'l str) -> ResolveFuture<'l> {
-            let ep = EndpointAddr::Socket(SocketEndpointAddr::direct(self.0));
+            let ep = EndpointAddr::direct(self.0);
             let source = Source::System;
             async move { Ok(stream::iter(std::iter::once((source, ep))).boxed()) }.boxed()
         }
@@ -220,10 +220,11 @@ fn missing_server_name_closes_connection_with_no_error() {
                 .into_iter()
                 .next()
                 .expect("no bound interface");
-            let port = match bind_iface.borrow().bound_addr().expect("no bound addr") {
-                dquic::prelude::BoundAddr::Internet(s) => s.port(),
-                _ => panic!("expected internet"),
-            };
+            let port = bind_iface
+                .borrow()
+                .bound_addr()
+                .expect("no bound addr")
+                .port();
             let mut server = H3Endpoint::new(quic);
             let host: http::uri::Authority = format!("localhost:{port}")
                 .parse()

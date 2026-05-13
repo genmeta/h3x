@@ -7,7 +7,7 @@ use std::{
 
 use h3x::dquic::{
     cert::handy::{ToCertificate, ToPrivateKey},
-    net::{BoundAddr, IO},
+    net::IO,
     resolver::handy::SystemResolver,
 };
 use http::uri::Authority;
@@ -106,10 +106,11 @@ pub async fn test_server_with(
         .into_iter()
         .next()
         .expect("no bound interface");
-    let port = match bind_iface.borrow().bound_addr().expect("no bound addr") {
-        BoundAddr::Internet(s) => s.port(),
-        _ => panic!("expected internet address"),
-    };
+    let port = bind_iface
+        .borrow()
+        .bound_addr()
+        .expect("no bound addr")
+        .port();
     let authority = Authority::from_maybe_shared(format!("localhost:{port}"))
         .expect("failed to parse authority");
     (h3x::endpoint::H3Endpoint::new(quic), authority)

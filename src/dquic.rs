@@ -88,11 +88,11 @@ pub mod net {
         prelude::{IO, IoExt},
         qbase::{
             cid::ConnectionId,
-            net::addr::{BleEndpontAddr, BoundAddr, EndpointAddr, SocketEndpointAddr},
+            net::{self, Family, addr::EndpointAddr},
         },
         qinterface::{
             BindInterface,
-            bind_uri::{BindUri, ParseBindUriError},
+            bind_uri::{BindUri, ParseError, Scheme},
             component::{location::Locations, route::QuicRouter},
             device::Devices,
             io::ProductIO,

@@ -1109,8 +1109,8 @@ mod tests {
         dquic::{
             client::{ClientQuicConfig, ServerCertVerifierChoice},
             endpoint::QuicEndpoint,
-            prelude::{BoundAddr, IO},
-            qbase::net::addr::{EndpointAddr, SocketEndpointAddr},
+            prelude::IO,
+            qbase::net::addr::EndpointAddr,
             qresolve::{Resolve, ResolveFuture, Source},
         },
         endpoint::{
@@ -1133,7 +1133,7 @@ mod tests {
 
     impl Resolve for FixedResolver {
         fn lookup<'l>(&'l self, _name: &'l str) -> ResolveFuture<'l> {
-            let ep = EndpointAddr::Socket(SocketEndpointAddr::direct(self.0));
+            let ep = EndpointAddr::direct(self.0);
             let source = Source::System;
             async move { Ok(stream::iter(std::iter::once((source, ep))).boxed()) }.boxed()
         }
@@ -1169,10 +1169,7 @@ mod tests {
             .bind(BindPattern::from_str("inet://127.0.0.1:0").unwrap())
             .await;
         let bind_iface = network.interfaces().into_iter().next().unwrap();
-        let port = match bind_iface.borrow().bound_addr().unwrap() {
-            BoundAddr::Internet(s) => s.port(),
-            _ => unreachable!(),
-        };
+        let port = bind_iface.borrow().bound_addr().unwrap().port();
         let resolver: Arc<dyn Resolve + Send + Sync> =
             Arc::new(FixedResolver(format!("127.0.0.1:{port}").parse().unwrap()));
 
