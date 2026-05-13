@@ -137,9 +137,14 @@ where
 
     /// Create a new request borrowing this endpoint.
     ///
-    /// This version uses `&H3Endpoint<T>` as the endpoint type parameter.
+    /// This is the primary method for creating requests. It borrows the
+    /// endpoint (returning a non-`'static` request type) so you can build
+    /// requests inline without cloning an [`Arc`].
     /// Authority is NOT set at construction time — use [`.uri()`] on the
     /// returned [`Request`] to set both the request URI and the authority.
+    ///
+    /// If you need a `'static` request (e.g. for async spawning), use
+    /// [`new_request_owned`] instead.
     ///
     /// [`Request`]: client::Request
     pub fn new_request(&self) -> ClientRequest<T, &H3Endpoint<T>> {
@@ -149,62 +154,43 @@ where
     }
 
     /// Convenience method to create a GET request for `uri`.
-    ///
-    /// Requires the endpoint to be wrapped in [`Arc`] so the returned
-    /// [`Request`](client::Request) satisfies `'static` bounds for async use.
-    pub fn get(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let req = self.new_request_owned();
-        req.method(Method::GET).uri(uri);
-        req
+    pub fn get(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+        self.new_request().method(Method::GET).uri(uri)
     }
 
     /// Convenience method to create a POST request for `uri`.
-    pub fn post(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let req = self.new_request_owned();
-        req.method(Method::POST).uri(uri);
-        req
+    pub fn post(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+        self.new_request().method(Method::POST).uri(uri)
     }
 
     /// Convenience method to create a PUT request for `uri`.
-    pub fn put(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let req = self.new_request_owned();
-        req.method(Method::PUT).uri(uri);
-        req
+    pub fn put(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+        self.new_request().method(Method::PUT).uri(uri)
     }
 
     /// Convenience method to create a DELETE request for `uri`.
-    pub fn delete(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let req = self.new_request_owned();
-        req.method(Method::DELETE).uri(uri);
-        req
+    pub fn delete(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+        self.new_request().method(Method::DELETE).uri(uri)
     }
 
     /// Convenience method to create a PATCH request for `uri`.
-    pub fn patch(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let req = self.new_request_owned();
-        req.method(Method::PATCH).uri(uri);
-        req
+    pub fn patch(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+        self.new_request().method(Method::PATCH).uri(uri)
     }
 
     /// Convenience method to create a HEAD request for `uri`.
-    pub fn head(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let req = self.new_request_owned();
-        req.method(Method::HEAD).uri(uri);
-        req
+    pub fn head(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+        self.new_request().method(Method::HEAD).uri(uri)
     }
 
-    /// Convenience method to create an OPTIONS request for `uri`.
-    pub fn options(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let req = self.new_request_owned();
-        req.method(Method::OPTIONS).uri(uri);
-        req
+    /// Convenience method to create a OPTIONS request for `uri`.
+    pub fn options(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+        self.new_request().method(Method::OPTIONS).uri(uri)
     }
 
     /// Convenience method to create a TRACE request for `uri`.
-    pub fn trace(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let req = self.new_request_owned();
-        req.method(Method::TRACE).uri(uri);
-        req
+    pub fn trace(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+        self.new_request().method(Method::TRACE).uri(uri)
     }
 }
 
