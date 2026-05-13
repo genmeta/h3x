@@ -200,8 +200,7 @@ impl QuicEndpoint {
         } else {
             bind
         };
-        let binds: Vec<BindHandle> =
-            join_all(bind.iter().map(|p| network.bind(p.clone()))).await;
+        let binds: Vec<BindHandle> = join_all(bind.iter().map(|p| network.bind(p.clone()))).await;
         let endpoint = Self {
             network,
             identity: ArcSwapOption::from(identity),
@@ -283,9 +282,7 @@ impl QuicEndpoint {
             Connection::new_client(server_name.to_owned(), self.client.token_sink.clone())
                 .with_parameters(parameters)
                 .with_tls_config((*tls).clone())
-                .with_streams_concurrency_strategy(
-                    self.client.stream_strategy_factory.as_ref(),
-                )
+                .with_streams_concurrency_strategy(self.client.stream_strategy_factory.as_ref())
                 .with_zero_rtt(self.client.enable_0rtt);
         let connection = self
             .network

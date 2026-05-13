@@ -7,12 +7,10 @@
 //! All types provide [`Default`] so that client endpoints can be constructed
 //! without the caller having to hand-roll configuration values.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use rustls::client::{WebPkiServerVerifier, danger::ServerCertVerifier};
 
-use super::common::CommonQuicConfig;
 use crate::dquic::{
     log::{QLog, handy::NoopLogger},
     param::{ClientParameters, handy::client_parameters},

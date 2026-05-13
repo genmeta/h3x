@@ -119,87 +119,92 @@ impl<T: quic::Connect> H3Endpoint<T>
 where
     T::Error: std::error::Error + Send + Sync + 'static,
 {
+    /// Create a new request owned by this endpoint (shared via [`Arc`]).
+    ///
+    /// Authority is NOT set at construction time — use [`.uri()`] on the
+    /// returned [`Request`] to set both the request URI and the authority.
+    /// If `.uri()` is never called, [`Request::into_future`] will fail with
+    /// [`RequestError::MalformedRequestHeader`] containing
+    /// `EmptyAuthorityOrHost`.
+    ///
+    /// [`Request`]: client::Request
+    /// [`Request::into_future`]: client::Request::into_future
+    pub fn new_request_owned(self: &Arc<Self>) -> ClientRequest<T, Arc<Self>> {
+        let msg = Message::unresolved_request();
+        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), msg));
+        ClientRequest::new(arbiter)
+    }
+
+    /// Create a new request borrowing this endpoint.
+    ///
+    /// This version uses `&H3Endpoint<T>` as the endpoint type parameter.
+    /// Authority is NOT set at construction time — use [`.uri()`] on the
+    /// returned [`Request`] to set both the request URI and the authority.
+    ///
+    /// [`Request`]: client::Request
+    pub fn new_request(&self) -> ClientRequest<T, &H3Endpoint<T>> {
+        let msg = Message::unresolved_request();
+        let arbiter = Arc::new(Arbiter::new(self, msg));
+        ClientRequest::new(arbiter)
+    }
+
     /// Convenience method to create a GET request for `uri`.
     ///
     /// Requires the endpoint to be wrapped in [`Arc`] so the returned
     /// [`Request`](client::Request) satisfies `'static` bounds for async use.
     pub fn get(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let authority = uri.authority().cloned().unwrap();
-        let mut msg = Message::unresolved_request();
-        msg.header_mut().set_method(Method::GET);
-        msg.header_mut().set_uri(uri);
-        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
-        ClientRequest::new(arbiter)
+        let req = self.new_request_owned();
+        req.method(Method::GET).uri(uri);
+        req
     }
 
     /// Convenience method to create a POST request for `uri`.
     pub fn post(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let authority = uri.authority().cloned().unwrap();
-        let mut msg = Message::unresolved_request();
-        msg.header_mut().set_method(Method::POST);
-        msg.header_mut().set_uri(uri);
-        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
-        ClientRequest::new(arbiter)
+        let req = self.new_request_owned();
+        req.method(Method::POST).uri(uri);
+        req
     }
 
     /// Convenience method to create a PUT request for `uri`.
     pub fn put(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let authority = uri.authority().cloned().unwrap();
-        let mut msg = Message::unresolved_request();
-        msg.header_mut().set_method(Method::PUT);
-        msg.header_mut().set_uri(uri);
-        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
-        ClientRequest::new(arbiter)
+        let req = self.new_request_owned();
+        req.method(Method::PUT).uri(uri);
+        req
     }
 
     /// Convenience method to create a DELETE request for `uri`.
     pub fn delete(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let authority = uri.authority().cloned().unwrap();
-        let mut msg = Message::unresolved_request();
-        msg.header_mut().set_method(Method::DELETE);
-        msg.header_mut().set_uri(uri);
-        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
-        ClientRequest::new(arbiter)
+        let req = self.new_request_owned();
+        req.method(Method::DELETE).uri(uri);
+        req
     }
 
     /// Convenience method to create a PATCH request for `uri`.
     pub fn patch(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let authority = uri.authority().cloned().unwrap();
-        let mut msg = Message::unresolved_request();
-        msg.header_mut().set_method(Method::PATCH);
-        msg.header_mut().set_uri(uri);
-        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
-        ClientRequest::new(arbiter)
+        let req = self.new_request_owned();
+        req.method(Method::PATCH).uri(uri);
+        req
     }
 
     /// Convenience method to create a HEAD request for `uri`.
     pub fn head(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let authority = uri.authority().cloned().unwrap();
-        let mut msg = Message::unresolved_request();
-        msg.header_mut().set_method(Method::HEAD);
-        msg.header_mut().set_uri(uri);
-        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
-        ClientRequest::new(arbiter)
+        let req = self.new_request_owned();
+        req.method(Method::HEAD).uri(uri);
+        req
     }
 
     /// Convenience method to create an OPTIONS request for `uri`.
     pub fn options(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let authority = uri.authority().cloned().unwrap();
-        let mut msg = Message::unresolved_request();
-        msg.header_mut().set_method(Method::OPTIONS);
-        msg.header_mut().set_uri(uri);
-        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
-        ClientRequest::new(arbiter)
+        let req = self.new_request_owned();
+        req.method(Method::OPTIONS).uri(uri);
+        req
     }
 
     /// Convenience method to create a TRACE request for `uri`.
     pub fn trace(self: &Arc<Self>, uri: Uri) -> ClientRequest<T, Arc<Self>> {
-        let authority = uri.authority().cloned().unwrap();
-        let mut msg = Message::unresolved_request();
-        msg.header_mut().set_method(Method::TRACE);
-        msg.header_mut().set_uri(uri);
-        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), authority, msg));
-        ClientRequest::new(arbiter)
+        let req = self.new_request_owned();
+        req.method(Method::TRACE).uri(uri);
+        req
     }
 }
 

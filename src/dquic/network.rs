@@ -714,12 +714,7 @@ impl AuthClient for InterfaceAuthClient {
         match entry {
             None => ClientNameVerifyResult::SilentRefuse("no server registered for SNI".to_owned()),
             Some(entry) if entry.bind.is_empty() => ClientNameVerifyResult::Accept,
-            Some(entry)
-                if entry
-                    .bind
-                    .iter()
-                    .any(|p| p.matches(&self.bind_uri)) =>
-            {
+            Some(entry) if entry.bind.iter().any(|p| p.matches(&self.bind_uri)) => {
                 ClientNameVerifyResult::Accept
             }
             Some(_) => ClientNameVerifyResult::SilentRefuse("bind pattern mismatch".to_owned()),
@@ -1107,7 +1102,7 @@ mod tests {
     // ── Helpers for two_sni_share_network_and_port ──
 
     use futures::{FutureExt, StreamExt, stream};
-    use http::uri::Authority;
+    use http::{Method, uri::Authority};
     use tokio_util::task::AbortOnDropHandle;
 
     use crate::{
@@ -1237,10 +1232,9 @@ mod tests {
         for (sni, expected) in [("alpha", "alpha"), ("beta", "beta")] {
             let authority: Authority = format!("{sni}:{port}").parse().unwrap();
             let uri: http::Uri = format!("https://{authority}/hello").parse().unwrap();
-            let (_req, mut resp) = client
-                .new_request()
-                .with_authority(authority)
-                .get(uri)
+            let req = client.new_request();
+            req.method(Method::GET).uri(uri);
+            let mut resp = req
                 .await
                 .unwrap_or_else(|e| panic!("request for {sni} failed: {e:?}"));
             assert_eq!(resp.status(), http::StatusCode::OK);

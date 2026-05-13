@@ -1,5 +1,7 @@
 mod common;
 
+use std::sync::Arc;
+
 use common::*;
 use h3x::{
     endpoint::server::{self, Router},
@@ -24,10 +26,13 @@ fn hello_world() {
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client_with(network).await;
-        let (_, mut response) = client
-            .new_request()
-            .get(format!("https://{host}/hello_world").parse().unwrap())
+        let client = Arc::new(test_client_with(network).await);
+        let mut response = client
+            .get(
+                format!("https://{host}/hello_world")
+                    .parse()
+                    .expect("valid uri"),
+            )
             .await
             .expect("failed to send request");
 
@@ -66,12 +71,14 @@ fn streaming_echo() {
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client_with(network).await;
-        let (mut request, mut response) = client
-            .new_request()
-            .post(format!("https://{host}/echo").parse().unwrap())
+        let client = Arc::new(test_client_with(network).await);
+        let request = client.post(format!("https://{host}/echo").parse().expect("valid uri"));
+        // flush headers so the server can respond before we write body
+        request
+            .flush()
             .await
-            .expect("failed to send request");
+            .expect("failed to send request headers");
+        let mut response = request.response().await.expect("failed to get response");
         assert_eq!(response.status(), http::StatusCode::OK);
 
         request
@@ -81,11 +88,11 @@ fn streaming_echo() {
             .close()
             .await
             .expect("failed to close stream");
-        let response = response
+        let body = response
             .read_to_bytes()
             .await
             .expect("failed to read response body");
-        assert_eq!(response, TEST_DATA);
+        assert_eq!(body, TEST_DATA);
     })
 }
 
@@ -100,10 +107,13 @@ fn fallback() {
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client_with(network).await;
-        let (_, response) = client
-            .new_request()
-            .get(format!("https://{host}/non_exist").parse().unwrap())
+        let client = Arc::new(test_client_with(network).await);
+        let response = client
+            .get(
+                format!("https://{host}/non_exist")
+                    .parse()
+                    .expect("valid uri"),
+            )
             .await
             .expect("failed to send request");
 
@@ -128,20 +138,23 @@ fn auto_close() {
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = test_client_with(network).await;
-        let (_, mut response) = client
-            .new_request()
-            .with_body(TEST_DATA)
-            .post(format!("https://{host}/echo").parse().unwrap())
+        let client = Arc::new(test_client_with(network).await);
+        let request = client.post(format!("https://{host}/echo").parse().expect("valid uri"));
+        request
+            .write(TEST_DATA)
             .await
-            .expect("failed to send request");
+            .expect("failed to write body")
+            .close()
+            .await
+            .expect("failed to close stream");
+        let mut response = request.await.expect("failed to send request");
 
         assert_eq!(response.status(), http::StatusCode::OK);
-        let response = response
+        let body = response
             .read_to_bytes()
             .await
             .expect("failed to read response body");
-        assert_eq!(response, TEST_DATA);
+        assert_eq!(body, TEST_DATA);
     })
 }
 
@@ -198,12 +211,16 @@ fn missing_server_name_closes_connection_with_no_error() {
                 .identity(identity)
                 .resolver(Arc::new(SystemResolver))
                 .bind(Arc::new(vec![
-                    FromStr::from_str("inet://127.0.0.1:0").unwrap(),
+                    FromStr::from_str("inet://127.0.0.1:0").expect("valid bind pattern"),
                 ]))
                 .build()
                 .await;
-            let bind_iface = network.interfaces().into_iter().next().unwrap();
-            let port = match bind_iface.borrow().bound_addr().unwrap() {
+            let bind_iface = network
+                .interfaces()
+                .into_iter()
+                .next()
+                .expect("no bound interface");
+            let port = match bind_iface.borrow().bound_addr().expect("no bound addr") {
                 dquic::prelude::BoundAddr::Internet(s) => s.port(),
                 _ => panic!("expected internet"),
             };
@@ -220,13 +237,14 @@ fn missing_server_name_closes_connection_with_no_error() {
             let client_quic = h3x::dquic::QuicEndpoint::builder()
                 .network(network)
                 .resolver(Arc::new(FixedResolver(
-                    format!("127.0.0.1:{port}").parse().unwrap(),
+                    format!("127.0.0.1:{port}")
+                        .parse()
+                        .expect("valid socket addr"),
                 )))
                 .build()
                 .await;
-            let client = H3Endpoint::new(client_quic);
+            let client = Arc::new(H3Endpoint::new(client_quic));
             let error = client
-                .new_request()
                 .get(
                     format!("https://{host}/hello_world")
                         .parse()

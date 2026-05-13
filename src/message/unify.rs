@@ -79,6 +79,7 @@ impl From<MalformedHeaderSection> for MalformedMessageError {
     }
 }
 
+// todo: 通过泛型区分请求和响应，避免运行时检查。虽现版本无法支持自定义泛型作为常量泛型，但可以通过零大小类型（ZST）和特化实现来达到类似效果。
 #[derive(Debug, Clone)]
 pub struct Message {
     header: FieldSection,

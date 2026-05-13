@@ -44,7 +44,7 @@ pub use self::unfold::{
 };
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Snafu)]
+#[derive(Debug, Clone, Snafu)]
 pub enum MessageStreamError {
     #[snafu(transparent)]
     Quic { source: quic::StreamError },

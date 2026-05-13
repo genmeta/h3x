@@ -3,12 +3,14 @@ use std::{
     error::Error,
     future::IntoFuture,
     ops::{Deref, DerefMut},
-    pin::Pin,
-    sync::{Arc, Mutex as SyncMutex},
+    sync::{
+        Arc, Mutex as SyncMutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use bytes::{Buf, Bytes};
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, future::BoxFuture};
 use http::{
     HeaderMap, HeaderValue, Method, Uri,
     header::{AsHeaderName, IntoHeaderName},
@@ -34,8 +36,8 @@ use crate::{
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum RequestError<E: Error + 'static> {
-    #[snafu(transparent)]
-    Connect { source: ConnectError<E> },
+    #[snafu(display("failed to connect endpoint"))]
+    Connect { source: Arc<ConnectError<E>> },
     #[snafu(transparent)]
     Connection { source: quic::ConnectionError },
     #[snafu(display("request stream error"))]
@@ -43,7 +45,7 @@ pub enum RequestError<E: Error + 'static> {
     #[snafu(display("response stream error"))]
     ResponseStream { source: quic::StreamError },
     #[snafu(display("request cannot be sent due to malformed header"))]
-    MalformedRequestHeader { source: MalformedHeaderSection },
+    MalformedRequestHeader { source: Arc<MalformedHeaderSection> },
     #[snafu(display(
         "header section too large to fit into a single frame, maybe too many header fields"
     ))]
@@ -64,6 +66,48 @@ pub enum RequestError<E: Error + 'static> {
     MessageStream { source: MessageStreamError },
 }
 
+impl<E: Error + 'static> From<ConnectError<E>> for RequestError<E> {
+    fn from(source: ConnectError<E>) -> Self {
+        Self::Connect {
+            source: Arc::new(source),
+        }
+    }
+}
+impl<E: Error + 'static> Clone for RequestError<E> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Connect { source } => Self::Connect {
+                source: Arc::clone(source),
+            },
+            Self::Connection { source } => Self::Connection {
+                source: source.clone(),
+            },
+            Self::RequestStream { source } => Self::RequestStream {
+                source: source.clone(),
+            },
+            Self::ResponseStream { source } => Self::ResponseStream {
+                source: source.clone(),
+            },
+            Self::MalformedRequestHeader { source } => Self::MalformedRequestHeader {
+                source: Arc::clone(source),
+            },
+            Self::HeaderTooLarge => Self::HeaderTooLarge,
+            Self::TrailerTooLarge => Self::TrailerTooLarge,
+            Self::DataFrameTooLarge => Self::DataFrameTooLarge,
+            Self::MalformedResponse => Self::MalformedResponse,
+            Self::Acquire { source } => Self::Acquire {
+                source: source.clone(),
+            },
+            Self::StreamInit { source } => Self::StreamInit {
+                source: source.clone(),
+            },
+            Self::MessageStream { source } => Self::MessageStream {
+                source: source.clone(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Snafu)]
 #[snafu(module)]
 pub enum AcquireError {
@@ -71,83 +115,114 @@ pub enum AcquireError {
     AlreadyTaken,
 }
 
-type InitCache = AsyncMutex<Option<()>>;
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum AuthorityFrozen {
+    #[snafu(display("authority is frozen — uri() called after stream initialization"))]
+    InitComplete,
+}
 
 pub(crate) struct Arbiter<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> {
-    pub(crate) message: SyncMutex<Option<Message>>,
-    pub(crate) write_stream: SyncMutex<Option<WriteStream>>,
-    pub(crate) read_stream: SyncMutex<Option<ReadStream>>,
-    pub(crate) init_state: InitCache,
-    pub(crate) endpoint: EP,
-    pub(crate) authority: Authority,
+    request_message: SyncMutex<Option<Message>>,
+    write_stream: SyncMutex<Option<WriteStream>>,
+    read_stream: SyncMutex<Option<ReadStream>>,
+    init_state: AsyncMutex<Option<Result<(), RequestError<Q::Error>>>>,
+    endpoint: EP,
+    authority: SyncMutex<Option<Authority>>,
+    init_done: AtomicBool,
 }
 
 impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Arbiter<Q, EP> {
-    pub fn new(endpoint: EP, authority: Authority, message: Message) -> Self {
+    pub(crate) fn new(endpoint: EP, message: Message) -> Self {
         Arbiter {
-            message: SyncMutex::new(Some(message)),
+            request_message: SyncMutex::new(Some(message)),
             write_stream: SyncMutex::new(None),
             read_stream: SyncMutex::new(None),
             init_state: AsyncMutex::new(None),
             endpoint,
-            authority,
+            authority: SyncMutex::new(None),
+            init_done: AtomicBool::new(false),
         }
     }
 
-    pub fn acquire_message(&self) -> Result<Message, AcquireError> {
-        self.message
+    pub(crate) fn set_authority(&self, auth: Authority) -> Result<(), AuthorityFrozen> {
+        if self.init_done.load(Ordering::Acquire) {
+            return Err(AuthorityFrozen::InitComplete);
+        }
+        *self.authority.lock().expect("lock poisoned") = Some(auth);
+        Ok(())
+    }
+
+    fn acquire_request_message(&self) -> Result<Message, AcquireError> {
+        self.request_message
             .lock()
             .unwrap()
             .take()
             .ok_or(AcquireError::AlreadyTaken)
     }
 
-    pub fn return_message_to_pool(&self, msg: Message) {
-        *self.message.lock().unwrap() = Some(msg);
+    fn return_request_message(&self, message: Message) {
+        *self.request_message.lock().unwrap() = Some(message);
     }
 
-    pub async fn ensure_stream_init(&self) -> Result<(), RequestError<Q::Error>>
-    where
-        Q::Error: std::error::Error + Send + Sync + 'static,
-    {
-        if self.read_stream.lock().unwrap().is_some() {
-            return Ok(());
+    pub fn return_write_stream(&self, write_stream: WriteStream) {
+        *self.write_stream.lock().unwrap() = Some(write_stream);
+    }
+}
+
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Arbiter<Q, EP>
+where
+    Q::Error: std::error::Error + Send + Sync + 'static,
+{
+    async fn ensure_stream_init(&self) -> Result<(), RequestError<Q::Error>> {
+        // Fast path: init already done
+        if self.init_done.load(Ordering::Acquire) {
+            return self
+                .init_state
+                .lock()
+                .await
+                .as_ref()
+                .expect("init_state is Some when init_done is true")
+                .clone();
         }
 
         let mut guard = self.init_state.lock().await;
 
-        if guard.is_some() {
-            return Ok(());
+        // Double-check: another caller may have finished while we waited
+        if let Some(cached) = guard.as_ref() {
+            return cached.clone();
         }
 
-        if self.read_stream.lock().unwrap().is_some() {
-            return Ok(());
-        }
+        // Extract authority from the sync mutex
+        let authority = self
+            .authority
+            .lock()
+            .expect("lock poisoned")
+            .clone()
+            .ok_or_else(|| RequestError::MalformedRequestHeader {
+                source: Arc::new(MalformedHeaderSection::EmptyAuthorityOrHost),
+            })?;
 
-        tracing::debug!("initializing streams for {}", self.authority);
+        // Execute the actual init (network I/O — lock NOT held)
         let result: Result<(), RequestError<Q::Error>> = async {
-            let conn = self.endpoint.connect(self.authority.clone()).await?;
-            let (rs, ws) = conn
+            let connection = self.endpoint.connect(authority).await?;
+            let (read_stream, write_stream) = connection
                 .initial_message_stream()
                 .await
                 .context(StreamInitSnafu)?;
-            *self.read_stream.lock().unwrap() = Some(rs);
-            *self.write_stream.lock().unwrap() = Some(ws);
+            *self.read_stream.lock().expect("lock poisoned") = Some(read_stream);
+            *self.write_stream.lock().expect("lock poisoned") = Some(write_stream);
             Ok(())
         }
         .await;
 
-        if result.is_ok() {
-            *guard = Some(());
-        }
-
+        // Store result (success or failure) and mark init as done
+        *guard = Some(result.clone());
+        self.init_done.store(true, Ordering::Release);
         result
     }
 
-    pub async fn acquire_read_stream(&self) -> Result<ReadStream, RequestError<Q::Error>>
-    where
-        Q::Error: std::error::Error + Send + Sync + 'static,
-    {
+    async fn acquire_read_stream(&self) -> Result<ReadStream, RequestError<Q::Error>> {
         if let Some(rs) = self.read_stream.lock().unwrap().take() {
             return Ok(rs);
         }
@@ -161,10 +236,7 @@ impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Arbiter<Q, EP> {
             })
     }
 
-    pub async fn acquire_response(&self) -> Result<Response, RequestError<Q::Error>>
-    where
-        Q::Error: std::error::Error + Send + Sync + 'static,
-    {
+    async fn acquire_response(&self) -> Result<Response, RequestError<Q::Error>> {
         let mut stream = self.acquire_read_stream().await?;
 
         let mut message = Message::unresolved_response();
@@ -180,10 +252,7 @@ impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Arbiter<Q, EP> {
         })
     }
 
-    pub async fn into_response(mut self) -> Result<Response, RequestError<Q::Error>>
-    where
-        Q::Error: std::error::Error + Send + Sync + 'static,
-    {
+    async fn into_response(mut self) -> Result<Response, RequestError<Q::Error>> {
         let mut read_stream = self.acquire_read_stream().await?;
         let mut response_message = Message::unresolved_response();
         let read_response = async { read_stream.read_message_header(&mut response_message).await };
@@ -192,7 +261,7 @@ impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Arbiter<Q, EP> {
         let mut write_stream = self.write_stream.get_mut().unwrap().take().expect(
             "message should be present (should be guaranteed by request lifecycle management)",
         );
-        let mut request_message = self.message.get_mut().unwrap().take().expect(
+        let mut request_message = self.request_message.get_mut().unwrap().take().expect(
             "message should be present (should be guaranteed by request lifecycle management)",
         );
         let mut close_reqeust =
@@ -219,12 +288,9 @@ impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Arbiter<Q, EP> {
         })
     }
 
-    pub async fn acquire_write_stream(&self) -> Result<WriteStream, RequestError<Q::Error>>
-    where
-        Q::Error: std::error::Error + Send + Sync + 'static,
-    {
-        if let Some(ws) = self.write_stream.lock().unwrap().take() {
-            return Ok(ws);
+    async fn acquire_write_stream(&self) -> Result<WriteStream, RequestError<Q::Error>> {
+        if let Some(write_stream) = self.write_stream.lock().unwrap().take() {
+            return Ok(write_stream);
         }
         self.ensure_stream_init().await?;
         self.write_stream
@@ -235,16 +301,12 @@ impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Arbiter<Q, EP> {
                 source: AcquireError::AlreadyTaken,
             })
     }
-
-    pub fn return_write_stream_to_pool(&self, ws: WriteStream) {
-        *self.write_stream.lock().unwrap() = Some(ws);
-    }
 }
 
 impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Drop for Arbiter<Q, EP> {
     fn drop(&mut self) {
         // get_mut on &mut self guarantees exclusive access - no lock needed
-        if let Some(mut message) = self.message.get_mut().unwrap().take()
+        if let Some(mut message) = self.request_message.get_mut().unwrap().take()
             && !message.is_dropped()
             && !message.is_complete()
             && let Some(mut write_stream) = self.write_stream.get_mut().unwrap().take()
@@ -274,16 +336,30 @@ impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Request<Q, EP> {
 
     /// Return all held resources to the arbiter pool. Used by Clone and Drop.
     fn return_all_to_pool(&self) {
-        let arbiter = match self.arbiter.borrow().as_ref() {
-            Some(a) => Arc::clone(a),
-            None => return,
+        let Ok(arbiter) = self.arbiter() else {
+            return;
         };
-        if let Some(msg) = self.held_message.take() {
-            arbiter.return_message_to_pool(msg);
+        if let Some(message) = self.held_message.take() {
+            arbiter.return_request_message(message);
         }
-        if let Some(ws) = self.held_write_stream.take() {
-            arbiter.return_write_stream_to_pool(ws);
+        if let Some(write_stream) = self.held_write_stream.take() {
+            arbiter.return_write_stream(write_stream);
         }
+    }
+
+    fn arbiter(&self) -> Result<Arc<Arbiter<Q, EP>>, AcquireError> {
+        self.arbiter
+            .borrow()
+            .as_ref()
+            .cloned()
+            .ok_or(AcquireError::AlreadyTaken)
+    }
+
+    fn take_arbiter(&self) -> Result<Arc<Arbiter<Q, EP>>, AcquireError> {
+        self.arbiter
+            .borrow_mut()
+            .take()
+            .ok_or(AcquireError::AlreadyTaken)
     }
 }
 
@@ -293,15 +369,10 @@ where
 {
     fn clone(&self) -> Self {
         self.return_all_to_pool();
-        let arbiter = self.arbiter.borrow();
-        let arbiter = match arbiter.as_ref() {
-            Some(a) => RefCell::new(Some(Arc::clone(a))),
-            None => RefCell::new(None),
-        };
         Request {
             held_message: RefCell::new(None),
             held_write_stream: RefCell::new(None),
-            arbiter,
+            arbiter: RefCell::new(self.arbiter().ok()),
         }
     }
 }
@@ -312,48 +383,127 @@ impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Drop for Request<Q, EP
     }
 }
 
+pub(crate) struct RequestMessageGuard<'a, Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> {
+    message: Message,
+    request: &'a Request<Q, EP>,
+}
+
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Deref for RequestMessageGuard<'_, Q, EP> {
+    type Target = Message;
+    fn deref(&self) -> &Self::Target {
+        &self.message
+    }
+}
+
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> DerefMut
+    for RequestMessageGuard<'_, Q, EP>
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.message
+    }
+}
+
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Drop for RequestMessageGuard<'_, Q, EP> {
+    fn drop(&mut self) {
+        *self.request.held_message.borrow_mut() = Some(self.message.take());
+    }
+}
+
 impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Request<Q, EP>
 where
     Q::Error: std::error::Error + Send + Sync + 'static,
 {
-    pub(crate) fn message(&self) -> Result<MessageGuard<'_, Q, EP>, RequestError<Q::Error>> {
-        if self.arbiter.borrow().is_none() {
-            return Err(RequestError::Acquire {
-                source: AcquireError::AlreadyTaken,
-            });
-        }
+    pub(crate) fn message(&self) -> Result<RequestMessageGuard<'_, Q, EP>, RequestError<Q::Error>> {
+        let arbiter = self.arbiter()?;
+
         if let Some(message) = self.held_message.take() {
-            return Ok(MessageGuard {
+            return Ok(RequestMessageGuard {
                 message,
                 request: self,
             });
         }
-        *self.arbiter.borrow_mut() = None;
-        Err(RequestError::Acquire {
-            source: AcquireError::AlreadyTaken,
-        })
+
+        match arbiter.acquire_request_message() {
+            Ok(message) => Ok(RequestMessageGuard {
+                message,
+                request: self,
+            }),
+            Err(error @ AcquireError::AlreadyTaken) => {
+                *self.arbiter.borrow_mut() = None;
+                Err(error.into())
+            }
+        }
     }
 
+    pub fn method(&self, method: Method) -> &Self {
+        if let Ok(mut message) = self.message() {
+            message.header_mut().set_method(method);
+        }
+        self
+    }
+
+    pub fn uri(&self, uri: Uri) -> &Self {
+        let Ok(mut message) = self.message() else {
+            return self;
+        };
+        if let Some(auth) = uri.authority().cloned()
+            && let Ok(arbiter) = self.arbiter()
+            && arbiter.set_authority(auth).is_err()
+        {
+            message.set_malformed();
+        }
+        message.header_mut().set_uri(uri);
+        self
+    }
+
+    pub fn header(&self, name: impl IntoHeaderName, value: HeaderValue) -> &Self {
+        if let Ok(mut message) = self.message() {
+            message.header_mut().header_map.insert(name, value);
+        }
+        self
+    }
+}
+
+pub(crate) struct WriteGuard<'a, Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> {
+    write_stream: WriteStream,
+    request: &'a Request<Q, EP>,
+}
+
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Deref for WriteGuard<'_, Q, EP> {
+    type Target = WriteStream;
+    fn deref(&self) -> &Self::Target {
+        &self.write_stream
+    }
+}
+
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> DerefMut for WriteGuard<'_, Q, EP> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.write_stream
+    }
+}
+
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Drop for WriteGuard<'_, Q, EP> {
+    fn drop(&mut self) {
+        *self.request.held_write_stream.borrow_mut() = Some(self.write_stream.take());
+    }
+}
+
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Request<Q, EP>
+where
+    Q::Error: std::error::Error + Send + Sync + 'static,
+{
     pub(crate) async fn write_stream(
         &self,
     ) -> Result<WriteGuard<'_, Q, EP>, RequestError<Q::Error>> {
-        if self.arbiter.borrow().is_none() {
-            return Err(RequestError::Acquire {
-                source: AcquireError::AlreadyTaken,
-            });
-        }
+        let arbiter = self.arbiter()?;
+
         if let Some(write_stream) = self.held_write_stream.take() {
             return Ok(WriteGuard {
                 write_stream,
                 request: self,
             });
         }
-        let arbiter = Arc::clone(
-            self.arbiter
-                .borrow()
-                .as_ref()
-                .expect("arbiter must be Some after gate"),
-        );
+
         match arbiter.acquire_write_stream().await {
             Ok(write_stream) => Ok(WriteGuard {
                 write_stream,
@@ -401,114 +551,56 @@ where
     }
 }
 
-pub(crate) struct MessageGuard<'a, Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> {
-    message: Message,
-    request: &'a Request<Q, EP>,
-}
-
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Deref for MessageGuard<'_, Q, EP> {
-    type Target = Message;
-    fn deref(&self) -> &Self::Target {
-        &self.message
-    }
-}
-
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> DerefMut for MessageGuard<'_, Q, EP> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.message
-    }
-}
-
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Drop for MessageGuard<'_, Q, EP> {
-    fn drop(&mut self) {
-        *self.request.held_message.borrow_mut() = Some(self.message.take());
-    }
-}
-
-pub(crate) struct WriteGuard<'a, Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> {
-    write_stream: WriteStream,
-    request: &'a Request<Q, EP>,
-}
-
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Deref for WriteGuard<'_, Q, EP> {
-    type Target = WriteStream;
-    fn deref(&self) -> &Self::Target {
-        &self.write_stream
-    }
-}
-
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> DerefMut for WriteGuard<'_, Q, EP> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.write_stream
-    }
-}
-
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Drop for WriteGuard<'_, Q, EP> {
-    fn drop(&mut self) {
-        *self.request.held_write_stream.borrow_mut() = Some(self.write_stream.take());
-    }
-}
-
 impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Request<Q, EP>
 where
     Q::Error: std::error::Error + Send + Sync + 'static,
 {
-    pub fn with_method(&self, method: Method) -> &Self {
-        if let Ok(mut msg) = self.message() {
-            msg.header_mut().set_method(method);
-        }
-        self
-    }
-
-    pub fn with_uri(&self, uri: Uri) -> &Self {
-        if let Ok(mut msg) = self.message() {
-            msg.header_mut().set_uri(uri);
-        }
-        self
-    }
-
-    pub fn header(&self, name: impl IntoHeaderName, value: HeaderValue) -> &Self {
-        if let Ok(mut msg) = self.message() {
-            msg.header_mut().header_map.insert(name, value);
-        }
-        self
-    }
-
     pub async fn response(&self) -> Result<Response, RequestError<Q::Error>> {
-        let arbiter = Arc::clone(
-            self.arbiter
-                .borrow()
-                .as_ref()
-                .expect("arbiter must be Some for response()"),
-        );
-        arbiter.acquire_response().await
+        self.arbiter()?.acquire_response().await
     }
 
     pub async fn into_response(self) -> Result<Response, RequestError<Q::Error>> {
         self.return_all_to_pool();
-        let arbiter = self
-            .arbiter
-            .borrow_mut()
-            .take()
-            .expect("arbiter should be present for into_response (guaranteed by request lifecycle management)");
-        match Arc::try_unwrap(arbiter) {
+        match Arc::try_unwrap(self.take_arbiter()?) {
             Ok(arbiter) => arbiter.into_response().await,
             Err(arbiter) => arbiter.acquire_response().await,
         }
     }
 }
 
-impl<Q, EP> IntoFuture for Request<Q, EP>
+// Two concrete IntoFuture impls because the generic `'ep` lifetime on EP cannot be
+// constrained by the impl header (Rust requires every lifetime parameter to appear in
+// the concrete type or a bound on a type in the impl header). Rather than forcing callers
+// to annotate lifetimes, we cover both concrete endpoint types that h3x produces:
+//
+//   - `&'a H3Endpoint<Q>` — borrowed reference (used by H3Endpoint::new_request)
+//   - `Arc<H3Endpoint<Q>>` — shared ownership (used by H3Endpoint::get/post/… & new_request_owned)
+impl<'a, Q> IntoFuture for Request<Q, &'a H3Endpoint<Q>>
 where
     Q: quic::Connect + Sync + 'static,
-    EP: Deref<Target = H3Endpoint<Q>> + Clone + Send + Sync + 'static,
     Q::Connection: Send + 'static,
     Q::Error: std::error::Error + Send + Sync + 'static,
     <Q::Connection as quic::ManageStream>::StreamReader: Send,
     <Q::Connection as quic::ManageStream>::StreamWriter: Send,
 {
     type Output = Result<Response, RequestError<Q::Error>>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output>>>;
+    type IntoFuture = BoxFuture<'a, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.into_response())
+    }
+}
+
+impl<Q> IntoFuture for Request<Q, Arc<H3Endpoint<Q>>>
+where
+    Q: quic::Connect + Sync + 'static,
+    Q::Connection: Send + 'static,
+    Q::Error: std::error::Error + Send + Sync + 'static,
+    <Q::Connection as quic::ManageStream>::StreamReader: Send,
+    <Q::Connection as quic::ManageStream>::StreamWriter: Send,
+{
+    type Output = Result<Response, RequestError<Q::Error>>;
+    type IntoFuture = BoxFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.into_response())
@@ -593,9 +685,9 @@ impl Response {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, atomic::Ordering};
 
-    use http::uri::Authority;
+    use http::{Uri, uri::Authority};
 
     use super::*;
     use crate::{connection::tests::MockConnection, varint::VarInt};
@@ -620,7 +712,9 @@ mod tests {
         let endpoint = Arc::new(H3Endpoint::new(TestConnect));
         let authority = Authority::from_static("example.com");
         let message = crate::message::unify::Message::unresolved_request();
-        Arc::new(Arbiter::new(endpoint, authority, message))
+        let arbiter = Arc::new(Arbiter::new(endpoint, message));
+        arbiter.set_authority(authority).expect("set authority");
+        arbiter
     }
 
     /// Creates an `Arbiter` with a `WriteStream` pre-populated
@@ -643,7 +737,7 @@ mod tests {
         *arbiter.read_stream.lock().unwrap() = Some(rs);
         // Simulate a completed ensure_init so the second acquire
         // doesn't attempt a real connection
-        *arbiter.init_state.try_lock().unwrap() = Some(());
+        *arbiter.init_state.try_lock().unwrap() = Some(Ok(()));
         arbiter
     }
 
@@ -651,9 +745,11 @@ mod tests {
     fn request_with_message(
         arbiter: &Arc<Arbiter<TestConnect, Arc<H3Endpoint<TestConnect>>>>,
     ) -> Request<TestConnect, Arc<H3Endpoint<TestConnect>>> {
-        let msg = arbiter.acquire_message().expect("pool should have message");
+        let message = arbiter
+            .acquire_request_message()
+            .expect("pool should have message");
         Request {
-            held_message: std::cell::RefCell::new(Some(msg)),
+            held_message: std::cell::RefCell::new(Some(message)),
             held_write_stream: std::cell::RefCell::new(None),
             arbiter: std::cell::RefCell::new(Some(Arc::clone(arbiter))),
         }
@@ -726,7 +822,7 @@ mod tests {
         );
 
         // Return to pool
-        arbiter.return_write_stream_to_pool(ws);
+        arbiter.return_write_stream(ws);
         assert!(
             arbiter.write_stream.lock().unwrap().is_some(),
             "pool should have write_stream after return"
@@ -843,7 +939,7 @@ mod tests {
 
         // Verify pool has the message
         assert!(
-            arbiter.message.lock().unwrap().is_some(),
+            arbiter.request_message.lock().unwrap().is_some(),
             "message should be back in pool"
         );
 
@@ -872,7 +968,7 @@ mod tests {
             .expect("first acquire should succeed");
 
         // Simulate a write operation (no-op for mock)
-        arbiter.return_write_stream_to_pool(ws1);
+        arbiter.return_write_stream(ws1);
 
         let ws2 = arbiter
             .acquire_write_stream()
@@ -1103,7 +1199,7 @@ mod tests {
     #[tokio::test]
     async fn test_into_future_inline_no_message() {
         let arbiter = test_arbiter();
-        let _msg = arbiter.acquire_message();
+        let _msg = arbiter.acquire_request_message();
         let req = Request::new(Arc::clone(&arbiter));
 
         let result = req.await;
@@ -1164,5 +1260,127 @@ mod tests {
             "build a real H3Endpoint, create a POST Request, clone it, \
              write body to the clone, await the original, assert status 200"
         )
+    }
+
+    // ====================================================================
+    // Task — authority & lifecycle tests
+    // ====================================================================
+
+    /// Authority can be set when `init_done` is false (initial state).
+    ///
+    /// Assertions:
+    /// - `set_authority()` returns `Ok(())`.
+    /// - `authority` mutex contains the new value.
+    #[tokio::test]
+    async fn test_set_authority_before_init() {
+        let arbiter = test_arbiter();
+        // Override the authority that test_arbiter already set
+        let new_auth = Authority::from_static("new.example.com");
+        let result = arbiter.set_authority(new_auth.clone());
+        assert!(result.is_ok(), "set_authority should succeed before init");
+        let stored = arbiter.authority.lock().expect("lock poisoned").clone();
+        assert_eq!(stored, Some(new_auth), "authority should be updated");
+    }
+
+    /// After `init_done` is set to `true`, `set_authority()` returns
+    /// `Err(AuthorityFrozen::InitComplete)`.
+    ///
+    /// Assertions:
+    /// - With `init_done = true`, `set_authority()` → `Err(AuthorityFrozen::InitComplete)`.
+    #[tokio::test]
+    async fn test_set_authority_after_init_frozen() {
+        let arbiter = test_arbiter();
+        // Freeze authority
+        arbiter.init_done.store(true, Ordering::Release);
+        let result = arbiter.set_authority(Authority::from_static("new.example.com"));
+        assert!(
+            result.is_err(),
+            "set_authority should return Err after init_done"
+        );
+        match result {
+            Err(AuthorityFrozen::InitComplete) => {} // expected
+            other => panic!("expected AuthorityFrozen::InitComplete, got {other:?}"),
+        }
+    }
+
+    /// When `init_done` is true and `init_state` caches `Ok(())`,
+    /// `ensure_stream_init()` returns the cached success immediately.
+    ///
+    /// Assertions:
+    /// - `ensure_stream_init().await` → `Ok(())`.
+    #[tokio::test]
+    async fn test_ensure_stream_init_cached_success() {
+        let arbiter = test_arbiter();
+        // Pre-set init_state to success and mark init done
+        *arbiter.init_state.lock().await = Some(Ok(()));
+        arbiter.init_done.store(true, Ordering::Release);
+        // Second call should return cached Ok
+        let result = arbiter.ensure_stream_init().await;
+        assert!(
+            result.is_ok(),
+            "ensure_stream_init should return cached Ok, got {result:?}"
+        );
+    }
+
+    /// Calling `.uri()` on a `Request` syncs the authority from the
+    /// URI into the `Arbiter`'s authority field.
+    ///
+    /// Assertions:
+    /// - After `request.uri(uri)`, `arbiter.authority` matches the URI authority.
+    #[tokio::test]
+    async fn test_uri_authority_sync() {
+        let arbiter = test_arbiter();
+        let req = request_with_message(&arbiter);
+
+        let uri: Uri = "https://sync.example.com/path".parse().expect("valid URI");
+        req.uri(uri);
+
+        let stored = arbiter.authority.lock().expect("lock poisoned").clone();
+        assert_eq!(
+            stored.as_ref().map(|a| a.as_str()),
+            Some("sync.example.com"),
+            "authority should be synced from URI"
+        );
+    }
+
+    /// `RequestError` implements `Clone`. Verify that cloning a
+    /// unit-like variant produces an equal error.
+    ///
+    /// Assertions:
+    /// - `RequestError::HeaderTooLarge.clone()` yields `RequestError::HeaderTooLarge`.
+    #[test]
+    fn test_request_error_clone() {
+        let err = RequestError::<quic::ConnectionError>::HeaderTooLarge;
+        let cloned = err.clone();
+        match (&err, &cloned) {
+            (RequestError::HeaderTooLarge, RequestError::HeaderTooLarge) => {}
+            _ => panic!("clone mismatch: err={err:?} cloned={cloned:?}"),
+        }
+    }
+
+    /// When `init_done` is true (authority frozen), calling `.uri()`
+    /// with a URI containing a new authority marks the message as
+    /// malformed via `msg.set_malformed()`.
+    ///
+    /// Assertions:
+    /// - `.uri()` with a different authority → message is malformed.
+    #[tokio::test]
+    async fn test_uri_poisons_on_frozen() {
+        let arbiter = test_arbiter();
+        // Freeze authority
+        arbiter.init_done.store(true, Ordering::Release);
+
+        let req = request_with_message(&arbiter);
+        let uri: Uri = "https://different.example.com/path"
+            .parse()
+            .expect("valid URI");
+        req.uri(uri);
+
+        // Retrieve the message back and check it's malformed
+        let msg_guard = req.message().expect("should be able to get message");
+        assert!(
+            msg_guard.is_malformed(),
+            "message should be marked malformed after frozen authority change"
+        );
     }
 }

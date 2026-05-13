@@ -128,10 +128,7 @@ impl PartialEq for ServerQuicConfig {
             && Arc::ptr_eq(&self.token_provider, &other.token_provider)
             && self.backlog == other.backlog
             && Arc::ptr_eq(&self.client_auther, &other.client_auther)
-            && Arc::ptr_eq(
-                &self.client_cert_verifier,
-                &other.client_cert_verifier,
-            )
+            && Arc::ptr_eq(&self.client_cert_verifier, &other.client_cert_verifier)
             && self.anti_port_scan == other.anti_port_scan
     }
 }

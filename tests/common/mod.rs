@@ -25,7 +25,7 @@ pub fn run<F: Future>(test_name: &'static str, future: F) -> F::Output {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .unwrap()
+            .expect("failed to build tokio runtime")
     });
 
     static TRACING: LazyLock<WorkerGuard> = LazyLock::new(|| {
