@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```rust,no_run
 use std::sync::Arc;
 use h3x::{
-    dquic::{Identity, QuicEndpoint, ServerName},
+    dquic::{Identity, Name, QuicEndpoint},
     endpoint::{H3Endpoint, server::{Request, Response, Router}},
 };
 
@@ -45,7 +45,7 @@ async fn hello(_req: &mut Request, resp: &mut Response) {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let identity = Arc::new(Identity {
-        name: ServerName::new("localhost"),
+        name: Name::from_str("localhost"),
         certs: todo!("load your certificate chain"),
         key: todo!("load your private key"),
         ocsp: Arc::new(None),
@@ -78,7 +78,7 @@ h3x provides adapters to bridge the Tower / hyper service ecosystem into DHTTP/3
 use std::sync::Arc;
 use axum::{Router as AxumRouter, routing::get};
 use h3x::{
-    dquic::{Identity, QuicEndpoint, ServerName},
+    dquic::{Identity, Name, QuicEndpoint},
     endpoint::H3Endpoint,
     hyper::server::TowerService,
 };
@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = TowerService(router.into_service());
 
     let identity = Arc::new(Identity {
-        name: ServerName::new("localhost"),
+        name: Name::from_str("localhost"),
         certs: todo!("load your certificate chain"),
         key: todo!("load your private key"),
         ocsp: Arc::new(None),

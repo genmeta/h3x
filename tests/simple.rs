@@ -6,7 +6,7 @@ use common::*;
 use futures::{FutureExt, StreamExt, stream};
 use h3x::{
     dquic::{
-        Identity, ServerName,
+        Identity,
         cert::handy::{ToCertificate, ToPrivateKey},
         net::{EndpointAddr, IO},
         resolver::{Resolve, ResolveFuture, Source, handy::SystemResolver},
@@ -190,7 +190,7 @@ fn missing_server_name_closes_connection_with_no_error() {
             // so the SNI won't match
             let network = h3x::dquic::Network::builder().build();
             let identity = Arc::new(Identity {
-                name: ServerName::new("server"),
+                name: "server".parse().unwrap(),
                 certs: Arc::new(SERVER_CERT.to_certificate()),
                 key: Arc::new(SERVER_KEY.to_private_key()),
                 ocsp: Arc::new(None),

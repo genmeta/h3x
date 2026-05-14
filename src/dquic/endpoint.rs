@@ -343,6 +343,10 @@ impl QuicEndpoint {
         let mut observer = self.network.locations().subscribe();
         let weak = Arc::downgrade(&conn);
         let patterns: Vec<BindPattern> = self.bind.iter().cloned().collect();
+        // Inherent termination: this companion task tracks local
+        // address changes for the accepted connection. It exits when
+        // (a) conn is dropped (weak.upgrade fails), (b) conn terminates,
+        // or (c) the locations observer channel is exhausted.
         tokio::spawn(
             async move {
                 loop {
@@ -412,6 +416,12 @@ impl quic::Connect for QuicEndpoint {
             match connection.path_context() {
                 Ok(ctx) if !ctx.paths::<Vec<_>>().is_empty() => {
                     let weak = Arc::downgrade(&connection);
+                    // Inherent termination: this path-discovery companion
+                    // drains remaining DNS results and local address events
+                    // after the first path is established. It exits when
+                    // (a) connection is dropped (weak.upgrade fails),
+                    // (b) connection terminates, or (c) both DNS and
+                    // observer streams are exhausted.
                     tokio::spawn(
                         async move {
                             loop {
@@ -607,7 +617,6 @@ mod tests {
 
     use super::*;
     use crate::dquic::resolver::handy::SystemResolver;
-    use dhttp_identity::Name;
 
     #[tokio::test]
     async fn test_quic_endpoint_construction() {
@@ -680,7 +689,7 @@ mod tests {
 
     fn make_identity(name: &str) -> Identity {
         Identity {
-            name: Name::from_str(name),
+            name: name.parse().unwrap(),
             certs: Arc::new(vec![]),
             key: Arc::new(PrivateKeyDer::Pkcs8(b"dummy-key-data".to_vec().into())),
             ocsp: Arc::new(None),
@@ -970,10 +979,10 @@ mod tests {
         use dashmap::DashMap;
         use rustls::{pki_types::CertificateDer, sign::CertifiedKey};
 
-    use crate::dquic::{
-        identity::{Identity, Name},
-        resolver::handy::SystemResolver,
-    };
+        use crate::dquic::{
+            cert::handy::{ToCertificate, ToPrivateKey},
+            sni::{RegistryGuard, ServerConfig as SniServerConfig, ServerEntry},
+        };
 
         let mut config = Arc::new(ServerQuicConfig::default());
         let cache = ArcSwapOption::new(None);
@@ -984,7 +993,7 @@ mod tests {
         let key: PrivateKeyDer<'static> = key_bytes.to_private_key();
 
         let identity = Arc::new(Identity {
-            name: Name::from_str("localhost"),
+            name: "localhost".parse().unwrap(),
             certs: Arc::new(certs.clone()),
             key: Arc::new(key.clone_key()),
             ocsp: Arc::new(None),
@@ -1012,7 +1021,7 @@ mod tests {
 
         let registry = Arc::new(DashMap::new());
         let reg_guard = Arc::new(RegistryGuard {
-            name: Name::from_str("localhost"),
+            name: "localhost".parse().unwrap(),
             registry: Arc::downgrade(&registry),
             self_entry: Weak::new(),
         });

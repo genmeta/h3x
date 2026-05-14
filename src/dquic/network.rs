@@ -263,6 +263,13 @@ impl Network {
             && Arc::ptr_eq(&existing.identity, &identity)
         {
             let rx = existing.incomings_rx.clone();
+            // NOTE: creates a new Arc<ServerEntry> sharing the existing
+            // guard. When the original entry drops before this clone,
+            // a zombie Weak<ServerEntry> lingers in sni_registry until
+            // the next bind_server call. This is benign:
+            // - SniCertResolver::resolve returns None for dead Weak
+            // - InterfaceAuthClient::verify_client_name returns SilentRefuse
+            // - Next bind_server removes the zombie via occupied.remove()
             let binding = ServerBinding {
                 entry: Arc::new(ServerEntry {
                     identity: existing.identity.clone(),
@@ -283,6 +290,9 @@ impl Network {
         match self.sni_registry.entry(name.clone()) {
             Entry::Occupied(occupied) => match occupied.get().upgrade() {
                 Some(existing) if Arc::ptr_eq(&existing.identity, &identity) => {
+                    // NOTE: same shared-guard pattern as the
+                    // pre-check path above; see that comment for
+                    // the benign zombie Weak explanation.
                     let binding = ServerBinding {
                         entry: Arc::new(ServerEntry {
                             identity: existing.identity.clone(),
@@ -685,7 +695,14 @@ impl Network {
                     .expect("bind_registry poisoned")
                     .get(&pattern)
                 {
-                    *entry.bound.lock().expect("bound mutex poisoned") = bound;
+                    let mut target = entry.bound.lock().expect("bound mutex poisoned");
+                    // Retain only interfaces that still match current
+                    // devices, then merge reconcile's additions without
+                    // clobbering concurrent insertions from bind().
+                    target.retain(|k, _| desired_keys.contains(k));
+                    for (k, v) in bound {
+                        target.entry(k).or_insert(v);
+                    }
                 }
             }
         }
@@ -784,7 +801,7 @@ mod tests {
         let key: PrivateKeyDer<'static> = SERVER_KEY.to_private_key();
 
         Arc::new(Identity {
-            name: Name::from_str(name),
+            name: name.parse().unwrap(),
             certs: Arc::new(certs),
             key: Arc::new(key),
             ocsp: Arc::new(None),
@@ -942,7 +959,7 @@ mod tests {
     #[test]
     fn test_bind_server_error_sni_in_use_display() {
         let err = BindServerError::SniInUse {
-            name: Name::from_str("example.com"),
+            name: "example.com".parse().unwrap(),
         };
         let display = format!("{err}");
         assert!(

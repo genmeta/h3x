@@ -6,6 +6,7 @@ use std::{
 };
 
 use h3x::dquic::{
+    Name,
     cert::handy::{ToCertificate, ToPrivateKey},
     net::IO,
     resolver::handy::SystemResolver,
@@ -69,7 +70,7 @@ pub async fn test_client() -> h3x::dquic::H3Endpoint {
 
 pub async fn test_server() -> (h3x::dquic::H3Endpoint, Authority) {
     let identity = Arc::new(h3x::dquic::Identity {
-        name: h3x::dquic::ServerName::new("localhost"),
+        name: "localhost".parse().unwrap(),
         certs: Arc::new(SERVER_CERT.to_certificate()),
         key: Arc::new(SERVER_KEY.to_private_key()),
         ocsp: Arc::new(None),

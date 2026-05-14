@@ -16,11 +16,7 @@ use rustls::{
     sign::CertifiedKey,
 };
 
-use crate::dquic::{
-    binds::BindPattern,
-    connection::Connection,
-    identity::Identity,
-};
+use crate::dquic::{binds::BindPattern, connection::Connection, identity::Identity};
 
 /// Per-SNI entry stored behind a `Weak` in the network's registry.
 ///

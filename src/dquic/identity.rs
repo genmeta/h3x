@@ -40,7 +40,7 @@ pub(crate) fn build_certified_key(
 mod tests {
     use std::sync::Arc;
 
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::pki_types::PrivateKeyDer;
 
     use super::*;
 
@@ -48,7 +48,7 @@ mod tests {
     fn test_certs_arc_sharing() {
         let certs = vec![];
         let id1 = Identity {
-            name: Name::from_str("test"),
+            name: "test".parse().unwrap(),
             certs: Arc::new(certs),
             key: Arc::new(PrivateKeyDer::Pkcs8(b"dummy".to_vec().into())),
             ocsp: Arc::new(None),
@@ -63,7 +63,7 @@ mod tests {
     #[test]
     fn test_ocsp_default_none() {
         let id = Identity {
-            name: Name::from_str("test"),
+            name: "test".parse().unwrap(),
             certs: Arc::new(vec![]),
             key: Arc::new(PrivateKeyDer::Pkcs8(b"dummy".to_vec().into())),
             ocsp: Arc::new(None),
@@ -74,7 +74,7 @@ mod tests {
     #[test]
     fn test_ocsp_update_independent() {
         let id1 = Identity {
-            name: Name::from_str("test"),
+            name: "test".parse().unwrap(),
             certs: Arc::new(vec![]),
             key: Arc::new(PrivateKeyDer::Pkcs8(b"dummy".to_vec().into())),
             ocsp: Arc::new(None),
@@ -88,19 +88,19 @@ mod tests {
 
     #[test]
     fn test_name_lowercase_normalization() {
-        let name = Name::from_str("LOCALHOST");
+        let name: Name = "LOCALHOST".parse().unwrap();
         assert_eq!(name.as_str(), "localhost");
     }
 
     #[test]
     fn test_name_display() {
-        let name = Name::from_str("MyHost");
+        let name: Name = "MyHost".parse().unwrap();
         assert_eq!(format!("{name}"), "myhost");
     }
 
     #[test]
     fn test_name_deref() {
-        let name = Name::from_str("AbCdEfG");
+        let name: Name = "AbCdEfG".parse().unwrap();
         let s: &str = &name;
         assert_eq!(s, "abcdefg", "Name should deref to lowercased str");
     }
@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn test_name_borrow() {
         use std::borrow::Borrow;
-        let name = Name::from_str("BorrowTest");
+        let name: Name = "BorrowTest".parse().unwrap();
         let s: &str = Borrow::<str>::borrow(&name);
         assert_eq!(
             s, "borrowtest",
@@ -118,11 +118,11 @@ mod tests {
 
     #[test]
     fn test_name_eq() {
-        let a = Name::from_str("EXAMPLE");
-        let b = Name::from_str("example");
+        let a: Name = "EXAMPLE".parse().unwrap();
+        let b: Name = "example".parse().unwrap();
         assert_eq!(a, b, "same name in different case should be equal");
 
-        let c = Name::from_str("other");
+        let c: Name = "other".parse().unwrap();
         assert_ne!(a, c, "different names should not be equal");
     }
 
@@ -139,8 +139,8 @@ mod tests {
             h.finish()
         };
 
-        let a = Name::from_str("MiXeDcAsE");
-        let b = Name::from_str("mixedcase");
+        let a: Name = "MiXeDcAsE".parse().unwrap();
+        let b: Name = "mixedcase".parse().unwrap();
         assert_eq!(
             hash(&a),
             hash(&b),
@@ -152,7 +152,7 @@ mod tests {
     fn test_identity_clone_preserves_fields() {
         let key = PrivateKeyDer::Pkcs8(b"dummy".to_vec().into());
         let id1 = Identity {
-            name: Name::from_str("clone-test"),
+            name: "clone-test".parse().unwrap(),
             certs: Arc::new(vec![]),
             key: Arc::new(key),
             ocsp: Arc::new(None),
@@ -181,7 +181,7 @@ mod tests {
         let key = SERVER_KEY.to_private_key();
 
         let identity = Identity {
-            name: Name::from_str("localhost"),
+            name: "localhost".parse().unwrap(),
             certs: Arc::new(certs),
             key: Arc::new(key),
             ocsp: Arc::new(None),
