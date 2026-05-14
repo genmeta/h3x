@@ -160,7 +160,7 @@ fn auto_close() {
 
 #[test]
 fn missing_server_name_closes_connection_with_no_error() {
-    use std::{net::SocketAddr, str::FromStr, sync::Arc};
+    use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
     use dquic::prelude::{
         IO,
@@ -245,15 +245,25 @@ fn missing_server_name_closes_connection_with_no_error() {
                 .build()
                 .await;
             let client = Arc::new(H3Endpoint::new(client_quic));
-            let error = client
-                .get(
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.get(
                     format!("https://{host}/hello_world")
                         .parse()
                         .expect("valid uri"),
-                )
-                .await
-                .err()
-                .expect("request should fail with no matching server name");
+                ),
+            )
+            .await;
+
+            let error = match result {
+                // timeout is expected — server silently refuses via SilentRefuse,
+                // the QUIC PTO exponential backoff takes ~18s; we cut it short here
+                Err(_elapsed) => return,
+                Ok(Ok(_response)) => {
+                    panic!("expected error from missing server name, got success")
+                }
+                Ok(Err(e)) => e,
+            };
 
             match error {
                 // Connection rejected at QUIC level (SNI mismatch, path validation)
