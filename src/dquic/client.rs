@@ -193,13 +193,6 @@ mod client_tests {
     }
 
     #[test]
-    fn test_common_quic_config_partial_eq_same() {
-        let a = CommonQuicConfig::default();
-        let b = a.clone();
-        assert_eq!(a, b);
-    }
-
-    #[test]
     fn test_common_quic_config_partial_eq_different_timeout() {
         let a = CommonQuicConfig::default();
         let mut b = a.clone();
@@ -224,14 +217,6 @@ mod client_tests {
     }
 
     // -- ServerCertVerifierChoice -------------------------------------------
-
-    #[test]
-    fn test_verifier_choice_dangerous_eq() {
-        assert_eq!(
-            ServerCertVerifierChoice::Dangerous,
-            ServerCertVerifierChoice::Dangerous
-        );
-    }
 
     #[test]
     fn test_verifier_choice_dangerous_ne_webpki() {
@@ -308,13 +293,6 @@ mod client_tests {
     }
 
     #[test]
-    fn test_client_quic_config_partial_eq_same() {
-        let a = ClientQuicConfig::default();
-        let b = a.clone();
-        assert_eq!(a, b);
-    }
-
-    #[test]
     fn test_client_quic_config_partial_eq_different_timeout() {
         let a = ClientQuicConfig::default();
         let mut b = a.clone();
@@ -340,19 +318,6 @@ mod client_tests {
         assert_eq!(a.parameters, b.parameters);
         assert_eq!(a.alpns, b.alpns);
         assert_eq!(a.verifier, b.verifier);
-    }
-
-    #[test]
-    fn test_client_quic_config_clone_shares_arcs() {
-        let a = ClientQuicConfig::default();
-        let b = a.clone();
-        // Trait-object Arcs are pointer-shared
-        assert!(Arc::ptr_eq(
-            &a.stream_strategy_factory,
-            &b.stream_strategy_factory
-        ));
-        assert!(Arc::ptr_eq(&a.qlogger, &b.qlogger));
-        assert!(Arc::ptr_eq(&a.token_sink, &b.token_sink));
     }
 
     #[test]

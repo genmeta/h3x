@@ -706,7 +706,7 @@ mod tests {
         Arc::new(settings)
     }
 
-    // --- Fix 2: zero increment rejection ---
+    // --- Core encoding tests ---
 
     #[test]
     fn on_insert_count_increment_zero_returns_err() {
@@ -738,7 +738,7 @@ mod tests {
         assert!(result.is_ok(), "Expected Ok, got {result:?}");
     }
 
-    // --- Fix 3: panic→error for capacity ---
+    // --- Table management tests ---
 
     #[test]
     fn set_max_table_capacity_exceeds_max_returns_err() {
@@ -776,7 +776,7 @@ mod tests {
         );
     }
 
-    // --- Fix 4: eviction guard ---
+    // --- Eviction tests ---
 
     #[test]
     fn insert_with_literal_name_cannot_evict_when_unacknowledged() {
@@ -810,7 +810,7 @@ mod tests {
         );
     }
 
-    // --- Fix 7: blocked streams — get_dynamic_references ---
+    // --- Edge case tests ---
 
     #[test]
     fn get_dynamic_references_finds_dynamic_indexed_field() {

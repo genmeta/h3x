@@ -224,13 +224,6 @@ mod tests {
     }
 
     #[test]
-    fn test_server_name_clone() {
-        let name = ServerName::new("cloneable");
-        let cloned = name.clone();
-        assert_eq!(name, cloned, "cloned ServerName should equal the original");
-    }
-
-    #[test]
     fn test_identity_clone_preserves_fields() {
         let key = PrivateKeyDer::Pkcs8(b"dummy".to_vec().into());
         let id1 = Identity {

@@ -440,7 +440,7 @@ mod tests {
     use super::EncodedFieldSectionPrefix;
     use crate::codec::DecodeError;
 
-    // --- Fix 6: RIC modular encoding ---
+    // --- Field representation tests ---
 
     #[test]
     fn test_encode_ric_zero() {
