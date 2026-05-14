@@ -942,7 +942,7 @@ mod tests {
     #[test]
     fn test_bind_server_error_sni_in_use_display() {
         let err = BindServerError::SniInUse {
-            name: ServerName::new("example.com"),
+            name: Name::from_str("example.com"),
         };
         let display = format!("{err}");
         assert!(
