@@ -810,7 +810,7 @@ mod tests {
     /// in its pool (fast-path for `acquire_write_stream`).
     fn test_arbiter_with_ws() -> Arc<Arbiter<TestConnect, Arc<H3Endpoint<TestConnect>>>> {
         let arbiter = test_arbiter();
-        let ws = crate::message::stream::WriteStream::new_for_test(VarInt::from_u32(0));
+        let ws = crate::message::test::write_stream_for_test(VarInt::from_u32(0));
         *arbiter.write_stream.lock().unwrap() = Some(ws);
         arbiter
     }
@@ -822,7 +822,7 @@ mod tests {
     /// `AlreadyConsumed` on the second call.
     fn test_arbiter_with_rs() -> Arc<Arbiter<TestConnect, Arc<H3Endpoint<TestConnect>>>> {
         let arbiter = test_arbiter();
-        let rs = crate::message::stream::ReadStream::new_for_test(VarInt::from_u32(0));
+        let rs = crate::message::test::read_stream_for_test(VarInt::from_u32(0));
         *arbiter.read_stream.lock().unwrap() = Some(rs);
         // Simulate a completed ensure_init so the second acquire
         // doesn't attempt a real connection
@@ -844,44 +844,7 @@ mod tests {
         }
     }
 
-    // // ====================================================================
-    // // Task 11 GREEN tests — resource acquire/return lifecycle
-    // // ====================================================================
-
-    // /// `acquire_message()` → `return_message_to_pool()` →
-    // /// `acquire_message()` cycle: message returns to pool after
-    // /// being returned.
-    // ///
-    // /// Assertions:
-    // /// - First `acquire_message()` → `Some(msg)`, pool → `None`.
-    // /// - After `return_message_to_pool(msg)`, pool → `Some`.
-    // /// - Second `acquire_message()` → `Some`.
-    // #[tokio::test]
-    // async fn test_acquire_message_cycle() {
-    //     let arbiter = test_arbiter();
-
-    //     // First acquire — pool starts with one message
-    //     let msg = arbiter.acquire_message();
-    //     assert!(msg.is_some(), "first acquire should return message");
-    //     assert!(
-    //         arbiter.message.lock().unwrap().is_none(),
-    //         "pool should be empty after acquire"
-    //     );
-
-    //     // Return to pool
-    //     arbiter.return_message_to_pool(msg.unwrap());
-    //     assert!(
-    //         arbiter.message.lock().unwrap().is_some(),
-    //         "pool should have message after return"
-    //     );
-
-    //     // Second acquire — message is back in pool
-    //     let msg2 = arbiter.acquire_message();
-    //     assert!(msg2.is_some(), "second acquire should return message");
-
-    //     // Cleanup: return message so Arbiter::drop doesn't spawn cleanup
-    //     drop(msg2);
-    // }
+    // --- Resource acquire/return lifecycle tests ---
 
     /// After pre-populating `write_stream` (simulating a completed
     /// `ensure_init`), `acquire_write_stream()` succeeds via the
@@ -1218,16 +1181,14 @@ mod tests {
         )
     }
 
-    // ====================================================================
-    // Task 17 GREEN tests — IntoFuture both paths
-    // ====================================================================
+    // --- IntoFuture path tests ---
 
     /// Creates an `Arbiter` with both `write_stream` and `read_stream`
     /// pre‑populated, so the inline `IntoFuture` path can proceed past
     /// resource acquisition without calling the (expensive) `ensure_init`.
     fn test_arbiter_with_ws_and_rs() -> Arc<Arbiter<TestConnect, Arc<H3Endpoint<TestConnect>>>> {
         let arbiter = test_arbiter_with_ws();
-        let rs = crate::message::stream::ReadStream::new_for_test(VarInt::from_u32(1));
+        let rs = crate::message::test::read_stream_for_test(VarInt::from_u32(1));
         *arbiter.read_stream.lock().unwrap() = Some(rs);
         arbiter
     }
@@ -1260,10 +1221,10 @@ mod tests {
     /// Verifies the split path is correctly selected when other clones
     /// exist and the error propagates through the `IntoFuture`.
     #[tokio::test]
-    #[ignore = "split path not yet implemented (todo in Task 16)"]
+    #[ignore = "split path not yet implemented"]
     async fn test_into_future_split_read_error() {
         let arbiter = test_arbiter();
-        let rs = crate::message::stream::ReadStream::new_for_test(VarInt::from_u32(0));
+        let rs = crate::message::test::read_stream_for_test(VarInt::from_u32(0));
         *arbiter.read_stream.lock().unwrap() = Some(rs);
 
         let req = request_with_message(&arbiter);
@@ -1307,10 +1268,10 @@ mod tests {
     /// This test verifies the refcount‑based routing, exercised through
     /// the same `read_message_header` error as `test_into_future_split_read_error`.
     #[tokio::test]
-    #[ignore = "split path not yet implemented (todo in Task 16)"]
+    #[ignore = "split path not yet implemented"]
     async fn test_into_future_split_refcount() {
         let arbiter = test_arbiter();
-        let rs = crate::message::stream::ReadStream::new_for_test(VarInt::from_u32(0));
+        let rs = crate::message::test::read_stream_for_test(VarInt::from_u32(0));
         *arbiter.read_stream.lock().unwrap() = Some(rs);
 
         let req = request_with_message(&arbiter);
@@ -1353,9 +1314,7 @@ mod tests {
         )
     }
 
-    // ====================================================================
-    // Task — authority & lifecycle tests
-    // ====================================================================
+    // --- Authority & lifecycle tests ---
 
     /// Authority can be set when `init_done` is false (initial state).
     ///
