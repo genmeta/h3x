@@ -57,7 +57,6 @@ use crate::dquic::{
     binds::BindPattern,
     connection::Connection,
     identity::Identity,
-    identity::Name,
     net::{
         BindInterface, BindUri, Devices, InterfaceManager, Locations, ProductIO, QuicRouter,
         handy::DEFAULT_IO_FACTORY,
