@@ -38,8 +38,8 @@ pub mod server;
 /// `T: quic::Connect`, it can work with any QUIC backend.
 pub struct H3Endpoint<T: quic::Connect> {
     pub(crate) quic: T,
-    pub(crate) pool: Pool<T::Connection>,
     pub(crate) builder: Arc<ConnectionBuilder<T::Connection>>,
+    pub(crate) pool: Pool<T::Connection>,
 }
 
 /// RAII guard for mutable access to [`H3Endpoint`]'s QUIC transport.
@@ -76,13 +76,12 @@ impl<T: quic::Connect> H3Endpoint<T> {
     #[builder]
     pub fn new(
         quic: T,
-        #[builder(default)] pool: Pool<T::Connection>,
         #[builder(default)] builder: Arc<ConnectionBuilder<T::Connection>>,
     ) -> Self {
         Self {
             quic,
-            pool,
             builder,
+            pool: Pool::empty(),
         }
     }
 }
@@ -247,11 +246,11 @@ where
         let pool = this.pool.clone();
         let builder = this.builder.clone();
         async move {
-            let mut ref_ep = H3Endpoint::builder()
-                .quic(&this.quic)
-                .pool(pool)
-                .builder(builder)
-                .build();
+            let mut ref_ep = H3Endpoint {
+                quic: &this.quic,
+                builder,
+                pool,
+            };
             ref_ep.serve(service).await
         }
     }
