@@ -44,7 +44,7 @@ pub(crate) mod listener;
 mod stream;
 
 #[cfg(test)]
-mod tests;
+mod test_utils;
 
 pub use self::{
     connection::{
