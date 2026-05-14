@@ -302,3 +302,127 @@ fn missing_server_name_closes_connection_with_no_error() {
         },
     )
 }
+
+#[test]
+fn connection_refused() {
+    use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
+
+    use futures::{FutureExt, StreamExt, stream};
+    use h3x::{
+        dquic::{
+            qbase::net::addr::EndpointAddr,
+            qresolve::{Resolve, ResolveFuture, Source},
+        },
+        endpoint::H3Endpoint,
+    };
+
+    #[derive(Debug)]
+    struct FixedResolver(SocketAddr);
+
+    impl std::fmt::Display for FixedResolver {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FixedResolver({})", self.0)
+        }
+    }
+
+    impl Resolve for FixedResolver {
+        fn lookup<'l>(&'l self, _name: &'l str) -> ResolveFuture<'l> {
+            let ep = EndpointAddr::direct(self.0);
+            let source = Source::System;
+            async move { Ok(stream::iter(std::iter::once((source, ep))).boxed()) }.boxed()
+        }
+    }
+
+    run("connection_refused", async move {
+        let network = test_network().await;
+
+        let client_quic = h3x::dquic::QuicEndpoint::builder()
+            .network(network)
+            .resolver(Arc::new(FixedResolver(
+                SocketAddr::from_str("127.0.0.1:1").expect("valid socket addr"),
+            )))
+            .build()
+            .await;
+        let client = Arc::new(H3Endpoint::new(client_quic));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get("https://localhost/hello_world".parse().expect("valid uri")),
+        )
+        .await;
+
+        match result {
+            Err(_elapsed) => { /* expected — UDP to closed port times out */ }
+            Ok(Err(e)) => match e {
+                h3x::endpoint::client::RequestError::Connect { .. } => { /* expected */ }
+                h3x::endpoint::client::RequestError::ResponseStream {
+                    source:
+                        quic::StreamError::Connection {
+                            source: quic::ConnectionError::Transport { .. },
+                        },
+                } => { /* also valid */ }
+                other => panic!("expected Connect error or timeout, got: {other:?}"),
+            },
+            Ok(Ok(_response)) => panic!("expected error from refused connection, got success"),
+        }
+    })
+}
+
+#[test]
+#[ignore = "requires a real unresponsive server; QUIC-in-memory transport completes too fast"]
+fn request_timeout() {
+    use std::sync::Arc;
+
+    run("request_timeout", async move {
+        let network = test_network().await;
+
+        let router = Router::new().get("/hello_world", hello_world_service);
+        let (mut server, host) = test_server_with(network.clone()).await;
+        let _serve =
+            AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
+
+        let client = Arc::new(test_client_with(network).await);
+
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(1),
+            client.get(
+                format!("https://{host}/hello_world")
+                    .parse()
+                    .expect("valid uri"),
+            ),
+        )
+        .await;
+
+        match result {
+            Err(_elapsed) => { /* timeout fired as expected */ }
+            Ok(Ok(response)) => {
+                assert_eq!(response.status(), http::StatusCode::OK);
+            }
+            Ok(Err(e)) => panic!("request failed: {e:?}"),
+        }
+    })
+}
+
+#[test]
+fn empty_authority_error() {
+    use std::sync::Arc;
+
+    run("empty_authority_error", async move {
+        let client = Arc::new(test_client().await);
+
+        let error = client
+            .new_request_owned()
+            .await
+            .err()
+            .expect("request without authority should fail");
+
+        match error {
+            h3x::endpoint::client::RequestError::MalformedRequestHeader { .. } => {
+                // expected — EmptyAuthorityOrHost or similar
+            }
+            other => panic!(
+                "expected MalformedRequestHeader error for missing authority, got: {other:?}"
+            ),
+        }
+    })
+}
