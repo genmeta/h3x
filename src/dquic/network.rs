@@ -44,6 +44,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use dhttp_identity::Name;
 use snafu::Snafu;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
@@ -55,7 +56,7 @@ pub use crate::dquic::sni::ServerBinding;
 use crate::dquic::{
     binds::BindPattern,
     connection::Connection,
-    identity::{Identity, ServerName},
+    identity::Identity,
     net::{
         BindInterface, BindUri, Devices, InterfaceManager, Locations, ProductIO, QuicRouter,
         handy::DEFAULT_IO_FACTORY,
@@ -79,7 +80,7 @@ use crate::dquic::{
     },
 };
 
-pub(crate) type SniRegistry = Arc<DashMap<ServerName, Weak<ServerEntry>>>;
+pub(crate) type SniRegistry = Arc<DashMap<Name<'static>, Weak<ServerEntry>>>;
 
 /// Error returned by [`Network::bind_server`].
 #[derive(Debug, Snafu)]
@@ -89,7 +90,7 @@ pub enum BindServerError {
     #[snafu(display("sni {name} is already bound to a different identity"))]
     SniInUse {
         /// SNI that is already registered.
-        name: ServerName,
+        name: Name<'static>,
     },
     /// The network already has a server configuration that is incompatible
     /// with the one provided. Drop every existing [`ServerBinding`] before
@@ -522,7 +523,7 @@ impl Network {
     /// that have been dropped are automatically cleaned up by the [`RegistryGuard`]
     /// drop logic.
     #[allow(dead_code, reason = "used in test module")]
-    pub(crate) fn registered_sni_names(&self) -> Vec<ServerName> {
+    pub(crate) fn registered_sni_names(&self) -> Vec<Name<'static>> {
         self.sni_registry
             .iter()
             .filter(|kv| kv.value().upgrade().is_some())
@@ -783,7 +784,7 @@ mod tests {
         let key: PrivateKeyDer<'static> = SERVER_KEY.to_private_key();
 
         Arc::new(Identity {
-            name: ServerName::new(name),
+            name: Name::from_str(name),
             certs: Arc::new(certs),
             key: Arc::new(key),
             ocsp: Arc::new(None),

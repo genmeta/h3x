@@ -15,10 +15,12 @@ use rustls::{
     sign::CertifiedKey,
 };
 
+use dhttp_identity::Name;
+
 use crate::dquic::{
     binds::BindPattern,
     connection::Connection,
-    identity::{Identity, ServerName},
+    identity::Identity,
 };
 
 /// Per-SNI entry stored behind a `Weak` in the network's registry.
@@ -42,8 +44,8 @@ pub(crate) struct ServerEntry {
 /// RAII guard that removes an SNI entry from the registry when the last
 /// [`ServerBinding`] referencing it is dropped.
 pub(crate) struct RegistryGuard {
-    pub(crate) name: ServerName,
-    pub(crate) registry: Weak<DashMap<ServerName, Weak<ServerEntry>>>,
+    pub(crate) name: Name<'static>,
+    pub(crate) registry: Weak<DashMap<Name<'static>, Weak<ServerEntry>>>,
     pub(crate) self_entry: Weak<ServerEntry>,
 }
 
@@ -96,7 +98,7 @@ impl std::fmt::Debug for ServerBinding {
 
 impl ServerBinding {
     /// Return the server name this binding was registered under.
-    pub fn name(&self) -> &ServerName {
+    pub fn name(&self) -> &Name<'static> {
         &self.entry.identity.name
     }
 
@@ -114,7 +116,7 @@ impl ServerBinding {
 /// SNI names are matched ASCII case-insensitively per RFC 6066 §3.
 #[derive(Clone)]
 pub(crate) struct SniCertResolver {
-    pub(crate) registry: Weak<DashMap<ServerName, Weak<ServerEntry>>>,
+    pub(crate) registry: Weak<DashMap<Name<'static>, Weak<ServerEntry>>>,
 }
 
 impl std::fmt::Debug for SniCertResolver {

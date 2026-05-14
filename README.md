@@ -15,67 +15,52 @@ High-performance asynchronous DHTTP/3 implementation in Rust.
 
 > ⚠️ Currently, h3x is in the early stages of development, and the API may undergo significant changes.
 
-h3x includes `dquic` as its built-in QUIC backend (feature `dquic`, enabled by default). The `h3x::dquic` module exposes wrapped types for HTTP/3 transport over `dquic`.
+h3x includes `dquic` as its built-in QUIC backend (feature `dquic`, enabled by default). Wrap a `QuicEndpoint` in an `H3Endpoint` to get HTTP/3 client and server semantics on top of QUIC.
 
-```rust
-use h3x::dquic::{
-    H3Client, H3Servers,
-    prelude::{BindUri, handy::ToCertificate},
+```rust,no_run
+use h3x::{dquic::QuicEndpoint, endpoint::H3Endpoint};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = H3Endpoint::new(QuicEndpoint::new().await);
+
+    let mut response = endpoint.get("https://example.com:4433/hello".parse()?).await?;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    println!("{}", response.read_to_string().await?);
+    Ok(())
+}
+```
+
+```rust,no_run
+use std::sync::Arc;
+use h3x::{
+    dquic::{Identity, QuicEndpoint, ServerName},
+    endpoint::{H3Endpoint, server::{Request, Response, Router}},
 };
 
-async fn client_example() -> Result<(), Box<dyn std::error::Error>> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add_parsable_certificates(
-        include_bytes!("tests/keychain/localhost/ca.cert").to_certificate(),
+async fn hello(_req: &mut Request, resp: &mut Response) {
+    resp.set_status(http::StatusCode::OK).set_body(&b"Hello, World!"[..]);
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let identity = Arc::new(Identity {
+        name: ServerName::new("localhost"),
+        certs: todo!("load your certificate chain"),
+        key: todo!("load your private key"),
+        ocsp: Arc::new(None),
+    });
+    let endpoint = H3Endpoint::new(
+        QuicEndpoint::builder()
+            .identity(identity)
+            .bind(Arc::new(vec!["127.0.0.1:4433".parse()?]))
+            .build().await,
     );
-    let h3_client = H3Client::builder()
-        .with_root_certificates(roots)
-        .without_identity()?
-        .build();
 
-    // Initiate GET request
-    // The request stream is automatically closed when dropped
-    let (_, mut response) = h3_client
-        .new_request()
-        .get("localhost:4433/hello_world".parse()?)
-        .await?;
-
-    // Check response status code
-    assert_eq!(response.status(), http::StatusCode::OK);
-
-    let text = response.read_to_string().await?;
-    println!("Response: {:?}", text);
-
+    let router = Router::new().get("/hello", hello);
+    endpoint.serve(router).await?;
     Ok(())
 }
-
-async fn server_example() -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = H3Servers::builder()
-        .without_client_cert_verifier()?
-        .listen()?;
-
-    let hello_world = async |request: &mut h3x::server::Request,
-                             response: &mut h3x::server::Response| {
-        response
-            .set_status(http::StatusCode::OK)
-            .set_body(&b"Hello, World!"[..]);
-    };
-
-    app.add_server(
-        "localhost",
-        include_bytes!("tests/keychain/localhost/server.cert"),
-        include_bytes!("tests/keychain/localhost/server.key"),
-        None,
-        [BindUri::from("inet://[::1]:4433")],
-        h3x::server::Router::new().get("/hello_world", hello_world),
-    )
-    .await?;
-
-    app.run().await;
-
-    Ok(())
-}
-
 ```
 
 #### Hyper / Tower Integration
@@ -89,60 +74,50 @@ h3x provides adapters to bridge the Tower / hyper service ecosystem into DHTTP/3
 > - `h3x::hyper::upgrade` — stream takeover for Extended CONNECT tunnels (instead of `hyper::upgrade`)
 > - `h3x::hyper::ext::Protocol` — protocol indication in CONNECT requests (instead of `hyper::ext::Protocol`)
 
-```rust
-use axum::{Router, body::Body, routing::get};
+```rust,no_run
+use std::sync::Arc;
+use axum::{Router as AxumRouter, routing::get};
 use h3x::{
-    dquic::{H3Client, H3Servers, prelude::{BindUri, handy::ToCertificate}},
+    dquic::{Identity, QuicEndpoint, ServerName},
+    endpoint::H3Endpoint,
     hyper::server::TowerService,
 };
 
-async fn serve_axum_over_dhttp3() -> Result<(), Box<dyn std::error::Error>> {
-    // Build a standard Tower service — here an axum Router
-    let router = Router::new()
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let router = AxumRouter::new()
         .route("/hello", get(|| async { "Hello from DHTTP/3!" }));
-
-    // Wrap it with TowerService to bridge into h3x
     let service = TowerService(router.into_service());
 
-    let mut app = H3Servers::builder()
-        .without_client_cert_verifier()?
-        .listen()?;
-
-    app.add_server(
-        "localhost",
-        include_bytes!("tests/keychain/localhost/server.cert"),
-        include_bytes!("tests/keychain/localhost/server.key"),
-        None,
-        [BindUri::from("inet://[::1]:4433")],
-        service,
+    let identity = Arc::new(Identity {
+        name: ServerName::new("localhost"),
+        certs: todo!("load your certificate chain"),
+        key: todo!("load your private key"),
+        ocsp: Arc::new(None),
+    });
+    H3Endpoint::new(
+        QuicEndpoint::builder()
+            .identity(identity)
+            .bind(Arc::new(vec!["127.0.0.1:4433".parse()?]))
+            .build().await,
     )
+    .serve(service)
     .await?;
-
-    app.run().await;
     Ok(())
 }
+```
 
-// Client side — execute requests with hyper Body types
-async fn hyper_client_example() -> Result<(), Box<dyn std::error::Error>> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add_parsable_certificates(
-        include_bytes!("tests/keychain/localhost/ca.cert").to_certificate(),
-    );
-    let h3_client = H3Client::builder()
-        .with_root_certificates(roots)
-        .without_identity()?
-        .build();
+```rust,no_run
+use h3x::{dquic::QuicEndpoint, endpoint::H3Endpoint};
 
-    let connection = h3_client.connect("localhost:4433".parse()?).await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = H3Endpoint::new(QuicEndpoint::new().await);
 
-    let response = connection
-        .execute_hyper_request(
-            http::Request::get("https://localhost:4433/hello")
-                .body(Body::empty())?,
-        )
-        .await?;
-
+    let mut response = endpoint.get("https://example.com:4433/hello".parse()?).await?;
     assert_eq!(response.status(), http::StatusCode::OK);
+    let body = response.read_to_bytes().await?;
+    println!("{}", String::from_utf8_lossy(&body));
     Ok(())
 }
 ```

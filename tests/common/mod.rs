@@ -62,42 +62,24 @@ pub const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/se
 pub const SERVER_KEY: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
 pub const TEST_DATA: &[u8] = include_bytes!("mod.rs");
 
-pub async fn test_network() -> Arc<h3x::dquic::Network> {
-    h3x::dquic::Network::builder().build()
-}
-
 pub async fn test_client() -> h3x::dquic::H3Endpoint {
-    test_client_with(test_network().await).await
-}
-
-pub async fn test_client_with(network: Arc<h3x::dquic::Network>) -> h3x::dquic::H3Endpoint {
-    let quic = h3x::dquic::QuicEndpoint::builder()
-        .network(network)
-        .resolver(Arc::new(SystemResolver))
-        .build()
-        .await;
+    let quic = h3x::dquic::QuicEndpoint::builder().build().await;
     h3x::endpoint::H3Endpoint::new(quic)
 }
 
 pub async fn test_server() -> (h3x::dquic::H3Endpoint, Authority) {
-    test_server_with(test_network().await).await
-}
-
-pub async fn test_server_with(
-    network: Arc<h3x::dquic::Network>,
-) -> (h3x::dquic::H3Endpoint, Authority) {
     let identity = Arc::new(h3x::dquic::Identity {
         name: h3x::dquic::ServerName::new("localhost"),
         certs: Arc::new(SERVER_CERT.to_certificate()),
         key: Arc::new(SERVER_KEY.to_private_key()),
         ocsp: Arc::new(None),
     });
+    let network = h3x::dquic::Network::builder().build();
     let quic = h3x::dquic::QuicEndpoint::builder()
         .network(network.clone())
         .identity(identity)
-        .resolver(Arc::new(SystemResolver))
         .bind(Arc::new(vec![
-            std::str::FromStr::from_str("inet://127.0.0.1:0").expect("valid pattern"),
+            "127.0.0.1:0".parse().expect("valid pattern"),
         ]))
         .build()
         .await;

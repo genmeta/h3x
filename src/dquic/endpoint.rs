@@ -181,12 +181,17 @@ impl<'a> Drop for ServerConfigMutGuard<'a> {
     }
 }
 
+impl QuicEndpoint {
+    pub async fn new() -> Self {
+        Self::builder().build().await
+    }
+}
+
 #[bon]
 impl QuicEndpoint {
-    /// Construct a new endpoint.
     #[builder]
     pub async fn new(
-        network: Arc<Network>,
+        #[builder(default = Network::builder().build())] network: Arc<Network>,
         identity: Option<Arc<Identity>>,
         #[builder(default = Arc::new(crate::dquic::prelude::handy::SystemResolver))] resolver: Arc<
             dyn Resolve + Send + Sync,

@@ -1,10 +1,20 @@
 mod common;
 
-use std::sync::Arc;
+use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use common::*;
+use futures::{FutureExt, StreamExt, stream};
 use h3x::{
-    endpoint::server::{self, Router},
+    dquic::{
+        Identity, ServerName,
+        cert::handy::{ToCertificate, ToPrivateKey},
+        net::{EndpointAddr, IO},
+        resolver::{Resolve, ResolveFuture, Source, handy::SystemResolver},
+    },
+    endpoint::{
+        H3Endpoint,
+        server::{self, Router},
+    },
     error::Code,
     quic,
     varint::VarInt,
@@ -21,12 +31,11 @@ async fn hello_world_service(_: &mut server::Request, response: &mut server::Res
 fn hello_world() {
     run("hello_world", async move {
         let router = Router::new().get("/hello_world", hello_world_service);
-        let network = test_network().await;
-        let (mut server, host) = test_server_with(network.clone()).await;
+        let (mut server, host) = test_server().await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = Arc::new(test_client_with(network).await);
+        let client = Arc::new(test_client().await);
         let mut response = client
             .get(
                 format!("https://{host}/hello_world")
@@ -66,12 +75,11 @@ async fn streaming_echo_service(request: &mut server::Request, response: &mut se
 fn streaming_echo() {
     run("streaming_echo", async move {
         let router = Router::new().post("/echo", streaming_echo_service);
-        let network = test_network().await;
-        let (mut server, host) = test_server_with(network.clone()).await;
+        let (mut server, host) = test_server().await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = Arc::new(test_client_with(network).await);
+        let client = Arc::new(test_client().await);
         let request = client.post(format!("https://{host}/echo").parse().expect("valid uri"));
         // flush headers so the server can respond before we write body
         request
@@ -102,12 +110,11 @@ fn fallback() {
         let router = Router::new()
             .get("/hello_world", hello_world_service)
             .post("/hello_world", hello_world_service);
-        let network = test_network().await;
-        let (mut server, host) = test_server_with(network.clone()).await;
+        let (mut server, host) = test_server().await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = Arc::new(test_client_with(network).await);
+        let client = Arc::new(test_client().await);
         let response = client
             .get(
                 format!("https://{host}/non_exist")
@@ -133,12 +140,11 @@ async fn echo_service(request: &mut server::Request, response: &mut server::Resp
 fn auto_close() {
     run("auto_close", async move {
         let router = Router::new().post("/echo", echo_service);
-        let network = test_network().await;
-        let (mut server, host) = test_server_with(network.clone()).await;
+        let (mut server, host) = test_server().await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = Arc::new(test_client_with(network).await);
+        let client = Arc::new(test_client().await);
         let request = client.post(format!("https://{host}/echo").parse().expect("valid uri"));
         request
             .write(TEST_DATA)
@@ -160,22 +166,6 @@ fn auto_close() {
 
 #[test]
 fn missing_server_name_closes_connection_with_no_error() {
-    use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
-
-    use dquic::prelude::{
-        IO,
-        handy::{SystemResolver, ToCertificate, ToPrivateKey},
-    };
-    use futures::{FutureExt, StreamExt, stream};
-    use h3x::{
-        dquic::{
-            Identity, ServerName,
-            qbase::net::addr::EndpointAddr,
-            qresolve::{Resolve, ResolveFuture, Source},
-        },
-        endpoint::H3Endpoint,
-    };
-
     #[derive(Debug)]
     struct FixedResolver(SocketAddr);
 
@@ -196,10 +186,9 @@ fn missing_server_name_closes_connection_with_no_error() {
     run(
         "missing_server_name_closes_connection_with_no_error",
         async move {
-            let network = test_network().await;
-
             // Create server with identity "server" — client will use "localhost",
             // so the SNI won't match
+            let network = h3x::dquic::Network::builder().build();
             let identity = Arc::new(Identity {
                 name: ServerName::new("server"),
                 certs: Arc::new(SERVER_CERT.to_certificate()),
@@ -211,7 +200,7 @@ fn missing_server_name_closes_connection_with_no_error() {
                 .identity(identity)
                 .resolver(Arc::new(SystemResolver))
                 .bind(Arc::new(vec![
-                    FromStr::from_str("inet://127.0.0.1:0").expect("valid bind pattern"),
+                    "127.0.0.1:0".parse().expect("valid bind pattern"),
                 ]))
                 .build()
                 .await;
@@ -236,7 +225,6 @@ fn missing_server_name_closes_connection_with_no_error() {
 
             // Use FixedResolver to bypass system DNS and directly target the server port
             let client_quic = h3x::dquic::QuicEndpoint::builder()
-                .network(network)
                 .resolver(Arc::new(FixedResolver(
                     format!("127.0.0.1:{port}")
                         .parse()
@@ -305,17 +293,6 @@ fn missing_server_name_closes_connection_with_no_error() {
 
 #[test]
 fn connection_refused() {
-    use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
-
-    use futures::{FutureExt, StreamExt, stream};
-    use h3x::{
-        dquic::{
-            qbase::net::addr::EndpointAddr,
-            qresolve::{Resolve, ResolveFuture, Source},
-        },
-        endpoint::H3Endpoint,
-    };
-
     #[derive(Debug)]
     struct FixedResolver(SocketAddr);
 
@@ -334,10 +311,7 @@ fn connection_refused() {
     }
 
     run("connection_refused", async move {
-        let network = test_network().await;
-
         let client_quic = h3x::dquic::QuicEndpoint::builder()
-            .network(network)
             .resolver(Arc::new(FixedResolver(
                 SocketAddr::from_str("127.0.0.1:1").expect("valid socket addr"),
             )))
@@ -371,17 +345,13 @@ fn connection_refused() {
 #[test]
 #[ignore = "requires a real unresponsive server; QUIC-in-memory transport completes too fast"]
 fn request_timeout() {
-    use std::sync::Arc;
-
     run("request_timeout", async move {
-        let network = test_network().await;
-
         let router = Router::new().get("/hello_world", hello_world_service);
-        let (mut server, host) = test_server_with(network.clone()).await;
+        let (mut server, host) = test_server().await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
 
-        let client = Arc::new(test_client_with(network).await);
+        let client = Arc::new(test_client().await);
 
         let result = tokio::time::timeout(
             tokio::time::Duration::from_millis(1),
@@ -405,8 +375,6 @@ fn request_timeout() {
 
 #[test]
 fn empty_authority_error() {
-    use std::sync::Arc;
-
     run("empty_authority_error", async move {
         let client = Arc::new(test_client().await);
 
