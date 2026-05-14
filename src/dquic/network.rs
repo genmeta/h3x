@@ -57,6 +57,7 @@ use crate::dquic::{
     binds::BindPattern,
     connection::Connection,
     identity::Identity,
+    identity::Name,
     net::{
         BindInterface, BindUri, Devices, InterfaceManager, Locations, ProductIO, QuicRouter,
         handy::DEFAULT_IO_FACTORY,
@@ -277,7 +278,7 @@ impl Network {
             return Ok(binding);
         }
 
-        let certified_key = identity.build_certified_key()?;
+        let certified_key = crate::dquic::identity::build_certified_key(&identity)?;
 
         use dashmap::mapref::entry::Entry;
         match self.sni_registry.entry(name.clone()) {

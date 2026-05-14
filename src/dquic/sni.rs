@@ -10,12 +10,11 @@
 use std::sync::{Arc, Weak};
 
 use dashmap::DashMap;
+use dhttp_identity::Name;
 use rustls::{
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
-
-use dhttp_identity::Name;
 
 use crate::dquic::{
     binds::BindPattern,

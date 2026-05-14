@@ -606,10 +606,8 @@ mod tests {
     use rustls::pki_types::PrivateKeyDer;
 
     use super::*;
-    use crate::dquic::{
-        identity::{Identity, ServerName},
-        resolver::handy::SystemResolver,
-    };
+    use crate::dquic::resolver::handy::SystemResolver;
+    use dhttp_identity::Name;
 
     #[tokio::test]
     async fn test_quic_endpoint_construction() {
@@ -682,7 +680,7 @@ mod tests {
 
     fn make_identity(name: &str) -> Identity {
         Identity {
-            name: ServerName::new(name),
+            name: Name::from_str(name),
             certs: Arc::new(vec![]),
             key: Arc::new(PrivateKeyDer::Pkcs8(b"dummy-key-data".to_vec().into())),
             ocsp: Arc::new(None),
@@ -972,10 +970,10 @@ mod tests {
         use dashmap::DashMap;
         use rustls::{pki_types::CertificateDer, sign::CertifiedKey};
 
-        use crate::dquic::{
-            cert::handy::{ToCertificate, ToPrivateKey},
-            sni::{RegistryGuard, ServerConfig as SniServerConfig, ServerEntry},
-        };
+    use crate::dquic::{
+        identity::{Identity, Name},
+        resolver::handy::SystemResolver,
+    };
 
         let mut config = Arc::new(ServerQuicConfig::default());
         let cache = ArcSwapOption::new(None);
@@ -986,7 +984,7 @@ mod tests {
         let key: PrivateKeyDer<'static> = key_bytes.to_private_key();
 
         let identity = Arc::new(Identity {
-            name: ServerName::new("localhost"),
+            name: Name::from_str("localhost"),
             certs: Arc::new(certs.clone()),
             key: Arc::new(key.clone_key()),
             ocsp: Arc::new(None),
@@ -1014,7 +1012,7 @@ mod tests {
 
         let registry = Arc::new(DashMap::new());
         let reg_guard = Arc::new(RegistryGuard {
-            name: ServerName::new("localhost"),
+            name: Name::from_str("localhost"),
             registry: Arc::downgrade(&registry),
             self_entry: Weak::new(),
         });
