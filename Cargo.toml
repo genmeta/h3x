@@ -30,10 +30,7 @@ matchit = "0.9"
 x509-parser = "0.18"
 tower-service = "0.3"
 
-# internal — temporary path dep during ServerName→Name migration;
-# TODO: switch to git ref once dhttp-identity types stabilize
-#   dhttp-identity = { git = "https://github.com/genmeta/dhttp-home.git" }
-dhttp-identity = { path = "../dhttp-home/identity" }
+dhttp-identity = { git = "ssh://git@github.com/genmeta/dhttp.git", rev = "4fdacf2c89d6f433b258897d8aeda4dffc009e94" }
 
 # feature dquic
 dquic = { git = "ssh://git@github.com/genmeta/dquic.git", branch = "feat/v0.5.1", optional = true }
@@ -117,3 +114,7 @@ tracing-appender = "0.2"
 tracing-subscriber = "0.3"
 proptest = "1"
 # remoc = { version = "0.18", features = ["default-codec-bincode"] }
+
+# Local development: override git dep with path to monorepo sibling
+[patch."ssh://git@github.com/genmeta/dhttp.git"]
+dhttp-identity = { path = "../dhttp/identity" }
