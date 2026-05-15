@@ -30,7 +30,7 @@ matchit = "0.9"
 x509-parser = "0.18"
 tower-service = "0.3"
 
-dhttp-identity = { git = "ssh://git@github.com/genmeta/dhttp.git", rev = "4fdacf2c89d6f433b258897d8aeda4dffc009e94" }
+dhttp-identity = { git = "ssh://git@github.com/genmeta/dhttp.git", rev = "9aa36c6f39d7c59c21f6db081edef0f88d5d1416" }
 
 # feature dquic
 dquic = { git = "ssh://git@github.com/genmeta/dquic.git", branch = "feat/v0.5.1", optional = true }
@@ -75,7 +75,16 @@ peg = { version = "0.8", optional = true }
 
 [features]
 default = ["dquic", "hyper"]
-dquic = ["dep:dquic", "dep:arc-swap", "dep:async-channel", "dep:derive_more", "dep:either", "dep:globset", "dep:peg", "tokio/time"]
+dquic = [
+    "dep:dquic",
+    "dep:arc-swap",
+    "dep:async-channel",
+    "dep:derive_more",
+    "dep:either",
+    "dep:globset",
+    "dep:peg",
+    "tokio/time",
+]
 hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
 # EXPERIMENTAL — broken due to remoc 0.18 codec changes (--all-features SKIP)
