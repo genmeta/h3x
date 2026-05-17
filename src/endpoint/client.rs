@@ -133,7 +133,7 @@ pub enum AuthorityFrozen {
     InitComplete,
 }
 
-pub(crate) struct Arbiter<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> {
+pub(crate) struct Arbiter<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> {
     request_message: SyncMutex<Option<Message>>,
     write_stream: SyncMutex<Option<WriteStream>>,
     read_stream: SyncMutex<Option<ReadStream>>,
@@ -143,7 +143,7 @@ pub(crate) struct Arbiter<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> {
     init_done: AtomicBool,
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Arbiter<Q, EP> {
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> Arbiter<Q, EP> {
     pub(crate) fn new(endpoint: EP, message: Message) -> Self {
         Arbiter {
             request_message: SyncMutex::new(Some(message)),
@@ -181,7 +181,7 @@ impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Arbiter<Q, EP> {
     }
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Arbiter<Q, EP>
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> Arbiter<Q, EP>
 where
     Q::Error: std::error::Error + Send + Sync + 'static,
 {
@@ -314,7 +314,7 @@ where
     }
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Drop for Arbiter<Q, EP> {
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> Drop for Arbiter<Q, EP> {
     fn drop(&mut self) {
         // get_mut on &mut self guarantees exclusive access - no lock needed
         if let Some(mut message) = self.request_message.get_mut().unwrap().take()
@@ -330,13 +330,13 @@ impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Drop for Arbiter<Q, EP
     }
 }
 
-pub struct Request<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> {
+pub struct Request<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> {
     held_message: RefCell<Option<Message>>,
     held_write_stream: RefCell<Option<WriteStream>>,
     arbiter: RefCell<Option<Arc<Arbiter<Q, EP>>>>,
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Request<Q, EP> {
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> Request<Q, EP> {
     pub(crate) fn new(arbiter: Arc<Arbiter<Q, EP>>) -> Self {
         Request {
             held_message: RefCell::new(None),
@@ -374,7 +374,7 @@ impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Request<Q, EP> {
     }
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Clone for Request<Q, EP>
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> Clone for Request<Q, EP>
 where
     Q::Error: std::error::Error + Send + Sync + 'static,
 {
@@ -388,25 +388,25 @@ where
     }
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Drop for Request<Q, EP> {
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> Drop for Request<Q, EP> {
     fn drop(&mut self) {
         self.return_all_to_pool();
     }
 }
 
-pub(crate) struct RequestMessageGuard<'a, Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> {
+pub(crate) struct RequestMessageGuard<'a, Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> {
     message: Message,
     request: &'a Request<Q, EP>,
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Deref for RequestMessageGuard<'_, Q, EP> {
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> Deref for RequestMessageGuard<'_, Q, EP> {
     type Target = Message;
     fn deref(&self) -> &Self::Target {
         &self.message
     }
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> DerefMut
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> DerefMut
     for RequestMessageGuard<'_, Q, EP>
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
@@ -414,13 +414,13 @@ impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> DerefMut
     }
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Drop for RequestMessageGuard<'_, Q, EP> {
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> Drop for RequestMessageGuard<'_, Q, EP> {
     fn drop(&mut self) {
         *self.request.held_message.borrow_mut() = Some(self.message.take());
     }
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Request<Q, EP>
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> Request<Q, EP>
 where
     Q::Error: std::error::Error + Send + Sync + 'static,
 {
@@ -553,31 +553,31 @@ where
     }
 }
 
-pub(crate) struct WriteGuard<'a, Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> {
+pub(crate) struct WriteGuard<'a, Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> {
     write_stream: WriteStream,
     request: &'a Request<Q, EP>,
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Deref for WriteGuard<'_, Q, EP> {
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> Deref for WriteGuard<'_, Q, EP> {
     type Target = WriteStream;
     fn deref(&self) -> &Self::Target {
         &self.write_stream
     }
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> DerefMut for WriteGuard<'_, Q, EP> {
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> DerefMut for WriteGuard<'_, Q, EP> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.write_stream
     }
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Drop for WriteGuard<'_, Q, EP> {
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> Drop for WriteGuard<'_, Q, EP> {
     fn drop(&mut self) {
         *self.request.held_write_stream.borrow_mut() = Some(self.write_stream.take());
     }
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Request<Q, EP>
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> Request<Q, EP>
 where
     Q::Error: std::error::Error + Send + Sync + 'static,
 {
@@ -640,7 +640,7 @@ where
     }
 }
 
-impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q>>> Request<Q, EP>
+impl<Q: quic::Connect, EP: Deref<Target = H3Endpoint<Q, Q::Connection>>> Request<Q, EP>
 where
     Q::Error: std::error::Error + Send + Sync + 'static,
 {
@@ -662,9 +662,9 @@ where
 // the concrete type or a bound on a type in the impl header). Rather than forcing callers
 // to annotate lifetimes, we cover both concrete endpoint types that h3x produces:
 //
-//   - `&'a H3Endpoint<Q>` — borrowed reference (used by H3Endpoint::new_request)
-//   - `Arc<H3Endpoint<Q>>` — shared ownership (used by H3Endpoint::get/post/… & new_request_owned)
-impl<'a, Q> IntoFuture for Request<Q, &'a H3Endpoint<Q>>
+//   - `&'a H3Endpoint<Q, Q::Connection>` — borrowed reference (used by H3Endpoint::new_request)
+//   - `Arc<H3Endpoint<Q, Q::Connection>>` — shared ownership (used by H3Endpoint::get/post/… & new_request_owned)
+impl<'a, Q> IntoFuture for Request<Q, &'a H3Endpoint<Q, Q::Connection>>
 where
     Q: quic::Connect + Sync + 'static,
     Q::Connection: Send + 'static,
@@ -680,7 +680,7 @@ where
     }
 }
 
-impl<Q> IntoFuture for Request<Q, Arc<H3Endpoint<Q>>>
+impl<Q> IntoFuture for Request<Q, Arc<H3Endpoint<Q, Q::Connection>>>
 where
     Q: quic::Connect + Sync + 'static,
     Q::Connection: Send + 'static,
@@ -797,7 +797,7 @@ mod tests {
 
     /// Creates an `Arbiter` with a mock endpoint and a single
     /// `Message::unresolved_request()` pre-populated in its pool.
-    fn test_arbiter() -> Arc<Arbiter<TestConnect, Arc<H3Endpoint<TestConnect>>>> {
+    fn test_arbiter() -> Arc<Arbiter<TestConnect, Arc<H3Endpoint<TestConnect, MockConnection>>>> {
         let endpoint = Arc::new(H3Endpoint::new(TestConnect));
         let authority = Authority::from_static("example.com");
         let message = crate::message::unify::Message::unresolved_request();
@@ -808,7 +808,7 @@ mod tests {
 
     /// Creates an `Arbiter` with a `WriteStream` pre-populated
     /// in its pool (fast-path for `acquire_write_stream`).
-    fn test_arbiter_with_ws() -> Arc<Arbiter<TestConnect, Arc<H3Endpoint<TestConnect>>>> {
+    fn test_arbiter_with_ws() -> Arc<Arbiter<TestConnect, Arc<H3Endpoint<TestConnect, MockConnection>>>> {
         let arbiter = test_arbiter();
         let ws = crate::message::test::write_stream_for_test(VarInt::from_u32(0));
         *arbiter.write_stream.lock().unwrap() = Some(ws);
@@ -820,7 +820,7 @@ mod tests {
     /// a completed `ensure_init` that has already been consumed.
     /// This allows testing `acquire_read_stream` returning
     /// `AlreadyConsumed` on the second call.
-    fn test_arbiter_with_rs() -> Arc<Arbiter<TestConnect, Arc<H3Endpoint<TestConnect>>>> {
+    fn test_arbiter_with_rs() -> Arc<Arbiter<TestConnect, Arc<H3Endpoint<TestConnect, MockConnection>>>> {
         let arbiter = test_arbiter();
         let rs = crate::message::test::read_stream_for_test(VarInt::from_u32(0));
         *arbiter.read_stream.lock().unwrap() = Some(rs);
@@ -832,8 +832,8 @@ mod tests {
 
     /// Creates a `Request` that holds a message acquired from the pool.
     fn request_with_message(
-        arbiter: &Arc<Arbiter<TestConnect, Arc<H3Endpoint<TestConnect>>>>,
-    ) -> Request<TestConnect, Arc<H3Endpoint<TestConnect>>> {
+        arbiter: &Arc<Arbiter<TestConnect, Arc<H3Endpoint<TestConnect, MockConnection>>>>,
+    ) -> Request<TestConnect, Arc<H3Endpoint<TestConnect, MockConnection>>> {
         let message = arbiter
             .acquire_request_message()
             .expect("pool should have message");
@@ -1186,7 +1186,7 @@ mod tests {
     /// Creates an `Arbiter` with both `write_stream` and `read_stream`
     /// pre‑populated, so the inline `IntoFuture` path can proceed past
     /// resource acquisition without calling the (expensive) `ensure_init`.
-    fn test_arbiter_with_ws_and_rs() -> Arc<Arbiter<TestConnect, Arc<H3Endpoint<TestConnect>>>> {
+    fn test_arbiter_with_ws_and_rs() -> Arc<Arbiter<TestConnect, Arc<H3Endpoint<TestConnect, MockConnection>>>> {
         let arbiter = test_arbiter_with_ws();
         let rs = crate::message::test::read_stream_for_test(VarInt::from_u32(1));
         *arbiter.read_stream.lock().unwrap() = Some(rs);

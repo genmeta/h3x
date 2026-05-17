@@ -1,8 +1,9 @@
 //! Generic HTTP/3 endpoint.
 //!
-//! [`H3Endpoint`] wraps a [`quic::Connect`] implementation with an HTTP/3
-//! connection pool and a user-configurable [`ConnectionBuilder`], providing
-//! the foundation for both client and server functionality.
+//! [`H3Endpoint`] combines a QUIC transport `Q` with a selected connection
+//! type `C`, providing the foundation for both client and server
+//! functionality.  Client methods require `Q: quic::Connect<Connection = C>`;
+//! server methods require `Q: quic::Listen<Connection = C>`.
 //!
 //! [`ConnectionBuilder`]: crate::connection::ConnectionBuilder
 
@@ -31,52 +32,57 @@ use crate::{
 pub mod client;
 pub mod server;
 
-/// Generic HTTP/3 endpoint.
+/// Generic HTTP/3 endpoint parameterized over a QUIC transport `Q` and a
+/// connection type `C`.
 ///
-/// `H3Endpoint` is the central abstraction that combines a QUIC transport
-/// implementation with an HTTP/3 connection pool. Parameterized over
-/// `T: quic::Connect`, it can work with any QUIC backend.
-pub struct H3Endpoint<T: quic::Connect> {
-    pub(crate) quic: T,
-    pub(crate) builder: Arc<ConnectionBuilder<T::Connection>>,
-    pub(crate) pool: Pool<T::Connection>,
+/// `Q` carries no struct-level constraint — abilities are encoded at the
+/// method level:
+///
+/// | Capability | Bound |
+/// |---|---|
+/// | Client (connect, new_request, get, …) | `Q: quic::Connect<Connection = C>` |
+/// | Server (serve, serve_owned)            | `Q: quic::Listen<Connection = C>`  |
+pub struct H3Endpoint<Q, C: quic::Connection> {
+    pub(crate) quic: Q,
+    pub(crate) builder: Arc<ConnectionBuilder<C>>,
+    pub(crate) pool: Pool<C>,
 }
 
 /// RAII guard for mutable access to [`H3Endpoint`]'s QUIC transport.
 ///
 /// On drop, clears the endpoint's connection pool via [`Pool::clear`],
 /// ensuring no stale connections remain after QUIC configuration changes.
-pub struct QuicMutGuard<'a, T: quic::Connect> {
-    quic: &'a mut T,
-    pool: &'a Pool<T::Connection>,
+pub struct QuicMutGuard<'a, Q, C: quic::Connection> {
+    quic: &'a mut Q,
+    pool: &'a Pool<C>,
 }
 
-impl<'a, T: quic::Connect> std::ops::Deref for QuicMutGuard<'a, T> {
-    type Target = T;
+impl<Q, C: quic::Connection> std::ops::Deref for QuicMutGuard<'_, Q, C> {
+    type Target = Q;
     fn deref(&self) -> &Self::Target {
         self.quic
     }
 }
 
-impl<'a, T: quic::Connect> std::ops::DerefMut for QuicMutGuard<'a, T> {
+impl<Q, C: quic::Connection> std::ops::DerefMut for QuicMutGuard<'_, Q, C> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.quic
     }
 }
 
-impl<'a, T: quic::Connect> Drop for QuicMutGuard<'a, T> {
+impl<Q, C: quic::Connection> Drop for QuicMutGuard<'_, Q, C> {
     fn drop(&mut self) {
         self.pool.clear();
     }
 }
 
 #[bon]
-impl<T: quic::Connect> H3Endpoint<T> {
+impl<Q, C: quic::Connection> H3Endpoint<Q, C> {
     /// Construct a new HTTP/3 endpoint.
     #[builder]
     pub fn new(
-        quic: T,
-        #[builder(default)] builder: Arc<ConnectionBuilder<T::Connection>>,
+        quic: Q,
+        #[builder(default)] builder: Arc<ConnectionBuilder<C>>,
     ) -> Self {
         Self {
             quic,
@@ -86,37 +92,48 @@ impl<T: quic::Connect> H3Endpoint<T> {
     }
 }
 
-impl<T: quic::Connect> H3Endpoint<T> {
+impl<Q, C: quic::Connection> H3Endpoint<Q, C>
+where
+    Q: quic::Connect<Connection = C>,
+{
     /// Construct a new HTTP/3 endpoint with default pool and builder.
-    pub fn new(quic: T) -> Self {
+    pub fn new(quic: Q) -> Self {
         H3Endpoint::builder().quic(quic).build()
     }
+}
 
+impl<Q, C: quic::Connection> H3Endpoint<Q, C> {
     /// Obtain a mutable guard for the QUIC transport.
     ///
-    /// The guard implements [`DerefMut`](std::ops::DerefMut) targeting `T`.
+    /// The guard implements [`DerefMut`](std::ops::DerefMut) targeting `Q`.
     /// On drop, the connection pool is cleared via [`Pool::clear`].
-    pub fn quic_mut(&mut self) -> QuicMutGuard<'_, T> {
+    pub fn quic_mut(&mut self) -> QuicMutGuard<'_, Q, C> {
         QuicMutGuard {
             quic: &mut self.quic,
             pool: &self.pool,
         }
     }
+}
 
+impl<Q, C: quic::Connection> H3Endpoint<Q, C>
+where
+    Q: quic::Connect<Connection = C>,
+{
     /// Obtain (or reuse) an HTTP/3 connection to `server` from the pool.
     pub async fn connect(
         &self,
-        server: Authority, // to &str
-    ) -> Result<Arc<H3Connection<T::Connection>>, pool::ConnectError<T::Error>> {
+        server: Authority,
+    ) -> Result<Arc<H3Connection<C>>, pool::ConnectError<Q::Error>> {
         self.pool
             .reuse_or_connect_with(&self.quic, self.builder.clone(), server)
             .await
     }
 }
 
-impl<T: quic::Connect> H3Endpoint<T>
+impl<Q, C: quic::Connection> H3Endpoint<Q, C>
 where
-    T::Error: std::error::Error + Send + Sync + 'static,
+    Q: quic::Connect<Connection = C>,
+    Q::Error: std::error::Error + Send + Sync + 'static,
 {
     /// Create a new request owned by this endpoint (shared via [`Arc`]).
     ///
@@ -128,7 +145,7 @@ where
     ///
     /// [`Request`]: client::Request
     /// [`Request::into_future`]: client::Request::into_future
-    pub fn new_request_owned(self: &Arc<Self>) -> ClientRequest<T, Arc<Self>> {
+    pub fn new_request_owned(self: &Arc<Self>) -> ClientRequest<Q, Arc<Self>> {
         let msg = Message::unresolved_request();
         let arbiter = Arc::new(Arbiter::new(Arc::clone(self), msg));
         ClientRequest::new(arbiter)
@@ -146,60 +163,59 @@ where
     /// [`new_request_owned`] instead.
     ///
     /// [`Request`]: client::Request
-    pub fn new_request(&self) -> ClientRequest<T, &H3Endpoint<T>> {
+    pub fn new_request(&self) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
         let msg = Message::unresolved_request();
         let arbiter = Arc::new(Arbiter::new(self, msg));
         ClientRequest::new(arbiter)
     }
 
     /// Convenience method to create a GET request for `uri`.
-    pub fn get(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+    pub fn get(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
         self.new_request().method(Method::GET).uri(uri)
     }
 
     /// Convenience method to create a POST request for `uri`.
-    pub fn post(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+    pub fn post(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
         self.new_request().method(Method::POST).uri(uri)
     }
 
     /// Convenience method to create a PUT request for `uri`.
-    pub fn put(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+    pub fn put(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
         self.new_request().method(Method::PUT).uri(uri)
     }
 
     /// Convenience method to create a DELETE request for `uri`.
-    pub fn delete(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+    pub fn delete(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
         self.new_request().method(Method::DELETE).uri(uri)
     }
 
     /// Convenience method to create a PATCH request for `uri`.
-    pub fn patch(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+    pub fn patch(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
         self.new_request().method(Method::PATCH).uri(uri)
     }
 
     /// Convenience method to create a HEAD request for `uri`.
-    pub fn head(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+    pub fn head(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
         self.new_request().method(Method::HEAD).uri(uri)
     }
 
     /// Convenience method to create a OPTIONS request for `uri`.
-    pub fn options(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+    pub fn options(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
         self.new_request().method(Method::OPTIONS).uri(uri)
     }
 
     /// Convenience method to create a TRACE request for `uri`.
-    pub fn trace(&self, uri: Uri) -> ClientRequest<T, &H3Endpoint<T>> {
+    pub fn trace(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
         self.new_request().method(Method::TRACE).uri(uri)
     }
 }
 
-impl<T> H3Endpoint<T>
+impl<Q, C: quic::Connection> H3Endpoint<Q, C>
 where
-    T: quic::Listen<Connection = <T as quic::Connect>::Connection> + quic::Connect,
-    <T as quic::Connect>::Connection: quic::Connection,
+    Q: quic::Listen<Connection = C>,
 {
     /// Accept and serve HTTP/3 connections in a loop.
-    pub async fn serve<S>(&mut self, service: S) -> Result<(), <T as quic::Listen>::Error>
+    pub async fn serve<S>(&mut self, service: S) -> Result<(), <Q as quic::Listen>::Error>
     where
         S: Service<UnresolvedRequest, Response = ()> + Clone + Send + Sync + 'static,
         S::Future: Send,
@@ -221,25 +237,25 @@ where
         }
     }
 
-    /// Serve HTTP/3 requests on an `Arc<H3Endpoint<T>>`.
+    /// Serve HTTP/3 requests on an `Arc<H3Endpoint<Q, C>>`.
     ///
     /// The returned future does not capture `&self`, so it can be spawned:
     ///
     /// ```ignore
-    /// let h3: Arc<H3Endpoint<QuicEndpoint>> = ...;
+    /// let h3: Arc<H3Endpoint<QuicEndpoint, Connection>> = ...;
     /// tokio::spawn(h3.serve(router));
     /// ```
     pub fn serve_owned<S>(
         self: &Arc<Self>,
         service: S,
-    ) -> impl Future<Output = Result<(), <T as quic::Listen>::Error>> + use<S, T>
+    ) -> impl Future<Output = Result<(), <Q as quic::Listen>::Error>> + use<S, Q, C>
     where
         S: Service<UnresolvedRequest, Response = ()> + Clone + Send + Sync + 'static,
         S::Future: Send,
         S::Error: Into<Box<dyn Error + Send + Sync>>,
-        for<'a> &'a T: quic::Listen<
-                Connection = <T as quic::Connect>::Connection,
-                Error = <T as quic::Listen>::Error,
+        for<'a> &'a Q: quic::Listen<
+                Connection = C,
+                Error = <Q as quic::Listen>::Error,
             >,
     {
         let this = Arc::clone(self);

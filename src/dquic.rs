@@ -119,4 +119,4 @@ pub mod connection {
 }
 
 /// Type alias for the default `H3Endpoint<QuicEndpoint>`.
-pub type H3Endpoint = crate::endpoint::H3Endpoint<QuicEndpoint>;
+pub type H3Endpoint = crate::endpoint::H3Endpoint<QuicEndpoint, dquic::prelude::Connection>;

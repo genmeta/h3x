@@ -343,6 +343,22 @@ impl quic::Listen for dquic::prelude::QuicListeners {
     }
 }
 
+impl quic::Listen for &dquic::prelude::QuicListeners {
+    type Connection = dquic::prelude::Connection;
+
+    type Error = dquic::prelude::ListenersShutdown;
+
+    async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
+        let (connection, ..) = (*self).accept().await?;
+        Ok(connection)
+    }
+
+    async fn shutdown(&self) -> Result<(), Self::Error> {
+        (*self).shutdown();
+        Ok(())
+    }
+}
+
 impl quic::Listen for Arc<dquic::prelude::QuicListeners> {
     type Connection = dquic::prelude::Connection;
 
