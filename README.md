@@ -45,7 +45,7 @@ async fn hello(_req: &mut Request, resp: &mut Response) {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let identity = Arc::new(Identity {
-        name: Name::from_str("localhost"),
+        name: Name::from_static("localhost")?,
         certs: todo!("load your certificate chain"),
         key: todo!("load your private key"),
         ocsp: Arc::new(None),
@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = TowerService(router.into_service());
 
     let identity = Arc::new(Identity {
-        name: Name::from_str("localhost"),
+        name: Name::from_static("localhost")?,
         certs: todo!("load your certificate chain"),
         key: todo!("load your private key"),
         ocsp: Arc::new(None),

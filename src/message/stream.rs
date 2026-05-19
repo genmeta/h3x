@@ -60,8 +60,10 @@ pub enum MessageStreamError {
     TrailerTooLarge,
     #[snafu(display("data frame payload too large, try smaller chunk size"))]
     DataFrameTooLarge { source: varint::err::Overflow },
-    #[snafu(display("HTTP/3 message from peer is malformed"))]
+    #[snafu(display("http/3 message from peer is malformed"))]
     MalformedIncomingMessage,
+    #[snafu(display("message send previously failed"))]
+    MessageSendFailed,
 }
 
 impl From<quic::ConnectionError> for MessageStreamError {
@@ -87,6 +89,7 @@ impl From<MessageStreamError> for io::Error {
             MessageStreamError::Quic { .. } => None,
             MessageStreamError::Goaway { .. } => Some(ErrorKind::ConnectionAborted),
             MessageStreamError::MalformedIncomingMessage => Some(ErrorKind::InvalidData),
+            MessageStreamError::MessageSendFailed => Some(ErrorKind::BrokenPipe),
             MessageStreamError::HeaderTooLarge
             | MessageStreamError::TrailerTooLarge
             | MessageStreamError::DataFrameTooLarge { .. } => Some(ErrorKind::InvalidInput),

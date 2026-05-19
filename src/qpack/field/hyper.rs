@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
 use http::{HeaderName, Request, Response, Uri, Version, request, response};
 use snafu::OptionExt;
@@ -96,7 +98,7 @@ impl From<request::Parts> for FieldSection {
 
         Self {
             pseudo_headers: Some(pseudo),
-            header_map: request.headers,
+            header_map: Arc::new(request.headers),
         }
     }
 }
@@ -105,14 +107,17 @@ impl TryFrom<FieldSection> for request::Parts {
     type Error = MalformedHeaderSection;
 
     fn try_from(value: FieldSection) -> Result<Self, Self::Error> {
+        let FieldSection {
+            pseudo_headers,
+            header_map,
+        } = value;
         let PseudoHeaders::Request {
             method,
             scheme,
             authority,
             path,
             protocol,
-        } = value
-            .pseudo_headers
+        } = pseudo_headers
             .context(malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu)?
         else {
             return Err(MalformedHeaderSection::ResponsePseudoHeaderInRequest);
@@ -137,7 +142,8 @@ impl TryFrom<FieldSection> for request::Parts {
             .method(method)
             .version(Version::HTTP_3)
             .body(())?;
-        *request.headers_mut() = value.header_map;
+        *request.headers_mut() =
+            Arc::try_unwrap(header_map).unwrap_or_else(|header_map| (*header_map).clone());
 
         if let Some(protocol) = protocol {
             request.extensions_mut().insert(protocol);
@@ -151,7 +157,7 @@ impl From<response::Parts> for FieldSection {
     fn from(response: response::Parts) -> Self {
         Self {
             pseudo_headers: Some(PseudoHeaders::response(response.status)),
-            header_map: response.headers,
+            header_map: Arc::new(response.headers),
         }
     }
 }
@@ -160,8 +166,11 @@ impl TryFrom<FieldSection> for response::Parts {
     type Error = MalformedHeaderSection;
 
     fn try_from(value: FieldSection) -> Result<Self, Self::Error> {
-        let PseudoHeaders::Response { status } = value
-            .pseudo_headers
+        let FieldSection {
+            pseudo_headers,
+            header_map,
+        } = value;
+        let PseudoHeaders::Response { status } = pseudo_headers
             .context(malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu)?
         else {
             return Err(MalformedHeaderSection::RequestPseudoHeaderInResponse);
@@ -173,7 +182,8 @@ impl TryFrom<FieldSection> for response::Parts {
             .status(status)
             .version(Version::HTTP_3)
             .body(())?;
-        *response.headers_mut() = value.header_map;
+        *response.headers_mut() =
+            Arc::try_unwrap(header_map).unwrap_or_else(|header_map| (*header_map).clone());
         Ok(response.into_parts().0)
     }
 }

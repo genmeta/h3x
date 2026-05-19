@@ -105,6 +105,37 @@ fn streaming_echo() {
 }
 
 #[test]
+fn response_sends_request_headers() {
+    run("response_sends_request_headers", async move {
+        let router = Router::new().post("/echo", streaming_echo_service);
+        let (mut server, host) = test_server().await;
+        let _serve =
+            AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
+
+        let client = Arc::new(test_client().await);
+        let request = client.post(format!("https://{host}/echo").parse().expect("valid uri"));
+        let mut response = tokio::time::timeout(Duration::from_secs(5), request.response())
+            .await
+            .expect("response() should send headers before waiting for response")
+            .expect("failed to get response");
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        request
+            .write(TEST_DATA)
+            .await
+            .expect("failed to write body")
+            .close()
+            .await
+            .expect("failed to close stream");
+        let body = response
+            .read_to_bytes()
+            .await
+            .expect("failed to read response body");
+        assert_eq!(body, TEST_DATA);
+    })
+}
+
+#[test]
 fn fallback() {
     run("fallback", async move {
         let router = Router::new()
@@ -153,6 +184,28 @@ fn auto_close() {
             .close()
             .await
             .expect("failed to close stream");
+        let mut response = request.await.expect("failed to send request");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = response
+            .read_to_bytes()
+            .await
+            .expect("failed to read response body");
+        assert_eq!(body, TEST_DATA);
+    })
+}
+
+#[test]
+fn set_body_auto_close() {
+    run("set_body_auto_close", async move {
+        let router = Router::new().post("/echo", echo_service);
+        let (mut server, host) = test_server().await;
+        let _serve =
+            AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
+
+        let client = Arc::new(test_client().await);
+        let request = client.post(format!("https://{host}/echo").parse().expect("valid uri"));
+        request.set_body(TEST_DATA);
         let mut response = request.await.expect("failed to send request");
 
         assert_eq!(response.status(), http::StatusCode::OK);

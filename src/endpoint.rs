@@ -80,10 +80,7 @@ impl<Q, C: quic::Connection> Drop for QuicMutGuard<'_, Q, C> {
 impl<Q, C: quic::Connection> H3Endpoint<Q, C> {
     /// Construct a new HTTP/3 endpoint.
     #[builder]
-    pub fn new(
-        quic: Q,
-        #[builder(default)] builder: Arc<ConnectionBuilder<C>>,
-    ) -> Self {
+    pub fn new(quic: Q, #[builder(default)] builder: Arc<ConnectionBuilder<C>>) -> Self {
         Self {
             quic,
             builder,
@@ -112,6 +109,11 @@ impl<Q, C: quic::Connection> H3Endpoint<Q, C> {
             quic: &mut self.quic,
             pool: &self.pool,
         }
+    }
+
+    /// Shared reference to the underlying QUIC transport.
+    pub fn quic(&self) -> &Q {
+        &self.quic
     }
 }
 
@@ -253,10 +255,7 @@ where
         S: Service<UnresolvedRequest, Response = ()> + Clone + Send + Sync + 'static,
         S::Future: Send,
         S::Error: Into<Box<dyn Error + Send + Sync>>,
-        for<'a> &'a Q: quic::Listen<
-                Connection = C,
-                Error = <Q as quic::Listen>::Error,
-            >,
+        for<'a> &'a Q: quic::Listen<Connection = C, Error = <Q as quic::Listen>::Error>,
     {
         let this = Arc::clone(self);
         let pool = this.pool.clone();

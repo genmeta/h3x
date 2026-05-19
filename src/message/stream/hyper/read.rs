@@ -95,7 +95,7 @@ impl ReadStream {
                 Ok(field_section) if !field_section.is_trailer() => {
                     Some(Err(H3MessageError::UnexpectedHeadersInBody.into()))
                 }
-                Ok(field_section) => Some(Ok(Frame::trailers(field_section.header_map))),
+                Ok(field_section) => Some(Ok(Frame::trailers(field_section.into_header_map()))),
                 Err(error) => Some(Err(error)),
             },
         }

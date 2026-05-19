@@ -15,7 +15,7 @@ use crate::{
     error::Code,
     message::{
         stream::{MessageStreamError, ReadStream, WriteStream},
-        unify::{MalformedMessageError, Message, MessageStage, ReadToStringError},
+        unify::{MalformedMessageError, Message, ReadToStringError},
     },
     protocol::Protocols,
     qpack::field::{Protocol, PseudoHeaders},
@@ -128,7 +128,7 @@ impl Request {
     }
 
     pub fn headers(&self) -> &http::HeaderMap {
-        &self.message.header().header_map
+        self.message.header().header_map()
     }
 
     pub fn header(&self, name: impl AsHeaderName) -> Option<&HeaderValue> {
@@ -229,34 +229,35 @@ impl Response {
         &mut self,
         operation: &str,
         operate: impl FnOnce(&mut Self) -> Result<(), MalformedMessageError>,
-    ) {
+    ) -> bool {
         if self.message.is_malformed() {
             tracing::warn!(
-                target: "h3x::server", operation,
-                "Response is malformed, operation will not affect the response stream",
+                operation,
+                "response is malformed, operation will not affect the response stream",
             );
+            return false;
         }
         if let Err(error) = operate(self) {
+            let report = Report::from_error(&error);
             tracing::warn!(
-                target: "h3x::server", operation, error = %Report::from_error(error),
-                "Operation malformed the response message, response stream will be cancelled with H3_REQUEST_CANCELLED",
+                operation, error = %report,
+                "operation malformed the response message, response stream will be cancelled",
             );
             self.message.set_malformed();
+            return false;
         }
+        true
     }
 
     pub fn headers(&self) -> &http::HeaderMap {
-        &self.message.header().header_map
+        self.message.header().header_map()
     }
 
     pub fn headers_mut(&mut self) -> &mut http::HeaderMap {
         self.check_message_operation("modify_headers", |this| {
-            if this.message.stage() > MessageStage::Header {
-                return Err(MalformedMessageError::HeaderAlreadySent);
-            }
-            Ok(())
+            this.message.header_mut().map(|_| ())
         });
-        &mut self.message.header_mut().header_map
+        self.message.header_mut_unchecked().header_map_mut()
     }
 
     pub fn set_header(&mut self, name: impl IntoHeaderName, value: HeaderValue) -> &mut Self {
@@ -273,12 +274,9 @@ impl Response {
 
     pub fn set_status(&mut self, status: http::StatusCode) -> &mut Self {
         self.check_message_operation("set_status", |this| {
-            if this.message.stage() > MessageStage::Header {
-                return Err(MalformedMessageError::HeaderAlreadySent);
-            }
+            this.message.header_mut()?.set_status(status);
             Ok(())
         });
-        self.message.header_mut().set_status(status);
         self
     }
 
@@ -287,16 +285,9 @@ impl Response {
             if this.message.is_interim_response() {
                 return Err(MalformedMessageError::BodyOrTrailerOnInterimResponse);
             }
-            if this.message.stage() > MessageStage::Body {
-                return Err(MalformedMessageError::BodyAlreadySending);
-            }
-            if this.message.stage() == MessageStage::Body {
-                return Err(MalformedMessageError::BodyReplacementDuringSend);
-            }
-            this.message.chunked_body()?;
+            this.message.set_body(content)?;
             Ok(())
         });
-        self.message.set_body(content);
         self
     }
 
@@ -376,12 +367,9 @@ impl Response {
             if this.message.is_interim_response() {
                 return Err(MalformedMessageError::BodyOrTrailerOnInterimResponse);
             }
-            if this.message.stage() > MessageStage::Trailer {
-                return Err(MalformedMessageError::TrailerAlreadySent);
-            }
-            Ok(())
+            this.message.trailers_mut().map(|_| ())
         });
-        self.message.trailers_mut()
+        self.message.trailers_mut_unchecked()
     }
 
     pub fn set_trailer(&mut self, name: impl IntoHeaderName, value: HeaderValue) -> &mut Self {
@@ -467,9 +455,10 @@ impl Response {
             };
             if let Err(error) = check() {
                 message.set_malformed();
+                let report = Report::from_error(&error);
                 tracing::warn!(
-                    target: "h3x::server", error = %Report::from_error(error),
-                    "Response stream cannot be closed properly as its malformed",
+                    error = %report,
+                    "response stream cannot be closed properly as it is malformed",
                 );
             }
         }
@@ -486,5 +475,46 @@ impl Drop for Response {
             // Best-effort: send the end-of-stream marker before the response is dropped.
             tokio::spawn(future.in_current_span());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        connection::tests::TestLocalAgent,
+        message::{test::write_stream_for_test, unify::MessageStage},
+        varint::VarInt,
+    };
+
+    fn test_response() -> Response {
+        Response {
+            message: Message::unresolved_response(),
+            stream: write_stream_for_test(VarInt::from_u32(0)),
+            agent: Arc::new(TestLocalAgent),
+            stream_id: StreamId(VarInt::from_u32(0)),
+            protocols: Arc::new(Protocols::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_body_after_trailer_stage_keeps_response_malformed() {
+        let mut response = test_response();
+        response.message.set_body(&b""[..]).expect("set body");
+        response
+            .stream
+            .send_message_header(&mut response.message)
+            .await
+            .expect("send header");
+        response
+            .stream
+            .send_message_chunked_body_chunk(&mut response.message)
+            .await
+            .expect("advance chunked body");
+        assert_eq!(response.message.stage(), MessageStage::Trailer);
+
+        response.set_body(&b"body"[..]);
+
+        assert!(response.message.is_malformed());
     }
 }

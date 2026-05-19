@@ -18,6 +18,7 @@ pub mod varint;
 pub mod dquic;
 
 pub mod endpoint;
+pub mod server;
 
 #[cfg(feature = "hyper")]
 pub mod hyper;

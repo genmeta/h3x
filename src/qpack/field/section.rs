@@ -1,4 +1,4 @@
-use std::pin::pin;
+use std::{pin::pin, sync::Arc};
 
 use bytes::Bytes;
 use futures::{Stream, TryStreamExt};
@@ -125,22 +125,34 @@ impl From<header::ToStrError> for MalformedHeaderSection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldSection {
     pub(crate) pseudo_headers: Option<super::PseudoHeaders>,
-    pub(crate) header_map: HeaderMap,
+    pub(crate) header_map: Arc<HeaderMap>,
 }
 
 impl FieldSection {
     pub fn header(pseudo_headers: PseudoHeaders, header_map: HeaderMap) -> Self {
         Self {
             pseudo_headers: Some(pseudo_headers),
-            header_map,
+            header_map: Arc::new(header_map),
         }
     }
 
     pub fn trailer(header_map: HeaderMap) -> Self {
         Self {
             pseudo_headers: None,
-            header_map,
+            header_map: Arc::new(header_map),
         }
+    }
+
+    pub fn header_map(&self) -> &HeaderMap {
+        &self.header_map
+    }
+
+    pub fn header_map_mut(&mut self) -> &mut HeaderMap {
+        Arc::make_mut(&mut self.header_map)
+    }
+
+    pub fn into_header_map(self) -> HeaderMap {
+        Arc::try_unwrap(self.header_map).unwrap_or_else(|header_map| (*header_map).clone())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -561,7 +573,7 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>> + Send> DecodeFrom<S> for 
 
         Ok(FieldSection {
             pseudo_headers,
-            header_map,
+            header_map: Arc::new(header_map),
         })
     }
 }

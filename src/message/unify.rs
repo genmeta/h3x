@@ -1,4 +1,4 @@
-use std::mem;
+use std::{future::Future, mem};
 
 use bytes::{Buf, Bytes};
 use http::{
@@ -16,7 +16,10 @@ use crate::{
     message::stream::{DEFAULT_COMPRESS_ALGO, MessageStreamError, ReadStream, WriteStream},
     qpack::{
         encoder::EncodeHeaderSectionError,
-        field::{FieldSection, MalformedHeaderSection, PseudoHeaders, malformed_header_section},
+        field::{
+            FieldLine, FieldSection, MalformedHeaderSection, PseudoHeaders,
+            malformed_header_section,
+        },
     },
 };
 
@@ -39,9 +42,11 @@ pub enum MessageStage {
 
     /// Message struct is malformed
     Malformed = 4,
+    /// Message sending failed and cannot be resumed
+    Failed = 5,
     /// Message struct is already taken/dropped
     // State can be removed after async drop stabilizes
-    Dropped = 5,
+    Dropped = 6,
 }
 
 #[derive(Debug, Snafu)]
@@ -57,6 +62,14 @@ pub enum MalformedMessageError {
     TrailerAlreadySent,
     #[snafu(display("cannot change body mode after transfer has started"))]
     BodyModeChangeAfterTransferStarted,
+    #[snafu(display("cannot modify body after transfer has ended"))]
+    BodyAlreadyComplete,
+    #[snafu(display("cannot mutate malformed message"))]
+    MessageMalformed,
+    #[snafu(display("cannot mutate message after sending failed"))]
+    MessageFailed,
+    #[snafu(display("cannot mutate dropped message"))]
+    MessageDropped,
 
     // === 模式不匹配错误 ===
     #[snafu(display("chunked body operation cannot be performed on streaming body"))]
@@ -127,11 +140,29 @@ impl Message {
         self.header.is_response_header()
     }
 
+    fn terminal_stage_error(&self) -> Option<MalformedMessageError> {
+        match self.stage {
+            MessageStage::Malformed => Some(MalformedMessageError::MessageMalformed),
+            MessageStage::Failed => Some(MalformedMessageError::MessageFailed),
+            MessageStage::Dropped => Some(MalformedMessageError::MessageDropped),
+            MessageStage::Header
+            | MessageStage::Body
+            | MessageStage::Trailer
+            | MessageStage::Complete => None,
+        }
+    }
+
     pub fn streaming_body(&mut self) -> Result<&mut u64, MalformedMessageError> {
+        if let Some(error) = self.terminal_stage_error() {
+            return Err(error);
+        }
+        if self.stage > MessageStage::Body {
+            return Err(MalformedMessageError::BodyAlreadyComplete);
+        }
+
         if let Body::Chunked { buflist } = &self.body {
             match self.stage {
-                MessageStage::Header => {}
-                MessageStage::Body if !buflist.inner().has_remaining() => {}
+                MessageStage::Header if !buflist.inner().has_remaining() => {}
                 _ => return Err(MalformedMessageError::BodyModeChangeAfterTransferStarted),
             }
 
@@ -144,13 +175,17 @@ impl Message {
     }
 
     pub fn chunked_body(&mut self) -> Result<&mut BuflistCursor, MalformedMessageError> {
-        if let Body::Streaming { count } = &self.body {
-            match self.stage {
-                MessageStage::Header => { /* Ok to change mode: body unused */ }
-                MessageStage::Body if *count == 0 => { /* Ok to change mode: body unused */ }
-                _ => return Err(MalformedMessageError::BodyModeChangeAfterTransferStarted),
-            }
+        if let Some(error) = self.terminal_stage_error() {
+            return Err(error);
+        }
+        if self.stage > MessageStage::Body {
+            return Err(MalformedMessageError::BodyAlreadyComplete);
+        }
 
+        if let Body::Streaming { .. } = &self.body {
+            if self.stage != MessageStage::Header {
+                return Err(MalformedMessageError::BodyModeChangeAfterTransferStarted);
+            }
             self.body = Body::Chunked {
                 buflist: BuflistCursor::new(BufList::new()),
             };
@@ -167,7 +202,17 @@ impl Message {
             && self.header().status().is_informational()
     }
 
-    pub fn header_mut(&mut self) -> &mut FieldSection {
+    pub fn header_mut(&mut self) -> Result<&mut FieldSection, MalformedMessageError> {
+        if let Some(error) = self.terminal_stage_error() {
+            return Err(error);
+        }
+        if self.stage > MessageStage::Header {
+            return Err(MalformedMessageError::HeaderAlreadySent);
+        }
+        Ok(&mut self.header)
+    }
+
+    pub(crate) fn header_mut_unchecked(&mut self) -> &mut FieldSection {
         &mut self.header
     }
 
@@ -184,7 +229,21 @@ impl Message {
     }
 
     /// Set body to buffer mode with given content
-    pub fn set_body(&mut self, mut content: impl Buf) {
+    pub fn set_body(&mut self, mut content: impl Buf) -> Result<(), MalformedMessageError> {
+        if let Some(error) = self.terminal_stage_error() {
+            return Err(error);
+        }
+        match self.stage {
+            MessageStage::Header => {}
+            MessageStage::Body => return Err(MalformedMessageError::BodyReplacementDuringSend),
+            MessageStage::Trailer | MessageStage::Complete => {
+                return Err(MalformedMessageError::BodyAlreadyComplete);
+            }
+            MessageStage::Malformed | MessageStage::Failed | MessageStage::Dropped => {
+                unreachable!("terminal stages are checked above")
+            }
+        }
+
         let mut buflist = BufList::new();
         while content.has_remaining() {
             buflist.write(content.copy_to_bytes(content.chunk().len()));
@@ -192,14 +251,25 @@ impl Message {
         self.body = Body::Chunked {
             buflist: BuflistCursor::new(buflist),
         };
+        Ok(())
     }
 
     pub fn trailers(&self) -> &HeaderMap {
-        &self.trailer.header_map
+        self.trailer.header_map()
     }
 
-    pub fn trailers_mut(&mut self) -> &mut HeaderMap {
-        &mut self.trailer.header_map
+    pub fn trailers_mut(&mut self) -> Result<&mut HeaderMap, MalformedMessageError> {
+        if let Some(error) = self.terminal_stage_error() {
+            return Err(error);
+        }
+        if self.stage > MessageStage::Trailer {
+            return Err(MalformedMessageError::TrailerAlreadySent);
+        }
+        Ok(self.trailer.header_map_mut())
+    }
+
+    pub(crate) fn trailers_mut_unchecked(&mut self) -> &mut HeaderMap {
+        self.trailer.header_map_mut()
     }
 
     pub fn stage(&self) -> MessageStage {
@@ -220,6 +290,20 @@ impl Message {
 
     pub fn set_malformed(&mut self) {
         self.stage = MessageStage::Malformed;
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.stage() == MessageStage::Failed
+    }
+
+    pub fn set_failed(&mut self) {
+        self.stage = MessageStage::Failed;
+    }
+
+    fn set_failed_unless_malformed(&mut self) {
+        if !self.is_malformed() {
+            self.set_failed();
+        }
     }
 
     pub fn set_dropped(&mut self) {
@@ -291,6 +375,7 @@ impl ReadStream {
             MessageStage::Malformed => {
                 return Err(MessageStreamError::MalformedIncomingMessage);
             }
+            MessageStage::Failed => return Err(MessageStreamError::MessageSendFailed),
             MessageStage::Dropped => message_used_after_dropped(),
         }
 
@@ -357,6 +442,7 @@ impl ReadStream {
             MessageStage::Malformed => {
                 return Some(Err(MessageStreamError::MalformedIncomingMessage));
             }
+            MessageStage::Failed => return Some(Err(MessageStreamError::MessageSendFailed)),
             MessageStage::Dropped => message_used_after_dropped(),
         }
 
@@ -448,9 +534,15 @@ impl ReadStream {
                 while let Some(body_part) =
                     self.read_message_body_chunk(message).await.transpose()?
                 {
-                    message.chunked_body().expect("checked").write(body_part);
+                    let Body::Chunked { buflist } = &mut message.body else {
+                        unreachable!("message body mode changed while reading chunked body")
+                    };
+                    buflist.write(body_part);
                 }
-                Ok(Buffer::Borrow(message.chunked_body().expect("checked")))
+                let Body::Chunked { buflist } = &mut message.body else {
+                    unreachable!("message body mode changed while reading chunked body")
+                };
+                Ok(Buffer::Borrow(buflist))
             }
         }
     }
@@ -488,7 +580,10 @@ impl ReadStream {
                     }
                     match self.read_message_body_chunk(message).await? {
                         Ok(body_part) => {
-                            message.chunked_body().expect("checked").write(body_part);
+                            let Body::Chunked { buflist } = &mut message.body else {
+                                unreachable!("message body mode changed while reading chunked body")
+                            };
+                            buflist.write(body_part);
                             continue;
                         }
                         Err(error) => return Some(Err(error)),
@@ -520,6 +615,7 @@ impl ReadStream {
             MessageStage::Trailer => {}
             MessageStage::Complete => return Ok(message.trailers()),
             MessageStage::Malformed => return Err(MessageStreamError::MalformedIncomingMessage),
+            MessageStage::Failed => return Err(MessageStreamError::MessageSendFailed),
             MessageStage::Dropped => message_used_after_dropped(),
         }
 
@@ -548,28 +644,43 @@ impl ReadStream {
 }
 
 impl WriteStream {
-    pub async fn send_message_header(
-        &mut self,
+    /// Sends the message header frame.
+    ///
+    /// # Cancellation safety
+    ///
+    /// This method synchronously advances `message` before returning the future so
+    /// the returned future does not borrow `message`. The returned future must be
+    /// awaited to completion. Dropping it may leave `message` marked as if the header
+    /// was sent even though the frame was not written.
+    ///
+    /// # Error state
+    ///
+    /// Because the returned future no longer holds `message`, I/O errors are not
+    /// written back into the message state. Callers using this low-level method
+    /// directly must mark the message failed or malformed as appropriate.
+    pub fn send_message_header<'s>(
+        &'s mut self,
         message: &mut Message,
-    ) -> Result<(), MessageStreamError> {
-        match message.stage {
-            MessageStage::Header => {}
-            // header already sent
-            MessageStage::Body | MessageStage::Trailer | MessageStage::Complete => return Ok(()),
-            MessageStage::Malformed => {
-                return self.cancel(Code::H3_REQUEST_CANCELLED).await;
+    ) -> impl Future<Output = Result<(), MessageStreamError>> + use<'s> {
+        let action = match message.stage {
+            MessageStage::Header => {
+                let fields = message.header.iter().collect::<Vec<_>>();
+                if message.is_interim_response() {
+                    message.stage = MessageStage::Header;
+                } else {
+                    message.stage = MessageStage::Body;
+                }
+                MessageWriteAction::Header(fields)
             }
+            // header already sent
+            MessageStage::Body => MessageWriteAction::None,
+            MessageStage::Trailer | MessageStage::Complete => MessageWriteAction::None,
+            MessageStage::Malformed => MessageWriteAction::Cancel,
+            MessageStage::Failed => MessageWriteAction::Failed,
             MessageStage::Dropped => message_used_after_dropped(),
-        }
+        };
 
-        self.send_header(message.header.iter()).await?;
-        if message.is_interim_response() {
-            message.stage = MessageStage::Header;
-        } else {
-            message.stage = MessageStage::Body;
-        }
-
-        Ok(())
+        async move { self.execute_message_write_action(action).await }
     }
 
     pub async fn send_data(&mut self, data: impl Buf + Send) -> Result<(), MessageStreamError> {
@@ -578,78 +689,216 @@ impl WriteStream {
             .await
     }
 
-    pub async fn send_message_streaming_body(
-        &mut self,
+    /// Sends one streaming body chunk.
+    ///
+    /// # Cancellation safety
+    ///
+    /// This method synchronously advances the message body count before returning
+    /// the future so the returned future does not borrow `message`. The returned
+    /// future must be awaited to completion. Dropping it may leave the message body
+    /// count advanced even though the data was not written.
+    ///
+    /// # Error state
+    ///
+    /// Because the returned future no longer holds `message`, I/O errors are not
+    /// written back into the message state. Callers using this low-level method
+    /// directly must mark the message failed or malformed as appropriate.
+    pub fn send_message_streaming_body<'s, B>(
+        &'s mut self,
         message: &mut Message,
-        content: impl Buf + Send,
-    ) -> Result<(), MessageStreamError> {
+        content: B,
+    ) -> impl Future<Output = Result<(), MessageStreamError>> + use<'s, B>
+    where
+        B: Buf + Send + 's,
+    {
         // if message.is_interim_response() {
         //     // malformed message
         // }
         // message.enable_streaming()?; // violate of set_body call
 
-        match message.stage {
+        let additional = content.remaining() as u64;
+        let action = match message.stage {
             MessageStage::Header => {
-                self.send_message_header(message).await?;
-                debug_assert_eq!(message.stage, MessageStage::Body);
+                if let Err(_error) = message.streaming_body().map(|count| *count += additional) {
+                    message.set_malformed();
+                    StreamingBodyAction::Cancel
+                } else {
+                    let fields = message.header.iter().collect::<Vec<_>>();
+                    if message.is_interim_response() {
+                        message.stage = MessageStage::Header;
+                    } else {
+                        message.stage = MessageStage::Body;
+                    }
+                    debug_assert_eq!(message.stage, MessageStage::Body);
+                    StreamingBodyAction::Send {
+                        header: Some(fields),
+                        content,
+                    }
+                }
             }
-            MessageStage::Body => {}
+            MessageStage::Body => {
+                if let Err(_error) = message.streaming_body().map(|count| *count += additional) {
+                    message.set_malformed();
+                    StreamingBodyAction::Cancel
+                } else {
+                    StreamingBodyAction::Send {
+                        header: None,
+                        content,
+                    }
+                }
+            }
             MessageStage::Trailer | MessageStage::Complete => {
-                /* this will cause H3_FRAME_UNEXPECTED error */
+                message.set_malformed();
+                StreamingBodyAction::Cancel
             }
-            MessageStage::Malformed => {
-                return self.cancel(Code::H3_REQUEST_CANCELLED).await;
-            }
+            MessageStage::Malformed => StreamingBodyAction::Cancel,
+            MessageStage::Failed => StreamingBodyAction::Failed,
             MessageStage::Dropped => message_used_after_dropped(),
+        };
+
+        async move {
+            match action {
+                StreamingBodyAction::Send { header, content } => {
+                    if let Some(header) = header {
+                        self.send_header(header).await?;
+                    }
+                    self.send_data(content).await
+                }
+                StreamingBodyAction::Cancel => self.cancel(Code::H3_REQUEST_CANCELLED).await,
+                StreamingBodyAction::Failed => Err(MessageStreamError::MessageSendFailed),
+            }
         }
-
-        let len = content.remaining();
-        self.send_data(content).await?;
-        *message
-            .streaming_body()
-            .expect("call send_streaming_body on chunked body, this is a bug") += len as u64;
-
-        Ok(())
     }
 
-    pub async fn send_message_chunked_body(
-        &mut self,
+    /// Sends one buffered body chunk, if one is available.
+    ///
+    /// # Cancellation safety
+    ///
+    /// This method synchronously takes one chunk from `message` before returning the
+    /// future so the returned future does not borrow `message`. The returned future
+    /// must be awaited to completion. Dropping it may discard the taken chunk while
+    /// leaving the message cursor advanced.
+    ///
+    /// # Error state
+    ///
+    /// Because the returned future no longer holds `message`, I/O errors are not
+    /// written back into the message state. Callers using this low-level method
+    /// directly must mark the message failed or malformed as appropriate.
+    pub fn send_message_chunked_body_chunk<'s>(
+        &'s mut self,
         message: &mut Message,
-    ) -> Result<(), MessageStreamError> {
+    ) -> impl Future<Output = Result<bool, MessageStreamError>> + use<'s> {
         // if message.is_interim_response() {
         //     // malformed message
         // }
 
-        match message.stage {
-            MessageStage::Header => {
-                self.send_message_header(message).await?;
-                debug_assert_eq!(message.stage, MessageStage::Body);
-            }
-            MessageStage::Body => {}
-            MessageStage::Trailer | MessageStage::Complete => {
-                /* this will cause H3_FRAME_UNEXPECTED error */
-            }
-            MessageStage::Malformed => {
-                return self.cancel(Code::H3_REQUEST_CANCELLED).await;
-            }
+        let action = match message.stage {
+            MessageStage::Header => ChunkedBodyChunkAction::None,
+            MessageStage::Body => ChunkedBodyChunkAction::Unset,
+            MessageStage::Trailer | MessageStage::Complete => ChunkedBodyChunkAction::None,
+            MessageStage::Malformed => ChunkedBodyChunkAction::Cancel,
+            MessageStage::Failed => ChunkedBodyChunkAction::Failed,
             MessageStage::Dropped => message_used_after_dropped(),
-        }
-
-        let Body::Chunked { buflist } = &mut message.body else {
-            unreachable!("Call send_chunked_body on non-chunked body, this is a bug");
         };
 
-        while buflist.has_remaining() {
-            let bytes = buflist.copy_to_bytes(buflist.chunk().len());
-            let frame = Frame::new(Frame::DATA_FRAME_TYPE, bytes)?;
-            self.try_stream_io(async |this| Ok(this.send_frame(frame).await?))
-                .await?;
-        }
+        let action = match action {
+            ChunkedBodyChunkAction::Unset => match &mut message.body {
+                Body::Chunked { buflist } if buflist.has_remaining() => {
+                    let data = buflist.copy_to_bytes(buflist.chunk().len());
+                    if !buflist.has_remaining() {
+                        message.stage = MessageStage::Trailer;
+                    }
+                    ChunkedBodyChunkAction::Data(data)
+                }
+                Body::Chunked { .. } => {
+                    message.stage = MessageStage::Trailer;
+                    ChunkedBodyChunkAction::None
+                }
+                Body::Streaming { .. } => ChunkedBodyChunkAction::None,
+            },
+            action => action,
+        };
 
-        message.stage = MessageStage::Trailer;
-        Ok(())
+        async move {
+            match action {
+                ChunkedBodyChunkAction::Data(data) => {
+                    self.send_data(data).await?;
+                    Ok(true)
+                }
+                ChunkedBodyChunkAction::None | ChunkedBodyChunkAction::Unset => Ok(false),
+                ChunkedBodyChunkAction::Cancel => {
+                    self.cancel(Code::H3_REQUEST_CANCELLED).await.map(|_| false)
+                }
+                ChunkedBodyChunkAction::Failed => Err(MessageStreamError::MessageSendFailed),
+            }
+        }
     }
 
+    /// Sends the complete buffered body.
+    ///
+    /// This wrapper marks `message` as failed when an awaited write returns an I/O
+    /// error. It is still not cancellation-safe: cancelling the future may leave the
+    /// message partially advanced.
+    pub async fn send_message_chunked_body(
+        &mut self,
+        message: &mut Message,
+    ) -> Result<(), MessageStreamError> {
+        if let Err(error) = self.send_message_header(message).await {
+            message.set_failed_unless_malformed();
+            return Err(error);
+        }
+
+        loop {
+            match self.send_message_chunked_body_chunk(message).await {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
+                Err(error) => {
+                    message.set_failed_unless_malformed();
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Sends the trailer frame.
+    ///
+    /// # Cancellation safety
+    ///
+    /// This method synchronously marks `message` complete before returning the
+    /// future so the returned future does not borrow `message`. The returned future
+    /// must be awaited to completion. Dropping it may leave `message` complete even
+    /// though the trailer frame was not written.
+    ///
+    /// # Error state
+    ///
+    /// Because the returned future no longer holds `message`, I/O errors are not
+    /// written back into the message state. Callers using this low-level method
+    /// directly must mark the message failed or malformed as appropriate.
+    pub fn send_message_trailer_frame<'s>(
+        &'s mut self,
+        message: &mut Message,
+    ) -> impl Future<Output = Result<(), MessageStreamError>> + use<'s> {
+        let action = match message.stage {
+            MessageStage::Header => MessageWriteAction::Failed,
+            MessageStage::Body | MessageStage::Trailer => {
+                let fields = message.trailer.iter().collect::<Vec<_>>();
+                message.stage = MessageStage::Complete;
+                MessageWriteAction::Trailer(fields)
+            }
+            MessageStage::Complete => MessageWriteAction::None,
+            MessageStage::Malformed => MessageWriteAction::Cancel,
+            MessageStage::Failed => MessageWriteAction::Failed,
+            MessageStage::Dropped => message_used_after_dropped(),
+        };
+
+        async move { self.execute_message_write_action(action).await }
+    }
+
+    /// Sends the buffered body, if any, followed by the trailer frame.
+    ///
+    /// This wrapper marks `message` as failed when an awaited write returns an I/O
+    /// error. It is still not cancellation-safe: cancelling the future may leave the
+    /// message partially advanced.
     pub async fn send_message_trailer(
         &mut self,
         message: &mut Message,
@@ -658,10 +907,16 @@ impl WriteStream {
         match message.stage {
             MessageStage::Header | MessageStage::Body => {
                 if message.is_chunked() {
-                    self.send_message_chunked_body(message).await?;
+                    if let Err(error) = self.send_message_chunked_body(message).await {
+                        message.set_failed_unless_malformed();
+                        return Err(error);
+                    }
                     debug_assert_eq!(message.stage, MessageStage::Trailer);
                 } else {
-                    self.send_message_header(message).await?;
+                    if let Err(error) = self.send_message_header(message).await {
+                        message.set_failed_unless_malformed();
+                        return Err(error);
+                    }
                     debug_assert_eq!(message.stage, MessageStage::Body);
                     // no body or streaming body already sent
                 }
@@ -671,13 +926,23 @@ impl WriteStream {
             MessageStage::Malformed => {
                 return self.cancel(Code::H3_REQUEST_CANCELLED).await;
             }
+            MessageStage::Failed => return Err(MessageStreamError::MessageSendFailed),
             MessageStage::Dropped => message_used_after_dropped(),
         }
 
-        // TODO: check FieldLines size
-        let field_lines = message.trailer.iter();
-        let algo = &DEFAULT_COMPRESS_ALGO;
+        if let Err(error) = self.send_message_trailer_frame(message).await {
+            message.set_failed_unless_malformed();
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
 
+    async fn send_trailer_header(
+        &mut self,
+        field_lines: impl IntoIterator<Item = FieldLine> + Send,
+    ) -> Result<(), MessageStreamError> {
+        let algo = &DEFAULT_COMPRESS_ALGO;
         let result = self
             .try_stream_io(async move |this| {
                 let stream = &mut this.stream;
@@ -697,10 +962,7 @@ impl WriteStream {
         }
 
         match result {
-            Ok(()) => {
-                message.stage = MessageStage::Complete;
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(error) => match error {
                 EncodeError::FramePayloadTooLarge => Err(MessageStreamError::TrailerTooLarge),
                 EncodeError::HuffmanEncoding => {
@@ -710,6 +972,24 @@ impl WriteStream {
         }
     }
 
+    async fn execute_message_write_action(
+        &mut self,
+        action: MessageWriteAction,
+    ) -> Result<(), MessageStreamError> {
+        match action {
+            MessageWriteAction::None => Ok(()),
+            MessageWriteAction::Cancel => self.cancel(Code::H3_REQUEST_CANCELLED).await,
+            MessageWriteAction::Failed => Err(MessageStreamError::MessageSendFailed),
+            MessageWriteAction::Header(fields) => self.send_header(fields).await,
+            MessageWriteAction::Trailer(fields) => self.send_trailer_header(fields).await,
+        }
+    }
+
+    /// Sends all currently buffered message parts.
+    ///
+    /// This wrapper marks `message` as failed when an awaited write returns an I/O
+    /// error. It is still not cancellation-safe: cancelling the future may leave the
+    /// message partially advanced.
     pub async fn send_message(&mut self, message: &mut Message) -> Result<(), MessageStreamError> {
         match message.stage {
             MessageStage::Header | MessageStage::Body => {
@@ -720,7 +1000,10 @@ impl WriteStream {
                     self.send_message_chunked_body(message).await?;
                     debug_assert_eq!(message.stage, MessageStage::Trailer);
                 } else {
-                    self.send_message_header(message).await?;
+                    if let Err(error) = self.send_message_header(message).await {
+                        message.set_failed_unless_malformed();
+                        return Err(error);
+                    }
                     if message.is_interim_response() {
                         debug_assert!(message.stage == MessageStage::Header);
                     } else {
@@ -745,19 +1028,113 @@ impl WriteStream {
             MessageStage::Malformed => {
                 return self.cancel(Code::H3_REQUEST_CANCELLED).await;
             }
+            MessageStage::Failed => return Err(MessageStreamError::MessageSendFailed),
             MessageStage::Dropped => message_used_after_dropped(),
         }
 
         Ok(())
     }
 
+    /// Sends all currently buffered message parts and flushes the stream.
+    ///
+    /// This method is not cancellation-safe because message state may be advanced
+    /// before all stream I/O completes.
     pub async fn flush_message(&mut self, message: &mut Message) -> Result<(), MessageStreamError> {
         self.send_message(message).await?;
         self.flush().await
     }
 
+    /// Sends all currently buffered message parts and closes the stream.
+    ///
+    /// This method is not cancellation-safe because message state may be advanced
+    /// before all stream I/O completes.
     pub async fn close_message(&mut self, message: &mut Message) -> Result<(), MessageStreamError> {
         self.send_message(message).await?;
         self.close().await
+    }
+}
+
+enum MessageWriteAction {
+    None,
+    Cancel,
+    Failed,
+    Header(Vec<FieldLine>),
+    Trailer(Vec<FieldLine>),
+}
+
+enum StreamingBodyAction<B> {
+    Send {
+        header: Option<Vec<FieldLine>>,
+        content: B,
+    },
+    Cancel,
+    Failed,
+}
+
+enum ChunkedBodyChunkAction {
+    Unset,
+    None,
+    Cancel,
+    Failed,
+    Data(Bytes),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::varint::VarInt;
+
+    #[tokio::test]
+    async fn send_message_header_future_releases_message_before_await() {
+        let mut stream = crate::message::test::write_stream_for_test(VarInt::from_u32(0));
+        let mut message = Message::unresolved_request();
+
+        let send = stream.send_message_header(&mut message);
+
+        assert_eq!(message.stage(), MessageStage::Body);
+        send.await.expect("send header");
+    }
+
+    #[test]
+    fn set_body_keeps_header_stage_before_io() {
+        let mut message = Message::unresolved_request();
+
+        message
+            .set_body(Bytes::from_static(b"abc"))
+            .expect("set body");
+
+        assert_eq!(message.stage(), MessageStage::Header);
+    }
+
+    #[test]
+    fn set_body_does_not_clear_terminal_error_stage() {
+        let mut malformed = Message::unresolved_request();
+        malformed.set_malformed();
+        assert!(malformed.set_body(Bytes::from_static(b"abc")).is_err());
+        assert!(malformed.is_malformed());
+
+        let mut failed = Message::unresolved_request();
+        failed.set_failed();
+        assert!(failed.set_body(Bytes::from_static(b"abc")).is_err());
+        assert!(failed.is_failed());
+
+        let mut dropped = Message::unresolved_request();
+        dropped.set_dropped();
+        assert!(dropped.set_body(Bytes::from_static(b"abc")).is_err());
+        assert!(dropped.is_dropped());
+    }
+
+    #[tokio::test]
+    async fn set_body_does_not_suppress_header_frame() {
+        let mut stream = crate::message::test::write_stream_for_test(VarInt::from_u32(0));
+        let mut message = Message::unresolved_request();
+        message
+            .set_body(Bytes::from_static(b"abc"))
+            .expect("set body");
+
+        let send = stream.send_message_header(&mut message);
+
+        assert_eq!(message.stage(), MessageStage::Body);
+        send.await.expect("send header");
     }
 }

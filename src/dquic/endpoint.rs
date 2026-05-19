@@ -185,6 +185,26 @@ impl QuicEndpoint {
     pub async fn new() -> Self {
         Self::builder().build().await
     }
+
+    /// Reference to the shared network infrastructure.
+    pub fn network(&self) -> &Arc<Network> {
+        &self.network
+    }
+
+    /// Current TLS identity, if any.
+    pub fn identity(&self) -> Option<Arc<Identity>> {
+        self.identity.load_full()
+    }
+
+    /// Bind patterns governing which interfaces this endpoint uses.
+    pub fn bind_patterns(&self) -> &Arc<Vec<BindPattern>> {
+        &self.bind
+    }
+
+    /// Reference to the DNS resolver.
+    pub fn resolver(&self) -> &Arc<dyn Resolve + Send + Sync> {
+        &self.resolver
+    }
 }
 
 #[bon]

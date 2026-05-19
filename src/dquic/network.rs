@@ -81,6 +81,7 @@ use crate::dquic::{
 };
 
 pub(crate) type SniRegistry = Arc<DashMap<Name<'static>, Weak<ServerEntry>>>;
+type BoundInterfaces = HashMap<String, (BindUri, BindInterface)>;
 
 /// Error returned by [`Network::bind_server`].
 #[derive(Debug, Snafu)]
@@ -137,7 +138,7 @@ struct BindsEntry {
     /// installed components) stay alive. The inner lock is separate from
     /// the outer `bind_registry` mutex so the reconcile task can perform
     /// async bind/unbind without holding the registry lock.
-    bound: Mutex<HashMap<String, (BindUri, BindInterface)>>,
+    bound: Mutex<BoundInterfaces>,
 }
 
 /// RAII handle returned by [`Network::bind`].
@@ -238,7 +239,7 @@ impl Network {
     }
 
     /// Return a clone of the shared [`Locations`] component.
-    pub(crate) fn locations(&self) -> Arc<Locations> {
+    pub fn locations(&self) -> Arc<Locations> {
         self.locations.clone()
     }
 
@@ -248,7 +249,7 @@ impl Network {
     /// must use a compatible [`ServerQuicConfig`] (or the exact same
     /// `Arc`).  Returns a [`ServerBinding`] handle that receives accepted
     /// connections for this SNI.
-    pub(crate) async fn bind_server(
+    pub async fn bind_server(
         self: &Arc<Self>,
         identity: Arc<Identity>,
         server_config: ServerQuicConfig,
@@ -527,6 +528,48 @@ impl Network {
             .collect()
     }
 
+    /// Return all currently bound URIs across all registered patterns.
+    pub fn current_bind_uris(&self) -> Vec<BindUri> {
+        let registry = self.bind_registry.lock().expect("bind_registry poisoned");
+        registry
+            .values()
+            .flat_map(|entry| {
+                let bound = entry.bound.lock().expect("bound mutex poisoned");
+                bound
+                    .values()
+                    .map(|(uri, _iface)| uri.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Return the currently bound interface for an exact [`BindUri`].
+    pub fn get_iface(&self, uri: &BindUri) -> Option<BindInterface> {
+        let key = uri.identity_key();
+        let registry = self.bind_registry.lock().expect("bind_registry poisoned");
+        registry.values().find_map(|entry| {
+            let bound = entry.bound.lock().expect("bound mutex poisoned");
+            bound.get(&key).map(|(_uri, iface)| iface.clone())
+        })
+    }
+
+    /// Return all currently bound interfaces for a specific [`BindPattern`].
+    ///
+    /// Returns `None` if the pattern has not been registered via
+    /// [`Network::bind`].
+    pub fn get_interfaces(&self, pattern: &BindPattern) -> Option<Vec<BindInterface>> {
+        let registry = self.bind_registry.lock().expect("bind_registry poisoned");
+        registry.get(pattern).map(|entry| {
+            entry
+                .bound
+                .lock()
+                .expect("bound mutex poisoned")
+                .values()
+                .map(|(_, iface)| iface.clone())
+                .collect()
+        })
+    }
+
     /// Return the server names currently registered in the SNI registry.
     ///
     /// Only names with live [`ServerBinding`] handles are included; entries
@@ -652,57 +695,58 @@ impl Network {
     /// Background task that reconciles bound interfaces with device changes.
     #[allow(clippy::type_complexity)]
     async fn run_reconcile(&self) {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
+        let mut monitor = self.devices.monitor();
+        while let Some((_interfaces, event)) = monitor.update().await {
+            tracing::debug!(?event, "network interface change, reconciling binds");
+            self.reconcile_once().await;
+        }
+    }
 
-            let patterns: Vec<(BindPattern, HashMap<String, (BindUri, BindInterface)>)> = {
-                let registry = self.bind_registry.lock().expect("bind_registry poisoned");
-                registry
-                    .iter()
-                    .map(|(p, e)| {
-                        let bound = e.bound.lock().expect("bound mutex poisoned");
-                        (p.clone(), bound.clone())
-                    })
-                    .collect()
-            };
+    /// Extracted reconcile logic, run per interface change.
+    async fn reconcile_once(&self) {
+        let patterns: Vec<(BindPattern, BoundInterfaces)> = {
+            let registry = self.bind_registry.lock().expect("bind_registry poisoned");
+            registry
+                .iter()
+                .map(|(p, e)| {
+                    let bound = e.bound.lock().expect("bound mutex poisoned");
+                    (p.clone(), bound.clone())
+                })
+                .collect()
+        };
 
-            for (pattern, mut bound) in patterns {
-                let desired_keys: std::collections::HashSet<String> = pattern
-                    .to_bind_uris(self.devices.interfaces().keys().map(String::as_str))
-                    .map(|u| u.identity_key())
-                    .collect();
-                bound.retain(|key, _| desired_keys.contains(key));
+        for (pattern, mut bound) in patterns {
+            let desired_keys: std::collections::HashSet<String> = pattern
+                .to_bind_uris(self.devices.interfaces().keys().map(String::as_str))
+                .map(|u| u.identity_key())
+                .collect();
+            bound.retain(|key, _| desired_keys.contains(key));
 
-                for uri in
-                    pattern.to_bind_uris(self.devices.interfaces().keys().map(String::as_str))
-                {
-                    let key = uri.identity_key();
-                    if let std::collections::hash_map::Entry::Vacant(e) = bound.entry(key) {
-                        let iface = self
-                            .iface_manager
-                            .bind(uri.clone(), self.io_factory.clone())
-                            .await;
-                        self.init_iface_components(&iface);
-                        e.insert((uri.clone(), iface));
-                    }
+            for uri in pattern.to_bind_uris(self.devices.interfaces().keys().map(String::as_str)) {
+                let key = uri.identity_key();
+                if let std::collections::hash_map::Entry::Vacant(e) = bound.entry(key) {
+                    let iface = self
+                        .iface_manager
+                        .bind(uri.clone(), self.io_factory.clone())
+                        .await;
+                    self.init_iface_components(&iface);
+                    e.insert((uri.clone(), iface));
                 }
+            }
 
-                if let Some(entry) = self
-                    .bind_registry
-                    .lock()
-                    .expect("bind_registry poisoned")
-                    .get(&pattern)
-                {
-                    let mut target = entry.bound.lock().expect("bound mutex poisoned");
-                    // Retain only interfaces that still match current
-                    // devices, then merge reconcile's additions without
-                    // clobbering concurrent insertions from bind().
-                    target.retain(|k, _| desired_keys.contains(k));
-                    for (k, v) in bound {
-                        target.entry(k).or_insert(v);
-                    }
+            if let Some(entry) = self
+                .bind_registry
+                .lock()
+                .expect("bind_registry poisoned")
+                .get(&pattern)
+            {
+                let mut target = entry.bound.lock().expect("bound mutex poisoned");
+                // Retain only interfaces that still match current
+                // devices, then merge reconcile's additions without
+                // clobbering concurrent insertions from bind().
+                target.retain(|k, _| desired_keys.contains(k));
+                for (k, v) in bound {
+                    target.entry(k).or_insert(v);
                 }
             }
         }
