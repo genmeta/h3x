@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use dhttp_identity::identity as agent;
 use futures::future::BoxFuture;
 use snafu::Snafu;
 use tokio::task::JoinHandle;
@@ -20,7 +21,7 @@ use crate::{
     error::{Code, H3ConnectionError, H3StreamError},
     protocol::{IdentifiedProtocolInitializer, ProductProtocol, Protocols, StreamVerdict},
     qpack::protocol::QPackProtocolFactory,
-    quic::{self, CancelStreamExt, StopStreamExt, agent},
+    quic::{self, CancelStreamExt, StopStreamExt},
     varint::VarInt,
 };
 
@@ -701,6 +702,7 @@ pub(crate) mod tests {
     use std::{future::pending, pin::Pin, sync::Arc};
 
     use bytes::Bytes;
+    use dhttp_identity::identity as agent;
     use futures::{Sink, future::BoxFuture, stream::Stream};
 
     #[cfg(feature = "dquic")]
@@ -715,7 +717,7 @@ pub(crate) mod tests {
     };
     use crate::{
         protocol::Protocols,
-        quic::{self, ConnectionError, agent},
+        quic::{self, ConnectionError},
         varint::VarInt,
     };
 

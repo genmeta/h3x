@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
+use dhttp_identity::identity as agent;
 use futures::{Sink, Stream, StreamExt, future::BoxFuture};
 use http::{
     HeaderMap, HeaderValue, Method, Uri,
@@ -19,7 +20,7 @@ use crate::{
     },
     protocol::Protocols,
     qpack::field::{Protocol, PseudoHeaders},
-    quic::{self, agent},
+    quic,
     stream_id::StreamId,
 };
 

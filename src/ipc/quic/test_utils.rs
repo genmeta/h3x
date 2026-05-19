@@ -344,7 +344,7 @@ impl quic::Lifecycle for StreamableConnection {
 #[derive(Debug)]
 struct NoAgent;
 
-impl crate::quic::agent::LocalAgent for NoAgent {
+impl dhttp_identity::identity::LocalAgent for NoAgent {
     fn name(&self) -> &str {
         "none"
     }
@@ -361,12 +361,12 @@ impl crate::quic::agent::LocalAgent for NoAgent {
         &self,
         _scheme: rustls::SignatureScheme,
         _data: &[u8],
-    ) -> futures::future::BoxFuture<'_, Result<Vec<u8>, crate::quic::agent::SignError>> {
+    ) -> futures::future::BoxFuture<'_, Result<Vec<u8>, dhttp_identity::identity::SignError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
 
-impl crate::quic::agent::RemoteAgent for NoAgent {
+impl dhttp_identity::identity::RemoteAgent for NoAgent {
     fn name(&self) -> &str {
         "none"
     }

@@ -1,3 +1,4 @@
+use dhttp_identity::identity::{self as agent, SignError, VerifyError};
 use futures::future::BoxFuture;
 use rustls::{
     SignatureScheme,
@@ -8,10 +9,7 @@ use super::serde_types::{
     SerdeCertificateDer, SerdeSignatureAlgorithm, SerdeSignatureScheme,
     SerdeSubjectPublicKeyInfoDer,
 };
-use crate::quic::{
-    self,
-    agent::{self, SignError, VerifyError},
-};
+use crate::quic;
 
 /// Remote trait for [`agent::LocalAgent`], exposing all 6 methods over remoc RTC.
 #[remoc::rtc::remote]
@@ -117,7 +115,7 @@ impl agent::LocalAgent for CachedLocalAgent {
     }
 
     fn public_key(&self) -> SubjectPublicKeyInfoDer<'_> {
-        agent::extract_public_key(quic::agent::LocalAgent::cert_chain(self))
+        agent::extract_public_key(agent::LocalAgent::cert_chain(self))
     }
 
     fn verify(
@@ -126,12 +124,8 @@ impl agent::LocalAgent for CachedLocalAgent {
         data: &[u8],
         signature: &[u8],
     ) -> BoxFuture<'_, Result<bool, VerifyError>> {
-        let result = agent::verify_signature(
-            quic::agent::LocalAgent::public_key(self),
-            scheme,
-            data,
-            signature,
-        );
+        let result =
+            agent::verify_signature(agent::LocalAgent::public_key(self), scheme, data, signature);
         Box::pin(std::future::ready(result))
     }
 }
@@ -180,7 +174,7 @@ impl agent::RemoteAgent for CachedRemoteAgent {
     }
 
     fn public_key(&self) -> SubjectPublicKeyInfoDer<'_> {
-        agent::extract_public_key(quic::agent::RemoteAgent::cert_chain(self))
+        agent::extract_public_key(agent::RemoteAgent::cert_chain(self))
     }
 
     fn verify(
@@ -190,7 +184,7 @@ impl agent::RemoteAgent for CachedRemoteAgent {
         signature: &[u8],
     ) -> BoxFuture<'_, Result<bool, VerifyError>> {
         let result = agent::verify_signature(
-            quic::agent::RemoteAgent::public_key(self),
+            agent::RemoteAgent::public_key(self),
             scheme,
             data,
             signature,

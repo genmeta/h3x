@@ -6,18 +6,11 @@ use std::{
 };
 
 use bytes::Bytes;
+use dhttp_identity::identity::{self as agent, SignError};
 use futures::{Sink, Stream, future::BoxFuture};
 use rustls::{SignatureScheme, pki_types::CertificateDer, sign::CertifiedKey};
 
-use crate::{
-    error::Code,
-    quic,
-    quic::{
-        CancelStream,
-        agent::{self, SignError},
-    },
-    varint::VarInt,
-};
+use crate::{error::Code, quic, quic::CancelStream, varint::VarInt};
 
 pub fn convert_varint(varint: dquic::prelude::VarInt) -> VarInt {
     // dquic's VarInt is already bounds-checked to RFC 9000 spec (< 2^62)

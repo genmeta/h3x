@@ -12,11 +12,10 @@ use std::{
 };
 
 use bytes::Bytes;
+use dhttp_identity::identity::{LocalAgent, RemoteAgent};
 use futures::{Sink, Stream, future::BoxFuture};
 use http::uri::Authority;
 use snafu::Snafu;
-
-pub mod agent;
 
 use crate::{error::Code, varint::VarInt};
 
@@ -251,7 +250,7 @@ impl<T: ManageStream> DynManageStream for T {
 
 /// AFIT version of local agent access.
 pub trait WithLocalAgent: Send + Sync {
-    type LocalAgent: agent::LocalAgent + 'static;
+    type LocalAgent: LocalAgent + 'static;
     fn local_agent(
         &self,
     ) -> impl Future<Output = Result<Option<Self::LocalAgent>, ConnectionError>> + Send + '_;
@@ -259,26 +258,22 @@ pub trait WithLocalAgent: Send + Sync {
 
 /// Object-safe version of [`WithLocalAgent`] with type-erased agent.
 pub trait DynWithLocalAgent: Send + Sync {
-    fn local_agent(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::LocalAgent>>, ConnectionError>>;
+    fn local_agent(&self) -> BoxFuture<'_, Result<Option<Arc<dyn LocalAgent>>, ConnectionError>>;
 }
 
 impl<T: WithLocalAgent> DynWithLocalAgent for T {
-    fn local_agent(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::LocalAgent>>, ConnectionError>> {
+    fn local_agent(&self) -> BoxFuture<'_, Result<Option<Arc<dyn LocalAgent>>, ConnectionError>> {
         Box::pin(async {
             WithLocalAgent::local_agent(self)
                 .await
-                .map(|opt| opt.map(|a| Arc::new(a) as Arc<dyn agent::LocalAgent>))
+                .map(|opt| opt.map(|a| Arc::new(a) as Arc<dyn LocalAgent>))
         })
     }
 }
 
 /// AFIT version of remote agent access.
 pub trait WithRemoteAgent: Send + Sync {
-    type RemoteAgent: agent::RemoteAgent + 'static;
+    type RemoteAgent: RemoteAgent + 'static;
     fn remote_agent(
         &self,
     ) -> impl Future<Output = Result<Option<Self::RemoteAgent>, ConnectionError>> + Send + '_;
@@ -286,19 +281,15 @@ pub trait WithRemoteAgent: Send + Sync {
 
 /// Object-safe version of [`WithRemoteAgent`] with type-erased agent.
 pub trait DynWithRemoteAgent: Send + Sync {
-    fn remote_agent(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::RemoteAgent>>, ConnectionError>>;
+    fn remote_agent(&self) -> BoxFuture<'_, Result<Option<Arc<dyn RemoteAgent>>, ConnectionError>>;
 }
 
 impl<T: WithRemoteAgent> DynWithRemoteAgent for T {
-    fn remote_agent(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<Arc<dyn agent::RemoteAgent>>, ConnectionError>> {
+    fn remote_agent(&self) -> BoxFuture<'_, Result<Option<Arc<dyn RemoteAgent>>, ConnectionError>> {
         Box::pin(async {
             WithRemoteAgent::remote_agent(self)
                 .await
-                .map(|opt| opt.map(|a| Arc::new(a) as Arc<dyn agent::RemoteAgent>))
+                .map(|opt| opt.map(|a| Arc::new(a) as Arc<dyn RemoteAgent>))
         })
     }
 }

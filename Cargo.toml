@@ -30,7 +30,7 @@ matchit = "0.9"
 x509-parser = "0.18"
 tower-service = "0.3"
 
-dhttp-identity = { git = "ssh://git@github.com/genmeta/dhttp.git", rev = "9aa36c6f39d7c59c21f6db081edef0f88d5d1416" }
+dhttp-identity = { git = "ssh://git@github.com/genmeta/dhttp.git", branch = "main" }
 
 # feature dquic
 dquic = { git = "ssh://git@github.com/genmeta/dquic.git", branch = "feat/v0.5.1", optional = true }

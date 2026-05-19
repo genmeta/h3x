@@ -10,7 +10,7 @@
 use std::sync::{Arc, Weak};
 
 use dashmap::DashMap;
-use dhttp_identity::Name;
+use dhttp_identity::name::Name;
 use rustls::{
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,

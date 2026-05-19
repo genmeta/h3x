@@ -47,7 +47,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use dhttp_identity::Name;
+use dhttp_identity::name::Name;
 use futures::{FutureExt, future::BoxFuture};
 use snafu::Snafu;
 use tokio_util::task::AbortOnDropHandle;

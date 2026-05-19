@@ -9,6 +9,7 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
+use dhttp_identity::identity as agent;
 use futures::{Stream, StreamExt, future::BoxFuture};
 use http::{
     HeaderMap, HeaderValue, Method, Uri,
@@ -28,7 +29,7 @@ use crate::{
     },
     pool::ConnectError,
     qpack::field::MalformedHeaderSection,
-    quic::{self, agent},
+    quic,
 };
 
 #[derive(Debug, Snafu)]

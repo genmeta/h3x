@@ -1,7 +1,4 @@
-use crate::{
-    quic::{self, agent},
-    varint::VarInt,
-};
+use crate::{quic, varint::VarInt};
 
 /// Lossy: remoc RPC errors must be serialized across process boundaries, so the
 /// original error type is stringified into a QUIC transport error reason.
@@ -22,18 +19,6 @@ impl From<remoc::rtc::CallError> for quic::ConnectionError {
 }
 
 impl From<remoc::rtc::CallError> for quic::StreamError {
-    fn from(error: remoc::rtc::CallError) -> Self {
-        quic::ConnectionError::from(error).into()
-    }
-}
-
-impl From<remoc::rtc::CallError> for agent::SignError {
-    fn from(error: remoc::rtc::CallError) -> Self {
-        quic::ConnectionError::from(error).into()
-    }
-}
-
-impl From<remoc::rtc::CallError> for agent::VerifyError {
     fn from(error: remoc::rtc::CallError) -> Self {
         quic::ConnectionError::from(error).into()
     }

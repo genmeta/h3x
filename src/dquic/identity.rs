@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-pub use dhttp_identity::{Identity, Name};
+pub use dhttp_identity::{identity::Identity, name::Name};
 
 /// Build a [`CertifiedKey`](rustls::sign::CertifiedKey) from an [`Identity`]
 /// for use in rustls.
@@ -18,7 +18,7 @@ pub use dhttp_identity::{Identity, Name};
 /// The returned key is wrapped in [`Arc`] so it can be shared across
 /// many TLS sessions.
 pub(crate) fn build_certified_key(
-    identity: &dhttp_identity::Identity,
+    identity: &Identity,
 ) -> Result<Arc<rustls::sign::CertifiedKey>, crate::dquic::network::BindServerError> {
     use snafu::ResultExt;
 
