@@ -3,7 +3,10 @@
 use std::net::IpAddr;
 
 use super::*;
-use crate::dquic::{net::Family, qinterface::bind_uri::Scheme};
+use crate::dquic::{
+    net::Family,
+    qinterface::bind_uri::{BindUri, Scheme},
+};
 
 // ============================================================================
 // Parsing — core parsing tests (from original "Parsing tests" section +
@@ -584,6 +587,14 @@ fn expand_ipv6() {
         assert_eq!(uris.len(), 1);
         assert!(uris[0].starts_with("inet://[::1]:0/"));
     }
+}
+
+#[test]
+fn ipv6_ip_pattern_matches_generated_bind_uri() {
+    let pattern: BindPattern = "inet://[::]:4433".parse().unwrap();
+    let bind_uri: BindUri = "inet://[::]:4433".parse().unwrap();
+
+    assert!(pattern.matches(&bind_uri));
 }
 
 // ============================================================================

@@ -2,6 +2,7 @@ use std::{
     cell::LazyCell,
     fmt,
     hash::{Hash, Hasher},
+    net::IpAddr,
     str::FromStr,
 };
 
@@ -253,7 +254,13 @@ impl BindPattern {
             return false;
         };
         match &self.host {
-            BindHost::Ip { addr, .. } => host == addr.to_string(),
+            BindHost::Ip { addr, .. } => {
+                let host = host
+                    .strip_prefix('[')
+                    .and_then(|host| host.strip_suffix(']'))
+                    .unwrap_or(host);
+                host.parse::<IpAddr>().is_ok_and(|host| host == *addr)
+            }
             _ => self.host.matches(host),
         }
     }
