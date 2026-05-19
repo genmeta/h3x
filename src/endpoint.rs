@@ -115,6 +115,19 @@ impl<Q, C: quic::Connection> H3Endpoint<Q, C> {
     pub fn quic(&self) -> &Q {
         &self.quic
     }
+
+    /// Clear all cached client connections.
+    ///
+    /// This is useful when an external network transition invalidates paths
+    /// without mutating the QUIC transport configuration itself.
+    pub fn clear_pool(&self) {
+        self.pool.clear();
+    }
+
+    /// Number of cached client connection entries.
+    pub fn pool_len(&self) -> usize {
+        self.pool.len()
+    }
 }
 
 impl<Q, C: quic::Connection> H3Endpoint<Q, C>
@@ -450,5 +463,22 @@ mod tests {
         } // guard dropped, pool.clear() called
 
         assert_eq!(h3.pool.len(), 0);
+    }
+
+    #[test]
+    fn test_clear_pool_clears_endpoint_connections() {
+        let h3 = H3Endpoint::new(MockConnect);
+
+        let auth: Authority = "example.com:443".parse().unwrap();
+        h3.pool
+            .connections
+            .entry(auth)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+
+        assert_eq!(h3.pool_len(), 1);
+
+        h3.clear_pool();
+
+        assert_eq!(h3.pool_len(), 0);
     }
 }
