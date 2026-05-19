@@ -1,6 +1,11 @@
 //! QUIC-only endpoint built on top of a shared [`Network`].
 
-use std::{any::Any, net::SocketAddr, str::FromStr, sync::Arc};
+use std::{
+    any::Any,
+    net::SocketAddr,
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
 use arc_swap::ArcSwapOption;
 use bon::bon;
@@ -15,7 +20,10 @@ use crate::{
         client::{ClientQuicConfig, ServerCertVerifierChoice},
         connection::Connection,
         identity::Identity,
-        net::{BindUri, ConnectionId, EndpointAddr},
+        net::{
+            BindUri, ConnectionId, EndpointAddr,
+            net::route::{Link, Pathway},
+        },
         network::{BindHandle, BindServerError, Network, ServerBinding},
         resolver::Resolve,
         server::ServerQuicConfig,
@@ -412,9 +420,10 @@ impl quic::Connect for QuicEndpoint {
 
         // Two legs driving path establishment:
         //   1. DNS results  → add_peer_endpoint
-        //   2. local ifaces → add_local_endpoint (via observer)
+        //   2. local ifaces → add compatible local paths (via observer)
         let mut observer = self.network.locations().subscribe();
         let bind = self.bind.clone();
+        let peers = Arc::new(Mutex::new(Vec::new()));
 
         loop {
             tokio::select! {
@@ -423,6 +432,7 @@ impl quic::Connect for QuicEndpoint {
                     return Err(ConnectError::NoReachableEndpoint);
                 }
                 Some((source, server_ep)) = server_eps.next() => {
+                    peers.lock().expect("peers mutex poisoned").push(server_ep);
                     self.add_current_local_endpoints_for_peer(&connection, server_ep);
                     let _ = connection.add_peer_endpoint(server_ep, source);
                 }
@@ -430,13 +440,22 @@ impl quic::Connect for QuicEndpoint {
                     if !bind.iter().any(|p| p.matches(&bind_uri)) {
                         continue;
                     }
-                    Self::handle_local_addr_event(&connection, bind_uri, event);
+                    let peers = peers.lock().expect("peers mutex poisoned").clone();
+                    Self::handle_local_addr_event_for_peers(
+                        &self.network,
+                        &connection,
+                        bind_uri,
+                        event,
+                        &peers,
+                    );
                 }
             }
 
             match connection.path_context() {
                 Ok(ctx) if !ctx.paths::<Vec<_>>().is_empty() => {
                     let weak = Arc::downgrade(&connection);
+                    let network = self.network.clone();
+                    let peers = peers.clone();
                     // Inherent termination: this path-discovery companion
                     // drains remaining DNS results and local address events
                     // after the first path is established. It exits when
@@ -452,12 +471,26 @@ impl quic::Connect for QuicEndpoint {
                                     _ = c.terminated() => break,
                                     Some((s, e)) = server_eps.next() => {
                                         let Some(c) = weak.upgrade() else { break };
+                                        peers.lock().expect("peers mutex poisoned").push(e);
+                                        Self::add_current_local_endpoints_for_peer_on(
+                                            &network,
+                                            &bind,
+                                            &c,
+                                            e,
+                                        );
                                         let _ = c.add_peer_endpoint(e, s);
                                     }
                                     Some((uri, e)) = observer.recv() => {
                                         let Some(c) = weak.upgrade() else { break };
                                         if bind.iter().any(|p| p.matches(&uri)) {
-                                            Self::handle_local_addr_event(&c, uri, e);
+                                            let peers = peers.lock().expect("peers mutex poisoned").clone();
+                                            Self::handle_local_addr_event_for_peers(
+                                                &network,
+                                                &c,
+                                                uri,
+                                                e,
+                                                &peers,
+                                            );
                                         }
                                     }
                                 }
@@ -602,12 +635,21 @@ impl<'a> Drop for IdentityMutGuard<'a> {
 
 impl QuicEndpoint {
     fn add_current_local_endpoints_for_peer(&self, connection: &Connection, peer: EndpointAddr) {
+        Self::add_current_local_endpoints_for_peer_on(&self.network, &self.bind, connection, peer);
+    }
+
+    fn add_current_local_endpoints_for_peer_on(
+        network: &Network,
+        bind: &[BindPattern],
+        connection: &Connection,
+        peer: EndpointAddr,
+    ) {
         use crate::dquic::net::IO as _;
 
         let remote_addr = *peer;
         let mut candidates = Vec::new();
-        for pattern in self.bind.iter() {
-            let Some(ifaces) = self.network.get_interfaces(pattern) else {
+        for pattern in bind {
+            let Some(ifaces) = network.get_interfaces(pattern) else {
                 continue;
             };
 
@@ -625,8 +667,7 @@ impl QuicEndpoint {
                     }
                 };
                 let Some(preference) =
-                    self.network
-                        .local_endpoint_preference(&bind_uri, bound_addr, remote_addr)
+                    network.local_endpoint_preference(&bind_uri, bound_addr, remote_addr)
                 else {
                     continue;
                 };
@@ -650,6 +691,53 @@ impl QuicEndpoint {
                 );
             }
         }
+    }
+
+    fn add_local_path_for_peer(
+        conn: &Connection,
+        bind_uri: BindUri,
+        bound_addr: SocketAddr,
+        peer: EndpointAddr,
+    ) {
+        let link = Link::new(bound_addr, *peer);
+        let pathway = Pathway::new(EndpointAddr::direct(bound_addr), peer);
+        if let Err(error) = conn.add_path(bind_uri, link, pathway) {
+            tracing::trace!(
+                error = %Report::from_error(&error),
+                "failed to add local path"
+            );
+        }
+    }
+
+    fn handle_local_addr_event_for_peers(
+        network: &Network,
+        conn: &Connection,
+        bind_uri: BindUri,
+        event: crate::dquic::qinterface::component::location::AddressEvent<dyn Any + Send + Sync>,
+        peers: &[EndpointAddr],
+    ) {
+        use crate::dquic::qinterface::component::location::AddressEvent;
+
+        let event = match event.downcast::<std::io::Result<SocketAddr>>() {
+            Ok(AddressEvent::Upsert(data)) => {
+                let Ok(bound_addr) = *data.as_ref() else {
+                    return;
+                };
+                for peer in peers {
+                    if network
+                        .local_endpoint_preference(&bind_uri, bound_addr, **peer)
+                        .is_some()
+                    {
+                        Self::add_local_path_for_peer(conn, bind_uri.clone(), bound_addr, *peer);
+                    }
+                }
+                return;
+            }
+            Ok(AddressEvent::Remove(_)) | Ok(AddressEvent::Closed) => return,
+            Err(event) => event,
+        };
+        // ClientLocationData: not handled (requires add_local_punch_address).
+        let _ = event;
     }
 
     /// Handle a single local-address event: upsert → call add_local_endpoint.
@@ -685,10 +773,36 @@ impl QuicEndpoint {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
+
+    use futures::{FutureExt, StreamExt, stream};
+    use http::uri::Authority;
     use rustls::pki_types::PrivateKeyDer;
 
     use super::*;
-    use crate::dquic::resolver::handy::SystemResolver;
+    use crate::{
+        dquic::{
+            qresolve::{ResolveFuture, Source},
+            resolver::handy::SystemResolver,
+        },
+        quic::Connect,
+    };
+
+    #[derive(Debug)]
+    struct SequenceResolver(Vec<(Source, EndpointAddr)>);
+
+    impl fmt::Display for SequenceResolver {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "sequence resolver")
+        }
+    }
+
+    impl Resolve for SequenceResolver {
+        fn lookup<'l>(&'l self, _name: &'l str) -> ResolveFuture<'l> {
+            let records = self.0.clone();
+            async move { Ok(stream::iter(records).boxed()) }.boxed()
+        }
+    }
 
     #[tokio::test]
     async fn test_quic_endpoint_construction() {
@@ -757,6 +871,38 @@ mod tests {
         // The dual-task model is set up internally in connect()
         // We verify it doesn't panic or error during setup
         // (actual connection would require valid DNS resolution)
+    }
+
+    #[tokio::test]
+    async fn connect_does_not_report_loopback_path_for_non_loopback_peer() {
+        let remote: SocketAddr = "10.10.0.4:4433"
+            .parse()
+            .expect("valid non-loopback endpoint");
+        let resolver: Arc<dyn Resolve + Send + Sync> = Arc::new(SequenceResolver(vec![(
+            Source::System,
+            EndpointAddr::direct(remote),
+        )]));
+        let bind = Arc::new(vec![
+            BindPattern::from_str("inet://127.0.0.1:0").expect("valid loopback bind pattern"),
+        ]);
+        let endpoint = QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .resolver(resolver)
+            .bind(bind)
+            .build()
+            .await;
+        let authority: Authority = "remote.test:4433".parse().expect("valid authority");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            endpoint.connect(&authority),
+        )
+        .await;
+
+        assert!(
+            !matches!(result, Ok(Ok(_))),
+            "loopback-only local binds must not establish paths to non-loopback peers"
+        );
     }
 
     fn make_identity(name: &str) -> Identity {
