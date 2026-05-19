@@ -746,6 +746,36 @@ impl Network {
         self.devices.resolve(device, family)
     }
 
+    /// Return whether `bound_addr` belongs to the currently-default interface
+    /// represented by `bind_uri`.
+    ///
+    /// This is intentionally stricter than [`local_endpoint_preference`]:
+    /// stale bind handles can briefly outlive netlink reconciliation after a
+    /// device is removed. In that case the device is absent from the current
+    /// snapshot and this method returns `false` rather than treating the
+    /// address as an "other" usable endpoint.
+    pub fn bound_addr_is_on_default_route(
+        &self,
+        bind_uri: &BindUri,
+        bound_addr: SocketAddr,
+    ) -> bool {
+        let Some((family, device, _port)) = bind_uri.as_iface_bind_uri() else {
+            return false;
+        };
+        let bound_family = if bound_addr.is_ipv4() {
+            Family::V4
+        } else {
+            Family::V6
+        };
+        if family != bound_family {
+            return false;
+        }
+
+        self.devices.get(device).is_some_and(|interface| {
+            interface.default && interface_contains(&interface, bound_addr.ip())
+        })
+    }
+
     pub(crate) fn local_endpoint_preference(
         &self,
         bind_uri: &BindUri,
