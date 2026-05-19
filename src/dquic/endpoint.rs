@@ -415,7 +415,6 @@ impl quic::Connect for QuicEndpoint {
         //   2. local ifaces → add_local_endpoint (via observer)
         let mut observer = self.network.locations().subscribe();
         let bind = self.bind.clone();
-        self.add_current_local_endpoints(&connection);
 
         loop {
             tokio::select! {
@@ -424,6 +423,7 @@ impl quic::Connect for QuicEndpoint {
                     return Err(ConnectError::NoReachableEndpoint);
                 }
                 Some((source, server_ep)) = server_eps.next() => {
+                    self.add_current_local_endpoints_for_peer(&connection, server_ep);
                     let _ = connection.add_peer_endpoint(server_ep, source);
                 }
                 Some((bind_uri, event)) = observer.recv() => {
@@ -601,9 +601,11 @@ impl<'a> Drop for IdentityMutGuard<'a> {
 }
 
 impl QuicEndpoint {
-    fn add_current_local_endpoints(&self, connection: &Connection) {
+    fn add_current_local_endpoints_for_peer(&self, connection: &Connection, peer: EndpointAddr) {
         use crate::dquic::net::IO as _;
 
+        let remote_addr = *peer;
+        let mut candidates = Vec::new();
         for pattern in self.bind.iter() {
             let Some(ifaces) = self.network.get_interfaces(pattern) else {
                 continue;
@@ -622,13 +624,30 @@ impl QuicEndpoint {
                         continue;
                     }
                 };
-                let endpoint = EndpointAddr::direct(bound_addr);
-                if let Err(error) = connection.add_local_endpoint(bind_uri, endpoint) {
-                    tracing::warn!(
-                        error = %Report::from_error(&error),
-                        "failed to add local endpoint"
-                    );
-                }
+                let Some(preference) =
+                    self.network
+                        .local_endpoint_preference(&bind_uri, bound_addr, remote_addr)
+                else {
+                    continue;
+                };
+                candidates.push((preference, bind_uri, EndpointAddr::direct(bound_addr)));
+            }
+        }
+
+        let Some(best_preference) = candidates.iter().map(|(preference, ..)| *preference).min()
+        else {
+            return;
+        };
+
+        for (preference, bind_uri, endpoint) in candidates {
+            if preference != best_preference {
+                continue;
+            }
+            if let Err(error) = connection.add_local_endpoint(bind_uri, endpoint) {
+                tracing::trace!(
+                    error = %Report::from_error(&error),
+                    "failed to add current local endpoint"
+                );
             }
         }
     }
