@@ -480,10 +480,15 @@ impl Drop for Response {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::ControlFlow;
+
     use super::*;
     use crate::{
         connection::tests::TestLocalAgent,
-        message::{test::write_stream_for_test, unify::MessageStage},
+        message::{
+            test::write_stream_for_test,
+            unify::{MessageStage, MessageWriteGoal},
+        },
         varint::VarInt,
     };
 
@@ -501,16 +506,16 @@ mod tests {
     async fn set_body_after_trailer_stage_keeps_response_malformed() {
         let mut response = test_response();
         response.message.set_body(&b""[..]).expect("set body");
-        response
+        let header = response
             .stream
-            .send_message_header(&mut response.message)
-            .await
-            .expect("send header");
-        response
+            .send_message_step(&mut response.message, MessageWriteGoal::Header)
+            .await;
+        assert!(matches!(header, ControlFlow::Break(Ok(()))));
+        let body = response
             .stream
-            .send_message_chunked_body_chunk(&mut response.message)
-            .await
-            .expect("advance chunked body");
+            .send_message_step(&mut response.message, MessageWriteGoal::Body)
+            .await;
+        assert!(matches!(body, ControlFlow::Break(Ok(()))));
         assert_eq!(response.message.stage(), MessageStage::Trailer);
 
         response.set_body(&b"body"[..]);

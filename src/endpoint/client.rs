@@ -1,7 +1,7 @@
 use std::{
     error::Error,
     future::IntoFuture,
-    ops::Deref,
+    ops::{ControlFlow, Deref},
     sync::{
         Arc, Mutex as SyncMutex,
         atomic::{AtomicBool, Ordering},
@@ -24,7 +24,7 @@ use crate::{
     error::Code,
     message::{
         stream::{InitialMessageStreamError, MessageStreamError, ReadStream, WriteStream},
-        unify::{MalformedMessageError, Message, ReadToStringError},
+        unify::{MalformedMessageError, Message, MessageWriteGoal, ReadToStringError},
     },
     pool::ConnectError,
     qpack::field::MalformedHeaderSection,
@@ -246,6 +246,36 @@ where
             })
     }
 
+    async fn initialized_write_stream(
+        &self,
+    ) -> Result<tokio::sync::MappedMutexGuard<'_, WriteStream>, RequestError<Q::Error>> {
+        let write_guard = self.write_stream.lock().await;
+        if write_guard.is_none() {
+            return Err(RequestError::Acquire {
+                source: AcquireError::AlreadyTaken,
+            });
+        }
+        Ok(tokio::sync::MutexGuard::map(write_guard, |stream| {
+            stream
+                .as_mut()
+                .expect("write stream is present after explicit check")
+        }))
+    }
+
+    async fn acquire_write_stream(
+        &self,
+    ) -> Result<tokio::sync::MappedMutexGuard<'_, WriteStream>, RequestError<Q::Error>> {
+        self.ensure_stream_init().await?;
+        self.initialized_write_stream().await
+    }
+
+    async fn write_stream(
+        &self,
+    ) -> Result<tokio::sync::MappedMutexGuard<'_, WriteStream>, RequestError<Q::Error>> {
+        self.send_buffered_request().await?;
+        self.initialized_write_stream().await
+    }
+
     async fn read_response(&self) -> Result<Response, RequestError<Q::Error>> {
         let mut stream = self.take_read_stream().await?;
         let mut message = Message::unresolved_response();
@@ -261,34 +291,41 @@ where
         })
     }
 
-    async fn send_request_header(&self) -> Result<(), RequestError<Q::Error>> {
-        self.ensure_stream_init().await?;
-        let mut write_guard = self.write_stream.lock().await;
-        let write_stream = write_guard.as_mut().ok_or(RequestError::Acquire {
-            source: AcquireError::AlreadyTaken,
-        })?;
+    async fn send_request_to_goal(
+        &self,
+        goal: MessageWriteGoal,
+    ) -> Result<(), RequestError<Q::Error>> {
+        let mut write_stream = self.acquire_write_stream().await?;
 
-        let result = {
-            let mut message = self.message();
-            write_stream.send_message_header(&mut message)
+        loop {
+            let flow = {
+                let mut message = self.message();
+                write_stream.send_message_step(&mut message, goal)
+            }
+            .await;
+
+            match flow {
+                ControlFlow::Continue(()) => {}
+                ControlFlow::Break(result) => {
+                    if result.is_err() {
+                        self.mark_message_failed_unless_malformed();
+                    }
+                    result?;
+                    return Ok(());
+                }
+            }
         }
-        .await;
-        if result.is_err() {
-            self.mark_message_failed_unless_malformed();
-        }
-        result?;
-        Ok(())
+    }
+
+    async fn send_request_header(&self) -> Result<(), RequestError<Q::Error>> {
+        self.send_request_to_goal(MessageWriteGoal::Header).await
     }
 
     async fn write_body_chunk(
         &self,
         content: impl Buf + Send,
     ) -> Result<(), RequestError<Q::Error>> {
-        self.ensure_stream_init().await?;
-        let mut write_guard = self.write_stream.lock().await;
-        let write_stream = write_guard.as_mut().ok_or(RequestError::Acquire {
-            source: AcquireError::AlreadyTaken,
-        })?;
+        let mut write_stream = self.acquire_write_stream().await?;
 
         let result = {
             let mut message = self.message();
@@ -303,112 +340,22 @@ where
     }
 
     async fn flush_request(&self) -> Result<(), RequestError<Q::Error>> {
-        self.send_buffered_request().await?;
-        let mut write_guard = self.write_stream.lock().await;
-        let write_stream = write_guard.as_mut().ok_or(RequestError::Acquire {
-            source: AcquireError::AlreadyTaken,
-        })?;
-        write_stream.flush().await?;
+        self.write_stream().await?.flush().await?;
         Ok(())
     }
 
     async fn close_request(&self) -> Result<(), RequestError<Q::Error>> {
-        self.send_buffered_request().await?;
-        let mut write_guard = self.write_stream.lock().await;
-        let write_stream = write_guard.as_mut().ok_or(RequestError::Acquire {
-            source: AcquireError::AlreadyTaken,
-        })?;
-        write_stream.close().await?;
+        self.write_stream().await?.close().await?;
         Ok(())
     }
 
     async fn cancel_request(&self, code: Code) -> Result<(), RequestError<Q::Error>> {
-        self.ensure_stream_init().await?;
-        let mut write_guard = self.write_stream.lock().await;
-        let write_stream = write_guard.as_mut().ok_or(RequestError::Acquire {
-            source: AcquireError::AlreadyTaken,
-        })?;
-        write_stream.cancel(code).await?;
+        self.acquire_write_stream().await?.cancel(code).await?;
         Ok(())
     }
 
     async fn send_buffered_request(&self) -> Result<(), RequestError<Q::Error>> {
-        self.ensure_stream_init().await?;
-        let mut write_guard = self.write_stream.lock().await;
-        let write_stream = write_guard.as_mut().ok_or(RequestError::Acquire {
-            source: AcquireError::AlreadyTaken,
-        })?;
-
-        loop {
-            let stage = { self.message().stage() };
-            match stage {
-                crate::message::unify::MessageStage::Header => {
-                    let result = {
-                        let mut message = self.message();
-                        write_stream.send_message_header(&mut message)
-                    }
-                    .await;
-                    if result.is_err() {
-                        self.mark_message_failed_unless_malformed();
-                    }
-                    result?;
-                }
-                crate::message::unify::MessageStage::Body => {
-                    let is_chunked = { self.message().is_chunked() };
-
-                    let result = {
-                        let mut message = self.message();
-                        write_stream.send_message_header(&mut message)
-                    }
-                    .await;
-                    if result.is_err() {
-                        self.mark_message_failed_unless_malformed();
-                    }
-                    result?;
-
-                    if !is_chunked {
-                        return Ok(());
-                    }
-                    let sent = {
-                        let mut message = self.message();
-                        write_stream.send_message_chunked_body_chunk(&mut message)
-                    }
-                    .await;
-                    if sent.is_err() {
-                        self.mark_message_failed_unless_malformed();
-                    }
-                    if !sent? {
-                        continue;
-                    }
-                }
-                crate::message::unify::MessageStage::Trailer => {
-                    let has_trailers = { !self.message().trailers().is_empty() };
-                    if !has_trailers {
-                        return Ok(());
-                    }
-                    let result = {
-                        let mut message = self.message();
-                        write_stream.send_message_trailer_frame(&mut message)
-                    }
-                    .await;
-                    if result.is_err() {
-                        self.mark_message_failed_unless_malformed();
-                    }
-                    result?;
-                }
-                crate::message::unify::MessageStage::Complete => return Ok(()),
-                crate::message::unify::MessageStage::Malformed => {
-                    write_stream.cancel(Code::H3_REQUEST_CANCELLED).await?;
-                    return Ok(());
-                }
-                crate::message::unify::MessageStage::Failed => {
-                    return Err(MessageStreamError::MessageSendFailed.into());
-                }
-                crate::message::unify::MessageStage::Dropped => {
-                    unreachable!("Message used after destroyed, this is a bug")
-                }
-            }
-        }
+        self.send_request_to_goal(MessageWriteGoal::Complete).await
     }
 
     async fn into_response(self) -> Result<Response, RequestError<Q::Error>> {
@@ -576,11 +523,22 @@ where
         self.state.cancel_request(code).await
     }
 
+    /// Sends the request header and waits for the response.
+    ///
+    /// This method intentionally sends only the header section. It is meant for
+    /// full-duplex requests where another owner of the same request may continue
+    /// writing the body. If the whole buffered request should be sent before waiting
+    /// for the response, use [`Self::into_response`] when the request is uniquely
+    /// owned.
     pub async fn response(&self) -> Result<Response, RequestError<Q::Error>> {
         self.state.send_request_header().await?;
         self.state.read_response().await
     }
 
+    /// Sends the whole buffered request when uniquely owned, then waits for the response.
+    ///
+    /// If other `Request` clones still exist, this falls back to [`Self::response`]
+    /// and therefore only sends the request header before waiting for the response.
     pub async fn into_response(self) -> Result<Response, RequestError<Q::Error>> {
         match Arc::try_unwrap(self.state) {
             Ok(state) => state.into_response().await,
