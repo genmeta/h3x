@@ -6,7 +6,7 @@ use arc_swap::ArcSwapOption;
 use bon::bon;
 use futures::{StreamExt, future::join_all};
 use rustls::ClientConfig;
-use snafu::{ResultExt, Snafu};
+use snafu::{Report, ResultExt, Snafu};
 use tracing::Instrument;
 
 use crate::{
@@ -415,6 +415,7 @@ impl quic::Connect for QuicEndpoint {
         //   2. local ifaces → add_local_endpoint (via observer)
         let mut observer = self.network.locations().subscribe();
         let bind = self.bind.clone();
+        self.add_current_local_endpoints(&connection);
 
         loop {
             tokio::select! {
@@ -600,6 +601,38 @@ impl<'a> Drop for IdentityMutGuard<'a> {
 }
 
 impl QuicEndpoint {
+    fn add_current_local_endpoints(&self, connection: &Connection) {
+        use crate::dquic::net::IO as _;
+
+        for pattern in self.bind.iter() {
+            let Some(ifaces) = self.network.get_interfaces(pattern) else {
+                continue;
+            };
+
+            for iface in ifaces {
+                let bind_uri = iface.bind_uri();
+                let bound_addr = match iface.borrow().bound_addr() {
+                    Ok(bound_addr) => bound_addr,
+                    Err(error) => {
+                        tracing::trace!(
+                            %bind_uri,
+                            error = %Report::from_error(&error),
+                            "skipping local endpoint without bound address"
+                        );
+                        continue;
+                    }
+                };
+                let endpoint = EndpointAddr::direct(bound_addr);
+                if let Err(error) = connection.add_local_endpoint(bind_uri, endpoint) {
+                    tracing::warn!(
+                        error = %Report::from_error(&error),
+                        "failed to add local endpoint"
+                    );
+                }
+            }
+        }
+    }
+
     /// Handle a single local-address event: upsert → call add_local_endpoint.
     fn handle_local_addr_event(
         conn: &Connection,
