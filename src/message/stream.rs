@@ -338,6 +338,12 @@ impl WriteStream {
         self.stream.encode_one(frame).await
     }
 
+    pub async fn send_data(&mut self, data: impl Buf + Send) -> Result<(), MessageStreamError> {
+        let frame = Frame::new(Frame::DATA_FRAME_TYPE, data)?;
+        self.try_stream_io(async |this| Ok(this.send_frame(frame).await?))
+            .await
+    }
+
     async fn peer_goaway_covers(
         &mut self,
     ) -> Result<impl Future<Output = Result<(), quic::ConnectionError>> + use<>, quic::StreamError>

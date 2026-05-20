@@ -1,35 +1,28 @@
 //! Generic HTTP/3 endpoint.
 //!
 //! [`H3Endpoint`] combines a QUIC transport `Q` with a selected connection
-//! type `C`, providing the foundation for both client and server
-//! functionality.  Client methods require `Q: quic::Connect<Connection = C>`;
-//! server methods require `Q: quic::Listen<Connection = C>`.
+//! type `C`, providing raw HTTP/3 connection pooling and request serving.
+//! Client connection access requires `Q: quic::Connect<Connection = C>`;
+//! server request serving requires `Q: quic::Listen<Connection = C>`.
 //!
 //! [`ConnectionBuilder`]: crate::connection::ConnectionBuilder
 
-use std::{error::Error, future::Future, sync::Arc};
+use std::{error::Error, sync::Arc};
 
 use bon::bon;
-use http::{Method, Uri, uri::Authority};
+use http::uri::Authority;
 use tower_service::Service;
 use tracing::Instrument;
 
 use crate::{
     connection::{Connection as H3Connection, ConnectionBuilder},
-    endpoint::{
-        client::{Arbiter, Request as ClientRequest},
-        server::UnresolvedRequest,
-    },
-    message::{
-        stream::{ReadStream, WriteStream},
-        unify::Message,
-    },
+    endpoint::server::UnresolvedRequest,
+    message::stream::{ReadStream, WriteStream},
     pool::{self, Pool},
     quic::{self, GetStreamIdExt},
     stream_id::StreamId,
 };
 
-pub mod client;
 pub mod server;
 
 /// Generic HTTP/3 endpoint parameterized over a QUIC transport `Q` and a
@@ -40,7 +33,7 @@ pub mod server;
 ///
 /// | Capability | Bound |
 /// |---|---|
-/// | Client (connect, new_request, get, …) | `Q: quic::Connect<Connection = C>` |
+/// | Client connection access (connect)    | `Q: quic::Connect<Connection = C>` |
 /// | Server (serve, serve_owned)            | `Q: quic::Listen<Connection = C>`  |
 pub struct H3Endpoint<Q, C: quic::Connection> {
     pub(crate) quic: Q,
@@ -142,86 +135,6 @@ where
         self.pool
             .reuse_or_connect_with(&self.quic, self.builder.clone(), server)
             .await
-    }
-}
-
-impl<Q, C: quic::Connection> H3Endpoint<Q, C>
-where
-    Q: quic::Connect<Connection = C>,
-    Q::Error: std::error::Error + Send + Sync + 'static,
-{
-    /// Create a new request owned by this endpoint (shared via [`Arc`]).
-    ///
-    /// Authority is NOT set at construction time — use [`.uri()`] on the
-    /// returned [`Request`] to set both the request URI and the authority.
-    /// If `.uri()` is never called, [`Request::into_future`] will fail with
-    /// [`RequestError::MalformedRequestHeader`] containing
-    /// `EmptyAuthorityOrHost`.
-    ///
-    /// [`Request`]: client::Request
-    /// [`Request::into_future`]: client::Request::into_future
-    pub fn new_request_owned(self: &Arc<Self>) -> ClientRequest<Q, Arc<Self>> {
-        let msg = Message::unresolved_request();
-        let arbiter = Arc::new(Arbiter::new(Arc::clone(self), msg));
-        ClientRequest::new(arbiter)
-    }
-
-    /// Create a new request borrowing this endpoint.
-    ///
-    /// This is the primary method for creating requests. It borrows the
-    /// endpoint (returning a non-`'static` request type) so you can build
-    /// requests inline without cloning an [`Arc`].
-    /// Authority is NOT set at construction time — use [`.uri()`] on the
-    /// returned [`Request`] to set both the request URI and the authority.
-    ///
-    /// If you need a `'static` request (e.g. for async spawning), use
-    /// [`new_request_owned`] instead.
-    ///
-    /// [`Request`]: client::Request
-    pub fn new_request(&self) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
-        let msg = Message::unresolved_request();
-        let arbiter = Arc::new(Arbiter::new(self, msg));
-        ClientRequest::new(arbiter)
-    }
-
-    /// Convenience method to create a GET request for `uri`.
-    pub fn get(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
-        self.new_request().method(Method::GET).uri(uri)
-    }
-
-    /// Convenience method to create a POST request for `uri`.
-    pub fn post(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
-        self.new_request().method(Method::POST).uri(uri)
-    }
-
-    /// Convenience method to create a PUT request for `uri`.
-    pub fn put(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
-        self.new_request().method(Method::PUT).uri(uri)
-    }
-
-    /// Convenience method to create a DELETE request for `uri`.
-    pub fn delete(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
-        self.new_request().method(Method::DELETE).uri(uri)
-    }
-
-    /// Convenience method to create a PATCH request for `uri`.
-    pub fn patch(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
-        self.new_request().method(Method::PATCH).uri(uri)
-    }
-
-    /// Convenience method to create a HEAD request for `uri`.
-    pub fn head(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
-        self.new_request().method(Method::HEAD).uri(uri)
-    }
-
-    /// Convenience method to create a OPTIONS request for `uri`.
-    pub fn options(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
-        self.new_request().method(Method::OPTIONS).uri(uri)
-    }
-
-    /// Convenience method to create a TRACE request for `uri`.
-    pub fn trace(&self, uri: Uri) -> ClientRequest<Q, &H3Endpoint<Q, C>> {
-        self.new_request().method(Method::TRACE).uri(uri)
     }
 }
 

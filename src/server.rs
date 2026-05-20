@@ -7,11 +7,7 @@ use snafu::Report;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-pub use crate::endpoint::server::{
-    BoxService, BoxServiceFuture, IntoBoxService, MessageStreamError, MethodRouter, ReadStream,
-    ReadToStringError, Request, Response, Serve, ServersRouter, ServersRouterDispatchError,
-    Service, UnresolvedRequest, WriteStream, box_service,
-};
+pub use crate::endpoint::server::{MessageStreamError, ReadStream, UnresolvedRequest, WriteStream};
 use crate::{
     connection::ConnectionBuilder,
     error::Code,
@@ -170,19 +166,6 @@ where
 
                     if let Err(error) = service.call(unresolved_request).await {
                         let error = error.into();
-                        if error
-                            .as_ref()
-                            .downcast_ref::<ServersRouterDispatchError>()
-                            .is_some()
-                        {
-                            tracing::debug!(
-                                stream_id = %stream_id,
-                                error = %Report::from_error(error.as_ref()),
-                                "close incoming connection due to missing service"
-                            );
-                            connection.close(Code::H3_NO_ERROR, "no error");
-                            return;
-                        }
                         tracing::debug!(
                             stream_id = %stream_id,
                             error = %Report::from_error(error.as_ref()),

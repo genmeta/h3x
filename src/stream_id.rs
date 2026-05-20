@@ -11,16 +11,16 @@ use crate::{
 ///
 /// A lightweight newtype around [`VarInt`] representing the QUIC stream ID of the
 /// current request/response pair. Injected as a field in
-/// [`Request`](crate::endpoint::server::Request) and [`Response`](crate::endpoint::server::Response)
-/// (native path) or as a request extension (hyper path).
+/// [`UnresolvedRequest`](crate::endpoint::server::UnresolvedRequest) on the raw
+/// endpoint path or as a request extension on the hyper path.
 ///
 /// `StreamId` serves as the per-stream key when deriving protocol-specific session
 /// handles from connection-scoped protocol state stored in [`Protocols`](crate::protocol::Protocols):
 ///
 /// ```ignore
-/// // Native handler:
-/// let proto = request.protocols().get::<MyProtocol>().unwrap();
-/// let session = proto.create_session(request.stream_id());
+/// // Raw handler:
+/// let proto = request.connection.protocols().get::<MyProtocol>().unwrap();
+/// let session = proto.create_session(request.stream_id);
 ///
 /// // Hyper handler:
 /// let stream_id = request.extensions().get::<StreamId>().unwrap();

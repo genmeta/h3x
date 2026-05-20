@@ -21,19 +21,19 @@
 //!
 //! # Handler access pattern
 //!
-//! Handlers receive protocol access through [`crate::endpoint::server::Request::protocols()`]
-//! and [`crate::endpoint::server::Response::protocols()`], which return `&Arc<Protocols>`.
-//! Combined with [`crate::stream_id::StreamId`], a handler can derive
-//! per-request/session handles from the connection-scoped protocol state:
+//! Raw handlers receive protocol access through
+//! [`crate::endpoint::server::UnresolvedRequest::connection`], which exposes
+//! connection-scoped protocol state. Combined with [`crate::stream_id::StreamId`],
+//! a handler can derive per-request/session handles from that state:
 //!
 //! ```ignore
-//! // Native h3x handler:
-//! let dhttp = request.protocols().get::<DHttpProtocol>().unwrap();
-//! let stream_id = request.stream_id();
+//! // Raw h3x handler:
+//! let dhttp = request.connection.protocols().get::<DHttpProtocol>().unwrap();
+//! let stream_id = request.stream_id;
 //!
 //! // Hypothetical extension protocol:
 //! let proto = request.protocols().get::<MyProtocol>().expect("MyProtocol required");
-//! let session = proto.create_session(request.stream_id());
+//! let session = proto.create_session(request.stream_id);
 //! ```
 //!
 //! In hyper handlers, the same data is available via request extensions:

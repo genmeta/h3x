@@ -1,14 +1,17 @@
-pub use crate::message::{
-    stream::{MessageStreamError, ReadStream, WriteStream},
-    unify::ReadToStringError,
-};
+use std::sync::Arc;
 
-mod message;
-pub(crate) use message::read_request_header;
-pub use message::{Request, Response, UnresolvedRequest};
-mod route;
-pub use route::{MethodRouter, Service};
-mod servers_router;
-pub use servers_router::{ServersRouter, ServersRouterDispatchError};
-mod service;
-pub use service::{BoxService, BoxServiceFuture, IntoBoxService, Serve, box_service};
+pub use crate::message::stream::{MessageStreamError, ReadStream, WriteStream};
+use crate::{connection::ConnectionState, quic, stream_id::StreamId};
+
+/// A request that has just been accepted on a QUIC stream but whose HTTP/3
+/// header frame has not yet been interpreted by a higher-level HTTP API.
+pub struct UnresolvedRequest {
+    /// QUIC stream identifier for this request.
+    pub stream_id: StreamId,
+    /// Incoming request stream.
+    pub read_stream: ReadStream,
+    /// Outgoing response stream.
+    pub write_stream: WriteStream,
+    /// Owning h3 connection.
+    pub connection: Arc<ConnectionState<dyn quic::DynConnection>>,
+}

@@ -7,12 +7,12 @@ use bytes::Bytes;
 use futures::future::{self, BoxFuture};
 use http::Method;
 use http_body::Body;
-use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
-use snafu::{Report, ResultExt, Snafu};
+use http_body_util::combinators::UnsyncBoxBody;
+use snafu::{ResultExt, Snafu};
 use tracing::Instrument;
 
 use crate::{
-    endpoint::server::{Request, Response, UnresolvedRequest},
+    endpoint::server::UnresolvedRequest,
     message::stream::{
         MessageStreamError, ReadStream,
         hyper::{
@@ -21,101 +21,6 @@ use crate::{
         },
     },
 };
-
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct TowerService<S>(pub S);
-
-impl<S, RespBody> crate::endpoint::server::Serve for TowerService<S>
-where
-    S: tower_service::Service<
-            http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,
-            Response = http::Response<RespBody>,
-            Error: Error + Send,
-            Future: Send,
-        > + Clone
-        + Send
-        + 'static,
-    RespBody: Body<Data: Send, Error: Error + Send + 'static> + Send,
-{
-    type Future<'s> = BoxFuture<'s, ()>;
-
-    fn serve<'s>(&self, req: &'s mut Request, resp: &'s mut Response) -> Self::Future<'s> {
-        let mut service = self.0.clone();
-        Box::pin(async move {
-            if let Err(error) = future::poll_fn(|cx| service.poll_ready(cx)).await {
-                tracing::debug!(error = %Report::from_error(error), "service cannot be ready");
-                return;
-            }
-
-            let mut read_stream = Some(req.read_stream().take());
-            let mut write_stream = resp.write_stream().take();
-            resp.mark_taken_over();
-
-            let is_connect = req.method() == Method::CONNECT;
-
-            let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
-            let request = if is_connect {
-                let remain_read_stream = RemainStream::immediately(
-                    read_stream
-                        .take()
-                        .expect("connect request must have read stream"),
-                );
-                http::Request::builder()
-                    .method(req.method())
-                    .uri(req.uri())
-                    .extension(TakeoverSlot::new(remain_read_stream))
-                    .extension(TakeoverSlot::new(remain_write_stream.clone()))
-                    .body(UnsyncBoxBody::new(Empty::new().map_err(|n| match n {})))
-            } else {
-                http::Request::builder()
-                    .method(req.method())
-                    .uri(req.uri())
-                    .body(UnsyncBoxBody::new(
-                        read_stream
-                            .take()
-                            .expect("non-connect request must have read stream")
-                            .into_hyper_body(),
-                    ))
-            };
-
-            let mut request = match request {
-                Ok(request) => request,
-                Err(error) => {
-                    tracing::warn!(error = %Report::from_error(error), "failed to convert request, skip serving");
-                    return;
-                }
-            };
-
-            *request.headers_mut() = req.headers().clone();
-            request.extensions_mut().insert(resp.agent().clone());
-            request.extensions_mut().insert(req.stream_id());
-            request.extensions_mut().insert(req.protocols().clone());
-            if let Some(remote_agent) = req.agent().cloned() {
-                request.extensions_mut().insert(remote_agent);
-            }
-
-            match service.call(request).await {
-                Ok(response) => {
-                    if let Err(error) = write_stream.send_hyper_response(response).await {
-                        tracing::debug!(error = %Report::from_error(error), "failed to send response");
-                    }
-                    if is_connect {
-                        // Flush the buffered response so the client receives
-                        // it before the stream is handed to the upgrade layer.
-                        _ = write_stream.flush().await;
-                        _ = remain_write_stream_tx.send(write_stream);
-                    } else {
-                        _ = write_stream.close().await;
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(error = %Report::from_error(error), "service failed")
-                }
-            }
-        })
-    }
-}
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
@@ -139,6 +44,10 @@ impl<S: Error + 'static, B: Error + 'static> From<SendMessageError<B>>
     }
 }
 
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct TowerService<S>(pub S);
+
 impl<S, RespBody, ServiceE> tower_service::Service<UnresolvedRequest> for TowerService<S>
 where
     S: tower_service::Service<
@@ -153,9 +62,7 @@ where
     RespBody: Body<Data: Send, Error: Error + Send + 'static> + Send,
 {
     type Response = ();
-
     type Error = HandleRequestError<ServiceE, RespBody::Error>;
-
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -198,10 +105,6 @@ where
             let is_connect = request.method() == Method::CONNECT;
             let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
 
-            // Downstream handlers read the owning connection out of extensions
-            // and call `local_agent().await` / `remote_agent().await` /
-            // `protocols()` on demand. `stream_id` is request-scoped so it is
-            // still inserted alongside the connection.
             request.extensions_mut().insert(stream_id);
             request.extensions_mut().insert(connection);
             if is_connect
@@ -244,90 +147,6 @@ where
 #[repr(transparent)]
 pub struct HyperService<S>(pub S);
 
-impl<S, RespBody> crate::endpoint::server::Serve for HyperService<S>
-where
-    S: hyper::service::Service<
-            http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,
-            Response = http::Response<RespBody>,
-            Error: Error + Send,
-            Future: Send,
-        > + Clone
-        + Send
-        + 'static,
-    RespBody: Body<Data: Send, Error: Error + Send + 'static> + Send,
-{
-    type Future<'s> = BoxFuture<'s, ()>;
-
-    fn serve<'s>(&self, req: &'s mut Request, resp: &'s mut Response) -> Self::Future<'s> {
-        let service = self.0.clone();
-        Box::pin(async move {
-            let mut read_stream = Some(req.read_stream().take());
-            let mut write_stream = resp.write_stream().take();
-            resp.mark_taken_over();
-
-            let is_connect = req.method() == Method::CONNECT;
-
-            let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
-            let request = if is_connect {
-                let remain_read_stream = RemainStream::immediately(
-                    read_stream
-                        .take()
-                        .expect("connect request must have read stream"),
-                );
-                http::Request::builder()
-                    .method(req.method())
-                    .uri(req.uri())
-                    .extension(TakeoverSlot::new(remain_read_stream))
-                    .extension(TakeoverSlot::new(remain_write_stream.clone()))
-                    .body(UnsyncBoxBody::new(Empty::new().map_err(|n| match n {})))
-            } else {
-                http::Request::builder()
-                    .method(req.method())
-                    .uri(req.uri())
-                    .body(UnsyncBoxBody::new(
-                        read_stream
-                            .take()
-                            .expect("non-connect request must have read stream")
-                            .into_hyper_body(),
-                    ))
-            };
-
-            let mut request = match request {
-                Ok(request) => request,
-                Err(error) => {
-                    tracing::warn!(error = %Report::from_error(error), "failed to convert request, skip serving");
-                    return;
-                }
-            };
-
-            *request.headers_mut() = req.headers().clone();
-            request.extensions_mut().insert(resp.agent().clone());
-            request.extensions_mut().insert(req.stream_id());
-            request.extensions_mut().insert(req.protocols().clone());
-            if let Some(remote_agent) = req.agent().cloned() {
-                request.extensions_mut().insert(remote_agent);
-            }
-
-            match service.call(request).await {
-                Ok(response) => {
-                    if let Err(error) = write_stream.send_hyper_response(response).await {
-                        tracing::debug!(error = %Report::from_error(error), "failed to send response");
-                    }
-                    if is_connect {
-                        _ = write_stream.flush().await;
-                        _ = remain_write_stream_tx.send(write_stream);
-                    } else {
-                        _ = write_stream.close().await;
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(error = %Report::from_error(error), "service failed")
-                }
-            }
-        })
-    }
-}
-
 impl<S, RespBody, ServiceE> tower_service::Service<UnresolvedRequest> for HyperService<S>
 where
     S: hyper::service::Service<
@@ -342,9 +161,7 @@ where
     RespBody: Body<Data: Send, Error: Error + Send + 'static> + Send,
 {
     type Response = ();
-
     type Error = HandleRequestError<ServiceE, RespBody::Error>;
-
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -381,10 +198,6 @@ where
             let is_connect = request.method() == Method::CONNECT;
             let (remain_write_stream_tx, remain_write_stream) = RemainStream::pending();
 
-            // Downstream handlers read the owning connection out of extensions
-            // and call `local_agent().await` / `remote_agent().await` /
-            // `protocols()` on demand. `stream_id` is request-scoped so it is
-            // still inserted alongside the connection.
             request.extensions_mut().insert(stream_id);
             request.extensions_mut().insert(connection);
             if is_connect
