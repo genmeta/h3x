@@ -26,7 +26,7 @@ use crate::{
 #[repr(transparent)]
 pub struct TowerService<S>(pub S);
 
-impl<S, RespBody> crate::endpoint::server::Service for TowerService<S>
+impl<S, RespBody> crate::endpoint::server::Serve for TowerService<S>
 where
     S: tower_service::Service<
             http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,
@@ -244,7 +244,7 @@ where
 #[repr(transparent)]
 pub struct HyperService<S>(pub S);
 
-impl<S, RespBody> crate::endpoint::server::Service for HyperService<S>
+impl<S, RespBody> crate::endpoint::server::Serve for HyperService<S>
 where
     S: hyper::service::Service<
             http::Request<UnsyncBoxBody<Bytes, MessageStreamError>>,

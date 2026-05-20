@@ -13,7 +13,7 @@ use h3x::{
     },
     endpoint::{
         H3Endpoint,
-        server::{self, Router},
+        server::{self, Service},
     },
     error::Code,
     quic,
@@ -30,7 +30,7 @@ async fn hello_world_service(_: &mut server::Request, response: &mut server::Res
 #[test]
 fn hello_world() {
     run("hello_world", async move {
-        let router = Router::new().get("/hello_world", hello_world_service);
+        let router = Service::new().get("/hello_world", hello_world_service);
         let (mut server, host) = test_server().await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
@@ -74,7 +74,7 @@ async fn streaming_echo_service(request: &mut server::Request, response: &mut se
 #[test]
 fn streaming_echo() {
     run("streaming_echo", async move {
-        let router = Router::new().post("/echo", streaming_echo_service);
+        let router = Service::new().post("/echo", streaming_echo_service);
         let (mut server, host) = test_server().await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
@@ -107,7 +107,7 @@ fn streaming_echo() {
 #[test]
 fn response_sends_request_headers() {
     run("response_sends_request_headers", async move {
-        let router = Router::new().post("/echo", streaming_echo_service);
+        let router = Service::new().post("/echo", streaming_echo_service);
         let (mut server, host) = test_server().await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
@@ -138,7 +138,7 @@ fn response_sends_request_headers() {
 #[test]
 fn fallback() {
     run("fallback", async move {
-        let router = Router::new()
+        let router = Service::new()
             .get("/hello_world", hello_world_service)
             .post("/hello_world", hello_world_service);
         let (mut server, host) = test_server().await;
@@ -170,7 +170,7 @@ async fn echo_service(request: &mut server::Request, response: &mut server::Resp
 #[test]
 fn auto_close() {
     run("auto_close", async move {
-        let router = Router::new().post("/echo", echo_service);
+        let router = Service::new().post("/echo", echo_service);
         let (mut server, host) = test_server().await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
@@ -198,7 +198,7 @@ fn auto_close() {
 #[test]
 fn set_body_auto_close() {
     run("set_body_auto_close", async move {
-        let router = Router::new().post("/echo", echo_service);
+        let router = Service::new().post("/echo", echo_service);
         let (mut server, host) = test_server().await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));
@@ -273,7 +273,7 @@ fn missing_server_name_closes_connection_with_no_error() {
                 .expect("valid authority");
 
             let _serve = AbortOnDropHandle::new(tokio::spawn(async move {
-                let _ = server.serve(Router::new()).await;
+                let _ = server.serve(Service::new()).await;
             }));
 
             // Use FixedResolver to bypass system DNS and directly target the server port
@@ -399,7 +399,7 @@ fn connection_refused() {
 #[ignore = "requires a real unresponsive server; QUIC-in-memory transport completes too fast"]
 fn request_timeout() {
     run("request_timeout", async move {
-        let router = Router::new().get("/hello_world", hello_world_service);
+        let router = Service::new().get("/hello_world", hello_world_service);
         let (mut server, host) = test_server().await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));

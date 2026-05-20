@@ -82,7 +82,7 @@ async fn interim_response_service(_request: &mut server::Request, response: &mut
 #[test]
 fn interim_response() {
     run("interim_response", async move {
-        let router = server::Router::new().get("/ultimate_answer", interim_response_service);
+        let router = server::Service::new().get("/ultimate_answer", interim_response_service);
         let (mut server, host) = test_server().await;
         let _serve =
             AbortOnDropHandle::new(tokio::spawn(async move { server.serve(router).await }));

@@ -8,7 +8,7 @@ use futures::future::BoxFuture;
 use http::{Method, StatusCode};
 
 use crate::endpoint::server::{
-    BoxService, BoxServiceFuture, IntoBoxService, MessageStreamError, Request, Response, Service,
+    BoxService, BoxServiceFuture, IntoBoxService, MessageStreamError, Request, Response, Serve,
     UnresolvedRequest, box_service,
 };
 
@@ -31,7 +31,7 @@ impl Fallback {
     }
 }
 
-impl Service for Fallback {
+impl Serve for Fallback {
     type Future<'s> = BoxServiceFuture<'s>;
 
     fn serve<'s>(&self, request: &'s mut Request, response: &'s mut Response) -> Self::Future<'s> {
@@ -89,7 +89,7 @@ impl RouterInner {
     }
 }
 
-impl Service for RouterInner {
+impl Serve for RouterInner {
     type Future<'s> = BoxServiceFuture<'s>;
 
     fn serve<'s>(
@@ -113,11 +113,11 @@ impl Service for RouterInner {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct Router {
+pub struct Service {
     inner: Arc<RouterInner>,
 }
 
-impl Router {
+impl Service {
     pub fn new() -> Self {
         Self::default()
     }
@@ -184,7 +184,7 @@ impl Router {
 
     #[tracing::instrument(skip(self, req), fields(method = tracing::field::Empty, uri = tracing::field::Empty))]
     pub async fn handle(&self, req: UnresolvedRequest) -> Result<(), MessageStreamError> {
-        let (mut request, mut response) = req.resolve().await?;
+        let (mut request, mut response) = crate::endpoint::server::read_request_header(req).await?;
 
         tracing::Span::current()
             .record("method", request.method().as_str())
@@ -202,15 +202,15 @@ impl Router {
     }
 }
 
-impl Service for Router {
+impl Serve for Service {
     type Future<'s> = BoxServiceFuture<'s>;
 
     fn serve<'s>(&self, request: &'s mut Request, response: &'s mut Response) -> Self::Future<'s> {
-        Router::serve(self, request, response)
+        Service::serve(self, request, response)
     }
 }
 
-impl tower_service::Service<UnresolvedRequest> for Router {
+impl tower_service::Service<UnresolvedRequest> for Service {
     type Response = ();
 
     type Error = MessageStreamError;
@@ -223,8 +223,8 @@ impl tower_service::Service<UnresolvedRequest> for Router {
     }
 
     fn call(&mut self, req: UnresolvedRequest) -> Self::Future {
-        let router = self.clone();
-        Box::pin(async move { router.handle(req).await })
+        let service = self.clone();
+        Box::pin(async move { service.handle(req).await })
     }
 }
 
@@ -313,9 +313,9 @@ impl<S> MethodRouter<S> {
     }
 }
 
-impl<S> Service for MethodRouter<S>
+impl<S> Serve for MethodRouter<S>
 where
-    S: Clone + for<'s> Service<Future<'s>: Send> + Send + 'static,
+    S: Clone + for<'s> Serve<Future<'s>: Send> + Send + 'static,
 {
     type Future<'s> = BoxServiceFuture<'s>;
 
@@ -431,12 +431,12 @@ mod tests {
 
     #[test]
     fn router_builder_chain() {
-        use super::Router;
+        use super::Service;
 
         async fn dummy(_req: &mut super::Request, _resp: &mut super::Response) {}
 
         // Just test that the builder pattern compiles and doesn't panic
-        let _router = Router::new()
+        let _service = Service::new()
             .route("/exact", dummy)
             .get("/api/users", dummy)
             .post("/api/users", dummy)

@@ -280,7 +280,7 @@ where
     async fn read_response(&self) -> Result<Response, RequestError<Q::Error>> {
         let mut stream = self.take_read_stream().await?;
         let mut message = Message::unresolved_response();
-        stream.read_message_header(&mut message).await?;
+        message.read_header(&mut stream).await?;
 
         let agent = stream.connection().remote_agent().await?.expect(
             "remote agent should be present(should be guaranteed by h3 connection establishment)",
@@ -301,7 +301,7 @@ where
         loop {
             let flow = {
                 let mut message = self.message();
-                write_stream.send_message_step(&mut message, goal)
+                message.write_step(&mut write_stream, goal)
             }
             .await;
 
@@ -330,7 +330,7 @@ where
 
         let result = {
             let mut message = self.message();
-            write_stream.send_message_streaming_body(&mut message, content)
+            message.write_body_chunk(&mut write_stream, content)
         }
         .await;
         if result.is_err() {
@@ -363,9 +363,7 @@ where
         self.close_request().await?;
         let mut read_stream = self.take_read_stream().await?;
         let mut response_message = Message::unresolved_response();
-        read_stream
-            .read_message_header(&mut response_message)
-            .await?;
+        response_message.read_header(&mut read_stream).await?;
 
         let agent = read_stream.connection().remote_agent().await?.expect(
             "remote agent should be present(should be guaranteed by h3 connection establishment)",
@@ -598,7 +596,7 @@ pub struct Response {
 
 impl Response {
     pub async fn next_response(&mut self) -> Result<&mut Self, MessageStreamError> {
-        self.stream.read_message_header(&mut self.message).await?;
+        self.message.read_header(&mut self.stream).await?;
         Ok(self)
     }
 
@@ -615,23 +613,19 @@ impl Response {
     }
 
     pub async fn read(&mut self) -> Option<Result<Bytes, MessageStreamError>> {
-        self.stream.read_message(&mut self.message).await
+        self.message.read(&mut self.stream).await
     }
 
     pub async fn read_all(&mut self) -> Result<impl Buf, MessageStreamError> {
-        self.stream.read_message_full_body(&mut self.message).await
+        self.message.read_full_body(&mut self.stream).await
     }
 
     pub async fn read_to_bytes(&mut self) -> Result<Bytes, MessageStreamError> {
-        self.stream
-            .read_message_body_to_bytes(&mut self.message)
-            .await
+        self.message.read_to_bytes(&mut self.stream).await
     }
 
     pub async fn read_to_string(&mut self) -> Result<String, ReadToStringError> {
-        self.stream
-            .read_message_body_to_string(&mut self.message)
-            .await
+        self.message.read_to_string(&mut self.stream).await
     }
 
     pub async fn as_stream(&mut self) -> impl Stream<Item = Result<Bytes, MessageStreamError>> {
@@ -649,7 +643,7 @@ impl Response {
     }
 
     pub async fn trailers(&mut self) -> Result<&HeaderMap, MessageStreamError> {
-        self.stream.read_message_trailer(&mut self.message).await
+        self.message.read_trailers(&mut self.stream).await
     }
 
     pub async fn stop(&mut self, code: Code) -> Result<(), MessageStreamError> {

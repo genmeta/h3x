@@ -894,6 +894,102 @@ impl WriteStream {
     }
 }
 
+impl Message {
+    pub async fn read_header<'e>(
+        &'e mut self,
+        stream: &mut ReadStream,
+    ) -> Result<&'e FieldSection, MessageStreamError> {
+        stream.read_message_header(self).await
+    }
+
+    pub async fn read_body_chunk(
+        &mut self,
+        stream: &mut ReadStream,
+    ) -> Option<Result<Bytes, MessageStreamError>> {
+        stream.read_message_body_chunk(self).await
+    }
+
+    pub async fn read_full_body<'e>(
+        &'e mut self,
+        stream: &mut ReadStream,
+    ) -> Result<impl Buf + 'e, MessageStreamError> {
+        stream.read_message_full_body(self).await
+    }
+
+    pub async fn read_to_bytes(
+        &mut self,
+        stream: &mut ReadStream,
+    ) -> Result<Bytes, MessageStreamError> {
+        stream.read_message_body_to_bytes(self).await
+    }
+
+    pub async fn read_to_string(
+        &mut self,
+        stream: &mut ReadStream,
+    ) -> Result<String, ReadToStringError> {
+        stream.read_message_body_to_string(self).await
+    }
+
+    pub async fn read(
+        &mut self,
+        stream: &mut ReadStream,
+    ) -> Option<Result<Bytes, MessageStreamError>> {
+        stream.read_message(self).await
+    }
+
+    pub async fn read_trailers<'e>(
+        &'e mut self,
+        stream: &mut ReadStream,
+    ) -> Result<&'e HeaderMap, MessageStreamError> {
+        stream.read_message_trailer(self).await
+    }
+
+    pub fn write_step<'s>(
+        &mut self,
+        stream: &'s mut WriteStream,
+        goal: MessageWriteGoal,
+    ) -> impl Future<Output = MessageWriteFlow> + use<'s> {
+        stream.send_message_step(self, goal)
+    }
+
+    pub fn write_body_chunk<'s, B>(
+        &mut self,
+        stream: &'s mut WriteStream,
+        content: B,
+    ) -> impl Future<Output = Result<(), MessageStreamError>> + use<'s, B>
+    where
+        B: Buf + Send + 's,
+    {
+        stream.send_message_streaming_body(self, content)
+    }
+
+    pub async fn write_chunked_body(
+        &mut self,
+        stream: &mut WriteStream,
+    ) -> Result<(), MessageStreamError> {
+        stream.send_message_chunked_body(self).await
+    }
+
+    pub async fn write_trailers(
+        &mut self,
+        stream: &mut WriteStream,
+    ) -> Result<(), MessageStreamError> {
+        stream.send_message_trailer(self).await
+    }
+
+    pub async fn write_all(&mut self, stream: &mut WriteStream) -> Result<(), MessageStreamError> {
+        stream.send_message(self).await
+    }
+
+    pub async fn flush(&mut self, stream: &mut WriteStream) -> Result<(), MessageStreamError> {
+        stream.flush_message(self).await
+    }
+
+    pub async fn close(&mut self, stream: &mut WriteStream) -> Result<(), MessageStreamError> {
+        stream.close_message(self).await
+    }
+}
+
 enum MessageWriteStepAction {
     BreakOk,
     Cancel,
@@ -1070,7 +1166,7 @@ mod tests {
         let mut stream = crate::message::test::write_stream_for_test(VarInt::from_u32(0));
         let mut message = Message::unresolved_request();
 
-        let send = stream.send_message_step(&mut message, MessageWriteGoal::Header);
+        let send = message.write_step(&mut stream, MessageWriteGoal::Header);
 
         assert_eq!(message.stage(), MessageStage::Body);
         assert!(matches!(send.await, ControlFlow::Break(Ok(()))));
@@ -1113,7 +1209,7 @@ mod tests {
             .set_body(Bytes::from_static(b"abc"))
             .expect("set body");
 
-        let send = stream.send_message_step(&mut message, MessageWriteGoal::Header);
+        let send = message.write_step(&mut stream, MessageWriteGoal::Header);
 
         assert_eq!(message.stage(), MessageStage::Body);
         assert!(matches!(send.await, ControlFlow::Break(Ok(()))));
@@ -1127,8 +1223,8 @@ mod tests {
             .set_body(Bytes::from_static(b"abc"))
             .expect("set body");
 
-        let flow = stream
-            .send_message_step(&mut message, MessageWriteGoal::Body)
+        let flow = message
+            .write_step(&mut stream, MessageWriteGoal::Body)
             .await;
 
         assert!(matches!(flow, ControlFlow::Continue(())));

@@ -5,6 +5,7 @@ use std::{
     net::SocketAddr,
     str::FromStr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use arc_swap::ArcSwapOption;
@@ -419,11 +420,17 @@ impl quic::Connect for QuicEndpoint {
             .context(TlsSnafu)?;
 
         // Two legs driving path establishment:
-        //   1. DNS results  → add_peer_endpoint
-        //   2. local ifaces → add compatible local paths (via observer)
+        //   1. DNS results      → add peer endpoints
+        //   2. Locations events → add local endpoints
+        //
+        // Locations replays the current bound addresses when a subscriber is
+        // registered, so connect does not scan bound interfaces and synthesize
+        // local addresses on its own.
         let mut observer = self.network.locations().subscribe();
         let bind = self.bind.clone();
         let peers = Arc::new(Mutex::new(Vec::new()));
+        let connect_timeout = tokio::time::sleep(self.connect_path_timeout());
+        tokio::pin!(connect_timeout);
 
         loop {
             tokio::select! {
@@ -431,10 +438,22 @@ impl quic::Connect for QuicEndpoint {
                 _ = connection.terminated() => {
                     return Err(ConnectError::NoReachableEndpoint);
                 }
+                _ = &mut connect_timeout => {
+                    connection
+                        .validate()
+                        .map_err(|_| ConnectError::NoReachableEndpoint)?;
+                    Self::spawn_path_discovery_companion(
+                        self.network.clone(),
+                        bind.clone(),
+                        peers.clone(),
+                        connection.clone(),
+                        server_eps,
+                        observer,
+                    );
+                    return Ok(connection);
+                }
                 Some((source, server_ep)) = server_eps.next() => {
                     Self::add_resolved_peer_endpoint(
-                        &self.network,
-                        self.bind.as_ref(),
                         &connection,
                         &peers,
                         source,
@@ -457,70 +476,26 @@ impl quic::Connect for QuicEndpoint {
                 }
             }
 
-            match connection.path_context() {
-                Ok(ctx) if !ctx.paths::<Vec<_>>().is_empty() => {
+            match Self::connection_has_paths(&connection) {
+                Ok(true) => {
                     // Resolver streams often contain a batch of equivalent endpoints
                     // that are ready immediately (for example STUN-agent and
                     // same-link direct records). Install the ready batch before
                     // returning so the handshake starts with all current path
                     // candidates instead of whichever record happened to arrive first.
-                    Self::drain_ready_peer_endpoints(
-                        &self.network,
-                        self.bind.as_ref(),
-                        &connection,
-                        &peers,
-                        &mut server_eps,
-                    );
-                    let weak = Arc::downgrade(&connection);
-                    let network = self.network.clone();
-                    let peers = peers.clone();
-                    // Inherent termination: this path-discovery companion
-                    // drains remaining DNS results and local address events
-                    // after the first path is established. It exits when
-                    // (a) connection is dropped (weak.upgrade fails),
-                    // (b) connection terminates, or (c) both DNS and
-                    // observer streams are exhausted.
-                    tokio::spawn(
-                        async move {
-                            loop {
-                                let Some(c) = weak.upgrade() else { break };
-                                tokio::select! {
-                                    biased;
-                                    _ = c.terminated() => break,
-                                    Some((s, e)) = server_eps.next() => {
-                                        let Some(c) = weak.upgrade() else { break };
-                                        Self::add_resolved_peer_endpoint(
-                                            &network,
-                                            bind.as_ref(),
-                                            &c,
-                                            &peers,
-                                            s,
-                                            e,
-                                        );
-                                    }
-                                    Some((uri, e)) = observer.recv() => {
-                                        let Some(c) = weak.upgrade() else { break };
-                                        if bind.iter().any(|p| p.matches(&uri)) {
-                                            let peers = peers.lock().expect("peers mutex poisoned").clone();
-                                            Self::handle_local_addr_event_for_peers(
-                                                &network,
-                                                bind.as_ref(),
-                                                &c,
-                                                uri,
-                                                e,
-                                                &peers,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        .in_current_span(),
+                    Self::drain_ready_peer_endpoints(&connection, &peers, &mut server_eps);
+                    Self::spawn_path_discovery_companion(
+                        self.network.clone(),
+                        bind.clone(),
+                        peers.clone(),
+                        connection.clone(),
+                        server_eps,
+                        observer,
                     );
                     return Ok(connection);
                 }
+                Ok(false) => {} // no paths yet — continue loop
                 Err(_) => return Err(ConnectError::NoReachableEndpoint),
-                _ => {} // no paths yet — continue loop
             }
         }
     }
@@ -653,22 +628,94 @@ impl<'a> Drop for IdentityMutGuard<'a> {
 }
 
 impl QuicEndpoint {
+    fn connect_path_timeout(&self) -> Duration {
+        self.client
+            .parameters
+            .get::<Duration>(crate::dquic::qbase::param::ParameterId::MaxIdleTimeout)
+            .filter(|timeout| !timeout.is_zero())
+            .unwrap_or(Duration::from_secs(20))
+    }
+
+    fn connection_has_paths(
+        connection: &Connection,
+    ) -> Result<bool, crate::dquic::qbase::error::Error> {
+        connection
+            .path_context()
+            .map(|ctx| !ctx.paths::<Vec<_>>().is_empty())
+    }
+
+    fn spawn_path_discovery_companion<S>(
+        network: Arc<Network>,
+        bind: Arc<Vec<BindPattern>>,
+        peers: Arc<Mutex<Vec<EndpointAddr>>>,
+        connection: Arc<Connection>,
+        mut server_eps: S,
+        mut observer: crate::dquic::qinterface::component::location::Observer,
+    ) where
+        S: Stream<Item = (Source, EndpointAddr)> + Unpin + Send + 'static,
+    {
+        let weak = Arc::downgrade(&connection);
+        // Inherent termination: this path-discovery companion drains remaining
+        // DNS results and local address events after connect has established
+        // that the connection will not leak. It exits when (a) connection is
+        // dropped (weak.upgrade fails), (b) connection terminates, or (c) both
+        // DNS and observer streams are exhausted.
+        tokio::spawn(
+            async move {
+                let mut dns_done = false;
+                let mut locations_done = false;
+                loop {
+                    if dns_done && locations_done {
+                        break;
+                    }
+                    let Some(c) = weak.upgrade() else { break };
+                    tokio::select! {
+                        biased;
+                        _ = c.terminated() => break,
+                        result = server_eps.next(), if !dns_done => {
+                            let Some((s, e)) = result else {
+                                dns_done = true;
+                                continue;
+                            };
+                            let Some(c) = weak.upgrade() else { break };
+                            Self::add_resolved_peer_endpoint(&c, &peers, s, e);
+                        }
+                        result = observer.recv(), if !locations_done => {
+                            let Some((uri, e)) = result else {
+                                locations_done = true;
+                                continue;
+                            };
+                            let Some(c) = weak.upgrade() else { break };
+                            if bind.iter().any(|p| p.matches(&uri)) {
+                                let peers = peers.lock().expect("peers mutex poisoned").clone();
+                                Self::handle_local_addr_event_for_peers(
+                                    &network,
+                                    bind.as_ref(),
+                                    &c,
+                                    uri,
+                                    e,
+                                    &peers,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            .in_current_span(),
+        );
+    }
+
     fn add_resolved_peer_endpoint(
-        network: &Network,
-        bind: &[BindPattern],
         connection: &Connection,
         peers: &Arc<Mutex<Vec<EndpointAddr>>>,
         source: Source,
         server_ep: EndpointAddr,
     ) {
         peers.lock().expect("peers mutex poisoned").push(server_ep);
-        Self::add_current_local_endpoints_for_peer_on(network, bind, connection, server_ep);
         let _ = connection.add_peer_endpoint(server_ep, source);
     }
 
     fn drain_ready_peer_endpoints<S>(
-        network: &Network,
-        bind: &[BindPattern],
         connection: &Connection,
         peers: &Arc<Mutex<Vec<EndpointAddr>>>,
         server_eps: &mut S,
@@ -676,145 +723,7 @@ impl QuicEndpoint {
         S: Stream<Item = (Source, EndpointAddr)> + Unpin,
     {
         while let Some(Some((source, server_ep))) = server_eps.next().now_or_never() {
-            Self::add_resolved_peer_endpoint(network, bind, connection, peers, source, server_ep);
-        }
-    }
-
-    fn add_current_local_endpoints_for_peer_on(
-        network: &Network,
-        bind: &[BindPattern],
-        connection: &Connection,
-        peer: EndpointAddr,
-    ) {
-        use crate::dquic::{net::IO as _, qtraversal::nat::client::StunClientsComponent};
-
-        let remote_addr = *peer;
-        let mut candidates = Vec::new();
-        for pattern in bind {
-            let Some(ifaces) = network.get_interfaces(pattern) else {
-                continue;
-            };
-
-            for iface in ifaces {
-                let bind_uri = iface.bind_uri();
-                let bound_addr = match iface.borrow().bound_addr() {
-                    Ok(bound_addr) => bound_addr,
-                    Err(error) => {
-                        tracing::trace!(
-                            %bind_uri,
-                            error = %Report::from_error(&error),
-                            "skipping local endpoint without bound address"
-                        );
-                        continue;
-                    }
-                };
-                let Some(preference) =
-                    network.local_endpoint_preference(&bind_uri, bound_addr, remote_addr)
-                else {
-                    continue;
-                };
-                candidates.push((preference, bind_uri, EndpointAddr::direct(bound_addr)));
-            }
-        }
-
-        let Some(best_preference) = candidates.iter().map(|(preference, ..)| *preference).min()
-        else {
-            return;
-        };
-
-        for (preference, bind_uri, endpoint) in candidates {
-            if preference != best_preference {
-                continue;
-            }
-            if let Err(error) = connection.add_local_endpoint(bind_uri, endpoint) {
-                tracing::trace!(
-                    error = %Report::from_error(&error),
-                    "failed to add current local endpoint"
-                );
-            }
-        }
-
-        let EndpointAddr::Agent {
-            agent: peer_agent,
-            outer: peer_outer,
-        } = peer
-        else {
-            return;
-        };
-
-        let best_preference = Self::best_current_local_preference(network, bind, remote_addr);
-        for pattern in bind {
-            let Some(ifaces) = network.get_interfaces(pattern) else {
-                continue;
-            };
-
-            for iface in ifaces {
-                let bind_uri = iface.bind_uri();
-                let Some((bound_addr, endpoints, owns_peer_agent)) =
-                    iface.with_components(|components, current| {
-                        let bound_addr = match current.bound_addr() {
-                            Ok(bound_addr) => bound_addr,
-                            Err(error) => {
-                                tracing::trace!(
-                                    %bind_uri,
-                                    error = %Report::from_error(&error),
-                                    "skipping stun local endpoint without bound address"
-                                );
-                                return None;
-                            }
-                        };
-                        if network.local_endpoint_preference(&bind_uri, bound_addr, remote_addr)
-                            != best_preference
-                        {
-                            return None;
-                        }
-
-                        let mut owns_peer_agent = false;
-                        let endpoints = components
-                            .get::<StunClientsComponent>()
-                            .map(|stun| {
-                                stun.with_clients(|clients| {
-                                    clients
-                                        .values()
-                                        .filter_map(|client| {
-                                            let outer = client.get_outer_addr()?.ok()?;
-                                            owns_peer_agent |= client.agent_addr() == peer_agent
-                                                && outer == peer_outer;
-                                            Some(EndpointAddr::with_agent(
-                                                client.agent_addr(),
-                                                outer,
-                                            ))
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
-                            })
-                            .unwrap_or_default();
-
-                        Some((bound_addr, endpoints, owns_peer_agent))
-                    })
-                else {
-                    continue;
-                };
-
-                if owns_peer_agent {
-                    // A DNS record can legitimately point back at this endpoint's
-                    // own STUN agent address. Hairpinning through the agent is
-                    // not a valid route in that case, and publishing private
-                    // bound addresses in global DNS would make other NAT peers
-                    // choose unreachable direct paths. Use the current binding
-                    // only as an in-process self-connect path.
-                    Self::add_local_path_for_peer(
-                        connection,
-                        bind_uri.clone(),
-                        bound_addr,
-                        EndpointAddr::direct(bound_addr),
-                    );
-                }
-
-                for endpoint in endpoints {
-                    Self::add_local_endpoint_for_peer(connection, bind_uri.clone(), endpoint);
-                }
-            }
+            Self::add_resolved_peer_endpoint(connection, peers, source, server_ep);
         }
     }
 
@@ -946,7 +855,21 @@ impl QuicEndpoint {
                         let best_preference =
                             Self::best_current_local_preference(network, bind, **peer);
                         if preference.is_some() && preference == best_preference {
-                            Self::add_local_endpoint_for_peer(conn, bind_uri.clone(), endpoint);
+                            if endpoint == *peer {
+                                // A DNS record can legitimately point back at
+                                // this endpoint's own STUN agent address. Use
+                                // the current binding as an in-process
+                                // self-connect path without synthesizing
+                                // addresses from the interface table.
+                                Self::add_local_path_for_peer(
+                                    conn,
+                                    bind_uri.clone(),
+                                    bound_addr,
+                                    EndpointAddr::direct(bound_addr),
+                                );
+                            } else {
+                                Self::add_local_endpoint_for_peer(conn, bind_uri.clone(), endpoint);
+                            }
                         }
                     }
                     return;

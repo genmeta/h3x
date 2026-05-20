@@ -1521,7 +1521,7 @@ mod tests {
         },
         endpoint::{
             H3Endpoint,
-            server::{Request, Response, Router},
+            server::{Request, Response, Service},
         },
     };
 
@@ -1585,8 +1585,8 @@ mod tests {
         // `ServerQuicConfig::default()` yields fresh trait objects each
         // call and `server_config_compatible` rejects the second bind.
         let shared_server_config = ServerQuicConfig::default();
-        let alpha_router = Router::new().get("/hello", alpha_service);
-        let beta_router = Router::new().get("/hello", beta_service);
+        let alpha_router = Service::new().get("/hello", alpha_service);
+        let beta_router = Service::new().get("/hello", beta_service);
         for (name, router) in [("alpha", alpha_router), ("beta", beta_router)] {
             let named = make_identity(name);
             // Eagerly register so rustls' SniCertResolver sees both SNIs

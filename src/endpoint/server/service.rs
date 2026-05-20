@@ -4,7 +4,7 @@ use futures::future::BoxFuture;
 
 use crate::endpoint::server::{Request, Response};
 
-pub trait Service {
+pub trait Serve {
     type Future<'s>: Future<Output = ()>;
 
     fn serve<'s>(&self, request: &'s mut Request, response: &'s mut Response) -> Self::Future<'s>;
@@ -29,7 +29,7 @@ where
     }
 }
 
-impl<S> Service for S
+impl<S> Serve for S
 where
     S: for<'s> ServiceFn<'s>,
 {
@@ -46,7 +46,7 @@ trait CloneableService: Any {
     fn clone_box(&self) -> Box<dyn CloneableService + Send + Sync>;
 }
 
-impl<H: for<'s> Service<Future<'s>: Send> + Any + Clone + Send + Sync> CloneableService for H {
+impl<H: for<'s> Serve<Future<'s>: Send> + Any + Clone + Send + Sync> CloneableService for H {
     fn serve<'s>(&self, request: &'s mut Request, response: &'s mut Response) -> BoxFuture<'s, ()> {
         Box::pin(self.serve(request, response))
     }
@@ -56,15 +56,13 @@ impl<H: for<'s> Service<Future<'s>: Send> + Any + Clone + Send + Sync> Cloneable
     }
 }
 
-pub trait IntoBoxService:
-    for<'s> Service<Future<'s>: Send> + Clone + Send + Sync + 'static
-{
+pub trait IntoBoxService: for<'s> Serve<Future<'s>: Send> + Clone + Send + Sync + 'static {
     fn into_box_service(self) -> BoxService {
         BoxService(Box::new(self))
     }
 }
 
-impl<S: for<'s> Service<Future<'s>: Send> + Clone + Send + Sync + 'static> IntoBoxService for S {}
+impl<S: for<'s> Serve<Future<'s>: Send> + Clone + Send + Sync + 'static> IntoBoxService for S {}
 
 pub type BoxServiceFuture<'s> = BoxFuture<'s, ()>;
 type DynService = dyn CloneableService + Send + Sync;
@@ -96,7 +94,7 @@ impl BoxService {
     }
 }
 
-impl Service for BoxService {
+impl Serve for BoxService {
     type Future<'s> = BoxServiceFuture<'s>;
 
     fn serve<'s>(&self, request: &'s mut Request, response: &'s mut Response) -> Self::Future<'s> {

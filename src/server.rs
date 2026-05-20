@@ -9,7 +9,7 @@ use tracing::Instrument;
 
 pub use crate::endpoint::server::{
     BoxService, BoxServiceFuture, IntoBoxService, MessageStreamError, MethodRouter, ReadStream,
-    ReadToStringError, Request, Response, Router, ServersRouter, ServersRouterDispatchError,
+    ReadToStringError, Request, Response, Serve, ServersRouter, ServersRouterDispatchError,
     Service, UnresolvedRequest, WriteStream, box_service,
 };
 use crate::{

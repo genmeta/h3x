@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
 use dhttp_identity::identity as agent;
-use futures::{Sink, Stream, StreamExt, future::BoxFuture};
+use futures::{Sink, Stream, StreamExt};
 use http::{
     HeaderMap, HeaderValue, Method, Uri,
     header::{AsHeaderName, IntoHeaderName},
@@ -28,16 +28,13 @@ use crate::{
 /// header frame has not yet been read.
 ///
 /// All per-connection context (local/remote agents, protocol registry) is
-/// reachable through [`Self::connection`] — [`resolve`](Self::resolve)
-/// awaits those accessors once and hands back an eagerly-populated
-/// [`Request`]/[`Response`] pair.
+/// reachable through [`Self::connection`].
 pub struct UnresolvedRequest {
     /// QUIC stream identifier for this request.
     pub stream_id: StreamId,
-    /// Incoming request stream — read by [`resolve`](Self::resolve) to pull
-    /// the HTTP/3 header frame.
+    /// Incoming request stream.
     pub read_stream: ReadStream,
-    /// Outgoing response stream — handed to the [`Response`] on resolve.
+    /// Outgoing response stream.
     pub write_stream: WriteStream,
     /// Owning h3 connection. Type-erased so the request-handling pipeline
     /// stays independent of the concrete QUIC implementation; all accessors
@@ -46,53 +43,40 @@ pub struct UnresolvedRequest {
     pub connection: Arc<ConnectionState<dyn quic::DynConnection>>,
 }
 
-impl UnresolvedRequest {
-    pub async fn resolve(self) -> Result<(Request, Response), MessageStreamError> {
-        let UnresolvedRequest {
-            stream_id,
-            read_stream,
-            write_stream,
-            connection,
-        } = self;
-        // Agents are backed by a watch channel — fetching them per-request
-        // is effectively a clone once the handshake has completed.
-        let local_agent = connection
-            .local_agent()
-            .await?
-            .expect("server connection must have a local agent (SNI)");
-        let remote_agent = connection.remote_agent().await?;
-        let protocols = connection.protocols().clone();
+pub(crate) async fn read_request_header(
+    request: UnresolvedRequest,
+) -> Result<(Request, Response), MessageStreamError> {
+    let UnresolvedRequest {
+        stream_id,
+        read_stream,
+        write_stream,
+        connection,
+    } = request;
+    // Agents are backed by a watch channel — fetching them per-request
+    // is effectively a clone once the handshake has completed.
+    let local_agent = connection
+        .local_agent()
+        .await?
+        .expect("server connection must have a local agent (SNI)");
+    let remote_agent = connection.remote_agent().await?;
+    let protocols = connection.protocols().clone();
 
-        let mut request = Request {
-            message: Message::unresolved_request(),
-            stream: read_stream,
-            agent: remote_agent,
-            stream_id,
-            protocols: protocols.clone(),
-        };
-        request
-            .stream
-            .read_message_header(&mut request.message)
-            .await?;
-        let response = Response {
-            message: Message::unresolved_response(),
-            stream: write_stream,
-            agent: local_agent,
-            stream_id,
-            protocols,
-        };
-        Ok((request, response))
-    }
-}
-
-impl IntoFuture for UnresolvedRequest {
-    type Output = Result<(Request, Response), MessageStreamError>;
-
-    type IntoFuture = BoxFuture<'static, Self::Output>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(self.resolve())
-    }
+    let mut request = Request {
+        message: Message::unresolved_request(),
+        stream: read_stream,
+        agent: remote_agent,
+        stream_id,
+        protocols: protocols.clone(),
+    };
+    request.message.read_header(&mut request.stream).await?;
+    let response = Response {
+        message: Message::unresolved_response(),
+        stream: write_stream,
+        agent: local_agent,
+        stream_id,
+        protocols,
+    };
+    Ok((request, response))
 }
 
 pub struct Request {
@@ -137,23 +121,19 @@ impl Request {
     }
 
     pub async fn read(&mut self) -> Option<Result<Bytes, MessageStreamError>> {
-        self.stream.read_message(&mut self.message).await
+        self.message.read(&mut self.stream).await
     }
 
     pub async fn read_all(&mut self) -> Result<impl Buf, MessageStreamError> {
-        self.stream.read_message_full_body(&mut self.message).await
+        self.message.read_full_body(&mut self.stream).await
     }
 
     pub async fn read_to_bytes(&mut self) -> Result<Bytes, MessageStreamError> {
-        self.stream
-            .read_message_body_to_bytes(&mut self.message)
-            .await
+        self.message.read_to_bytes(&mut self.stream).await
     }
 
     pub async fn read_to_string(&mut self) -> Result<String, ReadToStringError> {
-        self.stream
-            .read_message_body_to_string(&mut self.message)
-            .await
+        self.message.read_to_string(&mut self.stream).await
     }
 
     pub async fn as_stream(&mut self) -> impl Stream<Item = Result<Bytes, MessageStreamError>> {
@@ -171,7 +151,7 @@ impl Request {
     }
 
     pub async fn trailers(&mut self) -> Result<&HeaderMap, MessageStreamError> {
-        self.stream.read_message_trailer(&mut self.message).await
+        self.message.read_trailers(&mut self.stream).await
     }
 
     pub async fn stop(&mut self, code: Code) -> Result<(), MessageStreamError> {
@@ -303,8 +283,8 @@ impl Response {
             this.message.streaming_body()?;
             Ok(())
         });
-        self.stream
-            .send_message_streaming_body(&mut self.message, content)
+        self.message
+            .write_body_chunk(&mut self.stream, content)
             .await?;
         Ok(self)
     }
@@ -316,7 +296,7 @@ impl Response {
             }
             Ok(())
         });
-        self.stream.flush_message(&mut self.message).await?;
+        self.message.flush(&mut self.stream).await?;
         Ok(self)
     }
 
@@ -391,7 +371,7 @@ impl Response {
             }
             Ok(())
         });
-        self.stream.close_message(&mut self.message).await
+        self.message.close(&mut self.stream).await
     }
 
     pub async fn cancel(&mut self, code: Code) -> Result<(), MessageStreamError> {
@@ -465,7 +445,7 @@ impl Response {
         }
 
         Some(async move {
-            _ = stream.close_message(&mut message).await;
+            _ = message.close(&mut stream).await;
         })
     }
 }
@@ -508,13 +488,13 @@ mod tests {
         let mut response = test_response();
         response.message.set_body(&b""[..]).expect("set body");
         let header = response
-            .stream
-            .send_message_step(&mut response.message, MessageWriteGoal::Header)
+            .message
+            .write_step(&mut response.stream, MessageWriteGoal::Header)
             .await;
         assert!(matches!(header, ControlFlow::Break(Ok(()))));
         let body = response
-            .stream
-            .send_message_step(&mut response.message, MessageWriteGoal::Body)
+            .message
+            .write_step(&mut response.stream, MessageWriteGoal::Body)
             .await;
         assert!(matches!(body, ControlFlow::Break(Ok(()))));
         assert_eq!(response.message.stage(), MessageStage::Trailer);

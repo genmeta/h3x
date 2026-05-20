@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 use std::sync::Arc;
 use h3x::{
     dquic::{Identity, Name, QuicEndpoint},
-    endpoint::{H3Endpoint, server::{Request, Response, Router}},
+    endpoint::{H3Endpoint, server::{Request, Response, Service}},
 };
 
 async fn hello(_req: &mut Request, resp: &mut Response) {
@@ -57,8 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build().await,
     );
 
-    let router = Router::new().get("/hello", hello);
-    endpoint.serve(router).await?;
+    let service = Service::new().get("/hello", hello);
+    endpoint.serve(service).await?;
     Ok(())
 }
 ```
