@@ -9,7 +9,7 @@ use std::{
 
 use arc_swap::ArcSwapOption;
 use bon::bon;
-use futures::{StreamExt, future::join_all};
+use futures::{FutureExt, Stream, StreamExt, future::join_all};
 use rustls::ClientConfig;
 use snafu::{Report, ResultExt, Snafu};
 use tracing::Instrument;
@@ -25,7 +25,7 @@ use crate::{
             net::route::{Link, Pathway},
         },
         network::{BindHandle, BindServerError, Network, ServerBinding},
-        resolver::Resolve,
+        resolver::{Resolve, Source},
         server::ServerQuicConfig,
     },
     quic,
@@ -432,9 +432,14 @@ impl quic::Connect for QuicEndpoint {
                     return Err(ConnectError::NoReachableEndpoint);
                 }
                 Some((source, server_ep)) = server_eps.next() => {
-                    peers.lock().expect("peers mutex poisoned").push(server_ep);
-                    self.add_current_local_endpoints_for_peer(&connection, server_ep);
-                    let _ = connection.add_peer_endpoint(server_ep, source);
+                    Self::add_resolved_peer_endpoint(
+                        &self.network,
+                        self.bind.as_ref(),
+                        &connection,
+                        &peers,
+                        source,
+                        server_ep,
+                    );
                 }
                 Some((bind_uri, event)) = observer.recv() => {
                     if !bind.iter().any(|p| p.matches(&bind_uri)) {
@@ -454,6 +459,18 @@ impl quic::Connect for QuicEndpoint {
 
             match connection.path_context() {
                 Ok(ctx) if !ctx.paths::<Vec<_>>().is_empty() => {
+                    // Resolver streams often contain a batch of equivalent endpoints
+                    // that are ready immediately (for example STUN-agent and
+                    // same-link direct records). Install the ready batch before
+                    // returning so the handshake starts with all current path
+                    // candidates instead of whichever record happened to arrive first.
+                    Self::drain_ready_peer_endpoints(
+                        &self.network,
+                        self.bind.as_ref(),
+                        &connection,
+                        &peers,
+                        &mut server_eps,
+                    );
                     let weak = Arc::downgrade(&connection);
                     let network = self.network.clone();
                     let peers = peers.clone();
@@ -472,14 +489,14 @@ impl quic::Connect for QuicEndpoint {
                                     _ = c.terminated() => break,
                                     Some((s, e)) = server_eps.next() => {
                                         let Some(c) = weak.upgrade() else { break };
-                                        peers.lock().expect("peers mutex poisoned").push(e);
-                                        Self::add_current_local_endpoints_for_peer_on(
+                                        Self::add_resolved_peer_endpoint(
                                             &network,
-                                            &bind,
+                                            bind.as_ref(),
                                             &c,
+                                            &peers,
+                                            s,
                                             e,
                                         );
-                                        let _ = c.add_peer_endpoint(e, s);
                                     }
                                     Some((uri, e)) = observer.recv() => {
                                         let Some(c) = weak.upgrade() else { break };
@@ -636,8 +653,31 @@ impl<'a> Drop for IdentityMutGuard<'a> {
 }
 
 impl QuicEndpoint {
-    fn add_current_local_endpoints_for_peer(&self, connection: &Connection, peer: EndpointAddr) {
-        Self::add_current_local_endpoints_for_peer_on(&self.network, &self.bind, connection, peer);
+    fn add_resolved_peer_endpoint(
+        network: &Network,
+        bind: &[BindPattern],
+        connection: &Connection,
+        peers: &Arc<Mutex<Vec<EndpointAddr>>>,
+        source: Source,
+        server_ep: EndpointAddr,
+    ) {
+        peers.lock().expect("peers mutex poisoned").push(server_ep);
+        Self::add_current_local_endpoints_for_peer_on(network, bind, connection, server_ep);
+        let _ = connection.add_peer_endpoint(server_ep, source);
+    }
+
+    fn drain_ready_peer_endpoints<S>(
+        network: &Network,
+        bind: &[BindPattern],
+        connection: &Connection,
+        peers: &Arc<Mutex<Vec<EndpointAddr>>>,
+        server_eps: &mut S,
+    ) where
+        S: Stream<Item = (Source, EndpointAddr)> + Unpin,
+    {
+        while let Some(Some((source, server_ep))) = server_eps.next().now_or_never() {
+            Self::add_resolved_peer_endpoint(network, bind, connection, peers, source, server_ep);
+        }
     }
 
     fn add_current_local_endpoints_for_peer_on(
