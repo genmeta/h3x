@@ -644,7 +644,7 @@ impl QuicEndpoint {
         connection: &Connection,
         peer: EndpointAddr,
     ) {
-        use crate::dquic::net::IO as _;
+        use crate::dquic::{net::IO as _, qtraversal::nat::client::StunClientsComponent};
 
         let remote_addr = *peer;
         let mut candidates = Vec::new();
@@ -689,6 +689,58 @@ impl QuicEndpoint {
                     error = %Report::from_error(&error),
                     "failed to add current local endpoint"
                 );
+            }
+        }
+
+        if !matches!(peer, EndpointAddr::Agent { .. }) {
+            return;
+        }
+
+        for pattern in bind {
+            let Some(ifaces) = network.get_interfaces(pattern) else {
+                continue;
+            };
+
+            for iface in ifaces {
+                let bind_uri = iface.bind_uri();
+                let endpoints = iface.with_components(|components, current| {
+                    let bound_addr = match current.bound_addr() {
+                        Ok(bound_addr) => bound_addr,
+                        Err(error) => {
+                            tracing::trace!(
+                                %bind_uri,
+                                error = %Report::from_error(&error),
+                                "skipping stun local endpoint without bound address"
+                            );
+                            return Vec::new();
+                        }
+                    };
+                    if network
+                        .local_endpoint_preference(&bind_uri, bound_addr, remote_addr)
+                        .is_none()
+                    {
+                        return Vec::new();
+                    }
+
+                    components
+                        .get::<StunClientsComponent>()
+                        .map(|stun| {
+                            stun.with_clients(|clients| {
+                                clients
+                                    .values()
+                                    .filter_map(|client| {
+                                        let outer = client.get_outer_addr()?.ok()?;
+                                        Some(EndpointAddr::with_agent(client.agent_addr(), outer))
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .unwrap_or_default()
+                });
+
+                for endpoint in endpoints {
+                    Self::add_local_endpoint_for_peer(connection, bind_uri.clone(), endpoint);
+                }
             }
         }
     }
