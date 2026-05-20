@@ -403,12 +403,19 @@ impl quic::Connect for QuicEndpoint {
         let full = server.as_str();
         let server_str = full.rsplit_once('@').map_or(full, |(_, host)| host);
 
+        tracing::debug!(server = server_str, "connecting quic endpoint");
         let tls = self.ensure_client().context(TlsSnafu)?;
         let mut server_eps =
             futures::StreamExt::fuse(self.resolver.lookup(server_str).await.context(DnsSnafu)?);
         let connection = self
             .build_client_connection(server_str, tls)
             .context(TlsSnafu)?;
+        tracing::trace!(
+            server = server_str,
+            timeout_ms = self.connect_path_timeout().as_millis(),
+            bind_pattern_count = self.bind.len(),
+            "waiting for quic path"
+        );
 
         // Two legs driving path establishment:
         //   1. DNS results      → add peer endpoints
@@ -441,6 +448,12 @@ impl quic::Connect for QuicEndpoint {
                     return Ok(connection);
                 }
                 Some((source, server_ep)) = server_eps.next() => {
+                    tracing::trace!(
+                        server = server_str,
+                        ?source,
+                        endpoint = ?server_ep,
+                        "resolved peer endpoint"
+                    );
                     Self::add_resolved_peer_endpoint(
                         &connection,
                         source,
@@ -449,8 +462,10 @@ impl quic::Connect for QuicEndpoint {
                 }
                 Some((bind_uri, event)) = observer.recv() => {
                     if !bind.iter().any(|p| p.matches(&bind_uri)) {
+                        tracing::trace!(%bind_uri, "ignoring location event outside bind patterns");
                         continue;
                     }
+                    tracing::trace!(%bind_uri, "handling location event for connect");
                     Self::handle_local_addr_event(&connection, bind_uri, event);
                 }
             }
@@ -469,6 +484,7 @@ impl quic::Connect for QuicEndpoint {
                         server_eps,
                         observer,
                     );
+                    tracing::debug!(server = server_str, "quic endpoint has at least one path");
                     return Ok(connection);
                 }
                 Ok(false) => {} // no paths yet — continue loop
@@ -727,9 +743,15 @@ impl QuicEndpoint {
         let event = match event.downcast::<std::io::Result<SocketAddr>>() {
             Ok(AddressEvent::Upsert(data)) => {
                 let Ok(addr) = *data.as_ref() else {
+                    tracing::trace!(%bind_uri, "ignoring failed bound address event");
                     return;
                 };
                 let endpoint_addr = EndpointAddr::direct(addr);
+                tracing::trace!(
+                    %bind_uri,
+                    endpoint = ?endpoint_addr,
+                    "adding local direct endpoint"
+                );
                 if let Err(e) = conn.add_local_endpoint(bind_uri, endpoint_addr) {
                     let report = snafu::Report::from_error(&e);
                     tracing::warn!(
@@ -746,8 +768,14 @@ impl QuicEndpoint {
             match event.downcast::<crate::dquic::qtraversal::nat::client::ClientLocationData>() {
                 Ok(AddressEvent::Upsert(data)) => {
                     let Ok(endpoint) = *data.as_ref() else {
+                        tracing::trace!(%bind_uri, "ignoring failed stun location event");
                         return;
                     };
+                    tracing::trace!(
+                        %bind_uri,
+                        endpoint = ?endpoint,
+                        "adding local stun endpoint"
+                    );
                     Self::add_local_endpoint_for_peer(conn, bind_uri, endpoint);
                     return;
                 }
