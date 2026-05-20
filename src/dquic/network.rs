@@ -175,6 +175,13 @@ impl BindDriver for QuicBindDriver {
         }
         .boxed()
     }
+
+    fn rebind<'a>(&'a self, _network: &'a Network, iface: &'a BindInterface) -> BoxFuture<'a, ()> {
+        async move {
+            iface.rebind().await;
+        }
+        .boxed()
+    }
 }
 
 /// Error returned by [`Network::bind_server`].
@@ -1771,5 +1778,97 @@ mod tests {
         assert!(driver.rebinds.load(Ordering::Relaxed) > 0);
 
         handle.unbind().await;
+    }
+
+    #[tokio::test]
+    async fn quic_bind_driver_rebinds_existing_interface_io() {
+        use std::{
+            net::SocketAddr,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::Poll,
+        };
+
+        use bytes::BytesMut;
+        use dquic::qbase::net::route::Route;
+
+        #[derive(Debug)]
+        struct RebindingIoFactory {
+            bind_count: AtomicUsize,
+        }
+
+        #[derive(Debug)]
+        struct RebindingIo {
+            bind_uri: BindUri,
+            addr: SocketAddr,
+        }
+
+        impl ProductIO for RebindingIoFactory {
+            fn bind(&self, bind_uri: BindUri) -> Box<dyn crate::dquic::net::IO> {
+                let port = 10_000 + self.bind_count.fetch_add(1, Ordering::SeqCst) as u16;
+                Box::new(RebindingIo {
+                    bind_uri,
+                    addr: SocketAddr::from(([127, 0, 0, 1], port)),
+                })
+            }
+        }
+
+        impl crate::dquic::net::IO for RebindingIo {
+            fn bind_uri(&self) -> BindUri {
+                self.bind_uri.clone()
+            }
+
+            fn bound_addr(&self) -> io::Result<SocketAddr> {
+                Ok(self.addr)
+            }
+
+            fn max_segment_size(&self) -> io::Result<usize> {
+                Ok(1200)
+            }
+
+            fn max_segments(&self) -> io::Result<usize> {
+                Ok(1)
+            }
+
+            fn poll_send(
+                &self,
+                _cx: &mut Context,
+                _pkts: &[io::IoSlice],
+                _route: Route,
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(0))
+            }
+
+            fn poll_recv(
+                &self,
+                _cx: &mut Context,
+                _pkts: &mut [BytesMut],
+                _route: &mut [Route],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+
+            fn poll_close(&mut self, _cx: &mut Context) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let factory = Arc::new(RebindingIoFactory {
+            bind_count: AtomicUsize::new(0),
+        });
+        let manager = Arc::new(InterfaceManager::new());
+        let network = Network::builder()
+            .iface_manager(manager)
+            .io_factory(factory.clone())
+            .build();
+        let uri: BindUri = "inet://127.0.0.1:0".parse().expect("valid bind uri");
+
+        let iface = network.quic_driver.bind(&network, uri).await;
+        let before = iface.borrow().bound_addr().expect("initial bound addr");
+
+        network.quic_driver.rebind(&network, &iface).await;
+
+        let after = iface.borrow().bound_addr().expect("rebound addr");
+        assert_ne!(before, after, "quic bind driver must replace stale IO");
+        assert_eq!(factory.bind_count.load(Ordering::SeqCst), 2);
     }
 }
