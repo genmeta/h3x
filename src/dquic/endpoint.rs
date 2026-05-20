@@ -734,9 +734,13 @@ impl QuicEndpoint {
             }
         }
 
-        if !matches!(peer, EndpointAddr::Agent { .. }) {
+        let EndpointAddr::Agent {
+            agent: peer_agent,
+            outer: peer_outer,
+        } = peer
+        else {
             return;
-        }
+        };
 
         let best_preference = Self::best_current_local_preference(network, bind, remote_addr);
         for pattern in bind {
@@ -746,39 +750,66 @@ impl QuicEndpoint {
 
             for iface in ifaces {
                 let bind_uri = iface.bind_uri();
-                let endpoints = iface.with_components(|components, current| {
-                    let bound_addr = match current.bound_addr() {
-                        Ok(bound_addr) => bound_addr,
-                        Err(error) => {
-                            tracing::trace!(
-                                %bind_uri,
-                                error = %Report::from_error(&error),
-                                "skipping stun local endpoint without bound address"
-                            );
-                            return Vec::new();
+                let Some((bound_addr, endpoints, owns_peer_agent)) =
+                    iface.with_components(|components, current| {
+                        let bound_addr = match current.bound_addr() {
+                            Ok(bound_addr) => bound_addr,
+                            Err(error) => {
+                                tracing::trace!(
+                                    %bind_uri,
+                                    error = %Report::from_error(&error),
+                                    "skipping stun local endpoint without bound address"
+                                );
+                                return None;
+                            }
+                        };
+                        if network.local_endpoint_preference(&bind_uri, bound_addr, remote_addr)
+                            != best_preference
+                        {
+                            return None;
                         }
-                    };
-                    if network.local_endpoint_preference(&bind_uri, bound_addr, remote_addr)
-                        != best_preference
-                    {
-                        return Vec::new();
-                    }
 
-                    components
-                        .get::<StunClientsComponent>()
-                        .map(|stun| {
-                            stun.with_clients(|clients| {
-                                clients
-                                    .values()
-                                    .filter_map(|client| {
-                                        let outer = client.get_outer_addr()?.ok()?;
-                                        Some(EndpointAddr::with_agent(client.agent_addr(), outer))
-                                    })
-                                    .collect::<Vec<_>>()
+                        let mut owns_peer_agent = false;
+                        let endpoints = components
+                            .get::<StunClientsComponent>()
+                            .map(|stun| {
+                                stun.with_clients(|clients| {
+                                    clients
+                                        .values()
+                                        .filter_map(|client| {
+                                            let outer = client.get_outer_addr()?.ok()?;
+                                            owns_peer_agent |= client.agent_addr() == peer_agent
+                                                && outer == peer_outer;
+                                            Some(EndpointAddr::with_agent(
+                                                client.agent_addr(),
+                                                outer,
+                                            ))
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
                             })
-                        })
-                        .unwrap_or_default()
-                });
+                            .unwrap_or_default();
+
+                        Some((bound_addr, endpoints, owns_peer_agent))
+                    })
+                else {
+                    continue;
+                };
+
+                if owns_peer_agent {
+                    // A DNS record can legitimately point back at this endpoint's
+                    // own STUN agent address. Hairpinning through the agent is
+                    // not a valid route in that case, and publishing private
+                    // bound addresses in global DNS would make other NAT peers
+                    // choose unreachable direct paths. Use the current binding
+                    // only as an in-process self-connect path.
+                    Self::add_local_path_for_peer(
+                        connection,
+                        bind_uri.clone(),
+                        bound_addr,
+                        EndpointAddr::direct(bound_addr),
+                    );
+                }
 
                 for endpoint in endpoints {
                     Self::add_local_endpoint_for_peer(connection, bind_uri.clone(), endpoint);
