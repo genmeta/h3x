@@ -709,6 +709,32 @@ impl QuicEndpoint {
         }
     }
 
+    fn add_local_endpoint_for_peer(conn: &Connection, bind_uri: BindUri, endpoint: EndpointAddr) {
+        if let Err(error) = conn.add_local_endpoint(bind_uri.clone(), endpoint) {
+            tracing::trace!(
+                error = %Report::from_error(&error),
+                "failed to add local endpoint"
+            );
+        }
+        if matches!(endpoint, EndpointAddr::Agent { .. }) {
+            match conn.add_local_punch_address(bind_uri, endpoint) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::trace!(
+                        error = %Report::from_error(&error),
+                        "failed to add local punch endpoint"
+                    );
+                }
+                Err(error) => {
+                    tracing::trace!(
+                        error = %Report::from_error(&error),
+                        "failed to add local punch endpoint"
+                    );
+                }
+            }
+        }
+    }
+
     fn handle_local_addr_event_for_peers(
         network: &Network,
         conn: &Connection,
@@ -736,8 +762,18 @@ impl QuicEndpoint {
             Ok(AddressEvent::Remove(_)) | Ok(AddressEvent::Closed) => return,
             Err(event) => event,
         };
-        // ClientLocationData: not handled (requires add_local_punch_address).
-        let _ = event;
+        let _event =
+            match event.downcast::<crate::dquic::qtraversal::nat::client::ClientLocationData>() {
+                Ok(AddressEvent::Upsert(data)) => {
+                    let Ok(endpoint) = *data.as_ref() else {
+                        return;
+                    };
+                    Self::add_local_endpoint_for_peer(conn, bind_uri, endpoint);
+                    return;
+                }
+                Ok(AddressEvent::Remove(_)) | Ok(AddressEvent::Closed) => return,
+                Err(event) => event,
+            };
     }
 
     /// Handle a single local-address event: upsert → call add_local_endpoint.
@@ -766,8 +802,18 @@ impl QuicEndpoint {
             Ok(AddressEvent::Remove(_)) | Ok(AddressEvent::Closed) => return,
             Err(event) => event,
         };
-        // ClientLocationData: not handled (requires add_local_punch_address).
-        let _ = event;
+        let _event =
+            match event.downcast::<crate::dquic::qtraversal::nat::client::ClientLocationData>() {
+                Ok(AddressEvent::Upsert(data)) => {
+                    let Ok(endpoint) = *data.as_ref() else {
+                        return;
+                    };
+                    Self::add_local_endpoint_for_peer(conn, bind_uri, endpoint);
+                    return;
+                }
+                Ok(AddressEvent::Remove(_)) | Ok(AddressEvent::Closed) => return,
+                Err(event) => event,
+            };
     }
 }
 
