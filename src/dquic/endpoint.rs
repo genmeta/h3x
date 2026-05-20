@@ -443,6 +443,7 @@ impl quic::Connect for QuicEndpoint {
                     let peers = peers.lock().expect("peers mutex poisoned").clone();
                     Self::handle_local_addr_event_for_peers(
                         &self.network,
+                        self.bind.as_ref(),
                         &connection,
                         bind_uri,
                         event,
@@ -486,6 +487,7 @@ impl quic::Connect for QuicEndpoint {
                                             let peers = peers.lock().expect("peers mutex poisoned").clone();
                                             Self::handle_local_addr_event_for_peers(
                                                 &network,
+                                                bind.as_ref(),
                                                 &c,
                                                 uri,
                                                 e,
@@ -696,6 +698,7 @@ impl QuicEndpoint {
             return;
         }
 
+        let best_preference = Self::best_current_local_preference(network, bind, remote_addr);
         for pattern in bind {
             let Some(ifaces) = network.get_interfaces(pattern) else {
                 continue;
@@ -715,9 +718,8 @@ impl QuicEndpoint {
                             return Vec::new();
                         }
                     };
-                    if network
-                        .local_endpoint_preference(&bind_uri, bound_addr, remote_addr)
-                        .is_none()
+                    if network.local_endpoint_preference(&bind_uri, bound_addr, remote_addr)
+                        != best_preference
                     {
                         return Vec::new();
                     }
@@ -743,6 +745,43 @@ impl QuicEndpoint {
                 }
             }
         }
+    }
+
+    fn best_current_local_preference(
+        network: &Network,
+        bind: &[BindPattern],
+        remote_addr: SocketAddr,
+    ) -> Option<crate::dquic::network::LocalEndpointPreference> {
+        use crate::dquic::net::IO as _;
+
+        bind.iter()
+            .filter_map(|pattern| network.get_interfaces(pattern))
+            .flatten()
+            .filter_map(|iface| {
+                let bind_uri = iface.bind_uri();
+                let bound_addr = iface.borrow().bound_addr().ok()?;
+                network.local_endpoint_preference(&bind_uri, bound_addr, remote_addr)
+            })
+            .min()
+    }
+
+    fn current_bound_addr_for_bind_uri(
+        network: &Network,
+        bind: &[BindPattern],
+        target: &BindUri,
+    ) -> Option<SocketAddr> {
+        use crate::dquic::net::IO as _;
+
+        bind.iter()
+            .filter_map(|pattern| network.get_interfaces(pattern))
+            .flatten()
+            .find_map(|iface| {
+                let bind_uri = iface.bind_uri();
+                if &bind_uri != target {
+                    return None;
+                }
+                iface.borrow().bound_addr().ok()
+            })
     }
 
     fn add_local_path_for_peer(
@@ -789,6 +828,7 @@ impl QuicEndpoint {
 
     fn handle_local_addr_event_for_peers(
         network: &Network,
+        bind: &[BindPattern],
         conn: &Connection,
         bind_uri: BindUri,
         event: crate::dquic::qinterface::component::location::AddressEvent<dyn Any + Send + Sync>,
@@ -802,10 +842,11 @@ impl QuicEndpoint {
                     return;
                 };
                 for peer in peers {
-                    if network
-                        .local_endpoint_preference(&bind_uri, bound_addr, **peer)
-                        .is_some()
-                    {
+                    let preference =
+                        network.local_endpoint_preference(&bind_uri, bound_addr, **peer);
+                    let best_preference =
+                        Self::best_current_local_preference(network, bind, **peer);
+                    if preference.is_some() && preference == best_preference {
                         Self::add_local_path_for_peer(conn, bind_uri.clone(), bound_addr, *peer);
                     }
                 }
@@ -820,7 +861,23 @@ impl QuicEndpoint {
                     let Ok(endpoint) = *data.as_ref() else {
                         return;
                     };
-                    Self::add_local_endpoint_for_peer(conn, bind_uri, endpoint);
+                    let Some(bound_addr) =
+                        Self::current_bound_addr_for_bind_uri(network, bind, &bind_uri)
+                    else {
+                        return;
+                    };
+                    for peer in peers {
+                        if !matches!(peer, EndpointAddr::Agent { .. }) {
+                            continue;
+                        }
+                        let preference =
+                            network.local_endpoint_preference(&bind_uri, bound_addr, **peer);
+                        let best_preference =
+                            Self::best_current_local_preference(network, bind, **peer);
+                        if preference.is_some() && preference == best_preference {
+                            Self::add_local_endpoint_for_peer(conn, bind_uri.clone(), endpoint);
+                        }
+                    }
                     return;
                 }
                 Ok(AddressEvent::Remove(_)) | Ok(AddressEvent::Closed) => return,
