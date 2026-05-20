@@ -1,12 +1,6 @@
 //! QUIC-only endpoint built on top of a shared [`Network`].
 
-use std::{
-    any::Any,
-    net::SocketAddr,
-    str::FromStr,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{any::Any, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwapOption;
 use bon::bon;
@@ -21,10 +15,7 @@ use crate::{
         client::{ClientQuicConfig, ServerCertVerifierChoice},
         connection::Connection,
         identity::Identity,
-        net::{
-            BindUri, ConnectionId, EndpointAddr,
-            net::route::{Link, Pathway},
-        },
+        net::{BindUri, ConnectionId, EndpointAddr},
         network::{BindHandle, BindServerError, Network, ServerBinding},
         resolver::{Resolve, Source},
         server::ServerQuicConfig,
@@ -428,7 +419,6 @@ impl quic::Connect for QuicEndpoint {
         // local addresses on its own.
         let mut observer = self.network.locations().subscribe();
         let bind = self.bind.clone();
-        let peers = Arc::new(Mutex::new(Vec::new()));
         let connect_timeout = tokio::time::sleep(self.connect_path_timeout());
         tokio::pin!(connect_timeout);
 
@@ -443,9 +433,7 @@ impl quic::Connect for QuicEndpoint {
                         .validate()
                         .map_err(|_| ConnectError::NoReachableEndpoint)?;
                     Self::spawn_path_discovery_companion(
-                        self.network.clone(),
                         bind.clone(),
-                        peers.clone(),
                         connection.clone(),
                         server_eps,
                         observer,
@@ -455,7 +443,6 @@ impl quic::Connect for QuicEndpoint {
                 Some((source, server_ep)) = server_eps.next() => {
                     Self::add_resolved_peer_endpoint(
                         &connection,
-                        &peers,
                         source,
                         server_ep,
                     );
@@ -464,15 +451,7 @@ impl quic::Connect for QuicEndpoint {
                     if !bind.iter().any(|p| p.matches(&bind_uri)) {
                         continue;
                     }
-                    let peers = peers.lock().expect("peers mutex poisoned").clone();
-                    Self::handle_local_addr_event_for_peers(
-                        &self.network,
-                        self.bind.as_ref(),
-                        &connection,
-                        bind_uri,
-                        event,
-                        &peers,
-                    );
+                    Self::handle_local_addr_event(&connection, bind_uri, event);
                 }
             }
 
@@ -483,11 +462,9 @@ impl quic::Connect for QuicEndpoint {
                     // same-link direct records). Install the ready batch before
                     // returning so the handshake starts with all current path
                     // candidates instead of whichever record happened to arrive first.
-                    Self::drain_ready_peer_endpoints(&connection, &peers, &mut server_eps);
+                    Self::drain_ready_peer_endpoints(&connection, &mut server_eps);
                     Self::spawn_path_discovery_companion(
-                        self.network.clone(),
                         bind.clone(),
-                        peers.clone(),
                         connection.clone(),
                         server_eps,
                         observer,
@@ -645,9 +622,7 @@ impl QuicEndpoint {
     }
 
     fn spawn_path_discovery_companion<S>(
-        network: Arc<Network>,
         bind: Arc<Vec<BindPattern>>,
-        peers: Arc<Mutex<Vec<EndpointAddr>>>,
         connection: Arc<Connection>,
         mut server_eps: S,
         mut observer: crate::dquic::qinterface::component::location::Observer,
@@ -678,7 +653,7 @@ impl QuicEndpoint {
                                 continue;
                             };
                             let Some(c) = weak.upgrade() else { break };
-                            Self::add_resolved_peer_endpoint(&c, &peers, s, e);
+                            Self::add_resolved_peer_endpoint(&c, s, e);
                         }
                         result = observer.recv(), if !locations_done => {
                             let Some((uri, e)) = result else {
@@ -687,15 +662,7 @@ impl QuicEndpoint {
                             };
                             let Some(c) = weak.upgrade() else { break };
                             if bind.iter().any(|p| p.matches(&uri)) {
-                                let peers = peers.lock().expect("peers mutex poisoned").clone();
-                                Self::handle_local_addr_event_for_peers(
-                                    &network,
-                                    bind.as_ref(),
-                                    &c,
-                                    uri,
-                                    e,
-                                    &peers,
-                                );
+                                Self::handle_local_addr_event(&c, uri, e);
                             }
                         }
                     }
@@ -707,76 +674,18 @@ impl QuicEndpoint {
 
     fn add_resolved_peer_endpoint(
         connection: &Connection,
-        peers: &Arc<Mutex<Vec<EndpointAddr>>>,
         source: Source,
         server_ep: EndpointAddr,
     ) {
-        peers.lock().expect("peers mutex poisoned").push(server_ep);
         let _ = connection.add_peer_endpoint(server_ep, source);
     }
 
-    fn drain_ready_peer_endpoints<S>(
-        connection: &Connection,
-        peers: &Arc<Mutex<Vec<EndpointAddr>>>,
-        server_eps: &mut S,
-    ) where
+    fn drain_ready_peer_endpoints<S>(connection: &Connection, server_eps: &mut S)
+    where
         S: Stream<Item = (Source, EndpointAddr)> + Unpin,
     {
         while let Some(Some((source, server_ep))) = server_eps.next().now_or_never() {
-            Self::add_resolved_peer_endpoint(connection, peers, source, server_ep);
-        }
-    }
-
-    fn best_current_local_preference(
-        network: &Network,
-        bind: &[BindPattern],
-        remote_addr: SocketAddr,
-    ) -> Option<crate::dquic::network::LocalEndpointPreference> {
-        use crate::dquic::net::IO as _;
-
-        bind.iter()
-            .filter_map(|pattern| network.get_interfaces(pattern))
-            .flatten()
-            .filter_map(|iface| {
-                let bind_uri = iface.bind_uri();
-                let bound_addr = iface.borrow().bound_addr().ok()?;
-                network.local_endpoint_preference(&bind_uri, bound_addr, remote_addr)
-            })
-            .min()
-    }
-
-    fn current_bound_addr_for_bind_uri(
-        network: &Network,
-        bind: &[BindPattern],
-        target: &BindUri,
-    ) -> Option<SocketAddr> {
-        use crate::dquic::net::IO as _;
-
-        bind.iter()
-            .filter_map(|pattern| network.get_interfaces(pattern))
-            .flatten()
-            .find_map(|iface| {
-                let bind_uri = iface.bind_uri();
-                if &bind_uri != target {
-                    return None;
-                }
-                iface.borrow().bound_addr().ok()
-            })
-    }
-
-    fn add_local_path_for_peer(
-        conn: &Connection,
-        bind_uri: BindUri,
-        bound_addr: SocketAddr,
-        peer: EndpointAddr,
-    ) {
-        let link = Link::new(bound_addr, *peer);
-        let pathway = Pathway::new(EndpointAddr::direct(bound_addr), peer);
-        if let Err(error) = conn.add_path(bind_uri, link, pathway) {
-            tracing::trace!(
-                error = %Report::from_error(&error),
-                "failed to add local path"
-            );
+            Self::add_resolved_peer_endpoint(connection, source, server_ep);
         }
     }
 
@@ -806,80 +715,8 @@ impl QuicEndpoint {
         }
     }
 
-    fn handle_local_addr_event_for_peers(
-        network: &Network,
-        bind: &[BindPattern],
-        conn: &Connection,
-        bind_uri: BindUri,
-        event: crate::dquic::qinterface::component::location::AddressEvent<dyn Any + Send + Sync>,
-        peers: &[EndpointAddr],
-    ) {
-        use crate::dquic::qinterface::component::location::AddressEvent;
-
-        let event = match event.downcast::<std::io::Result<SocketAddr>>() {
-            Ok(AddressEvent::Upsert(data)) => {
-                let Ok(bound_addr) = *data.as_ref() else {
-                    return;
-                };
-                for peer in peers {
-                    let preference =
-                        network.local_endpoint_preference(&bind_uri, bound_addr, **peer);
-                    let best_preference =
-                        Self::best_current_local_preference(network, bind, **peer);
-                    if preference.is_some() && preference == best_preference {
-                        Self::add_local_path_for_peer(conn, bind_uri.clone(), bound_addr, *peer);
-                    }
-                }
-                return;
-            }
-            Ok(AddressEvent::Remove(_)) | Ok(AddressEvent::Closed) => return,
-            Err(event) => event,
-        };
-        let _event =
-            match event.downcast::<crate::dquic::qtraversal::nat::client::ClientLocationData>() {
-                Ok(AddressEvent::Upsert(data)) => {
-                    let Ok(endpoint) = *data.as_ref() else {
-                        return;
-                    };
-                    let Some(bound_addr) =
-                        Self::current_bound_addr_for_bind_uri(network, bind, &bind_uri)
-                    else {
-                        return;
-                    };
-                    for peer in peers {
-                        if !matches!(peer, EndpointAddr::Agent { .. }) {
-                            continue;
-                        }
-                        let preference =
-                            network.local_endpoint_preference(&bind_uri, bound_addr, **peer);
-                        let best_preference =
-                            Self::best_current_local_preference(network, bind, **peer);
-                        if preference.is_some() && preference == best_preference {
-                            if endpoint == *peer {
-                                // A DNS record can legitimately point back at
-                                // this endpoint's own STUN agent address. Use
-                                // the current binding as an in-process
-                                // self-connect path without synthesizing
-                                // addresses from the interface table.
-                                Self::add_local_path_for_peer(
-                                    conn,
-                                    bind_uri.clone(),
-                                    bound_addr,
-                                    EndpointAddr::direct(bound_addr),
-                                );
-                            } else {
-                                Self::add_local_endpoint_for_peer(conn, bind_uri.clone(), endpoint);
-                            }
-                        }
-                    }
-                    return;
-                }
-                Ok(AddressEvent::Remove(_)) | Ok(AddressEvent::Closed) => return,
-                Err(event) => event,
-            };
-    }
-
-    /// Handle a single local-address event: upsert → call add_local_endpoint.
+    /// Handle a single local-address event by recording it in the connection's
+    /// address book. QUIC path pairing is qtraversal's responsibility.
     fn handle_local_addr_event(
         conn: &Connection,
         bind_uri: BindUri,
@@ -922,36 +759,10 @@ impl QuicEndpoint {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt;
-
-    use futures::{FutureExt, StreamExt, stream};
-    use http::uri::Authority;
     use rustls::pki_types::PrivateKeyDer;
 
     use super::*;
-    use crate::{
-        dquic::{
-            qresolve::{ResolveFuture, Source},
-            resolver::handy::SystemResolver,
-        },
-        quic::Connect,
-    };
-
-    #[derive(Debug)]
-    struct SequenceResolver(Vec<(Source, EndpointAddr)>);
-
-    impl fmt::Display for SequenceResolver {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "sequence resolver")
-        }
-    }
-
-    impl Resolve for SequenceResolver {
-        fn lookup<'l>(&'l self, _name: &'l str) -> ResolveFuture<'l> {
-            let records = self.0.clone();
-            async move { Ok(stream::iter(records).boxed()) }.boxed()
-        }
-    }
+    use crate::dquic::resolver::handy::SystemResolver;
 
     #[tokio::test]
     async fn test_quic_endpoint_construction() {
@@ -1023,34 +834,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_does_not_report_loopback_path_for_non_loopback_peer() {
-        let remote: SocketAddr = "10.10.0.4:4433"
-            .parse()
-            .expect("valid non-loopback endpoint");
-        let resolver: Arc<dyn Resolve + Send + Sync> = Arc::new(SequenceResolver(vec![(
-            Source::System,
-            EndpointAddr::direct(remote),
-        )]));
-        let bind = Arc::new(vec![
-            BindPattern::from_str("inet://127.0.0.1:0").expect("valid loopback bind pattern"),
-        ]);
+    async fn local_location_before_dns_peer_still_creates_path() {
+        let bind_pattern = BindPattern::from_str("inet://127.0.0.1:0").expect("valid bind pattern");
+        let bind = Arc::new(vec![bind_pattern.clone()]);
         let endpoint = QuicEndpoint::builder()
             .network(Network::builder().build())
-            .resolver(resolver)
-            .bind(bind)
+            .bind(bind.clone())
             .build()
             .await;
-        let authority: Authority = "remote.test:4433".parse().expect("valid authority");
+        let tls = endpoint.ensure_client().expect("client tls");
+        let connection = endpoint
+            .build_client_connection("remote.test", tls)
+            .expect("client connection");
+        let iface = endpoint
+            .network
+            .get_interfaces(&bind_pattern)
+            .expect("registered bind")
+            .into_iter()
+            .next()
+            .expect("bound interface");
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            endpoint.connect(&authority),
-        )
-        .await;
+        use crate::dquic::net::IO as _;
+        let bind_uri = iface.bind_uri();
+        let local_addr = iface.borrow().bound_addr().expect("bound address");
+        let data: Arc<dyn Any + Send + Sync> =
+            Arc::new(Ok::<SocketAddr, std::io::Error>(local_addr));
+        let event = crate::dquic::qinterface::component::location::AddressEvent::Upsert(data);
+
+        QuicEndpoint::handle_local_addr_event(&connection, bind_uri, event);
+
+        let remote_addr = SocketAddr::new(local_addr.ip(), local_addr.port() + 1);
+        QuicEndpoint::add_resolved_peer_endpoint(
+            &connection,
+            Source::System,
+            EndpointAddr::direct(remote_addr),
+        );
 
         assert!(
-            !matches!(result, Ok(Ok(_))),
-            "loopback-only local binds must not establish paths to non-loopback peers"
+            QuicEndpoint::connection_has_paths(&connection).expect("path context"),
+            "local endpoint replayed before DNS peer must be retained for peer pairing"
         );
     }
 

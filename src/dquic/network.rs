@@ -87,50 +87,11 @@ use crate::dquic::{
 pub(crate) type SniRegistry = Arc<DashMap<Name<'static>, Weak<ServerEntry>>>;
 type BoundInterfaces = HashMap<String, (BindUri, BindInterface)>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum LocalEndpointPreference {
-    SameSubnet,
-    DefaultRoute,
-    Other,
-}
-
 fn interface_contains(interface: &::dquic::qinterface::device::Interface, ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => interface.ipv4.iter().any(|net| net.contains(&ip)),
         IpAddr::V6(ip) => interface.ipv6.iter().any(|net| net.contains(&ip)),
     }
-}
-
-fn local_endpoint_preference_for_interface(
-    interface: Option<&::dquic::qinterface::device::Interface>,
-    bound_addr: SocketAddr,
-    remote_addr: SocketAddr,
-) -> Option<LocalEndpointPreference> {
-    if bound_addr.is_ipv4() != remote_addr.is_ipv4() {
-        return None;
-    }
-
-    let local_ip = bound_addr.ip();
-    let remote_ip = remote_addr.ip();
-    if remote_ip.is_loopback() {
-        return local_ip
-            .is_loopback()
-            .then_some(LocalEndpointPreference::SameSubnet);
-    }
-    if local_ip.is_loopback() {
-        return None;
-    }
-
-    let Some(interface) = interface else {
-        return Some(LocalEndpointPreference::Other);
-    };
-    if interface_contains(interface, remote_ip) {
-        return Some(LocalEndpointPreference::SameSubnet);
-    }
-    if interface.default {
-        return Some(LocalEndpointPreference::DefaultRoute);
-    }
-    Some(LocalEndpointPreference::Other)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -756,11 +717,9 @@ impl Network {
     /// Return whether `bound_addr` belongs to the currently-default interface
     /// represented by `bind_uri`.
     ///
-    /// This is intentionally stricter than [`local_endpoint_preference`]:
-    /// stale bind handles can briefly outlive netlink reconciliation after a
+    /// Stale bind handles can briefly outlive netlink reconciliation after a
     /// device is removed. In that case the device is absent from the current
-    /// snapshot and this method returns `false` rather than treating the
-    /// address as an "other" usable endpoint.
+    /// snapshot and this method returns `false`.
     pub fn bound_addr_is_on_default_route(
         &self,
         bind_uri: &BindUri,
@@ -781,28 +740,6 @@ impl Network {
         self.devices.get(device).is_some_and(|interface| {
             interface.default && interface_contains(&interface, bound_addr.ip())
         })
-    }
-
-    pub(crate) fn local_endpoint_preference(
-        &self,
-        bind_uri: &BindUri,
-        bound_addr: SocketAddr,
-        remote_addr: SocketAddr,
-    ) -> Option<LocalEndpointPreference> {
-        let Some((family, device, _port)) = bind_uri.as_iface_bind_uri() else {
-            return local_endpoint_preference_for_interface(None, bound_addr, remote_addr);
-        };
-        let remote_family = if remote_addr.is_ipv4() {
-            Family::V4
-        } else {
-            Family::V6
-        };
-        if family != remote_family {
-            return None;
-        }
-
-        let interface = self.devices.get(device);
-        local_endpoint_preference_for_interface(interface.as_ref(), bound_addr, remote_addr)
     }
 
     /// Return all currently bound interfaces for a specific [`BindPattern`].
@@ -1127,77 +1064,6 @@ mod tests {
 
     fn make_server_config() -> ServerQuicConfig {
         ServerQuicConfig::default()
-    }
-
-    fn test_interface(addr: &str, default: bool) -> ::dquic::qinterface::device::Interface {
-        let mut interface = ::dquic::qinterface::device::Interface::dummy();
-        if addr.contains(':') {
-            interface.ipv6 = vec![addr.parse().expect("valid test ipv6 network")];
-        } else {
-            interface.ipv4 = vec![addr.parse().expect("valid test ipv4 network")];
-        }
-        interface.default = default;
-        interface
-    }
-
-    #[test]
-    fn local_endpoint_preference_rejects_loopback_for_non_loopback_remote() {
-        let interface = test_interface("127.0.0.1/8", false);
-        let preference = local_endpoint_preference_for_interface(
-            Some(&interface),
-            "127.0.0.1:1234".parse().unwrap(),
-            "10.10.0.4:4433".parse().unwrap(),
-        );
-
-        assert_eq!(preference, None);
-    }
-
-    #[test]
-    fn local_endpoint_preference_prefers_same_subnet_over_default_route() {
-        let same_subnet = test_interface("10.110.0.10/24", false);
-        let default_route = test_interface("10.255.0.13/24", true);
-
-        let same_preference = local_endpoint_preference_for_interface(
-            Some(&same_subnet),
-            "10.110.0.10:1234".parse().unwrap(),
-            "10.110.0.20:4433".parse().unwrap(),
-        );
-        let default_preference = local_endpoint_preference_for_interface(
-            Some(&default_route),
-            "10.255.0.13:1234".parse().unwrap(),
-            "10.110.0.20:4433".parse().unwrap(),
-        );
-
-        assert_eq!(same_preference, Some(LocalEndpointPreference::SameSubnet));
-        assert_eq!(
-            default_preference,
-            Some(LocalEndpointPreference::DefaultRoute)
-        );
-        assert!(same_preference < default_preference);
-    }
-
-    #[test]
-    fn local_endpoint_preference_uses_default_route_for_remote_network() {
-        let default_route = test_interface("10.110.0.10/24", true);
-        let non_default = test_interface("10.255.0.13/24", false);
-
-        let default_preference = local_endpoint_preference_for_interface(
-            Some(&default_route),
-            "10.110.0.10:1234".parse().unwrap(),
-            "10.10.0.4:4433".parse().unwrap(),
-        );
-        let other_preference = local_endpoint_preference_for_interface(
-            Some(&non_default),
-            "10.255.0.13:1234".parse().unwrap(),
-            "10.10.0.4:4433".parse().unwrap(),
-        );
-
-        assert_eq!(
-            default_preference,
-            Some(LocalEndpointPreference::DefaultRoute)
-        );
-        assert_eq!(other_preference, Some(LocalEndpointPreference::Other));
-        assert!(default_preference < other_preference);
     }
 
     #[tokio::test]
