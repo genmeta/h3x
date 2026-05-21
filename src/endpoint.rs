@@ -7,10 +7,11 @@
 //!
 //! [`ConnectionBuilder`]: crate::connection::ConnectionBuilder
 
-use std::{error::Error, sync::Arc};
+use std::{any::Any, error::Error, sync::Arc};
 
 use bon::bon;
 use http::uri::Authority;
+use snafu::ResultExt;
 use tower_service::Service;
 use tracing::Instrument;
 
@@ -48,6 +49,15 @@ pub struct H3Endpoint<Q, C: quic::Connection> {
 pub struct QuicMutGuard<'a, Q, C: quic::Connection> {
     quic: &'a mut Q,
     pool: &'a Pool<C>,
+}
+
+#[derive(Debug, snafu::Snafu)]
+#[snafu(module)]
+pub enum AcceptError<E: Error + 'static> {
+    #[snafu(display("failed to accept QUIC connection"))]
+    Accept { source: E },
+    #[snafu(display("failed to initialize H3 connection"))]
+    Build { source: quic::ConnectionError },
 }
 
 impl<Q, C: quic::Connection> std::ops::Deref for QuicMutGuard<'_, Q, C> {
@@ -135,6 +145,86 @@ where
         self.pool
             .reuse_or_connect_with(&self.quic, self.builder.clone(), server)
             .await
+    }
+}
+
+impl<Q, C: quic::Connection> H3Endpoint<Q, C>
+where
+    Q: quic::Listen<Connection = C>,
+{
+    /// Accept one QUIC connection and initialize it as an HTTP/3 connection.
+    pub async fn accept(&mut self) -> Result<Arc<H3Connection<C>>, AcceptError<Q::Error>> {
+        let quic_conn = self
+            .quic
+            .accept()
+            .await
+            .context(accept_error::AcceptSnafu)?;
+        let h3_conn = self
+            .builder
+            .build(quic_conn)
+            .await
+            .context(accept_error::BuildSnafu)?;
+        Ok(Arc::new(h3_conn))
+    }
+
+    /// Accept one HTTP/3 connection from a shared endpoint handle.
+    ///
+    /// Rust does not support overloading inherent methods by receiver type, so
+    /// the shared-handle variant uses the same `*_owned` convention as
+    /// [`H3Endpoint::serve_owned`].
+    pub fn accept_owned<E>(
+        self: &Arc<Self>,
+    ) -> impl Future<Output = Result<Arc<H3Connection<C>>, AcceptError<E>>> + use<E, Q, C>
+    where
+        E: Error + Any,
+        for<'a> &'a Q: quic::Listen<Connection = C, Error = E>,
+    {
+        let this = Arc::clone(self);
+        let builder = this.builder.clone();
+        let pool = this.pool.clone();
+        async move {
+            let mut ref_ep = H3Endpoint {
+                quic: &this.quic,
+                builder,
+                pool,
+            };
+            ref_ep.accept().await
+        }
+    }
+}
+
+impl<Q, C> quic::Connect for H3Endpoint<Q, C>
+where
+    Q: quic::Connect<Connection = C>,
+    C: quic::Connection,
+{
+    type Connection = C;
+    type Error = Q::Error;
+
+    fn connect<'a>(
+        &'a self,
+        server: &'a Authority,
+    ) -> impl Future<Output = Result<Arc<Self::Connection>, Self::Error>> + Send + 'a {
+        self.quic.connect(server)
+    }
+}
+
+impl<Q, C> quic::Listen for H3Endpoint<Q, C>
+where
+    Q: quic::Listen<Connection = C>,
+    C: quic::Connection,
+{
+    type Connection = C;
+    type Error = Q::Error;
+
+    fn accept(
+        &mut self,
+    ) -> impl Future<Output = Result<Arc<Self::Connection>, Self::Error>> + Send + '_ {
+        self.quic.accept()
+    }
+
+    fn shutdown(&self) -> impl Future<Output = Result<(), Self::Error>> + Send + '_ {
+        self.quic.shutdown()
     }
 }
 
@@ -275,12 +365,23 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        future::pending,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use http::uri::Authority;
 
     use super::*;
-    use crate::{connection::tests::MockConnection, pool::ReuseableConnection};
+    use crate::{
+        connection::tests::{
+            MockConnection, TestLocalAgent, TestReadStream, TestRemoteAgent, TestWriteStream,
+        },
+        pool::ReuseableConnection,
+    };
 
     /// Minimal quic::Connect implementation for testing QuicMutGuard.
     struct MockConnect;
@@ -295,6 +396,139 @@ mod tests {
         ) -> Result<Arc<Self::Connection>, Self::Error> {
             unreachable!("connect is not called in guard tests")
         }
+    }
+
+    struct BuildableConnection;
+
+    impl quic::ManageStream for BuildableConnection {
+        type StreamReader = TestReadStream;
+        type StreamWriter = TestWriteStream;
+
+        async fn open_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            pending().await
+        }
+
+        async fn open_uni(&self) -> Result<Self::StreamWriter, quic::ConnectionError> {
+            Ok(TestWriteStream)
+        }
+
+        async fn accept_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            pending().await
+        }
+
+        async fn accept_uni(&self) -> Result<Self::StreamReader, quic::ConnectionError> {
+            pending().await
+        }
+    }
+
+    impl quic::WithLocalAgent for BuildableConnection {
+        type LocalAgent = TestLocalAgent;
+
+        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+            Ok(None)
+        }
+    }
+
+    impl quic::WithRemoteAgent for BuildableConnection {
+        type RemoteAgent = TestRemoteAgent;
+
+        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+            Ok(None)
+        }
+    }
+
+    impl quic::Lifecycle for BuildableConnection {
+        fn close(&self, _code: crate::error::Code, _reason: std::borrow::Cow<'static, str>) {}
+
+        fn check(&self) -> Result<(), quic::ConnectionError> {
+            Ok(())
+        }
+
+        async fn closed(&self) -> quic::ConnectionError {
+            pending().await
+        }
+    }
+
+    #[derive(Default)]
+    struct MockListen {
+        accepted: Arc<AtomicUsize>,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    impl quic::Listen for MockListen {
+        type Connection = BuildableConnection;
+        type Error = quic::ConnectionError;
+
+        async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
+            self.accepted.fetch_add(1, Ordering::Relaxed);
+            Ok(Arc::new(BuildableConnection))
+        }
+
+        async fn shutdown(&self) -> Result<(), Self::Error> {
+            self.shutdowns.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    impl quic::Listen for &MockListen {
+        type Connection = BuildableConnection;
+        type Error = quic::ConnectionError;
+
+        async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
+            self.accepted.fetch_add(1, Ordering::Relaxed);
+            Ok(Arc::new(BuildableConnection))
+        }
+
+        async fn shutdown(&self) -> Result<(), Self::Error> {
+            self.shutdowns.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn h3_endpoint_implements_quic_connect_when_transport_connects() {
+        fn assert_connect<T: quic::Connect<Connection = MockConnection>>() {}
+
+        assert_connect::<H3Endpoint<MockConnect, MockConnection>>();
+        assert_connect::<Arc<H3Endpoint<MockConnect, MockConnection>>>();
+    }
+
+    #[test]
+    fn h3_endpoint_implements_quic_listen_when_transport_listens() {
+        fn assert_listen<T: quic::Listen<Connection = BuildableConnection>>() {}
+
+        assert_listen::<H3Endpoint<MockListen, BuildableConnection>>();
+    }
+
+    #[tokio::test]
+    async fn accept_builds_h3_connection_from_accepted_quic_connection() {
+        let listen = MockListen::default();
+        let accepted = listen.accepted.clone();
+        let mut endpoint = H3Endpoint::builder().quic(listen).build();
+
+        let connection = endpoint.accept().await.expect("accept should build H3");
+
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+        connection.qpack().expect("qpack should be initialized");
+    }
+
+    #[tokio::test]
+    async fn accept_owned_builds_h3_connection_from_shared_endpoint() {
+        let listen = MockListen::default();
+        let accepted = listen.accepted.clone();
+        let endpoint = Arc::new(H3Endpoint::builder().quic(listen).build());
+
+        let connection = endpoint
+            .accept_owned()
+            .await
+            .expect("accept_owned should build H3");
+
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+        connection.qpack().expect("qpack should be initialized");
     }
 
     /// Verify that QuicMutGuard provides mutable access to the inner QUIC transport.
