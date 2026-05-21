@@ -225,7 +225,8 @@ impl QuicEndpoint {
         } else {
             bind
         };
-        let binds: Vec<BindHandle> = join_all(bind.iter().map(|p| network.bind(p.clone()))).await;
+        let binds: Vec<BindHandle> =
+            join_all(bind.iter().map(|p| network.quic().bind(p.clone()))).await;
         let endpoint = Self {
             network,
             identity: ArcSwapOption::from(identity),
@@ -311,6 +312,7 @@ impl QuicEndpoint {
                 .with_zero_rtt(self.client.enable_0rtt);
         let connection = self
             .network
+            .quic()
             .configure_connection(builder)
             .with_defer_idle_timeout(self.client.defer_idle_timeout)
             .with_cids(ConnectionId::random_gen(8))
@@ -333,6 +335,7 @@ impl QuicEndpoint {
         }
         let binding = self
             .network
+            .quic()
             .bind_server(named, (*self.server).clone(), self.bind.clone())
             .await
             .context(BindServerSnafu)?;
@@ -360,7 +363,7 @@ impl QuicEndpoint {
     pub async fn accept(&self) -> Result<Arc<Connection>, AcceptError> {
         let binding = self.ensure_server().await?;
         let conn = binding.recv().await.ok_or(AcceptError::Shutdown)?;
-        let mut observer = self.network.locations().subscribe();
+        let mut observer = self.network.quic().locations().subscribe();
         let weak = Arc::downgrade(&conn);
         let patterns: Vec<BindPattern> = self.bind.iter().cloned().collect();
         // Inherent termination: this companion task tracks local
@@ -424,7 +427,7 @@ impl quic::Connect for QuicEndpoint {
         // Locations replays the current bound addresses when a subscriber is
         // registered, so connect does not scan bound interfaces and synthesize
         // local addresses on its own.
-        let mut observer = self.network.locations().subscribe();
+        let mut observer = self.network.quic().locations().subscribe();
         let bind = self.bind.clone();
         let connect_timeout = tokio::time::sleep(self.connect_path_timeout());
         tokio::pin!(connect_timeout);
@@ -832,9 +835,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_network_locations_accessor() {
-        // Verify that Network::locations() accessor is available for Task A
+        // Verify that the built-in QUIC locations accessor is available.
         let network = Network::builder().build();
-        let _locations = network.locations();
+        let _locations = network.quic().locations();
         // Just verify we can access it without panicking
     }
 
@@ -876,6 +879,7 @@ mod tests {
             .expect("client connection");
         let iface = endpoint
             .network
+            .quic()
             .get_interfaces(&bind_pattern)
             .expect("registered bind")
             .into_iter()

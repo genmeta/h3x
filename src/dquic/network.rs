@@ -1,8 +1,10 @@
 //! Process-shared QUIC network infrastructure.
 //!
-//! [`Network`] owns the long-lived components needed to send and receive QUIC
-//! packets on a set of network interfaces, **and** the SNI fan-out registry
-//! used to route newly-accepted connections to per-identity
+//! [`Network`] owns the long-lived bind registry and device reconciliation
+//! task. Its built-in [`QuicBindDriver`] owns the QUIC runtime components
+//! needed to send and receive QUIC packets on a set of network interfaces,
+//! including the SNI fan-out registry used to route newly-accepted
+//! connections to per-identity
 //! [`QuicEndpoint`](crate::dquic::endpoint::QuicEndpoint) listeners.
 //!
 //! A [`Network`] is always used via [`Arc<Network>`]: clone the [`Arc`] to
@@ -11,27 +13,29 @@
 //!
 //! ## SNI dispatch
 //!
-//! The builder installs a *connectionless packet dispatcher* on the network's
-//! [`QuicRouter`]. When an Initial / 0-RTT packet arrives without matching
+//! The built-in QUIC driver installs a *connectionless packet dispatcher* on
+//! its [`QuicRouter`]. When an Initial / 0-RTT packet arrives without matching
 //! an existing connection, the dispatcher constructs a fresh server
 //! [`Connection`](crate::dquic::prelude::Connection) using the shared
-//! [`ServerQuicConfig`](crate::dquic::server::ServerQuicConfig) stored in the network's
-//! `server_slot`, waits for the handshake to reveal the ClientHello SNI, and
-//! fans the connection into the matching [`ServerBinding`]'s mpmc queue.
+//! [`ServerQuicConfig`](crate::dquic::server::ServerQuicConfig) stored in the
+//! QUIC driver's `server_slot`, waits for the handshake to reveal the
+//! ClientHello SNI, and fans the connection into the matching
+//! [`ServerBinding`]'s mpmc queue.
 //!
 //! Because the underlying rustls `ServerConfig` must be chosen *before* SNI
-//! is known, the network stores **one** `ServerQuicConfig` at a time. The
-//! first call to [`Network::bind_server`] initialises the slot; subsequent
-//! calls with an identical (or `Arc::ptr_eq`) configuration succeed, while
-//! a conflicting configuration is rejected with
+//! is known, the QUIC driver stores **one** `ServerQuicConfig` at a time.
+//! The first call to [`QuicBindDriver::bind_server`] initialises that slot;
+//! subsequent calls with an identical (or `Arc::ptr_eq`) configuration
+//! succeed, while a conflicting configuration is rejected with
 //! [`BindServerError::ServerConfigConflict`]. When the last [`ServerBinding`]
 //! referring to the slot drops, the slot clears and a different configuration
 //! may be used on the next bind.
 //!
 //! ## Binds registry
 //!
-//! [`Network::bind`] registers a [`BindPattern`] with reference counting.
-//! Repeated calls with the same pattern increment the count; when every
+//! [`QuicBindDriver::bind`] and [`Network::bind_with`] register a
+//! [`BindPattern`] with reference counting. Repeated calls with the same
+//! driver and pattern increment the count; when every
 //! returned [`BindHandle`] is dropped or [`BindHandle::unbind`] is called,
 //! the count reaches zero and the bound interfaces are released.
 //! A single background reconcile task (started at build time)
@@ -96,12 +100,21 @@ fn interface_contains(interface: &::dquic::qinterface::device::Interface, ip: Ip
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BindRegistryKey {
-    driver: usize,
+    driver: BindDriverId,
     pattern: BindPattern,
 }
 
-fn bind_driver_key<D: BindDriver + ?Sized>(driver: &Arc<D>) -> usize {
-    Arc::as_ptr(driver) as *const () as usize
+/// Opaque identity of an [`Arc`]-backed [`BindDriver`].
+///
+/// The bind registry stores a strong `Arc<dyn BindDriver>` next to every key,
+/// so the allocation behind this pointer identity cannot be freed or reused
+/// while the key is live. A `Weak` key would still need the same pointer-based
+/// hashing/equality, while also mixing liveness into an identity-only key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BindDriverId(usize);
+
+fn bind_driver_id<D: BindDriver + ?Sized>(driver: &Arc<D>) -> BindDriverId {
+    BindDriverId(Arc::as_ptr(driver) as *const () as usize)
 }
 
 /// Driver that binds one concrete [`BindUri`] into a runtime binding resource.
@@ -113,25 +126,71 @@ pub trait BindDriver: Send + Sync {
     }
 }
 
+/// Built-in QUIC binding runtime owned by [`Network`].
+///
+/// Obtain it with [`Network::quic`]. Methods that register or query binds use
+/// the originating [`Network`]'s bind registry; keep the `Network` alive while
+/// using a cloned `Arc<QuicBindDriver>`.
 pub struct QuicBindDriver {
+    network: Weak<Network>,
     iface_manager: Arc<InterfaceManager>,
     io_factory: Arc<dyn ProductIO + 'static>,
+    stun_resolver: Arc<dyn Resolve + Send + Sync>,
+    stun_server: Option<Arc<str>>,
+    quic_router: Arc<QuicRouter>,
+    locations: Arc<Locations>,
+    sni_registry: SniRegistry,
+    server_slot: RwLock<Weak<sni::ServerConfig>>,
 }
 
+#[bon::bon]
 impl QuicBindDriver {
-    fn new(iface_manager: Arc<InterfaceManager>, io_factory: Arc<dyn ProductIO + 'static>) -> Self {
-        Self {
+    #[builder]
+    fn new(
+        network: Weak<Network>,
+        #[builder(default = Arc::new(InterfaceManager::new()))] iface_manager: Arc<
+            InterfaceManager,
+        >,
+        #[builder(default = Arc::new(DEFAULT_IO_FACTORY))] io_factory: Arc<dyn ProductIO + 'static>,
+        #[builder(default = Arc::new(SystemResolver))] stun_resolver: Arc<
+            dyn Resolve + Send + Sync,
+        >,
+        stun_server: Option<Arc<str>>,
+        #[builder(default = Arc::new(QuicRouter::new()))] quic_router: Arc<QuicRouter>,
+        #[builder(default = Arc::new(Locations::new()))] locations: Arc<Locations>,
+    ) -> Arc<Self> {
+        let driver = Arc::new(Self {
+            network,
             iface_manager,
             io_factory,
-        }
+            stun_resolver,
+            stun_server,
+            quic_router,
+            locations,
+            sni_registry: Arc::new(DashMap::new()),
+            server_slot: RwLock::new(Weak::new()),
+        });
+
+        let weak_driver = Arc::downgrade(&driver);
+        let installed = driver
+            .quic_router
+            .on_connectless_packets(move |packet, way| {
+                let Some(driver) = weak_driver.upgrade() else {
+                    return;
+                };
+                Self::dispatch_initial_packet(driver, packet, way);
+            });
+        tracing::debug!(installed, "sni dispatcher installation");
+
+        driver
     }
 }
 
 impl BindDriver for QuicBindDriver {
-    fn bind<'a>(&'a self, network: &'a Network, uri: BindUri) -> BoxFuture<'a, BindInterface> {
+    fn bind<'a>(&'a self, _network: &'a Network, uri: BindUri) -> BoxFuture<'a, BindInterface> {
         async move {
             let iface = self.iface_manager.bind(uri, self.io_factory.clone()).await;
-            network.init_quic_iface_components(&iface);
+            self.init_quic_iface_components(&iface);
             iface
         }
         .boxed()
@@ -145,7 +204,416 @@ impl BindDriver for QuicBindDriver {
     }
 }
 
-/// Error returned by [`Network::bind_server`].
+impl QuicBindDriver {
+    fn registry_id(&self) -> BindDriverId {
+        BindDriverId(self as *const Self as *const () as usize)
+    }
+
+    fn network(&self) -> Arc<Network> {
+        self.network
+            .upgrade()
+            .expect("quic driver is detached from network")
+    }
+
+    #[must_use]
+    pub fn locations(&self) -> Arc<Locations> {
+        self.locations.clone()
+    }
+
+    pub(crate) fn configure_connection<F, T>(
+        &self,
+        builder: ConnectionFoundation<F, T>,
+    ) -> ConnectionFoundation<F, T> {
+        builder
+            .with_iface_manager(self.iface_manager.clone())
+            .with_iface_factory(self.io_factory.clone())
+            .with_quic_router(self.quic_router.clone())
+            .with_locations(self.locations.clone())
+    }
+
+    fn init_quic_iface_components(&self, bind_iface: &BindInterface) {
+        let uri = bind_iface.bind_uri();
+        let stun_server = if let Some(server) = uri.stun_server() {
+            Some(Arc::from(server.into_owned()))
+        } else if let Some("false") = uri.prop(BindUri::STUN_PROP).as_deref() {
+            None
+        } else {
+            self.stun_server.clone()
+        };
+
+        bind_iface.with_components_mut(|components, iface| {
+            let router = components
+                .init_with(|| QuicRouterComponent::new(self.quic_router.clone()))
+                .router();
+
+            if let Some(stun_server) = stun_server {
+                let stun_router = components
+                    .init_with(|| StunRouterComponent::new(iface.downgrade()))
+                    .router();
+                let loc = components
+                    .init_with(|| {
+                        LocationsComponent::new(iface.downgrade(), self.locations.clone())
+                    })
+                    .clone();
+                let clients = components
+                    .init_with(|| {
+                        StunClientsComponent::new(
+                            iface.downgrade(),
+                            stun_router.clone(),
+                            self.stun_resolver.clone(),
+                            stun_server,
+                            Vec::new(),
+                            Some(loc),
+                        )
+                    })
+                    .clone();
+                let forwarder = components
+                    .init_with(|| ForwardersComponent::new_client(clients))
+                    .forwarder();
+                components.init_with(|| {
+                    ReceiveAndDeliverPacketComponent::builder(iface.downgrade())
+                        .quic_router(router)
+                        .stun_router(stun_router)
+                        .forwarder(forwarder)
+                        .init()
+                });
+            } else {
+                components.init_with(|| {
+                    LocationsComponent::new(iface.downgrade(), self.locations.clone())
+                });
+                components.init_with(|| {
+                    ReceiveAndDeliverPacketComponent::builder(iface.downgrade())
+                        .quic_router(router)
+                        .init()
+                });
+            }
+        });
+    }
+
+    fn server_binding_for_existing(
+        existing: &Arc<ServerEntry>,
+        bind_patterns: Arc<Vec<BindPattern>>,
+    ) -> ServerBinding {
+        ServerBinding {
+            entry: Arc::new(ServerEntry {
+                identity: existing.identity.clone(),
+                certified_key: existing.certified_key.clone(),
+                incomings_tx: existing.incomings_tx.clone(),
+                incomings_rx: existing.incomings_rx.clone(),
+                config: existing.config.clone(),
+                guard: existing.guard.clone(),
+                bind: bind_patterns,
+            }),
+        }
+    }
+
+    fn compatible_server_slot(
+        &self,
+        server_config: &ServerQuicConfig,
+    ) -> Result<Arc<ServerConfig>, BindServerError> {
+        use bind_server_error::*;
+
+        let slot_guard = self.server_slot.read().unwrap();
+        if let Some(slot) = slot_guard.upgrade() {
+            if !slot.config.is_compatible_with(server_config) {
+                return ServerConfigConflictSnafu.fail();
+            }
+            return Ok(slot);
+        }
+
+        drop(slot_guard);
+        let mut slot_guard = self.server_slot.write().unwrap();
+        if let Some(slot) = slot_guard.upgrade() {
+            if !slot.config.is_compatible_with(server_config) {
+                return ServerConfigConflictSnafu.fail();
+            }
+            return Ok(slot);
+        }
+
+        let resolver = SniCertResolver {
+            registry: Arc::downgrade(&self.sni_registry),
+        };
+        let rustls_config = Arc::new(server_config.build_rustls_server_config(resolver)?);
+        let slot = Arc::new(ServerConfig {
+            config: server_config.clone(),
+            rustls_config,
+        });
+        *slot_guard = Arc::downgrade(&slot);
+        Ok(slot)
+    }
+
+    pub async fn bind_server(
+        self: Arc<Self>,
+        identity: Arc<Identity>,
+        server_config: ServerQuicConfig,
+        bind_patterns: Arc<Vec<BindPattern>>,
+    ) -> Result<ServerBinding, BindServerError> {
+        let name = identity.name.clone();
+
+        if let Some(kv) = self.sni_registry.get(&name)
+            && let Some(existing) = kv.value().upgrade()
+            && Arc::ptr_eq(&existing.identity, &identity)
+        {
+            // NOTE: creates a new Arc<ServerEntry> sharing the existing
+            // guard. When the original entry drops before this clone,
+            // a zombie Weak<ServerEntry> lingers in sni_registry until
+            // the next bind_server call. This is benign:
+            // - SniCertResolver::resolve returns None for dead Weak
+            // - InterfaceAuthClient::verify_client_name returns SilentRefuse
+            // - Next bind_server removes the zombie via occupied.remove()
+            return Ok(Self::server_binding_for_existing(&existing, bind_patterns));
+        }
+
+        let certified_key = crate::dquic::identity::build_certified_key(&identity)?;
+
+        use dashmap::mapref::entry::Entry;
+        match self.sni_registry.entry(name.clone()) {
+            Entry::Occupied(occupied) => match occupied.get().upgrade() {
+                Some(existing) if Arc::ptr_eq(&existing.identity, &identity) => {
+                    // NOTE: same shared-guard pattern as the
+                    // pre-check path above; see that comment for
+                    // the benign zombie Weak explanation.
+                    return Ok(Self::server_binding_for_existing(&existing, bind_patterns));
+                }
+                _ => {
+                    occupied.remove();
+                }
+            },
+            Entry::Vacant(_) => {}
+        }
+
+        let slot = self.compatible_server_slot(&server_config)?;
+
+        let (incomings_tx, incomings_rx) = async_channel::bounded(server_config.backlog);
+
+        let entry = Arc::new_cyclic(|weak_entry| ServerEntry {
+            identity,
+            certified_key,
+            incomings_tx,
+            incomings_rx,
+            config: slot,
+            guard: Arc::new(RegistryGuard {
+                name: name.clone(),
+                registry: Arc::downgrade(&self.sni_registry),
+                self_entry: weak_entry.clone(),
+            }),
+            bind: bind_patterns.clone(),
+        });
+
+        self.sni_registry
+            .insert(name.clone(), Arc::downgrade(&entry));
+
+        Ok(ServerBinding { entry })
+    }
+
+    #[cfg(test)]
+    fn registered_sni_names(&self) -> Vec<Name<'static>> {
+        self.sni_registry
+            .iter()
+            .filter(|kv| kv.value().upgrade().is_some())
+            .map(|kv| kv.key().clone())
+            .collect()
+    }
+
+    /// Register a [`BindPattern`] through this built-in QUIC driver.
+    ///
+    /// Returns a [`BindHandle`] that keeps the pattern alive. When all
+    /// handles for a pattern are dropped (or [`BindHandle::unbind`] is
+    /// called), the bound interfaces are released.
+    pub async fn bind(self: Arc<Self>, pattern: BindPattern) -> BindHandle {
+        let network = self.network();
+        network.bind_with(self.clone(), pattern).await
+    }
+
+    fn collect_bound<T>(&self, map: impl Fn(&BindUri, &BindInterface) -> T) -> Vec<T> {
+        let network = self.network();
+        let registry = network
+            .bind_registry
+            .lock()
+            .expect("bind_registry poisoned");
+        let quic_driver = self.registry_id();
+        registry
+            .iter()
+            .filter(|(key, _)| key.driver == quic_driver)
+            .map(|(_, entry)| entry)
+            .flat_map(|entry| {
+                let bound = entry.bound.lock().expect("bound mutex poisoned");
+                bound
+                    .values()
+                    .map(|(uri, iface)| map(uri, iface))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Return all currently bound interfaces owned by this QUIC driver.
+    #[must_use]
+    pub fn interfaces(&self) -> Vec<BindInterface> {
+        self.collect_bound(|_, iface| iface.clone())
+    }
+
+    /// Return all currently bound URIs owned by this QUIC driver.
+    #[must_use]
+    pub fn current_bind_uris(&self) -> Vec<BindUri> {
+        self.collect_bound(|uri, _| uri.clone())
+    }
+
+    /// Return the currently bound interface for an exact [`BindUri`].
+    #[must_use]
+    pub fn get_iface(&self, uri: &BindUri) -> Option<BindInterface> {
+        let key = uri.identity_key();
+        let network = self.network();
+        let registry = network
+            .bind_registry
+            .lock()
+            .expect("bind_registry poisoned");
+        let quic_driver = self.registry_id();
+        registry
+            .iter()
+            .filter(|(key, _)| key.driver == quic_driver)
+            .map(|(_, entry)| entry)
+            .find_map(|entry| {
+                let bound = entry.bound.lock().expect("bound mutex poisoned");
+                bound.get(&key).map(|(_uri, iface)| iface.clone())
+            })
+    }
+
+    /// Return all currently bound interfaces for a specific [`BindPattern`].
+    ///
+    /// Returns `None` if the pattern has not been registered through this
+    /// driver.
+    #[must_use]
+    pub fn get_interfaces(&self, pattern: &BindPattern) -> Option<Vec<BindInterface>> {
+        let network = self.network();
+        let key = BindRegistryKey {
+            driver: self.registry_id(),
+            pattern: pattern.clone(),
+        };
+        let registry = network
+            .bind_registry
+            .lock()
+            .expect("bind_registry poisoned");
+        registry.get(&key).map(|entry| {
+            entry
+                .bound
+                .lock()
+                .expect("bound mutex poisoned")
+                .values()
+                .map(|(_, iface)| iface.clone())
+                .collect()
+        })
+    }
+
+    /// Connectionless packet dispatcher installed on the [`QuicRouter`].
+    ///
+    /// Called for every Initial / 0-RTT packet that doesn't match an
+    /// existing connection. Spawns a new server [`Connection`] using the
+    /// shared server slot, waits for the TLS handshake to reveal the SNI,
+    /// and fans the connection into the matching [`ServerBinding`]'s queue.
+    fn dispatch_initial_packet(driver: Arc<Self>, packet: Packet, way: Way) {
+        use crate::dquic::qbase::packet::{
+            DataHeader,
+            header::{self, GetDcid},
+        };
+
+        // Filter to Initial and 0-RTT packets.
+        let (bind_uri, pathway, link) = way;
+
+        let data_packet = match &packet {
+            Packet::Data(dp) => dp,
+            Packet::VN(_) | Packet::Retry(_) => return,
+        };
+
+        let DataHeader::Long(long_header) = &data_packet.header else {
+            return;
+        };
+
+        let (header::long::DataHeader::Initial(_) | header::long::DataHeader::ZeroRtt(_)) =
+            long_header
+        else {
+            return;
+        };
+
+        let origin_dcid = *data_packet.dcid();
+
+        // Read the slot synchronously: this router callback cannot await.
+        let Some(slot) = driver.server_slot.try_read().ok().and_then(|g| g.upgrade()) else {
+            return;
+        };
+
+        // Build the connection synchronously so the CID is registered in
+        // QuicRouter before the first packet is delivered.
+        let sni_registry = driver.sni_registry.clone();
+
+        let foundation = Connection::new_server(slot.config.token_provider.clone())
+            .with_parameters(slot.config.parameters.clone())
+            .with_client_auther(Box::new((
+                InterfaceAuthClient {
+                    bind_uri: bind_uri.clone(),
+                    sni_registry: sni_registry.clone(),
+                },
+                slot.config.client_auther.clone(),
+            )))
+            .with_tls_config((*slot.rustls_config).clone());
+
+        let conn = driver
+            .configure_connection(foundation)
+            .with_streams_concurrency_strategy(slot.config.stream_strategy_factory.as_ref())
+            .with_defer_idle_timeout(slot.config.defer_idle_timeout)
+            .with_zero_rtt(slot.config.enable_0rtt)
+            .with_cids(origin_dcid)
+            .with_qlog(slot.config.qlogger.clone())
+            .run();
+
+        let quic_router = driver.quic_router.clone();
+
+        // Spawn only async delivery and SNI dispatch work.
+        // Inherent termination: this task owns the newly-created server
+        // connection and exits once SNI dispatch succeeds, the SNI queue is
+        // closed, or connection name resolution fails.
+        tokio::spawn(
+            async move {
+                quic_router.deliver(packet, (bind_uri, pathway, link)).await;
+
+                // server_name() waits for TLS handshake info — do NOT call
+                // handshaked() here; for server role it blocks until a Data
+                // packet arrives, which would deadlock the test until timeout.
+                let sni = match conn.server_name().await {
+                    Ok(name) => name,
+                    Err(e) => {
+                        let report = snafu::Report::from_error(&e);
+                        tracing::debug!(
+                            error = %report,
+                            "failed to get server name"
+                        );
+                        return;
+                    }
+                };
+
+                let sni_lower = sni.to_ascii_lowercase();
+                if let Some(entry) = sni_registry
+                    .get::<str>(&sni_lower)
+                    .and_then(|item| item.value().upgrade())
+                {
+                    if entry.incomings_tx.send(conn).await.is_err() {
+                        tracing::debug!(
+                            name = %sni,
+                            "sni channel closed"
+                        );
+                    }
+                    return;
+                }
+                tracing::debug!(
+                    name = %sni,
+                    "no endpoint registered for SNI"
+                );
+            }
+            .in_current_span(),
+        );
+    }
+}
+
+/// Error returned by [`QuicBindDriver::bind_server`].
 #[derive(Debug, Snafu)]
 #[snafu(module, visibility(pub))]
 pub enum BindServerError {
@@ -155,10 +623,10 @@ pub enum BindServerError {
         /// SNI that is already registered.
         name: Name<'static>,
     },
-    /// The network already has a server configuration that is incompatible
-    /// with the one provided. Drop every existing [`ServerBinding`] before
-    /// binding with a different configuration.
-    #[snafu(display("network already holds an incompatible server configuration"))]
+    /// The QUIC driver already has a server configuration that is
+    /// incompatible with the one provided. Drop every existing
+    /// [`ServerBinding`] before binding with a different configuration.
+    #[snafu(display("quic driver already holds an incompatible server configuration"))]
     ServerConfigConflict,
     /// Loading the identity's private key into rustls failed.
     #[snafu(display("failed to load server private key"))]
@@ -174,21 +642,14 @@ pub enum BindServerError {
     },
 }
 
-/// Shared QUIC network infrastructure.
+/// Shared network bind orchestration with a built-in QUIC runtime.
 ///
 /// Used exclusively via [`Arc<Network>`]. [`Network::builder().build()`](Network::builder)
-/// returns an [`Arc`] directly after installing the SNI dispatcher on the router.
+/// returns an [`Arc`] directly after constructing the built-in QUIC driver.
 pub struct Network {
-    stun_resolver: Arc<dyn Resolve + Send + Sync>,
-    stun_server: Option<Arc<str>>,
     devices: &'static Devices,
     quic_driver: Arc<QuicBindDriver>,
-    quic_router: Arc<QuicRouter>,
-    locations: Arc<Locations>,
     bind_registry: Mutex<HashMap<BindRegistryKey, BindsEntry>>,
-    sni_registry: SniRegistry,
-    server_slot: RwLock<Weak<sni::ServerConfig>>,
-    dispatcher_installed: OnceLock<()>,
     _reconcile: OnceLock<AbortOnDropHandle<()>>,
 }
 
@@ -203,7 +664,7 @@ struct BindsEntry {
     bound: Mutex<BoundInterfaces>,
 }
 
-/// RAII handle returned by [`Network::bind`].
+/// RAII handle returned by [`QuicBindDriver::bind`] or [`Network::bind_with`].
 ///
 /// The handle holds a reference-counted spot in the bind registry.
 /// When all handles for a pattern are dropped, the bound interfaces
@@ -298,55 +759,15 @@ impl crate::dquic::net::IO for NullIo {
 impl Network {
     #[builder(start_fn(name = builder, vis = "pub"), builder_type(vis = "pub"))]
     fn new(
-        #[builder(default = Arc::new(SystemResolver))] stun_resolver: Arc<
-            dyn Resolve + Send + Sync,
-        >,
         stun_server: Option<Arc<str>>,
         #[builder(default = Devices::global())] devices: &'static Devices,
-        #[builder(default = Arc::new(DEFAULT_IO_FACTORY))] io_factory: Arc<dyn ProductIO + 'static>,
-        #[builder(default = Arc::new(InterfaceManager::new()))] iface_manager: Arc<
-            InterfaceManager,
-        >,
-        #[builder(default = Arc::new(QuicRouter::new()))] quic_router: Arc<QuicRouter>,
-        #[builder(default = Arc::new(Locations::new()))] locations: Arc<Locations>,
     ) -> Arc<Self> {
-        let network = Arc::new(Network {
-            stun_resolver,
-            stun_server,
-            devices,
-            quic_driver: Arc::new(QuicBindDriver::new(iface_manager, io_factory)),
-            quic_router,
-            locations,
-            bind_registry: Mutex::new(HashMap::new()),
-            sni_registry: Arc::new(DashMap::new()),
-            server_slot: RwLock::new(Weak::new()),
-            dispatcher_installed: OnceLock::new(),
-            _reconcile: OnceLock::new(),
-        });
-
-        // Install the SNI dispatcher on the quic router. Only succeeds once;
-        // subsequent builds on the same globally-shared router silently fail.
-        let dispatcher_net = network.clone();
-        let installed = network
-            .quic_router
-            .on_connectless_packets(move |packet, way| {
-                Self::dispatch_initial_packet(dispatcher_net.clone(), packet, way)
-            });
-        tracing::debug!(installed, "sni dispatcher installation");
-        let _ = network.dispatcher_installed.set(());
-
-        // Start the background reconcile task that keeps bound interfaces
-        // in sync with device changes.
-        let reconcile_net = network.clone();
-        let handle = tokio::spawn(
-            async move {
-                reconcile_net.run_reconcile().await;
-            }
-            .in_current_span(),
-        );
-        let _ = network._reconcile.set(AbortOnDropHandle::new(handle));
-
-        network
+        Self::build_with_quic_driver(devices, |network| {
+            QuicBindDriver::builder()
+                .network(network.clone())
+                .maybe_stun_server(stun_server)
+                .build()
+        })
     }
 }
 
@@ -355,167 +776,39 @@ impl Network {
 // ---------------------------------------------------------------------------
 
 impl Network {
-    /// Inject the network's shared components into a connection foundation
-    /// builder.
-    ///
-    /// The caller continues to chain role-specific configuration after this
-    /// call and finishes with `.with_cids(…)` / `.run()`.
-    pub(crate) fn configure_connection<F, T>(
-        &self,
-        builder: ConnectionFoundation<F, T>,
-    ) -> ConnectionFoundation<F, T> {
-        builder
-            .with_iface_manager(self.quic_driver.iface_manager.clone())
-            .with_iface_factory(self.quic_driver.io_factory.clone())
-            .with_quic_router(self.quic_router.clone())
-            .with_locations(self.locations.clone())
-    }
-
-    /// Return a clone of the shared [`Locations`] component.
-    pub fn locations(&self) -> Arc<Locations> {
-        self.locations.clone()
-    }
-
-    /// Register a server identity on the network's SNI fan-out.
-    ///
-    /// The first call initialises the shared server TLS context; later calls
-    /// must use a compatible [`ServerQuicConfig`] (or the exact same
-    /// `Arc`).  Returns a [`ServerBinding`] handle that receives accepted
-    /// connections for this SNI.
-    pub async fn bind_server(
-        self: &Arc<Self>,
-        identity: Arc<Identity>,
-        server_config: ServerQuicConfig,
-        bind_patterns: Arc<Vec<BindPattern>>,
-    ) -> Result<ServerBinding, BindServerError> {
-        use bind_server_error::*;
-
-        let name = identity.name.clone();
-
-        if let Some(kv) = self.sni_registry.get(&name)
-            && let Some(existing) = kv.value().upgrade()
-            && Arc::ptr_eq(&existing.identity, &identity)
-        {
-            let rx = existing.incomings_rx.clone();
-            // NOTE: creates a new Arc<ServerEntry> sharing the existing
-            // guard. When the original entry drops before this clone,
-            // a zombie Weak<ServerEntry> lingers in sni_registry until
-            // the next bind_server call. This is benign:
-            // - SniCertResolver::resolve returns None for dead Weak
-            // - InterfaceAuthClient::verify_client_name returns SilentRefuse
-            // - Next bind_server removes the zombie via occupied.remove()
-            let binding = ServerBinding {
-                entry: Arc::new(ServerEntry {
-                    identity: existing.identity.clone(),
-                    certified_key: existing.certified_key.clone(),
-                    incomings_tx: existing.incomings_tx.clone(),
-                    incomings_rx: rx,
-                    config: existing.config.clone(),
-                    guard: existing.guard.clone(),
-                    bind: bind_patterns.clone(),
-                }),
-            };
-            return Ok(binding);
-        }
-
-        let certified_key = crate::dquic::identity::build_certified_key(&identity)?;
-
-        use dashmap::mapref::entry::Entry;
-        match self.sni_registry.entry(name.clone()) {
-            Entry::Occupied(occupied) => match occupied.get().upgrade() {
-                Some(existing) if Arc::ptr_eq(&existing.identity, &identity) => {
-                    // NOTE: same shared-guard pattern as the
-                    // pre-check path above; see that comment for
-                    // the benign zombie Weak explanation.
-                    let binding = ServerBinding {
-                        entry: Arc::new(ServerEntry {
-                            identity: existing.identity.clone(),
-                            certified_key: existing.certified_key.clone(),
-                            incomings_tx: existing.incomings_tx.clone(),
-                            incomings_rx: existing.incomings_rx.clone(),
-                            config: existing.config.clone(),
-                            guard: existing.guard.clone(),
-                            bind: bind_patterns.clone(),
-                        }),
-                    };
-                    return Ok(binding);
-                }
-                _ => {
-                    occupied.remove();
-                }
-            },
-            Entry::Vacant(_) => {}
-        }
-
-        let slot = {
-            let slot_guard = self.server_slot.read().unwrap();
-            if let Some(slot) = slot_guard.upgrade() {
-                if !slot.config.is_compatible_with(&server_config) {
-                    return ServerConfigConflictSnafu.fail();
-                }
-                slot
-            } else {
-                drop(slot_guard);
-                let mut slot_guard = self.server_slot.write().unwrap();
-                if let Some(slot) = slot_guard.upgrade() {
-                    if !slot.config.is_compatible_with(&server_config) {
-                        return ServerConfigConflictSnafu.fail();
-                    }
-                    slot
-                } else {
-                    let sni_registry_weak = Arc::downgrade(&self.sni_registry);
-                    let resolver = SniCertResolver {
-                        registry: sni_registry_weak,
-                    };
-                    let rustls_config =
-                        Arc::new(server_config.build_rustls_server_config(resolver)?);
-                    let slot = Arc::new(ServerConfig {
-                        config: server_config.clone(),
-                        rustls_config,
-                    });
-                    *slot_guard = Arc::downgrade(&slot);
-                    slot
-                }
+    fn build_with_quic_driver(
+        devices: &'static Devices,
+        build_quic_driver: impl FnOnce(Weak<Network>) -> Arc<QuicBindDriver>,
+    ) -> Arc<Self> {
+        let network = Arc::new_cyclic(|network| {
+            let quic_driver = build_quic_driver(network.clone());
+            Network {
+                devices,
+                quic_driver,
+                bind_registry: Mutex::new(HashMap::new()),
+                _reconcile: OnceLock::new(),
             }
-        };
-
-        let (incomings_tx, incomings_rx) = async_channel::bounded(server_config.backlog);
-
-        let guard = Arc::new(RegistryGuard {
-            name: name.clone(),
-            registry: Arc::downgrade(&self.sni_registry),
-            self_entry: Weak::new(),
         });
 
-        let entry = Arc::new_cyclic(|_weak_entry| ServerEntry {
-            identity,
-            certified_key,
-            incomings_tx,
-            incomings_rx,
-            config: slot,
-            guard: guard.clone(),
-            bind: bind_patterns.clone(),
-        });
+        // Start the background reconcile task that keeps bound interfaces
+        // in sync with device changes.
+        let reconcile_net = Arc::downgrade(&network);
+        let devices = network.devices;
+        let handle = tokio::spawn(
+            async move {
+                Network::run_reconcile(reconcile_net, devices).await;
+            }
+            .in_current_span(),
+        );
+        let _ = network._reconcile.set(AbortOnDropHandle::new(handle));
 
-        // Fix the guard's self_entry to point at the entry we just created.
-        // Safety: guard's only strong reference is held here and in `entry`.
-        // We use unsafe to get a mutable ref to the Arc's inner (unique).
-        let guard_mut = unsafe { &mut *(Arc::as_ptr(&guard) as *mut RegistryGuard) };
-        guard_mut.self_entry = Arc::downgrade(&entry);
-
-        self.sni_registry
-            .insert(name.clone(), Arc::downgrade(&entry));
-
-        Ok(ServerBinding { entry })
+        network
     }
 
-    /// Register a [`BindPattern`] through the default QUIC driver.
-    ///
-    /// Returns a [`BindHandle`] that keeps the pattern alive. When all
-    /// handles for a pattern are dropped (or [`BindHandle::unbind`] is
-    /// called), the bound interfaces are released.
-    pub async fn bind(self: &Arc<Self>, pattern: BindPattern) -> BindHandle {
-        self.bind_with(self.quic_driver.clone(), pattern).await
+    /// Return the built-in QUIC runtime view for QUIC-specific operations.
+    #[must_use]
+    pub fn quic(&self) -> Arc<QuicBindDriver> {
+        self.quic_driver.clone()
     }
 
     /// Register a [`BindPattern`] through an explicit binding driver.
@@ -524,7 +817,7 @@ impl Network {
         D: BindDriver + 'static,
     {
         let key = BindRegistryKey {
-            driver: bind_driver_key(&driver),
+            driver: bind_driver_id(&driver),
             pattern,
         };
         let driver_erased: Arc<dyn BindDriver> = driver;
@@ -574,65 +867,6 @@ impl Network {
         }
     }
 
-    fn init_quic_iface_components(&self, bind_iface: &BindInterface) {
-        let uri = bind_iface.bind_uri();
-        let stun_server = if let Some(server) = uri.stun_server() {
-            Some(Arc::from(server.into_owned()))
-        } else if let Some("false") = uri.prop(BindUri::STUN_PROP).as_deref() {
-            None
-        } else {
-            self.stun_server.clone()
-        };
-
-        bind_iface.with_components_mut(|components, iface| {
-            let router = components
-                .init_with(|| QuicRouterComponent::new(self.quic_router.clone()))
-                .router();
-
-            if let Some(stun_server) = stun_server {
-                let stun_router = components
-                    .init_with(|| StunRouterComponent::new(iface.downgrade()))
-                    .router();
-                let loc = components
-                    .init_with(|| {
-                        LocationsComponent::new(iface.downgrade(), self.locations.clone())
-                    })
-                    .clone();
-                let clients = components
-                    .init_with(|| {
-                        StunClientsComponent::new(
-                            iface.downgrade(),
-                            stun_router.clone(),
-                            self.stun_resolver.clone(),
-                            stun_server,
-                            Vec::new(),
-                            Some(loc),
-                        )
-                    })
-                    .clone();
-                let forwarder = components
-                    .init_with(|| ForwardersComponent::new_client(clients))
-                    .forwarder();
-                components.init_with(|| {
-                    ReceiveAndDeliverPacketComponent::builder(iface.downgrade())
-                        .quic_router(router)
-                        .stun_router(stun_router)
-                        .forwarder(forwarder)
-                        .init()
-                });
-            } else {
-                components.init_with(|| {
-                    LocationsComponent::new(iface.downgrade(), self.locations.clone())
-                });
-                components.init_with(|| {
-                    ReceiveAndDeliverPacketComponent::builder(iface.downgrade())
-                        .quic_router(router)
-                        .init()
-                });
-            }
-        });
-    }
-
     /// Release a previously registered [`BindPattern`] and its bound
     /// interfaces.
     async fn unbind(&self, key: &BindRegistryKey) {
@@ -655,61 +889,11 @@ impl Network {
         }
     }
 
-    /// Return all currently bound interfaces across all patterns.
-    pub fn interfaces(&self) -> Vec<BindInterface> {
-        let registry = self.bind_registry.lock().expect("bind_registry poisoned");
-        let quic_driver = bind_driver_key(&self.quic_driver);
-        registry
-            .iter()
-            .filter(|(key, _)| key.driver == quic_driver)
-            .map(|(_, entry)| entry)
-            .flat_map(|entry| {
-                let bound = entry.bound.lock().expect("bound mutex poisoned");
-                bound
-                    .values()
-                    .map(|(_uri, iface)| iface.clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
-    /// Return all currently bound URIs across all registered patterns.
-    pub fn current_bind_uris(&self) -> Vec<BindUri> {
-        let registry = self.bind_registry.lock().expect("bind_registry poisoned");
-        let quic_driver = bind_driver_key(&self.quic_driver);
-        registry
-            .iter()
-            .filter(|(key, _)| key.driver == quic_driver)
-            .map(|(_, entry)| entry)
-            .flat_map(|entry| {
-                let bound = entry.bound.lock().expect("bound mutex poisoned");
-                bound
-                    .values()
-                    .map(|(uri, _iface)| uri.clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
-    /// Return the currently bound interface for an exact [`BindUri`].
-    pub fn get_iface(&self, uri: &BindUri) -> Option<BindInterface> {
-        let key = uri.identity_key();
-        let registry = self.bind_registry.lock().expect("bind_registry poisoned");
-        let quic_driver = bind_driver_key(&self.quic_driver);
-        registry
-            .iter()
-            .filter(|(key, _)| key.driver == quic_driver)
-            .map(|(_, entry)| entry)
-            .find_map(|entry| {
-                let bound = entry.bound.lock().expect("bound mutex poisoned");
-                bound.get(&key).map(|(_uri, iface)| iface.clone())
-            })
-    }
-
     /// Resolve the current address for a device and IP family.
     ///
     /// Bind drivers use this to derive per-device resources from the same
     /// device snapshot that drives [`Network`] reconciliation.
+    #[must_use]
     pub fn resolve_device_addr(&self, device: &str, family: Family) -> Option<IpAddr> {
         self.devices.resolve(device, family)
     }
@@ -720,6 +904,7 @@ impl Network {
     /// Stale bind handles can briefly outlive netlink reconciliation after a
     /// device is removed. In that case the device is absent from the current
     /// snapshot and this method returns `false`.
+    #[must_use]
     pub fn bound_addr_is_on_default_route(
         &self,
         bind_uri: &BindUri,
@@ -742,15 +927,8 @@ impl Network {
         })
     }
 
-    /// Return all currently bound interfaces for a specific [`BindPattern`].
-    ///
-    /// Returns `None` if the pattern has not been registered via
-    /// [`Network::bind`].
-    pub fn get_interfaces(&self, pattern: &BindPattern) -> Option<Vec<BindInterface>> {
-        self.get_interfaces_with(&self.quic_driver, pattern)
-    }
-
     /// Return all currently bound interfaces for a specific driver and pattern.
+    #[must_use]
     pub fn get_interfaces_with<D>(
         &self,
         driver: &Arc<D>,
@@ -760,7 +938,7 @@ impl Network {
         D: BindDriver + ?Sized,
     {
         let key = BindRegistryKey {
-            driver: bind_driver_key(driver),
+            driver: bind_driver_id(driver),
             pattern: pattern.clone(),
         };
         let registry = self.bind_registry.lock().expect("bind_registry poisoned");
@@ -775,155 +953,32 @@ impl Network {
         })
     }
 
-    /// Return the server names currently registered in the SNI registry.
-    ///
-    /// Only names with live [`ServerBinding`] handles are included; entries
-    /// that have been dropped are automatically cleaned up by the [`RegistryGuard`]
-    /// drop logic.
-    #[allow(dead_code, reason = "used in test module")]
-    pub(crate) fn registered_sni_names(&self) -> Vec<Name<'static>> {
-        self.sni_registry
-            .iter()
-            .filter(|kv| kv.value().upgrade().is_some())
-            .map(|kv| kv.key().clone())
-            .collect()
-    }
-
-    /// Connectionless packet dispatcher installed on the [`QuicRouter`].
-    ///
-    /// Called for every Initial / 0-RTT packet that doesn't match an
-    /// existing connection.  Spawns a new server [`Connection`] using the
-    /// shared server slot, waits for the TLS handshake to reveal the SNI,
-    /// and fans the connection into the matching [`ServerBinding`]'s queue.
-    fn dispatch_initial_packet(network: Arc<Self>, packet: Packet, way: Way) {
-        use crate::dquic::qbase::packet::{
-            DataHeader,
-            header::{self, GetDcid},
-        };
-
-        // === STEP 1: Filter — only Initial and 0-RTT packets ===
-        let (bind_uri, pathway, link) = way;
-
-        let data_packet = match &packet {
-            Packet::Data(dp) => dp,
-            Packet::VN(_) | Packet::Retry(_) => return,
-        };
-
-        let DataHeader::Long(long_header) = &data_packet.header else {
-            return;
-        };
-
-        let (header::long::DataHeader::Initial(_) | header::long::DataHeader::ZeroRtt(_)) =
-            long_header
-        else {
-            return;
-        };
-
-        let origin_dcid = *data_packet.dcid();
-
-        // === STEP 2: Get slot synchronously (try_read, no await) ===
-        let Some(slot) = network
-            .server_slot
-            .try_read()
-            .ok()
-            .and_then(|g| g.upgrade())
-        else {
-            return;
-        };
-
-        // === STEP 3: Build Connection synchronously — CID registered in QuicRouter NOW ===
-        let sni_registry = network.sni_registry.clone();
-
-        let foundation = Connection::new_server(slot.config.token_provider.clone())
-            .with_parameters(slot.config.parameters.clone())
-            .with_client_auther(Box::new((
-                InterfaceAuthClient {
-                    bind_uri: bind_uri.clone(),
-                    sni_registry: sni_registry.clone(),
-                },
-                slot.config.client_auther.clone(),
-            )))
-            .with_tls_config((*slot.rustls_config).clone());
-
-        let foundation = network.configure_connection(foundation);
-        let conn = foundation
-            .with_streams_concurrency_strategy(slot.config.stream_strategy_factory.as_ref())
-            .with_defer_idle_timeout(slot.config.defer_idle_timeout)
-            .with_zero_rtt(slot.config.enable_0rtt)
-            .with_cids(origin_dcid)
-            .with_qlog(slot.config.qlogger.clone())
-            .run();
-
-        let quic_router = network.quic_router.clone();
-
-        // === STEP 4: Spawn only async work (deliver + wait for SNI + dispatch) ===
-        tokio::spawn(
-            async move {
-                quic_router.deliver(packet, (bind_uri, pathway, link)).await;
-
-                // server_name() waits for TLS handshake info — do NOT call
-                // handshaked() here; for server role it blocks until a Data
-                // packet arrives, which would deadlock the test until timeout.
-                let sni = match conn.server_name().await {
-                    Ok(name) => name,
-                    Err(e) => {
-                        let report = snafu::Report::from_error(&e);
-                        tracing::debug!(
-                            error = %report,
-                            "failed to get server name"
-                        );
-                        return;
-                    }
-                };
-
-                let sni_lower = sni.to_ascii_lowercase();
-                if let Some(entry) = sni_registry
-                    .get::<str>(&sni_lower)
-                    .and_then(|item| item.value().upgrade())
-                {
-                    if entry.incomings_tx.send(conn).await.is_err() {
-                        tracing::debug!(
-                            name = %sni,
-                            "sni channel closed"
-                        );
-                    }
-                    return;
-                }
-                tracing::debug!(
-                    name = %sni,
-                    "no endpoint registered for SNI"
-                );
-            }
-            .in_current_span(),
-        );
-    }
     /// Background task that reconciles bound interfaces with device changes.
-    #[allow(clippy::type_complexity)]
-    async fn run_reconcile(&self) {
-        let mut monitor = self.devices.monitor();
+    async fn run_reconcile(network: Weak<Network>, devices: &'static Devices) {
+        let mut monitor = devices.monitor();
         while let Some((_interfaces, event)) = monitor.update().await {
+            let Some(network) = network.upgrade() else {
+                break;
+            };
             tracing::debug!(?event, "network interface change, reconciling binds");
-            self.reconcile_once().await;
+            network.reconcile_once().await;
         }
     }
 
     /// Extracted reconcile logic, run per interface change.
     async fn reconcile_once(&self) {
-        let entries: Vec<(BindRegistryKey, Arc<dyn BindDriver>, BoundInterfaces)> = {
+        let entries: Vec<(BindRegistryKey, BoundInterfaces, Arc<dyn BindDriver>)> = {
             let registry = self.bind_registry.lock().expect("bind_registry poisoned");
             registry
                 .iter()
                 .map(|(key, entry)| {
                     let bound = entry.bound.lock().expect("bound mutex poisoned");
-                    (key.clone(), entry.driver.clone(), bound.clone())
+                    (key.clone(), bound.clone(), entry.driver.clone())
                 })
                 .collect()
         };
 
-        for (key, mut bound, driver) in entries
-            .into_iter()
-            .map(|(key, driver, bound)| (key, bound, driver))
-        {
+        for (key, mut bound, driver) in entries {
             let desired_uris: Vec<BindUri> = key
                 .pattern
                 .to_bind_uris(self.devices.interfaces().keys().map(String::as_str))
@@ -1074,19 +1129,22 @@ mod tests {
         let config = make_server_config();
 
         let binding_a = network
+            .quic()
             .bind_server(identity_a.clone(), config.clone(), Arc::new(Vec::new()))
             .await
             .expect("first bind should succeed");
 
         let binding_b = network
+            .quic()
             .bind_server(identity_b.clone(), config.clone(), Arc::new(Vec::new()))
             .await
             .expect("second bind with different identity should succeed (overwrite)");
 
         assert_eq!(binding_a.name(), binding_b.name());
-        assert_eq!(network.sni_registry.len(), 1);
+        let quic = network.quic();
+        assert_eq!(quic.sni_registry.len(), 1);
 
-        let entry = network
+        let entry = quic
             .sni_registry
             .get(binding_b.name())
             .and_then(|kv| kv.value().upgrade())
@@ -1101,24 +1159,27 @@ mod tests {
         let config = make_server_config();
 
         let binding_a = network
+            .quic()
             .bind_server(identity.clone(), config.clone(), Arc::new(Vec::new()))
             .await
             .expect("first bind should succeed");
 
         let binding_b = network
+            .quic()
             .bind_server(identity.clone(), config.clone(), Arc::new(Vec::new()))
             .await
             .expect("second bind with same identity should succeed (reuse)");
 
         assert_eq!(binding_a.name(), binding_b.name());
-        assert_eq!(network.sni_registry.len(), 1);
+        let quic = network.quic();
+        assert_eq!(quic.sni_registry.len(), 1);
 
-        let entry_a = network
+        let entry_a = quic
             .sni_registry
             .get(binding_a.name())
             .and_then(|kv| kv.value().upgrade())
             .expect("registry should have the entry");
-        let entry_b = network
+        let entry_b = quic
             .sni_registry
             .get(binding_b.name())
             .and_then(|kv| kv.value().upgrade())
@@ -1136,15 +1197,57 @@ mod tests {
     #[tokio::test]
     async fn test_network_locations() {
         let network = Network::builder().build();
-        let locations = network.locations();
+        let locations = network.quic().locations();
         let _cloned = locations.clone();
+    }
+
+    #[tokio::test]
+    async fn quic_driver_exposes_quic_specific_queries() {
+        let network = Network::builder().build();
+        let quic: Arc<QuicBindDriver> = network.quic();
+        assert!(Arc::ptr_eq(&quic, &network.quic()));
+        assert!(Arc::ptr_eq(&quic.locations(), &network.quic().locations()));
+
+        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+        let mut handle = quic.clone().bind(pattern.clone()).await;
+
+        let quic_interfaces = quic.interfaces();
+
+        let quic_uris = quic.current_bind_uris();
+
+        if let Some(uri) = quic_uris.first() {
+            assert!(quic.get_iface(uri).is_some());
+        }
+
+        assert_eq!(
+            quic.get_interfaces(&pattern)
+                .expect("quic interfaces should be registered")
+                .len(),
+            quic_interfaces.len()
+        );
+
+        handle.unbind().await;
+    }
+
+    #[tokio::test]
+    async fn network_drop_is_not_prevented_by_background_callbacks() {
+        let network = Network::builder().build();
+        let weak = Arc::downgrade(&network);
+
+        drop(network);
+        tokio::task::yield_now().await;
+
+        assert!(
+            weak.upgrade().is_none(),
+            "network should not be retained by reconcile or router callbacks"
+        );
     }
 
     #[tokio::test]
     async fn test_network_registered_sni_names_empty() {
         let network = Network::builder().build();
         assert!(
-            network.registered_sni_names().is_empty(),
+            network.quic().registered_sni_names().is_empty(),
             "fresh network should have no registered sni names"
         );
     }
@@ -1156,11 +1259,12 @@ mod tests {
         let config = make_server_config();
 
         let _binding = network
+            .quic()
             .bind_server(identity, config, Arc::new(Vec::new()))
             .await
             .expect("bind should succeed");
 
-        let names = network.registered_sni_names();
+        let names = network.quic().registered_sni_names();
         assert_eq!(names.len(), 1);
         assert_eq!(names[0].as_str(), "alpha");
     }
@@ -1172,14 +1276,15 @@ mod tests {
         let config = make_server_config();
 
         let binding = network
+            .quic()
             .bind_server(identity, config, Arc::new(Vec::new()))
             .await
             .expect("bind should succeed");
 
-        assert_eq!(network.registered_sni_names().len(), 1);
+        assert_eq!(network.quic().registered_sni_names().len(), 1);
         drop(binding);
         assert!(
-            network.registered_sni_names().is_empty(),
+            network.quic().registered_sni_names().is_empty(),
             "names should be empty after dropping the last binding"
         );
     }
@@ -1192,11 +1297,13 @@ mod tests {
         let config = make_server_config();
 
         let binding_a = network
+            .quic()
             .bind_server(identity_a.clone(), config.clone(), Arc::new(Vec::new()))
             .await
             .expect("first bind should succeed");
 
         let binding_b = network
+            .quic()
             .bind_server(identity_b.clone(), config.clone(), Arc::new(Vec::new()))
             .await
             .expect("second bind with same config should succeed");
@@ -1204,7 +1311,7 @@ mod tests {
         assert_eq!(binding_a.name().as_str(), "a");
         assert_eq!(binding_b.name().as_str(), "b");
 
-        let names = network.registered_sni_names();
+        let names = network.quic().registered_sni_names();
         assert_eq!(names.len(), 2, "both names should be registered");
         assert!(names.iter().any(|n| n.as_str() == "a"));
         assert!(names.iter().any(|n| n.as_str() == "b"));
@@ -1239,7 +1346,7 @@ mod tests {
             "Display should contain 'incompatible': {display}"
         );
         assert!(
-            display.starts_with("network"),
+            display.starts_with("quic driver"),
             "Display should start with lowercase: {display}"
         );
         assert!(
@@ -1271,6 +1378,7 @@ mod tests {
         let config = make_server_config();
 
         let binding = network
+            .quic()
             .bind_server(identity, config, Arc::new(Vec::new()))
             .await
             .expect("bind should succeed");
@@ -1285,6 +1393,7 @@ mod tests {
         let config = make_server_config();
 
         let binding = network
+            .quic()
             .bind_server(identity, config, Arc::new(Vec::new()))
             .await
             .expect("bind should succeed");
@@ -1297,18 +1406,20 @@ mod tests {
     #[tokio::test]
     async fn test_network_configure_connection() {
         let network = Network::builder().build();
-        let provider = TlsClientConfig::builder().crypto_provider().clone();
-        let tls = TlsClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .expect("TLS 1.3 should be supported")
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_no_client_auth();
+        let new_builder = || {
+            let provider = TlsClientConfig::builder().crypto_provider().clone();
+            let tls = TlsClientConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .expect("TLS 1.3 should be supported")
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
 
-        let builder =
             Connection::new_client("test.example.com".to_string(), Arc::new(NoopTokenRegistry))
-                .with_tls_config(tls);
+                .with_tls_config(tls)
+        };
 
-        let _foundation = network.configure_connection(builder);
+        let _foundation = network.quic().configure_connection(new_builder());
+        let _foundation = network.quic().configure_connection(new_builder());
     }
 
     #[test]
@@ -1332,10 +1443,12 @@ mod tests {
         };
 
         let _held = network
+            .quic()
             .bind_server(a, cfg_a, Arc::new(Vec::new()))
             .await
             .expect("first bind succeeds");
         let err = network
+            .quic()
             .bind_server(b, cfg_b, Arc::new(Vec::new()))
             .await
             .expect_err("incompatible server config must fail");
@@ -1359,6 +1472,7 @@ mod tests {
 
         {
             let _first = network
+                .quic()
                 .bind_server(make_identity("alpha"), cfg_a, Arc::new(Vec::new()))
                 .await
                 .expect("first bind succeeds");
@@ -1366,6 +1480,7 @@ mod tests {
         // After the binding drops the slot should clear, allowing a new
         // incompatible config to install.
         let _second = network
+            .quic()
             .bind_server(make_identity("beta"), cfg_b, Arc::new(Vec::new()))
             .await
             .expect("slot should auto-reset after last binding dropped");
@@ -1443,6 +1558,18 @@ mod tests {
         assert_eq!(a_ifaces.len(), b_ifaces.len());
         assert!(!a_ifaces.is_empty());
         assert!(!a_ifaces[0].borrow().same_io(&b_ifaces[0].borrow()));
+        assert!(
+            network.quic().interfaces().is_empty(),
+            "non-quic driver binds must not appear in quic interface queries"
+        );
+        assert!(
+            network.quic().current_bind_uris().is_empty(),
+            "non-quic driver binds must not appear in quic bind uri queries"
+        );
+        assert!(
+            network.quic().get_interfaces(&pattern).is_none(),
+            "non-quic driver binds must not appear in quic pattern queries"
+        );
 
         handle_a.unbind().await;
         handle_b.unbind().await;
@@ -1578,16 +1705,20 @@ mod tests {
             bind_count: AtomicUsize::new(0),
         });
         let manager = Arc::new(InterfaceManager::new());
-        let network = Network::builder()
-            .iface_manager(manager)
-            .io_factory(factory.clone())
-            .build();
+        let network = Network::build_with_quic_driver(Devices::global(), |network| {
+            QuicBindDriver::builder()
+                .network(network)
+                .iface_manager(manager)
+                .io_factory(factory.clone())
+                .build()
+        });
         let uri: BindUri = "inet://127.0.0.1:0".parse().expect("valid bind uri");
 
-        let iface = network.quic_driver.bind(&network, uri).await;
+        let quic = network.quic();
+        let iface = BindDriver::bind(quic.as_ref(), &network, uri).await;
         let before = iface.borrow().bound_addr().expect("initial bound addr");
 
-        network.quic_driver.rebind(&network, &iface).await;
+        quic.rebind(&network, &iface).await;
 
         let after = iface.borrow().bound_addr().expect("rebound addr");
         assert_ne!(before, after, "quic bind driver must replace stale IO");

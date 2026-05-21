@@ -85,6 +85,7 @@ pub async fn test_server() -> (h3x::dquic::H3Endpoint, Authority) {
         .build()
         .await;
     let bind_iface = network
+        .quic()
         .interfaces()
         .into_iter()
         .next()

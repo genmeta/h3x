@@ -1,11 +1,11 @@
-//! Per-SNI server state used by [`Network`](super::Network) to fan out
-//! incoming connections across many [`QuicEndpoint`](super::QuicEndpoint)
-//! instances.
+//! Per-SNI server state used by [`QuicBindDriver`](super::QuicBindDriver) to
+//! fan out incoming connections across many
+//! [`QuicEndpoint`](super::QuicEndpoint) instances.
 //!
 //! A [`ServerBinding`] is cheap to clone: each clone shares the same
 //! mpmc [`async_channel`] tail, so multiple endpoints that registered the
 //! same SNI cooperatively drain inbound connections. Dropping the last
-//! strong reference unregisters the SNI entry from the network.
+//! strong reference unregisters the SNI entry from the QUIC driver.
 
 use std::sync::{Arc, Weak};
 
@@ -18,7 +18,7 @@ use rustls::{
 
 use crate::dquic::{binds::BindPattern, connection::Connection, identity::Identity};
 
-/// Per-SNI entry stored behind a `Weak` in the network's registry.
+/// Per-SNI entry stored behind a `Weak` in the QUIC driver's registry.
 ///
 /// Holds an mpmc channel so multiple [`ServerBinding`] clones share the
 /// same inbound connection queue.
@@ -58,15 +58,16 @@ impl Drop for RegistryGuard {
 }
 
 /// Shared server-side QUIC/TLS context. At most one instance exists per
-/// [`Network`](super::Network) at any time; identical instances are shared
-/// across all registered SNIs, and conflicting configurations are rejected
-/// at `bind_server` time.
+/// [`QuicBindDriver`](super::QuicBindDriver) at any time; identical instances
+/// are shared across all registered SNIs, and conflicting configurations are
+/// rejected at `bind_server` time.
 pub(crate) struct ServerConfig {
     pub(crate) config: crate::dquic::server::ServerQuicConfig,
     pub(crate) rustls_config: Arc<rustls::ServerConfig>,
 }
 
-/// Public handle returned by [`Network::bind_server`](super::Network::bind_server).
+/// Public handle returned by
+/// [`QuicBindDriver::bind_server`](super::QuicBindDriver::bind_server).
 ///
 /// Cloning is cheap and yields a new receiver on the **same** mpmc queue —
 /// concurrently calling `recv` from multiple clones fans out inbound
@@ -106,7 +107,7 @@ impl ServerBinding {
     }
 }
 
-/// rustls `ResolvesServerCert` backed by the network's SNI registry.
+/// rustls `ResolvesServerCert` backed by the QUIC driver's SNI registry.
 ///
 /// SNI names are matched ASCII case-insensitively per RFC 6066 §3.
 #[derive(Clone)]
