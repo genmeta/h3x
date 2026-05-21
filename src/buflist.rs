@@ -24,6 +24,13 @@ impl BufList {
         }
     }
 
+    /// Copy all remaining bytes from a [`Buf`] into a new [`BufList`].
+    pub fn from_buf(buf: impl Buf) -> Self {
+        let mut buflist = Self::new();
+        buflist.write(buf);
+        buflist
+    }
+
     pub fn write(&mut self, mut buf: impl Buf) {
         while buf.has_remaining() {
             self.bufs.push_back(buf.copy_to_bytes(buf.chunk().len()));
@@ -346,6 +353,14 @@ mod tests {
         assert_eq!(bl.remaining(), 5);
         assert!(bl.has_remaining());
         assert_eq!(bl.chunk(), b"hello");
+    }
+
+    #[test]
+    fn from_buf_copies_all_remaining_data() {
+        let source = Bytes::from_static(b"hello world").slice(6..);
+        let bl = BufList::from_buf(source);
+        assert_eq!(bl.remaining(), 5);
+        assert_eq!(bl.chunk(), b"world");
     }
 
     #[test]
