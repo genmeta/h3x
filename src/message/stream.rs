@@ -140,81 +140,6 @@ impl ReadStream {
         self.state.quic()
     }
 
-    pub async fn peer_goaway_covers(
-        &mut self,
-    ) -> Result<impl Future<Output = Result<(), quic::ConnectionError>> + use<>, quic::StreamError>
-    {
-        let stream_id = self.stream.stream_id().await?;
-        let state = self.state.clone();
-
-        Ok(async move {
-            let conn = state.quic().clone();
-            let error = conn.closed();
-            let dhttp_state = state
-                .protocols()
-                .get::<DHttpProtocol>()
-                .unwrap()
-                .state
-                .clone();
-            tokio::select! {
-                biased;
-                _goaway = dhttp_state.peer_goaway_covers(stream_id) => Ok(()),
-                error = error => Err(error),
-            }
-        })
-    }
-
-    pub async fn try_stream_io<T>(
-        &mut self,
-        f: impl AsyncFnOnce(&mut Self) -> Result<T, connection::StreamError>,
-    ) -> Result<T, MessageStreamError> {
-        let peer_goaway = self.peer_goaway_covers().await?;
-        tokio::select! {
-            result = f(self) => match result {
-                Ok(value) => Ok(value),
-                Err(error) => Err(self.handle_stream_error(error).await.into()),
-            },
-            goaway = peer_goaway => match goaway {
-                Ok(()) => {
-                    // FIXME: which code should be used?
-                    _ = self.stream.stop(Code::H3_NO_ERROR.into()).await;
-                    Err(ConnectionGoaway::Peer.into())
-                }
-                Err(error) => Err(error.into())
-            }
-        }
-    }
-
-    /// Resolve a stream-level H3 error into a `quic::StreamError`, performing
-    /// the correct side effect for each variant:
-    ///
-    /// - `Connection` — delegate to [`LifecycleExt::handle_connection_error`]
-    ///   so that a fresh H3 connection-scope violation closes the QUIC
-    ///   connection.
-    /// - `Reset` — nothing to do locally; the peer already reset the stream.
-    /// - `H3` — a freshly detected stream-scope protocol violation; issue
-    ///   `STOP_SENDING` on this reader so the peer observes the abort.
-    pub async fn handle_stream_error(
-        &mut self,
-        error: connection::StreamError,
-    ) -> quic::StreamError {
-        match error {
-            connection::StreamError::Connection { source } => self
-                .state
-                .quic()
-                .as_ref()
-                .handle_connection_error(source)
-                .await
-                .into(),
-            connection::StreamError::Reset { code } => quic::StreamError::Reset { code },
-            connection::StreamError::H3 { source } => {
-                let code = source.code().into_inner();
-                _ = self.stream.stop(code).await;
-                quic::StreamError::Reset { code }
-            }
-        }
-    }
-
     pub async fn peek_frame(
         &mut self,
     ) -> Option<Result<ReadableFrame<'_, BoxDynQuicStreamReader>, connection::StreamError>> {
@@ -305,6 +230,81 @@ impl ReadStream {
             .await
     }
 
+    pub async fn peer_goaway_covers(
+        &mut self,
+    ) -> Result<impl Future<Output = Result<(), quic::ConnectionError>> + use<>, quic::StreamError>
+    {
+        let stream_id = self.stream.stream_id().await?;
+        let state = self.state.clone();
+
+        Ok(async move {
+            let conn = state.quic().clone();
+            let error = conn.closed();
+            let dhttp_state = state
+                .protocols()
+                .get::<DHttpProtocol>()
+                .unwrap()
+                .state
+                .clone();
+            tokio::select! {
+                biased;
+                _goaway = dhttp_state.peer_goaway_covers(stream_id) => Ok(()),
+                error = error => Err(error),
+            }
+        })
+    }
+
+    pub async fn try_stream_io<T>(
+        &mut self,
+        f: impl AsyncFnOnce(&mut Self) -> Result<T, connection::StreamError>,
+    ) -> Result<T, MessageStreamError> {
+        let peer_goaway = self.peer_goaway_covers().await?;
+        tokio::select! {
+            result = f(self) => match result {
+                Ok(value) => Ok(value),
+                Err(error) => Err(self.handle_stream_error(error).await.into()),
+            },
+            goaway = peer_goaway => match goaway {
+                Ok(()) => {
+                    // FIXME: which code should be used?
+                    _ = self.stream.stop(Code::H3_NO_ERROR.into()).await;
+                    Err(ConnectionGoaway::Peer.into())
+                }
+                Err(error) => Err(error.into())
+            }
+        }
+    }
+
+    /// Resolve a stream-level H3 error into a `quic::StreamError`, performing
+    /// the correct side effect for each variant:
+    ///
+    /// - `Connection` — delegate to [`LifecycleExt::handle_connection_error`]
+    ///   so that a fresh H3 connection-scope violation closes the QUIC
+    ///   connection.
+    /// - `Reset` — nothing to do locally; the peer already reset the stream.
+    /// - `H3` — a freshly detected stream-scope protocol violation; issue
+    ///   `STOP_SENDING` on this reader so the peer observes the abort.
+    pub async fn handle_stream_error(
+        &mut self,
+        error: connection::StreamError,
+    ) -> quic::StreamError {
+        match error {
+            connection::StreamError::Connection { source } => self
+                .state
+                .quic()
+                .as_ref()
+                .handle_connection_error(source)
+                .await
+                .into(),
+            connection::StreamError::Reset { code } => quic::StreamError::Reset { code },
+            connection::StreamError::H3 { source } => {
+                let code = source.code().into_inner();
+                _ = self.stream.stop(code).await;
+                quic::StreamError::Reset { code }
+            }
+        }
+    }
+
     pub fn take(&mut self) -> Self {
         let taken = self.stream.inner_mut().take();
         Self {
@@ -375,14 +375,73 @@ impl WriteStream {
         self.write_frame(frame).await
     }
 
+    pub async fn write_header_frame(
+        &mut self,
+        field_lines: impl IntoIterator<Item = FieldLine> + Send,
+    ) -> Result<Result<(), EncodeError>, connection::StreamError> {
+        let algo = &DEFAULT_COMPRESS_ALGO;
+        let stream = &mut self.stream;
+        match Encoder::encode(&*self.qpack_encoder, field_lines, algo, stream).await {
+            Ok(frame) => Ok(Ok(self.write_frame(frame).await?)),
+            Err(EncodeHeaderSectionError::Encode { source }) => Ok(Err(source)),
+            Err(EncodeHeaderSectionError::Stream { source }) => Err(source),
+        }
+    }
+
     pub async fn write_data(&mut self, data: impl Buf + Send) -> Result<(), MessageStreamError> {
         let frame = Frame::new(Frame::DATA_FRAME_TYPE, data)?;
         self.try_stream_io(async move |this| this.write_frame(frame).await)
             .await
     }
 
+    pub async fn write_header(
+        &mut self,
+        field_lines: impl IntoIterator<Item = FieldLine> + Send,
+    ) -> Result<(), MessageStreamError> {
+        let result = self
+            .try_stream_io(async move |this| this.write_header_frame(field_lines).await)
+            .await?;
+
+        // Flush encoder instructions (dynamic table insertions) to the encoder stream.
+        // Encoder stream errors are connection-level: reset = connection error per RFC 9204.
+        if let Err(error) = self.qpack_encoder.flush_instructions().await {
+            let quic_error = self.handle_stream_error(error).await;
+            return Err(quic_error.into());
+        }
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(EncodeError::FramePayloadTooLarge) => Err(MessageStreamError::HeaderTooLarge),
+            Err(EncodeError::HuffmanEncoding) => {
+                unreachable!("FieldSection contain invalid header name/value, this is a bug")
+            }
+        }
+    }
+
     pub async fn send_data(&mut self, data: impl Buf + Send) -> Result<(), MessageStreamError> {
         self.write_data(data).await
+    }
+
+    pub async fn send_header(
+        &mut self,
+        field_lines: impl IntoIterator<Item = FieldLine> + Send,
+    ) -> Result<(), MessageStreamError> {
+        self.write_header(field_lines).await
+    }
+
+    pub async fn flush(&mut self) -> Result<(), MessageStreamError> {
+        self.try_stream_io(async move |this| Ok(this.stream.flush_inner().await?))
+            .await
+    }
+
+    pub async fn close(&mut self) -> Result<(), MessageStreamError> {
+        self.try_stream_io(async move |this| Ok(this.stream.close().await?))
+            .await
+    }
+
+    pub async fn cancel(&mut self, code: Code) -> Result<(), MessageStreamError> {
+        self.try_stream_io(async move |this| Ok(this.stream.cancel(code.into_inner()).await?))
+            .await
     }
 
     async fn peer_goaway_covers(
@@ -459,65 +518,6 @@ impl WriteStream {
                 quic::StreamError::Reset { code }
             }
         }
-    }
-
-    pub async fn write_header_frame(
-        &mut self,
-        field_lines: impl IntoIterator<Item = FieldLine> + Send,
-    ) -> Result<Result<(), EncodeError>, connection::StreamError> {
-        let algo = &DEFAULT_COMPRESS_ALGO;
-        let stream = &mut self.stream;
-        match Encoder::encode(&*self.qpack_encoder, field_lines, algo, stream).await {
-            Ok(frame) => Ok(Ok(self.write_frame(frame).await?)),
-            Err(EncodeHeaderSectionError::Encode { source }) => Ok(Err(source)),
-            Err(EncodeHeaderSectionError::Stream { source }) => Err(source),
-        }
-    }
-
-    pub async fn write_header(
-        &mut self,
-        field_lines: impl IntoIterator<Item = FieldLine> + Send,
-    ) -> Result<(), MessageStreamError> {
-        let result = self
-            .try_stream_io(async move |this| this.write_header_frame(field_lines).await)
-            .await?;
-
-        // Flush encoder instructions (dynamic table insertions) to the encoder stream.
-        // Encoder stream errors are connection-level: reset = connection error per RFC 9204.
-        if let Err(error) = self.qpack_encoder.flush_instructions().await {
-            let quic_error = self.handle_stream_error(error).await;
-            return Err(quic_error.into());
-        }
-
-        match result {
-            Ok(()) => Ok(()),
-            Err(EncodeError::FramePayloadTooLarge) => Err(MessageStreamError::HeaderTooLarge),
-            Err(EncodeError::HuffmanEncoding) => {
-                unreachable!("FieldSection contain invalid header name/value, this is a bug")
-            }
-        }
-    }
-
-    pub async fn send_header(
-        &mut self,
-        field_lines: impl IntoIterator<Item = FieldLine> + Send,
-    ) -> Result<(), MessageStreamError> {
-        self.write_header(field_lines).await
-    }
-
-    pub async fn flush(&mut self) -> Result<(), MessageStreamError> {
-        self.try_stream_io(async move |this| Ok(this.stream.flush_inner().await?))
-            .await
-    }
-
-    pub async fn close(&mut self) -> Result<(), MessageStreamError> {
-        self.try_stream_io(async move |this| Ok(this.stream.close().await?))
-            .await
-    }
-
-    pub async fn cancel(&mut self, code: Code) -> Result<(), MessageStreamError> {
-        self.try_stream_io(async move |this| Ok(this.stream.cancel(code.into_inner()).await?))
-            .await
     }
 
     pub fn take(&mut self) -> Self {
