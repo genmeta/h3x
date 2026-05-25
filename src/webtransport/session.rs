@@ -1,26 +1,32 @@
 //! WebTransport session handle.
 //!
-//! A [`WebTransportSession`] is returned by
-//! [`WebTransportProtocol::register`](super::WebTransportProtocol::register) and
+//! A [`WebTransportSession`] is created from an
+//! [`EstablishedConnect`](crate::extended_connect::EstablishedConnect) and
 //! provides the application-facing API for opening and accepting streams within a
 //! WebTransport session.
 //!
 //! Dropping the session automatically unregisters it from the protocol registry.
 
-use std::{fmt, sync::Arc};
+use std::{fmt, future::pending, mem::ManuallyDrop, sync::Arc};
 
 use snafu::ResultExt;
 use tokio::{io::AsyncWriteExt, sync::mpsc};
+use tokio_util::task::AbortOnDropHandle;
+use tracing::Instrument;
 
 use super::{
     error::{
-        Closed, DatagramError, OpenSnafu, OpenStreamError, UnsupportedSnafu, WriteHeaderSnafu,
+        AcceptStreamError, DatagramError, OpenStreamError, RegisterSessionError, SessionClosed,
+        UnsupportedSnafu, accept_stream_error, open_stream_error,
     },
-    protocol::Registry,
+    protocol::{WEBTRANSPORT_BIDI_SIGNAL, WEBTRANSPORT_H3, WEBTRANSPORT_UNI_SIGNAL},
+    registry::{RegisteredSession, SessionState},
 };
 use crate::{
     codec::{BoxReadStream, BoxWriteStream, EncodeExt, SinkWriter},
+    extended_connect::EstablishedConnect,
     quic::{self},
+    stream_id::StreamId,
     varint::VarInt,
 };
 
@@ -48,69 +54,124 @@ pub(super) type RoutedUniStream = BoxReadStream;
 /// Dropping the handle automatically unregisters the session from the protocol
 /// registry.
 pub struct WebTransportSession {
-    session_id: VarInt,
+    state: Arc<SessionState>,
     bidi_rx: tokio::sync::Mutex<mpsc::Receiver<RoutedBiStream>>,
     uni_rx: tokio::sync::Mutex<mpsc::Receiver<RoutedUniStream>>,
-    conn: Arc<dyn quic::DynManageStream>,
-    registry: Registry,
+    conn: Arc<dyn quic::DynConnection>,
+    _control_task: AbortOnDropHandle<()>,
 }
 
 impl WebTransportSession {
-    pub(super) fn new(
-        session_id: VarInt,
-        bidi_rx: mpsc::Receiver<RoutedBiStream>,
-        uni_rx: mpsc::Receiver<RoutedUniStream>,
-        conn: Arc<dyn quic::DynManageStream>,
-        registry: Registry,
+    fn from_registered(
+        registered: RegisteredSession,
+        conn: Arc<dyn quic::DynConnection>,
+        connect: EstablishedConnect,
     ) -> Self {
+        let state = registered.state;
+        let task_state = Arc::clone(&state);
+        let control_task = async move {
+            match connect.into_streams().await {
+                Ok((mut read, _write)) => loop {
+                    match read.read_data_chunk().await {
+                        Ok(Some(_chunk)) => {}
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::debug!(
+                                error = %snafu::Report::from_error(&error),
+                                "webtransport connect stream read failed"
+                            );
+                            break;
+                        }
+                    }
+                },
+                Err(error) => {
+                    tracing::debug!(
+                        error = %snafu::Report::from_error(&error),
+                        "failed to take over webtransport connect stream"
+                    );
+                }
+            }
+            task_state.close();
+        };
+
         Self {
-            session_id,
-            bidi_rx: tokio::sync::Mutex::new(bidi_rx),
-            uni_rx: tokio::sync::Mutex::new(uni_rx),
+            state,
+            bidi_rx: tokio::sync::Mutex::new(registered.bidi_rx),
+            uni_rx: tokio::sync::Mutex::new(registered.uni_rx),
             conn,
-            registry,
+            _control_task: spawn_control_task(control_task),
         }
     }
 
     /// The session ID (QUIC stream ID of the CONNECT stream that established
     /// this session).
-    pub fn session_id(&self) -> VarInt {
-        self.session_id
+    pub fn id(&self) -> StreamId {
+        self.state.id()
     }
 
     /// Open a new bidirectional stream within this session.
     ///
-    /// Writes the WT bidi signal value (`0x41`) and the session ID as a
-    /// routing header, then returns the raw stream pair positioned after the
+    /// Writes the WebTransport bidi signal value (`0x41`) and the session ID as
+    /// a routing header, then returns the raw stream pair positioned after the
     /// header.
     pub async fn open_bi(&self) -> Result<(BoxReadStream, BoxWriteStream), OpenStreamError> {
-        let (reader, writer) = self.conn.open_bi().await.context(OpenSnafu)?;
-        let writer = write_header(writer, super::WT_BIDI_SIGNAL, self.session_id).await?;
+        self.state
+            .check_open()
+            .context(open_stream_error::ClosedSnafu)?;
+        let (reader, writer) = self
+            .conn
+            .open_bi()
+            .await
+            .context(open_stream_error::OpenSnafu)?;
+        let writer = write_header(writer, WEBTRANSPORT_BIDI_SIGNAL, self.id()).await?;
         Ok((reader, writer))
     }
 
     /// Open a new unidirectional stream within this session.
     ///
-    /// Writes the WT uni signal value (`0x54`) and the session ID as a
-    /// routing header, then returns the write half positioned after the header.
+    /// Writes the WebTransport uni signal value (`0x54`) and the session ID as
+    /// a routing header, then returns the write half positioned after the
+    /// header.
     pub async fn open_uni(&self) -> Result<BoxWriteStream, OpenStreamError> {
-        let writer = self.conn.open_uni().await.context(OpenSnafu)?;
-        let writer = write_header(writer, super::WT_UNI_SIGNAL, self.session_id).await?;
-        Ok(writer)
+        self.state
+            .check_open()
+            .context(open_stream_error::ClosedSnafu)?;
+        let writer = self
+            .conn
+            .open_uni()
+            .await
+            .context(open_stream_error::OpenSnafu)?;
+        write_header(writer, WEBTRANSPORT_UNI_SIGNAL, self.id()).await
     }
 
     /// Accept a bidirectional stream routed to this session by the protocol layer.
-    ///
-    /// Returns [`Closed`] when the session is closed and no more streams will arrive.
-    pub async fn accept_bi(&self) -> Result<(BoxReadStream, BoxWriteStream), Closed> {
-        self.bidi_rx.lock().await.recv().await.ok_or(Closed)
+    pub async fn accept_bi(&self) -> Result<(BoxReadStream, BoxWriteStream), AcceptStreamError> {
+        self.state
+            .check_open()
+            .context(accept_stream_error::ClosedSnafu)?;
+        let mut rx = self.bidi_rx.lock().await;
+        tokio::select! {
+            stream = rx.recv() => stream.ok_or(SessionClosed).context(accept_stream_error::ClosedSnafu),
+            source = self.conn.closed() => {
+                self.state.close();
+                Err(AcceptStreamError::Connection { source })
+            }
+        }
     }
 
     /// Accept a unidirectional stream routed to this session by the protocol layer.
-    ///
-    /// Returns [`Closed`] when the session is closed and no more streams will arrive.
-    pub async fn accept_uni(&self) -> Result<BoxReadStream, Closed> {
-        self.uni_rx.lock().await.recv().await.ok_or(Closed)
+    pub async fn accept_uni(&self) -> Result<BoxReadStream, AcceptStreamError> {
+        self.state
+            .check_open()
+            .context(accept_stream_error::ClosedSnafu)?;
+        let mut rx = self.uni_rx.lock().await;
+        tokio::select! {
+            stream = rx.recv() => stream.ok_or(SessionClosed).context(accept_stream_error::ClosedSnafu),
+            source = self.conn.closed() => {
+                self.state.close();
+                Err(AcceptStreamError::Connection { source })
+            }
+        }
     }
 
     /// Send a datagram within this session.
@@ -128,6 +189,77 @@ impl WebTransportSession {
     }
 }
 
+impl TryFrom<EstablishedConnect> for WebTransportSession {
+    type Error = RegisterSessionError;
+
+    fn try_from(connect: EstablishedConnect) -> Result<Self, Self::Error> {
+        let mut connect = ManuallyDrop::new(connect);
+
+        let protocol = match connect.protocol() {
+            Some(protocol) => protocol,
+            None => return reject_connect(&mut connect, RegisterSessionError::MissingProtocol),
+        };
+        if protocol.as_str() != WEBTRANSPORT_H3 {
+            let protocol = protocol.clone();
+            return reject_connect(
+                &mut connect,
+                RegisterSessionError::UnexpectedProtocol { protocol },
+            );
+        }
+
+        let (registered, conn) = {
+            let Some(protocol) = connect
+                .connection()
+                .protocol::<super::WebTransportProtocol>()
+            else {
+                return reject_connect(&mut connect, RegisterSessionError::ProtocolLayerMissing);
+            };
+            let registered = match protocol.register(connect.stream_id()) {
+                Ok(registered) => registered,
+                Err(error) => return reject_connect(&mut connect, error),
+            };
+            let conn = protocol.connection();
+            (registered, conn)
+        };
+
+        // SAFETY: this is the only successful ownership transfer from
+        // `connect`; all error paths call `reject_connect`, which also takes it
+        // exactly once before returning.
+        let connect = unsafe { ManuallyDrop::take(&mut connect) };
+        Ok(Self::from_registered(registered, conn, connect))
+    }
+}
+
+fn reject_connect(
+    connect: &mut ManuallyDrop<EstablishedConnect>,
+    error: RegisterSessionError,
+) -> Result<WebTransportSession, RegisterSessionError> {
+    // SAFETY: `reject_connect` always returns immediately after taking the
+    // value, and every caller uses it as a terminal error path.
+    let connect = unsafe { ManuallyDrop::take(connect) };
+    drop_rejected_connect(connect);
+    Err(error)
+}
+
+fn drop_rejected_connect(connect: EstablishedConnect) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        drop(connect);
+        return;
+    }
+
+    // Inherent termination: this task owns only the rejected CONNECT stream and
+    // exits immediately after dropping it inside a Tokio runtime, which is
+    // required by guarded stream cleanup.
+    std::mem::drop(
+        fallback_runtime_handle().spawn(
+            async move {
+                drop(connect);
+            }
+            .in_current_span(),
+        ),
+    );
+}
+
 // ============================================================================
 // Header writing helper
 // ============================================================================
@@ -136,24 +268,55 @@ impl WebTransportSession {
 async fn write_header(
     writer: BoxWriteStream,
     signal: VarInt,
-    session_id: VarInt,
+    session_id: StreamId,
 ) -> Result<BoxWriteStream, OpenStreamError> {
     let mut codec_writer = SinkWriter::new(writer);
     codec_writer
         .encode_one(signal)
         .await
         .map_err(quic::StreamError::from)
-        .context(WriteHeaderSnafu)?;
+        .context(open_stream_error::WriteHeaderSnafu)?;
     codec_writer
         .encode_one(session_id)
         .await
         .map_err(quic::StreamError::from)
-        .context(WriteHeaderSnafu)?;
+        .context(open_stream_error::WriteHeaderSnafu)?;
     AsyncWriteExt::flush(&mut codec_writer)
         .await
         .map_err(quic::StreamError::from)
-        .context(WriteHeaderSnafu)?;
+        .context(open_stream_error::WriteHeaderSnafu)?;
     Ok(codec_writer.into_inner())
+}
+
+fn spawn_control_task(
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+) -> AbortOnDropHandle<()> {
+    let task = task.in_current_span();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => AbortOnDropHandle::new(handle.spawn(task)),
+        Err(_) => AbortOnDropHandle::new(fallback_runtime_handle().spawn(task)),
+    }
+}
+
+fn fallback_runtime_handle() -> &'static tokio::runtime::Handle {
+    static HANDLE: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+    HANDLE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("h3x-webtransport-control".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to create webtransport control runtime");
+                tx.send(runtime.handle().clone())
+                    .expect("failed to publish webtransport control runtime");
+                runtime.block_on(pending::<()>());
+            })
+            .expect("failed to spawn webtransport control runtime");
+        rx.recv()
+            .expect("webtransport control runtime exited during startup")
+    })
 }
 
 // ============================================================================
@@ -163,23 +326,82 @@ async fn write_header(
 impl fmt::Debug for WebTransportSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WebTransportSession")
-            .field("session_id", &self.session_id)
+            .field("id", &self.id())
             .finish()
     }
 }
 
 impl Drop for WebTransportSession {
     fn drop(&mut self) {
-        if let Ok(mut registry) = self.registry.lock() {
-            registry.remove(&self.session_id);
-        }
+        self.state.close();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::{
+        connection::{ConnectionState, tests::MockConnection},
+        extended_connect::EstablishedConnect,
+        message::test::{read_stream_for_test, write_stream_for_test},
+        protocol::Protocols,
+        qpack::field::Protocol,
+        quic,
+        stream_id::StreamId,
+        varint::VarInt,
+        webtransport::{WEBTRANSPORT_H3, WebTransportProtocol},
+    };
 
     const fn assert_send_sync<T: Send + Sync>() {}
     const _: () = assert_send_sync::<WebTransportSession>();
+
+    fn connection_with_webtransport() -> Arc<ConnectionState<dyn quic::DynConnection>> {
+        let quic = Arc::new(MockConnection::new());
+        let erased: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(WebTransportProtocol::new_for_test(erased));
+        Arc::new(ConnectionState::new_for_test(quic, Arc::new(protocols)).erase())
+    }
+
+    fn connect_with_protocol(protocol: Option<Protocol>) -> EstablishedConnect {
+        let stream_id = StreamId::from(VarInt::from_u32(4));
+        EstablishedConnect::ready(
+            stream_id,
+            protocol,
+            connection_with_webtransport(),
+            read_stream_for_test(stream_id.0),
+            write_stream_for_test(stream_id.0),
+        )
+    }
+
+    #[test]
+    fn try_from_established_connect_registers_session() {
+        let session = WebTransportSession::try_from(connect_with_protocol(Some(Protocol::new(
+            WEBTRANSPORT_H3,
+        ))))
+        .expect("valid webtransport connect registers session");
+
+        assert_eq!(session.id(), StreamId::from(VarInt::from_u32(4)));
+    }
+
+    #[test]
+    fn try_from_rejects_missing_protocol() {
+        let error = WebTransportSession::try_from(connect_with_protocol(None))
+            .expect_err("missing protocol is invalid");
+        assert!(matches!(error, RegisterSessionError::MissingProtocol));
+    }
+
+    #[test]
+    fn try_from_rejects_unexpected_protocol() {
+        let error = WebTransportSession::try_from(connect_with_protocol(Some(Protocol::new(
+            "other-protocol",
+        ))))
+        .expect_err("wrong protocol token is invalid");
+        assert!(matches!(
+            error,
+            RegisterSessionError::UnexpectedProtocol { .. }
+        ));
+    }
 }

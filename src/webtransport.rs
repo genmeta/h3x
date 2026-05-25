@@ -7,7 +7,7 @@
 //!
 //! WebTransport (draft-ietf-webtrans-http3) enables multiplexed, bidirectional
 //! and unidirectional streams within an HTTP/3 connection. A session is
-//! established via Extended CONNECT with `:protocol=webtransport`, after which
+//! established via Extended CONNECT with `:protocol=webtransport-h3`, after which
 //! both peers can open streams associated with that session.
 //!
 //! # Stream identification
@@ -24,8 +24,8 @@
 //!
 //! ```ignore
 //! // Server handler: accept a WebTransport CONNECT request
-//! let wt = request.protocols().get::<WebTransportProtocol>().unwrap();
-//! let session = wt.register(request.stream_id().into_inner())?;
+//! let connect = request.establish_connect().await?;
+//! let session = WebTransportSession::try_from(connect)?;
 //!
 //! // Open / accept streams within the session
 //! let (reader, writer) = session.open_bi().await?;
@@ -40,16 +40,20 @@ use futures::future::BoxFuture;
 use crate::{
     codec::{BoxReadStream, BoxWriteStream},
     quic::{ReadStream, WriteStream},
-    varint::VarInt,
+    stream_id::StreamId,
 };
 
 mod error;
 mod protocol;
+mod registry;
 mod session;
 
-pub use error::{Closed, DatagramError, OpenSnafu, OpenStreamError, RegisterError};
+pub use error::{
+    AcceptStreamError, DatagramError, OpenStreamError, RegisterSessionError, SessionClosed,
+};
 pub use protocol::{
-    WT_BIDI_SIGNAL, WT_UNI_SIGNAL, WebTransportProtocol, WebTransportProtocolFactory,
+    WEBTRANSPORT_BIDI_SIGNAL, WEBTRANSPORT_H3, WEBTRANSPORT_UNI_SIGNAL, WebTransportProtocol,
+    WebTransportProtocolFactory,
 };
 pub use session::WebTransportSession;
 
@@ -65,7 +69,7 @@ pub trait Session: Send + Sync {
     type StreamReader: ReadStream + Unpin;
     type StreamWriter: WriteStream + Unpin;
 
-    fn session_id(&self) -> VarInt;
+    fn id(&self) -> StreamId;
 
     fn open_bi(
         &self,
@@ -79,9 +83,13 @@ pub trait Session: Send + Sync {
 
     fn accept_bi(
         &self,
-    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), Closed>> + Send + '_;
+    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), AcceptStreamError>>
+    + Send
+    + '_;
 
-    fn accept_uni(&self) -> impl Future<Output = Result<Self::StreamReader, Closed>> + Send + '_;
+    fn accept_uni(
+        &self,
+    ) -> impl Future<Output = Result<Self::StreamReader, AcceptStreamError>> + Send + '_;
 }
 
 // ============================================================================
@@ -93,7 +101,7 @@ pub trait Session: Send + Sync {
 /// Stream types are fixed to [`BoxReadStream`] / [`BoxWriteStream`].
 /// A blanket impl is provided for all `T: Session`.
 pub trait DynSession: Send + Sync {
-    fn session_id(&self) -> VarInt;
+    fn id(&self) -> StreamId;
 
     #[allow(clippy::type_complexity)]
     fn open_bi(&self) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), OpenStreamError>>;
@@ -101,14 +109,16 @@ pub trait DynSession: Send + Sync {
     fn open_uni(&self) -> BoxFuture<'_, Result<BoxWriteStream, OpenStreamError>>;
 
     #[allow(clippy::type_complexity)]
-    fn accept_bi(&self) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), Closed>>;
+    fn accept_bi(
+        &self,
+    ) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), AcceptStreamError>>;
 
-    fn accept_uni(&self) -> BoxFuture<'_, Result<BoxReadStream, Closed>>;
+    fn accept_uni(&self) -> BoxFuture<'_, Result<BoxReadStream, AcceptStreamError>>;
 }
 
 impl<T: Session> DynSession for T {
-    fn session_id(&self) -> VarInt {
-        Session::session_id(self)
+    fn id(&self) -> StreamId {
+        Session::id(self)
     }
 
     fn open_bi(&self) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), OpenStreamError>> {
@@ -125,14 +135,16 @@ impl<T: Session> DynSession for T {
         })
     }
 
-    fn accept_bi(&self) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), Closed>> {
+    fn accept_bi(
+        &self,
+    ) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), AcceptStreamError>> {
         Box::pin(async {
             let (r, w) = Session::accept_bi(self).await?;
             Ok((Box::pin(r) as BoxReadStream, Box::pin(w) as BoxWriteStream))
         })
     }
 
-    fn accept_uni(&self) -> BoxFuture<'_, Result<BoxReadStream, Closed>> {
+    fn accept_uni(&self) -> BoxFuture<'_, Result<BoxReadStream, AcceptStreamError>> {
         Box::pin(async {
             let r = Session::accept_uni(self).await?;
             Ok(Box::pin(r) as BoxReadStream)
@@ -148,8 +160,8 @@ impl Session for WebTransportSession {
     type StreamReader = BoxReadStream;
     type StreamWriter = BoxWriteStream;
 
-    fn session_id(&self) -> VarInt {
-        WebTransportSession::session_id(self)
+    fn id(&self) -> StreamId {
+        WebTransportSession::id(self)
     }
 
     async fn open_bi(&self) -> Result<(BoxReadStream, BoxWriteStream), OpenStreamError> {
@@ -160,11 +172,11 @@ impl Session for WebTransportSession {
         WebTransportSession::open_uni(self).await
     }
 
-    async fn accept_bi(&self) -> Result<(BoxReadStream, BoxWriteStream), Closed> {
+    async fn accept_bi(&self) -> Result<(BoxReadStream, BoxWriteStream), AcceptStreamError> {
         WebTransportSession::accept_bi(self).await
     }
 
-    async fn accept_uni(&self) -> Result<BoxReadStream, Closed> {
+    async fn accept_uni(&self) -> Result<BoxReadStream, AcceptStreamError> {
         WebTransportSession::accept_uni(self).await
     }
 }

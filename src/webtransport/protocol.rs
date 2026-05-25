@@ -10,19 +10,17 @@
 //! The protocol layer consumes exactly two fields from each incoming stream:
 //!
 //! 1. The stream signal value ([`VarInt`])
-//! 2. The session ID ([`VarInt`])
+//! 2. The session ID ([`StreamId`](crate::stream_id::StreamId))
 //!
 //! The session receives the stream positioned after these two fields.
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use futures::future::BoxFuture;
-use snafu::ensure;
-use tokio::sync::mpsc;
 
 use super::{
-    error::{AlreadyRegisteredSnafu, RegisterError},
-    session::{RoutedBiStream, RoutedUniStream, WebTransportSession},
+    error::RegisterSessionError,
+    registry::{RegisteredSession, Registry},
 };
 use crate::{
     codec::{
@@ -31,6 +29,7 @@ use crate::{
     connection::StreamError,
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     quic::{self, ConnectionError},
+    stream_id::StreamId,
     varint::VarInt,
 };
 
@@ -38,50 +37,16 @@ use crate::{
 // Constants
 // ============================================================================
 
+/// Extended CONNECT protocol token for WebTransport over HTTP/3.
+pub const WEBTRANSPORT_H3: &str = "webtransport-h3";
+
 /// Signal value for WebTransport bidirectional streams
 /// (draft-ietf-webtrans-http3, §2).
-pub const WT_BIDI_SIGNAL: VarInt = VarInt::from_u32(0x41);
+pub const WEBTRANSPORT_BIDI_SIGNAL: VarInt = VarInt::from_u32(0x41);
 
 /// Signal value for WebTransport unidirectional streams
 /// (draft-ietf-webtrans-http3, §2).
-pub const WT_UNI_SIGNAL: VarInt = VarInt::from_u32(0x54);
-
-// ============================================================================
-// Session stream router
-// ============================================================================
-
-/// Session registry: maps session ID to stream routers.
-pub(super) type Registry = Arc<std::sync::Mutex<HashMap<VarInt, SessionStreamRouter>>>;
-
-/// Routes incoming streams to a single WebTransport session via bounded channels.
-pub(super) struct SessionStreamRouter {
-    bidi_tx: mpsc::Sender<RoutedBiStream>,
-    uni_tx: mpsc::Sender<RoutedUniStream>,
-}
-
-impl SessionStreamRouter {
-    fn new(bidi_tx: mpsc::Sender<RoutedBiStream>, uni_tx: mpsc::Sender<RoutedUniStream>) -> Self {
-        Self { bidi_tx, uni_tx }
-    }
-
-    fn route_bi(&self, session_id: VarInt, stream: RoutedBiStream) {
-        if self.bidi_tx.try_send(stream).is_err() {
-            tracing::debug!(
-                ?session_id,
-                "session bidi channel full or closed, dropping stream"
-            );
-        }
-    }
-
-    fn route_uni(&self, session_id: VarInt, stream: RoutedUniStream) {
-        if self.uni_tx.try_send(stream).is_err() {
-            tracing::debug!(
-                ?session_id,
-                "session uni channel full or closed, dropping stream"
-            );
-        }
-    }
-}
+pub const WEBTRANSPORT_UNI_SIGNAL: VarInt = VarInt::from_u32(0x54);
 
 // ============================================================================
 // WebTransportProtocol
@@ -96,50 +61,35 @@ impl SessionStreamRouter {
 /// shared (via `Arc<Protocols>`) across all concurrent streams.
 pub struct WebTransportProtocol {
     registry: Registry,
-    conn: Arc<dyn quic::DynManageStream>,
+    conn: Arc<dyn quic::DynConnection>,
 }
 
 impl fmt::Debug for WebTransportProtocol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WebTransportProtocol")
-            .field(
-                "sessions",
-                &self.registry.lock().map(|r| r.len()).unwrap_or(0),
-            )
+            .field("sessions", &self.registry.len())
             .finish()
     }
 }
 
 impl WebTransportProtocol {
-    /// Register a new session for the given session ID.
-    ///
-    /// Returns a [`WebTransportSession`] that receives routed streams and can
-    /// open new streams. The session unregisters itself when dropped.
-    pub fn register(&self, session_id: VarInt) -> Result<WebTransportSession, RegisterError> {
-        let (bidi_tx, bidi_rx) = mpsc::channel(16);
-        let (uni_tx, uni_rx) = mpsc::channel(16);
+    pub(super) fn register(
+        &self,
+        session_id: StreamId,
+    ) -> Result<RegisteredSession, RegisterSessionError> {
+        self.registry.register(session_id)
+    }
 
-        let mut registry = self
-            .registry
-            .lock()
-            .map_err(|_| RegisterError::RegistryPoisoned)?;
+    pub(super) fn connection(&self) -> Arc<dyn quic::DynConnection> {
+        Arc::clone(&self.conn)
+    }
 
-        ensure!(
-            !registry.contains_key(&session_id),
-            AlreadyRegisteredSnafu {
-                session_id: crate::stream_id::StreamId::from(session_id),
-            }
-        );
-
-        registry.insert(session_id, SessionStreamRouter::new(bidi_tx, uni_tx));
-
-        Ok(WebTransportSession::new(
-            session_id,
-            bidi_rx,
-            uni_rx,
-            Arc::clone(&self.conn),
-            Arc::clone(&self.registry),
-        ))
+    #[cfg(test)]
+    pub(crate) fn new_for_test(conn: Arc<dyn quic::DynConnection>) -> Self {
+        Self {
+            registry: Registry::default(),
+            conn,
+        }
     }
 }
 
@@ -156,12 +106,12 @@ impl WebTransportProtocol {
             return Ok(StreamVerdict::Passed((reader, writer)));
         };
 
-        if signal_value != WT_BIDI_SIGNAL {
+        if signal_value != WEBTRANSPORT_BIDI_SIGNAL {
             return Ok(StreamVerdict::Passed((reader, writer)));
         }
 
         // WebTransport bidi stream confirmed. Decode session ID for routing.
-        let Ok(session_id) = reader.decode_one::<VarInt>().await else {
+        let Ok(session_id) = reader.decode_one::<StreamId>().await else {
             tracing::debug!("failed to decode session ID from webtransport bidi stream");
             return Ok(StreamVerdict::Accepted);
         };
@@ -171,18 +121,7 @@ impl WebTransportProtocol {
         let reader: BoxReadStream = Box::pin(reader.into_stream_reader());
         let writer: BoxWriteStream = writer.into_inner();
 
-        let Ok(registry) = self.registry.lock() else {
-            tracing::debug!("webtransport session registry lock poisoned");
-            return Ok(StreamVerdict::Accepted);
-        };
-        if let Some(router) = registry.get(&session_id) {
-            router.route_bi(session_id, (reader, writer));
-        } else {
-            tracing::debug!(
-                ?session_id,
-                "no registered session for webtransport bidi stream"
-            );
-        }
+        self.registry.route_bi(session_id, (reader, writer));
 
         Ok(StreamVerdict::Accepted)
     }
@@ -195,12 +134,12 @@ impl WebTransportProtocol {
             return Ok(StreamVerdict::Passed(stream));
         };
 
-        if signal_value != WT_UNI_SIGNAL {
+        if signal_value != WEBTRANSPORT_UNI_SIGNAL {
             return Ok(StreamVerdict::Passed(stream));
         }
 
         // WebTransport uni stream confirmed. Decode session ID for routing.
-        let Ok(session_id) = stream.decode_one::<VarInt>().await else {
+        let Ok(session_id) = stream.decode_one::<StreamId>().await else {
             tracing::debug!("failed to decode session ID from webtransport uni stream");
             return Ok(StreamVerdict::Accepted);
         };
@@ -209,18 +148,7 @@ impl WebTransportProtocol {
 
         let reader: BoxReadStream = Box::pin(stream.into_stream_reader());
 
-        let Ok(registry) = self.registry.lock() else {
-            tracing::debug!("webtransport session registry lock poisoned");
-            return Ok(StreamVerdict::Accepted);
-        };
-        if let Some(router) = registry.get(&session_id) {
-            router.route_uni(session_id, reader);
-        } else {
-            tracing::debug!(
-                ?session_id,
-                "no registered session for webtransport uni stream"
-            );
-        }
+        self.registry.route_uni(session_id, reader);
 
         Ok(StreamVerdict::Accepted)
     }
@@ -271,10 +199,10 @@ impl<C: quic::Connection> ProductProtocol<C> for WebTransportProtocolFactory {
         conn: &'a Arc<C>,
         _layers: &'a Protocols,
     ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
-        let conn: Arc<dyn quic::DynManageStream> = conn.clone();
+        let conn: Arc<dyn quic::DynConnection> = conn.clone();
         Box::pin(async move {
             Ok(WebTransportProtocol {
-                registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                registry: Registry::default(),
                 conn,
             })
         })
@@ -295,7 +223,7 @@ mod tests {
 
     #[test]
     fn signal_values_are_correct() {
-        assert_eq!(WT_BIDI_SIGNAL.into_inner(), 0x41);
-        assert_eq!(WT_UNI_SIGNAL.into_inner(), 0x54);
+        assert_eq!(WEBTRANSPORT_BIDI_SIGNAL.into_inner(), 0x41);
+        assert_eq!(WEBTRANSPORT_UNI_SIGNAL.into_inner(), 0x54);
     }
 }
