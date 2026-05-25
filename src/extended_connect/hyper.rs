@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use http::{Method, StatusCode};
 use http_body::Body;
+use http_body_util::Empty;
 use snafu::{OptionExt, ResultExt, Snafu, ensure};
 
 use crate::{
@@ -41,7 +43,6 @@ pub enum AcceptError {
     TakeRead { source: TakeoverError },
 }
 
-#[allow(dead_code)]
 fn pending_write_error(error: TakeoverError) -> PendingWriteStreamError {
     match error {
         TakeoverError::Unsupported => PendingWriteStreamError::Unsupported,
@@ -87,7 +88,9 @@ where
     ))
 }
 
-pub async fn accept<B>(request: http::Request<B>) -> Result<(), AcceptError>
+pub async fn accept<B>(
+    mut request: http::Request<B>,
+) -> Result<(http::Response<Empty<Bytes>>, EstablishedConnect), AcceptError>
 where
     B: Body + Unpin + Send + 'static,
 {
@@ -98,14 +101,40 @@ where
         }
     );
 
-    Ok(())
+    let stream_id = *request
+        .extensions()
+        .get::<StreamId>()
+        .context(accept_error::MissingStreamIdSnafu)?;
+    let connection = request
+        .extensions()
+        .get::<Arc<ConnectionState<dyn quic::DynConnection>>>()
+        .cloned()
+        .context(accept_error::MissingConnectionSnafu)?;
+    let protocol = request.extensions().get::<Protocol>().cloned();
+
+    let read = crate::hyper::upgrade::take::<ReadStream>(&mut request)
+        .await
+        .context(accept_error::TakeReadSnafu)?;
+
+    let write = async move {
+        match crate::hyper::upgrade::take::<WriteStream>(&mut request).await {
+            Ok(write) => Ok(write),
+            Err(error) => Err(pending_write_error(error)),
+        }
+    };
+
+    let response = http::Response::builder()
+        .status(StatusCode::OK)
+        .body(Empty::<Bytes>::new())
+        .expect("200 OK response with empty body is valid");
+
+    let connect = EstablishedConnect::pending(stream_id, protocol, connection, read, write);
+    Ok((response, connect))
 }
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
     use http::{Request, Response, StatusCode};
-    use http_body_util::Empty;
 
     use super::*;
     use crate::qpack::field::Protocol;
@@ -149,9 +178,25 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .expect("valid request");
 
-        let error = accept(request)
-            .await
-            .expect_err("only CONNECT can be accepted");
+        let error = match accept(request).await {
+            Ok(_) => panic!("only CONNECT can be accepted"),
+            Err(error) => error,
+        };
         assert!(matches!(error, AcceptError::NotConnect { method } if method == http::Method::GET));
+    }
+
+    #[tokio::test]
+    async fn accept_requires_stream_id_metadata() {
+        let request = Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("https://example.test/session")
+            .body(Empty::<Bytes>::new())
+            .expect("valid request");
+
+        let error = match accept(request).await {
+            Ok(_) => panic!("stream ID metadata is required"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, AcceptError::MissingStreamId));
     }
 }
