@@ -55,34 +55,36 @@ impl Registry {
         sessions.remove(&session_id);
     }
 
-    pub(super) fn route_bi(&self, session_id: StreamId, stream: RoutedBiStream) {
+    pub(super) fn route_bi(
+        &self,
+        session_id: StreamId,
+        stream: RoutedBiStream,
+    ) -> Result<(), RoutedBiStream> {
         let Ok(sessions) = self.inner.lock() else {
-            tracing::debug!(?session_id, "webtransport session registry lock poisoned");
-            return;
+            tracing::debug!(session_id = %session_id, "webtransport session registry lock poisoned");
+            return Err(stream);
         };
-        if let Some(router) = sessions.get(&session_id) {
-            router.route_bi(session_id, stream);
-        } else {
-            tracing::debug!(
-                ?session_id,
-                "no registered session for webtransport bidi stream"
-            );
-        }
+        let Some(router) = sessions.get(&session_id) else {
+            tracing::debug!(session_id = %session_id, "no registered session for webtransport bidi stream");
+            return Err(stream);
+        };
+        router.route_bi(session_id, stream)
     }
 
-    pub(super) fn route_uni(&self, session_id: StreamId, stream: RoutedUniStream) {
+    pub(super) fn route_uni(
+        &self,
+        session_id: StreamId,
+        stream: RoutedUniStream,
+    ) -> Result<(), RoutedUniStream> {
         let Ok(sessions) = self.inner.lock() else {
-            tracing::debug!(?session_id, "webtransport session registry lock poisoned");
-            return;
+            tracing::debug!(session_id = %session_id, "webtransport session registry lock poisoned");
+            return Err(stream);
         };
-        if let Some(router) = sessions.get(&session_id) {
-            router.route_uni(session_id, stream);
-        } else {
-            tracing::debug!(
-                ?session_id,
-                "no registered session for webtransport uni stream"
-            );
-        }
+        let Some(router) = sessions.get(&session_id) else {
+            tracing::debug!(session_id = %session_id, "no registered session for webtransport uni stream");
+            return Err(stream);
+        };
+        router.route_uni(session_id, stream)
     }
 
     pub(super) fn len(&self) -> usize {
@@ -152,21 +154,33 @@ impl SessionStreamRouter {
         Self { bidi_tx, uni_tx }
     }
 
-    fn route_bi(&self, session_id: StreamId, stream: RoutedBiStream) {
-        if self.bidi_tx.try_send(stream).is_err() {
-            tracing::debug!(
-                ?session_id,
-                "session bidi channel full or closed, dropping stream"
-            );
+    fn route_bi(&self, session_id: StreamId, stream: RoutedBiStream) -> Result<(), RoutedBiStream> {
+        match self.bidi_tx.try_send(stream) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::debug!(
+                    session_id = %session_id,
+                    "session bidi channel full or closed, rejecting stream"
+                );
+                Err(error.into_inner())
+            }
         }
     }
 
-    fn route_uni(&self, session_id: StreamId, stream: RoutedUniStream) {
-        if self.uni_tx.try_send(stream).is_err() {
-            tracing::debug!(
-                ?session_id,
-                "session uni channel full or closed, dropping stream"
-            );
+    fn route_uni(
+        &self,
+        session_id: StreamId,
+        stream: RoutedUniStream,
+    ) -> Result<(), RoutedUniStream> {
+        match self.uni_tx.try_send(stream) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::debug!(
+                    session_id = %session_id,
+                    "session uni channel full or closed, rejecting stream"
+                );
+                Err(error.into_inner())
+            }
         }
     }
 }

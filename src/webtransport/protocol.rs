@@ -28,7 +28,7 @@ use crate::{
     },
     connection::StreamError,
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
-    quic::{self, ConnectionError},
+    quic::{self, CancelStreamExt, ConnectionError, StopStreamExt},
     stream_id::StreamId,
     varint::VarInt,
 };
@@ -112,16 +112,20 @@ impl WebTransportProtocol {
 
         // WebTransport bidi stream confirmed. Decode session ID for routing.
         let Ok(session_id) = reader.decode_one::<StreamId>().await else {
-            tracing::debug!("failed to decode session ID from webtransport bidi stream");
+            tracing::debug!("failed to decode session id from webtransport bidi stream");
             return Ok(StreamVerdict::Accepted);
         };
 
-        tracing::debug!(?session_id, "routing webtransport bidi stream to session");
+        tracing::debug!(session_id = %session_id, "routing webtransport bidi stream to session");
 
         let reader: BoxReadStream = Box::pin(reader.into_stream_reader());
         let writer: BoxWriteStream = writer.into_inner();
 
-        self.registry.route_bi(session_id, (reader, writer));
+        if let Err((mut reader, mut writer)) = self.registry.route_bi(session_id, (reader, writer))
+        {
+            let code = crate::error::Code::H3_REQUEST_CANCELLED.into_inner();
+            _ = tokio::join!(reader.stop(code), writer.cancel(code));
+        }
 
         Ok(StreamVerdict::Accepted)
     }
@@ -140,15 +144,18 @@ impl WebTransportProtocol {
 
         // WebTransport uni stream confirmed. Decode session ID for routing.
         let Ok(session_id) = stream.decode_one::<StreamId>().await else {
-            tracing::debug!("failed to decode session ID from webtransport uni stream");
+            tracing::debug!("failed to decode session id from webtransport uni stream");
             return Ok(StreamVerdict::Accepted);
         };
 
-        tracing::debug!(?session_id, "routing webtransport uni stream to session");
+        tracing::debug!(session_id = %session_id, "routing webtransport uni stream to session");
 
         let reader: BoxReadStream = Box::pin(stream.into_stream_reader());
 
-        self.registry.route_uni(session_id, reader);
+        if let Err(mut reader) = self.registry.route_uni(session_id, reader) {
+            let code = crate::error::Code::H3_REQUEST_CANCELLED.into_inner();
+            _ = reader.stop(code).await;
+        }
 
         Ok(StreamVerdict::Accepted)
     }
@@ -215,15 +222,306 @@ impl<C: quic::Connection> ProductProtocol<C> for WebTransportProtocolFactory {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        borrow::Cow,
+        collections::VecDeque,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+
+    use bytes::Bytes;
+    use dhttp_identity::identity as agent;
+    use futures::{Sink, Stream, future::pending};
+
     use super::*;
+    use crate::{
+        codec::{PeekableStreamReader, SinkWriter, StreamReader},
+        error::Code,
+        quic,
+    };
 
     const fn assert_send_sync<T: Send + Sync>() {}
-    // WebTransportProtocol is Send + Sync (required for Protocol trait).
     const _: () = assert_send_sync::<WebTransportProtocol>();
 
     #[test]
-    fn signal_values_are_correct() {
+    fn webtransport_constants_are_draft15_values() {
+        assert_eq!(WEBTRANSPORT_H3, "webtransport-h3");
         assert_eq!(WEBTRANSPORT_BIDI_SIGNAL.into_inner(), 0x41);
         assert_eq!(WEBTRANSPORT_UNI_SIGNAL.into_inner(), 0x54);
+    }
+
+    #[tokio::test]
+    async fn unknown_bidi_session_is_accepted_and_aborted() {
+        let state = Arc::new(StreamState::default());
+        let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x41, 0x2a])]);
+        let writer = test_writer(state.clone());
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_bi((reader, writer))
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert_eq!(
+            state.stopped_codes(),
+            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+        );
+        assert_eq!(
+            state.cancelled_codes(),
+            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_uni_session_is_accepted_and_stopped() {
+        let state = Arc::new(StreamState::default());
+        let stream = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x54, 0x2a])]);
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_uni(stream)
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert_eq!(
+            state.stopped_codes(),
+            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+        );
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[derive(Debug, Default)]
+    struct StreamState {
+        stopped: Mutex<Vec<VarInt>>,
+        cancelled: Mutex<Vec<VarInt>>,
+    }
+
+    impl StreamState {
+        fn stopped_codes(&self) -> Vec<VarInt> {
+            self.stopped.lock().expect("stopped lock poisoned").clone()
+        }
+
+        fn cancelled_codes(&self) -> Vec<VarInt> {
+            self.cancelled
+                .lock()
+                .expect("cancelled lock poisoned")
+                .clone()
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestReadStream {
+        state: Arc<StreamState>,
+        chunks: VecDeque<Bytes>,
+    }
+
+    impl Stream for TestReadStream {
+        type Item = Result<Bytes, quic::StreamError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.chunks.pop_front().map(Ok))
+        }
+    }
+
+    impl quic::GetStreamId for TestReadStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(VarInt::from_u32(0)))
+        }
+    }
+
+    impl quic::StopStream for TestReadStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            self.state
+                .stopped
+                .lock()
+                .expect("stopped lock poisoned")
+                .push(code);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestWriteStream {
+        state: Arc<StreamState>,
+    }
+
+    impl Sink<Bytes> for TestWriteStream {
+        type Error = quic::StreamError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Bytes) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl quic::GetStreamId for TestWriteStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(VarInt::from_u32(0)))
+        }
+    }
+
+    impl quic::CancelStream for TestWriteStream {
+        fn poll_cancel(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            self.state
+                .cancelled
+                .lock()
+                .expect("cancelled lock poisoned")
+                .push(code);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestLocalAgent;
+
+    impl agent::LocalAgent for TestLocalAgent {
+        fn name(&self) -> &str {
+            "test-local"
+        }
+
+        fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
+            &[]
+        }
+
+        fn sign_algorithm(&self) -> rustls::SignatureAlgorithm {
+            rustls::SignatureAlgorithm::ED25519
+        }
+
+        fn sign(
+            &self,
+            _scheme: rustls::SignatureScheme,
+            _data: &[u8],
+        ) -> futures::future::BoxFuture<'_, Result<Vec<u8>, agent::SignError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestRemoteAgent;
+
+    impl agent::RemoteAgent for TestRemoteAgent {
+        fn name(&self) -> &str {
+            "test-remote"
+        }
+
+        fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
+            &[]
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TestConnection;
+
+    impl quic::ManageStream for TestConnection {
+        type StreamReader = TestReadStream;
+        type StreamWriter = TestWriteStream;
+
+        async fn open_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            pending().await
+        }
+
+        async fn open_uni(&self) -> Result<Self::StreamWriter, quic::ConnectionError> {
+            pending().await
+        }
+
+        async fn accept_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            pending().await
+        }
+
+        async fn accept_uni(&self) -> Result<Self::StreamReader, quic::ConnectionError> {
+            pending().await
+        }
+    }
+
+    impl quic::WithLocalAgent for TestConnection {
+        type LocalAgent = TestLocalAgent;
+
+        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+            Ok(None)
+        }
+    }
+
+    impl quic::WithRemoteAgent for TestConnection {
+        type RemoteAgent = TestRemoteAgent;
+
+        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+            Ok(None)
+        }
+    }
+
+    impl quic::Lifecycle for TestConnection {
+        fn close(&self, _code: Code, _reason: Cow<'static, str>) {}
+
+        fn check(&self) -> Result<(), quic::ConnectionError> {
+            Ok(())
+        }
+
+        async fn closed(&self) -> quic::ConnectionError {
+            pending().await
+        }
+    }
+
+    fn test_reader(
+        state: Arc<StreamState>,
+        chunks: Vec<Bytes>,
+    ) -> PeekableStreamReader<BoxReadStream> {
+        let stream = TestReadStream {
+            state,
+            chunks: chunks.into(),
+        };
+        PeekableStreamReader::new(StreamReader::new(Box::pin(stream) as BoxReadStream))
+    }
+
+    fn test_writer(state: Arc<StreamState>) -> SinkWriter<BoxWriteStream> {
+        SinkWriter::new(Box::pin(TestWriteStream { state }) as BoxWriteStream)
+    }
+
+    fn test_protocol() -> WebTransportProtocol {
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection);
+        WebTransportProtocol {
+            registry: Registry::default(),
+            conn,
+        }
     }
 }

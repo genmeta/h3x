@@ -206,7 +206,7 @@ mod lifecycle_ext {
     /// Like [`LifecycleExt`], this trait is sealed: it is automatically
     /// implemented for any type that already satisfies [`LifecycleExt`].
     #[allow(async_fn_in_trait)]
-    pub trait WtLifecycleExt: LifecycleExt {
+    pub trait WebTransportLifecycleExt: LifecycleExt {
         /// Check liveness and surface any error as an [`OpenStreamError`].
         fn check_open(&self) -> Result<(), OpenStreamError> {
             quic::Lifecycle::check(self).context(OpenSnafu)
@@ -310,8 +310,8 @@ mod lifecycle_ext {
         }
     }
 
-    impl<T: LifecycleExt + ?Sized> WtLifecycleExt for T {}
+    impl<T: LifecycleExt + ?Sized> WebTransportLifecycleExt for T {}
 }
 
 #[cfg(feature = "rpc")]
-pub use lifecycle_ext::WtLifecycleExt;
+pub use lifecycle_ext::WebTransportLifecycleExt;
