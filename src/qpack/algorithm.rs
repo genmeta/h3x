@@ -451,7 +451,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::{
-        dhttp::settings::{QpackBlockedStreams, QpackMaxTableCapacity, Settings},
+        dhttp::settings::Settings,
         qpack::{
             algorithm::{Algorithm, CompressOutput, DynamicCompressAlgo, HuffmanNever},
             encoder::EncoderState,
@@ -462,10 +462,12 @@ mod tests {
 
     fn state_with_capacity(table_capacity: u32) -> EncoderState {
         let mut settings = Settings::default();
-        settings.set(QpackMaxTableCapacity::setting(VarInt::from_u32(
-            table_capacity,
-        )));
-        settings.set(QpackBlockedStreams::setting(VarInt::from_u32(100)));
+        settings.set(crate::qpack::settings::QpackMaxTableCapacity::setting(
+            VarInt::from_u32(table_capacity),
+        ));
+        settings.set(crate::qpack::settings::QpackBlockedStreams::setting(
+            VarInt::from_u32(100),
+        ));
         let mut state = EncoderState::new(Arc::new(settings));
         if table_capacity > 0 {
             state
@@ -821,7 +823,7 @@ mod tests {
         use proptest::prelude::*;
 
         use crate::{
-            dhttp::settings::{QpackBlockedStreams, QpackMaxTableCapacity, Settings},
+            dhttp::settings::Settings,
             qpack::{
                 algorithm::{Algorithm, DynamicCompressAlgo, HuffmanNever},
                 decoder::DecoderState,
@@ -833,8 +835,12 @@ mod tests {
 
         fn settings_pair(capacity: u32) -> Arc<Settings> {
             let mut settings = Settings::default();
-            settings.set(QpackMaxTableCapacity::setting(VarInt::from_u32(capacity)));
-            settings.set(QpackBlockedStreams::setting(VarInt::from_u32(100)));
+            settings.set(crate::qpack::settings::QpackMaxTableCapacity::setting(
+                VarInt::from_u32(capacity),
+            ));
+            settings.set(crate::qpack::settings::QpackBlockedStreams::setting(
+                VarInt::from_u32(100),
+            ));
             Arc::new(settings)
         }
 

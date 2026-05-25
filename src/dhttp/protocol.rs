@@ -84,7 +84,8 @@ mod tests {
     use crate::{
         codec::{BoxReadStream, BoxWriteStream, SinkWriter, StreamReader},
         connection::{ConnectionState, tests::MockConnection},
-        dhttp::settings::{EnableConnectProtocol, Settings},
+        dhttp::settings::Settings,
+        extended_connect::settings::EnableConnectProtocol,
         protocol::Protocols,
         quic::{self, GetStreamIdExt},
     };

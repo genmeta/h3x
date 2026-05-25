@@ -39,10 +39,9 @@ impl Setting {
     }
 
     pub fn check(&self) -> Result<(), InvalidSettingValue> {
-        let is_bool_setting = self.id == EnableConnectProtocol::ID
-            || self.id == EnableWebTransport::ID
-            || self.id == H3Datagram::ID;
-        if is_bool_setting && self.value != VarInt::from_u32(0) && self.value != VarInt::from_u32(1)
+        if is_boolean_setting(self.id)
+            && self.value != VarInt::from_u32(0)
+            && self.value != VarInt::from_u32(1)
         {
             return Err(InvalidSettingValue::BoolSetting {
                 id: self.id,
@@ -69,6 +68,13 @@ impl H3ConnectionError for InvalidSettingValue {
     fn code(&self) -> Code {
         Code::H3_SETTINGS_ERROR
     }
+}
+
+const fn is_boolean_setting(id: VarInt) -> bool {
+    let id = id.into_inner();
+    id == crate::extended_connect::settings::EnableConnectProtocol::ID.into_inner()
+        || id == crate::dhttp::webtransport::settings::EnableWebTransport::ID.into_inner()
+        || id == crate::dhttp::datagram::settings::H3Datagram::ID.into_inner()
 }
 
 impl<S: AsyncRead + Send> DecodeFrom<S> for Setting {
@@ -173,45 +179,25 @@ impl EncodeInto<BufList> for Settings {
 impl Settings {
     /// Typed access to a setting value. The return type depends on the setting:
     ///
-    /// - Concrete setting types (`QpackMaxTableCapacity`, `MaxFieldSectionSize`, …)
-    ///   apply defaults and return their associated `Value` type.
+    /// - Concrete setting types (`crate::qpack::settings::QpackMaxTableCapacity`,
+    ///   `MaxFieldSectionSize`, …) apply defaults and return their associated `Value` type.
     /// - A raw [`VarInt`] identifier returns `Option<VarInt>` with no default fallback.
     ///
     /// ```ignore
-    /// settings.get(QpackMaxTableCapacity)       // → VarInt (with default)
-    /// settings.get(MaxFieldSectionSize)          // → Option<VarInt>
-    /// settings.get(VarInt::from_u32(0x06))       // → Option<VarInt> (raw)
+    /// settings.get(crate::qpack::settings::QpackMaxTableCapacity) // → VarInt (with default)
+    /// settings.get(MaxFieldSectionSize)                           // → Option<VarInt>
+    /// settings.get(VarInt::from_u32(0x06))                        // → Option<VarInt> (raw)
     /// ```
     pub fn get<S: SettingId>(&self, id: S) -> S::Value {
         id.value_from(self)
     }
 
-    fn get_raw(&self, id: VarInt) -> Option<VarInt> {
+    pub(crate) fn get_raw(&self, id: VarInt) -> Option<VarInt> {
         self.map.get(&id).copied()
     }
 
     pub fn max_field_section_size(&self) -> Option<VarInt> {
         self.get(MaxFieldSectionSize)
-    }
-
-    pub fn qpack_max_table_capacity(&self) -> VarInt {
-        self.get(QpackMaxTableCapacity)
-    }
-
-    pub fn qpack_blocked_streams(&self) -> VarInt {
-        self.get(QpackBlockedStreams)
-    }
-
-    pub fn enable_connect_protocol(&self) -> bool {
-        self.get(EnableConnectProtocol)
-    }
-
-    pub fn enable_webtransport(&self) -> bool {
-        self.get(EnableWebTransport)
-    }
-
-    pub fn h3_datagram(&self) -> bool {
-        self.get(H3Datagram)
     }
 
     pub fn set(&mut self, Setting { id, value }: Setting) {
@@ -292,71 +278,6 @@ impl SettingId for VarInt {
     }
 }
 
-/// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (0x01). Default: 0.
-///
-/// To bound the memory requirements of the decoder, the decoder limits the
-/// maximum value the encoder is permitted to set for the dynamic table
-/// capacity. In HTTP/3, this limit is determined by the value of
-/// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` sent by the decoder.
-///
-/// <https://datatracker.ietf.org/doc/html/rfc9204#section-5>
-pub struct QpackMaxTableCapacity;
-
-impl QpackMaxTableCapacity {
-    pub const ID: VarInt = VarInt::from_u32(0x01);
-    /// The default value is zero. See Section 3.2 for usage. This is the
-    /// equivalent of the `SETTINGS_HEADER_TABLE_SIZE` from HTTP/2.
-    pub const DEFAULT: VarInt = VarInt::from_u32(0);
-
-    pub const fn setting(value: VarInt) -> Setting {
-        Setting::new(Self::ID, value)
-    }
-}
-
-impl SettingId for QpackMaxTableCapacity {
-    type Value = VarInt;
-
-    fn id(&self) -> VarInt {
-        Self::ID
-    }
-
-    fn value_from(&self, settings: &Settings) -> VarInt {
-        settings.get_raw(Self::ID).unwrap_or(Self::DEFAULT)
-    }
-}
-
-/// `SETTINGS_QPACK_BLOCKED_STREAMS` (0x07). Default: 0.
-///
-/// The decoder specifies an upper bound on the number of streams that can
-/// be blocked using the `SETTINGS_QPACK_BLOCKED_STREAMS` setting. An
-/// encoder MUST limit the number of streams that could become blocked to
-/// the value of `SETTINGS_QPACK_BLOCKED_STREAMS` at all times.
-///
-/// <https://datatracker.ietf.org/doc/html/rfc9204#section-2.1.2-4>
-pub struct QpackBlockedStreams;
-
-impl QpackBlockedStreams {
-    pub const ID: VarInt = VarInt::from_u32(0x07);
-    /// The default value is zero. See Section 2.1.2.
-    pub const DEFAULT: VarInt = VarInt::from_u32(0);
-
-    pub const fn setting(value: VarInt) -> Setting {
-        Setting::new(Self::ID, value)
-    }
-}
-
-impl SettingId for QpackBlockedStreams {
-    type Value = VarInt;
-
-    fn id(&self) -> VarInt {
-        Self::ID
-    }
-
-    fn value_from(&self, settings: &Settings) -> VarInt {
-        settings.get_raw(Self::ID).unwrap_or(Self::DEFAULT)
-    }
-}
-
 /// `SETTINGS_MAX_FIELD_SECTION_SIZE` (0x06). No default (unlimited).
 ///
 /// An HTTP/3 implementation MAY impose a limit on the maximum size of the
@@ -388,95 +309,6 @@ impl SettingId for MaxFieldSectionSize {
     }
 }
 
-/// `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x08). No default.
-///
-/// Enables the Extended CONNECT method for WebSocket upgrades over HTTP/3.
-/// The value MUST be 0 or 1.
-///
-/// <https://datatracker.ietf.org/doc/html/rfc9220>
-pub struct EnableConnectProtocol;
-
-impl EnableConnectProtocol {
-    pub const ID: VarInt = VarInt::from_u32(0x08);
-
-    pub const fn setting(enabled: bool) -> Setting {
-        Setting::new(Self::ID, VarInt::from_u32(enabled as u32))
-    }
-}
-
-impl SettingId for EnableConnectProtocol {
-    type Value = bool;
-
-    fn id(&self) -> VarInt {
-        Self::ID
-    }
-
-    fn value_from(&self, settings: &Settings) -> bool {
-        settings
-            .get_raw(Self::ID)
-            .is_some_and(|v| v == VarInt::from_u32(1))
-    }
-}
-
-/// `SETTINGS_ENABLE_WEBTRANSPORT` (0x2b603742). No default.
-///
-/// Enables WebTransport over HTTP/3. The value MUST be 0 or 1.
-/// Requires `SETTINGS_ENABLE_CONNECT_PROTOCOL` to also be enabled.
-///
-/// <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3>
-pub struct EnableWebTransport;
-
-impl EnableWebTransport {
-    pub const ID: VarInt = VarInt::from_u32(0x2b603742);
-
-    pub const fn setting(enabled: bool) -> Setting {
-        Setting::new(Self::ID, VarInt::from_u32(enabled as u32))
-    }
-}
-
-impl SettingId for EnableWebTransport {
-    type Value = bool;
-
-    fn id(&self) -> VarInt {
-        Self::ID
-    }
-
-    fn value_from(&self, settings: &Settings) -> bool {
-        settings
-            .get_raw(Self::ID)
-            .is_some_and(|v| v == VarInt::from_u32(1))
-    }
-}
-
-/// `H3_DATAGRAM` (0x33). No default.
-///
-/// Indicates support for HTTP/3 datagrams (RFC 9297). The value MUST be 0 or 1.
-///
-/// <https://datatracker.ietf.org/doc/html/rfc9297>
-pub struct H3Datagram;
-
-impl H3Datagram {
-    pub const ID: VarInt = VarInt::from_u32(0x33);
-
-    pub const fn setting(enabled: bool) -> Setting {
-        Setting::new(Self::ID, VarInt::from_u32(enabled as u32))
-    }
-}
-
-impl SettingId for H3Datagram {
-    type Value = bool;
-
-    fn id(&self) -> VarInt {
-        Self::ID
-    }
-
-    fn value_from(&self, settings: &Settings) -> bool {
-        settings
-            .get_raw(Self::ID)
-            .is_some_and(|v| v == VarInt::from_u32(1))
-    }
-}
-
 impl UnidirectionalStream<()> {
     /// A control stream is indicated by a stream type of 0x00. Data on this
     ///  stream consists of HTTP/3 frames, as defined in Section 7.2.
@@ -497,5 +329,29 @@ impl<S: ?Sized> UnidirectionalStream<S> {
         Self::initial(UnidirectionalStream::CONTROL_STREAM_TYPE, stream)
             .await
             .map_err(|error| error.map_stream_reset(|_| H3CriticalStreamClosed::Control.into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        dhttp::{datagram::settings::H3Datagram, webtransport::settings::EnableWebTransport},
+        extended_connect::settings::EnableConnectProtocol,
+        varint::VarInt,
+    };
+
+    #[test]
+    fn boolean_setting_validation_uses_new_owner_modules() {
+        for id in [
+            EnableConnectProtocol::ID,
+            EnableWebTransport::ID,
+            H3Datagram::ID,
+        ] {
+            let err = Setting::new(id, VarInt::from_u32(2))
+                .check()
+                .expect_err("boolean setting value 2 must be rejected");
+            assert!(matches!(err, InvalidSettingValue::BoolSetting { .. }));
+        }
     }
 }

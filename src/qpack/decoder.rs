@@ -667,8 +667,8 @@ mod tests {
 
     use super::{DecoderInstruction, DecoderState};
     use crate::{
-        dhttp::settings::{QpackMaxTableCapacity, Settings},
-        qpack::r#static,
+        dhttp::settings::Settings,
+        qpack::{settings::QpackMaxTableCapacity, r#static},
         varint::VarInt,
     };
 

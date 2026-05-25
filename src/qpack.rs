@@ -6,6 +6,7 @@ pub mod field;
 pub mod instruction;
 pub mod integer;
 pub mod protocol;
+pub mod settings;
 pub mod r#static;
 pub mod string;
 
@@ -22,7 +23,7 @@ mod tests {
         codec::{DecodeExt, EncodeExt, SinkWriter, StreamReader},
         dhttp::{
             frame::{Frame, stream::FrameStream},
-            settings::{QpackBlockedStreams, QpackMaxTableCapacity, Settings},
+            settings::Settings,
             stream::UnidirectionalStream,
         },
         qpack::{
@@ -186,8 +187,12 @@ mod tests {
 
     fn settings_with_dynamic_table() -> Arc<Settings> {
         let mut settings = Settings::default();
-        settings.set(QpackMaxTableCapacity::setting(VarInt::from_u32(4096)));
-        settings.set(QpackBlockedStreams::setting(VarInt::from_u32(100)));
+        settings.set(crate::qpack::settings::QpackMaxTableCapacity::setting(
+            VarInt::from_u32(4096),
+        ));
+        settings.set(crate::qpack::settings::QpackBlockedStreams::setting(
+            VarInt::from_u32(100),
+        ));
         Arc::new(settings)
     }
 
