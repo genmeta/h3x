@@ -175,12 +175,9 @@ where
 impl ReadStream {
     pub fn as_bytes_stream(&mut self) -> impl ReadMessageStream + '_ {
         unfold(self, |this: &mut ReadStream| async move {
-            match this
-                .try_stream_io(async |this| this.read_data_frame_chunk().await.transpose())
-                .await
-                .transpose()?
-            {
-                Ok(bytes) => Some((Ok(bytes), this)),
+            match this.read_data_chunk().await {
+                Ok(Some(bytes)) => Some((Ok(bytes), this)),
+                Ok(None) => None,
                 Err(error) => Some((Err(error), this)),
             }
         })
@@ -196,12 +193,9 @@ impl ReadStream {
 
     pub fn into_bytes_stream(self) -> impl ReadMessageStream {
         unfold(self, |mut this: ReadStream| async move {
-            match this
-                .try_stream_io(async |this| this.read_data_frame_chunk().await.transpose())
-                .await
-                .transpose()?
-            {
-                Ok(bytes) => Some((Ok(bytes), this)),
+            match this.read_data_chunk().await {
+                Ok(Some(bytes)) => Some((Ok(bytes), this)),
+                Ok(None) => None,
                 Err(error) => Some((Err(error), this)),
             }
         })

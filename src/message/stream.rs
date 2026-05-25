@@ -229,50 +229,63 @@ impl ReadStream {
 
     pub async fn read_data_frame_chunk(
         &mut self,
-    ) -> Option<Result<Bytes, connection::StreamError>> {
+    ) -> Result<Option<Bytes>, connection::StreamError> {
         loop {
             match self.peek_frame().await {
                 Some(Ok(mut frame)) if frame.r#type() == Frame::DATA_FRAME_TYPE => {
                     match frame.try_next().await {
-                        Ok(Some(bytes)) => return Some(Ok(bytes)),
+                        Ok(Some(bytes)) => return Ok(Some(bytes)),
                         Ok(None) => {
-                            _ = Pin::new(&mut self.stream).consume_current_frame().await;
+                            Pin::new(&mut self.stream).consume_current_frame().await?;
                             continue;
                         }
                         Err(error) => {
                             let error = error.into_stream_error(|error| {
                                 H3FrameDecodeError { source: error }.into()
                             });
-                            return Some(Err(error));
+                            return Err(error);
                         }
                     }
                 }
-                Some(Ok(..)) | None => return None,
-                Some(Err(error)) => return Some(Err(error)),
+                Some(Ok(..)) | None => return Ok(None),
+                Some(Err(error)) => return Err(error),
             }
         }
     }
 
     pub async fn read_header_frame(
         &mut self,
-    ) -> Option<Result<FieldSection, connection::StreamError>> {
+    ) -> Result<Option<FieldSection>, connection::StreamError> {
         match self.peek_frame().await {
             Some(Ok(frame)) if frame.r#type() == Frame::HEADERS_FRAME_TYPE => {
-                let frame = match Pin::new(&mut self.stream).frame()? {
+                let Some(frame) = Pin::new(&mut self.stream).frame() else {
+                    return Ok(None);
+                };
+                let frame = match frame {
                     Ok(frame) => frame,
-                    Err(error) => return Some(Err(error)),
+                    Err(error) => return Err(error),
                 };
                 match self.qpack_decoder.decode(frame).await {
                     Ok(field_section) => {
-                        _ = Pin::new(&mut self.stream).consume_current_frame().await;
-                        Some(Ok(field_section))
+                        Pin::new(&mut self.stream).consume_current_frame().await?;
+                        Ok(Some(field_section))
                     }
-                    Err(error) => Some(Err(error)),
+                    Err(error) => Err(error),
                 }
             }
-            Some(Ok(..)) | None => None,
-            Some(Err(error)) => Some(Err(error)),
+            Some(Ok(..)) | None => Ok(None),
+            Some(Err(error)) => Err(error),
         }
+    }
+
+    pub async fn read_data_chunk(&mut self) -> Result<Option<Bytes>, MessageStreamError> {
+        self.try_stream_io(async |this| this.read_data_frame_chunk().await)
+            .await
+    }
+
+    pub async fn read_header(&mut self) -> Result<Option<FieldSection>, MessageStreamError> {
+        self.try_stream_io(async |this| this.read_header_frame().await)
+            .await
     }
 
     pub async fn stop(&mut self, code: Code) -> Result<(), MessageStreamError> {
@@ -836,6 +849,37 @@ mod tests {
             .await
             .expect("peer_goaway_covers should resolve without error");
         drop(covers);
+    }
+
+    #[tokio::test]
+    async fn read_data_frame_chunk_returns_result_option_stream_error() {
+        let mut stream = read_stream_for_test(VarInt::from_u32(0));
+
+        let result: Result<Option<Bytes>, StreamError> = stream.read_data_frame_chunk().await;
+
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_header_frame_returns_result_option_stream_error() {
+        let mut stream = read_stream_for_test(VarInt::from_u32(0));
+
+        let result: Result<Option<crate::qpack::field::FieldSection>, StreamError> =
+            stream.read_header_frame().await;
+
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn high_level_read_methods_return_message_stream_error() {
+        let mut stream = read_stream_for_test(VarInt::from_u32(0));
+
+        let data: Result<Option<Bytes>, MessageStreamError> = stream.read_data_chunk().await;
+        let header: Result<Option<crate::qpack::field::FieldSection>, MessageStreamError> =
+            stream.read_header().await;
+
+        assert!(data.unwrap().is_none());
+        assert!(header.unwrap().is_none());
     }
 
     #[tokio::test]

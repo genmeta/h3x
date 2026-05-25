@@ -12,7 +12,7 @@ use super::{
     MessageStreamError, ReadStream,
     upgrade::{RemainStream, TakeoverSlot},
 };
-use crate::{connection, error::H3MessageError};
+use crate::error::H3MessageError;
 
 pin_project_lite::pin_project! {
     #[project = EitherProj]
@@ -65,49 +65,62 @@ impl ReadStream {
     pub async fn read_hyper_request_parts(
         &mut self,
     ) -> Result<http::request::Parts, MessageStreamError> {
-        self.try_stream_io(async |stream| {
-            let Some(field_section) = stream.read_header_frame().await.transpose()? else {
-                return Err(H3MessageError::MissingHeaderSection.into());
-            };
-            Ok(http::request::Parts::try_from(field_section)?)
-        })
-        .await
+        let Some(field_section) = self.read_header().await? else {
+            let error = self
+                .handle_stream_error(H3MessageError::MissingHeaderSection.into())
+                .await;
+            return Err(error.into());
+        };
+        match http::request::Parts::try_from(field_section) {
+            Ok(parts) => Ok(parts),
+            Err(error) => {
+                let error = self.handle_stream_error(error.into()).await;
+                Err(error.into())
+            }
+        }
     }
 
     pub async fn read_hyper_response_parts(
         &mut self,
     ) -> Result<http::response::Parts, MessageStreamError> {
-        self.try_stream_io(async |stream| {
-            let Some(field_section) = stream.read_header_frame().await.transpose()? else {
-                return Err(H3MessageError::MissingHeaderSection.into());
-            };
-            Ok(http::response::Parts::try_from(field_section)?)
-        })
-        .await
+        let Some(field_section) = self.read_header().await? else {
+            let error = self
+                .handle_stream_error(H3MessageError::MissingHeaderSection.into())
+                .await;
+            return Err(error.into());
+        };
+        match http::response::Parts::try_from(field_section) {
+            Ok(parts) => Ok(parts),
+            Err(error) => {
+                let error = self.handle_stream_error(error.into()).await;
+                Err(error.into())
+            }
+        }
     }
 
-    pub async fn read_hyper_frame(
-        &mut self,
-    ) -> Option<Result<Frame<Bytes>, connection::StreamError>> {
-        match self.read_data_frame_chunk().await {
-            Some(data) => Some(data.map(Frame::data)),
-            None => match self.read_header_frame().await? {
-                Ok(field_section) if !field_section.is_trailer() => {
-                    Some(Err(H3MessageError::UnexpectedHeadersInBody.into()))
-                }
-                Ok(field_section) => Some(Ok(Frame::trailers(field_section.into_header_map()))),
-                Err(error) => Some(Err(error)),
-            },
+    pub async fn read_hyper_frame(&mut self) -> Result<Option<Frame<Bytes>>, MessageStreamError> {
+        if let Some(data) = self.read_data_chunk().await? {
+            return Ok(Some(Frame::data(data)));
         }
+
+        let Some(field_section) = self.read_header().await? else {
+            return Ok(None);
+        };
+
+        if !field_section.is_trailer() {
+            let error = self
+                .handle_stream_error(H3MessageError::UnexpectedHeadersInBody.into())
+                .await;
+            return Err(error.into());
+        }
+
+        Ok(Some(Frame::trailers(field_section.into_header_map())))
     }
 
     pub fn as_hyper_body(&mut self) -> impl Body<Data = Bytes, Error = MessageStreamError> + Send {
         StreamBody::new(
             stream::unfold(self, async |stream| {
-                let frame = stream
-                    .try_stream_io(async |stream| stream.read_hyper_frame().await.transpose())
-                    .await
-                    .transpose()?;
+                let frame = stream.read_hyper_frame().await.transpose()?;
                 Some((frame, stream))
             })
             .fuse(),
@@ -117,10 +130,7 @@ impl ReadStream {
     pub fn into_hyper_body(self) -> impl Body<Data = Bytes, Error = MessageStreamError> + Send {
         StreamBody::new(
             stream::unfold(self, async |mut stream| {
-                let frame = stream
-                    .try_stream_io(async |stream| stream.read_hyper_frame().await.transpose())
-                    .await
-                    .transpose()?;
+                let frame = stream.read_hyper_frame().await.transpose()?;
                 Some((frame, stream))
             })
             .fuse(),
