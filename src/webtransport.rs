@@ -24,7 +24,7 @@
 //!
 //! ```ignore
 //! // Server handler: accept a WebTransport CONNECT request
-//! let connect = request.establish_connect().await?;
+//! let (_response, connect) = h3x::hyper::extended_connect::accept(request).await?;
 //! let session = WebTransportSession::try_from(connect)?;
 //!
 //! // Open / accept streams within the session

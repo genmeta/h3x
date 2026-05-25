@@ -7,7 +7,7 @@
 //!
 //! Dropping the session automatically unregisters it from the protocol registry.
 
-use std::{fmt, future::pending, mem::ManuallyDrop, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use snafu::ResultExt;
 use tokio::{io::AsyncWriteExt, sync::mpsc};
@@ -99,7 +99,7 @@ impl WebTransportSession {
             bidi_rx: tokio::sync::Mutex::new(registered.bidi_rx),
             uni_rx: tokio::sync::Mutex::new(registered.uni_rx),
             conn,
-            _control_task: spawn_control_task(control_task),
+            _control_task: AbortOnDropHandle::new(tokio::spawn(control_task.in_current_span())),
         }
     }
 
@@ -151,11 +151,12 @@ impl WebTransportSession {
             .context(accept_stream_error::ClosedSnafu)?;
         let mut rx = self.bidi_rx.lock().await;
         tokio::select! {
-            stream = rx.recv() => stream.ok_or(SessionClosed).context(accept_stream_error::ClosedSnafu),
+            biased;
             source = self.conn.closed() => {
                 self.state.close();
                 Err(AcceptStreamError::Connection { source })
             }
+            stream = rx.recv() => stream.ok_or(SessionClosed).context(accept_stream_error::ClosedSnafu),
         }
     }
 
@@ -166,11 +167,12 @@ impl WebTransportSession {
             .context(accept_stream_error::ClosedSnafu)?;
         let mut rx = self.uni_rx.lock().await;
         tokio::select! {
-            stream = rx.recv() => stream.ok_or(SessionClosed).context(accept_stream_error::ClosedSnafu),
+            biased;
             source = self.conn.closed() => {
                 self.state.close();
                 Err(AcceptStreamError::Connection { source })
             }
+            stream = rx.recv() => stream.ok_or(SessionClosed).context(accept_stream_error::ClosedSnafu),
         }
     }
 
@@ -193,71 +195,27 @@ impl TryFrom<EstablishedConnect> for WebTransportSession {
     type Error = RegisterSessionError;
 
     fn try_from(connect: EstablishedConnect) -> Result<Self, Self::Error> {
-        let mut connect = ManuallyDrop::new(connect);
-
         let protocol = match connect.protocol() {
             Some(protocol) => protocol,
-            None => return reject_connect(&mut connect, RegisterSessionError::MissingProtocol),
+            None => return Err(RegisterSessionError::MissingProtocol),
         };
         if protocol.as_str() != WEBTRANSPORT_H3 {
             let protocol = protocol.clone();
-            return reject_connect(
-                &mut connect,
-                RegisterSessionError::UnexpectedProtocol { protocol },
-            );
+            return Err(RegisterSessionError::UnexpectedProtocol { protocol });
         }
 
         let (registered, conn) = {
-            let Some(protocol) = connect
+            let protocol = connect
                 .connection()
                 .protocol::<super::WebTransportProtocol>()
-            else {
-                return reject_connect(&mut connect, RegisterSessionError::ProtocolLayerMissing);
-            };
-            let registered = match protocol.register(connect.stream_id()) {
-                Ok(registered) => registered,
-                Err(error) => return reject_connect(&mut connect, error),
-            };
+                .ok_or(RegisterSessionError::ProtocolLayerMissing)?;
+            let registered = protocol.register(connect.stream_id())?;
             let conn = protocol.connection();
             (registered, conn)
         };
 
-        // SAFETY: this is the only successful ownership transfer from
-        // `connect`; all error paths call `reject_connect`, which also takes it
-        // exactly once before returning.
-        let connect = unsafe { ManuallyDrop::take(&mut connect) };
         Ok(Self::from_registered(registered, conn, connect))
     }
-}
-
-fn reject_connect(
-    connect: &mut ManuallyDrop<EstablishedConnect>,
-    error: RegisterSessionError,
-) -> Result<WebTransportSession, RegisterSessionError> {
-    // SAFETY: `reject_connect` always returns immediately after taking the
-    // value, and every caller uses it as a terminal error path.
-    let connect = unsafe { ManuallyDrop::take(connect) };
-    drop_rejected_connect(connect);
-    Err(error)
-}
-
-fn drop_rejected_connect(connect: EstablishedConnect) {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        drop(connect);
-        return;
-    }
-
-    // Inherent termination: this task owns only the rejected CONNECT stream and
-    // exits immediately after dropping it inside a Tokio runtime, which is
-    // required by guarded stream cleanup.
-    std::mem::drop(
-        fallback_runtime_handle().spawn(
-            async move {
-                drop(connect);
-            }
-            .in_current_span(),
-        ),
-    );
 }
 
 // ============================================================================
@@ -286,37 +244,6 @@ async fn write_header(
         .map_err(quic::StreamError::from)
         .context(open_stream_error::WriteHeaderSnafu)?;
     Ok(codec_writer.into_inner())
-}
-
-fn spawn_control_task(
-    task: impl std::future::Future<Output = ()> + Send + 'static,
-) -> AbortOnDropHandle<()> {
-    let task = task.in_current_span();
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => AbortOnDropHandle::new(handle.spawn(task)),
-        Err(_) => AbortOnDropHandle::new(fallback_runtime_handle().spawn(task)),
-    }
-}
-
-fn fallback_runtime_handle() -> &'static tokio::runtime::Handle {
-    static HANDLE: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
-    HANDLE.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("h3x-webtransport-control".to_owned())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to create webtransport control runtime");
-                tx.send(runtime.handle().clone())
-                    .expect("failed to publish webtransport control runtime");
-                runtime.block_on(pending::<()>());
-            })
-            .expect("failed to spawn webtransport control runtime");
-        rx.recv()
-            .expect("webtransport control runtime exited during startup")
-    })
 }
 
 // ============================================================================
@@ -376,8 +303,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn try_from_established_connect_registers_session() {
+    #[tokio::test]
+    async fn try_from_established_connect_registers_session() {
         let session = WebTransportSession::try_from(connect_with_protocol(Some(Protocol::new(
             WEBTRANSPORT_H3,
         ))))
@@ -386,15 +313,15 @@ mod tests {
         assert_eq!(session.id(), StreamId::from(VarInt::from_u32(4)));
     }
 
-    #[test]
-    fn try_from_rejects_missing_protocol() {
+    #[tokio::test]
+    async fn try_from_rejects_missing_protocol() {
         let error = WebTransportSession::try_from(connect_with_protocol(None))
             .expect_err("missing protocol is invalid");
         assert!(matches!(error, RegisterSessionError::MissingProtocol));
     }
 
-    #[test]
-    fn try_from_rejects_unexpected_protocol() {
+    #[tokio::test]
+    async fn try_from_rejects_unexpected_protocol() {
         let error = WebTransportSession::try_from(connect_with_protocol(Some(Protocol::new(
             "other-protocol",
         ))))

@@ -1,7 +1,6 @@
 use snafu::Snafu;
 
 use crate::{
-    extended_connect::IntoStreamsError,
     qpack::field::Protocol,
     quic::{ConnectionError, StreamError},
     stream_id::StreamId,
@@ -20,8 +19,6 @@ pub enum RegisterSessionError {
     AlreadyRegistered { session_id: StreamId },
     #[snafu(display("session registry lock poisoned"))]
     RegistryPoisoned,
-    #[snafu(display("failed to take over webtransport connect stream"))]
-    TakeConnectStream { source: IntoStreamsError },
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
