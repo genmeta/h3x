@@ -1,9 +1,9 @@
-use std::error::Error;
+use std::{error::Error, sync::Arc};
 
 use bytes::Bytes;
 use http_body::Body;
 use http_body_util::{BodyExt, Empty};
-use snafu::ResultExt;
+use snafu::{ResultExt, Snafu};
 use tracing::Instrument;
 
 use crate::{
@@ -17,14 +17,33 @@ use crate::{
             write::send_message_error,
         },
     },
-    quic,
+    qpack::field::Protocol,
+    quic::{self, GetStreamIdExt},
+    stream_id::StreamId,
 };
 
-#[derive(Debug)]
+fn protocol_from_extensions(extensions: &http::Extensions) -> Option<Protocol> {
+    if let Some(protocol) = extensions.get::<Protocol>() {
+        return Some(protocol.clone());
+    }
+
+    extensions.get::<::hyper::ext::Protocol>().map(|protocol| {
+        Protocol::try_from(Bytes::copy_from_slice(protocol.as_ref()))
+            .expect("hyper protocol token is valid UTF-8")
+    })
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module, visibility(pub))]
 pub enum RequestError<E: Error + 'static> {
+    #[snafu(display("failed to open initial message stream"))]
     InitialStream { source: InitialMessageStreamError },
+    #[snafu(display("failed to send request"))]
     SendRequest { source: SendMessageError<E> },
+    #[snafu(display("failed to receive response"))]
     ReceiveResponse { source: MessageStreamError },
+    #[snafu(display("failed to read request stream ID"))]
+    StreamId { source: quic::StreamError },
 }
 
 impl<E: Error + 'static> From<InitialMessageStreamError> for RequestError<E> {
@@ -48,27 +67,6 @@ impl<E: Error + 'static> From<MessageStreamError> for RequestError<E> {
     }
 }
 
-impl<E: Error + 'static> std::fmt::Display for RequestError<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        #[allow(unused_variables)]
-        match self {
-            RequestError::InitialStream { source, .. } => source.fmt(f),
-            RequestError::SendRequest { source, .. } => source.fmt(f),
-            RequestError::ReceiveResponse { source, .. } => source.fmt(f),
-        }
-    }
-}
-
-impl<E: Error + 'static> Error for RequestError<E> {
-    fn source(&self) -> ::core::option::Option<&(dyn ::snafu::Error + 'static)> {
-        match *self {
-            RequestError::InitialStream { ref source, .. } => source.source(),
-            RequestError::SendRequest { ref source, .. } => source.source(),
-            RequestError::ReceiveResponse { ref source, .. } => source.source(),
-        }
-    }
-}
-
 impl<C: quic::Connection> Connection<C> {
     #[tracing::instrument(level = "debug", skip_all, fields(method = %request.method(), uri = %request.uri()))]
     pub async fn execute_hyper_request<B: Body + Send + 'static>(
@@ -87,6 +85,11 @@ impl<C: quic::Connection> Connection<C> {
 
         if is_connect {
             // CONNECT: no body or trailers — join send + receive headers.
+            let protocol = protocol_from_extensions(request.extensions());
+            let stream_id = write_stream
+                .stream_id()
+                .await
+                .context(request_error::StreamIdSnafu)?;
             let (parts, _body) = request.into_parts();
             let (send_result, recv_result) =
                 tokio::join!(write_stream.send_hyper_request_parts(parts), async {
@@ -105,6 +108,11 @@ impl<C: quic::Connection> Connection<C> {
             send_result.context(send_message_error::StreamSnafu)?;
             let mut response_parts = recv_result?;
 
+            response_parts.extensions.insert(StreamId::from(stream_id));
+            response_parts.extensions.insert(Arc::new(self.erase()));
+            if let Some(protocol) = protocol {
+                response_parts.extensions.insert(protocol);
+            }
             response_parts
                 .extensions
                 .insert(TakeoverSlot::new(RemainStream::immediately(read_stream)));
@@ -146,5 +154,43 @@ impl<C: quic::Connection> Connection<C> {
             let body = Either::left(read_stream.into_hyper_body());
             Ok(http::Response::from_parts(response_parts, body))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http::Extensions;
+
+    use super::*;
+
+    #[test]
+    fn protocol_from_extensions_captures_h3x_protocol() {
+        let mut extensions = Extensions::new();
+        extensions.insert(Protocol::new("webtransport"));
+
+        let protocol = protocol_from_extensions(&extensions).expect("protocol is captured");
+
+        assert_eq!(protocol.as_str(), "webtransport");
+    }
+
+    #[test]
+    fn protocol_from_extensions_captures_hyper_protocol() {
+        let mut extensions = Extensions::new();
+        extensions.insert(::hyper::ext::Protocol::from_static("websocket"));
+
+        let protocol = protocol_from_extensions(&extensions).expect("protocol is captured");
+
+        assert_eq!(protocol.as_str(), "websocket");
+    }
+
+    #[test]
+    fn protocol_from_extensions_prefers_h3x_protocol() {
+        let mut extensions = Extensions::new();
+        extensions.insert(::hyper::ext::Protocol::from_static("websocket"));
+        extensions.insert(Protocol::new("webtransport"));
+
+        let protocol = protocol_from_extensions(&extensions).expect("protocol is captured");
+
+        assert_eq!(protocol.as_str(), "webtransport");
     }
 }

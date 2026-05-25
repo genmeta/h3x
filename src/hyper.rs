@@ -55,6 +55,10 @@ pub mod ext {
     pub use crate::qpack::field::Protocol;
 }
 
+pub mod extended_connect {
+    pub use crate::extended_connect::hyper::*;
+}
+
 pub use crate::message::stream::hyper::write::SendMessageError;
 
 pub mod client;

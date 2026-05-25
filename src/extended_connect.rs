@@ -14,6 +14,8 @@ use crate::{
 mod error;
 mod tunnel;
 
+#[cfg(feature = "hyper")]
+pub mod hyper;
 pub mod settings;
 
 pub use error::{
