@@ -66,6 +66,18 @@ pub enum MessageStreamError {
     MessageSendFailed,
 }
 
+#[derive(Debug, Snafu)]
+#[snafu(display("data frame payload too large, try smaller chunk size"))]
+struct DataFrameTooLargeStreamError {
+    source: varint::err::Overflow,
+}
+
+impl crate::error::H3StreamError for DataFrameTooLargeStreamError {
+    fn code(&self) -> Code {
+        Code::H3_FRAME_ERROR
+    }
+}
+
 impl From<quic::ConnectionError> for MessageStreamError {
     fn from(value: quic::ConnectionError) -> Self {
         Self::Quic {
@@ -344,17 +356,33 @@ impl WriteStream {
         }
     }
 
-    pub async fn send_frame(
+    pub async fn write_frame(
         &mut self,
         frame: Frame<impl Buf + Send>,
-    ) -> Result<(), quic::StreamError> {
-        self.stream.encode_one(frame).await
+    ) -> Result<(), connection::StreamError> {
+        self.stream.encode_one(frame).await?;
+        Ok(())
+    }
+
+    pub async fn write_data_frame(
+        &mut self,
+        data: impl Buf + Send,
+    ) -> Result<(), connection::StreamError> {
+        let frame = match Frame::new(Frame::DATA_FRAME_TYPE, data) {
+            Ok(frame) => frame,
+            Err(source) => return Err(DataFrameTooLargeStreamError { source }.into()),
+        };
+        self.write_frame(frame).await
+    }
+
+    pub async fn write_data(&mut self, data: impl Buf + Send) -> Result<(), MessageStreamError> {
+        let frame = Frame::new(Frame::DATA_FRAME_TYPE, data)?;
+        self.try_stream_io(async move |this| this.write_frame(frame).await)
+            .await
     }
 
     pub async fn send_data(&mut self, data: impl Buf + Send) -> Result<(), MessageStreamError> {
-        let frame = Frame::new(Frame::DATA_FRAME_TYPE, data)?;
-        self.try_stream_io(async |this| Ok(this.send_frame(frame).await?))
-            .await
+        self.write_data(data).await
     }
 
     async fn peer_goaway_covers(
@@ -433,20 +461,25 @@ impl WriteStream {
         }
     }
 
-    pub async fn send_header(
+    pub async fn write_header_frame(
+        &mut self,
+        field_lines: impl IntoIterator<Item = FieldLine> + Send,
+    ) -> Result<Result<(), EncodeError>, connection::StreamError> {
+        let algo = &DEFAULT_COMPRESS_ALGO;
+        let stream = &mut self.stream;
+        match Encoder::encode(&*self.qpack_encoder, field_lines, algo, stream).await {
+            Ok(frame) => Ok(Ok(self.write_frame(frame).await?)),
+            Err(EncodeHeaderSectionError::Encode { source }) => Ok(Err(source)),
+            Err(EncodeHeaderSectionError::Stream { source }) => Err(source),
+        }
+    }
+
+    pub async fn write_header(
         &mut self,
         field_lines: impl IntoIterator<Item = FieldLine> + Send,
     ) -> Result<(), MessageStreamError> {
-        let algo = &DEFAULT_COMPRESS_ALGO;
         let result = self
-            .try_stream_io(async move |this| {
-                let stream = &mut this.stream;
-                match Encoder::encode(&*this.qpack_encoder, field_lines, algo, stream).await {
-                    Ok(frame) => Ok(Ok(this.send_frame(frame).await?)),
-                    Err(EncodeHeaderSectionError::Encode { source }) => Ok(Err(source)),
-                    Err(EncodeHeaderSectionError::Stream { source }) => Err(source),
-                }
-            })
+            .try_stream_io(async move |this| this.write_header_frame(field_lines).await)
             .await?;
 
         // Flush encoder instructions (dynamic table insertions) to the encoder stream.
@@ -463,6 +496,13 @@ impl WriteStream {
                 unreachable!("FieldSection contain invalid header name/value, this is a bug")
             }
         }
+    }
+
+    pub async fn send_header(
+        &mut self,
+        field_lines: impl IntoIterator<Item = FieldLine> + Send,
+    ) -> Result<(), MessageStreamError> {
+        self.write_header(field_lines).await
     }
 
     pub async fn flush(&mut self) -> Result<(), MessageStreamError> {
@@ -561,7 +601,7 @@ mod tests {
         task::{Context, Poll},
     };
 
-    use bytes::Bytes;
+    use bytes::{Buf, Bytes};
     use futures::{Sink, SinkExt, Stream};
 
     use super::{MessageStreamError, ReadStream, WriteStream, guard};
@@ -570,7 +610,7 @@ mod tests {
         connection::{ConnectionState, StreamError, tests::MockConnection},
         dhttp::{goaway::Goaway, protocol::DHttpProtocol, settings::Settings},
         error::Code,
-        message::test::read_stream_for_test,
+        message::test::{read_stream_for_test, write_stream_for_test},
         protocol::Protocols,
         qpack::protocol::{QPackDecoder, QPackEncoder},
         quic::{self, GetStreamIdExt},
@@ -880,6 +920,63 @@ mod tests {
 
         assert!(data.unwrap().is_none());
         assert!(header.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn write_data_frame_returns_connection_stream_error() {
+        let mut stream = write_stream_for_test(VarInt::from_u32(0));
+
+        let result: Result<(), StreamError> =
+            stream.write_data_frame(Bytes::from_static(b"hello")).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn write_data_returns_message_stream_error() {
+        let mut stream = write_stream_for_test(VarInt::from_u32(0));
+
+        let result: Result<(), MessageStreamError> =
+            stream.write_data(Bytes::from_static(b"hello")).await;
+
+        assert!(result.is_ok());
+    }
+
+    struct OversizedBuf;
+
+    impl Buf for OversizedBuf {
+        fn remaining(&self) -> usize {
+            (VarInt::MAX.into_inner() as usize) + 1
+        }
+
+        fn chunk(&self) -> &[u8] {
+            &[]
+        }
+
+        fn advance(&mut self, _cnt: usize) {
+            unreachable!("oversized payload should fail before writing")
+        }
+    }
+
+    #[tokio::test]
+    async fn write_data_oversized_payload_returns_data_frame_too_large() {
+        let mut stream = write_stream_for_test(VarInt::from_u32(0));
+
+        let result = stream.write_data(OversizedBuf).await;
+
+        assert!(matches!(
+            result,
+            Err(MessageStreamError::DataFrameTooLarge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_data_alias_delegates_to_write_data() {
+        let mut stream = write_stream_for_test(VarInt::from_u32(0));
+
+        let result = stream.send_data(Bytes::from_static(b"hello")).await;
+
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

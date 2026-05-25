@@ -232,7 +232,7 @@ impl WriteStream {
         unfold(
             self,
             async |stream: &mut WriteStream, buf: Bytes| {
-                stream.send_data(buf).await.map(|_| stream)
+                stream.write_data(buf).await.map(|_| stream)
             },
             async |stream: &mut WriteStream| stream.flush().await.map(|_| stream),
             async |stream: &mut WriteStream| stream.close().await.map(|_| stream),
@@ -250,7 +250,9 @@ impl WriteStream {
     pub fn into_bytes_sink(self) -> impl WriteMessageStream {
         unfold(
             self,
-            async |mut stream: WriteStream, buf: Bytes| stream.send_data(buf).await.map(|_| stream),
+            async |mut stream: WriteStream, buf: Bytes| {
+                stream.write_data(buf).await.map(|_| stream)
+            },
             async |mut stream: WriteStream| stream.flush().await.map(|_| stream),
             async |mut stream: WriteStream| stream.close().await.map(|_| stream),
         )

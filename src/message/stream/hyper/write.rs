@@ -45,7 +45,7 @@ impl WriteStream {
             let frame = frame.context(send_message_error::BodySnafu)?;
             let frame = match frame.into_data() {
                 Ok(data) => {
-                    self.send_data(data)
+                    self.write_data(data)
                         .await
                         .context(send_message_error::StreamSnafu)?;
                     continue;
@@ -54,7 +54,7 @@ impl WriteStream {
             };
             let frame = match frame.into_trailers() {
                 Ok(trailers) => {
-                    self.send_header(header_map_to_field_lines(trailers))
+                    self.write_header(header_map_to_field_lines(trailers))
                         .await
                         .context(send_message_error::StreamSnafu)?;
                     break;
@@ -72,7 +72,7 @@ impl WriteStream {
         &mut self,
         parts: http::request::Parts,
     ) -> Result<(), MessageStreamError> {
-        self.send_header(hyper_request_parts_to_field_lines(parts))
+        self.write_header(hyper_request_parts_to_field_lines(parts))
             .await
     }
 
@@ -85,7 +85,7 @@ impl WriteStream {
         B::Error: std::error::Error + 'static,
     {
         let (parts, body) = request.into_parts();
-        self.send_header(hyper_request_parts_to_field_lines(parts))
+        self.write_header(hyper_request_parts_to_field_lines(parts))
             .await
             .context(send_message_error::StreamSnafu)?;
         self.send_hyper_body(body).await
@@ -95,7 +95,7 @@ impl WriteStream {
         &mut self,
         parts: http::response::Parts,
     ) -> Result<(), MessageStreamError> {
-        self.send_header(hyper_response_parts_to_field_lines(parts))
+        self.write_header(hyper_response_parts_to_field_lines(parts))
             .await
     }
 
@@ -108,7 +108,7 @@ impl WriteStream {
         B::Error: std::error::Error + 'static,
     {
         let (parts, body) = response.into_parts();
-        self.send_header(hyper_response_parts_to_field_lines(parts))
+        self.write_header(hyper_response_parts_to_field_lines(parts))
             .await
             .context(send_message_error::StreamSnafu)?;
         self.send_hyper_body(body).await
