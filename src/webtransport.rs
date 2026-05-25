@@ -23,14 +23,12 @@
 //! # Usage
 //!
 //! ```ignore
-//! // Server handler: accept a WebTransport CONNECT request
-//! let (_response, connect) = h3x::hyper::extended_connect::accept(request).await?;
-//! let session = WebTransportSession::try_from(connect)?;
-//!
-//! // Open / accept streams within the session
+//! let (response, connect) = h3x::hyper::extended_connect::accept(request).await?;
+//! let session = h3x::webtransport::WebTransportSession::try_from(connect)?;
 //! let (reader, writer) = session.open_bi().await?;
 //! let (reader, writer) = session.accept_bi().await?;
 //! let reader = session.accept_uni().await?;
+//! # Ok::<_, Box<dyn std::error::Error>>(())
 //! ```
 
 use std::future::Future;
@@ -191,16 +189,17 @@ mod lifecycle_ext {
 
     use snafu::ResultExt;
 
-    use super::{Closed, OpenSnafu, OpenStreamError};
+    use super::{AcceptStreamError, OpenStreamError, SessionClosed};
     use crate::{
         quic::{self, ConnectionError},
         rpc::lifecycle::LifecycleExt,
+        webtransport::error::{accept_stream_error, open_stream_error},
     };
 
     /// WebTransport-flavoured extension of [`LifecycleExt`].
     ///
     /// Adds check/guard helpers that surface [`OpenStreamError`] and
-    /// [`Closed`] instead of the raw [`ConnectionError`], while preserving
+    /// [`AcceptStreamError`] instead of the raw [`ConnectionError`], while preserving
     /// the lazy first-wins latching discipline.
     ///
     /// Like [`LifecycleExt`], this trait is sealed: it is automatically
@@ -209,12 +208,12 @@ mod lifecycle_ext {
     pub trait WebTransportLifecycleExt: LifecycleExt {
         /// Check liveness and surface any error as an [`OpenStreamError`].
         fn check_open(&self) -> Result<(), OpenStreamError> {
-            quic::Lifecycle::check(self).context(OpenSnafu)
+            quic::Lifecycle::check(self).context(open_stream_error::OpenSnafu)
         }
 
-        /// Check liveness and flatten any error into a [`Closed`].
-        fn check_accept(&self) -> Result<(), Closed> {
-            quic::Lifecycle::check(self).map_err(|_| Closed)
+        /// Check liveness and surface any error as an [`AcceptStreamError`].
+        fn check_accept(&self) -> Result<(), AcceptStreamError> {
+            quic::Lifecycle::check(self).context(accept_stream_error::ConnectionSnafu)
         }
 
         /// Guard an async open operation whose error is already an
@@ -240,14 +239,14 @@ mod lifecycle_ext {
         /// Guard an async open operation whose error must be lazily converted
         /// to an [`OpenStreamError`].
         ///
-        /// `map_err` is invoked only when the operation errored **and** no
+        /// `convert_error` is invoked only when the operation errored **and** no
         /// error has been latched yet. If the resulting
         /// [`OpenStreamError::Open`] carries a connection error, it is
         /// substituted with the already-latched value (first wins).
         async fn guard_open_with<T, E, M>(
             &self,
             fut: impl Future<Output = Result<T, E>>,
-            map_err: M,
+            convert_error: M,
         ) -> Result<T, OpenStreamError>
         where
             M: FnOnce(E) -> OpenStreamError,
@@ -259,7 +258,7 @@ mod lifecycle_ext {
                     if let Some(existing) = self.latch().peek() {
                         return Err(OpenStreamError::Open { source: existing });
                     }
-                    Err(match map_err(e) {
+                    Err(match convert_error(e) {
                         OpenStreamError::Open { source } => OpenStreamError::Open {
                             source: self.latch().latch_with(|| source),
                         },
@@ -270,28 +269,36 @@ mod lifecycle_ext {
         }
 
         /// Guard an async accept operation whose error is already a
-        /// [`Closed`].
+        /// [`AcceptStreamError`].
         async fn guard_accept<T>(
             &self,
-            fut: impl Future<Output = Result<T, Closed>>,
-        ) -> Result<T, Closed> {
+            fut: impl Future<Output = Result<T, AcceptStreamError>>,
+        ) -> Result<T, AcceptStreamError> {
             self.check_accept()?;
-            fut.await
+            match fut.await {
+                Ok(v) => Ok(v),
+                Err(AcceptStreamError::Connection { source }) => {
+                    Err(AcceptStreamError::Connection {
+                        source: self.latch().latch_with(|| source),
+                    })
+                }
+                Err(other) => Err(other),
+            }
         }
 
         /// Guard an async accept operation whose error carries richer
-        /// information than [`Closed`].
+        /// information than [`SessionClosed`].
         ///
-        /// `map_err` is invoked only when the operation errored **and** no
+        /// `convert_error` is invoked only when the operation errored **and** no
         /// error has been latched yet. Returning `Some(error)` from it will
         /// lazily install that error in the latch so later observers (on the
         /// connection path) see a meaningful terminal cause; the caller
-        /// always sees a plain [`Closed`].
+        /// sees either a structured connection error or a plain session closure.
         async fn guard_accept_err<T, E, M>(
             &self,
             fut: impl Future<Output = Result<T, E>>,
-            map_err: M,
-        ) -> Result<T, Closed>
+            convert_error: M,
+        ) -> Result<T, AcceptStreamError>
         where
             M: FnOnce(E) -> Option<ConnectionError>,
         {
@@ -299,12 +306,17 @@ mod lifecycle_ext {
             match fut.await {
                 Ok(v) => Ok(v),
                 Err(e) => {
-                    if self.latch().peek().is_none()
-                        && let Some(error) = map_err(e)
-                    {
-                        let _ = self.latch().latch_with(|| error);
+                    if let Some(existing) = self.latch().peek() {
+                        return Err(AcceptStreamError::Connection { source: existing });
                     }
-                    Err(Closed)
+                    if let Some(error) = convert_error(e) {
+                        return Err(AcceptStreamError::Connection {
+                            source: self.latch().latch_with(|| error),
+                        });
+                    }
+                    Err(AcceptStreamError::Closed {
+                        source: SessionClosed,
+                    })
                 }
             }
         }

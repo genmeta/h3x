@@ -2,7 +2,7 @@
 //!
 //! Follows the same pattern as [`super::super::quic::connection`]: a
 //! `#[remoc::rtc::remote]` trait provides the wire protocol, a blanket-free
-//! server impl delegates to [`WebTransportSession`], and [`RemoteWtSession`]
+//! server impl delegates to [`WebTransportSession`], and [`RemoteWebTransportSession`]
 //! wraps the generated client to present a convenient async API.
 
 use std::sync::Arc;
@@ -17,8 +17,11 @@ use super::super::{
 use crate::{
     message::stream::guard,
     quic::{self, ConnectionError, DynLifecycle},
+    stream_id::StreamId,
     varint::VarInt,
-    webtransport::{self, Closed, OpenStreamError, WtLifecycleExt},
+    webtransport::{
+        self, AcceptStreamError, OpenStreamError, SessionClosed, WebTransportLifecycleExt,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -27,22 +30,22 @@ use crate::{
 
 /// Remoc RPC counterpart of [`WebTransportSession`].
 ///
-/// Uses the native [`OpenStreamError`] and [`Closed`] error types directly —
+/// Uses the native [`OpenStreamError`] and [`SessionClosed`] error types directly —
 /// both are serializable. The `session_id` is not included because it is
 /// immutable and can be passed out-of-band at construction time.
 #[remoc::rtc::remote]
-pub trait WtSession: Send + Sync {
+pub trait WebTransportRpcSession: Send + Sync {
     async fn open_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), OpenStreamError>;
     async fn open_uni(&self) -> Result<WriteStreamClient, OpenStreamError>;
-    async fn accept_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), Closed>;
-    async fn accept_uni(&self) -> Result<ReadStreamClient, Closed>;
+    async fn accept_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), SessionClosed>;
+    async fn accept_uni(&self) -> Result<ReadStreamClient, SessionClosed>;
 }
 
 // ---------------------------------------------------------------------------
-// Server: impl WtSession for WebTransportSession
+// Server: impl WebTransportRpcSession for WebTransportSession
 // ---------------------------------------------------------------------------
 
-impl WtSession for webtransport::WebTransportSession {
+impl WebTransportRpcSession for webtransport::WebTransportSession {
     async fn open_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), OpenStreamError> {
         let (reader, writer) = webtransport::WebTransportSession::open_bi(self).await?;
         let (rs, rc) = ReadStreamServer::new(reader, 1);
@@ -74,8 +77,14 @@ impl WtSession for webtransport::WebTransportSession {
         Ok(wc)
     }
 
-    async fn accept_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), Closed> {
-        let (reader, writer) = webtransport::WebTransportSession::accept_bi(self).await?;
+    async fn accept_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), SessionClosed> {
+        let (reader, writer) = match webtransport::WebTransportSession::accept_bi(self).await {
+            Ok(streams) => streams,
+            Err(AcceptStreamError::Closed { source }) => return Err(source),
+            // RPC compatibility surface exposes only session closure here; the connection
+            // error has already been latched by h3x's connection lifecycle.
+            Err(AcceptStreamError::Connection { source: _ }) => return Err(SessionClosed),
+        };
         let (rs, rc) = ReadStreamServer::new(reader, 1);
         tokio::spawn(
             (async move {
@@ -93,8 +102,14 @@ impl WtSession for webtransport::WebTransportSession {
         Ok((rc, wc))
     }
 
-    async fn accept_uni(&self) -> Result<ReadStreamClient, Closed> {
-        let reader = webtransport::WebTransportSession::accept_uni(self).await?;
+    async fn accept_uni(&self) -> Result<ReadStreamClient, SessionClosed> {
+        let reader = match webtransport::WebTransportSession::accept_uni(self).await {
+            Ok(stream) => stream,
+            Err(AcceptStreamError::Closed { source }) => return Err(source),
+            // RPC compatibility surface exposes only session closure here; the connection
+            // error has already been latched by h3x's connection lifecycle.
+            Err(AcceptStreamError::Connection { source: _ }) => return Err(SessionClosed),
+        };
         let (rs, rc) = ReadStreamServer::new(reader, 1);
         tokio::spawn(
             (async move {
@@ -107,10 +122,10 @@ impl WtSession for webtransport::WebTransportSession {
 }
 
 // ---------------------------------------------------------------------------
-// Client: RemoteWtSession wraps WtSessionClient
+// Client: RemoteWebTransportSession wraps WebTransportRpcSessionClient
 // ---------------------------------------------------------------------------
 
-/// A wrapper around [`WtSessionClient`] that converts RPC stream clients back
+/// A wrapper around [`WebTransportRpcSessionClient`] that converts RPC stream clients back
 /// into boxed async streams.
 ///
 /// This is the client-side handle for a remote WebTransport session. It mirrors
@@ -125,16 +140,16 @@ impl WtSession for webtransport::WebTransportSession {
 /// own remoc channel — is latched and returned on every subsequent operation,
 /// satisfying the QUIC connection-error consistency requirement.
 #[derive(Clone)]
-pub struct RemoteWtSession {
-    client: WtSessionClient,
+pub struct RemoteWebTransportSession {
+    client: WebTransportRpcSessionClient,
     session_id: VarInt,
     parent: Arc<dyn DynLifecycle>,
     latch: ConnectionErrorLatch,
 }
 
-impl RemoteWtSession {
+impl RemoteWebTransportSession {
     pub fn new(
-        client: WtSessionClient,
+        client: WebTransportRpcSessionClient,
         session_id: VarInt,
         conn_lifecycle: Arc<dyn DynLifecycle>,
     ) -> Self {
@@ -146,7 +161,7 @@ impl RemoteWtSession {
         }
     }
 
-    pub fn into_inner(self) -> WtSessionClient {
+    pub fn into_inner(self) -> WebTransportRpcSessionClient {
         self.client
     }
 
@@ -156,7 +171,7 @@ impl RemoteWtSession {
             source: quic::TransportError {
                 kind: VarInt::from_u32(0x01),
                 frame_type: VarInt::from_u32(0x00),
-                reason: "remoc wt session channel closed".into(),
+                reason: "remoc webtransport session channel closed".into(),
             },
         }
     }
@@ -173,13 +188,13 @@ impl RemoteWtSession {
     }
 }
 
-impl HasLatch for RemoteWtSession {
+impl HasLatch for RemoteWebTransportSession {
     fn latch(&self) -> &ConnectionErrorLatch {
         &self.latch
     }
 }
 
-impl quic::Lifecycle for RemoteWtSession {
+impl quic::Lifecycle for RemoteWebTransportSession {
     fn close(&self, code: crate::error::Code, reason: std::borrow::Cow<'static, str>) {
         DynLifecycle::close(self.parent.as_ref(), code, reason);
     }
@@ -194,56 +209,68 @@ impl quic::Lifecycle for RemoteWtSession {
     }
 }
 
-impl webtransport::Session for RemoteWtSession {
+impl webtransport::Session for RemoteWebTransportSession {
     type StreamReader = guard::GuardedQuicReader;
     type StreamWriter = guard::GuardedQuicWriter;
 
-    fn session_id(&self) -> VarInt {
-        self.session_id
+    fn id(&self) -> StreamId {
+        self.session_id.into()
     }
 
     async fn open_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), OpenStreamError> {
-        let (reader, writer) = self.guard_open(WtSession::open_bi(&self.client)).await?;
-        Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
-    }
-
-    async fn open_uni(&self) -> Result<Self::StreamWriter, OpenStreamError> {
-        let writer = self.guard_open(WtSession::open_uni(&self.client)).await?;
-        Ok(writer.into_boxed_quic())
-    }
-
-    async fn accept_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Closed> {
         let (reader, writer) = self
-            .guard_accept_err(WtSession::accept_bi(&self.client), |Closed| {
-                RemocClient::is_closed(&self.client).then(Self::remoc_channel_error)
-            })
+            .guard_open(WebTransportRpcSession::open_bi(&self.client))
             .await?;
         Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
     }
 
-    async fn accept_uni(&self) -> Result<Self::StreamReader, Closed> {
+    async fn open_uni(&self) -> Result<Self::StreamWriter, OpenStreamError> {
+        let writer = self
+            .guard_open(WebTransportRpcSession::open_uni(&self.client))
+            .await?;
+        Ok(writer.into_boxed_quic())
+    }
+
+    async fn accept_bi(
+        &self,
+    ) -> Result<(Self::StreamReader, Self::StreamWriter), AcceptStreamError> {
+        let (reader, writer) = self
+            .guard_accept_err(
+                WebTransportRpcSession::accept_bi(&self.client),
+                |SessionClosed| {
+                    RemocClient::is_closed(&self.client).then(Self::remoc_channel_error)
+                },
+            )
+            .await?;
+        Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
+    }
+
+    async fn accept_uni(&self) -> Result<Self::StreamReader, AcceptStreamError> {
         let reader = self
-            .guard_accept_err(WtSession::accept_uni(&self.client), |Closed| {
-                RemocClient::is_closed(&self.client).then(Self::remoc_channel_error)
-            })
+            .guard_accept_err(
+                WebTransportRpcSession::accept_uni(&self.client),
+                |SessionClosed| {
+                    RemocClient::is_closed(&self.client).then(Self::remoc_channel_error)
+                },
+            )
             .await?;
         Ok(reader.into_boxed_quic())
     }
 }
 
-impl WtSessionClient {
-    /// Convert into a [`RemoteWtSession`].
-    pub fn into_wt(
+impl WebTransportRpcSessionClient {
+    /// Convert into a [`RemoteWebTransportSession`].
+    pub fn into_webtransport_session(
         self,
         session_id: VarInt,
         conn_lifecycle: Arc<dyn DynLifecycle>,
-    ) -> RemoteWtSession {
-        RemoteWtSession::new(self, session_id, conn_lifecycle)
+    ) -> RemoteWebTransportSession {
+        RemoteWebTransportSession::new(self, session_id, conn_lifecycle)
     }
 }
 
-impl From<RemoteWtSession> for WtSessionClient {
-    fn from(remote: RemoteWtSession) -> Self {
+impl From<RemoteWebTransportSession> for WebTransportRpcSessionClient {
+    fn from(remote: RemoteWebTransportSession) -> Self {
         remote.client
     }
 }

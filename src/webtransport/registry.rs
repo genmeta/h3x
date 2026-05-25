@@ -29,10 +29,9 @@ impl Registry {
         let (bidi_tx, bidi_rx) = mpsc::channel(SESSION_STREAM_CHANNEL_SIZE);
         let (uni_tx, uni_rx) = mpsc::channel(SESSION_STREAM_CHANNEL_SIZE);
 
-        let mut sessions = self
-            .inner
-            .lock()
-            .map_err(|_| RegisterSessionError::RegistryPoisoned)?;
+        let Ok(mut sessions) = self.inner.lock() else {
+            return Err(RegisterSessionError::RegistryPoisoned);
+        };
 
         if sessions.contains_key(&session_id) {
             return Err(RegisterSessionError::AlreadyRegistered { session_id });

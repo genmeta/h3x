@@ -1,13 +1,15 @@
 //! RPC forwarding for the WebTransport session layer.
 //!
 //! Re-exports the RTC trait, generated client/server types, and the
-//! [`RemoteWtSession`] convenience wrapper.
+//! [`RemoteWebTransportSession`] convenience wrapper.
 
 mod session;
 
 pub use self::session::{
-    RemoteWtSession, WtSessionClient, WtSessionReqReceiver, WtSessionServer, WtSessionServerRef,
-    WtSessionServerRefMut, WtSessionServerShared, WtSessionServerSharedMut,
+    RemoteWebTransportSession, WebTransportRpcSessionClient, WebTransportRpcSessionReqReceiver,
+    WebTransportRpcSessionServer, WebTransportRpcSessionServerRef,
+    WebTransportRpcSessionServerRefMut, WebTransportRpcSessionServerShared,
+    WebTransportRpcSessionServerSharedMut,
 };
 use crate::{quic, webtransport};
 
@@ -19,8 +21,8 @@ impl From<remoc::rtc::CallError> for webtransport::OpenStreamError {
     }
 }
 
-impl From<remoc::rtc::CallError> for webtransport::Closed {
+impl From<remoc::rtc::CallError> for webtransport::SessionClosed {
     fn from(_error: remoc::rtc::CallError) -> Self {
-        webtransport::Closed
+        webtransport::SessionClosed
     }
 }

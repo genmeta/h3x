@@ -23,7 +23,7 @@ use super::{
     registry::{RegisteredSession, SessionState},
 };
 use crate::{
-    codec::{BoxReadStream, BoxWriteStream, EncodeExt, SinkWriter},
+    codec::{BoxReadStream, BoxWriteStream, EncodeExt, EncodeInto, SinkWriter},
     extended_connect::EstablishedConnect,
     quic::{self},
     stream_id::StreamId,
@@ -229,21 +229,35 @@ async fn write_header(
     session_id: StreamId,
 ) -> Result<BoxWriteStream, OpenStreamError> {
     let mut codec_writer = SinkWriter::new(writer);
-    codec_writer
-        .encode_one(signal)
+    encode_header_value(&mut codec_writer, signal)
         .await
-        .map_err(quic::StreamError::from)
         .context(open_stream_error::WriteHeaderSnafu)?;
-    codec_writer
-        .encode_one(session_id)
+    encode_header_value(&mut codec_writer, session_id)
         .await
-        .map_err(quic::StreamError::from)
         .context(open_stream_error::WriteHeaderSnafu)?;
-    AsyncWriteExt::flush(&mut codec_writer)
+    flush_header(&mut codec_writer)
         .await
-        .map_err(quic::StreamError::from)
         .context(open_stream_error::WriteHeaderSnafu)?;
     Ok(codec_writer.into_inner())
+}
+
+async fn encode_header_value<T>(
+    codec_writer: &mut SinkWriter<BoxWriteStream>,
+    value: T,
+) -> Result<(), quic::StreamError>
+where
+    T: Send,
+    for<'a> T: EncodeInto<&'a mut SinkWriter<BoxWriteStream>, Error = std::io::Error, Output = ()>,
+{
+    codec_writer.encode_one(value).await?;
+    Ok(())
+}
+
+async fn flush_header(
+    codec_writer: &mut SinkWriter<BoxWriteStream>,
+) -> Result<(), quic::StreamError> {
+    AsyncWriteExt::flush(codec_writer).await?;
+    Ok(())
 }
 
 // ============================================================================
