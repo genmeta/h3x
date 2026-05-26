@@ -329,3 +329,485 @@ pub(super) fn encode_control(tag: u8, code: VarInt) -> ([u8; CONTROL_MAX_LEN], u
     let vi_len = encode_varint_to_slice(&mut buf[1..], code);
     (buf, 1 + vi_len)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        borrow::Cow,
+        io::{self, ErrorKind},
+        ops::ControlFlow,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+
+    use bytes::{Bytes, BytesMut};
+    use futures::{future::poll_fn, task::noop_waker_ref};
+    use tokio::{
+        io::{AsyncWrite, AsyncWriteExt},
+        net::{
+            UnixStream,
+            unix::{OwnedReadHalf, OwnedWriteHalf},
+        },
+        sync::Notify,
+    };
+    use tokio_util::codec::{Encoder, FramedRead};
+
+    use super::{
+        super::codec::{Frame, StreamCodec},
+        DrainOutcome, PendingPush, PipeState, Step, Transition,
+    };
+    use crate::{
+        error::Code,
+        quic::{self, StreamError},
+        varint::VarInt,
+    };
+
+    fn test_connection_error(reason: &str) -> quic::ConnectionError {
+        quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(0x02),
+                frame_type: VarInt::from_u32(0x07),
+                reason: reason.to_owned().into(),
+            },
+        }
+    }
+
+    fn create_context() -> Context<'static> {
+        Context::from_waker(noop_waker_ref())
+    }
+
+    struct TestLifecycle {
+        terminal_error: Arc<Mutex<Option<quic::ConnectionError>>>,
+        notify: Arc<Notify>,
+    }
+
+    impl TestLifecycle {
+        fn alive() -> Self {
+            Self {
+                terminal_error: Arc::new(Mutex::new(None)),
+                notify: Arc::new(Notify::new()),
+            }
+        }
+
+        fn dead(reason: &str) -> Self {
+            let lifecycle = Self::alive();
+            lifecycle.set_error(test_connection_error(reason));
+            lifecycle
+        }
+
+        fn set_error(&self, error: quic::ConnectionError) {
+            let mut terminal_error = self.terminal_error.lock().unwrap();
+            *terminal_error = Some(error);
+            self.notify.notify_waiters();
+        }
+    }
+
+    impl quic::Lifecycle for TestLifecycle {
+        fn close(&self, _code: Code, _reason: Cow<'static, str>) {}
+
+        fn check(&self) -> Result<(), quic::ConnectionError> {
+            match self.terminal_error.lock().unwrap().clone() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        async fn closed(&self) -> quic::ConnectionError {
+            loop {
+                let terminal_error = self.terminal_error.lock().unwrap().clone();
+                if let Some(error) = terminal_error {
+                    break error;
+                }
+                self.notify.notified().await;
+            }
+        }
+    }
+
+    #[test]
+    fn step_map_and_then_are_functor_like() {
+        let value = Step::Done(1).map(|x| x + 1);
+        assert!(matches!(value, Step::Done(2)));
+        assert!(matches!(Step::<u8>::Pending.map(|x| x + 1), Step::Pending));
+        assert!(matches!(
+            Step::<u8>::Transition(Transition::Finish).map(|x| x + 1),
+            Step::Transition(Transition::Finish)
+        ));
+
+        let transition = Transition::Reset(VarInt::from_u32(7));
+        let value = Step::Done(1).and_then(|x| Step::Done(x + 10));
+        assert!(matches!(value, Step::Done(11)));
+        assert!(matches!(
+            Step::<u8>::Pending.and_then(Step::Done),
+            Step::Pending
+        ));
+        assert!(matches!(
+            Step::<u8>::Transition(transition).and_then(Step::Done),
+            Step::Transition(Transition::Reset(_))
+        ));
+    }
+
+    #[test]
+    fn pipe_state_apply_transitions_to_dead_and_dying_states() {
+        let code = VarInt::from_u32(4);
+        let mut cx = create_context();
+        let mut state = PipeState::Live(());
+
+        state.apply(Transition::Reset(code), &mut cx);
+        assert!(matches!(
+            state,
+            PipeState::Dead(Err(StreamError::Reset { code: got })) if got == code
+        ));
+
+        let mut state = PipeState::Live(());
+        state.apply(Transition::Finish, &mut cx);
+        assert!(matches!(state, PipeState::Dead(Ok(()))));
+
+        let dead_lifecycle = TestLifecycle::dead("closed");
+        let mut state = PipeState::Live(());
+        state.apply(Transition::ConnDied(Arc::new(dead_lifecycle)), &mut cx);
+        assert!(matches!(
+            state,
+            PipeState::Dead(Err(StreamError::Connection { .. }))
+        ));
+
+        let alive_lifecycle = Arc::new(TestLifecycle::alive());
+        let mut state = PipeState::Live(());
+        state.apply(Transition::ConnDied(alive_lifecycle.clone() as _), &mut cx);
+        assert!(matches!(state, PipeState::Dying(_)));
+        let ready = state.poll_non_live(&mut cx);
+        assert!(matches!(ready, Some(Poll::Pending)));
+
+        alive_lifecycle.set_error(test_connection_error("gone"));
+        let ready = state.poll_non_live(&mut cx);
+        assert!(matches!(
+            ready,
+            Some(Poll::Ready(Err(StreamError::Connection { .. })))
+        ));
+    }
+
+    #[test]
+    fn pipe_state_poll_non_live_and_live_mut_behaviour() {
+        let mut cx = create_context();
+
+        let mut state: PipeState<i32> = PipeState::Live(8);
+        assert!(state.poll_non_live(&mut cx).is_none());
+        assert!(state.live_mut().is_some());
+
+        state = PipeState::Dead(Ok(()));
+        assert!(matches!(
+            state.poll_non_live(&mut cx),
+            Some(Poll::Ready(Ok(())))
+        ));
+        assert!(state.live_mut().is_none());
+
+        let mut state: PipeState<i32> = PipeState::Dead(Err(StreamError::Connection {
+            source: test_connection_error("bad"),
+        }));
+        assert!(matches!(
+            state.poll_non_live(&mut cx),
+            Some(Poll::Ready(Err(StreamError::Connection { .. })))
+        ));
+    }
+
+    #[test]
+    fn drain_outcome_resolve_maps_read_closed_and_break_cases() {
+        let step = DrainOutcome::Drained.resolve(|| Step::Done(()));
+        assert!(matches!(step, Step::Done(())));
+
+        assert!(matches!(
+            DrainOutcome::Break(Transition::Finish).resolve(|| Step::Done(())),
+            Step::Transition(Transition::Finish)
+        ));
+
+        let step = DrainOutcome::ReadClosed
+            .resolve(|| Step::Transition(Transition::Reset(VarInt::from_u32(3))));
+        assert!(matches!(
+            step,
+            Step::Transition(Transition::Reset(code)) if code == VarInt::from_u32(3)
+        ));
+    }
+
+    async fn make_framed_reader_and_writer()
+    -> (FramedRead<OwnedReadHalf, StreamCodec>, OwnedWriteHalf) {
+        let (left, right) = UnixStream::pair().unwrap();
+        let (left_read, _left_write) = left.into_split();
+        let (right_read, right_write) = right.into_split();
+        let read = FramedRead::new(left_read, StreamCodec::new());
+        drop(right_read);
+        (read, right_write)
+    }
+
+    async fn write_frames(write: &mut OwnedWriteHalf, frames: &[Frame]) -> io::Result<()> {
+        let mut codec = StreamCodec::new();
+        let mut buf = BytesMut::new();
+        for frame in frames {
+            Encoder::encode(&mut codec, frame.clone(), &mut buf).map_err(io::Error::other)?;
+        }
+        write.write_all(&buf).await?;
+        write.flush().await
+    }
+
+    #[tokio::test]
+    async fn drain_returns_drained_when_no_frames_available() {
+        let (mut read, write) = make_framed_reader_and_writer().await;
+        drop(write);
+        let mut cx = create_context();
+        let outcome = super::drain(&mut read, &mut cx, |_| ControlFlow::Continue(()));
+        assert!(matches!(outcome, super::DrainOutcome::Drained));
+    }
+
+    #[tokio::test]
+    async fn drain_returns_break_when_callback_requests_transition() {
+        let (mut read, mut write) = make_framed_reader_and_writer().await;
+        write_frames(
+            &mut write,
+            &[
+                Frame::Pull,
+                Frame::Push(Bytes::from_static(b"hello")),
+                Frame::Stop(VarInt::from_u32(7)),
+            ],
+        )
+        .await
+        .unwrap();
+        let mut pulled = false;
+        let mut saw_push = false;
+        let mut outcome = super::DrainOutcome::Drained;
+        for _ in 0..4 {
+            outcome = poll_fn(|cx| {
+                Poll::Ready(super::drain(&mut read, cx, |frame| match frame {
+                    super::super::codec::Frame::Pull => {
+                        pulled = true;
+                        ControlFlow::Continue(())
+                    }
+                    super::super::codec::Frame::Push(_) => {
+                        saw_push = true;
+                        ControlFlow::Continue(())
+                    }
+                    super::super::codec::Frame::Stop(code) => {
+                        assert_eq!(code, VarInt::from_u32(7));
+                        ControlFlow::Break(Transition::Reset(code))
+                    }
+                    super::super::codec::Frame::Cancel(_)
+                    | super::super::codec::Frame::ConnClosed => ControlFlow::Continue(()),
+                }))
+            })
+            .await;
+            if !matches!(outcome, super::DrainOutcome::Drained) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(pulled);
+        assert!(saw_push);
+        assert!(matches!(
+            outcome,
+            super::DrainOutcome::Break(Transition::Reset(code)) if code == VarInt::from_u32(7)
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_returns_read_closed_on_eof_and_codec_error() {
+        let (mut read, mut write) = make_framed_reader_and_writer().await;
+        write_frames(&mut write, &[Frame::Push(Bytes::from_static(b"bye"))])
+            .await
+            .unwrap();
+        write.shutdown().await.unwrap();
+        drop(write);
+        let mut push_seen = false;
+        let mut outcome = super::DrainOutcome::Drained;
+        for _ in 0..4 {
+            outcome = poll_fn(|cx| {
+                Poll::Ready(super::drain(&mut read, cx, |frame| {
+                    push_seen = matches!(frame, super::super::codec::Frame::Push(_));
+                    ControlFlow::Continue(())
+                }))
+            })
+            .await;
+            if !matches!(outcome, super::DrainOutcome::Drained) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(push_seen);
+        assert!(matches!(
+            outcome,
+            super::DrainOutcome::ReadClosed | super::DrainOutcome::Drained
+        ));
+
+        let (mut read, mut raw) = make_framed_reader_and_writer().await;
+        raw.write_all(&[0xff]).await.unwrap();
+        let outcome =
+            poll_fn(|cx| Poll::Ready(super::drain(&mut read, cx, |_| ControlFlow::Continue(()))))
+                .await;
+        assert!(matches!(
+            outcome,
+            super::DrainOutcome::ReadClosed | super::DrainOutcome::Drained
+        ));
+    }
+
+    enum MockWriteBehavior {
+        Chunk(usize),
+        Pending,
+        Zero,
+        Error,
+    }
+
+    struct MockWrite {
+        behavior: MockWriteBehavior,
+        written: Vec<u8>,
+        pending_returned: bool,
+    }
+
+    impl MockWrite {
+        fn new(behavior: MockWriteBehavior) -> Self {
+            Self {
+                behavior,
+                written: Vec::new(),
+                pending_returned: false,
+            }
+        }
+    }
+
+    impl AsyncWrite for MockWrite {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            let slices = [std::io::IoSlice::new(buf)];
+            self.poll_write_vectored(cx, &slices)
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> Poll<Result<usize, io::Error>> {
+            let this = self.get_mut();
+            match &this.behavior {
+                MockWriteBehavior::Chunk(chunk) => {
+                    let total = bufs.iter().map(|b| b.len()).sum::<usize>();
+                    let count = total.min(*chunk);
+                    let mut remaining = count;
+                    for buf in bufs {
+                        let take = remaining.min(buf.len());
+                        this.written.extend_from_slice(&buf[..take]);
+                        remaining -= take;
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                    Poll::Ready(Ok(count))
+                }
+                MockWriteBehavior::Pending => {
+                    if this.pending_returned {
+                        Poll::Ready(Ok(0))
+                    } else {
+                        this.pending_returned = true;
+                        Poll::Pending
+                    }
+                }
+                MockWriteBehavior::Zero => Poll::Ready(Ok(0)),
+                MockWriteBehavior::Error => Poll::Ready(Err(io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "mock write error",
+                ))),
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn flush_pending_reports_done_and_clears_pending_on_success() {
+        let mut write = MockWrite::new(MockWriteBehavior::Chunk(4));
+        let payload = Bytes::from_static(b"hello world");
+        let mut pending = Some(PendingPush::new(payload.clone()).unwrap());
+        let mut cx = create_context();
+        let lifecycle: Arc<dyn quic::DynLifecycle> = Arc::new(TestLifecycle::alive());
+
+        let result = super::flush_pending(&mut write, &lifecycle, &mut pending, &mut cx);
+        assert!(matches!(result, super::Step::Done(())));
+        assert!(pending.is_none());
+        assert!(!write.written.is_empty());
+
+        let mut expected = Vec::new();
+        let (header, header_len) = super::super::codec::encode_push_header(payload.len()).unwrap();
+        expected.extend_from_slice(&header[..header_len]);
+        expected.extend_from_slice(&payload);
+        assert_eq!(write.written, expected);
+    }
+
+    #[test]
+    fn flush_pending_passes_readiness_changes() {
+        let mut write = MockWrite::new(MockWriteBehavior::Pending);
+        let mut pending = Some(PendingPush::new(Bytes::from_static(b"hello")).unwrap());
+        let mut cx = create_context();
+        let lifecycle: Arc<dyn quic::DynLifecycle> = Arc::new(TestLifecycle::alive());
+
+        let result = super::flush_pending(&mut write, &lifecycle, &mut pending, &mut cx);
+        assert!(matches!(result, super::Step::Pending));
+        assert!(pending.is_some());
+    }
+
+    #[test]
+    fn flush_pending_converts_zero_and_error_to_transition() {
+        let lifecycle: Arc<dyn quic::DynLifecycle> = Arc::new(TestLifecycle::alive());
+        let mut cx = create_context();
+
+        let mut zero = MockWrite::new(MockWriteBehavior::Zero);
+        let mut pending = Some(PendingPush::new(Bytes::from_static(b"hello")).unwrap());
+        let result = super::flush_pending(&mut zero, &lifecycle, &mut pending, &mut cx);
+        assert!(matches!(
+            result,
+            super::Step::Transition(super::Transition::Finish)
+        ));
+
+        let mut error = MockWrite::new(MockWriteBehavior::Error);
+        let mut pending = Some(PendingPush::new(Bytes::from_static(b"hello")).unwrap());
+        let result = super::flush_pending(&mut error, &lifecycle, &mut pending, &mut cx);
+        assert!(matches!(
+            result,
+            super::Step::Transition(super::Transition::Finish)
+        ));
+    }
+
+    #[test]
+    fn check_lifecycle_preserves_alive_or_transitions_to_conn_died() {
+        let alive = Arc::new(TestLifecycle::alive());
+        let step = super::check_lifecycle(
+            &(alive as Arc<dyn quic::DynLifecycle>),
+            Step::Transition(Transition::Finish),
+        );
+        assert!(matches!(step, Step::Transition(Transition::Finish)));
+
+        let dead = Arc::new(TestLifecycle::dead("dead"));
+        let step = super::check_lifecycle(&(dead as Arc<dyn quic::DynLifecycle>), Step::Done(()));
+        assert!(matches!(step, Step::Transition(Transition::ConnDied(_))));
+    }
+
+    #[test]
+    fn encode_control_has_expected_prefix_and_length() {
+        use super::super::codec::encode_varint_to_slice;
+
+        let tag = 0x09;
+        let code = VarInt::from_u32(0x1f4);
+        let (buf, len) = super::encode_control(tag, code);
+        let mut expected = [0u8; super::super::codec::CONTROL_MAX_LEN];
+        expected[0] = tag;
+        let vi_len = encode_varint_to_slice(&mut expected[1..], code);
+        let expected_len = 1 + vi_len;
+        assert_eq!(len, expected_len);
+        assert_eq!(&buf[..len], &expected[..expected_len]);
+    }
+}

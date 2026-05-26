@@ -371,6 +371,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         future::{Ready, pending, ready},
         sync::{
             Arc, Mutex,
@@ -554,6 +555,8 @@ mod tests {
         }
     }
 
+    type ConnectionResultQueue<C> = Arc<Mutex<VecDeque<Result<Arc<C>, quic::ConnectionError>>>>;
+
     #[derive(Clone)]
     struct CountingConnect<C: quic::Connection> {
         calls: Arc<AtomicUsize>,
@@ -596,6 +599,38 @@ mod tests {
                 .lock()
                 .expect("result mutex should not be poisoned")
                 .clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct SequencedConnect<C: quic::Connection> {
+        calls: Arc<AtomicUsize>,
+        results: ConnectionResultQueue<C>,
+    }
+
+    impl<C: quic::Connection> SequencedConnect<C> {
+        fn new(results: impl IntoIterator<Item = Result<Arc<C>, quic::ConnectionError>>) -> Self {
+            Self {
+                calls: Arc::default(),
+                results: Arc::new(Mutex::new(results.into_iter().collect())),
+            }
+        }
+    }
+
+    impl<C: quic::Connection> quic::Connect for SequencedConnect<C> {
+        type Connection = C;
+        type Error = quic::ConnectionError;
+
+        async fn connect<'a>(
+            &'a self,
+            _server: &'a Authority,
+        ) -> Result<Arc<Self::Connection>, Self::Error> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.results
+                .lock()
+                .expect("result queue mutex should not be poisoned")
+                .pop_front()
+                .expect("connect result queue should contain an entry")
         }
     }
 
@@ -692,6 +727,57 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct SequencedListen<C: quic::Connection> {
+        accepted: Arc<AtomicUsize>,
+        results: ConnectionResultQueue<C>,
+    }
+
+    impl<C: quic::Connection> SequencedListen<C> {
+        fn new(results: impl IntoIterator<Item = Result<Arc<C>, quic::ConnectionError>>) -> Self {
+            Self {
+                accepted: Arc::default(),
+                results: Arc::new(Mutex::new(results.into_iter().collect())),
+            }
+        }
+    }
+
+    impl<C: quic::Connection> quic::Listen for SequencedListen<C> {
+        type Connection = C;
+        type Error = quic::ConnectionError;
+
+        async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
+            self.accepted.fetch_add(1, Ordering::Relaxed);
+            self.results
+                .lock()
+                .expect("listen result queue mutex should not be poisoned")
+                .pop_front()
+                .expect("listen result queue should contain an entry")
+        }
+
+        async fn shutdown(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl<C: quic::Connection> quic::Listen for &SequencedListen<C> {
+        type Connection = C;
+        type Error = quic::ConnectionError;
+
+        async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
+            self.accepted.fetch_add(1, Ordering::Relaxed);
+            self.results
+                .lock()
+                .expect("listen result queue mutex should not be poisoned")
+                .pop_front()
+                .expect("listen result queue should contain an entry")
+        }
+
+        async fn shutdown(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
     struct NoopService;
 
     impl Service<UnresolvedRequest> for NoopService {
@@ -736,6 +822,15 @@ mod tests {
 
         assert!(Arc::ptr_eq(&builder, &endpoint.builder));
         assert!(Arc::ptr_eq(&accepted, &endpoint.quic().accepted));
+        assert_eq!(endpoint.pool_len(), 0);
+    }
+
+    #[test]
+    fn builder_without_explicit_builder_uses_default_connection_builder() {
+        let endpoint: H3Endpoint<_, BuildableConnection> =
+            H3Endpoint::builder().quic(MockListen::default()).build();
+
+        assert_eq!(*endpoint.builder, ConnectionBuilder::default());
         assert_eq!(endpoint.pool_len(), 0);
     }
 
@@ -793,6 +888,20 @@ mod tests {
             .expect_err("connector error should be returned");
 
         assert!(matches!(error, pool::ConnectError::Connector { source } if source.is_transport()));
+    }
+
+    #[tokio::test]
+    async fn inherent_connect_returns_h3_build_error() {
+        let endpoint =
+            H3Endpoint::<_, MockConnection>::new(CountingConnect::succeed(MockConnection::new()));
+        let server: Authority = "test-remote:443".parse().unwrap();
+
+        let error = endpoint
+            .connect(server)
+            .await
+            .expect_err("H3 builder error should be returned");
+
+        assert!(matches!(error, pool::ConnectError::H3 { source } if source.is_transport()));
     }
 
     #[tokio::test]
@@ -893,6 +1002,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accept_owned_returns_quic_accept_error_from_shared_endpoint() {
+        let endpoint = Arc::new(H3Endpoint::builder().quic(FailingListen).build());
+
+        let error = endpoint
+            .accept_owned()
+            .await
+            .expect_err("shared accept error should be returned");
+
+        assert!(matches!(error, AcceptError::Accept { source } if source.is_transport()));
+    }
+
+    #[tokio::test]
     async fn quic_listen_impl_delegates_accept_and_shutdown_to_inner_transport() {
         let listen = MockListen::default();
         let accepted = listen.accepted.clone();
@@ -923,6 +1044,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_skips_build_errors_and_returns_later_accept_error() {
+        let listen = SequencedListen::new([
+            Ok(Arc::new(MockConnection::new())),
+            Err(test_connection_error("accept failed after build retry")),
+        ]);
+        let accepted = listen.accepted.clone();
+        let mut endpoint = H3Endpoint::builder().quic(listen).build();
+
+        let error = endpoint
+            .serve(NoopService)
+            .await
+            .expect_err("serve should continue past build errors and return accept error");
+
+        assert!(error.is_transport());
+        assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
     async fn serve_owned_returns_quic_accept_error_from_shared_endpoint() {
         let endpoint = Arc::new(H3Endpoint::builder().quic(FailingListen).build());
 
@@ -932,6 +1071,26 @@ mod tests {
             .expect_err("serve_owned should return shared listener accept error");
 
         assert!(error.is_transport());
+    }
+
+    #[tokio::test]
+    async fn serve_owned_skips_build_errors_and_returns_later_accept_error() {
+        let listen = SequencedListen::new([
+            Ok(Arc::new(MockConnection::new())),
+            Err(test_connection_error(
+                "shared accept failed after build retry",
+            )),
+        ]);
+        let accepted = listen.accepted.clone();
+        let endpoint = Arc::new(H3Endpoint::builder().quic(listen).build());
+
+        let error = endpoint
+            .serve_owned(NoopService)
+            .await
+            .expect_err("serve_owned should continue past build errors and return accept error");
+
+        assert!(error.is_transport());
+        assert_eq!(accepted.load(Ordering::Relaxed), 2);
     }
 
     /// Verify that QuicMutGuard provides mutable access to the inner QUIC transport.
@@ -1030,5 +1189,83 @@ mod tests {
         h3.clear_pool();
 
         assert_eq!(h3.pool_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn clear_pool_forces_next_connect_to_rebuild_connection() {
+        let connector = CountingConnect::succeed(IdentifiedConnection::new("reconnect.example"));
+        let calls = connector.calls.clone();
+        let endpoint = H3Endpoint::new(connector);
+        let server: Authority = "reconnect.example:443".parse().unwrap();
+
+        let first = endpoint
+            .connect(server.clone())
+            .await
+            .expect("first connect should build H3");
+        endpoint.clear_pool();
+        let second = endpoint
+            .connect(server)
+            .await
+            .expect("second connect should rebuild H3 after clearing pool");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(endpoint.pool_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_quic_mut_guard_forces_next_connect_to_rebuild_connection() {
+        let connector =
+            CountingConnect::succeed(IdentifiedConnection::new("guard-reconnect.example"));
+        let calls = connector.calls.clone();
+        let mut endpoint = H3Endpoint::new(connector);
+        let server: Authority = "guard-reconnect.example:443".parse().unwrap();
+
+        let first = endpoint
+            .connect(server.clone())
+            .await
+            .expect("first connect should build H3");
+        drop(endpoint.quic_mut());
+        let second = endpoint
+            .connect(server)
+            .await
+            .expect("second connect should rebuild H3 after guard drop");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(endpoint.pool_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn connector_errors_are_not_cached_and_later_connect_can_succeed() {
+        let connector = SequencedConnect::new([
+            Err(test_connection_error("connector failed once")),
+            Ok(Arc::new(IdentifiedConnection::new("recover.example"))),
+        ]);
+        let calls = connector.calls.clone();
+        let endpoint = H3Endpoint::new(connector);
+        let server: Authority = "recover.example:443".parse().unwrap();
+
+        let first = endpoint
+            .connect(server.clone())
+            .await
+            .expect_err("first connect should fail at the connector");
+        let second = endpoint
+            .connect(server)
+            .await
+            .expect("second connect should retry after connector failure");
+
+        assert!(matches!(first, pool::ConnectError::Connector { source } if source.is_transport()));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            second
+                .remote_agent()
+                .await
+                .expect("remote agent lookup should succeed")
+                .as_ref()
+                .map(|agent| agent.name()),
+            Some("recover.example"),
+        );
+        assert_eq!(endpoint.pool_len(), 1);
     }
 }

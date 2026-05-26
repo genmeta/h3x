@@ -169,3 +169,289 @@ impl<S: StopStream + ?Sized> StopStream for FrameStream<S> {
         self.project().stream.poll_stop(cx, code)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+
+    use bytes::Bytes;
+    use futures::{SinkExt, Stream, StreamExt, future::poll_fn, stream};
+    use tokio::io::AsyncReadExt;
+
+    use super::FrameStream;
+    use crate::{
+        codec::{EncodeExt, StreamReader},
+        connection::{self, StreamError},
+        dhttp::frame::Frame,
+        error::Code,
+        quic,
+        quic::{GetStreamId, StopStream},
+        varint::VarInt,
+    };
+
+    #[derive(Debug)]
+    struct MockStream {
+        stream_id: VarInt,
+        stop_code: Arc<Mutex<Option<VarInt>>>,
+        items: std::vec::IntoIter<Result<Bytes, quic::StreamError>>,
+    }
+
+    impl MockStream {
+        fn from_iter(stream_id: VarInt, items: Vec<Result<Bytes, quic::StreamError>>) -> Self {
+            Self {
+                stream_id,
+                stop_code: Arc::new(Mutex::new(None)),
+                items: items.into_iter(),
+            }
+        }
+    }
+
+    impl futures::Stream for MockStream {
+        type Item = std::result::Result<Bytes, quic::StreamError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.get_mut().items.next())
+        }
+    }
+
+    impl quic::GetStreamId for MockStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
+        }
+    }
+
+    impl quic::StopStream for MockStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            *self.stop_code.lock().expect("stop_code lock poisoned") = Some(code);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn to_pre_byte_stream(
+        data: impl IntoIterator<Item = u8>,
+    ) -> impl Stream<Item = Result<Bytes, quic::StreamError>> {
+        stream::iter(data.into_iter().map(|byte| Ok(Bytes::from(vec![byte]))))
+    }
+
+    fn expect_h3_frame_decode_error(error: StreamError) {
+        match error {
+            StreamError::Connection {
+                source: connection::ConnectionError::H3 { source, .. },
+            } => {
+                assert_eq!(source.code(), Code::H3_FRAME_ERROR);
+            }
+            other => panic!("expected h3 frame decode error, got {other:?}"),
+        }
+    }
+
+    fn channel() -> (
+        impl futures::Sink<Bytes, Error = quic::StreamError>,
+        impl Stream<Item = Result<Bytes, quic::StreamError>>,
+    ) {
+        let (sink, stream) = futures::channel::mpsc::channel(8);
+        (sink.sink_map_err(|_e| unreachable!()), stream.map(Ok))
+    }
+
+    #[tokio::test]
+    async fn frame_reads_next_frame_payload_and_advances() {
+        let stream = StreamReader::new(to_pre_byte_stream([
+            0x00, 0x05, // DATA, len 5
+            b'H', b'e', b'l', b'l', b'o', 0x00, 0x05, // DATA, len 5
+            b'W', b'o', b'r', b'l', b'd',
+        ]));
+
+        let mut stream = std::pin::pin!(FrameStream::new(stream));
+
+        let mut frame1 = stream.as_mut().next_frame().await.unwrap().unwrap();
+        assert_eq!(frame1.r#type().into_inner(), 0);
+        assert_eq!(frame1.length().into_inner(), 5);
+
+        let mut payload = Vec::new();
+        frame1.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(&payload[..], b"Hello");
+
+        let mut frame2 = stream.next_frame().await.unwrap().unwrap();
+        let mut payload = Vec::new();
+        frame2.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(&payload[..], b"World");
+    }
+
+    #[tokio::test]
+    async fn empty_input_produces_no_frame() {
+        let mut stream =
+            std::pin::pin!(FrameStream::new(StreamReader::new(to_pre_byte_stream([]))));
+
+        assert!(stream.as_mut().frame().is_none());
+        assert!(stream.as_mut().next_frame().await.is_none());
+        assert!(stream.as_mut().frame().is_none());
+    }
+
+    #[tokio::test]
+    async fn next_unreserved_frame_skips_reserved_frames() {
+        let stream = StreamReader::new(to_pre_byte_stream([
+            0x21, 0x02, // RESERVED frame type, len 2
+            b'p', b'a', 0x00, 0x03, // DATA frame, len 3
+            b'o', b'n', b'e',
+        ]));
+
+        let mut stream = std::pin::pin!(FrameStream::new(stream));
+        let mut frame = stream
+            .as_mut()
+            .next_unreserved_frame()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.r#type(), Frame::DATA_FRAME_TYPE);
+
+        let mut payload = Vec::new();
+        frame.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(payload.as_slice(), b"one");
+    }
+
+    #[tokio::test]
+    async fn next_frame_consumes_previous_frame_before_decoding_next() {
+        let stream = StreamReader::new(to_pre_byte_stream([
+            0x00, 0x04, // DATA, len 4
+            b'P', b'u', b't', b's', 0x01, 0x00, // HEADERS, len 0
+        ]));
+
+        let mut stream = std::pin::pin!(FrameStream::new(stream));
+        let mut first = stream.as_mut().next_frame().await.unwrap().unwrap();
+
+        let mut prefix = [0u8; 2];
+        first.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(&prefix, b"Pu");
+
+        let second = stream.as_mut().next_frame().await.unwrap().unwrap();
+        assert_eq!(second.r#type(), Frame::HEADERS_FRAME_TYPE);
+        assert_eq!(second.length().into_inner(), 0);
+    }
+
+    #[tokio::test]
+    async fn incomplete_length_converts_to_frame_decode_error() {
+        let mut stream = std::pin::pin!(FrameStream::new(StreamReader::new(to_pre_byte_stream([
+            0x00, // frame type present but length missing
+        ]))));
+
+        let error = match stream.as_mut().next_frame().await {
+            Some(Err(error)) => error,
+            Some(Ok(_)) => panic!("expected frame decode error"),
+            None => panic!("expected frame decode error"),
+        };
+        expect_h3_frame_decode_error(error);
+
+        let error = match stream.as_mut().frame() {
+            Some(Err(error)) => error,
+            Some(Ok(_)) => panic!("expected frame decode error"),
+            None => panic!("expected frame decode error"),
+        };
+        expect_h3_frame_decode_error(error);
+    }
+
+    #[tokio::test]
+    async fn incomplete_payload_error_propagates_on_consume() {
+        let mut stream = std::pin::pin!(FrameStream::new(StreamReader::new(to_pre_byte_stream([
+            0x00, 0x05, // DATA len 5
+            b'H', b'e', b'l', b'l', // payload incomplete
+        ]))));
+
+        assert!(stream.as_mut().next_frame().await.unwrap().is_ok());
+
+        let error = match stream.as_mut().next_frame().await {
+            Some(Err(error)) => error,
+            Some(Ok(_)) => panic!("expected frame decode error"),
+            None => panic!("expected frame decode error"),
+        };
+        expect_h3_frame_decode_error(error);
+    }
+
+    #[tokio::test]
+    async fn stream_reset_error_is_forwarded() {
+        let stream = StreamReader::new(stream::iter([Err(quic::StreamError::Reset {
+            code: VarInt::from_u32(0x22),
+        })]));
+        let mut stream = std::pin::pin!(FrameStream::new(stream));
+
+        let error = match stream.as_mut().next_frame().await {
+            Some(Err(error)) => error,
+            Some(Ok(_)) => panic!("expected stream reset"),
+            None => panic!("expected stream reset"),
+        };
+        assert!(matches!(error, StreamError::Reset { code } if code.into_inner() == 0x22));
+    }
+
+    #[tokio::test]
+    async fn control_traits_delegate_to_inner() {
+        let stream_id = VarInt::from_u32(7);
+        let stop_code = VarInt::from_u32(9);
+        let mock = MockStream::from_iter(stream_id, vec![Ok(Bytes::from_static(b"\x00\x00"))]);
+        let stop_code_ref = mock.stop_code.clone();
+        let mut stream = FrameStream::new(StreamReader::new(mock));
+
+        assert_eq!(
+            poll_fn(|cx| Pin::new(&mut stream).poll_stream_id(cx))
+                .await
+                .expect("stream id"),
+            stream_id
+        );
+        poll_fn(|cx| Pin::new(&mut stream).poll_stop(cx, stop_code))
+            .await
+            .expect("stream stop");
+        assert_eq!(
+            *stop_code_ref.lock().expect("stop_code lock poisoned"),
+            Some(stop_code)
+        );
+    }
+
+    #[tokio::test]
+    async fn encode_and_decode_frames() {
+        use crate::codec::SinkWriter;
+
+        let (sink, stream) = channel();
+
+        let decode = async move {
+            let stream = StreamReader::new(stream);
+            let mut stream = std::pin::pin!(FrameStream::new(stream));
+
+            let mut frame1 = stream.as_mut().next_frame().await.unwrap().unwrap();
+            assert_eq!(frame1.r#type().into_inner(), 0);
+            let mut payload = Vec::new();
+            frame1.read_to_end(&mut payload).await.unwrap();
+            assert_eq!(&payload[..], b"ok");
+
+            let mut frame2 = stream.as_mut().next_frame().await.unwrap().unwrap();
+            assert_eq!(frame2.r#type().into_inner(), 0);
+            let mut payload = Vec::new();
+            frame2.read_to_end(&mut payload).await.unwrap();
+            assert_eq!(&payload[..], b"go");
+            Ok::<(), ()>(())
+        };
+
+        let encode = async move {
+            let mut sink = SinkWriter::new(sink);
+
+            let frame1 =
+                Frame::new(VarInt::from_u32(0), Bytes::from_static(b"ok")).expect("frame1");
+            let frame2 =
+                Frame::new(VarInt::from_u32(0), Bytes::from_static(b"go")).expect("frame2");
+
+            sink.encode_one(frame1).await.unwrap();
+            sink.encode_one(frame2).await.unwrap();
+            futures::SinkExt::flush(&mut sink).await.unwrap();
+            Ok::<(), ()>(())
+        };
+
+        tokio::try_join!(decode, encode).unwrap();
+    }
+}

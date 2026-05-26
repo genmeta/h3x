@@ -602,20 +602,22 @@ mod tests {
         pin::Pin,
         sync::Arc,
         task::{Context, Poll},
+        time::Duration,
     };
 
     use bytes::{Buf, Bytes};
     use futures::{Sink, SinkExt, Stream};
+    use tokio::{sync::mpsc, time::timeout};
 
     use super::{MessageStreamError, ReadStream, WriteStream, guard};
     use crate::{
-        codec::{SinkWriter, StreamReader},
+        codec::{ErasedPeekableBiStream, PeekableStreamReader, SinkWriter, StreamReader},
         connection::{ConnectionState, StreamError, tests::MockConnection},
         dhttp::{goaway::Goaway, protocol::DHttpProtocol, settings::Settings},
         error::Code,
         message::test::{read_stream_for_test, write_stream_for_test},
-        protocol::Protocols,
-        qpack::protocol::{QPackDecoder, QPackEncoder},
+        protocol::{Protocol, Protocols, StreamVerdict},
+        qpack::protocol::{QPackDecoder, QPackEncoder, QPackProtocolFactory},
         quic::{self, GetStreamIdExt},
         varint::VarInt,
     };
@@ -788,6 +790,237 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct StreamIdErrorReadStream {
+        error: quic::StreamError,
+    }
+
+    impl quic::GetStreamId for StreamIdErrorReadStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Err(self.get_mut().error.clone()))
+        }
+    }
+
+    impl quic::StopStream for StreamIdErrorReadStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            _code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            let _ = self;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for StreamIdErrorReadStream {
+        type Item = Result<Bytes, quic::StreamError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let _ = self;
+            Poll::Ready(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct StreamIdErrorWriteStream {
+        error: quic::StreamError,
+    }
+
+    impl quic::GetStreamId for StreamIdErrorWriteStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Err(self.get_mut().error.clone()))
+        }
+    }
+
+    impl quic::CancelStream for StreamIdErrorWriteStream {
+        fn poll_cancel(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            _code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            let _ = self;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Sink<Bytes> for StreamIdErrorWriteStream {
+        type Error = quic::StreamError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            let _ = self;
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Bytes) -> Result<(), Self::Error> {
+            let _ = self;
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            let _ = self;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            let _ = self;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TrackedReadStream {
+        stream_id: VarInt,
+        stop_tx: mpsc::UnboundedSender<VarInt>,
+    }
+
+    impl quic::GetStreamId for TrackedReadStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.get_mut().stream_id))
+        }
+    }
+
+    impl quic::StopStream for TrackedReadStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            self.get_mut()
+                .stop_tx
+                .send(code)
+                .expect("tracked reader receiver should still be alive");
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for TrackedReadStream {
+        type Item = Result<Bytes, quic::StreamError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let _ = self;
+            Poll::Ready(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct TrackedWriteStream {
+        stream_id: VarInt,
+        cancel_tx: mpsc::UnboundedSender<VarInt>,
+    }
+
+    impl quic::GetStreamId for TrackedWriteStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.get_mut().stream_id))
+        }
+    }
+
+    impl quic::CancelStream for TrackedWriteStream {
+        fn poll_cancel(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            self.get_mut()
+                .cancel_tx
+                .send(code)
+                .expect("tracked writer receiver should still be alive");
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Sink<Bytes> for TrackedWriteStream {
+        type Error = quic::StreamError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            let _ = self;
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Bytes) -> Result<(), Self::Error> {
+            let _ = self;
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            let _ = self;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            let _ = self;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn state_without_qpack(quic: Arc<MockConnection>) -> ConnectionState<MockConnection> {
+        let erased: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased));
+        ConnectionState::new_for_test(quic, Arc::new(protocols))
+    }
+
+    async fn state_with_qpack(quic: Arc<MockConnection>) -> ConnectionState<MockConnection> {
+        let erased: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased));
+        let qpack = QPackProtocolFactory::new()
+            .init(&quic, &protocols)
+            .await
+            .expect("qpack protocol should initialize for tests");
+        protocols.insert(qpack);
+        ConnectionState::new_for_test(quic, Arc::new(protocols))
+    }
+
+    async fn test_peekable_bi_stream_with_bytes(
+        stream_id: u32,
+        bytes: &[u8],
+    ) -> ErasedPeekableBiStream {
+        let (reader, mut write_side) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
+        write_side
+            .send(Bytes::copy_from_slice(bytes))
+            .await
+            .expect("write test bidi bytes");
+        write_side.close().await.expect("close test bidi read side");
+
+        let (_read_side, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
+        (
+            PeekableStreamReader::new(StreamReader::new(
+                Box::pin(reader) as crate::codec::BoxReadStream
+            )),
+            SinkWriter::new(Box::pin(writer) as crate::codec::BoxWriteStream),
+        )
+    }
+
     #[tokio::test]
     async fn read_stream_try_stream_io_aborts_when_peer_goaway_covers_stream() {
         let erased: Arc<dyn quic::DynConnection> = Arc::new(MockConnection::new());
@@ -868,6 +1101,378 @@ mod tests {
                 source: crate::connection::ConnectionGoaway::Peer
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn initial_message_stream_requires_qpack_protocol() {
+        let state = state_without_qpack(Arc::new(MockConnection::new()));
+
+        let result = state.initial_message_stream().await;
+
+        assert!(matches!(
+            result,
+            Err(super::InitialMessageStreamError::QPackProtocolDisabled { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn initial_message_stream_wraps_initial_raw_stream_errors() {
+        let quic = Arc::new(MockConnection::new());
+        let state = state_with_qpack(quic).await;
+
+        let result = state.initial_message_stream().await;
+
+        assert!(matches!(
+            result,
+            Err(super::InitialMessageStreamError::InitialRawStream {
+                source: crate::dhttp::protocol::InitialRawMessageStreamError::Connection { .. }
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn initial_message_stream_wraps_successful_raw_streams() {
+        let quic = Arc::new(MockConnection::new());
+        quic.enable_stream_ops();
+        let state = state_with_qpack(quic).await;
+
+        let (mut reader, mut writer) = state
+            .initial_message_stream()
+            .await
+            .expect("initial message stream should open");
+
+        assert_eq!(
+            reader.stream_id().await.expect("reader stream id"),
+            VarInt::from_u32(0)
+        );
+        assert_eq!(
+            writer.stream_id().await.expect("writer stream id"),
+            VarInt::from_u32(0)
+        );
+        assert_eq!(state.max_initialized_stream_id(), Some(VarInt::from_u32(0)));
+    }
+
+    #[tokio::test]
+    async fn accept_message_stream_requires_qpack_protocol() {
+        let state = state_without_qpack(Arc::new(MockConnection::new()));
+
+        let result = state.accept_message_stream().await;
+
+        assert!(matches!(
+            result,
+            Err(super::AcceptMessageStreamError::QPackProtocolDisabled { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_message_stream_wraps_goaway_rejections() {
+        let quic = Arc::new(MockConnection::new());
+        let state = state_with_qpack(quic).await;
+        state
+            .dhttp()
+            .local_goaway
+            .set(Goaway::new(VarInt::from_u32(12)));
+        assert!(matches!(
+            state
+                .dhttp()
+                .accept_bi(test_peekable_bi_stream_with_bytes(12, &[0x01]).await)
+                .await
+                .expect("request stream should be routed"),
+            StreamVerdict::Accepted
+        ));
+
+        let result = state.accept_message_stream().await;
+
+        assert!(matches!(
+            result,
+            Err(super::AcceptMessageStreamError::AcceptRawStream {
+                source: crate::dhttp::protocol::AcceptRawMessageStreamError::Goaway {
+                    source: crate::connection::ConnectionGoaway::Local
+                }
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_message_stream_wraps_successful_raw_streams() {
+        let quic = Arc::new(MockConnection::new());
+        let state = state_with_qpack(quic).await;
+        assert!(matches!(
+            state
+                .dhttp()
+                .accept_bi(test_peekable_bi_stream_with_bytes(6, &[0x01]).await)
+                .await
+                .expect("request stream should be routed"),
+            StreamVerdict::Accepted
+        ));
+
+        let (mut reader, mut writer) = state
+            .accept_message_stream()
+            .await
+            .expect("accepted message stream should wrap raw streams");
+
+        assert_eq!(
+            reader.stream_id().await.expect("reader stream id"),
+            VarInt::from_u32(6)
+        );
+        assert_eq!(
+            writer.stream_id().await.expect("writer stream id"),
+            VarInt::from_u32(6)
+        );
+        assert_eq!(state.max_received_stream_id(), Some(VarInt::from_u32(6)));
+    }
+
+    #[tokio::test]
+    async fn read_stream_peer_goaway_future_returns_connection_error_when_connection_closes() {
+        let quic = Arc::new(MockConnection::new());
+        let state = state_without_qpack(quic.clone()).erase();
+        let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TestReadStream {
+            stream_id: VarInt::from_u32(2),
+        })
+            as crate::codec::BoxReadStream));
+        let mut stream = ReadStream::new(
+            reader,
+            Arc::new(QPackDecoder::new(
+                Arc::new(Settings::default()),
+                qpack_decoder_sink(),
+                qpack_decoder_stream(),
+            )),
+            state,
+        );
+        quic.set_terminal_error(quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(1),
+                frame_type: VarInt::from_u32(0),
+                reason: "peer closed".into(),
+            },
+        });
+
+        let result = stream
+            .peer_goaway_covers()
+            .await
+            .expect("stream id should resolve")
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(quic::ConnectionError::Transport { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_stream_peer_goaway_future_returns_connection_error_when_connection_closes() {
+        let quic = Arc::new(MockConnection::new());
+        let state = state_without_qpack(quic.clone()).erase();
+        let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TestWriteStream {
+            stream_id: VarInt::from_u32(3),
+        })
+            as crate::codec::BoxWriteStream));
+        let mut stream = WriteStream::new(
+            writer,
+            Arc::new(QPackEncoder::new(
+                Arc::new(Settings::default()),
+                qpack_encoder_sink(),
+                qpack_encoder_stream(),
+            )),
+            state,
+        );
+        quic.set_terminal_error(quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(1),
+                frame_type: VarInt::from_u32(0),
+                reason: "peer closed".into(),
+            },
+        });
+
+        let result = stream
+            .peer_goaway_covers()
+            .await
+            .expect("stream id should resolve")
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(quic::ConnectionError::Transport { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_stream_try_stream_io_surfaces_stream_id_errors() {
+        let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
+        let reset_code = VarInt::from_u32(91);
+        let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(
+            StreamIdErrorReadStream {
+                error: quic::StreamError::Reset { code: reset_code },
+            },
+        )
+            as crate::codec::BoxReadStream));
+        let mut stream = ReadStream::new(
+            reader,
+            Arc::new(QPackDecoder::new(
+                Arc::new(Settings::default()),
+                qpack_decoder_sink(),
+                qpack_decoder_stream(),
+            )),
+            state,
+        );
+
+        let result: Result<(), MessageStreamError> = stream
+            .try_stream_io(async |_this| panic!("closure should not run when stream id fails"))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(MessageStreamError::Quic {
+                source: quic::StreamError::Reset { code }
+            }) if code == reset_code
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_stream_try_stream_io_surfaces_stream_id_errors() {
+        let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
+        let reset_code = VarInt::from_u32(92);
+        let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(
+            StreamIdErrorWriteStream {
+                error: quic::StreamError::Reset { code: reset_code },
+            },
+        )
+            as crate::codec::BoxWriteStream));
+        let mut stream = WriteStream::new(
+            writer,
+            Arc::new(QPackEncoder::new(
+                Arc::new(Settings::default()),
+                qpack_encoder_sink(),
+                qpack_encoder_stream(),
+            )),
+            state,
+        );
+
+        let result: Result<(), MessageStreamError> = stream
+            .try_stream_io(async |_this| panic!("closure should not run when stream id fails"))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(MessageStreamError::Quic {
+                source: quic::StreamError::Reset { code }
+            }) if code == reset_code
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_stream_take_transfers_drop_cleanup_to_taken_wrapper() {
+        let quic = Arc::new(MockConnection::new());
+        let state = state_without_qpack(quic).erase();
+        let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
+        let mut stream = ReadStream::new(
+            StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
+                stream_id: VarInt::from_u32(14),
+                stop_tx,
+            })
+                as crate::codec::BoxReadStream)),
+            Arc::new(QPackDecoder::new(
+                Arc::new(Settings::default()),
+                qpack_decoder_sink(),
+                qpack_decoder_stream(),
+            )),
+            state,
+        );
+
+        let mut taken = stream.take();
+        assert_eq!(
+            taken.stream_id().await.expect("taken stream id"),
+            VarInt::from_u32(14)
+        );
+
+        drop(stream);
+        assert!(
+            timeout(Duration::from_millis(50), stop_rx.recv())
+                .await
+                .is_err()
+        );
+
+        drop(taken);
+        assert_eq!(
+            timeout(Duration::from_secs(1), stop_rx.recv())
+                .await
+                .expect("taken read stream drop should stop")
+                .expect("stop code should be sent"),
+            VarInt::from(Code::H3_NO_ERROR),
+        );
+    }
+
+    #[tokio::test]
+    async fn write_stream_take_transfers_drop_cleanup_to_taken_wrapper() {
+        let quic = Arc::new(MockConnection::new());
+        let state = state_without_qpack(quic).erase();
+        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let mut stream = WriteStream::new(
+            SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
+                stream_id: VarInt::from_u32(15),
+                cancel_tx,
+            })
+                as crate::codec::BoxWriteStream)),
+            Arc::new(QPackEncoder::new(
+                Arc::new(Settings::default()),
+                qpack_encoder_sink(),
+                qpack_encoder_stream(),
+            )),
+            state,
+        );
+
+        let mut taken = stream.take();
+        assert_eq!(
+            taken.stream_id().await.expect("taken stream id"),
+            VarInt::from_u32(15)
+        );
+
+        drop(stream);
+        assert!(
+            timeout(Duration::from_millis(50), cancel_rx.recv())
+                .await
+                .is_err()
+        );
+
+        drop(taken);
+        assert_eq!(
+            timeout(Duration::from_secs(1), cancel_rx.recv())
+                .await
+                .expect("taken write stream drop should cancel")
+                .expect("cancel code should be sent"),
+            VarInt::from(Code::H3_NO_ERROR),
+        );
+    }
+
+    #[tokio::test]
+    async fn write_stream_flush_close_cancel_and_header_aliases_succeed_on_mock_stream() {
+        let mut header_stream = write_stream_for_test(VarInt::from_u32(0));
+        header_stream
+            .write_header(std::iter::empty())
+            .await
+            .expect("empty header section should encode");
+
+        let mut send_header_stream = write_stream_for_test(VarInt::from_u32(0));
+        send_header_stream
+            .send_header(std::iter::empty())
+            .await
+            .expect("send_header should delegate to write_header");
+
+        let mut flush_close_stream = write_stream_for_test(VarInt::from_u32(0));
+        flush_close_stream
+            .flush()
+            .await
+            .expect("flush should succeed");
+        flush_close_stream
+            .close()
+            .await
+            .expect("close should succeed");
+
+        let mut cancel_stream = write_stream_for_test(VarInt::from_u32(0));
+        cancel_stream
+            .cancel(Code::H3_NO_ERROR)
+            .await
+            .expect("cancel should succeed");
     }
 
     #[tokio::test]
