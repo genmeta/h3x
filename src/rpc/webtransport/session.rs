@@ -10,18 +10,19 @@ use std::sync::Arc;
 use remoc::{prelude::Server, rtc::Client as RemocClient};
 use tracing::Instrument;
 
-use super::super::{
-    lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt},
-    quic::{ReadStreamClient, ReadStreamServer, WriteStreamClient, WriteStreamServer},
+use super::{
+    super::{
+        lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt as ConnectionLifecycleExt},
+        quic::{ReadStreamClient, ReadStreamServer, WriteStreamClient, WriteStreamServer},
+    },
+    LifecycleExt,
 };
 use crate::{
     message::stream::guard,
     quic::{self, ConnectionError, DynLifecycle},
     stream_id::StreamId,
     varint::VarInt,
-    webtransport::{
-        self, AcceptStreamError, OpenStreamError, SessionClosed, WebTransportLifecycleExt,
-    },
+    webtransport::{self, AcceptStreamError, OpenStreamError},
 };
 
 // ---------------------------------------------------------------------------
@@ -30,15 +31,15 @@ use crate::{
 
 /// Remoc RPC counterpart of [`WebTransportSession`].
 ///
-/// Uses the native [`OpenStreamError`] and [`SessionClosed`] error types directly —
-/// both are serializable. The `session_id` is not included because it is
-/// immutable and can be passed out-of-band at construction time.
+/// Uses the native [`OpenStreamError`] and [`AcceptStreamError`] error types
+/// directly — both are serializable. The `session_id` is not included because
+/// it is immutable and can be passed out-of-band at construction time.
 #[remoc::rtc::remote]
 pub trait WebTransportRpcSession: Send + Sync {
     async fn open_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), OpenStreamError>;
     async fn open_uni(&self) -> Result<WriteStreamClient, OpenStreamError>;
-    async fn accept_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), SessionClosed>;
-    async fn accept_uni(&self) -> Result<ReadStreamClient, SessionClosed>;
+    async fn accept_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), AcceptStreamError>;
+    async fn accept_uni(&self) -> Result<ReadStreamClient, AcceptStreamError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -77,14 +78,8 @@ impl WebTransportRpcSession for webtransport::WebTransportSession {
         Ok(wc)
     }
 
-    async fn accept_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), SessionClosed> {
-        let (reader, writer) = match webtransport::WebTransportSession::accept_bi(self).await {
-            Ok(streams) => streams,
-            Err(AcceptStreamError::Closed { source }) => return Err(source),
-            // RPC compatibility surface exposes only session closure here; the connection
-            // error has already been latched by h3x's connection lifecycle.
-            Err(AcceptStreamError::Connection { source: _ }) => return Err(SessionClosed),
-        };
+    async fn accept_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), AcceptStreamError> {
+        let (reader, writer) = webtransport::WebTransportSession::accept_bi(self).await?;
         let (rs, rc) = ReadStreamServer::new(reader, 1);
         tokio::spawn(
             (async move {
@@ -102,14 +97,8 @@ impl WebTransportRpcSession for webtransport::WebTransportSession {
         Ok((rc, wc))
     }
 
-    async fn accept_uni(&self) -> Result<ReadStreamClient, SessionClosed> {
-        let reader = match webtransport::WebTransportSession::accept_uni(self).await {
-            Ok(stream) => stream,
-            Err(AcceptStreamError::Closed { source }) => return Err(source),
-            // RPC compatibility surface exposes only session closure here; the connection
-            // error has already been latched by h3x's connection lifecycle.
-            Err(AcceptStreamError::Connection { source: _ }) => return Err(SessionClosed),
-        };
+    async fn accept_uni(&self) -> Result<ReadStreamClient, AcceptStreamError> {
+        let reader = webtransport::WebTransportSession::accept_uni(self).await?;
         let (rs, rc) = ReadStreamServer::new(reader, 1);
         tokio::spawn(
             (async move {
@@ -235,24 +224,14 @@ impl webtransport::Session for RemoteWebTransportSession {
         &self,
     ) -> Result<(Self::StreamReader, Self::StreamWriter), AcceptStreamError> {
         let (reader, writer) = self
-            .guard_accept_err(
-                WebTransportRpcSession::accept_bi(&self.client),
-                |SessionClosed| {
-                    RemocClient::is_closed(&self.client).then(Self::remoc_channel_error)
-                },
-            )
+            .guard_accept(WebTransportRpcSession::accept_bi(&self.client))
             .await?;
         Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
     }
 
     async fn accept_uni(&self) -> Result<Self::StreamReader, AcceptStreamError> {
         let reader = self
-            .guard_accept_err(
-                WebTransportRpcSession::accept_uni(&self.client),
-                |SessionClosed| {
-                    RemocClient::is_closed(&self.client).then(Self::remoc_channel_error)
-                },
-            )
+            .guard_accept(WebTransportRpcSession::accept_uni(&self.client))
             .await?;
         Ok(reader.into_boxed_quic())
     }
@@ -286,6 +265,7 @@ mod tests {
     use bytes::Bytes;
     use futures::{Sink, SinkExt, Stream, StreamExt};
     use remoc::prelude::ServerShared;
+    use tokio::time::{Duration, timeout};
     use tokio_util::task::AbortOnDropHandle;
     use tracing::Instrument;
 
@@ -299,7 +279,7 @@ mod tests {
         protocol::Protocols,
         qpack::field::Protocol,
         quic::{GetStreamIdExt, StopStreamExt},
-        webtransport::{WEBTRANSPORT_H3, WebTransportProtocol},
+        webtransport::{SessionClosed, WEBTRANSPORT_H3, WebTransportProtocol},
     };
 
     struct TestRpcSession {
@@ -405,16 +385,22 @@ mod tests {
             Ok(self.write_stream(2))
         }
 
-        async fn accept_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), SessionClosed> {
+        async fn accept_bi(
+            &self,
+        ) -> Result<(ReadStreamClient, WriteStreamClient), AcceptStreamError> {
             if self.close_accept {
-                return Err(SessionClosed);
+                return Err(AcceptStreamError::Closed {
+                    source: SessionClosed,
+                });
             }
             Ok(self.stream_pair(3))
         }
 
-        async fn accept_uni(&self) -> Result<ReadStreamClient, SessionClosed> {
+        async fn accept_uni(&self) -> Result<ReadStreamClient, AcceptStreamError> {
             if self.close_accept {
-                return Err(SessionClosed);
+                return Err(AcceptStreamError::Closed {
+                    source: SessionClosed,
+                });
             }
             Ok(self.read_stream(4))
         }
@@ -471,9 +457,12 @@ mod tests {
         }
     }
 
-    fn spawn_rpc_session(
-        session: Arc<TestRpcSession>,
-    ) -> (AbortOnDropHandle<()>, WebTransportRpcSessionClient) {
+    fn spawn_rpc_session<S>(
+        session: Arc<S>,
+    ) -> (AbortOnDropHandle<()>, WebTransportRpcSessionClient)
+    where
+        S: WebTransportRpcSession + 'static,
+    {
         let (server, client) = WebTransportRpcSessionServerShared::new(session, 1);
         let task = AbortOnDropHandle::new(tokio::spawn(
             async move {
@@ -516,23 +505,51 @@ mod tests {
         assert_eq!(received, bytes);
     }
 
-    fn connection_with_webtransport() -> Arc<ConnectionState<dyn quic::DynConnection>> {
+    fn connection_with_webtransport_pair() -> (
+        Arc<MockConnection>,
+        Arc<ConnectionState<dyn quic::DynConnection>>,
+    ) {
         let quic = Arc::new(MockConnection::new());
         let erased: Arc<dyn quic::DynConnection> = quic.clone();
         let mut protocols = Protocols::new();
         protocols.insert(WebTransportProtocol::new_for_test(erased));
-        Arc::new(ConnectionState::new_for_test(quic, Arc::new(protocols)).erase())
+        let connection =
+            Arc::new(ConnectionState::new_for_test(quic.clone(), Arc::new(protocols)).erase());
+        (quic, connection)
     }
 
-    fn webtransport_connect() -> EstablishedConnect {
+    fn connection_with_webtransport() -> Arc<ConnectionState<dyn quic::DynConnection>> {
+        connection_with_webtransport_pair().1
+    }
+
+    fn webtransport_connect_on(
+        connection: Arc<ConnectionState<dyn quic::DynConnection>>,
+    ) -> EstablishedConnect {
         let stream_id = StreamId::from(VarInt::from_u32(8));
         EstablishedConnect::ready(
             stream_id,
             Some(Protocol::new(WEBTRANSPORT_H3)),
-            connection_with_webtransport(),
+            connection,
             read_stream_for_test(stream_id.0),
             write_stream_for_test(stream_id.0),
         )
+    }
+
+    fn webtransport_connect() -> EstablishedConnect {
+        webtransport_connect_on(connection_with_webtransport())
+    }
+
+    async fn wait_for_remoc_client_to_close(client: &WebTransportRpcSessionClient) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if RemocClient::is_closed(client) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("remoc client should close");
     }
 
     #[tokio::test]
@@ -617,6 +634,14 @@ mod tests {
         };
         assert_reason(&source, "rpc open failed");
 
+        let Err(error) = webtransport::Session::open_uni(&remote).await else {
+            panic!("latched open error should block uni opens");
+        };
+        let OpenStreamError::Open { source } = error else {
+            panic!("expected open stream connection error");
+        };
+        assert_reason(&source, "rpc open failed");
+
         let error = quic::Lifecycle::check(&remote).expect_err("latched error should fail check");
         assert_reason(&error, "rpc open failed");
     }
@@ -664,6 +689,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_session_maps_closed_remoc_channel_to_transport_errors() {
+        let session = Arc::new(TestRpcSession::new());
+        let (server_task, client) = spawn_rpc_session(session);
+        let parent = Arc::new(TestLifecycle::default());
+        let remote = RemoteWebTransportSession::new(client, VarInt::from_u32(42), parent);
+
+        drop(server_task);
+        wait_for_remoc_client_to_close(&remote.client).await;
+
+        let Err(error) = webtransport::Session::open_bi(&remote).await else {
+            panic!("open_bi should surface remoc channel closure");
+        };
+        let OpenStreamError::Open { source } = error else {
+            panic!("expected open stream connection error");
+        };
+        assert_reason(&source, "remoc webtransport session channel closed");
+
+        let Err(error) = webtransport::Session::accept_uni(&remote).await else {
+            panic!("accept_uni should surface remoc channel closure");
+        };
+        let AcceptStreamError::Connection { source } = error else {
+            panic!("expected accept connection error");
+        };
+        assert_reason(&source, "remoc webtransport session channel closed");
+
+        let error =
+            quic::Lifecycle::check(&remote).expect_err("latched remoc error should fail checks");
+        assert_reason(&error, "remoc webtransport session channel closed");
+
+        let closed = timeout(Duration::from_secs(1), quic::Lifecycle::closed(&remote))
+            .await
+            .expect("latched closed should resolve immediately");
+        assert_reason(&closed, "remoc webtransport session channel closed");
+    }
+
+    #[tokio::test]
+    async fn remote_session_prefers_parent_error_over_closed_remoc_channel() {
+        let session = Arc::new(TestRpcSession::new());
+        let (server_task, client) = spawn_rpc_session(session);
+        let parent = Arc::new(TestLifecycle::default());
+        let remote = RemoteWebTransportSession::new(client, VarInt::from_u32(42), parent.clone());
+
+        drop(server_task);
+        wait_for_remoc_client_to_close(&remote.client).await;
+        parent.set_terminal(connection_error("parent closed"));
+
+        let error = quic::Lifecycle::check(&remote).expect_err("parent error should win probe");
+        assert_reason(&error, "parent closed");
+    }
+
+    #[tokio::test]
     async fn concrete_webtransport_rpc_session_surfaces_open_errors() {
         let session = webtransport::WebTransportSession::try_from(webtransport_connect())
             .expect("connect should create webtransport session");
@@ -683,5 +759,44 @@ mod tests {
             open_uni,
             OpenStreamError::Open { .. } | OpenStreamError::Closed { .. },
         ));
+    }
+
+    #[tokio::test]
+    async fn concrete_webtransport_rpc_session_preserves_connection_closed_accepts() {
+        let (quic, connection) = connection_with_webtransport_pair();
+        let session =
+            webtransport::WebTransportSession::try_from(webtransport_connect_on(connection))
+                .expect("connect should create webtransport session");
+        quic.set_terminal_error(connection_error("accept_bi connection closed"));
+
+        let accept_bi = timeout(
+            Duration::from_secs(1),
+            WebTransportRpcSession::accept_bi(&session),
+        )
+        .await
+        .expect("accept_bi should resolve on closed connection")
+        .expect_err("accept_bi should preserve connection closure");
+        let AcceptStreamError::Connection { source } = accept_bi else {
+            panic!("expected accept_bi connection error");
+        };
+        assert_reason(&source, "accept_bi connection closed");
+
+        let (quic, connection) = connection_with_webtransport_pair();
+        let session =
+            webtransport::WebTransportSession::try_from(webtransport_connect_on(connection))
+                .expect("connect should create webtransport session");
+        quic.set_terminal_error(connection_error("accept_uni connection closed"));
+
+        let accept_uni = timeout(
+            Duration::from_secs(1),
+            WebTransportRpcSession::accept_uni(&session),
+        )
+        .await
+        .expect("accept_uni should resolve on closed connection")
+        .expect_err("accept_uni should preserve connection closure");
+        let AcceptStreamError::Connection { source } = accept_uni else {
+            panic!("expected accept_uni connection error");
+        };
+        assert_reason(&source, "accept_uni connection closed");
     }
 }

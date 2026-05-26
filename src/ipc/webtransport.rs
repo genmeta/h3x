@@ -38,7 +38,7 @@ use std::{future::Future, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 use tokio::net::UnixStream;
 use tracing::{Instrument, debug};
 
@@ -52,13 +52,96 @@ use crate::{
         transport::{FdRegistry, FdSender},
     },
     quic::{self, ConnectionError, DynLifecycle, GetStreamIdExt},
-    rpc::lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt},
+    rpc::lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt as ConnectionLifecycleExt},
     stream_id::StreamId,
     varint::VarInt,
     webtransport::{
-        self, AcceptStreamError, OpenStreamError, SessionClosed, WebTransportLifecycleExt,
+        self, AcceptStreamError, OpenStreamError, SessionClosed, accept_stream_error,
+        open_stream_error,
     },
 };
+
+/// WebTransport-flavoured lifecycle helpers for IPC-backed session handles.
+///
+/// The trait is intentionally named `LifecycleExt`; the module namespace
+/// (`ipc::webtransport::LifecycleExt`) carries the domain. It uses the same
+/// connection-error latch as the IPC connection handle and maps IPC
+/// WebTransport operations into [`OpenStreamError`] /
+/// [`AcceptStreamError`].
+///
+/// Implementers still must satisfy the latch-aware lifecycle invariant from
+/// [`crate::rpc::lifecycle`]: their [`quic::Lifecycle`] implementation must
+/// consult and resolve the same latch used by these guard helpers.
+#[allow(async_fn_in_trait)]
+pub trait LifecycleExt: ConnectionLifecycleExt {
+    /// Check liveness and surface any error as an [`OpenStreamError`].
+    fn check_open(&self) -> Result<(), OpenStreamError> {
+        quic::Lifecycle::check(self).context(open_stream_error::OpenSnafu)
+    }
+
+    /// Check liveness and surface any error as an [`AcceptStreamError`].
+    fn check_accept(&self) -> Result<(), AcceptStreamError> {
+        quic::Lifecycle::check(self).context(accept_stream_error::ConnectionSnafu)
+    }
+
+    /// Guard an async open operation whose error must be lazily converted to
+    /// an [`OpenStreamError`].
+    async fn guard_open_with<T, E, M>(
+        &self,
+        fut: impl Future<Output = Result<T, E>>,
+        convert_error: M,
+    ) -> Result<T, OpenStreamError>
+    where
+        M: FnOnce(E) -> OpenStreamError,
+    {
+        self.check_open()?;
+        match fut.await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if let Some(existing) = self.latch().peek() {
+                    return Err(OpenStreamError::Open { source: existing });
+                }
+                Err(match convert_error(e) {
+                    OpenStreamError::Open { source } => OpenStreamError::Open {
+                        source: self.latch().latch_with(|| source),
+                    },
+                    other => other,
+                })
+            }
+        }
+    }
+
+    /// Guard an async accept operation whose error carries richer information
+    /// than [`SessionClosed`].
+    async fn guard_accept_err<T, E, M>(
+        &self,
+        fut: impl Future<Output = Result<T, E>>,
+        convert_error: M,
+    ) -> Result<T, AcceptStreamError>
+    where
+        M: FnOnce(E) -> Option<ConnectionError>,
+    {
+        self.check_accept()?;
+        match fut.await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if let Some(existing) = self.latch().peek() {
+                    return Err(AcceptStreamError::Connection { source: existing });
+                }
+                if let Some(error) = convert_error(e) {
+                    return Err(AcceptStreamError::Connection {
+                        source: self.latch().latch_with(|| error),
+                    });
+                }
+                Err(AcceptStreamError::Closed {
+                    source: SessionClosed,
+                })
+            }
+        }
+    }
+}
+
+impl<T: ConnectionLifecycleExt + ?Sized> LifecycleExt for T {}
 
 // ---------------------------------------------------------------------------
 // IPC error types
@@ -107,14 +190,16 @@ pub enum IpcWebTransportOpenError {
 
 /// Errors from IPC `accept_bi` / `accept_uni` operations.
 ///
-/// Extends [`SessionClosed`] with an IPC transport variant.
+/// Extends [`AcceptStreamError`] with an IPC transport variant for
+/// FD-passing and socketpair failures. Conversion to [`ConnectionError`] is
+/// deferred to the latch site via [`ConnectionErrorLatch::latch_with`].
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Snafu)]
 #[snafu(module(ipc_webtransport_accept_error), visibility(pub))]
 pub enum IpcWebTransportAcceptError {
-    /// The session has been closed.
-    #[snafu(display("webtransport session closed"))]
-    Closed,
+    /// The underlying stream operation failed.
+    #[snafu(transparent)]
+    Stream { source: AcceptStreamError },
 
     /// IPC plumbing failure (RPC, stream, or I/O).
     #[snafu(transparent)]
@@ -134,8 +219,8 @@ impl From<remoc::rtc::CallError> for IpcWebTransportAcceptError {
 }
 
 impl From<SessionClosed> for IpcWebTransportAcceptError {
-    fn from(_: SessionClosed) -> Self {
-        IpcWebTransportAcceptError::Closed
+    fn from(source: SessionClosed) -> Self {
+        AcceptStreamError::Closed { source }.into()
     }
 }
 
@@ -266,15 +351,7 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     }
 
     async fn accept_bi(&self) -> Result<(VarInt, VarInt), IpcWebTransportAcceptError> {
-        let (mut reader, writer) = match self.session.accept_bi().await {
-            Ok(streams) => streams,
-            Err(AcceptStreamError::Closed { source }) => return Err(source.into()),
-            // IPC compatibility surface exposes only session closure here; the connection
-            // error has already been latched by h3x's connection lifecycle.
-            Err(AcceptStreamError::Connection { source: _ }) => {
-                return Err(IpcWebTransportAcceptError::Closed);
-            }
-        };
+        let (mut reader, writer) = self.session.accept_bi().await?;
 
         let stream_id = GetStreamIdExt::stream_id(&mut reader)
             .await
@@ -307,15 +384,7 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     }
 
     async fn accept_uni(&self) -> Result<(VarInt, VarInt), IpcWebTransportAcceptError> {
-        let mut reader = match self.session.accept_uni().await {
-            Ok(stream) => stream,
-            Err(AcceptStreamError::Closed { source }) => return Err(source.into()),
-            // IPC compatibility surface exposes only session closure here; the connection
-            // error has already been latched by h3x's connection lifecycle.
-            Err(AcceptStreamError::Connection { source: _ }) => {
-                return Err(IpcWebTransportAcceptError::Closed);
-            }
-        };
+        let mut reader = self.session.accept_uni().await?;
 
         let stream_id = GetStreamIdExt::stream_id(&mut reader)
             .await
@@ -497,7 +566,12 @@ impl IpcWebTransportSessionHandle {
     ) -> Result<T, AcceptStreamError> {
         self.lifecycle
             .guard_accept_err(fut, |e| match e {
-                IpcWebTransportAcceptError::Closed => None,
+                IpcWebTransportAcceptError::Stream {
+                    source: AcceptStreamError::Closed { .. },
+                } => None,
+                IpcWebTransportAcceptError::Stream {
+                    source: AcceptStreamError::Connection { source },
+                } => Some(source),
                 IpcWebTransportAcceptError::Transport { source } => {
                     Some(ipc_connection_error(&source))
                 }
@@ -529,6 +603,30 @@ impl IpcWebTransportSessionHandle {
             ipc_connection_error(&plumbing)
         });
         AcceptStreamError::Connection { source }
+    }
+
+    fn fd_to_open_unix_stream(
+        &self,
+        fd: std::os::fd::OwnedFd,
+    ) -> Result<UnixStream, OpenStreamError> {
+        let std_stream = std::os::unix::net::UnixStream::from(fd);
+        std_stream
+            .set_nonblocking(true)
+            .map_err(|e| self.latch_open_transport(e, "set_nonblocking"))?;
+        UnixStream::from_std(std_stream)
+            .map_err(|e| self.latch_open_transport(e, "unix stream from_std"))
+    }
+
+    fn fd_to_accept_unix_stream(
+        &self,
+        fd: std::os::fd::OwnedFd,
+    ) -> Result<UnixStream, AcceptStreamError> {
+        let std_stream = std::os::unix::net::UnixStream::from(fd);
+        std_stream
+            .set_nonblocking(true)
+            .map_err(|e| self.latch_accept_transport(e, "set_nonblocking"))?;
+        UnixStream::from_std(std_stream)
+            .map_err(|e| self.latch_accept_transport(e, "unix stream from_std"))
     }
 }
 
@@ -596,12 +694,10 @@ impl IpcWebTransportSessionHandle {
 
         let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
 
-        let sock_a = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd_a))
-            .map_err(|e| self.latch_open_transport(e, "UnixStream::from_std"))?;
+        let sock_a = self.fd_to_open_unix_stream(fd_a)?;
         let reader = IpcReadStream::new(stream_id, sock_a, lifecycle.clone());
 
-        let sock_b = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd_b))
-            .map_err(|e| self.latch_open_transport(e, "UnixStream::from_std"))?;
+        let sock_b = self.fd_to_open_unix_stream(fd_b)?;
         let writer = IpcWriteStream::new(stream_id, sock_b, lifecycle);
 
         Ok((reader, writer))
@@ -633,12 +729,10 @@ impl IpcWebTransportSessionHandle {
 
         let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
 
-        let sock_a = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd_a))
-            .map_err(|e| self.latch_accept_transport(e, "UnixStream::from_std"))?;
+        let sock_a = self.fd_to_accept_unix_stream(fd_a)?;
         let reader = IpcReadStream::new(stream_id, sock_a, lifecycle.clone());
 
-        let sock_b = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd_b))
-            .map_err(|e| self.latch_accept_transport(e, "UnixStream::from_std"))?;
+        let sock_b = self.fd_to_accept_unix_stream(fd_b)?;
         let writer = IpcWriteStream::new(stream_id, sock_b, lifecycle);
 
         Ok((reader, writer))
@@ -666,8 +760,7 @@ impl IpcWebTransportSessionHandle {
         }
         let fd = fds.into_iter().next().unwrap();
         let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
-        let sock = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd))
-            .map_err(|e| self.latch_open_transport(e, "UnixStream::from_std"))?;
+        let sock = self.fd_to_open_unix_stream(fd)?;
         Ok(IpcWriteStream::new(stream_id, sock, lifecycle))
     }
 
@@ -693,8 +786,7 @@ impl IpcWebTransportSessionHandle {
         }
         let fd = fds.into_iter().next().unwrap();
         let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
-        let sock = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd))
-            .map_err(|e| self.latch_accept_transport(e, "UnixStream::from_std"))?;
+        let sock = self.fd_to_accept_unix_stream(fd)?;
         Ok(IpcReadStream::new(stream_id, sock, lifecycle))
     }
 }
@@ -819,6 +911,27 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ClosedAcceptIpcSession;
+
+    impl IpcWebTransportSession for ClosedAcceptIpcSession {
+        async fn open_bi(&self) -> Result<(VarInt, VarInt), IpcWebTransportOpenError> {
+            Ok((VarInt::from_u32(0), VarInt::from_u32(1)))
+        }
+
+        async fn open_uni(&self) -> Result<(VarInt, VarInt), IpcWebTransportOpenError> {
+            Ok((VarInt::from_u32(0), VarInt::from_u32(2)))
+        }
+
+        async fn accept_bi(&self) -> Result<(VarInt, VarInt), IpcWebTransportAcceptError> {
+            Err(SessionClosed.into())
+        }
+
+        async fn accept_uni(&self) -> Result<(VarInt, VarInt), IpcWebTransportAcceptError> {
+            Err(SessionClosed.into())
+        }
+    }
+
     fn connection_error(reason: &'static str) -> ConnectionError {
         ConnectionError::Transport {
             source: quic::TransportError {
@@ -847,8 +960,26 @@ mod tests {
         );
     }
 
-    fn spawn_ipc_session() -> (AbortOnDropHandle<()>, IpcWebTransportSessionClient) {
-        let (server, client) = IpcWebTransportSessionServerShared::new(Arc::new(TestIpcSession), 1);
+    fn assert_ipc_transport_metadata(error: &ConnectionError, expected: &str) {
+        let ConnectionError::Transport { source } = error else {
+            panic!("expected transport error");
+        };
+        assert_eq!(source.kind, IPC_ERROR_KIND);
+        assert_eq!(source.frame_type, IPC_FRAME_TYPE);
+        assert!(
+            source.reason.contains(expected),
+            "reason {:?} should contain {expected:?}",
+            source.reason
+        );
+    }
+
+    fn spawn_ipc_session_with<T>(
+        session: Arc<T>,
+    ) -> (AbortOnDropHandle<()>, IpcWebTransportSessionClient)
+    where
+        T: IpcWebTransportSession + 'static,
+    {
+        let (server, client) = IpcWebTransportSessionServerShared::new(session, 1);
         let task = AbortOnDropHandle::new(tokio::spawn(
             async move {
                 let _ = server.serve(true).await;
@@ -856,6 +987,10 @@ mod tests {
             .in_current_span(),
         ));
         (task, client)
+    }
+
+    fn spawn_ipc_session() -> (AbortOnDropHandle<()>, IpcWebTransportSessionClient) {
+        spawn_ipc_session_with(Arc::new(TestIpcSession))
     }
 
     fn handle_with_registry(
@@ -880,7 +1015,7 @@ mod tests {
         _stream: MuxStream,
     }
 
-    async fn registered_fds(count: usize) -> RegisteredFds {
+    async fn registered_fds_with_nonblocking(count: usize, nonblocking: bool) -> RegisteredFds {
         let (channel_a, channel_b) = MuxChannel::pair_for_test().expect("mux channel pair");
         let (mut sink_a, _stream_a) = channel_a.split().expect("split channel a");
         let (_sink_b, mut stream_b) = channel_b.split().expect("split channel b");
@@ -889,7 +1024,8 @@ mod tests {
         let mut fds = SmallVec::new();
         for _ in 0..count {
             let (fd, _peer) = StdUnixStream::pair().expect("fd pair");
-            fd.set_nonblocking(true).expect("client fd is nonblocking");
+            fd.set_nonblocking(nonblocking)
+                .expect("set client fd nonblocking mode");
             fds.push(fd.into());
         }
 
@@ -912,6 +1048,10 @@ mod tests {
         }
     }
 
+    async fn registered_fds(count: usize) -> RegisteredFds {
+        registered_fds_with_nonblocking(count, true).await
+    }
+
     #[test]
     fn ipc_error_helpers_preserve_context() {
         let open = ipc_open_io("boom", "open context");
@@ -929,7 +1069,12 @@ mod tests {
         assert_reason_contains(&ipc_connection_error(&source), "accept context: closed");
 
         let closed = IpcWebTransportAcceptError::from(SessionClosed);
-        assert!(matches!(closed, IpcWebTransportAcceptError::Closed));
+        assert!(matches!(
+            closed,
+            IpcWebTransportAcceptError::Stream {
+                source: AcceptStreamError::Closed { .. },
+            },
+        ));
 
         let fd_count = FdCountError {
             expected: 2,
@@ -1035,7 +1180,9 @@ mod tests {
         let registered = registered_fds(1).await;
         let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
         let closed = handle
-            .guard_ipc_accept(async { Err::<(), _>(IpcWebTransportAcceptError::Closed) })
+            .guard_ipc_accept(async {
+                Err::<(), _>(IpcWebTransportAcceptError::from(SessionClosed))
+            })
             .await
             .expect_err("closed accept error should surface");
         assert!(matches!(closed, AcceptStreamError::Closed { .. }));
@@ -1159,6 +1306,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_trait_methods_map_rpc_drop_to_ipc_transport_errors() {
+        let registered = registered_fds(2).await;
+        let (task, handle, _parent) = handle_with_registry(registered.registry.clone());
+        drop(task);
+
+        let Err(error) = webtransport::Session::open_bi(&handle).await else {
+            panic!("dropped RPC server should fail open_bi");
+        };
+        let OpenStreamError::Open { source } = error else {
+            panic!("expected open connection error");
+        };
+        assert_ipc_transport_metadata(&source, "processing request failed");
+
+        let Err(error) = webtransport::Session::open_uni(&handle).await else {
+            panic!("latched RPC failure should fail open_uni");
+        };
+        let OpenStreamError::Open { source } = error else {
+            panic!("expected open connection error");
+        };
+        assert_ipc_transport_metadata(&source, "processing request failed");
+
+        let registered = registered_fds(2).await;
+        let (task, handle, _parent) = handle_with_registry(registered.registry.clone());
+        drop(task);
+
+        let Err(error) = webtransport::Session::accept_bi(&handle).await else {
+            panic!("dropped RPC server should fail accept_bi");
+        };
+        let AcceptStreamError::Connection { source } = error else {
+            panic!("expected accept connection error");
+        };
+        assert_ipc_transport_metadata(&source, "processing request failed");
+
+        let Err(error) = webtransport::Session::accept_uni(&handle).await else {
+            panic!("latched RPC failure should fail accept_uni");
+        };
+        let AcceptStreamError::Connection { source } = error else {
+            panic!("expected accept connection error");
+        };
+        assert_ipc_transport_metadata(&source, "processing request failed");
+    }
+
+    #[tokio::test]
+    async fn session_trait_methods_map_closed_accepts_without_latching_transport_errors() {
+        let registered = registered_fds(1).await;
+        let (task, client) = spawn_ipc_session_with(Arc::new(ClosedAcceptIpcSession));
+        let parent = Arc::new(TestLifecycle::default());
+        let lifecycle: Arc<dyn DynLifecycle> = parent.clone();
+        let handle = IpcWebTransportSessionHandle::new(
+            VarInt::from_u32(42),
+            client,
+            registered.registry,
+            lifecycle,
+        );
+
+        let Err(error) = webtransport::Session::accept_bi(&handle).await else {
+            panic!("accept_bi should surface session closed");
+        };
+        assert!(matches!(error, AcceptStreamError::Closed { .. }));
+        assert!(quic::Lifecycle::check(handle.lifecycle.as_ref()).is_ok());
+
+        let Err(error) = webtransport::Session::accept_uni(&handle).await else {
+            panic!("accept_uni should surface session closed");
+        };
+        assert!(matches!(error, AcceptStreamError::Closed { .. }));
+        assert!(quic::Lifecycle::check(handle.lifecycle.as_ref()).is_ok());
+
+        drop(task);
+    }
+
+    #[tokio::test]
     async fn fd_count_mismatch_is_latched_as_transport_error() {
         let registered = registered_fds(1).await;
         let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
@@ -1247,6 +1465,122 @@ mod tests {
             panic!("expected accept connection error");
         };
         assert_reason_contains(&source, "wait_fds: fd registry is closed");
+    }
+
+    #[tokio::test]
+    async fn blocking_socket_fds_are_normalized_during_unix_stream_conversion_for_all_stream_kinds()
+    {
+        let registered = registered_fds_with_nonblocking(2, false).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+        let (mut reader, mut writer) = webtransport::Session::open_bi(&handle)
+            .await
+            .expect("blocking bidi fds should be normalized for open_bi");
+        assert_eq!(
+            reader.stream_id().await.expect("reader id"),
+            VarInt::from_u32(1)
+        );
+        assert_eq!(
+            writer.stream_id().await.expect("writer id"),
+            VarInt::from_u32(1)
+        );
+
+        let registered = registered_fds_with_nonblocking(1, false).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+        let mut writer = webtransport::Session::open_uni(&handle)
+            .await
+            .expect("blocking uni fd should be normalized for open_uni");
+        assert_eq!(
+            writer.stream_id().await.expect("writer id"),
+            VarInt::from_u32(2)
+        );
+
+        let registered = registered_fds_with_nonblocking(2, false).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+        let (mut reader, mut writer) = webtransport::Session::accept_bi(&handle)
+            .await
+            .expect("blocking bidi fds should be normalized for accept_bi");
+        assert_eq!(
+            reader.stream_id().await.expect("reader id"),
+            VarInt::from_u32(3)
+        );
+        assert_eq!(
+            writer.stream_id().await.expect("writer id"),
+            VarInt::from_u32(3)
+        );
+
+        let registered = registered_fds_with_nonblocking(1, false).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+        let mut reader = webtransport::Session::accept_uni(&handle)
+            .await
+            .expect("blocking uni fd should be normalized for accept_uni");
+        assert_eq!(
+            reader.stream_id().await.expect("reader id"),
+            VarInt::from_u32(4)
+        );
+    }
+
+    #[tokio::test]
+    async fn latched_transport_errors_short_circuit_later_session_methods() {
+        let registered = registered_fds(1).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+
+        let Err(error) = webtransport::Session::open_bi(&handle).await else {
+            panic!("fd count mismatch should fail open_bi");
+        };
+        let OpenStreamError::Open { source } = error else {
+            panic!("expected open connection error");
+        };
+        assert_reason_contains(&source, "expected 2 fds, got 1");
+
+        let Err(error) = webtransport::Session::open_uni(&handle).await else {
+            panic!("latched open error should short-circuit open_uni");
+        };
+        let OpenStreamError::Open { source } = error else {
+            panic!("expected open connection error");
+        };
+        assert_reason_contains(&source, "expected 2 fds, got 1");
+
+        let registered = registered_fds(2).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+
+        let Err(error) = webtransport::Session::accept_uni(&handle).await else {
+            panic!("fd count mismatch should fail accept_uni");
+        };
+        let AcceptStreamError::Connection { source } = error else {
+            panic!("expected accept connection error");
+        };
+        assert_reason_contains(&source, "expected 1 fds, got 2");
+
+        let Err(error) = webtransport::Session::accept_bi(&handle).await else {
+            panic!("latched accept error should short-circuit accept_bi");
+        };
+        let AcceptStreamError::Connection { source } = error else {
+            panic!("expected accept connection error");
+        };
+        assert_reason_contains(&source, "expected 1 fds, got 2");
+    }
+
+    #[tokio::test]
+    async fn parent_lifecycle_errors_block_session_methods_before_rpc_and_fd_work() {
+        let registered = registered_fds(2).await;
+        let (_task, handle, parent) = handle_with_registry(registered.registry.clone());
+        parent.set_terminal(connection_error("parent lifecycle closed"));
+
+        let Err(error) = webtransport::Session::open_bi(&handle).await else {
+            panic!("parent lifecycle should block open_bi");
+        };
+        let OpenStreamError::Open { source } = error else {
+            panic!("expected open connection error");
+        };
+        assert_reason(&source, "parent lifecycle closed");
+
+        let Err(error) = webtransport::Session::accept_bi(&handle).await else {
+            panic!("parent lifecycle should block accept_bi");
+        };
+        let AcceptStreamError::Connection { source } = error else {
+            panic!("expected accept connection error");
+        };
+        assert_reason(&source, "parent lifecycle closed");
     }
 
     #[tokio::test]

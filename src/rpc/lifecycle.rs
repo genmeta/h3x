@@ -24,6 +24,23 @@
 //! [`quic::Lifecycle`] automatically gives the container all of
 //! [`LifecycleExt`]'s guard/check/closed helpers via blanket impl.
 //!
+//! # Latch-aware lifecycle invariant
+//!
+//! A type that implements [`HasLatch`] **must** make its [`quic::Lifecycle`]
+//! implementation latch-aware. In practice, `check()` should consult the latch
+//! first (usually through [`LifecycleExt::check_with_probe`]), and `closed()`
+//! should return or install the canonical latched error (usually through
+//! [`LifecycleExt::resolve_closed`]).
+//!
+//! Implementing `HasLatch` but writing `check()` / `closed()` as if the latch
+//! did not exist is an implementation bug: operation guards may have already
+//! recorded a terminal error, and direct lifecycle callers must observe the
+//! same first-wins error.
+//!
+//! `close(code, reason)` is intentionally not a latch propagation channel. It
+//! only initiates local close; the terminal error is recorded by guarded
+//! operation failures, liveness probes, or `closed()` resolution.
+//!
 //! The container authors its own `impl Lifecycle` using
 //! [`check_with_probe`](LifecycleExt::check_with_probe) and
 //! [`resolve_closed`](LifecycleExt::resolve_closed) as building blocks;
@@ -108,7 +125,9 @@ pub(crate) mod sealed {
     /// container's latch without making the latch a public API.
     ///
     /// Implementers must return a stable reference to the same
-    /// [`ConnectionErrorLatch`] on every call.
+    /// [`ConnectionErrorLatch`] on every call, and their [`crate::quic::Lifecycle`]
+    /// implementation must be latch-aware. See the module-level
+    /// "Latch-aware lifecycle invariant" section.
     pub trait HasLatch {
         fn latch(&self) -> &ConnectionErrorLatch;
     }
