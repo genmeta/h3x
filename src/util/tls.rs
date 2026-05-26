@@ -49,3 +49,58 @@ impl rustls::client::danger::ServerCertVerifier for DangerousServerCertVerifier 
         ]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use rustls::{
+        SignatureScheme,
+        client::danger::ServerCertVerifier,
+        pki_types::{CertificateDer, ServerName, UnixTime},
+    };
+
+    use super::*;
+
+    #[test]
+    fn dangerous_verifier_accepts_server_cert_without_validation() {
+        let verifier = DangerousServerCertVerifier;
+        assert_eq!(format!("{verifier:?}"), "DangerousServerCertVerifier");
+        let end_entity = CertificateDer::from(Vec::new());
+        let server_name = ServerName::try_from("example.com").expect("server name");
+
+        verifier
+            .verify_server_cert(
+                &end_entity,
+                &[],
+                &server_name,
+                &[],
+                UnixTime::since_unix_epoch(Duration::ZERO),
+            )
+            .expect("dangerous verifier should accept any certificate");
+    }
+
+    #[test]
+    fn dangerous_verifier_advertises_all_supported_signature_schemes() {
+        let schemes = DangerousServerCertVerifier.supported_verify_schemes();
+
+        assert_eq!(
+            schemes,
+            vec![
+                SignatureScheme::RSA_PKCS1_SHA1,
+                SignatureScheme::ECDSA_SHA1_Legacy,
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA384,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PKCS1_SHA512,
+                SignatureScheme::ECDSA_NISTP521_SHA512,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+                SignatureScheme::ED25519,
+                SignatureScheme::ED448,
+            ]
+        );
+    }
+}
