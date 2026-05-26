@@ -74,7 +74,7 @@ pub struct ServerQuicConfig {
     /// verification. Defaults to [`AcceptAllClientAuther`].
     pub client_auther: Arc<dyn AuthClient>,
     /// How rustls should verify client certificates. Defaults to
-    /// [`NoClientAuth`](rustls::server::NoClientAuth).
+    /// [`NoClientAuth`].
     pub client_cert_verifier: Arc<dyn ClientCertVerifier>,
     /// When enabled, failed connections are silently dropped instead of
     /// answered with an error packet.

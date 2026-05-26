@@ -30,7 +30,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --no-default-features --features hyper -- -D warnings
+      - run: cargo clippy --all-features --all-targets -- -D warnings
 
   doc:
     name: Documentation
@@ -41,7 +41,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --no-default-features --features hyper
+      # rpc/ipc rustdoc needs a consumer-selected remoc codec and a separate
+      # docs-link cleanup; clippy, tests, and coverage still exercise all features.
+      - run: cargo doc --no-deps --no-default-features --features dquic,hyper,serde,testing,webtransport
 
   test:
     name: Tests
@@ -50,13 +52,38 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --no-default-features --lib
+      - run: cargo test --all-features --all-targets
 
-  test-endpoint:
-    name: Tests (endpoint)
+  coverage:
+    name: Coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --features endpoint
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Generate coverage summary
+        run: |
+          cargo llvm-cov clean
+          cargo llvm-cov \
+            --all-features \
+            --all-targets \
+            --summary-only \
+            --json \
+            --output-path target/llvm-cov/coverage.json \
+            --fail-under-lines 62 \
+            --fail-under-functions 59 \
+            --fail-under-regions 63
+      - name: Generate LCOV report
+        run: cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
+      - name: Generate HTML report
+        run: cargo llvm-cov report --html --output-dir target/llvm-cov/html
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: h3x-coverage
+          path: |
+            target/llvm-cov/coverage.json
+            target/llvm-cov/lcov.info
+            target/llvm-cov/html

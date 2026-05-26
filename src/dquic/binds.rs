@@ -1,6 +1,6 @@
 //! Extended bind pattern for flexible BindUri generation.
 //!
-//! [`Bind`] is a pattern-like extension of
+//! [`BindPattern`] is a pattern-like extension of
 //! [`BindUri`](crate::dquic::qinterface::bind_uri::BindUri) that provides:
 //!
 //! 1. **Glob host** — `iface://v4.en*:8080` matches all interfaces starting with "en"

@@ -541,7 +541,7 @@ impl QuicEndpoint {
 
     /// Obtain a mutable guard for the endpoint's identity.
     ///
-    /// The guard implements [`DerefMut`] targeting
+    /// The guard implements [`DerefMut`](std::ops::DerefMut) targeting
     /// `Option<Arc<Identity>>`, so callers may inspect, mutate, set, or
     /// clear the identity. Caches are invalidated when the guard is dropped.
     pub fn identity_mut(&mut self) -> IdentityMutGuard<'_> {
@@ -556,7 +556,7 @@ impl QuicEndpoint {
 
     /// Update the OCSP staple for this endpoint's identity.
     ///
-    /// Convenience wrapper around [`identity_mut`]; no-op when there
+    /// Convenience wrapper around [`Self::identity_mut`]; no-op when there
     /// is no identity set.
     pub fn update_ocsp(&mut self, ocsp: Option<Vec<u8>>) {
         let mut guard = self.identity_mut();

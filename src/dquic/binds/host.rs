@@ -8,7 +8,7 @@ use globset::{Glob, GlobMatcher};
 
 use crate::dquic::qbase::net::Family;
 
-/// The host part of a [`Bind`](super::Bind) — a parsed IP address, a glob pattern, or an exact name.
+/// The host part of a [`BindPattern`](super::BindPattern) — a parsed IP address, a glob pattern, or an exact name.
 ///
 /// Literal host names (e.g. `enp17s0`) are normally represented as
 /// [`Glob`](BindHost::Glob) with a literal pattern (globset treats them as exact

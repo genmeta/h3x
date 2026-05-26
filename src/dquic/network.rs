@@ -16,8 +16,8 @@
 //! The built-in QUIC driver installs a *connectionless packet dispatcher* on
 //! its [`QuicRouter`]. When an Initial / 0-RTT packet arrives without matching
 //! an existing connection, the dispatcher constructs a fresh server
-//! [`Connection`](crate::dquic::prelude::Connection) using the shared
-//! [`ServerQuicConfig`](crate::dquic::server::ServerQuicConfig) stored in the
+//! [`Connection`] using the shared
+//! [`ServerQuicConfig`] stored in the
 //! QUIC driver's `server_slot`, waits for the handshake to reveal the
 //! ClientHello SNI, and fans the connection into the matching
 //! [`ServerBinding`]'s mpmc queue.
