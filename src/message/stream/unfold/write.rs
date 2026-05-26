@@ -266,3 +266,180 @@ impl WriteStream {
         SinkWriter::new(Box::pin(self.into_bytes_sink()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+
+    use futures::{FutureExt, future::poll_fn};
+
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Event {
+        Send(Bytes),
+        Flush,
+        Close,
+        Cancel(VarInt),
+    }
+
+    #[derive(Debug)]
+    struct ControlSink {
+        stream_id: VarInt,
+        events: Arc<Mutex<Vec<Event>>>,
+    }
+
+    impl GetStreamId for ControlSink {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
+        }
+    }
+
+    impl CancelStream for ControlSink {
+        fn poll_cancel(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            self.events
+                .lock()
+                .expect("event log poisoned")
+                .push(Event::Cancel(code));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn unfold_sends_flushes_and_closes_in_order() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = Box::pin(unfold(
+            ControlSink {
+                stream_id: VarInt::from_u32(11),
+                events: events.clone(),
+            },
+            |stream: ControlSink, item: Bytes| async move {
+                stream
+                    .events
+                    .lock()
+                    .expect("event log poisoned")
+                    .push(Event::Send(item));
+                Ok::<_, MessageStreamError>(stream)
+            },
+            |stream: ControlSink| async move {
+                stream
+                    .events
+                    .lock()
+                    .expect("event log poisoned")
+                    .push(Event::Flush);
+                Ok::<_, MessageStreamError>(stream)
+            },
+            |stream: ControlSink| async move {
+                stream
+                    .events
+                    .lock()
+                    .expect("event log poisoned")
+                    .push(Event::Close);
+                Ok::<_, MessageStreamError>(stream)
+            },
+        ));
+
+        poll_fn(|cx| sink.as_mut().poll_ready(cx))
+            .await
+            .expect("sink ready");
+        sink.as_mut()
+            .start_send(Bytes::from_static(b"payload"))
+            .expect("send accepted");
+        poll_fn(|cx| sink.as_mut().poll_flush(cx))
+            .await
+            .expect("sink flushed");
+        poll_fn(|cx| sink.as_mut().poll_close(cx))
+            .await
+            .expect("sink closed");
+
+        assert_eq!(
+            *events.lock().expect("event log poisoned"),
+            vec![
+                Event::Send(Bytes::from_static(b"payload")),
+                Event::Flush,
+                Event::Close,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn control_traits_forward_while_value_available() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let stream_id = VarInt::from_u32(37);
+        let cancel_code = VarInt::from_u32(41);
+        let mut sink = Box::pin(unfold(
+            ControlSink {
+                stream_id,
+                events: events.clone(),
+            },
+            |stream: ControlSink, _item: Bytes| async move { Ok::<_, MessageStreamError>(stream) },
+            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
+            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
+        ));
+
+        assert_eq!(
+            poll_fn(|cx| sink.as_mut().poll_stream_id(cx))
+                .await
+                .expect("stream id"),
+            stream_id
+        );
+        poll_fn(|cx| sink.as_mut().poll_cancel(cx, cancel_code))
+            .await
+            .expect("cancel forwarded");
+
+        assert_eq!(
+            *events.lock().expect("event log poisoned"),
+            vec![Event::Cancel(cancel_code)]
+        );
+    }
+
+    #[tokio::test]
+    async fn control_traits_wait_while_send_future_owns_value() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = Box::pin(unfold(
+            ControlSink {
+                stream_id: VarInt::from_u32(37),
+                events,
+            },
+            |_stream: ControlSink, _item: Bytes| {
+                futures::future::pending::<Result<ControlSink, MessageStreamError>>()
+            },
+            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
+            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
+        ));
+
+        poll_fn(|cx| sink.as_mut().poll_ready(cx))
+            .await
+            .expect("sink ready");
+        sink.as_mut()
+            .start_send(Bytes::from_static(b"payload"))
+            .expect("send accepted");
+
+        assert!(
+            poll_fn(|cx| sink.as_mut().poll_ready(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert!(
+            poll_fn(|cx| sink.as_mut().poll_stream_id(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert!(
+            poll_fn(|cx| sink.as_mut().poll_cancel(cx, VarInt::from_u32(41)))
+                .now_or_never()
+                .is_none()
+        );
+    }
+}

@@ -209,3 +209,111 @@ impl ReadStream {
         StreamReader::new(Box::pin(self.into_bytes_stream()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+
+    use futures::{FutureExt, StreamExt, future::poll_fn};
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct ControlStream {
+        stream_id: VarInt,
+        stopped: Arc<Mutex<Option<VarInt>>>,
+    }
+
+    impl GetStreamId for ControlStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
+        }
+    }
+
+    impl StopStream for ControlStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            *self.stopped.lock().expect("stop state poisoned") = Some(code);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn unfold_yields_items_and_reports_termination() {
+        let mut stream = Box::pin(unfold(0, |value| async move {
+            if value < 3 {
+                Some((value, value + 1))
+            } else {
+                None
+            }
+        }));
+
+        assert_eq!(stream.as_mut().next().await, Some(0));
+        assert_eq!(stream.as_mut().next().await, Some(1));
+        assert_eq!(stream.as_mut().next().await, Some(2));
+        assert_eq!(stream.as_mut().next().await, None);
+        assert!(stream.as_ref().get_ref().is_terminated());
+    }
+
+    #[tokio::test]
+    async fn control_traits_forward_while_value_available() {
+        let stopped = Arc::new(Mutex::new(None));
+        let stream_id = VarInt::from_u32(37);
+        let stop_code = VarInt::from_u32(41);
+        let mut stream = Box::pin(unfold(
+            ControlStream {
+                stream_id,
+                stopped: stopped.clone(),
+            },
+            |stream| async move { Some(((), stream)) },
+        ));
+
+        assert_eq!(
+            poll_fn(|cx| stream.as_mut().poll_stream_id(cx))
+                .await
+                .expect("stream id"),
+            stream_id
+        );
+        poll_fn(|cx| stream.as_mut().poll_stop(cx, stop_code))
+            .await
+            .expect("stop forwarded");
+        assert_eq!(
+            *stopped.lock().expect("stop state poisoned"),
+            Some(stop_code)
+        );
+    }
+
+    #[tokio::test]
+    async fn control_traits_wait_while_future_owns_value() {
+        let stopped = Arc::new(Mutex::new(None));
+        let mut stream = Box::pin(unfold(
+            ControlStream {
+                stream_id: VarInt::from_u32(37),
+                stopped,
+            },
+            |_stream| futures::future::pending::<Option<((), ControlStream)>>(),
+        ));
+
+        assert!(futures::poll!(stream.as_mut().next()).is_pending());
+        assert!(
+            poll_fn(|cx| stream.as_mut().poll_stream_id(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert!(
+            poll_fn(|cx| stream.as_mut().poll_stop(cx, VarInt::from_u32(41)))
+                .now_or_never()
+                .is_none()
+        );
+    }
+}
