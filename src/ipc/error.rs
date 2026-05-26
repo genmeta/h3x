@@ -80,3 +80,72 @@ impl From<remoc::rtc::CallError> for IpcAcceptError {
         IpcPlumbingError::Rpc { source: error }.into()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{error::Code, quic::ApplicationError, varint::VarInt};
+
+    #[test]
+    fn plumbing_io_error_displays_message() {
+        let error = IpcPlumbingError::Io {
+            message: "socketpair failed".to_owned(),
+        };
+
+        assert_eq!(error.to_string(), "socketpair failed");
+    }
+
+    #[test]
+    fn call_error_converts_to_open_plumbing_error() {
+        let error = IpcOpenError::from(remoc::rtc::CallError::Dropped);
+        let IpcOpenError::Plumbing {
+            source: IpcPlumbingError::Rpc { source },
+        } = error
+        else {
+            panic!("call error should map to open plumbing error");
+        };
+
+        assert!(matches!(source, remoc::rtc::CallError::Dropped));
+    }
+
+    #[test]
+    fn call_error_converts_to_accept_plumbing_error() {
+        let error = IpcAcceptError::from(remoc::rtc::CallError::Dropped);
+        let IpcAcceptError::Plumbing {
+            source: IpcPlumbingError::Rpc { source },
+        } = error
+        else {
+            panic!("call error should map to accept plumbing error");
+        };
+
+        assert!(matches!(source, remoc::rtc::CallError::Dropped));
+    }
+
+    #[test]
+    fn connection_error_stays_connection_scoped_on_open_and_accept() {
+        let source = ConnectionError::Application {
+            source: ApplicationError {
+                code: Code::new(VarInt::from_u32(7)),
+                reason: "application closed".into(),
+            },
+        };
+
+        let open_error = IpcOpenError::from(source.clone());
+        let IpcOpenError::Connection {
+            source: open_source,
+        } = open_error
+        else {
+            panic!("connection error should stay connection-scoped on open");
+        };
+        assert!(open_source.is_application());
+
+        let accept_error = IpcAcceptError::from(source);
+        let IpcAcceptError::Connection {
+            source: accept_source,
+        } = accept_error
+        else {
+            panic!("connection error should stay connection-scoped on accept");
+        };
+        assert!(accept_source.is_application());
+    }
+}

@@ -70,3 +70,59 @@ impl std::fmt::Debug for StringError {
         std::fmt::Debug::fmt(&self.0, f)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::stream::MessageStreamError;
+
+    #[test]
+    fn call_error_maps_to_internal_transport_connection_error() {
+        let error = quic::ConnectionError::from(remoc::rtc::CallError::Dropped);
+        let quic::ConnectionError::Transport { source } = error else {
+            panic!("call error should map to transport error");
+        };
+
+        assert_eq!(source.kind, VarInt::from_u32(0x01));
+        assert_eq!(source.frame_type, VarInt::from_u32(0x00));
+        assert_eq!(source.reason, "remoc call error: processing request failed");
+    }
+
+    #[test]
+    fn call_error_maps_to_stream_error_through_connection_error() {
+        let error = quic::StreamError::from(remoc::rtc::CallError::Dropped);
+        let quic::StreamError::Connection { source } = error else {
+            panic!("call error should map to connection-scoped stream error");
+        };
+
+        assert!(source.is_transport());
+    }
+
+    #[test]
+    fn call_error_maps_to_message_stream_error_through_quic_error() {
+        let error = MessageStreamError::from(remoc::rtc::CallError::Dropped);
+        let MessageStreamError::Quic {
+            source: quic::StreamError::Connection { source },
+        } = error
+        else {
+            panic!("call error should map through QUIC stream error");
+        };
+
+        assert!(source.is_transport());
+    }
+
+    #[test]
+    fn string_error_behaves_like_wrapped_string() {
+        let mut error = StringError::new("remote failure".to_owned());
+        assert_eq!(&*error, "remote failure");
+
+        error.push_str(" with context");
+
+        assert_eq!(error.as_str(), "remote failure with context");
+        assert_eq!(format!("{error}"), "remote failure with context");
+        assert_eq!(format!("{error:?}"), "\"remote failure with context\"");
+
+        fn assert_std_error(_: &(impl std::error::Error + ?Sized)) {}
+        assert_std_error(&error);
+    }
+}

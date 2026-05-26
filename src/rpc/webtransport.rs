@@ -26,3 +26,25 @@ impl From<remoc::rtc::CallError> for webtransport::SessionClosed {
         webtransport::SessionClosed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_error_maps_to_open_stream_connection_error() {
+        let error = webtransport::OpenStreamError::from(remoc::rtc::CallError::Dropped);
+        let webtransport::OpenStreamError::Open { source } = error else {
+            panic!("call error should map to open stream connection error");
+        };
+
+        assert!(source.is_transport());
+    }
+
+    #[test]
+    fn call_error_maps_to_session_closed_marker() {
+        let closed = webtransport::SessionClosed::from(remoc::rtc::CallError::Dropped);
+
+        assert_eq!(closed, webtransport::SessionClosed);
+    }
+}
