@@ -514,12 +514,16 @@ async fn listen_accept_bootstrap() {
 
     // Client accepts — should get IpcConnectionHandle
     let handle = quic::Listen::accept(&mut listener).await.unwrap();
-    assert!(quic::Lifecycle::check(&handle).is_ok());
+    assert!(quic::Lifecycle::check(handle.as_ref()).is_ok());
 
     // Agent should be None since mock returns None
-    let local = quic::WithLocalAgent::local_agent(&handle).await.unwrap();
+    let local = quic::WithLocalAgent::local_agent(handle.as_ref())
+        .await
+        .unwrap();
     assert!(local.is_none());
-    let remote = quic::WithRemoteAgent::remote_agent(&handle).await.unwrap();
+    let remote = quic::WithRemoteAgent::remote_agent(handle.as_ref())
+        .await
+        .unwrap();
     assert!(remote.is_none());
 }
 
@@ -583,7 +587,7 @@ async fn connect_roundtrip() {
     let handle = quic::Connect::connect(&connector, &authority)
         .await
         .unwrap();
-    assert!(quic::Lifecycle::check(&handle).is_ok());
+    assert!(quic::Lifecycle::check(handle.as_ref()).is_ok());
 }
 
 #[tokio::test]
@@ -594,17 +598,17 @@ async fn lifecycle_propagation() {
     conn_tx.send(conn).await.unwrap();
 
     let handle = quic::Listen::accept(&mut listener).await.unwrap();
-    assert!(quic::Lifecycle::check(&handle).is_ok());
+    assert!(quic::Lifecycle::check(handle.as_ref()).is_ok());
 
     // close() should not panic
-    quic::Lifecycle::close(&handle, Code::H3_NO_ERROR, "test shutdown".into());
+    quic::Lifecycle::close(handle.as_ref(), Code::H3_NO_ERROR, "test shutdown".into());
 
     // Inject terminal error on the server side
     let err = test_connection_error("connection reset by peer");
     lc.set_terminal_error(err);
 
     // closed() should return the error
-    let terminal = quic::Lifecycle::closed(&handle).await;
+    let terminal = quic::Lifecycle::closed(handle.as_ref()).await;
     match terminal {
         ConnectionError::Transport { source } => {
             assert!(source.reason.contains("connection reset by peer"));
@@ -613,7 +617,7 @@ async fn lifecycle_propagation() {
     }
 
     // check() should now return Err
-    assert!(quic::Lifecycle::check(&handle).is_err());
+    assert!(quic::Lifecycle::check(handle.as_ref()).is_err());
 }
 
 #[tokio::test]
@@ -627,7 +631,7 @@ async fn open_bi_data_transfer() {
     let handle = quic::Listen::accept(&mut listener).await.unwrap();
 
     // Open a bidi stream through the IPC chain
-    let (mut reader, mut writer) = quic::ManageStream::open_bi(&handle).await.unwrap();
+    let (mut reader, mut writer) = quic::ManageStream::open_bi(handle.as_ref()).await.unwrap();
 
     // Server → Client: inject data into the mock QUIC reader → bridge → pipe → PipeReader
     test_handles
@@ -661,7 +665,7 @@ async fn open_bi_unavailable() {
     let handle = quic::Listen::accept(&mut listener).await.unwrap();
 
     // open_bi should fail because no streams are in the queue
-    let result = quic::ManageStream::open_bi(&handle).await;
+    let result = quic::ManageStream::open_bi(handle.as_ref()).await;
     assert!(result.is_err());
 }
 
@@ -680,7 +684,7 @@ async fn open_uni_data_transfer() {
     let handle = quic::Listen::accept(&mut listener).await.unwrap();
 
     // Open a uni stream — the client gets a writer
-    let mut writer = quic::ManageStream::open_uni(&handle).await.unwrap();
+    let mut writer = quic::ManageStream::open_uni(handle.as_ref()).await.unwrap();
 
     // Client → Server: PipeWriter → pipe → bridge → mock QUIC writer → test rx
     use futures::SinkExt;
@@ -701,7 +705,9 @@ async fn accept_uni_data_transfer() {
     let handle = quic::Listen::accept(&mut listener).await.unwrap();
 
     // Accept a uni stream — the client gets a reader
-    let mut reader = quic::ManageStream::accept_uni(&handle).await.unwrap();
+    let mut reader = quic::ManageStream::accept_uni(handle.as_ref())
+        .await
+        .unwrap();
 
     // Server → Client: inject data into mock QUIC reader → bridge → pipe → client
     test_handles
@@ -724,7 +730,7 @@ async fn open_uni_unavailable() {
 
     let handle = quic::Listen::accept(&mut listener).await.unwrap();
 
-    let result = quic::ManageStream::open_uni(&handle).await;
+    let result = quic::ManageStream::open_uni(handle.as_ref()).await;
     assert!(result.is_err());
 }
 
@@ -737,6 +743,6 @@ async fn accept_uni_unavailable() {
 
     let handle = quic::Listen::accept(&mut listener).await.unwrap();
 
-    let result = quic::ManageStream::accept_uni(&handle).await;
+    let result = quic::ManageStream::accept_uni(handle.as_ref()).await;
     assert!(result.is_err());
 }
