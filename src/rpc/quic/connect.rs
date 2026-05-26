@@ -105,3 +105,147 @@ impl quic::Connect for RemoteConnector {
         Ok(Arc::new(RemoteConnection::from(client)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use remoc::prelude::ServerShared;
+    use tokio_util::task::AbortOnDropHandle;
+    use tracing::Instrument;
+
+    use super::*;
+    use crate::connection::tests::MockConnection;
+
+    #[derive(Debug, snafu::Snafu)]
+    #[snafu(display("test connector failed"))]
+    struct TestConnectError;
+
+    #[derive(Debug, Default)]
+    struct TestConnector {
+        connections: Mutex<VecDeque<Arc<MockConnection>>>,
+        calls: AtomicUsize,
+        last_server: Mutex<Option<Authority>>,
+    }
+
+    impl TestConnector {
+        fn with_connections(connections: impl IntoIterator<Item = Arc<MockConnection>>) -> Self {
+            Self {
+                connections: Mutex::new(connections.into_iter().collect()),
+                calls: AtomicUsize::default(),
+                last_server: Mutex::default(),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+
+        fn last_server(&self) -> Option<Authority> {
+            self.last_server
+                .lock()
+                .expect("last server mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl quic::Connect for TestConnector {
+        type Connection = MockConnection;
+        type Error = TestConnectError;
+
+        async fn connect<'a>(
+            &'a self,
+            server: &'a Authority,
+        ) -> Result<Arc<Self::Connection>, Self::Error> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            *self
+                .last_server
+                .lock()
+                .expect("last server mutex should not be poisoned") = Some(server.clone());
+            self.connections
+                .lock()
+                .expect("connection queue mutex should not be poisoned")
+                .pop_front()
+                .ok_or(TestConnectError)
+        }
+    }
+
+    #[tokio::test]
+    async fn blanket_connect_returns_connection_client() {
+        let authority = Authority::from_static("example.test:443");
+        let connector = TestConnector::with_connections([Arc::new(MockConnection::new())]);
+
+        let client = Connect::connect(&connector, SerdeAuthority::from(&authority))
+            .await
+            .expect("blanket connect should return a remote connection client");
+
+        assert_eq!(connector.call_count(), 1);
+        assert_eq!(connector.last_server(), Some(authority));
+
+        let remote = RemoteConnection::from(client);
+        assert!(quic::Lifecycle::check(&remote).is_ok());
+    }
+
+    #[tokio::test]
+    async fn blanket_connect_stringifies_transport_errors() {
+        let authority = Authority::from_static("example.test:443");
+        let connector = TestConnector::default();
+
+        let error = Connect::connect(&connector, SerdeAuthority::from(&authority))
+            .await
+            .expect_err("empty connector should fail");
+
+        let ConnectError::Remote { source } = error else {
+            panic!("connector error should cross RPC boundary as remote error");
+        };
+        assert_eq!(source.as_str(), "test connector failed");
+    }
+
+    #[tokio::test]
+    async fn remote_connector_delegates_to_connect_client() {
+        let authority = Authority::from_static("example.test:443");
+        let connector = Arc::new(TestConnector::with_connections([Arc::new(
+            MockConnection::new(),
+        )]));
+        let (server, client) = ConnectServerShared::new(connector.clone(), 1);
+        let _server_task = AbortOnDropHandle::new(tokio::spawn(
+            async move {
+                let _ = server.serve(true).await;
+            }
+            .in_current_span(),
+        ));
+        let remote = RemoteConnector::new(client);
+
+        let connection = quic::Connect::connect(&remote, &authority)
+            .await
+            .expect("remote connector should connect through RTC");
+
+        assert_eq!(connector.call_count(), 1);
+        assert!(quic::Lifecycle::check(connection.as_ref()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn remote_connector_conversions_preserve_client_handle() {
+        let connector = Arc::new(TestConnector::default());
+        let (server, client) = ConnectServerShared::new(connector, 1);
+        let _server_task = AbortOnDropHandle::new(tokio::spawn(
+            async move {
+                let _ = server.serve(true).await;
+            }
+            .in_current_span(),
+        ));
+
+        let remote = RemoteConnector::new(client.clone());
+        let inner = remote.into_inner();
+        let remote = ConnectClient::into_quic(inner.clone());
+        let inner: ConnectClient = remote.into();
+        let remote = RemoteConnector::from(inner);
+        let _inner = ConnectClient::from(remote);
+    }
+}
