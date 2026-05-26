@@ -195,3 +195,173 @@ impl<T, S: Sink<T> + ?Sized> Sink<T> for UnidirectionalStream<S> {
         self.project().stream.poll_close(cx)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+    use futures::{SinkExt, StreamExt, future::poll_fn};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+    use crate::{
+        buflist::BufList,
+        codec::{DecodeExt, EncodeExt},
+    };
+
+    #[tokio::test]
+    async fn initial_writes_stream_type_and_keeps_payload_writable() {
+        let stream_type = VarInt::from_u32(0x21);
+        let mut stream = UnidirectionalStream::initial(stream_type, BufList::new())
+            .await
+            .expect("initial stream");
+
+        assert_eq!(stream.r#type(), stream_type);
+        assert!(stream.is_reserved_stream());
+
+        stream.write_all(b"payload").await.expect("payload write");
+        AsyncWriteExt::flush(&mut stream)
+            .await
+            .expect("payload flush");
+
+        let mut inner = stream.into_inner();
+        let decoded_type = inner
+            .decode_one::<VarInt>()
+            .await
+            .expect("stream type prefix");
+        let mut payload = Vec::new();
+        inner
+            .read_to_end(&mut payload)
+            .await
+            .expect("remaining payload");
+
+        assert_eq!(decoded_type, stream_type);
+        assert_eq!(payload, b"payload");
+    }
+
+    #[tokio::test]
+    async fn accept_reads_stream_type_and_leaves_remaining_payload() {
+        let stream_type = VarInt::from_u32(0x02);
+        let mut payload = BufList::new();
+        payload
+            .encode_one(stream_type)
+            .await
+            .expect("stream type encoding");
+        payload.write(Bytes::from_static(b"body"));
+
+        let mut stream = UnidirectionalStream::accept(payload)
+            .await
+            .expect("accepted stream");
+        let mut body = Vec::new();
+        stream
+            .read_to_end(&mut body)
+            .await
+            .expect("remaining payload");
+
+        assert_eq!(stream.r#type(), stream_type);
+        assert!(!stream.is_reserved_stream());
+        assert_eq!(body, b"body");
+    }
+
+    #[tokio::test]
+    async fn stream_and_sink_delegate_to_inner_value() {
+        let mut stream = UnidirectionalStream {
+            r#type: VarInt::from_u32(0),
+            stream: futures::stream::iter([Ok::<_, quic::StreamError>(Bytes::from_static(
+                b"chunk",
+            ))]),
+        };
+
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"chunk")
+        );
+        assert!(stream.next().await.is_none());
+
+        let mut sink = UnidirectionalStream {
+            r#type: VarInt::from_u32(0),
+            stream: futures::sink::drain::<Bytes>(),
+        };
+        sink.send(Bytes::from_static(b"ignored"))
+            .await
+            .expect("sink forwards to inner drain");
+    }
+
+    #[derive(Debug)]
+    struct ControlStream {
+        stream_id: VarInt,
+        stopped: Arc<Mutex<Option<VarInt>>>,
+        cancelled: Arc<Mutex<Option<VarInt>>>,
+    }
+
+    impl GetStreamId for ControlStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
+        }
+    }
+
+    impl StopStream for ControlStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            *self.stopped.lock().expect("stop state poisoned") = Some(code);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl CancelStream for ControlStream {
+        fn poll_cancel(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            *self.cancelled.lock().expect("cancel state poisoned") = Some(code);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn control_traits_delegate_to_inner_stream() {
+        let stopped = Arc::new(Mutex::new(None));
+        let cancelled = Arc::new(Mutex::new(None));
+        let stream_id = VarInt::from_u32(17);
+        let stop_code = VarInt::from_u32(23);
+        let cancel_code = VarInt::from_u32(29);
+        let mut stream = UnidirectionalStream {
+            r#type: VarInt::from_u32(0),
+            stream: ControlStream {
+                stream_id,
+                stopped: stopped.clone(),
+                cancelled: cancelled.clone(),
+            },
+        };
+
+        assert_eq!(
+            poll_fn(|cx| Pin::new(&mut stream).poll_stream_id(cx))
+                .await
+                .expect("stream id"),
+            stream_id
+        );
+        poll_fn(|cx| Pin::new(&mut stream).poll_stop(cx, stop_code))
+            .await
+            .expect("stop forwarded");
+        poll_fn(|cx| Pin::new(&mut stream).poll_cancel(cx, cancel_code))
+            .await
+            .expect("cancel forwarded");
+
+        assert_eq!(
+            *stopped.lock().expect("stop state poisoned"),
+            Some(stop_code)
+        );
+        assert_eq!(
+            *cancelled.lock().expect("cancel state poisoned"),
+            Some(cancel_code)
+        );
+    }
+}

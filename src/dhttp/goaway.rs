@@ -82,3 +82,51 @@ impl EncodeInto<BufList> for Goaway {
         Ok(frame)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::codec::{DecodeFrom, EncodeExt};
+
+    #[test]
+    fn new_stores_stream_id() {
+        let stream_id = VarInt::from_u32(11);
+
+        assert_eq!(Goaway::new(stream_id).stream_id(), stream_id);
+    }
+
+    #[tokio::test]
+    async fn encode_decode_round_trips() {
+        let stream_id = VarInt::from_u32(1337);
+        let mut frame = BufList::new()
+            .encode(Goaway::new(stream_id))
+            .await
+            .expect("goaway encoding is infallible");
+
+        assert_eq!(frame.r#type(), Frame::GOAWAY_FRAME_TYPE);
+
+        let decoded = Goaway::decode_from(&mut frame).await.expect("goaway frame");
+
+        assert_eq!(decoded.stream_id(), stream_id);
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_trailing_payload() {
+        let mut payload = BufList::new();
+        payload
+            .encode_one(VarInt::from_u32(7))
+            .await
+            .expect("varint encoding into buflist is infallible");
+        payload.write(Bytes::from_static(b"trailing"));
+        let mut frame =
+            Frame::new(Frame::GOAWAY_FRAME_TYPE, payload).expect("payload length fits varint");
+
+        let error = Goaway::decode_from(&mut frame)
+            .await
+            .expect_err("trailing payload is malformed");
+
+        assert!(matches!(error, StreamError::Connection { .. }));
+    }
+}

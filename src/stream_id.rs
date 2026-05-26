@@ -86,3 +86,48 @@ impl fmt::Display for StreamId {
         write!(f, "{}", self.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::{DecodeFrom, EncodeInto};
+
+    #[test]
+    fn conversions_preserve_inner_varint() {
+        let raw = VarInt::from_u32(123);
+        let stream_id = StreamId::from(raw);
+
+        assert_eq!(stream_id.into_inner(), 123);
+        assert_eq!(VarInt::from(stream_id), raw);
+    }
+
+    #[test]
+    fn try_from_rejects_values_outside_varint_range() {
+        let error = StreamId::try_from(1_u64 << 62).expect_err("value exceeds QUIC varint range");
+
+        assert_eq!(
+            error.to_string(),
+            "value(4611686018427387904) too large for varint encoding"
+        );
+    }
+
+    #[test]
+    fn display_delegates_to_inner_varint() {
+        let stream_id = StreamId::from(VarInt::from_u32(7));
+
+        assert_eq!(stream_id.to_string(), "7");
+    }
+
+    #[tokio::test]
+    async fn encode_decode_round_trips() {
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        let expected = StreamId::from(VarInt::from_u32(0x3fff));
+
+        let write = async move { expected.encode_into(&mut writer).await.expect("encode") };
+        let read = async move { StreamId::decode_from(&mut reader).await.expect("decode") };
+
+        let ((), decoded) = tokio::join!(write, read);
+
+        assert_eq!(decoded, expected);
+    }
+}
