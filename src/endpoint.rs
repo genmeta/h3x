@@ -372,7 +372,9 @@ where
 mod tests {
     use std::{
         collections::VecDeque,
+        fmt,
         future::{Ready, pending, ready},
+        pin::Pin,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -380,16 +382,32 @@ mod tests {
         task::{Context, Poll},
     };
 
+    use bytes::Bytes;
     use dhttp_identity::identity;
+    use futures::{SinkExt, Stream};
     use http::uri::Authority;
+    use tokio::{
+        sync::Notify,
+        time::{Duration, timeout},
+    };
     use tower_service::Service;
 
     use super::*;
     use crate::{
-        connection::tests::{
-            MockConnection, TestLocalAgent, TestReadStream, TestRemoteAgent, TestWriteStream,
+        codec::{
+            BoxReadStream, BoxWriteStream, ErasedPeekableBiStream, PeekableStreamReader,
+            SinkWriter, StreamReader,
         },
+        connection::{
+            ConnectionState,
+            tests::{
+                MockConnection, TestLocalAgent, TestReadStream, TestRemoteAgent, TestWriteStream,
+            },
+        },
+        dhttp::protocol::DHttpProtocol,
         pool::ReuseableConnection,
+        protocol::{Protocol, Protocols, StreamVerdict},
+        qpack::protocol::QPackProtocolFactory,
         varint::VarInt,
     };
 
@@ -791,6 +809,250 @@ mod tests {
 
         fn call(&mut self, _request: UnresolvedRequest) -> Self::Future {
             ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ControlledConnection {
+        close_notify: Arc<Notify>,
+        close_error: quic::ConnectionError,
+    }
+
+    impl ControlledConnection {
+        fn new(reason: &'static str) -> Self {
+            Self {
+                close_notify: Arc::new(Notify::new()),
+                close_error: test_connection_error(reason),
+            }
+        }
+
+        fn trigger_close(&self) {
+            self.close_notify.notify_waiters();
+        }
+    }
+
+    impl quic::ManageStream for ControlledConnection {
+        type StreamReader = TestReadStream;
+        type StreamWriter = TestWriteStream;
+
+        async fn open_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            pending().await
+        }
+
+        async fn open_uni(&self) -> Result<Self::StreamWriter, quic::ConnectionError> {
+            Ok(TestWriteStream)
+        }
+
+        async fn accept_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            pending().await
+        }
+
+        async fn accept_uni(&self) -> Result<Self::StreamReader, quic::ConnectionError> {
+            pending().await
+        }
+    }
+
+    impl quic::WithLocalAgent for ControlledConnection {
+        type LocalAgent = TestLocalAgent;
+
+        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+            Ok(None)
+        }
+    }
+
+    impl quic::WithRemoteAgent for ControlledConnection {
+        type RemoteAgent = TestRemoteAgent;
+
+        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+            Ok(None)
+        }
+    }
+
+    impl quic::Lifecycle for ControlledConnection {
+        fn close(&self, _code: crate::error::Code, _reason: std::borrow::Cow<'static, str>) {
+            self.trigger_close();
+        }
+
+        fn check(&self) -> Result<(), quic::ConnectionError> {
+            Ok(())
+        }
+
+        async fn closed(&self) -> quic::ConnectionError {
+            self.close_notify.notified().await;
+            self.close_error.clone()
+        }
+    }
+
+    fn state_without_qpack(
+        quic: Arc<ControlledConnection>,
+    ) -> ConnectionState<ControlledConnection> {
+        let erased: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased));
+        ConnectionState::new_for_test(quic, Arc::new(protocols))
+    }
+
+    async fn state_with_qpack(
+        quic: Arc<ControlledConnection>,
+    ) -> ConnectionState<ControlledConnection> {
+        let erased: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased));
+        let qpack = QPackProtocolFactory::new()
+            .init(&quic, &protocols)
+            .await
+            .expect("qpack protocol should initialize for endpoint tests");
+        protocols.insert(qpack);
+        ConnectionState::new_for_test(quic, Arc::new(protocols))
+    }
+
+    async fn http3_request_stream(stream_id: u32) -> ErasedPeekableBiStream {
+        let stream_id = VarInt::from_u32(stream_id);
+        let (reader, mut write_side) = quic::test::mock_stream_pair(stream_id);
+        write_side
+            .send(Bytes::from_static(&[0x01]))
+            .await
+            .expect("write test HEADERS frame type");
+        write_side
+            .close()
+            .await
+            .expect("close test request read side");
+
+        let (_read_side, writer) = quic::test::mock_stream_pair(stream_id);
+        (
+            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream)),
+            SinkWriter::new(Box::pin(writer) as BoxWriteStream),
+        )
+    }
+
+    async fn enqueue_http3_request(
+        state: &ConnectionState<ControlledConnection>,
+        stream: ErasedPeekableBiStream,
+    ) {
+        let verdict = Protocol::accept_bi(state.dhttp(), stream)
+            .await
+            .expect("test request stream should be classified");
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+    }
+
+    #[derive(Debug)]
+    struct StreamIdErrorReadStream {
+        first_chunk: Option<Bytes>,
+        close_notify: Arc<Notify>,
+    }
+
+    impl StreamIdErrorReadStream {
+        fn new(close_notify: Arc<Notify>) -> Self {
+            Self {
+                first_chunk: Some(Bytes::from_static(&[0x01])),
+                close_notify,
+            }
+        }
+    }
+
+    impl quic::GetStreamId for StreamIdErrorReadStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            self.close_notify.notify_waiters();
+            Poll::Ready(Err(quic::StreamError::Reset {
+                code: VarInt::from_u32(0x11),
+            }))
+        }
+    }
+
+    impl quic::StopStream for StreamIdErrorReadStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            _code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            let _ = self;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for StreamIdErrorReadStream {
+        type Item = Result<Bytes, quic::StreamError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            Poll::Ready(this.first_chunk.take().map(Ok))
+        }
+    }
+
+    fn stream_id_error_request_stream(
+        stream_id: u32,
+        close_notify: Arc<Notify>,
+    ) -> ErasedPeekableBiStream {
+        let stream_id = VarInt::from_u32(stream_id);
+        let reader = PeekableStreamReader::new(StreamReader::new(Box::pin(
+            StreamIdErrorReadStream::new(close_notify),
+        ) as BoxReadStream));
+        let (_unused_reader, writer) = quic::test::mock_stream_pair(stream_id);
+        (reader, SinkWriter::new(Box::pin(writer) as BoxWriteStream))
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordingService {
+        seen_streams: Arc<Mutex<Vec<StreamId>>>,
+        close_notify: Arc<Notify>,
+    }
+
+    impl Service<UnresolvedRequest> for RecordingService {
+        type Response = ();
+        type Error = quic::ConnectionError;
+        type Future = Ready<Result<(), Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: UnresolvedRequest) -> Self::Future {
+            self.seen_streams
+                .lock()
+                .expect("recording service mutex should not be poisoned")
+                .push(request.stream_id);
+            self.close_notify.notify_waiters();
+            ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestServiceError;
+
+    impl fmt::Display for TestServiceError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("test service failure")
+        }
+    }
+
+    impl Error for TestServiceError {}
+
+    #[derive(Debug, Clone)]
+    struct FailingService {
+        calls: Arc<AtomicUsize>,
+        close_notify: Arc<Notify>,
+    }
+
+    impl Service<UnresolvedRequest> for FailingService {
+        type Response = ();
+        type Error = TestServiceError;
+        type Future = Ready<Result<(), Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: UnresolvedRequest) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.close_notify.notify_waiters();
+            ready(Err(TestServiceError))
         }
     }
 
@@ -1267,5 +1529,154 @@ mod tests {
             Some("recover.example"),
         );
         assert_eq!(endpoint.pool_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn serve_connection_returns_when_accepting_request_streams_fails() {
+        let quic = Arc::new(ControlledConnection::new("serve connection closed"));
+        let state = state_without_qpack(quic.clone());
+        let connection = Arc::new(H3Connection::from_state_for_test(state));
+
+        quic.trigger_close();
+
+        timeout(
+            Duration::from_millis(100),
+            serve_connection(connection, NoopService),
+        )
+        .await
+        .expect("serve_connection should stop when accepting streams fails");
+    }
+
+    #[tokio::test]
+    async fn serve_connection_skips_requests_when_stream_id_lookup_fails() {
+        let quic = Arc::new(ControlledConnection::new("stream id failed"));
+        let state = state_without_qpack(quic.clone());
+        enqueue_http3_request(
+            &state,
+            stream_id_error_request_stream(21, quic.close_notify.clone()),
+        )
+        .await;
+        let connection = Arc::new(H3Connection::from_state_for_test(state));
+        let seen_streams = Arc::new(Mutex::new(Vec::new()));
+
+        timeout(
+            Duration::from_millis(100),
+            serve_connection(
+                connection,
+                RecordingService {
+                    seen_streams: seen_streams.clone(),
+                    close_notify: Arc::new(Notify::new()),
+                },
+            ),
+        )
+        .await
+        .expect("serve_connection should stop after stream-id failure closes the connection");
+
+        assert!(
+            seen_streams
+                .lock()
+                .expect("recording service mutex should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_connection_returns_when_qpack_is_unavailable() {
+        let quic = Arc::new(ControlledConnection::new("qpack unused"));
+        let state = state_without_qpack(quic);
+        enqueue_http3_request(&state, http3_request_stream(23).await).await;
+        let connection = Arc::new(H3Connection::from_state_for_test(state));
+        let seen_streams = Arc::new(Mutex::new(Vec::new()));
+
+        timeout(
+            Duration::from_millis(100),
+            serve_connection(
+                connection,
+                RecordingService {
+                    seen_streams: seen_streams.clone(),
+                    close_notify: Arc::new(Notify::new()),
+                },
+            ),
+        )
+        .await
+        .expect("serve_connection should stop when qpack is unavailable");
+
+        assert!(
+            seen_streams
+                .lock()
+                .expect("recording service mutex should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_connection_spawns_request_handling_for_valid_requests() {
+        let quic = Arc::new(ControlledConnection::new("request served"));
+        let state = state_with_qpack(quic.clone()).await;
+        enqueue_http3_request(&state, http3_request_stream(25).await).await;
+        let connection = Arc::new(H3Connection::from_state_for_test(state));
+        let seen_streams = Arc::new(Mutex::new(Vec::new()));
+
+        timeout(
+            Duration::from_millis(100),
+            serve_connection(
+                connection,
+                RecordingService {
+                    seen_streams: seen_streams.clone(),
+                    close_notify: quic.close_notify.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("serve_connection should stop after the test service closes the connection");
+
+        timeout(Duration::from_millis(100), async {
+            loop {
+                if seen_streams
+                    .lock()
+                    .expect("recording service mutex should not be poisoned")
+                    .as_slice()
+                    == [StreamId(VarInt::from_u32(25))]
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request handler task should record the accepted stream");
+    }
+
+    #[tokio::test]
+    async fn serve_connection_keeps_running_when_request_handler_returns_error() {
+        let quic = Arc::new(ControlledConnection::new("handler failed"));
+        let state = state_with_qpack(quic.clone()).await;
+        enqueue_http3_request(&state, http3_request_stream(27).await).await;
+        let connection = Arc::new(H3Connection::from_state_for_test(state));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        timeout(
+            Duration::from_millis(100),
+            serve_connection(
+                connection,
+                FailingService {
+                    calls: calls.clone(),
+                    close_notify: quic.close_notify.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("serve_connection should stop after the failing handler closes the connection");
+
+        timeout(Duration::from_millis(100), async {
+            loop {
+                if calls.load(Ordering::Relaxed) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failing request handler task should run once");
     }
 }
