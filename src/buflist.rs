@@ -334,9 +334,13 @@ impl Extend<Bytes> for BuflistCursor {
 
 #[cfg(test)]
 mod tests {
-    use bytes::{Buf, Bytes};
+    use std::io::IoSlice;
 
-    use super::BufList;
+    use bytes::{Buf, Bytes, BytesMut};
+    use futures::{SinkExt, StreamExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    use super::{BufList, BuflistCursor};
 
     #[test]
     fn empty_buflist() {
@@ -438,6 +442,80 @@ mod tests {
     }
 
     #[test]
+    fn chunks_vectored_reports_front_buffers() {
+        let bl: BufList = vec![
+            Bytes::from_static(b"ab"),
+            Bytes::from_static(b"cd"),
+            Bytes::from_static(b"ef"),
+        ]
+        .into_iter()
+        .collect();
+        let mut slices = [
+            IoSlice::new(&[]),
+            IoSlice::new(&[]),
+            IoSlice::new(&[]),
+            IoSlice::new(&[]),
+        ];
+
+        let filled = bl.chunks_vectored(&mut slices);
+
+        assert_eq!(filled, 3);
+        assert_eq!(&*slices[0], b"ab");
+        assert_eq!(&*slices[1], b"cd");
+        assert_eq!(&*slices[2], b"ef");
+    }
+
+    #[tokio::test]
+    async fn async_write_merges_unique_tail_and_flushes() {
+        let mut bl = BufList::new();
+        bl.write(BytesMut::from(&b"hello"[..]).freeze());
+
+        bl.write_all(b" world").await.unwrap();
+        AsyncWriteExt::flush(&mut bl).await.unwrap();
+        bl.shutdown().await.unwrap();
+
+        assert_eq!(bl.bufs.len(), 1);
+        assert_eq!(bl.copy_to_bytes(11), Bytes::from_static(b"hello world"));
+    }
+
+    #[tokio::test]
+    async fn async_write_preserves_shared_tail_before_appending() {
+        let mut bl = BufList::new();
+        bl.write(Bytes::from_static(b"hello"));
+
+        bl.write_all(b"!").await.unwrap();
+
+        assert_eq!(bl.bufs.len(), 2);
+        assert_eq!(bl.copy_to_bytes(6), Bytes::from_static(b"hello!"));
+    }
+
+    #[tokio::test]
+    async fn sink_async_read_bufread_and_stream_delegations() {
+        let mut bl = BufList::new();
+        bl.send(Bytes::from_static(b"ab")).await.unwrap();
+        bl.feed(Bytes::from_static(b"cd")).await.unwrap();
+        SinkExt::flush(&mut bl).await.unwrap();
+
+        let mut read = [0; 3];
+        let read_len = bl.read(&mut read).await.unwrap();
+        assert_eq!(read_len, 2);
+        assert_eq!(&read[..read_len], b"ab");
+
+        let filled = bl.fill_buf().await.unwrap();
+        assert_eq!(filled, b"cd");
+        bl.consume(1);
+        assert_eq!(bl.fill_buf().await.unwrap(), b"d");
+        bl.consume(1);
+        assert!(bl.fill_buf().await.unwrap().is_empty());
+
+        bl.send(Bytes::from_static(b"ef")).await.unwrap();
+        assert_eq!(bl.next().await, Some(Bytes::from_static(b"ef")));
+        assert_eq!(bl.next().await, None);
+
+        bl.close().await.unwrap();
+    }
+
+    #[test]
     fn sequential_reads() {
         let mut bl = BufList::new();
         bl.write(Bytes::from_static(b"ab"));
@@ -462,5 +540,105 @@ mod tests {
         let mut bl = BufList::new();
         bl.write(Bytes::from_static(b"ab"));
         bl.advance(3);
+    }
+
+    fn cursor_source() -> BuflistCursor {
+        BuflistCursor::new(
+            vec![
+                Bytes::from_static(b"ab"),
+                Bytes::from_static(b"cd"),
+                Bytes::from_static(b"ef"),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    }
+
+    #[test]
+    fn cursor_reset_commit_inner_and_iteration_track_offsets() {
+        let mut cursor = cursor_source();
+
+        cursor.advance(3);
+        assert_eq!(cursor.chunk(), b"d");
+        assert_eq!(
+            cursor.iter().collect::<Vec<_>>(),
+            vec![Bytes::from_static(b"d"), Bytes::from_static(b"ef")]
+        );
+
+        cursor.reset();
+        assert_eq!(cursor.chunk(), b"ab");
+        assert_eq!(cursor.remaining(), 6);
+
+        cursor.advance(3);
+        cursor.commit();
+
+        assert_eq!(cursor.inner().remaining(), 3);
+        assert_eq!(cursor.chunk(), b"d");
+        assert_eq!(cursor.copy_to_bytes(3), Bytes::from_static(b"def"));
+    }
+
+    #[test]
+    fn cursor_write_extend_and_empty_iteration() {
+        let mut cursor = BuflistCursor::new(BufList::new());
+
+        assert!(!cursor.has_remaining());
+        assert_eq!(cursor.iter().collect::<Vec<_>>(), vec![Bytes::new()]);
+
+        cursor.write(Bytes::from_static(b"ab"));
+        cursor.extend([Bytes::from_static(b"cd")]);
+
+        assert_eq!(cursor.inner().remaining(), 4);
+        assert_eq!(cursor.copy_to_bytes(4), Bytes::from_static(b"abcd"));
+    }
+
+    #[test]
+    fn cursor_chunks_vectored_start_from_current_offset() {
+        let mut cursor = cursor_source();
+        cursor.advance(1);
+        let mut slices = [
+            IoSlice::new(&[]),
+            IoSlice::new(&[]),
+            IoSlice::new(&[]),
+            IoSlice::new(&[]),
+        ];
+
+        let filled = cursor.chunks_vectored(&mut slices);
+
+        assert_eq!(filled, 3);
+        assert_eq!(&*slices[0], b"b");
+        assert_eq!(&*slices[1], b"cd");
+        assert_eq!(&*slices[2], b"ef");
+    }
+
+    #[test]
+    fn cursor_copy_to_bytes_covers_zero_exact_and_spanning_paths() {
+        let mut zero = cursor_source();
+        assert_eq!(zero.copy_to_bytes(0), Bytes::new());
+        assert_eq!(zero.remaining(), 6);
+
+        let mut exact = BuflistCursor::new(
+            vec![Bytes::from_static(b"abc")]
+                .into_iter()
+                .collect::<BufList>(),
+        );
+        exact.advance(1);
+        assert_eq!(exact.copy_to_bytes(2), Bytes::from_static(b"bc"));
+        assert_eq!(exact.remaining(), 0);
+
+        let mut spanning = BuflistCursor::new(
+            vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")]
+                .into_iter()
+                .collect::<BufList>(),
+        );
+        spanning.advance(1);
+        assert_eq!(spanning.copy_to_bytes(3), Bytes::from_static(b"bcd"));
+        assert_eq!(spanning.remaining(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "advance beyond buffer length")]
+    fn cursor_advance_beyond_panics() {
+        let mut cursor = cursor_source();
+        cursor.advance(7);
     }
 }
