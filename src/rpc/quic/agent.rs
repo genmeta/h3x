@@ -299,3 +299,335 @@ where
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use remoc::prelude::ServerShared;
+    use tokio_util::task::AbortOnDropHandle;
+    use tracing::Instrument;
+
+    use super::*;
+    use crate::dquic::cert::handy::ToCertificate;
+
+    const SERVER_CERT: &[u8] = include_bytes!("../../../tests/keychain/localhost/server.cert");
+
+    #[derive(Clone, Debug)]
+    struct TestLocalAgent {
+        name: &'static str,
+        cert_chain: Vec<CertificateDer<'static>>,
+        fail_sign: bool,
+    }
+
+    impl TestLocalAgent {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                cert_chain: SERVER_CERT.to_certificate(),
+                fail_sign: false,
+            }
+        }
+
+        fn failing_signer() -> Self {
+            Self {
+                fail_sign: true,
+                ..Self::new("failing-local")
+            }
+        }
+    }
+
+    impl agent::LocalAgent for TestLocalAgent {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn cert_chain(&self) -> &[CertificateDer<'static>] {
+            &self.cert_chain
+        }
+
+        fn sign_algorithm(&self) -> rustls::SignatureAlgorithm {
+            rustls::SignatureAlgorithm::ECDSA
+        }
+
+        fn sign(
+            &self,
+            scheme: SignatureScheme,
+            data: &[u8],
+        ) -> BoxFuture<'_, Result<Vec<u8>, SignError>> {
+            let fail_sign = self.fail_sign;
+            let data = data.to_vec();
+            Box::pin(async move {
+                if fail_sign {
+                    return Err(SignError::UnsupportedScheme { scheme });
+                }
+                Ok(expected_signature(scheme, &data))
+            })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct TestRemoteAgent {
+        name: &'static str,
+        cert_chain: Vec<CertificateDer<'static>>,
+    }
+
+    impl TestRemoteAgent {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                cert_chain: SERVER_CERT.to_certificate(),
+            }
+        }
+    }
+
+    impl agent::RemoteAgent for TestRemoteAgent {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn cert_chain(&self) -> &[CertificateDer<'static>] {
+            &self.cert_chain
+        }
+    }
+
+    fn expected_signature(scheme: SignatureScheme, data: &[u8]) -> Vec<u8> {
+        let mut signature = u16::from(scheme).to_be_bytes().to_vec();
+        signature.extend_from_slice(data);
+        signature
+    }
+
+    fn assert_transport_reason(error: quic::ConnectionError, fragment: &str) {
+        let quic::ConnectionError::Transport { source } = error else {
+            panic!("expected transport error");
+        };
+        assert!(
+            source.reason.contains(fragment),
+            "transport reason {:?} should contain {fragment:?}",
+            source.reason,
+        );
+    }
+
+    fn spawn_local_agent_server(
+        agent: TestLocalAgent,
+    ) -> (AbortOnDropHandle<()>, LocalAgentClient) {
+        let (server, client) = LocalAgentServerShared::new(Arc::new(agent), 1);
+        let task = AbortOnDropHandle::new(tokio::spawn(
+            async move {
+                let _ = server.serve(true).await;
+            }
+            .in_current_span(),
+        ));
+        (task, client)
+    }
+
+    fn spawn_remote_agent_server(
+        agent: TestRemoteAgent,
+    ) -> (AbortOnDropHandle<()>, RemoteAgentClient) {
+        let (server, client) = RemoteAgentServerShared::new(Arc::new(agent), 1);
+        let task = AbortOnDropHandle::new(tokio::spawn(
+            async move {
+                let _ = server.serve(true).await;
+            }
+            .in_current_span(),
+        ));
+        (task, client)
+    }
+
+    #[tokio::test]
+    async fn blanket_local_agent_delegates_all_methods() {
+        let agent = TestLocalAgent::new("local.example");
+        let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
+
+        assert_eq!(
+            super::LocalAgent::name(&agent).await.expect("name"),
+            "local.example",
+        );
+        let certs = super::LocalAgent::cert_chain(&agent)
+            .await
+            .expect("cert chain");
+        let cert = CertificateDer::from(certs.into_iter().next().expect("certificate"));
+        assert_eq!(cert.as_ref(), agent.cert_chain[0].as_ref());
+        assert_eq!(
+            rustls::SignatureAlgorithm::from(
+                super::LocalAgent::sign_algorithm(&agent)
+                    .await
+                    .expect("sign algorithm"),
+            ),
+            rustls::SignatureAlgorithm::ECDSA,
+        );
+
+        let signature = super::LocalAgent::sign(
+            &agent,
+            SerdeSignatureScheme::from(scheme),
+            b"payload".to_vec(),
+        )
+        .await
+        .expect("sign");
+        assert_eq!(signature, expected_signature(scheme, b"payload"));
+
+        let public_key = SubjectPublicKeyInfoDer::from(
+            super::LocalAgent::public_key(&agent)
+                .await
+                .expect("public key"),
+        );
+        assert_eq!(
+            public_key.as_ref(),
+            agent::LocalAgent::public_key(&agent).as_ref(),
+        );
+
+        let verified = super::LocalAgent::verify(
+            &agent,
+            SerdeSignatureScheme::from(scheme),
+            b"payload".to_vec(),
+            b"not a real signature".to_vec(),
+        )
+        .await
+        .expect("verify");
+        assert!(!verified);
+    }
+
+    #[tokio::test]
+    async fn blanket_remote_agent_delegates_all_methods() {
+        let agent = TestRemoteAgent::new("remote.example");
+        let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
+
+        assert_eq!(
+            super::RemoteAgent::name(&agent).await.expect("name"),
+            "remote.example",
+        );
+        let certs = super::RemoteAgent::cert_chain(&agent)
+            .await
+            .expect("cert chain");
+        let cert = CertificateDer::from(certs.into_iter().next().expect("certificate"));
+        assert_eq!(cert.as_ref(), agent.cert_chain[0].as_ref());
+
+        let public_key = SubjectPublicKeyInfoDer::from(
+            super::RemoteAgent::public_key(&agent)
+                .await
+                .expect("public key"),
+        );
+        assert_eq!(
+            public_key.as_ref(),
+            agent::RemoteAgent::public_key(&agent).as_ref(),
+        );
+
+        let verified = super::RemoteAgent::verify(
+            &agent,
+            SerdeSignatureScheme::from(scheme),
+            b"payload".to_vec(),
+            b"not a real signature".to_vec(),
+        )
+        .await
+        .expect("verify");
+        assert!(!verified);
+    }
+
+    #[tokio::test]
+    async fn blanket_agent_errors_become_transport_errors() {
+        let local = TestLocalAgent::failing_signer();
+        let remote = TestRemoteAgent::new("remote.example");
+        let unsupported = SerdeSignatureScheme::from(SignatureScheme::from(0xffff));
+
+        let error = super::LocalAgent::sign(&local, unsupported, b"payload".to_vec())
+            .await
+            .expect_err("sign error should be mapped");
+        assert_transport_reason(error, "sign error");
+
+        let error = super::LocalAgent::verify(
+            &local,
+            unsupported,
+            b"payload".to_vec(),
+            b"signature".to_vec(),
+        )
+        .await
+        .expect_err("local verify error should be mapped");
+        assert_transport_reason(error, "verify error");
+
+        let error = super::RemoteAgent::verify(
+            &remote,
+            unsupported,
+            b"payload".to_vec(),
+            b"signature".to_vec(),
+        )
+        .await
+        .expect_err("remote verify error should be mapped");
+        assert_transport_reason(error, "verify error");
+    }
+
+    #[tokio::test]
+    async fn cached_local_agent_fetches_remote_fields_and_delegates_sign() {
+        let agent = TestLocalAgent::new("cached-local.example");
+        let (_task, client) = spawn_local_agent_server(agent.clone());
+
+        let cached = CachedLocalAgent::from_client(client)
+            .await
+            .expect("cached local agent");
+
+        assert_eq!(agent::LocalAgent::name(&cached), agent.name);
+        assert_eq!(
+            agent::LocalAgent::cert_chain(&cached)[0].as_ref(),
+            agent.cert_chain[0].as_ref(),
+        );
+        assert_eq!(
+            agent::LocalAgent::sign_algorithm(&cached),
+            rustls::SignatureAlgorithm::ECDSA,
+        );
+        assert!(
+            format!("{cached:?}").contains("CachedRemoteLocalAgent"),
+            "debug output should name cached local agent",
+        );
+
+        let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
+        let signature = agent::LocalAgent::sign(&cached, scheme, b"payload")
+            .await
+            .expect("cached sign");
+        assert_eq!(signature, expected_signature(scheme, b"payload"));
+
+        let public_key = agent::LocalAgent::public_key(&cached);
+        assert_eq!(
+            public_key.as_ref(),
+            agent::LocalAgent::public_key(&agent).as_ref()
+        );
+        let verified =
+            agent::LocalAgent::verify(&cached, scheme, b"payload", b"not a real signature")
+                .await
+                .expect("cached verify");
+        assert!(!verified);
+    }
+
+    #[tokio::test]
+    async fn cached_remote_agent_fetches_remote_fields() {
+        let agent = TestRemoteAgent::new("cached-remote.example");
+        let (_task, client) = spawn_remote_agent_server(agent.clone());
+
+        let cached = CachedRemoteAgent::from_client(client)
+            .await
+            .expect("cached remote agent");
+
+        assert_eq!(agent::RemoteAgent::name(&cached), agent.name);
+        assert_eq!(
+            agent::RemoteAgent::cert_chain(&cached)[0].as_ref(),
+            agent.cert_chain[0].as_ref(),
+        );
+        assert!(
+            format!("{cached:?}").contains("CachedRemoteRemoteAgent"),
+            "debug output should name cached remote agent",
+        );
+
+        let public_key = agent::RemoteAgent::public_key(&cached);
+        assert_eq!(
+            public_key.as_ref(),
+            agent::RemoteAgent::public_key(&agent).as_ref(),
+        );
+        let verified = agent::RemoteAgent::verify(
+            &cached,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            b"payload",
+            b"not a real signature",
+        )
+        .await
+        .expect("cached verify");
+        assert!(!verified);
+    }
+}
