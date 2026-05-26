@@ -138,7 +138,7 @@ impl QPackProtocol {
                 .lock()
                 .expect("lock is not poisoned")
                 .take()
-                .ok_or(H3StreamCreationError::DuplicateQpackDecoderStream)?
+                .ok_or(H3StreamCreationError::DuplicateQpackEncoderStream)?
                 .send(uni_stream_reader);
             Ok(StreamVerdict::Accepted)
         } else if stream_type == UnidirectionalStream::QPACK_DECODER_STREAM_TYPE {

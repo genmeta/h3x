@@ -48,8 +48,7 @@ impl Drop for RegistryGuard {
     fn drop(&mut self) {
         if let Some(registry) = self.registry.upgrade()
             && let Some(kv) = registry.get(&self.name)
-            && let Some(current_entry) = kv.value().upgrade()
-            && Weak::ptr_eq(&self.self_entry, &Arc::downgrade(&current_entry))
+            && Weak::ptr_eq(&self.self_entry, kv.value())
         {
             drop(kv);
             registry.remove(&self.name);
