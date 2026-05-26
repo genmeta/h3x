@@ -268,6 +268,54 @@ mod client_tests {
     }
 
     #[test]
+    fn test_verifier_choice_custom_different_arc_ne() {
+        let a: Arc<dyn ServerCertVerifier> = Arc::new(DangerousServerCertVerifier);
+        let b: Arc<dyn ServerCertVerifier> = Arc::new(DangerousServerCertVerifier);
+        assert_ne!(
+            ServerCertVerifierChoice::Custom(a),
+            ServerCertVerifierChoice::Custom(b)
+        );
+    }
+
+    #[test]
+    fn test_verifier_choice_cross_variant_not_equal() {
+        let verifier: Arc<dyn ServerCertVerifier> = Arc::new(DangerousServerCertVerifier);
+        assert_ne!(
+            ServerCertVerifierChoice::Dangerous,
+            ServerCertVerifierChoice::Custom(verifier.clone())
+        );
+        assert_ne!(
+            ServerCertVerifierChoice::WebPki(
+                WebPkiServerVerifier::builder(Arc::new(root_store_with_ca()))
+                    .build()
+                    .unwrap()
+            ),
+            ServerCertVerifierChoice::Custom(verifier)
+        );
+    }
+
+    #[test]
+    fn test_verifier_choice_debug_variants() {
+        let store = root_store_with_ca();
+        let webpki = WebPkiServerVerifier::builder(Arc::new(store))
+            .build()
+            .unwrap();
+
+        let dangerous = ServerCertVerifierChoice::Dangerous;
+        let custom: Arc<dyn ServerCertVerifier> = Arc::new(DangerousServerCertVerifier);
+
+        assert_eq!(format!("{:?}", dangerous), "Dangerous");
+        assert_eq!(
+            format!("{:?}", ServerCertVerifierChoice::WebPki(webpki)),
+            "WebPki"
+        );
+        assert_eq!(
+            format!("{:?}", ServerCertVerifierChoice::Custom(custom)),
+            "Custom"
+        );
+    }
+
+    #[test]
     fn test_verifier_choice_default_is_dangerous() {
         assert_eq!(
             ServerCertVerifierChoice::default(),
@@ -298,6 +346,58 @@ mod client_tests {
         let mut b = a.clone();
         b.defer_idle_timeout = Duration::from_secs(99);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_client_quic_config_partial_eq_different_verifier() {
+        let a = ClientQuicConfig::default();
+        let store = root_store_with_ca();
+        let webpki = WebPkiServerVerifier::builder(Arc::new(store))
+            .build()
+            .unwrap();
+
+        let mut custom = a.clone();
+        custom.verifier = ServerCertVerifierChoice::Custom(Arc::new(DangerousServerCertVerifier));
+        assert_ne!(a, custom);
+
+        let mut webpki_choice = a.clone();
+        webpki_choice.verifier = ServerCertVerifierChoice::WebPki(webpki);
+        assert_ne!(a, webpki_choice);
+    }
+
+    #[test]
+    fn test_client_quic_config_partial_eq_different_components() {
+        let a = ClientQuicConfig::default();
+
+        let mut strategy = a.clone();
+        strategy.stream_strategy_factory = Arc::new(ConsistentConcurrency::new);
+        assert_ne!(a, strategy);
+
+        let mut qlogger = a.clone();
+        qlogger.qlogger = Arc::new(NoopLogger);
+        assert_ne!(a, qlogger);
+
+        let mut token_sink = a.clone();
+        token_sink.token_sink = Arc::new(NoopTokenRegistry);
+        assert_ne!(a, token_sink);
+    }
+
+    #[test]
+    fn test_client_quic_config_debug() {
+        let cfg = ClientQuicConfig {
+            alpns: vec![b"h3".to_vec()],
+            ..ClientQuicConfig::default()
+        };
+
+        let rendered = format!("{cfg:?}");
+        assert!(rendered.contains("ClientQuicConfig"));
+        assert!(rendered.contains("defer_idle_timeout: 0ns"));
+        assert!(rendered.contains("enable_0rtt: false"));
+        assert!(rendered.contains("enable_sslkeylog: false"));
+        assert!(rendered.contains("alpns: 1"));
+        assert!(rendered.contains("verifier: Dangerous"));
+        assert!(rendered.contains(".."));
+        assert!(!rendered.contains("stream_strategy_factory"));
     }
 
     #[test]
@@ -335,5 +435,30 @@ mod client_tests {
         // b has the new values
         assert_eq!(b.defer_idle_timeout, Duration::from_secs(99));
         assert!(!b.alpns.is_empty());
+    }
+
+    #[test]
+    fn test_client_quic_config_mutate_arc_fields_does_not_affect_clone() {
+        let a = ClientQuicConfig::default();
+        let mut b = a.clone();
+
+        // Replace trait-object Arcs in the clone.
+        b.stream_strategy_factory = Arc::new(ConsistentConcurrency::new);
+        b.qlogger = Arc::new(NoopLogger);
+        b.token_sink = Arc::new(NoopTokenRegistry);
+
+        // Other value fields stay unchanged and only trait-object identities diverge.
+        assert_eq!(a.defer_idle_timeout, b.defer_idle_timeout);
+        assert_eq!(a.enable_0rtt, b.enable_0rtt);
+        assert_eq!(a.enable_sslkeylog, b.enable_sslkeylog);
+        assert_eq!(a.parameters, b.parameters);
+        assert_eq!(a.alpns, b.alpns);
+        assert_eq!(a.verifier, b.verifier);
+        assert!(!Arc::ptr_eq(
+            &a.stream_strategy_factory,
+            &b.stream_strategy_factory
+        ));
+        assert!(!Arc::ptr_eq(&a.qlogger, &b.qlogger));
+        assert!(!Arc::ptr_eq(&a.token_sink, &b.token_sink));
     }
 }

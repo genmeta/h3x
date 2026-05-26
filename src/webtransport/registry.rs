@@ -188,6 +188,7 @@ impl SessionStreamRouter {
 mod tests {
     use std::{
         collections::VecDeque,
+        panic::{AssertUnwindSafe, catch_unwind},
         pin::Pin,
         sync::{Arc, Mutex},
         task::{Context, Poll},
@@ -324,6 +325,14 @@ mod tests {
 
     fn uni_stream(id: u32) -> RoutedUniStream {
         test_read_stream(id, vec![id as u8])
+    }
+
+    fn poison_registry(registry: &Registry) {
+        let registry = registry.clone();
+        let _ = catch_unwind(AssertUnwindSafe(move || {
+            let _guard = registry.inner.lock().expect("registry lock should succeed");
+            panic!("poison registry mutex");
+        }));
     }
 
     #[test]
@@ -474,5 +483,43 @@ mod tests {
 
         assert!(registry.route_bi(session_id, bidi_stream(99)).is_err());
         assert!(registry.route_uni(session_id, uni_stream(100)).is_err());
+    }
+
+    #[tokio::test]
+    async fn poisoned_registry_surfaces_errors_and_preserves_streams() {
+        let registry = Registry::default();
+        let session_id = StreamId::from(VarInt::from_u32(12));
+        poison_registry(&registry);
+
+        let error = registry
+            .register(session_id)
+            .expect_err("poisoned registry should reject new registrations");
+        assert!(matches!(error, RegisterSessionError::RegistryPoisoned));
+        assert_eq!(registry.len(), 0);
+
+        registry.unregister(session_id);
+
+        let mut returned_bidi = registry
+            .route_bi(session_id, bidi_stream(13))
+            .expect_err("poisoned registry should return routed bidi stream");
+        assert_eq!(
+            returned_bidi
+                .0
+                .stream_id()
+                .await
+                .expect("returned bidi stream id should be readable"),
+            VarInt::from_u32(13)
+        );
+
+        let mut returned_uni = registry
+            .route_uni(session_id, uni_stream(14))
+            .expect_err("poisoned registry should return routed uni stream");
+        assert_eq!(
+            returned_uni
+                .stream_id()
+                .await
+                .expect("returned uni stream id should be readable"),
+            VarInt::from_u32(14)
+        );
     }
 }

@@ -485,7 +485,7 @@ mod tests {
 
     use bytes::Bytes;
     use dhttp_identity::identity::SignError;
-    use futures::{SinkExt, channel::oneshot};
+    use futures::{SinkExt, StreamExt, channel::oneshot};
     use rustls::{SignatureAlgorithm, SignatureScheme, pki_types::CertificateDer};
 
     use super::*;
@@ -776,6 +776,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn qpack_initial_stream_helpers_write_expected_stream_types() {
+        let (mut encoder_reader, encoder_writer) =
+            quic::test::mock_stream_pair(VarInt::from_u32(0));
+        let encoder_stream = UnidirectionalStream::initial_qpack_encoder_stream(SinkWriter::new(
+            Box::pin(encoder_writer) as BoxWriteStream,
+        ))
+        .await
+        .expect("encoder stream init");
+        let mut encoder_writer = encoder_stream.into_inner();
+        encoder_writer.flush_inner().await.expect("encoder flush");
+        assert_eq!(
+            encoder_reader
+                .next()
+                .await
+                .expect("encoder bytes")
+                .expect("encoder stream read"),
+            Bytes::from_static(&[0x02]),
+        );
+
+        let (mut decoder_reader, decoder_writer) =
+            quic::test::mock_stream_pair(VarInt::from_u32(0));
+        let decoder_stream = UnidirectionalStream::initial_qpack_decoder_stream(SinkWriter::new(
+            Box::pin(decoder_writer) as BoxWriteStream,
+        ))
+        .await
+        .expect("decoder stream init");
+        let mut decoder_writer = decoder_stream.into_inner();
+        decoder_writer.flush_inner().await.expect("decoder flush");
+        assert_eq!(
+            decoder_reader
+                .next()
+                .await
+                .expect("decoder bytes")
+                .expect("decoder stream read"),
+            Bytes::from_static(&[0x03]),
+        );
+    }
+
+    #[tokio::test]
+    async fn qpack_test_helpers_cover_mock_connection_error_paths() {
+        use dhttp_identity::identity::{LocalAgent as _, RemoteAgent as _};
+
+        let local = TestLocalAgent;
+        assert_eq!(local.name(), "test.local");
+        assert!(local.cert_chain().is_empty());
+        assert_eq!(local.sign_algorithm(), SignatureAlgorithm::ECDSA);
+        let sign_error = local
+            .sign(SignatureScheme::ED25519, b"payload")
+            .await
+            .expect_err("unsupported scheme should fail");
+        assert!(matches!(
+            sign_error,
+            SignError::UnsupportedScheme {
+                scheme: SignatureScheme::ED25519,
+            }
+        ));
+
+        let remote = TestRemoteAgent;
+        assert_eq!(remote.name(), "test.remote");
+        assert!(remote.cert_chain().is_empty());
+
+        let conn = MockConnection::with_open_uni_available(false);
+        quic::Lifecycle::close(&conn, Code::H3_NO_ERROR, Cow::Borrowed("ignored"));
+        assert!(quic::Lifecycle::check(&conn).is_ok());
+        let closed = quic::Lifecycle::closed(&conn).await;
+        match closed {
+            quic::ConnectionError::Transport { source } => {
+                assert_eq!(source.reason, "connection closed");
+            }
+            error => panic!("unexpected close error: {error:?}"),
+        }
+
+        assert!(
+            quic::WithLocalAgent::local_agent(&conn)
+                .await
+                .expect("local agent query")
+                .is_none()
+        );
+        assert!(
+            quic::WithRemoteAgent::remote_agent(&conn)
+                .await
+                .expect("remote agent query")
+                .is_none()
+        );
+
+        assert!(quic::ManageStream::open_bi(&conn).await.is_err());
+        assert!(quic::ManageStream::accept_bi(&conn).await.is_err());
+        assert!(quic::ManageStream::accept_uni(&conn).await.is_err());
+        assert!(quic::ManageStream::open_uni(&conn).await.is_err());
+        assert_eq!(
+            conn.stream_calls(),
+            vec!["open_bi", "accept_bi", "accept_uni", "open_uni"]
+        );
+
+        let mut sink = instruction_sink::<EncoderInstruction>();
+        sink.send(EncoderInstruction::SetDynamicTableCapacity { capacity: 1 })
+            .await
+            .expect("instruction sink accepts values");
+    }
+
+    #[tokio::test]
+    async fn qpack_protocol_trait_access_and_connection_state_accessor_work() {
+        let protocol = qpack_protocol();
+        let protocol_ref: &dyn Protocol = &protocol;
+
+        assert!(matches!(
+            protocol_ref
+                .accept_uni(peekable_uni_from_bytes(&[0x00]).await)
+                .await
+                .expect("trait object uni verdict"),
+            StreamVerdict::Passed(_)
+        ));
+        assert!(matches!(
+            protocol_ref
+                .accept_bi(peekable_bi_stream())
+                .await
+                .expect("trait object bi verdict"),
+            StreamVerdict::Passed(_)
+        ));
+
+        let conn = Arc::new(MockConnection::with_open_uni_available(true));
+        let disabled_state = ConnectionState::new_for_test(conn.clone(), Arc::default());
+        assert!(matches!(disabled_state.qpack(), Err(QPackProtocolDisabled)));
+
+        let mut protocols = Protocols::new();
+        protocols.insert(qpack_protocol());
+        let protocols = Arc::new(protocols);
+        let enabled_state = ConnectionState::new_for_test(conn, protocols.clone());
+        assert!(std::ptr::eq(
+            enabled_state.qpack().expect("qpack protocol should exist"),
+            protocols
+                .get::<QPackProtocol>()
+                .expect("protocol registry should contain qpack"),
+        ));
+    }
+
+    #[tokio::test]
     async fn qpack_protocol_accepts_encoder_and_decoder_unidirectional_streams() {
         let protocol = qpack_protocol();
 
@@ -883,6 +1020,29 @@ mod tests {
             "DHttpLayer must be initialized before QPackLayer"
         );
         assert!(conn.stream_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn qpack_protocol_factory_product_trait_init_matches_inherent_init() {
+        let conn = Arc::new(MockConnection::with_open_uni_available(true));
+        let dhttp = DHttpProtocolFactory::default()
+            .init(&conn)
+            .await
+            .expect("dhttp init");
+        let mut protocols = Protocols::new();
+        protocols.insert(dhttp);
+
+        let protocol = ProductProtocol::init(&QPackProtocolFactory::new(), &conn, &protocols)
+            .await
+            .expect("trait init");
+
+        tokio::task::yield_now().await;
+
+        assert_eq!(conn.stream_calls(), vec!["open_uni"]);
+        assert_eq!(
+            format!("{protocol:?}"),
+            "QPackLayer { encoder: \"...\", decoder: \"...\" }"
+        );
     }
 
     #[tokio::test]

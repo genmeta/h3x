@@ -606,7 +606,7 @@ mod tests {
     };
 
     use bytes::{Buf, Bytes};
-    use futures::{Sink, SinkExt, Stream};
+    use futures::{Sink, SinkExt, Stream, future::poll_fn};
     use tokio::{sync::mpsc, time::timeout};
 
     use super::{MessageStreamError, ReadStream, WriteStream, guard};
@@ -618,7 +618,7 @@ mod tests {
         message::test::{read_stream_for_test, write_stream_for_test},
         protocol::{Protocol, Protocols, StreamVerdict},
         qpack::protocol::{QPackDecoder, QPackEncoder, QPackProtocolFactory},
-        quic::{self, GetStreamIdExt},
+        quic::{self, CancelStream, GetStreamId, GetStreamIdExt, StopStream},
         varint::VarInt,
     };
 
@@ -1021,6 +1021,55 @@ mod tests {
         )
     }
 
+    async fn read_stream_with_bytes(stream_id: u32, bytes: &[u8]) -> ReadStream {
+        let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
+        writer
+            .send(Bytes::copy_from_slice(bytes))
+            .await
+            .expect("write test stream bytes");
+        writer.close().await.expect("close test stream writer");
+
+        ReadStream::new(
+            StreamReader::new(guard::GuardedQuicReader::new(
+                Box::pin(reader) as crate::codec::BoxReadStream
+            )),
+            Arc::new(QPackDecoder::new(
+                Arc::new(Settings::default()),
+                qpack_decoder_sink(),
+                qpack_decoder_stream(),
+            )),
+            state_without_qpack(Arc::new(MockConnection::new())).erase(),
+        )
+    }
+
+    fn paired_message_streams(stream_id: u32) -> (ReadStream, WriteStream) {
+        let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
+        let read_stream = ReadStream::new(
+            StreamReader::new(guard::GuardedQuicReader::new(
+                Box::pin(reader) as crate::codec::BoxReadStream
+            )),
+            Arc::new(QPackDecoder::new(
+                Arc::new(Settings::default()),
+                qpack_decoder_sink(),
+                qpack_decoder_stream(),
+            )),
+            state_without_qpack(Arc::new(MockConnection::new())).erase(),
+        );
+        let write_stream = WriteStream::new(
+            SinkWriter::new(guard::GuardedQuicWriter::new(
+                Box::pin(writer) as crate::codec::BoxWriteStream
+            )),
+            Arc::new(QPackEncoder::new(
+                Arc::new(Settings::default()),
+                qpack_encoder_sink(),
+                qpack_encoder_stream(),
+            )),
+            state_without_qpack(Arc::new(MockConnection::new())).erase(),
+        );
+
+        (read_stream, write_stream)
+    }
+
     #[tokio::test]
     async fn read_stream_try_stream_io_aborts_when_peer_goaway_covers_stream() {
         let erased: Arc<dyn quic::DynConnection> = Arc::new(MockConnection::new());
@@ -1358,6 +1407,207 @@ mod tests {
                 source: quic::StreamError::Reset { code }
             }) if code == reset_code
         ));
+    }
+
+    #[tokio::test]
+    async fn read_data_frame_chunk_skips_reserved_and_empty_frames_before_payload() {
+        let mut stream = read_stream_with_bytes(
+            16,
+            &[
+                0x21, 0x00, // reserved frame
+                0x00, 0x00, // empty DATA frame
+                0x00, 0x03, b'a', b'b', b'c',
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            stream
+                .read_data_frame_chunk()
+                .await
+                .expect("payload chunk should decode"),
+            Some(Bytes::from_static(b"abc"))
+        );
+        assert_eq!(
+            stream
+                .read_data_frame_chunk()
+                .await
+                .expect("stream should end cleanly after payload"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn read_data_frame_chunk_reports_unexpected_frame_types() {
+        let mut stream = read_stream_with_bytes(17, &[0x04, 0x00]).await;
+
+        let error = stream
+            .read_data_frame_chunk()
+            .await
+            .expect_err("settings frame on request stream should be rejected");
+
+        assert!(matches!(
+            error,
+            StreamError::Connection {
+                source: crate::connection::ConnectionError::H3 { source }
+            } if source.code() == Code::H3_FRAME_UNEXPECTED
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_header_frame_decodes_empty_headers_and_then_eof() {
+        let (mut reader, mut writer) = paired_message_streams(18);
+        writer
+            .write_header(std::iter::empty::<crate::qpack::field::FieldLine>())
+            .await
+            .expect("empty header section should encode");
+        writer.close().await.expect("writer should close cleanly");
+
+        let header = reader
+            .read_header_frame()
+            .await
+            .expect("header frame should decode")
+            .expect("header frame should be present");
+        assert!(header.is_empty());
+        assert!(
+            reader
+                .read_header_frame()
+                .await
+                .expect("stream should end cleanly")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_and_write_stream_traits_delegate_to_inner_streams() {
+        let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
+        let stop_code = VarInt::from_u32(51);
+        let cancel_code = VarInt::from_u32(52);
+        let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let mut reader = ReadStream::new(
+            StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
+                stream_id: VarInt::from_u32(19),
+                stop_tx,
+            })
+                as crate::codec::BoxReadStream)),
+            Arc::new(QPackDecoder::new(
+                Arc::new(Settings::default()),
+                qpack_decoder_sink(),
+                qpack_decoder_stream(),
+            )),
+            state.clone(),
+        );
+        let mut writer = WriteStream::new(
+            SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
+                stream_id: VarInt::from_u32(20),
+                cancel_tx,
+            })
+                as crate::codec::BoxWriteStream)),
+            Arc::new(QPackEncoder::new(
+                Arc::new(Settings::default()),
+                qpack_encoder_sink(),
+                qpack_encoder_stream(),
+            )),
+            state,
+        );
+
+        assert_eq!(
+            poll_fn(|cx| Pin::new(&mut reader).poll_stream_id(cx))
+                .await
+                .expect("reader stream id"),
+            VarInt::from_u32(19)
+        );
+        poll_fn(|cx| Pin::new(&mut reader).poll_stop(cx, stop_code))
+            .await
+            .expect("reader stop");
+        assert_eq!(
+            timeout(Duration::from_secs(1), stop_rx.recv())
+                .await
+                .expect("reader stop should be observed")
+                .expect("stop code should be sent"),
+            stop_code,
+        );
+
+        assert_eq!(
+            poll_fn(|cx| Pin::new(&mut writer).poll_stream_id(cx))
+                .await
+                .expect("writer stream id"),
+            VarInt::from_u32(20)
+        );
+        poll_fn(|cx| Pin::new(&mut writer).poll_cancel(cx, cancel_code))
+            .await
+            .expect("writer cancel");
+        assert_eq!(
+            timeout(Duration::from_secs(1), cancel_rx.recv())
+                .await
+                .expect("writer cancel should be observed")
+                .expect("cancel code should be sent"),
+            cancel_code,
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_stream_error_resets_and_stops_or_cancels_streams() {
+        let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
+        let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let mut reader = ReadStream::new(
+            StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
+                stream_id: VarInt::from_u32(21),
+                stop_tx,
+            })
+                as crate::codec::BoxReadStream)),
+            Arc::new(QPackDecoder::new(
+                Arc::new(Settings::default()),
+                qpack_decoder_sink(),
+                qpack_decoder_stream(),
+            )),
+            state.clone(),
+        );
+        let mut writer = WriteStream::new(
+            SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
+                stream_id: VarInt::from_u32(22),
+                cancel_tx,
+            })
+                as crate::codec::BoxWriteStream)),
+            Arc::new(QPackEncoder::new(
+                Arc::new(Settings::default()),
+                qpack_encoder_sink(),
+                qpack_encoder_stream(),
+            )),
+            state,
+        );
+
+        let read_error = reader
+            .handle_stream_error(crate::error::H3MessageError::MissingHeaderSection.into())
+            .await;
+        let write_error = writer
+            .handle_stream_error(crate::error::H3MessageError::MissingHeaderSection.into())
+            .await;
+
+        assert!(matches!(
+            read_error,
+            quic::StreamError::Reset { code } if code == VarInt::from(Code::H3_MESSAGE_ERROR)
+        ));
+        assert!(matches!(
+            write_error,
+            quic::StreamError::Reset { code } if code == VarInt::from(Code::H3_MESSAGE_ERROR)
+        ));
+        assert_eq!(
+            timeout(Duration::from_secs(1), stop_rx.recv())
+                .await
+                .expect("reader stop should be observed")
+                .expect("stop code should be sent"),
+            VarInt::from(Code::H3_MESSAGE_ERROR),
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(1), cancel_rx.recv())
+                .await
+                .expect("writer cancel should be observed")
+                .expect("cancel code should be sent"),
+            VarInt::from(Code::H3_MESSAGE_ERROR),
+        );
     }
 
     #[tokio::test]

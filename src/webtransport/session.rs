@@ -290,17 +290,23 @@ mod tests {
 
     use bytes::Bytes;
     use dhttp_identity::identity as agent;
-    use futures::{Sink, SinkExt, Stream, StreamExt, future::pending};
+    use futures::{Sink, SinkExt, Stream, StreamExt, future, future::pending};
+    use tokio::time::{Duration, timeout};
     use tokio_util::task::AbortOnDropHandle;
     use tracing::Instrument;
 
     use super::*;
     use crate::{
+        codec::StreamReader,
         connection::{ConnectionState, tests::MockConnection},
+        dhttp::{protocol::DHttpProtocol, settings::Settings},
         extended_connect::EstablishedConnect,
-        message::test::{read_stream_for_test, write_stream_for_test},
+        message::{
+            stream::{ReadStream, guard},
+            test::{read_stream_for_test, write_stream_for_test},
+        },
         protocol::Protocols,
-        qpack::field::Protocol,
+        qpack::{field::Protocol, protocol::QPackDecoder},
         quic,
         stream_id::StreamId,
         varint::VarInt,
@@ -416,6 +422,86 @@ mod tests {
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
         ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum HeaderFailureMode {
+        SendOnCall(usize),
+        Flush,
+    }
+
+    #[derive(Debug)]
+    struct HeaderFailWriteStream {
+        mode: HeaderFailureMode,
+        send_calls: usize,
+        state: Arc<StreamState>,
+        stream_id: VarInt,
+    }
+
+    impl Sink<Bytes> for HeaderFailWriteStream {
+        type Error = quic::StreamError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+            self.send_calls += 1;
+            if matches!(self.mode, HeaderFailureMode::SendOnCall(call) if call == self.send_calls) {
+                return Err(quic::StreamError::Reset {
+                    code: VarInt::from_u32(0xe0 + self.send_calls as u32),
+                });
+            }
+
+            self.state
+                .written
+                .lock()
+                .expect("written lock poisoned")
+                .extend_from_slice(&item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if matches!(self.mode, HeaderFailureMode::Flush) {
+                return Poll::Ready(Err(quic::StreamError::Reset {
+                    code: VarInt::from_u32(0xef),
+                }));
+            }
+
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl quic::GetStreamId for HeaderFailWriteStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
+        }
+    }
+
+    impl quic::CancelStream for HeaderFailWriteStream {
+        fn poll_cancel(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
             Poll::Ready(Ok(()))
         }
     }
@@ -548,6 +634,82 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct HeaderFailConnection {
+        mode: HeaderFailureMode,
+        state: Arc<StreamState>,
+    }
+
+    impl quic::ManageStream for HeaderFailConnection {
+        type StreamReader = TestReadStream;
+        type StreamWriter = HeaderFailWriteStream;
+
+        async fn open_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            Ok((
+                TestReadStream {
+                    state: Arc::clone(&self.state),
+                    chunks: VecDeque::new(),
+                    stream_id: VarInt::from_u32(21),
+                },
+                HeaderFailWriteStream {
+                    mode: self.mode,
+                    send_calls: 0,
+                    state: Arc::clone(&self.state),
+                    stream_id: VarInt::from_u32(21),
+                },
+            ))
+        }
+
+        async fn open_uni(&self) -> Result<Self::StreamWriter, quic::ConnectionError> {
+            Ok(HeaderFailWriteStream {
+                mode: self.mode,
+                send_calls: 0,
+                state: Arc::clone(&self.state),
+                stream_id: VarInt::from_u32(22),
+            })
+        }
+
+        async fn accept_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            pending().await
+        }
+
+        async fn accept_uni(&self) -> Result<Self::StreamReader, quic::ConnectionError> {
+            pending().await
+        }
+    }
+
+    impl quic::WithLocalAgent for HeaderFailConnection {
+        type LocalAgent = TestLocalAgent;
+
+        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+            Ok(None)
+        }
+    }
+
+    impl quic::WithRemoteAgent for HeaderFailConnection {
+        type RemoteAgent = TestRemoteAgent;
+
+        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+            Ok(None)
+        }
+    }
+
+    impl quic::Lifecycle for HeaderFailConnection {
+        fn close(&self, _code: crate::error::Code, _reason: Cow<'static, str>) {}
+
+        fn check(&self) -> Result<(), quic::ConnectionError> {
+            Ok(())
+        }
+
+        async fn closed(&self) -> quic::ConnectionError {
+            pending().await
+        }
+    }
+
     fn connection_with_webtransport() -> Arc<ConnectionState<dyn quic::DynConnection>> {
         let quic = Arc::new(MockConnection::new());
         let erased: Arc<dyn quic::DynConnection> = quic.clone();
@@ -606,6 +768,124 @@ mod tests {
             _control_task: noop_task(),
         };
         (registry, session)
+    }
+
+    fn open_session_with_closed_receivers(
+        session_id: StreamId,
+        conn: Arc<dyn quic::DynConnection>,
+    ) -> WebTransportSession {
+        let registry = Registry::default();
+        let registered = registry
+            .register(session_id)
+            .expect("session registration should succeed");
+        let (_bidi_tx, bidi_rx) = mpsc::channel(1);
+        let (_uni_tx, uni_rx) = mpsc::channel(1);
+
+        WebTransportSession {
+            state: Arc::clone(&registered.state),
+            bidi_rx: tokio::sync::Mutex::new(bidi_rx),
+            uni_rx: tokio::sync::Mutex::new(uni_rx),
+            conn,
+            _control_task: noop_task(),
+        }
+    }
+
+    fn qpack_decoder_sink() -> Pin<
+        Box<
+            dyn Sink<
+                    crate::qpack::decoder::DecoderInstruction,
+                    Error = crate::connection::StreamError,
+                > + Send,
+        >,
+    > {
+        Box::pin(
+            futures::sink::drain::<crate::qpack::decoder::DecoderInstruction>()
+                .sink_map_err(|never| match never {}),
+        )
+    }
+
+    fn qpack_decoder_stream() -> Pin<
+        Box<
+            dyn Stream<
+                    Item = Result<
+                        crate::qpack::encoder::EncoderInstruction,
+                        crate::connection::StreamError,
+                    >,
+                > + Send,
+        >,
+    > {
+        Box::pin(futures::stream::empty::<
+            Result<crate::qpack::encoder::EncoderInstruction, crate::connection::StreamError>,
+        >())
+    }
+
+    async fn read_stream_with_bytes(stream_id: u32, bytes: &[u8]) -> ReadStream {
+        let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
+        writer
+            .send(Bytes::copy_from_slice(bytes))
+            .await
+            .expect("write test stream bytes");
+        writer.close().await.expect("close test stream writer");
+
+        let quic = Arc::new(MockConnection::new());
+        let erased: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased.clone()));
+        let state = ConnectionState::new_for_test(quic, Arc::new(protocols)).erase();
+
+        ReadStream::new(
+            StreamReader::new(guard::GuardedQuicReader::new(
+                Box::pin(reader) as crate::codec::BoxReadStream
+            )),
+            Arc::new(QPackDecoder::new(
+                Arc::new(Settings::default()),
+                qpack_decoder_sink(),
+                qpack_decoder_stream(),
+            )),
+            state,
+        )
+    }
+
+    async fn read_stream_with_reset(stream_id: u32, code: VarInt) -> ReadStream {
+        use crate::quic::CancelStreamExt;
+
+        let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
+        writer
+            .cancel(code)
+            .await
+            .expect("send reset to test stream reader");
+        drop(writer);
+
+        let quic = Arc::new(MockConnection::new());
+        let erased: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased.clone()));
+        let state = ConnectionState::new_for_test(quic, Arc::new(protocols)).erase();
+
+        ReadStream::new(
+            StreamReader::new(guard::GuardedQuicReader::new(
+                Box::pin(reader) as crate::codec::BoxReadStream
+            )),
+            Arc::new(QPackDecoder::new(
+                Arc::new(Settings::default()),
+                qpack_decoder_sink(),
+                qpack_decoder_stream(),
+            )),
+            state,
+        )
+    }
+
+    async fn wait_until_session_closed(session: &WebTransportSession) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if session.state.check_open().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session should close before timeout");
     }
 
     fn assert_transport_reason(error: &quic::ConnectionError, expected_reason: &str) {
@@ -686,6 +966,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn debug_includes_session_id() {
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
+            state: Arc::new(StreamState::default()),
+        });
+        let (_registry, session) =
+            session_with_connection(StreamId::from(VarInt::from_u32(4)), conn);
+
+        let formatted = format!("{session:?}");
+        assert!(formatted.contains("WebTransportSession"));
+        assert!(formatted.contains(&format!("{:?}", session.id())));
+    }
+
+    #[tokio::test]
     async fn open_bi_writes_webtransport_header_and_keeps_writer_usable() {
         let stream_state = Arc::new(StreamState::default());
         let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
@@ -706,6 +999,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_bi_maps_header_write_failure_on_first_signal_write() {
+        let stream_state = Arc::new(StreamState::default());
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(HeaderFailConnection {
+            mode: HeaderFailureMode::SendOnCall(1),
+            state: Arc::clone(&stream_state),
+        });
+        let (_registry, session) =
+            session_with_connection(StreamId::from(VarInt::from_u32(4)), conn);
+
+        assert!(matches!(
+            session.open_bi().await,
+            Err(OpenStreamError::WriteHeader { .. })
+        ));
+        assert!(stream_state.written().is_empty());
+    }
+
+    #[tokio::test]
     async fn open_uni_writes_webtransport_header_and_keeps_writer_usable() {
         let stream_state = Arc::new(StreamState::default());
         let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
@@ -723,6 +1033,40 @@ mod tests {
         assert_eq!(stream_state.written(), vec![0x40, 0x54, 0x04, 0xcc]);
         assert!(stream_state.flushes() >= 1);
         assert!(stream_state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_uni_maps_header_write_failure_on_session_id_write() {
+        let stream_state = Arc::new(StreamState::default());
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(HeaderFailConnection {
+            mode: HeaderFailureMode::SendOnCall(1),
+            state: Arc::clone(&stream_state),
+        });
+        let (_registry, session) =
+            session_with_connection(StreamId::from(VarInt::from_u32(4)), conn);
+
+        assert!(matches!(
+            session.open_uni().await,
+            Err(OpenStreamError::WriteHeader { .. })
+        ));
+        assert!(stream_state.written().is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_bi_maps_header_flush_failure() {
+        let stream_state = Arc::new(StreamState::default());
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(HeaderFailConnection {
+            mode: HeaderFailureMode::Flush,
+            state: Arc::clone(&stream_state),
+        });
+        let (_registry, session) =
+            session_with_connection(StreamId::from(VarInt::from_u32(4)), conn);
+
+        assert!(matches!(
+            session.open_bi().await,
+            Err(OpenStreamError::WriteHeader { .. })
+        ));
+        assert_eq!(stream_state.written(), vec![0x40, 0x41, 0x04]);
     }
 
     #[tokio::test]
@@ -773,6 +1117,23 @@ mod tests {
             session.open_uni().await,
             Err(OpenStreamError::Closed { .. })
         ));
+        assert!(matches!(
+            session.accept_bi().await,
+            Err(AcceptStreamError::Closed { .. })
+        ));
+        assert!(matches!(
+            session.accept_uni().await,
+            Err(AcceptStreamError::Closed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_streams_map_dropped_receivers_to_closed_errors() {
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
+            state: Arc::new(StreamState::default()),
+        });
+        let session = open_session_with_closed_receivers(StreamId::from(VarInt::from_u32(4)), conn);
+
         assert!(matches!(
             session.accept_bi().await,
             Err(AcceptStreamError::Closed { .. })
@@ -939,5 +1300,76 @@ mod tests {
                 .expect_err("recv_datagram should be unsupported"),
             DatagramError::Unsupported
         ));
+    }
+
+    #[tokio::test]
+    async fn control_task_closes_session_after_connect_stream_payload_and_eof() {
+        let registry = Registry::default();
+        let session_id = StreamId::from(VarInt::from_u32(24));
+        let registered = registry
+            .register(session_id)
+            .expect("session registration should succeed");
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
+            state: Arc::new(StreamState::default()),
+        });
+        let connect = EstablishedConnect::ready(
+            session_id,
+            Some(Protocol::new(WEBTRANSPORT_H3)),
+            connection_without_webtransport(),
+            read_stream_with_bytes(24, &[0x00, 0x03, b'a', b'b', b'c']).await,
+            write_stream_for_test(session_id.0),
+        );
+
+        let session = WebTransportSession::from_registered(registered, conn, connect);
+        wait_until_session_closed(&session).await;
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn control_task_closes_session_after_connect_stream_read_error() {
+        let registry = Registry::default();
+        let session_id = StreamId::from(VarInt::from_u32(25));
+        let registered = registry
+            .register(session_id)
+            .expect("session registration should succeed");
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
+            state: Arc::new(StreamState::default()),
+        });
+        let connect = EstablishedConnect::ready(
+            session_id,
+            Some(Protocol::new(WEBTRANSPORT_H3)),
+            connection_without_webtransport(),
+            read_stream_with_reset(25, VarInt::from_u32(0xaa)).await,
+            write_stream_for_test(session_id.0),
+        );
+
+        let session = WebTransportSession::from_registered(registered, conn, connect);
+        wait_until_session_closed(&session).await;
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn control_task_closes_session_when_connect_takeover_fails() {
+        let registry = Registry::default();
+        let session_id = StreamId::from(VarInt::from_u32(26));
+        let registered = registry
+            .register(session_id)
+            .expect("session registration should succeed");
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
+            state: Arc::new(StreamState::default()),
+        });
+        let connect = EstablishedConnect::pending(
+            session_id,
+            Some(Protocol::new(WEBTRANSPORT_H3)),
+            connection_without_webtransport(),
+            read_stream_for_test(session_id.0),
+            future::ready(Err(
+                crate::extended_connect::PendingWriteStreamError::Aborted,
+            )),
+        );
+
+        let session = WebTransportSession::from_registered(registered, conn, connect);
+        wait_until_session_closed(&session).await;
+        assert_eq!(registry.len(), 0);
     }
 }

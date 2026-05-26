@@ -481,6 +481,13 @@ mod tests {
         assert_eq!(source.code(), Code::H3_MESSAGE_ERROR);
     }
 
+    fn assert_no_source(error: &(dyn std::error::Error + 'static)) {
+        assert!(
+            error.source().is_none(),
+            "expected no source, got {error:?}"
+        );
+    }
+
     #[test]
     fn decode_error_io_roundtrips_and_classifies_plain_eof() {
         let cases = [
@@ -528,6 +535,62 @@ mod tests {
         let other = io::Error::new(io::ErrorKind::InvalidData, "plain invalid data");
         let other = EncodeError::try_from(other).expect_err("plain error should be preserved");
         assert_eq!(other.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn codec_leaf_errors_have_expected_display_debug_and_source() {
+        let decode_cases = [
+            (
+                DecodeError::Incomplete,
+                "stream closed unexpectedly",
+                "Incomplete",
+            ),
+            (
+                DecodeError::IntegerOverflow,
+                "integer too large (overflow u64)",
+                "IntegerOverflow",
+            ),
+            (
+                DecodeError::InvalidHuffmanCode,
+                "invalid huffman code",
+                "InvalidHuffmanCode",
+            ),
+            (
+                DecodeError::ArithmeticOverflow,
+                "arithmetic overflow while decoding",
+                "ArithmeticOverflow",
+            ),
+            (
+                DecodeError::DecompressionFailed,
+                "QPACK decompression failed",
+                "DecompressionFailed",
+            ),
+        ];
+
+        for (error, display, debug_fragment) in decode_cases {
+            assert_eq!(error.to_string(), display);
+            assert!(format!("{error:?}").contains(debug_fragment));
+            assert_no_source(&error);
+        }
+
+        let encode_cases = [
+            (
+                EncodeError::FramePayloadTooLarge,
+                "frame payload too large (overflow 2^62-1)",
+                "FramePayloadTooLarge",
+            ),
+            (
+                EncodeError::HuffmanEncoding,
+                "header name/value contains bytes out of QPACK allowed range",
+                "HuffmanEncoding",
+            ),
+        ];
+
+        for (error, display, debug_fragment) in encode_cases {
+            assert_eq!(error.to_string(), display);
+            assert!(format!("{error:?}").contains(debug_fragment));
+            assert_no_source(&error);
+        }
     }
 
     #[test]
@@ -689,6 +752,79 @@ mod tests {
     }
 
     #[test]
+    fn stream_decode_error_display_debug_source_and_quic_conversion() {
+        let connection = StreamDecodeError::Connection {
+            source: connection_error("connection display"),
+        };
+        assert_eq!(
+            connection.to_string(),
+            "transport error (0x1 in frame 0x2): connection display"
+        );
+        assert!(format!("{connection:?}").contains("Connection"));
+        assert_no_source(&connection);
+        let io_error = io::Error::from(connection);
+        assert_eq!(io_error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            io_error.get_ref().expect("wrapped error").to_string(),
+            "transport error (0x1 in frame 0x2): connection display"
+        );
+
+        let reset = StreamDecodeError::Reset { code: varint(55) };
+        assert_eq!(reset.to_string(), "stream reset with code 55");
+        assert!(format!("{reset:?}").contains("Reset"));
+        assert_no_source(&reset);
+        let io_error = io::Error::from(reset);
+        assert_eq!(io_error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(io_error.to_string(), "stream reset with code 55");
+
+        let decode = StreamDecodeError::Decode {
+            source: DecodeError::DecompressionFailed,
+        };
+        assert_eq!(decode.to_string(), "QPACK decompression failed");
+        assert!(format!("{decode:?}").contains("Decode"));
+        assert_no_source(&decode);
+        assert_eq!(io::Error::from(decode).kind(), io::ErrorKind::InvalidData);
+
+        let converted = StreamDecodeError::from(transport_error("quic decode from conn"));
+        let StreamDecodeError::Connection { source } = converted else {
+            panic!("expected connection variant");
+        };
+        assert_connection_reason(&source, "quic decode from conn");
+
+        let converted = ConnectionDecodeError::from(transport_error("quic conn decode"));
+        let ConnectionDecodeError::Connection { source } = converted else {
+            panic!("expected connection variant");
+        };
+        assert_connection_reason(&source, "quic conn decode");
+    }
+
+    #[test]
+    fn connection_decode_error_display_debug_and_source() {
+        let connection = ConnectionDecodeError::Connection {
+            source: connection_error("connection decode display"),
+        };
+        assert_eq!(
+            connection.to_string(),
+            "transport error (0x1 in frame 0x2): connection decode display"
+        );
+        assert!(format!("{connection:?}").contains("Connection"));
+        assert_no_source(&connection);
+
+        let decode = ConnectionDecodeError::Decode {
+            source: DecodeError::ArithmeticOverflow,
+        };
+        assert_eq!(decode.to_string(), "arithmetic overflow while decoding");
+        assert!(format!("{decode:?}").contains("Decode"));
+        assert_no_source(&decode);
+        let io_error = io::Error::from(decode);
+        assert_eq!(io_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            io_error.get_ref().expect("wrapped error").to_string(),
+            "arithmetic overflow while decoding"
+        );
+    }
+
+    #[test]
     fn stream_encode_escalation_covers_all_branches() {
         let error = StreamEncodeError::Connection {
             source: connection_error("connection"),
@@ -813,5 +949,96 @@ mod tests {
             source: EncodeError::FramePayloadTooLarge,
         });
         assert_eq!(io_error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn stream_encode_error_display_debug_source_and_quic_conversion() {
+        let connection = StreamEncodeError::Connection {
+            source: connection_error("encode connection display"),
+        };
+        assert_eq!(
+            connection.to_string(),
+            "transport error (0x1 in frame 0x2): encode connection display"
+        );
+        assert!(format!("{connection:?}").contains("Connection"));
+        assert_no_source(&connection);
+        let io_error = io::Error::from(connection);
+        assert_eq!(io_error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            io_error.get_ref().expect("wrapped error").to_string(),
+            "transport error (0x1 in frame 0x2): encode connection display"
+        );
+
+        let reset = StreamEncodeError::Reset { code: varint(88) };
+        assert_eq!(reset.to_string(), "stream reset with code 88");
+        assert!(format!("{reset:?}").contains("Reset"));
+        assert_no_source(&reset);
+        let io_error = io::Error::from(reset);
+        assert_eq!(io_error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(io_error.to_string(), "stream reset with code 88");
+
+        let encode = StreamEncodeError::Encode {
+            source: EncodeError::FramePayloadTooLarge,
+        };
+        assert_eq!(
+            encode.to_string(),
+            "frame payload too large (overflow 2^62-1)"
+        );
+        assert!(format!("{encode:?}").contains("Encode"));
+        assert_no_source(&encode);
+        assert_eq!(io::Error::from(encode).kind(), io::ErrorKind::InvalidData);
+
+        let converted = StreamEncodeError::from(application_error("quic encode from conn"));
+        let StreamEncodeError::Connection { source } = converted else {
+            panic!("expected connection variant");
+        };
+        let connection::ConnectionError::Quic {
+            source: quic::ConnectionError::Application { source },
+        } = source
+        else {
+            panic!("expected application error");
+        };
+        assert_eq!(source.reason.as_ref(), "quic encode from conn");
+
+        let converted = ConnectionEncodeError::from(application_error("quic conn encode"));
+        let ConnectionEncodeError::Connection { source } = converted else {
+            panic!("expected connection variant");
+        };
+        let connection::ConnectionError::Quic {
+            source: quic::ConnectionError::Application { source },
+        } = source
+        else {
+            panic!("expected application error");
+        };
+        assert_eq!(source.reason.as_ref(), "quic conn encode");
+    }
+
+    #[test]
+    fn connection_encode_error_display_debug_and_source() {
+        let connection = ConnectionEncodeError::Connection {
+            source: connection_error("connection encode display"),
+        };
+        assert_eq!(
+            connection.to_string(),
+            "transport error (0x1 in frame 0x2): connection encode display"
+        );
+        assert!(format!("{connection:?}").contains("Connection"));
+        assert_no_source(&connection);
+
+        let encode = ConnectionEncodeError::Encode {
+            source: EncodeError::HuffmanEncoding,
+        };
+        assert_eq!(
+            encode.to_string(),
+            "header name/value contains bytes out of QPACK allowed range"
+        );
+        assert!(format!("{encode:?}").contains("Encode"));
+        assert_no_source(&encode);
+        let io_error = io::Error::from(encode);
+        assert_eq!(io_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            io_error.get_ref().expect("wrapped error").to_string(),
+            "header name/value contains bytes out of QPACK allowed range"
+        );
     }
 }
