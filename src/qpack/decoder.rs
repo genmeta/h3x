@@ -661,29 +661,51 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, sync::Arc};
+    use std::{
+        collections::VecDeque,
+        io::Cursor,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
 
-    use bytes::Bytes;
+    use bytes::{Buf, Bytes};
+    use futures::{Sink, StreamExt, stream};
+    use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
 
     use super::{
-        DecoderInstruction, DecoderState, InvalidDynamicTableReference, QPackEncoderStreamError,
-        decompression_field_line_representation,
+        Decoder, DecoderInstruction, DecoderState, InvalidDynamicTableReference,
+        MessageStreamReader, QPackEncoderStreamError, decompression_field_line_representation,
     };
     use crate::{
+        buflist::BufList,
         codec::{DecodeFrom, EncodeInto},
+        connection::StreamError,
         dhttp::settings::Settings,
+        error::{Code, H3ConnectionError},
         qpack::{
             dynamic::DynamicTable,
-            field::{FieldLine, FieldLineRepresentation},
+            encoder::EncoderInstruction,
+            field::{EncodedFieldSectionPrefix, FieldLine, FieldLineRepresentation},
             settings::QpackMaxTableCapacity,
             r#static,
         },
+        quic::{self, GetStreamId, StopStream, StopStreamExt},
         varint::VarInt,
     };
 
     fn test_settings(capacity: u32) -> Arc<Settings> {
         let mut settings = Settings::default();
         settings.set(QpackMaxTableCapacity::setting(VarInt::from_u32(capacity)));
+        Arc::new(settings)
+    }
+
+    fn test_settings_with_max_field_section_size(capacity: u32, max_size: u32) -> Arc<Settings> {
+        let mut settings = Settings::default();
+        settings.set(QpackMaxTableCapacity::setting(VarInt::from_u32(capacity)));
+        settings.set(crate::dhttp::settings::MaxFieldSectionSize::setting(
+            VarInt::from_u32(max_size),
+        ));
         Arc::new(settings)
     }
 
@@ -705,6 +727,157 @@ mod tests {
         table
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingDecoderSink {
+        instructions: Arc<Mutex<Vec<DecoderInstruction>>>,
+    }
+
+    type RecordedDecoderInstructions = Arc<Mutex<Vec<DecoderInstruction>>>;
+    type TestEncoderStream =
+        stream::Iter<std::vec::IntoIter<Result<EncoderInstruction, StreamError>>>;
+    type TestDecoder = Decoder<RecordingDecoderSink, TestEncoderStream>;
+
+    impl Sink<DecoderInstruction> for RecordingDecoderSink {
+        type Error = StreamError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: DecoderInstruction) -> Result<(), Self::Error> {
+            self.instructions
+                .lock()
+                .expect("lock is not poisoned")
+                .push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn test_decoder(
+        settings: Arc<Settings>,
+        instructions: Vec<Result<EncoderInstruction, StreamError>>,
+    ) -> (TestDecoder, RecordedDecoderInstructions) {
+        let sink = RecordingDecoderSink::default();
+        let sent = sink.instructions.clone();
+        (
+            Decoder::new(settings, sink, stream::iter(instructions)),
+            sent,
+        )
+    }
+
+    pin_project_lite::pin_project! {
+        struct TestHeaderFrame {
+            stream_id: VarInt,
+            #[pin]
+            payload: Cursor<Vec<u8>>,
+        }
+    }
+
+    impl AsyncRead for TestHeaderFrame {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.project().payload.poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncBufRead for TestHeaderFrame {
+        fn poll_fill_buf(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<&[u8]>> {
+            self.project().payload.poll_fill_buf(cx)
+        }
+
+        fn consume(self: Pin<&mut Self>, amt: usize) {
+            self.project().payload.consume(amt);
+        }
+    }
+
+    impl GetStreamId for TestHeaderFrame {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            let this = self.project();
+            Poll::Ready(Ok(*this.stream_id))
+        }
+    }
+
+    async fn encode_header_payload(
+        prefix: EncodedFieldSectionPrefix,
+        representations: Vec<FieldLineRepresentation>,
+    ) -> Vec<u8> {
+        let mut payload = BufList::new();
+        prefix
+            .encode_into(&mut payload)
+            .await
+            .expect("prefix should encode");
+        for representation in representations {
+            representation
+                .encode_into(&mut payload)
+                .await
+                .expect("field line representation should encode");
+        }
+        payload.copy_to_bytes(payload.remaining()).to_vec()
+    }
+
+    struct TestReadStream {
+        stream_id: VarInt,
+        stop_codes: Arc<Mutex<Vec<VarInt>>>,
+        items: VecDeque<Result<Bytes, quic::StreamError>>,
+    }
+
+    impl futures::Stream for TestReadStream {
+        type Item = Result<Bytes, quic::StreamError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.items.pop_front())
+        }
+    }
+
+    impl GetStreamId for TestReadStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
+        }
+    }
+
+    impl StopStream for TestReadStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            self.stop_codes
+                .lock()
+                .expect("lock is not poisoned")
+                .push(code);
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[test]
     fn decoder_state_default_construction() {
         let state = DecoderState::new(test_settings(0));
@@ -712,6 +885,44 @@ mod tests {
         assert_eq!(state.dynamic_table.inserted_count, 0);
         assert_eq!(state.dynamic_table.known_received_count, 0);
         assert!(state.pending_instructions.is_empty());
+    }
+
+    #[test]
+    fn decoder_error_types_report_qpack_error_codes() {
+        let encoder_stream_errors = [
+            QPackEncoderStreamError::SetDynamicTableCapacityExceeded,
+            QPackEncoderStreamError::NoEvictableEntryForInsertion,
+            QPackEncoderStreamError::ReferencedStaticEntryNotExisted { index: 7 },
+            QPackEncoderStreamError::ReferencedDynamicEntryNotExisted { index: 11 },
+        ];
+
+        for error in encoder_stream_errors {
+            assert_eq!(error.code(), Code::QPACK_ENCODER_STREAM_ERROR);
+        }
+
+        let invalid_references = [
+            InvalidDynamicTableReference::IndexOverflow,
+            InvalidDynamicTableReference::ReferencedStaticEntryNotExisted { index: 7 },
+            InvalidDynamicTableReference::ReferencedDynamicEntryNotExisted { index: 11 },
+        ];
+
+        for error in invalid_references {
+            assert_eq!(error.code(), Code::QPACK_DECOMPRESSION_FAILED);
+        }
+    }
+
+    #[test]
+    fn decoder_wrapper_emit_and_known_received_count_delegate_to_state() {
+        let (decoder, _) = test_decoder(test_settings(128), Vec::new());
+
+        decoder.emit(DecoderInstruction::StreamCancellation { stream_id: 9 });
+
+        assert_eq!(decoder.known_received_count(), 0);
+        let state = decoder.state.lock().expect("lock is not poisoned");
+        assert_eq!(
+            state.pending_instructions.front(),
+            Some(&DecoderInstruction::StreamCancellation { stream_id: 9 })
+        );
     }
 
     #[test]
@@ -869,6 +1080,74 @@ mod tests {
     }
 
     #[test]
+    fn insert_with_dynamic_name_reference_reuses_existing_name() {
+        let mut state = DecoderState::new(test_settings(128));
+        state.set_dynamic_table_capacity(128).unwrap();
+        state
+            .insert_with_literal_name(Bytes::from_static(b"x-name"), Bytes::from_static(b"old"))
+            .expect("seed entry should fit");
+
+        state
+            .insert_with_name_reference(false, 0, Bytes::from_static(b"new"))
+            .expect("dynamic name reference should insert");
+
+        let entry = state
+            .dynamic_table
+            .get(1)
+            .expect("second entry should exist");
+        assert_eq!(entry.name, Bytes::from_static(b"x-name"));
+        assert_eq!(entry.value, Bytes::from_static(b"new"));
+        assert_eq!(state.table_inserted_count(), 2);
+    }
+
+    #[test]
+    fn insert_with_name_reference_evicts_acknowledged_entry_when_needed() {
+        let mut state = DecoderState::new(test_settings(80));
+        state.set_dynamic_table_capacity(80).unwrap();
+        state
+            .insert_with_literal_name(Bytes::from_static(b"x-old"), Bytes::from_static(b"old"))
+            .expect("seed entry should fit");
+
+        state
+            .insert_with_name_reference(true, 1, Bytes::from_static(b"/very/long/path/value"))
+            .expect("new entry should fit after eviction");
+
+        assert_eq!(state.dynamic_table.dropped_count, 1);
+        assert!(state.dynamic_table.get(0).is_none());
+        let entry = state
+            .dynamic_table
+            .get(1)
+            .expect("inserted entry should remain");
+        assert_eq!(entry.name, Bytes::from_static(b":path"));
+        assert_eq!(entry.value, Bytes::from_static(b"/very/long/path/value"));
+    }
+
+    #[test]
+    fn insert_with_literal_name_evicts_acknowledged_entry_when_needed() {
+        let mut state = DecoderState::new(test_settings(80));
+        state.set_dynamic_table_capacity(80).unwrap();
+        state
+            .insert_with_literal_name(Bytes::from_static(b"x-old"), Bytes::from_static(b"old"))
+            .expect("seed entry should fit");
+
+        state
+            .insert_with_literal_name(
+                Bytes::from_static(b"x-new"),
+                Bytes::from_static(b"larger-new-value"),
+            )
+            .expect("new literal should fit after eviction");
+
+        assert_eq!(state.dynamic_table.dropped_count, 1);
+        assert!(state.dynamic_table.get(0).is_none());
+        let entry = state
+            .dynamic_table
+            .get(1)
+            .expect("inserted entry should remain");
+        assert_eq!(entry.name, Bytes::from_static(b"x-new"));
+        assert_eq!(entry.value, Bytes::from_static(b"larger-new-value"));
+    }
+
+    #[test]
     fn insert_with_name_reference_errors_for_missing_references() {
         let mut state = DecoderState::new(test_settings(4096));
         state.set_dynamic_table_capacity(4096).unwrap();
@@ -917,6 +1196,221 @@ mod tests {
                 Err(QPackEncoderStreamError::ReferencedDynamicEntryNotExisted { index: 0 })
             ),
             "Expected missing dynamic entry error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_existing_entry_evicts_when_needed_and_updates_count() {
+        let mut state = DecoderState::new(test_settings(50));
+        state.set_dynamic_table_capacity(50).unwrap();
+        state
+            .insert_with_literal_name(Bytes::from_static(b"x-name"), Bytes::from_static(b"value"))
+            .expect("seed entry should fit");
+        state.pending_instructions.clear();
+
+        state
+            .duplicate(0)
+            .expect("duplicate should fit after eviction");
+
+        assert_eq!(state.dynamic_table.dropped_count, 1);
+        assert!(state.dynamic_table.get(0).is_none());
+        let entry = state.dynamic_table.get(1).expect("duplicate should remain");
+        assert_eq!(entry.name, Bytes::from_static(b"x-name"));
+        assert_eq!(entry.value, Bytes::from_static(b"value"));
+        assert_eq!(state.dynamic_table.known_received_count, 2);
+        assert_eq!(
+            state.pending_instructions.back(),
+            Some(&DecoderInstruction::InsertCountIncrement { increment: 1 })
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_instruction_until_applies_encoder_stream_mutations() {
+        let instructions = vec![
+            Ok(EncoderInstruction::SetDynamicTableCapacity { capacity: 128 }),
+            Ok(EncoderInstruction::InsertWithLiteralName {
+                name_huffman: false,
+                name: Bytes::from_static(b"x-name"),
+                value_huffman: false,
+                value: Bytes::from_static(b"value"),
+            }),
+            Ok(EncoderInstruction::InsertWithNameReference {
+                is_static: false,
+                name_index: 0,
+                huffman: false,
+                value: Bytes::from_static(b"referenced"),
+            }),
+            Ok(EncoderInstruction::Duplicate { index: 0 }),
+        ];
+        let (decoder, _) = test_decoder(test_settings(128), instructions);
+
+        decoder
+            .receive_instruction_until(3)
+            .await
+            .expect("encoder instructions should be applied");
+
+        let state = decoder.state.lock().expect("lock is not poisoned");
+        assert_eq!(state.dynamic_table.capacity, 128);
+        assert_eq!(state.dynamic_table.inserted_count, 3);
+        assert_eq!(
+            state.dynamic_table.get(1).expect("referenced entry").name,
+            Bytes::from_static(b"x-name")
+        );
+        assert_eq!(
+            state.dynamic_table.get(2).expect("duplicate entry").value,
+            Bytes::from_static(b"referenced")
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_instruction_until_returns_when_count_already_known() {
+        let (decoder, _) = test_decoder(test_settings(128), Vec::new());
+
+        decoder
+            .receive_instruction_until(0)
+            .await
+            .expect("zero required count is already known");
+    }
+
+    #[tokio::test]
+    async fn decode_emits_section_acknowledgment_for_dynamic_reference() {
+        let (decoder, sent) = test_decoder(test_settings(128), Vec::new());
+        {
+            let mut state = decoder.state.lock().expect("lock is not poisoned");
+            state.set_dynamic_table_capacity(128).unwrap();
+            state
+                .insert_with_literal_name(Bytes::from_static(b"x-name"), Bytes::from_static(b"ok"))
+                .expect("seed entry should fit");
+            state.pending_instructions.clear();
+        }
+
+        let prefix = EncodedFieldSectionPrefix {
+            encoded_insert_count: EncodedFieldSectionPrefix::encode_ric(1, 128),
+            sign: false,
+            delta_base: 0,
+        };
+        let payload = encode_header_payload(
+            prefix,
+            vec![FieldLineRepresentation::IndexedFieldLine {
+                is_static: false,
+                index: 0,
+            }],
+        )
+        .await;
+        let frame = TestHeaderFrame {
+            stream_id: VarInt::from_u32(23),
+            payload: Cursor::new(payload),
+        };
+
+        let section = decoder.decode(frame).await.expect("header should decode");
+
+        assert_eq!(
+            section.header_map.get("x-name").expect("x-name header"),
+            "ok"
+        );
+        assert_eq!(
+            sent.lock().expect("lock is not poisoned").as_slice(),
+            &[DecoderInstruction::SectionAcknowledgment { stream_id: 23 }]
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_field_section_that_exceeds_configured_limit() {
+        let (decoder, _) = test_decoder(
+            test_settings_with_max_field_section_size(128, 1),
+            Vec::new(),
+        );
+        let payload = encode_header_payload(
+            EncodedFieldSectionPrefix {
+                encoded_insert_count: 0,
+                sign: false,
+                delta_base: 0,
+            },
+            vec![FieldLineRepresentation::LiteralFieldLineWithLiteralName {
+                never_dynamic: false,
+                name_huffman: false,
+                name: Bytes::from_static(b"x-large"),
+                value_huffman: false,
+                value: Bytes::from_static(b"value"),
+            }],
+        )
+        .await;
+        let frame = TestHeaderFrame {
+            stream_id: VarInt::from_u32(31),
+            payload: Cursor::new(payload),
+        };
+
+        let error = decoder
+            .decode(frame)
+            .await
+            .expect_err("limit should reject field");
+
+        match error {
+            StreamError::H3 { source } => assert_eq!(source.code(), Code::H3_EXCESSIVE_LOAD),
+            error => panic!("unexpected error: {error:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn message_stream_reader_stop_and_reset_emit_stream_cancellation() {
+        let (decoder, _) = test_decoder(test_settings(128), Vec::new());
+        let decoder = Arc::new(decoder);
+        let stop_codes = Arc::new(Mutex::new(Vec::new()));
+        let mut stopped_reader = MessageStreamReader::new(
+            TestReadStream {
+                stream_id: VarInt::from_u32(41),
+                stop_codes: stop_codes.clone(),
+                items: VecDeque::new(),
+            },
+            decoder.clone(),
+        );
+
+        stopped_reader
+            .stop(VarInt::from_u32(7))
+            .await
+            .expect("stop should be forwarded");
+
+        assert_eq!(
+            stop_codes.lock().expect("lock is not poisoned").as_slice(),
+            &[VarInt::from_u32(7)]
+        );
+        assert_eq!(
+            decoder
+                .state
+                .lock()
+                .expect("lock is not poisoned")
+                .pending_instructions
+                .back(),
+            Some(&DecoderInstruction::StreamCancellation { stream_id: 41 })
+        );
+
+        let mut reset_reader = MessageStreamReader::new(
+            TestReadStream {
+                stream_id: VarInt::from_u32(43),
+                stop_codes,
+                items: VecDeque::from([Err(quic::StreamError::Reset {
+                    code: VarInt::from_u32(11),
+                })]),
+            },
+            decoder.clone(),
+        );
+
+        let item = reset_reader
+            .next()
+            .await
+            .expect("reset item should be yielded");
+        assert!(matches!(
+            item,
+            Err(quic::StreamError::Reset { code }) if code == VarInt::from_u32(11)
+        ));
+        assert_eq!(
+            decoder
+                .state
+                .lock()
+                .expect("lock is not poisoned")
+                .pending_instructions
+                .back(),
+            Some(&DecoderInstruction::StreamCancellation { stream_id: 43 })
         );
     }
 
