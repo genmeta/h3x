@@ -479,14 +479,83 @@ mod tests {
     use std::{
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
+        sync::{Arc, Mutex},
     };
 
+    use bytes::Bytes;
+    use futures::{SinkExt, channel::oneshot};
+
     use super::*;
+    use crate::codec::{BoxReadStream, BoxWriteStream, PeekableStreamReader, StreamReader};
 
     fn hash_of<T: Hash>(t: &T) -> u64 {
         let mut h = DefaultHasher::new();
         t.hash(&mut h);
         h.finish()
+    }
+
+    fn instruction_sink<Instruction: Send + 'static>() -> BoxInstructionSink<'static, Instruction> {
+        Box::pin(futures::sink::unfold((), |(), _instruction| async {
+            Ok::<(), StreamError>(())
+        }))
+    }
+
+    fn instruction_stream<Instruction: Send + 'static>()
+    -> BoxInstructionStream<'static, Instruction> {
+        Box::pin(futures::stream::pending())
+    }
+
+    fn qpack_protocol() -> QPackProtocol {
+        let (encoder_inst_receiver_tx, _encoder_inst_receiver_rx) =
+            oneshot::channel::<ErasedStreamReader>();
+        let (decoder_inst_receiver_tx, _decoder_inst_receiver_rx) =
+            oneshot::channel::<ErasedStreamReader>();
+
+        QPackProtocol {
+            encoder_inst_receiver_tx: Mutex::new(Some(encoder_inst_receiver_tx)),
+            encoder: Arc::new(Encoder::new(
+                Arc::<Settings>::default(),
+                instruction_sink::<EncoderInstruction>(),
+                instruction_stream::<DecoderInstruction>(),
+            )),
+            decoder_inst_receiver_tx: Mutex::new(Some(decoder_inst_receiver_tx)),
+            decoder: Arc::new(Decoder::new(
+                Arc::<Settings>::default(),
+                instruction_sink::<DecoderInstruction>(),
+                instruction_stream::<EncoderInstruction>(),
+            )),
+        }
+    }
+
+    async fn peekable_uni_from_bytes(bytes: &'static [u8]) -> ErasedPeekableUniStream {
+        let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(0));
+        if !bytes.is_empty() {
+            writer
+                .send(Bytes::from_static(bytes))
+                .await
+                .expect("send bytes");
+        }
+        writer.close().await.expect("close writer");
+        PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream))
+    }
+
+    fn peekable_bi_stream() -> ErasedPeekableBiStream {
+        let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(4));
+        (
+            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream)),
+            SinkWriter::new(Box::pin(writer) as BoxWriteStream),
+        )
+    }
+
+    fn assert_duplicate_stream_creation(error: StreamError, expected_message: &str) {
+        let StreamError::Connection { source } = error else {
+            panic!("expected connection-scoped stream error");
+        };
+        let crate::connection::ConnectionError::H3 { source } = source else {
+            panic!("expected h3 connection error");
+        };
+        assert_eq!(source.code(), Code::H3_STREAM_CREATION_ERROR);
+        assert_eq!(source.to_string(), expected_message);
     }
 
     #[test]
@@ -529,6 +598,110 @@ mod tests {
         assert_ne!(
             UnidirectionalStream::<()>::QPACK_ENCODER_STREAM_TYPE.into_inner(),
             UnidirectionalStream::<()>::QPACK_DECODER_STREAM_TYPE.into_inner(),
+        );
+    }
+
+    #[tokio::test]
+    async fn qpack_stream_type_helpers_identify_encoder_and_decoder_streams() {
+        let encoder_stream = UnidirectionalStream::initial_qpack_encoder_stream(tokio::io::sink())
+            .await
+            .expect("encoder stream");
+        assert!(encoder_stream.is_qpack_encoder_stream());
+        assert!(!encoder_stream.is_qpack_decoder_stream());
+
+        let decoder_stream = UnidirectionalStream::initial_qpack_decoder_stream(tokio::io::sink())
+            .await
+            .expect("decoder stream");
+        assert!(decoder_stream.is_qpack_decoder_stream());
+        assert!(!decoder_stream.is_qpack_encoder_stream());
+    }
+
+    #[tokio::test]
+    async fn qpack_protocol_accepts_encoder_and_decoder_unidirectional_streams() {
+        let protocol = qpack_protocol();
+
+        let encoder = peekable_uni_from_bytes(&[0x02]).await;
+        assert!(matches!(
+            protocol.accept_uni(encoder).await.expect("encoder verdict"),
+            StreamVerdict::Accepted
+        ));
+
+        let decoder = peekable_uni_from_bytes(&[0x03]).await;
+        assert!(matches!(
+            protocol.accept_uni(decoder).await.expect("decoder verdict"),
+            StreamVerdict::Accepted
+        ));
+    }
+
+    #[tokio::test]
+    async fn qpack_protocol_passes_unknown_or_incomplete_unidirectional_streams() {
+        let protocol = qpack_protocol();
+
+        let unknown = peekable_uni_from_bytes(&[0x00, b'h']).await;
+        assert!(matches!(
+            protocol.accept_uni(unknown).await.expect("unknown verdict"),
+            StreamVerdict::Passed(_)
+        ));
+
+        let incomplete = peekable_uni_from_bytes(&[]).await;
+        assert!(matches!(
+            protocol
+                .accept_uni(incomplete)
+                .await
+                .expect("incomplete verdict"),
+            StreamVerdict::Passed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn qpack_protocol_rejects_duplicate_instruction_streams_with_specific_errors() {
+        let protocol = qpack_protocol();
+
+        let first_encoder = peekable_uni_from_bytes(&[0x02]).await;
+        assert!(matches!(
+            protocol
+                .accept_uni(first_encoder)
+                .await
+                .expect("first encoder verdict"),
+            StreamVerdict::Accepted
+        ));
+        let second_encoder = peekable_uni_from_bytes(&[0x02]).await;
+        let error = match protocol.accept_uni(second_encoder).await {
+            Ok(_) => panic!("duplicate encoder should fail"),
+            Err(error) => error,
+        };
+        assert_duplicate_stream_creation(error, "qpack encoder stream already exists");
+
+        let first_decoder = peekable_uni_from_bytes(&[0x03]).await;
+        assert!(matches!(
+            protocol
+                .accept_uni(first_decoder)
+                .await
+                .expect("first decoder verdict"),
+            StreamVerdict::Accepted
+        ));
+        let second_decoder = peekable_uni_from_bytes(&[0x03]).await;
+        let error = match protocol.accept_uni(second_decoder).await {
+            Ok(_) => panic!("duplicate decoder should fail"),
+            Err(error) => error,
+        };
+        assert_duplicate_stream_creation(error, "qpack decoder stream already exists");
+    }
+
+    #[tokio::test]
+    async fn qpack_protocol_passes_bidirectional_streams_and_formats_disabled_error() {
+        let protocol = qpack_protocol();
+        assert!(matches!(
+            protocol
+                .accept_bi(peekable_bi_stream())
+                .await
+                .expect("bidi verdict"),
+            StreamVerdict::Passed(_)
+        ));
+
+        assert_eq!(
+            QPackProtocolDisabled.to_string(),
+            "qpack protocol is disabled"
         );
     }
 }
