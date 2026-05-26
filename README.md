@@ -7,7 +7,7 @@ High-performance asynchronous DHTTP/3 implementation in Rust.
 - **Zero-Copy**: Achieves full-link *zero-copy* from the QUIC layer to the application layer.
 - **Multipath QUIC**: Integrates the `dquic` implementation, featuring efficient transmission, robust authentication capabilities, and high extensibility.
 - **Hyper / Tower Compatibility** *(feature `hyper`, enabled by default)*: Provides `TowerService` and `HyperService` adapters to run existing Tower or hyper services (e.g. `axum`) over DHTTP/3. Since h3x cannot construct hyper's internal types, the `h3x::hyper` module provides its own alternatives for upgrade and protocol negotiation.
-- **Remoc** *(feature `remoc`, experimental)*: Optional [`remoc`](https://crates.io/crates/remoc) integration for remote trait calls (RTC) over QUIC connections. This is an experimental feature and the API may change.
+- **RPC / IPC** *(features `rpc` and `ipc`, experimental)*: Optional [`remoc`](https://crates.io/crates/remoc) integration for remote trait calls (RTC) over QUIC connections, with optional IPC transport support. Consumers must select exactly one `remoc/default-codec-*` feature; h3x tests use the bincode codec through a dev-dependency.
 - **Extended CONNECT**: Supports [Extended CONNECT (RFC9220)](https://datatracker.ietf.org/doc/html/rfc9220) for protocol tunneling over HTTP/3.
 - **Future Extensions**: Plans to support extensions such as [WebTransport over HTTP/3 (Draft)](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-14).
 
@@ -121,3 +121,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+### Testing and Coverage
+
+h3x uses one canonical test entrypoint for local development and CI:
+
+```bash
+cargo test --all-features --all-targets
+```
+
+All feature-gated paths, including `rpc`, `ipc`, `webtransport`, `dquic`, and `hyper`, must compile and test through that command. The dev-dependency on `remoc` selects the bincode default codec for tests so `rpc`/`ipc` can compile under `--all-features`.
+
+Documentation is checked with warnings denied for all non-`rpc`/`ipc` features:
+
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features --features dquic,hyper,serde,testing,webtransport
+```
+
+Coverage uses `cargo-llvm-cov` directly:
+
+```bash
+cargo llvm-cov clean
+cargo llvm-cov \
+  --all-features \
+  --all-targets \
+  --summary-only \
+  --json \
+  --output-path target/llvm-cov/coverage.json \
+  --fail-under-lines 62 \
+  --fail-under-functions 59 \
+  --fail-under-regions 63
+cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
+cargo llvm-cov report --html --output-dir target/llvm-cov/html
+```
+
+The HTML report entrypoint is:
+
+```text
+target/llvm-cov/html/index.html
+```
+
+The initial coverage gate preserves the current baseline. Raise the gate only in commits that add meaningful tests or remove dead code.

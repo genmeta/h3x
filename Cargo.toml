@@ -86,10 +86,10 @@ dquic = [
 ]
 hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
-# EXPERIMENTAL — broken due to remoc 0.18 codec changes (--all-features SKIP)
-# Do not enable without also enabling a default-codec-* remoc feature.
+# EXPERIMENTAL — consumer crates must also enable exactly one remoc default-codec-* feature.
+# h3x tests select default-codec-bincode in [dev-dependencies] for all-features CI.
 rpc = ["dep:remoc", "serde", "bytes/serde"]
-# EXPERIMENTAL — depends on broken rpc feature
+# EXPERIMENTAL — depends on rpc and the same consumer-selected remoc codec.
 ipc = ["rpc", "dep:nix", "dep:smallvec", "tokio/net"]
 webtransport = []
 testing = []
