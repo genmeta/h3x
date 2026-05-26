@@ -335,10 +335,11 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use dhttp_identity::identity as agent;
+    use dhttp_identity::identity::{self as agent, LocalAgent as _, RemoteAgent as _};
     use futures::{
-        Sink, SinkExt, Stream,
+        FutureExt, Sink, SinkExt, Stream,
         future::{BoxFuture, pending},
+        task::noop_waker_ref,
     };
     use tokio::io::AsyncReadExt;
 
@@ -346,7 +347,10 @@ mod tests {
     use crate::{
         codec::{BoxReadStream, BoxWriteStream, PeekableStreamReader, SinkWriter, StreamReader},
         error::Code,
-        quic::{self, CancelStream, ConnectionError, GetStreamId, StopStream},
+        quic::{
+            self, CancelStream, ConnectionError, GetStreamId, Lifecycle, ManageStream, StopStream,
+            WithLocalAgent, WithRemoteAgent,
+        },
         varint::VarInt,
     };
 
@@ -858,6 +862,123 @@ mod tests {
         let a = MockFactoryFoo(1);
         let b = MockFactoryBar(1);
         assert_ne!(identity::<C, _>(a), identity::<C, _>(b));
+    }
+
+    #[tokio::test]
+    async fn mock_protocol_passes_uni_and_bi_streams() {
+        let protocol = MockProtocol;
+
+        let uni = protocol
+            .accept_uni(peekable_uni_stream_with_bytes(b"mp").await)
+            .await
+            .expect("mock protocol passes uni stream");
+        let StreamVerdict::Passed(mut uni) = uni else {
+            panic!("mock protocol must pass uni stream");
+        };
+        let mut uni_buf = [0; 2];
+        uni.read_exact(&mut uni_buf)
+            .await
+            .expect("read mock-passed uni bytes");
+        assert_eq!(&uni_buf, b"mp");
+
+        let bi = protocol
+            .accept_bi(peekable_bi_stream_with_bytes(b"mb").await)
+            .await
+            .expect("mock protocol passes bidi stream");
+        let StreamVerdict::Passed((mut reader, _writer)) = bi else {
+            panic!("mock protocol must pass bidi stream");
+        };
+        let mut bi_buf = [0; 2];
+        reader
+            .read_exact(&mut bi_buf)
+            .await
+            .expect("read mock-passed bidi bytes");
+        assert_eq!(&bi_buf, b"mb");
+    }
+
+    #[tokio::test]
+    async fn test_connection_support_traits_return_expected_values() {
+        let conn = TestConnection;
+
+        let local = conn
+            .local_agent()
+            .await
+            .expect("local agent lookup succeeds");
+        assert!(local.is_none());
+        let remote = conn
+            .remote_agent()
+            .await
+            .expect("remote agent lookup succeeds");
+        assert!(remote.is_none());
+        conn.check().expect("test connection health check succeeds");
+        conn.close(Code::H3_NO_ERROR, Cow::Borrowed("test close"));
+
+        assert!(conn.open_bi().now_or_never().is_none());
+        assert!(conn.open_uni().now_or_never().is_none());
+        assert!(conn.accept_bi().now_or_never().is_none());
+        assert!(conn.accept_uni().now_or_never().is_none());
+        assert!(conn.closed().now_or_never().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_agents_and_streams_expose_minimal_trait_behavior() {
+        let local = TestLocalAgent;
+        assert_eq!(local.name(), "test-local");
+        assert!(local.cert_chain().is_empty());
+        assert_eq!(local.sign_algorithm(), rustls::SignatureAlgorithm::ED25519);
+        assert_eq!(
+            local
+                .sign(rustls::SignatureScheme::ED25519, b"payload")
+                .await
+                .expect("test local agent signs"),
+            Vec::<u8>::new()
+        );
+
+        let remote = TestRemoteAgent;
+        assert_eq!(remote.name(), "test-remote");
+        assert!(remote.cert_chain().is_empty());
+
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        let mut reader = TestReadStream;
+        assert!(matches!(
+            Pin::new(&mut reader).poll_stream_id(&mut cx),
+            Poll::Ready(Ok(id)) if id == VarInt::from_u32(0)
+        ));
+        assert!(matches!(
+            Pin::new(&mut reader).poll_stop(&mut cx, VarInt::from_u32(7)),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            Pin::new(&mut reader).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+
+        let mut writer = TestWriteStream;
+        assert!(matches!(
+            Pin::new(&mut writer).poll_stream_id(&mut cx),
+            Poll::Ready(Ok(id)) if id == VarInt::from_u32(0)
+        ));
+        assert!(matches!(
+            Pin::new(&mut writer).poll_cancel(&mut cx, VarInt::from_u32(8)),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            Pin::new(&mut writer).poll_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        Pin::new(&mut writer)
+            .start_send(Bytes::from_static(b"ignored"))
+            .expect("writer send succeeds");
+        assert!(matches!(
+            Pin::new(&mut writer).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            Pin::new(&mut writer).poll_close(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
     }
 
     #[test]

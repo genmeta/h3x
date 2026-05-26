@@ -239,3 +239,119 @@ impl fmt::Display for BindHost {
         f.write_str(self.as_str())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
+
+    use super::*;
+    use crate::dquic::qbase::net::Family;
+
+    fn hash(host: &BindHost) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        host.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn classify_ip_and_glob_variants() {
+        let ipv4 = BindHost::classify("127.0.0.1", None).unwrap();
+        assert!(ipv4.is_ip_addr());
+        assert!(!ipv4.is_glob());
+        assert_eq!(ipv4.as_str(), "127.0.0.1");
+        assert_eq!(ipv4.as_ip_addr(), Some("127.0.0.1".parse().unwrap()));
+
+        let ipv6 = BindHost::classify("[::1]", None).unwrap();
+        assert!(ipv6.is_ip_addr());
+        assert_eq!(ipv6.as_str(), "::1");
+        assert_eq!(ipv6.families(), [Family::V4, Family::V6]);
+
+        let glob = BindHost::classify("en*", None).unwrap();
+        assert!(!glob.is_ip_addr());
+        assert!(glob.is_glob());
+        assert_eq!(glob.as_str(), "en*");
+        assert_eq!(glob.families(), [Family::V4, Family::V6]);
+    }
+
+    #[test]
+    fn classify_rejects_family_for_ip_and_falls_back_to_exact_on_bad_glob() {
+        let err = BindHost::classify("127.0.0.1", Some(Family::V4))
+            .expect_err("family prefix should be rejected for plain IP address");
+        assert_eq!(err, "family prefix is not valid for IP addresses");
+
+        let err = BindHost::classify("[::1]", Some(Family::V6))
+            .expect_err("family prefix should be rejected for bracketed IPv6");
+        assert_eq!(err, "family prefix is not valid for IP addresses");
+
+        let exact = BindHost::classify("[", None).unwrap();
+        assert!(matches!(exact, BindHost::Exact { family: None, ref nic } if nic == "["));
+        assert!(!exact.is_glob());
+        assert_eq!(exact.family(), None);
+        assert_eq!(exact.families(), [Family::V4, Family::V6]);
+    }
+
+    #[test]
+    fn host_matching_and_identity_accessors() {
+        let exact = BindHost::classify("enp17s0", Some(Family::V4)).unwrap();
+        assert_eq!(exact.family(), Some(Family::V4));
+        assert_eq!(exact.as_str(), "enp17s0");
+        assert!(!exact.matches("eth0"));
+        assert!(exact.matches("enp17s0"));
+
+        let ip = BindHost::classify("192.168.0.1", None).unwrap();
+        assert!(ip.is_ip_addr());
+        assert_eq!(ip.as_ip_addr().unwrap().to_string(), "192.168.0.1");
+        assert!(!ip.matches("192.168.0.1"));
+    }
+
+    #[test]
+    fn host_display_debug_and_hash() {
+        let literal = BindHost::classify("enp17s0", None).unwrap();
+        assert_eq!(format!("{literal}"), "enp17s0");
+        assert!(
+            matches!(&format!("{literal:?}"), s if s.contains("Glob") && s.contains("pattern"))
+        );
+        assert_eq!(
+            hash(&literal),
+            hash(&BindHost::classify("enp17s0", None).unwrap())
+        );
+
+        let exact = BindHost::classify("[", None).unwrap();
+        assert_eq!(format!("{exact}"), "[");
+        assert_eq!(exact.as_str(), "[");
+        assert!(matches!(&format!("{exact:?}"), s if s.contains("Exact") && s.contains("nic")));
+        assert_eq!(hash(&exact), hash(&BindHost::classify("[", None).unwrap()));
+
+        let ip = BindHost::classify("::1", None).unwrap();
+        let ip_debug = format!("{ip:?}");
+        assert!(ip_debug.contains("Ip"));
+        assert!(ip_debug.contains("addr"));
+        assert!(ip_debug.contains("repr"));
+        assert_eq!(format!("{ip}"), "::1");
+        assert_eq!(hash(&ip), hash(&BindHost::classify("::1", None).unwrap()));
+    }
+
+    #[test]
+    fn partial_eq_for_all_variants() {
+        let exact_a = BindHost::classify("[", None).unwrap();
+        let exact_b = BindHost::classify("[", None).unwrap();
+        assert_eq!(exact_a, exact_b);
+
+        let exact_c = BindHost::classify("[", Some(Family::V4)).unwrap();
+        assert_ne!(exact_a, exact_c);
+
+        let glob_a = BindHost::classify("en*", None).unwrap();
+        let glob_b = BindHost::classify("en*", Some(Family::V6)).unwrap();
+        assert_ne!(glob_a, glob_b);
+        assert_eq!(glob_a, BindHost::classify("en*", None).unwrap());
+
+        let ip_a = BindHost::classify("::1", None).unwrap();
+        let ip_b = BindHost::classify("::1", None).unwrap();
+        let ipv4 = BindHost::classify("127.0.0.1", None).unwrap();
+        assert_eq!(ip_a, ip_b);
+        assert_ne!(ip_a, ipv4);
+    }
+}

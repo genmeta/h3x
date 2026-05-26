@@ -402,11 +402,12 @@ mod tests {
         },
         qrecovery::streams::error::StreamError as DquicStreamError,
     };
+    use futures::{SinkExt, StreamExt};
     use http::uri::Authority;
     use tokio::time;
 
     use super::*;
-    use crate::quic::Lifecycle;
+    use crate::quic::{CancelStreamExt, GetStreamIdExt, Lifecycle, StopStreamExt};
 
     const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");
     const SERVER_KEY: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
@@ -478,6 +479,11 @@ mod tests {
             client: client_connection.expect("client should connect"),
             server: server_connection.expect("server should accept"),
         }
+    }
+
+    fn close_pair(pair: &ConnectedPair) {
+        Lifecycle::close(pair.client.as_ref(), Code::H3_NO_ERROR, Cow::Borrowed(""));
+        Lifecycle::close(pair.server.as_ref(), Code::H3_NO_ERROR, Cow::Borrowed(""));
     }
 
     fn assert_transport_error(
@@ -738,5 +744,114 @@ mod tests {
                 .await
                 .expect("verification should run")
         );
+    }
+
+    #[tokio::test]
+    async fn bidirectional_stream_wrappers_expose_ids_and_transfer_bytes() {
+        let pair = connected_pair().await;
+        let (mut client_reader, mut client_writer) =
+            with_timeout(quic::ManageStream::open_bi(pair.client.as_ref()))
+                .await
+                .expect("client opens stream");
+
+        let client_reader_id = client_reader.stream_id().await.expect("client reader id");
+        let client_writer_id = client_writer.stream_id().await.expect("client writer id");
+        assert_eq!(client_reader_id, client_writer_id);
+
+        client_writer
+            .send(Bytes::from_static(b"client payload"))
+            .await
+            .expect("client sends request bytes");
+
+        let (mut server_reader, mut server_writer) =
+            with_timeout(quic::ManageStream::accept_bi(pair.server.as_ref()))
+                .await
+                .expect("server accepts stream");
+        let server_reader_id = server_reader.stream_id().await.expect("server reader id");
+        let server_writer_id = server_writer.stream_id().await.expect("server writer id");
+        assert_eq!(server_reader_id, server_writer_id);
+        assert_eq!(client_reader_id, server_reader_id);
+        assert_eq!(server_reader.size_hint(), (0, None));
+
+        let received = with_timeout(server_reader.next())
+            .await
+            .expect("server receives a chunk")
+            .expect("server chunk is ok");
+        assert_eq!(received, Bytes::from_static(b"client payload"));
+
+        server_writer
+            .send(Bytes::from_static(b"server payload"))
+            .await
+            .expect("server sends response bytes");
+        let received = with_timeout(client_reader.next())
+            .await
+            .expect("client receives a chunk")
+            .expect("client chunk is ok");
+        assert_eq!(received, Bytes::from_static(b"server payload"));
+
+        with_timeout(client_writer.close())
+            .await
+            .expect("client writer closes");
+        with_timeout(server_writer.close())
+            .await
+            .expect("server writer closes");
+        close_pair(&pair);
+    }
+
+    #[tokio::test]
+    async fn unidirectional_stream_wrappers_expose_ids_and_transfer_bytes() {
+        let pair = connected_pair().await;
+        let mut client_writer = with_timeout(quic::ManageStream::open_uni(pair.client.as_ref()))
+            .await
+            .expect("client opens unidirectional stream");
+
+        let client_stream_id = client_writer.stream_id().await.expect("client writer id");
+        client_writer
+            .send(Bytes::from_static(b"one-way payload"))
+            .await
+            .expect("client sends unidirectional bytes");
+
+        let mut server_reader = with_timeout(quic::ManageStream::accept_uni(pair.server.as_ref()))
+            .await
+            .expect("server accepts unidirectional stream");
+        let server_stream_id = server_reader.stream_id().await.expect("server reader id");
+        assert_eq!(client_stream_id, server_stream_id);
+
+        let received = with_timeout(server_reader.next())
+            .await
+            .expect("server receives unidirectional chunk")
+            .expect("server unidirectional chunk is ok");
+        assert_eq!(received, Bytes::from_static(b"one-way payload"));
+
+        with_timeout(client_writer.close())
+            .await
+            .expect("client unidirectional writer closes");
+        close_pair(&pair);
+    }
+
+    #[tokio::test]
+    async fn stream_stop_and_cancel_wrappers_complete() {
+        let pair = connected_pair().await;
+        let mut client_writer = with_timeout(quic::ManageStream::open_uni(pair.client.as_ref()))
+            .await
+            .expect("client opens stream for stop");
+        client_writer
+            .send(Bytes::from_static(b"stop payload"))
+            .await
+            .expect("client sends bytes before stop");
+
+        let mut server_reader = with_timeout(quic::ManageStream::accept_uni(pair.server.as_ref()))
+            .await
+            .expect("server accepts stream for stop");
+
+        server_reader
+            .stop(VarInt::from_u32(0x10))
+            .await
+            .expect("stop-sending completes on reader wrapper");
+        client_writer
+            .cancel(VarInt::from_u32(0x11))
+            .await
+            .expect("reset completes on writer wrapper");
+        close_pair(&pair);
     }
 }

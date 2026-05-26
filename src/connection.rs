@@ -709,10 +709,11 @@ pub(crate) mod tests {
     use bytes::Bytes;
     use dhttp_identity::identity as agent;
     use futures::{Sink, future::BoxFuture, stream::Stream};
+    use tracing::Instrument;
 
     #[cfg(feature = "dquic")]
     use super::ConnectionBuilder;
-    use super::{Connection, ConnectionState, StreamError};
+    use super::{Connection, ConnectionState, LifecycleExt, StreamError};
     #[cfg(feature = "dquic")]
     use crate::{
         codec::{ErasedPeekableBiStream, ErasedPeekableUniStream},
@@ -1229,6 +1230,207 @@ pub(crate) mod tests {
         let a = ConnectionBuilder::<C>::new(s1);
         let b = ConnectionBuilder::<C>::new(s2);
         assert_ne!(a, b);
+    }
+
+    #[cfg(feature = "dquic")]
+    #[test]
+    fn builder_display_and_debug_list_protocol_initializers() {
+        let builder =
+            ConnectionBuilder::<C>::new(Arc::new(Settings::default())).protocol(MockFactory(7));
+
+        assert_eq!(
+            builder.to_string(),
+            "ConnectionBuilder[DHTTP/3, QPACK, MockFactory]"
+        );
+        let debug = format!("{builder:?}");
+        assert!(debug.contains("ConnectionBuilder"));
+        assert!(debug.contains("DHttpProtocolFactory"));
+        assert!(debug.contains("QPackProtocolFactory"));
+        assert!(debug.contains("MockFactory"));
+    }
+
+    #[tokio::test]
+    async fn builder_closes_quic_when_initial_protocol_init_fails() {
+        let quic = Arc::new(MockConnection::new());
+        let result = ConnectionBuilder::new(Arc::new(Settings::default()))
+            .build(quic.clone())
+            .await;
+
+        let error = result.expect_err("open_uni failure should abort connection build");
+        assert_transport_reason(&error, "open_uni unavailable");
+        assert_eq!(
+            quic.close_calls(),
+            vec![(Code::H3_NO_ERROR, "h3 build aborted".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_success_initializes_dhttp_and_qpack_protocols() {
+        let quic = Arc::new(MockConnection::new());
+        quic.enable_stream_ops();
+        let settings = Arc::new(Settings::default());
+
+        let connection = ConnectionBuilder::new(settings.clone())
+            .build(quic.clone())
+            .await
+            .expect("builder should initialize built-in protocols");
+
+        assert!(
+            connection
+                .protocol::<crate::dhttp::protocol::DHttpProtocol>()
+                .is_some()
+        );
+        assert!(connection.qpack().is_ok());
+        assert!(Arc::ptr_eq(&connection.settings(), &settings));
+        assert_eq!(quic.stream_calls()[0], "open_uni");
+
+        drop(connection);
+        assert!(
+            quic.close_calls()
+                .iter()
+                .any(|(code, reason)| *code == Code::H3_NO_ERROR && reason == "no error")
+        );
+    }
+
+    #[test]
+    fn state_accessors_return_underlying_quic_and_protocol_registry() {
+        let quic = Arc::new(MockConnection::new());
+        let protocols = Arc::new(Protocols::new());
+        let state = ConnectionState::new_for_test(quic.clone(), protocols.clone());
+
+        assert!(Arc::ptr_eq(state.quic(), &quic));
+        assert!(Arc::ptr_eq(state.protocols(), &protocols));
+        assert!(state.protocol::<MockProtocol>().is_none());
+        assert!(format!("{state:?}").contains("ConnectionState"));
+    }
+
+    #[tokio::test]
+    async fn state_open_stream_helpers_delegate_success_and_error_paths() {
+        let quic = MockConnection::new();
+        let state =
+            ConnectionState::new_for_test(Arc::new(quic.clone()), Arc::new(Protocols::new()));
+
+        let bi_error = state
+            .open_bi()
+            .await
+            .expect_err("open_bi should fail before enabled");
+        assert_transport_reason(&bi_error, "open_bi unavailable");
+        let uni_error = state
+            .open_uni()
+            .await
+            .expect_err("open_uni should fail before enabled");
+        assert_transport_reason(&uni_error, "open_uni unavailable");
+
+        quic.enable_stream_ops();
+        state
+            .open_bi()
+            .await
+            .expect("open_bi should delegate success");
+        state
+            .open_uni()
+            .await
+            .expect("open_uni should delegate success");
+
+        assert_eq!(
+            quic.stream_calls(),
+            vec!["open_bi", "open_uni", "open_bi", "open_uni"]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_and_remote_agent_accessors_delegate_on_concrete_state() {
+        let quic = MockConnection::new();
+        let state = ConnectionState::new_for_test(Arc::new(quic), Arc::new(Protocols::new()));
+
+        let local = state
+            .local_agent()
+            .await
+            .expect("local agent lookup should succeed")
+            .expect("local agent should be present");
+        assert_eq!(local.name(), "test-local");
+
+        let remote = state
+            .remote_agent()
+            .await
+            .expect("remote agent lookup should succeed")
+            .expect("remote agent should be present");
+        assert_eq!(remote.name(), "test-remote");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_ext_h3_error_closes_then_returns_terminal_error() {
+        let quic = MockConnection::new();
+        let quic_for_task = quic.clone();
+        let task = tokio::spawn(
+            async move {
+                quic_for_task
+                    .handle_connection_error(super::ConnectionError::from(H3MissingSettings))
+                    .await
+            }
+            .in_current_span(),
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !quic.close_calls().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("h3 error should close promptly");
+
+        assert_eq!(
+            quic.close_calls(),
+            vec![(
+                Code::H3_MISSING_SETTINGS,
+                "no SETTINGS frame at beginning of control stream".to_owned()
+            )]
+        );
+
+        quic.set_terminal_error(test_connection_error("after h3 close"));
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("closed should resolve")
+            .expect("task should not panic");
+        assert_transport_reason(&error, "after h3 close");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_ext_h3_error_returns_existing_terminal_error_without_closing() {
+        let quic = MockConnection::new();
+        quic.set_terminal_error(test_connection_error("already closed"));
+
+        let error = quic
+            .handle_connection_error(super::ConnectionError::from(H3MissingSettings))
+            .await;
+
+        assert_transport_reason(&error, "already closed");
+        assert!(quic.close_calls().is_empty());
+    }
+
+    #[test]
+    fn stream_error_from_connection_scope_h3_registry_variant() {
+        let error = StreamError::from(H3MissingSettings);
+
+        match error {
+            StreamError::Connection { source } => {
+                assert_connection_h3_code(source, Code::H3_MISSING_SETTINGS);
+            }
+            other => panic!("expected connection-scope stream error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_error_map_stream_reset_maps_only_reset_code() {
+        let reset_code = VarInt::from_u32(0x123);
+        let mapped = StreamError::Reset { code: reset_code }.map_stream_reset(|code| {
+            assert_eq!(code, reset_code);
+            StreamError::from(H3MessageError::MissingHeaderSection)
+        });
+
+        assert_stream_h3_code(mapped, Code::H3_MESSAGE_ERROR);
     }
 
     #[test]

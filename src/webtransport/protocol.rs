@@ -454,8 +454,225 @@ mod tests {
         assert!(state.cancelled_codes().is_empty());
     }
 
+    #[tokio::test]
+    async fn empty_bidi_stream_is_passed_through_without_side_effects() {
+        let state = Arc::new(StreamState::default());
+        let reader = test_reader(state.clone(), Vec::new());
+        let writer = test_writer(state.clone());
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_bi((reader, writer))
+            .await
+            .expect("routing should not fail");
+
+        let StreamVerdict::Passed((mut passed_reader, _passed_writer)) = verdict else {
+            panic!("unexpected verdict");
+        };
+        Pin::new(&mut passed_reader).reset();
+        let mut passed_reader = passed_reader.into_stream_reader();
+        assert!(passed_reader.next().await.is_none());
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_uni_stream_is_passed_through_without_side_effects() {
+        let state = Arc::new(StreamState::default());
+        let stream = test_reader(state.clone(), Vec::new());
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_uni(stream)
+            .await
+            .expect("routing should not fail");
+
+        let StreamVerdict::Passed(mut passed_stream) = verdict else {
+            panic!("unexpected verdict");
+        };
+        Pin::new(&mut passed_stream).reset();
+        let mut passed_stream = passed_stream.into_stream_reader();
+        assert!(passed_stream.next().await.is_none());
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_bidi_session_channel_rejects_and_aborts_extra_stream() {
+        let protocol = test_protocol();
+        let mut registered = protocol
+            .register(StreamId::from(VarInt::from_u32(42)))
+            .expect("session registration should succeed");
+
+        for _ in 0..16 {
+            let state = Arc::new(StreamState::default());
+            let reader = test_reader(
+                state.clone(),
+                vec![Bytes::from_static(&[0x40, 0x41, 0x2a, 0xde, 0xad])],
+            );
+            let writer = test_writer(state.clone());
+
+            let verdict = protocol
+                .accept_bi((reader, writer))
+                .await
+                .expect("routing should not fail");
+
+            assert!(matches!(verdict, StreamVerdict::Accepted));
+            assert!(state.stopped_codes().is_empty());
+            assert!(state.cancelled_codes().is_empty());
+        }
+
+        let overflow_state = Arc::new(StreamState::default());
+        let reader = test_reader(
+            overflow_state.clone(),
+            vec![Bytes::from_static(&[0x40, 0x41, 0x2a, 0xfa, 0xce])],
+        );
+        let writer = test_writer(overflow_state.clone());
+
+        let verdict = protocol
+            .accept_bi((reader, writer))
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert_eq!(
+            overflow_state.stopped_codes(),
+            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+        );
+        assert_eq!(
+            overflow_state.cancelled_codes(),
+            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+        );
+
+        let (mut routed_reader, _routed_writer) = registered
+            .bidi_rx
+            .recv()
+            .await
+            .expect("registered session should still retain queued streams");
+        assert_eq!(
+            routed_reader
+                .next()
+                .await
+                .expect("reader should yield a payload chunk")
+                .expect("payload chunk should succeed"),
+            Bytes::from_static(&[0xde, 0xad])
+        );
+    }
+
+    #[tokio::test]
+    async fn full_uni_session_channel_rejects_and_stops_extra_stream() {
+        let protocol = test_protocol();
+        let mut registered = protocol
+            .register(StreamId::from(VarInt::from_u32(42)))
+            .expect("session registration should succeed");
+
+        for _ in 0..16 {
+            let state = Arc::new(StreamState::default());
+            let stream = test_reader(
+                state.clone(),
+                vec![Bytes::from_static(&[0x40, 0x54, 0x2a, 0xbe, 0xef])],
+            );
+
+            let verdict = protocol
+                .accept_uni(stream)
+                .await
+                .expect("routing should not fail");
+
+            assert!(matches!(verdict, StreamVerdict::Accepted));
+            assert!(state.stopped_codes().is_empty());
+            assert!(state.cancelled_codes().is_empty());
+        }
+
+        let overflow_state = Arc::new(StreamState::default());
+        let stream = test_reader(
+            overflow_state.clone(),
+            vec![Bytes::from_static(&[0x40, 0x54, 0x2a, 0xca, 0xfe])],
+        );
+
+        let verdict = protocol
+            .accept_uni(stream)
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert_eq!(
+            overflow_state.stopped_codes(),
+            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+        );
+        assert!(overflow_state.cancelled_codes().is_empty());
+
+        let mut routed_reader = registered
+            .uni_rx
+            .recv()
+            .await
+            .expect("registered session should still retain queued streams");
+        assert_eq!(
+            routed_reader
+                .next()
+                .await
+                .expect("reader should yield a payload chunk")
+                .expect("payload chunk should succeed"),
+            Bytes::from_static(&[0xbe, 0xef])
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_init_keeps_connection_and_starts_empty() {
+        let conn = Arc::new(TestConnection);
+        let expected: Arc<dyn quic::DynConnection> = conn.clone();
+        let protocol = WebTransportProtocolFactory
+            .init(&conn, &Protocols::new())
+            .await
+            .expect("factory init should succeed");
+
+        assert!(Arc::ptr_eq(&protocol.connection(), &expected));
+        assert_eq!(
+            format!("{protocol:?}"),
+            "WebTransportProtocol { sessions: 0 }"
+        );
+    }
+
+    #[test]
+    fn new_for_test_connection_and_duplicate_registration_behave_consistently() {
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection);
+        let protocol = WebTransportProtocol::new_for_test(conn.clone());
+        let session_id = StreamId::from(VarInt::from_u32(42));
+
+        assert!(Arc::ptr_eq(&protocol.connection(), &conn));
+
+        let registered = protocol
+            .register(session_id)
+            .expect("session registration should succeed");
+        assert_eq!(registered.state.id(), session_id);
+
+        match protocol.register(session_id) {
+            Err(RegisterSessionError::AlreadyRegistered {
+                session_id: duplicate,
+            }) => assert_eq!(duplicate, session_id),
+            other => panic!("unexpected duplicate registration result: {other:?}"),
+        }
+
+        drop(registered);
+
+        protocol
+            .register(session_id)
+            .expect("dropped session should unregister and allow reuse");
+    }
+
     #[test]
     fn protocol_debug_and_factory_display_expose_session_count_and_name() {
+        use std::collections::{BTreeSet, HashSet};
+
+        let mut hash_set = HashSet::new();
+        hash_set.insert(WebTransportProtocolFactory);
+        hash_set.insert(WebTransportProtocolFactory);
+        assert_eq!(hash_set.len(), 1);
+
+        let mut btree_set = BTreeSet::new();
+        btree_set.insert(WebTransportProtocolFactory);
+        btree_set.insert(WebTransportProtocolFactory);
+        assert_eq!(btree_set.len(), 1);
+
         let protocol = test_protocol();
         assert_eq!(format!("{}", WebTransportProtocolFactory), "WebTransport");
         assert_eq!(
