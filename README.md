@@ -142,16 +142,17 @@ Coverage uses `cargo-llvm-cov` directly:
 
 ```bash
 cargo llvm-cov clean
+mkdir -p target/llvm-cov
 cargo llvm-cov \
   --all-features \
   --all-targets \
   --summary-only \
   --json \
-  --output-path target/coverage.json \
+  --output-path target/llvm-cov/coverage.json \
   --fail-under-lines 62 \
   --fail-under-functions 56 \
   --fail-under-regions 64
-cargo llvm-cov report --lcov --output-path target/lcov.info
+cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
 cargo llvm-cov report --html --output-dir target/llvm-cov
 ```
 
