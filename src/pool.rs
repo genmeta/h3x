@@ -277,15 +277,28 @@ impl<C: quic::Connection> Pool<C> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        io,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
+    use dhttp_identity::identity::RemoteAgent;
     use http::uri::Authority;
+    use tokio::sync::Semaphore;
     use tokio_util::task::AbortOnDropHandle;
 
-    use super::{Pool, ReuseableConnection};
+    use super::{ConnectError, InsertError, Pool, ReuseableConnection};
     use crate::{
-        connection::{Connection, ConnectionState},
-        dhttp::{goaway::Goaway, protocol::DHttpProtocol},
+        connection::{Connection, ConnectionBuilder, ConnectionState},
+        dhttp::{
+            goaway::Goaway,
+            protocol::DHttpProtocol,
+            settings::{Setting, Settings},
+        },
         quic,
         varint::VarInt,
     };
@@ -304,12 +317,232 @@ mod tests {
         AbortOnDropHandle::new(tokio::spawn(async {}))
     }
 
+    fn matching_server() -> Authority {
+        "test-remote:443".parse().unwrap()
+    }
+
+    fn inserted_identity() -> Authority {
+        "test-remote".parse().unwrap()
+    }
+
+    fn alternate_builder() -> Arc<ConnectionBuilder<crate::connection::tests::MockConnection>> {
+        let mut settings = Settings::default();
+        settings.set(Setting::new(VarInt::from_u32(0x21), VarInt::from_u32(0x07)));
+        Arc::new(ConnectionBuilder::new(Arc::new(settings)))
+    }
+
+    fn mock_connection(
+        quic: crate::connection::tests::MockConnection,
+    ) -> Connection<crate::connection::tests::MockConnection> {
+        Connection::from_state_for_test(ConnectionState::new_for_test(
+            Arc::new(quic),
+            Arc::new(crate::protocol::Protocols::new()),
+        ))
+    }
+
+    fn mock_connection_with_dhttp(
+        quic: crate::connection::tests::MockConnection,
+    ) -> Connection<crate::connection::tests::MockConnection> {
+        let mut protocols = crate::protocol::Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(Arc::new(quic.clone())));
+        Connection::from_state_for_test(ConnectionState::new_for_test(
+            Arc::new(quic),
+            Arc::new(protocols),
+        ))
+    }
+
     async fn reusable_connection(
         connection: Connection<crate::connection::tests::MockConnection>,
     ) -> Arc<ReuseableConnection<crate::connection::tests::MockConnection>> {
         let reusable = Arc::new(ReuseableConnection::pending());
         reusable.insert(Arc::new(connection), abort_handle()).await;
         reusable
+    }
+
+    async fn wait_until(label: &str, f: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !f() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestConnector {
+        state: Arc<TestConnectorState>,
+    }
+
+    #[derive(Debug)]
+    struct TestConnectorState {
+        calls: AtomicUsize,
+        error_message: Option<&'static str>,
+        returned_quics: Mutex<Vec<crate::connection::tests::MockConnection>>,
+        gate_first_call: Option<Arc<Semaphore>>,
+    }
+
+    impl TestConnector {
+        fn succeed() -> Self {
+            Self {
+                state: Arc::new(TestConnectorState {
+                    calls: AtomicUsize::new(0),
+                    error_message: None,
+                    returned_quics: Mutex::new(Vec::new()),
+                    gate_first_call: None,
+                }),
+            }
+        }
+
+        fn succeed_with_first_call_gate() -> (Self, Arc<Semaphore>) {
+            let gate = Arc::new(Semaphore::new(0));
+            (
+                Self {
+                    state: Arc::new(TestConnectorState {
+                        calls: AtomicUsize::new(0),
+                        error_message: None,
+                        returned_quics: Mutex::new(Vec::new()),
+                        gate_first_call: Some(gate.clone()),
+                    }),
+                },
+                gate,
+            )
+        }
+
+        fn fail(message: &'static str) -> Self {
+            Self {
+                state: Arc::new(TestConnectorState {
+                    calls: AtomicUsize::new(0),
+                    error_message: Some(message),
+                    returned_quics: Mutex::new(Vec::new()),
+                    gate_first_call: None,
+                }),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.state.calls.load(Ordering::SeqCst)
+        }
+
+        fn returned_quics(&self) -> Vec<crate::connection::tests::MockConnection> {
+            self.state
+                .returned_quics
+                .lock()
+                .expect("returned quics log poisoned")
+                .clone()
+        }
+    }
+
+    impl quic::Connect for TestConnector {
+        type Connection = crate::connection::tests::MockConnection;
+        type Error = io::Error;
+
+        async fn connect(&self, _server: &Authority) -> Result<Arc<Self::Connection>, Self::Error> {
+            let call = self.state.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0
+                && let Some(gate) = &self.state.gate_first_call
+            {
+                gate.acquire()
+                    .await
+                    .expect("gate should not be closed")
+                    .forget();
+            }
+            if let Some(message) = self.state.error_message {
+                return Err(io::Error::other(message));
+            }
+
+            let quic = crate::connection::tests::MockConnection::new();
+            quic.enable_stream_ops();
+            self.state
+                .returned_quics
+                .lock()
+                .expect("returned quics log poisoned")
+                .push(quic.clone());
+            Ok(Arc::new(quic))
+        }
+    }
+
+    #[derive(Debug)]
+    struct NamedRemoteAgent(&'static str);
+
+    impl RemoteAgent for NamedRemoteAgent {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
+            &[]
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct IdentityOverrideConnection {
+        inner: crate::connection::tests::MockConnection,
+        remote_name: Option<&'static str>,
+    }
+
+    impl IdentityOverrideConnection {
+        fn new(remote_name: Option<&'static str>) -> Self {
+            Self {
+                inner: crate::connection::tests::MockConnection::new(),
+                remote_name,
+            }
+        }
+    }
+
+    impl quic::ManageStream for IdentityOverrideConnection {
+        type StreamReader = crate::connection::tests::TestReadStream;
+        type StreamWriter = crate::connection::tests::TestWriteStream;
+
+        async fn open_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            quic::ManageStream::open_bi(&self.inner).await
+        }
+
+        async fn open_uni(&self) -> Result<Self::StreamWriter, quic::ConnectionError> {
+            quic::ManageStream::open_uni(&self.inner).await
+        }
+
+        async fn accept_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            quic::ManageStream::accept_bi(&self.inner).await
+        }
+
+        async fn accept_uni(&self) -> Result<Self::StreamReader, quic::ConnectionError> {
+            quic::ManageStream::accept_uni(&self.inner).await
+        }
+    }
+
+    impl quic::WithLocalAgent for IdentityOverrideConnection {
+        type LocalAgent = crate::connection::tests::TestLocalAgent;
+
+        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+            Ok(Some(crate::connection::tests::TestLocalAgent))
+        }
+    }
+
+    impl quic::WithRemoteAgent for IdentityOverrideConnection {
+        type RemoteAgent = NamedRemoteAgent;
+
+        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+            Ok(self.remote_name.map(NamedRemoteAgent))
+        }
+    }
+
+    impl quic::Lifecycle for IdentityOverrideConnection {
+        fn close(&self, code: crate::error::Code, reason: std::borrow::Cow<'static, str>) {
+            quic::Lifecycle::close(&self.inner, code, reason);
+        }
+
+        fn check(&self) -> Result<(), quic::ConnectionError> {
+            quic::Lifecycle::check(&self.inner)
+        }
+
+        async fn closed(&self) -> quic::ConnectionError {
+            quic::Lifecycle::closed(&self.inner).await
+        }
     }
 
     #[test]
@@ -378,6 +611,293 @@ mod tests {
 
         let reusable = reusable_connection(Connection::from_state_for_test(state)).await;
         assert!(reusable.reuse().is_none());
+    }
+
+    #[tokio::test]
+    async fn reusable_connection_try_insert_with_error_preserves_existing_connection() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct TestInsertFailure;
+
+        let quic = crate::connection::tests::MockConnection::new();
+        let expected = Arc::new(mock_connection_with_dhttp(quic));
+        let reusable = Arc::new(ReuseableConnection::pending());
+
+        reusable.insert(expected.clone(), abort_handle()).await;
+
+        let error = reusable
+            .try_insert_with(async || {
+                Err::<
+                    (
+                        Arc<Connection<crate::connection::tests::MockConnection>>,
+                        AbortOnDropHandle<()>,
+                    ),
+                    _,
+                >(TestInsertFailure)
+            })
+            .await
+            .expect_err("insertion should fail");
+
+        assert_eq!(error, TestInsertFailure);
+        assert!(Arc::ptr_eq(
+            &reusable
+                .reuse()
+                .expect("existing connection should remain reusable"),
+            &expected,
+        ));
+    }
+
+    #[tokio::test]
+    async fn pool_reuses_same_authority_even_with_different_builders() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let connector = TestConnector::succeed();
+        let server = matching_server();
+
+        let first = pool
+            .reuse_or_connect_with(
+                &connector,
+                Arc::new(ConnectionBuilder::default()),
+                server.clone(),
+            )
+            .await
+            .expect("first connect should succeed");
+        let second = pool
+            .reuse_or_connect_with(&connector, alternate_builder(), server)
+            .await
+            .expect("second connect should reuse");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(connector.call_count(), 1);
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pool_coordinates_in_flight_connect_attempts() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let (connector, first_call_gate) = TestConnector::succeed_with_first_call_gate();
+        let server = matching_server();
+        let builder = Arc::new(ConnectionBuilder::default());
+        let first = pool.reuse_or_connect_with(&connector, builder.clone(), server.clone());
+        let mut first = std::pin::pin!(first);
+        assert!(
+            futures::poll!(first.as_mut()).is_pending(),
+            "gated first connect should remain pending until released",
+        );
+        assert_eq!(
+            connector.call_count(),
+            1,
+            "first poll should start one dial"
+        );
+        assert_eq!(
+            pool.len(),
+            1,
+            "pending entry should exist while first call is gated"
+        );
+
+        let second = pool.reuse_or_connect_with(&connector, builder, server.clone());
+        let mut second = std::pin::pin!(second);
+        assert!(
+            futures::poll!(second.as_mut()).is_pending(),
+            "second caller should pend while the first connection attempt is in flight",
+        );
+
+        wait_until("second waiter to attach to the same pending entry", || {
+            let Some(entry) = pool.connections.get(&server) else {
+                return false;
+            };
+            Arc::strong_count(entry.value()) >= 3
+        })
+        .await;
+
+        assert_eq!(
+            connector.call_count(),
+            1,
+            "second in-flight caller should wait on the pending entry instead of dialing again",
+        );
+
+        first_call_gate.add_permits(1);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let (first, second) = loop {
+            let first_poll = futures::poll!(first.as_mut());
+            let second_poll = futures::poll!(second.as_mut());
+
+            match (first_poll, second_poll) {
+                (std::task::Poll::Ready(first), std::task::Poll::Ready(second)) => {
+                    break (
+                        first.expect("first connect should succeed"),
+                        second.expect("second waiter should reuse the same connection"),
+                    );
+                }
+                (std::task::Poll::Ready(_), std::task::Poll::Pending)
+                    if std::time::Instant::now() >= deadline =>
+                {
+                    panic!("second in-flight waiter stalled after the first connection completed");
+                }
+                (std::task::Poll::Pending, _) if std::time::Instant::now() >= deadline => {
+                    panic!("first in-flight connection attempt stalled before becoming reusable");
+                }
+                _ => tokio::task::yield_now().await,
+            }
+        };
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(connector.call_count(), 1);
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pool_returns_connector_error() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let connector = TestConnector::fail("dial failed");
+        let error = pool
+            .reuse_or_connect_with(
+                &connector,
+                Arc::new(ConnectionBuilder::default()),
+                matching_server(),
+            )
+            .await
+            .expect_err("connect should fail");
+
+        match error {
+            ConnectError::Connector { source } => {
+                assert_eq!(source.to_string(), "dial failed");
+            }
+            other => panic!("expected connector error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_rejects_incorrect_peer_identity() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let connector = TestConnector::succeed();
+        let server: Authority = "expected.example:443".parse().unwrap();
+
+        let error = pool
+            .reuse_or_connect_with(&connector, Arc::new(ConnectionBuilder::default()), server)
+            .await
+            .expect_err("identity mismatch should fail");
+
+        match error {
+            ConnectError::IncorrectIdentity { expected, actual } => {
+                assert_eq!(expected, "expected.example");
+                assert_eq!(actual.as_deref(), Some("test-remote"));
+            }
+            other => panic!("expected identity error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_replaces_closed_connection_with_new_one() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let connector = TestConnector::succeed();
+        let server = matching_server();
+        let builder = Arc::new(ConnectionBuilder::default());
+
+        let first = pool
+            .reuse_or_connect_with(&connector, builder.clone(), server.clone())
+            .await
+            .expect("first connect should succeed");
+        let first_quic = connector
+            .returned_quics()
+            .into_iter()
+            .next()
+            .expect("first connection should be recorded");
+        first_quic.set_terminal_error(test_connection_error("closed"));
+
+        let second = pool
+            .reuse_or_connect_with(&connector, builder, server)
+            .await
+            .expect("second connect should replace the dead connection");
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(connector.call_count(), 2);
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn spawn_try_release_waits_until_no_other_waiter_holds_entry() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let quic = crate::connection::tests::MockConnection::new();
+        let connection = Arc::new(mock_connection(quic.clone()));
+        let server = inserted_identity();
+
+        pool.try_insert(connection)
+            .await
+            .expect("insert should succeed");
+        let reusable = pool
+            .connections
+            .get(&server)
+            .expect("entry should exist")
+            .value()
+            .clone();
+
+        quic.set_terminal_error(test_connection_error("release"));
+        pool.clone().spawn_try_release(server.clone());
+        tokio::task::yield_now().await;
+
+        assert_eq!(pool.len(), 1, "held waiter must keep the entry alive");
+
+        drop(reusable);
+        pool.clone().spawn_try_release(server);
+        wait_until("entry release after waiter drop", || pool.is_empty()).await;
+    }
+
+    #[tokio::test]
+    async fn try_insert_releases_entry_after_connection_closes() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let quic = crate::connection::tests::MockConnection::new();
+
+        pool.try_insert(Arc::new(mock_connection(quic.clone())))
+            .await
+            .expect("insert should succeed");
+
+        assert_eq!(pool.len(), 1);
+
+        quic.set_terminal_error(test_connection_error("closed after insert"));
+        wait_until("entry release after inserted connection closes", || {
+            pool.is_empty()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn try_insert_rejects_missing_identity() {
+        let pool = Pool::<IdentityOverrideConnection>::empty();
+        let connection = Arc::new(Connection::from_state_for_test(
+            ConnectionState::new_for_test(
+                Arc::new(IdentityOverrideConnection::new(None)),
+                Arc::new(crate::protocol::Protocols::new()),
+            ),
+        ));
+
+        let error = pool
+            .try_insert(connection)
+            .await
+            .expect_err("missing identity should fail");
+
+        assert!(matches!(error, InsertError::MissingIdentity));
+        assert!(pool.is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_insert_rejects_invalid_identity() {
+        let pool = Pool::<IdentityOverrideConnection>::empty();
+        let connection = Arc::new(Connection::from_state_for_test(
+            ConnectionState::new_for_test(
+                Arc::new(IdentityOverrideConnection::new(Some(
+                    "not a valid authority",
+                ))),
+                Arc::new(crate::protocol::Protocols::new()),
+            ),
+        ));
+
+        let error = pool
+            .try_insert(connection)
+            .await
+            .expect_err("invalid identity should fail");
+
+        assert!(matches!(error, InsertError::InvalidIdentity));
+        assert!(pool.is_empty());
     }
 
     #[test]

@@ -938,6 +938,27 @@ mod tests {
         assert_eq!(fd_count.to_string(), "expected 2 fds, got 1");
     }
 
+    #[test]
+    fn call_errors_convert_to_transport_errors() {
+        let open = IpcWebTransportOpenError::from(remoc::rtc::CallError::Dropped);
+        let IpcWebTransportOpenError::Transport {
+            source: IpcPlumbingError::Rpc { source },
+        } = open
+        else {
+            panic!("expected open RPC transport error");
+        };
+        assert_eq!(source.to_string(), "processing request failed");
+
+        let accept = IpcWebTransportAcceptError::from(remoc::rtc::CallError::RemoteForward);
+        let IpcWebTransportAcceptError::Transport {
+            source: IpcPlumbingError::Rpc { source },
+        } = accept
+        else {
+            panic!("expected accept RPC transport error");
+        };
+        assert_eq!(source.to_string(), "forwarding error");
+    }
+
     #[tokio::test]
     async fn ipc_webtransport_lifecycle_delegates_and_latches_parent_errors() {
         let parent = Arc::new(TestLifecycle::default());
@@ -956,6 +977,23 @@ mod tests {
         parent.set_terminal(connection_error("later parent error"));
         let error = quic::Lifecycle::closed(&lifecycle).await;
         assert_reason(&error, "parent closed");
+    }
+
+    #[tokio::test]
+    async fn ipc_webtransport_lifecycle_closed_latches_parent_without_prior_check() {
+        let parent = Arc::new(TestLifecycle::default());
+        let lifecycle = IpcWebTransportLifecycle {
+            parent: parent.clone(),
+            latch: ConnectionErrorLatch::new(),
+        };
+
+        parent.set_terminal(connection_error("direct parent close"));
+        let error = quic::Lifecycle::closed(&lifecycle).await;
+        assert_reason(&error, "direct parent close");
+
+        parent.set_terminal(connection_error("ignored later close"));
+        let latched = quic::Lifecycle::check(&lifecycle).expect_err("closed should latch");
+        assert_reason(&latched, "direct parent close");
     }
 
     #[tokio::test]
@@ -1004,6 +1042,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guard_ipc_accept_transport_error_latches_connection_error() {
+        let registered = registered_fds(1).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+
+        let error = handle
+            .guard_ipc_accept(async {
+                Err::<(), _>(IpcWebTransportAcceptError::Transport {
+                    source: IpcPlumbingError::Io {
+                        message: "accept transport".into(),
+                    },
+                })
+            })
+            .await
+            .expect_err("transport accept error should surface");
+
+        let AcceptStreamError::Connection { source } = error else {
+            panic!("expected accept connection error");
+        };
+        assert_reason(&source, "accept transport");
+
+        let latched = quic::Lifecycle::check(handle.lifecycle.as_ref())
+            .expect_err("accept transport error should latch");
+        assert_reason(&latched, "accept transport");
+    }
+
+    #[tokio::test]
     async fn fds_to_streams_build_ipc_streams_with_expected_ids() {
         let registered = registered_fds(2).await;
         let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
@@ -1032,6 +1096,66 @@ mod tests {
             .await
             .expect("uni reader");
         assert_eq!(reader.stream_id().await.expect("reader id"), stream_id);
+
+        let registered = registered_fds(2).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+        let (mut reader, mut writer) = handle
+            .fds_to_bi_accept(registered.id, stream_id)
+            .await
+            .expect("accepted bidi streams");
+        assert_eq!(reader.stream_id().await.expect("reader id"), stream_id);
+        assert_eq!(writer.stream_id().await.expect("writer id"), stream_id);
+    }
+
+    #[tokio::test]
+    async fn session_trait_methods_open_and_accept_registered_fds() {
+        let registered = registered_fds(2).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+        let (mut reader, mut writer) = webtransport::Session::open_bi(&handle)
+            .await
+            .expect("open bidi streams");
+        assert_eq!(
+            reader.stream_id().await.expect("reader id"),
+            VarInt::from_u32(1)
+        );
+        assert_eq!(
+            writer.stream_id().await.expect("writer id"),
+            VarInt::from_u32(1)
+        );
+
+        let registered = registered_fds(1).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+        let mut writer = webtransport::Session::open_uni(&handle)
+            .await
+            .expect("open uni writer");
+        assert_eq!(
+            writer.stream_id().await.expect("writer id"),
+            VarInt::from_u32(2)
+        );
+
+        let registered = registered_fds(2).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+        let (mut reader, mut writer) = webtransport::Session::accept_bi(&handle)
+            .await
+            .expect("accept bidi streams");
+        assert_eq!(
+            reader.stream_id().await.expect("reader id"),
+            VarInt::from_u32(3)
+        );
+        assert_eq!(
+            writer.stream_id().await.expect("writer id"),
+            VarInt::from_u32(3)
+        );
+
+        let registered = registered_fds(1).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+        let mut reader = webtransport::Session::accept_uni(&handle)
+            .await
+            .expect("accept uni reader");
+        assert_eq!(
+            reader.stream_id().await.expect("reader id"),
+            VarInt::from_u32(4)
+        );
     }
 
     #[tokio::test]
@@ -1060,6 +1184,69 @@ mod tests {
             panic!("expected accept connection error");
         };
         assert_reason_contains(&source, "expected 1 fds, got 2");
+
+        let registered = registered_fds(1).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+
+        let Err(error) = handle
+            .fds_to_bi_accept(registered.id, VarInt::from_u32(9))
+            .await
+        else {
+            panic!("accepted bidi requires two fds");
+        };
+        let AcceptStreamError::Connection { source } = error else {
+            panic!("expected accept connection error");
+        };
+        assert_reason_contains(&source, "expected 2 fds, got 1");
+
+        let registered = registered_fds(2).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+
+        let Err(error) = handle
+            .fds_to_uni_writer(registered.id, VarInt::from_u32(9))
+            .await
+        else {
+            panic!("uni writer requires one fd");
+        };
+        let OpenStreamError::Open { source } = error else {
+            panic!("expected open connection error");
+        };
+        assert_reason_contains(&source, "expected 1 fds, got 2");
+    }
+
+    #[tokio::test]
+    async fn closed_fd_registry_errors_are_latched_as_transport_errors() {
+        let registered = registered_fds(1).await;
+        let registry = registered.registry.clone();
+        drop(registered);
+        let (_task, handle, _parent) = handle_with_registry(registry);
+
+        let Err(error) = handle
+            .fds_to_uni_writer(VarInt::from_u32(99), VarInt::from_u32(9))
+            .await
+        else {
+            panic!("closed registry should fail open conversion");
+        };
+        let OpenStreamError::Open { source } = error else {
+            panic!("expected open connection error");
+        };
+        assert_reason_contains(&source, "wait_fds: fd registry is closed");
+
+        let registered = registered_fds(1).await;
+        let registry = registered.registry.clone();
+        drop(registered);
+        let (_task, handle, _parent) = handle_with_registry(registry);
+
+        let Err(error) = handle
+            .fds_to_uni_reader(VarInt::from_u32(99), VarInt::from_u32(9))
+            .await
+        else {
+            panic!("closed registry should fail accept conversion");
+        };
+        let AcceptStreamError::Connection { source } = error else {
+            panic!("expected accept connection error");
+        };
+        assert_reason_contains(&source, "wait_fds: fd registry is closed");
     }
 
     #[tokio::test]

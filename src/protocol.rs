@@ -325,9 +325,10 @@ pub enum StreamVerdict<S> {
 mod tests {
     use std::{
         borrow::Cow,
+        collections::HashSet,
         pin::Pin,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll},
@@ -336,9 +337,10 @@ mod tests {
     use bytes::Bytes;
     use dhttp_identity::identity as agent;
     use futures::{
-        Sink, Stream,
+        Sink, SinkExt, Stream,
         future::{BoxFuture, pending},
     };
+    use tokio::io::AsyncReadExt;
 
     use super::*;
     use crate::{
@@ -426,6 +428,95 @@ mod tests {
             PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream)),
             SinkWriter::new(Box::pin(writer) as BoxWriteStream),
         )
+    }
+
+    async fn peekable_uni_stream_with_bytes(bytes: &[u8]) -> ErasedPeekableUniStream {
+        let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(0));
+        writer
+            .send(Bytes::copy_from_slice(bytes))
+            .await
+            .expect("write test uni bytes");
+        writer.close().await.expect("close test uni stream");
+        PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream))
+    }
+
+    async fn peekable_bi_stream_with_bytes(bytes: &[u8]) -> ErasedPeekableBiStream {
+        let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(4));
+        writer
+            .send(Bytes::copy_from_slice(bytes))
+            .await
+            .expect("write test bidi bytes");
+        writer.close().await.expect("close test bidi stream");
+        (
+            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream)),
+            SinkWriter::new(Box::pin(writer) as BoxWriteStream),
+        )
+    }
+
+    #[derive(Debug, Default)]
+    struct RoutingObservation {
+        calls: AtomicUsize,
+        reads: Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[derive(Debug)]
+    struct RoutedProtocol<const ID: u8> {
+        observation: Arc<RoutingObservation>,
+    }
+
+    impl<const ID: u8> Protocol for RoutedProtocol<ID> {
+        fn accept_uni<'a>(
+            &'a self,
+            stream: ErasedPeekableUniStream,
+        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
+            Box::pin(async move {
+                let mut stream = stream;
+                let call = self.observation.calls.fetch_add(1, Ordering::SeqCst);
+                let read_len = if call == 0 { 1 } else { 2 };
+                let mut buf = vec![0; read_len];
+                stream
+                    .read_exact(&mut buf)
+                    .await
+                    .expect("read routed uni bytes");
+                self.observation
+                    .reads
+                    .lock()
+                    .expect("lock routed uni observation")
+                    .push(buf);
+                if call == 0 {
+                    Ok(StreamVerdict::Passed(stream))
+                } else {
+                    Ok(StreamVerdict::Accepted)
+                }
+            })
+        }
+
+        fn accept_bi<'a>(
+            &'a self,
+            stream: ErasedPeekableBiStream,
+        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
+            Box::pin(async move {
+                let mut stream = stream;
+                let call = self.observation.calls.fetch_add(1, Ordering::SeqCst);
+                let read_len = if call == 0 { 1 } else { 2 };
+                let mut buf = vec![0; read_len];
+                stream
+                    .0
+                    .read_exact(&mut buf)
+                    .await
+                    .expect("read routed bidi bytes");
+                self.observation
+                    .reads
+                    .lock()
+                    .expect("lock routed bidi observation")
+                    .push(buf);
+                if call == 0 {
+                    Ok(StreamVerdict::Passed(stream))
+                } else {
+                    Ok(StreamVerdict::Accepted)
+                }
+            })
+        }
     }
 
     #[derive(Debug)]
@@ -708,6 +799,34 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Hash, PartialEq, Eq)]
+    struct FailingFactory(&'static str);
+
+    impl fmt::Display for FailingFactory {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "FailingFactory({})", self.0)
+        }
+    }
+
+    impl ProductProtocol<TestConnection> for FailingFactory {
+        type Protocol = MockProtocol2;
+
+        fn init<'a>(
+            &'a self,
+            _: &'a Arc<TestConnection>,
+            _: &'a Protocols,
+        ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
+            Box::pin(async move {
+                Err(ConnectionError::Application {
+                    source: quic::ApplicationError {
+                        code: Code::H3_INTERNAL_ERROR,
+                        reason: Cow::Borrowed("failing factory"),
+                    },
+                })
+            })
+        }
+    }
+
     fn identity<C: quic::Connection, F: ProductProtocol<C>>(
         f: F,
     ) -> IdentifiedProtocolInitializer<C> {
@@ -744,11 +863,106 @@ mod tests {
     #[test]
     fn protocol_registry_get_insert_and_debug() {
         let mut protocols = Protocols::new();
+        assert_eq!(format!("{protocols:?}"), "[]");
         assert!(protocols.get::<MockProtocol>().is_none());
 
         protocols.insert(MockProtocol);
+        protocols.insert(MockProtocol2);
         assert!(protocols.get::<MockProtocol>().is_some());
-        assert!(format!("{protocols:?}").contains("MockProtocol"));
+        assert!(protocols.get::<MockProtocol2>().is_some());
+        let debug = format!("{protocols:?}");
+        assert!(debug.contains("MockProtocol"));
+        assert!(debug.contains("MockProtocol2"));
+    }
+
+    #[tokio::test]
+    async fn protocol_registry_accept_uni_passes_through_empty_registry() {
+        let protocols = Protocols::default();
+        let verdict = protocols
+            .accept_uni(peekable_uni_stream_with_bytes(b"ok").await)
+            .await
+            .expect("empty registry must pass uni stream");
+        let StreamVerdict::Passed(mut stream) = verdict else {
+            panic!("empty registry must not accept uni stream");
+        };
+
+        let mut buf = [0; 2];
+        stream
+            .read_exact(&mut buf)
+            .await
+            .expect("read passed uni bytes");
+        assert_eq!(&buf, b"ok");
+    }
+
+    #[tokio::test]
+    async fn protocol_registry_accept_bi_passes_through_empty_registry() {
+        let protocols = Protocols::default();
+        let verdict = protocols
+            .accept_bi(peekable_bi_stream_with_bytes(b"bi").await)
+            .await
+            .expect("empty registry must pass bidi stream");
+        let StreamVerdict::Passed((mut reader, _writer)) = verdict else {
+            panic!("empty registry must not accept bidi stream");
+        };
+
+        let mut buf = [0; 2];
+        reader
+            .read_exact(&mut buf)
+            .await
+            .expect("read passed bidi bytes");
+        assert_eq!(&buf, b"bi");
+    }
+
+    #[tokio::test]
+    async fn protocol_registry_accept_uni_resets_stream_before_next_layer() {
+        let observation = Arc::new(RoutingObservation::default());
+        let mut protocols = Protocols::new();
+        protocols.insert(RoutedProtocol::<1> {
+            observation: observation.clone(),
+        });
+        protocols.insert(RoutedProtocol::<2> {
+            observation: observation.clone(),
+        });
+
+        let verdict = protocols
+            .accept_uni(peekable_uni_stream_with_bytes(b"ab").await)
+            .await
+            .expect("layered uni routing succeeds");
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert_eq!(observation.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *observation
+                .reads
+                .lock()
+                .expect("lock layered uni observation"),
+            vec![b"a".to_vec(), b"ab".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_registry_accept_bi_resets_stream_before_next_layer() {
+        let observation = Arc::new(RoutingObservation::default());
+        let mut protocols = Protocols::new();
+        protocols.insert(RoutedProtocol::<1> {
+            observation: observation.clone(),
+        });
+        protocols.insert(RoutedProtocol::<2> {
+            observation: observation.clone(),
+        });
+
+        let verdict = protocols
+            .accept_bi(peekable_bi_stream_with_bytes(b"cd").await)
+            .await
+            .expect("layered bidi routing succeeds");
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert_eq!(observation.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *observation
+                .reads
+                .lock()
+                .expect("lock layered bidi observation"),
+            vec![b"c".to_vec(), b"cd".to_vec()]
+        );
     }
 
     #[tokio::test]
@@ -829,6 +1043,39 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, StreamError::Reset { code } if code == VarInt::from_u32(0x0102)));
+    }
+
+    #[test]
+    fn identified_initializer_hashes_and_compares_by_factory_identity() {
+        let initializers = HashSet::from([
+            identity::<C, _>(MockFactoryFoo(1)),
+            identity::<C, _>(MockFactoryFoo(1)),
+            identity::<C, _>(MockFactoryFoo(2)),
+            identity::<C, _>(MockFactoryBar(1)),
+        ]);
+
+        assert_eq!(initializers.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn identified_initializer_propagates_init_errors_without_inserting_protocol() {
+        let initializer = IdentifiedProtocolInitializer::new(FailingFactory("boom"));
+        let conn = Arc::new(TestConnection);
+        let mut protocols = Protocols::new();
+        let init: &dyn InitProtocols<TestConnection> = ops::Deref::deref(&initializer);
+
+        let error = init
+            .init_protocols(&conn, &mut protocols)
+            .await
+            .expect_err("failing initializer must propagate connection error");
+
+        assert!(matches!(
+            error,
+            ConnectionError::Application { source }
+                if source.code == Code::H3_INTERNAL_ERROR
+                    && source.reason == Cow::Borrowed("failing factory")
+        ));
+        assert!(protocols.get::<MockProtocol2>().is_none());
     }
 
     #[tokio::test]

@@ -366,14 +366,17 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        future::pending,
+        future::{Ready, pending, ready},
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        task::{Context, Poll},
     };
 
+    use dhttp_identity::identity;
     use http::uri::Authority;
+    use tower_service::Service;
 
     use super::*;
     use crate::{
@@ -381,6 +384,7 @@ mod tests {
             MockConnection, TestLocalAgent, TestReadStream, TestRemoteAgent, TestWriteStream,
         },
         pool::ReuseableConnection,
+        varint::VarInt,
     };
 
     /// Minimal quic::Connect implementation for testing QuicMutGuard.
@@ -398,6 +402,7 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
     struct BuildableConnection;
 
     impl quic::ManageStream for BuildableConnection {
@@ -453,6 +458,142 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct NamedRemoteAgent {
+        name: &'static str,
+    }
+
+    impl identity::RemoteAgent for NamedRemoteAgent {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
+            &[]
+        }
+    }
+
+    #[derive(Debug)]
+    struct IdentifiedConnection {
+        remote_name: &'static str,
+    }
+
+    impl IdentifiedConnection {
+        fn new(remote_name: &'static str) -> Self {
+            Self { remote_name }
+        }
+    }
+
+    impl quic::ManageStream for IdentifiedConnection {
+        type StreamReader = TestReadStream;
+        type StreamWriter = TestWriteStream;
+
+        async fn open_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            pending().await
+        }
+
+        async fn open_uni(&self) -> Result<Self::StreamWriter, quic::ConnectionError> {
+            Ok(TestWriteStream)
+        }
+
+        async fn accept_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            pending().await
+        }
+
+        async fn accept_uni(&self) -> Result<Self::StreamReader, quic::ConnectionError> {
+            pending().await
+        }
+    }
+
+    impl quic::WithLocalAgent for IdentifiedConnection {
+        type LocalAgent = TestLocalAgent;
+
+        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+            Ok(None)
+        }
+    }
+
+    impl quic::WithRemoteAgent for IdentifiedConnection {
+        type RemoteAgent = NamedRemoteAgent;
+
+        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+            Ok(Some(NamedRemoteAgent {
+                name: self.remote_name,
+            }))
+        }
+    }
+
+    impl quic::Lifecycle for IdentifiedConnection {
+        fn close(&self, _code: crate::error::Code, _reason: std::borrow::Cow<'static, str>) {}
+
+        fn check(&self) -> Result<(), quic::ConnectionError> {
+            Ok(())
+        }
+
+        async fn closed(&self) -> quic::ConnectionError {
+            pending().await
+        }
+    }
+
+    fn test_connection_error(reason: &'static str) -> quic::ConnectionError {
+        quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(0x01),
+                frame_type: VarInt::from_u32(0x00),
+                reason: reason.into(),
+            },
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingConnect<C: quic::Connection> {
+        calls: Arc<AtomicUsize>,
+        servers: Arc<Mutex<Vec<Authority>>>,
+        result: Arc<Mutex<Result<Arc<C>, quic::ConnectionError>>>,
+    }
+
+    impl<C: quic::Connection> CountingConnect<C> {
+        fn succeed(connection: C) -> Self {
+            Self {
+                calls: Arc::default(),
+                servers: Arc::default(),
+                result: Arc::new(Mutex::new(Ok(Arc::new(connection)))),
+            }
+        }
+
+        fn fail(error: quic::ConnectionError) -> Self {
+            Self {
+                calls: Arc::default(),
+                servers: Arc::default(),
+                result: Arc::new(Mutex::new(Err(error))),
+            }
+        }
+    }
+
+    impl<C: quic::Connection> quic::Connect for CountingConnect<C> {
+        type Connection = C;
+        type Error = quic::ConnectionError;
+
+        async fn connect<'a>(
+            &'a self,
+            server: &'a Authority,
+        ) -> Result<Arc<Self::Connection>, Self::Error> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.servers
+                .lock()
+                .expect("server log mutex should not be poisoned")
+                .push(server.clone());
+            self.result
+                .lock()
+                .expect("result mutex should not be poisoned")
+                .clone()
+        }
+    }
+
     #[derive(Default)]
     struct MockListen {
         accepted: Arc<AtomicUsize>,
@@ -489,6 +630,79 @@ mod tests {
         }
     }
 
+    struct FailingListen;
+
+    impl quic::Listen for FailingListen {
+        type Connection = BuildableConnection;
+        type Error = quic::ConnectionError;
+
+        async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
+            Err(test_connection_error("accept failed"))
+        }
+
+        async fn shutdown(&self) -> Result<(), Self::Error> {
+            Err(test_connection_error("shutdown failed"))
+        }
+    }
+
+    impl quic::Listen for &FailingListen {
+        type Connection = BuildableConnection;
+        type Error = quic::ConnectionError;
+
+        async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
+            Err(test_connection_error("shared accept failed"))
+        }
+
+        async fn shutdown(&self) -> Result<(), Self::Error> {
+            Err(test_connection_error("shared shutdown failed"))
+        }
+    }
+
+    struct UnbuildableListen;
+
+    impl quic::Listen for UnbuildableListen {
+        type Connection = MockConnection;
+        type Error = quic::ConnectionError;
+
+        async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
+            Ok(Arc::new(MockConnection::new()))
+        }
+
+        async fn shutdown(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl quic::Listen for &UnbuildableListen {
+        type Connection = MockConnection;
+        type Error = quic::ConnectionError;
+
+        async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
+            Ok(Arc::new(MockConnection::new()))
+        }
+
+        async fn shutdown(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct NoopService;
+
+    impl Service<UnresolvedRequest> for NoopService {
+        type Response = ();
+        type Error = quic::ConnectionError;
+        type Future = Ready<Result<(), Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: UnresolvedRequest) -> Self::Future {
+            ready(Ok(()))
+        }
+    }
+
     #[test]
     fn h3_endpoint_implements_quic_connect_when_transport_connects() {
         fn assert_connect<T: quic::Connect<Connection = MockConnection>>() {}
@@ -504,6 +718,100 @@ mod tests {
         assert_listen::<H3Endpoint<MockListen, BuildableConnection>>();
     }
 
+    #[test]
+    fn builder_preserves_custom_builder_and_quic_accessor_returns_transport() {
+        let listen = MockListen::default();
+        let accepted = listen.accepted.clone();
+        let builder: Arc<ConnectionBuilder<BuildableConnection>> =
+            Arc::new(ConnectionBuilder::new(Arc::default()));
+        let endpoint = H3Endpoint::builder()
+            .quic(listen)
+            .builder(builder.clone())
+            .build();
+
+        assert!(Arc::ptr_eq(&builder, &endpoint.builder));
+        assert!(Arc::ptr_eq(&accepted, &endpoint.quic().accepted));
+        assert_eq!(endpoint.pool_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn inherent_connect_builds_and_reuses_pooled_h3_connection() {
+        let connector = CountingConnect::succeed(IdentifiedConnection::new("test-remote"));
+        let calls = connector.calls.clone();
+        let servers = connector.servers.clone();
+        let endpoint = H3Endpoint::new(connector);
+        let server: Authority = "test-remote:443".parse().unwrap();
+
+        let first = endpoint
+            .connect(server.clone())
+            .await
+            .expect("first connect should build H3");
+        let second = endpoint
+            .connect(server.clone())
+            .await
+            .expect("second connect should reuse H3");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            servers
+                .lock()
+                .expect("server log mutex should not be poisoned")
+                .as_slice(),
+            &[server],
+        );
+        assert_eq!(endpoint.pool_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn inherent_connect_returns_connector_error() {
+        let endpoint = H3Endpoint::<_, IdentifiedConnection>::new(CountingConnect::fail(
+            test_connection_error("connector failed"),
+        ));
+        let server: Authority = "test-remote:443".parse().unwrap();
+
+        let error = endpoint
+            .connect(server)
+            .await
+            .expect_err("connector error should be returned");
+
+        assert!(matches!(error, pool::ConnectError::Connector { source } if source.is_transport()));
+    }
+
+    #[tokio::test]
+    async fn inherent_connect_rejects_peer_identity_mismatch() {
+        let connector = CountingConnect::succeed(IdentifiedConnection::new("actual.example"));
+        let endpoint = H3Endpoint::new(connector);
+        let server: Authority = "expected.example:443".parse().unwrap();
+
+        let error = endpoint
+            .connect(server)
+            .await
+            .expect_err("identity mismatch should be returned");
+
+        assert!(matches!(
+            error,
+            pool::ConnectError::IncorrectIdentity { expected, actual }
+                if expected == "expected.example" && actual.as_deref() == Some("actual.example")
+        ));
+    }
+
+    #[tokio::test]
+    async fn quic_connect_impl_delegates_to_inner_transport() {
+        let connector = CountingConnect::succeed(IdentifiedConnection::new("delegated.example"));
+        let calls = connector.calls.clone();
+        let endpoint = H3Endpoint::new(connector);
+        let server: Authority = "delegated.example:443".parse().unwrap();
+
+        let connection = quic::Connect::connect(&endpoint, &server)
+            .await
+            .expect("delegated connect should return raw QUIC connection");
+
+        assert_eq!(connection.remote_name, "delegated.example");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(endpoint.pool_len(), 0);
+    }
+
     #[tokio::test]
     async fn accept_builds_h3_connection_from_accepted_quic_connection() {
         let listen = MockListen::default();
@@ -514,6 +822,30 @@ mod tests {
 
         assert_eq!(accepted.load(Ordering::Relaxed), 1);
         connection.qpack().expect("qpack should be initialized");
+    }
+
+    #[tokio::test]
+    async fn accept_returns_quic_accept_error() {
+        let mut endpoint = H3Endpoint::builder().quic(FailingListen).build();
+
+        let error = endpoint
+            .accept()
+            .await
+            .expect_err("accept error should be returned");
+
+        assert!(matches!(error, AcceptError::Accept { source } if source.is_transport()));
+    }
+
+    #[tokio::test]
+    async fn accept_returns_h3_build_error() {
+        let mut endpoint = H3Endpoint::builder().quic(UnbuildableListen).build();
+
+        let error = endpoint
+            .accept()
+            .await
+            .expect_err("build error should be returned");
+
+        assert!(matches!(error, AcceptError::Build { source } if source.is_transport()));
     }
 
     #[tokio::test]
@@ -529,6 +861,60 @@ mod tests {
 
         assert_eq!(accepted.load(Ordering::Relaxed), 1);
         connection.qpack().expect("qpack should be initialized");
+    }
+
+    #[tokio::test]
+    async fn accept_owned_returns_h3_build_error_from_shared_endpoint() {
+        let endpoint = Arc::new(H3Endpoint::builder().quic(UnbuildableListen).build());
+
+        let error = endpoint
+            .accept_owned()
+            .await
+            .expect_err("shared build error should be returned");
+
+        assert!(matches!(error, AcceptError::Build { source } if source.is_transport()));
+    }
+
+    #[tokio::test]
+    async fn quic_listen_impl_delegates_accept_and_shutdown_to_inner_transport() {
+        let listen = MockListen::default();
+        let accepted = listen.accepted.clone();
+        let shutdowns = listen.shutdowns.clone();
+        let mut endpoint = H3Endpoint::builder().quic(listen).build();
+
+        let _connection = quic::Listen::accept(&mut endpoint)
+            .await
+            .expect("listen impl should return raw QUIC connection");
+        quic::Listen::shutdown(&endpoint)
+            .await
+            .expect("listen impl should delegate shutdown");
+
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+        assert_eq!(shutdowns.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn serve_returns_quic_accept_error() {
+        let mut endpoint = H3Endpoint::builder().quic(FailingListen).build();
+
+        let error = endpoint
+            .serve(NoopService)
+            .await
+            .expect_err("serve should return listener accept error");
+
+        assert!(error.is_transport());
+    }
+
+    #[tokio::test]
+    async fn serve_owned_returns_quic_accept_error_from_shared_endpoint() {
+        let endpoint = Arc::new(H3Endpoint::builder().quic(FailingListen).build());
+
+        let error = endpoint
+            .serve_owned(NoopService)
+            .await
+            .expect_err("serve_owned should return shared listener accept error");
+
+        assert!(error.is_transport());
     }
 
     /// Verify that QuicMutGuard provides mutable access to the inner QUIC transport.

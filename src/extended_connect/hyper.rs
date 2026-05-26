@@ -134,10 +134,50 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+    };
+
     use http::{Request, Response, StatusCode};
+    use http_body::Body;
 
     use super::*;
-    use crate::qpack::field::Protocol;
+    use crate::{
+        connection::{ConnectionState, tests::MockConnection},
+        message::{
+            stream::hyper::upgrade::{RemainStream, TakeoverSlot},
+            test::{read_stream_for_test, write_stream_for_test},
+        },
+        protocol::Protocols,
+        qpack::field::Protocol,
+        varint::VarInt,
+    };
+
+    #[derive(Debug, Clone)]
+    struct ErrorBody;
+
+    impl Body for ErrorBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(Some(Err(std::io::Error::other("body error"))))
+        }
+    }
+
+    fn state_for_test() -> Arc<ConnectionState<dyn quic::DynConnection>> {
+        let quic = Arc::new(MockConnection::new());
+        let erased: Arc<dyn quic::DynConnection> = quic;
+        Arc::new(ConnectionState::new_for_test(
+            erased,
+            Arc::new(Protocols::new()),
+        ))
+    }
 
     #[tokio::test]
     async fn establish_rejects_non_success_status() {
@@ -170,6 +210,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn establish_requires_connection_metadata() {
+        let stream_id = StreamId::from(VarInt::from_u32(4));
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Empty::<Bytes>::new())
+            .expect("valid response");
+
+        response.extensions_mut().insert(stream_id);
+        response
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                read_stream_for_test(stream_id.0),
+            )));
+        response
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                write_stream_for_test(stream_id.0),
+            )));
+
+        let error = match establish(response).await {
+            Ok(_) => panic!("connection metadata is required"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, EstablishError::MissingConnection));
+    }
+
+    #[tokio::test]
+    async fn establish_returns_ready_connect_with_protocol_and_streams() {
+        let stream_id = StreamId::from(VarInt::from_u32(8));
+        let state = state_for_test();
+        let protocol = Protocol::new("webtransport-h3");
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Empty::<Bytes>::new())
+            .expect("valid response");
+
+        response.extensions_mut().insert(stream_id);
+        response.extensions_mut().insert(state.clone());
+        response.extensions_mut().insert(protocol.clone());
+        response
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                read_stream_for_test(stream_id.0),
+            )));
+        response
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                write_stream_for_test(stream_id.0),
+            )));
+
+        let connect = establish(response).await.expect("establish should succeed");
+        assert!(Arc::ptr_eq(connect.connection(), &state));
+        assert_eq!(connect.stream_id(), stream_id);
+        assert_eq!(
+            connect.protocol().map(Protocol::as_str),
+            Some("webtransport-h3")
+        );
+
+        let (_read, _write) = connect
+            .into_streams()
+            .await
+            .expect("establish should provide streams");
+    }
+
+    #[tokio::test]
+    async fn establish_missing_protocol_defaults_to_none() {
+        let stream_id = StreamId::from(VarInt::from_u32(12));
+        let state = state_for_test();
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Empty::<Bytes>::new())
+            .expect("valid response");
+
+        response.extensions_mut().insert(stream_id);
+        response.extensions_mut().insert(state);
+        response
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                read_stream_for_test(stream_id.0),
+            )));
+        response
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                write_stream_for_test(stream_id.0),
+            )));
+
+        let connect = establish(response).await.expect("establish should succeed");
+        assert_eq!(connect.protocol(), None);
+        assert_eq!(connect.stream_id(), stream_id);
+    }
+
+    #[tokio::test]
+    async fn establish_fails_when_write_slot_is_missing() {
+        let stream_id = StreamId::from(VarInt::from_u32(16));
+        let state = state_for_test();
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Empty::<Bytes>::new())
+            .expect("valid response");
+
+        response.extensions_mut().insert(stream_id);
+        response.extensions_mut().insert(state);
+        response
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                read_stream_for_test(stream_id.0),
+            )));
+
+        let error = match establish(response).await {
+            Ok(_) => panic!("missing write takeover slot should fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            EstablishError::TakeWrite {
+                source: TakeoverError::Unsupported
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn accept_rejects_non_connect_request() {
         let request = Request::builder()
             .method(http::Method::GET)
@@ -198,5 +359,160 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, AcceptError::MissingStreamId));
+    }
+
+    #[tokio::test]
+    async fn accept_requires_connection_metadata() {
+        let stream_id = StreamId::from(VarInt::from_u32(20));
+        let mut request = Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("https://example.test/session")
+            .body(Empty::<Bytes>::new())
+            .expect("valid request");
+
+        request.extensions_mut().insert(stream_id);
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                read_stream_for_test(stream_id.0),
+            )));
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                write_stream_for_test(stream_id.0),
+            )));
+
+        let error = match accept(request).await {
+            Ok(_) => panic!("connection metadata is required"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, AcceptError::MissingConnection));
+    }
+
+    #[tokio::test]
+    async fn accept_returns_ok_response_and_connect_with_streams() {
+        let stream_id = StreamId::from(VarInt::from_u32(24));
+        let state = state_for_test();
+        let protocol = Protocol::new("webtransport-h3");
+        let mut request = Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("https://example.test/session")
+            .body(Empty::<Bytes>::new())
+            .expect("valid request");
+
+        request.extensions_mut().insert(stream_id);
+        request.extensions_mut().insert(state.clone());
+        request.extensions_mut().insert(protocol.clone());
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                read_stream_for_test(stream_id.0),
+            )));
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                write_stream_for_test(stream_id.0),
+            )));
+
+        let (response, connect) = accept(request).await.expect("accept should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(connect.stream_id(), stream_id);
+        assert_eq!(
+            connect.protocol().map(Protocol::as_str),
+            Some("webtransport-h3")
+        );
+        assert!(Arc::ptr_eq(connect.connection(), &state));
+
+        let (_read, _write) = connect
+            .into_streams()
+            .await
+            .expect("streams should be ready");
+    }
+
+    #[tokio::test]
+    async fn accept_missing_protocol_defaults_to_none() {
+        let stream_id = StreamId::from(VarInt::from_u32(28));
+        let state = state_for_test();
+        let mut request = Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("https://example.test/session")
+            .body(Empty::<Bytes>::new())
+            .expect("valid request");
+
+        request.extensions_mut().insert(stream_id);
+        request.extensions_mut().insert(state);
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                read_stream_for_test(stream_id.0),
+            )));
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                write_stream_for_test(stream_id.0),
+            )));
+
+        let (_response, connect) = accept(request).await.expect("accept should succeed");
+        assert_eq!(connect.protocol(), None);
+    }
+
+    #[tokio::test]
+    async fn accept_fails_when_read_takeover_fails() {
+        let stream_id = StreamId::from(VarInt::from_u32(32));
+        let mut request = Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("https://example.test/session")
+            .body(ErrorBody)
+            .expect("valid request");
+
+        request.extensions_mut().insert(stream_id);
+        request.extensions_mut().insert(state_for_test());
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                write_stream_for_test(stream_id.0),
+            )));
+
+        let error = match accept(request).await {
+            Ok(_) => panic!("read body errors should fail takeover"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            AcceptError::TakeRead {
+                source: TakeoverError::BodyNotReleased
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_into_streams_reports_missing_write_takeover_as_pending_error() {
+        let stream_id = StreamId::from(VarInt::from_u32(36));
+        let mut request = Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("https://example.test/session")
+            .body(Empty::<Bytes>::new())
+            .expect("valid request");
+
+        request.extensions_mut().insert(stream_id);
+        request.extensions_mut().insert(state_for_test());
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                read_stream_for_test(stream_id.0),
+            )));
+
+        let (_response, connect) = accept(request).await.expect("accept should parse request");
+        let error = match connect.into_streams().await {
+            Ok(_) => panic!("write takeover should be unsupported"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            crate::extended_connect::IntoStreamsError::PendingWriteStream {
+                source: crate::extended_connect::PendingWriteStreamError::Unsupported
+            }
+        ));
     }
 }
