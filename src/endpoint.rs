@@ -119,6 +119,11 @@ impl<Q, C: quic::Connection> H3Endpoint<Q, C> {
         &self.quic
     }
 
+    /// Consume the endpoint and return the underlying QUIC transport.
+    pub fn into_quic(self) -> Q {
+        self.quic
+    }
+
     /// Clear all cached client connections.
     ///
     /// This is useful when an external network transition invalidates paths
@@ -732,6 +737,18 @@ mod tests {
         assert!(Arc::ptr_eq(&builder, &endpoint.builder));
         assert!(Arc::ptr_eq(&accepted, &endpoint.quic().accepted));
         assert_eq!(endpoint.pool_len(), 0);
+    }
+
+    #[test]
+    fn into_quic_returns_owned_transport() {
+        let listen = MockListen::default();
+        let accepted = listen.accepted.clone();
+        let endpoint: H3Endpoint<_, BuildableConnection> =
+            H3Endpoint::builder().quic(listen).build();
+
+        let listen = endpoint.into_quic();
+
+        assert!(Arc::ptr_eq(&accepted, &listen.accepted));
     }
 
     #[tokio::test]
