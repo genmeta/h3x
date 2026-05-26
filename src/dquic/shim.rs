@@ -385,3 +385,118 @@ impl quic::Connect for Arc<dquic::prelude::QuicClient> {
         dquic::prelude::QuicClient::connect(self, &name).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use dquic::{
+        qbase::{
+            error::{AppError, Error as DquicError, ErrorFrameType, ErrorKind, QuicError},
+            frame::{FrameType, ResetStreamError},
+            varint::VarInt as DquicVarInt,
+        },
+        qrecovery::streams::error::StreamError as DquicStreamError,
+    };
+
+    use super::*;
+
+    fn assert_transport_error(
+        error: quic::ConnectionError,
+        expected_kind: VarInt,
+        expected_frame_type: VarInt,
+        expected_reason: &str,
+    ) {
+        let quic::ConnectionError::Transport { source } = error else {
+            panic!("expected transport error");
+        };
+        assert_eq!(source.kind, expected_kind);
+        assert_eq!(source.frame_type, expected_frame_type);
+        assert_eq!(source.reason, Cow::Borrowed(expected_reason));
+    }
+
+    #[test]
+    fn convert_varint_preserves_dquic_value() {
+        let value = DquicVarInt::from_u64(0x1234_5678).expect("dquic varint");
+
+        assert_eq!(convert_varint(value), VarInt::from_u32(0x1234_5678));
+    }
+
+    #[test]
+    fn convert_connection_error_preserves_transport_v1_frame_type() {
+        let error = DquicError::Quic(QuicError::new(
+            ErrorKind::StreamLimit,
+            ErrorFrameType::V1(FrameType::StopSending),
+            "stream limit",
+        ));
+
+        assert_transport_error(
+            convert_connection_error(error),
+            VarInt::from_u32(0x04),
+            VarInt::from_u32(0x05),
+            "stream limit",
+        );
+    }
+
+    #[test]
+    fn convert_connection_error_preserves_transport_extension_frame_type() {
+        let extension_frame = DquicVarInt::from_u32(0x21);
+        let error = DquicError::Quic(QuicError::new(
+            ErrorKind::ProtocolViolation,
+            ErrorFrameType::Ext(extension_frame),
+            "extension frame",
+        ));
+
+        assert_transport_error(
+            convert_connection_error(error),
+            VarInt::from_u32(0x0a),
+            VarInt::from_u32(0x21),
+            "extension frame",
+        );
+    }
+
+    #[test]
+    fn convert_connection_error_preserves_application_error() {
+        let error = DquicError::App(AppError::new(
+            DquicVarInt::from_u32(Code::H3_REQUEST_CANCELLED.into_inner().into_inner() as u32),
+            "application close",
+        ));
+
+        let quic::ConnectionError::Application { source } = convert_connection_error(error) else {
+            panic!("expected application error");
+        };
+        assert_eq!(source.code, Code::H3_REQUEST_CANCELLED);
+        assert_eq!(source.reason, Cow::Borrowed("application close"));
+    }
+
+    #[test]
+    fn convert_stream_error_preserves_connection_and_reset_errors() {
+        let connection = DquicStreamError::Connection(DquicError::Quic(
+            QuicError::with_default_fty(ErrorKind::Internal, "connection failed"),
+        ));
+        let quic::StreamError::Connection { source } = convert_stream_error(connection) else {
+            panic!("expected connection stream error");
+        };
+        assert_transport_error(
+            source,
+            VarInt::from_u32(0x01),
+            VarInt::from_u32(0x00),
+            "connection failed",
+        );
+
+        let reset = DquicStreamError::Reset(ResetStreamError::new(
+            DquicVarInt::from_u32(0x100),
+            DquicVarInt::from_u32(0),
+        ));
+        let quic::StreamError::Reset { code } = convert_stream_error(reset) else {
+            panic!("expected reset stream error");
+        };
+        assert_eq!(code, VarInt::from_u32(0x100));
+    }
+
+    #[test]
+    #[should_panic(expected = "h3x write data after shutdown")]
+    fn convert_stream_error_rejects_eos_sent() {
+        _ = convert_stream_error(DquicStreamError::EosSent);
+    }
+}

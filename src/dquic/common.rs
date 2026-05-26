@@ -59,3 +59,65 @@ impl PartialEq for CommonQuicConfig {
             && Arc::ptr_eq(&self.qlogger, &other.qlogger)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_uses_noop_components_and_disabled_features() {
+        let config = CommonQuicConfig::default();
+
+        assert_eq!(config.defer_idle_timeout, Duration::ZERO);
+        assert!(!config.enable_0rtt);
+        assert!(!config.enable_sslkeylog);
+        assert_eq!(
+            format!("{config:?}"),
+            "CommonQuicConfig { defer_idle_timeout: 0ns, enable_0rtt: false, enable_sslkeylog: false, .. }",
+        );
+    }
+
+    #[test]
+    fn clone_preserves_dynamic_component_identity() {
+        let config = CommonQuicConfig {
+            defer_idle_timeout: Duration::from_secs(5),
+            enable_0rtt: true,
+            enable_sslkeylog: true,
+            ..Default::default()
+        };
+
+        let cloned = config.clone();
+
+        assert_eq!(config, cloned);
+        assert!(Arc::ptr_eq(
+            &config.stream_strategy_factory,
+            &cloned.stream_strategy_factory,
+        ));
+        assert!(Arc::ptr_eq(&config.qlogger, &cloned.qlogger));
+    }
+
+    #[test]
+    fn equality_requires_same_values_and_same_dynamic_component_arcs() {
+        let config = CommonQuicConfig::default();
+
+        let mut different_timeout = config.clone();
+        different_timeout.defer_idle_timeout = Duration::from_secs(1);
+        assert_ne!(config, different_timeout);
+
+        let mut different_zero_rtt = config.clone();
+        different_zero_rtt.enable_0rtt = true;
+        assert_ne!(config, different_zero_rtt);
+
+        let mut different_sslkeylog = config.clone();
+        different_sslkeylog.enable_sslkeylog = true;
+        assert_ne!(config, different_sslkeylog);
+
+        let mut different_strategy = config.clone();
+        different_strategy.stream_strategy_factory = Arc::new(ConsistentConcurrency::new);
+        assert_ne!(config, different_strategy);
+
+        let mut different_logger = config.clone();
+        different_logger.qlogger = Arc::new(NoopLogger);
+        assert_ne!(config, different_logger);
+    }
+}

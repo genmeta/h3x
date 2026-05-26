@@ -334,8 +334,11 @@ impl<S: ?Sized> UnidirectionalStream<S> {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Buf;
+
     use super::*;
     use crate::{
+        codec::{DecodeExt, EncodeExt},
         dhttp::{datagram::settings::H3Datagram, webtransport::settings::EnableWebTransport},
         extended_connect::settings::EnableConnectProtocol,
         varint::VarInt,
@@ -353,5 +356,148 @@ mod tests {
                 .expect_err("boolean setting value 2 must be rejected");
             assert!(matches!(err, InvalidSettingValue::BoolSetting { .. }));
         }
+    }
+
+    #[test]
+    fn setting_construction_validation_and_error_metadata() {
+        let setting = Setting::from((MaxFieldSectionSize::ID, VarInt::from_u32(4096)));
+        assert_eq!(setting.id, MaxFieldSectionSize.id());
+        assert_eq!(setting.value, VarInt::from_u32(4096));
+        assert!(setting.check().is_ok());
+
+        assert!(
+            Setting::new(EnableConnectProtocol::ID, VarInt::from_u32(0))
+                .check()
+                .is_ok()
+        );
+        assert!(
+            Setting::new(EnableConnectProtocol::ID, VarInt::from_u32(1))
+                .check()
+                .is_ok()
+        );
+
+        let error = Setting::new(EnableConnectProtocol::ID, VarInt::from_u32(2))
+            .check()
+            .expect_err("invalid boolean setting must fail");
+        assert_eq!(error.code(), Code::H3_SETTINGS_ERROR);
+        assert_eq!(
+            error.to_string(),
+            "boolean setting 8 must have value 0 or 1, got 2",
+        );
+    }
+
+    #[test]
+    fn settings_accessors_iterators_and_extension_paths() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.get(VarInt::from_u32(0x1234)), None);
+        assert_eq!(settings.max_field_section_size(), None);
+
+        settings.set(MaxFieldSectionSize::setting(VarInt::from_u32(4096)));
+        settings.extend([
+            EnableConnectProtocol::setting(true),
+            H3Datagram::setting(false),
+        ]);
+        settings.extend(std::iter::once(H3Datagram::setting(true)));
+
+        assert_eq!(
+            settings.get(MaxFieldSectionSize),
+            Some(VarInt::from_u32(4096)),
+        );
+        assert_eq!(
+            settings.max_field_section_size(),
+            Some(VarInt::from_u32(4096)),
+        );
+        assert_eq!(
+            settings.get(VarInt::from_u32(0x06)),
+            Some(VarInt::from_u32(4096)),
+        );
+        assert!(settings.enable_connect_protocol());
+        assert!(settings.h3_datagram());
+        assert!(!settings.enable_webtransport());
+
+        let borrowed: Vec<_> = (&settings).into_iter().collect();
+        assert_eq!(borrowed.len(), 3);
+        assert_eq!(borrowed[0].id, MaxFieldSectionSize::ID);
+
+        let owned: Vec<_> = settings.clone().into_iter().collect();
+        assert_eq!(owned.len(), borrowed.len());
+        for (left, right) in owned.iter().zip(&borrowed) {
+            assert_eq!(left.id, right.id);
+            assert_eq!(left.value, right.value);
+        }
+
+        let rebuilt = Settings::from_iter(owned);
+        assert_eq!(settings, rebuilt);
+    }
+
+    #[tokio::test]
+    async fn setting_encode_decode_round_trips_and_rejects_invalid_bool() {
+        let mut encoded = BufList::new();
+        encoded
+            .encode_one(Setting::new(
+                MaxFieldSectionSize::ID,
+                VarInt::from_u32(4096),
+            ))
+            .await
+            .expect("setting encoding into buflist is infallible");
+        let decoded = encoded.decode::<Setting>().await.expect("setting decodes");
+        assert_eq!(decoded.id, MaxFieldSectionSize::ID);
+        assert_eq!(decoded.value, VarInt::from_u32(4096));
+
+        let mut invalid = BufList::new();
+        invalid
+            .encode_one(Setting::new(EnableWebTransport::ID, VarInt::from_u32(2)))
+            .await
+            .expect("setting encoding into buflist is infallible");
+        let error = match invalid.decode::<Setting>().await {
+            Ok(_) => panic!("invalid boolean setting must fail to decode"),
+            Err(error) => error,
+        };
+        let StreamError::Connection {
+            source: crate::connection::ConnectionError::H3 { source },
+        } = error
+        else {
+            panic!("invalid setting value should be a connection-scoped H3 error");
+        };
+        assert_eq!(source.code(), Code::H3_SETTINGS_ERROR);
+    }
+
+    #[tokio::test]
+    async fn settings_encode_to_frame_and_decode_payload() {
+        let settings = Settings::from_iter([
+            MaxFieldSectionSize::setting(VarInt::from_u32(8192)),
+            EnableConnectProtocol::setting(true),
+        ]);
+
+        let frame = BufList::new()
+            .encode(&settings)
+            .await
+            .expect("settings encoding into buflist is infallible");
+        assert_eq!(frame.r#type(), Frame::SETTINGS_FRAME_TYPE);
+        assert!(frame.length().into_inner() > 0);
+
+        let decoded = frame
+            .into_payload()
+            .decode::<Settings>()
+            .await
+            .expect("settings decode from payload");
+        assert_eq!(decoded, settings);
+
+        let frame = BufList::new()
+            .encode(settings.clone())
+            .await
+            .expect("owned settings encoding into buflist is infallible");
+        assert_eq!(frame.r#type(), Frame::SETTINGS_FRAME_TYPE);
+    }
+
+    #[tokio::test]
+    async fn control_stream_helpers_identify_and_write_stream_type() {
+        let control = UnidirectionalStream::initial_control_stream(BufList::new())
+            .await
+            .expect("control stream initialization");
+
+        assert!(control.is_control_stream());
+        assert_eq!(control.r#type(), UnidirectionalStream::CONTROL_STREAM_TYPE);
+        assert!(control.into_inner().has_remaining());
     }
 }
