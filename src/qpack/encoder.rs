@@ -678,6 +678,7 @@ mod tests {
         codec::{DecodeFrom, EncodeInto},
         connection::StreamError,
         dhttp::settings::Settings,
+        error::{Code, H3ConnectionError},
         qpack::{
             encoder::{
                 EncoderInstruction, EncoderState, QPackDecoderStreamError, QPackEncoderError,
@@ -721,6 +722,22 @@ mod tests {
             VarInt::from_u32(10),
         ));
         Arc::new(settings)
+    }
+
+    fn state_with_full_unacknowledged_entry() -> EncoderState {
+        let mut state = EncoderState::new(settings_with_capacity(128));
+        state
+            .set_max_table_capacity(64)
+            .expect("set capacity failed");
+        state
+            .insert_with_literal_name(
+                false,
+                Bytes::from(vec![b'x'; 16]),
+                false,
+                Bytes::from(vec![b'y'; 16]),
+            )
+            .expect("insert full-size entry");
+        state
     }
 
     #[derive(Default)]
@@ -792,6 +809,47 @@ mod tests {
     }
 
     // --- Core encoding tests ---
+
+    #[test]
+    fn decoder_stream_errors_report_qpack_decoder_stream_error_code() {
+        let cases = [
+            QPackDecoderStreamError::AcknowledgeNonExistSection { stream_id: 7 },
+            QPackDecoderStreamError::IncrementKnownReceivedCountOverflow,
+            QPackDecoderStreamError::IncrementZero,
+        ];
+
+        for error in cases {
+            assert_eq!(error.code(), Code::QPACK_DECODER_STREAM_ERROR);
+        }
+    }
+
+    #[test]
+    fn encoder_state_accessors_expose_initial_and_capacity_state() {
+        let settings = settings_with_capacity(128);
+        let mut state = EncoderState::new(settings.clone());
+
+        assert!(std::ptr::eq(state.settings(), settings.as_ref()));
+        assert_eq!(state.table_capacity(), 0);
+        assert_eq!(state.table_size(), 0);
+        assert_eq!(state.table_inserted_count(), 0);
+        assert_eq!(state.table_known_received_count(), 0);
+        assert_eq!(state.table_dropped_count(), 0);
+        assert_eq!(state.table_remaining(), 0);
+        assert!(state.entries().next().is_none());
+        assert!(state.find_name(&Bytes::from_static(b"missing")).is_none());
+        assert!(state.find_value(&Bytes::from_static(b"missing")).is_none());
+        assert!(state.pending_instructions().is_empty());
+
+        state
+            .set_max_table_capacity(64)
+            .expect("capacity within peer setting");
+        assert_eq!(state.table_capacity(), 64);
+        assert_eq!(state.table_remaining(), 64);
+        assert_eq!(
+            state.pending_instructions().back(),
+            Some(&EncoderInstruction::SetDynamicTableCapacity { capacity: 64 })
+        );
+    }
 
     #[tokio::test]
     async fn encoder_instruction_roundtrip_all_variants() {
@@ -906,6 +964,43 @@ mod tests {
     }
 
     // --- Table management tests ---
+
+    #[test]
+    fn full_unacknowledged_table_blocks_capacity_reference_and_duplicate_mutations() {
+        let mut shrink = state_with_full_unacknowledged_entry();
+        assert!(matches!(
+            shrink.set_max_table_capacity(32),
+            Err(QPackEncoderError::CannotEvict)
+        ));
+
+        let mut static_reference = state_with_full_unacknowledged_entry();
+        assert!(matches!(
+            static_reference.insert_with_name_reference(
+                true,
+                0,
+                false,
+                Bytes::from_static(b"value"),
+            ),
+            Err(QPackEncoderError::CannotEvict)
+        ));
+
+        let mut dynamic_reference = state_with_full_unacknowledged_entry();
+        assert!(matches!(
+            dynamic_reference.insert_with_name_reference(
+                false,
+                0,
+                false,
+                Bytes::from_static(b"value"),
+            ),
+            Err(QPackEncoderError::CannotEvict)
+        ));
+
+        let mut duplicate = state_with_full_unacknowledged_entry();
+        assert!(matches!(
+            duplicate.duplicate(0),
+            Err(QPackEncoderError::CannotEvict)
+        ));
+    }
 
     #[test]
     fn set_max_table_capacity_exceeds_max_returns_err() {
