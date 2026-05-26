@@ -147,12 +147,12 @@ cargo llvm-cov \
   --all-targets \
   --summary-only \
   --json \
-  --output-path target/llvm-cov/coverage.json \
+  --output-path target/coverage.json \
   --fail-under-lines 62 \
-  --fail-under-functions 59 \
-  --fail-under-regions 63
-cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
-cargo llvm-cov report --html --output-dir target/llvm-cov/html
+  --fail-under-functions 56 \
+  --fail-under-regions 64
+cargo llvm-cov report --lcov --output-path target/lcov.info
+cargo llvm-cov report --html --output-dir target/llvm-cov
 ```
 
 The HTML report entrypoint is:

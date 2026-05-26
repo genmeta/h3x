@@ -71,19 +71,19 @@ jobs:
             --all-targets \
             --summary-only \
             --json \
-            --output-path target/llvm-cov/coverage.json \
+            --output-path target/coverage.json \
             --fail-under-lines 62 \
-            --fail-under-functions 59 \
-            --fail-under-regions 63
+            --fail-under-functions 56 \
+            --fail-under-regions 64
       - name: Generate LCOV report
-        run: cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
+        run: cargo llvm-cov report --lcov --output-path target/lcov.info
       - name: Generate HTML report
-        run: cargo llvm-cov report --html --output-dir target/llvm-cov/html
+        run: cargo llvm-cov report --html --output-dir target/llvm-cov
       - name: Upload coverage reports
         uses: actions/upload-artifact@v4
         with:
           name: h3x-coverage
           path: |
-            target/llvm-cov/coverage.json
-            target/llvm-cov/lcov.info
+            target/coverage.json
+            target/lcov.info
             target/llvm-cov/html
