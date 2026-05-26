@@ -475,3 +475,250 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+
+    use futures::{FutureExt, SinkExt, StreamExt, future::poll_fn};
+
+    use super::*;
+    use crate::quic::{CancelStreamExt, GetStreamIdExt, StopStreamExt};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Event {
+        ReadStarted,
+        ReadCancelled,
+        Stop(u64),
+        Write(Bytes),
+        WriteStarted(Bytes),
+        WriteCancelled,
+        Flush,
+        Shutdown,
+        Cancel(u64),
+    }
+
+    #[derive(Debug)]
+    struct TestReadClient {
+        chunks: VecDeque<Option<Result<Bytes, quic::StreamError>>>,
+        events: Arc<Mutex<Vec<Event>>>,
+    }
+
+    impl TestReadClient {
+        fn new(chunks: impl IntoIterator<Item = Option<Result<Bytes, quic::StreamError>>>) -> Self {
+            Self {
+                chunks: chunks.into_iter().collect(),
+                events: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn record(&self, event: Event) {
+            self.events
+                .lock()
+                .expect("events mutex should not be poisoned")
+                .push(event);
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestWriteClient {
+        events: Arc<Mutex<Vec<Event>>>,
+    }
+
+    impl TestWriteClient {
+        fn new() -> Self {
+            Self {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn record(&self, event: Event) {
+            self.events
+                .lock()
+                .expect("events mutex should not be poisoned")
+                .push(event);
+        }
+    }
+
+    fn events(events: &Mutex<Vec<Event>>) -> Vec<Event> {
+        events
+            .lock()
+            .expect("events mutex should not be poisoned")
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn read_bridge_reads_until_eof_and_reports_stream_id() {
+        let stream_id = VarInt::from_u32(7);
+        let client = TestReadClient::new([
+            Some(Ok(Bytes::from_static(b"one"))),
+            Some(Ok(Bytes::from_static(b"two"))),
+            None,
+        ]);
+
+        let mut bridge = Box::pin(ReadBridge::<_, quic::StreamError, _, _, _, _>::new(
+            stream_id,
+            client,
+            |mut client: TestReadClient, _token: CancellationToken| async move {
+                let result = client.chunks.pop_front().expect("scripted read result");
+                Either::Left((client, result))
+            },
+            |client: TestReadClient, code: VarInt| async move {
+                client.record(Event::Stop(code.into_inner()));
+                (client, Ok(()))
+            },
+        ));
+
+        assert_eq!(bridge.stream_id().await.expect("stream id"), stream_id);
+        assert!(!bridge.is_terminated());
+        assert_eq!(
+            bridge.next().await.expect("first chunk").expect("read ok"),
+            Bytes::from_static(b"one"),
+        );
+        assert_eq!(
+            bridge.next().await.expect("second chunk").expect("read ok"),
+            Bytes::from_static(b"two"),
+        );
+        assert!(bridge.next().await.is_none());
+        assert!(bridge.is_terminated());
+        assert!(bridge.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_bridge_stop_cancels_pending_read_before_stopping() {
+        let stream_id = VarInt::from_u32(11);
+        let client = TestReadClient::new([]);
+        let events_handle = client.events.clone();
+        let mut bridge = Box::pin(ReadBridge::<_, quic::StreamError, _, _, _, _>::new(
+            stream_id,
+            client,
+            |client: TestReadClient, token: CancellationToken| async move {
+                client.record(Event::ReadStarted);
+                token.cancelled().await;
+                client.record(Event::ReadCancelled);
+                Either::Right(client)
+            },
+            |client: TestReadClient, code: VarInt| async move {
+                client.record(Event::Stop(code.into_inner()));
+                (client, Ok(()))
+            },
+        ));
+
+        let pending = poll_fn(|cx| bridge.as_mut().poll_next(cx)).now_or_never();
+        assert!(pending.is_none(), "scripted read should remain pending");
+
+        bridge
+            .stop(VarInt::from_u32(99))
+            .await
+            .expect("stop should complete after cancelling pending read");
+
+        assert_eq!(
+            events(events_handle.as_ref()),
+            vec![Event::ReadStarted, Event::ReadCancelled, Event::Stop(99),],
+        );
+    }
+
+    #[tokio::test]
+    async fn write_bridge_writes_flushes_shutdown_and_cancels() {
+        let stream_id = VarInt::from_u32(13);
+        let client = TestWriteClient::new();
+        let events_handle = client.events.clone();
+        let mut bridge = Box::pin(
+            WriteBridge::<_, quic::StreamError, _, _, _, _, _, _, _, _>::new(
+                stream_id,
+                client,
+                |client: TestWriteClient, _token: CancellationToken, bytes: Bytes| async move {
+                    client.record(Event::Write(bytes));
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    client.record(Event::Flush);
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    client.record(Event::Shutdown);
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, code: VarInt| async move {
+                    client.record(Event::Cancel(code.into_inner()));
+                    (client, Ok(()))
+                },
+            ),
+        );
+
+        assert_eq!(bridge.stream_id().await.expect("stream id"), stream_id);
+        bridge
+            .feed(Bytes::from_static(b"payload"))
+            .await
+            .expect("write");
+        bridge.flush().await.expect("flush");
+        bridge.close().await.expect("shutdown");
+        bridge.cancel(VarInt::from_u32(17)).await.expect("cancel");
+
+        assert_eq!(
+            events(events_handle.as_ref()),
+            vec![
+                Event::Write(Bytes::from_static(b"payload")),
+                Event::Flush,
+                Event::Shutdown,
+                Event::Cancel(17),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn write_bridge_cancel_cancels_pending_write() {
+        let stream_id = VarInt::from_u32(19);
+        let client = TestWriteClient::new();
+        let events_handle = client.events.clone();
+        let mut bridge = Box::pin(
+            WriteBridge::<_, quic::StreamError, _, _, _, _, _, _, _, _>::new(
+                stream_id,
+                client,
+                |client: TestWriteClient, token: CancellationToken, bytes: Bytes| async move {
+                    client.record(Event::WriteStarted(bytes));
+                    token.cancelled().await;
+                    client.record(Event::WriteCancelled);
+                    Either::Right(client)
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    client.record(Event::Flush);
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    client.record(Event::Shutdown);
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, code: VarInt| async move {
+                    client.record(Event::Cancel(code.into_inner()));
+                    (client, Ok(()))
+                },
+            ),
+        );
+
+        poll_fn(|cx| bridge.as_mut().poll_ready(cx))
+            .await
+            .expect("ready");
+        bridge
+            .as_mut()
+            .start_send(Bytes::from_static(b"pending"))
+            .expect("start send");
+
+        bridge
+            .cancel(VarInt::from_u32(23))
+            .await
+            .expect("cancel pending write");
+
+        assert_eq!(
+            events(events_handle.as_ref()),
+            vec![
+                Event::WriteStarted(Bytes::from_static(b"pending")),
+                Event::WriteCancelled,
+                Event::Cancel(23),
+            ],
+        );
+    }
+}
