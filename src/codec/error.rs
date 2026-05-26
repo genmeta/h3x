@@ -424,3 +424,394 @@ impl From<io::Error> for StreamEncodeError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{Code, H3NoError};
+
+    fn varint(value: u32) -> VarInt {
+        VarInt::from_u32(value)
+    }
+
+    fn transport_error(reason: &'static str) -> quic::ConnectionError {
+        quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: varint(1),
+                frame_type: varint(2),
+                reason: reason.into(),
+            },
+        }
+    }
+
+    fn application_error(reason: &'static str) -> quic::ConnectionError {
+        quic::ConnectionError::Application {
+            source: quic::ApplicationError {
+                code: Code::H3_INTERNAL_ERROR,
+                reason: reason.into(),
+            },
+        }
+    }
+
+    fn connection_error(reason: &'static str) -> connection::ConnectionError {
+        transport_error(reason).into()
+    }
+
+    fn assert_connection_reason(error: &connection::ConnectionError, expected: &str) {
+        let connection::ConnectionError::Quic {
+            source: quic::ConnectionError::Transport { source },
+        } = error
+        else {
+            panic!("expected transport connection error");
+        };
+        assert_eq!(source.reason.as_ref(), expected);
+    }
+
+    fn assert_stream_reset(error: connection::StreamError, expected: VarInt) {
+        let connection::StreamError::Reset { code } = error else {
+            panic!("expected stream reset");
+        };
+        assert_eq!(code, expected);
+    }
+
+    fn assert_stream_h3(error: connection::StreamError) {
+        let connection::StreamError::H3 { source } = error else {
+            panic!("expected h3 stream error");
+        };
+        assert_eq!(source.code(), Code::H3_MESSAGE_ERROR);
+    }
+
+    #[test]
+    fn decode_error_io_roundtrips_and_classifies_plain_eof() {
+        let cases = [
+            (DecodeError::Incomplete, io::ErrorKind::UnexpectedEof),
+            (DecodeError::IntegerOverflow, io::ErrorKind::InvalidData),
+            (DecodeError::InvalidHuffmanCode, io::ErrorKind::InvalidData),
+            (DecodeError::ArithmeticOverflow, io::ErrorKind::InvalidData),
+            (DecodeError::DecompressionFailed, io::ErrorKind::InvalidData),
+        ];
+
+        for (error, expected_kind) in cases {
+            let io_error = io::Error::from(error);
+            assert_eq!(io_error.kind(), expected_kind);
+            assert_eq!(
+                DecodeError::try_from(io_error).expect("decode error"),
+                error
+            );
+        }
+
+        let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "plain eof");
+        assert_eq!(
+            DecodeError::try_from(eof).expect("plain eof should map to incomplete"),
+            DecodeError::Incomplete
+        );
+
+        let other = io::Error::new(io::ErrorKind::InvalidData, "plain invalid data");
+        let other = DecodeError::try_from(other).expect_err("plain error should be preserved");
+        assert_eq!(other.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn encode_error_io_roundtrips() {
+        for error in [
+            EncodeError::FramePayloadTooLarge,
+            EncodeError::HuffmanEncoding,
+        ] {
+            let io_error = io::Error::from(error);
+            assert_eq!(io_error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                EncodeError::try_from(io_error).expect("encode error"),
+                error
+            );
+        }
+
+        let other = io::Error::new(io::ErrorKind::InvalidData, "plain invalid data");
+        let other = EncodeError::try_from(other).expect_err("plain error should be preserved");
+        assert_eq!(other.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn huffman_library_errors_map_to_codec_errors() {
+        assert_eq!(
+            DecodeError::from(httlib_huffman::DecoderError::InvalidInput),
+            DecodeError::InvalidHuffmanCode
+        );
+        assert_eq!(
+            EncodeError::from(httlib_huffman::EncoderError::InvalidInput),
+            EncodeError::FramePayloadTooLarge
+        );
+    }
+
+    #[test]
+    fn stream_decode_escalation_covers_all_branches() {
+        let error = StreamDecodeError::Connection {
+            source: connection_error("connection"),
+        };
+        let escalated = error.escalate_reset(|_| connection_error("reset"));
+        let ConnectionDecodeError::Connection { source } = escalated else {
+            panic!("expected connection branch");
+        };
+        assert_connection_reason(&source, "connection");
+
+        let escalated = StreamDecodeError::Reset { code: varint(7) }
+            .escalate_reset(|code| connection_error(if code == varint(7) { "reset" } else { "" }));
+        let ConnectionDecodeError::Connection { source } = escalated else {
+            panic!("expected reset escalation");
+        };
+        assert_connection_reason(&source, "reset");
+
+        let escalated = StreamDecodeError::Decode {
+            source: DecodeError::IntegerOverflow,
+        }
+        .escalate_reset(|_| connection_error("unused"));
+        let ConnectionDecodeError::Decode { source } = escalated else {
+            panic!("expected decode branch");
+        };
+        assert_eq!(source, DecodeError::IntegerOverflow);
+    }
+
+    #[test]
+    fn stream_decode_critical_close_escalates_reset_and_incomplete() {
+        for error in [
+            StreamDecodeError::Reset { code: varint(1) },
+            StreamDecodeError::Decode {
+                source: DecodeError::Incomplete,
+            },
+        ] {
+            let escalated = error.escalate_critical_close(|| connection_error("closed"));
+            let ConnectionDecodeError::Connection { source } = escalated else {
+                panic!("expected critical close");
+            };
+            assert_connection_reason(&source, "closed");
+        }
+
+        let escalated = StreamDecodeError::Decode {
+            source: DecodeError::InvalidHuffmanCode,
+        }
+        .escalate_critical_close(|| connection_error("unused"));
+        let ConnectionDecodeError::Decode { source } = escalated else {
+            panic!("expected decode branch");
+        };
+        assert_eq!(source, DecodeError::InvalidHuffmanCode);
+    }
+
+    #[test]
+    fn stream_decode_into_stream_error_covers_all_branches() {
+        let error = StreamDecodeError::Connection {
+            source: connection_error("connection"),
+        }
+        .into_stream_error(|_| H3NoError.into());
+        let connection::StreamError::Connection { source } = error else {
+            panic!("expected connection stream error");
+        };
+        assert_connection_reason(&source, "connection");
+
+        assert_stream_reset(
+            StreamDecodeError::Reset { code: varint(9) }.into_stream_error(|_| H3NoError.into()),
+            varint(9),
+        );
+
+        assert_stream_h3(
+            StreamDecodeError::Decode {
+                source: DecodeError::DecompressionFailed,
+            }
+            .into_stream_error(|_| crate::error::H3MessageError::UnexpectedHeadersInBody.into()),
+        );
+    }
+
+    #[test]
+    fn connection_decode_into_stream_error_covers_all_branches() {
+        let error = ConnectionDecodeError::Connection {
+            source: connection_error("connection"),
+        }
+        .into_stream_error(|_| H3NoError.into());
+        let connection::StreamError::Connection { source } = error else {
+            panic!("expected connection stream error");
+        };
+        assert_connection_reason(&source, "connection");
+
+        assert_stream_h3(
+            ConnectionDecodeError::Decode {
+                source: DecodeError::ArithmeticOverflow,
+            }
+            .into_stream_error(|_| crate::error::H3MessageError::MissingHeaderSection.into()),
+        );
+    }
+
+    #[test]
+    fn stream_decode_error_recovers_from_io_error_sources() {
+        let direct = io::Error::from(StreamDecodeError::Reset { code: varint(1) });
+        let StreamDecodeError::Reset { code } = StreamDecodeError::from(direct) else {
+            panic!("expected direct stream decode error");
+        };
+        assert_eq!(code, varint(1));
+
+        let quic_reset = io::Error::from(quic::StreamError::Reset { code: varint(2) });
+        let StreamDecodeError::Reset { code } = StreamDecodeError::from(quic_reset) else {
+            panic!("expected quic stream reset");
+        };
+        assert_eq!(code, varint(2));
+
+        let quic_connection = io::Error::from(quic::StreamError::Connection {
+            source: transport_error("quic stream connection"),
+        });
+        let StreamDecodeError::Connection { source } = StreamDecodeError::from(quic_connection)
+        else {
+            panic!("expected quic connection");
+        };
+        assert_connection_reason(&source, "quic stream connection");
+
+        let h3_connection = io::Error::from(connection_error("h3 connection"));
+        let StreamDecodeError::Connection { source } = StreamDecodeError::from(h3_connection)
+        else {
+            panic!("expected h3 connection");
+        };
+        assert_connection_reason(&source, "h3 connection");
+
+        let decode = io::Error::from(DecodeError::ArithmeticOverflow);
+        let StreamDecodeError::Decode { source } = StreamDecodeError::from(decode) else {
+            panic!("expected decode error");
+        };
+        assert_eq!(source, DecodeError::ArithmeticOverflow);
+    }
+
+    #[test]
+    fn connection_decode_error_converts_to_io() {
+        let io_error = io::Error::from(ConnectionDecodeError::Connection {
+            source: connection_error("connection"),
+        });
+        assert_eq!(io_error.kind(), io::ErrorKind::BrokenPipe);
+
+        let io_error = io::Error::from(ConnectionDecodeError::Decode {
+            source: DecodeError::Incomplete,
+        });
+        assert_eq!(io_error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn stream_encode_escalation_covers_all_branches() {
+        let error = StreamEncodeError::Connection {
+            source: connection_error("connection"),
+        };
+        let escalated = error.escalate_reset(|_| connection_error("reset"));
+        let ConnectionEncodeError::Connection { source } = escalated else {
+            panic!("expected connection branch");
+        };
+        assert_connection_reason(&source, "connection");
+
+        let escalated = StreamEncodeError::Reset { code: varint(7) }
+            .escalate_reset(|code| connection_error(if code == varint(7) { "reset" } else { "" }));
+        let ConnectionEncodeError::Connection { source } = escalated else {
+            panic!("expected reset escalation");
+        };
+        assert_connection_reason(&source, "reset");
+
+        let escalated = StreamEncodeError::Encode {
+            source: EncodeError::HuffmanEncoding,
+        }
+        .escalate_reset(|_| connection_error("unused"));
+        let ConnectionEncodeError::Encode { source } = escalated else {
+            panic!("expected encode branch");
+        };
+        assert_eq!(source, EncodeError::HuffmanEncoding);
+    }
+
+    #[test]
+    fn stream_encode_into_stream_error_covers_all_branches() {
+        let error = StreamEncodeError::Connection {
+            source: connection_error("connection"),
+        }
+        .into_stream_error(|_| H3NoError.into());
+        let connection::StreamError::Connection { source } = error else {
+            panic!("expected connection stream error");
+        };
+        assert_connection_reason(&source, "connection");
+
+        assert_stream_reset(
+            StreamEncodeError::Reset { code: varint(9) }.into_stream_error(|_| H3NoError.into()),
+            varint(9),
+        );
+
+        assert_stream_h3(
+            StreamEncodeError::Encode {
+                source: EncodeError::HuffmanEncoding,
+            }
+            .into_stream_error(|_| crate::error::H3MessageError::UnexpectedHeadersInBody.into()),
+        );
+    }
+
+    #[test]
+    fn connection_encode_into_stream_error_covers_all_branches() {
+        let error = ConnectionEncodeError::Connection {
+            source: connection_error("connection"),
+        }
+        .into_stream_error(|_| H3NoError.into());
+        let connection::StreamError::Connection { source } = error else {
+            panic!("expected connection stream error");
+        };
+        assert_connection_reason(&source, "connection");
+
+        assert_stream_h3(
+            ConnectionEncodeError::Encode {
+                source: EncodeError::FramePayloadTooLarge,
+            }
+            .into_stream_error(|_| crate::error::H3MessageError::MissingHeaderSection.into()),
+        );
+    }
+
+    #[test]
+    fn stream_encode_error_recovers_from_io_error_sources() {
+        let direct = io::Error::from(StreamEncodeError::Reset { code: varint(1) });
+        let StreamEncodeError::Reset { code } = StreamEncodeError::from(direct) else {
+            panic!("expected direct stream encode error");
+        };
+        assert_eq!(code, varint(1));
+
+        let quic_reset = io::Error::from(quic::StreamError::Reset { code: varint(2) });
+        let StreamEncodeError::Reset { code } = StreamEncodeError::from(quic_reset) else {
+            panic!("expected quic stream reset");
+        };
+        assert_eq!(code, varint(2));
+
+        let quic_connection = io::Error::from(quic::StreamError::Connection {
+            source: application_error("quic stream connection"),
+        });
+        let StreamEncodeError::Connection { source } = StreamEncodeError::from(quic_connection)
+        else {
+            panic!("expected quic connection");
+        };
+        let connection::ConnectionError::Quic {
+            source: quic::ConnectionError::Application { source },
+        } = source
+        else {
+            panic!("expected application error");
+        };
+        assert_eq!(source.reason.as_ref(), "quic stream connection");
+
+        let h3_connection = io::Error::from(connection_error("h3 connection"));
+        let StreamEncodeError::Connection { source } = StreamEncodeError::from(h3_connection)
+        else {
+            panic!("expected h3 connection");
+        };
+        assert_connection_reason(&source, "h3 connection");
+
+        let encode = io::Error::from(EncodeError::HuffmanEncoding);
+        let StreamEncodeError::Encode { source } = StreamEncodeError::from(encode) else {
+            panic!("expected encode error");
+        };
+        assert_eq!(source, EncodeError::HuffmanEncoding);
+    }
+
+    #[test]
+    fn connection_encode_error_converts_to_io() {
+        let io_error = io::Error::from(ConnectionEncodeError::Connection {
+            source: connection_error("connection"),
+        });
+        assert_eq!(io_error.kind(), io::ErrorKind::BrokenPipe);
+
+        let io_error = io::Error::from(ConnectionEncodeError::Encode {
+            source: EncodeError::FramePayloadTooLarge,
+        });
+        assert_eq!(io_error.kind(), io::ErrorKind::InvalidData);
+    }
+}

@@ -516,3 +516,307 @@ where
         ready!(self.poll(cx)?).poll_close(cx)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        convert::Infallible,
+        future::{Ready, ready},
+        io::Cursor,
+    };
+
+    use bytes::Bytes;
+    use futures::{SinkExt, StreamExt, stream::FusedStream};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    use super::*;
+    use crate::{
+        codec::{DecodeError, EncodeError},
+        quic::{CancelStreamExt, GetStreamIdExt, StopStreamExt},
+    };
+
+    fn varint(value: u32) -> VarInt {
+        VarInt::from_u32(value)
+    }
+
+    fn assert_reset(error: quic::StreamError, expected: VarInt) {
+        let quic::StreamError::Reset { code } = error else {
+            panic!("expected stream reset");
+        };
+        assert_eq!(code, expected);
+    }
+
+    fn deferred_quic_error<T>(
+        value: T,
+        code: u32,
+    ) -> Deferred<T, quic::StreamError, Ready<Result<T, quic::StreamError>>> {
+        drop(value);
+        Deferred::from(ready(Err(quic::StreamError::Reset { code: varint(code) })))
+    }
+
+    #[test]
+    fn resolved_converts_from_result_and_back() {
+        assert_eq!(Resolved::<_, DecodeError>::from(Ok(7)).into_result(), Ok(7));
+        assert_eq!(
+            Resolved::<i32, _>::from(Err(DecodeError::Incomplete)).into_result(),
+            Err(DecodeError::Incomplete)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_delegates_async_read_and_write() {
+        let (mut input, output) = tokio::io::duplex(16);
+        input.write_all(b"hello").await.expect("write input");
+        input.shutdown().await.expect("shutdown input");
+
+        let mut reader: Resolved<_, DecodeError> = Resolved::ok(output);
+        let mut received = Vec::new();
+        reader
+            .read_to_end(&mut received)
+            .await
+            .expect("read resolved value");
+        assert_eq!(received, b"hello");
+
+        let (writer_side, mut output) = tokio::io::duplex(16);
+        let mut writer: Resolved<_, EncodeError> = Resolved::ok(writer_side);
+        writer
+            .write_all(b"world")
+            .await
+            .expect("write resolved value");
+        writer.shutdown().await.expect("shutdown resolved value");
+
+        let mut received = Vec::new();
+        output
+            .read_to_end(&mut received)
+            .await
+            .expect("read written bytes");
+        assert_eq!(received, b"world");
+    }
+
+    #[tokio::test]
+    async fn resolved_error_maps_to_async_io_errors() {
+        let (_input, output) = tokio::io::duplex(1);
+        let mut reader: Resolved<tokio::io::DuplexStream, DecodeError> =
+            Resolved::err(DecodeError::Incomplete);
+        let error = reader.read(&mut [0]).await.expect_err("read should fail");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        drop(output);
+
+        let (writer_side, _output) = tokio::io::duplex(1);
+        let mut writer: Resolved<tokio::io::DuplexStream, EncodeError> =
+            Resolved::err(EncodeError::FramePayloadTooLarge);
+        let error = writer.write_all(b"x").await.expect_err("write should fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        drop(writer_side);
+    }
+
+    #[tokio::test]
+    async fn resolved_delegates_buffered_read() {
+        let cursor = Cursor::new(b"line\nrest".to_vec());
+        let mut reader: Resolved<_, DecodeError> = Resolved::ok(BufReader::new(cursor));
+
+        let bytes = reader.fill_buf().await.expect("fill buffer");
+        assert_eq!(bytes, b"line\nrest");
+        reader.consume(5);
+
+        let mut rest = String::new();
+        reader
+            .read_to_string(&mut rest)
+            .await
+            .expect("read after consume");
+        assert_eq!(rest, "rest");
+    }
+
+    #[tokio::test]
+    async fn resolved_delegates_quic_stream_traits_and_stream_sink() {
+        let (reader, writer) = quic::test::mock_stream_pair(varint(11));
+        let mut reader: Resolved<_, quic::StreamError> = Resolved::ok(reader);
+        let mut writer: Resolved<_, quic::StreamError> = Resolved::ok(writer);
+
+        assert_eq!(reader.stream_id().await.expect("reader id"), varint(11));
+        assert_eq!(writer.stream_id().await.expect("writer id"), varint(11));
+
+        writer
+            .send(Bytes::from_static(b"payload"))
+            .await
+            .expect("send");
+        assert_eq!(
+            reader.next().await.expect("item").expect("read"),
+            Bytes::from_static(b"payload")
+        );
+
+        reader.stop(varint(12)).await.expect("stop");
+        writer.cancel(varint(13)).await.expect("cancel");
+    }
+
+    #[tokio::test]
+    async fn resolved_stream_error_yields_error_item_and_is_terminated() {
+        let mut stream: Resolved<
+            futures::stream::Empty<Result<Bytes, quic::StreamError>>,
+            quic::StreamError,
+        > = Resolved::err(quic::StreamError::Reset { code: varint(31) });
+        let item = stream.next().await.expect("error item").expect_err("reset");
+        assert_reset(item, varint(31));
+        assert!(stream.is_terminated());
+
+        let value: Resolved<_, Infallible> =
+            Resolved::ok(futures::stream::iter([Ok::<_, Infallible>(
+                Bytes::from_static(b"one"),
+            )]));
+        assert_eq!(value.size_hint(), (1, Some(1)));
+    }
+
+    #[tokio::test]
+    async fn deferred_future_resolves_success_and_error() {
+        let value = Deferred::from(ready(Ok::<_, DecodeError>(42)))
+            .await
+            .expect("deferred value");
+        assert_eq!(value, 42);
+
+        let error = Deferred::from(ready(Err::<i32, _>(DecodeError::IntegerOverflow)))
+            .await
+            .expect_err("deferred error");
+        assert_eq!(error, DecodeError::IntegerOverflow);
+    }
+
+    #[tokio::test]
+    async fn deferred_delegates_async_read_write_and_buffered_read() {
+        let (mut input, output) = tokio::io::duplex(16);
+        input.write_all(b"hello").await.expect("write input");
+        input.shutdown().await.expect("shutdown input");
+
+        let mut reader = Deferred::from(ready(Ok::<_, DecodeError>(output)));
+        let mut received = Vec::new();
+        reader
+            .read_to_end(&mut received)
+            .await
+            .expect("read deferred value");
+        assert_eq!(received, b"hello");
+
+        let (writer_side, mut output) = tokio::io::duplex(16);
+        let mut writer = Deferred::from(ready(Ok::<_, EncodeError>(writer_side)));
+        writer
+            .write_all(b"world")
+            .await
+            .expect("write deferred value");
+        writer.shutdown().await.expect("shutdown deferred value");
+        let mut received = Vec::new();
+        output
+            .read_to_end(&mut received)
+            .await
+            .expect("read written bytes");
+        assert_eq!(received, b"world");
+
+        let cursor = Cursor::new(b"line\nrest".to_vec());
+        let mut reader = Deferred::from(ready(Ok::<_, DecodeError>(BufReader::new(cursor))));
+        assert_eq!(reader.fill_buf().await.expect("fill buffer"), b"line\nrest");
+        reader.consume(5);
+        let mut rest = String::new();
+        reader
+            .read_to_string(&mut rest)
+            .await
+            .expect("read after consume");
+        assert_eq!(rest, "rest");
+    }
+
+    #[tokio::test]
+    async fn deferred_error_maps_to_async_io_errors() {
+        let (_input, output) = tokio::io::duplex(1);
+        let mut reader = Deferred::from(ready({
+            drop(output);
+            Err::<tokio::io::DuplexStream, _>(DecodeError::Incomplete)
+        }));
+        let error = reader.read(&mut [0]).await.expect_err("read should fail");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+
+        let (writer_side, _output) = tokio::io::duplex(1);
+        let mut writer = Deferred::from(ready({
+            drop(writer_side);
+            Err::<tokio::io::DuplexStream, _>(EncodeError::HuffmanEncoding)
+        }));
+        let error = writer.write_all(b"x").await.expect_err("write should fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn deferred_delegates_quic_stream_traits_and_stream_sink() {
+        let (reader, writer) = quic::test::mock_stream_pair(varint(21));
+        let mut reader = Deferred::from(ready(Ok::<_, quic::StreamError>(reader)));
+        let mut writer = Deferred::from(ready(Ok::<_, quic::StreamError>(writer)));
+
+        assert_eq!(reader.stream_id().await.expect("reader id"), varint(21));
+        assert_eq!(writer.stream_id().await.expect("writer id"), varint(21));
+
+        writer
+            .send(Bytes::from_static(b"deferred"))
+            .await
+            .expect("send");
+        assert_eq!(
+            reader.next().await.expect("item").expect("read"),
+            Bytes::from_static(b"deferred")
+        );
+
+        assert_eq!(reader.size_hint(), (0, None));
+
+        reader.stop(varint(22)).await.expect("stop");
+        writer.cancel(varint(23)).await.expect("cancel");
+    }
+
+    #[tokio::test]
+    async fn deferred_fused_stream_tracks_pending_and_ready_state() {
+        let stream =
+            futures::stream::iter([Ok::<_, Infallible>(Bytes::from_static(b"one"))]).fuse();
+        let mut stream = Deferred::from(ready(Ok::<_, Infallible>(stream)));
+
+        assert!(!stream.is_terminated());
+        assert_eq!(
+            stream.next().await.expect("item").expect("stream value"),
+            Bytes::from_static(b"one")
+        );
+        assert!(stream.next().await.is_none());
+        assert!(stream.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn deferred_error_maps_to_quic_stream_error_for_all_traits() {
+        let (reader, _writer) = quic::test::mock_stream_pair(varint(31));
+        let mut stream_id = deferred_quic_error(reader, 32);
+        assert_reset(
+            stream_id
+                .stream_id()
+                .await
+                .expect_err("stream id should fail"),
+            varint(32),
+        );
+
+        let (reader, _writer) = quic::test::mock_stream_pair(varint(33));
+        let mut stop = deferred_quic_error(reader, 34);
+        assert_reset(
+            stop.stop(varint(35)).await.expect_err("stop should fail"),
+            varint(34),
+        );
+
+        let (_reader, writer) = quic::test::mock_stream_pair(varint(36));
+        let mut cancel = deferred_quic_error(writer, 37);
+        assert_reset(
+            cancel
+                .cancel(varint(38))
+                .await
+                .expect_err("cancel should fail"),
+            varint(37),
+        );
+
+        let (reader, _writer) = quic::test::mock_stream_pair(varint(39));
+        let mut stream = deferred_quic_error(reader, 40);
+        let item = stream.next().await.expect("error item").expect_err("reset");
+        assert_reset(item, varint(40));
+
+        let (_reader, writer) = quic::test::mock_stream_pair(varint(41));
+        let mut sink = deferred_quic_error(writer, 42);
+        let error = sink
+            .send(Bytes::from_static(b"ignored"))
+            .await
+            .expect_err("send should fail");
+        assert_reset(error, varint(42));
+    }
+}

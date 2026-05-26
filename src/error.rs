@@ -310,3 +310,207 @@ impl H3ConnectionError for H3IdError {
         Code::H3_ID_ERROR
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        codec::{DecodeError, EncodeError},
+        connection::{ConnectionError, StreamError},
+    };
+
+    fn varint(value: u32) -> VarInt {
+        VarInt::from_u32(value)
+    }
+
+    fn assert_connection_error<E>(error: E, expected_code: Code, expected_display: &str)
+    where
+        E: H3ConnectionError + 'static,
+    {
+        assert_eq!(error.code(), expected_code);
+        assert_eq!(error.to_string(), expected_display);
+
+        let ConnectionError::H3 { source } = ConnectionError::from(error) else {
+            panic!("expected h3 connection error");
+        };
+        assert_eq!(source.code(), expected_code);
+        assert_eq!(source.to_string(), expected_display);
+    }
+
+    fn assert_stream_error<E>(error: E, expected_code: Code, expected_display: &str)
+    where
+        E: H3StreamError + 'static,
+    {
+        assert_eq!(error.code(), expected_code);
+        assert_eq!(error.to_string(), expected_display);
+
+        let StreamError::H3 { source } = StreamError::from(error) else {
+            panic!("expected h3 stream error");
+        };
+        assert_eq!(source.code(), expected_code);
+        assert_eq!(source.to_string(), expected_display);
+    }
+
+    #[test]
+    fn code_conversions_and_display_cover_known_and_unknown_codes() {
+        let known = Code::H3_NO_ERROR;
+        assert_eq!(known.into_inner(), varint(0x100));
+        assert_eq!(known.value(), varint(0x100));
+        assert_eq!(VarInt::from(known), varint(0x100));
+        assert_eq!(known.to_string(), "H3_NO_ERROR (0x100)");
+
+        let custom = Code::from(varint(0x12345));
+        assert_eq!(custom.into_inner(), varint(0x12345));
+        assert_eq!(custom.value(), varint(0x12345));
+        assert_eq!(custom.to_string(), "Code 0x12345");
+
+        let constructed = Code::new(varint(0x201));
+        assert_eq!(constructed, Code::QPACK_ENCODER_STREAM_ERROR);
+        assert_eq!(
+            constructed.to_string(),
+            "QPACK_ENCODER_STREAM_ERROR (0x201)"
+        );
+    }
+
+    #[test]
+    fn connection_error_types_report_their_codes_and_messages() {
+        for error in [
+            H3StreamCreationError::DuplicateControlStream,
+            H3StreamCreationError::DuplicateQpackEncoderStream,
+            H3StreamCreationError::DuplicateQpackDecoderStream,
+        ] {
+            assert_connection_error(
+                error,
+                Code::H3_STREAM_CREATION_ERROR,
+                match error {
+                    H3StreamCreationError::DuplicateControlStream => {
+                        "control stream already exists"
+                    }
+                    H3StreamCreationError::DuplicateQpackEncoderStream => {
+                        "qpack encoder stream already exists"
+                    }
+                    H3StreamCreationError::DuplicateQpackDecoderStream => {
+                        "qpack decoder stream already exists"
+                    }
+                },
+            );
+        }
+
+        assert_connection_error(
+            H3CriticalStreamClosed::QPackEncoder,
+            Code::H3_CLOSED_CRITICAL_STREAM,
+            "qpack encoder stream closed unexpectedly",
+        );
+        assert_connection_error(
+            H3CriticalStreamClosed::QPackDecoder,
+            Code::H3_CLOSED_CRITICAL_STREAM,
+            "qpack decoder stream closed unexpectedly",
+        );
+        assert_connection_error(
+            H3CriticalStreamClosed::Control,
+            Code::H3_CLOSED_CRITICAL_STREAM,
+            "control stream closed unexpectedly",
+        );
+
+        for error in [
+            H3FrameUnexpected::DuplicateSettings,
+            H3FrameUnexpected::UnexpectedFrameType,
+            H3FrameUnexpected::UnexpectedFrameDuringTrailer,
+        ] {
+            assert_connection_error(
+                error,
+                Code::H3_FRAME_UNEXPECTED,
+                match error {
+                    H3FrameUnexpected::DuplicateSettings => "received subsequent SETTINGS frame",
+                    H3FrameUnexpected::UnexpectedFrameType => {
+                        "unexpected frame type on request stream"
+                    }
+                    H3FrameUnexpected::UnexpectedFrameDuringTrailer => {
+                        "unexpected frame during trailer reading"
+                    }
+                },
+            );
+        }
+
+        assert_connection_error(H3NoError, Code::H3_NO_ERROR, "no error");
+        assert_connection_error(
+            H3MissingSettings,
+            Code::H3_MISSING_SETTINGS,
+            "no SETTINGS frame at beginning of control stream",
+        );
+        assert_connection_error(
+            H3GeneralProtocolError::TrailingPayload,
+            Code::H3_GENERAL_PROTOCOL_ERROR,
+            "trailing payload in GOAWAY frame",
+        );
+        assert_connection_error(
+            H3GeneralProtocolError::Decode {
+                source: DecodeError::ArithmeticOverflow,
+            },
+            Code::H3_GENERAL_PROTOCOL_ERROR,
+            "protocol decode error",
+        );
+        assert_connection_error(
+            H3InternalError::QPackEncoderEncode {
+                source: EncodeError::HuffmanEncoding,
+            },
+            Code::H3_INTERNAL_ERROR,
+            "QPACK encoder encode failure",
+        );
+        assert_connection_error(
+            H3InternalError::MissingServerName,
+            Code::H3_INTERNAL_ERROR,
+            "missing server name (SNI) on incoming connection",
+        );
+        assert_connection_error(
+            H3FrameDecodeError {
+                source: DecodeError::IntegerOverflow,
+            },
+            Code::H3_FRAME_ERROR,
+            "frame decode error",
+        );
+        assert_connection_error(
+            QpackDecompressionFailed::Decode {
+                source: DecodeError::DecompressionFailed,
+            },
+            Code::QPACK_DECOMPRESSION_FAILED,
+            "QPACK decompression decode error",
+        );
+
+        for error in [
+            H3IdError::PushIdExceedsLimit,
+            H3IdError::GoawayStreamIdOrdering,
+        ] {
+            assert_connection_error(
+                error,
+                Code::H3_ID_ERROR,
+                match error {
+                    H3IdError::PushIdExceedsLimit => "push ID exceeds limit",
+                    H3IdError::GoawayStreamIdOrdering => "GOAWAY stream ID ordering violation",
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn stream_error_types_report_their_codes_and_messages() {
+        assert_stream_error(
+            H3MessageError::MissingHeaderSection,
+            Code::H3_MESSAGE_ERROR,
+            "missing header section in HTTP message",
+        );
+        assert_stream_error(
+            H3MessageError::UnexpectedHeadersInBody,
+            Code::H3_MESSAGE_ERROR,
+            "unexpected headers frame in message body",
+        );
+        assert_stream_error(
+            H3ExcessiveFieldSectionSize {
+                actual: 8192,
+                limit: 4096,
+            },
+            Code::H3_EXCESSIVE_LOAD,
+            "field section size 8192 exceeds limit 4096",
+        );
+    }
+}
