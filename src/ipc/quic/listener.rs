@@ -343,7 +343,7 @@ mod tests {
     use remoc::prelude::ServerSharedMut;
     use smallvec::smallvec;
     use tokio::{
-        sync::{RwLock, mpsc},
+        sync::{RwLock, mpsc, oneshot},
         task::JoinHandle,
         time::{Duration, timeout},
     };
@@ -761,6 +761,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listen_adapter_accept_maps_queue_fd_error_when_parent_transport_is_closed() {
+        let parent_transport = ParentTransport::new();
+        let fd_sender = parent_transport.fd_sender();
+        drop(parent_transport);
+
+        let (conn_tx, conn_rx) = mpsc::channel(1);
+        conn_tx
+            .send(Arc::new(TestConnection))
+            .await
+            .expect("send test connection");
+        drop(conn_tx);
+
+        let mut adapter = ListenAdapter::<_, remoc::codec::Default>::new(
+            QueuedListen {
+                rx: conn_rx,
+                shutdown_error: None,
+            },
+            fd_sender,
+        );
+
+        let error = IpcListen::accept(&mut adapter)
+            .await
+            .expect_err("closed parent transport should fail queue_fds");
+        let ConnectionError::Transport { source } = error else {
+            panic!("expected transport error");
+        };
+        assert_eq!(source.reason, "ipc listen: queue fd");
+    }
+
+    #[tokio::test]
     async fn setup_connection_returns_when_peer_is_closed() {
         let (server_mux, client_mux) = MuxChannel::pair_for_test().expect("mux pair");
         let (sink, stream) = server_mux.split().expect("server split");
@@ -1029,6 +1059,68 @@ mod tests {
         }
 
         drop(listener);
+        timeout(Duration::from_secs(1), peer_task)
+            .await
+            .expect("peer task timeout")
+            .expect("peer task panicked");
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn ipc_listener_accept_returns_receive_bootstrap_none_when_sender_closes_gracefully() {
+        let parent_transport = ParentTransport::new();
+        let (server_mux, client_fd) = MuxChannel::create_pair().expect("mux pair");
+        let fd_id = parent_transport
+            .fd_sender()
+            .queue_fds(smallvec![client_fd])
+            .expect("queue mux fd");
+        let fd_registry = parent_transport.fd_registry();
+        let (client, server_task) = spawn_rpc_server(StaticIpcListen {
+            accept_result: Ok(fd_id),
+            shutdown_result: Ok(()),
+            parent_transport: Some(parent_transport),
+        });
+        let mut listener = IpcListener::<remoc::codec::Default>::new(client, fd_registry);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let peer_task = tokio::spawn(
+            async move {
+                let (sink, stream) = server_mux.split().expect("server split");
+                let (remoc_conn, tx, _rx) =
+                    remoc::Connect::framed::<_, _, ConnectionBootstrap, (), remoc::codec::Default>(
+                        remoc::Cfg::default(),
+                        sink,
+                        stream,
+                    )
+                    .await
+                    .expect("server handshake");
+                let remoc_task = tokio::spawn(remoc_conn.in_current_span());
+                drop(tx);
+
+                let _ = shutdown_rx.await;
+                remoc_task.abort();
+                let _ = remoc_task.await;
+            }
+            .in_current_span(),
+        );
+
+        let error = match timeout(Duration::from_secs(1), quic::Listen::accept(&mut listener))
+            .await
+            .expect("accept timeout")
+        {
+            Ok(_) => panic!("missing bootstrap should fail"),
+            Err(error) => error,
+        };
+        match error {
+            IpcListenError::ReceiveBootstrap { message } => {
+                assert_eq!(message, "base channel closed before bootstrap received");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        drop(listener);
+        let _ = shutdown_tx.send(());
         timeout(Duration::from_secs(1), peer_task)
             .await
             .expect("peer task timeout")

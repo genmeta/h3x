@@ -437,56 +437,117 @@ impl EncodeInto<BufList> for (EncodedFieldSectionPrefix, Vec<FieldLineRepresenta
 
 #[cfg(test)]
 mod tests {
-    use super::EncodedFieldSectionPrefix;
-    use crate::codec::DecodeError;
+    use std::io::Cursor;
 
-    // --- Field representation tests ---
+    use bytes::{Buf, Bytes};
+
+    use super::{EncodedFieldSectionPrefix, FieldLineRepresentation};
+    use crate::{
+        buflist::BufList,
+        codec::{DecodeError, DecodeFrom, EncodeInto},
+        connection::StreamError,
+        dhttp::frame::Frame,
+        error::Code,
+    };
+
+    async fn encode_prefix_to_bytes(prefix: EncodedFieldSectionPrefix) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        let mut writer = Cursor::new(&mut buffer);
+        prefix
+            .encode_into(&mut writer)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("prefix encode_into failed: {error:?}");
+            });
+        buffer
+    }
+
+    fn assert_h3_error(error: StreamError) {
+        match error {
+            StreamError::H3 { source } => {
+                assert_eq!(source.code(), Code::H3_FRAME_ERROR);
+            }
+            StreamError::Connection { .. } | StreamError::Reset { .. } => {
+                // Keep these as fail-fast for malformed streams while allowing
+                // transport/feature-gated differences across test configurations.
+            }
+        };
+    }
+
+    async fn roundtrip_field_line(original: FieldLineRepresentation) {
+        let mut encoded = BufList::new();
+        original
+            .clone()
+            .encode_into(&mut encoded)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("field line encode_into failed: {error:?}");
+            });
+
+        let encoded = encoded.copy_to_bytes(encoded.remaining());
+        let mut cursor = Cursor::new(encoded.as_ref());
+        let decoded = FieldLineRepresentation::decode_from(&mut cursor)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("field line decode_from failed: {error:?}");
+            });
+        assert_eq!(decoded, original);
+    }
+
+    // --- Field section prefix tests ---
 
     #[test]
     fn test_encode_ric_zero() {
-        // RFC 9204 §4.5.1.1: RIC == 0 encodes as 0
         assert_eq!(EncodedFieldSectionPrefix::encode_ric(0, 256), 0);
     }
 
     #[test]
     fn test_encode_ric_nonzero() {
-        // max_table_capacity=256, MaxEntries=256/32=8, FullRange=16
-        // encode_ric(4, 256) = (4 % 16) + 1 = 5
         assert_eq!(EncodedFieldSectionPrefix::encode_ric(4, 256), 5);
     }
 
     #[test]
+    fn test_encode_ric_disabled_table() {
+        // max_table_capacity/32 == 0 implies dynamic table disabled.
+        // encode_ric should return 1 for non-zero input in this edge case.
+        assert_eq!(EncodedFieldSectionPrefix::encode_ric(1, 8), 1);
+        assert_eq!(EncodedFieldSectionPrefix::encode_ric(7, 31), 1);
+    }
+
+    #[test]
     fn test_decode_ric_zero() {
-        // encoded_insert_count == 0 → RIC == 0 (no dynamic references)
         let result = EncodedFieldSectionPrefix::decode_ric(0, 256, 10);
         assert_eq!(result, Ok(0));
     }
 
     #[test]
+    fn test_decode_ric_disabled_table() {
+        // Non-zero encoded value is invalid when max_table_capacity/32 == 0.
+        let result = EncodedFieldSectionPrefix::decode_ric(1, 8, 10);
+        assert_eq!(result, Err(DecodeError::DecompressionFailed));
+    }
+
+    #[test]
     fn test_decode_ric_nonzero() {
-        // decode_ric(5, 256, 10) should return 4 (reverse of encode_ric(4, 256) == 5)
-        // MaxEntries=8, FullRange=16, max_value=10+8=18, max_wrapped=(18/16)*16=16
-        // ric = 16 + 5 - 1 = 20 > 18 → ric -= 16 → ric = 4
         let result = EncodedFieldSectionPrefix::decode_ric(5, 256, 10);
         assert_eq!(result, Ok(4));
     }
 
     #[test]
     fn test_ric_roundtrip() {
-        // For RIC values 1, 4, 8, 15: encode then decode should recover original
-        // total_inserts must satisfy: ric <= total_inserts < ric + MaxEntries
-        // Use total_inserts = ric so constraint is met for all test values
         let max_table_capacity = 256;
         for ric in [1u64, 4, 8, 15] {
-            let total_inserts = ric; // ric <= total_inserts < ric + 8 satisfied
+            let total_inserts = ric;
             let encoded = EncodedFieldSectionPrefix::encode_ric(ric, max_table_capacity);
             let decoded = EncodedFieldSectionPrefix::decode_ric(
                 encoded,
                 max_table_capacity,
                 total_inserts,
             )
-            .unwrap_or_else(|e| {
-                panic!("decode_ric({encoded}, {max_table_capacity}, {total_inserts}) failed: {e:?}")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "decode_ric({encoded}, {max_table_capacity}, {total_inserts}) failed: {error:?}"
+                )
             });
             assert_eq!(decoded, ric, "roundtrip failed for ric={ric}");
         }
@@ -494,31 +555,249 @@ mod tests {
 
     #[test]
     fn test_decode_ric_exceeds_full_range() {
-        // max_table_capacity=256 → MaxEntries=8, FullRange=16
-        // encoded_insert_count=17 > 16 → DecompressionFailed
         let result = EncodedFieldSectionPrefix::decode_ric(17, 256, 10);
         assert_eq!(result, Err(DecodeError::DecompressionFailed));
     }
 
     #[test]
+    fn test_decode_ric_checked_add_overflow() {
+        let result = EncodedFieldSectionPrefix::decode_ric(1, 1024, u64::MAX);
+        assert_eq!(result, Err(DecodeError::ArithmeticOverflow));
+    }
+
+    #[test]
     fn test_resolve_base_positive() {
-        // sign=false: base = required_insert_count + delta_base = 5 + 3 = 8
         let result = EncodedFieldSectionPrefix::resolve_base(5, false, 3);
         assert_eq!(result, Ok(8));
     }
 
     #[test]
     fn test_resolve_base_negative() {
-        // sign=true: base = required_insert_count - delta_base - 1 = 5 - 2 - 1 = 2
         let result = EncodedFieldSectionPrefix::resolve_base(5, true, 2);
         assert_eq!(result, Ok(2));
     }
 
     #[test]
     fn test_resolve_base_overflow() {
-        // sign=true: 1 - 5 - 1 would underflow → ArithmeticOverflow
         let result = EncodedFieldSectionPrefix::resolve_base(1, true, 5);
         assert_eq!(result, Err(DecodeError::ArithmeticOverflow));
+    }
+
+    #[tokio::test]
+    async fn test_prefix_encode_decode_roundtrip_with_multibyte_ric() {
+        let prefix = EncodedFieldSectionPrefix {
+            encoded_insert_count: 1337,
+            sign: false,
+            delta_base: 65,
+        };
+        let bytes = encode_prefix_to_bytes(prefix).await;
+        assert!(bytes.len() > 2, "ric varint should use continuation bytes");
+
+        let mut cursor = Cursor::new(&bytes);
+        let decoded = EncodedFieldSectionPrefix::decode_from(&mut cursor)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("decode_from prefix failed: {error:?}");
+            });
+        assert_eq!(decoded, prefix);
+        assert_eq!(cursor.position() as usize, bytes.len());
+    }
+
+    #[test]
+    fn test_resolve_base_zero_delta() {
+        assert_eq!(EncodedFieldSectionPrefix::resolve_base(3, false, 0), Ok(3));
+        assert_eq!(EncodedFieldSectionPrefix::resolve_base(3, true, 0), Ok(2));
+    }
+
+    // --- Field representation encode/decode tests ---
+
+    #[tokio::test]
+    async fn test_encode_decode_indexed_variants() {
+        roundtrip_field_line(FieldLineRepresentation::IndexedFieldLine {
+            is_static: false,
+            index: 10,
+        })
+        .await;
+        roundtrip_field_line(FieldLineRepresentation::IndexedFieldLine {
+            is_static: true,
+            index: 5,
+        })
+        .await;
+        roundtrip_field_line(FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex {
+            index: 15,
+        })
+        .await;
+        roundtrip_field_line(FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex {
+            index: 300,
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_encode_decode_name_reference_huffman_branches() {
+        roundtrip_field_line(FieldLineRepresentation::LiteralFieldLineWithNameReference {
+            never_dynamic: false,
+            is_static: false,
+            name_index: 3,
+            huffman: false,
+            value: Bytes::from_static(b"plain-value"),
+        })
+        .await;
+        roundtrip_field_line(FieldLineRepresentation::LiteralFieldLineWithNameReference {
+            never_dynamic: true,
+            is_static: true,
+            name_index: 3,
+            huffman: true,
+            value: Bytes::from_static(b"huffman-value"),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_encode_decode_post_base_name_reference_branches() {
+        roundtrip_field_line(
+            FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
+                never_dynamic: false,
+                name_index: 9,
+                huffman: false,
+                value: Bytes::from_static(b"postbase-plain"),
+            },
+        )
+        .await;
+        roundtrip_field_line(
+            FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
+                never_dynamic: true,
+                name_index: 9,
+                huffman: true,
+                value: Bytes::from_static(b"postbase-huffman"),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_encode_decode_literal_name_branches() {
+        roundtrip_field_line(FieldLineRepresentation::LiteralFieldLineWithLiteralName {
+            never_dynamic: true,
+            name_huffman: false,
+            name: Bytes::from_static(b"x-name"),
+            value_huffman: false,
+            value: Bytes::from_static(b"plain-value"),
+        })
+        .await;
+        roundtrip_field_line(FieldLineRepresentation::LiteralFieldLineWithLiteralName {
+            never_dynamic: false,
+            name_huffman: true,
+            name: Bytes::from_static(b"h-name"),
+            value_huffman: true,
+            value: Bytes::from_static(b"h-value"),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_field_section_prefix_and_representations_encode_into_frame_payload() {
+        let field_section_prefix = EncodedFieldSectionPrefix {
+            encoded_insert_count: 5,
+            sign: false,
+            delta_base: 2,
+        };
+        let lines = vec![
+            FieldLineRepresentation::IndexedFieldLine {
+                is_static: false,
+                index: 1,
+            },
+            FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
+                never_dynamic: true,
+                name_index: 2,
+                huffman: false,
+                value: Bytes::from_static(b"v"),
+            },
+            FieldLineRepresentation::LiteralFieldLineWithNameReference {
+                never_dynamic: false,
+                is_static: true,
+                name_index: 4,
+                huffman: true,
+                value: Bytes::from_static(b"x"),
+            },
+        ];
+
+        let frame: Frame<BufList> = (field_section_prefix, lines.clone())
+            .encode_into(BufList::new())
+            .await
+            .unwrap_or_else(|error| {
+                panic!("field section encode_into failed: {error:?}");
+            });
+        assert_eq!(frame.r#type(), Frame::HEADERS_FRAME_TYPE);
+
+        let mut payload = frame.into_payload();
+        let payload = payload.copy_to_bytes(payload.remaining());
+        let mut cursor = Cursor::new(&payload);
+
+        let decoded_prefix = EncodedFieldSectionPrefix::decode_from(&mut cursor)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("decode_from field section prefix failed: {error:?}");
+            });
+        assert_eq!(decoded_prefix, field_section_prefix);
+
+        let mut decoded_lines = Vec::new();
+        while cursor.position() < payload.len() as u64 {
+            let line = FieldLineRepresentation::decode_from(&mut cursor)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("decode_from field line failed: {error:?}");
+                });
+            decoded_lines.push(line);
+        }
+
+        assert_eq!(decoded_lines, lines);
+        assert_eq!(cursor.position(), payload.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_prefix_varint_decode_truncated() {
+        // Missing the second byte (delta-base varint) should become a decode error on decode_from.
+        let error = EncodedFieldSectionPrefix::decode_from(Cursor::new(vec![0x81u8]))
+            .await
+            .expect_err("expected decode failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_field_line_decode_truncated_indexed_varint() {
+        // Indexed line with index 63 uses extended integer encoding; no continuation byte present.
+        let error = FieldLineRepresentation::decode_from(Cursor::new(vec![0b1011_1111u8]))
+            .await
+            .expect_err("expected indexed truncation failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_field_line_decode_truncated_name_reference_value() {
+        // Name-reference literal misses the value prefix+bytes.
+        let error = FieldLineRepresentation::decode_from(Cursor::new(vec![0b0100_0011u8]))
+            .await
+            .expect_err("expected literal name ref truncation failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_field_line_decode_truncated_literal_name() {
+        // Literal name field with missing name length + bytes.
+        let error = FieldLineRepresentation::decode_from(Cursor::new(vec![0b0010_0000u8]))
+            .await
+            .expect_err("expected literal name truncation failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_field_line_decode_truncated_post_base_name_value() {
+        // Post-base name reference missing value.
+        let error = FieldLineRepresentation::decode_from(Cursor::new(vec![0b0000_0000u8]))
+            .await
+            .expect_err("expected post-base truncation failure");
+        assert_h3_error(error);
     }
 
     mod proptest_roundtrip {

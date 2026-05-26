@@ -213,12 +213,14 @@ impl ReadStream {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         pin::Pin,
         sync::{Arc, Mutex},
         task::{Context, Poll},
     };
 
-    use futures::{FutureExt, StreamExt, future::poll_fn};
+    use futures::{FutureExt, Stream, StreamExt, future::poll_fn};
+    use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
 
     use super::*;
 
@@ -305,6 +307,200 @@ mod tests {
         ));
 
         assert!(futures::poll!(stream.as_mut().next()).is_pending());
+        assert!(
+            poll_fn(|cx| stream.as_mut().poll_stream_id(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert!(
+            poll_fn(|cx| stream.as_mut().poll_stop(cx, VarInt::from_u32(41)))
+                .now_or_never()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn unfold_yields_error_items_without_terminating_the_stream() {
+        let mut stream = Box::pin(unfold(
+            VecDeque::from([
+                Ok::<Bytes, MessageStreamError>(Bytes::from_static(b"chunk-1")),
+                Err::<Bytes, MessageStreamError>(MessageStreamError::MalformedIncomingMessage),
+                Ok(Bytes::from_static(b"chunk-2")),
+            ]),
+            |mut items| async move { items.pop_front().map(|item| (item, items)) },
+        ));
+
+        match stream.as_mut().next().await {
+            Some(Ok(item)) => assert_eq!(item, Bytes::from_static(b"chunk-1")),
+            value => panic!("unexpected first item: {value:?}"),
+        }
+        assert!(matches!(
+            stream.as_mut().next().await,
+            Some(Err(MessageStreamError::MalformedIncomingMessage))
+        ));
+        match stream.as_mut().next().await {
+            Some(Ok(item)) => assert_eq!(item, Bytes::from_static(b"chunk-2")),
+            value => panic!("unexpected third item: {value:?}"),
+        }
+        assert!(stream.as_mut().next().await.is_none());
+        assert!(stream.as_ref().get_ref().is_terminated());
+    }
+
+    #[tokio::test]
+    async fn stream_reader_implements_async_read_and_hits_eof() {
+        let mut reader = Box::pin(StreamReader::new(unfold(
+            VecDeque::from([
+                Ok::<Bytes, MessageStreamError>(Bytes::from_static(b"hel")),
+                Ok::<Bytes, MessageStreamError>(Bytes::from_static(b"lo")),
+                Ok::<Bytes, MessageStreamError>(Bytes::from_static(b"")),
+                Ok::<Bytes, MessageStreamError>(Bytes::from_static(b"world")),
+            ]),
+            |mut chunks| async move { chunks.pop_front().map(|chunk| (chunk, chunks)) },
+        )));
+
+        let mut data = Vec::new();
+        let mut read = 0;
+
+        loop {
+            let mut buf = [0_u8; 4];
+            let n = poll_fn(|cx| {
+                let mut read_buf = ReadBuf::new(&mut buf);
+                match reader.as_mut().poll_read(cx, &mut read_buf) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(ready) => Poll::Ready(ready.map(|_| read_buf.filled().len())),
+                }
+            })
+            .await
+            .unwrap();
+
+            if n == 0 {
+                break;
+            }
+
+            data.extend_from_slice(&buf[..n]);
+            read += n;
+        }
+
+        assert_eq!(read, 10);
+        assert_eq!(data, b"helloworld");
+        let mut buf = [0_u8; 4];
+        assert_eq!(
+            poll_fn(|cx| {
+                let mut read_buf = ReadBuf::new(&mut buf);
+                match reader.as_mut().poll_read(cx, &mut read_buf) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(ready) => Poll::Ready(ready.map(|_| read_buf.filled().len())),
+                }
+            })
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_reader_implements_async_buf_read() {
+        let mut reader = Box::pin(StreamReader::new(unfold(
+            VecDeque::from([
+                Ok::<Bytes, MessageStreamError>(Bytes::from_static(b"ab")),
+                Ok::<Bytes, MessageStreamError>(Bytes::from_static(b"cd")),
+            ]),
+            |mut chunks| async move { chunks.pop_front().map(|chunk| (chunk, chunks)) },
+        )));
+
+        assert_eq!(
+            poll_fn(|cx| {
+                reader
+                    .as_mut()
+                    .poll_fill_buf(cx)
+                    .map(|result| result.map(|buf| buf.to_vec()))
+            })
+            .await
+            .unwrap(),
+            b"ab"
+        );
+        reader.as_mut().consume(1);
+        assert_eq!(
+            poll_fn(|cx| {
+                reader
+                    .as_mut()
+                    .poll_fill_buf(cx)
+                    .map(|result| result.map(|buf| buf.to_vec()))
+            })
+            .await
+            .unwrap(),
+            b"b"
+        );
+        reader.as_mut().consume(1);
+        assert_eq!(
+            poll_fn(|cx| {
+                reader
+                    .as_mut()
+                    .poll_fill_buf(cx)
+                    .map(|result| result.map(|buf| buf.to_vec()))
+            })
+            .await
+            .unwrap(),
+            b"cd"
+        );
+        reader.as_mut().consume(2);
+        assert_eq!(
+            poll_fn(|cx| {
+                reader
+                    .as_mut()
+                    .poll_fill_buf(cx)
+                    .map(|result| result.map(|buf| buf.to_vec()))
+            })
+            .await
+            .unwrap(),
+            b""
+        );
+    }
+
+    #[tokio::test]
+    async fn read_stream_as_reader_reports_eof_and_termination() {
+        let mut stream = crate::message::test::read_stream_for_test(VarInt::from_u32(71));
+        let mut reader = Box::pin(stream.as_reader());
+
+        assert!(poll_fn(|cx| reader.as_mut().poll_next(cx)).await.is_none());
+        assert!(reader.stream().is_terminated());
+    }
+
+    #[tokio::test]
+    async fn read_stream_into_box_reader_forwards_control_traits_and_stops_at_eof() {
+        let stream_id = VarInt::from_u32(90);
+        let stop_code = VarInt::from_u32(102);
+
+        let mut stream = crate::message::test::read_stream_for_test(stream_id);
+        let mut reader = stream.as_box_reader();
+
+        assert_eq!(
+            poll_fn(|cx| Pin::new(&mut reader).poll_stream_id(cx))
+                .await
+                .unwrap(),
+            stream_id
+        );
+        poll_fn(|cx| Pin::new(&mut reader).poll_stop(cx, stop_code))
+            .await
+            .unwrap();
+
+        let mut inner = Box::pin(reader.into_inner());
+        assert!(poll_fn(|cx| inner.as_mut().poll_next(cx)).await.is_none());
+        assert!(inner.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn unfold_waits_for_termination_controls_after_done() {
+        let mut stream = Box::pin(unfold(
+            ControlStream {
+                stream_id: VarInt::from_u32(37),
+                stopped: Arc::new(Mutex::new(None)),
+            },
+            |_stream: ControlStream| async move { None::<((), ControlStream)> },
+        ));
+
+        assert!(stream.as_mut().next().await.is_none());
+        assert!(stream.as_ref().get_ref().is_terminated());
         assert!(
             poll_fn(|cx| stream.as_mut().poll_stream_id(cx))
                 .now_or_never()
