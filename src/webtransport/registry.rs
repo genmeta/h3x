@@ -183,3 +183,296 @@ impl SessionStreamRouter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+
+    use bytes::Bytes;
+    use futures::{Sink, Stream};
+
+    use super::*;
+    use crate::{
+        codec::{BoxReadStream, BoxWriteStream},
+        quic::{self, GetStreamIdExt},
+        varint::VarInt,
+    };
+
+    #[derive(Debug, Default)]
+    struct StreamState {
+        written: Mutex<Vec<u8>>,
+    }
+
+    #[derive(Debug)]
+    struct TestReadStream {
+        chunks: VecDeque<Bytes>,
+        stream_id: VarInt,
+    }
+
+    impl Stream for TestReadStream {
+        type Item = Result<Bytes, quic::StreamError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.chunks.pop_front().map(Ok))
+        }
+    }
+
+    impl quic::GetStreamId for TestReadStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
+        }
+    }
+
+    impl quic::StopStream for TestReadStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestWriteStream {
+        state: Arc<StreamState>,
+        stream_id: VarInt,
+    }
+
+    impl Sink<Bytes> for TestWriteStream {
+        type Error = quic::StreamError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+            self.state
+                .written
+                .lock()
+                .expect("written lock poisoned")
+                .extend_from_slice(&item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl quic::GetStreamId for TestWriteStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
+        }
+    }
+
+    impl quic::CancelStream for TestWriteStream {
+        fn poll_cancel(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn test_read_stream(id: u32, bytes: Vec<u8>) -> BoxReadStream {
+        Box::pin(TestReadStream {
+            chunks: VecDeque::from([Bytes::from(bytes)]),
+            stream_id: VarInt::from_u32(id),
+        }) as BoxReadStream
+    }
+
+    fn test_write_stream(id: u32, state: Arc<StreamState>) -> BoxWriteStream {
+        Box::pin(TestWriteStream {
+            state,
+            stream_id: VarInt::from_u32(id),
+        }) as BoxWriteStream
+    }
+
+    fn bidi_stream(id: u32) -> RoutedBiStream {
+        let state = Arc::new(StreamState::default());
+        (
+            test_read_stream(id, vec![id as u8]),
+            test_write_stream(id, Arc::clone(&state)),
+        )
+    }
+
+    fn uni_stream(id: u32) -> RoutedUniStream {
+        test_read_stream(id, vec![id as u8])
+    }
+
+    #[test]
+    fn register_len_duplicate_and_close_unregister() {
+        let registry = Registry::default();
+        let session_id = StreamId::from(VarInt::from_u32(4));
+
+        let registered = registry
+            .register(session_id)
+            .expect("first registration should succeed");
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registered.state.id(), session_id);
+        assert!(registered.state.check_open().is_ok());
+
+        let error = registry
+            .register(session_id)
+            .expect_err("duplicate session should be rejected");
+        assert!(matches!(
+            error,
+            RegisterSessionError::AlreadyRegistered { session_id: duplicate } if duplicate == session_id
+        ));
+
+        registered.state.close();
+        assert_eq!(registry.len(), 0);
+        assert!(registered.state.check_open().is_err());
+
+        registered.state.close();
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn dropping_registered_session_unregisters_it() {
+        let registry = Registry::default();
+        let session_id = StreamId::from(VarInt::from_u32(8));
+
+        let registered = registry
+            .register(session_id)
+            .expect("registration should succeed");
+        assert_eq!(registry.len(), 1);
+
+        drop(registered);
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn route_unknown_sessions_return_original_streams() {
+        let registry = Registry::default();
+        let session_id = StreamId::from(VarInt::from_u32(4));
+
+        let bidi = bidi_stream(1);
+        let mut returned_bidi = registry
+            .route_bi(session_id, bidi)
+            .expect_err("unknown bidi session should reject stream");
+        assert_eq!(
+            returned_bidi
+                .0
+                .stream_id()
+                .await
+                .expect("returned bidi stream id should be readable"),
+            VarInt::from_u32(1)
+        );
+
+        let uni = uni_stream(2);
+        let mut returned_uni = registry
+            .route_uni(session_id, uni)
+            .expect_err("unknown uni session should reject stream");
+        assert_eq!(
+            returned_uni
+                .stream_id()
+                .await
+                .expect("returned uni stream id should be readable"),
+            VarInt::from_u32(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn route_known_sessions_deliver_streams_to_receivers() {
+        let registry = Registry::default();
+        let session_id = StreamId::from(VarInt::from_u32(4));
+        let mut registered = registry
+            .register(session_id)
+            .expect("registration should succeed");
+
+        assert!(registry.route_bi(session_id, bidi_stream(3)).is_ok());
+        assert!(registry.route_uni(session_id, uni_stream(4)).is_ok());
+
+        let (mut bidi_reader, _bidi_writer) = registered
+            .bidi_rx
+            .recv()
+            .await
+            .expect("bidi receiver should get a stream");
+        let mut uni_reader = registered
+            .uni_rx
+            .recv()
+            .await
+            .expect("uni receiver should get a stream");
+
+        assert_eq!(
+            bidi_reader
+                .stream_id()
+                .await
+                .expect("bidi stream id should be readable"),
+            VarInt::from_u32(3)
+        );
+        assert_eq!(
+            uni_reader
+                .stream_id()
+                .await
+                .expect("uni stream id should be readable"),
+            VarInt::from_u32(4)
+        );
+    }
+
+    #[test]
+    fn route_rejects_closed_or_full_channels() {
+        let registry = Registry::default();
+        let session_id = StreamId::from(VarInt::from_u32(4));
+        let registered = registry
+            .register(session_id)
+            .expect("registration should succeed");
+
+        drop(registered.bidi_rx);
+        drop(registered.uni_rx);
+        assert!(registry.route_bi(session_id, bidi_stream(5)).is_err());
+        assert!(registry.route_uni(session_id, uni_stream(6)).is_err());
+    }
+
+    #[test]
+    fn route_rejects_when_session_channel_is_full() {
+        let registry = Registry::default();
+        let session_id = StreamId::from(VarInt::from_u32(9));
+        let _registered = registry
+            .register(session_id)
+            .expect("registration should succeed");
+
+        for id in 0..SESSION_STREAM_CHANNEL_SIZE {
+            assert!(
+                registry
+                    .route_bi(session_id, bidi_stream(id as u32))
+                    .is_ok()
+            );
+            assert!(
+                registry
+                    .route_uni(session_id, uni_stream(id as u32))
+                    .is_ok()
+            );
+        }
+
+        assert!(registry.route_bi(session_id, bidi_stream(99)).is_err());
+        assert!(registry.route_uni(session_id, uni_stream(100)).is_err());
+    }
+}

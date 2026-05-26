@@ -232,7 +232,7 @@ mod tests {
 
     use bytes::Bytes;
     use dhttp_identity::identity as agent;
-    use futures::{Sink, Stream, future::pending};
+    use futures::{Sink, Stream, StreamExt, future::pending};
 
     use super::*;
     use crate::{
@@ -291,6 +291,185 @@ mod tests {
             vec![Code::H3_REQUEST_CANCELLED.into_inner()]
         );
         assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn registered_bidi_session_receives_payload_after_header() {
+        let state = Arc::new(StreamState::default());
+        let reader = test_reader(
+            state.clone(),
+            vec![Bytes::from_static(&[0x40, 0x41, 0x2a, 0xde, 0xad])],
+        );
+        let writer = test_writer(state.clone());
+        let protocol = test_protocol();
+        let mut registered = protocol
+            .register(StreamId::from(VarInt::from_u32(42)))
+            .expect("session registration should succeed");
+
+        let verdict = protocol
+            .accept_bi((reader, writer))
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        let (mut routed_reader, _routed_writer) = registered
+            .bidi_rx
+            .recv()
+            .await
+            .expect("registered session should receive bidi stream");
+        assert_eq!(
+            routed_reader
+                .next()
+                .await
+                .expect("reader should yield a payload chunk")
+                .expect("payload chunk should succeed"),
+            Bytes::from_static(&[0xde, 0xad])
+        );
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn registered_uni_session_receives_payload_after_header() {
+        let state = Arc::new(StreamState::default());
+        let stream = test_reader(
+            state.clone(),
+            vec![Bytes::from_static(&[0x40, 0x54, 0x2a, 0xbe, 0xef])],
+        );
+        let protocol = test_protocol();
+        let mut registered = protocol
+            .register(StreamId::from(VarInt::from_u32(42)))
+            .expect("session registration should succeed");
+
+        let verdict = protocol
+            .accept_uni(stream)
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        let mut routed_reader = registered
+            .uni_rx
+            .recv()
+            .await
+            .expect("registered session should receive uni stream");
+        assert_eq!(
+            routed_reader
+                .next()
+                .await
+                .expect("reader should yield a payload chunk")
+                .expect("payload chunk should succeed"),
+            Bytes::from_static(&[0xbe, 0xef])
+        );
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wrong_bidi_signal_is_passed_through_without_aborting() {
+        let state = Arc::new(StreamState::default());
+        let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x05, 0x99])]);
+        let writer = test_writer(state.clone());
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_bi((reader, writer))
+            .await
+            .expect("routing should not fail");
+
+        let StreamVerdict::Passed((mut passed_reader, _passed_writer)) = verdict else {
+            panic!("unexpected verdict");
+        };
+        Pin::new(&mut passed_reader).reset();
+        let mut passed_reader = passed_reader.into_stream_reader();
+        assert_eq!(
+            passed_reader
+                .next()
+                .await
+                .expect("reader should yield original bytes")
+                .expect("reader chunk should succeed"),
+            Bytes::from_static(&[0x05, 0x99])
+        );
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wrong_uni_signal_is_passed_through_without_stopping() {
+        let state = Arc::new(StreamState::default());
+        let stream = test_reader(state.clone(), vec![Bytes::from_static(&[0x06, 0x77])]);
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_uni(stream)
+            .await
+            .expect("routing should not fail");
+
+        let StreamVerdict::Passed(mut passed_stream) = verdict else {
+            panic!("unexpected verdict");
+        };
+        Pin::new(&mut passed_stream).reset();
+        let mut passed_stream = passed_stream.into_stream_reader();
+        assert_eq!(
+            passed_stream
+                .next()
+                .await
+                .expect("reader should yield original bytes")
+                .expect("reader chunk should succeed"),
+            Bytes::from_static(&[0x06, 0x77])
+        );
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncated_bidi_session_id_is_accepted_without_abort() {
+        let state = Arc::new(StreamState::default());
+        let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x41])]);
+        let writer = test_writer(state.clone());
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_bi((reader, writer))
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncated_uni_session_id_is_accepted_without_stop() {
+        let state = Arc::new(StreamState::default());
+        let stream = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x54])]);
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_uni(stream)
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[test]
+    fn protocol_debug_and_factory_display_expose_session_count_and_name() {
+        let protocol = test_protocol();
+        assert_eq!(format!("{}", WebTransportProtocolFactory), "WebTransport");
+        assert_eq!(
+            format!("{protocol:?}"),
+            "WebTransportProtocol { sessions: 0 }"
+        );
+
+        let _registered = protocol
+            .register(StreamId::from(VarInt::from_u32(42)))
+            .expect("session registration should succeed");
+        assert_eq!(
+            format!("{protocol:?}"),
+            "WebTransportProtocol { sessions: 1 }"
+        );
     }
 
     #[derive(Debug, Default)]
