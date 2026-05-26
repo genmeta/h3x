@@ -388,9 +388,10 @@ impl quic::Connect for Arc<dquic::prelude::QuicClient> {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
+    use std::{borrow::Cow, sync::Arc};
 
     use dquic::{
+        prelude::handy::{ToCertificate, ToPrivateKey},
         qbase::{
             error::{AppError, Error as DquicError, ErrorFrameType, ErrorKind, QuicError},
             frame::{FrameType, ResetStreamError},
@@ -400,6 +401,17 @@ mod tests {
     };
 
     use super::*;
+
+    const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");
+    const SERVER_KEY: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
+
+    fn make_identity() -> crate::dquic::identity::Identity {
+        crate::dquic::identity::Identity::new(
+            "localhost".parse().expect("valid identity name"),
+            SERVER_CERT.to_certificate(),
+            SERVER_KEY.to_private_key(),
+        )
+    }
 
     fn assert_transport_error(
         error: quic::ConnectionError,
@@ -498,5 +510,101 @@ mod tests {
     #[should_panic(expected = "h3x write data after shutdown")]
     fn convert_stream_error_rejects_eos_sent() {
         _ = convert_stream_error(DquicStreamError::EosSent);
+    }
+
+    #[tokio::test]
+    async fn dquic_local_agent_exposes_identity_and_signing() {
+        let identity = make_identity();
+        let certified_key =
+            crate::dquic::identity::build_certified_key(&identity).expect("test key should load");
+        let local = DquicLocalAgent {
+            name: Arc::from(identity.name.as_str()),
+            certified_key,
+        };
+
+        assert_eq!(agent::LocalAgent::name(&local), "localhost");
+        assert_eq!(agent::LocalAgent::cert_chain(&local), identity.cert_chain());
+        assert_eq!(
+            agent::LocalAgent::sign_algorithm(&local),
+            rustls::SignatureAlgorithm::ECDSA
+        );
+        assert!(format!("{local:?}").contains("DquicLocalAgent"));
+
+        let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
+        let signature = agent::LocalAgent::sign(&local, scheme, b"payload")
+            .await
+            .expect("signature");
+        assert!(
+            agent::LocalAgent::verify(&local, scheme, b"payload", &signature)
+                .await
+                .expect("verification should run")
+        );
+        assert!(
+            !agent::LocalAgent::verify(&local, scheme, b"wrong payload", &signature)
+                .await
+                .expect("verification should run")
+        );
+    }
+
+    #[tokio::test]
+    async fn dquic_local_agent_reports_unsupported_sign_scheme() {
+        let identity = make_identity();
+        let certified_key =
+            crate::dquic::identity::build_certified_key(&identity).expect("test key should load");
+        let local = DquicLocalAgent {
+            name: Arc::from(identity.name.as_str()),
+            certified_key,
+        };
+
+        let error = agent::LocalAgent::sign(&local, SignatureScheme::RSA_PKCS1_SHA256, b"payload")
+            .await
+            .expect_err("rsa should not be supported by an ecdsa key");
+        assert!(matches!(
+            error,
+            SignError::UnsupportedScheme {
+                scheme: SignatureScheme::RSA_PKCS1_SHA256
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dquic_remote_agent_exposes_identity_and_verification() {
+        let identity = make_identity();
+        let certified_key =
+            crate::dquic::identity::build_certified_key(&identity).expect("test key should load");
+        let local = DquicLocalAgent {
+            name: Arc::from(identity.name.as_str()),
+            certified_key,
+        };
+        let remote = DquicRemoteAgent {
+            name: Arc::from("peer.localhost"),
+            cert_chain: Arc::from(identity.cert_chain()),
+        };
+
+        assert_eq!(agent::RemoteAgent::name(&remote), "peer.localhost");
+        assert_eq!(
+            agent::RemoteAgent::cert_chain(&remote),
+            identity.cert_chain()
+        );
+        assert_eq!(
+            agent::RemoteAgent::public_key(&remote).as_ref(),
+            agent::LocalAgent::public_key(&local).as_ref()
+        );
+        assert!(format!("{remote:?}").contains("DquicRemoteAgent"));
+
+        let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
+        let signature = agent::LocalAgent::sign(&local, scheme, b"payload")
+            .await
+            .expect("signature");
+        assert!(
+            agent::RemoteAgent::verify(&remote, scheme, b"payload", &signature)
+                .await
+                .expect("verification should run")
+        );
+        assert!(
+            !agent::RemoteAgent::verify(&remote, scheme, b"wrong payload", &signature)
+                .await
+                .expect("verification should run")
+        );
     }
 }
