@@ -521,13 +521,15 @@ where
 mod tests {
     use std::{
         convert::Infallible,
-        future::{Ready, ready},
+        future::{Ready, pending, ready},
         io::Cursor,
+        pin::Pin,
+        task::{Context, Poll},
     };
 
     use bytes::Bytes;
-    use futures::{SinkExt, StreamExt, stream::FusedStream};
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use futures::{SinkExt, StreamExt, stream::FusedStream, task::noop_waker_ref};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
 
     use super::*;
     use crate::{
@@ -818,5 +820,43 @@ mod tests {
             .await
             .expect_err("send should fail");
         assert_reset(error, varint(42));
+    }
+
+    #[test]
+    fn deferred_pending_read_stays_pending_without_transitioning() {
+        let mut reader =
+            Deferred::<Cursor<Vec<u8>>, DecodeError, _>::from(pending::<Result<_, _>>());
+        let mut output = [0; 8];
+        let mut read_buf = ReadBuf::new(&mut output);
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        assert!(matches!(
+            Pin::new(&mut reader).poll_read(&mut cx, &mut read_buf),
+            Poll::Pending
+        ));
+        assert!(matches!(reader, Deferred::Pending { .. }));
+    }
+
+    #[test]
+    #[should_panic(expected = "start_send before poll_ready completed")]
+    fn deferred_start_send_before_ready_panics() {
+        let (_reader, writer) = quic::test::mock_stream_pair(varint(43));
+        let mut sink = Box::pin(Deferred::from(async move {
+            pending::<()>().await;
+            Ok::<_, quic::StreamError>(writer)
+        }));
+
+        sink.as_mut()
+            .start_send(Bytes::from_static(b"not ready"))
+            .expect("panic before result");
+    }
+
+    #[test]
+    #[should_panic(expected = "consume before read")]
+    fn deferred_consume_before_read_panics() {
+        let reader = BufReader::new(Cursor::new(b"pending".to_vec()));
+        let mut reader = Deferred::from(ready(Ok::<_, DecodeError>(reader)));
+        Pin::new(&mut reader).consume(1);
     }
 }
