@@ -699,7 +699,12 @@ pub(crate) mod tests {
         fmt,
         hash::{Hash, Hasher},
     };
-    use std::{future::pending, pin::Pin, sync::Arc};
+    use std::{
+        future::pending,
+        io,
+        pin::Pin,
+        sync::{Arc, Mutex},
+    };
 
     use bytes::Bytes;
     use dhttp_identity::identity as agent;
@@ -707,15 +712,15 @@ pub(crate) mod tests {
 
     #[cfg(feature = "dquic")]
     use super::ConnectionBuilder;
-    use super::ConnectionState;
+    use super::{Connection, ConnectionState, StreamError};
     #[cfg(feature = "dquic")]
     use crate::{
         codec::{ErasedPeekableBiStream, ErasedPeekableUniStream},
-        connection::StreamError,
         dhttp::settings::{MaxFieldSectionSize, Settings},
         protocol::{ProductProtocol, Protocol, StreamVerdict},
     };
     use crate::{
+        error::{Code, H3MessageError, H3MissingSettings},
         protocol::Protocols,
         quic::{self, ConnectionError},
         varint::VarInt,
@@ -855,6 +860,9 @@ pub(crate) mod tests {
     #[derive(Debug, Default)]
     pub(crate) struct MockConnectionState {
         terminal_error: crate::util::set_once::SetOnce<quic::ConnectionError>,
+        close_calls: Mutex<Vec<(Code, String)>>,
+        stream_calls: Mutex<Vec<&'static str>>,
+        stream_ops_available: std::sync::atomic::AtomicBool,
     }
 
     #[derive(Debug, Clone, Default)]
@@ -870,6 +878,42 @@ pub(crate) mod tests {
         pub(crate) fn set_terminal_error(&self, error: quic::ConnectionError) {
             let _ = self.state.terminal_error.set(error);
         }
+
+        pub(crate) fn enable_stream_ops(&self) {
+            self.state
+                .stream_ops_available
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        pub(crate) fn close_calls(&self) -> Vec<(Code, String)> {
+            self.state
+                .close_calls
+                .lock()
+                .expect("close call log poisoned")
+                .clone()
+        }
+
+        pub(crate) fn stream_calls(&self) -> Vec<&'static str> {
+            self.state
+                .stream_calls
+                .lock()
+                .expect("stream call log poisoned")
+                .clone()
+        }
+
+        fn record_stream_call(&self, call: &'static str) {
+            self.state
+                .stream_calls
+                .lock()
+                .expect("stream call log poisoned")
+                .push(call);
+        }
+
+        fn stream_ops_available(&self) -> bool {
+            self.state
+                .stream_ops_available
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
     }
 
     impl quic::ManageStream for MockConnection {
@@ -879,21 +923,41 @@ pub(crate) mod tests {
         async fn open_bi(
             &self,
         ) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
-            Err(test_connection_error("open_bi unavailable"))
+            self.record_stream_call("open_bi");
+            if self.stream_ops_available() {
+                Ok((TestReadStream, TestWriteStream))
+            } else {
+                Err(test_connection_error("open_bi unavailable"))
+            }
         }
 
         async fn open_uni(&self) -> Result<Self::StreamWriter, ConnectionError> {
-            Err(test_connection_error("open_uni unavailable"))
+            self.record_stream_call("open_uni");
+            if self.stream_ops_available() {
+                Ok(TestWriteStream)
+            } else {
+                Err(test_connection_error("open_uni unavailable"))
+            }
         }
 
         async fn accept_bi(
             &self,
         ) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
-            Err(test_connection_error("accept_bi unavailable"))
+            self.record_stream_call("accept_bi");
+            if self.stream_ops_available() {
+                Ok((TestReadStream, TestWriteStream))
+            } else {
+                Err(test_connection_error("accept_bi unavailable"))
+            }
         }
 
         async fn accept_uni(&self) -> Result<Self::StreamReader, ConnectionError> {
-            Err(test_connection_error("accept_uni unavailable"))
+            self.record_stream_call("accept_uni");
+            if self.stream_ops_available() {
+                Ok(TestReadStream)
+            } else {
+                Err(test_connection_error("accept_uni unavailable"))
+            }
         }
     }
 
@@ -901,7 +965,7 @@ pub(crate) mod tests {
         type LocalAgent = TestLocalAgent;
 
         async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, ConnectionError> {
-            Ok(None)
+            Ok(Some(TestLocalAgent))
         }
     }
 
@@ -909,12 +973,18 @@ pub(crate) mod tests {
         type RemoteAgent = TestRemoteAgent;
 
         async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, ConnectionError> {
-            Ok(None)
+            Ok(Some(TestRemoteAgent))
         }
     }
 
     impl quic::Lifecycle for MockConnection {
-        fn close(&self, _code: crate::error::Code, _reason: std::borrow::Cow<'static, str>) {}
+        fn close(&self, code: crate::error::Code, reason: std::borrow::Cow<'static, str>) {
+            self.state
+                .close_calls
+                .lock()
+                .expect("close call log poisoned")
+                .push((code, reason.into_owned()));
+        }
 
         fn check(&self) -> Result<(), ConnectionError> {
             match self.state.terminal_error.peek() {
@@ -947,6 +1017,27 @@ pub(crate) mod tests {
                 assert_eq!(source.reason.as_ref(), expected_reason);
             }
             other => panic!("expected transport error, got {other:?}"),
+        }
+    }
+
+    fn assert_connection_h3_code(error: super::ConnectionError, expected_code: Code) {
+        match error {
+            super::ConnectionError::H3 { source } => assert_eq!(source.code(), expected_code),
+            other => panic!("expected h3 connection error, got {other:?}"),
+        }
+    }
+
+    fn assert_stream_reset(error: StreamError, expected_code: VarInt) {
+        match error {
+            StreamError::Reset { code } => assert_eq!(code, expected_code),
+            other => panic!("expected stream reset, got {other:?}"),
+        }
+    }
+
+    fn assert_stream_h3_code(error: StreamError, expected_code: Code) {
+        match error {
+            StreamError::H3 { source } => assert_eq!(source.code(), expected_code),
+            other => panic!("expected h3 stream error, got {other:?}"),
         }
     }
 
@@ -1138,6 +1229,151 @@ pub(crate) mod tests {
         let a = ConnectionBuilder::<C>::new(s1);
         let b = ConnectionBuilder::<C>::new(s2);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn connection_error_recovers_from_io_error_layers() {
+        let connection_error = super::ConnectionError::from(test_connection_error("wrapped"));
+        let recovered = super::ConnectionError::from(io::Error::from(connection_error));
+        match recovered {
+            super::ConnectionError::Quic { source } => assert_transport_reason(&source, "wrapped"),
+            other => panic!("expected quic connection error, got {other:?}"),
+        }
+
+        let quic_error = test_connection_error("quic");
+        let recovered = super::ConnectionError::from(io::Error::from(quic_error));
+        match recovered {
+            super::ConnectionError::Quic { source } => assert_transport_reason(&source, "quic"),
+            other => panic!("expected quic connection error, got {other:?}"),
+        }
+
+        let h3_error = super::ConnectionError::from(H3MissingSettings);
+        let super::ConnectionError::H3 { source } = h3_error else {
+            panic!("expected h3 connection error");
+        };
+        let h3_source: Arc<dyn crate::error::H3ConnectionError> = source;
+        let recovered = super::ConnectionError::from(io::Error::other(h3_source));
+        assert_connection_h3_code(recovered, Code::H3_MISSING_SETTINGS);
+    }
+
+    #[test]
+    fn stream_error_recovers_from_io_error_layers() {
+        let reset_code = VarInt::from_u32(0x41);
+        let reset = StreamError::Reset { code: reset_code };
+        assert_stream_reset(StreamError::from(io::Error::from(reset)), reset_code);
+
+        let quic_reset_code = VarInt::from_u32(0x42);
+        let quic_reset = quic::StreamError::Reset {
+            code: quic_reset_code,
+        };
+        assert_stream_reset(
+            StreamError::from(io::Error::from(quic_reset)),
+            quic_reset_code,
+        );
+
+        let connection_error = super::ConnectionError::from(test_connection_error("stream"));
+        let recovered = StreamError::from(io::Error::from(connection_error));
+        match recovered {
+            StreamError::Connection {
+                source: super::ConnectionError::Quic { source },
+            } => assert_transport_reason(&source, "stream"),
+            other => panic!("expected stream connection error, got {other:?}"),
+        }
+
+        let h3 = StreamError::from(H3MessageError::MissingHeaderSection);
+        let StreamError::H3 { source } = h3 else {
+            panic!("expected h3 stream error");
+        };
+        let h3_source: Arc<dyn crate::error::H3StreamError> = source;
+        let recovered = StreamError::from(io::Error::other(h3_source));
+        assert_stream_h3_code(recovered, Code::H3_MESSAGE_ERROR);
+    }
+
+    #[test]
+    fn map_stream_reset_leaves_non_reset_errors_unchanged() {
+        let mut mapper_called = false;
+        let error = StreamError::from(H3MessageError::UnexpectedHeadersInBody);
+        let mapped = error.map_stream_reset(|code| {
+            mapper_called = true;
+            StreamError::Reset { code }
+        });
+
+        assert!(!mapper_called);
+        assert_stream_h3_code(mapped, Code::H3_MESSAGE_ERROR);
+    }
+
+    #[tokio::test]
+    async fn erased_connection_state_delegates_dyn_connection_operations() {
+        let quic = MockConnection::new();
+        quic.enable_stream_ops();
+        let state =
+            ConnectionState::new_for_test(Arc::new(quic.clone()), Arc::new(Protocols::new()));
+        let erased = state.erase();
+
+        assert!(Arc::ptr_eq(state.protocols(), erased.protocols()));
+        assert_eq!(
+            erased
+                .local_agent()
+                .await
+                .expect("local agent delegated")
+                .expect("local agent present")
+                .name(),
+            "test-local"
+        );
+        assert_eq!(
+            erased
+                .remote_agent()
+                .await
+                .expect("remote agent delegated")
+                .expect("remote agent present")
+                .name(),
+            "test-remote"
+        );
+        assert!(erased.check().is_ok());
+
+        let _ = quic::DynManageStream::open_bi(&**erased.quic())
+            .await
+            .expect("open_bi delegated");
+        let _ = quic::DynManageStream::open_uni(&**erased.quic())
+            .await
+            .expect("open_uni delegated");
+        let _ = quic::DynManageStream::accept_bi(&**erased.quic())
+            .await
+            .expect("accept_bi delegated");
+        let _ = quic::DynManageStream::accept_uni(&**erased.quic())
+            .await
+            .expect("accept_uni delegated");
+
+        assert_eq!(
+            quic.stream_calls(),
+            vec!["open_bi", "open_uni", "accept_bi", "accept_uni"]
+        );
+
+        erased.close(Code::H3_NO_ERROR, "dyn close");
+        assert_eq!(
+            quic.close_calls(),
+            vec![(Code::H3_NO_ERROR, "dyn close".to_owned())]
+        );
+
+        quic.set_terminal_error(test_connection_error("dyn closed"));
+        let closed = erased.closed().await;
+        assert_transport_reason(&closed, "dyn closed");
+    }
+
+    #[tokio::test]
+    async fn connection_from_state_for_test_closes_on_drop() {
+        let quic = MockConnection::new();
+        let state =
+            ConnectionState::new_for_test(Arc::new(quic.clone()), Arc::new(Protocols::new()));
+        let connection = Connection::from_state_for_test(state);
+
+        assert!(quic.close_calls().is_empty());
+        drop(connection);
+
+        assert_eq!(
+            quic.close_calls(),
+            vec![(Code::H3_NO_ERROR, "no error".to_owned())]
+        );
     }
 
     #[test]
