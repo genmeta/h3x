@@ -790,3 +790,1253 @@ impl IpcConnectionClient {
         IpcConnectionHandle::new(self, fd_registry, conn_fd_sender)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        borrow::Cow,
+        collections::VecDeque,
+        future::pending,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+
+    use bytes::Bytes;
+    use dhttp_identity::identity;
+    use futures::{Sink, SinkExt, Stream, StreamExt};
+    use remoc::prelude::ServerShared;
+    use smallvec::smallvec;
+    use tokio::{net::UnixStream, sync::mpsc};
+    use tokio_util::task::AbortOnDropHandle;
+    use tracing::Instrument;
+
+    use super::*;
+    use crate::{
+        ipc::transport::{FdRegistry, FdSender, MuxChannel},
+        quic::{CancelStream, GetStreamId, GetStreamIdExt, StopStream},
+    };
+
+    fn test_connection_error(reason: &str) -> ConnectionError {
+        ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(0x31),
+                frame_type: VarInt::from_u32(0x32),
+                reason: reason.to_owned().into(),
+            },
+        }
+    }
+
+    fn test_stream_error(reason: &str) -> StreamError {
+        StreamError::Connection {
+            source: test_connection_error(reason),
+        }
+    }
+
+    #[derive(Default)]
+    struct TestLifecycle {
+        terminal: Mutex<Option<ConnectionError>>,
+    }
+
+    impl TestLifecycle {
+        fn set_terminal(&self, error: ConnectionError) {
+            *self
+                .terminal
+                .lock()
+                .expect("terminal mutex should not be poisoned") = Some(error);
+        }
+    }
+
+    impl quic::Lifecycle for TestLifecycle {
+        fn close(&self, _code: Code, _reason: Cow<'static, str>) {}
+
+        fn check(&self) -> Result<(), ConnectionError> {
+            match self
+                .terminal
+                .lock()
+                .expect("terminal mutex should not be poisoned")
+                .clone()
+            {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        async fn closed(&self) -> ConnectionError {
+            let terminal = self
+                .terminal
+                .lock()
+                .expect("terminal mutex should not be poisoned")
+                .clone();
+            match terminal {
+                Some(error) => error,
+                None => pending().await,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct TestLocalAgent(&'static str);
+
+    impl identity::LocalAgent for TestLocalAgent {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
+            &[]
+        }
+
+        fn sign_algorithm(&self) -> rustls::SignatureAlgorithm {
+            rustls::SignatureAlgorithm::ED25519
+        }
+
+        fn sign(
+            &self,
+            _scheme: rustls::SignatureScheme,
+            _data: &[u8],
+        ) -> futures::future::BoxFuture<'_, Result<Vec<u8>, identity::SignError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct TestRemoteAgent(&'static str);
+
+    impl identity::RemoteAgent for TestRemoteAgent {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
+            &[]
+        }
+    }
+
+    struct TestReader {
+        stream_id: Result<VarInt, StreamError>,
+        rx: mpsc::Receiver<Bytes>,
+    }
+
+    impl GetStreamId for TestReader {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<VarInt, StreamError>> {
+            Poll::Ready(self.stream_id.clone())
+        }
+    }
+
+    impl StopStream for TestReader {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _code: VarInt,
+        ) -> Poll<Result<(), StreamError>> {
+            self.get_mut().rx.close();
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for TestReader {
+        type Item = Result<Bytes, StreamError>;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.get_mut().rx.poll_recv(cx).map(|item| item.map(Ok))
+        }
+    }
+
+    struct TestWriter {
+        stream_id: Result<VarInt, StreamError>,
+        tx: Option<mpsc::Sender<Bytes>>,
+    }
+
+    impl GetStreamId for TestWriter {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<VarInt, StreamError>> {
+            Poll::Ready(self.stream_id.clone())
+        }
+    }
+
+    impl CancelStream for TestWriter {
+        fn poll_cancel(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _code: VarInt,
+        ) -> Poll<Result<(), StreamError>> {
+            self.get_mut().tx = None;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Sink<Bytes> for TestWriter {
+        type Error = StreamError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if self.tx.is_some() {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Err(test_stream_error("writer closed")))
+            }
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+            let this = self.get_mut();
+            let Some(tx) = &this.tx else {
+                return Err(test_stream_error("writer closed"));
+            };
+            tx.try_send(item)
+                .map_err(|_| test_stream_error("writer send failed"))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.get_mut().tx = None;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct BidiHandles {
+        tx_to_reader: mpsc::Sender<Bytes>,
+        rx_from_writer: mpsc::Receiver<Bytes>,
+    }
+
+    struct UniWriterHandles {
+        rx_from_writer: mpsc::Receiver<Bytes>,
+    }
+
+    struct UniReaderHandles {
+        tx_to_reader: mpsc::Sender<Bytes>,
+    }
+
+    struct TestConnection {
+        lifecycle: Arc<TestLifecycle>,
+        closes: Mutex<Vec<(Code, Cow<'static, str>)>>,
+        open_bi: Mutex<VecDeque<Result<(TestReader, TestWriter), ConnectionError>>>,
+        accept_bi: Mutex<VecDeque<Result<(TestReader, TestWriter), ConnectionError>>>,
+        open_uni: Mutex<VecDeque<Result<TestWriter, ConnectionError>>>,
+        accept_uni: Mutex<VecDeque<Result<TestReader, ConnectionError>>>,
+        local_agent: Mutex<Result<Option<TestLocalAgent>, ConnectionError>>,
+        remote_agent: Mutex<Result<Option<TestRemoteAgent>, ConnectionError>>,
+    }
+
+    impl TestConnection {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                lifecycle: Arc::new(TestLifecycle::default()),
+                closes: Mutex::new(Vec::new()),
+                open_bi: Mutex::new(VecDeque::new()),
+                accept_bi: Mutex::new(VecDeque::new()),
+                open_uni: Mutex::new(VecDeque::new()),
+                accept_uni: Mutex::new(VecDeque::new()),
+                local_agent: Mutex::new(Ok(None)),
+                remote_agent: Mutex::new(Ok(None)),
+            })
+        }
+
+        fn set_local_agent(&self, agent: Option<TestLocalAgent>) {
+            *self
+                .local_agent
+                .lock()
+                .expect("local agent mutex should not be poisoned") = Ok(agent);
+        }
+
+        fn set_remote_agent(&self, agent: Option<TestRemoteAgent>) {
+            *self
+                .remote_agent
+                .lock()
+                .expect("remote agent mutex should not be poisoned") = Ok(agent);
+        }
+
+        fn close_calls(&self) -> Vec<(Code, Cow<'static, str>)> {
+            self.closes
+                .lock()
+                .expect("close mutex should not be poisoned")
+                .clone()
+        }
+
+        fn push_open_bi_success(&self, stream_id: VarInt) -> BidiHandles {
+            let (reader_tx, reader_rx) = mpsc::channel(8);
+            let (writer_tx, writer_rx) = mpsc::channel(8);
+            self.open_bi
+                .lock()
+                .expect("open_bi mutex should not be poisoned")
+                .push_back(Ok((
+                    TestReader {
+                        stream_id: Ok(stream_id),
+                        rx: reader_rx,
+                    },
+                    TestWriter {
+                        stream_id: Ok(stream_id),
+                        tx: Some(writer_tx),
+                    },
+                )));
+            BidiHandles {
+                tx_to_reader: reader_tx,
+                rx_from_writer: writer_rx,
+            }
+        }
+
+        fn push_accept_bi_success(&self, stream_id: VarInt) -> BidiHandles {
+            let (reader_tx, reader_rx) = mpsc::channel(8);
+            let (writer_tx, writer_rx) = mpsc::channel(8);
+            self.accept_bi
+                .lock()
+                .expect("accept_bi mutex should not be poisoned")
+                .push_back(Ok((
+                    TestReader {
+                        stream_id: Ok(stream_id),
+                        rx: reader_rx,
+                    },
+                    TestWriter {
+                        stream_id: Ok(stream_id),
+                        tx: Some(writer_tx),
+                    },
+                )));
+            BidiHandles {
+                tx_to_reader: reader_tx,
+                rx_from_writer: writer_rx,
+            }
+        }
+
+        fn push_open_uni_success(&self, stream_id: VarInt) -> UniWriterHandles {
+            let (writer_tx, writer_rx) = mpsc::channel(8);
+            self.open_uni
+                .lock()
+                .expect("open_uni mutex should not be poisoned")
+                .push_back(Ok(TestWriter {
+                    stream_id: Ok(stream_id),
+                    tx: Some(writer_tx),
+                }));
+            UniWriterHandles {
+                rx_from_writer: writer_rx,
+            }
+        }
+
+        fn push_accept_uni_success(&self, stream_id: VarInt) -> UniReaderHandles {
+            let (reader_tx, reader_rx) = mpsc::channel(8);
+            self.accept_uni
+                .lock()
+                .expect("accept_uni mutex should not be poisoned")
+                .push_back(Ok(TestReader {
+                    stream_id: Ok(stream_id),
+                    rx: reader_rx,
+                }));
+            UniReaderHandles {
+                tx_to_reader: reader_tx,
+            }
+        }
+
+        fn push_open_bi_stream_id_error(&self, error: StreamError) {
+            let (_reader_tx, reader_rx) = mpsc::channel(1);
+            let (writer_tx, _writer_rx) = mpsc::channel(1);
+            self.open_bi
+                .lock()
+                .expect("open_bi mutex should not be poisoned")
+                .push_back(Ok((
+                    TestReader {
+                        stream_id: Err(error.clone()),
+                        rx: reader_rx,
+                    },
+                    TestWriter {
+                        stream_id: Ok(VarInt::from_u32(1)),
+                        tx: Some(writer_tx),
+                    },
+                )));
+        }
+
+        fn push_accept_bi_stream_id_error(&self, error: StreamError) {
+            let (_reader_tx, reader_rx) = mpsc::channel(1);
+            let (writer_tx, _writer_rx) = mpsc::channel(1);
+            self.accept_bi
+                .lock()
+                .expect("accept_bi mutex should not be poisoned")
+                .push_back(Ok((
+                    TestReader {
+                        stream_id: Err(error.clone()),
+                        rx: reader_rx,
+                    },
+                    TestWriter {
+                        stream_id: Ok(VarInt::from_u32(1)),
+                        tx: Some(writer_tx),
+                    },
+                )));
+        }
+
+        fn push_open_uni_stream_id_error(&self, error: StreamError) {
+            let (writer_tx, _writer_rx) = mpsc::channel(1);
+            self.open_uni
+                .lock()
+                .expect("open_uni mutex should not be poisoned")
+                .push_back(Ok(TestWriter {
+                    stream_id: Err(error),
+                    tx: Some(writer_tx),
+                }));
+        }
+
+        fn push_accept_uni_stream_id_error(&self, error: StreamError) {
+            let (_reader_tx, reader_rx) = mpsc::channel(1);
+            self.accept_uni
+                .lock()
+                .expect("accept_uni mutex should not be poisoned")
+                .push_back(Ok(TestReader {
+                    stream_id: Err(error),
+                    rx: reader_rx,
+                }));
+        }
+
+        fn push_open_bi_error(&self, error: ConnectionError) {
+            self.open_bi
+                .lock()
+                .expect("open_bi mutex should not be poisoned")
+                .push_back(Err(error));
+        }
+
+        fn push_accept_bi_error(&self, error: ConnectionError) {
+            self.accept_bi
+                .lock()
+                .expect("accept_bi mutex should not be poisoned")
+                .push_back(Err(error));
+        }
+
+        fn push_open_uni_error(&self, error: ConnectionError) {
+            self.open_uni
+                .lock()
+                .expect("open_uni mutex should not be poisoned")
+                .push_back(Err(error));
+        }
+
+        fn push_accept_uni_error(&self, error: ConnectionError) {
+            self.accept_uni
+                .lock()
+                .expect("accept_uni mutex should not be poisoned")
+                .push_back(Err(error));
+        }
+    }
+
+    impl ManageStream for TestConnection {
+        type StreamReader = TestReader;
+        type StreamWriter = TestWriter;
+
+        async fn open_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
+            self.open_bi
+                .lock()
+                .expect("open_bi mutex should not be poisoned")
+                .pop_front()
+                .unwrap_or_else(|| Err(test_connection_error("missing open_bi result")))
+        }
+
+        async fn accept_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
+            self.accept_bi
+                .lock()
+                .expect("accept_bi mutex should not be poisoned")
+                .pop_front()
+                .unwrap_or_else(|| Err(test_connection_error("missing accept_bi result")))
+        }
+
+        async fn open_uni(&self) -> Result<Self::StreamWriter, ConnectionError> {
+            self.open_uni
+                .lock()
+                .expect("open_uni mutex should not be poisoned")
+                .pop_front()
+                .unwrap_or_else(|| Err(test_connection_error("missing open_uni result")))
+        }
+
+        async fn accept_uni(&self) -> Result<Self::StreamReader, ConnectionError> {
+            self.accept_uni
+                .lock()
+                .expect("accept_uni mutex should not be poisoned")
+                .pop_front()
+                .unwrap_or_else(|| Err(test_connection_error("missing accept_uni result")))
+        }
+    }
+
+    impl quic::Lifecycle for TestConnection {
+        fn close(&self, code: Code, reason: Cow<'static, str>) {
+            self.closes
+                .lock()
+                .expect("close mutex should not be poisoned")
+                .push((code, reason));
+        }
+
+        fn check(&self) -> Result<(), ConnectionError> {
+            quic::Lifecycle::check(self.lifecycle.as_ref())
+        }
+
+        async fn closed(&self) -> ConnectionError {
+            quic::Lifecycle::closed(self.lifecycle.as_ref()).await
+        }
+    }
+
+    impl quic::WithLocalAgent for TestConnection {
+        type LocalAgent = TestLocalAgent;
+
+        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, ConnectionError> {
+            self.local_agent
+                .lock()
+                .expect("local agent mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl quic::WithRemoteAgent for TestConnection {
+        type RemoteAgent = TestRemoteAgent;
+
+        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, ConnectionError> {
+            self.remote_agent
+                .lock()
+                .expect("remote agent mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    struct FdHarness {
+        server_sender: FdSender,
+        client_registry: FdRegistry,
+        client_sender: FdSender,
+        sink: crate::ipc::transport::MuxSink,
+        stream: crate::ipc::transport::MuxStream,
+    }
+
+    impl FdHarness {
+        fn new() -> Self {
+            let (server_mux, client_mux) = MuxChannel::pair_for_test().expect("create mux pair");
+            let (server_sink, _server_stream) = server_mux.split().expect("split server mux");
+            let (client_sink, client_stream) = client_mux.split().expect("split client mux");
+            let client_registry = client_stream.fd_registry();
+            let client_sender = client_sink.fd_sender();
+            let server_sender = server_sink.fd_sender();
+            Self {
+                server_sender,
+                client_registry,
+                client_sender,
+                sink: server_sink,
+                stream: client_stream,
+            }
+        }
+
+        async fn flush(&mut self) {
+            self.sink.send(Bytes::new()).await.expect("flush fd frame");
+            let _ = self
+                .stream
+                .next()
+                .await
+                .expect("mux stream item")
+                .expect("bytes frame");
+        }
+    }
+
+    fn spawn_connection_server<C>(
+        connection: Arc<C>,
+    ) -> (AbortOnDropHandle<()>, IpcConnectionClient)
+    where
+        C: IpcConnection + 'static,
+    {
+        let (server, client) = IpcConnectionServerShared::new(connection, 1);
+        let task = AbortOnDropHandle::new(tokio::spawn(
+            async move {
+                let _ = server.serve(true).await;
+            }
+            .in_current_span(),
+        ));
+        (task, client)
+    }
+
+    struct ScriptedIpcConnection {
+        open_bi: Mutex<VecDeque<Result<Resolved<IpcBiHandle, StreamError>, IpcOpenError>>>,
+        accept_bi: Mutex<VecDeque<Result<Resolved<IpcBiHandle, StreamError>, IpcAcceptError>>>,
+        open_uni: Mutex<VecDeque<Result<Resolved<IpcUniHandle, StreamError>, IpcOpenError>>>,
+        accept_uni: Mutex<VecDeque<Result<Resolved<IpcUniHandle, StreamError>, IpcAcceptError>>>,
+        local_agent: Mutex<Result<Option<LocalAgentClient>, ConnectionError>>,
+        remote_agent: Mutex<Result<Option<RemoteAgentClient>, ConnectionError>>,
+        close_calls: Mutex<Vec<(Code, Cow<'static, str>)>>,
+        closed_result: Mutex<Result<ConnectionError, ConnectionError>>,
+    }
+
+    impl ScriptedIpcConnection {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                open_bi: Mutex::new(VecDeque::new()),
+                accept_bi: Mutex::new(VecDeque::new()),
+                open_uni: Mutex::new(VecDeque::new()),
+                accept_uni: Mutex::new(VecDeque::new()),
+                local_agent: Mutex::new(Ok(None)),
+                remote_agent: Mutex::new(Ok(None)),
+                close_calls: Mutex::new(Vec::new()),
+                closed_result: Mutex::new(Ok(test_connection_error("scripted closed"))),
+            })
+        }
+    }
+
+    impl IpcConnection for ScriptedIpcConnection {
+        async fn open_bi(&self) -> Result<Resolved<IpcBiHandle, StreamError>, IpcOpenError> {
+            self.open_bi
+                .lock()
+                .expect("open_bi mutex should not be poisoned")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Err(IpcOpenError::Connection {
+                        source: test_connection_error("missing scripted open_bi"),
+                    })
+                })
+        }
+
+        async fn accept_bi(&self) -> Result<Resolved<IpcBiHandle, StreamError>, IpcAcceptError> {
+            self.accept_bi
+                .lock()
+                .expect("accept_bi mutex should not be poisoned")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Err(IpcAcceptError::Connection {
+                        source: test_connection_error("missing scripted accept_bi"),
+                    })
+                })
+        }
+
+        async fn open_uni(&self) -> Result<Resolved<IpcUniHandle, StreamError>, IpcOpenError> {
+            self.open_uni
+                .lock()
+                .expect("open_uni mutex should not be poisoned")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Err(IpcOpenError::Connection {
+                        source: test_connection_error("missing scripted open_uni"),
+                    })
+                })
+        }
+
+        async fn accept_uni(&self) -> Result<Resolved<IpcUniHandle, StreamError>, IpcAcceptError> {
+            self.accept_uni
+                .lock()
+                .expect("accept_uni mutex should not be poisoned")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Err(IpcAcceptError::Connection {
+                        source: test_connection_error("missing scripted accept_uni"),
+                    })
+                })
+        }
+
+        async fn local_agent(&self) -> Result<Option<LocalAgentClient>, ConnectionError> {
+            self.local_agent
+                .lock()
+                .expect("local agent mutex should not be poisoned")
+                .clone()
+        }
+
+        async fn remote_agent(&self) -> Result<Option<RemoteAgentClient>, ConnectionError> {
+            self.remote_agent
+                .lock()
+                .expect("remote agent mutex should not be poisoned")
+                .clone()
+        }
+
+        async fn close(
+            &self,
+            code: Code,
+            reason: Cow<'static, str>,
+        ) -> Result<(), ConnectionError> {
+            self.close_calls
+                .lock()
+                .expect("close mutex should not be poisoned")
+                .push((code, reason));
+            Ok(())
+        }
+
+        async fn closed(&self) -> Result<ConnectionError, ConnectionError> {
+            self.closed_result
+                .lock()
+                .expect("closed mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    fn spawn_local_agent(agent: TestLocalAgent) -> (AbortOnDropHandle<()>, LocalAgentClient) {
+        let (server, client) = LocalAgentServerShared::new(Arc::new(agent), 1);
+        let task = AbortOnDropHandle::new(tokio::spawn(
+            async move {
+                let _ = server.serve(true).await;
+            }
+            .in_current_span(),
+        ));
+        (task, client)
+    }
+
+    fn spawn_remote_agent(agent: TestRemoteAgent) -> (AbortOnDropHandle<()>, RemoteAgentClient) {
+        let (server, client) = RemoteAgentServerShared::new(Arc::new(agent), 1);
+        let task = AbortOnDropHandle::new(tokio::spawn(
+            async move {
+                let _ = server.serve(true).await;
+            }
+            .in_current_span(),
+        ));
+        (task, client)
+    }
+
+    fn assert_transport_reason(error: &ConnectionError, expected_fragment: &str) {
+        let ConnectionError::Transport { source } = error else {
+            panic!("expected transport error");
+        };
+        assert!(
+            source.reason.contains(expected_fragment),
+            "transport reason {:?} should contain {expected_fragment:?}",
+            source.reason,
+        );
+    }
+
+    fn owned_fd() -> std::os::fd::OwnedFd {
+        let (stream, _peer) = UnixStream::pair().expect("create unix pair");
+        stream.into_std().expect("convert tokio stream").into()
+    }
+
+    #[tokio::test]
+    async fn adapter_open_and_accept_streams_bridge_data() {
+        let mut fd_harness = FdHarness::new();
+        let connection = TestConnection::new();
+        let adapter = ConnectionAdapter::new(connection.clone(), fd_harness.server_sender.clone());
+        let (_rpc_task, rpc) = spawn_connection_server(Arc::new(adapter));
+        let handle = rpc.into_handle(
+            fd_harness.client_registry.clone(),
+            fd_harness.client_sender.clone(),
+        );
+
+        let mut open_bi_handles = connection.push_open_bi_success(VarInt::from_u32(11));
+        let Resolved::Value { value: open_bi } = IpcConnection::open_bi(&handle.rpc)
+            .await
+            .expect("open_bi rpc")
+        else {
+            panic!("open_bi should return handle");
+        };
+        fd_harness.flush().await;
+        let (mut bi_reader, mut bi_writer) = handle.fds_to_bi(open_bi).await.expect("bidi fds");
+        bi_writer
+            .send(Bytes::from_static(b"client-to-server"))
+            .await
+            .expect("write bidi payload");
+        let received = open_bi_handles
+            .rx_from_writer
+            .recv()
+            .await
+            .expect("server should receive bidi payload");
+        assert_eq!(received, Bytes::from_static(b"client-to-server"));
+        open_bi_handles
+            .tx_to_reader
+            .send(Bytes::from_static(b"server-to-client"))
+            .await
+            .expect("inject bidi payload");
+        let received = bi_reader
+            .next()
+            .await
+            .expect("bidi reader item")
+            .expect("bidi reader payload");
+        assert_eq!(received, Bytes::from_static(b"server-to-client"));
+
+        let mut accept_bi_handles = connection.push_accept_bi_success(VarInt::from_u32(13));
+        let Resolved::Value { value: accept_bi } = IpcConnection::accept_bi(&handle.rpc)
+            .await
+            .expect("accept_bi rpc")
+        else {
+            panic!("accept_bi should return handle");
+        };
+        fd_harness.flush().await;
+        let (mut accepted_reader, mut accepted_writer) = handle
+            .fds_to_bi(accept_bi)
+            .await
+            .expect("accepted bidi fds");
+        accepted_writer
+            .send(Bytes::from_static(b"accepted-client-write"))
+            .await
+            .expect("accepted writer");
+        let received = accept_bi_handles
+            .rx_from_writer
+            .recv()
+            .await
+            .expect("server should receive accepted bidi payload");
+        assert_eq!(received, Bytes::from_static(b"accepted-client-write"));
+        accept_bi_handles
+            .tx_to_reader
+            .send(Bytes::from_static(b"accepted-server-write"))
+            .await
+            .expect("inject accepted payload");
+        let received = accepted_reader
+            .next()
+            .await
+            .expect("accepted reader item")
+            .expect("accepted reader payload");
+        assert_eq!(received, Bytes::from_static(b"accepted-server-write"));
+
+        let mut open_uni_handles = connection.push_open_uni_success(VarInt::from_u32(17));
+        let Resolved::Value { value: open_uni } = IpcConnection::open_uni(&handle.rpc)
+            .await
+            .expect("open_uni rpc")
+        else {
+            panic!("open_uni should return handle");
+        };
+        fd_harness.flush().await;
+        let mut uni_writer = handle
+            .fds_to_uni_writer(open_uni)
+            .await
+            .expect("uni writer fds");
+        uni_writer
+            .send(Bytes::from_static(b"uni-client-write"))
+            .await
+            .expect("uni write");
+        let received = open_uni_handles
+            .rx_from_writer
+            .recv()
+            .await
+            .expect("server should receive uni payload");
+        assert_eq!(received, Bytes::from_static(b"uni-client-write"));
+
+        let accept_uni_handles = connection.push_accept_uni_success(VarInt::from_u32(19));
+        let Resolved::Value { value: accept_uni } = IpcConnection::accept_uni(&handle.rpc)
+            .await
+            .expect("accept_uni rpc")
+        else {
+            panic!("accept_uni should return handle");
+        };
+        fd_harness.flush().await;
+        let mut uni_reader = handle
+            .fds_to_uni_reader(accept_uni)
+            .await
+            .expect("uni reader fds");
+        accept_uni_handles
+            .tx_to_reader
+            .send(Bytes::from_static(b"uni-server-write"))
+            .await
+            .expect("inject uni payload");
+        let received = uni_reader
+            .next()
+            .await
+            .expect("uni reader item")
+            .expect("uni reader payload");
+        assert_eq!(received, Bytes::from_static(b"uni-server-write"));
+    }
+
+    #[tokio::test]
+    async fn adapter_returns_resolved_stream_errors_and_connection_errors() {
+        let fd_harness = FdHarness::new();
+        let connection = TestConnection::new();
+        let adapter = ConnectionAdapter::new(connection.clone(), fd_harness.server_sender);
+
+        let stream_error = StreamError::Reset {
+            code: VarInt::from_u32(77),
+        };
+        connection.push_open_bi_stream_id_error(stream_error.clone());
+        let resolved = adapter.open_bi_impl().await.expect("open_bi impl");
+        match resolved {
+            Resolved::Error {
+                error: StreamError::Reset { code },
+            } => assert_eq!(code, VarInt::from_u32(77)),
+            Resolved::Error { error } => panic!("expected reset error, got {error:?}"),
+            Resolved::Value { .. } => panic!("expected stream_id error"),
+        }
+
+        connection.push_accept_bi_stream_id_error(stream_error.clone());
+        let resolved = adapter.accept_bi_impl().await.expect("accept_bi impl");
+        match resolved {
+            Resolved::Error {
+                error: StreamError::Reset { code },
+            } => assert_eq!(code, VarInt::from_u32(77)),
+            Resolved::Error { error } => panic!("expected reset error, got {error:?}"),
+            Resolved::Value { .. } => panic!("expected stream_id error"),
+        }
+
+        connection.push_open_uni_stream_id_error(stream_error.clone());
+        let resolved = adapter.open_uni_impl().await.expect("open_uni impl");
+        match resolved {
+            Resolved::Error {
+                error: StreamError::Reset { code },
+            } => assert_eq!(code, VarInt::from_u32(77)),
+            Resolved::Error { error } => panic!("expected reset error, got {error:?}"),
+            Resolved::Value { .. } => panic!("expected stream_id error"),
+        }
+
+        connection.push_accept_uni_stream_id_error(stream_error.clone());
+        let resolved = adapter.accept_uni_impl().await.expect("accept_uni impl");
+        match resolved {
+            Resolved::Error {
+                error: StreamError::Reset { code },
+            } => assert_eq!(code, VarInt::from_u32(77)),
+            Resolved::Error { error } => panic!("expected reset error, got {error:?}"),
+            Resolved::Value { .. } => panic!("expected stream_id error"),
+        }
+
+        let open_error = test_connection_error("open_bi failed");
+        connection.push_open_bi_error(open_error.clone());
+        let error = match adapter.open_bi_impl().await {
+            Ok(_) => panic!("open_bi should fail"),
+            Err(error) => error,
+        };
+        let IpcOpenError::Connection { source } = error else {
+            panic!("expected open_bi connection error");
+        };
+        assert_transport_reason(&source, "open_bi failed");
+
+        let accept_error = test_connection_error("accept_bi failed");
+        connection.push_accept_bi_error(accept_error.clone());
+        let error = match adapter.accept_bi_impl().await {
+            Ok(_) => panic!("accept_bi should fail"),
+            Err(error) => error,
+        };
+        let IpcAcceptError::Connection { source } = error else {
+            panic!("expected accept_bi connection error");
+        };
+        assert_transport_reason(&source, "accept_bi failed");
+
+        let open_uni_error = test_connection_error("open_uni failed");
+        connection.push_open_uni_error(open_uni_error.clone());
+        let error = match adapter.open_uni_impl().await {
+            Ok(_) => panic!("open_uni should fail"),
+            Err(error) => error,
+        };
+        let IpcOpenError::Connection { source } = error else {
+            panic!("expected open_uni connection error");
+        };
+        assert_transport_reason(&source, "open_uni failed");
+
+        let accept_uni_error = test_connection_error("accept_uni failed");
+        connection.push_accept_uni_error(accept_uni_error.clone());
+        let error = match adapter.accept_uni_impl().await {
+            Ok(_) => panic!("accept_uni should fail"),
+            Err(error) => error,
+        };
+        let IpcAcceptError::Connection { source } = error else {
+            panic!("expected accept_uni connection error");
+        };
+        assert_transport_reason(&source, "accept_uni failed");
+    }
+
+    #[tokio::test]
+    async fn adapter_surfaces_agents_and_lifecycle() {
+        let fd_harness = FdHarness::new();
+        let connection = TestConnection::new();
+        connection.set_local_agent(Some(TestLocalAgent("local-test")));
+        connection.set_remote_agent(Some(TestRemoteAgent("remote-test")));
+
+        let adapter = ConnectionAdapter::new(connection.clone(), fd_harness.server_sender);
+
+        let local = IpcConnection::local_agent(&adapter)
+            .await
+            .expect("local agent rpc")
+            .expect("local agent");
+        let _local = local;
+
+        let remote = IpcConnection::remote_agent(&adapter)
+            .await
+            .expect("remote agent rpc")
+            .expect("remote agent");
+        let _remote = remote;
+
+        IpcConnection::close(&adapter, Code::H3_NO_ERROR, "adapter close".into())
+            .await
+            .expect("adapter close");
+        assert_eq!(
+            connection.close_calls(),
+            vec![(Code::H3_NO_ERROR, Cow::Borrowed("adapter close"))]
+        );
+
+        let terminal = test_connection_error("adapter terminal");
+        connection.lifecycle.set_terminal(terminal.clone());
+        let observed = IpcConnection::closed(&adapter)
+            .await
+            .expect("adapter closed");
+        assert_transport_reason(&observed, "adapter terminal");
+    }
+
+    #[tokio::test]
+    async fn handle_manage_stream_maps_success_errors_and_fd_mismatches() {
+        let mut fd_harness = FdHarness::new();
+        let service = ScriptedIpcConnection::new();
+        let (_task, client) = spawn_connection_server(service.clone());
+        let handle = client.into_handle(
+            fd_harness.client_registry.clone(),
+            fd_harness.client_sender.clone(),
+        );
+
+        let bidi_id = fd_harness
+            .server_sender
+            .queue_fds(smallvec![owned_fd(), owned_fd()])
+            .expect("queue bidi fds");
+        fd_harness.flush().await;
+        service
+            .open_bi
+            .lock()
+            .expect("open_bi mutex should not be poisoned")
+            .push_back(Ok(Resolved::ok(IpcBiHandle {
+                fd_id: bidi_id,
+                stream_id: VarInt::from_u32(41),
+            })));
+        let (reader, writer) = handle.open_bi().await.expect("handle open_bi");
+        let mut reader = match reader.into_result() {
+            Ok(reader) => reader,
+            Err(error) => panic!("expected reader value, got {error:?}"),
+        };
+        let mut writer = match writer.into_result() {
+            Ok(writer) => writer,
+            Err(error) => panic!("expected writer value, got {error:?}"),
+        };
+        assert_eq!(
+            reader.stream_id().await.expect("reader stream id"),
+            VarInt::from_u32(41)
+        );
+        assert_eq!(
+            writer.stream_id().await.expect("writer stream id"),
+            VarInt::from_u32(41)
+        );
+
+        let stream_error = StreamError::Reset {
+            code: VarInt::from_u32(91),
+        };
+        service
+            .accept_bi
+            .lock()
+            .expect("accept_bi mutex should not be poisoned")
+            .push_back(Ok(Resolved::err(stream_error.clone())));
+        let (reader, writer) = handle.accept_bi().await.expect("handle accept_bi");
+        match reader {
+            Resolved::Error {
+                error: StreamError::Reset { code },
+            } => assert_eq!(code, VarInt::from_u32(91)),
+            _ => panic!("expected accept_bi reader reset"),
+        }
+        match writer {
+            Resolved::Error {
+                error: StreamError::Reset { code },
+            } => assert_eq!(code, VarInt::from_u32(91)),
+            _ => panic!("expected accept_bi writer reset"),
+        }
+
+        let uni_id = fd_harness
+            .server_sender
+            .queue_fds(smallvec![owned_fd()])
+            .expect("queue uni fd");
+        fd_harness.flush().await;
+        service
+            .open_uni
+            .lock()
+            .expect("open_uni mutex should not be poisoned")
+            .push_back(Ok(Resolved::ok(IpcUniHandle {
+                fd_id: uni_id,
+                stream_id: VarInt::from_u32(51),
+            })));
+        let writer = handle.open_uni().await.expect("handle open_uni");
+        let mut writer = match writer.into_result() {
+            Ok(writer) => writer,
+            Err(error) => panic!("expected uni writer value, got {error:?}"),
+        };
+        assert_eq!(
+            writer.stream_id().await.expect("uni writer stream id"),
+            VarInt::from_u32(51)
+        );
+
+        service
+            .accept_uni
+            .lock()
+            .expect("accept_uni mutex should not be poisoned")
+            .push_back(Ok(Resolved::err(stream_error.clone())));
+        let reader = handle.accept_uni().await.expect("handle accept_uni");
+        match reader {
+            Resolved::Error {
+                error: StreamError::Reset { code },
+            } => assert_eq!(code, VarInt::from_u32(91)),
+            _ => panic!("expected accept_uni reset"),
+        }
+
+        let mut mismatch_harness = FdHarness::new();
+        let mismatch_service = ScriptedIpcConnection::new();
+        let (_mismatch_task, mismatch_client) = spawn_connection_server(mismatch_service.clone());
+        let mismatch_handle = mismatch_client.into_handle(
+            mismatch_harness.client_registry.clone(),
+            mismatch_harness.client_sender.clone(),
+        );
+
+        let wrong_bidi_id = mismatch_harness
+            .server_sender
+            .queue_fds(smallvec![owned_fd()])
+            .expect("queue single fd");
+        mismatch_harness.flush().await;
+        mismatch_service
+            .open_bi
+            .lock()
+            .expect("open_bi mutex should not be poisoned")
+            .push_back(Ok(Resolved::ok(IpcBiHandle {
+                fd_id: wrong_bidi_id,
+                stream_id: VarInt::from_u32(61),
+            })));
+        let error = match mismatch_handle.open_bi().await {
+            Ok(_) => panic!("wrong bidi fd count should fail"),
+            Err(error) => error,
+        };
+        assert_transport_reason(&error, "expected 2 fds for bidi stream, got 1");
+
+        let mut uni_mismatch_harness = FdHarness::new();
+        let uni_mismatch_service = ScriptedIpcConnection::new();
+        let (_uni_mismatch_task, uni_mismatch_client) =
+            spawn_connection_server(uni_mismatch_service.clone());
+        let uni_mismatch_handle = uni_mismatch_client.into_handle(
+            uni_mismatch_harness.client_registry.clone(),
+            uni_mismatch_harness.client_sender.clone(),
+        );
+
+        let wrong_uni_id = uni_mismatch_harness
+            .server_sender
+            .queue_fds(smallvec![owned_fd(), owned_fd()])
+            .expect("queue two fds");
+        uni_mismatch_harness.flush().await;
+        uni_mismatch_service
+            .open_uni
+            .lock()
+            .expect("open_uni mutex should not be poisoned")
+            .push_back(Ok(Resolved::ok(IpcUniHandle {
+                fd_id: wrong_uni_id,
+                stream_id: VarInt::from_u32(71),
+            })));
+        let error = match uni_mismatch_handle.open_uni().await {
+            Ok(_) => panic!("wrong uni fd count should fail"),
+            Err(error) => error,
+        };
+        assert_transport_reason(&error, "expected 1 fd for uni stream, got 2");
+
+        let open_error_service = ScriptedIpcConnection::new();
+        let (_open_error_task, open_error_client) =
+            spawn_connection_server(open_error_service.clone());
+        let open_error_handle = open_error_client.into_handle(
+            fd_harness.client_registry.clone(),
+            fd_harness.client_sender.clone(),
+        );
+
+        let wrong_open_error = test_connection_error("scripted open error");
+        open_error_service
+            .open_bi
+            .lock()
+            .expect("open_bi mutex should not be poisoned")
+            .push_back(Err(IpcOpenError::Connection {
+                source: wrong_open_error,
+            }));
+        let error = match open_error_handle.open_bi().await {
+            Ok(_) => panic!("open_bi should fail"),
+            Err(error) => error,
+        };
+        assert_transport_reason(&error, "scripted open error");
+
+        let accept_error_harness = FdHarness::new();
+        let accept_error_service = ScriptedIpcConnection::new();
+        let (_accept_error_task, accept_error_client) =
+            spawn_connection_server(accept_error_service.clone());
+        let accept_error_handle = accept_error_client.into_handle(
+            accept_error_harness.client_registry,
+            accept_error_harness.client_sender,
+        );
+
+        let wrong_accept_error = test_connection_error("scripted accept error");
+        accept_error_service
+            .accept_uni
+            .lock()
+            .expect("accept_uni mutex should not be poisoned")
+            .push_back(Err(IpcAcceptError::Connection {
+                source: wrong_accept_error,
+            }));
+        let error = match accept_error_handle.accept_uni().await {
+            Ok(_) => panic!("accept_uni should fail"),
+            Err(error) => error,
+        };
+        assert_transport_reason(&error, "scripted accept error");
+    }
+
+    #[tokio::test]
+    async fn handle_agents_and_lifecycle_paths_are_mapped() {
+        let fd_harness = FdHarness::new();
+        let service = ScriptedIpcConnection::new();
+        let (local_agent_task, local_client) = spawn_local_agent(TestLocalAgent("scripted-local"));
+        let (remote_agent_task, remote_client) =
+            spawn_remote_agent(TestRemoteAgent("scripted-remote"));
+        *service
+            .local_agent
+            .lock()
+            .expect("local agent mutex should not be poisoned") = Ok(Some(local_client));
+        *service
+            .remote_agent
+            .lock()
+            .expect("remote agent mutex should not be poisoned") = Ok(Some(remote_client));
+        *service
+            .closed_result
+            .lock()
+            .expect("closed mutex should not be poisoned") =
+            Err(test_connection_error("closed rpc failed"));
+
+        let (_task, client) = spawn_connection_server(service.clone());
+        let handle = client.into_handle(fd_harness.client_registry, fd_harness.client_sender);
+
+        let local = quic::WithLocalAgent::local_agent(&handle)
+            .await
+            .expect("local agent handle")
+            .expect("local cached agent");
+        assert_eq!(identity::LocalAgent::name(&local), "scripted-local");
+
+        let remote = quic::WithRemoteAgent::remote_agent(&handle)
+            .await
+            .expect("remote agent handle")
+            .expect("remote cached agent");
+        assert_eq!(identity::RemoteAgent::name(&remote), "scripted-remote");
+
+        quic::Lifecycle::close(&handle, Code::H3_NO_ERROR, "handle close".into());
+        tokio::task::yield_now().await;
+        assert_eq!(
+            service
+                .close_calls
+                .lock()
+                .expect("close mutex should not be poisoned")
+                .clone(),
+            vec![(Code::H3_NO_ERROR, Cow::Borrowed("handle close"))]
+        );
+
+        let closed = quic::Lifecycle::closed(&handle).await;
+        assert_transport_reason(&closed, "ipc connection channel closed");
+
+        drop(local_agent_task);
+        drop(remote_agent_task);
+    }
+
+    #[test]
+    fn helper_mappings_preserve_expected_reasons() {
+        let plumbing = ipc_io_plumbing(io::Error::other("boom"), "socketpair");
+        let conn = plumbing_to_conn(&plumbing);
+        assert_transport_reason(&conn, "socketpair: boom");
+
+        let open = map_open_err(IpcOpenError::Plumbing {
+            source: plumbing.clone(),
+        });
+        assert_transport_reason(&open, "socketpair: boom");
+
+        let accept = map_accept_err(IpcAcceptError::Plumbing { source: plumbing });
+        assert_transport_reason(&accept, "socketpair: boom");
+
+        let io_error = ipc_io_error(io::Error::other("io failure"), "from_std");
+        assert_transport_reason(&io_error, "ipc: from_std");
+
+        let transport = ipc_transport_error(io::Error::other("registry failed"), "wait_fds");
+        assert_transport_reason(&transport, "ipc: wait_fds");
+
+        let channel = IpcConnectionHandle::ipc_channel_error();
+        assert_transport_reason(&channel, "ipc connection channel closed");
+    }
+}

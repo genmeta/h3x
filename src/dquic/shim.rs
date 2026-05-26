@@ -388,10 +388,13 @@ impl quic::Connect for Arc<dquic::prelude::QuicClient> {
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Cow, sync::Arc};
+    use std::{borrow::Cow, str::FromStr, sync::Arc, time::Duration};
 
     use dquic::{
-        prelude::handy::{ToCertificate, ToPrivateKey},
+        prelude::{
+            IO,
+            handy::{ToCertificate, ToPrivateKey},
+        },
         qbase::{
             error::{AppError, Error as DquicError, ErrorFrameType, ErrorKind, QuicError},
             frame::{FrameType, ResetStreamError},
@@ -399,8 +402,11 @@ mod tests {
         },
         qrecovery::streams::error::StreamError as DquicStreamError,
     };
+    use http::uri::Authority;
+    use tokio::time;
 
     use super::*;
+    use crate::quic::Lifecycle;
 
     const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");
     const SERVER_KEY: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
@@ -411,6 +417,67 @@ mod tests {
             SERVER_CERT.to_certificate(),
             SERVER_KEY.to_private_key(),
         )
+    }
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    async fn with_timeout<T>(future: impl Future<Output = T>) -> T {
+        time::timeout(TEST_TIMEOUT, future)
+            .await
+            .expect("test operation timed out")
+    }
+
+    async fn make_server_endpoint() -> (crate::dquic::QuicEndpoint, Authority) {
+        let identity = Arc::new(make_identity());
+        let network = crate::dquic::Network::builder().build();
+        let endpoint = crate::dquic::QuicEndpoint::builder()
+            .network(network.clone())
+            .identity(identity)
+            .bind(Arc::new(vec![
+                crate::dquic::binds::BindPattern::from_str("127.0.0.1:0")
+                    .expect("valid bind pattern"),
+            ]))
+            .build()
+            .await;
+        let bind_iface = network
+            .quic()
+            .interfaces()
+            .into_iter()
+            .next()
+            .expect("server should bind an interface");
+        let port = bind_iface
+            .borrow()
+            .bound_addr()
+            .expect("server interface should have a bound address")
+            .port();
+        let authority =
+            Authority::from_maybe_shared(format!("localhost:{port}")).expect("valid authority");
+        (endpoint, authority)
+    }
+
+    struct ConnectedPair {
+        _client_endpoint: crate::dquic::QuicEndpoint,
+        _server_endpoint: crate::dquic::QuicEndpoint,
+        client: Arc<dquic::prelude::Connection>,
+        server: Arc<dquic::prelude::Connection>,
+    }
+
+    async fn connected_pair() -> ConnectedPair {
+        let client_endpoint = crate::dquic::QuicEndpoint::builder().build().await;
+        let (server_endpoint, authority) = make_server_endpoint().await;
+        let (server_connection, client_connection) = with_timeout(async {
+            tokio::join!(
+                server_endpoint.accept(),
+                quic::Connect::connect(&client_endpoint, &authority)
+            )
+        })
+        .await;
+        ConnectedPair {
+            _client_endpoint: client_endpoint,
+            _server_endpoint: server_endpoint,
+            client: client_connection.expect("client should connect"),
+            server: server_connection.expect("server should accept"),
+        }
     }
 
     fn assert_transport_error(
@@ -510,6 +577,71 @@ mod tests {
     #[should_panic(expected = "h3x write data after shutdown")]
     fn convert_stream_error_rejects_eos_sent() {
         _ = convert_stream_error(DquicStreamError::EosSent);
+    }
+
+    #[tokio::test]
+    async fn connection_agents_are_exposed_from_established_dquic_connection() {
+        let pair = connected_pair().await;
+        let client = &pair.client;
+        let server = &pair.server;
+
+        let client_local = quic::WithLocalAgent::local_agent(client.as_ref())
+            .await
+            .expect("client local agent lookup");
+        assert!(
+            client_local.is_none(),
+            "anonymous client has no local agent"
+        );
+
+        let client_remote = quic::WithRemoteAgent::remote_agent(client.as_ref())
+            .await
+            .expect("client remote agent lookup")
+            .expect("client should observe server identity");
+        assert_eq!(agent::RemoteAgent::name(&client_remote), "localhost");
+        assert_eq!(
+            agent::RemoteAgent::cert_chain(&client_remote),
+            make_identity().cert_chain()
+        );
+
+        let server_local = quic::WithLocalAgent::local_agent(server.as_ref())
+            .await
+            .expect("server local agent lookup")
+            .expect("server should have local identity");
+        assert_eq!(agent::LocalAgent::name(&server_local), "localhost");
+        assert_eq!(
+            agent::LocalAgent::cert_chain(&server_local),
+            make_identity().cert_chain()
+        );
+
+        let server_remote = quic::WithRemoteAgent::remote_agent(server.as_ref())
+            .await
+            .expect("server remote agent lookup");
+        assert!(
+            server_remote.is_none(),
+            "server should not observe an anonymous client identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_close_check_and_closed_report_terminal_error() {
+        let pair = connected_pair().await;
+        let client = &pair.client;
+        let server = &pair.server;
+        Lifecycle::check(client.as_ref()).expect("client initially live");
+        Lifecycle::check(server.as_ref()).expect("server initially live");
+
+        Lifecycle::close(
+            client.as_ref(),
+            Code::H3_REQUEST_CANCELLED,
+            Cow::Borrowed("done"),
+        );
+
+        let error = with_timeout(Lifecycle::closed(server.as_ref())).await;
+        assert!(
+            error.is_application() || error.is_transport(),
+            "closed should report a terminal connection error"
+        );
+        assert!(Lifecycle::check(server.as_ref()).is_err());
     }
 
     #[tokio::test]

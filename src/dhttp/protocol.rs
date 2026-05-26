@@ -78,11 +78,12 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use futures::{Sink, Stream};
+    use futures::{Sink, SinkExt, Stream, StreamExt};
+    use tokio::time::{Duration, timeout};
 
     use super::*;
     use crate::{
-        codec::{BoxReadStream, BoxWriteStream, SinkWriter, StreamReader},
+        codec::{BoxReadStream, BoxWriteStream, PeekableStreamReader, SinkWriter, StreamReader},
         connection::{ConnectionState, tests::MockConnection},
         dhttp::settings::Settings,
         extended_connect::settings::EnableConnectProtocol,
@@ -188,6 +189,50 @@ mod tests {
         (reader, writer)
     }
 
+    async fn test_peekable_uni_stream_with_bytes(bytes: &[u8]) -> ErasedPeekableUniStream {
+        let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(2));
+        writer
+            .send(Bytes::copy_from_slice(bytes))
+            .await
+            .expect("write test uni bytes");
+        writer.close().await.expect("close test uni stream");
+        PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream))
+    }
+
+    fn test_empty_peekable_uni_stream() -> ErasedPeekableUniStream {
+        PeekableStreamReader::new(StreamReader::new(Box::pin(TestReadStream {
+            stream_id: VarInt::from_u32(2),
+        }) as BoxReadStream))
+    }
+
+    async fn test_peekable_bi_stream_with_bytes(
+        stream_id: u32,
+        bytes: &[u8],
+    ) -> ErasedPeekableBiStream {
+        let (reader, mut write_side) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
+        write_side
+            .send(Bytes::copy_from_slice(bytes))
+            .await
+            .expect("write test bidi bytes");
+        write_side.close().await.expect("close test bidi read side");
+
+        let (_read_side, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
+        (
+            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream)),
+            SinkWriter::new(Box::pin(writer) as BoxWriteStream),
+        )
+    }
+
+    fn test_empty_peekable_bi_stream(stream_id: u32) -> ErasedPeekableBiStream {
+        let stream_id = VarInt::from_u32(stream_id);
+        (
+            PeekableStreamReader::new(StreamReader::new(
+                Box::pin(TestReadStream { stream_id }) as BoxReadStream
+            )),
+            SinkWriter::new(Box::pin(TestWriteStream { stream_id }) as BoxWriteStream),
+        )
+    }
+
     fn test_connection_state() -> ConnectionState<MockConnection> {
         let quic = Arc::new(MockConnection::new());
         let erased_connection: Arc<dyn quic::DynConnection> = quic.clone();
@@ -200,6 +245,22 @@ mod tests {
         let mut h = DefaultHasher::new();
         t.hash(&mut h);
         h.finish()
+    }
+
+    fn assert_stream_connection_code(error: StreamError, expected: Code) {
+        assert!(matches!(
+            error,
+            StreamError::Connection {
+                source: crate::connection::ConnectionError::H3 { source },
+            } if source.code() == expected
+        ));
+    }
+
+    #[test]
+    fn dhttp_factory_display_names_protocol() {
+        let factory = DHttpProtocolFactory::default();
+
+        assert_eq!(factory.to_string(), "DHTTP/3");
     }
 
     #[test]
@@ -250,6 +311,35 @@ mod tests {
     }
 
     #[test]
+    fn begin_local_goaway_defaults_to_zero_without_received_streams() {
+        let state = DHttpState::new(Arc::new(Settings::default()));
+
+        let goaway = state.begin_local_goaway();
+
+        assert_eq!(goaway.stream_id(), VarInt::from_u32(0));
+        assert_eq!(state.local_goaway.peek(), Some(goaway));
+    }
+
+    #[test]
+    fn begin_local_goaway_uses_max_received_stream_id() {
+        let state = DHttpState::new(Arc::new(Settings::default()));
+        state
+            .register_accepted_stream(VarInt::from_u32(3))
+            .expect("first accepted stream");
+        state
+            .register_accepted_stream(VarInt::from_u32(11))
+            .expect("higher accepted stream");
+        state
+            .register_accepted_stream(VarInt::from_u32(7))
+            .expect("lower accepted stream");
+
+        let goaway = state.begin_local_goaway();
+
+        assert_eq!(goaway.stream_id(), VarInt::from_u32(11));
+        assert_eq!(state.local_goaway.peek(), Some(goaway));
+    }
+
+    #[test]
     fn initialized_stream_updates_initialized_only() {
         let state = DHttpState::new(Arc::new(Settings::default()));
         let stream_id = VarInt::from_u32(7);
@@ -263,6 +353,23 @@ mod tests {
     }
 
     #[test]
+    fn initialized_stream_tracks_maximum_stream_id() {
+        let state = DHttpState::new(Arc::new(Settings::default()));
+
+        state
+            .register_initialized_stream(VarInt::from_u32(15))
+            .expect("first initialized stream");
+        state
+            .register_initialized_stream(VarInt::from_u32(5))
+            .expect("lower initialized stream");
+
+        assert_eq!(
+            state.max_initialized_stream_id.peek(),
+            Some(VarInt::from_u32(15))
+        );
+    }
+
+    #[test]
     fn accepted_stream_updates_received_only() {
         let state = DHttpState::new(Arc::new(Settings::default()));
         let stream_id = VarInt::from_u32(9);
@@ -273,6 +380,35 @@ mod tests {
 
         assert_eq!(state.max_received_stream_id.peek(), Some(stream_id));
         assert_eq!(state.max_initialized_stream_id.peek(), None);
+    }
+
+    #[test]
+    fn accepted_stream_tracks_maximum_stream_id() {
+        let state = DHttpState::new(Arc::new(Settings::default()));
+
+        state
+            .register_accepted_stream(VarInt::from_u32(12))
+            .expect("first accepted stream");
+        state
+            .register_accepted_stream(VarInt::from_u32(4))
+            .expect("lower accepted stream");
+
+        assert_eq!(
+            state.max_received_stream_id.peek(),
+            Some(VarInt::from_u32(12))
+        );
+    }
+
+    #[test]
+    fn accepted_stream_rejected_at_local_goaway_boundary() {
+        let state = DHttpState::new(Arc::new(Settings::default()));
+        state.local_goaway.set(Goaway::new(VarInt::from_u32(10)));
+
+        let error = state
+            .register_accepted_stream(VarInt::from_u32(10))
+            .expect_err("stream at local goaway boundary must be rejected");
+
+        assert_eq!(error, ConnectionGoaway::Local);
     }
 
     #[test]
@@ -341,7 +477,372 @@ mod tests {
             .apply_peer_goaway(covering)
             .expect("covering goaway should be accepted");
 
-        assert_eq!(waiter.await.expect("join should succeed"), covering);
+        let observed = timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("peer goaway waiter should resolve")
+            .expect("join should succeed");
+        assert_eq!(observed, covering);
+    }
+
+    #[tokio::test]
+    async fn peer_goaway_covers_ignores_non_covering_existing_value() {
+        let state = Arc::new(DHttpState::new(Arc::new(Settings::default())));
+        state
+            .apply_peer_goaway(Goaway::new(VarInt::from_u32(20)))
+            .expect("non-covering peer goaway should be accepted");
+
+        let waiter_state = state.clone();
+        let waiter =
+            tokio::spawn(
+                async move { waiter_state.peer_goaway_covers(VarInt::from_u32(10)).await },
+            );
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        let covering = Goaway::new(VarInt::from_u32(10));
+        state
+            .apply_peer_goaway(covering)
+            .expect("covering peer goaway should be accepted");
+
+        let observed = timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("peer goaway waiter should resolve")
+            .expect("join should succeed");
+        assert_eq!(observed, covering);
+    }
+
+    #[tokio::test]
+    async fn accept_uni_passes_stream_when_type_cannot_be_decoded() {
+        let state = test_connection_state();
+        let stream = test_empty_peekable_uni_stream();
+
+        assert!(matches!(
+            state.dhttp().accept_uni(stream).await.expect("uni verdict"),
+            StreamVerdict::Passed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_uni_accepts_first_control_stream_and_rejects_duplicate() {
+        let state = test_connection_state();
+
+        let first = test_peekable_uni_stream_with_bytes(&[0x00]).await;
+        assert!(matches!(
+            state
+                .dhttp()
+                .accept_uni(first)
+                .await
+                .expect("first control"),
+            StreamVerdict::Accepted
+        ));
+
+        let duplicate = test_peekable_uni_stream_with_bytes(&[0x00]).await;
+        let error = match state.dhttp().accept_uni(duplicate).await {
+            Ok(_) => panic!("duplicate control stream must fail"),
+            Err(error) => error,
+        };
+
+        assert_stream_connection_code(error, Code::H3_STREAM_CREATION_ERROR);
+    }
+
+    #[tokio::test]
+    async fn accept_uni_rejects_push_stream_without_max_push_id() {
+        let state = test_connection_state();
+        let stream = test_peekable_uni_stream_with_bytes(&[0x01]).await;
+
+        let error = match state.dhttp().accept_uni(stream).await {
+            Ok(_) => panic!("push stream should exceed push id limit"),
+            Err(error) => error,
+        };
+
+        assert_stream_connection_code(error, Code::H3_ID_ERROR);
+    }
+
+    #[tokio::test]
+    async fn accept_uni_accepts_reserved_stream_type() {
+        let state = test_connection_state();
+        let stream = test_peekable_uni_stream_with_bytes(&[0x21]).await;
+
+        assert!(matches!(
+            state
+                .dhttp()
+                .accept_uni(stream)
+                .await
+                .expect("reserved stream verdict"),
+            StreamVerdict::Accepted
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_uni_passes_unknown_stream_type() {
+        let state = test_connection_state();
+        let stream = test_peekable_uni_stream_with_bytes(&[0x02]).await;
+
+        assert!(matches!(
+            state
+                .dhttp()
+                .accept_uni(stream)
+                .await
+                .expect("unknown stream verdict"),
+            StreamVerdict::Passed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_bi_passes_stream_when_frame_type_cannot_be_decoded() {
+        let state = test_connection_state();
+        let stream = test_empty_peekable_bi_stream(0);
+
+        assert!(matches!(
+            state
+                .dhttp()
+                .accept_bi(stream)
+                .await
+                .expect("empty bidi verdict"),
+            StreamVerdict::Passed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_bi_routes_known_http3_frame_type() {
+        let state = test_connection_state();
+        let stream = test_peekable_bi_stream_with_bytes(12, &[0x01]).await;
+
+        assert!(matches!(
+            state
+                .dhttp()
+                .accept_bi(stream)
+                .await
+                .expect("headers frame verdict"),
+            StreamVerdict::Accepted
+        ));
+
+        let (mut reader, _writer) = state.dhttp().unresolved_request_streams.receive().await;
+        assert_eq!(
+            reader.stream_id().await.expect("routed stream id"),
+            VarInt::from_u32(12)
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_bi_routes_reserved_http3_frame_type() {
+        let state = test_connection_state();
+        let stream = test_peekable_bi_stream_with_bytes(16, &[0x21]).await;
+
+        assert!(matches!(
+            state
+                .dhttp()
+                .accept_bi(stream)
+                .await
+                .expect("reserved frame verdict"),
+            StreamVerdict::Accepted
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_bi_passes_unknown_frame_type() {
+        let state = test_connection_state();
+        let stream = test_peekable_bi_stream_with_bytes(20, &[0x41]).await;
+
+        assert!(matches!(
+            state
+                .dhttp()
+                .accept_bi(stream)
+                .await
+                .expect("unknown frame verdict"),
+            StreamVerdict::Passed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_bi_evicts_oldest_unresolved_stream_when_ring_is_full() {
+        let state = test_connection_state();
+
+        for stream_id in 0..=32 {
+            let stream = test_peekable_bi_stream_with_bytes(stream_id, &[0x01]).await;
+            assert!(matches!(
+                state
+                    .dhttp()
+                    .accept_bi(stream)
+                    .await
+                    .expect("known frame verdict"),
+                StreamVerdict::Accepted
+            ));
+        }
+
+        let (mut reader, _writer) = state.dhttp().unresolved_request_streams.receive().await;
+        assert_eq!(
+            reader.stream_id().await.expect("oldest retained stream id"),
+            VarInt::from_u32(1)
+        );
+    }
+
+    #[test]
+    fn http3_frame_type_classifier_covers_known_reserved_and_unknown_values() {
+        assert!(DHttpProtocol::is_http3_frame_type(VarInt::from_u32(0x00)));
+        assert!(DHttpProtocol::is_http3_frame_type(VarInt::from_u32(0x01)));
+        assert!(DHttpProtocol::is_http3_frame_type(VarInt::from_u32(0x0d)));
+        assert!(DHttpProtocol::is_http3_frame_type(VarInt::from_u32(0x21)));
+        assert!(DHttpProtocol::is_http3_frame_type(VarInt::from_u32(0x40)));
+        assert!(!DHttpProtocol::is_http3_frame_type(VarInt::from_u32(0x02)));
+        assert!(!DHttpProtocol::is_http3_frame_type(VarInt::from_u32(0x41)));
+    }
+
+    #[tokio::test]
+    async fn protocol_factory_init_opens_uni_and_sets_local_settings() {
+        let conn = Arc::new(MockConnection::new());
+        conn.enable_stream_ops();
+        let mut settings = Settings::default();
+        settings.set(EnableConnectProtocol::setting(true));
+        let settings = Arc::new(settings);
+        let factory = DHttpProtocolFactory::new(settings.clone());
+
+        let protocol = factory.init(&conn).await.expect("protocol init");
+
+        assert_eq!(protocol.local_settings, settings);
+        assert_eq!(conn.stream_calls(), vec!["open_uni"]);
+    }
+
+    #[tokio::test]
+    async fn protocol_factory_init_returns_open_uni_connection_error() {
+        let conn = Arc::new(MockConnection::new());
+        let factory = DHttpProtocolFactory::default();
+
+        let error = factory
+            .init(&conn)
+            .await
+            .expect_err("open_uni failure should fail init");
+
+        assert!(matches!(error, quic::ConnectionError::Transport { .. }));
+        assert_eq!(conn.stream_calls(), vec!["open_uni"]);
+    }
+
+    #[test]
+    fn connection_state_accessors_return_dhttp_state_values() {
+        let state = test_connection_state();
+        state
+            .dhttp()
+            .register_initialized_stream(VarInt::from_u32(4))
+            .expect("initialized stream");
+        state
+            .dhttp()
+            .register_accepted_stream(VarInt::from_u32(8))
+            .expect("accepted stream");
+        state
+            .dhttp()
+            .apply_peer_goaway(Goaway::new(VarInt::from_u32(12)))
+            .expect("peer goaway");
+
+        assert_eq!(state.settings(), Arc::new(Settings::default()));
+        assert_eq!(state.max_initialized_stream_id(), Some(VarInt::from_u32(4)));
+        assert_eq!(state.max_received_stream_id(), Some(VarInt::from_u32(8)));
+        assert_eq!(
+            state.peek_peer_goaway(),
+            Some(Goaway::new(VarInt::from_u32(12)))
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_settings_resolves_when_settings_already_available() {
+        let state = test_connection_state();
+        let settings = Arc::new(Settings::default());
+        state
+            .dhttp()
+            .peer_settings
+            .set(settings.clone())
+            .expect("set peer settings");
+
+        let observed = state
+            .peer_settings()
+            .await
+            .await
+            .expect("peer settings should resolve");
+
+        assert_eq!(observed, settings);
+    }
+
+    #[tokio::test]
+    async fn peer_goawaies_yields_peer_goaway_updates() {
+        let state = test_connection_state();
+        let goaway = Goaway::new(VarInt::from_u32(18));
+
+        let mut goawaies = pin!(state.peer_goawaies());
+        state
+            .dhttp()
+            .apply_peer_goaway(goaway)
+            .expect("peer goaway");
+
+        let observed = timeout(Duration::from_millis(100), goawaies.next())
+            .await
+            .expect("peer goaway stream should yield")
+            .expect("peer goaway stream should not end")
+            .expect("peer goaway item should be ok");
+
+        assert_eq!(observed, goaway);
+    }
+
+    #[tokio::test]
+    async fn goaway_sends_local_goaway_using_max_received_stream_id() {
+        let state = test_connection_state();
+        state
+            .dhttp()
+            .register_accepted_stream(VarInt::from_u32(14))
+            .expect("accepted stream");
+
+        state.goaway().await.expect("send goaway");
+
+        assert_eq!(
+            state.dhttp().local_goaway.peek(),
+            Some(Goaway::new(VarInt::from_u32(14)))
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_raw_message_stream_registers_opened_stream() {
+        let quic = Arc::new(MockConnection::new());
+        quic.enable_stream_ops();
+        let erased_connection: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased_connection));
+        let state = ConnectionState::new_for_test(quic.clone(), Arc::new(protocols));
+
+        let (mut reader, _writer) = state
+            .initial_raw_message_stream()
+            .await
+            .expect("initial stream");
+
+        assert_eq!(
+            reader.stream_id().await.expect("stream id"),
+            VarInt::from_u32(0)
+        );
+        assert_eq!(state.max_initialized_stream_id(), Some(VarInt::from_u32(0)));
+        assert_eq!(quic.stream_calls(), vec!["open_bi"]);
+    }
+
+    #[tokio::test]
+    async fn initial_raw_message_stream_rejects_when_peer_goaway_latched() {
+        let quic = Arc::new(MockConnection::new());
+        quic.enable_stream_ops();
+        let erased_connection: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased_connection));
+        let state = ConnectionState::new_for_test(quic, Arc::new(protocols));
+        state
+            .dhttp()
+            .apply_peer_goaway(Goaway::new(VarInt::from_u32(0)))
+            .expect("peer goaway");
+
+        let error = match state.initial_raw_message_stream().await {
+            Ok(_) => panic!("peer goaway should reject initialized stream"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            InitialRawMessageStreamError::Goaway {
+                source: ConnectionGoaway::Peer
+            }
+        ));
     }
 
     #[tokio::test]
@@ -471,8 +972,9 @@ mod tests {
             .unresolved_request_streams
             .send(test_erased_streams(10));
 
-        let error = accept_task
+        let error = timeout(Duration::from_millis(100), accept_task)
             .await
+            .expect("accept task should resolve")
             .expect("join should succeed")
             .err()
             .expect("boundary should apply even if goaway was set after accept started");
