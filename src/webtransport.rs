@@ -327,3 +327,256 @@ mod lifecycle_ext {
 
 #[cfg(feature = "rpc")]
 pub use lifecycle_ext::WebTransportLifecycleExt;
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use bytes::Bytes;
+    use futures::{SinkExt, StreamExt};
+
+    use super::*;
+    use crate::{
+        error::Code,
+        quic::{self, GetStreamIdExt},
+        varint::VarInt,
+    };
+
+    #[derive(Debug)]
+    struct TestSession {
+        id: StreamId,
+    }
+
+    impl TestSession {
+        fn new(id: StreamId) -> Self {
+            Self { id }
+        }
+    }
+
+    fn boxed_stream_pair(stream_id: u32) -> (BoxReadStream, BoxWriteStream) {
+        let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
+        (
+            Box::pin(reader) as BoxReadStream,
+            Box::pin(writer) as BoxWriteStream,
+        )
+    }
+
+    impl Session for TestSession {
+        type StreamReader = BoxReadStream;
+        type StreamWriter = BoxWriteStream;
+
+        fn id(&self) -> StreamId {
+            self.id
+        }
+
+        async fn open_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), OpenStreamError> {
+            Ok(boxed_stream_pair(1))
+        }
+
+        async fn open_uni(&self) -> Result<Self::StreamWriter, OpenStreamError> {
+            let (_reader, writer) = boxed_stream_pair(2);
+            Ok(writer)
+        }
+
+        async fn accept_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), AcceptStreamError> {
+            Ok(boxed_stream_pair(3))
+        }
+
+        async fn accept_uni(&self) -> Result<Self::StreamReader, AcceptStreamError> {
+            let (reader, _writer) = boxed_stream_pair(4);
+            Ok(reader)
+        }
+    }
+
+    async fn assert_roundtrip(
+        reader: &mut BoxReadStream,
+        writer: &mut BoxWriteStream,
+        payload: &'static [u8],
+    ) {
+        let bytes = Bytes::from_static(payload);
+        writer
+            .send(bytes.clone())
+            .await
+            .expect("stream write should succeed");
+        let received = reader
+            .next()
+            .await
+            .expect("reader should receive one chunk")
+            .expect("stream read should succeed");
+
+        assert_eq!(received, bytes);
+    }
+
+    #[tokio::test]
+    async fn dyn_session_delegates_all_stream_operations() {
+        let session = TestSession::new(StreamId(VarInt::from_u32(42)));
+        let dyn_session: &dyn DynSession = &session;
+
+        assert_eq!(dyn_session.id(), StreamId(VarInt::from_u32(42)));
+
+        let (mut reader, mut writer) = dyn_session.open_bi().await.expect("open_bi should succeed");
+        assert_eq!(reader.stream_id().await.unwrap(), VarInt::from_u32(1));
+        assert_eq!(writer.stream_id().await.unwrap(), VarInt::from_u32(1));
+        assert_roundtrip(&mut reader, &mut writer, b"open-bidi").await;
+
+        let mut writer = dyn_session
+            .open_uni()
+            .await
+            .expect("open_uni should succeed");
+        assert_eq!(writer.stream_id().await.unwrap(), VarInt::from_u32(2));
+
+        let (mut reader, mut writer) = dyn_session
+            .accept_bi()
+            .await
+            .expect("accept_bi should succeed");
+        assert_eq!(reader.stream_id().await.unwrap(), VarInt::from_u32(3));
+        assert_eq!(writer.stream_id().await.unwrap(), VarInt::from_u32(3));
+        assert_roundtrip(&mut reader, &mut writer, b"accept-bidi").await;
+
+        let mut reader = dyn_session
+            .accept_uni()
+            .await
+            .expect("accept_uni should succeed");
+        assert_eq!(reader.stream_id().await.unwrap(), VarInt::from_u32(4));
+    }
+
+    #[cfg(feature = "rpc")]
+    mod lifecycle_tests {
+        use std::future::pending;
+
+        use super::*;
+        use crate::rpc::lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt};
+
+        #[derive(Debug, Default)]
+        struct TestLifecycle {
+            latch: ConnectionErrorLatch,
+        }
+
+        impl HasLatch for TestLifecycle {
+            fn latch(&self) -> &ConnectionErrorLatch {
+                &self.latch
+            }
+        }
+
+        impl quic::Lifecycle for TestLifecycle {
+            fn close(&self, _code: Code, _reason: Cow<'static, str>) {}
+
+            fn check(&self) -> Result<(), quic::ConnectionError> {
+                self.check_with_probe(|| None)
+            }
+
+            async fn closed(&self) -> quic::ConnectionError {
+                self.resolve_closed(pending()).await
+            }
+        }
+
+        fn connection_error(reason: &'static str) -> quic::ConnectionError {
+            quic::ConnectionError::Transport {
+                source: quic::TransportError {
+                    kind: VarInt::from_u32(0x01),
+                    frame_type: VarInt::from_u32(0x00),
+                    reason: reason.into(),
+                },
+            }
+        }
+
+        fn assert_reason(error: &quic::ConnectionError, expected: &str) {
+            let quic::ConnectionError::Transport { source } = error else {
+                panic!("expected transport error");
+            };
+            assert_eq!(source.reason.as_ref(), expected);
+        }
+
+        #[tokio::test]
+        async fn webtransport_lifecycle_checks_and_latches_open_errors() {
+            let lifecycle = TestLifecycle::default();
+
+            lifecycle.check_open().expect("open check should pass");
+            lifecycle.check_accept().expect("accept check should pass");
+
+            let error = lifecycle
+                .guard_open(async {
+                    Err::<(), _>(OpenStreamError::Open {
+                        source: connection_error("first"),
+                    })
+                })
+                .await
+                .expect_err("open error should be returned");
+            let OpenStreamError::Open { source } = error else {
+                panic!("expected open error");
+            };
+            assert_reason(&source, "first");
+
+            let error = lifecycle
+                .guard_open(async {
+                    Err::<(), _>(OpenStreamError::Open {
+                        source: connection_error("second"),
+                    })
+                })
+                .await
+                .expect_err("latched open error should be returned");
+            let OpenStreamError::Open { source } = error else {
+                panic!("expected open error");
+            };
+            assert_reason(&source, "first");
+        }
+
+        #[tokio::test]
+        async fn webtransport_lifecycle_guard_open_with_converts_lazily() {
+            let lifecycle = TestLifecycle::default();
+
+            let error = lifecycle
+                .guard_open_with(async { Err::<(), _>("boom") }, |_| OpenStreamError::Open {
+                    source: connection_error("converted"),
+                })
+                .await
+                .expect_err("converted open error should be returned");
+
+            let OpenStreamError::Open { source } = error else {
+                panic!("expected open error");
+            };
+            assert_reason(&source, "converted");
+        }
+
+        #[tokio::test]
+        async fn webtransport_lifecycle_accept_guards_preserve_error_shape() {
+            let lifecycle = TestLifecycle::default();
+
+            let error = lifecycle
+                .guard_accept(async {
+                    Err::<(), _>(AcceptStreamError::Connection {
+                        source: connection_error("accept"),
+                    })
+                })
+                .await
+                .expect_err("accept error should be returned");
+            let AcceptStreamError::Connection { source } = error else {
+                panic!("expected connection error");
+            };
+            assert_reason(&source, "accept");
+
+            let lifecycle = TestLifecycle::default();
+            let error = lifecycle
+                .guard_accept_err(async { Err::<(), _>("closed") }, |_| None)
+                .await
+                .expect_err("closed session should be returned");
+            assert!(matches!(error, AcceptStreamError::Closed { .. }));
+
+            let lifecycle = TestLifecycle::default();
+            let error = lifecycle
+                .guard_accept_err(async { Err::<(), _>("connection") }, |_| {
+                    Some(connection_error("converted accept"))
+                })
+                .await
+                .expect_err("converted accept error should be returned");
+            let AcceptStreamError::Connection { source } = error else {
+                panic!("expected connection error");
+            };
+            assert_reason(&source, "converted accept");
+        }
+    }
+}
