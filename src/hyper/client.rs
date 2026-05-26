@@ -17,7 +17,7 @@ use crate::{
             write::send_message_error,
         },
     },
-    qpack::field::Protocol,
+    qpack::field::{Protocol, hyper::validated_hyper_request_parts_to_field_lines},
     quic::{self, GetStreamIdExt},
     stream_id::StreamId,
 };
@@ -80,19 +80,31 @@ impl<C: quic::Connection> Connection<C> {
         B::Data: Send,
         B::Error: Error + Send + 'static,
     {
-        let (mut read_stream, mut write_stream) = self.initial_message_stream().await?;
         let is_connect = request.method() == http::Method::CONNECT;
+        let protocol = if is_connect {
+            protocol_from_extensions(request.extensions())
+        } else {
+            None
+        };
+        let (parts, body) = request.into_parts();
+        let fields = validated_hyper_request_parts_to_field_lines(parts)
+            .context(send_message_error::MalformedHeaderSnafu)?;
+        let (mut read_stream, mut write_stream) = self.initial_message_stream().await?;
 
         if is_connect {
             // CONNECT: no body or trailers — join send + receive headers.
-            let protocol = protocol_from_extensions(request.extensions());
             let stream_id = write_stream
                 .stream_id()
                 .await
                 .context(request_error::StreamIdSnafu)?;
-            let (parts, _body) = request.into_parts();
-            let (send_result, recv_result) =
-                tokio::join!(write_stream.send_hyper_request_parts(parts), async {
+            let (send_result, recv_result) = tokio::join!(
+                async {
+                    write_stream
+                        .write_header(fields)
+                        .await
+                        .context(send_message_error::StreamSnafu)
+                },
+                async {
                     loop {
                         let parts = read_stream.read_hyper_response_parts().await?;
                         if !parts.status.is_informational() {
@@ -104,8 +116,9 @@ impl<C: quic::Connection> Connection<C> {
                             "skipping informational response",
                         );
                     }
-                },);
-            send_result.context(send_message_error::StreamSnafu)?;
+                },
+            );
+            send_result?;
             let mut response_parts = recv_result?;
 
             response_parts.extensions.insert(StreamId::from(stream_id));
@@ -123,9 +136,8 @@ impl<C: quic::Connection> Connection<C> {
             Ok(http::Response::from_parts(response_parts, body))
         } else {
             // Non-CONNECT: send headers, spawn body sender, read response.
-            let (parts, body) = request.into_parts();
             write_stream
-                .send_hyper_request_parts(parts)
+                .write_header(fields)
                 .await
                 .context(send_message_error::StreamSnafu)?;
 

@@ -20,6 +20,7 @@ use crate::{
             write::SendMessageError,
         },
     },
+    qpack::field::MalformedHeaderSection,
 };
 
 #[derive(Debug, Snafu)]
@@ -27,6 +28,8 @@ use crate::{
 pub enum HandleRequestError<S: Error + 'static, B: Error + 'static> {
     #[snafu(display("failed to handle message stream"))]
     Stream { source: MessageStreamError },
+    #[snafu(display("response pseudo-header section is malformed"))]
+    MalformedHeader { source: MalformedHeaderSection },
     #[snafu(display("service error"))]
     Service { source: S },
     #[snafu(display("response body error"))]
@@ -39,6 +42,9 @@ impl<S: Error + 'static, B: Error + 'static> From<SendMessageError<B>>
     fn from(source: SendMessageError<B>) -> Self {
         match source {
             SendMessageError::Stream { source } => HandleRequestError::Stream { source },
+            SendMessageError::MalformedHeader { source } => {
+                HandleRequestError::MalformedHeader { source }
+            }
             SendMessageError::Body { source } => HandleRequestError::Body { source },
         }
     }

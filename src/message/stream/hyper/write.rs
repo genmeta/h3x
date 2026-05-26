@@ -1,13 +1,20 @@
-use std::pin::pin;
+use std::{convert::Infallible, pin::pin};
 
 use http_body::Body;
 use http_body_util::BodyExt;
 use snafu::{ResultExt, Snafu};
 
 use super::{MessageStreamError, WriteStream};
-use crate::qpack::field::hyper::{
-    header_map_to_field_lines, hyper_request_parts_to_field_lines,
-    hyper_response_parts_to_field_lines,
+use crate::{
+    error::H3StreamError,
+    qpack::field::{
+        MalformedHeaderSection,
+        hyper::{
+            header_map_to_field_lines, hyper_response_parts_to_field_lines,
+            validated_hyper_request_parts_to_field_lines,
+        },
+    },
+    quic::CancelStreamExt,
 };
 
 #[derive(Debug, Snafu)]
@@ -15,6 +22,8 @@ use crate::qpack::field::hyper::{
 pub enum SendMessageError<E: std::error::Error + 'static> {
     #[snafu(display("failed to send message on stream"))]
     Stream { source: MessageStreamError },
+    #[snafu(display("request pseudo-header section is malformed"))]
+    MalformedHeader { source: MalformedHeaderSection },
     #[snafu(display("failed to read body frame"))]
     Body { source: E },
 }
@@ -26,6 +35,9 @@ impl<E: std::error::Error + 'static> SendMessageError<E> {
     ) -> SendMessageError<E1> {
         match self {
             SendMessageError::Stream { source } => SendMessageError::Stream { source },
+            SendMessageError::MalformedHeader { source } => {
+                SendMessageError::MalformedHeader { source }
+            }
             SendMessageError::Body { source } => SendMessageError::Body { source: f(source) },
         }
     }
@@ -71,9 +83,17 @@ impl WriteStream {
     pub async fn send_hyper_request_parts(
         &mut self,
         parts: http::request::Parts,
-    ) -> Result<(), MessageStreamError> {
-        self.write_header(hyper_request_parts_to_field_lines(parts))
+    ) -> Result<(), SendMessageError<Infallible>> {
+        let fields = match validated_hyper_request_parts_to_field_lines(parts) {
+            Ok(fields) => fields,
+            Err(source) => {
+                _ = self.stream.cancel(source.code().into_inner()).await;
+                return Err(SendMessageError::MalformedHeader { source });
+            }
+        };
+        self.write_header(fields)
             .await
+            .context(send_message_error::StreamSnafu)
     }
 
     pub async fn send_hyper_request<B: Body>(
@@ -85,7 +105,14 @@ impl WriteStream {
         B::Error: std::error::Error + 'static,
     {
         let (parts, body) = request.into_parts();
-        self.write_header(hyper_request_parts_to_field_lines(parts))
+        let fields = match validated_hyper_request_parts_to_field_lines(parts) {
+            Ok(fields) => fields,
+            Err(source) => {
+                _ = self.stream.cancel(source.code().into_inner()).await;
+                return Err(SendMessageError::MalformedHeader { source });
+            }
+        };
+        self.write_header(fields)
             .await
             .context(send_message_error::StreamSnafu)?;
         self.send_hyper_body(body).await

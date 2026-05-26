@@ -33,6 +33,8 @@ pub enum MalformedHeaderSection {
     ResponsePseudoHeaderInRequest,
     #[snafu(display("field section contains pseudo-header fields in trailers"))]
     PseudoHeaderInTrailer,
+    #[snafu(display("pseudo-header field appears after regular header field"))]
+    PseudoHeaderAfterRegularHeader,
     #[snafu(display("field section too large"))]
     FieldSectionTooLarge,
     #[snafu(display(
@@ -196,6 +198,9 @@ impl FieldSection {
                 let Some(method) = method else {
                     return malformed_header_section::AbsenceOfMandatoryPseudoHeadersSnafu.fail();
                 };
+                if method != Method::CONNECT && protocol.is_some() {
+                    return Err(MalformedHeaderSection::ProtocolInNonConnectRequest);
+                }
 
                 // 4.  The Extended CONNECT Method
                 //
@@ -423,9 +428,14 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>> + Send> DecodeFrom<S> for 
 
         let mut pseudo_headers = None;
         let mut header_map = HeaderMap::new();
+        let mut regular_header_seen = false;
         while let Some(FieldLine { name, value }) = stream.try_next().await? {
             match name {
                 name if name == PseudoHeaders::METHOD => {
+                    ensure!(
+                        !regular_header_seen,
+                        malformed_header_section::PseudoHeaderAfterRegularHeaderSnafu
+                    );
                     let mut pseudo = pseudo_headers
                         .take()
                         .unwrap_or(PseudoHeaders::unresolved_request());
@@ -446,6 +456,10 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>> + Send> DecodeFrom<S> for 
                     pseudo_headers = Some(pseudo)
                 }
                 name if name == PseudoHeaders::PROTOOCL => {
+                    ensure!(
+                        !regular_header_seen,
+                        malformed_header_section::PseudoHeaderAfterRegularHeaderSnafu
+                    );
                     let mut pseudo = pseudo_headers
                         .take()
                         .unwrap_or(PseudoHeaders::unresolved_request());
@@ -468,6 +482,10 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>> + Send> DecodeFrom<S> for 
                     pseudo_headers = Some(pseudo)
                 }
                 name if name == PseudoHeaders::SCHEME => {
+                    ensure!(
+                        !regular_header_seen,
+                        malformed_header_section::PseudoHeaderAfterRegularHeaderSnafu
+                    );
                     let mut pseudo = pseudo_headers
                         .take()
                         .unwrap_or(PseudoHeaders::unresolved_request());
@@ -488,6 +506,10 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>> + Send> DecodeFrom<S> for 
                     pseudo_headers = Some(pseudo)
                 }
                 name if name == PseudoHeaders::AUTHORITY => {
+                    ensure!(
+                        !regular_header_seen,
+                        malformed_header_section::PseudoHeaderAfterRegularHeaderSnafu
+                    );
                     let mut pseudo = pseudo_headers
                         .take()
                         .unwrap_or(PseudoHeaders::unresolved_request());
@@ -510,6 +532,10 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>> + Send> DecodeFrom<S> for 
                     pseudo_headers = Some(pseudo)
                 }
                 name if name == PseudoHeaders::PATH => {
+                    ensure!(
+                        !regular_header_seen,
+                        malformed_header_section::PseudoHeaderAfterRegularHeaderSnafu
+                    );
                     let mut pseudo = pseudo_headers
                         .take()
                         .unwrap_or(PseudoHeaders::unresolved_request());
@@ -533,6 +559,10 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>> + Send> DecodeFrom<S> for 
                     pseudo_headers = Some(pseudo)
                 }
                 name if name == PseudoHeaders::STATUS => {
+                    ensure!(
+                        !regular_header_seen,
+                        malformed_header_section::PseudoHeaderAfterRegularHeaderSnafu
+                    );
                     let mut pseudo = pseudo_headers
                         .take()
                         .unwrap_or(PseudoHeaders::unresolved_response());
@@ -556,9 +586,14 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>> + Send> DecodeFrom<S> for 
                 }
 
                 name if name.starts_with(b":") => {
+                    ensure!(
+                        !regular_header_seen,
+                        malformed_header_section::PseudoHeaderAfterRegularHeaderSnafu
+                    );
                     return Err(MalformedHeaderSection::InvalidPseudoHeader { name }.into());
                 }
                 name => {
+                    regular_header_seen = true;
                     header_map
                         .try_append(
                             HeaderName::from_bytes(name.as_ref())
@@ -642,5 +677,36 @@ impl Iterator for Iter<'_> {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn decode_rejects_pseudo_header_after_regular_header() {
+        let fields = futures::stream::iter([
+            Ok(FieldLine {
+                name: Bytes::from_static(b"host"),
+                value: Bytes::from_static(b"reimu.pilot.genmeta.net"),
+            }),
+            Ok(FieldLine {
+                name: Bytes::from_static(b":method"),
+                value: Bytes::from_static(b"GET"),
+            }),
+        ]);
+
+        let error = FieldSection::decode_from(fields).await.unwrap_err();
+
+        let StreamError::H3 { source } = error else {
+            panic!("expected stream-scope H3 error");
+        };
+        assert_eq!(
+            source.to_string(),
+            "pseudo-header field appears after regular header field"
+        );
     }
 }

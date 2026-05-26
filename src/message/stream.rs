@@ -62,6 +62,8 @@ pub enum MessageStreamError {
     DataFrameTooLarge { source: varint::err::Overflow },
     #[snafu(display("http/3 message from peer is malformed"))]
     MalformedIncomingMessage,
+    #[snafu(display("http/3 message to send is malformed"))]
+    MalformedOutgoingMessage,
     #[snafu(display("message send previously failed"))]
     MessageSendFailed,
 }
@@ -101,6 +103,7 @@ impl From<MessageStreamError> for io::Error {
             MessageStreamError::Quic { .. } => None,
             MessageStreamError::Goaway { .. } => Some(ErrorKind::ConnectionAborted),
             MessageStreamError::MalformedIncomingMessage => Some(ErrorKind::InvalidData),
+            MessageStreamError::MalformedOutgoingMessage => Some(ErrorKind::InvalidInput),
             MessageStreamError::MessageSendFailed => Some(ErrorKind::BrokenPipe),
             MessageStreamError::HeaderTooLarge
             | MessageStreamError::TrailerTooLarge
@@ -639,6 +642,10 @@ mod tests {
         assert_kind(
             MessageStreamError::MalformedIncomingMessage,
             ErrorKind::InvalidData,
+        );
+        assert_kind(
+            MessageStreamError::MalformedOutgoingMessage,
+            ErrorKind::InvalidInput,
         );
         assert_kind(
             MessageStreamError::Goaway {

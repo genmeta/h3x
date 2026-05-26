@@ -41,33 +41,12 @@ pub fn header_map_to_field_lines(headers: http::HeaderMap) -> impl Iterator<Item
         .flatten()
 }
 
-pub fn hyper_request_parts_to_field_lines(
-    mut parts: http::request::Parts,
-) -> impl Iterator<Item = FieldLine> {
-    let uri_parts = parts.uri.into_parts();
-    let pseudo_headers = [
-        Some(parts.method.into()),
-        uri_parts.scheme.map(FieldLine::from),
-        uri_parts.authority.map(FieldLine::from),
-        uri_parts.path_and_query.map(FieldLine::from),
-    ];
-
-    let protocol = parts
-        .extensions
-        .remove::<Protocol>()
-        .map(FieldLine::from)
-        .or_else(|| {
-            parts
-                .extensions
-                .remove::<::hyper::ext::Protocol>()
-                .map(FieldLine::from)
-        });
-
-    pseudo_headers
-        .into_iter()
-        .flatten()
-        .chain(protocol)
-        .chain(header_map_to_field_lines(parts.headers))
+pub(crate) fn validated_hyper_request_parts_to_field_lines(
+    parts: http::request::Parts,
+) -> Result<Vec<FieldLine>, MalformedHeaderSection> {
+    let section = FieldSection::from(parts);
+    section.check_pseudo()?;
+    Ok(section.iter().collect())
 }
 
 pub fn hyper_response_parts_to_field_lines(
@@ -107,6 +86,8 @@ impl TryFrom<FieldSection> for request::Parts {
     type Error = MalformedHeaderSection;
 
     fn try_from(value: FieldSection) -> Result<Self, Self::Error> {
+        value.check_pseudo()?;
+
         let FieldSection {
             pseudo_headers,
             header_map,
@@ -185,5 +166,108 @@ impl TryFrom<FieldSection> for response::Parts {
         *response.headers_mut() =
             Arc::try_unwrap(header_map).unwrap_or_else(|header_map| (*header_map).clone());
         Ok(response.into_parts().0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_parts_rejects_authority_only_get() {
+        let section = FieldSection::header(
+            PseudoHeaders::Request {
+                method: Some(http::Method::GET),
+                scheme: None,
+                authority: Some("reimu.pilot.genmeta.net".parse().unwrap()),
+                path: None,
+                protocol: None,
+            },
+            http::HeaderMap::new(),
+        );
+
+        let error = http::request::Parts::try_from(section).unwrap_err();
+
+        assert!(matches!(
+            error,
+            MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders { .. }
+        ));
+    }
+
+    #[test]
+    fn request_parts_allows_connect_authority_form() {
+        let section = FieldSection::header(
+            PseudoHeaders::Request {
+                method: Some(http::Method::CONNECT),
+                scheme: None,
+                authority: Some("example.com:443".parse().unwrap()),
+                path: None,
+                protocol: None,
+            },
+            http::HeaderMap::new(),
+        );
+
+        let parts = http::request::Parts::try_from(section).unwrap();
+
+        assert_eq!(parts.method, http::Method::CONNECT);
+        assert_eq!(parts.uri.authority().unwrap().as_str(), "example.com:443");
+    }
+
+    #[test]
+    fn validated_request_parts_rejects_authority_only_get() {
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("reimu.pilot.genmeta.net")
+            .body(())
+            .unwrap();
+        let (parts, ()) = request.into_parts();
+
+        let error = validated_hyper_request_parts_to_field_lines(parts).unwrap_err();
+
+        assert!(matches!(
+            error,
+            MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders { .. }
+        ));
+    }
+
+    #[test]
+    fn request_parts_rejects_protocol_on_non_connect() {
+        let section = FieldSection::header(
+            PseudoHeaders::Request {
+                method: Some(http::Method::GET),
+                scheme: Some(http::uri::Scheme::HTTPS),
+                authority: Some("reimu.pilot.genmeta.net".parse().unwrap()),
+                path: Some("/".parse().unwrap()),
+                protocol: Some(Protocol::new("webtransport")),
+            },
+            http::HeaderMap::new(),
+        );
+
+        let error = http::request::Parts::try_from(section).unwrap_err();
+
+        assert!(matches!(
+            error,
+            MalformedHeaderSection::ProtocolInNonConnectRequest
+        ));
+    }
+
+    #[test]
+    fn validated_request_parts_rejects_protocol_on_get() {
+        let mut request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://reimu.pilot.genmeta.net/")
+            .body(())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(Protocol::new("webtransport"));
+        let (parts, ()) = request.into_parts();
+
+        let error = validated_hyper_request_parts_to_field_lines(parts).unwrap_err();
+
+        assert!(matches!(
+            error,
+            MalformedHeaderSection::ProtocolInNonConnectRequest
+        ));
     }
 }
