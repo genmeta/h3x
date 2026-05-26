@@ -306,3 +306,338 @@ impl quic::Lifecycle for RemoteConnection {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use bytes::Bytes;
+    use futures::{Sink, SinkExt, Stream, StreamExt};
+    use remoc::prelude::ServerShared;
+    use tokio_util::task::AbortOnDropHandle;
+
+    use super::*;
+    use crate::{
+        codec::{BoxReadStream, BoxWriteStream},
+        quic::{GetStreamIdExt, StopStreamExt},
+    };
+
+    struct TestRpcConnection {
+        fail_open: bool,
+        terminal: Mutex<Option<quic::ConnectionError>>,
+        closes: Mutex<Vec<(Code, Cow<'static, str>)>>,
+        tasks: Mutex<Vec<AbortOnDropHandle<()>>>,
+    }
+
+    impl TestRpcConnection {
+        fn new() -> Self {
+            Self {
+                fail_open: false,
+                terminal: Mutex::new(None),
+                closes: Mutex::new(Vec::new()),
+                tasks: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn fail_open() -> Self {
+            Self {
+                fail_open: true,
+                ..Self::new()
+            }
+        }
+
+        fn set_terminal(&self, error: quic::ConnectionError) {
+            *self
+                .terminal
+                .lock()
+                .expect("terminal mutex should not be poisoned") = Some(error);
+        }
+
+        fn closes(&self) -> Vec<(Code, Cow<'static, str>)> {
+            self.closes
+                .lock()
+                .expect("closes mutex should not be poisoned")
+                .clone()
+        }
+
+        fn stream_pair(&self, stream_id: u32) -> (ReadStreamClient, WriteStreamClient) {
+            let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
+            let (reader_server, reader_client) =
+                stream::ReadStreamServer::new(Box::pin(reader) as BoxReadStream, 1);
+            let (writer_server, writer_client) =
+                stream::WriteStreamServer::new(Box::pin(writer) as BoxWriteStream, 1);
+            self.push_task(tokio::spawn(
+                async move {
+                    let _ = reader_server.serve().await;
+                }
+                .in_current_span(),
+            ));
+            self.push_task(tokio::spawn(
+                async move {
+                    let _ = writer_server.serve().await;
+                }
+                .in_current_span(),
+            ));
+            (reader_client, writer_client)
+        }
+
+        fn read_stream(&self, stream_id: u32) -> ReadStreamClient {
+            let (reader, _writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
+            let (reader_server, reader_client) =
+                stream::ReadStreamServer::new(Box::pin(reader) as BoxReadStream, 1);
+            self.push_task(tokio::spawn(
+                async move {
+                    let _ = reader_server.serve().await;
+                }
+                .in_current_span(),
+            ));
+            reader_client
+        }
+
+        fn write_stream(&self, stream_id: u32) -> WriteStreamClient {
+            let (_reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
+            let (writer_server, writer_client) =
+                stream::WriteStreamServer::new(Box::pin(writer) as BoxWriteStream, 1);
+            self.push_task(tokio::spawn(
+                async move {
+                    let _ = writer_server.serve().await;
+                }
+                .in_current_span(),
+            ));
+            writer_client
+        }
+
+        fn push_task(&self, task: tokio::task::JoinHandle<()>) {
+            self.tasks
+                .lock()
+                .expect("tasks mutex should not be poisoned")
+                .push(AbortOnDropHandle::new(task));
+        }
+    }
+
+    impl super::Connection for TestRpcConnection {
+        async fn open_bi(
+            &self,
+        ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError> {
+            if self.fail_open {
+                return Err(connection_error("rpc open failed"));
+            }
+            Ok(self.stream_pair(1))
+        }
+
+        async fn open_uni(&self) -> Result<WriteStreamClient, quic::ConnectionError> {
+            if self.fail_open {
+                return Err(connection_error("rpc open failed"));
+            }
+            Ok(self.write_stream(2))
+        }
+
+        async fn accept_bi(
+            &self,
+        ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError> {
+            Ok(self.stream_pair(3))
+        }
+
+        async fn accept_uni(&self) -> Result<ReadStreamClient, quic::ConnectionError> {
+            Ok(self.read_stream(4))
+        }
+
+        async fn local_agent(&self) -> Result<Option<LocalAgentClient>, quic::ConnectionError> {
+            Ok(None)
+        }
+
+        async fn remote_agent(&self) -> Result<Option<RemoteAgentClient>, quic::ConnectionError> {
+            Ok(None)
+        }
+
+        async fn close(
+            &self,
+            code: Code,
+            reason: Cow<'static, str>,
+        ) -> Result<(), quic::ConnectionError> {
+            self.closes
+                .lock()
+                .expect("closes mutex should not be poisoned")
+                .push((code, reason));
+            Ok(())
+        }
+
+        async fn closed(&self) -> Result<quic::ConnectionError, quic::ConnectionError> {
+            Ok(self
+                .terminal
+                .lock()
+                .expect("terminal mutex should not be poisoned")
+                .clone()
+                .unwrap_or_else(|| connection_error("rpc closed")))
+        }
+    }
+
+    fn spawn_rpc_connection(
+        connection: Arc<TestRpcConnection>,
+    ) -> (AbortOnDropHandle<()>, ConnectionClient) {
+        let (server, client) = ConnectionServerShared::new(connection, 1);
+        let task = AbortOnDropHandle::new(tokio::spawn(
+            async move {
+                let _ = server.serve(true).await;
+            }
+            .in_current_span(),
+        ));
+        (task, client)
+    }
+
+    fn connection_error(reason: &'static str) -> quic::ConnectionError {
+        quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(0x01),
+                frame_type: VarInt::from_u32(0x00),
+                reason: reason.into(),
+            },
+        }
+    }
+
+    fn assert_reason(error: &quic::ConnectionError, expected: &str) {
+        let quic::ConnectionError::Transport { source } = error else {
+            panic!("expected transport error");
+        };
+        assert_eq!(source.reason.as_ref(), expected);
+    }
+
+    async fn assert_roundtrip(
+        reader: &mut (impl Stream<Item = Result<Bytes, quic::StreamError>> + Unpin),
+        writer: &mut (impl Sink<Bytes, Error = quic::StreamError> + Unpin),
+        payload: &'static [u8],
+    ) {
+        let bytes = Bytes::from_static(payload);
+        writer.send(bytes.clone()).await.expect("write");
+        let received = reader
+            .next()
+            .await
+            .expect("reader should produce one chunk")
+            .expect("read");
+        assert_eq!(received, bytes);
+    }
+
+    #[tokio::test]
+    async fn remote_connection_conversions_preserve_client() {
+        let connection = Arc::new(TestRpcConnection::new());
+        let (_task, client) = spawn_rpc_connection(connection);
+
+        let remote = ConnectionClient::into_quic(client);
+        let client = remote.clone().into_inner();
+        let remote = RemoteConnection::from(client);
+        let client = ConnectionClient::from(remote);
+        let remote = client.into_quic();
+
+        let mut writer = quic::ManageStream::open_uni(&remote)
+            .await
+            .expect("open uni");
+        assert_eq!(
+            writer.stream_id().await.expect("stream id"),
+            VarInt::from_u32(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_connection_delegates_stream_operations_and_agents() {
+        let connection = Arc::new(TestRpcConnection::new());
+        let (_task, client) = spawn_rpc_connection(connection.clone());
+        let remote = client.into_quic();
+
+        quic::Lifecycle::check(&remote).expect("fresh connection should be live");
+
+        let (mut reader, mut writer) = quic::ManageStream::open_bi(&remote)
+            .await
+            .expect("open bidi");
+        assert_eq!(
+            reader.stream_id().await.expect("reader id"),
+            VarInt::from_u32(1)
+        );
+        assert_eq!(
+            writer.stream_id().await.expect("writer id"),
+            VarInt::from_u32(1)
+        );
+        assert_roundtrip(&mut reader, &mut writer, b"open-bidi").await;
+
+        let mut writer = quic::ManageStream::open_uni(&remote)
+            .await
+            .expect("open uni");
+        assert_eq!(
+            writer.stream_id().await.expect("writer id"),
+            VarInt::from_u32(2)
+        );
+
+        let (mut reader, mut writer) = quic::ManageStream::accept_bi(&remote)
+            .await
+            .expect("accept bidi");
+        assert_eq!(
+            reader.stream_id().await.expect("reader id"),
+            VarInt::from_u32(3)
+        );
+        assert_eq!(
+            writer.stream_id().await.expect("writer id"),
+            VarInt::from_u32(3)
+        );
+        assert_roundtrip(&mut reader, &mut writer, b"accept-bidi").await;
+
+        let mut reader = quic::ManageStream::accept_uni(&remote)
+            .await
+            .expect("accept uni");
+        assert_eq!(
+            reader.stream_id().await.expect("reader id"),
+            VarInt::from_u32(4)
+        );
+        reader
+            .stop(VarInt::from_u32(10))
+            .await
+            .expect("stop accepted reader");
+
+        assert!(
+            quic::WithLocalAgent::local_agent(&remote)
+                .await
+                .expect("local agent")
+                .is_none()
+        );
+        assert!(
+            quic::WithRemoteAgent::remote_agent(&remote)
+                .await
+                .expect("remote agent")
+                .is_none()
+        );
+
+        quic::Lifecycle::close(&remote, Code::H3_NO_ERROR, "bye".into());
+        for _ in 0..20 {
+            if !connection.closes().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            connection.closes(),
+            vec![(Code::H3_NO_ERROR, Cow::Borrowed("bye"))],
+        );
+
+        connection.set_terminal(connection_error("terminal"));
+        let closed = quic::Lifecycle::closed(&remote).await;
+        assert_reason(&closed, "terminal");
+        let latched = quic::Lifecycle::check(&remote).expect_err("closed should latch");
+        assert_reason(&latched, "terminal");
+    }
+
+    #[tokio::test]
+    async fn remote_connection_latches_remote_errors() {
+        let connection = Arc::new(TestRpcConnection::fail_open());
+        let (_task, client) = spawn_rpc_connection(connection);
+        let remote = client.into_quic();
+
+        let Err(error) = quic::ManageStream::open_bi(&remote).await else {
+            panic!("open error should surface");
+        };
+        assert_reason(&error, "rpc open failed");
+
+        let latched = quic::Lifecycle::check(&remote).expect_err("open error should latch");
+        assert_reason(&latched, "rpc open failed");
+
+        let closed = quic::Lifecycle::closed(&remote).await;
+        assert_reason(&closed, "rpc open failed");
+    }
+}
