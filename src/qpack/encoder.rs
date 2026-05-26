@@ -662,16 +662,29 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        collections::VecDeque,
+        io::Cursor,
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+    };
 
     use bytes::Bytes;
+    use futures::Sink;
+    use tokio::io::AsyncWrite;
 
     use crate::{
+        codec::{DecodeFrom, EncodeInto},
+        connection::StreamError,
         dhttp::settings::Settings,
         qpack::{
-            encoder::{EncoderState, QPackDecoderStreamError, QPackEncoderError},
-            field::FieldLineRepresentation,
+            encoder::{
+                EncoderInstruction, EncoderState, QPackDecoderStreamError, QPackEncoderError,
+            },
+            field::{FieldLine, FieldLineRepresentation},
         },
+        quic,
         varint::VarInt,
     };
 
@@ -710,7 +723,102 @@ mod tests {
         Arc::new(settings)
     }
 
+    #[derive(Default)]
+    struct RecordingSink {
+        bytes: Vec<u8>,
+    }
+
+    impl AsyncWrite for RecordingSink {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            self.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Sink<Bytes> for RecordingSink {
+        type Error = quic::StreamError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+            self.bytes.extend_from_slice(&item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn encode_decode_roundtrip(
+        instruction: EncoderInstruction,
+    ) -> Result<EncoderInstruction, StreamError> {
+        let mut sink = RecordingSink::default();
+        instruction.clone().encode_into(&mut sink).await?;
+        EncoderInstruction::decode_from(Cursor::new(sink.bytes)).await
+    }
+
     // --- Core encoding tests ---
+
+    #[tokio::test]
+    async fn encoder_instruction_roundtrip_all_variants() {
+        let instructions = [
+            EncoderInstruction::SetDynamicTableCapacity { capacity: 123 },
+            EncoderInstruction::InsertWithNameReference {
+                is_static: true,
+                name_index: 15,
+                huffman: false,
+                value: Bytes::from_static(b"value"),
+            },
+            EncoderInstruction::InsertWithLiteralName {
+                name_huffman: false,
+                name: Bytes::from_static(b"x-test"),
+                value_huffman: false,
+                value: Bytes::from_static(b"payload"),
+            },
+            EncoderInstruction::Duplicate { index: 7 },
+        ];
+
+        for instruction in instructions {
+            let decoded = encode_decode_roundtrip(instruction.clone())
+                .await
+                .expect("instruction should roundtrip");
+            assert_eq!(decoded, instruction);
+        }
+    }
 
     #[test]
     fn on_insert_count_increment_zero_returns_err() {
@@ -740,6 +848,61 @@ mod tests {
         // inserted_count == 1, known_received_count == 0 → increment of 1 is valid
         let result = state.on_insert_count_increment(1);
         assert!(result.is_ok(), "Expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn on_insert_count_increment_overflow_returns_err() {
+        let mut state = EncoderState::new(settings_with_capacity(256));
+        state
+            .set_max_table_capacity(128)
+            .expect("set capacity failed");
+        state
+            .insert_with_literal_name(
+                false,
+                Bytes::from_static(b"x-custom"),
+                false,
+                Bytes::from_static(b"value"),
+            )
+            .expect("insert failed");
+
+        let result = state.on_insert_count_increment(2);
+
+        assert!(
+            matches!(
+                result,
+                Err(QPackDecoderStreamError::IncrementKnownReceivedCountOverflow)
+            ),
+            "Expected IncrementKnownReceivedCountOverflow, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn on_section_acknowledgment_missing_stream_returns_err() {
+        let mut state = EncoderState::new(settings_with_capacity(256));
+
+        let result = state.on_section_acknowledgment(42);
+
+        assert!(
+            matches!(
+                result,
+                Err(QPackDecoderStreamError::AcknowledgeNonExistSection { stream_id: 42 })
+            ),
+            "Expected AcknowledgeNonExistSection, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn on_section_acknowledgment_updates_known_received_count_and_clears_stream() {
+        let mut state = EncoderState::new(settings_with_capacity(256));
+        state.dynamic_table.known_received_count = 1;
+        state.blocking_streams.insert(7, VecDeque::from([3]));
+
+        state
+            .on_section_acknowledgment(7)
+            .expect("section acknowledgment should succeed");
+
+        assert_eq!(state.dynamic_table.known_received_count, 4);
+        assert!(!state.blocking_streams.contains_key(&7));
     }
 
     // --- Table management tests ---
@@ -780,6 +943,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn set_max_table_capacity_shrinks_by_evicting_acknowledged_entries() {
+        let mut state = EncoderState::new(settings_with_capacity(128));
+        state
+            .set_max_table_capacity(128)
+            .expect("set capacity failed");
+        state
+            .insert_with_literal_name(
+                false,
+                Bytes::from_static(b"header-1"),
+                false,
+                Bytes::from_static(b"value-1"),
+            )
+            .expect("first insert failed");
+        state
+            .insert_with_literal_name(
+                false,
+                Bytes::from_static(b"header-2"),
+                false,
+                Bytes::from_static(b"value-2"),
+            )
+            .expect("second insert failed");
+        state.dynamic_table.known_received_count = state.dynamic_table.inserted_count;
+
+        state
+            .set_max_table_capacity(64)
+            .expect("shrink should evict acknowledged entries");
+
+        assert_eq!(state.table_capacity(), 64);
+        assert_eq!(state.table_dropped_count(), 1);
+        assert_eq!(state.table_inserted_count(), 2);
+        assert_eq!(
+            state
+                .entries()
+                .map(|(index, entry)| (index, entry.name.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, Bytes::from_static(b"header-2"))]
+        );
+        assert!(state.find_name(&Bytes::from_static(b"header-1")).is_none());
+        assert!(state.find_value(&Bytes::from_static(b"value-1")).is_none());
+    }
+
     // --- Eviction tests ---
 
     #[test]
@@ -811,6 +1016,73 @@ mod tests {
         assert!(
             matches!(result, Err(QPackEncoderError::CannotEvict)),
             "Expected CannotEvict, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn insert_with_name_reference_uses_dynamic_relative_index() {
+        let mut state = EncoderState::new(settings_with_capacity(256));
+        state
+            .set_max_table_capacity(256)
+            .expect("set capacity failed");
+        let referenced_index = state
+            .insert_with_literal_name(
+                false,
+                Bytes::from_static(b"x-name"),
+                false,
+                Bytes::from_static(b"first"),
+            )
+            .expect("first insert failed");
+
+        let new_index = state
+            .insert_with_name_reference(
+                false,
+                referenced_index,
+                false,
+                Bytes::from_static(b"second"),
+            )
+            .expect("name reference insert failed");
+
+        assert_eq!(new_index, 1);
+        assert_eq!(
+            state.pending_instructions().back(),
+            Some(&EncoderInstruction::InsertWithNameReference {
+                is_static: false,
+                name_index: 0,
+                huffman: false,
+                value: Bytes::from_static(b"second"),
+            })
+        );
+    }
+
+    #[test]
+    fn duplicate_uses_relative_index_and_preserves_entry() {
+        let mut state = EncoderState::new(settings_with_capacity(256));
+        state
+            .set_max_table_capacity(256)
+            .expect("set capacity failed");
+        let original_index = state
+            .insert_with_literal_name(
+                false,
+                Bytes::from_static(b"x-name"),
+                false,
+                Bytes::from_static(b"value"),
+            )
+            .expect("insert failed");
+
+        let duplicated_index = state.duplicate(original_index).expect("duplicate failed");
+
+        assert_eq!(duplicated_index, 1);
+        assert_eq!(
+            state.pending_instructions().back(),
+            Some(&EncoderInstruction::Duplicate { index: 0 })
+        );
+        assert_eq!(
+            state.get_entry(duplicated_index),
+            Some(&FieldLine {
+                name: Bytes::from_static(b"x-name"),
+                value: Bytes::from_static(b"value"),
+            })
         );
     }
 

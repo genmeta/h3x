@@ -661,14 +661,23 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{io::Cursor, sync::Arc};
 
     use bytes::Bytes;
 
-    use super::{DecoderInstruction, DecoderState};
+    use super::{
+        DecoderInstruction, DecoderState, InvalidDynamicTableReference, QPackEncoderStreamError,
+        decompression_field_line_representation,
+    };
     use crate::{
+        codec::{DecodeFrom, EncodeInto},
         dhttp::settings::Settings,
-        qpack::{settings::QpackMaxTableCapacity, r#static},
+        qpack::{
+            dynamic::DynamicTable,
+            field::{FieldLine, FieldLineRepresentation},
+            settings::QpackMaxTableCapacity,
+            r#static,
+        },
         varint::VarInt,
     };
 
@@ -676,6 +685,24 @@ mod tests {
         let mut settings = Settings::default();
         settings.set(QpackMaxTableCapacity::setting(VarInt::from_u32(capacity)));
         Arc::new(settings)
+    }
+
+    async fn encode_decode_roundtrip(
+        instruction: DecoderInstruction,
+    ) -> Result<DecoderInstruction, crate::connection::StreamError> {
+        let mut encoded = Vec::new();
+        instruction.encode_into(Cursor::new(&mut encoded)).await?;
+        DecoderInstruction::decode_from(Cursor::new(encoded)).await
+    }
+
+    fn dynamic_table_with_entries(entries: &[FieldLine]) -> DynamicTable {
+        let mut table = DynamicTable::new();
+        table.capacity = 512;
+        for entry in entries {
+            table.index(entry.clone());
+        }
+        table.known_received_count = table.inserted_count;
+        table
     }
 
     #[test]
@@ -737,6 +764,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn decoder_instruction_roundtrip_all_variants() {
+        let instructions = [
+            DecoderInstruction::SectionAcknowledgment { stream_id: 7 },
+            DecoderInstruction::StreamCancellation { stream_id: 11 },
+            DecoderInstruction::InsertCountIncrement { increment: 5 },
+        ];
+
+        for instruction in instructions {
+            let decoded = encode_decode_roundtrip(instruction)
+                .await
+                .expect("instruction should roundtrip");
+            assert_eq!(decoded, instruction);
+        }
+    }
+
     #[test]
     fn set_dynamic_table_capacity_within_limit() {
         let mut state = DecoderState::new(test_settings(256));
@@ -748,6 +791,52 @@ mod tests {
     fn set_dynamic_table_capacity_exceeds_max() {
         let mut state = DecoderState::new(test_settings(256));
         assert!(state.set_dynamic_table_capacity(512).is_err());
+    }
+
+    #[test]
+    fn update_known_received_count_merges_pending_increment() {
+        let mut state = DecoderState::new(test_settings(256));
+
+        state.update_known_received_count(1);
+        state.update_known_received_count(3);
+
+        assert_eq!(state.dynamic_table.known_received_count, 3);
+        assert_eq!(state.pending_instructions.len(), 1);
+        assert_eq!(
+            state.pending_instructions[0],
+            DecoderInstruction::InsertCountIncrement { increment: 3 }
+        );
+    }
+
+    #[test]
+    fn set_dynamic_table_capacity_evicts_entries_until_within_limit() {
+        let mut state = DecoderState::new(test_settings(128));
+        state.set_dynamic_table_capacity(128).unwrap();
+        state
+            .insert_with_literal_name(
+                Bytes::from_static(b"header-1"),
+                Bytes::from_static(b"value-1"),
+            )
+            .unwrap();
+        state
+            .insert_with_literal_name(
+                Bytes::from_static(b"header-2"),
+                Bytes::from_static(b"value-2"),
+            )
+            .unwrap();
+
+        state.set_dynamic_table_capacity(64).unwrap();
+
+        assert_eq!(state.dynamic_table.capacity, 64);
+        assert_eq!(state.dynamic_table.dropped_count, 1);
+        assert_eq!(
+            state
+                .dynamic_table
+                .entries()
+                .map(|(index, entry)| (index, entry.name.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, Bytes::from_static(b"header-2"))]
+        );
     }
 
     #[test]
@@ -780,6 +869,32 @@ mod tests {
     }
 
     #[test]
+    fn insert_with_name_reference_errors_for_missing_references() {
+        let mut state = DecoderState::new(test_settings(4096));
+        state.set_dynamic_table_capacity(4096).unwrap();
+
+        let missing_static =
+            state.insert_with_name_reference(true, 9999, Bytes::from_static(b"value"));
+        let missing_dynamic =
+            state.insert_with_name_reference(false, 0, Bytes::from_static(b"value"));
+
+        assert!(
+            matches!(
+                missing_static,
+                Err(QPackEncoderStreamError::ReferencedStaticEntryNotExisted { index: 9999 })
+            ),
+            "unexpected static result: {missing_static:?}"
+        );
+        assert!(
+            matches!(
+                missing_dynamic,
+                Err(QPackEncoderStreamError::ReferencedDynamicEntryNotExisted { index: 0 })
+            ),
+            "unexpected dynamic result: {missing_dynamic:?}"
+        );
+    }
+
+    #[test]
     fn insert_fails_when_capacity_too_small() {
         let mut state = DecoderState::new(test_settings(4096));
         // Set capacity very small — a FieldLine has 32 bytes overhead + name + value
@@ -787,6 +902,22 @@ mod tests {
         let result =
             state.insert_with_literal_name(Bytes::from_static(b"name"), Bytes::from_static(b"v"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn duplicate_errors_for_missing_dynamic_entry() {
+        let mut state = DecoderState::new(test_settings(256));
+        state.set_dynamic_table_capacity(256).unwrap();
+
+        let result = state.duplicate(0);
+
+        assert!(
+            matches!(
+                result,
+                Err(QPackEncoderStreamError::ReferencedDynamicEntryNotExisted { index: 0 })
+            ),
+            "Expected missing dynamic entry error, got {result:?}"
+        );
     }
 
     #[test]
@@ -800,9 +931,6 @@ mod tests {
 
     #[test]
     fn decompression_static_indexed_field_line() {
-        use super::decompression_field_line_representation;
-        use crate::qpack::{dynamic::DynamicTable, field::FieldLineRepresentation};
-
         let dt = DynamicTable::new();
         let repr = FieldLineRepresentation::IndexedFieldLine {
             is_static: true,
@@ -815,9 +943,6 @@ mod tests {
 
     #[test]
     fn decompression_literal_with_literal_name() {
-        use super::decompression_field_line_representation;
-        use crate::qpack::{dynamic::DynamicTable, field::FieldLineRepresentation};
-
         let dt = DynamicTable::new();
         let repr = FieldLineRepresentation::LiteralFieldLineWithLiteralName {
             never_dynamic: false,
@@ -833,14 +958,108 @@ mod tests {
 
     #[test]
     fn decompression_invalid_static_index() {
-        use super::decompression_field_line_representation;
-        use crate::qpack::{dynamic::DynamicTable, field::FieldLineRepresentation};
-
         let dt = DynamicTable::new();
         let repr = FieldLineRepresentation::IndexedFieldLine {
             is_static: true,
             index: 9999,
         };
         assert!(decompression_field_line_representation(&repr, 0, &dt).is_err());
+    }
+
+    #[test]
+    fn decompression_dynamic_references_resolve_relative_and_post_base_indices() {
+        let dt = dynamic_table_with_entries(&[
+            FieldLine {
+                name: Bytes::from_static(b"header-1"),
+                value: Bytes::from_static(b"value-1"),
+            },
+            FieldLine {
+                name: Bytes::from_static(b"header-2"),
+                value: Bytes::from_static(b"value-2"),
+            },
+            FieldLine {
+                name: Bytes::from_static(b"header-3"),
+                value: Bytes::from_static(b"value-3"),
+            },
+        ]);
+
+        let indexed = FieldLineRepresentation::IndexedFieldLine {
+            is_static: false,
+            index: 0,
+        };
+        let indexed_post_base =
+            FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex { index: 0 };
+        let literal_name_ref = FieldLineRepresentation::LiteralFieldLineWithNameReference {
+            never_dynamic: false,
+            is_static: false,
+            name_index: 1,
+            huffman: false,
+            value: Bytes::from_static(b"patched"),
+        };
+        let literal_post_base =
+            FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
+                never_dynamic: false,
+                name_index: 0,
+                huffman: false,
+                value: Bytes::from_static(b"patched-post"),
+            };
+
+        assert_eq!(
+            decompression_field_line_representation(&indexed, 3, &dt).unwrap(),
+            FieldLine {
+                name: Bytes::from_static(b"header-3"),
+                value: Bytes::from_static(b"value-3"),
+            }
+        );
+        assert_eq!(
+            decompression_field_line_representation(&indexed_post_base, 2, &dt).unwrap(),
+            FieldLine {
+                name: Bytes::from_static(b"header-3"),
+                value: Bytes::from_static(b"value-3"),
+            }
+        );
+        assert_eq!(
+            decompression_field_line_representation(&literal_name_ref, 3, &dt).unwrap(),
+            FieldLine {
+                name: Bytes::from_static(b"header-2"),
+                value: Bytes::from_static(b"patched"),
+            }
+        );
+        assert_eq!(
+            decompression_field_line_representation(&literal_post_base, 2, &dt).unwrap(),
+            FieldLine {
+                name: Bytes::from_static(b"header-3"),
+                value: Bytes::from_static(b"patched-post"),
+            }
+        );
+    }
+
+    #[test]
+    fn decompression_reports_index_overflow_and_missing_dynamic_entry() {
+        let dt = dynamic_table_with_entries(&[FieldLine {
+            name: Bytes::from_static(b"header-1"),
+            value: Bytes::from_static(b"value-1"),
+        }]);
+
+        let overflow = FieldLineRepresentation::IndexedFieldLine {
+            is_static: false,
+            index: 1,
+        };
+        let missing = FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex { index: 10 };
+
+        assert!(
+            matches!(
+                decompression_field_line_representation(&overflow, 0, &dt),
+                Err(InvalidDynamicTableReference::IndexOverflow)
+            ),
+            "expected relative index overflow"
+        );
+        assert!(
+            matches!(
+                decompression_field_line_representation(&missing, 1, &dt),
+                Err(InvalidDynamicTableReference::ReferencedDynamicEntryNotExisted { index: 11 })
+            ),
+            "expected missing post-base entry"
+        );
     }
 }

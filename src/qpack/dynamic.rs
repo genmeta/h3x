@@ -89,3 +89,114 @@ impl DynamicTable {
         self.known_received_count += increment;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::DynamicTable;
+    use crate::qpack::field::FieldLine;
+
+    fn field_line(name: &'static [u8], value: &'static [u8]) -> FieldLine {
+        FieldLine {
+            name: Bytes::from_static(name),
+            value: Bytes::from_static(value),
+        }
+    }
+
+    #[test]
+    fn get_and_get_mut_respect_dropped_count() {
+        let mut table = DynamicTable::new();
+        table.capacity = 128;
+        table.index(field_line(b"header-1", b"value-1"));
+        table.index(field_line(b"header-2", b"value-2"));
+        table.increment_known_received_count(1);
+
+        let (evicted_index, evicted) = table.evict();
+        assert_eq!(evicted_index, 0);
+        assert_eq!(evicted.name, Bytes::from_static(b"header-1"));
+        assert!(table.get(0).is_none());
+
+        let entry = table.get_mut(1).expect("second entry should remain");
+        entry.value = Bytes::from_static(b"updated");
+        assert_eq!(
+            table.get(1).expect("updated entry should exist").value,
+            Bytes::from_static(b"updated")
+        );
+    }
+
+    #[test]
+    fn evictable_depends_on_known_received_count() {
+        let mut table = DynamicTable::new();
+        table.capacity = 64;
+        table.index(field_line(b"header-1", b"value-1"));
+
+        assert!(
+            !table.evictable(),
+            "unacknowledged entry must not be evictable"
+        );
+
+        table.increment_known_received_count(1);
+        assert!(
+            table.evictable(),
+            "acknowledged entry should become evictable"
+        );
+    }
+
+    #[test]
+    fn entries_preserve_absolute_indices_after_eviction() {
+        let mut table = DynamicTable::new();
+        table.capacity = 192;
+        table.index(field_line(b"header-1", b"value-1"));
+        table.index(field_line(b"header-2", b"value-2"));
+        table.index(field_line(b"header-3", b"value-3"));
+        table.increment_known_received_count(2);
+        table.evict();
+
+        let entries = table
+            .entries()
+            .map(|(index, entry)| (index, entry.name.clone()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            entries,
+            vec![
+                (1, Bytes::from_static(b"header-2")),
+                (2, Bytes::from_static(b"header-3")),
+            ]
+        );
+    }
+
+    #[test]
+    fn evict_updates_size_and_counts() {
+        let mut table = DynamicTable::new();
+        let entry = field_line(b"header-1", b"value-1");
+        let entry_size = entry.size();
+        table.capacity = entry_size;
+        table.index(entry);
+        table.increment_known_received_count(1);
+
+        let (index, _) = table.evict();
+
+        assert_eq!(index, 0);
+        assert_eq!(table.size, 0);
+        assert_eq!(table.dropped_count, 1);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn increment_known_received_count_accumulates() {
+        let mut table = DynamicTable::new();
+        table.increment_known_received_count(2);
+        table.increment_known_received_count(3);
+        assert_eq!(table.known_received_count, 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "Dynamic table size exceeded its capacity")]
+    fn index_panics_when_capacity_is_exceeded() {
+        let mut table = DynamicTable::new();
+        table.capacity = 10;
+        table.index(field_line(b"header-1", b"value-1"));
+    }
+}
