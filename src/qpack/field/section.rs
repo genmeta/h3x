@@ -683,8 +683,327 @@ impl Iterator for Iter<'_> {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use futures::stream;
 
     use super::*;
+
+    fn field(name: &'static [u8], value: &'static [u8]) -> Result<FieldLine, StreamError> {
+        Ok(FieldLine {
+            name: Bytes::from_static(name),
+            value: Bytes::from_static(value),
+        })
+    }
+
+    async fn decode_fields(
+        fields: impl IntoIterator<Item = Result<FieldLine, StreamError>>,
+    ) -> Result<FieldSection, StreamError> {
+        let fields: Vec<_> = fields.into_iter().collect();
+        FieldSection::decode_from(stream::iter(fields)).await
+    }
+
+    fn assert_h3_error(error: StreamError, expected: &str) {
+        let StreamError::H3 { source } = error else {
+            panic!("expected stream-scope H3 error");
+        };
+        assert_eq!(source.to_string(), expected);
+    }
+
+    fn request_pseudo(
+        method: Option<Method>,
+        scheme: Option<Scheme>,
+        authority: Option<Authority>,
+        path: Option<PathAndQuery>,
+        protocol: Option<Protocol>,
+    ) -> PseudoHeaders {
+        PseudoHeaders::Request {
+            method,
+            scheme,
+            authority,
+            path,
+            protocol,
+        }
+    }
+
+    #[test]
+    fn field_section_accessors_mutators_and_iteration() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-test", HeaderValue::from_static("one"));
+        let mut section = FieldSection::header(
+            PseudoHeaders::request(
+                Method::GET,
+                Uri::from_static("https://example.test:443/a?b=1"),
+            ),
+            headers,
+        );
+
+        assert!(!section.is_empty());
+        assert!(section.is_request_header());
+        assert!(!section.is_response_header());
+        assert!(!section.is_trailer());
+        assert_eq!(section.method(), Method::GET);
+        assert_eq!(section.scheme(), Some(Scheme::HTTPS));
+        assert_eq!(
+            section.authority().as_ref().map(Authority::as_str),
+            Some("example.test:443")
+        );
+        assert_eq!(
+            section.path().as_ref().map(PathAndQuery::as_str),
+            Some("/a?b=1")
+        );
+        assert_eq!(
+            section.uri(),
+            Uri::from_static("https://example.test:443/a?b=1")
+        );
+
+        section.set_method(Method::POST);
+        section.set_scheme(Scheme::HTTP);
+        section.set_authority(Authority::from_static("example.test:80"));
+        section.set_path(PathAndQuery::from_static("/changed"));
+        section.set_protocol(Protocol::new("webtransport"));
+        section.set_uri(Uri::from_static("https://other.test/new"));
+        section
+            .header_map_mut()
+            .insert("x-second", HeaderValue::from_static("two"));
+
+        assert_eq!(section.method(), Method::POST);
+        assert_eq!(
+            section.protocol().as_ref().map(Protocol::as_str),
+            Some("webtransport")
+        );
+        assert_eq!(section.uri(), Uri::from_static("https://other.test/new"));
+        assert_eq!(section.header_map()["x-second"], "two");
+
+        let fields: Vec<_> = section.iter().collect();
+        let names: Vec<_> = fields
+            .iter()
+            .map(|line| std::str::from_utf8(&line.name).expect("field name"))
+            .collect();
+        assert_eq!(
+            &names[..5],
+            [":method", ":protocol", ":scheme", ":authority", ":path"]
+        );
+
+        let cloned = section.clone();
+        assert_eq!(cloned.into_header_map().len(), 2);
+
+        let trailer = FieldSection::trailer(HeaderMap::new());
+        assert!(trailer.is_empty());
+        assert!(trailer.is_trailer());
+        assert!(trailer.check_pseudo().is_ok());
+    }
+
+    #[test]
+    fn response_field_section_accessors_and_iteration() {
+        let mut section =
+            FieldSection::header(PseudoHeaders::response(StatusCode::OK), HeaderMap::new());
+
+        assert!(section.is_response_header());
+        assert_eq!(section.status(), StatusCode::OK);
+
+        section.set_status(StatusCode::ACCEPTED);
+        assert_eq!(section.status(), StatusCode::ACCEPTED);
+
+        let fields: Vec<_> = section.iter().collect();
+        assert_eq!(fields, vec![FieldLine::from(StatusCode::ACCEPTED)]);
+    }
+
+    #[test]
+    fn check_pseudo_validates_request_authority_and_connect_rules() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("example.test"));
+        let valid = FieldSection::header(
+            request_pseudo(
+                Some(Method::GET),
+                Some(Scheme::HTTPS),
+                Some(Authority::from_static("example.test")),
+                Some(PathAndQuery::from_static("/")),
+                None,
+            ),
+            headers,
+        );
+        assert!(valid.check_pseudo().is_ok());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("different.test"));
+        let mismatch = FieldSection::header(
+            request_pseudo(
+                Some(Method::GET),
+                Some(Scheme::HTTPS),
+                Some(Authority::from_static("example.test")),
+                Some(PathAndQuery::from_static("/")),
+                None,
+            ),
+            headers,
+        );
+        assert!(matches!(
+            mismatch.check_pseudo(),
+            Err(MalformedHeaderSection::AuthorityHostMismatch)
+        ));
+
+        let extended_connect = FieldSection::header(
+            request_pseudo(
+                Some(Method::CONNECT),
+                Some(Scheme::HTTPS),
+                Some(Authority::from_static("example.test")),
+                Some(PathAndQuery::from_static("/session")),
+                Some(Protocol::new("webtransport")),
+            ),
+            HeaderMap::new(),
+        );
+        assert!(extended_connect.check_pseudo().is_ok());
+
+        let plain_connect = FieldSection::header(
+            request_pseudo(
+                Some(Method::CONNECT),
+                None,
+                Some(Authority::from_static("example.test:443")),
+                None,
+                None,
+            ),
+            HeaderMap::new(),
+        );
+        assert!(plain_connect.check_pseudo().is_ok());
+    }
+
+    #[test]
+    fn check_pseudo_reports_request_error_variants() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "host",
+            HeaderValue::from_bytes(&[0xff]).expect("opaque header value"),
+        );
+        let invalid_host = FieldSection::header(
+            request_pseudo(
+                Some(Method::GET),
+                Some(Scheme::HTTPS),
+                None,
+                Some(PathAndQuery::from_static("/")),
+                None,
+            ),
+            headers,
+        );
+        assert!(matches!(
+            invalid_host.check_pseudo(),
+            Err(MalformedHeaderSection::InvalidHostHeader)
+        ));
+
+        let missing = FieldSection::header(PseudoHeaders::unresolved_request(), HeaderMap::new());
+        assert!(matches!(
+            missing.check_pseudo(),
+            Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders { .. })
+        ));
+
+        let protocol_in_get = FieldSection::header(
+            request_pseudo(
+                Some(Method::GET),
+                Some(Scheme::HTTPS),
+                Some(Authority::from_static("example.test")),
+                Some(PathAndQuery::from_static("/")),
+                Some(Protocol::new("webtransport")),
+            ),
+            HeaderMap::new(),
+        );
+        assert!(matches!(
+            protocol_in_get.check_pseudo(),
+            Err(MalformedHeaderSection::ProtocolInNonConnectRequest)
+        ));
+
+        let connect_with_scheme = FieldSection::header(
+            request_pseudo(
+                Some(Method::CONNECT),
+                Some(Scheme::HTTPS),
+                Some(Authority::from_static("example.test:443")),
+                None,
+                None,
+            ),
+            HeaderMap::new(),
+        );
+        assert!(matches!(
+            connect_with_scheme.check_pseudo(),
+            Err(MalformedHeaderSection::UnexpectedSchemeForConnectRequest)
+        ));
+
+        let connect_with_path = FieldSection::header(
+            request_pseudo(
+                Some(Method::CONNECT),
+                None,
+                Some(Authority::from_static("example.test:443")),
+                Some(PathAndQuery::from_static("/")),
+                None,
+            ),
+            HeaderMap::new(),
+        );
+        assert!(matches!(
+            connect_with_path.check_pseudo(),
+            Err(MalformedHeaderSection::UnexpectedPathForConnectRequest)
+        ));
+
+        let connect_without_authority = FieldSection::header(
+            request_pseudo(Some(Method::CONNECT), None, None, None, None),
+            HeaderMap::new(),
+        );
+        assert!(matches!(
+            connect_without_authority.check_pseudo(),
+            Err(MalformedHeaderSection::MissingAuthorityForConnectRequest)
+        ));
+
+        let connect_without_port = FieldSection::header(
+            request_pseudo(
+                Some(Method::CONNECT),
+                None,
+                Some(Authority::from_static("example.test")),
+                None,
+                None,
+            ),
+            HeaderMap::new(),
+        );
+        assert!(matches!(
+            connect_without_port.check_pseudo(),
+            Err(MalformedHeaderSection::MissingPortForConnectAuthority)
+        ));
+    }
+
+    #[test]
+    fn check_pseudo_reports_response_error_variants() {
+        let response = FieldSection::header(PseudoHeaders::unresolved_response(), HeaderMap::new());
+        assert!(matches!(
+            response.check_pseudo(),
+            Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn decode_accepts_request_response_and_trailer_sections() {
+        let request = decode_fields([
+            field(b":method", b"GET"),
+            field(b":scheme", b"https"),
+            field(b":authority", b"example.test"),
+            field(b":path", b"/hello"),
+            field(b"host", b"example.test"),
+        ])
+        .await
+        .expect("request field section");
+        assert!(request.is_request_header());
+        assert_eq!(request.method(), Method::GET);
+        assert_eq!(
+            request.uri(),
+            Uri::from_static("https://example.test/hello")
+        );
+        assert_eq!(request.header_map()["host"], "example.test");
+
+        let response = decode_fields([field(b":status", b"204"), field(b"server", b"h3x")])
+            .await
+            .expect("response field section");
+        assert!(response.is_response_header());
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.header_map()["server"], "h3x");
+
+        let trailer = decode_fields([field(b"x-trailer", b"done")])
+            .await
+            .expect("trailer field section");
+        assert!(trailer.is_trailer());
+        assert_eq!(trailer.header_map()["x-trailer"], "done");
+    }
 
     #[tokio::test]
     async fn decode_rejects_pseudo_header_after_regular_header() {
@@ -708,5 +1027,43 @@ mod tests {
             source.to_string(),
             "pseudo-header field appears after regular header field"
         );
+    }
+
+    #[tokio::test]
+    async fn decode_reports_duplicate_mixed_invalid_and_parse_errors() {
+        let duplicate = decode_fields([field(b":method", b"GET"), field(b":method", b"POST")])
+            .await
+            .expect_err("duplicate pseudo header");
+        assert_h3_error(
+            duplicate,
+            "duplicate pseudo-header field with name b\":method\"",
+        );
+
+        let mixed = decode_fields([field(b":method", b"GET"), field(b":status", b"200")])
+            .await
+            .expect_err("mixed request and response pseudo headers");
+        assert_h3_error(
+            mixed,
+            "field section contains both request and response pseudo-header fields",
+        );
+
+        let invalid = decode_fields([field(b":unknown", b"value")])
+            .await
+            .expect_err("unknown pseudo header");
+        assert_h3_error(
+            invalid,
+            "invalid pseudo-header field with name b\":unknown\"",
+        );
+
+        let invalid_protocol =
+            decode_fields([field(b":method", b"CONNECT"), field(b":protocol", &[0xff])])
+                .await
+                .expect_err("invalid protocol token");
+        assert_h3_error(invalid_protocol, "invalid :protocol pseudo-header token");
+
+        let invalid_status = decode_fields([field(b":status", b"not-a-status")])
+            .await
+            .expect_err("invalid status");
+        assert_h3_error(invalid_status, "invalid status code");
     }
 }
