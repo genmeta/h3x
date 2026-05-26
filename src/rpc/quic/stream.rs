@@ -143,3 +143,91 @@ where
         CancelStreamExt::cancel(self, code).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use futures::StreamExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn blanket_read_stream_delegates_to_quic_reader() {
+        let stream_id = VarInt::from_u32(7);
+        let (mut reader, mut writer) = quic::test::mock_stream_pair(stream_id);
+
+        futures::SinkExt::send(&mut writer, Bytes::from_static(b"hello"))
+            .await
+            .expect("write succeeds");
+        drop(writer);
+
+        let id = ReadStream::stream_id(&mut reader)
+            .await
+            .expect("stream id resolves");
+        assert_eq!(id, stream_id);
+
+        let chunk = ReadStream::read(&mut reader).await.expect("read succeeds");
+        assert_eq!(chunk, Some(Bytes::from_static(b"hello")));
+
+        let eof = ReadStream::read(&mut reader).await.expect("eof succeeds");
+        assert!(eof.is_none());
+    }
+
+    #[tokio::test]
+    async fn blanket_read_stream_stop_delegates_to_quic_reader() {
+        let stream_id = VarInt::from_u32(9);
+        let (mut reader, _writer) = quic::test::mock_stream_pair(stream_id);
+
+        ReadStream::stop(&mut reader, VarInt::from_u32(42))
+            .await
+            .expect("stop succeeds");
+    }
+
+    #[tokio::test]
+    async fn blanket_write_stream_delegates_to_quic_writer() {
+        let stream_id = VarInt::from_u32(11);
+        let (mut reader, mut writer) = quic::test::mock_stream_pair(stream_id);
+
+        let id = WriteStream::stream_id(&mut writer)
+            .await
+            .expect("stream id resolves");
+        assert_eq!(id, stream_id);
+
+        WriteStream::write(&mut writer, Bytes::from_static(b"payload"))
+            .await
+            .expect("write succeeds");
+        WriteStream::flush(&mut writer)
+            .await
+            .expect("flush succeeds");
+
+        let chunk = reader
+            .next()
+            .await
+            .expect("chunk present")
+            .expect("read ok");
+        assert_eq!(chunk, Bytes::from_static(b"payload"));
+
+        WriteStream::shutdown(&mut writer)
+            .await
+            .expect("shutdown succeeds");
+        assert!(reader.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn blanket_write_stream_cancel_delegates_to_quic_writer() {
+        let stream_id = VarInt::from_u32(13);
+        let (mut reader, mut writer) = quic::test::mock_stream_pair(stream_id);
+        let code = VarInt::from_u32(99);
+
+        WriteStream::cancel(&mut writer, code)
+            .await
+            .expect("cancel succeeds");
+
+        let error = reader
+            .next()
+            .await
+            .expect("reset is delivered")
+            .expect_err("reader observes reset");
+        assert!(matches!(error, quic::StreamError::Reset { code: c } if c == code));
+    }
+}
