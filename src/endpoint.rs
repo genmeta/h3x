@@ -387,7 +387,7 @@ mod tests {
     use futures::{SinkExt, Stream};
     use http::uri::Authority;
     use tokio::{
-        sync::Notify,
+        sync::watch,
         time::{Duration, timeout},
     };
     use tower_service::Service;
@@ -812,22 +812,53 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct CloseLatch {
+        closed_tx: watch::Sender<bool>,
+        closed_rx: watch::Receiver<bool>,
+    }
+
+    impl Default for CloseLatch {
+        fn default() -> Self {
+            let (closed_tx, closed_rx) = watch::channel(false);
+            Self {
+                closed_tx,
+                closed_rx,
+            }
+        }
+    }
+
+    impl CloseLatch {
+        fn close(&self) {
+            let _ = self.closed_tx.send(true);
+        }
+
+        async fn wait(&self) {
+            let mut closed_rx = self.closed_rx.clone();
+            while !*closed_rx.borrow_and_update() {
+                if closed_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct ControlledConnection {
-        close_notify: Arc<Notify>,
+        close_latch: Arc<CloseLatch>,
         close_error: quic::ConnectionError,
     }
 
     impl ControlledConnection {
         fn new(reason: &'static str) -> Self {
             Self {
-                close_notify: Arc::new(Notify::new()),
+                close_latch: Arc::new(CloseLatch::default()),
                 close_error: test_connection_error(reason),
             }
         }
 
         fn trigger_close(&self) {
-            self.close_notify.notify_waiters();
+            self.close_latch.close();
         }
     }
 
@@ -882,7 +913,7 @@ mod tests {
         }
 
         async fn closed(&self) -> quic::ConnectionError {
-            self.close_notify.notified().await;
+            self.close_latch.wait().await;
             self.close_error.clone()
         }
     }
@@ -942,14 +973,14 @@ mod tests {
     #[derive(Debug)]
     struct StreamIdErrorReadStream {
         first_chunk: Option<Bytes>,
-        close_notify: Arc<Notify>,
+        close_latch: Arc<CloseLatch>,
     }
 
     impl StreamIdErrorReadStream {
-        fn new(close_notify: Arc<Notify>) -> Self {
+        fn new(close_latch: Arc<CloseLatch>) -> Self {
             Self {
                 first_chunk: Some(Bytes::from_static(&[0x01])),
-                close_notify,
+                close_latch,
             }
         }
     }
@@ -959,7 +990,7 @@ mod tests {
             self: Pin<&mut Self>,
             _cx: &mut Context,
         ) -> Poll<Result<VarInt, quic::StreamError>> {
-            self.close_notify.notify_waiters();
+            self.close_latch.close();
             Poll::Ready(Err(quic::StreamError::Reset {
                 code: VarInt::from_u32(0x11),
             }))
@@ -988,11 +1019,11 @@ mod tests {
 
     fn stream_id_error_request_stream(
         stream_id: u32,
-        close_notify: Arc<Notify>,
+        close_latch: Arc<CloseLatch>,
     ) -> ErasedPeekableBiStream {
         let stream_id = VarInt::from_u32(stream_id);
         let reader = PeekableStreamReader::new(StreamReader::new(Box::pin(
-            StreamIdErrorReadStream::new(close_notify),
+            StreamIdErrorReadStream::new(close_latch),
         ) as BoxReadStream));
         let (_unused_reader, writer) = quic::test::mock_stream_pair(stream_id);
         (reader, SinkWriter::new(Box::pin(writer) as BoxWriteStream))
@@ -1001,7 +1032,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct RecordingService {
         seen_streams: Arc<Mutex<Vec<StreamId>>>,
-        close_notify: Arc<Notify>,
+        close_latch: Arc<CloseLatch>,
     }
 
     impl Service<UnresolvedRequest> for RecordingService {
@@ -1018,7 +1049,7 @@ mod tests {
                 .lock()
                 .expect("recording service mutex should not be poisoned")
                 .push(request.stream_id);
-            self.close_notify.notify_waiters();
+            self.close_latch.close();
             ready(Ok(()))
         }
     }
@@ -1037,7 +1068,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct FailingService {
         calls: Arc<AtomicUsize>,
-        close_notify: Arc<Notify>,
+        close_latch: Arc<CloseLatch>,
     }
 
     impl Service<UnresolvedRequest> for FailingService {
@@ -1051,7 +1082,7 @@ mod tests {
 
         fn call(&mut self, _request: UnresolvedRequest) -> Self::Future {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            self.close_notify.notify_waiters();
+            self.close_latch.close();
             ready(Err(TestServiceError))
         }
     }
@@ -1553,7 +1584,7 @@ mod tests {
         let state = state_without_qpack(quic.clone());
         enqueue_http3_request(
             &state,
-            stream_id_error_request_stream(21, quic.close_notify.clone()),
+            stream_id_error_request_stream(21, quic.close_latch.clone()),
         )
         .await;
         let connection = Arc::new(H3Connection::from_state_for_test(state));
@@ -1565,7 +1596,7 @@ mod tests {
                 connection,
                 RecordingService {
                     seen_streams: seen_streams.clone(),
-                    close_notify: Arc::new(Notify::new()),
+                    close_latch: Arc::new(CloseLatch::default()),
                 },
             ),
         )
@@ -1594,7 +1625,7 @@ mod tests {
                 connection,
                 RecordingService {
                     seen_streams: seen_streams.clone(),
-                    close_notify: Arc::new(Notify::new()),
+                    close_latch: Arc::new(CloseLatch::default()),
                 },
             ),
         )
@@ -1623,7 +1654,7 @@ mod tests {
                 connection,
                 RecordingService {
                     seen_streams: seen_streams.clone(),
-                    close_notify: quic.close_notify.clone(),
+                    close_latch: quic.close_latch.clone(),
                 },
             ),
         )
@@ -1661,7 +1692,7 @@ mod tests {
                 connection,
                 FailingService {
                     calls: calls.clone(),
-                    close_notify: quic.close_notify.clone(),
+                    close_latch: quic.close_latch.clone(),
                 },
             ),
         )

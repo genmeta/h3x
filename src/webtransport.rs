@@ -179,6 +179,14 @@ impl Session for WebTransportSession {
     }
 }
 
+#[cfg(feature = "rpc")]
+/// Backward-compatible public path for WebTransport lifecycle helpers.
+///
+/// The implementation lives under [`crate::rpc::webtransport::LifecycleExt`],
+/// but existing callers may still import
+/// `h3x::webtransport::WebTransportLifecycleExt`.
+pub use crate::rpc::webtransport::LifecycleExt as WebTransportLifecycleExt;
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -290,5 +298,85 @@ mod tests {
             .await
             .expect("accept_uni should succeed");
         assert_eq!(reader.stream_id().await.unwrap(), VarInt::from_u32(4));
+    }
+
+    #[cfg(feature = "rpc")]
+    mod compatibility_tests {
+        use std::{borrow::Cow, future::pending};
+
+        use super::*;
+        use crate::{
+            error::Code,
+            rpc::lifecycle::{
+                ConnectionErrorLatch, HasLatch, LifecycleExt as ConnectionLifecycleExt,
+            },
+            webtransport::WebTransportLifecycleExt,
+        };
+
+        #[derive(Debug, Default)]
+        struct TestLifecycle {
+            latch: ConnectionErrorLatch,
+        }
+
+        impl HasLatch for TestLifecycle {
+            fn latch(&self) -> &ConnectionErrorLatch {
+                &self.latch
+            }
+        }
+
+        impl quic::Lifecycle for TestLifecycle {
+            fn close(&self, _code: Code, _reason: Cow<'static, str>) {}
+
+            fn check(&self) -> Result<(), quic::ConnectionError> {
+                self.check_with_probe(|| None)
+            }
+
+            async fn closed(&self) -> quic::ConnectionError {
+                self.resolve_closed(pending()).await
+            }
+        }
+
+        fn connection_error(reason: &'static str) -> quic::ConnectionError {
+            quic::ConnectionError::Transport {
+                source: quic::TransportError {
+                    kind: VarInt::from_u32(0x01),
+                    frame_type: VarInt::from_u32(0x00),
+                    reason: reason.into(),
+                },
+            }
+        }
+
+        #[tokio::test]
+        async fn legacy_webtransport_lifecycle_ext_path_exposes_helper_set() {
+            let lifecycle = TestLifecycle::default();
+
+            lifecycle.check_open().expect("open check should pass");
+            lifecycle.check_accept().expect("accept check should pass");
+
+            lifecycle
+                .guard_open(async { Ok::<_, OpenStreamError>(()) })
+                .await
+                .expect("guard_open should be available on the old path");
+
+            let lifecycle = TestLifecycle::default();
+            lifecycle
+                .guard_accept(async { Ok::<_, AcceptStreamError>(()) })
+                .await
+                .expect("guard_accept should be available on the old path");
+
+            let lifecycle = TestLifecycle::default();
+            lifecycle
+                .guard_accept_err(async { Err::<(), _>("closed") }, |_| None)
+                .await
+                .expect_err("guard_accept_err should be available on the old path");
+
+            let lifecycle = TestLifecycle::default();
+            lifecycle
+                .guard_open_with(async { Err::<(), _>("open") }, |_| OpenStreamError::Open {
+                    source: connection_error("open"),
+                })
+                .await
+                .expect_err("guard_open_with should be available on the old path");
+        }
     }
 }

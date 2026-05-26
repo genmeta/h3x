@@ -86,6 +86,7 @@ impl EncodeInto<BufList> for Goaway {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use tracing::Instrument;
 
     use super::*;
     use crate::{
@@ -177,12 +178,15 @@ mod tests {
         let mut prefilled = BufList::new();
         prefilled.write(Bytes::from_static(b"already-filled"));
 
-        let join = tokio::spawn(async move {
-            prefilled
-                .encode(Goaway::new(VarInt::from_u32(1)))
-                .await
-                .expect("goaway encoding should panic before this")
-        });
+        let join = tokio::spawn(
+            async move {
+                prefilled
+                    .encode(Goaway::new(VarInt::from_u32(1)))
+                    .await
+                    .expect("goaway encoding should panic before this")
+            }
+            .in_current_span(),
+        );
 
         let err = join
             .await
@@ -200,10 +204,13 @@ mod tests {
         let frame =
             Frame::new(Frame::SETTINGS_FRAME_TYPE, payload).expect("payload length fits varint");
 
-        let join = tokio::spawn(async move {
-            let mut frame = frame;
-            let _ = Goaway::decode_from(&mut frame).await;
-        });
+        let join = tokio::spawn(
+            async move {
+                let mut frame = frame;
+                let _ = Goaway::decode_from(&mut frame).await;
+            }
+            .in_current_span(),
+        );
 
         let err = join
             .await
