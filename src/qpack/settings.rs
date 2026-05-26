@@ -78,4 +78,56 @@ mod tests {
         assert_eq!(settings.qpack_max_table_capacity(), VarInt::from_u32(4096));
         assert_eq!(settings.qpack_blocked_streams(), VarInt::from_u32(100));
     }
+
+    #[test]
+    fn qpack_settings_boundaries_and_ids() {
+        assert_eq!(QpackMaxTableCapacity::ID, VarInt::from_u32(0x01));
+        assert_eq!(QpackBlockedStreams::ID, VarInt::from_u32(0x07));
+        assert_eq!(QpackMaxTableCapacity::DEFAULT, VarInt::from_u32(0));
+        assert_eq!(QpackBlockedStreams::DEFAULT, VarInt::from_u32(0));
+        assert_eq!(
+            QpackMaxTableCapacity::setting(VarInt::MAX).id,
+            QpackMaxTableCapacity::ID
+        );
+        assert_eq!(
+            QpackBlockedStreams::setting(VarInt::from_u32(0)).value,
+            VarInt::from_u32(0),
+        );
+    }
+
+    #[test]
+    fn qpack_settings_raw_lookup_and_default_fallback() {
+        let mut settings = Settings::default();
+
+        assert_eq!(settings.get_raw(QpackMaxTableCapacity::ID), None);
+        assert_eq!(
+            settings.get(QpackMaxTableCapacity),
+            QpackMaxTableCapacity::DEFAULT
+        );
+
+        settings.set(QpackMaxTableCapacity::setting(VarInt::from_u32(99)));
+        assert_eq!(
+            settings.get_raw(QpackMaxTableCapacity::ID),
+            Some(VarInt::from_u32(99))
+        );
+        assert_eq!(settings.qpack_max_table_capacity(), VarInt::from_u32(99));
+        assert_eq!(settings.get(QpackMaxTableCapacity), VarInt::from_u32(99));
+
+        settings.set(QpackMaxTableCapacity::setting(VarInt::from_u32(0)));
+        assert_eq!(
+            settings.get_raw(QpackMaxTableCapacity::ID),
+            Some(VarInt::from_u32(0))
+        );
+        assert_eq!(settings.qpack_max_table_capacity(), VarInt::from_u32(0));
+    }
+
+    #[test]
+    fn qpack_setting_constructors_stay_well_formed_for_unknown_id_queries() {
+        let setting = QpackBlockedStreams::setting(VarInt::MAX);
+        let id: VarInt = QpackBlockedStreams::ID;
+
+        assert_eq!(setting.id, id);
+        assert_eq!(setting.value, VarInt::MAX);
+        assert_eq!(Setting::from((id, VarInt::from_u32(0x7f))).id, id);
+    }
 }

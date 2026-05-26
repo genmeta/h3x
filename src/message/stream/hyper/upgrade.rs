@@ -212,10 +212,12 @@ mod tests {
         future::poll_fn,
         pin::Pin,
         task::{Context, Poll},
+        time::Duration,
     };
 
     use bytes::Bytes;
     use http_body::{Body, Frame};
+    use tracing::Instrument;
 
     use super::*;
     use crate::message::stream::ReadStream;
@@ -233,6 +235,129 @@ mod tests {
         ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
             Poll::Ready(Some(Err(std::io::Error::other("body error"))))
         }
+    }
+
+    #[derive(Debug)]
+    struct OneFrameBody {
+        done: bool,
+    }
+
+    impl Body for OneFrameBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            if this.done {
+                Poll::Ready(None)
+            } else {
+                this.done = true;
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"hello")))))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn remain_stream_pending_waits_until_sender_sends() {
+        let (tx, mut stream) = RemainStream::<u8>::pending();
+
+        let send_task = tokio::spawn(
+            async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                tx.send(8).ok();
+            }
+            .in_current_span(),
+        );
+
+        let value = tokio::time::timeout(
+            Duration::from_millis(100),
+            poll_fn(|cx| Pin::new(&mut stream).poll(cx)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(value, 8);
+
+        send_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remain_stream_returns_none_when_sender_dropped() {
+        let (tx, mut stream) = RemainStream::<u8>::pending();
+        drop(tx);
+
+        let value = tokio::time::timeout(
+            Duration::from_millis(100),
+            poll_fn(|cx| Pin::new(&mut stream).poll(cx)),
+        )
+        .await
+        .unwrap();
+        assert!(value.is_none());
+    }
+
+    #[tokio::test]
+    async fn remain_stream_immediately_returns_some() {
+        let mut stream = RemainStream::immediately(15u8);
+        let value = poll_fn(|cx| Pin::new(&mut stream).poll(cx)).await;
+        assert_eq!(value, Some(15));
+    }
+
+    #[tokio::test]
+    async fn takeover_works_for_response_and_mut_ref_variants() {
+        let mut response = http::Response::new(http_body_util::Empty::<Bytes>::new());
+        response
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(21u8)));
+
+        let value = {
+            let response_ref = &mut response;
+            poll_fn(|cx| HasTakeover::<u8>::poll_takeover(response_ref, cx)).await
+        };
+        assert_eq!(value, Ok(21));
+
+        let mut response = http::Response::new(OneFrameBody { done: false });
+        response
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(42u8)));
+        let response_ref = &mut response;
+
+        let value = poll_fn(|cx| HasTakeover::<u8>::poll_takeover(response_ref, cx)).await;
+        assert_eq!(value, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn takeover_release_body_frames_until_eof_on_request() {
+        let mut request = http::Request::new(OneFrameBody { done: false });
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(77u8)));
+
+        let value = poll_fn(|cx| HasTakeover::<u8>::poll_takeover(&mut request, cx)).await;
+        assert_eq!(value, Ok(77));
+    }
+
+    #[tokio::test]
+    async fn takeover_returns_unsupported_for_response_without_slot() {
+        let mut response = http::Response::new(http_body_util::Empty::<Bytes>::new());
+        let value = poll_fn(|cx| HasTakeover::<u8>::poll_takeover(&mut response, cx)).await;
+        assert!(matches!(value, Err(TakeoverError::Unsupported)));
+    }
+
+    #[test]
+    fn missing_stream_display_matches_read_write_and_read_and_write() {
+        assert_eq!(MissingStream::Read.to_string(), "read");
+        assert_eq!(MissingStream::Write.to_string(), "write");
+        assert_eq!(MissingStream::Both.to_string(), "read and write");
+    }
+
+    #[test]
+    fn upgrade_error_converts_takeover_error() {
+        let takeover = TakeoverError::BodyNotReleased;
+        let upgrade: UpgradeError = takeover.into();
+        assert_eq!(upgrade, UpgradeError::Takeover { source: takeover });
     }
 
     #[tokio::test]

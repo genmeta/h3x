@@ -477,16 +477,163 @@ impl<C: ?Sized> ConnectionState<C> {
 #[cfg(test)]
 mod tests {
     use std::{
+        borrow::Cow,
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
         sync::{Arc, Mutex},
     };
 
     use bytes::Bytes;
+    use dhttp_identity::identity::SignError;
     use futures::{SinkExt, channel::oneshot};
+    use rustls::{SignatureAlgorithm, SignatureScheme, pki_types::CertificateDer};
 
     use super::*;
-    use crate::codec::{BoxReadStream, BoxWriteStream, PeekableStreamReader, StreamReader};
+    use crate::{
+        codec::{BoxReadStream, BoxWriteStream, PeekableStreamReader, StreamReader},
+        dhttp::protocol::DHttpProtocolFactory,
+    };
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestLocalAgent;
+
+    impl dhttp_identity::identity::LocalAgent for TestLocalAgent {
+        fn name(&self) -> &str {
+            "test.local"
+        }
+
+        fn cert_chain(&self) -> &[CertificateDer<'static>] {
+            &[]
+        }
+
+        fn sign_algorithm(&self) -> SignatureAlgorithm {
+            SignatureAlgorithm::ECDSA
+        }
+
+        fn sign(
+            &self,
+            scheme: SignatureScheme,
+            _data: &[u8],
+        ) -> futures::future::BoxFuture<'_, Result<Vec<u8>, SignError>> {
+            Box::pin(std::future::ready(Err(SignError::UnsupportedScheme {
+                scheme,
+            })))
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestRemoteAgent;
+
+    impl dhttp_identity::identity::RemoteAgent for TestRemoteAgent {
+        fn name(&self) -> &str {
+            "test.remote"
+        }
+
+        fn cert_chain(&self) -> &[CertificateDer<'static>] {
+            &[]
+        }
+    }
+
+    #[derive(Debug, Default, Clone)]
+    struct MockConnection {
+        stream_calls: Arc<Mutex<Vec<&'static str>>>,
+        open_uni_available: bool,
+    }
+
+    impl MockConnection {
+        fn with_open_uni_available(open_uni_available: bool) -> Self {
+            Self {
+                stream_calls: Arc::default(),
+                open_uni_available,
+            }
+        }
+
+        fn stream_calls(&self) -> Vec<&'static str> {
+            self.stream_calls
+                .lock()
+                .expect("stream call log poisoned")
+                .clone()
+        }
+
+        fn record_stream_call(&self, call: &'static str) {
+            self.stream_calls
+                .lock()
+                .expect("stream call log poisoned")
+                .push(call);
+        }
+    }
+
+    fn test_connection_error(reason: &'static str) -> quic::ConnectionError {
+        quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(0x01),
+                frame_type: VarInt::from_u32(0x00),
+                reason: reason.into(),
+            },
+        }
+    }
+
+    impl quic::ManageStream for MockConnection {
+        type StreamReader = BoxReadStream;
+        type StreamWriter = BoxWriteStream;
+
+        async fn open_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            self.record_stream_call("open_bi");
+            Err(test_connection_error("open_bi unavailable"))
+        }
+
+        async fn open_uni(&self) -> Result<Self::StreamWriter, quic::ConnectionError> {
+            self.record_stream_call("open_uni");
+            if !self.open_uni_available {
+                return Err(test_connection_error("open_uni unavailable"));
+            }
+
+            let (_reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(0));
+            Ok(Box::pin(writer) as BoxWriteStream)
+        }
+
+        async fn accept_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            self.record_stream_call("accept_bi");
+            Err(test_connection_error("accept_bi unavailable"))
+        }
+
+        async fn accept_uni(&self) -> Result<Self::StreamReader, quic::ConnectionError> {
+            self.record_stream_call("accept_uni");
+            Err(test_connection_error("accept_uni unavailable"))
+        }
+    }
+
+    impl quic::WithLocalAgent for MockConnection {
+        type LocalAgent = TestLocalAgent;
+
+        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+            Ok(None)
+        }
+    }
+
+    impl quic::WithRemoteAgent for MockConnection {
+        type RemoteAgent = TestRemoteAgent;
+
+        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+            Ok(None)
+        }
+    }
+
+    impl quic::Lifecycle for MockConnection {
+        fn close(&self, _code: Code, _reason: Cow<'static, str>) {}
+
+        fn check(&self) -> Result<(), quic::ConnectionError> {
+            Ok(())
+        }
+
+        async fn closed(&self) -> quic::ConnectionError {
+            test_connection_error("connection closed")
+        }
+    }
 
     fn hash_of<T: Hash>(t: &T) -> u64 {
         let mut h = DefaultHasher::new();
@@ -577,6 +724,18 @@ mod tests {
         let b = QPackProtocolFactory::new();
         assert_eq!(a, b);
     }
+
+    #[test]
+    fn qpack_factory_display_and_debug_are_stable() {
+        let factory = QPackProtocolFactory::new();
+        assert_eq!(factory.to_string(), "QPACK");
+        assert_eq!(format!("{factory:?}"), "QPackProtocolFactory");
+        assert_eq!(
+            format!("{:?}", qpack_protocol()),
+            "QPackLayer { encoder: \"...\", decoder: \"...\" }"
+        );
+    }
+
     #[test]
     fn qpack_decoder_stream_type_is_0x03() {
         assert_eq!(
@@ -703,5 +862,116 @@ mod tests {
             QPackProtocolDisabled.to_string(),
             "qpack protocol is disabled"
         );
+    }
+
+    #[tokio::test]
+    async fn qpack_protocol_factory_init_requires_dhttp_protocol() {
+        let conn = Arc::new(MockConnection::with_open_uni_available(true));
+        let factory = QPackProtocolFactory::new();
+
+        let error = factory
+            .init(&conn, &Protocols::new())
+            .await
+            .expect_err("missing dhttp should fail init");
+
+        let quic::ConnectionError::Application { source } = error else {
+            panic!("expected application error");
+        };
+        assert_eq!(source.code, Code::H3_INTERNAL_ERROR);
+        assert_eq!(
+            source.reason,
+            "DHttpLayer must be initialized before QPackLayer"
+        );
+        assert!(conn.stream_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn qpack_protocol_factory_init_is_lazy_until_qpack_streams_are_used() {
+        let conn = Arc::new(MockConnection::with_open_uni_available(true));
+        let dhttp = DHttpProtocolFactory::default()
+            .init(&conn)
+            .await
+            .expect("dhttp init");
+        let mut protocols = Protocols::new();
+        protocols.insert(dhttp);
+
+        let protocol = QPackProtocolFactory::new()
+            .init(&conn, &protocols)
+            .await
+            .expect("qpack init");
+
+        assert_eq!(conn.stream_calls(), vec!["open_uni"]);
+
+        {
+            let mut state = protocol.encoder.state.lock().await;
+            state.emit(EncoderInstruction::SetDynamicTableCapacity { capacity: 1 });
+        }
+        protocol
+            .encoder
+            .flush_instructions()
+            .await
+            .expect("encoder flush opens stream");
+
+        {
+            let mut state = protocol.decoder.state.lock().expect("decoder state lock");
+            state
+                .pending_instructions
+                .push_back(DecoderInstruction::SectionAcknowledgment { stream_id: 7 });
+        }
+        protocol
+            .decoder
+            .flush_instructions()
+            .await
+            .expect("decoder flush opens stream");
+
+        assert_eq!(
+            conn.stream_calls(),
+            vec!["open_uni", "open_uni", "open_uni"]
+        );
+    }
+
+    #[tokio::test]
+    async fn qpack_protocol_factory_init_propagates_qpack_stream_open_errors_when_used() {
+        let conn = Arc::new(MockConnection::with_open_uni_available(false));
+        let dhttp = {
+            let openable = Arc::new(MockConnection::with_open_uni_available(true));
+            DHttpProtocolFactory::default()
+                .init(&openable)
+                .await
+                .expect("dhttp init")
+        };
+        let mut protocols = Protocols::new();
+        protocols.insert(dhttp);
+
+        let protocol = QPackProtocolFactory::new()
+            .init(&conn, &protocols)
+            .await
+            .expect("qpack init");
+
+        {
+            let mut state = protocol.encoder.state.lock().await;
+            state.emit(EncoderInstruction::SetDynamicTableCapacity { capacity: 1 });
+        }
+        let encoder_error = protocol
+            .encoder
+            .flush_instructions()
+            .await
+            .expect_err("encoder flush should surface open_uni failure");
+        assert!(matches!(encoder_error, StreamError::Connection { .. }));
+
+        {
+            let mut state = protocol.decoder.state.lock().expect("decoder state lock");
+            state
+                .pending_instructions
+                .push_back(DecoderInstruction::SectionAcknowledgment { stream_id: 9 });
+        }
+        let decoder_error = protocol
+            .decoder
+            .flush_instructions()
+            .await
+            .expect_err("decoder flush should surface open_uni failure");
+        assert!(matches!(decoder_error, StreamError::Connection { .. }));
+
+        assert_eq!(conn.stream_calls(), vec!["open_uni", "open_uni"]);
     }
 }
