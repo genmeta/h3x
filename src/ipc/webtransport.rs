@@ -190,16 +190,16 @@ pub enum IpcWebTransportOpenError {
 
 /// Errors from IPC `accept_bi` / `accept_uni` operations.
 ///
-/// Extends [`AcceptStreamError`] with an IPC transport variant for
-/// FD-passing and socketpair failures. Conversion to [`ConnectionError`] is
-/// deferred to the latch site via [`ConnectionErrorLatch::latch_with`].
+/// Extends [`SessionClosed`] with an IPC transport variant for FD-passing and
+/// socketpair failures. Conversion to [`ConnectionError`] is deferred to the
+/// latch site via [`ConnectionErrorLatch::latch_with`].
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Snafu)]
 #[snafu(module(ipc_webtransport_accept_error), visibility(pub))]
 pub enum IpcWebTransportAcceptError {
-    /// The underlying stream operation failed.
-    #[snafu(transparent)]
-    Stream { source: AcceptStreamError },
+    /// The session has been closed.
+    #[snafu(display("webtransport session closed"))]
+    Closed,
 
     /// IPC plumbing failure (RPC, stream, or I/O).
     #[snafu(transparent)]
@@ -219,8 +219,8 @@ impl From<remoc::rtc::CallError> for IpcWebTransportAcceptError {
 }
 
 impl From<SessionClosed> for IpcWebTransportAcceptError {
-    fn from(source: SessionClosed) -> Self {
-        AcceptStreamError::Closed { source }.into()
+    fn from(_source: SessionClosed) -> Self {
+        IpcWebTransportAcceptError::Closed
     }
 }
 
@@ -351,7 +351,13 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     }
 
     async fn accept_bi(&self) -> Result<(VarInt, VarInt), IpcWebTransportAcceptError> {
-        let (mut reader, writer) = self.session.accept_bi().await?;
+        let (mut reader, writer) = match self.session.accept_bi().await {
+            Ok(streams) => streams,
+            Err(AcceptStreamError::Closed { source }) => return Err(source.into()),
+            Err(AcceptStreamError::Connection { source: _ }) => {
+                return Err(IpcWebTransportAcceptError::Closed);
+            }
+        };
 
         let stream_id = GetStreamIdExt::stream_id(&mut reader)
             .await
@@ -384,7 +390,13 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     }
 
     async fn accept_uni(&self) -> Result<(VarInt, VarInt), IpcWebTransportAcceptError> {
-        let mut reader = self.session.accept_uni().await?;
+        let mut reader = match self.session.accept_uni().await {
+            Ok(stream) => stream,
+            Err(AcceptStreamError::Closed { source }) => return Err(source.into()),
+            Err(AcceptStreamError::Connection { source: _ }) => {
+                return Err(IpcWebTransportAcceptError::Closed);
+            }
+        };
 
         let stream_id = GetStreamIdExt::stream_id(&mut reader)
             .await
@@ -566,12 +578,7 @@ impl IpcWebTransportSessionHandle {
     ) -> Result<T, AcceptStreamError> {
         self.lifecycle
             .guard_accept_err(fut, |e| match e {
-                IpcWebTransportAcceptError::Stream {
-                    source: AcceptStreamError::Closed { .. },
-                } => None,
-                IpcWebTransportAcceptError::Stream {
-                    source: AcceptStreamError::Connection { source },
-                } => Some(source),
+                IpcWebTransportAcceptError::Closed => None,
                 IpcWebTransportAcceptError::Transport { source } => {
                     Some(ipc_connection_error(&source))
                 }
@@ -1069,12 +1076,7 @@ mod tests {
         assert_reason_contains(&ipc_connection_error(&source), "accept context: closed");
 
         let closed = IpcWebTransportAcceptError::from(SessionClosed);
-        assert!(matches!(
-            closed,
-            IpcWebTransportAcceptError::Stream {
-                source: AcceptStreamError::Closed { .. },
-            },
-        ));
+        assert!(matches!(closed, IpcWebTransportAcceptError::Closed));
 
         let fd_count = FdCountError {
             expected: 2,
