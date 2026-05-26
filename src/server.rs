@@ -196,3 +196,283 @@ where
         self.listener.shutdown().await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        future::{Ready, pending, ready},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
+
+    use tower_service::Service;
+
+    use super::*;
+    use crate::{
+        connection::tests::{TestLocalAgent, TestReadStream, TestRemoteAgent, TestWriteStream},
+        quic,
+    };
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TestListenErrorKind {
+        Exhausted,
+        Injected,
+    }
+
+    impl TestListenErrorKind {
+        const fn as_str(self) -> &'static str {
+            match self {
+                Self::Exhausted => "exhausted",
+                Self::Injected => "injected",
+            }
+        }
+    }
+
+    #[derive(Debug, snafu::Snafu)]
+    #[snafu(display("test listener failed: {}", kind.as_str()))]
+    struct TestListenError {
+        kind: TestListenErrorKind,
+    }
+
+    #[derive(Debug)]
+    enum AcceptAction {
+        Connection(Arc<TestConnection>),
+        Error(TestListenErrorKind),
+    }
+
+    #[derive(Debug, Default)]
+    struct TestListener {
+        actions: VecDeque<AcceptAction>,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    impl TestListener {
+        fn with_actions(actions: impl IntoIterator<Item = AcceptAction>) -> Self {
+            Self {
+                actions: actions.into_iter().collect(),
+                shutdowns: Arc::default(),
+            }
+        }
+    }
+
+    impl quic::Listen for TestListener {
+        type Connection = TestConnection;
+        type Error = TestListenError;
+
+        async fn accept(&mut self) -> Result<Arc<Self::Connection>, Self::Error> {
+            match self.actions.pop_front() {
+                Some(AcceptAction::Connection(connection)) => Ok(connection),
+                Some(AcceptAction::Error(kind)) => Err(TestListenError { kind }),
+                None => Err(TestListenError {
+                    kind: TestListenErrorKind::Exhausted,
+                }),
+            }
+        }
+
+        async fn shutdown(&self) -> Result<(), Self::Error> {
+            self.shutdowns.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TestConnection {
+        closes: AtomicUsize,
+        close_reasons: Mutex<Vec<(Code, String)>>,
+    }
+
+    impl TestConnection {
+        fn close_count(&self) -> usize {
+            self.closes.load(Ordering::Relaxed)
+        }
+
+        fn has_close_reason(&self, expected: &str) -> bool {
+            self.close_reasons
+                .lock()
+                .expect("close reason mutex should not be poisoned")
+                .iter()
+                .any(|(_, reason)| reason == expected)
+        }
+    }
+
+    impl quic::ManageStream for TestConnection {
+        type StreamReader = TestReadStream;
+        type StreamWriter = TestWriteStream;
+
+        async fn open_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            pending().await
+        }
+
+        async fn open_uni(&self) -> Result<Self::StreamWriter, quic::ConnectionError> {
+            Ok(TestWriteStream)
+        }
+
+        async fn accept_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), quic::ConnectionError> {
+            pending().await
+        }
+
+        async fn accept_uni(&self) -> Result<Self::StreamReader, quic::ConnectionError> {
+            pending().await
+        }
+    }
+
+    impl quic::WithLocalAgent for TestConnection {
+        type LocalAgent = TestLocalAgent;
+
+        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+            Ok(None)
+        }
+    }
+
+    impl quic::WithRemoteAgent for TestConnection {
+        type RemoteAgent = TestRemoteAgent;
+
+        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+            Ok(None)
+        }
+    }
+
+    impl quic::Lifecycle for TestConnection {
+        fn close(&self, code: Code, reason: std::borrow::Cow<'static, str>) {
+            self.closes.fetch_add(1, Ordering::Relaxed);
+            self.close_reasons
+                .lock()
+                .expect("close reason mutex should not be poisoned")
+                .push((code, reason.into_owned()));
+        }
+
+        fn check(&self) -> Result<(), quic::ConnectionError> {
+            Ok(())
+        }
+
+        async fn closed(&self) -> quic::ConnectionError {
+            pending().await
+        }
+    }
+
+    #[derive(Debug, snafu::Snafu)]
+    #[snafu(display("test service failed"))]
+    struct TestServiceError;
+
+    #[derive(Clone, Debug, Default)]
+    struct TestService {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<UnresolvedRequest> for TestService {
+        type Response = ();
+        type Error = TestServiceError;
+        type Future = Ready<Result<(), Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: UnresolvedRequest) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            ready(Ok(()))
+        }
+    }
+
+    fn test_servers(
+        listener: TestListener,
+        service: TestService,
+    ) -> Servers<TestListener, TestService> {
+        Servers::from_quic_listener()
+            .listener(listener)
+            .service(service)
+            .build()
+    }
+
+    #[test]
+    fn builder_accessors_and_into_parts_preserve_components() {
+        let listener = TestListener::default();
+        let shutdowns = listener.shutdowns.clone();
+        let service = TestService::default();
+        let calls = service.calls.clone();
+        let builder = Arc::new(ConnectionBuilder::new(Arc::default()));
+        let servers = Servers::from_quic_listener()
+            .listener(listener)
+            .service(service)
+            .builder(builder.clone())
+            .build();
+
+        assert!(Arc::ptr_eq(&builder, &servers.builder));
+        assert!(Arc::ptr_eq(&shutdowns, &servers.quic_listener().shutdowns));
+        assert!(Arc::ptr_eq(&calls, &servers.service().calls));
+
+        let (_pool, listener, service, extracted_builder) = servers.into_parts();
+
+        assert!(Arc::ptr_eq(&builder, &extracted_builder));
+        assert!(Arc::ptr_eq(&shutdowns, &listener.shutdowns));
+        assert!(Arc::ptr_eq(&calls, &service.calls));
+    }
+
+    #[tokio::test]
+    async fn shutdown_delegates_to_quic_listener() {
+        let listener = TestListener::default();
+        let shutdowns = listener.shutdowns.clone();
+        let servers = test_servers(listener, TestService::default());
+
+        servers.shutdown().await.expect("shutdown should succeed");
+
+        assert_eq!(shutdowns.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn run_returns_listener_error() {
+        let listener =
+            TestListener::with_actions([AcceptAction::Error(TestListenErrorKind::Injected)]);
+        let mut servers = test_servers(listener, TestService::default());
+
+        let error = servers.run().await;
+
+        assert_eq!(error.kind, TestListenErrorKind::Injected);
+    }
+
+    #[tokio::test]
+    async fn run_accepts_connections_until_listener_error() {
+        let listener = TestListener::with_actions([
+            AcceptAction::Connection(Arc::new(TestConnection::default())),
+            AcceptAction::Error(TestListenErrorKind::Injected),
+        ]);
+        let mut servers = test_servers(listener, TestService::default());
+
+        let error = servers.run().await;
+
+        assert_eq!(error.kind, TestListenErrorKind::Injected);
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_connection_closes_connection_without_sni() {
+        let connection = Arc::new(TestConnection::default());
+        let servers = test_servers(TestListener::default(), TestService::default());
+
+        servers.handle_incoming_connection(connection.clone()).await;
+
+        assert!(connection.close_count() >= 1);
+        assert!(connection.has_close_reason("missing server name (SNI) on incoming connection"));
+    }
+
+    #[test]
+    fn quic_listener_mut_and_service_mut_expose_components() {
+        let mut servers = test_servers(TestListener::default(), TestService::default());
+
+        servers
+            .quic_listener_mut()
+            .actions
+            .push_back(AcceptAction::Error(TestListenErrorKind::Injected));
+        servers.service_mut().calls.store(7, Ordering::Relaxed);
+
+        assert_eq!(servers.quic_listener().actions.len(), 1);
+        assert_eq!(servers.service().calls.load(Ordering::Relaxed), 7);
+    }
+}
