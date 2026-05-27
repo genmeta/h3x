@@ -16,7 +16,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{Sink, Stream, StreamExt, future::pending};
+use futures::{Sink, SinkExt, Stream, StreamExt, future::pending};
 use remoc::prelude::{ServerShared, ServerSharedMut};
 use tokio::sync::{Mutex, mpsc};
 
@@ -52,6 +52,32 @@ fn test_connection_error(reason: &str) -> ConnectionError {
             frame_type: VarInt::from_u32(0x00),
             reason: reason.to_owned().into(),
         },
+    }
+}
+
+fn assert_connection_reason(error: &ConnectionError, expected: &str) {
+    match error {
+        ConnectionError::Transport { source } => {
+            assert!(source.reason.contains(expected), "{source:?}");
+        }
+        error => panic!("expected transport error containing {expected:?}, got {error:?}"),
+    }
+}
+
+fn assert_stream_reason(error: &StreamError, expected: &str) {
+    match error {
+        StreamError::Connection { source } => assert_connection_reason(source, expected),
+        error => panic!("expected connection stream error containing {expected:?}, got {error:?}"),
+    }
+}
+
+fn expect_connection_error<T>(
+    result: Result<T, ConnectionError>,
+    context: &str,
+) -> ConnectionError {
+    match result {
+        Ok(_) => panic!("{context}"),
+        Err(error) => error,
     }
 }
 
@@ -502,6 +528,243 @@ async fn setup_listen_pair() -> (
     server_result.unwrap();
     let listener = client_result.unwrap();
     (listener, conn_tx)
+}
+
+#[tokio::test]
+async fn direct_lifecycle_and_stream_helpers_cover_control_paths() {
+    use quic::{CancelStreamExt, GetStreamIdExt, StopStreamExt};
+
+    let lifecycle = TestLifecycle::new();
+    assert!(quic::Lifecycle::check(&lifecycle).is_ok());
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            quic::Lifecycle::closed(&lifecycle),
+        )
+        .await
+        .is_err(),
+        "open lifecycle should keep closed() pending"
+    );
+    let terminal = test_connection_error("direct lifecycle terminal");
+    lifecycle.set_terminal_error(terminal);
+    assert_connection_reason(
+        &quic::Lifecycle::check(&lifecycle).expect_err("terminal lifecycle should fail check"),
+        "direct lifecycle terminal",
+    );
+    assert_connection_reason(
+        &quic::Lifecycle::closed(&lifecycle).await,
+        "direct lifecycle terminal",
+    );
+
+    let (reader_tx, reader_rx) = mpsc::channel(1);
+    let mut reader = ChannelReader {
+        stream_id: VarInt::from_u32(401),
+        rx: reader_rx,
+    };
+    assert_eq!(
+        reader.stream_id().await.expect("reader stream id"),
+        VarInt::from_u32(401)
+    );
+    reader_tx
+        .send(Bytes::from_static(b"direct reader"))
+        .await
+        .expect("send reader bytes");
+    assert_eq!(
+        reader
+            .next()
+            .await
+            .expect("reader item")
+            .expect("reader ok"),
+        Bytes::from_static(b"direct reader")
+    );
+    reader
+        .stop(VarInt::from_u32(402))
+        .await
+        .expect("stop reader");
+    assert!(
+        reader_tx
+            .send(Bytes::from_static(b"after stop"))
+            .await
+            .is_err(),
+        "stopped reader should close its receiver"
+    );
+
+    let (writer_tx, mut writer_rx) = mpsc::channel(1);
+    let mut writer = ChannelWriter {
+        stream_id: VarInt::from_u32(403),
+        tx: Some(writer_tx),
+    };
+    assert_eq!(
+        writer.stream_id().await.expect("writer stream id"),
+        VarInt::from_u32(403)
+    );
+    writer
+        .send(Bytes::from_static(b"direct writer"))
+        .await
+        .expect("send writer bytes");
+    assert_eq!(
+        writer_rx.recv().await.expect("writer bytes"),
+        Bytes::from_static(b"direct writer")
+    );
+    writer.close().await.expect("close writer");
+    assert!(
+        writer_rx.recv().await.is_none(),
+        "closed writer should drop its sender"
+    );
+    let error = writer
+        .send(Bytes::from_static(b"after close"))
+        .await
+        .expect_err("closed writer should reject writes");
+    assert_stream_reason(&error, "writer closed");
+
+    let (writer_tx, mut writer_rx) = mpsc::channel(1);
+    let mut writer = ChannelWriter {
+        stream_id: VarInt::from_u32(404),
+        tx: Some(writer_tx),
+    };
+    writer
+        .cancel(VarInt::from_u32(405))
+        .await
+        .expect("cancel writer");
+    assert!(
+        writer_rx.recv().await.is_none(),
+        "canceled writer should drop its sender"
+    );
+
+    let (writer_tx, _writer_rx) = mpsc::channel(1);
+    let mut writer = ChannelWriter {
+        stream_id: VarInt::from_u32(406),
+        tx: Some(writer_tx),
+    };
+    Pin::new(&mut writer)
+        .start_send(Bytes::from_static(b"first"))
+        .expect("first try_send should fit");
+    let error = Pin::new(&mut writer)
+        .start_send(Bytes::from_static(b"second"))
+        .expect_err("full channel should fail start_send");
+    assert_stream_reason(&error, "send failed");
+}
+
+#[tokio::test]
+async fn direct_connection_agent_listener_and_connector_helpers_cover_errors() {
+    let (conn, lifecycle) = StreamableConnection::new();
+    assert_connection_reason(
+        &expect_connection_error(
+            quic::ManageStream::open_bi(conn.as_ref()).await,
+            "empty bidi queue should fail",
+        ),
+        "no bidi streams available",
+    );
+    assert_connection_reason(
+        &expect_connection_error(
+            quic::ManageStream::open_uni(conn.as_ref()).await,
+            "empty uni writer queue should fail",
+        ),
+        "no uni write streams available",
+    );
+    assert_connection_reason(
+        &expect_connection_error(
+            quic::ManageStream::accept_bi(conn.as_ref()).await,
+            "accept_bi helper is intentionally unavailable",
+        ),
+        "accept_bi not implemented",
+    );
+    assert_connection_reason(
+        &expect_connection_error(
+            quic::ManageStream::accept_uni(conn.as_ref()).await,
+            "empty uni reader queue should fail",
+        ),
+        "no uni read streams available",
+    );
+
+    quic::Lifecycle::close(conn.as_ref(), Code::H3_NO_ERROR, "direct close".into());
+    quic::Lifecycle::check(conn.as_ref()).expect("connection should start live");
+    lifecycle.set_terminal_error(test_connection_error("direct connection terminal"));
+    assert_connection_reason(
+        &quic::Lifecycle::check(conn.as_ref()).expect_err("terminal connection should fail check"),
+        "direct connection terminal",
+    );
+    assert_connection_reason(
+        &quic::Lifecycle::closed(conn.as_ref()).await,
+        "direct connection terminal",
+    );
+
+    assert!(
+        quic::WithLocalAgent::local_agent(conn.as_ref())
+            .await
+            .expect("local agent helper should succeed")
+            .is_none()
+    );
+    assert!(
+        quic::WithRemoteAgent::remote_agent(conn.as_ref())
+            .await
+            .expect("remote agent helper should succeed")
+            .is_none()
+    );
+
+    let agent = NoAgent;
+    assert_eq!(dhttp_identity::identity::LocalAgent::name(&agent), "none");
+    assert_eq!(dhttp_identity::identity::RemoteAgent::name(&agent), "none");
+    assert!(dhttp_identity::identity::LocalAgent::cert_chain(&agent).is_empty());
+    assert!(dhttp_identity::identity::RemoteAgent::cert_chain(&agent).is_empty());
+    assert_eq!(
+        dhttp_identity::identity::LocalAgent::sign_algorithm(&agent),
+        rustls::SignatureAlgorithm::ED25519
+    );
+    assert!(
+        dhttp_identity::identity::LocalAgent::sign(
+            &agent,
+            rustls::SignatureScheme::ED25519,
+            b"payload",
+        )
+        .await
+        .expect("no-agent signing should succeed")
+        .is_empty()
+    );
+
+    let (tx, rx) = mpsc::channel(1);
+    let mut listener = MockListen { rx };
+    quic::Listen::shutdown(&listener)
+        .await
+        .expect("mock listener shutdown should succeed");
+    drop(tx);
+    assert_connection_reason(
+        &expect_connection_error(
+            quic::Listen::accept(&mut listener).await,
+            "closed listener should fail accept",
+        ),
+        "listener closed",
+    );
+
+    let authority = "direct.example:443"
+        .parse::<http::uri::Authority>()
+        .expect("authority parses");
+    let connector = MockConnect {
+        conn: Mutex::new(None),
+    };
+    assert_connection_reason(
+        &expect_connection_error(
+            quic::Connect::connect(&connector, &authority).await,
+            "unstaged connector should fail",
+        ),
+        "no connection staged",
+    );
+
+    let (conn, _lifecycle) = StreamableConnection::new();
+    let connector = MockConnect {
+        conn: Mutex::new(Some(conn.clone())),
+    };
+    let connected = quic::Connect::connect(&connector, &authority)
+        .await
+        .expect("staged connector should return connection");
+    assert!(Arc::ptr_eq(&conn, &connected));
+    assert_connection_reason(
+        &expect_connection_error(
+            quic::Connect::connect(&connector, &authority).await,
+            "staged connection should be consumed",
+        ),
+        "no connection staged",
+    );
 }
 
 #[tokio::test]
