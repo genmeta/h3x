@@ -491,7 +491,13 @@ impl quic::Connect for Arc<dquic::prelude::QuicClient> {
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Cow, str::FromStr, sync::Arc, time::Duration};
+    use std::{
+        borrow::Cow,
+        fmt,
+        str::FromStr,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use dquic::{
         prelude::{
@@ -505,12 +511,15 @@ mod tests {
         },
         qrecovery::streams::error::StreamError as DquicStreamError,
     };
-    use futures::{FutureExt, SinkExt, StreamExt};
+    use futures::{FutureExt, SinkExt, StreamExt, stream};
     use http::uri::Authority;
     use tokio::time;
 
     use super::*;
-    use crate::quic::{CancelStreamExt, GetStreamIdExt, Lifecycle, StopStreamExt};
+    use crate::{
+        dquic::resolver::{Record, Resolve, ResolveFuture},
+        quic::{CancelStreamExt, GetStreamIdExt, Lifecycle, StopStreamExt},
+    };
 
     const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");
     const SERVER_KEY: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
@@ -559,6 +568,13 @@ mod tests {
         (endpoint, authority)
     }
 
+    fn make_raw_listeners() -> Arc<dquic::prelude::QuicListeners> {
+        dquic::prelude::QuicListeners::builder()
+            .without_client_cert_verifier()
+            .listen(1)
+            .expect("raw listeners start")
+    }
+
     struct ConnectedPair {
         _client_endpoint: crate::dquic::QuicEndpoint,
         _server_endpoint: crate::dquic::QuicEndpoint,
@@ -589,6 +605,38 @@ mod tests {
         Lifecycle::close(pair.server.as_ref(), Code::H3_NO_ERROR, Cow::Borrowed(""));
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingResolver {
+        names: Mutex<Vec<String>>,
+    }
+
+    impl RecordingResolver {
+        fn names(&self) -> Vec<String> {
+            self.names.lock().unwrap().clone()
+        }
+    }
+
+    impl fmt::Display for RecordingResolver {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("recording resolver")
+        }
+    }
+
+    impl Resolve for RecordingResolver {
+        fn lookup<'l>(&'l self, name: &'l str) -> ResolveFuture<'l> {
+            self.names.lock().unwrap().push(name.to_owned());
+            async { Ok(stream::empty::<Record>().boxed()) }.boxed()
+        }
+    }
+
+    fn transport_connection_error(kind: u32) -> quic::ConnectionError {
+        quic::ConnectionError::from(quic::TransportError {
+            kind: VarInt::from_u32(kind),
+            frame_type: VarInt::from_u32(0),
+            reason: format!("test transport {kind}").into(),
+        })
+    }
+
     fn assert_transport_error(
         error: quic::ConnectionError,
         expected_kind: VarInt,
@@ -608,6 +656,18 @@ mod tests {
         let value = DquicVarInt::from_u64(0x1234_5678).expect("dquic varint");
 
         assert_eq!(convert_varint(value), VarInt::from_u32(0x1234_5678));
+    }
+
+    #[test]
+    fn stale_latch_detection_matches_origin_pairs() {
+        let first = DquicConnectionId::from_slice(b"first");
+        let second = DquicConnectionId::from_slice(b"second");
+
+        assert!(is_stale_latch(Some(first), Some(second)));
+        assert!(is_stale_latch(None, Some(first)));
+        assert!(!is_stale_latch(Some(first), Some(first)));
+        assert!(!is_stale_latch(Some(first), None));
+        assert!(!is_stale_latch(None, None));
     }
 
     #[test]
@@ -756,6 +816,69 @@ mod tests {
             .now_or_never()
             .expect("latched closed should resolve immediately");
         assert_eq!(repeated.to_string(), error.to_string());
+    }
+
+    #[tokio::test]
+    async fn stale_latched_connection_error_is_discarded() {
+        let pair = connected_pair().await;
+        let connection = pair.client.as_ref();
+        let key = dquic_connection_key(connection);
+        let stale_origin = Some(DquicConnectionId::from_slice(b"not-current"));
+
+        latch_connection_error(connection, stale_origin, transport_connection_error(0x31));
+
+        assert!(latched_connection_error(connection).is_none());
+        assert!(dquic_connection_latches().get(&key).is_none());
+        close_pair(&pair);
+    }
+
+    #[tokio::test]
+    async fn listen_impls_for_references_and_arcs_shutdown_accept_queue() {
+        let listeners = make_raw_listeners();
+
+        let mut by_ref = listeners.as_ref();
+        quic::Listen::shutdown(&by_ref)
+            .await
+            .expect("reference listener shutdown");
+        assert!(quic::Listen::accept(&mut by_ref).await.is_err());
+
+        let mut by_arc = listeners.clone();
+        quic::Listen::shutdown(&by_arc)
+            .await
+            .expect("arc listener shutdown");
+        assert!(quic::Listen::accept(&mut by_arc).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_impl_formats_authority_with_and_without_port() {
+        let resolver = Arc::new(RecordingResolver::default());
+        let client = Arc::new(
+            dquic::prelude::QuicClient::builder()
+                .with_resolver(resolver.clone())
+                .without_verifier()
+                .without_cert()
+                .build(),
+        );
+        let with_port = "example.test:8443"
+            .parse::<Authority>()
+            .expect("authority with port parses");
+        let without_port = "example.test"
+            .parse::<Authority>()
+            .expect("authority without port parses");
+
+        let first = quic::Connect::connect(&client, &with_port)
+            .await
+            .expect("connect with port");
+        let second = quic::Connect::connect(&client, &without_port)
+            .await
+            .expect("connect without port");
+
+        assert_eq!(
+            resolver.names(),
+            vec!["example.test:8443".to_owned(), "example.test".to_owned()]
+        );
+        Lifecycle::close(first.as_ref(), Code::H3_NO_ERROR, Cow::Borrowed(""));
+        Lifecycle::close(second.as_ref(), Code::H3_NO_ERROR, Cow::Borrowed(""));
     }
 
     #[tokio::test]
