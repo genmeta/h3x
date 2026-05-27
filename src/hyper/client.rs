@@ -539,6 +539,13 @@ mod tests {
         assert_eq!(protocol.as_str(), "webtransport");
     }
 
+    #[test]
+    fn protocol_from_extensions_returns_none_without_protocol() {
+        let extensions = Extensions::new();
+
+        assert!(protocol_from_extensions(&extensions).is_none());
+    }
+
     #[tokio::test]
     async fn execute_non_connect_sends_request_and_skips_informational_response() {
         let stream_id = VarInt::from_u32(0);
@@ -674,6 +681,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_connect_preserves_protocol_extension() {
+        let stream_id = VarInt::from_u32(12);
+        let (connection, mut server_reader, mut server_writer) =
+            connection_with_staged_bi_stream(stream_id, Ok(stream_id)).await;
+        let mut request = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("https://example.test/connect")
+            .body(Full::new(Bytes::new()))
+            .expect("request should be valid");
+        request
+            .extensions_mut()
+            .insert(::hyper::ext::Protocol::from_static("webtransport"));
+
+        let client = connection.execute_hyper_request(request);
+        let server = async move {
+            let request_parts = server_reader
+                .read_hyper_request_parts()
+                .await
+                .expect("connect headers should be readable");
+            assert_eq!(request_parts.method, http::Method::CONNECT);
+
+            server_writer
+                .send_hyper_response_parts(response_parts(http::StatusCode::OK))
+                .await
+                .expect("connect response should be written");
+            server_writer
+                .close()
+                .await
+                .expect("connect response stream should close");
+        };
+
+        let (response, ()) = tokio::join!(client, server);
+        let response = response.expect("connect response should succeed");
+
+        let protocol = response
+            .extensions()
+            .get::<Protocol>()
+            .expect("protocol should be preserved");
+        assert_eq!(protocol.as_str(), "webtransport");
+    }
+
+    #[tokio::test]
+    async fn execute_request_reports_initial_stream_errors() {
+        let connection = connection_without_staged_stream().await;
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.test/")
+            .body(Full::new(Bytes::new()))
+            .expect("request should be valid");
+
+        let error = match connection.execute_hyper_request(request).await {
+            Ok(_) => panic!("missing staged stream should be reported"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, RequestError::InitialStream { .. }));
+    }
+
+    #[tokio::test]
+    async fn execute_request_reports_response_read_errors() {
+        let stream_id = VarInt::from_u32(16);
+        let (connection, mut server_reader, mut server_writer) =
+            connection_with_staged_bi_stream(stream_id, Ok(stream_id)).await;
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.test/")
+            .body(Full::new(Bytes::new()))
+            .expect("request should be valid");
+
+        let client = connection.execute_hyper_request(request);
+        let server = async move {
+            let request_parts = server_reader
+                .read_hyper_request_parts()
+                .await
+                .expect("request headers should be readable");
+            assert_eq!(request_parts.method, http::Method::GET);
+
+            server_writer
+                .close()
+                .await
+                .expect("response stream should close without response");
+        };
+
+        let (error, ()) = tokio::join!(
+            async {
+                match client.await {
+                    Ok(_) => panic!("missing response should be reported"),
+                    Err(error) => error,
+                }
+            },
+            server,
+        );
+
+        assert!(matches!(error, RequestError::ReceiveResponse { .. }));
+    }
+
+    #[tokio::test]
     async fn execute_request_reports_malformed_header_as_send_request_error() {
         let connection = connection_without_staged_stream().await;
         let mut request = http::Request::builder()
@@ -736,5 +840,31 @@ mod tests {
         let error: RequestError<Infallible> = source.into();
 
         assert!(matches!(error, RequestError::SendRequest { .. }));
+    }
+
+    #[test]
+    fn request_error_from_initial_stream_error_preserves_variant() {
+        let source = InitialMessageStreamError::InitialRawStream {
+            source: crate::dhttp::protocol::InitialRawMessageStreamError::Connection {
+                source: test_connection_error("initial stream failed"),
+            },
+        };
+
+        let error: RequestError<Infallible> = source.into();
+
+        assert!(matches!(error, RequestError::InitialStream { .. }));
+    }
+
+    #[test]
+    fn request_error_from_message_stream_error_preserves_variant() {
+        let source = MessageStreamError::Quic {
+            source: quic::StreamError::Reset {
+                code: VarInt::from_u32(0x20),
+            },
+        };
+
+        let error: RequestError<Infallible> = source.into();
+
+        assert!(matches!(error, RequestError::ReceiveResponse { .. }));
     }
 }
