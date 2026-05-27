@@ -173,9 +173,12 @@ impl ServerQuicConfig {
 
 #[cfg(test)]
 mod server_tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{Arc, Weak},
+        time::Duration,
+    };
 
-    use crate::dquic::server::*;
+    use crate::dquic::{server::*, sni::SniCertResolver};
 
     #[test]
     fn test_server_quic_config_default() {
@@ -221,6 +224,65 @@ mod server_tests {
         let a = ServerQuicConfig::default();
         let mut b = a.clone();
         b.anti_port_scan = true;
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_server_quic_config_debug_reports_public_value_fields() {
+        let cfg = ServerQuicConfig {
+            defer_idle_timeout: Duration::from_secs(3),
+            enable_0rtt: true,
+            enable_sslkeylog: true,
+            alpns: vec![b"h3".to_vec(), b"dhttp".to_vec()],
+            backlog: 7,
+            anti_port_scan: true,
+            ..Default::default()
+        };
+
+        let debug = format!("{cfg:?}");
+
+        assert!(debug.contains("defer_idle_timeout: 3s"));
+        assert!(debug.contains("enable_0rtt: true"));
+        assert!(debug.contains("enable_sslkeylog: true"));
+        assert!(debug.contains("alpns: 2"));
+        assert!(debug.contains("backlog: 7"));
+        assert!(debug.contains("anti_port_scan: true"));
+        assert!(debug.contains(".."));
+    }
+
+    #[test]
+    fn test_server_quic_config_partial_eq_different_common_values() {
+        let a = ServerQuicConfig::default();
+
+        let mut b = a.clone();
+        b.defer_idle_timeout = Duration::from_secs(1);
+        assert_ne!(a, b);
+
+        let mut b = a.clone();
+        b.enable_0rtt = true;
+        assert_ne!(a, b);
+
+        let mut b = a.clone();
+        b.enable_sslkeylog = true;
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_server_quic_config_partial_eq_requires_same_trait_object_arcs() {
+        let a = ServerQuicConfig::default();
+        let b = ServerQuicConfig::default();
+
+        assert_eq!(a.defer_idle_timeout, b.defer_idle_timeout);
+        assert_eq!(a.enable_0rtt, b.enable_0rtt);
+        assert_eq!(a.enable_sslkeylog, b.enable_sslkeylog);
+        assert_eq!(a.parameters, b.parameters);
+        assert_eq!(a.alpns, b.alpns);
+        assert_eq!(a.backlog, b.backlog);
+        assert_eq!(a.anti_port_scan, b.anti_port_scan);
+        assert!(
+            !Arc::ptr_eq(&a.stream_strategy_factory, &b.stream_strategy_factory),
+            "fresh default configs should not share dynamic strategy factories"
+        );
         assert_ne!(a, b);
     }
 
@@ -305,5 +367,36 @@ mod server_tests {
         let b = a.clone();
         a.anti_port_scan = true;
         assert!(!a.is_compatible_with(&b));
+    }
+
+    #[test]
+    fn build_rustls_server_config_copies_alpns_and_enables_0rtt() {
+        let cfg = ServerQuicConfig {
+            alpns: vec![b"h3".to_vec(), b"dhttp".to_vec()],
+            enable_0rtt: true,
+            ..Default::default()
+        };
+
+        let tls = cfg
+            .build_rustls_server_config(SniCertResolver {
+                registry: Weak::new(),
+            })
+            .expect("default verifier should produce a rustls config");
+
+        assert_eq!(tls.alpn_protocols, cfg.alpns);
+        assert_eq!(tls.max_early_data_size, 0xffff_ffff);
+    }
+
+    #[test]
+    fn build_rustls_server_config_leaves_0rtt_disabled_by_default() {
+        let cfg = ServerQuicConfig::default();
+
+        let tls = cfg
+            .build_rustls_server_config(SniCertResolver {
+                registry: Weak::new(),
+            })
+            .expect("default verifier should produce a rustls config");
+
+        assert_eq!(tls.max_early_data_size, 0);
     }
 }

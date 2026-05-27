@@ -755,7 +755,7 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use futures::{SinkExt, StreamExt, future::pending};
+    use futures::{SinkExt, StreamExt, future, future::pending};
     use remoc::prelude::ServerShared;
     use smallvec::SmallVec;
     use tokio::time::{Duration, timeout};
@@ -766,7 +766,17 @@ mod tests {
         super::transport::{MuxChannel, MuxSink, MuxStream},
         *,
     };
-    use crate::{error::Code, quic::GetStreamIdExt};
+    use crate::{
+        codec::{BoxReadStream, BoxWriteStream, PeekableStreamReader, SinkWriter, StreamReader},
+        connection::{ConnectionState, tests::MockConnection},
+        error::Code,
+        extended_connect::{EstablishedConnect, PendingWriteStreamError},
+        message::{stream::WriteStream, test::read_stream_for_test},
+        protocol::{Protocol as ProtocolLayer, Protocols, StreamVerdict},
+        qpack::field::Protocol,
+        quic::GetStreamIdExt,
+        webtransport::{WEBTRANSPORT_H3, WebTransportProtocol},
+    };
 
     #[derive(Debug, Default)]
     struct TestLifecycle {
@@ -1008,6 +1018,97 @@ mod tests {
         registered_fds_with_nonblocking(count, true).await
     }
 
+    fn fd_transport() -> (MuxSink, MuxStream, FdRegistry) {
+        let (channel_a, channel_b) = MuxChannel::pair_for_test().expect("mux channel pair");
+        let (sink_a, _stream_a) = channel_a.split().expect("split channel a");
+        let (_sink_b, stream_b) = channel_b.split().expect("split channel b");
+        let registry = stream_b.fd_registry();
+        (sink_a, stream_b, registry)
+    }
+
+    async fn receive_queued_fds(
+        sink: &mut MuxSink,
+        stream: &mut MuxStream,
+        registry: &FdRegistry,
+        fd_id: VarInt,
+    ) -> Vec<std::os::fd::OwnedFd> {
+        sink.send(Bytes::new())
+            .await
+            .expect("drive queued fd frame");
+        let _ = stream
+            .next()
+            .await
+            .expect("stream should yield")
+            .expect("empty bytes frame should decode");
+        timeout(Duration::from_secs(1), registry.wait_fds(fd_id))
+            .await
+            .expect("queued fds should arrive")
+            .expect("queued fds should decode")
+            .into_vec()
+    }
+
+    fn connection_with_enabled_webtransport_pair() -> (
+        Arc<MockConnection>,
+        Arc<ConnectionState<dyn quic::DynConnection>>,
+    ) {
+        let quic = Arc::new(MockConnection::new());
+        quic.enable_stream_ops();
+        let erased: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(WebTransportProtocol::new_for_test(erased));
+        let connection =
+            Arc::new(ConnectionState::new_for_test(quic.clone(), Arc::new(protocols)).erase());
+        (quic, connection)
+    }
+
+    fn webtransport_connect_on(
+        connection: Arc<ConnectionState<dyn quic::DynConnection>>,
+        session_id: StreamId,
+    ) -> EstablishedConnect {
+        EstablishedConnect::pending(
+            session_id,
+            Some(Protocol::new(WEBTRANSPORT_H3)),
+            connection,
+            read_stream_for_test(session_id.0),
+            future::pending::<Result<WriteStream, PendingWriteStreamError>>(),
+        )
+    }
+
+    fn webtransport_session_on(
+        connection: Arc<ConnectionState<dyn quic::DynConnection>>,
+        session_id: StreamId,
+    ) -> Arc<webtransport::WebTransportSession> {
+        Arc::new(
+            webtransport::WebTransportSession::try_from(webtransport_connect_on(
+                connection, session_id,
+            ))
+            .expect("connect should create webtransport session"),
+        )
+    }
+
+    async fn peekable_uni_stream_from_bytes(bytes: &[u8]) -> crate::codec::ErasedPeekableUniStream {
+        let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(4));
+        writer
+            .send(Bytes::copy_from_slice(bytes))
+            .await
+            .expect("write test uni bytes");
+        writer.close().await.expect("close test uni stream");
+        PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream))
+    }
+
+    async fn peekable_bi_stream_from_bytes(bytes: &[u8]) -> crate::codec::ErasedPeekableBiStream {
+        let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(4));
+        writer
+            .send(Bytes::copy_from_slice(bytes))
+            .await
+            .expect("write test bidi bytes");
+        writer.close().await.expect("close test bidi stream");
+        (
+            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream)),
+            SinkWriter::new(Box::pin(writer) as BoxWriteStream),
+        )
+    }
+
     #[test]
     fn ipc_error_helpers_preserve_context() {
         let open = ipc_open_io("boom", "open context");
@@ -1032,6 +1133,89 @@ mod tests {
             got: 1,
         };
         assert_eq!(fd_count.to_string(), "expected 2 fds, got 1");
+    }
+
+    #[tokio::test]
+    async fn session_adapter_open_methods_queue_expected_fds_and_stream_ids() {
+        let (_quic, connection) = connection_with_enabled_webtransport_pair();
+        let session = webtransport_session_on(connection, StreamId::from(VarInt::from_u32(42)));
+        let (mut sink, mut stream, registry) = fd_transport();
+        let parent = Arc::new(TestLifecycle::default());
+        let lifecycle: Arc<dyn DynLifecycle> = parent;
+        let adapter = WebTransportSessionAdapter::new(session, sink.fd_sender(), lifecycle);
+
+        let (fd_id, stream_id) = IpcWebTransportSession::open_bi(&adapter)
+            .await
+            .expect("adapter open_bi should queue bidi fds");
+        assert_eq!(stream_id, VarInt::from_u32(0));
+        let fds = receive_queued_fds(&mut sink, &mut stream, &registry, fd_id).await;
+        assert_eq!(fds.len(), 2);
+
+        let (fd_id, stream_id) = IpcWebTransportSession::open_uni(&adapter)
+            .await
+            .expect("adapter open_uni should queue uni fd");
+        assert_eq!(stream_id, VarInt::from_u32(0));
+        let fds = receive_queued_fds(&mut sink, &mut stream, &registry, fd_id).await;
+        assert_eq!(fds.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_adapter_accept_methods_route_streams_and_queue_expected_fds() {
+        let (_quic, connection) = connection_with_enabled_webtransport_pair();
+        let session_id = StreamId::from(VarInt::from_u32(42));
+        let session = webtransport_session_on(connection.clone(), session_id);
+        let protocol = connection
+            .protocol::<WebTransportProtocol>()
+            .expect("connection should include webtransport protocol");
+        let (mut sink, mut stream, registry) = fd_transport();
+        let parent = Arc::new(TestLifecycle::default());
+        let lifecycle: Arc<dyn DynLifecycle> = parent;
+        let adapter = WebTransportSessionAdapter::new(session, sink.fd_sender(), lifecycle);
+
+        let routed_bi = peekable_bi_stream_from_bytes(&[0x40, 0x41, 0x2a, 0xde]).await;
+        let verdict = ProtocolLayer::accept_bi(protocol, routed_bi)
+            .await
+            .expect("bidi routing should not fail");
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        let (fd_id, stream_id) = IpcWebTransportSession::accept_bi(&adapter)
+            .await
+            .expect("adapter accept_bi should queue bidi fds");
+        assert_eq!(stream_id, VarInt::from_u32(4));
+        let fds = receive_queued_fds(&mut sink, &mut stream, &registry, fd_id).await;
+        assert_eq!(fds.len(), 2);
+
+        let routed_uni = peekable_uni_stream_from_bytes(&[0x40, 0x54, 0x2a, 0xbe]).await;
+        let verdict = ProtocolLayer::accept_uni(protocol, routed_uni)
+            .await
+            .expect("uni routing should not fail");
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        let (fd_id, stream_id) = IpcWebTransportSession::accept_uni(&adapter)
+            .await
+            .expect("adapter accept_uni should queue uni fd");
+        assert_eq!(stream_id, VarInt::from_u32(4));
+        let fds = receive_queued_fds(&mut sink, &mut stream, &registry, fd_id).await;
+        assert_eq!(fds.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_adapter_accept_methods_map_connection_closure_to_closed() {
+        let (quic, connection) = connection_with_enabled_webtransport_pair();
+        let session = webtransport_session_on(connection, StreamId::from(VarInt::from_u32(42)));
+        quic.set_terminal_error(connection_error("adapter accept connection closed"));
+        let (sink, _stream, _registry) = fd_transport();
+        let parent = Arc::new(TestLifecycle::default());
+        let lifecycle: Arc<dyn DynLifecycle> = parent;
+        let adapter = WebTransportSessionAdapter::new(session, sink.fd_sender(), lifecycle);
+
+        let error = IpcWebTransportSession::accept_bi(&adapter)
+            .await
+            .expect_err("connection closure should close bidi accept");
+        assert!(matches!(error, IpcWebTransportAcceptError::Closed));
+
+        let error = IpcWebTransportSession::accept_uni(&adapter)
+            .await
+            .expect_err("connection closure should close uni accept");
+        assert!(matches!(error, IpcWebTransportAcceptError::Closed));
     }
 
     #[test]

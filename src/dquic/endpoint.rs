@@ -928,6 +928,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_new_uses_default_anonymous_endpoint_shape() {
+        let endpoint = QuicEndpoint::new().await;
+
+        assert!(endpoint.identity().is_none());
+        assert_eq!(endpoint.bind_patterns().len(), 1);
+        assert_eq!(endpoint.bind_patterns()[0].to_string(), "iface://*");
+        assert!(endpoint.client_tls_cache.load_full().is_some());
+        assert!(endpoint.server_binding_cache.load_full().is_none());
+    }
+
+    #[tokio::test]
+    async fn accessors_return_builder_supplied_components_and_default_bind() {
+        let network = Network::builder().build();
+        let resolver = Arc::new(SystemResolver);
+        let endpoint = QuicEndpoint::builder()
+            .network(network.clone())
+            .resolver(resolver.clone())
+            .build()
+            .await;
+
+        assert!(Arc::ptr_eq(endpoint.network(), &network));
+        assert!(Arc::ptr_eq(endpoint.resolver(), &(resolver as Arc<_>)));
+        assert!(endpoint.identity().is_none());
+        assert_eq!(endpoint.bind_patterns().len(), 1);
+        assert_eq!(endpoint.bind_patterns()[0].to_string(), "iface://*");
+    }
+
+    #[tokio::test]
+    async fn ensure_client_caches_tls_and_clone_starts_with_empty_cache() {
+        let endpoint = make_endpoint().await;
+
+        let first = endpoint.ensure_client().expect("client tls should build");
+        let second = endpoint
+            .ensure_client()
+            .expect("client tls should be cached");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let cloned = endpoint.clone();
+        assert!(
+            cloned.client_tls_cache.load_full().is_none(),
+            "clone should not inherit stale client TLS cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_client_tls_copies_alpns_and_early_data_flag() {
+        let mut endpoint = make_endpoint().await;
+        {
+            let mut client = endpoint.client_config_mut();
+            client.alpns = vec![b"h3".to_vec(), b"dhttp".to_vec()];
+            client.enable_0rtt = true;
+        }
+
+        let tls = endpoint
+            .build_client_tls()
+            .expect("client tls should build");
+
+        assert_eq!(tls.alpn_protocols, endpoint.client.alpns);
+        assert!(tls.enable_early_data);
+    }
+
+    #[tokio::test]
     async fn test_identity_mut_set() {
         let mut endpoint = make_endpoint().await;
         assert!(endpoint.identity.load_full().is_none());

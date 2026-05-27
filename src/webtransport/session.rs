@@ -293,7 +293,7 @@ mod tests {
     use futures::{Sink, SinkExt, Stream, StreamExt, future, future::pending};
     use tokio::time::{Duration, timeout};
     use tokio_util::task::AbortOnDropHandle;
-    use tracing::Instrument;
+    use tracing::{Instrument, Level};
 
     use super::*;
     use crate::{
@@ -713,6 +713,202 @@ mod tests {
         async fn closed(&self) -> quic::ConnectionError {
             pending().await
         }
+    }
+
+    fn enable_debug_tracing_for_test() -> tracing::dispatcher::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::DEBUG)
+            .with_writer(std::io::sink)
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        tracing::dispatcher::set_default(&dispatch)
+    }
+
+    #[tokio::test]
+    async fn test_stream_helpers_expose_ids_and_shutdown_codes() {
+        use crate::quic::{CancelStreamExt, GetStreamIdExt, StopStreamExt};
+
+        let state = Arc::new(StreamState::default());
+        let mut reader = TestReadStream {
+            state: Arc::clone(&state),
+            chunks: VecDeque::from([Bytes::from_static(&[0x01])]),
+            stream_id: VarInt::from_u32(41),
+        };
+        let mut writer = TestWriteStream {
+            state: Arc::clone(&state),
+            stream_id: VarInt::from_u32(42),
+        };
+
+        assert_eq!(
+            reader.stream_id().await.expect("reader id"),
+            VarInt::from_u32(41)
+        );
+        assert_eq!(
+            writer.stream_id().await.expect("writer id"),
+            VarInt::from_u32(42)
+        );
+        reader
+            .stop(VarInt::from_u32(0x31))
+            .await
+            .expect("stop reader");
+        writer
+            .cancel(VarInt::from_u32(0x32))
+            .await
+            .expect("cancel writer");
+        writer.close().await.expect("close writer");
+
+        assert_eq!(state.stopped_codes(), vec![VarInt::from_u32(0x31)]);
+        assert_eq!(state.cancelled_codes(), vec![VarInt::from_u32(0x32)]);
+    }
+
+    #[tokio::test]
+    async fn test_agents_return_static_metadata_and_empty_signature() {
+        let local = TestLocalAgent;
+        let remote = TestRemoteAgent;
+
+        assert_eq!(agent::LocalAgent::name(&local), "test-local");
+        assert!(agent::LocalAgent::cert_chain(&local).is_empty());
+        assert_eq!(
+            agent::LocalAgent::sign_algorithm(&local),
+            rustls::SignatureAlgorithm::ED25519
+        );
+        assert!(
+            agent::LocalAgent::sign(&local, rustls::SignatureScheme::ED25519, b"payload")
+                .await
+                .expect("test signer")
+                .is_empty()
+        );
+
+        assert_eq!(agent::RemoteAgent::name(&remote), "test-remote");
+        assert!(agent::RemoteAgent::cert_chain(&remote).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_connection_trait_methods_are_pending_or_empty() {
+        let conn = TestConnection {
+            state: Arc::new(StreamState::default()),
+        };
+
+        assert!(
+            quic::WithLocalAgent::local_agent(&conn)
+                .await
+                .expect("local agent")
+                .is_none()
+        );
+        assert!(
+            quic::WithRemoteAgent::remote_agent(&conn)
+                .await
+                .expect("remote agent")
+                .is_none()
+        );
+        quic::Lifecycle::check(&conn).expect("connection is open");
+        quic::Lifecycle::close(
+            &conn,
+            crate::error::Code::from(VarInt::from_u32(0)),
+            Cow::Borrowed("test close"),
+        );
+
+        timeout(
+            Duration::from_millis(10),
+            quic::ManageStream::accept_bi(&conn),
+        )
+        .await
+        .expect_err("accept_bi should stay pending");
+        timeout(
+            Duration::from_millis(10),
+            quic::ManageStream::accept_uni(&conn),
+        )
+        .await
+        .expect_err("accept_uni should stay pending");
+        timeout(Duration::from_millis(10), quic::Lifecycle::closed(&conn))
+            .await
+            .expect_err("closed should stay pending");
+    }
+
+    #[tokio::test]
+    async fn header_fail_connection_nonfailing_mode_exercises_remaining_traits() {
+        use crate::quic::{CancelStreamExt, GetStreamIdExt};
+
+        let state = Arc::new(StreamState::default());
+        let conn = HeaderFailConnection {
+            mode: HeaderFailureMode::SendOnCall(99),
+            state: Arc::clone(&state),
+        };
+
+        assert!(
+            quic::WithLocalAgent::local_agent(&conn)
+                .await
+                .expect("local agent")
+                .is_none()
+        );
+        assert!(
+            quic::WithRemoteAgent::remote_agent(&conn)
+                .await
+                .expect("remote agent")
+                .is_none()
+        );
+        quic::Lifecycle::check(&conn).expect("connection is open");
+        quic::Lifecycle::close(
+            &conn,
+            crate::error::Code::from(VarInt::from_u32(0)),
+            Cow::Borrowed("test close"),
+        );
+        timeout(
+            Duration::from_millis(10),
+            quic::ManageStream::accept_bi(&conn),
+        )
+        .await
+        .expect_err("accept_bi should stay pending");
+        timeout(
+            Duration::from_millis(10),
+            quic::ManageStream::accept_uni(&conn),
+        )
+        .await
+        .expect_err("accept_uni should stay pending");
+        timeout(Duration::from_millis(10), quic::Lifecycle::closed(&conn))
+            .await
+            .expect_err("closed should stay pending");
+
+        let (_reader, mut writer) = quic::ManageStream::open_bi(&conn)
+            .await
+            .expect("open bidi stream");
+        assert_eq!(
+            writer.stream_id().await.expect("writer id"),
+            VarInt::from_u32(21)
+        );
+        writer
+            .send(Bytes::from_static(&[0xaa]))
+            .await
+            .expect("write payload");
+        writer.flush().await.expect("flush writer");
+        writer
+            .cancel(VarInt::from_u32(0x44))
+            .await
+            .expect("cancel writer");
+        writer.close().await.expect("close writer");
+        assert_eq!(state.written(), vec![0xaa]);
+    }
+
+    #[tokio::test]
+    async fn header_fail_write_stream_can_fail_after_prior_write() {
+        let stream_state = Arc::new(StreamState::default());
+        let mut writer = HeaderFailWriteStream {
+            mode: HeaderFailureMode::SendOnCall(2),
+            state: Arc::clone(&stream_state),
+            send_calls: 0,
+            stream_id: VarInt::from_u32(23),
+        };
+
+        writer
+            .send(Bytes::from_static(&[0x40, 0x41]))
+            .await
+            .expect("first write should succeed");
+        let error = writer
+            .send(Bytes::from_static(&[0x04]))
+            .await
+            .expect_err("second write should fail");
+        assert!(matches!(error, quic::StreamError::Reset { .. }));
+        assert_eq!(stream_state.written(), vec![0x40, 0x41]);
     }
 
     fn connection_with_webtransport() -> Arc<ConnectionState<dyn quic::DynConnection>> {
@@ -1456,6 +1652,7 @@ mod tests {
 
     #[tokio::test]
     async fn control_task_closes_session_after_connect_stream_read_error() {
+        let _guard = enable_debug_tracing_for_test();
         let registry = Registry::default();
         let session_id = StreamId::from(VarInt::from_u32(25));
         let registered = registry
@@ -1479,6 +1676,7 @@ mod tests {
 
     #[tokio::test]
     async fn control_task_closes_session_when_connect_takeover_fails() {
+        let _guard = enable_debug_tracing_for_test();
         let registry = Registry::default();
         let session_id = StreamId::from(VarInt::from_u32(26));
         let registered = registry
