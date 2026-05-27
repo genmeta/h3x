@@ -497,7 +497,11 @@ mod tests {
         WriteStarted(Bytes),
         WriteCancelled,
         Flush,
+        FlushStarted,
+        FlushCancelled,
         Shutdown,
+        ShutdownStarted,
+        ShutdownCancelled,
         Cancel(u64),
     }
 
@@ -622,6 +626,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_bridge_propagates_read_and_stop_errors() {
+        let read_code = VarInt::from_u32(31);
+        let stop_code = VarInt::from_u32(32);
+        let client = TestReadClient::new([Some(Err(quic::StreamError::Reset { code: read_code }))]);
+        let mut bridge = Box::pin(ReadBridge::<_, quic::StreamError, _, _, _, _>::new(
+            VarInt::from_u32(12),
+            client,
+            |mut client: TestReadClient, _token: CancellationToken| async move {
+                let result = client.chunks.pop_front().expect("scripted read result");
+                Either::Left((client, result))
+            },
+            move |client: TestReadClient, _code: VarInt| async move {
+                (client, Err(quic::StreamError::Reset { code: stop_code }))
+            },
+        ));
+
+        assert!(matches!(
+            bridge.next().await,
+            Some(Err(quic::StreamError::Reset { code })) if code == read_code
+        ));
+        assert!(matches!(
+            bridge.stop(VarInt::from_u32(99)).await,
+            Err(quic::StreamError::Reset { code }) if code == stop_code
+        ));
+    }
+
+    #[tokio::test]
     async fn write_bridge_writes_flushes_shutdown_and_cancels() {
         let stream_id = VarInt::from_u32(13);
         let client = TestWriteClient::new();
@@ -718,6 +749,146 @@ mod tests {
                 Event::WriteStarted(Bytes::from_static(b"pending")),
                 Event::WriteCancelled,
                 Event::Cancel(23),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn write_bridge_reports_operation_errors() {
+        let write_code = VarInt::from_u32(41);
+        let flush_code = VarInt::from_u32(42);
+        let shutdown_code = VarInt::from_u32(43);
+        let cancel_code = VarInt::from_u32(44);
+        let mut bridge = Box::pin(
+            WriteBridge::<_, quic::StreamError, _, _, _, _, _, _, _, _>::new(
+                VarInt::from_u32(25),
+                TestWriteClient::new(),
+                move |client: TestWriteClient, _token: CancellationToken, _bytes: Bytes| async move {
+                    Either::Left((client, Err(quic::StreamError::Reset { code: write_code })))
+                },
+                move |client: TestWriteClient, _token: CancellationToken| async move {
+                    Either::Left((client, Err(quic::StreamError::Reset { code: flush_code })))
+                },
+                move |client: TestWriteClient, _token: CancellationToken| async move {
+                    Either::Left((
+                        client,
+                        Err(quic::StreamError::Reset {
+                            code: shutdown_code,
+                        }),
+                    ))
+                },
+                move |client: TestWriteClient, _code: VarInt| async move {
+                    (client, Err(quic::StreamError::Reset { code: cancel_code }))
+                },
+            ),
+        );
+
+        assert!(matches!(
+            bridge.send(Bytes::from_static(b"write")).await,
+            Err(quic::StreamError::Reset { code }) if code == write_code
+        ));
+        assert!(matches!(
+            bridge.flush().await,
+            Err(quic::StreamError::Reset { code }) if code == flush_code
+        ));
+        assert!(matches!(
+            bridge.close().await,
+            Err(quic::StreamError::Reset { code }) if code == shutdown_code
+        ));
+        assert!(matches!(
+            bridge.cancel(VarInt::from_u32(55)).await,
+            Err(quic::StreamError::Reset { code }) if code == cancel_code
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_bridge_cancel_cancels_pending_flush_and_shutdown() {
+        let flush_client = TestWriteClient::new();
+        let flush_events = flush_client.events.clone();
+        let mut flush_bridge = Box::pin(
+            WriteBridge::<_, quic::StreamError, _, _, _, _, _, _, _, _>::new(
+                VarInt::from_u32(27),
+                flush_client,
+                |client: TestWriteClient, _token: CancellationToken, _bytes: Bytes| async move {
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, token: CancellationToken| async move {
+                    client.record(Event::FlushStarted);
+                    token.cancelled().await;
+                    client.record(Event::FlushCancelled);
+                    Either::Right(client)
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, code: VarInt| async move {
+                    client.record(Event::Cancel(code.into_inner()));
+                    (client, Ok(()))
+                },
+            ),
+        );
+
+        assert!(
+            poll_fn(|cx| flush_bridge.as_mut().poll_flush(cx))
+                .now_or_never()
+                .is_none(),
+            "flush should remain pending until cancellation"
+        );
+        flush_bridge
+            .cancel(VarInt::from_u32(57))
+            .await
+            .expect("cancel pending flush");
+        assert_eq!(
+            events(flush_events.as_ref()),
+            vec![
+                Event::FlushStarted,
+                Event::FlushCancelled,
+                Event::Cancel(57),
+            ],
+        );
+
+        let shutdown_client = TestWriteClient::new();
+        let shutdown_events = shutdown_client.events.clone();
+        let mut shutdown_bridge =
+            Box::pin(
+                WriteBridge::<_, quic::StreamError, _, _, _, _, _, _, _, _>::new(
+                    VarInt::from_u32(29),
+                    shutdown_client,
+                    |client: TestWriteClient, _token: CancellationToken, _bytes: Bytes| async move {
+                        Either::Left((client, Ok(())))
+                    },
+                    |client: TestWriteClient, _token: CancellationToken| async move {
+                        Either::Left((client, Ok(())))
+                    },
+                    |client: TestWriteClient, token: CancellationToken| async move {
+                        client.record(Event::ShutdownStarted);
+                        token.cancelled().await;
+                        client.record(Event::ShutdownCancelled);
+                        Either::Right(client)
+                    },
+                    |client: TestWriteClient, code: VarInt| async move {
+                        client.record(Event::Cancel(code.into_inner()));
+                        (client, Ok(()))
+                    },
+                ),
+            );
+
+        assert!(
+            poll_fn(|cx| shutdown_bridge.as_mut().poll_close(cx))
+                .now_or_never()
+                .is_none(),
+            "shutdown should remain pending until cancellation"
+        );
+        shutdown_bridge
+            .cancel(VarInt::from_u32(59))
+            .await
+            .expect("cancel pending shutdown");
+        assert_eq!(
+            events(shutdown_events.as_ref()),
+            vec![
+                Event::ShutdownStarted,
+                Event::ShutdownCancelled,
+                Event::Cancel(59),
             ],
         );
     }
