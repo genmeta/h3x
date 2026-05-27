@@ -19,6 +19,26 @@ pub enum PseudoHeaders {
     Response { status: Option<StatusCode> },
 }
 
+fn has_missing_path_component(path_and_query: &PathAndQuery) -> bool {
+    path_and_query == &PathAndQuery::from_static("") || path_and_query.as_str().starts_with('?')
+}
+
+fn normalize_http_path(path_and_query: PathAndQuery) -> PathAndQuery {
+    if path_and_query == PathAndQuery::from_static("") {
+        return PathAndQuery::from_static("/");
+    }
+
+    if path_and_query.as_str().starts_with('?') {
+        let mut normalized = String::with_capacity(path_and_query.as_str().len() + 1);
+        normalized.push('/');
+        normalized.push_str(path_and_query.as_str());
+        return PathAndQuery::try_from(normalized)
+            .expect("path-and-query with a prefixed slash remains valid");
+    }
+
+    path_and_query
+}
+
 impl PseudoHeaders {
     pub const METHOD: &str = ":method";
     pub const SCHEME: &str = ":scheme";
@@ -30,20 +50,22 @@ impl PseudoHeaders {
 
     pub fn request(method: Method, uri: Uri) -> Self {
         let uri = uri.into_parts();
+        let is_http = uri.scheme == Some(Scheme::HTTP) || uri.scheme == Some(Scheme::HTTPS);
+        // RFC 9114 Section 4.3.1 defines :path as path-absolute plus an
+        // optional query. For http/https URIs with no path component, use "/"
+        // (or "/?query" for query-only targets). OPTIONS requests with no path
+        // component use "*".
         let path = match uri.path_and_query {
-            Some(path_and_query) => Some(path_and_query),
-            // This pseudo-header field MUST NOT be empty for "http" or "https"
-            // URIs; "http" or "https" URIs that do not contain a path component
-            // MUST include a value of / (ASCII 0x2f). An OPTIONS request that
-            // does not include a path component includes the value * (ASCII
-            // 0x2a) for the :path pseudo-header field; see Section 7.1 of
-            // [HTTP].
-            //
-            // https://datatracker.ietf.org/doc/html/rfc9114#section-4.3.1-2.16.1
-            None if uri.scheme == Some(Scheme::HTTP) || uri.scheme == Some(Scheme::HTTPS) => {
-                Some(PathAndQuery::from_static("/"))
+            Some(path_and_query)
+                if method == http::Method::OPTIONS
+                    && has_missing_path_component(&path_and_query) =>
+            {
+                Some(PathAndQuery::from_static("*"))
             }
-            None if method == http::Method::OPTIONS => Some(PathAndQuery::from_static("/")),
+            Some(path_and_query) if is_http => Some(normalize_http_path(path_and_query)),
+            Some(path_and_query) => Some(path_and_query),
+            None if method == http::Method::OPTIONS => Some(PathAndQuery::from_static("*")),
+            None if is_http => Some(PathAndQuery::from_static("/")),
             None => None,
         };
         PseudoHeaders::Request {
@@ -92,5 +114,117 @@ impl PseudoHeaders {
             }
             PseudoHeaders::Response { status } => status.is_none(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http::{Method, StatusCode, Uri, uri::PathAndQuery};
+
+    use super::PseudoHeaders;
+
+    #[test]
+    fn request_extracts_pseudo_headers_from_absolute_uri() {
+        let pseudo = PseudoHeaders::request(
+            Method::GET,
+            Uri::from_static("https://example.com:443/resource?q=1"),
+        );
+
+        assert_eq!(
+            pseudo,
+            PseudoHeaders::Request {
+                method: Some(Method::GET),
+                scheme: Some(http::uri::Scheme::HTTPS),
+                authority: Some(http::uri::Authority::from_static("example.com:443")),
+                path: Some(PathAndQuery::from_static("/resource?q=1")),
+                protocol: None,
+            }
+        );
+        assert!(!pseudo.is_empty());
+    }
+
+    #[test]
+    fn request_defaults_http_and_https_missing_path_to_slash() {
+        let https = PseudoHeaders::request(Method::GET, Uri::from_static("https://example.com"));
+        let http = PseudoHeaders::request(Method::GET, Uri::from_static("http://example.com"));
+
+        for pseudo in [https, http] {
+            match pseudo {
+                PseudoHeaders::Request { path, .. } => {
+                    assert_eq!(path.as_ref().map(PathAndQuery::as_str), Some("/"));
+                }
+                PseudoHeaders::Response { .. } => panic!("request should produce request headers"),
+            }
+        }
+    }
+
+    #[test]
+    fn request_normalizes_query_only_http_and_https_uri_to_absolute_path() {
+        let https =
+            PseudoHeaders::request(Method::GET, Uri::from_static("https://example.com?x=1"));
+        let http = PseudoHeaders::request(Method::GET, Uri::from_static("http://example.com?x=1"));
+
+        for pseudo in [https, http] {
+            match pseudo {
+                PseudoHeaders::Request { path, .. } => {
+                    assert_eq!(path.as_ref().map(PathAndQuery::as_str), Some("/?x=1"));
+                }
+                PseudoHeaders::Response { .. } => panic!("request should produce request headers"),
+            }
+        }
+    }
+
+    #[test]
+    fn options_missing_path_uses_asterisk_but_explicit_paths_are_preserved() {
+        let no_path =
+            PseudoHeaders::request(Method::OPTIONS, Uri::from_static("https://example.com"));
+        let query_only =
+            PseudoHeaders::request(Method::OPTIONS, Uri::from_static("https://example.com?x=1"));
+        let explicit_slash =
+            PseudoHeaders::request(Method::OPTIONS, Uri::from_static("https://example.com/"));
+        let explicit_slash_with_query = PseudoHeaders::request(
+            Method::OPTIONS,
+            Uri::from_static("https://example.com/?x=1"),
+        );
+
+        match no_path {
+            PseudoHeaders::Request { path, .. } => {
+                assert_eq!(path.as_ref().map(PathAndQuery::as_str), Some("*"));
+            }
+            PseudoHeaders::Response { .. } => panic!("request should produce request headers"),
+        }
+        match query_only {
+            PseudoHeaders::Request { path, .. } => {
+                assert_eq!(path.as_ref().map(PathAndQuery::as_str), Some("*"));
+            }
+            PseudoHeaders::Response { .. } => panic!("request should produce request headers"),
+        }
+        match explicit_slash {
+            PseudoHeaders::Request { path, .. } => {
+                assert_eq!(path.as_ref().map(PathAndQuery::as_str), Some("/"));
+            }
+            PseudoHeaders::Response { .. } => panic!("request should produce request headers"),
+        }
+        match explicit_slash_with_query {
+            PseudoHeaders::Request { path, .. } => {
+                assert_eq!(path.as_ref().map(PathAndQuery::as_str), Some("/?x=1"));
+            }
+            PseudoHeaders::Response { .. } => panic!("request should produce request headers"),
+        }
+    }
+
+    #[test]
+    fn response_and_unresolved_headers_report_empty_state() {
+        let response = PseudoHeaders::response(StatusCode::NO_CONTENT);
+        assert_eq!(
+            response,
+            PseudoHeaders::Response {
+                status: Some(StatusCode::NO_CONTENT),
+            }
+        );
+        assert!(!response.is_empty());
+
+        assert!(PseudoHeaders::unresolved_request().is_empty());
+        assert!(PseudoHeaders::unresolved_response().is_empty());
     }
 }
