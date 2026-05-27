@@ -972,6 +972,127 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn check_pseudo_validates_authority_host_presence_and_empty_values() {
+        let authority_only = FieldSection::header(
+            request_pseudo(
+                Some(Method::GET),
+                Some(Scheme::HTTPS),
+                Some(Authority::from_static("example.test")),
+                Some(PathAndQuery::from_static("/")),
+                None,
+            ),
+            HeaderMap::new(),
+        );
+        assert!(authority_only.check_pseudo().is_ok());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("example.test"));
+        let host_only = FieldSection::header(
+            request_pseudo(
+                Some(Method::GET),
+                Some(Scheme::HTTPS),
+                None,
+                Some(PathAndQuery::from_static("/")),
+                None,
+            ),
+            headers,
+        );
+        assert!(host_only.check_pseudo().is_ok());
+
+        let missing_authority_and_host = FieldSection::header(
+            request_pseudo(
+                Some(Method::GET),
+                Some(Scheme::HTTPS),
+                None,
+                Some(PathAndQuery::from_static("/")),
+                None,
+            ),
+            HeaderMap::new(),
+        );
+        assert!(matches!(
+            missing_authority_and_host.check_pseudo(),
+            Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders { .. })
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static(""));
+        let empty_host = FieldSection::header(
+            request_pseudo(
+                Some(Method::GET),
+                Some(Scheme::HTTPS),
+                None,
+                Some(PathAndQuery::from_static("/")),
+                None,
+            ),
+            headers,
+        );
+        assert!(matches!(
+            empty_host.check_pseudo(),
+            Err(MalformedHeaderSection::EmptyAuthorityOrHost)
+        ));
+
+        let non_http_without_authority_or_host = FieldSection::header(
+            request_pseudo(
+                Some(Method::GET),
+                Some(Scheme::try_from("urn").expect("scheme")),
+                None,
+                Some(PathAndQuery::from_static("/opaque")),
+                None,
+            ),
+            HeaderMap::new(),
+        );
+        assert!(non_http_without_authority_or_host.check_pseudo().is_ok());
+    }
+
+    #[test]
+    fn check_pseudo_requires_scheme_and_path_for_regular_and_extended_requests() {
+        let missing_scheme = FieldSection::header(
+            request_pseudo(
+                Some(Method::GET),
+                None,
+                Some(Authority::from_static("example.test")),
+                Some(PathAndQuery::from_static("/")),
+                None,
+            ),
+            HeaderMap::new(),
+        );
+        assert!(matches!(
+            missing_scheme.check_pseudo(),
+            Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders { .. })
+        ));
+
+        let missing_path = FieldSection::header(
+            request_pseudo(
+                Some(Method::GET),
+                Some(Scheme::HTTPS),
+                Some(Authority::from_static("example.test")),
+                None,
+                None,
+            ),
+            HeaderMap::new(),
+        );
+        assert!(matches!(
+            missing_path.check_pseudo(),
+            Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders { .. })
+        ));
+
+        let extended_connect_missing_path = FieldSection::header(
+            request_pseudo(
+                Some(Method::CONNECT),
+                Some(Scheme::HTTPS),
+                Some(Authority::from_static("example.test")),
+                None,
+                Some(Protocol::new("webtransport")),
+            ),
+            HeaderMap::new(),
+        );
+        assert!(matches!(
+            extended_connect_missing_path.check_pseudo(),
+            Err(MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn decode_accepts_request_response_and_trailer_sections() {
         let request = decode_fields([
@@ -1065,5 +1186,96 @@ mod tests {
             .await
             .expect_err("invalid status");
         assert_h3_error(invalid_status, "invalid status code");
+    }
+
+    #[tokio::test]
+    async fn decode_reports_duplicate_request_and_response_pseudo_headers() {
+        for (name, first, second) in [
+            (
+                b":protocol" as &'static [u8],
+                b"webtransport" as &'static [u8],
+                b"websocket" as &'static [u8],
+            ),
+            (b":scheme", b"https", b"http"),
+            (b":authority", b"example.test", b"other.test"),
+            (b":path", b"/one", b"/two"),
+            (b":status", b"200", b"204"),
+        ] {
+            let duplicate = decode_fields([field(name, first), field(name, second)])
+                .await
+                .expect_err("duplicate pseudo header");
+            assert_h3_error(
+                duplicate,
+                &format!(
+                    "duplicate pseudo-header field with name {:?}",
+                    Bytes::from_static(name)
+                ),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_reports_parse_errors_for_pseudo_and_regular_fields() {
+        let invalid_method = decode_fields([field(b":method", b"bad method")])
+            .await
+            .expect_err("invalid method");
+        assert_h3_error(invalid_method, "invalid HTTP method");
+
+        let invalid_scheme = decode_fields([field(b":scheme", b"://")])
+            .await
+            .expect_err("invalid scheme");
+        assert_h3_error(invalid_scheme, "invalid scheme");
+
+        let invalid_authority = decode_fields([field(b":authority", b"bad authority")])
+            .await
+            .expect_err("invalid authority");
+        assert_h3_error(invalid_authority, "invalid uri character");
+
+        let invalid_path = decode_fields([field(b":path", b"bad path")])
+            .await
+            .expect_err("invalid path");
+        assert_h3_error(invalid_path, "invalid uri character");
+
+        let invalid_header_name = decode_fields([field(b"bad header", b"value")])
+            .await
+            .expect_err("invalid header name");
+        assert_h3_error(invalid_header_name, "invalid HTTP header name");
+
+        let invalid_header_value = decode_fields([field(b"x-test", b"bad\nvalue")])
+            .await
+            .expect_err("invalid header value");
+        assert_h3_error(invalid_header_value, "failed to parse header value");
+    }
+
+    #[tokio::test]
+    async fn decode_propagates_source_stream_error() {
+        let error = FieldSection::decode_from(stream::iter([Err(StreamError::Reset {
+            code: 42u32.into(),
+        })]))
+        .await
+        .expect_err("source stream error");
+
+        assert!(matches!(error, StreamError::Reset { code } if code.into_inner() == 42));
+    }
+
+    #[tokio::test]
+    async fn malformed_header_section_display_and_source_are_structured() {
+        let error = decode_fields([field(b":protocol", &[0xff])])
+            .await
+            .expect_err("invalid protocol token");
+        let StreamError::H3 { source } = error else {
+            panic!("expected stream-scope H3 error");
+        };
+        assert_eq!(source.to_string(), "invalid :protocol pseudo-header token");
+        assert!(std::error::Error::source(source.as_ref()).is_some());
+
+        let error = decode_fields([field(b":status", b"not-a-status")])
+            .await
+            .expect_err("invalid status");
+        let StreamError::H3 { source } = error else {
+            panic!("expected stream-scope H3 error");
+        };
+        assert_eq!(source.to_string(), "invalid status code");
+        assert!(std::error::Error::source(source.as_ref()).is_none());
     }
 }

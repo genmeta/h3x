@@ -387,6 +387,22 @@ mod tests {
     }
 
     #[test]
+    fn non_boolean_settings_accept_arbitrary_values_and_validation_error_has_no_source() {
+        let custom_setting = Setting::new(VarInt::from_u32(0x21), VarInt::MAX);
+        assert!(custom_setting.check().is_ok());
+
+        let error = Setting::new(H3Datagram::ID, VarInt::from_u32(42))
+            .check()
+            .expect_err("invalid boolean setting must fail");
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(error.code(), Code::H3_SETTINGS_ERROR);
+        assert_eq!(
+            error.to_string(),
+            "boolean setting 51 must have value 0 or 1, got 42",
+        );
+    }
+
+    #[test]
     fn settings_accessors_iterators_and_extension_paths() {
         let mut settings = Settings::default();
         assert_eq!(settings.get(VarInt::from_u32(0x1234)), None);
@@ -488,6 +504,49 @@ mod tests {
             .await
             .expect("owned settings encoding into buflist is infallible");
         assert_eq!(frame.r#type(), Frame::SETTINGS_FRAME_TYPE);
+    }
+
+    #[tokio::test]
+    async fn empty_settings_encode_to_zero_length_frame_and_decode_to_default() {
+        let settings = Settings::default();
+
+        let frame = BufList::new()
+            .encode(&settings)
+            .await
+            .expect("settings encoding into buflist is infallible");
+        assert_eq!(frame.r#type(), Frame::SETTINGS_FRAME_TYPE);
+        assert_eq!(frame.length(), VarInt::from_u32(0));
+
+        let decoded = frame
+            .into_payload()
+            .decode::<Settings>()
+            .await
+            .expect("empty settings payload decodes");
+        assert_eq!(decoded, settings);
+    }
+
+    #[tokio::test]
+    async fn settings_decode_uses_last_value_for_duplicate_identifiers() {
+        let mut encoded = BufList::new();
+        encoded
+            .encode_one(MaxFieldSectionSize::setting(VarInt::from_u32(1024)))
+            .await
+            .expect("setting encoding into buflist is infallible");
+        encoded
+            .encode_one(MaxFieldSectionSize::setting(VarInt::from_u32(2048)))
+            .await
+            .expect("setting encoding into buflist is infallible");
+
+        let decoded = encoded
+            .decode::<Settings>()
+            .await
+            .expect("settings payload decodes");
+
+        assert_eq!(
+            decoded.max_field_section_size(),
+            Some(VarInt::from_u32(2048)),
+        );
+        assert_eq!(decoded.into_iter().count(), 1);
     }
 
     #[tokio::test]

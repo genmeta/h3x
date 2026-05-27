@@ -493,3 +493,241 @@ impl<S: quic::StopStream + Unpin> quic::StopStream for PeekableStreamReader<S> {
         Pin::new(&mut self.get_mut().stream).poll_stop(cx, code)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{future::poll_fn, pin::Pin};
+
+    use bytes::Bytes;
+    use futures::{StreamExt, stream};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+    use super::*;
+    use crate::quic::{GetStreamId, StopStream, StreamError};
+
+    fn byte_stream(
+        chunks: impl IntoIterator<Item = &'static [u8]>,
+    ) -> impl Stream<Item = Result<Bytes, StreamError>> {
+        stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, StreamError>(Bytes::from_static(chunk))),
+        )
+    }
+
+    #[tokio::test]
+    async fn stream_reader_accessors_mapping_and_io_paths() {
+        let mut reader = StreamReader::new(byte_stream([&b""[..], &b"hello"[..], &b" world"[..]]));
+        assert_eq!(reader.stream().size_hint(), (3, Some(3)));
+        assert_eq!(reader.stream_mut().size_hint(), (3, Some(3)));
+
+        let mut pinned = Pin::new(&mut reader);
+        assert!(pinned.as_mut().has_remaining().await.unwrap());
+
+        let mut prefix = [0; 2];
+        pinned
+            .as_mut()
+            .read_exact(&mut prefix)
+            .await
+            .expect("partial async read should succeed");
+        assert_eq!(&prefix, b"he");
+
+        assert_eq!(
+            pinned.as_mut().fill_buf().await.expect("fill buffered"),
+            b"llo"
+        );
+        pinned.as_mut().consume(3);
+
+        assert_eq!(
+            pinned
+                .as_mut()
+                .next()
+                .await
+                .expect("remaining chunk should be yielded")
+                .unwrap(),
+            Bytes::from_static(b" world")
+        );
+        assert!(
+            !pinned
+                .as_mut()
+                .has_remaining()
+                .await
+                .expect("eof should be clean")
+        );
+
+        let mapped = StreamReader::new(byte_stream([&b"a"[..]])).map_stream(|inner| inner);
+        let mut mapped = Box::pin(mapped);
+        assert_eq!(
+            mapped
+                .as_mut()
+                .next()
+                .await
+                .expect("mapped stream should yield")
+                .unwrap(),
+            Bytes::from_static(b"a")
+        );
+
+        let inner = StreamReader::new(byte_stream([&b"inner"[..]])).into_inner();
+        assert_eq!(inner.size_hint(), (1, Some(1)));
+    }
+
+    #[tokio::test]
+    async fn fixed_length_reader_limits_renews_and_reports_incomplete_reads() {
+        let mut reader = FixedLengthReader::new(tokio::io::empty(), 0);
+        let mut empty = [0; 1];
+        let read = reader
+            .read(&mut empty)
+            .await
+            .expect("zero remaining reads eof");
+        assert_eq!(read, 0);
+
+        let mut reader = FixedLengthReader::new(tokio::io::empty(), 1);
+        let err = reader
+            .read_exact(&mut empty)
+            .await
+            .expect_err("premature eof should be incomplete");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+
+        let mut reader = FixedLengthReader::new(tokio::io::BufReader::new(&b"abcdef"[..]), 4);
+        let mut buf = [0; 8];
+        let read = reader.read(&mut buf).await.expect("bounded read");
+        assert_eq!(read, 4);
+        assert_eq!(&buf[..read], b"abcd");
+        assert_eq!(reader.read(&mut buf).await.expect("remaining exhausted"), 0);
+
+        Pin::new(&mut reader).renew(2);
+        assert_eq!(reader.fill_buf().await.expect("renewed fill buffer"), b"ef");
+        reader.consume(1);
+        assert_eq!(
+            reader.fill_buf().await.expect("remaining after consume"),
+            b"f"
+        );
+
+        let stream = reader.stream_mut();
+        assert_eq!(stream.buffer().len(), 1);
+
+        let mut pinned = Pin::new(&mut reader);
+        let stream = pinned.as_mut().project_stream_mut();
+        assert_eq!(stream.buffer().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fixed_length_streams_slice_owned_and_borrowed_stream_readers() {
+        let stream_reader = StreamReader::new(byte_stream([&b"ab"[..], &b"cdef"[..]]));
+        let mut reader = Box::pin(FixedLengthReader::new(stream_reader, 5));
+
+        assert_eq!(
+            reader
+                .as_mut()
+                .next()
+                .await
+                .expect("first chunk")
+                .expect("first chunk ok"),
+            Bytes::from_static(b"ab")
+        );
+        assert_eq!(
+            reader
+                .as_mut()
+                .next()
+                .await
+                .expect("second chunk")
+                .expect("second chunk ok"),
+            Bytes::from_static(b"cde")
+        );
+        assert!(reader.as_mut().next().await.is_none());
+
+        let mut stream_reader = StreamReader::new(byte_stream([&b"12"[..], &b"345"[..]]));
+        let mut borrowed = Box::pin(FixedLengthReader::new(&mut stream_reader, 4));
+        assert_eq!(
+            borrowed
+                .as_mut()
+                .next()
+                .await
+                .expect("borrowed first chunk")
+                .expect("borrowed first chunk ok"),
+            Bytes::from_static(b"12")
+        );
+        assert_eq!(
+            borrowed
+                .as_mut()
+                .next()
+                .await
+                .expect("borrowed second chunk")
+                .expect("borrowed second chunk ok"),
+            Bytes::from_static(b"34")
+        );
+        assert!(borrowed.as_mut().next().await.is_none());
+
+        let mut incomplete = Box::pin(FixedLengthReader::new(
+            StreamReader::new(byte_stream([&b"x"[..]])),
+            2,
+        ));
+        assert_eq!(
+            incomplete
+                .as_mut()
+                .next()
+                .await
+                .expect("available byte")
+                .expect("available byte ok"),
+            Bytes::from_static(b"x")
+        );
+        assert!(
+            incomplete
+                .as_mut()
+                .next()
+                .await
+                .expect("incomplete item")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn peekable_stream_reader_reset_commit_flush_and_traits() {
+        let stream_id = VarInt::from_u32(91);
+        let stop_code = VarInt::from_u32(92);
+        let (mock_reader, _mock_writer) = crate::quic::test::mock_stream_pair(stream_id);
+        let mut reader = Box::pin(PeekableStreamReader::new(StreamReader::new(mock_reader)));
+
+        assert_eq!(
+            poll_fn(|cx| reader.as_mut().poll_stream_id(cx))
+                .await
+                .expect("stream id"),
+            stream_id
+        );
+        poll_fn(|cx| reader.as_mut().poll_stop(cx, stop_code))
+            .await
+            .expect("stop should delegate");
+
+        let mut reader = Box::pin(PeekableStreamReader::new(StreamReader::new(byte_stream([
+            &b"abc"[..],
+            &b"def"[..],
+        ]))));
+        assert_eq!(reader.as_mut().fill_buf().await.unwrap(), b"abc");
+        reader.as_mut().consume(2);
+        reader.as_mut().reset();
+        assert_eq!(reader.as_mut().fill_buf().await.unwrap(), b"abc");
+        reader.as_mut().consume(2);
+        reader.as_mut().commit();
+        assert_eq!(reader.as_mut().fill_buf().await.unwrap(), b"c");
+
+        let mut one = [0; 1];
+        reader
+            .as_mut()
+            .read_exact(&mut one)
+            .await
+            .expect("peekable async read should consume committed byte");
+        assert_eq!(&one, b"c");
+
+        assert_eq!(reader.as_mut().fill_buf().await.unwrap(), b"def");
+        reader.as_mut().consume(1);
+        let mut plain = Pin::into_inner(reader).into_stream_reader();
+        assert_eq!(
+            Pin::new(&mut plain)
+                .next()
+                .await
+                .expect("flushed buffered tail")
+                .unwrap(),
+            Bytes::from_static(b"ef")
+        );
+    }
+}

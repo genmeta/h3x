@@ -666,12 +666,12 @@ mod tests {
         collections::VecDeque,
         io::Cursor,
         pin::Pin,
-        sync::Arc,
+        sync::{Arc, Mutex},
         task::{Context, Poll},
     };
 
     use bytes::Bytes;
-    use futures::Sink;
+    use futures::{Sink, stream};
     use tokio::io::AsyncWrite;
 
     use crate::{
@@ -680,12 +680,15 @@ mod tests {
         dhttp::settings::Settings,
         error::{Code, H3ConnectionError},
         qpack::{
+            algorithm::{Algorithm, CompressOutput},
+            decoder::DecoderInstruction,
             encoder::{
-                EncoderInstruction, EncoderState, QPackDecoderStreamError, QPackEncoderError,
+                Encoder, EncoderInstruction, EncoderState, QPackDecoderStreamError,
+                QPackEncoderError,
             },
-            field::{FieldLine, FieldLineRepresentation},
+            field::{EncodedFieldSectionPrefix, FieldLine, FieldLineRepresentation},
         },
-        quic,
+        quic::{self, GetStreamId},
         varint::VarInt,
     };
 
@@ -714,12 +717,19 @@ mod tests {
     }
 
     fn settings_with_capacity(capacity: u32) -> Arc<Settings> {
+        settings_with_capacity_and_blocked_streams(capacity, 10)
+    }
+
+    fn settings_with_capacity_and_blocked_streams(
+        capacity: u32,
+        blocked_streams: u32,
+    ) -> Arc<Settings> {
         let mut settings = Settings::default();
         settings.set(crate::qpack::settings::QpackMaxTableCapacity::setting(
             VarInt::from_u32(capacity),
         ));
         settings.set(crate::qpack::settings::QpackBlockedStreams::setting(
-            VarInt::from_u32(10),
+            VarInt::from_u32(blocked_streams),
         ));
         Arc::new(settings)
     }
@@ -800,6 +810,115 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingInstructionSink {
+        instructions: Arc<Mutex<Vec<EncoderInstruction>>>,
+        flushes: Arc<Mutex<usize>>,
+    }
+
+    impl RecordingInstructionSink {
+        fn instructions(&self) -> Vec<EncoderInstruction> {
+            self.instructions
+                .lock()
+                .expect("instruction lock is not poisoned")
+                .clone()
+        }
+
+        fn flushes(&self) -> usize {
+            *self.flushes.lock().expect("flush lock is not poisoned")
+        }
+    }
+
+    impl Sink<EncoderInstruction> for RecordingInstructionSink {
+        type Error = StreamError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: EncoderInstruction) -> Result<(), Self::Error> {
+            self.instructions
+                .lock()
+                .expect("instruction lock is not poisoned")
+                .push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            *self.flushes.lock().expect("flush lock is not poisoned") += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct TestStreamId(u32);
+
+    impl GetStreamId for TestStreamId {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(VarInt::from_u32(self.0)))
+        }
+    }
+
+    #[derive(Default)]
+    struct MayBlockProbeAlgorithm {
+        max_referenced_index: Option<u64>,
+        observed_may_block: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl MayBlockProbeAlgorithm {
+        fn with_max_referenced_index(max_referenced_index: u64) -> Self {
+            Self {
+                max_referenced_index: Some(max_referenced_index),
+                observed_may_block: Arc::default(),
+            }
+        }
+
+        fn observed_may_block(&self) -> Vec<bool> {
+            self.observed_may_block
+                .lock()
+                .expect("may_block lock is not poisoned")
+                .clone()
+        }
+    }
+
+    impl Algorithm for MayBlockProbeAlgorithm {
+        async fn compress(
+            &self,
+            _state: &mut EncoderState,
+            _entries: impl IntoIterator<Item = FieldLine> + Send,
+            may_block: bool,
+        ) -> CompressOutput {
+            self.observed_may_block
+                .lock()
+                .expect("may_block lock is not poisoned")
+                .push(may_block);
+            CompressOutput {
+                prefix: EncodedFieldSectionPrefix {
+                    encoded_insert_count: 0,
+                    sign: false,
+                    delta_base: 0,
+                },
+                representations: Vec::new(),
+                max_referenced_index: self.max_referenced_index,
+            }
+        }
+    }
+
     async fn encode_decode_roundtrip(
         instruction: EncoderInstruction,
     ) -> Result<EncoderInstruction, StreamError> {
@@ -876,6 +995,66 @@ mod tests {
                 .expect("instruction should roundtrip");
             assert_eq!(decoded, instruction);
         }
+    }
+
+    #[tokio::test]
+    async fn encoder_instruction_encodes_huffman_and_static_flags_on_wire() {
+        let mut sink = RecordingSink::default();
+        EncoderInstruction::InsertWithNameReference {
+            is_static: true,
+            name_index: 10,
+            huffman: true,
+            value: Bytes::from_static(b"abc"),
+        }
+        .encode_into(&mut sink)
+        .await
+        .expect("instruction should encode");
+
+        assert_eq!(sink.bytes[0], 0b1100_1010);
+        assert_eq!(sink.bytes[1] & 0b1000_0000, 0b1000_0000);
+
+        let decoded = EncoderInstruction::decode_from(Cursor::new(sink.bytes))
+            .await
+            .expect("instruction should decode");
+        assert_eq!(
+            decoded,
+            EncoderInstruction::InsertWithNameReference {
+                is_static: true,
+                name_index: 10,
+                huffman: true,
+                value: Bytes::from_static(b"abc"),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn encoder_instruction_encodes_literal_name_huffman_flags_independently() {
+        let mut sink = RecordingSink::default();
+        EncoderInstruction::InsertWithLiteralName {
+            name_huffman: true,
+            name: Bytes::from_static(b"abc"),
+            value_huffman: false,
+            value: Bytes::from_static(b"xyz"),
+        }
+        .encode_into(&mut sink)
+        .await
+        .expect("instruction should encode");
+
+        assert_eq!(sink.bytes[0] & 0b1110_0000, 0b0110_0000);
+        assert_eq!(sink.bytes[3] & 0b1000_0000, 0);
+
+        let decoded = EncoderInstruction::decode_from(Cursor::new(sink.bytes))
+            .await
+            .expect("instruction should decode");
+        assert_eq!(
+            decoded,
+            EncoderInstruction::InsertWithLiteralName {
+                name_huffman: true,
+                name: Bytes::from_static(b"abc"),
+                value_huffman: false,
+                value: Bytes::from_static(b"xyz"),
+            }
+        );
     }
 
     #[test]
@@ -961,6 +1140,19 @@ mod tests {
 
         assert_eq!(state.dynamic_table.known_received_count, 4);
         assert!(!state.blocking_streams.contains_key(&7));
+    }
+
+    #[test]
+    fn on_section_acknowledgment_removes_only_acknowledged_section() {
+        let mut state = EncoderState::new(settings_with_capacity(256));
+        state.blocking_streams.insert(7, VecDeque::from([1, 3]));
+
+        state
+            .on_section_acknowledgment(7)
+            .expect("section acknowledgment should succeed");
+
+        assert_eq!(state.blocking_streams.get(&7), Some(&VecDeque::from([3])));
+        assert_eq!(state.table_known_received_count(), 2);
     }
 
     // --- Table management tests ---
@@ -1179,6 +1371,179 @@ mod tests {
                 value: Bytes::from_static(b"value"),
             })
         );
+    }
+
+    #[test]
+    fn evict_entry_removes_only_the_evicted_duplicate_index() {
+        let mut state = EncoderState::new(settings_with_capacity(256));
+        state
+            .set_max_table_capacity(256)
+            .expect("set capacity failed");
+        let first_index = state
+            .insert_with_literal_name(
+                false,
+                Bytes::from_static(b"x-name"),
+                false,
+                Bytes::from_static(b"value"),
+            )
+            .expect("insert failed");
+        let duplicated_index = state.duplicate(first_index).expect("duplicate failed");
+        state.dynamic_table.known_received_count = 1;
+
+        let (evicted_index, evicted_entry) = state.evict_entry();
+
+        assert_eq!(evicted_index, first_index);
+        assert_eq!(
+            evicted_entry,
+            FieldLine {
+                name: Bytes::from_static(b"x-name"),
+                value: Bytes::from_static(b"value"),
+            }
+        );
+        assert_eq!(
+            state
+                .find_name(&Bytes::from_static(b"x-name"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            state
+                .find_name(&Bytes::from_static(b"x-name"))
+                .unwrap()
+                .contains(&duplicated_index)
+        );
+        assert_eq!(
+            state
+                .find_value(&Bytes::from_static(b"value"))
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![duplicated_index]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_settings_initializes_capacity_and_flushes_instruction() {
+        let encoder_sink = RecordingInstructionSink::default();
+        let recorded = encoder_sink.clone();
+        let encoder = Encoder::new(
+            settings_with_capacity(0),
+            encoder_sink,
+            stream::empty::<Result<DecoderInstruction, StreamError>>(),
+        );
+
+        encoder.apply_settings(settings_with_capacity(96)).await;
+
+        assert_eq!(encoder.state.lock().await.table_capacity(), 96);
+        assert_eq!(
+            recorded.instructions(),
+            vec![EncoderInstruction::SetDynamicTableCapacity { capacity: 96 }]
+        );
+        assert_eq!(recorded.flushes(), 1);
+        assert!(encoder.state.lock().await.pending_instructions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn encode_tracks_blocking_sections_from_algorithm_output() {
+        let encoder = Encoder::new(
+            settings_with_capacity_and_blocked_streams(128, 1),
+            RecordingInstructionSink::default(),
+            stream::empty::<Result<DecoderInstruction, StreamError>>(),
+        );
+        let algorithm = MayBlockProbeAlgorithm::with_max_referenced_index(4);
+
+        encoder
+            .encode(Vec::new(), &algorithm, TestStreamId(11))
+            .await
+            .expect("header section should encode");
+
+        assert_eq!(algorithm.observed_may_block(), vec![true]);
+        assert_eq!(
+            encoder.state.lock().await.blocking_streams.get(&11),
+            Some(&VecDeque::from([4]))
+        );
+    }
+
+    #[tokio::test]
+    async fn encode_disallows_new_blocking_streams_after_peer_limit() {
+        let encoder = Encoder::new(
+            settings_with_capacity_and_blocked_streams(128, 1),
+            RecordingInstructionSink::default(),
+            stream::empty::<Result<DecoderInstruction, StreamError>>(),
+        );
+        {
+            let mut state = encoder.state.lock().await;
+            state.blocking_streams.insert(1, VecDeque::from([0]));
+        }
+        let algorithm = MayBlockProbeAlgorithm::default();
+
+        encoder
+            .encode(Vec::new(), &algorithm, TestStreamId(2))
+            .await
+            .expect("header section should encode");
+        encoder
+            .encode(Vec::new(), &algorithm, TestStreamId(1))
+            .await
+            .expect("header section should encode");
+
+        assert_eq!(algorithm.observed_may_block(), vec![false, true]);
+    }
+
+    #[tokio::test]
+    async fn receive_instruction_applies_decoder_stream_state_changes() {
+        let encoder = Encoder::new(
+            settings_with_capacity(128),
+            RecordingInstructionSink::default(),
+            stream::iter([
+                Ok(DecoderInstruction::SectionAcknowledgment { stream_id: 7 }),
+                Ok(DecoderInstruction::StreamCancellation { stream_id: 8 }),
+                Ok(DecoderInstruction::InsertCountIncrement { increment: 1 }),
+            ]),
+        );
+        {
+            let mut state = encoder.state.lock().await;
+            state
+                .set_max_table_capacity(128)
+                .expect("set capacity failed");
+            state
+                .insert_with_literal_name(
+                    false,
+                    Bytes::from_static(b"x-name"),
+                    false,
+                    Bytes::from_static(b"value"),
+                )
+                .expect("insert failed");
+            state
+                .insert_with_literal_name(
+                    false,
+                    Bytes::from_static(b"x-name-2"),
+                    false,
+                    Bytes::from_static(b"value-2"),
+                )
+                .expect("insert failed");
+            state.blocking_streams.insert(7, VecDeque::from([0]));
+            state.blocking_streams.insert(8, VecDeque::from([0]));
+        }
+
+        encoder
+            .receive_instruction()
+            .await
+            .expect("section acknowledgment should be accepted");
+        encoder
+            .receive_instruction()
+            .await
+            .expect("stream cancellation should be accepted");
+        encoder
+            .receive_instruction()
+            .await
+            .expect("insert count increment should be accepted");
+
+        let state = encoder.state.lock().await;
+        assert!(!state.blocking_streams.contains_key(&7));
+        assert!(!state.blocking_streams.contains_key(&8));
+        assert_eq!(state.table_known_received_count(), 2);
     }
 
     // --- Edge case tests ---
