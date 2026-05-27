@@ -83,6 +83,8 @@ mod tests {
     fn qpack_settings_boundaries_and_ids() {
         assert_eq!(QpackMaxTableCapacity::ID, VarInt::from_u32(0x01));
         assert_eq!(QpackBlockedStreams::ID, VarInt::from_u32(0x07));
+        assert_eq!(QpackMaxTableCapacity.id(), QpackMaxTableCapacity::ID);
+        assert_eq!(QpackBlockedStreams.id(), QpackBlockedStreams::ID);
         assert_eq!(QpackMaxTableCapacity::DEFAULT, VarInt::from_u32(0));
         assert_eq!(QpackBlockedStreams::DEFAULT, VarInt::from_u32(0));
         assert_eq!(

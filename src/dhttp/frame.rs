@@ -339,9 +339,10 @@ mod tests {
 
     use futures::{
         Sink, SinkExt,
+        future::poll_fn,
         stream::{self, Stream, StreamExt},
     };
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     use tracing::Instrument;
 
     use super::*;
@@ -440,7 +441,9 @@ mod tests {
     fn known_frame_type_constants() {
         assert_eq!(Frame::DATA_FRAME_TYPE, VarInt::from_u32(0x00));
         assert_eq!(Frame::HEADERS_FRAME_TYPE, VarInt::from_u32(0x01));
+        assert_eq!(Frame::CANCEL_PUSH_FRAME_TYPE, VarInt::from_u32(0x03));
         assert_eq!(Frame::SETTINGS_FRAME_TYPE, VarInt::from_u32(0x04));
+        assert_eq!(Frame::PUSH_PROMISE_FRAME_TYPE, VarInt::from_u32(0x05));
         assert_eq!(Frame::GOAWAY_FRAME_TYPE, VarInt::from_u32(0x07));
         assert_eq!(Frame::MAX_PUSH_ID_FRAME_TYPE, VarInt::from_u32(0x0d));
     }
@@ -474,8 +477,68 @@ mod tests {
     #[test]
     fn map_preserves_frame_meta() {
         let frame = Frame::new(Frame::HEADERS_FRAME_TYPE, Bytes::from_static(b"hello")).unwrap();
-        let payload_len = frame.map(|payload| payload.len() * 2).into_payload();
-        assert_eq!(payload_len, 10);
+        let mapped = frame.map(|payload| payload.len() * 2);
+        assert_eq!(mapped.r#type(), Frame::HEADERS_FRAME_TYPE);
+        assert_eq!(mapped.length().into_inner(), 5);
+        assert_eq!(mapped.into_payload(), 10);
+    }
+
+    #[tokio::test]
+    async fn async_write_updates_length_and_delegates_io() {
+        let (payload, mut reader) = tokio::io::duplex(64);
+        let mut frame = Frame {
+            r#type: Frame::DATA_FRAME_TYPE,
+            length: VarInt::from_u32(0),
+            payload,
+        };
+
+        frame.write_all(b"abc").await.expect("payload write");
+        assert_eq!(frame.length().into_inner(), 3);
+        AsyncWriteExt::flush(&mut frame)
+            .await
+            .expect("payload flush");
+        AsyncWriteExt::shutdown(&mut frame)
+            .await
+            .expect("payload shutdown");
+
+        let mut payload = Vec::new();
+        reader
+            .read_to_end(&mut payload)
+            .await
+            .expect("payload forwarded");
+        assert_eq!(payload, b"abc");
+    }
+
+    #[tokio::test]
+    async fn async_write_rejects_frame_payload_overflow() {
+        let payload = tokio::io::sink();
+        let mut frame = Frame {
+            r#type: Frame::DATA_FRAME_TYPE,
+            length: VarInt::MAX,
+            payload,
+        };
+
+        let error = frame
+            .write_all(b"x")
+            .await
+            .expect_err("payload beyond varint max is invalid");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(
+            EncodeError::try_from(error),
+            Ok(EncodeError::FramePayloadTooLarge)
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_buf_read_delegates_to_payload() {
+        let mut payload = BufList::new();
+        payload.write(Bytes::from_static(b"abc"));
+        let mut frame = Frame::new(Frame::DATA_FRAME_TYPE, payload).expect("frame");
+
+        assert_eq!(frame.fill_buf().await.expect("fill buf"), b"abc");
+        frame.consume(1);
+        assert_eq!(frame.fill_buf().await.expect("fill buf"), b"bc");
     }
 
     #[tokio::test]
@@ -611,6 +674,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decode_to_buflist_collects_payload() {
+        let mut stream = StreamReader::new(to_pre_byte_stream([
+            0x01, // HEADERS
+            0x03, // len 3
+            b'a', b'b', b'c',
+        ]));
+
+        let frame = Frame::<BufList>::decode_from(&mut stream)
+            .await
+            .expect("frame");
+
+        assert_eq!(frame.r#type(), Frame::HEADERS_FRAME_TYPE);
+        assert_eq!(frame.length().into_inner(), 3);
+        let mut payload = frame.into_payload();
+        let mut decoded = Vec::new();
+        while payload.has_remaining() {
+            let chunk = payload.chunk();
+            decoded.extend_from_slice(chunk);
+            payload.advance(chunk.len());
+        }
+        assert_eq!(decoded, b"abc");
+    }
+
+    #[tokio::test]
     async fn sink_updates_length_and_reports_overflow() {
         let (sink, chunks) = SinkRecorder::new();
         let mut frame = Frame {
@@ -622,6 +709,7 @@ mod tests {
         frame.send(Bytes::from_static(b"abc")).await.unwrap();
         assert_eq!(frame.length().into_inner(), 3);
         assert_eq!(chunks.lock().expect("chunks lock")[0].as_ref(), b"abc");
+        frame.close().await.expect("sink close forwarded");
 
         let (sink, chunks) = SinkRecorder::new();
         let mut frame = Frame {
@@ -659,6 +747,62 @@ mod tests {
         }
         assert_eq!(chunks[0].as_ref(), b"one");
         assert_eq!(chunks[1].as_ref(), b"two");
+    }
+
+    #[derive(Debug)]
+    struct ControlPayload {
+        stream_id: VarInt,
+        stopped: Arc<Mutex<Option<VarInt>>>,
+    }
+
+    impl GetStreamId for ControlPayload {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
+        }
+    }
+
+    impl StopStream for ControlPayload {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            *self.stopped.lock().expect("stop state poisoned") = Some(code);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn control_traits_delegate_to_payload() {
+        let stopped = Arc::new(Mutex::new(None));
+        let stream_id = VarInt::from_u32(17);
+        let stop_code = VarInt::from_u32(23);
+        let mut frame = Frame {
+            r#type: Frame::DATA_FRAME_TYPE,
+            length: VarInt::from_u32(0),
+            payload: ControlPayload {
+                stream_id,
+                stopped: stopped.clone(),
+            },
+        };
+
+        assert_eq!(
+            poll_fn(|cx| Pin::new(&mut frame).poll_stream_id(cx))
+                .await
+                .expect("stream id"),
+            stream_id
+        );
+        poll_fn(|cx| Pin::new(&mut frame).poll_stop(cx, stop_code))
+            .await
+            .expect("stop");
+
+        assert_eq!(
+            *stopped.lock().expect("stop state poisoned"),
+            Some(stop_code)
+        );
     }
 
     #[tokio::test]

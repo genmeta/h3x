@@ -101,6 +101,7 @@ impl<T> Stream for Receiver<T> {
 mod tests {
     use std::time::Duration;
 
+    use futures::{FutureExt, StreamExt};
     use tokio::time::timeout;
     use tracing::Instrument;
 
@@ -177,5 +178,38 @@ mod tests {
 
         let result = timeout(Duration::from_millis(20), receiver).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn ring_channel_overflow_discards_only_oldest_item() {
+        let channel: RingChannel<i32> = RingChannel::new(2);
+
+        assert_eq!(channel.send(1), None);
+        assert_eq!(channel.send(2), None);
+        assert_eq!(channel.send(3), Some(1));
+
+        let receiver = channel.receive();
+        let mut receiver = std::pin::pin!(receiver);
+        assert_eq!(receiver.as_mut().next().await, Some(2));
+        assert_eq!(receiver.as_mut().next().await, Some(3));
+        assert_eq!(receiver.as_mut().next().now_or_never(), None);
+    }
+
+    #[tokio::test]
+    async fn pending_receiver_recovers_from_consumed_notification() {
+        let channel: RingChannel<i32> = RingChannel::new(1);
+        let pending_receiver = channel.receive();
+        assert_eq!(pending_receiver.now_or_never(), None);
+
+        let waiting_receiver = channel.receive();
+        let mut waiting_receiver = std::pin::pin!(waiting_receiver);
+        assert_eq!(waiting_receiver.as_mut().next().now_or_never(), None);
+
+        channel.send(1);
+        let consumed_by_other_receiver = channel.receive().await;
+        assert_eq!(consumed_by_other_receiver, 1);
+
+        channel.send(2);
+        assert_eq!(waiting_receiver.as_mut().next().await, Some(2));
     }
 }

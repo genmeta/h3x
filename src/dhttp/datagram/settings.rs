@@ -53,4 +53,20 @@ mod tests {
             Some(VarInt::from_u32(1))
         );
     }
+
+    #[test]
+    fn h3_datagram_exposes_id_and_treats_only_one_as_enabled() {
+        assert_eq!(H3Datagram.id(), H3Datagram::ID);
+
+        let mut settings = Settings::default();
+        settings.set(H3Datagram::setting(false));
+        assert!(!settings.h3_datagram());
+        assert_eq!(
+            settings.get(VarInt::from_u32(0x33)),
+            Some(VarInt::from_u32(0))
+        );
+
+        settings.set(Setting::new(H3Datagram::ID, VarInt::from_u32(2)));
+        assert!(!settings.h3_datagram());
+    }
 }

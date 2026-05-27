@@ -193,6 +193,42 @@ mod tests {
     }
 
     #[test]
+    fn default_matches_new_empty_table() {
+        let table = DynamicTable::default();
+
+        assert_eq!(table.inserted_count, 0);
+        assert_eq!(table.dropped_count, 0);
+        assert_eq!(table.known_received_count, 0);
+        assert_eq!(table.size, 0);
+        assert_eq!(table.capacity, 0);
+        assert!(table.is_empty());
+        assert_eq!(table.entries().len(), 0);
+    }
+
+    #[test]
+    fn get_mut_returns_none_for_evicted_absolute_index() {
+        let mut table = DynamicTable::new();
+        table.capacity = 128;
+        table.index(field_line(b"header-1", b"value-1"));
+        table.index(field_line(b"header-2", b"value-2"));
+        table.increment_known_received_count(1);
+        table.evict();
+
+        assert!(table.get_mut(0).is_none());
+        assert!(table.get_mut(1).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "No evictable entry exist")]
+    fn evict_panics_when_no_entry_is_acknowledged() {
+        let mut table = DynamicTable::new();
+        table.capacity = 64;
+        table.index(field_line(b"header-1", b"value-1"));
+
+        table.evict();
+    }
+
+    #[test]
     #[should_panic(expected = "Dynamic table size exceeded its capacity")]
     fn index_panics_when_capacity_is_exceeded() {
         let mut table = DynamicTable::new();

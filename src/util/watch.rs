@@ -144,9 +144,9 @@ impl<T: Clone> Stream for Watcher<T> {
 
 #[cfg(test)]
 mod tests {
-    use futures::StreamExt;
+    use futures::{FutureExt, StreamExt};
 
-    use super::Watch;
+    use super::{Get, Watch};
 
     #[tokio::test]
     async fn set_before_watch_observes_current_value_immediately() {
@@ -208,5 +208,60 @@ mod tests {
         .expect("watch stream should yield a value");
 
         assert_eq!(value, 3);
+    }
+
+    #[test]
+    fn peek_and_set_return_previous_value() {
+        let watch = Watch::new();
+
+        assert_eq!(watch.peek(), None);
+        assert_eq!(watch.set("first"), None);
+        assert_eq!(watch.peek(), Some("first"));
+        assert_eq!(watch.set("second"), Some("first"));
+        assert_eq!(watch.peek(), Some("second"));
+    }
+
+    #[test]
+    fn locked_value_get_set_and_replace_update_shared_state() {
+        let watch = Watch::new();
+
+        {
+            let mut value = watch.lock();
+            assert_eq!(value.get(), None);
+            value.set(1);
+            assert_eq!(value.get(), Some(&1));
+            assert_eq!(value.replace(2), Some(1));
+            assert_eq!(value.get(), Some(&2));
+        }
+
+        assert_eq!(watch.peek(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn watcher_observes_sequential_updates_when_polled_between_sets() {
+        let watch = Watch::new();
+        let watcher = watch.watch();
+        let mut watcher = std::pin::pin!(watcher);
+
+        watch.set("first");
+        assert_eq!(watcher.as_mut().next().await, Some("first"));
+
+        watch.set("second");
+        assert_eq!(watcher.as_mut().next().await, Some("second"));
+        assert_eq!(watcher.as_mut().next().now_or_never(), None);
+    }
+
+    #[tokio::test]
+    async fn get_future_returns_latest_value_after_notification() {
+        let watch = Watch::new();
+        let mut get = Box::pin(Get {
+            notified: watch.notify.clone().notified_owned(),
+            state: watch.state.clone(),
+        });
+
+        assert_eq!(get.as_mut().now_or_never(), None);
+        watch.set(5);
+
+        assert_eq!(get.await, Some(5));
     }
 }

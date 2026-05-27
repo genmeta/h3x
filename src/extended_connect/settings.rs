@@ -53,4 +53,20 @@ mod tests {
             Some(VarInt::from_u32(1))
         );
     }
+
+    #[test]
+    fn enable_connect_protocol_exposes_id_and_treats_only_one_as_enabled() {
+        assert_eq!(EnableConnectProtocol.id(), EnableConnectProtocol::ID);
+
+        let mut settings = Settings::default();
+        settings.set(EnableConnectProtocol::setting(false));
+        assert!(!settings.enable_connect_protocol());
+        assert_eq!(
+            settings.get(VarInt::from_u32(0x08)),
+            Some(VarInt::from_u32(0))
+        );
+
+        settings.set(Setting::new(EnableConnectProtocol::ID, VarInt::from_u32(2)));
+        assert!(!settings.enable_connect_protocol());
+    }
 }

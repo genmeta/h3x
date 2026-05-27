@@ -97,3 +97,60 @@ impl<T: Clone> Future for Get<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use futures::FutureExt;
+
+    use super::*;
+
+    #[test]
+    fn default_starts_unset_and_set_stores_value() {
+        let value = SetOnce::default();
+
+        assert!(!value.is_set());
+        assert_eq!(value.peek(), None);
+
+        assert_eq!(value.set(7), Ok(()));
+        assert!(value.is_set());
+        assert_eq!(value.peek(), Some(7));
+        assert_eq!(value.get().now_or_never(), Some(Some(7)));
+    }
+
+    #[test]
+    fn second_set_returns_rejected_value_without_replacing_existing() {
+        let value = SetOnce::new();
+
+        assert_eq!(value.set("first"), Ok(()));
+        assert_eq!(value.set("second"), Err("second"));
+        assert_eq!(value.peek(), Some("first"));
+    }
+
+    #[test]
+    fn set_with_does_not_call_factory_after_value_is_set() {
+        let value = SetOnce::new();
+        assert_eq!(value.set(1), Ok(()));
+
+        let mut called = false;
+        let factory = || {
+            called = true;
+            2
+        };
+
+        assert!(value.set_with(factory).is_err());
+        assert!(!called);
+        assert_eq!(value.peek(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn pending_get_observes_value_set_from_clone() {
+        let value = SetOnce::new();
+        assert_eq!(value.get().now_or_never(), None);
+
+        let setter = value.clone();
+        let get = value.get();
+
+        assert_eq!(setter.set(11), Ok(()));
+        assert_eq!(get.await, Some(11));
+    }
+}

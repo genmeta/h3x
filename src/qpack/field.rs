@@ -149,3 +149,89 @@ impl From<StatusCode> for FieldLine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use http::{
+        Method, StatusCode,
+        header::{HeaderName, HeaderValue},
+        uri::{Authority, PathAndQuery, Scheme},
+    };
+
+    use super::{FieldLine, Protocol, PseudoHeaders};
+
+    #[test]
+    fn protocol_validates_utf8_and_exposes_original_token() {
+        let protocol = Protocol::try_from(Bytes::from_static(b"webtransport"))
+            .expect("ASCII protocol token should be valid");
+
+        assert_eq!(protocol.as_bytes(), b"webtransport");
+        assert_eq!(protocol.as_str(), "webtransport");
+        assert_eq!(AsRef::<[u8]>::as_ref(&protocol), b"webtransport");
+        assert_eq!(AsRef::<str>::as_ref(&protocol), "webtransport");
+
+        let error = Protocol::try_from(Bytes::from_static(b"\xff")).expect_err("invalid UTF-8");
+        assert_eq!(error.valid_up_to(), 0);
+    }
+
+    #[test]
+    fn field_line_from_header_parts_preserves_name_value_and_size() {
+        let field = FieldLine::from((
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/dhttp"),
+        ));
+
+        assert_eq!(field.name, Bytes::from_static(b"content-type"));
+        assert_eq!(field.value, Bytes::from_static(b"application/dhttp"));
+        assert_eq!(
+            field.size(),
+            "content-type".len() as u64 + "application/dhttp".len() as u64 + 32
+        );
+    }
+
+    #[test]
+    fn field_line_from_pseudo_source_types_uses_expected_names_and_values() {
+        let method = FieldLine::from(Method::POST);
+        assert_eq!(
+            method.name,
+            Bytes::from_static(PseudoHeaders::METHOD.as_bytes())
+        );
+        assert_eq!(method.value, Bytes::from_static(b"POST"));
+
+        let scheme = FieldLine::from(Scheme::HTTPS);
+        assert_eq!(
+            scheme.name,
+            Bytes::from_static(PseudoHeaders::SCHEME.as_bytes())
+        );
+        assert_eq!(scheme.value, Bytes::from_static(b"https"));
+
+        let authority = FieldLine::from(Authority::from_static("example.com:443"));
+        assert_eq!(
+            authority.name,
+            Bytes::from_static(PseudoHeaders::AUTHORITY.as_bytes())
+        );
+        assert_eq!(authority.value, Bytes::from_static(b"example.com:443"));
+
+        let path = FieldLine::from(PathAndQuery::from_static("/resource?q=1"));
+        assert_eq!(
+            path.name,
+            Bytes::from_static(PseudoHeaders::PATH.as_bytes())
+        );
+        assert_eq!(path.value, Bytes::from_static(b"/resource?q=1"));
+
+        let protocol = FieldLine::from(Protocol::new("webtransport"));
+        assert_eq!(
+            protocol.name,
+            Bytes::from_static(PseudoHeaders::PROTOOCL.as_bytes())
+        );
+        assert_eq!(protocol.value, Bytes::from_static(b"webtransport"));
+
+        let status = FieldLine::from(StatusCode::CREATED);
+        assert_eq!(
+            status.name,
+            Bytes::from_static(PseudoHeaders::STATUS.as_bytes())
+        );
+        assert_eq!(status.value, Bytes::from_static(b"201"));
+    }
+}

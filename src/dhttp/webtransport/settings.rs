@@ -56,4 +56,20 @@ mod tests {
         );
         assert_eq!(settings.get(VarInt::from_u32(0x2b603742)), None);
     }
+
+    #[test]
+    fn enable_webtransport_exposes_id_and_treats_only_one_as_enabled() {
+        assert_eq!(EnableWebTransport.id(), EnableWebTransport::ID);
+
+        let mut settings = Settings::default();
+        settings.set(EnableWebTransport::setting(false));
+        assert!(!settings.enable_webtransport());
+        assert_eq!(
+            settings.get(VarInt::from_u32(0x2c7cf000)),
+            Some(VarInt::from_u32(0)),
+        );
+
+        settings.set(Setting::new(EnableWebTransport::ID, VarInt::from_u32(2)));
+        assert!(!settings.enable_webtransport());
+    }
 }
