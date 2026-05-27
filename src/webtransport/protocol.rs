@@ -592,6 +592,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reset_while_decoding_bidi_signal_is_passed_through_without_aborting() {
+        let state = Arc::new(StreamState::default());
+        let reader = test_reader_results(state.clone(), vec![Err(reset_stream_error(7))]);
+        let writer = test_writer(state.clone());
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_bi((reader, writer))
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Passed(_)));
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_while_decoding_uni_signal_is_passed_through_without_stopping() {
+        let state = Arc::new(StreamState::default());
+        let stream = test_reader_results(state.clone(), vec![Err(reset_stream_error(7))]);
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_uni(stream)
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Passed(_)));
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_while_decoding_bidi_session_id_is_accepted_without_abort() {
+        let state = Arc::new(StreamState::default());
+        let reader = test_reader_results(
+            state.clone(),
+            vec![
+                Ok(Bytes::from_static(&[0x40, 0x41])),
+                Err(reset_stream_error(9)),
+            ],
+        );
+        let writer = test_writer(state.clone());
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_bi((reader, writer))
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_while_decoding_uni_session_id_is_accepted_without_stop() {
+        let state = Arc::new(StreamState::default());
+        let stream = test_reader_results(
+            state.clone(),
+            vec![
+                Ok(Bytes::from_static(&[0x40, 0x54])),
+                Err(reset_stream_error(9)),
+            ],
+        );
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_uni(stream)
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
     async fn empty_bidi_stream_is_passed_through_without_side_effects() {
         let state = Arc::new(StreamState::default());
         let reader = test_reader(state.clone(), Vec::new());
@@ -697,6 +775,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_bidi_abort_for_unknown_session_is_ignored() {
+        let state = Arc::new(StreamState::with_stop_and_cancel_errors());
+        let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x41, 0x2a])]);
+        let writer = test_writer(state.clone());
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_bi((reader, writer))
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert_eq!(
+            state.stopped_codes(),
+            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+        );
+        assert_eq!(
+            state.cancelled_codes(),
+            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+        );
+    }
+
+    #[tokio::test]
     async fn full_uni_session_channel_rejects_and_stops_extra_stream() {
         let protocol = test_protocol();
         let mut registered = protocol
@@ -751,6 +852,25 @@ mod tests {
                 .expect("payload chunk should succeed"),
             Bytes::from_static(&[0xbe, 0xef])
         );
+    }
+
+    #[tokio::test]
+    async fn failed_uni_stop_for_unknown_session_is_ignored() {
+        let state = Arc::new(StreamState::with_stop_error());
+        let stream = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x54, 0x2a])]);
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_uni(stream)
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert_eq!(
+            state.stopped_codes(),
+            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+        );
+        assert!(state.cancelled_codes().is_empty());
     }
 
     #[tokio::test]
@@ -955,9 +1075,26 @@ mod tests {
     struct StreamState {
         stopped: Mutex<Vec<VarInt>>,
         cancelled: Mutex<Vec<VarInt>>,
+        fail_stop: bool,
+        fail_cancel: bool,
     }
 
     impl StreamState {
+        fn with_stop_error() -> Self {
+            Self {
+                fail_stop: true,
+                ..Self::default()
+            }
+        }
+
+        fn with_stop_and_cancel_errors() -> Self {
+            Self {
+                fail_stop: true,
+                fail_cancel: true,
+                ..Self::default()
+            }
+        }
+
         fn stopped_codes(&self) -> Vec<VarInt> {
             self.stopped.lock().expect("stopped lock poisoned").clone()
         }
@@ -973,14 +1110,14 @@ mod tests {
     #[derive(Debug)]
     struct TestReadStream {
         state: Arc<StreamState>,
-        chunks: VecDeque<Bytes>,
+        chunks: VecDeque<Result<Bytes, quic::StreamError>>,
     }
 
     impl Stream for TestReadStream {
         type Item = Result<Bytes, quic::StreamError>;
 
         fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Poll::Ready(self.chunks.pop_front().map(Ok))
+            Poll::Ready(self.chunks.pop_front())
         }
     }
 
@@ -1004,7 +1141,11 @@ mod tests {
                 .lock()
                 .expect("stopped lock poisoned")
                 .push(code);
-            Poll::Ready(Ok(()))
+            if self.state.fail_stop {
+                Poll::Ready(Err(reset_stream_error(0x1f)))
+            } else {
+                Poll::Ready(Ok(()))
+            }
         }
     }
 
@@ -1062,7 +1203,11 @@ mod tests {
                 .lock()
                 .expect("cancelled lock poisoned")
                 .push(code);
-            Poll::Ready(Ok(()))
+            if self.state.fail_cancel {
+                Poll::Ready(Err(reset_stream_error(0x2f)))
+            } else {
+                Poll::Ready(Ok(()))
+            }
         }
     }
 
@@ -1164,6 +1309,13 @@ mod tests {
         state: Arc<StreamState>,
         chunks: Vec<Bytes>,
     ) -> PeekableStreamReader<BoxReadStream> {
+        test_reader_results(state, chunks.into_iter().map(Ok).collect())
+    }
+
+    fn test_reader_results(
+        state: Arc<StreamState>,
+        chunks: Vec<Result<Bytes, quic::StreamError>>,
+    ) -> PeekableStreamReader<BoxReadStream> {
         let stream = TestReadStream {
             state,
             chunks: chunks.into(),
@@ -1180,6 +1332,12 @@ mod tests {
         WebTransportProtocol {
             registry: Registry::default(),
             conn,
+        }
+    }
+
+    fn reset_stream_error(code: u32) -> quic::StreamError {
+        quic::StreamError::Reset {
+            code: VarInt::from_u32(code),
         }
     }
 }

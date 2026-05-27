@@ -343,7 +343,7 @@ mod tests {
     };
     use smallvec::smallvec;
     use tokio::{
-        sync::{Mutex, Notify},
+        sync::{Mutex, Notify, oneshot},
         task::JoinHandle,
         time::{Duration, timeout},
     };
@@ -1094,6 +1094,68 @@ mod tests {
             .await
             .expect("peer task timeout")
             .expect("peer task panicked");
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn ipc_connector_returns_bootstrap_error_when_sender_closes_without_value() {
+        let parent_transport = ParentTransport::new();
+        let (server_mux, client_fd) = MuxChannel::create_pair().expect("mux pair");
+        let fd_id = parent_transport
+            .fd_sender()
+            .queue_fds(smallvec![client_fd])
+            .expect("queue mux fd");
+        let fd_registry = parent_transport.fd_registry();
+        let (client, server_task) = spawn_rpc_server(StaticIpcConnect {
+            connect_result: Ok(fd_id),
+            parent_transport: Some(Mutex::new(parent_transport)),
+        });
+        let connector = IpcConnector::<remoc::codec::Default>::new(client, fd_registry);
+
+        let (remoc_task_tx, remoc_task_rx) = oneshot::channel();
+        let peer_task = tokio::spawn(
+            async move {
+                let (sink, stream) = server_mux.split().expect("server split");
+                let (remoc_conn, tx, _rx) =
+                    remoc::Connect::framed::<_, _, ConnectionBootstrap, (), remoc::codec::Default>(
+                        remoc::Cfg::default(),
+                        sink,
+                        stream,
+                    )
+                    .await
+                    .expect("server handshake");
+                let remoc_task = tokio::spawn(remoc_conn.in_current_span());
+                drop(tx);
+                let _ = remoc_task_tx.send(remoc_task);
+            }
+            .in_current_span(),
+        );
+
+        let error = match timeout(
+            Duration::from_secs(1),
+            quic::Connect::connect(&connector, &Authority::from_static("server.example")),
+        )
+        .await
+        .expect("connect timeout")
+        {
+            Ok(_) => panic!("closed bootstrap sender should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ConnectorError::Bootstrap));
+
+        let remoc_task = timeout(Duration::from_secs(1), remoc_task_rx)
+            .await
+            .expect("remoc task receiver timeout")
+            .expect("peer should send remoc task");
+        timeout(Duration::from_secs(1), peer_task)
+            .await
+            .expect("peer task timeout")
+            .expect("peer task panicked");
+        drop(connector);
+        remoc_task.abort();
+        let _ = remoc_task.await;
         server_task.abort();
         let _ = server_task.await;
     }

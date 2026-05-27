@@ -384,7 +384,7 @@ mod tests {
 
     use bytes::Bytes;
     use dhttp_identity::identity;
-    use futures::{SinkExt, Stream};
+    use futures::{SinkExt, Stream, StreamExt};
     use http::uri::Authority;
     use tokio::{
         sync::watch,
@@ -405,9 +405,11 @@ mod tests {
             },
         },
         dhttp::protocol::DHttpProtocol,
+        message::stream::guard::{GuardedQuicReader, GuardedQuicWriter},
         pool::ReuseableConnection,
         protocol::{Protocol, Protocols, StreamVerdict},
         qpack::protocol::QPackProtocolFactory,
+        quic::{GetStreamIdExt, StopStreamExt},
         varint::VarInt,
     };
 
@@ -1888,5 +1890,234 @@ mod tests {
         })
         .await
         .expect("failing request handler task should run once");
+    }
+
+    #[tokio::test]
+    async fn test_connection_helpers_expose_expected_pending_and_agent_paths() {
+        let buildable = BuildableConnection;
+        quic::Lifecycle::check(&buildable).expect("buildable connection is live");
+        quic::Lifecycle::close(
+            &buildable,
+            crate::error::Code::H3_NO_ERROR,
+            std::borrow::Cow::Borrowed("test close"),
+        );
+        assert!(
+            quic::WithLocalAgent::local_agent(&buildable)
+                .await
+                .expect("buildable local agent")
+                .is_none()
+        );
+        assert!(
+            quic::WithRemoteAgent::remote_agent(&buildable)
+                .await
+                .expect("buildable remote agent")
+                .is_none()
+        );
+        quic::ManageStream::open_uni(&buildable)
+            .await
+            .expect("buildable open_uni");
+        timeout(
+            Duration::from_millis(10),
+            quic::ManageStream::open_bi(&buildable),
+        )
+        .await
+        .expect_err("buildable open_bi stays pending");
+        timeout(
+            Duration::from_millis(10),
+            quic::ManageStream::accept_bi(&buildable),
+        )
+        .await
+        .expect_err("buildable accept_bi stays pending");
+        timeout(
+            Duration::from_millis(10),
+            quic::ManageStream::accept_uni(&buildable),
+        )
+        .await
+        .expect_err("buildable accept_uni stays pending");
+        timeout(
+            Duration::from_millis(10),
+            quic::Lifecycle::closed(&buildable),
+        )
+        .await
+        .expect_err("buildable closed stays pending");
+
+        let identified = IdentifiedConnection::new("identified.example");
+        quic::Lifecycle::check(&identified).expect("identified connection is live");
+        assert!(
+            quic::WithLocalAgent::local_agent(&identified)
+                .await
+                .expect("identified local agent")
+                .is_none()
+        );
+        let remote = quic::WithRemoteAgent::remote_agent(&identified)
+            .await
+            .expect("identified remote agent")
+            .expect("identified remote agent exists");
+        assert_eq!(identity::RemoteAgent::name(&remote), "identified.example");
+        assert!(identity::RemoteAgent::cert_chain(&remote).is_empty());
+        quic::ManageStream::open_uni(&identified)
+            .await
+            .expect("identified open_uni");
+        timeout(
+            Duration::from_millis(10),
+            quic::ManageStream::open_bi(&identified),
+        )
+        .await
+        .expect_err("identified open_bi stays pending");
+        timeout(
+            Duration::from_millis(10),
+            quic::Lifecycle::closed(&identified),
+        )
+        .await
+        .expect_err("identified closed stays pending");
+    }
+
+    #[tokio::test]
+    async fn test_controlled_connection_and_stream_id_helpers_cover_remaining_traits() {
+        let controlled = ControlledConnection::new("controlled terminal");
+        quic::Lifecycle::check(&controlled).expect("controlled connection is live");
+        assert!(
+            quic::WithLocalAgent::local_agent(&controlled)
+                .await
+                .expect("controlled local agent")
+                .is_none()
+        );
+        assert!(
+            quic::WithRemoteAgent::remote_agent(&controlled)
+                .await
+                .expect("controlled remote agent")
+                .is_none()
+        );
+        quic::ManageStream::open_uni(&controlled)
+            .await
+            .expect("controlled open_uni");
+        timeout(
+            Duration::from_millis(10),
+            quic::ManageStream::open_bi(&controlled),
+        )
+        .await
+        .expect_err("controlled open_bi stays pending");
+        quic::Lifecycle::close(
+            &controlled,
+            crate::error::Code::H3_NO_ERROR,
+            std::borrow::Cow::Borrowed("test close"),
+        );
+        let closed = quic::Lifecycle::closed(&controlled).await;
+        assert!(matches!(closed, quic::ConnectionError::Transport { .. }));
+
+        let close_latch = Arc::new(CloseLatch::default());
+        let mut stream = StreamIdErrorReadStream::new(close_latch.clone());
+        let stream_id_error = stream
+            .stream_id()
+            .await
+            .expect_err("first stream-id helper reports reset");
+        assert!(matches!(stream_id_error, quic::StreamError::Reset { .. }));
+        close_latch.wait().await;
+        stream
+            .stop(VarInt::from_u32(0x33))
+            .await
+            .expect("stop helper is a no-op success");
+        assert_eq!(
+            Pin::new(&mut stream)
+                .next()
+                .await
+                .expect("stream yields one chunk")
+                .expect("chunk is ok"),
+            Bytes::from_static(&[0x01])
+        );
+        assert!(
+            Pin::new(&mut stream).next().await.is_none(),
+            "stream helper ends after its single chunk"
+        );
+
+        let mut stream = StreamIdErrorReadStream::fail_after_first_success(VarInt::from_u32(99));
+        assert_eq!(
+            stream.stream_id().await.expect("first lookup succeeds"),
+            VarInt::from_u32(99)
+        );
+        assert!(stream.stream_id().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_listener_and_service_helpers_cover_direct_paths() {
+        let listen = MockListen::default();
+        let shutdowns = listen.shutdowns.clone();
+        let mut listen_ref = &listen;
+        quic::Listen::shutdown(&listen_ref)
+            .await
+            .expect("shared mock shutdown succeeds");
+        let _accepted = quic::Listen::accept(&mut listen_ref)
+            .await
+            .expect("shared mock accept succeeds");
+        assert_eq!(shutdowns.load(Ordering::Relaxed), 1);
+        assert_eq!(listen.accepted.load(Ordering::Relaxed), 1);
+
+        let failing = FailingListen;
+        let mut failing_ref = &failing;
+        assert!(quic::Listen::accept(&mut failing_ref).await.is_err());
+        assert!(quic::Listen::shutdown(&failing_ref).await.is_err());
+
+        let unbuildable = UnbuildableListen;
+        let mut unbuildable_ref = &unbuildable;
+        let _ = quic::Listen::accept(&mut unbuildable_ref)
+            .await
+            .expect("shared unbuildable accept returns raw connection");
+        quic::Listen::shutdown(&unbuildable_ref)
+            .await
+            .expect("shared unbuildable shutdown succeeds");
+
+        let sequenced = SequencedListen::new([Ok(Arc::new(BuildableConnection))]);
+        quic::Listen::shutdown(&sequenced)
+            .await
+            .expect("sequenced shutdown succeeds");
+        let mut sequenced_ref = &sequenced;
+        quic::Listen::shutdown(&sequenced_ref)
+            .await
+            .expect("shared sequenced shutdown succeeds");
+        let _ = quic::Listen::accept(&mut sequenced_ref)
+            .await
+            .expect("shared sequenced accept consumes queued result");
+
+        let quic = Arc::new(ControlledConnection::new("direct request connection"));
+        let state = state_with_qpack(quic).await;
+        let qpack = state.qpack().expect("qpack should be initialized");
+        let erased = state.erase();
+        let connection = Arc::new(erased.clone());
+        let (request_reader, _request_write_side) =
+            quic::test::mock_stream_pair(VarInt::from_u32(111));
+        let (_response_read_side, response_writer) =
+            quic::test::mock_stream_pair(VarInt::from_u32(111));
+        let close_latch = Arc::new(CloseLatch::default());
+        let request = UnresolvedRequest {
+            stream_id: StreamId(VarInt::from_u32(111)),
+            read_stream: ReadStream::new(
+                StreamReader::new(GuardedQuicReader::new(
+                    Box::pin(request_reader) as BoxReadStream
+                )),
+                qpack.decoder.clone(),
+                erased.clone(),
+            ),
+            write_stream: WriteStream::new(
+                SinkWriter::new(GuardedQuicWriter::new(
+                    Box::pin(response_writer) as BoxWriteStream
+                )),
+                qpack.encoder.clone(),
+                erased,
+            ),
+            connection,
+        };
+        let mut service = RecordingService {
+            seen_streams: Arc::new(Mutex::new(Vec::new())),
+            close_latch,
+        };
+        serve_request(&mut service, request).await;
+        assert_eq!(
+            service
+                .seen_streams
+                .lock()
+                .expect("recording service mutex should not be poisoned")
+                .as_slice(),
+            &[StreamId(VarInt::from_u32(111))]
+        );
     }
 }

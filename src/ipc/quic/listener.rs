@@ -332,6 +332,7 @@ where
 mod tests {
     use std::{
         borrow::Cow,
+        future::Future,
         io,
         pin::Pin,
         sync::Arc,
@@ -339,7 +340,7 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use futures::{Sink, SinkExt, Stream, StreamExt, future::pending};
+    use futures::{Sink, SinkExt, Stream, StreamExt, future::pending, task::noop_waker};
     use remoc::prelude::ServerSharedMut;
     use smallvec::smallvec;
     use tokio::{
@@ -909,11 +910,28 @@ mod tests {
             .send(Arc::new(TestConnection))
             .await
             .expect("send second test connection");
-        drop(conn_tx);
-        let accept_handle = timeout(Duration::from_secs(1), quic::Listen::accept(&mut listener))
+        let open_uni_handle = timeout(Duration::from_secs(1), quic::Listen::accept(&mut listener))
             .await
             .expect("second accept timeout")
             .expect("second accept succeeds");
+
+        let open_uni_error = match quic::ManageStream::open_uni(open_uni_handle.as_ref()).await {
+            Ok(_) => panic!("open_uni error should propagate over ipc"),
+            Err(error) => error,
+        };
+        let ConnectionError::Transport { source } = open_uni_error else {
+            panic!("expected open_uni transport error");
+        };
+        assert!(source.reason.contains("open_uni should not be called"));
+
+        conn_tx
+            .send(Arc::new(TestConnection))
+            .await
+            .expect("send third test connection");
+        let accept_handle = timeout(Duration::from_secs(1), quic::Listen::accept(&mut listener))
+            .await
+            .expect("third accept timeout")
+            .expect("third accept succeeds");
 
         let accept_error = match quic::ManageStream::accept_bi(accept_handle.as_ref()).await {
             Ok(_) => panic!("accept_bi error should propagate over ipc"),
@@ -924,8 +942,31 @@ mod tests {
         };
         assert!(source.reason.contains("accept_bi should not be called"));
 
+        conn_tx
+            .send(Arc::new(TestConnection))
+            .await
+            .expect("send fourth test connection");
+        drop(conn_tx);
+        let accept_uni_handle =
+            timeout(Duration::from_secs(1), quic::Listen::accept(&mut listener))
+                .await
+                .expect("fourth accept timeout")
+                .expect("fourth accept succeeds");
+
+        let accept_uni_error =
+            match quic::ManageStream::accept_uni(accept_uni_handle.as_ref()).await {
+                Ok(_) => panic!("accept_uni error should propagate over ipc"),
+                Err(error) => error,
+            };
+        let ConnectionError::Transport { source } = accept_uni_error else {
+            panic!("expected accept_uni transport error");
+        };
+        assert!(source.reason.contains("accept_uni should not be called"));
+
         drop(handle);
+        drop(open_uni_handle);
         drop(accept_handle);
+        drop(accept_uni_handle);
         drop(listener);
         server_task.abort();
         let _ = server_task.await;
@@ -976,6 +1017,40 @@ mod tests {
         assert!(matches!(error, IpcListenError::Rpc { .. }));
 
         drop(listener);
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn ipc_listener_accept_returns_wait_fd_error_when_fd_id_already_has_waiter() {
+        let parent_transport = ParentTransport::new();
+        let fd_id = VarInt::from_u32(7);
+        let fd_registry = parent_transport.fd_registry();
+        let waiter_registry = fd_registry.clone();
+        let mut pending_wait = Box::pin(waiter_registry.wait_fds(fd_id));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(pending_wait.as_mut().poll(&mut cx).is_pending());
+
+        let (client, server_task) = spawn_rpc_server(StaticIpcListen {
+            accept_result: Ok(fd_id),
+            shutdown_result: Ok(()),
+            parent_transport: None,
+        });
+        let mut listener = IpcListener::<remoc::codec::Default>::new(client, fd_registry);
+
+        let error = match timeout(Duration::from_secs(1), quic::Listen::accept(&mut listener))
+            .await
+            .expect("accept timeout")
+        {
+            Ok(_) => panic!("duplicate fd waiter should fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, IpcListenError::WaitFd { .. }));
+
+        drop(listener);
+        drop(pending_wait);
+        drop(parent_transport);
         server_task.abort();
         let _ = server_task.await;
     }
