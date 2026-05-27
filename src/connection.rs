@@ -700,6 +700,7 @@ pub(crate) mod tests {
         hash::{Hash, Hasher},
     };
     use std::{
+        error::Error as _,
         future::pending,
         io,
         pin::Pin,
@@ -708,7 +709,7 @@ pub(crate) mod tests {
 
     use bytes::Bytes;
     use dhttp_identity::identity as agent;
-    use futures::{Sink, future::BoxFuture, stream::Stream};
+    use futures::{Sink, SinkExt, future::BoxFuture, stream::Stream};
     use tracing::Instrument;
 
     #[cfg(feature = "dquic")]
@@ -723,7 +724,7 @@ pub(crate) mod tests {
     use crate::{
         error::{Code, H3MessageError, H3MissingSettings},
         protocol::Protocols,
-        quic::{self, ConnectionError},
+        quic::{self, CancelStreamExt, ConnectionError, StopStreamExt},
         varint::VarInt,
     };
 
@@ -884,6 +885,12 @@ pub(crate) mod tests {
             self.state
                 .stream_ops_available
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        pub(crate) fn disable_stream_ops(&self) {
+            self.state
+                .stream_ops_available
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
 
         pub(crate) fn close_calls(&self) -> Vec<(Code, String)> {
@@ -1092,7 +1099,32 @@ pub(crate) mod tests {
             _: &'a Arc<C>,
             _: &'a Protocols,
         ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
-            unimplemented!("not used in builder identity tests")
+            Box::pin(async { Ok(MockProtocol) })
+        }
+    }
+
+    #[cfg(feature = "dquic")]
+    #[derive(Debug)]
+    struct PassThenDisableProtocol {
+        quic: MockConnection,
+    }
+
+    #[cfg(feature = "dquic")]
+    impl Protocol for PassThenDisableProtocol {
+        fn accept_uni<'a>(
+            &'a self,
+            stream: ErasedPeekableUniStream,
+        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
+            self.quic.disable_stream_ops();
+            Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
+        }
+
+        fn accept_bi<'a>(
+            &'a self,
+            stream: ErasedPeekableBiStream,
+        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
+            self.quic.disable_stream_ops();
+            Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
         }
     }
 
@@ -1292,6 +1324,21 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(feature = "dquic")]
+    #[tokio::test]
+    async fn builder_initializes_custom_protocol_factory() {
+        let quic = Arc::new(MockConnection::new());
+        quic.enable_stream_ops();
+
+        let connection = ConnectionBuilder::new(Arc::new(Settings::default()))
+            .protocol(MockFactory(7))
+            .build(quic)
+            .await
+            .expect("custom protocol factory should initialize");
+
+        assert!(connection.protocol::<MockProtocol>().is_some());
+    }
+
     #[test]
     fn state_accessors_return_underlying_quic_and_protocol_registry() {
         let quic = Arc::new(MockConnection::new());
@@ -1358,6 +1405,53 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn accept_tasks_handle_accept_errors_without_closing_again() {
+        let bi_quic = MockConnection::new();
+        let bi_state =
+            ConnectionState::new_for_test(Arc::new(bi_quic.clone()), Arc::new(Protocols::new()));
+        ConnectionState::accept_bi_stream_task(bi_state).await;
+        assert_eq!(bi_quic.stream_calls(), vec!["accept_bi"]);
+        assert!(bi_quic.close_calls().is_empty());
+
+        let uni_quic = MockConnection::new();
+        let uni_state =
+            ConnectionState::new_for_test(Arc::new(uni_quic.clone()), Arc::new(Protocols::new()));
+        ConnectionState::accept_uni_stream_task(uni_state).await;
+        assert_eq!(uni_quic.stream_calls(), vec!["accept_uni"]);
+        assert!(uni_quic.close_calls().is_empty());
+    }
+
+    #[cfg(feature = "dquic")]
+    #[tokio::test]
+    async fn accept_tasks_pass_unknown_streams_to_stop_and_cancel_paths() {
+        let bi_quic = MockConnection::new();
+        bi_quic.enable_stream_ops();
+        let bi_protocols = {
+            let mut protocols = Protocols::new();
+            protocols.insert(PassThenDisableProtocol {
+                quic: bi_quic.clone(),
+            });
+            Arc::new(protocols)
+        };
+        let bi_state = ConnectionState::new_for_test(Arc::new(bi_quic.clone()), bi_protocols);
+        ConnectionState::accept_bi_stream_task(bi_state).await;
+        assert_eq!(bi_quic.stream_calls(), vec!["accept_bi", "accept_bi"]);
+
+        let uni_quic = MockConnection::new();
+        uni_quic.enable_stream_ops();
+        let uni_protocols = {
+            let mut protocols = Protocols::new();
+            protocols.insert(PassThenDisableProtocol {
+                quic: uni_quic.clone(),
+            });
+            Arc::new(protocols)
+        };
+        let uni_state = ConnectionState::new_for_test(Arc::new(uni_quic.clone()), uni_protocols);
+        ConnectionState::accept_uni_stream_task(uni_state).await;
+        assert_eq!(uni_quic.stream_calls(), vec!["accept_uni", "accept_uni"]);
+    }
+
+    #[tokio::test]
     async fn lifecycle_ext_h3_error_closes_then_returns_terminal_error() {
         let quic = MockConnection::new();
         let quic_for_task = quic.clone();
@@ -1420,6 +1514,56 @@ pub(crate) mod tests {
             }
             other => panic!("expected connection-scope stream error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn h3_error_display_and_sources_are_layered() {
+        let connection_error = super::ConnectionError::from(H3MissingSettings);
+        assert_eq!(
+            connection_error.to_string(),
+            "h3 connection-scope protocol error"
+        );
+        assert_eq!(
+            connection_error
+                .source()
+                .expect("h3 connection source")
+                .to_string(),
+            "no SETTINGS frame at beginning of control stream"
+        );
+
+        let stream_error = StreamError::from(H3MessageError::MissingHeaderSection);
+        assert_eq!(stream_error.to_string(), "h3 stream-scope protocol error");
+        assert_eq!(
+            stream_error.source().expect("h3 stream source").to_string(),
+            "missing header section in HTTP message"
+        );
+    }
+
+    #[test]
+    fn stream_error_h3_io_roundtrip_preserves_source() {
+        let io_error = io::Error::from(StreamError::from(H3MessageError::MissingHeaderSection));
+        assert_eq!(io_error.kind(), io::ErrorKind::Other);
+
+        let recovered = StreamError::from(io_error);
+        assert_stream_h3_code(recovered, Code::H3_MESSAGE_ERROR);
+    }
+
+    #[test]
+    fn connection_error_recovery_rejects_untyped_io_error() {
+        let result = std::panic::catch_unwind(|| {
+            let _ = super::ConnectionError::from(io::Error::other("opaque"));
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn stream_error_recovery_rejects_untyped_io_error() {
+        let result = std::panic::catch_unwind(|| {
+            let _ = StreamError::from(io::Error::other("opaque"));
+        });
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1502,6 +1646,25 @@ pub(crate) mod tests {
 
         assert!(!mapper_called);
         assert_stream_h3_code(mapped, Code::H3_MESSAGE_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_stream_helpers_cover_stop_cancel_and_close() {
+        let mut reader = TestReadStream;
+        reader
+            .stop(VarInt::from_u32(0x103))
+            .await
+            .expect("test reader stop should succeed");
+
+        let mut writer = TestWriteStream;
+        writer
+            .cancel(VarInt::from_u32(0x103))
+            .await
+            .expect("test writer cancel should succeed");
+        writer
+            .close()
+            .await
+            .expect("test writer close should succeed");
     }
 
     #[tokio::test]

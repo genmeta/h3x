@@ -1091,7 +1091,7 @@ impl Drop for BindHandle {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{net::SocketAddr, str::FromStr, time::Duration};
 
     use dquic::prelude::{IO, handy::NoopTokenRegistry};
     use rustls::ClientConfig as TlsClientConfig;
@@ -1119,6 +1119,70 @@ mod tests {
 
     fn make_server_config() -> ServerQuicConfig {
         ServerQuicConfig::default()
+    }
+
+    fn make_local_agent(name: &str) -> LocalAgent {
+        let identity = make_identity(name);
+        let certified_key =
+            crate::dquic::identity::build_certified_key(&identity).expect("valid certified key");
+        LocalAgent::new(Arc::from(name), certified_key)
+    }
+
+    fn make_remote_agent(name: &str) -> RemoteAgent {
+        let identity = make_identity(name);
+        RemoteAgent::new(Arc::from(name), Arc::from(identity.certs.as_slice()))
+    }
+
+    struct TestNullDriver {
+        manager: Arc<crate::dquic::net::InterfaceManager>,
+    }
+
+    impl TestNullDriver {
+        fn new() -> Self {
+            Self {
+                manager: Arc::new(crate::dquic::net::InterfaceManager::new()),
+            }
+        }
+    }
+
+    impl BindDriver for TestNullDriver {
+        fn bind<'a>(&'a self, _network: &'a Network, uri: BindUri) -> BoxFuture<'a, BindInterface> {
+            async move { self.manager.bind(uri, Arc::new(NullIo::new)).await }.boxed()
+        }
+    }
+
+    #[test]
+    fn interface_contains_matches_ipv4_and_ipv6_networks() {
+        let mut interface = ::dquic::qinterface::device::Interface::dummy();
+        interface.ipv4.push("192.0.2.10/24".parse().unwrap());
+        interface.ipv6.push("2001:db8::10/64".parse().unwrap());
+
+        assert!(interface_contains(
+            &interface,
+            "192.0.2.99".parse().unwrap()
+        ));
+        assert!(!interface_contains(
+            &interface,
+            "198.51.100.1".parse().unwrap()
+        ));
+        assert!(interface_contains(
+            &interface,
+            "2001:db8::99".parse().unwrap()
+        ));
+        assert!(!interface_contains(
+            &interface,
+            "2001:db9::1".parse().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_bind_driver_rebind_is_noop() {
+        let network = Network::builder().build();
+        let driver = Arc::new(TestNullDriver::new());
+        let uri: BindUri = "iface://v4.lo:0".parse().expect("valid bind uri");
+        let iface = driver.bind(&network, uri).await;
+
+        driver.rebind(&network, &iface).await;
     }
 
     #[tokio::test]
@@ -1516,30 +1580,6 @@ mod tests {
 
     #[tokio::test]
     async fn bind_with_keeps_driver_bindings_separate_for_same_pattern() {
-        use futures::{FutureExt, future::BoxFuture};
-
-        struct TestNullDriver {
-            manager: Arc<crate::dquic::net::InterfaceManager>,
-        }
-
-        impl TestNullDriver {
-            fn new() -> Self {
-                Self {
-                    manager: Arc::new(crate::dquic::net::InterfaceManager::new()),
-                }
-            }
-        }
-
-        impl BindDriver for TestNullDriver {
-            fn bind<'a>(
-                &'a self,
-                _network: &'a Network,
-                uri: BindUri,
-            ) -> BoxFuture<'a, BindInterface> {
-                async move { self.manager.bind(uri, Arc::new(NullIo::new)).await }.boxed()
-            }
-        }
-
         let network = Network::builder().build();
         let driver_a = Arc::new(TestNullDriver::new());
         let driver_b = Arc::new(TestNullDriver::new());
@@ -1573,6 +1613,167 @@ mod tests {
 
         handle_a.unbind().await;
         handle_b.unbind().await;
+    }
+
+    #[tokio::test]
+    async fn bind_handle_unbind_is_refcounted_and_idempotent() {
+        let network = Network::builder().build();
+        let driver = Arc::new(TestNullDriver::new());
+        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+
+        let mut first = network.bind_with(driver.clone(), pattern.clone()).await;
+        let mut second = network.bind_with(driver.clone(), pattern.clone()).await;
+
+        first.unbind().await;
+        assert!(
+            network.get_interfaces_with(&driver, &pattern).is_some(),
+            "first unbind should only decrement the shared bind refcount"
+        );
+
+        first.unbind().await;
+        assert!(
+            network.get_interfaces_with(&driver, &pattern).is_some(),
+            "repeating unbind on the same handle must not release again"
+        );
+
+        second.unbind().await;
+        assert!(
+            network.get_interfaces_with(&driver, &pattern).is_none(),
+            "last handle should remove the registry entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_bind_handle_releases_binding_in_background() {
+        let network = Network::builder().build();
+        let driver = Arc::new(TestNullDriver::new());
+        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+
+        {
+            let _handle = network.bind_with(driver.clone(), pattern.clone()).await;
+            assert!(network.get_interfaces_with(&driver, &pattern).is_some());
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while network.get_interfaces_with(&driver, &pattern).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the last handle should schedule an unbind task");
+    }
+
+    #[tokio::test]
+    async fn interface_auth_client_checks_sni_registry_and_bind_patterns() {
+        let network = Network::builder().build();
+        let quic = network.quic();
+        let server_agent = make_local_agent("alpha");
+        let client_agent = make_remote_agent("client");
+
+        let auth = InterfaceAuthClient {
+            bind_uri: "iface://v4.eth0:443".parse().expect("valid bind uri"),
+            sni_registry: quic.sni_registry.clone(),
+        };
+
+        let empty_bind = quic
+            .clone()
+            .bind_server(
+                make_identity("alpha"),
+                make_server_config(),
+                Arc::new(Vec::new()),
+            )
+            .await
+            .expect("bind should succeed");
+        assert_eq!(
+            auth.verify_client_name(&server_agent, None),
+            ClientNameVerifyResult::Accept
+        );
+        assert_eq!(
+            auth.verify_client_agent(&server_agent, &client_agent),
+            ClientAgentVerifyResult::Accept
+        );
+
+        drop(empty_bind);
+        assert!(matches!(
+            auth.verify_client_name(&server_agent, None),
+            ClientNameVerifyResult::SilentRefuse(reason)
+                if reason == "no server registered for SNI"
+        ));
+
+        let patterns = Arc::new(vec![
+            BindPattern::from_str("iface://v4.lo:443").expect("valid pattern"),
+        ]);
+        let _scoped_bind = quic
+            .clone()
+            .bind_server(make_identity("alpha"), make_server_config(), patterns)
+            .await
+            .expect("bind should succeed");
+
+        assert!(matches!(
+            auth.verify_client_name(&server_agent, None),
+            ClientNameVerifyResult::SilentRefuse(reason) if reason == "bind pattern mismatch"
+        ));
+
+        let matching_auth = InterfaceAuthClient {
+            bind_uri: "iface://v4.lo:443".parse().expect("valid bind uri"),
+            sni_registry: quic.sni_registry.clone(),
+        };
+        assert_eq!(
+            matching_auth.verify_client_name(&server_agent, None),
+            ClientNameVerifyResult::Accept
+        );
+    }
+
+    #[tokio::test]
+    async fn network_device_addr_helpers_reject_non_matching_inputs() {
+        let network = Network::builder().build();
+        assert!(
+            network
+                .resolve_device_addr("__missing__", Family::V4)
+                .is_none()
+        );
+
+        let inet_uri: BindUri = "inet://127.0.0.1:443".parse().expect("valid bind uri");
+        assert!(!network.bound_addr_is_on_default_route(
+            &inet_uri,
+            SocketAddr::from(([127, 0, 0, 1], 443)),
+        ));
+
+        let iface_uri: BindUri = "iface://v4.__missing__:443"
+            .parse()
+            .expect("valid bind uri");
+        assert!(
+            !network
+                .bound_addr_is_on_default_route(&iface_uri, SocketAddr::from(([0, 0, 0, 0], 443)),)
+        );
+        assert!(!network.bound_addr_is_on_default_route(
+            &iface_uri,
+            "[::1]:443".parse().expect("valid socket addr"),
+        ));
+    }
+
+    #[tokio::test]
+    async fn quic_bind_driver_initializes_stun_component_branches() {
+        let manager = Arc::new(InterfaceManager::new());
+        let network = Network::build_with_quic_driver(Devices::global(), |network| {
+            QuicBindDriver::builder()
+                .network(network)
+                .iface_manager(manager)
+                .io_factory(Arc::new(NullIoFactory))
+                .stun_server(Arc::from("default.stun.example:3478"))
+                .build()
+        });
+        let quic = network.quic();
+
+        let disabled: BindUri = "iface://v4.lo:0/?stun=false"
+            .parse()
+            .expect("valid bind uri");
+        let _disabled_iface = BindDriver::bind(quic.as_ref(), &network, disabled).await;
+
+        let explicit: BindUri = "iface://v4.lo:1/?stun_server=explicit.stun.example:3478"
+            .parse()
+            .expect("valid bind uri");
+        let _explicit_iface = BindDriver::bind(quic.as_ref(), &network, explicit).await;
     }
 
     #[tokio::test]

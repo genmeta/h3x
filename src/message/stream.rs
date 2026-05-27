@@ -989,6 +989,16 @@ mod tests {
         ConnectionState::new_for_test(quic, Arc::new(protocols))
     }
 
+    fn transport_error(reason: &'static str) -> quic::ConnectionError {
+        quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(1),
+                frame_type: VarInt::from_u32(0),
+                reason: reason.into(),
+            },
+        }
+    }
+
     async fn state_with_qpack(quic: Arc<MockConnection>) -> ConnectionState<MockConnection> {
         let erased: Arc<dyn quic::DynConnection> = quic.clone();
         let mut protocols = Protocols::new();
@@ -1407,6 +1417,295 @@ mod tests {
                 source: quic::StreamError::Reset { code }
             }) if code == reset_code
         ));
+    }
+
+    #[test]
+    fn message_stream_error_conversions_cover_connection_and_send_failure_variants() {
+        use std::io::ErrorKind;
+
+        let error = MessageStreamError::from(transport_error("connection conversion"));
+        assert!(matches!(
+            error,
+            MessageStreamError::Quic {
+                source: quic::StreamError::Connection { .. }
+            }
+        ));
+
+        let io_error = std::io::Error::from(MessageStreamError::MessageSendFailed);
+        assert_eq!(io_error.kind(), ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn oversized_write_data_frame_reports_h3_frame_error_code() {
+        let mut stream = write_stream_for_test(VarInt::from_u32(0));
+
+        let error = stream
+            .write_data_frame(OversizedBuf)
+            .await
+            .expect_err("oversized frame should fail before writing");
+
+        assert!(matches!(
+            error,
+            StreamError::H3 { source } if source.code() == Code::H3_FRAME_ERROR
+        ));
+    }
+
+    #[tokio::test]
+    async fn truncated_data_frame_reports_error_after_streaming_available_chunk() {
+        let mut data_stream = read_stream_with_bytes(23, &[0x00, 0x03, b'a']).await;
+        // DATA frame bodies are streamed as chunks arrive; an EOF shorter
+        // than the declared frame length is detected when the frame is polled
+        // again.
+        let data_error = data_stream
+            .read_data_frame_chunk()
+            .await
+            .expect("first truncated DATA chunk is yielded before frame EOF is known");
+        assert_eq!(data_error, Some(Bytes::from_static(b"a")));
+        let data_error = data_stream
+            .read_data_frame_chunk()
+            .await
+            .expect_err("truncated DATA payload should fail when the frame is resumed");
+        assert!(matches!(
+            data_error,
+            StreamError::Connection {
+                source: crate::connection::ConnectionError::H3 { source }
+            } if source.code() == Code::H3_FRAME_ERROR
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_frame_header_is_reported_by_peek_header_path() {
+        let mut header_stream = read_stream_with_bytes(24, &[0x00]).await;
+        let header_error = header_stream
+            .read_header_frame()
+            .await
+            .expect_err("truncated frame header should fail while peeking");
+        assert!(matches!(
+            header_error,
+            StreamError::Connection {
+                source: crate::connection::ConnectionError::H3 { source }
+            } if source.code() == Code::H3_FRAME_ERROR
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_header_frame_returns_none_when_next_frame_is_data() {
+        let mut stream = read_stream_with_bytes(25, &[0x00, 0x03, b'a', b'b', b'c']).await;
+
+        assert!(
+            stream
+                .read_header_frame()
+                .await
+                .expect("DATA frame should be valid")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn try_stream_io_surfaces_connection_close_from_goaway_future() {
+        let read_quic = Arc::new(MockConnection::new());
+        let read_state = state_without_qpack(read_quic.clone()).erase();
+        read_quic.set_terminal_error(transport_error("read try_stream_io connection close"));
+        let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TestReadStream {
+            stream_id: VarInt::from_u32(26),
+        })
+            as crate::codec::BoxReadStream));
+        let mut read_stream = ReadStream::new(
+            reader,
+            Arc::new(QPackDecoder::new(
+                Arc::new(Settings::default()),
+                qpack_decoder_sink(),
+                qpack_decoder_stream(),
+            )),
+            read_state,
+        );
+        let read_result = read_stream
+            .try_stream_io(async |_this| {
+                futures::future::pending::<Result<(), StreamError>>().await
+            })
+            .await;
+        assert!(matches!(
+            read_result,
+            Err(MessageStreamError::Quic {
+                source: quic::StreamError::Connection { .. }
+            })
+        ));
+
+        let write_quic = Arc::new(MockConnection::new());
+        let write_state = state_without_qpack(write_quic.clone()).erase();
+        write_quic.set_terminal_error(transport_error("write try_stream_io connection close"));
+        let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TestWriteStream {
+            stream_id: VarInt::from_u32(27),
+        })
+            as crate::codec::BoxWriteStream));
+        let mut write_stream = WriteStream::new(
+            writer,
+            Arc::new(QPackEncoder::new(
+                Arc::new(Settings::default()),
+                qpack_encoder_sink(),
+                qpack_encoder_stream(),
+            )),
+            write_state,
+        );
+        let write_result = write_stream
+            .try_stream_io(async |_this| {
+                futures::future::pending::<Result<(), StreamError>>().await
+            })
+            .await;
+        assert!(matches!(
+            write_result,
+            Err(MessageStreamError::Quic {
+                source: quic::StreamError::Connection { .. }
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_io_error_branches_delegate_connection_errors_to_lifecycle() {
+        let read_quic = Arc::new(MockConnection::new());
+        let read_state = state_without_qpack(read_quic.clone()).erase();
+        let terminal_error = transport_error("read lifecycle closed");
+        read_quic.set_terminal_error(terminal_error.clone());
+        let mut read_stream = read_stream_for_test(VarInt::from_u32(28));
+        read_stream.state = read_state;
+
+        let read_error = read_stream
+            .try_stream_io(async |_this| {
+                Err::<(), _>(StreamError::Connection {
+                    source: crate::error::H3FrameUnexpected::UnexpectedFrameType.into(),
+                })
+            })
+            .await;
+        assert!(matches!(
+            read_error,
+            Err(MessageStreamError::Quic {
+                source: quic::StreamError::Connection {
+                    source: quic::ConnectionError::Transport { source }
+                }
+            }) if source.reason == "read lifecycle closed"
+        ));
+        assert!(
+            read_quic.close_calls().is_empty(),
+            "already-closed connections should return their terminal error without closing again"
+        );
+
+        let write_quic = Arc::new(MockConnection::new());
+        let write_state = state_without_qpack(write_quic.clone()).erase();
+        let terminal_error = transport_error("write lifecycle closed");
+        write_quic.set_terminal_error(terminal_error.clone());
+        let mut write_stream = write_stream_for_test(VarInt::from_u32(29));
+        write_stream.state = write_state;
+
+        let write_error = write_stream
+            .try_stream_io(async |_this| {
+                Err::<(), _>(StreamError::Connection {
+                    source: crate::error::H3FrameUnexpected::UnexpectedFrameType.into(),
+                })
+            })
+            .await;
+        assert!(matches!(
+            write_error,
+            Err(MessageStreamError::Quic {
+                source: quic::StreamError::Connection {
+                    source: quic::ConnectionError::Transport { source }
+                }
+            }) if source.reason == "write lifecycle closed"
+        ));
+        assert!(
+            write_quic.close_calls().is_empty(),
+            "already-closed connections should return their terminal error without closing again"
+        );
+    }
+
+    #[tokio::test]
+    async fn simple_test_stream_helpers_poll_to_ready() {
+        let mut reader = TestReadStream {
+            stream_id: VarInt::from_u32(30),
+        };
+        assert!(
+            poll_fn(|cx| Pin::new(&mut reader).poll_next(cx))
+                .await
+                .is_none()
+        );
+
+        let mut stream_id_error_reader = StreamIdErrorReadStream {
+            error: quic::StreamError::Reset {
+                code: VarInt::from_u32(31),
+            },
+        };
+        assert!(
+            poll_fn(|cx| Pin::new(&mut stream_id_error_reader).poll_next(cx))
+                .await
+                .is_none()
+        );
+        poll_fn(|cx| Pin::new(&mut stream_id_error_reader).poll_stop(cx, VarInt::from_u32(0)))
+            .await
+            .expect("stream-id-error reader stop should still be ready");
+
+        let mut tracked_reader = TrackedReadStream {
+            stream_id: VarInt::from_u32(32),
+            stop_tx: mpsc::unbounded_channel().0,
+        };
+        assert!(
+            poll_fn(|cx| Pin::new(&mut tracked_reader).poll_next(cx))
+                .await
+                .is_none()
+        );
+
+        let mut writer = TestWriteStream {
+            stream_id: VarInt::from_u32(33),
+        };
+        poll_fn(|cx| Pin::new(&mut writer).poll_ready(cx))
+            .await
+            .expect("test writer should be ready");
+        Pin::new(&mut writer)
+            .start_send(Bytes::from_static(b"x"))
+            .expect("test writer should accept bytes");
+        poll_fn(|cx| Pin::new(&mut writer).poll_flush(cx))
+            .await
+            .expect("test writer should flush");
+        poll_fn(|cx| Pin::new(&mut writer).poll_close(cx))
+            .await
+            .expect("test writer should close");
+
+        let mut stream_id_error_writer = StreamIdErrorWriteStream {
+            error: quic::StreamError::Reset {
+                code: VarInt::from_u32(34),
+            },
+        };
+        poll_fn(|cx| Pin::new(&mut stream_id_error_writer).poll_cancel(cx, VarInt::from_u32(0)))
+            .await
+            .expect("stream-id-error writer cancel should be ready");
+        poll_fn(|cx| Pin::new(&mut stream_id_error_writer).poll_ready(cx))
+            .await
+            .expect("stream-id-error writer should be ready");
+        Pin::new(&mut stream_id_error_writer)
+            .start_send(Bytes::from_static(b"x"))
+            .expect("stream-id-error writer should accept bytes");
+        poll_fn(|cx| Pin::new(&mut stream_id_error_writer).poll_flush(cx))
+            .await
+            .expect("stream-id-error writer should flush");
+        poll_fn(|cx| Pin::new(&mut stream_id_error_writer).poll_close(cx))
+            .await
+            .expect("stream-id-error writer should close");
+
+        let (cancel_tx, _cancel_rx) = mpsc::unbounded_channel();
+        let mut tracked_writer = TrackedWriteStream {
+            stream_id: VarInt::from_u32(35),
+            cancel_tx,
+        };
+        poll_fn(|cx| Pin::new(&mut tracked_writer).poll_ready(cx))
+            .await
+            .expect("tracked writer should be ready");
+        Pin::new(&mut tracked_writer)
+            .start_send(Bytes::from_static(b"x"))
+            .expect("tracked writer should accept bytes");
+        poll_fn(|cx| Pin::new(&mut tracked_writer).poll_flush(cx))
+            .await
+            .expect("tracked writer should flush");
+        poll_fn(|cx| Pin::new(&mut tracked_writer).poll_close(cx))
+            .await
+            .expect("tracked writer should close");
     }
 
     #[tokio::test]

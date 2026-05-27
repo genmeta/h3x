@@ -371,6 +371,11 @@ fn display_roundtrip() {
     let cases: &[(&str, &str)] = &[
         // display_full
         ("iface://v4.enp17s0:8080", "iface://v4.enp17s0:8080"),
+        // display_normalizes_uppercase_family
+        (
+            "iface://V6.enp17s0:8080?reuse=true",
+            "iface://v6.enp17s0:8080/?reuse=true",
+        ),
         // display_no_port
         ("iface://v4.enp17s0", "iface://v4.enp17s0"),
         // display_no_family
@@ -612,6 +617,10 @@ fn parse_errors() {
         "inet://v6.[::1]:8080".parse::<BindPattern>().is_err(),
         "family prefix should be rejected for IP addresses"
     );
+    assert!(
+        "iface://enp17s0:70000".parse::<BindPattern>().is_err(),
+        "ports above u16::MAX should be rejected"
+    );
 }
 
 #[test]
@@ -651,4 +660,15 @@ fn inet_pattern_matches_ip_address_and_port_only() {
 
     let non_ip_pattern: BindPattern = "inet://*:8080".parse().unwrap();
     assert!(!non_ip_pattern.matches(&"inet://127.0.0.1:8080".parse().unwrap()));
+}
+
+#[test]
+fn wildcard_port_matches_any_actual_port_for_supported_schemes() {
+    let iface_pattern: BindPattern = "iface://v4.en*".parse().unwrap();
+    assert!(iface_pattern.matches(&"iface://v4.enp17s0:0".parse().unwrap()));
+    assert!(iface_pattern.matches(&"iface://v4.enp17s0:4433".parse().unwrap()));
+
+    let inet_pattern: BindPattern = "inet://127.0.0.1".parse().unwrap();
+    assert!(inet_pattern.matches(&"inet://127.0.0.1:0".parse().unwrap()));
+    assert!(inet_pattern.matches(&"inet://127.0.0.1:4433".parse().unwrap()));
 }
