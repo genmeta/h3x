@@ -460,6 +460,41 @@ mod tests {
         assert!(registry.route_uni(session_id, uni_stream(6)).is_err());
     }
 
+    #[tokio::test]
+    async fn route_closed_channels_return_original_streams() {
+        let registry = Registry::default();
+        let session_id = StreamId::from(VarInt::from_u32(16));
+        let registered = registry
+            .register(session_id)
+            .expect("registration should succeed");
+
+        drop(registered.bidi_rx);
+        drop(registered.uni_rx);
+
+        let mut returned_bidi = registry
+            .route_bi(session_id, bidi_stream(17))
+            .expect_err("closed bidi receiver should reject stream");
+        assert_eq!(
+            returned_bidi
+                .0
+                .stream_id()
+                .await
+                .expect("returned bidi stream id should be readable"),
+            VarInt::from_u32(17)
+        );
+
+        let mut returned_uni = registry
+            .route_uni(session_id, uni_stream(18))
+            .expect_err("closed uni receiver should reject stream");
+        assert_eq!(
+            returned_uni
+                .stream_id()
+                .await
+                .expect("returned uni stream id should be readable"),
+            VarInt::from_u32(18)
+        );
+    }
+
     #[test]
     fn route_rejects_when_session_channel_is_full() {
         let registry = Registry::default();
@@ -483,6 +518,111 @@ mod tests {
 
         assert!(registry.route_bi(session_id, bidi_stream(99)).is_err());
         assert!(registry.route_uni(session_id, uni_stream(100)).is_err());
+    }
+
+    #[tokio::test]
+    async fn route_full_channels_return_original_streams() {
+        let registry = Registry::default();
+        let session_id = StreamId::from(VarInt::from_u32(20));
+        let _registered = registry
+            .register(session_id)
+            .expect("registration should succeed");
+
+        for id in 0..SESSION_STREAM_CHANNEL_SIZE {
+            assert!(
+                registry
+                    .route_bi(session_id, bidi_stream(id as u32))
+                    .is_ok()
+            );
+            assert!(
+                registry
+                    .route_uni(session_id, uni_stream(id as u32))
+                    .is_ok()
+            );
+        }
+
+        let mut returned_bidi = registry
+            .route_bi(session_id, bidi_stream(21))
+            .expect_err("full bidi channel should reject stream");
+        assert_eq!(
+            returned_bidi
+                .0
+                .stream_id()
+                .await
+                .expect("returned bidi stream id should be readable"),
+            VarInt::from_u32(21)
+        );
+
+        let mut returned_uni = registry
+            .route_uni(session_id, uni_stream(22))
+            .expect_err("full uni channel should reject stream");
+        assert_eq!(
+            returned_uni
+                .stream_id()
+                .await
+                .expect("returned uni stream id should be readable"),
+            VarInt::from_u32(22)
+        );
+    }
+
+    #[tokio::test]
+    async fn close_unregisters_session_and_allows_id_reuse() {
+        let registry = Registry::default();
+        let session_id = StreamId::from(VarInt::from_u32(24));
+        let registered = registry
+            .register(session_id)
+            .expect("initial registration should succeed");
+
+        registered.state.close();
+        assert_eq!(registry.len(), 0);
+
+        let mut returned = registry
+            .route_uni(session_id, uni_stream(25))
+            .expect_err("closed session should no longer route streams");
+        assert_eq!(
+            returned
+                .stream_id()
+                .await
+                .expect("returned uni stream id should be readable"),
+            VarInt::from_u32(25)
+        );
+
+        let mut registered_again = registry
+            .register(session_id)
+            .expect("closed session id should be reusable");
+        assert_eq!(registry.len(), 1);
+        assert!(registry.route_uni(session_id, uni_stream(26)).is_ok());
+
+        let mut routed = registered_again
+            .uni_rx
+            .recv()
+            .await
+            .expect("re-registered session should receive streams");
+        assert_eq!(
+            routed
+                .stream_id()
+                .await
+                .expect("routed uni stream id should be readable"),
+            VarInt::from_u32(26)
+        );
+    }
+
+    #[test]
+    fn cloned_session_state_keeps_registration_until_last_state_drop() {
+        let registry = Registry::default();
+        let session_id = StreamId::from(VarInt::from_u32(28));
+        let registered = registry
+            .register(session_id)
+            .expect("registration should succeed");
+        let state = Arc::clone(&registered.state);
+
+        drop(registered);
+        assert_eq!(registry.len(), 1);
+        assert!(registry.route_uni(session_id, uni_stream(29)).is_err());
+        assert!(state.check_open().is_ok());
+
+        drop(state);
+        assert_eq!(registry.len(), 0);
     }
 
     #[tokio::test]

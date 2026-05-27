@@ -278,6 +278,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_open_guards_return_success_and_passthrough_closed() {
+        let lifecycle = TestLifecycle::default();
+
+        let value = lifecycle
+            .guard_open(async { Ok::<_, OpenStreamError>(7) })
+            .await
+            .expect("successful open operation should pass through");
+        assert_eq!(value, 7);
+
+        let error = lifecycle
+            .guard_open(async {
+                Err::<(), _>(OpenStreamError::Closed {
+                    source: SessionClosed,
+                })
+            })
+            .await
+            .expect_err("closed session error should pass through");
+        assert!(matches!(error, OpenStreamError::Closed { .. }));
+        lifecycle
+            .check_open()
+            .expect("non-connection open error must not latch");
+
+        let error = lifecycle
+            .guard_open_with(async { Err::<(), _>("closed") }, |_| {
+                OpenStreamError::Closed {
+                    source: SessionClosed,
+                }
+            })
+            .await
+            .expect_err("converted closed session error should pass through");
+        assert!(matches!(error, OpenStreamError::Closed { .. }));
+        lifecycle
+            .check_open()
+            .expect("converted non-connection open error must not latch");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_open_guard_with_uses_error_latched_during_operation() {
+        let lifecycle = TestLifecycle::default();
+        let latch = lifecycle.latch.clone();
+
+        let error = lifecycle
+            .guard_open_with(
+                async move {
+                    latch.latch_with(|| connection_error("latched during open"));
+                    Err::<(), _>("unconverted")
+                },
+                |_| {
+                    panic!("conversion should be skipped once operation latched a connection error")
+                },
+            )
+            .await
+            .expect_err("latched open error should be returned");
+
+        let OpenStreamError::Open { source } = error else {
+            panic!("expected open error");
+        };
+        assert_reason(&source, "latched during open");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_checks_surface_latched_open_error() {
+        let lifecycle = TestLifecycle::default();
+
+        let error = lifecycle
+            .guard_open(async {
+                Err::<(), _>(OpenStreamError::Open {
+                    source: connection_error("check latch"),
+                })
+            })
+            .await
+            .expect_err("open error should be returned");
+        let OpenStreamError::Open { source } = error else {
+            panic!("expected open error");
+        };
+        assert_reason(&source, "check latch");
+
+        let open_error = lifecycle
+            .check_open()
+            .expect_err("open check should surface latched error");
+        let OpenStreamError::Open { source } = open_error else {
+            panic!("expected open error");
+        };
+        assert_reason(&source, "check latch");
+
+        let accept_error = lifecycle
+            .check_accept()
+            .expect_err("accept check should surface latched error");
+        let AcceptStreamError::Connection { source } = accept_error else {
+            panic!("expected connection error");
+        };
+        assert_reason(&source, "check latch");
+    }
+
+    #[tokio::test]
     async fn lifecycle_accept_guards_preserve_error_shape() {
         let lifecycle = TestLifecycle::default();
 
@@ -312,5 +407,61 @@ mod tests {
             panic!("expected connection error");
         };
         assert_reason(&source, "converted accept");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_accept_guards_return_success_and_passthrough_closed() {
+        let lifecycle = TestLifecycle::default();
+
+        let value = lifecycle
+            .guard_accept(async { Ok::<_, AcceptStreamError>(11) })
+            .await
+            .expect("successful accept operation should pass through");
+        assert_eq!(value, 11);
+
+        let error = lifecycle
+            .guard_accept(async {
+                Err::<(), _>(AcceptStreamError::Closed {
+                    source: SessionClosed,
+                })
+            })
+            .await
+            .expect_err("closed session error should pass through");
+        assert!(matches!(error, AcceptStreamError::Closed { .. }));
+        lifecycle
+            .check_accept()
+            .expect("non-connection accept error must not latch");
+
+        let value = lifecycle
+            .guard_accept_err(async { Ok::<_, &'static str>(13) }, |_| {
+                panic!("conversion should not run for successful accept operation")
+            })
+            .await
+            .expect("successful converted accept operation should pass through");
+        assert_eq!(value, 13);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_accept_guard_uses_error_latched_during_operation() {
+        let lifecycle = TestLifecycle::default();
+        let latch = lifecycle.latch.clone();
+
+        let error = lifecycle
+            .guard_accept_err(
+                async move {
+                    latch.latch_with(|| connection_error("latched during accept"));
+                    Err::<(), _>("unconverted")
+                },
+                |_| {
+                    panic!("conversion should be skipped once operation latched a connection error")
+                },
+            )
+            .await
+            .expect_err("latched accept error should be returned");
+
+        let AcceptStreamError::Connection { source } = error else {
+            panic!("expected connection error");
+        };
+        assert_reason(&source, "latched during accept");
     }
 }

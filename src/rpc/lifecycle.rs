@@ -391,6 +391,21 @@ mod tests {
     }
 
     #[test]
+    fn cloned_latch_handles_share_canonical_error() {
+        let latch = ConnectionErrorLatch::new();
+        let clone = latch.clone();
+
+        assert!(latch.check().is_ok());
+        assert!(clone.check().is_ok());
+
+        let installed = clone.latch_with(|| make_err(11));
+        let observed = latch.check().unwrap_err();
+
+        assert_eq!(error_kind(&installed), VarInt::from_u32(11));
+        assert_eq!(error_kind(&observed), VarInt::from_u32(11));
+    }
+
+    #[test]
     fn check_with_probe_folds_probe_into_latch() {
         let lc = TestLifecycle::new();
         lc.set_probe(make_err(42));
@@ -415,6 +430,26 @@ mod tests {
         assert!(quic::Lifecycle::check(&lc).is_ok());
     }
 
+    #[test]
+    fn check_with_probe_skips_probe_when_latched() {
+        let lc = TestLifecycle::new();
+        lc.latch.latch_with(|| make_err(12));
+
+        let called = Mutex::new(false);
+        let err = lc
+            .check_with_probe(|| {
+                *called.lock().unwrap() = true;
+                Some(make_err(13))
+            })
+            .unwrap_err();
+
+        assert_eq!(error_kind(&err), VarInt::from_u32(12));
+        assert!(
+            !*called.lock().unwrap(),
+            "probe must not run after a terminal error is latched"
+        );
+    }
+
     #[tokio::test]
     async fn resolve_closed_returns_latched_without_awaiting() {
         let lc = TestLifecycle::new();
@@ -433,6 +468,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_closed_returns_error_that_wins_during_wait() {
+        let lc = TestLifecycle::new();
+        let latch = lc.latch.clone();
+
+        let got = lc
+            .resolve_closed(async move {
+                latch.latch_with(|| make_err(14));
+                make_err(15)
+            })
+            .await;
+
+        assert_eq!(error_kind(&got), VarInt::from_u32(14));
+        assert_eq!(
+            error_kind(&lc.latch.check().unwrap_err()),
+            VarInt::from_u32(14)
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_closed_latches_wait_result() {
         let lc = TestLifecycle::new();
         lc.set_wait(make_err(5));
@@ -448,6 +502,38 @@ mod tests {
             &again,
             ConnectionError::Transport { source } if source.kind == VarInt::from_u32(5)
         ));
+    }
+
+    #[tokio::test]
+    async fn guard_does_not_poll_operation_after_failed_check() {
+        let lc = TestLifecycle::new();
+        lc.set_probe(make_err(16));
+
+        let called = Arc::new(Mutex::new(false));
+        let called2 = called.clone();
+        let res: Result<(), ConnectionError> = lc
+            .guard(async move {
+                *called2.lock().unwrap() = true;
+                Ok(())
+            })
+            .await;
+
+        assert_eq!(error_kind(&res.unwrap_err()), VarInt::from_u32(16));
+        assert!(
+            !*called.lock().unwrap(),
+            "operation future must not be polled after failed check"
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_latches_operation_error() {
+        let lc = TestLifecycle::new();
+
+        let first: Result<(), ConnectionError> = lc.guard(async { Err(make_err(17)) }).await;
+        let second: Result<(), ConnectionError> = lc.guard(async { Err(make_err(18)) }).await;
+
+        assert_eq!(error_kind(&first.unwrap_err()), VarInt::from_u32(17));
+        assert_eq!(error_kind(&second.unwrap_err()), VarInt::from_u32(17));
     }
 
     #[tokio::test]
@@ -494,5 +580,58 @@ mod tests {
             }
             _ => panic!("unexpected error shape"),
         }
+    }
+
+    #[test]
+    fn guard_sync_with_success_does_not_map_error() {
+        let lc = TestLifecycle::new();
+        let called = Mutex::new(false);
+
+        let out = lc
+            .guard_sync_with(
+                || Ok::<_, &'static str>(21),
+                |_| {
+                    *called.lock().unwrap() = true;
+                    make_err(22)
+                },
+            )
+            .unwrap();
+
+        assert_eq!(out, 21);
+        assert!(
+            !*called.lock().unwrap(),
+            "map_err must not run for successful operations"
+        );
+    }
+
+    #[test]
+    fn guard_sync_with_skips_operation_and_mapping_after_failed_check() {
+        let lc = TestLifecycle::new();
+        lc.set_probe(make_err(23));
+
+        let op_called = Mutex::new(false);
+        let map_called = Mutex::new(false);
+        let err = lc
+            .guard_sync_with(
+                || {
+                    *op_called.lock().unwrap() = true;
+                    Err::<(), _>("not reached")
+                },
+                |_| {
+                    *map_called.lock().unwrap() = true;
+                    make_err(24)
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(error_kind(&err), VarInt::from_u32(23));
+        assert!(
+            !*op_called.lock().unwrap(),
+            "operation must not run after failed check"
+        );
+        assert!(
+            !*map_called.lock().unwrap(),
+            "map_err must not run when operation is skipped"
+        );
     }
 }

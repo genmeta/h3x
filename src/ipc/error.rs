@@ -83,6 +83,8 @@ impl From<remoc::rtc::CallError> for IpcAcceptError {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
+
     use super::*;
     use crate::{error::Code, quic::ApplicationError, varint::VarInt};
 
@@ -93,6 +95,60 @@ mod tests {
         };
 
         assert_eq!(error.to_string(), "socketpair failed");
+    }
+
+    #[test]
+    fn plumbing_io_error_preserves_message_and_has_no_source() {
+        let error = IpcPlumbingError::Io {
+            message: "socketpair failed".to_owned(),
+        };
+
+        let IpcPlumbingError::Io { message } = &error else {
+            panic!("expected io plumbing error");
+        };
+        assert_eq!(message, "socketpair failed");
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn plumbing_rpc_error_displays_like_call_error() {
+        let source = remoc::rtc::CallError::Dropped;
+        let expected = source.to_string();
+        let error = IpcPlumbingError::Rpc { source };
+
+        assert_eq!(error.to_string(), expected);
+    }
+
+    #[test]
+    fn plumbing_error_converts_to_open_and_accept_errors() {
+        let open_error = IpcOpenError::from(IpcPlumbingError::Io {
+            message: "open socketpair failed".to_owned(),
+        });
+        let IpcOpenError::Plumbing { source } = open_error else {
+            panic!("plumbing error should stay plumbing-scoped on open");
+        };
+        assert_eq!(source.to_string(), "open socketpair failed");
+
+        let accept_error = IpcAcceptError::from(IpcPlumbingError::Io {
+            message: "accept socketpair failed".to_owned(),
+        });
+        let IpcAcceptError::Plumbing { source } = accept_error else {
+            panic!("plumbing error should stay plumbing-scoped on accept");
+        };
+        assert_eq!(source.to_string(), "accept socketpair failed");
+    }
+
+    #[test]
+    fn open_and_accept_io_plumbing_errors_display_inner_message() {
+        let open_error = IpcOpenError::from(IpcPlumbingError::Io {
+            message: "open socketpair failed".to_owned(),
+        });
+        assert_eq!(open_error.to_string(), "open socketpair failed");
+
+        let accept_error = IpcAcceptError::from(IpcPlumbingError::Io {
+            message: "accept socketpair failed".to_owned(),
+        });
+        assert_eq!(accept_error.to_string(), "accept socketpair failed");
     }
 
     #[test]
