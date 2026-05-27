@@ -871,6 +871,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipc_listener_accepted_handle_forwards_connection_rpc_methods() {
+        let (mut listener, conn_tx, server_task) = setup_listener_pair().await;
+        conn_tx
+            .send(Arc::new(TestConnection))
+            .await
+            .expect("send test connection");
+
+        let handle = timeout(Duration::from_secs(1), quic::Listen::accept(&mut listener))
+            .await
+            .expect("accept timeout")
+            .expect("accept succeeds");
+
+        assert!(
+            quic::WithLocalAgent::local_agent(handle.as_ref())
+                .await
+                .expect("local agent rpc")
+                .is_none()
+        );
+        assert!(
+            quic::WithRemoteAgent::remote_agent(handle.as_ref())
+                .await
+                .expect("remote agent rpc")
+                .is_none()
+        );
+
+        let open_error = match quic::ManageStream::open_bi(handle.as_ref()).await {
+            Ok(_) => panic!("open_bi error should propagate over ipc"),
+            Err(error) => error,
+        };
+        let ConnectionError::Transport { source } = open_error else {
+            panic!("expected open_bi transport error");
+        };
+        assert!(source.reason.contains("open_bi should not be called"));
+
+        conn_tx
+            .send(Arc::new(TestConnection))
+            .await
+            .expect("send second test connection");
+        drop(conn_tx);
+        let accept_handle = timeout(Duration::from_secs(1), quic::Listen::accept(&mut listener))
+            .await
+            .expect("second accept timeout")
+            .expect("second accept succeeds");
+
+        let accept_error = match quic::ManageStream::accept_bi(accept_handle.as_ref()).await {
+            Ok(_) => panic!("accept_bi error should propagate over ipc"),
+            Err(error) => error,
+        };
+        let ConnectionError::Transport { source } = accept_error else {
+            panic!("expected accept_bi transport error");
+        };
+        assert!(source.reason.contains("accept_bi should not be called"));
+
+        drop(handle);
+        drop(accept_handle);
+        drop(listener);
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
     async fn ipc_listener_accept_returns_rpc_error() {
         let parent_transport = ParentTransport::new();
         let (client, server_task) = spawn_rpc_server(StaticIpcListen {

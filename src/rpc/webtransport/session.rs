@@ -285,6 +285,7 @@ mod tests {
     struct TestRpcSession {
         fail_open: bool,
         close_accept: bool,
+        fail_accept: bool,
         tasks: Mutex<Vec<AbortOnDropHandle<()>>>,
     }
 
@@ -293,6 +294,7 @@ mod tests {
             Self {
                 fail_open: false,
                 close_accept: false,
+                fail_accept: false,
                 tasks: Mutex::new(Vec::new()),
             }
         }
@@ -300,6 +302,13 @@ mod tests {
         fn fail_open() -> Self {
             Self {
                 fail_open: true,
+                ..Self::new()
+            }
+        }
+
+        fn fail_accept() -> Self {
+            Self {
+                fail_accept: true,
                 ..Self::new()
             }
         }
@@ -388,6 +397,11 @@ mod tests {
         async fn accept_bi(
             &self,
         ) -> Result<(ReadStreamClient, WriteStreamClient), AcceptStreamError> {
+            if self.fail_accept {
+                return Err(AcceptStreamError::Connection {
+                    source: connection_error("rpc accept failed"),
+                });
+            }
             if self.close_accept {
                 return Err(AcceptStreamError::Closed {
                     source: SessionClosed,
@@ -397,6 +411,11 @@ mod tests {
         }
 
         async fn accept_uni(&self) -> Result<ReadStreamClient, AcceptStreamError> {
+            if self.fail_accept {
+                return Err(AcceptStreamError::Connection {
+                    source: connection_error("rpc accept failed"),
+                });
+            }
             if self.close_accept {
                 return Err(AcceptStreamError::Closed {
                     source: SessionClosed,
@@ -518,6 +537,15 @@ mod tests {
         (quic, connection)
     }
 
+    fn connection_with_enabled_webtransport_pair() -> (
+        Arc<MockConnection>,
+        Arc<ConnectionState<dyn quic::DynConnection>>,
+    ) {
+        let (quic, connection) = connection_with_webtransport_pair();
+        quic.enable_stream_ops();
+        (quic, connection)
+    }
+
     fn connection_with_webtransport() -> Arc<ConnectionState<dyn quic::DynConnection>> {
         connection_with_webtransport_pair().1
     }
@@ -620,6 +648,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_session_into_inner_returns_rpc_client() {
+        let session = Arc::new(TestRpcSession::new());
+        let (_server_task, client) = spawn_rpc_session(session);
+        let parent = Arc::new(TestLifecycle::default());
+        let remote = RemoteWebTransportSession::new(client, VarInt::from_u32(42), parent.clone());
+
+        let client = remote.into_inner();
+        let converted = client.into_webtransport_session(VarInt::from_u32(43), parent);
+
+        assert_eq!(
+            webtransport::Session::id(&converted),
+            StreamId::from(VarInt::from_u32(43)),
+        );
+        webtransport::Session::open_uni(&converted)
+            .await
+            .expect("client returned by into_inner should remain usable");
+    }
+
+    #[tokio::test]
     async fn remote_session_latches_open_errors() {
         let session = Arc::new(TestRpcSession::fail_open());
         let (_server_task, client) = spawn_rpc_session(session);
@@ -667,6 +714,34 @@ mod tests {
             panic!("accept_uni should report session closure");
         };
         assert!(matches!(error, AcceptStreamError::Closed { .. }));
+    }
+
+    #[tokio::test]
+    async fn remote_session_latches_accept_connection_errors() {
+        let session = Arc::new(TestRpcSession::fail_accept());
+        let (_server_task, client) = spawn_rpc_session(session);
+        let parent = Arc::new(TestLifecycle::default());
+        let remote = RemoteWebTransportSession::new(client, VarInt::from_u32(42), parent);
+
+        let Err(error) = webtransport::Session::accept_bi(&remote).await else {
+            panic!("accept_bi should surface connection failure");
+        };
+        let AcceptStreamError::Connection { source } = error else {
+            panic!("expected accept connection error");
+        };
+        assert_reason(&source, "rpc accept failed");
+
+        let Err(error) = webtransport::Session::accept_uni(&remote).await else {
+            panic!("latched accept error should block later accepts");
+        };
+        let AcceptStreamError::Connection { source } = error else {
+            panic!("expected latched accept connection error");
+        };
+        assert_reason(&source, "rpc accept failed");
+
+        let error =
+            quic::Lifecycle::check(&remote).expect_err("latched accept error should fail check");
+        assert_reason(&error, "rpc accept failed");
     }
 
     #[tokio::test]
@@ -764,6 +839,51 @@ mod tests {
             open_uni,
             OpenStreamError::Open { .. } | OpenStreamError::Closed { .. },
         ));
+    }
+
+    #[tokio::test]
+    async fn concrete_webtransport_rpc_session_wraps_successful_open_streams() {
+        let (_quic, connection) = connection_with_enabled_webtransport_pair();
+        let session =
+            webtransport::WebTransportSession::try_from(webtransport_connect_on(connection))
+                .expect("connect should create webtransport session");
+
+        let (reader, writer) = WebTransportRpcSession::open_bi(&session)
+            .await
+            .expect("open_bi should wrap successful streams");
+        let mut reader = reader.into_boxed_quic();
+        let mut writer = writer.into_boxed_quic();
+        assert_eq!(
+            reader.stream_id().await.expect("reader id"),
+            VarInt::from_u32(0)
+        );
+        assert_eq!(
+            writer.stream_id().await.expect("writer id"),
+            VarInt::from_u32(0)
+        );
+        writer
+            .send(Bytes::from_static(b"wrapped-bidi"))
+            .await
+            .expect("wrapped bidi writer should remain usable");
+        assert!(reader.next().await.is_none());
+
+        let (_quic, connection) = connection_with_enabled_webtransport_pair();
+        let session =
+            webtransport::WebTransportSession::try_from(webtransport_connect_on(connection))
+                .expect("connect should create webtransport session");
+
+        let writer = WebTransportRpcSession::open_uni(&session)
+            .await
+            .expect("open_uni should wrap successful stream");
+        let mut writer = writer.into_boxed_quic();
+        assert_eq!(
+            writer.stream_id().await.expect("writer id"),
+            VarInt::from_u32(0)
+        );
+        writer
+            .send(Bytes::from_static(b"wrapped-uni"))
+            .await
+            .expect("wrapped uni writer should remain usable");
     }
 
     #[tokio::test]

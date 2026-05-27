@@ -977,14 +977,24 @@ mod tests {
     #[derive(Debug)]
     struct StreamIdErrorReadStream {
         first_chunk: Option<Bytes>,
-        close_latch: Arc<CloseLatch>,
+        close_latch: Option<Arc<CloseLatch>>,
+        first_stream_id: Option<VarInt>,
     }
 
     impl StreamIdErrorReadStream {
         fn new(close_latch: Arc<CloseLatch>) -> Self {
             Self {
                 first_chunk: Some(Bytes::from_static(&[0x01])),
-                close_latch,
+                close_latch: Some(close_latch),
+                first_stream_id: None,
+            }
+        }
+
+        fn fail_after_first_success(stream_id: VarInt) -> Self {
+            Self {
+                first_chunk: Some(Bytes::from_static(&[0x01])),
+                close_latch: None,
+                first_stream_id: Some(stream_id),
             }
         }
     }
@@ -994,7 +1004,13 @@ mod tests {
             self: Pin<&mut Self>,
             _cx: &mut Context,
         ) -> Poll<Result<VarInt, quic::StreamError>> {
-            self.close_latch.close();
+            let this = self.get_mut();
+            if let Some(stream_id) = this.first_stream_id.take() {
+                return Poll::Ready(Ok(stream_id));
+            }
+            if let Some(close_latch) = &this.close_latch {
+                close_latch.close();
+            }
             Poll::Ready(Err(quic::StreamError::Reset {
                 code: VarInt::from_u32(0x11),
             }))
@@ -1028,6 +1044,15 @@ mod tests {
         let stream_id = VarInt::from_u32(stream_id);
         let reader = PeekableStreamReader::new(StreamReader::new(Box::pin(
             StreamIdErrorReadStream::new(close_latch),
+        ) as BoxReadStream));
+        let (_unused_reader, writer) = quic::test::mock_stream_pair(stream_id);
+        (reader, SinkWriter::new(Box::pin(writer) as BoxWriteStream))
+    }
+
+    fn second_stream_id_error_request_stream(stream_id: u32) -> ErasedPeekableBiStream {
+        let stream_id = VarInt::from_u32(stream_id);
+        let reader = PeekableStreamReader::new(StreamReader::new(Box::pin(
+            StreamIdErrorReadStream::fail_after_first_success(stream_id),
         ) as BoxReadStream));
         let (_unused_reader, writer) = quic::test::mock_stream_pair(stream_id);
         (reader, SinkWriter::new(Box::pin(writer) as BoxWriteStream))
@@ -1724,6 +1749,45 @@ mod tests {
                 .expect("recording service mutex should not be poisoned")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn serve_connection_continues_after_stream_id_lookup_failure() {
+        let quic = Arc::new(ControlledConnection::new("stream id failed then recovered"));
+        let state = state_with_qpack(quic.clone()).await;
+        enqueue_http3_request(&state, second_stream_id_error_request_stream(29)).await;
+        enqueue_http3_request(&state, http3_request_stream(31).await).await;
+        let connection = Arc::new(H3Connection::from_state_for_test(state));
+        let seen_streams = Arc::new(Mutex::new(Vec::new()));
+
+        timeout(
+            Duration::from_millis(100),
+            serve_connection(
+                connection,
+                RecordingService {
+                    seen_streams: seen_streams.clone(),
+                    close_latch: quic.close_latch.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("serve_connection should continue after stream-id failure");
+
+        timeout(Duration::from_millis(100), async {
+            loop {
+                if seen_streams
+                    .lock()
+                    .expect("recording service mutex should not be poisoned")
+                    .as_slice()
+                    == [StreamId(VarInt::from_u32(31))]
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("valid request after stream-id failure should be served");
     }
 
     #[tokio::test]

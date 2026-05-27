@@ -343,7 +343,7 @@ mod tests {
     };
     use smallvec::smallvec;
     use tokio::{
-        sync::Mutex,
+        sync::{Mutex, Notify},
         task::JoinHandle,
         time::{Duration, timeout},
     };
@@ -502,17 +502,45 @@ mod tests {
 
     struct TestLifecycle {
         terminal_error: SetOnce<ConnectionError>,
+        close_calls: StdMutex<Vec<(Code, Cow<'static, str>)>>,
+        close_notify: Notify,
     }
 
     impl TestLifecycle {
         fn new() -> Self {
             Self {
                 terminal_error: SetOnce::new(),
+                close_calls: StdMutex::new(Vec::new()),
+                close_notify: Notify::new(),
             }
         }
 
         fn set_terminal_error(&self, error: ConnectionError) {
             let _ = self.terminal_error.set(error);
+        }
+
+        fn record_close(&self, code: Code, reason: Cow<'static, str>) {
+            self.close_calls
+                .lock()
+                .expect("close calls mutex poisoned")
+                .push((code, reason));
+            self.close_notify.notify_waiters();
+        }
+
+        async fn wait_for_close_call(&self) -> (Code, Cow<'static, str>) {
+            loop {
+                let notified = self.close_notify.notified();
+                if let Some(call) = self
+                    .close_calls
+                    .lock()
+                    .expect("close calls mutex poisoned")
+                    .first()
+                    .cloned()
+                {
+                    return call;
+                }
+                notified.await;
+            }
         }
     }
 
@@ -568,7 +596,9 @@ mod tests {
     }
 
     impl quic::Lifecycle for TestConnection {
-        fn close(&self, _code: Code, _reason: Cow<'static, str>) {}
+        fn close(&self, code: Code, reason: Cow<'static, str>) {
+            self.lifecycle.record_close(code, reason);
+        }
 
         fn check(&self) -> Result<(), ConnectionError> {
             match self.lifecycle.terminal_error.peek() {
@@ -1064,6 +1094,81 @@ mod tests {
             .await
             .expect("peer task timeout")
             .expect("peer task panicked");
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn ipc_connector_connected_handle_forwards_connection_rpc_methods() {
+        let (connection, lifecycle) = TestConnection::new();
+        let authorities = Arc::new(StdMutex::new(Vec::new()));
+        let parent_transport = ParentTransport::new();
+        let fd_registry = parent_transport.fd_registry();
+        let adapter = DrivingConnectAdapter::<remoc::codec::Default, _> {
+            inner: ConnectAdapter::new(
+                RecordingConnect {
+                    connection,
+                    authorities,
+                },
+                parent_transport.fd_sender(),
+            ),
+            parent_transport: Mutex::new(parent_transport),
+        };
+        let (client, server_task) = spawn_rpc_server(adapter);
+        let connector = IpcConnector::<remoc::codec::Default>::new(client, fd_registry);
+        let handle = quic::Connect::connect(&connector, &Authority::from_static("server.example"))
+            .await
+            .expect("connect succeeds");
+
+        assert!(
+            quic::WithLocalAgent::local_agent(handle.as_ref())
+                .await
+                .expect("local agent rpc")
+                .is_none()
+        );
+        assert!(
+            quic::WithRemoteAgent::remote_agent(handle.as_ref())
+                .await
+                .expect("remote agent rpc")
+                .is_none()
+        );
+
+        let open_error = match quic::ManageStream::open_bi(handle.as_ref()).await {
+            Ok(_) => panic!("open_bi error should propagate over ipc"),
+            Err(error) => error,
+        };
+        let ConnectionError::Transport { source } = open_error else {
+            panic!("expected open_bi transport error");
+        };
+        assert!(source.reason.contains("open_bi should not be called"));
+
+        let accept_handle =
+            quic::Connect::connect(&connector, &Authority::from_static("server.example"))
+                .await
+                .expect("second connect succeeds");
+        let accept_error = match quic::ManageStream::accept_bi(accept_handle.as_ref()).await {
+            Ok(_) => panic!("accept_bi error should propagate over ipc"),
+            Err(error) => error,
+        };
+        let ConnectionError::Transport { source } = accept_error else {
+            panic!("expected accept_bi transport error");
+        };
+        assert!(source.reason.contains("accept_bi should not be called"));
+
+        quic::Lifecycle::close(
+            accept_handle.as_ref(),
+            Code::H3_NO_ERROR,
+            Cow::Borrowed("client requested close"),
+        );
+        let (code, reason) = timeout(Duration::from_secs(1), lifecycle.wait_for_close_call())
+            .await
+            .expect("close rpc timeout");
+        assert_eq!(code, Code::H3_NO_ERROR);
+        assert_eq!(reason, Cow::Borrowed("client requested close"));
+
+        drop(handle);
+        drop(accept_handle);
+        drop(connector);
         server_task.abort();
         let _ = server_task.await;
     }

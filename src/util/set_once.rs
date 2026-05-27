@@ -153,4 +153,17 @@ mod tests {
         assert_eq!(setter.set(11), Ok(()));
         assert_eq!(get.await, Some(11));
     }
+
+    #[test]
+    fn get_survives_notification_before_value_is_set() {
+        let value = SetOnce::new();
+        let mut get = Box::pin(value.get());
+
+        assert_eq!(get.as_mut().now_or_never(), None);
+        value.notify.notify_waiters();
+        assert_eq!(get.as_mut().now_or_never(), None);
+
+        assert_eq!(value.set(13), Ok(()));
+        assert_eq!(get.now_or_never(), Some(Some(13)));
+    }
 }
