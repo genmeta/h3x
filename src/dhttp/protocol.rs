@@ -83,12 +83,15 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{BoxReadStream, BoxWriteStream, PeekableStreamReader, SinkWriter, StreamReader},
+        codec::{
+            BoxReadStream, BoxWriteStream, EncodeExt, PeekableStreamReader, SinkWriter,
+            StreamReader,
+        },
         connection::{ConnectionState, tests::MockConnection},
         dhttp::settings::Settings,
         extended_connect::settings::EnableConnectProtocol,
         protocol::Protocols,
-        quic::{self, GetStreamIdExt},
+        quic::{self, CancelStream, GetStreamId, GetStreamIdExt},
     };
 
     #[derive(Debug)]
@@ -256,11 +259,87 @@ mod tests {
         ));
     }
 
+    async fn stream_reader_from_frames(
+        frames: impl IntoIterator<Item = Frame<BufList>>,
+    ) -> StreamReader<BoxReadStream> {
+        let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(2));
+        let mut writer = SinkWriter::new(writer);
+        for frame in frames {
+            writer
+                .encode_one(frame)
+                .await
+                .expect("encode test control frame");
+        }
+        writer.close().await.expect("close test control stream");
+        StreamReader::new(Box::pin(reader) as BoxReadStream)
+    }
+
+    async fn settings_frame(settings: &Settings) -> Frame<BufList> {
+        BufList::new()
+            .encode(settings)
+            .await
+            .expect("settings encoding into buflist is infallible")
+    }
+
+    async fn goaway_frame(stream_id: u32) -> Frame<BufList> {
+        BufList::new()
+            .encode(Goaway::new(VarInt::from_u32(stream_id)))
+            .await
+            .expect("goaway encoding into buflist is infallible")
+    }
+
     #[test]
     fn dhttp_factory_display_names_protocol() {
         let factory = DHttpProtocolFactory::default();
 
         assert_eq!(factory.to_string(), "DHTTP/3");
+    }
+
+    #[tokio::test]
+    async fn test_stream_helpers_cover_writer_control_and_sink_traits() {
+        let stream_id = VarInt::from_u32(27);
+        let mut writer = TestWriteStream { stream_id };
+
+        assert_eq!(
+            futures::future::poll_fn(|cx| Pin::new(&mut writer).poll_stream_id(cx))
+                .await
+                .expect("stream id"),
+            stream_id
+        );
+        futures::future::poll_fn(|cx| Pin::new(&mut writer).poll_cancel(cx, VarInt::from_u32(1)))
+            .await
+            .expect("cancel succeeds");
+        writer
+            .send(Bytes::from_static(b"payload"))
+            .await
+            .expect("send succeeds");
+        writer.flush().await.expect("flush succeeds");
+        writer.close().await.expect("close succeeds");
+    }
+
+    #[tokio::test]
+    async fn dhttp_protocol_debug_capacity_and_trait_routes_are_stable() {
+        let state = test_connection_state();
+        let debug = format!("{:?}", state.dhttp());
+        assert!(debug.contains("DHttpLayer"));
+        assert!(debug.contains("control_stream"));
+        assert_eq!(state.dhttp().max_unresolved_request_streams().await, 32);
+
+        let uni = test_peekable_uni_stream_with_bytes(&[0x02]).await;
+        assert!(matches!(
+            Protocol::accept_uni(state.dhttp(), uni)
+                .await
+                .expect("trait uni accept"),
+            StreamVerdict::Passed(_)
+        ));
+
+        let bi = test_peekable_bi_stream_with_bytes(28, &[0x41]).await;
+        assert!(matches!(
+            Protocol::accept_bi(state.dhttp(), bi)
+                .await
+                .expect("trait bidi accept"),
+            StreamVerdict::Passed(_)
+        ));
     }
 
     #[test]
@@ -442,6 +521,64 @@ mod tests {
                 source: crate::connection::ConnectionError::H3 { source },
             } if source.code() == Code::H3_ID_ERROR
         ));
+    }
+
+    #[tokio::test]
+    async fn control_stream_reads_settings_goaway_unknown_and_reports_close() {
+        let state = DHttpState::new(Arc::new(Settings::default()));
+        let mut settings = Settings::default();
+        settings.set(EnableConnectProtocol::setting(true));
+        let settings = Arc::new(settings);
+        let unknown = Frame::new(VarInt::from_u32(0x2f), BufList::new())
+            .expect("unknown frame type is valid");
+        let stream = stream_reader_from_frames([
+            settings_frame(&settings).await,
+            unknown,
+            goaway_frame(9).await,
+        ])
+        .await;
+
+        let error = match state.handle_control_stream(stream).await {
+            Ok(never) => match never {},
+            Err(error) => error,
+        };
+
+        assert_stream_connection_code(error, Code::H3_CLOSED_CRITICAL_STREAM);
+        assert_eq!(state.peer_settings.peek(), Some(settings));
+        assert_eq!(
+            state.peer_goaway.peek(),
+            Some(Goaway::new(VarInt::from_u32(9)))
+        );
+    }
+
+    #[tokio::test]
+    async fn control_stream_rejects_non_settings_first_frame_and_duplicate_settings() {
+        let state = DHttpState::new(Arc::new(Settings::default()));
+        let error = match state
+            .handle_control_stream(stream_reader_from_frames([goaway_frame(1).await]).await)
+            .await
+        {
+            Ok(never) => match never {},
+            Err(error) => error,
+        };
+        assert_stream_connection_code(error, Code::H3_MISSING_SETTINGS);
+
+        let state = DHttpState::new(Arc::new(Settings::default()));
+        let settings = Settings::default();
+        let error = match state
+            .handle_control_stream(
+                stream_reader_from_frames([
+                    settings_frame(&settings).await,
+                    settings_frame(&settings).await,
+                ])
+                .await,
+            )
+            .await
+        {
+            Ok(never) => match never {},
+            Err(error) => error,
+        };
+        assert_stream_connection_code(error, Code::H3_FRAME_UNEXPECTED);
     }
 
     #[tokio::test]
