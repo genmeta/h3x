@@ -44,7 +44,7 @@ impl VarInt {
     /// Construct a `VarInt` from a [`u64`].
     /// Succeeds if `x` < 2^62.
     pub const fn from_u64(value: u64) -> Result<Self, err::Overflow> {
-        if value < VARINT_MAX {
+        if value <= VARINT_MAX {
             Ok(Self(value))
         } else {
             Err(err::Overflow { value: value as _ })
@@ -63,7 +63,7 @@ impl VarInt {
     /// Construct a `VarInt` from a [`u128`].
     /// Succeeds if `x` < 2^62.
     pub fn from_u128(value: u128) -> Result<Self, err::Overflow> {
-        if value < VARINT_MAX as u128 {
+        if value <= VARINT_MAX as u128 {
             Ok(Self(value as _))
         } else {
             Err(err::Overflow { value })
@@ -264,11 +264,11 @@ mod tests {
         assert!(VarInt::from_u64(63).is_ok());
         assert!(VarInt::from_u64(16383).is_ok());
         assert!(VarInt::from_u64(VARINT_MAX - 1).is_ok());
+        assert!(VarInt::from_u64(VARINT_MAX).is_ok());
     }
 
     #[test]
     fn from_u64_overflow() {
-        assert!(VarInt::from_u64(VARINT_MAX).is_err());
         assert!(VarInt::from_u64(VARINT_MAX + 1).is_err());
         assert!(VarInt::from_u64(u64::MAX).is_err());
     }
@@ -318,9 +318,36 @@ mod tests {
         let _ = VarInt::from(0u16);
         let _ = VarInt::from(0u32);
         assert!(VarInt::try_from(0u64).is_ok());
-        assert!(VarInt::try_from(VARINT_MAX).is_err());
+        assert!(VarInt::try_from(VARINT_MAX).is_ok());
+        assert!(VarInt::try_from(VARINT_MAX + 1).is_err());
         assert!(VarInt::try_from(0u128).is_ok());
-        assert!(VarInt::try_from(VARINT_MAX as u128).is_err());
+        assert!(VarInt::try_from(VARINT_MAX as u128).is_ok());
+        assert!(VarInt::try_from(VARINT_MAX as u128 + 1).is_err());
+        assert!(VarInt::try_from(0usize).is_ok());
+        #[cfg(target_pointer_width = "64")]
+        assert!(VarInt::try_from((VARINT_MAX + 1) as usize).is_err());
+    }
+
+    #[test]
+    fn unchecked_constructor_and_constants_preserve_raw_value() {
+        // SAFETY: 123 is below the QUIC varint 2^62 bound.
+        let value = unsafe { VarInt::from_u64_unchecked(123) };
+
+        assert_eq!(value.into_inner(), 123);
+        assert_eq!(VarInt::MAX_SIZE, 8);
+        assert_eq!(VarInt::MAX.into_inner(), VARINT_MAX);
+    }
+
+    #[test]
+    fn overflow_error_reports_original_value() {
+        let overflow = VARINT_MAX as u128 + 1;
+        let error = VarInt::from_u128(overflow).expect_err("value above max is rejected");
+
+        assert_eq!(
+            error.to_string(),
+            format!("value({overflow}) too large for varint encoding")
+        );
+        assert!(format!("{error:?}").contains(&overflow.to_string()));
     }
 
     async fn encode_decode_round_trip(value: u64) {
@@ -359,6 +386,7 @@ mod tests {
         encode_decode_round_trip(1 << 30).await;
         encode_decode_round_trip(1 << 40).await;
         encode_decode_round_trip(VARINT_MAX - 1).await;
+        encode_decode_round_trip(VARINT_MAX).await;
     }
 
     #[test]
