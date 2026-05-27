@@ -552,10 +552,12 @@ impl<S: Stream<Item = Result<FieldLine, StreamError>> + Send> DecodeFrom<S> for 
                         path_field.is_none(),
                         malformed_header_section::DuplicatePseudoHeaderSnafu { name }
                     );
-                    *path_field = Some(
+                    *path_field = Some(if value.as_ref() == b"*" {
+                        super::pseudo::asterisk_path()
+                    } else {
                         PathAndQuery::from_maybe_shared(value)
-                            .map_err(MalformedHeaderSection::from)?,
-                    );
+                            .map_err(MalformedHeaderSection::from)?
+                    });
                     pseudo_headers = Some(pseudo)
                 }
                 name if name == PseudoHeaders::STATUS => {
@@ -706,6 +708,17 @@ mod tests {
             panic!("expected stream-scope H3 error");
         };
         assert_eq!(source.to_string(), expected);
+    }
+
+    fn assert_h3_error_one_of(error: StreamError, expected: &[&str]) {
+        let StreamError::H3 { source } = error else {
+            panic!("expected stream-scope H3 error");
+        };
+        let message = source.to_string();
+        assert!(
+            expected.iter().any(|expected| message == *expected),
+            "unexpected H3 error message {message:?}; expected one of {expected:?}"
+        );
     }
 
     fn request_pseudo(
@@ -1127,6 +1140,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decode_accepts_options_asterisk_path() {
+        let request = decode_fields([
+            field(b":method", b"OPTIONS"),
+            field(b":scheme", b"https"),
+            field(b":authority", b"example.test"),
+            field(b":path", b"*"),
+        ])
+        .await
+        .expect("options request field section");
+
+        assert!(request.check_pseudo().is_ok());
+        assert_eq!(request.method(), Method::OPTIONS);
+        assert_eq!(request.path().as_ref().map(PathAndQuery::as_str), Some("*"));
+        assert!(request.iter().any(|line| {
+            line.name == Bytes::from_static(PseudoHeaders::PATH.as_bytes())
+                && line.value == Bytes::from_static(b"*")
+        }));
+    }
+
+    #[tokio::test]
     async fn decode_rejects_pseudo_header_after_regular_header() {
         let fields = futures::stream::iter([
             Ok(FieldLine {
@@ -1234,7 +1267,10 @@ mod tests {
         let invalid_path = decode_fields([field(b":path", b"bad path")])
             .await
             .expect_err("invalid path");
-        assert_h3_error(invalid_path, "invalid uri character");
+        assert_h3_error_one_of(
+            invalid_path,
+            &["invalid uri character", "path does not start with slash"],
+        );
 
         let invalid_header_name = decode_fields([field(b"bad header", b"value")])
             .await

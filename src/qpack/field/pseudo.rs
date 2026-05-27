@@ -20,11 +20,11 @@ pub enum PseudoHeaders {
 }
 
 fn has_missing_path_component(path_and_query: &PathAndQuery) -> bool {
-    path_and_query == &PathAndQuery::from_static("") || path_and_query.as_str().starts_with('?')
+    path_and_query.as_str().is_empty() || path_and_query.as_str().starts_with('?')
 }
 
 fn normalize_http_path(path_and_query: PathAndQuery) -> PathAndQuery {
-    if path_and_query == PathAndQuery::from_static("") {
+    if path_and_query.as_str().is_empty() {
         return PathAndQuery::from_static("/");
     }
 
@@ -37,6 +37,13 @@ fn normalize_http_path(path_and_query: PathAndQuery) -> PathAndQuery {
     }
 
     path_and_query
+}
+
+pub(super) fn asterisk_path() -> PathAndQuery {
+    Uri::from_static("*")
+        .into_parts()
+        .path_and_query
+        .expect("asterisk URI carries a path-and-query")
 }
 
 impl PseudoHeaders {
@@ -60,11 +67,11 @@ impl PseudoHeaders {
                 if method == http::Method::OPTIONS
                     && has_missing_path_component(&path_and_query) =>
             {
-                Some(PathAndQuery::from_static("*"))
+                Some(asterisk_path())
             }
             Some(path_and_query) if is_http => Some(normalize_http_path(path_and_query)),
             Some(path_and_query) => Some(path_and_query),
-            None if method == http::Method::OPTIONS => Some(PathAndQuery::from_static("*")),
+            None if method == http::Method::OPTIONS => Some(asterisk_path()),
             None if is_http => Some(PathAndQuery::from_static("/")),
             None => None,
         };
@@ -175,11 +182,10 @@ mod tests {
     }
 
     #[test]
-    fn options_missing_path_uses_asterisk_but_explicit_paths_are_preserved() {
-        let no_path =
-            PseudoHeaders::request(Method::OPTIONS, Uri::from_static("https://example.com"));
-        let query_only =
-            PseudoHeaders::request(Method::OPTIONS, Uri::from_static("https://example.com?x=1"));
+    fn options_asterisk_form_and_authority_form_use_asterisk_but_explicit_paths_are_preserved() {
+        let asterisk_form = PseudoHeaders::request(Method::OPTIONS, Uri::from_static("*"));
+        let authority_form =
+            PseudoHeaders::request(Method::OPTIONS, Uri::from_static("example.com"));
         let explicit_slash =
             PseudoHeaders::request(Method::OPTIONS, Uri::from_static("https://example.com/"));
         let explicit_slash_with_query = PseudoHeaders::request(
@@ -187,13 +193,13 @@ mod tests {
             Uri::from_static("https://example.com/?x=1"),
         );
 
-        match no_path {
+        match asterisk_form {
             PseudoHeaders::Request { path, .. } => {
                 assert_eq!(path.as_ref().map(PathAndQuery::as_str), Some("*"));
             }
             PseudoHeaders::Response { .. } => panic!("request should produce request headers"),
         }
-        match query_only {
+        match authority_form {
             PseudoHeaders::Request { path, .. } => {
                 assert_eq!(path.as_ref().map(PathAndQuery::as_str), Some("*"));
             }

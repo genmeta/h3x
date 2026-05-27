@@ -144,15 +144,27 @@ impl WriteStream {
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::Infallible, fmt};
+    use std::{
+        convert::Infallible,
+        fmt,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
 
     use bytes::Bytes;
-    use futures::stream;
+    use futures::{Sink, SinkExt, Stream, stream};
     use http_body::Frame;
-    use http_body_util::{Full, StreamBody};
+    use http_body_util::{Empty, Full, StreamBody};
 
     use super::*;
-    use crate::{message::test::write_stream_for_test, varint::VarInt};
+    use crate::{
+        codec::SinkWriter,
+        message::{stream::guard, test::write_stream_for_test},
+        qpack::protocol::QPackEncoder,
+        quic,
+        varint::VarInt,
+    };
 
     #[derive(Debug)]
     struct TestBodyError;
@@ -179,11 +191,120 @@ mod tests {
     fn request_parts(uri: &'static str) -> http::request::Parts {
         let request = http::Request::builder()
             .method(http::Method::GET)
-            .uri(uri)
+            .uri(http::Uri::try_from(uri).expect("uri"))
             .header("x-test", "present")
             .body(())
             .expect("request");
         request.into_parts().0
+    }
+
+    fn cancel_observing_write_stream(stream_id: VarInt) -> (WriteStream, Arc<Mutex<Vec<VarInt>>>) {
+        struct TestWriter {
+            stream_id: VarInt,
+            cancelled: Arc<Mutex<Vec<VarInt>>>,
+        }
+        impl quic::GetStreamId for TestWriter {
+            fn poll_stream_id(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<VarInt, quic::StreamError>> {
+                Poll::Ready(Ok(self.get_mut().stream_id))
+            }
+        }
+        impl quic::CancelStream for TestWriter {
+            fn poll_cancel(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                code: VarInt,
+            ) -> Poll<Result<(), quic::StreamError>> {
+                self.cancelled.lock().expect("cancel lock").push(code);
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl Sink<Bytes> for TestWriter {
+            type Error = quic::StreamError;
+
+            fn poll_ready(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn start_send(self: Pin<&mut Self>, _item: Bytes) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn enc_sink() -> Pin<
+            Box<
+                dyn Sink<
+                        crate::qpack::encoder::EncoderInstruction,
+                        Error = crate::connection::StreamError,
+                    > + Send,
+            >,
+        > {
+            Box::pin(
+                futures::sink::drain::<crate::qpack::encoder::EncoderInstruction>()
+                    .sink_map_err(|never| match never {}),
+            )
+        }
+        fn enc_stream() -> Pin<
+            Box<
+                dyn Stream<
+                        Item = Result<
+                            crate::qpack::decoder::DecoderInstruction,
+                            crate::connection::StreamError,
+                        >,
+                    > + Send,
+            >,
+        > {
+            Box::pin(futures::stream::empty::<
+                Result<crate::qpack::decoder::DecoderInstruction, crate::connection::StreamError>,
+            >())
+        }
+
+        let mock = Arc::new(crate::connection::tests::MockConnection::new());
+        let erased: Arc<dyn quic::DynConnection> = mock;
+
+        let mut protocols = crate::protocol::Protocols::new();
+        protocols.insert(crate::dhttp::protocol::DHttpProtocol::new_for_test(
+            erased.clone(),
+        ));
+        let state = crate::connection::ConnectionState::new_for_test(erased, Arc::new(protocols));
+
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TestWriter {
+            stream_id,
+            cancelled: cancelled.clone(),
+        })
+            as crate::codec::BoxWriteStream));
+
+        let stream = WriteStream::new(
+            writer,
+            Arc::new(QPackEncoder::new(
+                Arc::new(crate::dhttp::settings::Settings::default()),
+                enc_sink(),
+                enc_stream(),
+            )),
+            state,
+        );
+
+        (stream, cancelled)
     }
 
     #[tokio::test]
@@ -213,7 +334,7 @@ mod tests {
         let mut stream = write_stream_for_test(VarInt::from_u32(0));
         let request = http::Request::builder()
             .method(http::Method::POST)
-            .uri("https://example.test/upload")
+            .uri(http::Uri::from_static("https://example.test/upload"))
             .body(Full::new(Bytes::from_static(b"payload")))
             .expect("request");
 
@@ -237,6 +358,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_hyper_body_stops_after_trailers() {
+        let mut stream = write_stream_for_test(VarInt::from_u32(0));
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-trailer", http::HeaderValue::from_static("done"));
+        let body = StreamBody::new(stream::iter([
+            Ok::<_, TestBodyError>(Frame::<Bytes>::trailers(trailers)),
+            Err(TestBodyError),
+        ]));
+
+        stream
+            .send_hyper_body(body)
+            .await
+            .expect("body stops after trailers");
+    }
+
+    #[tokio::test]
     async fn send_hyper_body_maps_body_errors() {
         let mut stream = write_stream_for_test(VarInt::from_u32(0));
         let body = StreamBody::new(stream::iter([Err::<Frame<Bytes>, _>(TestBodyError)]));
@@ -247,6 +384,21 @@ mod tests {
             .expect_err("body error should be returned");
 
         assert!(matches!(error, SendMessageError::Body { .. }));
+    }
+
+    #[tokio::test]
+    async fn send_hyper_request_accepts_empty_body() {
+        let mut stream = write_stream_for_test(VarInt::from_u32(0));
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(http::Uri::from_static("https://example.test/"))
+            .body(Empty::<Bytes>::new())
+            .expect("request");
+
+        stream
+            .send_hyper_request(request)
+            .await
+            .expect("empty request sent");
     }
 
     #[tokio::test]
@@ -273,6 +425,60 @@ mod tests {
             .send_hyper_response(response)
             .await
             .expect("response sent");
+    }
+
+    #[tokio::test]
+    async fn send_hyper_response_accepts_empty_body() {
+        let mut stream = write_stream_for_test(VarInt::from_u32(0));
+        let response = http::Response::builder()
+            .status(http::StatusCode::NO_CONTENT)
+            .body(Empty::<Bytes>::new())
+            .expect("response");
+
+        stream
+            .send_hyper_response(response)
+            .await
+            .expect("empty response sent");
+    }
+
+    #[tokio::test]
+    async fn send_hyper_response_maps_body_errors() {
+        let mut stream = write_stream_for_test(VarInt::from_u32(0));
+        let body = StreamBody::new(stream::iter([Err::<Frame<Bytes>, _>(TestBodyError)]));
+        let response = http::Response::builder()
+            .status(http::StatusCode::OK)
+            .body(body)
+            .expect("response");
+
+        let error = stream
+            .send_hyper_response(response)
+            .await
+            .expect_err("response body error should be returned");
+
+        assert!(matches!(
+            error,
+            SendMessageError::Body {
+                source: TestBodyError
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_hyper_request_parts_cancels_stream_on_malformed_parts() {
+        let (mut stream, cancelled) = cancel_observing_write_stream(VarInt::from_u32(0));
+        let expected_code =
+            validated_hyper_request_parts_to_field_lines(request_parts("example.test"))
+                .expect_err("authority-only GET is malformed")
+                .code()
+                .into_inner();
+
+        let error = stream
+            .send_hyper_request_parts(request_parts("example.test"))
+            .await
+            .expect_err("authority-only GET is malformed");
+
+        assert!(matches!(error, SendMessageError::MalformedHeader { .. }));
+        assert_eq!(*cancelled.lock().expect("cancel lock"), vec![expected_code]);
     }
 
     #[test]

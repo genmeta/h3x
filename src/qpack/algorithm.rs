@@ -453,7 +453,10 @@ mod tests {
     use crate::{
         dhttp::settings::Settings,
         qpack::{
-            algorithm::{Algorithm, CompressOutput, DynamicCompressAlgo, HuffmanNever},
+            algorithm::{
+                Algorithm, CompressOutput, DynamicCompressAlgo, HuffmanAlways, HuffmanNever,
+                StaticCompressAlgo,
+            },
             encoder::EncoderState,
             field::{EncodedFieldSectionPrefix, FieldLine, FieldLineRepresentation},
         },
@@ -486,6 +489,10 @@ mod tests {
 
     fn algo() -> DynamicCompressAlgo<HuffmanNever> {
         DynamicCompressAlgo::new(HuffmanNever)
+    }
+
+    fn huffman_algo() -> DynamicCompressAlgo<HuffmanAlways> {
+        DynamicCompressAlgo::new(HuffmanAlways)
     }
 
     async fn do_compress(
@@ -672,6 +679,247 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn static_algorithm_emits_all_three_representation_forms() {
+        let mut state = state_with_capacity(256);
+        let algo = StaticCompressAlgo::new(HuffmanAlways);
+        let output = algo
+            .compress(
+                &mut state,
+                vec![
+                    field_line(":method", "GET"),
+                    field_line(":path", "/custom"),
+                    field_line("x-literal", "value"),
+                ],
+                false,
+            )
+            .await;
+
+        assert_eq!(output.representations.len(), 3);
+        assert!(matches!(
+            output.representations[0],
+            FieldLineRepresentation::IndexedFieldLine {
+                is_static: true,
+                index: 17
+            }
+        ));
+        assert!(matches!(
+            &output.representations[1],
+            FieldLineRepresentation::LiteralFieldLineWithNameReference {
+                never_dynamic: true,
+                is_static: true,
+                huffman: true,
+                value,
+                ..
+            } if value == b"/custom".as_slice()
+        ));
+        assert!(matches!(
+            &output.representations[2],
+            FieldLineRepresentation::LiteralFieldLineWithLiteralName {
+                never_dynamic: true,
+                name_huffman: true,
+                name,
+                value_huffman: true,
+                value,
+            } if name == b"x-literal".as_slice() && value == b"value".as_slice()
+        ));
+        assert_eq!(state.table_inserted_count(), 0);
+        assert!(output.max_referenced_index.is_none());
+        assert_eq!(
+            output.prefix,
+            EncodedFieldSectionPrefix {
+                encoded_insert_count: 0,
+                sign: false,
+                delta_base: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_literal_name_uses_huffman_flags_from_strategy() {
+        let mut state = state_with_capacity(0);
+        let output = huffman_algo()
+            .compress(&mut state, vec![field_line("x-huffman", "value")], true)
+            .await;
+
+        assert!(matches!(
+            &output.representations[0],
+            FieldLineRepresentation::LiteralFieldLineWithLiteralName {
+                never_dynamic: false,
+                name_huffman: true,
+                name,
+                value_huffman: true,
+                value,
+            } if name == b"x-huffman".as_slice() && value == b"value".as_slice()
+        ));
+    }
+
+    #[tokio::test]
+    async fn all_sensitive_header_names_are_case_insensitive_and_never_inserted() {
+        let sensitive_names = [
+            "authorization",
+            "AUTHORIZATION",
+            "proxy-authorization",
+            "Proxy-Authorization",
+            "cookie",
+            "COOKIE",
+            "set-cookie",
+            "Set-Cookie",
+        ];
+
+        for name in sensitive_names {
+            let mut state = state_with_capacity(256);
+            let output = do_compress(&mut state, vec![field_line(name, "secret")], true).await;
+
+            assert_eq!(state.table_inserted_count(), 0, "{name} was inserted");
+            assert!(
+                output.max_referenced_index.is_none(),
+                "{name} referenced dynamic table"
+            );
+            match &output.representations[0] {
+                FieldLineRepresentation::LiteralFieldLineWithNameReference {
+                    never_dynamic,
+                    ..
+                }
+                | FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
+                    never_dynamic,
+                    ..
+                }
+                | FieldLineRepresentation::LiteralFieldLineWithLiteralName {
+                    never_dynamic, ..
+                } => assert!(*never_dynamic, "{name} did not set never_dynamic"),
+                other => panic!("expected literal representation for {name}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_exact_match_can_use_post_base_reference() {
+        let mut state = state_with_capacity(256);
+        let output = do_compress(
+            &mut state,
+            vec![
+                field_line("x-repeat", "same"),
+                field_line("x-repeat", "same"),
+            ],
+            true,
+        )
+        .await;
+
+        assert_eq!(state.table_inserted_count(), 1);
+        assert_eq!(output.max_referenced_index, Some(0));
+        assert!(matches!(
+            output.representations.as_slice(),
+            [
+                FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex { index: 0 },
+                FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex { index: 0 },
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn dynamic_name_reference_uses_pre_base_when_name_is_acknowledged() {
+        let mut state = state_with_capacity(48);
+
+        let _ = do_compress(&mut state, vec![field_line("x-ref", "a")], true).await;
+        state.dynamic_table.known_received_count = state.dynamic_table.inserted_count;
+
+        let output = do_compress(&mut state, vec![field_line("x-ref", "longer-value")], true).await;
+
+        assert_eq!(state.table_inserted_count(), 1);
+        assert_eq!(output.max_referenced_index, Some(0));
+        assert!(matches!(
+            &output.representations[0],
+            FieldLineRepresentation::LiteralFieldLineWithNameReference {
+                never_dynamic: false,
+                is_static: false,
+                name_index: 0,
+                huffman: false,
+                value,
+            } if value == b"longer-value".as_slice()
+        ));
+    }
+
+    #[tokio::test]
+    async fn dynamic_name_reference_uses_post_base_when_name_is_new_in_section() {
+        let mut state = state_with_capacity(48);
+        let output = do_compress(
+            &mut state,
+            vec![
+                field_line("x-ref", "a"),
+                field_line("x-ref", "longer-value"),
+            ],
+            true,
+        )
+        .await;
+
+        assert_eq!(state.table_inserted_count(), 1);
+        assert_eq!(output.max_referenced_index, Some(0));
+        assert!(matches!(
+            &output.representations[1],
+            FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
+                never_dynamic: false,
+                name_index: 0,
+                huffman: false,
+                value,
+            } if value == b"longer-value".as_slice()
+        ));
+    }
+
+    #[tokio::test]
+    async fn may_block_false_falls_back_when_dynamic_name_is_unacknowledged() {
+        let mut state = state_with_capacity(48);
+
+        let _ = do_compress(&mut state, vec![field_line("x-ref", "a")], true).await;
+        assert_eq!(state.table_known_received_count(), 0);
+
+        let output =
+            do_compress(&mut state, vec![field_line("x-ref", "longer-value")], false).await;
+
+        assert_eq!(state.table_inserted_count(), 1);
+        assert!(output.max_referenced_index.is_none());
+        assert!(matches!(
+            &output.representations[0],
+            FieldLineRepresentation::LiteralFieldLineWithLiteralName {
+                never_dynamic: false,
+                name_huffman: false,
+                name,
+                value_huffman: false,
+                value,
+            } if name == b"x-ref".as_slice() && value == b"longer-value".as_slice()
+        ));
+    }
+
+    #[tokio::test]
+    async fn prefix_required_insert_count_uses_largest_dynamic_reference() {
+        let mut state = state_with_capacity(256);
+
+        let _ = do_compress(
+            &mut state,
+            vec![field_line("x-a", "one"), field_line("x-b", "two")],
+            true,
+        )
+        .await;
+        state.dynamic_table.known_received_count = state.dynamic_table.inserted_count;
+
+        let output = do_compress(
+            &mut state,
+            vec![field_line("x-a", "one"), field_line("x-b", "two")],
+            true,
+        )
+        .await;
+
+        assert_eq!(output.max_referenced_index, Some(1));
+        assert_eq!(
+            output.prefix,
+            EncodedFieldSectionPrefix {
+                encoded_insert_count: EncodedFieldSectionPrefix::encode_ric(2, 256),
+                sign: false,
+                delta_base: 0,
+            }
+        );
     }
 
     // --- Multiple entries ---
