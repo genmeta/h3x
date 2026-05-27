@@ -179,14 +179,6 @@ impl Session for WebTransportSession {
     }
 }
 
-#[cfg(feature = "rpc")]
-/// Backward-compatible public path for WebTransport lifecycle helpers.
-///
-/// The implementation lives under [`crate::rpc::webtransport::LifecycleExt`],
-/// but existing callers may still import
-/// `h3x::webtransport::WebTransportLifecycleExt`.
-pub use crate::rpc::webtransport::LifecycleExt as WebTransportLifecycleExt;
-
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -301,16 +293,18 @@ mod tests {
     }
 
     #[cfg(feature = "rpc")]
-    mod compatibility_tests {
+    mod lifecycle_ext_tests {
         use std::{borrow::Cow, future::pending};
 
         use super::*;
         use crate::{
             error::Code,
-            rpc::lifecycle::{
-                ConnectionErrorLatch, HasLatch, LifecycleExt as ConnectionLifecycleExt,
+            rpc::{
+                lifecycle::{
+                    ConnectionErrorLatch, HasLatch, LifecycleExt as ConnectionLifecycleExt,
+                },
+                webtransport::LifecycleExt as _,
             },
-            webtransport::WebTransportLifecycleExt,
         };
 
         #[derive(Debug, Default)]
@@ -347,7 +341,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn legacy_webtransport_lifecycle_ext_path_exposes_helper_set() {
+        async fn module_scoped_lifecycle_ext_path_exposes_helper_set() {
             let lifecycle = TestLifecycle::default();
 
             lifecycle.check_open().expect("open check should pass");
@@ -356,19 +350,19 @@ mod tests {
             lifecycle
                 .guard_open(async { Ok::<_, OpenStreamError>(()) })
                 .await
-                .expect("guard_open should be available on the old path");
+                .expect("guard_open should be available on the module path");
 
             let lifecycle = TestLifecycle::default();
             lifecycle
                 .guard_accept(async { Ok::<_, AcceptStreamError>(()) })
                 .await
-                .expect("guard_accept should be available on the old path");
+                .expect("guard_accept should be available on the module path");
 
             let lifecycle = TestLifecycle::default();
             lifecycle
                 .guard_accept_err(async { Err::<(), _>("closed") }, |_| None)
                 .await
-                .expect_err("guard_accept_err should be available on the old path");
+                .expect_err("guard_accept_err should be available on the module path");
 
             let lifecycle = TestLifecycle::default();
             lifecycle
