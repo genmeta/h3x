@@ -722,6 +722,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_agent_reports_empty_identity_material() {
+        let agent = NoAgent;
+
+        assert_eq!(dhttp_identity::identity::LocalAgent::name(&agent), "none");
+        assert!(dhttp_identity::identity::LocalAgent::cert_chain(&agent).is_empty());
+        assert_eq!(
+            dhttp_identity::identity::LocalAgent::sign_algorithm(&agent),
+            rustls::SignatureAlgorithm::ED25519
+        );
+        assert_eq!(
+            dhttp_identity::identity::LocalAgent::sign(
+                &agent,
+                rustls::SignatureScheme::ED25519,
+                b"payload",
+            )
+            .await
+            .expect("test agent sign"),
+            Vec::<u8>::new()
+        );
+
+        assert_eq!(dhttp_identity::identity::RemoteAgent::name(&agent), "none");
+        assert!(dhttp_identity::identity::RemoteAgent::cert_chain(&agent).is_empty());
+    }
+
+    #[test]
+    fn never_stream_test_doubles_are_immediately_ready() {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut reader = NeverReadStream;
+        assert!(
+            matches!(
+                quic::GetStreamId::poll_stream_id(Pin::new(&mut reader), &mut cx),
+                Poll::Ready(Ok(id)) if id == VarInt::from_u32(0)
+            ),
+            "reader stream id should be ready"
+        );
+        assert!(
+            matches!(
+                quic::StopStream::poll_stop(Pin::new(&mut reader), &mut cx, VarInt::from_u32(7)),
+                Poll::Ready(Ok(()))
+            ),
+            "stop reader should be ready"
+        );
+        assert!(Stream::poll_next(Pin::new(&mut reader), &mut cx).is_ready());
+
+        let mut writer = NeverWriteStream;
+        assert!(
+            matches!(
+                quic::GetStreamId::poll_stream_id(Pin::new(&mut writer), &mut cx),
+                Poll::Ready(Ok(id)) if id == VarInt::from_u32(0)
+            ),
+            "writer stream id should be ready"
+        );
+        assert!(
+            matches!(
+                quic::CancelStream::poll_cancel(
+                    Pin::new(&mut writer),
+                    &mut cx,
+                    VarInt::from_u32(7),
+                ),
+                Poll::Ready(Ok(()))
+            ),
+            "cancel writer should be ready"
+        );
+        assert!(matches!(
+            Sink::poll_ready(Pin::new(&mut writer), &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        Sink::start_send(Pin::new(&mut writer), Bytes::from_static(b"payload"))
+            .expect("writer send");
+        assert!(matches!(
+            Sink::poll_flush(Pin::new(&mut writer), &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            Sink::poll_close(Pin::new(&mut writer), &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[tokio::test]
+    async fn listen_adapter_accept_returns_fd_id_queued_for_client() {
+        let mut parent_transport = ParentTransport::new();
+        let fd_registry = parent_transport.fd_registry();
+        let (conn_tx, conn_rx) = mpsc::channel(1);
+        conn_tx
+            .send(Arc::new(TestConnection))
+            .await
+            .expect("send test connection");
+        drop(conn_tx);
+        let mut adapter = ListenAdapter::<_, remoc::codec::Default>::new(
+            QueuedListen {
+                rx: conn_rx,
+                shutdown_error: None,
+            },
+            parent_transport.fd_sender(),
+        );
+
+        let fd_id = timeout(Duration::from_secs(1), IpcListen::accept(&mut adapter))
+            .await
+            .expect("accept timeout")
+            .expect("accept succeeds");
+        parent_transport.drive_once().await;
+        let fds = timeout(Duration::from_secs(1), fd_registry.wait_fds(fd_id))
+            .await
+            .expect("wait fds timeout")
+            .expect("fd registered");
+        assert_eq!(fds.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn listen_adapter_shutdown_succeeds_when_inner_shutdown_succeeds() {
+        let parent_transport = ParentTransport::new();
+        let (_conn_tx, conn_rx) = mpsc::channel(1);
+        let adapter = ListenAdapter::<_, remoc::codec::Default>::new(
+            QueuedListen {
+                rx: conn_rx,
+                shutdown_error: None,
+            },
+            parent_transport.fd_sender(),
+        );
+
+        IpcListen::shutdown(&adapter)
+            .await
+            .expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
     async fn listen_adapter_accept_maps_inner_error() {
         let parent_transport = ParentTransport::new();
         let mut adapter = ListenAdapter::<_, remoc::codec::Default>::new(
