@@ -671,8 +671,8 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use futures::{Sink, stream};
-    use tokio::io::AsyncWrite;
+    use futures::{Sink, SinkExt, stream};
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
 
     use crate::{
         codec::{DecodeFrom, EncodeInto},
@@ -683,8 +683,8 @@ mod tests {
             algorithm::{Algorithm, CompressOutput},
             decoder::DecoderInstruction,
             encoder::{
-                Encoder, EncoderInstruction, EncoderState, QPackDecoderStreamError,
-                QPackEncoderError,
+                EncodeHeaderSectionError, Encoder, EncoderInstruction, EncoderState,
+                QPackDecoderStreamError, QPackEncoderError,
             },
             field::{EncodedFieldSectionPrefix, FieldLine, FieldLineRepresentation},
             r#static,
@@ -1093,6 +1093,95 @@ mod tests {
                 value: Bytes::from_static(b"xyz"),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn recording_sinks_exercise_async_write_and_sink_completion_paths() {
+        let mut byte_sink = RecordingSink::default();
+        byte_sink
+            .write_all(b"async")
+            .await
+            .expect("async write should record bytes");
+        AsyncWriteExt::flush(&mut byte_sink)
+            .await
+            .expect("async flush should succeed");
+        byte_sink
+            .shutdown()
+            .await
+            .expect("async shutdown should succeed");
+        byte_sink
+            .send(Bytes::from_static(b"-sink"))
+            .await
+            .expect("sink send should record bytes");
+        byte_sink.close().await.expect("sink close should succeed");
+        assert_eq!(byte_sink.bytes, b"async-sink");
+
+        let mut instruction_sink = RecordingInstructionSink::default();
+        instruction_sink
+            .send(EncoderInstruction::Duplicate { index: 9 })
+            .await
+            .expect("instruction sink send should succeed");
+        instruction_sink
+            .close()
+            .await
+            .expect("instruction sink close should succeed");
+        assert_eq!(
+            instruction_sink.instructions(),
+            vec![EncoderInstruction::Duplicate { index: 9 }]
+        );
+        assert_eq!(instruction_sink.flushes(), 1);
+    }
+
+    #[test]
+    fn evict_entry_removes_unique_name_and_value_indices() {
+        let mut state = EncoderState::new(settings_with_capacity(128));
+        state
+            .set_max_table_capacity(128)
+            .expect("set capacity failed");
+        let index = state
+            .insert_with_literal_name(
+                false,
+                Bytes::from_static(b"unique-name"),
+                false,
+                Bytes::from_static(b"unique-value"),
+            )
+            .expect("insert failed");
+        state.dynamic_table.known_received_count = state.table_inserted_count();
+
+        let (evicted_index, evicted_entry) = state.evict_entry();
+
+        assert_eq!(evicted_index, index);
+        assert_eq!(
+            evicted_entry,
+            FieldLine {
+                name: Bytes::from_static(b"unique-name"),
+                value: Bytes::from_static(b"unique-value"),
+            }
+        );
+        assert!(
+            state
+                .find_name(&Bytes::from_static(b"unique-name"))
+                .is_none()
+        );
+        assert!(
+            state
+                .find_value(&Bytes::from_static(b"unique-value"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn encode_header_section_error_from_quic_stream_error_preserves_reset_code() {
+        let error = EncodeHeaderSectionError::from(quic::StreamError::Reset {
+            code: VarInt::from_u32(77),
+        });
+
+        match error {
+            EncodeHeaderSectionError::Stream {
+                source: StreamError::Reset { code },
+            } => assert_eq!(code, VarInt::from_u32(77)),
+            error => panic!("unexpected encode header error: {error:?}"),
+        }
     }
 
     #[test]
@@ -1804,6 +1893,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn receive_instruction_reports_decoder_instruction_state_errors() {
+        let missing_section = Encoder::new(
+            settings_with_capacity(128),
+            RecordingInstructionSink::default(),
+            stream::iter([Ok(DecoderInstruction::SectionAcknowledgment {
+                stream_id: 42,
+            })]),
+        );
+        assert_connection_h3_code(
+            missing_section
+                .receive_instruction()
+                .await
+                .expect_err("missing section acknowledgment must be rejected"),
+            Code::QPACK_DECODER_STREAM_ERROR,
+        );
+
+        let zero_increment = Encoder::new(
+            settings_with_capacity(128),
+            RecordingInstructionSink::default(),
+            stream::iter([Ok(DecoderInstruction::InsertCountIncrement {
+                increment: 0,
+            })]),
+        );
+        assert_connection_h3_code(
+            zero_increment
+                .receive_instruction()
+                .await
+                .expect_err("zero insert count increment must be rejected"),
+            Code::QPACK_DECODER_STREAM_ERROR,
+        );
+    }
+
     // --- Edge case tests ---
 
     #[test]
@@ -1837,6 +1959,20 @@ mod tests {
         }];
         let refs: Vec<u64> = get_dynamic_references(&reprs).collect();
         assert_eq!(refs, vec![7]);
+    }
+
+    #[test]
+    fn get_dynamic_references_finds_post_base_name_reference() {
+        let reprs = vec![
+            FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
+                never_dynamic: false,
+                name_index: 11,
+                huffman: false,
+                value: Bytes::from_static(b"val"),
+            },
+        ];
+        let refs: Vec<u64> = get_dynamic_references(&reprs).collect();
+        assert_eq!(refs, vec![11]);
     }
 
     #[test]
