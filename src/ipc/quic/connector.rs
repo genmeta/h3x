@@ -328,6 +328,7 @@ fn connect_error(err: impl std::error::Error, context: &str) -> ConnectionError 
 mod tests {
     use std::{
         borrow::Cow,
+        error::Error as StdError,
         io,
         pin::Pin,
         sync::{Arc, Mutex as StdMutex},
@@ -335,7 +336,7 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use futures::{Sink, SinkExt, Stream, StreamExt, future::pending};
+    use futures::{Sink, SinkExt, Stream, StreamExt, future::pending, task::noop_waker};
     use remoc::prelude::ServerShared;
     use serde::{
         Deserialize,
@@ -373,6 +374,13 @@ mod tests {
         };
         assert_eq!(source.kind, IPC_ERROR_KIND);
         assert_eq!(source.frame_type, IPC_FRAME_TYPE);
+        assert_eq!(source.reason, expected_reason);
+    }
+
+    fn assert_test_transport_reason(error: ConnectionError, expected_reason: &str) {
+        let ConnectionError::Transport { source } = error else {
+            panic!("expected transport error");
+        };
         assert_eq!(source.reason, expected_reason);
     }
 
@@ -752,6 +760,155 @@ mod tests {
             connect_error(io::Error::other("boom"), "split"),
             "ipc connect: split",
         );
+    }
+
+    #[test]
+    fn connector_error_display_and_sources_are_variant_specific() {
+        let rpc = ConnectorError::Rpc {
+            source: test_connection_error("rpc failed"),
+        };
+        assert_eq!(rpc.to_string(), "ipc connect rpc failed");
+        assert!(StdError::source(&rpc).is_some());
+
+        let wait_fds = ConnectorError::WaitFds {
+            source: crate::ipc::transport::WaitFdsError::Closed,
+        };
+        assert_eq!(wait_fds.to_string(), "failed to retrieve mux channel fd");
+        assert!(StdError::source(&wait_fds).is_some());
+
+        let empty_fd = ConnectorError::EmptyFd;
+        assert_eq!(empty_fd.to_string(), "no fd received from registry");
+        assert!(StdError::source(&empty_fd).is_none());
+
+        let from_fd = ConnectorError::FromFd {
+            source: io::Error::other("not a socket"),
+        };
+        assert_eq!(
+            from_fd.to_string(),
+            "failed to reconstruct mux channel from fd"
+        );
+        assert!(StdError::source(&from_fd).is_some());
+
+        let split = ConnectorError::Split {
+            source: crate::ipc::transport::SplitError::AsyncFd {
+                source: io::Error::other("async fd failed"),
+            },
+        };
+        assert_eq!(split.to_string(), "failed to split mux channel");
+        assert!(StdError::source(&split).is_some());
+
+        let remoc = ConnectorError::Remoc {
+            message: "handshake failed".to_owned(),
+        };
+        assert_eq!(
+            remoc.to_string(),
+            "failed to establish remoc connection: handshake failed"
+        );
+        assert!(StdError::source(&remoc).is_none());
+
+        let bootstrap = ConnectorError::Bootstrap;
+        assert_eq!(
+            bootstrap.to_string(),
+            "failed to receive connection bootstrap"
+        );
+        assert!(StdError::source(&bootstrap).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_helpers_expose_agent_stream_and_lifecycle_contracts() {
+        let agent = NoAgent;
+        assert_eq!(dhttp_identity::identity::LocalAgent::name(&agent), "none");
+        assert!(dhttp_identity::identity::LocalAgent::cert_chain(&agent).is_empty());
+        assert_eq!(
+            dhttp_identity::identity::LocalAgent::sign_algorithm(&agent),
+            rustls::SignatureAlgorithm::ED25519
+        );
+        assert!(
+            dhttp_identity::identity::LocalAgent::sign(
+                &agent,
+                rustls::SignatureScheme::ED25519,
+                b"payload",
+            )
+            .await
+            .expect("test agent signing succeeds")
+            .is_empty()
+        );
+        assert_eq!(dhttp_identity::identity::RemoteAgent::name(&agent), "none");
+        assert!(dhttp_identity::identity::RemoteAgent::cert_chain(&agent).is_empty());
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut reader = NeverReadStream;
+        let mut reader = Pin::new(&mut reader);
+        match quic::GetStreamId::poll_stream_id(reader.as_mut(), &mut cx) {
+            Poll::Ready(Ok(stream_id)) => assert_eq!(stream_id, VarInt::from_u32(0)),
+            other => panic!("unexpected reader stream id poll: {other:?}"),
+        }
+        assert!(matches!(
+            quic::StopStream::poll_stop(reader.as_mut(), &mut cx, VarInt::from_u32(7)),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            reader.as_mut().poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+
+        let mut writer = NeverWriteStream;
+        let mut writer = Pin::new(&mut writer);
+        match quic::GetStreamId::poll_stream_id(writer.as_mut(), &mut cx) {
+            Poll::Ready(Ok(stream_id)) => assert_eq!(stream_id, VarInt::from_u32(0)),
+            other => panic!("unexpected writer stream id poll: {other:?}"),
+        }
+        assert!(matches!(
+            quic::CancelStream::poll_cancel(writer.as_mut(), &mut cx, VarInt::from_u32(11)),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            Sink::<Bytes>::poll_ready(writer.as_mut(), &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        Sink::<Bytes>::start_send(writer.as_mut(), Bytes::from_static(b"ignored"))
+            .expect("test writer accepts bytes");
+        assert!(matches!(
+            Sink::<Bytes>::poll_flush(writer.as_mut(), &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            Sink::<Bytes>::poll_close(writer.as_mut(), &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+
+        let (connection, lifecycle) = TestConnection::new();
+        assert!(quic::Lifecycle::check(connection.as_ref()).is_ok());
+        assert!(
+            timeout(
+                Duration::from_millis(10),
+                quic::Lifecycle::closed(connection.as_ref()),
+            )
+            .await
+            .is_err(),
+            "helper connection should remain open until terminal error is set"
+        );
+
+        let open_uni = match quic::ManageStream::open_uni(connection.as_ref()).await {
+            Ok(_) => panic!("open_uni helper should fail"),
+            Err(error) => error,
+        };
+        assert_test_transport_reason(open_uni, "open_uni should not be called");
+
+        let accept_uni = match quic::ManageStream::accept_uni(connection.as_ref()).await {
+            Ok(_) => panic!("accept_uni helper should fail"),
+            Err(error) => error,
+        };
+        assert_test_transport_reason(accept_uni, "accept_uni should not be called");
+
+        lifecycle.set_terminal_error(test_connection_error("terminal helper error"));
+        let check = quic::Lifecycle::check(connection.as_ref())
+            .expect_err("terminal error should make check fail");
+        assert_test_transport_reason(check, "terminal helper error");
+        let closed = quic::Lifecycle::closed(connection.as_ref()).await;
+        assert_test_transport_reason(closed, "terminal helper error");
     }
 
     #[tokio::test]
@@ -1217,6 +1374,33 @@ mod tests {
         };
         assert!(source.reason.contains("accept_bi should not be called"));
 
+        let open_uni_handle =
+            quic::Connect::connect(&connector, &Authority::from_static("server.example"))
+                .await
+                .expect("third connect succeeds");
+        let open_uni_error = match quic::ManageStream::open_uni(open_uni_handle.as_ref()).await {
+            Ok(_) => panic!("open_uni error should propagate over ipc"),
+            Err(error) => error,
+        };
+        let ConnectionError::Transport { source } = open_uni_error else {
+            panic!("expected open_uni transport error");
+        };
+        assert!(source.reason.contains("open_uni should not be called"));
+
+        let accept_uni_handle =
+            quic::Connect::connect(&connector, &Authority::from_static("server.example"))
+                .await
+                .expect("fourth connect succeeds");
+        let accept_uni_error =
+            match quic::ManageStream::accept_uni(accept_uni_handle.as_ref()).await {
+                Ok(_) => panic!("accept_uni error should propagate over ipc"),
+                Err(error) => error,
+            };
+        let ConnectionError::Transport { source } = accept_uni_error else {
+            panic!("expected accept_uni transport error");
+        };
+        assert!(source.reason.contains("accept_uni should not be called"));
+
         quic::Lifecycle::close(
             accept_handle.as_ref(),
             Code::H3_NO_ERROR,
@@ -1230,6 +1414,8 @@ mod tests {
 
         drop(handle);
         drop(accept_handle);
+        drop(open_uni_handle);
+        drop(accept_uni_handle);
         drop(connector);
         server_task.abort();
         let _ = server_task.await;
