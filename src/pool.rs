@@ -980,6 +980,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_accepts_matching_identity_override_connection() {
+        let pool = Pool::<IdentityOverrideConnection>::empty();
+        let connector = IdentityConnector::new(Some("test-remote"));
+        let server = matching_server();
+
+        let connection = pool
+            .reuse_or_connect_with(
+                &connector,
+                Arc::new(ConnectionBuilder::default()),
+                server.clone(),
+            )
+            .await
+            .expect("matching peer identity should connect");
+
+        let reused = pool
+            .reuse_or_connect_with(&connector, Arc::new(ConnectionBuilder::default()), server)
+            .await
+            .expect("matching peer identity should reuse");
+
+        assert!(Arc::ptr_eq(&connection, &reused));
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn identity_override_connection_delegates_quic_capabilities() {
+        let connection = IdentityOverrideConnection::with_stream_ops(Some("delegated.example"));
+
+        quic::ManageStream::open_bi(&connection)
+            .await
+            .expect("open_bi should delegate to inner connection");
+        quic::ManageStream::open_uni(&connection)
+            .await
+            .expect("open_uni should delegate to inner connection");
+        quic::ManageStream::accept_bi(&connection)
+            .await
+            .expect("accept_bi should delegate to inner connection");
+        quic::ManageStream::accept_uni(&connection)
+            .await
+            .expect("accept_uni should delegate to inner connection");
+
+        let local = quic::WithLocalAgent::local_agent(&connection)
+            .await
+            .expect("local agent lookup should succeed");
+        assert!(local.is_some());
+
+        let remote = quic::WithRemoteAgent::remote_agent(&connection)
+            .await
+            .expect("remote agent lookup should succeed")
+            .expect("remote agent should be present");
+        assert_eq!(remote.name(), "delegated.example");
+        assert!(remote.cert_chain().is_empty());
+
+        assert!(quic::Lifecycle::check(&connection).is_ok());
+        quic::Lifecycle::close(
+            &connection,
+            crate::error::Code::H3_NO_ERROR,
+            "delegated close".into(),
+        );
+        assert_eq!(
+            connection.inner.close_calls(),
+            vec![(
+                crate::error::Code::H3_NO_ERROR,
+                "delegated close".to_owned()
+            )],
+        );
+
+        connection
+            .inner
+            .set_terminal_error(test_connection_error("delegated terminal"));
+        let closed = quic::Lifecycle::closed(&connection).await;
+        assert!(closed.to_string().contains("delegated terminal"));
+        assert_eq!(
+            connection.inner.stream_calls(),
+            vec!["open_bi", "open_uni", "accept_bi", "accept_uni"],
+        );
+    }
+
+    #[tokio::test]
     async fn pool_returns_h3_error_when_connection_initialization_fails() {
         let pool = Pool::<crate::connection::tests::MockConnection>::empty();
 

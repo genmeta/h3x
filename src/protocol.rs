@@ -757,7 +757,7 @@ mod tests {
             _: &'a Arc<C>,
             _: &'a Protocols,
         ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
-            unimplemented!("not used in identity tests")
+            Box::pin(async { Ok(MockProtocol) })
         }
     }
 
@@ -799,7 +799,7 @@ mod tests {
             _: &'a Arc<C>,
             _: &'a Protocols,
         ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
-            unimplemented!("not used in identity tests")
+            Box::pin(async { Ok(MockProtocol2) })
         }
     }
 
@@ -1176,6 +1176,85 @@ mod tests {
         ]);
 
         assert_eq!(initializers.len(), 3);
+    }
+
+    #[test]
+    fn mock_factories_format_and_compare_by_configured_identity() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            CountingFactory {
+                id: 9,
+                calls: calls.clone(),
+            },
+            CountingFactory { id: 9, calls }
+        );
+        assert_ne!(
+            CountingFactory {
+                id: 9,
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            CountingFactory {
+                id: 10,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        );
+
+        assert_eq!(MockFactoryFoo(1).to_string(), "MockFactory");
+        assert_eq!(MockFactoryBar(1).to_string(), "MockFactory2");
+        assert_eq!(
+            FailingFactory("format").to_string(),
+            "FailingFactory(format)"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_factory_initializers_insert_their_protocols() {
+        let conn = Arc::new(TestConnection);
+        let mut protocols = Protocols::new();
+
+        MockFactoryFoo(11)
+            .init_protocols(&conn, &mut protocols)
+            .await
+            .expect("foo factory initializes mock protocol");
+        MockFactoryBar(12)
+            .init_protocols(&conn, &mut protocols)
+            .await
+            .expect("bar factory initializes second mock protocol");
+
+        assert!(protocols.get::<MockProtocol>().is_some());
+        assert!(protocols.get::<MockProtocol2>().is_some());
+    }
+
+    #[tokio::test]
+    async fn second_mock_protocol_passes_uni_and_bi_streams() {
+        let protocol = MockProtocol2;
+
+        let uni = protocol
+            .accept_uni(peekable_uni_stream_with_bytes(b"u2").await)
+            .await
+            .expect("second mock protocol passes uni stream");
+        let StreamVerdict::Passed(mut uni) = uni else {
+            panic!("second mock protocol must pass uni stream");
+        };
+        let mut uni_buf = [0; 2];
+        uni.read_exact(&mut uni_buf)
+            .await
+            .expect("read second mock-passed uni bytes");
+        assert_eq!(&uni_buf, b"u2");
+
+        let bi = protocol
+            .accept_bi(peekable_bi_stream_with_bytes(b"b2").await)
+            .await
+            .expect("second mock protocol passes bidi stream");
+        let StreamVerdict::Passed((mut reader, _writer)) = bi else {
+            panic!("second mock protocol must pass bidi stream");
+        };
+        let mut bi_buf = [0; 2];
+        reader
+            .read_exact(&mut bi_buf)
+            .await
+            .expect("read second mock-passed bidi bytes");
+        assert_eq!(&bi_buf, b"b2");
     }
 
     #[tokio::test]

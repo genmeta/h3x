@@ -687,6 +687,7 @@ mod tests {
                 QPackEncoderError,
             },
             field::{EncodedFieldSectionPrefix, FieldLine, FieldLineRepresentation},
+            r#static,
         },
         quic::{self, GetStreamId},
         varint::VarInt,
@@ -995,6 +996,34 @@ mod tests {
                 .expect("instruction should roundtrip");
             assert_eq!(decoded, instruction);
         }
+    }
+
+    #[tokio::test]
+    async fn encoder_instruction_roundtrips_extended_integer_values() {
+        let instructions = [
+            EncoderInstruction::SetDynamicTableCapacity { capacity: 4096 },
+            EncoderInstruction::InsertWithNameReference {
+                is_static: false,
+                name_index: 130,
+                huffman: false,
+                value: Bytes::from_static(b"value"),
+            },
+            EncoderInstruction::Duplicate { index: 257 },
+        ];
+
+        for instruction in instructions {
+            let decoded = encode_decode_roundtrip(instruction.clone())
+                .await
+                .expect("instruction should roundtrip");
+            assert_eq!(decoded, instruction);
+        }
+    }
+
+    #[tokio::test]
+    async fn encoder_instruction_decode_truncated_input_returns_error() {
+        let result = EncoderInstruction::decode_from(Cursor::new(Vec::<u8>::new())).await;
+
+        assert!(result.is_err(), "empty encoder instruction must fail");
     }
 
     #[tokio::test]
@@ -1307,6 +1336,88 @@ mod tests {
     }
 
     #[test]
+    fn insert_with_literal_name_indexes_entry_and_emits_instruction() {
+        let mut state = EncoderState::new(settings_with_capacity(128));
+        state
+            .set_max_table_capacity(128)
+            .expect("set capacity failed");
+
+        let index = state
+            .insert_with_literal_name(
+                true,
+                Bytes::from_static(b"x-name"),
+                false,
+                Bytes::from_static(b"value"),
+            )
+            .expect("insert failed");
+
+        assert_eq!(index, 0);
+        assert_eq!(
+            state.get_entry(index),
+            Some(&FieldLine {
+                name: Bytes::from_static(b"x-name"),
+                value: Bytes::from_static(b"value"),
+            })
+        );
+        assert!(
+            state
+                .find_name(&Bytes::from_static(b"x-name"))
+                .unwrap()
+                .contains(&index)
+        );
+        assert!(
+            state
+                .find_value(&Bytes::from_static(b"value"))
+                .unwrap()
+                .contains(&index)
+        );
+        assert_eq!(
+            state.pending_instructions().back(),
+            Some(&EncoderInstruction::InsertWithLiteralName {
+                name_huffman: true,
+                name: Bytes::from_static(b"x-name"),
+                value_huffman: false,
+                value: Bytes::from_static(b"value"),
+            })
+        );
+    }
+
+    #[test]
+    fn insert_with_name_reference_uses_static_name_and_emits_static_reference() {
+        let mut state = EncoderState::new(settings_with_capacity(128));
+        state
+            .set_max_table_capacity(128)
+            .expect("set capacity failed");
+        let static_name_index = 17;
+        let expected_name = Bytes::from_static(
+            r#static::get_name(static_name_index)
+                .expect("static name exists")
+                .as_bytes(),
+        );
+
+        let index = state
+            .insert_with_name_reference(true, static_name_index, true, Bytes::from_static(b"PATCH"))
+            .expect("static name reference insert failed");
+
+        assert_eq!(
+            state.get_entry(index),
+            Some(&FieldLine {
+                name: expected_name,
+                value: Bytes::from_static(b"PATCH"),
+            })
+        );
+        assert_eq!(
+            state.pending_instructions().back(),
+            Some(&EncoderInstruction::InsertWithNameReference {
+                is_static: true,
+                name_index: static_name_index,
+                huffman: true,
+                value: Bytes::from_static(b"PATCH"),
+            })
+        );
+    }
+
+    #[test]
     fn insert_with_name_reference_uses_dynamic_relative_index() {
         let mut state = EncoderState::new(settings_with_capacity(256));
         state
@@ -1343,6 +1454,43 @@ mod tests {
     }
 
     #[test]
+    fn insertion_evicts_acknowledged_entries_to_make_room() {
+        let mut state = EncoderState::new(settings_with_capacity(96));
+        state
+            .set_max_table_capacity(64)
+            .expect("set capacity failed");
+        state
+            .insert_with_literal_name(
+                false,
+                Bytes::from_static(b"old-name"),
+                false,
+                Bytes::from_static(b"old-value"),
+            )
+            .expect("initial insert failed");
+        state.dynamic_table.known_received_count = state.table_inserted_count();
+
+        let index = state
+            .insert_with_literal_name(
+                false,
+                Bytes::from_static(b"new-name"),
+                false,
+                Bytes::from_static(b"new-value"),
+            )
+            .expect("acknowledged old entry should be evictable");
+
+        assert_eq!(index, 1);
+        assert_eq!(state.table_dropped_count(), 1);
+        assert!(state.find_name(&Bytes::from_static(b"old-name")).is_none());
+        assert_eq!(
+            state
+                .entries()
+                .map(|(index, entry)| (index, entry.name.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, Bytes::from_static(b"new-name"))]
+        );
+    }
+
+    #[test]
     fn duplicate_uses_relative_index_and_preserves_entry() {
         let mut state = EncoderState::new(settings_with_capacity(256));
         state
@@ -1370,6 +1518,39 @@ mod tests {
                 name: Bytes::from_static(b"x-name"),
                 value: Bytes::from_static(b"value"),
             })
+        );
+    }
+
+    #[test]
+    fn duplicate_evicts_acknowledged_entries_to_make_room() {
+        let mut state = EncoderState::new(settings_with_capacity(96));
+        state
+            .set_max_table_capacity(64)
+            .expect("set capacity failed");
+        let original_index = state
+            .insert_with_literal_name(
+                false,
+                Bytes::from_static(b"x-name"),
+                false,
+                Bytes::from_static(b"value"),
+            )
+            .expect("insert failed");
+        state.dynamic_table.known_received_count = state.table_inserted_count();
+
+        let duplicated_index = state
+            .duplicate(original_index)
+            .expect("acknowledged original entry should be evictable");
+
+        assert_eq!(duplicated_index, 1);
+        assert_eq!(state.table_dropped_count(), 1);
+        assert_eq!(
+            state
+                .find_name(&Bytes::from_static(b"x-name"))
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![duplicated_index]
         );
     }
 
@@ -1442,6 +1623,58 @@ mod tests {
             vec![EncoderInstruction::SetDynamicTableCapacity { capacity: 96 }]
         );
         assert_eq!(recorded.flushes(), 1);
+        assert!(encoder.state.lock().await.pending_instructions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_settings_does_not_emit_capacity_when_peer_capacity_is_zero() {
+        let encoder_sink = RecordingInstructionSink::default();
+        let recorded = encoder_sink.clone();
+        let encoder = Encoder::new(
+            settings_with_capacity(0),
+            encoder_sink,
+            stream::empty::<Result<DecoderInstruction, StreamError>>(),
+        );
+
+        encoder.apply_settings(settings_with_capacity(0)).await;
+
+        assert_eq!(encoder.state.lock().await.table_capacity(), 0);
+        assert!(recorded.instructions().is_empty());
+        assert_eq!(recorded.flushes(), 1);
+    }
+
+    #[tokio::test]
+    async fn flush_instructions_sends_all_pending_instructions_in_order_once() {
+        let encoder_sink = RecordingInstructionSink::default();
+        let recorded = encoder_sink.clone();
+        let encoder = Encoder::new(
+            settings_with_capacity(128),
+            encoder_sink,
+            stream::empty::<Result<DecoderInstruction, StreamError>>(),
+        );
+        {
+            let mut state = encoder.state.lock().await;
+            state.emit(EncoderInstruction::SetDynamicTableCapacity { capacity: 64 });
+            state.emit(EncoderInstruction::Duplicate { index: 3 });
+        }
+
+        encoder
+            .flush_instructions()
+            .await
+            .expect("flush should succeed");
+        encoder
+            .flush_instructions()
+            .await
+            .expect("second flush should succeed without resending");
+
+        assert_eq!(
+            recorded.instructions(),
+            vec![
+                EncoderInstruction::SetDynamicTableCapacity { capacity: 64 },
+                EncoderInstruction::Duplicate { index: 3 },
+            ]
+        );
+        assert_eq!(recorded.flushes(), 2);
         assert!(encoder.state.lock().await.pending_instructions().is_empty());
     }
 
@@ -1544,6 +1777,19 @@ mod tests {
         assert!(!state.blocking_streams.contains_key(&7));
         assert!(!state.blocking_streams.contains_key(&8));
         assert_eq!(state.table_known_received_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn receive_instruction_reports_closed_decoder_stream() {
+        let encoder = Encoder::new(
+            settings_with_capacity(128),
+            RecordingInstructionSink::default(),
+            stream::empty::<Result<DecoderInstruction, StreamError>>(),
+        );
+
+        let result = encoder.receive_instruction().await;
+
+        assert!(result.is_err(), "closed decoder stream must be reported");
     }
 
     // --- Edge case tests ---

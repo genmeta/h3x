@@ -709,6 +709,15 @@ mod tests {
         Arc::new(settings)
     }
 
+    fn assert_connection_h3_code(error: StreamError, expected: Code) {
+        match error {
+            StreamError::Connection {
+                source: crate::connection::ConnectionError::H3 { source },
+            } => assert_eq!(source.code(), expected),
+            error => panic!("unexpected error: {error:?}"),
+        }
+    }
+
     async fn encode_decode_roundtrip(
         instruction: DecoderInstruction,
     ) -> Result<DecoderInstruction, crate::connection::StreamError> {
@@ -1270,6 +1279,103 @@ mod tests {
             .receive_instruction_until(0)
             .await
             .expect("zero required count is already known");
+    }
+
+    #[tokio::test]
+    async fn receive_instruction_until_reports_closed_encoder_stream() {
+        let (decoder, _) = test_decoder(test_settings(128), Vec::new());
+
+        let error = decoder
+            .receive_instruction_until(1)
+            .await
+            .expect_err("missing encoder stream instruction should close the connection");
+
+        assert_connection_h3_code(error, Code::H3_CLOSED_CRITICAL_STREAM);
+    }
+
+    #[tokio::test]
+    async fn receive_instruction_until_propagates_encoder_stream_read_error() {
+        let (decoder, _) = test_decoder(
+            test_settings(128),
+            vec![Err(StreamError::Reset {
+                code: VarInt::from_u32(33),
+            })],
+        );
+
+        let error = decoder
+            .receive_instruction_until(1)
+            .await
+            .expect_err("encoder stream read error should propagate");
+
+        assert!(matches!(
+            error,
+            StreamError::Reset { code } if code == VarInt::from_u32(33)
+        ));
+    }
+
+    #[tokio::test]
+    async fn receive_instruction_until_rejects_invalid_encoder_instructions() {
+        let cases = [
+            vec![Ok(EncoderInstruction::SetDynamicTableCapacity {
+                capacity: 256,
+            })],
+            vec![
+                Ok(EncoderInstruction::SetDynamicTableCapacity { capacity: 64 }),
+                Ok(EncoderInstruction::InsertWithNameReference {
+                    is_static: true,
+                    name_index: 9999,
+                    huffman: false,
+                    value: Bytes::from_static(b"value"),
+                }),
+            ],
+            vec![
+                Ok(EncoderInstruction::SetDynamicTableCapacity { capacity: 0 }),
+                Ok(EncoderInstruction::InsertWithLiteralName {
+                    name_huffman: false,
+                    name: Bytes::from_static(b"name"),
+                    value_huffman: false,
+                    value: Bytes::from_static(b"value"),
+                }),
+            ],
+        ];
+
+        for instructions in cases {
+            let (decoder, _) = test_decoder(test_settings(128), instructions);
+            let error = decoder
+                .receive_instruction_until(1)
+                .await
+                .expect_err("invalid encoder instruction should close the connection");
+
+            assert_connection_h3_code(error, Code::QPACK_ENCODER_STREAM_ERROR);
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_instructions_sends_and_drains_pending_queue() {
+        let (decoder, sent) = test_decoder(test_settings(128), Vec::new());
+        decoder.emit(DecoderInstruction::StreamCancellation { stream_id: 1 });
+        decoder.emit(DecoderInstruction::StreamCancellation { stream_id: 2 });
+
+        decoder
+            .flush_instructions()
+            .await
+            .expect("pending instructions should flush");
+
+        assert_eq!(
+            sent.lock().expect("lock is not poisoned").as_slice(),
+            &[
+                DecoderInstruction::StreamCancellation { stream_id: 1 },
+                DecoderInstruction::StreamCancellation { stream_id: 2 },
+            ]
+        );
+        assert!(
+            decoder
+                .state
+                .lock()
+                .expect("lock is not poisoned")
+                .pending_instructions
+                .is_empty()
+        );
     }
 
     #[tokio::test]
