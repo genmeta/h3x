@@ -570,6 +570,12 @@ mod tests {
 
     fn make_raw_listeners() -> Arc<dquic::prelude::QuicListeners> {
         dquic::prelude::QuicListeners::builder()
+            .with_router(Arc::new(
+                dquic::qinterface::component::route::QuicRouter::default(),
+            ))
+            .with_locations(Arc::new(
+                dquic::qinterface::component::location::Locations::new(),
+            ))
             .without_client_cert_verifier()
             .listen(1)
             .expect("raw listeners start")
@@ -836,6 +842,10 @@ mod tests {
     async fn listen_impls_for_references_and_arcs_shutdown_accept_queue() {
         let listeners = make_raw_listeners();
 
+        quic::Listen::shutdown(listeners.as_ref())
+            .await
+            .expect("direct listener shutdown");
+
         let mut by_ref = listeners.as_ref();
         quic::Listen::shutdown(&by_ref)
             .await
@@ -847,6 +857,19 @@ mod tests {
             .await
             .expect("arc listener shutdown");
         assert!(quic::Listen::accept(&mut by_arc).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn isolated_raw_listener_configs_allow_concurrent_listener_instances() {
+        let first = make_raw_listeners();
+        let second = make_raw_listeners();
+
+        quic::Listen::shutdown(first.as_ref())
+            .await
+            .expect("first isolated listener shutdown");
+        quic::Listen::shutdown(second.as_ref())
+            .await
+            .expect("second isolated listener shutdown");
     }
 
     #[tokio::test]
@@ -877,6 +900,7 @@ mod tests {
             resolver.names(),
             vec!["example.test:8443".to_owned(), "example.test".to_owned()]
         );
+        assert_eq!(format!("{}", resolver.as_ref()), "recording resolver");
         Lifecycle::close(first.as_ref(), Code::H3_NO_ERROR, Cow::Borrowed(""));
         Lifecycle::close(second.as_ref(), Code::H3_NO_ERROR, Cow::Borrowed(""));
     }
