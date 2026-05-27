@@ -1,11 +1,12 @@
 use std::{
     borrow::Cow,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
+use dashmap::{DashMap, mapref::entry::Entry};
 use dhttp_identity::identity::{self as agent, SignError};
 use futures::{Sink, Stream, future::BoxFuture};
 use rustls::{SignatureScheme, pki_types::CertificateDer, sign::CertifiedKey};
@@ -41,6 +42,88 @@ pub fn convert_connection_error(error: dquic::prelude::Error) -> quic::Connectio
             })
         }
     }
+}
+
+type DquicConnectionId = dquic::qbase::cid::ConnectionId;
+
+#[derive(Clone)]
+struct LatchedConnectionError {
+    origin_dcid: Option<DquicConnectionId>,
+    error: quic::ConnectionError,
+}
+
+fn dquic_connection_latches() -> &'static DashMap<usize, LatchedConnectionError> {
+    static LATCHES: OnceLock<DashMap<usize, LatchedConnectionError>> = OnceLock::new();
+    LATCHES.get_or_init(DashMap::new)
+}
+
+fn dquic_connection_key(connection: &dquic::prelude::Connection) -> usize {
+    std::ptr::from_ref(connection).cast::<()>() as usize
+}
+
+fn dquic_origin_dcid(connection: &dquic::prelude::Connection) -> Option<DquicConnectionId> {
+    connection.origin_dcid().ok()
+}
+
+fn is_stale_latch(
+    stored_origin: Option<DquicConnectionId>,
+    current_origin: Option<DquicConnectionId>,
+) -> bool {
+    match (stored_origin, current_origin) {
+        (Some(stored), Some(current)) => stored != current,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
+fn latched_connection_error(
+    connection: &dquic::prelude::Connection,
+) -> Option<quic::ConnectionError> {
+    let key = dquic_connection_key(connection);
+    let entry = dquic_connection_latches().get(&key)?;
+    if is_stale_latch(entry.origin_dcid, dquic_origin_dcid(connection)) {
+        drop(entry);
+        dquic_connection_latches().remove(&key);
+        None
+    } else {
+        Some(entry.error.clone())
+    }
+}
+
+fn latch_connection_error(
+    connection: &dquic::prelude::Connection,
+    origin_dcid: Option<DquicConnectionId>,
+    error: quic::ConnectionError,
+) -> quic::ConnectionError {
+    let key = dquic_connection_key(connection);
+    match dquic_connection_latches().entry(key) {
+        Entry::Occupied(mut entry) => {
+            if is_stale_latch(entry.get().origin_dcid, origin_dcid) {
+                entry.insert(LatchedConnectionError {
+                    origin_dcid,
+                    error: error.clone(),
+                });
+                error
+            } else {
+                entry.get().error.clone()
+            }
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(LatchedConnectionError {
+                origin_dcid,
+                error: error.clone(),
+            });
+            error
+        }
+    }
+}
+
+fn convert_and_latch_connection_error(
+    connection: &dquic::prelude::Connection,
+    error: dquic::prelude::Error,
+) -> quic::ConnectionError {
+    let origin_dcid = dquic_origin_dcid(connection);
+    latch_connection_error(connection, origin_dcid, convert_connection_error(error))
 }
 
 pub fn convert_stream_error(error: dquic::prelude::StreamError) -> quic::StreamError {
@@ -176,13 +259,17 @@ impl quic::ManageStream for dquic::prelude::Connection {
         let stream = self
             .open_bi_stream()
             .await
-            .map_err(convert_connection_error)?;
+            .map_err(|error| convert_and_latch_connection_error(self, error))?;
         let (stream_id, (reader, writer)) = stream.ok_or_else(|| {
-            quic::ConnectionError::from(quic::TransportError {
-                kind: VarInt::from_u32(0x04), // STREAM_LIMIT_ERROR
-                frame_type: VarInt::from_u32(0),
-                reason: "stream ID space exhausted".into(),
-            })
+            latch_connection_error(
+                self,
+                dquic_origin_dcid(self),
+                quic::ConnectionError::from(quic::TransportError {
+                    kind: VarInt::from_u32(0x04), // STREAM_LIMIT_ERROR
+                    frame_type: VarInt::from_u32(0),
+                    reason: "stream ID space exhausted".into(),
+                }),
+            )
         })?;
         let stream_id = convert_varint(stream_id.into());
         let reader = StreamReader { stream_id, reader };
@@ -194,13 +281,17 @@ impl quic::ManageStream for dquic::prelude::Connection {
         let stream = self
             .open_uni_stream()
             .await
-            .map_err(convert_connection_error)?;
+            .map_err(|error| convert_and_latch_connection_error(self, error))?;
         let (stream_id, writer) = stream.ok_or_else(|| {
-            quic::ConnectionError::from(quic::TransportError {
-                kind: VarInt::from_u32(0x04), // STREAM_LIMIT_ERROR
-                frame_type: VarInt::from_u32(0),
-                reason: "stream ID space exhausted".into(),
-            })
+            latch_connection_error(
+                self,
+                dquic_origin_dcid(self),
+                quic::ConnectionError::from(quic::TransportError {
+                    kind: VarInt::from_u32(0x04), // STREAM_LIMIT_ERROR
+                    frame_type: VarInt::from_u32(0),
+                    reason: "stream ID space exhausted".into(),
+                }),
+            )
         })?;
         let stream_id = convert_varint(stream_id.into());
         Ok(StreamWriter { stream_id, writer })
@@ -212,7 +303,7 @@ impl quic::ManageStream for dquic::prelude::Connection {
         let (stream_id, (reader, writer)) = self
             .accept_bi_stream()
             .await
-            .map_err(convert_connection_error)?;
+            .map_err(|error| convert_and_latch_connection_error(self, error))?;
         let stream_id = convert_varint(stream_id.into());
         let reader = StreamReader { stream_id, reader };
         let writer = StreamWriter { stream_id, writer };
@@ -223,7 +314,7 @@ impl quic::ManageStream for dquic::prelude::Connection {
         let (stream_id, reader) = self
             .accept_uni_stream()
             .await
-            .map_err(convert_connection_error)?;
+            .map_err(|error| convert_and_latch_connection_error(self, error))?;
         let stream_id = convert_varint(stream_id.into());
         Ok(StreamReader { stream_id, reader })
     }
@@ -278,7 +369,10 @@ impl quic::WithLocalAgent for dquic::prelude::Connection {
     type LocalAgent = DquicLocalAgent;
 
     async fn local_agent(&self) -> Result<Option<DquicLocalAgent>, quic::ConnectionError> {
-        let local_agent = self.local_agent().await.map_err(convert_connection_error)?;
+        let local_agent = self
+            .local_agent()
+            .await
+            .map_err(|error| convert_and_latch_connection_error(self, error))?;
         Ok(local_agent.map(|local_agent| {
             let name = AsRef::<Arc<str>>::as_ref(&local_agent).clone();
             let certified_key = AsRef::<Arc<CertifiedKey>>::as_ref(&local_agent).clone();
@@ -297,7 +391,7 @@ impl quic::WithRemoteAgent for dquic::prelude::Connection {
         let remote_agent = self
             .remote_agent()
             .await
-            .map_err(convert_connection_error)?;
+            .map_err(|error| convert_and_latch_connection_error(self, error))?;
         Ok(remote_agent.map(|remote_agent| {
             let name = AsRef::<Arc<str>>::as_ref(&remote_agent).clone();
             let cert_chain = AsRef::<Arc<[CertificateDer]>>::as_ref(&remote_agent).clone();
@@ -312,11 +406,20 @@ impl quic::Lifecycle for dquic::prelude::Connection {
     }
 
     fn check(&self) -> Result<(), quic::ConnectionError> {
-        self.validate().map_err(convert_connection_error)
+        if let Some(error) = latched_connection_error(self) {
+            return Err(error);
+        }
+        self.validate()
+            .map_err(|error| convert_and_latch_connection_error(self, error))
     }
 
     async fn closed(&self) -> quic::ConnectionError {
-        convert_connection_error(dquic::prelude::Connection::terminated(self).await)
+        if let Some(error) = latched_connection_error(self) {
+            return error;
+        }
+        let origin_dcid = dquic_origin_dcid(self);
+        let error = convert_connection_error(dquic::prelude::Connection::terminated(self).await);
+        latch_connection_error(self, origin_dcid, error)
     }
 }
 
@@ -402,7 +505,7 @@ mod tests {
         },
         qrecovery::streams::error::StreamError as DquicStreamError,
     };
-    use futures::{SinkExt, StreamExt};
+    use futures::{FutureExt, SinkExt, StreamExt};
     use http::uri::Authority;
     use tokio::time;
 
@@ -647,7 +750,12 @@ mod tests {
             error.is_application() || error.is_transport(),
             "closed should report a terminal connection error"
         );
-        assert!(Lifecycle::check(server.as_ref()).is_err());
+        let checked = Lifecycle::check(server.as_ref()).expect_err("terminal error is latched");
+        assert_eq!(checked.to_string(), error.to_string());
+        let repeated = Lifecycle::closed(server.as_ref())
+            .now_or_never()
+            .expect("latched closed should resolve immediately");
+        assert_eq!(repeated.to_string(), error.to_string());
     }
 
     #[tokio::test]
