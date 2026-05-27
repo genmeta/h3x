@@ -583,6 +583,53 @@ mod tests {
         let stream_id = VarInt::from_u32(71);
         let cancel_code = VarInt::from_u32(72);
 
+        let mut bytes_stream = crate::message::test::write_stream_for_test(stream_id);
+        {
+            let mut sink = Box::pin(bytes_stream.as_bytes_sink());
+            assert_eq!(
+                poll_fn(|cx| sink.as_mut().poll_stream_id(cx))
+                    .await
+                    .expect("as_bytes_sink stream id"),
+                stream_id
+            );
+            poll_fn(|cx| sink.as_mut().poll_cancel(cx, cancel_code))
+                .await
+                .expect("as_bytes_sink cancel");
+            sink.as_mut()
+                .send(Bytes::from_static(b"payload"))
+                .await
+                .expect("as_bytes_sink send");
+            sink.as_mut().flush().await.expect("as_bytes_sink flush");
+            sink.as_mut().close().await.expect("as_bytes_sink close");
+        }
+
+        let mut owned_sink =
+            Box::pin(crate::message::test::write_stream_for_test(stream_id).into_bytes_sink());
+        assert_eq!(
+            poll_fn(|cx| owned_sink.as_mut().poll_stream_id(cx))
+                .await
+                .expect("into_bytes_sink stream id"),
+            stream_id
+        );
+        poll_fn(|cx| owned_sink.as_mut().poll_cancel(cx, cancel_code))
+            .await
+            .expect("into_bytes_sink cancel");
+        owned_sink
+            .as_mut()
+            .send(Bytes::from_static(b"payload"))
+            .await
+            .expect("into_bytes_sink send");
+        owned_sink
+            .as_mut()
+            .flush()
+            .await
+            .expect("into_bytes_sink flush");
+        owned_sink
+            .as_mut()
+            .close()
+            .await
+            .expect("into_bytes_sink close");
+
         let mut borrowed_stream = crate::message::test::write_stream_for_test(stream_id);
         {
             let mut writer = Box::pin(borrowed_stream.as_writer());

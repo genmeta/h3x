@@ -278,6 +278,7 @@ impl<C: quic::Connection> Pool<C> {
 #[cfg(test)]
 mod tests {
     use std::{
+        error::Error as StdError,
         io,
         sync::{
             Arc, Mutex,
@@ -488,6 +489,12 @@ mod tests {
                 remote_name,
             }
         }
+
+        fn with_stream_ops(remote_name: Option<&'static str>) -> Self {
+            let inner = crate::connection::tests::MockConnection::new();
+            inner.enable_stream_ops();
+            Self { inner, remote_name }
+        }
     }
 
     impl quic::ManageStream for IdentityOverrideConnection {
@@ -543,6 +550,172 @@ mod tests {
         async fn closed(&self) -> quic::ConnectionError {
             quic::Lifecycle::closed(&self.inner).await
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct IdentityConnector {
+        connection: IdentityOverrideConnection,
+    }
+
+    impl IdentityConnector {
+        fn new(remote_name: Option<&'static str>) -> Self {
+            Self {
+                connection: IdentityOverrideConnection::with_stream_ops(remote_name),
+            }
+        }
+    }
+
+    impl quic::Connect for IdentityConnector {
+        type Connection = IdentityOverrideConnection;
+        type Error = io::Error;
+
+        async fn connect(&self, _server: &Authority) -> Result<Arc<Self::Connection>, Self::Error> {
+            Ok(Arc::new(self.connection.clone()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnavailableStreamsConnector;
+
+    impl quic::Connect for UnavailableStreamsConnector {
+        type Connection = crate::connection::tests::MockConnection;
+        type Error = io::Error;
+
+        async fn connect(&self, _server: &Authority) -> Result<Arc<Self::Connection>, Self::Error> {
+            Ok(Arc::new(crate::connection::tests::MockConnection::new()))
+        }
+    }
+
+    #[test]
+    fn reusable_connection_pending_starts_empty() {
+        let reusable = ReuseableConnection::<crate::connection::tests::MockConnection>::pending();
+
+        assert!(reusable.peek().is_none());
+        assert!(reusable.reuse().is_none());
+    }
+
+    #[tokio::test]
+    async fn reusable_connection_insert_with_publishes_connection() {
+        let expected = Arc::new(mock_connection_with_dhttp(
+            crate::connection::tests::MockConnection::new(),
+        ));
+        let reusable = ReuseableConnection::pending();
+
+        reusable
+            .insert_with(async || (expected.clone(), abort_handle()))
+            .await;
+
+        assert!(Arc::ptr_eq(
+            &reusable.peek().expect("connection should be visible"),
+            &expected,
+        ));
+        assert!(Arc::ptr_eq(
+            &reusable.reuse().expect("connection should be reusable"),
+            &expected,
+        ));
+    }
+
+    #[tokio::test]
+    async fn reusable_connection_try_insert_with_replaces_existing_connection() {
+        let old = Arc::new(mock_connection_with_dhttp(
+            crate::connection::tests::MockConnection::new(),
+        ));
+        let new = Arc::new(mock_connection_with_dhttp(
+            crate::connection::tests::MockConnection::new(),
+        ));
+        let reusable = ReuseableConnection::pending();
+        reusable.insert(old.clone(), abort_handle()).await;
+
+        reusable
+            .try_insert_with::<io::Error>(async || Ok((new.clone(), abort_handle())))
+            .await
+            .expect("replacement should succeed");
+
+        let reused = reusable
+            .reuse()
+            .expect("replacement should become reusable");
+        assert!(Arc::ptr_eq(&reused, &new));
+        assert!(!Arc::ptr_eq(&reused, &old));
+    }
+
+    #[test]
+    fn pool_default_clone_shares_entries_and_clear() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::default();
+        assert!(pool.is_empty());
+
+        let cloned = pool.clone();
+        let auth: Authority = "example.com:443".parse().unwrap();
+        cloned
+            .connections
+            .entry(auth)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+
+        assert_eq!(pool.len(), 1);
+        assert!(!cloned.is_empty());
+
+        pool.clear();
+        assert!(cloned.is_empty());
+    }
+
+    #[test]
+    fn connect_error_display_and_sources_are_semantic() {
+        let connector: ConnectError<io::Error> = ConnectError::Connector {
+            source: io::Error::other("dial failed"),
+        };
+        assert_eq!(
+            connector.to_string(),
+            "failed to initialize QUIC connection"
+        );
+        assert_eq!(
+            StdError::source(&connector)
+                .expect("connector error should preserve source")
+                .to_string(),
+            "dial failed"
+        );
+
+        let anonymous: ConnectError<io::Error> = ConnectError::IncorrectIdentity {
+            expected: "expected.example".to_owned(),
+            actual: None,
+        };
+        assert_eq!(
+            anonymous.to_string(),
+            "peer name mismatch: expected expected.example, actual <anonymous>"
+        );
+        assert!(StdError::source(&anonymous).is_none());
+
+        let named: ConnectError<io::Error> = ConnectError::IncorrectIdentity {
+            expected: "expected.example".to_owned(),
+            actual: Some("actual.example".to_owned()),
+        };
+        assert_eq!(
+            named.to_string(),
+            "peer name mismatch: expected expected.example, actual actual.example"
+        );
+        assert!(StdError::source(&named).is_none());
+
+        let source = test_connection_error("h3 failed");
+        let source_display = source.to_string();
+        let h3: ConnectError<io::Error> = ConnectError::H3 { source };
+        assert_eq!(h3.to_string(), source_display);
+    }
+
+    #[test]
+    fn insert_error_display_and_sources_are_semantic() {
+        let missing = InsertError::MissingIdentity;
+        assert_eq!(missing.to_string(), "peer does not provide identity");
+        assert!(StdError::source(&missing).is_none());
+
+        let invalid = InsertError::InvalidIdentity;
+        assert_eq!(
+            invalid.to_string(),
+            "peer provided invalid identity (cannot be parsed as Authority)"
+        );
+        assert!(StdError::source(&invalid).is_none());
+
+        let source = test_connection_error("insert failed");
+        let source_display = source.to_string();
+        let quic = InsertError::Quic { source };
+        assert_eq!(quic.to_string(), source_display);
     }
 
     #[test]
@@ -787,6 +960,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_rejects_anonymous_peer_identity() {
+        let pool = Pool::<IdentityOverrideConnection>::empty();
+        let connector = IdentityConnector::new(None);
+        let server = matching_server();
+
+        let error = pool
+            .reuse_or_connect_with(&connector, Arc::new(ConnectionBuilder::default()), server)
+            .await
+            .expect_err("anonymous peer should fail identity verification");
+
+        match error {
+            ConnectError::IncorrectIdentity { expected, actual } => {
+                assert_eq!(expected, "test-remote");
+                assert!(actual.is_none());
+            }
+            other => panic!("expected identity error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_returns_h3_error_when_connection_initialization_fails() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+
+        let error = pool
+            .reuse_or_connect_with(
+                &UnavailableStreamsConnector,
+                Arc::new(ConnectionBuilder::default()),
+                matching_server(),
+            )
+            .await
+            .expect_err("builder should fail when stream operations are unavailable");
+
+        assert!(matches!(error, ConnectError::H3 { .. }));
+    }
+
+    #[tokio::test]
     async fn pool_replaces_closed_connection_with_new_one() {
         let pool = Pool::<crate::connection::tests::MockConnection>::empty();
         let connector = TestConnector::succeed();
@@ -812,6 +1021,45 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(connector.call_count(), 2);
         assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn try_insert_makes_connection_reusable_under_remote_identity() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let connection = Arc::new(mock_connection_with_dhttp(
+            crate::connection::tests::MockConnection::new(),
+        ));
+
+        pool.try_insert(connection.clone())
+            .await
+            .expect("insert should succeed");
+
+        let reusable = pool
+            .connections
+            .get(&inserted_identity())
+            .expect("entry should be keyed by remote identity");
+        assert!(Arc::ptr_eq(
+            &reusable.reuse().expect("connection should be reusable"),
+            &connection,
+        ));
+    }
+
+    #[tokio::test]
+    async fn clear_drops_cached_connection_and_aborts_release_task() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let quic = crate::connection::tests::MockConnection::new();
+
+        pool.try_insert(Arc::new(mock_connection_with_dhttp(quic.clone())))
+            .await
+            .expect("insert should succeed");
+
+        pool.clear();
+
+        wait_until("cached connection drop after clear", || {
+            !quic.close_calls().is_empty()
+        })
+        .await;
+        assert!(pool.is_empty());
     }
 
     #[tokio::test]
