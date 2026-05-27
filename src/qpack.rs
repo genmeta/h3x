@@ -357,6 +357,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn apply_pending_encoder_instructions_replays_duplicate_entries() {
+        use crate::qpack::{decoder::DecoderState, encoder::EncoderState};
+
+        let settings = settings_with_dynamic_table();
+        let mut encoder_state = EncoderState::new(settings.clone());
+        encoder_state
+            .set_max_table_capacity(4096)
+            .expect("set encoder capacity");
+        let original_index = encoder_state
+            .insert_with_literal_name(
+                false,
+                Bytes::from_static(b"x-duplicate"),
+                false,
+                Bytes::from_static(b"value"),
+            )
+            .expect("insert original entry");
+        let duplicated_index = encoder_state
+            .duplicate(original_index)
+            .expect("duplicate original entry");
+        let mut decoder_state = DecoderState::new(settings);
+
+        apply_pending_encoder_instructions(&mut encoder_state, &mut decoder_state);
+
+        assert_eq!(decoder_state.table_inserted_count(), duplicated_index + 1);
+        assert_eq!(
+            decoder_state.dynamic_table.get(duplicated_index),
+            Some(&crate::qpack::field::FieldLine {
+                name: Bytes::from_static(b"x-duplicate"),
+                value: Bytes::from_static(b"value"),
+            })
+        );
+    }
+
     #[tokio::test]
     async fn dynamic_response_trailer_and_empty_field_sections_roundtrip() {
         use crate::qpack::{
@@ -441,7 +475,7 @@ mod tests {
         use crate::qpack::{
             algorithm::{Algorithm, DynamicCompressAlgo, HuffmanAlways},
             decoder::DecoderState,
-            encoder::{EncoderInstruction, EncoderState},
+            encoder::EncoderState,
             field::{EncodedFieldSectionPrefix, FieldLine},
         };
 
@@ -486,38 +520,7 @@ mod tests {
 
         // Apply encoder instructions to decoder state
         // (simulates instructions arriving via encoder stream)
-        for instruction in encoder_state.pending_instructions() {
-            match instruction {
-                EncoderInstruction::SetDynamicTableCapacity { capacity } => {
-                    decoder_state.set_dynamic_table_capacity(*capacity).unwrap();
-                }
-                EncoderInstruction::InsertWithNameReference {
-                    is_static,
-                    name_index,
-                    value,
-                    ..
-                } => {
-                    // Wire-format name_index: relative for dynamic, absolute for static
-                    let abs_index = if *is_static {
-                        *name_index
-                    } else {
-                        decoder_state.table_inserted_count() - name_index - 1
-                    };
-                    decoder_state
-                        .insert_with_name_reference(*is_static, abs_index, value.clone())
-                        .unwrap();
-                }
-                EncoderInstruction::InsertWithLiteralName { name, value, .. } => {
-                    decoder_state
-                        .insert_with_literal_name(name.clone(), value.clone())
-                        .unwrap();
-                }
-                EncoderInstruction::Duplicate { index } => {
-                    let abs_index = decoder_state.table_inserted_count() - index - 1;
-                    decoder_state.duplicate(abs_index).unwrap();
-                }
-            }
-        }
+        apply_pending_encoder_instructions(&mut encoder_state, &mut decoder_state);
 
         // Decode the RIC to get required_insert_count
         let max_table_capacity = settings.qpack_max_table_capacity().into_inner();
