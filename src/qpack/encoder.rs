@@ -735,6 +735,15 @@ mod tests {
         Arc::new(settings)
     }
 
+    fn assert_connection_h3_code(error: StreamError, expected: Code) {
+        match error {
+            StreamError::Connection {
+                source: crate::connection::ConnectionError::H3 { source },
+            } => assert_eq!(source.code(), expected),
+            error => panic!("unexpected error: {error:?}"),
+        }
+    }
+
     fn state_with_full_unacknowledged_entry() -> EncoderState {
         let mut state = EncoderState::new(settings_with_capacity(128));
         state
@@ -1789,7 +1798,10 @@ mod tests {
 
         let result = encoder.receive_instruction().await;
 
-        assert!(result.is_err(), "closed decoder stream must be reported");
+        assert_connection_h3_code(
+            result.expect_err("closed decoder stream must be reported"),
+            Code::H3_CLOSED_CRITICAL_STREAM,
+        );
     }
 
     // --- Edge case tests ---
