@@ -644,6 +644,11 @@ mod tests {
 
         let error = quic::Lifecycle::check(&remote).expect_err("latched error should fail check");
         assert_reason(&error, "rpc open failed");
+
+        let closed = timeout(Duration::from_secs(1), quic::Lifecycle::closed(&remote))
+            .await
+            .expect("latched closed should resolve immediately");
+        assert_reason(&closed, "rpc open failed");
     }
 
     #[tokio::test]

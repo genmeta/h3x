@@ -837,6 +837,7 @@ mod tests {
     use futures::{SinkExt, StreamExt, future::pending};
     use remoc::prelude::ServerShared;
     use smallvec::SmallVec;
+    use tokio::time::{Duration, timeout};
     use tokio_util::task::AbortOnDropHandle;
     use tracing::Instrument;
 
@@ -1179,6 +1180,14 @@ mod tests {
             .expect_err("transport error should latch");
         assert_reason(&latched, "open transport");
 
+        let closed = timeout(
+            Duration::from_secs(1),
+            quic::Lifecycle::closed(handle.lifecycle.as_ref()),
+        )
+        .await
+        .expect("latched open transport error should resolve closed immediately");
+        assert_reason(&closed, "open transport");
+
         let registered = registered_fds(1).await;
         let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
         let closed = handle
@@ -1214,6 +1223,14 @@ mod tests {
         let latched = quic::Lifecycle::check(handle.lifecycle.as_ref())
             .expect_err("accept transport error should latch");
         assert_reason(&latched, "accept transport");
+
+        let closed = timeout(
+            Duration::from_secs(1),
+            quic::Lifecycle::closed(handle.lifecycle.as_ref()),
+        )
+        .await
+        .expect("latched accept transport error should resolve closed immediately");
+        assert_reason(&closed, "accept transport");
     }
 
     #[tokio::test]
