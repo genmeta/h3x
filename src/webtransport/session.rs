@@ -519,8 +519,13 @@ mod tests {
         fn poll_cancel(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-            _code: VarInt,
+            code: VarInt,
         ) -> Poll<Result<(), quic::StreamError>> {
+            self.state
+                .cancelled
+                .lock()
+                .expect("cancelled lock poisoned")
+                .push(code);
             Poll::Ready(Ok(()))
         }
     }
@@ -1036,7 +1041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_uni_maps_header_write_failure_on_session_id_write() {
+    async fn open_uni_maps_buffered_header_write_failure() {
         let stream_state = Arc::new(StreamState::default());
         let conn: Arc<dyn quic::DynConnection> = Arc::new(HeaderFailConnection {
             mode: HeaderFailureMode::SendOnCall(1),
@@ -1067,6 +1072,23 @@ mod tests {
             Err(OpenStreamError::WriteHeader { .. })
         ));
         assert_eq!(stream_state.written(), vec![0x40, 0x41, 0x04]);
+    }
+
+    #[tokio::test]
+    async fn open_uni_maps_header_flush_failure() {
+        let stream_state = Arc::new(StreamState::default());
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(HeaderFailConnection {
+            mode: HeaderFailureMode::Flush,
+            state: Arc::clone(&stream_state),
+        });
+        let (_registry, session) =
+            session_with_connection(StreamId::from(VarInt::from_u32(4)), conn);
+
+        assert!(matches!(
+            session.open_uni().await,
+            Err(OpenStreamError::WriteHeader { .. })
+        ));
+        assert_eq!(stream_state.written(), vec![0x40, 0x54, 0x04]);
     }
 
     #[tokio::test]
@@ -1102,11 +1124,10 @@ mod tests {
 
     #[tokio::test]
     async fn closed_session_maps_open_and_accept_to_closed_errors() {
-        let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
-            state: Arc::new(StreamState::default()),
-        });
+        let conn = Arc::new(MockConnection::new());
+        let erased: Arc<dyn quic::DynConnection> = conn.clone();
         let (_registry, session) =
-            session_with_connection(StreamId::from(VarInt::from_u32(4)), conn);
+            session_with_connection(StreamId::from(VarInt::from_u32(4)), erased);
         session.state.close();
 
         assert!(matches!(
@@ -1125,6 +1146,7 @@ mod tests {
             session.accept_uni().await,
             Err(AcceptStreamError::Closed { .. })
         ));
+        assert!(conn.stream_calls().is_empty());
     }
 
     #[tokio::test]
@@ -1142,6 +1164,33 @@ mod tests {
             session.accept_uni().await,
             Err(AcceptStreamError::Closed { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn drop_unregisters_session_and_rejects_late_routed_streams() {
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
+            state: Arc::new(StreamState::default()),
+        });
+        let (registry, session) =
+            session_with_connection(StreamId::from(VarInt::from_u32(4)), conn);
+        assert_eq!(registry.len(), 1);
+
+        let session_id = session.id();
+        drop(session);
+
+        let routed_state = Arc::new(StreamState::default());
+        let rejected = registry.route_uni(
+            session_id,
+            Box::pin(TestReadStream {
+                state: Arc::clone(&routed_state),
+                chunks: VecDeque::from([Bytes::from_static(&[0x55])]),
+                stream_id: VarInt::from_u32(13),
+            }) as BoxReadStream,
+        );
+
+        assert!(rejected.is_err());
+        assert_eq!(registry.len(), 0);
+        assert!(routed_state.stopped_codes().is_empty());
     }
 
     #[tokio::test]
@@ -1251,6 +1300,86 @@ mod tests {
                 other => panic!("expected connection error, got {other:?}"),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn accept_bi_prefers_connection_closed_over_queued_stream() {
+        let conn = Arc::new(MockConnection::new());
+        conn.set_terminal_error(quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(1),
+                frame_type: VarInt::from_u32(0),
+                reason: "connection closed with queued bidi".into(),
+            },
+        });
+        let erased: Arc<dyn quic::DynConnection> = conn;
+        let (registry, session) =
+            session_with_connection(StreamId::from(VarInt::from_u32(4)), erased);
+        let routed_state = Arc::new(StreamState::default());
+        assert!(
+            registry
+                .route_bi(
+                    session.id(),
+                    (
+                        Box::pin(TestReadStream {
+                            state: Arc::clone(&routed_state),
+                            chunks: VecDeque::from([Bytes::from_static(&[0x66])]),
+                            stream_id: VarInt::from_u32(14),
+                        }) as BoxReadStream,
+                        Box::pin(TestWriteStream {
+                            state: Arc::clone(&routed_state),
+                            stream_id: VarInt::from_u32(14),
+                        }) as BoxWriteStream,
+                    ),
+                )
+                .is_ok()
+        );
+
+        match session.accept_bi().await {
+            Ok(_) => panic!("accept_bi should prefer closed connection"),
+            Err(AcceptStreamError::Connection { source }) => {
+                assert_transport_reason(&source, "connection closed with queued bidi");
+            }
+            Err(other) => panic!("expected connection error, got {other:?}"),
+        }
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn accept_uni_prefers_connection_closed_over_queued_stream() {
+        let conn = Arc::new(MockConnection::new());
+        conn.set_terminal_error(quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(1),
+                frame_type: VarInt::from_u32(0),
+                reason: "connection closed with queued uni".into(),
+            },
+        });
+        let erased: Arc<dyn quic::DynConnection> = conn;
+        let (registry, session) =
+            session_with_connection(StreamId::from(VarInt::from_u32(4)), erased);
+        let routed_state = Arc::new(StreamState::default());
+        assert!(
+            registry
+                .route_uni(
+                    session.id(),
+                    Box::pin(TestReadStream {
+                        state: Arc::clone(&routed_state),
+                        chunks: VecDeque::from([Bytes::from_static(&[0x77])]),
+                        stream_id: VarInt::from_u32(15),
+                    }) as BoxReadStream,
+                )
+                .is_ok()
+        );
+
+        match session.accept_uni().await {
+            Ok(_) => panic!("accept_uni should prefer closed connection"),
+            Err(AcceptStreamError::Connection { source }) => {
+                assert_transport_reason(&source, "connection closed with queued uni");
+            }
+            Err(other) => panic!("expected connection error, got {other:?}"),
+        }
+        assert_eq!(registry.len(), 0);
     }
 
     #[tokio::test]

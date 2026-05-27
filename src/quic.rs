@@ -571,6 +571,11 @@ impl<S: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + ?
 
 #[cfg(any(test, feature = "testing"))]
 pub mod test {
+    #[cfg(test)]
+    use std::{
+        convert::Infallible,
+        sync::{Arc, Mutex},
+    };
     use std::{
         pin::Pin,
         task::{Context, Poll, ready},
@@ -578,8 +583,12 @@ pub mod test {
 
     use bytes::Bytes;
     use futures::{Sink, SinkExt, Stream, StreamExt};
+    #[cfg(test)]
+    use http::uri::Authority;
     use tokio::sync::oneshot;
 
+    #[cfg(test)]
+    use crate::{connection::tests::MockConnection, quic::Connect};
     use crate::{
         quic::{CancelStream, GetStreamId, StopStream, StreamError},
         varint::VarInt,
@@ -604,6 +613,47 @@ pub mod test {
     pub enum Packet {
         Stream(Bytes),
         Reset(VarInt),
+    }
+
+    #[cfg(test)]
+    #[derive(Default)]
+    struct RecordingConnector {
+        connection: Arc<MockConnection>,
+        servers: Mutex<Vec<String>>,
+    }
+
+    #[cfg(test)]
+    impl RecordingConnector {
+        fn new(connection: MockConnection) -> Self {
+            Self {
+                connection: Arc::new(connection),
+                servers: Mutex::default(),
+            }
+        }
+
+        fn servers(&self) -> Vec<String> {
+            self.servers
+                .lock()
+                .expect("recorded server list poisoned")
+                .clone()
+        }
+    }
+
+    #[cfg(test)]
+    impl Connect for RecordingConnector {
+        type Connection = MockConnection;
+        type Error = Infallible;
+
+        async fn connect<'a>(
+            &'a self,
+            server: &'a Authority,
+        ) -> Result<Arc<Self::Connection>, Self::Error> {
+            self.servers
+                .lock()
+                .expect("recorded server list poisoned")
+                .push(server.to_string());
+            Ok(self.connection.clone())
+        }
     }
 
     impl<S: ?Sized> GetStreamId for MockStreamWriter<S> {
@@ -883,5 +933,38 @@ pub mod test {
                 Some(Err(StreamError::Reset { code })) if code == reset_code
             ));
         }
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
+    async fn connect_blanket_impls_delegate_for_refs_and_arcs() {
+        async fn connect_with<C>(connector: C, server: &Authority) -> Arc<C::Connection>
+        where
+            C: Connect,
+            C::Error: std::fmt::Debug,
+        {
+            connector.connect(server).await.expect("connect succeeds")
+        }
+
+        let connector = RecordingConnector::new(MockConnection::new());
+        let expected = connector.connection.clone();
+
+        let first_server = "first.example:443"
+            .parse::<Authority>()
+            .expect("authority parses");
+        let first = connect_with(&connector, &first_server).await;
+        assert!(Arc::ptr_eq(&first, &expected));
+        assert_eq!(connector.servers(), vec!["first.example:443"]);
+
+        let connector = Arc::new(connector);
+        let second_server = "second.example:443"
+            .parse::<Authority>()
+            .expect("authority parses");
+        let second = connect_with(connector.clone(), &second_server).await;
+        assert!(Arc::ptr_eq(&second, &expected));
+        assert_eq!(
+            connector.servers(),
+            vec!["first.example:443", "second.example:443"],
+        );
     }
 }

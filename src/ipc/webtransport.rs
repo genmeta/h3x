@@ -1220,6 +1220,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guard_ipc_operations_return_success_without_latching_errors() {
+        let registered = registered_fds(1).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+
+        let open = handle
+            .guard_ipc_open(async {
+                Ok::<_, IpcWebTransportOpenError>((VarInt::from_u32(11), VarInt::from_u32(12)))
+            })
+            .await
+            .expect("successful open guard should pass through value");
+        assert_eq!(open, (VarInt::from_u32(11), VarInt::from_u32(12)));
+        assert!(quic::Lifecycle::check(handle.lifecycle.as_ref()).is_ok());
+
+        let accept = handle
+            .guard_ipc_accept(async {
+                Ok::<_, IpcWebTransportAcceptError>((VarInt::from_u32(13), VarInt::from_u32(14)))
+            })
+            .await
+            .expect("successful accept guard should pass through value");
+        assert_eq!(accept, (VarInt::from_u32(13), VarInt::from_u32(14)));
+        assert!(quic::Lifecycle::check(handle.lifecycle.as_ref()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn fd_to_unix_stream_helpers_normalize_blocking_fds_without_latching_errors() {
+        let registered = registered_fds(1).await;
+        let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
+
+        let (open_fd, _open_peer) = StdUnixStream::pair().expect("open fd pair");
+        open_fd
+            .set_nonblocking(false)
+            .expect("open fd should allow blocking mode");
+        let _open_stream = handle
+            .fd_to_open_unix_stream(open_fd.into())
+            .expect("open fd conversion should normalize blocking sockets");
+        assert!(quic::Lifecycle::check(handle.lifecycle.as_ref()).is_ok());
+
+        let (accept_fd, _accept_peer) = StdUnixStream::pair().expect("accept fd pair");
+        accept_fd
+            .set_nonblocking(false)
+            .expect("accept fd should allow blocking mode");
+        let _accept_stream = handle
+            .fd_to_accept_unix_stream(accept_fd.into())
+            .expect("accept fd conversion should normalize blocking sockets");
+        assert!(quic::Lifecycle::check(handle.lifecycle.as_ref()).is_ok());
+    }
+
+    #[tokio::test]
     async fn lifecycle_guard_helpers_prefer_errors_latched_while_future_is_pending() {
         let parent = Arc::new(TestLifecycle::default());
         let lifecycle = IpcWebTransportLifecycle {

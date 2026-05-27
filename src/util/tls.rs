@@ -55,12 +55,26 @@ mod tests {
     use std::time::Duration;
 
     use rustls::{
-        SignatureScheme,
+        DigitallySignedStruct, SignatureScheme,
         client::danger::ServerCertVerifier,
+        internal::msgs::codec::{Codec, Reader},
         pki_types::{CertificateDer, ServerName, UnixTime},
     };
 
     use super::*;
+
+    fn digitally_signed_struct_for_test(scheme: SignatureScheme) -> DigitallySignedStruct {
+        // rustls exposes `DigitallySignedStruct` publicly because verifier
+        // traits take it by reference, but its constructor is crate-private.
+        // Decode the same wire representation that rustls uses internally so
+        // these verifier tests can exercise the signature callbacks without
+        // depending on unsafe construction.
+        let mut signature = Vec::new();
+        scheme.encode(&mut signature);
+        0u16.encode(&mut signature);
+        DigitallySignedStruct::read(&mut Reader::init(&signature))
+            .expect("digitally signed struct decodes")
+    }
 
     #[test]
     fn dangerous_verifier_accepts_server_cert_without_validation() {
@@ -102,5 +116,19 @@ mod tests {
                 SignatureScheme::ED448,
             ]
         );
+    }
+
+    #[test]
+    fn dangerous_verifier_accepts_tls_signatures_without_validation() {
+        let verifier = DangerousServerCertVerifier;
+        let end_entity = CertificateDer::from(Vec::new());
+        let signature = digitally_signed_struct_for_test(SignatureScheme::RSA_PSS_SHA256);
+
+        verifier
+            .verify_tls12_signature(&[], &end_entity, &signature)
+            .expect("dangerous verifier should accept any TLS 1.2 signature");
+        verifier
+            .verify_tls13_signature(&[], &end_entity, &signature)
+            .expect("dangerous verifier should accept any TLS 1.3 signature");
     }
 }
