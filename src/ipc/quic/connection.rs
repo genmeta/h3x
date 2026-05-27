@@ -814,7 +814,9 @@ mod tests {
     use super::*;
     use crate::{
         ipc::transport::{FdRegistry, FdSender, MuxChannel},
-        quic::{CancelStream, GetStreamId, GetStreamIdExt, StopStream},
+        quic::{
+            CancelStream, CancelStreamExt, GetStreamId, GetStreamIdExt, StopStream, StopStreamExt,
+        },
     };
 
     fn test_connection_error(reason: &str) -> ConnectionError {
@@ -1508,6 +1510,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_helpers_cover_direct_control_paths() {
+        let lifecycle = TestLifecycle::default();
+        quic::Lifecycle::close(&lifecycle, Code::H3_NO_ERROR, "ignored".into());
+        quic::Lifecycle::check(&lifecycle).expect("empty lifecycle should be live");
+        assert!(
+            time::timeout(
+                std::time::Duration::from_millis(10),
+                quic::Lifecycle::closed(&lifecycle),
+            )
+            .await
+            .is_err(),
+            "empty lifecycle should remain pending"
+        );
+
+        let terminal = test_connection_error("helper terminal");
+        lifecycle.set_terminal(terminal);
+        let checked =
+            quic::Lifecycle::check(&lifecycle).expect_err("terminal lifecycle should fail check");
+        assert_transport_reason(&checked, "helper terminal");
+        let closed = quic::Lifecycle::closed(&lifecycle).await;
+        assert_transport_reason(&closed, "helper terminal");
+
+        let agent = TestLocalAgent("signer");
+        let signature =
+            identity::LocalAgent::sign(&agent, rustls::SignatureScheme::ED25519, b"payload")
+                .await
+                .expect("test local agent should sign");
+        assert!(signature.is_empty());
+
+        let (reader_tx, reader_rx) = mpsc::channel(1);
+        let mut reader = TestReader {
+            stream_id: Ok(VarInt::from_u32(601)),
+            rx: reader_rx,
+        };
+        reader
+            .stop(VarInt::from_u32(602))
+            .await
+            .expect("test reader stop should succeed");
+        assert!(
+            reader_tx
+                .send(Bytes::from_static(b"after-stop"))
+                .await
+                .is_err(),
+            "stopping the test reader should close its receiver"
+        );
+
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let mut writer = TestWriter {
+            stream_id: Ok(VarInt::from_u32(603)),
+            tx: Some(writer_tx),
+        };
+        writer
+            .cancel(VarInt::from_u32(604))
+            .await
+            .expect("test writer cancel should succeed");
+        assert!(
+            writer_rx.recv().await.is_none(),
+            "canceling the test writer should drop its sender"
+        );
+        let error = Pin::new(&mut writer)
+            .start_send(Bytes::from_static(b"after-cancel"))
+            .expect_err("closed test writer should reject start_send");
+        match error {
+            StreamError::Connection { source } => {
+                assert_transport_reason(&source, "writer closed");
+            }
+            error => panic!("expected writer closed connection error, got {error:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn scripted_helpers_return_default_typed_errors() {
+        let connection = TestConnection::new();
+        let error = ManageStream::open_bi(connection.as_ref())
+            .await
+            .err()
+            .expect("missing open_bi result should be an error");
+        assert_transport_reason(&error, "missing open_bi result");
+        let error = ManageStream::accept_bi(connection.as_ref())
+            .await
+            .err()
+            .expect("missing accept_bi result should be an error");
+        assert_transport_reason(&error, "missing accept_bi result");
+        let error = ManageStream::open_uni(connection.as_ref())
+            .await
+            .err()
+            .expect("missing open_uni result should be an error");
+        assert_transport_reason(&error, "missing open_uni result");
+        let error = ManageStream::accept_uni(connection.as_ref())
+            .await
+            .err()
+            .expect("missing accept_uni result should be an error");
+        assert_transport_reason(&error, "missing accept_uni result");
+
+        quic::Lifecycle::check(connection.as_ref()).expect("new test connection should be live");
+        connection
+            .lifecycle
+            .set_terminal(test_connection_error("connection terminal"));
+        let error = quic::Lifecycle::check(connection.as_ref())
+            .expect_err("terminal test connection should fail check");
+        assert_transport_reason(&error, "connection terminal");
+
+        let service = ScriptedIpcConnection::new();
+        let error = IpcConnection::open_bi(service.as_ref())
+            .await
+            .err()
+            .expect("missing scripted open_bi should be an error");
+        assert_transport_reason(&map_open_err(error), "missing scripted open_bi");
+        let error = IpcConnection::accept_bi(service.as_ref())
+            .await
+            .err()
+            .expect("missing scripted accept_bi should be an error");
+        assert_transport_reason(&map_accept_err(error), "missing scripted accept_bi");
+        let error = IpcConnection::open_uni(service.as_ref())
+            .await
+            .err()
+            .expect("missing scripted open_uni should be an error");
+        assert_transport_reason(&map_open_err(error), "missing scripted open_uni");
+        let error = IpcConnection::accept_uni(service.as_ref())
+            .await
+            .err()
+            .expect("missing scripted accept_uni should be an error");
+        assert_transport_reason(&map_accept_err(error), "missing scripted accept_uni");
+    }
+
+    #[tokio::test]
     async fn bridge_helpers_stop_when_destination_fails() {
         let lifecycle_state = Arc::new(TestLifecycle::default());
         lifecycle_state.set_terminal(test_connection_error("bridge reader terminal"));
@@ -2051,6 +2179,35 @@ mod tests {
         };
         assert_transport_reason(&error, "expected 2 fds for bidi stream, got 1");
 
+        let mut accept_bi_mismatch_harness = FdHarness::new();
+        let accept_bi_mismatch_service = ScriptedIpcConnection::new();
+        let (_accept_bi_mismatch_task, accept_bi_mismatch_client) =
+            spawn_connection_server(accept_bi_mismatch_service.clone());
+        let accept_bi_mismatch_handle = accept_bi_mismatch_client.into_handle(
+            accept_bi_mismatch_harness.client_registry.clone(),
+            accept_bi_mismatch_harness.client_sender.clone(),
+        );
+
+        let wrong_accept_bi_id = accept_bi_mismatch_harness
+            .server_sender
+            .queue_fds(smallvec![owned_fd()])
+            .expect("queue single accept bidi fd");
+        accept_bi_mismatch_harness.flush().await;
+        accept_bi_mismatch_service
+            .accept_bi
+            .lock()
+            .expect("accept_bi mutex should not be poisoned")
+            .push_back(Ok(Resolved::ok(IpcBiHandle {
+                fd_id: wrong_accept_bi_id,
+                stream_id: VarInt::from_u32(63),
+            })));
+        let error = accept_bi_mismatch_handle
+            .accept_bi()
+            .await
+            .err()
+            .expect("wrong accepted bidi fd count should fail");
+        assert_transport_reason(&error, "expected 2 fds for bidi stream, got 1");
+
         let mut uni_mismatch_harness = FdHarness::new();
         let uni_mismatch_service = ScriptedIpcConnection::new();
         let (_uni_mismatch_task, uni_mismatch_client) =
@@ -2175,6 +2332,29 @@ mod tests {
             Ok(_) => panic!("closed fd registry should fail open_bi"),
             Err(error) => error,
         };
+        assert_transport_reason(&error, "ipc: wait_fds");
+
+        let service = ScriptedIpcConnection::new();
+        let (_task, client) = spawn_connection_server(service.clone());
+        let fd_harness = FdHarness::new();
+        let handle = client.into_handle(
+            fd_harness.client_registry.clone(),
+            fd_harness.client_sender.clone(),
+        );
+        drop(fd_harness);
+        service
+            .accept_bi
+            .lock()
+            .expect("accept_bi mutex should not be poisoned")
+            .push_back(Ok(Resolved::ok(IpcBiHandle {
+                fd_id: VarInt::from_u32(512),
+                stream_id: VarInt::from_u32(514),
+            })));
+        let error = handle
+            .accept_bi()
+            .await
+            .err()
+            .expect("closed fd registry should fail accept_bi");
         assert_transport_reason(&error, "ipc: wait_fds");
 
         let service = ScriptedIpcConnection::new();
