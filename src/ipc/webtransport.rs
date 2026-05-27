@@ -771,7 +771,10 @@ mod tests {
         connection::{ConnectionState, tests::MockConnection},
         error::Code,
         extended_connect::{EstablishedConnect, PendingWriteStreamError},
-        message::{stream::WriteStream, test::read_stream_for_test},
+        message::{
+            stream::WriteStream,
+            test::{read_stream_for_test, write_stream_for_test},
+        },
         protocol::{Protocol as ProtocolLayer, Protocols, StreamVerdict},
         qpack::field::Protocol,
         quic::GetStreamIdExt,
@@ -1061,6 +1064,19 @@ mod tests {
         (quic, connection)
     }
 
+    fn connection_with_disabled_webtransport_pair() -> (
+        Arc<MockConnection>,
+        Arc<ConnectionState<dyn quic::DynConnection>>,
+    ) {
+        let quic = Arc::new(MockConnection::new());
+        let erased: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(WebTransportProtocol::new_for_test(erased));
+        let connection =
+            Arc::new(ConnectionState::new_for_test(quic.clone(), Arc::new(protocols)).erase());
+        (quic, connection)
+    }
+
     fn webtransport_connect_on(
         connection: Arc<ConnectionState<dyn quic::DynConnection>>,
         session_id: StreamId,
@@ -1074,6 +1090,19 @@ mod tests {
         )
     }
 
+    fn closing_webtransport_connect_on(
+        connection: Arc<ConnectionState<dyn quic::DynConnection>>,
+        session_id: StreamId,
+    ) -> EstablishedConnect {
+        EstablishedConnect::ready(
+            session_id,
+            Some(Protocol::new(WEBTRANSPORT_H3)),
+            connection,
+            read_stream_for_test(session_id.0),
+            write_stream_for_test(session_id.0),
+        )
+    }
+
     fn webtransport_session_on(
         connection: Arc<ConnectionState<dyn quic::DynConnection>>,
         session_id: StreamId,
@@ -1084,6 +1113,22 @@ mod tests {
             ))
             .expect("connect should create webtransport session"),
         )
+    }
+
+    async fn closed_webtransport_session_on(
+        connection: Arc<ConnectionState<dyn quic::DynConnection>>,
+        session_id: StreamId,
+    ) -> Arc<webtransport::WebTransportSession> {
+        let session = Arc::new(
+            webtransport::WebTransportSession::try_from(closing_webtransport_connect_on(
+                connection, session_id,
+            ))
+            .expect("connect should create webtransport session"),
+        );
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        session
     }
 
     async fn peekable_uni_stream_from_bytes(bytes: &[u8]) -> crate::codec::ErasedPeekableUniStream {
@@ -1160,6 +1205,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_adapter_open_methods_map_connection_open_errors() {
+        let (quic, connection) = connection_with_disabled_webtransport_pair();
+        let session = webtransport_session_on(connection, StreamId::from(VarInt::from_u32(42)));
+        let (sink, _stream, _registry) = fd_transport();
+        let parent = Arc::new(TestLifecycle::default());
+        let lifecycle: Arc<dyn DynLifecycle> = parent;
+        let adapter = WebTransportSessionAdapter::new(session, sink.fd_sender(), lifecycle);
+
+        let error = IpcWebTransportSession::open_bi(&adapter)
+            .await
+            .expect_err("adapter open_bi should preserve connection open errors");
+        let IpcWebTransportOpenError::Stream {
+            source: OpenStreamError::Open { source },
+        } = error
+        else {
+            panic!("expected open_bi stream open error");
+        };
+        assert_reason(&source, "open_bi unavailable");
+
+        let error = IpcWebTransportSession::open_uni(&adapter)
+            .await
+            .expect_err("adapter open_uni should preserve connection open errors");
+        let IpcWebTransportOpenError::Stream {
+            source: OpenStreamError::Open { source },
+        } = error
+        else {
+            panic!("expected open_uni stream open error");
+        };
+        assert_reason(&source, "open_uni unavailable");
+        assert_eq!(quic.stream_calls(), vec!["open_bi", "open_uni"]);
+    }
+
+    #[tokio::test]
     async fn session_adapter_accept_methods_route_streams_and_queue_expected_fds() {
         let (_quic, connection) = connection_with_enabled_webtransport_pair();
         let session_id = StreamId::from(VarInt::from_u32(42));
@@ -1215,6 +1293,62 @@ mod tests {
         let error = IpcWebTransportSession::accept_uni(&adapter)
             .await
             .expect_err("connection closure should close uni accept");
+        assert!(matches!(error, IpcWebTransportAcceptError::Closed));
+    }
+
+    #[tokio::test]
+    async fn session_adapter_accept_uni_maps_connection_closure_to_closed() {
+        let (quic, connection) = connection_with_enabled_webtransport_pair();
+        let session = webtransport_session_on(connection, StreamId::from(VarInt::from_u32(42)));
+        quic.set_terminal_error(connection_error("adapter accept uni connection closed"));
+        let (sink, _stream, _registry) = fd_transport();
+        let parent = Arc::new(TestLifecycle::default());
+        let lifecycle: Arc<dyn DynLifecycle> = parent;
+        let adapter = WebTransportSessionAdapter::new(session, sink.fd_sender(), lifecycle);
+
+        let error = IpcWebTransportSession::accept_uni(&adapter)
+            .await
+            .expect_err("connection closure should close uni accept");
+        assert!(matches!(error, IpcWebTransportAcceptError::Closed));
+    }
+
+    #[tokio::test]
+    async fn session_adapter_accept_methods_map_session_closed_to_closed() {
+        let (_quic, connection) = connection_with_enabled_webtransport_pair();
+        let session = closed_webtransport_session_on(
+            connection.clone(),
+            StreamId::from(VarInt::from_u32(42)),
+        )
+        .await;
+        let (sink, _stream, _registry) = fd_transport();
+        let parent = Arc::new(TestLifecycle::default());
+        let lifecycle: Arc<dyn DynLifecycle> = parent;
+        let adapter = WebTransportSessionAdapter::new(session, sink.fd_sender(), lifecycle);
+
+        let error = timeout(
+            Duration::from_secs(1),
+            IpcWebTransportSession::accept_bi(&adapter),
+        )
+        .await
+        .expect("closed bidi accept should not remain pending")
+        .expect_err("closed session should close bidi accept");
+        assert!(matches!(error, IpcWebTransportAcceptError::Closed));
+
+        let (_quic, connection) = connection_with_enabled_webtransport_pair();
+        let session =
+            closed_webtransport_session_on(connection, StreamId::from(VarInt::from_u32(43))).await;
+        let (sink, _stream, _registry) = fd_transport();
+        let parent = Arc::new(TestLifecycle::default());
+        let lifecycle: Arc<dyn DynLifecycle> = parent;
+        let adapter = WebTransportSessionAdapter::new(session, sink.fd_sender(), lifecycle);
+
+        let error = timeout(
+            Duration::from_secs(1),
+            IpcWebTransportSession::accept_uni(&adapter),
+        )
+        .await
+        .expect("closed uni accept should not remain pending")
+        .expect_err("closed session should close uni accept");
         assert!(matches!(error, IpcWebTransportAcceptError::Closed));
     }
 
@@ -1312,6 +1446,50 @@ mod tests {
         parent.set_terminal(connection_error("ignored later close"));
         let latched = quic::Lifecycle::check(&lifecycle).expect_err("closed should latch");
         assert_reason(&latched, "direct parent close");
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_closed_remains_pending_without_terminal_error() {
+        let lifecycle = TestLifecycle::default();
+
+        let result = timeout(
+            Duration::from_millis(10),
+            quic::Lifecycle::closed(&lifecycle),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_session_test_helpers_keep_unrelated_methods_available() {
+        let closed_accept = ClosedAcceptIpcSession;
+        assert_eq!(
+            IpcWebTransportSession::open_bi(&closed_accept)
+                .await
+                .expect("closed accept helper should still open bidi"),
+            (VarInt::from_u32(0), VarInt::from_u32(1))
+        );
+        assert_eq!(
+            IpcWebTransportSession::open_uni(&closed_accept)
+                .await
+                .expect("closed accept helper should still open uni"),
+            (VarInt::from_u32(0), VarInt::from_u32(2))
+        );
+
+        let closed_open = ClosedOpenIpcSession;
+        assert_eq!(
+            IpcWebTransportSession::accept_bi(&closed_open)
+                .await
+                .expect("closed open helper should still accept bidi"),
+            (VarInt::from_u32(0), VarInt::from_u32(3))
+        );
+        assert_eq!(
+            IpcWebTransportSession::accept_uni(&closed_open)
+                .await
+                .expect("closed open helper should still accept uni"),
+            (VarInt::from_u32(0), VarInt::from_u32(4))
+        );
     }
 
     #[tokio::test]
