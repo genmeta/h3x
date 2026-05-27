@@ -401,7 +401,9 @@ mod tests {
         accept_bi_error: Option<quic::ConnectionError>,
         accept_uni_error: Option<quic::ConnectionError>,
         local_agent: Option<TestLocalAgent>,
+        local_agent_error: Option<quic::ConnectionError>,
         remote_agent: Option<TestRemoteAgent>,
+        remote_agent_error: Option<quic::ConnectionError>,
         terminal: Mutex<Option<quic::ConnectionError>>,
         closes: Mutex<Vec<(Code, Cow<'static, str>)>>,
     }
@@ -414,7 +416,9 @@ mod tests {
                 accept_bi_error: None,
                 accept_uni_error: None,
                 local_agent: None,
+                local_agent_error: None,
                 remote_agent: None,
+                remote_agent_error: None,
                 terminal: Mutex::new(None),
                 closes: Mutex::new(Vec::new()),
             }
@@ -452,6 +456,20 @@ mod tests {
         fn fail_accept_uni(reason: &'static str) -> Self {
             Self {
                 accept_uni_error: Some(connection_error(reason)),
+                ..Self::new()
+            }
+        }
+
+        fn fail_local_agent(reason: &'static str) -> Self {
+            Self {
+                local_agent_error: Some(connection_error(reason)),
+                ..Self::new()
+            }
+        }
+
+        fn fail_remote_agent(reason: &'static str) -> Self {
+            Self {
+                remote_agent_error: Some(connection_error(reason)),
                 ..Self::new()
             }
         }
@@ -522,6 +540,9 @@ mod tests {
         type LocalAgent = TestLocalAgent;
 
         async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+            if let Some(error) = &self.local_agent_error {
+                return Err(error.clone());
+            }
             Ok(self.local_agent.clone())
         }
     }
@@ -530,6 +551,9 @@ mod tests {
         type RemoteAgent = TestRemoteAgent;
 
         async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+            if let Some(error) = &self.remote_agent_error {
+                return Err(error.clone());
+            }
             Ok(self.remote_agent.clone())
         }
     }
@@ -900,6 +924,56 @@ mod tests {
         assert_reason(&closed, "terminal");
         let latched = quic::Lifecycle::check(&remote).expect_err("closed should latch");
         assert_reason(&latched, "terminal");
+    }
+
+    #[tokio::test]
+    async fn remote_connection_preserves_absent_agents() {
+        let connection = Arc::new(TestQuicConnection::new());
+        let (_task, client) = spawn_rpc_connection(connection);
+        let remote = client.into_quic();
+
+        let local_agent = quic::WithLocalAgent::local_agent(&remote)
+            .await
+            .expect("local agent lookup should succeed");
+        assert!(local_agent.is_none());
+
+        let remote_agent = quic::WithRemoteAgent::remote_agent(&remote)
+            .await
+            .expect("remote agent lookup should succeed");
+        assert!(remote_agent.is_none());
+
+        quic::Lifecycle::check(&remote).expect("absent agents should not close connection");
+    }
+
+    #[tokio::test]
+    async fn remote_connection_latches_agent_lookup_errors() {
+        let connection = Arc::new(TestQuicConnection::fail_local_agent(
+            "local agent lookup failed",
+        ));
+        let (_task, client) = spawn_rpc_connection(connection);
+        let remote = client.into_quic();
+
+        let Err(error) = quic::WithLocalAgent::local_agent(&remote).await else {
+            panic!("local agent error should surface");
+        };
+        assert_reason(&error, "local agent lookup failed");
+
+        let latched = quic::Lifecycle::check(&remote).expect_err("local agent error should latch");
+        assert_reason(&latched, "local agent lookup failed");
+
+        let connection = Arc::new(TestQuicConnection::fail_remote_agent(
+            "remote agent lookup failed",
+        ));
+        let (_task, client) = spawn_rpc_connection(connection);
+        let remote = client.into_quic();
+
+        let Err(error) = quic::WithRemoteAgent::remote_agent(&remote).await else {
+            panic!("remote agent error should surface");
+        };
+        assert_reason(&error, "remote agent lookup failed");
+
+        let closed = quic::Lifecycle::closed(&remote).await;
+        assert_reason(&closed, "remote agent lookup failed");
     }
 
     #[tokio::test]
