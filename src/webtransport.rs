@@ -195,6 +195,11 @@ mod tests {
         id: StreamId,
     }
 
+    #[derive(Debug)]
+    struct FailingSession {
+        id: StreamId,
+    }
+
     impl TestSession {
         fn new(id: StreamId) -> Self {
             Self { id }
@@ -237,6 +242,43 @@ mod tests {
         async fn accept_uni(&self) -> Result<Self::StreamReader, AcceptStreamError> {
             let (reader, _writer) = boxed_stream_pair(4);
             Ok(reader)
+        }
+    }
+
+    impl Session for FailingSession {
+        type StreamReader = BoxReadStream;
+        type StreamWriter = BoxWriteStream;
+
+        fn id(&self) -> StreamId {
+            self.id
+        }
+
+        async fn open_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), OpenStreamError> {
+            Err(OpenStreamError::Closed {
+                source: SessionClosed,
+            })
+        }
+
+        async fn open_uni(&self) -> Result<Self::StreamWriter, OpenStreamError> {
+            Err(OpenStreamError::Closed {
+                source: SessionClosed,
+            })
+        }
+
+        async fn accept_bi(
+            &self,
+        ) -> Result<(Self::StreamReader, Self::StreamWriter), AcceptStreamError> {
+            Err(AcceptStreamError::Closed {
+                source: SessionClosed,
+            })
+        }
+
+        async fn accept_uni(&self) -> Result<Self::StreamReader, AcceptStreamError> {
+            Err(AcceptStreamError::Closed {
+                source: SessionClosed,
+            })
         }
     }
 
@@ -290,6 +332,32 @@ mod tests {
             .await
             .expect("accept_uni should succeed");
         assert_eq!(reader.stream_id().await.unwrap(), VarInt::from_u32(4));
+    }
+
+    #[tokio::test]
+    async fn dyn_session_preserves_operation_errors() {
+        let session = FailingSession {
+            id: StreamId(VarInt::from_u32(7)),
+        };
+        let dyn_session: &dyn DynSession = &session;
+
+        assert_eq!(dyn_session.id(), StreamId(VarInt::from_u32(7)));
+        assert!(matches!(
+            dyn_session.open_bi().await,
+            Err(OpenStreamError::Closed { .. })
+        ));
+        assert!(matches!(
+            dyn_session.open_uni().await,
+            Err(OpenStreamError::Closed { .. })
+        ));
+        assert!(matches!(
+            dyn_session.accept_bi().await,
+            Err(AcceptStreamError::Closed { .. })
+        ));
+        assert!(matches!(
+            dyn_session.accept_uni().await,
+            Err(AcceptStreamError::Closed { .. })
+        ));
     }
 
     #[cfg(feature = "rpc")]

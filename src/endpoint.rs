@@ -426,6 +426,10 @@ mod tests {
         }
     }
 
+    struct MutableTransport {
+        generation: usize,
+    }
+
     #[derive(Debug)]
     struct BuildableConnection;
 
@@ -1139,6 +1143,21 @@ mod tests {
         assert!(Arc::ptr_eq(&accepted, &listen.accepted));
     }
 
+    #[test]
+    fn accept_error_display_describes_current_layer_and_preserves_source() {
+        let accept = AcceptError::Accept {
+            source: test_connection_error("accept display source"),
+        };
+        let build = AcceptError::<quic::ConnectionError>::Build {
+            source: test_connection_error("build display source"),
+        };
+
+        assert_eq!(accept.to_string(), "failed to accept QUIC connection");
+        assert!(Error::source(&accept).is_some());
+        assert_eq!(build.to_string(), "failed to initialize H3 connection");
+        assert!(Error::source(&build).is_some());
+    }
+
     #[tokio::test]
     async fn inherent_connect_builds_and_reuses_pooled_h3_connection() {
         let connector = CountingConnect::succeed(IdentifiedConnection::new("test-remote"));
@@ -1232,6 +1251,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quic_connect_impl_returns_inner_transport_error_without_pooling() {
+        let connector =
+            CountingConnect::<IdentifiedConnection>::fail(test_connection_error("delegate failed"));
+        let calls = connector.calls.clone();
+        let endpoint = H3Endpoint::new(connector);
+        let server: Authority = "delegated.example:443".parse().unwrap();
+
+        let error = quic::Connect::connect(&endpoint, &server)
+            .await
+            .expect_err("delegated connect should return raw QUIC errors");
+
+        assert!(error.is_transport());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(endpoint.pool_len(), 0);
+    }
+
+    #[tokio::test]
     async fn accept_builds_h3_connection_from_accepted_quic_connection() {
         let listen = MockListen::default();
         let accepted = listen.accepted.clone();
@@ -1241,6 +1277,21 @@ mod tests {
 
         assert_eq!(accepted.load(Ordering::Relaxed), 1);
         connection.qpack().expect("qpack should be initialized");
+    }
+
+    #[tokio::test]
+    async fn quic_listen_impl_returns_inner_accept_and_shutdown_errors() {
+        let mut endpoint = H3Endpoint::builder().quic(FailingListen).build();
+
+        let accept_error = quic::Listen::accept(&mut endpoint)
+            .await
+            .expect_err("listen impl should return raw accept errors");
+        let shutdown_error = quic::Listen::shutdown(&endpoint)
+            .await
+            .expect_err("listen impl should return raw shutdown errors");
+
+        assert!(accept_error.is_transport());
+        assert!(shutdown_error.is_transport());
     }
 
     #[tokio::test]
@@ -1355,6 +1406,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_spawns_for_buildable_connections_and_returns_later_accept_error() {
+        let listen = SequencedListen::new([
+            Ok(Arc::new(BuildableConnection)),
+            Err(test_connection_error(
+                "accept failed after serving one connection",
+            )),
+        ]);
+        let accepted = listen.accepted.clone();
+        let mut endpoint = H3Endpoint::builder().quic(listen).build();
+
+        let error = endpoint
+            .serve(NoopService)
+            .await
+            .expect_err("serve should return the later listener error");
+
+        assert!(error.is_transport());
+        assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
     async fn serve_owned_returns_quic_accept_error_from_shared_endpoint() {
         let endpoint = Arc::new(H3Endpoint::builder().quic(FailingListen).build());
 
@@ -1381,6 +1452,26 @@ mod tests {
             .serve_owned(NoopService)
             .await
             .expect_err("serve_owned should continue past build errors and return accept error");
+
+        assert!(error.is_transport());
+        assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn serve_owned_spawns_for_buildable_connections_and_returns_later_accept_error() {
+        let listen = SequencedListen::new([
+            Ok(Arc::new(BuildableConnection)),
+            Err(test_connection_error(
+                "shared accept failed after serving one connection",
+            )),
+        ]);
+        let accepted = listen.accepted.clone();
+        let endpoint = Arc::new(H3Endpoint::builder().quic(listen).build());
+
+        let error = endpoint
+            .serve_owned(NoopService)
+            .await
+            .expect_err("serve_owned should return the later listener error");
 
         assert!(error.is_transport());
         assert_eq!(accepted.load(Ordering::Relaxed), 2);
@@ -1465,6 +1556,30 @@ mod tests {
         } // guard dropped, pool.clear() called
 
         assert_eq!(h3.pool.len(), 0);
+    }
+
+    #[test]
+    fn quic_mut_allows_mutating_transport_before_clearing_pool_on_drop() {
+        let mut endpoint: H3Endpoint<_, BuildableConnection> = H3Endpoint::builder()
+            .quic(MutableTransport { generation: 0 })
+            .build();
+        let pool = endpoint.pool.clone();
+        let auth: Authority = "example.com:443".parse().unwrap();
+        endpoint
+            .pool
+            .connections
+            .entry(auth)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+
+        {
+            let mut guard = endpoint.quic_mut();
+            guard.generation = 1;
+            assert_eq!(guard.generation, 1);
+            assert_eq!(pool.len(), 1);
+        }
+
+        assert_eq!(endpoint.quic().generation, 1);
+        assert_eq!(endpoint.pool_len(), 0);
     }
 
     #[test]

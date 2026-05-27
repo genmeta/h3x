@@ -940,6 +940,33 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ClosedOpenIpcSession;
+
+    impl IpcWebTransportSession for ClosedOpenIpcSession {
+        async fn open_bi(&self) -> Result<(VarInt, VarInt), IpcWebTransportOpenError> {
+            Err(OpenStreamError::Closed {
+                source: SessionClosed,
+            }
+            .into())
+        }
+
+        async fn open_uni(&self) -> Result<(VarInt, VarInt), IpcWebTransportOpenError> {
+            Err(OpenStreamError::Closed {
+                source: SessionClosed,
+            }
+            .into())
+        }
+
+        async fn accept_bi(&self) -> Result<(VarInt, VarInt), IpcWebTransportAcceptError> {
+            Ok((VarInt::from_u32(0), VarInt::from_u32(3)))
+        }
+
+        async fn accept_uni(&self) -> Result<(VarInt, VarInt), IpcWebTransportAcceptError> {
+            Ok((VarInt::from_u32(0), VarInt::from_u32(4)))
+        }
+    }
+
     fn connection_error(reason: &'static str) -> ConnectionError {
         ConnectionError::Transport {
             source: quic::TransportError {
@@ -1084,6 +1111,44 @@ mod tests {
             got: 1,
         };
         assert_eq!(fd_count.to_string(), "expected 2 fds, got 1");
+    }
+
+    #[test]
+    fn transparent_error_wrappers_preserve_display_and_transport_metadata() {
+        let stream = IpcPlumbingError::from(quic::StreamError::Reset {
+            code: VarInt::from_u32(0x45),
+        });
+        let IpcPlumbingError::Stream { source } = &stream else {
+            panic!("expected stream plumbing error");
+        };
+        assert_eq!(stream.to_string(), source.to_string());
+        assert_ipc_transport_metadata(&ipc_connection_error(&stream), "stream reset with code");
+
+        let open = IpcWebTransportOpenError::from(OpenStreamError::Closed {
+            source: SessionClosed,
+        });
+        assert!(matches!(open, IpcWebTransportOpenError::Stream { .. }));
+        assert_eq!(open.to_string(), "webtransport session closed");
+
+        let open = IpcWebTransportOpenError::from(IpcPlumbingError::Io {
+            message: "queued fd failed".into(),
+        });
+        assert!(matches!(open, IpcWebTransportOpenError::Transport { .. }));
+        assert_eq!(open.to_string(), "queued fd failed");
+
+        let accept = IpcWebTransportAcceptError::from(IpcPlumbingError::Io {
+            message: "waited fd failed".into(),
+        });
+        assert!(matches!(
+            accept,
+            IpcWebTransportAcceptError::Transport { .. }
+        ));
+        assert_eq!(accept.to_string(), "waited fd failed");
+
+        assert_eq!(
+            IpcWebTransportAcceptError::Closed.to_string(),
+            "webtransport session closed"
+        );
     }
 
     #[test]
@@ -1234,6 +1299,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_guard_helpers_prefer_errors_latched_while_future_is_pending() {
+        let parent = Arc::new(TestLifecycle::default());
+        let lifecycle = IpcWebTransportLifecycle {
+            parent,
+            latch: ConnectionErrorLatch::new(),
+        };
+
+        let error = lifecycle
+            .guard_open_with(
+                async {
+                    lifecycle
+                        .latch()
+                        .latch_with(|| connection_error("raced open"));
+                    Err::<(), _>("ignored open error")
+                },
+                |_| OpenStreamError::Open {
+                    source: connection_error("converted open"),
+                },
+            )
+            .await
+            .expect_err("latched open error should win");
+        let OpenStreamError::Open { source } = error else {
+            panic!("expected open connection error");
+        };
+        assert_reason(&source, "raced open");
+
+        let parent = Arc::new(TestLifecycle::default());
+        let lifecycle = IpcWebTransportLifecycle {
+            parent,
+            latch: ConnectionErrorLatch::new(),
+        };
+
+        let error = lifecycle
+            .guard_accept_err(
+                async {
+                    lifecycle
+                        .latch()
+                        .latch_with(|| connection_error("raced accept"));
+                    Err::<(), _>("ignored accept error")
+                },
+                |_| Some(connection_error("converted accept")),
+            )
+            .await
+            .expect_err("latched accept error should win");
+        let AcceptStreamError::Connection { source } = error else {
+            panic!("expected accept connection error");
+        };
+        assert_reason(&source, "raced accept");
+    }
+
+    #[tokio::test]
     async fn fds_to_streams_build_ipc_streams_with_expected_ids() {
         let registered = registered_fds(2).await;
         let (_task, handle, _parent) = handle_with_registry(registered.registry.clone());
@@ -1365,6 +1481,34 @@ mod tests {
             panic!("expected accept connection error");
         };
         assert_ipc_transport_metadata(&source, "processing request failed");
+    }
+
+    #[tokio::test]
+    async fn session_trait_methods_map_closed_opens_without_latching_transport_errors() {
+        let registered = registered_fds(1).await;
+        let (task, client) = spawn_ipc_session_with(Arc::new(ClosedOpenIpcSession));
+        let parent = Arc::new(TestLifecycle::default());
+        let lifecycle: Arc<dyn DynLifecycle> = parent.clone();
+        let handle = IpcWebTransportSessionHandle::new(
+            VarInt::from_u32(42),
+            client,
+            registered.registry,
+            lifecycle,
+        );
+
+        let Err(error) = webtransport::Session::open_bi(&handle).await else {
+            panic!("open_bi should surface session closed");
+        };
+        assert!(matches!(error, OpenStreamError::Closed { .. }));
+        assert!(quic::Lifecycle::check(handle.lifecycle.as_ref()).is_ok());
+
+        let Err(error) = webtransport::Session::open_uni(&handle).await else {
+            panic!("open_uni should surface session closed");
+        };
+        assert!(matches!(error, OpenStreamError::Closed { .. }));
+        assert!(quic::Lifecycle::check(handle.lifecycle.as_ref()).is_ok());
+
+        drop(task);
     }
 
     #[tokio::test]

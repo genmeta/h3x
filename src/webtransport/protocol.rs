@@ -238,6 +238,7 @@ mod tests {
     use crate::{
         codec::{PeekableStreamReader, SinkWriter, StreamReader},
         error::Code,
+        protocol::InitProtocols,
         quic,
     };
 
@@ -365,6 +366,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn split_bidi_routing_header_routes_registered_stream() {
+        let state = Arc::new(StreamState::default());
+        let reader = test_reader(
+            state.clone(),
+            vec![
+                Bytes::from_static(&[0x40]),
+                Bytes::from_static(&[0x41]),
+                Bytes::from_static(&[0x2a, 0xca, 0xfe]),
+            ],
+        );
+        let writer = test_writer(state.clone());
+        let protocol = test_protocol();
+        let mut registered = protocol
+            .register(StreamId::from(VarInt::from_u32(42)))
+            .expect("session registration should succeed");
+
+        let verdict = protocol
+            .accept_bi((reader, writer))
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        let (mut routed_reader, _routed_writer) = registered
+            .bidi_rx
+            .recv()
+            .await
+            .expect("registered session should receive bidi stream");
+        assert_eq!(
+            routed_reader
+                .next()
+                .await
+                .expect("reader should yield a payload chunk")
+                .expect("payload chunk should succeed"),
+            Bytes::from_static(&[0xca, 0xfe])
+        );
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn split_uni_routing_header_routes_registered_stream() {
+        let state = Arc::new(StreamState::default());
+        let stream = test_reader(
+            state.clone(),
+            vec![
+                Bytes::from_static(&[0x40]),
+                Bytes::from_static(&[0x54]),
+                Bytes::from_static(&[0x2a, 0xca, 0xfe]),
+            ],
+        );
+        let protocol = test_protocol();
+        let mut registered = protocol
+            .register(StreamId::from(VarInt::from_u32(42)))
+            .expect("session registration should succeed");
+
+        let verdict = protocol
+            .accept_uni(stream)
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        let mut routed_reader = registered
+            .uni_rx
+            .recv()
+            .await
+            .expect("registered session should receive uni stream");
+        assert_eq!(
+            routed_reader
+                .next()
+                .await
+                .expect("reader should yield a payload chunk")
+                .expect("payload chunk should succeed"),
+            Bytes::from_static(&[0xca, 0xfe])
+        );
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
     async fn wrong_bidi_signal_is_passed_through_without_aborting() {
         let state = Arc::new(StreamState::default());
         let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x05, 0x99])]);
@@ -416,6 +496,63 @@ mod tests {
                 .expect("reader should yield original bytes")
                 .expect("reader chunk should succeed"),
             Bytes::from_static(&[0x06, 0x77])
+        );
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn incomplete_bidi_signal_is_passed_through_without_aborting() {
+        let state = Arc::new(StreamState::default());
+        let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40])]);
+        let writer = test_writer(state.clone());
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_bi((reader, writer))
+            .await
+            .expect("routing should not fail");
+
+        let StreamVerdict::Passed((mut passed_reader, _passed_writer)) = verdict else {
+            panic!("unexpected verdict");
+        };
+        Pin::new(&mut passed_reader).reset();
+        let mut passed_reader = passed_reader.into_stream_reader();
+        assert_eq!(
+            passed_reader
+                .next()
+                .await
+                .expect("reader should yield original bytes")
+                .expect("reader chunk should succeed"),
+            Bytes::from_static(&[0x40])
+        );
+        assert!(state.stopped_codes().is_empty());
+        assert!(state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn incomplete_uni_signal_is_passed_through_without_stopping() {
+        let state = Arc::new(StreamState::default());
+        let stream = test_reader(state.clone(), vec![Bytes::from_static(&[0x40])]);
+        let protocol = test_protocol();
+
+        let verdict = protocol
+            .accept_uni(stream)
+            .await
+            .expect("routing should not fail");
+
+        let StreamVerdict::Passed(mut passed_stream) = verdict else {
+            panic!("unexpected verdict");
+        };
+        Pin::new(&mut passed_stream).reset();
+        let mut passed_stream = passed_stream.into_stream_reader();
+        assert_eq!(
+            passed_stream
+                .next()
+                .await
+                .expect("reader should yield original bytes")
+                .expect("reader chunk should succeed"),
+            Bytes::from_static(&[0x40])
         );
         assert!(state.stopped_codes().is_empty());
         assert!(state.cancelled_codes().is_empty());
@@ -617,6 +754,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_bidi_session_receiver_rejects_and_aborts_stream() {
+        let protocol = test_protocol();
+        let RegisteredSession {
+            state: _session_state,
+            bidi_rx,
+            uni_rx: _uni_rx,
+        } = protocol
+            .register(StreamId::from(VarInt::from_u32(42)))
+            .expect("session registration should succeed");
+        drop(bidi_rx);
+
+        let stream_state = Arc::new(StreamState::default());
+        let reader = test_reader(
+            stream_state.clone(),
+            vec![Bytes::from_static(&[0x40, 0x41, 0x2a, 0xfa, 0xce])],
+        );
+        let writer = test_writer(stream_state.clone());
+
+        let verdict = protocol
+            .accept_bi((reader, writer))
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert_eq!(
+            stream_state.stopped_codes(),
+            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+        );
+        assert_eq!(
+            stream_state.cancelled_codes(),
+            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_uni_session_receiver_rejects_and_stops_stream() {
+        let protocol = test_protocol();
+        let RegisteredSession {
+            state: _session_state,
+            bidi_rx: _bidi_rx,
+            uni_rx,
+        } = protocol
+            .register(StreamId::from(VarInt::from_u32(42)))
+            .expect("session registration should succeed");
+        drop(uni_rx);
+
+        let stream_state = Arc::new(StreamState::default());
+        let stream = test_reader(
+            stream_state.clone(),
+            vec![Bytes::from_static(&[0x40, 0x54, 0x2a, 0xfa, 0xce])],
+        );
+
+        let verdict = protocol
+            .accept_uni(stream)
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert_eq!(
+            stream_state.stopped_codes(),
+            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+        );
+        assert!(stream_state.cancelled_codes().is_empty());
+    }
+
+    #[tokio::test]
     async fn factory_init_keeps_connection_and_starts_empty() {
         let conn = Arc::new(TestConnection);
         let expected: Arc<dyn quic::DynConnection> = conn.clone();
@@ -629,6 +832,41 @@ mod tests {
         assert_eq!(
             format!("{protocol:?}"),
             "WebTransportProtocol { sessions: 0 }"
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_initializer_inserts_webtransport_protocol_once() {
+        let conn = Arc::new(TestConnection);
+        let mut layers = Protocols::new();
+
+        WebTransportProtocolFactory
+            .init_protocols(&conn, &mut layers)
+            .await
+            .expect("factory initializer should insert protocol");
+
+        let protocol = layers
+            .get::<WebTransportProtocol>()
+            .expect("webtransport protocol should be registered");
+        let _registered = protocol
+            .register(StreamId::from(VarInt::from_u32(42)))
+            .expect("session registration should succeed");
+        assert_eq!(
+            format!("{protocol:?}"),
+            "WebTransportProtocol { sessions: 1 }"
+        );
+
+        WebTransportProtocolFactory
+            .init_protocols(&conn, &mut layers)
+            .await
+            .expect("second initialization should be a no-op");
+
+        let protocol = layers
+            .get::<WebTransportProtocol>()
+            .expect("webtransport protocol should remain registered");
+        assert_eq!(
+            format!("{protocol:?}"),
+            "WebTransportProtocol { sessions: 1 }"
         );
     }
 
@@ -657,6 +895,30 @@ mod tests {
         protocol
             .register(session_id)
             .expect("dropped session should unregister and allow reuse");
+    }
+
+    #[test]
+    fn explicit_session_close_unregisters_and_reports_closed() {
+        let protocol = test_protocol();
+        let session_id = StreamId::from(VarInt::from_u32(42));
+        let registered = protocol
+            .register(session_id)
+            .expect("session registration should succeed");
+        assert_eq!(
+            format!("{protocol:?}"),
+            "WebTransportProtocol { sessions: 1 }"
+        );
+
+        registered.state.close();
+
+        assert!(registered.state.check_open().is_err());
+        assert_eq!(
+            format!("{protocol:?}"),
+            "WebTransportProtocol { sessions: 0 }"
+        );
+        protocol
+            .register(session_id)
+            .expect("closed session should unregister and allow reuse");
     }
 
     #[test]
