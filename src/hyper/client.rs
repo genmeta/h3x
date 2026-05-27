@@ -68,6 +68,14 @@ impl<E: Error + 'static> From<MessageStreamError> for RequestError<E> {
 }
 
 impl<C: quic::Connection> Connection<C> {
+    /// Execute a hyper-compatible HTTP request over this H3 connection.
+    ///
+    /// The response body type is intentionally opaque and does not guarantee
+    /// [`Unpin`]. This keeps the native streaming body shape visible to the
+    /// compiler instead of imposing a boxing policy on every caller. Callers
+    /// that need an [`Unpin`] body should choose the pinning or boxing strategy
+    /// appropriate for that call site, such as `pin!`, `Pin<Box<_>>`, or an
+    /// `http_body_util` boxed body.
     #[tracing::instrument(level = "debug", skip_all, fields(method = %request.method(), uri = %request.uri()))]
     pub async fn execute_hyper_request<B: Body + Send + 'static>(
         &self,
