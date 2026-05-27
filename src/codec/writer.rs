@@ -264,3 +264,319 @@ where
         self.project().sink.poll_close(cx)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fmt,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use bytes::Bytes;
+    use futures::{
+        Sink, SinkExt,
+        stream::{self, pending},
+        task::noop_waker,
+    };
+    use tokio::io::{AsyncWriteExt, Error as IoError};
+
+    use super::{Feed, SinkWriter};
+    use crate::{
+        quic::{CancelStream, GetStreamId, StreamError},
+        varint::VarInt,
+    };
+
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    struct TestError(&'static str);
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for TestError {}
+
+    impl From<TestError> for IoError {
+        fn from(error: TestError) -> Self {
+            Self::other(error)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        items: Vec<Bytes>,
+        ready_pending: usize,
+        ready_error: Option<TestError>,
+        flushes: usize,
+        closes: usize,
+        cancel_codes: Vec<VarInt>,
+        stream_id: Option<VarInt>,
+    }
+
+    impl Sink<Bytes> for RecordingSink {
+        type Error = TestError;
+
+        fn poll_ready(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if let Some(error) = self.ready_error.take() {
+                return Poll::Ready(Err(error));
+            }
+            if self.ready_pending > 0 {
+                self.ready_pending -= 1;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+            self.items.push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.closes += 1;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl CancelStream for RecordingSink {
+        fn poll_cancel(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), StreamError>> {
+            self.cancel_codes.push(code);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl GetStreamId for RecordingSink {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, StreamError>> {
+            Poll::Ready(Ok(self.stream_id.expect("stream id is configured")))
+        }
+    }
+
+    #[tokio::test]
+    async fn async_write_buffers_small_writes_until_flush() {
+        let mut writer = SinkWriter::new(RecordingSink::default());
+
+        writer.write_all(b"hello ").await.expect("write succeeds");
+        writer.write_all(b"world").await.expect("write succeeds");
+        assert!(writer.sink().items.is_empty());
+
+        AsyncWriteExt::flush(&mut writer)
+            .await
+            .expect("flush succeeds");
+
+        assert_eq!(
+            writer.sink().items,
+            vec![Bytes::from_static(b"hello world")]
+        );
+        assert_eq!(writer.sink().flushes, 1);
+    }
+
+    #[tokio::test]
+    async fn async_write_flushes_existing_buffer_before_buffering_large_write() {
+        let mut writer = SinkWriter::new(RecordingSink::default());
+        let large = vec![b'x'; 8 * 1024];
+
+        writer.write_all(b"small").await.expect("write succeeds");
+        writer.write_all(&large).await.expect("write succeeds");
+
+        assert_eq!(writer.sink().items, vec![Bytes::from_static(b"small")]);
+
+        AsyncWriteExt::flush(&mut writer)
+            .await
+            .expect("flush succeeds");
+
+        assert_eq!(
+            writer.sink().items,
+            vec![Bytes::from_static(b"small"), Bytes::from(large)]
+        );
+        assert_eq!(writer.sink().flushes, 1);
+    }
+
+    #[tokio::test]
+    async fn async_write_shutdown_flushes_buffer_and_closes_inner_sink() {
+        let mut writer = SinkWriter::new(RecordingSink::default());
+
+        writer.write_all(b"body").await.expect("write succeeds");
+        writer.shutdown().await.expect("shutdown succeeds");
+
+        assert_eq!(writer.sink().items, vec![Bytes::from_static(b"body")]);
+        assert_eq!(writer.sink().closes, 1);
+    }
+
+    #[tokio::test]
+    async fn sink_accessors_map_sink_and_into_inner_preserve_buffer_and_inner_state() {
+        let mut writer = SinkWriter::new(RecordingSink::default());
+        writer.sink_mut().flushes = 7;
+        writer.write_all(b"buffered").await.expect("write succeeds");
+
+        let mut writer = writer.map_sink(|mut sink| {
+            sink.stream_id = Some(VarInt::from_u32(9));
+            sink
+        });
+        writer.flush_buffer().await.expect("flush succeeds");
+        let inner = writer.into_inner();
+
+        assert_eq!(inner.items, vec![Bytes::from_static(b"buffered")]);
+        assert_eq!(inner.flushes, 7);
+        assert_eq!(inner.stream_id, Some(VarInt::from_u32(9)));
+    }
+
+    #[test]
+    fn cancel_stream_and_get_stream_id_forward_to_inner_sink() {
+        let mut writer = SinkWriter::new(RecordingSink {
+            stream_id: Some(VarInt::from_u32(33)),
+            ..RecordingSink::default()
+        });
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let cancel_code = VarInt::from_u32(44);
+        assert!(matches!(
+            Pin::new(&mut writer).poll_cancel(&mut cx, cancel_code),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(writer.sink().cancel_codes, vec![cancel_code]);
+        assert!(matches!(
+            Pin::new(&mut writer).poll_stream_id(&mut cx),
+            Poll::Ready(Ok(id)) if id == VarInt::from_u32(33)
+        ));
+    }
+
+    #[tokio::test]
+    async fn feed_ready_sends_queued_item_after_pending_inner_readiness() {
+        let mut feed = Feed::new(RecordingSink {
+            ready_pending: 1,
+            ..RecordingSink::default()
+        });
+
+        Pin::new(&mut feed)
+            .start_send(Bytes::from_static(b"queued"))
+            .expect("queue item");
+        Pin::new(&mut feed).ready().await.expect("ready succeeds");
+
+        assert_eq!(feed.sink.items, vec![Bytes::from_static(b"queued")]);
+    }
+
+    #[tokio::test]
+    async fn feed_send_all_sends_each_stream_item_and_poll_close_closes_inner_sink() {
+        let mut feed = Feed::new(RecordingSink::default());
+
+        Pin::new(&mut feed)
+            .send_all(stream::iter([
+                Bytes::from_static(b"one"),
+                Bytes::from_static(b"two"),
+            ]))
+            .await
+            .expect("send all succeeds");
+        assert_eq!(
+            feed.sink.items,
+            vec![Bytes::from_static(b"one"), Bytes::from_static(b"two")]
+        );
+
+        Pin::new(&mut feed)
+            .start_send(Bytes::from_static(b"closing"))
+            .expect("queue close item");
+        Pin::new(&mut feed).close().await.expect("close succeeds");
+
+        assert_eq!(
+            feed.sink.items,
+            vec![
+                Bytes::from_static(b"one"),
+                Bytes::from_static(b"two"),
+                Bytes::from_static(b"closing")
+            ]
+        );
+        assert_eq!(feed.sink.closes, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "start_send called before poll_ready")]
+    fn feed_start_send_panics_when_previous_item_has_not_been_flushed() {
+        let mut feed = Feed::new(RecordingSink::default());
+
+        Pin::new(&mut feed)
+            .start_send(Bytes::from_static(b"first"))
+            .expect("queue first item");
+        Pin::new(&mut feed)
+            .start_send(Bytes::from_static(b"second"))
+            .expect("second item panics first");
+    }
+
+    #[test]
+    fn feed_poll_ready_preserves_item_on_pending_and_error() {
+        let mut pending_feed = Feed::new(RecordingSink {
+            ready_pending: 1,
+            ..RecordingSink::default()
+        });
+        Pin::new(&mut pending_feed)
+            .start_send(Bytes::from_static(b"pending"))
+            .expect("queue pending item");
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut pending_feed).poll_ready(&mut cx),
+            Poll::Pending
+        ));
+        assert!(pending_feed.item.is_some());
+        assert!(matches!(
+            Pin::new(&mut pending_feed).poll_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(
+            pending_feed.sink.items,
+            vec![Bytes::from_static(b"pending")]
+        );
+
+        let mut error_feed = Feed::new(RecordingSink {
+            ready_error: Some(TestError("not ready")),
+            ..RecordingSink::default()
+        });
+        Pin::new(&mut error_feed)
+            .start_send(Bytes::from_static(b"error"))
+            .expect("queue error item");
+
+        assert_eq!(
+            Pin::new(&mut error_feed).poll_ready(&mut cx),
+            Poll::Ready(Err(TestError("not ready")))
+        );
+        assert!(error_feed.item.is_some());
+        assert!(error_feed.sink.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn feed_send_all_waits_for_stream_item_after_becoming_ready() {
+        let mut feed = Feed::<_, Bytes>::new(RecordingSink::default());
+        let mut send_all = Box::pin(Pin::new(&mut feed).send_all(pending()));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(send_all.as_mut().poll(&mut cx), Poll::Pending));
+        drop(send_all);
+
+        assert!(feed.sink.items.is_empty());
+    }
+}

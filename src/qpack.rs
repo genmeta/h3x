@@ -16,7 +16,7 @@ mod tests {
 
     use bytes::Bytes;
     use futures::SinkExt;
-    use http::Request;
+    use http::{HeaderMap, HeaderValue, Request, Response};
     use tokio::{io::AsyncReadExt, sync::Notify, time};
 
     use crate::{
@@ -183,6 +183,122 @@ mod tests {
         })
         .await
         .expect("test timedout");
+    }
+
+    #[tokio::test]
+    async fn static_response_trailer_and_empty_field_sections_roundtrip() {
+        let encode_strategy = StaticCompressAlgo::new(HuffmanAlways);
+
+        let (encoder_stream_reader, encoder_stream_writer) =
+            mock_stream_pair_with_capacity(VarInt::from_u32(1), 64);
+        let (decoder_stream_reader, decoder_stream_writer) =
+            mock_stream_pair_with_capacity(VarInt::from_u32(2), 64);
+
+        let init_encoder = tokio::spawn(async move {
+            let encoder_stream = UnidirectionalStream::initial(
+                UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE,
+                SinkWriter::new(encoder_stream_writer),
+            )
+            .await
+            .unwrap();
+
+            let decoder_stream = Box::pin(Deferred::from(async move {
+                let decoder_stream = StreamReader::new(decoder_stream_reader)
+                    .decode::<UnidirectionalStream<_>>()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    decoder_stream.r#type(),
+                    UnidirectionalStream::QPACK_DECODER_STREAM_TYPE
+                );
+                Ok::<_, ConnectionError>(decoder_stream)
+            }));
+
+            Arc::new(Encoder::new(
+                Arc::<Settings>::default(),
+                Box::pin((encoder_stream).into_encode_sink()),
+                Box::pin((decoder_stream).into_decode_stream()),
+            ))
+        });
+
+        let init_decoder = tokio::spawn(async move {
+            let decoder_stream = UnidirectionalStream::initial(
+                UnidirectionalStream::QPACK_DECODER_STREAM_TYPE,
+                SinkWriter::new(decoder_stream_writer),
+            )
+            .await
+            .unwrap();
+
+            let encoder_stream = Box::pin(Deferred::from(async move {
+                let encoder_stream = StreamReader::new(encoder_stream_reader)
+                    .decode::<UnidirectionalStream<_>>()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    encoder_stream.r#type(),
+                    UnidirectionalStream::QPACK_ENCODER_STREAM_TYPE
+                );
+                Ok::<_, ConnectionError>(encoder_stream)
+            }));
+
+            Arc::new(Decoder::new(
+                Arc::new(Settings::default()),
+                Box::pin((decoder_stream).into_encode_sink()),
+                Box::pin((encoder_stream).into_decode_stream()),
+            ))
+        });
+
+        let (encoder, decoder) = time::timeout(time::Duration::from_secs(1), async move {
+            tokio::try_join!(init_encoder, init_decoder).unwrap()
+        })
+        .await
+        .expect("setup timed out");
+
+        let response = Response::builder()
+            .status(204)
+            .header("server", "h3x-test")
+            .header("cache-control", "no-store")
+            .body(())
+            .unwrap();
+        let (response_parts, ()) = response.into_parts();
+
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-checksum", HeaderValue::from_static("sha256:abc123"));
+        trailers.insert("x-empty", HeaderValue::from_static(""));
+
+        let cases = [
+            (VarInt::from_u32(4), FieldSection::from(response_parts)),
+            (VarInt::from_u32(8), FieldSection::trailer(trailers)),
+            (
+                VarInt::from_u32(12),
+                FieldSection::trailer(HeaderMap::new()),
+            ),
+        ];
+
+        for (stream_id, field_section) in cases {
+            let expected = field_section.clone();
+            let (read_stream, write_stream) = mock_stream_pair_with_capacity(stream_id, 64);
+            let mut write_stream = SinkWriter::new(write_stream);
+
+            let header_frame = Encoder::encode(
+                &*encoder,
+                field_section.iter(),
+                &encode_strategy,
+                &mut write_stream,
+            )
+            .await
+            .unwrap();
+            write_stream.encode_one(header_frame).await.unwrap();
+            write_stream.flush().await.unwrap();
+
+            let read_stream = MessageStreamReader::new(read_stream, decoder.clone());
+            let mut frame_stream = pin!(FrameStream::new(StreamReader::new(read_stream)));
+            let frame = frame_stream.as_mut().next_frame().await.unwrap().unwrap();
+            assert_eq!(frame.r#type(), Frame::HEADERS_FRAME_TYPE);
+
+            let decoded = Decoder::decode(&*decoder, frame).await.unwrap();
+            assert_eq!(decoded, expected);
+        }
     }
 
     fn settings_with_dynamic_table() -> Arc<Settings> {

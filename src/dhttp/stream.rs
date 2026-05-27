@@ -202,7 +202,7 @@ mod tests {
 
     use bytes::Bytes;
     use futures::{SinkExt, StreamExt, future::poll_fn};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::{
@@ -262,6 +262,84 @@ mod tests {
         assert_eq!(stream.r#type(), stream_type);
         assert!(!stream.is_reserved_stream());
         assert_eq!(body, b"body");
+    }
+
+    #[tokio::test]
+    async fn decode_ext_uses_unidirectional_accept_path() {
+        let stream_type = VarInt::from_u32(0x03);
+        let mut payload = BufList::new();
+        payload
+            .encode_one(stream_type)
+            .await
+            .expect("stream type encoding");
+        payload.write(Bytes::from_static(b"after-type"));
+
+        let mut stream = payload
+            .decode::<UnidirectionalStream<_>>()
+            .await
+            .expect("decoded unidirectional stream");
+
+        assert_eq!(stream.r#type(), stream_type);
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).await.expect("body");
+        assert_eq!(body, b"after-type");
+    }
+
+    #[tokio::test]
+    async fn accept_rejects_missing_stream_type() {
+        let error = match UnidirectionalStream::accept(BufList::new()).await {
+            Ok(_) => panic!("stream type is mandatory"),
+            Err(error) => error,
+        };
+
+        let StreamError::Connection { source } = error else {
+            panic!("missing stream type should be connection-scoped");
+        };
+        let crate::connection::ConnectionError::H3 { source } = source else {
+            panic!("missing stream type should map to an H3 connection error");
+        };
+        assert_eq!(source.code(), crate::error::Code::H3_GENERAL_PROTOCOL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn async_buf_read_delegates_fill_and_consume_to_inner_stream() {
+        let mut payload = BufList::new();
+        payload.write(Bytes::from_static(b"abc"));
+        payload.write(Bytes::from_static(b"def"));
+        let mut stream = UnidirectionalStream {
+            r#type: VarInt::from_u32(0),
+            stream: payload,
+        };
+
+        assert_eq!(stream.fill_buf().await.expect("fill buf"), b"abc");
+        stream.consume(2);
+        assert_eq!(
+            stream.fill_buf().await.expect("remaining first chunk"),
+            b"c"
+        );
+        stream.consume(1);
+        assert_eq!(stream.fill_buf().await.expect("second chunk"), b"def");
+        stream.consume(3);
+        assert_eq!(stream.fill_buf().await.expect("eof"), b"");
+    }
+
+    #[test]
+    fn reserved_stream_detection_matches_http3_grease_pattern() {
+        for value in [0x21, 0x40, 0x5f, 0x7e] {
+            let stream = UnidirectionalStream {
+                r#type: VarInt::from_u32(value),
+                stream: (),
+            };
+            assert!(stream.is_reserved_stream(), "{value:#x} is reserved");
+        }
+
+        for value in [0x00, 0x20, 0x22, 0x41] {
+            let stream = UnidirectionalStream {
+                r#type: VarInt::from_u32(value),
+                stream: (),
+            };
+            assert!(!stream.is_reserved_stream(), "{value:#x} is not reserved");
+        }
     }
 
     #[tokio::test]

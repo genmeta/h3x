@@ -214,6 +214,7 @@ impl ReadStream {
 mod tests {
     use std::{
         collections::VecDeque,
+        io,
         pin::Pin,
         sync::{Arc, Mutex},
         task::{Context, Poll},
@@ -467,6 +468,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_stream_into_bytes_stream_forwards_control_traits_until_eof() {
+        let stream_id = VarInt::from_u32(72);
+        let stop_code = VarInt::from_u32(73);
+        let stream = crate::message::test::read_stream_for_test(stream_id);
+        let mut bytes = Box::pin(stream.into_bytes_stream());
+
+        assert_eq!(
+            poll_fn(|cx| bytes.as_mut().poll_stream_id(cx))
+                .await
+                .expect("stream id"),
+            stream_id
+        );
+        poll_fn(|cx| bytes.as_mut().poll_stop(cx, stop_code))
+            .await
+            .expect("stop forwarded");
+
+        assert!(poll_fn(|cx| bytes.as_mut().poll_next(cx)).await.is_none());
+        assert!(bytes.as_ref().get_ref().is_terminated());
+        assert!(
+            poll_fn(|cx| bytes.as_mut().poll_stream_id(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert!(
+            poll_fn(|cx| bytes.as_mut().poll_stop(cx, stop_code))
+                .now_or_never()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_stream_into_reader_reports_eof_and_termination() {
+        let stream = crate::message::test::read_stream_for_test(VarInt::from_u32(74));
+        let mut reader = Box::pin(stream.into_reader());
+
+        assert!(poll_fn(|cx| reader.as_mut().poll_next(cx)).await.is_none());
+        assert!(reader.stream().is_terminated());
+    }
+
+    #[tokio::test]
+    async fn read_stream_from_conversion_builds_box_reader() {
+        let stream_id = VarInt::from_u32(75);
+        let stream = crate::message::test::read_stream_for_test(stream_id);
+        let mut reader: BoxMessageStreamReader<'static> = stream.into();
+
+        assert_eq!(
+            poll_fn(|cx| Pin::new(&mut reader).poll_stream_id(cx))
+                .await
+                .expect("stream id"),
+            stream_id
+        );
+
+        let mut inner = Box::pin(reader.into_inner());
+        assert!(poll_fn(|cx| inner.as_mut().poll_next(cx)).await.is_none());
+        assert!(inner.is_terminated());
+    }
+
+    #[tokio::test]
     async fn read_stream_into_box_reader_forwards_control_traits_and_stops_at_eof() {
         let stream_id = VarInt::from_u32(90);
         let stop_code = VarInt::from_u32(102);
@@ -511,5 +570,55 @@ mod tests {
                 .now_or_never()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn stream_reader_maps_message_stream_error_items_to_io_errors() {
+        let mut reader = Box::pin(StreamReader::new(unfold(
+            VecDeque::from([Err::<Bytes, MessageStreamError>(
+                MessageStreamError::MalformedIncomingMessage,
+            )]),
+            |mut chunks| async move { chunks.pop_front().map(|chunk| (chunk, chunks)) },
+        )));
+        let mut buf = [0_u8; 4];
+
+        let error = poll_fn(|cx| {
+            let mut read_buf = ReadBuf::new(&mut buf);
+            match reader.as_mut().poll_read(cx, &mut read_buf) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => Poll::Ready(result),
+            }
+        })
+        .await
+        .expect_err("error item should become io error");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn stream_reader_poll_next_returns_buffered_chunk_then_eof() {
+        let mut reader = Box::pin(StreamReader::new(unfold(
+            VecDeque::from([Ok::<Bytes, MessageStreamError>(Bytes::from_static(b"abcd"))]),
+            |mut chunks| async move { chunks.pop_front().map(|chunk| (chunk, chunks)) },
+        )));
+        let mut buf = [0_u8; 2];
+
+        let read = poll_fn(|cx| {
+            let mut read_buf = ReadBuf::new(&mut buf);
+            match reader.as_mut().poll_read(cx, &mut read_buf) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => Poll::Ready(result.map(|_| read_buf.filled().len())),
+            }
+        })
+        .await
+        .expect("partial read succeeds");
+        assert_eq!(read, 2);
+        assert_eq!(&buf, b"ab");
+
+        match poll_fn(|cx| reader.as_mut().poll_next(cx)).await {
+            Some(Ok(chunk)) => assert_eq!(chunk, Bytes::from_static(b"cd")),
+            value => panic!("unexpected buffered chunk: {value:?}"),
+        }
+        assert!(poll_fn(|cx| reader.as_mut().poll_next(cx)).await.is_none());
     }
 }
