@@ -793,4 +793,95 @@ pub mod test {
         };
         tokio::join!(send, recv);
     }
+
+    #[test]
+    fn stream_error_helpers_preserve_typed_io_sources() {
+        use crate::{
+            error::Code,
+            quic::{ApplicationError, ConnectionError, TransportError},
+        };
+
+        let reset_code = VarInt::from_u32(17);
+        let reset = StreamError::Reset { code: reset_code };
+        assert!(reset.is_reset());
+        let reset_io = std::io::Error::from(reset.clone());
+        assert!(matches!(
+            StreamError::try_from(reset_io),
+            Ok(StreamError::Reset { code }) if code == reset_code
+        ));
+
+        let connection = ConnectionError::Application {
+            source: ApplicationError {
+                code: Code::H3_NO_ERROR,
+                reason: "closed".into(),
+            },
+        };
+        let stream = StreamError::from(std::io::Error::from(connection.clone()));
+        assert!(!stream.is_reset());
+        assert!(matches!(
+            stream,
+            StreamError::Connection {
+                source: ConnectionError::Application { .. },
+            }
+        ));
+        assert!(connection.is_application());
+        assert!(!connection.is_transport());
+
+        let transport = ConnectionError::Transport {
+            source: TransportError {
+                kind: Code::H3_INTERNAL_ERROR.into(),
+                frame_type: VarInt::from_u32(0x21),
+                reason: "transport failure".into(),
+            },
+        };
+        assert!(transport.is_transport());
+        assert!(!transport.is_application());
+        assert!(matches!(
+            StreamError::try_from(std::io::Error::from(transport)),
+            Ok(StreamError::Connection {
+                source: ConnectionError::Transport { .. },
+            })
+        ));
+
+        let plain = std::io::Error::other("not a quic stream error");
+        assert!(StreamError::try_from(plain).is_err());
+    }
+
+    #[tokio::test]
+    async fn mock_stream_pair_reports_stream_id_and_accepts_stop_calls() {
+        use crate::quic::{GetStreamIdExt, StopStreamExt};
+
+        let stream_id = VarInt::from_u32(91);
+        let (mut reader, mut writer) = mock_stream_pair(stream_id);
+
+        assert_eq!(
+            reader.stream_id().await.expect("reader stream id"),
+            stream_id
+        );
+        assert_eq!(
+            writer.stream_id().await.expect("writer stream id"),
+            stream_id
+        );
+
+        let stop_code = VarInt::from_u32(29);
+        reader.stop(stop_code).await.expect("stop stream");
+        reader.stop(stop_code).await.expect("repeated stop stream");
+    }
+
+    #[tokio::test]
+    async fn mock_stream_cancel_delivers_sticky_reset_to_reader() {
+        use crate::quic::CancelStreamExt;
+
+        let reset_code = VarInt::from_u32(33);
+        let (mut reader, mut writer) = mock_stream_pair(VarInt::from_u32(7));
+
+        writer.cancel(reset_code).await.expect("cancel stream");
+
+        for _ in 0..2 {
+            assert!(matches!(
+                reader.next().await,
+                Some(Err(StreamError::Reset { code })) if code == reset_code
+            ));
+        }
+    }
 }

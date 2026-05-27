@@ -334,15 +334,123 @@ impl<S: ?Sized> UnidirectionalStream<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
     use bytes::Buf;
 
     use super::*;
     use crate::{
         codec::{DecodeExt, EncodeExt},
+        connection,
         dhttp::{datagram::settings::H3Datagram, webtransport::settings::EnableWebTransport},
         extended_connect::settings::EnableConnectProtocol,
+        quic,
         varint::VarInt,
     };
+
+    #[derive(Clone)]
+    struct FailWrite {
+        error: quic::StreamError,
+    }
+
+    impl FailWrite {
+        fn reset(code: VarInt) -> Self {
+            Self {
+                error: quic::StreamError::Reset { code },
+            }
+        }
+
+        fn connection() -> Self {
+            Self {
+                error: quic::StreamError::Connection {
+                    source: quic_connection_error(),
+                },
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FailWrite {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::from(self.error.clone())))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct FailBufRead {
+        error: Option<connection::StreamError>,
+    }
+
+    impl FailBufRead {
+        fn new(error: connection::StreamError) -> Self {
+            Self { error: Some(error) }
+        }
+    }
+
+    impl tokio::io::AsyncRead for FailBufRead {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncBufRead for FailBufRead {
+        fn poll_fill_buf(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+            let error = self
+                .get_mut()
+                .error
+                .take()
+                .expect("test stream should be polled once");
+            Poll::Ready(Err(io::Error::from(error)))
+        }
+
+        fn consume(self: Pin<&mut Self>, _amt: usize) {}
+    }
+
+    fn quic_connection_error() -> quic::ConnectionError {
+        quic::ConnectionError::Application {
+            source: quic::ApplicationError {
+                code: Code::H3_INTERNAL_ERROR,
+                reason: "test failure".into(),
+            },
+        }
+    }
+
+    fn assert_h3_connection_code(error: StreamError, expected: Code) {
+        let StreamError::Connection {
+            source: connection::ConnectionError::H3 { source },
+        } = error
+        else {
+            panic!("expected h3 connection error");
+        };
+        assert_eq!(source.code(), expected);
+    }
+
+    fn assert_quic_connection_error(error: StreamError) {
+        let StreamError::Connection {
+            source: connection::ConnectionError::Quic { .. },
+        } = error
+        else {
+            panic!("expected quic connection error");
+        };
+    }
 
     #[test]
     fn boolean_setting_validation_uses_new_owner_modules() {
@@ -446,6 +554,74 @@ mod tests {
         assert_eq!(settings, rebuilt);
     }
 
+    #[test]
+    fn setting_id_methods_return_wire_ids_and_typed_values() {
+        let mut settings = Settings::default();
+        let raw_id = VarInt::from_u32(0x21);
+
+        assert_eq!(raw_id.id(), raw_id);
+        assert_eq!(raw_id.value_from(&settings), None);
+        assert_eq!(MaxFieldSectionSize.id(), MaxFieldSectionSize::ID);
+        assert_eq!(MaxFieldSectionSize.value_from(&settings), None);
+
+        settings.set(Setting::new(raw_id, VarInt::from_u32(7)));
+        settings.set(MaxFieldSectionSize::setting(VarInt::from_u32(4096)));
+
+        assert_eq!(raw_id.value_from(&settings), Some(VarInt::from_u32(7)));
+        assert_eq!(settings.get(raw_id), Some(VarInt::from_u32(7)));
+        assert_eq!(
+            MaxFieldSectionSize.value_from(&settings),
+            Some(VarInt::from_u32(4096)),
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_decode_maps_incomplete_id_and_value_to_closed_control_stream() {
+        for payload in [
+            BufList::new(),
+            BufList::from_buf(&[MaxFieldSectionSize::ID.into_inner() as u8][..]),
+        ] {
+            let error = match payload.decode::<Setting>().await {
+                Ok(_) => panic!("incomplete setting must fail"),
+                Err(error) => error,
+            };
+            assert_h3_connection_code(error, Code::H3_CLOSED_CRITICAL_STREAM);
+        }
+    }
+
+    #[tokio::test]
+    async fn setting_encode_maps_reset_to_closed_control_stream_and_preserves_connection_errors() {
+        let reset_code = VarInt::from_u32(77);
+        let error = Setting::new(MaxFieldSectionSize::ID, VarInt::from_u32(1))
+            .encode_into(FailWrite::reset(reset_code))
+            .await
+            .expect_err("write reset must fail");
+        assert_h3_connection_code(error, Code::H3_CLOSED_CRITICAL_STREAM);
+
+        let error = Setting::new(MaxFieldSectionSize::ID, VarInt::from_u32(1))
+            .encode_into(FailWrite::connection())
+            .await
+            .expect_err("connection write failure must fail");
+        assert_quic_connection_error(error);
+    }
+
+    #[tokio::test]
+    async fn settings_decode_propagates_stream_fill_buf_errors() {
+        let reset_code = VarInt::from_u32(88);
+        let reset = FailBufRead::new(StreamError::Reset { code: reset_code })
+            .decode::<Settings>()
+            .await
+            .expect_err("fill_buf reset must fail");
+        assert!(matches!(reset, StreamError::Reset { code } if code == reset_code));
+
+        let connection =
+            FailBufRead::new(connection::ConnectionError::from(quic_connection_error()).into())
+                .decode::<Settings>()
+                .await
+                .expect_err("fill_buf connection error must fail");
+        assert_quic_connection_error(connection);
+    }
+
     #[tokio::test]
     async fn setting_encode_decode_round_trips_and_rejects_invalid_bool() {
         let mut encoded = BufList::new();
@@ -547,6 +723,22 @@ mod tests {
             Some(VarInt::from_u32(2048)),
         );
         assert_eq!(decoded.into_iter().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn initial_control_stream_maps_write_errors() {
+        let error =
+            UnidirectionalStream::initial_control_stream(FailWrite::reset(VarInt::from_u32(9)))
+                .await
+                .err()
+                .expect("control stream reset must fail");
+        assert_h3_connection_code(error, Code::H3_CLOSED_CRITICAL_STREAM);
+
+        let error = UnidirectionalStream::initial_control_stream(FailWrite::connection())
+            .await
+            .err()
+            .expect("control stream connection failure must fail");
+        assert_quic_connection_error(error);
     }
 
     #[tokio::test]

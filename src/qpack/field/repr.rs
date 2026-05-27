@@ -494,6 +494,17 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
+    async fn encode_field_line_to_bytes(field_line: FieldLineRepresentation) -> Vec<u8> {
+        let mut encoded = BufList::new();
+        field_line
+            .encode_into(&mut encoded)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("field line encode_into failed: {error:?}");
+            });
+        encoded.copy_to_bytes(encoded.remaining()).to_vec()
+    }
+
     // --- Field section prefix tests ---
 
     #[test]
@@ -566,6 +577,23 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_ric_wrapped_value_above_max_is_invalid() {
+        // max_entries = 8, full_range = 16, max_value = 8.
+        // Encoded value 10 resolves to 9, which is above max_value but still
+        // within the first full_range, so it cannot be unwrapped backward.
+        let result = EncodedFieldSectionPrefix::decode_ric(10, 256, 0);
+        assert_eq!(result, Err(DecodeError::DecompressionFailed));
+    }
+
+    #[test]
+    fn test_decode_ric_unwraps_value_above_max() {
+        // max_entries = 8, full_range = 16, max_value = 28.
+        // Encoded value 16 first resolves to 31, then unwraps to 15.
+        let result = EncodedFieldSectionPrefix::decode_ric(16, 256, 20);
+        assert_eq!(result, Ok(15));
+    }
+
+    #[test]
     fn test_resolve_base_positive() {
         let result = EncodedFieldSectionPrefix::resolve_base(5, false, 3);
         assert_eq!(result, Ok(8));
@@ -580,6 +608,12 @@ mod tests {
     #[test]
     fn test_resolve_base_overflow() {
         let result = EncodedFieldSectionPrefix::resolve_base(1, true, 5);
+        assert_eq!(result, Err(DecodeError::ArithmeticOverflow));
+    }
+
+    #[test]
+    fn test_resolve_base_positive_overflow() {
+        let result = EncodedFieldSectionPrefix::resolve_base(u64::MAX, false, 1);
         assert_eq!(result, Err(DecodeError::ArithmeticOverflow));
     }
 
@@ -609,7 +643,82 @@ mod tests {
         assert_eq!(EncodedFieldSectionPrefix::resolve_base(3, true, 0), Ok(2));
     }
 
+    #[tokio::test]
+    async fn test_prefix_encode_preserves_sign_bit_with_extended_delta_base() {
+        let prefix = EncodedFieldSectionPrefix {
+            encoded_insert_count: 255,
+            sign: true,
+            delta_base: 127,
+        };
+
+        let bytes = encode_prefix_to_bytes(prefix).await;
+
+        assert_eq!(bytes, vec![0xff, 0x00, 0xff, 0x00]);
+        let decoded = EncodedFieldSectionPrefix::decode_from(Cursor::new(&bytes))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("decode_from signed prefix failed: {error:?}");
+            });
+        assert_eq!(decoded, prefix);
+    }
+
     // --- Field representation encode/decode tests ---
+
+    #[tokio::test]
+    async fn test_field_line_encode_exact_index_prefixes() {
+        let indexed = encode_field_line_to_bytes(FieldLineRepresentation::IndexedFieldLine {
+            is_static: true,
+            index: 63,
+        })
+        .await;
+        assert_eq!(indexed, vec![0xff, 0x00]);
+
+        let post_base = encode_field_line_to_bytes(
+            FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex { index: 15 },
+        )
+        .await;
+        assert_eq!(post_base, vec![0x1f, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn test_field_line_encode_exact_literal_prefixes() {
+        let name_reference = encode_field_line_to_bytes(
+            FieldLineRepresentation::LiteralFieldLineWithNameReference {
+                never_dynamic: true,
+                is_static: true,
+                name_index: 15,
+                huffman: false,
+                value: Bytes::new(),
+            },
+        )
+        .await;
+        assert_eq!(name_reference, vec![0x7f, 0x00, 0x00]);
+
+        let post_base_name_reference = encode_field_line_to_bytes(
+            FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
+                never_dynamic: true,
+                name_index: 7,
+                huffman: false,
+                value: Bytes::new(),
+            },
+        )
+        .await;
+        assert_eq!(post_base_name_reference, vec![0x0f, 0x00, 0x00]);
+
+        let literal_name =
+            encode_field_line_to_bytes(FieldLineRepresentation::LiteralFieldLineWithLiteralName {
+                never_dynamic: true,
+                name_huffman: false,
+                name: Bytes::from_static(b"x-test1"),
+                value_huffman: false,
+                value: Bytes::new(),
+            })
+            .await;
+        assert_eq!(
+            literal_name,
+            [vec![0x37, 0x00], b"x-test1".to_vec(), vec![0x00]].concat()
+        );
+    }
 
     #[tokio::test]
     async fn test_encode_decode_indexed_variants() {
@@ -765,11 +874,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_prefix_decode_missing_first_byte() {
+        let error = EncodedFieldSectionPrefix::decode_from(Cursor::new(Vec::<u8>::new()))
+            .await
+            .expect_err("expected missing prefix failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_prefix_decode_truncated_delta_base_varint() {
+        let error = EncodedFieldSectionPrefix::decode_from(Cursor::new(vec![0x00u8, 0xff]))
+            .await
+            .expect_err("expected delta-base truncation failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
     async fn test_field_line_decode_truncated_indexed_varint() {
         // Indexed line with index 63 uses extended integer encoding; no continuation byte present.
         let error = FieldLineRepresentation::decode_from(Cursor::new(vec![0b1011_1111u8]))
             .await
             .expect_err("expected indexed truncation failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_field_line_decode_truncated_post_base_index_varint() {
+        let error = FieldLineRepresentation::decode_from(Cursor::new(vec![0b0001_1111u8]))
+            .await
+            .expect_err("expected post-base index truncation failure");
         assert_h3_error(error);
     }
 
@@ -783,6 +916,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_field_line_decode_truncated_name_reference_value_bytes() {
+        let error =
+            FieldLineRepresentation::decode_from(Cursor::new(vec![0b0100_0011u8, 0x02, b'a']))
+                .await
+                .expect_err("expected literal name ref value bytes truncation failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
     async fn test_field_line_decode_truncated_literal_name() {
         // Literal name field with missing name length + bytes.
         let error = FieldLineRepresentation::decode_from(Cursor::new(vec![0b0010_0000u8]))
@@ -792,11 +934,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_field_line_decode_truncated_literal_name_bytes() {
+        let error = FieldLineRepresentation::decode_from(Cursor::new(vec![0b0010_0010u8, b'a']))
+            .await
+            .expect_err("expected literal name bytes truncation failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_field_line_decode_truncated_literal_name_value_bytes() {
+        let error = FieldLineRepresentation::decode_from(Cursor::new(vec![
+            0b0010_0001u8,
+            b'n',
+            0x02,
+            b'v',
+        ]))
+        .await
+        .expect_err("expected literal name value bytes truncation failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
     async fn test_field_line_decode_truncated_post_base_name_value() {
         // Post-base name reference missing value.
         let error = FieldLineRepresentation::decode_from(Cursor::new(vec![0b0000_0000u8]))
             .await
             .expect_err("expected post-base truncation failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_field_line_decode_truncated_post_base_name_value_bytes() {
+        let error =
+            FieldLineRepresentation::decode_from(Cursor::new(vec![0b0000_0001u8, 0x02, b'a']))
+                .await
+                .expect_err("expected post-base value bytes truncation failure");
         assert_h3_error(error);
     }
 
