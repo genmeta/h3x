@@ -2,7 +2,6 @@ use std::{
     cell::LazyCell,
     fmt,
     hash::{Hash, Hasher},
-    net::IpAddr,
     str::FromStr,
 };
 
@@ -239,29 +238,60 @@ impl BindPattern {
     /// Check if a concrete [`BindUri`] could be produced by this pattern.
     ///
     /// Compares scheme, port, and host. Wildcard ports (None) match any port.
-    /// Glob/exact hosts use [`BindHost::matches`] for pattern matching.
+    /// For `iface://` URIs, the family prefix is matched separately from the
+    /// interface name. Glob/exact hosts use [`BindHost::matches`] for pattern
+    /// matching.
     #[must_use]
     pub fn matches(&self, bind_uri: &BindUri) -> bool {
         if self.scheme != bind_uri.scheme() {
             return false;
         }
-        if let Some(port) = self.port
-            && bind_uri.as_uri().port_u16() != Some(port)
+        match self.scheme {
+            Scheme::Iface => self.matches_iface_bind_uri(bind_uri),
+            Scheme::Inet => self.matches_inet_bind_uri(bind_uri),
+            _ => false,
+        }
+    }
+
+    fn port_matches(&self, actual: u16) -> bool {
+        if let Some(expected) = self.port
+            && expected != actual
         {
             return false;
         }
-        let Some(host) = bind_uri.as_uri().host() else {
+        true
+    }
+
+    fn matches_iface_bind_uri(&self, bind_uri: &BindUri) -> bool {
+        let Some((family, interface, port)) = bind_uri.as_iface_bind_uri() else {
             return false;
         };
+        if !self.port_matches(port) {
+            return false;
+        }
         match &self.host {
-            BindHost::Ip { addr, .. } => {
-                let host = host
-                    .strip_prefix('[')
-                    .and_then(|host| host.strip_suffix(']'))
-                    .unwrap_or(host);
-                host.parse::<IpAddr>().is_ok_and(|host| host == *addr)
+            BindHost::Ip { .. } => false,
+            host => {
+                if let Some(pattern_family) = host.family()
+                    && pattern_family != family
+                {
+                    return false;
+                }
+                host.matches(interface)
             }
-            _ => self.host.matches(host),
+        }
+    }
+
+    fn matches_inet_bind_uri(&self, bind_uri: &BindUri) -> bool {
+        let Some(addr) = bind_uri.as_inet_bind_uri() else {
+            return false;
+        };
+        if !self.port_matches(addr.port()) {
+            return false;
+        }
+        match &self.host {
+            BindHost::Ip { addr: pattern, .. } => *pattern == addr.ip(),
+            BindHost::Glob { .. } | BindHost::Exact { .. } => false,
         }
     }
 

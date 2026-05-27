@@ -613,3 +613,42 @@ fn parse_errors() {
         "family prefix should be rejected for IP addresses"
     );
 }
+
+#[test]
+fn iface_pattern_matches_generated_bind_uri() {
+    let pattern: BindPattern = "iface://v4.en*:8080".parse().unwrap();
+    let generated = pattern
+        .to_bind_uris(["enp17s0"])
+        .next()
+        .expect("pattern should generate one bind uri");
+
+    assert!(
+        pattern.matches(&generated),
+        "pattern {pattern} should match generated bind uri {generated}"
+    );
+}
+
+#[test]
+fn iface_pattern_matches_family_interface_and_port_separately() {
+    let pattern: BindPattern = "iface://v4.en*:8080".parse().unwrap();
+
+    assert!(pattern.matches(&"iface://v4.enp17s0:8080".parse().unwrap()));
+    assert!(!pattern.matches(&"iface://v6.enp17s0:8080".parse().unwrap()));
+    assert!(!pattern.matches(&"iface://v4.wlan0:8080".parse().unwrap()));
+    assert!(!pattern.matches(&"iface://v4.enp17s0:8081".parse().unwrap()));
+
+    let wildcard_family_and_port: BindPattern = "iface://en*".parse().unwrap();
+    assert!(wildcard_family_and_port.matches(&"iface://v6.eno1:4433".parse().unwrap()));
+}
+
+#[test]
+fn inet_pattern_matches_ip_address_and_port_only() {
+    let pattern: BindPattern = "inet://127.0.0.1:8080".parse().unwrap();
+
+    assert!(pattern.matches(&"inet://127.0.0.1:8080".parse().unwrap()));
+    assert!(!pattern.matches(&"inet://127.0.0.1:8081".parse().unwrap()));
+    assert!(!pattern.matches(&"inet://127.0.0.2:8080".parse().unwrap()));
+
+    let non_ip_pattern: BindPattern = "inet://*:8080".parse().unwrap();
+    assert!(!non_ip_pattern.matches(&"inet://127.0.0.1:8080".parse().unwrap()));
+}
