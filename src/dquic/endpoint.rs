@@ -790,10 +790,20 @@ impl QuicEndpoint {
 
 #[cfg(test)]
 mod tests {
-    use rustls::pki_types::PrivateKeyDer;
+    use std::any::TypeId;
+
+    use rustls::{RootCertStore, client::WebPkiServerVerifier, pki_types::PrivateKeyDer};
 
     use super::*;
-    use crate::dquic::resolver::handy::SystemResolver;
+    use crate::dquic::{cert::handy::ToCertificate, resolver::handy::SystemResolver};
+
+    const CA_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/ca.cert");
+
+    fn root_store_with_ca() -> RootCertStore {
+        let mut store = RootCertStore::empty();
+        store.add_parsable_certificates(CA_CERT.to_certificate());
+        store
+    }
 
     #[tokio::test]
     async fn test_quic_endpoint_construction() {
@@ -905,6 +915,133 @@ mod tests {
         assert!(
             QuicEndpoint::connection_has_paths(&connection).expect("path context"),
             "local endpoint replayed before DNS peer must be retained for peer pairing"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_helpers_cover_identity_verifier_and_ready_endpoint_paths() {
+        let mut endpoint = make_endpoint().await;
+        let webpki = WebPkiServerVerifier::builder(Arc::new(root_store_with_ca()))
+            .build()
+            .expect("webpki verifier");
+        {
+            let mut client = endpoint.client_config_mut();
+            client.verifier = ServerCertVerifierChoice::WebPki(webpki);
+        }
+        endpoint
+            .build_client_tls()
+            .expect("webpki verifier client tls");
+
+        {
+            let mut client = endpoint.client_config_mut();
+            client.verifier =
+                ServerCertVerifierChoice::Custom(Arc::new(DangerousServerCertVerifier));
+        }
+        let tls = Arc::new(
+            endpoint
+                .build_client_tls()
+                .expect("custom verifier client tls"),
+        );
+        {
+            let mut identity = endpoint.identity_mut();
+            *identity = Some(Arc::new(make_identity("client-name.test")));
+        }
+        endpoint
+            .build_client_connection("server.example", tls)
+            .expect("client connection with identity parameter");
+
+        let bind_pattern = BindPattern::from_str("inet://127.0.0.1:0").expect("valid bind pattern");
+        let bind_endpoint = QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .bind(Arc::new(vec![bind_pattern.clone()]))
+            .build()
+            .await;
+        let tls = bind_endpoint.ensure_client().expect("client tls");
+        let connection = bind_endpoint
+            .build_client_connection("server.example", tls)
+            .expect("client connection");
+        let iface = bind_endpoint
+            .network
+            .quic()
+            .get_interfaces(&bind_pattern)
+            .expect("registered bind")
+            .into_iter()
+            .next()
+            .expect("bound interface");
+
+        use crate::dquic::net::IO as _;
+        let bind_uri = iface.bind_uri();
+        let local_addr = iface.borrow().bound_addr().expect("bound address");
+        let data: Arc<dyn Any + Send + Sync> =
+            Arc::new(Ok::<SocketAddr, std::io::Error>(local_addr));
+        QuicEndpoint::handle_local_addr_event(
+            &connection,
+            bind_uri,
+            crate::dquic::qinterface::component::location::AddressEvent::Upsert(data),
+        );
+
+        let mut endpoints = futures::stream::iter([
+            (
+                Source::System,
+                EndpointAddr::direct(SocketAddr::new(local_addr.ip(), local_addr.port() + 1)),
+            ),
+            (
+                Source::Dht,
+                EndpointAddr::direct(SocketAddr::new(local_addr.ip(), local_addr.port() + 2)),
+            ),
+        ]);
+        QuicEndpoint::drain_ready_peer_endpoints(&connection, &mut endpoints);
+        assert!(
+            QuicEndpoint::connection_has_paths(&connection).expect("path context"),
+            "ready peer endpoints should pair with the retained local endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_address_event_ignores_remove_closed_failed_and_unknown_payloads() {
+        use crate::dquic::qinterface::component::location::AddressEvent;
+
+        let endpoint = make_endpoint().await;
+        let tls = endpoint.ensure_client().expect("client tls");
+        let connection = endpoint
+            .build_client_connection("remote.test", tls)
+            .expect("client connection");
+        let bind_uri: BindUri = "inet://127.0.0.1:0".parse().expect("bind uri");
+
+        QuicEndpoint::handle_local_addr_event(
+            &connection,
+            bind_uri.clone(),
+            AddressEvent::Remove(TypeId::of::<std::io::Result<SocketAddr>>()),
+        );
+        QuicEndpoint::handle_local_addr_event(&connection, bind_uri.clone(), AddressEvent::Closed);
+
+        let failed_direct: Arc<dyn Any + Send + Sync> = Arc::new(Err::<SocketAddr, _>(
+            std::io::Error::other("synthetic bind failure"),
+        ));
+        QuicEndpoint::handle_local_addr_event(
+            &connection,
+            bind_uri.clone(),
+            AddressEvent::Upsert(failed_direct),
+        );
+
+        QuicEndpoint::handle_local_addr_event(
+            &connection,
+            bind_uri.clone(),
+            AddressEvent::Remove(TypeId::of::<
+                crate::dquic::qtraversal::nat::client::ClientLocationData,
+            >()),
+        );
+
+        let unknown_payload: Arc<dyn Any + Send + Sync> = Arc::new("not a location payload");
+        QuicEndpoint::handle_local_addr_event(
+            &connection,
+            bind_uri,
+            AddressEvent::Upsert(unknown_payload),
+        );
+
+        assert!(
+            !QuicEndpoint::connection_has_paths(&connection).expect("path context"),
+            "ignored events should not create paths"
         );
     }
 
@@ -1066,6 +1203,40 @@ mod tests {
 
         endpoint.update_ocsp(Some(vec![9, 8, 7]));
         assert!(endpoint.identity.load_full().is_none());
+    }
+
+    #[tokio::test]
+    async fn identity_guard_deref_and_invalidate_caches_cover_direct_helpers() {
+        let mut endpoint = make_endpoint().await;
+        endpoint.client_tls_cache.store(Some(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        )));
+
+        {
+            let mut guard = endpoint.identity_mut();
+            assert!(std::ops::Deref::deref(&guard).is_none());
+            *guard = Some(Arc::new(make_identity("deref-helper.test")));
+            assert_eq!(
+                std::ops::Deref::deref(&guard)
+                    .as_ref()
+                    .expect("guard identity")
+                    .name
+                    .as_str(),
+                "deref-helper.test"
+            );
+        }
+        assert!(endpoint.identity.load_full().is_some());
+
+        endpoint.client_tls_cache.store(Some(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        )));
+        endpoint.invalidate_caches();
+        assert!(endpoint.client_tls_cache.load_full().is_none());
+        assert!(endpoint.server_binding_cache.load_full().is_none());
     }
 
     #[tokio::test]
@@ -1460,9 +1631,34 @@ mod tests {
                 config: &mut config,
                 cache: &cache,
             };
+            assert!(!std::ops::Deref::deref(&guard).enable_0rtt);
             guard.enable_0rtt = true;
         }
         assert!(config.enable_0rtt);
+    }
+
+    #[tokio::test]
+    async fn quic_listen_trait_impls_delegate_accept_and_shutdown() {
+        let mut owned = make_endpoint().await;
+        let owned_error = match <QuicEndpoint as quic::Listen>::accept(&mut owned).await {
+            Ok(_) => panic!("anonymous owned endpoint cannot accept"),
+            Err(error) => error,
+        };
+        assert!(matches!(owned_error, AcceptError::ServerUnavailable));
+        <QuicEndpoint as quic::Listen>::shutdown(&owned)
+            .await
+            .expect("owned shutdown");
+
+        let endpoint = make_endpoint().await;
+        let mut shared = &endpoint;
+        let shared_error = match <&QuicEndpoint as quic::Listen>::accept(&mut shared).await {
+            Ok(_) => panic!("anonymous shared endpoint cannot accept"),
+            Err(error) => error,
+        };
+        assert!(matches!(shared_error, AcceptError::ServerUnavailable));
+        <&QuicEndpoint as quic::Listen>::shutdown(&shared)
+            .await
+            .expect("shared shutdown");
     }
 
     #[test]

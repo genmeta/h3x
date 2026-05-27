@@ -271,7 +271,10 @@ impl WriteStream {
 mod tests {
     use std::{
         pin::Pin,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         task::{Context, Poll},
     };
 
@@ -315,6 +318,144 @@ mod tests {
                 .push(Event::Cancel(code));
             Poll::Ready(Ok(()))
         }
+    }
+
+    type ControlReady = futures::future::Ready<Result<ControlSink, MessageStreamError>>;
+    type ReadyState = State<ControlSink, ControlReady, ControlReady, ControlReady>;
+
+    fn control_sink(stream_id: VarInt) -> ControlSink {
+        ControlSink {
+            stream_id,
+            events: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn ready_control(stream_id: VarInt) -> ControlReady {
+        futures::future::ready(Ok(control_sink(stream_id)))
+    }
+
+    #[derive(Debug)]
+    struct GateFuture {
+        value: Option<ControlSink>,
+        open: Arc<AtomicBool>,
+    }
+
+    impl Future for GateFuture {
+        type Output = Result<ControlSink, MessageStreamError>;
+
+        fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.open.load(Ordering::SeqCst) {
+                Poll::Ready(Ok(self
+                    .value
+                    .take()
+                    .expect("gate future polled after ready")))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    #[test]
+    fn state_take_value_only_extracts_value_state() {
+        let mut value = ReadyState::Value {
+            value: control_sink(VarInt::from_u32(3)),
+        };
+        assert_eq!(
+            Pin::new(&mut value)
+                .take_value()
+                .expect("value state should yield inner value")
+                .stream_id,
+            VarInt::from_u32(3)
+        );
+        assert!(
+            Pin::new(&mut value).take_value().is_none(),
+            "taking the value should leave the state empty"
+        );
+
+        let mut send = ReadyState::Send {
+            future: ready_control(VarInt::from_u32(5)),
+        };
+        assert!(Pin::new(&mut send).take_value().is_none());
+
+        let mut flush = ReadyState::Flush {
+            future: ready_control(VarInt::from_u32(7)),
+        };
+        assert!(Pin::new(&mut flush).take_value().is_none());
+
+        let mut close = ReadyState::Close {
+            future: ready_control(VarInt::from_u32(9)),
+        };
+        assert!(Pin::new(&mut close).take_value().is_none());
+    }
+
+    #[test]
+    fn state_poll_value_covers_value_send_flush_close_and_empty() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut value = ReadyState::Value {
+            value: ControlSink {
+                stream_id: VarInt::from_u32(13),
+                events: events.clone(),
+            },
+        };
+        assert_eq!(
+            poll_fn(|cx| Pin::new(&mut value).poll_value(cx))
+                .now_or_never()
+                .expect("value state should be ready")
+                .expect("value state should return Ok")
+                .stream_id,
+            VarInt::from_u32(13)
+        );
+
+        let mut send = ReadyState::Send {
+            future: futures::future::ready(Ok(ControlSink {
+                stream_id: VarInt::from_u32(17),
+                events: events.clone(),
+            })),
+        };
+        assert_eq!(
+            poll_fn(|cx| Pin::new(&mut send).poll_value(cx))
+                .now_or_never()
+                .expect("send future should be ready")
+                .expect("send future should return Ok")
+                .stream_id,
+            VarInt::from_u32(17)
+        );
+
+        let mut flush = ReadyState::Flush {
+            future: futures::future::ready(Ok(ControlSink {
+                stream_id: VarInt::from_u32(19),
+                events: events.clone(),
+            })),
+        };
+        assert_eq!(
+            poll_fn(|cx| Pin::new(&mut flush).poll_value(cx))
+                .now_or_never()
+                .expect("flush future should be ready")
+                .expect("flush future should return Ok")
+                .stream_id,
+            VarInt::from_u32(19)
+        );
+
+        let mut close = ReadyState::Close {
+            future: futures::future::ready(Ok(ControlSink {
+                stream_id: VarInt::from_u32(23),
+                events,
+            })),
+        };
+        assert_eq!(
+            poll_fn(|cx| Pin::new(&mut close).poll_value(cx))
+                .now_or_never()
+                .expect("close future should be ready")
+                .expect("close future should return Ok")
+                .stream_id,
+            VarInt::from_u32(23)
+        );
+
+        let mut empty = ReadyState::Empty;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = poll_fn(|cx| Pin::new(&mut empty).poll_value(cx)).now_or_never();
+        }));
+        assert!(panic.is_err());
     }
 
     #[tokio::test]
@@ -371,6 +512,175 @@ mod tests {
                 Event::Flush,
                 Event::Close,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unfold_flush_and_close_keep_single_in_flight_operation_until_ready() {
+        let flush_open = Arc::new(AtomicBool::new(false));
+        let close_open = Arc::new(AtomicBool::new(false));
+        let flush_started = Arc::new(AtomicUsize::new(0));
+        let close_started = Arc::new(AtomicUsize::new(0));
+        let mut sink = Box::pin(unfold(
+            ControlSink {
+                stream_id: VarInt::from_u32(31),
+                events: Arc::new(Mutex::new(Vec::new())),
+            },
+            |stream: ControlSink, _item: Bytes| async move { Ok::<_, MessageStreamError>(stream) },
+            {
+                let flush_open = flush_open.clone();
+                let flush_started = flush_started.clone();
+                move |stream: ControlSink| {
+                    flush_started.fetch_add(1, Ordering::SeqCst);
+                    GateFuture {
+                        value: Some(stream),
+                        open: flush_open.clone(),
+                    }
+                }
+            },
+            {
+                let close_open = close_open.clone();
+                let close_started = close_started.clone();
+                move |stream: ControlSink| {
+                    close_started.fetch_add(1, Ordering::SeqCst);
+                    GateFuture {
+                        value: Some(stream),
+                        open: close_open.clone(),
+                    }
+                }
+            },
+        ));
+
+        poll_fn(|cx| sink.as_mut().poll_ready(cx))
+            .await
+            .expect("sink ready");
+
+        assert!(
+            poll_fn(|cx| sink.as_mut().poll_flush(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert_eq!(
+            flush_started.load(Ordering::SeqCst),
+            1,
+            "first flush poll should start one flush future"
+        );
+        assert!(
+            poll_fn(|cx| sink.as_mut().poll_flush(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert_eq!(
+            flush_started.load(Ordering::SeqCst),
+            1,
+            "polling an in-flight flush must not start another flush"
+        );
+
+        flush_open.store(true, Ordering::SeqCst);
+        poll_fn(|cx| sink.as_mut().poll_flush(cx))
+            .await
+            .expect("flush completes once gate opens");
+        poll_fn(|cx| sink.as_mut().poll_ready(cx))
+            .await
+            .expect("sink ready after completed flush");
+        assert_eq!(
+            flush_started.load(Ordering::SeqCst),
+            1,
+            "poll_ready on value state must not flush again"
+        );
+
+        assert!(
+            poll_fn(|cx| sink.as_mut().poll_close(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert_eq!(
+            close_started.load(Ordering::SeqCst),
+            1,
+            "first close poll should start one close future"
+        );
+        assert!(
+            poll_fn(|cx| sink.as_mut().poll_close(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert_eq!(
+            close_started.load(Ordering::SeqCst),
+            1,
+            "polling an in-flight close must not start another close"
+        );
+
+        close_open.store(true, Ordering::SeqCst);
+        poll_fn(|cx| sink.as_mut().poll_close(cx))
+            .await
+            .expect("close completes once gate opens");
+        poll_fn(|cx| sink.as_mut().poll_ready(cx))
+            .await
+            .expect("sink ready after completed close");
+        assert_eq!(
+            close_started.load(Ordering::SeqCst),
+            1,
+            "poll_ready on value state must not close again"
+        );
+    }
+
+    #[tokio::test]
+    async fn unfold_poll_ready_waits_for_send_then_restores_control_traits() {
+        let send_open = Arc::new(AtomicBool::new(false));
+        let send_started = Arc::new(AtomicUsize::new(0));
+        let stream_id = VarInt::from_u32(33);
+        let cancel_code = VarInt::from_u32(34);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = Box::pin(unfold(
+            ControlSink {
+                stream_id,
+                events: events.clone(),
+            },
+            {
+                let send_open = send_open.clone();
+                let send_started = send_started.clone();
+                move |stream: ControlSink, _item: Bytes| {
+                    send_started.fetch_add(1, Ordering::SeqCst);
+                    GateFuture {
+                        value: Some(stream),
+                        open: send_open.clone(),
+                    }
+                }
+            },
+            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
+            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
+        ));
+
+        poll_fn(|cx| sink.as_mut().poll_ready(cx))
+            .await
+            .expect("sink initially ready");
+        sink.as_mut()
+            .start_send(Bytes::from_static(b"payload"))
+            .expect("send accepted");
+        assert!(
+            poll_fn(|cx| sink.as_mut().poll_ready(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert_eq!(send_started.load(Ordering::SeqCst), 1);
+
+        send_open.store(true, Ordering::SeqCst);
+        poll_fn(|cx| sink.as_mut().poll_ready(cx))
+            .await
+            .expect("send completes once gate opens");
+        assert_eq!(send_started.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            poll_fn(|cx| sink.as_mut().poll_stream_id(cx))
+                .await
+                .expect("stream id should be available after send completes"),
+            stream_id
+        );
+        poll_fn(|cx| sink.as_mut().poll_cancel(cx, cancel_code))
+            .await
+            .expect("cancel should be available after send completes");
+        assert_eq!(
+            *events.lock().expect("event log poisoned"),
+            vec![Event::Cancel(cancel_code)]
         );
     }
 
@@ -728,5 +1038,114 @@ mod tests {
             .await
             .expect("from send");
         from_writer.as_mut().close().await.expect("from close");
+    }
+
+    #[tokio::test]
+    async fn write_stream_writer_adapters_forward_control_with_buffered_send_then_flush_and_close()
+    {
+        let stream_id = VarInt::from_u32(81);
+        let cancel_code = VarInt::from_u32(82);
+
+        let mut borrowed_stream = crate::message::test::write_stream_for_test(stream_id);
+        {
+            let mut writer = Box::pin(borrowed_stream.as_writer());
+            poll_fn(|cx| writer.as_mut().poll_ready(cx))
+                .await
+                .expect("as_writer initially ready");
+            writer
+                .as_mut()
+                .start_send(Bytes::from_static(b"buffered"))
+                .expect("as_writer buffers send");
+            assert_eq!(
+                poll_fn(|cx| writer.as_mut().poll_stream_id(cx))
+                    .await
+                    .expect("as_writer stream id with buffered send"),
+                stream_id
+            );
+            poll_fn(|cx| writer.as_mut().poll_cancel(cx, cancel_code))
+                .await
+                .expect("as_writer cancel with buffered send");
+            writer.as_mut().flush().await.expect("as_writer flush");
+            assert_eq!(
+                poll_fn(|cx| writer.as_mut().poll_stream_id(cx))
+                    .await
+                    .expect("as_writer stream id after flush"),
+                stream_id
+            );
+            writer.as_mut().close().await.expect("as_writer close");
+        }
+
+        let mut borrowed_box_stream = crate::message::test::write_stream_for_test(stream_id);
+        {
+            let mut writer = Box::pin(borrowed_box_stream.as_box_writer());
+            poll_fn(|cx| writer.as_mut().poll_ready(cx))
+                .await
+                .expect("as_box_writer initially ready");
+            writer
+                .as_mut()
+                .start_send(Bytes::from_static(b"buffered"))
+                .expect("as_box_writer buffers send");
+            assert_eq!(
+                poll_fn(|cx| writer.as_mut().poll_stream_id(cx))
+                    .await
+                    .expect("as_box_writer stream id with buffered send"),
+                stream_id
+            );
+            poll_fn(|cx| writer.as_mut().poll_cancel(cx, cancel_code))
+                .await
+                .expect("as_box_writer cancel with buffered send");
+            writer.as_mut().flush().await.expect("as_box_writer flush");
+            writer.as_mut().close().await.expect("as_box_writer close");
+        }
+
+        let mut writer =
+            Box::pin(crate::message::test::write_stream_for_test(stream_id).into_writer());
+        poll_fn(|cx| writer.as_mut().poll_ready(cx))
+            .await
+            .expect("into_writer initially ready");
+        writer
+            .as_mut()
+            .start_send(Bytes::from_static(b"buffered"))
+            .expect("into_writer buffers send");
+        assert_eq!(
+            poll_fn(|cx| writer.as_mut().poll_stream_id(cx))
+                .await
+                .expect("into_writer stream id with buffered send"),
+            stream_id
+        );
+        poll_fn(|cx| writer.as_mut().poll_cancel(cx, cancel_code))
+            .await
+            .expect("into_writer cancel with buffered send");
+        writer.as_mut().flush().await.expect("into_writer flush");
+        writer.as_mut().close().await.expect("into_writer close");
+
+        let mut boxed_writer =
+            Box::pin(crate::message::test::write_stream_for_test(stream_id).into_box_writer());
+        poll_fn(|cx| boxed_writer.as_mut().poll_ready(cx))
+            .await
+            .expect("into_box_writer initially ready");
+        boxed_writer
+            .as_mut()
+            .start_send(Bytes::from_static(b"buffered"))
+            .expect("into_box_writer buffers send");
+        assert_eq!(
+            poll_fn(|cx| boxed_writer.as_mut().poll_stream_id(cx))
+                .await
+                .expect("into_box_writer stream id with buffered send"),
+            stream_id
+        );
+        poll_fn(|cx| boxed_writer.as_mut().poll_cancel(cx, cancel_code))
+            .await
+            .expect("into_box_writer cancel with buffered send");
+        boxed_writer
+            .as_mut()
+            .flush()
+            .await
+            .expect("into_box_writer flush");
+        boxed_writer
+            .as_mut()
+            .close()
+            .await
+            .expect("into_box_writer close");
     }
 }

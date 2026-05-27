@@ -27,7 +27,7 @@ mod tests {
             stream::UnidirectionalStream,
         },
         qpack::{
-            algorithm::{DynamicCompressAlgo, HuffmanAlways, StaticCompressAlgo},
+            algorithm::{Algorithm, DynamicCompressAlgo, HuffmanAlways, StaticCompressAlgo},
             decoder::{Decoder, MessageStreamReader},
             encoder::Encoder,
             field::FieldSection,
@@ -310,6 +310,128 @@ mod tests {
             VarInt::from_u32(100),
         ));
         Arc::new(settings)
+    }
+
+    #[tokio::test]
+    async fn settings_with_dynamic_table_enables_qpack_limits() {
+        let settings = settings_with_dynamic_table();
+
+        assert_eq!(settings.qpack_max_table_capacity(), VarInt::from_u32(4096));
+        assert_eq!(settings.qpack_blocked_streams(), VarInt::from_u32(100));
+    }
+
+    fn apply_pending_encoder_instructions(
+        encoder_state: &mut crate::qpack::encoder::EncoderState,
+        decoder_state: &mut crate::qpack::decoder::DecoderState,
+    ) {
+        use crate::qpack::encoder::EncoderInstruction;
+
+        while let Some(instruction) = encoder_state.pending_instructions.pop_front() {
+            match instruction {
+                EncoderInstruction::SetDynamicTableCapacity { capacity } => {
+                    decoder_state.set_dynamic_table_capacity(capacity).unwrap();
+                }
+                EncoderInstruction::InsertWithNameReference {
+                    is_static,
+                    name_index,
+                    value,
+                    ..
+                } => {
+                    let abs_index = if is_static {
+                        name_index
+                    } else {
+                        decoder_state.table_inserted_count() - name_index - 1
+                    };
+                    decoder_state
+                        .insert_with_name_reference(is_static, abs_index, value)
+                        .unwrap();
+                }
+                EncoderInstruction::InsertWithLiteralName { name, value, .. } => {
+                    decoder_state.insert_with_literal_name(name, value).unwrap();
+                }
+                EncoderInstruction::Duplicate { index } => {
+                    let abs_index = decoder_state.table_inserted_count() - index - 1;
+                    decoder_state.duplicate(abs_index).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_response_trailer_and_empty_field_sections_roundtrip() {
+        use crate::qpack::{
+            decoder::DecoderState,
+            encoder::EncoderState,
+            field::{EncodedFieldSectionPrefix, FieldLine},
+        };
+
+        let settings = settings_with_dynamic_table();
+        let mut encoder_state = EncoderState::new(settings.clone());
+        encoder_state
+            .set_max_table_capacity(4096)
+            .expect("set encoder capacity");
+
+        let mut decoder_state = DecoderState::new(settings.clone());
+        apply_pending_encoder_instructions(&mut encoder_state, &mut decoder_state);
+
+        let encode_strategy = DynamicCompressAlgo::new(HuffmanAlways);
+
+        let response = Response::builder()
+            .status(201)
+            .header("server", "h3x-dynamic-test")
+            .header("x-dynamic-name", "first")
+            .header("cache-control", "no-store")
+            .body(())
+            .unwrap();
+        let (response_parts, ()) = response.into_parts();
+
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-dynamic-name", HeaderValue::from_static("second"));
+        trailers.insert("x-trailer-only", HeaderValue::from_static("present"));
+
+        let cases = [
+            FieldSection::from(response_parts),
+            FieldSection::trailer(trailers),
+            FieldSection::trailer(HeaderMap::new()),
+        ];
+
+        for field_section in cases {
+            let expected: Vec<FieldLine> = field_section.iter().collect();
+            let output = encode_strategy
+                .compress(&mut encoder_state, field_section.iter(), true)
+                .await;
+            apply_pending_encoder_instructions(&mut encoder_state, &mut decoder_state);
+
+            let required_insert_count = EncodedFieldSectionPrefix::decode_ric(
+                output.prefix.encoded_insert_count,
+                settings.qpack_max_table_capacity().into_inner(),
+                decoder_state.table_inserted_count(),
+            )
+            .expect("decode required insert count");
+            let base = EncodedFieldSectionPrefix::resolve_base(
+                required_insert_count,
+                output.prefix.sign,
+                output.prefix.delta_base,
+            )
+            .expect("resolve base");
+
+            let decoded: Vec<FieldLine> = output
+                .representations
+                .iter()
+                .map(|repr| decoder_state.decompress(repr, base).expect("decompress"))
+                .collect();
+            assert_eq!(decoded, expected);
+        }
+
+        assert_eq!(encoder_state.table_capacity(), 4096);
+        assert!(
+            encoder_state.table_inserted_count() >= 3,
+            "dynamic response/trailer roundtrip should insert reusable table entries"
+        );
+        assert_eq!(
+            decoder_state.table_inserted_count(),
+            encoder_state.table_inserted_count()
+        );
     }
 
     /// Direct roundtrip test: encode with DynamicCompressAlgo, then decode using
