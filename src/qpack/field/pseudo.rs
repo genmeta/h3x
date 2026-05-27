@@ -128,7 +128,27 @@ impl PseudoHeaders {
 mod tests {
     use http::{Method, StatusCode, Uri, uri::PathAndQuery};
 
-    use super::PseudoHeaders;
+    use super::{PseudoHeaders, asterisk_path, has_missing_path_component};
+
+    #[test]
+    fn pseudo_header_names_match_http3_wire_names() {
+        assert_eq!(PseudoHeaders::METHOD, ":method");
+        assert_eq!(PseudoHeaders::SCHEME, ":scheme");
+        assert_eq!(PseudoHeaders::AUTHORITY, ":authority");
+        assert_eq!(PseudoHeaders::PATH, ":path");
+        assert_eq!(PseudoHeaders::PROTOOCL, ":protocol");
+        assert_eq!(PseudoHeaders::STATUS, ":status");
+    }
+
+    #[test]
+    fn path_helpers_identify_query_only_and_asterisk_forms() {
+        let query_only = PathAndQuery::from_static("?x=1");
+        let absolute = PathAndQuery::from_static("/x?y=1");
+
+        assert!(has_missing_path_component(&query_only));
+        assert!(!has_missing_path_component(&absolute));
+        assert_eq!(asterisk_path().as_str(), "*");
+    }
 
     #[test]
     fn request_extracts_pseudo_headers_from_absolute_uri() {

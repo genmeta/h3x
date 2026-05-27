@@ -195,12 +195,12 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use futures::{Sink, Stream};
+    use futures::{Sink, SinkExt, Stream, StreamExt};
 
     use super::*;
     use crate::{
         codec::{BoxReadStream, BoxWriteStream},
-        quic::{self, GetStreamIdExt},
+        quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
         varint::VarInt,
     };
 
@@ -333,6 +333,62 @@ mod tests {
             let _guard = registry.inner.lock().expect("registry lock should succeed");
             panic!("poison registry mutex");
         }));
+    }
+
+    #[tokio::test]
+    async fn test_read_stream_reads_chunks_and_stops() {
+        let mut stream = test_read_stream(40, b"chunk".to_vec());
+
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .expect("read stream should yield one chunk")
+                .expect("read chunk should succeed"),
+            Bytes::from_static(b"chunk")
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "read stream should be exhausted"
+        );
+        stream
+            .stop(VarInt::from_u32(41))
+            .await
+            .expect("read stream stop should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_write_stream_writes_flushes_closes_and_cancels() {
+        let state = Arc::new(StreamState::default());
+        let mut stream = test_write_stream(42, Arc::clone(&state));
+
+        assert_eq!(
+            stream
+                .stream_id()
+                .await
+                .expect("write stream id should be readable"),
+            VarInt::from_u32(42)
+        );
+        stream
+            .send(Bytes::from_static(b"payload"))
+            .await
+            .expect("write stream send should succeed");
+        stream
+            .close()
+            .await
+            .expect("write stream close should succeed");
+        stream
+            .cancel(VarInt::from_u32(43))
+            .await
+            .expect("write stream cancel should succeed");
+
+        assert_eq!(
+            *state
+                .written
+                .lock()
+                .expect("written lock should not poison"),
+            b"payload".to_vec()
+        );
     }
 
     #[test]
@@ -518,6 +574,65 @@ mod tests {
 
         assert!(registry.route_bi(session_id, bidi_stream(99)).is_err());
         assert!(registry.route_uni(session_id, uni_stream(100)).is_err());
+    }
+
+    #[tokio::test]
+    async fn route_uses_exact_registered_session_id() {
+        let registry = Registry::default();
+        let first_session_id = StreamId::from(VarInt::from_u32(32));
+        let second_session_id = StreamId::from(VarInt::from_u32(36));
+        let mut first = registry
+            .register(first_session_id)
+            .expect("first registration should succeed");
+        let mut second = registry
+            .register(second_session_id)
+            .expect("second registration should succeed");
+
+        assert!(
+            registry
+                .route_bi(second_session_id, bidi_stream(37))
+                .is_ok()
+        );
+        assert!(
+            registry
+                .route_uni(second_session_id, uni_stream(38))
+                .is_ok()
+        );
+
+        assert!(matches!(
+            first.bidi_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            first.uni_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let (mut second_bidi_reader, _second_bidi_writer) = second
+            .bidi_rx
+            .recv()
+            .await
+            .expect("second session should receive routed bidi stream");
+        assert_eq!(
+            second_bidi_reader
+                .stream_id()
+                .await
+                .expect("second bidi stream id should be readable"),
+            VarInt::from_u32(37)
+        );
+
+        let mut second_uni_reader = second
+            .uni_rx
+            .recv()
+            .await
+            .expect("second session should receive routed uni stream");
+        assert_eq!(
+            second_uni_reader
+                .stream_id()
+                .await
+                .expect("second uni stream id should be readable"),
+            VarInt::from_u32(38)
+        );
     }
 
     #[tokio::test]

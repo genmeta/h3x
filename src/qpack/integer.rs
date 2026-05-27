@@ -94,6 +94,14 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn integer_new_stores_value() {
+        let integer = Integer::new(42);
+
+        assert_eq!(integer.value(), 42);
+        assert_eq!(integer, Integer::new(42));
+    }
+
     async fn round_trip(n: u8, value: u64) {
         let mut buf = Vec::new();
         encode_integer(Cursor::new(&mut buf), 0, n, value)

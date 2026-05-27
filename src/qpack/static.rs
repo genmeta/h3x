@@ -309,4 +309,15 @@ mod tests {
         assert_eq!(get(25), Some((":status", "200")));
         assert_eq!(get(98), Some(("x-frame-options", "sameorigin")));
     }
+
+    #[test]
+    fn test_static_table_name_and_value_accessors() {
+        assert_eq!(get_name(0), Some(":authority"));
+        assert_eq!(get_name(98), Some("x-frame-options"));
+        assert_eq!(get_name(99), None);
+
+        assert_eq!(get_value(0), Some(""));
+        assert_eq!(get_value(98), Some("sameorigin"));
+        assert_eq!(get_value(99), None);
+    }
 }

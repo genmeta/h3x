@@ -505,6 +505,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_latches_default_wait_error_when_wait_is_unset() {
+        let lc = TestLifecycle::new();
+
+        let got = quic::Lifecycle::closed(&lc).await;
+
+        assert_eq!(error_kind(&got), VarInt::from_u32(99));
+        assert_eq!(
+            error_kind(&lc.latch.check().unwrap_err()),
+            VarInt::from_u32(99)
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_success_returns_value_without_latching_error() {
+        let lc = TestLifecycle::new();
+
+        let out = lc.guard(async { Ok::<_, ConnectionError>(31) }).await;
+
+        assert_eq!(out.unwrap(), 31);
+        assert!(lc.latch.check().is_ok());
+    }
+
+    #[tokio::test]
     async fn guard_does_not_poll_operation_after_failed_check() {
         let lc = TestLifecycle::new();
         lc.set_probe(make_err(16));
@@ -565,6 +588,46 @@ mod tests {
         assert_eq!(out.unwrap(), 7);
     }
 
+    #[tokio::test]
+    async fn guard_with_error_maps_and_latches_first_error() {
+        let lc = TestLifecycle::new();
+        let map_calls = Mutex::new(Vec::new());
+
+        let first: Result<(), ConnectionError> = lc
+            .guard_with(async { Err::<(), _>(32) }, |tag| {
+                map_calls.lock().unwrap().push(tag);
+                make_err(tag)
+            })
+            .await;
+
+        assert_eq!(error_kind(&first.unwrap_err()), VarInt::from_u32(32));
+        assert_eq!(map_calls.lock().unwrap().as_slice(), &[32]);
+
+        let second_map_called = Mutex::new(false);
+        let second: Result<(), ConnectionError> = lc
+            .guard_with(async { Err::<(), _>(33) }, |_| {
+                *second_map_called.lock().unwrap() = true;
+                make_err(33)
+            })
+            .await;
+
+        assert_eq!(error_kind(&second.unwrap_err()), VarInt::from_u32(32));
+        assert!(
+            !*second_map_called.lock().unwrap(),
+            "map_err must stay lazy after an error is latched"
+        );
+    }
+
+    #[test]
+    fn guard_sync_success_returns_value_without_latching_error() {
+        let lc = TestLifecycle::new();
+
+        let out = lc.guard_sync(|| Ok::<_, ConnectionError>(34)).unwrap();
+
+        assert_eq!(out, 34);
+        assert!(lc.latch.check().is_ok());
+    }
+
     #[test]
     fn guard_sync_latches_only_first_error() {
         let lc = TestLifecycle::new();
@@ -580,6 +643,42 @@ mod tests {
             }
             _ => panic!("unexpected error shape"),
         }
+    }
+
+    #[test]
+    fn guard_sync_with_error_maps_and_latches_first_error() {
+        let lc = TestLifecycle::new();
+        let map_calls = Mutex::new(Vec::new());
+
+        let first = lc
+            .guard_sync_with(
+                || Err::<(), _>(35),
+                |tag| {
+                    map_calls.lock().unwrap().push(tag);
+                    make_err(tag)
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(error_kind(&first), VarInt::from_u32(35));
+        assert_eq!(map_calls.lock().unwrap().as_slice(), &[35]);
+
+        let second_map_called = Mutex::new(false);
+        let second = lc
+            .guard_sync_with(
+                || Err::<(), _>(36),
+                |_| {
+                    *second_map_called.lock().unwrap() = true;
+                    make_err(36)
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(error_kind(&second), VarInt::from_u32(35));
+        assert!(
+            !*second_map_called.lock().unwrap(),
+            "map_err must stay lazy after an error is latched"
+        );
     }
 
     #[test]
