@@ -282,11 +282,24 @@ mod tests {
         }
     }
 
+    fn make_app_err(tag: u32) -> ConnectionError {
+        ConnectionError::Application {
+            source: quic::ApplicationError {
+                code: Code::new(VarInt::from_u32(tag)),
+                reason: format!("test-app-{tag}").into(),
+            },
+        }
+    }
+
     fn error_kind(error: &ConnectionError) -> VarInt {
         match error {
             ConnectionError::Transport { source } => source.kind,
             _ => panic!("unexpected error shape"),
         }
+    }
+
+    fn ok_unit() -> Result<(), ConnectionError> {
+        Ok(())
     }
 
     /// Minimal container used to exercise the sealed trait.
@@ -406,6 +419,20 @@ mod tests {
     }
 
     #[test]
+    fn close_does_not_install_terminal_error() {
+        let lc = TestLifecycle::new();
+
+        quic::Lifecycle::close(
+            &lc,
+            Code::new(VarInt::from_u32(19)),
+            Cow::Borrowed("local close"),
+        );
+
+        assert!(lc.latch.check().is_ok());
+        assert!(quic::Lifecycle::check(&lc).is_ok());
+    }
+
+    #[test]
     fn check_with_probe_folds_probe_into_latch() {
         let lc = TestLifecycle::new();
         lc.set_probe(make_err(42));
@@ -448,6 +475,26 @@ mod tests {
             !*called.lock().unwrap(),
             "probe must not run after a terminal error is latched"
         );
+    }
+
+    #[test]
+    fn check_with_probe_preserves_application_error_shape() {
+        let lc = TestLifecycle::new();
+        lc.set_probe(make_app_err(25));
+
+        let e1 = quic::Lifecycle::check(&lc).unwrap_err();
+        let e2 = quic::Lifecycle::check(&lc).unwrap_err();
+
+        match (&e1, &e2) {
+            (
+                ConnectionError::Application { source: s1 },
+                ConnectionError::Application { source: s2 },
+            ) => {
+                assert_eq!(s1.code, Code::new(VarInt::from_u32(25)));
+                assert_eq!(s2.code, Code::new(VarInt::from_u32(25)));
+            }
+            _ => panic!("unexpected error shape"),
+        }
     }
 
     #[tokio::test]
@@ -580,6 +627,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guard_with_skips_operation_and_mapping_after_failed_check() {
+        let lc = TestLifecycle::new();
+        lc.set_probe(make_err(26));
+
+        let err = tokio::time::timeout(
+            Duration::from_millis(50),
+            lc.guard_with(
+                std::future::pending::<Result<(), ConnectionError>>(),
+                std::convert::identity,
+            ),
+        )
+        .await
+        .expect("guard_with must return before polling the pending operation")
+        .unwrap_err();
+
+        assert_eq!(error_kind(&err), VarInt::from_u32(26));
+    }
+
+    #[tokio::test]
     async fn guard_with_success_is_untouched() {
         let lc = TestLifecycle::new();
         let out: Result<i32, ConnectionError> = lc
@@ -622,10 +688,19 @@ mod tests {
     fn guard_sync_success_returns_value_without_latching_error() {
         let lc = TestLifecycle::new();
 
-        let out = lc.guard_sync(|| Ok::<_, ConnectionError>(34)).unwrap();
+        lc.guard_sync(ok_unit).unwrap();
 
-        assert_eq!(out, 34);
         assert!(lc.latch.check().is_ok());
+    }
+
+    #[test]
+    fn guard_sync_skips_operation_after_failed_check() {
+        let lc = TestLifecycle::new();
+        lc.set_probe(make_err(28));
+
+        let err = lc.guard_sync(ok_unit).unwrap_err();
+
+        assert_eq!(error_kind(&err), VarInt::from_u32(28));
     }
 
     #[test]
