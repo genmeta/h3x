@@ -77,27 +77,22 @@ impl ConnectionErrorLatch {
         Self::default()
     }
 
-    /// Lazy latch: only calls `f` when no error is latched yet.
+    /// Lazy latch: only calls `f` when no error is latched at entry.
     ///
-    /// Returns the canonical (first-wins) error.
+    /// If another setter wins the race after `f` constructs an error, returns
+    /// the already-latched canonical (first-wins) error instead of the losing
+    /// candidate.
     pub(crate) fn latch_with(&self, f: impl FnOnce() -> ConnectionError) -> ConnectionError {
         match self.terminal_error.peek() {
             Some(existing) => existing,
             None => {
                 let error = f();
-                let _ = self.terminal_error.set(error.clone());
-                error
+                match self.terminal_error.set(error.clone()) {
+                    Ok(()) => error,
+                    Err(rejected) => self.terminal_error.peek().unwrap_or(rejected),
+                }
             }
         }
-    }
-
-    /// Crate-internal shortcut equivalent to `latch_with(|| error)`.
-    ///
-    /// Intended for call sites that already own a concrete [`ConnectionError`]
-    /// (e.g. forwarding the terminal error out of `closed()` after the
-    /// underlying future resolved).
-    pub(crate) fn latch_raw(&self, error: ConnectionError) -> ConnectionError {
-        self.latch_with(|| error)
     }
 
     /// Return the latched error, if any.
@@ -188,7 +183,7 @@ pub trait LifecycleExt: quic::Lifecycle + HasLatch {
             return error;
         }
         let error = wait.await;
-        self.latch().latch_raw(error)
+        self.latch().latch_with(|| error)
     }
 
     /// Guard an async operation whose error is already a [`ConnectionError`].
@@ -269,7 +264,9 @@ impl<T: quic::Lifecycle + HasLatch + ?Sized> LifecycleExt for T {}
 mod tests {
     use std::{
         borrow::Cow,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, mpsc},
+        thread,
+        time::Duration,
     };
 
     use super::*;
@@ -282,6 +279,13 @@ mod tests {
                 frame_type: VarInt::from_u32(0),
                 reason: format!("test-{tag}").into(),
             },
+        }
+    }
+
+    fn error_kind(error: &ConnectionError) -> VarInt {
+        match error {
+            ConnectionError::Transport { source } => source.kind,
+            _ => panic!("unexpected error shape"),
         }
     }
 
@@ -357,6 +361,33 @@ mod tests {
             &again,
             ConnectionError::Transport { source } if source.kind == VarInt::from_u32(1)
         ));
+    }
+
+    #[test]
+    fn latch_with_returns_canonical_error_when_setter_races() {
+        let latch = ConnectionErrorLatch::new();
+        let slow_latch = latch.clone();
+        let fast_latch = latch.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+
+        let slow = thread::spawn(move || {
+            slow_latch.latch_with(|| {
+                entered_tx.send(()).unwrap();
+                thread::sleep(Duration::from_millis(100));
+                make_err(1)
+            })
+        });
+
+        entered_rx.recv().unwrap();
+
+        let fast = thread::spawn(move || fast_latch.latch_with(|| make_err(2)));
+
+        let slow_error = slow.join().unwrap();
+        let fast_error = fast.join().unwrap();
+        let canonical = latch.check().unwrap_err();
+
+        assert_eq!(error_kind(&slow_error), error_kind(&canonical));
+        assert_eq!(error_kind(&fast_error), error_kind(&canonical));
     }
 
     #[test]

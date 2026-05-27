@@ -38,10 +38,16 @@ use std::{future::Future, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 use tokio::net::UnixStream;
 use tracing::{Instrument, debug};
 
+/// WebTransport-flavoured lifecycle helpers for IPC-backed session handles.
+///
+/// IPC uses the same remoc control-plane and connection-error latch discipline
+/// as RPC WebTransport handles, so this module reuses the RPC helper trait
+/// directly while preserving the `ipc::webtransport::LifecycleExt` path.
+pub use crate::rpc::webtransport::LifecycleExt;
 use crate::{
     codec::{BoxReadStream, BoxWriteStream},
     ipc::{
@@ -52,96 +58,11 @@ use crate::{
         transport::{FdRegistry, FdSender},
     },
     quic::{self, ConnectionError, DynLifecycle, GetStreamIdExt},
-    rpc::lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt as ConnectionLifecycleExt},
+    rpc::lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt as _},
     stream_id::StreamId,
     varint::VarInt,
-    webtransport::{
-        self, AcceptStreamError, OpenStreamError, SessionClosed, accept_stream_error,
-        open_stream_error,
-    },
+    webtransport::{self, AcceptStreamError, OpenStreamError, SessionClosed},
 };
-
-/// WebTransport-flavoured lifecycle helpers for IPC-backed session handles.
-///
-/// The trait is intentionally named `LifecycleExt`; the module namespace
-/// (`ipc::webtransport::LifecycleExt`) carries the domain. It uses the same
-/// connection-error latch as the IPC connection handle and maps IPC
-/// WebTransport operations into [`OpenStreamError`] /
-/// [`AcceptStreamError`].
-///
-/// Implementers still must satisfy the latch-aware lifecycle invariant from
-/// [`crate::rpc::lifecycle`]: their [`quic::Lifecycle`] implementation must
-/// consult and resolve the same latch used by these guard helpers.
-#[allow(async_fn_in_trait)]
-pub trait LifecycleExt: ConnectionLifecycleExt {
-    /// Check liveness and surface any error as an [`OpenStreamError`].
-    fn check_open(&self) -> Result<(), OpenStreamError> {
-        quic::Lifecycle::check(self).context(open_stream_error::OpenSnafu)
-    }
-
-    /// Check liveness and surface any error as an [`AcceptStreamError`].
-    fn check_accept(&self) -> Result<(), AcceptStreamError> {
-        quic::Lifecycle::check(self).context(accept_stream_error::ConnectionSnafu)
-    }
-
-    /// Guard an async open operation whose error must be lazily converted to
-    /// an [`OpenStreamError`].
-    async fn guard_open_with<T, E, M>(
-        &self,
-        fut: impl Future<Output = Result<T, E>>,
-        convert_error: M,
-    ) -> Result<T, OpenStreamError>
-    where
-        M: FnOnce(E) -> OpenStreamError,
-    {
-        self.check_open()?;
-        match fut.await {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                if let Some(existing) = self.latch().peek() {
-                    return Err(OpenStreamError::Open { source: existing });
-                }
-                Err(match convert_error(e) {
-                    OpenStreamError::Open { source } => OpenStreamError::Open {
-                        source: self.latch().latch_with(|| source),
-                    },
-                    other => other,
-                })
-            }
-        }
-    }
-
-    /// Guard an async accept operation whose error carries richer information
-    /// than [`SessionClosed`].
-    async fn guard_accept_err<T, E, M>(
-        &self,
-        fut: impl Future<Output = Result<T, E>>,
-        convert_error: M,
-    ) -> Result<T, AcceptStreamError>
-    where
-        M: FnOnce(E) -> Option<ConnectionError>,
-    {
-        self.check_accept()?;
-        match fut.await {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                if let Some(existing) = self.latch().peek() {
-                    return Err(AcceptStreamError::Connection { source: existing });
-                }
-                if let Some(error) = convert_error(e) {
-                    return Err(AcceptStreamError::Connection {
-                        source: self.latch().latch_with(|| error),
-                    });
-                }
-                Err(AcceptStreamError::Closed {
-                    source: SessionClosed,
-                })
-            }
-        }
-    }
-}
-
-impl<T: ConnectionLifecycleExt + ?Sized> LifecycleExt for T {}
 
 // ---------------------------------------------------------------------------
 // IPC error types
