@@ -635,6 +635,15 @@ mod tests {
 
     #[test]
     fn stream_decode_critical_close_escalates_reset_and_incomplete() {
+        let escalated = StreamDecodeError::Connection {
+            source: connection_error("connection"),
+        }
+        .escalate_critical_close(|| connection_error("unused"));
+        let ConnectionDecodeError::Connection { source } = escalated else {
+            panic!("expected connection branch");
+        };
+        assert_connection_reason(&source, "connection");
+
         for error in [
             StreamDecodeError::Reset { code: varint(1) },
             StreamDecodeError::Decode {
@@ -656,6 +665,15 @@ mod tests {
             panic!("expected decode branch");
         };
         assert_eq!(source, DecodeError::InvalidHuffmanCode);
+    }
+
+    #[test]
+    fn stream_decode_error_recovers_plain_eof_as_incomplete_decode() {
+        let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "plain eof");
+        let StreamDecodeError::Decode { source } = StreamDecodeError::from(eof) else {
+            panic!("expected incomplete decode error");
+        };
+        assert_eq!(source, DecodeError::Incomplete);
     }
 
     #[test]
