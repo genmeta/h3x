@@ -232,7 +232,7 @@ mod tests {
 
     use bytes::Bytes;
     use dhttp_identity::identity as agent;
-    use futures::{Sink, Stream, StreamExt, future::pending};
+    use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, future::pending};
 
     use super::*;
     use crate::{
@@ -242,8 +242,12 @@ mod tests {
         quic,
     };
 
-    const fn assert_send_sync<T: Send + Sync>() {}
-    const _: () = assert_send_sync::<WebTransportProtocol>();
+    #[test]
+    fn webtransport_protocol_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<WebTransportProtocol>();
+    }
 
     #[test]
     fn webtransport_constants_are_draft15_values() {
@@ -1069,6 +1073,201 @@ mod tests {
             format!("{protocol:?}"),
             "WebTransportProtocol { sessions: 1 }"
         );
+    }
+
+    #[tokio::test]
+    async fn test_stream_doubles_delegate_stream_id_stop_cancel_and_sink_operations() {
+        use quic::{CancelStreamExt as _, GetStreamIdExt as _, StopStreamExt as _};
+
+        let state = Arc::new(StreamState::default());
+
+        let mut reader = TestReadStream {
+            state: state.clone(),
+            chunks: VecDeque::from([Ok(Bytes::from_static(b"payload"))]),
+        };
+        assert_eq!(
+            reader
+                .stream_id()
+                .await
+                .expect("reader stream id should be available"),
+            VarInt::from_u32(0)
+        );
+        assert_eq!(
+            reader
+                .next()
+                .await
+                .expect("reader should yield chunk")
+                .expect("chunk should succeed"),
+            Bytes::from_static(b"payload")
+        );
+        reader
+            .stop(VarInt::from_u32(0x11))
+            .await
+            .expect("reader stop should succeed");
+        assert_eq!(state.stopped_codes(), vec![VarInt::from_u32(0x11)]);
+
+        let mut writer = TestWriteStream {
+            state: state.clone(),
+        };
+        assert_eq!(
+            writer
+                .stream_id()
+                .await
+                .expect("writer stream id should be available"),
+            VarInt::from_u32(0)
+        );
+        writer
+            .send(Bytes::from_static(b"ignored"))
+            .await
+            .expect("test writer sink send should succeed");
+        writer
+            .flush()
+            .await
+            .expect("test writer sink flush should succeed");
+        writer
+            .close()
+            .await
+            .expect("test writer sink close should succeed");
+        writer
+            .cancel(VarInt::from_u32(0x12))
+            .await
+            .expect("writer cancel should succeed");
+        assert_eq!(state.cancelled_codes(), vec![VarInt::from_u32(0x12)]);
+
+        let failing_reader_state = Arc::new(StreamState::with_stop_error());
+        let mut failing_reader = TestReadStream {
+            state: failing_reader_state.clone(),
+            chunks: VecDeque::new(),
+        };
+        let error = failing_reader
+            .stop(VarInt::from_u32(0x13))
+            .await
+            .expect_err("configured stop error should surface");
+        assert!(error.is_reset());
+        assert_eq!(
+            failing_reader_state.stopped_codes(),
+            vec![VarInt::from_u32(0x13)]
+        );
+
+        let failing_writer_state = Arc::new(StreamState::with_stop_and_cancel_errors());
+        let mut failing_writer = TestWriteStream {
+            state: failing_writer_state.clone(),
+        };
+        let error = failing_writer
+            .cancel(VarInt::from_u32(0x14))
+            .await
+            .expect_err("configured cancel error should surface");
+        assert!(error.is_reset());
+        assert_eq!(
+            failing_writer_state.cancelled_codes(),
+            vec![VarInt::from_u32(0x14)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connection_double_delegates_agents_lifecycle_and_pending_streams() {
+        let conn = TestConnection;
+
+        assert!(
+            quic::ManageStream::open_bi(&conn).now_or_never().is_none(),
+            "test open_bi should remain pending"
+        );
+        assert!(
+            quic::ManageStream::open_uni(&conn).now_or_never().is_none(),
+            "test open_uni should remain pending"
+        );
+        assert!(
+            quic::ManageStream::accept_bi(&conn)
+                .now_or_never()
+                .is_none(),
+            "test accept_bi should remain pending"
+        );
+        assert!(
+            quic::ManageStream::accept_uni(&conn)
+                .now_or_never()
+                .is_none(),
+            "test accept_uni should remain pending"
+        );
+
+        assert!(
+            quic::WithLocalAgent::local_agent(&conn)
+                .await
+                .expect("local agent lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            quic::WithRemoteAgent::remote_agent(&conn)
+                .await
+                .expect("remote agent lookup should succeed")
+                .is_none()
+        );
+        quic::Lifecycle::close(&conn, Code::H3_NO_ERROR, Cow::Borrowed("test close"));
+        quic::Lifecycle::check(&conn).expect("test connection should remain open");
+        assert!(
+            quic::Lifecycle::closed(&conn).now_or_never().is_none(),
+            "test closed future should remain pending"
+        );
+
+        let dyn_conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection);
+        assert!(
+            dyn_conn.open_bi().now_or_never().is_none(),
+            "dyn open_bi should delegate to the pending test connection"
+        );
+        assert!(
+            dyn_conn.open_uni().now_or_never().is_none(),
+            "dyn open_uni should delegate to the pending test connection"
+        );
+        assert!(
+            dyn_conn.accept_bi().now_or_never().is_none(),
+            "dyn accept_bi should delegate to the pending test connection"
+        );
+        assert!(
+            dyn_conn.accept_uni().now_or_never().is_none(),
+            "dyn accept_uni should delegate to the pending test connection"
+        );
+        assert!(
+            dyn_conn
+                .local_agent()
+                .await
+                .expect("dyn local agent lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            dyn_conn
+                .remote_agent()
+                .await
+                .expect("dyn remote agent lookup should succeed")
+                .is_none()
+        );
+        dyn_conn.close(Code::H3_NO_ERROR, Cow::Borrowed("dyn test close"));
+        dyn_conn
+            .check()
+            .expect("dyn test connection should remain open");
+        assert!(
+            dyn_conn.closed().now_or_never().is_none(),
+            "dyn closed future should delegate to the pending test connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_doubles_expose_identity_metadata_and_signing() {
+        let local = TestLocalAgent;
+        assert_eq!(agent::LocalAgent::name(&local), "test-local");
+        assert!(agent::LocalAgent::cert_chain(&local).is_empty());
+        assert_eq!(
+            agent::LocalAgent::sign_algorithm(&local),
+            rustls::SignatureAlgorithm::ED25519
+        );
+        assert_eq!(
+            agent::LocalAgent::sign(&local, rustls::SignatureScheme::ED25519, b"payload")
+                .await
+                .expect("test local agent signing should succeed"),
+            Vec::<u8>::new()
+        );
+
+        let remote = TestRemoteAgent;
+        assert_eq!(agent::RemoteAgent::name(&remote), "test-remote");
+        assert!(agent::RemoteAgent::cert_chain(&remote).is_empty());
     }
 
     #[derive(Debug, Default)]
