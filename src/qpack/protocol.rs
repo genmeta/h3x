@@ -541,6 +541,7 @@ mod tests {
     struct MockConnection {
         stream_calls: Arc<Mutex<Vec<&'static str>>>,
         open_uni_available: bool,
+        closed_pending: bool,
     }
 
     impl MockConnection {
@@ -548,6 +549,15 @@ mod tests {
             Self {
                 stream_calls: Arc::default(),
                 open_uni_available,
+                closed_pending: false,
+            }
+        }
+
+        fn with_open_uni_available_and_pending_close(open_uni_available: bool) -> Self {
+            Self {
+                stream_calls: Arc::default(),
+                open_uni_available,
+                closed_pending: true,
             }
         }
 
@@ -634,7 +644,11 @@ mod tests {
         }
 
         async fn closed(&self) -> quic::ConnectionError {
-            test_connection_error("connection closed")
+            if self.closed_pending {
+                std::future::pending().await
+            } else {
+                test_connection_error("connection closed")
+            }
         }
     }
 
@@ -1093,6 +1107,64 @@ mod tests {
         assert_eq!(
             format!("{protocol:?}"),
             "QPackLayer { encoder: \"...\", decoder: \"...\" }"
+        );
+    }
+
+    #[tokio::test]
+    async fn qpack_protocol_factory_routes_peer_encoder_stream_to_decoder_instruction_receiver() {
+        let conn = Arc::new(MockConnection::with_open_uni_available_and_pending_close(
+            true,
+        ));
+        let mut settings = Settings::default();
+        settings.set(crate::qpack::settings::QpackMaxTableCapacity::setting(
+            VarInt::from_u32(64),
+        ));
+        let mut dhttp = DHttpProtocolFactory::default()
+            .init(&conn)
+            .await
+            .expect("dhttp init");
+        Arc::get_mut(&mut dhttp.state)
+            .expect("test dhttp state should be uniquely owned")
+            .local_settings = Arc::new(settings);
+        let mut protocols = Protocols::new();
+        protocols.insert(dhttp);
+
+        let protocol = QPackProtocolFactory::new()
+            .init(&conn, &protocols)
+            .await
+            .expect("qpack init");
+
+        let encoder_stream = peekable_uni_from_bytes(&[
+            0x02, // QPACK encoder stream type
+            0x3f, 0x21, // SetDynamicTableCapacity { capacity: 64 }
+            0x41, b'x', // literal name "x"
+            0x01, b'y', // literal value "y"
+        ])
+        .await;
+        assert!(matches!(
+            protocol
+                .accept_uni(encoder_stream)
+                .await
+                .expect("encoder stream verdict"),
+            StreamVerdict::Accepted
+        ));
+
+        protocol
+            .decoder
+            .receive_instruction_until(1)
+            .await
+            .expect("peer encoder instruction stream should reach qpack decoder");
+
+        let state = protocol.decoder.state.lock().expect("decoder state lock");
+        assert_eq!(state.dynamic_table.capacity, 64);
+        assert_eq!(state.dynamic_table.inserted_count, 1);
+        assert_eq!(
+            state.dynamic_table.get(0).expect("inserted entry").name,
+            Bytes::from_static(b"x")
+        );
+        assert_eq!(
+            state.dynamic_table.get(0).expect("inserted entry").value,
+            Bytes::from_static(b"y")
         );
     }
 

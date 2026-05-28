@@ -259,6 +259,23 @@ mod tests {
         ));
     }
 
+    fn test_transport_error(reason: &'static str) -> quic::ConnectionError {
+        quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(0x01),
+                frame_type: VarInt::from_u32(0x00),
+                reason: reason.into(),
+            },
+        }
+    }
+
+    fn assert_transport_error_reason(error: &quic::ConnectionError, expected: &str) {
+        let quic::ConnectionError::Transport { source } = error else {
+            panic!("expected transport connection error");
+        };
+        assert_eq!(source.reason.as_ref(), expected);
+    }
+
     async fn stream_reader_from_frames(
         frames: impl IntoIterator<Item = Frame<BufList>>,
     ) -> StreamReader<BoxReadStream> {
@@ -919,6 +936,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_goawaies_yields_connection_error_when_connection_closes() {
+        let quic = Arc::new(MockConnection::new());
+        let erased_connection: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased_connection));
+        let state = ConnectionState::new_for_test(quic.clone(), Arc::new(protocols));
+        quic.set_terminal_error(test_transport_error("peer goawaies closed"));
+
+        let mut goawaies = pin!(state.peer_goawaies());
+        let error = timeout(Duration::from_millis(100), goawaies.next())
+            .await
+            .expect("peer goaway stream should resolve")
+            .expect("peer goaway stream should not end")
+            .expect_err("connection closure should yield an error");
+
+        assert_transport_error_reason(&error, "peer goawaies closed");
+    }
+
+    #[tokio::test]
     async fn goaway_sends_local_goaway_using_max_received_stream_id() {
         let state = test_connection_state();
         state
@@ -954,6 +990,26 @@ mod tests {
         );
         assert_eq!(state.max_initialized_stream_id(), Some(VarInt::from_u32(0)));
         assert_eq!(quic.stream_calls(), vec!["open_bi"]);
+    }
+
+    #[tokio::test]
+    async fn accept_raw_message_stream_returns_connection_error_when_connection_closes() {
+        let quic = Arc::new(MockConnection::new());
+        let erased_connection: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased_connection));
+        let state = ConnectionState::new_for_test(quic.clone(), Arc::new(protocols));
+        quic.set_terminal_error(test_transport_error("accept raw closed"));
+
+        let error = match state.accept_raw_message_stream().await {
+            Ok(_) => panic!("connection closure should stop raw message acceptance"),
+            Err(error) => error,
+        };
+        let AcceptRawMessageStreamError::Connection { source } = error else {
+            panic!("expected connection error");
+        };
+
+        assert_transport_error_reason(&source, "accept raw closed");
     }
 
     #[tokio::test]

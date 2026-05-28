@@ -341,6 +341,7 @@ mod tests {
     };
 
     use bytes::Buf;
+    use tokio::io::AsyncWriteExt;
 
     use super::*;
     use crate::{
@@ -370,6 +371,43 @@ mod tests {
                     source: quic_connection_error(),
                 },
             }
+        }
+    }
+
+    struct FailAfterWrites {
+        successful_writes_before_failure: usize,
+        error: quic::StreamError,
+    }
+
+    impl FailAfterWrites {
+        fn new(successful_writes_before_failure: usize, error: quic::StreamError) -> Self {
+            Self {
+                successful_writes_before_failure,
+                error,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FailAfterWrites {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.successful_writes_before_failure == 0 {
+                return Poll::Ready(Err(io::Error::from(self.error.clone())));
+            }
+
+            self.successful_writes_before_failure -= 1;
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -613,6 +651,10 @@ mod tests {
 
     #[tokio::test]
     async fn setting_encode_maps_reset_to_closed_control_stream_and_preserves_connection_errors() {
+        let mut idle_writer = FailWrite::reset(VarInt::from_u32(0));
+        idle_writer.flush().await.expect("flush succeeds");
+        idle_writer.shutdown().await.expect("shutdown succeeds");
+
         let reset_code = VarInt::from_u32(77);
         let error = Setting::new(MaxFieldSectionSize::ID, VarInt::from_u32(1))
             .encode_into(FailWrite::reset(reset_code))
@@ -642,6 +684,30 @@ mod tests {
                 .await
                 .expect_err("fill_buf connection error must fail");
         assert_quic_connection_error(connection);
+    }
+
+    #[tokio::test]
+    async fn setting_encode_maps_value_write_reset_to_closed_control_stream() {
+        let mut idle_writer = FailAfterWrites::new(
+            1,
+            quic::StreamError::Reset {
+                code: VarInt::from_u32(0),
+            },
+        );
+        idle_writer.flush().await.expect("flush succeeds");
+        idle_writer.shutdown().await.expect("shutdown succeeds");
+
+        let error = Setting::new(MaxFieldSectionSize::ID, VarInt::from_u32(4096))
+            .encode_into(FailAfterWrites::new(
+                1,
+                quic::StreamError::Reset {
+                    code: VarInt::from_u32(123),
+                },
+            ))
+            .await
+            .expect_err("value write reset must fail");
+
+        assert_h3_connection_code(error, Code::H3_CLOSED_CRITICAL_STREAM);
     }
 
     #[tokio::test]
