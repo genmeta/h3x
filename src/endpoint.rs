@@ -1890,6 +1890,14 @@ mod tests {
         })
         .await
         .expect("failing request handler task should run once");
+
+        // calls is incremented inside Service::call before the returned Ready future
+        // is polled. Yield additional times so the spawned serve_request task observes
+        // the ready error and runs the diagnostic logging branch before the runtime
+        // is torn down.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test]
