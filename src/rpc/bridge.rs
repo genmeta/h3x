@@ -486,7 +486,7 @@ mod tests {
     use futures::{FutureExt, SinkExt, StreamExt, future::poll_fn};
 
     use super::*;
-    use crate::quic::{CancelStreamExt, GetStreamIdExt, StopStreamExt};
+    use crate::quic::{CancelStream, CancelStreamExt, GetStreamIdExt, StopStream, StopStreamExt};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Event {
@@ -552,6 +552,14 @@ mod tests {
             .lock()
             .expect("events mutex should not be poisoned")
             .clone()
+    }
+
+    /// Take the value out of `Arc<Mutex<Option<T>>>` without holding the
+    /// guard across an await point (clippy: `await_holding_lock`).
+    fn take_locked<T>(slot: &Mutex<Option<T>>) -> Option<T> {
+        slot.lock()
+            .expect("slot mutex should not be poisoned")
+            .take()
     }
 
     #[tokio::test]
@@ -891,5 +899,409 @@ mod tests {
                 Event::Cancel(59),
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn read_bridge_poll_next_observes_read_right_and_retries() {
+        // Drive poll_next through the `Either::Right` branch (lines 129-132):
+        // the read closure returns `Right(stream)` once, which forces the
+        // state machine back to `Stream` and re-invokes the read closure.
+        let stream_id = VarInt::from_u32(101);
+        let attempts = Arc::new(Mutex::new(0_u32));
+        let client = TestReadClient::new([Some(Ok(Bytes::from_static(b"second")))]);
+        let attempts_for_closure = attempts.clone();
+        let mut bridge = Box::pin(ReadBridge::<_, quic::StreamError, _, _, _, _>::new(
+            stream_id,
+            client,
+            move |mut client: TestReadClient, _token: CancellationToken| {
+                let attempts = attempts_for_closure.clone();
+                async move {
+                    let mut guard = attempts.lock().expect("attempts");
+                    *guard += 1;
+                    if *guard == 1 {
+                        Either::Right(client)
+                    } else {
+                        let result = client.chunks.pop_front().expect("scripted read result");
+                        Either::Left((client, result))
+                    }
+                }
+            },
+            |client: TestReadClient, _code: VarInt| async move { (client, Ok(())) },
+        ));
+
+        let chunk = bridge.next().await.expect("chunk").expect("read ok");
+        assert_eq!(chunk, Bytes::from_static(b"second"));
+        assert_eq!(*attempts.lock().expect("attempts"), 2);
+    }
+
+    #[tokio::test]
+    async fn read_bridge_poll_next_drains_pending_stop_future() {
+        // Drive poll_next through the `Stop` arm (lines 134-137): we leave the
+        // bridge in `Stop` state by issuing poll_stop while the stop future is
+        // pending, then call poll_next which must drain the same future.
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let stop_rx = Arc::new(Mutex::new(Some(stop_rx)));
+        let mut bridge = Box::pin(ReadBridge::<_, quic::StreamError, _, _, _, _>::new(
+            VarInt::from_u32(102),
+            TestReadClient::new([Some(Ok(Bytes::from_static(b"data")))]),
+            |mut client: TestReadClient, _token: CancellationToken| async move {
+                let result = client.chunks.pop_front().expect("scripted read result");
+                Either::Left((client, result))
+            },
+            move |client: TestReadClient, _code: VarInt| {
+                let stop_rx = stop_rx.clone();
+                async move {
+                    let rx = stop_rx
+                        .lock()
+                        .expect("stop_rx mutex")
+                        .take()
+                        .expect("stop_rx taken once");
+                    let _ = rx.await;
+                    (client, Ok(()))
+                }
+            },
+        ));
+
+        // First poll_stop call: stop future is pending (waiting on stop_rx).
+        assert!(
+            poll_fn(|cx| bridge.as_mut().poll_stop(cx, VarInt::from_u32(7)))
+                .now_or_never()
+                .is_none(),
+            "stop should remain pending until released"
+        );
+
+        // Now poll_next: bridge is in Stop state, hits lines 134-137.
+        // Spawn poll_next on a separate task and release the stop after.
+        let next_pending = poll_fn(|cx| bridge.as_mut().poll_next(cx)).now_or_never();
+        assert!(next_pending.is_none(), "poll_next observes pending Stop");
+
+        // Release the stop future and let poll_next loop back into Stream.
+        stop_tx.send(()).expect("send stop release");
+        let chunk = bridge.next().await.expect("chunk").expect("read ok");
+        assert_eq!(chunk, Bytes::from_static(b"data"));
+    }
+
+    #[tokio::test]
+    async fn read_bridge_poll_stop_propagates_completed_read_data() {
+        // Drive poll_stop through the `Read` arm's `Either::Left` pattern
+        // (lines 179-181 Left): poll_next leaves a Read future in flight, but
+        // the future completes with data (Left) when stop polls it.
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel::<()>();
+        let read_rx = Arc::new(Mutex::new(Some(read_rx)));
+        let mut bridge = Box::pin(ReadBridge::<_, quic::StreamError, _, _, _, _>::new(
+            VarInt::from_u32(103),
+            TestReadClient::new([Some(Ok(Bytes::from_static(b"raced")))]),
+            move |mut client: TestReadClient, _token: CancellationToken| {
+                let read_rx = read_rx.clone();
+                async move {
+                    // Wait on an external signal that is independent of the
+                    // cancellation token; once released, return Left with data.
+                    let rx = read_rx
+                        .lock()
+                        .expect("read_rx mutex")
+                        .take()
+                        .expect("read_rx taken once");
+                    let _ = rx.await;
+                    let result = client.chunks.pop_front().expect("scripted read");
+                    Either::Left((client, result))
+                }
+            },
+            |client: TestReadClient, _code: VarInt| async move { (client, Ok(())) },
+        ));
+
+        // Start a read: it parks waiting on read_rx.
+        assert!(
+            poll_fn(|cx| bridge.as_mut().poll_next(cx))
+                .now_or_never()
+                .is_none(),
+            "read should remain pending"
+        );
+
+        // Release the read future; it will resolve to Left when polled next.
+        read_tx.send(()).expect("send read release");
+
+        // poll_stop sees Read state, polls future which returns Left(stream, data).
+        bridge
+            .stop(VarInt::from_u32(11))
+            .await
+            .expect("stop after completed read");
+    }
+
+    #[tokio::test]
+    async fn read_bridge_poll_stop_replaces_future_when_code_differs() {
+        // Drive poll_stop through the `Stop` arm where the in-flight stop's
+        // code differs from the new code (lines 189-191): poll_stop must
+        // resolve the pending stop and immediately issue a new one.
+        let calls = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let gate_rx = Arc::new(Mutex::new(Some(gate_rx)));
+        let calls_for_closure = calls.clone();
+        let mut bridge = Box::pin(ReadBridge::<_, quic::StreamError, _, _, _, _>::new(
+            VarInt::from_u32(104),
+            TestReadClient::new([]),
+            |client: TestReadClient, _token: CancellationToken| async move {
+                std::future::pending::<()>().await;
+                Either::Right(client)
+            },
+            move |client: TestReadClient, code: VarInt| {
+                let calls = calls_for_closure.clone();
+                let gate_rx = gate_rx.clone();
+                async move {
+                    calls.lock().expect("calls").push(code.into_inner());
+                    if let Some(rx) = take_locked(&gate_rx) {
+                        let _ = rx.await;
+                    }
+                    (client, Ok(()))
+                }
+            },
+        ));
+
+        // First stop: pending because gate is closed.
+        assert!(
+            poll_fn(|cx| bridge.as_mut().poll_stop(cx, VarInt::from_u32(21)))
+                .now_or_never()
+                .is_none(),
+            "first stop pending"
+        );
+        // Second stop with a different code: poll the future once to consume
+        // the in-flight (different-code) stop, then it must issue a new stop.
+        let pending =
+            poll_fn(|cx| bridge.as_mut().poll_stop(cx, VarInt::from_u32(22))).now_or_never();
+        assert!(pending.is_none(), "second stop polled while gate closed");
+        // Release the gate; the first stop completes; the loop schedules a
+        // second stop call with code 22 (now uses the released stop closure).
+        gate_tx.send(()).expect("release gate");
+        bridge
+            .stop(VarInt::from_u32(22))
+            .await
+            .expect("stop completes with new code");
+
+        let recorded = calls.lock().expect("calls").clone();
+        assert_eq!(recorded.first().copied(), Some(21));
+        assert!(recorded.contains(&22), "second stop must be issued");
+    }
+
+    #[tokio::test]
+    async fn write_bridge_poll_ready_drains_pending_cancel_future() {
+        // Drive poll_ready through the `Cancel` arm (lines 352-355): if a
+        // cancel future is in flight, poll_ready must drain it.
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let cancel_rx = Arc::new(Mutex::new(Some(cancel_rx)));
+        let mut bridge = Box::pin(
+            WriteBridge::<_, quic::StreamError, _, _, _, _, _, _, _, _>::new(
+                VarInt::from_u32(204),
+                TestWriteClient::new(),
+                |client: TestWriteClient, _token: CancellationToken, _bytes: Bytes| async move {
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    Either::Left((client, Ok(())))
+                },
+                move |client: TestWriteClient, _code: VarInt| {
+                    let cancel_rx = cancel_rx.clone();
+                    async move {
+                        if let Some(rx) = take_locked(&cancel_rx) {
+                            let _ = rx.await;
+                        }
+                        (client, Ok(()))
+                    }
+                },
+            ),
+        );
+
+        // Drive bridge into Cancel state with a pending cancel future.
+        assert!(
+            poll_fn(|cx| bridge.as_mut().poll_cancel(cx, VarInt::from_u32(31)))
+                .now_or_never()
+                .is_none(),
+            "cancel should be pending until released"
+        );
+
+        // poll_ready now sees Cancel state and must drain it (lines 352-355).
+        assert!(
+            poll_fn(|cx| bridge.as_mut().poll_ready(cx))
+                .now_or_never()
+                .is_none(),
+            "poll_ready observes pending Cancel"
+        );
+
+        // Release the cancel; the drained Cancel result loops to Stream, then
+        // poll_ready returns Ready.
+        cancel_tx.send(()).expect("release cancel");
+        poll_fn(|cx| bridge.as_mut().poll_ready(cx))
+            .await
+            .expect("poll_ready completes once cancel drains");
+    }
+
+    #[tokio::test]
+    async fn write_bridge_poll_cancel_propagates_completed_operation() {
+        // Drive poll_cancel through the in-flight Write/Flush/Shutdown
+        // `Either::Left` patterns (lines 444 / 450 / 456 Left): the in-flight
+        // operation completes with a result before being cancelled.
+        for operation in ["write", "flush", "shutdown"] {
+            let (op_tx, op_rx) = tokio::sync::oneshot::channel::<()>();
+            let op_rx = Arc::new(Mutex::new(Some(op_rx)));
+            let write_release = if operation == "write" {
+                Some(op_rx.clone())
+            } else {
+                None
+            };
+            let flush_release = if operation == "flush" {
+                Some(op_rx.clone())
+            } else {
+                None
+            };
+            let shutdown_release = if operation == "shutdown" {
+                Some(op_rx.clone())
+            } else {
+                None
+            };
+            let mut bridge = Box::pin(
+                WriteBridge::<_, quic::StreamError, _, _, _, _, _, _, _, _>::new(
+                    VarInt::from_u32(205),
+                    TestWriteClient::new(),
+                    move |client: TestWriteClient, _token: CancellationToken, _bytes: Bytes| {
+                        let release = write_release.clone();
+                        async move {
+                            if let Some(release) = release
+                                && let Some(rx) = take_locked(&release)
+                            {
+                                let _ = rx.await;
+                            }
+                            Either::Left((client, Ok(())))
+                        }
+                    },
+                    move |client: TestWriteClient, _token: CancellationToken| {
+                        let release = flush_release.clone();
+                        async move {
+                            if let Some(release) = release
+                                && let Some(rx) = take_locked(&release)
+                            {
+                                let _ = rx.await;
+                            }
+                            Either::Left((client, Ok(())))
+                        }
+                    },
+                    move |client: TestWriteClient, _token: CancellationToken| {
+                        let release = shutdown_release.clone();
+                        async move {
+                            if let Some(release) = release
+                                && let Some(rx) = take_locked(&release)
+                            {
+                                let _ = rx.await;
+                            }
+                            Either::Left((client, Ok(())))
+                        }
+                    },
+                    |client: TestWriteClient, _code: VarInt| async move { (client, Ok(())) },
+                ),
+            );
+
+            // Park the targeted operation.
+            match operation {
+                "write" => {
+                    poll_fn(|cx| bridge.as_mut().poll_ready(cx))
+                        .await
+                        .expect("ready");
+                    bridge
+                        .as_mut()
+                        .start_send(Bytes::from_static(b"x"))
+                        .expect("start send");
+                    assert!(
+                        poll_fn(|cx| bridge.as_mut().poll_flush(cx))
+                            .now_or_never()
+                            .is_none(),
+                        "flush observes pending write"
+                    );
+                }
+                "flush" => {
+                    assert!(
+                        poll_fn(|cx| bridge.as_mut().poll_flush(cx))
+                            .now_or_never()
+                            .is_none(),
+                        "flush pending"
+                    );
+                }
+                "shutdown" => {
+                    assert!(
+                        poll_fn(|cx| bridge.as_mut().poll_close(cx))
+                            .now_or_never()
+                            .is_none(),
+                        "shutdown pending"
+                    );
+                }
+                _ => unreachable!(),
+            }
+
+            // Release the operation so its future resolves to Left when
+            // poll_cancel polls it.
+            op_tx.send(()).expect("release op");
+
+            bridge
+                .cancel(VarInt::from_u32(41))
+                .await
+                .expect("cancel after completed op");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_bridge_poll_cancel_replaces_future_when_code_differs() {
+        // Drive poll_cancel through the `Cancel` arm where the in-flight
+        // cancel's code differs from the new code (lines 466-469).
+        let calls = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let gate_rx = Arc::new(Mutex::new(Some(gate_rx)));
+        let calls_for_closure = calls.clone();
+        let mut bridge = Box::pin(
+            WriteBridge::<_, quic::StreamError, _, _, _, _, _, _, _, _>::new(
+                VarInt::from_u32(206),
+                TestWriteClient::new(),
+                |client: TestWriteClient, _token: CancellationToken, _bytes: Bytes| async move {
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    Either::Left((client, Ok(())))
+                },
+                move |client: TestWriteClient, code: VarInt| {
+                    let calls = calls_for_closure.clone();
+                    let gate_rx = gate_rx.clone();
+                    async move {
+                        calls.lock().expect("calls").push(code.into_inner());
+                        if let Some(rx) = take_locked(&gate_rx) {
+                            let _ = rx.await;
+                        }
+                        (client, Ok(()))
+                    }
+                },
+            ),
+        );
+
+        // First cancel: pending because gate is closed.
+        assert!(
+            poll_fn(|cx| bridge.as_mut().poll_cancel(cx, VarInt::from_u32(51)))
+                .now_or_never()
+                .is_none(),
+            "first cancel pending"
+        );
+        // Second cancel with a different code: poll once to consume the
+        // in-flight cancel, then a new one with code 52 must be issued.
+        let pending =
+            poll_fn(|cx| bridge.as_mut().poll_cancel(cx, VarInt::from_u32(52))).now_or_never();
+        assert!(pending.is_none(), "second cancel polled while gate closed");
+        gate_tx.send(()).expect("release gate");
+        bridge
+            .cancel(VarInt::from_u32(52))
+            .await
+            .expect("cancel completes with new code");
+
+        let recorded = calls.lock().expect("calls").clone();
+        assert_eq!(recorded.first().copied(), Some(51));
+        assert!(recorded.contains(&52), "second cancel must be issued");
     }
 }
