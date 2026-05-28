@@ -100,6 +100,8 @@ impl<T: Clone> Future for Get<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use futures::FutureExt;
 
     use super::*;
@@ -131,14 +133,18 @@ mod tests {
         let value = SetOnce::new();
         assert_eq!(value.set(1), Ok(()));
 
-        let mut called = false;
+        let called = Cell::new(false);
         let factory = || {
-            called = true;
+            called.set(true);
             2
         };
 
-        assert!(value.set_with(factory).is_err());
-        assert!(!called);
+        let rejected = value
+            .set_with(factory)
+            .expect_err("factory should be returned when already set");
+        assert!(!called.get());
+        assert_eq!(rejected(), 2);
+        assert!(called.get());
         assert_eq!(value.peek(), Some(1));
     }
 

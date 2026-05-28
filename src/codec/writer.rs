@@ -304,6 +304,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_error_display_and_io_conversion_are_stable() {
+        assert_eq!(TestError("not ready").to_string(), "not ready");
+
+        let error = IoError::from(TestError("io bridge"));
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "io bridge");
+    }
+
     #[derive(Default)]
     struct RecordingSink {
         items: Vec<Bytes>,

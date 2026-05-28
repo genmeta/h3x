@@ -279,6 +279,10 @@ mod tests {
     #[snafu(display("test service failed"))]
     struct TestServiceError;
 
+    #[derive(Debug, snafu::Snafu)]
+    #[snafu(display("body failed"))]
+    struct TestBodyError;
+
     #[derive(Debug, Default)]
     struct ServiceState {
         ready: AtomicUsize,
@@ -608,16 +612,42 @@ mod tests {
 
     #[test]
     fn handle_request_error_from_body_error_preserves_variant() {
-        #[derive(Debug, snafu::Snafu)]
-        #[snafu(display("body failed"))]
-        struct TestBodyError;
-
         let error: HandleRequestError<TestServiceError, TestBodyError> = SendMessageError::Body {
             source: TestBodyError,
         }
         .into();
 
         assert!(matches!(error, HandleRequestError::Body { .. }));
+    }
+
+    #[test]
+    fn handle_request_error_from_stream_error_preserves_variant() {
+        let error: HandleRequestError<TestServiceError, TestBodyError> = SendMessageError::Stream {
+            source: MessageStreamError::Quic {
+                source: quic::StreamError::Reset {
+                    code: VarInt::from_u32(7),
+                },
+            },
+        }
+        .into();
+
+        assert!(matches!(error, HandleRequestError::Stream { .. }));
+    }
+
+    #[test]
+    fn handle_request_error_from_malformed_header_preserves_variant() {
+        let error: HandleRequestError<TestServiceError, TestBodyError> =
+            SendMessageError::MalformedHeader {
+                source: MalformedHeaderSection::ProtocolInNonConnectRequest,
+            }
+            .into();
+
+        assert!(matches!(
+            error,
+            HandleRequestError::MalformedHeader {
+                source: MalformedHeaderSection::ProtocolInNonConnectRequest
+            }
+        ));
     }
 
     #[test]

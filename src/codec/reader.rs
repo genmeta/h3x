@@ -518,6 +518,7 @@ mod tests {
     #[tokio::test]
     async fn stream_reader_accessors_mapping_and_io_paths() {
         let mut reader = StreamReader::new(byte_stream([&b""[..], &b"hello"[..], &b" world"[..]]));
+        assert_eq!(reader.size_hint(), (3, Some(3)));
         assert_eq!(reader.stream().size_hint(), (3, Some(3)));
         assert_eq!(reader.stream_mut().size_hint(), (3, Some(3)));
 
@@ -536,7 +537,7 @@ mod tests {
             pinned.as_mut().fill_buf().await.expect("fill buffered"),
             b"llo"
         );
-        pinned.as_mut().consume(3);
+        tokio::io::AsyncBufRead::consume(pinned.as_mut(), 3);
 
         assert_eq!(
             pinned
@@ -703,7 +704,7 @@ mod tests {
             &b"def"[..],
         ]))));
         assert_eq!(reader.as_mut().fill_buf().await.unwrap(), b"abc");
-        reader.as_mut().consume(2);
+        tokio::io::AsyncBufRead::consume(reader.as_mut(), 2);
         reader.as_mut().reset();
         assert_eq!(reader.as_mut().fill_buf().await.unwrap(), b"abc");
         reader.as_mut().consume(2);

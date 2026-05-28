@@ -480,7 +480,10 @@ mod tests {
         borrow::Cow,
         collections::hash_map::DefaultHasher,
         hash::{Hash, Hasher},
+        io,
+        pin::Pin,
         sync::{Arc, Mutex},
+        task::{Context, Poll},
     };
 
     use bytes::Bytes;
@@ -705,6 +708,39 @@ mod tests {
         assert_eq!(source.to_string(), expected_message);
     }
 
+    fn assert_critical_stream_closed(error: StreamError, expected_message: &str) {
+        let StreamError::Connection {
+            source: crate::connection::ConnectionError::H3 { source },
+        } = error
+        else {
+            panic!("expected h3 connection error");
+        };
+        assert_eq!(source.code(), Code::H3_CLOSED_CRITICAL_STREAM);
+        assert_eq!(source.to_string(), expected_message);
+    }
+
+    struct ResetWrite;
+
+    impl tokio::io::AsyncWrite for ResetWrite {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::from(quic::StreamError::Reset {
+                code: VarInt::from_u32(7),
+            })))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[test]
     fn qpack_factory_all_equal() {
         assert_eq!(QPackProtocolFactory::new(), QPackProtocolFactory::new());
@@ -812,6 +848,21 @@ mod tests {
                 .expect("decoder stream read"),
             Bytes::from_static(&[0x03]),
         );
+    }
+
+    #[tokio::test]
+    async fn qpack_initial_stream_helpers_map_reset_to_critical_stream_closed() {
+        let error = UnidirectionalStream::initial_qpack_encoder_stream(ResetWrite)
+            .await
+            .err()
+            .expect("encoder stream reset should be critical");
+        assert_critical_stream_closed(error, "qpack encoder stream closed unexpectedly");
+
+        let error = UnidirectionalStream::initial_qpack_decoder_stream(ResetWrite)
+            .await
+            .err()
+            .expect("decoder stream reset should be critical");
+        assert_critical_stream_closed(error, "qpack decoder stream closed unexpectedly");
     }
 
     #[tokio::test]
