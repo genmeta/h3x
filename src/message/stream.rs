@@ -1489,6 +1489,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peek_frame_replays_stored_frame_decode_error() {
+        let mut stream = read_stream_with_bytes(28, &[0x00]).await;
+
+        let first = stream
+            .peek_frame()
+            .await
+            .expect("malformed frame should produce an error");
+        let first = first.err().expect("truncated frame header should fail");
+        assert!(matches!(
+            first,
+            StreamError::Connection {
+                source: crate::connection::ConnectionError::H3 { source }
+            } if source.code() == Code::H3_FRAME_ERROR
+        ));
+
+        let replayed = stream
+            .peek_frame()
+            .await
+            .expect("stored frame error should still be visible");
+        let replayed = replayed
+            .err()
+            .expect("stored decode error should be replayed");
+        assert!(matches!(
+            replayed,
+            StreamError::Connection {
+                source: crate::connection::ConnectionError::H3 { source }
+            } if source.code() == Code::H3_FRAME_ERROR
+        ));
+    }
+
+    #[tokio::test]
     async fn read_header_frame_returns_none_when_next_frame_is_data() {
         let mut stream = read_stream_with_bytes(25, &[0x00, 0x03, b'a', b'b', b'c']).await;
 

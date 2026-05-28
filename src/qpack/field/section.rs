@@ -821,6 +821,62 @@ mod tests {
     }
 
     #[test]
+    fn wrong_pseudo_header_accessor_panics_are_preserved() {
+        fn assert_panics(operation: impl FnOnce()) {
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).is_err());
+        }
+
+        fn response_section() -> FieldSection {
+            FieldSection::header(PseudoHeaders::response(StatusCode::OK), HeaderMap::new())
+        }
+
+        fn request_section() -> FieldSection {
+            FieldSection::header(
+                PseudoHeaders::request(Method::GET, Uri::from_static("https://example.test/")),
+                HeaderMap::new(),
+            )
+        }
+
+        assert_panics(|| {
+            let _ = response_section().method();
+        });
+        assert_panics(|| response_section().set_method(Method::POST));
+        assert_panics(|| {
+            let _ = response_section().scheme();
+        });
+        assert_panics(|| response_section().set_scheme(Scheme::HTTPS));
+        assert_panics(|| {
+            let _ = response_section().authority();
+        });
+        assert_panics(|| response_section().set_authority(Authority::from_static("example.test")));
+        assert_panics(|| {
+            let _ = response_section().path();
+        });
+        assert_panics(|| response_section().set_path(PathAndQuery::from_static("/")));
+        assert_panics(|| {
+            let _ = response_section().protocol();
+        });
+        assert_panics(|| response_section().set_protocol(Protocol::new("webtransport")));
+        assert_panics(|| {
+            let _ = request_section().status();
+        });
+        assert_panics(|| request_section().set_status(StatusCode::OK));
+    }
+
+    #[test]
+    fn max_size_reached_converts_to_malformed_header_section() {
+        let error = HeaderMap::<HeaderValue>::try_with_capacity(usize::MAX)
+            .expect_err("oversized capacity should be rejected");
+
+        let error = MalformedHeaderSection::from(error);
+
+        assert!(matches!(
+            error,
+            MalformedHeaderSection::InvalidMessage { .. }
+        ));
+    }
+
+    #[test]
     fn check_pseudo_validates_request_authority_and_connect_rules() {
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("example.test"));
@@ -1181,6 +1237,52 @@ mod tests {
             source.to_string(),
             "pseudo-header field appears after regular header field"
         );
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_each_pseudo_header_after_regular_header() {
+        for (name, value) in [
+            (
+                b":protocol" as &'static [u8],
+                b"webtransport" as &'static [u8],
+            ),
+            (b":scheme", b"https"),
+            (b":authority", b"example.test"),
+            (b":path", b"/"),
+            (b":status", b"200"),
+            (b":unknown", b"value"),
+        ] {
+            let error = decode_fields([field(b"host", b"example.test"), field(name, value)])
+                .await
+                .expect_err("pseudo header after regular header should be rejected");
+
+            assert_h3_error(
+                error,
+                "pseudo-header field appears after regular header field",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_each_request_pseudo_header_after_response_pseudo_header() {
+        for (name, value) in [
+            (b":method" as &'static [u8], b"GET" as &'static [u8]),
+            (b":protocol", b"webtransport"),
+            (b":scheme", b"https"),
+            (b":authority", b"example.test"),
+            (b":path", b"/"),
+        ] {
+            let error = decode_fields([field(b":status", b"200"), field(name, value)])
+                .await
+                .expect_err(
+                    "request pseudo header after response pseudo header should be rejected",
+                );
+
+            assert_h3_error(
+                error,
+                "field section contains both request and response pseudo-header fields",
+            );
+        }
     }
 
     #[tokio::test]

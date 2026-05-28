@@ -341,6 +341,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_hyper_request_parts_rejects_response_pseudo_headers() {
+        let (mut reader, mut writer) = stream_pair(VarInt::from_u32(0));
+        writer
+            .send_hyper_response_parts(response_parts(http::StatusCode::OK))
+            .await
+            .expect("response header should be written");
+
+        let error = reader
+            .read_hyper_request_parts()
+            .await
+            .expect_err("response pseudo headers are malformed for requests");
+
+        assert!(matches!(error, MessageStreamError::Quic { .. }));
+    }
+
+    #[tokio::test]
+    async fn read_hyper_response_parts_rejects_request_pseudo_headers() {
+        let (mut reader, mut writer) = stream_pair(VarInt::from_u32(0));
+        writer
+            .send_hyper_request_parts(request_parts(http::Method::GET, "https://example.test/"))
+            .await
+            .expect("request header should be written");
+
+        let error = reader
+            .read_hyper_response_parts()
+            .await
+            .expect_err("request pseudo headers are malformed for responses");
+
+        assert!(matches!(error, MessageStreamError::Quic { .. }));
+    }
+
+    #[tokio::test]
     async fn read_hyper_frame_returns_none_on_empty_stream() {
         let mut stream = read_stream_for_test(VarInt::from_u32(0));
 
@@ -359,6 +391,50 @@ mod tests {
         let owned = read_stream_for_test(VarInt::from_u32(0));
         let body = owned.into_hyper_body();
         let mut body = std::pin::pin!(body);
+        assert!(next_body_frame(body.as_mut()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn as_hyper_body_yields_data_frames() {
+        let (mut reader, mut writer) = stream_pair(VarInt::from_u32(0));
+        writer
+            .send_data(Bytes::from_static(b"borrowed-body"))
+            .await
+            .expect("data should be written");
+        writer.close().await.expect("stream should close cleanly");
+
+        let body = reader.as_hyper_body();
+        let mut body = std::pin::pin!(body);
+        let frame = next_body_frame(body.as_mut())
+            .await
+            .expect("body frame")
+            .expect("data frame should decode");
+        assert_eq!(
+            frame.into_data().expect("data"),
+            Bytes::from_static(b"borrowed-body")
+        );
+        assert!(next_body_frame(body.as_mut()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn into_hyper_body_yields_data_frames() {
+        let (reader, mut writer) = stream_pair(VarInt::from_u32(0));
+        writer
+            .send_data(Bytes::from_static(b"owned-body"))
+            .await
+            .expect("data should be written");
+        writer.close().await.expect("stream should close cleanly");
+
+        let body = reader.into_hyper_body();
+        let mut body = std::pin::pin!(body);
+        let frame = next_body_frame(body.as_mut())
+            .await
+            .expect("body frame")
+            .expect("data frame should decode");
+        assert_eq!(
+            frame.into_data().expect("data"),
+            Bytes::from_static(b"owned-body")
+        );
         assert!(next_body_frame(body.as_mut()).await.is_none());
     }
 

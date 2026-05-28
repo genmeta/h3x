@@ -541,6 +541,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn insert_without_blocking_populates_table_but_emits_literal() {
+        let mut state = state_with_capacity(256);
+
+        let output = do_compress(&mut state, vec![field_line("x-custom", "hello")], false).await;
+
+        assert_eq!(state.table_inserted_count(), 1);
+        assert!(output.max_referenced_index.is_none());
+        assert_eq!(output.prefix.encoded_insert_count, 0);
+        assert!(matches!(
+            &output.representations[..],
+            [FieldLineRepresentation::LiteralFieldLineWithLiteralName {
+                never_dynamic: false,
+                name_huffman: false,
+                name,
+                value_huffman: false,
+                value,
+            }] if name.as_ref() == b"x-custom" && value.as_ref() == b"hello"
+        ));
+    }
+
+    #[tokio::test]
     async fn second_request_uses_pre_base_dynamic_ref() {
         let mut state = state_with_capacity(256);
 
@@ -1126,6 +1147,34 @@ mod tests {
             }
             // Simulate flush: clear processed instructions
             encoder.pending_instructions.clear();
+        }
+
+        #[test]
+        fn apply_instructions_replays_all_encoder_instruction_variants() {
+            let settings = settings_pair(4096);
+            let mut encoder = EncoderState::new(settings.clone());
+            encoder.set_max_table_capacity(4096).unwrap();
+            encoder
+                .insert_with_literal_name(
+                    false,
+                    Bytes::from_static(b"x-first"),
+                    false,
+                    Bytes::from_static(b"one"),
+                )
+                .unwrap();
+            encoder
+                .insert_with_name_reference(true, 1, false, Bytes::from_static(b"/custom"))
+                .unwrap();
+            encoder
+                .insert_with_name_reference(false, 0, false, Bytes::from_static(b"two"))
+                .unwrap();
+            encoder.duplicate(0).unwrap();
+
+            let mut decoder = DecoderState::new(settings);
+            apply_instructions(&mut encoder, &mut decoder);
+
+            assert_eq!(decoder.table_inserted_count(), 4);
+            assert!(encoder.pending_instructions().is_empty());
         }
 
         fn verify_roundtrip(
