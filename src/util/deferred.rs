@@ -585,6 +585,7 @@ mod tests {
             .write_all(b"world")
             .await
             .expect("write resolved value");
+        writer.flush().await.expect("flush resolved value");
         writer.shutdown().await.expect("shutdown resolved value");
 
         let mut received = Vec::new();
@@ -649,6 +650,10 @@ mod tests {
 
         reader.stop(varint(12)).await.expect("stop");
         writer.cancel(varint(13)).await.expect("cancel");
+
+        let (_reader, writer) = quic::test::mock_stream_pair(varint(14));
+        let mut writer: Resolved<_, quic::StreamError> = Resolved::ok(writer);
+        writer.close().await.expect("close");
     }
 
     #[tokio::test]
@@ -657,6 +662,7 @@ mod tests {
             futures::stream::Empty<Result<Bytes, quic::StreamError>>,
             quic::StreamError,
         > = Resolved::err(quic::StreamError::Reset { code: varint(31) });
+        assert_eq!(stream.size_hint(), (0, None));
         let item = stream.next().await.expect("error item").expect_err("reset");
         assert_reset(item, varint(31));
         assert!(stream.is_terminated());
@@ -701,6 +707,7 @@ mod tests {
             .write_all(b"world")
             .await
             .expect("write deferred value");
+        writer.flush().await.expect("flush deferred value");
         writer.shutdown().await.expect("shutdown deferred value");
         let mut received = Vec::new();
         output
@@ -762,6 +769,10 @@ mod tests {
 
         reader.stop(varint(22)).await.expect("stop");
         writer.cancel(varint(23)).await.expect("cancel");
+
+        let (_reader, writer) = quic::test::mock_stream_pair(varint(24));
+        let mut writer = Deferred::from(ready(Ok::<_, quic::StreamError>(writer)));
+        writer.close().await.expect("close");
     }
 
     #[tokio::test]

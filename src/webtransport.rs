@@ -181,11 +181,18 @@ impl Session for WebTransportSession {
 
 #[cfg(test)]
 mod tests {
+    use std::{future, sync::Arc};
+
     use bytes::Bytes;
     use futures::{SinkExt, StreamExt};
 
     use super::*;
     use crate::{
+        connection::{ConnectionState, tests::MockConnection},
+        extended_connect::{EstablishedConnect, PendingWriteStreamError},
+        message::{stream::WriteStream, test::read_stream_for_test},
+        protocol::Protocols,
+        qpack::field::Protocol,
         quic::{self, GetStreamIdExt},
         varint::VarInt,
     };
@@ -212,6 +219,48 @@ mod tests {
             Box::pin(reader) as BoxReadStream,
             Box::pin(writer) as BoxWriteStream,
         )
+    }
+
+    fn connection_with_webtransport(
+        mock: Arc<MockConnection>,
+    ) -> Arc<ConnectionState<dyn quic::DynConnection>> {
+        let erased: Arc<dyn quic::DynConnection> = mock.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(WebTransportProtocol::new_for_test(erased));
+        Arc::new(ConnectionState::new_for_test(mock, Arc::new(protocols)).erase())
+    }
+
+    fn webtransport_session_for_test(
+        mock: Arc<MockConnection>,
+        stream_id: StreamId,
+    ) -> WebTransportSession {
+        WebTransportSession::try_from(EstablishedConnect::pending(
+            stream_id,
+            Some(Protocol::new(WEBTRANSPORT_H3)),
+            connection_with_webtransport(mock),
+            read_stream_for_test(stream_id.0),
+            future::pending::<Result<WriteStream, PendingWriteStreamError>>(),
+        ))
+        .expect("webtransport session should be registered")
+    }
+
+    fn connection_error(reason: &'static str) -> quic::ConnectionError {
+        quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(0x01),
+                frame_type: VarInt::from_u32(0x00),
+                reason: reason.into(),
+            },
+        }
+    }
+
+    fn assert_transport_reason(error: &quic::ConnectionError, expected_reason: &str) {
+        match error {
+            quic::ConnectionError::Transport { source } => {
+                assert_eq!(source.reason.as_ref(), expected_reason);
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
     }
 
     impl Session for TestSession {
@@ -358,6 +407,57 @@ mod tests {
             dyn_session.accept_uni().await,
             Err(AcceptStreamError::Closed { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn dyn_session_bridge_uses_webtransport_session_open_impls() {
+        let mock = Arc::new(MockConnection::new());
+        mock.enable_stream_ops();
+        let session_id = StreamId(VarInt::from_u32(44));
+        let session = webtransport_session_for_test(Arc::clone(&mock), session_id);
+        let dyn_session: &dyn DynSession = &session;
+
+        assert_eq!(dyn_session.id(), session_id);
+
+        let (mut reader, mut writer) = dyn_session.open_bi().await.expect("open_bi should work");
+        assert_eq!(reader.stream_id().await.unwrap(), VarInt::from_u32(0));
+        assert_eq!(writer.stream_id().await.unwrap(), VarInt::from_u32(0));
+
+        let mut writer = dyn_session.open_uni().await.expect("open_uni should work");
+        assert_eq!(writer.stream_id().await.unwrap(), VarInt::from_u32(0));
+
+        assert_eq!(mock.stream_calls(), vec!["open_bi", "open_uni"]);
+    }
+
+    #[tokio::test]
+    async fn dyn_session_bridge_uses_webtransport_session_accept_impls() {
+        let mock = Arc::new(MockConnection::new());
+        mock.set_terminal_error(connection_error("bidi closed"));
+        let session =
+            webtransport_session_for_test(Arc::clone(&mock), StreamId(VarInt::from_u32(46)));
+        let dyn_session: &dyn DynSession = &session;
+
+        match dyn_session.accept_bi().await {
+            Err(AcceptStreamError::Connection { source }) => {
+                assert_transport_reason(&source, "bidi closed");
+            }
+            Err(_) => panic!("expected connection error"),
+            Ok(_) => panic!("accept_bi should fail"),
+        }
+
+        let mock = Arc::new(MockConnection::new());
+        mock.set_terminal_error(connection_error("uni closed"));
+        let session =
+            webtransport_session_for_test(Arc::clone(&mock), StreamId(VarInt::from_u32(48)));
+        let dyn_session: &dyn DynSession = &session;
+
+        match dyn_session.accept_uni().await {
+            Err(AcceptStreamError::Connection { source }) => {
+                assert_transport_reason(&source, "uni closed");
+            }
+            Err(_) => panic!("expected connection error"),
+            Ok(_) => panic!("accept_uni should fail"),
+        }
     }
 
     #[cfg(feature = "rpc")]

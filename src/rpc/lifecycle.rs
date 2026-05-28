@@ -552,6 +552,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_after_probe_error_returns_latched_without_consuming_wait() {
+        let lc = TestLifecycle::new();
+        lc.set_probe(make_err(40));
+
+        let check_error = quic::Lifecycle::check(&lc).unwrap_err();
+        assert_eq!(error_kind(&check_error), VarInt::from_u32(40));
+
+        lc.set_wait(make_err(41));
+        let closed_error = quic::Lifecycle::closed(&lc).await;
+
+        assert_eq!(error_kind(&closed_error), VarInt::from_u32(40));
+        assert!(
+            lc.wait.lock().unwrap().is_some(),
+            "closed must not poll wait once check has latched the terminal error"
+        );
+    }
+
+    #[tokio::test]
     async fn closed_latches_default_wait_error_when_wait_is_unset() {
         let lc = TestLifecycle::new();
 
@@ -604,6 +622,25 @@ mod tests {
 
         assert_eq!(error_kind(&first.unwrap_err()), VarInt::from_u32(17));
         assert_eq!(error_kind(&second.unwrap_err()), VarInt::from_u32(17));
+    }
+
+    #[tokio::test]
+    async fn guard_returns_error_latched_during_operation() {
+        let lc = TestLifecycle::new();
+        let latch = lc.latch.clone();
+
+        let res: Result<(), ConnectionError> = lc
+            .guard(async move {
+                latch.latch_with(|| make_err(37));
+                Err(make_err(38))
+            })
+            .await;
+
+        assert_eq!(error_kind(&res.unwrap_err()), VarInt::from_u32(37));
+        assert_eq!(
+            error_kind(&lc.latch.check().unwrap_err()),
+            VarInt::from_u32(37)
+        );
     }
 
     #[tokio::test]
@@ -701,6 +738,26 @@ mod tests {
         let err = lc.guard_sync(ok_unit).unwrap_err();
 
         assert_eq!(error_kind(&err), VarInt::from_u32(28));
+    }
+
+    #[test]
+    fn guard_sync_skips_closure_when_already_latched() {
+        let lc = TestLifecycle::new();
+        lc.latch.latch_with(|| make_err(29));
+
+        let called = Mutex::new(false);
+        let err = lc
+            .guard_sync(|| {
+                *called.lock().unwrap() = true;
+                Ok::<_, ConnectionError>(())
+            })
+            .unwrap_err();
+
+        assert_eq!(error_kind(&err), VarInt::from_u32(29));
+        assert!(
+            !*called.lock().unwrap(),
+            "operation closure must not run after a terminal error is latched"
+        );
     }
 
     #[test]
