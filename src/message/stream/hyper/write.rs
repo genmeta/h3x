@@ -402,6 +402,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_hyper_request_with_observed_writer_accepts_valid_request() {
+        let (mut stream, cancelled) = cancel_observing_write_stream(VarInt::from_u32(0));
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(http::Uri::from_static("https://example.test/upload"))
+            .body(Full::new(Bytes::from_static(b"payload")))
+            .expect("request");
+
+        stream
+            .send_hyper_request(request)
+            .await
+            .expect("request sent");
+        stream.flush().await.expect("stream flushed");
+        stream.close().await.expect("stream closed");
+
+        assert!(cancelled.lock().expect("cancel lock").is_empty());
+    }
+
+    #[tokio::test]
     async fn send_hyper_response_parts_and_response_succeed() {
         let mut stream = write_stream_for_test(VarInt::from_u32(0));
         let response = http::Response::builder()
@@ -474,6 +493,29 @@ mod tests {
 
         let error = stream
             .send_hyper_request_parts(request_parts("example.test"))
+            .await
+            .expect_err("authority-only GET is malformed");
+
+        assert!(matches!(error, SendMessageError::MalformedHeader { .. }));
+        assert_eq!(*cancelled.lock().expect("cancel lock"), vec![expected_code]);
+    }
+
+    #[tokio::test]
+    async fn send_hyper_request_cancels_stream_on_malformed_parts() {
+        let (mut stream, cancelled) = cancel_observing_write_stream(VarInt::from_u32(0));
+        let expected_code =
+            validated_hyper_request_parts_to_field_lines(request_parts("example.test"))
+                .expect_err("authority-only GET is malformed")
+                .code()
+                .into_inner();
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(http::Uri::try_from("example.test").expect("uri"))
+            .body(Empty::<Bytes>::new())
+            .expect("request");
+
+        let error = stream
+            .send_hyper_request(request)
             .await
             .expect_err("authority-only GET is malformed");
 
