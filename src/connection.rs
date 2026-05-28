@@ -1130,6 +1130,53 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "dquic")]
+    #[derive(Debug, Clone, Copy)]
+    enum ErrKind {
+        Connection,
+        Reset,
+    }
+
+    #[cfg(feature = "dquic")]
+    #[derive(Debug)]
+    struct ErrThenDisableProtocol {
+        quic: MockConnection,
+        kind: ErrKind,
+    }
+
+    #[cfg(feature = "dquic")]
+    impl ErrThenDisableProtocol {
+        fn make_error(&self) -> StreamError {
+            match self.kind {
+                ErrKind::Connection => StreamError::from(H3MissingSettings),
+                ErrKind::Reset => StreamError::Reset {
+                    code: VarInt::from_u32(7),
+                },
+            }
+        }
+    }
+
+    #[cfg(feature = "dquic")]
+    impl Protocol for ErrThenDisableProtocol {
+        fn accept_uni<'a>(
+            &'a self,
+            _stream: ErasedPeekableUniStream,
+        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
+            self.quic.disable_stream_ops();
+            let err = self.make_error();
+            Box::pin(async move { Err(err) })
+        }
+
+        fn accept_bi<'a>(
+            &'a self,
+            _stream: ErasedPeekableBiStream,
+        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
+            self.quic.disable_stream_ops();
+            let err = self.make_error();
+            Box::pin(async move { Err(err) })
+        }
+    }
+
+    #[cfg(feature = "dquic")]
     type C = dquic::prelude::Connection;
 
     /// Hash equality and determinism: identical inputs must produce equal hashes.
@@ -1487,6 +1534,170 @@ pub(crate) mod tests {
         let uni_state = ConnectionState::new_for_test(Arc::new(uni_quic.clone()), uni_protocols);
         ConnectionState::accept_uni_stream_task(uni_state).await;
         assert_eq!(uni_quic.stream_calls(), vec!["accept_uni", "accept_uni"]);
+    }
+
+    #[cfg(feature = "dquic")]
+    #[tokio::test]
+    async fn accept_bi_task_calls_handle_connection_error_for_connection_scope_errors() {
+        let bi_quic = MockConnection::new();
+        bi_quic.enable_stream_ops();
+
+        let protocols = {
+            let mut protocols = Protocols::new();
+            protocols.insert(ErrThenDisableProtocol {
+                quic: bi_quic.clone(),
+                kind: ErrKind::Connection,
+            });
+            Arc::new(protocols)
+        };
+        let state = ConnectionState::new_for_test(Arc::new(bi_quic.clone()), protocols);
+        let task = tokio::spawn(ConnectionState::accept_bi_stream_task(state).in_current_span());
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !bi_quic.close_calls().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection-scope error should trigger close");
+
+        bi_quic.set_terminal_error(test_connection_error("bi terminal"));
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("accept_bi task should terminate")
+            .expect("task should not panic");
+
+        assert!(bi_quic.stream_calls().contains(&"accept_bi"));
+        assert_eq!(bi_quic.close_calls().len(), 1);
+        assert_eq!(bi_quic.close_calls()[0].0, Code::H3_MISSING_SETTINGS);
+    }
+
+    #[cfg(feature = "dquic")]
+    #[tokio::test]
+    async fn accept_uni_task_calls_handle_connection_error_for_connection_scope_errors() {
+        let uni_quic = MockConnection::new();
+        uni_quic.enable_stream_ops();
+
+        let protocols = {
+            let mut protocols = Protocols::new();
+            protocols.insert(ErrThenDisableProtocol {
+                quic: uni_quic.clone(),
+                kind: ErrKind::Connection,
+            });
+            Arc::new(protocols)
+        };
+        let state = ConnectionState::new_for_test(Arc::new(uni_quic.clone()), protocols);
+        let task = tokio::spawn(ConnectionState::accept_uni_stream_task(state).in_current_span());
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !uni_quic.close_calls().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection-scope error should trigger close");
+
+        uni_quic.set_terminal_error(test_connection_error("uni terminal"));
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("accept_uni task should terminate")
+            .expect("task should not panic");
+
+        assert!(uni_quic.stream_calls().contains(&"accept_uni"));
+        assert_eq!(uni_quic.close_calls().len(), 1);
+        assert_eq!(uni_quic.close_calls()[0].0, Code::H3_MISSING_SETTINGS);
+    }
+
+    #[cfg(feature = "dquic")]
+    #[tokio::test]
+    async fn accept_bi_task_skips_close_for_stream_scope_errors() {
+        let bi_quic = MockConnection::new();
+        bi_quic.enable_stream_ops();
+
+        let protocols = {
+            let mut protocols = Protocols::new();
+            protocols.insert(ErrThenDisableProtocol {
+                quic: bi_quic.clone(),
+                kind: ErrKind::Reset,
+            });
+            Arc::new(protocols)
+        };
+        let state = ConnectionState::new_for_test(Arc::new(bi_quic.clone()), protocols);
+        let task = tokio::spawn(ConnectionState::accept_bi_stream_task(state).in_current_span());
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if bi_quic.stream_calls().contains(&"accept_bi") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task should call accept_bi");
+
+        // give the stream-scope error path a chance to execute
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+
+        bi_quic.set_terminal_error(test_connection_error("bi reset terminal"));
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("accept_bi task should terminate")
+            .expect("task should not panic");
+
+        assert!(
+            bi_quic.close_calls().is_empty(),
+            "stream-scope errors must not trigger connection close"
+        );
+    }
+
+    #[cfg(feature = "dquic")]
+    #[tokio::test]
+    async fn accept_uni_task_skips_close_for_stream_scope_errors() {
+        let uni_quic = MockConnection::new();
+        uni_quic.enable_stream_ops();
+
+        let protocols = {
+            let mut protocols = Protocols::new();
+            protocols.insert(ErrThenDisableProtocol {
+                quic: uni_quic.clone(),
+                kind: ErrKind::Reset,
+            });
+            Arc::new(protocols)
+        };
+        let state = ConnectionState::new_for_test(Arc::new(uni_quic.clone()), protocols);
+        let task = tokio::spawn(ConnectionState::accept_uni_stream_task(state).in_current_span());
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if uni_quic.stream_calls().contains(&"accept_uni") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task should call accept_uni");
+
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+
+        uni_quic.set_terminal_error(test_connection_error("uni reset terminal"));
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("accept_uni task should terminate")
+            .expect("task should not panic");
+
+        assert!(uni_quic.close_calls().is_empty());
     }
 
     #[tokio::test]
