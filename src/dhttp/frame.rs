@@ -415,6 +415,95 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailingEncodeStream {
+        reset_code: VarInt,
+        fail_write_at: Option<usize>,
+        fail_start_send: bool,
+        write_calls: usize,
+    }
+
+    impl FailingEncodeStream {
+        fn fail_write_at(call: usize, reset_code: VarInt) -> Self {
+            Self {
+                reset_code,
+                fail_write_at: Some(call),
+                fail_start_send: false,
+                write_calls: 0,
+            }
+        }
+
+        fn fail_start_send(reset_code: VarInt) -> Self {
+            Self {
+                reset_code,
+                fail_write_at: None,
+                fail_start_send: true,
+                write_calls: 0,
+            }
+        }
+
+        fn reset(&self) -> quic::StreamError {
+            quic::StreamError::Reset {
+                code: self.reset_code,
+            }
+        }
+    }
+
+    impl AsyncWrite for FailingEncodeStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.write_calls += 1;
+            if this.fail_write_at == Some(this.write_calls) {
+                return Poll::Ready(Err(io::Error::from(this.reset())));
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Sink<Bytes> for FailingEncodeStream {
+        type Error = quic::StreamError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Bytes) -> Result<(), Self::Error> {
+            if self.fail_start_send {
+                return Err(self.reset());
+            }
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     struct CapturedPayload(Vec<u8>);
 
@@ -774,6 +863,79 @@ mod tests {
             }
         ));
         assert!(chunks.lock().expect("chunks lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn sink_start_send_propagates_payload_error() {
+        let mut frame = Frame {
+            r#type: Frame::DATA_FRAME_TYPE,
+            length: VarInt::from_u32(0),
+            payload: FailingEncodeStream::fail_start_send(VarInt::from_u32(41)),
+        };
+
+        let error = frame
+            .send(Bytes::from_static(b"abc"))
+            .await
+            .expect_err("payload start_send should fail");
+
+        assert!(matches!(
+            error,
+            crate::codec::StreamEncodeError::Reset { code } if code == VarInt::from_u32(41)
+        ));
+    }
+
+    #[tokio::test]
+    async fn encode_into_propagates_type_length_and_payload_errors() {
+        let frame = Frame::new(Frame::DATA_FRAME_TYPE, Bytes::from_static(b"abc")).unwrap();
+
+        let error = frame
+            .clone()
+            .encode_into(FailingEncodeStream::fail_write_at(1, VarInt::from_u32(43)))
+            .await
+            .expect_err("frame type write should fail");
+        assert!(matches!(
+            error,
+            quic::StreamError::Reset { code } if code == VarInt::from_u32(43)
+        ));
+
+        let error = frame
+            .clone()
+            .encode_into(FailingEncodeStream::fail_write_at(2, VarInt::from_u32(47)))
+            .await
+            .expect_err("frame length write should fail");
+        assert!(matches!(
+            error,
+            quic::StreamError::Reset { code } if code == VarInt::from_u32(47)
+        ));
+
+        let error = frame
+            .encode_into(FailingEncodeStream::fail_start_send(VarInt::from_u32(53)))
+            .await
+            .expect_err("payload feed should fail");
+        assert!(matches!(
+            error,
+            quic::StreamError::Reset { code } if code == VarInt::from_u32(53)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failing_encode_stream_allows_nonfailing_io_and_sink_paths() {
+        let mut stream = FailingEncodeStream {
+            reset_code: VarInt::from_u32(59),
+            fail_write_at: None,
+            fail_start_send: false,
+            write_calls: 0,
+        };
+
+        stream.write_all(b"ok").await.expect("write");
+        AsyncWriteExt::flush(&mut stream).await.expect("flush");
+        AsyncWriteExt::shutdown(&mut stream)
+            .await
+            .expect("shutdown");
+
+        stream.send(Bytes::from_static(b"ok")).await.expect("send");
+        SinkExt::flush(&mut stream).await.expect("sink flush");
+        stream.close().await.expect("sink close");
     }
 
     #[tokio::test]

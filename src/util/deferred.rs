@@ -528,7 +528,7 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use futures::{SinkExt, StreamExt, stream::FusedStream, task::noop_waker_ref};
+    use futures::{Sink, SinkExt, StreamExt, stream::FusedStream, task::noop_waker_ref};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
 
     use super::*;
@@ -548,6 +548,11 @@ mod tests {
         assert_eq!(code, expected);
     }
 
+    fn resolved_quic_error<T>(value: T, code: u32) -> Resolved<T, quic::StreamError> {
+        drop(value);
+        Resolved::err(quic::StreamError::Reset { code: varint(code) })
+    }
+
     fn deferred_quic_error<T>(
         value: T,
         code: u32,
@@ -563,6 +568,19 @@ mod tests {
             Resolved::<i32, _>::from(Err(DecodeError::Incomplete)).into_result(),
             Err(DecodeError::Incomplete)
         );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn resolved_serializes_and_deserializes_error_result() {
+        let resolved: Resolved<u8, u16> = Resolved::err(7);
+
+        let encoded = serde_json::to_value(&resolved).expect("error result serializes");
+        assert_eq!(encoded, serde_json::json!({ "Err": 7 }));
+
+        let decoded: Resolved<u8, u16> =
+            serde_json::from_value(encoded).expect("error result deserializes");
+        assert_eq!(decoded.into_result(), Err(7));
     }
 
     #[tokio::test]
@@ -614,6 +632,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_error_maps_to_buffered_read_flush_and_shutdown_errors() {
+        let mut reader: Resolved<BufReader<Cursor<Vec<u8>>>, DecodeError> =
+            Resolved::err(DecodeError::Incomplete);
+        let error = reader.fill_buf().await.expect_err("fill_buf should fail");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+
+        let mut writer: Resolved<tokio::io::DuplexStream, EncodeError> =
+            Resolved::err(EncodeError::FramePayloadTooLarge);
+        let error = writer.flush().await.expect_err("flush should fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let error = writer.shutdown().await.expect_err("shutdown should fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
     async fn resolved_delegates_buffered_read() {
         let cursor = Cursor::new(b"line\nrest".to_vec());
         let mut reader: Resolved<_, DecodeError> = Resolved::ok(BufReader::new(cursor));
@@ -654,6 +687,65 @@ mod tests {
         let (_reader, writer) = quic::test::mock_stream_pair(varint(14));
         let mut writer: Resolved<_, quic::StreamError> = Resolved::ok(writer);
         writer.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn resolved_error_maps_to_quic_stream_error_for_control_traits() {
+        let (reader, _writer) = quic::test::mock_stream_pair(varint(51));
+        let mut stream_id = resolved_quic_error(reader, 52);
+        assert_reset(
+            stream_id
+                .stream_id()
+                .await
+                .expect_err("stream id should fail"),
+            varint(52),
+        );
+
+        let (reader, _writer) = quic::test::mock_stream_pair(varint(53));
+        let mut stop = resolved_quic_error(reader, 54);
+        assert_reset(
+            stop.stop(varint(55)).await.expect_err("stop should fail"),
+            varint(54),
+        );
+
+        let (_reader, writer) = quic::test::mock_stream_pair(varint(56));
+        let mut cancel = resolved_quic_error(writer, 57);
+        assert_reset(
+            cancel
+                .cancel(varint(58))
+                .await
+                .expect_err("cancel should fail"),
+            varint(57),
+        );
+    }
+
+    #[test]
+    fn resolved_error_maps_to_sink_operation_errors() {
+        let (_reader, writer) = quic::test::mock_stream_pair(varint(59));
+        let mut sink = Box::pin(resolved_quic_error(writer, 60));
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        let Poll::Ready(Err(error)) = sink.as_mut().poll_ready(&mut cx) else {
+            panic!("poll_ready should return reset");
+        };
+        assert_reset(error, varint(60));
+
+        let error = sink
+            .as_mut()
+            .start_send(Bytes::from_static(b"ignored"))
+            .expect_err("start_send should fail");
+        assert_reset(error, varint(60));
+
+        let Poll::Ready(Err(error)) = sink.as_mut().poll_flush(&mut cx) else {
+            panic!("poll_flush should return reset");
+        };
+        assert_reset(error, varint(60));
+
+        let Poll::Ready(Err(error)) = sink.as_mut().poll_close(&mut cx) else {
+            panic!("poll_close should return reset");
+        };
+        assert_reset(error, varint(60));
     }
 
     #[tokio::test]
@@ -831,6 +923,25 @@ mod tests {
             .await
             .expect_err("send should fail");
         assert_reset(error, varint(42));
+    }
+
+    #[test]
+    fn deferred_ready_error_maps_to_start_send_error() {
+        let (_reader, writer) = quic::test::mock_stream_pair(varint(61));
+        let mut sink = Box::pin(deferred_quic_error(writer, 62));
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        let Poll::Ready(Err(error)) = sink.as_mut().poll_ready(&mut cx) else {
+            panic!("poll_ready should resolve to reset");
+        };
+        assert_reset(error, varint(62));
+
+        let error = sink
+            .as_mut()
+            .start_send(Bytes::from_static(b"ignored"))
+            .expect_err("start_send should fail");
+        assert_reset(error, varint(62));
     }
 
     #[test]

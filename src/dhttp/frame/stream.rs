@@ -399,6 +399,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incomplete_type_varint_converts_to_frame_decode_error() {
+        let mut stream = std::pin::pin!(FrameStream::new(StreamReader::new(to_pre_byte_stream([
+            0x40, // two-byte varint prefix without the second byte
+        ]))));
+
+        let error = match stream.as_mut().next_frame().await {
+            Some(Err(error)) => error,
+            Some(Ok(_)) => panic!("expected frame decode error"),
+            None => panic!("expected frame decode error"),
+        };
+        expect_h3_frame_decode_error(error);
+    }
+
+    #[tokio::test]
     async fn consume_current_frame_returns_stored_decode_error() {
         let mut stream = std::pin::pin!(FrameStream::new(StreamReader::new(to_pre_byte_stream([
             0x00, // frame type present but length missing
@@ -472,6 +486,23 @@ mod tests {
             *stop_code_ref.lock().expect("stop_code lock poisoned"),
             Some(stop_code)
         );
+    }
+
+    #[tokio::test]
+    async fn mock_stream_payload_decodes_frame() {
+        let mock = MockStream::from_iter(
+            VarInt::from_u32(11),
+            vec![Ok(Bytes::from_static(b"\x00\x02ok"))],
+        );
+        let mut stream = std::pin::pin!(FrameStream::new(StreamReader::new(mock)));
+
+        let mut frame = stream.as_mut().next_frame().await.unwrap().unwrap();
+        assert_eq!(frame.r#type(), Frame::DATA_FRAME_TYPE);
+        assert_eq!(frame.length().into_inner(), 2);
+
+        let mut payload = Vec::new();
+        frame.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(payload, b"ok");
     }
 
     #[tokio::test]
