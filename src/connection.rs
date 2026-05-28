@@ -698,6 +698,7 @@ pub(crate) mod tests {
         collections::hash_map::DefaultHasher,
         fmt,
         hash::{Hash, Hasher},
+        marker::PhantomData,
     };
     use std::{
         error::Error as _,
@@ -1178,6 +1179,43 @@ pub(crate) mod tests {
             hash_of(&builder2),
             "identical builders must hash equally"
         );
+    }
+
+    #[cfg(feature = "dquic")]
+    #[test]
+    fn display_lists_each_initializer_separated_by_commas() {
+        let s = || Arc::new(Settings::default());
+
+        let empty = ConnectionBuilder::<C> {
+            initializers: Vec::new(),
+            _connection: PhantomData,
+        };
+        assert_eq!(format!("{}", empty), "ConnectionBuilder[]");
+
+        let one = ConnectionBuilder::<C> {
+            initializers: Vec::new(),
+            _connection: PhantomData,
+        }
+        .protocol(MockFactory(1));
+        assert_eq!(format!("{}", one), "ConnectionBuilder[MockFactory]");
+
+        let two = ConnectionBuilder::<C> {
+            initializers: Vec::new(),
+            _connection: PhantomData,
+        }
+        .protocol(MockFactory(1))
+        .protocol(MockFactory(2));
+        assert_eq!(
+            format!("{}", two),
+            "ConnectionBuilder[MockFactory, MockFactory]"
+        );
+
+        let default_with_extra = ConnectionBuilder::<C>::new(s()).protocol(MockFactory(99));
+        let rendered = format!("{}", default_with_extra);
+        assert!(rendered.starts_with("ConnectionBuilder["));
+        assert!(rendered.ends_with(']'));
+        assert!(rendered.contains("MockFactory"));
+        assert_eq!(rendered.matches(", ").count(), 2);
     }
 
     /// Different settings produce different hashes.
