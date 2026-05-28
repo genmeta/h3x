@@ -839,6 +839,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_error_latch_reuses_current_origin_and_replaces_stale_origin() {
+        let pair = connected_pair().await;
+        let connection = pair.client.as_ref();
+        let key = dquic_connection_key(connection);
+        let origin = dquic_origin_dcid(connection);
+        let stale_origin = Some(DquicConnectionId::from_slice(b"not-current"));
+        dquic_connection_latches().remove(&key);
+
+        let first = latch_connection_error(connection, origin, transport_connection_error(0x32));
+        assert_transport_error(
+            first,
+            VarInt::from_u32(0x32),
+            VarInt::from_u32(0),
+            "test transport 50",
+        );
+
+        let reused = latch_connection_error(connection, origin, transport_connection_error(0x33));
+        assert_transport_error(
+            reused,
+            VarInt::from_u32(0x32),
+            VarInt::from_u32(0),
+            "test transport 50",
+        );
+
+        let replaced =
+            latch_connection_error(connection, stale_origin, transport_connection_error(0x34));
+        assert_transport_error(
+            replaced,
+            VarInt::from_u32(0x34),
+            VarInt::from_u32(0),
+            "test transport 52",
+        );
+        assert!(latched_connection_error(connection).is_none());
+
+        let converted = convert_and_latch_connection_error(
+            connection,
+            DquicError::Quic(QuicError::with_default_fty(
+                ErrorKind::ProtocolViolation,
+                "converted failure",
+            )),
+        );
+        assert_transport_error(
+            converted,
+            VarInt::from_u32(0x0a),
+            VarInt::from_u32(0),
+            "converted failure",
+        );
+
+        dquic_connection_latches().remove(&key);
+        close_pair(&pair);
+    }
+
+    #[tokio::test]
     async fn listen_impls_for_references_and_arcs_shutdown_accept_queue() {
         let listeners = make_raw_listeners();
 

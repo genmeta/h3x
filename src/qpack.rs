@@ -320,6 +320,232 @@ mod tests {
         assert_eq!(settings.qpack_blocked_streams(), VarInt::from_u32(100));
     }
 
+    #[test]
+    fn qpack_error_displays_and_connection_codes_are_stable() {
+        use crate::{
+            error::{Code, H3ConnectionError},
+            qpack::{
+                decoder::{InvalidDynamicTableReference, QPackEncoderStreamError},
+                encoder::{QPackDecoderStreamError, QPackEncoderError},
+                protocol::{QPackProtocolDisabled, QPackProtocolFactory},
+            },
+        };
+
+        let decoder_stream_error =
+            QPackDecoderStreamError::AcknowledgeNonExistSection { stream_id: 99 };
+        assert_eq!(
+            decoder_stream_error.to_string(),
+            "acknowledging non-existent or non-blocking stream"
+        );
+        assert_eq!(
+            decoder_stream_error.code(),
+            Code::QPACK_DECODER_STREAM_ERROR
+        );
+        assert_eq!(
+            QPackDecoderStreamError::IncrementKnownReceivedCountOverflow.to_string(),
+            "known received count increment overflow (known_received_count + increment > inserted_count)"
+        );
+        assert_eq!(
+            QPackDecoderStreamError::IncrementZero.to_string(),
+            "insert count increment of zero is not allowed"
+        );
+
+        assert_eq!(
+            QPackEncoderError::CapacityExceedsMax {
+                capacity: 2,
+                max: 1,
+            }
+            .to_string(),
+            "dynamic table capacity 2 exceeds SETTINGS_QPACK_MAX_TABLE_CAPACITY 1"
+        );
+        assert_eq!(
+            QPackEncoderError::CannotEvict.to_string(),
+            "cannot evict entries: no evictable entries in dynamic table"
+        );
+
+        let encoder_stream_error =
+            QPackEncoderStreamError::ReferencedStaticEntryNotExisted { index: 100 };
+        assert_eq!(
+            encoder_stream_error.to_string(),
+            "referenced static table entry 100 does not exist"
+        );
+        assert_eq!(
+            encoder_stream_error.code(),
+            Code::QPACK_ENCODER_STREAM_ERROR
+        );
+        assert_eq!(
+            QPackEncoderStreamError::SetDynamicTableCapacityExceeded.to_string(),
+            "setting dynamic table capacity exceeded maximum allowed"
+        );
+        assert_eq!(
+            QPackEncoderStreamError::NoEvictableEntryForInsertion.to_string(),
+            "no evictable entry for insertion, cannot insert new entry"
+        );
+        assert_eq!(
+            QPackEncoderStreamError::ReferencedDynamicEntryNotExisted { index: 7 }.to_string(),
+            "referenced dynamic table entry 7 does not exist"
+        );
+
+        let invalid_reference = InvalidDynamicTableReference::IndexOverflow;
+        assert_eq!(invalid_reference.to_string(), "reference index overflow");
+        assert_eq!(invalid_reference.code(), Code::QPACK_DECOMPRESSION_FAILED);
+        assert_eq!(
+            InvalidDynamicTableReference::ReferencedStaticEntryNotExisted { index: 99 }.to_string(),
+            "referenced static table entry 99 does not exist"
+        );
+        assert_eq!(
+            InvalidDynamicTableReference::ReferencedDynamicEntryNotExisted { index: 8 }.to_string(),
+            "referenced dynamic table entry 8 does not exist"
+        );
+
+        assert_eq!(QPackProtocolFactory::new().to_string(), "QPACK");
+        assert_eq!(
+            QPackProtocolDisabled.to_string(),
+            "qpack protocol is disabled"
+        );
+    }
+
+    #[test]
+    fn encoder_state_rejects_invalid_capacity_ack_and_increment_paths() {
+        use crate::qpack::encoder::{EncoderState, QPackDecoderStreamError, QPackEncoderError};
+
+        let settings = settings_with_dynamic_table();
+        let mut encoder_state = EncoderState::new(settings);
+
+        let capacity_error = encoder_state
+            .set_max_table_capacity(4097)
+            .expect_err("capacity above peer setting must be rejected");
+        assert!(matches!(
+            capacity_error,
+            QPackEncoderError::CapacityExceedsMax {
+                capacity: 4097,
+                max: 4096
+            }
+        ));
+
+        encoder_state
+            .set_max_table_capacity(64)
+            .expect("capacity within peer setting");
+        encoder_state
+            .insert_with_literal_name(
+                false,
+                Bytes::from_static(b"x-unacked"),
+                false,
+                Bytes::from_static(b"value"),
+            )
+            .expect("insert should fit the dynamic table");
+
+        let shrink_error = encoder_state
+            .set_max_table_capacity(0)
+            .expect_err("unacknowledged entry is not evictable");
+        assert!(matches!(shrink_error, QPackEncoderError::CannotEvict));
+        assert_eq!(encoder_state.table_inserted_count(), 1);
+        assert_eq!(encoder_state.table_dropped_count(), 0);
+
+        let ack_error = encoder_state
+            .on_section_acknowledgment(VarInt::from_u32(4).into_inner())
+            .expect_err("unknown stream id must not be acknowledged");
+        assert!(matches!(
+            ack_error,
+            QPackDecoderStreamError::AcknowledgeNonExistSection { stream_id: 4 }
+        ));
+
+        let zero_increment = encoder_state
+            .on_insert_count_increment(0)
+            .expect_err("zero insert count increment is a decoder stream error");
+        assert!(matches!(
+            zero_increment,
+            QPackDecoderStreamError::IncrementZero
+        ));
+
+        let overflow_increment = encoder_state
+            .on_insert_count_increment(2)
+            .expect_err("increment beyond inserted-known count must fail");
+        assert!(matches!(
+            overflow_increment,
+            QPackDecoderStreamError::IncrementKnownReceivedCountOverflow
+        ));
+    }
+
+    #[test]
+    fn decoder_state_rejects_invalid_encoder_stream_operations() {
+        use crate::qpack::decoder::{DecoderState, QPackEncoderStreamError};
+
+        let settings = settings_with_dynamic_table();
+        let mut decoder_state = DecoderState::new(settings);
+
+        let capacity_error = decoder_state
+            .set_dynamic_table_capacity(4097)
+            .expect_err("capacity above local setting must be rejected");
+        assert!(matches!(
+            capacity_error,
+            QPackEncoderStreamError::SetDynamicTableCapacityExceeded
+        ));
+
+        let missing_static = decoder_state
+            .insert_with_name_reference(true, 99, Bytes::from_static(b"value"))
+            .expect_err("invalid static table name reference must fail");
+        assert!(matches!(
+            missing_static,
+            QPackEncoderStreamError::ReferencedStaticEntryNotExisted { index: 99 }
+        ));
+
+        let missing_dynamic = decoder_state
+            .insert_with_name_reference(false, 0, Bytes::from_static(b"value"))
+            .expect_err("invalid dynamic table name reference must fail");
+        assert!(matches!(
+            missing_dynamic,
+            QPackEncoderStreamError::ReferencedDynamicEntryNotExisted { index: 0 }
+        ));
+
+        decoder_state
+            .set_dynamic_table_capacity(0)
+            .expect("zero capacity is within settings");
+        let no_space = decoder_state
+            .insert_with_literal_name(Bytes::from_static(b"x-too-large"), Bytes::new())
+            .expect_err("entry cannot fit in a zero-capacity dynamic table");
+        assert!(matches!(
+            no_space,
+            QPackEncoderStreamError::NoEvictableEntryForInsertion
+        ));
+
+        let missing_duplicate = decoder_state
+            .duplicate(0)
+            .expect_err("invalid duplicate reference must fail");
+        assert!(matches!(
+            missing_duplicate,
+            QPackEncoderStreamError::ReferencedDynamicEntryNotExisted { index: 0 }
+        ));
+    }
+
+    #[test]
+    fn encoded_field_section_prefix_handles_boundary_values() {
+        use crate::{codec::DecodeError, qpack::field::EncodedFieldSectionPrefix};
+
+        assert_eq!(EncodedFieldSectionPrefix::encode_ric(0, 4096), 0);
+        assert_eq!(
+            EncodedFieldSectionPrefix::encode_ric(1, 0),
+            1,
+            "non-zero RIC with disabled dynamic table is preserved as an invalid wire value"
+        );
+        assert_eq!(
+            EncodedFieldSectionPrefix::decode_ric(1, 0, 0),
+            Err(DecodeError::DecompressionFailed)
+        );
+        assert_eq!(
+            EncodedFieldSectionPrefix::decode_ric(3, 32, 0),
+            Err(DecodeError::DecompressionFailed)
+        );
+        assert_eq!(
+            EncodedFieldSectionPrefix::resolve_base(u64::MAX, false, 1),
+            Err(DecodeError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            EncodedFieldSectionPrefix::resolve_base(0, true, 0),
+            Err(DecodeError::ArithmeticOverflow)
+        );
+    }
+
     fn apply_pending_encoder_instructions(
         encoder_state: &mut crate::qpack::encoder::EncoderState,
         decoder_state: &mut crate::qpack::decoder::DecoderState,
