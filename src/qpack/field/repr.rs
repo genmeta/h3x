@@ -594,6 +594,13 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_ric_rejects_zero_after_unwrapping() {
+        let result = EncodedFieldSectionPrefix::decode_ric(1, 256, 0);
+
+        assert_eq!(result, Err(DecodeError::DecompressionFailed));
+    }
+
+    #[test]
     fn test_resolve_base_positive() {
         let result = EncodedFieldSectionPrefix::resolve_base(5, false, 3);
         assert_eq!(result, Ok(8));
@@ -678,6 +685,39 @@ mod tests {
         )
         .await;
         assert_eq!(post_base, vec![0x1f, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn test_field_line_encode_exact_false_flag_prefixes() {
+        let dynamic_index = encode_field_line_to_bytes(FieldLineRepresentation::IndexedFieldLine {
+            is_static: false,
+            index: 63,
+        })
+        .await;
+        assert_eq!(dynamic_index, vec![0xbf, 0x00]);
+
+        let dynamic_name_reference = encode_field_line_to_bytes(
+            FieldLineRepresentation::LiteralFieldLineWithNameReference {
+                never_dynamic: false,
+                is_static: false,
+                name_index: 15,
+                huffman: false,
+                value: Bytes::new(),
+            },
+        )
+        .await;
+        assert_eq!(dynamic_name_reference, vec![0x4f, 0x00, 0x00]);
+
+        let post_base_name_reference = encode_field_line_to_bytes(
+            FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
+                never_dynamic: false,
+                name_index: 7,
+                huffman: false,
+                value: Bytes::new(),
+            },
+        )
+        .await;
+        assert_eq!(post_base_name_reference, vec![0x07, 0x00, 0x00]);
     }
 
     #[tokio::test]
@@ -882,10 +922,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_prefix_decode_truncated_required_insert_count_varint() {
+        let error = EncodedFieldSectionPrefix::decode_from(Cursor::new(vec![0xffu8]))
+            .await
+            .expect_err("expected required insert count truncation failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
     async fn test_prefix_decode_truncated_delta_base_varint() {
         let error = EncodedFieldSectionPrefix::decode_from(Cursor::new(vec![0x00u8, 0xff]))
             .await
             .expect_err("expected delta-base truncation failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_field_line_decode_missing_prefix_byte() {
+        let error = FieldLineRepresentation::decode_from(Cursor::new(Vec::<u8>::new()))
+            .await
+            .expect_err("expected missing field line prefix failure");
         assert_h3_error(error);
     }
 
@@ -903,6 +959,14 @@ mod tests {
         let error = FieldLineRepresentation::decode_from(Cursor::new(vec![0b0001_1111u8]))
             .await
             .expect_err("expected post-base index truncation failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_field_line_decode_truncated_name_reference_index_varint() {
+        let error = FieldLineRepresentation::decode_from(Cursor::new(vec![0b0100_1111u8]))
+            .await
+            .expect_err("expected literal name reference index truncation failure");
         assert_h3_error(error);
     }
 
@@ -951,6 +1015,14 @@ mod tests {
         ]))
         .await
         .expect_err("expected literal name value bytes truncation failure");
+        assert_h3_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_field_line_decode_truncated_post_base_name_index_varint() {
+        let error = FieldLineRepresentation::decode_from(Cursor::new(vec![0b0000_0111u8]))
+            .await
+            .expect_err("expected post-base name index truncation failure");
         assert_h3_error(error);
     }
 

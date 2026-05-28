@@ -252,6 +252,34 @@ mod tests {
     }
 
     #[test]
+    fn request_parts_try_from_clones_shared_header_map_and_rejects_trailers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-shared", http::HeaderValue::from_static("ok"));
+        let section = FieldSection::header(
+            PseudoHeaders::Request {
+                method: Some(http::Method::GET),
+                scheme: Some(http::uri::Scheme::HTTPS),
+                authority: Some("example.test".parse().unwrap()),
+                path: Some("/".parse().unwrap()),
+                protocol: None,
+            },
+            headers,
+        );
+        let _shared = section.clone();
+
+        let parts = http::request::Parts::try_from(section).unwrap();
+
+        assert_eq!(parts.headers.get("x-shared").unwrap(), "ok");
+
+        let error = http::request::Parts::try_from(FieldSection::trailer(http::HeaderMap::new()))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders { .. }
+        ));
+    }
+
+    #[test]
     fn request_parts_reject_response_pseudo_headers() {
         let section = FieldSection::header(
             PseudoHeaders::response(http::StatusCode::OK),
@@ -298,6 +326,25 @@ mod tests {
         assert!(matches!(
             error,
             MalformedHeaderSection::RequestPseudoHeaderInResponse
+        ));
+    }
+
+    #[test]
+    fn response_parts_try_from_clones_shared_header_map_and_rejects_trailers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-shared", http::HeaderValue::from_static("ok"));
+        let section = FieldSection::header(PseudoHeaders::response(http::StatusCode::OK), headers);
+        let _shared = section.clone();
+
+        let parts = http::response::Parts::try_from(section).unwrap();
+
+        assert_eq!(parts.headers.get("x-shared").unwrap(), "ok");
+
+        let error = http::response::Parts::try_from(FieldSection::trailer(http::HeaderMap::new()))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MalformedHeaderSection::AbsenceOfMandatoryPseudoHeaders { .. }
         ));
     }
 

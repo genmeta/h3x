@@ -551,4 +551,10 @@ mod tests {
 
         assert!(matches!(error, SendMessageError::Body { .. }));
     }
+
+    #[test]
+    fn test_body_error_display_messages_are_stable() {
+        assert_eq!(TestBodyError.to_string(), "test body error");
+        assert_eq!(MappedBodyError.to_string(), "mapped body error");
+    }
 }
