@@ -344,7 +344,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{DecodeExt, EncodeExt},
+        codec::{DecodeError, DecodeExt, EncodeExt},
         connection,
         dhttp::{datagram::settings::H3Datagram, webtransport::settings::EnableWebTransport},
         extended_connect::settings::EnableConnectProtocol,
@@ -370,6 +370,18 @@ mod tests {
                     source: quic_connection_error(),
                 },
             }
+        }
+    }
+
+    struct FailRead;
+
+    impl tokio::io::AsyncRead for FailRead {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(DecodeError::ArithmeticOverflow.into()))
         }
     }
 
@@ -434,22 +446,21 @@ mod tests {
     }
 
     fn assert_h3_connection_code(error: StreamError, expected: Code) {
-        let StreamError::Connection {
-            source: connection::ConnectionError::H3 { source },
-        } = error
-        else {
-            panic!("expected h3 connection error");
-        };
-        assert_eq!(source.code(), expected);
+        assert!(matches!(
+            error,
+            StreamError::Connection {
+                source: connection::ConnectionError::H3 { source },
+            } if source.code() == expected
+        ));
     }
 
     fn assert_quic_connection_error(error: StreamError) {
-        let StreamError::Connection {
-            source: connection::ConnectionError::Quic { .. },
-        } = error
-        else {
-            panic!("expected quic connection error");
-        };
+        assert!(matches!(
+            error,
+            StreamError::Connection {
+                source: connection::ConnectionError::Quic { .. },
+            }
+        ));
     }
 
     #[test]
@@ -590,6 +601,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setting_decode_maps_payload_decode_error_to_frame_decode_error() {
+        let error = FailRead
+            .decode::<Setting>()
+            .await
+            .err()
+            .expect("typed decode failure should be a frame decode error");
+
+        assert_h3_connection_code(error, Code::H3_FRAME_ERROR);
+    }
+
+    #[tokio::test]
     async fn setting_encode_maps_reset_to_closed_control_stream_and_preserves_connection_errors() {
         let reset_code = VarInt::from_u32(77);
         let error = Setting::new(MaxFieldSectionSize::ID, VarInt::from_u32(1))
@@ -641,17 +663,12 @@ mod tests {
             .encode_one(Setting::new(EnableWebTransport::ID, VarInt::from_u32(2)))
             .await
             .expect("setting encoding into buflist is infallible");
-        let error = match invalid.decode::<Setting>().await {
-            Ok(_) => panic!("invalid boolean setting must fail to decode"),
-            Err(error) => error,
-        };
-        let StreamError::Connection {
-            source: crate::connection::ConnectionError::H3 { source },
-        } = error
-        else {
-            panic!("invalid setting value should be a connection-scoped H3 error");
-        };
-        assert_eq!(source.code(), Code::H3_SETTINGS_ERROR);
+        let error = invalid
+            .decode::<Setting>()
+            .await
+            .err()
+            .expect("invalid boolean setting must fail to decode");
+        assert_h3_connection_code(error, Code::H3_SETTINGS_ERROR);
     }
 
     #[tokio::test]

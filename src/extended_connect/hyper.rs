@@ -331,6 +331,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn establish_fails_when_read_slot_is_missing() {
+        let stream_id = StreamId::from(VarInt::from_u32(18));
+        let state = state_for_test();
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Empty::<Bytes>::new())
+            .expect("valid response");
+
+        response.extensions_mut().insert(stream_id);
+        response.extensions_mut().insert(state);
+        response
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                write_stream_for_test(stream_id.0),
+            )));
+
+        let error = establish(response)
+            .await
+            .err()
+            .expect("missing read takeover slot should fail");
+        assert!(matches!(
+            error,
+            EstablishError::TakeRead {
+                source: TakeoverError::Unsupported
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn accept_rejects_non_connect_request() {
         let request = Request::builder()
             .method(http::Method::GET)
@@ -512,6 +541,40 @@ mod tests {
             error,
             crate::extended_connect::IntoStreamsError::PendingWriteStream {
                 source: crate::extended_connect::PendingWriteStreamError::Unsupported
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_into_streams_reports_aborted_write_takeover_as_pending_error() {
+        let stream_id = StreamId::from(VarInt::from_u32(40));
+        let mut request = Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("https://example.test/session")
+            .body(Empty::<Bytes>::new())
+            .expect("valid request");
+
+        request.extensions_mut().insert(stream_id);
+        request.extensions_mut().insert(state_for_test());
+        request
+            .extensions_mut()
+            .insert(TakeoverSlot::new(RemainStream::immediately(
+                read_stream_for_test(stream_id.0),
+            )));
+        let (write_tx, write) = RemainStream::<WriteStream>::pending();
+        request.extensions_mut().insert(TakeoverSlot::new(write));
+        drop(write_tx);
+
+        let (_response, connect) = accept(request).await.expect("accept should parse request");
+        let error = connect
+            .into_streams()
+            .await
+            .err()
+            .expect("write takeover should be aborted");
+        assert!(matches!(
+            error,
+            crate::extended_connect::IntoStreamsError::PendingWriteStream {
+                source: crate::extended_connect::PendingWriteStreamError::Aborted
             }
         ));
     }

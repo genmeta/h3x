@@ -339,6 +339,21 @@ mod tests {
     }
 
     #[test]
+    fn malformed_unchecked_value_panics_when_sized() {
+        // SAFETY: This intentionally violates the unsafe constructor contract to verify
+        // the internal invariant guard for malformed values.
+        let value = unsafe { VarInt::from_u64_unchecked(VARINT_MAX + 1) };
+
+        let panic = std::panic::catch_unwind(|| value.encoding_size())
+            .expect_err("malformed unchecked value should panic");
+        assert!(
+            panic
+                .downcast_ref::<&'static str>()
+                .is_some_and(|message| message.contains("malformed VarInt"))
+        );
+    }
+
+    #[test]
     fn overflow_error_reports_original_value() {
         let overflow = VARINT_MAX as u128 + 1;
         let error = VarInt::from_u128(overflow).expect_err("value above max is rejected");
@@ -387,6 +402,24 @@ mod tests {
         encode_decode_round_trip(1 << 40).await;
         encode_decode_round_trip(VARINT_MAX - 1).await;
         encode_decode_round_trip(VARINT_MAX).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_unchecked_value_panics_when_encoded() {
+        // SAFETY: This intentionally violates the unsafe constructor contract to verify
+        // the internal invariant guard for malformed values.
+        let value = unsafe { VarInt::from_u64_unchecked(VARINT_MAX + 1) };
+        let join = tokio::spawn(async move {
+            value
+                .encode_into(Cursor::new(Vec::<u8>::new()))
+                .await
+                .expect("malformed unchecked value should panic before returning");
+        });
+
+        let error = join
+            .await
+            .expect_err("malformed unchecked value should panic");
+        assert!(error.is_panic());
     }
 
     #[test]

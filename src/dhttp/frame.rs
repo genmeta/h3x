@@ -432,9 +432,41 @@ mod tests {
         }
     }
 
+    #[cfg(target_pointer_width = "64")]
+    #[derive(Debug)]
+    struct HugeBuf;
+
+    #[cfg(target_pointer_width = "64")]
+    impl bytes::Buf for HugeBuf {
+        fn remaining(&self) -> usize {
+            VARINT_MAX as usize + 1
+        }
+
+        fn chunk(&self) -> &[u8] {
+            &[]
+        }
+
+        fn advance(&mut self, _cnt: usize) {}
+    }
+
     #[test]
     fn new_frame() {
         Frame::new(Frame::DATA_FRAME_TYPE, Bytes::new()).unwrap();
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn new_rejects_payload_larger_than_varint() {
+        let error = Frame::new(Frame::DATA_FRAME_TYPE, HugeBuf)
+            .expect_err("frame payload length must fit in varint");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "value({}) too large for varint encoding",
+                VARINT_MAX as u128 + 1
+            )
+        );
     }
 
     #[test]
@@ -695,6 +727,22 @@ mod tests {
             payload.advance(chunk.len());
         }
         assert_eq!(decoded, b"abc");
+    }
+
+    #[tokio::test]
+    async fn decode_to_buflist_incomplete_payload_returns_h3_frame_error() {
+        let mut stream = StreamReader::new(to_pre_byte_stream([
+            0x00, // DATA
+            0x05, // len 5
+            b'H', b'e', b'l', b'l',
+        ]));
+
+        assert!(matches!(
+            Frame::<BufList>::decode_from(&mut stream).await,
+            Err(StreamError::Connection {
+                source: crate::connection::ConnectionError::H3 { source },
+            }) if source.code() == Code::H3_FRAME_ERROR
+        ));
     }
 
     #[tokio::test]

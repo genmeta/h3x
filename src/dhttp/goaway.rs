@@ -85,12 +85,19 @@ impl EncodeInto<BufList> for Goaway {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
     use bytes::Bytes;
+    use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
     use tracing::Instrument;
 
     use super::*;
     use crate::{
-        codec::{DecodeFrom, EncodeExt},
+        codec::{DecodeError, DecodeFrom, EncodeExt},
         connection::ConnectionError,
         error::Code,
     };
@@ -146,13 +153,12 @@ mod tests {
             .await
             .expect_err("trailing payload is malformed");
 
-        let StreamError::Connection {
-            source: ConnectionError::H3 { source },
-        } = error
-        else {
-            panic!("trailing payload should produce a connection-scoped H3 error");
-        };
-        assert_eq!(source.code(), Code::H3_GENERAL_PROTOCOL_ERROR);
+        assert!(matches!(
+            error,
+            StreamError::Connection {
+                source: ConnectionError::H3 { source },
+            } if source.code() == Code::H3_GENERAL_PROTOCOL_ERROR
+        ));
     }
 
     #[tokio::test]
@@ -164,13 +170,52 @@ mod tests {
             .await
             .expect_err("missing stream id is malformed");
 
-        let StreamError::Connection {
-            source: ConnectionError::H3 { source },
-        } = error
-        else {
-            panic!("empty payload should produce a connection-scoped H3 error");
-        };
-        assert_eq!(source.code(), Code::H3_CLOSED_CRITICAL_STREAM);
+        assert!(matches!(
+            error,
+            StreamError::Connection {
+                source: ConnectionError::H3 { source },
+            } if source.code() == Code::H3_CLOSED_CRITICAL_STREAM
+        ));
+    }
+
+    struct ErrorPayload;
+
+    impl AsyncRead for ErrorPayload {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(DecodeError::ArithmeticOverflow.into()))
+        }
+    }
+
+    impl AsyncBufRead for ErrorPayload {
+        fn poll_fill_buf(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+            Poll::Ready(Err(DecodeError::ArithmeticOverflow.into()))
+        }
+
+        fn consume(self: Pin<&mut Self>, _amt: usize) {}
+    }
+
+    #[tokio::test]
+    async fn decode_maps_payload_decode_error_to_frame_decode_error() {
+        let mut payload = BufList::new();
+        payload.write(Bytes::from_static(b"\0"));
+        let mut frame = Frame::new(Frame::GOAWAY_FRAME_TYPE, payload)
+            .expect("payload length fits varint")
+            .map(|_| ErrorPayload);
+
+        let error = Goaway::decode_from(&mut frame)
+            .await
+            .expect_err("payload decode failure should be a frame decode error");
+
+        assert!(matches!(
+            error,
+            StreamError::Connection {
+                source: ConnectionError::H3 { source },
+            } if source.code() == Code::H3_FRAME_ERROR
+        ));
     }
 
     #[tokio::test]

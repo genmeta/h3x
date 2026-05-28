@@ -320,6 +320,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn next_unreserved_frame_returns_none_after_only_reserved_frames() {
+        let stream = StreamReader::new(to_pre_byte_stream([
+            0x21, 0x02, // RESERVED frame type, len 2
+            b'p', b'a',
+        ]));
+
+        let mut stream = std::pin::pin!(FrameStream::new(stream));
+
+        assert!(stream.as_mut().next_unreserved_frame().await.is_none());
+        assert!(stream.as_mut().frame().is_none());
+    }
+
+    #[tokio::test]
     async fn next_frame_consumes_previous_frame_before_decoding_next() {
         let stream = StreamReader::new(to_pre_byte_stream([
             0x00, 0x04, // DATA, len 4
@@ -332,6 +345,32 @@ mod tests {
         let mut prefix = [0u8; 2];
         first.read_exact(&mut prefix).await.unwrap();
         assert_eq!(&prefix, b"Pu");
+
+        let second = stream.as_mut().next_frame().await.unwrap().unwrap();
+        assert_eq!(second.r#type(), Frame::HEADERS_FRAME_TYPE);
+        assert_eq!(second.length().into_inner(), 0);
+    }
+
+    #[tokio::test]
+    async fn consume_current_frame_drains_payload_and_clears_current_frame() {
+        let stream = StreamReader::new(to_pre_byte_stream([
+            0x00, 0x03, // DATA, len 3
+            b'a', b'b', b'c', 0x01, 0x00, // HEADERS, len 0
+        ]));
+
+        let mut stream = std::pin::pin!(FrameStream::new(stream));
+        {
+            let first = stream.as_mut().next_frame().await.unwrap().unwrap();
+            assert_eq!(first.r#type(), Frame::DATA_FRAME_TYPE);
+            assert_eq!(first.length().into_inner(), 3);
+        }
+
+        stream
+            .as_mut()
+            .consume_current_frame()
+            .await
+            .expect("current frame is drained");
+        assert!(stream.as_mut().frame().is_none());
 
         let second = stream.as_mut().next_frame().await.unwrap().unwrap();
         assert_eq!(second.r#type(), Frame::HEADERS_FRAME_TYPE);
