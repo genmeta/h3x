@@ -1,12 +1,22 @@
 #![allow(clippy::type_complexity)]
 
-use std::net::IpAddr;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    net::IpAddr,
+};
 
 use super::*;
 use crate::dquic::{
     net::Family,
     qinterface::bind_uri::{BindUri, Scheme},
 };
+
+fn pattern_hash(pattern: &BindPattern) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    pattern.hash(&mut hasher);
+    hasher.finish()
+}
 
 // ============================================================================
 // Parsing — core parsing tests (from original "Parsing tests" section +
@@ -362,6 +372,22 @@ fn parsing_bare_ip() {
     }
 }
 
+#[test]
+fn parsing_suffix_edge_cases() {
+    let no_scheme: BindPattern = "V4.enp17s0:8080?reuse=true".parse().unwrap();
+    assert_eq!(no_scheme.scheme, Scheme::Iface);
+    assert_eq!(no_scheme.host.family(), Some(Family::V4));
+    assert_eq!(no_scheme.host.as_str(), "enp17s0");
+    assert_eq!(no_scheme.port, Some(8080));
+    assert_eq!(no_scheme.path_and_query_str(), Some("?reuse=true"));
+
+    let bare_ip: BindPattern = "127.0.0.1?temporary=true".parse().unwrap();
+    assert_eq!(bare_ip.scheme, Scheme::Inet);
+    assert_eq!(bare_ip.host.as_str(), "127.0.0.1");
+    assert_eq!(bare_ip.port, None);
+    assert_eq!(bare_ip.path_and_query_str(), Some("?temporary=true"));
+}
+
 // ============================================================================
 // Display roundtrip
 // ============================================================================
@@ -394,6 +420,21 @@ fn display_roundtrip() {
             .unwrap_or_else(|e| panic!("failed to parse '{input}': {e}"));
         assert_eq!(b.to_string(), *expected, "display mismatch for '{input}'");
     }
+}
+
+#[test]
+fn hash_includes_path_and_query_suffix() {
+    let with_suffix: BindPattern = "iface://v4.enp17s0:8080/?reuse=true".parse().unwrap();
+    let same_suffix: BindPattern = "iface://v4.enp17s0:8080/?reuse=true".parse().unwrap();
+    assert_eq!(pattern_hash(&with_suffix), pattern_hash(&same_suffix));
+
+    let without_suffix: BindPattern = "iface://v4.enp17s0:8080".parse().unwrap();
+    let same_without_suffix: BindPattern = "iface://v4.enp17s0:8080".parse().unwrap();
+    assert_ne!(pattern_hash(&with_suffix), pattern_hash(&without_suffix));
+    assert_eq!(
+        pattern_hash(&without_suffix),
+        pattern_hash(&same_without_suffix)
+    );
 }
 
 // ============================================================================
@@ -648,6 +689,17 @@ fn iface_pattern_matches_family_interface_and_port_separately() {
 
     let wildcard_family_and_port: BindPattern = "iface://en*".parse().unwrap();
     assert!(wildcard_family_and_port.matches(&"iface://v6.eno1:4433".parse().unwrap()));
+}
+
+#[test]
+fn pattern_matching_rejects_scheme_and_host_class_mismatches() {
+    let iface_pattern: BindPattern = "iface://v4.en*:8080".parse().unwrap();
+    let inet_uri: BindUri = "inet://127.0.0.1:8080".parse().unwrap();
+    assert!(!iface_pattern.matches(&inet_uri));
+
+    let iface_ip_pattern: BindPattern = "iface://127.0.0.1:8080".parse().unwrap();
+    let iface_uri: BindUri = "iface://v4.enp17s0:8080".parse().unwrap();
+    assert!(!iface_ip_pattern.matches(&iface_uri));
 }
 
 #[test]

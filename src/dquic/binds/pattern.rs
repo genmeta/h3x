@@ -46,6 +46,29 @@ impl Hash for BindPattern {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn match_helpers_reject_uri_of_other_shape() {
+        let iface_pattern: BindPattern = "iface://v4.en*:8080".parse().unwrap();
+        let inet_uri: BindUri = "inet://127.0.0.1:8080".parse().unwrap();
+        assert!(!iface_pattern.matches_iface_bind_uri(&inet_uri));
+
+        let inet_pattern: BindPattern = "inet://127.0.0.1:8080".parse().unwrap();
+        let iface_uri: BindUri = "iface://v4.enp17s0:8080".parse().unwrap();
+        assert!(!inet_pattern.matches_inet_bind_uri(&iface_uri));
+    }
+
+    #[test]
+    fn ip_hosts_do_not_match_interface_links() {
+        let pattern: BindPattern = "127.0.0.1:8080".parse().unwrap();
+
+        assert_eq!(pattern.match_interface_links("lo").count(), 0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Display
 // ---------------------------------------------------------------------------

@@ -126,7 +126,10 @@ impl PseudoHeaders {
 
 #[cfg(test)]
 mod tests {
-    use http::{Method, StatusCode, Uri, uri::PathAndQuery};
+    use http::{
+        Method, StatusCode, Uri,
+        uri::{PathAndQuery, Scheme},
+    };
 
     use super::{PseudoHeaders, asterisk_path, has_missing_path_component};
 
@@ -172,32 +175,65 @@ mod tests {
 
     #[test]
     fn request_defaults_http_and_https_missing_path_to_slash() {
-        let https = PseudoHeaders::request(Method::GET, Uri::from_static("https://example.com"));
-        let http = PseudoHeaders::request(Method::GET, Uri::from_static("http://example.com"));
+        let cases = [
+            (
+                Uri::from_static("https://example.com"),
+                Scheme::HTTPS,
+                "example.com",
+            ),
+            (
+                Uri::from_static("http://example.com"),
+                Scheme::HTTP,
+                "example.com",
+            ),
+        ];
 
-        for pseudo in [https, http] {
-            match pseudo {
-                PseudoHeaders::Request { path, .. } => {
-                    assert_eq!(path.as_ref().map(PathAndQuery::as_str), Some("/"));
+        for (uri, expected_scheme, expected_authority) in cases {
+            assert!(matches!(
+                PseudoHeaders::request(Method::GET, uri),
+                PseudoHeaders::Request {
+                    method: Some(Method::GET),
+                    scheme: Some(ref scheme),
+                    authority: Some(ref authority),
+                    path: Some(ref path),
+                    protocol: None,
                 }
-                PseudoHeaders::Response { .. } => panic!("request should produce request headers"),
-            }
+                    if scheme == &expected_scheme
+                        && authority.as_str() == expected_authority
+                        && path.as_str() == "/"
+            ));
         }
     }
 
     #[test]
     fn request_normalizes_query_only_http_and_https_uri_to_absolute_path() {
-        let https =
-            PseudoHeaders::request(Method::GET, Uri::from_static("https://example.com?x=1"));
-        let http = PseudoHeaders::request(Method::GET, Uri::from_static("http://example.com?x=1"));
+        let cases = [
+            (
+                Uri::from_static("https://example.com?x=1"),
+                Scheme::HTTPS,
+                "example.com",
+            ),
+            (
+                Uri::from_static("http://example.com?x=1"),
+                Scheme::HTTP,
+                "example.com",
+            ),
+        ];
 
-        for pseudo in [https, http] {
-            match pseudo {
-                PseudoHeaders::Request { path, .. } => {
-                    assert_eq!(path.as_ref().map(PathAndQuery::as_str), Some("/?x=1"));
+        for (uri, expected_scheme, expected_authority) in cases {
+            assert!(matches!(
+                PseudoHeaders::request(Method::GET, uri),
+                PseudoHeaders::Request {
+                    method: Some(Method::GET),
+                    scheme: Some(ref scheme),
+                    authority: Some(ref authority),
+                    path: Some(ref path),
+                    protocol: None,
                 }
-                PseudoHeaders::Response { .. } => panic!("request should produce request headers"),
-            }
+                    if scheme == &expected_scheme
+                        && authority.as_str() == expected_authority
+                        && path.as_str() == "/?x=1"
+            ));
         }
     }
 
@@ -206,6 +242,8 @@ mod tests {
         let asterisk_form = PseudoHeaders::request(Method::OPTIONS, Uri::from_static("*"));
         let authority_form =
             PseudoHeaders::request(Method::OPTIONS, Uri::from_static("example.com"));
+        let query_only =
+            PseudoHeaders::request(Method::OPTIONS, Uri::from_static("https://example.com?x=1"));
         let explicit_slash =
             PseudoHeaders::request(Method::OPTIONS, Uri::from_static("https://example.com/"));
         let explicit_slash_with_query = PseudoHeaders::request(
@@ -213,30 +251,67 @@ mod tests {
             Uri::from_static("https://example.com/?x=1"),
         );
 
-        match asterisk_form {
-            PseudoHeaders::Request { path, .. } => {
-                assert_eq!(path.as_ref().map(PathAndQuery::as_str), Some("*"));
+        assert!(matches!(
+            asterisk_form,
+            PseudoHeaders::Request {
+                method: Some(Method::OPTIONS),
+                scheme: None,
+                authority: None,
+                path: Some(ref path),
+                protocol: None,
             }
-            PseudoHeaders::Response { .. } => panic!("request should produce request headers"),
-        }
-        match authority_form {
-            PseudoHeaders::Request { path, .. } => {
-                assert_eq!(path.as_ref().map(PathAndQuery::as_str), Some("*"));
+                if path.as_str() == "*"
+        ));
+        assert!(matches!(
+            authority_form,
+            PseudoHeaders::Request {
+                method: Some(Method::OPTIONS),
+                scheme: None,
+                authority: Some(ref authority),
+                path: Some(ref path),
+                protocol: None,
             }
-            PseudoHeaders::Response { .. } => panic!("request should produce request headers"),
-        }
-        match explicit_slash {
-            PseudoHeaders::Request { path, .. } => {
-                assert_eq!(path.as_ref().map(PathAndQuery::as_str), Some("/"));
+                if authority.as_str() == "example.com" && path.as_str() == "*"
+        ));
+        assert!(matches!(
+            query_only,
+            PseudoHeaders::Request {
+                method: Some(Method::OPTIONS),
+                scheme: Some(ref scheme),
+                authority: Some(ref authority),
+                path: Some(ref path),
+                protocol: None,
             }
-            PseudoHeaders::Response { .. } => panic!("request should produce request headers"),
-        }
-        match explicit_slash_with_query {
-            PseudoHeaders::Request { path, .. } => {
-                assert_eq!(path.as_ref().map(PathAndQuery::as_str), Some("/?x=1"));
+                if scheme == &Scheme::HTTPS
+                    && authority.as_str() == "example.com"
+                    && path.as_str() == "*"
+        ));
+        assert!(matches!(
+            explicit_slash,
+            PseudoHeaders::Request {
+                method: Some(Method::OPTIONS),
+                scheme: Some(ref scheme),
+                authority: Some(ref authority),
+                path: Some(ref path),
+                protocol: None,
             }
-            PseudoHeaders::Response { .. } => panic!("request should produce request headers"),
-        }
+                if scheme == &Scheme::HTTPS
+                    && authority.as_str() == "example.com"
+                    && path.as_str() == "/"
+        ));
+        assert!(matches!(
+            explicit_slash_with_query,
+            PseudoHeaders::Request {
+                method: Some(Method::OPTIONS),
+                scheme: Some(ref scheme),
+                authority: Some(ref authority),
+                path: Some(ref path),
+                protocol: None,
+            }
+                if scheme == &Scheme::HTTPS
+                    && authority.as_str() == "example.com"
+                    && path.as_str() == "/?x=1"
+        ));
     }
 
     #[test]
