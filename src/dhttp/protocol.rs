@@ -909,10 +909,26 @@ mod tests {
         let observed = state
             .peer_settings()
             .await
-            .await
             .expect("peer settings should resolve");
 
         assert_eq!(observed, settings);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_resolves_to_connection_error_when_settings_never_arrive() {
+        let quic = Arc::new(MockConnection::new());
+        let erased_connection: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased_connection));
+        let state = ConnectionState::new_for_test(quic.clone(), Arc::new(protocols));
+        quic.set_terminal_error(test_transport_error("peer settings closed"));
+
+        let error = timeout(Duration::from_millis(100), state.peer_settings())
+            .await
+            .expect("peer settings should resolve on connection close")
+            .expect_err("connection closure should yield an error");
+
+        assert_transport_error_reason(&error, "peer settings closed");
     }
 
     #[tokio::test]
@@ -1632,15 +1648,18 @@ impl<C: ?Sized> ConnectionState<C> {
 }
 
 impl<C: quic::DynLifecycle + Sync> ConnectionState<C> {
-    pub async fn peer_settings(
-        &self,
-    ) -> impl Future<Output = Result<Arc<Settings>, quic::ConnectionError>> + Send + use<'_, C>
-    {
-        let error = self.closed();
-        (self.dhttp().peer_settings.get()).then(|option| match option {
-            Some(settings) => future::ready(Ok(settings)).left_future(),
-            None => error.map(Err).right_future(),
-        })
+    /// Per RFC 9114 §3.2/§6.2.1, SETTINGS MUST be the first frame on the
+    /// control stream; a connection that closes before SETTINGS arrives is in
+    /// error. Races [`Self::closed`] so callers cannot hang on a frame that
+    /// will never come, mirroring [`Self::peer_goawaies`].
+    pub async fn peer_settings(&self) -> Result<Arc<Settings>, quic::ConnectionError> {
+        let settings = self.dhttp().peer_settings.get();
+        let closed = self.closed();
+        match future::select(pin!(settings), pin!(closed)).await {
+            future::Either::Left((Some(settings), _)) => Ok(settings),
+            future::Either::Left((None, closed)) => Err(closed.await),
+            future::Either::Right((error, _)) => Err(error),
+        }
     }
 
     pub fn peer_goawaies(
