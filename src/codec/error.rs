@@ -757,6 +757,14 @@ mod tests {
     }
 
     #[test]
+    fn stream_decode_error_panics_on_untyped_io_error() {
+        let panic = std::panic::catch_unwind(|| {
+            let _ = StreamDecodeError::from(io::Error::other("plain decode error"));
+        });
+        assert!(panic.is_err());
+    }
+
+    #[test]
     fn connection_decode_error_converts_to_io() {
         let io_error = io::Error::from(ConnectionDecodeError::Connection {
             source: connection_error("connection"),
@@ -954,6 +962,14 @@ mod tests {
             panic!("expected encode error");
         };
         assert_eq!(source, EncodeError::HuffmanEncoding);
+    }
+
+    #[test]
+    fn stream_encode_error_panics_on_untyped_io_error() {
+        let panic = std::panic::catch_unwind(|| {
+            let _ = StreamEncodeError::from(io::Error::other("plain encode error"));
+        });
+        assert!(panic.is_err());
     }
 
     #[test]

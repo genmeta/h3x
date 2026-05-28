@@ -334,6 +334,70 @@ mod tests {
         futures::future::ready(Ok(control_sink(stream_id)))
     }
 
+    fn send_ok(stream: ControlSink, _item: Bytes) -> ControlReady {
+        futures::future::ready(Ok(stream))
+    }
+
+    fn operation_ok(stream: ControlSink) -> ControlReady {
+        futures::future::ready(Ok(stream))
+    }
+
+    fn send_pending(
+        _stream: ControlSink,
+        _item: Bytes,
+    ) -> futures::future::Pending<Result<ControlSink, MessageStreamError>> {
+        futures::future::pending()
+    }
+
+    fn operation_pending(
+        _stream: ControlSink,
+    ) -> futures::future::Pending<Result<ControlSink, MessageStreamError>> {
+        futures::future::pending()
+    }
+
+    fn send_message_failed(_stream: ControlSink, _item: Bytes) -> ControlReady {
+        futures::future::ready(Err(MessageStreamError::MessageSendFailed))
+    }
+
+    fn send_malformed_outgoing(_stream: ControlSink, _item: Bytes) -> ControlReady {
+        futures::future::ready(Err(MessageStreamError::MalformedOutgoingMessage))
+    }
+
+    fn operation_message_failed(_stream: ControlSink) -> ControlReady {
+        futures::future::ready(Err(MessageStreamError::MessageSendFailed))
+    }
+
+    fn operation_malformed_outgoing(_stream: ControlSink) -> ControlReady {
+        futures::future::ready(Err(MessageStreamError::MalformedOutgoingMessage))
+    }
+
+    fn record_send(stream: ControlSink, item: Bytes) -> ControlReady {
+        stream
+            .events
+            .lock()
+            .expect("event log poisoned")
+            .push(Event::Send(item));
+        futures::future::ready(Ok(stream))
+    }
+
+    fn record_flush(stream: ControlSink) -> ControlReady {
+        stream
+            .events
+            .lock()
+            .expect("event log poisoned")
+            .push(Event::Flush);
+        futures::future::ready(Ok(stream))
+    }
+
+    fn record_close(stream: ControlSink) -> ControlReady {
+        stream
+            .events
+            .lock()
+            .expect("event log poisoned")
+            .push(Event::Close);
+        futures::future::ready(Ok(stream))
+    }
+
     #[derive(Debug)]
     struct GateFuture {
         value: Option<ControlSink>,
@@ -466,30 +530,9 @@ mod tests {
                 stream_id: VarInt::from_u32(11),
                 events: events.clone(),
             },
-            |stream: ControlSink, item: Bytes| async move {
-                stream
-                    .events
-                    .lock()
-                    .expect("event log poisoned")
-                    .push(Event::Send(item));
-                Ok::<_, MessageStreamError>(stream)
-            },
-            |stream: ControlSink| async move {
-                stream
-                    .events
-                    .lock()
-                    .expect("event log poisoned")
-                    .push(Event::Flush);
-                Ok::<_, MessageStreamError>(stream)
-            },
-            |stream: ControlSink| async move {
-                stream
-                    .events
-                    .lock()
-                    .expect("event log poisoned")
-                    .push(Event::Close);
-                Ok::<_, MessageStreamError>(stream)
-            },
+            record_send,
+            record_flush,
+            record_close,
         ));
 
         poll_fn(|cx| sink.as_mut().poll_ready(cx))
@@ -526,7 +569,7 @@ mod tests {
                 stream_id: VarInt::from_u32(31),
                 events: Arc::new(Mutex::new(Vec::new())),
             },
-            |stream: ControlSink, _item: Bytes| async move { Ok::<_, MessageStreamError>(stream) },
+            send_ok,
             {
                 let flush_open = flush_open.clone();
                 let flush_started = flush_started.clone();
@@ -625,6 +668,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unfold_flush_and_close_wait_for_in_flight_send_before_starting() {
+        let send_open = Arc::new(AtomicBool::new(false));
+        let send_started = Arc::new(AtomicUsize::new(0));
+        let flush_started = Arc::new(AtomicUsize::new(0));
+        let mut flush_sink = Box::pin(unfold(
+            ControlSink {
+                stream_id: VarInt::from_u32(35),
+                events: Arc::new(Mutex::new(Vec::new())),
+            },
+            {
+                let send_open = send_open.clone();
+                let send_started = send_started.clone();
+                move |stream: ControlSink, _item: Bytes| {
+                    send_started.fetch_add(1, Ordering::SeqCst);
+                    GateFuture {
+                        value: Some(stream),
+                        open: send_open.clone(),
+                    }
+                }
+            },
+            {
+                let flush_started = flush_started.clone();
+                move |stream: ControlSink| {
+                    flush_started.fetch_add(1, Ordering::SeqCst);
+                    futures::future::ready(Ok::<_, MessageStreamError>(stream))
+                }
+            },
+            operation_ok,
+        ));
+
+        poll_fn(|cx| flush_sink.as_mut().poll_ready(cx))
+            .await
+            .expect("sink initially ready");
+        flush_sink
+            .as_mut()
+            .start_send(Bytes::from_static(b"payload"))
+            .expect("send accepted");
+        assert!(
+            poll_fn(|cx| flush_sink.as_mut().poll_flush(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert_eq!(send_started.load(Ordering::SeqCst), 1);
+        assert_eq!(flush_started.load(Ordering::SeqCst), 0);
+
+        send_open.store(true, Ordering::SeqCst);
+        poll_fn(|cx| flush_sink.as_mut().poll_flush(cx))
+            .await
+            .expect("flush starts after send completes");
+        assert_eq!(flush_started.load(Ordering::SeqCst), 1);
+
+        let send_open = Arc::new(AtomicBool::new(false));
+        let send_started = Arc::new(AtomicUsize::new(0));
+        let close_started = Arc::new(AtomicUsize::new(0));
+        let mut close_sink = Box::pin(unfold(
+            ControlSink {
+                stream_id: VarInt::from_u32(39),
+                events: Arc::new(Mutex::new(Vec::new())),
+            },
+            {
+                let send_open = send_open.clone();
+                let send_started = send_started.clone();
+                move |stream: ControlSink, _item: Bytes| {
+                    send_started.fetch_add(1, Ordering::SeqCst);
+                    GateFuture {
+                        value: Some(stream),
+                        open: send_open.clone(),
+                    }
+                }
+            },
+            operation_ok,
+            {
+                let close_started = close_started.clone();
+                move |stream: ControlSink| {
+                    close_started.fetch_add(1, Ordering::SeqCst);
+                    futures::future::ready(Ok::<_, MessageStreamError>(stream))
+                }
+            },
+        ));
+
+        poll_fn(|cx| close_sink.as_mut().poll_ready(cx))
+            .await
+            .expect("sink initially ready");
+        close_sink
+            .as_mut()
+            .start_send(Bytes::from_static(b"payload"))
+            .expect("send accepted");
+        assert!(
+            poll_fn(|cx| close_sink.as_mut().poll_close(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert_eq!(send_started.load(Ordering::SeqCst), 1);
+        assert_eq!(close_started.load(Ordering::SeqCst), 0);
+
+        send_open.store(true, Ordering::SeqCst);
+        poll_fn(|cx| close_sink.as_mut().poll_close(cx))
+            .await
+            .expect("close starts after send completes");
+        assert_eq!(close_started.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn unfold_poll_ready_waits_for_send_then_restores_control_traits() {
         let send_open = Arc::new(AtomicBool::new(false));
         let send_started = Arc::new(AtomicUsize::new(0));
@@ -647,8 +793,8 @@ mod tests {
                     }
                 }
             },
-            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
-            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
+            operation_ok,
+            operation_ok,
         ));
 
         poll_fn(|cx| sink.as_mut().poll_ready(cx))
@@ -694,9 +840,9 @@ mod tests {
                 stream_id,
                 events: events.clone(),
             },
-            |stream: ControlSink, _item: Bytes| async move { Ok::<_, MessageStreamError>(stream) },
-            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
-            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
+            send_ok,
+            operation_ok,
+            operation_ok,
         ));
 
         assert_eq!(
@@ -723,11 +869,9 @@ mod tests {
                 stream_id: VarInt::from_u32(37),
                 events,
             },
-            |_stream: ControlSink, _item: Bytes| {
-                futures::future::pending::<Result<ControlSink, MessageStreamError>>()
-            },
-            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
-            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
+            send_pending,
+            operation_ok,
+            operation_ok,
         ));
 
         poll_fn(|cx| sink.as_mut().poll_ready(cx))
@@ -761,9 +905,9 @@ mod tests {
                 stream_id: VarInt::from_u32(1),
                 events: Arc::new(Mutex::new(Vec::new())),
             },
-            |stream: ControlSink, _item: Bytes| async move { Ok::<_, MessageStreamError>(stream) },
-            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
-            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
+            send_ok,
+            operation_ok,
+            operation_ok,
         ));
         poll_fn(|cx| sink.as_mut().poll_ready(cx))
             .now_or_never()
@@ -789,11 +933,9 @@ mod tests {
                 stream_id: VarInt::from_u32(55),
                 events: Arc::new(Mutex::new(Vec::new())),
             },
-            |stream: ControlSink, _item: Bytes| async move { Ok::<_, MessageStreamError>(stream) },
-            |_stream: ControlSink| {
-                futures::future::pending::<Result<ControlSink, MessageStreamError>>()
-            },
-            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
+            send_ok,
+            operation_pending,
+            operation_ok,
         ));
         poll_fn(|cx| flush_sink.as_mut().poll_ready(cx))
             .await
@@ -823,11 +965,9 @@ mod tests {
                 stream_id: VarInt::from_u32(57),
                 events: Arc::new(Mutex::new(Vec::new())),
             },
-            |stream: ControlSink, _item: Bytes| async move { Ok::<_, MessageStreamError>(stream) },
-            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
-            |_stream: ControlSink| {
-                futures::future::pending::<Result<ControlSink, MessageStreamError>>()
-            },
+            send_ok,
+            operation_ok,
+            operation_pending,
         ));
         assert!(
             poll_fn(|cx| close_sink.as_mut().poll_close(cx))
@@ -847,17 +987,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unfold_flush_and_close_propagate_in_flight_send_errors() {
+        let mut flush_sink = Box::pin(unfold(
+            ControlSink {
+                stream_id: VarInt::from_u32(63),
+                events: Arc::new(Mutex::new(Vec::new())),
+            },
+            send_message_failed,
+            operation_malformed_outgoing,
+            operation_ok,
+        ));
+        poll_fn(|cx| flush_sink.as_mut().poll_ready(cx))
+            .await
+            .expect("flush sink ready");
+        flush_sink
+            .as_mut()
+            .start_send(Bytes::from_static(b"payload"))
+            .expect("send accepted");
+        assert!(matches!(
+            poll_fn(|cx| flush_sink.as_mut().poll_flush(cx)).await,
+            Err(MessageStreamError::MessageSendFailed)
+        ));
+
+        let mut close_sink = Box::pin(unfold(
+            ControlSink {
+                stream_id: VarInt::from_u32(64),
+                events: Arc::new(Mutex::new(Vec::new())),
+            },
+            send_malformed_outgoing,
+            operation_ok,
+            operation_message_failed,
+        ));
+        poll_fn(|cx| close_sink.as_mut().poll_ready(cx))
+            .await
+            .expect("close sink ready");
+        close_sink
+            .as_mut()
+            .start_send(Bytes::from_static(b"payload"))
+            .expect("send accepted");
+        assert!(matches!(
+            poll_fn(|cx| close_sink.as_mut().poll_close(cx)).await,
+            Err(MessageStreamError::MalformedOutgoingMessage)
+        ));
+    }
+
+    #[tokio::test]
     async fn unfold_propagates_flush_and_close_errors() {
         let mut flush_sink = Box::pin(unfold(
             ControlSink {
                 stream_id: VarInt::from_u32(61),
                 events: Arc::new(Mutex::new(Vec::new())),
             },
-            |stream: ControlSink, _item: Bytes| async move { Ok::<_, MessageStreamError>(stream) },
-            |_stream: ControlSink| async move {
-                Err::<ControlSink, _>(MessageStreamError::MessageSendFailed)
-            },
-            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
+            send_ok,
+            operation_message_failed,
+            operation_ok,
         ));
         poll_fn(|cx| flush_sink.as_mut().poll_ready(cx))
             .await
@@ -876,11 +1059,9 @@ mod tests {
                 stream_id: VarInt::from_u32(62),
                 events: Arc::new(Mutex::new(Vec::new())),
             },
-            |stream: ControlSink, _item: Bytes| async move { Ok::<_, MessageStreamError>(stream) },
-            |stream: ControlSink| async move { Ok::<_, MessageStreamError>(stream) },
-            |_stream: ControlSink| async move {
-                Err::<ControlSink, _>(MessageStreamError::MalformedOutgoingMessage)
-            },
+            send_ok,
+            operation_ok,
+            operation_malformed_outgoing,
         ));
         assert!(matches!(
             poll_fn(|cx| close_sink.as_mut().poll_close(cx)).await,
