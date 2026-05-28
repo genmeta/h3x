@@ -1435,6 +1435,17 @@ mod tests {
         assert_eq!(io_error.kind(), ErrorKind::BrokenPipe);
     }
 
+    #[test]
+    fn message_stream_error_io_kind_delegates_quic_connection_errors() {
+        use std::io::ErrorKind;
+
+        let io_error =
+            std::io::Error::from(MessageStreamError::from(transport_error("io conversion")));
+
+        assert_eq!(io_error.kind(), ErrorKind::BrokenPipe);
+        assert!(io_error.to_string().contains("io conversion"));
+    }
+
     #[tokio::test]
     async fn oversized_write_data_frame_reports_h3_frame_error_code() {
         let mut stream = write_stream_for_test(VarInt::from_u32(0));
@@ -1447,6 +1458,23 @@ mod tests {
         assert!(matches!(
             error,
             StreamError::H3 { source } if source.code() == Code::H3_FRAME_ERROR
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_data_frame_chunk_errors_when_data_payload_missing() {
+        let mut stream = read_stream_with_bytes(23, &[0x00, 0x03]).await;
+
+        let error = stream
+            .read_data_frame_chunk()
+            .await
+            .expect_err("missing DATA payload should fail immediately");
+
+        assert!(matches!(
+            error,
+            StreamError::Connection {
+                source: crate::connection::ConnectionError::H3 { source }
+            } if source.code() == Code::H3_FRAME_ERROR
         ));
     }
 
@@ -1938,6 +1966,104 @@ mod tests {
                 .expect("cancel code should be sent"),
             VarInt::from(Code::H3_MESSAGE_ERROR),
         );
+    }
+
+    #[tokio::test]
+    async fn handle_stream_error_passthrough_variants_do_not_reset_streams() {
+        let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
+        let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let mut reader = ReadStream::new(
+            StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
+                stream_id: VarInt::from_u32(30),
+                stop_tx,
+            })
+                as crate::codec::BoxReadStream)),
+            Arc::new(QPackDecoder::new(
+                Arc::new(Settings::default()),
+                qpack_decoder_sink(),
+                qpack_decoder_stream(),
+            )),
+            state.clone(),
+        );
+        let mut writer = WriteStream::new(
+            SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
+                stream_id: VarInt::from_u32(31),
+                cancel_tx,
+            })
+                as crate::codec::BoxWriteStream)),
+            Arc::new(QPackEncoder::new(
+                Arc::new(Settings::default()),
+                qpack_encoder_sink(),
+                qpack_encoder_stream(),
+            )),
+            state,
+        );
+
+        let reset_code = VarInt::from_u32(32);
+        let read_error = reader
+            .handle_stream_error(StreamError::Reset { code: reset_code })
+            .await;
+        let write_error = writer
+            .handle_stream_error(StreamError::Reset { code: reset_code })
+            .await;
+
+        assert!(matches!(
+            read_error,
+            quic::StreamError::Reset { code } if code == reset_code
+        ));
+        assert!(matches!(
+            write_error,
+            quic::StreamError::Reset { code } if code == reset_code
+        ));
+        assert!(
+            stop_rx.try_recv().is_err(),
+            "peer reset should not trigger STOP_SENDING"
+        );
+        assert!(
+            cancel_rx.try_recv().is_err(),
+            "peer reset should not trigger RESET_STREAM"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_stream_error_quic_connection_errors_return_source_without_close() {
+        let read_quic = Arc::new(MockConnection::new());
+        let write_quic = Arc::new(MockConnection::new());
+        let mut reader = read_stream_for_test(VarInt::from_u32(33));
+        let mut writer = write_stream_for_test(VarInt::from_u32(34));
+        reader.state = state_without_qpack(read_quic.clone()).erase();
+        writer.state = state_without_qpack(write_quic.clone()).erase();
+
+        let read_error = reader
+            .handle_stream_error(StreamError::Connection {
+                source: crate::connection::ConnectionError::Quic {
+                    source: transport_error("read passthrough"),
+                },
+            })
+            .await;
+        let write_error = writer
+            .handle_stream_error(StreamError::Connection {
+                source: crate::connection::ConnectionError::Quic {
+                    source: transport_error("write passthrough"),
+                },
+            })
+            .await;
+
+        assert!(matches!(
+            read_error,
+            quic::StreamError::Connection {
+                source: quic::ConnectionError::Transport { source }
+            } if source.reason == "read passthrough"
+        ));
+        assert!(matches!(
+            write_error,
+            quic::StreamError::Connection {
+                source: quic::ConnectionError::Transport { source }
+            } if source.reason == "write passthrough"
+        ));
+        assert!(read_quic.close_calls().is_empty());
+        assert!(write_quic.close_calls().is_empty());
     }
 
     #[tokio::test]

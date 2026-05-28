@@ -132,3 +132,76 @@ pub trait DecodeExt {
 }
 
 impl<S: ?Sized> DecodeExt for S {}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use futures::StreamExt;
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FailingItem;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum TestDecodeError {
+        Decode,
+        Io(io::ErrorKind),
+    }
+
+    impl From<io::Error> for TestDecodeError {
+        fn from(error: io::Error) -> Self {
+            Self::Io(error.kind())
+        }
+    }
+
+    impl<'s, S> DecodeFrom<&'s mut S> for FailingItem
+    where
+        S: AsyncBufRead + Send + 's,
+    {
+        type Error = TestDecodeError;
+
+        async fn decode_from(_stream: &'s mut S) -> Result<Self, Self::Error> {
+            Err(TestDecodeError::Decode)
+        }
+    }
+
+    struct FailingRead;
+
+    impl AsyncRead for FailingRead {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("read failed")))
+        }
+    }
+
+    #[tokio::test]
+    async fn into_decode_stream_yields_item_decode_errors() {
+        let decoder = io::Cursor::new([1]);
+        let stream = decoder.into_decode_stream::<FailingItem, TestDecodeError>();
+        futures::pin_mut!(stream);
+
+        assert_eq!(stream.next().await, Some(Err(TestDecodeError::Decode)));
+    }
+
+    #[tokio::test]
+    async fn into_decode_stream_yields_io_errors() {
+        let decoder = tokio::io::BufReader::new(FailingRead);
+        let stream = decoder.into_decode_stream::<FailingItem, TestDecodeError>();
+        futures::pin_mut!(stream);
+
+        assert_eq!(
+            stream.next().await,
+            Some(Err(TestDecodeError::Io(io::ErrorKind::Other)))
+        );
+    }
+}

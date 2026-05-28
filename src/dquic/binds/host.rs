@@ -358,11 +358,13 @@ mod tests {
         let glob_b = BindHost::classify("en*", Some(Family::V6)).unwrap();
         assert_ne!(glob_a, glob_b);
         assert_eq!(glob_a, BindHost::classify("en*", None).unwrap());
+        assert_ne!(exact_a, glob_a);
 
         let ip_a = BindHost::classify("::1", None).unwrap();
         let ip_b = BindHost::classify("::1", None).unwrap();
         let ipv4 = BindHost::classify("127.0.0.1", None).unwrap();
         assert_eq!(ip_a, ip_b);
         assert_ne!(ip_a, ipv4);
+        assert_ne!(glob_a, ip_a);
     }
 }

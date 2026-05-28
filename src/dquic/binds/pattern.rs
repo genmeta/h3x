@@ -67,6 +67,15 @@ mod tests {
 
         assert_eq!(pattern.match_interface_links("lo").count(), 0);
     }
+
+    #[test]
+    fn unknown_explicit_scheme_falls_back_to_iface() {
+        let pattern: BindPattern = "custom://v4.en*:8080/path?query".parse().unwrap();
+
+        assert_eq!(pattern.scheme, Scheme::Iface);
+        assert_eq!(pattern.path_and_query_str(), Some("/path?query"));
+        assert_eq!(pattern.to_string(), "iface://v4.en*:8080/path?query");
+    }
 }
 
 // ---------------------------------------------------------------------------
