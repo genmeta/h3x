@@ -365,6 +365,20 @@ mod tests {
         assert!(format!("{error:?}").contains(&overflow.to_string()));
     }
 
+    #[cfg(feature = "serde")]
+    #[test]
+    fn overflow_error_serializes_as_original_value() {
+        let overflow = VARINT_MAX as u128 + 1;
+        let error = VarInt::from_u128(overflow).expect_err("value above max is rejected");
+
+        let encoded = serde_json::to_value(error).expect("overflow serializes as u128 value");
+        assert_eq!(encoded, serde_json::json!(overflow));
+
+        let decoded: err::Overflow =
+            serde_json::from_value(encoded).expect("overflow deserializes from u128 value");
+        assert_eq!(decoded, error);
+    }
+
     async fn encode_decode_round_trip(value: u64) {
         let vi = VarInt::from_u64(value).unwrap();
         let mut buf = Vec::new();

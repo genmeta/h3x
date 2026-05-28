@@ -121,3 +121,4 @@ tracing-appender = "0.2"
 tracing-subscriber = "0.3"
 proptest = "1"
 remoc = { version = "0.18", default-features = false, features = ["default-codec-bincode"] }
+serde_json = "1"

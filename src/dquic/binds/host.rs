@@ -308,6 +308,17 @@ mod tests {
     }
 
     #[test]
+    fn exact_host_with_v6_family_matches_and_compares_by_family() {
+        let exact = BindHost::classify("[", Some(Family::V6)).unwrap();
+        assert_eq!(exact.family(), Some(Family::V6));
+        assert_eq!(exact.families(), [Family::V6]);
+        assert!(exact.matches("["));
+        assert!(!exact.matches("]"));
+        assert_eq!(exact, BindHost::classify("[", Some(Family::V6)).unwrap());
+        assert_ne!(exact, BindHost::classify("[", Some(Family::V4)).unwrap());
+    }
+
+    #[test]
     fn host_display_debug_and_hash() {
         let literal = BindHost::classify("enp17s0", None).unwrap();
         assert_eq!(format!("{literal}"), "enp17s0");

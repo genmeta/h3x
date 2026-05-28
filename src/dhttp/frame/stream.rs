@@ -399,6 +399,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consume_current_frame_returns_stored_decode_error() {
+        let mut stream = std::pin::pin!(FrameStream::new(StreamReader::new(to_pre_byte_stream([
+            0x00, // frame type present but length missing
+        ]))));
+
+        let error = match stream.as_mut().next_frame().await {
+            Some(Err(error)) => error,
+            Some(Ok(_)) => panic!("expected frame decode error"),
+            None => panic!("expected frame decode error"),
+        };
+        expect_h3_frame_decode_error(error);
+
+        let error = stream
+            .as_mut()
+            .consume_current_frame()
+            .await
+            .expect_err("stored decode error should be returned");
+        expect_h3_frame_decode_error(error);
+    }
+
+    #[tokio::test]
     async fn incomplete_payload_error_propagates_on_consume() {
         let mut stream = std::pin::pin!(FrameStream::new(StreamReader::new(to_pre_byte_stream([
             0x00, 0x05, // DATA len 5

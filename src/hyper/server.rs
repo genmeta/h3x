@@ -291,6 +291,8 @@ mod tests {
         uri: Mutex<Option<http::Uri>>,
         stream_id_seen: Mutex<Option<StreamId>>,
         connection_seen: AtomicUsize,
+        read_takeover_seen: AtomicUsize,
+        write_takeover_seen: AtomicUsize,
         body: Mutex<Option<Bytes>>,
     }
 
@@ -316,6 +318,20 @@ mod tests {
                 .is_some()
             {
                 self.connection_seen.fetch_add(1, Ordering::Relaxed);
+            }
+            if request
+                .extensions()
+                .get::<TakeoverSlot<ReadStream>>()
+                .is_some()
+            {
+                self.read_takeover_seen.fetch_add(1, Ordering::Relaxed);
+            }
+            if request
+                .extensions()
+                .get::<TakeoverSlot<WriteStream>>()
+                .is_some()
+            {
+                self.write_takeover_seen.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -571,7 +587,43 @@ mod tests {
         );
         assert_eq!(state.stream_id(), Some(StreamId(VarInt::from_u32(0))));
         assert_eq!(state.connection_seen.load(Ordering::Relaxed), 1);
+        assert_eq!(state.read_takeover_seen.load(Ordering::Relaxed), 0);
+        assert_eq!(state.write_takeover_seen.load(Ordering::Relaxed), 0);
         assert_eq!(state.body(), Some(Bytes::from_static(b"payload")));
+    }
+
+    #[tokio::test]
+    async fn tower_service_connect_request_exposes_write_takeover_and_flushes_response() {
+        let state = Arc::new(ServiceState::default());
+        let mut service = TowerService(TestTowerService {
+            state: state.clone(),
+        });
+        let request = http::Request::builder()
+            .method(Method::CONNECT)
+            .uri("example.test:443")
+            .body(Full::new(Bytes::new()))
+            .expect("connect request should be valid");
+        let (unresolved, mut response_reader) = request_pair(request).await;
+
+        service
+            .call(unresolved)
+            .await
+            .expect("connect request should be handled");
+
+        let parts = response_reader
+            .read_hyper_response_parts()
+            .await
+            .expect("flushed connect response headers should be readable");
+        assert_eq!(parts.status, StatusCode::CREATED);
+        assert_eq!(parts.headers.get("x-service").unwrap(), "tower");
+        assert_eq!(state.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(state.method(), Some(Method::CONNECT));
+        assert_eq!(state.uri(), Some("example.test:443".parse().unwrap()));
+        assert_eq!(state.stream_id(), Some(StreamId(VarInt::from_u32(0))));
+        assert_eq!(state.connection_seen.load(Ordering::Relaxed), 1);
+        assert_eq!(state.read_takeover_seen.load(Ordering::Relaxed), 1);
+        assert_eq!(state.write_takeover_seen.load(Ordering::Relaxed), 1);
+        assert_eq!(state.body(), Some(Bytes::new()));
     }
 
     #[tokio::test]
@@ -607,7 +659,43 @@ mod tests {
         );
         assert_eq!(state.stream_id(), Some(StreamId(VarInt::from_u32(0))));
         assert_eq!(state.connection_seen.load(Ordering::Relaxed), 1);
+        assert_eq!(state.read_takeover_seen.load(Ordering::Relaxed), 0);
+        assert_eq!(state.write_takeover_seen.load(Ordering::Relaxed), 0);
         assert_eq!(state.body(), Some(Bytes::from_static(b"body")));
+    }
+
+    #[tokio::test]
+    async fn hyper_service_connect_request_exposes_write_takeover_and_flushes_response() {
+        let state = Arc::new(ServiceState::default());
+        let mut service = HyperService(TestHyperService {
+            state: state.clone(),
+        });
+        let request = http::Request::builder()
+            .method(Method::CONNECT)
+            .uri("example.test:443")
+            .body(Full::new(Bytes::new()))
+            .expect("connect request should be valid");
+        let (unresolved, mut response_reader) = request_pair(request).await;
+
+        service
+            .call(unresolved)
+            .await
+            .expect("connect request should be handled");
+
+        let parts = response_reader
+            .read_hyper_response_parts()
+            .await
+            .expect("flushed connect response headers should be readable");
+        assert_eq!(parts.status, StatusCode::ACCEPTED);
+        assert_eq!(parts.headers.get("x-service").unwrap(), "hyper");
+        assert_eq!(state.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(state.method(), Some(Method::CONNECT));
+        assert_eq!(state.uri(), Some("example.test:443".parse().unwrap()));
+        assert_eq!(state.stream_id(), Some(StreamId(VarInt::from_u32(0))));
+        assert_eq!(state.connection_seen.load(Ordering::Relaxed), 1);
+        assert_eq!(state.read_takeover_seen.load(Ordering::Relaxed), 1);
+        assert_eq!(state.write_takeover_seen.load(Ordering::Relaxed), 1);
+        assert_eq!(state.body(), Some(Bytes::new()));
     }
 
     #[test]
