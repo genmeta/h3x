@@ -224,6 +224,9 @@ mod tests {
         AsyncWriteExt::flush(&mut stream)
             .await
             .expect("payload flush");
+        AsyncWriteExt::shutdown(&mut stream)
+            .await
+            .expect("payload shutdown");
 
         let mut inner = stream.into_inner();
         let decoded_type = inner
@@ -287,18 +290,17 @@ mod tests {
 
     #[tokio::test]
     async fn accept_rejects_missing_stream_type() {
-        let error = match UnidirectionalStream::accept(BufList::new()).await {
-            Ok(_) => panic!("stream type is mandatory"),
-            Err(error) => error,
-        };
+        let error = UnidirectionalStream::accept(BufList::new())
+            .await
+            .err()
+            .expect("stream type is mandatory");
 
-        let StreamError::Connection { source } = error else {
-            panic!("missing stream type should be connection-scoped");
-        };
-        let crate::connection::ConnectionError::H3 { source } = source else {
-            panic!("missing stream type should map to an H3 connection error");
-        };
-        assert_eq!(source.code(), crate::error::Code::H3_GENERAL_PROTOCOL_ERROR);
+        assert!(matches!(
+            error,
+            StreamError::Connection {
+                source: crate::connection::ConnectionError::H3 { source },
+            } if source.code() == crate::error::Code::H3_GENERAL_PROTOCOL_ERROR
+        ));
     }
 
     #[tokio::test]
@@ -364,6 +366,9 @@ mod tests {
         sink.send(Bytes::from_static(b"ignored"))
             .await
             .expect("sink forwards to inner drain");
+        sink.close()
+            .await
+            .expect("sink close forwards to inner drain");
     }
 
     #[derive(Debug)]

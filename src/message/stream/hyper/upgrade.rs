@@ -306,6 +306,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cloned_remain_stream_receives_from_shared_receiver() {
+        let (tx, stream) = RemainStream::<u8>::pending();
+        let mut cloned = stream.clone();
+
+        tx.send(9).expect("receiver is still alive");
+
+        let value = poll_fn(|cx| Pin::new(&mut cloned).poll(cx)).await;
+        assert_eq!(value, Some(9));
+    }
+
+    #[tokio::test]
+    async fn cloned_takeover_slot_shares_taken_state() {
+        let slot = TakeoverSlot::new(RemainStream::immediately(33u8));
+        let cloned = slot.clone();
+
+        let first = poll_fn(|cx| cloned.poll_take(cx)).await;
+        assert_eq!(first, Ok(33));
+
+        let second = poll_fn(|cx| slot.poll_take(cx)).await;
+        assert_eq!(second, Err(TakeoverError::AlreadyTaken));
+    }
+
+    #[tokio::test]
     async fn takeover_works_for_response_and_mut_ref_variants() {
         let mut response = http::Response::new(http_body_util::Empty::<Bytes>::new());
         response
