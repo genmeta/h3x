@@ -124,3 +124,12 @@ remoc = { version = "0.18", default-features = false, features = [
     "default-codec-bincode",
 ] }
 serde_json = "1"
+
+# Root-only local stack coherence patches. These keep h3x aligned with the
+# sibling repositories in this multi-repo checkout when Cargo.lock has stale
+# git revisions.
+[patch."https://github.com/genmeta/dhttp.git"]
+dhttp-identity = { path = "../dhttp/identity" }
+
+[patch."https://github.com/genmeta/dquic.git"]
+dquic = { path = "../dquic/dquic" }

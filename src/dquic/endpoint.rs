@@ -635,9 +635,26 @@ impl QuicEndpoint {
     fn connection_has_paths(
         connection: &Connection,
     ) -> Result<bool, crate::dquic::qbase::error::Error> {
-        connection
-            .path_context()
-            .map(|ctx| !ctx.paths::<Vec<_>>().is_empty())
+        let ctx = connection.path_context()?;
+        Ok(ctx
+            .paths::<Vec<_>>()
+            .into_iter()
+            .any(|(pathway, _)| Self::pathway_is_connect_ready(pathway)))
+    }
+
+    fn pathway_is_connect_ready(
+        pathway: crate::dquic::qbase::net::route::Pathway,
+    ) -> bool {
+        match (pathway.local(), pathway.remote()) {
+            (EndpointAddr::Direct { addr: local }, EndpointAddr::Direct { addr: remote }) => {
+                Self::direct_path_is_connect_ready(local, remote)
+            }
+            _ => true,
+        }
+    }
+
+    fn direct_path_is_connect_ready(local: SocketAddr, remote: SocketAddr) -> bool {
+        local.ip().is_loopback() == remote.ip().is_loopback()
     }
 
     fn spawn_path_discovery_companion<S>(
@@ -915,6 +932,52 @@ mod tests {
         assert!(
             QuicEndpoint::connection_has_paths(&connection).expect("path context"),
             "local endpoint replayed before DNS peer must be retained for peer pairing"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_to_non_loopback_direct_path_is_not_connect_ready() {
+        let bind_pattern = BindPattern::from_str("inet://127.0.0.1:0").expect("valid bind pattern");
+        let bind_endpoint = QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .bind(Arc::new(vec![bind_pattern.clone()]))
+            .build()
+            .await;
+        let tls = bind_endpoint.ensure_client().expect("client tls");
+        let connection = bind_endpoint
+            .build_client_connection("server.example", tls)
+            .expect("client connection");
+        let iface = bind_endpoint
+            .network
+            .quic()
+            .get_interfaces(&bind_pattern)
+            .expect("registered bind")
+            .into_iter()
+            .next()
+            .expect("bound interface");
+
+        use crate::dquic::net::IO as _;
+        let bind_uri = iface.bind_uri();
+        let local_addr = iface.borrow().bound_addr().expect("bound address");
+        let data: Arc<dyn Any + Send + Sync> =
+            Arc::new(Ok::<SocketAddr, std::io::Error>(local_addr));
+        QuicEndpoint::handle_local_addr_event(
+            &connection,
+            bind_uri,
+            crate::dquic::qinterface::component::location::AddressEvent::Upsert(data),
+        );
+
+        QuicEndpoint::add_resolved_peer_endpoint(
+            &connection,
+            Source::H3 {
+                server: Arc::from("https://dns.genmeta.net:4433"),
+            },
+            EndpointAddr::direct("10.10.0.100:47388".parse().expect("remote addr")),
+        );
+
+        assert!(
+            !QuicEndpoint::connection_has_paths(&connection).expect("path context"),
+            "loopback-to-non-loopback direct paths are not ready for client handshake"
         );
     }
 
