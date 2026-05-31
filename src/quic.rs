@@ -12,7 +12,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use dhttp_identity::identity::{LocalAgent, RemoteAgent};
+use dhttp_identity::identity::{LocalAuthority, RemoteAuthority};
 use futures::{Sink, Stream, future::BoxFuture};
 use http::uri::Authority;
 use snafu::Snafu;
@@ -248,48 +248,56 @@ impl<T: ManageStream> DynManageStream for T {
     }
 }
 
-/// AFIT version of local agent access.
-pub trait WithLocalAgent: Send + Sync {
-    type LocalAgent: LocalAgent + 'static;
-    fn local_agent(
+/// AFIT version of local authority access.
+pub trait WithLocalAuthority: Send + Sync {
+    type LocalAuthority: LocalAuthority + 'static;
+    fn local_authority(
         &self,
-    ) -> impl Future<Output = Result<Option<Self::LocalAgent>, ConnectionError>> + Send + '_;
+    ) -> impl Future<Output = Result<Option<Self::LocalAuthority>, ConnectionError>> + Send + '_;
 }
 
-/// Object-safe version of [`WithLocalAgent`] with type-erased agent.
-pub trait DynWithLocalAgent: Send + Sync {
-    fn local_agent(&self) -> BoxFuture<'_, Result<Option<Arc<dyn LocalAgent>>, ConnectionError>>;
+/// Object-safe version of [`WithLocalAuthority`] with type-erased agent.
+pub trait DynWithLocalAuthority: Send + Sync {
+    fn local_authority(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<Arc<dyn LocalAuthority>>, ConnectionError>>;
 }
 
-impl<T: WithLocalAgent> DynWithLocalAgent for T {
-    fn local_agent(&self) -> BoxFuture<'_, Result<Option<Arc<dyn LocalAgent>>, ConnectionError>> {
+impl<T: WithLocalAuthority> DynWithLocalAuthority for T {
+    fn local_authority(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<Arc<dyn LocalAuthority>>, ConnectionError>> {
         Box::pin(async {
-            WithLocalAgent::local_agent(self)
+            WithLocalAuthority::local_authority(self)
                 .await
-                .map(|opt| opt.map(|a| Arc::new(a) as Arc<dyn LocalAgent>))
+                .map(|opt| opt.map(|a| Arc::new(a) as Arc<dyn LocalAuthority>))
         })
     }
 }
 
-/// AFIT version of remote agent access.
-pub trait WithRemoteAgent: Send + Sync {
-    type RemoteAgent: RemoteAgent + 'static;
-    fn remote_agent(
+/// AFIT version of remote authority access.
+pub trait WithRemoteAuthority: Send + Sync {
+    type RemoteAuthority: RemoteAuthority + 'static;
+    fn remote_authority(
         &self,
-    ) -> impl Future<Output = Result<Option<Self::RemoteAgent>, ConnectionError>> + Send + '_;
+    ) -> impl Future<Output = Result<Option<Self::RemoteAuthority>, ConnectionError>> + Send + '_;
 }
 
-/// Object-safe version of [`WithRemoteAgent`] with type-erased agent.
-pub trait DynWithRemoteAgent: Send + Sync {
-    fn remote_agent(&self) -> BoxFuture<'_, Result<Option<Arc<dyn RemoteAgent>>, ConnectionError>>;
+/// Object-safe version of [`WithRemoteAuthority`] with type-erased agent.
+pub trait DynWithRemoteAuthority: Send + Sync {
+    fn remote_authority(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<Arc<dyn RemoteAuthority>>, ConnectionError>>;
 }
 
-impl<T: WithRemoteAgent> DynWithRemoteAgent for T {
-    fn remote_agent(&self) -> BoxFuture<'_, Result<Option<Arc<dyn RemoteAgent>>, ConnectionError>> {
+impl<T: WithRemoteAuthority> DynWithRemoteAuthority for T {
+    fn remote_authority(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<Arc<dyn RemoteAuthority>>, ConnectionError>> {
         Box::pin(async {
-            WithRemoteAgent::remote_agent(self)
+            WithRemoteAuthority::remote_authority(self)
                 .await
-                .map(|opt| opt.map(|a| Arc::new(a) as Arc<dyn RemoteAgent>))
+                .map(|opt| opt.map(|a| Arc::new(a) as Arc<dyn RemoteAuthority>))
         })
     }
 }
@@ -301,8 +309,8 @@ impl<T: WithRemoteAgent> DynWithRemoteAgent for T {
 /// # Error latching contract
 ///
 /// A connection has a single terminal error. Once **any** operation on the same
-/// connection — including [`ManageStream`], [`WithLocalAgent`],
-/// [`WithRemoteAgent`], or [`Lifecycle`] methods — returns a
+/// connection — including [`ManageStream`], [`WithLocalAuthority`],
+/// [`WithRemoteAuthority`], or [`Lifecycle`] methods — returns a
 /// [`ConnectionError`] (directly, or wrapped in
 /// [`StreamError::Connection`]), the connection is considered dead and:
 ///
@@ -365,23 +373,30 @@ impl<T: ?Sized + Lifecycle> DynLifecycle for T {
 /// Not object-safe due to associated types. Use [`DynConnection`] for
 /// type-erased usage.
 pub trait Connection:
-    ManageStream + WithLocalAgent + WithRemoteAgent + Lifecycle + Send + Sync + Any
+    ManageStream + WithLocalAuthority + WithRemoteAuthority + Lifecycle + Send + Sync + Any
 {
 }
 
-impl<C: ManageStream + WithLocalAgent + WithRemoteAgent + Lifecycle + Send + Sync + Any> Connection
-    for C
+impl<C: ManageStream + WithLocalAuthority + WithRemoteAuthority + Lifecycle + Send + Sync + Any>
+    Connection for C
 {
 }
 
 /// Object-safe composite trait for type-erased connections.
 pub trait DynConnection:
-    DynManageStream + DynWithLocalAgent + DynWithRemoteAgent + DynLifecycle + Send + Sync + Any
+    DynManageStream + DynWithLocalAuthority + DynWithRemoteAuthority + DynLifecycle + Send + Sync + Any
 {
 }
 
-impl<C: DynManageStream + DynWithLocalAgent + DynWithRemoteAgent + DynLifecycle + Send + Sync + Any>
-    DynConnection for C
+impl<
+    C: DynManageStream
+        + DynWithLocalAuthority
+        + DynWithRemoteAuthority
+        + DynLifecycle
+        + Send
+        + Sync
+        + Any,
+> DynConnection for C
 {
 }
 

@@ -368,9 +368,9 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct NoAgent;
+    struct NoAuthority;
 
-    impl dhttp_identity::identity::LocalAgent for NoAgent {
+    impl dhttp_identity::identity::LocalAuthority for NoAuthority {
         fn name(&self) -> &str {
             "none"
         }
@@ -393,7 +393,7 @@ mod tests {
         }
     }
 
-    impl dhttp_identity::identity::RemoteAgent for NoAgent {
+    impl dhttp_identity::identity::RemoteAuthority for NoAuthority {
         fn name(&self) -> &str {
             "none"
         }
@@ -514,18 +514,18 @@ mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for TestConnection {
-        type LocalAgent = NoAgent;
+    impl quic::WithLocalAuthority for TestConnection {
+        type LocalAuthority = NoAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, ConnectionError> {
+        async fn local_authority(&self) -> Result<Option<Self::LocalAuthority>, ConnectionError> {
             Ok(None)
         }
     }
 
-    impl quic::WithRemoteAgent for TestConnection {
-        type RemoteAgent = NoAgent;
+    impl quic::WithRemoteAuthority for TestConnection {
+        type RemoteAuthority = NoAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, ConnectionError> {
+        async fn remote_authority(&self) -> Result<Option<Self::RemoteAuthority>, ConnectionError> {
             Ok(None)
         }
     }
@@ -722,28 +722,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_agent_reports_empty_identity_material() {
-        let agent = NoAgent;
+    async fn test_authority_reports_empty_identity_material() {
+        let authority = NoAuthority;
 
-        assert_eq!(dhttp_identity::identity::LocalAgent::name(&agent), "none");
-        assert!(dhttp_identity::identity::LocalAgent::cert_chain(&agent).is_empty());
         assert_eq!(
-            dhttp_identity::identity::LocalAgent::sign_algorithm(&agent),
+            dhttp_identity::identity::LocalAuthority::name(&authority),
+            "none"
+        );
+        assert!(dhttp_identity::identity::LocalAuthority::cert_chain(&authority).is_empty());
+        assert_eq!(
+            dhttp_identity::identity::LocalAuthority::sign_algorithm(&authority),
             rustls::SignatureAlgorithm::ED25519
         );
         assert_eq!(
-            dhttp_identity::identity::LocalAgent::sign(
-                &agent,
+            dhttp_identity::identity::LocalAuthority::sign(
+                &authority,
                 rustls::SignatureScheme::ED25519,
                 b"payload",
             )
             .await
-            .expect("test agent sign"),
+            .expect("test authority sign"),
             Vec::<u8>::new()
         );
 
-        assert_eq!(dhttp_identity::identity::RemoteAgent::name(&agent), "none");
-        assert!(dhttp_identity::identity::RemoteAgent::cert_chain(&agent).is_empty());
+        assert_eq!(
+            dhttp_identity::identity::RemoteAuthority::name(&authority),
+            "none"
+        );
+        assert!(dhttp_identity::identity::RemoteAuthority::cert_chain(&authority).is_empty());
     }
 
     #[test]
@@ -1014,15 +1020,15 @@ mod tests {
             .expect("accept succeeds");
 
         assert!(
-            quic::WithLocalAgent::local_agent(handle.as_ref())
+            quic::WithLocalAuthority::local_authority(handle.as_ref())
                 .await
-                .expect("local agent rpc")
+                .expect("local authority rpc")
                 .is_none()
         );
         assert!(
-            quic::WithRemoteAgent::remote_agent(handle.as_ref())
+            quic::WithRemoteAuthority::remote_authority(handle.as_ref())
                 .await
-                .expect("remote agent rpc")
+                .expect("remote authority rpc")
                 .is_none()
         );
 

@@ -362,18 +362,22 @@ mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for QueuedConnection {
-        type LocalAgent = crate::connection::tests::TestLocalAgent;
+    impl quic::WithLocalAuthority for QueuedConnection {
+        type LocalAuthority = crate::connection::tests::TestLocalAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+        async fn local_authority(
+            &self,
+        ) -> Result<Option<Self::LocalAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
 
-    impl quic::WithRemoteAgent for QueuedConnection {
-        type RemoteAgent = crate::connection::tests::TestRemoteAgent;
+    impl quic::WithRemoteAuthority for QueuedConnection {
+        type RemoteAuthority = crate::connection::tests::TestRemoteAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+        async fn remote_authority(
+            &self,
+        ) -> Result<Option<Self::RemoteAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }

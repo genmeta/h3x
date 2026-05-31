@@ -1,4 +1,4 @@
-use dhttp_identity::identity::{self as agent, SignError, VerifyError};
+use dhttp_identity::identity::{self as authority, SignError, VerifyError};
 use futures::future::BoxFuture;
 use rustls::{
     SignatureScheme,
@@ -11,9 +11,9 @@ use super::serde_types::{
 };
 use crate::quic;
 
-/// Remote trait for [`agent::LocalAgent`], exposing all 6 methods over remoc RTC.
+/// Remote trait for [`authority::LocalAuthority`], exposing all 6 methods over remoc RTC.
 #[remoc::rtc::remote]
-pub trait LocalAgent: Send + Sync {
+pub trait LocalAuthority: Send + Sync {
     async fn name(&self) -> Result<String, quic::ConnectionError>;
     async fn cert_chain(&self) -> Result<Vec<SerdeCertificateDer>, quic::ConnectionError>;
     async fn sign_algorithm(&self) -> Result<SerdeSignatureAlgorithm, quic::ConnectionError>;
@@ -31,9 +31,9 @@ pub trait LocalAgent: Send + Sync {
     ) -> Result<bool, quic::ConnectionError>;
 }
 
-/// Remote trait for [`agent::RemoteAgent`], exposing all 4 methods over remoc RTC.
+/// Remote trait for [`authority::RemoteAuthority`], exposing all 4 methods over remoc RTC.
 #[remoc::rtc::remote]
-pub trait RemoteAgent: Send + Sync {
+pub trait RemoteAuthority: Send + Sync {
     async fn name(&self) -> Result<String, quic::ConnectionError>;
     async fn cert_chain(&self) -> Result<Vec<SerdeCertificateDer>, quic::ConnectionError>;
     async fn public_key(&self) -> Result<SerdeSubjectPublicKeyInfoDer, quic::ConnectionError>;
@@ -45,26 +45,26 @@ pub trait RemoteAgent: Send + Sync {
     ) -> Result<bool, quic::ConnectionError>;
 }
 
-pub struct CachedLocalAgent {
-    client: LocalAgentClient,
+pub struct CachedLocalAuthority {
+    client: LocalAuthorityClient,
     name: String,
     cert_chain: Vec<CertificateDer<'static>>,
     sign_algorithm: rustls::SignatureAlgorithm,
 }
 
-impl std::fmt::Debug for CachedLocalAgent {
+impl std::fmt::Debug for CachedLocalAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedRemoteLocalAgent")
+        f.debug_struct("CachedRemoteLocalAuthority")
             .field("name", &self.name)
             .field("sign_algorithm", &self.sign_algorithm)
             .finish_non_exhaustive()
     }
 }
 
-impl CachedLocalAgent {
+impl CachedLocalAuthority {
     /// Create a new cached wrapper by eagerly fetching synchronous fields from
-    /// the remote agent.
-    pub async fn from_client(client: LocalAgentClient) -> Result<Self, quic::ConnectionError> {
+    /// the remote authority.
+    pub async fn from_client(client: LocalAuthorityClient) -> Result<Self, quic::ConnectionError> {
         let name = client.name().await?;
         let cert_chain: Vec<CertificateDer<'static>> = client
             .cert_chain()
@@ -82,7 +82,7 @@ impl CachedLocalAgent {
     }
 }
 
-impl agent::LocalAgent for CachedLocalAgent {
+impl authority::LocalAuthority for CachedLocalAuthority {
     fn name(&self) -> &str {
         &self.name
     }
@@ -115,7 +115,7 @@ impl agent::LocalAgent for CachedLocalAgent {
     }
 
     fn public_key(&self) -> SubjectPublicKeyInfoDer<'_> {
-        agent::extract_public_key(agent::LocalAgent::cert_chain(self))
+        authority::extract_public_key(authority::LocalAuthority::cert_chain(self))
     }
 
     fn verify(
@@ -124,31 +124,35 @@ impl agent::LocalAgent for CachedLocalAgent {
         data: &[u8],
         signature: &[u8],
     ) -> BoxFuture<'_, Result<bool, VerifyError>> {
-        let result =
-            agent::verify_signature(agent::LocalAgent::public_key(self), scheme, data, signature);
+        let result = authority::verify_signature(
+            authority::LocalAuthority::public_key(self),
+            scheme,
+            data,
+            signature,
+        );
         Box::pin(std::future::ready(result))
     }
 }
 
-pub struct CachedRemoteAgent {
+pub struct CachedRemoteAuthority {
     #[allow(dead_code)]
-    client: RemoteAgentClient,
+    client: RemoteAuthorityClient,
     name: String,
     cert_chain: Vec<CertificateDer<'static>>,
 }
 
-impl std::fmt::Debug for CachedRemoteAgent {
+impl std::fmt::Debug for CachedRemoteAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedRemoteRemoteAgent")
+        f.debug_struct("CachedRemoteRemoteAuthority")
             .field("name", &self.name)
             .finish_non_exhaustive()
     }
 }
 
-impl CachedRemoteAgent {
+impl CachedRemoteAuthority {
     /// Create a new cached wrapper by eagerly fetching synchronous fields from
-    /// the remote agent.
-    pub async fn from_client(client: RemoteAgentClient) -> Result<Self, quic::ConnectionError> {
+    /// the remote authority.
+    pub async fn from_client(client: RemoteAuthorityClient) -> Result<Self, quic::ConnectionError> {
         let name = client.name().await?;
         let cert_chain: Vec<CertificateDer<'static>> = client
             .cert_chain()
@@ -164,7 +168,7 @@ impl CachedRemoteAgent {
     }
 }
 
-impl agent::RemoteAgent for CachedRemoteAgent {
+impl authority::RemoteAuthority for CachedRemoteAuthority {
     fn name(&self) -> &str {
         &self.name
     }
@@ -174,7 +178,7 @@ impl agent::RemoteAgent for CachedRemoteAgent {
     }
 
     fn public_key(&self) -> SubjectPublicKeyInfoDer<'_> {
-        agent::extract_public_key(agent::RemoteAgent::cert_chain(self))
+        authority::extract_public_key(authority::RemoteAuthority::cert_chain(self))
     }
 
     fn verify(
@@ -183,8 +187,8 @@ impl agent::RemoteAgent for CachedRemoteAgent {
         data: &[u8],
         signature: &[u8],
     ) -> BoxFuture<'_, Result<bool, VerifyError>> {
-        let result = agent::verify_signature(
-            agent::RemoteAgent::public_key(self),
+        let result = authority::verify_signature(
+            authority::RemoteAuthority::public_key(self),
             scheme,
             data,
             signature,
@@ -193,12 +197,12 @@ impl agent::RemoteAgent for CachedRemoteAgent {
     }
 }
 
-impl<A> LocalAgent for A
+impl<A> LocalAuthority for A
 where
-    A: agent::LocalAgent + Send + Sync,
+    A: authority::LocalAuthority + Send + Sync,
 {
     async fn name(&self) -> Result<String, quic::ConnectionError> {
-        Ok(agent::LocalAgent::name(self).to_owned())
+        Ok(authority::LocalAuthority::name(self).to_owned())
     }
 
     async fn cert_chain(&self) -> Result<Vec<SerdeCertificateDer>, quic::ConnectionError> {
@@ -212,7 +216,7 @@ where
 
     async fn sign_algorithm(&self) -> Result<SerdeSignatureAlgorithm, quic::ConnectionError> {
         Ok(SerdeSignatureAlgorithm::from(
-            agent::LocalAgent::sign_algorithm(self),
+            authority::LocalAuthority::sign_algorithm(self),
         ))
     }
 
@@ -221,7 +225,7 @@ where
         scheme: SerdeSignatureScheme,
         data: Vec<u8>,
     ) -> Result<Vec<u8>, quic::ConnectionError> {
-        agent::LocalAgent::sign(self, SignatureScheme::from(scheme), &data)
+        authority::LocalAuthority::sign(self, SignatureScheme::from(scheme), &data)
             .await
             // lossy: TransportError.reason is a protocol string field
             .map_err(|e| quic::ConnectionError::Transport {
@@ -235,7 +239,7 @@ where
 
     async fn public_key(&self) -> Result<SerdeSubjectPublicKeyInfoDer, quic::ConnectionError> {
         Ok(SerdeSubjectPublicKeyInfoDer::from(
-            agent::LocalAgent::public_key(self),
+            authority::LocalAuthority::public_key(self),
         ))
     }
 
@@ -245,7 +249,7 @@ where
         data: Vec<u8>,
         signature: Vec<u8>,
     ) -> Result<bool, quic::ConnectionError> {
-        agent::LocalAgent::verify(self, SignatureScheme::from(scheme), &data, &signature)
+        authority::LocalAuthority::verify(self, SignatureScheme::from(scheme), &data, &signature)
             .await
             // lossy: TransportError.reason is a protocol string field
             .map_err(|e| quic::ConnectionError::Transport {
@@ -258,12 +262,12 @@ where
     }
 }
 
-impl<A> RemoteAgent for A
+impl<A> RemoteAuthority for A
 where
-    A: agent::RemoteAgent + Send + Sync,
+    A: authority::RemoteAuthority + Send + Sync,
 {
     async fn name(&self) -> Result<String, quic::ConnectionError> {
-        Ok(agent::RemoteAgent::name(self).to_owned())
+        Ok(authority::RemoteAuthority::name(self).to_owned())
     }
 
     async fn cert_chain(&self) -> Result<Vec<SerdeCertificateDer>, quic::ConnectionError> {
@@ -277,7 +281,7 @@ where
 
     async fn public_key(&self) -> Result<SerdeSubjectPublicKeyInfoDer, quic::ConnectionError> {
         Ok(SerdeSubjectPublicKeyInfoDer::from(
-            agent::RemoteAgent::public_key(self),
+            authority::RemoteAuthority::public_key(self),
         ))
     }
 
@@ -287,7 +291,7 @@ where
         data: Vec<u8>,
         signature: Vec<u8>,
     ) -> Result<bool, quic::ConnectionError> {
-        agent::RemoteAgent::verify(self, SignatureScheme::from(scheme), &data, &signature)
+        authority::RemoteAuthority::verify(self, SignatureScheme::from(scheme), &data, &signature)
             .await
             // lossy: TransportError.reason is a protocol string field
             .map_err(|e| quic::ConnectionError::Transport {
@@ -314,13 +318,13 @@ mod tests {
     const SERVER_CERT: &[u8] = include_bytes!("../../../tests/keychain/localhost/server.cert");
 
     #[derive(Clone, Debug)]
-    struct TestLocalAgent {
+    struct TestLocalAuthority {
         name: &'static str,
         cert_chain: Vec<CertificateDer<'static>>,
         fail_sign: bool,
     }
 
-    impl TestLocalAgent {
+    impl TestLocalAuthority {
         fn new(name: &'static str) -> Self {
             Self {
                 name,
@@ -337,7 +341,7 @@ mod tests {
         }
     }
 
-    impl agent::LocalAgent for TestLocalAgent {
+    impl authority::LocalAuthority for TestLocalAuthority {
         fn name(&self) -> &str {
             self.name
         }
@@ -367,12 +371,12 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    struct TestRemoteAgent {
+    struct TestRemoteAuthority {
         name: &'static str,
         cert_chain: Vec<CertificateDer<'static>>,
     }
 
-    impl TestRemoteAgent {
+    impl TestRemoteAuthority {
         fn new(name: &'static str) -> Self {
             Self {
                 name,
@@ -381,7 +385,7 @@ mod tests {
         }
     }
 
-    impl agent::RemoteAgent for TestRemoteAgent {
+    impl authority::RemoteAuthority for TestRemoteAuthority {
         fn name(&self) -> &str {
             self.name
         }
@@ -408,10 +412,10 @@ mod tests {
         );
     }
 
-    fn spawn_local_agent_server(
-        agent: TestLocalAgent,
-    ) -> (AbortOnDropHandle<()>, LocalAgentClient) {
-        let (server, client) = LocalAgentServerShared::new(Arc::new(agent), 1);
+    fn spawn_local_authority_server(
+        authority: TestLocalAuthority,
+    ) -> (AbortOnDropHandle<()>, LocalAuthorityClient) {
+        let (server, client) = LocalAuthorityServerShared::new(Arc::new(authority), 1);
         let task = AbortOnDropHandle::new(tokio::spawn(
             async move {
                 let _ = server.serve(true).await;
@@ -421,10 +425,10 @@ mod tests {
         (task, client)
     }
 
-    fn spawn_remote_agent_server(
-        agent: TestRemoteAgent,
-    ) -> (AbortOnDropHandle<()>, RemoteAgentClient) {
-        let (server, client) = RemoteAgentServerShared::new(Arc::new(agent), 1);
+    fn spawn_remote_authority_server(
+        authority: TestRemoteAuthority,
+    ) -> (AbortOnDropHandle<()>, RemoteAuthorityClient) {
+        let (server, client) = RemoteAuthorityServerShared::new(Arc::new(authority), 1);
         let task = AbortOnDropHandle::new(tokio::spawn(
             async move {
                 let _ = server.serve(true).await;
@@ -435,30 +439,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blanket_local_agent_delegates_all_methods() {
-        let agent = TestLocalAgent::new("local.example");
+    async fn blanket_local_authority_delegates_all_methods() {
+        let authority = TestLocalAuthority::new("local.example");
         let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
 
         assert_eq!(
-            super::LocalAgent::name(&agent).await.expect("name"),
+            super::LocalAuthority::name(&authority).await.expect("name"),
             "local.example",
         );
-        let certs = super::LocalAgent::cert_chain(&agent)
+        let certs = super::LocalAuthority::cert_chain(&authority)
             .await
             .expect("cert chain");
         let cert = CertificateDer::from(certs.into_iter().next().expect("certificate"));
-        assert_eq!(cert.as_ref(), agent.cert_chain[0].as_ref());
+        assert_eq!(cert.as_ref(), authority.cert_chain[0].as_ref());
         assert_eq!(
             rustls::SignatureAlgorithm::from(
-                super::LocalAgent::sign_algorithm(&agent)
+                super::LocalAuthority::sign_algorithm(&authority)
                     .await
                     .expect("sign algorithm"),
             ),
             rustls::SignatureAlgorithm::ECDSA,
         );
 
-        let signature = super::LocalAgent::sign(
-            &agent,
+        let signature = super::LocalAuthority::sign(
+            &authority,
             SerdeSignatureScheme::from(scheme),
             b"payload".to_vec(),
         )
@@ -467,17 +471,17 @@ mod tests {
         assert_eq!(signature, expected_signature(scheme, b"payload"));
 
         let public_key = SubjectPublicKeyInfoDer::from(
-            super::LocalAgent::public_key(&agent)
+            super::LocalAuthority::public_key(&authority)
                 .await
                 .expect("public key"),
         );
         assert_eq!(
             public_key.as_ref(),
-            agent::LocalAgent::public_key(&agent).as_ref(),
+            authority::LocalAuthority::public_key(&authority).as_ref(),
         );
 
-        let verified = super::LocalAgent::verify(
-            &agent,
+        let verified = super::LocalAuthority::verify(
+            &authority,
             SerdeSignatureScheme::from(scheme),
             b"payload".to_vec(),
             b"not a real signature".to_vec(),
@@ -488,32 +492,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blanket_remote_agent_delegates_all_methods() {
-        let agent = TestRemoteAgent::new("remote.example");
+    async fn blanket_remote_authority_delegates_all_methods() {
+        let authority = TestRemoteAuthority::new("remote.example");
         let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
 
         assert_eq!(
-            super::RemoteAgent::name(&agent).await.expect("name"),
+            super::RemoteAuthority::name(&authority)
+                .await
+                .expect("name"),
             "remote.example",
         );
-        let certs = super::RemoteAgent::cert_chain(&agent)
+        let certs = super::RemoteAuthority::cert_chain(&authority)
             .await
             .expect("cert chain");
         let cert = CertificateDer::from(certs.into_iter().next().expect("certificate"));
-        assert_eq!(cert.as_ref(), agent.cert_chain[0].as_ref());
+        assert_eq!(cert.as_ref(), authority.cert_chain[0].as_ref());
 
         let public_key = SubjectPublicKeyInfoDer::from(
-            super::RemoteAgent::public_key(&agent)
+            super::RemoteAuthority::public_key(&authority)
                 .await
                 .expect("public key"),
         );
         assert_eq!(
             public_key.as_ref(),
-            agent::RemoteAgent::public_key(&agent).as_ref(),
+            authority::RemoteAuthority::public_key(&authority).as_ref(),
         );
 
-        let verified = super::RemoteAgent::verify(
-            &agent,
+        let verified = super::RemoteAuthority::verify(
+            &authority,
             SerdeSignatureScheme::from(scheme),
             b"payload".to_vec(),
             b"not a real signature".to_vec(),
@@ -524,17 +530,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blanket_agent_errors_become_transport_errors() {
-        let local = TestLocalAgent::failing_signer();
-        let remote = TestRemoteAgent::new("remote.example");
+    async fn blanket_authority_errors_become_transport_errors() {
+        let local = TestLocalAuthority::failing_signer();
+        let remote = TestRemoteAuthority::new("remote.example");
         let unsupported = SerdeSignatureScheme::from(SignatureScheme::from(0xffff));
 
-        let error = super::LocalAgent::sign(&local, unsupported, b"payload".to_vec())
+        let error = super::LocalAuthority::sign(&local, unsupported, b"payload".to_vec())
             .await
             .expect_err("sign error should be mapped");
         assert_transport_reason(error, "sign error");
 
-        let error = super::LocalAgent::verify(
+        let error = super::LocalAuthority::verify(
             &local,
             unsupported,
             b"payload".to_vec(),
@@ -544,7 +550,7 @@ mod tests {
         .expect_err("local verify error should be mapped");
         assert_transport_reason(error, "verify error");
 
-        let error = super::RemoteAgent::verify(
+        let error = super::RemoteAuthority::verify(
             &remote,
             unsupported,
             b"payload".to_vec(),
@@ -556,71 +562,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_local_agent_fetches_remote_fields_and_delegates_sign() {
-        let agent = TestLocalAgent::new("cached-local.example");
-        let (_task, client) = spawn_local_agent_server(agent.clone());
+    async fn cached_local_authority_fetches_remote_fields_and_delegates_sign() {
+        let authority = TestLocalAuthority::new("cached-local.example");
+        let (_task, client) = spawn_local_authority_server(authority.clone());
 
-        let cached = CachedLocalAgent::from_client(client)
+        let cached = CachedLocalAuthority::from_client(client)
             .await
-            .expect("cached local agent");
+            .expect("cached local authority");
 
-        assert_eq!(agent::LocalAgent::name(&cached), agent.name);
+        assert_eq!(authority::LocalAuthority::name(&cached), authority.name);
         assert_eq!(
-            agent::LocalAgent::cert_chain(&cached)[0].as_ref(),
-            agent.cert_chain[0].as_ref(),
+            authority::LocalAuthority::cert_chain(&cached)[0].as_ref(),
+            authority.cert_chain[0].as_ref(),
         );
         assert_eq!(
-            agent::LocalAgent::sign_algorithm(&cached),
+            authority::LocalAuthority::sign_algorithm(&cached),
             rustls::SignatureAlgorithm::ECDSA,
         );
         assert!(
-            format!("{cached:?}").contains("CachedRemoteLocalAgent"),
-            "debug output should name cached local agent",
+            format!("{cached:?}").contains("CachedRemoteLocalAuthority"),
+            "debug output should name cached local authority",
         );
 
         let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
-        let signature = agent::LocalAgent::sign(&cached, scheme, b"payload")
+        let signature = authority::LocalAuthority::sign(&cached, scheme, b"payload")
             .await
             .expect("cached sign");
         assert_eq!(signature, expected_signature(scheme, b"payload"));
 
-        let public_key = agent::LocalAgent::public_key(&cached);
+        let public_key = authority::LocalAuthority::public_key(&cached);
         assert_eq!(
             public_key.as_ref(),
-            agent::LocalAgent::public_key(&agent).as_ref()
+            authority::LocalAuthority::public_key(&authority).as_ref()
         );
         let verified =
-            agent::LocalAgent::verify(&cached, scheme, b"payload", b"not a real signature")
+            authority::LocalAuthority::verify(&cached, scheme, b"payload", b"not a real signature")
                 .await
                 .expect("cached verify");
         assert!(!verified);
     }
 
     #[tokio::test]
-    async fn cached_remote_agent_fetches_remote_fields() {
-        let agent = TestRemoteAgent::new("cached-remote.example");
-        let (_task, client) = spawn_remote_agent_server(agent.clone());
+    async fn cached_remote_authority_fetches_remote_fields() {
+        let authority = TestRemoteAuthority::new("cached-remote.example");
+        let (_task, client) = spawn_remote_authority_server(authority.clone());
 
-        let cached = CachedRemoteAgent::from_client(client)
+        let cached = CachedRemoteAuthority::from_client(client)
             .await
-            .expect("cached remote agent");
+            .expect("cached remote authority");
 
-        assert_eq!(agent::RemoteAgent::name(&cached), agent.name);
+        assert_eq!(authority::RemoteAuthority::name(&cached), authority.name);
         assert_eq!(
-            agent::RemoteAgent::cert_chain(&cached)[0].as_ref(),
-            agent.cert_chain[0].as_ref(),
+            authority::RemoteAuthority::cert_chain(&cached)[0].as_ref(),
+            authority.cert_chain[0].as_ref(),
         );
         assert!(
-            format!("{cached:?}").contains("CachedRemoteRemoteAgent"),
-            "debug output should name cached remote agent",
+            format!("{cached:?}").contains("CachedRemoteRemoteAuthority"),
+            "debug output should name cached remote authority",
         );
 
-        let public_key = agent::RemoteAgent::public_key(&cached);
+        let public_key = authority::RemoteAuthority::public_key(&cached);
         assert_eq!(
             public_key.as_ref(),
-            agent::RemoteAgent::public_key(&agent).as_ref(),
+            authority::RemoteAuthority::public_key(&authority).as_ref(),
         );
-        let verified = agent::RemoteAgent::verify(
+        let verified = authority::RemoteAuthority::verify(
             &cached,
             SignatureScheme::ECDSA_NISTP256_SHA256,
             b"payload",

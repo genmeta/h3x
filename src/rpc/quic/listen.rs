@@ -29,8 +29,8 @@ pub trait Listen: Send + Sync {
 impl<L> Listen for L
 where
     L: quic::Listen + 'static,
-    <L::Connection as quic::WithLocalAgent>::LocalAgent: Send + Sync,
-    <L::Connection as quic::WithRemoteAgent>::RemoteAgent: Send + Sync,
+    <L::Connection as quic::WithLocalAuthority>::LocalAuthority: Send + Sync,
+    <L::Connection as quic::WithRemoteAuthority>::RemoteAuthority: Send + Sync,
 {
     async fn accept(&mut self) -> Result<ConnectionClient, ListenError> {
         // lossy: cross-process serialization boundary

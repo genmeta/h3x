@@ -335,7 +335,7 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use dhttp_identity::identity::{self as agent, LocalAgent as _, RemoteAgent as _};
+    use dhttp_identity::identity::{self as authority, LocalAuthority as _, RemoteAuthority as _};
     use futures::{
         FutureExt, Sink, SinkExt, Stream,
         future::{BoxFuture, pending},
@@ -349,7 +349,7 @@ mod tests {
         error::Code,
         quic::{
             self, CancelStream, ConnectionError, GetStreamId, Lifecycle, ManageStream, StopStream,
-            WithLocalAgent, WithRemoteAgent,
+            WithLocalAuthority, WithRemoteAuthority,
         },
         varint::VarInt,
     };
@@ -524,9 +524,9 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct TestLocalAgent;
+    struct TestLocalAuthority;
 
-    impl agent::LocalAgent for TestLocalAgent {
+    impl authority::LocalAuthority for TestLocalAuthority {
         fn name(&self) -> &str {
             "test-local"
         }
@@ -543,15 +543,15 @@ mod tests {
             &self,
             _scheme: rustls::SignatureScheme,
             _data: &[u8],
-        ) -> BoxFuture<'_, Result<Vec<u8>, agent::SignError>> {
+        ) -> BoxFuture<'_, Result<Vec<u8>, authority::SignError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
 
     #[derive(Debug)]
-    struct TestRemoteAgent;
+    struct TestRemoteAuthority;
 
-    impl agent::RemoteAgent for TestRemoteAgent {
+    impl authority::RemoteAuthority for TestRemoteAuthority {
         fn name(&self) -> &str {
             "test-remote"
         }
@@ -670,18 +670,18 @@ mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for TestConnection {
-        type LocalAgent = TestLocalAgent;
+    impl quic::WithLocalAuthority for TestConnection {
+        type LocalAuthority = TestLocalAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, ConnectionError> {
+        async fn local_authority(&self) -> Result<Option<Self::LocalAuthority>, ConnectionError> {
             Ok(None)
         }
     }
 
-    impl quic::WithRemoteAgent for TestConnection {
-        type RemoteAgent = TestRemoteAgent;
+    impl quic::WithRemoteAuthority for TestConnection {
+        type RemoteAuthority = TestRemoteAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, ConnectionError> {
+        async fn remote_authority(&self) -> Result<Option<Self::RemoteAuthority>, ConnectionError> {
             Ok(None)
         }
     }
@@ -901,14 +901,14 @@ mod tests {
         let conn = TestConnection;
 
         let local = conn
-            .local_agent()
+            .local_authority()
             .await
-            .expect("local agent lookup succeeds");
+            .expect("local authority lookup succeeds");
         assert!(local.is_none());
         let remote = conn
-            .remote_agent()
+            .remote_authority()
             .await
-            .expect("remote agent lookup succeeds");
+            .expect("remote authority lookup succeeds");
         assert!(remote.is_none());
         conn.check().expect("test connection health check succeeds");
         conn.close(Code::H3_NO_ERROR, Cow::Borrowed("test close"));
@@ -922,7 +922,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_agents_and_streams_expose_minimal_trait_behavior() {
-        let local = TestLocalAgent;
+        let local = TestLocalAuthority;
         assert_eq!(local.name(), "test-local");
         assert!(local.cert_chain().is_empty());
         assert_eq!(local.sign_algorithm(), rustls::SignatureAlgorithm::ED25519);
@@ -930,11 +930,11 @@ mod tests {
             local
                 .sign(rustls::SignatureScheme::ED25519, b"payload")
                 .await
-                .expect("test local agent signs"),
+                .expect("test local authority signs"),
             Vec::<u8>::new()
         );
 
-        let remote = TestRemoteAgent;
+        let remote = TestRemoteAuthority;
         assert_eq!(remote.name(), "test-remote");
         assert!(remote.cert_chain().is_empty());
 

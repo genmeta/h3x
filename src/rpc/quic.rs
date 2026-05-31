@@ -42,7 +42,7 @@
 //! - [`WriteStreamClient::into_quic`] — convert into a `quic::WriteStream`
 //! - [`WriteStreamClient::into_boxed_quic`] — convert into a boxed writer adapter
 
-mod agent;
+mod authority;
 mod connect;
 mod connection;
 mod error;
@@ -52,12 +52,13 @@ mod stream;
 
 // Raw remoc-generated RTC client types (serializable, sendable over the wire)
 pub use self::{
-    agent::{
-        CachedLocalAgent, CachedRemoteAgent, LocalAgentClient, LocalAgentReqReceiver,
-        LocalAgentServer, LocalAgentServerRef, LocalAgentServerRefMut, LocalAgentServerShared,
-        LocalAgentServerSharedMut, RemoteAgentClient, RemoteAgentReqReceiver, RemoteAgentServer,
-        RemoteAgentServerRef, RemoteAgentServerRefMut, RemoteAgentServerShared,
-        RemoteAgentServerSharedMut,
+    authority::{
+        CachedLocalAuthority, CachedRemoteAuthority, LocalAuthorityClient,
+        LocalAuthorityReqReceiver, LocalAuthorityServer, LocalAuthorityServerRef,
+        LocalAuthorityServerRefMut, LocalAuthorityServerShared, LocalAuthorityServerSharedMut,
+        RemoteAuthorityClient, RemoteAuthorityReqReceiver, RemoteAuthorityServer,
+        RemoteAuthorityServerRef, RemoteAuthorityServerRefMut, RemoteAuthorityServerShared,
+        RemoteAuthorityServerSharedMut,
     },
     connect::{
         ConnectClient, ConnectError, ConnectReqReceiver, ConnectServer, ConnectServerRef,

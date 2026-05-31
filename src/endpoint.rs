@@ -35,7 +35,7 @@ pub mod server;
 /// | Capability | Bound |
 /// |---|---|
 /// | Client connection access (connect)    | `Q: quic::Connect<Connection = C>` |
-/// | Server (serve, serve_owned)            | `Q: quic::Listen<Connection = C>`  |
+/// | Server (listen, listen_owned)          | `Q: quic::Listen<Connection = C>`  |
 pub struct H3Endpoint<Q, C: quic::Connection> {
     pub(crate) quic: Q,
     pub(crate) builder: Arc<ConnectionBuilder<C>>,
@@ -176,7 +176,7 @@ where
     ///
     /// Rust does not support overloading inherent methods by receiver type, so
     /// the shared-handle variant uses the same `*_owned` convention as
-    /// [`H3Endpoint::serve_owned`].
+    /// [`H3Endpoint::listen_owned`].
     pub fn accept_owned<E>(
         self: &Arc<Self>,
     ) -> impl Future<Output = Result<Arc<H3Connection<C>>, AcceptError<E>>> + use<E, Q, C>
@@ -238,7 +238,8 @@ where
     Q: quic::Listen<Connection = C>,
 {
     /// Accept and serve HTTP/3 connections in a loop.
-    pub async fn serve<S>(&mut self, service: S) -> Result<(), <Q as quic::Listen>::Error>
+    #[doc(alias = "serve")]
+    pub async fn listen<S>(&mut self, service: S) -> Result<(), <Q as quic::Listen>::Error>
     where
         S: Service<UnresolvedRequest, Response = ()> + Clone + Send + Sync + 'static,
         S::Future: Send,
@@ -256,19 +257,20 @@ where
             };
             // Inherent termination: spawned task exits when accept_raw_message_stream
             // returns an error (connection closed) or qpack is no longer available.
-            tokio::spawn(serve_connection(h3_conn, service.clone()).in_current_span());
+            tokio::spawn(listen_connection(h3_conn, service.clone()).in_current_span());
         }
     }
 
-    /// Serve HTTP/3 requests on an `Arc<H3Endpoint<Q, C>>`.
+    /// Listen for HTTP/3 requests on an `Arc<H3Endpoint<Q, C>>`.
     ///
     /// The returned future does not capture `&self`, so it can be spawned:
     ///
     /// ```ignore
     /// let h3: Arc<H3Endpoint<QuicEndpoint, Connection>> = ...;
-    /// tokio::spawn(h3.serve(router));
+    /// tokio::spawn(h3.listen(router));
     /// ```
-    pub fn serve_owned<S>(
+    #[doc(alias = "serve_owned")]
+    pub fn listen_owned<S>(
         self: &Arc<Self>,
         service: S,
     ) -> impl Future<Output = Result<(), <Q as quic::Listen>::Error>> + use<S, Q, C>
@@ -287,17 +289,17 @@ where
                 builder,
                 pool,
             };
-            ref_ep.serve(service).await
+            ref_ep.listen(service).await
         }
     }
 }
 
-/// Serve requests from a single accepted H3 connection.
+/// Listen for requests from a single accepted H3 connection.
 ///
 /// Inherent termination: returns when [`H3Connection::accept_raw_message_stream`]
 /// produces an error (connection closed) or when the QPACK module is no longer
 /// available.
-async fn serve_connection<C, S>(h3_conn: Arc<H3Connection<C>>, mut service: S)
+async fn listen_connection<C, S>(h3_conn: Arc<H3Connection<C>>, mut service: S)
 where
     C: quic::Connection,
     S: Service<UnresolvedRequest, Response = ()> + Clone + Send + 'static,
@@ -342,14 +344,14 @@ where
         };
 
         // Inherent termination: the spawned task exits when the service future resolves.
-        tokio::spawn(serve_request(&mut service, request).in_current_span());
+        tokio::spawn(listen_request(&mut service, request).in_current_span());
     }
 }
 
 /// Spawn a task to process a single request through `service`.
 ///
 /// Inherent termination: the spawned task exits when the service future resolves.
-fn serve_request<S>(
+fn listen_request<S>(
     service: &mut S,
     request: UnresolvedRequest,
 ) -> impl Future<Output = ()> + use<S>
@@ -401,7 +403,8 @@ mod tests {
         connection::{
             ConnectionState,
             tests::{
-                MockConnection, TestLocalAgent, TestReadStream, TestRemoteAgent, TestWriteStream,
+                MockConnection, TestLocalAuthority, TestReadStream, TestRemoteAuthority,
+                TestWriteStream,
             },
         },
         dhttp::protocol::DHttpProtocol,
@@ -460,18 +463,22 @@ mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for BuildableConnection {
-        type LocalAgent = TestLocalAgent;
+    impl quic::WithLocalAuthority for BuildableConnection {
+        type LocalAuthority = TestLocalAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+        async fn local_authority(
+            &self,
+        ) -> Result<Option<Self::LocalAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
 
-    impl quic::WithRemoteAgent for BuildableConnection {
-        type RemoteAgent = TestRemoteAgent;
+    impl quic::WithRemoteAuthority for BuildableConnection {
+        type RemoteAuthority = TestRemoteAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+        async fn remote_authority(
+            &self,
+        ) -> Result<Option<Self::RemoteAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
@@ -489,11 +496,11 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
-    struct NamedRemoteAgent {
+    struct NamedRemoteAuthority {
         name: &'static str,
     }
 
-    impl identity::RemoteAgent for NamedRemoteAgent {
+    impl identity::RemoteAuthority for NamedRemoteAuthority {
         fn name(&self) -> &str {
             self.name
         }
@@ -539,19 +546,23 @@ mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for IdentifiedConnection {
-        type LocalAgent = TestLocalAgent;
+    impl quic::WithLocalAuthority for IdentifiedConnection {
+        type LocalAuthority = TestLocalAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+        async fn local_authority(
+            &self,
+        ) -> Result<Option<Self::LocalAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
 
-    impl quic::WithRemoteAgent for IdentifiedConnection {
-        type RemoteAgent = NamedRemoteAgent;
+    impl quic::WithRemoteAuthority for IdentifiedConnection {
+        type RemoteAuthority = NamedRemoteAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
-            Ok(Some(NamedRemoteAgent {
+        async fn remote_authority(
+            &self,
+        ) -> Result<Option<Self::RemoteAuthority>, quic::ConnectionError> {
+            Ok(Some(NamedRemoteAuthority {
                 name: self.remote_name,
             }))
         }
@@ -893,18 +904,22 @@ mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for ControlledConnection {
-        type LocalAgent = TestLocalAgent;
+    impl quic::WithLocalAuthority for ControlledConnection {
+        type LocalAuthority = TestLocalAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+        async fn local_authority(
+            &self,
+        ) -> Result<Option<Self::LocalAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
 
-    impl quic::WithRemoteAgent for ControlledConnection {
-        type RemoteAgent = TestRemoteAgent;
+    impl quic::WithRemoteAuthority for ControlledConnection {
+        type RemoteAuthority = TestRemoteAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+        async fn remote_authority(
+            &self,
+        ) -> Result<Option<Self::RemoteAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
@@ -1403,19 +1418,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_returns_quic_accept_error() {
+    async fn listen_returns_quic_accept_error() {
         let mut endpoint = H3Endpoint::builder().quic(FailingListen).build();
 
         let error = endpoint
-            .serve(NoopService)
+            .listen(NoopService)
             .await
-            .expect_err("serve should return listener accept error");
+            .expect_err("listen should return listener accept error");
 
         assert!(error.is_transport());
     }
 
     #[tokio::test]
-    async fn serve_skips_build_errors_and_returns_later_accept_error() {
+    async fn listen_skips_build_errors_and_returns_later_accept_error() {
         let listen = SequencedListen::new([
             Ok(Arc::new(MockConnection::new())),
             Err(test_connection_error("accept failed after build retry")),
@@ -1424,16 +1439,16 @@ mod tests {
         let mut endpoint = H3Endpoint::builder().quic(listen).build();
 
         let error = endpoint
-            .serve(NoopService)
+            .listen(NoopService)
             .await
-            .expect_err("serve should continue past build errors and return accept error");
+            .expect_err("listen should continue past build errors and return accept error");
 
         assert!(error.is_transport());
         assert_eq!(accepted.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
-    async fn serve_spawns_for_buildable_connections_and_returns_later_accept_error() {
+    async fn listen_spawns_for_buildable_connections_and_returns_later_accept_error() {
         let listen = SequencedListen::new([
             Ok(Arc::new(BuildableConnection)),
             Err(test_connection_error(
@@ -1444,28 +1459,28 @@ mod tests {
         let mut endpoint = H3Endpoint::builder().quic(listen).build();
 
         let error = endpoint
-            .serve(NoopService)
+            .listen(NoopService)
             .await
-            .expect_err("serve should return the later listener error");
+            .expect_err("listen should return the later listener error");
 
         assert!(error.is_transport());
         assert_eq!(accepted.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
-    async fn serve_owned_returns_quic_accept_error_from_shared_endpoint() {
+    async fn listen_owned_returns_quic_accept_error_from_shared_endpoint() {
         let endpoint = Arc::new(H3Endpoint::builder().quic(FailingListen).build());
 
         let error = endpoint
-            .serve_owned(NoopService)
+            .listen_owned(NoopService)
             .await
-            .expect_err("serve_owned should return shared listener accept error");
+            .expect_err("listen_owned should return shared listener accept error");
 
         assert!(error.is_transport());
     }
 
     #[tokio::test]
-    async fn serve_owned_skips_build_errors_and_returns_later_accept_error() {
+    async fn listen_owned_skips_build_errors_and_returns_later_accept_error() {
         let listen = SequencedListen::new([
             Ok(Arc::new(MockConnection::new())),
             Err(test_connection_error(
@@ -1476,16 +1491,16 @@ mod tests {
         let endpoint = Arc::new(H3Endpoint::builder().quic(listen).build());
 
         let error = endpoint
-            .serve_owned(NoopService)
+            .listen_owned(NoopService)
             .await
-            .expect_err("serve_owned should continue past build errors and return accept error");
+            .expect_err("listen_owned should continue past build errors and return accept error");
 
         assert!(error.is_transport());
         assert_eq!(accepted.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
-    async fn serve_owned_spawns_for_buildable_connections_and_returns_later_accept_error() {
+    async fn listen_owned_spawns_for_buildable_connections_and_returns_later_accept_error() {
         let listen = SequencedListen::new([
             Ok(Arc::new(BuildableConnection)),
             Err(test_connection_error(
@@ -1496,9 +1511,9 @@ mod tests {
         let endpoint = Arc::new(H3Endpoint::builder().quic(listen).build());
 
         let error = endpoint
-            .serve_owned(NoopService)
+            .listen_owned(NoopService)
             .await
-            .expect_err("serve_owned should return the later listener error");
+            .expect_err("listen_owned should return the later listener error");
 
         assert!(error.is_transport());
         assert_eq!(accepted.load(Ordering::Relaxed), 2);
@@ -1694,9 +1709,9 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(
             second
-                .remote_agent()
+                .remote_authority()
                 .await
-                .expect("remote agent lookup should succeed")
+                .expect("remote authority lookup should succeed")
                 .as_ref()
                 .map(|agent| agent.name()),
             Some("recover.example"),
@@ -1705,8 +1720,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_connection_returns_when_accepting_request_streams_fails() {
-        let quic = Arc::new(ControlledConnection::new("serve connection closed"));
+    async fn listen_connection_returns_when_accepting_request_streams_fails() {
+        let quic = Arc::new(ControlledConnection::new("listen connection closed"));
         let state = state_without_qpack(quic.clone());
         let connection = Arc::new(H3Connection::from_state_for_test(state));
 
@@ -1714,14 +1729,14 @@ mod tests {
 
         timeout(
             Duration::from_millis(100),
-            serve_connection(connection, NoopService),
+            listen_connection(connection, NoopService),
         )
         .await
-        .expect("serve_connection should stop when accepting streams fails");
+        .expect("listen_connection should stop when accepting streams fails");
     }
 
     #[tokio::test]
-    async fn serve_connection_skips_requests_when_stream_id_lookup_fails() {
+    async fn listen_connection_skips_requests_when_stream_id_lookup_fails() {
         let quic = Arc::new(ControlledConnection::new("stream id failed"));
         let state = state_without_qpack(quic.clone());
         enqueue_http3_request(
@@ -1734,7 +1749,7 @@ mod tests {
 
         timeout(
             Duration::from_millis(100),
-            serve_connection(
+            listen_connection(
                 connection,
                 RecordingService {
                     seen_streams: seen_streams.clone(),
@@ -1743,7 +1758,7 @@ mod tests {
             ),
         )
         .await
-        .expect("serve_connection should stop after stream-id failure closes the connection");
+        .expect("listen_connection should stop after stream-id failure closes the connection");
 
         assert!(
             seen_streams
@@ -1754,7 +1769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_connection_continues_after_stream_id_lookup_failure() {
+    async fn listen_connection_continues_after_stream_id_lookup_failure() {
         let quic = Arc::new(ControlledConnection::new("stream id failed then recovered"));
         let state = state_with_qpack(quic.clone()).await;
         enqueue_http3_request(&state, second_stream_id_error_request_stream(29)).await;
@@ -1764,7 +1779,7 @@ mod tests {
 
         timeout(
             Duration::from_millis(100),
-            serve_connection(
+            listen_connection(
                 connection,
                 RecordingService {
                     seen_streams: seen_streams.clone(),
@@ -1773,7 +1788,7 @@ mod tests {
             ),
         )
         .await
-        .expect("serve_connection should continue after stream-id failure");
+        .expect("listen_connection should continue after stream-id failure");
 
         timeout(Duration::from_millis(100), async {
             loop {
@@ -1793,7 +1808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_connection_returns_when_qpack_is_unavailable() {
+    async fn listen_connection_returns_when_qpack_is_unavailable() {
         let quic = Arc::new(ControlledConnection::new("qpack unused"));
         let state = state_without_qpack(quic);
         enqueue_http3_request(&state, http3_request_stream(23).await).await;
@@ -1802,7 +1817,7 @@ mod tests {
 
         timeout(
             Duration::from_millis(100),
-            serve_connection(
+            listen_connection(
                 connection,
                 RecordingService {
                     seen_streams: seen_streams.clone(),
@@ -1811,7 +1826,7 @@ mod tests {
             ),
         )
         .await
-        .expect("serve_connection should stop when qpack is unavailable");
+        .expect("listen_connection should stop when qpack is unavailable");
 
         assert!(
             seen_streams
@@ -1822,7 +1837,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_connection_spawns_request_handling_for_valid_requests() {
+    async fn listen_connection_spawns_request_handling_for_valid_requests() {
         let quic = Arc::new(ControlledConnection::new("request served"));
         let state = state_with_qpack(quic.clone()).await;
         enqueue_http3_request(&state, http3_request_stream(25).await).await;
@@ -1831,7 +1846,7 @@ mod tests {
 
         timeout(
             Duration::from_millis(100),
-            serve_connection(
+            listen_connection(
                 connection,
                 RecordingService {
                     seen_streams: seen_streams.clone(),
@@ -1840,7 +1855,7 @@ mod tests {
             ),
         )
         .await
-        .expect("serve_connection should stop after the test service closes the connection");
+        .expect("listen_connection should stop after the test service closes the connection");
 
         timeout(Duration::from_millis(100), async {
             loop {
@@ -1860,7 +1875,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_connection_keeps_running_when_request_handler_returns_error() {
+    async fn listen_connection_keeps_running_when_request_handler_returns_error() {
         let quic = Arc::new(ControlledConnection::new("handler failed"));
         let state = state_with_qpack(quic.clone()).await;
         enqueue_http3_request(&state, http3_request_stream(27).await).await;
@@ -1869,7 +1884,7 @@ mod tests {
 
         timeout(
             Duration::from_millis(100),
-            serve_connection(
+            listen_connection(
                 connection,
                 FailingService {
                     calls: calls.clone(),
@@ -1878,7 +1893,7 @@ mod tests {
             ),
         )
         .await
-        .expect("serve_connection should stop after the failing handler closes the connection");
+        .expect("listen_connection should stop after the failing handler closes the connection");
 
         timeout(Duration::from_millis(100), async {
             loop {
@@ -1892,7 +1907,7 @@ mod tests {
         .expect("failing request handler task should run once");
 
         // calls is incremented inside Service::call before the returned Ready future
-        // is polled. Yield additional times so the spawned serve_request task observes
+        // is polled. Yield additional times so the spawned listen_request task observes
         // the ready error and runs the diagnostic logging branch before the runtime
         // is torn down.
         for _ in 0..16 {
@@ -1910,15 +1925,15 @@ mod tests {
             std::borrow::Cow::Borrowed("test close"),
         );
         assert!(
-            quic::WithLocalAgent::local_agent(&buildable)
+            quic::WithLocalAuthority::local_authority(&buildable)
                 .await
-                .expect("buildable local agent")
+                .expect("buildable local authority")
                 .is_none()
         );
         assert!(
-            quic::WithRemoteAgent::remote_agent(&buildable)
+            quic::WithRemoteAuthority::remote_authority(&buildable)
                 .await
-                .expect("buildable remote agent")
+                .expect("buildable remote authority")
                 .is_none()
         );
         quic::ManageStream::open_uni(&buildable)
@@ -1952,17 +1967,20 @@ mod tests {
         let identified = IdentifiedConnection::new("identified.example");
         quic::Lifecycle::check(&identified).expect("identified connection is live");
         assert!(
-            quic::WithLocalAgent::local_agent(&identified)
+            quic::WithLocalAuthority::local_authority(&identified)
                 .await
-                .expect("identified local agent")
+                .expect("identified local authority")
                 .is_none()
         );
-        let remote = quic::WithRemoteAgent::remote_agent(&identified)
+        let remote = quic::WithRemoteAuthority::remote_authority(&identified)
             .await
-            .expect("identified remote agent")
-            .expect("identified remote agent exists");
-        assert_eq!(identity::RemoteAgent::name(&remote), "identified.example");
-        assert!(identity::RemoteAgent::cert_chain(&remote).is_empty());
+            .expect("identified remote authority")
+            .expect("identified remote authority exists");
+        assert_eq!(
+            identity::RemoteAuthority::name(&remote),
+            "identified.example"
+        );
+        assert!(identity::RemoteAuthority::cert_chain(&remote).is_empty());
         quic::ManageStream::open_uni(&identified)
             .await
             .expect("identified open_uni");
@@ -1985,15 +2003,15 @@ mod tests {
         let controlled = ControlledConnection::new("controlled terminal");
         quic::Lifecycle::check(&controlled).expect("controlled connection is live");
         assert!(
-            quic::WithLocalAgent::local_agent(&controlled)
+            quic::WithLocalAuthority::local_authority(&controlled)
                 .await
-                .expect("controlled local agent")
+                .expect("controlled local authority")
                 .is_none()
         );
         assert!(
-            quic::WithRemoteAgent::remote_agent(&controlled)
+            quic::WithRemoteAuthority::remote_authority(&controlled)
                 .await
-                .expect("controlled remote agent")
+                .expect("controlled remote authority")
                 .is_none()
         );
         quic::ManageStream::open_uni(&controlled)
@@ -2118,7 +2136,7 @@ mod tests {
             seen_streams: Arc::new(Mutex::new(Vec::new())),
             close_latch,
         };
-        serve_request(&mut service, request).await;
+        listen_request(&mut service, request).await;
         assert_eq!(
             service
                 .seen_streams

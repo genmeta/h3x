@@ -1190,15 +1190,15 @@ mod tests {
         );
 
         assert!(
-            quic::WithLocalAgent::local_agent(&conn)
+            quic::WithLocalAuthority::local_authority(&conn)
                 .await
-                .expect("local agent lookup should succeed")
+                .expect("local authority lookup should succeed")
                 .is_none()
         );
         assert!(
-            quic::WithRemoteAgent::remote_agent(&conn)
+            quic::WithRemoteAuthority::remote_authority(&conn)
                 .await
-                .expect("remote agent lookup should succeed")
+                .expect("remote authority lookup should succeed")
                 .is_none()
         );
         quic::Lifecycle::close(&conn, Code::H3_NO_ERROR, Cow::Borrowed("test close"));
@@ -1227,16 +1227,16 @@ mod tests {
         );
         assert!(
             dyn_conn
-                .local_agent()
+                .local_authority()
                 .await
-                .expect("dyn local agent lookup should succeed")
+                .expect("dyn local authority lookup should succeed")
                 .is_none()
         );
         assert!(
             dyn_conn
-                .remote_agent()
+                .remote_authority()
                 .await
-                .expect("dyn remote agent lookup should succeed")
+                .expect("dyn remote authority lookup should succeed")
                 .is_none()
         );
         dyn_conn.close(Code::H3_NO_ERROR, Cow::Borrowed("dyn test close"));
@@ -1251,23 +1251,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_agent_doubles_expose_identity_metadata_and_signing() {
-        let local = TestLocalAgent;
-        assert_eq!(agent::LocalAgent::name(&local), "test-local");
-        assert!(agent::LocalAgent::cert_chain(&local).is_empty());
+        let local = TestLocalAuthority;
+        assert_eq!(authority::LocalAuthority::name(&local), "test-local");
+        assert!(authority::LocalAuthority::cert_chain(&local).is_empty());
         assert_eq!(
-            agent::LocalAgent::sign_algorithm(&local),
+            authority::LocalAuthority::sign_algorithm(&local),
             rustls::SignatureAlgorithm::ED25519
         );
         assert_eq!(
-            agent::LocalAgent::sign(&local, rustls::SignatureScheme::ED25519, b"payload")
+            authority::LocalAuthority::sign(&local, rustls::SignatureScheme::ED25519, b"payload")
                 .await
-                .expect("test local agent signing should succeed"),
+                .expect("test local authority signing should succeed"),
             Vec::<u8>::new()
         );
 
-        let remote = TestRemoteAgent;
-        assert_eq!(agent::RemoteAgent::name(&remote), "test-remote");
-        assert!(agent::RemoteAgent::cert_chain(&remote).is_empty());
+        let remote = TestRemoteAuthority;
+        assert_eq!(authority::RemoteAuthority::name(&remote), "test-remote");
+        assert!(authority::RemoteAuthority::cert_chain(&remote).is_empty());
     }
 
     #[derive(Debug, Default)]
@@ -1411,9 +1411,9 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct TestLocalAgent;
+    struct TestLocalAuthority;
 
-    impl agent::LocalAgent for TestLocalAgent {
+    impl authority::LocalAuthority for TestLocalAuthority {
         fn name(&self) -> &str {
             "test-local"
         }
@@ -1430,15 +1430,15 @@ mod tests {
             &self,
             _scheme: rustls::SignatureScheme,
             _data: &[u8],
-        ) -> futures::future::BoxFuture<'_, Result<Vec<u8>, agent::SignError>> {
+        ) -> futures::future::BoxFuture<'_, Result<Vec<u8>, authority::SignError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
 
     #[derive(Debug)]
-    struct TestRemoteAgent;
+    struct TestRemoteAuthority;
 
-    impl agent::RemoteAgent for TestRemoteAgent {
+    impl authority::RemoteAuthority for TestRemoteAuthority {
         fn name(&self) -> &str {
             "test-remote"
         }
@@ -1476,18 +1476,22 @@ mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for TestConnection {
-        type LocalAgent = TestLocalAgent;
+    impl quic::WithLocalAuthority for TestConnection {
+        type LocalAuthority = TestLocalAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+        async fn local_authority(
+            &self,
+        ) -> Result<Option<Self::LocalAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
 
-    impl quic::WithRemoteAgent for TestConnection {
-        type RemoteAgent = TestRemoteAgent;
+    impl quic::WithRemoteAuthority for TestConnection {
+        type RemoteAuthority = TestRemoteAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+        async fn remote_authority(
+            &self,
+        ) -> Result<Option<Self::RemoteAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }

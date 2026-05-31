@@ -7,7 +7,7 @@ use std::{
 
 use bytes::Bytes;
 use dashmap::{DashMap, mapref::entry::Entry};
-use dhttp_identity::identity::{self as agent, SignError};
+use dhttp_identity::identity::{self as authority, SignError};
 use futures::{Sink, Stream, future::BoxFuture};
 use rustls::{SignatureScheme, pki_types::CertificateDer, sign::CertifiedKey};
 
@@ -321,12 +321,12 @@ impl quic::ManageStream for dquic::prelude::Connection {
 }
 
 #[derive(Debug)]
-pub struct DquicLocalAgent {
+pub struct DquicLocalAuthority {
     name: Arc<str>,
     certified_key: Arc<CertifiedKey>,
 }
 
-impl agent::LocalAgent for DquicLocalAgent {
+impl authority::LocalAuthority for DquicLocalAuthority {
     fn name(&self) -> &str {
         &self.name
     }
@@ -344,18 +344,18 @@ impl agent::LocalAgent for DquicLocalAgent {
         scheme: SignatureScheme,
         data: &[u8],
     ) -> BoxFuture<'_, Result<Vec<u8>, SignError>> {
-        let result = agent::sign_with_key(self.certified_key.key.as_ref(), scheme, data);
+        let result = authority::sign_with_key(self.certified_key.key.as_ref(), scheme, data);
         Box::pin(std::future::ready(result))
     }
 }
 
 #[derive(Debug)]
-pub struct DquicRemoteAgent {
+pub struct DquicRemoteAuthority {
     name: Arc<str>,
     cert_chain: Arc<[CertificateDer<'static>]>,
 }
 
-impl agent::RemoteAgent for DquicRemoteAgent {
+impl authority::RemoteAuthority for DquicRemoteAuthority {
     fn name(&self) -> &str {
         &self.name
     }
@@ -365,18 +365,18 @@ impl agent::RemoteAgent for DquicRemoteAgent {
     }
 }
 
-impl quic::WithLocalAgent for dquic::prelude::Connection {
-    type LocalAgent = DquicLocalAgent;
+impl quic::WithLocalAuthority for dquic::prelude::Connection {
+    type LocalAuthority = DquicLocalAuthority;
 
-    async fn local_agent(&self) -> Result<Option<DquicLocalAgent>, quic::ConnectionError> {
-        let local_agent = self
-            .local_agent()
+    async fn local_authority(&self) -> Result<Option<DquicLocalAuthority>, quic::ConnectionError> {
+        let authority = self
+            .local_authority()
             .await
             .map_err(|error| convert_and_latch_connection_error(self, error))?;
-        Ok(local_agent.map(|local_agent| {
-            let name = AsRef::<Arc<str>>::as_ref(&local_agent).clone();
-            let certified_key = AsRef::<Arc<CertifiedKey>>::as_ref(&local_agent).clone();
-            DquicLocalAgent {
+        Ok(authority.map(|authority| {
+            let name = AsRef::<Arc<str>>::as_ref(&authority).clone();
+            let certified_key = AsRef::<Arc<CertifiedKey>>::as_ref(&authority).clone();
+            DquicLocalAuthority {
                 name,
                 certified_key,
             }
@@ -384,18 +384,20 @@ impl quic::WithLocalAgent for dquic::prelude::Connection {
     }
 }
 
-impl quic::WithRemoteAgent for dquic::prelude::Connection {
-    type RemoteAgent = DquicRemoteAgent;
+impl quic::WithRemoteAuthority for dquic::prelude::Connection {
+    type RemoteAuthority = DquicRemoteAuthority;
 
-    async fn remote_agent(&self) -> Result<Option<DquicRemoteAgent>, quic::ConnectionError> {
-        let remote_agent = self
-            .remote_agent()
+    async fn remote_authority(
+        &self,
+    ) -> Result<Option<DquicRemoteAuthority>, quic::ConnectionError> {
+        let authority = self
+            .remote_authority()
             .await
             .map_err(|error| convert_and_latch_connection_error(self, error))?;
-        Ok(remote_agent.map(|remote_agent| {
-            let name = AsRef::<Arc<str>>::as_ref(&remote_agent).clone();
-            let cert_chain = AsRef::<Arc<[CertificateDer]>>::as_ref(&remote_agent).clone();
-            DquicRemoteAgent { name, cert_chain }
+        Ok(authority.map(|authority| {
+            let name = AsRef::<Arc<str>>::as_ref(&authority).clone();
+            let cert_chain = AsRef::<Arc<[CertificateDer]>>::as_ref(&authority).clone();
+            DquicRemoteAuthority { name, cert_chain }
         }))
     }
 }
@@ -760,37 +762,40 @@ mod tests {
         let client = &pair.client;
         let server = &pair.server;
 
-        let client_local = quic::WithLocalAgent::local_agent(client.as_ref())
+        let client_local = quic::WithLocalAuthority::local_authority(client.as_ref())
             .await
-            .expect("client local agent lookup");
+            .expect("client local authority lookup");
         assert!(
             client_local.is_none(),
-            "anonymous client has no local agent"
+            "anonymous client has no local authority"
         );
 
-        let client_remote = quic::WithRemoteAgent::remote_agent(client.as_ref())
+        let client_remote = quic::WithRemoteAuthority::remote_authority(client.as_ref())
             .await
-            .expect("client remote agent lookup")
+            .expect("client remote authority lookup")
             .expect("client should observe server identity");
-        assert_eq!(agent::RemoteAgent::name(&client_remote), "localhost");
         assert_eq!(
-            agent::RemoteAgent::cert_chain(&client_remote),
+            authority::RemoteAuthority::name(&client_remote),
+            "localhost"
+        );
+        assert_eq!(
+            authority::RemoteAuthority::cert_chain(&client_remote),
             make_identity().cert_chain()
         );
 
-        let server_local = quic::WithLocalAgent::local_agent(server.as_ref())
+        let server_local = quic::WithLocalAuthority::local_authority(server.as_ref())
             .await
-            .expect("server local agent lookup")
+            .expect("server local authority lookup")
             .expect("server should have local identity");
-        assert_eq!(agent::LocalAgent::name(&server_local), "localhost");
+        assert_eq!(authority::LocalAuthority::name(&server_local), "localhost");
         assert_eq!(
-            agent::LocalAgent::cert_chain(&server_local),
+            authority::LocalAuthority::cert_chain(&server_local),
             make_identity().cert_chain()
         );
 
-        let server_remote = quic::WithRemoteAgent::remote_agent(server.as_ref())
+        let server_remote = quic::WithRemoteAuthority::remote_authority(server.as_ref())
             .await
-            .expect("server remote agent lookup");
+            .expect("server remote authority lookup");
         assert!(
             server_remote.is_none(),
             "server should not observe an anonymous client identity"
@@ -959,52 +964,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dquic_local_agent_exposes_identity_and_signing() {
+    async fn dquic_local_authority_exposes_identity_and_signing() {
         let identity = make_identity();
         let certified_key =
             crate::dquic::identity::build_certified_key(&identity).expect("test key should load");
-        let local = DquicLocalAgent {
+        let local = DquicLocalAuthority {
             name: Arc::from(identity.name.as_str()),
             certified_key,
         };
 
-        assert_eq!(agent::LocalAgent::name(&local), "localhost");
-        assert_eq!(agent::LocalAgent::cert_chain(&local), identity.cert_chain());
+        assert_eq!(authority::LocalAuthority::name(&local), "localhost");
         assert_eq!(
-            agent::LocalAgent::sign_algorithm(&local),
+            authority::LocalAuthority::cert_chain(&local),
+            identity.cert_chain()
+        );
+        assert_eq!(
+            authority::LocalAuthority::sign_algorithm(&local),
             rustls::SignatureAlgorithm::ECDSA
         );
-        assert!(format!("{local:?}").contains("DquicLocalAgent"));
+        assert!(format!("{local:?}").contains("DquicLocalAuthority"));
 
         let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
-        let signature = agent::LocalAgent::sign(&local, scheme, b"payload")
+        let signature = authority::LocalAuthority::sign(&local, scheme, b"payload")
             .await
             .expect("signature");
         assert!(
-            agent::LocalAgent::verify(&local, scheme, b"payload", &signature)
+            authority::LocalAuthority::verify(&local, scheme, b"payload", &signature)
                 .await
                 .expect("verification should run")
         );
         assert!(
-            !agent::LocalAgent::verify(&local, scheme, b"wrong payload", &signature)
+            !authority::LocalAuthority::verify(&local, scheme, b"wrong payload", &signature)
                 .await
                 .expect("verification should run")
         );
     }
 
     #[tokio::test]
-    async fn dquic_local_agent_reports_unsupported_sign_scheme() {
+    async fn dquic_local_authority_reports_unsupported_sign_scheme() {
         let identity = make_identity();
         let certified_key =
             crate::dquic::identity::build_certified_key(&identity).expect("test key should load");
-        let local = DquicLocalAgent {
+        let local = DquicLocalAuthority {
             name: Arc::from(identity.name.as_str()),
             certified_key,
         };
 
-        let error = agent::LocalAgent::sign(&local, SignatureScheme::RSA_PKCS1_SHA256, b"payload")
-            .await
-            .expect_err("rsa should not be supported by an ecdsa key");
+        let error =
+            authority::LocalAuthority::sign(&local, SignatureScheme::RSA_PKCS1_SHA256, b"payload")
+                .await
+                .expect_err("rsa should not be supported by an ecdsa key");
         assert!(matches!(
             error,
             SignError::UnsupportedScheme {
@@ -1014,41 +1023,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dquic_remote_agent_exposes_identity_and_verification() {
+    async fn dquic_remote_authority_exposes_identity_and_verification() {
         let identity = make_identity();
         let certified_key =
             crate::dquic::identity::build_certified_key(&identity).expect("test key should load");
-        let local = DquicLocalAgent {
+        let local = DquicLocalAuthority {
             name: Arc::from(identity.name.as_str()),
             certified_key,
         };
-        let remote = DquicRemoteAgent {
+        let remote = DquicRemoteAuthority {
             name: Arc::from("peer.localhost"),
             cert_chain: Arc::from(identity.cert_chain()),
         };
 
-        assert_eq!(agent::RemoteAgent::name(&remote), "peer.localhost");
+        assert_eq!(authority::RemoteAuthority::name(&remote), "peer.localhost");
         assert_eq!(
-            agent::RemoteAgent::cert_chain(&remote),
+            authority::RemoteAuthority::cert_chain(&remote),
             identity.cert_chain()
         );
         assert_eq!(
-            agent::RemoteAgent::public_key(&remote).as_ref(),
-            agent::LocalAgent::public_key(&local).as_ref()
+            authority::RemoteAuthority::public_key(&remote).as_ref(),
+            authority::LocalAuthority::public_key(&local).as_ref()
         );
-        assert!(format!("{remote:?}").contains("DquicRemoteAgent"));
+        assert!(format!("{remote:?}").contains("DquicRemoteAuthority"));
 
         let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
-        let signature = agent::LocalAgent::sign(&local, scheme, b"payload")
+        let signature = authority::LocalAuthority::sign(&local, scheme, b"payload")
             .await
             .expect("signature");
         assert!(
-            agent::RemoteAgent::verify(&remote, scheme, b"payload", &signature)
+            authority::RemoteAuthority::verify(&remote, scheme, b"payload", &signature)
                 .await
                 .expect("verification should run")
         );
         assert!(
-            !agent::RemoteAgent::verify(&remote, scheme, b"wrong payload", &signature)
+            !authority::RemoteAuthority::verify(&remote, scheme, b"wrong payload", &signature)
                 .await
                 .expect("verification should run")
         );

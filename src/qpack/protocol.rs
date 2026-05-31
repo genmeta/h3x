@@ -498,9 +498,9 @@ mod tests {
     };
 
     #[derive(Debug, Clone, Copy)]
-    struct TestLocalAgent;
+    struct TestLocalAuthority;
 
-    impl dhttp_identity::identity::LocalAgent for TestLocalAgent {
+    impl dhttp_identity::identity::LocalAuthority for TestLocalAuthority {
         fn name(&self) -> &str {
             "test.local"
         }
@@ -525,9 +525,9 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Copy)]
-    struct TestRemoteAgent;
+    struct TestRemoteAuthority;
 
-    impl dhttp_identity::identity::RemoteAgent for TestRemoteAgent {
+    impl dhttp_identity::identity::RemoteAuthority for TestRemoteAuthority {
         fn name(&self) -> &str {
             "test.remote"
         }
@@ -620,18 +620,22 @@ mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for MockConnection {
-        type LocalAgent = TestLocalAgent;
+    impl quic::WithLocalAuthority for MockConnection {
+        type LocalAuthority = TestLocalAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+        async fn local_authority(
+            &self,
+        ) -> Result<Option<Self::LocalAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
 
-    impl quic::WithRemoteAgent for MockConnection {
-        type RemoteAgent = TestRemoteAgent;
+    impl quic::WithRemoteAuthority for MockConnection {
+        type RemoteAuthority = TestRemoteAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+        async fn remote_authority(
+            &self,
+        ) -> Result<Option<Self::RemoteAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
@@ -881,9 +885,9 @@ mod tests {
 
     #[tokio::test]
     async fn qpack_test_helpers_cover_mock_connection_error_paths() {
-        use dhttp_identity::identity::{LocalAgent as _, RemoteAgent as _};
+        use dhttp_identity::identity::{LocalAuthority as _, RemoteAuthority as _};
 
-        let local = TestLocalAgent;
+        let local = TestLocalAuthority;
         assert_eq!(local.name(), "test.local");
         assert!(local.cert_chain().is_empty());
         assert_eq!(local.sign_algorithm(), SignatureAlgorithm::ECDSA);
@@ -898,7 +902,7 @@ mod tests {
             }
         ));
 
-        let remote = TestRemoteAgent;
+        let remote = TestRemoteAuthority;
         assert_eq!(remote.name(), "test.remote");
         assert!(remote.cert_chain().is_empty());
 
@@ -914,15 +918,15 @@ mod tests {
         }
 
         assert!(
-            quic::WithLocalAgent::local_agent(&conn)
+            quic::WithLocalAuthority::local_authority(&conn)
                 .await
-                .expect("local agent query")
+                .expect("local authority query")
                 .is_none()
         );
         assert!(
-            quic::WithRemoteAgent::remote_agent(&conn)
+            quic::WithRemoteAuthority::remote_authority(&conn)
                 .await
-                .expect("remote agent query")
+                .expect("remote authority query")
                 .is_none()
         );
 

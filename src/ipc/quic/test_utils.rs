@@ -366,11 +366,11 @@ impl quic::Lifecycle for StreamableConnection {
     }
 }
 
-// Dummy agent types for WithLocalAgent / WithRemoteAgent
+// Dummy authority types for WithLocalAuthority / WithRemoteAuthority
 #[derive(Debug)]
-struct NoAgent;
+struct NoAuthority;
 
-impl dhttp_identity::identity::LocalAgent for NoAgent {
+impl dhttp_identity::identity::LocalAuthority for NoAuthority {
     fn name(&self) -> &str {
         "none"
     }
@@ -392,7 +392,7 @@ impl dhttp_identity::identity::LocalAgent for NoAgent {
     }
 }
 
-impl dhttp_identity::identity::RemoteAgent for NoAgent {
+impl dhttp_identity::identity::RemoteAuthority for NoAuthority {
     fn name(&self) -> &str {
         "none"
     }
@@ -402,16 +402,16 @@ impl dhttp_identity::identity::RemoteAgent for NoAgent {
     }
 }
 
-impl quic::WithLocalAgent for StreamableConnection {
-    type LocalAgent = NoAgent;
-    async fn local_agent(&self) -> Result<Option<NoAgent>, ConnectionError> {
+impl quic::WithLocalAuthority for StreamableConnection {
+    type LocalAuthority = NoAuthority;
+    async fn local_authority(&self) -> Result<Option<NoAuthority>, ConnectionError> {
         Ok(None)
     }
 }
 
-impl quic::WithRemoteAgent for StreamableConnection {
-    type RemoteAgent = NoAgent;
-    async fn remote_agent(&self) -> Result<Option<NoAgent>, ConnectionError> {
+impl quic::WithRemoteAuthority for StreamableConnection {
+    type RemoteAuthority = NoAuthority;
+    async fn remote_authority(&self) -> Result<Option<NoAuthority>, ConnectionError> {
         Ok(None)
     }
 }
@@ -690,35 +690,41 @@ async fn direct_connection_agent_listener_and_connector_helpers_cover_errors() {
     );
 
     assert!(
-        quic::WithLocalAgent::local_agent(conn.as_ref())
+        quic::WithLocalAuthority::local_authority(conn.as_ref())
             .await
-            .expect("local agent helper should succeed")
+            .expect("local authority helper should succeed")
             .is_none()
     );
     assert!(
-        quic::WithRemoteAgent::remote_agent(conn.as_ref())
+        quic::WithRemoteAuthority::remote_authority(conn.as_ref())
             .await
-            .expect("remote agent helper should succeed")
+            .expect("remote authority helper should succeed")
             .is_none()
     );
 
-    let agent = NoAgent;
-    assert_eq!(dhttp_identity::identity::LocalAgent::name(&agent), "none");
-    assert_eq!(dhttp_identity::identity::RemoteAgent::name(&agent), "none");
-    assert!(dhttp_identity::identity::LocalAgent::cert_chain(&agent).is_empty());
-    assert!(dhttp_identity::identity::RemoteAgent::cert_chain(&agent).is_empty());
+    let authority = NoAuthority;
     assert_eq!(
-        dhttp_identity::identity::LocalAgent::sign_algorithm(&agent),
+        dhttp_identity::identity::LocalAuthority::name(&authority),
+        "none"
+    );
+    assert_eq!(
+        dhttp_identity::identity::RemoteAuthority::name(&authority),
+        "none"
+    );
+    assert!(dhttp_identity::identity::LocalAuthority::cert_chain(&authority).is_empty());
+    assert!(dhttp_identity::identity::RemoteAuthority::cert_chain(&authority).is_empty());
+    assert_eq!(
+        dhttp_identity::identity::LocalAuthority::sign_algorithm(&authority),
         rustls::SignatureAlgorithm::ED25519
     );
     assert!(
-        dhttp_identity::identity::LocalAgent::sign(
-            &agent,
+        dhttp_identity::identity::LocalAuthority::sign(
+            &authority,
             rustls::SignatureScheme::ED25519,
             b"payload",
         )
         .await
-        .expect("no-agent signing should succeed")
+        .expect("no-authority signing should succeed")
         .is_empty()
     );
 
@@ -779,12 +785,12 @@ async fn listen_accept_bootstrap() {
     let handle = quic::Listen::accept(&mut listener).await.unwrap();
     assert!(quic::Lifecycle::check(handle.as_ref()).is_ok());
 
-    // Agent should be None since mock returns None
-    let local = quic::WithLocalAgent::local_agent(handle.as_ref())
+    // Authority should be None since mock returns None
+    let local = quic::WithLocalAuthority::local_authority(handle.as_ref())
         .await
         .unwrap();
     assert!(local.is_none());
-    let remote = quic::WithRemoteAgent::remote_agent(handle.as_ref())
+    let remote = quic::WithRemoteAuthority::remote_authority(handle.as_ref())
         .await
         .unwrap();
     assert!(remote.is_none());

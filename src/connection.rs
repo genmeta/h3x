@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use dhttp_identity::identity as agent;
+use dhttp_identity::identity as authority;
 use futures::future::BoxFuture;
 use snafu::Snafu;
 use tokio::task::JoinHandle;
@@ -517,22 +517,22 @@ impl<C: quic::ManageStream + quic::Lifecycle + Sync> ConnectionState<C> {
     }
 }
 
-impl<C: ?Sized + quic::DynWithLocalAgent> ConnectionState<C> {
-    pub async fn local_agent(
+impl<C: ?Sized + quic::DynWithLocalAuthority> ConnectionState<C> {
+    pub async fn local_authority(
         &self,
-    ) -> Result<Option<Arc<dyn agent::LocalAgent>>, quic::ConnectionError> {
+    ) -> Result<Option<Arc<dyn authority::LocalAuthority>>, quic::ConnectionError> {
         // Goes through the object-safe trait so that this impl applies
-        // uniformly to both sized `C: WithLocalAgent` (via the blanket impl)
+        // uniformly to both sized `C: WithLocalAuthority` (via the blanket impl)
         // and `dyn DynConnection`.
-        quic::DynWithLocalAgent::local_agent(&*self.quic).await
+        quic::DynWithLocalAuthority::local_authority(&*self.quic).await
     }
 }
 
-impl<C: ?Sized + quic::DynWithRemoteAgent> ConnectionState<C> {
-    pub async fn remote_agent(
+impl<C: ?Sized + quic::DynWithRemoteAuthority> ConnectionState<C> {
+    pub async fn remote_authority(
         &self,
-    ) -> Result<Option<Arc<dyn agent::RemoteAgent>>, quic::ConnectionError> {
-        quic::DynWithRemoteAgent::remote_agent(&*self.quic).await
+    ) -> Result<Option<Arc<dyn authority::RemoteAuthority>>, quic::ConnectionError> {
+        quic::DynWithRemoteAuthority::remote_authority(&*self.quic).await
     }
 }
 
@@ -709,7 +709,7 @@ pub(crate) mod tests {
     };
 
     use bytes::Bytes;
-    use dhttp_identity::identity as agent;
+    use dhttp_identity::identity as authority;
     use futures::{Sink, SinkExt, future::BoxFuture, stream::Stream};
     use tracing::Instrument;
 
@@ -730,9 +730,9 @@ pub(crate) mod tests {
     };
 
     #[derive(Debug)]
-    pub(crate) struct TestLocalAgent;
+    pub(crate) struct TestLocalAuthority;
 
-    impl agent::LocalAgent for TestLocalAgent {
+    impl authority::LocalAuthority for TestLocalAuthority {
         fn name(&self) -> &str {
             "test-local"
         }
@@ -749,15 +749,15 @@ pub(crate) mod tests {
             &self,
             _scheme: rustls::SignatureScheme,
             _data: &[u8],
-        ) -> BoxFuture<'_, Result<Vec<u8>, agent::SignError>> {
+        ) -> BoxFuture<'_, Result<Vec<u8>, authority::SignError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
 
     #[derive(Debug)]
-    pub(crate) struct TestRemoteAgent;
+    pub(crate) struct TestRemoteAuthority;
 
-    impl agent::RemoteAgent for TestRemoteAgent {
+    impl authority::RemoteAuthority for TestRemoteAuthority {
         fn name(&self) -> &str {
             "test-remote"
         }
@@ -970,19 +970,19 @@ pub(crate) mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for MockConnection {
-        type LocalAgent = TestLocalAgent;
+    impl quic::WithLocalAuthority for MockConnection {
+        type LocalAuthority = TestLocalAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, ConnectionError> {
-            Ok(Some(TestLocalAgent))
+        async fn local_authority(&self) -> Result<Option<Self::LocalAuthority>, ConnectionError> {
+            Ok(Some(TestLocalAuthority))
         }
     }
 
-    impl quic::WithRemoteAgent for MockConnection {
-        type RemoteAgent = TestRemoteAgent;
+    impl quic::WithRemoteAuthority for MockConnection {
+        type RemoteAuthority = TestRemoteAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, ConnectionError> {
-            Ok(Some(TestRemoteAgent))
+        async fn remote_authority(&self) -> Result<Option<Self::RemoteAuthority>, ConnectionError> {
+            Ok(Some(TestRemoteAuthority))
         }
     }
 
@@ -1470,22 +1470,22 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn local_and_remote_agent_accessors_delegate_on_concrete_state() {
+    async fn local_and_remote_authority_accessors_delegate_on_concrete_state() {
         let quic = MockConnection::new();
         let state = ConnectionState::new_for_test(Arc::new(quic), Arc::new(Protocols::new()));
 
         let local = state
-            .local_agent()
+            .local_authority()
             .await
-            .expect("local agent lookup should succeed")
-            .expect("local agent should be present");
+            .expect("local authority lookup should succeed")
+            .expect("local authority should be present");
         assert_eq!(local.name(), "test-local");
 
         let remote = state
-            .remote_agent()
+            .remote_authority()
             .await
-            .expect("remote agent lookup should succeed")
-            .expect("remote agent should be present");
+            .expect("remote authority lookup should succeed")
+            .expect("remote authority should be present");
         assert_eq!(remote.name(), "test-remote");
     }
 
@@ -1927,19 +1927,19 @@ pub(crate) mod tests {
         assert!(Arc::ptr_eq(state.protocols(), erased.protocols()));
         assert_eq!(
             erased
-                .local_agent()
+                .local_authority()
                 .await
-                .expect("local agent delegated")
-                .expect("local agent present")
+                .expect("local authority delegated")
+                .expect("local authority present")
                 .name(),
             "test-local"
         );
         assert_eq!(
             erased
-                .remote_agent()
+                .remote_authority()
                 .await
-                .expect("remote agent delegated")
-                .expect("remote agent present")
+                .expect("remote authority delegated")
+                .expect("remote authority present")
                 .name(),
             "test-remote"
         );

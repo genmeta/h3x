@@ -32,8 +32,8 @@ pub trait Connect: Send + Sync {
 impl<C> Connect for C
 where
     C: quic::Connect + 'static,
-    <C::Connection as quic::WithLocalAgent>::LocalAgent: Send + Sync,
-    <C::Connection as quic::WithRemoteAgent>::RemoteAgent: Send + Sync,
+    <C::Connection as quic::WithLocalAuthority>::LocalAuthority: Send + Sync,
+    <C::Connection as quic::WithRemoteAuthority>::RemoteAuthority: Send + Sync,
 {
     async fn connect(&self, server: SerdeAuthority) -> Result<ConnectionClient, ConnectError> {
         // lossy: cross-process serialization boundary

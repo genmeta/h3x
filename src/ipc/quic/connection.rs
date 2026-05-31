@@ -31,7 +31,7 @@
 //!
 //! [`ConnectionBootstrap`] is the one-shot value sent over the remoc base
 //! channel when a new connection is established.  It carries the
-//! [`IpcConnectionClient`] for stream management and agent access.
+//! [`IpcConnectionClient`] for stream management and authority access.
 
 use std::{borrow::Cow, io, sync::Arc};
 
@@ -56,8 +56,8 @@ use crate::{
     rpc::{
         lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt},
         quic::{
-            CachedLocalAgent, CachedRemoteAgent, LocalAgentClient, LocalAgentServerShared,
-            RemoteAgentClient, RemoteAgentServerShared,
+            CachedLocalAuthority, CachedRemoteAuthority, LocalAuthorityClient,
+            LocalAuthorityServerShared, RemoteAuthorityClient, RemoteAuthorityServerShared,
         },
     },
     util::deferred::Resolved,
@@ -111,11 +111,11 @@ pub trait IpcConnection: Send + Sync {
     /// Returns `Resolved<IpcUniHandle, StreamError>` on success.
     async fn accept_uni(&self) -> Result<Resolved<IpcUniHandle, StreamError>, IpcAcceptError>;
 
-    /// Obtain the local agent (signing / identity) handle, if available.
-    async fn local_agent(&self) -> Result<Option<LocalAgentClient>, ConnectionError>;
+    /// Obtain the local authority (signing / identity) handle, if available.
+    async fn local_authority(&self) -> Result<Option<LocalAuthorityClient>, ConnectionError>;
 
-    /// Obtain the remote agent (verification) handle, if available.
-    async fn remote_agent(&self) -> Result<Option<RemoteAgentClient>, ConnectionError>;
+    /// Obtain the remote authority (verification) handle, if available.
+    async fn remote_authority(&self) -> Result<Option<RemoteAuthorityClient>, ConnectionError>;
 
     /// Close the connection with an application error code and reason.
     async fn close(&self, code: Code, reason: Cow<'static, str>) -> Result<(), ConnectionError>;
@@ -132,11 +132,11 @@ pub trait IpcConnection: Send + Sync {
 /// IPC connection is established.
 ///
 /// Carries the [`IpcConnectionClient`] which provides both stream management
-/// RPC and agent access — agent methods are part of the [`IpcConnection`]
+/// RPC and authority access — authority methods are part of the [`IpcConnection`]
 /// trait alongside stream operations.
 #[derive(Serialize, Deserialize)]
 pub struct ConnectionBootstrap {
-    /// RPC client for stream operations, agent access, and lifecycle.
+    /// RPC client for stream operations, authority access, and lifecycle.
     pub connection: IpcConnectionClient,
 }
 
@@ -201,15 +201,15 @@ impl<M> IpcConnection for ConnectionAdapter<M>
 where
     M: ManageStream
         + quic::Lifecycle
-        + quic::WithLocalAgent
-        + quic::WithRemoteAgent
+        + quic::WithLocalAuthority
+        + quic::WithRemoteAuthority
         + Send
         + Sync
         + 'static,
     M::StreamReader: Unpin + 'static,
     M::StreamWriter: Unpin + 'static,
-    M::LocalAgent: Send + Sync,
-    M::RemoteAgent: Send + Sync,
+    M::LocalAuthority: Send + Sync,
+    M::RemoteAuthority: Send + Sync,
 {
     async fn open_bi(&self) -> Result<Resolved<IpcBiHandle, StreamError>, IpcOpenError> {
         self.open_bi_impl().await
@@ -227,10 +227,10 @@ where
         self.accept_uni_impl().await
     }
 
-    async fn local_agent(&self) -> Result<Option<LocalAgentClient>, ConnectionError> {
-        match quic::WithLocalAgent::local_agent(self.inner.as_ref()).await? {
+    async fn local_authority(&self) -> Result<Option<LocalAuthorityClient>, ConnectionError> {
+        match quic::WithLocalAuthority::local_authority(self.inner.as_ref()).await? {
             Some(agent) => {
-                let (server, client) = LocalAgentServerShared::new(Arc::new(agent), 1);
+                let (server, client) = LocalAuthorityServerShared::new(Arc::new(agent), 1);
                 tokio::spawn(
                     (async move {
                         let _ = server.serve(true).await;
@@ -243,10 +243,10 @@ where
         }
     }
 
-    async fn remote_agent(&self) -> Result<Option<RemoteAgentClient>, ConnectionError> {
-        match quic::WithRemoteAgent::remote_agent(self.inner.as_ref()).await? {
+    async fn remote_authority(&self) -> Result<Option<RemoteAuthorityClient>, ConnectionError> {
+        match quic::WithRemoteAuthority::remote_authority(self.inner.as_ref()).await? {
             Some(agent) => {
-                let (server, client) = RemoteAgentServerShared::new(Arc::new(agent), 1);
+                let (server, client) = RemoteAuthorityServerShared::new(Arc::new(agent), 1);
                 tokio::spawn(
                     (async move {
                         let _ = server.serve(true).await;
@@ -273,15 +273,15 @@ impl<M> ConnectionAdapter<M>
 where
     M: ManageStream
         + quic::Lifecycle
-        + quic::WithLocalAgent
-        + quic::WithRemoteAgent
+        + quic::WithLocalAuthority
+        + quic::WithRemoteAuthority
         + Send
         + Sync
         + 'static,
     M::StreamReader: Unpin + 'static,
     M::StreamWriter: Unpin + 'static,
-    M::LocalAgent: Send + Sync,
-    M::RemoteAgent: Send + Sync,
+    M::LocalAuthority: Send + Sync,
+    M::RemoteAuthority: Send + Sync,
 {
     async fn open_bi_impl(&self) -> Result<Resolved<IpcBiHandle, StreamError>, IpcOpenError> {
         let (mut reader, writer) = ManageStream::open_bi(self.inner.as_ref())
@@ -654,18 +654,18 @@ impl IpcConnectionHandle {
     }
 }
 
-impl quic::WithLocalAgent for IpcConnectionHandle {
-    type LocalAgent = CachedLocalAgent;
+impl quic::WithLocalAuthority for IpcConnectionHandle {
+    type LocalAuthority = CachedLocalAuthority;
 
-    async fn local_agent(&self) -> Result<Option<CachedLocalAgent>, ConnectionError> {
+    async fn local_authority(&self) -> Result<Option<CachedLocalAuthority>, ConnectionError> {
         match self
             .lifecycle
-            .guard(IpcConnection::local_agent(&self.rpc))
+            .guard(IpcConnection::local_authority(&self.rpc))
             .await?
         {
             Some(client) => Ok(Some(
                 self.lifecycle
-                    .guard(CachedLocalAgent::from_client(client))
+                    .guard(CachedLocalAuthority::from_client(client))
                     .await?,
             )),
             None => Ok(None),
@@ -673,18 +673,18 @@ impl quic::WithLocalAgent for IpcConnectionHandle {
     }
 }
 
-impl quic::WithRemoteAgent for IpcConnectionHandle {
-    type RemoteAgent = CachedRemoteAgent;
+impl quic::WithRemoteAuthority for IpcConnectionHandle {
+    type RemoteAuthority = CachedRemoteAuthority;
 
-    async fn remote_agent(&self) -> Result<Option<CachedRemoteAgent>, ConnectionError> {
+    async fn remote_authority(&self) -> Result<Option<CachedRemoteAuthority>, ConnectionError> {
         match self
             .lifecycle
-            .guard(IpcConnection::remote_agent(&self.rpc))
+            .guard(IpcConnection::remote_authority(&self.rpc))
             .await?
         {
             Some(client) => Ok(Some(
                 self.lifecycle
-                    .guard(CachedRemoteAgent::from_client(client))
+                    .guard(CachedRemoteAuthority::from_client(client))
                     .await?,
             )),
             None => Ok(None),
@@ -878,9 +878,9 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    struct TestLocalAgent(&'static str);
+    struct TestLocalAuthority(&'static str);
 
-    impl identity::LocalAgent for TestLocalAgent {
+    impl identity::LocalAuthority for TestLocalAuthority {
         fn name(&self) -> &str {
             self.0
         }
@@ -903,9 +903,9 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    struct TestRemoteAgent(&'static str);
+    struct TestRemoteAuthority(&'static str);
 
-    impl identity::RemoteAgent for TestRemoteAgent {
+    impl identity::RemoteAuthority for TestRemoteAuthority {
         fn name(&self) -> &str {
             self.0
         }
@@ -1032,8 +1032,8 @@ mod tests {
         accept_bi: Mutex<VecDeque<Result<(TestReader, TestWriter), ConnectionError>>>,
         open_uni: Mutex<VecDeque<Result<TestWriter, ConnectionError>>>,
         accept_uni: Mutex<VecDeque<Result<TestReader, ConnectionError>>>,
-        local_agent: Mutex<Result<Option<TestLocalAgent>, ConnectionError>>,
-        remote_agent: Mutex<Result<Option<TestRemoteAgent>, ConnectionError>>,
+        local_authority: Mutex<Result<Option<TestLocalAuthority>, ConnectionError>>,
+        remote_authority: Mutex<Result<Option<TestRemoteAuthority>, ConnectionError>>,
     }
 
     impl TestConnection {
@@ -1045,23 +1045,23 @@ mod tests {
                 accept_bi: Mutex::new(VecDeque::new()),
                 open_uni: Mutex::new(VecDeque::new()),
                 accept_uni: Mutex::new(VecDeque::new()),
-                local_agent: Mutex::new(Ok(None)),
-                remote_agent: Mutex::new(Ok(None)),
+                local_authority: Mutex::new(Ok(None)),
+                remote_authority: Mutex::new(Ok(None)),
             })
         }
 
-        fn set_local_agent(&self, agent: Option<TestLocalAgent>) {
+        fn set_local_authority(&self, agent: Option<TestLocalAuthority>) {
             *self
-                .local_agent
+                .local_authority
                 .lock()
-                .expect("local agent mutex should not be poisoned") = Ok(agent);
+                .expect("local authority mutex should not be poisoned") = Ok(agent);
         }
 
-        fn set_remote_agent(&self, agent: Option<TestRemoteAgent>) {
+        fn set_remote_authority(&self, agent: Option<TestRemoteAuthority>) {
             *self
-                .remote_agent
+                .remote_authority
                 .lock()
-                .expect("remote agent mutex should not be poisoned") = Ok(agent);
+                .expect("remote authority mutex should not be poisoned") = Ok(agent);
         }
 
         fn close_calls(&self) -> Vec<(Code, Cow<'static, str>)> {
@@ -1288,24 +1288,24 @@ mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for TestConnection {
-        type LocalAgent = TestLocalAgent;
+    impl quic::WithLocalAuthority for TestConnection {
+        type LocalAuthority = TestLocalAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, ConnectionError> {
-            self.local_agent
+        async fn local_authority(&self) -> Result<Option<Self::LocalAuthority>, ConnectionError> {
+            self.local_authority
                 .lock()
-                .expect("local agent mutex should not be poisoned")
+                .expect("local authority mutex should not be poisoned")
                 .clone()
         }
     }
 
-    impl quic::WithRemoteAgent for TestConnection {
-        type RemoteAgent = TestRemoteAgent;
+    impl quic::WithRemoteAuthority for TestConnection {
+        type RemoteAuthority = TestRemoteAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, ConnectionError> {
-            self.remote_agent
+        async fn remote_authority(&self) -> Result<Option<Self::RemoteAuthority>, ConnectionError> {
+            self.remote_authority
                 .lock()
-                .expect("remote agent mutex should not be poisoned")
+                .expect("remote authority mutex should not be poisoned")
                 .clone()
         }
     }
@@ -1367,8 +1367,8 @@ mod tests {
         accept_bi: Mutex<VecDeque<Result<Resolved<IpcBiHandle, StreamError>, IpcAcceptError>>>,
         open_uni: Mutex<VecDeque<Result<Resolved<IpcUniHandle, StreamError>, IpcOpenError>>>,
         accept_uni: Mutex<VecDeque<Result<Resolved<IpcUniHandle, StreamError>, IpcAcceptError>>>,
-        local_agent: Mutex<Result<Option<LocalAgentClient>, ConnectionError>>,
-        remote_agent: Mutex<Result<Option<RemoteAgentClient>, ConnectionError>>,
+        local_authority: Mutex<Result<Option<LocalAuthorityClient>, ConnectionError>>,
+        remote_authority: Mutex<Result<Option<RemoteAuthorityClient>, ConnectionError>>,
         close_calls: Mutex<Vec<(Code, Cow<'static, str>)>>,
         closed_result: Mutex<Result<ConnectionError, ConnectionError>>,
     }
@@ -1380,8 +1380,8 @@ mod tests {
                 accept_bi: Mutex::new(VecDeque::new()),
                 open_uni: Mutex::new(VecDeque::new()),
                 accept_uni: Mutex::new(VecDeque::new()),
-                local_agent: Mutex::new(Ok(None)),
-                remote_agent: Mutex::new(Ok(None)),
+                local_authority: Mutex::new(Ok(None)),
+                remote_authority: Mutex::new(Ok(None)),
                 close_calls: Mutex::new(Vec::new()),
                 closed_result: Mutex::new(Ok(test_connection_error("scripted closed"))),
             })
@@ -1437,17 +1437,17 @@ mod tests {
                 })
         }
 
-        async fn local_agent(&self) -> Result<Option<LocalAgentClient>, ConnectionError> {
-            self.local_agent
+        async fn local_authority(&self) -> Result<Option<LocalAuthorityClient>, ConnectionError> {
+            self.local_authority
                 .lock()
-                .expect("local agent mutex should not be poisoned")
+                .expect("local authority mutex should not be poisoned")
                 .clone()
         }
 
-        async fn remote_agent(&self) -> Result<Option<RemoteAgentClient>, ConnectionError> {
-            self.remote_agent
+        async fn remote_authority(&self) -> Result<Option<RemoteAuthorityClient>, ConnectionError> {
+            self.remote_authority
                 .lock()
-                .expect("remote agent mutex should not be poisoned")
+                .expect("remote authority mutex should not be poisoned")
                 .clone()
         }
 
@@ -1471,8 +1471,10 @@ mod tests {
         }
     }
 
-    fn spawn_local_agent(agent: TestLocalAgent) -> (AbortOnDropHandle<()>, LocalAgentClient) {
-        let (server, client) = LocalAgentServerShared::new(Arc::new(agent), 1);
+    fn spawn_local_authority(
+        authority: TestLocalAuthority,
+    ) -> (AbortOnDropHandle<()>, LocalAuthorityClient) {
+        let (server, client) = LocalAuthorityServerShared::new(Arc::new(authority), 1);
         let task = AbortOnDropHandle::new(tokio::spawn(
             async move {
                 let _ = server.serve(true).await;
@@ -1482,8 +1484,10 @@ mod tests {
         (task, client)
     }
 
-    fn spawn_remote_agent(agent: TestRemoteAgent) -> (AbortOnDropHandle<()>, RemoteAgentClient) {
-        let (server, client) = RemoteAgentServerShared::new(Arc::new(agent), 1);
+    fn spawn_remote_authority(
+        authority: TestRemoteAuthority,
+    ) -> (AbortOnDropHandle<()>, RemoteAuthorityClient) {
+        let (server, client) = RemoteAuthorityServerShared::new(Arc::new(authority), 1);
         let task = AbortOnDropHandle::new(tokio::spawn(
             async move {
                 let _ = server.serve(true).await;
@@ -1532,11 +1536,14 @@ mod tests {
         let closed = quic::Lifecycle::closed(&lifecycle).await;
         assert_transport_reason(&closed, "helper terminal");
 
-        let agent = TestLocalAgent("signer");
-        let signature =
-            identity::LocalAgent::sign(&agent, rustls::SignatureScheme::ED25519, b"payload")
-                .await
-                .expect("test local agent should sign");
+        let authority = TestLocalAuthority("signer");
+        let signature = identity::LocalAuthority::sign(
+            &authority,
+            rustls::SignatureScheme::ED25519,
+            b"payload",
+        )
+        .await
+        .expect("test local authority should sign");
         assert!(signature.is_empty());
 
         let (reader_tx, reader_rx) = mpsc::channel(1);
@@ -1914,28 +1921,28 @@ mod tests {
     async fn adapter_surfaces_agents_and_lifecycle() {
         let fd_harness = FdHarness::new();
         let connection = TestConnection::new();
-        connection.set_local_agent(Some(TestLocalAgent("local-test")));
-        connection.set_remote_agent(Some(TestRemoteAgent("remote-test")));
+        connection.set_local_authority(Some(TestLocalAuthority("local-test")));
+        connection.set_remote_authority(Some(TestRemoteAuthority("remote-test")));
 
         let adapter = ConnectionAdapter::new(connection.clone(), fd_harness.server_sender);
 
-        let local = IpcConnection::local_agent(&adapter)
+        let local = IpcConnection::local_authority(&adapter)
             .await
-            .expect("local agent rpc")
-            .expect("local agent");
-        let local = CachedLocalAgent::from_client(local)
+            .expect("local authority rpc")
+            .expect("local authority");
+        let local = CachedLocalAuthority::from_client(local)
             .await
-            .expect("cache local agent");
-        assert_eq!(identity::LocalAgent::name(&local), "local-test");
+            .expect("cache local authority");
+        assert_eq!(identity::LocalAuthority::name(&local), "local-test");
 
-        let remote = IpcConnection::remote_agent(&adapter)
+        let remote = IpcConnection::remote_authority(&adapter)
             .await
-            .expect("remote agent rpc")
-            .expect("remote agent");
-        let remote = CachedRemoteAgent::from_client(remote)
+            .expect("remote authority rpc")
+            .expect("remote authority");
+        let remote = CachedRemoteAuthority::from_client(remote)
             .await
-            .expect("cache remote agent");
-        assert_eq!(identity::RemoteAgent::name(&remote), "remote-test");
+            .expect("cache remote authority");
+        assert_eq!(identity::RemoteAuthority::name(&remote), "remote-test");
 
         IpcConnection::close(&adapter, Code::H3_NO_ERROR, "adapter close".into())
             .await
@@ -1960,15 +1967,15 @@ mod tests {
         let adapter = ConnectionAdapter::new(connection, fd_harness.server_sender);
 
         assert!(
-            IpcConnection::local_agent(&adapter)
+            IpcConnection::local_authority(&adapter)
                 .await
-                .expect("local agent rpc")
+                .expect("local authority rpc")
                 .is_none()
         );
         assert!(
-            IpcConnection::remote_agent(&adapter)
+            IpcConnection::remote_authority(&adapter)
                 .await
-                .expect("remote agent rpc")
+                .expect("remote authority rpc")
                 .is_none()
         );
     }
@@ -2403,20 +2410,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_agents_and_lifecycle_paths_are_mapped() {
+    async fn handle_authorities_and_lifecycle_paths_are_mapped() {
         let fd_harness = FdHarness::new();
         let service = ScriptedIpcConnection::new();
-        let (local_agent_task, local_client) = spawn_local_agent(TestLocalAgent("scripted-local"));
-        let (remote_agent_task, remote_client) =
-            spawn_remote_agent(TestRemoteAgent("scripted-remote"));
+        let (local_authority_task, local_client) =
+            spawn_local_authority(TestLocalAuthority("scripted-local"));
+        let (remote_authority_task, remote_client) =
+            spawn_remote_authority(TestRemoteAuthority("scripted-remote"));
         *service
-            .local_agent
+            .local_authority
             .lock()
-            .expect("local agent mutex should not be poisoned") = Ok(Some(local_client));
+            .expect("local authority mutex should not be poisoned") = Ok(Some(local_client));
         *service
-            .remote_agent
+            .remote_authority
             .lock()
-            .expect("remote agent mutex should not be poisoned") = Ok(Some(remote_client));
+            .expect("remote authority mutex should not be poisoned") = Ok(Some(remote_client));
         *service
             .closed_result
             .lock()
@@ -2428,17 +2436,17 @@ mod tests {
 
         quic::Lifecycle::check(&handle).expect("handle should be live");
 
-        let local = quic::WithLocalAgent::local_agent(&handle)
+        let local = quic::WithLocalAuthority::local_authority(&handle)
             .await
-            .expect("local agent handle")
-            .expect("local cached agent");
-        assert_eq!(identity::LocalAgent::name(&local), "scripted-local");
+            .expect("local authority handle")
+            .expect("local cached authority");
+        assert_eq!(identity::LocalAuthority::name(&local), "scripted-local");
 
-        let remote = quic::WithRemoteAgent::remote_agent(&handle)
+        let remote = quic::WithRemoteAuthority::remote_authority(&handle)
             .await
-            .expect("remote agent handle")
-            .expect("remote cached agent");
-        assert_eq!(identity::RemoteAgent::name(&remote), "scripted-remote");
+            .expect("remote authority handle")
+            .expect("remote cached authority");
+        assert_eq!(identity::RemoteAuthority::name(&remote), "scripted-remote");
 
         quic::Lifecycle::close(&handle, Code::H3_NO_ERROR, "handle close".into());
         tokio::task::yield_now().await;
@@ -2456,8 +2464,8 @@ mod tests {
         let checked = quic::Lifecycle::check(&handle).expect_err("latched error should fail check");
         assert_transport_reason(&checked, "ipc connection channel closed");
 
-        drop(local_agent_task);
-        drop(remote_agent_task);
+        drop(local_authority_task);
+        drop(remote_authority_task);
     }
 
     #[tokio::test]
@@ -2468,15 +2476,15 @@ mod tests {
         let handle = client.into_handle(fd_harness.client_registry, fd_harness.client_sender);
 
         assert!(
-            quic::WithLocalAgent::local_agent(&handle)
+            quic::WithLocalAuthority::local_authority(&handle)
                 .await
-                .expect("local agent handle")
+                .expect("local authority handle")
                 .is_none()
         );
         assert!(
-            quic::WithRemoteAgent::remote_agent(&handle)
+            quic::WithRemoteAuthority::remote_authority(&handle)
                 .await
-                .expect("remote agent handle")
+                .expect("remote authority handle")
                 .is_none()
         );
     }

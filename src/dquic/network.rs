@@ -72,7 +72,10 @@ use crate::dquic::{
     resolver::{Resolve, handy::SystemResolver},
     server::ServerQuicConfig,
     sni::{self, RegistryGuard, ServerConfig, ServerEntry, SniCertResolver},
-    tls::{AuthClient, ClientAgentVerifyResult, ClientNameVerifyResult, LocalAgent, RemoteAgent},
+    tls::{
+        AuthClient, ClientAuthorityVerifyResult, ClientNameVerifyResult, LocalAuthority,
+        RemoteAuthority,
+    },
 };
 // Internal implementation types — not part of curated domain modules
 use crate::dquic::{
@@ -1028,10 +1031,10 @@ struct InterfaceAuthClient {
 impl AuthClient for InterfaceAuthClient {
     fn verify_client_name(
         &self,
-        server_agent: &LocalAgent,
+        server_authority: &LocalAuthority,
         _client_name: Option<&str>,
     ) -> ClientNameVerifyResult {
-        let sni = server_agent.name();
+        let sni = server_authority.name();
         let sni_lower = sni.to_ascii_lowercase();
         let entry = self
             .sni_registry
@@ -1048,12 +1051,12 @@ impl AuthClient for InterfaceAuthClient {
         }
     }
 
-    fn verify_client_agent(
+    fn verify_client_authority(
         &self,
-        _server_agent: &LocalAgent,
-        _client_agent: &RemoteAgent,
-    ) -> ClientAgentVerifyResult {
-        ClientAgentVerifyResult::Accept
+        _server_authority: &LocalAuthority,
+        _client_authority: &RemoteAuthority,
+    ) -> ClientAuthorityVerifyResult {
+        ClientAuthorityVerifyResult::Accept
     }
 }
 
@@ -1121,16 +1124,16 @@ mod tests {
         ServerQuicConfig::default()
     }
 
-    fn make_local_agent(name: &str) -> LocalAgent {
+    fn make_local_authority(name: &str) -> LocalAuthority {
         let identity = make_identity(name);
         let certified_key =
             crate::dquic::identity::build_certified_key(&identity).expect("valid certified key");
-        LocalAgent::new(Arc::from(name), certified_key)
+        LocalAuthority::new(Arc::from(name), certified_key)
     }
 
-    fn make_remote_agent(name: &str) -> RemoteAgent {
+    fn make_remote_authority(name: &str) -> RemoteAuthority {
         let identity = make_identity(name);
-        RemoteAgent::new(Arc::from(name), Arc::from(identity.certs.as_slice()))
+        RemoteAuthority::new(Arc::from(name), Arc::from(identity.certs.as_slice()))
     }
 
     struct TestNullDriver {
@@ -1667,8 +1670,8 @@ mod tests {
     async fn interface_auth_client_checks_sni_registry_and_bind_patterns() {
         let network = Network::builder().build();
         let quic = network.quic();
-        let server_agent = make_local_agent("alpha");
-        let client_agent = make_remote_agent("client");
+        let server_authority = make_local_authority("alpha");
+        let client_authority = make_remote_authority("client");
 
         let auth = InterfaceAuthClient {
             bind_uri: "iface://v4.eth0:443".parse().expect("valid bind uri"),
@@ -1685,17 +1688,17 @@ mod tests {
             .await
             .expect("bind should succeed");
         assert_eq!(
-            auth.verify_client_name(&server_agent, None),
+            auth.verify_client_name(&server_authority, None),
             ClientNameVerifyResult::Accept
         );
         assert_eq!(
-            auth.verify_client_agent(&server_agent, &client_agent),
-            ClientAgentVerifyResult::Accept
+            auth.verify_client_authority(&server_authority, &client_authority),
+            ClientAuthorityVerifyResult::Accept
         );
 
         drop(empty_bind);
         assert!(matches!(
-            auth.verify_client_name(&server_agent, None),
+            auth.verify_client_name(&server_authority, None),
             ClientNameVerifyResult::SilentRefuse(reason)
                 if reason == "no server registered for SNI"
         ));
@@ -1710,7 +1713,7 @@ mod tests {
             .expect("bind should succeed");
 
         assert!(matches!(
-            auth.verify_client_name(&server_agent, None),
+            auth.verify_client_name(&server_authority, None),
             ClientNameVerifyResult::SilentRefuse(reason) if reason == "bind pattern mismatch"
         ));
 
@@ -1719,7 +1722,7 @@ mod tests {
             sni_registry: quic.sni_registry.clone(),
         };
         assert_eq!(
-            matching_auth.verify_client_name(&server_agent, None),
+            matching_auth.verify_client_name(&server_authority, None),
             ClientNameVerifyResult::Accept
         );
     }

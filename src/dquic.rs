@@ -40,7 +40,8 @@ pub mod token {
 /// dquic TLS / client authentication types
 pub mod tls {
     pub use dquic::qconnection::tls::{
-        AuthClient, ClientAgentVerifyResult, ClientNameVerifyResult, LocalAgent, RemoteAgent,
+        AuthClient, ClientAuthorityVerifyResult, ClientNameVerifyResult, LocalAuthority,
+        RemoteAuthority,
     };
 
     pub mod handy {

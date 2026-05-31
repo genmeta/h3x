@@ -293,7 +293,7 @@ impl QuicEndpoint {
 
         // Propagate the endpoint's named identity into the QUIC transport
         // `ClientName` parameter so the peer can populate its
-        // `remote_agent` (identity-based access control on the server
+        // `remote_authority` (identity-based access control on the server
         // relies on this).
         let mut parameters = self.client.parameters.clone();
         if let Some(named) = self.identity.load_full() {

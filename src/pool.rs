@@ -193,8 +193,8 @@ impl<C: quic::Connection> Pool<C> {
                     let connection = builder.build(quic_conn).await?;
 
                     tracing::trace!("h3 connection established, verifying peer identity");
-                    let remote_agent = connection.remote_agent().await?;
-                    let actual_peer_name = remote_agent.as_ref().map(|agent| agent.name());
+                    let authority = connection.remote_authority().await?;
+                    let actual_peer_name = authority.as_ref().map(|authority| authority.name());
                     if actual_peer_name.as_ref() != Some(&server.host()) {
                         return connect_error::IncorrectIdentitySnafu {
                             expected: server.host().to_string(),
@@ -240,12 +240,12 @@ impl<C: quic::Connection> Pool<C> {
     }
 
     pub async fn try_insert(&self, connection: Arc<Connection<C>>) -> Result<(), InsertError> {
-        let remote_agent = connection
-            .remote_agent()
+        let authority = connection
+            .remote_authority()
             .await?
             .context(insert_error::MissingIdentitySnafu)?;
 
-        let client: Authority = remote_agent
+        let client: Authority = authority
             .name()
             .parse()
             .ok()
@@ -287,7 +287,7 @@ mod tests {
         time::Duration,
     };
 
-    use dhttp_identity::identity::RemoteAgent;
+    use dhttp_identity::identity::RemoteAuthority;
     use http::uri::Authority;
     use tokio::sync::Semaphore;
     use tokio_util::task::AbortOnDropHandle;
@@ -464,9 +464,9 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct NamedRemoteAgent(&'static str);
+    struct NamedRemoteAuthority(&'static str);
 
-    impl RemoteAgent for NamedRemoteAgent {
+    impl RemoteAuthority for NamedRemoteAuthority {
         fn name(&self) -> &str {
             self.0
         }
@@ -522,19 +522,23 @@ mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for IdentityOverrideConnection {
-        type LocalAgent = crate::connection::tests::TestLocalAgent;
+    impl quic::WithLocalAuthority for IdentityOverrideConnection {
+        type LocalAuthority = crate::connection::tests::TestLocalAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
-            Ok(Some(crate::connection::tests::TestLocalAgent))
+        async fn local_authority(
+            &self,
+        ) -> Result<Option<Self::LocalAuthority>, quic::ConnectionError> {
+            Ok(Some(crate::connection::tests::TestLocalAuthority))
         }
     }
 
-    impl quic::WithRemoteAgent for IdentityOverrideConnection {
-        type RemoteAgent = NamedRemoteAgent;
+    impl quic::WithRemoteAuthority for IdentityOverrideConnection {
+        type RemoteAuthority = NamedRemoteAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
-            Ok(self.remote_name.map(NamedRemoteAgent))
+        async fn remote_authority(
+            &self,
+        ) -> Result<Option<Self::RemoteAuthority>, quic::ConnectionError> {
+            Ok(self.remote_name.map(NamedRemoteAuthority))
         }
     }
 
@@ -1020,15 +1024,15 @@ mod tests {
             .await
             .expect("accept_uni should delegate to inner connection");
 
-        let local = quic::WithLocalAgent::local_agent(&connection)
+        let local = quic::WithLocalAuthority::local_authority(&connection)
             .await
-            .expect("local agent lookup should succeed");
+            .expect("local authority lookup should succeed");
         assert!(local.is_some());
 
-        let remote = quic::WithRemoteAgent::remote_agent(&connection)
+        let remote = quic::WithRemoteAuthority::remote_authority(&connection)
             .await
-            .expect("remote agent lookup should succeed")
-            .expect("remote agent should be present");
+            .expect("remote authority lookup should succeed")
+            .expect("remote authority should be present");
         assert_eq!(remote.name(), "delegated.example");
         assert!(remote.cert_chain().is_empty());
 

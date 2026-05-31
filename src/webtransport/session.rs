@@ -531,9 +531,9 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct TestLocalAgent;
+    struct TestLocalAuthority;
 
-    impl agent::LocalAgent for TestLocalAgent {
+    impl authority::LocalAuthority for TestLocalAuthority {
         fn name(&self) -> &str {
             "test-local"
         }
@@ -550,15 +550,15 @@ mod tests {
             &self,
             _scheme: rustls::SignatureScheme,
             _data: &[u8],
-        ) -> futures::future::BoxFuture<'_, Result<Vec<u8>, agent::SignError>> {
+        ) -> futures::future::BoxFuture<'_, Result<Vec<u8>, authority::SignError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
 
     #[derive(Debug)]
-    struct TestRemoteAgent;
+    struct TestRemoteAuthority;
 
-    impl agent::RemoteAgent for TestRemoteAgent {
+    impl authority::RemoteAuthority for TestRemoteAuthority {
         fn name(&self) -> &str {
             "test-remote"
         }
@@ -611,18 +611,22 @@ mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for TestConnection {
-        type LocalAgent = TestLocalAgent;
+    impl quic::WithLocalAuthority for TestConnection {
+        type LocalAuthority = TestLocalAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+        async fn local_authority(
+            &self,
+        ) -> Result<Option<Self::LocalAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
 
-    impl quic::WithRemoteAgent for TestConnection {
-        type RemoteAgent = TestRemoteAgent;
+    impl quic::WithRemoteAuthority for TestConnection {
+        type RemoteAuthority = TestRemoteAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+        async fn remote_authority(
+            &self,
+        ) -> Result<Option<Self::RemoteAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
@@ -687,18 +691,22 @@ mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for HeaderFailConnection {
-        type LocalAgent = TestLocalAgent;
+    impl quic::WithLocalAuthority for HeaderFailConnection {
+        type LocalAuthority = TestLocalAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+        async fn local_authority(
+            &self,
+        ) -> Result<Option<Self::LocalAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
 
-    impl quic::WithRemoteAgent for HeaderFailConnection {
-        type RemoteAgent = TestRemoteAgent;
+    impl quic::WithRemoteAuthority for HeaderFailConnection {
+        type RemoteAuthority = TestRemoteAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+        async fn remote_authority(
+            &self,
+        ) -> Result<Option<Self::RemoteAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
@@ -763,24 +771,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_agents_return_static_metadata_and_empty_signature() {
-        let local = TestLocalAgent;
-        let remote = TestRemoteAgent;
+        let local = TestLocalAuthority;
+        let remote = TestRemoteAuthority;
 
-        assert_eq!(agent::LocalAgent::name(&local), "test-local");
-        assert!(agent::LocalAgent::cert_chain(&local).is_empty());
+        assert_eq!(authority::LocalAuthority::name(&local), "test-local");
+        assert!(authority::LocalAuthority::cert_chain(&local).is_empty());
         assert_eq!(
-            agent::LocalAgent::sign_algorithm(&local),
+            authority::LocalAuthority::sign_algorithm(&local),
             rustls::SignatureAlgorithm::ED25519
         );
         assert!(
-            agent::LocalAgent::sign(&local, rustls::SignatureScheme::ED25519, b"payload")
+            authority::LocalAuthority::sign(&local, rustls::SignatureScheme::ED25519, b"payload")
                 .await
                 .expect("test signer")
                 .is_empty()
         );
 
-        assert_eq!(agent::RemoteAgent::name(&remote), "test-remote");
-        assert!(agent::RemoteAgent::cert_chain(&remote).is_empty());
+        assert_eq!(authority::RemoteAuthority::name(&remote), "test-remote");
+        assert!(authority::RemoteAuthority::cert_chain(&remote).is_empty());
     }
 
     #[tokio::test]
@@ -790,15 +798,15 @@ mod tests {
         };
 
         assert!(
-            quic::WithLocalAgent::local_agent(&conn)
+            quic::WithLocalAuthority::local_authority(&conn)
                 .await
-                .expect("local agent")
+                .expect("local authority")
                 .is_none()
         );
         assert!(
-            quic::WithRemoteAgent::remote_agent(&conn)
+            quic::WithRemoteAuthority::remote_authority(&conn)
                 .await
-                .expect("remote agent")
+                .expect("remote authority")
                 .is_none()
         );
         quic::Lifecycle::check(&conn).expect("connection is open");
@@ -836,15 +844,15 @@ mod tests {
         };
 
         assert!(
-            quic::WithLocalAgent::local_agent(&conn)
+            quic::WithLocalAuthority::local_authority(&conn)
                 .await
-                .expect("local agent")
+                .expect("local authority")
                 .is_none()
         );
         assert!(
-            quic::WithRemoteAgent::remote_agent(&conn)
+            quic::WithRemoteAuthority::remote_authority(&conn)
                 .await
-                .expect("remote agent")
+                .expect("remote authority")
                 .is_none()
         );
         quic::Lifecycle::check(&conn).expect("connection is open");

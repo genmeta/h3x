@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use super::{
-    agent::{CachedLocalAgent, CachedRemoteAgent, LocalAgentClient, RemoteAgentClient},
+    authority::{
+        CachedLocalAuthority, CachedRemoteAuthority, LocalAuthorityClient, RemoteAuthorityClient,
+    },
     stream::{self, ReadStreamClient, WriteStreamClient},
 };
 use crate::{
@@ -27,8 +29,10 @@ pub trait Connection: Send + Sync {
         &self,
     ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError>;
     async fn accept_uni(&self) -> Result<ReadStreamClient, quic::ConnectionError>;
-    async fn local_agent(&self) -> Result<Option<LocalAgentClient>, quic::ConnectionError>;
-    async fn remote_agent(&self) -> Result<Option<RemoteAgentClient>, quic::ConnectionError>;
+    async fn local_authority(&self) -> Result<Option<LocalAuthorityClient>, quic::ConnectionError>;
+    async fn remote_authority(
+        &self,
+    ) -> Result<Option<RemoteAuthorityClient>, quic::ConnectionError>;
     async fn close(
         &self,
         code: Code,
@@ -44,8 +48,8 @@ pub trait Connection: Send + Sync {
 impl<C> Connection for C
 where
     C: quic::Connection + 'static,
-    C::LocalAgent: Send + Sync,
-    C::RemoteAgent: Send + Sync,
+    C::LocalAuthority: Send + Sync,
+    C::RemoteAuthority: Send + Sync,
 {
     async fn open_bi(
         &self,
@@ -113,11 +117,11 @@ where
         Ok(rc)
     }
 
-    async fn local_agent(&self) -> Result<Option<LocalAgentClient>, quic::ConnectionError> {
-        match quic::WithLocalAgent::local_agent(self).await? {
+    async fn local_authority(&self) -> Result<Option<LocalAuthorityClient>, quic::ConnectionError> {
+        match quic::WithLocalAuthority::local_authority(self).await? {
             Some(agent) => {
                 let (server, client) =
-                    super::agent::LocalAgentServerShared::new(Arc::new(agent), 1);
+                    super::authority::LocalAuthorityServerShared::new(Arc::new(agent), 1);
                 tokio::spawn(
                     (async move {
                         let _ = server.serve(true).await;
@@ -130,11 +134,13 @@ where
         }
     }
 
-    async fn remote_agent(&self) -> Result<Option<RemoteAgentClient>, quic::ConnectionError> {
-        match quic::WithRemoteAgent::remote_agent(self).await? {
+    async fn remote_authority(
+        &self,
+    ) -> Result<Option<RemoteAuthorityClient>, quic::ConnectionError> {
+        match quic::WithRemoteAuthority::remote_authority(self).await? {
             Some(agent) => {
                 let (server, client) =
-                    super::agent::RemoteAgentServerShared::new(Arc::new(agent), 1);
+                    super::authority::RemoteAuthorityServerShared::new(Arc::new(agent), 1);
                 tokio::spawn(
                     (async move {
                         let _ = server.serve(true).await;
@@ -254,26 +260,33 @@ impl quic::ManageStream for RemoteConnection {
     }
 }
 
-impl quic::WithLocalAgent for RemoteConnection {
-    type LocalAgent = CachedLocalAgent;
+impl quic::WithLocalAuthority for RemoteConnection {
+    type LocalAuthority = CachedLocalAuthority;
 
-    async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, ConnectionError> {
-        match self.guard(Connection::local_agent(&self.client)).await? {
+    async fn local_authority(&self) -> Result<Option<Self::LocalAuthority>, ConnectionError> {
+        match self
+            .guard(Connection::local_authority(&self.client))
+            .await?
+        {
             Some(agent) => Ok(Some(
-                self.guard(CachedLocalAgent::from_client(agent)).await?,
+                self.guard(CachedLocalAuthority::from_client(agent)).await?,
             )),
             None => Ok(None),
         }
     }
 }
 
-impl quic::WithRemoteAgent for RemoteConnection {
-    type RemoteAgent = CachedRemoteAgent;
+impl quic::WithRemoteAuthority for RemoteConnection {
+    type RemoteAuthority = CachedRemoteAuthority;
 
-    async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, ConnectionError> {
-        match self.guard(Connection::remote_agent(&self.client)).await? {
+    async fn remote_authority(&self) -> Result<Option<Self::RemoteAuthority>, ConnectionError> {
+        match self
+            .guard(Connection::remote_authority(&self.client))
+            .await?
+        {
             Some(agent) => Ok(Some(
-                self.guard(CachedRemoteAgent::from_client(agent)).await?,
+                self.guard(CachedRemoteAuthority::from_client(agent))
+                    .await?,
             )),
             None => Ok(None),
         }
@@ -317,7 +330,7 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use dhttp_identity::identity::{self as agent, SignError};
+    use dhttp_identity::identity::{self as authority, SignError};
     use futures::{Sink, SinkExt, Stream, StreamExt, future::BoxFuture};
     use remoc::prelude::ServerShared;
     use rustls::{SignatureScheme, pki_types::CertificateDer};
@@ -333,12 +346,12 @@ mod tests {
     const SERVER_CERT: &[u8] = include_bytes!("../../../tests/keychain/localhost/server.cert");
 
     #[derive(Clone, Debug)]
-    struct TestLocalAgent {
+    struct TestLocalAuthority {
         name: &'static str,
         cert_chain: Vec<CertificateDer<'static>>,
     }
 
-    impl TestLocalAgent {
+    impl TestLocalAuthority {
         fn new(name: &'static str) -> Self {
             Self {
                 name,
@@ -347,7 +360,7 @@ mod tests {
         }
     }
 
-    impl agent::LocalAgent for TestLocalAgent {
+    impl authority::LocalAuthority for TestLocalAuthority {
         fn name(&self) -> &str {
             self.name
         }
@@ -371,12 +384,12 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    struct TestRemoteAgent {
+    struct TestRemoteAuthority {
         name: &'static str,
         cert_chain: Vec<CertificateDer<'static>>,
     }
 
-    impl TestRemoteAgent {
+    impl TestRemoteAuthority {
         fn new(name: &'static str) -> Self {
             Self {
                 name,
@@ -385,7 +398,7 @@ mod tests {
         }
     }
 
-    impl agent::RemoteAgent for TestRemoteAgent {
+    impl authority::RemoteAuthority for TestRemoteAuthority {
         fn name(&self) -> &str {
             self.name
         }
@@ -400,10 +413,10 @@ mod tests {
         open_uni_error: Option<quic::ConnectionError>,
         accept_bi_error: Option<quic::ConnectionError>,
         accept_uni_error: Option<quic::ConnectionError>,
-        local_agent: Option<TestLocalAgent>,
-        local_agent_error: Option<quic::ConnectionError>,
-        remote_agent: Option<TestRemoteAgent>,
-        remote_agent_error: Option<quic::ConnectionError>,
+        local_authority: Option<TestLocalAuthority>,
+        local_authority_error: Option<quic::ConnectionError>,
+        remote_authority: Option<TestRemoteAuthority>,
+        remote_authority_error: Option<quic::ConnectionError>,
         terminal: Mutex<Option<quic::ConnectionError>>,
         closes: Mutex<Vec<(Code, Cow<'static, str>)>>,
     }
@@ -415,10 +428,10 @@ mod tests {
                 open_uni_error: None,
                 accept_bi_error: None,
                 accept_uni_error: None,
-                local_agent: None,
-                local_agent_error: None,
-                remote_agent: None,
-                remote_agent_error: None,
+                local_authority: None,
+                local_authority_error: None,
+                remote_authority: None,
+                remote_authority_error: None,
                 terminal: Mutex::new(None),
                 closes: Mutex::new(Vec::new()),
             }
@@ -426,8 +439,8 @@ mod tests {
 
         fn with_agents() -> Self {
             Self {
-                local_agent: Some(TestLocalAgent::new("local.example")),
-                remote_agent: Some(TestRemoteAgent::new("remote.example")),
+                local_authority: Some(TestLocalAuthority::new("local.example")),
+                remote_authority: Some(TestRemoteAuthority::new("remote.example")),
                 ..Self::new()
             }
         }
@@ -460,16 +473,16 @@ mod tests {
             }
         }
 
-        fn fail_local_agent(reason: &'static str) -> Self {
+        fn fail_local_authority(reason: &'static str) -> Self {
             Self {
-                local_agent_error: Some(connection_error(reason)),
+                local_authority_error: Some(connection_error(reason)),
                 ..Self::new()
             }
         }
 
-        fn fail_remote_agent(reason: &'static str) -> Self {
+        fn fail_remote_authority(reason: &'static str) -> Self {
             Self {
-                remote_agent_error: Some(connection_error(reason)),
+                remote_authority_error: Some(connection_error(reason)),
                 ..Self::new()
             }
         }
@@ -536,25 +549,29 @@ mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for TestQuicConnection {
-        type LocalAgent = TestLocalAgent;
+    impl quic::WithLocalAuthority for TestQuicConnection {
+        type LocalAuthority = TestLocalAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
-            if let Some(error) = &self.local_agent_error {
+        async fn local_authority(
+            &self,
+        ) -> Result<Option<Self::LocalAuthority>, quic::ConnectionError> {
+            if let Some(error) = &self.local_authority_error {
                 return Err(error.clone());
             }
-            Ok(self.local_agent.clone())
+            Ok(self.local_authority.clone())
         }
     }
 
-    impl quic::WithRemoteAgent for TestQuicConnection {
-        type RemoteAgent = TestRemoteAgent;
+    impl quic::WithRemoteAuthority for TestQuicConnection {
+        type RemoteAuthority = TestRemoteAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
-            if let Some(error) = &self.remote_agent_error {
+        async fn remote_authority(
+            &self,
+        ) -> Result<Option<Self::RemoteAuthority>, quic::ConnectionError> {
+            if let Some(error) = &self.remote_authority_error {
                 return Err(error.clone());
             }
-            Ok(self.remote_agent.clone())
+            Ok(self.remote_authority.clone())
         }
     }
 
@@ -717,18 +734,22 @@ mod tests {
         }
     }
 
-    impl quic::WithLocalAgent for BrokenIdQuicConnection {
-        type LocalAgent = TestLocalAgent;
+    impl quic::WithLocalAuthority for BrokenIdQuicConnection {
+        type LocalAuthority = TestLocalAuthority;
 
-        async fn local_agent(&self) -> Result<Option<Self::LocalAgent>, quic::ConnectionError> {
+        async fn local_authority(
+            &self,
+        ) -> Result<Option<Self::LocalAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
 
-    impl quic::WithRemoteAgent for BrokenIdQuicConnection {
-        type RemoteAgent = TestRemoteAgent;
+    impl quic::WithRemoteAuthority for BrokenIdQuicConnection {
+        type RemoteAuthority = TestRemoteAuthority;
 
-        async fn remote_agent(&self) -> Result<Option<Self::RemoteAgent>, quic::ConnectionError> {
+        async fn remote_authority(
+            &self,
+        ) -> Result<Option<Self::RemoteAuthority>, quic::ConnectionError> {
             Ok(None)
         }
     }
@@ -884,28 +905,40 @@ mod tests {
             .await
             .expect("stop accepted reader");
 
-        let local_agent = quic::WithLocalAgent::local_agent(&remote)
+        let local_authority = quic::WithLocalAuthority::local_authority(&remote)
             .await
-            .expect("local agent")
-            .expect("local agent should exist");
-        assert_eq!(agent::LocalAgent::name(&local_agent), "local.example");
-        assert_eq!(agent::LocalAgent::cert_chain(&local_agent).len(), 1);
+            .expect("local authority")
+            .expect("local authority should exist");
         assert_eq!(
-            agent::LocalAgent::sign_algorithm(&local_agent),
+            authority::LocalAuthority::name(&local_authority),
+            "local.example"
+        );
+        assert_eq!(
+            authority::LocalAuthority::cert_chain(&local_authority).len(),
+            1
+        );
+        assert_eq!(
+            authority::LocalAuthority::sign_algorithm(&local_authority),
             rustls::SignatureAlgorithm::ECDSA,
         );
         let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
-        let signature = agent::LocalAgent::sign(&local_agent, scheme, b"payload")
+        let signature = authority::LocalAuthority::sign(&local_authority, scheme, b"payload")
             .await
-            .expect("local agent sign");
+            .expect("local authority sign");
         assert_eq!(signature, expected_signature(scheme, b"payload"));
 
-        let remote_agent = quic::WithRemoteAgent::remote_agent(&remote)
+        let remote_authority = quic::WithRemoteAuthority::remote_authority(&remote)
             .await
-            .expect("remote agent")
-            .expect("remote agent should exist");
-        assert_eq!(agent::RemoteAgent::name(&remote_agent), "remote.example");
-        assert_eq!(agent::RemoteAgent::cert_chain(&remote_agent).len(), 1);
+            .expect("remote authority")
+            .expect("remote authority should exist");
+        assert_eq!(
+            authority::RemoteAuthority::name(&remote_authority),
+            "remote.example"
+        );
+        assert_eq!(
+            authority::RemoteAuthority::cert_chain(&remote_authority).len(),
+            1
+        );
 
         quic::Lifecycle::close(&remote, Code::H3_NO_ERROR, "bye".into());
         for _ in 0..20 {
@@ -932,48 +965,49 @@ mod tests {
         let (_task, client) = spawn_rpc_connection(connection);
         let remote = client.into_quic();
 
-        let local_agent = quic::WithLocalAgent::local_agent(&remote)
+        let local_authority = quic::WithLocalAuthority::local_authority(&remote)
             .await
-            .expect("local agent lookup should succeed");
-        assert!(local_agent.is_none());
+            .expect("local authority lookup should succeed");
+        assert!(local_authority.is_none());
 
-        let remote_agent = quic::WithRemoteAgent::remote_agent(&remote)
+        let remote_authority = quic::WithRemoteAuthority::remote_authority(&remote)
             .await
-            .expect("remote agent lookup should succeed");
-        assert!(remote_agent.is_none());
+            .expect("remote authority lookup should succeed");
+        assert!(remote_authority.is_none());
 
         quic::Lifecycle::check(&remote).expect("absent agents should not close connection");
     }
 
     #[tokio::test]
     async fn remote_connection_latches_agent_lookup_errors() {
-        let connection = Arc::new(TestQuicConnection::fail_local_agent(
-            "local agent lookup failed",
+        let connection = Arc::new(TestQuicConnection::fail_local_authority(
+            "local authority lookup failed",
         ));
         let (_task, client) = spawn_rpc_connection(connection);
         let remote = client.into_quic();
 
-        let Err(error) = quic::WithLocalAgent::local_agent(&remote).await else {
-            panic!("local agent error should surface");
+        let Err(error) = quic::WithLocalAuthority::local_authority(&remote).await else {
+            panic!("local authority error should surface");
         };
-        assert_reason(&error, "local agent lookup failed");
+        assert_reason(&error, "local authority lookup failed");
 
-        let latched = quic::Lifecycle::check(&remote).expect_err("local agent error should latch");
-        assert_reason(&latched, "local agent lookup failed");
+        let latched =
+            quic::Lifecycle::check(&remote).expect_err("local authority error should latch");
+        assert_reason(&latched, "local authority lookup failed");
 
-        let connection = Arc::new(TestQuicConnection::fail_remote_agent(
-            "remote agent lookup failed",
+        let connection = Arc::new(TestQuicConnection::fail_remote_authority(
+            "remote authority lookup failed",
         ));
         let (_task, client) = spawn_rpc_connection(connection);
         let remote = client.into_quic();
 
-        let Err(error) = quic::WithRemoteAgent::remote_agent(&remote).await else {
-            panic!("remote agent error should surface");
+        let Err(error) = quic::WithRemoteAuthority::remote_authority(&remote).await else {
+            panic!("remote authority error should surface");
         };
-        assert_reason(&error, "remote agent lookup failed");
+        assert_reason(&error, "remote authority lookup failed");
 
         let closed = quic::Lifecycle::closed(&remote).await;
-        assert_reason(&closed, "remote agent lookup failed");
+        assert_reason(&closed, "remote authority lookup failed");
     }
 
     #[tokio::test]
