@@ -1,6 +1,6 @@
 [package]
 name = "h3x"
-description = "High-performance zero-copy DHTTP/3 implementation"
+description = "Peer-to-peer DHTTP/3 transport over QUIC"
 version = "0.2.0"
 edition = "2024"
 readme = "README.md"

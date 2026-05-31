@@ -1,6 +1,6 @@
 [![License: Apache-2.0](https://img.shields.io/github/license/genmeta/h3x)](https://www.apache.org/licenses/LICENSE-2.0)
 
-High-performance asynchronous DHTTP/3 implementation in Rust.
+Peer-to-peer DHTTP/3 transport over QUIC, implemented in Rust.
 
 - **Peer-to-Peer**: Extends [HTTP3(RFC9114)](https://datatracker.ietf.org/doc/html/rfc9114) to *DHTTP/3*, allowing both sides of the connection to initiate and handle HTTP3 requests (achieved by disabling server push).
 - **Asynchronous I/O**: Built on the Rust asynchronous ecosystem, providing high-performance I/O processing capabilities.
@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let service = Service::new().get("/hello", hello);
-    endpoint.serve(service).await?;
+    endpoint.listen(service).await?;
     Ok(())
 }
 ```
@@ -101,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .bind(Arc::new(vec!["127.0.0.1:4433".parse()?]))
             .build().await,
     )
-    .serve(service)
+    .listen(service)
     .await?;
     Ok(())
 }
