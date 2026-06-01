@@ -2,7 +2,7 @@
 
 use std::{any::Any, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bon::bon;
 use futures::{FutureExt, Stream, StreamExt, future::join_all};
 use rustls::ClientConfig;
@@ -95,13 +95,13 @@ pub struct QuicEndpoint {
     /// Shared network infrastructure.
     pub(crate) network: Arc<Network>,
     /// TLS identity for this endpoint (`None` for anonymous/client-only).
-    pub(crate) identity: ArcSwapOption<Identity>,
+    pub(crate) identity: Arc<ArcSwapOption<Identity>>,
     /// Resolver used when establishing outbound connections.
     pub(crate) resolver: Arc<dyn Resolve + Send + Sync>,
     /// Client-side configuration.
-    pub(crate) client: Arc<ClientQuicConfig>,
+    pub(crate) client: Arc<ArcSwap<ClientQuicConfig>>,
     /// Server-side configuration.
-    pub(crate) server: Arc<ServerQuicConfig>,
+    pub(crate) server: Arc<ArcSwap<ServerQuicConfig>>,
     /// Bind patterns for interface filtering (shared by client and server roles).
     pub(crate) bind: Arc<Vec<BindPattern>>,
     _binds: Arc<Vec<BindHandle>>,
@@ -113,7 +113,7 @@ impl Clone for QuicEndpoint {
     fn clone(&self) -> Self {
         Self {
             network: self.network.clone(),
-            identity: ArcSwapOption::from(self.identity.load_full()),
+            identity: self.identity.clone(),
             resolver: self.resolver.clone(),
             client: self.client.clone(),
             server: self.server.clone(),
@@ -130,7 +130,8 @@ impl Clone for QuicEndpoint {
 /// On drop, invalidates the endpoint's `client_tls_cache` so that the next
 /// `connect()` call rebuilds the TLS configuration.
 pub struct ClientConfigMutGuard<'a> {
-    config: &'a mut Arc<ClientQuicConfig>,
+    config: Arc<ClientQuicConfig>,
+    target: &'a ArcSwap<ClientQuicConfig>,
     cache: &'a ArcSwapOption<ClientConfig>,
 }
 
@@ -143,12 +144,13 @@ impl<'a> std::ops::Deref for ClientConfigMutGuard<'a> {
 
 impl<'a> std::ops::DerefMut for ClientConfigMutGuard<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        Arc::make_mut(self.config)
+        Arc::make_mut(&mut self.config)
     }
 }
 
 impl<'a> Drop for ClientConfigMutGuard<'a> {
     fn drop(&mut self) {
+        self.target.store(self.config.clone());
         self.cache.store(None);
     }
 }
@@ -158,7 +160,8 @@ impl<'a> Drop for ClientConfigMutGuard<'a> {
 /// On drop, invalidates the endpoint's `server_binding_cache` so that the next
 /// `accept()` call rebuilds the server binding.
 pub struct ServerConfigMutGuard<'a> {
-    config: &'a mut Arc<ServerQuicConfig>,
+    config: Arc<ServerQuicConfig>,
+    target: &'a ArcSwap<ServerQuicConfig>,
     cache: &'a ArcSwapOption<ServerBinding>,
 }
 
@@ -171,12 +174,13 @@ impl<'a> std::ops::Deref for ServerConfigMutGuard<'a> {
 
 impl<'a> std::ops::DerefMut for ServerConfigMutGuard<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        Arc::make_mut(self.config)
+        Arc::make_mut(&mut self.config)
     }
 }
 
 impl<'a> Drop for ServerConfigMutGuard<'a> {
     fn drop(&mut self) {
+        self.target.store(self.config.clone());
         self.cache.store(None);
     }
 }
@@ -205,6 +209,10 @@ impl QuicEndpoint {
     pub fn resolver(&self) -> &Arc<dyn Resolve + Send + Sync> {
         &self.resolver
     }
+
+    pub fn set_resolver(&mut self, resolver: Arc<dyn Resolve + Send + Sync>) {
+        self.resolver = resolver;
+    }
 }
 
 #[bon]
@@ -229,10 +237,10 @@ impl QuicEndpoint {
             join_all(bind.iter().map(|p| network.quic().bind(p.clone()))).await;
         let endpoint = Self {
             network,
-            identity: ArcSwapOption::from(identity),
+            identity: Arc::new(ArcSwapOption::from(identity)),
             resolver,
-            client: Arc::new(client),
-            server: Arc::new(server),
+            client: Arc::new(ArcSwap::from_pointee(client)),
+            server: Arc::new(ArcSwap::from_pointee(server)),
             bind,
             _binds: Arc::new(binds),
             client_tls_cache: ArcSwapOption::empty(),
@@ -262,7 +270,8 @@ impl QuicEndpoint {
         let builder = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(TLS13)
             .context(VersionSnafu)?;
-        let builder = match &self.client.verifier {
+        let client = self.client.load_full();
+        let builder = match &client.verifier {
             ServerCertVerifierChoice::Dangerous => builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(DangerousServerCertVerifier)),
@@ -277,8 +286,8 @@ impl QuicEndpoint {
                 .with_client_auth_cert(id.certs.iter().cloned().collect(), id.key.clone_key())
                 .context(ClientAuthSnafu)?,
         };
-        tls.alpn_protocols.clone_from(&self.client.alpns);
-        tls.enable_early_data = self.client.enable_0rtt;
+        tls.alpn_protocols.clone_from(&client.alpns);
+        tls.enable_early_data = client.enable_0rtt;
         Ok(tls)
     }
 }
@@ -295,7 +304,8 @@ impl QuicEndpoint {
         // `ClientName` parameter so the peer can populate its
         // `remote_authority` (identity-based access control on the server
         // relies on this).
-        let mut parameters = self.client.parameters.clone();
+        let client = self.client.load_full();
+        let mut parameters = client.parameters.clone();
         if let Some(named) = self.identity.load_full() {
             parameters
                 .set(
@@ -304,19 +314,18 @@ impl QuicEndpoint {
                 )
                 .context(SetParameterSnafu)?;
         }
-        let builder =
-            Connection::new_client(server_name.to_owned(), self.client.token_sink.clone())
-                .with_parameters(parameters)
-                .with_tls_config((*tls).clone())
-                .with_streams_concurrency_strategy(self.client.stream_strategy_factory.as_ref())
-                .with_zero_rtt(self.client.enable_0rtt);
+        let builder = Connection::new_client(server_name.to_owned(), client.token_sink.clone())
+            .with_parameters(parameters)
+            .with_tls_config((*tls).clone())
+            .with_streams_concurrency_strategy(client.stream_strategy_factory.as_ref())
+            .with_zero_rtt(client.enable_0rtt);
         let connection = self
             .network
             .quic()
             .configure_connection(builder)
-            .with_defer_idle_timeout(self.client.defer_idle_timeout)
+            .with_defer_idle_timeout(client.defer_idle_timeout)
             .with_cids(ConnectionId::random_gen(8))
-            .with_qlog(self.client.qlogger.clone())
+            .with_qlog(client.qlogger.clone())
             .run();
         Ok(connection)
     }
@@ -333,10 +342,11 @@ impl QuicEndpoint {
         if let Some(cached) = self.server_binding_cache.load_full() {
             return Ok(cached.as_ref().clone());
         }
+        let server = self.server.load_full();
         let binding = self
             .network
             .quic()
-            .bind_server(named, (*self.server).clone(), self.bind.clone())
+            .bind_server(named, (*server).clone(), self.bind.clone())
             .await
             .context(BindServerSnafu)?;
         self.server_binding_cache
@@ -547,7 +557,7 @@ impl QuicEndpoint {
     pub fn identity_mut(&mut self) -> IdentityMutGuard<'_> {
         let value = self.identity.load_full();
         IdentityMutGuard {
-            identity: &self.identity,
+            identity: self.identity.as_ref(),
             value,
             client_cache: &self.client_tls_cache,
             server_cache: &self.server_binding_cache,
@@ -572,7 +582,8 @@ impl QuicEndpoint {
     /// When the guard is dropped, the `client_tls_cache` is invalidated.
     pub fn client_config_mut(&mut self) -> ClientConfigMutGuard<'_> {
         ClientConfigMutGuard {
-            config: &mut self.client,
+            config: self.client.load_full(),
+            target: self.client.as_ref(),
             cache: &self.client_tls_cache,
         }
     }
@@ -584,7 +595,8 @@ impl QuicEndpoint {
     /// When the guard is dropped, the `server_binding_cache` is invalidated.
     pub fn server_config_mut(&mut self) -> ServerConfigMutGuard<'_> {
         ServerConfigMutGuard {
-            config: &mut self.server,
+            config: self.server.load_full(),
+            target: self.server.as_ref(),
             cache: &self.server_binding_cache,
         }
     }
@@ -626,6 +638,7 @@ impl<'a> Drop for IdentityMutGuard<'a> {
 impl QuicEndpoint {
     fn connect_path_timeout(&self) -> Duration {
         self.client
+            .load_full()
             .parameters
             .get::<Duration>(crate::dquic::qbase::param::ParameterId::MaxIdleTimeout)
             .filter(|timeout| !timeout.is_zero())
@@ -642,9 +655,7 @@ impl QuicEndpoint {
             .any(|(pathway, _)| Self::pathway_is_connect_ready(pathway)))
     }
 
-    fn pathway_is_connect_ready(
-        pathway: crate::dquic::qbase::net::route::Pathway,
-    ) -> bool {
+    fn pathway_is_connect_ready(pathway: crate::dquic::qbase::net::route::Pathway) -> bool {
         match (pathway.local(), pathway.remote()) {
             (EndpointAddr::Direct { addr: local }, EndpointAddr::Direct { addr: remote }) => {
                 Self::direct_path_is_connect_ready(local, remote)
@@ -837,8 +848,8 @@ mod tests {
             .build()
             .await;
 
-        assert!(Arc::ptr_eq(&endpoint.network, &network));
-        assert!(endpoint.identity.load_full().is_none());
+        assert!(Arc::ptr_eq(endpoint.network(), &network));
+        assert!(endpoint.identity().is_none());
     }
 
     #[tokio::test]
@@ -905,7 +916,7 @@ mod tests {
             .build_client_connection("remote.test", tls)
             .expect("client connection");
         let iface = endpoint
-            .network
+            .network()
             .quic()
             .get_interfaces(&bind_pattern)
             .expect("registered bind")
@@ -948,7 +959,7 @@ mod tests {
             .build_client_connection("server.example", tls)
             .expect("client connection");
         let iface = bind_endpoint
-            .network
+            .network()
             .quic()
             .get_interfaces(&bind_pattern)
             .expect("registered bind")
@@ -1024,7 +1035,7 @@ mod tests {
             .build_client_connection("server.example", tls)
             .expect("client connection");
         let iface = bind_endpoint
-            .network
+            .network()
             .quic()
             .get_interfaces(&bind_pattern)
             .expect("registered bind")
@@ -1156,7 +1167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_client_caches_tls_and_clone_starts_with_empty_cache() {
+    async fn ensure_client_caches_tls_but_clone_does_not_share_cache() {
         let endpoint = make_endpoint().await;
 
         let first = endpoint.ensure_client().expect("client tls should build");
@@ -1166,10 +1177,7 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
 
         let cloned = endpoint.clone();
-        assert!(
-            cloned.client_tls_cache.load_full().is_none(),
-            "clone should not inherit stale client TLS cache"
-        );
+        assert!(cloned.client_tls_cache.load_full().is_none());
     }
 
     #[tokio::test]
@@ -1185,14 +1193,14 @@ mod tests {
             .build_client_tls()
             .expect("client tls should build");
 
-        assert_eq!(tls.alpn_protocols, endpoint.client.alpns);
+        assert_eq!(tls.alpn_protocols, endpoint.client.load_full().alpns);
         assert!(tls.enable_early_data);
     }
 
     #[tokio::test]
     async fn test_identity_mut_set() {
         let mut endpoint = make_endpoint().await;
-        assert!(endpoint.identity.load_full().is_none());
+        assert!(endpoint.identity().is_none());
 
         let identity = make_identity("test.example.com");
         {
@@ -1200,7 +1208,7 @@ mod tests {
             *guard = Some(Arc::new(identity));
         }
 
-        let id = endpoint.identity.load_full();
+        let id = endpoint.identity();
         assert!(id.is_some());
         assert_eq!(id.unwrap().name.as_str(), "test.example.com");
     }
@@ -1213,14 +1221,14 @@ mod tests {
             let mut guard = endpoint.identity_mut();
             *guard = Some(Arc::new(identity));
         }
-        assert!(endpoint.identity.load_full().is_some());
+        assert!(endpoint.identity().is_some());
 
         {
             let mut guard = endpoint.identity_mut();
             *guard = None;
         }
 
-        assert!(endpoint.identity.load_full().is_none());
+        assert!(endpoint.identity().is_none());
     }
 
     #[tokio::test]
@@ -1231,7 +1239,7 @@ mod tests {
             let mut guard = endpoint.identity_mut();
             *guard = Some(Arc::new(identity));
         }
-        assert!(endpoint.identity.load_full().unwrap().ocsp.is_none());
+        assert!(endpoint.identity().unwrap().ocsp.is_none());
 
         {
             let mut guard = endpoint.identity_mut();
@@ -1240,7 +1248,7 @@ mod tests {
             }
         }
 
-        let id = endpoint.identity.load_full().unwrap();
+        let id = endpoint.identity().unwrap();
         assert_eq!(id.ocsp.as_deref(), Some(&[10u8, 20, 30][..]));
     }
 
@@ -1255,17 +1263,17 @@ mod tests {
 
         endpoint.update_ocsp(Some(vec![1, 2, 3]));
 
-        let id = endpoint.identity.load_full().unwrap();
+        let id = endpoint.identity().unwrap();
         assert_eq!(id.ocsp.as_deref(), Some(&[1u8, 2, 3][..]));
     }
 
     #[tokio::test]
     async fn test_update_ocsp_without_identity_no_panic() {
         let mut endpoint = make_endpoint().await;
-        assert!(endpoint.identity.load_full().is_none());
+        assert!(endpoint.identity().is_none());
 
         endpoint.update_ocsp(Some(vec![9, 8, 7]));
-        assert!(endpoint.identity.load_full().is_none());
+        assert!(endpoint.identity().is_none());
     }
 
     #[tokio::test]
@@ -1290,7 +1298,7 @@ mod tests {
                 "deref-helper.test"
             );
         }
-        assert!(endpoint.identity.load_full().is_some());
+        assert!(endpoint.identity().is_some());
 
         endpoint.client_tls_cache.store(Some(Arc::new(
             rustls::ClientConfig::builder()
@@ -1305,14 +1313,14 @@ mod tests {
     #[tokio::test]
     async fn test_client_config_mut() {
         let mut endpoint = make_endpoint().await;
-        assert!(!endpoint.client.enable_0rtt);
+        assert!(!endpoint.client.load_full().enable_0rtt);
 
         {
             let mut guard = endpoint.client_config_mut();
             guard.enable_0rtt = true;
         } // guard dropped → cache invalidated
 
-        assert!(endpoint.client.enable_0rtt);
+        assert!(endpoint.client.load_full().enable_0rtt);
     }
 
     #[tokio::test]
@@ -1333,14 +1341,14 @@ mod tests {
     #[tokio::test]
     async fn test_server_config_mut() {
         let mut endpoint = make_endpoint().await;
-        assert!(!endpoint.server.anti_port_scan);
+        assert!(!endpoint.server.load_full().anti_port_scan);
 
         {
             let mut guard = endpoint.server_config_mut();
             guard.anti_port_scan = true;
         }
 
-        assert!(endpoint.server.anti_port_scan);
+        assert!(endpoint.server.load_full().anti_port_scan);
     }
 
     #[tokio::test]
@@ -1356,6 +1364,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clone_shares_identity_updates() {
+        let mut endpoint = make_endpoint().await;
+        let mut cloned = endpoint.clone();
+
+        {
+            let mut guard = endpoint.identity_mut();
+            *guard = Some(Arc::new(make_identity("shared-identity.test")));
+        }
+
+        assert_eq!(
+            cloned
+                .identity()
+                .expect("clone sees shared identity")
+                .name
+                .as_str(),
+            "shared-identity.test"
+        );
+
+        {
+            let mut guard = cloned.identity_mut();
+            *guard = None;
+        }
+
+        assert!(endpoint.identity().is_none());
+    }
+
+    #[tokio::test]
+    async fn set_resolver_on_clone_does_not_change_original_resolver() {
+        let endpoint = make_endpoint().await;
+        let original = endpoint.resolver().clone();
+        let replacement: Arc<dyn Resolve + Send + Sync> = Arc::new(SystemResolver);
+        let mut cloned = endpoint.clone();
+
+        cloned.set_resolver(replacement.clone());
+
+        assert!(Arc::ptr_eq(endpoint.resolver(), &original));
+        assert!(Arc::ptr_eq(cloned.resolver(), &replacement));
+    }
+
+    #[tokio::test]
     async fn test_clone_preserves_identity() {
         let mut endpoint = make_endpoint().await;
         let identity = make_identity("clone-preserve.test");
@@ -1365,8 +1413,8 @@ mod tests {
         }
 
         let cloned = endpoint.clone();
-        let orig_id = endpoint.identity.load_full().unwrap();
-        let cloned_id = cloned.identity.load_full().unwrap();
+        let orig_id = endpoint.identity().unwrap();
+        let cloned_id = cloned.identity().unwrap();
 
         assert_eq!(orig_id.name.as_str(), cloned_id.name.as_str());
         assert_eq!(orig_id.certs.len(), cloned_id.certs.len());
@@ -1374,9 +1422,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clone_creates_independent_caches() {
+    async fn clone_shares_identity_clear() {
         let mut endpoint = make_endpoint().await;
-        let identity = make_identity("independent.test");
+        let identity = make_identity("shared-clear.test");
         {
             let mut guard = endpoint.identity_mut();
             *guard = Some(Arc::new(identity));
@@ -1388,8 +1436,8 @@ mod tests {
             let mut guard = endpoint.identity_mut();
             *guard = None;
         }
-        assert!(endpoint.identity.load_full().is_none());
-        assert!(cloned.identity.load_full().is_some());
+        assert!(endpoint.identity().is_none());
+        assert!(cloned.identity().is_none());
     }
 
     #[test]
@@ -1476,17 +1524,20 @@ mod tests {
 
     #[test]
     fn test_server_config_guard_derefmut() {
-        let mut config = Arc::new(ServerQuicConfig::default());
+        let config = Arc::new(ServerQuicConfig::default());
+        let target = ArcSwap::from(config);
         let cache = ArcSwapOption::<ServerBinding>::new(None);
         {
             let mut guard = ServerConfigMutGuard {
-                config: &mut config,
+                config: target.load_full(),
+                target: &target,
                 cache: &cache,
             };
             assert!(!guard.anti_port_scan);
             guard.anti_port_scan = true;
             assert!(guard.anti_port_scan);
         }
+        assert!(target.load_full().anti_port_scan);
     }
 
     #[test]
@@ -1501,7 +1552,8 @@ mod tests {
             sni::{RegistryGuard, ServerConfig as SniServerConfig, ServerEntry},
         };
 
-        let mut config = Arc::new(ServerQuicConfig::default());
+        let config = Arc::new(ServerQuicConfig::default());
+        let target = ArcSwap::from(config);
         let cache = ArcSwapOption::new(None);
 
         let cert_bytes: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");
@@ -1565,7 +1617,8 @@ mod tests {
 
         {
             let _guard = ServerConfigMutGuard {
-                config: &mut config,
+                config: target.load_full(),
+                target: &target,
                 cache: &cache,
             };
         }
@@ -1576,12 +1629,12 @@ mod tests {
     #[tokio::test]
     async fn test_identity_guard_set() {
         let endpoint = make_endpoint().await;
-        assert!(endpoint.identity.load_full().is_none());
+        assert!(endpoint.identity().is_none());
 
         let identity = make_identity("guard-set.test");
         {
             let mut guard = IdentityMutGuard {
-                identity: &endpoint.identity,
+                identity: endpoint.identity.as_ref(),
                 value: endpoint.identity.load_full(),
                 client_cache: &endpoint.client_tls_cache,
                 server_cache: &endpoint.server_binding_cache,
@@ -1589,7 +1642,7 @@ mod tests {
             *guard = Some(Arc::new(identity));
         }
 
-        let id = endpoint.identity.load_full();
+        let id = endpoint.identity();
         assert!(id.is_some());
         assert_eq!(id.unwrap().name.as_str(), "guard-set.test");
     }
@@ -1602,11 +1655,11 @@ mod tests {
             let mut guard = endpoint.identity_mut();
             *guard = Some(Arc::new(identity));
         }
-        assert!(endpoint.identity.load_full().is_some());
+        assert!(endpoint.identity().is_some());
 
         {
             let mut guard = IdentityMutGuard {
-                identity: &endpoint.identity,
+                identity: endpoint.identity.as_ref(),
                 value: endpoint.identity.load_full(),
                 client_cache: &endpoint.client_tls_cache,
                 server_cache: &endpoint.server_binding_cache,
@@ -1614,7 +1667,7 @@ mod tests {
             *guard = None;
         }
 
-        assert!(endpoint.identity.load_full().is_none());
+        assert!(endpoint.identity().is_none());
     }
 
     #[tokio::test]
@@ -1625,11 +1678,11 @@ mod tests {
             let mut guard = endpoint.identity_mut();
             *guard = Some(Arc::new(identity));
         }
-        assert!(endpoint.identity.load_full().unwrap().ocsp.is_none());
+        assert!(endpoint.identity().unwrap().ocsp.is_none());
 
         {
             let mut guard = IdentityMutGuard {
-                identity: &endpoint.identity,
+                identity: endpoint.identity.as_ref(),
                 value: endpoint.identity.load_full(),
                 client_cache: &endpoint.client_tls_cache,
                 server_cache: &endpoint.server_binding_cache,
@@ -1639,7 +1692,7 @@ mod tests {
             }
         }
 
-        let id = endpoint.identity.load_full().unwrap();
+        let id = endpoint.identity().unwrap();
         assert_eq!(id.ocsp.as_deref(), Some(&[10u8, 20, 30][..]));
     }
 
@@ -1666,7 +1719,7 @@ mod tests {
 
         {
             let guard = IdentityMutGuard {
-                identity: &endpoint.identity,
+                identity: endpoint.identity.as_ref(),
                 value: endpoint.identity.load_full(),
                 client_cache: &endpoint.client_tls_cache,
                 server_cache: &endpoint.server_binding_cache,
@@ -1687,17 +1740,19 @@ mod tests {
 
     #[test]
     fn test_client_config_guard_derefmut() {
-        let mut config = Arc::new(ClientQuicConfig::default());
+        let config = Arc::new(ClientQuicConfig::default());
+        let target = ArcSwap::from(config);
         let cache = ArcSwapOption::<ClientConfig>::new(None);
         {
             let mut guard = ClientConfigMutGuard {
-                config: &mut config,
+                config: target.load_full(),
+                target: &target,
                 cache: &cache,
             };
             assert!(!std::ops::Deref::deref(&guard).enable_0rtt);
             guard.enable_0rtt = true;
         }
-        assert!(config.enable_0rtt);
+        assert!(target.load_full().enable_0rtt);
     }
 
     #[tokio::test]
@@ -1726,7 +1781,8 @@ mod tests {
 
     #[test]
     fn test_client_config_guard_drop_invalidates_cache() {
-        let mut config = Arc::new(ClientQuicConfig::default());
+        let config = Arc::new(ClientQuicConfig::default());
+        let target = ArcSwap::from(config);
         let cache = ArcSwapOption::new(Some(Arc::new(
             rustls::ClientConfig::builder()
                 .with_root_certificates(rustls::RootCertStore::empty())
@@ -1737,7 +1793,8 @@ mod tests {
 
         {
             let _guard = ClientConfigMutGuard {
-                config: &mut config,
+                config: target.load_full(),
+                target: &target,
                 cache: &cache,
             };
         }

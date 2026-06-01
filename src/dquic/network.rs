@@ -219,8 +219,33 @@ impl QuicBindDriver {
     }
 
     #[must_use]
+    pub fn iface_manager(&self) -> Arc<InterfaceManager> {
+        self.iface_manager.clone()
+    }
+
+    #[must_use]
+    pub fn io_factory(&self) -> Arc<dyn ProductIO + 'static> {
+        self.io_factory.clone()
+    }
+
+    #[must_use]
+    pub fn quic_router(&self) -> Arc<QuicRouter> {
+        self.quic_router.clone()
+    }
+
+    #[must_use]
     pub fn locations(&self) -> Arc<Locations> {
         self.locations.clone()
+    }
+
+    #[must_use]
+    pub fn stun_server(&self) -> Option<Arc<str>> {
+        self.stun_server.clone()
+    }
+
+    #[must_use]
+    pub fn stun_resolver(&self) -> Arc<dyn Resolve + Send + Sync> {
+        self.stun_resolver.clone()
     }
 
     pub(crate) fn configure_connection<F, T>(
@@ -352,6 +377,7 @@ impl QuicBindDriver {
         bind_patterns: Arc<Vec<BindPattern>>,
     ) -> Result<ServerBinding, BindServerError> {
         let name = identity.name.clone();
+        let slot = self.compatible_server_slot(&server_config)?;
 
         if let Some(kv) = self.sni_registry.get(&name)
             && let Some(existing) = kv.value().upgrade()
@@ -384,8 +410,6 @@ impl QuicBindDriver {
             },
             Entry::Vacant(_) => {}
         }
-
-        let slot = self.compatible_server_slot(&server_config)?;
 
         let (incomings_tx, incomings_rx) = async_channel::bounded(server_config.backlog);
 
@@ -763,12 +787,26 @@ impl Network {
     #[builder(start_fn(name = builder, vis = "pub"), builder_type(vis = "pub"))]
     fn new(
         stun_server: Option<Arc<str>>,
+        #[builder(default = Arc::new(InterfaceManager::new()))] iface_manager: Arc<
+            InterfaceManager,
+        >,
+        #[builder(default = Arc::new(DEFAULT_IO_FACTORY))] io_factory: Arc<dyn ProductIO + 'static>,
+        #[builder(default = Arc::new(SystemResolver))] stun_resolver: Arc<
+            dyn Resolve + Send + Sync,
+        >,
+        #[builder(default = Arc::new(QuicRouter::new()))] quic_router: Arc<QuicRouter>,
+        #[builder(default = Arc::new(Locations::new()))] locations: Arc<Locations>,
         #[builder(default = Devices::global())] devices: &'static Devices,
     ) -> Arc<Self> {
         Self::build_with_quic_driver(devices, |network| {
             QuicBindDriver::builder()
                 .network(network.clone())
+                .iface_manager(iface_manager)
+                .io_factory(io_factory)
+                .stun_resolver(stun_resolver)
                 .maybe_stun_server(stun_server)
+                .quic_router(quic_router)
+                .locations(locations)
                 .build()
         })
     }
@@ -1097,6 +1135,7 @@ mod tests {
     use std::{net::SocketAddr, str::FromStr, time::Duration};
 
     use dquic::prelude::{IO, handy::NoopTokenRegistry};
+    use futures::StreamExt;
     use rustls::ClientConfig as TlsClientConfig;
 
     use super::*;
@@ -1152,6 +1191,58 @@ mod tests {
         fn bind<'a>(&'a self, _network: &'a Network, uri: BindUri) -> BoxFuture<'a, BindInterface> {
             async move { self.manager.bind(uri, Arc::new(NullIo::new)).await }.boxed()
         }
+    }
+
+    #[derive(Debug)]
+    struct MarkerResolver;
+
+    impl std::fmt::Display for MarkerResolver {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("marker resolver")
+        }
+    }
+
+    impl Resolve for MarkerResolver {
+        fn lookup<'a>(&'a self, _name: &'a str) -> crate::dquic::resolver::ResolveFuture<'a> {
+            async move { Ok(futures::stream::empty().boxed()) }.boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn network_builder_accepts_custom_stun_resolver() {
+        let resolver: Arc<dyn Resolve + Send + Sync> = Arc::new(MarkerResolver);
+        let network = Network::builder().stun_resolver(resolver.clone()).build();
+
+        assert!(Arc::ptr_eq(&network.quic().stun_resolver, &resolver));
+    }
+
+    #[tokio::test]
+    async fn network_builder_forwards_quic_bind_driver_options() {
+        let iface_manager = Arc::new(InterfaceManager::new());
+        let io_factory: Arc<dyn ProductIO + 'static> = Arc::new(NullIoFactory);
+        let stun_resolver: Arc<dyn Resolve + Send + Sync> = Arc::new(MarkerResolver);
+        let quic_router = Arc::new(QuicRouter::new());
+        let locations = Arc::new(Locations::new());
+
+        let network = Network::builder()
+            .iface_manager(iface_manager.clone())
+            .io_factory(io_factory.clone())
+            .stun_resolver(stun_resolver.clone())
+            .stun_server(Arc::from("builder.stun.example:3478"))
+            .quic_router(quic_router.clone())
+            .locations(locations.clone())
+            .build();
+        let quic = network.quic();
+
+        assert!(Arc::ptr_eq(&quic.iface_manager, &iface_manager));
+        assert!(Arc::ptr_eq(&quic.io_factory, &io_factory));
+        assert!(Arc::ptr_eq(&quic.stun_resolver, &stun_resolver));
+        assert_eq!(
+            quic.stun_server.as_deref(),
+            Some("builder.stun.example:3478")
+        );
+        assert!(Arc::ptr_eq(&quic.quic_router, &quic_router));
+        assert!(Arc::ptr_eq(&quic.locations, &locations));
     }
 
     #[test]
@@ -1493,6 +1584,31 @@ mod tests {
     fn test_bind_pattern_parsing() {
         let pattern = BindPattern::from_str("127.0.0.1:8080").expect("valid pattern");
         assert_eq!(pattern.port, Some(8080));
+    }
+
+    #[tokio::test]
+    async fn bind_server_same_identity_rejects_incompatible_server_config() {
+        let network = Network::builder().build();
+        let identity = make_identity("same.example.com");
+        let cfg_a = make_server_config();
+        let cfg_b = ServerQuicConfig {
+            alpns: vec![b"altproto".to_vec()],
+            ..Default::default()
+        };
+
+        let _held = network
+            .quic()
+            .bind_server(identity.clone(), cfg_a, Arc::new(Vec::new()))
+            .await
+            .expect("first bind succeeds");
+
+        let error = network
+            .quic()
+            .bind_server(identity, cfg_b, Arc::new(Vec::new()))
+            .await
+            .expect_err("same identity with incompatible config must fail");
+
+        assert!(matches!(error, BindServerError::ServerConfigConflict));
     }
 
     #[tokio::test]

@@ -289,7 +289,7 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use dhttp_identity::identity as agent;
+    use dhttp_identity::identity as authority;
     use futures::{Sink, SinkExt, Stream, StreamExt, future, future::pending};
     use tokio::time::{Duration, timeout};
     use tokio_util::task::AbortOnDropHandle;

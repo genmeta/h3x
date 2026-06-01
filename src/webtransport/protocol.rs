@@ -231,7 +231,7 @@ mod tests {
     };
 
     use bytes::Bytes;
-    use dhttp_identity::identity as agent;
+    use dhttp_identity::identity as authority;
     use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, future::pending};
 
     use super::*;
