@@ -622,7 +622,9 @@ impl QuicBindDriver {
                     .get::<str>(&sni_lower)
                     .and_then(|item| item.value().upgrade())
                 {
-                    if entry.incomings_tx.send(conn).await.is_err() {
+                    let incomings_tx = entry.incomings_tx.clone();
+                    drop(entry);
+                    if incomings_tx.send(conn).await.is_err() {
                         tracing::debug!(
                             name = %sni,
                             "sni channel closed"

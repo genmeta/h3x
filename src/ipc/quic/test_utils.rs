@@ -483,10 +483,10 @@ async fn setup_listen_pair() -> (
     let (server_mux, client_mux) = MuxChannel::pair_for_test().unwrap();
 
     let (server_sink, server_stream) = server_mux.split().unwrap();
-    let fd_sender = server_sink.fd_sender();
+    let server_fd_transfer = server_stream.fd_transfer(server_sink.fd_sender());
 
     let (client_sink, client_stream) = client_mux.split().unwrap();
-    let client_fd_registry = client_stream.fd_registry();
+    let client_fd_transfer = client_stream.fd_transfer(client_sink.fd_sender());
 
     // Both sides must handshake concurrently
     let server_task = tokio::spawn(async move {
@@ -500,7 +500,8 @@ async fn setup_listen_pair() -> (
             .unwrap();
         tokio::spawn(remoc_conn);
 
-        let adapter = ListenAdapter::<_, remoc::codec::Default>::new(mock_listen, fd_sender);
+        let adapter =
+            ListenAdapter::<_, remoc::codec::Default>::new(mock_listen, server_fd_transfer);
         let (server, listen_client) =
             IpcListenServerSharedMut::new(Arc::new(tokio::sync::RwLock::new(adapter)), 64);
         tokio::spawn(async move {
@@ -521,7 +522,7 @@ async fn setup_listen_pair() -> (
         tokio::spawn(remoc_conn);
 
         let listen_client = rx.recv().await.unwrap().unwrap();
-        IpcListener::new(listen_client, client_fd_registry)
+        IpcListener::new(listen_client, client_fd_transfer)
     });
 
     let (server_result, client_result) = tokio::join!(server_task, client_task);
@@ -808,10 +809,10 @@ async fn connect_roundtrip() {
     let (server_mux, client_mux) = MuxChannel::pair_for_test().unwrap();
 
     let (server_sink, server_stream) = server_mux.split().unwrap();
-    let fd_sender = server_sink.fd_sender();
+    let server_fd_transfer = server_stream.fd_transfer(server_sink.fd_sender());
 
     let (client_sink, client_stream) = client_mux.split().unwrap();
-    let client_fd_registry = client_stream.fd_registry();
+    let client_fd_transfer = client_stream.fd_transfer(client_sink.fd_sender());
 
     // Both sides must handshake concurrently
     let server_task = tokio::spawn(async move {
@@ -825,7 +826,8 @@ async fn connect_roundtrip() {
             .unwrap();
         tokio::spawn(remoc_conn);
 
-        let adapter = ConnectAdapter::<_, remoc::codec::Default>::new(mock_connect, fd_sender);
+        let adapter =
+            ConnectAdapter::<_, remoc::codec::Default>::new(mock_connect, server_fd_transfer);
         let (server, connect_client) = IpcConnectServerShared::new(Arc::new(adapter), 64);
         tokio::spawn(async move {
             let _ = server.serve(true).await;
@@ -845,7 +847,7 @@ async fn connect_roundtrip() {
         tokio::spawn(remoc_conn);
 
         let connect_client = rx.recv().await.unwrap().unwrap();
-        IpcConnector::<remoc::codec::Default>::new(connect_client, client_fd_registry)
+        IpcConnector::<remoc::codec::Default>::new(connect_client, client_fd_transfer)
     });
 
     let (server_result, client_result) = tokio::join!(server_task, client_task);
