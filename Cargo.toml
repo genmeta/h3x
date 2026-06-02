@@ -52,7 +52,7 @@ remoc = { version = "0.18", default-features = false, optional = true, features 
 ] }
 
 # feature pipe
-nix = { version = "0.29", default-features = false, optional = true, features = [
+nix = { version = "0.31", default-features = false, optional = true, features = [
     "fs",
     "socket",
     "uio",

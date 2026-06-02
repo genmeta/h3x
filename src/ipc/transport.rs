@@ -803,7 +803,7 @@ fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
 fn recv_frame_data(
     fd: RawFd,
     data_buf: &mut [u8],
-    cmsg_buf: &mut Vec<u8>,
+    cmsg_buf: &mut [u8],
 ) -> io::Result<(usize, FdVec)> {
     let mut iov = [io::IoSliceMut::new(data_buf)];
 
