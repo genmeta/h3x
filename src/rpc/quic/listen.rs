@@ -38,6 +38,9 @@ where
             .await
             .map_err(|e| StringError::new(e.to_string()))?;
         let (server, client) = ConnectionServerShared::new(connection, 1);
+        // Inherent termination: the returned ConnectionClient owns the remoc
+        // endpoint; when that client is dropped or the channel closes,
+        // server.serve exits.
         tokio::spawn(
             (async move {
                 let _ = server.serve(true).await;

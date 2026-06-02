@@ -29,7 +29,10 @@
 //! 4. Receives the [`ConnectionBootstrap`] from the base channel.
 //! 5. Returns an [`IpcConnectionHandle`].
 
-use std::sync::Arc;
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+};
 
 use remoc::prelude::ServerShared;
 use smallvec::smallvec;
@@ -113,6 +116,7 @@ fn close_cancelled_connection(connection: &impl quic::Lifecycle, context: &'stat
 pub struct ListenAdapter<L, Codec> {
     inner: L,
     fd_transfer: FdTransfer,
+    tasks: Mutex<Vec<AbortOnDropHandle<()>>>,
     _codec: std::marker::PhantomData<Codec>,
 }
 
@@ -121,8 +125,19 @@ impl<L, Codec> ListenAdapter<L, Codec> {
         Self {
             inner,
             fd_transfer,
+            tasks: Mutex::new(Vec::new()),
             _codec: std::marker::PhantomData,
         }
+    }
+
+    fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let handle = AbortOnDropHandle::new(tokio::spawn(task.in_current_span()));
+        let mut tasks = self
+            .tasks
+            .lock()
+            .expect("listen adapter task registry should not be poisoned");
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle);
     }
 }
 
@@ -134,6 +149,7 @@ where
     async fn accept(&mut self, fd_id: VarInt) -> Result<VarInt, ConnectionError> {
         let mut delivery = self.fd_transfer.delivery(fd_id);
         let connection = tokio::select! {
+            biased;
             _ = delivery.cancelled() => return Err(ipc_listen_cancelled("accept")),
             result = quic::Listen::accept(&mut self.inner) => {
                 result.map_err(|e| ipc_listen_error(e, "accept"))?
@@ -155,8 +171,7 @@ where
             .split()
             .map_err(|e| ipc_listen_error(e, "split mux"))?;
 
-        // Inherent termination: exits when remoc handshake completes or fails.
-        tokio::spawn(Self::setup_connection(connection, sink, stream).in_current_span());
+        self.spawn_task(Self::setup_connection(connection, sink, stream));
 
         Ok(fd_id)
     }
@@ -204,19 +219,17 @@ where
                 return;
             }
         };
-        // Inherent termination: exits when remoc ChMux closes.
-        tokio::spawn(remoc_conn.in_current_span());
+        let remoc_task = AbortOnDropHandle::new(tokio::spawn(remoc_conn.in_current_span()));
 
         // Create the ConnectionAdapter for this connection's stream management
         let adapter = ConnectionAdapter::new(connection, conn_fd_transfer);
         let (server, rpc_client) = IpcConnectionServerShared::new(Arc::new(adapter), 64);
-        // Inherent termination: exits when remoc ChMux closes.
-        tokio::spawn(
-            async move {
+        let server_task = AbortOnDropHandle::new(tokio::spawn(
+            (async move {
                 let _ = server.serve(true).await;
-            }
+            })
             .in_current_span(),
-        );
+        ));
 
         // Send the bootstrap data over the remoc base channel
         let bootstrap = ConnectionBootstrap {
@@ -224,7 +237,10 @@ where
         };
         if tx.send(bootstrap).await.is_err() {
             debug!("failed to send connection bootstrap: base channel closed");
+            return;
         }
+
+        let _ = futures::future::join(remoc_task, server_task).await;
     }
 }
 

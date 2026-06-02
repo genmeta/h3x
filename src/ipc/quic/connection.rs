@@ -32,7 +32,12 @@
 //! channel when a new connection is established.  It carries the
 //! [`IpcConnectionClient`] for stream management and authority access.
 
-use std::{borrow::Cow, future::Future, io, sync::Arc};
+use std::{
+    borrow::Cow,
+    future::Future,
+    io,
+    sync::{Arc, Mutex},
+};
 
 use futures::{SinkExt, StreamExt};
 use remoc::prelude::ServerShared;
@@ -201,11 +206,26 @@ pub async fn bridge_writer(
 pub struct ConnectionAdapter<M> {
     inner: Arc<M>,
     fd_transfer: FdTransfer,
+    tasks: Mutex<Vec<AbortOnDropHandle<()>>>,
 }
 
 impl<M> ConnectionAdapter<M> {
     pub fn new(inner: Arc<M>, fd_transfer: FdTransfer) -> Self {
-        Self { inner, fd_transfer }
+        Self {
+            inner,
+            fd_transfer,
+            tasks: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let handle = AbortOnDropHandle::new(tokio::spawn(task.in_current_span()));
+        let mut tasks = self
+            .tasks
+            .lock()
+            .expect("connection adapter task registry should not be poisoned");
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle);
     }
 }
 
@@ -255,12 +275,9 @@ where
         match quic::WithLocalAuthority::local_authority(self.inner.as_ref()).await? {
             Some(agent) => {
                 let (server, client) = LocalAuthorityServerShared::new(Arc::new(agent), 1);
-                tokio::spawn(
-                    (async move {
-                        let _ = server.serve(true).await;
-                    })
-                    .in_current_span(),
-                );
+                self.spawn_task(async move {
+                    let _ = server.serve(true).await;
+                });
                 Ok(Some(client))
             }
             None => Ok(None),
@@ -271,12 +288,9 @@ where
         match quic::WithRemoteAuthority::remote_authority(self.inner.as_ref()).await? {
             Some(agent) => {
                 let (server, client) = RemoteAuthorityServerShared::new(Arc::new(agent), 1);
-                tokio::spawn(
-                    (async move {
-                        let _ = server.serve(true).await;
-                    })
-                    .in_current_span(),
-                );
+                self.spawn_task(async move {
+                    let _ = server.serve(true).await;
+                });
                 Ok(Some(client))
             }
             None => Ok(None),
@@ -313,6 +327,7 @@ where
     ) -> Result<Resolved<IpcBiHandle, StreamError>, IpcOpenError> {
         let mut delivery = self.fd_transfer.delivery(fd_id);
         let (mut reader, writer) = tokio::select! {
+            biased;
             _ = delivery.cancelled() => return Err(ipc_cancelled_plumbing("open_bi").into()),
             result = ManageStream::open_bi(self.inner.as_ref()) => {
                 result.map_err(|e| IpcOpenError::Connection { source: e })?
@@ -334,6 +349,7 @@ where
     ) -> Result<Resolved<IpcBiHandle, StreamError>, IpcAcceptError> {
         let mut delivery = self.fd_transfer.delivery(fd_id);
         let (mut reader, writer) = tokio::select! {
+            biased;
             _ = delivery.cancelled() => return Err(ipc_cancelled_plumbing("accept_bi").into()),
             result = ManageStream::accept_bi(self.inner.as_ref()) => {
                 result.map_err(|e| IpcAcceptError::Connection { source: e })?
@@ -378,11 +394,11 @@ where
 
         // Bridge reader direction: real QUIC reader → IpcWriteStream on srv_a
         let pipe_w = IpcWriteStream::new(stream_id, srv_a, lifecycle.clone());
-        tokio::spawn(bridge_reader(reader, pipe_w).in_current_span());
+        self.spawn_task(bridge_reader(reader, pipe_w));
 
         // Bridge writer direction: IpcReadStream on srv_b → real QUIC writer
         let pipe_r = IpcReadStream::new(stream_id, srv_b, lifecycle);
-        tokio::spawn(bridge_writer(pipe_r, writer).in_current_span());
+        self.spawn_task(bridge_writer(pipe_r, writer));
 
         Ok(IpcBiHandle { stream_id })
     }
@@ -393,6 +409,7 @@ where
     ) -> Result<Resolved<IpcUniHandle, StreamError>, IpcOpenError> {
         let mut delivery = self.fd_transfer.delivery(fd_id);
         let mut writer = tokio::select! {
+            biased;
             _ = delivery.cancelled() => return Err(ipc_cancelled_plumbing("open_uni").into()),
             result = ManageStream::open_uni(self.inner.as_ref()) => {
                 result.map_err(|e| IpcOpenError::Connection { source: e })?
@@ -413,7 +430,7 @@ where
 
         // IpcReadStream on srv → real QUIC writer
         let pipe_r = IpcReadStream::new(stream_id, srv, lifecycle);
-        tokio::spawn(bridge_writer(pipe_r, writer).in_current_span());
+        self.spawn_task(bridge_writer(pipe_r, writer));
 
         Ok(Resolved::ok(IpcUniHandle { stream_id }))
     }
@@ -424,6 +441,7 @@ where
     ) -> Result<Resolved<IpcUniHandle, StreamError>, IpcAcceptError> {
         let mut delivery = self.fd_transfer.delivery(fd_id);
         let mut reader = tokio::select! {
+            biased;
             _ = delivery.cancelled() => return Err(ipc_cancelled_plumbing("accept_uni").into()),
             result = ManageStream::accept_uni(self.inner.as_ref()) => {
                 result.map_err(|e| IpcAcceptError::Connection { source: e })?
@@ -444,7 +462,7 @@ where
 
         // Real QUIC reader → IpcWriteStream on srv
         let pipe_w = IpcWriteStream::new(stream_id, srv, lifecycle);
-        tokio::spawn(bridge_reader(reader, pipe_w).in_current_span());
+        self.spawn_task(bridge_reader(reader, pipe_w));
 
         Ok(Resolved::ok(IpcUniHandle { stream_id }))
     }
@@ -475,6 +493,7 @@ pub struct IpcConnectionHandle {
 struct IpcLifecycle {
     connection: IpcConnectionClient,
     latch: ConnectionErrorLatch,
+    close_tasks: Mutex<Vec<AbortOnDropHandle<()>>>,
 }
 
 impl HasLatch for IpcLifecycle {
@@ -486,12 +505,18 @@ impl HasLatch for IpcLifecycle {
 impl quic::Lifecycle for IpcLifecycle {
     fn close(&self, code: Code, reason: Cow<'static, str>) {
         let rpc = self.connection.clone();
-        tokio::spawn(
-            async move {
+        let handle = AbortOnDropHandle::new(tokio::spawn(
+            (async move {
                 let _ = IpcConnection::close(&rpc, code, reason).await;
-            }
+            })
             .in_current_span(),
-        );
+        ));
+        let mut tasks = self
+            .close_tasks
+            .lock()
+            .expect("ipc lifecycle close task registry should not be poisoned");
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle);
     }
 
     fn check(&self) -> Result<(), ConnectionError> {
@@ -521,6 +546,7 @@ impl IpcConnectionHandle {
         let lifecycle = Arc::new(IpcLifecycle {
             connection: rpc.clone(),
             latch: ConnectionErrorLatch::new(),
+            close_tasks: Mutex::new(Vec::new()),
         });
         Self {
             rpc,
@@ -650,6 +676,12 @@ impl IpcConnectionHandle {
         tokio::pin!(rpc);
 
         tokio::select! {
+            biased;
+            receive_result = &mut receive => {
+                let received = receive_result.map_err(|e| ipc_transport_error(e, "receive fds"))?;
+                let resolved = rpc.await.map_err(map_open_err)?;
+                Ok((resolved, Some(received)))
+            }
             rpc_result = &mut rpc => {
                 let resolved = rpc_result.map_err(map_open_err)?;
                 match resolved {
@@ -659,11 +691,6 @@ impl IpcConnectionHandle {
                     }
                     Resolved::Error { error } => Ok((Resolved::err(error), None)),
                 }
-            }
-            receive_result = &mut receive => {
-                let received = receive_result.map_err(|e| ipc_transport_error(e, "receive fds"))?;
-                let resolved = rpc.await.map_err(map_open_err)?;
-                Ok((resolved, Some(received)))
             }
         }
     }
@@ -678,6 +705,12 @@ impl IpcConnectionHandle {
         tokio::pin!(rpc);
 
         tokio::select! {
+            biased;
+            receive_result = &mut receive => {
+                let received = receive_result.map_err(|e| ipc_transport_error(e, "receive fds"))?;
+                let resolved = rpc.await.map_err(map_accept_err)?;
+                Ok((resolved, Some(received)))
+            }
             rpc_result = &mut rpc => {
                 let resolved = rpc_result.map_err(map_accept_err)?;
                 match resolved {
@@ -687,11 +720,6 @@ impl IpcConnectionHandle {
                     }
                     Resolved::Error { error } => Ok((Resolved::err(error), None)),
                 }
-            }
-            receive_result = &mut receive => {
-                let received = receive_result.map_err(|e| ipc_transport_error(e, "receive fds"))?;
-                let resolved = rpc.await.map_err(map_accept_err)?;
-                Ok((resolved, Some(received)))
             }
         }
     }

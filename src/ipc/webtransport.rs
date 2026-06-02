@@ -34,12 +34,16 @@
 //! - **`accept_uni`**: 1 FD (reader pipe, server side reads from the real
 //!   WebTransport uni stream and writes to pipe).
 
-use std::{future::Future, sync::Arc};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+};
 
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use snafu::Snafu;
 use tokio::net::UnixStream;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{Instrument, debug};
 
 /// WebTransport-flavoured lifecycle helpers for IPC-backed session handles.
@@ -260,6 +264,7 @@ pub struct WebTransportSessionAdapter {
     session: Arc<webtransport::WebTransportSession>,
     fd_transfer: FdTransfer,
     lifecycle: Arc<dyn DynLifecycle>,
+    tasks: Mutex<Vec<AbortOnDropHandle<()>>>,
 }
 
 impl WebTransportSessionAdapter {
@@ -272,7 +277,18 @@ impl WebTransportSessionAdapter {
             session,
             fd_transfer,
             lifecycle,
+            tasks: Mutex::new(Vec::new()),
         }
+    }
+
+    fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let handle = AbortOnDropHandle::new(tokio::spawn(task.in_current_span()));
+        let mut tasks = self
+            .tasks
+            .lock()
+            .expect("webtransport adapter task registry should not be poisoned");
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle);
     }
 }
 
@@ -280,6 +296,7 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     async fn open_bi(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportOpenError> {
         let mut delivery = self.fd_transfer.delivery(fd_id);
         let (mut reader, writer) = tokio::select! {
+            biased;
             _ = delivery.cancelled() => return Err(ipc_open_cancelled("open_bi")),
             result = self.session.open_bi() => result?,
         };
@@ -294,6 +311,7 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     async fn accept_bi(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportAcceptError> {
         let mut delivery = self.fd_transfer.delivery(fd_id);
         let (mut reader, writer) = tokio::select! {
+            biased;
             _ = delivery.cancelled() => return Err(ipc_accept_cancelled("accept_bi")),
             result = self.session.accept_bi() => {
                 match result {
@@ -317,6 +335,7 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     async fn open_uni(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportOpenError> {
         let mut delivery = self.fd_transfer.delivery(fd_id);
         let mut writer = tokio::select! {
+            biased;
             _ = delivery.cancelled() => return Err(ipc_open_cancelled("open_uni")),
             result = self.session.open_uni() => result?,
         };
@@ -336,7 +355,7 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
 
         // IpcReadStream on srv → real WebTransport write stream
         let pipe_r = IpcReadStream::new(stream_id, srv, lifecycle);
-        tokio::spawn(bridge_writer(pipe_r, writer).in_current_span());
+        self.spawn_task(bridge_writer(pipe_r, writer));
 
         Ok(stream_id)
     }
@@ -344,6 +363,7 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     async fn accept_uni(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportAcceptError> {
         let mut delivery = self.fd_transfer.delivery(fd_id);
         let mut reader = tokio::select! {
+            biased;
             _ = delivery.cancelled() => return Err(ipc_accept_cancelled("accept_uni")),
             result = self.session.accept_uni() => {
                 match result {
@@ -371,7 +391,7 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
 
         // Real WebTransport read stream → IpcWriteStream on srv
         let pipe_w = IpcWriteStream::new(stream_id, srv, lifecycle);
-        tokio::spawn(bridge_reader(reader, pipe_w).in_current_span());
+        self.spawn_task(bridge_reader(reader, pipe_w));
 
         Ok(stream_id)
     }
@@ -401,11 +421,11 @@ impl WebTransportSessionAdapter {
 
         // Bridge reader direction: real WebTransport reader → IpcWriteStream on srv_a
         let pipe_w = IpcWriteStream::new(stream_id, srv_a, lifecycle.clone());
-        tokio::spawn(bridge_reader(reader, pipe_w).in_current_span());
+        self.spawn_task(bridge_reader(reader, pipe_w));
 
         // Bridge writer direction: IpcReadStream on srv_b → real WebTransport writer
         let pipe_r = IpcReadStream::new(stream_id, srv_b, lifecycle);
-        tokio::spawn(bridge_writer(pipe_r, writer).in_current_span());
+        self.spawn_task(bridge_writer(pipe_r, writer));
 
         Ok(stream_id)
     }
@@ -432,10 +452,10 @@ impl WebTransportSessionAdapter {
             .map_err(|e| ipc_accept_io(e, "deliver fds"))?;
 
         let pipe_w = IpcWriteStream::new(stream_id, srv_a, lifecycle.clone());
-        tokio::spawn(bridge_reader(reader, pipe_w).in_current_span());
+        self.spawn_task(bridge_reader(reader, pipe_w));
 
         let pipe_r = IpcReadStream::new(stream_id, srv_b, lifecycle);
-        tokio::spawn(bridge_writer(pipe_r, writer).in_current_span());
+        self.spawn_task(bridge_writer(pipe_r, writer));
 
         Ok(stream_id)
     }
@@ -606,14 +626,15 @@ impl IpcWebTransportSessionHandle {
         tokio::pin!(rpc);
 
         tokio::select! {
-            rpc_result = &mut rpc => {
-                let stream_id = rpc_result?;
-                let received = receive.await.map_err(|e| ipc_open_io(e, "receive fds"))?;
-                Ok((stream_id, received))
-            }
+            biased;
             receive_result = &mut receive => {
                 let received = receive_result.map_err(|e| ipc_open_io(e, "receive fds"))?;
                 let stream_id = rpc.await?;
+                Ok((stream_id, received))
+            }
+            rpc_result = &mut rpc => {
+                let stream_id = rpc_result?;
+                let received = receive.await.map_err(|e| ipc_open_io(e, "receive fds"))?;
                 Ok((stream_id, received))
             }
         }
@@ -629,14 +650,15 @@ impl IpcWebTransportSessionHandle {
         tokio::pin!(rpc);
 
         tokio::select! {
-            rpc_result = &mut rpc => {
-                let stream_id = rpc_result?;
-                let received = receive.await.map_err(|e| ipc_accept_io(e, "receive fds"))?;
-                Ok((stream_id, received))
-            }
+            biased;
             receive_result = &mut receive => {
                 let received = receive_result.map_err(|e| ipc_accept_io(e, "receive fds"))?;
                 let stream_id = rpc.await?;
+                Ok((stream_id, received))
+            }
+            rpc_result = &mut rpc => {
+                let stream_id = rpc_result?;
+                let received = receive.await.map_err(|e| ipc_accept_io(e, "receive fds"))?;
                 Ok((stream_id, received))
             }
         }

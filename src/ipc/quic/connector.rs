@@ -31,7 +31,10 @@
 //! 4. Receives the [`ConnectionBootstrap`] from the base channel.
 //! 5. Wraps the result as an [`IpcConnectionHandle`].
 
-use std::sync::Arc;
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+};
 
 use http::uri::Authority;
 use remoc::{self, RemoteSend, prelude::ServerShared};
@@ -115,6 +118,7 @@ pub enum ConnectorError {
 pub struct ConnectAdapter<C, Codec> {
     inner: C,
     fd_transfer: FdTransfer,
+    tasks: Mutex<Vec<AbortOnDropHandle<()>>>,
     _codec: std::marker::PhantomData<Codec>,
 }
 
@@ -123,8 +127,19 @@ impl<C, Codec> ConnectAdapter<C, Codec> {
         Self {
             inner,
             fd_transfer,
+            tasks: Mutex::new(Vec::new()),
             _codec: std::marker::PhantomData,
         }
+    }
+
+    fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let handle = AbortOnDropHandle::new(tokio::spawn(task.in_current_span()));
+        let mut tasks = self
+            .tasks
+            .lock()
+            .expect("connect adapter task registry should not be poisoned");
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle);
     }
 }
 
@@ -145,6 +160,7 @@ where
         let authority = Authority::try_from(server).map_err(|e| connect_error(e, "authority"))?;
         let mut delivery = self.fd_transfer.delivery(fd_id);
         let connection = tokio::select! {
+            biased;
             _ = delivery.cancelled() => return Err(connect_cancelled("connect")),
             result = quic::Connect::connect(&self.inner, &authority) => {
                 result.map_err(|e| connect_error(e, "connect"))?
@@ -164,8 +180,7 @@ where
         // are spawned as a background task after the FD delivery has been acked.
         let (sink, stream) = server_mux.split().map_err(|e| connect_error(e, "split"))?;
 
-        // Inherent termination: exits when remoc handshake completes or fails.
-        tokio::spawn(Self::setup_connection(connection, sink, stream).in_current_span());
+        self.spawn_task(Self::setup_connection(connection, sink, stream));
 
         Ok(fd_id)
     }
@@ -211,19 +226,17 @@ where
                     return;
                 }
             };
-        // Inherent termination: exits when remoc ChMux closes.
-        tokio::spawn(conn.in_current_span());
+        let remoc_task = AbortOnDropHandle::new(tokio::spawn(conn.in_current_span()));
 
         // Create the ConnectionAdapter and wrap it as an IPC RPC server.
         let adapter = ConnectionAdapter::new(connection, conn_fd_transfer);
         let (server, rpc_client) = IpcConnectionServerShared::new(Arc::new(adapter), 64);
-        // Inherent termination: exits when remoc ChMux closes.
-        tokio::spawn(
-            async move {
+        let server_task = AbortOnDropHandle::new(tokio::spawn(
+            (async move {
                 let _ = server.serve(true).await;
-            }
+            })
             .in_current_span(),
-        );
+        ));
 
         let bootstrap = ConnectionBootstrap {
             connection: rpc_client,
@@ -231,7 +244,10 @@ where
 
         if tx.send(bootstrap).await.is_err() {
             debug!("failed to send connection bootstrap: base channel closed");
+            return;
         }
+
+        let _ = futures::future::join(remoc_task, server_task).await;
     }
 }
 

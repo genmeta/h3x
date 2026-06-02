@@ -1,10 +1,14 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    sync::{Arc, Mutex},
+};
 
 use remoc::{
     prelude::{Server, ServerShared},
     rtc::Client as RemocClient,
 };
 use serde::{Deserialize, Serialize};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
 use super::{
@@ -56,6 +60,9 @@ where
     ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError> {
         let (reader, writer) = quic::ManageStream::open_bi(self).await?;
         let (rs, rc) = stream::ReadStreamServer::new(Box::pin(reader), 1);
+        // Inherent termination: the returned stream client owns the remoc
+        // endpoint; when the client is dropped or the channel closes,
+        // server.serve exits.
         tokio::spawn(
             (async move {
                 let _ = rs.serve().await;
@@ -63,6 +70,9 @@ where
             .in_current_span(),
         );
         let (ws, wc) = stream::WriteStreamServer::new(Box::pin(writer), 1);
+        // Inherent termination: the returned stream client owns the remoc
+        // endpoint; when the client is dropped or the channel closes,
+        // server.serve exits.
         tokio::spawn(
             (async move {
                 let _ = ws.serve().await;
@@ -75,6 +85,9 @@ where
     async fn open_uni(&self) -> Result<WriteStreamClient, quic::ConnectionError> {
         let writer = quic::ManageStream::open_uni(self).await?;
         let (ws, wc) = stream::WriteStreamServer::new(Box::pin(writer), 1);
+        // Inherent termination: the returned stream client owns the remoc
+        // endpoint; when the client is dropped or the channel closes,
+        // server.serve exits.
         tokio::spawn(
             (async move {
                 let _ = ws.serve().await;
@@ -89,6 +102,9 @@ where
     ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError> {
         let (reader, writer) = quic::ManageStream::accept_bi(self).await?;
         let (rs, rc) = stream::ReadStreamServer::new(Box::pin(reader), 1);
+        // Inherent termination: the returned stream client owns the remoc
+        // endpoint; when the client is dropped or the channel closes,
+        // server.serve exits.
         tokio::spawn(
             (async move {
                 let _ = rs.serve().await;
@@ -96,6 +112,9 @@ where
             .in_current_span(),
         );
         let (ws, wc) = stream::WriteStreamServer::new(Box::pin(writer), 1);
+        // Inherent termination: the returned stream client owns the remoc
+        // endpoint; when the client is dropped or the channel closes,
+        // server.serve exits.
         tokio::spawn(
             (async move {
                 let _ = ws.serve().await;
@@ -108,6 +127,9 @@ where
     async fn accept_uni(&self) -> Result<ReadStreamClient, quic::ConnectionError> {
         let reader = quic::ManageStream::accept_uni(self).await?;
         let (rs, rc) = stream::ReadStreamServer::new(Box::pin(reader), 1);
+        // Inherent termination: the returned stream client owns the remoc
+        // endpoint; when the client is dropped or the channel closes,
+        // server.serve exits.
         tokio::spawn(
             (async move {
                 let _ = rs.serve().await;
@@ -122,6 +144,9 @@ where
             Some(agent) => {
                 let (server, client) =
                     super::authority::LocalAuthorityServerShared::new(Arc::new(agent), 1);
+                // Inherent termination: the returned authority client owns
+                // the remoc endpoint; when the client is dropped or the
+                // channel closes, server.serve exits.
                 tokio::spawn(
                     (async move {
                         let _ = server.serve(true).await;
@@ -141,6 +166,9 @@ where
             Some(agent) => {
                 let (server, client) =
                     super::authority::RemoteAuthorityServerShared::new(Arc::new(agent), 1);
+                // Inherent termination: the returned authority client owns
+                // the remoc endpoint; when the client is dropped or the
+                // channel closes, server.serve exits.
                 tokio::spawn(
                     (async move {
                         let _ = server.serve(true).await;
@@ -184,6 +212,8 @@ pub struct RemoteConnection {
     client: ConnectionClient,
     #[serde(skip)]
     latch: ConnectionErrorLatch,
+    #[serde(skip)]
+    close_tasks: Arc<Mutex<Vec<AbortOnDropHandle<()>>>>,
 }
 
 impl RemoteConnection {
@@ -191,6 +221,7 @@ impl RemoteConnection {
         Self {
             client,
             latch: ConnectionErrorLatch::new(),
+            close_tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -296,12 +327,18 @@ impl quic::WithRemoteAuthority for RemoteConnection {
 impl quic::Lifecycle for RemoteConnection {
     fn close(&self, code: Code, reason: Cow<'static, str>) {
         let client = self.client.clone();
-        tokio::spawn(
-            async move {
+        let handle = AbortOnDropHandle::new(tokio::spawn(
+            (async move {
                 let _ = Connection::close(&client, code, reason).await;
-            }
+            })
             .in_current_span(),
-        );
+        ));
+        let mut tasks = self
+            .close_tasks
+            .lock()
+            .expect("remote connection close task registry should not be poisoned");
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle);
     }
 
     fn check(&self) -> Result<(), ConnectionError> {

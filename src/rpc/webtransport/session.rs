@@ -50,6 +50,9 @@ impl WebTransportRpcSession for webtransport::WebTransportSession {
     async fn open_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), OpenStreamError> {
         let (reader, writer) = webtransport::WebTransportSession::open_bi(self).await?;
         let (rs, rc) = ReadStreamServer::new(reader, 1);
+        // Inherent termination: the returned stream client owns the remoc
+        // endpoint; when the client is dropped or the channel closes,
+        // server.serve exits.
         tokio::spawn(
             (async move {
                 let _ = rs.serve().await;
@@ -57,6 +60,9 @@ impl WebTransportRpcSession for webtransport::WebTransportSession {
             .in_current_span(),
         );
         let (ws, wc) = WriteStreamServer::new(writer, 1);
+        // Inherent termination: the returned stream client owns the remoc
+        // endpoint; when the client is dropped or the channel closes,
+        // server.serve exits.
         tokio::spawn(
             (async move {
                 let _ = ws.serve().await;
@@ -69,6 +75,9 @@ impl WebTransportRpcSession for webtransport::WebTransportSession {
     async fn open_uni(&self) -> Result<WriteStreamClient, OpenStreamError> {
         let writer = webtransport::WebTransportSession::open_uni(self).await?;
         let (ws, wc) = WriteStreamServer::new(writer, 1);
+        // Inherent termination: the returned stream client owns the remoc
+        // endpoint; when the client is dropped or the channel closes,
+        // server.serve exits.
         tokio::spawn(
             (async move {
                 let _ = ws.serve().await;
@@ -81,6 +90,9 @@ impl WebTransportRpcSession for webtransport::WebTransportSession {
     async fn accept_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), AcceptStreamError> {
         let (reader, writer) = webtransport::WebTransportSession::accept_bi(self).await?;
         let (rs, rc) = ReadStreamServer::new(reader, 1);
+        // Inherent termination: the returned stream client owns the remoc
+        // endpoint; when the client is dropped or the channel closes,
+        // server.serve exits.
         tokio::spawn(
             (async move {
                 let _ = rs.serve().await;
@@ -88,6 +100,9 @@ impl WebTransportRpcSession for webtransport::WebTransportSession {
             .in_current_span(),
         );
         let (ws, wc) = WriteStreamServer::new(writer, 1);
+        // Inherent termination: the returned stream client owns the remoc
+        // endpoint; when the client is dropped or the channel closes,
+        // server.serve exits.
         tokio::spawn(
             (async move {
                 let _ = ws.serve().await;
@@ -100,6 +115,9 @@ impl WebTransportRpcSession for webtransport::WebTransportSession {
     async fn accept_uni(&self) -> Result<ReadStreamClient, AcceptStreamError> {
         let reader = webtransport::WebTransportSession::accept_uni(self).await?;
         let (rs, rc) = ReadStreamServer::new(reader, 1);
+        // Inherent termination: the returned stream client owns the remoc
+        // endpoint; when the client is dropped or the channel closes,
+        // server.serve exits.
         tokio::spawn(
             (async move {
                 let _ = rs.serve().await;
