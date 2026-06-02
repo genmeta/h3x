@@ -26,8 +26,6 @@ snafu = "0.9"
 tokio = { version = "1", features = ["rt", "macros", "sync", "io-util"] }
 tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
 tracing = "0.1"
-matchit = "0.9"
-x509-parser = "0.18"
 tower-service = "0.3"
 
 dhttp-identity = { git = "https://github.com/genmeta/dhttp.git", branch = "main" }
@@ -62,12 +60,6 @@ smallvec = { version = "1", optional = true }
 # feature endpoint
 arc-swap = { version = "1", optional = true }
 async-channel = { version = "2", optional = true }
-derive_more = { version = "2", optional = true, features = [
-    "deref",
-    "deref_mut",
-    "from",
-    "into",
-] }
 either = { version = "1", optional = true }
 globset = { version = "0.4", optional = true }
 peg = { version = "0.8", optional = true }
@@ -78,7 +70,6 @@ dquic = [
     "dep:dquic",
     "dep:arc-swap",
     "dep:async-channel",
-    "dep:derive_more",
     "dep:either",
     "dep:globset",
     "dep:peg",
@@ -95,18 +86,6 @@ webtransport = []
 testing = []
 
 [dev-dependencies]
-axum = { version = "0.8", default-features = false, features = [
-    "form", # (default)
-    # "http1",    # (default)
-    "json",         # (default)
-    "matched-path", # (default)
-    "original-uri", # (default)
-    "query",        # (default)
-    "tokio",        # (default)
-    "tower-log",    # (default)
-    "tracing",      # (default)
-    "macros",       # for debug_handler
-] }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "logging",
