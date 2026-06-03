@@ -10,6 +10,7 @@
 //! it transitions to a [`Resolved`] state and delegates all further calls.
 
 use std::{
+    collections::VecDeque,
     fmt::Debug,
     pin::Pin,
     task::{Context, Poll, ready},
@@ -337,6 +338,148 @@ impl<T, E, F> Deferred<T, E, F> {
     }
 }
 
+pin_project_lite::pin_project! {
+    /// Stream-specific lazy reader wrapper that remembers committed receive-side controls.
+    ///
+    /// The generic [`Deferred`] wrapper remains a plain lazy value adapter. This
+    /// type adds read-stream semantics on top: `poll_stop` records a committed
+    /// STOP_SENDING request even while the opening future is still pending, then
+    /// applies it before later reads once the stream exists.
+    pub struct DeferredStreamReader<InnerStream, Error, OpenFuture> {
+        #[pin]
+        inner: Deferred<InnerStream, Error, OpenFuture>,
+        pending_stop: Option<VarInt>,
+        cached_id: Option<VarInt>,
+    }
+}
+
+impl<InnerStream, Error, OpenFuture> DeferredStreamReader<InnerStream, Error, OpenFuture>
+where
+    OpenFuture: Future<Output = Result<InnerStream, Error>>,
+{
+    /// Wrap an opening future without a known stream id.
+    pub fn new(open: OpenFuture) -> Self {
+        Self {
+            inner: Deferred::from(open),
+            pending_stop: None,
+            cached_id: None,
+        }
+    }
+}
+
+impl<InnerStream, Error, OpenFuture> From<OpenFuture>
+    for DeferredStreamReader<InnerStream, Error, OpenFuture>
+where
+    OpenFuture: Future<Output = Result<InnerStream, Error>>,
+{
+    fn from(open: OpenFuture) -> Self {
+        Self::new(open)
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Stream-specific lazy writer wrapper that remembers committed send-side controls.
+    ///
+    /// The wrapper records reset, flush, and close operations that are first
+    /// polled before the opening future resolves. After resolution it drains
+    /// those operations before accepting new data.
+    pub struct DeferredStreamWriter<InnerStream, Error, OpenFuture> {
+        #[pin]
+        inner: Deferred<InnerStream, Error, OpenFuture>,
+        pending: PendingWriteQueue,
+        cached_id: Option<VarInt>,
+    }
+}
+
+impl<InnerStream, Error, OpenFuture> DeferredStreamWriter<InnerStream, Error, OpenFuture>
+where
+    OpenFuture: Future<Output = Result<InnerStream, Error>>,
+{
+    /// Wrap an opening future without a known stream id.
+    pub fn new(open: OpenFuture) -> Self {
+        Self {
+            inner: Deferred::from(open),
+            pending: PendingWriteQueue::default(),
+            cached_id: None,
+        }
+    }
+}
+
+impl<InnerStream, Error, OpenFuture> From<OpenFuture>
+    for DeferredStreamWriter<InnerStream, Error, OpenFuture>
+where
+    OpenFuture: Future<Output = Result<InnerStream, Error>>,
+{
+    fn from(open: OpenFuture) -> Self {
+        Self::new(open)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PendingWriteOp {
+    Reset(VarInt),
+    Flush,
+    Close,
+}
+
+#[derive(Debug, Default)]
+struct PendingWriteQueue {
+    ops: VecDeque<PendingWriteOp>,
+}
+
+impl PendingWriteQueue {
+    fn contains_reset(&self) -> bool {
+        matches!(self.ops.front(), Some(PendingWriteOp::Reset(_)))
+    }
+
+    fn contains_flush(&self) -> bool {
+        self.ops.contains(&PendingWriteOp::Flush)
+    }
+
+    fn contains_close(&self) -> bool {
+        self.ops.contains(&PendingWriteOp::Close)
+    }
+
+    fn contains_kind(&self, op: PendingWriteOp) -> bool {
+        match op {
+            PendingWriteOp::Reset(_) => self.contains_reset(),
+            PendingWriteOp::Flush => self.contains_flush(),
+            PendingWriteOp::Close => self.contains_close(),
+        }
+    }
+
+    fn enqueue_reset(&mut self, code: VarInt) {
+        if !self.contains_reset() {
+            self.ops.clear();
+            self.ops.push_back(PendingWriteOp::Reset(code));
+        }
+    }
+
+    fn enqueue_flush(&mut self) {
+        if !self.contains_reset() && !self.contains_flush() {
+            self.ops.push_back(PendingWriteOp::Flush);
+        }
+    }
+
+    fn enqueue_close(&mut self) {
+        if !self.contains_reset() && !self.contains_close() {
+            self.ops.push_back(PendingWriteOp::Close);
+        }
+    }
+
+    fn front(&self) -> Option<PendingWriteOp> {
+        self.ops.front().copied()
+    }
+
+    fn pop_front(&mut self) {
+        self.ops.pop_front();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+}
+
 impl<T, E, F> Future for Deferred<T, E, F>
 where
     F: Future<Output = Result<T, E>>,
@@ -394,6 +537,196 @@ where
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
         ready!(self.poll(cx)?).poll_cancel(cx, code)
+    }
+}
+
+impl<InnerStream, Error, OpenFuture> quic::GetStreamId
+    for DeferredStreamReader<InnerStream, Error, OpenFuture>
+where
+    InnerStream: quic::GetStreamId,
+    Error: Clone,
+    quic::StreamError: From<Error>,
+    OpenFuture: Future<Output = Result<InnerStream, Error>>,
+{
+    fn poll_stream_id(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Result<VarInt, quic::StreamError>> {
+        if let Some(stream_id) = self.as_mut().project().cached_id.as_ref().copied() {
+            return Poll::Ready(Ok(stream_id));
+        }
+
+        let stream_id = {
+            let project = self.as_mut().project();
+            let stream = match ready!(project.inner.poll(cx)) {
+                Ok(stream) => stream,
+                Err(error) => return Poll::Ready(Err(error.into())),
+            };
+            ready!(stream.poll_stream_id(cx))?
+        };
+        *self.as_mut().project().cached_id = Some(stream_id);
+        Poll::Ready(Ok(stream_id))
+    }
+}
+
+impl<InnerStream, Error, OpenFuture> quic::StopStream
+    for DeferredStreamReader<InnerStream, Error, OpenFuture>
+where
+    InnerStream: quic::StopStream,
+    Error: Clone,
+    quic::StreamError: From<Error>,
+    OpenFuture: Future<Output = Result<InnerStream, Error>>,
+{
+    fn poll_stop(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        if self.as_mut().project().pending_stop.is_none() {
+            *self.as_mut().project().pending_stop = Some(code);
+        }
+        let code = self
+            .as_mut()
+            .project()
+            .pending_stop
+            .expect("pending stop code should be present");
+
+        let result = {
+            let project = self.as_mut().project();
+            let stream = match ready!(project.inner.poll(cx)) {
+                Ok(stream) => stream,
+                Err(error) => return Poll::Ready(Err(error.into())),
+            };
+            ready!(stream.poll_stop(cx, code))
+        };
+        *self.as_mut().project().pending_stop = None;
+        Poll::Ready(result)
+    }
+}
+
+impl<InnerStream, Error, OpenFuture, Item, StreamItemError> futures::Stream
+    for DeferredStreamReader<InnerStream, Error, OpenFuture>
+where
+    InnerStream: futures::Stream<Item = Result<Item, StreamItemError>> + quic::StopStream,
+    Error: Clone,
+    quic::StreamError: From<Error>,
+    StreamItemError: From<Error> + From<quic::StreamError>,
+    OpenFuture: Future<Output = Result<InnerStream, Error>>,
+{
+    type Item = InnerStream::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(code) = self.as_mut().project().pending_stop.as_ref().copied()
+            && let Err(error) = ready!(quic::StopStream::poll_stop(self.as_mut(), cx, code))
+        {
+            return Poll::Ready(Some(Err(StreamItemError::from(error))));
+        }
+
+        let project = self.as_mut().project();
+        let stream = match ready!(project.inner.poll(cx)) {
+            Ok(stream) => stream,
+            Err(error) => return Poll::Ready(Some(Err(StreamItemError::from(error)))),
+        };
+        stream.poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, None)
+    }
+}
+
+impl<InnerStream, Error, OpenFuture, Item, StreamItemError> FusedStream
+    for DeferredStreamReader<InnerStream, Error, OpenFuture>
+where
+    InnerStream: FusedStream<Item = Result<Item, StreamItemError>> + quic::StopStream,
+    Error: Clone,
+    quic::StreamError: From<Error>,
+    StreamItemError: From<Error> + From<quic::StreamError>,
+    OpenFuture: Future<Output = Result<InnerStream, Error>>,
+{
+    fn is_terminated(&self) -> bool {
+        if self.pending_stop.is_some() {
+            return false;
+        }
+        match &self.inner {
+            Deferred::Pending { .. } => false,
+            Deferred::Ready { resolved } => resolved.is_terminated(),
+        }
+    }
+}
+
+impl<InnerStream, Error, OpenFuture> quic::GetStreamId
+    for DeferredStreamWriter<InnerStream, Error, OpenFuture>
+where
+    InnerStream: quic::GetStreamId,
+    Error: Clone,
+    quic::StreamError: From<Error>,
+    OpenFuture: Future<Output = Result<InnerStream, Error>>,
+{
+    fn poll_stream_id(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Result<VarInt, quic::StreamError>> {
+        if let Some(stream_id) = self.as_mut().project().cached_id.as_ref().copied() {
+            return Poll::Ready(Ok(stream_id));
+        }
+
+        let stream_id = {
+            let project = self.as_mut().project();
+            let stream = match ready!(project.inner.poll(cx)) {
+                Ok(stream) => stream,
+                Err(error) => return Poll::Ready(Err(error.into())),
+            };
+            ready!(stream.poll_stream_id(cx))?
+        };
+        *self.as_mut().project().cached_id = Some(stream_id);
+        Poll::Ready(Ok(stream_id))
+    }
+}
+
+impl<InnerStream, Error, OpenFuture> DeferredStreamWriter<InnerStream, Error, OpenFuture>
+where
+    InnerStream: quic::CancelStream,
+    Error: Clone,
+    quic::StreamError: From<Error>,
+    OpenFuture: Future<Output = Result<InnerStream, Error>>,
+{
+    fn poll_reset_op(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        let Some(PendingWriteOp::Reset(code)) = self.as_mut().project().pending.front() else {
+            return Poll::Ready(Ok(()));
+        };
+
+        let result = {
+            let project = self.as_mut().project();
+            let stream = match ready!(project.inner.poll(cx)) {
+                Ok(stream) => stream,
+                Err(error) => return Poll::Ready(Err(error.into())),
+            };
+            ready!(stream.poll_cancel(cx, code))
+        };
+        self.as_mut().project().pending.pop_front();
+        Poll::Ready(result)
+    }
+}
+
+impl<InnerStream, Error, OpenFuture> quic::CancelStream
+    for DeferredStreamWriter<InnerStream, Error, OpenFuture>
+where
+    InnerStream: quic::CancelStream,
+    Error: Clone,
+    quic::StreamError: From<Error>,
+    OpenFuture: Future<Output = Result<InnerStream, Error>>,
+{
+    fn poll_cancel(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        self.as_mut().project().pending.enqueue_reset(code);
+        self.poll_reset_op(cx)
     }
 }
 
@@ -517,24 +850,152 @@ where
     }
 }
 
+impl<InnerStream, Error, OpenFuture> DeferredStreamWriter<InnerStream, Error, OpenFuture>
+where
+    InnerStream: quic::CancelStream,
+    Error: Clone,
+    quic::StreamError: From<Error>,
+    OpenFuture: Future<Output = Result<InnerStream, Error>>,
+{
+    fn poll_pending_until<Item, SinkError>(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        target: Option<PendingWriteOp>,
+    ) -> Poll<Result<(), SinkError>>
+    where
+        InnerStream: Sink<Item, Error = SinkError>,
+        SinkError: From<Error> + From<quic::StreamError>,
+    {
+        loop {
+            let op = {
+                let project = self.as_mut().project();
+                if let Some(target) = target
+                    && !project.pending.contains_kind(target)
+                {
+                    return Poll::Ready(Ok(()));
+                }
+                match project.pending.front() {
+                    Some(op) => op,
+                    None => return Poll::Ready(Ok(())),
+                }
+            };
+
+            match op {
+                PendingWriteOp::Reset(_) => {
+                    ready!(self.as_mut().poll_reset_op(cx)).map_err(SinkError::from)?;
+                }
+                PendingWriteOp::Flush => {
+                    let result = {
+                        let project = self.as_mut().project();
+                        let stream = match ready!(project.inner.poll(cx)) {
+                            Ok(stream) => stream,
+                            Err(error) => return Poll::Ready(Err(error.into())),
+                        };
+                        ready!(stream.poll_flush(cx))
+                    };
+                    self.as_mut().project().pending.pop_front();
+                    result?;
+                    if target == Some(PendingWriteOp::Flush) {
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                PendingWriteOp::Close => {
+                    let result = {
+                        let project = self.as_mut().project();
+                        let stream = match ready!(project.inner.poll(cx)) {
+                            Ok(stream) => stream,
+                            Err(error) => return Poll::Ready(Err(error.into())),
+                        };
+                        ready!(stream.poll_close(cx))
+                    };
+                    self.as_mut().project().pending.pop_front();
+                    result?;
+                    if target == Some(PendingWriteOp::Close) {
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<InnerStream, Error, OpenFuture, Item> Sink<Item>
+    for DeferredStreamWriter<InnerStream, Error, OpenFuture>
+where
+    InnerStream: Sink<Item> + quic::CancelStream,
+    Error: Clone,
+    InnerStream::Error: From<Error> + From<quic::StreamError>,
+    quic::StreamError: From<Error>,
+    OpenFuture: Future<Output = Result<InnerStream, Error>>,
+{
+    type Error = InnerStream::Error;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        while !self.as_mut().project().pending.is_empty() {
+            ready!(
+                self.as_mut()
+                    .poll_pending_until::<Item, Self::Error>(cx, None)?
+            );
+        }
+
+        let project = self.as_mut().project();
+        let stream = match ready!(project.inner.poll(cx)) {
+            Ok(stream) => stream,
+            Err(error) => return Poll::Ready(Err(error.into())),
+        };
+        stream.poll_ready(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Item) -> Result<(), Self::Error> {
+        let project = self.project();
+        assert!(
+            project.pending.is_empty(),
+            "start_send called without poll_ready being called first"
+        );
+        project
+            .inner
+            .try_peek_mut()
+            .expect("start_send before poll_ready completed")?
+            .start_send(item)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.as_mut().project().pending.enqueue_flush();
+        self.poll_pending_until(cx, Some(PendingWriteOp::Flush))
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.as_mut().project().pending.enqueue_close();
+        self.poll_pending_until(cx, Some(PendingWriteOp::Close))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         convert::Infallible,
         future::{Ready, pending, ready},
         io::Cursor,
         pin::Pin,
+        sync::{Arc, Mutex},
         task::{Context, Poll},
     };
 
     use bytes::Bytes;
-    use futures::{Sink, SinkExt, StreamExt, stream::FusedStream, task::noop_waker_ref};
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
+    use futures::{
+        FutureExt, Sink, SinkExt, Stream, StreamExt, future::poll_fn, stream::FusedStream,
+        task::noop_waker_ref,
+    };
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf},
+        sync::oneshot,
+    };
 
     use super::*;
     use crate::{
         codec::{DecodeError, EncodeError},
-        quic::{CancelStreamExt, GetStreamIdExt, StopStreamExt},
+        quic::{CancelStream, CancelStreamExt, GetStreamIdExt, StopStream, StopStreamExt},
     };
 
     fn varint(value: u32) -> VarInt {
@@ -559,6 +1020,137 @@ mod tests {
     ) -> Deferred<T, quic::StreamError, Ready<Result<T, quic::StreamError>>> {
         drop(value);
         Deferred::from(ready(Err(quic::StreamError::Reset { code: varint(code) })))
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum DeferredStreamEvent {
+        Stop(VarInt),
+        Write(Bytes),
+        Flush,
+        Close,
+        Cancel(VarInt),
+    }
+
+    #[derive(Debug)]
+    struct RecordingReader {
+        stream_id: VarInt,
+        events: Arc<Mutex<Vec<DeferredStreamEvent>>>,
+        chunks: VecDeque<Result<Bytes, quic::StreamError>>,
+        terminated: bool,
+    }
+
+    impl quic::GetStreamId for RecordingReader {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
+        }
+    }
+
+    impl quic::StopStream for RecordingReader {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            self.events
+                .lock()
+                .expect("event log poisoned")
+                .push(DeferredStreamEvent::Stop(code));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for RecordingReader {
+        type Item = Result<Bytes, quic::StreamError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            match this.chunks.pop_front() {
+                Some(item) => Poll::Ready(Some(item)),
+                None => {
+                    this.terminated = true;
+                    Poll::Ready(None)
+                }
+            }
+        }
+    }
+
+    impl FusedStream for RecordingReader {
+        fn is_terminated(&self) -> bool {
+            self.terminated
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingWriter {
+        stream_id: VarInt,
+        events: Arc<Mutex<Vec<DeferredStreamEvent>>>,
+    }
+
+    impl quic::GetStreamId for RecordingWriter {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
+        }
+    }
+
+    impl quic::CancelStream for RecordingWriter {
+        fn poll_cancel(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            self.events
+                .lock()
+                .expect("event log poisoned")
+                .push(DeferredStreamEvent::Cancel(code));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Sink<Bytes> for RecordingWriter {
+        type Error = quic::StreamError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+            self.events
+                .lock()
+                .expect("event log poisoned")
+                .push(DeferredStreamEvent::Write(item));
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.events
+                .lock()
+                .expect("event log poisoned")
+                .push(DeferredStreamEvent::Flush);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.events
+                .lock()
+                .expect("event log poisoned")
+                .push(DeferredStreamEvent::Close);
+            Poll::Ready(Ok(()))
+        }
     }
 
     #[test]
@@ -865,6 +1457,124 @@ mod tests {
         let (_reader, writer) = quic::test::mock_stream_pair(varint(24));
         let mut writer = Deferred::from(ready(Ok::<_, quic::StreamError>(writer)));
         writer.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn deferred_stream_reader_applies_stop_committed_before_resolution() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (open_tx, open_rx) = oneshot::channel();
+        let stop_code = varint(101);
+        let mut reader = Box::pin(DeferredStreamReader::from(async move {
+            open_rx
+                .await
+                .expect("stream opener should resolve before test ends")
+        }));
+
+        assert!(
+            poll_fn(|cx| reader.as_mut().poll_stop(cx, stop_code))
+                .now_or_never()
+                .is_none()
+        );
+        assert!(events.lock().expect("event log poisoned").is_empty());
+
+        open_tx
+            .send(Ok::<_, quic::StreamError>(RecordingReader {
+                stream_id: varint(102),
+                events: events.clone(),
+                chunks: VecDeque::from([Ok(Bytes::from_static(b"after stop"))]),
+                terminated: false,
+            }))
+            .expect("send opener result");
+
+        assert_eq!(
+            reader
+                .as_mut()
+                .next()
+                .await
+                .expect("chunk after stop")
+                .expect("read succeeds"),
+            Bytes::from_static(b"after stop")
+        );
+        assert_eq!(
+            *events.lock().expect("event log poisoned"),
+            vec![DeferredStreamEvent::Stop(stop_code)]
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_stream_writer_reset_replaces_flush_committed_before_resolution() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (open_tx, open_rx) = oneshot::channel();
+        let reset_code = varint(111);
+        let mut writer = Box::pin(DeferredStreamWriter::from(async move {
+            open_rx
+                .await
+                .expect("stream opener should resolve before test ends")
+        }));
+
+        assert!(
+            poll_fn(|cx| writer.as_mut().poll_flush(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert!(
+            poll_fn(|cx| writer.as_mut().poll_cancel(cx, reset_code))
+                .now_or_never()
+                .is_none()
+        );
+        assert!(events.lock().expect("event log poisoned").is_empty());
+
+        open_tx
+            .send(Ok::<_, quic::StreamError>(RecordingWriter {
+                stream_id: varint(112),
+                events: events.clone(),
+            }))
+            .expect("send opener result");
+
+        poll_fn(|cx| writer.as_mut().poll_ready(cx))
+            .await
+            .expect("writer becomes ready after reset drains");
+        assert_eq!(
+            *events.lock().expect("event log poisoned"),
+            vec![DeferredStreamEvent::Cancel(reset_code)]
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_stream_writer_drains_flush_and_close_in_commit_order_after_resolution() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (open_tx, open_rx) = oneshot::channel();
+        let mut writer = Box::pin(DeferredStreamWriter::from(async move {
+            open_rx
+                .await
+                .expect("stream opener should resolve before test ends")
+        }));
+
+        assert!(
+            poll_fn(|cx| writer.as_mut().poll_close(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert!(
+            poll_fn(|cx| writer.as_mut().poll_flush(cx))
+                .now_or_never()
+                .is_none()
+        );
+
+        open_tx
+            .send(Ok::<_, quic::StreamError>(RecordingWriter {
+                stream_id: varint(113),
+                events: events.clone(),
+            }))
+            .expect("send opener result");
+
+        poll_fn(|cx| writer.as_mut().poll_ready(cx))
+            .await
+            .expect("writer becomes ready after controls drain");
+        assert_eq!(
+            *events.lock().expect("event log poisoned"),
+            vec![DeferredStreamEvent::Close, DeferredStreamEvent::Flush]
+        );
     }
 
     #[tokio::test]

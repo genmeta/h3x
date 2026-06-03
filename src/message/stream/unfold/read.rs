@@ -50,121 +50,251 @@ impl From<ReadStream> for BoxMessageStreamReader<'static> {
 pin_project_lite::pin_project! {
     #[project = StateProj]
     #[project_replace = StateProjReplace]
-    enum State<T, Fut> {
-        Value { value: T },
-        Future { #[pin] future: Fut },
-        Done,
+    enum State<StreamState, ReadFuture, StopFuture> {
+        Stream { stream: StreamState },
+        Read {
+            token: tokio_util::sync::CancellationToken,
+            #[pin]
+            future: ReadFuture,
+        },
+        Stop {
+            code: VarInt,
+            #[pin]
+            future: StopFuture,
+        },
         Empty,
     }
 }
 
+impl<StreamState, ReadFuture, StopFuture> State<StreamState, ReadFuture, StopFuture> {
+    fn take_stream(self: Pin<&mut Self>) -> StreamState {
+        match self.project_replace(Self::Empty) {
+            StateProjReplace::Stream { stream } => stream,
+            _ => unreachable!("invalid state for take_stream"),
+        }
+    }
+}
+
 pin_project_lite::pin_project! {
-    /// A fused stream adapter similar to [`futures::stream::unfold`], but the
-    /// inner value's QUIC control traits ([`GetStreamId`], [`StopStream`]) are
-    /// forwarded when the value is not consumed by an in-flight future.
+    /// A fused stream adapter similar to [`futures::stream::unfold`], but with
+    /// stream-specific read and stop futures that always return the stream state.
     #[must_use = "streams do nothing unless polled"]
-    pub struct Unfold<T, F, Fut> {
-        f: F,
+    pub struct Unfold<StreamState, Read, Stop, ReadFuture, StopFuture, Item> {
+        read: Read,
+        stop: Stop,
+        terminated: bool,
+        pending_stop: Option<VarInt>,
+        pending_item: Option<Item>,
+        _item: std::marker::PhantomData<fn() -> Item>,
         #[pin]
-        state: State<T, Fut>,
+        state: State<StreamState, ReadFuture, StopFuture>,
+    }
+}
+
+trait StreamErrorItem {
+    fn from_stream_error(error: quic::StreamError) -> Self;
+}
+
+impl<Value, Error> StreamErrorItem for Result<Value, Error>
+where
+    Error: From<quic::StreamError>,
+{
+    fn from_stream_error(error: quic::StreamError) -> Self {
+        Err(error.into())
     }
 }
 
 /// Create an [`Unfold`] stream.
 ///
-/// Works like [`futures::stream::unfold`] but the returned stream conditionally
-/// implements [`GetStreamId`] and [`StopStream`] when `T` does.
-pub fn unfold<T, F, Fut, Item>(init: T, f: F) -> Unfold<T, F, Fut>
+/// The read future yields either a delivered item plus the returned stream
+/// state, EOF plus the returned stream state, or an interrupted stream state.
+/// The stop future is a separate operation so callers can adapt states whose
+/// stop behavior is not expressed directly as a [`StopStream`] implementation.
+pub fn unfold<StreamState, Read, Stop, ReadFuture, StopFuture, Item>(
+    init: StreamState,
+    read: Read,
+    stop: Stop,
+) -> Unfold<StreamState, Read, Stop, ReadFuture, StopFuture, Item>
 where
-    F: FnMut(T) -> Fut,
-    Fut: Future<Output = Option<(Item, T)>>,
+    Read: FnMut(StreamState, tokio_util::sync::CancellationToken) -> ReadFuture,
+    ReadFuture: Future<Output = futures::future::Either<(StreamState, Option<Item>), StreamState>>,
+    Stop: FnMut(StreamState, VarInt) -> StopFuture,
+    StopFuture: Future<Output = (StreamState, Result<(), quic::StreamError>)>,
 {
     Unfold {
-        f,
-        state: State::Value { value: init },
+        read,
+        stop,
+        terminated: false,
+        pending_stop: None,
+        pending_item: None,
+        _item: std::marker::PhantomData,
+        state: State::Stream { stream: init },
     }
 }
 
-impl<T, F, Fut, Item> futures::Stream for Unfold<T, F, Fut>
+impl<StreamState, Read, Stop, ReadFuture, StopFuture, Item>
+    Unfold<StreamState, Read, Stop, ReadFuture, StopFuture, Item>
 where
-    F: FnMut(T) -> Fut,
-    Fut: Future<Output = Option<(Item, T)>>,
+    Read: FnMut(StreamState, tokio_util::sync::CancellationToken) -> ReadFuture,
+    ReadFuture: Future<Output = futures::future::Either<(StreamState, Option<Item>), StreamState>>,
+    Stop: FnMut(StreamState, VarInt) -> StopFuture,
+    StopFuture: Future<Output = (StreamState, Result<(), quic::StreamError>)>,
 {
-    type Item = Item;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
+    fn poll_pending_stop(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        let Some(code) = self.as_mut().project().pending_stop.as_ref().copied() else {
+            return Poll::Ready(Ok(()));
+        };
 
         loop {
-            match this.state.as_mut().project() {
-                StateProj::Value { .. } => {
-                    let value = match this.state.as_mut().project_replace(State::Empty) {
-                        StateProjReplace::Value { value } => value,
-                        _ => unreachable!(),
-                    };
-                    let fut = (this.f)(value);
-                    this.state.set(State::Future { future: fut });
+            let mut project = self.as_mut().project();
+            match project.state.as_mut().project() {
+                StateProj::Stream { .. } => {
+                    let stream = project.state.as_mut().take_stream();
+                    project.state.set(State::Stop {
+                        code,
+                        future: (project.stop)(stream, code),
+                    });
                 }
-                StateProj::Future { future } => match ready!(future.poll(cx)) {
-                    Some((item, value)) => {
-                        this.state.set(State::Value { value });
-                        return Poll::Ready(Some(item));
+                StateProj::Read { token, future } => {
+                    token.cancel();
+                    match ready!(future.poll(cx)) {
+                        futures::future::Either::Left((stream, item)) => {
+                            if item.is_none() {
+                                *project.terminated = true;
+                            }
+                            *project.pending_item = item;
+                            project.state.set(State::Stream { stream });
+                        }
+                        futures::future::Either::Right(stream) => {
+                            project.state.set(State::Stream { stream });
+                        }
                     }
-                    None => {
-                        this.state.set(State::Done);
-                        return Poll::Ready(None);
-                    }
-                },
-                StateProj::Done | StateProj::Empty => {
-                    return Poll::Ready(None);
                 }
+                StateProj::Stop { future, .. } => {
+                    let (stream, result) = ready!(future.poll(cx));
+                    project.state.set(State::Stream { stream });
+                    *project.pending_stop = None;
+                    return Poll::Ready(result);
+                }
+                StateProj::Empty => unreachable!("invalid state for poll_pending_stop"),
             }
         }
     }
 }
 
-impl<T, F, Fut, Item> FusedStream for Unfold<T, F, Fut>
+impl<StreamState, Read, Stop, ReadFuture, StopFuture, Item> futures::Stream
+    for Unfold<StreamState, Read, Stop, ReadFuture, StopFuture, Item>
 where
-    F: FnMut(T) -> Fut,
-    Fut: Future<Output = Option<(Item, T)>>,
+    Read: FnMut(StreamState, tokio_util::sync::CancellationToken) -> ReadFuture,
+    ReadFuture: Future<Output = futures::future::Either<(StreamState, Option<Item>), StreamState>>,
+    Stop: FnMut(StreamState, VarInt) -> StopFuture,
+    StopFuture: Future<Output = (StreamState, Result<(), quic::StreamError>)>,
+    Item: StreamErrorItem,
 {
-    fn is_terminated(&self) -> bool {
-        matches!(self.state, State::Done)
+    type Item = Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(item) = self.as_mut().project().pending_item.take() {
+            return Poll::Ready(Some(item));
+        }
+
+        if self.as_mut().project().pending_stop.is_some()
+            && let Err(error) = ready!(self.as_mut().poll_pending_stop(cx))
+        {
+            return Poll::Ready(Some(Item::from_stream_error(error)));
+        }
+
+        loop {
+            let mut project = self.as_mut().project();
+            match project.state.as_mut().project() {
+                StateProj::Stream { .. } => {
+                    if *project.terminated {
+                        return Poll::Ready(None);
+                    }
+                    let stream = project.state.as_mut().take_stream();
+                    let token = tokio_util::sync::CancellationToken::new();
+                    project.state.set(State::Read {
+                        token: token.clone(),
+                        future: (project.read)(stream, token),
+                    });
+                }
+                StateProj::Read { future, .. } => match ready!(future.poll(cx)) {
+                    futures::future::Either::Left((stream, item)) => {
+                        if item.is_none() {
+                            *project.terminated = true;
+                        }
+                        project.state.set(State::Stream { stream });
+                        return Poll::Ready(item);
+                    }
+                    futures::future::Either::Right(stream) => {
+                        project.state.set(State::Stream { stream });
+                    }
+                },
+                StateProj::Stop { future, .. } => {
+                    let (stream, result) = ready!(future.poll(cx));
+                    project.state.set(State::Stream { stream });
+                    *project.pending_stop = None;
+                    if let Err(error) = result {
+                        return Poll::Ready(Some(Item::from_stream_error(error)));
+                    }
+                }
+                StateProj::Empty => unreachable!("invalid state for poll_next"),
+            }
+        }
     }
 }
 
-impl<T: GetStreamId + Unpin, F, Fut, Item> GetStreamId for Unfold<T, F, Fut>
+impl<StreamState, Read, Stop, ReadFuture, StopFuture, Item> FusedStream
+    for Unfold<StreamState, Read, Stop, ReadFuture, StopFuture, Item>
 where
-    F: FnMut(T) -> Fut,
-    Fut: Future<Output = Option<(Item, T)>>,
+    Read: FnMut(StreamState, tokio_util::sync::CancellationToken) -> ReadFuture,
+    ReadFuture: Future<Output = futures::future::Either<(StreamState, Option<Item>), StreamState>>,
+    Stop: FnMut(StreamState, VarInt) -> StopFuture,
+    StopFuture: Future<Output = (StreamState, Result<(), quic::StreamError>)>,
+    Item: StreamErrorItem,
+{
+    fn is_terminated(&self) -> bool {
+        self.terminated
+    }
+}
+
+impl<StreamState, Read, Stop, ReadFuture, StopFuture, Item> GetStreamId
+    for Unfold<StreamState, Read, Stop, ReadFuture, StopFuture, Item>
+where
+    StreamState: GetStreamId + Unpin,
 {
     fn poll_stream_id(
         self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<Result<VarInt, quic::StreamError>> {
-        let this = self.project();
-        match this.state.project() {
-            StateProj::Value { value } => Pin::new(value).poll_stream_id(cx),
+        let project = self.project();
+        match project.state.project() {
+            StateProj::Stream { stream } => Pin::new(stream).poll_stream_id(cx),
             _ => Poll::Pending,
         }
     }
 }
 
-impl<T: StopStream + Unpin, F, Fut, Item> StopStream for Unfold<T, F, Fut>
+impl<StreamState, Read, Stop, ReadFuture, StopFuture, Item> StopStream
+    for Unfold<StreamState, Read, Stop, ReadFuture, StopFuture, Item>
 where
-    F: FnMut(T) -> Fut,
-    Fut: Future<Output = Option<(Item, T)>>,
+    Read: FnMut(StreamState, tokio_util::sync::CancellationToken) -> ReadFuture,
+    ReadFuture: Future<Output = futures::future::Either<(StreamState, Option<Item>), StreamState>>,
+    Stop: FnMut(StreamState, VarInt) -> StopFuture,
+    StopFuture: Future<Output = (StreamState, Result<(), quic::StreamError>)>,
 {
     fn poll_stop(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        let this = self.project();
-        match this.state.project() {
-            StateProj::Value { value } => Pin::new(value).poll_stop(cx, code),
-            _ => Poll::Pending,
+        if self.as_mut().project().pending_stop.is_none() {
+            *self.as_mut().project().pending_stop = Some(code);
         }
+        self.poll_pending_stop(cx)
     }
 }
 
@@ -174,13 +304,28 @@ where
 
 impl ReadStream {
     pub fn as_bytes_stream(&mut self) -> impl ReadMessageStream + '_ {
-        unfold(self, |this: &mut ReadStream| async move {
-            match this.read_data_chunk().await {
-                Ok(Some(bytes)) => Some((Ok(bytes), this)),
-                Ok(None) => None,
-                Err(error) => Some((Err(error), this)),
-            }
-        })
+        unfold(
+            self,
+            |stream: &mut ReadStream, token| async move {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => futures::future::Either::Right(stream),
+                    result = stream.read_data_chunk() => {
+                        let item = match result {
+                            Ok(Some(bytes)) => Some(Ok(bytes)),
+                            Ok(None) => None,
+                            Err(error) => Some(Err(error)),
+                        };
+                        futures::future::Either::Left((stream, item))
+                    }
+                }
+            },
+            |stream: &mut ReadStream, code| async move {
+                let result =
+                    futures::future::poll_fn(|cx| Pin::new(&mut *stream).poll_stop(cx, code)).await;
+                (stream, result)
+            },
+        )
     }
 
     pub fn as_reader(&mut self) -> StreamReader<impl ReadMessageStream + '_> {
@@ -192,13 +337,28 @@ impl ReadStream {
     }
 
     pub fn into_bytes_stream(self) -> impl ReadMessageStream {
-        unfold(self, |mut this: ReadStream| async move {
-            match this.read_data_chunk().await {
-                Ok(Some(bytes)) => Some((Ok(bytes), this)),
-                Ok(None) => None,
-                Err(error) => Some((Err(error), this)),
-            }
-        })
+        unfold(
+            self,
+            |mut stream: ReadStream, token| async move {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => futures::future::Either::Right(stream),
+                    result = stream.read_data_chunk() => {
+                        let item = match result {
+                            Ok(Some(bytes)) => Some(Ok(bytes)),
+                            Ok(None) => None,
+                            Err(error) => Some(Err(error)),
+                        };
+                        futures::future::Either::Left((stream, item))
+                    }
+                }
+            },
+            |mut stream: ReadStream, code| async move {
+                let result =
+                    futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_stop(cx, code)).await;
+                (stream, result)
+            },
+        )
     }
 
     pub fn into_reader(self) -> StreamReader<impl ReadMessageStream> {
@@ -220,7 +380,10 @@ mod tests {
         task::{Context, Poll},
     };
 
-    use futures::{FutureExt, Stream, StreamExt, future::poll_fn};
+    use futures::{
+        FutureExt, Stream, StreamExt,
+        future::{Either, poll_fn},
+    };
     use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
 
     use super::*;
@@ -251,20 +414,28 @@ mod tests {
         }
     }
 
+    async fn stop_ok<StreamState>(
+        stream: StreamState,
+        _code: VarInt,
+    ) -> (StreamState, Result<(), quic::StreamError>) {
+        (stream, Ok(()))
+    }
+
     #[tokio::test]
     async fn unfold_yields_items_and_reports_termination() {
-        let mut stream = Box::pin(unfold(0, |value| async move {
-            if value < 3 {
-                Some((value, value + 1))
-            } else {
-                None
-            }
-        }));
+        let mut stream = Box::pin(unfold(
+            0,
+            |value, _token| async move {
+                let item = (value < 3).then_some(Ok::<_, quic::StreamError>(value));
+                Either::Left((value + 1, item))
+            },
+            stop_ok,
+        ));
 
-        assert_eq!(stream.as_mut().next().await, Some(0));
-        assert_eq!(stream.as_mut().next().await, Some(1));
-        assert_eq!(stream.as_mut().next().await, Some(2));
-        assert_eq!(stream.as_mut().next().await, None);
+        assert_eq!(stream.as_mut().next().await.unwrap().unwrap(), 0);
+        assert_eq!(stream.as_mut().next().await.unwrap().unwrap(), 1);
+        assert_eq!(stream.as_mut().next().await.unwrap().unwrap(), 2);
+        assert!(stream.as_mut().next().await.is_none());
         assert!(stream.as_ref().get_ref().is_terminated());
     }
 
@@ -278,7 +449,11 @@ mod tests {
                 stream_id,
                 stopped: stopped.clone(),
             },
-            |stream| async move { Some(((), stream)) },
+            |stream, _token| async move { Either::Left((stream, Some(Ok::<_, quic::StreamError>(())))) },
+            |stream: ControlStream, code| async move {
+                *stream.stopped.lock().expect("stop state poisoned") = Some(code);
+                (stream, Ok(()))
+            },
         ));
 
         assert_eq!(
@@ -304,7 +479,15 @@ mod tests {
                 stream_id: VarInt::from_u32(37),
                 stopped,
             },
-            |_stream| futures::future::pending::<Option<((), ControlStream)>>(),
+            |_stream, _token| {
+                futures::future::pending::<
+                    Either<(ControlStream, Option<Result<(), quic::StreamError>>), ControlStream>,
+                >()
+            },
+            |stream: ControlStream, code| async move {
+                *stream.stopped.lock().expect("stop state poisoned") = Some(code);
+                (stream, Ok(()))
+            },
         ));
 
         assert!(futures::poll!(stream.as_mut().next()).is_pending());
@@ -321,6 +504,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_uses_stop_closure_after_interrupting_pending_read() {
+        let stopped = Arc::new(Mutex::new(None));
+        let stop_code = VarInt::from_u32(41);
+        let stream_id = VarInt::from_u32(37);
+        let mut stream = Box::pin(unfold(
+            ControlStream {
+                stream_id,
+                stopped: stopped.clone(),
+            },
+            |stream, token| async move {
+                token.cancelled().await;
+                Either::<
+                    (ControlStream, Option<Result<(), quic::StreamError>>),
+                    ControlStream,
+                >::Right(stream)
+            },
+            |stream: ControlStream, code| async move {
+                *stream.stopped.lock().expect("stop state poisoned") = Some(code);
+                (stream, Ok(()))
+            },
+        ));
+
+        assert!(
+            poll_fn(|cx| stream.as_mut().poll_next(cx))
+                .now_or_never()
+                .is_none()
+        );
+        poll_fn(|cx| stream.as_mut().poll_stop(cx, stop_code))
+            .await
+            .expect("stop should complete");
+        assert_eq!(
+            *stopped.lock().expect("stop state poisoned"),
+            Some(stop_code)
+        );
+        assert_eq!(
+            poll_fn(|cx| stream.as_mut().poll_stream_id(cx))
+                .await
+                .expect("stream id should remain available"),
+            stream_id
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_preserves_eof_observed_while_interrupting_pending_read() {
+        let stopped = Arc::new(Mutex::new(None));
+        let stop_code = VarInt::from_u32(41);
+        let mut stream = Box::pin(unfold(
+            ControlStream {
+                stream_id: VarInt::from_u32(37),
+                stopped: stopped.clone(),
+            },
+            |stream, token| async move {
+                token.cancelled().await;
+                Either::<
+                    (ControlStream, Option<Result<(), quic::StreamError>>),
+                    ControlStream,
+                >::Left((stream, None))
+            },
+            |stream: ControlStream, code| async move {
+                *stream.stopped.lock().expect("stop state poisoned") = Some(code);
+                (stream, Ok(()))
+            },
+        ));
+
+        assert!(
+            poll_fn(|cx| stream.as_mut().poll_next(cx))
+                .now_or_never()
+                .is_none()
+        );
+        poll_fn(|cx| stream.as_mut().poll_stop(cx, stop_code))
+            .await
+            .expect("stop should complete");
+
+        assert!(stream.as_ref().get_ref().is_terminated());
+        assert_eq!(
+            *stopped.lock().expect("stop state poisoned"),
+            Some(stop_code)
+        );
+    }
+
+    #[tokio::test]
     async fn unfold_yields_error_items_without_terminating_the_stream() {
         let mut stream = Box::pin(unfold(
             VecDeque::from([
@@ -328,7 +592,11 @@ mod tests {
                 Err::<Bytes, MessageStreamError>(MessageStreamError::MalformedIncomingMessage),
                 Ok(Bytes::from_static(b"chunk-2")),
             ]),
-            |mut items| async move { items.pop_front().map(|item| (item, items)) },
+            |mut items, _token| async move {
+                let item = items.pop_front();
+                Either::Left((items, item))
+            },
+            stop_ok,
         ));
 
         match stream.as_mut().next().await {
@@ -356,7 +624,11 @@ mod tests {
                 Ok::<Bytes, MessageStreamError>(Bytes::from_static(b"")),
                 Ok::<Bytes, MessageStreamError>(Bytes::from_static(b"world")),
             ]),
-            |mut chunks| async move { chunks.pop_front().map(|chunk| (chunk, chunks)) },
+            |mut chunks, _token| async move {
+                let chunk = chunks.pop_front();
+                Either::Left((chunks, chunk))
+            },
+            stop_ok,
         )));
 
         let mut data = Vec::new();
@@ -406,7 +678,11 @@ mod tests {
                 Ok::<Bytes, MessageStreamError>(Bytes::from_static(b"ab")),
                 Ok::<Bytes, MessageStreamError>(Bytes::from_static(b"cd")),
             ]),
-            |mut chunks| async move { chunks.pop_front().map(|chunk| (chunk, chunks)) },
+            |mut chunks, _token| async move {
+                let chunk = chunks.pop_front();
+                Either::Left((chunks, chunk))
+            },
+            stop_ok,
         )));
 
         assert_eq!(
@@ -486,16 +762,15 @@ mod tests {
 
         assert!(poll_fn(|cx| bytes.as_mut().poll_next(cx)).await.is_none());
         assert!(bytes.as_ref().get_ref().is_terminated());
-        assert!(
+        assert_eq!(
             poll_fn(|cx| bytes.as_mut().poll_stream_id(cx))
-                .now_or_never()
-                .is_none()
+                .await
+                .expect("stream id after eof"),
+            stream_id
         );
-        assert!(
-            poll_fn(|cx| bytes.as_mut().poll_stop(cx, stop_code))
-                .now_or_never()
-                .is_none()
-        );
+        poll_fn(|cx| bytes.as_mut().poll_stop(cx, stop_code))
+            .await
+            .expect("stop after eof");
     }
 
     #[tokio::test]
@@ -555,21 +830,23 @@ mod tests {
                 stream_id: VarInt::from_u32(37),
                 stopped: Arc::new(Mutex::new(None)),
             },
-            |_stream: ControlStream| async move { None::<((), ControlStream)> },
+            |stream: ControlStream, _token| async move {
+                Either::Left((stream, None::<Result<(), quic::StreamError>>))
+            },
+            stop_ok,
         ));
 
         assert!(stream.as_mut().next().await.is_none());
         assert!(stream.as_ref().get_ref().is_terminated());
-        assert!(
+        assert_eq!(
             poll_fn(|cx| stream.as_mut().poll_stream_id(cx))
-                .now_or_never()
-                .is_none()
+                .await
+                .expect("stream id after termination"),
+            VarInt::from_u32(37)
         );
-        assert!(
-            poll_fn(|cx| stream.as_mut().poll_stop(cx, VarInt::from_u32(41)))
-                .now_or_never()
-                .is_none()
-        );
+        poll_fn(|cx| stream.as_mut().poll_stop(cx, VarInt::from_u32(41)))
+            .await
+            .expect("stop after termination");
     }
 
     #[tokio::test]
@@ -578,7 +855,11 @@ mod tests {
             VecDeque::from([Err::<Bytes, MessageStreamError>(
                 MessageStreamError::MalformedIncomingMessage,
             )]),
-            |mut chunks| async move { chunks.pop_front().map(|chunk| (chunk, chunks)) },
+            |mut chunks, _token| async move {
+                let chunk = chunks.pop_front();
+                Either::Left((chunks, chunk))
+            },
+            stop_ok,
         )));
         let mut buf = [0_u8; 4];
 
@@ -599,7 +880,11 @@ mod tests {
     async fn stream_reader_poll_next_returns_buffered_chunk_then_eof() {
         let mut reader = Box::pin(StreamReader::new(unfold(
             VecDeque::from([Ok::<Bytes, MessageStreamError>(Bytes::from_static(b"abcd"))]),
-            |mut chunks| async move { chunks.pop_front().map(|chunk| (chunk, chunks)) },
+            |mut chunks, _token| async move {
+                let chunk = chunks.pop_front();
+                Either::Left((chunks, chunk))
+            },
+            stop_ok,
         )));
         let mut buf = [0_u8; 2];
 

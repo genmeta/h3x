@@ -400,6 +400,12 @@ impl<
 {
 }
 
+/// Read-only observation of a QUIC stream id.
+///
+/// Polling for the id has no committed stream side effect and no ordering
+/// relationship with data, stop, or reset operations. An implementation may
+/// return the id immediately or wait until the id is observable. Dropping a
+/// pending [`StreamId`] future commits nothing.
 pub trait GetStreamId {
     fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>>;
 }
@@ -446,6 +452,16 @@ pub trait GetStreamIdExt {
 
 impl<T: GetStreamId + ?Sized> GetStreamIdExt for T {}
 
+/// Receive-side STOP_SENDING control for a stream.
+///
+/// The first poll of [`poll_stop`](StopStream::poll_stop) commits the
+/// STOP_SENDING request and its code. Dropping the caller future after that
+/// first poll does not cancel the request; later polls for the same outstanding
+/// stop operation continue it rather than creating a new one.
+///
+/// STOP_SENDING asks the peer to stop sending. It does not reset the local send
+/// side, and it must not discard bytes that were already received locally but
+/// have not yet been delivered to the caller.
 pub trait StopStream {
     fn poll_stop(
         self: Pin<&mut Self>,
@@ -505,6 +521,13 @@ pub trait StopStreamExt {
 
 impl<T: StopStream + ?Sized> StopStreamExt for T {}
 
+/// Byte stream plus QUIC receive-side control.
+///
+/// Bytes are delivered to the caller only when [`Stream::poll_next`] returns
+/// `Poll::Ready(Some(Ok(bytes)))`. If a pending read future is dropped before
+/// an item is delivered, the stream must not lose bytes that have not been
+/// yielded. Local STOP_SENDING does not weaken this delivery rule; reads may
+/// continue until peer reset, EOF, or a stream/connection error is reported.
 pub trait ReadStream:
     StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + Send + Any
 {
@@ -515,6 +538,14 @@ impl<S: StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + S
 {
 }
 
+/// Send-side RESET_STREAM control for a stream.
+///
+/// This trait keeps the historical `cancel` name, but the operation is QUIC
+/// RESET_STREAM rather than cancellation of a Rust future. The first poll of
+/// [`poll_cancel`](CancelStream::poll_cancel) commits the reset code. Once
+/// committed, reset may interrupt in-flight send-side work such as data send,
+/// flush, or shutdown. RESET_STREAM does not stop local receive-side byte
+/// delivery.
 pub trait CancelStream {
     fn poll_cancel(
         self: Pin<&mut Self>,
@@ -574,6 +605,19 @@ pub trait CancelStreamExt {
 
 impl<T: CancelStream + ?Sized> CancelStreamExt for T {}
 
+/// Byte sink plus QUIC send-side reset control.
+///
+/// For the [`Sink`] part of this trait, [`Sink::start_send`] is the data commit
+/// point. After it succeeds, the item is committed to the stream and must be
+/// delivered in order unless a later committed reset or an underlying
+/// stream/connection error prevents delivery.
+///
+/// [`Sink::poll_ready`] may advance already committed send work, but it does
+/// not commit a new item. [`Sink::poll_flush`] and [`Sink::poll_close`] are
+/// committed on first poll; dropping the caller future after that first poll
+/// does not cancel them. Repeated polls of the same operation kind continue the
+/// outstanding operation rather than creating another one. A committed reset
+/// supersedes send-side work.
 pub trait WriteStream:
     CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + Any
 {
