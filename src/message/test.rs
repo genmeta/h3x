@@ -94,6 +94,7 @@ pub fn read_stream_for_test(stream_id: VarInt) -> ReadStream {
     ));
 
     ReadStream::new(
+        stream_id,
         reader,
         Arc::new(QPackDecoder::new(
             Arc::new(crate::dhttp::settings::Settings::default()),

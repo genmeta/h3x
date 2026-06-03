@@ -495,6 +495,7 @@ mod tests {
 
         (
             ReadStream::new(
+                stream_id,
                 reader,
                 Arc::new(QPackDecoder::new(
                     Arc::new(Settings::default()),

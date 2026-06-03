@@ -1040,6 +1040,7 @@ mod tests {
         let state = ConnectionState::new_for_test(quic, Arc::new(protocols)).erase();
 
         ReadStream::new(
+            VarInt::from_u32(stream_id),
             StreamReader::new(guard::GuardedQuicReader::new(
                 Box::pin(reader) as crate::codec::BoxReadStream
             )),
@@ -1069,6 +1070,7 @@ mod tests {
         let state = ConnectionState::new_for_test(quic, Arc::new(protocols)).erase();
 
         ReadStream::new(
+            VarInt::from_u32(stream_id),
             StreamReader::new(guard::GuardedQuicReader::new(
                 Box::pin(reader) as crate::codec::BoxReadStream
             )),

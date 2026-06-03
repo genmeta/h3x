@@ -318,7 +318,7 @@ where
             }
         };
         let stream_id = match GetStreamIdExt::stream_id(&mut reader).await {
-            Ok(id) => StreamId(id),
+            Ok(id) => id,
             Err(e) => {
                 let report = snafu::Report::from_error(&e);
                 tracing::debug!(error = %report, "failed to get stream id, skipping request");
@@ -333,11 +333,12 @@ where
                 return;
             }
         };
-        let read_stream = ReadStream::new(reader, qpack.decoder.clone(), (*erased).clone());
+        let read_stream =
+            ReadStream::new(stream_id, reader, qpack.decoder.clone(), (*erased).clone());
         let write_stream = WriteStream::new(writer, qpack.encoder.clone(), (*erased).clone());
 
         let request = UnresolvedRequest {
-            stream_id,
+            stream_id: StreamId(stream_id),
             read_stream,
             write_stream,
             connection: erased.clone(),
@@ -2117,6 +2118,7 @@ mod tests {
         let request = UnresolvedRequest {
             stream_id: StreamId(VarInt::from_u32(111)),
             read_stream: ReadStream::new(
+                VarInt::from_u32(111),
                 StreamReader::new(GuardedQuicReader::new(
                     Box::pin(request_reader) as BoxReadStream
                 )),

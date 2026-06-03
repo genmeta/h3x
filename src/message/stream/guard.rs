@@ -117,6 +117,12 @@ impl GuardedQuicReader {
         self.completed = true;
         Self { inner, completed }
     }
+
+    /// Consume this guard and return the protected stream without running drop cleanup.
+    pub(super) fn into_inner(mut self) -> BoxReadStream {
+        self.completed = true;
+        mem::replace(&mut self.inner, dropped_reader())
+    }
 }
 
 impl Stream for GuardedQuicReader {

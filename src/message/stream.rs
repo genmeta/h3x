@@ -25,6 +25,7 @@ use crate::{
     error::{Code, H3FrameDecodeError, H3FrameUnexpected},
     qpack::{
         algorithm::{DynamicCompressAlgo, HuffmanAlways},
+        decoder::MessageStreamReader as QPackMessageStreamReader,
         encoder::{EncodeHeaderSectionError, Encoder},
         field::{FieldLine, FieldSection},
         protocol::{QPackDecoder, QPackEncoder, QPackProtocolDisabled},
@@ -127,10 +128,19 @@ pub struct ReadStream {
 
 impl ReadStream {
     pub fn new(
+        stream_id: VarInt,
         stream: StreamReader<BoxDynQuicStreamReader>,
         qpack_decoder: Arc<QPackDecoder>,
         state: ConnectionState<dyn quic::DynConnection>,
     ) -> Self {
+        let decoder = qpack_decoder.clone();
+        let stream = stream.map_stream(move |guarded| {
+            guard::GuardedQuicReader::new(Box::pin(QPackMessageStreamReader::new(
+                stream_id,
+                guarded.into_inner(),
+                decoder,
+            )))
+        });
         let frame_stream = FrameStream::new(stream);
         Self {
             stream: frame_stream,
@@ -576,9 +586,14 @@ impl<C: quic::Connection> ConnectionState<C> {
     ) -> Result<(ReadStream, WriteStream), InitialMessageStreamError> {
         let state = self.erase();
         let qpack = self.qpack()?;
-        let (reader, writer) = self.initial_raw_message_stream().await?;
+        let (mut reader, writer) = self.initial_raw_message_stream().await?;
+        let stream_id = reader.stream_id().await.map_err(|source| {
+            InitialMessageStreamError::InitialRawStream {
+                source: InitialRawMessageStreamError::ResponseStream { source },
+            }
+        })?;
         Ok((
-            ReadStream::new(reader, qpack.decoder.clone(), state.clone()),
+            ReadStream::new(stream_id, reader, qpack.decoder.clone(), state.clone()),
             WriteStream::new(writer, qpack.encoder.clone(), state),
         ))
     }
@@ -588,9 +603,14 @@ impl<C: quic::Connection> ConnectionState<C> {
     ) -> Result<(ReadStream, WriteStream), AcceptMessageStreamError> {
         let state = self.erase();
         let qpack = self.qpack()?;
-        let (reader, writer) = self.accept_raw_message_stream().await?;
+        let (mut reader, writer) = self.accept_raw_message_stream().await?;
+        let stream_id = reader.stream_id().await.map_err(|source| {
+            AcceptMessageStreamError::AcceptRawStream {
+                source: AcceptRawMessageStreamError::RequestStream { source },
+            }
+        })?;
         Ok((
-            ReadStream::new(reader, qpack.decoder.clone(), state.clone()),
+            ReadStream::new(stream_id, reader, qpack.decoder.clone(), state.clone()),
             WriteStream::new(writer, qpack.encoder.clone(), state),
         ))
     }
@@ -1040,6 +1060,7 @@ mod tests {
         writer.close().await.expect("close test stream writer");
 
         ReadStream::new(
+            VarInt::from_u32(stream_id),
             StreamReader::new(guard::GuardedQuicReader::new(
                 Box::pin(reader) as crate::codec::BoxReadStream
             )),
@@ -1055,6 +1076,7 @@ mod tests {
     fn paired_message_streams(stream_id: u32) -> (ReadStream, WriteStream) {
         let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
         let read_stream = ReadStream::new(
+            VarInt::from_u32(stream_id),
             StreamReader::new(guard::GuardedQuicReader::new(
                 Box::pin(reader) as crate::codec::BoxReadStream
             )),
@@ -1093,6 +1115,7 @@ mod tests {
         })
             as crate::codec::BoxReadStream));
         let mut read_stream = ReadStream::new(
+            VarInt::from_u32(10),
             reader,
             Arc::new(QPackDecoder::new(
                 Arc::new(Settings::default()),
@@ -1282,6 +1305,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_stream_stop_emits_qpack_stream_cancellation() {
+        let stream_id = VarInt::from_u32(24);
+        let stop_code = VarInt::from_u32(25);
+        let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
+        let decoder = Arc::new(QPackDecoder::new(
+            Arc::new(Settings::default()),
+            qpack_decoder_sink(),
+            qpack_decoder_stream(),
+        ));
+        let (reader, _writer) = quic::test::mock_stream_pair(stream_id);
+        let mut stream = ReadStream::new(
+            stream_id,
+            StreamReader::new(guard::GuardedQuicReader::new(
+                Box::pin(reader) as crate::codec::BoxReadStream
+            )),
+            decoder.clone(),
+            state,
+        );
+
+        poll_fn(|cx| Pin::new(&mut stream).poll_stop(cx, stop_code))
+            .await
+            .expect("read stream stop should complete");
+
+        assert_eq!(
+            decoder
+                .state
+                .lock()
+                .expect("lock is not poisoned")
+                .pending_instructions
+                .back(),
+            Some(
+                &crate::qpack::decoder::DecoderInstruction::StreamCancellation {
+                    stream_id: stream_id.into_inner()
+                }
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn read_stream_peer_goaway_future_returns_connection_error_when_connection_closes() {
         let quic = Arc::new(MockConnection::new());
         let state = state_without_qpack(quic.clone()).erase();
@@ -1290,6 +1352,7 @@ mod tests {
         })
             as crate::codec::BoxReadStream));
         let mut stream = ReadStream::new(
+            VarInt::from_u32(2),
             reader,
             Arc::new(QPackDecoder::new(
                 Arc::new(Settings::default()),
@@ -1356,16 +1419,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_stream_try_stream_io_surfaces_stream_id_errors() {
+    async fn read_stream_try_stream_io_uses_constructor_stream_id() {
         let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
-        let reset_code = VarInt::from_u32(91);
         let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(
             StreamIdErrorReadStream {
-                error: quic::StreamError::Reset { code: reset_code },
+                error: quic::StreamError::Reset {
+                    code: VarInt::from_u32(91),
+                },
             },
         )
             as crate::codec::BoxReadStream));
         let mut stream = ReadStream::new(
+            VarInt::from_u32(91),
             reader,
             Arc::new(QPackDecoder::new(
                 Arc::new(Settings::default()),
@@ -1374,16 +1439,23 @@ mod tests {
             )),
             state,
         );
+        stream
+            .state
+            .dhttp()
+            .apply_peer_goaway(Goaway::new(VarInt::from_u32(90)))
+            .expect("peer goaway should be accepted");
 
         let result: Result<(), MessageStreamError> = stream
-            .try_stream_io(async |_this| panic!("closure should not run when stream id fails"))
+            .try_stream_io(async |_this| {
+                futures::future::pending::<Result<(), crate::connection::StreamError>>().await
+            })
             .await;
 
         assert!(matches!(
             result,
-            Err(MessageStreamError::Quic {
-                source: quic::StreamError::Reset { code }
-            }) if code == reset_code
+            Err(MessageStreamError::Goaway {
+                source: crate::connection::ConnectionGoaway::Peer
+            })
         ));
     }
 
@@ -1570,6 +1642,7 @@ mod tests {
         })
             as crate::codec::BoxReadStream));
         let mut read_stream = ReadStream::new(
+            VarInt::from_u32(26),
             reader,
             Arc::new(QPackDecoder::new(
                 Arc::new(Settings::default()),
@@ -1844,6 +1917,7 @@ mod tests {
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
         let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
         let mut reader = ReadStream::new(
+            VarInt::from_u32(19),
             StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(19),
                 stop_tx,
@@ -1911,6 +1985,7 @@ mod tests {
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
         let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
         let mut reader = ReadStream::new(
+            VarInt::from_u32(21),
             StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(21),
                 stop_tx,
@@ -1974,6 +2049,7 @@ mod tests {
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
         let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
         let mut reader = ReadStream::new(
+            VarInt::from_u32(30),
             StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(30),
                 stop_tx,
@@ -2072,6 +2148,7 @@ mod tests {
         let state = state_without_qpack(quic).erase();
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
         let mut stream = ReadStream::new(
+            VarInt::from_u32(14),
             StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(14),
                 stop_tx,

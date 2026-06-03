@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     pin::{Pin, pin},
     sync::{Arc, Mutex as SyncMutex},
-    task::{Context, Poll, ready},
+    task::{Context, Poll},
 };
 
 use bytes::Bytes;
@@ -500,60 +500,75 @@ where
 
 pin_project_lite::pin_project! {
     /// A read stream wrapper that emits stream cancellation instruction when reset is received or stop sending is called.
-    pub struct MessageStreamReader<S: ReadStream, Ds, Es> {
-        decoder: Arc<Decoder<Ds, Es>>,
+    pub struct MessageStreamReader<S: ReadStream, D> {
+        stream_id: VarInt,
+        stream_cancellation_emitted: bool,
+        decoder: Arc<D>,
         #[pin]
         stream: S,
     }
 
 }
 
-impl<S: ReadStream + Unpin, Ds, Es> MessageStreamReader<S, Ds, Es> {
-    pub fn new(stream: S, decoder: Arc<Decoder<Ds, Es>>) -> Self {
-        Self { stream, decoder }
+impl<S: ReadStream, D> MessageStreamReader<S, D> {
+    pub fn new(stream_id: VarInt, stream: S, decoder: Arc<D>) -> Self {
+        Self {
+            stream_id,
+            stream_cancellation_emitted: false,
+            stream,
+            decoder,
+        }
     }
 }
 
-impl<S: ReadStream, Ds, Es> StopStream for MessageStreamReader<S, Ds, Es> {
+impl<S: ReadStream, Ds, Es> StopStream for MessageStreamReader<S, Decoder<Ds, Es>> {
     fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        let mut project = self.project();
-        let stream_id = ready!(project.stream.as_mut().poll_stream_id(cx))?.into_inner();
-        ready!(project.stream.poll_stop(cx, code))?;
-        project
-            .decoder
-            .emit(DecoderInstruction::StreamCancellation { stream_id });
-        Poll::Ready(Ok(()))
+        let project = self.project();
+        let poll = project.stream.poll_stop(cx, code);
+        if !*project.stream_cancellation_emitted {
+            project
+                .decoder
+                .emit(DecoderInstruction::StreamCancellation {
+                    stream_id: project.stream_id.into_inner(),
+                });
+            *project.stream_cancellation_emitted = true;
+        }
+        poll
     }
 }
 
-impl<S: ReadStream, Ds, Es> GetStreamId for MessageStreamReader<S, Ds, Es> {
+impl<S: ReadStream, D> GetStreamId for MessageStreamReader<S, D> {
     fn poll_stream_id(
         self: Pin<&mut Self>,
-        cx: &mut Context,
+        _cx: &mut Context,
     ) -> Poll<Result<VarInt, quic::StreamError>> {
-        self.project().stream.poll_stream_id(cx)
+        Poll::Ready(Ok(*self.project().stream_id))
     }
 }
 
-impl<S: ReadStream, Ds, Es> Stream for MessageStreamReader<S, Ds, Es> {
+impl<S: ReadStream, Ds, Es> Stream for MessageStreamReader<S, Decoder<Ds, Es>> {
     type Item = S::Item;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut project = self.project();
-        let stream_id = ready!(project.stream.as_mut().poll_stream_id(cx))?.into_inner();
-        match project.stream.poll_next(cx) {
-            poll @ Poll::Ready(Some(Err(quic::StreamError::Reset { .. }))) => {
-                project
-                    .decoder
-                    .emit(DecoderInstruction::StreamCancellation { stream_id });
-                poll
-            }
-            poll => poll,
+        let project = self.project();
+        let poll = project.stream.poll_next(cx);
+        if matches!(
+            poll,
+            Poll::Ready(Some(Err(quic::StreamError::Reset { .. })))
+        ) && !*project.stream_cancellation_emitted
+        {
+            project
+                .decoder
+                .emit(DecoderInstruction::StreamCancellation {
+                    stream_id: project.stream_id.into_inner(),
+                });
+            *project.stream_cancellation_emitted = true;
         }
+        poll
     }
 }
 
@@ -861,6 +876,72 @@ mod tests {
 
         fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             Poll::Ready(self.items.pop_front())
+        }
+    }
+
+    struct PendingStopReadStream {
+        stop_codes: Arc<Mutex<Vec<VarInt>>>,
+    }
+
+    struct ResetWithoutStreamIdReadStream {
+        items: VecDeque<Result<Bytes, quic::StreamError>>,
+    }
+
+    impl futures::Stream for PendingStopReadStream {
+        type Item = Result<Bytes, quic::StreamError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl futures::Stream for ResetWithoutStreamIdReadStream {
+        type Item = Result<Bytes, quic::StreamError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.items.pop_front())
+        }
+    }
+
+    impl GetStreamId for PendingStopReadStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            panic!("message stream reader stop should use constructor stream id")
+        }
+    }
+
+    impl GetStreamId for ResetWithoutStreamIdReadStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            panic!("message stream reader reset should use constructor stream id")
+        }
+    }
+
+    impl StopStream for PendingStopReadStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            self.stop_codes
+                .lock()
+                .expect("lock is not poisoned")
+                .push(code);
+            Poll::Pending
+        }
+    }
+
+    impl StopStream for ResetWithoutStreamIdReadStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            _code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -1463,6 +1544,7 @@ mod tests {
         let decoder = Arc::new(decoder);
         let stop_codes = Arc::new(Mutex::new(Vec::new()));
         let mut stopped_reader = MessageStreamReader::new(
+            VarInt::from_u32(41),
             TestReadStream {
                 stream_id: VarInt::from_u32(41),
                 stop_codes: stop_codes.clone(),
@@ -1491,6 +1573,7 @@ mod tests {
         );
 
         let mut reset_reader = MessageStreamReader::new(
+            VarInt::from_u32(43),
             TestReadStream {
                 stream_id: VarInt::from_u32(43),
                 stop_codes,
@@ -1517,6 +1600,112 @@ mod tests {
                 .pending_instructions
                 .back(),
             Some(&DecoderInstruction::StreamCancellation { stream_id: 43 })
+        );
+    }
+
+    #[test]
+    fn message_stream_reader_pending_stop_emits_stream_cancellation_once() {
+        let (decoder, _) = test_decoder(test_settings(128), Vec::new());
+        let decoder = Arc::new(decoder);
+        let stop_codes = Arc::new(Mutex::new(Vec::new()));
+        let mut reader = Box::pin(MessageStreamReader::new(
+            VarInt::from_u32(45),
+            PendingStopReadStream {
+                stop_codes: stop_codes.clone(),
+            },
+            decoder.clone(),
+        ));
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(
+            reader.as_mut().poll_stop(&mut cx, VarInt::from_u32(7)),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            reader.as_mut().poll_stop(&mut cx, VarInt::from_u32(7)),
+            Poll::Pending
+        ));
+
+        assert_eq!(
+            stop_codes.lock().expect("lock is not poisoned").as_slice(),
+            &[VarInt::from_u32(7), VarInt::from_u32(7)]
+        );
+        let state = decoder.state.lock().expect("lock is not poisoned");
+        assert_eq!(state.pending_instructions.len(), 1);
+        assert_eq!(
+            state.pending_instructions.back(),
+            Some(&DecoderInstruction::StreamCancellation { stream_id: 45 })
+        );
+    }
+
+    #[tokio::test]
+    async fn message_stream_reader_does_not_emit_duplicate_cancellation_after_stop() {
+        let (decoder, _) = test_decoder(test_settings(128), Vec::new());
+        let decoder = Arc::new(decoder);
+        let stop_codes = Arc::new(Mutex::new(Vec::new()));
+        let mut reader = MessageStreamReader::new(
+            VarInt::from_u32(46),
+            TestReadStream {
+                stream_id: VarInt::from_u32(46),
+                stop_codes,
+                items: VecDeque::from([Err(quic::StreamError::Reset {
+                    code: VarInt::from_u32(11),
+                })]),
+            },
+            decoder.clone(),
+        );
+
+        reader
+            .stop(VarInt::from_u32(7))
+            .await
+            .expect("stop should be forwarded");
+        decoder.emit(DecoderInstruction::InsertCountIncrement { increment: 1 });
+
+        let item = reader.next().await.expect("reset item should be yielded");
+        assert!(matches!(
+            item,
+            Err(quic::StreamError::Reset { code }) if code == VarInt::from_u32(11)
+        ));
+
+        let state = decoder.state.lock().expect("lock is not poisoned");
+        assert_eq!(
+            state.pending_instructions.iter().collect::<Vec<_>>(),
+            vec![
+                &DecoderInstruction::StreamCancellation { stream_id: 46 },
+                &DecoderInstruction::InsertCountIncrement { increment: 1 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn message_stream_reader_reset_uses_constructor_stream_id() {
+        let (decoder, _) = test_decoder(test_settings(128), Vec::new());
+        let decoder = Arc::new(decoder);
+        let mut reader = MessageStreamReader::new(
+            VarInt::from_u32(47),
+            ResetWithoutStreamIdReadStream {
+                items: VecDeque::from([Err(quic::StreamError::Reset {
+                    code: VarInt::from_u32(11),
+                })]),
+            },
+            decoder.clone(),
+        );
+
+        let item = reader.next().await.expect("reset item should be yielded");
+        assert!(matches!(
+            item,
+            Err(quic::StreamError::Reset { code }) if code == VarInt::from_u32(11)
+        ));
+
+        assert_eq!(
+            decoder
+                .state
+                .lock()
+                .expect("lock is not poisoned")
+                .pending_instructions
+                .back(),
+            Some(&DecoderInstruction::StreamCancellation { stream_id: 47 })
         );
     }
 
