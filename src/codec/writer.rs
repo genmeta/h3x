@@ -181,7 +181,9 @@ impl<S: ResetStream + ?Sized> ResetStream for SinkWriter<S> {
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), StreamError>> {
-        self.project().sink.poll_reset(cx, code)
+        let project = self.project();
+        project.buffer.clear();
+        project.sink.poll_reset(cx, code)
     }
 }
 
@@ -473,6 +475,40 @@ mod tests {
             Pin::new(&mut writer).poll_stream_id(&mut cx),
             Poll::Ready(Ok(id)) if id == VarInt::from_u32(33)
         ));
+    }
+
+    #[tokio::test]
+    async fn reset_discards_buffered_committed_item() {
+        let mut writer = SinkWriter::new(RecordingSink::default());
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut writer).poll_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        Pin::new(&mut writer)
+            .start_send(Bytes::from_static(b"committed"))
+            .expect("start_send commits item into writer buffer");
+        assert!(
+            writer.sink().items.is_empty(),
+            "item should still be buffered before flush"
+        );
+
+        let reset_code = VarInt::from_u32(45);
+        assert!(matches!(
+            Pin::new(&mut writer).poll_reset(&mut cx, reset_code),
+            Poll::Ready(Ok(()))
+        ));
+        SinkExt::flush(&mut writer)
+            .await
+            .expect("flush after reset should not send cleared item");
+
+        assert_eq!(writer.sink().reset_codes, vec![reset_code]);
+        assert!(
+            writer.sink().items.is_empty(),
+            "reset should supersede buffered send-side work"
+        );
     }
 
     #[tokio::test]

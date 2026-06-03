@@ -274,7 +274,7 @@ where
 // ============================================================================
 
 pin_project_lite::pin_project! {
-    /// A lazily opened stream.
+    /// A lazy value adapter.
     ///
     /// Wraps a future that resolves to `Result<T, E>`.  While the future is
     /// pending, trait method calls drive it to completion; once resolved,
@@ -490,53 +490,6 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Deferred::poll(self, cx).map(|result| result.map(|t| t.clone()))
-    }
-}
-
-impl<S, E, F> quic::GetStreamId for Deferred<S, E, F>
-where
-    S: quic::GetStreamId,
-    E: Clone,
-    quic::StreamError: From<E>,
-    F: Future<Output = Result<S, E>>,
-{
-    fn poll_stream_id(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-    ) -> Poll<Result<VarInt, quic::StreamError>> {
-        ready!(self.poll(cx)?).poll_stream_id(cx)
-    }
-}
-
-impl<S, E, F> quic::StopStream for Deferred<S, E, F>
-where
-    S: quic::StopStream,
-    E: Clone,
-    quic::StreamError: From<E>,
-    F: Future<Output = Result<S, E>>,
-{
-    fn poll_stop(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        code: VarInt,
-    ) -> Poll<Result<(), quic::StreamError>> {
-        ready!(self.poll(cx)?).poll_stop(cx, code)
-    }
-}
-
-impl<S, E, F> quic::ResetStream for Deferred<S, E, F>
-where
-    S: quic::ResetStream,
-    E: Clone,
-    quic::StreamError: From<E>,
-    F: Future<Output = Result<S, E>>,
-{
-    fn poll_reset(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        code: VarInt,
-    ) -> Poll<Result<(), quic::StreamError>> {
-        ready!(self.poll(cx)?).poll_reset(cx, code)
     }
 }
 
@@ -1432,10 +1385,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_delegates_quic_stream_traits_and_stream_sink() {
+    async fn deferred_stream_wrappers_delegate_quic_stream_traits_and_stream_sink() {
         let (reader, writer) = quic::test::mock_stream_pair(varint(21));
-        let mut reader = Deferred::from(ready(Ok::<_, quic::StreamError>(reader)));
-        let mut writer = Deferred::from(ready(Ok::<_, quic::StreamError>(writer)));
+        let mut reader = DeferredStreamReader::from(ready(Ok::<_, quic::StreamError>(reader)));
+        let mut writer = DeferredStreamWriter::from(ready(Ok::<_, quic::StreamError>(writer)));
 
         assert_eq!(reader.stream_id().await.expect("reader id"), varint(21));
         assert_eq!(writer.stream_id().await.expect("writer id"), varint(21));
@@ -1593,34 +1546,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_error_maps_to_quic_stream_error_for_all_traits() {
-        let (reader, _writer) = quic::test::mock_stream_pair(varint(31));
-        let mut stream_id = deferred_quic_error(reader, 32);
-        assert_reset(
-            stream_id
-                .stream_id()
-                .await
-                .expect_err("stream id should fail"),
-            varint(32),
-        );
-
-        let (reader, _writer) = quic::test::mock_stream_pair(varint(33));
-        let mut stop = deferred_quic_error(reader, 34);
-        assert_reset(
-            stop.stop(varint(35)).await.expect_err("stop should fail"),
-            varint(34),
-        );
-
-        let (_reader, writer) = quic::test::mock_stream_pair(varint(36));
-        let mut reset = deferred_quic_error(writer, 37);
-        assert_reset(
-            reset
-                .reset(varint(38))
-                .await
-                .expect_err("reset should fail"),
-            varint(37),
-        );
-
+    async fn deferred_error_maps_to_stream_and_sink_errors() {
         let (reader, _writer) = quic::test::mock_stream_pair(varint(39));
         let mut stream = deferred_quic_error(reader, 40);
         let item = stream.next().await.expect("error item").expect_err("reset");
