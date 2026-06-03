@@ -320,7 +320,7 @@ mod tests {
     struct StreamState {
         written: Mutex<Vec<u8>>,
         stopped: Mutex<Vec<VarInt>>,
-        cancelled: Mutex<Vec<VarInt>>,
+        resets: Mutex<Vec<VarInt>>,
         flushes: Mutex<usize>,
     }
 
@@ -329,11 +329,8 @@ mod tests {
             self.written.lock().expect("written lock poisoned").clone()
         }
 
-        fn cancelled_codes(&self) -> Vec<VarInt> {
-            self.cancelled
-                .lock()
-                .expect("cancelled lock poisoned")
-                .clone()
+        fn reset_codes(&self) -> Vec<VarInt> {
+            self.resets.lock().expect("resets lock poisoned").clone()
         }
 
         fn stopped_codes(&self) -> Vec<VarInt> {
@@ -496,8 +493,8 @@ mod tests {
         }
     }
 
-    impl quic::CancelStream for HeaderFailWriteStream {
-        fn poll_cancel(
+    impl quic::ResetStream for HeaderFailWriteStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             _code: VarInt,
@@ -515,16 +512,16 @@ mod tests {
         }
     }
 
-    impl quic::CancelStream for TestWriteStream {
-        fn poll_cancel(
+    impl quic::ResetStream for TestWriteStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             code: VarInt,
         ) -> Poll<Result<(), quic::StreamError>> {
             self.state
-                .cancelled
+                .resets
                 .lock()
-                .expect("cancelled lock poisoned")
+                .expect("resets lock poisoned")
                 .push(code);
             Poll::Ready(Ok(()))
         }
@@ -734,7 +731,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_helpers_expose_ids_and_shutdown_codes() {
-        use crate::quic::{CancelStreamExt, GetStreamIdExt, StopStreamExt};
+        use crate::quic::{GetStreamIdExt, ResetStreamExt, StopStreamExt};
 
         let state = Arc::new(StreamState::default());
         let mut reader = TestReadStream {
@@ -760,13 +757,13 @@ mod tests {
             .await
             .expect("stop reader");
         writer
-            .cancel(VarInt::from_u32(0x32))
+            .reset(VarInt::from_u32(0x32))
             .await
-            .expect("cancel writer");
+            .expect("reset writer");
         writer.close().await.expect("close writer");
 
         assert_eq!(state.stopped_codes(), vec![VarInt::from_u32(0x31)]);
-        assert_eq!(state.cancelled_codes(), vec![VarInt::from_u32(0x32)]);
+        assert_eq!(state.reset_codes(), vec![VarInt::from_u32(0x32)]);
     }
 
     #[tokio::test]
@@ -835,7 +832,7 @@ mod tests {
 
     #[tokio::test]
     async fn header_fail_connection_nonfailing_mode_exercises_remaining_traits() {
-        use crate::quic::{CancelStreamExt, GetStreamIdExt};
+        use crate::quic::{GetStreamIdExt, ResetStreamExt};
 
         let state = Arc::new(StreamState::default());
         let conn = HeaderFailConnection {
@@ -890,9 +887,9 @@ mod tests {
             .expect("write payload");
         writer.flush().await.expect("flush writer");
         writer
-            .cancel(VarInt::from_u32(0x44))
+            .reset(VarInt::from_u32(0x44))
             .await
-            .expect("cancel writer");
+            .expect("reset writer");
         writer.close().await.expect("close writer");
         assert_eq!(state.written(), vec![0xaa]);
     }
@@ -1056,11 +1053,11 @@ mod tests {
     }
 
     async fn read_stream_with_reset(stream_id: u32, code: VarInt) -> ReadStream {
-        use crate::quic::CancelStreamExt;
+        use crate::quic::ResetStreamExt;
 
         let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
         writer
-            .cancel(code)
+            .reset(code)
             .await
             .expect("send reset to test stream reader");
         drop(writer);
@@ -1204,7 +1201,7 @@ mod tests {
 
         assert_eq!(stream_state.written(), vec![0x40, 0x41, 0x04, 0xaa, 0xbb]);
         assert!(stream_state.flushes() >= 1);
-        assert!(stream_state.cancelled_codes().is_empty());
+        assert!(stream_state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -1241,7 +1238,7 @@ mod tests {
 
         assert_eq!(stream_state.written(), vec![0x40, 0x54, 0x04, 0xcc]);
         assert!(stream_state.flushes() >= 1);
-        assert!(stream_state.cancelled_codes().is_empty());
+        assert!(stream_state.reset_codes().is_empty());
     }
 
     #[tokio::test]

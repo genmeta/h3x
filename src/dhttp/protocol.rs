@@ -40,7 +40,7 @@ use crate::{
     },
     message::stream::guard,
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
-    quic::{self, CancelStreamExt, ConnectionError, GetStreamIdExt, StopStreamExt},
+    quic::{self, ConnectionError, GetStreamIdExt, ResetStreamExt, StopStreamExt},
     util::{ring_channel::RingChannel, set_once::SetOnce, watch::Watch},
     varint::VarInt,
 };
@@ -91,7 +91,7 @@ mod tests {
         dhttp::settings::Settings,
         extended_connect::settings::EnableConnectProtocol,
         protocol::Protocols,
-        quic::{self, CancelStream, GetStreamId, GetStreamIdExt},
+        quic::{self, GetStreamId, GetStreamIdExt, ResetStream},
     };
 
     #[derive(Debug)]
@@ -140,8 +140,8 @@ mod tests {
         }
     }
 
-    impl quic::CancelStream for TestWriteStream {
-        fn poll_cancel(
+    impl quic::ResetStream for TestWriteStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context,
             _code: VarInt,
@@ -323,9 +323,9 @@ mod tests {
                 .expect("stream id"),
             stream_id
         );
-        futures::future::poll_fn(|cx| Pin::new(&mut writer).poll_cancel(cx, VarInt::from_u32(1)))
+        futures::future::poll_fn(|cx| Pin::new(&mut writer).poll_reset(cx, VarInt::from_u32(1)))
             .await
-            .expect("cancel succeeds");
+            .expect("reset succeeds");
         writer
             .send(Bytes::from_static(b"payload"))
             .await
@@ -1491,7 +1491,7 @@ impl DHttpProtocol {
             if let Some(mut unresolved) = self.unresolved_request_streams.send(item) {
                 // Ring channel is full — reject the oldest unresolved request.
                 let code = Code::H3_REQUEST_REJECTED.into_inner();
-                _ = tokio::join!(unresolved.0.stop(code), unresolved.1.cancel(code));
+                _ = tokio::join!(unresolved.0.stop(code), unresolved.1.reset(code));
             }
             Ok(StreamVerdict::Accepted)
         } else {
@@ -1738,7 +1738,7 @@ impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync> ConnectionState<C> {
             Ok(()) => Ok((reader, writer)),
             Err(ConnectionGoaway::Local) => {
                 let code = Code::H3_REQUEST_REJECTED.into_inner();
-                _ = tokio::join!(reader.stop(code), writer.cancel(code));
+                _ = tokio::join!(reader.stop(code), writer.reset(code));
                 Err(ConnectionGoaway::Local.into())
             }
             Err(ConnectionGoaway::Peer) => {

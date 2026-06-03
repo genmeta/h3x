@@ -1,5 +1,5 @@
 //! Generic bridge state machines for converting remoc RTC clients back into
-//! poll-based streams (`Stream`, `Sink`, `GetStreamId`, `StopStream`, `CancelStream`).
+//! poll-based streams (`Stream`, `Sink`, `GetStreamId`, `StopStream`, `ResetStream`).
 //!
 //! Both QUIC-level and message-level stream clients share the same state machine
 //! logic; only the client type and data error type differ. This module provides
@@ -220,7 +220,7 @@ pin_project_lite::pin_project! {
             token: CancellationToken,
             #[pin] future: SF,
         },
-        Cancel {
+        Reset {
             code: VarInt,
             #[pin] future: CF,
         },
@@ -239,14 +239,14 @@ impl<St, WF, FF, SF, CF> WriteState<St, WF, FF, SF, CF> {
 
 pin_project_lite::pin_project! {
     /// Generic write bridge: converts an RTC client into a poll-based
-    /// `Sink<Bytes> + CancelStream + GetStreamId`.
+    /// `Sink<Bytes> + ResetStream + GetStreamId`.
     ///
     /// - `St`: client type
     /// - `E`: data error type (`Sink::Error`)
     /// - `W / WF`: write closure / future
     /// - `F / FF`: flush closure / future
     /// - `S / SF`: shutdown closure / future
-    /// - `C / CF`: cancel closure / future
+    /// - `C / CF`: reset closure / future
     pub(super) struct WriteBridge<St, E, W, WF, F, FF, S, SF, C, CF> {
         stream_id: VarInt,
         #[pin]
@@ -255,7 +255,7 @@ pin_project_lite::pin_project! {
         write: W,
         flush: F,
         shutdown: S,
-        cancel: C,
+        reset: C,
 
         _error: std::marker::PhantomData<fn() -> E>,
     }
@@ -269,7 +269,7 @@ impl<St, E, W, WF, F, FF, S, SF, C, CF> WriteBridge<St, E, W, WF, F, FF, S, SF, 
         write: W,
         flush: F,
         shutdown: S,
-        cancel: C,
+        reset: C,
     ) -> Self {
         Self {
             stream_id,
@@ -277,7 +277,7 @@ impl<St, E, W, WF, F, FF, S, SF, C, CF> WriteBridge<St, E, W, WF, F, FF, S, SF, 
             write,
             flush,
             shutdown,
-            cancel,
+            reset,
             _error: std::marker::PhantomData,
         }
     }
@@ -349,7 +349,7 @@ where
                         }
                     };
                 }
-                WriteStateProj::Cancel { future, .. } => {
+                WriteStateProj::Reset { future, .. } => {
                     let (stream, result) = ready!(future.poll(cx));
                     state.set(WriteState::Stream { stream });
                     result?;
@@ -415,7 +415,7 @@ where
     }
 }
 
-impl<St, E, W, WF, F, FF, S, SF, C, CF> quic::CancelStream
+impl<St, E, W, WF, F, FF, S, SF, C, CF> quic::ResetStream
     for WriteBridge<St, E, W, WF, F, FF, S, SF, C, CF>
 where
     E: From<quic::StreamError>,
@@ -428,7 +428,7 @@ where
     C: Fn(St, VarInt) -> CF,
     CF: Future<Output = (St, Result<(), quic::StreamError>)>,
 {
-    fn poll_cancel(
+    fn poll_reset(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
@@ -457,7 +457,7 @@ where
                         ready!(future.poll(cx));
                     stream
                 }
-                WriteStateProj::Cancel { future, code: sent } => {
+                WriteStateProj::Reset { future, code: sent } => {
                     let (stream, result) = ready!(future.poll(cx));
                     if *sent == code {
                         state.set(WriteState::Stream { stream });
@@ -466,11 +466,11 @@ where
                         stream
                     }
                 }
-                WriteStateProj::Empty => unreachable!("invalid state for poll_cancel"),
+                WriteStateProj::Empty => unreachable!("invalid state for poll_reset"),
             };
-            state.set(WriteState::Cancel {
+            state.set(WriteState::Reset {
                 code,
-                future: (project.cancel)(stream, code),
+                future: (project.reset)(stream, code),
             })
         }
     }
@@ -486,7 +486,7 @@ mod tests {
     use futures::{FutureExt, SinkExt, StreamExt, future::poll_fn};
 
     use super::*;
-    use crate::quic::{CancelStream, CancelStreamExt, GetStreamIdExt, StopStream, StopStreamExt};
+    use crate::quic::{GetStreamIdExt, ResetStream, ResetStreamExt, StopStream, StopStreamExt};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Event {
@@ -502,7 +502,7 @@ mod tests {
         Shutdown,
         ShutdownStarted,
         ShutdownCancelled,
-        Cancel(u64),
+        Reset(u64),
     }
 
     #[derive(Debug)]
@@ -661,7 +661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_bridge_writes_flushes_shutdown_and_cancels() {
+    async fn write_bridge_writes_flushes_shutdown_and_resets() {
         let stream_id = VarInt::from_u32(13);
         let client = TestWriteClient::new();
         let events_handle = client.events.clone();
@@ -682,7 +682,7 @@ mod tests {
                     Either::Left((client, Ok(())))
                 },
                 |client: TestWriteClient, code: VarInt| async move {
-                    client.record(Event::Cancel(code.into_inner()));
+                    client.record(Event::Reset(code.into_inner()));
                     (client, Ok(()))
                 },
             ),
@@ -695,7 +695,7 @@ mod tests {
             .expect("write");
         bridge.flush().await.expect("flush");
         bridge.close().await.expect("shutdown");
-        bridge.cancel(VarInt::from_u32(17)).await.expect("cancel");
+        bridge.reset(VarInt::from_u32(17)).await.expect("reset");
 
         assert_eq!(
             events(events_handle.as_ref()),
@@ -703,13 +703,13 @@ mod tests {
                 Event::Write(Bytes::from_static(b"payload")),
                 Event::Flush,
                 Event::Shutdown,
-                Event::Cancel(17),
+                Event::Reset(17),
             ],
         );
     }
 
     #[tokio::test]
-    async fn write_bridge_cancel_cancels_pending_write() {
+    async fn write_bridge_reset_interrupts_pending_write() {
         let stream_id = VarInt::from_u32(19);
         let client = TestWriteClient::new();
         let events_handle = client.events.clone();
@@ -732,7 +732,7 @@ mod tests {
                     Either::Left((client, Ok(())))
                 },
                 |client: TestWriteClient, code: VarInt| async move {
-                    client.record(Event::Cancel(code.into_inner()));
+                    client.record(Event::Reset(code.into_inner()));
                     (client, Ok(()))
                 },
             ),
@@ -747,16 +747,16 @@ mod tests {
             .expect("start send");
 
         bridge
-            .cancel(VarInt::from_u32(23))
+            .reset(VarInt::from_u32(23))
             .await
-            .expect("cancel pending write");
+            .expect("reset pending write");
 
         assert_eq!(
             events(events_handle.as_ref()),
             vec![
                 Event::WriteStarted(Bytes::from_static(b"pending")),
                 Event::WriteCancelled,
-                Event::Cancel(23),
+                Event::Reset(23),
             ],
         );
     }
@@ -766,7 +766,7 @@ mod tests {
         let write_code = VarInt::from_u32(41);
         let flush_code = VarInt::from_u32(42);
         let shutdown_code = VarInt::from_u32(43);
-        let cancel_code = VarInt::from_u32(44);
+        let reset_code = VarInt::from_u32(44);
         let mut bridge = Box::pin(
             WriteBridge::<_, quic::StreamError, _, _, _, _, _, _, _, _>::new(
                 VarInt::from_u32(25),
@@ -786,7 +786,7 @@ mod tests {
                     ))
                 },
                 move |client: TestWriteClient, _code: VarInt| async move {
-                    (client, Err(quic::StreamError::Reset { code: cancel_code }))
+                    (client, Err(quic::StreamError::Reset { code: reset_code }))
                 },
             ),
         );
@@ -804,13 +804,13 @@ mod tests {
             Err(quic::StreamError::Reset { code }) if code == shutdown_code
         ));
         assert!(matches!(
-            bridge.cancel(VarInt::from_u32(55)).await,
-            Err(quic::StreamError::Reset { code }) if code == cancel_code
+            bridge.reset(VarInt::from_u32(55)).await,
+            Err(quic::StreamError::Reset { code }) if code == reset_code
         ));
     }
 
     #[tokio::test]
-    async fn write_bridge_cancel_cancels_pending_flush_and_shutdown() {
+    async fn write_bridge_reset_interrupts_pending_flush_and_shutdown() {
         let flush_client = TestWriteClient::new();
         let flush_events = flush_client.events.clone();
         let mut flush_bridge = Box::pin(
@@ -830,7 +830,7 @@ mod tests {
                     Either::Left((client, Ok(())))
                 },
                 |client: TestWriteClient, code: VarInt| async move {
-                    client.record(Event::Cancel(code.into_inner()));
+                    client.record(Event::Reset(code.into_inner()));
                     (client, Ok(()))
                 },
             ),
@@ -843,16 +843,12 @@ mod tests {
             "flush should remain pending until cancellation"
         );
         flush_bridge
-            .cancel(VarInt::from_u32(57))
+            .reset(VarInt::from_u32(57))
             .await
-            .expect("cancel pending flush");
+            .expect("reset pending flush");
         assert_eq!(
             events(flush_events.as_ref()),
-            vec![
-                Event::FlushStarted,
-                Event::FlushCancelled,
-                Event::Cancel(57),
-            ],
+            vec![Event::FlushStarted, Event::FlushCancelled, Event::Reset(57),],
         );
 
         let shutdown_client = TestWriteClient::new();
@@ -875,7 +871,7 @@ mod tests {
                         Either::Right(client)
                     },
                     |client: TestWriteClient, code: VarInt| async move {
-                        client.record(Event::Cancel(code.into_inner()));
+                        client.record(Event::Reset(code.into_inner()));
                         (client, Ok(()))
                     },
                 ),
@@ -888,15 +884,15 @@ mod tests {
             "shutdown should remain pending until cancellation"
         );
         shutdown_bridge
-            .cancel(VarInt::from_u32(59))
+            .reset(VarInt::from_u32(59))
             .await
-            .expect("cancel pending shutdown");
+            .expect("reset pending shutdown");
         assert_eq!(
             events(shutdown_events.as_ref()),
             vec![
                 Event::ShutdownStarted,
                 Event::ShutdownCancelled,
-                Event::Cancel(59),
+                Event::Reset(59),
             ],
         );
     }
@@ -1082,11 +1078,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_bridge_poll_ready_drains_pending_cancel_future() {
-        // Drive poll_ready through the `Cancel` arm (lines 352-355): if a
-        // cancel future is in flight, poll_ready must drain it.
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-        let cancel_rx = Arc::new(Mutex::new(Some(cancel_rx)));
+    async fn write_bridge_poll_ready_drains_pending_reset_future() {
+        // Drive poll_ready through the `Reset` arm (lines 352-355): if a
+        // reset future is in flight, poll_ready must drain it.
+        let (reset_tx, reset_rx) = tokio::sync::oneshot::channel::<()>();
+        let reset_rx = Arc::new(Mutex::new(Some(reset_rx)));
         let mut bridge = Box::pin(
             WriteBridge::<_, quic::StreamError, _, _, _, _, _, _, _, _>::new(
                 VarInt::from_u32(204),
@@ -1101,9 +1097,9 @@ mod tests {
                     Either::Left((client, Ok(())))
                 },
                 move |client: TestWriteClient, _code: VarInt| {
-                    let cancel_rx = cancel_rx.clone();
+                    let reset_rx = reset_rx.clone();
                     async move {
-                        if let Some(rx) = take_locked(&cancel_rx) {
+                        if let Some(rx) = take_locked(&reset_rx) {
                             let _ = rx.await;
                         }
                         (client, Ok(()))
@@ -1112,33 +1108,33 @@ mod tests {
             ),
         );
 
-        // Drive bridge into Cancel state with a pending cancel future.
+        // Drive bridge into Reset state with a pending reset future.
         assert!(
-            poll_fn(|cx| bridge.as_mut().poll_cancel(cx, VarInt::from_u32(31)))
+            poll_fn(|cx| bridge.as_mut().poll_reset(cx, VarInt::from_u32(31)))
                 .now_or_never()
                 .is_none(),
-            "cancel should be pending until released"
+            "reset should be pending until released"
         );
 
-        // poll_ready now sees Cancel state and must drain it (lines 352-355).
+        // poll_ready now sees Reset state and must drain it (lines 352-355).
         assert!(
             poll_fn(|cx| bridge.as_mut().poll_ready(cx))
                 .now_or_never()
                 .is_none(),
-            "poll_ready observes pending Cancel"
+            "poll_ready observes pending Reset"
         );
 
-        // Release the cancel; the drained Cancel result loops to Stream, then
+        // Release the reset; the drained Reset result loops to Stream, then
         // poll_ready returns Ready.
-        cancel_tx.send(()).expect("release cancel");
+        reset_tx.send(()).expect("release reset");
         poll_fn(|cx| bridge.as_mut().poll_ready(cx))
             .await
-            .expect("poll_ready completes once cancel drains");
+            .expect("poll_ready completes once reset drains");
     }
 
     #[tokio::test]
-    async fn write_bridge_poll_cancel_propagates_completed_operation() {
-        // Drive poll_cancel through the in-flight Write/Flush/Shutdown
+    async fn write_bridge_poll_reset_propagates_completed_operation() {
+        // Drive poll_reset through the in-flight Write/Flush/Shutdown
         // `Either::Left` patterns (lines 444 / 450 / 456 Left): the in-flight
         // operation completes with a result before being cancelled.
         for operation in ["write", "flush", "shutdown"] {
@@ -1237,20 +1233,20 @@ mod tests {
             }
 
             // Release the operation so its future resolves to Left when
-            // poll_cancel polls it.
+            // poll_reset polls it.
             op_tx.send(()).expect("release op");
 
             bridge
-                .cancel(VarInt::from_u32(41))
+                .reset(VarInt::from_u32(41))
                 .await
-                .expect("cancel after completed op");
+                .expect("reset after completed op");
         }
     }
 
     #[tokio::test]
-    async fn write_bridge_poll_cancel_replaces_future_when_code_differs() {
-        // Drive poll_cancel through the `Cancel` arm where the in-flight
-        // cancel's code differs from the new code (lines 466-469).
+    async fn write_bridge_poll_reset_replaces_future_when_code_differs() {
+        // Drive poll_reset through the `Reset` arm where the in-flight
+        // reset's code differs from the new code (lines 466-469).
         let calls = Arc::new(Mutex::new(Vec::<u64>::new()));
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
         let gate_rx = Arc::new(Mutex::new(Some(gate_rx)));
@@ -1282,26 +1278,26 @@ mod tests {
             ),
         );
 
-        // First cancel: pending because gate is closed.
+        // First reset: pending because gate is closed.
         assert!(
-            poll_fn(|cx| bridge.as_mut().poll_cancel(cx, VarInt::from_u32(51)))
+            poll_fn(|cx| bridge.as_mut().poll_reset(cx, VarInt::from_u32(51)))
                 .now_or_never()
                 .is_none(),
-            "first cancel pending"
+            "first reset pending"
         );
-        // Second cancel with a different code: poll once to consume the
-        // in-flight cancel, then a new one with code 52 must be issued.
+        // Second reset with a different code: poll once to consume the
+        // in-flight reset, then a new one with code 52 must be issued.
         let pending =
-            poll_fn(|cx| bridge.as_mut().poll_cancel(cx, VarInt::from_u32(52))).now_or_never();
-        assert!(pending.is_none(), "second cancel polled while gate closed");
+            poll_fn(|cx| bridge.as_mut().poll_reset(cx, VarInt::from_u32(52))).now_or_never();
+        assert!(pending.is_none(), "second reset polled while gate closed");
         gate_tx.send(()).expect("release gate");
         bridge
-            .cancel(VarInt::from_u32(52))
+            .reset(VarInt::from_u32(52))
             .await
-            .expect("cancel completes with new code");
+            .expect("reset completes with new code");
 
         let recorded = calls.lock().expect("calls").clone();
         assert_eq!(recorded.first().copied(), Some(51));
-        assert!(recorded.contains(&52), "second cancel must be issued");
+        assert!(recorded.contains(&52), "second reset must be issued");
     }
 }

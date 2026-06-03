@@ -29,7 +29,7 @@ use crate::{
         field::{FieldLine, FieldSection},
         protocol::{QPackDecoder, QPackEncoder, QPackProtocolDisabled},
     },
-    quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
+    quic::{self, GetStreamIdExt, ResetStreamExt, StopStreamExt},
     varint::{self, VarInt},
 };
 
@@ -442,8 +442,8 @@ impl WriteStream {
             .await
     }
 
-    pub async fn cancel(&mut self, code: Code) -> Result<(), MessageStreamError> {
-        self.try_stream_io(async move |this| Ok(this.stream.cancel(code.into_inner()).await?))
+    pub async fn reset(&mut self, code: Code) -> Result<(), MessageStreamError> {
+        self.try_stream_io(async move |this| Ok(this.stream.reset(code.into_inner()).await?))
             .await
     }
 
@@ -490,7 +490,7 @@ impl WriteStream {
             goaway = peer_goaway => match goaway {
                 Ok(()) => {
                     // FIXME: which code should be used?
-                    _ = self.stream.cancel(Code::H3_NO_ERROR.into()).await;
+                    _ = self.stream.reset(Code::H3_NO_ERROR.into()).await;
                     Err(ConnectionGoaway::Peer.into())
                 }
                 Err(error) => Err(error.into())
@@ -500,7 +500,7 @@ impl WriteStream {
 
     /// Resolve a stream-level H3 error into a `quic::StreamError`. See
     /// [`ReadStream::handle_stream_error`] for semantics; the difference is
-    /// that `H3` errors issue `RESET_STREAM` (via `cancel`) on this writer
+    /// that `H3` errors issue `RESET_STREAM` (via `reset`) on this writer
     /// instead of `STOP_SENDING`.
     pub async fn handle_stream_error(
         &mut self,
@@ -517,7 +517,7 @@ impl WriteStream {
             connection::StreamError::Reset { code } => quic::StreamError::Reset { code },
             connection::StreamError::H3 { source } => {
                 let code = source.code().into_inner();
-                _ = self.stream.cancel(code).await;
+                _ = self.stream.reset(code).await;
                 quic::StreamError::Reset { code }
             }
         }
@@ -542,13 +542,13 @@ impl quic::GetStreamId for WriteStream {
     }
 }
 
-impl quic::CancelStream for WriteStream {
-    fn poll_cancel(
+impl quic::ResetStream for WriteStream {
+    fn poll_reset(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        Pin::new(&mut self.get_mut().stream).poll_cancel(cx, code)
+        Pin::new(&mut self.get_mut().stream).poll_reset(cx, code)
     }
 }
 
@@ -618,7 +618,7 @@ mod tests {
         message::test::{read_stream_for_test, write_stream_for_test},
         protocol::{Protocol, Protocols, StreamVerdict},
         qpack::protocol::{QPackDecoder, QPackEncoder, QPackProtocolFactory},
-        quic::{self, CancelStream, GetStreamId, GetStreamIdExt, StopStream},
+        quic::{self, GetStreamId, GetStreamIdExt, ResetStream, StopStream},
         varint::VarInt,
     };
 
@@ -751,8 +751,8 @@ mod tests {
         }
     }
 
-    impl quic::CancelStream for TestWriteStream {
-        fn poll_cancel(
+    impl quic::ResetStream for TestWriteStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context,
             _code: VarInt,
@@ -838,8 +838,8 @@ mod tests {
         }
     }
 
-    impl quic::CancelStream for StreamIdErrorWriteStream {
-        fn poll_cancel(
+    impl quic::ResetStream for StreamIdErrorWriteStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context,
             _code: VarInt,
@@ -923,7 +923,7 @@ mod tests {
     #[derive(Debug)]
     struct TrackedWriteStream {
         stream_id: VarInt,
-        cancel_tx: mpsc::UnboundedSender<VarInt>,
+        reset_tx: mpsc::UnboundedSender<VarInt>,
     }
 
     impl quic::GetStreamId for TrackedWriteStream {
@@ -935,14 +935,14 @@ mod tests {
         }
     }
 
-    impl quic::CancelStream for TrackedWriteStream {
-        fn poll_cancel(
+    impl quic::ResetStream for TrackedWriteStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context,
             code: VarInt,
         ) -> Poll<Result<(), quic::StreamError>> {
             self.get_mut()
-                .cancel_tx
+                .reset_tx
                 .send(code)
                 .expect("tracked writer receiver should still be alive");
             Poll::Ready(Ok(()))
@@ -1732,9 +1732,9 @@ mod tests {
                 code: VarInt::from_u32(34),
             },
         };
-        poll_fn(|cx| Pin::new(&mut stream_id_error_writer).poll_cancel(cx, VarInt::from_u32(0)))
+        poll_fn(|cx| Pin::new(&mut stream_id_error_writer).poll_reset(cx, VarInt::from_u32(0)))
             .await
-            .expect("stream-id-error writer cancel should be ready");
+            .expect("stream-id-error writer reset should be ready");
         poll_fn(|cx| Pin::new(&mut stream_id_error_writer).poll_ready(cx))
             .await
             .expect("stream-id-error writer should be ready");
@@ -1748,10 +1748,10 @@ mod tests {
             .await
             .expect("stream-id-error writer should close");
 
-        let (cancel_tx, _cancel_rx) = mpsc::unbounded_channel();
+        let (reset_tx, _reset_rx) = mpsc::unbounded_channel();
         let mut tracked_writer = TrackedWriteStream {
             stream_id: VarInt::from_u32(35),
-            cancel_tx,
+            reset_tx,
         };
         poll_fn(|cx| Pin::new(&mut tracked_writer).poll_ready(cx))
             .await
@@ -1840,9 +1840,9 @@ mod tests {
     async fn read_and_write_stream_traits_delegate_to_inner_streams() {
         let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
         let stop_code = VarInt::from_u32(51);
-        let cancel_code = VarInt::from_u32(52);
+        let reset_code = VarInt::from_u32(52);
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
-        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
         let mut reader = ReadStream::new(
             StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(19),
@@ -1859,7 +1859,7 @@ mod tests {
         let mut writer = WriteStream::new(
             SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
                 stream_id: VarInt::from_u32(20),
-                cancel_tx,
+                reset_tx,
             })
                 as crate::codec::BoxWriteStream)),
             Arc::new(QPackEncoder::new(
@@ -1893,23 +1893,23 @@ mod tests {
                 .expect("writer stream id"),
             VarInt::from_u32(20)
         );
-        poll_fn(|cx| Pin::new(&mut writer).poll_cancel(cx, cancel_code))
+        poll_fn(|cx| Pin::new(&mut writer).poll_reset(cx, reset_code))
             .await
-            .expect("writer cancel");
+            .expect("writer reset");
         assert_eq!(
-            timeout(Duration::from_secs(1), cancel_rx.recv())
+            timeout(Duration::from_secs(1), reset_rx.recv())
                 .await
-                .expect("writer cancel should be observed")
-                .expect("cancel code should be sent"),
-            cancel_code,
+                .expect("writer reset should be observed")
+                .expect("reset code should be sent"),
+            reset_code,
         );
     }
 
     #[tokio::test]
-    async fn handle_stream_error_resets_and_stops_or_cancels_streams() {
+    async fn handle_stream_error_resets_writer_and_stops_reader_streams() {
         let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
-        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
         let mut reader = ReadStream::new(
             StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(21),
@@ -1926,7 +1926,7 @@ mod tests {
         let mut writer = WriteStream::new(
             SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
                 stream_id: VarInt::from_u32(22),
-                cancel_tx,
+                reset_tx,
             })
                 as crate::codec::BoxWriteStream)),
             Arc::new(QPackEncoder::new(
@@ -1960,10 +1960,10 @@ mod tests {
             VarInt::from(Code::H3_MESSAGE_ERROR),
         );
         assert_eq!(
-            timeout(Duration::from_secs(1), cancel_rx.recv())
+            timeout(Duration::from_secs(1), reset_rx.recv())
                 .await
-                .expect("writer cancel should be observed")
-                .expect("cancel code should be sent"),
+                .expect("writer reset should be observed")
+                .expect("reset code should be sent"),
             VarInt::from(Code::H3_MESSAGE_ERROR),
         );
     }
@@ -1972,7 +1972,7 @@ mod tests {
     async fn handle_stream_error_passthrough_variants_do_not_reset_streams() {
         let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
-        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
         let mut reader = ReadStream::new(
             StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(30),
@@ -1989,7 +1989,7 @@ mod tests {
         let mut writer = WriteStream::new(
             SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
                 stream_id: VarInt::from_u32(31),
-                cancel_tx,
+                reset_tx,
             })
                 as crate::codec::BoxWriteStream)),
             Arc::new(QPackEncoder::new(
@@ -2021,7 +2021,7 @@ mod tests {
             "peer reset should not trigger STOP_SENDING"
         );
         assert!(
-            cancel_rx.try_recv().is_err(),
+            reset_rx.try_recv().is_err(),
             "peer reset should not trigger RESET_STREAM"
         );
     }
@@ -2112,11 +2112,11 @@ mod tests {
     async fn write_stream_take_transfers_drop_cleanup_to_taken_wrapper() {
         let quic = Arc::new(MockConnection::new());
         let state = state_without_qpack(quic).erase();
-        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
         let mut stream = WriteStream::new(
             SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
                 stream_id: VarInt::from_u32(15),
-                cancel_tx,
+                reset_tx,
             })
                 as crate::codec::BoxWriteStream)),
             Arc::new(QPackEncoder::new(
@@ -2135,23 +2135,23 @@ mod tests {
 
         drop(stream);
         assert!(
-            timeout(Duration::from_millis(50), cancel_rx.recv())
+            timeout(Duration::from_millis(50), reset_rx.recv())
                 .await
                 .is_err()
         );
 
         drop(taken);
         assert_eq!(
-            timeout(Duration::from_secs(1), cancel_rx.recv())
+            timeout(Duration::from_secs(1), reset_rx.recv())
                 .await
-                .expect("taken write stream drop should cancel")
-                .expect("cancel code should be sent"),
+                .expect("taken write stream drop should reset")
+                .expect("reset code should be sent"),
             VarInt::from(Code::H3_NO_ERROR),
         );
     }
 
     #[tokio::test]
-    async fn write_stream_flush_close_cancel_and_header_aliases_succeed_on_mock_stream() {
+    async fn write_stream_flush_close_reset_and_header_aliases_succeed_on_mock_stream() {
         let mut header_stream = write_stream_for_test(VarInt::from_u32(0));
         header_stream
             .write_header(std::iter::empty())
@@ -2174,11 +2174,11 @@ mod tests {
             .await
             .expect("close should succeed");
 
-        let mut cancel_stream = write_stream_for_test(VarInt::from_u32(0));
-        cancel_stream
-            .cancel(Code::H3_NO_ERROR)
+        let mut reset_stream = write_stream_for_test(VarInt::from_u32(0));
+        reset_stream
+            .reset(Code::H3_NO_ERROR)
             .await
-            .expect("cancel should succeed");
+            .expect("reset should succeed");
     }
 
     #[tokio::test]

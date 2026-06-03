@@ -176,8 +176,8 @@ impl quic::GetStreamId for ChannelWriter {
     }
 }
 
-impl quic::CancelStream for ChannelWriter {
-    fn poll_cancel(
+impl quic::ResetStream for ChannelWriter {
+    fn poll_reset(
         self: Pin<&mut Self>,
         _cx: &mut Context,
         _code: VarInt,
@@ -223,7 +223,7 @@ impl Sink<Bytes> for ChannelWriter {
     }
 }
 
-// WriteStream blanket impl exists for S: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + Any
+// WriteStream blanket impl exists for S: ResetStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + Any
 
 // ---------------------------------------------------------------------------
 // StreamableConnection: mock connection that supports actual data transfer
@@ -533,7 +533,7 @@ async fn setup_listen_pair() -> (
 
 #[tokio::test]
 async fn direct_lifecycle_and_stream_helpers_cover_control_paths() {
-    use quic::{CancelStreamExt, GetStreamIdExt, StopStreamExt};
+    use quic::{GetStreamIdExt, ResetStreamExt, StopStreamExt};
 
     let lifecycle = TestLifecycle::new();
     assert!(quic::Lifecycle::check(&lifecycle).is_ok());
@@ -624,9 +624,9 @@ async fn direct_lifecycle_and_stream_helpers_cover_control_paths() {
         tx: Some(writer_tx),
     };
     writer
-        .cancel(VarInt::from_u32(405))
+        .reset(VarInt::from_u32(405))
         .await
-        .expect("cancel writer");
+        .expect("reset writer");
     assert!(
         writer_rx.recv().await.is_none(),
         "canceled writer should drop its sender"

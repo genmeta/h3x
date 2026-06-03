@@ -348,7 +348,7 @@ mod tests {
         codec::{BoxReadStream, BoxWriteStream, PeekableStreamReader, SinkWriter, StreamReader},
         error::Code,
         quic::{
-            self, CancelStream, ConnectionError, GetStreamId, Lifecycle, ManageStream, StopStream,
+            self, ConnectionError, GetStreamId, Lifecycle, ManageStream, ResetStream, StopStream,
             WithLocalAuthority, WithRemoteAuthority,
         },
         varint::VarInt,
@@ -603,8 +603,8 @@ mod tests {
         }
     }
 
-    impl CancelStream for TestWriteStream {
-        fn poll_cancel(
+    impl ResetStream for TestWriteStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context,
             _code: VarInt,
@@ -961,7 +961,7 @@ mod tests {
             Poll::Ready(Ok(id)) if id == VarInt::from_u32(0)
         ));
         assert!(matches!(
-            Pin::new(&mut writer).poll_cancel(&mut cx, VarInt::from_u32(8)),
+            Pin::new(&mut writer).poll_reset(&mut cx, VarInt::from_u32(8)),
             Poll::Ready(Ok(()))
         ));
         assert!(matches!(

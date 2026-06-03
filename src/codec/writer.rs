@@ -10,7 +10,7 @@ use futures::{Sink, Stream, StreamExt};
 use tokio::io::{self, AsyncWrite};
 
 use crate::{
-    quic::{CancelStream, GetStreamId, StreamError},
+    quic::{GetStreamId, ResetStream, StreamError},
     varint::VarInt,
 };
 
@@ -175,13 +175,13 @@ where
     }
 }
 
-impl<S: CancelStream + ?Sized> CancelStream for SinkWriter<S> {
-    fn poll_cancel(
+impl<S: ResetStream + ?Sized> ResetStream for SinkWriter<S> {
+    fn poll_reset(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), StreamError>> {
-        self.project().sink.poll_cancel(cx, code)
+        self.project().sink.poll_reset(cx, code)
     }
 }
 
@@ -283,7 +283,7 @@ mod tests {
 
     use super::{Feed, SinkWriter};
     use crate::{
-        quic::{CancelStream, GetStreamId, StreamError},
+        quic::{GetStreamId, ResetStream, StreamError},
         varint::VarInt,
     };
 
@@ -321,7 +321,7 @@ mod tests {
         ready_error: Option<TestError>,
         flushes: usize,
         closes: usize,
-        cancel_codes: Vec<VarInt>,
+        reset_codes: Vec<VarInt>,
         stream_id: Option<VarInt>,
     }
 
@@ -365,13 +365,13 @@ mod tests {
         }
     }
 
-    impl CancelStream for RecordingSink {
-        fn poll_cancel(
+    impl ResetStream for RecordingSink {
+        fn poll_reset(
             mut self: Pin<&mut Self>,
             _cx: &mut Context,
             code: VarInt,
         ) -> Poll<Result<(), StreamError>> {
-            self.cancel_codes.push(code);
+            self.reset_codes.push(code);
             Poll::Ready(Ok(()))
         }
     }
@@ -455,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_stream_and_get_stream_id_forward_to_inner_sink() {
+    fn reset_stream_and_get_stream_id_forward_to_inner_sink() {
         let mut writer = SinkWriter::new(RecordingSink {
             stream_id: Some(VarInt::from_u32(33)),
             ..RecordingSink::default()
@@ -463,12 +463,12 @@ mod tests {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
-        let cancel_code = VarInt::from_u32(44);
+        let reset_code = VarInt::from_u32(44);
         assert!(matches!(
-            Pin::new(&mut writer).poll_cancel(&mut cx, cancel_code),
+            Pin::new(&mut writer).poll_reset(&mut cx, reset_code),
             Poll::Ready(Ok(()))
         ));
-        assert_eq!(writer.sink().cancel_codes, vec![cancel_code]);
+        assert_eq!(writer.sink().reset_codes, vec![reset_code]);
         assert!(matches!(
             Pin::new(&mut writer).poll_stream_id(&mut cx),
             Poll::Ready(Ok(id)) if id == VarInt::from_u32(33)

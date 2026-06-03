@@ -274,13 +274,13 @@ mod tests {
         }
     }
 
-    impl quic::CancelStream for ClientWriteStream {
-        fn poll_cancel(
+    impl quic::ResetStream for ClientWriteStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             cx: &mut Context,
             code: VarInt,
         ) -> Poll<Result<(), quic::StreamError>> {
-            self.get_mut().inner.as_mut().poll_cancel(cx, code)
+            self.get_mut().inner.as_mut().poll_reset(cx, code)
         }
     }
 

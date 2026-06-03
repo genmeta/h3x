@@ -11,7 +11,7 @@ use crate::{
     codec::{DecodeExt, DecodeFrom, EncodeExt, StreamDecodeError},
     connection::StreamError,
     error::H3GeneralProtocolError,
-    quic::{self, CancelStream, GetStreamId, StopStream},
+    quic::{self, GetStreamId, ResetStream, StopStream},
     varint::VarInt,
 };
 
@@ -148,13 +148,13 @@ impl<S: Stream + ?Sized> Stream for UnidirectionalStream<S> {
     }
 }
 
-impl<S: CancelStream + ?Sized> CancelStream for UnidirectionalStream<S> {
-    fn poll_cancel(
+impl<S: ResetStream + ?Sized> ResetStream for UnidirectionalStream<S> {
+    fn poll_reset(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        self.project().stream.poll_cancel(cx, code)
+        self.project().stream.poll_reset(cx, code)
     }
 }
 
@@ -375,7 +375,7 @@ mod tests {
     struct ControlStream {
         stream_id: VarInt,
         stopped: Arc<Mutex<Option<VarInt>>>,
-        cancelled: Arc<Mutex<Option<VarInt>>>,
+        reset: Arc<Mutex<Option<VarInt>>>,
     }
 
     impl GetStreamId for ControlStream {
@@ -398,13 +398,13 @@ mod tests {
         }
     }
 
-    impl CancelStream for ControlStream {
-        fn poll_cancel(
+    impl ResetStream for ControlStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context,
             code: VarInt,
         ) -> Poll<Result<(), quic::StreamError>> {
-            *self.cancelled.lock().expect("cancel state poisoned") = Some(code);
+            *self.reset.lock().expect("reset state poisoned") = Some(code);
             Poll::Ready(Ok(()))
         }
     }
@@ -412,16 +412,16 @@ mod tests {
     #[tokio::test]
     async fn control_traits_delegate_to_inner_stream() {
         let stopped = Arc::new(Mutex::new(None));
-        let cancelled = Arc::new(Mutex::new(None));
+        let reset = Arc::new(Mutex::new(None));
         let stream_id = VarInt::from_u32(17);
         let stop_code = VarInt::from_u32(23);
-        let cancel_code = VarInt::from_u32(29);
+        let reset_code = VarInt::from_u32(29);
         let mut stream = UnidirectionalStream {
             r#type: VarInt::from_u32(0),
             stream: ControlStream {
                 stream_id,
                 stopped: stopped.clone(),
-                cancelled: cancelled.clone(),
+                reset: reset.clone(),
             },
         };
 
@@ -434,17 +434,17 @@ mod tests {
         poll_fn(|cx| Pin::new(&mut stream).poll_stop(cx, stop_code))
             .await
             .expect("stop forwarded");
-        poll_fn(|cx| Pin::new(&mut stream).poll_cancel(cx, cancel_code))
+        poll_fn(|cx| Pin::new(&mut stream).poll_reset(cx, reset_code))
             .await
-            .expect("cancel forwarded");
+            .expect("reset forwarded");
 
         assert_eq!(
             *stopped.lock().expect("stop state poisoned"),
             Some(stop_code)
         );
         assert_eq!(
-            *cancelled.lock().expect("cancel state poisoned"),
-            Some(cancel_code)
+            *reset.lock().expect("reset state poisoned"),
+            Some(reset_code)
         );
     }
 }

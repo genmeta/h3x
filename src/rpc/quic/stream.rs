@@ -6,7 +6,7 @@ use super::super::bridge;
 use crate::{
     codec::BoxReadStream,
     message::stream::guard,
-    quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
+    quic::{self, GetStreamIdExt, ResetStreamExt, StopStreamExt},
     util::deferred::{DeferredStreamReader, DeferredStreamWriter},
     varint::VarInt,
 };
@@ -51,7 +51,7 @@ pub trait WriteStream: Send {
     async fn write(&mut self, data: Bytes) -> Result<(), quic::StreamError>;
     async fn flush(&mut self) -> Result<(), quic::StreamError>;
     async fn shutdown(&mut self) -> Result<(), quic::StreamError>;
-    async fn cancel(&mut self, code: VarInt) -> Result<(), quic::StreamError>;
+    async fn reset(&mut self, code: VarInt) -> Result<(), quic::StreamError>;
 }
 
 impl WriteStreamClient {
@@ -90,7 +90,7 @@ impl WriteStreamClient {
                 }
             },
             |mut client: WriteStreamClient, code| async move {
-                let res = client.cancel(code).await;
+                let res = client.reset(code).await;
                 (client, res)
             },
         ))
@@ -140,8 +140,8 @@ where
         SinkExt::close(self).await
     }
 
-    async fn cancel(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
-        CancelStreamExt::cancel(self, code).await
+    async fn reset(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
+        ResetStreamExt::reset(self, code).await
     }
 }
 
@@ -215,14 +215,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blanket_write_stream_cancel_delegates_to_quic_writer() {
+    async fn blanket_write_stream_reset_delegates_to_quic_writer() {
         let stream_id = VarInt::from_u32(13);
         let (mut reader, mut writer) = quic::test::mock_stream_pair(stream_id);
         let code = VarInt::from_u32(99);
 
-        WriteStream::cancel(&mut writer, code)
+        WriteStream::reset(&mut writer, code)
             .await
-            .expect("cancel succeeds");
+            .expect("reset succeeds");
 
         let error = reader
             .next()

@@ -12,21 +12,21 @@ use tokio_util::sync::CancellationToken;
 use super::super::{MessageStreamError, WriteStream};
 use crate::{
     codec::SinkWriter,
-    quic::{self, CancelStream, GetStreamId},
+    quic::{self, GetStreamId, ResetStream},
     varint::VarInt,
 };
 
 /// A message-level byte sink that also supports QUIC stream control operations.
 ///
 /// This is the message-layer analog of [`quic::WriteStream`], combining DATA-frame
-/// byte sinking with the underlying QUIC stream's [`CancelStream`] and
+/// byte sinking with the underlying QUIC stream's [`ResetStream`] and
 /// [`GetStreamId`] capabilities.
 pub trait WriteMessageStream:
-    CancelStream + GetStreamId + Sink<Bytes, Error = MessageStreamError> + Send
+    ResetStream + GetStreamId + Sink<Bytes, Error = MessageStreamError> + Send
 {
 }
 
-impl<T: CancelStream + GetStreamId + Sink<Bytes, Error = MessageStreamError> + Send + ?Sized>
+impl<T: ResetStream + GetStreamId + Sink<Bytes, Error = MessageStreamError> + Send + ?Sized>
     WriteMessageStream for T
 {
 }
@@ -540,7 +540,7 @@ impl<
     CloseFuture,
     ResetFuture,
     SinkError,
-> CancelStream
+> ResetStream
     for Unfold<
         StreamState,
         Send,
@@ -561,7 +561,7 @@ where
     ResetFuture: Future<Output = (StreamState, Result<(), quic::StreamError>)>,
     SinkError: From<quic::StreamError>,
 {
-    fn poll_cancel(
+    fn poll_reset(
         mut self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
@@ -657,7 +657,7 @@ impl WriteStream {
             },
             async |stream: &mut WriteStream, code| {
                 let result =
-                    futures::future::poll_fn(|cx| Pin::new(&mut *stream).poll_cancel(cx, code))
+                    futures::future::poll_fn(|cx| Pin::new(&mut *stream).poll_reset(cx, code))
                         .await;
                 (stream, result)
             },
@@ -698,8 +698,7 @@ impl WriteStream {
             },
             async |mut stream: WriteStream, code| {
                 let result =
-                    futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_cancel(cx, code))
-                        .await;
+                    futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_reset(cx, code)).await;
                 (stream, result)
             },
         )
@@ -731,14 +730,14 @@ mod tests {
     };
 
     use super::*;
-    use crate::quic::{CancelStream, GetStreamId};
+    use crate::quic::{GetStreamId, ResetStream};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Event {
         Send(Bytes),
         Flush,
         Close,
-        Cancel(VarInt),
+        Reset(VarInt),
     }
 
     #[derive(Debug)]
@@ -756,8 +755,8 @@ mod tests {
         }
     }
 
-    impl CancelStream for ControlSink {
-        fn poll_cancel(
+    impl ResetStream for ControlSink {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context,
             code: VarInt,
@@ -765,7 +764,7 @@ mod tests {
             self.events
                 .lock()
                 .expect("event log poisoned")
-                .push(Event::Cancel(code));
+                .push(Event::Reset(code));
             Poll::Ready(Ok(()))
         }
     }
@@ -875,16 +874,16 @@ mod tests {
         futures::future::ready(Either::Left((stream, Ok(()))))
     }
 
-    fn record_cancel(stream: ControlSink, code: VarInt) -> ResetReady {
+    fn record_reset(stream: ControlSink, code: VarInt) -> ResetReady {
         stream
             .events
             .lock()
             .expect("event log poisoned")
-            .push(Event::Cancel(code));
+            .push(Event::Reset(code));
         futures::future::ready((stream, Ok(())))
     }
 
-    fn cancel_ok(stream: ControlSink, _code: VarInt) -> ResetReady {
+    fn reset_ok(stream: ControlSink, _code: VarInt) -> ResetReady {
         futures::future::ready((stream, Ok(())))
     }
 
@@ -956,7 +955,7 @@ mod tests {
             record_send,
             record_flush,
             record_close,
-            record_cancel,
+            record_reset,
         ));
 
         poll_fn(|cx| sink.as_mut().poll_ready(cx))
@@ -1016,7 +1015,7 @@ mod tests {
                     }
                 }
             },
-            cancel_ok,
+            reset_ok,
         ));
 
         poll_fn(|cx| sink.as_mut().poll_ready(cx))
@@ -1121,7 +1120,7 @@ mod tests {
                 }
             },
             operation_ok,
-            cancel_ok,
+            reset_ok,
         ));
 
         poll_fn(|cx| flush_sink.as_mut().poll_ready(cx))
@@ -1172,7 +1171,7 @@ mod tests {
                     futures::future::ready(Either::Left((stream, Ok::<_, MessageStreamError>(()))))
                 }
             },
-            cancel_ok,
+            reset_ok,
         ));
 
         poll_fn(|cx| close_sink.as_mut().poll_ready(cx))
@@ -1202,7 +1201,7 @@ mod tests {
         let send_open = Arc::new(AtomicBool::new(false));
         let send_started = Arc::new(AtomicUsize::new(0));
         let stream_id = VarInt::from_u32(33);
-        let cancel_code = VarInt::from_u32(34);
+        let reset_code = VarInt::from_u32(34);
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut sink = Box::pin(unfold(
             ControlSink {
@@ -1222,7 +1221,7 @@ mod tests {
             },
             operation_ok,
             operation_ok,
-            record_cancel,
+            record_reset,
         ));
 
         poll_fn(|cx| sink.as_mut().poll_ready(cx))
@@ -1249,12 +1248,12 @@ mod tests {
                 .expect("stream id should be available after send completes"),
             stream_id
         );
-        poll_fn(|cx| sink.as_mut().poll_cancel(cx, cancel_code))
+        poll_fn(|cx| sink.as_mut().poll_reset(cx, reset_code))
             .await
-            .expect("cancel should be available after send completes");
+            .expect("reset should be available after send completes");
         assert_eq!(
             *events.lock().expect("event log poisoned"),
-            vec![Event::Cancel(cancel_code)]
+            vec![Event::Reset(reset_code)]
         );
     }
 
@@ -1262,7 +1261,7 @@ mod tests {
     async fn control_traits_forward_while_value_available() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let stream_id = VarInt::from_u32(37);
-        let cancel_code = VarInt::from_u32(41);
+        let reset_code = VarInt::from_u32(41);
         let mut sink = Box::pin(unfold(
             ControlSink {
                 stream_id,
@@ -1271,7 +1270,7 @@ mod tests {
             send_ok,
             operation_ok,
             operation_ok,
-            record_cancel,
+            record_reset,
         ));
 
         assert_eq!(
@@ -1280,13 +1279,13 @@ mod tests {
                 .expect("stream id"),
             stream_id
         );
-        poll_fn(|cx| sink.as_mut().poll_cancel(cx, cancel_code))
+        poll_fn(|cx| sink.as_mut().poll_reset(cx, reset_code))
             .await
-            .expect("cancel forwarded");
+            .expect("reset forwarded");
 
         assert_eq!(
             *events.lock().expect("event log poisoned"),
-            vec![Event::Cancel(cancel_code)]
+            vec![Event::Reset(reset_code)]
         );
     }
 
@@ -1301,7 +1300,7 @@ mod tests {
             send_pending,
             operation_ok,
             operation_ok,
-            cancel_ok,
+            reset_ok,
         ));
 
         poll_fn(|cx| sink.as_mut().poll_ready(cx))
@@ -1322,16 +1321,16 @@ mod tests {
                 .is_none()
         );
         assert!(
-            poll_fn(|cx| sink.as_mut().poll_cancel(cx, VarInt::from_u32(41)))
+            poll_fn(|cx| sink.as_mut().poll_reset(cx, VarInt::from_u32(41)))
                 .now_or_never()
                 .is_none()
         );
     }
 
     #[tokio::test]
-    async fn cancel_uses_reset_closure_after_interrupting_pending_send() {
+    async fn reset_uses_reset_closure_after_interrupting_pending_send() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let cancel_code = VarInt::from_u32(41);
+        let reset_code = VarInt::from_u32(41);
         let mut sink = Box::pin(unfold(
             ControlSink {
                 stream_id: VarInt::from_u32(37),
@@ -1353,7 +1352,7 @@ mod tests {
                     .events
                     .lock()
                     .expect("event log poisoned")
-                    .push(Event::Cancel(code));
+                    .push(Event::Reset(code));
                 (stream, Ok::<(), quic::StreamError>(()))
             },
         ));
@@ -1365,14 +1364,14 @@ mod tests {
             .start_send(Bytes::from_static(b"payload"))
             .expect("send accepted");
 
-        poll_fn(|cx| sink.as_mut().poll_cancel(cx, cancel_code))
+        poll_fn(|cx| sink.as_mut().poll_reset(cx, reset_code))
             .await
-            .expect("cancel should complete");
+            .expect("reset should complete");
         assert_eq!(
             *events.lock().expect("event log poisoned"),
             vec![
                 Event::Send(Bytes::from_static(b"payload")),
-                Event::Cancel(cancel_code),
+                Event::Reset(reset_code),
             ]
         );
     }
@@ -1387,7 +1386,7 @@ mod tests {
             send_ok,
             operation_ok,
             operation_ok,
-            cancel_ok,
+            reset_ok,
         ));
         poll_fn(|cx| sink.as_mut().poll_ready(cx))
             .now_or_never()
@@ -1416,7 +1415,7 @@ mod tests {
             send_ok,
             operation_pending,
             operation_ok,
-            cancel_ok,
+            reset_ok,
         ));
         poll_fn(|cx| flush_sink.as_mut().poll_ready(cx))
             .await
@@ -1436,7 +1435,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            poll_fn(|cx| flush_sink.as_mut().poll_cancel(cx, VarInt::from_u32(56)))
+            poll_fn(|cx| flush_sink.as_mut().poll_reset(cx, VarInt::from_u32(56)))
                 .now_or_never()
                 .is_none()
         );
@@ -1449,7 +1448,7 @@ mod tests {
             send_ok,
             operation_ok,
             operation_pending,
-            cancel_ok,
+            reset_ok,
         ));
         assert!(
             poll_fn(|cx| close_sink.as_mut().poll_close(cx))
@@ -1462,7 +1461,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            poll_fn(|cx| close_sink.as_mut().poll_cancel(cx, VarInt::from_u32(58)))
+            poll_fn(|cx| close_sink.as_mut().poll_reset(cx, VarInt::from_u32(58)))
                 .now_or_never()
                 .is_none()
         );
@@ -1478,7 +1477,7 @@ mod tests {
             send_message_failed,
             operation_malformed_outgoing,
             operation_ok,
-            cancel_ok,
+            reset_ok,
         ));
         poll_fn(|cx| flush_sink.as_mut().poll_ready(cx))
             .await
@@ -1500,7 +1499,7 @@ mod tests {
             send_malformed_outgoing,
             operation_ok,
             operation_message_failed,
-            cancel_ok,
+            reset_ok,
         ));
         poll_fn(|cx| close_sink.as_mut().poll_ready(cx))
             .await
@@ -1525,7 +1524,7 @@ mod tests {
             send_ok,
             operation_message_failed,
             operation_ok,
-            cancel_ok,
+            reset_ok,
         ));
         poll_fn(|cx| flush_sink.as_mut().poll_ready(cx))
             .await
@@ -1547,7 +1546,7 @@ mod tests {
             send_ok,
             operation_ok,
             operation_malformed_outgoing,
-            cancel_ok,
+            reset_ok,
         ));
         assert!(matches!(
             poll_fn(|cx| close_sink.as_mut().poll_close(cx)).await,
@@ -1558,7 +1557,7 @@ mod tests {
     #[tokio::test]
     async fn write_stream_adapter_builders_preserve_sink_and_control_traits() {
         let stream_id = VarInt::from_u32(71);
-        let cancel_code = VarInt::from_u32(72);
+        let reset_code = VarInt::from_u32(72);
 
         let mut bytes_stream = crate::message::test::write_stream_for_test(stream_id);
         {
@@ -1569,9 +1568,9 @@ mod tests {
                     .expect("as_bytes_sink stream id"),
                 stream_id
             );
-            poll_fn(|cx| sink.as_mut().poll_cancel(cx, cancel_code))
+            poll_fn(|cx| sink.as_mut().poll_reset(cx, reset_code))
                 .await
-                .expect("as_bytes_sink cancel");
+                .expect("as_bytes_sink reset");
             sink.as_mut()
                 .send(Bytes::from_static(b"payload"))
                 .await
@@ -1588,9 +1587,9 @@ mod tests {
                 .expect("into_bytes_sink stream id"),
             stream_id
         );
-        poll_fn(|cx| owned_sink.as_mut().poll_cancel(cx, cancel_code))
+        poll_fn(|cx| owned_sink.as_mut().poll_reset(cx, reset_code))
             .await
-            .expect("into_bytes_sink cancel");
+            .expect("into_bytes_sink reset");
         owned_sink
             .as_mut()
             .send(Bytes::from_static(b"payload"))
@@ -1616,9 +1615,9 @@ mod tests {
                     .expect("as_writer stream id"),
                 stream_id
             );
-            poll_fn(|cx| writer.as_mut().poll_cancel(cx, cancel_code))
+            poll_fn(|cx| writer.as_mut().poll_reset(cx, reset_code))
                 .await
-                .expect("as_writer cancel");
+                .expect("as_writer reset");
             writer
                 .as_mut()
                 .send(Bytes::from_static(b"payload"))
@@ -1636,9 +1635,9 @@ mod tests {
                     .expect("as_box_writer stream id"),
                 stream_id
             );
-            poll_fn(|cx| writer.as_mut().poll_cancel(cx, cancel_code))
+            poll_fn(|cx| writer.as_mut().poll_reset(cx, reset_code))
                 .await
-                .expect("as_box_writer cancel");
+                .expect("as_box_writer reset");
             writer
                 .as_mut()
                 .send(Bytes::from_static(b"payload"))
@@ -1655,9 +1654,9 @@ mod tests {
                 .expect("into_writer stream id"),
             stream_id
         );
-        poll_fn(|cx| writer.as_mut().poll_cancel(cx, cancel_code))
+        poll_fn(|cx| writer.as_mut().poll_reset(cx, reset_code))
             .await
-            .expect("into_writer cancel");
+            .expect("into_writer reset");
         writer
             .as_mut()
             .send(Bytes::from_static(b"payload"))
@@ -1673,9 +1672,9 @@ mod tests {
                 .expect("into_box_writer stream id"),
             stream_id
         );
-        poll_fn(|cx| boxed_writer.as_mut().poll_cancel(cx, cancel_code))
+        poll_fn(|cx| boxed_writer.as_mut().poll_reset(cx, reset_code))
             .await
-            .expect("into_box_writer cancel");
+            .expect("into_box_writer reset");
         boxed_writer
             .as_mut()
             .send(Bytes::from_static(b"payload"))
@@ -1696,9 +1695,9 @@ mod tests {
                 .expect("from stream id"),
             stream_id
         );
-        poll_fn(|cx| from_writer.as_mut().poll_cancel(cx, cancel_code))
+        poll_fn(|cx| from_writer.as_mut().poll_reset(cx, reset_code))
             .await
-            .expect("from cancel");
+            .expect("from reset");
         from_writer
             .as_mut()
             .send(Bytes::from_static(b"payload"))
@@ -1711,7 +1710,7 @@ mod tests {
     async fn write_stream_writer_adapters_forward_control_with_buffered_send_then_flush_and_close()
     {
         let stream_id = VarInt::from_u32(81);
-        let cancel_code = VarInt::from_u32(82);
+        let reset_code = VarInt::from_u32(82);
 
         let mut borrowed_stream = crate::message::test::write_stream_for_test(stream_id);
         {
@@ -1729,9 +1728,9 @@ mod tests {
                     .expect("as_writer stream id with buffered send"),
                 stream_id
             );
-            poll_fn(|cx| writer.as_mut().poll_cancel(cx, cancel_code))
+            poll_fn(|cx| writer.as_mut().poll_reset(cx, reset_code))
                 .await
-                .expect("as_writer cancel with buffered send");
+                .expect("as_writer reset with buffered send");
             writer.as_mut().flush().await.expect("as_writer flush");
             assert_eq!(
                 poll_fn(|cx| writer.as_mut().poll_stream_id(cx))
@@ -1758,9 +1757,9 @@ mod tests {
                     .expect("as_box_writer stream id with buffered send"),
                 stream_id
             );
-            poll_fn(|cx| writer.as_mut().poll_cancel(cx, cancel_code))
+            poll_fn(|cx| writer.as_mut().poll_reset(cx, reset_code))
                 .await
-                .expect("as_box_writer cancel with buffered send");
+                .expect("as_box_writer reset with buffered send");
             writer.as_mut().flush().await.expect("as_box_writer flush");
             writer.as_mut().close().await.expect("as_box_writer close");
         }
@@ -1780,9 +1779,9 @@ mod tests {
                 .expect("into_writer stream id with buffered send"),
             stream_id
         );
-        poll_fn(|cx| writer.as_mut().poll_cancel(cx, cancel_code))
+        poll_fn(|cx| writer.as_mut().poll_reset(cx, reset_code))
             .await
-            .expect("into_writer cancel with buffered send");
+            .expect("into_writer reset with buffered send");
         writer.as_mut().flush().await.expect("into_writer flush");
         writer.as_mut().close().await.expect("into_writer close");
 
@@ -1801,9 +1800,9 @@ mod tests {
                 .expect("into_box_writer stream id with buffered send"),
             stream_id
         );
-        poll_fn(|cx| boxed_writer.as_mut().poll_cancel(cx, cancel_code))
+        poll_fn(|cx| boxed_writer.as_mut().poll_reset(cx, reset_code))
             .await
-            .expect("into_box_writer cancel with buffered send");
+            .expect("into_box_writer reset with buffered send");
         boxed_writer
             .as_mut()
             .flush()

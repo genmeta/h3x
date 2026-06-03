@@ -2,7 +2,7 @@
 //!
 //! Wraps the write direction of a `SOCK_STREAM` socketpair, encoding the pipe
 //! framing protocol and exposing it as `Sink<Bytes, Error = StreamError>` +
-//! [`CancelStream`] + [`GetStreamId`], satisfying [`quic::WriteStream`].
+//! [`ResetStream`] + [`GetStreamId`], satisfying [`quic::WriteStream`].
 //!
 //! # Flow control
 //!
@@ -43,7 +43,7 @@ use super::{
     },
 };
 use crate::{
-    quic::{self, CancelStream, GetStreamId, StreamError},
+    quic::{self, GetStreamId, ResetStream, StreamError},
     varint::VarInt,
 };
 
@@ -143,8 +143,8 @@ impl WriterLive {
         })
     }
 
-    /// `poll_cancel` step: discard pending data → best-effort CANCEL → shutdown.
-    fn step_poll_cancel(&mut self, code: VarInt, cx: &mut Context<'_>) -> Step<()> {
+    /// `poll_reset` step: discard pending data → best-effort CANCEL → shutdown.
+    fn step_poll_reset(&mut self, code: VarInt, cx: &mut Context<'_>) -> Step<()> {
         self.pending = None;
         let (buf, len) = encode_control(TAG_CANCEL, code);
         let _ = Pin::new(&mut self.write).poll_write(cx, &buf[..len]);
@@ -272,8 +272,8 @@ impl Sink<Bytes> for IpcWriteStream {
     }
 }
 
-impl CancelStream for IpcWriteStream {
-    fn poll_cancel(
+impl ResetStream for IpcWriteStream {
+    fn poll_reset(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
@@ -281,12 +281,12 @@ impl CancelStream for IpcWriteStream {
         let this = self.get_mut();
         loop {
             if let Some(poll) = this.state.poll_non_live(cx) {
-                // Already dead — cancel is a no-op.
+                // Already dead — reset is a no-op.
                 let _ = poll;
                 return Poll::Ready(Ok(()));
             }
             let live = this.state.live_mut().unwrap();
-            match live.step_poll_cancel(code, cx) {
+            match live.step_poll_reset(code, cx) {
                 Step::Done(()) => return Poll::Ready(Ok(())),
                 Step::Pending => return Poll::Pending,
                 Step::Transition(t) => this.state.apply(t, cx),
@@ -317,7 +317,7 @@ mod tests {
     use tokio_util::codec::{FramedRead, FramedWrite};
 
     use super::*;
-    use crate::quic::{CancelStream, ConnectionError};
+    use crate::quic::{ConnectionError, ResetStream};
 
     struct TestLifecycle {
         terminal: Option<ConnectionError>,
@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_cancel_sends_cancel_and_discards_pending_push() {
+    async fn poll_reset_sends_cancel_and_discards_pending_push() {
         let (mut writer, mut peer_ctrl, mut peer_data) = setup_writer().await;
         let code = VarInt::from_u32(77);
 
@@ -520,7 +520,7 @@ mod tests {
             .start_send(Bytes::from_static(b"discard-me"))
             .unwrap();
 
-        poll_fn(|cx| Pin::new(&mut writer).poll_cancel(cx, code))
+        poll_fn(|cx| Pin::new(&mut writer).poll_reset(cx, code))
             .await
             .unwrap();
 
@@ -530,7 +530,7 @@ mod tests {
         );
         let eof = timeout(Duration::from_millis(200), peer_data.next())
             .await
-            .expect("expected EOF after poll_cancel");
+            .expect("expected EOF after poll_reset");
         assert!(eof.is_none());
     }
 
@@ -619,7 +619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_is_noop_after_writer_is_dead() {
+    async fn reset_is_noop_after_writer_is_dead() {
         let (mut writer, mut peer_ctrl, _peer_data) = setup_writer().await;
 
         peer_ctrl
@@ -630,7 +630,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        poll_fn(|cx| Pin::new(&mut writer).poll_cancel(cx, VarInt::from_u32(9)))
+        poll_fn(|cx| Pin::new(&mut writer).poll_reset(cx, VarInt::from_u32(9)))
             .await
             .unwrap();
     }

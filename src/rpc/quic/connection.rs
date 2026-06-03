@@ -377,7 +377,7 @@ mod tests {
     use crate::{
         codec::{BoxReadStream, BoxWriteStream},
         dquic::cert::handy::ToCertificate,
-        quic::{CancelStream, GetStreamId, GetStreamIdExt, StopStream, StopStreamExt},
+        quic::{GetStreamId, GetStreamIdExt, ResetStream, StopStream, StopStreamExt},
     };
 
     const SERVER_CERT: &[u8] = include_bytes!("../../../tests/keychain/localhost/server.cert");
@@ -687,8 +687,8 @@ mod tests {
         }
     }
 
-    impl CancelStream for BrokenIdWriteStream {
-        fn poll_cancel(
+    impl ResetStream for BrokenIdWriteStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             _code: VarInt,

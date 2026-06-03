@@ -540,70 +540,69 @@ impl<S: StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + S
 
 /// Send-side RESET_STREAM control for a stream.
 ///
-/// This trait keeps the historical `cancel` name, but the operation is QUIC
-/// RESET_STREAM rather than cancellation of a Rust future. The first poll of
-/// [`poll_cancel`](CancelStream::poll_cancel) commits the reset code. Once
-/// committed, reset may interrupt in-flight send-side work such as data send,
-/// flush, or shutdown. RESET_STREAM does not stop local receive-side byte
-/// delivery.
-pub trait CancelStream {
-    fn poll_cancel(
+/// This operation is QUIC RESET_STREAM rather than cancellation of a Rust
+/// future. The first poll of [`poll_reset`](ResetStream::poll_reset) commits
+/// the reset code. Once committed, reset may interrupt in-flight send-side work
+/// such as data send, flush, or shutdown. RESET_STREAM does not stop local
+/// receive-side byte delivery.
+pub trait ResetStream {
+    fn poll_reset(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), StreamError>>;
 }
 
-impl<S> CancelStream for &mut S
+impl<S> ResetStream for &mut S
 where
-    S: CancelStream + Unpin + ?Sized,
+    S: ResetStream + Unpin + ?Sized,
 {
-    fn poll_cancel(
+    fn poll_reset(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), StreamError>> {
-        S::poll_cancel(Pin::new(self.get_mut()), cx, code)
+        S::poll_reset(Pin::new(self.get_mut()), cx, code)
     }
 }
 
-impl<P> CancelStream for Pin<P>
+impl<P> ResetStream for Pin<P>
 where
-    P: DerefMut<Target: CancelStream>,
+    P: DerefMut<Target: ResetStream>,
 {
-    fn poll_cancel(
+    fn poll_reset(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), StreamError>> {
-        <P::Target as CancelStream>::poll_cancel(self.as_deref_mut(), cx, code)
+        <P::Target as ResetStream>::poll_reset(self.as_deref_mut(), cx, code)
     }
 }
 
 pin_project_lite::pin_project! {
-    pub struct Cancel<S:?Sized>{
+    pub struct Reset<S:?Sized>{
         code: VarInt,
         #[pin]
         stream: S
     }
 }
 
-impl<S: CancelStream + ?Sized> Future for Cancel<S> {
+impl<S: ResetStream + ?Sized> Future for Reset<S> {
     type Output = Result<(), StreamError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let project = self.project();
-        project.stream.poll_cancel(cx, *project.code)
+        project.stream.poll_reset(cx, *project.code)
     }
 }
 
-pub trait CancelStreamExt {
-    fn cancel(&mut self, code: VarInt) -> Cancel<&mut Self> {
-        Cancel { code, stream: self }
+pub trait ResetStreamExt {
+    fn reset(&mut self, code: VarInt) -> Reset<&mut Self> {
+        Reset { code, stream: self }
     }
 }
 
-impl<T: CancelStream + ?Sized> CancelStreamExt for T {}
+impl<T: ResetStream + ?Sized> ResetStreamExt for T {}
 
 /// Byte sink plus QUIC send-side reset control.
 ///
@@ -619,11 +618,11 @@ impl<T: CancelStream + ?Sized> CancelStreamExt for T {}
 /// outstanding operation rather than creating another one. A committed reset
 /// supersedes send-side work.
 pub trait WriteStream:
-    CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + Any
+    ResetStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + Any
 {
 }
 
-impl<S: CancelStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + ?Sized + Any>
+impl<S: ResetStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + ?Sized + Any>
     WriteStream for S
 {
 }
@@ -649,7 +648,7 @@ pub mod test {
     #[cfg(test)]
     use crate::{connection::tests::MockConnection, quic::Connect};
     use crate::{
-        quic::{CancelStream, GetStreamId, StopStream, StreamError},
+        quic::{GetStreamId, ResetStream, StopStream, StreamError},
         varint::VarInt,
     };
 
@@ -724,11 +723,11 @@ pub mod test {
         }
     }
 
-    impl<S: Sink<Packet> + ?Sized> CancelStream for MockStreamWriter<S>
+    impl<S: Sink<Packet> + ?Sized> ResetStream for MockStreamWriter<S>
     where
         StreamError: From<S::Error>,
     {
-        fn poll_cancel(
+        fn poll_reset(
             self: Pin<&mut Self>,
             cx: &mut Context,
             code: VarInt,
@@ -978,13 +977,13 @@ pub mod test {
     }
 
     #[tokio::test]
-    async fn mock_stream_cancel_delivers_sticky_reset_to_reader() {
-        use crate::quic::CancelStreamExt;
+    async fn mock_stream_reset_delivers_sticky_reset_to_reader() {
+        use crate::quic::ResetStreamExt;
 
         let reset_code = VarInt::from_u32(33);
         let (mut reader, mut writer) = mock_stream_pair(VarInt::from_u32(7));
 
-        writer.cancel(reset_code).await.expect("cancel stream");
+        writer.reset(reset_code).await.expect("reset stream");
 
         for _ in 0..2 {
             assert!(matches!(

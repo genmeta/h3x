@@ -11,7 +11,7 @@ use dhttp_identity::identity::{self as authority, SignError};
 use futures::{Sink, Stream, future::BoxFuture};
 use rustls::{SignatureScheme, pki_types::CertificateDer, sign::CertifiedKey};
 
-use crate::{error::Code, quic, quic::CancelStream, varint::VarInt};
+use crate::{error::Code, quic, quic::ResetStream, varint::VarInt};
 
 pub fn convert_varint(varint: dquic::prelude::VarInt) -> VarInt {
     // dquic's VarInt is already bounds-checked to RFC 9000 spec (< 2^62)
@@ -237,8 +237,8 @@ impl Sink<Bytes> for StreamWriter {
     }
 }
 
-impl CancelStream for StreamWriter {
-    fn poll_cancel(
+impl ResetStream for StreamWriter {
+    fn poll_reset(
         self: Pin<&mut Self>,
         _: &mut Context,
         code: VarInt,
@@ -520,7 +520,7 @@ mod tests {
     use super::*;
     use crate::{
         dquic::resolver::{Record, Resolve, ResolveFuture},
-        quic::{CancelStreamExt, GetStreamIdExt, Lifecycle, StopStreamExt},
+        quic::{GetStreamIdExt, Lifecycle, ResetStreamExt, StopStreamExt},
     };
 
     const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");
@@ -1147,7 +1147,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_stop_and_cancel_wrappers_complete() {
+    async fn stream_stop_and_reset_wrappers_complete() {
         let pair = connected_pair().await;
         let mut client_writer = with_timeout(quic::ManageStream::open_uni(pair.client.as_ref()))
             .await
@@ -1166,7 +1166,7 @@ mod tests {
             .await
             .expect("stop-sending completes on reader wrapper");
         client_writer
-            .cancel(VarInt::from_u32(0x11))
+            .reset(VarInt::from_u32(0x11))
             .await
             .expect("reset completes on writer wrapper");
         close_pair(&pair);

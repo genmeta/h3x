@@ -14,7 +14,7 @@ use crate::{
             validated_hyper_request_parts_to_field_lines,
         },
     },
-    quic::CancelStreamExt,
+    quic::ResetStreamExt,
 };
 
 #[derive(Debug, Snafu)]
@@ -87,7 +87,7 @@ impl WriteStream {
         let fields = match validated_hyper_request_parts_to_field_lines(parts) {
             Ok(fields) => fields,
             Err(source) => {
-                _ = self.stream.cancel(source.code().into_inner()).await;
+                _ = self.stream.reset(source.code().into_inner()).await;
                 return Err(SendMessageError::MalformedHeader { source });
             }
         };
@@ -108,7 +108,7 @@ impl WriteStream {
         let fields = match validated_hyper_request_parts_to_field_lines(parts) {
             Ok(fields) => fields,
             Err(source) => {
-                _ = self.stream.cancel(source.code().into_inner()).await;
+                _ = self.stream.reset(source.code().into_inner()).await;
                 return Err(SendMessageError::MalformedHeader { source });
             }
         };
@@ -198,10 +198,10 @@ mod tests {
         request.into_parts().0
     }
 
-    fn cancel_observing_write_stream(stream_id: VarInt) -> (WriteStream, Arc<Mutex<Vec<VarInt>>>) {
+    fn reset_observing_write_stream(stream_id: VarInt) -> (WriteStream, Arc<Mutex<Vec<VarInt>>>) {
         struct TestWriter {
             stream_id: VarInt,
-            cancelled: Arc<Mutex<Vec<VarInt>>>,
+            resets: Arc<Mutex<Vec<VarInt>>>,
         }
         impl quic::GetStreamId for TestWriter {
             fn poll_stream_id(
@@ -211,13 +211,13 @@ mod tests {
                 Poll::Ready(Ok(self.get_mut().stream_id))
             }
         }
-        impl quic::CancelStream for TestWriter {
-            fn poll_cancel(
+        impl quic::ResetStream for TestWriter {
+            fn poll_reset(
                 self: Pin<&mut Self>,
                 _cx: &mut Context<'_>,
                 code: VarInt,
             ) -> Poll<Result<(), quic::StreamError>> {
-                self.cancelled.lock().expect("cancel lock").push(code);
+                self.resets.lock().expect("reset lock").push(code);
                 Poll::Ready(Ok(()))
             }
         }
@@ -287,10 +287,10 @@ mod tests {
         ));
         let state = crate::connection::ConnectionState::new_for_test(erased, Arc::new(protocols));
 
-        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let resets = Arc::new(Mutex::new(Vec::new()));
         let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TestWriter {
             stream_id,
-            cancelled: cancelled.clone(),
+            resets: resets.clone(),
         })
             as crate::codec::BoxWriteStream));
 
@@ -304,7 +304,7 @@ mod tests {
             state,
         );
 
-        (stream, cancelled)
+        (stream, resets)
     }
 
     #[tokio::test]
@@ -403,7 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_hyper_request_with_observed_writer_accepts_valid_request() {
-        let (mut stream, cancelled) = cancel_observing_write_stream(VarInt::from_u32(0));
+        let (mut stream, resets) = reset_observing_write_stream(VarInt::from_u32(0));
         let request = http::Request::builder()
             .method(http::Method::POST)
             .uri(http::Uri::from_static("https://example.test/upload"))
@@ -417,7 +417,7 @@ mod tests {
         stream.flush().await.expect("stream flushed");
         stream.close().await.expect("stream closed");
 
-        assert!(cancelled.lock().expect("cancel lock").is_empty());
+        assert!(resets.lock().expect("reset lock").is_empty());
     }
 
     #[tokio::test]
@@ -483,8 +483,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_hyper_request_parts_cancels_stream_on_malformed_parts() {
-        let (mut stream, cancelled) = cancel_observing_write_stream(VarInt::from_u32(0));
+    async fn send_hyper_request_parts_resets_stream_on_malformed_parts() {
+        let (mut stream, resets) = reset_observing_write_stream(VarInt::from_u32(0));
         let expected_code =
             validated_hyper_request_parts_to_field_lines(request_parts("example.test"))
                 .expect_err("authority-only GET is malformed")
@@ -497,12 +497,12 @@ mod tests {
             .expect_err("authority-only GET is malformed");
 
         assert!(matches!(error, SendMessageError::MalformedHeader { .. }));
-        assert_eq!(*cancelled.lock().expect("cancel lock"), vec![expected_code]);
+        assert_eq!(*resets.lock().expect("reset lock"), vec![expected_code]);
     }
 
     #[tokio::test]
-    async fn send_hyper_request_cancels_stream_on_malformed_parts() {
-        let (mut stream, cancelled) = cancel_observing_write_stream(VarInt::from_u32(0));
+    async fn send_hyper_request_resets_stream_on_malformed_parts() {
+        let (mut stream, resets) = reset_observing_write_stream(VarInt::from_u32(0));
         let expected_code =
             validated_hyper_request_parts_to_field_lines(request_parts("example.test"))
                 .expect_err("authority-only GET is malformed")
@@ -520,7 +520,7 @@ mod tests {
             .expect_err("authority-only GET is malformed");
 
         assert!(matches!(error, SendMessageError::MalformedHeader { .. }));
-        assert_eq!(*cancelled.lock().expect("cancel lock"), vec![expected_code]);
+        assert_eq!(*resets.lock().expect("reset lock"), vec![expected_code]);
     }
 
     #[test]

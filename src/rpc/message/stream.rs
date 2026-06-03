@@ -12,7 +12,7 @@ use crate::message::stream::{
 };
 use crate::{
     message::stream::{BoxMessageStreamReader, BoxMessageStreamWriter, MessageStreamError},
-    quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
+    quic::{self, GetStreamIdExt, ResetStreamExt, StopStreamExt},
     util::deferred::{DeferredStreamReader, DeferredStreamWriter},
     varint::VarInt,
 };
@@ -35,14 +35,14 @@ pub trait ReadMessageStream: Send {
 /// Remote trait for writing to a message-level stream over remoc RTC.
 ///
 /// Data writes use [`MessageStreamError`]; QUIC control operations
-/// (`stream_id`, `cancel`) use [`quic::StreamError`].
+/// (`stream_id`, `reset`) use [`quic::StreamError`].
 #[remoc::rtc::remote]
 pub trait WriteMessageStream: Send {
     async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError>;
     async fn write(&mut self, data: Bytes) -> Result<(), MessageStreamError>;
     async fn flush(&mut self) -> Result<(), MessageStreamError>;
     async fn shutdown(&mut self) -> Result<(), MessageStreamError>;
-    async fn cancel(&mut self, code: VarInt) -> Result<(), quic::StreamError>;
+    async fn reset(&mut self, code: VarInt) -> Result<(), quic::StreamError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -86,8 +86,8 @@ where
         SinkExt::close(self).await
     }
 
-    async fn cancel(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
-        CancelStreamExt::cancel(self, code).await
+    async fn reset(&mut self, code: VarInt) -> Result<(), quic::StreamError> {
+        ResetStreamExt::reset(self, code).await
     }
 }
 
@@ -173,7 +173,7 @@ impl WriteMessageStreamClient {
                 }
             },
             |mut client: WriteMessageStreamClient, code| async move {
-                let res = client.cancel(code).await;
+                let res = client.reset(code).await;
                 (client, res)
             },
         ))
@@ -266,7 +266,7 @@ mod tests {
         Write(Bytes),
         Flush,
         Shutdown,
-        Cancel(VarInt),
+        Reset(VarInt),
     }
 
     struct TestWriteMessageStream {
@@ -283,8 +283,8 @@ mod tests {
         }
     }
 
-    impl quic::CancelStream for TestWriteMessageStream {
-        fn poll_cancel(
+    impl quic::ResetStream for TestWriteMessageStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context,
             code: VarInt,
@@ -292,7 +292,7 @@ mod tests {
             self.events
                 .lock()
                 .expect("event log poisoned")
-                .push(Event::Cancel(code));
+                .push(Event::Reset(code));
             Poll::Ready(Ok(()))
         }
     }
@@ -393,8 +393,8 @@ mod tests {
         }
     }
 
-    impl quic::CancelStream for BlockingWriteMessageStream {
-        fn poll_cancel(
+    impl quic::ResetStream for BlockingWriteMessageStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context,
             code: VarInt,
@@ -402,7 +402,7 @@ mod tests {
             self.events
                 .lock()
                 .expect("event log poisoned")
-                .push(Event::Cancel(code));
+                .push(Event::Reset(code));
             Poll::Ready(Ok(()))
         }
     }
@@ -507,7 +507,7 @@ mod tests {
     async fn blanket_write_message_stream_delegates_to_original_sink() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let stream_id = VarInt::from_u32(23);
-        let cancel_code = VarInt::from_u32(29);
+        let reset_code = VarInt::from_u32(29);
         let mut stream = TestWriteMessageStream {
             stream_id,
             events: events.clone(),
@@ -527,9 +527,9 @@ mod tests {
         WriteMessageStream::shutdown(&mut stream)
             .await
             .expect("shutdown succeeds");
-        WriteMessageStream::cancel(&mut stream, cancel_code)
+        WriteMessageStream::reset(&mut stream, reset_code)
             .await
-            .expect("cancel succeeds");
+            .expect("reset succeeds");
 
         assert_eq!(
             *events.lock().expect("event log poisoned"),
@@ -538,7 +538,7 @@ mod tests {
                 Event::Flush,
                 Event::Flush,
                 Event::Shutdown,
-                Event::Cancel(cancel_code),
+                Event::Reset(reset_code),
             ]
         );
     }
@@ -716,7 +716,7 @@ mod tests {
     #[tokio::test]
     async fn write_client_into_message_stream_delegates_and_box_writer_writes() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let cancel_code = VarInt::from_u32(47);
+        let reset_code = VarInt::from_u32(47);
         let (client, task) = spawn_write_server(TestWriteMessageStream {
             stream_id: VarInt::from_u32(45),
             events: events.clone(),
@@ -743,9 +743,9 @@ mod tests {
             .await
             .expect("flush succeeds");
         stream.as_mut().close().await.expect("shutdown succeeds");
-        CancelStreamExt::cancel(&mut stream.as_mut(), cancel_code)
+        ResetStreamExt::reset(&mut stream.as_mut(), reset_code)
             .await
-            .expect("cancel succeeds");
+            .expect("reset succeeds");
 
         assert_eq!(
             *events.lock().expect("event log poisoned"),
@@ -754,7 +754,7 @@ mod tests {
                 Event::Flush,
                 Event::Flush,
                 Event::Shutdown,
-                Event::Cancel(cancel_code),
+                Event::Reset(reset_code),
             ]
         );
         drop(stream);
@@ -797,9 +797,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_client_cancel_cancels_pending_remote_write() {
+    async fn write_client_reset_interrupts_pending_remote_write() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let cancel_code = VarInt::from_u32(53);
+        let reset_code = VarInt::from_u32(53);
         let (client, task) = spawn_write_server(BlockingWriteMessageStream {
             stream_id: VarInt::from_u32(51),
             events: events.clone(),
@@ -819,12 +819,12 @@ mod tests {
             .start_send(Bytes::from_static(b"pending"))
             .expect("start send succeeds");
 
-        CancelStreamExt::cancel(&mut stream.as_mut(), cancel_code)
+        ResetStreamExt::reset(&mut stream.as_mut(), reset_code)
             .await
-            .expect("cancel succeeds");
+            .expect("reset succeeds");
         assert_eq!(
             *events.lock().expect("event log poisoned"),
-            vec![Event::Cancel(cancel_code),]
+            vec![Event::Reset(reset_code),]
         );
 
         task.abort();

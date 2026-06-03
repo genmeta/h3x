@@ -28,7 +28,7 @@ use crate::{
     },
     connection::StreamError,
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
-    quic::{self, CancelStreamExt, ConnectionError, StopStreamExt},
+    quic::{self, ConnectionError, ResetStreamExt, StopStreamExt},
     stream_id::StreamId,
     varint::VarInt,
 };
@@ -124,7 +124,7 @@ impl WebTransportProtocol {
         if let Err((mut reader, mut writer)) = self.registry.route_bi(session_id, (reader, writer))
         {
             let code = crate::error::Code::H3_REQUEST_CANCELLED.into_inner();
-            _ = tokio::join!(reader.stop(code), writer.cancel(code));
+            _ = tokio::join!(reader.stop(code), writer.reset(code));
         }
 
         Ok(StreamVerdict::Accepted)
@@ -274,7 +274,7 @@ mod tests {
             vec![Code::H3_REQUEST_CANCELLED.into_inner()]
         );
         assert_eq!(
-            state.cancelled_codes(),
+            state.reset_codes(),
             vec![Code::H3_REQUEST_CANCELLED.into_inner()]
         );
     }
@@ -295,7 +295,7 @@ mod tests {
             state.stopped_codes(),
             vec![Code::H3_REQUEST_CANCELLED.into_inner()]
         );
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -331,7 +331,7 @@ mod tests {
             Bytes::from_static(&[0xde, 0xad])
         );
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -366,7 +366,7 @@ mod tests {
             Bytes::from_static(&[0xbe, 0xef])
         );
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -406,7 +406,7 @@ mod tests {
             Bytes::from_static(&[0xca, 0xfe])
         );
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -445,7 +445,7 @@ mod tests {
             Bytes::from_static(&[0xca, 0xfe])
         );
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -474,7 +474,7 @@ mod tests {
             Bytes::from_static(&[0x05, 0x99])
         );
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -502,7 +502,7 @@ mod tests {
             Bytes::from_static(&[0x06, 0x77])
         );
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -531,7 +531,7 @@ mod tests {
             Bytes::from_static(&[0x40])
         );
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -559,7 +559,7 @@ mod tests {
             Bytes::from_static(&[0x40])
         );
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -576,7 +576,7 @@ mod tests {
 
         assert!(matches!(verdict, StreamVerdict::Accepted));
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -592,7 +592,7 @@ mod tests {
 
         assert!(matches!(verdict, StreamVerdict::Accepted));
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -609,7 +609,7 @@ mod tests {
 
         assert!(matches!(verdict, StreamVerdict::Passed(_)));
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -625,7 +625,7 @@ mod tests {
 
         assert!(matches!(verdict, StreamVerdict::Passed(_)));
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -648,7 +648,7 @@ mod tests {
 
         assert!(matches!(verdict, StreamVerdict::Accepted));
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -670,7 +670,7 @@ mod tests {
 
         assert!(matches!(verdict, StreamVerdict::Accepted));
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -692,7 +692,7 @@ mod tests {
         let mut passed_reader = passed_reader.into_stream_reader();
         assert!(passed_reader.next().await.is_none());
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -713,7 +713,7 @@ mod tests {
         let mut passed_stream = passed_stream.into_stream_reader();
         assert!(passed_stream.next().await.is_none());
         assert!(state.stopped_codes().is_empty());
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -738,7 +738,7 @@ mod tests {
 
             assert!(matches!(verdict, StreamVerdict::Accepted));
             assert!(state.stopped_codes().is_empty());
-            assert!(state.cancelled_codes().is_empty());
+            assert!(state.reset_codes().is_empty());
         }
 
         let overflow_state = Arc::new(StreamState::default());
@@ -759,7 +759,7 @@ mod tests {
             vec![Code::H3_REQUEST_CANCELLED.into_inner()]
         );
         assert_eq!(
-            overflow_state.cancelled_codes(),
+            overflow_state.reset_codes(),
             vec![Code::H3_REQUEST_CANCELLED.into_inner()]
         );
 
@@ -780,7 +780,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_bidi_abort_for_unknown_session_is_ignored() {
-        let state = Arc::new(StreamState::with_stop_and_cancel_errors());
+        let state = Arc::new(StreamState::with_stop_and_reset_errors());
         let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x41, 0x2a])]);
         let writer = test_writer(state.clone());
         let protocol = test_protocol();
@@ -796,7 +796,7 @@ mod tests {
             vec![Code::H3_REQUEST_CANCELLED.into_inner()]
         );
         assert_eq!(
-            state.cancelled_codes(),
+            state.reset_codes(),
             vec![Code::H3_REQUEST_CANCELLED.into_inner()]
         );
     }
@@ -822,7 +822,7 @@ mod tests {
 
             assert!(matches!(verdict, StreamVerdict::Accepted));
             assert!(state.stopped_codes().is_empty());
-            assert!(state.cancelled_codes().is_empty());
+            assert!(state.reset_codes().is_empty());
         }
 
         let overflow_state = Arc::new(StreamState::default());
@@ -841,7 +841,7 @@ mod tests {
             overflow_state.stopped_codes(),
             vec![Code::H3_REQUEST_CANCELLED.into_inner()]
         );
-        assert!(overflow_state.cancelled_codes().is_empty());
+        assert!(overflow_state.reset_codes().is_empty());
 
         let mut routed_reader = registered
             .uni_rx
@@ -874,7 +874,7 @@ mod tests {
             state.stopped_codes(),
             vec![Code::H3_REQUEST_CANCELLED.into_inner()]
         );
-        assert!(state.cancelled_codes().is_empty());
+        assert!(state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -907,7 +907,7 @@ mod tests {
             vec![Code::H3_REQUEST_CANCELLED.into_inner()]
         );
         assert_eq!(
-            stream_state.cancelled_codes(),
+            stream_state.reset_codes(),
             vec![Code::H3_REQUEST_CANCELLED.into_inner()]
         );
     }
@@ -940,7 +940,7 @@ mod tests {
             stream_state.stopped_codes(),
             vec![Code::H3_REQUEST_CANCELLED.into_inner()]
         );
-        assert!(stream_state.cancelled_codes().is_empty());
+        assert!(stream_state.reset_codes().is_empty());
     }
 
     #[tokio::test]
@@ -1076,8 +1076,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stream_doubles_delegate_stream_id_stop_cancel_and_sink_operations() {
-        use quic::{CancelStreamExt as _, GetStreamIdExt as _, StopStreamExt as _};
+    async fn test_stream_doubles_delegate_stream_id_stop_reset_and_sink_operations() {
+        use quic::{GetStreamIdExt as _, ResetStreamExt as _, StopStreamExt as _};
 
         let state = Arc::new(StreamState::default());
 
@@ -1129,10 +1129,10 @@ mod tests {
             .await
             .expect("test writer sink close should succeed");
         writer
-            .cancel(VarInt::from_u32(0x12))
+            .reset(VarInt::from_u32(0x12))
             .await
-            .expect("writer cancel should succeed");
-        assert_eq!(state.cancelled_codes(), vec![VarInt::from_u32(0x12)]);
+            .expect("writer reset should succeed");
+        assert_eq!(state.reset_codes(), vec![VarInt::from_u32(0x12)]);
 
         let failing_reader_state = Arc::new(StreamState::with_stop_error());
         let mut failing_reader = TestReadStream {
@@ -1149,17 +1149,17 @@ mod tests {
             vec![VarInt::from_u32(0x13)]
         );
 
-        let failing_writer_state = Arc::new(StreamState::with_stop_and_cancel_errors());
+        let failing_writer_state = Arc::new(StreamState::with_stop_and_reset_errors());
         let mut failing_writer = TestWriteStream {
             state: failing_writer_state.clone(),
         };
         let error = failing_writer
-            .cancel(VarInt::from_u32(0x14))
+            .reset(VarInt::from_u32(0x14))
             .await
-            .expect_err("configured cancel error should surface");
+            .expect_err("configured reset error should surface");
         assert!(error.is_reset());
         assert_eq!(
-            failing_writer_state.cancelled_codes(),
+            failing_writer_state.reset_codes(),
             vec![VarInt::from_u32(0x14)]
         );
     }
@@ -1273,9 +1273,9 @@ mod tests {
     #[derive(Debug, Default)]
     struct StreamState {
         stopped: Mutex<Vec<VarInt>>,
-        cancelled: Mutex<Vec<VarInt>>,
+        resets: Mutex<Vec<VarInt>>,
         fail_stop: bool,
-        fail_cancel: bool,
+        fail_reset: bool,
     }
 
     impl StreamState {
@@ -1286,10 +1286,10 @@ mod tests {
             }
         }
 
-        fn with_stop_and_cancel_errors() -> Self {
+        fn with_stop_and_reset_errors() -> Self {
             Self {
                 fail_stop: true,
-                fail_cancel: true,
+                fail_reset: true,
                 ..Self::default()
             }
         }
@@ -1298,11 +1298,8 @@ mod tests {
             self.stopped.lock().expect("stopped lock poisoned").clone()
         }
 
-        fn cancelled_codes(&self) -> Vec<VarInt> {
-            self.cancelled
-                .lock()
-                .expect("cancelled lock poisoned")
-                .clone()
+        fn reset_codes(&self) -> Vec<VarInt> {
+            self.resets.lock().expect("resets lock poisoned").clone()
         }
     }
 
@@ -1391,18 +1388,18 @@ mod tests {
         }
     }
 
-    impl quic::CancelStream for TestWriteStream {
-        fn poll_cancel(
+    impl quic::ResetStream for TestWriteStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             code: VarInt,
         ) -> Poll<Result<(), quic::StreamError>> {
             self.state
-                .cancelled
+                .resets
                 .lock()
-                .expect("cancelled lock poisoned")
+                .expect("resets lock poisoned")
                 .push(code);
-            if self.state.fail_cancel {
+            if self.state.fail_reset {
                 Poll::Ready(Err(reset_stream_error(0x2f)))
             } else {
                 Poll::Ready(Ok(()))

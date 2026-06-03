@@ -3,7 +3,7 @@
 //! Parallel to [`super::quic`] which bridges raw QUIC streams, this module
 //! bridges **message-level** streams ([`ReadMessageStream`] / [`WriteMessageStream`])
 //! that carry HTTP/3 DATA frame semantics and use [`MessageStreamError`] for their
-//! data path. The QUIC-level control operations (`StopStream`, `CancelStream`,
+//! data path. The QUIC-level control operations (`StopStream`, `ResetStream`,
 //! `GetStreamId`) still use [`quic::StreamError`].
 //! The current RPC runtime implementation is backed by `remoc`.
 //!

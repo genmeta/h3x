@@ -139,18 +139,18 @@ where
     }
 }
 
-impl<S, E> quic::CancelStream for Resolved<S, E>
+impl<S, E> quic::ResetStream for Resolved<S, E>
 where
-    S: quic::CancelStream,
+    S: quic::ResetStream,
     E: Clone,
     quic::StreamError: From<E>,
 {
-    fn poll_cancel(
+    fn poll_reset(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        self.poll_inner()?.poll_cancel(cx, code)
+        self.poll_inner()?.poll_reset(cx, code)
     }
 }
 
@@ -524,19 +524,19 @@ where
     }
 }
 
-impl<S, E, F> quic::CancelStream for Deferred<S, E, F>
+impl<S, E, F> quic::ResetStream for Deferred<S, E, F>
 where
-    S: quic::CancelStream,
+    S: quic::ResetStream,
     E: Clone,
     quic::StreamError: From<E>,
     F: Future<Output = Result<S, E>>,
 {
-    fn poll_cancel(
+    fn poll_reset(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
-        ready!(self.poll(cx)?).poll_cancel(cx, code)
+        ready!(self.poll(cx)?).poll_reset(cx, code)
     }
 }
 
@@ -686,7 +686,7 @@ where
 
 impl<InnerStream, Error, OpenFuture> DeferredStreamWriter<InnerStream, Error, OpenFuture>
 where
-    InnerStream: quic::CancelStream,
+    InnerStream: quic::ResetStream,
     Error: Clone,
     quic::StreamError: From<Error>,
     OpenFuture: Future<Output = Result<InnerStream, Error>>,
@@ -705,22 +705,22 @@ where
                 Ok(stream) => stream,
                 Err(error) => return Poll::Ready(Err(error.into())),
             };
-            ready!(stream.poll_cancel(cx, code))
+            ready!(stream.poll_reset(cx, code))
         };
         self.as_mut().project().pending.pop_front();
         Poll::Ready(result)
     }
 }
 
-impl<InnerStream, Error, OpenFuture> quic::CancelStream
+impl<InnerStream, Error, OpenFuture> quic::ResetStream
     for DeferredStreamWriter<InnerStream, Error, OpenFuture>
 where
-    InnerStream: quic::CancelStream,
+    InnerStream: quic::ResetStream,
     Error: Clone,
     quic::StreamError: From<Error>,
     OpenFuture: Future<Output = Result<InnerStream, Error>>,
 {
-    fn poll_cancel(
+    fn poll_reset(
         mut self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
@@ -852,7 +852,7 @@ where
 
 impl<InnerStream, Error, OpenFuture> DeferredStreamWriter<InnerStream, Error, OpenFuture>
 where
-    InnerStream: quic::CancelStream,
+    InnerStream: quic::ResetStream,
     Error: Clone,
     quic::StreamError: From<Error>,
     OpenFuture: Future<Output = Result<InnerStream, Error>>,
@@ -922,7 +922,7 @@ where
 impl<InnerStream, Error, OpenFuture, Item> Sink<Item>
     for DeferredStreamWriter<InnerStream, Error, OpenFuture>
 where
-    InnerStream: Sink<Item> + quic::CancelStream,
+    InnerStream: Sink<Item> + quic::ResetStream,
     Error: Clone,
     InnerStream::Error: From<Error> + From<quic::StreamError>,
     quic::StreamError: From<Error>,
@@ -995,7 +995,7 @@ mod tests {
     use super::*;
     use crate::{
         codec::{DecodeError, EncodeError},
-        quic::{CancelStream, CancelStreamExt, GetStreamIdExt, StopStream, StopStreamExt},
+        quic::{GetStreamIdExt, ResetStream, ResetStreamExt, StopStream, StopStreamExt},
     };
 
     fn varint(value: u32) -> VarInt {
@@ -1028,7 +1028,7 @@ mod tests {
         Write(Bytes),
         Flush,
         Close,
-        Cancel(VarInt),
+        Reset(VarInt),
     }
 
     #[derive(Debug)]
@@ -1098,8 +1098,8 @@ mod tests {
         }
     }
 
-    impl quic::CancelStream for RecordingWriter {
-        fn poll_cancel(
+    impl quic::ResetStream for RecordingWriter {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context,
             code: VarInt,
@@ -1107,7 +1107,7 @@ mod tests {
             self.events
                 .lock()
                 .expect("event log poisoned")
-                .push(DeferredStreamEvent::Cancel(code));
+                .push(DeferredStreamEvent::Reset(code));
             Poll::Ready(Ok(()))
         }
     }
@@ -1274,7 +1274,7 @@ mod tests {
         );
 
         reader.stop(varint(12)).await.expect("stop");
-        writer.cancel(varint(13)).await.expect("cancel");
+        writer.reset(varint(13)).await.expect("reset");
 
         let (_reader, writer) = quic::test::mock_stream_pair(varint(14));
         let mut writer: Resolved<_, quic::StreamError> = Resolved::ok(writer);
@@ -1301,12 +1301,12 @@ mod tests {
         );
 
         let (_reader, writer) = quic::test::mock_stream_pair(varint(56));
-        let mut cancel = resolved_quic_error(writer, 57);
+        let mut reset = resolved_quic_error(writer, 57);
         assert_reset(
-            cancel
-                .cancel(varint(58))
+            reset
+                .reset(varint(58))
                 .await
-                .expect_err("cancel should fail"),
+                .expect_err("reset should fail"),
             varint(57),
         );
     }
@@ -1452,7 +1452,7 @@ mod tests {
         assert_eq!(reader.size_hint(), (0, None));
 
         reader.stop(varint(22)).await.expect("stop");
-        writer.cancel(varint(23)).await.expect("cancel");
+        writer.reset(varint(23)).await.expect("reset");
 
         let (_reader, writer) = quic::test::mock_stream_pair(varint(24));
         let mut writer = Deferred::from(ready(Ok::<_, quic::StreamError>(writer)));
@@ -1518,7 +1518,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            poll_fn(|cx| writer.as_mut().poll_cancel(cx, reset_code))
+            poll_fn(|cx| writer.as_mut().poll_reset(cx, reset_code))
                 .now_or_never()
                 .is_none()
         );
@@ -1536,7 +1536,7 @@ mod tests {
             .expect("writer becomes ready after reset drains");
         assert_eq!(
             *events.lock().expect("event log poisoned"),
-            vec![DeferredStreamEvent::Cancel(reset_code)]
+            vec![DeferredStreamEvent::Reset(reset_code)]
         );
     }
 
@@ -1612,12 +1612,12 @@ mod tests {
         );
 
         let (_reader, writer) = quic::test::mock_stream_pair(varint(36));
-        let mut cancel = deferred_quic_error(writer, 37);
+        let mut reset = deferred_quic_error(writer, 37);
         assert_reset(
-            cancel
-                .cancel(varint(38))
+            reset
+                .reset(varint(38))
                 .await
-                .expect_err("cancel should fail"),
+                .expect_err("reset should fail"),
             varint(37),
         );
 

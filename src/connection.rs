@@ -21,7 +21,7 @@ use crate::{
     error::{Code, H3ConnectionError, H3StreamError},
     protocol::{IdentifiedProtocolInitializer, ProductProtocol, Protocols, StreamVerdict},
     qpack::protocol::QPackProtocolFactory,
-    quic::{self, CancelStreamExt, StopStreamExt},
+    quic::{self, ResetStreamExt, StopStreamExt},
     varint::VarInt,
 };
 
@@ -567,7 +567,7 @@ impl<C: quic::Connection> ConnectionState<C> {
                     // https://datatracker.ietf.org/doc/html/rfc9114#section-9-4
                     Ok(StreamVerdict::Passed((mut stream_reader, mut stream_writer))) => {
                         let code = Code::H3_STREAM_CREATION_ERROR.into_inner();
-                        _ = tokio::join!(stream_reader.stop(code), stream_writer.cancel(code))
+                        _ = tokio::join!(stream_reader.stop(code), stream_writer.reset(code))
                     }
                     Err(stream_error) => {
                         // The stream has been consumed by protocol matching
@@ -725,7 +725,7 @@ pub(crate) mod tests {
     use crate::{
         error::{Code, H3MessageError, H3MissingSettings},
         protocol::Protocols,
-        quic::{self, CancelStreamExt, ConnectionError, StopStreamExt},
+        quic::{self, ConnectionError, ResetStreamExt, StopStreamExt},
         varint::VarInt,
     };
 
@@ -816,8 +816,8 @@ pub(crate) mod tests {
         }
     }
 
-    impl quic::CancelStream for TestWriteStream {
-        fn poll_cancel(
+    impl quic::ResetStream for TestWriteStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut std::task::Context,
             _code: VarInt,
@@ -1508,7 +1508,7 @@ pub(crate) mod tests {
 
     #[cfg(feature = "dquic")]
     #[tokio::test]
-    async fn accept_tasks_pass_unknown_streams_to_stop_and_cancel_paths() {
+    async fn accept_tasks_pass_unknown_streams_to_stop_and_reset_paths() {
         let bi_quic = MockConnection::new();
         bi_quic.enable_stream_ops();
         let bi_protocols = {
@@ -1898,7 +1898,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_stream_helpers_cover_stop_cancel_and_close() {
+    async fn test_stream_helpers_cover_stop_reset_and_close() {
         let mut reader = TestReadStream;
         reader
             .stop(VarInt::from_u32(0x103))
@@ -1907,9 +1907,9 @@ pub(crate) mod tests {
 
         let mut writer = TestWriteStream;
         writer
-            .cancel(VarInt::from_u32(0x103))
+            .reset(VarInt::from_u32(0x103))
             .await
-            .expect("test writer cancel should succeed");
+            .expect("test writer reset should succeed");
         writer
             .close()
             .await

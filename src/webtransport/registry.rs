@@ -200,7 +200,7 @@ mod tests {
     use super::*;
     use crate::{
         codec::{BoxReadStream, BoxWriteStream},
-        quic::{self, CancelStreamExt, GetStreamIdExt, StopStreamExt},
+        quic::{self, GetStreamIdExt, ResetStreamExt, StopStreamExt},
         varint::VarInt,
     };
 
@@ -291,8 +291,8 @@ mod tests {
         }
     }
 
-    impl quic::CancelStream for TestWriteStream {
-        fn poll_cancel(
+    impl quic::ResetStream for TestWriteStream {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             _code: VarInt,
@@ -358,7 +358,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_stream_writes_flushes_closes_and_cancels() {
+    async fn test_write_stream_writes_flushes_closes_and_resets() {
         let state = Arc::new(StreamState::default());
         let mut stream = test_write_stream(42, Arc::clone(&state));
 
@@ -378,9 +378,9 @@ mod tests {
             .await
             .expect("write stream close should succeed");
         stream
-            .cancel(VarInt::from_u32(43))
+            .reset(VarInt::from_u32(43))
             .await
-            .expect("write stream cancel should succeed");
+            .expect("write stream reset should succeed");
 
         assert_eq!(
             *state

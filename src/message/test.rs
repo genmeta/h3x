@@ -121,8 +121,8 @@ pub fn write_stream_for_test(stream_id: VarInt) -> WriteStream {
             Poll::Ready(Ok(self.get_mut().stream_id))
         }
     }
-    impl quic::CancelStream for TestWriter {
-        fn poll_cancel(
+    impl quic::ResetStream for TestWriter {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context,
             _code: VarInt,
@@ -231,11 +231,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_stream_cancel() {
+    async fn test_write_stream_reset() {
         let stream_id = VarInt::from_u32(4);
         let mut write_stream = write_stream_for_test(stream_id);
-        let result = write_stream.cancel(Code::H3_NO_ERROR).await;
-        assert!(result.is_ok(), "cancel should succeed on mock writer");
+        let result = write_stream.reset(Code::H3_NO_ERROR).await;
+        assert!(result.is_ok(), "reset should succeed on mock writer");
     }
 
     #[tokio::test]

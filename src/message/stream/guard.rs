@@ -11,7 +11,7 @@ use tracing::Instrument;
 use crate::{
     codec::{BoxReadStream, BoxWriteStream},
     error::Code,
-    quic::{self, CancelStreamExt, StopStreamExt},
+    quic::{self, ResetStreamExt, StopStreamExt},
     varint::VarInt,
 };
 
@@ -53,8 +53,8 @@ impl Sink<Bytes> for DroppedStream {
     }
 }
 
-impl quic::CancelStream for DroppedStream {
-    fn poll_cancel(
+impl quic::ResetStream for DroppedStream {
+    fn poll_reset(
         self: Pin<&mut Self>,
         _cx: &mut Context,
         _code: VarInt,
@@ -174,8 +174,8 @@ impl Drop for GuardedQuicReader {
 // GuardedQuicWriter
 // ---------------------------------------------------------------------------
 
-/// A QUIC write stream wrapper that automatically cancels the stream on drop
-/// if it hasn't been properly closed or explicitly cancelled.
+/// A QUIC write stream wrapper that automatically resets the stream on drop if
+/// it hasn't been properly closed or explicitly reset.
 pub struct GuardedQuicWriter {
     inner: BoxWriteStream,
     completed: bool,
@@ -224,14 +224,14 @@ impl Sink<Bytes> for GuardedQuicWriter {
     }
 }
 
-impl quic::CancelStream for GuardedQuicWriter {
-    fn poll_cancel(
+impl quic::ResetStream for GuardedQuicWriter {
+    fn poll_reset(
         self: Pin<&mut Self>,
         cx: &mut Context,
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
         let this = self.get_mut();
-        let result = this.inner.as_mut().poll_cancel(cx, code);
+        let result = this.inner.as_mut().poll_reset(cx, code);
         if let Poll::Ready(Ok(())) = &result {
             this.completed = true;
         }
@@ -254,7 +254,7 @@ impl Drop for GuardedQuicWriter {
             let mut inner = mem::replace(&mut self.inner, dropped_writer());
             tokio::spawn(
                 async move {
-                    _ = inner.cancel(Code::H3_NO_ERROR.into()).await;
+                    _ = inner.reset(Code::H3_NO_ERROR.into()).await;
                 }
                 .in_current_span(),
             );
@@ -277,7 +277,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::quic::{CancelStream, GetStreamId, GetStreamIdExt, StopStream};
+    use crate::quic::{GetStreamId, GetStreamIdExt, ResetStream, StopStream};
 
     fn stream_error(code: u32) -> quic::StreamError {
         quic::StreamError::Reset {
@@ -308,7 +308,7 @@ mod tests {
     async fn assert_no_code(mut rx: mpsc::UnboundedReceiver<VarInt>) {
         match timeout(Duration::from_millis(50), rx.recv()).await {
             Err(_) | Ok(None) => {}
-            Ok(Some(code)) => panic!("unexpected stop/cancel notification received: {code}"),
+            Ok(Some(code)) => panic!("unexpected stop/reset notification received: {code}"),
         }
     }
 
@@ -395,12 +395,12 @@ mod tests {
         stream_id: VarInt,
         sent_items: SentItems,
         close_results: StopResultQueue,
-        cancel_results: StopResultQueue,
+        reset_results: StopResultQueue,
     }
 
     struct TestWriter {
         state: WriterState,
-        cancel_tx: mpsc::UnboundedSender<VarInt>,
+        reset_tx: mpsc::UnboundedSender<VarInt>,
     }
 
     impl Sink<Bytes> for TestWriter {
@@ -444,20 +444,20 @@ mod tests {
         }
     }
 
-    impl quic::CancelStream for TestWriter {
-        fn poll_cancel(
+    impl quic::ResetStream for TestWriter {
+        fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context,
             code: VarInt,
         ) -> Poll<Result<(), quic::StreamError>> {
-            self.cancel_tx
+            self.reset_tx
                 .send(code)
-                .expect("writer cancel receiver should still be alive");
+                .expect("writer reset receiver should still be alive");
             let result = self
                 .state
-                .cancel_results
+                .reset_results
                 .lock()
-                .expect("writer cancel queue lock should not be poisoned")
+                .expect("writer reset queue lock should not be poisoned")
                 .pop_front()
                 .unwrap_or(Ok(()));
             Poll::Ready(result)
@@ -476,7 +476,7 @@ mod tests {
     fn writer_guard(
         stream_id: u32,
         close_results: impl IntoIterator<Item = Result<(), quic::StreamError>>,
-        cancel_results: impl IntoIterator<Item = Result<(), quic::StreamError>>,
+        reset_results: impl IntoIterator<Item = Result<(), quic::StreamError>>,
     ) -> (
         GuardedQuicWriter,
         SentItems,
@@ -487,13 +487,13 @@ mod tests {
             stream_id: VarInt::from_u32(stream_id),
             sent_items: sent_items.clone(),
             close_results: Arc::new(Mutex::new(close_results.into_iter().collect())),
-            cancel_results: Arc::new(Mutex::new(cancel_results.into_iter().collect())),
+            reset_results: Arc::new(Mutex::new(reset_results.into_iter().collect())),
         };
-        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
+        let (reset_tx, reset_rx) = mpsc::unbounded_channel();
         (
-            GuardedQuicWriter::new(Box::pin(TestWriter { state, cancel_tx })),
+            GuardedQuicWriter::new(Box::pin(TestWriter { state, reset_tx })),
             sent_items,
-            cancel_rx,
+            reset_rx,
         )
     }
 
@@ -597,7 +597,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_take_moves_inner_stream_and_panics_on_original_use() {
-        let (mut guard, sent_items, cancel_rx) = writer_guard(8, [], [Ok(())]);
+        let (mut guard, sent_items, reset_rx) = writer_guard(8, [], [Ok(())]);
         let mut taken = GuardedQuicWriter::take(&mut guard);
 
         assert_eq!(
@@ -635,7 +635,7 @@ mod tests {
             let _ = Pin::new(&mut guard).poll_close(&mut cx);
         });
         assert_guard_panic(|| {
-            let _ = Pin::new(&mut guard).poll_cancel(&mut cx, VarInt::from_u32(2));
+            let _ = Pin::new(&mut guard).poll_reset(&mut cx, VarInt::from_u32(2));
         });
 
         drop(guard);
@@ -643,48 +643,48 @@ mod tests {
 
         assert_eq!(
             timeout(Duration::from_secs(1), async move {
-                let mut cancel_rx = cancel_rx;
-                cancel_rx.recv().await
+                let mut reset_rx = reset_rx;
+                reset_rx.recv().await
             })
             .await
             .expect("writer drop cleanup should run")
-            .expect("writer cancel code should be sent"),
+            .expect("writer reset code should be sent"),
             VarInt::from(Code::H3_NO_ERROR),
         );
     }
 
     #[tokio::test]
-    async fn writer_close_ok_marks_completed_and_drop_skips_cancel() {
-        let (mut guard, _, cancel_rx) = writer_guard(21, [Ok(())], []);
+    async fn writer_close_ok_marks_completed_and_drop_skips_reset() {
+        let (mut guard, _, reset_rx) = writer_guard(21, [Ok(())], []);
 
         guard.close().await.expect("close should succeed");
 
         drop(guard);
-        assert_no_code(cancel_rx).await;
+        assert_no_code(reset_rx).await;
     }
 
     #[tokio::test]
-    async fn writer_cancel_ok_marks_completed_and_drop_skips_second_cancel() {
-        let (mut guard, _, mut cancel_rx) = writer_guard(22, [], [Ok(())]);
+    async fn writer_reset_ok_marks_completed_and_drop_skips_second_reset() {
+        let (mut guard, _, mut reset_rx) = writer_guard(22, [], [Ok(())]);
 
-        poll_fn(|cx| Pin::new(&mut guard).poll_cancel(cx, VarInt::from_u32(66)))
+        poll_fn(|cx| Pin::new(&mut guard).poll_reset(cx, VarInt::from_u32(66)))
             .await
-            .expect("cancel should succeed");
+            .expect("reset should succeed");
         assert_eq!(
-            timeout(Duration::from_secs(1), cancel_rx.recv())
+            timeout(Duration::from_secs(1), reset_rx.recv())
                 .await
-                .expect("cancel call should notify")
-                .expect("cancel code should be present"),
+                .expect("reset call should notify")
+                .expect("reset code should be present"),
             VarInt::from_u32(66),
         );
 
         drop(guard);
-        assert_no_code(cancel_rx).await;
+        assert_no_code(reset_rx).await;
     }
 
     #[tokio::test]
     async fn writer_close_error_keeps_guard_incomplete_for_drop_cleanup() {
-        let (mut guard, _, mut cancel_rx) = writer_guard(23, [Err(stream_error(77))], [Ok(())]);
+        let (mut guard, _, mut reset_rx) = writer_guard(23, [Err(stream_error(77))], [Ok(())]);
 
         let error = guard.close().await.expect_err("close should fail");
         assert!(matches!(
@@ -695,10 +695,10 @@ mod tests {
         drop(guard);
 
         assert_eq!(
-            timeout(Duration::from_secs(1), cancel_rx.recv())
+            timeout(Duration::from_secs(1), reset_rx.recv())
                 .await
-                .expect("drop cleanup should cancel")
-                .expect("cancel code should be present"),
+                .expect("drop cleanup should reset")
+                .expect("reset code should be present"),
             VarInt::from(Code::H3_NO_ERROR),
         );
     }
