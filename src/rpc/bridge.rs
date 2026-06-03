@@ -57,6 +57,8 @@ pin_project_lite::pin_project! {
     pub(super) struct ReadBridge<St, E, R, RF, S, SF> {
         stream_id: VarInt,
         terminated: bool,
+        pending_stop: Option<VarInt>,
+        pending_item: Option<Result<Bytes, E>>,
         #[pin]
         state: ReadState<St, RF, SF>,
 
@@ -73,6 +75,8 @@ impl<St, E, R, RF, S, SF> ReadBridge<St, E, R, RF, S, SF> {
         Self {
             stream_id,
             terminated: false,
+            pending_stop: None,
+            pending_item: None,
             state: ReadState::Stream { stream: client },
             read,
             stop,
@@ -105,8 +109,24 @@ where
         let mut state = project.state;
 
         loop {
+            let stop_in_flight = matches!(state.as_mut().project(), ReadStateProj::Stop { .. });
+            if project.pending_stop.is_none()
+                && !stop_in_flight
+                && let Some(item) = project.pending_item.take()
+            {
+                return Poll::Ready(Some(item));
+            }
+
             match state.as_mut().project() {
                 ReadStateProj::Stream { .. } => {
+                    if let Some(code) = project.pending_stop.take() {
+                        let stream = state.as_mut().take_stream();
+                        state.set(ReadState::Stop {
+                            code,
+                            future: (project.stop)(stream, code),
+                        });
+                        continue;
+                    }
                     if *project.terminated {
                         return Poll::Ready(None);
                     }
@@ -117,14 +137,21 @@ where
                         future: (project.read)(stream, cancellation_token),
                     });
                 }
-                ReadStateProj::Read { future, .. } => {
+                ReadStateProj::Read { future, token } => {
+                    if project.pending_stop.is_some() {
+                        token.cancel();
+                    }
                     match ready!(future.poll(cx)) {
                         Either::Left((stream, result)) => {
-                            if result.is_none() {
-                                *project.terminated = true;
+                            match result {
+                                Some(item) => {
+                                    *project.pending_item = Some(item);
+                                }
+                                None => {
+                                    *project.terminated = true;
+                                }
                             }
                             state.set(ReadState::Stream { stream });
-                            return Poll::Ready(result);
                         }
                         Either::Right(stream) => {
                             state.set(ReadState::Stream { stream });
@@ -171,14 +198,39 @@ where
         let project = self.project();
         let mut state = project.state;
 
+        let stop_in_flight_with_same_code = matches!(state.as_mut().project(), ReadStateProj::Stop { code: sent, .. } if *sent == code);
+        if !stop_in_flight_with_same_code && project.pending_stop.is_none() {
+            *project.pending_stop = Some(code);
+        }
+
         loop {
-            let stream = match state.as_mut().project() {
-                ReadStateProj::Stream { .. } => state.as_mut().take_stream(),
+            match state.as_mut().project() {
+                ReadStateProj::Stream { .. } => {
+                    let code = project.pending_stop.take().unwrap_or(code);
+                    let stream = state.as_mut().take_stream();
+                    state.set(ReadState::Stop {
+                        code,
+                        future: (project.stop)(stream, code),
+                    });
+                }
                 ReadStateProj::Read { future, token } => {
                     token.cancel();
-                    let (Either::Left((stream, ..)) | Either::Right(stream)) =
-                        ready!(future.poll(cx));
-                    stream
+                    match ready!(future.poll(cx)) {
+                        Either::Left((stream, result)) => {
+                            match result {
+                                Some(item) => {
+                                    *project.pending_item = Some(item);
+                                }
+                                None => {
+                                    *project.terminated = true;
+                                }
+                            }
+                            state.set(ReadState::Stream { stream });
+                        }
+                        Either::Right(stream) => {
+                            state.set(ReadState::Stream { stream });
+                        }
+                    }
                 }
                 ReadStateProj::Stop { future, code: sent } => {
                     let (stream, result) = ready!(future.poll(cx));
@@ -186,15 +238,14 @@ where
                         state.set(ReadState::Stream { stream });
                         return Poll::Ready(result);
                     } else {
-                        stream
+                        if project.pending_stop.is_none() {
+                            *project.pending_stop = Some(code);
+                        }
+                        state.set(ReadState::Stream { stream });
                     }
                 }
                 ReadStateProj::Empty => unreachable!("invalid state for poll_stop"),
-            };
-            state.set(ReadState::Stop {
-                code,
-                future: (project.stop)(stream, code),
-            })
+            }
         }
     }
 }
@@ -249,6 +300,9 @@ pin_project_lite::pin_project! {
     /// - `C / CF`: reset closure / future
     pub(super) struct WriteBridge<St, E, W, WF, F, FF, S, SF, C, CF> {
         stream_id: VarInt,
+        pending_reset: Option<VarInt>,
+        pending_flush: bool,
+        pending_shutdown: bool,
         #[pin]
         state: WriteState<St, WF, FF, SF, CF>,
 
@@ -273,6 +327,9 @@ impl<St, E, W, WF, F, FF, S, SF, C, CF> WriteBridge<St, E, W, WF, F, FF, S, SF, 
     ) -> Self {
         Self {
             stream_id,
+            pending_reset: None,
+            pending_flush: false,
+            pending_shutdown: false,
             state: WriteState::Stream { stream: client },
             write,
             flush,
@@ -314,8 +371,71 @@ where
         let mut state = project.state;
 
         loop {
+            if let Some(code) = *project.pending_reset {
+                match state.as_mut().project() {
+                    WriteStateProj::Stream { .. } => {
+                        let code = project
+                            .pending_reset
+                            .take()
+                            .expect("pending reset code must exist");
+                        let stream = state.as_mut().take_stream();
+                        state.set(WriteState::Reset {
+                            code,
+                            future: (project.reset)(stream, code),
+                        });
+                    }
+                    WriteStateProj::Write { future, token } => {
+                        token.cancel();
+                        let (Either::Left((stream, ..)) | Either::Right(stream)) =
+                            ready!(future.poll(cx));
+                        state.set(WriteState::Stream { stream });
+                    }
+                    WriteStateProj::Flush { future, token } => {
+                        token.cancel();
+                        let (Either::Left((stream, ..)) | Either::Right(stream)) =
+                            ready!(future.poll(cx));
+                        state.set(WriteState::Stream { stream });
+                    }
+                    WriteStateProj::Shutdown { future, token } => {
+                        token.cancel();
+                        let (Either::Left((stream, ..)) | Either::Right(stream)) =
+                            ready!(future.poll(cx));
+                        state.set(WriteState::Stream { stream });
+                    }
+                    WriteStateProj::Reset { future, code: sent } => {
+                        let sent_matches_pending = *sent == code;
+                        let (stream, result) = ready!(future.poll(cx));
+                        state.set(WriteState::Stream { stream });
+                        if sent_matches_pending {
+                            *project.pending_reset = None;
+                            result?;
+                        }
+                    }
+                    WriteStateProj::Empty => unreachable!("invalid state for poll_ready"),
+                };
+                continue;
+            }
+
             match state.as_mut().project() {
-                WriteStateProj::Stream { .. } => return Poll::Ready(Ok(())),
+                WriteStateProj::Stream { .. } => {
+                    let stream = state.as_mut().take_stream();
+                    if *project.pending_flush {
+                        let cancellation_token = CancellationToken::new();
+                        state.set(WriteState::Flush {
+                            token: cancellation_token.clone(),
+                            future: (project.flush)(stream, cancellation_token),
+                        });
+                    } else if *project.pending_shutdown {
+                        let cancellation_token = CancellationToken::new();
+                        state.set(WriteState::Shutdown {
+                            token: cancellation_token.clone(),
+                            future: (project.shutdown)(stream, cancellation_token),
+                        });
+                    } else {
+                        state.set(WriteState::Stream { stream });
+                        return Poll::Ready(Ok(()));
+                    }
+                }
                 WriteStateProj::Write { future, .. } => {
                     match ready!(future.poll(cx)) {
                         Either::Left((stream, result)) => {
@@ -331,10 +451,12 @@ where
                     match ready!(future.poll(cx)) {
                         Either::Left((stream, result)) => {
                             state.set(WriteState::Stream { stream });
+                            *project.pending_flush = false;
                             result?;
                         }
                         Either::Right(stream) => {
                             state.set(WriteState::Stream { stream });
+                            *project.pending_flush = false;
                         }
                     };
                 }
@@ -342,10 +464,12 @@ where
                     match ready!(future.poll(cx)) {
                         Either::Left((stream, result)) => {
                             state.set(WriteState::Stream { stream });
+                            *project.pending_shutdown = false;
                             result?;
                         }
                         Either::Right(stream) => {
                             state.set(WriteState::Stream { stream });
+                            *project.pending_shutdown = false;
                         }
                     };
                 }
@@ -373,45 +497,19 @@ where
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        loop {
-            let is_flush = matches!(self.state, WriteState::Flush { .. });
-
-            ready!(self.as_mut().poll_ready(cx)?);
-            if is_flush {
-                return Poll::Ready(Ok(()));
-            }
-
+        {
             let project = self.as_mut().project();
-            let mut state = project.state;
-
-            let stream = state.as_mut().take_stream();
-            let cancellation_token = CancellationToken::new();
-            state.set(WriteState::Flush {
-                token: cancellation_token.clone(),
-                future: (project.flush)(stream, cancellation_token),
-            });
+            *project.pending_flush = true;
         }
+        self.poll_ready(cx)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        loop {
-            let is_shutdown = matches!(self.state, WriteState::Shutdown { .. });
-
-            ready!(self.as_mut().poll_ready(cx)?);
-            if is_shutdown {
-                return Poll::Ready(Ok(()));
-            }
-
+        {
             let project = self.as_mut().project();
-            let mut state = project.state;
-
-            let stream = state.as_mut().take_stream();
-            let cancellation_token = CancellationToken::new();
-            state.set(WriteState::Shutdown {
-                token: cancellation_token.clone(),
-                future: (project.shutdown)(stream, cancellation_token),
-            });
+            *project.pending_shutdown = true;
         }
+        self.poll_ready(cx)
     }
 }
 
@@ -436,26 +534,78 @@ where
         let project = self.project();
         let mut state = project.state;
 
+        let reset_in_flight_with_same_code = matches!(state.as_mut().project(), WriteStateProj::Reset { code: sent, .. } if *sent == code);
+        if !reset_in_flight_with_same_code && project.pending_reset.is_none() {
+            *project.pending_reset = Some(code);
+        }
+        *project.pending_flush = false;
+        *project.pending_shutdown = false;
+
         loop {
-            let stream = match state.as_mut().project() {
-                WriteStateProj::Stream { .. } => state.as_mut().take_stream(),
+            if let Some(pending_code) = *project.pending_reset {
+                match state.as_mut().project() {
+                    WriteStateProj::Stream { .. } => {
+                        let pending_code = project
+                            .pending_reset
+                            .take()
+                            .expect("pending reset code must exist");
+                        let stream = state.as_mut().take_stream();
+                        state.set(WriteState::Reset {
+                            code: pending_code,
+                            future: (project.reset)(stream, pending_code),
+                        });
+                    }
+                    WriteStateProj::Write { future, token } => {
+                        token.cancel();
+                        let (Either::Left((stream, ..)) | Either::Right(stream)) =
+                            ready!(future.poll(cx));
+                        state.set(WriteState::Stream { stream });
+                    }
+                    WriteStateProj::Flush { future, token } => {
+                        token.cancel();
+                        let (Either::Left((stream, ..)) | Either::Right(stream)) =
+                            ready!(future.poll(cx));
+                        state.set(WriteState::Stream { stream });
+                    }
+                    WriteStateProj::Shutdown { future, token } => {
+                        token.cancel();
+                        let (Either::Left((stream, ..)) | Either::Right(stream)) =
+                            ready!(future.poll(cx));
+                        state.set(WriteState::Stream { stream });
+                    }
+                    WriteStateProj::Reset { future, code: sent } => {
+                        let sent_matches_pending = *sent == pending_code;
+                        let (stream, result) = ready!(future.poll(cx));
+                        state.set(WriteState::Stream { stream });
+                        if sent_matches_pending {
+                            *project.pending_reset = None;
+                            return Poll::Ready(result);
+                        }
+                    }
+                    WriteStateProj::Empty => unreachable!("invalid state for poll_reset"),
+                }
+                continue;
+            }
+
+            match state.as_mut().project() {
+                WriteStateProj::Stream { .. } => return Poll::Ready(Ok(())),
                 WriteStateProj::Write { future, token } => {
                     token.cancel();
                     let (Either::Left((stream, ..)) | Either::Right(stream)) =
                         ready!(future.poll(cx));
-                    stream
+                    state.set(WriteState::Stream { stream });
                 }
                 WriteStateProj::Flush { future, token } => {
                     token.cancel();
                     let (Either::Left((stream, ..)) | Either::Right(stream)) =
                         ready!(future.poll(cx));
-                    stream
+                    state.set(WriteState::Stream { stream });
                 }
                 WriteStateProj::Shutdown { future, token } => {
                     token.cancel();
                     let (Either::Left((stream, ..)) | Either::Right(stream)) =
                         ready!(future.poll(cx));
-                    stream
+                    state.set(WriteState::Stream { stream });
                 }
                 WriteStateProj::Reset { future, code: sent } => {
                     let (stream, result) = ready!(future.poll(cx));
@@ -463,15 +613,14 @@ where
                         state.set(WriteState::Stream { stream });
                         return Poll::Ready(result);
                     } else {
-                        stream
+                        if project.pending_reset.is_none() {
+                            *project.pending_reset = Some(code);
+                        }
+                        state.set(WriteState::Stream { stream });
                     }
                 }
                 WriteStateProj::Empty => unreachable!("invalid state for poll_reset"),
-            };
-            state.set(WriteState::Reset {
-                code,
-                future: (project.reset)(stream, code),
-            })
+            }
         }
     }
 }
@@ -634,6 +783,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_bridge_pending_stop_survives_dropped_first_poll_while_read_in_flight() {
+        let stream_id = VarInt::from_u32(111);
+        let client = TestReadClient::new([]);
+        let events_handle = client.events.clone();
+        let (read_release_tx, read_release_rx) = tokio::sync::oneshot::channel::<()>();
+        let read_release_rx = Arc::new(Mutex::new(Some(read_release_rx)));
+        let read_attempts = Arc::new(Mutex::new(0_u32));
+        let attempts_for_read = read_attempts.clone();
+        let mut bridge = Box::pin(ReadBridge::<_, quic::StreamError, _, _, _, _>::new(
+            stream_id,
+            client,
+            move |client: TestReadClient, token: CancellationToken| {
+                let read_release_rx = read_release_rx.clone();
+                let attempts_for_read = attempts_for_read.clone();
+                async move {
+                    let attempt = {
+                        let mut attempts = attempts_for_read.lock().expect("attempts");
+                        *attempts += 1;
+                        *attempts
+                    };
+                    if attempt == 1 {
+                        client.record(Event::ReadStarted);
+                        token.cancelled().await;
+                        client.record(Event::ReadCancelled);
+                        let rx = take_locked(&read_release_rx).expect("read release");
+                        let _ = rx.await;
+                        Either::Right(client)
+                    } else {
+                        Either::Left((client, None))
+                    }
+                }
+            },
+            |client: TestReadClient, code: VarInt| async move {
+                client.record(Event::Stop(code.into_inner()));
+                (client, Ok(()))
+            },
+        ));
+
+        assert!(
+            poll_fn(|cx| bridge.as_mut().poll_next(cx))
+                .now_or_never()
+                .is_none(),
+            "read should remain pending"
+        );
+
+        let first_stop =
+            poll_fn(|cx| bridge.as_mut().poll_stop(cx, VarInt::from_u32(77))).now_or_never();
+        assert!(
+            first_stop.is_none(),
+            "first stop poll should commit but wait for the in-flight read"
+        );
+        drop(first_stop);
+
+        read_release_tx.send(()).expect("release read");
+        assert!(
+            bridge.next().await.is_none(),
+            "next poll should complete the committed stop before EOF"
+        );
+
+        assert_eq!(
+            events(events_handle.as_ref()),
+            vec![Event::ReadStarted, Event::ReadCancelled, Event::Stop(77),],
+        );
+    }
+
+    #[tokio::test]
     async fn read_bridge_propagates_read_and_stop_errors() {
         let read_code = VarInt::from_u32(31);
         let stop_code = VarInt::from_u32(32);
@@ -757,6 +972,202 @@ mod tests {
                 Event::WriteStarted(Bytes::from_static(b"pending")),
                 Event::WriteCancelled,
                 Event::Reset(23),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn write_bridge_pending_flush_survives_dropped_first_poll_while_write_in_flight() {
+        let client = TestWriteClient::new();
+        let events_handle = client.events.clone();
+        let (write_release_tx, write_release_rx) = tokio::sync::oneshot::channel::<()>();
+        let write_release_rx = Arc::new(Mutex::new(Some(write_release_rx)));
+        let mut bridge = Box::pin(
+            WriteBridge::<_, quic::StreamError, _, _, _, _, _, _, _, _>::new(
+                VarInt::from_u32(211),
+                client,
+                move |client: TestWriteClient, _token: CancellationToken, bytes: Bytes| {
+                    let write_release_rx = write_release_rx.clone();
+                    async move {
+                        client.record(Event::WriteStarted(bytes.clone()));
+                        let rx = take_locked(&write_release_rx).expect("write release");
+                        let _ = rx.await;
+                        client.record(Event::Write(bytes));
+                        Either::Left((client, Ok(())))
+                    }
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    client.record(Event::Flush);
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    client.record(Event::Shutdown);
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, code: VarInt| async move {
+                    client.record(Event::Reset(code.into_inner()));
+                    (client, Ok(()))
+                },
+            ),
+        );
+
+        poll_fn(|cx| bridge.as_mut().poll_ready(cx))
+            .await
+            .expect("ready");
+        bridge
+            .as_mut()
+            .start_send(Bytes::from_static(b"pending-flush"))
+            .expect("start send");
+
+        assert!(
+            poll_fn(|cx| bridge.as_mut().poll_flush(cx))
+                .now_or_never()
+                .is_none(),
+            "flush should commit and wait for the in-flight write"
+        );
+
+        write_release_tx.send(()).expect("release write");
+        poll_fn(|cx| bridge.as_mut().poll_ready(cx))
+            .await
+            .expect("poll_ready continues committed flush");
+
+        assert_eq!(
+            events(events_handle.as_ref()),
+            vec![
+                Event::WriteStarted(Bytes::from_static(b"pending-flush")),
+                Event::Write(Bytes::from_static(b"pending-flush")),
+                Event::Flush,
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn write_bridge_pending_close_survives_dropped_first_poll_while_write_in_flight() {
+        let client = TestWriteClient::new();
+        let events_handle = client.events.clone();
+        let (write_release_tx, write_release_rx) = tokio::sync::oneshot::channel::<()>();
+        let write_release_rx = Arc::new(Mutex::new(Some(write_release_rx)));
+        let mut bridge = Box::pin(
+            WriteBridge::<_, quic::StreamError, _, _, _, _, _, _, _, _>::new(
+                VarInt::from_u32(212),
+                client,
+                move |client: TestWriteClient, _token: CancellationToken, bytes: Bytes| {
+                    let write_release_rx = write_release_rx.clone();
+                    async move {
+                        client.record(Event::WriteStarted(bytes.clone()));
+                        let rx = take_locked(&write_release_rx).expect("write release");
+                        let _ = rx.await;
+                        client.record(Event::Write(bytes));
+                        Either::Left((client, Ok(())))
+                    }
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    client.record(Event::Flush);
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    client.record(Event::Shutdown);
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, code: VarInt| async move {
+                    client.record(Event::Reset(code.into_inner()));
+                    (client, Ok(()))
+                },
+            ),
+        );
+
+        poll_fn(|cx| bridge.as_mut().poll_ready(cx))
+            .await
+            .expect("ready");
+        bridge
+            .as_mut()
+            .start_send(Bytes::from_static(b"pending-close"))
+            .expect("start send");
+
+        assert!(
+            poll_fn(|cx| bridge.as_mut().poll_close(cx))
+                .now_or_never()
+                .is_none(),
+            "close should commit and wait for the in-flight write"
+        );
+
+        write_release_tx.send(()).expect("release write");
+        poll_fn(|cx| bridge.as_mut().poll_ready(cx))
+            .await
+            .expect("poll_ready continues committed close");
+
+        assert_eq!(
+            events(events_handle.as_ref()),
+            vec![
+                Event::WriteStarted(Bytes::from_static(b"pending-close")),
+                Event::Write(Bytes::from_static(b"pending-close")),
+                Event::Shutdown,
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn write_bridge_pending_reset_survives_dropped_first_poll_while_write_in_flight() {
+        let client = TestWriteClient::new();
+        let events_handle = client.events.clone();
+        let (write_release_tx, write_release_rx) = tokio::sync::oneshot::channel::<()>();
+        let write_release_rx = Arc::new(Mutex::new(Some(write_release_rx)));
+        let mut bridge = Box::pin(
+            WriteBridge::<_, quic::StreamError, _, _, _, _, _, _, _, _>::new(
+                VarInt::from_u32(213),
+                client,
+                move |client: TestWriteClient, token: CancellationToken, bytes: Bytes| {
+                    let write_release_rx = write_release_rx.clone();
+                    async move {
+                        client.record(Event::WriteStarted(bytes));
+                        token.cancelled().await;
+                        client.record(Event::WriteCancelled);
+                        let rx = take_locked(&write_release_rx).expect("write release");
+                        let _ = rx.await;
+                        Either::Right(client)
+                    }
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    client.record(Event::Flush);
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, _token: CancellationToken| async move {
+                    client.record(Event::Shutdown);
+                    Either::Left((client, Ok(())))
+                },
+                |client: TestWriteClient, code: VarInt| async move {
+                    client.record(Event::Reset(code.into_inner()));
+                    (client, Ok(()))
+                },
+            ),
+        );
+
+        poll_fn(|cx| bridge.as_mut().poll_ready(cx))
+            .await
+            .expect("ready");
+        bridge
+            .as_mut()
+            .start_send(Bytes::from_static(b"pending-reset"))
+            .expect("start send");
+
+        assert!(
+            poll_fn(|cx| bridge.as_mut().poll_reset(cx, VarInt::from_u32(88)))
+                .now_or_never()
+                .is_none(),
+            "reset should commit and wait for the in-flight write"
+        );
+
+        write_release_tx.send(()).expect("release write");
+        poll_fn(|cx| bridge.as_mut().poll_ready(cx))
+            .await
+            .expect("poll_ready continues committed reset");
+
+        assert_eq!(
+            events(events_handle.as_ref()),
+            vec![
+                Event::WriteStarted(Bytes::from_static(b"pending-reset")),
+                Event::WriteCancelled,
+                Event::Reset(88),
             ],
         );
     }
@@ -1021,6 +1432,62 @@ mod tests {
             .stop(VarInt::from_u32(11))
             .await
             .expect("stop after completed read");
+    }
+
+    #[tokio::test]
+    async fn read_bridge_stop_preserves_completed_read_data_for_next_poll() {
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel::<()>();
+        let read_rx = Arc::new(Mutex::new(Some(read_rx)));
+        let attempts = Arc::new(Mutex::new(0_u32));
+        let attempts_for_read = attempts.clone();
+        let mut bridge = Box::pin(ReadBridge::<_, quic::StreamError, _, _, _, _>::new(
+            VarInt::from_u32(105),
+            TestReadClient::new([]),
+            move |client: TestReadClient, _token: CancellationToken| {
+                let read_rx = read_rx.clone();
+                let attempts_for_read = attempts_for_read.clone();
+                async move {
+                    let attempt = {
+                        let mut attempts = attempts_for_read.lock().expect("attempts");
+                        *attempts += 1;
+                        *attempts
+                    };
+                    if attempt == 1 {
+                        let rx = take_locked(&read_rx).expect("read_rx taken once");
+                        let _ = rx.await;
+                        Either::Left((
+                            client,
+                            Some(Ok(Bytes::from_static(b"completed-before-stop"))),
+                        ))
+                    } else {
+                        Either::Left((client, None))
+                    }
+                }
+            },
+            |client: TestReadClient, _code: VarInt| async move { (client, Ok(())) },
+        ));
+
+        assert!(
+            poll_fn(|cx| bridge.as_mut().poll_next(cx))
+                .now_or_never()
+                .is_none(),
+            "read should remain pending before release"
+        );
+        read_tx.send(()).expect("release read");
+
+        bridge
+            .stop(VarInt::from_u32(12))
+            .await
+            .expect("stop after completed read");
+
+        let item = bridge
+            .next()
+            .await
+            .expect("completed read should be preserved");
+        assert_eq!(
+            item.expect("read ok"),
+            Bytes::from_static(b"completed-before-stop")
+        );
     }
 
     #[tokio::test]

@@ -259,6 +259,64 @@ impl PendingPush {
     }
 }
 
+/// Buffered STOP/CANCEL control frame waiting to be flushed.
+pub(super) struct PendingControl {
+    buf: [u8; CONTROL_MAX_LEN],
+    len: usize,
+    off: usize,
+}
+
+impl PendingControl {
+    /// Create a pending control frame from a frame tag and QUIC error code.
+    pub fn new(tag: u8, code: VarInt) -> Self {
+        let (buf, len) = encode_control(tag, code);
+        Self { buf, len, off: 0 }
+    }
+
+    fn remaining(&self) -> &[u8] {
+        &self.buf[self.off..self.len]
+    }
+
+    fn advance(&mut self, written: usize) {
+        self.off += written;
+    }
+
+    fn is_done(&self) -> bool {
+        self.off == self.len
+    }
+}
+
+/// Flush a pending control frame through `write`.
+pub(super) fn flush_control(
+    write: &mut (impl AsyncWrite + Unpin),
+    lifecycle: &Arc<dyn quic::DynLifecycle>,
+    pending: &mut Option<PendingControl>,
+    cx: &mut Context<'_>,
+) -> Step<()> {
+    loop {
+        let Some(control) = pending.as_mut() else {
+            return Step::Done(());
+        };
+
+        let written = match Pin::new(&mut *write).poll_write(cx, control.remaining()) {
+            Poll::Ready(Ok(0)) => {
+                return check_lifecycle(lifecycle, Step::Transition(Transition::Finish));
+            }
+            Poll::Ready(Ok(written)) => written,
+            Poll::Ready(Err(e)) => {
+                tracing::debug!(%e, "pipe write error during control frame flush");
+                return check_lifecycle(lifecycle, Step::Transition(Transition::Finish));
+            }
+            Poll::Pending => return Step::Pending,
+        };
+
+        control.advance(written);
+        if control.is_done() {
+            *pending = None;
+        }
+    }
+}
+
 /// Flush a pending PUSH frame through `write` using vectored I/O.
 ///
 /// Returns `Step::Done(())` when fully written, `Step::Pending` when blocked,

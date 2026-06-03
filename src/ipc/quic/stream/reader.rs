@@ -30,7 +30,7 @@ use tokio_util::codec::FramedRead;
 
 use super::{
     codec::{Frame, StreamCodec, TAG_PULL, TAG_STOP},
-    state::{PipeState, Step, Transition, check_lifecycle, encode_control},
+    state::{PendingControl, PipeState, Step, Transition, check_lifecycle, flush_control},
 };
 use crate::{
     quic::{self, GetStreamId, StopStream, StreamError},
@@ -45,19 +45,33 @@ struct ReaderLive {
     read: FramedRead<OwnedReadHalf, StreamCodec>,
     write: OwnedWriteHalf,
     lifecycle: Arc<dyn quic::DynLifecycle>,
+    pending_stop: Option<PendingControl>,
 }
 
 impl ReaderLive {
+    fn step_pending_stop(&mut self, cx: &mut Context<'_>) -> Step<()> {
+        flush_control(&mut self.write, &self.lifecycle, &mut self.pending_stop, cx)
+    }
+
     /// `poll_recv` step: send PULL → block-wait for PUSH.
     ///
     /// Uses atomic single-byte `poll_write` for PULL, eliminating the double-
     /// PULL bug that existed with the FramedWrite approach.
     fn step_poll_recv(&mut self, cx: &mut Context<'_>) -> Step<Bytes> {
+        if self.pending_stop.is_some() {
+            match self.step_pending_stop(cx) {
+                Step::Done(()) => {}
+                Step::Pending => return Step::Pending,
+                Step::Transition(t) => return Step::Transition(t),
+            }
+        }
+
         let Self {
             pulling,
             read,
             write,
             lifecycle,
+            pending_stop: _,
         } = self;
 
         // 1. Send PULL if we haven't yet (atomic single-byte write).
@@ -104,19 +118,10 @@ impl ReaderLive {
 
     /// `poll_stop` step: encode STOP into a stack buffer and write it once.
     fn step_poll_stop(&mut self, code: VarInt, cx: &mut Context<'_>) -> Step<()> {
-        let Self {
-            write, lifecycle, ..
-        } = self;
-        let (buf, len) = encode_control(TAG_STOP, code);
-        match Pin::new(&mut *write).poll_write(cx, &buf[..len]) {
-            Poll::Ready(Ok(_)) => Step::Done(()),
-            Poll::Ready(Err(e)) => {
-                tracing::debug!(%e, "pipe write error sending STOP");
-                check_lifecycle(lifecycle, Step::Done(()))
-            }
-            // Frame buffered in kernel — report success.
-            Poll::Pending => Step::Done(()),
+        if self.pending_stop.is_none() {
+            self.pending_stop = Some(PendingControl::new(TAG_STOP, code));
         }
+        self.step_pending_stop(cx)
     }
 }
 
@@ -147,6 +152,7 @@ impl IpcReadStream {
                 read: FramedRead::new(read_half, StreamCodec::new()),
                 write: write_half,
                 lifecycle,
+                pending_stop: None,
             }),
         }
     }
@@ -213,12 +219,12 @@ impl StopStream for IpcReadStream {
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Cow, future::pending, pin::Pin, sync::Arc};
+    use std::{borrow::Cow, future::pending, os::fd::AsRawFd, pin::Pin, sync::Arc};
 
     use bytes::Bytes;
-    use futures::{SinkExt, StreamExt, future::poll_fn};
+    use futures::{FutureExt, SinkExt, StreamExt, future::poll_fn};
     use tokio::{
-        io::AsyncWriteExt,
+        io::{AsyncReadExt, AsyncWriteExt},
         net::{
             UnixStream,
             unix::{OwnedReadHalf, OwnedWriteHalf},
@@ -298,6 +304,74 @@ mod tests {
         FramedRead<OwnedReadHalf, StreamCodec>,
     ) {
         setup_reader_with_lifecycle(alive_lifecycle()).await
+    }
+
+    async fn setup_reader_with_raw_control_peer(
+        lifecycle: Arc<dyn quic::DynLifecycle>,
+    ) -> (
+        IpcReadStream,
+        FramedWrite<OwnedWriteHalf, StreamCodec>,
+        OwnedReadHalf,
+    ) {
+        let (reader_side, peer_side) = UnixStream::pair().unwrap();
+        let (peer_read, peer_write) = peer_side.into_split();
+
+        let reader = IpcReadStream::new(VarInt::from_u32(7), reader_side, lifecycle);
+
+        (
+            reader,
+            FramedWrite::new(peer_write, StreamCodec::new()),
+            peer_read,
+        )
+    }
+
+    fn shrink_send_buffer(write: &OwnedWriteHalf) {
+        let size: nix::libc::c_int = 4096;
+        let rc = unsafe {
+            nix::libc::setsockopt(
+                write.as_ref().as_raw_fd(),
+                nix::libc::SOL_SOCKET,
+                nix::libc::SO_SNDBUF,
+                &size as *const _ as *const nix::libc::c_void,
+                std::mem::size_of_val(&size) as nix::libc::socklen_t,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "setsockopt(SO_SNDBUF) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    async fn fill_write_half(write: &mut OwnedWriteHalf, byte: u8) -> usize {
+        shrink_send_buffer(write);
+        timeout(Duration::from_millis(200), write.as_ref().writable())
+            .await
+            .expect("write half should become writable")
+            .unwrap();
+        let filler = [byte; 1024];
+        let mut written_total = 0usize;
+        loop {
+            match write.as_ref().try_write(&filler) {
+                Ok(0) => panic!("write half reported zero-byte write"),
+                Ok(written) => {
+                    written_total += written;
+                    assert!(
+                        written_total < 1_000_000,
+                        "socket did not become full after {written_total} bytes"
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("write half failed while filling: {error}"),
+            }
+        }
+
+        assert!(
+            written_total > 0,
+            "socket should accept filler before Pending"
+        );
+        written_total
     }
 
     #[tokio::test]
@@ -479,6 +553,54 @@ mod tests {
         if let Ok(Some(Ok(frame))) = timeout(Duration::from_millis(100), peer_out.next()).await {
             assert_eq!(frame, Frame::Stop(code));
         }
+    }
+
+    #[tokio::test]
+    async fn stop_committed_while_pipe_full_is_driven_by_next_poll() {
+        let (mut reader, _peer_in, mut peer_out) =
+            setup_reader_with_raw_control_peer(alive_lifecycle()).await;
+        let code = VarInt::from_u32(7);
+        let filler_count = {
+            let live = reader.state.live_mut().expect("reader should be live");
+            fill_write_half(&mut live.write, TAG_PULL).await
+        };
+
+        assert!(
+            poll_fn(|cx| Pin::new(&mut reader).poll_stop(cx, code))
+                .now_or_never()
+                .is_none(),
+            "stop should remain pending until the STOP frame is written"
+        );
+
+        let mut filler = vec![0_u8; filler_count];
+        timeout(Duration::from_millis(200), peer_out.read_exact(&mut filler))
+            .await
+            .expect("filler bytes should be readable")
+            .unwrap();
+        assert!(filler.iter().all(|byte| *byte == TAG_PULL));
+
+        let mut observed = Vec::new();
+        timeout(Duration::from_millis(200), async {
+            while observed.len() < 2 {
+                assert!(
+                    poll_fn(|cx| Pin::new(&mut reader).poll_next(cx))
+                        .now_or_never()
+                        .is_none(),
+                    "next poll should drive committed STOP then wait for data"
+                );
+                let mut buf = [0_u8; 16];
+                if let Ok(Ok(read)) =
+                    timeout(Duration::from_millis(10), peer_out.read(&mut buf)).await
+                    && read > 0
+                {
+                    observed.extend_from_slice(&buf[..read]);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("STOP bytes should be emitted");
+        assert_eq!(&observed[..2], [TAG_STOP, code.into_inner() as u8]);
     }
 
     #[tokio::test]
