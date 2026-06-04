@@ -289,14 +289,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{BoxReadStream, BoxWriteStream},
         connection::{ConnectionState, tests::MockConnection},
         error::Code,
         extended_connect::EstablishedConnect,
         message::test::{read_stream_for_test, write_stream_for_test},
         protocol::Protocols,
         qpack::field::Protocol,
-        quic::{GetStreamIdExt, StopStreamExt},
+        quic::{BoxQuicStreamReader, BoxQuicStreamWriter, GetStreamIdExt, StopStreamExt},
         webtransport::{SessionClosed, WEBTRANSPORT_H3, WebTransportProtocol},
     };
 
@@ -341,9 +340,9 @@ mod tests {
         fn stream_pair(&self, stream_id: u32) -> (ReadStreamClient, WriteStreamClient) {
             let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
             let (reader_server, reader_client) =
-                ReadStreamServer::new(Box::pin(reader) as BoxReadStream, 1);
+                ReadStreamServer::new(Box::pin(reader) as BoxQuicStreamReader, 1);
             let (writer_server, writer_client) =
-                WriteStreamServer::new(Box::pin(writer) as BoxWriteStream, 1);
+                WriteStreamServer::new(Box::pin(writer) as BoxQuicStreamWriter, 1);
             self.push_task(tokio::spawn(
                 async move {
                     let _ = reader_server.serve().await;
@@ -362,7 +361,7 @@ mod tests {
         fn read_stream(&self, stream_id: u32) -> ReadStreamClient {
             let (reader, _writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
             let (reader_server, reader_client) =
-                ReadStreamServer::new(Box::pin(reader) as BoxReadStream, 1);
+                ReadStreamServer::new(Box::pin(reader) as BoxQuicStreamReader, 1);
             self.push_task(tokio::spawn(
                 async move {
                     let _ = reader_server.serve().await;
@@ -375,7 +374,7 @@ mod tests {
         fn write_stream(&self, stream_id: u32) -> WriteStreamClient {
             let (_reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
             let (writer_server, writer_client) =
-                WriteStreamServer::new(Box::pin(writer) as BoxWriteStream, 1);
+                WriteStreamServer::new(Box::pin(writer) as BoxQuicStreamWriter, 1);
             self.push_task(tokio::spawn(
                 async move {
                     let _ = writer_server.serve().await;

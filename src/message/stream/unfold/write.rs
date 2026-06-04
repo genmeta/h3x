@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::{Sink, future::Either};
 use tokio_util::sync::CancellationToken;
 
-use super::super::{MessageStreamError, WriteStream};
+use super::super::{MessageStreamError, MessageWriter};
 use crate::{
     codec::SinkWriter,
     quic::{self, GetStreamId, ResetStream},
@@ -32,10 +32,10 @@ impl<T: ResetStream + GetStreamId + Sink<Bytes, Error = MessageStreamError> + Se
 }
 
 /// Boxed stream writer with QUIC stream control traits preserved.
-pub type BoxMessageStreamWriter<'s> = SinkWriter<Pin<Box<dyn WriteMessageStream + 's>>>;
+pub type BoxMessageWriter<S = dyn WriteMessageStream> = SinkWriter<Pin<Box<S>>>;
 
-impl From<WriteStream> for BoxMessageStreamWriter<'static> {
-    fn from(value: WriteStream) -> Self {
+impl From<MessageWriter> for BoxMessageWriter {
+    fn from(value: MessageWriter) -> Self {
         value.into_box_writer()
     }
 }
@@ -627,35 +627,35 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// WriteStream conversion methods
+// MessageWriter conversion methods
 // ---------------------------------------------------------------------------
 
-impl WriteStream {
+impl MessageWriter {
     pub fn as_bytes_sink(&mut self) -> impl WriteMessageStream + '_ {
         unfold(
             self,
-            async |stream: &mut WriteStream, token, buf: Bytes| {
+            async |stream: &mut MessageWriter, token, buf: Bytes| {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => Either::Right(stream),
                     result = stream.write_data(buf) => Either::Left((stream, result)),
                 }
             },
-            async |stream: &mut WriteStream, token| {
+            async |stream: &mut MessageWriter, token| {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => Either::Right(stream),
                     result = stream.flush() => Either::Left((stream, result)),
                 }
             },
-            async |stream: &mut WriteStream, token| {
+            async |stream: &mut MessageWriter, token| {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => Either::Right(stream),
                     result = stream.close() => Either::Left((stream, result)),
                 }
             },
-            async |stream: &mut WriteStream, code| {
+            async |stream: &mut MessageWriter, code| {
                 let result =
                     futures::future::poll_fn(|cx| Pin::new(&mut *stream).poll_reset(cx, code))
                         .await;
@@ -668,35 +668,35 @@ impl WriteStream {
         SinkWriter::new(self.as_bytes_sink())
     }
 
-    pub fn as_box_writer(&mut self) -> BoxMessageStreamWriter<'_> {
+    pub fn as_box_writer(&mut self) -> BoxMessageWriter<dyn WriteMessageStream + '_> {
         SinkWriter::new(Box::pin(self.as_bytes_sink()))
     }
 
     pub fn into_bytes_sink(self) -> impl WriteMessageStream {
         unfold(
             self,
-            async |mut stream: WriteStream, token, buf: Bytes| {
+            async |mut stream: MessageWriter, token, buf: Bytes| {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => Either::Right(stream),
                     result = stream.write_data(buf) => Either::Left((stream, result)),
                 }
             },
-            async |mut stream: WriteStream, token| {
+            async |mut stream: MessageWriter, token| {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => Either::Right(stream),
                     result = stream.flush() => Either::Left((stream, result)),
                 }
             },
-            async |mut stream: WriteStream, token| {
+            async |mut stream: MessageWriter, token| {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => Either::Right(stream),
                     result = stream.close() => Either::Left((stream, result)),
                 }
             },
-            async |mut stream: WriteStream, code| {
+            async |mut stream: MessageWriter, code| {
                 let result =
                     futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_reset(cx, code)).await;
                 (stream, result)
@@ -708,7 +708,7 @@ impl WriteStream {
         SinkWriter::new(self.into_bytes_sink())
     }
 
-    pub fn into_box_writer(self) -> BoxMessageStreamWriter<'static> {
+    pub fn into_box_writer(self) -> BoxMessageWriter {
         SinkWriter::new(Box::pin(self.into_bytes_sink()))
     }
 }
@@ -1686,7 +1686,7 @@ mod tests {
             .await
             .expect("into_box_writer close");
 
-        let mut from_writer = Box::pin(BoxMessageStreamWriter::from(
+        let mut from_writer = Box::pin(BoxMessageWriter::from(
             crate::message::test::write_stream_for_test(stream_id),
         ));
         assert_eq!(

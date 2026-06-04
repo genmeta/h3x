@@ -267,8 +267,8 @@ impl From<RemoteConnection> for ConnectionClient {
 }
 
 impl quic::ManageStream for RemoteConnection {
-    type StreamWriter = crate::dhttp::protocol::BoxDynQuicStreamWriter;
-    type StreamReader = crate::dhttp::protocol::BoxDynQuicStreamReader;
+    type StreamWriter = crate::message::stream::guard::GuardedQuicWriter;
+    type StreamReader = crate::message::stream::guard::GuardedQuicReader;
 
     async fn open_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
         let (reader, writer) = self.guard(Connection::open_bi(&self.client)).await?;
@@ -375,9 +375,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{BoxReadStream, BoxWriteStream},
         dquic::cert::handy::ToCertificate,
-        quic::{GetStreamId, GetStreamIdExt, ResetStream, StopStream, StopStreamExt},
+        quic::{
+            BoxQuicStreamReader, BoxQuicStreamWriter, GetStreamId, GetStreamIdExt, ResetStream,
+            StopStream, StopStreamExt,
+        },
     };
 
     const SERVER_CERT: &[u8] = include_bytes!("../../../tests/keychain/localhost/server.cert");
@@ -540,8 +542,8 @@ mod tests {
     }
 
     impl quic::ManageStream for TestQuicConnection {
-        type StreamReader = BoxReadStream;
-        type StreamWriter = BoxWriteStream;
+        type StreamReader = BoxQuicStreamReader;
+        type StreamWriter = BoxQuicStreamWriter;
 
         async fn open_bi(
             &self,
@@ -551,8 +553,8 @@ mod tests {
             }
             let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(1));
             Ok((
-                Box::pin(reader) as BoxReadStream,
-                Box::pin(writer) as BoxWriteStream,
+                Box::pin(reader) as BoxQuicStreamReader,
+                Box::pin(writer) as BoxQuicStreamWriter,
             ))
         }
 
@@ -561,7 +563,7 @@ mod tests {
                 return Err(error.clone());
             }
             let (_reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(2));
-            Ok(Box::pin(writer) as BoxWriteStream)
+            Ok(Box::pin(writer) as BoxQuicStreamWriter)
         }
 
         async fn accept_bi(
@@ -572,8 +574,8 @@ mod tests {
             }
             let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(3));
             Ok((
-                Box::pin(reader) as BoxReadStream,
-                Box::pin(writer) as BoxWriteStream,
+                Box::pin(reader) as BoxQuicStreamReader,
+                Box::pin(writer) as BoxQuicStreamWriter,
             ))
         }
 
@@ -582,7 +584,7 @@ mod tests {
                 return Err(error.clone());
             }
             let (reader, _writer) = quic::test::mock_stream_pair(VarInt::from_u32(4));
-            Ok(Box::pin(reader) as BoxReadStream)
+            Ok(Box::pin(reader) as BoxQuicStreamReader)
         }
     }
 
@@ -729,8 +731,8 @@ mod tests {
     struct BrokenIdQuicConnection;
 
     impl quic::ManageStream for BrokenIdQuicConnection {
-        type StreamReader = BoxReadStream;
-        type StreamWriter = BoxWriteStream;
+        type StreamReader = BoxQuicStreamReader;
+        type StreamWriter = BoxQuicStreamWriter;
 
         async fn open_bi(
             &self,
@@ -738,17 +740,17 @@ mod tests {
             Ok((
                 Box::pin(BrokenIdReadStream {
                     error: stream_connection_error("open bidi reader stream id failed"),
-                }) as BoxReadStream,
+                }) as BoxQuicStreamReader,
                 Box::pin(BrokenIdWriteStream {
                     error: stream_connection_error("open bidi writer stream id failed"),
-                }) as BoxWriteStream,
+                }) as BoxQuicStreamWriter,
             ))
         }
 
         async fn open_uni(&self) -> Result<Self::StreamWriter, quic::ConnectionError> {
             Ok(Box::pin(BrokenIdWriteStream {
                 error: stream_connection_error("open uni writer stream id failed"),
-            }) as BoxWriteStream)
+            }) as BoxQuicStreamWriter)
         }
 
         async fn accept_bi(
@@ -757,17 +759,17 @@ mod tests {
             Ok((
                 Box::pin(BrokenIdReadStream {
                     error: stream_connection_error("accept bidi reader stream id failed"),
-                }) as BoxReadStream,
+                }) as BoxQuicStreamReader,
                 Box::pin(BrokenIdWriteStream {
                     error: stream_connection_error("accept bidi writer stream id failed"),
-                }) as BoxWriteStream,
+                }) as BoxQuicStreamWriter,
             ))
         }
 
         async fn accept_uni(&self) -> Result<Self::StreamReader, quic::ConnectionError> {
             Ok(Box::pin(BrokenIdReadStream {
                 error: stream_connection_error("accept uni reader stream id failed"),
-            }) as BoxReadStream)
+            }) as BoxQuicStreamReader)
         }
     }
 

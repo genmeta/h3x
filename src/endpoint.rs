@@ -18,7 +18,7 @@ use tracing::Instrument;
 use crate::{
     connection::{Connection as H3Connection, ConnectionBuilder},
     endpoint::server::UnresolvedRequest,
-    message::stream::{ReadStream, WriteStream},
+    message::stream::{MessageReader, MessageWriter},
     pool::{self, Pool},
     quic::{self, GetStreamIdExt},
     stream_id::StreamId,
@@ -334,8 +334,8 @@ where
             }
         };
         let read_stream =
-            ReadStream::new(stream_id, reader, qpack.decoder.clone(), (*erased).clone());
-        let write_stream = WriteStream::new(writer, qpack.encoder.clone(), (*erased).clone());
+            MessageReader::new(stream_id, reader, qpack.decoder.clone(), (*erased).clone());
+        let write_stream = MessageWriter::new(writer, qpack.encoder.clone(), (*erased).clone());
 
         let request = UnresolvedRequest {
             stream_id: StreamId(stream_id),
@@ -398,8 +398,8 @@ mod tests {
     use super::*;
     use crate::{
         codec::{
-            BoxReadStream, BoxWriteStream, ErasedPeekableBiStream, PeekableStreamReader,
-            SinkWriter, StreamReader,
+            BoxPeekableStreamReader, BoxStreamWriter, PeekableStreamReader, SinkWriter,
+            StreamReader,
         },
         connection::{
             ConnectionState,
@@ -413,7 +413,7 @@ mod tests {
         pool::ReuseableConnection,
         protocol::{Protocol, Protocols, StreamVerdict},
         qpack::protocol::QPackProtocolFactory,
-        quic::{GetStreamIdExt, StopStreamExt},
+        quic::{BoxQuicStreamReader, BoxQuicStreamWriter, GetStreamIdExt, StopStreamExt},
         varint::VarInt,
     };
 
@@ -963,7 +963,7 @@ mod tests {
         ConnectionState::new_for_test(quic, Arc::new(protocols))
     }
 
-    async fn http3_request_stream(stream_id: u32) -> ErasedPeekableBiStream {
+    async fn http3_request_stream(stream_id: u32) -> (BoxPeekableStreamReader, BoxStreamWriter) {
         let stream_id = VarInt::from_u32(stream_id);
         let (reader, mut write_side) = quic::test::mock_stream_pair(stream_id);
         write_side
@@ -977,14 +977,14 @@ mod tests {
 
         let (_read_side, writer) = quic::test::mock_stream_pair(stream_id);
         (
-            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream)),
-            SinkWriter::new(Box::pin(writer) as BoxWriteStream),
+            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxQuicStreamReader)),
+            SinkWriter::new(Box::pin(writer) as BoxQuicStreamWriter),
         )
     }
 
     async fn enqueue_http3_request(
         state: &ConnectionState<ControlledConnection>,
-        stream: ErasedPeekableBiStream,
+        stream: (BoxPeekableStreamReader, BoxStreamWriter),
     ) {
         let verdict = Protocol::accept_bi(state.dhttp(), stream)
             .await
@@ -1058,22 +1058,30 @@ mod tests {
     fn stream_id_error_request_stream(
         stream_id: u32,
         close_latch: Arc<CloseLatch>,
-    ) -> ErasedPeekableBiStream {
+    ) -> (BoxPeekableStreamReader, BoxStreamWriter) {
         let stream_id = VarInt::from_u32(stream_id);
         let reader = PeekableStreamReader::new(StreamReader::new(Box::pin(
             StreamIdErrorReadStream::new(close_latch),
-        ) as BoxReadStream));
+        ) as BoxQuicStreamReader));
         let (_unused_reader, writer) = quic::test::mock_stream_pair(stream_id);
-        (reader, SinkWriter::new(Box::pin(writer) as BoxWriteStream))
+        (
+            reader,
+            SinkWriter::new(Box::pin(writer) as BoxQuicStreamWriter),
+        )
     }
 
-    fn second_stream_id_error_request_stream(stream_id: u32) -> ErasedPeekableBiStream {
+    fn second_stream_id_error_request_stream(
+        stream_id: u32,
+    ) -> (BoxPeekableStreamReader, BoxStreamWriter) {
         let stream_id = VarInt::from_u32(stream_id);
         let reader = PeekableStreamReader::new(StreamReader::new(Box::pin(
             StreamIdErrorReadStream::fail_after_first_success(stream_id),
-        ) as BoxReadStream));
+        ) as BoxQuicStreamReader));
         let (_unused_reader, writer) = quic::test::mock_stream_pair(stream_id);
-        (reader, SinkWriter::new(Box::pin(writer) as BoxWriteStream))
+        (
+            reader,
+            SinkWriter::new(Box::pin(writer) as BoxQuicStreamWriter),
+        )
     }
 
     #[derive(Debug, Clone)]
@@ -2117,17 +2125,17 @@ mod tests {
         let close_latch = Arc::new(CloseLatch::default());
         let request = UnresolvedRequest {
             stream_id: StreamId(VarInt::from_u32(111)),
-            read_stream: ReadStream::new(
+            read_stream: MessageReader::new(
                 VarInt::from_u32(111),
                 StreamReader::new(GuardedQuicReader::new(
-                    Box::pin(request_reader) as BoxReadStream
+                    Box::pin(request_reader) as BoxQuicStreamReader
                 )),
                 qpack.decoder.clone(),
                 erased.clone(),
             ),
-            write_stream: WriteStream::new(
+            write_stream: MessageWriter::new(
                 SinkWriter::new(GuardedQuicWriter::new(
-                    Box::pin(response_writer) as BoxWriteStream
+                    Box::pin(response_writer) as BoxQuicStreamWriter
                 )),
                 qpack.encoder.clone(),
                 erased,

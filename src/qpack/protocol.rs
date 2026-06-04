@@ -17,8 +17,7 @@ use tracing::Instrument;
 
 use crate::{
     codec::{
-        DecodeExt, EncodeExt, ErasedPeekableBiStream, ErasedPeekableUniStream, ErasedStreamReader,
-        SinkWriter,
+        BoxPeekableStreamReader, BoxStreamReader, BoxStreamWriter, DecodeExt, EncodeExt, SinkWriter,
     },
     connection::{ConnectionState, LifecycleExt, StreamError},
     dhttp::{protocol::DHttpProtocol, settings::Settings, stream::UnidirectionalStream},
@@ -103,12 +102,12 @@ pub type QPackDecoder = Decoder<
 /// (encoder 0x02, decoder 0x03) and passes all other streams through.
 pub struct QPackProtocol {
     /// Oneshot sender for dispatching the peer's QPACK encoder instruction stream.
-    encoder_inst_receiver_tx: Mutex<Option<oneshot::Sender<ErasedStreamReader>>>,
+    encoder_inst_receiver_tx: Mutex<Option<oneshot::Sender<BoxStreamReader>>>,
     /// QPACK encoder, set during connection initialization.
     pub encoder: Arc<QPackEncoder>,
 
     /// Oneshot sender for dispatching the peer's QPACK decoder instruction stream.
-    decoder_inst_receiver_tx: Mutex<Option<oneshot::Sender<ErasedStreamReader>>>,
+    decoder_inst_receiver_tx: Mutex<Option<oneshot::Sender<BoxStreamReader>>>,
     /// QPACK decoder, set during connection initialization.
     pub decoder: Arc<QPackDecoder>,
 }
@@ -125,8 +124,8 @@ impl std::fmt::Debug for QPackProtocol {
 impl QPackProtocol {
     async fn accept_uni(
         &self,
-        mut stream: ErasedPeekableUniStream,
-    ) -> Result<StreamVerdict<ErasedPeekableUniStream>, StreamError> {
+        mut stream: BoxPeekableStreamReader,
+    ) -> Result<StreamVerdict<BoxPeekableStreamReader>, StreamError> {
         let Ok(stream_type) = stream.decode_one::<VarInt>().await else {
             return Ok(StreamVerdict::Passed(stream));
         };
@@ -158,8 +157,8 @@ impl QPackProtocol {
 
     async fn accept_bi(
         &self,
-        stream: ErasedPeekableBiStream,
-    ) -> Result<StreamVerdict<ErasedPeekableBiStream>, StreamError> {
+        stream: (BoxPeekableStreamReader, BoxStreamWriter),
+    ) -> Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError> {
         Ok(StreamVerdict::Passed(stream))
     }
 }
@@ -167,15 +166,16 @@ impl QPackProtocol {
 impl Protocol for QPackProtocol {
     fn accept_uni<'a>(
         &'a self,
-        stream: ErasedPeekableUniStream,
-    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
+        stream: BoxPeekableStreamReader,
+    ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableStreamReader>, StreamError>> {
         Box::pin(self.accept_uni(stream))
     }
 
     fn accept_bi<'a>(
         &'a self,
-        stream: ErasedPeekableBiStream,
-    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
+        stream: (BoxPeekableStreamReader, BoxStreamWriter),
+    ) -> BoxFuture<'a, Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError>>
+    {
         Box::pin(self.accept_bi(stream))
     }
 }
@@ -210,9 +210,9 @@ impl QPackProtocolFactory {
 
         // Create dispatch channels for incoming peer QPACK streams
         let (encoder_inst_receiver_tx, encoder_inst_receiver_rx) =
-            oneshot::channel::<ErasedStreamReader>();
+            oneshot::channel::<BoxStreamReader>();
         let (decoder_inst_receiver_tx, decoder_inst_receiver_rx) =
-            oneshot::channel::<ErasedStreamReader>();
+            oneshot::channel::<BoxStreamReader>();
 
         // Create QPACK encoder with lazy streams
         let encoder = {
@@ -352,12 +352,12 @@ impl<C: ?Sized> ConnectionState<C> {
 //     use super::QPackLayer;
 //     use crate::{
 //         codec::{StreamReader, peekable::PeekableStreamReader},
-//         layer::{BoxPeekableUniStream, Protocol, StreamVerdict},
+//         layer::{BoxPeekableStreamReader, Protocol, StreamVerdict},
 //         varint::VarInt,
 //     };
 
-//     /// Helper: create a BoxPeekableUniStream from raw byte chunks.
-//     fn peekable_uni_from_chunks(chunks: Vec<&'static [u8]>) -> BoxPeekableUniStream {
+//     /// Helper: create a BoxPeekableStreamReader from raw byte chunks.
+//     fn peekable_uni_from_chunks(chunks: Vec<&'static [u8]>) -> BoxPeekableStreamReader {
 //         let chunks_owned: Vec<Bytes> = chunks.into_iter().map(Bytes::from_static).collect();
 
 //         let (reader, mut writer) = crate::quic::test::mock_stream_pair(VarInt::from_u32(0));
@@ -377,8 +377,8 @@ impl<C: ?Sized> ConnectionState<C> {
 //         PeekableStreamReader::new(stream_reader)
 //     }
 
-//     /// Helper: create a BoxPeekableBiStream from raw byte chunks for the read side.
-//     fn peekable_bi_from_chunks(read_chunks: Vec<&'static [u8]>) -> crate::layer::BoxPeekableBiStream {
+//     /// Helper: create a (BoxPeekableStreamReader, BoxStreamWriter) from raw byte chunks for the read side.
+//     fn peekable_bi_from_chunks(read_chunks: Vec<&'static [u8]>) -> crate::layer::(BoxPeekableStreamReader, BoxStreamWriter) {
 //         let (reader, mut writer_feed) = crate::quic::test::mock_stream_pair(VarInt::from_u32(4));
 //         let (_, write_side) = crate::quic::test::mock_stream_pair(VarInt::from_u32(4));
 
@@ -493,8 +493,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{BoxReadStream, BoxWriteStream, PeekableStreamReader, StreamReader},
+        codec::{PeekableStreamReader, StreamReader},
         dhttp::protocol::DHttpProtocolFactory,
+        quic::{BoxQuicStreamReader, BoxQuicStreamWriter},
     };
 
     #[derive(Debug, Clone, Copy)]
@@ -587,8 +588,8 @@ mod tests {
     }
 
     impl quic::ManageStream for MockConnection {
-        type StreamReader = BoxReadStream;
-        type StreamWriter = BoxWriteStream;
+        type StreamReader = BoxQuicStreamReader;
+        type StreamWriter = BoxQuicStreamWriter;
 
         async fn open_bi(
             &self,
@@ -604,7 +605,7 @@ mod tests {
             }
 
             let (_reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(0));
-            Ok(Box::pin(writer) as BoxWriteStream)
+            Ok(Box::pin(writer) as BoxQuicStreamWriter)
         }
 
         async fn accept_bi(
@@ -675,9 +676,9 @@ mod tests {
 
     fn qpack_protocol() -> QPackProtocol {
         let (encoder_inst_receiver_tx, _encoder_inst_receiver_rx) =
-            oneshot::channel::<ErasedStreamReader>();
+            oneshot::channel::<BoxStreamReader>();
         let (decoder_inst_receiver_tx, _decoder_inst_receiver_rx) =
-            oneshot::channel::<ErasedStreamReader>();
+            oneshot::channel::<BoxStreamReader>();
 
         QPackProtocol {
             encoder_inst_receiver_tx: Mutex::new(Some(encoder_inst_receiver_tx)),
@@ -695,7 +696,7 @@ mod tests {
         }
     }
 
-    async fn peekable_uni_from_bytes(bytes: &'static [u8]) -> ErasedPeekableUniStream {
+    async fn peekable_uni_from_bytes(bytes: &'static [u8]) -> BoxPeekableStreamReader {
         let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(0));
         if !bytes.is_empty() {
             writer
@@ -704,14 +705,14 @@ mod tests {
                 .expect("send bytes");
         }
         writer.close().await.expect("close writer");
-        PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream))
+        PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxQuicStreamReader))
     }
 
-    fn peekable_bi_stream() -> ErasedPeekableBiStream {
+    fn peekable_bi_stream() -> (BoxPeekableStreamReader, BoxStreamWriter) {
         let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(4));
         (
-            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream)),
-            SinkWriter::new(Box::pin(writer) as BoxWriteStream),
+            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxQuicStreamReader)),
+            SinkWriter::new(Box::pin(writer) as BoxQuicStreamWriter),
         )
     }
 
@@ -834,7 +835,7 @@ mod tests {
         let (mut encoder_reader, encoder_writer) =
             quic::test::mock_stream_pair(VarInt::from_u32(0));
         let encoder_stream = UnidirectionalStream::initial_qpack_encoder_stream(SinkWriter::new(
-            Box::pin(encoder_writer) as BoxWriteStream,
+            Box::pin(encoder_writer) as BoxQuicStreamWriter,
         ))
         .await
         .expect("encoder stream init");
@@ -852,7 +853,7 @@ mod tests {
         let (mut decoder_reader, decoder_writer) =
             quic::test::mock_stream_pair(VarInt::from_u32(0));
         let decoder_stream = UnidirectionalStream::initial_qpack_decoder_stream(SinkWriter::new(
-            Box::pin(decoder_writer) as BoxWriteStream,
+            Box::pin(decoder_writer) as BoxQuicStreamWriter,
         ))
         .await
         .expect("decoder stream init");

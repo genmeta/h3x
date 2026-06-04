@@ -14,7 +14,7 @@ use tracing::Instrument;
 use crate::{
     endpoint::server::UnresolvedRequest,
     message::stream::{
-        MessageStreamError, ReadStream,
+        MessageReader, MessageStreamError,
         hyper::{
             upgrade::{RemainStream, TakeoverSlot},
             write::SendMessageError,
@@ -116,7 +116,7 @@ where
             if is_connect
                 && request
                     .extensions()
-                    .get::<TakeoverSlot<ReadStream>>()
+                    .get::<TakeoverSlot<MessageReader>>()
                     .is_some()
             {
                 request
@@ -209,7 +209,7 @@ where
             if is_connect
                 && request
                     .extensions()
-                    .get::<TakeoverSlot<ReadStream>>()
+                    .get::<TakeoverSlot<MessageReader>>()
                     .is_some()
             {
                 request
@@ -263,7 +263,7 @@ mod tests {
         codec::{SinkWriter, StreamReader},
         connection::{ConnectionState, StreamError, tests::MockConnection},
         dhttp::{protocol::DHttpProtocol, settings::Settings},
-        message::stream::{WriteStream, guard},
+        message::stream::{MessageWriter, guard},
         protocol::Protocols,
         qpack::{
             decoder::DecoderInstruction,
@@ -321,14 +321,14 @@ mod tests {
             }
             if request
                 .extensions()
-                .get::<TakeoverSlot<ReadStream>>()
+                .get::<TakeoverSlot<MessageReader>>()
                 .is_some()
             {
                 self.read_takeover_seen.fetch_add(1, Ordering::Relaxed);
             }
             if request
                 .extensions()
-                .get::<TakeoverSlot<WriteStream>>()
+                .get::<TakeoverSlot<MessageWriter>>()
                 .is_some()
             {
                 self.write_takeover_seen.fetch_add(1, Ordering::Relaxed);
@@ -483,18 +483,18 @@ mod tests {
         ConnectionState::new_for_test(erased, Arc::new(protocols))
     }
 
-    fn stream_pair(stream_id: VarInt) -> (ReadStream, WriteStream) {
+    fn stream_pair(stream_id: VarInt) -> (MessageReader, MessageWriter) {
         let state = connection_state();
         let (reader, writer) = quic::test::mock_stream_pair_with_capacity(stream_id, 64);
         let reader = StreamReader::new(guard::GuardedQuicReader::new(
-            Box::pin(reader) as crate::codec::BoxReadStream
+            Box::pin(reader) as crate::quic::BoxQuicStreamReader
         ));
         let writer = SinkWriter::new(guard::GuardedQuicWriter::new(
-            Box::pin(writer) as crate::codec::BoxWriteStream
+            Box::pin(writer) as crate::quic::BoxQuicStreamWriter
         ));
 
         (
-            ReadStream::new(
+            MessageReader::new(
                 stream_id,
                 reader,
                 Arc::new(QPackDecoder::new(
@@ -504,7 +504,7 @@ mod tests {
                 )),
                 state.clone(),
             ),
-            WriteStream::new(
+            MessageWriter::new(
                 writer,
                 Arc::new(QPackEncoder::new(
                     Arc::new(Settings::default()),
@@ -516,7 +516,9 @@ mod tests {
         )
     }
 
-    async fn request_pair(request: http::Request<Full<Bytes>>) -> (UnresolvedRequest, ReadStream) {
+    async fn request_pair(
+        request: http::Request<Full<Bytes>>,
+    ) -> (UnresolvedRequest, MessageReader) {
         let stream_id = VarInt::from_u32(0);
         let (server_read, mut request_writer) = stream_pair(stream_id);
         request_writer
@@ -540,7 +542,7 @@ mod tests {
         )
     }
 
-    async fn read_response(response_reader: ReadStream) -> (http::response::Parts, Bytes) {
+    async fn read_response(response_reader: MessageReader) -> (http::response::Parts, Bytes) {
         let response = response_reader
             .into_hyper_response()
             .await

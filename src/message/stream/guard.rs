@@ -9,9 +9,8 @@ use futures::{Sink, Stream};
 use tracing::Instrument;
 
 use crate::{
-    codec::{BoxReadStream, BoxWriteStream},
     error::Code,
-    quic::{self, ResetStreamExt, StopStreamExt},
+    quic::{self, BoxQuicStreamReader, BoxQuicStreamWriter, ResetStreamExt, StopStreamExt},
     varint::VarInt,
 };
 
@@ -82,11 +81,11 @@ impl quic::GetStreamId for DroppedStream {
     }
 }
 
-fn dropped_reader() -> BoxReadStream {
+fn dropped_reader() -> BoxQuicStreamReader {
     Box::pin(DroppedStream)
 }
 
-fn dropped_writer() -> BoxWriteStream {
+fn dropped_writer() -> BoxQuicStreamWriter {
     Box::pin(DroppedStream)
 }
 
@@ -97,12 +96,12 @@ fn dropped_writer() -> BoxWriteStream {
 /// A QUIC read stream wrapper that automatically stops the stream on drop
 /// if it hasn't been fully consumed (EOF) or explicitly stopped.
 pub struct GuardedQuicReader {
-    inner: BoxReadStream,
+    inner: BoxQuicStreamReader,
     completed: bool,
 }
 
 impl GuardedQuicReader {
-    pub fn new(inner: BoxReadStream) -> Self {
+    pub fn new(inner: BoxQuicStreamReader) -> Self {
         Self {
             inner,
             completed: false,
@@ -119,7 +118,7 @@ impl GuardedQuicReader {
     }
 
     /// Consume this guard and return the protected stream without running drop cleanup.
-    pub(super) fn into_inner(mut self) -> BoxReadStream {
+    pub(super) fn into_inner(mut self) -> BoxQuicStreamReader {
         self.completed = true;
         mem::replace(&mut self.inner, dropped_reader())
     }
@@ -183,12 +182,12 @@ impl Drop for GuardedQuicReader {
 /// A QUIC write stream wrapper that automatically resets the stream on drop if
 /// it hasn't been properly closed or explicitly reset.
 pub struct GuardedQuicWriter {
-    inner: BoxWriteStream,
+    inner: BoxQuicStreamWriter,
     completed: bool,
 }
 
 impl GuardedQuicWriter {
-    pub fn new(inner: BoxWriteStream) -> Self {
+    pub fn new(inner: BoxQuicStreamWriter) -> Self {
         Self {
             inner,
             completed: false,

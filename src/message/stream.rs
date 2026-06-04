@@ -17,10 +17,7 @@ use crate::{
             Frame,
             stream::{FrameStream, ReadableFrame},
         },
-        protocol::{
-            AcceptRawMessageStreamError, BoxDynQuicStreamReader, BoxDynQuicStreamWriter,
-            DHttpProtocol, InitialRawMessageStreamError,
-        },
+        protocol::{AcceptRawMessageStreamError, DHttpProtocol, InitialRawMessageStreamError},
     },
     error::{Code, H3FrameDecodeError, H3FrameUnexpected},
     qpack::{
@@ -40,8 +37,8 @@ pub(crate) mod hyper;
 pub(crate) mod unfold;
 
 pub use self::unfold::{
-    read::{BoxMessageStreamReader, ReadMessageStream},
-    write::{BoxMessageStreamWriter, WriteMessageStream},
+    read::{BoxMessageReader, ReadMessageStream},
+    write::{BoxMessageWriter, WriteMessageStream},
 };
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -120,16 +117,16 @@ impl From<MessageStreamError> for io::Error {
     }
 }
 
-pub struct ReadStream {
-    pub(super) stream: FrameStream<BoxDynQuicStreamReader>,
+pub struct MessageReader {
+    pub(super) stream: FrameStream<guard::GuardedQuicReader>,
     pub(super) qpack_decoder: Arc<QPackDecoder>,
     pub(super) state: ConnectionState<dyn quic::DynConnection>,
 }
 
-impl ReadStream {
+impl MessageReader {
     pub fn new(
         stream_id: VarInt,
-        stream: StreamReader<BoxDynQuicStreamReader>,
+        stream: StreamReader<guard::GuardedQuicReader>,
         qpack_decoder: Arc<QPackDecoder>,
         state: ConnectionState<dyn quic::DynConnection>,
     ) -> Self {
@@ -155,7 +152,7 @@ impl ReadStream {
 
     pub async fn peek_frame(
         &mut self,
-    ) -> Option<Result<ReadableFrame<'_, BoxDynQuicStreamReader>, connection::StreamError>> {
+    ) -> Option<Result<ReadableFrame<'_, guard::GuardedQuicReader>, connection::StreamError>> {
         loop {
             match Pin::new(&mut self.stream).frame() {
                 None => match Pin::new(&mut self.stream).next_unreserved_frame().await? {
@@ -328,7 +325,7 @@ impl ReadStream {
     }
 }
 
-impl quic::GetStreamId for ReadStream {
+impl quic::GetStreamId for MessageReader {
     fn poll_stream_id(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -337,7 +334,7 @@ impl quic::GetStreamId for ReadStream {
     }
 }
 
-impl quic::StopStream for ReadStream {
+impl quic::StopStream for MessageReader {
     fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -347,8 +344,8 @@ impl quic::StopStream for ReadStream {
     }
 }
 
-pub struct WriteStream {
-    pub(super) stream: SinkWriter<BoxDynQuicStreamWriter>,
+pub struct MessageWriter {
+    pub(super) stream: SinkWriter<guard::GuardedQuicWriter>,
     pub(super) qpack_encoder: Arc<QPackEncoder>,
     pub(super) state: ConnectionState<dyn quic::DynConnection>,
 }
@@ -356,9 +353,9 @@ pub struct WriteStream {
 pub const DEFAULT_COMPRESS_ALGO: DynamicCompressAlgo<HuffmanAlways> =
     DynamicCompressAlgo::new(HuffmanAlways);
 
-impl WriteStream {
+impl MessageWriter {
     pub fn new(
-        stream: SinkWriter<BoxDynQuicStreamWriter>,
+        stream: SinkWriter<guard::GuardedQuicWriter>,
         qpack_encoder: Arc<QPackEncoder>,
         state: ConnectionState<dyn quic::DynConnection>,
     ) -> Self {
@@ -509,7 +506,7 @@ impl WriteStream {
     }
 
     /// Resolve a stream-level H3 error into a `quic::StreamError`. See
-    /// [`ReadStream::handle_stream_error`] for semantics; the difference is
+    /// [`MessageReader::handle_stream_error`] for semantics; the difference is
     /// that `H3` errors issue `RESET_STREAM` (via `reset`) on this writer
     /// instead of `STOP_SENDING`.
     pub async fn handle_stream_error(
@@ -543,7 +540,7 @@ impl WriteStream {
     }
 }
 
-impl quic::GetStreamId for WriteStream {
+impl quic::GetStreamId for MessageWriter {
     fn poll_stream_id(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -552,7 +549,7 @@ impl quic::GetStreamId for WriteStream {
     }
 }
 
-impl quic::ResetStream for WriteStream {
+impl quic::ResetStream for MessageWriter {
     fn poll_reset(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -583,7 +580,7 @@ pub enum AcceptMessageStreamError {
 impl<C: quic::Connection> ConnectionState<C> {
     pub async fn initial_message_stream(
         &self,
-    ) -> Result<(ReadStream, WriteStream), InitialMessageStreamError> {
+    ) -> Result<(MessageReader, MessageWriter), InitialMessageStreamError> {
         let state = self.erase();
         let qpack = self.qpack()?;
         let (mut reader, writer) = self.initial_raw_message_stream().await?;
@@ -593,14 +590,14 @@ impl<C: quic::Connection> ConnectionState<C> {
             }
         })?;
         Ok((
-            ReadStream::new(stream_id, reader, qpack.decoder.clone(), state.clone()),
-            WriteStream::new(writer, qpack.encoder.clone(), state),
+            MessageReader::new(stream_id, reader, qpack.decoder.clone(), state.clone()),
+            MessageWriter::new(writer, qpack.encoder.clone(), state),
         ))
     }
 
     pub async fn accept_message_stream(
         &self,
-    ) -> Result<(ReadStream, WriteStream), AcceptMessageStreamError> {
+    ) -> Result<(MessageReader, MessageWriter), AcceptMessageStreamError> {
         let state = self.erase();
         let qpack = self.qpack()?;
         let (mut reader, writer) = self.accept_raw_message_stream().await?;
@@ -610,8 +607,8 @@ impl<C: quic::Connection> ConnectionState<C> {
             }
         })?;
         Ok((
-            ReadStream::new(stream_id, reader, qpack.decoder.clone(), state.clone()),
-            WriteStream::new(writer, qpack.encoder.clone(), state),
+            MessageReader::new(stream_id, reader, qpack.decoder.clone(), state.clone()),
+            MessageWriter::new(writer, qpack.encoder.clone(), state),
         ))
     }
 }
@@ -629,9 +626,12 @@ mod tests {
     use futures::{Sink, SinkExt, Stream, future::poll_fn};
     use tokio::{sync::mpsc, time::timeout};
 
-    use super::{MessageStreamError, ReadStream, WriteStream, guard};
+    use super::{MessageReader, MessageStreamError, MessageWriter, guard};
     use crate::{
-        codec::{ErasedPeekableBiStream, PeekableStreamReader, SinkWriter, StreamReader},
+        codec::{
+            BoxPeekableStreamReader, BoxStreamWriter, PeekableStreamReader, SinkWriter,
+            StreamReader,
+        },
         connection::{ConnectionState, StreamError, tests::MockConnection},
         dhttp::{goaway::Goaway, protocol::DHttpProtocol, settings::Settings},
         error::Code,
@@ -1034,7 +1034,7 @@ mod tests {
     async fn test_peekable_bi_stream_with_bytes(
         stream_id: u32,
         bytes: &[u8],
-    ) -> ErasedPeekableBiStream {
+    ) -> (BoxPeekableStreamReader, BoxStreamWriter) {
         let (reader, mut write_side) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
         write_side
             .send(Bytes::copy_from_slice(bytes))
@@ -1045,13 +1045,13 @@ mod tests {
         let (_read_side, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
         (
             PeekableStreamReader::new(StreamReader::new(
-                Box::pin(reader) as crate::codec::BoxReadStream
+                Box::pin(reader) as crate::quic::BoxQuicStreamReader
             )),
-            SinkWriter::new(Box::pin(writer) as crate::codec::BoxWriteStream),
+            SinkWriter::new(Box::pin(writer) as crate::quic::BoxQuicStreamWriter),
         )
     }
 
-    async fn read_stream_with_bytes(stream_id: u32, bytes: &[u8]) -> ReadStream {
+    async fn read_stream_with_bytes(stream_id: u32, bytes: &[u8]) -> MessageReader {
         let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
         writer
             .send(Bytes::copy_from_slice(bytes))
@@ -1059,10 +1059,10 @@ mod tests {
             .expect("write test stream bytes");
         writer.close().await.expect("close test stream writer");
 
-        ReadStream::new(
+        MessageReader::new(
             VarInt::from_u32(stream_id),
             StreamReader::new(guard::GuardedQuicReader::new(
-                Box::pin(reader) as crate::codec::BoxReadStream
+                Box::pin(reader) as crate::quic::BoxQuicStreamReader
             )),
             Arc::new(QPackDecoder::new(
                 Arc::new(Settings::default()),
@@ -1073,12 +1073,12 @@ mod tests {
         )
     }
 
-    fn paired_message_streams(stream_id: u32) -> (ReadStream, WriteStream) {
+    fn paired_message_streams(stream_id: u32) -> (MessageReader, MessageWriter) {
         let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
-        let read_stream = ReadStream::new(
+        let read_stream = MessageReader::new(
             VarInt::from_u32(stream_id),
             StreamReader::new(guard::GuardedQuicReader::new(
-                Box::pin(reader) as crate::codec::BoxReadStream
+                Box::pin(reader) as crate::quic::BoxQuicStreamReader
             )),
             Arc::new(QPackDecoder::new(
                 Arc::new(Settings::default()),
@@ -1087,9 +1087,9 @@ mod tests {
             )),
             state_without_qpack(Arc::new(MockConnection::new())).erase(),
         );
-        let write_stream = WriteStream::new(
+        let write_stream = MessageWriter::new(
             SinkWriter::new(guard::GuardedQuicWriter::new(
-                Box::pin(writer) as crate::codec::BoxWriteStream
+                Box::pin(writer) as crate::quic::BoxQuicStreamWriter
             )),
             Arc::new(QPackEncoder::new(
                 Arc::new(Settings::default()),
@@ -1113,8 +1113,8 @@ mod tests {
         let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TestReadStream {
             stream_id: VarInt::from_u32(10),
         })
-            as crate::codec::BoxReadStream));
-        let mut read_stream = ReadStream::new(
+            as crate::quic::BoxQuicStreamReader));
+        let mut read_stream = MessageReader::new(
             VarInt::from_u32(10),
             reader,
             Arc::new(QPackDecoder::new(
@@ -1155,8 +1155,8 @@ mod tests {
         let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TestWriteStream {
             stream_id: VarInt::from_u32(12),
         })
-            as crate::codec::BoxWriteStream));
-        let mut write_stream = WriteStream::new(
+            as crate::quic::BoxQuicStreamWriter));
+        let mut write_stream = MessageWriter::new(
             writer,
             Arc::new(QPackEncoder::new(
                 Arc::new(Settings::default()),
@@ -1315,10 +1315,10 @@ mod tests {
             qpack_decoder_stream(),
         ));
         let (reader, _writer) = quic::test::mock_stream_pair(stream_id);
-        let mut stream = ReadStream::new(
+        let mut stream = MessageReader::new(
             stream_id,
             StreamReader::new(guard::GuardedQuicReader::new(
-                Box::pin(reader) as crate::codec::BoxReadStream
+                Box::pin(reader) as crate::quic::BoxQuicStreamReader
             )),
             decoder.clone(),
             state,
@@ -1350,8 +1350,8 @@ mod tests {
         let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TestReadStream {
             stream_id: VarInt::from_u32(2),
         })
-            as crate::codec::BoxReadStream));
-        let mut stream = ReadStream::new(
+            as crate::quic::BoxQuicStreamReader));
+        let mut stream = MessageReader::new(
             VarInt::from_u32(2),
             reader,
             Arc::new(QPackDecoder::new(
@@ -1388,8 +1388,8 @@ mod tests {
         let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TestWriteStream {
             stream_id: VarInt::from_u32(3),
         })
-            as crate::codec::BoxWriteStream));
-        let mut stream = WriteStream::new(
+            as crate::quic::BoxQuicStreamWriter));
+        let mut stream = MessageWriter::new(
             writer,
             Arc::new(QPackEncoder::new(
                 Arc::new(Settings::default()),
@@ -1428,8 +1428,8 @@ mod tests {
                 },
             },
         )
-            as crate::codec::BoxReadStream));
-        let mut stream = ReadStream::new(
+            as crate::quic::BoxQuicStreamReader));
+        let mut stream = MessageReader::new(
             VarInt::from_u32(91),
             reader,
             Arc::new(QPackDecoder::new(
@@ -1468,8 +1468,8 @@ mod tests {
                 error: quic::StreamError::Reset { code: reset_code },
             },
         )
-            as crate::codec::BoxWriteStream));
-        let mut stream = WriteStream::new(
+            as crate::quic::BoxQuicStreamWriter));
+        let mut stream = MessageWriter::new(
             writer,
             Arc::new(QPackEncoder::new(
                 Arc::new(Settings::default()),
@@ -1640,8 +1640,8 @@ mod tests {
         let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TestReadStream {
             stream_id: VarInt::from_u32(26),
         })
-            as crate::codec::BoxReadStream));
-        let mut read_stream = ReadStream::new(
+            as crate::quic::BoxQuicStreamReader));
+        let mut read_stream = MessageReader::new(
             VarInt::from_u32(26),
             reader,
             Arc::new(QPackDecoder::new(
@@ -1669,8 +1669,8 @@ mod tests {
         let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TestWriteStream {
             stream_id: VarInt::from_u32(27),
         })
-            as crate::codec::BoxWriteStream));
-        let mut write_stream = WriteStream::new(
+            as crate::quic::BoxQuicStreamWriter));
+        let mut write_stream = MessageWriter::new(
             writer,
             Arc::new(QPackEncoder::new(
                 Arc::new(Settings::default()),
@@ -1916,13 +1916,13 @@ mod tests {
         let reset_code = VarInt::from_u32(52);
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
         let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
-        let mut reader = ReadStream::new(
+        let mut reader = MessageReader::new(
             VarInt::from_u32(19),
             StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(19),
                 stop_tx,
             })
-                as crate::codec::BoxReadStream)),
+                as crate::quic::BoxQuicStreamReader)),
             Arc::new(QPackDecoder::new(
                 Arc::new(Settings::default()),
                 qpack_decoder_sink(),
@@ -1930,12 +1930,12 @@ mod tests {
             )),
             state.clone(),
         );
-        let mut writer = WriteStream::new(
+        let mut writer = MessageWriter::new(
             SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
                 stream_id: VarInt::from_u32(20),
                 reset_tx,
             })
-                as crate::codec::BoxWriteStream)),
+                as crate::quic::BoxQuicStreamWriter)),
             Arc::new(QPackEncoder::new(
                 Arc::new(Settings::default()),
                 qpack_encoder_sink(),
@@ -1984,13 +1984,13 @@ mod tests {
         let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
         let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
-        let mut reader = ReadStream::new(
+        let mut reader = MessageReader::new(
             VarInt::from_u32(21),
             StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(21),
                 stop_tx,
             })
-                as crate::codec::BoxReadStream)),
+                as crate::quic::BoxQuicStreamReader)),
             Arc::new(QPackDecoder::new(
                 Arc::new(Settings::default()),
                 qpack_decoder_sink(),
@@ -1998,12 +1998,12 @@ mod tests {
             )),
             state.clone(),
         );
-        let mut writer = WriteStream::new(
+        let mut writer = MessageWriter::new(
             SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
                 stream_id: VarInt::from_u32(22),
                 reset_tx,
             })
-                as crate::codec::BoxWriteStream)),
+                as crate::quic::BoxQuicStreamWriter)),
             Arc::new(QPackEncoder::new(
                 Arc::new(Settings::default()),
                 qpack_encoder_sink(),
@@ -2048,13 +2048,13 @@ mod tests {
         let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
         let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
-        let mut reader = ReadStream::new(
+        let mut reader = MessageReader::new(
             VarInt::from_u32(30),
             StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(30),
                 stop_tx,
             })
-                as crate::codec::BoxReadStream)),
+                as crate::quic::BoxQuicStreamReader)),
             Arc::new(QPackDecoder::new(
                 Arc::new(Settings::default()),
                 qpack_decoder_sink(),
@@ -2062,12 +2062,12 @@ mod tests {
             )),
             state.clone(),
         );
-        let mut writer = WriteStream::new(
+        let mut writer = MessageWriter::new(
             SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
                 stream_id: VarInt::from_u32(31),
                 reset_tx,
             })
-                as crate::codec::BoxWriteStream)),
+                as crate::quic::BoxQuicStreamWriter)),
             Arc::new(QPackEncoder::new(
                 Arc::new(Settings::default()),
                 qpack_encoder_sink(),
@@ -2147,13 +2147,13 @@ mod tests {
         let quic = Arc::new(MockConnection::new());
         let state = state_without_qpack(quic).erase();
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
-        let mut stream = ReadStream::new(
+        let mut stream = MessageReader::new(
             VarInt::from_u32(14),
             StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(14),
                 stop_tx,
             })
-                as crate::codec::BoxReadStream)),
+                as crate::quic::BoxQuicStreamReader)),
             Arc::new(QPackDecoder::new(
                 Arc::new(Settings::default()),
                 qpack_decoder_sink(),
@@ -2190,12 +2190,12 @@ mod tests {
         let quic = Arc::new(MockConnection::new());
         let state = state_without_qpack(quic).erase();
         let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
-        let mut stream = WriteStream::new(
+        let mut stream = MessageWriter::new(
             SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
                 stream_id: VarInt::from_u32(15),
                 reset_tx,
             })
-                as crate::codec::BoxWriteStream)),
+                as crate::quic::BoxQuicStreamWriter)),
             Arc::new(QPackEncoder::new(
                 Arc::new(Settings::default()),
                 qpack_encoder_sink(),

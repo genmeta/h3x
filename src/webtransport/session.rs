@@ -23,9 +23,9 @@ use super::{
     registry::{RegisteredSession, SessionState},
 };
 use crate::{
-    codec::{BoxReadStream, BoxWriteStream, EncodeExt, EncodeInto, SinkWriter},
+    codec::{EncodeExt, EncodeInto, SinkWriter},
     extended_connect::EstablishedConnect,
-    quic::{self},
+    quic::{self, BoxQuicStreamReader, BoxQuicStreamWriter},
     stream_id::StreamId,
     varint::VarInt,
 };
@@ -36,11 +36,11 @@ use crate::{
 
 /// A routed bidirectional stream (reader + writer) after signal/session-ID
 /// consumption by the protocol layer.
-pub(super) type RoutedBiStream = (BoxReadStream, BoxWriteStream);
+pub(super) type RoutedBiStream = (BoxQuicStreamReader, BoxQuicStreamWriter);
 
 /// A routed unidirectional stream (reader only) after signal/session-ID
 /// consumption by the protocol layer.
-pub(super) type RoutedUniStream = BoxReadStream;
+pub(super) type RoutedUniStream = BoxQuicStreamReader;
 
 // ============================================================================
 // WebTransportSession
@@ -114,7 +114,9 @@ impl WebTransportSession {
     /// Writes the WebTransport bidi signal value (`0x41`) and the session ID as
     /// a routing header, then returns the raw stream pair positioned after the
     /// header.
-    pub async fn open_bi(&self) -> Result<(BoxReadStream, BoxWriteStream), OpenStreamError> {
+    pub async fn open_bi(
+        &self,
+    ) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), OpenStreamError> {
         self.state
             .check_open()
             .context(open_stream_error::ClosedSnafu)?;
@@ -132,7 +134,7 @@ impl WebTransportSession {
     /// Writes the WebTransport uni signal value (`0x54`) and the session ID as
     /// a routing header, then returns the write half positioned after the
     /// header.
-    pub async fn open_uni(&self) -> Result<BoxWriteStream, OpenStreamError> {
+    pub async fn open_uni(&self) -> Result<BoxQuicStreamWriter, OpenStreamError> {
         self.state
             .check_open()
             .context(open_stream_error::ClosedSnafu)?;
@@ -145,7 +147,9 @@ impl WebTransportSession {
     }
 
     /// Accept a bidirectional stream routed to this session by the protocol layer.
-    pub async fn accept_bi(&self) -> Result<(BoxReadStream, BoxWriteStream), AcceptStreamError> {
+    pub async fn accept_bi(
+        &self,
+    ) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), AcceptStreamError> {
         self.state
             .check_open()
             .context(accept_stream_error::ClosedSnafu)?;
@@ -161,7 +165,7 @@ impl WebTransportSession {
     }
 
     /// Accept a unidirectional stream routed to this session by the protocol layer.
-    pub async fn accept_uni(&self) -> Result<BoxReadStream, AcceptStreamError> {
+    pub async fn accept_uni(&self) -> Result<BoxQuicStreamReader, AcceptStreamError> {
         self.state
             .check_open()
             .context(accept_stream_error::ClosedSnafu)?;
@@ -224,10 +228,10 @@ impl TryFrom<EstablishedConnect> for WebTransportSession {
 
 /// Write the WebTransport stream routing header (signal + session_id) and flush.
 async fn write_header(
-    writer: BoxWriteStream,
+    writer: BoxQuicStreamWriter,
     signal: VarInt,
     session_id: StreamId,
-) -> Result<BoxWriteStream, OpenStreamError> {
+) -> Result<BoxQuicStreamWriter, OpenStreamError> {
     let mut codec_writer = SinkWriter::new(writer);
     encode_header_value(&mut codec_writer, signal)
         .await
@@ -242,19 +246,20 @@ async fn write_header(
 }
 
 async fn encode_header_value<T>(
-    codec_writer: &mut SinkWriter<BoxWriteStream>,
+    codec_writer: &mut SinkWriter<BoxQuicStreamWriter>,
     value: T,
 ) -> Result<(), quic::StreamError>
 where
     T: Send,
-    for<'a> T: EncodeInto<&'a mut SinkWriter<BoxWriteStream>, Error = std::io::Error, Output = ()>,
+    for<'a> T:
+        EncodeInto<&'a mut SinkWriter<BoxQuicStreamWriter>, Error = std::io::Error, Output = ()>,
 {
     codec_writer.encode_one(value).await?;
     Ok(())
 }
 
 async fn flush_header(
-    codec_writer: &mut SinkWriter<BoxWriteStream>,
+    codec_writer: &mut SinkWriter<BoxQuicStreamWriter>,
 ) -> Result<(), quic::StreamError> {
     AsyncWriteExt::flush(codec_writer).await?;
     Ok(())
@@ -302,7 +307,7 @@ mod tests {
         dhttp::{protocol::DHttpProtocol, settings::Settings},
         extended_connect::EstablishedConnect,
         message::{
-            stream::{ReadStream, guard},
+            stream::{MessageReader, guard},
             test::{read_stream_for_test, write_stream_for_test},
         },
         protocol::Protocols,
@@ -1025,7 +1030,7 @@ mod tests {
         >())
     }
 
-    async fn read_stream_with_bytes(stream_id: u32, bytes: &[u8]) -> ReadStream {
+    async fn read_stream_with_bytes(stream_id: u32, bytes: &[u8]) -> MessageReader {
         let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
         writer
             .send(Bytes::copy_from_slice(bytes))
@@ -1039,10 +1044,10 @@ mod tests {
         protocols.insert(DHttpProtocol::new_for_test(erased.clone()));
         let state = ConnectionState::new_for_test(quic, Arc::new(protocols)).erase();
 
-        ReadStream::new(
+        MessageReader::new(
             VarInt::from_u32(stream_id),
             StreamReader::new(guard::GuardedQuicReader::new(
-                Box::pin(reader) as crate::codec::BoxReadStream
+                Box::pin(reader) as crate::quic::BoxQuicStreamReader
             )),
             Arc::new(QPackDecoder::new(
                 Arc::new(Settings::default()),
@@ -1053,7 +1058,7 @@ mod tests {
         )
     }
 
-    async fn read_stream_with_reset(stream_id: u32, code: VarInt) -> ReadStream {
+    async fn read_stream_with_reset(stream_id: u32, code: VarInt) -> MessageReader {
         use crate::quic::ResetStreamExt;
 
         let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
@@ -1069,10 +1074,10 @@ mod tests {
         protocols.insert(DHttpProtocol::new_for_test(erased.clone()));
         let state = ConnectionState::new_for_test(quic, Arc::new(protocols)).erase();
 
-        ReadStream::new(
+        MessageReader::new(
             VarInt::from_u32(stream_id),
             StreamReader::new(guard::GuardedQuicReader::new(
-                Box::pin(reader) as crate::codec::BoxReadStream
+                Box::pin(reader) as crate::quic::BoxQuicStreamReader
             )),
             Arc::new(QPackDecoder::new(
                 Arc::new(Settings::default()),
@@ -1388,7 +1393,7 @@ mod tests {
                 state: Arc::clone(&routed_state),
                 chunks: VecDeque::from([Bytes::from_static(&[0x55])]),
                 stream_id: VarInt::from_u32(13),
-            }) as BoxReadStream,
+            }) as BoxQuicStreamReader,
         );
 
         assert!(rejected.is_err());
@@ -1415,11 +1420,11 @@ mod tests {
                             state: Arc::clone(&routed_state),
                             chunks: VecDeque::from([Bytes::from_static(&[0x11, 0x22])]),
                             stream_id: VarInt::from_u32(11),
-                        }) as BoxReadStream,
+                        }) as BoxQuicStreamReader,
                         Box::pin(TestWriteStream {
                             state: Arc::clone(&routed_state),
                             stream_id: VarInt::from_u32(11),
-                        }) as BoxWriteStream,
+                        }) as BoxQuicStreamWriter,
                     ),
                 )
                 .is_ok()
@@ -1460,7 +1465,7 @@ mod tests {
                         state: Arc::clone(&routed_state),
                         chunks: VecDeque::from([Bytes::from_static(&[0x44])]),
                         stream_id: VarInt::from_u32(12),
-                    }) as BoxReadStream,
+                    }) as BoxQuicStreamReader,
                 )
                 .is_ok()
         );
@@ -1528,11 +1533,11 @@ mod tests {
                             state: Arc::clone(&routed_state),
                             chunks: VecDeque::from([Bytes::from_static(&[0x66])]),
                             stream_id: VarInt::from_u32(14),
-                        }) as BoxReadStream,
+                        }) as BoxQuicStreamReader,
                         Box::pin(TestWriteStream {
                             state: Arc::clone(&routed_state),
                             stream_id: VarInt::from_u32(14),
-                        }) as BoxWriteStream,
+                        }) as BoxQuicStreamWriter,
                     ),
                 )
                 .is_ok()
@@ -1570,7 +1575,7 @@ mod tests {
                         state: Arc::clone(&routed_state),
                         chunks: VecDeque::from([Bytes::from_static(&[0x77])]),
                         stream_id: VarInt::from_u32(15),
-                    }) as BoxReadStream,
+                    }) as BoxQuicStreamReader,
                 )
                 .is_ok()
         );

@@ -199,8 +199,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{BoxReadStream, BoxWriteStream},
-        quic::{self, GetStreamIdExt, ResetStreamExt, StopStreamExt},
+        quic::{
+            self, BoxQuicStreamReader, BoxQuicStreamWriter, GetStreamIdExt, ResetStreamExt,
+            StopStreamExt,
+        },
         varint::VarInt,
     };
 
@@ -301,18 +303,18 @@ mod tests {
         }
     }
 
-    fn test_read_stream(id: u32, bytes: Vec<u8>) -> BoxReadStream {
+    fn test_read_stream(id: u32, bytes: Vec<u8>) -> BoxQuicStreamReader {
         Box::pin(TestReadStream {
             chunks: VecDeque::from([Bytes::from(bytes)]),
             stream_id: VarInt::from_u32(id),
-        }) as BoxReadStream
+        }) as BoxQuicStreamReader
     }
 
-    fn test_write_stream(id: u32, state: Arc<StreamState>) -> BoxWriteStream {
+    fn test_write_stream(id: u32, state: Arc<StreamState>) -> BoxQuicStreamWriter {
         Box::pin(TestWriteStream {
             state,
             stream_id: VarInt::from_u32(id),
-        }) as BoxWriteStream
+        }) as BoxQuicStreamWriter
     }
 
     fn bidi_stream(id: u32) -> RoutedBiStream {

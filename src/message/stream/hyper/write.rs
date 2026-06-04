@@ -4,7 +4,7 @@ use http_body::Body;
 use http_body_util::BodyExt;
 use snafu::{ResultExt, Snafu};
 
-use super::{MessageStreamError, WriteStream};
+use super::{MessageStreamError, MessageWriter};
 use crate::{
     error::H3StreamError,
     qpack::field::{
@@ -43,7 +43,7 @@ impl<E: std::error::Error + 'static> SendMessageError<E> {
     }
 }
 
-impl WriteStream {
+impl MessageWriter {
     pub(crate) async fn send_hyper_body<B: Body>(
         &mut self,
         body: B,
@@ -198,7 +198,7 @@ mod tests {
         request.into_parts().0
     }
 
-    fn reset_observing_write_stream(stream_id: VarInt) -> (WriteStream, Arc<Mutex<Vec<VarInt>>>) {
+    fn reset_observing_write_stream(stream_id: VarInt) -> (MessageWriter, Arc<Mutex<Vec<VarInt>>>) {
         struct TestWriter {
             stream_id: VarInt,
             resets: Arc<Mutex<Vec<VarInt>>>,
@@ -292,9 +292,9 @@ mod tests {
             stream_id,
             resets: resets.clone(),
         })
-            as crate::codec::BoxWriteStream));
+            as crate::quic::BoxQuicStreamWriter));
 
-        let stream = WriteStream::new(
+        let stream = MessageWriter::new(
             writer,
             Arc::new(QPackEncoder::new(
                 Arc::new(crate::dhttp::settings::Settings::default()),

@@ -5,7 +5,7 @@ use snafu::ResultExt;
 
 use crate::{
     connection::ConnectionState,
-    message::stream::{ReadStream, WriteStream},
+    message::stream::{MessageReader, MessageWriter},
     qpack::field::Protocol,
     quic,
     stream_id::StreamId,
@@ -33,12 +33,12 @@ pub struct EstablishedConnect {
 #[allow(dead_code)]
 enum ConnectControl {
     Ready {
-        read: ReadStream,
-        write: WriteStream,
+        read: MessageReader,
+        write: MessageWriter,
     },
     Pending {
-        read: ReadStream,
-        write: BoxFuture<'static, Result<WriteStream, PendingWriteStreamError>>,
+        read: MessageReader,
+        write: BoxFuture<'static, Result<MessageWriter, PendingWriteStreamError>>,
     },
 }
 
@@ -48,8 +48,8 @@ impl EstablishedConnect {
         stream_id: StreamId,
         protocol: Option<Protocol>,
         connection: Arc<ConnectionState<dyn quic::DynConnection>>,
-        read: ReadStream,
-        write: WriteStream,
+        read: MessageReader,
+        write: MessageWriter,
     ) -> Self {
         Self {
             stream_id,
@@ -64,8 +64,8 @@ impl EstablishedConnect {
         stream_id: StreamId,
         protocol: Option<Protocol>,
         connection: Arc<ConnectionState<dyn quic::DynConnection>>,
-        read: ReadStream,
-        write: impl Future<Output = Result<WriteStream, PendingWriteStreamError>> + Send + 'static,
+        read: MessageReader,
+        write: impl Future<Output = Result<MessageWriter, PendingWriteStreamError>> + Send + 'static,
     ) -> Self {
         Self {
             stream_id,
@@ -90,7 +90,7 @@ impl EstablishedConnect {
         &self.connection
     }
 
-    pub async fn into_streams(self) -> Result<(ReadStream, WriteStream), IntoStreamsError> {
+    pub async fn into_streams(self) -> Result<(MessageReader, MessageWriter), IntoStreamsError> {
         match self.control {
             ConnectControl::Ready { read, write } => Ok((read, write)),
             ConnectControl::Pending { read, write } => {

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-pub use crate::message::stream::{MessageStreamError, ReadStream, WriteStream};
+pub use crate::message::stream::{MessageReader, MessageStreamError, MessageWriter};
 use crate::{connection::ConnectionState, quic, stream_id::StreamId};
 
 /// A request that has just been accepted on a QUIC stream but whose HTTP/3
@@ -9,9 +9,9 @@ pub struct UnresolvedRequest {
     /// QUIC stream identifier for this request.
     pub stream_id: StreamId,
     /// Incoming request stream.
-    pub read_stream: ReadStream,
+    pub read_stream: MessageReader,
     /// Outgoing response stream.
-    pub write_stream: WriteStream,
+    pub write_stream: MessageWriter,
     /// Owning h3 connection.
     pub connection: Arc<ConnectionState<dyn quic::DynConnection>>,
 }

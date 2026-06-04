@@ -201,7 +201,7 @@ mod tests {
         codec::{SinkWriter, StreamReader},
         connection::{ConnectionBuilder, ConnectionState, StreamError},
         dhttp::{protocol::DHttpProtocol, settings::Settings},
-        message::stream::{ReadStream, WriteStream, guard},
+        message::stream::{MessageReader, MessageWriter, guard},
         protocol::Protocols,
         qpack::{
             decoder::DecoderInstruction,
@@ -214,11 +214,14 @@ mod tests {
 
     struct ClientReadStream {
         stream_id: Result<VarInt, quic::StreamError>,
-        inner: quic::BoxReadStream,
+        inner: quic::BoxQuicStreamReader,
     }
 
     impl ClientReadStream {
-        fn new(stream_id: Result<VarInt, quic::StreamError>, inner: quic::BoxReadStream) -> Self {
+        fn new(
+            stream_id: Result<VarInt, quic::StreamError>,
+            inner: quic::BoxQuicStreamReader,
+        ) -> Self {
             Self { stream_id, inner }
         }
     }
@@ -254,11 +257,14 @@ mod tests {
 
     struct ClientWriteStream {
         stream_id: Result<VarInt, quic::StreamError>,
-        inner: quic::BoxWriteStream,
+        inner: quic::BoxQuicStreamWriter,
     }
 
     impl ClientWriteStream {
-        fn new(stream_id: Result<VarInt, quic::StreamError>, inner: quic::BoxWriteStream) -> Self {
+        fn new(
+            stream_id: Result<VarInt, quic::StreamError>,
+            inner: quic::BoxQuicStreamWriter,
+        ) -> Self {
             Self { stream_id, inner }
         }
     }
@@ -308,7 +314,7 @@ mod tests {
     struct QueuedConnection {
         bi_streams: Mutex<VecDeque<(ClientReadStream, ClientWriteStream)>>,
         next_uni_stream_id: AtomicU32,
-        uni_readers: Mutex<Vec<quic::BoxReadStream>>,
+        uni_readers: Mutex<Vec<quic::BoxQuicStreamReader>>,
     }
 
     impl fmt::Debug for QueuedConnection {
@@ -438,17 +444,17 @@ mod tests {
         stream_id: VarInt,
         reader: impl quic::ReadStream + Unpin + 'static,
         writer: impl quic::WriteStream + Unpin + 'static,
-    ) -> (ReadStream, WriteStream) {
+    ) -> (MessageReader, MessageWriter) {
         let state = server_connection_state();
         let reader = StreamReader::new(guard::GuardedQuicReader::new(
-            Box::pin(reader) as crate::codec::BoxReadStream
+            Box::pin(reader) as crate::quic::BoxQuicStreamReader
         ));
         let writer = SinkWriter::new(guard::GuardedQuicWriter::new(
-            Box::pin(writer) as crate::codec::BoxWriteStream
+            Box::pin(writer) as crate::quic::BoxQuicStreamWriter
         ));
 
         (
-            ReadStream::new(
+            MessageReader::new(
                 stream_id,
                 reader,
                 Arc::new(QPackDecoder::new(
@@ -458,7 +464,7 @@ mod tests {
                 )),
                 state.clone(),
             ),
-            WriteStream::new(
+            MessageWriter::new(
                 writer,
                 Arc::new(QPackEncoder::new(
                     Arc::new(Settings::default()),
@@ -473,7 +479,7 @@ mod tests {
     async fn connection_with_staged_bi_stream(
         stream_id: VarInt,
         write_stream_id: Result<VarInt, quic::StreamError>,
-    ) -> (Connection<QueuedConnection>, ReadStream, WriteStream) {
+    ) -> (Connection<QueuedConnection>, MessageReader, MessageWriter) {
         let quic = Arc::new(QueuedConnection::default());
         let (server_reader, client_writer) =
             quic::test::mock_stream_pair_with_capacity(stream_id, 256);
@@ -666,13 +672,13 @@ mod tests {
         assert!(
             response
                 .extensions()
-                .get::<TakeoverSlot<ReadStream>>()
+                .get::<TakeoverSlot<MessageReader>>()
                 .is_some()
         );
         assert!(
             response
                 .extensions()
-                .get::<TakeoverSlot<WriteStream>>()
+                .get::<TakeoverSlot<MessageWriter>>()
                 .is_some()
         );
         let body = response

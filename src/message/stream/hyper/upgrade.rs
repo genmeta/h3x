@@ -220,7 +220,7 @@ mod tests {
     use tracing::Instrument;
 
     use super::*;
-    use crate::message::stream::ReadStream;
+    use crate::message::stream::MessageReader;
 
     #[derive(Debug, Clone)]
     struct ErrorBody;
@@ -386,19 +386,21 @@ mod tests {
     #[tokio::test]
     async fn takeover_returns_unsupported_when_slot_missing() {
         let mut request = http::Request::new(http_body_util::Empty::<Bytes>::new());
-        let result = poll_fn(|cx| HasTakeover::<ReadStream>::poll_takeover(&mut request, cx)).await;
+        let result =
+            poll_fn(|cx| HasTakeover::<MessageReader>::poll_takeover(&mut request, cx)).await;
         assert!(matches!(result, Err(TakeoverError::Unsupported)));
     }
 
     #[tokio::test]
     async fn takeover_returns_ready_when_slot_available() {
         let mut request = http::Request::new(http_body_util::Empty::<Bytes>::new());
-        let (read_tx, read) = RemainStream::<ReadStream>::pending();
+        let (read_tx, read) = RemainStream::<MessageReader>::pending();
         request.extensions_mut().insert(TakeoverSlot::new(read));
 
         drop(read_tx);
 
-        let result = poll_fn(|cx| HasTakeover::<ReadStream>::poll_takeover(&mut request, cx)).await;
+        let result =
+            poll_fn(|cx| HasTakeover::<MessageReader>::poll_takeover(&mut request, cx)).await;
         assert!(matches!(result, Err(TakeoverError::Aborted)));
     }
 
@@ -418,19 +420,21 @@ mod tests {
     #[tokio::test]
     async fn takeover_returns_aborted_when_sender_dropped() {
         let mut request = http::Request::new(http_body_util::Empty::<Bytes>::new());
-        let (read_tx, read) = RemainStream::<ReadStream>::pending();
+        let (read_tx, read) = RemainStream::<MessageReader>::pending();
         request.extensions_mut().insert(TakeoverSlot::new(read));
 
         drop(read_tx);
 
-        let result = poll_fn(|cx| HasTakeover::<ReadStream>::poll_takeover(&mut request, cx)).await;
+        let result =
+            poll_fn(|cx| HasTakeover::<MessageReader>::poll_takeover(&mut request, cx)).await;
         assert!(matches!(result, Err(TakeoverError::Aborted)));
     }
 
     #[tokio::test]
     async fn takeover_returns_body_not_released_on_body_error() {
         let mut request = http::Request::new(ErrorBody);
-        let result = poll_fn(|cx| HasTakeover::<ReadStream>::poll_takeover(&mut request, cx)).await;
+        let result =
+            poll_fn(|cx| HasTakeover::<MessageReader>::poll_takeover(&mut request, cx)).await;
         assert!(matches!(result, Err(TakeoverError::BodyNotReleased)));
     }
 }

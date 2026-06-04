@@ -34,8 +34,7 @@
 use futures::future::BoxFuture;
 
 use crate::{
-    codec::{BoxReadStream, BoxWriteStream},
-    quic::{ReadStream, WriteStream},
+    quic::{BoxQuicStreamReader, BoxQuicStreamWriter, ReadStream, WriteStream},
     stream_id::StreamId,
 };
 
@@ -96,22 +95,24 @@ pub trait Session: Send + Sync {
 
 /// Object-safe version of [`Session`] with type-erased streams.
 ///
-/// Stream types are fixed to [`BoxReadStream`] / [`BoxWriteStream`].
+/// Stream types are fixed to [`BoxQuicStreamReader`] / [`BoxQuicStreamWriter`].
 /// A blanket impl is provided for all `T: Session`.
 pub trait DynSession: Send + Sync {
     fn id(&self) -> StreamId;
 
     #[allow(clippy::type_complexity)]
-    fn open_bi(&self) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), OpenStreamError>>;
+    fn open_bi(
+        &self,
+    ) -> BoxFuture<'_, Result<(BoxQuicStreamReader, BoxQuicStreamWriter), OpenStreamError>>;
 
-    fn open_uni(&self) -> BoxFuture<'_, Result<BoxWriteStream, OpenStreamError>>;
+    fn open_uni(&self) -> BoxFuture<'_, Result<BoxQuicStreamWriter, OpenStreamError>>;
 
     #[allow(clippy::type_complexity)]
     fn accept_bi(
         &self,
-    ) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), AcceptStreamError>>;
+    ) -> BoxFuture<'_, Result<(BoxQuicStreamReader, BoxQuicStreamWriter), AcceptStreamError>>;
 
-    fn accept_uni(&self) -> BoxFuture<'_, Result<BoxReadStream, AcceptStreamError>>;
+    fn accept_uni(&self) -> BoxFuture<'_, Result<BoxQuicStreamReader, AcceptStreamError>>;
 }
 
 impl<T: Session> DynSession for T {
@@ -119,33 +120,41 @@ impl<T: Session> DynSession for T {
         Session::id(self)
     }
 
-    fn open_bi(&self) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), OpenStreamError>> {
+    fn open_bi(
+        &self,
+    ) -> BoxFuture<'_, Result<(BoxQuicStreamReader, BoxQuicStreamWriter), OpenStreamError>> {
         Box::pin(async {
             let (r, w) = Session::open_bi(self).await?;
-            Ok((Box::pin(r) as BoxReadStream, Box::pin(w) as BoxWriteStream))
+            Ok((
+                Box::pin(r) as BoxQuicStreamReader,
+                Box::pin(w) as BoxQuicStreamWriter,
+            ))
         })
     }
 
-    fn open_uni(&self) -> BoxFuture<'_, Result<BoxWriteStream, OpenStreamError>> {
+    fn open_uni(&self) -> BoxFuture<'_, Result<BoxQuicStreamWriter, OpenStreamError>> {
         Box::pin(async {
             let w = Session::open_uni(self).await?;
-            Ok(Box::pin(w) as BoxWriteStream)
+            Ok(Box::pin(w) as BoxQuicStreamWriter)
         })
     }
 
     fn accept_bi(
         &self,
-    ) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), AcceptStreamError>> {
+    ) -> BoxFuture<'_, Result<(BoxQuicStreamReader, BoxQuicStreamWriter), AcceptStreamError>> {
         Box::pin(async {
             let (r, w) = Session::accept_bi(self).await?;
-            Ok((Box::pin(r) as BoxReadStream, Box::pin(w) as BoxWriteStream))
+            Ok((
+                Box::pin(r) as BoxQuicStreamReader,
+                Box::pin(w) as BoxQuicStreamWriter,
+            ))
         })
     }
 
-    fn accept_uni(&self) -> BoxFuture<'_, Result<BoxReadStream, AcceptStreamError>> {
+    fn accept_uni(&self) -> BoxFuture<'_, Result<BoxQuicStreamReader, AcceptStreamError>> {
         Box::pin(async {
             let r = Session::accept_uni(self).await?;
-            Ok(Box::pin(r) as BoxReadStream)
+            Ok(Box::pin(r) as BoxQuicStreamReader)
         })
     }
 }
@@ -155,26 +164,28 @@ impl<T: Session> DynSession for T {
 // ============================================================================
 
 impl Session for WebTransportSession {
-    type StreamReader = BoxReadStream;
-    type StreamWriter = BoxWriteStream;
+    type StreamReader = BoxQuicStreamReader;
+    type StreamWriter = BoxQuicStreamWriter;
 
     fn id(&self) -> StreamId {
         WebTransportSession::id(self)
     }
 
-    async fn open_bi(&self) -> Result<(BoxReadStream, BoxWriteStream), OpenStreamError> {
+    async fn open_bi(&self) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), OpenStreamError> {
         WebTransportSession::open_bi(self).await
     }
 
-    async fn open_uni(&self) -> Result<BoxWriteStream, OpenStreamError> {
+    async fn open_uni(&self) -> Result<BoxQuicStreamWriter, OpenStreamError> {
         WebTransportSession::open_uni(self).await
     }
 
-    async fn accept_bi(&self) -> Result<(BoxReadStream, BoxWriteStream), AcceptStreamError> {
+    async fn accept_bi(
+        &self,
+    ) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), AcceptStreamError> {
         WebTransportSession::accept_bi(self).await
     }
 
-    async fn accept_uni(&self) -> Result<BoxReadStream, AcceptStreamError> {
+    async fn accept_uni(&self) -> Result<BoxQuicStreamReader, AcceptStreamError> {
         WebTransportSession::accept_uni(self).await
     }
 }
@@ -190,7 +201,7 @@ mod tests {
     use crate::{
         connection::{ConnectionState, tests::MockConnection},
         extended_connect::{EstablishedConnect, PendingWriteStreamError},
-        message::{stream::WriteStream, test::read_stream_for_test},
+        message::{stream::MessageWriter, test::read_stream_for_test},
         protocol::Protocols,
         qpack::field::Protocol,
         quic::{self, GetStreamIdExt},
@@ -213,11 +224,11 @@ mod tests {
         }
     }
 
-    fn boxed_stream_pair(stream_id: u32) -> (BoxReadStream, BoxWriteStream) {
+    fn boxed_stream_pair(stream_id: u32) -> (BoxQuicStreamReader, BoxQuicStreamWriter) {
         let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
         (
-            Box::pin(reader) as BoxReadStream,
-            Box::pin(writer) as BoxWriteStream,
+            Box::pin(reader) as BoxQuicStreamReader,
+            Box::pin(writer) as BoxQuicStreamWriter,
         )
     }
 
@@ -239,7 +250,7 @@ mod tests {
             Some(Protocol::new(WEBTRANSPORT_H3)),
             connection_with_webtransport(mock),
             read_stream_for_test(stream_id.0),
-            future::pending::<Result<WriteStream, PendingWriteStreamError>>(),
+            future::pending::<Result<MessageWriter, PendingWriteStreamError>>(),
         ))
         .expect("webtransport session should be registered")
     }
@@ -264,8 +275,8 @@ mod tests {
     }
 
     impl Session for TestSession {
-        type StreamReader = BoxReadStream;
-        type StreamWriter = BoxWriteStream;
+        type StreamReader = BoxQuicStreamReader;
+        type StreamWriter = BoxQuicStreamWriter;
 
         fn id(&self) -> StreamId {
             self.id
@@ -295,8 +306,8 @@ mod tests {
     }
 
     impl Session for FailingSession {
-        type StreamReader = BoxReadStream;
-        type StreamWriter = BoxWriteStream;
+        type StreamReader = BoxQuicStreamReader;
+        type StreamWriter = BoxQuicStreamWriter;
 
         fn id(&self) -> StreamId {
             self.id
@@ -332,8 +343,8 @@ mod tests {
     }
 
     async fn assert_roundtrip(
-        reader: &mut BoxReadStream,
-        writer: &mut BoxWriteStream,
+        reader: &mut BoxQuicStreamReader,
+        writer: &mut BoxQuicStreamWriter,
         payload: &'static [u8],
     ) {
         let bytes = Bytes::from_static(payload);

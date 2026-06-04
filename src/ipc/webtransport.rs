@@ -53,7 +53,6 @@ use tracing::{Instrument, debug};
 /// directly while preserving the `ipc::webtransport::LifecycleExt` path.
 pub use crate::rpc::webtransport::LifecycleExt;
 use crate::{
-    codec::{BoxReadStream, BoxWriteStream},
     ipc::{
         quic::{
             IpcReadStream, IpcWriteStream,
@@ -61,7 +60,10 @@ use crate::{
         },
         transport::{FdDelivery, FdTransfer, ReceivedFds},
     },
-    quic::{self, ConnectionError, DynLifecycle, GetStreamIdExt},
+    quic::{
+        self, BoxQuicStreamReader, BoxQuicStreamWriter, ConnectionError, DynLifecycle,
+        GetStreamIdExt,
+    },
     rpc::lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt as _},
     stream_id::StreamId,
     varint::VarInt,
@@ -402,8 +404,8 @@ impl WebTransportSessionAdapter {
     async fn bridge_bi(
         &self,
         delivery: FdDelivery,
-        reader: BoxReadStream,
-        writer: BoxWriteStream,
+        reader: BoxQuicStreamReader,
+        writer: BoxQuicStreamWriter,
         stream_id: VarInt,
     ) -> Result<VarInt, IpcWebTransportOpenError> {
         let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
@@ -434,8 +436,8 @@ impl WebTransportSessionAdapter {
     async fn bridge_bi_accept(
         &self,
         delivery: FdDelivery,
-        reader: BoxReadStream,
-        writer: BoxWriteStream,
+        reader: BoxQuicStreamReader,
+        writer: BoxQuicStreamWriter,
         stream_id: VarInt,
     ) -> Result<VarInt, IpcWebTransportAcceptError> {
         let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();

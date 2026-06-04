@@ -9,7 +9,7 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Empty, StreamBody};
 
 use super::{
-    MessageStreamError, ReadStream,
+    MessageReader, MessageStreamError,
     upgrade::{RemainStream, TakeoverSlot},
 };
 use crate::error::H3MessageError;
@@ -61,7 +61,7 @@ impl<L: Body, R: Body<Data = L::Data, Error = L::Error>> Body for Either<L, R> {
     }
 }
 
-impl ReadStream {
+impl MessageReader {
     pub async fn read_hyper_request_parts(
         &mut self,
     ) -> Result<http::request::Parts, MessageStreamError> {
@@ -193,7 +193,7 @@ mod tests {
         connection::{ConnectionState, StreamError, tests::MockConnection},
         dhttp::{protocol::DHttpProtocol, settings::Settings},
         message::{
-            stream::{WriteStream, guard},
+            stream::{MessageWriter, guard},
             test::read_stream_for_test,
         },
         protocol::Protocols,
@@ -229,7 +229,7 @@ mod tests {
         >())
     }
 
-    fn stream_pair(stream_id: VarInt) -> (ReadStream, WriteStream) {
+    fn stream_pair(stream_id: VarInt) -> (MessageReader, MessageWriter) {
         let erased: Arc<dyn quic::DynConnection> = Arc::new(MockConnection::new());
 
         let mut protocols = Protocols::new();
@@ -238,14 +238,14 @@ mod tests {
 
         let (reader, writer) = quic::test::mock_stream_pair_with_capacity(stream_id, 64);
         let reader = StreamReader::new(guard::GuardedQuicReader::new(
-            Box::pin(reader) as crate::codec::BoxReadStream
+            Box::pin(reader) as crate::quic::BoxQuicStreamReader
         ));
         let writer = SinkWriter::new(guard::GuardedQuicWriter::new(
-            Box::pin(writer) as crate::codec::BoxWriteStream
+            Box::pin(writer) as crate::quic::BoxQuicStreamWriter
         ));
 
         (
-            ReadStream::new(
+            MessageReader::new(
                 stream_id,
                 reader,
                 Arc::new(QPackDecoder::new(
@@ -255,7 +255,7 @@ mod tests {
                 )),
                 state.clone(),
             ),
-            WriteStream::new(
+            MessageWriter::new(
                 writer,
                 Arc::new(QPackEncoder::new(
                     Arc::new(Settings::default()),
@@ -572,7 +572,7 @@ mod tests {
         assert!(
             request
                 .extensions()
-                .get::<TakeoverSlot<ReadStream>>()
+                .get::<TakeoverSlot<MessageReader>>()
                 .is_some()
         );
     }
@@ -595,7 +595,7 @@ mod tests {
         assert!(
             response
                 .extensions()
-                .get::<RemainStream<ReadStream>>()
+                .get::<RemainStream<MessageReader>>()
                 .is_some()
         );
     }

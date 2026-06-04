@@ -3,7 +3,7 @@ pub mod upgrade {
     use std::future::poll_fn;
 
     pub use crate::message::stream::{
-        BoxMessageStreamReader, BoxMessageStreamWriter, ReadStream, WriteStream,
+        BoxMessageReader, BoxMessageWriter, MessageReader, MessageWriter,
         hyper::upgrade::{HasTakeover, MissingStream, TakeoverError, TakeoverSlot, UpgradeError},
     };
 
@@ -15,22 +15,18 @@ pub mod upgrade {
 
     #[doc(alias = "take")]
     pub async fn on(
-        mut message: impl HasTakeover<ReadStream> + HasTakeover<WriteStream>,
-    ) -> Result<
-        (
-            BoxMessageStreamReader<'static>,
-            BoxMessageStreamWriter<'static>,
-        ),
-        UpgradeError,
-    > {
-        let read =
-            match poll_fn(|cx| HasTakeover::<ReadStream>::poll_takeover(&mut message, cx)).await {
-                Ok(read) => Some(read),
-                Err(TakeoverError::Unsupported) => None,
-                Err(source) => return Err(UpgradeError::Takeover { source }),
-            };
+        mut message: impl HasTakeover<MessageReader> + HasTakeover<MessageWriter>,
+    ) -> Result<(BoxMessageReader, BoxMessageWriter), UpgradeError> {
+        let read = match poll_fn(|cx| HasTakeover::<MessageReader>::poll_takeover(&mut message, cx))
+            .await
+        {
+            Ok(read) => Some(read),
+            Err(TakeoverError::Unsupported) => None,
+            Err(source) => return Err(UpgradeError::Takeover { source }),
+        };
         let write =
-            match poll_fn(|cx| HasTakeover::<WriteStream>::poll_takeover(&mut message, cx)).await {
+            match poll_fn(|cx| HasTakeover::<MessageWriter>::poll_takeover(&mut message, cx)).await
+            {
                 Ok(write) => Some(write),
                 Err(TakeoverError::Unsupported) => None,
                 Err(source) => return Err(UpgradeError::Takeover { source }),
@@ -118,7 +114,7 @@ mod tests {
     async fn take_returns_unsupported_when_no_takeover_slot() {
         let request = http::Request::new(http_body_util::Empty::<Bytes>::new());
 
-        let result = upgrade::take::<upgrade::ReadStream>(request).await;
+        let result = upgrade::take::<upgrade::MessageReader>(request).await;
         assert!(matches!(result, Err(TakeoverError::Unsupported)));
     }
 
@@ -132,7 +128,9 @@ mod tests {
                 .insert(TakeoverSlot::new(RemainStream::immediately(stream)));
             request
         };
-        let mut read_stream = upgrade::take::<upgrade::ReadStream>(request).await.unwrap();
+        let mut read_stream = upgrade::take::<upgrade::MessageReader>(request)
+            .await
+            .unwrap();
         let stream_id = GetStreamIdExt::stream_id(&mut read_stream).await.unwrap();
         assert_eq!(stream_id, VarInt::from_u32(55));
     }
@@ -223,7 +221,7 @@ mod tests {
             request
         };
 
-        let _ = upgrade::take::<upgrade::ReadStream>(&mut request)
+        let _ = upgrade::take::<upgrade::MessageReader>(&mut request)
             .await
             .unwrap();
 

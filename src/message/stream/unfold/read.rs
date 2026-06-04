@@ -7,7 +7,7 @@ use std::{
 use bytes::Bytes;
 use futures::stream::FusedStream;
 
-use super::super::{MessageStreamError, ReadStream};
+use super::super::{MessageStreamError, MessageReader};
 use crate::{
     codec::StreamReader,
     quic::{self, GetStreamId, StopStream},
@@ -35,10 +35,10 @@ impl<
 }
 
 /// Boxed stream reader with QUIC stream control traits preserved.
-pub type BoxMessageStreamReader<'s> = StreamReader<Pin<Box<dyn ReadMessageStream + 's>>>;
+pub type BoxMessageReader<S = dyn ReadMessageStream> = StreamReader<Pin<Box<S>>>;
 
-impl From<ReadStream> for BoxMessageStreamReader<'static> {
-    fn from(value: ReadStream) -> Self {
+impl From<MessageReader> for BoxMessageReader {
+    fn from(value: MessageReader) -> Self {
         value.into_box_reader()
     }
 }
@@ -299,14 +299,14 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// ReadStream conversion methods
+// MessageReader conversion methods
 // ---------------------------------------------------------------------------
 
-impl ReadStream {
+impl MessageReader {
     pub fn as_bytes_stream(&mut self) -> impl ReadMessageStream + '_ {
         unfold(
             self,
-            |stream: &mut ReadStream, token| async move {
+            |stream: &mut MessageReader, token| async move {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => futures::future::Either::Right(stream),
@@ -320,7 +320,7 @@ impl ReadStream {
                     }
                 }
             },
-            |stream: &mut ReadStream, code| async move {
+            |stream: &mut MessageReader, code| async move {
                 let result =
                     futures::future::poll_fn(|cx| Pin::new(&mut *stream).poll_stop(cx, code)).await;
                 (stream, result)
@@ -332,14 +332,14 @@ impl ReadStream {
         StreamReader::new(self.as_bytes_stream())
     }
 
-    pub fn as_box_reader(&mut self) -> BoxMessageStreamReader<'_> {
+    pub fn as_box_reader(&mut self) -> BoxMessageReader<dyn ReadMessageStream + '_> {
         StreamReader::new(Box::pin(self.as_bytes_stream()))
     }
 
     pub fn into_bytes_stream(self) -> impl ReadMessageStream {
         unfold(
             self,
-            |mut stream: ReadStream, token| async move {
+            |mut stream: MessageReader, token| async move {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => futures::future::Either::Right(stream),
@@ -353,7 +353,7 @@ impl ReadStream {
                     }
                 }
             },
-            |mut stream: ReadStream, code| async move {
+            |mut stream: MessageReader, code| async move {
                 let result =
                     futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_stop(cx, code)).await;
                 (stream, result)
@@ -365,7 +365,7 @@ impl ReadStream {
         StreamReader::new(self.into_bytes_stream())
     }
 
-    pub fn into_box_reader(self) -> BoxMessageStreamReader<'static> {
+    pub fn into_box_reader(self) -> BoxMessageReader {
         StreamReader::new(Box::pin(self.into_bytes_stream()))
     }
 }
@@ -786,7 +786,7 @@ mod tests {
     async fn read_stream_from_conversion_builds_box_reader() {
         let stream_id = VarInt::from_u32(75);
         let stream = crate::message::test::read_stream_for_test(stream_id);
-        let mut reader: BoxMessageStreamReader<'static> = stream.into();
+        let mut reader: BoxMessageReader = stream.into();
 
         assert_eq!(
             poll_fn(|cx| Pin::new(&mut reader).poll_stream_id(cx))

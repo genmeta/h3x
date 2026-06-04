@@ -23,12 +23,13 @@ use super::{
     registry::{RegisteredSession, Registry},
 };
 use crate::{
-    codec::{
-        BoxReadStream, BoxWriteStream, DecodeExt, ErasedPeekableBiStream, ErasedPeekableUniStream,
-    },
+    codec::{BoxPeekableStreamReader, BoxStreamWriter, DecodeExt},
     connection::StreamError,
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
-    quic::{self, ConnectionError, ResetStreamExt, StopStreamExt},
+    quic::{
+        self, BoxQuicStreamReader, BoxQuicStreamWriter, ConnectionError, ResetStreamExt,
+        StopStreamExt,
+    },
     stream_id::StreamId,
     varint::VarInt,
 };
@@ -100,8 +101,8 @@ impl WebTransportProtocol {
 impl WebTransportProtocol {
     async fn accept_bi_inner(
         &self,
-        (mut reader, writer): ErasedPeekableBiStream,
-    ) -> Result<StreamVerdict<ErasedPeekableBiStream>, StreamError> {
+        (mut reader, writer): (BoxPeekableStreamReader, BoxStreamWriter),
+    ) -> Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError> {
         let Ok(signal_value) = reader.decode_one::<VarInt>().await else {
             return Ok(StreamVerdict::Passed((reader, writer)));
         };
@@ -118,8 +119,8 @@ impl WebTransportProtocol {
 
         tracing::debug!(session_id = %session_id, "routing webtransport bidi stream to session");
 
-        let reader: BoxReadStream = Box::pin(reader.into_stream_reader());
-        let writer: BoxWriteStream = writer.into_inner();
+        let reader: BoxQuicStreamReader = Box::pin(reader.into_stream_reader());
+        let writer: BoxQuicStreamWriter = writer.into_inner();
 
         if let Err((mut reader, mut writer)) = self.registry.route_bi(session_id, (reader, writer))
         {
@@ -132,8 +133,8 @@ impl WebTransportProtocol {
 
     async fn accept_uni_inner(
         &self,
-        mut stream: ErasedPeekableUniStream,
-    ) -> Result<StreamVerdict<ErasedPeekableUniStream>, StreamError> {
+        mut stream: BoxPeekableStreamReader,
+    ) -> Result<StreamVerdict<BoxPeekableStreamReader>, StreamError> {
         let Ok(signal_value) = stream.decode_one::<VarInt>().await else {
             return Ok(StreamVerdict::Passed(stream));
         };
@@ -150,7 +151,7 @@ impl WebTransportProtocol {
 
         tracing::debug!(session_id = %session_id, "routing webtransport uni stream to session");
 
-        let reader: BoxReadStream = Box::pin(stream.into_stream_reader());
+        let reader: BoxQuicStreamReader = Box::pin(stream.into_stream_reader());
 
         if let Err(mut reader) = self.registry.route_uni(session_id, reader) {
             let code = crate::error::Code::H3_REQUEST_CANCELLED.into_inner();
@@ -164,15 +165,16 @@ impl WebTransportProtocol {
 impl Protocol for WebTransportProtocol {
     fn accept_uni<'a>(
         &'a self,
-        stream: ErasedPeekableUniStream,
-    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
+        stream: BoxPeekableStreamReader,
+    ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableStreamReader>, StreamError>> {
         Box::pin(self.accept_uni_inner(stream))
     }
 
     fn accept_bi<'a>(
         &'a self,
-        stream: ErasedPeekableBiStream,
-    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
+        stream: (BoxPeekableStreamReader, BoxStreamWriter),
+    ) -> BoxFuture<'a, Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError>>
+    {
         Box::pin(self.accept_bi_inner(stream))
     }
 }
@@ -1508,23 +1510,23 @@ mod tests {
     fn test_reader(
         state: Arc<StreamState>,
         chunks: Vec<Bytes>,
-    ) -> PeekableStreamReader<BoxReadStream> {
+    ) -> PeekableStreamReader<BoxQuicStreamReader> {
         test_reader_results(state, chunks.into_iter().map(Ok).collect())
     }
 
     fn test_reader_results(
         state: Arc<StreamState>,
         chunks: Vec<Result<Bytes, quic::StreamError>>,
-    ) -> PeekableStreamReader<BoxReadStream> {
+    ) -> PeekableStreamReader<BoxQuicStreamReader> {
         let stream = TestReadStream {
             state,
             chunks: chunks.into(),
         };
-        PeekableStreamReader::new(StreamReader::new(Box::pin(stream) as BoxReadStream))
+        PeekableStreamReader::new(StreamReader::new(Box::pin(stream) as BoxQuicStreamReader))
     }
 
-    fn test_writer(state: Arc<StreamState>) -> SinkWriter<BoxWriteStream> {
-        SinkWriter::new(Box::pin(TestWriteStream { state }) as BoxWriteStream)
+    fn test_writer(state: Arc<StreamState>) -> SinkWriter<BoxQuicStreamWriter> {
+        SinkWriter::new(Box::pin(TestWriteStream { state }) as BoxQuicStreamWriter)
     }
 
     fn test_protocol() -> WebTransportProtocol {

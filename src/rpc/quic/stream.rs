@@ -4,9 +4,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::bridge;
 use crate::{
-    codec::BoxReadStream,
     message::stream::guard,
-    quic::{self, GetStreamIdExt, ResetStreamExt, StopStreamExt},
+    quic::{self, BoxQuicStreamReader, GetStreamIdExt, ResetStreamExt, StopStreamExt},
     util::deferred::{DeferredStreamReader, DeferredStreamWriter},
     varint::VarInt,
 };
@@ -39,7 +38,7 @@ impl ReadStreamClient {
     }
 
     pub fn into_boxed_quic(self) -> guard::GuardedQuicReader {
-        let raw: BoxReadStream = Box::pin(DeferredStreamReader::from(self.into_quic()));
+        let raw: BoxQuicStreamReader = Box::pin(DeferredStreamReader::from(self.into_quic()));
         guard::GuardedQuicReader::new(raw)
     }
 }
@@ -97,7 +96,7 @@ impl WriteStreamClient {
     }
 
     pub fn into_boxed_quic(self) -> guard::GuardedQuicWriter {
-        let raw: crate::codec::BoxWriteStream =
+        let raw: crate::quic::BoxQuicStreamWriter =
             Box::pin(DeferredStreamWriter::from(self.into_quic()));
         guard::GuardedQuicWriter::new(raw)
     }

@@ -1,6 +1,6 @@
 use crate::{
     extended_connect::{EstablishedConnect, IntoStreamsError},
-    message::stream::{ReadStream, WriteStream},
+    message::stream::{MessageReader, MessageWriter},
     qpack::field::Protocol,
     stream_id::StreamId,
 };
@@ -24,7 +24,7 @@ impl ConnectTunnel {
         self.connect.protocol()
     }
 
-    pub async fn into_streams(self) -> Result<(ReadStream, WriteStream), IntoStreamsError> {
+    pub async fn into_streams(self) -> Result<(MessageReader, MessageWriter), IntoStreamsError> {
         self.connect.into_streams().await
     }
 }

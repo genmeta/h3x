@@ -24,7 +24,7 @@ use tracing::Instrument;
 use crate::{
     buflist::BufList,
     codec::{
-        DecodeExt, EncodeExt, ErasedPeekableBiStream, ErasedPeekableUniStream, Feed, SinkWriter,
+        BoxPeekableStreamReader, BoxStreamWriter, DecodeExt, EncodeExt, Feed, SinkWriter,
         StreamReader,
     },
     connection::{ConnectionGoaway, ConnectionState, LifecycleExt, StreamError},
@@ -83,15 +83,15 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{
-            BoxReadStream, BoxWriteStream, EncodeExt, PeekableStreamReader, SinkWriter,
-            StreamReader,
-        },
+        codec::{EncodeExt, PeekableStreamReader, SinkWriter, StreamReader},
         connection::{ConnectionState, tests::MockConnection},
         dhttp::settings::Settings,
         extended_connect::settings::EnableConnectProtocol,
         protocol::Protocols,
-        quic::{self, GetStreamId, GetStreamIdExt, ResetStream},
+        quic::{
+            self, BoxQuicStreamReader, BoxQuicStreamWriter, GetStreamId, GetStreamIdExt,
+            ResetStream,
+        },
     };
 
     #[derive(Debug)]
@@ -179,39 +179,44 @@ mod tests {
         }
     }
 
-    fn test_erased_streams(stream_id: u32) -> (GuardedStreamReader, GuardedStreamWriter) {
+    fn test_erased_streams(
+        stream_id: u32,
+    ) -> (
+        StreamReader<guard::GuardedQuicReader>,
+        SinkWriter<guard::GuardedQuicWriter>,
+    ) {
         let stream_id = VarInt::from_u32(stream_id);
         let reader =
             StreamReader::new(guard::GuardedQuicReader::new(
-                Box::pin(TestReadStream { stream_id }) as BoxReadStream,
+                Box::pin(TestReadStream { stream_id }) as BoxQuicStreamReader,
             ));
         let writer =
             SinkWriter::new(guard::GuardedQuicWriter::new(
-                Box::pin(TestWriteStream { stream_id }) as BoxWriteStream,
+                Box::pin(TestWriteStream { stream_id }) as BoxQuicStreamWriter,
             ));
         (reader, writer)
     }
 
-    async fn test_peekable_uni_stream_with_bytes(bytes: &[u8]) -> ErasedPeekableUniStream {
+    async fn test_peekable_uni_stream_with_bytes(bytes: &[u8]) -> BoxPeekableStreamReader {
         let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(2));
         writer
             .send(Bytes::copy_from_slice(bytes))
             .await
             .expect("write test uni bytes");
         writer.close().await.expect("close test uni stream");
-        PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream))
+        PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxQuicStreamReader))
     }
 
-    fn test_empty_peekable_uni_stream() -> ErasedPeekableUniStream {
+    fn test_empty_peekable_uni_stream() -> BoxPeekableStreamReader {
         PeekableStreamReader::new(StreamReader::new(Box::pin(TestReadStream {
             stream_id: VarInt::from_u32(2),
-        }) as BoxReadStream))
+        }) as BoxQuicStreamReader))
     }
 
     async fn test_peekable_bi_stream_with_bytes(
         stream_id: u32,
         bytes: &[u8],
-    ) -> ErasedPeekableBiStream {
+    ) -> (BoxPeekableStreamReader, BoxStreamWriter) {
         let (reader, mut write_side) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
         write_side
             .send(Bytes::copy_from_slice(bytes))
@@ -221,18 +226,18 @@ mod tests {
 
         let (_read_side, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
         (
-            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream)),
-            SinkWriter::new(Box::pin(writer) as BoxWriteStream),
+            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxQuicStreamReader)),
+            SinkWriter::new(Box::pin(writer) as BoxQuicStreamWriter),
         )
     }
 
-    fn test_empty_peekable_bi_stream(stream_id: u32) -> ErasedPeekableBiStream {
+    fn test_empty_peekable_bi_stream(stream_id: u32) -> (BoxPeekableStreamReader, BoxStreamWriter) {
         let stream_id = VarInt::from_u32(stream_id);
         (
             PeekableStreamReader::new(StreamReader::new(
-                Box::pin(TestReadStream { stream_id }) as BoxReadStream
+                Box::pin(TestReadStream { stream_id }) as BoxQuicStreamReader
             )),
-            SinkWriter::new(Box::pin(TestWriteStream { stream_id }) as BoxWriteStream),
+            SinkWriter::new(Box::pin(TestWriteStream { stream_id }) as BoxQuicStreamWriter),
         )
     }
 
@@ -278,7 +283,7 @@ mod tests {
 
     async fn stream_reader_from_frames(
         frames: impl IntoIterator<Item = Frame<BufList>>,
-    ) -> StreamReader<BoxReadStream> {
+    ) -> StreamReader<BoxQuicStreamReader> {
         let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(2));
         let mut writer = SinkWriter::new(writer);
         for frame in frames {
@@ -288,7 +293,7 @@ mod tests {
                 .expect("encode test control frame");
         }
         writer.close().await.expect("close test control stream");
-        StreamReader::new(Box::pin(reader) as BoxReadStream)
+        StreamReader::new(Box::pin(reader) as BoxQuicStreamReader)
     }
 
     async fn settings_frame(settings: &Settings) -> Frame<BufList> {
@@ -1337,12 +1342,6 @@ impl DHttpState {
 
 type FrameSink = Feed<BoxSink<'static, Frame<BufList>, StreamError>, Frame<BufList>>;
 
-pub type BoxDynQuicStreamReader = guard::GuardedQuicReader;
-pub type BoxDynQuicStreamWriter = guard::GuardedQuicWriter;
-
-type GuardedStreamReader = StreamReader<BoxDynQuicStreamReader>;
-type GuardedStreamWriter = SinkWriter<BoxDynQuicStreamWriter>;
-
 /// DHTTP/3 protocol layer.
 ///
 /// Implements [`Protocol`] to handle HTTP/3 stream identification and
@@ -1361,7 +1360,10 @@ pub struct DHttpProtocol {
 
     handle_control_stream: SetOnce<AbortOnDropHandle<()>>,
 
-    unresolved_request_streams: RingChannel<(GuardedStreamReader, GuardedStreamWriter)>,
+    unresolved_request_streams: RingChannel<(
+        StreamReader<guard::GuardedQuicReader>,
+        SinkWriter<guard::GuardedQuicWriter>,
+    )>,
 }
 
 impl ops::Deref for DHttpProtocol {
@@ -1388,8 +1390,8 @@ impl DHttpProtocol {
 
     async fn accept_uni(
         &self,
-        mut stream: ErasedPeekableUniStream,
-    ) -> Result<StreamVerdict<ErasedPeekableUniStream>, StreamError> {
+        mut stream: BoxPeekableStreamReader,
+    ) -> Result<StreamVerdict<BoxPeekableStreamReader>, StreamError> {
         let Ok(stream_type) = stream.decode_one::<VarInt>().await else {
             return Ok(StreamVerdict::Passed(stream));
         };
@@ -1457,8 +1459,8 @@ impl DHttpProtocol {
 
     async fn accept_bi(
         &self,
-        (mut reader, writer): ErasedPeekableBiStream,
-    ) -> Result<StreamVerdict<ErasedPeekableBiStream>, StreamError> {
+        (mut reader, writer): (BoxPeekableStreamReader, BoxStreamWriter),
+    ) -> Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError> {
         // HTTP/3 bidirectional streams are request streams (RFC 9114 §4.1).
         // The first bytes on a request stream are HTTP/3 frames, starting with
         // a frame type VarInt. We peek the first VarInt to determine whether
@@ -1533,15 +1535,16 @@ impl DHttpProtocol {
 impl Protocol for DHttpProtocol {
     fn accept_uni<'a>(
         &'a self,
-        stream: ErasedPeekableUniStream,
-    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
+        stream: BoxPeekableStreamReader,
+    ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableStreamReader>, StreamError>> {
         Box::pin(self.accept_uni(stream))
     }
 
     fn accept_bi<'a>(
         &'a self,
-        stream: ErasedPeekableBiStream,
-    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
+        stream: (BoxPeekableStreamReader, BoxStreamWriter),
+    ) -> BoxFuture<'a, Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError>>
+    {
         Box::pin(self.accept_bi(stream))
     }
 }
@@ -1714,7 +1717,13 @@ pub enum AcceptRawMessageStreamError {
 impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync> ConnectionState<C> {
     pub async fn initial_raw_message_stream(
         &self,
-    ) -> Result<(GuardedStreamReader, GuardedStreamWriter), InitialRawMessageStreamError> {
+    ) -> Result<
+        (
+            StreamReader<guard::GuardedQuicReader>,
+            SinkWriter<guard::GuardedQuicWriter>,
+        ),
+        InitialRawMessageStreamError,
+    > {
         let (reader, writer) = self.open_bi().await?;
         let (mut reader, writer) = (Box::pin(reader), Box::pin(writer));
         self.dhttp()
@@ -1727,7 +1736,13 @@ impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync> ConnectionState<C> {
 
     pub async fn accept_raw_message_stream(
         &self,
-    ) -> Result<(GuardedStreamReader, GuardedStreamWriter), AcceptRawMessageStreamError> {
+    ) -> Result<
+        (
+            StreamReader<guard::GuardedQuicReader>,
+            SinkWriter<guard::GuardedQuicWriter>,
+        ),
+        AcceptRawMessageStreamError,
+    > {
         let dhttp = self.dhttp();
         let (mut reader, mut writer) = tokio::select! {
             stream = dhttp.unresolved_request_streams.receive() => stream,

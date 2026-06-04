@@ -1,4 +1,4 @@
-use super::{MessageStreamError, ReadStream, WriteStream};
+use super::{MessageReader, MessageStreamError, MessageWriter};
 
 pub mod read;
 pub mod upgrade;

@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin};
+use std::future::Future;
 
 use crate::quic;
 
@@ -15,38 +15,15 @@ pub use reader::{FixedLengthReader, PeekableStreamReader, StreamReader};
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt};
 pub use writer::{Feed, SinkWriter};
 
-pub type BoxStreamReader<C> = StreamReader<Pin<Box<<C as quic::ManageStream>::StreamReader>>>;
+/// Boxed stream reader wrapping a boxed QUIC read stream.
+pub type BoxStreamReader<S = dyn quic::ReadStream> = StreamReader<quic::BoxQuicStreamReader<S>>;
 
-/// Type alias for a peekable unidirectional stream.
-pub type BoxPeekableUniStream<C> =
-    PeekableStreamReader<Pin<Box<<C as quic::ManageStream>::StreamReader>>>;
+/// Boxed stream writer wrapping a boxed QUIC write stream.
+pub type BoxStreamWriter<S = dyn quic::WriteStream> = SinkWriter<quic::BoxQuicStreamWriter<S>>;
 
-/// Type alias for a peekable bidirectional stream pair.
-pub type BoxPeekableBiStream<C> = (
-    PeekableStreamReader<Pin<Box<<C as quic::ManageStream>::StreamReader>>>,
-    SinkWriter<Pin<Box<<C as quic::ManageStream>::StreamWriter>>>,
-);
-
-/// Raw erased read stream: a pinned, boxed trait object for `quic::ReadStream`.
-pub type BoxReadStream = Pin<Box<dyn quic::ReadStream + Send>>;
-
-/// Raw erased write stream: a pinned, boxed trait object for `quic::WriteStream`.
-pub type BoxWriteStream = Pin<Box<dyn quic::WriteStream + Send>>;
-
-/// Erased (non-generic) stream reader wrapping a boxed `ReadStream` trait object.
-pub type ErasedStreamReader = StreamReader<BoxReadStream>;
-
-/// Erased (non-generic) sink writer wrapping a boxed `WriteStream` trait object.
-pub type ErasedStreamWriter = SinkWriter<BoxWriteStream>;
-
-/// Erased (non-generic) peekable unidirectional stream reader.
-pub type ErasedPeekableUniStream = PeekableStreamReader<BoxReadStream>;
-
-/// Erased (non-generic) peekable bidirectional stream pair.
-pub type ErasedPeekableBiStream = (
-    PeekableStreamReader<BoxReadStream>,
-    SinkWriter<BoxWriteStream>,
-);
+/// Boxed peekable stream reader wrapping a boxed QUIC read stream.
+pub type BoxPeekableStreamReader<S = dyn quic::ReadStream> =
+    PeekableStreamReader<quic::BoxQuicStreamReader<S>>;
 
 pub trait EncodeInto<S>: Sized {
     type Output;

@@ -59,8 +59,8 @@
 //! 3. The runtime protocol is **connection-scoped**: created once, shared across all
 //!    streams. Per-request or per-session state should be produced by handler-facing
 //!    methods (e.g. `create_session(stream_id)`) rather than stored in [`Protocols`].
-//! 4. Erase transport-specific types at the boundary: use [`crate::codec::BoxReadStream`],
-//!    [`crate::codec::BoxWriteStream`], or [`crate::quic::DynConnection`] to hold
+//! 4. Erase transport-specific types at the boundary: use [`crate::quic::BoxQuicStreamReader`],
+//!    [`crate::quic::BoxQuicStreamWriter`], or [`crate::quic::DynConnection`] to hold
 //!    connection capabilities without leaking generic `C`.
 
 use std::{
@@ -76,7 +76,7 @@ use std::{
 use futures::future::BoxFuture;
 
 use crate::{
-    codec::{ErasedPeekableBiStream, ErasedPeekableUniStream},
+    codec::{BoxPeekableStreamReader, BoxStreamWriter},
     connection::StreamError,
     quic::{self, ConnectionError},
 };
@@ -167,8 +167,8 @@ impl Protocols {
 
     pub(crate) async fn accept_uni(
         &self,
-        mut stream: ErasedPeekableUniStream,
-    ) -> Result<StreamVerdict<ErasedPeekableUniStream>, StreamError> {
+        mut stream: BoxPeekableStreamReader,
+    ) -> Result<StreamVerdict<BoxPeekableStreamReader>, StreamError> {
         for layer in self.layers.values() {
             match layer.accept_uni(stream).await? {
                 StreamVerdict::Accepted => return Ok(StreamVerdict::Accepted),
@@ -183,8 +183,8 @@ impl Protocols {
 
     pub(crate) async fn accept_bi(
         &self,
-        mut stream: ErasedPeekableBiStream,
-    ) -> Result<StreamVerdict<ErasedPeekableBiStream>, StreamError> {
+        mut stream: (BoxPeekableStreamReader, BoxStreamWriter),
+    ) -> Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError> {
         for layer in self.layers.values() {
             match layer.accept_bi(stream).await? {
                 StreamVerdict::Accepted => return Ok(StreamVerdict::Accepted),
@@ -301,15 +301,15 @@ pub trait Protocol: Any + Send + Sync + Debug {
     /// Returns whether the stream was accepted or should be passed to the next layer.
     fn accept_uni<'a>(
         &'a self,
-        stream: ErasedPeekableUniStream,
-    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>>;
+        stream: BoxPeekableStreamReader,
+    ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableStreamReader>, StreamError>>;
 
     /// Handles an incoming bidirectional stream.
     /// Returns whether the stream was accepted or should be passed to the next layer.
     fn accept_bi<'a>(
         &'a self,
-        stream: ErasedPeekableBiStream,
-    ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>>;
+        stream: (BoxPeekableStreamReader, BoxStreamWriter),
+    ) -> BoxFuture<'a, Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError>>;
 }
 
 /// Verdict for stream handling in protocol layers.
@@ -345,11 +345,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{BoxReadStream, BoxWriteStream, PeekableStreamReader, SinkWriter, StreamReader},
+        codec::{PeekableStreamReader, SinkWriter, StreamReader},
         error::Code,
         quic::{
-            self, ConnectionError, GetStreamId, Lifecycle, ManageStream, ResetStream, StopStream,
-            WithLocalAuthority, WithRemoteAuthority,
+            self, BoxQuicStreamReader, BoxQuicStreamWriter, ConnectionError, GetStreamId,
+            Lifecycle, ManageStream, ResetStream, StopStream, WithLocalAuthority,
+            WithRemoteAuthority,
         },
         varint::VarInt,
     };
@@ -361,15 +362,18 @@ mod tests {
     impl Protocol for MockProtocol {
         fn accept_uni<'a>(
             &'a self,
-            stream: ErasedPeekableUniStream,
-        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
+            stream: BoxPeekableStreamReader,
+        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableStreamReader>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
         }
 
         fn accept_bi<'a>(
             &'a self,
-            stream: ErasedPeekableBiStream,
-        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
+            stream: (BoxPeekableStreamReader, BoxStreamWriter),
+        ) -> BoxFuture<
+            'a,
+            Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError>,
+        > {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
         }
     }
@@ -396,8 +400,8 @@ mod tests {
     impl Protocol for VerdictProtocol {
         fn accept_uni<'a>(
             &'a self,
-            stream: ErasedPeekableUniStream,
-        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
+            stream: BoxPeekableStreamReader,
+        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableStreamReader>, StreamError>> {
             Box::pin(async move {
                 match self.uni {
                     TestVerdict::Accepted => Ok(StreamVerdict::Accepted),
@@ -409,8 +413,11 @@ mod tests {
 
         fn accept_bi<'a>(
             &'a self,
-            stream: ErasedPeekableBiStream,
-        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
+            stream: (BoxPeekableStreamReader, BoxStreamWriter),
+        ) -> BoxFuture<
+            'a,
+            Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError>,
+        > {
             Box::pin(async move {
                 match self.bi {
                     TestVerdict::Accepted => Ok(StreamVerdict::Accepted),
@@ -421,30 +428,32 @@ mod tests {
         }
     }
 
-    fn peekable_uni_stream() -> ErasedPeekableUniStream {
+    fn peekable_uni_stream() -> BoxPeekableStreamReader {
         let (reader, _writer) = quic::test::mock_stream_pair(VarInt::from_u32(0));
-        PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream))
+        PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxQuicStreamReader))
     }
 
-    fn peekable_bi_stream() -> ErasedPeekableBiStream {
+    fn peekable_bi_stream() -> (BoxPeekableStreamReader, BoxStreamWriter) {
         let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(4));
         (
-            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream)),
-            SinkWriter::new(Box::pin(writer) as BoxWriteStream),
+            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxQuicStreamReader)),
+            SinkWriter::new(Box::pin(writer) as BoxQuicStreamWriter),
         )
     }
 
-    async fn peekable_uni_stream_with_bytes(bytes: &[u8]) -> ErasedPeekableUniStream {
+    async fn peekable_uni_stream_with_bytes(bytes: &[u8]) -> BoxPeekableStreamReader {
         let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(0));
         writer
             .send(Bytes::copy_from_slice(bytes))
             .await
             .expect("write test uni bytes");
         writer.close().await.expect("close test uni stream");
-        PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream))
+        PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxQuicStreamReader))
     }
 
-    async fn peekable_bi_stream_with_bytes(bytes: &[u8]) -> ErasedPeekableBiStream {
+    async fn peekable_bi_stream_with_bytes(
+        bytes: &[u8],
+    ) -> (BoxPeekableStreamReader, BoxStreamWriter) {
         let (reader, mut writer) = quic::test::mock_stream_pair(VarInt::from_u32(4));
         writer
             .send(Bytes::copy_from_slice(bytes))
@@ -452,8 +461,8 @@ mod tests {
             .expect("write test bidi bytes");
         writer.close().await.expect("close test bidi stream");
         (
-            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxReadStream)),
-            SinkWriter::new(Box::pin(writer) as BoxWriteStream),
+            PeekableStreamReader::new(StreamReader::new(Box::pin(reader) as BoxQuicStreamReader)),
+            SinkWriter::new(Box::pin(writer) as BoxQuicStreamWriter),
         )
     }
 
@@ -471,8 +480,8 @@ mod tests {
     impl<const ID: u8> Protocol for RoutedProtocol<ID> {
         fn accept_uni<'a>(
             &'a self,
-            stream: ErasedPeekableUniStream,
-        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
+            stream: BoxPeekableStreamReader,
+        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableStreamReader>, StreamError>> {
             Box::pin(async move {
                 let mut stream = stream;
                 let call = self.observation.calls.fetch_add(1, Ordering::SeqCst);
@@ -497,8 +506,11 @@ mod tests {
 
         fn accept_bi<'a>(
             &'a self,
-            stream: ErasedPeekableBiStream,
-        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
+            stream: (BoxPeekableStreamReader, BoxStreamWriter),
+        ) -> BoxFuture<
+            'a,
+            Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError>,
+        > {
             Box::pin(async move {
                 let mut stream = stream;
                 let call = self.observation.calls.fetch_add(1, Ordering::SeqCst);
@@ -778,15 +790,18 @@ mod tests {
     impl Protocol for MockProtocol2 {
         fn accept_uni<'a>(
             &'a self,
-            stream: ErasedPeekableUniStream,
-        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableUniStream>, StreamError>> {
+            stream: BoxPeekableStreamReader,
+        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableStreamReader>, StreamError>> {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
         }
 
         fn accept_bi<'a>(
             &'a self,
-            stream: ErasedPeekableBiStream,
-        ) -> BoxFuture<'a, Result<StreamVerdict<ErasedPeekableBiStream>, StreamError>> {
+            stream: (BoxPeekableStreamReader, BoxStreamWriter),
+        ) -> BoxFuture<
+            'a,
+            Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError>,
+        > {
             Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
         }
     }

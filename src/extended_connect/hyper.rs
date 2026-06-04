@@ -9,7 +9,7 @@ use snafu::{OptionExt, ResultExt, Snafu, ensure};
 use crate::{
     connection::ConnectionState,
     extended_connect::{EstablishedConnect, PendingWriteStreamError},
-    message::stream::{ReadStream, WriteStream, hyper::upgrade::TakeoverError},
+    message::stream::{MessageReader, MessageWriter, hyper::upgrade::TakeoverError},
     qpack::field::Protocol,
     quic,
     stream_id::StreamId,
@@ -76,10 +76,10 @@ where
         .context(establish_error::MissingConnectionSnafu)?;
     let protocol = response.extensions().get::<Protocol>().cloned();
 
-    let read = crate::hyper::upgrade::take::<ReadStream>(&mut response)
+    let read = crate::hyper::upgrade::take::<MessageReader>(&mut response)
         .await
         .context(establish_error::TakeReadSnafu)?;
-    let write = crate::hyper::upgrade::take::<WriteStream>(&mut response)
+    let write = crate::hyper::upgrade::take::<MessageWriter>(&mut response)
         .await
         .context(establish_error::TakeWriteSnafu)?;
 
@@ -112,12 +112,12 @@ where
         .context(accept_error::MissingConnectionSnafu)?;
     let protocol = request.extensions().get::<Protocol>().cloned();
 
-    let read = crate::hyper::upgrade::take::<ReadStream>(&mut request)
+    let read = crate::hyper::upgrade::take::<MessageReader>(&mut request)
         .await
         .context(accept_error::TakeReadSnafu)?;
 
     let write = async move {
-        match crate::hyper::upgrade::take::<WriteStream>(&mut request).await {
+        match crate::hyper::upgrade::take::<MessageWriter>(&mut request).await {
             Ok(write) => Ok(write),
             Err(error) => Err(pending_write_error(error)),
         }
@@ -561,7 +561,7 @@ mod tests {
             .insert(TakeoverSlot::new(RemainStream::immediately(
                 read_stream_for_test(stream_id.0),
             )));
-        let (write_tx, write) = RemainStream::<WriteStream>::pending();
+        let (write_tx, write) = RemainStream::<MessageWriter>::pending();
         request.extensions_mut().insert(TakeoverSlot::new(write));
         drop(write_tx);
 

@@ -1,5 +1,5 @@
-//! Test helpers for creating [`ReadStream`](super::stream::ReadStream) and
-//! [`WriteStream`](super::stream::WriteStream) instances with mock QUIC connections,
+//! Test helpers for creating [`MessageReader`](super::stream::MessageReader) and
+//! [`MessageWriter`](super::stream::MessageWriter) instances with mock QUIC connections,
 //! suitable for unit testing.
 
 use std::{
@@ -11,7 +11,7 @@ use std::{
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream};
 
-use super::stream::{ReadStream, WriteStream, guard};
+use super::stream::{MessageReader, MessageWriter, guard};
 use crate::{
     codec::{SinkWriter, StreamReader},
     qpack::protocol::{QPackDecoder, QPackEncoder},
@@ -19,12 +19,12 @@ use crate::{
     varint::VarInt,
 };
 
-/// Create a [`ReadStream`] for testing with a mock QUIC connection.
+/// Create a [`MessageReader`] for testing with a mock QUIC connection.
 ///
-/// The returned `ReadStream` uses a no-op reader that immediately returns `None`,
+/// The returned `MessageReader` uses a no-op reader that immediately returns `None`,
 /// and QPack codec streams that never produce data. The underlying mock connection
 /// has no open streams and will never become ready.
-pub fn read_stream_for_test(stream_id: VarInt) -> ReadStream {
+pub fn read_stream_for_test(stream_id: VarInt) -> MessageReader {
     struct TestReader {
         stream_id: VarInt,
     }
@@ -90,10 +90,10 @@ pub fn read_stream_for_test(stream_id: VarInt) -> ReadStream {
     let state = crate::connection::ConnectionState::new_for_test(erased, Arc::new(protocols));
 
     let reader = StreamReader::new(guard::GuardedQuicReader::new(
-        Box::pin(TestReader { stream_id }) as crate::codec::BoxReadStream,
+        Box::pin(TestReader { stream_id }) as crate::quic::BoxQuicStreamReader,
     ));
 
-    ReadStream::new(
+    MessageReader::new(
         stream_id,
         reader,
         Arc::new(QPackDecoder::new(
@@ -105,12 +105,12 @@ pub fn read_stream_for_test(stream_id: VarInt) -> ReadStream {
     )
 }
 
-/// Create a [`WriteStream`] for testing with a mock QUIC connection.
+/// Create a [`MessageWriter`] for testing with a mock QUIC connection.
 ///
-/// The returned `WriteStream` uses a no-op writer that discards all written data,
+/// The returned `MessageWriter` uses a no-op writer that discards all written data,
 /// and QPack codec streams that never produce data. The underlying mock connection
 /// has no open streams and will never become ready.
-pub fn write_stream_for_test(stream_id: VarInt) -> WriteStream {
+pub fn write_stream_for_test(stream_id: VarInt) -> MessageWriter {
     struct TestWriter {
         stream_id: VarInt,
     }
@@ -194,10 +194,10 @@ pub fn write_stream_for_test(stream_id: VarInt) -> WriteStream {
     let state = crate::connection::ConnectionState::new_for_test(erased, Arc::new(protocols));
 
     let writer = SinkWriter::new(guard::GuardedQuicWriter::new(
-        Box::pin(TestWriter { stream_id }) as crate::codec::BoxWriteStream,
+        Box::pin(TestWriter { stream_id }) as crate::quic::BoxQuicStreamWriter,
     ));
 
-    WriteStream::new(
+    MessageWriter::new(
         writer,
         Arc::new(QPackEncoder::new(
             Arc::new(crate::dhttp::settings::Settings::default()),

@@ -11,7 +11,7 @@ use crate::message::stream::{
     ReadMessageStream as OrigReadMessageStream, WriteMessageStream as OrigWriteMessageStream,
 };
 use crate::{
-    message::stream::{BoxMessageStreamReader, BoxMessageStreamWriter, MessageStreamError},
+    message::stream::{BoxMessageReader, BoxMessageWriter, MessageStreamError},
     quic::{self, GetStreamIdExt, ResetStreamExt, StopStreamExt},
     util::deferred::{DeferredStreamReader, DeferredStreamWriter},
     varint::VarInt,
@@ -124,8 +124,8 @@ impl ReadMessageStreamClient {
         Box::pin(DeferredStreamReader::from(self.into_message_stream()))
     }
 
-    /// Convert into a [`BoxMessageStreamReader`] (implements [`AsyncRead`](tokio::io::AsyncRead)).
-    pub fn into_box_reader(self) -> BoxMessageStreamReader<'static> {
+    /// Convert into a [`BoxMessageReader`] (implements [`AsyncRead`](tokio::io::AsyncRead)).
+    pub fn into_box_reader(self) -> BoxMessageReader {
         crate::codec::StreamReader::new(self.into_boxed_message_stream())
     }
 }
@@ -186,8 +186,8 @@ impl WriteMessageStreamClient {
         Box::pin(DeferredStreamWriter::from(self.into_message_stream()))
     }
 
-    /// Convert into a [`BoxMessageStreamWriter`] (implements [`AsyncWrite`](tokio::io::AsyncWrite)).
-    pub fn into_box_writer(self) -> BoxMessageStreamWriter<'static> {
+    /// Convert into a [`BoxMessageWriter`] (implements [`AsyncWrite`](tokio::io::AsyncWrite)).
+    pub fn into_box_writer(self) -> BoxMessageWriter {
         crate::codec::SinkWriter::new(self.into_boxed_message_stream())
     }
 }

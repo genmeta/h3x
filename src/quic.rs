@@ -196,54 +196,68 @@ pub trait ManageStream: Send + Sync {
     ) -> impl Future<Output = Result<Self::StreamReader, ConnectionError>> + Send + '_;
 }
 
-/// Type-erased read stream: `Pin<Box<dyn ReadStream + Send>>`.
-pub type BoxReadStream = Pin<Box<dyn ReadStream + Send>>;
+/// Boxed QUIC read stream.
+pub type BoxQuicStreamReader<S = dyn ReadStream> = Pin<Box<S>>;
 
-/// Type-erased write stream: `Pin<Box<dyn WriteStream + Send>>`.
-pub type BoxWriteStream = Pin<Box<dyn WriteStream + Send>>;
+/// Boxed QUIC write stream.
+pub type BoxQuicStreamWriter<S = dyn WriteStream> = Pin<Box<S>>;
 
 /// Object-safe version of [`ManageStream`] with type-erased streams.
 ///
-/// Stream types are fixed to [`BoxReadStream`] / [`BoxWriteStream`].
+/// Stream types are fixed to [`BoxQuicStreamReader`] / [`BoxQuicStreamWriter`].
 /// A blanket impl is provided for all `T: ManageStream`.
 pub trait DynManageStream: Send + Sync {
     #[allow(clippy::type_complexity)]
-    fn open_bi(&self) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), ConnectionError>>;
+    fn open_bi(
+        &self,
+    ) -> BoxFuture<'_, Result<(BoxQuicStreamReader, BoxQuicStreamWriter), ConnectionError>>;
 
-    fn open_uni(&self) -> BoxFuture<'_, Result<BoxWriteStream, ConnectionError>>;
+    fn open_uni(&self) -> BoxFuture<'_, Result<BoxQuicStreamWriter, ConnectionError>>;
 
     #[allow(clippy::type_complexity)]
-    fn accept_bi(&self) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), ConnectionError>>;
+    fn accept_bi(
+        &self,
+    ) -> BoxFuture<'_, Result<(BoxQuicStreamReader, BoxQuicStreamWriter), ConnectionError>>;
 
-    fn accept_uni(&self) -> BoxFuture<'_, Result<BoxReadStream, ConnectionError>>;
+    fn accept_uni(&self) -> BoxFuture<'_, Result<BoxQuicStreamReader, ConnectionError>>;
 }
 
 impl<T: ManageStream> DynManageStream for T {
-    fn open_bi(&self) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), ConnectionError>> {
+    fn open_bi(
+        &self,
+    ) -> BoxFuture<'_, Result<(BoxQuicStreamReader, BoxQuicStreamWriter), ConnectionError>> {
         Box::pin(async {
             let (r, w) = ManageStream::open_bi(self).await?;
-            Ok((Box::pin(r) as BoxReadStream, Box::pin(w) as BoxWriteStream))
+            Ok((
+                Box::pin(r) as BoxQuicStreamReader,
+                Box::pin(w) as BoxQuicStreamWriter,
+            ))
         })
     }
 
-    fn open_uni(&self) -> BoxFuture<'_, Result<BoxWriteStream, ConnectionError>> {
+    fn open_uni(&self) -> BoxFuture<'_, Result<BoxQuicStreamWriter, ConnectionError>> {
         Box::pin(async {
             let w = ManageStream::open_uni(self).await?;
-            Ok(Box::pin(w) as BoxWriteStream)
+            Ok(Box::pin(w) as BoxQuicStreamWriter)
         })
     }
 
-    fn accept_bi(&self) -> BoxFuture<'_, Result<(BoxReadStream, BoxWriteStream), ConnectionError>> {
+    fn accept_bi(
+        &self,
+    ) -> BoxFuture<'_, Result<(BoxQuicStreamReader, BoxQuicStreamWriter), ConnectionError>> {
         Box::pin(async {
             let (r, w) = ManageStream::accept_bi(self).await?;
-            Ok((Box::pin(r) as BoxReadStream, Box::pin(w) as BoxWriteStream))
+            Ok((
+                Box::pin(r) as BoxQuicStreamReader,
+                Box::pin(w) as BoxQuicStreamWriter,
+            ))
         })
     }
 
-    fn accept_uni(&self) -> BoxFuture<'_, Result<BoxReadStream, ConnectionError>> {
+    fn accept_uni(&self) -> BoxFuture<'_, Result<BoxQuicStreamReader, ConnectionError>> {
         Box::pin(async {
             let r = ManageStream::accept_uni(self).await?;
-            Ok(Box::pin(r) as BoxReadStream)
+            Ok(Box::pin(r) as BoxQuicStreamReader)
         })
     }
 }
