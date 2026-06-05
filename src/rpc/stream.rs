@@ -4,6 +4,7 @@
 //! machine. It is the single home for typed stream command/event drivers used
 //! by RPC, IPC, and WebTransport IPC stream forwarding.
 
+pub(crate) mod drain;
 pub(crate) mod error;
 pub(crate) mod frame;
 pub(crate) mod io;

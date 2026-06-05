@@ -9,14 +9,14 @@ use bytes::Bytes;
 use futures::{Stream, stream::FusedStream};
 
 use super::{
+    drain,
     error::{
         DeferredStreamError, DriverProtocolError, defer_err_conn, latch_frame_io_error,
         latch_protocol_error,
     },
     frame::{ReadCommand, ReadEvent},
-    io::FrameIo,
 };
-use crate::{quic, rpc::lifecycle::LifecycleExt, varint::VarInt};
+use crate::{quic, varint::VarInt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadOperation {
@@ -83,10 +83,15 @@ enum ReaderFault {
 pin_project_lite::pin_project! {
     #[project = BridgeStreamReaderProj]
     #[project_replace = BridgeStreamReaderReplace]
-    pub(crate) enum BridgeStreamReader<Io, L, E> {
+    pub(crate) enum BridgeStreamReader<Io, L, E>
+    where
+        L: drain::DrainLifecycle,
+        Io: drain::ReadDrainIo<E>,
+        E: 'static,
+        quic::ConnectionError: From<E>,
+    {
         Active {
-            #[pin]
-            active: ActiveBridgeStreamReader<Io, L, E>,
+            active: Pin<Box<ActiveBridgeStreamReader<Io, L, E>>>,
         },
         Eos {
             stream_id: VarInt,
@@ -95,6 +100,32 @@ pin_project_lite::pin_project! {
             stream_id: VarInt,
             error: DeferredStreamError,
         },
+    }
+
+    impl<Io, L, E> PinnedDrop for BridgeStreamReader<Io, L, E>
+    where
+        L: drain::DrainLifecycle,
+        Io: drain::ReadDrainIo<E>,
+        E: 'static,
+        quic::ConnectionError: From<E>,
+    {
+        fn drop(mut this: Pin<&mut Self>) {
+            let stream_id = match this.as_mut().project() {
+                BridgeStreamReaderProj::Active { active } => active.as_ref().get_ref().stream_id,
+                BridgeStreamReaderProj::Eos { .. } | BridgeStreamReaderProj::Closed { .. } => {
+                    return;
+                }
+            };
+
+            match this.project_replace(BridgeStreamReader::Eos { stream_id }) {
+                BridgeStreamReaderReplace::Active { active }
+                    if active.as_ref().get_ref().has_committed_outbound() =>
+                {
+                    drain::spawn_read_drain(active);
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -112,7 +143,13 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl<Io, L, E> BridgeStreamReader<Io, L, E> {
+impl<Io, L, E> BridgeStreamReader<Io, L, E>
+where
+    L: drain::DrainLifecycle,
+    Io: drain::ReadDrainIo<E>,
+    E: 'static,
+    quic::ConnectionError: From<E>,
+{
     #[cfg_attr(
         not(test),
         expect(
@@ -122,7 +159,7 @@ impl<Io, L, E> BridgeStreamReader<Io, L, E> {
     )]
     pub(crate) fn new(stream_id: VarInt, bridge: Io, lifecycle: Arc<L>) -> Self {
         Self::Active {
-            active: ActiveBridgeStreamReader {
+            active: Box::pin(ActiveBridgeStreamReader {
                 stream_id,
                 lifecycle,
                 bridge,
@@ -131,12 +168,18 @@ impl<Io, L, E> BridgeStreamReader<Io, L, E> {
                 recv_state: ReaderRecvState::default(),
                 results: ReaderResults::default(),
                 _error: PhantomData,
-            },
+            }),
         }
     }
 }
 
 impl<Io, L, E> ActiveBridgeStreamReader<Io, L, E> {
+    pub(super) fn has_committed_outbound(&self) -> bool {
+        self.pending.pull
+            || self.pending.stop.is_some()
+            || matches!(self.send_state, SendState::Flush { .. })
+    }
+
     fn committed_stop_code(&self) -> Option<VarInt> {
         if let Some(code) = self.pending.stop {
             return Some(code);
@@ -219,8 +262,9 @@ impl<Io, L, E> ActiveBridgeStreamReader<Io, L, E> {
 
 impl<Io, L, E> ActiveBridgeStreamReader<Io, L, E>
 where
-    L: LifecycleExt + 'static,
-    Io: FrameIo<ReadCommand, ReadEvent, E>,
+    L: drain::DrainLifecycle,
+    Io: drain::ReadDrainIo<E>,
+    E: 'static,
     quic::ConnectionError: From<E>,
 {
     fn protocol_fault_for(lifecycle: &Arc<L>, error: DriverProtocolError) -> ReaderFault {
@@ -364,6 +408,97 @@ where
         }
     }
 
+    fn poll_drain_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        let mut this = self.as_mut().project();
+        match &mut *this.send_state {
+            SendState::Idle { ready: true } => Poll::Ready(Ok(())),
+            SendState::Idle { ready } => match ready!(this.bridge.as_mut().poll_ready(cx)) {
+                Ok(()) => {
+                    *ready = true;
+                    Poll::Ready(Ok(()))
+                }
+                Err(error) => {
+                    Poll::Ready(Err(latch_frame_io_error(this.lifecycle.as_ref(), error)))
+                }
+            },
+            SendState::Flush { .. } => unreachable!("reader drain readiness while flushing"),
+        }
+    }
+
+    fn start_drain_operation(
+        mut self: Pin<&mut Self>,
+        operation: ReadOperation,
+    ) -> Result<(), quic::StreamError> {
+        let command = match operation {
+            ReadOperation::Pull => ReadCommand::Pull,
+            ReadOperation::Stop { code } => ReadCommand::Stop { code },
+        };
+
+        let mut this = self.as_mut().project();
+        match this.bridge.as_mut().start_send(command) {
+            Ok(()) => {
+                *this.send_state = SendState::Flush {
+                    inflight: operation,
+                };
+                Ok(())
+            }
+            Err(error) => Err(latch_frame_io_error(this.lifecycle.as_ref(), error)),
+        }
+    }
+
+    pub(super) fn poll_drain(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        loop {
+            if matches!(self.as_ref().get_ref().send_state, SendState::Flush { .. }) {
+                let mut this = self.as_mut().project();
+                match ready!(this.bridge.as_mut().poll_flush(cx)) {
+                    Ok(()) => {
+                        *this.send_state = SendState::Idle { ready: false };
+                        continue;
+                    }
+                    Err(error) => {
+                        let error = latch_frame_io_error(this.lifecycle.as_ref(), error);
+                        drain::log_drain_error(&error, "reader");
+                        return Poll::Ready(());
+                    }
+                }
+            }
+
+            if self.as_ref().get_ref().pending.pull {
+                if let Err(error) = ready!(self.as_mut().poll_drain_ready(cx)) {
+                    drain::log_drain_error(&error, "reader");
+                    return Poll::Ready(());
+                }
+                self.as_mut().project().pending.pull = false;
+                if let Err(error) = self.as_mut().start_drain_operation(ReadOperation::Pull) {
+                    drain::log_drain_error(&error, "reader");
+                    return Poll::Ready(());
+                }
+                continue;
+            }
+
+            if let Some(code) = self.as_ref().get_ref().pending.stop {
+                if let Err(error) = ready!(self.as_mut().poll_drain_ready(cx)) {
+                    drain::log_drain_error(&error, "reader");
+                    return Poll::Ready(());
+                }
+                self.as_mut().project().pending.stop = None;
+                if let Err(error) = self
+                    .as_mut()
+                    .start_drain_operation(ReadOperation::Stop { code })
+                {
+                    drain::log_drain_error(&error, "reader");
+                    return Poll::Ready(());
+                }
+                continue;
+            }
+
+            return Poll::Ready(());
+        }
+    }
+
     fn drive_pull(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), ReaderFault>> {
         loop {
             if self.as_ref().get_ref().completed_pull_result() {
@@ -481,13 +616,14 @@ fn ready_error(error: quic::StreamError) -> DeferredStreamError {
 
 impl<Io, L, E> BridgeStreamReader<Io, L, E>
 where
-    L: LifecycleExt + 'static,
-    Io: FrameIo<ReadCommand, ReadEvent, E>,
+    L: drain::DrainLifecycle,
+    Io: drain::ReadDrainIo<E>,
+    E: 'static,
     quic::ConnectionError: From<E>,
 {
     fn stream_id(self: Pin<&mut Self>) -> VarInt {
         match self.project() {
-            BridgeStreamReaderProj::Active { active } => active.stream_id,
+            BridgeStreamReaderProj::Active { active } => active.as_ref().get_ref().stream_id,
             BridgeStreamReaderProj::Eos { stream_id } => *stream_id,
             BridgeStreamReaderProj::Closed { stream_id, .. } => *stream_id,
         }
@@ -534,15 +670,16 @@ where
 
 impl<Io, L, E> Stream for BridgeStreamReader<Io, L, E>
 where
-    L: LifecycleExt + 'static,
-    Io: FrameIo<ReadCommand, ReadEvent, E>,
+    L: drain::DrainLifecycle,
+    Io: drain::ReadDrainIo<E>,
+    E: 'static,
     quic::ConnectionError: From<E>,
 {
     type Item = Result<Bytes, quic::StreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.as_mut().project() {
-            BridgeStreamReaderProj::Active { mut active } => {
+            BridgeStreamReaderProj::Active { active } => {
                 let _commit = active.as_mut().commit_pull_pinned();
                 match ready!(active.as_mut().drive_pull(cx)) {
                     Ok(()) => match active.as_mut().take_pull_result_pinned() {
@@ -571,7 +708,10 @@ where
 
 impl<Io, L, E> FusedStream for BridgeStreamReader<Io, L, E>
 where
-    Self: Stream<Item = Result<Bytes, quic::StreamError>>,
+    L: drain::DrainLifecycle,
+    Io: drain::ReadDrainIo<E>,
+    E: 'static,
+    quic::ConnectionError: From<E>,
 {
     fn is_terminated(&self) -> bool {
         matches!(
@@ -587,8 +727,9 @@ where
 
 impl<Io, L, E> quic::GetStreamId for BridgeStreamReader<Io, L, E>
 where
-    L: LifecycleExt + 'static,
-    Io: FrameIo<ReadCommand, ReadEvent, E>,
+    L: drain::DrainLifecycle,
+    Io: drain::ReadDrainIo<E>,
+    E: 'static,
     quic::ConnectionError: From<E>,
 {
     fn poll_stream_id(
@@ -596,7 +737,9 @@ where
         _cx: &mut Context,
     ) -> Poll<Result<VarInt, quic::StreamError>> {
         match self.project() {
-            BridgeStreamReaderProj::Active { active } => Poll::Ready(Ok(active.stream_id)),
+            BridgeStreamReaderProj::Active { active } => {
+                Poll::Ready(Ok(active.as_ref().get_ref().stream_id))
+            }
             BridgeStreamReaderProj::Eos { stream_id } => Poll::Ready(Ok(*stream_id)),
             BridgeStreamReaderProj::Closed { stream_id, .. } => Poll::Ready(Ok(*stream_id)),
         }
@@ -605,8 +748,9 @@ where
 
 impl<Io, L, E> quic::StopStream for BridgeStreamReader<Io, L, E>
 where
-    L: LifecycleExt + 'static,
-    Io: FrameIo<ReadCommand, ReadEvent, E>,
+    L: drain::DrainLifecycle,
+    Io: drain::ReadDrainIo<E>,
+    E: 'static,
     quic::ConnectionError: From<E>,
 {
     fn poll_stop(
@@ -615,7 +759,7 @@ where
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
         match self.as_mut().project() {
-            BridgeStreamReaderProj::Active { mut active } => {
+            BridgeStreamReaderProj::Active { active } => {
                 let commit = active.as_mut().commit_stop_pinned(code);
                 let committed_code = match commit {
                     CommitResult::Committed | CommitResult::Duplicate => code,

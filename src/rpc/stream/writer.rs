@@ -9,14 +9,14 @@ use bytes::Bytes;
 use futures::Sink;
 
 use super::{
+    drain,
     error::{
         DeferredStreamError, DriverProtocolError, defer_err_conn, latch_frame_io_error,
         latch_protocol_error,
     },
     frame::{WriteCommand, WriteEvent},
-    io::FrameIo,
 };
-use crate::{quic, rpc::lifecycle::LifecycleExt, varint::VarInt};
+use crate::{quic, varint::VarInt};
 
 const WRITE_AFTER_EOS_PANIC: &str = "h3x write data after shutdown";
 
@@ -119,10 +119,15 @@ enum ResetDrive {
 pin_project_lite::pin_project! {
     #[project = BridgeStreamWriterProj]
     #[project_replace = BridgeStreamWriterReplace]
-    pub(crate) enum BridgeStreamWriter<Io, L, E> {
+    pub(crate) enum BridgeStreamWriter<Io, L, E>
+    where
+        L: drain::DrainLifecycle,
+        Io: drain::WriteDrainIo<E>,
+        E: 'static,
+        quic::ConnectionError: From<E>,
+    {
         Active {
-            #[pin]
-            active: ActiveBridgeStreamWriter<Io, L, E>,
+            active: Pin<Box<ActiveBridgeStreamWriter<Io, L, E>>>,
         },
         Eos {
             stream_id: VarInt,
@@ -135,6 +140,32 @@ pin_project_lite::pin_project! {
             stream_id: VarInt,
             error: DeferredStreamError,
         },
+    }
+
+    impl<Io, L, E> PinnedDrop for BridgeStreamWriter<Io, L, E>
+    where
+        L: drain::DrainLifecycle,
+        Io: drain::WriteDrainIo<E>,
+        E: 'static,
+        quic::ConnectionError: From<E>,
+    {
+        fn drop(mut this: Pin<&mut Self>) {
+            let stream_id = match this.as_mut().project() {
+                BridgeStreamWriterProj::Active { active } => active.as_ref().get_ref().stream_id,
+                BridgeStreamWriterProj::Eos { .. }
+                | BridgeStreamWriterProj::Reset { .. }
+                | BridgeStreamWriterProj::Closed { .. } => return,
+            };
+
+            match this.project_replace(BridgeStreamWriter::Eos { stream_id }) {
+                BridgeStreamWriterReplace::Active { active }
+                    if active.as_ref().get_ref().has_committed_outbound() =>
+                {
+                    drain::spawn_write_drain(active);
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -153,7 +184,13 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl<Io, L, E> BridgeStreamWriter<Io, L, E> {
+impl<Io, L, E> BridgeStreamWriter<Io, L, E>
+where
+    L: drain::DrainLifecycle,
+    Io: drain::WriteDrainIo<E>,
+    E: 'static,
+    quic::ConnectionError: From<E>,
+{
     #[cfg_attr(
         not(test),
         expect(
@@ -163,7 +200,7 @@ impl<Io, L, E> BridgeStreamWriter<Io, L, E> {
     )]
     pub(crate) fn new(stream_id: VarInt, bridge: Io, lifecycle: Arc<L>) -> Self {
         Self::Active {
-            active: ActiveBridgeStreamWriter {
+            active: Box::pin(ActiveBridgeStreamWriter {
                 stream_id,
                 lifecycle,
                 bridge,
@@ -173,12 +210,19 @@ impl<Io, L, E> BridgeStreamWriter<Io, L, E> {
                 results: WriterResults::default(),
                 write_generation: 0,
                 _error: PhantomData,
-            },
+            }),
         }
     }
 }
 
 impl<Io, L, E> ActiveBridgeStreamWriter<Io, L, E> {
+    pub(super) fn has_committed_outbound(&self) -> bool {
+        self.pending.push.is_some()
+            || self.pending.control.is_some()
+            || self.pending.reset.is_some()
+            || matches!(self.send_state, SendState::Flush { .. })
+    }
+
     fn committed_reset_code(&self) -> Option<VarInt> {
         if let Some(code) = self.pending.reset {
             return Some(code);
@@ -391,8 +435,9 @@ impl<Io, L, E> ActiveBridgeStreamWriter<Io, L, E> {
 
 impl<Io, L, E> ActiveBridgeStreamWriter<Io, L, E>
 where
-    L: LifecycleExt + 'static,
-    Io: FrameIo<WriteCommand, WriteEvent, E>,
+    L: drain::DrainLifecycle,
+    Io: drain::WriteDrainIo<E>,
+    E: 'static,
     quic::ConnectionError: From<E>,
 {
     fn protocol_fault_for(lifecycle: &Arc<L>, error: DriverProtocolError) -> WriterFault {
@@ -462,6 +507,143 @@ where
                 Ok(())
             }
             Err(error) => Err(Self::frame_io_fault_for(this.lifecycle, error)),
+        }
+    }
+
+    fn poll_drain_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        let mut this = self.as_mut().project();
+        match &mut *this.send_state {
+            SendState::Idle { ready: true } => Poll::Ready(Ok(())),
+            SendState::Idle { ready } => match ready!(this.bridge.as_mut().poll_ready(cx)) {
+                Ok(()) => {
+                    *ready = true;
+                    Poll::Ready(Ok(()))
+                }
+                Err(error) => {
+                    Poll::Ready(Err(latch_frame_io_error(this.lifecycle.as_ref(), error)))
+                }
+            },
+            SendState::Flush { .. } => unreachable!("writer drain readiness while flushing"),
+        }
+    }
+
+    fn start_drain_operation(
+        mut self: Pin<&mut Self>,
+        operation: WriteOperation,
+    ) -> Result<(), quic::StreamError> {
+        let command = match &operation {
+            WriteOperation::Push { data } => WriteCommand::Push { data: data.clone() },
+            WriteOperation::Flush { .. } => WriteCommand::Flush,
+            WriteOperation::Eos { .. } => WriteCommand::Eos,
+            WriteOperation::Reset { code } => WriteCommand::Reset { code: *code },
+        };
+
+        let mut this = self.as_mut().project();
+        match this.bridge.as_mut().start_send(command) {
+            Ok(()) => {
+                *this.send_state = SendState::Flush {
+                    inflight: operation,
+                };
+                Ok(())
+            }
+            Err(error) => Err(latch_frame_io_error(this.lifecycle.as_ref(), error)),
+        }
+    }
+
+    pub(super) fn poll_drain(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        loop {
+            if matches!(self.as_ref().get_ref().send_state, SendState::Flush { .. }) {
+                let mut this = self.as_mut().project();
+                match ready!(this.bridge.as_mut().poll_flush(cx)) {
+                    Ok(()) => {
+                        let sent = match std::mem::replace(
+                            this.send_state,
+                            SendState::Idle { ready: false },
+                        ) {
+                            SendState::Flush { inflight } => inflight,
+                            SendState::Idle { .. } => unreachable!("flush state checked above"),
+                        };
+                        match sent {
+                            WriteOperation::Push { .. } => continue,
+                            WriteOperation::Flush { .. }
+                            | WriteOperation::Eos { .. }
+                            | WriteOperation::Reset { .. } => return Poll::Ready(()),
+                        }
+                    }
+                    Err(error) => {
+                        let error = latch_frame_io_error(this.lifecycle.as_ref(), error);
+                        drain::log_drain_error(&error, "writer");
+                        return Poll::Ready(());
+                    }
+                }
+            }
+
+            if matches!(
+                self.as_ref().get_ref().recv_state,
+                WriterRecvState::Await { .. }
+            ) {
+                return Poll::Ready(());
+            }
+
+            if self.as_ref().get_ref().pending.push.is_some() {
+                if let Err(error) = ready!(self.as_mut().poll_drain_ready(cx)) {
+                    drain::log_drain_error(&error, "writer");
+                    return Poll::Ready(());
+                }
+                let data = self
+                    .as_mut()
+                    .project()
+                    .pending
+                    .push
+                    .take()
+                    .expect("pending push should exist");
+                if let Err(error) = self
+                    .as_mut()
+                    .start_drain_operation(WriteOperation::Push { data })
+                {
+                    drain::log_drain_error(&error, "writer");
+                    return Poll::Ready(());
+                }
+                continue;
+            }
+
+            if let Some(code) = self.as_ref().get_ref().pending.reset {
+                if let Err(error) = ready!(self.as_mut().poll_drain_ready(cx)) {
+                    drain::log_drain_error(&error, "writer");
+                    return Poll::Ready(());
+                }
+                self.as_mut().project().pending.reset = None;
+                if let Err(error) = self
+                    .as_mut()
+                    .start_drain_operation(WriteOperation::Reset { code })
+                {
+                    drain::log_drain_error(&error, "writer");
+                    return Poll::Ready(());
+                }
+                continue;
+            }
+
+            if let Some(control) = self.as_ref().get_ref().pending.control {
+                if let Err(error) = ready!(self.as_mut().poll_drain_ready(cx)) {
+                    drain::log_drain_error(&error, "writer");
+                    return Poll::Ready(());
+                }
+                self.as_mut().project().pending.control = None;
+                let operation = match control {
+                    WriteBarrier::Flush { generation } => WriteOperation::Flush { generation },
+                    WriteBarrier::Eos { covers_flush } => WriteOperation::Eos { covers_flush },
+                };
+                if let Err(error) = self.as_mut().start_drain_operation(operation) {
+                    drain::log_drain_error(&error, "writer");
+                    return Poll::Ready(());
+                }
+                continue;
+            }
+
+            return Poll::Ready(());
         }
     }
 
@@ -812,13 +994,14 @@ fn ready_error(error: quic::StreamError) -> DeferredStreamError {
 
 impl<Io, L, E> BridgeStreamWriter<Io, L, E>
 where
-    L: LifecycleExt + 'static,
-    Io: FrameIo<WriteCommand, WriteEvent, E>,
+    L: drain::DrainLifecycle,
+    Io: drain::WriteDrainIo<E>,
+    E: 'static,
     quic::ConnectionError: From<E>,
 {
     fn stream_id(self: Pin<&mut Self>) -> VarInt {
         match self.project() {
-            BridgeStreamWriterProj::Active { active } => active.stream_id,
+            BridgeStreamWriterProj::Active { active } => active.as_ref().get_ref().stream_id,
             BridgeStreamWriterProj::Eos { stream_id } => *stream_id,
             BridgeStreamWriterProj::Reset { stream_id, .. } => *stream_id,
             BridgeStreamWriterProj::Closed { stream_id, .. } => *stream_id,
@@ -877,15 +1060,16 @@ where
 
 impl<Io, L, E> Sink<Bytes> for BridgeStreamWriter<Io, L, E>
 where
-    L: LifecycleExt + 'static,
-    Io: FrameIo<WriteCommand, WriteEvent, E>,
+    L: drain::DrainLifecycle,
+    Io: drain::WriteDrainIo<E>,
+    E: 'static,
     quic::ConnectionError: From<E>,
 {
     type Error = quic::StreamError;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match self.as_mut().project() {
-            BridgeStreamWriterProj::Active { mut active } => {
+            BridgeStreamWriterProj::Active { active } => {
                 match ready!(active.as_mut().drive_credit(cx)) {
                     Ok(DriveTerminal::None) => Poll::Ready(Ok(())),
                     Ok(DriveTerminal::Eos) => {
@@ -915,14 +1099,16 @@ where
 
     fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
         match self.as_mut().project() {
-            BridgeStreamWriterProj::Active { active } => match active.commit_push_pinned(item) {
-                Ok(()) => Ok(()),
-                Err(error @ quic::StreamError::Connection { .. }) => {
-                    self.as_mut().close_with_stream_error(error.clone());
-                    Err(error)
+            BridgeStreamWriterProj::Active { active } => {
+                match active.as_mut().commit_push_pinned(item) {
+                    Ok(()) => Ok(()),
+                    Err(error @ quic::StreamError::Connection { .. }) => {
+                        self.as_mut().close_with_stream_error(error.clone());
+                        Err(error)
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
-            },
+            }
             BridgeStreamWriterProj::Eos { .. } => panic!("{WRITE_AFTER_EOS_PANIC}"),
             BridgeStreamWriterProj::Reset { code, .. } => {
                 Err(quic::StreamError::Reset { code: *code })
@@ -938,7 +1124,7 @@ where
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match self.as_mut().project() {
-            BridgeStreamWriterProj::Active { mut active } => {
+            BridgeStreamWriterProj::Active { active } => {
                 let (_commit, generation) = active.as_mut().commit_flush_pinned();
                 match ready!(active.as_mut().drive_flush(cx, generation)) {
                     Ok(DriveTerminal::None) => {
@@ -972,7 +1158,7 @@ where
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match self.as_mut().project() {
-            BridgeStreamWriterProj::Active { mut active } => {
+            BridgeStreamWriterProj::Active { active } => {
                 let _commit = active.as_mut().commit_eos_pinned();
                 match ready!(active.as_mut().drive_eos(cx)) {
                     Ok(DriveTerminal::Eos | DriveTerminal::None) => {
@@ -1004,8 +1190,9 @@ where
 
 impl<Io, L, E> quic::GetStreamId for BridgeStreamWriter<Io, L, E>
 where
-    L: LifecycleExt + 'static,
-    Io: FrameIo<WriteCommand, WriteEvent, E>,
+    L: drain::DrainLifecycle,
+    Io: drain::WriteDrainIo<E>,
+    E: 'static,
     quic::ConnectionError: From<E>,
 {
     fn poll_stream_id(
@@ -1013,7 +1200,9 @@ where
         cx: &mut Context,
     ) -> Poll<Result<VarInt, quic::StreamError>> {
         match self.project() {
-            BridgeStreamWriterProj::Active { active } => Poll::Ready(Ok(active.stream_id)),
+            BridgeStreamWriterProj::Active { active } => {
+                Poll::Ready(Ok(active.as_ref().get_ref().stream_id))
+            }
             BridgeStreamWriterProj::Eos { stream_id } => Poll::Ready(Ok(*stream_id)),
             BridgeStreamWriterProj::Reset { code, .. } => {
                 Poll::Ready(Err(quic::StreamError::Reset { code: *code }))
@@ -1027,8 +1216,9 @@ where
 
 impl<Io, L, E> quic::ResetStream for BridgeStreamWriter<Io, L, E>
 where
-    L: LifecycleExt + 'static,
-    Io: FrameIo<WriteCommand, WriteEvent, E>,
+    L: drain::DrainLifecycle,
+    Io: drain::WriteDrainIo<E>,
+    E: 'static,
     quic::ConnectionError: From<E>,
 {
     fn poll_reset(
@@ -1037,7 +1227,7 @@ where
         code: VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
         match self.as_mut().project() {
-            BridgeStreamWriterProj::Active { mut active } => {
+            BridgeStreamWriterProj::Active { active } => {
                 let commit = active.as_mut().commit_reset_pinned(code);
                 let committed_code = match commit {
                     CommitResult::Committed | CommitResult::Duplicate => {
@@ -1173,7 +1363,7 @@ mod tests {
         let (worker, hypervisor) = worker_writer_pair::<TestFrameIoError>();
         (
             BridgeStreamWriter::Active {
-                active: ActiveBridgeStreamWriter {
+                active: Box::pin(ActiveBridgeStreamWriter {
                     stream_id,
                     lifecycle,
                     bridge: worker,
@@ -1192,7 +1382,7 @@ mod tests {
                     },
                     write_generation: 0,
                     _error: PhantomData,
-                },
+                }),
             },
             hypervisor,
         )
