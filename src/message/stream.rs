@@ -22,7 +22,7 @@ use crate::{
     error::{Code, H3FrameDecodeError, H3FrameUnexpected},
     qpack::{
         algorithm::{DynamicCompressAlgo, HuffmanAlways},
-        decoder::MessageStreamReader as QPackMessageStreamReader,
+        decoder::QPackMessageStreamReader,
         encoder::{EncodeHeaderSectionError, Encoder},
         field::{FieldLine, FieldSection},
         protocol::{QPackDecoder, QPackEncoder, QPackProtocolDisabled},
@@ -37,8 +37,8 @@ pub(crate) mod hyper;
 pub(crate) mod unfold;
 
 pub use self::unfold::{
-    read::{BoxMessageReader, ReadMessageStream},
-    write::{BoxMessageWriter, WriteMessageStream},
+    read::{BoxMessageReader, MessageStreamReader},
+    write::{BoxMessageWriter, MessageStreamWriter},
 };
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -64,18 +64,8 @@ pub enum MessageStreamError {
     MalformedOutgoingMessage,
     #[snafu(display("message send previously failed"))]
     MessageSendFailed,
-}
-
-#[derive(Debug, Snafu)]
-#[snafu(display("data frame payload too large, try smaller chunk size"))]
-struct DataFrameTooLargeStreamError {
-    source: varint::err::Overflow,
-}
-
-impl crate::error::H3StreamError for DataFrameTooLargeStreamError {
-    fn code(&self) -> Code {
-        Code::H3_FRAME_ERROR
-    }
+    #[snafu(display("message writer is closed"))]
+    MessageWriterClosed,
 }
 
 impl From<quic::ConnectionError> for MessageStreamError {
@@ -102,7 +92,9 @@ impl From<MessageStreamError> for io::Error {
             MessageStreamError::Goaway { .. } => Some(ErrorKind::ConnectionAborted),
             MessageStreamError::MalformedIncomingMessage => Some(ErrorKind::InvalidData),
             MessageStreamError::MalformedOutgoingMessage => Some(ErrorKind::InvalidInput),
-            MessageStreamError::MessageSendFailed => Some(ErrorKind::BrokenPipe),
+            MessageStreamError::MessageSendFailed | MessageStreamError::MessageWriterClosed => {
+                Some(ErrorKind::BrokenPipe)
+            }
             MessageStreamError::HeaderTooLarge
             | MessageStreamError::TrailerTooLarge
             | MessageStreamError::DataFrameTooLarge { .. } => Some(ErrorKind::InvalidInput),
@@ -132,11 +124,11 @@ impl MessageReader {
     ) -> Self {
         let decoder = qpack_decoder.clone();
         let stream = stream.map_stream(move |guarded| {
-            guard::GuardedQuicReader::new(Box::pin(QPackMessageStreamReader::new(
-                stream_id,
-                guarded.into_inner(),
-                decoder,
-            )))
+            let mut stream = guard::GuardedQuicReader::new(Box::pin(
+                QPackMessageStreamReader::new(stream_id, guarded.into_inner(), decoder),
+            ));
+            stream.set_stream_id(stream_id);
+            stream
         });
         let frame_stream = FrameStream::new(stream);
         Self {
@@ -226,17 +218,17 @@ impl MessageReader {
     }
 
     pub async fn read_data_chunk(&mut self) -> Result<Option<Bytes>, MessageStreamError> {
-        self.try_stream_io(async |this| this.read_data_frame_chunk().await)
+        self.try_stream_read(async |this| this.read_data_frame_chunk().await)
             .await
     }
 
     pub async fn read_header(&mut self) -> Result<Option<FieldSection>, MessageStreamError> {
-        self.try_stream_io(async |this| this.read_header_frame().await)
+        self.try_stream_read(async |this| this.read_header_frame().await)
             .await
     }
 
     pub async fn stop(&mut self, code: Code) -> Result<(), MessageStreamError> {
-        self.try_stream_io(async move |this| Ok(this.stream.stop(code.into_inner()).await?))
+        self.try_stream_read(async move |this| Ok(this.stream.stop(code.into_inner()).await?))
             .await
     }
 
@@ -264,7 +256,7 @@ impl MessageReader {
         })
     }
 
-    pub async fn try_stream_io<T>(
+    pub async fn try_stream_read<T>(
         &mut self,
         f: impl AsyncFnOnce(&mut Self) -> Result<T, connection::StreamError>,
     ) -> Result<T, MessageStreamError> {
@@ -272,7 +264,9 @@ impl MessageReader {
         tokio::select! {
             result = f(self) => match result {
                 Ok(value) => Ok(value),
-                Err(error) => Err(self.handle_stream_error(error).await.into()),
+                Err(error) => Err(MessageStreamError::Quic {
+                    source: self.handle_stream_error(error).await,
+                }),
             },
             goaway = peer_goaway => match goaway {
                 Ok(()) => {
@@ -299,14 +293,22 @@ impl MessageReader {
         error: connection::StreamError,
     ) -> quic::StreamError {
         match error {
-            connection::StreamError::Connection { source } => self
-                .state
-                .quic()
-                .as_ref()
-                .handle_connection_error(source)
-                .await
-                .into(),
-            connection::StreamError::Reset { code } => quic::StreamError::Reset { code },
+            connection::StreamError::Connection { source } => {
+                let source = self
+                    .state
+                    .quic()
+                    .as_ref()
+                    .handle_connection_error(source)
+                    .await;
+                self.stream
+                    .inner_mut()
+                    .mark_connection_closed(source.clone());
+                source.into()
+            }
+            connection::StreamError::Reset { code } => {
+                self.stream.inner_mut().mark_reset(code);
+                quic::StreamError::Reset { code }
+            }
             connection::StreamError::H3 { source } => {
                 let code = source.code().into_inner();
                 _ = self.stream.stop(code).await;
@@ -366,58 +368,62 @@ impl MessageWriter {
         }
     }
 
+    fn ensure_write_open(&self) -> Result<(), MessageStreamError> {
+        match self.stream.sink().state_snapshot() {
+            guard::QuicWriterStateSnapshot::Open => Ok(()),
+            guard::QuicWriterStateSnapshot::Closed => Err(MessageStreamError::MessageWriterClosed),
+            guard::QuicWriterStateSnapshot::Reset { code } => Err(MessageStreamError::Quic {
+                source: quic::StreamError::Reset { code },
+            }),
+            guard::QuicWriterStateSnapshot::ConnectionClosed { source } => {
+                Err(MessageStreamError::Quic {
+                    source: quic::StreamError::Connection { source },
+                })
+            }
+            guard::QuicWriterStateSnapshot::Taken => {
+                panic!("message writer used after being taken, this is a bug")
+            }
+        }
+    }
+
     pub async fn write_frame(
         &mut self,
         frame: Frame<impl Buf + Send>,
-    ) -> Result<(), connection::StreamError> {
-        self.stream.encode_one(frame).await?;
-        Ok(())
+    ) -> Result<(), MessageStreamError> {
+        self.try_stream_write(async move |this| {
+            this.stream.encode_one(frame).await?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn write_data_frame(
         &mut self,
         data: impl Buf + Send,
-    ) -> Result<(), connection::StreamError> {
-        let frame = match Frame::new(Frame::DATA_FRAME_TYPE, data) {
-            Ok(frame) => frame,
-            Err(source) => return Err(DataFrameTooLargeStreamError { source }.into()),
-        };
+    ) -> Result<(), MessageStreamError> {
+        let frame = Frame::new(Frame::DATA_FRAME_TYPE, data)?;
         self.write_frame(frame).await
     }
 
     pub async fn write_header_frame(
         &mut self,
         field_lines: impl IntoIterator<Item = FieldLine> + Send,
-    ) -> Result<Result<(), EncodeError>, connection::StreamError> {
-        let algo = &DEFAULT_COMPRESS_ALGO;
-        let stream = &mut self.stream;
-        match Encoder::encode(&*self.qpack_encoder, field_lines, algo, stream).await {
-            Ok(frame) => Ok(Ok(self.write_frame(frame).await?)),
-            Err(EncodeHeaderSectionError::Encode { source }) => Ok(Err(source)),
-            Err(EncodeHeaderSectionError::Stream { source }) => Err(source),
-        }
-    }
-
-    pub async fn write_data(&mut self, data: impl Buf + Send) -> Result<(), MessageStreamError> {
-        let frame = Frame::new(Frame::DATA_FRAME_TYPE, data)?;
-        self.try_stream_io(async move |this| this.write_frame(frame).await)
-            .await
-    }
-
-    pub async fn write_header(
-        &mut self,
-        field_lines: impl IntoIterator<Item = FieldLine> + Send,
     ) -> Result<(), MessageStreamError> {
         let result = self
-            .try_stream_io(async move |this| this.write_header_frame(field_lines).await)
+            .try_stream_write(async move |this| {
+                let algo = &DEFAULT_COMPRESS_ALGO;
+                match Encoder::encode(&*this.qpack_encoder, field_lines, algo, &mut this.stream)
+                    .await
+                {
+                    Ok(frame) => {
+                        this.stream.encode_one(frame).await?;
+                        Ok(Ok(()))
+                    }
+                    Err(EncodeHeaderSectionError::Encode { source }) => Ok(Err(source)),
+                    Err(EncodeHeaderSectionError::Stream { source }) => Err(source),
+                }
+            })
             .await?;
-
-        // Flush encoder instructions (dynamic table insertions) to the encoder stream.
-        // Encoder stream errors are connection-level: reset = connection error per RFC 9204.
-        if let Err(error) = self.qpack_encoder.flush_instructions().await {
-            let quic_error = self.handle_stream_error(error).await;
-            return Err(quic_error.into());
-        }
 
         match result {
             Ok(()) => Ok(()),
@@ -426,6 +432,26 @@ impl MessageWriter {
                 unreachable!("FieldSection contain invalid header name/value, this is a bug")
             }
         }
+    }
+
+    pub async fn write_data(&mut self, data: impl Buf + Send) -> Result<(), MessageStreamError> {
+        self.write_data_frame(data).await
+    }
+
+    pub async fn write_header(
+        &mut self,
+        field_lines: impl IntoIterator<Item = FieldLine> + Send,
+    ) -> Result<(), MessageStreamError> {
+        self.write_header_frame(field_lines).await?;
+
+        // Flush encoder instructions (dynamic table insertions) to the encoder stream.
+        // Encoder stream errors are connection-level: reset = connection error per RFC 9204.
+        if let Err(error) = self.qpack_encoder.flush_instructions().await {
+            let quic_error = self.handle_stream_error(error).await;
+            return Err(MessageStreamError::Quic { source: quic_error });
+        }
+
+        Ok(())
     }
 
     pub async fn send_data(&mut self, data: impl Buf + Send) -> Result<(), MessageStreamError> {
@@ -440,17 +466,17 @@ impl MessageWriter {
     }
 
     pub async fn flush(&mut self) -> Result<(), MessageStreamError> {
-        self.try_stream_io(async move |this| Ok(this.stream.flush_inner().await?))
+        self.try_stream_write(async move |this| Ok(this.stream.flush_inner().await?))
             .await
     }
 
     pub async fn close(&mut self) -> Result<(), MessageStreamError> {
-        self.try_stream_io(async move |this| Ok(this.stream.close().await?))
+        self.try_stream_write(async move |this| Ok(this.stream.close().await?))
             .await
     }
 
     pub async fn reset(&mut self, code: Code) -> Result<(), MessageStreamError> {
-        self.try_stream_io(async move |this| Ok(this.stream.reset(code.into_inner()).await?))
+        self.try_stream_write(async move |this| Ok(this.stream.reset(code.into_inner()).await?))
             .await
     }
 
@@ -478,10 +504,11 @@ impl MessageWriter {
         })
     }
 
-    pub async fn try_stream_io<T>(
+    pub async fn try_stream_write<T>(
         &mut self,
         f: impl AsyncFnOnce(&mut Self) -> Result<T, connection::StreamError>,
     ) -> Result<T, MessageStreamError> {
+        self.ensure_write_open()?;
         let peer_goaway = self.peer_goaway_covers().await?;
         let f = async move |this: &mut Self| {
             let value = f(this).await?;
@@ -492,7 +519,9 @@ impl MessageWriter {
         tokio::select! {
             result = f(self) => match result {
                 Ok(value) => Ok(value),
-                Err(error) => Err(self.handle_stream_error(error).await.into()),
+                Err(error) => Err(MessageStreamError::Quic {
+                    source: self.handle_stream_error(error).await,
+                }),
             },
             goaway = peer_goaway => match goaway {
                 Ok(()) => {
@@ -514,14 +543,22 @@ impl MessageWriter {
         error: connection::StreamError,
     ) -> quic::StreamError {
         match error {
-            connection::StreamError::Connection { source } => self
-                .state
-                .quic()
-                .as_ref()
-                .handle_connection_error(source)
-                .await
-                .into(),
-            connection::StreamError::Reset { code } => quic::StreamError::Reset { code },
+            connection::StreamError::Connection { source } => {
+                let source = self
+                    .state
+                    .quic()
+                    .as_ref()
+                    .handle_connection_error(source)
+                    .await;
+                self.stream
+                    .sink_mut()
+                    .mark_connection_closed(source.clone());
+                source.into()
+            }
+            connection::StreamError::Reset { code } => {
+                self.stream.sink_mut().mark_reset(code);
+                quic::StreamError::Reset { code }
+            }
             connection::StreamError::H3 { source } => {
                 let code = source.code().into_inner();
                 _ = self.stream.reset(code).await;
@@ -1103,7 +1140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_stream_try_stream_io_aborts_when_peer_goaway_covers_stream() {
+    async fn read_stream_try_stream_read_aborts_when_peer_goaway_covers_stream() {
         let erased: Arc<dyn quic::DynConnection> = Arc::new(MockConnection::new());
 
         let mut protocols = Protocols::new();
@@ -1131,7 +1168,7 @@ mod tests {
             .expect("peer goaway should be accepted");
 
         let result = read_stream
-            .try_stream_io(async move |_this| {
+            .try_stream_read(async move |_this| {
                 futures::future::pending::<Result<(), crate::connection::StreamError>>().await
             })
             .await;
@@ -1145,7 +1182,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_stream_try_stream_io_aborts_when_peer_goaway_covers_stream() {
+    async fn write_stream_try_stream_write_aborts_when_peer_goaway_covers_stream() {
         let erased: Arc<dyn quic::DynConnection> = Arc::new(MockConnection::new());
 
         let mut protocols = Protocols::new();
@@ -1172,7 +1209,7 @@ mod tests {
             .expect("peer goaway should be accepted");
 
         let result = write_stream
-            .try_stream_io(async move |_this| {
+            .try_stream_write(async move |_this| {
                 futures::future::pending::<Result<(), crate::connection::StreamError>>().await
             })
             .await;
@@ -1419,7 +1456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_stream_try_stream_io_uses_constructor_stream_id() {
+    async fn read_stream_try_stream_read_uses_constructor_stream_id() {
         let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
         let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(
             StreamIdErrorReadStream {
@@ -1446,7 +1483,7 @@ mod tests {
             .expect("peer goaway should be accepted");
 
         let result: Result<(), MessageStreamError> = stream
-            .try_stream_io(async |_this| {
+            .try_stream_read(async |_this| {
                 futures::future::pending::<Result<(), crate::connection::StreamError>>().await
             })
             .await;
@@ -1460,7 +1497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_stream_try_stream_io_surfaces_stream_id_errors() {
+    async fn write_stream_try_stream_write_surfaces_stream_id_errors() {
         let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
         let reset_code = VarInt::from_u32(92);
         let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(
@@ -1480,7 +1517,7 @@ mod tests {
         );
 
         let result: Result<(), MessageStreamError> = stream
-            .try_stream_io(async |_this| panic!("closure should not run when stream id fails"))
+            .try_stream_write(async |_this| panic!("closure should not run when stream id fails"))
             .await;
 
         assert!(matches!(
@@ -1519,7 +1556,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_write_data_frame_reports_h3_frame_error_code() {
+    async fn oversized_write_data_frame_reports_message_error() {
         let mut stream = write_stream_for_test(VarInt::from_u32(0));
 
         let error = stream
@@ -1529,7 +1566,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            StreamError::H3 { source } if source.code() == Code::H3_FRAME_ERROR
+            MessageStreamError::DataFrameTooLarge { .. }
         ));
     }
 
@@ -1633,10 +1670,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_stream_io_surfaces_connection_close_from_goaway_future() {
+    async fn try_stream_read_and_write_surface_connection_close_from_goaway_future() {
         let read_quic = Arc::new(MockConnection::new());
         let read_state = state_without_qpack(read_quic.clone()).erase();
-        read_quic.set_terminal_error(transport_error("read try_stream_io connection close"));
+        read_quic.set_terminal_error(transport_error("read try_stream_read connection close"));
         let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TestReadStream {
             stream_id: VarInt::from_u32(26),
         })
@@ -1652,7 +1689,7 @@ mod tests {
             read_state,
         );
         let read_result = read_stream
-            .try_stream_io(async |_this| {
+            .try_stream_read(async |_this| {
                 futures::future::pending::<Result<(), StreamError>>().await
             })
             .await;
@@ -1665,7 +1702,7 @@ mod tests {
 
         let write_quic = Arc::new(MockConnection::new());
         let write_state = state_without_qpack(write_quic.clone()).erase();
-        write_quic.set_terminal_error(transport_error("write try_stream_io connection close"));
+        write_quic.set_terminal_error(transport_error("write try_stream_write connection close"));
         let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TestWriteStream {
             stream_id: VarInt::from_u32(27),
         })
@@ -1680,7 +1717,7 @@ mod tests {
             write_state,
         );
         let write_result = write_stream
-            .try_stream_io(async |_this| {
+            .try_stream_write(async |_this| {
                 futures::future::pending::<Result<(), StreamError>>().await
             })
             .await;
@@ -1693,7 +1730,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_io_error_branches_delegate_connection_errors_to_lifecycle() {
+    async fn stream_read_and_write_error_branches_delegate_connection_errors_to_lifecycle() {
         let read_quic = Arc::new(MockConnection::new());
         let read_state = state_without_qpack(read_quic.clone()).erase();
         let terminal_error = transport_error("read lifecycle closed");
@@ -1702,7 +1739,7 @@ mod tests {
         read_stream.state = read_state;
 
         let read_error = read_stream
-            .try_stream_io(async |_this| {
+            .try_stream_read(async |_this| {
                 Err::<(), _>(StreamError::Connection {
                     source: crate::error::H3FrameUnexpected::UnexpectedFrameType.into(),
                 })
@@ -1729,7 +1766,7 @@ mod tests {
         write_stream.state = write_state;
 
         let write_error = write_stream
-            .try_stream_io(async |_this| {
+            .try_stream_write(async |_this| {
                 Err::<(), _>(StreamError::Connection {
                     source: crate::error::H3FrameUnexpected::UnexpectedFrameType.into(),
                 })
@@ -2228,6 +2265,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_after_close_fast_fails_without_polling_inner_stream() {
+        let mut stream = write_stream_for_test(VarInt::from_u32(0));
+
+        stream.close().await.expect("initial close should succeed");
+        let error = stream
+            .write_data(Bytes::from_static(b"after close"))
+            .await
+            .expect_err("write after close should fail at message layer");
+
+        assert!(matches!(error, MessageStreamError::MessageWriterClosed));
+    }
+
+    #[tokio::test]
+    async fn reader_stop_does_not_close_receive_side() {
+        let mut stream = read_stream_with_bytes(41, &[0x00, 0x03, b'a', b'b', b'c']).await;
+
+        stream
+            .stop(Code::H3_NO_ERROR)
+            .await
+            .expect("stop should not close receive side");
+
+        assert_eq!(
+            stream
+                .read_data_frame_chunk()
+                .await
+                .expect("stopped reader should still yield buffered data"),
+            Some(Bytes::from_static(b"abc"))
+        );
+        assert_eq!(
+            stream
+                .read_data_frame_chunk()
+                .await
+                .expect("reader should close only after EOF"),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn write_stream_flush_close_reset_and_header_aliases_succeed_on_mock_stream() {
         let mut header_stream = write_stream_for_test(VarInt::from_u32(0));
         header_stream
@@ -2318,10 +2393,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_data_frame_returns_connection_stream_error() {
+    async fn write_data_frame_returns_message_stream_error() {
         let mut stream = write_stream_for_test(VarInt::from_u32(0));
 
-        let result: Result<(), StreamError> =
+        let result: Result<(), MessageStreamError> =
             stream.write_data_frame(Bytes::from_static(b"hello")).await;
 
         assert!(result.is_ok());

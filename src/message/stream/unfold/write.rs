@@ -1,6 +1,7 @@
 //! since futures::sink::unfold only works for send, we implement our own version here to support flush and close as well.
 
 use std::{
+    ops::DerefMut,
     pin::Pin,
     task::{Context, Poll, ready},
 };
@@ -21,18 +22,18 @@ use crate::{
 /// This is the message-layer analog of [`quic::WriteStream`], combining DATA-frame
 /// byte sinking with the underlying QUIC stream's [`ResetStream`] and
 /// [`GetStreamId`] capabilities.
-pub trait WriteMessageStream:
+pub trait MessageStreamWriter:
     ResetStream + GetStreamId + Sink<Bytes, Error = MessageStreamError> + Send
 {
 }
 
 impl<T: ResetStream + GetStreamId + Sink<Bytes, Error = MessageStreamError> + Send + ?Sized>
-    WriteMessageStream for T
+    MessageStreamWriter for T
 {
 }
 
 /// Boxed stream writer with QUIC stream control traits preserved.
-pub type BoxMessageWriter<S = dyn WriteMessageStream> = SinkWriter<Pin<Box<S>>>;
+pub type BoxMessageWriter<S = dyn MessageStreamWriter> = SinkWriter<Pin<Box<S>>>;
 
 impl From<MessageWriter> for BoxMessageWriter {
     fn from(value: MessageWriter) -> Self {
@@ -49,7 +50,7 @@ pin_project_lite::pin_project! {
     #[project_replace = StateProjReplace]
     #[derive(Debug)]
     enum State<StreamState, SendFuture, FlushFuture, CloseFuture, ResetFuture> {
-        Value { value: StreamState },
+        Stream { stream: StreamState },
         Send {
             token: CancellationToken,
             #[pin]
@@ -76,10 +77,10 @@ pin_project_lite::pin_project! {
 impl<StreamState, SendFuture, FlushFuture, CloseFuture, ResetFuture>
     State<StreamState, SendFuture, FlushFuture, CloseFuture, ResetFuture>
 {
-    fn take_value(self: Pin<&mut Self>) -> Option<StreamState> {
+    fn take_stream(self: Pin<&mut Self>) -> Option<StreamState> {
         match &*self {
-            Self::Value { .. } => match self.project_replace(Self::Empty) {
-                StateProjReplace::Value { value } => Some(value),
+            Self::Stream { .. } => match self.project_replace(Self::Empty) {
+                StateProjReplace::Stream { stream } => Some(stream),
                 _ => unreachable!(),
             },
             _ => None,
@@ -221,18 +222,18 @@ where
         matches!(self.state, State::Reset { .. })
     }
 
-    fn set_value(mut self: Pin<&mut Self>, value: StreamState) {
-        self.as_mut().project().state.set(State::Value { value });
+    fn set_stream(mut self: Pin<&mut Self>, stream: StreamState) {
+        self.as_mut().project().state.set(State::Stream { stream });
     }
 
-    fn poll_current_to_value(
+    fn poll_current_to_stream(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), SinkError>> {
         let completed = {
             let mut project = self.as_mut().project();
             match project.state.as_mut().project() {
-                StateProj::Value { .. } => return Poll::Ready(Ok(())),
+                StateProj::Stream { .. } => return Poll::Ready(Ok(())),
                 StateProj::Send { future, .. } => match ready!(future.poll(cx)) {
                     Either::Left((stream, result)) => (stream, result),
                     Either::Right(stream) => (stream, Ok(())),
@@ -249,25 +250,25 @@ where
                     let (stream, result) = ready!(future.poll(cx));
                     (stream, result.map_err(SinkError::from))
                 }
-                StateProj::Empty => unreachable!("invalid state for poll_current_to_value"),
+                StateProj::Empty => unreachable!("invalid state for poll_current_to_stream"),
             }
         };
-        self.as_mut().set_value(completed.0);
+        self.as_mut().set_stream(completed.0);
         Poll::Ready(completed.1)
     }
 
-    fn poll_current_to_value_after_reset(
+    fn poll_current_to_stream_after_reset(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<StreamState> {
         let stream = {
             let mut project = self.as_mut().project();
             match project.state.as_mut().project() {
-                StateProj::Value { .. } => project
+                StateProj::Stream { .. } => project
                     .state
                     .as_mut()
-                    .take_value()
-                    .expect("value state should contain stream"),
+                    .take_stream()
+                    .expect("stream state should contain stream"),
                 StateProj::Send { token, future } => {
                     token.cancel();
                     match ready!(future.poll(cx)) {
@@ -298,7 +299,7 @@ where
         Flush: FnMut(StreamState, CancellationToken) -> FlushFuture,
     {
         let mut project = self.as_mut().project();
-        let stream = project.state.as_mut().take_value().expect("value state");
+        let stream = project.state.as_mut().take_stream().expect("stream state");
         let token = CancellationToken::new();
         project.state.set(State::Flush {
             token: token.clone(),
@@ -311,7 +312,7 @@ where
         Close: FnMut(StreamState, CancellationToken) -> CloseFuture,
     {
         let mut project = self.as_mut().project();
-        let stream = project.state.as_mut().take_value().expect("value state");
+        let stream = project.state.as_mut().take_stream().expect("stream state");
         let token = CancellationToken::new();
         project.state.set(State::Close {
             token: token.clone(),
@@ -324,7 +325,7 @@ where
         Reset: FnMut(StreamState, VarInt) -> ResetFuture,
     {
         let mut project = self.as_mut().project();
-        let stream = project.state.as_mut().take_value().expect("value state");
+        let stream = project.state.as_mut().take_stream().expect("stream state");
         project.state.set(State::Reset {
             future: (project.reset)(stream, code),
         });
@@ -342,8 +343,8 @@ where
         };
 
         if !self.is_reset() {
-            let stream = ready!(self.as_mut().poll_current_to_value_after_reset(cx));
-            self.as_mut().set_value(stream);
+            let stream = ready!(self.as_mut().poll_current_to_stream_after_reset(cx));
+            self.as_mut().set_stream(stream);
             self.as_mut().start_reset(code);
         }
 
@@ -354,7 +355,7 @@ where
                 _ => unreachable!("reset operation should be active"),
             }
         };
-        self.as_mut().set_value(stream);
+        self.as_mut().set_stream(stream);
         self.as_mut().project().pending.pop_front();
         Poll::Ready(result)
     }
@@ -389,10 +390,10 @@ where
                 }
                 PendingWriteOp::Flush => {
                     if !self.is_flush() {
-                        ready!(self.as_mut().poll_current_to_value(cx)?);
+                        ready!(self.as_mut().poll_current_to_stream(cx)?);
                         self.as_mut().start_flush();
                     }
-                    ready!(self.as_mut().poll_current_to_value(cx)?);
+                    ready!(self.as_mut().poll_current_to_stream(cx)?);
                     self.as_mut().project().pending.pop_front();
                     if target == Some(PendingWriteOp::Flush) {
                         return Poll::Ready(Ok(()));
@@ -400,10 +401,10 @@ where
                 }
                 PendingWriteOp::Close => {
                     if !self.is_close() {
-                        ready!(self.as_mut().poll_current_to_value(cx)?);
+                        ready!(self.as_mut().poll_current_to_stream(cx)?);
                         self.as_mut().start_close();
                     }
-                    ready!(self.as_mut().poll_current_to_value(cx)?);
+                    ready!(self.as_mut().poll_current_to_stream(cx)?);
                     self.as_mut().project().pending.pop_front();
                     if target == Some(PendingWriteOp::Close) {
                         return Poll::Ready(Ok(()));
@@ -456,7 +457,7 @@ where
         while !self.as_mut().project().pending.is_empty() {
             ready!(self.as_mut().poll_pending_until(cx, None)?);
         }
-        ready!(self.as_mut().poll_current_to_value(cx)?);
+        ready!(self.as_mut().poll_current_to_stream(cx)?);
         Poll::Ready(Ok(()))
     }
 
@@ -465,7 +466,7 @@ where
         let stream = project
             .state
             .as_mut()
-            .take_value()
+            .take_stream()
             .expect("start_send called without poll_ready being called first");
         let token = CancellationToken::new();
         project.state.set(State::Send {
@@ -523,7 +524,7 @@ where
     ) -> Poll<Result<VarInt, quic::StreamError>> {
         let project = self.project();
         match project.state.project() {
-            StateProj::Value { value } => Pin::new(value).poll_stream_id(cx),
+            StateProj::Stream { stream } => Pin::new(stream).poll_stream_id(cx),
             _ => Poll::Pending,
         }
     }
@@ -622,7 +623,7 @@ where
         reset,
         pending: PendingWriteQueue::default(),
         _error: std::marker::PhantomData,
-        state: State::Value { value: init },
+        state: State::Stream { stream: init },
     }
 }
 
@@ -631,7 +632,7 @@ where
 // ---------------------------------------------------------------------------
 
 impl MessageWriter {
-    pub fn as_bytes_sink(&mut self) -> impl WriteMessageStream + '_ {
+    pub fn as_bytes_sink(&mut self) -> impl MessageStreamWriter + '_ {
         unfold(
             self,
             async |stream: &mut MessageWriter, token, buf: Bytes| {
@@ -655,24 +656,25 @@ impl MessageWriter {
                     result = stream.close() => Either::Left((stream, result)),
                 }
             },
-            async |stream: &mut MessageWriter, code| {
-                let result =
-                    futures::future::poll_fn(|cx| Pin::new(&mut *stream).poll_reset(cx, code))
-                        .await;
+            async |mut stream: &mut MessageWriter, code| {
+                let result = futures::future::poll_fn(|cx| {
+                    Pin::new(stream.deref_mut()).poll_reset(cx, code)
+                })
+                .await;
                 (stream, result)
             },
         )
     }
 
-    pub fn as_writer(&mut self) -> SinkWriter<impl WriteMessageStream + '_> {
+    pub fn as_writer(&mut self) -> SinkWriter<impl MessageStreamWriter + '_> {
         SinkWriter::new(self.as_bytes_sink())
     }
 
-    pub fn as_box_writer(&mut self) -> BoxMessageWriter<dyn WriteMessageStream + '_> {
+    pub fn as_box_writer(&mut self) -> BoxMessageWriter<dyn MessageStreamWriter + '_> {
         SinkWriter::new(Box::pin(self.as_bytes_sink()))
     }
 
-    pub fn into_bytes_sink(self) -> impl WriteMessageStream {
+    pub fn into_bytes_sink(self) -> impl MessageStreamWriter {
         unfold(
             self,
             async |mut stream: MessageWriter, token, buf: Bytes| {
@@ -704,7 +706,7 @@ impl MessageWriter {
         )
     }
 
-    pub fn into_writer(self) -> SinkWriter<impl WriteMessageStream> {
+    pub fn into_writer(self) -> SinkWriter<impl MessageStreamWriter> {
         SinkWriter::new(self.into_bytes_sink())
     }
 
@@ -779,6 +781,15 @@ mod tests {
             stream_id,
             events: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn assert_reset_message_error(error: MessageStreamError, code: VarInt) {
+        assert!(matches!(
+            error,
+            MessageStreamError::Quic {
+                source: quic::StreamError::Reset { code: actual }
+            } if actual == code
+        ));
     }
 
     fn ready_control(stream_id: VarInt) -> ControlReady {
@@ -909,39 +920,39 @@ mod tests {
     }
 
     #[test]
-    fn state_take_value_only_extracts_value_state() {
-        let mut value = ReadyState::Value {
-            value: control_sink(VarInt::from_u32(3)),
+    fn state_take_stream_only_extracts_stream_state() {
+        let mut stream = ReadyState::Stream {
+            stream: control_sink(VarInt::from_u32(3)),
         };
         assert_eq!(
-            Pin::new(&mut value)
-                .take_value()
-                .expect("value state should yield inner value")
+            Pin::new(&mut stream)
+                .take_stream()
+                .expect("stream state should yield inner stream")
                 .stream_id,
             VarInt::from_u32(3)
         );
         assert!(
-            Pin::new(&mut value).take_value().is_none(),
-            "taking the value should leave the state empty"
+            Pin::new(&mut stream).take_stream().is_none(),
+            "taking the stream should leave the state empty"
         );
 
         let mut send = ReadyState::Send {
             token: CancellationToken::new(),
             future: ready_control(VarInt::from_u32(5)),
         };
-        assert!(Pin::new(&mut send).take_value().is_none());
+        assert!(Pin::new(&mut send).take_stream().is_none());
 
         let mut flush = ReadyState::Flush {
             token: CancellationToken::new(),
             future: ready_control(VarInt::from_u32(7)),
         };
-        assert!(Pin::new(&mut flush).take_value().is_none());
+        assert!(Pin::new(&mut flush).take_stream().is_none());
 
         let mut close = ReadyState::Close {
             token: CancellationToken::new(),
             future: ready_control(VarInt::from_u32(9)),
         };
-        assert!(Pin::new(&mut close).take_value().is_none());
+        assert!(Pin::new(&mut close).take_stream().is_none());
     }
 
     #[tokio::test]
@@ -1053,7 +1064,7 @@ mod tests {
         assert_eq!(
             flush_started.load(Ordering::SeqCst),
             1,
-            "poll_ready on value state must not flush again"
+            "poll_ready on stream state must not flush again"
         );
 
         assert!(
@@ -1087,7 +1098,7 @@ mod tests {
         assert_eq!(
             close_started.load(Ordering::SeqCst),
             1,
-            "poll_ready on value state must not close again"
+            "poll_ready on stream state must not close again"
         );
     }
 
@@ -1555,7 +1566,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_stream_adapter_builders_preserve_sink_and_control_traits() {
+    async fn write_stream_adapter_builders_fast_fail_after_reset() {
         let stream_id = VarInt::from_u32(71);
         let reset_code = VarInt::from_u32(72);
 
@@ -1571,12 +1582,12 @@ mod tests {
             poll_fn(|cx| sink.as_mut().poll_reset(cx, reset_code))
                 .await
                 .expect("as_bytes_sink reset");
-            sink.as_mut()
+            let error = sink
+                .as_mut()
                 .send(Bytes::from_static(b"payload"))
                 .await
-                .expect("as_bytes_sink send");
-            sink.as_mut().flush().await.expect("as_bytes_sink flush");
-            sink.as_mut().close().await.expect("as_bytes_sink close");
+                .expect_err("as_bytes_sink send after reset should fail");
+            assert_reset_message_error(error, reset_code);
         }
 
         let mut owned_sink =
@@ -1590,21 +1601,12 @@ mod tests {
         poll_fn(|cx| owned_sink.as_mut().poll_reset(cx, reset_code))
             .await
             .expect("into_bytes_sink reset");
-        owned_sink
+        let error = owned_sink
             .as_mut()
             .send(Bytes::from_static(b"payload"))
             .await
-            .expect("into_bytes_sink send");
-        owned_sink
-            .as_mut()
-            .flush()
-            .await
-            .expect("into_bytes_sink flush");
-        owned_sink
-            .as_mut()
-            .close()
-            .await
-            .expect("into_bytes_sink close");
+            .expect_err("into_bytes_sink send after reset should fail");
+        assert_reset_message_error(error, reset_code);
 
         let mut borrowed_stream = crate::message::test::write_stream_for_test(stream_id);
         {
@@ -1618,12 +1620,12 @@ mod tests {
             poll_fn(|cx| writer.as_mut().poll_reset(cx, reset_code))
                 .await
                 .expect("as_writer reset");
-            writer
+            let error = writer
                 .as_mut()
                 .send(Bytes::from_static(b"payload"))
                 .await
-                .expect("as_writer send");
-            writer.as_mut().close().await.expect("as_writer close");
+                .expect_err("as_writer send after reset should fail");
+            assert_reset_message_error(error, reset_code);
         }
 
         let mut borrowed_box_stream = crate::message::test::write_stream_for_test(stream_id);
@@ -1638,12 +1640,12 @@ mod tests {
             poll_fn(|cx| writer.as_mut().poll_reset(cx, reset_code))
                 .await
                 .expect("as_box_writer reset");
-            writer
+            let error = writer
                 .as_mut()
                 .send(Bytes::from_static(b"payload"))
                 .await
-                .expect("as_box_writer send");
-            writer.as_mut().close().await.expect("as_box_writer close");
+                .expect_err("as_box_writer send after reset should fail");
+            assert_reset_message_error(error, reset_code);
         }
 
         let mut writer =
@@ -1657,12 +1659,12 @@ mod tests {
         poll_fn(|cx| writer.as_mut().poll_reset(cx, reset_code))
             .await
             .expect("into_writer reset");
-        writer
+        let error = writer
             .as_mut()
             .send(Bytes::from_static(b"payload"))
             .await
-            .expect("into_writer send");
-        writer.as_mut().close().await.expect("into_writer close");
+            .expect_err("into_writer send after reset should fail");
+        assert_reset_message_error(error, reset_code);
 
         let mut boxed_writer =
             Box::pin(crate::message::test::write_stream_for_test(stream_id).into_box_writer());
@@ -1675,16 +1677,12 @@ mod tests {
         poll_fn(|cx| boxed_writer.as_mut().poll_reset(cx, reset_code))
             .await
             .expect("into_box_writer reset");
-        boxed_writer
+        let error = boxed_writer
             .as_mut()
             .send(Bytes::from_static(b"payload"))
             .await
-            .expect("into_box_writer send");
-        boxed_writer
-            .as_mut()
-            .close()
-            .await
-            .expect("into_box_writer close");
+            .expect_err("into_box_writer send after reset should fail");
+        assert_reset_message_error(error, reset_code);
 
         let mut from_writer = Box::pin(BoxMessageWriter::from(
             crate::message::test::write_stream_for_test(stream_id),
@@ -1698,17 +1696,16 @@ mod tests {
         poll_fn(|cx| from_writer.as_mut().poll_reset(cx, reset_code))
             .await
             .expect("from reset");
-        from_writer
+        let error = from_writer
             .as_mut()
             .send(Bytes::from_static(b"payload"))
             .await
-            .expect("from send");
-        from_writer.as_mut().close().await.expect("from close");
+            .expect_err("from send after reset should fail");
+        assert_reset_message_error(error, reset_code);
     }
 
     #[tokio::test]
-    async fn write_stream_writer_adapters_forward_control_with_buffered_send_then_flush_and_close()
-    {
+    async fn write_stream_writer_adapters_fast_fail_buffered_send_after_reset() {
         let stream_id = VarInt::from_u32(81);
         let reset_code = VarInt::from_u32(82);
 
@@ -1731,14 +1728,22 @@ mod tests {
             poll_fn(|cx| writer.as_mut().poll_reset(cx, reset_code))
                 .await
                 .expect("as_writer reset with buffered send");
-            writer.as_mut().flush().await.expect("as_writer flush");
-            assert_eq!(
-                poll_fn(|cx| writer.as_mut().poll_stream_id(cx))
-                    .await
-                    .expect("as_writer stream id after flush"),
-                stream_id
-            );
-            writer.as_mut().close().await.expect("as_writer close");
+            let error = writer
+                .as_mut()
+                .flush()
+                .await
+                .expect_err("as_writer flush after reset should fail");
+            assert_reset_message_error(error, reset_code);
+            let error = poll_fn(|cx| writer.as_mut().poll_stream_id(cx))
+                .await
+                .expect_err("as_writer stream id after reset should fail");
+            assert!(matches!(error, quic::StreamError::Reset { code } if code == reset_code));
+            let error = writer
+                .as_mut()
+                .close()
+                .await
+                .expect_err("as_writer close after reset should fail");
+            assert_reset_message_error(error, reset_code);
         }
 
         let mut borrowed_box_stream = crate::message::test::write_stream_for_test(stream_id);
@@ -1760,8 +1765,18 @@ mod tests {
             poll_fn(|cx| writer.as_mut().poll_reset(cx, reset_code))
                 .await
                 .expect("as_box_writer reset with buffered send");
-            writer.as_mut().flush().await.expect("as_box_writer flush");
-            writer.as_mut().close().await.expect("as_box_writer close");
+            let error = writer
+                .as_mut()
+                .flush()
+                .await
+                .expect_err("as_box_writer flush after reset should fail");
+            assert_reset_message_error(error, reset_code);
+            let error = writer
+                .as_mut()
+                .close()
+                .await
+                .expect_err("as_box_writer close after reset should fail");
+            assert_reset_message_error(error, reset_code);
         }
 
         let mut writer =
@@ -1782,8 +1797,18 @@ mod tests {
         poll_fn(|cx| writer.as_mut().poll_reset(cx, reset_code))
             .await
             .expect("into_writer reset with buffered send");
-        writer.as_mut().flush().await.expect("into_writer flush");
-        writer.as_mut().close().await.expect("into_writer close");
+        let error = writer
+            .as_mut()
+            .flush()
+            .await
+            .expect_err("into_writer flush after reset should fail");
+        assert_reset_message_error(error, reset_code);
+        let error = writer
+            .as_mut()
+            .close()
+            .await
+            .expect_err("into_writer close after reset should fail");
+        assert_reset_message_error(error, reset_code);
 
         let mut boxed_writer =
             Box::pin(crate::message::test::write_stream_for_test(stream_id).into_box_writer());
@@ -1803,15 +1828,17 @@ mod tests {
         poll_fn(|cx| boxed_writer.as_mut().poll_reset(cx, reset_code))
             .await
             .expect("into_box_writer reset with buffered send");
-        boxed_writer
+        let error = boxed_writer
             .as_mut()
             .flush()
             .await
-            .expect("into_box_writer flush");
-        boxed_writer
+            .expect_err("into_box_writer flush after reset should fail");
+        assert_reset_message_error(error, reset_code);
+        let error = boxed_writer
             .as_mut()
             .close()
             .await
-            .expect("into_box_writer close");
+            .expect_err("into_box_writer close after reset should fail");
+        assert_reset_message_error(error, reset_code);
     }
 }

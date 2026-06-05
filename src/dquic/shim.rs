@@ -136,7 +136,19 @@ pub fn convert_stream_error(error: dquic::prelude::StreamError) -> quic::StreamE
                 .expect("QUIC reset error code fits in VarInt range"),
         },
         dquic::prelude::StreamError::EosSent => {
-            unreachable!("h3x write data after shutdown")
+            // dquic emits `EosSent` only when the local send side has
+            // already committed EOS/shutdown and h3x attempts to write more
+            // data afterward.
+            //
+            // h3x intentionally does not model this as `quic::StreamError`:
+            // it is not a peer `RESET_STREAM`, not a connection failure, and
+            // not an H3 protocol violation. The message/codec writer layer
+            // owns this lifecycle invariant and must prevent writes after
+            // close/reset before they reach the QUIC backend.
+            //
+            // Reaching this branch means h3x violated its writer lifecycle
+            // invariant.
+            panic!("h3x write data after shutdown")
         }
     }
 }

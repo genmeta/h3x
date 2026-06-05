@@ -1,13 +1,13 @@
 //! Remote forwarding of message-level streams via RPC RTC.
 //!
 //! Parallel to [`super::quic`] which bridges raw QUIC streams, this module
-//! bridges **message-level** streams ([`ReadMessageStream`] / [`WriteMessageStream`])
+//! bridges **message-level** streams ([`MessageStreamReader`](crate::message::stream::MessageStreamReader) / [`MessageStreamWriter`](crate::message::stream::MessageStreamWriter))
 //! that carry HTTP/3 DATA frame semantics and use [`MessageStreamError`] for their
 //! data path. The QUIC-level control operations (`StopStream`, `ResetStream`,
 //! `GetStreamId`) still use [`quic::StreamError`].
 //! The current RPC runtime implementation is backed by `remoc`.
 //!
-//! Any type implementing the original [`ReadMessageStream`] / [`WriteMessageStream`]
+//! Any type implementing the original [`MessageStreamReader`](crate::message::stream::MessageStreamReader) / [`MessageStreamWriter`](crate::message::stream::MessageStreamWriter)
 //! traits automatically implements the RTC traits via blanket impls.
 //!
 //! # Public API

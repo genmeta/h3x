@@ -5,10 +5,11 @@ use futures::{SinkExt, StreamExt, future::Either};
 use tokio_util::sync::CancellationToken;
 
 use super::super::bridge;
-// Import original traits under aliases to avoid collision with the RTC traits
-// defined in this module (which share the same names).
+// Import local stream capability traits under aliases to distinguish them from
+// the remote RTC traits defined in this module.
 use crate::message::stream::{
-    ReadMessageStream as OrigReadMessageStream, WriteMessageStream as OrigWriteMessageStream,
+    MessageStreamReader as LocalMessageStreamReader,
+    MessageStreamWriter as LocalMessageStreamWriter,
 };
 use crate::{
     message::stream::{BoxMessageReader, BoxMessageWriter, MessageStreamError},
@@ -51,7 +52,7 @@ pub trait WriteMessageStream: Send {
 
 impl<S> ReadMessageStream for S
 where
-    S: OrigReadMessageStream + Unpin + Send,
+    S: LocalMessageStreamReader + Unpin + Send,
 {
     async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError> {
         GetStreamIdExt::stream_id(self).await
@@ -68,7 +69,7 @@ where
 
 impl<S> WriteMessageStream for S
 where
-    S: OrigWriteMessageStream + Unpin + Send,
+    S: LocalMessageStreamWriter + Unpin + Send,
 {
     async fn stream_id(&mut self) -> Result<VarInt, quic::StreamError> {
         GetStreamIdExt::stream_id(self).await
@@ -92,14 +93,14 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Client side: ReadMessageStreamClient → impl OrigReadMessageStream
+// Client side: ReadMessageStreamClient → impl LocalMessageStreamReader
 // ---------------------------------------------------------------------------
 
 impl ReadMessageStreamClient {
-    /// Convert into a poll-based [`OrigReadMessageStream`].
+    /// Convert into a poll-based [`LocalMessageStreamReader`].
     pub async fn into_message_stream(
         mut self,
-    ) -> Result<impl OrigReadMessageStream, quic::StreamError> {
+    ) -> Result<impl LocalMessageStreamReader, quic::StreamError> {
         let stream_id = self.stream_id().await?;
         Ok(
             bridge::ReadBridge::<_, MessageStreamError, _, _, _, _>::new(
@@ -119,8 +120,10 @@ impl ReadMessageStreamClient {
         )
     }
 
-    /// Convert into a boxed [`OrigReadMessageStream`] (lazy — resolves on first poll).
-    pub fn into_boxed_message_stream(self) -> Pin<Box<dyn OrigReadMessageStream + Send + 'static>> {
+    /// Convert into a boxed [`LocalMessageStreamReader`] (lazy — resolves on first poll).
+    pub fn into_boxed_message_stream(
+        self,
+    ) -> Pin<Box<dyn LocalMessageStreamReader + Send + 'static>> {
         Box::pin(DeferredStreamReader::from(self.into_message_stream()))
     }
 
@@ -131,14 +134,14 @@ impl ReadMessageStreamClient {
 }
 
 // ---------------------------------------------------------------------------
-// Client side: WriteMessageStreamClient → impl OrigWriteMessageStream
+// Client side: WriteMessageStreamClient → impl LocalMessageStreamWriter
 // ---------------------------------------------------------------------------
 
 impl WriteMessageStreamClient {
-    /// Convert into a poll-based [`OrigWriteMessageStream`].
+    /// Convert into a poll-based [`LocalMessageStreamWriter`].
     pub async fn into_message_stream(
         mut self,
-    ) -> Result<impl OrigWriteMessageStream, quic::StreamError> {
+    ) -> Result<impl LocalMessageStreamWriter, quic::StreamError> {
         let stream_id = self.stream_id().await?;
         Ok(bridge::WriteBridge::<
             _,
@@ -179,10 +182,10 @@ impl WriteMessageStreamClient {
         ))
     }
 
-    /// Convert into a boxed [`OrigWriteMessageStream`] (lazy — resolves on first poll).
+    /// Convert into a boxed [`LocalMessageStreamWriter`] (lazy — resolves on first poll).
     pub fn into_boxed_message_stream(
         self,
-    ) -> Pin<Box<dyn OrigWriteMessageStream + Send + 'static>> {
+    ) -> Pin<Box<dyn LocalMessageStreamWriter + Send + 'static>> {
         Box::pin(DeferredStreamWriter::from(self.into_message_stream()))
     }
 
@@ -213,14 +216,14 @@ mod tests {
 
     use super::*;
 
-    struct TestReadMessageStream {
+    struct TestMessageStreamReader {
         stream_id: VarInt,
         chunks: VecDeque<Result<Bytes, MessageStreamError>>,
         stopped: Arc<Mutex<Option<VarInt>>>,
         terminated: bool,
     }
 
-    impl quic::GetStreamId for TestReadMessageStream {
+    impl quic::GetStreamId for TestMessageStreamReader {
         fn poll_stream_id(
             self: Pin<&mut Self>,
             _cx: &mut Context,
@@ -229,7 +232,7 @@ mod tests {
         }
     }
 
-    impl quic::StopStream for TestReadMessageStream {
+    impl quic::StopStream for TestMessageStreamReader {
         fn poll_stop(
             self: Pin<&mut Self>,
             _cx: &mut Context,
@@ -240,7 +243,7 @@ mod tests {
         }
     }
 
-    impl Stream for TestReadMessageStream {
+    impl Stream for TestMessageStreamReader {
         type Item = Result<Bytes, MessageStreamError>;
 
         fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -255,7 +258,7 @@ mod tests {
         }
     }
 
-    impl FusedStream for TestReadMessageStream {
+    impl FusedStream for TestMessageStreamReader {
         fn is_terminated(&self) -> bool {
             self.terminated
         }
@@ -269,12 +272,12 @@ mod tests {
         Reset(VarInt),
     }
 
-    struct TestWriteMessageStream {
+    struct TestMessageStreamWriter {
         stream_id: VarInt,
         events: Arc<Mutex<Vec<Event>>>,
     }
 
-    impl quic::GetStreamId for TestWriteMessageStream {
+    impl quic::GetStreamId for TestMessageStreamWriter {
         fn poll_stream_id(
             self: Pin<&mut Self>,
             _cx: &mut Context,
@@ -283,7 +286,7 @@ mod tests {
         }
     }
 
-    impl quic::ResetStream for TestWriteMessageStream {
+    impl quic::ResetStream for TestMessageStreamWriter {
         fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context,
@@ -297,7 +300,7 @@ mod tests {
         }
     }
 
-    impl Sink<Bytes> for TestWriteMessageStream {
+    impl Sink<Bytes> for TestMessageStreamWriter {
         type Error = MessageStreamError;
 
         fn poll_ready(
@@ -338,13 +341,13 @@ mod tests {
         }
     }
 
-    struct BlockingReadMessageStream {
+    struct BlockingMessageStreamReader {
         stream_id: VarInt,
         read_started: Arc<AtomicBool>,
         stopped: Arc<Mutex<Option<VarInt>>>,
     }
 
-    impl quic::GetStreamId for BlockingReadMessageStream {
+    impl quic::GetStreamId for BlockingMessageStreamReader {
         fn poll_stream_id(
             self: Pin<&mut Self>,
             _cx: &mut Context,
@@ -353,7 +356,7 @@ mod tests {
         }
     }
 
-    impl quic::StopStream for BlockingReadMessageStream {
+    impl quic::StopStream for BlockingMessageStreamReader {
         fn poll_stop(
             self: Pin<&mut Self>,
             _cx: &mut Context,
@@ -364,7 +367,7 @@ mod tests {
         }
     }
 
-    impl Stream for BlockingReadMessageStream {
+    impl Stream for BlockingMessageStreamReader {
         type Item = Result<Bytes, MessageStreamError>;
 
         fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -373,18 +376,18 @@ mod tests {
         }
     }
 
-    impl FusedStream for BlockingReadMessageStream {
+    impl FusedStream for BlockingMessageStreamReader {
         fn is_terminated(&self) -> bool {
             false
         }
     }
 
-    struct BlockingWriteMessageStream {
+    struct BlockingMessageStreamWriter {
         stream_id: VarInt,
         events: Arc<Mutex<Vec<Event>>>,
     }
 
-    impl quic::GetStreamId for BlockingWriteMessageStream {
+    impl quic::GetStreamId for BlockingMessageStreamWriter {
         fn poll_stream_id(
             self: Pin<&mut Self>,
             _cx: &mut Context,
@@ -393,7 +396,7 @@ mod tests {
         }
     }
 
-    impl quic::ResetStream for BlockingWriteMessageStream {
+    impl quic::ResetStream for BlockingMessageStreamWriter {
         fn poll_reset(
             self: Pin<&mut Self>,
             _cx: &mut Context,
@@ -407,7 +410,7 @@ mod tests {
         }
     }
 
-    impl Sink<Bytes> for BlockingWriteMessageStream {
+    impl Sink<Bytes> for BlockingMessageStreamWriter {
         type Error = MessageStreamError;
 
         fn poll_ready(
@@ -471,7 +474,7 @@ mod tests {
         let stopped = Arc::new(Mutex::new(None));
         let stream_id = VarInt::from_u32(17);
         let stop_code = VarInt::from_u32(19);
-        let mut stream = TestReadMessageStream {
+        let mut stream = TestMessageStreamReader {
             stream_id,
             chunks: VecDeque::from([Ok(Bytes::from_static(b"message"))]),
             stopped: stopped.clone(),
@@ -508,7 +511,7 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let stream_id = VarInt::from_u32(23);
         let reset_code = VarInt::from_u32(29);
-        let mut stream = TestWriteMessageStream {
+        let mut stream = TestMessageStreamWriter {
             stream_id,
             events: events.clone(),
         };
@@ -547,7 +550,7 @@ mod tests {
     async fn read_client_into_message_stream_delegates_and_propagates_errors() {
         let stopped = Arc::new(Mutex::new(None));
         let stop_code = VarInt::from_u32(41);
-        let (client, task) = spawn_read_server(TestReadMessageStream {
+        let (client, task) = spawn_read_server(TestMessageStreamReader {
             stream_id: VarInt::from_u32(31),
             chunks: VecDeque::from([
                 Ok(Bytes::from_static(b"one")),
@@ -607,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_client_box_adapters_are_lazy_and_read_bytes() {
-        let (boxed_client, boxed_task) = spawn_read_server(TestReadMessageStream {
+        let (boxed_client, boxed_task) = spawn_read_server(TestMessageStreamReader {
             stream_id: VarInt::from_u32(33),
             chunks: VecDeque::from([
                 Ok(Bytes::from_static(b"hel")),
@@ -632,7 +635,7 @@ mod tests {
             .expect("boxed read server exits")
             .expect("boxed read server task joins");
 
-        let (reader_client, reader_task) = spawn_read_server(TestReadMessageStream {
+        let (reader_client, reader_task) = spawn_read_server(TestMessageStreamReader {
             stream_id: VarInt::from_u32(35),
             chunks: VecDeque::from([
                 Ok(Bytes::from_static(b"wo")),
@@ -660,7 +663,7 @@ mod tests {
         let read_started = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(Mutex::new(None));
         let stop_code = VarInt::from_u32(43);
-        let (client, task) = spawn_read_server(BlockingReadMessageStream {
+        let (client, task) = spawn_read_server(BlockingMessageStreamReader {
             stream_id: VarInt::from_u32(37),
             read_started: read_started.clone(),
             stopped: stopped.clone(),
@@ -691,7 +694,7 @@ mod tests {
     #[tokio::test]
     async fn read_client_into_message_stream_maps_stream_id_call_errors() {
         let (server, client) = ReadMessageStreamServer::new(
-            TestReadMessageStream {
+            TestMessageStreamReader {
                 stream_id: VarInt::from_u32(39),
                 chunks: VecDeque::new(),
                 stopped: Arc::new(Mutex::new(None)),
@@ -717,7 +720,7 @@ mod tests {
     async fn write_client_into_message_stream_delegates_and_box_writer_writes() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let reset_code = VarInt::from_u32(47);
-        let (client, task) = spawn_write_server(TestWriteMessageStream {
+        let (client, task) = spawn_write_server(TestMessageStreamWriter {
             stream_id: VarInt::from_u32(45),
             events: events.clone(),
         });
@@ -764,7 +767,7 @@ mod tests {
             .expect("write server task joins");
 
         let writer_events = Arc::new(Mutex::new(Vec::new()));
-        let (writer_client, writer_task) = spawn_write_server(TestWriteMessageStream {
+        let (writer_client, writer_task) = spawn_write_server(TestMessageStreamWriter {
             stream_id: VarInt::from_u32(49),
             events: writer_events.clone(),
         });
@@ -800,7 +803,7 @@ mod tests {
     async fn write_client_reset_interrupts_pending_remote_write() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let reset_code = VarInt::from_u32(53);
-        let (client, task) = spawn_write_server(BlockingWriteMessageStream {
+        let (client, task) = spawn_write_server(BlockingMessageStreamWriter {
             stream_id: VarInt::from_u32(51),
             events: events.clone(),
         });
@@ -834,7 +837,7 @@ mod tests {
     #[tokio::test]
     async fn write_client_into_message_stream_maps_stream_id_call_errors() {
         let (server, client) = WriteMessageStreamServer::new(
-            TestWriteMessageStream {
+            TestMessageStreamWriter {
                 stream_id: VarInt::from_u32(55),
                 events: Arc::new(Mutex::new(Vec::new())),
             },

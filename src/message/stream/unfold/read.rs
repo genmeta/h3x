@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    ops::DerefMut,
     pin::Pin,
     task::{Context, Poll, ready},
 };
@@ -7,7 +8,7 @@ use std::{
 use bytes::Bytes;
 use futures::stream::FusedStream;
 
-use super::super::{MessageStreamError, MessageReader};
+use super::super::{MessageReader, MessageStreamError};
 use crate::{
     codec::StreamReader,
     quic::{self, GetStreamId, StopStream},
@@ -19,7 +20,7 @@ use crate::{
 /// This is the message-layer analog of [`quic::ReadStream`], combining DATA-frame
 /// byte streaming with the underlying QUIC stream's [`StopStream`] and
 /// [`GetStreamId`] capabilities.
-pub trait ReadMessageStream:
+pub trait MessageStreamReader:
     StopStream + GetStreamId + FusedStream<Item = Result<Bytes, MessageStreamError>> + Send
 {
 }
@@ -30,12 +31,12 @@ impl<
         + FusedStream<Item = Result<Bytes, MessageStreamError>>
         + Send
         + ?Sized,
-> ReadMessageStream for T
+> MessageStreamReader for T
 {
 }
 
 /// Boxed stream reader with QUIC stream control traits preserved.
-pub type BoxMessageReader<S = dyn ReadMessageStream> = StreamReader<Pin<Box<S>>>;
+pub type BoxMessageReader<S = dyn MessageStreamReader> = StreamReader<Pin<Box<S>>>;
 
 impl From<MessageReader> for BoxMessageReader {
     fn from(value: MessageReader) -> Self {
@@ -107,9 +108,10 @@ where
 /// Create an [`Unfold`] stream.
 ///
 /// The read future yields either a delivered item plus the returned stream
-/// state, EOF plus the returned stream state, or an interrupted stream state.
-/// The stop future is a separate operation so callers can adapt states whose
-/// stop behavior is not expressed directly as a [`StopStream`] implementation.
+/// state, EOF plus the returned stream state, or an internally interrupted
+/// stream state. The stop future is a separate operation so callers can adapt
+/// states whose stop behavior is not expressed directly as a [`StopStream`]
+/// implementation.
 pub fn unfold<StreamState, Read, Stop, ReadFuture, StopFuture, Item>(
     init: StreamState,
     read: Read,
@@ -158,21 +160,7 @@ where
                         future: (project.stop)(stream, code),
                     });
                 }
-                StateProj::Read { token, future } => {
-                    token.cancel();
-                    match ready!(future.poll(cx)) {
-                        futures::future::Either::Left((stream, item)) => {
-                            if item.is_none() {
-                                *project.terminated = true;
-                            }
-                            *project.pending_item = item;
-                            project.state.set(State::Stream { stream });
-                        }
-                        futures::future::Either::Right(stream) => {
-                            project.state.set(State::Stream { stream });
-                        }
-                    }
-                }
+                StateProj::Read { .. } => return Poll::Pending,
                 StateProj::Stop { future, .. } => {
                     let (stream, result) = ready!(future.poll(cx));
                     project.state.set(State::Stream { stream });
@@ -199,12 +187,6 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Some(item) = self.as_mut().project().pending_item.take() {
             return Poll::Ready(Some(item));
-        }
-
-        if self.as_mut().project().pending_stop.is_some()
-            && let Err(error) = ready!(self.as_mut().poll_pending_stop(cx))
-        {
-            return Poll::Ready(Some(Item::from_stream_error(error)));
         }
 
         loop {
@@ -303,7 +285,7 @@ where
 // ---------------------------------------------------------------------------
 
 impl MessageReader {
-    pub fn as_bytes_stream(&mut self) -> impl ReadMessageStream + '_ {
+    pub fn as_bytes_stream(&mut self) -> impl MessageStreamReader + '_ {
         unfold(
             self,
             |stream: &mut MessageReader, token| async move {
@@ -320,23 +302,24 @@ impl MessageReader {
                     }
                 }
             },
-            |stream: &mut MessageReader, code| async move {
+            |mut stream: &mut MessageReader, code| async move {
                 let result =
-                    futures::future::poll_fn(|cx| Pin::new(&mut *stream).poll_stop(cx, code)).await;
+                    futures::future::poll_fn(|cx| Pin::new(stream.deref_mut()).poll_stop(cx, code))
+                        .await;
                 (stream, result)
             },
         )
     }
 
-    pub fn as_reader(&mut self) -> StreamReader<impl ReadMessageStream + '_> {
+    pub fn as_reader(&mut self) -> StreamReader<impl MessageStreamReader + '_> {
         StreamReader::new(self.as_bytes_stream())
     }
 
-    pub fn as_box_reader(&mut self) -> BoxMessageReader<dyn ReadMessageStream + '_> {
+    pub fn as_box_reader(&mut self) -> BoxMessageReader<dyn MessageStreamReader + '_> {
         StreamReader::new(Box::pin(self.as_bytes_stream()))
     }
 
-    pub fn into_bytes_stream(self) -> impl ReadMessageStream {
+    pub fn into_bytes_stream(self) -> impl MessageStreamReader {
         unfold(
             self,
             |mut stream: MessageReader, token| async move {
@@ -361,7 +344,7 @@ impl MessageReader {
         )
     }
 
-    pub fn into_reader(self) -> StreamReader<impl ReadMessageStream> {
+    pub fn into_reader(self) -> StreamReader<impl MessageStreamReader> {
         StreamReader::new(self.into_bytes_stream())
     }
 
@@ -504,21 +487,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_uses_stop_closure_after_interrupting_pending_read() {
+    async fn stop_waits_for_pending_read_before_forwarding() {
         let stopped = Arc::new(Mutex::new(None));
         let stop_code = VarInt::from_u32(41);
         let stream_id = VarInt::from_u32(37);
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+        let mut read_rx = Some(read_rx);
         let mut stream = Box::pin(unfold(
             ControlStream {
                 stream_id,
                 stopped: stopped.clone(),
             },
-            |stream, token| async move {
-                token.cancelled().await;
-                Either::<
-                    (ControlStream, Option<Result<(), quic::StreamError>>),
-                    ControlStream,
-                >::Right(stream)
+            move |stream, _token| {
+                let read_rx = read_rx.take().expect("single read future");
+                async move {
+                    read_rx.await.expect("read release sent");
+                    Either::Left((stream, Some(Ok::<_, quic::StreamError>(()))))
+                }
             },
             |stream: ControlStream, code| async move {
                 *stream.stopped.lock().expect("stop state poisoned") = Some(code);
@@ -531,9 +516,18 @@ mod tests {
                 .now_or_never()
                 .is_none()
         );
+        assert!(
+            poll_fn(|cx| stream.as_mut().poll_stop(cx, stop_code))
+                .now_or_never()
+                .is_none()
+        );
+        assert_eq!(*stopped.lock().expect("stop state poisoned"), None);
+
+        read_tx.send(()).expect("release pending read");
+        assert!(matches!(stream.as_mut().next().await, Some(Ok(()))));
         poll_fn(|cx| stream.as_mut().poll_stop(cx, stop_code))
             .await
-            .expect("stop should complete");
+            .expect("stop should complete after read yields stream");
         assert_eq!(
             *stopped.lock().expect("stop state poisoned"),
             Some(stop_code)
@@ -547,20 +541,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_preserves_eof_observed_while_interrupting_pending_read() {
+    async fn stop_does_not_interrupt_pending_next() {
         let stopped = Arc::new(Mutex::new(None));
         let stop_code = VarInt::from_u32(41);
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+        let mut read_rx = Some(read_rx);
         let mut stream = Box::pin(unfold(
             ControlStream {
                 stream_id: VarInt::from_u32(37),
                 stopped: stopped.clone(),
             },
-            |stream, token| async move {
-                token.cancelled().await;
-                Either::<
-                    (ControlStream, Option<Result<(), quic::StreamError>>),
-                    ControlStream,
-                >::Left((stream, None))
+            move |stream, token| {
+                let read_rx = read_rx.take().expect("single read future");
+                async move {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => Either::Left((
+                            stream,
+                            Some(Ok::<Bytes, MessageStreamError>(Bytes::from_static(b"interrupted"))),
+                        )),
+                        item = read_rx => Either::Left((
+                            stream,
+                            Some(Ok::<Bytes, MessageStreamError>(
+                                item.expect("read release sent"),
+                            )),
+                        )),
+                    }
+                }
             },
             |stream: ControlStream, code| async move {
                 *stream.stopped.lock().expect("stop state poisoned") = Some(code);
@@ -573,9 +580,80 @@ mod tests {
                 .now_or_never()
                 .is_none()
         );
+        assert!(
+            poll_fn(|cx| stream.as_mut().poll_stop(cx, stop_code))
+                .now_or_never()
+                .is_none(),
+            "stop must wait for the read future without cancelling it"
+        );
+        assert_eq!(*stopped.lock().expect("stop state poisoned"), None);
+
+        read_tx
+            .send(Bytes::from_static(b"read"))
+            .expect("release pending read");
+        assert_eq!(
+            stream
+                .as_mut()
+                .next()
+                .await
+                .expect("read item")
+                .expect("read succeeds"),
+            Bytes::from_static(b"read")
+        );
+        assert_eq!(*stopped.lock().expect("stop state poisoned"), None);
+
         poll_fn(|cx| stream.as_mut().poll_stop(cx, stop_code))
             .await
-            .expect("stop should complete");
+            .expect("stop completes after read yields the stream");
+        assert_eq!(
+            *stopped.lock().expect("stop state poisoned"),
+            Some(stop_code)
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_pending_read_that_reaches_eof() {
+        let stopped = Arc::new(Mutex::new(None));
+        let stop_code = VarInt::from_u32(41);
+        let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
+        let mut eof_rx = Some(eof_rx);
+        let mut stream = Box::pin(unfold(
+            ControlStream {
+                stream_id: VarInt::from_u32(37),
+                stopped: stopped.clone(),
+            },
+            move |stream, _token| {
+                let eof_rx = eof_rx.take().expect("single read future");
+                async move {
+                    eof_rx.await.expect("eof release sent");
+                    Either::<
+                        (ControlStream, Option<Result<(), quic::StreamError>>),
+                        ControlStream,
+                    >::Left((stream, None))
+                }
+            },
+            |stream: ControlStream, code| async move {
+                *stream.stopped.lock().expect("stop state poisoned") = Some(code);
+                (stream, Ok(()))
+            },
+        ));
+
+        assert!(
+            poll_fn(|cx| stream.as_mut().poll_next(cx))
+                .now_or_never()
+                .is_none()
+        );
+        assert!(
+            poll_fn(|cx| stream.as_mut().poll_stop(cx, stop_code))
+                .now_or_never()
+                .is_none()
+        );
+
+        eof_tx.send(()).expect("release pending eof");
+        assert!(stream.as_mut().next().await.is_none());
+        poll_fn(|cx| stream.as_mut().poll_stop(cx, stop_code))
+            .await
+            .expect("stop should complete after eof yields stream");
 
         assert!(stream.as_ref().get_ref().is_terminated());
         assert_eq!(

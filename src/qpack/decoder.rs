@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    ops::DerefMut,
     pin::{Pin, pin},
     sync::{Arc, Mutex as SyncMutex},
     task::{Context, Poll},
@@ -440,7 +441,7 @@ where
 
     pub async fn flush_instructions(&self) -> Result<(), StreamError> {
         let mut decoder_stream = self.decoder_stream.lock().await;
-        let mut decoder_stream = Pin::new(&mut *decoder_stream);
+        let mut decoder_stream = Pin::new(decoder_stream.deref_mut());
         let instructions = stream::iter(self.pending_instructions());
         decoder_stream.as_mut().send_all(instructions).await?;
         decoder_stream.as_mut().flush().await?;
@@ -499,8 +500,9 @@ where
 }
 
 pin_project_lite::pin_project! {
-    /// A read stream wrapper that emits stream cancellation instruction when reset is received or stop sending is called.
-    pub struct MessageStreamReader<S: ReadStream, D> {
+    /// A QPACK-aware message read stream wrapper that emits stream cancellation
+    /// instructions when reset is received or STOP_SENDING is called.
+    pub struct QPackMessageStreamReader<S: ReadStream, D> {
         stream_id: VarInt,
         stream_cancellation_emitted: bool,
         decoder: Arc<D>,
@@ -510,7 +512,7 @@ pin_project_lite::pin_project! {
 
 }
 
-impl<S: ReadStream, D> MessageStreamReader<S, D> {
+impl<S: ReadStream, D> QPackMessageStreamReader<S, D> {
     pub fn new(stream_id: VarInt, stream: S, decoder: Arc<D>) -> Self {
         Self {
             stream_id,
@@ -521,7 +523,7 @@ impl<S: ReadStream, D> MessageStreamReader<S, D> {
     }
 }
 
-impl<S: ReadStream, Ds, Es> StopStream for MessageStreamReader<S, Decoder<Ds, Es>> {
+impl<S: ReadStream, Ds, Es> StopStream for QPackMessageStreamReader<S, Decoder<Ds, Es>> {
     fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -541,7 +543,7 @@ impl<S: ReadStream, Ds, Es> StopStream for MessageStreamReader<S, Decoder<Ds, Es
     }
 }
 
-impl<S: ReadStream, D> GetStreamId for MessageStreamReader<S, D> {
+impl<S: ReadStream, D> GetStreamId for QPackMessageStreamReader<S, D> {
     fn poll_stream_id(
         self: Pin<&mut Self>,
         _cx: &mut Context,
@@ -550,7 +552,7 @@ impl<S: ReadStream, D> GetStreamId for MessageStreamReader<S, D> {
     }
 }
 
-impl<S: ReadStream, Ds, Es> Stream for MessageStreamReader<S, Decoder<Ds, Es>> {
+impl<S: ReadStream, Ds, Es> Stream for QPackMessageStreamReader<S, Decoder<Ds, Es>> {
     type Item = S::Item;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -690,7 +692,7 @@ mod tests {
 
     use super::{
         Decoder, DecoderInstruction, DecoderState, InvalidDynamicTableReference,
-        MessageStreamReader, QPackEncoderStreamError, decompression_field_line_representation,
+        QPackEncoderStreamError, QPackMessageStreamReader, decompression_field_line_representation,
     };
     use crate::{
         buflist::BufList,
@@ -1543,7 +1545,7 @@ mod tests {
         let (decoder, _) = test_decoder(test_settings(128), Vec::new());
         let decoder = Arc::new(decoder);
         let stop_codes = Arc::new(Mutex::new(Vec::new()));
-        let mut stopped_reader = MessageStreamReader::new(
+        let mut stopped_reader = QPackMessageStreamReader::new(
             VarInt::from_u32(41),
             TestReadStream {
                 stream_id: VarInt::from_u32(41),
@@ -1572,7 +1574,7 @@ mod tests {
             Some(&DecoderInstruction::StreamCancellation { stream_id: 41 })
         );
 
-        let mut reset_reader = MessageStreamReader::new(
+        let mut reset_reader = QPackMessageStreamReader::new(
             VarInt::from_u32(43),
             TestReadStream {
                 stream_id: VarInt::from_u32(43),
@@ -1608,7 +1610,7 @@ mod tests {
         let (decoder, _) = test_decoder(test_settings(128), Vec::new());
         let decoder = Arc::new(decoder);
         let stop_codes = Arc::new(Mutex::new(Vec::new()));
-        let mut reader = Box::pin(MessageStreamReader::new(
+        let mut reader = Box::pin(QPackMessageStreamReader::new(
             VarInt::from_u32(45),
             PendingStopReadStream {
                 stop_codes: stop_codes.clone(),
@@ -1644,7 +1646,7 @@ mod tests {
         let (decoder, _) = test_decoder(test_settings(128), Vec::new());
         let decoder = Arc::new(decoder);
         let stop_codes = Arc::new(Mutex::new(Vec::new()));
-        let mut reader = MessageStreamReader::new(
+        let mut reader = QPackMessageStreamReader::new(
             VarInt::from_u32(46),
             TestReadStream {
                 stream_id: VarInt::from_u32(46),
@@ -1682,7 +1684,7 @@ mod tests {
     async fn message_stream_reader_reset_uses_constructor_stream_id() {
         let (decoder, _) = test_decoder(test_settings(128), Vec::new());
         let decoder = Arc::new(decoder);
-        let mut reader = MessageStreamReader::new(
+        let mut reader = QPackMessageStreamReader::new(
             VarInt::from_u32(47),
             ResetWithoutStreamIdReadStream {
                 items: VecDeque::from([Err(quic::StreamError::Reset {

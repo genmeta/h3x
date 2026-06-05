@@ -28,7 +28,7 @@ mod tests {
         },
         qpack::{
             algorithm::{Algorithm, DynamicCompressAlgo, HuffmanAlways, StaticCompressAlgo},
-            decoder::{Decoder, MessageStreamReader},
+            decoder::{Decoder, QPackMessageStreamReader},
             encoder::Encoder,
             field::FieldSection,
         },
@@ -157,8 +157,11 @@ mod tests {
         });
 
         let response = tokio::spawn(async move {
-            let response_stream =
-                MessageStreamReader::new(VarInt::from_u32(0), response_stream, decoder.clone());
+            let response_stream = QPackMessageStreamReader::new(
+                VarInt::from_u32(0),
+                response_stream,
+                decoder.clone(),
+            );
 
             let mut frame_stream = pin!(FrameStream::new(StreamReader::new(response_stream)));
             let frame = frame_stream.as_mut().next_frame().await.unwrap().unwrap();
@@ -292,7 +295,8 @@ mod tests {
             write_stream.encode_one(header_frame).await.unwrap();
             write_stream.flush().await.unwrap();
 
-            let read_stream = MessageStreamReader::new(stream_id, read_stream, decoder.clone());
+            let read_stream =
+                QPackMessageStreamReader::new(stream_id, read_stream, decoder.clone());
             let mut frame_stream = pin!(FrameStream::new(StreamReader::new(read_stream)));
             let frame = frame_stream.as_mut().next_frame().await.unwrap().unwrap();
             assert_eq!(frame.r#type(), Frame::HEADERS_FRAME_TYPE);
@@ -922,8 +926,11 @@ mod tests {
         });
 
         let response_task = tokio::spawn(async move {
-            let response_stream =
-                MessageStreamReader::new(VarInt::from_u32(0), response_stream, decoder.clone());
+            let response_stream = QPackMessageStreamReader::new(
+                VarInt::from_u32(0),
+                response_stream,
+                decoder.clone(),
+            );
 
             let mut frame_stream = pin!(FrameStream::new(StreamReader::new(response_stream)));
             let frame = frame_stream.as_mut().next_frame().await.unwrap().unwrap();
