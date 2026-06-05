@@ -1,5 +1,6 @@
 pub(crate) mod bridge;
 pub(crate) mod error;
+pub(crate) mod stream;
 
 pub mod lifecycle;
 pub mod quic;
