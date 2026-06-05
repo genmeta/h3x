@@ -102,14 +102,6 @@ impl FdSender {
         self.queue(frame::OutboundFrame::Fds { id, fds })
     }
 
-    pub(crate) fn cancel_fds(&self, id: VarInt) -> Result<(), QueueFdsError> {
-        self.queue(frame::OutboundFrame::CancelFds { id })
-    }
-
-    pub(crate) fn ack_fds(&self, id: VarInt) -> Result<(), QueueFdsError> {
-        self.queue(frame::OutboundFrame::AckFds { id })
-    }
-
     fn queue(&self, frame: frame::OutboundFrame) -> Result<(), QueueFdsError> {
         let Some(core) = self.core.upgrade() else {
             return Err(QueueFdsError::Closed);
@@ -254,14 +246,6 @@ async fn reader_loop(
                         continue;
                     }
                     pending_fd_frame = Some((id, fd_count));
-                }
-                Ok(Some(frame::InboundFrame::CancelFds { id })) => {
-                    plane.mark_cancelled(id);
-                    continue;
-                }
-                Ok(Some(frame::InboundFrame::AckFds { id })) => {
-                    plane.mark_acked(id);
-                    continue;
                 }
                 Ok(None) => {}
                 Err(error) => {

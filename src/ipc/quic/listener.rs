@@ -58,8 +58,8 @@ use crate::{
 /// Remote trait for IPC listener capability.
 ///
 /// Each successful [`accept`](IpcListen::accept) echoes the receiver-chosen
-/// FD transfer ID after the associated [`MuxChannel`] FD has been
-/// acknowledged by the receiver.
+/// FD transfer ID after the associated [`MuxChannel`] FD has been queued to
+/// the local mux writer FIFO.
 #[remoc::rtc::remote]
 pub trait IpcListen: Send + Sync {
     /// Accept an incoming connection.
@@ -84,22 +84,11 @@ fn ipc_listen_error(err: impl std::error::Error, context: &str) -> ConnectionErr
     }
 }
 
-fn ipc_listen_cancelled(context: &str) -> ConnectionError {
-    debug!(context, "ipc listener fd transfer cancelled");
-    ConnectionError::Transport {
-        source: quic::TransportError {
-            kind: IPC_ERROR_KIND,
-            frame_type: IPC_FRAME_TYPE,
-            reason: format!("ipc listen: {context} cancelled").into(),
-        },
-    }
-}
-
-fn close_cancelled_connection(connection: &impl quic::Lifecycle, context: &'static str) {
+fn close_undelivered_connection(connection: &impl quic::Lifecycle, context: &'static str) {
     quic::Lifecycle::close(
         connection,
         Code::H3_REQUEST_CANCELLED,
-        format!("ipc listen {context} cancelled").into(),
+        format!("ipc listen {context} failed").into(),
     );
 }
 
@@ -147,26 +136,22 @@ where
     Codec: remoc::codec::Codec,
 {
     async fn accept(&mut self, fd_id: VarInt) -> Result<VarInt, ConnectionError> {
-        let mut delivery = self.fd_transfer.delivery(fd_id);
-        let connection = tokio::select! {
-            biased;
-            _ = delivery.cancelled() => return Err(ipc_listen_cancelled("accept")),
-            result = quic::Listen::accept(&mut self.inner) => {
-                result.map_err(|e| ipc_listen_error(e, "accept"))?
-            }
-        };
+        let delivery = self.fd_transfer.delivery(fd_id);
+        let connection = quic::Listen::accept(&mut self.inner)
+            .await
+            .map_err(|e| ipc_listen_error(e, "accept"))?;
 
         // Create a MuxChannel pair for this connection
         let (server_mux, client_fd) =
             MuxChannel::create_pair().map_err(|e| ipc_listen_error(e, "create mux pair"))?;
 
         if let Err(error) = delivery.deliver(smallvec![client_fd]).await {
-            close_cancelled_connection(connection.as_ref(), "deliver");
+            close_undelivered_connection(connection.as_ref(), "deliver");
             return Err(ipc_listen_error(error, "deliver fd"));
         }
 
         // Split the server MuxChannel — the remoc handshake + bootstrap are
-        // spawned as a background task after the FD delivery has been acked.
+        // spawned as a background task after the FD delivery has been queued.
         let (sink, stream) = server_mux
             .split()
             .map_err(|e| ipc_listen_error(e, "split mux"))?;

@@ -62,8 +62,8 @@ use crate::{
 /// Remote trait for IPC connector capability.
 ///
 /// Each successful [`connect`](IpcConnect::connect) echoes the receiver-chosen
-/// FD transfer ID after the associated [`MuxChannel`] FD has been
-/// acknowledged by the receiver.
+/// FD transfer ID after the associated [`MuxChannel`] FD has been queued to
+/// the local mux writer FIFO.
 #[remoc::rtc::remote]
 pub trait IpcConnect: Send + Sync {
     /// Connect to a remote server.
@@ -158,26 +158,22 @@ where
         fd_id: VarInt,
     ) -> Result<VarInt, ConnectionError> {
         let authority = Authority::try_from(server).map_err(|e| connect_error(e, "authority"))?;
-        let mut delivery = self.fd_transfer.delivery(fd_id);
-        let connection = tokio::select! {
-            biased;
-            _ = delivery.cancelled() => return Err(connect_cancelled("connect")),
-            result = quic::Connect::connect(&self.inner, &authority) => {
-                result.map_err(|e| connect_error(e, "connect"))?
-            }
-        };
+        let delivery = self.fd_transfer.delivery(fd_id);
+        let connection = quic::Connect::connect(&self.inner, &authority)
+            .await
+            .map_err(|e| connect_error(e, "connect"))?;
 
         // Create a MuxChannel pair for this connection.
         let (server_mux, client_fd) =
             MuxChannel::create_pair().map_err(|e| connect_error(e, "create_pair"))?;
 
         if let Err(error) = delivery.deliver(smallvec![client_fd]).await {
-            close_cancelled_connection(connection.as_ref(), "deliver");
+            close_undelivered_connection(connection.as_ref(), "deliver");
             return Err(connect_error(error, "deliver fd"));
         }
 
         // Split the server-side MuxChannel — the remoc handshake + bootstrap
-        // are spawned as a background task after the FD delivery has been acked.
+        // are spawned as a background task after the FD delivery has been queued.
         let (sink, stream) = server_mux.split().map_err(|e| connect_error(e, "split"))?;
 
         self.spawn_task(Self::setup_connection(connection, sink, stream));
@@ -364,21 +360,10 @@ fn connect_error(err: impl std::error::Error, context: &str) -> ConnectionError 
     }
 }
 
-fn connect_cancelled(context: &str) -> ConnectionError {
-    tracing::debug!(context, "ipc connect fd transfer cancelled");
-    ConnectionError::Transport {
-        source: quic::TransportError {
-            kind: IPC_ERROR_KIND,
-            frame_type: IPC_FRAME_TYPE,
-            reason: format!("ipc connect: {context} cancelled").into(),
-        },
-    }
-}
-
-fn close_cancelled_connection(connection: &impl quic::Lifecycle, context: &'static str) {
+fn close_undelivered_connection(connection: &impl quic::Lifecycle, context: &'static str) {
     quic::Lifecycle::close(
         connection,
         Code::H3_REQUEST_CANCELLED,
-        format!("ipc connect {context} cancelled").into(),
+        format!("ipc connect {context} failed").into(),
     );
 }

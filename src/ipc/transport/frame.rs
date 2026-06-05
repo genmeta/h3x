@@ -12,27 +12,20 @@ use crate::varint::{VARINT_MAX, VarInt};
 
 const FRAME_TYPE_BYTES: u8 = 0x00;
 const FRAME_TYPE_FDS: u8 = 0x01;
-const FRAME_TYPE_CANCEL_FDS: u8 = 0x02;
-const FRAME_TYPE_ACK_FDS: u8 = 0x03;
 
 const MAX_FRAME_HEADER_LEN: usize = 1 + VarInt::MAX_SIZE;
 const MAX_FDS_FRAME_LEN: usize = 1 + VarInt::MAX_SIZE + VarInt::MAX_SIZE + VarInt::MAX_SIZE;
-const MAX_ID_FRAME_LEN: usize = 1 + VarInt::MAX_SIZE + VarInt::MAX_SIZE;
 
 #[derive(Debug)]
 pub(crate) enum OutboundFrame {
     Bytes(Bytes),
     Fds { id: VarInt, fds: FdVec },
-    CancelFds { id: VarInt },
-    AckFds { id: VarInt },
 }
 
 #[derive(Debug)]
 pub(crate) enum InboundFrame {
     Bytes(Bytes),
     Fds { id: VarInt, fd_count: usize },
-    CancelFds { id: VarInt },
-    AckFds { id: VarInt },
 }
 
 #[derive(Debug)]
@@ -50,11 +43,6 @@ pub(crate) enum PendingFrame {
         header_written: usize,
         payload: FdVec,
         include_ancillary: bool,
-    },
-    Id {
-        header: [u8; MAX_ID_FRAME_LEN],
-        header_len: usize,
-        header_written: usize,
     },
 }
 
@@ -99,24 +87,6 @@ impl PendingFrame {
         }
     }
 
-    fn new_id(frame_type: u8, id: VarInt) -> Self {
-        let mut id_buf = [0u8; VarInt::MAX_SIZE];
-        let id_len = encode_varint_to_slice(&mut id_buf, id);
-
-        let mut header = [0u8; MAX_ID_FRAME_LEN];
-        header[0] = frame_type;
-        let body_len = VarInt::try_from(id_len).expect("id body length fits varint");
-        let len_len = encode_varint_to_slice(&mut header[1..], body_len);
-        let body_start = 1 + len_len;
-        header[body_start..body_start + id_len].copy_from_slice(&id_buf[..id_len]);
-
-        Self::Id {
-            header,
-            header_len: body_start + id_len,
-            header_written: 0,
-        }
-    }
-
     pub(crate) fn is_complete(&self) -> bool {
         match self {
             Self::Bytes {
@@ -127,11 +97,6 @@ impl PendingFrame {
                 ..
             } => *header_written >= *header_len && *payload_written >= payload.len(),
             Self::Fds {
-                header_len,
-                header_written,
-                ..
-            }
-            | Self::Id {
                 header_len,
                 header_written,
                 ..
@@ -169,9 +134,6 @@ impl PendingFrame {
                     *include_ancillary = false;
                 }
             }
-            Self::Id { header_written, .. } => {
-                *header_written += n;
-            }
         }
     }
 }
@@ -180,8 +142,6 @@ pub(crate) fn pending_frame(frame: OutboundFrame) -> PendingFrame {
     match frame {
         OutboundFrame::Bytes(payload) => PendingFrame::new_bytes(payload),
         OutboundFrame::Fds { id, fds } => PendingFrame::new_fds(id, fds),
-        OutboundFrame::CancelFds { id } => PendingFrame::new_id(FRAME_TYPE_CANCEL_FDS, id),
-        OutboundFrame::AckFds { id } => PendingFrame::new_id(FRAME_TYPE_ACK_FDS, id),
     }
 }
 
@@ -231,17 +191,6 @@ pub(crate) fn send_pending_frame(fd: RawFd, frame: &mut PendingFrame) -> io::Res
                 sendmsg::<()>(fd, &iov, &[], MsgFlags::empty(), None)
             }
         }
-        PendingFrame::Id {
-            header,
-            header_len,
-            header_written,
-        } => {
-            if *header_written >= *header_len {
-                return Ok(0);
-            }
-            let iov = [io::IoSlice::new(&header[*header_written..*header_len])];
-            sendmsg::<()>(fd, &iov, &[], MsgFlags::empty(), None)
-        }
     };
 
     let sent = match sent {
@@ -258,11 +207,7 @@ pub(crate) fn try_decode_frame(src: &mut BytesMut) -> Result<Option<InboundFrame
     }
 
     let frame_type = src[0];
-    if frame_type != FRAME_TYPE_BYTES
-        && frame_type != FRAME_TYPE_FDS
-        && frame_type != FRAME_TYPE_CANCEL_FDS
-        && frame_type != FRAME_TYPE_ACK_FDS
-    {
+    if frame_type != FRAME_TYPE_BYTES && frame_type != FRAME_TYPE_FDS {
         return Err(MuxStreamError::UnknownFrameType { frame_type });
     }
 
@@ -294,22 +239,8 @@ pub(crate) fn try_decode_frame(src: &mut BytesMut) -> Result<Option<InboundFrame
             }
             Ok(Some(InboundFrame::Fds { id, fd_count }))
         }
-        FRAME_TYPE_CANCEL_FDS => Ok(Some(InboundFrame::CancelFds {
-            id: decode_id_payload(&payload)?,
-        })),
-        FRAME_TYPE_ACK_FDS => Ok(Some(InboundFrame::AckFds {
-            id: decode_id_payload(&payload)?,
-        })),
         _ => Err(MuxStreamError::UnknownFrameType { frame_type }),
     }
-}
-
-fn decode_id_payload(payload: &[u8]) -> Result<VarInt, MuxStreamError> {
-    let (id, consumed) = decode_varint_from_slice(payload)?;
-    if consumed != payload.len() {
-        return Err(MuxStreamError::InvalidFdsPayload);
-    }
-    Ok(id)
 }
 
 fn try_decode_varint_len(src: &[u8]) -> Result<Option<(usize, usize)>, MuxStreamError> {
@@ -371,28 +302,5 @@ fn encode_varint_to_slice(dst: &mut [u8], v: VarInt) -> usize {
         let bytes = ((0b11 << 62) | x).to_be_bytes();
         dst[..8].copy_from_slice(&bytes);
         8
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decodes_cancel_frame() {
-        let mut bytes = BytesMut::from(&[FRAME_TYPE_CANCEL_FDS, 0x01, 0x05][..]);
-        let frame = try_decode_frame(&mut bytes)
-            .expect("decode")
-            .expect("frame");
-        assert!(matches!(frame, InboundFrame::CancelFds { id } if id == VarInt::from_u32(5)));
-    }
-
-    #[test]
-    fn decodes_ack_frame() {
-        let mut bytes = BytesMut::from(&[FRAME_TYPE_ACK_FDS, 0x01, 0x07][..]);
-        let frame = try_decode_frame(&mut bytes)
-            .expect("decode")
-            .expect("frame");
-        assert!(matches!(frame, InboundFrame::AckFds { id } if id == VarInt::from_u32(7)));
     }
 }

@@ -5,7 +5,7 @@
 //! [`IpcConnection`] defines the RPC interface for connection-level stream
 //! management over IPC.  Each stream-opening method receives a caller-chosen
 //! FD transfer ID and returns the underlying QUIC stream ID after the FD
-//! delivery has been acknowledged.
+//! delivery has been queued to the local mux writer FIFO.
 //!
 //! # Server side
 //!
@@ -59,7 +59,7 @@ use crate::{
     },
     quic::{
         self, BoxQuicStreamReader, BoxQuicStreamWriter, ConnectionError, GetStreamIdExt,
-        ManageStream, ReadStream, StreamError, WriteStream,
+        ManageStream, ReadStream, ResetStreamExt, StopStreamExt, StreamError, WriteStream,
     },
     rpc::{
         lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt},
@@ -81,7 +81,7 @@ use crate::{
 /// Each stream-opening method receives a receiver-chosen FD transfer ID and
 /// returns a handle carrying the underlying QUIC stream ID. Server-side
 /// implementations must not return until the FD delivery has been
-/// acknowledged by the receiver.
+/// queued to the local mux writer FIFO.
 ///
 /// Agent and lifecycle methods mirror [`crate::rpc::quic::Connection`] and
 /// are forwarded over the same remoc channel — only bulk stream data travels
@@ -321,14 +321,8 @@ where
         &self,
         fd_id: VarInt,
     ) -> Result<Resolved<IpcBiHandle, StreamError>, IpcOpenError> {
-        let mut delivery = self.fd_transfer.delivery(fd_id);
-        let (mut reader, writer) = tokio::select! {
-            biased;
-            _ = delivery.cancelled() => return Err(ipc_cancelled_plumbing("open_bi").into()),
-            result = ManageStream::open_bi(self.inner.as_ref()) => {
-                result.map_err(|e| IpcOpenError::Connection { source: e })?
-            }
-        };
+        let delivery = self.fd_transfer.delivery(fd_id);
+        let (mut reader, writer) = ManageStream::open_bi(self.inner.as_ref()).await?;
         let stream_id = match reader.stream_id().await {
             Ok(id) => id,
             Err(stream_err) => return Ok(Resolved::err(stream_err)),
@@ -343,14 +337,8 @@ where
         &self,
         fd_id: VarInt,
     ) -> Result<Resolved<IpcBiHandle, StreamError>, IpcAcceptError> {
-        let mut delivery = self.fd_transfer.delivery(fd_id);
-        let (mut reader, writer) = tokio::select! {
-            biased;
-            _ = delivery.cancelled() => return Err(ipc_cancelled_plumbing("accept_bi").into()),
-            result = ManageStream::accept_bi(self.inner.as_ref()) => {
-                result.map_err(|e| IpcAcceptError::Connection { source: e })?
-            }
-        };
+        let delivery = self.fd_transfer.delivery(fd_id);
+        let (mut reader, writer) = ManageStream::accept_bi(self.inner.as_ref()).await?;
         let stream_id = match reader.stream_id().await {
             Ok(id) => id,
             Err(stream_err) => return Ok(Resolved::err(stream_err)),
@@ -365,8 +353,8 @@ where
     async fn bridge_bi(
         &self,
         delivery: FdDelivery,
-        reader: M::StreamReader,
-        writer: M::StreamWriter,
+        mut reader: M::StreamReader,
+        mut writer: M::StreamWriter,
         stream_id: VarInt,
     ) -> Result<IpcBiHandle, IpcPlumbingError> {
         // Socketpair for the reader direction: server read hypervisor ↔ client read bridge
@@ -381,10 +369,15 @@ where
             .into_std()
             .map_err(|e| ipc_io_plumbing(e, "into_std"))?;
 
-        delivery
+        if let Err(error) = delivery
             .deliver(smallvec![cli_a_std.into(), cli_b_std.into()])
             .await
-            .map_err(|e| ipc_io_plumbing(e, "deliver fds"))?;
+        {
+            let code = Code::H3_REQUEST_CANCELLED.into_inner();
+            let _ = reader.stop(code).await;
+            let _ = writer.reset(code).await;
+            return Err(ipc_io_plumbing(error, "deliver fds"));
+        }
 
         // Bridge reader direction: real QUIC reader ↔ read frame IO on srv_a.
         self.spawn_task(bridge_reader(reader, srv_a));
@@ -399,24 +392,18 @@ where
         &self,
         fd_id: VarInt,
     ) -> Result<Resolved<IpcUniHandle, StreamError>, IpcOpenError> {
-        let mut delivery = self.fd_transfer.delivery(fd_id);
-        let mut writer = tokio::select! {
-            biased;
-            _ = delivery.cancelled() => return Err(ipc_cancelled_plumbing("open_uni").into()),
-            result = ManageStream::open_uni(self.inner.as_ref()) => {
-                result.map_err(|e| IpcOpenError::Connection { source: e })?
-            }
-        };
+        let delivery = self.fd_transfer.delivery(fd_id);
+        let mut writer = ManageStream::open_uni(self.inner.as_ref()).await?;
         let stream_id = match writer.stream_id().await {
             Ok(id) => id,
             Err(stream_err) => return Ok(Resolved::err(stream_err)),
         };
         let (srv, cli) = UnixStream::pair().map_err(|e| ipc_io_plumbing(e, "socketpair"))?;
         let cli_std = cli.into_std().map_err(|e| ipc_io_plumbing(e, "into_std"))?;
-        delivery
-            .deliver(smallvec![cli_std.into()])
-            .await
-            .map_err(|e| ipc_io_plumbing(e, "deliver fds"))?;
+        if let Err(error) = delivery.deliver(smallvec![cli_std.into()]).await {
+            let _ = writer.reset(Code::H3_REQUEST_CANCELLED.into_inner()).await;
+            return Err(IpcOpenError::from(ipc_io_plumbing(error, "deliver fds")));
+        }
 
         // Write frame IO on srv ↔ real QUIC writer.
         self.spawn_task(bridge_writer(srv, writer));
@@ -428,24 +415,18 @@ where
         &self,
         fd_id: VarInt,
     ) -> Result<Resolved<IpcUniHandle, StreamError>, IpcAcceptError> {
-        let mut delivery = self.fd_transfer.delivery(fd_id);
-        let mut reader = tokio::select! {
-            biased;
-            _ = delivery.cancelled() => return Err(ipc_cancelled_plumbing("accept_uni").into()),
-            result = ManageStream::accept_uni(self.inner.as_ref()) => {
-                result.map_err(|e| IpcAcceptError::Connection { source: e })?
-            }
-        };
+        let delivery = self.fd_transfer.delivery(fd_id);
+        let mut reader = ManageStream::accept_uni(self.inner.as_ref()).await?;
         let stream_id = match reader.stream_id().await {
             Ok(id) => id,
             Err(stream_err) => return Ok(Resolved::err(stream_err)),
         };
         let (srv, cli) = UnixStream::pair().map_err(|e| ipc_io_plumbing(e, "socketpair"))?;
         let cli_std = cli.into_std().map_err(|e| ipc_io_plumbing(e, "into_std"))?;
-        delivery
-            .deliver(smallvec![cli_std.into()])
-            .await
-            .map_err(|e| ipc_io_plumbing(e, "deliver fds"))?;
+        if let Err(error) = delivery.deliver(smallvec![cli_std.into()]).await {
+            let _ = reader.stop(Code::H3_REQUEST_CANCELLED.into_inner()).await;
+            return Err(IpcAcceptError::from(ipc_io_plumbing(error, "deliver fds")));
+        }
 
         // Real QUIC reader ↔ read frame IO on srv.
         self.spawn_task(bridge_reader(reader, srv));
@@ -864,18 +845,11 @@ fn ipc_transport_error(err: impl std::error::Error, context: &str) -> Connection
     }
 }
 
-/// Convert an I/O error into an [`IpcPlumbingError`] (server side).
-fn ipc_io_plumbing(err: impl std::fmt::Display, context: &str) -> IpcPlumbingError {
-    debug!(error = %err, context, "ipc plumbing i/o error");
+/// Convert an infrastructure error into an [`IpcPlumbingError`] (server side).
+fn ipc_io_plumbing(err: impl std::error::Error, context: &str) -> IpcPlumbingError {
+    debug!(error = %snafu::Report::from_error(&err), context, "ipc plumbing i/o error");
     IpcPlumbingError::Io {
         message: format!("{context}: {err}"),
-    }
-}
-
-fn ipc_cancelled_plumbing(context: &str) -> IpcPlumbingError {
-    debug!(context, "ipc fd transfer cancelled");
-    IpcPlumbingError::Io {
-        message: format!("{context}: fd transfer cancelled"),
     }
 }
 

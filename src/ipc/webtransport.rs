@@ -53,6 +53,7 @@ use tracing::{Instrument, debug};
 /// directly while preserving the `ipc::webtransport::LifecycleExt` path.
 pub use crate::rpc::webtransport::LifecycleExt;
 use crate::{
+    error::Code,
     ipc::{
         quic::{
             connection::{IPC_ERROR_KIND, IPC_FRAME_TYPE, bridge_reader, bridge_writer},
@@ -62,7 +63,7 @@ use crate::{
     },
     quic::{
         self, BoxQuicStreamReader, BoxQuicStreamWriter, ConnectionError, DynLifecycle,
-        GetStreamIdExt,
+        GetStreamIdExt, ResetStreamExt, StopStreamExt,
     },
     rpc::lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt as _},
     stream_id::StreamId,
@@ -159,7 +160,7 @@ impl From<SessionClosed> for IpcWebTransportAcceptError {
 ///
 /// All stream-opening methods receive a receiver-chosen FD transfer ID and
 /// return the underlying QUIC stream ID after the FD delivery has been
-/// acknowledged.
+/// queued to the local mux writer FIFO.
 ///
 /// The `session_id` is not included — it is passed via [`WebTransportSessionBootstrap`].
 #[remoc::rtc::remote]
@@ -185,34 +186,18 @@ pub trait IpcWebTransportSession: Send + Sync {
 // Error helpers (server side)
 // ---------------------------------------------------------------------------
 
-fn ipc_open_io(err: impl std::fmt::Display, context: &str) -> IpcWebTransportOpenError {
-    debug!(error = %err, context, "ipc webtransport session i/o error");
+fn ipc_open_io(err: impl std::error::Error, context: &str) -> IpcWebTransportOpenError {
+    debug!(error = %snafu::Report::from_error(&err), context, "ipc webtransport session i/o error");
     IpcPlumbingError::Io {
         message: format!("{context}: {err}"),
     }
     .into()
 }
 
-fn ipc_accept_io(err: impl std::fmt::Display, context: &str) -> IpcWebTransportAcceptError {
-    debug!(error = %err, context, "ipc webtransport session i/o error");
+fn ipc_accept_io(err: impl std::error::Error, context: &str) -> IpcWebTransportAcceptError {
+    debug!(error = %snafu::Report::from_error(&err), context, "ipc webtransport session i/o error");
     IpcPlumbingError::Io {
         message: format!("{context}: {err}"),
-    }
-    .into()
-}
-
-fn ipc_open_cancelled(context: &str) -> IpcWebTransportOpenError {
-    debug!(context, "ipc webtransport fd transfer cancelled");
-    IpcPlumbingError::Io {
-        message: format!("{context}: fd transfer cancelled"),
-    }
-    .into()
-}
-
-fn ipc_accept_cancelled(context: &str) -> IpcWebTransportAcceptError {
-    debug!(context, "ipc webtransport fd transfer cancelled");
-    IpcPlumbingError::Io {
-        message: format!("{context}: fd transfer cancelled"),
     }
     .into()
 }
@@ -261,7 +246,7 @@ pub struct WebTransportSessionBootstrap {
 /// 2. Creates Unix socketpairs.
 /// 3. Spawns bridge tasks executing typed stream-frame IPC against real streams.
 /// 4. Delivers client-side FDs through [`FdTransfer`].
-/// 5. Returns the stream ID over RPC after FD delivery is acknowledged.
+/// 5. Returns the stream ID over RPC after FD delivery is queued.
 pub struct WebTransportSessionAdapter {
     session: Arc<webtransport::WebTransportSession>,
     fd_transfer: FdTransfer,
@@ -296,12 +281,8 @@ impl WebTransportSessionAdapter {
 
 impl IpcWebTransportSession for WebTransportSessionAdapter {
     async fn open_bi(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportOpenError> {
-        let mut delivery = self.fd_transfer.delivery(fd_id);
-        let (mut reader, writer) = tokio::select! {
-            biased;
-            _ = delivery.cancelled() => return Err(ipc_open_cancelled("open_bi")),
-            result = self.session.open_bi() => result?,
-        };
+        let delivery = self.fd_transfer.delivery(fd_id);
+        let (mut reader, writer) = self.session.open_bi().await?;
 
         let stream_id = GetStreamIdExt::stream_id(&mut reader)
             .await
@@ -311,18 +292,12 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     }
 
     async fn accept_bi(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportAcceptError> {
-        let mut delivery = self.fd_transfer.delivery(fd_id);
-        let (mut reader, writer) = tokio::select! {
-            biased;
-            _ = delivery.cancelled() => return Err(ipc_accept_cancelled("accept_bi")),
-            result = self.session.accept_bi() => {
-                match result {
-                    Ok(streams) => streams,
-                    Err(AcceptStreamError::Closed { source }) => return Err(source.into()),
-                    Err(AcceptStreamError::Connection { source: _ }) => {
-                        return Err(IpcWebTransportAcceptError::Closed);
-                    }
-                }
+        let delivery = self.fd_transfer.delivery(fd_id);
+        let (mut reader, writer) = match self.session.accept_bi().await {
+            Ok(streams) => streams,
+            Err(AcceptStreamError::Closed { source }) => return Err(source.into()),
+            Err(AcceptStreamError::Connection { source: _ }) => {
+                return Err(IpcWebTransportAcceptError::Closed);
             }
         };
 
@@ -335,12 +310,8 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     }
 
     async fn open_uni(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportOpenError> {
-        let mut delivery = self.fd_transfer.delivery(fd_id);
-        let mut writer = tokio::select! {
-            biased;
-            _ = delivery.cancelled() => return Err(ipc_open_cancelled("open_uni")),
-            result = self.session.open_uni() => result?,
-        };
+        let delivery = self.fd_transfer.delivery(fd_id);
+        let mut writer = self.session.open_uni().await?;
 
         let stream_id = GetStreamIdExt::stream_id(&mut writer)
             .await
@@ -348,10 +319,10 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
 
         let (srv, cli) = UnixStream::pair().map_err(|e| ipc_open_io(e, "socketpair"))?;
         let cli_std = cli.into_std().map_err(|e| ipc_open_io(e, "into_std"))?;
-        delivery
-            .deliver(smallvec![cli_std.into()])
-            .await
-            .map_err(|e| ipc_open_io(e, "deliver fds"))?;
+        if let Err(error) = delivery.deliver(smallvec![cli_std.into()]).await {
+            let _ = writer.reset(Code::H3_REQUEST_CANCELLED.into_inner()).await;
+            return Err(ipc_open_io(error, "deliver fds"));
+        }
 
         // Write frame IO on srv ↔ real WebTransport write stream.
         self.spawn_task(bridge_writer(srv, writer));
@@ -360,18 +331,12 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     }
 
     async fn accept_uni(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportAcceptError> {
-        let mut delivery = self.fd_transfer.delivery(fd_id);
-        let mut reader = tokio::select! {
-            biased;
-            _ = delivery.cancelled() => return Err(ipc_accept_cancelled("accept_uni")),
-            result = self.session.accept_uni() => {
-                match result {
-                    Ok(stream) => stream,
-                    Err(AcceptStreamError::Closed { source }) => return Err(source.into()),
-                    Err(AcceptStreamError::Connection { source: _ }) => {
-                        return Err(IpcWebTransportAcceptError::Closed);
-                    }
-                }
+        let delivery = self.fd_transfer.delivery(fd_id);
+        let mut reader = match self.session.accept_uni().await {
+            Ok(stream) => stream,
+            Err(AcceptStreamError::Closed { source }) => return Err(source.into()),
+            Err(AcceptStreamError::Connection { source: _ }) => {
+                return Err(IpcWebTransportAcceptError::Closed);
             }
         };
 
@@ -381,10 +346,10 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
 
         let (srv, cli) = UnixStream::pair().map_err(|e| ipc_accept_io(e, "socketpair"))?;
         let cli_std = cli.into_std().map_err(|e| ipc_accept_io(e, "into_std"))?;
-        delivery
-            .deliver(smallvec![cli_std.into()])
-            .await
-            .map_err(|e| ipc_accept_io(e, "deliver fds"))?;
+        if let Err(error) = delivery.deliver(smallvec![cli_std.into()]).await {
+            let _ = reader.stop(Code::H3_REQUEST_CANCELLED.into_inner()).await;
+            return Err(ipc_accept_io(error, "deliver fds"));
+        }
 
         // Real WebTransport read stream ↔ read frame IO on srv.
         self.spawn_task(bridge_reader(reader, srv));
@@ -398,8 +363,8 @@ impl WebTransportSessionAdapter {
     async fn bridge_bi(
         &self,
         delivery: FdDelivery,
-        reader: BoxQuicStreamReader,
-        writer: BoxQuicStreamWriter,
+        mut reader: BoxQuicStreamReader,
+        mut writer: BoxQuicStreamWriter,
         stream_id: VarInt,
     ) -> Result<VarInt, IpcWebTransportOpenError> {
         let (srv_a, cli_a) = UnixStream::pair().map_err(|e| ipc_open_io(e, "socketpair"))?;
@@ -408,10 +373,15 @@ impl WebTransportSessionAdapter {
         let cli_a_std = cli_a.into_std().map_err(|e| ipc_open_io(e, "into_std"))?;
         let cli_b_std = cli_b.into_std().map_err(|e| ipc_open_io(e, "into_std"))?;
 
-        delivery
+        if let Err(error) = delivery
             .deliver(smallvec![cli_a_std.into(), cli_b_std.into()])
             .await
-            .map_err(|e| ipc_open_io(e, "deliver fds"))?;
+        {
+            let code = Code::H3_REQUEST_CANCELLED.into_inner();
+            let _ = reader.stop(code).await;
+            let _ = writer.reset(code).await;
+            return Err(ipc_open_io(error, "deliver fds"));
+        }
 
         // Bridge reader direction: real WebTransport reader ↔ read frame IO on srv_a.
         self.spawn_task(bridge_reader(reader, srv_a));
@@ -426,8 +396,8 @@ impl WebTransportSessionAdapter {
     async fn bridge_bi_accept(
         &self,
         delivery: FdDelivery,
-        reader: BoxQuicStreamReader,
-        writer: BoxQuicStreamWriter,
+        mut reader: BoxQuicStreamReader,
+        mut writer: BoxQuicStreamWriter,
         stream_id: VarInt,
     ) -> Result<VarInt, IpcWebTransportAcceptError> {
         let (srv_a, cli_a) = UnixStream::pair().map_err(|e| ipc_accept_io(e, "socketpair"))?;
@@ -436,10 +406,15 @@ impl WebTransportSessionAdapter {
         let cli_a_std = cli_a.into_std().map_err(|e| ipc_accept_io(e, "into_std"))?;
         let cli_b_std = cli_b.into_std().map_err(|e| ipc_accept_io(e, "into_std"))?;
 
-        delivery
+        if let Err(error) = delivery
             .deliver(smallvec![cli_a_std.into(), cli_b_std.into()])
             .await
-            .map_err(|e| ipc_accept_io(e, "deliver fds"))?;
+        {
+            let code = Code::H3_REQUEST_CANCELLED.into_inner();
+            let _ = reader.stop(code).await;
+            let _ = writer.reset(code).await;
+            return Err(ipc_accept_io(error, "deliver fds"));
+        }
 
         self.spawn_task(bridge_reader(reader, srv_a));
 
