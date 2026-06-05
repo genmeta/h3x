@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, error::Error};
+use std::{collections::VecDeque, error::Error, pin::Pin, task::Poll};
 
 use bytes::Bytes;
 use futures::{SinkExt as _, StreamExt as _};
@@ -15,7 +15,7 @@ use crate::{
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-enum WriteBridgeProtocolError {
+enum WriteHypervisorProtocolError {
     #[snafu(display("received reset code {actual} after committed reset code {expected}"))]
     ConflictingReset { expected: VarInt, actual: VarInt },
 }
@@ -78,12 +78,31 @@ where
 
             match done {
                 Ok(HyperWriteDone::Push) => {
-                    if should_send_credit(inbound_closed, reset_code, &queue) {
-                        send_write_event(&mut bridge, WriteEvent::Pull).await;
+                    if should_send_credit(inbound_closed, reset_code, &queue)
+                        && !send_write_credit(
+                            &mut bridge,
+                            &mut queue,
+                            &mut reset_code,
+                            &mut inbound_closed,
+                        )
+                        .await
+                    {
+                        return;
                     }
                 }
                 Ok(HyperWriteDone::Flush) => {
                     send_write_event(&mut bridge, WriteEvent::FlushAck).await;
+                    if should_send_credit(inbound_closed, reset_code, &queue)
+                        && !send_write_credit(
+                            &mut bridge,
+                            &mut queue,
+                            &mut reset_code,
+                            &mut inbound_closed,
+                        )
+                        .await
+                    {
+                        return;
+                    }
                 }
                 Ok(HyperWriteDone::Eos) => {
                     send_write_event(&mut bridge, WriteEvent::EosAck).await;
@@ -152,7 +171,7 @@ fn record_command(
         WriteCommand::Reset { code } => match *reset_code {
             Some(committed) if committed == code => true,
             Some(expected) => {
-                let error = WriteBridgeProtocolError::ConflictingReset {
+                let error = WriteHypervisorProtocolError::ConflictingReset {
                     expected,
                     actual: code,
                 };
@@ -220,4 +239,86 @@ where
         let report = snafu::Report::from_error(&error);
         tracing::debug!(error = %report, "stream frame write bridge output failed");
     }
+}
+
+enum CreditSendState {
+    Ready,
+    Flush,
+    Done,
+}
+
+async fn send_write_credit<Io, E>(
+    bridge: &mut Io,
+    queue: &mut VecDeque<HyperWriteJob>,
+    reset_code: &mut Option<VarInt>,
+    inbound_closed: &mut bool,
+) -> bool
+where
+    Io: FrameIo<WriteEvent, WriteCommand, E> + Unpin,
+    E: Error + 'static,
+{
+    let mut state = CreditSendState::Ready;
+    futures::future::poll_fn(|cx| {
+        if !*inbound_closed {
+            match Pin::new(&mut *bridge).poll_next(cx) {
+                Poll::Ready(Some(Ok(command))) => {
+                    if record_command(queue, reset_code, command) {
+                        return Poll::Ready(true);
+                    }
+                    return Poll::Ready(false);
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    let report = snafu::Report::from_error(&error);
+                    tracing::warn!(error = %report, "stream frame write bridge input failed");
+                    return Poll::Ready(false);
+                }
+                Poll::Ready(None) => {
+                    *inbound_closed = true;
+                    return Poll::Ready(true);
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        loop {
+            match state {
+                CreditSendState::Ready => match Pin::new(&mut *bridge).poll_ready(cx) {
+                    Poll::Ready(Ok(())) => {
+                        if let Err(error) = Pin::new(&mut *bridge).start_send(WriteEvent::Pull) {
+                            let report = snafu::Report::from_error(&error);
+                            tracing::debug!(
+                                error = %report,
+                                "stream frame write bridge output failed"
+                            );
+                            state = CreditSendState::Done;
+                            return Poll::Ready(true);
+                        }
+                        state = CreditSendState::Flush;
+                    }
+                    Poll::Ready(Err(error)) => {
+                        let report = snafu::Report::from_error(&error);
+                        tracing::debug!(error = %report, "stream frame write bridge output failed");
+                        state = CreditSendState::Done;
+                        return Poll::Ready(true);
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                CreditSendState::Flush => match Pin::new(&mut *bridge).poll_flush(cx) {
+                    Poll::Ready(Ok(())) => {
+                        state = CreditSendState::Done;
+                        return Poll::Ready(true);
+                    }
+                    Poll::Ready(Err(error)) => {
+                        let report = snafu::Report::from_error(&error);
+                        tracing::debug!(error = %report, "stream frame write bridge output failed");
+                        state = CreditSendState::Done;
+                        return Poll::Ready(true);
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                CreditSendState::Done => return Poll::Ready(true),
+            }
+        }
+    })
+    .await
 }

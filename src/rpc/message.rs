@@ -1,36 +1,22 @@
-//! Remote forwarding of message-level streams via RPC RTC.
+//! Message-level RPC stream facades over typed stream frame channels.
 //!
-//! Parallel to [`super::quic`] which bridges raw QUIC streams, this module
-//! bridges **message-level** streams ([`MessageStreamReader`](crate::message::stream::MessageStreamReader) / [`MessageStreamWriter`](crate::message::stream::MessageStreamWriter))
-//! that carry HTTP/3 DATA frame semantics and use [`MessageStreamError`] for their
-//! data path. The QUIC-level control operations (`StopStream`, `ResetStream`,
-//! `GetStreamId`) still use [`quic::StreamError`].
-//! The current RPC runtime implementation is backed by `remoc`.
+//! The RPC runtime transports stream data/control through the same typed
+//! [`ReadFrameChannels`] and [`WriteFrameChannels`] used by QUIC-level RPC
+//! stream forwarding. This module adds message-level conversion methods on
+//! those channel bundles: data-path QUIC stream errors are mapped to
+//! [`MessageStreamError`](crate::message::stream::MessageStreamError), while
+//! QUIC control operations (`StopStream`, `ResetStream`, `GetStreamId`) keep
+//! returning [`quic::StreamError`](crate::quic::StreamError).
 //!
-//! Any type implementing the original [`MessageStreamReader`](crate::message::stream::MessageStreamReader) / [`MessageStreamWriter`](crate::message::stream::MessageStreamWriter)
-//! traits automatically implements the RTC traits via blanket impls.
+//! # Conversion methods
 //!
-//! # Public API
-//!
-//! ## RTC client handles (serializable, sendable over the wire)
-//!
-//! - [`ReadMessageStreamClient`]
-//! - [`WriteMessageStreamClient`]
-//!
-//! ## Conversion methods (reconstruct poll-based streams from clients)
-//!
-//! - [`ReadMessageStreamClient::into_message_stream`]
-//! - [`ReadMessageStreamClient::into_boxed_message_stream`]
-//! - [`ReadMessageStreamClient::into_box_reader`]
-//! - [`WriteMessageStreamClient::into_message_stream`]
-//! - [`WriteMessageStreamClient::into_boxed_message_stream`]
-//! - [`WriteMessageStreamClient::into_box_writer`]
+//! - `ReadFrameChannels::into_message_stream`
+//! - `ReadFrameChannels::into_boxed_message_stream`
+//! - `ReadFrameChannels::into_box_reader`
+//! - `WriteFrameChannels::into_message_stream`
+//! - `WriteFrameChannels::into_boxed_message_stream`
+//! - `WriteFrameChannels::into_box_writer`
 
 mod stream;
 
-pub use self::stream::{
-    ReadMessageStreamClient, ReadMessageStreamReqReceiver, ReadMessageStreamServer,
-    ReadMessageStreamServerRefMut, ReadMessageStreamServerSharedMut, WriteMessageStreamClient,
-    WriteMessageStreamReqReceiver, WriteMessageStreamServer, WriteMessageStreamServerRefMut,
-    WriteMessageStreamServerSharedMut,
-};
+pub use super::quic::{ReadFrameChannels, WriteFrameChannels};

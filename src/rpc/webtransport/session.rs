@@ -7,19 +7,22 @@
 
 use std::sync::Arc;
 
-use remoc::{prelude::Server, rtc::Client as RemocClient};
+use remoc::rtc::Client as RemocClient;
 use tracing::Instrument;
 
 use super::{
     super::{
         lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt as ConnectionLifecycleExt},
-        quic::{ReadStreamClient, ReadStreamServer, WriteStreamClient, WriteStreamServer},
+        quic::{ReadFrameChannels, WriteFrameChannels},
     },
     LifecycleExt,
 };
 use crate::{
     message::stream::guard,
-    quic::{self, ConnectionError, DynLifecycle},
+    quic::{
+        self, BoxQuicStreamReader, BoxQuicStreamWriter, ConnectionError, DynLifecycle,
+        GetStreamIdExt,
+    },
     stream_id::StreamId,
     varint::VarInt,
     webtransport::{self, AcceptStreamError, OpenStreamError},
@@ -36,10 +39,11 @@ use crate::{
 /// it is immutable and can be passed out-of-band at construction time.
 #[remoc::rtc::remote]
 pub trait WebTransportRpcSession: Send + Sync {
-    async fn open_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), OpenStreamError>;
-    async fn open_uni(&self) -> Result<WriteStreamClient, OpenStreamError>;
-    async fn accept_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), AcceptStreamError>;
-    async fn accept_uni(&self) -> Result<ReadStreamClient, AcceptStreamError>;
+    async fn open_bi(&self) -> Result<(ReadFrameChannels, WriteFrameChannels), OpenStreamError>;
+    async fn open_uni(&self) -> Result<WriteFrameChannels, OpenStreamError>;
+    async fn accept_bi(&self)
+    -> Result<(ReadFrameChannels, WriteFrameChannels), AcceptStreamError>;
+    async fn accept_uni(&self) -> Result<ReadFrameChannels, AcceptStreamError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -47,84 +51,32 @@ pub trait WebTransportRpcSession: Send + Sync {
 // ---------------------------------------------------------------------------
 
 impl WebTransportRpcSession for webtransport::WebTransportSession {
-    async fn open_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), OpenStreamError> {
+    async fn open_bi(&self) -> Result<(ReadFrameChannels, WriteFrameChannels), OpenStreamError> {
         let (reader, writer) = webtransport::WebTransportSession::open_bi(self).await?;
-        let (rs, rc) = ReadStreamServer::new(reader, 1);
-        // Inherent termination: the returned stream client owns the remoc
-        // endpoint; when the client is dropped or the channel closes,
-        // server.serve exits.
-        tokio::spawn(
-            (async move {
-                let _ = rs.serve().await;
-            })
-            .in_current_span(),
-        );
-        let (ws, wc) = WriteStreamServer::new(writer, 1);
-        // Inherent termination: the returned stream client owns the remoc
-        // endpoint; when the client is dropped or the channel closes,
-        // server.serve exits.
-        tokio::spawn(
-            (async move {
-                let _ = ws.serve().await;
-            })
-            .in_current_span(),
-        );
-        Ok((rc, wc))
+        Ok((
+            read_channels_open(reader).await?,
+            write_channels_open(writer).await?,
+        ))
     }
 
-    async fn open_uni(&self) -> Result<WriteStreamClient, OpenStreamError> {
+    async fn open_uni(&self) -> Result<WriteFrameChannels, OpenStreamError> {
         let writer = webtransport::WebTransportSession::open_uni(self).await?;
-        let (ws, wc) = WriteStreamServer::new(writer, 1);
-        // Inherent termination: the returned stream client owns the remoc
-        // endpoint; when the client is dropped or the channel closes,
-        // server.serve exits.
-        tokio::spawn(
-            (async move {
-                let _ = ws.serve().await;
-            })
-            .in_current_span(),
-        );
-        Ok(wc)
+        write_channels_open(writer).await
     }
 
-    async fn accept_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), AcceptStreamError> {
+    async fn accept_bi(
+        &self,
+    ) -> Result<(ReadFrameChannels, WriteFrameChannels), AcceptStreamError> {
         let (reader, writer) = webtransport::WebTransportSession::accept_bi(self).await?;
-        let (rs, rc) = ReadStreamServer::new(reader, 1);
-        // Inherent termination: the returned stream client owns the remoc
-        // endpoint; when the client is dropped or the channel closes,
-        // server.serve exits.
-        tokio::spawn(
-            (async move {
-                let _ = rs.serve().await;
-            })
-            .in_current_span(),
-        );
-        let (ws, wc) = WriteStreamServer::new(writer, 1);
-        // Inherent termination: the returned stream client owns the remoc
-        // endpoint; when the client is dropped or the channel closes,
-        // server.serve exits.
-        tokio::spawn(
-            (async move {
-                let _ = ws.serve().await;
-            })
-            .in_current_span(),
-        );
-        Ok((rc, wc))
+        Ok((
+            read_channels_accept(reader).await?,
+            write_channels_accept(writer).await?,
+        ))
     }
 
-    async fn accept_uni(&self) -> Result<ReadStreamClient, AcceptStreamError> {
+    async fn accept_uni(&self) -> Result<ReadFrameChannels, AcceptStreamError> {
         let reader = webtransport::WebTransportSession::accept_uni(self).await?;
-        let (rs, rc) = ReadStreamServer::new(reader, 1);
-        // Inherent termination: the returned stream client owns the remoc
-        // endpoint; when the client is dropped or the channel closes,
-        // server.serve exits.
-        tokio::spawn(
-            (async move {
-                let _ = rs.serve().await;
-            })
-            .in_current_span(),
-        );
-        Ok(rc)
+        read_channels_accept(reader).await
     }
 }
 
@@ -228,14 +180,17 @@ impl webtransport::Session for RemoteWebTransportSession {
         let (reader, writer) = self
             .guard_open(WebTransportRpcSession::open_bi(&self.client))
             .await?;
-        Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
+        Ok((
+            self.read_channels_into_quic(reader),
+            self.write_channels_into_quic(writer),
+        ))
     }
 
     async fn open_uni(&self) -> Result<Self::StreamWriter, OpenStreamError> {
         let writer = self
             .guard_open(WebTransportRpcSession::open_uni(&self.client))
             .await?;
-        Ok(writer.into_boxed_quic())
+        Ok(self.write_channels_into_quic(writer))
     }
 
     async fn accept_bi(
@@ -244,14 +199,124 @@ impl webtransport::Session for RemoteWebTransportSession {
         let (reader, writer) = self
             .guard_accept(WebTransportRpcSession::accept_bi(&self.client))
             .await?;
-        Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
+        Ok((
+            self.read_channels_into_quic(reader),
+            self.write_channels_into_quic(writer),
+        ))
     }
 
     async fn accept_uni(&self) -> Result<Self::StreamReader, AcceptStreamError> {
         let reader = self
             .guard_accept(WebTransportRpcSession::accept_uni(&self.client))
             .await?;
-        Ok(reader.into_boxed_quic())
+        Ok(self.read_channels_into_quic(reader))
+    }
+}
+
+impl RemoteWebTransportSession {
+    fn read_channels_into_quic(&self, channels: ReadFrameChannels) -> guard::GuardedQuicReader {
+        let lifecycle = Arc::new(self.clone());
+        let raw = Box::pin(channels.into_quic(lifecycle)) as BoxQuicStreamReader;
+        guard::GuardedQuicReader::new(raw)
+    }
+
+    fn write_channels_into_quic(&self, channels: WriteFrameChannels) -> guard::GuardedQuicWriter {
+        let lifecycle = Arc::new(self.clone());
+        let raw = Box::pin(channels.into_quic(lifecycle)) as BoxQuicStreamWriter;
+        guard::GuardedQuicWriter::new(raw)
+    }
+}
+
+async fn read_channels_open(
+    mut reader: BoxQuicStreamReader,
+) -> Result<ReadFrameChannels, OpenStreamError> {
+    let stream_id = match reader.stream_id().await {
+        Ok(stream_id) => stream_id,
+        Err(error) => return Err(open_stream_id_error(error)),
+    };
+    let (channels, bridge) = ReadFrameChannels::pair(stream_id);
+    // Inherent termination: this task owns the real WebTransport stream and
+    // remoc frame IO. It exits when the real stream reaches a terminal state,
+    // the worker drops the frame channels, or frame IO reports failure.
+    tokio::spawn(
+        crate::rpc::stream::hypervisor::read::run_read_bridge(reader, bridge).in_current_span(),
+    );
+    Ok(channels)
+}
+
+async fn write_channels_open(
+    mut writer: BoxQuicStreamWriter,
+) -> Result<WriteFrameChannels, OpenStreamError> {
+    let stream_id = match writer.stream_id().await {
+        Ok(stream_id) => stream_id,
+        Err(error) => return Err(open_stream_id_error(error)),
+    };
+    let (channels, bridge) = WriteFrameChannels::pair(stream_id);
+    // Inherent termination: this task owns the real WebTransport stream and
+    // remoc frame IO. It exits when the real stream reaches a terminal state,
+    // the worker drops the frame channels, or frame IO reports failure.
+    tokio::spawn(
+        crate::rpc::stream::hypervisor::write::run_write_bridge(writer, bridge).in_current_span(),
+    );
+    Ok(channels)
+}
+
+async fn read_channels_accept(
+    mut reader: BoxQuicStreamReader,
+) -> Result<ReadFrameChannels, AcceptStreamError> {
+    let stream_id = match reader.stream_id().await {
+        Ok(stream_id) => stream_id,
+        Err(error) => return Err(accept_stream_id_error(error)),
+    };
+    let (channels, bridge) = ReadFrameChannels::pair(stream_id);
+    // Inherent termination: this task owns the real WebTransport stream and
+    // remoc frame IO. It exits when the real stream reaches a terminal state,
+    // the worker drops the frame channels, or frame IO reports failure.
+    tokio::spawn(
+        crate::rpc::stream::hypervisor::read::run_read_bridge(reader, bridge).in_current_span(),
+    );
+    Ok(channels)
+}
+
+async fn write_channels_accept(
+    mut writer: BoxQuicStreamWriter,
+) -> Result<WriteFrameChannels, AcceptStreamError> {
+    let stream_id = match writer.stream_id().await {
+        Ok(stream_id) => stream_id,
+        Err(error) => return Err(accept_stream_id_error(error)),
+    };
+    let (channels, bridge) = WriteFrameChannels::pair(stream_id);
+    // Inherent termination: this task owns the real WebTransport stream and
+    // remoc frame IO. It exits when the real stream reaches a terminal state,
+    // the worker drops the frame channels, or frame IO reports failure.
+    tokio::spawn(
+        crate::rpc::stream::hypervisor::write::run_write_bridge(writer, bridge).in_current_span(),
+    );
+    Ok(channels)
+}
+
+fn open_stream_id_error(error: quic::StreamError) -> OpenStreamError {
+    OpenStreamError::Open {
+        source: stream_id_connection_error(error),
+    }
+}
+
+fn accept_stream_id_error(error: quic::StreamError) -> AcceptStreamError {
+    AcceptStreamError::Connection {
+        source: stream_id_connection_error(error),
+    }
+}
+
+fn stream_id_connection_error(error: quic::StreamError) -> quic::ConnectionError {
+    match error {
+        quic::StreamError::Connection { source } => source,
+        quic::StreamError::Reset { code } => quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(0x0d),
+                frame_type: VarInt::from_u32(0x00),
+                reason: format!("rpc webtransport stream id reset with code {code}").into(),
+            },
+        },
     }
 }
 
@@ -296,6 +361,7 @@ mod tests {
         protocol::Protocols,
         qpack::field::Protocol,
         quic::{BoxQuicStreamReader, BoxQuicStreamWriter, GetStreamIdExt, StopStreamExt},
+        rpc::stream::test_io::TestLifecycle as StreamTestLifecycle,
         webtransport::{SessionClosed, WEBTRANSPORT_H3, WebTransportProtocol},
     };
 
@@ -337,48 +403,51 @@ mod tests {
             }
         }
 
-        fn stream_pair(&self, stream_id: u32) -> (ReadStreamClient, WriteStreamClient) {
-            let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
-            let (reader_server, reader_client) =
-                ReadStreamServer::new(Box::pin(reader) as BoxQuicStreamReader, 1);
-            let (writer_server, writer_client) =
-                WriteStreamServer::new(Box::pin(writer) as BoxQuicStreamWriter, 1);
+        fn stream_pair(&self, stream_id: u32) -> (ReadFrameChannels, WriteFrameChannels) {
+            let stream_id = VarInt::from_u32(stream_id);
+            let (reader, writer) = quic::test::mock_stream_pair(stream_id);
+            let (reader_client, reader_bridge) = ReadFrameChannels::pair(stream_id);
+            let (writer_client, writer_bridge) = WriteFrameChannels::pair(stream_id);
             self.push_task(tokio::spawn(
-                async move {
-                    let _ = reader_server.serve().await;
-                }
+                crate::rpc::stream::hypervisor::read::run_read_bridge(
+                    Box::pin(reader) as BoxQuicStreamReader,
+                    reader_bridge,
+                )
                 .in_current_span(),
             ));
             self.push_task(tokio::spawn(
-                async move {
-                    let _ = writer_server.serve().await;
-                }
+                crate::rpc::stream::hypervisor::write::run_write_bridge(
+                    Box::pin(writer) as BoxQuicStreamWriter,
+                    writer_bridge,
+                )
                 .in_current_span(),
             ));
             (reader_client, writer_client)
         }
 
-        fn read_stream(&self, stream_id: u32) -> ReadStreamClient {
-            let (reader, _writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
-            let (reader_server, reader_client) =
-                ReadStreamServer::new(Box::pin(reader) as BoxQuicStreamReader, 1);
+        fn read_stream(&self, stream_id: u32) -> ReadFrameChannels {
+            let stream_id = VarInt::from_u32(stream_id);
+            let (reader, _writer) = quic::test::mock_stream_pair(stream_id);
+            let (reader_client, reader_bridge) = ReadFrameChannels::pair(stream_id);
             self.push_task(tokio::spawn(
-                async move {
-                    let _ = reader_server.serve().await;
-                }
+                crate::rpc::stream::hypervisor::read::run_read_bridge(
+                    Box::pin(reader) as BoxQuicStreamReader,
+                    reader_bridge,
+                )
                 .in_current_span(),
             ));
             reader_client
         }
 
-        fn write_stream(&self, stream_id: u32) -> WriteStreamClient {
-            let (_reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
-            let (writer_server, writer_client) =
-                WriteStreamServer::new(Box::pin(writer) as BoxQuicStreamWriter, 1);
+        fn write_stream(&self, stream_id: u32) -> WriteFrameChannels {
+            let stream_id = VarInt::from_u32(stream_id);
+            let (_reader, writer) = quic::test::mock_stream_pair(stream_id);
+            let (writer_client, writer_bridge) = WriteFrameChannels::pair(stream_id);
             self.push_task(tokio::spawn(
-                async move {
-                    let _ = writer_server.serve().await;
-                }
+                crate::rpc::stream::hypervisor::write::run_write_bridge(
+                    Box::pin(writer) as BoxQuicStreamWriter,
+                    writer_bridge,
+                )
                 .in_current_span(),
             ));
             writer_client
@@ -393,7 +462,9 @@ mod tests {
     }
 
     impl WebTransportRpcSession for TestRpcSession {
-        async fn open_bi(&self) -> Result<(ReadStreamClient, WriteStreamClient), OpenStreamError> {
+        async fn open_bi(
+            &self,
+        ) -> Result<(ReadFrameChannels, WriteFrameChannels), OpenStreamError> {
             if self.fail_open {
                 return Err(OpenStreamError::Open {
                     source: connection_error("rpc open failed"),
@@ -402,7 +473,7 @@ mod tests {
             Ok(self.stream_pair(1))
         }
 
-        async fn open_uni(&self) -> Result<WriteStreamClient, OpenStreamError> {
+        async fn open_uni(&self) -> Result<WriteFrameChannels, OpenStreamError> {
             if self.fail_open {
                 return Err(OpenStreamError::Open {
                     source: connection_error("rpc open failed"),
@@ -413,7 +484,7 @@ mod tests {
 
         async fn accept_bi(
             &self,
-        ) -> Result<(ReadStreamClient, WriteStreamClient), AcceptStreamError> {
+        ) -> Result<(ReadFrameChannels, WriteFrameChannels), AcceptStreamError> {
             if self.fail_accept {
                 return Err(AcceptStreamError::Connection {
                     source: connection_error("rpc accept failed"),
@@ -427,7 +498,7 @@ mod tests {
             Ok(self.stream_pair(3))
         }
 
-        async fn accept_uni(&self) -> Result<ReadStreamClient, AcceptStreamError> {
+        async fn accept_uni(&self) -> Result<ReadFrameChannels, AcceptStreamError> {
             if self.fail_accept {
                 return Err(AcceptStreamError::Connection {
                     source: connection_error("rpc accept failed"),
@@ -532,10 +603,11 @@ mod tests {
         payload: &'static [u8],
     ) {
         let bytes = Bytes::from_static(payload);
-        writer.send(bytes.clone()).await.expect("write");
-        let received = reader
-            .next()
-            .await
+        let write = async { writer.send(bytes.clone()).await };
+        let read = async { reader.next().await };
+        let (write, received) = tokio::join!(write, read);
+        write.expect("write");
+        let received = received
             .expect("reader should produce one chunk")
             .expect("read");
         assert_eq!(received, bytes);
@@ -868,8 +940,9 @@ mod tests {
         let (reader, writer) = WebTransportRpcSession::open_bi(&session)
             .await
             .expect("open_bi should wrap successful streams");
-        let mut reader = reader.into_boxed_quic();
-        let mut writer = writer.into_boxed_quic();
+        let lifecycle = Arc::new(StreamTestLifecycle::new());
+        let mut reader = Box::pin(reader.into_quic(lifecycle.clone())) as BoxQuicStreamReader;
+        let mut writer = Box::pin(writer.into_quic(lifecycle)) as BoxQuicStreamWriter;
         assert_eq!(
             reader.stream_id().await.expect("reader id"),
             VarInt::from_u32(0)
@@ -878,11 +951,11 @@ mod tests {
             writer.stream_id().await.expect("writer id"),
             VarInt::from_u32(0)
         );
-        writer
-            .send(Bytes::from_static(b"wrapped-bidi"))
-            .await
-            .expect("wrapped bidi writer should remain usable");
-        assert!(reader.next().await.is_none());
+        let write = writer.send(Bytes::from_static(b"wrapped-bidi"));
+        let read = reader.next();
+        let (write, received) = tokio::join!(write, read);
+        write.expect("wrapped bidi writer should remain usable");
+        assert!(received.is_none());
 
         let (_quic, connection) = connection_with_enabled_webtransport_pair();
         let session =
@@ -892,7 +965,8 @@ mod tests {
         let writer = WebTransportRpcSession::open_uni(&session)
             .await
             .expect("open_uni should wrap successful stream");
-        let mut writer = writer.into_boxed_quic();
+        let lifecycle = Arc::new(StreamTestLifecycle::new());
+        let mut writer = Box::pin(writer.into_quic(lifecycle)) as BoxQuicStreamWriter;
         assert_eq!(
             writer.stream_id().await.expect("writer id"),
             VarInt::from_u32(0)

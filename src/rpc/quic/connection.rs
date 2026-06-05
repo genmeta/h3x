@@ -3,10 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use remoc::{
-    prelude::{Server, ServerShared},
-    rtc::Client as RemocClient,
-};
+use remoc::{prelude::ServerShared, rtc::Client as RemocClient};
 use serde::{Deserialize, Serialize};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
@@ -15,24 +12,26 @@ use super::{
     authority::{
         CachedLocalAuthority, CachedRemoteAuthority, LocalAuthorityClient, RemoteAuthorityClient,
     },
-    stream::{self, ReadStreamClient, WriteStreamClient},
+    stream::{ReadFrameChannels, WriteFrameChannels},
 };
 use crate::{
     error::Code,
-    quic::{self, ConnectionError},
+    message::stream::guard,
+    quic::{self, BoxQuicStreamReader, BoxQuicStreamWriter, ConnectionError, GetStreamIdExt},
     rpc::lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt},
     varint::VarInt,
 };
 
 #[remoc::rtc::remote]
 pub trait Connection: Send + Sync {
-    async fn open_bi(&self)
-    -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError>;
-    async fn open_uni(&self) -> Result<WriteStreamClient, quic::ConnectionError>;
+    async fn open_bi(
+        &self,
+    ) -> Result<(ReadFrameChannels, WriteFrameChannels), quic::ConnectionError>;
+    async fn open_uni(&self) -> Result<WriteFrameChannels, quic::ConnectionError>;
     async fn accept_bi(
         &self,
-    ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError>;
-    async fn accept_uni(&self) -> Result<ReadStreamClient, quic::ConnectionError>;
+    ) -> Result<(ReadFrameChannels, WriteFrameChannels), quic::ConnectionError>;
+    async fn accept_uni(&self) -> Result<ReadFrameChannels, quic::ConnectionError>;
     async fn local_authority(&self) -> Result<Option<LocalAuthorityClient>, quic::ConnectionError>;
     async fn remote_authority(
         &self,
@@ -57,86 +56,26 @@ where
 {
     async fn open_bi(
         &self,
-    ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError> {
+    ) -> Result<(ReadFrameChannels, WriteFrameChannels), quic::ConnectionError> {
         let (reader, writer) = quic::ManageStream::open_bi(self).await?;
-        let (rs, rc) = stream::ReadStreamServer::new(Box::pin(reader), 1);
-        // Inherent termination: the returned stream client owns the remoc
-        // endpoint; when the client is dropped or the channel closes,
-        // server.serve exits.
-        tokio::spawn(
-            (async move {
-                let _ = rs.serve().await;
-            })
-            .in_current_span(),
-        );
-        let (ws, wc) = stream::WriteStreamServer::new(Box::pin(writer), 1);
-        // Inherent termination: the returned stream client owns the remoc
-        // endpoint; when the client is dropped or the channel closes,
-        // server.serve exits.
-        tokio::spawn(
-            (async move {
-                let _ = ws.serve().await;
-            })
-            .in_current_span(),
-        );
-        Ok((rc, wc))
+        Ok((read_channels(reader).await?, write_channels(writer).await?))
     }
 
-    async fn open_uni(&self) -> Result<WriteStreamClient, quic::ConnectionError> {
+    async fn open_uni(&self) -> Result<WriteFrameChannels, quic::ConnectionError> {
         let writer = quic::ManageStream::open_uni(self).await?;
-        let (ws, wc) = stream::WriteStreamServer::new(Box::pin(writer), 1);
-        // Inherent termination: the returned stream client owns the remoc
-        // endpoint; when the client is dropped or the channel closes,
-        // server.serve exits.
-        tokio::spawn(
-            (async move {
-                let _ = ws.serve().await;
-            })
-            .in_current_span(),
-        );
-        Ok(wc)
+        write_channels(writer).await
     }
 
     async fn accept_bi(
         &self,
-    ) -> Result<(ReadStreamClient, WriteStreamClient), quic::ConnectionError> {
+    ) -> Result<(ReadFrameChannels, WriteFrameChannels), quic::ConnectionError> {
         let (reader, writer) = quic::ManageStream::accept_bi(self).await?;
-        let (rs, rc) = stream::ReadStreamServer::new(Box::pin(reader), 1);
-        // Inherent termination: the returned stream client owns the remoc
-        // endpoint; when the client is dropped or the channel closes,
-        // server.serve exits.
-        tokio::spawn(
-            (async move {
-                let _ = rs.serve().await;
-            })
-            .in_current_span(),
-        );
-        let (ws, wc) = stream::WriteStreamServer::new(Box::pin(writer), 1);
-        // Inherent termination: the returned stream client owns the remoc
-        // endpoint; when the client is dropped or the channel closes,
-        // server.serve exits.
-        tokio::spawn(
-            (async move {
-                let _ = ws.serve().await;
-            })
-            .in_current_span(),
-        );
-        Ok((rc, wc))
+        Ok((read_channels(reader).await?, write_channels(writer).await?))
     }
 
-    async fn accept_uni(&self) -> Result<ReadStreamClient, quic::ConnectionError> {
+    async fn accept_uni(&self) -> Result<ReadFrameChannels, quic::ConnectionError> {
         let reader = quic::ManageStream::accept_uni(self).await?;
-        let (rs, rc) = stream::ReadStreamServer::new(Box::pin(reader), 1);
-        // Inherent termination: the returned stream client owns the remoc
-        // endpoint; when the client is dropped or the channel closes,
-        // server.serve exits.
-        tokio::spawn(
-            (async move {
-                let _ = rs.serve().await;
-            })
-            .in_current_span(),
-        );
-        Ok(rc)
+        read_channels(reader).await
     }
 
     async fn local_authority(&self) -> Result<Option<LocalAuthorityClient>, quic::ConnectionError> {
@@ -272,22 +211,91 @@ impl quic::ManageStream for RemoteConnection {
 
     async fn open_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
         let (reader, writer) = self.guard(Connection::open_bi(&self.client)).await?;
-        Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
+        Ok((
+            self.read_channels_into_quic(reader),
+            self.write_channels_into_quic(writer),
+        ))
     }
 
     async fn open_uni(&self) -> Result<Self::StreamWriter, ConnectionError> {
         let writer = self.guard(Connection::open_uni(&self.client)).await?;
-        Ok(writer.into_boxed_quic())
+        Ok(self.write_channels_into_quic(writer))
     }
 
     async fn accept_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
         let (reader, writer) = self.guard(Connection::accept_bi(&self.client)).await?;
-        Ok((reader.into_boxed_quic(), writer.into_boxed_quic()))
+        Ok((
+            self.read_channels_into_quic(reader),
+            self.write_channels_into_quic(writer),
+        ))
     }
 
     async fn accept_uni(&self) -> Result<Self::StreamReader, ConnectionError> {
         let reader = self.guard(Connection::accept_uni(&self.client)).await?;
-        Ok(reader.into_boxed_quic())
+        Ok(self.read_channels_into_quic(reader))
+    }
+}
+
+impl RemoteConnection {
+    fn read_channels_into_quic(&self, channels: ReadFrameChannels) -> guard::GuardedQuicReader {
+        let lifecycle = Arc::new(self.clone());
+        let raw = Box::pin(channels.into_quic(lifecycle)) as BoxQuicStreamReader;
+        guard::GuardedQuicReader::new(raw)
+    }
+
+    fn write_channels_into_quic(&self, channels: WriteFrameChannels) -> guard::GuardedQuicWriter {
+        let lifecycle = Arc::new(self.clone());
+        let raw = Box::pin(channels.into_quic(lifecycle)) as BoxQuicStreamWriter;
+        guard::GuardedQuicWriter::new(raw)
+    }
+}
+
+async fn read_channels<R>(mut reader: R) -> Result<ReadFrameChannels, quic::ConnectionError>
+where
+    R: quic::ReadStream + Unpin + 'static,
+{
+    let stream_id = match reader.stream_id().await {
+        Ok(stream_id) => stream_id,
+        Err(error) => return Err(stream_id_error(error)),
+    };
+    let (channels, bridge) = ReadFrameChannels::pair(stream_id);
+    // Inherent termination: this task owns the real stream and remoc frame IO.
+    // It exits when the real stream reaches a terminal state, the worker drops
+    // the frame channels, or frame IO reports a connection failure.
+    tokio::spawn(
+        crate::rpc::stream::hypervisor::read::run_read_bridge(reader, bridge).in_current_span(),
+    );
+    Ok(channels)
+}
+
+async fn write_channels<W>(mut writer: W) -> Result<WriteFrameChannels, quic::ConnectionError>
+where
+    W: quic::WriteStream + Unpin + 'static,
+{
+    let stream_id = match writer.stream_id().await {
+        Ok(stream_id) => stream_id,
+        Err(error) => return Err(stream_id_error(error)),
+    };
+    let (channels, bridge) = WriteFrameChannels::pair(stream_id);
+    // Inherent termination: this task owns the real stream and remoc frame IO.
+    // It exits when the real stream reaches a terminal state, the worker drops
+    // the frame channels, or frame IO reports a connection failure.
+    tokio::spawn(
+        crate::rpc::stream::hypervisor::write::run_write_bridge(writer, bridge).in_current_span(),
+    );
+    Ok(channels)
+}
+
+fn stream_id_error(error: quic::StreamError) -> quic::ConnectionError {
+    match error {
+        quic::StreamError::Connection { source } => source,
+        quic::StreamError::Reset { code } => quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(0x0d),
+                frame_type: VarInt::from_u32(0x00),
+                reason: format!("rpc stream id reset with code {code}").into(),
+            },
+        },
     }
 }
 
@@ -833,13 +841,6 @@ mod tests {
         assert_eq!(source.reason.as_ref(), expected);
     }
 
-    fn assert_stream_reason(error: &quic::StreamError, expected: &str) {
-        let quic::StreamError::Connection { source } = error else {
-            panic!("expected connection-scoped stream error");
-        };
-        assert_reason(source, expected);
-    }
-
     fn expected_signature(data: &[u8]) -> Vec<u8> {
         let mut signature = b"canonical:".to_vec();
         signature.extend_from_slice(data);
@@ -1115,55 +1116,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_connection_boxed_streams_surface_stream_id_failures() {
+    async fn remote_connection_stream_methods_surface_stream_id_failures() {
         let connection = Arc::new(BrokenIdQuicConnection);
         let (_task, client) = spawn_rpc_connection(connection);
         let remote = client.into_quic();
+        let Err(error) = quic::ManageStream::open_bi(&remote).await else {
+            panic!("open bidi should fail before returning channels");
+        };
+        assert_reason(&error, "open bidi reader stream id failed");
 
-        let (mut reader, mut writer) = quic::ManageStream::open_bi(&remote)
-            .await
-            .expect("open bidi should return boxed streams");
-        let error = reader
-            .stream_id()
-            .await
-            .expect_err("reader stream id should fail");
-        assert_stream_reason(&error, "open bidi reader stream id failed");
-        let error = writer
-            .stream_id()
-            .await
-            .expect_err("writer stream id should fail");
-        assert_stream_reason(&error, "open bidi writer stream id failed");
+        let connection = Arc::new(BrokenIdQuicConnection);
+        let (_task, client) = spawn_rpc_connection(connection);
+        let remote = client.into_quic();
+        let Err(error) = quic::ManageStream::open_uni(&remote).await else {
+            panic!("open uni should fail before returning channels");
+        };
+        assert_reason(&error, "open uni writer stream id failed");
 
-        let mut writer = quic::ManageStream::open_uni(&remote)
-            .await
-            .expect("open uni should return boxed writer");
-        let error = writer
-            .stream_id()
-            .await
-            .expect_err("writer stream id should fail");
-        assert_stream_reason(&error, "open uni writer stream id failed");
+        let connection = Arc::new(BrokenIdQuicConnection);
+        let (_task, client) = spawn_rpc_connection(connection);
+        let remote = client.into_quic();
+        let Err(error) = quic::ManageStream::accept_bi(&remote).await else {
+            panic!("accept bidi should fail before returning channels");
+        };
+        assert_reason(&error, "accept bidi reader stream id failed");
 
-        let (mut reader, mut writer) = quic::ManageStream::accept_bi(&remote)
-            .await
-            .expect("accept bidi should return boxed streams");
-        let error = reader
-            .stream_id()
-            .await
-            .expect_err("reader stream id should fail");
-        assert_stream_reason(&error, "accept bidi reader stream id failed");
-        let error = writer
-            .stream_id()
-            .await
-            .expect_err("writer stream id should fail");
-        assert_stream_reason(&error, "accept bidi writer stream id failed");
-
-        let mut reader = quic::ManageStream::accept_uni(&remote)
-            .await
-            .expect("accept uni should return boxed reader");
-        let error = reader
-            .stream_id()
-            .await
-            .expect_err("reader stream id should fail");
-        assert_stream_reason(&error, "accept uni reader stream id failed");
+        let connection = Arc::new(BrokenIdQuicConnection);
+        let (_task, client) = spawn_rpc_connection(connection);
+        let remote = client.into_quic();
+        let Err(error) = quic::ManageStream::accept_uni(&remote).await else {
+            panic!("accept uni should fail before returning channels");
+        };
+        assert_reason(&error, "accept uni reader stream id failed");
     }
 }

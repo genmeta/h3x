@@ -21,8 +21,8 @@
 //! the wire and used to make RPC calls to the remote side.
 //!
 //! - [`ConnectionClient`] — RTC client for a remote QUIC connection
-//! - [`ReadStreamClient`] — RTC client for a remote readable QUIC stream
-//! - [`WriteStreamClient`] — RTC client for a remote writable QUIC stream
+//! - [`ReadFrameChannels`] — typed frame channels for a remote readable QUIC stream
+//! - [`WriteFrameChannels`] — typed frame channels for a remote writable QUIC stream
 //! - [`ConnectClient`] — RTC client for a remote QUIC connector
 //! - [`ListenClient`] — RTC client for a remote QUIC listener
 //!
@@ -37,10 +37,6 @@
 //! - [`ConnectionClient::into_quic`] — convert into a [`RemoteConnection`]
 //! - [`ConnectClient::into_quic`] — convert into a [`RemoteConnector`]
 //! - [`ListenClient::into_quic`] — convert into a [`RemoteListener`]
-//! - [`ReadStreamClient::into_quic`] — convert into a `quic::ReadStream`
-//! - [`ReadStreamClient::into_boxed_quic`] — convert into a boxed reader adapter
-//! - [`WriteStreamClient::into_quic`] — convert into a `quic::WriteStream`
-//! - [`WriteStreamClient::into_boxed_quic`] — convert into a boxed writer adapter
 
 mod authority;
 mod connect;
@@ -73,9 +69,5 @@ pub use self::{
         ListenClient, ListenError, ListenReqReceiver, ListenServer, ListenServerRefMut,
         ListenServerSharedMut, RemoteListener,
     },
-    stream::{
-        ReadStreamClient, ReadStreamReqReceiver, ReadStreamServer, ReadStreamServerRefMut,
-        ReadStreamServerSharedMut, WriteStreamClient, WriteStreamReqReceiver, WriteStreamServer,
-        WriteStreamServerRefMut, WriteStreamServerSharedMut,
-    },
+    stream::{ReadFrameChannels, WriteFrameChannels},
 };
