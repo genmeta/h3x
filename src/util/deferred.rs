@@ -598,11 +598,12 @@ where
     OpenFuture: Future<Output = Result<InnerStream, Error>>,
 {
     fn is_terminated(&self) -> bool {
-        if self.pending_stop.is_some() {
-            return false;
-        }
         match &self.inner {
             Deferred::Pending { .. } => false,
+            Deferred::Ready {
+                resolved: Resolved::Error { .. },
+            } => true,
+            Deferred::Ready { .. } if self.pending_stop.is_some() => false,
             Deferred::Ready { resolved } => resolved.is_terminated(),
         }
     }
@@ -1452,6 +1453,22 @@ mod tests {
             *events.lock().expect("event log poisoned"),
             vec![DeferredStreamEvent::Stop(stop_code)]
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_stream_reader_is_terminated_after_pending_stop_open_error() {
+        let stop_code = varint(103);
+        let error_code = varint(104);
+        let mut reader = Box::pin(DeferredStreamReader::from(ready(
+            Err::<RecordingReader, _>(quic::StreamError::Reset { code: error_code }),
+        )));
+
+        let error = poll_fn(|cx| reader.as_mut().poll_stop(cx, stop_code))
+            .await
+            .expect_err("stop should report opener error");
+
+        assert_reset(error, error_code);
+        assert!(reader.is_terminated());
     }
 
     #[tokio::test]
