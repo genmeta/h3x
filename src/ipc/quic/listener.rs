@@ -145,17 +145,23 @@ where
         let (server_mux, client_fd) =
             MuxChannel::create_pair().map_err(|e| ipc_listen_error(e, "create mux pair"))?;
 
+        // Split the server MuxChannel before FD delivery so all fallible local
+        // setup is complete before the worker can observe the FD.
+        let (sink, stream) = match server_mux.split() {
+            Ok(split) => split,
+            Err(error) => {
+                close_undelivered_connection(connection.as_ref(), "split");
+                return Err(ipc_listen_error(error, "split mux"));
+            }
+        };
+
         if let Err(error) = delivery.deliver(smallvec![client_fd]).await {
             close_undelivered_connection(connection.as_ref(), "deliver");
             return Err(ipc_listen_error(error, "deliver fd"));
         }
 
-        // Split the server MuxChannel — the remoc handshake + bootstrap are
-        // spawned as a background task after the FD delivery has been queued.
-        let (sink, stream) = server_mux
-            .split()
-            .map_err(|e| ipc_listen_error(e, "split mux"))?;
-
+        // The remoc handshake + bootstrap are spawned as a background task
+        // after the FD delivery has been queued.
         self.spawn_task(Self::setup_connection(connection, sink, stream));
 
         Ok(fd_id)
