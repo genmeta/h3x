@@ -489,7 +489,7 @@ mod tests {
     use bytes::Bytes;
     use dhttp_identity::identity::SignError;
     use futures::{SinkExt, StreamExt, channel::oneshot};
-    use rustls::{SignatureAlgorithm, SignatureScheme, pki_types::CertificateDer};
+    use rustls::pki_types::CertificateDer;
 
     use super::*;
     use crate::{
@@ -509,19 +509,8 @@ mod tests {
         fn cert_chain(&self) -> &[CertificateDer<'static>] {
             &[]
         }
-
-        fn sign_algorithm(&self) -> SignatureAlgorithm {
-            SignatureAlgorithm::ECDSA
-        }
-
-        fn sign(
-            &self,
-            scheme: SignatureScheme,
-            _data: &[u8],
-        ) -> futures::future::BoxFuture<'_, Result<Vec<u8>, SignError>> {
-            Box::pin(std::future::ready(Err(SignError::UnsupportedScheme {
-                scheme,
-            })))
+        fn sign(&self, _data: &[u8]) -> futures::future::BoxFuture<'_, Result<Vec<u8>, SignError>> {
+            Box::pin(std::future::ready(Err(SignError::UnsupportedKey)))
         }
     }
 
@@ -891,17 +880,11 @@ mod tests {
         let local = TestLocalAuthority;
         assert_eq!(local.name(), "test.local");
         assert!(local.cert_chain().is_empty());
-        assert_eq!(local.sign_algorithm(), SignatureAlgorithm::ECDSA);
         let sign_error = local
-            .sign(SignatureScheme::ED25519, b"payload")
+            .sign(b"payload")
             .await
-            .expect_err("unsupported scheme should fail");
-        assert!(matches!(
-            sign_error,
-            SignError::UnsupportedScheme {
-                scheme: SignatureScheme::ED25519,
-            }
-        ));
+            .expect_err("unsupported key should fail");
+        assert!(matches!(sign_error, SignError::UnsupportedKey));
 
         let remote = TestRemoteAuthority;
         assert_eq!(remote.name(), "test.remote");

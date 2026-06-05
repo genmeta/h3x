@@ -378,14 +378,8 @@ impl dhttp_identity::identity::LocalAuthority for NoAuthority {
     fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
         &[]
     }
-
-    fn sign_algorithm(&self) -> rustls::SignatureAlgorithm {
-        rustls::SignatureAlgorithm::ED25519
-    }
-
     fn sign(
         &self,
-        _scheme: rustls::SignatureScheme,
         _data: &[u8],
     ) -> futures::future::BoxFuture<'_, Result<Vec<u8>, dhttp_identity::identity::SignError>> {
         Box::pin(async { Ok(Vec::new()) })
@@ -714,19 +708,11 @@ async fn direct_connection_agent_listener_and_connector_helpers_cover_errors() {
     );
     assert!(dhttp_identity::identity::LocalAuthority::cert_chain(&authority).is_empty());
     assert!(dhttp_identity::identity::RemoteAuthority::cert_chain(&authority).is_empty());
-    assert_eq!(
-        dhttp_identity::identity::LocalAuthority::sign_algorithm(&authority),
-        rustls::SignatureAlgorithm::ED25519
-    );
     assert!(
-        dhttp_identity::identity::LocalAuthority::sign(
-            &authority,
-            rustls::SignatureScheme::ED25519,
-            b"payload",
-        )
-        .await
-        .expect("no-authority signing should succeed")
-        .is_empty()
+        dhttp_identity::identity::LocalAuthority::sign(&authority, b"payload",)
+            .await
+            .expect("no-authority signing should succeed")
+            .is_empty()
     );
 
     let (tx, rx) = mpsc::channel(1);

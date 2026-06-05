@@ -370,7 +370,7 @@ mod tests {
     use dhttp_identity::identity::{self as authority, SignError};
     use futures::{Sink, SinkExt, Stream, StreamExt, future::BoxFuture};
     use remoc::prelude::ServerShared;
-    use rustls::{SignatureScheme, pki_types::CertificateDer};
+    use rustls::pki_types::CertificateDer;
     use tokio_util::task::AbortOnDropHandle;
 
     use super::*;
@@ -407,17 +407,8 @@ mod tests {
         fn cert_chain(&self) -> &[CertificateDer<'static>] {
             &self.cert_chain
         }
-
-        fn sign_algorithm(&self) -> rustls::SignatureAlgorithm {
-            rustls::SignatureAlgorithm::ECDSA
-        }
-
-        fn sign(
-            &self,
-            scheme: SignatureScheme,
-            data: &[u8],
-        ) -> BoxFuture<'_, Result<Vec<u8>, SignError>> {
-            let signature = expected_signature(scheme, data);
+        fn sign(&self, data: &[u8]) -> BoxFuture<'_, Result<Vec<u8>, SignError>> {
+            let signature = expected_signature(data);
             Box::pin(std::future::ready(Ok(signature)))
         }
     }
@@ -849,8 +840,8 @@ mod tests {
         assert_reason(source, expected);
     }
 
-    fn expected_signature(scheme: SignatureScheme, data: &[u8]) -> Vec<u8> {
-        let mut signature = u16::from(scheme).to_be_bytes().to_vec();
+    fn expected_signature(data: &[u8]) -> Vec<u8> {
+        let mut signature = b"canonical:".to_vec();
         signature.extend_from_slice(data);
         signature
     }
@@ -956,15 +947,10 @@ mod tests {
             authority::LocalAuthority::cert_chain(&local_authority).len(),
             1
         );
-        assert_eq!(
-            authority::LocalAuthority::sign_algorithm(&local_authority),
-            rustls::SignatureAlgorithm::ECDSA,
-        );
-        let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
-        let signature = authority::LocalAuthority::sign(&local_authority, scheme, b"payload")
+        let signature = authority::LocalAuthority::sign(&local_authority, b"payload")
             .await
             .expect("local authority sign");
-        assert_eq!(signature, expected_signature(scheme, b"payload"));
+        assert_eq!(signature, expected_signature(b"payload"));
 
         let remote_authority = quic::WithRemoteAuthority::remote_authority(&remote)
             .await

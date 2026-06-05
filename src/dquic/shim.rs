@@ -9,7 +9,7 @@ use bytes::Bytes;
 use dashmap::{DashMap, mapref::entry::Entry};
 use dhttp_identity::identity::{self as authority, SignError};
 use futures::{Sink, Stream, future::BoxFuture};
-use rustls::{SignatureScheme, pki_types::CertificateDer, sign::CertifiedKey};
+use rustls::{pki_types::CertificateDer, sign::CertifiedKey};
 
 use crate::{error::Code, quic, quic::ResetStream, varint::VarInt};
 
@@ -346,17 +346,8 @@ impl authority::LocalAuthority for DquicLocalAuthority {
     fn cert_chain(&self) -> &[CertificateDer<'static>] {
         self.certified_key.cert.as_slice()
     }
-
-    fn sign_algorithm(&self) -> rustls::SignatureAlgorithm {
-        self.certified_key.key.algorithm()
-    }
-
-    fn sign(
-        &self,
-        scheme: SignatureScheme,
-        data: &[u8],
-    ) -> BoxFuture<'_, Result<Vec<u8>, SignError>> {
-        let result = authority::sign_with_key(self.certified_key.key.as_ref(), scheme, data);
+    fn sign(&self, data: &[u8]) -> BoxFuture<'_, Result<Vec<u8>, SignError>> {
+        let result = authority::sign_with_key(self.certified_key.key.as_ref(), data);
         Box::pin(std::future::ready(result))
     }
 }
@@ -990,48 +981,21 @@ mod tests {
             authority::LocalAuthority::cert_chain(&local),
             identity.cert_chain()
         );
-        assert_eq!(
-            authority::LocalAuthority::sign_algorithm(&local),
-            rustls::SignatureAlgorithm::ECDSA
-        );
         assert!(format!("{local:?}").contains("DquicLocalAuthority"));
 
-        let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
-        let signature = authority::LocalAuthority::sign(&local, scheme, b"payload")
+        let signature = authority::LocalAuthority::sign(&local, b"payload")
             .await
             .expect("signature");
         assert!(
-            authority::LocalAuthority::verify(&local, scheme, b"payload", &signature)
+            authority::LocalAuthority::verify(&local, b"payload", &signature)
                 .await
                 .expect("verification should run")
         );
         assert!(
-            !authority::LocalAuthority::verify(&local, scheme, b"wrong payload", &signature)
+            !authority::LocalAuthority::verify(&local, b"wrong payload", &signature)
                 .await
                 .expect("verification should run")
         );
-    }
-
-    #[tokio::test]
-    async fn dquic_local_authority_reports_unsupported_sign_scheme() {
-        let identity = make_identity();
-        let certified_key =
-            crate::dquic::identity::build_certified_key(&identity).expect("test key should load");
-        let local = DquicLocalAuthority {
-            name: Arc::from(identity.name.as_str()),
-            certified_key,
-        };
-
-        let error =
-            authority::LocalAuthority::sign(&local, SignatureScheme::RSA_PKCS1_SHA256, b"payload")
-                .await
-                .expect_err("rsa should not be supported by an ecdsa key");
-        assert!(matches!(
-            error,
-            SignError::UnsupportedScheme {
-                scheme: SignatureScheme::RSA_PKCS1_SHA256
-            }
-        ));
     }
 
     #[tokio::test]
@@ -1059,17 +1023,16 @@ mod tests {
         );
         assert!(format!("{remote:?}").contains("DquicRemoteAuthority"));
 
-        let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
-        let signature = authority::LocalAuthority::sign(&local, scheme, b"payload")
+        let signature = authority::LocalAuthority::sign(&local, b"payload")
             .await
             .expect("signature");
         assert!(
-            authority::RemoteAuthority::verify(&remote, scheme, b"payload", &signature)
+            authority::RemoteAuthority::verify(&remote, b"payload", &signature)
                 .await
                 .expect("verification should run")
         );
         assert!(
-            !authority::RemoteAuthority::verify(&remote, scheme, b"wrong payload", &signature)
+            !authority::RemoteAuthority::verify(&remote, b"wrong payload", &signature)
                 .await
                 .expect("verification should run")
         );

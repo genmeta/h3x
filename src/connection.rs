@@ -740,16 +740,7 @@ pub(crate) mod tests {
         fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
             &[]
         }
-
-        fn sign_algorithm(&self) -> rustls::SignatureAlgorithm {
-            rustls::SignatureAlgorithm::ED25519
-        }
-
-        fn sign(
-            &self,
-            _scheme: rustls::SignatureScheme,
-            _data: &[u8],
-        ) -> BoxFuture<'_, Result<Vec<u8>, authority::SignError>> {
+        fn sign(&self, _data: &[u8]) -> BoxFuture<'_, Result<Vec<u8>, authority::SignError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }

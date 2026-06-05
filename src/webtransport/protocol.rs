@@ -1257,11 +1257,7 @@ mod tests {
         assert_eq!(authority::LocalAuthority::name(&local), "test-local");
         assert!(authority::LocalAuthority::cert_chain(&local).is_empty());
         assert_eq!(
-            authority::LocalAuthority::sign_algorithm(&local),
-            rustls::SignatureAlgorithm::ED25519
-        );
-        assert_eq!(
-            authority::LocalAuthority::sign(&local, rustls::SignatureScheme::ED25519, b"payload")
+            authority::LocalAuthority::sign(&local, b"payload")
                 .await
                 .expect("test local authority signing should succeed"),
             Vec::<u8>::new()
@@ -1420,14 +1416,8 @@ mod tests {
         fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
             &[]
         }
-
-        fn sign_algorithm(&self) -> rustls::SignatureAlgorithm {
-            rustls::SignatureAlgorithm::ED25519
-        }
-
         fn sign(
             &self,
-            _scheme: rustls::SignatureScheme,
             _data: &[u8],
         ) -> futures::future::BoxFuture<'_, Result<Vec<u8>, authority::SignError>> {
             Box::pin(async { Ok(Vec::new()) })

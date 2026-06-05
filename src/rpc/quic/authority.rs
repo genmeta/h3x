@@ -1,37 +1,25 @@
 use dhttp_identity::identity::{self as authority, SignError, VerifyError};
 use futures::future::BoxFuture;
-use rustls::{
-    SignatureScheme,
-    pki_types::{CertificateDer, SubjectPublicKeyInfoDer},
-};
+use rustls::pki_types::{CertificateDer, SubjectPublicKeyInfoDer};
 
-use super::serde_types::{
-    SerdeCertificateDer, SerdeSignatureAlgorithm, SerdeSignatureScheme,
-    SerdeSubjectPublicKeyInfoDer,
-};
+use super::serde_types::{SerdeCertificateDer, SerdeSubjectPublicKeyInfoDer};
 use crate::quic;
 
-/// Remote trait for [`authority::LocalAuthority`], exposing all 6 methods over remoc RTC.
+/// Remote trait for [`authority::LocalAuthority`], exposing authority methods over remoc RTC.
 #[remoc::rtc::remote]
 pub trait LocalAuthority: Send + Sync {
     async fn name(&self) -> Result<String, quic::ConnectionError>;
     async fn cert_chain(&self) -> Result<Vec<SerdeCertificateDer>, quic::ConnectionError>;
-    async fn sign_algorithm(&self) -> Result<SerdeSignatureAlgorithm, quic::ConnectionError>;
-    async fn sign(
-        &self,
-        scheme: SerdeSignatureScheme,
-        data: Vec<u8>,
-    ) -> Result<Vec<u8>, quic::ConnectionError>;
+    async fn sign(&self, data: Vec<u8>) -> Result<Vec<u8>, quic::ConnectionError>;
     async fn public_key(&self) -> Result<SerdeSubjectPublicKeyInfoDer, quic::ConnectionError>;
     async fn verify(
         &self,
-        scheme: SerdeSignatureScheme,
         data: Vec<u8>,
         signature: Vec<u8>,
     ) -> Result<bool, quic::ConnectionError>;
 }
 
-/// Remote trait for [`authority::RemoteAuthority`], exposing all 4 methods over remoc RTC.
+/// Remote trait for [`authority::RemoteAuthority`], exposing authority methods over remoc RTC.
 #[remoc::rtc::remote]
 pub trait RemoteAuthority: Send + Sync {
     async fn name(&self) -> Result<String, quic::ConnectionError>;
@@ -39,7 +27,6 @@ pub trait RemoteAuthority: Send + Sync {
     async fn public_key(&self) -> Result<SerdeSubjectPublicKeyInfoDer, quic::ConnectionError>;
     async fn verify(
         &self,
-        scheme: SerdeSignatureScheme,
         data: Vec<u8>,
         signature: Vec<u8>,
     ) -> Result<bool, quic::ConnectionError>;
@@ -49,14 +36,12 @@ pub struct CachedLocalAuthority {
     client: LocalAuthorityClient,
     name: String,
     cert_chain: Vec<CertificateDer<'static>>,
-    sign_algorithm: rustls::SignatureAlgorithm,
 }
 
 impl std::fmt::Debug for CachedLocalAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedRemoteLocalAuthority")
             .field("name", &self.name)
-            .field("sign_algorithm", &self.sign_algorithm)
             .finish_non_exhaustive()
     }
 }
@@ -72,12 +57,10 @@ impl CachedLocalAuthority {
             .into_iter()
             .map(Into::into)
             .collect();
-        let sign_algorithm: rustls::SignatureAlgorithm = client.sign_algorithm().await?.into();
         Ok(Self {
             client,
             name,
             cert_chain,
-            sign_algorithm,
         })
     }
 }
@@ -91,21 +74,12 @@ impl authority::LocalAuthority for CachedLocalAuthority {
         &self.cert_chain
     }
 
-    fn sign_algorithm(&self) -> rustls::SignatureAlgorithm {
-        self.sign_algorithm
-    }
-
-    fn sign(
-        &self,
-        scheme: SignatureScheme,
-        data: &[u8],
-    ) -> BoxFuture<'_, Result<Vec<u8>, SignError>> {
-        let serde_scheme = SerdeSignatureScheme::from(scheme);
+    fn sign(&self, data: &[u8]) -> BoxFuture<'_, Result<Vec<u8>, SignError>> {
         let owned_data = data.to_vec();
         let client = self.client.clone();
         Box::pin(async move {
             client
-                .sign(serde_scheme, owned_data)
+                .sign(owned_data)
                 .await
                 // lossy: rustls API requires String for General error variant
                 .map_err(|e| SignError::Crypto {
@@ -118,15 +92,9 @@ impl authority::LocalAuthority for CachedLocalAuthority {
         authority::extract_public_key(authority::LocalAuthority::cert_chain(self))
     }
 
-    fn verify(
-        &self,
-        scheme: SignatureScheme,
-        data: &[u8],
-        signature: &[u8],
-    ) -> BoxFuture<'_, Result<bool, VerifyError>> {
+    fn verify(&self, data: &[u8], signature: &[u8]) -> BoxFuture<'_, Result<bool, VerifyError>> {
         let result = authority::verify_signature(
             authority::LocalAuthority::public_key(self),
-            scheme,
             data,
             signature,
         );
@@ -181,15 +149,9 @@ impl authority::RemoteAuthority for CachedRemoteAuthority {
         authority::extract_public_key(authority::RemoteAuthority::cert_chain(self))
     }
 
-    fn verify(
-        &self,
-        scheme: SignatureScheme,
-        data: &[u8],
-        signature: &[u8],
-    ) -> BoxFuture<'_, Result<bool, VerifyError>> {
+    fn verify(&self, data: &[u8], signature: &[u8]) -> BoxFuture<'_, Result<bool, VerifyError>> {
         let result = authority::verify_signature(
             authority::RemoteAuthority::public_key(self),
-            scheme,
             data,
             signature,
         );
@@ -214,18 +176,8 @@ where
             .collect())
     }
 
-    async fn sign_algorithm(&self) -> Result<SerdeSignatureAlgorithm, quic::ConnectionError> {
-        Ok(SerdeSignatureAlgorithm::from(
-            authority::LocalAuthority::sign_algorithm(self),
-        ))
-    }
-
-    async fn sign(
-        &self,
-        scheme: SerdeSignatureScheme,
-        data: Vec<u8>,
-    ) -> Result<Vec<u8>, quic::ConnectionError> {
-        authority::LocalAuthority::sign(self, SignatureScheme::from(scheme), &data)
+    async fn sign(&self, data: Vec<u8>) -> Result<Vec<u8>, quic::ConnectionError> {
+        authority::LocalAuthority::sign(self, &data)
             .await
             // lossy: TransportError.reason is a protocol string field
             .map_err(|e| quic::ConnectionError::Transport {
@@ -245,11 +197,10 @@ where
 
     async fn verify(
         &self,
-        scheme: SerdeSignatureScheme,
         data: Vec<u8>,
         signature: Vec<u8>,
     ) -> Result<bool, quic::ConnectionError> {
-        authority::LocalAuthority::verify(self, SignatureScheme::from(scheme), &data, &signature)
+        authority::LocalAuthority::verify(self, &data, &signature)
             .await
             // lossy: TransportError.reason is a protocol string field
             .map_err(|e| quic::ConnectionError::Transport {
@@ -287,11 +238,10 @@ where
 
     async fn verify(
         &self,
-        scheme: SerdeSignatureScheme,
         data: Vec<u8>,
         signature: Vec<u8>,
     ) -> Result<bool, quic::ConnectionError> {
-        authority::RemoteAuthority::verify(self, SignatureScheme::from(scheme), &data, &signature)
+        authority::RemoteAuthority::verify(self, &data, &signature)
             .await
             // lossy: TransportError.reason is a protocol string field
             .map_err(|e| quic::ConnectionError::Transport {
@@ -339,6 +289,14 @@ mod tests {
                 ..Self::new("failing-local")
             }
         }
+
+        fn invalid_cert_chain(name: &'static str) -> Self {
+            Self {
+                name,
+                cert_chain: vec![CertificateDer::from(vec![0x01, 0x02, 0x03])],
+                fail_sign: false,
+            }
+        }
     }
 
     impl authority::LocalAuthority for TestLocalAuthority {
@@ -350,22 +308,14 @@ mod tests {
             &self.cert_chain
         }
 
-        fn sign_algorithm(&self) -> rustls::SignatureAlgorithm {
-            rustls::SignatureAlgorithm::ECDSA
-        }
-
-        fn sign(
-            &self,
-            scheme: SignatureScheme,
-            data: &[u8],
-        ) -> BoxFuture<'_, Result<Vec<u8>, SignError>> {
+        fn sign(&self, data: &[u8]) -> BoxFuture<'_, Result<Vec<u8>, SignError>> {
             let fail_sign = self.fail_sign;
             let data = data.to_vec();
             Box::pin(async move {
                 if fail_sign {
-                    return Err(SignError::UnsupportedScheme { scheme });
+                    return Err(SignError::UnsupportedKey);
                 }
-                Ok(expected_signature(scheme, &data))
+                Ok(expected_signature(&data))
             })
         }
     }
@@ -383,6 +333,13 @@ mod tests {
                 cert_chain: SERVER_CERT.to_certificate(),
             }
         }
+
+        fn invalid_cert_chain(name: &'static str) -> Self {
+            Self {
+                name,
+                cert_chain: vec![CertificateDer::from(vec![0x04, 0x05, 0x06])],
+            }
+        }
     }
 
     impl authority::RemoteAuthority for TestRemoteAuthority {
@@ -395,8 +352,8 @@ mod tests {
         }
     }
 
-    fn expected_signature(scheme: SignatureScheme, data: &[u8]) -> Vec<u8> {
-        let mut signature = u16::from(scheme).to_be_bytes().to_vec();
+    fn expected_signature(data: &[u8]) -> Vec<u8> {
+        let mut signature = b"canonical:".to_vec();
         signature.extend_from_slice(data);
         signature
     }
@@ -441,7 +398,6 @@ mod tests {
     #[tokio::test]
     async fn blanket_local_authority_delegates_all_methods() {
         let authority = TestLocalAuthority::new("local.example");
-        let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
 
         assert_eq!(
             super::LocalAuthority::name(&authority).await.expect("name"),
@@ -452,23 +408,11 @@ mod tests {
             .expect("cert chain");
         let cert = CertificateDer::from(certs.into_iter().next().expect("certificate"));
         assert_eq!(cert.as_ref(), authority.cert_chain[0].as_ref());
-        assert_eq!(
-            rustls::SignatureAlgorithm::from(
-                super::LocalAuthority::sign_algorithm(&authority)
-                    .await
-                    .expect("sign algorithm"),
-            ),
-            rustls::SignatureAlgorithm::ECDSA,
-        );
 
-        let signature = super::LocalAuthority::sign(
-            &authority,
-            SerdeSignatureScheme::from(scheme),
-            b"payload".to_vec(),
-        )
-        .await
-        .expect("sign");
-        assert_eq!(signature, expected_signature(scheme, b"payload"));
+        let signature = super::LocalAuthority::sign(&authority, b"payload".to_vec())
+            .await
+            .expect("sign");
+        assert_eq!(signature, expected_signature(b"payload"));
 
         let public_key = SubjectPublicKeyInfoDer::from(
             super::LocalAuthority::public_key(&authority)
@@ -482,7 +426,6 @@ mod tests {
 
         let verified = super::LocalAuthority::verify(
             &authority,
-            SerdeSignatureScheme::from(scheme),
             b"payload".to_vec(),
             b"not a real signature".to_vec(),
         )
@@ -494,7 +437,6 @@ mod tests {
     #[tokio::test]
     async fn blanket_remote_authority_delegates_all_methods() {
         let authority = TestRemoteAuthority::new("remote.example");
-        let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
 
         assert_eq!(
             super::RemoteAuthority::name(&authority)
@@ -520,7 +462,6 @@ mod tests {
 
         let verified = super::RemoteAuthority::verify(
             &authority,
-            SerdeSignatureScheme::from(scheme),
             b"payload".to_vec(),
             b"not a real signature".to_vec(),
         )
@@ -532,17 +473,16 @@ mod tests {
     #[tokio::test]
     async fn blanket_authority_errors_become_transport_errors() {
         let local = TestLocalAuthority::failing_signer();
-        let remote = TestRemoteAuthority::new("remote.example");
-        let unsupported = SerdeSignatureScheme::from(SignatureScheme::from(0xffff));
+        let local_with_invalid_key = TestLocalAuthority::invalid_cert_chain("invalid-local");
+        let remote_with_invalid_key = TestRemoteAuthority::invalid_cert_chain("invalid-remote");
 
-        let error = super::LocalAuthority::sign(&local, unsupported, b"payload".to_vec())
+        let error = super::LocalAuthority::sign(&local, b"payload".to_vec())
             .await
             .expect_err("sign error should be mapped");
         assert_transport_reason(error, "sign error");
 
         let error = super::LocalAuthority::verify(
-            &local,
-            unsupported,
+            &local_with_invalid_key,
             b"payload".to_vec(),
             b"signature".to_vec(),
         )
@@ -551,8 +491,7 @@ mod tests {
         assert_transport_reason(error, "verify error");
 
         let error = super::RemoteAuthority::verify(
-            &remote,
-            unsupported,
+            &remote_with_invalid_key,
             b"payload".to_vec(),
             b"signature".to_vec(),
         )
@@ -575,20 +514,15 @@ mod tests {
             authority::LocalAuthority::cert_chain(&cached)[0].as_ref(),
             authority.cert_chain[0].as_ref(),
         );
-        assert_eq!(
-            authority::LocalAuthority::sign_algorithm(&cached),
-            rustls::SignatureAlgorithm::ECDSA,
-        );
         assert!(
             format!("{cached:?}").contains("CachedRemoteLocalAuthority"),
             "debug output should name cached local authority",
         );
 
-        let scheme = SignatureScheme::ECDSA_NISTP256_SHA256;
-        let signature = authority::LocalAuthority::sign(&cached, scheme, b"payload")
+        let signature = authority::LocalAuthority::sign(&cached, b"payload")
             .await
             .expect("cached sign");
-        assert_eq!(signature, expected_signature(scheme, b"payload"));
+        assert_eq!(signature, expected_signature(b"payload"));
 
         let public_key = authority::LocalAuthority::public_key(&cached);
         assert_eq!(
@@ -596,7 +530,7 @@ mod tests {
             authority::LocalAuthority::public_key(&authority).as_ref()
         );
         let verified =
-            authority::LocalAuthority::verify(&cached, scheme, b"payload", b"not a real signature")
+            authority::LocalAuthority::verify(&cached, b"payload", b"not a real signature")
                 .await
                 .expect("cached verify");
         assert!(!verified);
@@ -626,14 +560,10 @@ mod tests {
             public_key.as_ref(),
             authority::RemoteAuthority::public_key(&authority).as_ref(),
         );
-        let verified = authority::RemoteAuthority::verify(
-            &cached,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            b"payload",
-            b"not a real signature",
-        )
-        .await
-        .expect("cached verify");
+        let verified =
+            authority::RemoteAuthority::verify(&cached, b"payload", b"not a real signature")
+                .await
+                .expect("cached verify");
         assert!(!verified);
     }
 }
