@@ -7,6 +7,7 @@
 pub(crate) mod drain;
 pub(crate) mod error;
 pub(crate) mod frame;
+pub(crate) mod hypervisor;
 pub(crate) mod io;
 pub(crate) mod reader;
 pub(crate) mod writer;
