@@ -1,63 +1,68 @@
-//! Minimal framing codec for per-stream Unix socketpair IPC.
+//! Direction-aware stream frame codecs for per-stream Unix socketpair IPC.
 //!
 //! Each QUIC stream is carried over an independent `SOCK_STREAM` socketpair.
-//! The codec multiplexes data and control signals on the same byte stream using
-//! a simple tag-length-value encoding based on QUIC variable-length integers.
-//!
-//! # Frame types
-//!
-//! ```text
-//! PULL        = type(varint 0x00)
-//! PUSH        = type(varint 0x01) + length(varint) + payload
-//! STOP        = type(varint 0x02) + code(varint)
-//! CANCEL      = type(varint 0x03) + code(varint)
-//! CONN_CLOSED = type(varint 0x04)
-//! ```
+//! The wire format is a simple QUIC-varint tag followed by optional varint
+//! length/code fields and payload bytes. The frame vocabulary is shared with
+//! `rpc::stream::frame`; this module only adapts that vocabulary to
+//! `tokio_util::codec` for IPC pipes.
+
+use std::borrow::Cow;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use snafu::ResultExt as _;
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::varint::VarInt;
+use crate::{
+    quic,
+    rpc::stream::frame::{self, ReadCommand, ReadEvent, WriteCommand, WriteEvent},
+    varint::{self, VarInt},
+};
 
-/// Frame type tags.
-pub(super) const TAG_PULL: u8 = 0x00;
-const TAG_PUSH: u8 = 0x01;
-pub(super) const TAG_STOP: u8 = 0x02;
-pub(super) const TAG_CANCEL: u8 = 0x03;
-pub(super) const TAG_CONN_CLOSED: u8 = 0x04;
+const TAG_PULL: u8 = frame::TAG_PULL as u8;
+const TAG_PUSH: u8 = frame::TAG_PUSH as u8;
+const TAG_FLUSH: u8 = frame::TAG_FLUSH as u8;
+const TAG_FLUSH_ACK: u8 = frame::TAG_FLUSH_ACK as u8;
+const TAG_EOS: u8 = frame::TAG_EOS as u8;
+const TAG_EOS_ACK: u8 = frame::TAG_EOS_ACK as u8;
+const TAG_STOP: u8 = frame::TAG_STOP as u8;
+const TAG_STOP_ACK: u8 = frame::TAG_STOP_ACK as u8;
+const TAG_RESET: u8 = frame::TAG_RESET as u8;
+const TAG_RESET_ACK: u8 = frame::TAG_RESET_ACK as u8;
+const TAG_ERR_RESET: u8 = frame::TAG_ERR_RESET as u8;
+const TAG_ERR_CONN: u8 = frame::TAG_ERR_CONN as u8;
+
+const IPC_CODEC_ERROR_KIND: VarInt = VarInt::from_u32(0x0b);
+const IPC_CODEC_ERROR_FRAME_TYPE: VarInt = VarInt::from_u32(0x00);
 
 /// Maximum encoded header bytes for a PUSH frame: tag + varint length.
 pub(super) const PUSH_HEADER_MAX_LEN: usize = 1 + VarInt::MAX_SIZE;
 
-/// Maximum encoded bytes for a control frame: tag + varint code.
-pub(super) const CONTROL_MAX_LEN: usize = 1 + VarInt::MAX_SIZE;
-
-/// Frames exchanged over a per-stream socketpair.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Frame {
-    /// Flow-control signal — reader grants the writer permission to send one
-    /// PUSH frame.
-    Pull,
-    /// Stream data payload.
-    Push(Bytes),
-    /// STOP_SENDING — reader asks the remote writer to stop (carries error code).
-    Stop(VarInt),
-    /// RESET_STREAM — writer cancels the stream (carries error code).
-    Cancel(VarInt),
-    /// Connection-level closure notification.
-    ConnClosed,
-}
-
 /// Codec error.
 #[derive(Debug, snafu::Snafu)]
 #[snafu(module)]
-pub(super) enum CodecError {
+pub(crate) enum CodecError {
     #[snafu(transparent)]
     Io { source: std::io::Error },
-    #[snafu(display("unknown frame tag: 0x{tag:02x}"))]
+    #[snafu(display("unknown frame tag 0x{tag:02x}"))]
     UnknownTag { tag: u8 },
-    #[snafu(display("varint overflow"))]
-    VarIntOverflow,
+    #[snafu(display("frame tag 0x{tag:02x} is invalid for {direction}"))]
+    InvalidDirection { tag: u8, direction: &'static str },
+    #[snafu(display("failed to encode push payload length"))]
+    EncodePushLength { source: varint::err::Overflow },
+}
+
+impl From<CodecError> for quic::ConnectionError {
+    fn from(error: CodecError) -> Self {
+        quic::ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: IPC_CODEC_ERROR_KIND,
+                frame_type: IPC_CODEC_ERROR_FRAME_TYPE,
+                // Lossy: QUIC transport error reason is a protocol string field
+                // for local IPC codec failures.
+                reason: Cow::Owned(error.to_string()),
+            },
+        }
+    }
 }
 
 /// Try to decode one QUIC-style varint from `buf` without advancing it.
@@ -117,18 +122,15 @@ pub(super) fn encode_varint_to_slice(dst: &mut [u8], v: VarInt) -> usize {
 pub(super) fn encode_push_header(
     payload_len: usize,
 ) -> Result<([u8; PUSH_HEADER_MAX_LEN], usize), CodecError> {
-    let len = VarInt::try_from(payload_len).map_err(|_| CodecError::VarIntOverflow)?;
+    let len = VarInt::try_from(payload_len).context(codec_error::EncodePushLengthSnafu)?;
     let mut header = [0u8; PUSH_HEADER_MAX_LEN];
     header[0] = TAG_PUSH;
     let varint_size = encode_varint_to_slice(&mut header[1..], len);
     Ok((header, 1 + varint_size))
 }
 
-/// Minimal framing codec for the per-stream IPC protocol.
 #[derive(Debug, Default)]
-pub(super) struct StreamCodec {
-    /// Partially decoded frame state: once we know the tag and payload length
-    /// we store them here so we don't re-parse on the next `decode` call.
+struct WireCodec {
     state: DecodeState,
 }
 
@@ -136,48 +138,71 @@ pub(super) struct StreamCodec {
 enum DecodeState {
     #[default]
     Tag,
-    /// We have the tag and the payload length, waiting for payload bytes.
-    Push { len: usize },
-    /// Control frame (STOP/CANCEL): tag decoded, need varint code.
-    Control { tag: u8 },
+    Push {
+        len: usize,
+    },
+    Control {
+        tag: u8,
+    },
 }
 
-impl StreamCodec {
-    pub fn new() -> Self {
-        Self::default()
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WireFrame {
+    Pull,
+    Push { data: Bytes },
+    Flush,
+    FlushAck,
+    Eos,
+    EosAck,
+    Stop { code: VarInt },
+    StopAck { code: VarInt },
+    Reset { code: VarInt },
+    ResetAck { code: VarInt },
+    ErrReset { code: VarInt },
+    ErrConn,
+}
+
+impl WireFrame {
+    const fn tag(&self) -> u8 {
+        match self {
+            Self::Pull => TAG_PULL,
+            Self::Push { .. } => TAG_PUSH,
+            Self::Flush => TAG_FLUSH,
+            Self::FlushAck => TAG_FLUSH_ACK,
+            Self::Eos => TAG_EOS,
+            Self::EosAck => TAG_EOS_ACK,
+            Self::Stop { .. } => TAG_STOP,
+            Self::StopAck { .. } => TAG_STOP_ACK,
+            Self::Reset { .. } => TAG_RESET,
+            Self::ResetAck { .. } => TAG_RESET_ACK,
+            Self::ErrReset { .. } => TAG_ERR_RESET,
+            Self::ErrConn => TAG_ERR_CONN,
+        }
     }
 }
 
-impl Decoder for StreamCodec {
-    type Item = Frame;
-    type Error = CodecError;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Frame>, CodecError> {
+impl WireCodec {
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<WireFrame>, CodecError> {
         loop {
             match self.state {
                 DecodeState::Tag => {
                     if src.is_empty() {
                         return Ok(None);
                     }
-                    // Peek at the tag byte (first byte is always a 1-byte varint for 0x00..0x04).
                     let tag = src[0];
                     match tag {
                         TAG_PUSH => {
-                            // Need tag + varint length. Try to decode the length varint
-                            // starting right after the tag byte.
                             if src.len() < 2 {
                                 return Ok(None);
                             }
                             let after_tag = &src[1..];
                             let Some((len_vi, vi_size)) = try_decode_varint(after_tag) else {
-                                // Not enough bytes for the varint yet.
                                 return Ok(None);
                             };
                             let len = len_vi.into_inner() as usize;
                             let header_size = 1 + vi_size;
                             let total = header_size + len;
                             if src.len() < total {
-                                // Consume the header so DecodeState::Push only waits for payload.
                                 src.advance(header_size);
                                 src.reserve(len.saturating_sub(src.len()));
                                 self.state = DecodeState::Push { len };
@@ -185,33 +210,47 @@ impl Decoder for StreamCodec {
                             }
                             src.advance(header_size);
                             let data = src.split_to(len).freeze();
-                            // state stays Tag for next frame
-                            return Ok(Some(Frame::Push(data)));
+                            return Ok(Some(WireFrame::Push { data }));
+                        }
+                        TAG_STOP | TAG_STOP_ACK | TAG_RESET | TAG_RESET_ACK | TAG_ERR_RESET => {
+                            self.state = DecodeState::Control { tag };
+                            src.advance(1);
                         }
                         TAG_PULL => {
                             src.advance(1);
-                            return Ok(Some(Frame::Pull));
+                            return Ok(Some(WireFrame::Pull));
                         }
-                        TAG_STOP | TAG_CANCEL => {
-                            self.state = DecodeState::Control { tag };
-                            src.advance(1); // consume the tag byte
-                        }
-                        TAG_CONN_CLOSED => {
+                        TAG_FLUSH => {
                             src.advance(1);
-                            return Ok(Some(Frame::ConnClosed));
+                            return Ok(Some(WireFrame::Flush));
+                        }
+                        TAG_FLUSH_ACK => {
+                            src.advance(1);
+                            return Ok(Some(WireFrame::FlushAck));
+                        }
+                        TAG_EOS => {
+                            src.advance(1);
+                            return Ok(Some(WireFrame::Eos));
+                        }
+                        TAG_EOS_ACK => {
+                            src.advance(1);
+                            return Ok(Some(WireFrame::EosAck));
+                        }
+                        TAG_ERR_CONN => {
+                            src.advance(1);
+                            return Ok(Some(WireFrame::ErrConn));
                         }
                         _ => return Err(CodecError::UnknownTag { tag }),
                     }
                 }
                 DecodeState::Push { len } => {
-                    // We already consumed the header; just wait for the payload.
                     if src.len() < len {
                         src.reserve(len - src.len());
                         return Ok(None);
                     }
                     let data = src.split_to(len).freeze();
                     self.state = DecodeState::Tag;
-                    return Ok(Some(Frame::Push(data)));
+                    return Ok(Some(WireFrame::Push { data }));
                 }
                 DecodeState::Control { tag } => {
                     let Some((code, vi_size)) = try_decode_varint(src) else {
@@ -220,47 +259,239 @@ impl Decoder for StreamCodec {
                     src.advance(vi_size);
                     self.state = DecodeState::Tag;
                     return Ok(Some(match tag {
-                        TAG_STOP => Frame::Stop(code),
-                        TAG_CANCEL => Frame::Cancel(code),
-                        _ => unreachable!(),
+                        TAG_STOP => WireFrame::Stop { code },
+                        TAG_STOP_ACK => WireFrame::StopAck { code },
+                        TAG_RESET => WireFrame::Reset { code },
+                        TAG_RESET_ACK => WireFrame::ResetAck { code },
+                        TAG_ERR_RESET => WireFrame::ErrReset { code },
+                        _ => unreachable!("control state only records control tags"),
                     }));
                 }
             }
         }
     }
-}
 
-impl Encoder<Frame> for StreamCodec {
-    type Error = CodecError;
-
-    fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), CodecError> {
+    fn encode(&mut self, item: WireFrame, dst: &mut BytesMut) -> Result<(), CodecError> {
         match item {
-            Frame::Pull => {
-                dst.reserve(1);
-                dst.put_u8(TAG_PULL);
-            }
-            Frame::Push(data) => {
+            WireFrame::Pull => dst.put_u8(TAG_PULL),
+            WireFrame::Push { data } => {
                 let (header, header_len) = encode_push_header(data.len())?;
                 dst.reserve(header_len + data.len());
                 dst.extend_from_slice(&header[..header_len]);
                 dst.extend_from_slice(&data);
             }
-            Frame::Stop(code) => {
-                dst.reserve(1 + code.encoding_size());
-                dst.put_u8(TAG_STOP);
-                encode_varint(dst, code);
-            }
-            Frame::Cancel(code) => {
-                dst.reserve(1 + code.encoding_size());
-                dst.put_u8(TAG_CANCEL);
-                encode_varint(dst, code);
-            }
-            Frame::ConnClosed => {
-                dst.reserve(1);
-                dst.put_u8(TAG_CONN_CLOSED);
-            }
+            WireFrame::Flush => dst.put_u8(TAG_FLUSH),
+            WireFrame::FlushAck => dst.put_u8(TAG_FLUSH_ACK),
+            WireFrame::Eos => dst.put_u8(TAG_EOS),
+            WireFrame::EosAck => dst.put_u8(TAG_EOS_ACK),
+            WireFrame::Stop { code } => encode_control(dst, TAG_STOP, code),
+            WireFrame::StopAck { code } => encode_control(dst, TAG_STOP_ACK, code),
+            WireFrame::Reset { code } => encode_control(dst, TAG_RESET, code),
+            WireFrame::ResetAck { code } => encode_control(dst, TAG_RESET_ACK, code),
+            WireFrame::ErrReset { code } => encode_control(dst, TAG_ERR_RESET, code),
+            WireFrame::ErrConn => dst.put_u8(TAG_ERR_CONN),
         }
         Ok(())
+    }
+}
+
+fn encode_control(dst: &mut BytesMut, tag: u8, code: VarInt) {
+    dst.reserve(1 + code.encoding_size());
+    dst.put_u8(tag);
+    encode_varint(dst, code);
+}
+
+fn wrong_direction(tag: u8, direction: &'static str) -> CodecError {
+    CodecError::InvalidDirection { tag, direction }
+}
+
+/// Codec for worker-to-hypervisor read commands.
+#[derive(Debug, Default)]
+pub(super) struct ReadCommandCodec {
+    wire: WireCodec,
+}
+
+impl ReadCommandCodec {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Decoder for ReadCommandCodec {
+    type Item = ReadCommand;
+    type Error = CodecError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let Some(frame) = self.wire.decode(src)? else {
+            return Ok(None);
+        };
+        let tag = frame.tag();
+        match frame {
+            WireFrame::Pull => Ok(Some(ReadCommand::Pull)),
+            WireFrame::Stop { code } => Ok(Some(ReadCommand::Stop { code })),
+            _ => Err(wrong_direction(tag, "read command")),
+        }
+    }
+}
+
+impl Encoder<ReadCommand> for ReadCommandCodec {
+    type Error = CodecError;
+
+    fn encode(&mut self, item: ReadCommand, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        self.wire.encode(
+            match item {
+                ReadCommand::Pull => WireFrame::Pull,
+                ReadCommand::Stop { code } => WireFrame::Stop { code },
+            },
+            dst,
+        )
+    }
+}
+
+/// Codec for hypervisor-to-worker read events.
+#[derive(Debug, Default)]
+pub(super) struct ReadEventCodec {
+    wire: WireCodec,
+}
+
+impl ReadEventCodec {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Decoder for ReadEventCodec {
+    type Item = ReadEvent;
+    type Error = CodecError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let Some(frame) = self.wire.decode(src)? else {
+            return Ok(None);
+        };
+        let tag = frame.tag();
+        match frame {
+            WireFrame::Push { data } => Ok(Some(ReadEvent::Push { data })),
+            WireFrame::Eos => Ok(Some(ReadEvent::Eos)),
+            WireFrame::StopAck { code } => Ok(Some(ReadEvent::StopAck { code })),
+            WireFrame::ErrReset { code } => Ok(Some(ReadEvent::ErrReset { code })),
+            WireFrame::ErrConn => Ok(Some(ReadEvent::ErrConn)),
+            _ => Err(wrong_direction(tag, "read event")),
+        }
+    }
+}
+
+impl Encoder<ReadEvent> for ReadEventCodec {
+    type Error = CodecError;
+
+    fn encode(&mut self, item: ReadEvent, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        self.wire.encode(
+            match item {
+                ReadEvent::Push { data } => WireFrame::Push { data },
+                ReadEvent::Eos => WireFrame::Eos,
+                ReadEvent::StopAck { code } => WireFrame::StopAck { code },
+                ReadEvent::ErrReset { code } => WireFrame::ErrReset { code },
+                ReadEvent::ErrConn => WireFrame::ErrConn,
+            },
+            dst,
+        )
+    }
+}
+
+/// Codec for worker-to-hypervisor write commands.
+#[derive(Debug, Default)]
+pub(super) struct WriteCommandCodec {
+    wire: WireCodec,
+}
+
+impl WriteCommandCodec {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Decoder for WriteCommandCodec {
+    type Item = WriteCommand;
+    type Error = CodecError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let Some(frame) = self.wire.decode(src)? else {
+            return Ok(None);
+        };
+        let tag = frame.tag();
+        match frame {
+            WireFrame::Push { data } => Ok(Some(WriteCommand::Push { data })),
+            WireFrame::Flush => Ok(Some(WriteCommand::Flush)),
+            WireFrame::Eos => Ok(Some(WriteCommand::Eos)),
+            WireFrame::Reset { code } => Ok(Some(WriteCommand::Reset { code })),
+            _ => Err(wrong_direction(tag, "write command")),
+        }
+    }
+}
+
+impl Encoder<WriteCommand> for WriteCommandCodec {
+    type Error = CodecError;
+
+    fn encode(&mut self, item: WriteCommand, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        self.wire.encode(
+            match item {
+                WriteCommand::Push { data } => WireFrame::Push { data },
+                WriteCommand::Flush => WireFrame::Flush,
+                WriteCommand::Eos => WireFrame::Eos,
+                WriteCommand::Reset { code } => WireFrame::Reset { code },
+            },
+            dst,
+        )
+    }
+}
+
+/// Codec for hypervisor-to-worker write events.
+#[derive(Debug, Default)]
+pub(super) struct WriteEventCodec {
+    wire: WireCodec,
+}
+
+impl WriteEventCodec {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Decoder for WriteEventCodec {
+    type Item = WriteEvent;
+    type Error = CodecError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let Some(frame) = self.wire.decode(src)? else {
+            return Ok(None);
+        };
+        let tag = frame.tag();
+        match frame {
+            WireFrame::Pull => Ok(Some(WriteEvent::Pull)),
+            WireFrame::FlushAck => Ok(Some(WriteEvent::FlushAck)),
+            WireFrame::EosAck => Ok(Some(WriteEvent::EosAck)),
+            WireFrame::ResetAck { code } => Ok(Some(WriteEvent::ResetAck { code })),
+            WireFrame::ErrReset { code } => Ok(Some(WriteEvent::ErrReset { code })),
+            WireFrame::ErrConn => Ok(Some(WriteEvent::ErrConn)),
+            _ => Err(wrong_direction(tag, "write event")),
+        }
+    }
+}
+
+impl Encoder<WriteEvent> for WriteEventCodec {
+    type Error = CodecError;
+
+    fn encode(&mut self, item: WriteEvent, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        self.wire.encode(
+            match item {
+                WriteEvent::Pull => WireFrame::Pull,
+                WriteEvent::FlushAck => WireFrame::FlushAck,
+                WriteEvent::EosAck => WireFrame::EosAck,
+                WriteEvent::ResetAck { code } => WireFrame::ResetAck { code },
+                WriteEvent::ErrReset { code } => WireFrame::ErrReset { code },
+                WriteEvent::ErrConn => WireFrame::ErrConn,
+            },
+            dst,
+        )
     }
 }
 
@@ -268,106 +499,177 @@ impl Encoder<Frame> for StreamCodec {
 mod tests {
     use super::*;
 
-    fn round_trip(frame: Frame) {
-        let mut codec = StreamCodec::new();
+    fn encode<C, F>(codec: &mut C, frame: F) -> BytesMut
+    where
+        C: Encoder<F, Error = CodecError>,
+    {
         let mut buf = BytesMut::new();
-        codec.encode(frame.clone(), &mut buf).unwrap();
+        codec.encode(frame, &mut buf).unwrap();
+        buf
+    }
 
-        let mut decoder = StreamCodec::new();
-        let decoded = decoder.decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded, frame);
-        assert!(buf.is_empty());
+    fn decode<C>(codec: &mut C, mut buf: BytesMut) -> Result<C::Item, CodecError>
+    where
+        C: Decoder<Error = CodecError>,
+    {
+        codec.decode(&mut buf).map(|item| item.unwrap())
+    }
+
+    fn assert_direction_error(error: CodecError, tag: u8, direction: &'static str) {
+        match error {
+            CodecError::InvalidDirection {
+                tag: actual,
+                direction: actual_direction,
+            } => {
+                assert_eq!(actual, tag);
+                assert_eq!(actual_direction, direction);
+            }
+            other => panic!("expected invalid direction error, got {other:?}"),
+        }
     }
 
     #[test]
-    fn data_frame_round_trip() {
-        round_trip(Frame::Push(Bytes::from_static(b"hello world")));
+    fn read_command_codec_accepts_pull_and_stop() {
+        let code = VarInt::from_u32(0x42);
+        let mut encoder = ReadCommandCodec::new();
+        let mut decoder = ReadCommandCodec::new();
+
+        let pull = encode(&mut encoder, ReadCommand::Pull);
+        assert_eq!(decode(&mut decoder, pull).unwrap(), ReadCommand::Pull);
+
+        let stop = encode(&mut encoder, ReadCommand::Stop { code });
+        assert_eq!(
+            decode(&mut decoder, stop).unwrap(),
+            ReadCommand::Stop { code }
+        );
     }
 
     #[test]
-    fn empty_data_frame_round_trip() {
-        round_trip(Frame::Push(Bytes::new()));
-    }
-
-    #[test]
-    fn pull_frame_round_trip() {
-        round_trip(Frame::Pull);
-    }
-
-    #[test]
-    fn stop_frame_round_trip() {
-        round_trip(Frame::Stop(VarInt::from_u32(0x42)));
-    }
-
-    #[test]
-    fn cancel_frame_round_trip() {
-        round_trip(Frame::Cancel(VarInt::from_u32(0)));
-    }
-
-    #[test]
-    fn conn_closed_round_trip() {
-        round_trip(Frame::ConnClosed);
-    }
-
-    #[test]
-    fn large_data_frame() {
-        let data = Bytes::from(vec![0xab; 70_000]);
-        round_trip(Frame::Push(data));
-    }
-
-    #[test]
-    fn multiple_frames_in_sequence() {
-        let mut codec = StreamCodec::new();
-        let mut buf = BytesMut::new();
-
-        let frames = vec![
-            Frame::Pull,
-            Frame::Push(Bytes::from_static(b"first")),
-            Frame::Stop(VarInt::from_u32(1)),
-            Frame::Push(Bytes::from_static(b"second")),
-            Frame::Cancel(VarInt::from_u32(2)),
-            Frame::ConnClosed,
+    fn read_event_codec_accepts_read_events() {
+        let stop = VarInt::from_u32(0x43);
+        let reset = VarInt::from_u32(0x44);
+        let frames = [
+            ReadEvent::Push {
+                data: Bytes::from_static(b"read"),
+            },
+            ReadEvent::Eos,
+            ReadEvent::StopAck { code: stop },
+            ReadEvent::ErrReset { code: reset },
+            ReadEvent::ErrConn,
         ];
+        let mut encoder = ReadEventCodec::new();
+        let mut decoder = ReadEventCodec::new();
 
-        for f in &frames {
-            codec.encode(f.clone(), &mut buf).unwrap();
+        for frame in frames {
+            let encoded = encode(&mut encoder, frame.clone());
+            assert_eq!(decode(&mut decoder, encoded).unwrap(), frame);
         }
-
-        let mut decoder = StreamCodec::new();
-        for expected in &frames {
-            let decoded = decoder.decode(&mut buf).unwrap().unwrap();
-            assert_eq!(&decoded, expected);
-        }
-        assert!(buf.is_empty());
     }
 
     #[test]
-    fn incremental_decode() {
-        let mut codec = StreamCodec::new();
-        let mut buf = BytesMut::new();
-        codec
-            .encode(Frame::Push(Bytes::from_static(b"abc")), &mut buf)
-            .unwrap();
+    fn write_command_codec_accepts_write_commands() {
+        let reset = VarInt::from_u32(0x45);
+        let frames = [
+            WriteCommand::Push {
+                data: Bytes::from_static(b"write"),
+            },
+            WriteCommand::Flush,
+            WriteCommand::Eos,
+            WriteCommand::Reset { code: reset },
+        ];
+        let mut encoder = WriteCommandCodec::new();
+        let mut decoder = WriteCommandCodec::new();
 
+        for frame in frames {
+            let encoded = encode(&mut encoder, frame.clone());
+            assert_eq!(decode(&mut decoder, encoded).unwrap(), frame);
+        }
+    }
+
+    #[test]
+    fn write_event_codec_accepts_write_events() {
+        let reset = VarInt::from_u32(0x46);
+        let err_reset = VarInt::from_u32(0x47);
+        let frames = [
+            WriteEvent::Pull,
+            WriteEvent::FlushAck,
+            WriteEvent::EosAck,
+            WriteEvent::ResetAck { code: reset },
+            WriteEvent::ErrReset { code: err_reset },
+            WriteEvent::ErrConn,
+        ];
+        let mut encoder = WriteEventCodec::new();
+        let mut decoder = WriteEventCodec::new();
+
+        for frame in frames {
+            let encoded = encode(&mut encoder, frame.clone());
+            assert_eq!(decode(&mut decoder, encoded).unwrap(), frame);
+        }
+    }
+
+    #[test]
+    fn tag_valid_in_wrong_direction_returns_direction_error() {
+        let mut read_command_encoder = ReadCommandCodec::new();
+        let mut read_command_decoder = ReadCommandCodec::new();
+        let wrong = encode(&mut read_command_encoder, ReadCommand::Pull);
+        assert_direction_error(
+            decode(&mut ReadEventCodec::new(), wrong.clone()).unwrap_err(),
+            TAG_PULL,
+            "read event",
+        );
+        assert_direction_error(
+            decode(&mut WriteCommandCodec::new(), wrong.clone()).unwrap_err(),
+            TAG_PULL,
+            "write command",
+        );
+
+        let mut write_command_encoder = WriteCommandCodec::new();
+        let wrong = encode(&mut write_command_encoder, WriteCommand::Flush);
+        assert_direction_error(
+            decode(&mut read_command_decoder, wrong.clone()).unwrap_err(),
+            TAG_FLUSH,
+            "read command",
+        );
+        assert_direction_error(
+            decode(&mut WriteEventCodec::new(), wrong).unwrap_err(),
+            TAG_FLUSH,
+            "write event",
+        );
+    }
+
+    #[test]
+    fn unknown_tag_error() {
+        let mut decoder = ReadCommandCodec::new();
+        let mut buf = BytesMut::from(&[0xff][..]);
+        match decoder.decode(&mut buf).unwrap_err() {
+            CodecError::UnknownTag { tag } => assert_eq!(tag, 0xff),
+            other => panic!("expected unknown tag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incremental_push_decode() {
+        let payload = Bytes::from_static(b"abc");
+        let mut codec = ReadEventCodec::new();
+        let mut buf = encode(
+            &mut codec,
+            ReadEvent::Push {
+                data: payload.clone(),
+            },
+        );
         let full = buf.split();
 
-        // Feed one byte at a time.
-        let mut decoder = StreamCodec::new();
+        let mut decoder = ReadEventCodec::new();
         let mut partial = BytesMut::new();
         for i in 0..full.len() - 1 {
             partial.extend_from_slice(&full[i..i + 1]);
             assert!(decoder.decode(&mut partial).unwrap().is_none());
         }
         partial.extend_from_slice(&full[full.len() - 1..]);
-        let decoded = decoder.decode(&mut partial).unwrap().unwrap();
-        assert_eq!(decoded, Frame::Push(Bytes::from_static(b"abc")));
-    }
-
-    #[test]
-    fn unknown_tag_error() {
-        let mut decoder = StreamCodec::new();
-        let mut buf = BytesMut::from(&[0xff][..]);
-        assert!(decoder.decode(&mut buf).is_err());
+        assert_eq!(
+            decoder.decode(&mut partial).unwrap(),
+            Some(ReadEvent::Push { data: payload })
+        );
     }
 
     #[test]
@@ -385,11 +687,13 @@ mod tests {
     #[test]
     fn data_header_matches_frame_prefix() {
         let payload = Bytes::from(vec![0x5a; 1024]);
-        let mut codec = StreamCodec::new();
-        let mut encoded = BytesMut::new();
-        codec
-            .encode(Frame::Push(payload.clone()), &mut encoded)
-            .unwrap();
+        let mut codec = WriteCommandCodec::new();
+        let encoded = encode(
+            &mut codec,
+            WriteCommand::Push {
+                data: payload.clone(),
+            },
+        );
 
         let (header, header_len) = encode_push_header(payload.len()).unwrap();
         assert_eq!(&encoded[..header_len], &header[..header_len]);

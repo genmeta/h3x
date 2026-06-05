@@ -191,13 +191,6 @@ where
     E: 'static,
     quic::ConnectionError: From<E>,
 {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "writer construction is wired into bridge assembly by a follow-up task"
-        )
-    )]
     pub(crate) fn new(stream_id: VarInt, bridge: Io, lifecycle: Arc<L>) -> Self {
         Self::Active {
             active: Box::pin(ActiveBridgeStreamWriter {

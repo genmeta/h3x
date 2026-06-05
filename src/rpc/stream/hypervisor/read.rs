@@ -1,11 +1,3 @@
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "read hypervisor bridge is wired into ipc and rpc adapters by follow-up tasks"
-    )
-)]
-
 use std::{collections::VecDeque, error::Error};
 
 use futures::{SinkExt as _, StreamExt as _};

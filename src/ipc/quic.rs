@@ -24,24 +24,19 @@
 //! - [`IpcConnector`] — wraps [`IpcConnectClient`], implements `quic::Connect`
 //! - [`IpcListener`] — wraps [`IpcListenClient`], implements `quic::Listen`
 //!
-//! ## Stream types (IPC read/write stream backed by Unix socketpairs)
-//!
-//! - [`IpcReadStream`] — implements `quic::ReadStream`
-//! - [`IpcWriteStream`] — implements `quic::WriteStream`
-//!
 //! ## Bootstrap
 //!
 //! - [`ConnectionBootstrap`] — one-shot value sent when a connection is established
 //!
 //! ## Bridge helpers
 //!
-//! - [`bridge_reader`] — forward QUIC ReadStream → IpcWriteStream
-//! - [`bridge_writer`] — forward IpcReadStream → QUIC WriteStream
+//! - [`bridge_reader`] — run a QUIC read stream through IPC read frame IO
+//! - [`bridge_writer`] — run IPC write frame IO into a QUIC write stream
 
 pub(crate) mod connection;
 pub(crate) mod connector;
 pub(crate) mod listener;
-mod stream;
+pub(crate) mod stream;
 
 #[cfg(test)]
 mod test_utils;
@@ -60,5 +55,4 @@ pub use self::{
         IpcListenClient, IpcListenError, IpcListenReqReceiver, IpcListenServer,
         IpcListenServerSharedMut, IpcListener, ListenAdapter,
     },
-    stream::{IpcReadStream, IpcWriteStream},
 };

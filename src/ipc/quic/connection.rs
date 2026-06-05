@@ -14,8 +14,8 @@
 //! 1. Opens a real QUIC stream pair via the inner connection.
 //! 2. Creates 2 Unix socketpairs (one per direction).
 //! 3. Delivers the client-side FDs through the connection [`FdTransfer`].
-//! 4. Spawns bridge tasks that forward data between the real QUIC
-//!    streams and local [`IpcWriteStream`] / [`IpcReadStream`] endpoints.
+//! 4. Spawns bridge tasks that execute typed stream-frame IPC against the real
+//!    QUIC streams.
 //! 5. Returns the stream ID over RPC.
 //!
 //! # Client side
@@ -24,7 +24,7 @@
 //! [`quic::Connection`].  Each `open_bi` call:
 //! 1. Reserves a receiver-chosen FD transfer ID.
 //! 2. Calls the RPC method with that ID while concurrently receiving the FDs.
-//! 3. Wraps them as [`IpcReadStream`] / [`IpcWriteStream`].
+//! 3. Wraps them as boxed QUIC stream handles backed by typed IPC frame IO.
 //!
 //! # Bootstrap
 //!
@@ -39,7 +39,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use futures::{SinkExt, StreamExt};
 use remoc::prelude::ServerShared;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
@@ -51,12 +50,16 @@ use crate::{
     error::Code,
     ipc::{
         error::{IpcAcceptError, IpcOpenError, IpcPlumbingError},
-        quic::stream::{IpcBiHandle, IpcReadStream, IpcUniHandle, IpcWriteStream},
+        quic::stream::{
+            IpcBiHandle, IpcUniHandle,
+            reader::{self as ipc_reader, IpcReadHypervisorIo},
+            writer::{self as ipc_writer, IpcWriteHypervisorIo},
+        },
         transport::{FdDelivery, FdTransfer, ReceivedFds},
     },
     quic::{
-        self, ConnectionError, DynLifecycle, GetStreamIdExt, ManageStream, ReadStream, StreamError,
-        WriteStream,
+        self, BoxQuicStreamReader, BoxQuicStreamWriter, ConnectionError, GetStreamIdExt,
+        ManageStream, ReadStream, StreamError, WriteStream,
     },
     rpc::{
         lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt},
@@ -87,9 +90,8 @@ use crate::{
 /// # FD semantics
 ///
 /// - **`open_bi` / `accept_bi`**: 2 FDs are delivered (2 independent socketpairs).
-///   The first FD carries the reader-side pipe (server's IpcWriteStream ↔
-///   client's IpcReadStream), the second carries the writer-side pipe
-///   (server's IpcReadStream ↔ client's IpcWriteStream).
+///   The first FD carries read-side frame IO; the second carries write-side
+///   frame IO.
 ///
 /// - **`open_uni` / `accept_uni`**: 1 FD is delivered (a single socketpair).
 #[remoc::rtc::remote]
@@ -161,36 +163,30 @@ pub struct ConnectionBootstrap {
 // Bridge helpers: forward data between real QUIC streams and pipe socketpairs
 // ---------------------------------------------------------------------------
 
-/// Forward data from a QUIC [`ReadStream`] to a [`IpcWriteStream`] (server side).
+/// Execute a QUIC [`ReadStream`] through hypervisor-side IPC read frame IO.
 ///
-/// Reads chunks from the QUIC stream and sinks them into the pipe.
-/// Terminates when either side closes or errors.
-pub async fn bridge_reader(
-    mut quic_reader: impl ReadStream + Unpin,
-    mut pipe_writer: IpcWriteStream,
-) {
-    while let Some(Ok(chunk)) = quic_reader.next().await {
-        if pipe_writer.send(chunk).await.is_err() {
-            break;
-        }
-    }
-    let _ = pipe_writer.close().await;
+/// Worker pipe EOF is stream-handle abandonment on this side. Already received
+/// commands are drained by the shared hypervisor bridge; no EOF-derived QUIC
+/// control is synthesized.
+pub async fn bridge_reader(quic_reader: impl ReadStream + Unpin, pipe: UnixStream) {
+    crate::rpc::stream::hypervisor::read::run_read_bridge(
+        quic_reader,
+        IpcReadHypervisorIo::new(pipe),
+    )
+    .await;
 }
 
-/// Forward data from a [`IpcReadStream`] to a QUIC [`WriteStream`] (server side).
+/// Execute hypervisor-side IPC write frame IO against a QUIC [`WriteStream`].
 ///
-/// Reads chunks from the pipe and sinks them into the QUIC stream.
-/// Terminates when either side closes or errors.
-pub async fn bridge_writer(
-    mut pipe_reader: IpcReadStream,
-    mut quic_writer: impl WriteStream + Unpin,
-) {
-    while let Some(Ok(chunk)) = pipe_reader.next().await {
-        if quic_writer.send(chunk).await.is_err() {
-            break;
-        }
-    }
-    let _ = quic_writer.close().await;
+/// Worker pipe EOF is stream-handle abandonment on this side. Already received
+/// commands are drained by the shared hypervisor bridge; no EOF-derived FIN or
+/// RESET_STREAM is synthesized.
+pub async fn bridge_writer(pipe: UnixStream, quic_writer: impl WriteStream + Unpin) {
+    crate::rpc::stream::hypervisor::write::run_write_bridge(
+        quic_writer,
+        IpcWriteHypervisorIo::new(pipe),
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +197,7 @@ pub async fn bridge_writer(
 /// [`IpcConnection`].
 ///
 /// The inner connection is shared via `Arc` so that:
-/// - Bridge tasks can reference it as `Arc<dyn DynLifecycle>`.
+/// - Bridge tasks execute stream-frame IPC against concrete QUIC streams.
 /// - The [`FdTransfer`] delivers client-side FDs for each new stream.
 pub struct ConnectionAdapter<M> {
     inner: Arc<M>,
@@ -373,11 +369,9 @@ where
         writer: M::StreamWriter,
         stream_id: VarInt,
     ) -> Result<IpcBiHandle, IpcPlumbingError> {
-        let lifecycle: Arc<dyn DynLifecycle> = self.inner.clone();
-
-        // Socketpair for the reader direction: server IpcWriteStream ↔ client IpcReadStream
+        // Socketpair for the reader direction: server read hypervisor ↔ client read bridge
         let (srv_a, cli_a) = UnixStream::pair().map_err(|e| ipc_io_plumbing(e, "socketpair"))?;
-        // Socketpair for the writer direction: server IpcReadStream ↔ client IpcWriteStream
+        // Socketpair for the writer direction: server write hypervisor ↔ client write bridge
         let (srv_b, cli_b) = UnixStream::pair().map_err(|e| ipc_io_plumbing(e, "socketpair"))?;
 
         let cli_a_std = cli_a
@@ -392,13 +386,11 @@ where
             .await
             .map_err(|e| ipc_io_plumbing(e, "deliver fds"))?;
 
-        // Bridge reader direction: real QUIC reader → IpcWriteStream on srv_a
-        let pipe_w = IpcWriteStream::new(stream_id, srv_a, lifecycle.clone());
-        self.spawn_task(bridge_reader(reader, pipe_w));
+        // Bridge reader direction: real QUIC reader ↔ read frame IO on srv_a.
+        self.spawn_task(bridge_reader(reader, srv_a));
 
-        // Bridge writer direction: IpcReadStream on srv_b → real QUIC writer
-        let pipe_r = IpcReadStream::new(stream_id, srv_b, lifecycle);
-        self.spawn_task(bridge_writer(pipe_r, writer));
+        // Bridge writer direction: write frame IO on srv_b ↔ real QUIC writer.
+        self.spawn_task(bridge_writer(srv_b, writer));
 
         Ok(IpcBiHandle { stream_id })
     }
@@ -419,8 +411,6 @@ where
             Ok(id) => id,
             Err(stream_err) => return Ok(Resolved::err(stream_err)),
         };
-        let lifecycle: Arc<dyn DynLifecycle> = self.inner.clone();
-
         let (srv, cli) = UnixStream::pair().map_err(|e| ipc_io_plumbing(e, "socketpair"))?;
         let cli_std = cli.into_std().map_err(|e| ipc_io_plumbing(e, "into_std"))?;
         delivery
@@ -428,9 +418,8 @@ where
             .await
             .map_err(|e| ipc_io_plumbing(e, "deliver fds"))?;
 
-        // IpcReadStream on srv → real QUIC writer
-        let pipe_r = IpcReadStream::new(stream_id, srv, lifecycle);
-        self.spawn_task(bridge_writer(pipe_r, writer));
+        // Write frame IO on srv ↔ real QUIC writer.
+        self.spawn_task(bridge_writer(srv, writer));
 
         Ok(Resolved::ok(IpcUniHandle { stream_id }))
     }
@@ -451,8 +440,6 @@ where
             Ok(id) => id,
             Err(stream_err) => return Ok(Resolved::err(stream_err)),
         };
-        let lifecycle: Arc<dyn DynLifecycle> = self.inner.clone();
-
         let (srv, cli) = UnixStream::pair().map_err(|e| ipc_io_plumbing(e, "socketpair"))?;
         let cli_std = cli.into_std().map_err(|e| ipc_io_plumbing(e, "into_std"))?;
         delivery
@@ -460,9 +447,8 @@ where
             .await
             .map_err(|e| ipc_io_plumbing(e, "deliver fds"))?;
 
-        // Real QUIC reader → IpcWriteStream on srv
-        let pipe_w = IpcWriteStream::new(stream_id, srv, lifecycle);
-        self.spawn_task(bridge_reader(reader, pipe_w));
+        // Real QUIC reader ↔ read frame IO on srv.
+        self.spawn_task(bridge_reader(reader, srv));
 
         Ok(Resolved::ok(IpcUniHandle { stream_id }))
     }
@@ -489,7 +475,7 @@ pub struct IpcConnectionHandle {
 /// Owns the latch that enforces first-wins error semantics across every
 /// operation on the connection and its descendant streams.  Implements
 /// [`quic::Lifecycle`] so the shared `Arc<IpcLifecycle>` can be handed to
-/// [`IpcReadStream`] / [`IpcWriteStream`] as `Arc<dyn DynLifecycle>`.
+/// direct IPC stream-frame bridge handles.
 struct IpcLifecycle {
     connection: IpcConnectionClient,
     latch: ConnectionErrorLatch,
@@ -569,8 +555,8 @@ impl IpcConnectionHandle {
 }
 
 impl quic::ManageStream for IpcConnectionHandle {
-    type StreamReader = Resolved<IpcReadStream, StreamError>;
-    type StreamWriter = Resolved<IpcWriteStream, StreamError>;
+    type StreamReader = Resolved<BoxQuicStreamReader, StreamError>;
+    type StreamWriter = Resolved<BoxQuicStreamWriter, StreamError>;
 
     async fn open_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
         let (resolved, received) = self.open_bi_with_fds().await?;
@@ -724,67 +710,69 @@ impl IpcConnectionHandle {
         }
     }
 
-    /// Retrieve 2 FDs and construct a (IpcReadStream, IpcWriteStream) pair.
+    /// Retrieve 2 FDs and construct boxed IPC stream-frame bridge handles.
     async fn fds_to_bi(
         &self,
         handle: IpcBiHandle,
         received: ReceivedFds,
-    ) -> Result<(IpcReadStream, IpcWriteStream), ConnectionError> {
+    ) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), ConnectionError> {
         let IpcBiHandle { stream_id } = handle;
         self.lifecycle.guard_sync(|| {
             let (fd_a, fd_b) = received
                 .into_pair()
                 .map_err(|e| ipc_transport_error(e, "fd count"))?;
 
-            let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
+            let lifecycle = self.lifecycle.clone();
 
-            // fd_a → reader pipe (matches server's IpcWriteStream on srv_a)
+            // fd_a → reader pipe (matches server's read hypervisor on srv_a)
             let sock_a = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd_a))
                 .map_err(|e| ipc_io_error(e, "UnixStream::from_std"))?;
-            let reader = IpcReadStream::new(stream_id, sock_a, lifecycle.clone());
+            let reader = Box::pin(ipc_reader::reader(stream_id, sock_a, lifecycle.clone()))
+                as BoxQuicStreamReader;
 
-            // fd_b → writer pipe (matches server's IpcReadStream on srv_b)
+            // fd_b → writer pipe (matches server's write hypervisor on srv_b)
             let sock_b = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd_b))
                 .map_err(|e| ipc_io_error(e, "UnixStream::from_std"))?;
-            let writer = IpcWriteStream::new(stream_id, sock_b, lifecycle);
+            let writer =
+                Box::pin(ipc_writer::writer(stream_id, sock_b, lifecycle)) as BoxQuicStreamWriter;
 
             Ok((reader, writer))
         })
     }
 
-    /// Retrieve 1 FD and construct a IpcWriteStream (for open_uni).
+    /// Retrieve 1 FD and construct a boxed IPC write bridge (for open_uni).
     async fn fds_to_uni_writer(
         &self,
         handle: IpcUniHandle,
         received: ReceivedFds,
-    ) -> Result<IpcWriteStream, ConnectionError> {
+    ) -> Result<BoxQuicStreamWriter, ConnectionError> {
         let IpcUniHandle { stream_id } = handle;
         self.lifecycle.guard_sync(|| {
             let fd = received
                 .into_one()
                 .map_err(|e| ipc_transport_error(e, "fd count"))?;
-            let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
+            let lifecycle = self.lifecycle.clone();
             let sock = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd))
                 .map_err(|e| ipc_io_error(e, "UnixStream::from_std"))?;
-            Ok(IpcWriteStream::new(stream_id, sock, lifecycle))
+            Ok(Box::pin(ipc_writer::writer(stream_id, sock, lifecycle)) as BoxQuicStreamWriter)
         })
     }
 
-    /// Retrieve 1 FD and construct a IpcReadStream (for accept_uni).
+    /// Retrieve 1 FD and construct a boxed IPC read bridge (for accept_uni).
     async fn fds_to_uni_reader(
         &self,
         handle: IpcUniHandle,
         received: ReceivedFds,
-    ) -> Result<IpcReadStream, ConnectionError> {
+    ) -> Result<BoxQuicStreamReader, ConnectionError> {
         let IpcUniHandle { stream_id } = handle;
         self.lifecycle.guard_sync(|| {
             let fd = received
                 .into_one()
                 .map_err(|e| ipc_transport_error(e, "fd count"))?;
-            let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
+            let lifecycle = self.lifecycle.clone();
             let sock = UnixStream::from_std(std::os::unix::net::UnixStream::from(fd))
                 .map_err(|e| ipc_io_error(e, "UnixStream::from_std"))?;
-            Ok(IpcReadStream::new(stream_id, sock, lifecycle))
+            Ok(Box::pin(ipc_reader::reader(stream_id, sock, lifecycle)) as BoxQuicStreamReader)
         })
     }
 }

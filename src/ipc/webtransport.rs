@@ -28,11 +28,11 @@
 //!
 //! # FD semantics
 //!
-//! - **`open_bi` / `accept_bi`**: 2 FDs are delivered (reader pipe + writer pipe).
-//! - **`open_uni`**: 1 FD (writer pipe, server side reads from pipe and sends
+//! - **`open_bi` / `accept_bi`**: 2 FDs are delivered (read frame IO + write frame IO).
+//! - **`open_uni`**: 1 FD (write frame IO, server side applies worker commands
 //!   to the real WebTransport uni stream).
-//! - **`accept_uni`**: 1 FD (reader pipe, server side reads from the real
-//!   WebTransport uni stream and writes to pipe).
+//! - **`accept_uni`**: 1 FD (read frame IO, server side executes worker pulls
+//!   against the real WebTransport uni stream).
 
 use std::{
     future::Future,
@@ -55,8 +55,8 @@ pub use crate::rpc::webtransport::LifecycleExt;
 use crate::{
     ipc::{
         quic::{
-            IpcReadStream, IpcWriteStream,
             connection::{IPC_ERROR_KIND, IPC_FRAME_TYPE, bridge_reader, bridge_writer},
+            stream::{reader as ipc_reader, writer as ipc_writer},
         },
         transport::{FdDelivery, FdTransfer, ReceivedFds},
     },
@@ -259,13 +259,13 @@ pub struct WebTransportSessionBootstrap {
 /// Each stream-opening call:
 /// 1. Delegates to the inner session to get real boxed streams.
 /// 2. Creates Unix socketpairs.
-/// 3. Spawns bridge tasks forwarding data between real streams and pipes.
+/// 3. Spawns bridge tasks executing typed stream-frame IPC against real streams.
 /// 4. Delivers client-side FDs through [`FdTransfer`].
 /// 5. Returns the stream ID over RPC after FD delivery is acknowledged.
 pub struct WebTransportSessionAdapter {
     session: Arc<webtransport::WebTransportSession>,
     fd_transfer: FdTransfer,
-    lifecycle: Arc<dyn DynLifecycle>,
+    _lifecycle: Arc<dyn DynLifecycle>,
     tasks: Mutex<Vec<AbortOnDropHandle<()>>>,
 }
 
@@ -278,7 +278,7 @@ impl WebTransportSessionAdapter {
         Self {
             session,
             fd_transfer,
-            lifecycle,
+            _lifecycle: lifecycle,
             tasks: Mutex::new(Vec::new()),
         }
     }
@@ -346,8 +346,6 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
             .await
             .map_err(IpcPlumbingError::from)?;
 
-        let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
-
         let (srv, cli) = UnixStream::pair().map_err(|e| ipc_open_io(e, "socketpair"))?;
         let cli_std = cli.into_std().map_err(|e| ipc_open_io(e, "into_std"))?;
         delivery
@@ -355,9 +353,8 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
             .await
             .map_err(|e| ipc_open_io(e, "deliver fds"))?;
 
-        // IpcReadStream on srv → real WebTransport write stream
-        let pipe_r = IpcReadStream::new(stream_id, srv, lifecycle);
-        self.spawn_task(bridge_writer(pipe_r, writer));
+        // Write frame IO on srv ↔ real WebTransport write stream.
+        self.spawn_task(bridge_writer(srv, writer));
 
         Ok(stream_id)
     }
@@ -382,8 +379,6 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
             .await
             .map_err(IpcPlumbingError::from)?;
 
-        let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
-
         let (srv, cli) = UnixStream::pair().map_err(|e| ipc_accept_io(e, "socketpair"))?;
         let cli_std = cli.into_std().map_err(|e| ipc_accept_io(e, "into_std"))?;
         delivery
@@ -391,9 +386,8 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
             .await
             .map_err(|e| ipc_accept_io(e, "deliver fds"))?;
 
-        // Real WebTransport read stream → IpcWriteStream on srv
-        let pipe_w = IpcWriteStream::new(stream_id, srv, lifecycle);
-        self.spawn_task(bridge_reader(reader, pipe_w));
+        // Real WebTransport read stream ↔ read frame IO on srv.
+        self.spawn_task(bridge_reader(reader, srv));
 
         Ok(stream_id)
     }
@@ -408,8 +402,6 @@ impl WebTransportSessionAdapter {
         writer: BoxQuicStreamWriter,
         stream_id: VarInt,
     ) -> Result<VarInt, IpcWebTransportOpenError> {
-        let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
-
         let (srv_a, cli_a) = UnixStream::pair().map_err(|e| ipc_open_io(e, "socketpair"))?;
         let (srv_b, cli_b) = UnixStream::pair().map_err(|e| ipc_open_io(e, "socketpair"))?;
 
@@ -421,13 +413,11 @@ impl WebTransportSessionAdapter {
             .await
             .map_err(|e| ipc_open_io(e, "deliver fds"))?;
 
-        // Bridge reader direction: real WebTransport reader → IpcWriteStream on srv_a
-        let pipe_w = IpcWriteStream::new(stream_id, srv_a, lifecycle.clone());
-        self.spawn_task(bridge_reader(reader, pipe_w));
+        // Bridge reader direction: real WebTransport reader ↔ read frame IO on srv_a.
+        self.spawn_task(bridge_reader(reader, srv_a));
 
-        // Bridge writer direction: IpcReadStream on srv_b → real WebTransport writer
-        let pipe_r = IpcReadStream::new(stream_id, srv_b, lifecycle);
-        self.spawn_task(bridge_writer(pipe_r, writer));
+        // Bridge writer direction: write frame IO on srv_b ↔ real WebTransport writer.
+        self.spawn_task(bridge_writer(srv_b, writer));
 
         Ok(stream_id)
     }
@@ -440,8 +430,6 @@ impl WebTransportSessionAdapter {
         writer: BoxQuicStreamWriter,
         stream_id: VarInt,
     ) -> Result<VarInt, IpcWebTransportAcceptError> {
-        let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
-
         let (srv_a, cli_a) = UnixStream::pair().map_err(|e| ipc_accept_io(e, "socketpair"))?;
         let (srv_b, cli_b) = UnixStream::pair().map_err(|e| ipc_accept_io(e, "socketpair"))?;
 
@@ -453,11 +441,9 @@ impl WebTransportSessionAdapter {
             .await
             .map_err(|e| ipc_accept_io(e, "deliver fds"))?;
 
-        let pipe_w = IpcWriteStream::new(stream_id, srv_a, lifecycle.clone());
-        self.spawn_task(bridge_reader(reader, pipe_w));
+        self.spawn_task(bridge_reader(reader, srv_a));
 
-        let pipe_r = IpcReadStream::new(stream_id, srv_b, lifecycle);
-        self.spawn_task(bridge_writer(pipe_r, writer));
+        self.spawn_task(bridge_writer(srv_b, writer));
 
         Ok(stream_id)
     }
@@ -471,8 +457,7 @@ impl WebTransportSessionAdapter {
 ///
 /// Delegates to the parent connection's lifecycle while maintaining a local
 /// [`ConnectionErrorLatch`].  Implements [`quic::Lifecycle`] so it can be
-/// shared with [`IpcReadStream`] / [`IpcWriteStream`] as
-/// `Arc<dyn DynLifecycle>`.
+/// shared with direct IPC stream-frame bridge handles.
 struct IpcWebTransportLifecycle {
     parent: Arc<dyn DynLifecycle>,
     latch: ConnectionErrorLatch,
@@ -668,14 +653,14 @@ impl IpcWebTransportSessionHandle {
 }
 
 impl webtransport::Session for IpcWebTransportSessionHandle {
-    type StreamReader = IpcReadStream;
-    type StreamWriter = IpcWriteStream;
+    type StreamReader = BoxQuicStreamReader;
+    type StreamWriter = BoxQuicStreamWriter;
 
     fn id(&self) -> StreamId {
         self.session_id.into()
     }
 
-    async fn open_bi(&self) -> Result<(IpcReadStream, IpcWriteStream), OpenStreamError> {
+    async fn open_bi(&self) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), OpenStreamError> {
         let receiver = self.fd_transfer.receive();
         let fd_id = receiver.id();
         let (stream_id, received) =
@@ -687,7 +672,9 @@ impl webtransport::Session for IpcWebTransportSessionHandle {
         self.fds_to_bi(stream_id, received).await
     }
 
-    async fn accept_bi(&self) -> Result<(IpcReadStream, IpcWriteStream), AcceptStreamError> {
+    async fn accept_bi(
+        &self,
+    ) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), AcceptStreamError> {
         let receiver = self.fd_transfer.receive();
         let fd_id = receiver.id();
         let (stream_id, received) = self
@@ -699,7 +686,7 @@ impl webtransport::Session for IpcWebTransportSessionHandle {
         self.fds_to_bi_accept(stream_id, received).await
     }
 
-    async fn open_uni(&self) -> Result<IpcWriteStream, OpenStreamError> {
+    async fn open_uni(&self) -> Result<BoxQuicStreamWriter, OpenStreamError> {
         let receiver = self.fd_transfer.receive();
         let fd_id = receiver.id();
         let (stream_id, received) = self
@@ -711,7 +698,7 @@ impl webtransport::Session for IpcWebTransportSessionHandle {
         self.fds_to_uni_writer(stream_id, received).await
     }
 
-    async fn accept_uni(&self) -> Result<IpcReadStream, AcceptStreamError> {
+    async fn accept_uni(&self) -> Result<BoxQuicStreamReader, AcceptStreamError> {
         let receiver = self.fd_transfer.receive();
         let fd_id = receiver.id();
         let (stream_id, received) = self
@@ -725,23 +712,25 @@ impl webtransport::Session for IpcWebTransportSessionHandle {
 }
 
 impl IpcWebTransportSessionHandle {
-    /// Retrieve 2 FDs and construct a (IpcReadStream, IpcWriteStream) pair.
+    /// Retrieve 2 FDs and construct boxed IPC stream-frame bridge handles.
     async fn fds_to_bi(
         &self,
         stream_id: VarInt,
         received: ReceivedFds,
-    ) -> Result<(IpcReadStream, IpcWriteStream), OpenStreamError> {
+    ) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), OpenStreamError> {
         let (fd_a, fd_b) = received
             .into_pair()
             .map_err(|e| self.latch_open_transport(e, "fd count"))?;
 
-        let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
+        let lifecycle = self.lifecycle.clone();
 
         let sock_a = self.fd_to_open_unix_stream(fd_a)?;
-        let reader = IpcReadStream::new(stream_id, sock_a, lifecycle.clone());
+        let reader = Box::pin(ipc_reader::reader(stream_id, sock_a, lifecycle.clone()))
+            as BoxQuicStreamReader;
 
         let sock_b = self.fd_to_open_unix_stream(fd_b)?;
-        let writer = IpcWriteStream::new(stream_id, sock_b, lifecycle);
+        let writer =
+            Box::pin(ipc_writer::writer(stream_id, sock_b, lifecycle)) as BoxQuicStreamWriter;
 
         Ok((reader, writer))
     }
@@ -751,48 +740,50 @@ impl IpcWebTransportSessionHandle {
         &self,
         stream_id: VarInt,
         received: ReceivedFds,
-    ) -> Result<(IpcReadStream, IpcWriteStream), AcceptStreamError> {
+    ) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), AcceptStreamError> {
         let (fd_a, fd_b) = received
             .into_pair()
             .map_err(|e| self.latch_accept_transport(e, "fd count"))?;
 
-        let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
+        let lifecycle = self.lifecycle.clone();
 
         let sock_a = self.fd_to_accept_unix_stream(fd_a)?;
-        let reader = IpcReadStream::new(stream_id, sock_a, lifecycle.clone());
+        let reader = Box::pin(ipc_reader::reader(stream_id, sock_a, lifecycle.clone()))
+            as BoxQuicStreamReader;
 
         let sock_b = self.fd_to_accept_unix_stream(fd_b)?;
-        let writer = IpcWriteStream::new(stream_id, sock_b, lifecycle);
+        let writer =
+            Box::pin(ipc_writer::writer(stream_id, sock_b, lifecycle)) as BoxQuicStreamWriter;
 
         Ok((reader, writer))
     }
 
-    /// Retrieve 1 FD and construct a IpcWriteStream (for open_uni).
+    /// Retrieve 1 FD and construct a boxed IPC write bridge (for open_uni).
     async fn fds_to_uni_writer(
         &self,
         stream_id: VarInt,
         received: ReceivedFds,
-    ) -> Result<IpcWriteStream, OpenStreamError> {
+    ) -> Result<BoxQuicStreamWriter, OpenStreamError> {
         let fd = received
             .into_one()
             .map_err(|e| self.latch_open_transport(e, "fd count"))?;
-        let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
+        let lifecycle = self.lifecycle.clone();
         let sock = self.fd_to_open_unix_stream(fd)?;
-        Ok(IpcWriteStream::new(stream_id, sock, lifecycle))
+        Ok(Box::pin(ipc_writer::writer(stream_id, sock, lifecycle)) as BoxQuicStreamWriter)
     }
 
-    /// Retrieve 1 FD and construct a IpcReadStream (for accept_uni).
+    /// Retrieve 1 FD and construct a boxed IPC read bridge (for accept_uni).
     async fn fds_to_uni_reader(
         &self,
         stream_id: VarInt,
         received: ReceivedFds,
-    ) -> Result<IpcReadStream, AcceptStreamError> {
+    ) -> Result<BoxQuicStreamReader, AcceptStreamError> {
         let fd = received
             .into_one()
             .map_err(|e| self.latch_accept_transport(e, "fd count"))?;
-        let lifecycle: Arc<dyn DynLifecycle> = self.lifecycle.clone();
+        let lifecycle = self.lifecycle.clone();
         let sock = self.fd_to_accept_unix_stream(fd)?;
-        Ok(IpcReadStream::new(stream_id, sock, lifecycle))
+        Ok(Box::pin(ipc_reader::reader(stream_id, sock, lifecycle)) as BoxQuicStreamReader)
     }
 }
 

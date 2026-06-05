@@ -1,11 +1,6 @@
 mod codec;
 mod handle;
-mod reader;
-mod state;
-mod writer;
+pub(crate) mod reader;
+pub(crate) mod writer;
 
-pub use self::{
-    handle::{IpcBiHandle, IpcUniHandle},
-    reader::IpcReadStream,
-    writer::IpcWriteStream,
-};
+pub use self::handle::{IpcBiHandle, IpcUniHandle};
