@@ -7,6 +7,7 @@
 pub(crate) mod error;
 pub(crate) mod frame;
 pub(crate) mod io;
+pub(crate) mod reader;
 
 #[cfg(test)]
 pub(crate) mod test_io;
