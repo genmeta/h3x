@@ -27,9 +27,8 @@ fn owner_local_hyper_modules_are_public() {
 fn top_level_hyper_is_facade_without_client_or_server_modules() {
     let _request_error = std::any::TypeId::of::<h3x::hyper::RequestError<std::io::Error>>();
     let _send_error = std::any::TypeId::of::<h3x::hyper::SendMessageError<std::io::Error>>();
-    let _handle_error = std::any::TypeId::of::<
-        h3x::hyper::HandleRequestError<std::io::Error, std::io::Error>,
-    >();
+    let _handle_error =
+        std::any::TypeId::of::<h3x::hyper::HandleRequestError<std::io::Error, std::io::Error>>();
     let _tower = h3x::hyper::TowerService(());
     let _hyper = h3x::hyper::HyperService(());
     let _upgrade_error = h3x::hyper::upgrade::MissingStream::Both;
