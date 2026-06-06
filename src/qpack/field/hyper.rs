@@ -18,7 +18,9 @@ impl From<hyper::ext::Protocol> for FieldLine {
     }
 }
 
-pub fn header_map_to_field_lines(headers: http::HeaderMap) -> impl Iterator<Item = FieldLine> {
+pub(crate) fn header_map_to_field_lines(
+    headers: http::HeaderMap,
+) -> impl Iterator<Item = FieldLine> {
     headers
         .into_iter()
         .scan(None::<HeaderName>, |last_name, (name, value)| {
@@ -49,7 +51,7 @@ pub fn validated_hyper_request_parts_to_field_lines(
     Ok(section.iter().collect())
 }
 
-pub fn hyper_response_parts_to_field_lines(
+pub(crate) fn hyper_response_parts_to_field_lines(
     parts: http::response::Parts,
 ) -> impl Iterator<Item = FieldLine> {
     let pseudo_headers = [Some(FieldLine::from(parts.status))];
