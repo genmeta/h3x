@@ -30,9 +30,99 @@ impl SettingId for EnableWebTransport {
     }
 }
 
+/// `SETTINGS_WT_INITIAL_MAX_STREAMS_UNI` (0x2b64). Default: 0.
+pub struct InitialMaxStreamsUni;
+
+impl InitialMaxStreamsUni {
+    pub const ID: VarInt = VarInt::from_u32(0x2b64);
+    pub const DEFAULT: VarInt = VarInt::from_u32(0);
+
+    pub const fn setting(value: VarInt) -> Setting {
+        Setting::new(Self::ID, value)
+    }
+}
+
+impl SettingId for InitialMaxStreamsUni {
+    type Value = VarInt;
+
+    fn id(&self) -> VarInt {
+        Self::ID
+    }
+
+    fn value_from(&self, settings: &Settings) -> VarInt {
+        settings.get_raw(Self::ID).unwrap_or(Self::DEFAULT)
+    }
+}
+
+/// `SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI` (0x2b65). Default: 0.
+pub struct InitialMaxStreamsBidi;
+
+impl InitialMaxStreamsBidi {
+    pub const ID: VarInt = VarInt::from_u32(0x2b65);
+    pub const DEFAULT: VarInt = VarInt::from_u32(0);
+
+    pub const fn setting(value: VarInt) -> Setting {
+        Setting::new(Self::ID, value)
+    }
+}
+
+impl SettingId for InitialMaxStreamsBidi {
+    type Value = VarInt;
+
+    fn id(&self) -> VarInt {
+        Self::ID
+    }
+
+    fn value_from(&self, settings: &Settings) -> VarInt {
+        settings.get_raw(Self::ID).unwrap_or(Self::DEFAULT)
+    }
+}
+
+/// `SETTINGS_WT_INITIAL_MAX_DATA` (0x2b61). Default: 0.
+pub struct InitialMaxData;
+
+impl InitialMaxData {
+    pub const ID: VarInt = VarInt::from_u32(0x2b61);
+    pub const DEFAULT: VarInt = VarInt::from_u32(0);
+
+    pub const fn setting(value: VarInt) -> Setting {
+        Setting::new(Self::ID, value)
+    }
+}
+
+impl SettingId for InitialMaxData {
+    type Value = VarInt;
+
+    fn id(&self) -> VarInt {
+        Self::ID
+    }
+
+    fn value_from(&self, settings: &Settings) -> VarInt {
+        settings.get_raw(Self::ID).unwrap_or(Self::DEFAULT)
+    }
+}
+
 impl Settings {
     pub fn enable_webtransport(&self) -> bool {
         self.get(EnableWebTransport)
+    }
+
+    pub fn wt_initial_max_streams_uni(&self) -> VarInt {
+        self.get(InitialMaxStreamsUni)
+    }
+
+    pub fn wt_initial_max_streams_bidi(&self) -> VarInt {
+        self.get(InitialMaxStreamsBidi)
+    }
+
+    pub fn wt_initial_max_data(&self) -> VarInt {
+        self.get(InitialMaxData)
+    }
+
+    pub fn webtransport_flow_control_enabled(&self) -> bool {
+        self.wt_initial_max_streams_uni() != VarInt::from_u32(0)
+            || self.wt_initial_max_streams_bidi() != VarInt::from_u32(0)
+            || self.wt_initial_max_data() != VarInt::from_u32(0)
     }
 }
 
@@ -71,5 +161,31 @@ mod tests {
 
         settings.set(Setting::new(EnableWebTransport::ID, VarInt::from_u32(2)));
         assert!(!settings.enable_webtransport());
+    }
+
+    #[test]
+    fn webtransport_flow_control_settings_apply_draft_defaults() {
+        let settings = Settings::default();
+
+        assert_eq!(settings.wt_initial_max_streams_uni(), VarInt::from_u32(0));
+        assert_eq!(settings.wt_initial_max_streams_bidi(), VarInt::from_u32(0));
+        assert_eq!(settings.wt_initial_max_data(), VarInt::from_u32(0));
+        assert!(!settings.webtransport_flow_control_enabled());
+    }
+
+    #[test]
+    fn webtransport_flow_control_settings_use_typed_accessors() {
+        let mut settings = Settings::default();
+        settings.set(InitialMaxStreamsUni::setting(VarInt::from_u32(11)));
+        settings.set(InitialMaxStreamsBidi::setting(VarInt::from_u32(13)));
+        settings.set(InitialMaxData::setting(VarInt::MAX));
+
+        assert_eq!(settings.wt_initial_max_streams_uni(), VarInt::from_u32(11));
+        assert_eq!(settings.wt_initial_max_streams_bidi(), VarInt::from_u32(13));
+        assert_eq!(settings.wt_initial_max_data(), VarInt::MAX);
+        assert!(settings.webtransport_flow_control_enabled());
+        assert_eq!(InitialMaxStreamsUni.id(), VarInt::from_u32(0x2b64));
+        assert_eq!(InitialMaxStreamsBidi.id(), VarInt::from_u32(0x2b65));
+        assert_eq!(InitialMaxData.id(), VarInt::from_u32(0x2b61));
     }
 }
