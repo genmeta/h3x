@@ -11,7 +11,13 @@ use crate::varint::VarInt;
 
 pub mod unfold;
 
-pub trait GetStreamId<E = crate::quic::StreamError> {
+/// Read-only observation of a stream id.
+///
+/// Polling for the id has no committed stream side effect and no ordering
+/// relationship with data, stop, or reset operations. An implementation may
+/// return the id immediately or wait until the id is observable. Dropping a
+/// pending [`StreamId`] future commits nothing.
+pub trait GetStreamId<E> {
     fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<VarInt, E>>;
 }
 
@@ -42,6 +48,15 @@ pin_project_lite::pin_project! {
     }
 }
 
+impl<S, E> StreamId<S, E> {
+    pub(crate) fn new(stream: S) -> Self {
+        Self {
+            stream,
+            _error: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<S, E> Future for StreamId<S, E>
 where
     S: GetStreamId<E> + ?Sized,
@@ -53,18 +68,25 @@ where
     }
 }
 
-pub trait GetStreamIdExt<E = crate::quic::StreamError>: GetStreamId<E> {
+pub trait GetStreamIdExt<E>: GetStreamId<E> {
     fn stream_id(&mut self) -> StreamId<&mut Self, E> {
-        StreamId {
-            stream: self,
-            _error: std::marker::PhantomData,
-        }
+        StreamId::new(self)
     }
 }
 
 impl<T, E> GetStreamIdExt<E> for T where T: GetStreamId<E> + ?Sized {}
 
-pub trait StopStream<E = crate::quic::StreamError> {
+/// Receive-side stop control for a stream.
+///
+/// The first poll of [`poll_stop`](StopStream::poll_stop) commits the stop
+/// request and its code. Dropping the caller future after that first poll does
+/// not cancel the request; later polls for the same outstanding stop operation
+/// continue it rather than creating a new one.
+///
+/// Stop asks the peer to stop sending. It does not reset the local send side,
+/// and it must not discard bytes that were already received locally but have not
+/// yet been delivered to the caller.
+pub trait StopStream<E> {
     fn poll_stop(self: Pin<&mut Self>, cx: &mut Context<'_>, code: VarInt) -> Poll<Result<(), E>>;
 }
 
@@ -96,6 +118,16 @@ pin_project_lite::pin_project! {
     }
 }
 
+impl<S, E> Stop<S, E> {
+    pub(crate) fn new(stream: S, code: VarInt) -> Self {
+        Self {
+            code,
+            stream,
+            _error: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<S, E> Future for Stop<S, E>
 where
     S: StopStream<E> + ?Sized,
@@ -108,19 +140,22 @@ where
     }
 }
 
-pub trait StopStreamExt<E = crate::quic::StreamError>: StopStream<E> {
+pub trait StopStreamExt<E>: StopStream<E> {
     fn stop(&mut self, code: VarInt) -> Stop<&mut Self, E> {
-        Stop {
-            code,
-            stream: self,
-            _error: std::marker::PhantomData,
-        }
+        Stop::new(self, code)
     }
 }
 
 impl<T, E> StopStreamExt<E> for T where T: StopStream<E> + ?Sized {}
 
-pub trait ResetStream<E = crate::quic::StreamError> {
+/// Send-side reset control for a stream.
+///
+/// This operation is stream reset rather than cancellation of a Rust future.
+/// The first poll of [`poll_reset`](ResetStream::poll_reset) commits the reset
+/// code. Once committed, reset may interrupt in-flight send-side work such as
+/// data send, flush, or shutdown. Reset does not stop local receive-side byte
+/// delivery.
+pub trait ResetStream<E> {
     fn poll_reset(self: Pin<&mut Self>, cx: &mut Context<'_>, code: VarInt) -> Poll<Result<(), E>>;
 }
 
@@ -152,6 +187,16 @@ pin_project_lite::pin_project! {
     }
 }
 
+impl<S, E> Reset<S, E> {
+    pub(crate) fn new(stream: S, code: VarInt) -> Self {
+        Self {
+            code,
+            stream,
+            _error: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<S, E> Future for Reset<S, E>
 where
     S: ResetStream<E> + ?Sized,
@@ -164,13 +209,9 @@ where
     }
 }
 
-pub trait ResetStreamExt<E = crate::quic::StreamError>: ResetStream<E> {
+pub trait ResetStreamExt<E>: ResetStream<E> {
     fn reset(&mut self, code: VarInt) -> Reset<&mut Self, E> {
-        Reset {
-            code,
-            stream: self,
-            _error: std::marker::PhantomData,
-        }
+        Reset::new(self, code)
     }
 }
 
@@ -196,61 +237,17 @@ impl<T, D, IoE, ResetE, IdE> WriteStream<D, IoE, ResetE, IdE> for T where
 {
 }
 
-#[doc(hidden)]
-pub trait BoxStreamReaderTarget<D, IoE, StopE, IdE, S: ?Sized> {
-    type Target: ?Sized;
-}
+pub type BoxStreamReader<D, IoE, StopE = IoE, IdE = StopE> =
+    Pin<Box<dyn ReadStream<D, IoE, StopE, IdE> + Send>>;
 
-impl<D, IoE, StopE, IdE, S> BoxStreamReaderTarget<D, IoE, StopE, IdE, S> for ()
-where
-    S: ReadStream<D, IoE, StopE, IdE> + ?Sized,
-{
-    type Target = S;
-}
+pub type LocalBoxStreamReader<D, IoE, StopE = IoE, IdE = StopE> =
+    Pin<Box<dyn ReadStream<D, IoE, StopE, IdE>>>;
 
-#[doc(hidden)]
-pub trait BoxStreamWriterTarget<D, IoE, ResetE, IdE, S: ?Sized> {
-    type Target: ?Sized;
-}
+pub type BoxStreamWriter<D, IoE, ResetE = IoE, IdE = ResetE> =
+    Pin<Box<dyn WriteStream<D, IoE, ResetE, IdE> + Send>>;
 
-impl<D, IoE, ResetE, IdE, S> BoxStreamWriterTarget<D, IoE, ResetE, IdE, S> for ()
-where
-    S: WriteStream<D, IoE, ResetE, IdE> + ?Sized,
-{
-    type Target = S;
-}
-
-pub type BoxStreamReader<
-    D,
-    IoE,
-    StopE = IoE,
-    IdE = StopE,
-    S = dyn ReadStream<D, IoE, StopE, IdE> + Send,
-> = Pin<Box<<() as BoxStreamReaderTarget<D, IoE, StopE, IdE, S>>::Target>>;
-
-pub type LocalBoxStreamReader<
-    D,
-    IoE,
-    StopE = IoE,
-    IdE = StopE,
-    S = dyn ReadStream<D, IoE, StopE, IdE>,
-> = Pin<Box<<() as BoxStreamReaderTarget<D, IoE, StopE, IdE, S>>::Target>>;
-
-pub type BoxStreamWriter<
-    D,
-    IoE,
-    ResetE = IoE,
-    IdE = ResetE,
-    S = dyn WriteStream<D, IoE, ResetE, IdE> + Send,
-> = Pin<Box<<() as BoxStreamWriterTarget<D, IoE, ResetE, IdE, S>>::Target>>;
-
-pub type LocalBoxStreamWriter<
-    D,
-    IoE,
-    ResetE = IoE,
-    IdE = ResetE,
-    S = dyn WriteStream<D, IoE, ResetE, IdE>,
-> = Pin<Box<<() as BoxStreamWriterTarget<D, IoE, ResetE, IdE, S>>::Target>>;
+pub type LocalBoxStreamWriter<D, IoE, ResetE = IoE, IdE = ResetE> =
+    Pin<Box<dyn WriteStream<D, IoE, ResetE, IdE>>>;
 
 pub trait ManageStream {
     type Data;

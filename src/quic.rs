@@ -1,10 +1,19 @@
 use std::{
-    any::Any, borrow::Cow, convert::Infallible, error::Error, future::Future, io, sync::Arc,
+    any::Any,
+    borrow::Cow,
+    convert::Infallible,
+    error::Error,
+    future::Future,
+    io,
+    ops::DerefMut,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
 };
 
 use bytes::Bytes;
 use dhttp_identity::identity::{LocalAuthority, RemoteAuthority};
-use futures::future::BoxFuture;
+use futures::{Sink, Stream, future::BoxFuture};
 use http::uri::Authority;
 use snafu::Snafu;
 
@@ -158,35 +167,256 @@ impl<T: Connect> Connect for Arc<T> {
     }
 }
 
-pub use crate::stream::{
-    GetStreamId, GetStreamIdExt, ResetStream, ResetStreamExt, StopStream, StopStreamExt,
-};
+/// Read-only observation of a QUIC stream id.
+pub trait GetStreamId {
+    fn poll_stream_id(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<VarInt, StreamError>>;
+}
 
+impl<P> GetStreamId for Pin<P>
+where
+    P: DerefMut,
+    P::Target: GetStreamId,
+{
+    fn poll_stream_id(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<VarInt, StreamError>> {
+        <P::Target as GetStreamId>::poll_stream_id(self.as_deref_mut(), cx)
+    }
+}
+
+impl<S> GetStreamId for &mut S
+where
+    S: GetStreamId + Unpin + ?Sized,
+{
+    fn poll_stream_id(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<VarInt, StreamError>> {
+        S::poll_stream_id(Pin::new(self.get_mut()), cx)
+    }
+}
+
+pin_project_lite::pin_project! {
+    pub struct StreamId<S: ?Sized> {
+        #[pin]
+        stream: S,
+    }
+}
+
+impl<S> Future for StreamId<S>
+where
+    S: GetStreamId + ?Sized,
+{
+    type Output = Result<VarInt, StreamError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.project().stream.poll_stream_id(cx)
+    }
+}
+
+pub trait GetStreamIdExt: GetStreamId {
+    fn stream_id(&mut self) -> StreamId<&mut Self> {
+        StreamId { stream: self }
+    }
+}
+
+impl<T> GetStreamIdExt for T where T: GetStreamId + ?Sized {}
+
+/// QUIC receive-side STOP_SENDING control for a stream.
+pub trait StopStream {
+    fn poll_stop(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>>;
+}
+
+impl<P> StopStream for Pin<P>
+where
+    P: DerefMut,
+    P::Target: StopStream,
+{
+    fn poll_stop(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
+        <P::Target as StopStream>::poll_stop(self.as_deref_mut(), cx, code)
+    }
+}
+
+impl<S> StopStream for &mut S
+where
+    S: StopStream + Unpin + ?Sized,
+{
+    fn poll_stop(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
+        S::poll_stop(Pin::new(self.get_mut()), cx, code)
+    }
+}
+
+pin_project_lite::pin_project! {
+    pub struct Stop<S: ?Sized> {
+        code: VarInt,
+        #[pin]
+        stream: S,
+    }
+}
+
+impl<S> Future for Stop<S>
+where
+    S: StopStream + ?Sized,
+{
+    type Output = Result<(), StreamError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let project = self.project();
+        project.stream.poll_stop(cx, *project.code)
+    }
+}
+
+pub trait StopStreamExt: StopStream {
+    fn stop(&mut self, code: VarInt) -> Stop<&mut Self> {
+        Stop { code, stream: self }
+    }
+}
+
+impl<T> StopStreamExt for T where T: StopStream + ?Sized {}
+
+/// QUIC send-side RESET_STREAM control for a stream.
+pub trait ResetStream {
+    fn poll_reset(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>>;
+}
+
+impl<P> ResetStream for Pin<P>
+where
+    P: DerefMut,
+    P::Target: ResetStream,
+{
+    fn poll_reset(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
+        <P::Target as ResetStream>::poll_reset(self.as_deref_mut(), cx, code)
+    }
+}
+
+impl<S> ResetStream for &mut S
+where
+    S: ResetStream + Unpin + ?Sized,
+{
+    fn poll_reset(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
+        S::poll_reset(Pin::new(self.get_mut()), cx, code)
+    }
+}
+
+pin_project_lite::pin_project! {
+    pub struct Reset<S: ?Sized> {
+        code: VarInt,
+        #[pin]
+        stream: S,
+    }
+}
+
+impl<S> Future for Reset<S>
+where
+    S: ResetStream + ?Sized,
+{
+    type Output = Result<(), StreamError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let project = self.project();
+        project.stream.poll_reset(cx, *project.code)
+    }
+}
+
+pub trait ResetStreamExt: ResetStream {
+    fn reset(&mut self, code: VarInt) -> Reset<&mut Self> {
+        Reset { code, stream: self }
+    }
+}
+
+impl<T> ResetStreamExt for T where T: ResetStream + ?Sized {}
+
+/// Byte stream plus QUIC receive-side control.
 pub trait ReadStream:
-    stream::ReadStream<Bytes, StreamError, StreamError, StreamError> + Send + Any
+    StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + Send + Any
 {
 }
 
-impl<T> ReadStream for T where
-    T: stream::ReadStream<Bytes, StreamError, StreamError, StreamError> + Send + Any + ?Sized
+impl<S> ReadStream for S where
+    S: StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + Send + ?Sized + Any
 {
 }
 
+/// Byte sink plus QUIC send-side reset control.
 pub trait WriteStream:
-    stream::WriteStream<Bytes, StreamError, StreamError, StreamError> + Send + Any
+    ResetStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + Any
 {
 }
 
-impl<T> WriteStream for T where
-    T: stream::WriteStream<Bytes, StreamError, StreamError, StreamError> + Send + Any + ?Sized
+impl<S> WriteStream for S where
+    S: ResetStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + ?Sized + Any
 {
 }
 
-pub type BoxQuicStreamReader<S = dyn ReadStream> =
-    stream::BoxStreamReader<Bytes, StreamError, StreamError, StreamError, S>;
+pub type BoxQuicStreamReader<S = dyn ReadStream> = Pin<Box<S>>;
 
-pub type BoxQuicStreamWriter<S = dyn WriteStream> =
-    stream::BoxStreamWriter<Bytes, StreamError, StreamError, StreamError, S>;
+pub type BoxQuicStreamWriter<S = dyn WriteStream> = Pin<Box<S>>;
+
+impl stream::GetStreamId<StreamError> for dyn ReadStream {
+    fn poll_stream_id(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<VarInt, StreamError>> {
+        GetStreamId::poll_stream_id(self, cx)
+    }
+}
+
+impl stream::StopStream<StreamError> for dyn ReadStream {
+    fn poll_stop(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
+        StopStream::poll_stop(self, cx, code)
+    }
+}
+
+impl stream::GetStreamId<StreamError> for dyn WriteStream {
+    fn poll_stream_id(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<VarInt, StreamError>> {
+        GetStreamId::poll_stream_id(self, cx)
+    }
+}
+
+impl stream::ResetStream<StreamError> for dyn WriteStream {
+    fn poll_reset(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        code: VarInt,
+    ) -> Poll<Result<(), StreamError>> {
+        ResetStream::poll_reset(self, cx, code)
+    }
+}
 
 /// AFIT version of stream management with concrete associated types.
 ///
@@ -234,35 +464,35 @@ where
     type AcceptBiError = ConnectionError;
     type AcceptUniError = ConnectionError;
 
-    type StreamReader = T::StreamReader;
-    type StreamWriter = T::StreamWriter;
+    type StreamReader = BoxQuicStreamReader;
+    type StreamWriter = BoxQuicStreamWriter;
 
-    fn open_bi(
-        &self,
-    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), Self::OpenBiError>>
-    + Send
-    + '_ {
-        ManageStream::open_bi(self)
+    async fn open_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), Self::OpenBiError> {
+        let (reader, writer) = ManageStream::open_bi(self).await?;
+        Ok((
+            Box::pin(reader) as BoxQuicStreamReader,
+            Box::pin(writer) as BoxQuicStreamWriter,
+        ))
     }
 
-    fn open_uni(
-        &self,
-    ) -> impl Future<Output = Result<Self::StreamWriter, Self::OpenUniError>> + Send + '_ {
-        ManageStream::open_uni(self)
+    async fn open_uni(&self) -> Result<Self::StreamWriter, Self::OpenUniError> {
+        let writer = ManageStream::open_uni(self).await?;
+        Ok(Box::pin(writer) as BoxQuicStreamWriter)
     }
 
-    fn accept_bi(
+    async fn accept_bi(
         &self,
-    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), Self::AcceptBiError>>
-    + Send
-    + '_ {
-        ManageStream::accept_bi(self)
+    ) -> Result<(Self::StreamReader, Self::StreamWriter), Self::AcceptBiError> {
+        let (reader, writer) = ManageStream::accept_bi(self).await?;
+        Ok((
+            Box::pin(reader) as BoxQuicStreamReader,
+            Box::pin(writer) as BoxQuicStreamWriter,
+        ))
     }
 
-    fn accept_uni(
-        &self,
-    ) -> impl Future<Output = Result<Self::StreamReader, Self::AcceptUniError>> + Send + '_ {
-        ManageStream::accept_uni(self)
+    async fn accept_uni(&self) -> Result<Self::StreamReader, Self::AcceptUniError> {
+        let reader = ManageStream::accept_uni(self).await?;
+        Ok(Box::pin(reader) as BoxQuicStreamReader)
     }
 }
 
@@ -290,39 +520,21 @@ impl<T: ManageStream> DynManageStream for T {
     fn open_bi(
         &self,
     ) -> BoxFuture<'_, Result<(BoxQuicStreamReader, BoxQuicStreamWriter), ConnectionError>> {
-        Box::pin(async {
-            let (r, w) = stream::ManageStream::open_bi(self).await?;
-            Ok((
-                Box::pin(r) as BoxQuicStreamReader,
-                Box::pin(w) as BoxQuicStreamWriter,
-            ))
-        })
+        Box::pin(async { stream::ManageStream::open_bi(self).await })
     }
 
     fn open_uni(&self) -> BoxFuture<'_, Result<BoxQuicStreamWriter, ConnectionError>> {
-        Box::pin(async {
-            let w = stream::ManageStream::open_uni(self).await?;
-            Ok(Box::pin(w) as BoxQuicStreamWriter)
-        })
+        Box::pin(async { stream::ManageStream::open_uni(self).await })
     }
 
     fn accept_bi(
         &self,
     ) -> BoxFuture<'_, Result<(BoxQuicStreamReader, BoxQuicStreamWriter), ConnectionError>> {
-        Box::pin(async {
-            let (r, w) = stream::ManageStream::accept_bi(self).await?;
-            Ok((
-                Box::pin(r) as BoxQuicStreamReader,
-                Box::pin(w) as BoxQuicStreamWriter,
-            ))
-        })
+        Box::pin(async { stream::ManageStream::accept_bi(self).await })
     }
 
     fn accept_uni(&self) -> BoxFuture<'_, Result<BoxQuicStreamReader, ConnectionError>> {
-        Box::pin(async {
-            let r = stream::ManageStream::accept_uni(self).await?;
-            Ok(Box::pin(r) as BoxQuicStreamReader)
-        })
+        Box::pin(async { stream::ManageStream::accept_uni(self).await })
     }
 }
 
