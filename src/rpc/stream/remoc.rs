@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::VecDeque,
     marker::PhantomData,
     pin::Pin,
     sync::Arc,
@@ -11,7 +12,7 @@ use futures::{
     future::{BoxFuture, FutureExt as _},
     ready,
 };
-use remoc::rch::mpsc;
+use remoc::rch::{Sending, SendingError, mpsc};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt as _, Snafu};
 
@@ -132,6 +133,7 @@ pub(crate) struct RpcFrameIo<Out, In> {
     sender: Option<mpsc::Sender<Out>>,
     reserve: Option<ReserveFuture<Out>>,
     permit: Option<mpsc::Permit<Out>>,
+    sending: VecDeque<Sending<Out>>,
     receiver: mpsc::Receiver<In>,
     _in: PhantomData<fn() -> In>,
 }
@@ -145,6 +147,7 @@ impl<Out, In> RpcFrameIo<Out, In> {
             sender: Some(sender),
             reserve: None,
             permit: None,
+            sending: VecDeque::new(),
             receiver,
             _in: PhantomData,
         }
@@ -155,6 +158,13 @@ impl<Out, In> RpcFrameIo<Out, In> {
         Out: Send + 'static,
     {
         async move { sender.reserve().await }.boxed()
+    }
+}
+
+fn sending_error_to_send_error<T>(error: SendingError<T>) -> mpsc::SendError<()> {
+    match error {
+        SendingError::Send(source) => mpsc::SendError::RemoteSend(source.kind),
+        SendingError::Dropped => mpsc::SendError::Closed(()),
     }
 }
 
@@ -198,11 +208,20 @@ where
             .permit
             .take()
             .expect("rpc frame io sender is not ready");
-        let _sending = permit.send(item);
+        self.sending.push_back(permit.send(item));
         Ok(())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        while let Some(sending) = self.sending.front_mut() {
+            let result = ready!(sending.poll_unpin(cx));
+            self.sending.pop_front();
+            if let Err(error) = result {
+                return Poll::Ready(Err(RpcFrameIoError::Send {
+                    source: sending_error_to_send_error(error),
+                }));
+            }
+        }
         Poll::Ready(Ok(()))
     }
 
@@ -213,6 +232,7 @@ where
         self.sender = None;
         self.reserve = None;
         self.permit = None;
+        self.sending.clear();
         Poll::Ready(Ok(()))
     }
 }
@@ -232,7 +252,7 @@ impl<Out, In> Stream for RpcFrameIo<Out, In> {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use futures::{SinkExt as _, StreamExt as _};
+    use futures::{FutureExt as _, SinkExt as _, StreamExt as _, future::poll_fn};
 
     use super::*;
     use crate::rpc::stream::frame::{ReadCommand, ReadEvent};
@@ -243,20 +263,82 @@ mod tests {
         let (channels, mut hypervisor) = ReadFrameChannels::pair(stream_id);
         let mut worker = RpcFrameIo::new(channels.outbound, channels.inbound);
 
-        worker.send(ReadCommand::Pull).await.unwrap();
-        assert_eq!(hypervisor.next().await.unwrap().unwrap(), ReadCommand::Pull);
+        let send = worker.send(ReadCommand::Pull);
+        let receive = hypervisor.next();
+        let (send, received) = tokio::join!(send, receive);
+        send.unwrap();
+        assert_eq!(received.unwrap().unwrap(), ReadCommand::Pull);
 
-        hypervisor
-            .send(ReadEvent::Push {
-                data: Bytes::from_static(b"rpc frame"),
-            })
-            .await
-            .unwrap();
+        let send = hypervisor.send(ReadEvent::Push {
+            data: Bytes::from_static(b"rpc frame"),
+        });
+        let receive = worker.next();
+        let (send, received) = tokio::join!(send, receive);
+        send.unwrap();
         assert_eq!(
-            worker.next().await.unwrap().unwrap(),
+            received.unwrap().unwrap(),
             ReadEvent::Push {
                 data: Bytes::from_static(b"rpc frame"),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn flush_waits_until_remoc_send_is_observed() {
+        let (outbound, mut outbound_rx): (ReadOutSender, mpsc::Receiver<ReadCommand>) =
+            mpsc::channel(CHANNEL_CAPACITY);
+        let (_inbound_tx, inbound): (mpsc::Sender<ReadEvent>, ReadInReceiver) =
+            mpsc::channel(CHANNEL_CAPACITY);
+        let mut io = RpcFrameIo::new(outbound, inbound);
+
+        let send = io.send(ReadCommand::Pull);
+        tokio::pin!(send);
+        assert!(
+            send.as_mut().now_or_never().is_none(),
+            "flush must wait for remoc to finish sending the queued frame"
+        );
+
+        assert_eq!(outbound_rx.recv().await.unwrap(), Some(ReadCommand::Pull));
+        send.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn flush_waits_for_all_started_remoc_sends() {
+        let (outbound, mut outbound_rx): (ReadOutSender, mpsc::Receiver<ReadCommand>) =
+            mpsc::channel(CHANNEL_CAPACITY);
+        let (_inbound_tx, inbound): (mpsc::Sender<ReadEvent>, ReadInReceiver) =
+            mpsc::channel(CHANNEL_CAPACITY);
+        let mut io = RpcFrameIo::new(outbound, inbound);
+        let stop = VarInt::from_u32(9);
+
+        poll_fn(|cx| Pin::new(&mut io).poll_ready(cx))
+            .await
+            .unwrap();
+        Pin::new(&mut io).start_send(ReadCommand::Pull).unwrap();
+        poll_fn(|cx| Pin::new(&mut io).poll_ready(cx))
+            .await
+            .unwrap();
+        Pin::new(&mut io)
+            .start_send(ReadCommand::Stop { code: stop })
+            .unwrap();
+
+        let flush = poll_fn(|cx| Pin::new(&mut io).poll_flush(cx));
+        tokio::pin!(flush);
+        assert!(
+            flush.as_mut().now_or_never().is_none(),
+            "flush must wait for the first started send"
+        );
+
+        assert_eq!(outbound_rx.recv().await.unwrap(), Some(ReadCommand::Pull));
+        assert!(
+            flush.as_mut().now_or_never().is_none(),
+            "flush must wait for later started sends too"
+        );
+
+        assert_eq!(
+            outbound_rx.recv().await.unwrap(),
+            Some(ReadCommand::Stop { code: stop })
+        );
+        flush.await.unwrap();
     }
 }
