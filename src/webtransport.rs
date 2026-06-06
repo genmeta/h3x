@@ -38,6 +38,7 @@ use crate::{
     stream_id::StreamId,
 };
 
+mod close;
 mod error;
 mod protocol;
 mod registry;
@@ -45,6 +46,10 @@ mod session;
 mod session_id;
 mod stream_count;
 
+pub use close::{
+    CloseSession, CloseSessionMessage, CloseSessionMessageTooLong,
+    TryFromCloseSessionMessageBytesError, TryFromCloseSessionPartsError,
+};
 pub use error::{
     AcceptStreamError, DatagramError, OpenStreamError, RegisterSessionError, SessionClosed,
 };
