@@ -8,7 +8,6 @@ use bytes::Bytes;
 use futures::{Sink, Stream, stream::FusedStream};
 
 use crate::{
-    codec::{SinkWriter, StreamReader},
     dhttp::message::{BoxMessageReader, BoxMessageWriter, MessageStreamError},
     quic,
     rpc::{
@@ -280,6 +279,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        codec::{SinkWriter, StreamReader},
         rpc::stream::{
             frame::{ReadCommand, ReadEvent, WriteCommand, WriteEvent},
             remoc::RpcFrameIo,
