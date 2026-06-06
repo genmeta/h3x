@@ -34,6 +34,8 @@ pub enum OpenStreamError {
     Closed { source: SessionClosed },
     #[snafu(display("failed to open QUIC stream"))]
     Open { source: ConnectionError },
+    #[snafu(display("failed to observe opened QUIC stream id"))]
+    StreamId { source: StreamError },
     #[snafu(display("failed to write stream routing header"))]
     WriteHeader { source: StreamError },
 }
@@ -46,6 +48,8 @@ pub enum AcceptStreamError {
     Closed { source: SessionClosed },
     #[snafu(display("webtransport connection closed"))]
     Connection { source: ConnectionError },
+    #[snafu(display("failed to observe accepted QUIC stream id"))]
+    StreamId { source: StreamError },
 }
 
 #[derive(Debug, Snafu)]

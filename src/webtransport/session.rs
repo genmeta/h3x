@@ -25,10 +25,14 @@ use super::{
 use crate::{
     codec::{EncodeExt, EncodeInto, SinkWriter},
     extended_connect::EstablishedConnect,
-    quic::{self, BoxQuicStreamReader, BoxQuicStreamWriter},
+    quic::{self, BoxQuicStreamReader, BoxQuicStreamWriter, GetStreamIdExt},
     stream_id::StreamId,
     varint::VarInt,
 };
+
+pub(in crate::webtransport) mod stream;
+
+use stream::{WebTransportStreamReader, WebTransportStreamWriter};
 
 // ============================================================================
 // Stream type aliases
@@ -116,16 +120,28 @@ impl WebTransportSession {
     /// header.
     pub async fn open_bi(
         &self,
-    ) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), OpenStreamError> {
+    ) -> Result<(WebTransportStreamReader, WebTransportStreamWriter), OpenStreamError> {
         self.state
             .check_open()
             .context(open_stream_error::ClosedSnafu)?;
-        let (reader, writer) = self
+        let (mut reader, writer) = self
             .conn
             .open_bi()
             .await
             .context(open_stream_error::OpenSnafu)?;
         let writer = write_header(writer, WEBTRANSPORT_BIDI_SIGNAL, self.id()).await?;
+        let stream_id = reader
+            .stream_id()
+            .await
+            .context(open_stream_error::StreamIdSnafu)?;
+        let stream_id = StreamId::from(stream_id);
+        let (reader, tracked_reader) =
+            WebTransportStreamReader::tracked(stream_id, reader, Arc::downgrade(&self.state));
+        let (writer, tracked_writer) =
+            WebTransportStreamWriter::tracked(stream_id, writer, Arc::downgrade(&self.state));
+        self.state
+            .insert_tracked_bi(stream_id, tracked_reader, tracked_writer)
+            .context(open_stream_error::ClosedSnafu)?;
         Ok((reader, writer))
     }
 
@@ -134,7 +150,7 @@ impl WebTransportSession {
     /// Writes the WebTransport uni signal value (`0x54`) and the session ID as
     /// a routing header, then returns the write half positioned after the
     /// header.
-    pub async fn open_uni(&self) -> Result<BoxQuicStreamWriter, OpenStreamError> {
+    pub async fn open_uni(&self) -> Result<WebTransportStreamWriter, OpenStreamError> {
         self.state
             .check_open()
             .context(open_stream_error::ClosedSnafu)?;
@@ -143,41 +159,78 @@ impl WebTransportSession {
             .open_uni()
             .await
             .context(open_stream_error::OpenSnafu)?;
-        write_header(writer, WEBTRANSPORT_UNI_SIGNAL, self.id()).await
+        let mut writer = write_header(writer, WEBTRANSPORT_UNI_SIGNAL, self.id()).await?;
+        let stream_id = writer
+            .stream_id()
+            .await
+            .context(open_stream_error::StreamIdSnafu)?;
+        let stream_id = StreamId::from(stream_id);
+        let (writer, tracked_writer) =
+            WebTransportStreamWriter::tracked(stream_id, writer, Arc::downgrade(&self.state));
+        self.state
+            .insert_tracked_writer(stream_id, tracked_writer)
+            .context(open_stream_error::ClosedSnafu)?;
+        Ok(writer)
     }
 
     /// Accept a bidirectional stream routed to this session by the protocol layer.
     pub async fn accept_bi(
         &self,
-    ) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), AcceptStreamError> {
+    ) -> Result<(WebTransportStreamReader, WebTransportStreamWriter), AcceptStreamError> {
         self.state
             .check_open()
             .context(accept_stream_error::ClosedSnafu)?;
         let mut rx = self.bidi_rx.lock().await;
-        tokio::select! {
+        let (mut reader, writer) = tokio::select! {
             biased;
             source = self.conn.closed() => {
                 self.state.close();
-                Err(AcceptStreamError::Connection { source })
+                return Err(AcceptStreamError::Connection { source });
             }
-            stream = rx.recv() => stream.ok_or(SessionClosed).context(accept_stream_error::ClosedSnafu),
-        }
+            stream = rx.recv() => stream.ok_or(SessionClosed).context(accept_stream_error::ClosedSnafu)?,
+        };
+        drop(rx);
+        let stream_id = reader
+            .stream_id()
+            .await
+            .context(accept_stream_error::StreamIdSnafu)?;
+        let stream_id = StreamId::from(stream_id);
+        let (reader, tracked_reader) =
+            WebTransportStreamReader::tracked(stream_id, reader, Arc::downgrade(&self.state));
+        let (writer, tracked_writer) =
+            WebTransportStreamWriter::tracked(stream_id, writer, Arc::downgrade(&self.state));
+        self.state
+            .insert_tracked_bi(stream_id, tracked_reader, tracked_writer)
+            .context(accept_stream_error::ClosedSnafu)?;
+        Ok((reader, writer))
     }
 
     /// Accept a unidirectional stream routed to this session by the protocol layer.
-    pub async fn accept_uni(&self) -> Result<BoxQuicStreamReader, AcceptStreamError> {
+    pub async fn accept_uni(&self) -> Result<WebTransportStreamReader, AcceptStreamError> {
         self.state
             .check_open()
             .context(accept_stream_error::ClosedSnafu)?;
         let mut rx = self.uni_rx.lock().await;
-        tokio::select! {
+        let mut reader = tokio::select! {
             biased;
             source = self.conn.closed() => {
                 self.state.close();
-                Err(AcceptStreamError::Connection { source })
+                return Err(AcceptStreamError::Connection { source });
             }
-            stream = rx.recv() => stream.ok_or(SessionClosed).context(accept_stream_error::ClosedSnafu),
-        }
+            stream = rx.recv() => stream.ok_or(SessionClosed).context(accept_stream_error::ClosedSnafu)?,
+        };
+        drop(rx);
+        let stream_id = reader
+            .stream_id()
+            .await
+            .context(accept_stream_error::StreamIdSnafu)?;
+        let stream_id = StreamId::from(stream_id);
+        let (reader, tracked_reader) =
+            WebTransportStreamReader::tracked(stream_id, reader, Arc::downgrade(&self.state));
+        self.state
+            .insert_tracked_reader(stream_id, tracked_reader)
+            .context(accept_stream_error::ClosedSnafu)?;
+        Ok(reader)
     }
 
     /// Send a datagram within this session.
@@ -315,7 +368,9 @@ mod tests {
         quic,
         stream_id::StreamId,
         varint::VarInt,
-        webtransport::{WEBTRANSPORT_H3, WebTransportProtocol, registry::Registry},
+        webtransport::{
+            WEBTRANSPORT_H3, WebTransportProtocol, protocol::WT_SESSION_GONE, registry::Registry,
+        },
     };
 
     const fn assert_send_sync<T: Send + Sync>() {}
@@ -1436,6 +1491,90 @@ mod tests {
         );
         assert_eq!(routed_state.written(), vec![0x33]);
         assert!(stream_state.written().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_close_stops_and_resets_tracked_bidi_stream() {
+        let stream_state = Arc::new(StreamState::default());
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
+            state: Arc::clone(&stream_state),
+        });
+        let (registry, session) =
+            session_with_connection(StreamId::from(VarInt::from_u32(4)), conn);
+        let routed_state = Arc::new(StreamState::default());
+
+        assert!(
+            registry
+                .route_bi(
+                    session.id(),
+                    (
+                        Box::pin(TestReadStream {
+                            state: Arc::clone(&routed_state),
+                            chunks: VecDeque::from([Bytes::from_static(&[0x11])]),
+                            stream_id: VarInt::from_u32(31),
+                        }) as BoxQuicStreamReader,
+                        Box::pin(TestWriteStream {
+                            state: Arc::clone(&routed_state),
+                            stream_id: VarInt::from_u32(31),
+                        }) as BoxQuicStreamWriter,
+                    ),
+                )
+                .is_ok()
+        );
+
+        let (_reader, _writer) = session.accept_bi().await.expect("accept_bi should succeed");
+        session.state.close();
+        tokio::task::yield_now().await;
+
+        assert_eq!(routed_state.stopped_codes(), vec![WT_SESSION_GONE]);
+        assert_eq!(routed_state.reset_codes(), vec![WT_SESSION_GONE]);
+    }
+
+    #[tokio::test]
+    async fn reader_eof_removes_only_reader_tracking_before_session_close() {
+        let stream_state = Arc::new(StreamState::default());
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
+            state: Arc::clone(&stream_state),
+        });
+        let (registry, session) =
+            session_with_connection(StreamId::from(VarInt::from_u32(4)), conn);
+        let routed_state = Arc::new(StreamState::default());
+
+        assert!(
+            registry
+                .route_bi(
+                    session.id(),
+                    (
+                        Box::pin(TestReadStream {
+                            state: Arc::clone(&routed_state),
+                            chunks: VecDeque::from([Bytes::from_static(&[0x11])]),
+                            stream_id: VarInt::from_u32(32),
+                        }) as BoxQuicStreamReader,
+                        Box::pin(TestWriteStream {
+                            state: Arc::clone(&routed_state),
+                            stream_id: VarInt::from_u32(32),
+                        }) as BoxQuicStreamWriter,
+                    ),
+                )
+                .is_ok()
+        );
+
+        let (mut reader, _writer) = session.accept_bi().await.expect("accept_bi should succeed");
+        assert_eq!(
+            reader
+                .next()
+                .await
+                .expect("chunk")
+                .expect("read should work"),
+            Bytes::from_static(&[0x11])
+        );
+        assert!(reader.next().await.is_none());
+
+        session.state.close();
+        tokio::task::yield_now().await;
+
+        assert!(routed_state.stopped_codes().is_empty());
+        assert_eq!(routed_state.reset_codes(), vec![WT_SESSION_GONE]);
     }
 
     #[tokio::test]

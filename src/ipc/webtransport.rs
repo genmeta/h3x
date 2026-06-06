@@ -161,6 +161,9 @@ impl From<AcceptStreamError> for IpcWebTransportAcceptError {
         match error {
             AcceptStreamError::Closed { source } => source.into(),
             AcceptStreamError::Connection { source } => Self::Connection { source },
+            AcceptStreamError::StreamId { source } => Self::Transport {
+                source: IpcPlumbingError::Stream { source },
+            },
         }
     }
 }
@@ -309,7 +312,13 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
             .await
             .map_err(IpcPlumbingError::from)?;
 
-        self.bridge_bi(delivery, reader, writer, stream_id).await
+        self.bridge_bi(
+            delivery,
+            Box::pin(reader) as BoxQuicStreamReader,
+            Box::pin(writer) as BoxQuicStreamWriter,
+            stream_id,
+        )
+        .await
     }
 
     async fn accept_bi(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportAcceptError> {
@@ -323,8 +332,13 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
             .await
             .map_err(IpcPlumbingError::from)?;
 
-        self.bridge_bi_accept(delivery, reader, writer, stream_id)
-            .await
+        self.bridge_bi_accept(
+            delivery,
+            Box::pin(reader) as BoxQuicStreamReader,
+            Box::pin(writer) as BoxQuicStreamWriter,
+            stream_id,
+        )
+        .await
     }
 
     async fn open_uni(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportOpenError> {

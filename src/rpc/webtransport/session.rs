@@ -54,14 +54,14 @@ impl WebTransportRpcSession for webtransport::WebTransportSession {
     async fn open_bi(&self) -> Result<(ReadFrameChannels, WriteFrameChannels), OpenStreamError> {
         let (reader, writer) = webtransport::WebTransportSession::open_bi(self).await?;
         Ok((
-            read_channels_open(reader).await?,
-            write_channels_open(writer).await?,
+            read_channels_open(Box::pin(reader) as BoxQuicStreamReader).await?,
+            write_channels_open(Box::pin(writer) as BoxQuicStreamWriter).await?,
         ))
     }
 
     async fn open_uni(&self) -> Result<WriteFrameChannels, OpenStreamError> {
         let writer = webtransport::WebTransportSession::open_uni(self).await?;
-        write_channels_open(writer).await
+        write_channels_open(Box::pin(writer) as BoxQuicStreamWriter).await
     }
 
     async fn accept_bi(
@@ -69,14 +69,14 @@ impl WebTransportRpcSession for webtransport::WebTransportSession {
     ) -> Result<(ReadFrameChannels, WriteFrameChannels), AcceptStreamError> {
         let (reader, writer) = webtransport::WebTransportSession::accept_bi(self).await?;
         Ok((
-            read_channels_accept(reader).await?,
-            write_channels_accept(writer).await?,
+            read_channels_accept(Box::pin(reader) as BoxQuicStreamReader).await?,
+            write_channels_accept(Box::pin(writer) as BoxQuicStreamWriter).await?,
         ))
     }
 
     async fn accept_uni(&self) -> Result<ReadFrameChannels, AcceptStreamError> {
         let reader = webtransport::WebTransportSession::accept_uni(self).await?;
-        read_channels_accept(reader).await
+        read_channels_accept(Box::pin(reader) as BoxQuicStreamReader).await
     }
 }
 
@@ -296,28 +296,11 @@ async fn write_channels_accept(
 }
 
 fn open_stream_id_error(error: quic::StreamError) -> OpenStreamError {
-    OpenStreamError::Open {
-        source: stream_id_connection_error(error),
-    }
+    OpenStreamError::StreamId { source: error }
 }
 
 fn accept_stream_id_error(error: quic::StreamError) -> AcceptStreamError {
-    AcceptStreamError::Connection {
-        source: stream_id_connection_error(error),
-    }
-}
-
-fn stream_id_connection_error(error: quic::StreamError) -> quic::ConnectionError {
-    match error {
-        quic::StreamError::Connection { source } => source,
-        quic::StreamError::Reset { code } => quic::ConnectionError::Transport {
-            source: quic::TransportError {
-                kind: VarInt::from_u32(0x0d),
-                frame_type: VarInt::from_u32(0x00),
-                reason: format!("rpc webtransport stream id reset with code {code}").into(),
-            },
-        },
-    }
+    AcceptStreamError::StreamId { source: error }
 }
 
 impl WebTransportRpcSessionClient {

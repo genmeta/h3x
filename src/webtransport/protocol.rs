@@ -20,7 +20,7 @@ use futures::future::BoxFuture;
 
 use super::{
     error::RegisterSessionError,
-    registry::{RegisteredSession, Registry},
+    registry::{RegisteredSession, Registry, RouteBiError, RouteUniError},
 };
 use crate::{
     codec::{BoxPeekableStreamReader, BoxStreamWriter, DecodeExt},
@@ -48,6 +48,10 @@ pub const WEBTRANSPORT_BIDI_SIGNAL: VarInt = VarInt::from_u32(0x41);
 /// Signal value for WebTransport unidirectional streams
 /// (draft-ietf-webtrans-http3, §2).
 pub const WEBTRANSPORT_UNI_SIGNAL: VarInt = VarInt::from_u32(0x54);
+
+/// WebTransport error code for streams whose associated session is gone
+/// (draft-ietf-webtrans-http3, §9.5).
+pub const WT_SESSION_GONE: VarInt = VarInt::from_u32(0x170d7b68);
 
 // ============================================================================
 // WebTransportProtocol
@@ -122,10 +126,21 @@ impl WebTransportProtocol {
         let reader: BoxQuicStreamReader = Box::pin(reader.into_stream_reader());
         let writer: BoxQuicStreamWriter = writer.into_inner();
 
-        if let Err((mut reader, mut writer)) = self.registry.route_bi(session_id, (reader, writer))
-        {
-            let code = crate::error::Code::H3_REQUEST_CANCELLED.into_inner();
-            _ = tokio::join!(reader.stop(code), writer.reset(code));
+        match self.registry.route_bi(session_id, (reader, writer)) {
+            Ok(()) => {}
+            // draft-ietf-webtrans-http3 §4: "Session IDs that correspond to
+            // closed sessions are not considered invalid"; §9.5 defines
+            // WT_SESSION_GONE for streams whose associated session has closed.
+            // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3#section-4
+            // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3#section-9.5
+            Err(RouteBiError::Closed((mut reader, mut writer))) => {
+                _ = tokio::join!(reader.stop(WT_SESSION_GONE), writer.reset(WT_SESSION_GONE));
+            }
+            Err(RouteBiError::Unknown((mut reader, mut writer)))
+            | Err(RouteBiError::Rejected((mut reader, mut writer))) => {
+                let code = crate::error::Code::H3_REQUEST_CANCELLED.into_inner();
+                _ = tokio::join!(reader.stop(code), writer.reset(code));
+            }
         }
 
         Ok(StreamVerdict::Accepted)
@@ -153,9 +168,20 @@ impl WebTransportProtocol {
 
         let reader: BoxQuicStreamReader = Box::pin(stream.into_stream_reader());
 
-        if let Err(mut reader) = self.registry.route_uni(session_id, reader) {
-            let code = crate::error::Code::H3_REQUEST_CANCELLED.into_inner();
-            _ = reader.stop(code).await;
+        match self.registry.route_uni(session_id, reader) {
+            Ok(()) => {}
+            // draft-ietf-webtrans-http3 §4: "Session IDs that correspond to
+            // closed sessions are not considered invalid"; §9.5 defines
+            // WT_SESSION_GONE for streams whose associated session has closed.
+            // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3#section-4
+            // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3#section-9.5
+            Err(RouteUniError::Closed(mut reader)) => {
+                _ = reader.stop(WT_SESSION_GONE).await;
+            }
+            Err(RouteUniError::Unknown(mut reader)) | Err(RouteUniError::Rejected(mut reader)) => {
+                let code = crate::error::Code::H3_REQUEST_CANCELLED.into_inner();
+                _ = reader.stop(code).await;
+            }
         }
 
         Ok(StreamVerdict::Accepted)
@@ -256,6 +282,7 @@ mod tests {
         assert_eq!(WEBTRANSPORT_H3, "webtransport-h3");
         assert_eq!(WEBTRANSPORT_BIDI_SIGNAL.into_inner(), 0x41);
         assert_eq!(WEBTRANSPORT_UNI_SIGNAL.into_inner(), 0x54);
+        assert_eq!(WT_SESSION_GONE.into_inner(), 0x170d7b68);
     }
 
     #[tokio::test]
@@ -297,6 +324,49 @@ mod tests {
             state.stopped_codes(),
             vec![Code::H3_REQUEST_CANCELLED.into_inner()]
         );
+        assert!(state.reset_codes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_bidi_session_id_uses_wt_session_gone() {
+        let protocol = test_protocol();
+        let registered = protocol
+            .register(StreamId::from(VarInt::from_u32(42)))
+            .expect("session registration should succeed");
+        registered.state.close();
+
+        let state = Arc::new(StreamState::default());
+        let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x41, 0x2a])]);
+        let writer = test_writer(state.clone());
+
+        let verdict = protocol
+            .accept_bi((reader, writer))
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert_eq!(state.stopped_codes(), vec![WT_SESSION_GONE]);
+        assert_eq!(state.reset_codes(), vec![WT_SESSION_GONE]);
+    }
+
+    #[tokio::test]
+    async fn closed_uni_session_id_uses_wt_session_gone() {
+        let protocol = test_protocol();
+        let registered = protocol
+            .register(StreamId::from(VarInt::from_u32(42)))
+            .expect("session registration should succeed");
+        registered.state.close();
+
+        let state = Arc::new(StreamState::default());
+        let stream = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x54, 0x2a])]);
+
+        let verdict = protocol
+            .accept_uni(stream)
+            .await
+            .expect("routing should not fail");
+
+        assert!(matches!(verdict, StreamVerdict::Accepted));
+        assert_eq!(state.stopped_codes(), vec![WT_SESSION_GONE]);
         assert!(state.reset_codes().is_empty());
     }
 

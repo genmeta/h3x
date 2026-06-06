@@ -1,24 +1,51 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
 
+use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 use super::{
     error::{RegisterSessionError, SessionClosed},
-    session::{RoutedBiStream, RoutedUniStream},
+    protocol::WT_SESSION_GONE,
+    session::{
+        RoutedBiStream, RoutedUniStream,
+        stream::{TrackedStreamReader, TrackedStreamWriter},
+    },
 };
-use crate::stream_id::StreamId;
+use crate::{
+    quic::{ResetStreamExt, StopStreamExt},
+    stream_id::StreamId,
+};
 
 const SESSION_STREAM_CHANNEL_SIZE: usize = 16;
 
+#[derive(Debug, Default)]
+struct RegistryInner {
+    active: HashMap<StreamId, SessionStreamRouter>,
+    closed: HashSet<StreamId>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub(super) struct Registry {
-    inner: Arc<Mutex<HashMap<StreamId, SessionStreamRouter>>>,
+    inner: Arc<Mutex<RegistryInner>>,
+}
+
+pub(super) enum RouteBiError {
+    Unknown(RoutedBiStream),
+    Closed(RoutedBiStream),
+    Rejected(RoutedBiStream),
+}
+
+pub(super) enum RouteUniError {
+    Unknown(RoutedUniStream),
+    Closed(RoutedUniStream),
+    Rejected(RoutedUniStream),
 }
 
 impl Registry {
@@ -29,15 +56,18 @@ impl Registry {
         let (bidi_tx, bidi_rx) = mpsc::channel(SESSION_STREAM_CHANNEL_SIZE);
         let (uni_tx, uni_rx) = mpsc::channel(SESSION_STREAM_CHANNEL_SIZE);
 
-        let Ok(mut sessions) = self.inner.lock() else {
+        let Ok(mut inner) = self.inner.lock() else {
             return Err(RegisterSessionError::RegistryPoisoned);
         };
 
-        if sessions.contains_key(&session_id) {
+        if inner.active.contains_key(&session_id) {
             return Err(RegisterSessionError::AlreadyRegistered { session_id });
         }
 
-        sessions.insert(session_id, SessionStreamRouter::new(bidi_tx, uni_tx));
+        inner.closed.remove(&session_id);
+        inner
+            .active
+            .insert(session_id, SessionStreamRouter::new(bidi_tx, uni_tx));
 
         Ok(RegisteredSession {
             state: Arc::new(SessionState::new(session_id, self.clone())),
@@ -47,49 +77,66 @@ impl Registry {
     }
 
     pub(super) fn unregister(&self, session_id: StreamId) {
-        let Ok(mut sessions) = self.inner.lock() else {
+        self.close(session_id);
+    }
+
+    fn close(&self, session_id: StreamId) {
+        let Ok(mut inner) = self.inner.lock() else {
             tracing::debug!(?session_id, "webtransport session registry lock poisoned");
             return;
         };
-        sessions.remove(&session_id);
+        inner.active.remove(&session_id);
+        inner.closed.insert(session_id);
     }
 
     pub(super) fn route_bi(
         &self,
         session_id: StreamId,
         stream: RoutedBiStream,
-    ) -> Result<(), RoutedBiStream> {
-        let Ok(sessions) = self.inner.lock() else {
+    ) -> Result<(), RouteBiError> {
+        let Ok(inner) = self.inner.lock() else {
             tracing::debug!(session_id = %session_id, "webtransport session registry lock poisoned");
-            return Err(stream);
+            return Err(RouteBiError::Rejected(stream));
         };
-        let Some(router) = sessions.get(&session_id) else {
+        let Some(router) = inner.active.get(&session_id) else {
+            if inner.closed.contains(&session_id) {
+                tracing::debug!(session_id = %session_id, "webtransport bidi stream belongs to closed session");
+                return Err(RouteBiError::Closed(stream));
+            }
             tracing::debug!(session_id = %session_id, "no registered session for webtransport bidi stream");
-            return Err(stream);
+            return Err(RouteBiError::Unknown(stream));
         };
-        router.route_bi(session_id, stream)
+        router
+            .route_bi(session_id, stream)
+            .map_err(RouteBiError::Rejected)
     }
 
     pub(super) fn route_uni(
         &self,
         session_id: StreamId,
         stream: RoutedUniStream,
-    ) -> Result<(), RoutedUniStream> {
-        let Ok(sessions) = self.inner.lock() else {
+    ) -> Result<(), RouteUniError> {
+        let Ok(inner) = self.inner.lock() else {
             tracing::debug!(session_id = %session_id, "webtransport session registry lock poisoned");
-            return Err(stream);
+            return Err(RouteUniError::Rejected(stream));
         };
-        let Some(router) = sessions.get(&session_id) else {
+        let Some(router) = inner.active.get(&session_id) else {
+            if inner.closed.contains(&session_id) {
+                tracing::debug!(session_id = %session_id, "webtransport uni stream belongs to closed session");
+                return Err(RouteUniError::Closed(stream));
+            }
             tracing::debug!(session_id = %session_id, "no registered session for webtransport uni stream");
-            return Err(stream);
+            return Err(RouteUniError::Unknown(stream));
         };
-        router.route_uni(session_id, stream)
+        router
+            .route_uni(session_id, stream)
+            .map_err(RouteUniError::Rejected)
     }
 
     pub(super) fn len(&self) -> usize {
         self.inner
             .lock()
-            .map(|sessions| sessions.len())
+            .map(|inner| inner.active.len())
             .unwrap_or(0)
     }
 }
@@ -106,6 +153,8 @@ pub(super) struct SessionState {
     session_id: StreamId,
     registry: Registry,
     closed: AtomicBool,
+    tracked_readers: Mutex<HashMap<StreamId, TrackedStreamReader>>,
+    tracked_writers: Mutex<HashMap<StreamId, TrackedStreamWriter>>,
 }
 
 impl SessionState {
@@ -114,6 +163,8 @@ impl SessionState {
             session_id,
             registry,
             closed: AtomicBool::new(false),
+            tracked_readers: Mutex::new(HashMap::new()),
+            tracked_writers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -132,8 +183,216 @@ impl SessionState {
     pub(super) fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
             self.registry.unregister(self.session_id);
+            let (readers, writers) = self.take_tracked_streams();
+            spawn_tracked_stream_cleanup(self.session_id, readers, writers);
         }
     }
+
+    pub(super) fn insert_tracked_bi(
+        &self,
+        stream_id: StreamId,
+        reader: TrackedStreamReader,
+        writer: TrackedStreamWriter,
+    ) -> Result<(), SessionClosed> {
+        self.check_open()?;
+
+        let Ok(mut readers) = self.tracked_readers.lock() else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "webtransport session reader tracking lock poisoned"
+            );
+            return Err(SessionClosed);
+        };
+        let Ok(mut writers) = self.tracked_writers.lock() else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "webtransport session writer tracking lock poisoned"
+            );
+            return Err(SessionClosed);
+        };
+
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SessionClosed);
+        }
+
+        readers.insert(stream_id, reader);
+        writers.insert(stream_id, writer);
+
+        if self.closed.load(Ordering::Acquire) {
+            readers.remove(&stream_id);
+            writers.remove(&stream_id);
+            Err(SessionClosed)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn insert_tracked_reader(
+        &self,
+        stream_id: StreamId,
+        reader: TrackedStreamReader,
+    ) -> Result<(), SessionClosed> {
+        self.check_open()?;
+
+        let Ok(mut readers) = self.tracked_readers.lock() else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "webtransport session reader tracking lock poisoned"
+            );
+            return Err(SessionClosed);
+        };
+
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SessionClosed);
+        }
+
+        readers.insert(stream_id, reader);
+
+        if self.closed.load(Ordering::Acquire) {
+            readers.remove(&stream_id);
+            Err(SessionClosed)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn insert_tracked_writer(
+        &self,
+        stream_id: StreamId,
+        writer: TrackedStreamWriter,
+    ) -> Result<(), SessionClosed> {
+        self.check_open()?;
+
+        let Ok(mut writers) = self.tracked_writers.lock() else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "webtransport session writer tracking lock poisoned"
+            );
+            return Err(SessionClosed);
+        };
+
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SessionClosed);
+        }
+
+        writers.insert(stream_id, writer);
+
+        if self.closed.load(Ordering::Acquire) {
+            writers.remove(&stream_id);
+            Err(SessionClosed)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn remove_tracked_reader(&self, stream_id: StreamId) {
+        let Ok(mut readers) = self.tracked_readers.lock() else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "webtransport session reader tracking lock poisoned"
+            );
+            return;
+        };
+        readers.remove(&stream_id);
+    }
+
+    pub(super) fn remove_tracked_writer(&self, stream_id: StreamId) {
+        let Ok(mut writers) = self.tracked_writers.lock() else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "webtransport session writer tracking lock poisoned"
+            );
+            return;
+        };
+        writers.remove(&stream_id);
+    }
+
+    fn take_tracked_streams(&self) -> (Vec<TrackedStreamReader>, Vec<TrackedStreamWriter>) {
+        let readers = match self.tracked_readers.lock() {
+            Ok(mut readers) => readers.drain().map(|(_stream_id, reader)| reader).collect(),
+            Err(_) => {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    "webtransport session reader tracking lock poisoned"
+                );
+                Vec::new()
+            }
+        };
+        let writers = match self.tracked_writers.lock() {
+            Ok(mut writers) => writers.drain().map(|(_stream_id, writer)| writer).collect(),
+            Err(_) => {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    "webtransport session writer tracking lock poisoned"
+                );
+                Vec::new()
+            }
+        };
+        (readers, writers)
+    }
+}
+
+fn spawn_tracked_stream_cleanup(
+    session_id: StreamId,
+    readers: Vec<TrackedStreamReader>,
+    writers: Vec<TrackedStreamWriter>,
+) {
+    if readers.is_empty() && writers.is_empty() {
+        return;
+    }
+
+    let cleanup = cleanup_tracked_streams(session_id, readers, writers);
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            // Inherent termination: the task owns the taken tracked halves and
+            // exits after every STOP/RESET future resolves or returns an error.
+            let _cleanup_task = handle.spawn(cleanup.in_current_span());
+        }
+        Err(error) => {
+            let report = snafu::Report::from_error(&error);
+            tracing::debug!(
+                session_id = %session_id,
+                error = %report,
+                "failed to spawn webtransport session stream cleanup"
+            );
+        }
+    }
+}
+
+async fn cleanup_tracked_streams(
+    session_id: StreamId,
+    readers: Vec<TrackedStreamReader>,
+    writers: Vec<TrackedStreamWriter>,
+) {
+    let mut cleanup = FuturesUnordered::<BoxFuture<'static, ()>>::new();
+
+    for mut reader in readers {
+        cleanup.push(Box::pin(async move {
+            if let Err(error) = reader.stop(WT_SESSION_GONE).await {
+                let report = snafu::Report::from_error(&error);
+                tracing::debug!(
+                    session_id = %session_id,
+                    error = %report,
+                    "failed to stop webtransport session stream reader"
+                );
+            }
+        }));
+    }
+
+    for mut writer in writers {
+        cleanup.push(Box::pin(async move {
+            if let Err(error) = writer.reset(WT_SESSION_GONE).await {
+                let report = snafu::Report::from_error(&error);
+                tracing::debug!(
+                    session_id = %session_id,
+                    error = %report,
+                    "failed to reset webtransport session stream writer"
+                );
+            }
+        }));
+    }
+
+    while cleanup.next().await.is_some() {}
 }
 
 impl Drop for SessionState {
@@ -337,6 +596,22 @@ mod tests {
         }));
     }
 
+    fn route_bi_error_stream(error: RouteBiError) -> RoutedBiStream {
+        match error {
+            RouteBiError::Unknown(stream)
+            | RouteBiError::Closed(stream)
+            | RouteBiError::Rejected(stream) => stream,
+        }
+    }
+
+    fn route_uni_error_stream(error: RouteUniError) -> RoutedUniStream {
+        match error {
+            RouteUniError::Unknown(stream)
+            | RouteUniError::Closed(stream)
+            | RouteUniError::Rejected(stream) => stream,
+        }
+    }
+
     #[tokio::test]
     async fn test_read_stream_reads_chunks_and_stops() {
         let mut stream = test_read_stream(40, b"chunk".to_vec());
@@ -441,9 +716,11 @@ mod tests {
         let session_id = StreamId::from(VarInt::from_u32(4));
 
         let bidi = bidi_stream(1);
-        let mut returned_bidi = registry
+        let error = registry
             .route_bi(session_id, bidi)
             .expect_err("unknown bidi session should reject stream");
+        assert!(matches!(&error, RouteBiError::Unknown(_)));
+        let mut returned_bidi = route_bi_error_stream(error);
         assert_eq!(
             returned_bidi
                 .0
@@ -454,9 +731,11 @@ mod tests {
         );
 
         let uni = uni_stream(2);
-        let mut returned_uni = registry
+        let error = registry
             .route_uni(session_id, uni)
             .expect_err("unknown uni session should reject stream");
+        assert!(matches!(&error, RouteUniError::Unknown(_)));
+        let mut returned_uni = route_uni_error_stream(error);
         assert_eq!(
             returned_uni
                 .stream_id()
@@ -514,8 +793,14 @@ mod tests {
 
         drop(registered.bidi_rx);
         drop(registered.uni_rx);
-        assert!(registry.route_bi(session_id, bidi_stream(5)).is_err());
-        assert!(registry.route_uni(session_id, uni_stream(6)).is_err());
+        assert!(matches!(
+            registry.route_bi(session_id, bidi_stream(5)),
+            Err(RouteBiError::Rejected(_))
+        ));
+        assert!(matches!(
+            registry.route_uni(session_id, uni_stream(6)),
+            Err(RouteUniError::Rejected(_))
+        ));
     }
 
     #[tokio::test]
@@ -529,9 +814,11 @@ mod tests {
         drop(registered.bidi_rx);
         drop(registered.uni_rx);
 
-        let mut returned_bidi = registry
+        let error = registry
             .route_bi(session_id, bidi_stream(17))
             .expect_err("closed bidi receiver should reject stream");
+        assert!(matches!(&error, RouteBiError::Rejected(_)));
+        let mut returned_bidi = route_bi_error_stream(error);
         assert_eq!(
             returned_bidi
                 .0
@@ -541,9 +828,11 @@ mod tests {
             VarInt::from_u32(17)
         );
 
-        let mut returned_uni = registry
+        let error = registry
             .route_uni(session_id, uni_stream(18))
             .expect_err("closed uni receiver should reject stream");
+        assert!(matches!(&error, RouteUniError::Rejected(_)));
+        let mut returned_uni = route_uni_error_stream(error);
         assert_eq!(
             returned_uni
                 .stream_id()
@@ -574,8 +863,14 @@ mod tests {
             );
         }
 
-        assert!(registry.route_bi(session_id, bidi_stream(99)).is_err());
-        assert!(registry.route_uni(session_id, uni_stream(100)).is_err());
+        assert!(matches!(
+            registry.route_bi(session_id, bidi_stream(99)),
+            Err(RouteBiError::Rejected(_))
+        ));
+        assert!(matches!(
+            registry.route_uni(session_id, uni_stream(100)),
+            Err(RouteUniError::Rejected(_))
+        ));
     }
 
     #[tokio::test]
@@ -658,9 +953,11 @@ mod tests {
             );
         }
 
-        let mut returned_bidi = registry
+        let error = registry
             .route_bi(session_id, bidi_stream(21))
             .expect_err("full bidi channel should reject stream");
+        assert!(matches!(&error, RouteBiError::Rejected(_)));
+        let mut returned_bidi = route_bi_error_stream(error);
         assert_eq!(
             returned_bidi
                 .0
@@ -670,9 +967,11 @@ mod tests {
             VarInt::from_u32(21)
         );
 
-        let mut returned_uni = registry
+        let error = registry
             .route_uni(session_id, uni_stream(22))
             .expect_err("full uni channel should reject stream");
+        assert!(matches!(&error, RouteUniError::Rejected(_)));
+        let mut returned_uni = route_uni_error_stream(error);
         assert_eq!(
             returned_uni
                 .stream_id()
@@ -693,9 +992,11 @@ mod tests {
         registered.state.close();
         assert_eq!(registry.len(), 0);
 
-        let mut returned = registry
+        let error = registry
             .route_uni(session_id, uni_stream(25))
             .expect_err("closed session should no longer route streams");
+        assert!(matches!(&error, RouteUniError::Closed(_)));
+        let mut returned = route_uni_error_stream(error);
         assert_eq!(
             returned
                 .stream_id()
@@ -735,7 +1036,10 @@ mod tests {
 
         drop(registered);
         assert_eq!(registry.len(), 1);
-        assert!(registry.route_uni(session_id, uni_stream(29)).is_err());
+        assert!(matches!(
+            registry.route_uni(session_id, uni_stream(29)),
+            Err(RouteUniError::Rejected(_))
+        ));
         assert!(state.check_open().is_ok());
 
         drop(state);
@@ -756,9 +1060,11 @@ mod tests {
 
         registry.unregister(session_id);
 
-        let mut returned_bidi = registry
+        let error = registry
             .route_bi(session_id, bidi_stream(13))
             .expect_err("poisoned registry should return routed bidi stream");
+        assert!(matches!(&error, RouteBiError::Rejected(_)));
+        let mut returned_bidi = route_bi_error_stream(error);
         assert_eq!(
             returned_bidi
                 .0
@@ -768,9 +1074,11 @@ mod tests {
             VarInt::from_u32(13)
         );
 
-        let mut returned_uni = registry
+        let error = registry
             .route_uni(session_id, uni_stream(14))
             .expect_err("poisoned registry should return routed uni stream");
+        assert!(matches!(&error, RouteUniError::Rejected(_)));
+        let mut returned_uni = route_uni_error_stream(error);
         assert_eq!(
             returned_uni
                 .stream_id()

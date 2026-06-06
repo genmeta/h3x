@@ -49,10 +49,13 @@ pub use error::{
 #[cfg(feature = "rpc")]
 pub(crate) use error::{accept_stream_error, open_stream_error};
 pub use protocol::{
-    WEBTRANSPORT_BIDI_SIGNAL, WEBTRANSPORT_H3, WEBTRANSPORT_UNI_SIGNAL, WebTransportProtocol,
-    WebTransportProtocolFactory,
+    WEBTRANSPORT_BIDI_SIGNAL, WEBTRANSPORT_H3, WEBTRANSPORT_UNI_SIGNAL, WT_SESSION_GONE,
+    WebTransportProtocol, WebTransportProtocolFactory,
 };
-pub use session::WebTransportSession;
+pub use session::{
+    WebTransportSession,
+    stream::{WebTransportStreamReader, WebTransportStreamWriter},
+};
 
 // ============================================================================
 // Session trait (AFIT)
@@ -164,28 +167,28 @@ impl<T: Session> DynSession for T {
 // ============================================================================
 
 impl Session for WebTransportSession {
-    type StreamReader = BoxQuicStreamReader;
-    type StreamWriter = BoxQuicStreamWriter;
+    type StreamReader = WebTransportStreamReader;
+    type StreamWriter = WebTransportStreamWriter;
 
     fn id(&self) -> StreamId {
         WebTransportSession::id(self)
     }
 
-    async fn open_bi(&self) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), OpenStreamError> {
+    async fn open_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), OpenStreamError> {
         WebTransportSession::open_bi(self).await
     }
 
-    async fn open_uni(&self) -> Result<BoxQuicStreamWriter, OpenStreamError> {
+    async fn open_uni(&self) -> Result<Self::StreamWriter, OpenStreamError> {
         WebTransportSession::open_uni(self).await
     }
 
     async fn accept_bi(
         &self,
-    ) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), AcceptStreamError> {
+    ) -> Result<(Self::StreamReader, Self::StreamWriter), AcceptStreamError> {
         WebTransportSession::accept_bi(self).await
     }
 
-    async fn accept_uni(&self) -> Result<BoxQuicStreamReader, AcceptStreamError> {
+    async fn accept_uni(&self) -> Result<Self::StreamReader, AcceptStreamError> {
         WebTransportSession::accept_uni(self).await
     }
 }
