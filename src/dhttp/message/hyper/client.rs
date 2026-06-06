@@ -1,9 +1,10 @@
 use std::{error::Error, sync::Arc};
 
 use bytes::Bytes;
-use http_body::Body;
+use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Empty};
 use snafu::{ResultExt, Snafu};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
 use crate::{
@@ -31,6 +32,43 @@ fn protocol_from_extensions(extensions: &http::Extensions) -> Option<Protocol> {
         Protocol::try_from(Bytes::copy_from_slice(protocol.as_ref()))
             .expect("hyper protocol token is valid UTF-8")
     })
+}
+
+pin_project_lite::pin_project! {
+    struct AbortBodySenderOnDrop<B> {
+        _body_sender: AbortOnDropHandle<()>,
+        #[pin]
+        body: B,
+    }
+}
+
+impl<B> AbortBodySenderOnDrop<B> {
+    fn new(body: B, body_sender: AbortOnDropHandle<()>) -> Self {
+        Self {
+            _body_sender: body_sender,
+            body,
+        }
+    }
+}
+
+impl<B: Body> Body for AbortBodySenderOnDrop<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.project().body.poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -149,16 +187,16 @@ impl<C: quic::Connection> Connection<C> {
                 .await
                 .context(send_message_error::StreamSnafu)?;
 
-            // Spawn background task to send request body + close write stream.
-            // Guard ensures stream cleanup on failure.
-            tokio::spawn(
+            // Response body owns this task: dropping the response aborts an unfinished
+            // request body sender instead of leaving it detached.
+            let body_sender = AbortOnDropHandle::new(tokio::spawn(
                 async move {
                     if write_stream.send_hyper_body(body).await.is_ok() {
                         _ = write_stream.close().await;
                     }
                 }
                 .in_current_span(),
-            );
+            ));
 
             // Read response headers, skipping informational.
             let mut response_parts = read_stream.read_hyper_response_parts().await?;
@@ -171,7 +209,10 @@ impl<C: quic::Connection> Connection<C> {
                 response_parts = read_stream.read_hyper_response_parts().await?;
             }
 
-            let body = Either::left(read_stream.into_hyper_body());
+            let body = Either::left(AbortBodySenderOnDrop::new(
+                read_stream.into_hyper_body(),
+                body_sender,
+            ));
             Ok(http::Response::from_parts(response_parts, body))
         }
     }
@@ -194,7 +235,12 @@ mod tests {
 
     use futures::{Sink, SinkExt, Stream};
     use http::Extensions;
+    use http_body::Frame;
     use http_body_util::{BodyExt, Full};
+    use tokio::{
+        sync::oneshot,
+        time::{Duration, timeout},
+    };
 
     use super::*;
     use crate::{
@@ -400,6 +446,30 @@ mod tests {
 
         async fn closed(&self) -> quic::ConnectionError {
             pending().await
+        }
+    }
+
+    struct PendingRequestBody {
+        dropped: Option<oneshot::Sender<()>>,
+    }
+
+    impl Drop for PendingRequestBody {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                _ = dropped.send(());
+            }
+        }
+    }
+
+    impl Body for PendingRequestBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
         }
     }
 
@@ -621,6 +691,49 @@ mod tests {
             .expect("response body should be readable")
             .to_bytes();
         assert_eq!(body, Bytes::from_static(b"response body"));
+    }
+
+    #[tokio::test]
+    async fn dropping_non_connect_response_aborts_pending_request_body_sender() {
+        let stream_id = VarInt::from_u32(24);
+        let (connection, mut server_reader, mut server_writer) =
+            connection_with_staged_bi_stream(stream_id, Ok(stream_id)).await;
+        let (drop_tx, drop_rx) = oneshot::channel();
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://example.test/upload")
+            .body(PendingRequestBody {
+                dropped: Some(drop_tx),
+            })
+            .expect("request should be valid");
+
+        let client = connection.execute_hyper_request(request);
+        let server = async move {
+            let request_parts = server_reader
+                .read_hyper_request_parts()
+                .await
+                .expect("request headers should be readable");
+            assert_eq!(request_parts.method, http::Method::POST);
+
+            server_writer
+                .send_hyper_response_parts(response_parts(http::StatusCode::OK))
+                .await
+                .expect("response should be written");
+            server_writer
+                .close()
+                .await
+                .expect("response stream should close");
+        };
+
+        let (response, ()) = tokio::join!(client, server);
+        let response = response.expect("client response should succeed");
+
+        drop(response);
+
+        timeout(Duration::from_secs(1), drop_rx)
+            .await
+            .expect("request body sender should be aborted when response is dropped")
+            .expect("request body drop notification should be delivered");
     }
 
     #[tokio::test]
