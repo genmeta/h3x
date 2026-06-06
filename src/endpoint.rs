@@ -16,15 +16,15 @@ use tower_service::Service;
 use tracing::Instrument;
 
 use crate::{
-    connection::{Connection as H3Connection, ConnectionBuilder},
+    connection::{Connection as H3Connection, ConnectionBuilder, ConnectionState},
     dhttp::message::{MessageReader, MessageWriter},
-    endpoint::server::UnresolvedRequest,
     pool::{self, Pool},
     quic::{self, GetStreamIdExt},
     stream_id::StreamId,
 };
 
-pub mod server;
+#[cfg(feature = "hyper")]
+pub mod hyper;
 
 /// Generic HTTP/3 endpoint parameterized over a QUIC transport `Q` and a
 /// connection type `C`.
@@ -49,6 +49,19 @@ pub struct H3Endpoint<Q, C: quic::Connection> {
 pub struct QuicMutGuard<'a, Q, C: quic::Connection> {
     quic: &'a mut Q,
     pool: &'a Pool<C>,
+}
+
+/// A request that has just been accepted on a QUIC stream but whose HTTP/3
+/// header frame has not yet been interpreted by a higher-level HTTP API.
+pub struct UnresolvedRequest {
+    /// QUIC stream identifier for this request.
+    pub stream_id: StreamId,
+    /// Incoming request stream.
+    pub read_stream: MessageReader,
+    /// Outgoing response stream.
+    pub write_stream: MessageWriter,
+    /// Owning H3 connection.
+    pub connection: Arc<ConnectionState<dyn quic::DynConnection>>,
 }
 
 #[derive(Debug, snafu::Snafu)]

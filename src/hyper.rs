@@ -55,8 +55,10 @@ pub mod extended_connect {
     pub use crate::extended_connect::hyper::*;
 }
 
-pub use crate::dhttp::message::hyper::{RequestError, SendMessageError, client};
-pub mod server;
+pub use crate::{
+    dhttp::message::hyper::{RequestError, SendMessageError, client},
+    endpoint::hyper as server,
+};
 
 #[cfg(test)]
 mod tests {

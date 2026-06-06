@@ -22,7 +22,7 @@
 //! # Handler access pattern
 //!
 //! Raw handlers receive protocol access through
-//! [`crate::endpoint::server::UnresolvedRequest::connection`], which exposes
+//! [`crate::endpoint::UnresolvedRequest::connection`], which exposes
 //! connection-scoped protocol state. Combined with [`crate::stream_id::StreamId`],
 //! a handler can derive per-request/session handles from that state:
 //!

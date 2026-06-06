@@ -15,11 +15,11 @@ use crate::{
     dhttp::message::{
         MessageReader, MessageStreamError,
         hyper::{
+            SendMessageError,
             upgrade::{RemainStream, TakeoverSlot},
-            write::SendMessageError,
         },
     },
-    endpoint::server::UnresolvedRequest,
+    endpoint::UnresolvedRequest,
     qpack::field::MalformedHeaderSection,
 };
 
