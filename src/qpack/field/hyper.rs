@@ -41,7 +41,7 @@ pub fn header_map_to_field_lines(headers: http::HeaderMap) -> impl Iterator<Item
         .flatten()
 }
 
-pub(crate) fn validated_hyper_request_parts_to_field_lines(
+pub fn validated_hyper_request_parts_to_field_lines(
     parts: http::request::Parts,
 ) -> Result<Vec<FieldLine>, MalformedHeaderSection> {
     let section = FieldSection::from(parts);

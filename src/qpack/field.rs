@@ -13,7 +13,7 @@ mod section;
 pub use section::{FieldSection, Iter, MalformedHeaderSection, malformed_header_section};
 
 #[cfg(feature = "hyper")]
-pub(crate) mod hyper;
+pub mod hyper;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Protocol {

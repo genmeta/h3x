@@ -11,12 +11,12 @@ use crate::{
     dhttp::message::{
         InitialMessageStreamError, MessageStreamError,
         hyper::{
+            SendMessageError,
             read::Either,
             upgrade::{RemainStream, TakeoverSlot},
             write::send_message_error,
         },
     },
-    hyper::SendMessageError,
     qpack::field::{Protocol, hyper::validated_hyper_request_parts_to_field_lines},
     quic::{self, GetStreamIdExt},
     stream_id::StreamId,
