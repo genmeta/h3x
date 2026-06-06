@@ -36,11 +36,23 @@ pub(crate) mod guard;
 pub mod hyper;
 pub mod unfold;
 
-pub type BoxMessageReader =
-    crate::stream::BoxStreamReader<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>;
+pub type BoxMessageReader<
+    S = dyn crate::stream::ReadStream<
+        Bytes,
+        MessageStreamError,
+        quic::StreamError,
+        quic::StreamError,
+    > + Send,
+> = Pin<Box<S>>;
 
-pub type BoxMessageWriter =
-    crate::stream::BoxStreamWriter<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>;
+pub type BoxMessageWriter<
+    S = dyn crate::stream::WriteStream<
+        Bytes,
+        MessageStreamError,
+        quic::StreamError,
+        quic::StreamError,
+    > + Send,
+> = Pin<Box<S>>;
 
 impl quic::GetStreamId
     for dyn crate::stream::ReadStream<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>

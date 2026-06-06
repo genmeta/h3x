@@ -16,18 +16,18 @@ use crate::error::H3MessageError;
 
 pin_project_lite::pin_project! {
     #[project = EitherProj]
-    pub enum Either<L, R> {
+    pub(crate) enum Either<L, R> {
         Left { #[pin] body: L },
         Right { #[pin] body: R }
     }
 }
 
 impl<L, R> Either<L, R> {
-    pub fn left(body: L) -> Self {
+    pub(crate) fn left(body: L) -> Self {
         Self::Left { body }
     }
 
-    pub fn right(body: R) -> Self {
+    pub(crate) fn right(body: R) -> Self {
         Self::Right { body }
     }
 }

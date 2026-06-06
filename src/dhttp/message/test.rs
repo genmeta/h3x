@@ -1,5 +1,5 @@
-//! Test helpers for creating [`MessageReader`](super::stream::MessageReader) and
-//! [`MessageWriter`](super::stream::MessageWriter) instances with mock QUIC connections,
+//! Test helpers for creating [`MessageReader`](super::MessageReader) and
+//! [`MessageWriter`](super::MessageWriter) instances with mock QUIC connections,
 //! suitable for unit testing.
 
 use std::{
