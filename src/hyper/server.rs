@@ -12,14 +12,14 @@ use snafu::{ResultExt, Snafu};
 use tracing::Instrument;
 
 use crate::{
-    endpoint::server::UnresolvedRequest,
-    message::stream::{
+    dhttp::message::{
         MessageReader, MessageStreamError,
         hyper::{
             upgrade::{RemainStream, TakeoverSlot},
             write::SendMessageError,
         },
     },
+    endpoint::server::UnresolvedRequest,
     qpack::field::MalformedHeaderSection,
 };
 
@@ -262,8 +262,11 @@ mod tests {
     use crate::{
         codec::{SinkWriter, StreamReader},
         connection::{ConnectionState, StreamError, tests::MockConnection},
-        dhttp::{protocol::DHttpProtocol, settings::Settings},
-        message::stream::{MessageWriter, guard},
+        dhttp::{
+            message::{MessageWriter, guard},
+            protocol::DHttpProtocol,
+            settings::Settings,
+        },
         protocol::Protocols,
         qpack::{
             decoder::DecoderInstruction,
@@ -486,10 +489,10 @@ mod tests {
     fn stream_pair(stream_id: VarInt) -> (MessageReader, MessageWriter) {
         let state = connection_state();
         let (reader, writer) = quic::test::mock_stream_pair_with_capacity(stream_id, 64);
-        let reader = StreamReader::new(guard::GuardedQuicReader::new(
+        let reader = StreamReader::new(guard::GuardQuicReader::new(
             Box::pin(reader) as crate::quic::BoxQuicStreamReader
         ));
-        let writer = SinkWriter::new(guard::GuardedQuicWriter::new(
+        let writer = SinkWriter::new(guard::GuardQuicWriter::new(
             Box::pin(writer) as crate::quic::BoxQuicStreamWriter
         ));
 

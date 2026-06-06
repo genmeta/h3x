@@ -5,7 +5,7 @@ use snafu::ResultExt;
 
 use crate::{
     connection::ConnectionState,
-    message::stream::{MessageReader, MessageWriter},
+    dhttp::message::{MessageReader, MessageWriter},
     qpack::field::Protocol,
     quic,
     stream_id::StreamId,
@@ -112,7 +112,7 @@ mod tests {
     use super::*;
     use crate::{
         connection::{ConnectionState, tests::MockConnection},
-        message::test::{read_stream_for_test, write_stream_for_test},
+        dhttp::message::test::{read_stream_for_test, write_stream_for_test},
         protocol::Protocols,
         qpack::field::Protocol,
         quic,

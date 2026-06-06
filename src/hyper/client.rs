@@ -8,8 +8,7 @@ use tracing::Instrument;
 
 use crate::{
     connection::Connection,
-    hyper::SendMessageError,
-    message::stream::{
+    dhttp::message::{
         InitialMessageStreamError, MessageStreamError,
         hyper::{
             read::Either,
@@ -17,6 +16,7 @@ use crate::{
             write::send_message_error,
         },
     },
+    hyper::SendMessageError,
     qpack::field::{Protocol, hyper::validated_hyper_request_parts_to_field_lines},
     quic::{self, GetStreamIdExt},
     stream_id::StreamId,
@@ -200,8 +200,11 @@ mod tests {
     use crate::{
         codec::{SinkWriter, StreamReader},
         connection::{ConnectionBuilder, ConnectionState, StreamError},
-        dhttp::{protocol::DHttpProtocol, settings::Settings},
-        message::stream::{MessageReader, MessageWriter, guard},
+        dhttp::{
+            message::{MessageReader, MessageWriter, guard},
+            protocol::DHttpProtocol,
+            settings::Settings,
+        },
         protocol::Protocols,
         qpack::{
             decoder::DecoderInstruction,
@@ -446,10 +449,10 @@ mod tests {
         writer: impl quic::WriteStream + Unpin + 'static,
     ) -> (MessageReader, MessageWriter) {
         let state = server_connection_state();
-        let reader = StreamReader::new(guard::GuardedQuicReader::new(
+        let reader = StreamReader::new(guard::GuardQuicReader::new(
             Box::pin(reader) as crate::quic::BoxQuicStreamReader
         ));
-        let writer = SinkWriter::new(guard::GuardedQuicWriter::new(
+        let writer = SinkWriter::new(guard::GuardQuicWriter::new(
             Box::pin(writer) as crate::quic::BoxQuicStreamWriter
         ));
 

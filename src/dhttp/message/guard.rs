@@ -88,17 +88,17 @@ impl QuicWriterState {
 }
 
 // ---------------------------------------------------------------------------
-// GuardedQuicReader
+// GuardQuicReader
 // ---------------------------------------------------------------------------
 
 /// A QUIC read stream wrapper that automatically stops the stream on drop
 /// while the receive side is still open.
-pub struct GuardedQuicReader {
+pub struct GuardQuicReader {
     stream_id: Option<VarInt>,
     state: QuicReaderState,
 }
 
-impl GuardedQuicReader {
+impl GuardQuicReader {
     pub fn new(inner: BoxQuicStreamReader) -> Self {
         Self {
             stream_id: None,
@@ -152,7 +152,7 @@ impl GuardedQuicReader {
     }
 }
 
-impl Stream for GuardedQuicReader {
+impl Stream for GuardQuicReader {
     type Item = Result<Bytes, quic::StreamError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -184,7 +184,7 @@ impl Stream for GuardedQuicReader {
     }
 }
 
-impl quic::StopStream for GuardedQuicReader {
+impl quic::StopStream for GuardQuicReader {
     fn poll_stop(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -212,7 +212,7 @@ impl quic::StopStream for GuardedQuicReader {
     }
 }
 
-impl quic::GetStreamId for GuardedQuicReader {
+impl quic::GetStreamId for GuardQuicReader {
     fn poll_stream_id(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -250,7 +250,7 @@ impl quic::GetStreamId for GuardedQuicReader {
     }
 }
 
-impl Drop for GuardedQuicReader {
+impl Drop for GuardQuicReader {
     fn drop(&mut self) {
         if let QuicReaderState::Open { mut stream } = self.state.take() {
             // Inherent termination: the task owns the only remaining stream
@@ -267,16 +267,16 @@ impl Drop for GuardedQuicReader {
 }
 
 // ---------------------------------------------------------------------------
-// GuardedQuicWriter
+// GuardQuicWriter
 // ---------------------------------------------------------------------------
 
 /// A QUIC write stream wrapper that automatically resets the stream on drop
 /// while the send side is still open.
-pub struct GuardedQuicWriter {
+pub struct GuardQuicWriter {
     state: QuicWriterState,
 }
 
-impl GuardedQuicWriter {
+impl GuardQuicWriter {
     pub fn new(inner: BoxQuicStreamWriter) -> Self {
         Self {
             state: QuicWriterState::open(inner),
@@ -314,7 +314,7 @@ impl GuardedQuicWriter {
     }
 }
 
-impl Sink<Bytes> for GuardedQuicWriter {
+impl Sink<Bytes> for GuardQuicWriter {
     type Error = quic::StreamError;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -411,7 +411,7 @@ impl Sink<Bytes> for GuardedQuicWriter {
     }
 }
 
-impl quic::ResetStream for GuardedQuicWriter {
+impl quic::ResetStream for GuardQuicWriter {
     fn poll_reset(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -445,7 +445,7 @@ impl quic::ResetStream for GuardedQuicWriter {
     }
 }
 
-impl quic::GetStreamId for GuardedQuicWriter {
+impl quic::GetStreamId for GuardQuicWriter {
     fn poll_stream_id(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -475,7 +475,7 @@ impl quic::GetStreamId for GuardedQuicWriter {
     }
 }
 
-impl Drop for GuardedQuicWriter {
+impl Drop for GuardQuicWriter {
     fn drop(&mut self) {
         if let QuicWriterState::Open { mut stream } = self.state.take() {
             // Inherent termination: the task owns the only remaining stream
@@ -606,7 +606,7 @@ mod tests {
         stream_id: u32,
         next_results: impl IntoIterator<Item = Option<Result<Bytes, quic::StreamError>>>,
         stop_results: impl IntoIterator<Item = Result<(), quic::StreamError>>,
-    ) -> (GuardedQuicReader, mpsc::UnboundedReceiver<VarInt>) {
+    ) -> (GuardQuicReader, mpsc::UnboundedReceiver<VarInt>) {
         let state = ReaderState {
             stream_id: VarInt::from_u32(stream_id),
             next_results: Arc::new(Mutex::new(next_results.into_iter().collect())),
@@ -614,7 +614,7 @@ mod tests {
         };
         let (stop_tx, stop_rx) = mpsc::unbounded_channel();
         (
-            GuardedQuicReader::new(Box::pin(TestReader { state, stop_tx })),
+            GuardQuicReader::new(Box::pin(TestReader { state, stop_tx })),
             stop_rx,
         )
     }
@@ -706,11 +706,7 @@ mod tests {
         stream_id: u32,
         close_results: impl IntoIterator<Item = Result<(), quic::StreamError>>,
         reset_results: impl IntoIterator<Item = Result<(), quic::StreamError>>,
-    ) -> (
-        GuardedQuicWriter,
-        SentItems,
-        mpsc::UnboundedReceiver<VarInt>,
-    ) {
+    ) -> (GuardQuicWriter, SentItems, mpsc::UnboundedReceiver<VarInt>) {
         let sent_items = Arc::new(Mutex::new(Vec::new()));
         let state = WriterState {
             stream_id: VarInt::from_u32(stream_id),
@@ -720,7 +716,7 @@ mod tests {
         };
         let (reset_tx, reset_rx) = mpsc::unbounded_channel();
         (
-            GuardedQuicWriter::new(Box::pin(TestWriter { state, reset_tx })),
+            GuardQuicWriter::new(Box::pin(TestWriter { state, reset_tx })),
             sent_items,
             reset_rx,
         )
@@ -844,7 +840,7 @@ mod tests {
     async fn reader_take_moves_inner_stream_and_panics_on_original_use() {
         let (mut guard, stop_rx) = reader_guard(7, [], [Ok(())]);
         guard.set_stream_id(VarInt::from_u32(7));
-        let mut taken = GuardedQuicReader::take(&mut guard);
+        let mut taken = GuardQuicReader::take(&mut guard);
 
         assert_eq!(
             taken
@@ -894,7 +890,7 @@ mod tests {
     async fn reader_eof_releases_inner_stream_immediately() {
         let (stop_tx, _stop_rx) = mpsc::unbounded_channel();
         let (drop_tx, mut drop_rx) = mpsc::unbounded_channel();
-        let mut guard = GuardedQuicReader::new(Box::pin(DropNotifyingReader {
+        let mut guard = GuardQuicReader::new(Box::pin(DropNotifyingReader {
             stream_id: VarInt::from_u32(111),
             next_results: [None].into_iter().collect(),
             stop_tx,
@@ -960,7 +956,7 @@ mod tests {
     #[tokio::test]
     async fn writer_take_moves_inner_stream_and_panics_on_original_use() {
         let (mut guard, sent_items, reset_rx) = writer_guard(8, [], [Ok(())]);
-        let mut taken = GuardedQuicWriter::take(&mut guard);
+        let mut taken = GuardQuicWriter::take(&mut guard);
 
         assert_eq!(
             taken
@@ -1029,7 +1025,7 @@ mod tests {
     async fn writer_close_releases_inner_stream_immediately() {
         let (reset_tx, _reset_rx) = mpsc::unbounded_channel();
         let (drop_tx, mut drop_rx) = mpsc::unbounded_channel();
-        let mut guard = GuardedQuicWriter::new(Box::pin(DropNotifyingWriter {
+        let mut guard = GuardQuicWriter::new(Box::pin(DropNotifyingWriter {
             stream_id: VarInt::from_u32(121),
             close_results: [Ok(())].into_iter().collect(),
             reset_results: [].into_iter().collect(),
@@ -1068,7 +1064,7 @@ mod tests {
     async fn writer_reset_releases_inner_stream_immediately() {
         let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
         let (drop_tx, mut drop_rx) = mpsc::unbounded_channel();
-        let mut guard = GuardedQuicWriter::new(Box::pin(DropNotifyingWriter {
+        let mut guard = GuardQuicWriter::new(Box::pin(DropNotifyingWriter {
             stream_id: VarInt::from_u32(122),
             close_results: [].into_iter().collect(),
             reset_results: [Ok(())].into_iter().collect(),

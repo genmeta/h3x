@@ -160,7 +160,7 @@ mod tests {
     use super::*;
     use crate::{
         codec::SinkWriter,
-        message::{stream::guard, test::write_stream_for_test},
+        dhttp::message::{guard, test::write_stream_for_test},
         qpack::protocol::QPackEncoder,
         quic,
         varint::VarInt,
@@ -288,7 +288,7 @@ mod tests {
         let state = crate::connection::ConnectionState::new_for_test(erased, Arc::new(protocols));
 
         let resets = Arc::new(Mutex::new(Vec::new()));
-        let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TestWriter {
+        let writer = SinkWriter::new(guard::GuardQuicWriter::new(Box::pin(TestWriter {
             stream_id,
             resets: resets.clone(),
         })

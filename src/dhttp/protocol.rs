@@ -31,6 +31,7 @@ use crate::{
     dhttp::{
         frame::{Frame, stream::FrameStream},
         goaway::Goaway,
+        message::guard,
         settings::Settings,
         stream::UnidirectionalStream,
     },
@@ -38,7 +39,6 @@ use crate::{
         Code, H3CriticalStreamClosed, H3FrameUnexpected, H3IdError, H3MissingSettings,
         H3StreamCreationError,
     },
-    message::stream::guard,
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     quic::{self, ConnectionError, GetStreamIdExt, ResetStreamExt, StopStreamExt},
     util::{ring_channel::RingChannel, set_once::SetOnce, watch::Watch},
@@ -182,16 +182,16 @@ mod tests {
     fn test_erased_streams(
         stream_id: u32,
     ) -> (
-        StreamReader<guard::GuardedQuicReader>,
-        SinkWriter<guard::GuardedQuicWriter>,
+        StreamReader<guard::GuardQuicReader>,
+        SinkWriter<guard::GuardQuicWriter>,
     ) {
         let stream_id = VarInt::from_u32(stream_id);
         let reader =
-            StreamReader::new(guard::GuardedQuicReader::new(
+            StreamReader::new(guard::GuardQuicReader::new(
                 Box::pin(TestReadStream { stream_id }) as BoxQuicStreamReader,
             ));
         let writer =
-            SinkWriter::new(guard::GuardedQuicWriter::new(
+            SinkWriter::new(guard::GuardQuicWriter::new(
                 Box::pin(TestWriteStream { stream_id }) as BoxQuicStreamWriter,
             ));
         (reader, writer)
@@ -1361,8 +1361,8 @@ pub struct DHttpProtocol {
     handle_control_stream: SetOnce<AbortOnDropHandle<()>>,
 
     unresolved_request_streams: RingChannel<(
-        StreamReader<guard::GuardedQuicReader>,
-        SinkWriter<guard::GuardedQuicWriter>,
+        StreamReader<guard::GuardQuicReader>,
+        SinkWriter<guard::GuardQuicWriter>,
     )>,
 }
 
@@ -1487,8 +1487,8 @@ impl DHttpProtocol {
             Pin::new(&mut reader).reset();
             let reader = reader
                 .into_stream_reader()
-                .map_stream(guard::GuardedQuicReader::new);
-            let writer = writer.map_sink(guard::GuardedQuicWriter::new);
+                .map_stream(guard::GuardQuicReader::new);
+            let writer = writer.map_sink(guard::GuardQuicWriter::new);
             let item = (reader, writer);
             if let Some(mut unresolved) = self.unresolved_request_streams.send(item) {
                 // Ring channel is full — reject the oldest unresolved request.
@@ -1719,8 +1719,8 @@ impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync> ConnectionState<C> {
         &self,
     ) -> Result<
         (
-            StreamReader<guard::GuardedQuicReader>,
-            SinkWriter<guard::GuardedQuicWriter>,
+            StreamReader<guard::GuardQuicReader>,
+            SinkWriter<guard::GuardQuicWriter>,
         ),
         InitialRawMessageStreamError,
     > {
@@ -1729,8 +1729,8 @@ impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync> ConnectionState<C> {
         self.dhttp()
             .register_initialized_stream(reader.stream_id().await?)?;
         Ok((
-            StreamReader::new(guard::GuardedQuicReader::new(reader)),
-            SinkWriter::new(guard::GuardedQuicWriter::new(writer)),
+            StreamReader::new(guard::GuardQuicReader::new(reader)),
+            SinkWriter::new(guard::GuardQuicWriter::new(writer)),
         ))
     }
 
@@ -1738,8 +1738,8 @@ impl<C: quic::Lifecycle + quic::ManageStream + Send + Sync> ConnectionState<C> {
         &self,
     ) -> Result<
         (
-            StreamReader<guard::GuardedQuicReader>,
-            SinkWriter<guard::GuardedQuicWriter>,
+            StreamReader<guard::GuardQuicReader>,
+            SinkWriter<guard::GuardQuicWriter>,
         ),
         AcceptRawMessageStreamError,
     > {

@@ -2,7 +2,7 @@
 pub mod upgrade {
     use std::future::poll_fn;
 
-    pub use crate::message::stream::{
+    pub use crate::dhttp::message::{
         BoxMessageReader, BoxMessageWriter, MessageReader, MessageWriter,
         hyper::upgrade::{HasTakeover, MissingStream, TakeoverError, TakeoverSlot, UpgradeError},
     };
@@ -55,7 +55,7 @@ pub mod extended_connect {
     pub use crate::extended_connect::hyper::*;
 }
 
-pub use crate::message::stream::hyper::write::SendMessageError;
+pub use crate::dhttp::message::hyper::write::SendMessageError;
 
 pub mod client;
 pub mod server;
@@ -72,8 +72,8 @@ mod tests {
 
     use super::upgrade;
     use crate::{
-        message::{
-            stream::hyper::upgrade::{
+        dhttp::message::{
+            hyper::upgrade::{
                 MissingStream, RemainStream, TakeoverError, TakeoverSlot, UpgradeError,
             },
             test::{read_stream_for_test, write_stream_for_test},
@@ -103,8 +103,8 @@ mod tests {
         assert!(matches!(
             compat,
             Err(
-                crate::message::stream::hyper::upgrade::UpgradeError::Takeover {
-                    source: crate::message::stream::hyper::upgrade::TakeoverError::BodyNotReleased,
+                crate::dhttp::message::hyper::upgrade::UpgradeError::Takeover {
+                    source: crate::dhttp::message::hyper::upgrade::TakeoverError::BodyNotReleased,
                 }
             )
         ));

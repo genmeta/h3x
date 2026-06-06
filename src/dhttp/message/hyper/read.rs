@@ -191,10 +191,10 @@ mod tests {
     use crate::{
         codec::{SinkWriter, StreamReader},
         connection::{ConnectionState, StreamError, tests::MockConnection},
-        dhttp::{protocol::DHttpProtocol, settings::Settings},
-        message::{
-            stream::{MessageWriter, guard},
-            test::read_stream_for_test,
+        dhttp::{
+            message::{MessageWriter, guard, test::read_stream_for_test},
+            protocol::DHttpProtocol,
+            settings::Settings,
         },
         protocol::Protocols,
         qpack::{
@@ -237,10 +237,10 @@ mod tests {
         let state = ConnectionState::new_for_test(erased, Arc::new(protocols));
 
         let (reader, writer) = quic::test::mock_stream_pair_with_capacity(stream_id, 64);
-        let reader = StreamReader::new(guard::GuardedQuicReader::new(
+        let reader = StreamReader::new(guard::GuardQuicReader::new(
             Box::pin(reader) as crate::quic::BoxQuicStreamReader
         ));
-        let writer = SinkWriter::new(guard::GuardedQuicWriter::new(
+        let writer = SinkWriter::new(guard::GuardQuicWriter::new(
             Box::pin(writer) as crate::quic::BoxQuicStreamWriter
         ));
 

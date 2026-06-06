@@ -11,7 +11,7 @@ use std::{
 use bytes::Bytes;
 use futures::{Sink, SinkExt, Stream};
 
-use super::stream::{MessageReader, MessageWriter, guard};
+use super::{MessageReader, MessageWriter, guard};
 use crate::{
     codec::{SinkWriter, StreamReader},
     qpack::protocol::{QPackDecoder, QPackEncoder},
@@ -89,7 +89,7 @@ pub fn read_stream_for_test(stream_id: VarInt) -> MessageReader {
     ));
     let state = crate::connection::ConnectionState::new_for_test(erased, Arc::new(protocols));
 
-    let reader = StreamReader::new(guard::GuardedQuicReader::new(
+    let reader = StreamReader::new(guard::GuardQuicReader::new(
         Box::pin(TestReader { stream_id }) as crate::quic::BoxQuicStreamReader,
     ));
 
@@ -193,7 +193,7 @@ pub fn write_stream_for_test(stream_id: VarInt) -> MessageWriter {
     ));
     let state = crate::connection::ConnectionState::new_for_test(erased, Arc::new(protocols));
 
-    let writer = SinkWriter::new(guard::GuardedQuicWriter::new(
+    let writer = SinkWriter::new(guard::GuardQuicWriter::new(
         Box::pin(TestWriter { stream_id }) as crate::quic::BoxQuicStreamWriter,
     ));
 

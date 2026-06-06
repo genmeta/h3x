@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-pub use crate::message::stream::{MessageReader, MessageStreamError, MessageWriter};
+pub use crate::dhttp::message::{MessageReader, MessageStreamError, MessageWriter};
 use crate::{connection::ConnectionState, quic, stream_id::StreamId};
 
 /// A request that has just been accepted on a QUIC stream but whose HTTP/3

@@ -1,6 +1,6 @@
 use crate::{
+    dhttp::message::{MessageReader, MessageWriter},
     extended_connect::{EstablishedConnect, IntoStreamsError},
-    message::stream::{MessageReader, MessageWriter},
     qpack::field::Protocol,
     stream_id::StreamId,
 };

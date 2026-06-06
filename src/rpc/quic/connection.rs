@@ -15,8 +15,8 @@ use super::{
     stream::{ReadFrameChannels, WriteFrameChannels},
 };
 use crate::{
+    dhttp::message::guard,
     error::Code,
-    message::stream::guard,
     quic::{self, BoxQuicStreamReader, BoxQuicStreamWriter, ConnectionError, GetStreamIdExt},
     rpc::lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt},
     varint::VarInt,
@@ -206,8 +206,8 @@ impl From<RemoteConnection> for ConnectionClient {
 }
 
 impl quic::ManageStream for RemoteConnection {
-    type StreamWriter = crate::message::stream::guard::GuardedQuicWriter;
-    type StreamReader = crate::message::stream::guard::GuardedQuicReader;
+    type StreamWriter = crate::dhttp::message::guard::GuardQuicWriter;
+    type StreamReader = crate::dhttp::message::guard::GuardQuicReader;
 
     async fn open_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
         let (reader, writer) = self.guard(Connection::open_bi(&self.client)).await?;
@@ -237,16 +237,16 @@ impl quic::ManageStream for RemoteConnection {
 }
 
 impl RemoteConnection {
-    fn read_channels_into_quic(&self, channels: ReadFrameChannels) -> guard::GuardedQuicReader {
+    fn read_channels_into_quic(&self, channels: ReadFrameChannels) -> guard::GuardQuicReader {
         let lifecycle = Arc::new(self.clone());
         let raw = Box::pin(channels.into_quic(lifecycle)) as BoxQuicStreamReader;
-        guard::GuardedQuicReader::new(raw)
+        guard::GuardQuicReader::new(raw)
     }
 
-    fn write_channels_into_quic(&self, channels: WriteFrameChannels) -> guard::GuardedQuicWriter {
+    fn write_channels_into_quic(&self, channels: WriteFrameChannels) -> guard::GuardQuicWriter {
         let lifecycle = Arc::new(self.clone());
         let raw = Box::pin(channels.into_quic(lifecycle)) as BoxQuicStreamWriter;
-        guard::GuardedQuicWriter::new(raw)
+        guard::GuardQuicWriter::new(raw)
     }
 }
 

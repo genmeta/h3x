@@ -17,8 +17,8 @@ use tracing::Instrument;
 
 use crate::{
     connection::{Connection as H3Connection, ConnectionBuilder},
+    dhttp::message::{MessageReader, MessageWriter},
     endpoint::server::UnresolvedRequest,
-    message::stream::{MessageReader, MessageWriter},
     pool::{self, Pool},
     quic::{self, GetStreamIdExt},
     stream_id::StreamId,
@@ -408,8 +408,10 @@ mod tests {
                 TestWriteStream,
             },
         },
-        dhttp::protocol::DHttpProtocol,
-        message::stream::guard::{GuardedQuicReader, GuardedQuicWriter},
+        dhttp::{
+            message::guard::{GuardQuicReader, GuardQuicWriter},
+            protocol::DHttpProtocol,
+        },
         pool::ReuseableConnection,
         protocol::{Protocol, Protocols, StreamVerdict},
         qpack::protocol::QPackProtocolFactory,
@@ -2127,14 +2129,14 @@ mod tests {
             stream_id: StreamId(VarInt::from_u32(111)),
             read_stream: MessageReader::new(
                 VarInt::from_u32(111),
-                StreamReader::new(GuardedQuicReader::new(
+                StreamReader::new(GuardQuicReader::new(
                     Box::pin(request_reader) as BoxQuicStreamReader
                 )),
                 qpack.decoder.clone(),
                 erased.clone(),
             ),
             write_stream: MessageWriter::new(
-                SinkWriter::new(GuardedQuicWriter::new(
+                SinkWriter::new(GuardQuicWriter::new(
                     Box::pin(response_writer) as BoxQuicStreamWriter
                 )),
                 qpack.encoder.clone(),

@@ -203,8 +203,8 @@ mod tests {
     use super::*;
     use crate::{
         connection::{ConnectionState, tests::MockConnection},
+        dhttp::message::{MessageWriter, test::read_stream_for_test},
         extended_connect::{EstablishedConnect, PendingWriteStreamError},
-        message::{stream::MessageWriter, test::read_stream_for_test},
         protocol::Protocols,
         qpack::field::Protocol,
         quic::{self, GetStreamIdExt},

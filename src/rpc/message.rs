@@ -4,7 +4,7 @@
 //! [`ReadFrameChannels`] and [`WriteFrameChannels`] used by QUIC-level RPC
 //! stream forwarding. This module adds message-level conversion methods on
 //! those channel bundles: data-path QUIC stream errors are mapped to
-//! [`MessageStreamError`](crate::message::stream::MessageStreamError), while
+//! [`MessageStreamError`](crate::dhttp::message::MessageStreamError), while
 //! QUIC control operations (`StopStream`, `ResetStream`, `GetStreamId`) keep
 //! returning [`quic::StreamError`](crate::quic::StreamError).
 //!

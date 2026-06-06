@@ -357,12 +357,15 @@ mod tests {
     use crate::{
         codec::StreamReader,
         connection::{ConnectionState, tests::MockConnection},
-        dhttp::{protocol::DHttpProtocol, settings::Settings},
-        extended_connect::EstablishedConnect,
-        message::{
-            stream::{MessageReader, guard},
-            test::{read_stream_for_test, write_stream_for_test},
+        dhttp::{
+            message::{
+                MessageReader, guard,
+                test::{read_stream_for_test, write_stream_for_test},
+            },
+            protocol::DHttpProtocol,
+            settings::Settings,
         },
+        extended_connect::EstablishedConnect,
         protocol::Protocols,
         qpack::{field::Protocol, protocol::QPackDecoder},
         quic,
@@ -1091,7 +1094,7 @@ mod tests {
 
         MessageReader::new(
             VarInt::from_u32(stream_id),
-            StreamReader::new(guard::GuardedQuicReader::new(
+            StreamReader::new(guard::GuardQuicReader::new(
                 Box::pin(reader) as crate::quic::BoxQuicStreamReader
             )),
             Arc::new(QPackDecoder::new(
@@ -1121,7 +1124,7 @@ mod tests {
 
         MessageReader::new(
             VarInt::from_u32(stream_id),
-            StreamReader::new(guard::GuardedQuicReader::new(
+            StreamReader::new(guard::GuardQuicReader::new(
                 Box::pin(reader) as crate::quic::BoxQuicStreamReader
             )),
             Arc::new(QPackDecoder::new(

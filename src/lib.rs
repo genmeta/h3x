@@ -6,7 +6,6 @@ pub mod connection;
 pub mod dhttp;
 pub mod error;
 pub mod extended_connect;
-pub mod message;
 pub mod pool;
 pub mod protocol;
 pub mod qpack;

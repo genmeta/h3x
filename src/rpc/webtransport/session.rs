@@ -18,7 +18,7 @@ use super::{
     LifecycleExt,
 };
 use crate::{
-    message::stream::guard,
+    dhttp::message::guard,
     quic::{
         self, BoxQuicStreamReader, BoxQuicStreamWriter, ConnectionError, DynLifecycle,
         GetStreamIdExt,
@@ -169,8 +169,8 @@ impl quic::Lifecycle for RemoteWebTransportSession {
 }
 
 impl webtransport::Session for RemoteWebTransportSession {
-    type StreamReader = guard::GuardedQuicReader;
-    type StreamWriter = guard::GuardedQuicWriter;
+    type StreamReader = guard::GuardQuicReader;
+    type StreamWriter = guard::GuardQuicWriter;
 
     fn id(&self) -> StreamId {
         self.session_id.into()
@@ -214,16 +214,16 @@ impl webtransport::Session for RemoteWebTransportSession {
 }
 
 impl RemoteWebTransportSession {
-    fn read_channels_into_quic(&self, channels: ReadFrameChannels) -> guard::GuardedQuicReader {
+    fn read_channels_into_quic(&self, channels: ReadFrameChannels) -> guard::GuardQuicReader {
         let lifecycle = Arc::new(self.clone());
         let raw = Box::pin(channels.into_quic(lifecycle)) as BoxQuicStreamReader;
-        guard::GuardedQuicReader::new(raw)
+        guard::GuardQuicReader::new(raw)
     }
 
-    fn write_channels_into_quic(&self, channels: WriteFrameChannels) -> guard::GuardedQuicWriter {
+    fn write_channels_into_quic(&self, channels: WriteFrameChannels) -> guard::GuardQuicWriter {
         let lifecycle = Arc::new(self.clone());
         let raw = Box::pin(channels.into_quic(lifecycle)) as BoxQuicStreamWriter;
-        guard::GuardedQuicWriter::new(raw)
+        guard::GuardQuicWriter::new(raw)
     }
 }
 
@@ -338,9 +338,9 @@ mod tests {
     use super::*;
     use crate::{
         connection::{ConnectionState, tests::MockConnection},
+        dhttp::message::test::{read_stream_for_test, write_stream_for_test},
         error::Code,
         extended_connect::EstablishedConnect,
-        message::test::{read_stream_for_test, write_stream_for_test},
         protocol::Protocols,
         qpack::field::Protocol,
         quic::{BoxQuicStreamReader, BoxQuicStreamWriter, GetStreamIdExt, StopStreamExt},

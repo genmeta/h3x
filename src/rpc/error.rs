@@ -24,7 +24,7 @@ impl From<remoc::rtc::CallError> for quic::StreamError {
     }
 }
 
-impl From<remoc::rtc::CallError> for crate::message::stream::MessageStreamError {
+impl From<remoc::rtc::CallError> for crate::dhttp::message::MessageStreamError {
     fn from(error: remoc::rtc::CallError) -> Self {
         quic::StreamError::from(error).into()
     }
@@ -74,7 +74,7 @@ impl std::fmt::Debug for StringError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::stream::MessageStreamError;
+    use crate::dhttp::message::MessageStreamError;
 
     #[test]
     fn call_error_maps_to_internal_transport_connection_error() {

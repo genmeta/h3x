@@ -9,15 +9,13 @@ use futures::{Sink, Stream, stream::FusedStream};
 
 use crate::{
     codec::{SinkWriter, StreamReader},
-    message::stream::{
-        BoxMessageReader, BoxMessageWriter, MessageStreamError, MessageStreamReader,
-        MessageStreamWriter,
-    },
+    dhttp::message::{BoxMessageReader, BoxMessageWriter, MessageStreamError},
     quic,
     rpc::{
         lifecycle::LifecycleExt,
         stream::remoc::{ReadFrameChannels, WriteFrameChannels},
     },
+    stream,
 };
 
 pin_project_lite::pin_project! {
@@ -82,6 +80,31 @@ where
         code: crate::varint::VarInt,
     ) -> Poll<Result<(), quic::StreamError>> {
         self.project().inner.poll_stop(cx, code)
+    }
+}
+
+impl<R> stream::GetStreamId<quic::StreamError> for MessageFrameReader<R>
+where
+    R: quic::GetStreamId,
+{
+    fn poll_stream_id(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<crate::varint::VarInt, quic::StreamError>> {
+        quic::GetStreamId::poll_stream_id(self, cx)
+    }
+}
+
+impl<R> stream::StopStream<quic::StreamError> for MessageFrameReader<R>
+where
+    R: quic::StopStream,
+{
+    fn poll_stop(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        code: crate::varint::VarInt,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        quic::StopStream::poll_stop(self, cx, code)
     }
 }
 
@@ -161,9 +184,39 @@ where
     }
 }
 
+impl<W> stream::GetStreamId<quic::StreamError> for MessageFrameWriter<W>
+where
+    W: quic::GetStreamId,
+{
+    fn poll_stream_id(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<crate::varint::VarInt, quic::StreamError>> {
+        quic::GetStreamId::poll_stream_id(self, cx)
+    }
+}
+
+impl<W> stream::ResetStream<quic::StreamError> for MessageFrameWriter<W>
+where
+    W: quic::ResetStream,
+{
+    fn poll_reset(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        code: crate::varint::VarInt,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        quic::ResetStream::poll_reset(self, cx, code)
+    }
+}
+
 impl ReadFrameChannels {
     /// Convert RPC read frame channels into a poll-based message stream reader.
-    pub fn into_message_stream<L>(self, lifecycle: Arc<L>) -> impl MessageStreamReader + 'static
+    pub fn into_message_stream<L>(
+        self,
+        lifecycle: Arc<L>,
+    ) -> impl stream::ReadStream<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>
+    + Send
+    + 'static
     where
         L: LifecycleExt + 'static,
     {
@@ -171,28 +224,30 @@ impl ReadFrameChannels {
     }
 
     /// Convert RPC read frame channels into a boxed message stream reader.
-    pub fn into_boxed_message_stream<L>(
-        self,
-        lifecycle: Arc<L>,
-    ) -> Pin<Box<dyn MessageStreamReader + Send + 'static>>
+    pub fn into_boxed_message_stream<L>(self, lifecycle: Arc<L>) -> BoxMessageReader
     where
         L: LifecycleExt + 'static,
     {
         Box::pin(MessageFrameReader::new(self.into_quic(lifecycle)))
     }
 
-    /// Convert RPC read frame channels into an async byte reader.
+    /// Convert RPC read frame channels into a boxed message stream reader.
     pub fn into_box_reader<L>(self, lifecycle: Arc<L>) -> BoxMessageReader
     where
         L: LifecycleExt + 'static,
     {
-        StreamReader::new(self.into_boxed_message_stream(lifecycle))
+        self.into_boxed_message_stream(lifecycle)
     }
 }
 
 impl WriteFrameChannels {
     /// Convert RPC write frame channels into a poll-based message stream writer.
-    pub fn into_message_stream<L>(self, lifecycle: Arc<L>) -> impl MessageStreamWriter + 'static
+    pub fn into_message_stream<L>(
+        self,
+        lifecycle: Arc<L>,
+    ) -> impl stream::WriteStream<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>
+    + Send
+    + 'static
     where
         L: LifecycleExt + 'static,
     {
@@ -200,22 +255,19 @@ impl WriteFrameChannels {
     }
 
     /// Convert RPC write frame channels into a boxed message stream writer.
-    pub fn into_boxed_message_stream<L>(
-        self,
-        lifecycle: Arc<L>,
-    ) -> Pin<Box<dyn MessageStreamWriter + Send + 'static>>
+    pub fn into_boxed_message_stream<L>(self, lifecycle: Arc<L>) -> BoxMessageWriter
     where
         L: LifecycleExt + 'static,
     {
         Box::pin(MessageFrameWriter::new(self.into_quic(lifecycle)))
     }
 
-    /// Convert RPC write frame channels into an async byte writer.
+    /// Convert RPC write frame channels into a boxed message stream writer.
     pub fn into_box_writer<L>(self, lifecycle: Arc<L>) -> BoxMessageWriter
     where
         L: LifecycleExt + 'static,
     {
-        SinkWriter::new(self.into_boxed_message_stream(lifecycle))
+        self.into_boxed_message_stream(lifecycle)
     }
 }
 
@@ -228,12 +280,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        quic::{GetStreamIdExt as _, ResetStreamExt as _, StopStreamExt as _},
         rpc::stream::{
             frame::{ReadCommand, ReadEvent, WriteCommand, WriteEvent},
             remoc::RpcFrameIo,
             test_io::TestLifecycle,
         },
+        stream::{GetStreamIdExt as _, ResetStreamExt as _, StopStreamExt as _},
         varint::VarInt,
     };
 
@@ -253,7 +305,14 @@ mod tests {
 
     async fn send_write_credit(
         hypervisor: &mut RpcFrameIo<WriteEvent, WriteCommand>,
-        writer: &mut (impl MessageStreamWriter + Unpin),
+        writer: &mut (
+                 impl stream::WriteStream<
+            Bytes,
+            MessageStreamError,
+            quic::StreamError,
+            quic::StreamError,
+        > + Unpin
+             ),
     ) {
         let ready = poll_fn(|cx| Pin::new(&mut *writer).poll_ready(cx));
         let credit = hypervisor.send(WriteEvent::Pull);
@@ -417,10 +476,10 @@ mod tests {
 
         let stream_id = VarInt::from_u32(908);
         let (channels, mut hypervisor) = ReadFrameChannels::pair(stream_id);
-        let mut reader = channels.into_box_reader(lifecycle());
+        let reader = channels.into_box_reader(lifecycle());
         let read_all = async {
             let mut buf = Vec::new();
-            reader
+            StreamReader::new(reader)
                 .read_to_end(&mut buf)
                 .await
                 .expect("box reader should read");
@@ -476,7 +535,7 @@ mod tests {
 
         let stream_id = VarInt::from_u32(910);
         let (channels, mut hypervisor) = WriteFrameChannels::pair(stream_id);
-        let mut writer = channels.into_box_writer(lifecycle());
+        let mut writer = SinkWriter::new(channels.into_box_writer(lifecycle()));
         let write_all = async {
             writer
                 .write_all(b"writer")

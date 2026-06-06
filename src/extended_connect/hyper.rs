@@ -8,8 +8,8 @@ use snafu::{OptionExt, ResultExt, Snafu, ensure};
 
 use crate::{
     connection::ConnectionState,
+    dhttp::message::{MessageReader, MessageWriter, hyper::upgrade::TakeoverError},
     extended_connect::{EstablishedConnect, PendingWriteStreamError},
-    message::stream::{MessageReader, MessageWriter, hyper::upgrade::TakeoverError},
     qpack::field::Protocol,
     quic,
     stream_id::StreamId,
@@ -146,8 +146,8 @@ mod tests {
     use super::*;
     use crate::{
         connection::{ConnectionState, tests::MockConnection},
-        message::{
-            stream::hyper::upgrade::{RemainStream, TakeoverSlot},
+        dhttp::message::{
+            hyper::upgrade::{RemainStream, TakeoverSlot},
             test::{read_stream_for_test, write_stream_for_test},
         },
         protocol::Protocols,

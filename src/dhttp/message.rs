@@ -33,13 +33,64 @@ use crate::{
 
 pub(crate) mod guard;
 #[cfg(feature = "hyper")]
-pub(crate) mod hyper;
-pub(crate) mod unfold;
+pub mod hyper;
+pub mod unfold;
 
-pub use self::unfold::{
-    read::{BoxMessageReader, MessageStreamReader},
-    write::{BoxMessageWriter, MessageStreamWriter},
-};
+pub type BoxMessageReader =
+    crate::stream::BoxStreamReader<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>;
+
+pub type BoxMessageWriter =
+    crate::stream::BoxStreamWriter<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>;
+
+impl quic::GetStreamId
+    for dyn crate::stream::ReadStream<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>
+        + Send
+{
+    fn poll_stream_id(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<VarInt, quic::StreamError>> {
+        crate::stream::GetStreamId::poll_stream_id(self, cx)
+    }
+}
+
+impl quic::StopStream
+    for dyn crate::stream::ReadStream<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>
+        + Send
+{
+    fn poll_stop(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        code: VarInt,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        crate::stream::StopStream::poll_stop(self, cx, code)
+    }
+}
+
+impl quic::GetStreamId
+    for dyn crate::stream::WriteStream<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>
+        + Send
+{
+    fn poll_stream_id(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<VarInt, quic::StreamError>> {
+        crate::stream::GetStreamId::poll_stream_id(self, cx)
+    }
+}
+
+impl quic::ResetStream
+    for dyn crate::stream::WriteStream<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>
+        + Send
+{
+    fn poll_reset(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        code: VarInt,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        crate::stream::ResetStream::poll_reset(self, cx, code)
+    }
+}
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Snafu)]
@@ -110,7 +161,7 @@ impl From<MessageStreamError> for io::Error {
 }
 
 pub struct MessageReader {
-    pub(super) stream: FrameStream<guard::GuardedQuicReader>,
+    pub(super) stream: FrameStream<guard::GuardQuicReader>,
     pub(super) qpack_decoder: Arc<QPackDecoder>,
     pub(super) state: ConnectionState<dyn quic::DynConnection>,
 }
@@ -118,18 +169,19 @@ pub struct MessageReader {
 impl MessageReader {
     pub fn new(
         stream_id: VarInt,
-        stream: StreamReader<guard::GuardedQuicReader>,
+        stream: StreamReader<guard::GuardQuicReader>,
         qpack_decoder: Arc<QPackDecoder>,
         state: ConnectionState<dyn quic::DynConnection>,
     ) -> Self {
         let decoder = qpack_decoder.clone();
-        let stream = stream.map_stream(move |guarded| {
-            let mut stream = guard::GuardedQuicReader::new(Box::pin(
-                QPackMessageStreamReader::new(stream_id, guarded.into_inner(), decoder),
-            ));
-            stream.set_stream_id(stream_id);
-            stream
-        });
+        let stream =
+            stream.map_stream(move |guarded| {
+                let mut stream = guard::GuardQuicReader::new(Box::pin(
+                    QPackMessageStreamReader::new(stream_id, guarded.into_inner(), decoder),
+                ));
+                stream.set_stream_id(stream_id);
+                stream
+            });
         let frame_stream = FrameStream::new(stream);
         Self {
             stream: frame_stream,
@@ -144,7 +196,7 @@ impl MessageReader {
 
     pub async fn peek_frame(
         &mut self,
-    ) -> Option<Result<ReadableFrame<'_, guard::GuardedQuicReader>, connection::StreamError>> {
+    ) -> Option<Result<ReadableFrame<'_, guard::GuardQuicReader>, connection::StreamError>> {
         loop {
             match Pin::new(&mut self.stream).frame() {
                 None => match Pin::new(&mut self.stream).next_unreserved_frame().await? {
@@ -346,8 +398,27 @@ impl quic::StopStream for MessageReader {
     }
 }
 
+impl crate::stream::GetStreamId<quic::StreamError> for MessageReader {
+    fn poll_stream_id(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<VarInt, quic::StreamError>> {
+        quic::GetStreamId::poll_stream_id(self, cx)
+    }
+}
+
+impl crate::stream::StopStream<quic::StreamError> for MessageReader {
+    fn poll_stop(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        code: VarInt,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        quic::StopStream::poll_stop(self, cx, code)
+    }
+}
+
 pub struct MessageWriter {
-    pub(super) stream: SinkWriter<guard::GuardedQuicWriter>,
+    pub(super) stream: SinkWriter<guard::GuardQuicWriter>,
     pub(super) qpack_encoder: Arc<QPackEncoder>,
     pub(super) state: ConnectionState<dyn quic::DynConnection>,
 }
@@ -357,7 +428,7 @@ pub const DEFAULT_COMPRESS_ALGO: DynamicCompressAlgo<HuffmanAlways> =
 
 impl MessageWriter {
     pub fn new(
-        stream: SinkWriter<guard::GuardedQuicWriter>,
+        stream: SinkWriter<guard::GuardQuicWriter>,
         qpack_encoder: Arc<QPackEncoder>,
         state: ConnectionState<dyn quic::DynConnection>,
     ) -> Self {
@@ -596,6 +667,25 @@ impl quic::ResetStream for MessageWriter {
     }
 }
 
+impl crate::stream::GetStreamId<quic::StreamError> for MessageWriter {
+    fn poll_stream_id(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<VarInt, quic::StreamError>> {
+        quic::GetStreamId::poll_stream_id(self, cx)
+    }
+}
+
+impl crate::stream::ResetStream<quic::StreamError> for MessageWriter {
+    fn poll_reset(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        code: VarInt,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        quic::ResetStream::poll_reset(self, cx, code)
+    }
+}
+
 #[derive(Debug, Snafu, Clone)]
 pub enum InitialMessageStreamError {
     #[snafu(transparent)]
@@ -670,9 +760,13 @@ mod tests {
             StreamReader,
         },
         connection::{ConnectionState, StreamError, tests::MockConnection},
-        dhttp::{goaway::Goaway, protocol::DHttpProtocol, settings::Settings},
+        dhttp::{
+            goaway::Goaway,
+            message::test::{read_stream_for_test, write_stream_for_test},
+            protocol::DHttpProtocol,
+            settings::Settings,
+        },
         error::Code,
-        message::test::{read_stream_for_test, write_stream_for_test},
         protocol::{Protocol, Protocols, StreamVerdict},
         qpack::protocol::{QPackDecoder, QPackEncoder, QPackProtocolFactory},
         quic::{self, GetStreamId, GetStreamIdExt, ResetStream, StopStream},
@@ -1098,7 +1192,7 @@ mod tests {
 
         MessageReader::new(
             VarInt::from_u32(stream_id),
-            StreamReader::new(guard::GuardedQuicReader::new(
+            StreamReader::new(guard::GuardQuicReader::new(
                 Box::pin(reader) as crate::quic::BoxQuicStreamReader
             )),
             Arc::new(QPackDecoder::new(
@@ -1114,7 +1208,7 @@ mod tests {
         let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(stream_id));
         let read_stream = MessageReader::new(
             VarInt::from_u32(stream_id),
-            StreamReader::new(guard::GuardedQuicReader::new(
+            StreamReader::new(guard::GuardQuicReader::new(
                 Box::pin(reader) as crate::quic::BoxQuicStreamReader
             )),
             Arc::new(QPackDecoder::new(
@@ -1125,7 +1219,7 @@ mod tests {
             state_without_qpack(Arc::new(MockConnection::new())).erase(),
         );
         let write_stream = MessageWriter::new(
-            SinkWriter::new(guard::GuardedQuicWriter::new(
+            SinkWriter::new(guard::GuardQuicWriter::new(
                 Box::pin(writer) as crate::quic::BoxQuicStreamWriter
             )),
             Arc::new(QPackEncoder::new(
@@ -1147,7 +1241,7 @@ mod tests {
         protocols.insert(DHttpProtocol::new_for_test(erased.clone()));
         let state = ConnectionState::new_for_test(erased, Arc::new(protocols));
 
-        let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TestReadStream {
+        let reader = StreamReader::new(guard::GuardQuicReader::new(Box::pin(TestReadStream {
             stream_id: VarInt::from_u32(10),
         })
             as crate::quic::BoxQuicStreamReader));
@@ -1189,7 +1283,7 @@ mod tests {
         protocols.insert(DHttpProtocol::new_for_test(erased.clone()));
         let state = ConnectionState::new_for_test(erased, Arc::new(protocols));
 
-        let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TestWriteStream {
+        let writer = SinkWriter::new(guard::GuardQuicWriter::new(Box::pin(TestWriteStream {
             stream_id: VarInt::from_u32(12),
         })
             as crate::quic::BoxQuicStreamWriter));
@@ -1354,7 +1448,7 @@ mod tests {
         let (reader, _writer) = quic::test::mock_stream_pair(stream_id);
         let mut stream = MessageReader::new(
             stream_id,
-            StreamReader::new(guard::GuardedQuicReader::new(
+            StreamReader::new(guard::GuardQuicReader::new(
                 Box::pin(reader) as crate::quic::BoxQuicStreamReader
             )),
             decoder.clone(),
@@ -1384,7 +1478,7 @@ mod tests {
     async fn read_stream_peer_goaway_future_returns_connection_error_when_connection_closes() {
         let quic = Arc::new(MockConnection::new());
         let state = state_without_qpack(quic.clone()).erase();
-        let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TestReadStream {
+        let reader = StreamReader::new(guard::GuardQuicReader::new(Box::pin(TestReadStream {
             stream_id: VarInt::from_u32(2),
         })
             as crate::quic::BoxQuicStreamReader));
@@ -1422,7 +1516,7 @@ mod tests {
     async fn write_stream_peer_goaway_future_returns_connection_error_when_connection_closes() {
         let quic = Arc::new(MockConnection::new());
         let state = state_without_qpack(quic.clone()).erase();
-        let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TestWriteStream {
+        let writer = SinkWriter::new(guard::GuardQuicWriter::new(Box::pin(TestWriteStream {
             stream_id: VarInt::from_u32(3),
         })
             as crate::quic::BoxQuicStreamWriter));
@@ -1458,7 +1552,7 @@ mod tests {
     #[tokio::test]
     async fn read_stream_try_stream_read_uses_constructor_stream_id() {
         let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
-        let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(
+        let reader = StreamReader::new(guard::GuardQuicReader::new(Box::pin(
             StreamIdErrorReadStream {
                 error: quic::StreamError::Reset {
                     code: VarInt::from_u32(91),
@@ -1500,7 +1594,7 @@ mod tests {
     async fn write_stream_try_stream_write_surfaces_stream_id_errors() {
         let state = state_without_qpack(Arc::new(MockConnection::new())).erase();
         let reset_code = VarInt::from_u32(92);
-        let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(
+        let writer = SinkWriter::new(guard::GuardQuicWriter::new(Box::pin(
             StreamIdErrorWriteStream {
                 error: quic::StreamError::Reset { code: reset_code },
             },
@@ -1674,7 +1768,7 @@ mod tests {
         let read_quic = Arc::new(MockConnection::new());
         let read_state = state_without_qpack(read_quic.clone()).erase();
         read_quic.set_terminal_error(transport_error("read try_stream_read connection close"));
-        let reader = StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TestReadStream {
+        let reader = StreamReader::new(guard::GuardQuicReader::new(Box::pin(TestReadStream {
             stream_id: VarInt::from_u32(26),
         })
             as crate::quic::BoxQuicStreamReader));
@@ -1703,7 +1797,7 @@ mod tests {
         let write_quic = Arc::new(MockConnection::new());
         let write_state = state_without_qpack(write_quic.clone()).erase();
         write_quic.set_terminal_error(transport_error("write try_stream_write connection close"));
-        let writer = SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TestWriteStream {
+        let writer = SinkWriter::new(guard::GuardQuicWriter::new(Box::pin(TestWriteStream {
             stream_id: VarInt::from_u32(27),
         })
             as crate::quic::BoxQuicStreamWriter));
@@ -1955,7 +2049,7 @@ mod tests {
         let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
         let mut reader = MessageReader::new(
             VarInt::from_u32(19),
-            StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
+            StreamReader::new(guard::GuardQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(19),
                 stop_tx,
             })
@@ -1968,7 +2062,7 @@ mod tests {
             state.clone(),
         );
         let mut writer = MessageWriter::new(
-            SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
+            SinkWriter::new(guard::GuardQuicWriter::new(Box::pin(TrackedWriteStream {
                 stream_id: VarInt::from_u32(20),
                 reset_tx,
             })
@@ -2023,7 +2117,7 @@ mod tests {
         let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
         let mut reader = MessageReader::new(
             VarInt::from_u32(21),
-            StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
+            StreamReader::new(guard::GuardQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(21),
                 stop_tx,
             })
@@ -2036,7 +2130,7 @@ mod tests {
             state.clone(),
         );
         let mut writer = MessageWriter::new(
-            SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
+            SinkWriter::new(guard::GuardQuicWriter::new(Box::pin(TrackedWriteStream {
                 stream_id: VarInt::from_u32(22),
                 reset_tx,
             })
@@ -2087,7 +2181,7 @@ mod tests {
         let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
         let mut reader = MessageReader::new(
             VarInt::from_u32(30),
-            StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
+            StreamReader::new(guard::GuardQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(30),
                 stop_tx,
             })
@@ -2100,7 +2194,7 @@ mod tests {
             state.clone(),
         );
         let mut writer = MessageWriter::new(
-            SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
+            SinkWriter::new(guard::GuardQuicWriter::new(Box::pin(TrackedWriteStream {
                 stream_id: VarInt::from_u32(31),
                 reset_tx,
             })
@@ -2186,7 +2280,7 @@ mod tests {
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
         let mut stream = MessageReader::new(
             VarInt::from_u32(14),
-            StreamReader::new(guard::GuardedQuicReader::new(Box::pin(TrackedReadStream {
+            StreamReader::new(guard::GuardQuicReader::new(Box::pin(TrackedReadStream {
                 stream_id: VarInt::from_u32(14),
                 stop_tx,
             })
@@ -2228,7 +2322,7 @@ mod tests {
         let state = state_without_qpack(quic).erase();
         let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
         let mut stream = MessageWriter::new(
-            SinkWriter::new(guard::GuardedQuicWriter::new(Box::pin(TrackedWriteStream {
+            SinkWriter::new(guard::GuardQuicWriter::new(Box::pin(TrackedWriteStream {
                 stream_id: VarInt::from_u32(15),
                 reset_tx,
             })
@@ -2457,3 +2551,6 @@ mod tests {
             .expect("stop should succeed on mock");
     }
 }
+
+#[cfg(test)]
+pub mod test;

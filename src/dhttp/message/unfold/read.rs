@@ -8,35 +8,13 @@ use std::{
 use bytes::Bytes;
 use futures::stream::FusedStream;
 
-use super::super::{MessageReader, MessageStreamError};
+use super::super::{BoxMessageReader, MessageReader, MessageStreamError};
 use crate::{
     codec::StreamReader,
-    quic::{self, GetStreamId, StopStream},
+    quic::{self, GetStreamId as QuicGetStreamId, StopStream as QuicStopStream},
+    stream,
     varint::VarInt,
 };
-
-/// A message-level byte stream that also supports QUIC stream control operations.
-///
-/// This is the message-layer analog of [`quic::ReadStream`], combining DATA-frame
-/// byte streaming with the underlying QUIC stream's [`StopStream`] and
-/// [`GetStreamId`] capabilities.
-pub trait MessageStreamReader:
-    StopStream + GetStreamId + FusedStream<Item = Result<Bytes, MessageStreamError>> + Send
-{
-}
-
-impl<
-    T: StopStream
-        + GetStreamId
-        + FusedStream<Item = Result<Bytes, MessageStreamError>>
-        + Send
-        + ?Sized,
-> MessageStreamReader for T
-{
-}
-
-/// Boxed stream reader with QUIC stream control traits preserved.
-pub type BoxMessageReader<S = dyn MessageStreamReader> = StreamReader<Pin<Box<S>>>;
 
 impl From<MessageReader> for BoxMessageReader {
     fn from(value: MessageReader) -> Self {
@@ -243,10 +221,10 @@ where
     }
 }
 
-impl<StreamState, Read, Stop, ReadFuture, StopFuture, Item> GetStreamId
+impl<StreamState, Read, Stop, ReadFuture, StopFuture, Item> stream::GetStreamId<quic::StreamError>
     for Unfold<StreamState, Read, Stop, ReadFuture, StopFuture, Item>
 where
-    StreamState: GetStreamId + Unpin,
+    StreamState: stream::GetStreamId<quic::StreamError> + Unpin,
 {
     fn poll_stream_id(
         self: Pin<&mut Self>,
@@ -260,7 +238,44 @@ where
     }
 }
 
-impl<StreamState, Read, Stop, ReadFuture, StopFuture, Item> StopStream
+impl<StreamState, Read, Stop, ReadFuture, StopFuture, Item> stream::StopStream<quic::StreamError>
+    for Unfold<StreamState, Read, Stop, ReadFuture, StopFuture, Item>
+where
+    Read: FnMut(StreamState, tokio_util::sync::CancellationToken) -> ReadFuture,
+    ReadFuture: Future<Output = futures::future::Either<(StreamState, Option<Item>), StreamState>>,
+    Stop: FnMut(StreamState, VarInt) -> StopFuture,
+    StopFuture: Future<Output = (StreamState, Result<(), quic::StreamError>)>,
+{
+    fn poll_stop(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        code: VarInt,
+    ) -> Poll<Result<(), quic::StreamError>> {
+        if self.as_mut().project().pending_stop.is_none() {
+            *self.as_mut().project().pending_stop = Some(code);
+        }
+        self.poll_pending_stop(cx)
+    }
+}
+
+impl<StreamState, Read, Stop, ReadFuture, StopFuture, Item> QuicGetStreamId
+    for Unfold<StreamState, Read, Stop, ReadFuture, StopFuture, Item>
+where
+    StreamState: QuicGetStreamId + Unpin,
+{
+    fn poll_stream_id(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Result<VarInt, quic::StreamError>> {
+        let project = self.project();
+        match project.state.project() {
+            StateProj::Stream { stream } => Pin::new(stream).poll_stream_id(cx),
+            _ => Poll::Pending,
+        }
+    }
+}
+
+impl<StreamState, Read, Stop, ReadFuture, StopFuture, Item> QuicStopStream
     for Unfold<StreamState, Read, Stop, ReadFuture, StopFuture, Item>
 where
     Read: FnMut(StreamState, tokio_util::sync::CancellationToken) -> ReadFuture,
@@ -285,7 +300,14 @@ where
 // ---------------------------------------------------------------------------
 
 impl MessageReader {
-    pub fn as_bytes_stream(&mut self) -> impl MessageStreamReader + '_ {
+    pub fn as_bytes_stream(
+        &mut self,
+    ) -> impl stream::ReadStream<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>
+    + QuicGetStreamId
+    + QuicStopStream
+    + FusedStream
+    + Send
+    + '_ {
         unfold(
             self,
             |stream: &mut MessageReader, token| async move {
@@ -303,23 +325,47 @@ impl MessageReader {
                 }
             },
             |mut stream: &mut MessageReader, code| async move {
-                let result =
-                    futures::future::poll_fn(|cx| Pin::new(stream.deref_mut()).poll_stop(cx, code))
-                        .await;
+                let result = futures::future::poll_fn(|cx| {
+                    QuicStopStream::poll_stop(Pin::new(stream.deref_mut()), cx, code)
+                })
+                .await;
                 (stream, result)
             },
         )
     }
 
-    pub fn as_reader(&mut self) -> StreamReader<impl MessageStreamReader + '_> {
+    pub fn as_reader(
+        &mut self,
+    ) -> StreamReader<
+        impl stream::ReadStream<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>
+        + QuicGetStreamId
+        + QuicStopStream
+        + FusedStream
+        + Send
+        + '_,
+    > {
         StreamReader::new(self.as_bytes_stream())
     }
 
-    pub fn as_box_reader(&mut self) -> BoxMessageReader<dyn MessageStreamReader + '_> {
-        StreamReader::new(Box::pin(self.as_bytes_stream()))
+    pub fn as_box_reader(
+        &mut self,
+    ) -> Pin<
+        Box<
+            dyn stream::ReadStream<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.as_bytes_stream())
     }
 
-    pub fn into_bytes_stream(self) -> impl MessageStreamReader {
+    pub fn into_bytes_stream(
+        self,
+    ) -> impl stream::ReadStream<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>
+    + QuicGetStreamId
+    + QuicStopStream
+    + FusedStream
+    + Send {
         unfold(
             self,
             |mut stream: MessageReader, token| async move {
@@ -337,19 +383,29 @@ impl MessageReader {
                 }
             },
             |mut stream: MessageReader, code| async move {
-                let result =
-                    futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_stop(cx, code)).await;
+                let result = futures::future::poll_fn(|cx| {
+                    QuicStopStream::poll_stop(Pin::new(&mut stream), cx, code)
+                })
+                .await;
                 (stream, result)
             },
         )
     }
 
-    pub fn into_reader(self) -> StreamReader<impl MessageStreamReader> {
+    pub fn into_reader(
+        self,
+    ) -> StreamReader<
+        impl stream::ReadStream<Bytes, MessageStreamError, quic::StreamError, quic::StreamError>
+        + QuicGetStreamId
+        + QuicStopStream
+        + FusedStream
+        + Send,
+    > {
         StreamReader::new(self.into_bytes_stream())
     }
 
     pub fn into_box_reader(self) -> BoxMessageReader {
-        StreamReader::new(Box::pin(self.into_bytes_stream()))
+        Box::pin(self.into_bytes_stream())
     }
 }
 
@@ -377,7 +433,7 @@ mod tests {
         stopped: Arc<Mutex<Option<VarInt>>>,
     }
 
-    impl GetStreamId for ControlStream {
+    impl stream::GetStreamId<quic::StreamError> for ControlStream {
         fn poll_stream_id(
             self: Pin<&mut Self>,
             _cx: &mut Context,
@@ -386,7 +442,27 @@ mod tests {
         }
     }
 
-    impl StopStream for ControlStream {
+    impl stream::StopStream<quic::StreamError> for ControlStream {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            *self.stopped.lock().expect("stop state poisoned") = Some(code);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl QuicGetStreamId for ControlStream {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.stream_id))
+        }
+    }
+
+    impl QuicStopStream for ControlStream {
         fn poll_stop(
             self: Pin<&mut Self>,
             _cx: &mut Context,
@@ -814,7 +890,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_stream_as_reader_reports_eof_and_termination() {
-        let mut stream = crate::message::test::read_stream_for_test(VarInt::from_u32(71));
+        let mut stream = crate::dhttp::message::test::read_stream_for_test(VarInt::from_u32(71));
         let mut reader = Box::pin(stream.as_reader());
 
         assert!(poll_fn(|cx| reader.as_mut().poll_next(cx)).await.is_none());
@@ -825,7 +901,7 @@ mod tests {
     async fn read_stream_into_bytes_stream_forwards_control_traits_until_eof() {
         let stream_id = VarInt::from_u32(72);
         let stop_code = VarInt::from_u32(73);
-        let stream = crate::message::test::read_stream_for_test(stream_id);
+        let stream = crate::dhttp::message::test::read_stream_for_test(stream_id);
         let mut bytes = Box::pin(stream.into_bytes_stream());
 
         assert_eq!(
@@ -853,7 +929,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_stream_into_reader_reports_eof_and_termination() {
-        let stream = crate::message::test::read_stream_for_test(VarInt::from_u32(74));
+        let stream = crate::dhttp::message::test::read_stream_for_test(VarInt::from_u32(74));
         let mut reader = Box::pin(stream.into_reader());
 
         assert!(poll_fn(|cx| reader.as_mut().poll_next(cx)).await.is_none());
@@ -863,7 +939,7 @@ mod tests {
     #[tokio::test]
     async fn read_stream_from_conversion_builds_box_reader() {
         let stream_id = VarInt::from_u32(75);
-        let stream = crate::message::test::read_stream_for_test(stream_id);
+        let stream = crate::dhttp::message::test::read_stream_for_test(stream_id);
         let mut reader: BoxMessageReader = stream.into();
 
         assert_eq!(
@@ -873,9 +949,7 @@ mod tests {
             stream_id
         );
 
-        let mut inner = Box::pin(reader.into_inner());
-        assert!(poll_fn(|cx| inner.as_mut().poll_next(cx)).await.is_none());
-        assert!(inner.is_terminated());
+        assert!(poll_fn(|cx| reader.as_mut().poll_next(cx)).await.is_none());
     }
 
     #[tokio::test]
@@ -883,22 +957,20 @@ mod tests {
         let stream_id = VarInt::from_u32(90);
         let stop_code = VarInt::from_u32(102);
 
-        let mut stream = crate::message::test::read_stream_for_test(stream_id);
+        let mut stream = crate::dhttp::message::test::read_stream_for_test(stream_id);
         let mut reader = stream.as_box_reader();
 
         assert_eq!(
-            poll_fn(|cx| Pin::new(&mut reader).poll_stream_id(cx))
+            poll_fn(|cx| stream::GetStreamId::poll_stream_id(Pin::new(&mut reader), cx))
                 .await
                 .unwrap(),
             stream_id
         );
-        poll_fn(|cx| Pin::new(&mut reader).poll_stop(cx, stop_code))
+        poll_fn(|cx| stream::StopStream::poll_stop(Pin::new(&mut reader), cx, stop_code))
             .await
             .unwrap();
 
-        let mut inner = Box::pin(reader.into_inner());
-        assert!(poll_fn(|cx| inner.as_mut().poll_next(cx)).await.is_none());
-        assert!(inner.is_terminated());
+        assert!(poll_fn(|cx| reader.as_mut().poll_next(cx)).await.is_none());
     }
 
     #[tokio::test]

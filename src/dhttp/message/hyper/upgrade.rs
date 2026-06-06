@@ -220,7 +220,7 @@ mod tests {
     use tracing::Instrument;
 
     use super::*;
-    use crate::message::stream::MessageReader;
+    use crate::dhttp::message::MessageReader;
 
     #[derive(Debug, Clone)]
     struct ErrorBody;
