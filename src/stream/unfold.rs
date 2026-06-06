@@ -1,3 +1,5 @@
-//! Intermediate unfold module surface; Task 3 will genericize these adapters.
-
-pub use crate::message::stream::unfold::{read, write};
+//! Generic stream unfold adapters.
+//!
+//! This namespace is reserved for generic stream-preserving unfold adapters.
+//! Message- and QUIC-specific adapters remain under their owning modules until
+//! they are genericized.
