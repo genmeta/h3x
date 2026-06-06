@@ -36,6 +36,7 @@ const IPC_CODEC_ERROR_FRAME_TYPE: VarInt = VarInt::from_u32(0x00);
 
 /// Maximum encoded header bytes for a PUSH frame: tag + varint length.
 pub(super) const PUSH_HEADER_MAX_LEN: usize = 1 + VarInt::MAX_SIZE;
+const MAX_PUSH_RESERVE_STEP: usize = 64 * 1024;
 
 /// Codec error.
 #[derive(Debug, snafu::Snafu)]
@@ -47,6 +48,8 @@ pub(crate) enum CodecError {
     UnknownTag { tag: u8 },
     #[snafu(display("frame tag 0x{tag:02x} is invalid for {direction}"))]
     InvalidDirection { tag: u8, direction: &'static str },
+    #[snafu(display("push frame length overflows buffer size"))]
+    PushLengthOverflow,
     #[snafu(display("failed to encode push payload length"))]
     EncodePushLength { source: varint::err::Overflow },
 }
@@ -96,6 +99,10 @@ fn encode_varint(buf: &mut BytesMut, v: VarInt) {
     } else {
         buf.put_u64((0b11 << 62) | x);
     }
+}
+
+fn reserve_push_payload(src: &mut BytesMut, remaining: usize) {
+    src.reserve(remaining.min(MAX_PUSH_RESERVE_STEP));
 }
 
 pub(super) fn encode_varint_to_slice(dst: &mut [u8], v: VarInt) -> usize {
@@ -199,12 +206,16 @@ impl WireCodec {
                             let Some((len_vi, vi_size)) = try_decode_varint(after_tag) else {
                                 return Ok(None);
                             };
-                            let len = len_vi.into_inner() as usize;
+                            let Ok(len) = usize::try_from(len_vi.into_inner()) else {
+                                return Err(CodecError::PushLengthOverflow);
+                            };
                             let header_size = 1 + vi_size;
-                            let total = header_size + len;
+                            let Some(total) = header_size.checked_add(len) else {
+                                return Err(CodecError::PushLengthOverflow);
+                            };
                             if src.len() < total {
                                 src.advance(header_size);
-                                src.reserve(len.saturating_sub(src.len()));
+                                reserve_push_payload(src, len.saturating_sub(src.len()));
                                 self.state = DecodeState::Push { len };
                                 return Ok(None);
                             }
@@ -245,7 +256,7 @@ impl WireCodec {
                 }
                 DecodeState::Push { len } => {
                     if src.len() < len {
-                        src.reserve(len - src.len());
+                        reserve_push_payload(src, len - src.len());
                         return Ok(None);
                     }
                     let data = src.split_to(len).freeze();
@@ -669,6 +680,22 @@ mod tests {
         assert_eq!(
             decoder.decode(&mut partial).unwrap(),
             Some(ReadEvent::Push { data: payload })
+        );
+    }
+
+    #[test]
+    fn incomplete_large_push_decode_does_not_reserve_declared_payload_len() {
+        let declared_len = 10 * 1024 * 1024usize;
+        let mut codec = ReadEventCodec::new();
+        let mut buf = BytesMut::with_capacity(PUSH_HEADER_MAX_LEN);
+        buf.put_u8(TAG_PUSH);
+        encode_varint(&mut buf, VarInt::try_from(declared_len).unwrap());
+
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        assert!(
+            buf.capacity() <= 128 * 1024,
+            "decoder reserved declared payload length: capacity {}",
+            buf.capacity()
         );
     }
 
