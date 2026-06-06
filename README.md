@@ -6,7 +6,7 @@ Peer-to-peer DHTTP/3 transport over QUIC, implemented in Rust.
 - **Asynchronous I/O**: Built on the Rust asynchronous ecosystem, providing high-performance I/O processing capabilities.
 - **Zero-Copy**: Achieves full-link *zero-copy* from the QUIC layer to the application layer.
 - **Multipath QUIC**: Integrates the `dquic` implementation, featuring efficient transmission, robust authentication capabilities, and high extensibility.
-- **Hyper / Tower Compatibility** *(feature `hyper`, enabled by default)*: Provides `TowerService` and `HyperService` adapters to run existing Tower or hyper services (e.g. `axum`) over DHTTP/3. Since h3x cannot construct hyper's internal types, the `h3x::hyper` module provides its own alternatives for upgrade and protocol negotiation.
+- **Hyper / Tower Compatibility** *(feature `hyper`, enabled by default)*: Provides a single-file `h3x::hyper` facade for hyper-facing integrations. The facade exposes `TowerService`, `HyperService`, request execution errors, upgrade/takeover helpers, Extended CONNECT helpers, and protocol extension helpers. Lower-level hyper adapters also remain available from their semantic owners: `dhttp::message::hyper`, `endpoint::hyper`, `qpack::field::hyper`, and `extended_connect::hyper`.
 - **RPC / IPC** *(features `rpc` and `ipc`, experimental)*: Optional [`remoc`](https://crates.io/crates/remoc) integration for remote trait calls (RTC) over QUIC connections, with optional IPC transport support. Consumers must select exactly one `remoc/default-codec-*` feature; h3x tests use the bincode codec through a dev-dependency.
 - **Extended CONNECT**: Supports [Extended CONNECT (RFC9220)](https://datatracker.ietf.org/doc/html/rfc9220) for protocol tunneling over HTTP/3.
 - **Future Extensions**: Plans to support extensions such as [WebTransport over HTTP/3 (Draft)](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-14).
@@ -33,14 +33,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust,no_run
 use std::sync::Arc;
+use axum::{Router as AxumRouter, routing::get};
 use h3x::{
     dquic::{Identity, Name, QuicEndpoint},
-    endpoint::{H3Endpoint, server::{Request, Response, Service}},
+    endpoint::H3Endpoint,
+    hyper::TowerService,
 };
-
-async fn hello(_req: &mut Request, resp: &mut Response) {
-    resp.set_status(http::StatusCode::OK).set_body(&b"Hello, World!"[..]);
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,7 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build().await,
     );
 
-    let service = Service::new().get("/hello", hello);
+    let router = AxumRouter::new().route("/hello", get(|| async { "Hello, World!" }));
+    let service = TowerService(router.into_service());
     endpoint.listen(service).await?;
     Ok(())
 }
@@ -80,7 +79,7 @@ use axum::{Router as AxumRouter, routing::get};
 use h3x::{
     dquic::{Identity, Name, QuicEndpoint},
     endpoint::H3Endpoint,
-    hyper::server::TowerService,
+    hyper::TowerService,
 };
 
 #[tokio::main]
