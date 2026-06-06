@@ -38,6 +38,29 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StreamId(pub VarInt);
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum StreamInitiator {
+    Client,
+    Server,
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum StreamDirection {
+    Bidirectional,
+    Unidirectional,
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum StreamKind {
+    ClientBidirectional,
+    ServerBidirectional,
+    ClientUnidirectional,
+    ServerUnidirectional,
+}
+
 impl<S: AsyncWrite + Send> EncodeInto<S> for StreamId {
     type Output = ();
     type Error = <VarInt as EncodeInto<S>>::Error;
@@ -70,6 +93,51 @@ impl From<StreamId> for VarInt {
 impl StreamId {
     pub const fn into_inner(self) -> u64 {
         self.0.into_inner()
+    }
+
+    pub const fn initiator(self) -> StreamInitiator {
+        if self.into_inner() & 0x01 == 0 {
+            StreamInitiator::Client
+        } else {
+            StreamInitiator::Server
+        }
+    }
+
+    pub const fn direction(self) -> StreamDirection {
+        if self.into_inner() & 0x02 == 0 {
+            StreamDirection::Bidirectional
+        } else {
+            StreamDirection::Unidirectional
+        }
+    }
+
+    pub const fn kind(self) -> StreamKind {
+        match (self.is_client_initiated(), self.is_bidirectional()) {
+            (true, true) => StreamKind::ClientBidirectional,
+            (false, true) => StreamKind::ServerBidirectional,
+            (true, false) => StreamKind::ClientUnidirectional,
+            (false, false) => StreamKind::ServerUnidirectional,
+        }
+    }
+
+    pub const fn is_client_initiated(self) -> bool {
+        matches!(self.initiator(), StreamInitiator::Client)
+    }
+
+    pub const fn is_server_initiated(self) -> bool {
+        matches!(self.initiator(), StreamInitiator::Server)
+    }
+
+    pub const fn is_bidirectional(self) -> bool {
+        matches!(self.direction(), StreamDirection::Bidirectional)
+    }
+
+    pub const fn is_unidirectional(self) -> bool {
+        matches!(self.direction(), StreamDirection::Unidirectional)
+    }
+
+    pub const fn is_client_initiated_bidirectional(self) -> bool {
+        self.is_client_initiated() && self.is_bidirectional()
     }
 }
 
@@ -116,6 +184,28 @@ mod tests {
         let stream_id = StreamId::from(VarInt::from_u32(7));
 
         assert_eq!(stream_id.to_string(), "7");
+    }
+
+    #[test]
+    fn stream_id_exposes_quic_initiator_and_direction() {
+        let client_bi = StreamId::from(VarInt::from_u32(0));
+        let server_bi = StreamId::from(VarInt::from_u32(1));
+        let client_uni = StreamId::from(VarInt::from_u32(2));
+        let server_uni = StreamId::from(VarInt::from_u32(3));
+
+        assert_eq!(client_bi.kind(), StreamKind::ClientBidirectional);
+        assert_eq!(server_bi.kind(), StreamKind::ServerBidirectional);
+        assert_eq!(client_uni.kind(), StreamKind::ClientUnidirectional);
+        assert_eq!(server_uni.kind(), StreamKind::ServerUnidirectional);
+
+        assert_eq!(client_bi.initiator(), StreamInitiator::Client);
+        assert_eq!(server_bi.initiator(), StreamInitiator::Server);
+        assert_eq!(client_uni.direction(), StreamDirection::Unidirectional);
+        assert_eq!(server_bi.direction(), StreamDirection::Bidirectional);
+
+        assert!(client_bi.is_client_initiated_bidirectional());
+        assert!(!server_bi.is_client_initiated_bidirectional());
+        assert!(!client_uni.is_client_initiated_bidirectional());
     }
 
     #[tokio::test]

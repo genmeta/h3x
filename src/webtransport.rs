@@ -42,6 +42,7 @@ mod error;
 mod protocol;
 mod registry;
 mod session;
+mod session_id;
 
 pub use error::{
     AcceptStreamError, DatagramError, OpenStreamError, RegisterSessionError, SessionClosed,
@@ -56,6 +57,7 @@ pub use session::{
     WebTransportSession,
     stream::{WebTransportStreamReader, WebTransportStreamWriter},
 };
+pub use session_id::{InvalidSessionId, WebTransportSessionId};
 
 // ============================================================================
 // Session trait (AFIT)

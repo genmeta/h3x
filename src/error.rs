@@ -102,6 +102,10 @@ codes! {
     /// The requested operation cannot be served over HTTP/3. The peer should retry over HTTP/1.1.
     pub const H3_VERSION_FALLBACK = 0x0110;
 
+    // https://www.rfc-editor.org/rfc/rfc9297#section-3.3
+    /// HTTP Datagram or Capsule Protocol error.
+    pub const H3_DATAGRAM_ERROR = 0x33;
+
     // https://datatracker.ietf.org/doc/html/rfc9204#name-error-handling
     /// The decoder failed to interpret an encoded field section and is not able to continue decoding that field section.
     pub const QPACK_DECOMPRESSION_FAILED = 0x200;
@@ -109,6 +113,14 @@ codes! {
     pub const QPACK_ENCODER_STREAM_ERROR = 0x201;
     /// The encoder failed to interpret a decoder instruction received on the decoder stream.
     pub const QPACK_DECODER_STREAM_ERROR = 0x202;
+
+    // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3#section-9.5
+    /// WebTransport stream belongs to a session that is gone.
+    pub const WT_SESSION_GONE = 0x170d7b68;
+    /// WebTransport stream rejected because h3x does not buffer unknown sessions.
+    pub const WT_BUFFERED_STREAM_REJECTED = 0x3994bd84;
+    /// WebTransport session aborted because a flow control error was encountered.
+    pub const WT_FLOW_CONTROL_ERROR = 0x045d4487;
 }
 
 impl Code {
@@ -256,6 +268,28 @@ pub enum H3InternalError {
 impl H3ConnectionError for H3InternalError {
     fn code(&self) -> Code {
         Code::H3_INTERNAL_ERROR
+    }
+}
+
+#[cfg(test)]
+mod webtransport_code_tests {
+    use super::*;
+
+    #[test]
+    fn webtransport_codes_are_associated_constants() {
+        assert_eq!(Code::H3_DATAGRAM_ERROR.into_inner(), VarInt::from_u32(0x33));
+        assert_eq!(
+            Code::WT_SESSION_GONE.into_inner(),
+            VarInt::from_u32(0x170d7b68)
+        );
+        assert_eq!(
+            Code::WT_BUFFERED_STREAM_REJECTED.into_inner(),
+            VarInt::from_u32(0x3994bd84)
+        );
+        assert_eq!(
+            Code::WT_FLOW_CONTROL_ERROR.into_inner(),
+            VarInt::from_u32(0x045d4487)
+        );
     }
 }
 
