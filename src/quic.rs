@@ -1,23 +1,14 @@
 use std::{
-    any::Any,
-    borrow::Cow,
-    convert::Infallible,
-    error::Error,
-    future::Future,
-    io,
-    ops::DerefMut,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
+    any::Any, borrow::Cow, convert::Infallible, error::Error, future::Future, io, sync::Arc,
 };
 
 use bytes::Bytes;
 use dhttp_identity::identity::{LocalAuthority, RemoteAuthority};
-use futures::{Sink, Stream, future::BoxFuture};
+use futures::future::BoxFuture;
 use http::uri::Authority;
 use snafu::Snafu;
 
-use crate::{error::Code, varint::VarInt};
+use crate::{error::Code, stream, varint::VarInt};
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Snafu, Clone)]
@@ -167,10 +158,40 @@ impl<T: Connect> Connect for Arc<T> {
     }
 }
 
+pub use crate::stream::{
+    GetStreamId, GetStreamIdExt, ResetStream, ResetStreamExt, StopStream, StopStreamExt,
+};
+
+pub trait ReadStream:
+    stream::ReadStream<Bytes, StreamError, StreamError, StreamError> + Send + Any
+{
+}
+
+impl<T> ReadStream for T where
+    T: stream::ReadStream<Bytes, StreamError, StreamError, StreamError> + Send + Any + ?Sized
+{
+}
+
+pub trait WriteStream:
+    stream::WriteStream<Bytes, StreamError, StreamError, StreamError> + Send + Any
+{
+}
+
+impl<T> WriteStream for T where
+    T: stream::WriteStream<Bytes, StreamError, StreamError, StreamError> + Send + Any + ?Sized
+{
+}
+
+pub type BoxQuicStreamReader<S = dyn ReadStream> =
+    stream::BoxStreamReader<Bytes, StreamError, StreamError, StreamError, S>;
+
+pub type BoxQuicStreamWriter<S = dyn WriteStream> =
+    stream::BoxStreamWriter<Bytes, StreamError, StreamError, StreamError, S>;
+
 /// AFIT version of stream management with concrete associated types.
 ///
-/// Implement this for concrete connection types. A blanket impl provides
-/// [`DynManageStream`] automatically.
+/// Implement this for concrete QUIC connection types. A blanket impl provides
+/// [`stream::ManageStream`] and [`DynManageStream`] automatically.
 pub trait ManageStream: Send + Sync {
     type StreamReader: ReadStream + Unpin;
     type StreamWriter: WriteStream + Unpin;
@@ -196,11 +217,54 @@ pub trait ManageStream: Send + Sync {
     ) -> impl Future<Output = Result<Self::StreamReader, ConnectionError>> + Send + '_;
 }
 
-/// Boxed QUIC read stream.
-pub type BoxQuicStreamReader<S = dyn ReadStream> = Pin<Box<S>>;
+impl<T> stream::ManageStream for T
+where
+    T: ManageStream + ?Sized,
+{
+    type Data = Bytes;
 
-/// Boxed QUIC write stream.
-pub type BoxQuicStreamWriter<S = dyn WriteStream> = Pin<Box<S>>;
+    type ReadError = StreamError;
+    type WriteError = StreamError;
+    type StopError = StreamError;
+    type ResetError = StreamError;
+    type StreamIdError = StreamError;
+
+    type OpenBiError = ConnectionError;
+    type OpenUniError = ConnectionError;
+    type AcceptBiError = ConnectionError;
+    type AcceptUniError = ConnectionError;
+
+    type StreamReader = T::StreamReader;
+    type StreamWriter = T::StreamWriter;
+
+    fn open_bi(
+        &self,
+    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), Self::OpenBiError>>
+    + Send
+    + '_ {
+        ManageStream::open_bi(self)
+    }
+
+    fn open_uni(
+        &self,
+    ) -> impl Future<Output = Result<Self::StreamWriter, Self::OpenUniError>> + Send + '_ {
+        ManageStream::open_uni(self)
+    }
+
+    fn accept_bi(
+        &self,
+    ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), Self::AcceptBiError>>
+    + Send
+    + '_ {
+        ManageStream::accept_bi(self)
+    }
+
+    fn accept_uni(
+        &self,
+    ) -> impl Future<Output = Result<Self::StreamReader, Self::AcceptUniError>> + Send + '_ {
+        ManageStream::accept_uni(self)
+    }
+}
 
 /// Object-safe version of [`ManageStream`] with type-erased streams.
 ///
@@ -227,7 +291,7 @@ impl<T: ManageStream> DynManageStream for T {
         &self,
     ) -> BoxFuture<'_, Result<(BoxQuicStreamReader, BoxQuicStreamWriter), ConnectionError>> {
         Box::pin(async {
-            let (r, w) = ManageStream::open_bi(self).await?;
+            let (r, w) = stream::ManageStream::open_bi(self).await?;
             Ok((
                 Box::pin(r) as BoxQuicStreamReader,
                 Box::pin(w) as BoxQuicStreamWriter,
@@ -237,7 +301,7 @@ impl<T: ManageStream> DynManageStream for T {
 
     fn open_uni(&self) -> BoxFuture<'_, Result<BoxQuicStreamWriter, ConnectionError>> {
         Box::pin(async {
-            let w = ManageStream::open_uni(self).await?;
+            let w = stream::ManageStream::open_uni(self).await?;
             Ok(Box::pin(w) as BoxQuicStreamWriter)
         })
     }
@@ -246,7 +310,7 @@ impl<T: ManageStream> DynManageStream for T {
         &self,
     ) -> BoxFuture<'_, Result<(BoxQuicStreamReader, BoxQuicStreamWriter), ConnectionError>> {
         Box::pin(async {
-            let (r, w) = ManageStream::accept_bi(self).await?;
+            let (r, w) = stream::ManageStream::accept_bi(self).await?;
             Ok((
                 Box::pin(r) as BoxQuicStreamReader,
                 Box::pin(w) as BoxQuicStreamWriter,
@@ -256,7 +320,7 @@ impl<T: ManageStream> DynManageStream for T {
 
     fn accept_uni(&self) -> BoxFuture<'_, Result<BoxQuicStreamReader, ConnectionError>> {
         Box::pin(async {
-            let r = ManageStream::accept_uni(self).await?;
+            let r = stream::ManageStream::accept_uni(self).await?;
             Ok(Box::pin(r) as BoxQuicStreamReader)
         })
     }
@@ -411,233 +475,6 @@ impl<
         + Sync
         + Any,
 > DynConnection for C
-{
-}
-
-/// Read-only observation of a QUIC stream id.
-///
-/// Polling for the id has no committed stream side effect and no ordering
-/// relationship with data, stop, or reset operations. An implementation may
-/// return the id immediately or wait until the id is observable. Dropping a
-/// pending [`StreamId`] future commits nothing.
-pub trait GetStreamId {
-    fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>>;
-}
-
-impl<P> GetStreamId for Pin<P>
-where
-    P: DerefMut<Target: GetStreamId>,
-{
-    fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>> {
-        <P::Target as GetStreamId>::poll_stream_id(self.as_deref_mut(), cx)
-    }
-}
-
-impl<S> GetStreamId for &mut S
-where
-    S: GetStreamId + Unpin + ?Sized,
-{
-    fn poll_stream_id(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<VarInt, StreamError>> {
-        S::poll_stream_id(Pin::new(self.get_mut()), cx)
-    }
-}
-
-pin_project_lite::pin_project! {
-    pub struct StreamId<S: ?Sized>{
-        #[pin]
-        stream: S
-    }
-}
-
-impl<S: GetStreamId + ?Sized> Future for StreamId<S> {
-    type Output = Result<VarInt, StreamError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let project = self.project();
-        project.stream.poll_stream_id(cx)
-    }
-}
-
-pub trait GetStreamIdExt {
-    fn stream_id(&mut self) -> StreamId<&mut Self> {
-        StreamId { stream: self }
-    }
-}
-
-impl<T: GetStreamId + ?Sized> GetStreamIdExt for T {}
-
-/// Receive-side STOP_SENDING control for a stream.
-///
-/// The first poll of [`poll_stop`](StopStream::poll_stop) commits the
-/// STOP_SENDING request and its code. Dropping the caller future after that
-/// first poll does not cancel the request; later polls for the same outstanding
-/// stop operation continue it rather than creating a new one.
-///
-/// STOP_SENDING asks the peer to stop sending. It does not reset the local send
-/// side, and it must not discard bytes that were already received locally but
-/// have not yet been delivered to the caller.
-pub trait StopStream {
-    fn poll_stop(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        code: VarInt,
-    ) -> Poll<Result<(), StreamError>>;
-}
-
-impl<P> StopStream for Pin<P>
-where
-    P: DerefMut<Target: StopStream>,
-{
-    fn poll_stop(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        code: VarInt,
-    ) -> Poll<Result<(), StreamError>> {
-        <P::Target as StopStream>::poll_stop(self.as_deref_mut(), cx, code)
-    }
-}
-
-impl<S> StopStream for &mut S
-where
-    S: StopStream + Unpin + ?Sized,
-{
-    fn poll_stop(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        code: VarInt,
-    ) -> Poll<Result<(), StreamError>> {
-        S::poll_stop(Pin::new(self.get_mut()), cx, code)
-    }
-}
-
-pin_project_lite::pin_project! {
-    pub struct Stop<S: ?Sized>{
-        code: VarInt,
-        #[pin]
-        stream: S
-    }
-}
-
-impl<S: StopStream + ?Sized> Future for Stop<S> {
-    type Output = Result<(), StreamError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let project = self.project();
-        project.stream.poll_stop(cx, *project.code)
-    }
-}
-
-pub trait StopStreamExt {
-    fn stop(&mut self, code: VarInt) -> Stop<&mut Self> {
-        Stop { code, stream: self }
-    }
-}
-
-impl<T: StopStream + ?Sized> StopStreamExt for T {}
-
-/// Byte stream plus QUIC receive-side control.
-///
-/// Bytes are delivered to the caller only when [`Stream::poll_next`] returns
-/// `Poll::Ready(Some(Ok(bytes)))`. If a pending read future is dropped before
-/// an item is delivered, the stream must not lose bytes that have not been
-/// yielded. Local STOP_SENDING does not weaken this delivery rule; reads may
-/// continue until peer reset, EOF, or a stream/connection error is reported.
-pub trait ReadStream:
-    StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + Send + Any
-{
-}
-
-impl<S: StopStream + GetStreamId + Stream<Item = Result<Bytes, StreamError>> + Send + ?Sized + Any>
-    ReadStream for S
-{
-}
-
-/// Send-side RESET_STREAM control for a stream.
-///
-/// This operation is QUIC RESET_STREAM rather than cancellation of a Rust
-/// future. The first poll of [`poll_reset`](ResetStream::poll_reset) commits
-/// the reset code. Once committed, reset may interrupt in-flight send-side work
-/// such as data send, flush, or shutdown. RESET_STREAM does not stop local
-/// receive-side byte delivery.
-pub trait ResetStream {
-    fn poll_reset(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        code: VarInt,
-    ) -> Poll<Result<(), StreamError>>;
-}
-
-impl<S> ResetStream for &mut S
-where
-    S: ResetStream + Unpin + ?Sized,
-{
-    fn poll_reset(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        code: VarInt,
-    ) -> Poll<Result<(), StreamError>> {
-        S::poll_reset(Pin::new(self.get_mut()), cx, code)
-    }
-}
-
-impl<P> ResetStream for Pin<P>
-where
-    P: DerefMut<Target: ResetStream>,
-{
-    fn poll_reset(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        code: VarInt,
-    ) -> Poll<Result<(), StreamError>> {
-        <P::Target as ResetStream>::poll_reset(self.as_deref_mut(), cx, code)
-    }
-}
-
-pin_project_lite::pin_project! {
-    pub struct Reset<S:?Sized>{
-        code: VarInt,
-        #[pin]
-        stream: S
-    }
-}
-
-impl<S: ResetStream + ?Sized> Future for Reset<S> {
-    type Output = Result<(), StreamError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let project = self.project();
-        project.stream.poll_reset(cx, *project.code)
-    }
-}
-
-pub trait ResetStreamExt {
-    fn reset(&mut self, code: VarInt) -> Reset<&mut Self> {
-        Reset { code, stream: self }
-    }
-}
-
-impl<T: ResetStream + ?Sized> ResetStreamExt for T {}
-
-/// Byte sink plus QUIC send-side reset control.
-///
-/// For the [`Sink`] part of this trait, [`Sink::start_send`] is the data commit
-/// point. After it succeeds, the item is committed to the stream and must be
-/// delivered in order unless a later committed reset or an underlying
-/// stream/connection error prevents delivery.
-///
-/// [`Sink::poll_ready`] may advance already committed send work, but it does
-/// not commit a new item. [`Sink::poll_flush`] and [`Sink::poll_close`] are
-/// committed on first poll; dropping the caller future after that first poll
-/// does not cancel them. Repeated polls of the same operation kind continue the
-/// outstanding operation rather than creating another one. A committed reset
-/// supersedes send-side work.
-pub trait WriteStream:
-    ResetStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + Any
-{
-}
-
-impl<S: ResetStream + GetStreamId + Sink<Bytes, Error = StreamError> + Send + ?Sized + Any>
-    WriteStream for S
 {
 }
 
