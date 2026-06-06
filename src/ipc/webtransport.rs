@@ -129,6 +129,10 @@ pub enum IpcWebTransportAcceptError {
     #[snafu(display("webtransport session closed"))]
     Closed,
 
+    /// The underlying WebTransport connection failed.
+    #[snafu(transparent)]
+    Connection { source: ConnectionError },
+
     /// IPC plumbing failure (RPC, stream, or I/O).
     #[snafu(transparent)]
     Transport { source: IpcPlumbingError },
@@ -149,6 +153,15 @@ impl From<remoc::rtc::CallError> for IpcWebTransportAcceptError {
 impl From<SessionClosed> for IpcWebTransportAcceptError {
     fn from(_source: SessionClosed) -> Self {
         IpcWebTransportAcceptError::Closed
+    }
+}
+
+impl From<AcceptStreamError> for IpcWebTransportAcceptError {
+    fn from(error: AcceptStreamError) -> Self {
+        match error {
+            AcceptStreamError::Closed { source } => source.into(),
+            AcceptStreamError::Connection { source } => Self::Connection { source },
+        }
     }
 }
 
@@ -215,6 +228,14 @@ fn ipc_connection_error(error: &IpcPlumbingError) -> ConnectionError {
             frame_type: IPC_FRAME_TYPE,
             reason: error.to_string().into(),
         },
+    }
+}
+
+fn ipc_accept_error_connection(error: IpcWebTransportAcceptError) -> Option<ConnectionError> {
+    match error {
+        IpcWebTransportAcceptError::Closed => None,
+        IpcWebTransportAcceptError::Connection { source } => Some(source),
+        IpcWebTransportAcceptError::Transport { source } => Some(ipc_connection_error(&source)),
     }
 }
 
@@ -295,10 +316,7 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
         let delivery = self.fd_transfer.delivery(fd_id);
         let (mut reader, writer) = match self.session.accept_bi().await {
             Ok(streams) => streams,
-            Err(AcceptStreamError::Closed { source }) => return Err(source.into()),
-            Err(AcceptStreamError::Connection { source: _ }) => {
-                return Err(IpcWebTransportAcceptError::Closed);
-            }
+            Err(error) => return Err(error.into()),
         };
 
         let stream_id = GetStreamIdExt::stream_id(&mut reader)
@@ -334,10 +352,7 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
         let delivery = self.fd_transfer.delivery(fd_id);
         let mut reader = match self.session.accept_uni().await {
             Ok(stream) => stream,
-            Err(AcceptStreamError::Closed { source }) => return Err(source.into()),
-            Err(AcceptStreamError::Connection { source: _ }) => {
-                return Err(IpcWebTransportAcceptError::Closed);
-            }
+            Err(error) => return Err(error.into()),
         };
 
         let stream_id = GetStreamIdExt::stream_id(&mut reader)
@@ -519,12 +534,7 @@ impl IpcWebTransportSessionHandle {
         fut: impl Future<Output = Result<T, IpcWebTransportAcceptError>>,
     ) -> Result<T, AcceptStreamError> {
         self.lifecycle
-            .guard_accept_err(fut, |e| match e {
-                IpcWebTransportAcceptError::Closed => None,
-                IpcWebTransportAcceptError::Transport { source } => {
-                    Some(ipc_connection_error(&source))
-                }
-            })
+            .guard_accept_err(fut, ipc_accept_error_connection)
             .await
     }
 
@@ -771,5 +781,123 @@ impl IpcWebTransportSessionClient {
         conn_lifecycle: Arc<dyn DynLifecycle>,
     ) -> IpcWebTransportSessionHandle {
         IpcWebTransportSessionHandle::new(session_id, self, fd_transfer, conn_lifecycle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future;
+
+    use super::*;
+    use crate::{
+        connection::{ConnectionState, tests::MockConnection},
+        extended_connect::{EstablishedConnect, PendingWriteStreamError},
+        message::{stream::MessageWriter, test::read_stream_for_test},
+        protocol::Protocols,
+        qpack::field::Protocol,
+        stream_id::StreamId,
+        webtransport::{WEBTRANSPORT_H3, WebTransportProtocol},
+    };
+
+    fn connection_error(reason: &'static str) -> ConnectionError {
+        ConnectionError::Transport {
+            source: quic::TransportError {
+                kind: VarInt::from_u32(0x01),
+                frame_type: VarInt::from_u32(0x00),
+                reason: reason.into(),
+            },
+        }
+    }
+
+    fn assert_transport_reason(error: &ConnectionError, expected: &str) {
+        let ConnectionError::Transport { source } = error else {
+            panic!("expected transport error");
+        };
+        assert_eq!(source.reason.as_ref(), expected);
+    }
+
+    fn connection_with_webtransport(
+        mock: Arc<MockConnection>,
+    ) -> Arc<ConnectionState<dyn quic::DynConnection>> {
+        let erased: Arc<dyn quic::DynConnection> = mock.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(WebTransportProtocol::new_for_test(erased));
+        Arc::new(ConnectionState::new_for_test(mock, Arc::new(protocols)).erase())
+    }
+
+    fn webtransport_session_for_test(
+        mock: Arc<MockConnection>,
+        stream_id: StreamId,
+    ) -> Arc<webtransport::WebTransportSession> {
+        let connection = connection_with_webtransport(mock);
+        let session = webtransport::WebTransportSession::try_from(EstablishedConnect::pending(
+            stream_id,
+            Some(Protocol::new(WEBTRANSPORT_H3)),
+            connection.clone(),
+            read_stream_for_test(stream_id.0),
+            future::pending::<Result<MessageWriter, PendingWriteStreamError>>(),
+        ))
+        .expect("webtransport session should be registered");
+        Arc::new(session)
+    }
+
+    fn fd_transfer_for_test() -> crate::ipc::transport::FdTransfer {
+        let (mux, _peer) =
+            crate::ipc::transport::MuxChannel::pair_for_test().expect("mux channel pair");
+        let (sink, stream) = mux.split().expect("split mux channel");
+        stream.fd_transfer(sink.fd_sender())
+    }
+
+    fn webtransport_adapter(reason: &'static str) -> WebTransportSessionAdapter {
+        let mock = Arc::new(MockConnection::new());
+        let session =
+            webtransport_session_for_test(mock.clone(), StreamId::from(VarInt::from_u32(4)));
+        mock.set_terminal_error(connection_error(reason));
+        let lifecycle: Arc<dyn DynLifecycle> = mock;
+        WebTransportSessionAdapter::new(session, fd_transfer_for_test(), lifecycle)
+    }
+
+    #[test]
+    fn ipc_accept_error_preserves_connection_source() {
+        let error = IpcWebTransportAcceptError::from(AcceptStreamError::Connection {
+            source: connection_error("accept connection closed"),
+        });
+
+        let IpcWebTransportAcceptError::Connection { source } = error else {
+            panic!("expected IPC accept connection error");
+        };
+        assert_transport_reason(&source, "accept connection closed");
+    }
+
+    #[test]
+    fn ipc_accept_error_connection_mapping_preserves_connection_source() {
+        let source = ipc_accept_error_connection(IpcWebTransportAcceptError::Connection {
+            source: connection_error("mapped accept connection closed"),
+        })
+        .expect("connection IPC accept error should latch a connection error");
+
+        assert_transport_reason(&source, "mapped accept connection closed");
+        assert!(ipc_accept_error_connection(IpcWebTransportAcceptError::Closed).is_none());
+    }
+
+    #[tokio::test]
+    async fn webtransport_adapter_preserves_connection_closed_accepts() {
+        let adapter = webtransport_adapter("accept_bi connection closed");
+        let error = IpcWebTransportSession::accept_bi(&adapter, VarInt::from_u32(1))
+            .await
+            .expect_err("accept_bi should preserve connection failure");
+        let IpcWebTransportAcceptError::Connection { source } = error else {
+            panic!("expected accept_bi connection error");
+        };
+        assert_transport_reason(&source, "accept_bi connection closed");
+
+        let adapter = webtransport_adapter("accept_uni connection closed");
+        let error = IpcWebTransportSession::accept_uni(&adapter, VarInt::from_u32(2))
+            .await
+            .expect_err("accept_uni should preserve connection failure");
+        let IpcWebTransportAcceptError::Connection { source } = error else {
+            panic!("expected accept_uni connection error");
+        };
+        assert_transport_reason(&source, "accept_uni connection closed");
     }
 }
