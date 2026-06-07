@@ -50,10 +50,6 @@ pub const WEBTRANSPORT_BIDI_SIGNAL: VarInt = VarInt::from_u32(0x41);
 /// (draft-ietf-webtrans-http3, §2).
 pub const WEBTRANSPORT_UNI_SIGNAL: VarInt = VarInt::from_u32(0x54);
 
-/// WebTransport error code for streams whose associated session is gone
-/// (draft-ietf-webtrans-http3, §9.5).
-pub const WT_SESSION_GONE: VarInt = VarInt::from_u32(0x170d7b68);
-
 // ============================================================================
 // WebTransportProtocol
 // ============================================================================
@@ -137,11 +133,19 @@ impl WebTransportProtocol {
             // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3#section-4
             // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3#section-9.5
             Err(RouteBiError::Closed((mut reader, mut writer))) => {
-                _ = tokio::join!(reader.stop(WT_SESSION_GONE), writer.reset(WT_SESSION_GONE));
+                let code = crate::error::Code::WT_SESSION_GONE.into_inner();
+                _ = tokio::join!(reader.stop(code), writer.reset(code));
             }
-            Err(RouteBiError::Unknown((mut reader, mut writer)))
-            | Err(RouteBiError::Rejected((mut reader, mut writer))) => {
-                let code = crate::error::Code::H3_REQUEST_CANCELLED.into_inner();
+            Err(RouteBiError::Unknown((mut reader, mut writer))) => {
+                // draft-ietf-webtrans-http3 §4 allows buffering streams for a
+                // not-yet-established session and requires WT_BUFFERED_STREAM_REJECTED
+                // when that buffer is full. h3x uses a zero-capacity pre-session
+                // buffer, so every valid unknown-session stream is rejected here.
+                let code = crate::error::Code::WT_BUFFERED_STREAM_REJECTED.into_inner();
+                _ = tokio::join!(reader.stop(code), writer.reset(code));
+            }
+            Err(RouteBiError::Rejected((mut reader, mut writer))) => {
+                let code = crate::error::Code::WT_FLOW_CONTROL_ERROR.into_inner();
                 _ = tokio::join!(reader.stop(code), writer.reset(code));
             }
         }
@@ -181,10 +185,19 @@ impl WebTransportProtocol {
             // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3#section-4
             // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3#section-9.5
             Err(RouteUniError::Closed(mut reader)) => {
-                _ = reader.stop(WT_SESSION_GONE).await;
+                let code = crate::error::Code::WT_SESSION_GONE.into_inner();
+                _ = reader.stop(code).await;
             }
-            Err(RouteUniError::Unknown(mut reader)) | Err(RouteUniError::Rejected(mut reader)) => {
-                let code = crate::error::Code::H3_REQUEST_CANCELLED.into_inner();
+            Err(RouteUniError::Unknown(mut reader)) => {
+                // draft-ietf-webtrans-http3 §4 allows buffering streams for a
+                // not-yet-established session and requires WT_BUFFERED_STREAM_REJECTED
+                // when that buffer is full. h3x uses a zero-capacity pre-session
+                // buffer, so every valid unknown-session stream is rejected here.
+                let code = crate::error::Code::WT_BUFFERED_STREAM_REJECTED.into_inner();
+                _ = reader.stop(code).await;
+            }
+            Err(RouteUniError::Rejected(mut reader)) => {
+                let code = crate::error::Code::WT_FLOW_CONTROL_ERROR.into_inner();
                 _ = reader.stop(code).await;
             }
         }
@@ -288,11 +301,11 @@ mod tests {
         assert_eq!(WEBTRANSPORT_H3, "webtransport-h3");
         assert_eq!(WEBTRANSPORT_BIDI_SIGNAL.into_inner(), 0x41);
         assert_eq!(WEBTRANSPORT_UNI_SIGNAL.into_inner(), 0x54);
-        assert_eq!(WT_SESSION_GONE.into_inner(), 0x170d7b68);
+        assert_eq!(Code::WT_SESSION_GONE.into_inner(), 0x170d7b68);
     }
 
     #[tokio::test]
-    async fn unknown_bidi_session_is_accepted_and_aborted() {
+    async fn unknown_bidi_session_is_rejected_with_wt_buffered_stream_rejected() {
         let state = Arc::new(StreamState::default());
         let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x41, 0x28])]);
         let writer = test_writer(state.clone());
@@ -306,16 +319,16 @@ mod tests {
         assert!(matches!(verdict, StreamVerdict::Accepted));
         assert_eq!(
             state.stopped_codes(),
-            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+            vec![Code::WT_BUFFERED_STREAM_REJECTED.into_inner()]
         );
         assert_eq!(
             state.reset_codes(),
-            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+            vec![Code::WT_BUFFERED_STREAM_REJECTED.into_inner()]
         );
     }
 
     #[tokio::test]
-    async fn unknown_uni_session_is_accepted_and_stopped() {
+    async fn unknown_uni_session_is_rejected_with_wt_buffered_stream_rejected() {
         let state = Arc::new(StreamState::default());
         let stream = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x54, 0x28])]);
         let protocol = test_protocol();
@@ -328,7 +341,7 @@ mod tests {
         assert!(matches!(verdict, StreamVerdict::Accepted));
         assert_eq!(
             state.stopped_codes(),
-            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+            vec![Code::WT_BUFFERED_STREAM_REJECTED.into_inner()]
         );
         assert!(state.reset_codes().is_empty());
     }
@@ -379,8 +392,14 @@ mod tests {
             .expect("routing should not fail");
 
         assert!(matches!(verdict, StreamVerdict::Accepted));
-        assert_eq!(state.stopped_codes(), vec![WT_SESSION_GONE]);
-        assert_eq!(state.reset_codes(), vec![WT_SESSION_GONE]);
+        assert_eq!(
+            state.stopped_codes(),
+            vec![Code::WT_SESSION_GONE.into_inner()]
+        );
+        assert_eq!(
+            state.reset_codes(),
+            vec![Code::WT_SESSION_GONE.into_inner()]
+        );
     }
 
     #[tokio::test]
@@ -400,7 +419,10 @@ mod tests {
             .expect("routing should not fail");
 
         assert!(matches!(verdict, StreamVerdict::Accepted));
-        assert_eq!(state.stopped_codes(), vec![WT_SESSION_GONE]);
+        assert_eq!(
+            state.stopped_codes(),
+            vec![Code::WT_SESSION_GONE.into_inner()]
+        );
         assert!(state.reset_codes().is_empty());
     }
 
@@ -862,11 +884,11 @@ mod tests {
         assert!(matches!(verdict, StreamVerdict::Accepted));
         assert_eq!(
             overflow_state.stopped_codes(),
-            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+            vec![Code::WT_FLOW_CONTROL_ERROR.into_inner()]
         );
         assert_eq!(
             overflow_state.reset_codes(),
-            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+            vec![Code::WT_FLOW_CONTROL_ERROR.into_inner()]
         );
 
         let (mut routed_reader, _routed_writer) = registered
@@ -885,7 +907,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_bidi_abort_for_unknown_session_is_ignored() {
+    async fn failed_bidi_rejection_for_unknown_session_is_ignored() {
         let state = Arc::new(StreamState::with_stop_and_reset_errors());
         let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x41, 0x28])]);
         let writer = test_writer(state.clone());
@@ -899,11 +921,11 @@ mod tests {
         assert!(matches!(verdict, StreamVerdict::Accepted));
         assert_eq!(
             state.stopped_codes(),
-            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+            vec![Code::WT_BUFFERED_STREAM_REJECTED.into_inner()]
         );
         assert_eq!(
             state.reset_codes(),
-            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+            vec![Code::WT_BUFFERED_STREAM_REJECTED.into_inner()]
         );
     }
 
@@ -945,7 +967,7 @@ mod tests {
         assert!(matches!(verdict, StreamVerdict::Accepted));
         assert_eq!(
             overflow_state.stopped_codes(),
-            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+            vec![Code::WT_FLOW_CONTROL_ERROR.into_inner()]
         );
         assert!(overflow_state.reset_codes().is_empty());
 
@@ -965,7 +987,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_uni_stop_for_unknown_session_is_ignored() {
+    async fn failed_uni_rejection_for_unknown_session_is_ignored() {
         let state = Arc::new(StreamState::with_stop_error());
         let stream = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x54, 0x28])]);
         let protocol = test_protocol();
@@ -978,7 +1000,7 @@ mod tests {
         assert!(matches!(verdict, StreamVerdict::Accepted));
         assert_eq!(
             state.stopped_codes(),
-            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+            vec![Code::WT_BUFFERED_STREAM_REJECTED.into_inner()]
         );
         assert!(state.reset_codes().is_empty());
     }
@@ -1010,11 +1032,11 @@ mod tests {
         assert!(matches!(verdict, StreamVerdict::Accepted));
         assert_eq!(
             stream_state.stopped_codes(),
-            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+            vec![Code::WT_FLOW_CONTROL_ERROR.into_inner()]
         );
         assert_eq!(
             stream_state.reset_codes(),
-            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+            vec![Code::WT_FLOW_CONTROL_ERROR.into_inner()]
         );
     }
 
@@ -1044,7 +1066,7 @@ mod tests {
         assert!(matches!(verdict, StreamVerdict::Accepted));
         assert_eq!(
             stream_state.stopped_codes(),
-            vec![Code::H3_REQUEST_CANCELLED.into_inner()]
+            vec![Code::WT_FLOW_CONTROL_ERROR.into_inner()]
         );
         assert!(stream_state.reset_codes().is_empty());
     }
@@ -1120,11 +1142,17 @@ mod tests {
             other => panic!("unexpected duplicate registration result: {other:?}"),
         }
 
-        drop(registered);
+        registered.state.close();
 
-        protocol
+        let error = protocol
             .register(session_id)
-            .expect("dropped session should unregister and allow reuse");
+            .expect_err("closed session id must remain reserved");
+        assert!(matches!(
+            error,
+            RegisterSessionError::AlreadyRegistered {
+                session_id: duplicate
+            } if duplicate == session_id
+        ));
     }
 
     #[test]
@@ -1146,9 +1174,15 @@ mod tests {
             format!("{protocol:?}"),
             "WebTransportProtocol { sessions: 0 }"
         );
-        protocol
+        let error = protocol
             .register(session_id)
-            .expect("closed session should unregister and allow reuse");
+            .expect_err("closed session id must remain reserved");
+        assert!(matches!(
+            error,
+            RegisterSessionError::AlreadyRegistered {
+                session_id: duplicate
+            } if duplicate == session_id
+        ));
     }
 
     #[test]

@@ -369,6 +369,7 @@ mod tests {
             protocol::DHttpProtocol,
             settings::Settings,
         },
+        error::Code,
         extended_connect::EstablishedConnect,
         protocol::Protocols,
         qpack::{field::Protocol, protocol::QPackDecoder},
@@ -376,8 +377,7 @@ mod tests {
         stream_id::StreamId,
         varint::VarInt,
         webtransport::{
-            WEBTRANSPORT_H3, WebTransportProtocol, WebTransportSessionId,
-            protocol::WT_SESSION_GONE, registry::Registry,
+            WEBTRANSPORT_H3, WebTransportProtocol, WebTransportSessionId, registry::Registry,
         },
     };
 
@@ -1569,8 +1569,14 @@ mod tests {
         session.state.close();
         tokio::task::yield_now().await;
 
-        assert_eq!(routed_state.stopped_codes(), vec![WT_SESSION_GONE]);
-        assert_eq!(routed_state.reset_codes(), vec![WT_SESSION_GONE]);
+        assert_eq!(
+            routed_state.stopped_codes(),
+            vec![Code::WT_SESSION_GONE.into_inner()]
+        );
+        assert_eq!(
+            routed_state.reset_codes(),
+            vec![Code::WT_SESSION_GONE.into_inner()]
+        );
     }
 
     #[tokio::test]
@@ -1617,7 +1623,10 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert!(routed_state.stopped_codes().is_empty());
-        assert_eq!(routed_state.reset_codes(), vec![WT_SESSION_GONE]);
+        assert_eq!(
+            routed_state.reset_codes(),
+            vec![Code::WT_SESSION_GONE.into_inner()]
+        );
     }
 
     #[tokio::test]

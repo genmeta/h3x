@@ -13,13 +13,13 @@ use tracing::Instrument;
 use super::{
     WebTransportSessionId,
     error::{RegisterSessionError, SessionClosed},
-    protocol::WT_SESSION_GONE,
     session::{
         RoutedBiStream, RoutedUniStream,
         stream::{TrackedStreamReader, TrackedStreamWriter},
     },
 };
 use crate::{
+    error::Code,
     quic::{ResetStreamExt, StopStreamExt},
     stream_id::StreamId,
 };
@@ -61,11 +61,10 @@ impl Registry {
             return Err(RegisterSessionError::RegistryPoisoned);
         };
 
-        if inner.active.contains_key(&session_id) {
+        if inner.active.contains_key(&session_id) || inner.closed.contains(&session_id) {
             return Err(RegisterSessionError::AlreadyRegistered { session_id });
         }
 
-        inner.closed.remove(&session_id);
         inner
             .active
             .insert(session_id, SessionStreamRouter::new(bidi_tx, uni_tx));
@@ -369,7 +368,7 @@ async fn cleanup_tracked_streams(
 
     for mut reader in readers {
         cleanup.push(Box::pin(async move {
-            if let Err(error) = reader.stop(WT_SESSION_GONE).await {
+            if let Err(error) = reader.stop(Code::WT_SESSION_GONE.into_inner()).await {
                 let report = snafu::Report::from_error(&error);
                 tracing::debug!(
                     session_id = %session_id,
@@ -382,7 +381,7 @@ async fn cleanup_tracked_streams(
 
     for mut writer in writers {
         cleanup.push(Box::pin(async move {
-            if let Err(error) = writer.reset(WT_SESSION_GONE).await {
+            if let Err(error) = writer.reset(Code::WT_SESSION_GONE.into_inner()).await {
                 let report = snafu::Report::from_error(&error);
                 tracing::debug!(
                     session_id = %session_id,
@@ -992,7 +991,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_unregisters_session_and_allows_id_reuse() {
+    async fn closed_session_tombstone_is_preserved_for_connection_lifetime() {
         let registry = Registry::default();
         let session_id = wt_session_id(24);
         let registered = registry
@@ -1015,24 +1014,15 @@ mod tests {
             VarInt::from_u32(25)
         );
 
-        let mut registered_again = registry
+        let error = registry
             .register(session_id)
-            .expect("closed session id should be reusable");
-        assert_eq!(registry.len(), 1);
-        assert!(registry.route_uni(session_id, uni_stream(26)).is_ok());
-
-        let mut routed = registered_again
-            .uni_rx
-            .recv()
-            .await
-            .expect("re-registered session should receive streams");
-        assert_eq!(
-            routed
-                .stream_id()
-                .await
-                .expect("routed uni stream id should be readable"),
-            VarInt::from_u32(26)
-        );
+            .expect_err("closed session id must not be re-registered");
+        assert!(matches!(
+            error,
+            RegisterSessionError::AlreadyRegistered {
+                session_id: duplicate
+            } if duplicate == session_id
+        ));
     }
 
     #[test]

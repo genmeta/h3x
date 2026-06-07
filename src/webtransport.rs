@@ -53,8 +53,8 @@ pub use error::{
 #[cfg(feature = "rpc")]
 pub(crate) use error::{accept_stream_error, open_stream_error};
 pub use protocol::{
-    WEBTRANSPORT_BIDI_SIGNAL, WEBTRANSPORT_H3, WEBTRANSPORT_UNI_SIGNAL, WT_SESSION_GONE,
-    WebTransportProtocol, WebTransportProtocolFactory,
+    WEBTRANSPORT_BIDI_SIGNAL, WEBTRANSPORT_H3, WEBTRANSPORT_UNI_SIGNAL, WebTransportProtocol,
+    WebTransportProtocolFactory,
 };
 pub use session::{
     WebTransportSession,
