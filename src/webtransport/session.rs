@@ -206,6 +206,7 @@ enum ControlTaskError {
 }
 
 impl WebTransportSession {
+    #[cfg(test)]
     fn from_registered(
         registered: RegisteredSession,
         conn: Arc<dyn quic::DynConnection>,
@@ -509,6 +510,7 @@ impl WebTransportSession {
     }
 }
 
+#[cfg(test)]
 fn default_peer_stream_credit() -> WebTransportStreamCount {
     WebTransportStreamCount::try_from(VarInt::from_u32(16))
         .expect("default webtransport peer stream credit is valid")
@@ -845,7 +847,27 @@ impl TryFrom<EstablishedConnect> for WebTransportSession {
             return Err(RegisterSessionError::UnexpectedProtocol { protocol });
         }
 
-        let (registered, conn) = {
+        let (registered, conn, peer_bidi_credit, peer_uni_credit) = {
+            let dhttp = connect
+                .connection()
+                .protocol::<crate::dhttp::protocol::DHttpProtocol>()
+                .ok_or(RegisterSessionError::ProtocolLayerMissing)?;
+            let peer_settings = dhttp
+                .peer_settings_peek()
+                .ok_or(RegisterSessionError::PeerSettingsUnavailable)?;
+            if !peer_settings.enable_webtransport() {
+                return Err(RegisterSessionError::WebTransportNotEnabled);
+            }
+            if !peer_settings.webtransport_flow_control_enabled() {
+                return Err(RegisterSessionError::FlowControlNotEnabled);
+            }
+            let peer_bidi_credit =
+                WebTransportStreamCount::try_from(peer_settings.wt_initial_max_streams_bidi())
+                    .context(register_session_error::InitialStreamCountSnafu)?;
+            let peer_uni_credit =
+                WebTransportStreamCount::try_from(peer_settings.wt_initial_max_streams_uni())
+                    .context(register_session_error::InitialStreamCountSnafu)?;
+
             let protocol = connect
                 .connection()
                 .protocol::<super::WebTransportProtocol>()
@@ -854,10 +876,16 @@ impl TryFrom<EstablishedConnect> for WebTransportSession {
                 .context(register_session_error::InvalidSessionIdSnafu)?;
             let registered = protocol.register(session_id)?;
             let conn = protocol.connection();
-            (registered, conn)
+            (registered, conn, peer_bidi_credit, peer_uni_credit)
         };
 
-        Ok(Self::from_registered(registered, conn, connect))
+        Ok(Self::from_registered_with_peer_credit(
+            registered,
+            conn,
+            connect,
+            peer_bidi_credit,
+            peer_uni_credit,
+        ))
     }
 }
 
@@ -951,7 +979,12 @@ mod tests {
             },
             protocol::DHttpProtocol,
             settings::Settings,
-            webtransport::capsule::{Capsule, CapsuleType},
+            webtransport::{
+                capsule::{Capsule, CapsuleType},
+                settings::{
+                    EnableWebTransport, InitialMaxData, InitialMaxStreamsBidi, InitialMaxStreamsUni,
+                },
+            },
         },
         error::Code,
         extended_connect::EstablishedConnect,
@@ -1563,9 +1596,31 @@ mod tests {
     }
 
     fn connection_with_webtransport() -> Arc<ConnectionState<dyn quic::DynConnection>> {
+        connection_with_webtransport_and_peer_settings(enabled_webtransport_settings())
+    }
+
+    fn enabled_webtransport_settings() -> Settings {
+        let mut settings = Settings::default();
+        settings.set(EnableWebTransport::setting(true));
+        settings.set(InitialMaxStreamsBidi::setting(VarInt::from_u32(16)));
+        settings.set(InitialMaxStreamsUni::setting(VarInt::from_u32(16)));
+        settings.set(InitialMaxData::setting(VarInt::MAX));
+        settings
+    }
+
+    fn connection_with_webtransport_and_peer_settings(
+        settings: Settings,
+    ) -> Arc<ConnectionState<dyn quic::DynConnection>> {
         let quic = Arc::new(MockConnection::new());
         let erased: Arc<dyn quic::DynConnection> = quic.clone();
         let mut protocols = Protocols::new();
+        let dhttp = DHttpProtocol::new_for_test(erased.clone());
+        dhttp
+            .state
+            .peer_settings
+            .set(Arc::new(settings))
+            .expect("peer settings should be set once");
+        protocols.insert(dhttp);
         protocols.insert(WebTransportProtocol::new_for_test(erased));
         Arc::new(ConnectionState::new_for_test(quic, Arc::new(protocols)).erase())
     }
@@ -2039,6 +2094,39 @@ mod tests {
         let id: WebTransportSessionId = session.id();
 
         assert_eq!(id.stream_id(), StreamId::from(VarInt::from_u32(4)));
+    }
+
+    #[tokio::test]
+    async fn try_from_rejects_when_peer_settings_do_not_enable_webtransport() {
+        let connect = connect_on_connection(
+            connection_with_webtransport_and_peer_settings(Settings::default()),
+            StreamId::from(VarInt::from_u32(4)),
+            Some(Protocol::new(WEBTRANSPORT_H3)),
+        );
+
+        let error = WebTransportSession::try_from(connect)
+            .expect_err("WT session must require peer WebTransport settings");
+
+        assert!(matches!(
+            error,
+            RegisterSessionError::WebTransportNotEnabled
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_from_accepts_when_peer_settings_enable_webtransport_and_stream_credit() {
+        let connect = connect_on_connection(
+            connection_with_webtransport_and_peer_settings(enabled_webtransport_settings()),
+            StreamId::from(VarInt::from_u32(4)),
+            Some(Protocol::new(WEBTRANSPORT_H3)),
+        );
+
+        let session = WebTransportSession::try_from(connect).expect("negotiated WT session");
+
+        assert_eq!(
+            session.id().stream_id(),
+            StreamId::from(VarInt::from_u32(4))
+        );
     }
 
     #[tokio::test]

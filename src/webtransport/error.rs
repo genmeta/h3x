@@ -18,6 +18,16 @@ pub enum RegisterSessionError {
     UnexpectedProtocol { protocol: Protocol },
     #[snafu(display("webtransport protocol layer is not registered on the connection"))]
     ProtocolLayerMissing,
+    #[snafu(display("peer HTTP/3 settings are not available"))]
+    PeerSettingsUnavailable,
+    #[snafu(display("webtransport is not enabled by peer settings"))]
+    WebTransportNotEnabled,
+    #[snafu(display("webtransport stream-count flow control is not enabled by peer settings"))]
+    FlowControlNotEnabled,
+    #[snafu(display("invalid peer webtransport initial stream count"))]
+    InitialStreamCount {
+        source: InvalidWebTransportStreamCount,
+    },
     #[snafu(display("invalid webtransport session id"))]
     InvalidSessionId { source: InvalidSessionId },
     #[snafu(display("session already registered for {session_id}"))]

@@ -337,7 +337,14 @@ mod tests {
     use super::*;
     use crate::{
         connection::{ConnectionState, tests::MockConnection},
-        dhttp::message::test::{read_stream_for_test, write_stream_for_test},
+        dhttp::{
+            message::test::{read_stream_for_test, write_stream_for_test},
+            protocol::DHttpProtocol,
+            settings::Settings,
+            webtransport::settings::{
+                EnableWebTransport, InitialMaxData, InitialMaxStreamsBidi, InitialMaxStreamsUni,
+            },
+        },
         error::Code,
         extended_connect::EstablishedConnect,
         protocol::Protocols,
@@ -603,10 +610,26 @@ mod tests {
         let quic = Arc::new(MockConnection::new());
         let erased: Arc<dyn quic::DynConnection> = quic.clone();
         let mut protocols = Protocols::new();
+        let dhttp = DHttpProtocol::new_for_test(erased.clone());
+        dhttp
+            .state
+            .peer_settings
+            .set(Arc::new(enabled_webtransport_settings()))
+            .expect("peer settings should be set once");
+        protocols.insert(dhttp);
         protocols.insert(WebTransportProtocol::new_for_test(erased));
         let connection =
             Arc::new(ConnectionState::new_for_test(quic.clone(), Arc::new(protocols)).erase());
         (quic, connection)
+    }
+
+    fn enabled_webtransport_settings() -> Settings {
+        let mut settings = Settings::default();
+        settings.set(EnableWebTransport::setting(true));
+        settings.set(InitialMaxStreamsBidi::setting(VarInt::from_u32(16)));
+        settings.set(InitialMaxStreamsUni::setting(VarInt::from_u32(16)));
+        settings.set(InitialMaxData::setting(VarInt::MAX));
+        settings
     }
 
     fn connection_with_enabled_webtransport_pair() -> (

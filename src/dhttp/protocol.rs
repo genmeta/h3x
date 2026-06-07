@@ -1388,6 +1388,10 @@ impl DHttpProtocol {
         self.unresolved_request_streams.capacity()
     }
 
+    pub fn peer_settings_peek(&self) -> Option<Arc<Settings>> {
+        self.state.peer_settings.peek()
+    }
+
     async fn accept_uni(
         &self,
         mut stream: BoxPeekableStreamReader,
