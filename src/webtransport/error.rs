@@ -36,6 +36,8 @@ pub struct SessionClosed;
 pub enum SessionFlowControlError {
     #[snafu(display("peer exceeded webtransport stream credit"))]
     ExceededStreamCredit,
+    #[snafu(display("peer decreased webtransport max streams"))]
+    DecreasingMaxStreams,
     #[snafu(display("webtransport stream queue capacity invariant failed"))]
     QueueCapacityInvariant,
     #[snafu(display("webtransport stream count overflow"))]
@@ -90,7 +92,8 @@ pub enum SessionCloseReason {
     ControlStreamError,
 }
 
-#[derive(Debug, Snafu)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Snafu)]
 #[snafu(module, visibility(pub))]
 pub enum DrainSessionError {
     #[snafu(display("webtransport session closed"))]
@@ -99,7 +102,8 @@ pub enum DrainSessionError {
     Command { source: ControlCommandError },
 }
 
-#[derive(Debug, Snafu)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Snafu)]
 #[snafu(module, visibility(pub))]
 pub enum CloseSessionError {
     #[snafu(display("webtransport session closed"))]
@@ -108,7 +112,8 @@ pub enum CloseSessionError {
     Command { source: ControlCommandError },
 }
 
-#[derive(Debug, Snafu)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Snafu)]
 #[snafu(module, visibility(pub(in crate::webtransport)))]
 pub enum ControlCommandError {
     #[snafu(display("webtransport control task is closed"))]
@@ -131,6 +136,8 @@ pub enum OpenStreamError {
     StreamId { source: StreamError },
     #[snafu(display("failed to write stream routing header"))]
     WriteHeader { source: StreamError },
+    #[snafu(display("failed to send webtransport stream credit command"))]
+    Control { source: ControlCommandError },
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

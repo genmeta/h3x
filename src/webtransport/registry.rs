@@ -225,6 +225,76 @@ impl IncomingStreamCredit {
 }
 
 #[derive(Debug)]
+struct LocalOpenCredit {
+    peer_max: WebTransportStreamCount,
+    opened: WebTransportStreamCount,
+    last_blocked_sent: Option<WebTransportStreamCount>,
+    changed: watch::Sender<WebTransportStreamCount>,
+}
+
+impl LocalOpenCredit {
+    fn new(peer_max: WebTransportStreamCount) -> Self {
+        let (changed, _rx) = watch::channel(peer_max);
+        Self {
+            peer_max,
+            opened: WebTransportStreamCount::ZERO,
+            last_blocked_sent: None,
+            changed,
+        }
+    }
+
+    fn try_reserve(&mut self) -> Result<(), WebTransportStreamCount> {
+        if self.opened >= self.peer_max {
+            return Err(self.peer_max);
+        }
+        self.opened = self
+            .opened
+            .checked_increment()
+            .expect("opened stream count cannot overflow below peer maximum");
+        Ok(())
+    }
+
+    fn block(&mut self) -> LocalStreamCreditBlock {
+        let maximum = self.peer_max;
+        let send_blocked = self.last_blocked_sent != Some(maximum);
+        if send_blocked {
+            self.last_blocked_sent = Some(maximum);
+        }
+        LocalStreamCreditBlock {
+            maximum,
+            send_blocked,
+            changed: self.changed.subscribe(),
+        }
+    }
+
+    fn update_peer_max(
+        &mut self,
+        peer_max: WebTransportStreamCount,
+    ) -> Result<(), SessionFlowControlError> {
+        if peer_max < self.peer_max {
+            return Err(SessionFlowControlError::DecreasingMaxStreams);
+        }
+        if peer_max > self.peer_max {
+            self.peer_max = peer_max;
+            self.last_blocked_sent = None;
+            let _ = self.changed.send(peer_max);
+        }
+        Ok(())
+    }
+}
+
+pub(super) struct LocalStreamCreditBlock {
+    pub(super) maximum: WebTransportStreamCount,
+    pub(super) send_blocked: bool,
+    pub(super) changed: watch::Receiver<WebTransportStreamCount>,
+}
+
+pub(super) enum LocalStreamCreditReservation {
+    Reserved,
+    Blocked(LocalStreamCreditBlock),
+}
+
+#[derive(Debug)]
 pub(super) struct RegisteredSession {
     pub(super) state: Arc<SessionState>,
     pub(super) bidi_rx: mpsc::Receiver<RoutedBiStream>,
@@ -242,6 +312,8 @@ pub(super) struct SessionState {
     uni_tx: mpsc::Sender<RoutedUniStream>,
     bidi_credit: Mutex<IncomingStreamCredit>,
     uni_credit: Mutex<IncomingStreamCredit>,
+    local_bidi_credit: Mutex<LocalOpenCredit>,
+    local_uni_credit: Mutex<LocalOpenCredit>,
     bidi_queue_capacity: usize,
     uni_queue_capacity: usize,
     tracked_readers: Mutex<HashMap<StreamId, TrackedStreamReader>>,
@@ -262,6 +334,7 @@ impl SessionState {
     ) -> Self {
         let (close_reason, _close_rx) = watch::channel(None);
         let (drain_status, _drain_rx) = watch::channel(None);
+        let default_local_credit = default_initial_stream_credit();
         Self {
             session_id,
             registry,
@@ -272,6 +345,8 @@ impl SessionState {
             uni_tx,
             bidi_credit: Mutex::new(IncomingStreamCredit::new(bidi_credit)),
             uni_credit: Mutex::new(IncomingStreamCredit::new(uni_credit)),
+            local_bidi_credit: Mutex::new(LocalOpenCredit::new(default_local_credit)),
+            local_uni_credit: Mutex::new(LocalOpenCredit::new(default_local_credit)),
             bidi_queue_capacity,
             uni_queue_capacity,
             tracked_readers: Mutex::new(HashMap::new()),
@@ -288,6 +363,31 @@ impl SessionState {
             Err(SessionClosed)
         } else {
             Ok(())
+        }
+    }
+
+    pub(super) fn set_local_stream_credit(
+        &self,
+        peer_bidi_credit: WebTransportStreamCount,
+        peer_uni_credit: WebTransportStreamCount,
+    ) {
+        if let Ok(mut credit) = self.local_bidi_credit.lock() {
+            *credit = LocalOpenCredit::new(peer_bidi_credit);
+        } else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "webtransport session local bidi credit lock poisoned"
+            );
+            self.close();
+        }
+        if let Ok(mut credit) = self.local_uni_credit.lock() {
+            *credit = LocalOpenCredit::new(peer_uni_credit);
+        } else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "webtransport session local uni credit lock poisoned"
+            );
+            self.close();
         }
     }
 
@@ -536,6 +636,67 @@ impl SessionState {
             return Err(SessionFlowControlError::QueueCapacityInvariant);
         };
         credit.accept_one()
+    }
+
+    pub(super) fn reserve_local_bidi(&self) -> Result<LocalStreamCreditReservation, SessionClosed> {
+        self.reserve_local_credit(&self.local_bidi_credit, "bidi")
+    }
+
+    pub(super) fn reserve_local_uni(&self) -> Result<LocalStreamCreditReservation, SessionClosed> {
+        self.reserve_local_credit(&self.local_uni_credit, "uni")
+    }
+
+    fn reserve_local_credit(
+        &self,
+        credit: &Mutex<LocalOpenCredit>,
+        direction: &'static str,
+    ) -> Result<LocalStreamCreditReservation, SessionClosed> {
+        self.check_open()?;
+        let Ok(mut credit) = credit.lock() else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                direction,
+                "webtransport session local stream credit lock poisoned"
+            );
+            self.close();
+            return Err(SessionClosed);
+        };
+        match credit.try_reserve() {
+            Ok(()) => Ok(LocalStreamCreditReservation::Reserved),
+            Err(_) => Ok(LocalStreamCreditReservation::Blocked(credit.block())),
+        }
+    }
+
+    pub(super) fn update_peer_bidi_max(
+        &self,
+        peer_max: WebTransportStreamCount,
+    ) -> Result<(), SessionFlowControlError> {
+        self.update_peer_max(&self.local_bidi_credit, peer_max, "bidi")
+    }
+
+    pub(super) fn update_peer_uni_max(
+        &self,
+        peer_max: WebTransportStreamCount,
+    ) -> Result<(), SessionFlowControlError> {
+        self.update_peer_max(&self.local_uni_credit, peer_max, "uni")
+    }
+
+    fn update_peer_max(
+        &self,
+        credit: &Mutex<LocalOpenCredit>,
+        peer_max: WebTransportStreamCount,
+        direction: &'static str,
+    ) -> Result<(), SessionFlowControlError> {
+        let Ok(mut credit) = credit.lock() else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                direction,
+                "webtransport session local stream credit lock poisoned"
+            );
+            self.close();
+            return Err(SessionFlowControlError::QueueCapacityInvariant);
+        };
+        credit.update_peer_max(peer_max)
     }
 
     pub(super) fn remove_tracked_reader(&self, stream_id: StreamId) {

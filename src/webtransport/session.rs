@@ -9,6 +9,7 @@
 
 use std::{fmt, sync::Arc};
 
+use bytes::Buf;
 use snafu::{ResultExt, Snafu};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -18,7 +19,8 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
 use super::{
-    CloseSession, DecodeCloseSessionError, WebTransportSessionId,
+    CloseSession, DecodeCloseSessionError, DecodeWebTransportStreamCountError,
+    WebTransportSessionId, WebTransportStreamCount,
     error::{
         AcceptStreamError, CloseReason, CloseSessionError, ControlCommandError, DatagramError,
         DrainReason, DrainSessionError, OpenStreamError, RegisterSessionError, SessionCloseReason,
@@ -27,7 +29,7 @@ use super::{
         register_session_error,
     },
     protocol::{WEBTRANSPORT_BIDI_SIGNAL, WEBTRANSPORT_H3, WEBTRANSPORT_UNI_SIGNAL},
-    registry::{RegisteredSession, SessionState},
+    registry::{LocalStreamCreditReservation, RegisteredSession, SessionState},
 };
 use crate::{
     buflist::BufList,
@@ -48,6 +50,7 @@ use stream::{WebTransportStreamReader, WebTransportStreamWriter};
 
 const CONTROL_CAPSULE_SKIP_CHUNK_SIZE: usize = 8 * 1024;
 const CLOSE_SESSION_CAPSULE_MAX_PAYLOAD: u64 = 4 + 1024;
+const STREAM_COUNT_CAPSULE_MAX_PAYLOAD: u64 = 8;
 
 // ============================================================================
 // Stream type aliases
@@ -89,11 +92,21 @@ enum ControlCommand {
         close: CloseSession,
         ack: oneshot::Sender<Result<(), ControlCommandError>>,
     },
+    StreamsBlockedBidi {
+        maximum: WebTransportStreamCount,
+        ack: oneshot::Sender<Result<(), ControlCommandError>>,
+    },
+    StreamsBlockedUni {
+        maximum: WebTransportStreamCount,
+        ack: oneshot::Sender<Result<(), ControlCommandError>>,
+    },
 }
 
 enum RemoteControlCapsule {
     Close(CloseSession),
     Drain,
+    MaxStreamsBidi(WebTransportStreamCount),
+    MaxStreamsUni(WebTransportStreamCount),
     Ignored,
 }
 
@@ -129,6 +142,44 @@ impl ControlHandle {
             Err(_) => Err(ControlCommandError::ResponseDropped),
         }
     }
+
+    async fn streams_blocked_bidi(
+        &self,
+        maximum: WebTransportStreamCount,
+    ) -> Result<(), ControlCommandError> {
+        let (ack, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(ControlCommand::StreamsBlockedBidi { maximum, ack })
+            .await
+            .is_err()
+        {
+            return Err(ControlCommandError::Closed);
+        }
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(ControlCommandError::ResponseDropped),
+        }
+    }
+
+    async fn streams_blocked_uni(
+        &self,
+        maximum: WebTransportStreamCount,
+    ) -> Result<(), ControlCommandError> {
+        let (ack, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(ControlCommand::StreamsBlockedUni { maximum, ack })
+            .await
+            .is_err()
+        {
+            return Err(ControlCommandError::Closed);
+        }
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(ControlCommandError::ResponseDropped),
+        }
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -144,10 +195,46 @@ enum ControlTaskError {
     DrainSessionPayload,
     #[snafu(display("invalid webtransport close session capsule"))]
     CloseSessionPayload { source: DecodeCloseSessionError },
+    #[snafu(display("invalid webtransport stream count capsule"))]
+    StreamCountPayload {
+        source: DecodeWebTransportStreamCountError,
+    },
+    #[snafu(display("webtransport stream count capsule payload is too large"))]
+    StreamCountPayloadTooLarge,
+    #[snafu(display("webtransport stream count capsule has trailing bytes"))]
+    StreamCountPayloadTrailing,
 }
 
 impl WebTransportSession {
     fn from_registered(
+        registered: RegisteredSession,
+        conn: Arc<dyn quic::DynConnection>,
+        connect: EstablishedConnect,
+    ) -> Self {
+        let default_credit = default_peer_stream_credit();
+        Self::from_registered_with_peer_credit(
+            registered,
+            conn,
+            connect,
+            default_credit,
+            default_credit,
+        )
+    }
+
+    fn from_registered_with_peer_credit(
+        registered: RegisteredSession,
+        conn: Arc<dyn quic::DynConnection>,
+        connect: EstablishedConnect,
+        peer_bidi_credit: WebTransportStreamCount,
+        peer_uni_credit: WebTransportStreamCount,
+    ) -> Self {
+        registered
+            .state
+            .set_local_stream_credit(peer_bidi_credit, peer_uni_credit);
+        Self::from_registered_inner(registered, conn, connect)
+    }
+
+    fn from_registered_inner(
         registered: RegisteredSession,
         conn: Arc<dyn quic::DynConnection>,
         connect: EstablishedConnect,
@@ -185,6 +272,7 @@ impl WebTransportSession {
         self.state
             .check_open()
             .context(open_stream_error::ClosedSnafu)?;
+        self.reserve_local_bidi().await?;
         let (mut reader, writer) = self
             .conn
             .open_bi()
@@ -215,6 +303,7 @@ impl WebTransportSession {
         self.state
             .check_open()
             .context(open_stream_error::ClosedSnafu)?;
+        self.reserve_local_uni().await?;
         let writer = self
             .conn
             .open_uni()
@@ -356,6 +445,73 @@ impl WebTransportSession {
     pub async fn drained(&self) -> SessionDrain {
         self.state.drained().await
     }
+
+    async fn reserve_local_bidi(&self) -> Result<(), OpenStreamError> {
+        loop {
+            match self
+                .state
+                .reserve_local_bidi()
+                .context(open_stream_error::ClosedSnafu)?
+            {
+                LocalStreamCreditReservation::Reserved => return Ok(()),
+                LocalStreamCreditReservation::Blocked(mut block) => {
+                    if block.send_blocked {
+                        self.control
+                            .streams_blocked_bidi(block.maximum)
+                            .await
+                            .context(open_stream_error::ControlSnafu)?;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = self.state.closed() => {
+                            return Err(SessionClosed).context(open_stream_error::ClosedSnafu);
+                        }
+                        changed = block.changed.changed() => {
+                            if changed.is_err() {
+                                return Err(SessionClosed).context(open_stream_error::ClosedSnafu);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn reserve_local_uni(&self) -> Result<(), OpenStreamError> {
+        loop {
+            match self
+                .state
+                .reserve_local_uni()
+                .context(open_stream_error::ClosedSnafu)?
+            {
+                LocalStreamCreditReservation::Reserved => return Ok(()),
+                LocalStreamCreditReservation::Blocked(mut block) => {
+                    if block.send_blocked {
+                        self.control
+                            .streams_blocked_uni(block.maximum)
+                            .await
+                            .context(open_stream_error::ControlSnafu)?;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = self.state.closed() => {
+                            return Err(SessionClosed).context(open_stream_error::ClosedSnafu);
+                        }
+                        changed = block.changed.changed() => {
+                            if changed.is_err() {
+                                return Err(SessionClosed).context(open_stream_error::ClosedSnafu);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn default_peer_stream_credit() -> WebTransportStreamCount {
+    WebTransportStreamCount::try_from(VarInt::from_u32(16))
+        .expect("default webtransport peer stream credit is valid")
 }
 
 async fn run_control_task(
@@ -403,6 +559,34 @@ async fn drive_control_task(
                     state.drain_with_reason(SessionDrain::Requested(DrainReason::Session(
                         SessionDrainReason::Remote,
                     )));
+                }
+                Some(RemoteControlCapsule::MaxStreamsBidi(maximum)) => {
+                    if let Err(error) = state.update_peer_bidi_max(maximum) {
+                        let report = snafu::Report::from_error(&error);
+                        tracing::debug!(
+                            session_id = %state.id(),
+                            error = %report,
+                            "invalid webtransport bidi max streams update"
+                        );
+                        state.close_with_reason(CloseReason::Session(SessionCloseReason::Protocol {
+                            code: crate::error::Code::WT_FLOW_CONTROL_ERROR,
+                        }));
+                        break;
+                    }
+                }
+                Some(RemoteControlCapsule::MaxStreamsUni(maximum)) => {
+                    if let Err(error) = state.update_peer_uni_max(maximum) {
+                        let report = snafu::Report::from_error(&error);
+                        tracing::debug!(
+                            session_id = %state.id(),
+                            error = %report,
+                            "invalid webtransport uni max streams update"
+                        );
+                        state.close_with_reason(CloseReason::Session(SessionCloseReason::Protocol {
+                            code: crate::error::Code::WT_FLOW_CONTROL_ERROR,
+                        }));
+                        break;
+                    }
                 }
                 Some(RemoteControlCapsule::Ignored) => {}
                 None => break,
@@ -465,6 +649,14 @@ where
             }
             Ok(Some(RemoteControlCapsule::Drain))
         }
+        CapsuleType::WT_MAX_STREAMS_BIDI => {
+            let maximum = read_stream_count_payload(reader, length).await?;
+            Ok(Some(RemoteControlCapsule::MaxStreamsBidi(maximum)))
+        }
+        CapsuleType::WT_MAX_STREAMS_UNI => {
+            let maximum = read_stream_count_payload(reader, length).await?;
+            Ok(Some(RemoteControlCapsule::MaxStreamsUni(maximum)))
+        }
         _ => {
             skip_control_capsule_payload(reader, length)
                 .await
@@ -472,6 +664,32 @@ where
             Ok(Some(RemoteControlCapsule::Ignored))
         }
     }
+}
+
+async fn read_stream_count_payload<S>(
+    reader: &mut S,
+    length: VarInt,
+) -> Result<WebTransportStreamCount, ControlTaskError>
+where
+    S: AsyncRead + Unpin + Send,
+{
+    if length.into_inner() > STREAM_COUNT_CAPSULE_MAX_PAYLOAD {
+        skip_control_capsule_payload(reader, length)
+            .await
+            .context(control_task_error::DecodeCapsuleSnafu)?;
+        return Err(ControlTaskError::StreamCountPayloadTooLarge);
+    }
+    let mut payload = read_control_capsule_payload(reader, length)
+        .await
+        .context(control_task_error::DecodeCapsuleSnafu)?;
+    let count = payload
+        .decode_one::<WebTransportStreamCount>()
+        .await
+        .context(control_task_error::StreamCountPayloadSnafu)?;
+    if payload.remaining() != 0 {
+        return Err(ControlTaskError::StreamCountPayloadTrailing);
+    }
+    Ok(count)
 }
 
 async fn read_control_capsule_payload<S>(
@@ -547,6 +765,24 @@ async fn handle_control_command(
             _ = ack.send(result);
             true
         }
+        ControlCommand::StreamsBlockedBidi { maximum, ack } => {
+            let result =
+                write_stream_count_capsule(writer, CapsuleType::WT_STREAMS_BLOCKED_BIDI, maximum)
+                    .await
+                    .context(control_command_error::WriteSnafu);
+            let should_close = result.is_err();
+            _ = ack.send(result);
+            should_close
+        }
+        ControlCommand::StreamsBlockedUni { maximum, ack } => {
+            let result =
+                write_stream_count_capsule(writer, CapsuleType::WT_STREAMS_BLOCKED_UNI, maximum)
+                    .await
+                    .context(control_command_error::WriteSnafu);
+            let should_close = result.is_err();
+            _ = ack.send(result);
+            should_close
+        }
     }
 }
 
@@ -566,6 +802,20 @@ async fn write_close_capsule(
         .expect("encoding webtransport close session payload into a buflist is infallible");
     let capsule = Capsule::new(CapsuleType::WT_CLOSE_SESSION, payload)
         .expect("validated webtransport close session payload is a valid varint length");
+    write_control_capsule(writer, capsule).await
+}
+
+async fn write_stream_count_capsule(
+    writer: &mut MessageWriter,
+    r#type: CapsuleType,
+    count: WebTransportStreamCount,
+) -> Result<(), MessageStreamError> {
+    let payload = BufList::new()
+        .encode(count)
+        .await
+        .expect("encoding webtransport stream count payload into a buflist is infallible");
+    let capsule = Capsule::new(r#type, payload)
+        .expect("validated webtransport stream count payload is a valid varint length");
     write_control_capsule(writer, capsule).await
 }
 
@@ -715,7 +965,7 @@ mod tests {
         varint::VarInt,
         webtransport::{
             CloseSession, WEBTRANSPORT_H3, WebTransportProtocol, WebTransportSessionId,
-            registry::Registry,
+            WebTransportStreamCount, registry::Registry,
         },
     };
 
@@ -1563,6 +1813,16 @@ mod tests {
             assert_eq!(capsule.length(), VarInt::from_u32(0));
         }
 
+        async fn next_streams_blocked_bidi(&self) -> WebTransportStreamCount {
+            let capsule = self.next_capsule().await;
+            assert_eq!(capsule.r#type(), CapsuleType::WT_STREAMS_BLOCKED_BIDI);
+            capsule
+                .into_payload()
+                .decode::<WebTransportStreamCount>()
+                .await
+                .expect("streams blocked bidi payload should decode")
+        }
+
         async fn writer_closed(&self) -> bool {
             let mut reader = self.outgoing_reader.lock().await;
             matches!(
@@ -1593,6 +1853,61 @@ mod tests {
             message_writer_from_quic_writer(Box::pin(outgoing_writer)),
         );
         let session = WebTransportSession::from_registered(registered, conn, connect);
+        let state = ConnectStreamState {
+            outgoing_reader: tokio::sync::Mutex::new(message_reader_from_quic_reader(
+                session_id.0,
+                Box::pin(outgoing_reader),
+            )),
+            incoming_writer: tokio::sync::Mutex::new(message_writer_from_quic_writer(Box::pin(
+                incoming_writer,
+            ))),
+        };
+
+        (session, state)
+    }
+
+    fn stream_count(value: u32) -> WebTransportStreamCount {
+        WebTransportStreamCount::try_from(VarInt::from_u32(value)).expect("valid stream count")
+    }
+
+    async fn max_streams_bidi_capsule(value: WebTransportStreamCount) -> Capsule<BufList> {
+        let payload = BufList::new()
+            .encode(value)
+            .await
+            .expect("stream count payload should encode");
+        Capsule::new(CapsuleType::WT_MAX_STREAMS_BIDI, payload)
+            .expect("stream count payload length is valid")
+    }
+
+    fn webtransport_session_with_peer_credit(
+        session_id: StreamId,
+        peer_bidi_credit: WebTransportStreamCount,
+        peer_uni_credit: WebTransportStreamCount,
+    ) -> (WebTransportSession, ConnectStreamState) {
+        let registry = Registry::default();
+        let registered = registry
+            .register(wt_session_id(session_id))
+            .expect("session registration should succeed");
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
+            state: Arc::new(StreamState::default()),
+        });
+
+        let (incoming_reader, incoming_writer) = quic::test::mock_stream_pair(session_id.0);
+        let (outgoing_reader, outgoing_writer) = quic::test::mock_stream_pair(session_id.0);
+        let connect = EstablishedConnect::ready(
+            session_id,
+            Some(Protocol::new(WEBTRANSPORT_H3)),
+            connection_without_webtransport(),
+            message_reader_from_quic_reader(session_id.0, Box::pin(incoming_reader)),
+            message_writer_from_quic_writer(Box::pin(outgoing_writer)),
+        );
+        let session = WebTransportSession::from_registered_with_peer_credit(
+            registered,
+            conn,
+            connect,
+            peer_bidi_credit,
+            peer_uni_credit,
+        );
         let state = ConnectStreamState {
             outgoing_reader: tokio::sync::Mutex::new(message_reader_from_quic_reader(
                 session_id.0,
@@ -2399,6 +2714,57 @@ mod tests {
             SessionDrain::Requested(DrainReason::Session(SessionDrainReason::Remote))
         );
         assert!(session.state.check_open().is_ok());
+    }
+
+    #[tokio::test]
+    async fn open_bi_sends_streams_blocked_and_waits_until_peer_max_streams_increases() {
+        let (session, connect_state) = webtransport_session_with_peer_credit(
+            StreamId::from(VarInt::from_u32(4)),
+            WebTransportStreamCount::ZERO,
+            WebTransportStreamCount::ZERO,
+        );
+
+        let open = session.open_bi();
+        tokio::pin!(open);
+        timeout(Duration::from_millis(25), &mut open)
+            .await
+            .expect_err("open_bi should wait for peer stream credit");
+
+        assert_eq!(
+            connect_state.next_streams_blocked_bidi().await,
+            WebTransportStreamCount::ZERO
+        );
+
+        connect_state
+            .inject_capsule(max_streams_bidi_capsule(stream_count(1)).await)
+            .await;
+        let (_reader, _writer) = timeout(Duration::from_secs(1), open)
+            .await
+            .expect("open_bi should unblock after peer grants credit")
+            .expect("open_bi should succeed after peer grants credit");
+    }
+
+    #[tokio::test]
+    async fn decreasing_peer_max_streams_closes_session_with_flow_control_error() {
+        let (session, connect_state) = webtransport_session_with_peer_credit(
+            StreamId::from(VarInt::from_u32(4)),
+            stream_count(2),
+            WebTransportStreamCount::ZERO,
+        );
+
+        connect_state
+            .inject_capsule(max_streams_bidi_capsule(stream_count(1)).await)
+            .await;
+
+        let reason = timeout(Duration::from_secs(1), session.closed())
+            .await
+            .expect("decreasing max streams should close session");
+        assert_eq!(
+            reason,
+            CloseReason::Session(SessionCloseReason::Protocol {
+                code: Code::WT_FLOW_CONTROL_ERROR
+            })
+        );
     }
 
     #[tokio::test]
