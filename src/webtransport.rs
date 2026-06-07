@@ -44,7 +44,7 @@ mod session_id;
 mod stream_count;
 
 pub use close::{
-    CloseSession, CloseSessionMessage, CloseSessionMessageTooLong,
+    CloseSession, CloseSessionMessage, CloseSessionMessageTooLong, DecodeCloseSessionError,
     TryFromCloseSessionMessageBytesError, TryFromCloseSessionPartsError,
 };
 pub use error::{
@@ -61,7 +61,9 @@ pub use session::{
     stream::{WebTransportStreamReader, WebTransportStreamWriter},
 };
 pub use session_id::{InvalidSessionId, WebTransportSessionId};
-pub use stream_count::{InvalidWebTransportStreamCount, WebTransportStreamCount};
+pub use stream_count::{
+    DecodeWebTransportStreamCountError, InvalidWebTransportStreamCount, WebTransportStreamCount,
+};
 
 // ============================================================================
 // Session trait (AFIT)

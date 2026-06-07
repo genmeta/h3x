@@ -1,6 +1,13 @@
-use snafu::Snafu;
+use std::{convert::Infallible, io};
 
-use crate::varint::VarInt;
+use snafu::{ResultExt, Snafu};
+use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::{
+    buflist::BufList,
+    codec::{DecodeExt, DecodeFrom, EncodeExt, EncodeInto},
+    varint::VarInt,
+};
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -46,6 +53,57 @@ pub struct InvalidWebTransportStreamCount {
 impl InvalidWebTransportStreamCount {
     pub const fn value(&self) -> VarInt {
         self.value
+    }
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module(decode_webtransport_stream_count_error), visibility(pub(super)))]
+pub enum DecodeWebTransportStreamCountError {
+    #[snafu(display("failed to decode webtransport stream count"))]
+    Decode { source: io::Error },
+    #[snafu(display("invalid webtransport stream count"))]
+    Invalid {
+        source: InvalidWebTransportStreamCount,
+    },
+}
+
+impl<S> DecodeFrom<S> for WebTransportStreamCount
+where
+    S: AsyncRead + Unpin + Send,
+{
+    type Error = DecodeWebTransportStreamCountError;
+
+    async fn decode_from(mut stream: S) -> Result<Self, Self::Error> {
+        let value = stream
+            .decode_one::<VarInt>()
+            .await
+            .context(decode_webtransport_stream_count_error::DecodeSnafu)?;
+        Self::try_from(value).context(decode_webtransport_stream_count_error::InvalidSnafu)
+    }
+}
+
+impl<'s, S> EncodeInto<&'s mut S> for WebTransportStreamCount
+where
+    S: AsyncWrite + Unpin + Send,
+{
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: &'s mut S) -> Result<Self::Output, Self::Error> {
+        self.into_varint().encode_into(stream).await
+    }
+}
+
+impl EncodeInto<BufList> for WebTransportStreamCount {
+    type Output = BufList;
+    type Error = Infallible;
+
+    async fn encode_into(self, mut stream: BufList) -> Result<Self::Output, Self::Error> {
+        stream
+            .encode_one(self)
+            .await
+            .expect("encoding a webtransport stream count into a BufList is infallible");
+        Ok(stream)
     }
 }
 

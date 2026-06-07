@@ -47,6 +47,22 @@ pub struct Capsule<P: ?Sized> {
     payload: P,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CapsuleHeader {
+    r#type: CapsuleType,
+    length: VarInt,
+}
+
+impl CapsuleHeader {
+    pub const fn r#type(&self) -> CapsuleType {
+        self.r#type
+    }
+
+    pub const fn length(&self) -> VarInt {
+        self.length
+    }
+}
+
 impl<P: ?Sized> Capsule<P> {
     pub fn new(r#type: CapsuleType, payload: P) -> Result<Self, varint::err::Overflow>
     where
@@ -88,6 +104,26 @@ impl<P: ?Sized> Capsule<P> {
             length: self.length,
             payload: map(self.payload),
         }
+    }
+}
+
+impl Capsule<BufList> {
+    pub async fn skip_from<S>(stream: S, max_skip_chunk: VarInt) -> Result<CapsuleHeader, io::Error>
+    where
+        S: AsyncRead + Unpin + Send,
+    {
+        let mut stream = stream;
+        let r#type = CapsuleType::from(stream.decode_one::<VarInt>().await?);
+        let length = stream.decode_one::<VarInt>().await?;
+        let mut remaining = length.into_inner();
+        let scratch_len = max_skip_chunk.into_inner().clamp(1, READ_CHUNK_SIZE) as usize;
+        let mut scratch = vec![0; scratch_len];
+        while remaining > 0 {
+            let len = remaining.min(scratch.len() as u64) as usize;
+            stream.read_exact(&mut scratch[..len]).await?;
+            remaining -= len as u64;
+        }
+        Ok(CapsuleHeader { r#type, length })
     }
 }
 
@@ -170,6 +206,7 @@ mod tests {
         codec::{DecodeExt, EncodeExt, StreamReader},
         quic,
         varint::VarInt,
+        webtransport::{CloseSession, WebTransportStreamCount},
     };
 
     #[test]
@@ -229,5 +266,57 @@ mod tests {
         assert_eq!(decoded.length(), VarInt::from_u32(5));
         let mut payload = decoded.into_payload();
         assert_eq!(payload.copy_to_bytes(5), Bytes::from_static(b"hello"));
+    }
+
+    #[tokio::test]
+    async fn close_session_capsule_payload_round_trips_u32_and_utf8_message() {
+        let close = CloseSession::try_from((7_u32, "done")).expect("valid close");
+        let payload = BufList::new()
+            .encode(close.clone())
+            .await
+            .expect("close session encoding succeeds");
+
+        let decoded = payload
+            .decode::<CloseSession>()
+            .await
+            .expect("close session payload decodes");
+
+        assert_eq!(decoded, close);
+    }
+
+    #[tokio::test]
+    async fn stream_count_payload_round_trips_varint_without_u64_conversion() {
+        let count = WebTransportStreamCount::try_from(VarInt::from_u32(13)).expect("valid count");
+        let payload = BufList::new()
+            .encode(count)
+            .await
+            .expect("stream count encoding succeeds");
+
+        let decoded = payload
+            .decode::<WebTransportStreamCount>()
+            .await
+            .expect("stream count payload decodes");
+
+        assert_eq!(decoded.into_varint(), VarInt::from_u32(13));
+    }
+
+    #[tokio::test]
+    async fn capsule_payload_skip_does_not_materialize_unknown_payload() {
+        let mut payload = BufList::new();
+        payload.write(Bytes::from_static(b"unknown"));
+        let mut encoded = BufList::new()
+            .encode(
+                Capsule::new(CapsuleType::from(VarInt::from_u32(0x2f)), payload).expect("capsule"),
+            )
+            .await
+            .expect("encode");
+
+        let skipped = Capsule::skip_from(&mut encoded, VarInt::from_u32(1024))
+            .await
+            .expect("unknown capsule can be skipped");
+
+        assert_eq!(skipped.r#type(), CapsuleType::from(VarInt::from_u32(0x2f)));
+        assert_eq!(skipped.length(), VarInt::from_u32(7));
+        assert_eq!(encoded.remaining(), 0);
     }
 }

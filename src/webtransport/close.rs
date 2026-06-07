@@ -1,7 +1,13 @@
-use std::{convert::Infallible, error::Error as StdError, string::FromUtf8Error};
+use std::{convert::Infallible, error::Error as StdError, io, string::FromUtf8Error};
 
 use bytes::Bytes;
 use snafu::{ResultExt, Snafu};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::{
+    buflist::BufList,
+    codec::{DecodeFrom, EncodeExt, EncodeInto},
+};
 
 const CLOSE_SESSION_MESSAGE_MAX_LEN: usize = 1024;
 
@@ -155,6 +161,71 @@ impl TryFrom<(u32, Bytes)> for CloseSession {
 
     fn try_from((application_error_code, message): (u32, Bytes)) -> Result<Self, Self::Error> {
         Self::try_from_parts(application_error_code, message)
+    }
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module(decode_close_session_error), visibility(pub(super)))]
+pub enum DecodeCloseSessionError {
+    #[snafu(display("failed to decode webtransport close session application error code"))]
+    ApplicationErrorCode { source: io::Error },
+    #[snafu(display("failed to decode webtransport close session message"))]
+    Message { source: io::Error },
+    #[snafu(display("invalid webtransport close session message"))]
+    InvalidMessage {
+        source: TryFromCloseSessionMessageBytesError,
+    },
+}
+
+impl<S> DecodeFrom<S> for CloseSession
+where
+    S: AsyncRead + Unpin + Send,
+{
+    type Error = DecodeCloseSessionError;
+
+    async fn decode_from(mut stream: S) -> Result<Self, Self::Error> {
+        let application_error_code = stream
+            .read_u32()
+            .await
+            .context(decode_close_session_error::ApplicationErrorCodeSnafu)?;
+
+        let mut message = Vec::new();
+        stream
+            .take((CLOSE_SESSION_MESSAGE_MAX_LEN + 1) as u64)
+            .read_to_end(&mut message)
+            .await
+            .context(decode_close_session_error::MessageSnafu)?;
+        let message = CloseSessionMessage::try_from(Bytes::from(message))
+            .context(decode_close_session_error::InvalidMessageSnafu)?;
+
+        Ok(Self::new(application_error_code, message))
+    }
+}
+
+impl<'s, S> EncodeInto<&'s mut S> for CloseSession
+where
+    S: AsyncWrite + Unpin + Send,
+{
+    type Output = ();
+    type Error = io::Error;
+
+    async fn encode_into(self, stream: &'s mut S) -> Result<Self::Output, Self::Error> {
+        stream.write_u32(self.application_error_code()).await?;
+        stream.write_all(self.message().as_str().as_bytes()).await?;
+        Ok(())
+    }
+}
+
+impl EncodeInto<BufList> for CloseSession {
+    type Output = BufList;
+    type Error = Infallible;
+
+    async fn encode_into(self, mut stream: BufList) -> Result<Self::Output, Self::Error> {
+        stream
+            .encode_one(self)
+            .await
+            .expect("encoding CloseSession into a buflist is infallible");
+        Ok(stream)
     }
 }
 
