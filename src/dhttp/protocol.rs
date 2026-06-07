@@ -920,6 +920,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_settings_resolves_on_dyn_connection_state() {
+        let quic = Arc::new(MockConnection::new());
+        let erased_connection: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        let dhttp = DHttpProtocol::new_for_test(erased_connection.clone());
+        let settings = Arc::new(Settings::default());
+        dhttp
+            .peer_settings
+            .set(settings.clone())
+            .expect("set peer settings");
+        protocols.insert(dhttp);
+        let state: ConnectionState<dyn quic::DynConnection> =
+            ConnectionState::new_for_test(erased_connection, Arc::new(protocols));
+
+        let observed = state
+            .peer_settings()
+            .await
+            .expect("dyn peer settings should resolve");
+
+        assert_eq!(observed, settings);
+    }
+
+    #[tokio::test]
     async fn peer_settings_resolves_to_connection_error_when_settings_never_arrive() {
         let quic = Arc::new(MockConnection::new());
         let erased_connection: Arc<dyn quic::DynConnection> = quic.clone();
@@ -1654,7 +1677,7 @@ impl<C: ?Sized> ConnectionState<C> {
     }
 }
 
-impl<C: quic::DynLifecycle + Sync> ConnectionState<C> {
+impl<C: ?Sized + quic::DynLifecycle + Sync> ConnectionState<C> {
     /// Per RFC 9114 §3.2/§6.2.1, SETTINGS MUST be the first frame on the
     /// control stream; a connection that closes before SETTINGS arrives is in
     /// error. Races [`Self::closed`] so callers cannot hang on a frame that

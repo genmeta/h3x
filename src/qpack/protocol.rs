@@ -477,8 +477,10 @@ impl<C: ?Sized> ConnectionState<C> {
 #[cfg(test)]
 mod tests {
     use std::{
+        any::Any,
         borrow::Cow,
         collections::hash_map::DefaultHasher,
+        fmt,
         hash::{Hash, Hasher},
         io,
         pin::Pin,
@@ -527,17 +529,37 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Default, Clone)]
+    #[derive(Default, Clone)]
     struct MockConnection {
         stream_calls: Arc<Mutex<Vec<&'static str>>>,
+        open_uni_readers: Arc<Mutex<Vec<Box<dyn Any + Send>>>>,
         open_uni_available: bool,
         closed_pending: bool,
+    }
+
+    impl fmt::Debug for MockConnection {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("MockConnection")
+                .field("stream_calls", &self.stream_calls)
+                .field(
+                    "open_uni_readers",
+                    &self
+                        .open_uni_readers
+                        .lock()
+                        .expect("open uni readers lock poisoned")
+                        .len(),
+                )
+                .field("open_uni_available", &self.open_uni_available)
+                .field("closed_pending", &self.closed_pending)
+                .finish()
+        }
     }
 
     impl MockConnection {
         fn with_open_uni_available(open_uni_available: bool) -> Self {
             Self {
                 stream_calls: Arc::default(),
+                open_uni_readers: Arc::default(),
                 open_uni_available,
                 closed_pending: false,
             }
@@ -546,6 +568,7 @@ mod tests {
         fn with_open_uni_available_and_pending_close(open_uni_available: bool) -> Self {
             Self {
                 stream_calls: Arc::default(),
+                open_uni_readers: Arc::default(),
                 open_uni_available,
                 closed_pending: true,
             }
@@ -593,7 +616,11 @@ mod tests {
                 return Err(test_connection_error("open_uni unavailable"));
             }
 
-            let (_reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(0));
+            let (reader, writer) = quic::test::mock_stream_pair(VarInt::from_u32(0));
+            self.open_uni_readers
+                .lock()
+                .expect("open uni readers lock poisoned")
+                .push(Box::new(reader));
             Ok(Box::pin(writer) as BoxQuicStreamWriter)
         }
 

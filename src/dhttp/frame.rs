@@ -223,6 +223,7 @@ impl<P: Buf + Send, S: AsyncWrite + Sink<Bytes, Error = quic::StreamError> + Sen
             let bytes = payload.copy_to_bytes(payload.chunk().len());
             stream.as_mut().feed(bytes).await?;
         }
+        stream.as_mut().flush().await?;
         Ok(())
     }
 }
@@ -335,6 +336,7 @@ mod tests {
     use std::{
         pin::Pin,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use futures::{
@@ -342,7 +344,10 @@ mod tests {
         future::poll_fn,
         stream::{self, Stream, StreamExt},
     };
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
+        time::timeout,
+    };
     use tracing::Instrument;
 
     use super::*;
@@ -1047,6 +1052,28 @@ mod tests {
     ) {
         let (sink, stream) = futures::channel::mpsc::channel(8);
         (sink.sink_map_err(|_e| unreachable!()), stream.map(Ok))
+    }
+
+    #[tokio::test]
+    async fn encode_into_flushes_zero_length_frame() {
+        let (sink, stream) = channel();
+        let mut sink = SinkWriter::new(sink);
+        let frame = Frame::new(Frame::SETTINGS_FRAME_TYPE, Bytes::new()).expect("settings frame");
+
+        sink.encode_one(frame)
+            .await
+            .expect("frame encode should flush");
+
+        let stream = StreamReader::new(stream);
+        let mut stream = pin!(FrameStream::new(stream));
+        let frame = timeout(Duration::from_millis(100), stream.as_mut().next_frame())
+            .await
+            .expect("flushed frame should be observable")
+            .expect("frame should be present")
+            .expect("frame should decode");
+
+        assert_eq!(frame.r#type(), Frame::SETTINGS_FRAME_TYPE);
+        assert_eq!(frame.length(), VarInt::from_u32(0));
     }
 
     #[tokio::test]

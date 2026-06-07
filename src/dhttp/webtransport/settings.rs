@@ -1,5 +1,6 @@
 use crate::{
     dhttp::settings::{Setting, SettingId, Settings},
+    extended_connect::settings::EnableConnectProtocol,
     varint::VarInt,
 };
 
@@ -102,6 +103,40 @@ impl SettingId for InitialMaxData {
     }
 }
 
+/// HTTP/3 settings fragment advertising WebTransport support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebTransportSupport {
+    pub initial_max_streams_bidi: VarInt,
+    pub initial_max_streams_uni: VarInt,
+    pub initial_max_data: VarInt,
+}
+
+impl Default for WebTransportSupport {
+    fn default() -> Self {
+        Self {
+            initial_max_streams_bidi: VarInt::from_u32(16),
+            initial_max_streams_uni: VarInt::from_u32(16),
+            initial_max_data: VarInt::MAX,
+        }
+    }
+}
+
+impl IntoIterator for WebTransportSupport {
+    type Item = Setting;
+    type IntoIter = std::array::IntoIter<Setting, 5>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        [
+            EnableConnectProtocol::setting(true),
+            EnableWebTransport::setting(true),
+            InitialMaxStreamsBidi::setting(self.initial_max_streams_bidi),
+            InitialMaxStreamsUni::setting(self.initial_max_streams_uni),
+            InitialMaxData::setting(self.initial_max_data),
+        ]
+        .into_iter()
+    }
+}
+
 impl Settings {
     pub fn enable_webtransport(&self) -> bool {
         self.get(EnableWebTransport)
@@ -187,5 +222,25 @@ mod tests {
         assert_eq!(InitialMaxStreamsUni.id(), VarInt::from_u32(0x2b64));
         assert_eq!(InitialMaxStreamsBidi.id(), VarInt::from_u32(0x2b65));
         assert_eq!(InitialMaxData.id(), VarInt::from_u32(0x2b61));
+    }
+
+    #[test]
+    fn webtransport_support_is_a_composable_settings_fragment() {
+        let settings = Settings::default()
+            .with_all(WebTransportSupport::default())
+            .with(crate::dhttp::settings::MaxFieldSectionSize::setting(
+                VarInt::from_u32(4096),
+            ));
+
+        assert!(settings.enable_connect_protocol());
+        assert!(settings.enable_webtransport());
+        assert_eq!(settings.wt_initial_max_streams_bidi(), VarInt::from_u32(16));
+        assert_eq!(settings.wt_initial_max_streams_uni(), VarInt::from_u32(16));
+        assert_eq!(settings.wt_initial_max_data(), VarInt::MAX);
+        assert!(settings.webtransport_flow_control_enabled());
+        assert_eq!(
+            settings.max_field_section_size(),
+            Some(VarInt::from_u32(4096)),
+        );
     }
 }

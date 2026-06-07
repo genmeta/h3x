@@ -356,6 +356,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_bridge_does_not_duplicate_pull_after_flush_with_outstanding_credit() {
+        let first = Bytes::from_static(b"first");
+        let second = Bytes::from_static(b"second");
+        let (writer, handle) = recording_writer(VarInt::from_u32(313));
+        let (mut worker, hypervisor) = worker_writer_pair::<TestFrameIoError>();
+        let task = tokio::spawn(run_write_bridge(writer, hypervisor));
+
+        assert_eq!(expect_write_event(&mut worker).await, WriteEvent::Pull);
+        worker
+            .send(WriteCommand::Push {
+                data: first.clone(),
+            })
+            .await
+            .expect("first push should send");
+        assert_eq!(expect_write_event(&mut worker).await, WriteEvent::Pull);
+        worker
+            .send(WriteCommand::Flush)
+            .await
+            .expect("flush should send");
+        assert_eq!(expect_write_event(&mut worker).await, WriteEvent::FlushAck);
+
+        match tokio::time::timeout(Duration::from_millis(10), worker.next_frame()).await {
+            Ok(Some(Ok(frame))) => panic!("flush must not duplicate pull credit: {frame:?}"),
+            Ok(Some(Err(error))) => panic!("unexpected frame error after flush: {error:?}"),
+            Ok(None) | Err(_) => {}
+        }
+
+        worker
+            .send(WriteCommand::Push {
+                data: second.clone(),
+            })
+            .await
+            .expect("second push should use outstanding credit");
+        assert_eq!(expect_write_event(&mut worker).await, WriteEvent::Pull);
+        assert_eq!(
+            handle.ops(),
+            [
+                WriterOp::Push(first),
+                WriterOp::Flush,
+                WriterOp::Push(second)
+            ]
+        );
+        drop(worker);
+        tokio::time::timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("write bridge should finish after worker eof")
+            .expect("write bridge task should not panic");
+    }
+
+    #[tokio::test]
     async fn write_bridge_reset_clears_queued_work_without_interrupting_current_push() {
         let reset = VarInt::from_u32(307);
         let first = Bytes::from_static(b"first");

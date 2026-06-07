@@ -203,6 +203,16 @@ impl Settings {
     pub fn set(&mut self, Setting { id, value }: Setting) {
         self.map.insert(id, value);
     }
+
+    pub fn with(mut self, setting: Setting) -> Self {
+        self.set(setting);
+        self
+    }
+
+    pub fn with_all(mut self, settings: impl IntoIterator<Item = Setting>) -> Self {
+        self.extend(settings);
+        self
+    }
 }
 
 impl IntoIterator for Settings {
@@ -601,6 +611,24 @@ mod tests {
 
         let rebuilt = Settings::from_iter(owned);
         assert_eq!(settings, rebuilt);
+    }
+
+    #[test]
+    fn settings_with_and_with_all_compose_setting_fragments() {
+        let settings = Settings::default()
+            .with(MaxFieldSectionSize::setting(VarInt::from_u32(4096)))
+            .with_all([
+                EnableConnectProtocol::setting(true),
+                H3Datagram::setting(false),
+            ])
+            .with(H3Datagram::setting(true));
+
+        assert_eq!(
+            settings.max_field_section_size(),
+            Some(VarInt::from_u32(4096)),
+        );
+        assert!(settings.enable_connect_protocol());
+        assert!(settings.h3_datagram());
     }
 
     #[test]

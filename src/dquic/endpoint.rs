@@ -441,12 +441,24 @@ impl quic::Connect for QuicEndpoint {
         let bind = self.bind.clone();
         let connect_timeout = tokio::time::sleep(self.connect_path_timeout());
         tokio::pin!(connect_timeout);
+        let mut peer_agent_seen = false;
 
         loop {
             tokio::select! {
                 biased;
                 _ = connection.terminated() => {
                     return Err(ConnectError::NoReachableEndpoint);
+                }
+                result = connection.handshaked(), if peer_agent_seen => {
+                    result.map_err(|_| ConnectError::NoReachableEndpoint)?;
+                    Self::spawn_path_discovery_companion(
+                        bind.clone(),
+                        connection.clone(),
+                        server_eps,
+                        observer,
+                    );
+                    tracing::debug!(server = server_str, "quic endpoint handshaked before agent path");
+                    return Ok(connection);
                 }
                 _ = &mut connect_timeout => {
                     connection
@@ -467,10 +479,20 @@ impl quic::Connect for QuicEndpoint {
                         endpoint = ?server_ep,
                         "resolved peer endpoint"
                     );
+                    peer_agent_seen |= Self::endpoint_is_agent(server_ep);
                     Self::add_resolved_peer_endpoint(
                         &connection,
                         source,
                         server_ep,
+                    );
+                    // Resolver streams often contain a batch of equivalent endpoints
+                    // that are ready immediately (for example STUN-agent and
+                    // same-link direct records). Install the ready batch before
+                    // evaluating readiness so a Direct record cannot return before
+                    // a peer Agent record in the same DNS response is observed.
+                    peer_agent_seen |= Self::drain_ready_peer_endpoints(
+                        &connection,
+                        &mut server_eps,
                     );
                 }
                 Some((bind_uri, event)) = observer.recv() => {
@@ -483,14 +505,8 @@ impl quic::Connect for QuicEndpoint {
                 }
             }
 
-            match Self::connection_has_paths(&connection) {
+            match Self::connection_has_paths(&connection, peer_agent_seen) {
                 Ok(true) => {
-                    // Resolver streams often contain a batch of equivalent endpoints
-                    // that are ready immediately (for example STUN-agent and
-                    // same-link direct records). Install the ready batch before
-                    // returning so the handshake starts with all current path
-                    // candidates instead of whichever record happened to arrive first.
-                    Self::drain_ready_peer_endpoints(&connection, &mut server_eps);
                     Self::spawn_path_discovery_companion(
                         bind.clone(),
                         connection.clone(),
@@ -647,17 +663,24 @@ impl QuicEndpoint {
 
     fn connection_has_paths(
         connection: &Connection,
+        require_agent_path: bool,
     ) -> Result<bool, crate::dquic::qbase::error::Error> {
         let ctx = connection.path_context()?;
         Ok(ctx
             .paths::<Vec<_>>()
             .into_iter()
-            .any(|(pathway, _)| Self::pathway_is_connect_ready(pathway)))
+            .any(|(pathway, _)| Self::pathway_is_connect_ready(pathway, require_agent_path)))
     }
 
-    fn pathway_is_connect_ready(pathway: crate::dquic::qbase::net::route::Pathway) -> bool {
+    fn pathway_is_connect_ready(
+        pathway: crate::dquic::qbase::net::route::Pathway,
+        require_agent_path: bool,
+    ) -> bool {
         match (pathway.local(), pathway.remote()) {
             (EndpointAddr::Direct { addr: local }, EndpointAddr::Direct { addr: remote }) => {
+                if require_agent_path {
+                    return false;
+                }
                 Self::direct_path_is_connect_ready(local, remote)
             }
             _ => true,
@@ -727,13 +750,20 @@ impl QuicEndpoint {
         let _ = connection.add_peer_endpoint(server_ep, source);
     }
 
-    fn drain_ready_peer_endpoints<S>(connection: &Connection, server_eps: &mut S)
+    fn drain_ready_peer_endpoints<S>(connection: &Connection, server_eps: &mut S) -> bool
     where
         S: Stream<Item = (Source, EndpointAddr)> + Unpin,
     {
+        let mut agent_seen = false;
         while let Some(Some((source, server_ep))) = server_eps.next().now_or_never() {
+            agent_seen |= Self::endpoint_is_agent(server_ep);
             Self::add_resolved_peer_endpoint(connection, source, server_ep);
         }
+        agent_seen
+    }
+
+    fn endpoint_is_agent(endpoint: EndpointAddr) -> bool {
+        matches!(endpoint, EndpointAddr::Agent { .. })
     }
 
     fn add_local_endpoint_for_peer(conn: &Connection, bind_uri: BindUri, endpoint: EndpointAddr) {
@@ -941,7 +971,7 @@ mod tests {
         );
 
         assert!(
-            QuicEndpoint::connection_has_paths(&connection).expect("path context"),
+            QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
             "local endpoint replayed before DNS peer must be retained for peer pairing"
         );
     }
@@ -987,8 +1017,78 @@ mod tests {
         );
 
         assert!(
-            !QuicEndpoint::connection_has_paths(&connection).expect("path context"),
+            !QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
             "loopback-to-non-loopback direct paths are not ready for client handshake"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_agent_requires_agent_path_before_connect_ready() {
+        let bind_pattern = BindPattern::from_str("inet://127.0.0.1:0").expect("valid bind pattern");
+        let endpoint = QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .bind(Arc::new(vec![bind_pattern.clone()]))
+            .build()
+            .await;
+        let tls = endpoint.ensure_client().expect("client tls");
+        let connection = endpoint
+            .build_client_connection("server.example", tls)
+            .expect("client connection");
+        let iface = endpoint
+            .network()
+            .quic()
+            .get_interfaces(&bind_pattern)
+            .expect("registered bind")
+            .into_iter()
+            .next()
+            .expect("bound interface");
+
+        use crate::dquic::net::IO as _;
+        let bind_uri = iface.bind_uri();
+        let local_addr = iface.borrow().bound_addr().expect("bound address");
+        let remote_direct = SocketAddr::new(local_addr.ip(), local_addr.port() + 1);
+        let stun_agent: SocketAddr = "10.10.0.2:20004".parse().expect("stun agent");
+
+        QuicEndpoint::handle_local_addr_event(
+            &connection,
+            bind_uri.clone(),
+            crate::dquic::qinterface::component::location::AddressEvent::Upsert(Arc::new(Ok::<
+                SocketAddr,
+                std::io::Error,
+            >(
+                local_addr,
+            ))),
+        );
+        QuicEndpoint::add_resolved_peer_endpoint(
+            &connection,
+            Source::H3 {
+                server: Arc::from("https://dns.genmeta.net:4433"),
+            },
+            EndpointAddr::with_agent(stun_agent, "10.10.0.40:20000".parse().expect("outer addr")),
+        );
+        QuicEndpoint::add_resolved_peer_endpoint(
+            &connection,
+            Source::H3 {
+                server: Arc::from("https://dns.genmeta.net:4433"),
+            },
+            EndpointAddr::direct(remote_direct),
+        );
+
+        assert!(
+            QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
+            "direct loopback path is connect-ready when no Agent path is required"
+        );
+        assert!(
+            !QuicEndpoint::connection_has_paths(&connection, true).expect("path context"),
+            "peer Agent endpoints must not return on Direct-only paths"
+        );
+
+        connection
+            .add_local_endpoint(bind_uri, EndpointAddr::with_agent(stun_agent, local_addr))
+            .expect("local agent endpoint");
+        assert!(
+            QuicEndpoint::connection_has_paths(&connection, true).expect("path context"),
+            "local Agent endpoint should make peer Agent connection ready"
         );
     }
 
@@ -1066,7 +1166,7 @@ mod tests {
         ]);
         QuicEndpoint::drain_ready_peer_endpoints(&connection, &mut endpoints);
         assert!(
-            QuicEndpoint::connection_has_paths(&connection).expect("path context"),
+            QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
             "ready peer endpoints should pair with the retained local endpoint"
         );
     }
@@ -1114,7 +1214,7 @@ mod tests {
         );
 
         assert!(
-            !QuicEndpoint::connection_has_paths(&connection).expect("path context"),
+            !QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
             "ignored events should not create paths"
         );
     }

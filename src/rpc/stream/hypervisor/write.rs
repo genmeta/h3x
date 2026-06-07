@@ -47,6 +47,7 @@ where
     let mut queue = VecDeque::new();
     let mut reset_code = None;
     let mut inbound_closed = false;
+    let mut credit_outstanding = true;
 
     loop {
         if let Some(job) = queue.pop_front() {
@@ -58,7 +59,12 @@ where
                         inbound = bridge.next(), if !inbound_closed => {
                             match inbound {
                                 Some(Ok(command)) => {
-                                    if !record_command(&mut queue, &mut reset_code, command) {
+                                    if !record_command(
+                                        &mut queue,
+                                        &mut reset_code,
+                                        &mut credit_outstanding,
+                                        command,
+                                    ) {
                                         return;
                                     }
                                 }
@@ -78,12 +84,13 @@ where
 
             match done {
                 Ok(HyperWriteDone::Push) => {
-                    if should_send_credit(inbound_closed, reset_code, &queue)
+                    if should_send_credit(inbound_closed, reset_code, &queue, credit_outstanding)
                         && !send_write_credit(
                             &mut bridge,
                             &mut queue,
                             &mut reset_code,
                             &mut inbound_closed,
+                            &mut credit_outstanding,
                         )
                         .await
                     {
@@ -92,12 +99,13 @@ where
                 }
                 Ok(HyperWriteDone::Flush) => {
                     send_write_event(&mut bridge, WriteEvent::FlushAck).await;
-                    if should_send_credit(inbound_closed, reset_code, &queue)
+                    if should_send_credit(inbound_closed, reset_code, &queue, credit_outstanding)
                         && !send_write_credit(
                             &mut bridge,
                             &mut queue,
                             &mut reset_code,
                             &mut inbound_closed,
+                            &mut credit_outstanding,
                         )
                         .await
                     {
@@ -130,7 +138,12 @@ where
 
         match bridge.next().await {
             Some(Ok(command)) => {
-                if !record_command(&mut queue, &mut reset_code, command) {
+                if !record_command(
+                    &mut queue,
+                    &mut reset_code,
+                    &mut credit_outstanding,
+                    command,
+                ) {
                     return;
                 }
             }
@@ -147,10 +160,12 @@ where
 fn record_command(
     queue: &mut VecDeque<HyperWriteJob>,
     reset_code: &mut Option<VarInt>,
+    credit_outstanding: &mut bool,
     command: WriteCommand,
 ) -> bool {
     match command {
         WriteCommand::Push { data } => {
+            *credit_outstanding = false;
             if reset_code.is_none() && !has_terminal(queue) {
                 queue.push_back(HyperWriteJob::Push { data });
             }
@@ -199,8 +214,9 @@ fn should_send_credit(
     inbound_closed: bool,
     reset_code: Option<VarInt>,
     queue: &VecDeque<HyperWriteJob>,
+    credit_outstanding: bool,
 ) -> bool {
-    !inbound_closed && reset_code.is_none() && !has_terminal(queue)
+    !credit_outstanding && !inbound_closed && reset_code.is_none() && !has_terminal(queue)
 }
 
 async fn run_write_job<W>(
@@ -252,6 +268,7 @@ async fn send_write_credit<Io, E>(
     queue: &mut VecDeque<HyperWriteJob>,
     reset_code: &mut Option<VarInt>,
     inbound_closed: &mut bool,
+    credit_outstanding: &mut bool,
 ) -> bool
 where
     Io: FrameIo<WriteEvent, WriteCommand, E> + Unpin,
@@ -262,7 +279,7 @@ where
         if !*inbound_closed {
             match Pin::new(&mut *bridge).poll_next(cx) {
                 Poll::Ready(Some(Ok(command))) => {
-                    if record_command(queue, reset_code, command) {
+                    if record_command(queue, reset_code, credit_outstanding, command) {
                         return Poll::Ready(true);
                     }
                     return Poll::Ready(false);
@@ -293,6 +310,7 @@ where
                             state = CreditSendState::Done;
                             return Poll::Ready(true);
                         }
+                        *credit_outstanding = true;
                         state = CreditSendState::Flush;
                     }
                     Poll::Ready(Err(error)) => {
