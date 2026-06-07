@@ -1,3 +1,5 @@
+use std::fmt;
+
 use snafu::Snafu;
 
 use crate::{
@@ -30,6 +32,12 @@ impl TryFrom<StreamId> for WebTransportSessionId {
 impl From<WebTransportSessionId> for StreamId {
     fn from(session_id: WebTransportSessionId) -> Self {
         session_id.0
+    }
+}
+
+impl fmt::Display for WebTransportSessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 

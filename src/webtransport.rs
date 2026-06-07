@@ -33,10 +33,7 @@
 
 use futures::future::BoxFuture;
 
-use crate::{
-    quic::{BoxQuicStreamReader, BoxQuicStreamWriter, ReadStream, WriteStream},
-    stream_id::StreamId,
-};
+use crate::quic::{BoxQuicStreamReader, BoxQuicStreamWriter, ReadStream, WriteStream};
 
 mod close;
 mod error;
@@ -78,7 +75,7 @@ pub trait Session: Send + Sync {
     type StreamReader: ReadStream + Unpin;
     type StreamWriter: WriteStream + Unpin;
 
-    fn id(&self) -> StreamId;
+    fn id(&self) -> WebTransportSessionId;
 
     fn open_bi(
         &self,
@@ -110,7 +107,7 @@ pub trait Session: Send + Sync {
 /// Stream types are fixed to [`BoxQuicStreamReader`] / [`BoxQuicStreamWriter`].
 /// A blanket impl is provided for all `T: Session`.
 pub trait DynSession: Send + Sync {
-    fn id(&self) -> StreamId;
+    fn id(&self) -> WebTransportSessionId;
 
     #[allow(clippy::type_complexity)]
     fn open_bi(
@@ -128,7 +125,7 @@ pub trait DynSession: Send + Sync {
 }
 
 impl<T: Session> DynSession for T {
-    fn id(&self) -> StreamId {
+    fn id(&self) -> WebTransportSessionId {
         Session::id(self)
     }
 
@@ -179,7 +176,7 @@ impl Session for WebTransportSession {
     type StreamReader = WebTransportStreamReader;
     type StreamWriter = WebTransportStreamWriter;
 
-    fn id(&self) -> StreamId {
+    fn id(&self) -> WebTransportSessionId {
         WebTransportSession::id(self)
     }
 
@@ -217,23 +214,29 @@ mod tests {
         protocol::Protocols,
         qpack::field::Protocol,
         quic::{self, GetStreamIdExt},
+        stream_id::StreamId,
         varint::VarInt,
     };
 
     #[derive(Debug)]
     struct TestSession {
-        id: StreamId,
+        id: WebTransportSessionId,
     }
 
     #[derive(Debug)]
     struct FailingSession {
-        id: StreamId,
+        id: WebTransportSessionId,
     }
 
     impl TestSession {
-        fn new(id: StreamId) -> Self {
+        fn new(id: WebTransportSessionId) -> Self {
             Self { id }
         }
+    }
+
+    fn wt_session_id(id: u32) -> WebTransportSessionId {
+        WebTransportSessionId::try_from(StreamId(VarInt::from_u32(id)))
+            .expect("test id must be a valid webtransport session id")
     }
 
     fn boxed_stream_pair(stream_id: u32) -> (BoxQuicStreamReader, BoxQuicStreamWriter) {
@@ -290,7 +293,7 @@ mod tests {
         type StreamReader = BoxQuicStreamReader;
         type StreamWriter = BoxQuicStreamWriter;
 
-        fn id(&self) -> StreamId {
+        fn id(&self) -> WebTransportSessionId {
             self.id
         }
 
@@ -321,7 +324,7 @@ mod tests {
         type StreamReader = BoxQuicStreamReader;
         type StreamWriter = BoxQuicStreamWriter;
 
-        fn id(&self) -> StreamId {
+        fn id(&self) -> WebTransportSessionId {
             self.id
         }
 
@@ -375,10 +378,10 @@ mod tests {
 
     #[tokio::test]
     async fn dyn_session_delegates_all_stream_operations() {
-        let session = TestSession::new(StreamId(VarInt::from_u32(42)));
+        let session = TestSession::new(wt_session_id(40));
         let dyn_session: &dyn DynSession = &session;
 
-        assert_eq!(dyn_session.id(), StreamId(VarInt::from_u32(42)));
+        assert_eq!(dyn_session.id(), wt_session_id(40));
 
         let (mut reader, mut writer) = dyn_session.open_bi().await.expect("open_bi should succeed");
         assert_eq!(reader.stream_id().await.unwrap(), VarInt::from_u32(1));
@@ -409,11 +412,11 @@ mod tests {
     #[tokio::test]
     async fn dyn_session_preserves_operation_errors() {
         let session = FailingSession {
-            id: StreamId(VarInt::from_u32(7)),
+            id: wt_session_id(4),
         };
         let dyn_session: &dyn DynSession = &session;
 
-        assert_eq!(dyn_session.id(), StreamId(VarInt::from_u32(7)));
+        assert_eq!(dyn_session.id(), wt_session_id(4));
         assert!(matches!(
             dyn_session.open_bi().await,
             Err(OpenStreamError::Closed { .. })
@@ -440,7 +443,10 @@ mod tests {
         let session = webtransport_session_for_test(Arc::clone(&mock), session_id);
         let dyn_session: &dyn DynSession = &session;
 
-        assert_eq!(dyn_session.id(), session_id);
+        assert_eq!(
+            dyn_session.id(),
+            WebTransportSessionId::try_from(session_id).expect("valid session id")
+        );
 
         let (mut reader, mut writer) = dyn_session.open_bi().await.expect("open_bi should work");
         assert_eq!(reader.stream_id().await.unwrap(), VarInt::from_u32(0));
@@ -457,7 +463,7 @@ mod tests {
         let mock = Arc::new(MockConnection::new());
         mock.set_terminal_error(connection_error("bidi closed"));
         let session =
-            webtransport_session_for_test(Arc::clone(&mock), StreamId(VarInt::from_u32(46)));
+            webtransport_session_for_test(Arc::clone(&mock), StreamId(VarInt::from_u32(44)));
         let dyn_session: &dyn DynSession = &session;
 
         match dyn_session.accept_bi().await {

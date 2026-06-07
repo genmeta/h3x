@@ -1,13 +1,13 @@
 use snafu::Snafu;
 
+use super::{InvalidSessionId, WebTransportSessionId};
 use crate::{
     qpack::field::Protocol,
     quic::{ConnectionError, StreamError},
-    stream_id::StreamId,
 };
 
 #[derive(Debug, Snafu)]
-#[snafu(module, visibility(pub(super)))]
+#[snafu(module, visibility(pub(in crate::webtransport)))]
 pub enum RegisterSessionError {
     #[snafu(display("extended connect is missing a protocol token"))]
     MissingProtocol,
@@ -15,8 +15,10 @@ pub enum RegisterSessionError {
     UnexpectedProtocol { protocol: Protocol },
     #[snafu(display("webtransport protocol layer is not registered on the connection"))]
     ProtocolLayerMissing,
+    #[snafu(display("invalid webtransport session id"))]
+    InvalidSessionId { source: InvalidSessionId },
     #[snafu(display("session already registered for {session_id}"))]
-    AlreadyRegistered { session_id: StreamId },
+    AlreadyRegistered { session_id: WebTransportSessionId },
     #[snafu(display("session registry lock poisoned"))]
     RegistryPoisoned,
 }

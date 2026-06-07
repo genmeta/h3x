@@ -66,9 +66,10 @@ use crate::{
         GetStreamIdExt, ResetStreamExt, StopStreamExt,
     },
     rpc::lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt as _},
-    stream_id::StreamId,
     varint::VarInt,
-    webtransport::{self, AcceptStreamError, OpenStreamError, SessionClosed},
+    webtransport::{
+        self, AcceptStreamError, OpenStreamError, SessionClosed, WebTransportSessionId,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -253,7 +254,7 @@ fn ipc_accept_error_connection(error: IpcWebTransportAcceptError) -> Option<Conn
 #[derive(Serialize, Deserialize)]
 pub struct WebTransportSessionBootstrap {
     /// The session ID (immutable, no RPC needed).
-    pub session_id: VarInt,
+    pub session_id: WebTransportSessionId,
     /// RPC client for WebTransport session stream operations.
     pub session: IpcWebTransportSessionClient,
 }
@@ -498,7 +499,7 @@ impl quic::Lifecycle for IpcWebTransportLifecycle {
 /// Created by the client after receiving a [`WebTransportSessionBootstrap`] over the
 /// remoc channel.
 pub struct IpcWebTransportSessionHandle {
-    session_id: VarInt,
+    session_id: WebTransportSessionId,
     rpc: IpcWebTransportSessionClient,
     fd_transfer: FdTransfer,
     lifecycle: Arc<IpcWebTransportLifecycle>,
@@ -508,7 +509,7 @@ impl IpcWebTransportSessionHandle {
     /// Create a new handle from bootstrap data, FD registry, and the parent
     /// connection's lifecycle.
     pub fn new(
-        session_id: VarInt,
+        session_id: WebTransportSessionId,
         rpc: IpcWebTransportSessionClient,
         fd_transfer: FdTransfer,
         conn_lifecycle: Arc<dyn DynLifecycle>,
@@ -655,8 +656,8 @@ impl webtransport::Session for IpcWebTransportSessionHandle {
     type StreamReader = BoxQuicStreamReader;
     type StreamWriter = BoxQuicStreamWriter;
 
-    fn id(&self) -> StreamId {
-        self.session_id.into()
+    fn id(&self) -> WebTransportSessionId {
+        self.session_id
     }
 
     async fn open_bi(&self) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), OpenStreamError> {
@@ -790,7 +791,7 @@ impl IpcWebTransportSessionClient {
     /// Convert into an [`IpcWebTransportSessionHandle`].
     pub fn into_handle(
         self,
-        session_id: VarInt,
+        session_id: WebTransportSessionId,
         fd_transfer: FdTransfer,
         conn_lifecycle: Arc<dyn DynLifecycle>,
     ) -> IpcWebTransportSessionHandle {

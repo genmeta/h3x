@@ -15,9 +15,10 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
 use super::{
+    WebTransportSessionId,
     error::{
         AcceptStreamError, DatagramError, OpenStreamError, RegisterSessionError, SessionClosed,
-        UnsupportedSnafu, accept_stream_error, open_stream_error,
+        UnsupportedSnafu, accept_stream_error, open_stream_error, register_session_error,
     },
     protocol::{WEBTRANSPORT_BIDI_SIGNAL, WEBTRANSPORT_H3, WEBTRANSPORT_UNI_SIGNAL},
     registry::{RegisteredSession, SessionState},
@@ -109,7 +110,7 @@ impl WebTransportSession {
 
     /// The session ID (QUIC stream ID of the CONNECT stream that established
     /// this session).
-    pub fn id(&self) -> StreamId {
+    pub fn id(&self) -> WebTransportSessionId {
         self.state.id()
     }
 
@@ -129,7 +130,7 @@ impl WebTransportSession {
             .open_bi()
             .await
             .context(open_stream_error::OpenSnafu)?;
-        let writer = write_header(writer, WEBTRANSPORT_BIDI_SIGNAL, self.id()).await?;
+        let writer = write_header(writer, WEBTRANSPORT_BIDI_SIGNAL, self.id().stream_id()).await?;
         let stream_id = reader
             .stream_id()
             .await
@@ -159,7 +160,8 @@ impl WebTransportSession {
             .open_uni()
             .await
             .context(open_stream_error::OpenSnafu)?;
-        let mut writer = write_header(writer, WEBTRANSPORT_UNI_SIGNAL, self.id()).await?;
+        let mut writer =
+            write_header(writer, WEBTRANSPORT_UNI_SIGNAL, self.id().stream_id()).await?;
         let stream_id = writer
             .stream_id()
             .await
@@ -266,7 +268,9 @@ impl TryFrom<EstablishedConnect> for WebTransportSession {
                 .connection()
                 .protocol::<super::WebTransportProtocol>()
                 .ok_or(RegisterSessionError::ProtocolLayerMissing)?;
-            let registered = protocol.register(connect.stream_id())?;
+            let session_id = WebTransportSessionId::try_from(connect.stream_id())
+                .context(register_session_error::InvalidSessionIdSnafu)?;
+            let registered = protocol.register(session_id)?;
             let conn = protocol.connection();
             (registered, conn)
         };
@@ -372,7 +376,8 @@ mod tests {
         stream_id::StreamId,
         varint::VarInt,
         webtransport::{
-            WEBTRANSPORT_H3, WebTransportProtocol, protocol::WT_SESSION_GONE, registry::Registry,
+            WEBTRANSPORT_H3, WebTransportProtocol, WebTransportSessionId,
+            protocol::WT_SESSION_GONE, registry::Registry,
         },
     };
 
@@ -1007,6 +1012,11 @@ mod tests {
         Arc::new(ConnectionState::new_for_test(quic.clone(), Arc::new(Protocols::new())).erase())
     }
 
+    fn wt_session_id(session_id: StreamId) -> WebTransportSessionId {
+        WebTransportSessionId::try_from(session_id)
+            .expect("test id must be a valid webtransport session id")
+    }
+
     fn noop_task() -> AbortOnDropHandle<()> {
         AbortOnDropHandle::new(tokio::spawn(async {}.in_current_span()))
     }
@@ -1017,7 +1027,7 @@ mod tests {
     ) -> (Registry, WebTransportSession) {
         let registry = Registry::default();
         let registered = registry
-            .register(session_id)
+            .register(wt_session_id(session_id))
             .expect("session registration should succeed");
         let session = WebTransportSession {
             state: Arc::clone(&registered.state),
@@ -1035,7 +1045,7 @@ mod tests {
     ) -> WebTransportSession {
         let registry = Registry::default();
         let registered = registry
-            .register(session_id)
+            .register(wt_session_id(session_id))
             .expect("session registration should succeed");
         let (_bidi_tx, bidi_rx) = mpsc::channel(1);
         let (_uni_tx, uni_rx) = mpsc::channel(1);
@@ -1165,7 +1175,37 @@ mod tests {
         ))))
         .expect("valid webtransport connect registers session");
 
-        assert_eq!(session.id(), StreamId::from(VarInt::from_u32(4)));
+        assert_eq!(
+            session.id(),
+            wt_session_id(StreamId::from(VarInt::from_u32(4)))
+        );
+    }
+
+    #[tokio::test]
+    async fn try_from_rejects_invalid_connect_stream_id() {
+        let error = WebTransportSession::try_from(connect_on_connection(
+            connection_with_webtransport(),
+            StreamId::from(VarInt::from_u32(3)),
+            Some(Protocol::new(WEBTRANSPORT_H3)),
+        ))
+        .expect_err("server unidirectional stream id cannot establish a WT session");
+
+        let RegisterSessionError::InvalidSessionId { source } = error else {
+            panic!("expected invalid session id error, got {error:?}");
+        };
+        assert_eq!(source.session_id(), StreamId::from(VarInt::from_u32(3)));
+    }
+
+    #[tokio::test]
+    async fn concrete_session_id_returns_proof_type() {
+        let session = WebTransportSession::try_from(connect_with_protocol(Some(Protocol::new(
+            WEBTRANSPORT_H3,
+        ))))
+        .expect("valid webtransport connect registers session");
+
+        let id: WebTransportSessionId = session.id();
+
+        assert_eq!(id.stream_id(), StreamId::from(VarInt::from_u32(4)));
     }
 
     #[tokio::test]
@@ -1220,7 +1260,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            RegisterSessionError::AlreadyRegistered { session_id } if session_id == stream_id
+            RegisterSessionError::AlreadyRegistered { session_id } if session_id == wt_session_id(stream_id)
         ));
 
         drop(first);
@@ -1776,7 +1816,7 @@ mod tests {
         let registry = Registry::default();
         let session_id = StreamId::from(VarInt::from_u32(24));
         let registered = registry
-            .register(session_id)
+            .register(wt_session_id(session_id))
             .expect("session registration should succeed");
         let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
             state: Arc::new(StreamState::default()),
@@ -1798,9 +1838,9 @@ mod tests {
     async fn control_task_closes_session_after_connect_stream_read_error() {
         let _guard = enable_debug_tracing_for_test();
         let registry = Registry::default();
-        let session_id = StreamId::from(VarInt::from_u32(25));
+        let session_id = StreamId::from(VarInt::from_u32(28));
         let registered = registry
-            .register(session_id)
+            .register(wt_session_id(session_id))
             .expect("session registration should succeed");
         let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
             state: Arc::new(StreamState::default()),
@@ -1809,7 +1849,7 @@ mod tests {
             session_id,
             Some(Protocol::new(WEBTRANSPORT_H3)),
             connection_without_webtransport(),
-            read_stream_with_reset(25, VarInt::from_u32(0xaa)).await,
+            read_stream_with_reset(28, VarInt::from_u32(0xaa)).await,
             write_stream_for_test(session_id.0),
         );
 
@@ -1822,9 +1862,9 @@ mod tests {
     async fn control_task_closes_session_when_connect_takeover_fails() {
         let _guard = enable_debug_tracing_for_test();
         let registry = Registry::default();
-        let session_id = StreamId::from(VarInt::from_u32(26));
+        let session_id = StreamId::from(VarInt::from_u32(32));
         let registered = registry
-            .register(session_id)
+            .register(wt_session_id(session_id))
             .expect("session registration should succeed");
         let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
             state: Arc::new(StreamState::default()),

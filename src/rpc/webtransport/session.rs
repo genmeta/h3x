@@ -23,9 +23,8 @@ use crate::{
         self, BoxQuicStreamReader, BoxQuicStreamWriter, ConnectionError, DynLifecycle,
         GetStreamIdExt,
     },
-    stream_id::StreamId,
     varint::VarInt,
-    webtransport::{self, AcceptStreamError, OpenStreamError},
+    webtransport::{self, AcceptStreamError, OpenStreamError, WebTransportSessionId},
 };
 
 // ---------------------------------------------------------------------------
@@ -101,7 +100,7 @@ impl WebTransportRpcSession for webtransport::WebTransportSession {
 #[derive(Clone)]
 pub struct RemoteWebTransportSession {
     client: WebTransportRpcSessionClient,
-    session_id: VarInt,
+    session_id: WebTransportSessionId,
     parent: Arc<dyn DynLifecycle>,
     latch: ConnectionErrorLatch,
 }
@@ -109,7 +108,7 @@ pub struct RemoteWebTransportSession {
 impl RemoteWebTransportSession {
     pub fn new(
         client: WebTransportRpcSessionClient,
-        session_id: VarInt,
+        session_id: WebTransportSessionId,
         conn_lifecycle: Arc<dyn DynLifecycle>,
     ) -> Self {
         Self {
@@ -172,8 +171,8 @@ impl webtransport::Session for RemoteWebTransportSession {
     type StreamReader = guard::GuardQuicReader;
     type StreamWriter = guard::GuardQuicWriter;
 
-    fn id(&self) -> StreamId {
-        self.session_id.into()
+    fn id(&self) -> WebTransportSessionId {
+        self.session_id
     }
 
     async fn open_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), OpenStreamError> {
@@ -307,7 +306,7 @@ impl WebTransportRpcSessionClient {
     /// Convert into a [`RemoteWebTransportSession`].
     pub fn into_webtransport_session(
         self,
-        session_id: VarInt,
+        session_id: WebTransportSessionId,
         conn_lifecycle: Arc<dyn DynLifecycle>,
     ) -> RemoteWebTransportSession {
         RemoteWebTransportSession::new(self, session_id, conn_lifecycle)
@@ -345,6 +344,7 @@ mod tests {
         qpack::field::Protocol,
         quic::{BoxQuicStreamReader, BoxQuicStreamWriter, GetStreamIdExt, StopStreamExt},
         rpc::stream::test_io::TestLifecycle as StreamTestLifecycle,
+        stream_id::StreamId,
         webtransport::{SessionClosed, WEBTRANSPORT_H3, WebTransportProtocol},
     };
 
@@ -622,6 +622,11 @@ mod tests {
         connection_with_webtransport_pair().1
     }
 
+    fn wt_session_id(id: u32) -> WebTransportSessionId {
+        WebTransportSessionId::try_from(StreamId::from(VarInt::from_u32(id)))
+            .expect("test id must be a valid webtransport session id")
+    }
+
     fn webtransport_connect_on(
         connection: Arc<ConnectionState<dyn quic::DynConnection>>,
     ) -> EstablishedConnect {
@@ -658,12 +663,9 @@ mod tests {
         let (_server_task, client) = spawn_rpc_session(session);
         let parent = Arc::new(TestLifecycle::default());
         let remote =
-            RemoteWebTransportSession::new(client.clone(), VarInt::from_u32(42), parent.clone());
+            RemoteWebTransportSession::new(client.clone(), wt_session_id(40), parent.clone());
 
-        assert_eq!(
-            webtransport::Session::id(&remote),
-            StreamId::from(VarInt::from_u32(42)),
-        );
+        assert_eq!(webtransport::Session::id(&remote), wt_session_id(40),);
         quic::Lifecycle::check(&remote).expect("remote session should be live");
 
         let (mut reader, mut writer) = webtransport::Session::open_bi(&remote)
@@ -715,7 +717,7 @@ mod tests {
         quic::Lifecycle::close(&remote, Code::H3_NO_ERROR, "done".into());
         assert_eq!(parent.closes(), vec![(Code::H3_NO_ERROR, "done".into())]);
 
-        let converted = client.into_webtransport_session(VarInt::from_u32(7), parent);
+        let converted = client.into_webtransport_session(wt_session_id(44), parent);
         let _inner: WebTransportRpcSessionClient = converted.into();
     }
 
@@ -724,15 +726,12 @@ mod tests {
         let session = Arc::new(TestRpcSession::new());
         let (_server_task, client) = spawn_rpc_session(session);
         let parent = Arc::new(TestLifecycle::default());
-        let remote = RemoteWebTransportSession::new(client, VarInt::from_u32(42), parent.clone());
+        let remote = RemoteWebTransportSession::new(client, wt_session_id(40), parent.clone());
 
         let client = remote.into_inner();
-        let converted = client.into_webtransport_session(VarInt::from_u32(43), parent);
+        let converted = client.into_webtransport_session(wt_session_id(44), parent);
 
-        assert_eq!(
-            webtransport::Session::id(&converted),
-            StreamId::from(VarInt::from_u32(43)),
-        );
+        assert_eq!(webtransport::Session::id(&converted), wt_session_id(44),);
         webtransport::Session::open_uni(&converted)
             .await
             .expect("client returned by into_inner should remain usable");
@@ -743,7 +742,7 @@ mod tests {
         let session = Arc::new(TestRpcSession::fail_open());
         let (_server_task, client) = spawn_rpc_session(session);
         let parent = Arc::new(TestLifecycle::default());
-        let remote = RemoteWebTransportSession::new(client, VarInt::from_u32(42), parent.clone());
+        let remote = RemoteWebTransportSession::new(client, wt_session_id(40), parent.clone());
 
         let Err(error) = webtransport::Session::open_bi(&remote).await else {
             panic!("open error should surface");
@@ -775,7 +774,7 @@ mod tests {
         let session = Arc::new(TestRpcSession::close_accept());
         let (_server_task, client) = spawn_rpc_session(session);
         let parent = Arc::new(TestLifecycle::default());
-        let remote = RemoteWebTransportSession::new(client, VarInt::from_u32(42), parent);
+        let remote = RemoteWebTransportSession::new(client, wt_session_id(40), parent);
 
         let Err(error) = webtransport::Session::accept_bi(&remote).await else {
             panic!("accept_bi should report session closure");
@@ -793,7 +792,7 @@ mod tests {
         let session = Arc::new(TestRpcSession::fail_accept());
         let (_server_task, client) = spawn_rpc_session(session);
         let parent = Arc::new(TestLifecycle::default());
-        let remote = RemoteWebTransportSession::new(client, VarInt::from_u32(42), parent);
+        let remote = RemoteWebTransportSession::new(client, wt_session_id(40), parent);
 
         let Err(error) = webtransport::Session::accept_bi(&remote).await else {
             panic!("accept_bi should surface connection failure");
@@ -821,7 +820,7 @@ mod tests {
         let session = Arc::new(TestRpcSession::new());
         let (_server_task, client) = spawn_rpc_session(session);
         let parent = Arc::new(TestLifecycle::default());
-        let remote = RemoteWebTransportSession::new(client, VarInt::from_u32(42), parent.clone());
+        let remote = RemoteWebTransportSession::new(client, wt_session_id(40), parent.clone());
 
         parent.set_terminal(connection_error("parent closed"));
 
@@ -845,7 +844,7 @@ mod tests {
         let session = Arc::new(TestRpcSession::new());
         let (server_task, client) = spawn_rpc_session(session);
         let parent = Arc::new(TestLifecycle::default());
-        let remote = RemoteWebTransportSession::new(client, VarInt::from_u32(42), parent);
+        let remote = RemoteWebTransportSession::new(client, wt_session_id(40), parent);
 
         drop(server_task);
         wait_for_remoc_client_to_close(&remote.client).await;
@@ -881,7 +880,7 @@ mod tests {
         let session = Arc::new(TestRpcSession::new());
         let (server_task, client) = spawn_rpc_session(session);
         let parent = Arc::new(TestLifecycle::default());
-        let remote = RemoteWebTransportSession::new(client, VarInt::from_u32(42), parent.clone());
+        let remote = RemoteWebTransportSession::new(client, wt_session_id(40), parent.clone());
 
         drop(server_task);
         wait_for_remoc_client_to_close(&remote.client).await;

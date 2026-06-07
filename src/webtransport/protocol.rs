@@ -19,6 +19,7 @@ use std::{fmt, sync::Arc};
 use futures::future::BoxFuture;
 
 use super::{
+    WebTransportSessionId,
     error::RegisterSessionError,
     registry::{RegisteredSession, Registry, RouteBiError, RouteUniError},
 };
@@ -80,7 +81,7 @@ impl fmt::Debug for WebTransportProtocol {
 impl WebTransportProtocol {
     pub(super) fn register(
         &self,
-        session_id: StreamId,
+        session_id: WebTransportSessionId,
     ) -> Result<RegisteredSession, RegisterSessionError> {
         self.registry.register(session_id)
     }
@@ -116,10 +117,12 @@ impl WebTransportProtocol {
         }
 
         // WebTransport bidi stream confirmed. Decode session ID for routing.
-        let Ok(session_id) = reader.decode_one::<StreamId>().await else {
+        let Ok(raw_session_id) = reader.decode_one::<StreamId>().await else {
             tracing::debug!("failed to decode session id from webtransport bidi stream");
             return Ok(StreamVerdict::Accepted);
         };
+        let session_id = WebTransportSessionId::try_from(raw_session_id)
+            .map_err(crate::connection::ConnectionError::from)?;
 
         tracing::debug!(session_id = %session_id, "routing webtransport bidi stream to session");
 
@@ -159,10 +162,12 @@ impl WebTransportProtocol {
         }
 
         // WebTransport uni stream confirmed. Decode session ID for routing.
-        let Ok(session_id) = stream.decode_one::<StreamId>().await else {
+        let Ok(raw_session_id) = stream.decode_one::<StreamId>().await else {
             tracing::debug!("failed to decode session id from webtransport uni stream");
             return Ok(StreamVerdict::Accepted);
         };
+        let session_id = WebTransportSessionId::try_from(raw_session_id)
+            .map_err(crate::connection::ConnectionError::from)?;
 
         tracing::debug!(session_id = %session_id, "routing webtransport uni stream to session");
 
@@ -268,6 +273,7 @@ mod tests {
         error::Code,
         protocol::InitProtocols,
         quic,
+        webtransport::WebTransportSessionId,
     };
 
     #[test]
@@ -288,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_bidi_session_is_accepted_and_aborted() {
         let state = Arc::new(StreamState::default());
-        let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x41, 0x2a])]);
+        let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x41, 0x28])]);
         let writer = test_writer(state.clone());
         let protocol = test_protocol();
 
@@ -311,7 +317,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_uni_session_is_accepted_and_stopped() {
         let state = Arc::new(StreamState::default());
-        let stream = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x54, 0x2a])]);
+        let stream = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x54, 0x28])]);
         let protocol = test_protocol();
 
         let verdict = protocol
@@ -328,15 +334,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incoming_stream_with_invalid_session_id_closes_connection_with_h3_id_error() {
+        let state = Arc::new(StreamState::default());
+        let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x41, 0x03])]);
+        let writer = test_writer(state.clone());
+        let protocol = test_protocol();
+
+        let error = match protocol.accept_bi((reader, writer)).await {
+            Ok(_) => panic!("invalid WT session id must be connection scoped"),
+            Err(error) => error,
+        };
+
+        assert_stream_connection_code(error, Code::H3_ID_ERROR);
+    }
+
+    #[test]
+    fn registry_register_accepts_only_webtransport_session_id() {
+        let protocol = test_protocol();
+        let session_id = WebTransportSessionId::try_from(StreamId::from(VarInt::from_u32(4)))
+            .expect("client bidi stream id is valid WT session id");
+
+        let registered = protocol
+            .register(session_id)
+            .expect("registration succeeds");
+
+        assert_eq!(registered.state.id(), session_id);
+    }
+
+    #[tokio::test]
     async fn closed_bidi_session_id_uses_wt_session_gone() {
         let protocol = test_protocol();
         let registered = protocol
-            .register(StreamId::from(VarInt::from_u32(42)))
+            .register(wt_session_id(40))
             .expect("session registration should succeed");
         registered.state.close();
 
         let state = Arc::new(StreamState::default());
-        let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x41, 0x2a])]);
+        let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x41, 0x28])]);
         let writer = test_writer(state.clone());
 
         let verdict = protocol
@@ -353,12 +387,12 @@ mod tests {
     async fn closed_uni_session_id_uses_wt_session_gone() {
         let protocol = test_protocol();
         let registered = protocol
-            .register(StreamId::from(VarInt::from_u32(42)))
+            .register(wt_session_id(40))
             .expect("session registration should succeed");
         registered.state.close();
 
         let state = Arc::new(StreamState::default());
-        let stream = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x54, 0x2a])]);
+        let stream = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x54, 0x28])]);
 
         let verdict = protocol
             .accept_uni(stream)
@@ -375,12 +409,12 @@ mod tests {
         let state = Arc::new(StreamState::default());
         let reader = test_reader(
             state.clone(),
-            vec![Bytes::from_static(&[0x40, 0x41, 0x2a, 0xde, 0xad])],
+            vec![Bytes::from_static(&[0x40, 0x41, 0x28, 0xde, 0xad])],
         );
         let writer = test_writer(state.clone());
         let protocol = test_protocol();
         let mut registered = protocol
-            .register(StreamId::from(VarInt::from_u32(42)))
+            .register(wt_session_id(40))
             .expect("session registration should succeed");
 
         let verdict = protocol
@@ -411,11 +445,11 @@ mod tests {
         let state = Arc::new(StreamState::default());
         let stream = test_reader(
             state.clone(),
-            vec![Bytes::from_static(&[0x40, 0x54, 0x2a, 0xbe, 0xef])],
+            vec![Bytes::from_static(&[0x40, 0x54, 0x28, 0xbe, 0xef])],
         );
         let protocol = test_protocol();
         let mut registered = protocol
-            .register(StreamId::from(VarInt::from_u32(42)))
+            .register(wt_session_id(40))
             .expect("session registration should succeed");
 
         let verdict = protocol
@@ -449,13 +483,13 @@ mod tests {
             vec![
                 Bytes::from_static(&[0x40]),
                 Bytes::from_static(&[0x41]),
-                Bytes::from_static(&[0x2a, 0xca, 0xfe]),
+                Bytes::from_static(&[0x28, 0xca, 0xfe]),
             ],
         );
         let writer = test_writer(state.clone());
         let protocol = test_protocol();
         let mut registered = protocol
-            .register(StreamId::from(VarInt::from_u32(42)))
+            .register(wt_session_id(40))
             .expect("session registration should succeed");
 
         let verdict = protocol
@@ -489,12 +523,12 @@ mod tests {
             vec![
                 Bytes::from_static(&[0x40]),
                 Bytes::from_static(&[0x54]),
-                Bytes::from_static(&[0x2a, 0xca, 0xfe]),
+                Bytes::from_static(&[0x28, 0xca, 0xfe]),
             ],
         );
         let protocol = test_protocol();
         let mut registered = protocol
-            .register(StreamId::from(VarInt::from_u32(42)))
+            .register(wt_session_id(40))
             .expect("session registration should succeed");
 
         let verdict = protocol
@@ -792,14 +826,14 @@ mod tests {
     async fn full_bidi_session_channel_rejects_and_aborts_extra_stream() {
         let protocol = test_protocol();
         let mut registered = protocol
-            .register(StreamId::from(VarInt::from_u32(42)))
+            .register(wt_session_id(40))
             .expect("session registration should succeed");
 
         for _ in 0..16 {
             let state = Arc::new(StreamState::default());
             let reader = test_reader(
                 state.clone(),
-                vec![Bytes::from_static(&[0x40, 0x41, 0x2a, 0xde, 0xad])],
+                vec![Bytes::from_static(&[0x40, 0x41, 0x28, 0xde, 0xad])],
             );
             let writer = test_writer(state.clone());
 
@@ -816,7 +850,7 @@ mod tests {
         let overflow_state = Arc::new(StreamState::default());
         let reader = test_reader(
             overflow_state.clone(),
-            vec![Bytes::from_static(&[0x40, 0x41, 0x2a, 0xfa, 0xce])],
+            vec![Bytes::from_static(&[0x40, 0x41, 0x28, 0xfa, 0xce])],
         );
         let writer = test_writer(overflow_state.clone());
 
@@ -853,7 +887,7 @@ mod tests {
     #[tokio::test]
     async fn failed_bidi_abort_for_unknown_session_is_ignored() {
         let state = Arc::new(StreamState::with_stop_and_reset_errors());
-        let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x41, 0x2a])]);
+        let reader = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x41, 0x28])]);
         let writer = test_writer(state.clone());
         let protocol = test_protocol();
 
@@ -877,14 +911,14 @@ mod tests {
     async fn full_uni_session_channel_rejects_and_stops_extra_stream() {
         let protocol = test_protocol();
         let mut registered = protocol
-            .register(StreamId::from(VarInt::from_u32(42)))
+            .register(wt_session_id(40))
             .expect("session registration should succeed");
 
         for _ in 0..16 {
             let state = Arc::new(StreamState::default());
             let stream = test_reader(
                 state.clone(),
-                vec![Bytes::from_static(&[0x40, 0x54, 0x2a, 0xbe, 0xef])],
+                vec![Bytes::from_static(&[0x40, 0x54, 0x28, 0xbe, 0xef])],
             );
 
             let verdict = protocol
@@ -900,7 +934,7 @@ mod tests {
         let overflow_state = Arc::new(StreamState::default());
         let stream = test_reader(
             overflow_state.clone(),
-            vec![Bytes::from_static(&[0x40, 0x54, 0x2a, 0xca, 0xfe])],
+            vec![Bytes::from_static(&[0x40, 0x54, 0x28, 0xca, 0xfe])],
         );
 
         let verdict = protocol
@@ -933,7 +967,7 @@ mod tests {
     #[tokio::test]
     async fn failed_uni_stop_for_unknown_session_is_ignored() {
         let state = Arc::new(StreamState::with_stop_error());
-        let stream = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x54, 0x2a])]);
+        let stream = test_reader(state.clone(), vec![Bytes::from_static(&[0x40, 0x54, 0x28])]);
         let protocol = test_protocol();
 
         let verdict = protocol
@@ -957,14 +991,14 @@ mod tests {
             bidi_rx,
             uni_rx: _uni_rx,
         } = protocol
-            .register(StreamId::from(VarInt::from_u32(42)))
+            .register(wt_session_id(40))
             .expect("session registration should succeed");
         drop(bidi_rx);
 
         let stream_state = Arc::new(StreamState::default());
         let reader = test_reader(
             stream_state.clone(),
-            vec![Bytes::from_static(&[0x40, 0x41, 0x2a, 0xfa, 0xce])],
+            vec![Bytes::from_static(&[0x40, 0x41, 0x28, 0xfa, 0xce])],
         );
         let writer = test_writer(stream_state.clone());
 
@@ -992,14 +1026,14 @@ mod tests {
             bidi_rx: _bidi_rx,
             uni_rx,
         } = protocol
-            .register(StreamId::from(VarInt::from_u32(42)))
+            .register(wt_session_id(40))
             .expect("session registration should succeed");
         drop(uni_rx);
 
         let stream_state = Arc::new(StreamState::default());
         let stream = test_reader(
             stream_state.clone(),
-            vec![Bytes::from_static(&[0x40, 0x54, 0x2a, 0xfa, 0xce])],
+            vec![Bytes::from_static(&[0x40, 0x54, 0x28, 0xfa, 0xce])],
         );
 
         let verdict = protocol
@@ -1045,7 +1079,7 @@ mod tests {
             .get::<WebTransportProtocol>()
             .expect("webtransport protocol should be registered");
         let _registered = protocol
-            .register(StreamId::from(VarInt::from_u32(42)))
+            .register(wt_session_id(40))
             .expect("session registration should succeed");
         assert_eq!(
             format!("{protocol:?}"),
@@ -1070,7 +1104,7 @@ mod tests {
     fn new_for_test_connection_and_duplicate_registration_behave_consistently() {
         let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection);
         let protocol = WebTransportProtocol::new_for_test(conn.clone());
-        let session_id = StreamId::from(VarInt::from_u32(42));
+        let session_id = wt_session_id(40);
 
         assert!(Arc::ptr_eq(&protocol.connection(), &conn));
 
@@ -1096,7 +1130,7 @@ mod tests {
     #[test]
     fn explicit_session_close_unregisters_and_reports_closed() {
         let protocol = test_protocol();
-        let session_id = StreamId::from(VarInt::from_u32(42));
+        let session_id = wt_session_id(40);
         let registered = protocol
             .register(session_id)
             .expect("session registration should succeed");
@@ -1139,7 +1173,7 @@ mod tests {
         );
 
         let _registered = protocol
-            .register(StreamId::from(VarInt::from_u32(42)))
+            .register(wt_session_id(40))
             .expect("session registration should succeed");
         assert_eq!(
             format!("{protocol:?}"),
@@ -1597,9 +1631,24 @@ mod tests {
         }
     }
 
+    fn wt_session_id(id: u32) -> WebTransportSessionId {
+        WebTransportSessionId::try_from(StreamId::from(VarInt::from_u32(id)))
+            .expect("test id must be a valid webtransport session id")
+    }
+
     fn reset_stream_error(code: u32) -> quic::StreamError {
         quic::StreamError::Reset {
             code: VarInt::from_u32(code),
         }
+    }
+
+    fn assert_stream_connection_code(error: StreamError, expected: Code) {
+        let StreamError::Connection { source } = error else {
+            panic!("expected connection-scoped stream error, got {error:?}");
+        };
+        let crate::connection::ConnectionError::H3 { source } = source else {
+            panic!("expected h3 connection error, got {source:?}");
+        };
+        assert_eq!(source.code(), expected);
     }
 }

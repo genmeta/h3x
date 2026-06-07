@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tracing::Instrument;
 
 use super::{
+    WebTransportSessionId,
     error::{RegisterSessionError, SessionClosed},
     protocol::WT_SESSION_GONE,
     session::{
@@ -27,8 +28,8 @@ const SESSION_STREAM_CHANNEL_SIZE: usize = 16;
 
 #[derive(Debug, Default)]
 struct RegistryInner {
-    active: HashMap<StreamId, SessionStreamRouter>,
-    closed: HashSet<StreamId>,
+    active: HashMap<WebTransportSessionId, SessionStreamRouter>,
+    closed: HashSet<WebTransportSessionId>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -51,7 +52,7 @@ pub(super) enum RouteUniError {
 impl Registry {
     pub(super) fn register(
         &self,
-        session_id: StreamId,
+        session_id: WebTransportSessionId,
     ) -> Result<RegisteredSession, RegisterSessionError> {
         let (bidi_tx, bidi_rx) = mpsc::channel(SESSION_STREAM_CHANNEL_SIZE);
         let (uni_tx, uni_rx) = mpsc::channel(SESSION_STREAM_CHANNEL_SIZE);
@@ -76,11 +77,11 @@ impl Registry {
         })
     }
 
-    pub(super) fn unregister(&self, session_id: StreamId) {
+    pub(super) fn unregister(&self, session_id: WebTransportSessionId) {
         self.close(session_id);
     }
 
-    fn close(&self, session_id: StreamId) {
+    fn close(&self, session_id: WebTransportSessionId) {
         let Ok(mut inner) = self.inner.lock() else {
             tracing::debug!(?session_id, "webtransport session registry lock poisoned");
             return;
@@ -91,7 +92,7 @@ impl Registry {
 
     pub(super) fn route_bi(
         &self,
-        session_id: StreamId,
+        session_id: WebTransportSessionId,
         stream: RoutedBiStream,
     ) -> Result<(), RouteBiError> {
         let Ok(inner) = self.inner.lock() else {
@@ -113,7 +114,7 @@ impl Registry {
 
     pub(super) fn route_uni(
         &self,
-        session_id: StreamId,
+        session_id: WebTransportSessionId,
         stream: RoutedUniStream,
     ) -> Result<(), RouteUniError> {
         let Ok(inner) = self.inner.lock() else {
@@ -150,7 +151,7 @@ pub(super) struct RegisteredSession {
 
 #[derive(Debug)]
 pub(super) struct SessionState {
-    session_id: StreamId,
+    session_id: WebTransportSessionId,
     registry: Registry,
     closed: AtomicBool,
     tracked_readers: Mutex<HashMap<StreamId, TrackedStreamReader>>,
@@ -158,7 +159,7 @@ pub(super) struct SessionState {
 }
 
 impl SessionState {
-    fn new(session_id: StreamId, registry: Registry) -> Self {
+    fn new(session_id: WebTransportSessionId, registry: Registry) -> Self {
         Self {
             session_id,
             registry,
@@ -168,7 +169,7 @@ impl SessionState {
         }
     }
 
-    pub(super) fn id(&self) -> StreamId {
+    pub(super) fn id(&self) -> WebTransportSessionId {
         self.session_id
     }
 
@@ -333,7 +334,7 @@ impl SessionState {
 }
 
 fn spawn_tracked_stream_cleanup(
-    session_id: StreamId,
+    session_id: WebTransportSessionId,
     readers: Vec<TrackedStreamReader>,
     writers: Vec<TrackedStreamWriter>,
 ) {
@@ -360,7 +361,7 @@ fn spawn_tracked_stream_cleanup(
 }
 
 async fn cleanup_tracked_streams(
-    session_id: StreamId,
+    session_id: WebTransportSessionId,
     readers: Vec<TrackedStreamReader>,
     writers: Vec<TrackedStreamWriter>,
 ) {
@@ -412,7 +413,11 @@ impl SessionStreamRouter {
         Self { bidi_tx, uni_tx }
     }
 
-    fn route_bi(&self, session_id: StreamId, stream: RoutedBiStream) -> Result<(), RoutedBiStream> {
+    fn route_bi(
+        &self,
+        session_id: WebTransportSessionId,
+        stream: RoutedBiStream,
+    ) -> Result<(), RoutedBiStream> {
         match self.bidi_tx.try_send(stream) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -427,7 +432,7 @@ impl SessionStreamRouter {
 
     fn route_uni(
         &self,
-        session_id: StreamId,
+        session_id: WebTransportSessionId,
         stream: RoutedUniStream,
     ) -> Result<(), RoutedUniStream> {
         match self.uni_tx.try_send(stream) {
@@ -588,6 +593,11 @@ mod tests {
         test_read_stream(id, vec![id as u8])
     }
 
+    fn wt_session_id(id: u32) -> WebTransportSessionId {
+        WebTransportSessionId::try_from(StreamId::from(VarInt::from_u32(id)))
+            .expect("test id must be a valid webtransport session id")
+    }
+
     fn poison_registry(registry: &Registry) {
         let registry = registry.clone();
         let _ = catch_unwind(AssertUnwindSafe(move || {
@@ -671,7 +681,7 @@ mod tests {
     #[test]
     fn register_len_duplicate_and_close_unregister() {
         let registry = Registry::default();
-        let session_id = StreamId::from(VarInt::from_u32(4));
+        let session_id = wt_session_id(4);
 
         let registered = registry
             .register(session_id)
@@ -699,7 +709,7 @@ mod tests {
     #[test]
     fn dropping_registered_session_unregisters_it() {
         let registry = Registry::default();
-        let session_id = StreamId::from(VarInt::from_u32(8));
+        let session_id = wt_session_id(8);
 
         let registered = registry
             .register(session_id)
@@ -713,7 +723,7 @@ mod tests {
     #[tokio::test]
     async fn route_unknown_sessions_return_original_streams() {
         let registry = Registry::default();
-        let session_id = StreamId::from(VarInt::from_u32(4));
+        let session_id = wt_session_id(4);
 
         let bidi = bidi_stream(1);
         let error = registry
@@ -748,7 +758,7 @@ mod tests {
     #[tokio::test]
     async fn route_known_sessions_deliver_streams_to_receivers() {
         let registry = Registry::default();
-        let session_id = StreamId::from(VarInt::from_u32(4));
+        let session_id = wt_session_id(4);
         let mut registered = registry
             .register(session_id)
             .expect("registration should succeed");
@@ -786,7 +796,7 @@ mod tests {
     #[test]
     fn route_rejects_closed_or_full_channels() {
         let registry = Registry::default();
-        let session_id = StreamId::from(VarInt::from_u32(4));
+        let session_id = wt_session_id(4);
         let registered = registry
             .register(session_id)
             .expect("registration should succeed");
@@ -806,7 +816,7 @@ mod tests {
     #[tokio::test]
     async fn route_closed_channels_return_original_streams() {
         let registry = Registry::default();
-        let session_id = StreamId::from(VarInt::from_u32(16));
+        let session_id = wt_session_id(16);
         let registered = registry
             .register(session_id)
             .expect("registration should succeed");
@@ -845,7 +855,7 @@ mod tests {
     #[test]
     fn route_rejects_when_session_channel_is_full() {
         let registry = Registry::default();
-        let session_id = StreamId::from(VarInt::from_u32(9));
+        let session_id = wt_session_id(8);
         let _registered = registry
             .register(session_id)
             .expect("registration should succeed");
@@ -876,8 +886,8 @@ mod tests {
     #[tokio::test]
     async fn route_uses_exact_registered_session_id() {
         let registry = Registry::default();
-        let first_session_id = StreamId::from(VarInt::from_u32(32));
-        let second_session_id = StreamId::from(VarInt::from_u32(36));
+        let first_session_id = wt_session_id(32);
+        let second_session_id = wt_session_id(36);
         let mut first = registry
             .register(first_session_id)
             .expect("first registration should succeed");
@@ -935,7 +945,7 @@ mod tests {
     #[tokio::test]
     async fn route_full_channels_return_original_streams() {
         let registry = Registry::default();
-        let session_id = StreamId::from(VarInt::from_u32(20));
+        let session_id = wt_session_id(20);
         let _registered = registry
             .register(session_id)
             .expect("registration should succeed");
@@ -984,7 +994,7 @@ mod tests {
     #[tokio::test]
     async fn close_unregisters_session_and_allows_id_reuse() {
         let registry = Registry::default();
-        let session_id = StreamId::from(VarInt::from_u32(24));
+        let session_id = wt_session_id(24);
         let registered = registry
             .register(session_id)
             .expect("initial registration should succeed");
@@ -1028,7 +1038,7 @@ mod tests {
     #[test]
     fn cloned_session_state_keeps_registration_until_last_state_drop() {
         let registry = Registry::default();
-        let session_id = StreamId::from(VarInt::from_u32(28));
+        let session_id = wt_session_id(28);
         let registered = registry
             .register(session_id)
             .expect("registration should succeed");
@@ -1049,7 +1059,7 @@ mod tests {
     #[tokio::test]
     async fn poisoned_registry_surfaces_errors_and_preserves_streams() {
         let registry = Registry::default();
-        let session_id = StreamId::from(VarInt::from_u32(12));
+        let session_id = wt_session_id(12);
         poison_registry(&registry);
 
         let error = registry
