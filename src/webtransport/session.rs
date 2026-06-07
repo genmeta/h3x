@@ -192,6 +192,16 @@ impl WebTransportSession {
             stream = rx.recv() => stream.ok_or(SessionClosed).context(accept_stream_error::ClosedSnafu)?,
         };
         drop(rx);
+        if let Err(error) = self.state.accept_incoming_bi() {
+            let report = snafu::Report::from_error(&error);
+            tracing::debug!(
+                session_id = %self.id(),
+                error = %report,
+                "failed to advance webtransport bidi stream credit"
+            );
+            self.state.close();
+            return Err(SessionClosed).context(accept_stream_error::ClosedSnafu);
+        }
         let stream_id = reader
             .stream_id()
             .await
@@ -222,6 +232,16 @@ impl WebTransportSession {
             stream = rx.recv() => stream.ok_or(SessionClosed).context(accept_stream_error::ClosedSnafu)?,
         };
         drop(rx);
+        if let Err(error) = self.state.accept_incoming_uni() {
+            let report = snafu::Report::from_error(&error);
+            tracing::debug!(
+                session_id = %self.id(),
+                error = %report,
+                "failed to advance webtransport uni stream credit"
+            );
+            self.state.close();
+            return Err(SessionClosed).context(accept_stream_error::ClosedSnafu);
+        }
         let stream_id = reader
             .stream_id()
             .await

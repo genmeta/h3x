@@ -1,18 +1,21 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
 
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use snafu::ResultExt;
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
 use super::{
-    WebTransportSessionId,
-    error::{RegisterSessionError, SessionClosed},
+    WebTransportSessionId, WebTransportStreamCount,
+    error::{
+        RegisterSessionError, SessionClosed, SessionFlowControlError, session_flow_control_error,
+    },
     session::{
         RoutedBiStream, RoutedUniStream,
         stream::{TrackedStreamReader, TrackedStreamWriter},
@@ -22,13 +25,14 @@ use crate::{
     error::Code,
     quic::{ResetStreamExt, StopStreamExt},
     stream_id::StreamId,
+    varint::VarInt,
 };
 
 const SESSION_STREAM_CHANNEL_SIZE: usize = 16;
 
 #[derive(Debug, Default)]
 struct RegistryInner {
-    active: HashMap<WebTransportSessionId, SessionStreamRouter>,
+    active: HashMap<WebTransportSessionId, Weak<SessionState>>,
     closed: HashSet<WebTransportSessionId>,
 }
 
@@ -40,12 +44,14 @@ pub(super) struct Registry {
 pub(super) enum RouteBiError {
     Unknown(RoutedBiStream),
     Closed(RoutedBiStream),
+    FlowControl(RoutedBiStream),
     Rejected(RoutedBiStream),
 }
 
 pub(super) enum RouteUniError {
     Unknown(RoutedUniStream),
     Closed(RoutedUniStream),
+    FlowControl(RoutedUniStream),
     Rejected(RoutedUniStream),
 }
 
@@ -54,8 +60,20 @@ impl Registry {
         &self,
         session_id: WebTransportSessionId,
     ) -> Result<RegisteredSession, RegisterSessionError> {
-        let (bidi_tx, bidi_rx) = mpsc::channel(SESSION_STREAM_CHANNEL_SIZE);
-        let (uni_tx, uni_rx) = mpsc::channel(SESSION_STREAM_CHANNEL_SIZE);
+        let default_credit = default_initial_stream_credit();
+        self.register_with_credit(session_id, default_credit, default_credit)
+    }
+
+    pub(super) fn register_with_credit(
+        &self,
+        session_id: WebTransportSessionId,
+        bidi_credit: WebTransportStreamCount,
+        uni_credit: WebTransportStreamCount,
+    ) -> Result<RegisteredSession, RegisterSessionError> {
+        let bidi_queue_capacity = incoming_stream_queue_capacity(bidi_credit);
+        let uni_queue_capacity = incoming_stream_queue_capacity(uni_credit);
+        let (bidi_tx, bidi_rx) = mpsc::channel(bidi_queue_capacity);
+        let (uni_tx, uni_rx) = mpsc::channel(uni_queue_capacity);
 
         let Ok(mut inner) = self.inner.lock() else {
             return Err(RegisterSessionError::RegistryPoisoned);
@@ -65,12 +83,21 @@ impl Registry {
             return Err(RegisterSessionError::AlreadyRegistered { session_id });
         }
 
-        inner
-            .active
-            .insert(session_id, SessionStreamRouter::new(bidi_tx, uni_tx));
+        let state = Arc::new(SessionState::new(
+            session_id,
+            self.clone(),
+            bidi_tx,
+            uni_tx,
+            bidi_credit,
+            uni_credit,
+            bidi_queue_capacity,
+            uni_queue_capacity,
+        ));
+
+        inner.active.insert(session_id, Arc::downgrade(&state));
 
         Ok(RegisteredSession {
-            state: Arc::new(SessionState::new(session_id, self.clone())),
+            state,
             bidi_rx,
             uni_rx,
         })
@@ -94,21 +121,27 @@ impl Registry {
         session_id: WebTransportSessionId,
         stream: RoutedBiStream,
     ) -> Result<(), RouteBiError> {
-        let Ok(inner) = self.inner.lock() else {
-            tracing::debug!(session_id = %session_id, "webtransport session registry lock poisoned");
-            return Err(RouteBiError::Rejected(stream));
+        let state = {
+            let Ok(inner) = self.inner.lock() else {
+                tracing::debug!(session_id = %session_id, "webtransport session registry lock poisoned");
+                return Err(RouteBiError::Rejected(stream));
+            };
+            let Some(state) = inner
+                .active
+                .get(&session_id)
+                .and_then(std::sync::Weak::upgrade)
+            else {
+                if inner.closed.contains(&session_id) {
+                    tracing::debug!(session_id = %session_id, "webtransport bidi stream belongs to closed session");
+                    return Err(RouteBiError::Closed(stream));
+                }
+                tracing::debug!(session_id = %session_id, "no registered session for webtransport bidi stream");
+                return Err(RouteBiError::Unknown(stream));
+            };
+            state
         };
-        let Some(router) = inner.active.get(&session_id) else {
-            if inner.closed.contains(&session_id) {
-                tracing::debug!(session_id = %session_id, "webtransport bidi stream belongs to closed session");
-                return Err(RouteBiError::Closed(stream));
-            }
-            tracing::debug!(session_id = %session_id, "no registered session for webtransport bidi stream");
-            return Err(RouteBiError::Unknown(stream));
-        };
-        router
-            .route_bi(session_id, stream)
-            .map_err(RouteBiError::Rejected)
+
+        state.route_incoming_bi(stream)
     }
 
     pub(super) fn route_uni(
@@ -116,28 +149,77 @@ impl Registry {
         session_id: WebTransportSessionId,
         stream: RoutedUniStream,
     ) -> Result<(), RouteUniError> {
-        let Ok(inner) = self.inner.lock() else {
-            tracing::debug!(session_id = %session_id, "webtransport session registry lock poisoned");
-            return Err(RouteUniError::Rejected(stream));
+        let state = {
+            let Ok(inner) = self.inner.lock() else {
+                tracing::debug!(session_id = %session_id, "webtransport session registry lock poisoned");
+                return Err(RouteUniError::Rejected(stream));
+            };
+            let Some(state) = inner
+                .active
+                .get(&session_id)
+                .and_then(std::sync::Weak::upgrade)
+            else {
+                if inner.closed.contains(&session_id) {
+                    tracing::debug!(session_id = %session_id, "webtransport uni stream belongs to closed session");
+                    return Err(RouteUniError::Closed(stream));
+                }
+                tracing::debug!(session_id = %session_id, "no registered session for webtransport uni stream");
+                return Err(RouteUniError::Unknown(stream));
+            };
+            state
         };
-        let Some(router) = inner.active.get(&session_id) else {
-            if inner.closed.contains(&session_id) {
-                tracing::debug!(session_id = %session_id, "webtransport uni stream belongs to closed session");
-                return Err(RouteUniError::Closed(stream));
-            }
-            tracing::debug!(session_id = %session_id, "no registered session for webtransport uni stream");
-            return Err(RouteUniError::Unknown(stream));
-        };
-        router
-            .route_uni(session_id, stream)
-            .map_err(RouteUniError::Rejected)
-    }
 
+        state.route_incoming_uni(stream)
+    }
+}
+
+impl Registry {
     pub(super) fn len(&self) -> usize {
         self.inner
             .lock()
             .map(|inner| inner.active.len())
             .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IncomingStreamCredit {
+    advertised_max: WebTransportStreamCount,
+    received: WebTransportStreamCount,
+    queued: usize,
+}
+
+impl IncomingStreamCredit {
+    const fn new(advertised_max: WebTransportStreamCount) -> Self {
+        Self {
+            advertised_max,
+            received: WebTransportStreamCount::ZERO,
+            queued: 0,
+        }
+    }
+
+    fn reserve_incoming(&mut self, queue_capacity: usize) -> Result<(), SessionFlowControlError> {
+        if self.received >= self.advertised_max {
+            return Err(SessionFlowControlError::ExceededStreamCredit);
+        }
+        if self.queued >= queue_capacity {
+            return Err(SessionFlowControlError::QueueCapacityInvariant);
+        }
+        self.received = self
+            .received
+            .checked_increment()
+            .context(session_flow_control_error::StreamCountSnafu)?;
+        self.queued += 1;
+        Ok(())
+    }
+
+    fn accept_one(&mut self) -> Result<WebTransportStreamCount, SessionFlowControlError> {
+        self.queued = self.queued.saturating_sub(1);
+        self.advertised_max = self
+            .advertised_max
+            .checked_increment()
+            .context(session_flow_control_error::StreamCountSnafu)?;
+        Ok(self.advertised_max)
     }
 }
 
@@ -153,16 +235,38 @@ pub(super) struct SessionState {
     session_id: WebTransportSessionId,
     registry: Registry,
     closed: AtomicBool,
+    bidi_tx: mpsc::Sender<RoutedBiStream>,
+    uni_tx: mpsc::Sender<RoutedUniStream>,
+    bidi_credit: Mutex<IncomingStreamCredit>,
+    uni_credit: Mutex<IncomingStreamCredit>,
+    bidi_queue_capacity: usize,
+    uni_queue_capacity: usize,
     tracked_readers: Mutex<HashMap<StreamId, TrackedStreamReader>>,
     tracked_writers: Mutex<HashMap<StreamId, TrackedStreamWriter>>,
 }
 
 impl SessionState {
-    fn new(session_id: WebTransportSessionId, registry: Registry) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        session_id: WebTransportSessionId,
+        registry: Registry,
+        bidi_tx: mpsc::Sender<RoutedBiStream>,
+        uni_tx: mpsc::Sender<RoutedUniStream>,
+        bidi_credit: WebTransportStreamCount,
+        uni_credit: WebTransportStreamCount,
+        bidi_queue_capacity: usize,
+        uni_queue_capacity: usize,
+    ) -> Self {
         Self {
             session_id,
             registry,
             closed: AtomicBool::new(false),
+            bidi_tx,
+            uni_tx,
+            bidi_credit: Mutex::new(IncomingStreamCredit::new(bidi_credit)),
+            uni_credit: Mutex::new(IncomingStreamCredit::new(uni_credit)),
+            bidi_queue_capacity,
+            uni_queue_capacity,
             tracked_readers: Mutex::new(HashMap::new()),
             tracked_writers: Mutex::new(HashMap::new()),
         }
@@ -285,6 +389,110 @@ impl SessionState {
         }
     }
 
+    pub(super) fn route_incoming_bi(&self, stream: RoutedBiStream) -> Result<(), RouteBiError> {
+        if self.check_open().is_err() {
+            return Err(RouteBiError::Closed(stream));
+        }
+
+        let Ok(mut credit) = self.bidi_credit.lock() else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "webtransport session bidi credit lock poisoned"
+            );
+            self.close();
+            return Err(RouteBiError::Rejected(stream));
+        };
+        if let Err(error) = credit.reserve_incoming(self.bidi_queue_capacity) {
+            let report = snafu::Report::from_error(&error);
+            tracing::debug!(
+                session_id = %self.session_id,
+                error = %report,
+                "webtransport session bidi stream credit exhausted"
+            );
+            drop(credit);
+            self.close();
+            return Err(RouteBiError::FlowControl(stream));
+        }
+        drop(credit);
+
+        match self.bidi_tx.try_send(stream) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    "session bidi channel full or closed, rejecting stream"
+                );
+                self.close();
+                Err(RouteBiError::Rejected(error.into_inner()))
+            }
+        }
+    }
+
+    pub(super) fn route_incoming_uni(&self, stream: RoutedUniStream) -> Result<(), RouteUniError> {
+        if self.check_open().is_err() {
+            return Err(RouteUniError::Closed(stream));
+        }
+
+        let Ok(mut credit) = self.uni_credit.lock() else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "webtransport session uni credit lock poisoned"
+            );
+            self.close();
+            return Err(RouteUniError::Rejected(stream));
+        };
+        if let Err(error) = credit.reserve_incoming(self.uni_queue_capacity) {
+            let report = snafu::Report::from_error(&error);
+            tracing::debug!(
+                session_id = %self.session_id,
+                error = %report,
+                "webtransport session uni stream credit exhausted"
+            );
+            drop(credit);
+            self.close();
+            return Err(RouteUniError::FlowControl(stream));
+        }
+        drop(credit);
+
+        match self.uni_tx.try_send(stream) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    "session uni channel full or closed, rejecting stream"
+                );
+                self.close();
+                Err(RouteUniError::Rejected(error.into_inner()))
+            }
+        }
+    }
+
+    pub(super) fn accept_incoming_bi(
+        &self,
+    ) -> Result<WebTransportStreamCount, SessionFlowControlError> {
+        let Ok(mut credit) = self.bidi_credit.lock() else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "webtransport session bidi credit lock poisoned"
+            );
+            return Err(SessionFlowControlError::QueueCapacityInvariant);
+        };
+        credit.accept_one()
+    }
+
+    pub(super) fn accept_incoming_uni(
+        &self,
+    ) -> Result<WebTransportStreamCount, SessionFlowControlError> {
+        let Ok(mut credit) = self.uni_credit.lock() else {
+            tracing::debug!(
+                session_id = %self.session_id,
+                "webtransport session uni credit lock poisoned"
+            );
+            return Err(SessionFlowControlError::QueueCapacityInvariant);
+        };
+        credit.accept_one()
+    }
+
     pub(super) fn remove_tracked_reader(&self, stream_id: StreamId) {
         let Ok(mut readers) = self.tracked_readers.lock() else {
             tracing::debug!(
@@ -401,50 +609,15 @@ impl Drop for SessionState {
     }
 }
 
-#[derive(Debug)]
-struct SessionStreamRouter {
-    bidi_tx: mpsc::Sender<RoutedBiStream>,
-    uni_tx: mpsc::Sender<RoutedUniStream>,
+fn default_initial_stream_credit() -> WebTransportStreamCount {
+    WebTransportStreamCount::try_from(VarInt::from_u32(SESSION_STREAM_CHANNEL_SIZE as u32))
+        .expect("default webtransport stream credit is valid")
 }
 
-impl SessionStreamRouter {
-    fn new(bidi_tx: mpsc::Sender<RoutedBiStream>, uni_tx: mpsc::Sender<RoutedUniStream>) -> Self {
-        Self { bidi_tx, uni_tx }
-    }
-
-    fn route_bi(
-        &self,
-        session_id: WebTransportSessionId,
-        stream: RoutedBiStream,
-    ) -> Result<(), RoutedBiStream> {
-        match self.bidi_tx.try_send(stream) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                tracing::debug!(
-                    session_id = %session_id,
-                    "session bidi channel full or closed, rejecting stream"
-                );
-                Err(error.into_inner())
-            }
-        }
-    }
-
-    fn route_uni(
-        &self,
-        session_id: WebTransportSessionId,
-        stream: RoutedUniStream,
-    ) -> Result<(), RoutedUniStream> {
-        match self.uni_tx.try_send(stream) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                tracing::debug!(
-                    session_id = %session_id,
-                    "session uni channel full or closed, rejecting stream"
-                );
-                Err(error.into_inner())
-            }
-        }
-    }
+fn incoming_stream_queue_capacity(credit: WebTransportStreamCount) -> usize {
+    usize::try_from(credit.into_varint().into_inner())
+        .unwrap_or(SESSION_STREAM_CHANNEL_SIZE)
+        .clamp(1, SESSION_STREAM_CHANNEL_SIZE)
 }
 
 #[cfg(test)]
@@ -467,6 +640,7 @@ mod tests {
             StopStreamExt,
         },
         varint::VarInt,
+        webtransport::WebTransportStreamCount,
     };
 
     #[derive(Debug, Default)]
@@ -609,6 +783,7 @@ mod tests {
         match error {
             RouteBiError::Unknown(stream)
             | RouteBiError::Closed(stream)
+            | RouteBiError::FlowControl(stream)
             | RouteBiError::Rejected(stream) => stream,
         }
     }
@@ -617,6 +792,7 @@ mod tests {
         match error {
             RouteUniError::Unknown(stream)
             | RouteUniError::Closed(stream)
+            | RouteUniError::FlowControl(stream)
             | RouteUniError::Rejected(stream) => stream,
         }
     }
@@ -792,22 +968,86 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn route_incoming_bidi_closes_session_when_peer_exceeds_advertised_credit() {
+        let registry = Registry::default();
+        let session_id = wt_session_id(4);
+        let mut registered = registry
+            .register_with_credit(
+                session_id,
+                WebTransportStreamCount::try_from(VarInt::from_u32(1)).expect("bidi credit"),
+                WebTransportStreamCount::try_from(VarInt::from_u32(0)).expect("uni credit"),
+            )
+            .expect("registration should succeed");
+
+        assert!(
+            registry.route_bi(session_id, bidi_stream(8)).is_ok(),
+            "first stream should be allowed"
+        );
+        let error = registry
+            .route_bi(session_id, bidi_stream(12))
+            .expect_err("second stream exceeds credit");
+
+        assert!(matches!(error, RouteBiError::FlowControl(_)));
+        assert!(registered.state.check_open().is_err());
+        let (_reader, _writer) = registered
+            .bidi_rx
+            .recv()
+            .await
+            .expect("first stream remains queued");
+    }
+
+    #[tokio::test]
+    async fn route_incoming_uni_closes_session_when_peer_exceeds_advertised_credit() {
+        let registry = Registry::default();
+        let session_id = wt_session_id(4);
+        let mut registered = registry
+            .register_with_credit(
+                session_id,
+                WebTransportStreamCount::try_from(VarInt::from_u32(0)).expect("bidi credit"),
+                WebTransportStreamCount::try_from(VarInt::from_u32(1)).expect("uni credit"),
+            )
+            .expect("registration should succeed");
+
+        assert!(
+            registry.route_uni(session_id, uni_stream(10)).is_ok(),
+            "first stream should be allowed"
+        );
+        let error = registry
+            .route_uni(session_id, uni_stream(14))
+            .expect_err("second stream exceeds credit");
+
+        assert!(matches!(error, RouteUniError::FlowControl(_)));
+        assert!(registered.state.check_open().is_err());
+        let _reader = registered
+            .uni_rx
+            .recv()
+            .await
+            .expect("first stream remains queued");
+    }
+
     #[test]
     fn route_rejects_closed_or_full_channels() {
         let registry = Registry::default();
-        let session_id = wt_session_id(4);
-        let registered = registry
-            .register(session_id)
+        let bidi_session_id = wt_session_id(4);
+        let bidi_registered = registry
+            .register(bidi_session_id)
             .expect("registration should succeed");
 
-        drop(registered.bidi_rx);
-        drop(registered.uni_rx);
+        drop(bidi_registered.bidi_rx);
         assert!(matches!(
-            registry.route_bi(session_id, bidi_stream(5)),
+            registry.route_bi(bidi_session_id, bidi_stream(5)),
             Err(RouteBiError::Rejected(_))
         ));
+
+        let uni_session_id = wt_session_id(8);
+        let uni_registered = registry
+            .register(uni_session_id)
+            .expect("registration should succeed");
+
+        drop(uni_registered.uni_rx);
         assert!(matches!(
-            registry.route_uni(session_id, uni_stream(6)),
+            registry.route_uni(uni_session_id, uni_stream(6)),
             Err(RouteUniError::Rejected(_))
         ));
     }
@@ -815,16 +1055,15 @@ mod tests {
     #[tokio::test]
     async fn route_closed_channels_return_original_streams() {
         let registry = Registry::default();
-        let session_id = wt_session_id(16);
-        let registered = registry
-            .register(session_id)
+        let bidi_session_id = wt_session_id(16);
+        let bidi_registered = registry
+            .register(bidi_session_id)
             .expect("registration should succeed");
 
-        drop(registered.bidi_rx);
-        drop(registered.uni_rx);
+        drop(bidi_registered.bidi_rx);
 
         let error = registry
-            .route_bi(session_id, bidi_stream(17))
+            .route_bi(bidi_session_id, bidi_stream(17))
             .expect_err("closed bidi receiver should reject stream");
         assert!(matches!(&error, RouteBiError::Rejected(_)));
         let mut returned_bidi = route_bi_error_stream(error);
@@ -837,8 +1076,15 @@ mod tests {
             VarInt::from_u32(17)
         );
 
+        let uni_session_id = wt_session_id(20);
+        let uni_registered = registry
+            .register(uni_session_id)
+            .expect("registration should succeed");
+
+        drop(uni_registered.uni_rx);
+
         let error = registry
-            .route_uni(session_id, uni_stream(18))
+            .route_uni(uni_session_id, uni_stream(18))
             .expect_err("closed uni receiver should reject stream");
         assert!(matches!(&error, RouteUniError::Rejected(_)));
         let mut returned_uni = route_uni_error_stream(error);
@@ -852,33 +1098,42 @@ mod tests {
     }
 
     #[test]
-    fn route_rejects_when_session_channel_is_full() {
+    fn route_flow_control_when_initial_credit_is_exhausted() {
         let registry = Registry::default();
-        let session_id = wt_session_id(8);
-        let _registered = registry
-            .register(session_id)
+        let bidi_session_id = wt_session_id(24);
+        let _bidi_registered = registry
+            .register(bidi_session_id)
             .expect("registration should succeed");
 
         for id in 0..SESSION_STREAM_CHANNEL_SIZE {
             assert!(
                 registry
-                    .route_bi(session_id, bidi_stream(id as u32))
-                    .is_ok()
-            );
-            assert!(
-                registry
-                    .route_uni(session_id, uni_stream(id as u32))
+                    .route_bi(bidi_session_id, bidi_stream(id as u32))
                     .is_ok()
             );
         }
 
         assert!(matches!(
-            registry.route_bi(session_id, bidi_stream(99)),
-            Err(RouteBiError::Rejected(_))
+            registry.route_bi(bidi_session_id, bidi_stream(99)),
+            Err(RouteBiError::FlowControl(_))
         ));
+
+        let uni_session_id = wt_session_id(28);
+        let _uni_registered = registry
+            .register(uni_session_id)
+            .expect("registration should succeed");
+
+        for id in 0..SESSION_STREAM_CHANNEL_SIZE {
+            assert!(
+                registry
+                    .route_uni(uni_session_id, uni_stream(id as u32))
+                    .is_ok()
+            );
+        }
+
         assert!(matches!(
-            registry.route_uni(session_id, uni_stream(100)),
-            Err(RouteUniError::Rejected(_))
+            registry.route_uni(uni_session_id, uni_stream(100)),
+            Err(RouteUniError::FlowControl(_))
         ));
     }
 
@@ -944,28 +1199,23 @@ mod tests {
     #[tokio::test]
     async fn route_full_channels_return_original_streams() {
         let registry = Registry::default();
-        let session_id = wt_session_id(20);
-        let _registered = registry
-            .register(session_id)
+        let bidi_session_id = wt_session_id(40);
+        let _bidi_registered = registry
+            .register(bidi_session_id)
             .expect("registration should succeed");
 
         for id in 0..SESSION_STREAM_CHANNEL_SIZE {
             assert!(
                 registry
-                    .route_bi(session_id, bidi_stream(id as u32))
-                    .is_ok()
-            );
-            assert!(
-                registry
-                    .route_uni(session_id, uni_stream(id as u32))
+                    .route_bi(bidi_session_id, bidi_stream(id as u32))
                     .is_ok()
             );
         }
 
         let error = registry
-            .route_bi(session_id, bidi_stream(21))
-            .expect_err("full bidi channel should reject stream");
-        assert!(matches!(&error, RouteBiError::Rejected(_)));
+            .route_bi(bidi_session_id, bidi_stream(21))
+            .expect_err("exhausted bidi credit should reject stream");
+        assert!(matches!(&error, RouteBiError::FlowControl(_)));
         let mut returned_bidi = route_bi_error_stream(error);
         assert_eq!(
             returned_bidi
@@ -976,10 +1226,23 @@ mod tests {
             VarInt::from_u32(21)
         );
 
+        let uni_session_id = wt_session_id(44);
+        let _uni_registered = registry
+            .register(uni_session_id)
+            .expect("registration should succeed");
+
+        for id in 0..SESSION_STREAM_CHANNEL_SIZE {
+            assert!(
+                registry
+                    .route_uni(uni_session_id, uni_stream(id as u32))
+                    .is_ok()
+            );
+        }
+
         let error = registry
-            .route_uni(session_id, uni_stream(22))
-            .expect_err("full uni channel should reject stream");
-        assert!(matches!(&error, RouteUniError::Rejected(_)));
+            .route_uni(uni_session_id, uni_stream(22))
+            .expect_err("exhausted uni credit should reject stream");
+        assert!(matches!(&error, RouteUniError::FlowControl(_)));
         let mut returned_uni = route_uni_error_stream(error);
         assert_eq!(
             returned_uni
@@ -1040,7 +1303,8 @@ mod tests {
             registry.route_uni(session_id, uni_stream(29)),
             Err(RouteUniError::Rejected(_))
         ));
-        assert!(state.check_open().is_ok());
+        assert!(state.check_open().is_err());
+        assert_eq!(registry.len(), 0);
 
         drop(state);
         assert_eq!(registry.len(), 0);

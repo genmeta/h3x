@@ -1,6 +1,6 @@
 use snafu::Snafu;
 
-use super::{InvalidSessionId, WebTransportSessionId};
+use super::{InvalidSessionId, InvalidWebTransportStreamCount, WebTransportSessionId};
 use crate::{
     qpack::field::Protocol,
     quic::{ConnectionError, StreamError},
@@ -27,6 +27,19 @@ pub enum RegisterSessionError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
 #[snafu(display("webtransport session closed"))]
 pub struct SessionClosed;
+
+#[derive(Debug, Snafu, Clone, Copy, PartialEq, Eq)]
+#[snafu(module, visibility(pub(in crate::webtransport)))]
+pub enum SessionFlowControlError {
+    #[snafu(display("peer exceeded webtransport stream credit"))]
+    ExceededStreamCredit,
+    #[snafu(display("webtransport stream queue capacity invariant failed"))]
+    QueueCapacityInvariant,
+    #[snafu(display("webtransport stream count overflow"))]
+    StreamCount {
+        source: InvalidWebTransportStreamCount,
+    },
+}
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Snafu)]

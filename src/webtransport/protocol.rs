@@ -144,6 +144,10 @@ impl WebTransportProtocol {
                 let code = crate::error::Code::WT_BUFFERED_STREAM_REJECTED.into_inner();
                 _ = tokio::join!(reader.stop(code), writer.reset(code));
             }
+            Err(RouteBiError::FlowControl((mut reader, mut writer))) => {
+                let code = crate::error::Code::WT_FLOW_CONTROL_ERROR.into_inner();
+                _ = tokio::join!(reader.stop(code), writer.reset(code));
+            }
             Err(RouteBiError::Rejected((mut reader, mut writer))) => {
                 let code = crate::error::Code::WT_FLOW_CONTROL_ERROR.into_inner();
                 _ = tokio::join!(reader.stop(code), writer.reset(code));
@@ -194,6 +198,10 @@ impl WebTransportProtocol {
                 // when that buffer is full. h3x uses a zero-capacity pre-session
                 // buffer, so every valid unknown-session stream is rejected here.
                 let code = crate::error::Code::WT_BUFFERED_STREAM_REJECTED.into_inner();
+                _ = reader.stop(code).await;
+            }
+            Err(RouteUniError::FlowControl(mut reader)) => {
+                let code = crate::error::Code::WT_FLOW_CONTROL_ERROR.into_inner();
                 _ = reader.stop(code).await;
             }
             Err(RouteUniError::Rejected(mut reader)) => {
