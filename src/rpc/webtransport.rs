@@ -19,8 +19,8 @@ use crate::{
     quic::{self, ConnectionError},
     rpc::lifecycle::LifecycleExt as ConnectionLifecycleExt,
     webtransport::{
-        self, AcceptStreamError, OpenStreamError, SessionClosed, accept_stream_error,
-        open_stream_error,
+        self, AcceptStreamError, CloseReason, CloseSessionError, ControlCommandError,
+        DrainSessionError, OpenStreamError, SessionClosed, accept_stream_error, open_stream_error,
     },
 };
 
@@ -151,6 +151,28 @@ impl From<remoc::rtc::CallError> for webtransport::AcceptStreamError {
         webtransport::AcceptStreamError::Connection {
             source: quic::ConnectionError::from(error),
         }
+    }
+}
+
+impl From<remoc::rtc::CallError> for webtransport::DrainSessionError {
+    fn from(_error: remoc::rtc::CallError) -> Self {
+        DrainSessionError::Command {
+            source: ControlCommandError::Closed,
+        }
+    }
+}
+
+impl From<remoc::rtc::CallError> for webtransport::CloseSessionError {
+    fn from(_error: remoc::rtc::CallError) -> Self {
+        CloseSessionError::Command {
+            source: ControlCommandError::Closed,
+        }
+    }
+}
+
+impl From<remoc::rtc::CallError> for webtransport::CloseReason {
+    fn from(error: remoc::rtc::CallError) -> Self {
+        CloseReason::Connection(quic::ConnectionError::from(error))
     }
 }
 

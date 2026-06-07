@@ -24,7 +24,10 @@ use crate::{
         GetStreamIdExt,
     },
     varint::VarInt,
-    webtransport::{self, AcceptStreamError, OpenStreamError, WebTransportSessionId},
+    webtransport::{
+        self, AcceptStreamError, CloseReason, CloseSession, CloseSessionError, DrainSessionError,
+        OpenStreamError, SessionDrain, WebTransportSessionId,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -38,6 +41,10 @@ use crate::{
 /// it is immutable and can be passed out-of-band at construction time.
 #[remoc::rtc::remote]
 pub trait WebTransportRpcSession: Send + Sync {
+    async fn drain(&self) -> Result<(), DrainSessionError>;
+    async fn close(&self, close: CloseSession) -> Result<(), CloseSessionError>;
+    async fn drained(&self) -> Result<SessionDrain, CloseReason>;
+    async fn closed(&self) -> Result<CloseReason, CloseReason>;
     async fn open_bi(&self) -> Result<(ReadFrameChannels, WriteFrameChannels), OpenStreamError>;
     async fn open_uni(&self) -> Result<WriteFrameChannels, OpenStreamError>;
     async fn accept_bi(&self)
@@ -50,6 +57,22 @@ pub trait WebTransportRpcSession: Send + Sync {
 // ---------------------------------------------------------------------------
 
 impl WebTransportRpcSession for webtransport::WebTransportSession {
+    async fn drain(&self) -> Result<(), DrainSessionError> {
+        webtransport::WebTransportSession::drain(self).await
+    }
+
+    async fn close(&self, close: CloseSession) -> Result<(), CloseSessionError> {
+        webtransport::WebTransportSession::close(self, close).await
+    }
+
+    async fn drained(&self) -> Result<SessionDrain, CloseReason> {
+        Ok(webtransport::WebTransportSession::drained(self).await)
+    }
+
+    async fn closed(&self) -> Result<CloseReason, CloseReason> {
+        Ok(webtransport::WebTransportSession::closed(self).await)
+    }
+
     async fn open_bi(&self) -> Result<(ReadFrameChannels, WriteFrameChannels), OpenStreamError> {
         let (reader, writer) = webtransport::WebTransportSession::open_bi(self).await?;
         Ok((
@@ -173,6 +196,27 @@ impl webtransport::Session for RemoteWebTransportSession {
 
     fn id(&self) -> WebTransportSessionId {
         self.session_id
+    }
+
+    async fn drain(&self) -> Result<(), DrainSessionError> {
+        WebTransportRpcSession::drain(&self.client).await
+    }
+
+    async fn close(&self, close: CloseSession) -> Result<(), CloseSessionError> {
+        WebTransportRpcSession::close(&self.client, close).await
+    }
+
+    async fn drained(&self) -> SessionDrain {
+        match WebTransportRpcSession::drained(&self.client).await {
+            Ok(drain) => drain,
+            Err(reason) => SessionDrain::Closed(reason),
+        }
+    }
+
+    async fn closed(&self) -> CloseReason {
+        match WebTransportRpcSession::closed(&self.client).await {
+            Ok(reason) | Err(reason) => reason,
+        }
     }
 
     async fn open_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), OpenStreamError> {
@@ -352,13 +396,18 @@ mod tests {
         quic::{BoxQuicStreamReader, BoxQuicStreamWriter, GetStreamIdExt, StopStreamExt},
         rpc::stream::test_io::TestLifecycle as StreamTestLifecycle,
         stream_id::StreamId,
-        webtransport::{SessionClosed, WEBTRANSPORT_H3, WebTransportProtocol},
+        webtransport::{
+            CloseReason, CloseSession, DrainReason, SessionCloseReason, SessionClosed,
+            SessionDrain, SessionDrainReason, WEBTRANSPORT_H3, WebTransportProtocol,
+        },
     };
 
     struct TestRpcSession {
         fail_open: bool,
         close_accept: bool,
         fail_accept: bool,
+        drained: Mutex<bool>,
+        closed: Mutex<Option<CloseSession>>,
         tasks: Mutex<Vec<AbortOnDropHandle<()>>>,
     }
 
@@ -368,6 +417,8 @@ mod tests {
                 fail_open: false,
                 close_accept: false,
                 fail_accept: false,
+                drained: Mutex::new(false),
+                closed: Mutex::new(None),
                 tasks: Mutex::new(Vec::new()),
             }
         }
@@ -452,6 +503,47 @@ mod tests {
     }
 
     impl WebTransportRpcSession for TestRpcSession {
+        async fn drain(&self) -> Result<(), DrainSessionError> {
+            *self
+                .drained
+                .lock()
+                .expect("drained mutex should not poison") = true;
+            Ok(())
+        }
+
+        async fn close(&self, close: CloseSession) -> Result<(), CloseSessionError> {
+            *self.closed.lock().expect("closed mutex should not poison") = Some(close);
+            Ok(())
+        }
+
+        async fn drained(&self) -> Result<SessionDrain, CloseReason> {
+            if *self
+                .drained
+                .lock()
+                .expect("drained mutex should not poison")
+            {
+                Ok(SessionDrain::Requested(DrainReason::Session(
+                    SessionDrainReason::Local,
+                )))
+            } else {
+                Ok(SessionDrain::Closed(CloseReason::Session(
+                    SessionCloseReason::ControlStreamError,
+                )))
+            }
+        }
+
+        async fn closed(&self) -> Result<CloseReason, CloseReason> {
+            match self
+                .closed
+                .lock()
+                .expect("closed mutex should not poison")
+                .clone()
+            {
+                Some(close) => Ok(CloseReason::Session(SessionCloseReason::Local(close))),
+                None => Ok(CloseReason::Session(SessionCloseReason::ControlStreamError)),
+            }
+        }
+
         async fn open_bi(
             &self,
         ) -> Result<(ReadFrameChannels, WriteFrameChannels), OpenStreamError> {
@@ -758,6 +850,31 @@ mod tests {
         webtransport::Session::open_uni(&converted)
             .await
             .expect("client returned by into_inner should remain usable");
+    }
+
+    #[tokio::test]
+    async fn remote_webtransport_session_delegates_control_methods() {
+        let session = Arc::new(TestRpcSession::new());
+        let (_server_task, client) = spawn_rpc_session(session);
+        let parent = Arc::new(TestLifecycle::default());
+        let remote = RemoteWebTransportSession::new(client, wt_session_id(40), parent);
+        let close = CloseSession::try_from((5_u32, "bye")).expect("valid close");
+
+        webtransport::Session::drain(&remote)
+            .await
+            .expect("remote drain should succeed");
+        assert_eq!(
+            webtransport::Session::drained(&remote).await,
+            SessionDrain::Requested(DrainReason::Session(SessionDrainReason::Local))
+        );
+
+        webtransport::Session::close(&remote, close.clone())
+            .await
+            .expect("remote close should succeed");
+        assert_eq!(
+            webtransport::Session::closed(&remote).await,
+            CloseReason::Session(SessionCloseReason::Local(close))
+        );
     }
 
     #[tokio::test]

@@ -68,7 +68,8 @@ use crate::{
     rpc::lifecycle::{ConnectionErrorLatch, HasLatch, LifecycleExt as _},
     varint::VarInt,
     webtransport::{
-        self, AcceptStreamError, OpenStreamError, SessionClosed, WebTransportSessionId,
+        self, AcceptStreamError, CloseReason, CloseSession, CloseSessionError, DrainSessionError,
+        OpenStreamError, SessionClosed, SessionDrain, WebTransportSessionId,
     },
 };
 
@@ -182,6 +183,14 @@ impl From<AcceptStreamError> for IpcWebTransportAcceptError {
 /// The `session_id` is not included — it is passed via [`WebTransportSessionBootstrap`].
 #[remoc::rtc::remote]
 pub trait IpcWebTransportSession: Send + Sync {
+    async fn drain(&self) -> Result<(), DrainSessionError>;
+
+    async fn close(&self, close: CloseSession) -> Result<(), CloseSessionError>;
+
+    async fn drained(&self) -> Result<SessionDrain, CloseReason>;
+
+    async fn closed(&self) -> Result<CloseReason, CloseReason>;
+
     /// Open a bidirectional stream. Returns the stream ID.
     /// The caller retrieves **2 FDs** from the registry.
     async fn open_bi(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportOpenError>;
@@ -305,6 +314,22 @@ impl WebTransportSessionAdapter {
 }
 
 impl IpcWebTransportSession for WebTransportSessionAdapter {
+    async fn drain(&self) -> Result<(), DrainSessionError> {
+        self.session.drain().await
+    }
+
+    async fn close(&self, close: CloseSession) -> Result<(), CloseSessionError> {
+        self.session.close(close).await
+    }
+
+    async fn drained(&self) -> Result<SessionDrain, CloseReason> {
+        Ok(self.session.drained().await)
+    }
+
+    async fn closed(&self) -> Result<CloseReason, CloseReason> {
+        Ok(self.session.closed().await)
+    }
+
     async fn open_bi(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportOpenError> {
         let delivery = self.fd_transfer.delivery(fd_id);
         let (mut reader, writer) = self.session.open_bi().await?;
@@ -660,6 +685,27 @@ impl webtransport::Session for IpcWebTransportSessionHandle {
         self.session_id
     }
 
+    async fn drain(&self) -> Result<(), DrainSessionError> {
+        IpcWebTransportSession::drain(&self.rpc).await
+    }
+
+    async fn close(&self, close: CloseSession) -> Result<(), CloseSessionError> {
+        IpcWebTransportSession::close(&self.rpc, close).await
+    }
+
+    async fn drained(&self) -> SessionDrain {
+        match IpcWebTransportSession::drained(&self.rpc).await {
+            Ok(drain) => drain,
+            Err(reason) => SessionDrain::Closed(reason),
+        }
+    }
+
+    async fn closed(&self) -> CloseReason {
+        match IpcWebTransportSession::closed(&self.rpc).await {
+            Ok(reason) | Err(reason) => reason,
+        }
+    }
+
     async fn open_bi(&self) -> Result<(BoxQuicStreamReader, BoxQuicStreamWriter), OpenStreamError> {
         let receiver = self.fd_transfer.receive();
         let fd_id = receiver.id();
@@ -803,6 +849,8 @@ impl IpcWebTransportSessionClient {
 mod tests {
     use std::future;
 
+    use remoc::prelude::ServerShared;
+
     use super::*;
     use crate::{
         connection::{ConnectionState, tests::MockConnection},
@@ -818,7 +866,10 @@ mod tests {
         protocol::Protocols,
         qpack::field::Protocol,
         stream_id::StreamId,
-        webtransport::{WEBTRANSPORT_H3, WebTransportProtocol},
+        webtransport::{
+            CloseReason, CloseSession, DrainReason, SessionCloseReason, SessionDrain,
+            SessionDrainReason, WEBTRANSPORT_H3, WebTransportProtocol,
+        },
     };
 
     fn connection_error(reason: &'static str) -> ConnectionError {
@@ -879,6 +930,101 @@ mod tests {
         Arc::new(session)
     }
 
+    fn spawn_ipc_session<S>(
+        session: Arc<S>,
+    ) -> (AbortOnDropHandle<()>, IpcWebTransportSessionClient)
+    where
+        S: IpcWebTransportSession + 'static,
+    {
+        let (server, client) = IpcWebTransportSessionServerShared::new(session, 1);
+        let task = AbortOnDropHandle::new(tokio::spawn(
+            async move {
+                let _ = server.serve(true).await;
+            }
+            .in_current_span(),
+        ));
+        (task, client)
+    }
+
+    struct TestIpcSession {
+        drained: Mutex<bool>,
+        closed: Mutex<Option<CloseSession>>,
+    }
+
+    impl TestIpcSession {
+        fn new() -> Self {
+            Self {
+                drained: Mutex::new(false),
+                closed: Mutex::new(None),
+            }
+        }
+    }
+
+    impl IpcWebTransportSession for TestIpcSession {
+        async fn drain(&self) -> Result<(), DrainSessionError> {
+            *self
+                .drained
+                .lock()
+                .expect("drained mutex should not poison") = true;
+            Ok(())
+        }
+
+        async fn close(&self, close: CloseSession) -> Result<(), CloseSessionError> {
+            *self.closed.lock().expect("closed mutex should not poison") = Some(close);
+            Ok(())
+        }
+
+        async fn drained(&self) -> Result<SessionDrain, CloseReason> {
+            if *self
+                .drained
+                .lock()
+                .expect("drained mutex should not poison")
+            {
+                Ok(SessionDrain::Requested(DrainReason::Session(
+                    SessionDrainReason::Local,
+                )))
+            } else {
+                Ok(SessionDrain::Closed(CloseReason::Session(
+                    SessionCloseReason::ControlStreamError,
+                )))
+            }
+        }
+
+        async fn closed(&self) -> Result<CloseReason, CloseReason> {
+            match self
+                .closed
+                .lock()
+                .expect("closed mutex should not poison")
+                .clone()
+            {
+                Some(close) => Ok(CloseReason::Session(SessionCloseReason::Local(close))),
+                None => Ok(CloseReason::Session(SessionCloseReason::ControlStreamError)),
+            }
+        }
+
+        async fn open_bi(&self, _fd_id: VarInt) -> Result<VarInt, IpcWebTransportOpenError> {
+            Err(IpcPlumbingError::Io {
+                message: "test ipc session does not open bidi streams".into(),
+            }
+            .into())
+        }
+
+        async fn open_uni(&self, _fd_id: VarInt) -> Result<VarInt, IpcWebTransportOpenError> {
+            Err(IpcPlumbingError::Io {
+                message: "test ipc session does not open uni streams".into(),
+            }
+            .into())
+        }
+
+        async fn accept_bi(&self, _fd_id: VarInt) -> Result<VarInt, IpcWebTransportAcceptError> {
+            Err(IpcWebTransportAcceptError::Closed)
+        }
+
+        async fn accept_uni(&self, _fd_id: VarInt) -> Result<VarInt, IpcWebTransportAcceptError> {
+            Err(IpcWebTransportAcceptError::Closed)
+        }
+    }
+
     fn fd_transfer_for_test() -> crate::ipc::transport::FdTransfer {
         let (mux, _peer) =
             crate::ipc::transport::MuxChannel::pair_for_test().expect("mux channel pair");
@@ -937,5 +1083,38 @@ mod tests {
             panic!("expected accept_uni connection error");
         };
         assert_transport_reason(&source, "accept_uni connection closed");
+    }
+
+    #[tokio::test]
+    async fn ipc_webtransport_session_delegates_control_methods() {
+        let lifecycle = Arc::new(MockConnection::new());
+        let session_id = WebTransportSessionId::try_from(StreamId::from(VarInt::from_u32(4)))
+            .expect("test session id should be valid");
+        let session = Arc::new(TestIpcSession::new());
+        let (_server_task, client) = spawn_ipc_session(session);
+        let handle_lifecycle: Arc<dyn DynLifecycle> = lifecycle;
+        let handle = IpcWebTransportSessionHandle::new(
+            session_id,
+            client,
+            fd_transfer_for_test(),
+            handle_lifecycle,
+        );
+        let close = CloseSession::try_from((5_u32, "bye")).expect("valid close");
+
+        webtransport::Session::drain(&handle)
+            .await
+            .expect("ipc drain should succeed");
+        assert_eq!(
+            webtransport::Session::drained(&handle).await,
+            SessionDrain::Requested(DrainReason::Session(SessionDrainReason::Local))
+        );
+
+        webtransport::Session::close(&handle, close.clone())
+            .await
+            .expect("ipc close should succeed");
+        assert_eq!(
+            webtransport::Session::closed(&handle).await,
+            CloseReason::Session(SessionCloseReason::Local(close))
+        );
     }
 }

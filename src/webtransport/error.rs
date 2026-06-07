@@ -124,7 +124,7 @@ pub enum CloseSessionError {
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Snafu)]
-#[snafu(module, visibility(pub(in crate::webtransport)))]
+#[snafu(module, visibility(pub))]
 pub enum ControlCommandError {
     #[snafu(display("webtransport control task is closed"))]
     Closed,

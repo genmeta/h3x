@@ -81,6 +81,17 @@ pub trait Session: Send + Sync {
 
     fn id(&self) -> WebTransportSessionId;
 
+    fn drain(&self) -> impl Future<Output = Result<(), DrainSessionError>> + Send + '_;
+
+    fn close(
+        &self,
+        close: CloseSession,
+    ) -> impl Future<Output = Result<(), CloseSessionError>> + Send + '_;
+
+    fn drained(&self) -> impl Future<Output = SessionDrain> + Send + '_;
+
+    fn closed(&self) -> impl Future<Output = CloseReason> + Send + '_;
+
     fn open_bi(
         &self,
     ) -> impl Future<Output = Result<(Self::StreamReader, Self::StreamWriter), OpenStreamError>>
@@ -113,6 +124,14 @@ pub trait Session: Send + Sync {
 pub trait DynSession: Send + Sync {
     fn id(&self) -> WebTransportSessionId;
 
+    fn drain(&self) -> BoxFuture<'_, Result<(), DrainSessionError>>;
+
+    fn close(&self, close: CloseSession) -> BoxFuture<'_, Result<(), CloseSessionError>>;
+
+    fn drained(&self) -> BoxFuture<'_, SessionDrain>;
+
+    fn closed(&self) -> BoxFuture<'_, CloseReason>;
+
     #[allow(clippy::type_complexity)]
     fn open_bi(
         &self,
@@ -131,6 +150,22 @@ pub trait DynSession: Send + Sync {
 impl<T: Session> DynSession for T {
     fn id(&self) -> WebTransportSessionId {
         Session::id(self)
+    }
+
+    fn drain(&self) -> BoxFuture<'_, Result<(), DrainSessionError>> {
+        Box::pin(Session::drain(self))
+    }
+
+    fn close(&self, close: CloseSession) -> BoxFuture<'_, Result<(), CloseSessionError>> {
+        Box::pin(Session::close(self, close))
+    }
+
+    fn drained(&self) -> BoxFuture<'_, SessionDrain> {
+        Box::pin(Session::drained(self))
+    }
+
+    fn closed(&self) -> BoxFuture<'_, CloseReason> {
+        Box::pin(Session::closed(self))
     }
 
     fn open_bi(
@@ -184,6 +219,22 @@ impl Session for WebTransportSession {
         WebTransportSession::id(self)
     }
 
+    async fn drain(&self) -> Result<(), DrainSessionError> {
+        WebTransportSession::drain(self).await
+    }
+
+    async fn close(&self, close: CloseSession) -> Result<(), CloseSessionError> {
+        WebTransportSession::close(self, close).await
+    }
+
+    async fn drained(&self) -> SessionDrain {
+        WebTransportSession::drained(self).await
+    }
+
+    async fn closed(&self) -> CloseReason {
+        WebTransportSession::closed(self).await
+    }
+
     async fn open_bi(&self) -> Result<(Self::StreamReader, Self::StreamWriter), OpenStreamError> {
         WebTransportSession::open_bi(self).await
     }
@@ -232,6 +283,8 @@ mod tests {
     #[derive(Debug)]
     struct TestSession {
         id: WebTransportSessionId,
+        drained: std::sync::Mutex<bool>,
+        closed: std::sync::Mutex<Option<CloseSession>>,
     }
 
     #[derive(Debug)]
@@ -241,7 +294,11 @@ mod tests {
 
     impl TestSession {
         fn new(id: WebTransportSessionId) -> Self {
-            Self { id }
+            Self {
+                id,
+                drained: std::sync::Mutex::new(false),
+                closed: std::sync::Mutex::new(None),
+            }
         }
     }
 
@@ -324,6 +381,43 @@ mod tests {
             self.id
         }
 
+        async fn drain(&self) -> Result<(), DrainSessionError> {
+            *self
+                .drained
+                .lock()
+                .expect("drained mutex should not poison") = true;
+            Ok(())
+        }
+
+        async fn close(&self, close: CloseSession) -> Result<(), CloseSessionError> {
+            *self.closed.lock().expect("closed mutex should not poison") = Some(close);
+            Ok(())
+        }
+
+        async fn drained(&self) -> SessionDrain {
+            if *self
+                .drained
+                .lock()
+                .expect("drained mutex should not poison")
+            {
+                SessionDrain::Requested(DrainReason::Session(SessionDrainReason::Local))
+            } else {
+                SessionDrain::Closed(CloseReason::Session(SessionCloseReason::ControlStreamError))
+            }
+        }
+
+        async fn closed(&self) -> CloseReason {
+            match self
+                .closed
+                .lock()
+                .expect("closed mutex should not poison")
+                .clone()
+            {
+                Some(close) => CloseReason::Session(SessionCloseReason::Local(close)),
+                None => CloseReason::Session(SessionCloseReason::ControlStreamError),
+            }
+        }
+
         async fn open_bi(
             &self,
         ) -> Result<(Self::StreamReader, Self::StreamWriter), OpenStreamError> {
@@ -353,6 +447,26 @@ mod tests {
 
         fn id(&self) -> WebTransportSessionId {
             self.id
+        }
+
+        async fn drain(&self) -> Result<(), DrainSessionError> {
+            Err(DrainSessionError::Closed {
+                source: SessionClosed,
+            })
+        }
+
+        async fn close(&self, _close: CloseSession) -> Result<(), CloseSessionError> {
+            Err(CloseSessionError::Closed {
+                source: SessionClosed,
+            })
+        }
+
+        async fn drained(&self) -> SessionDrain {
+            SessionDrain::Closed(CloseReason::Session(SessionCloseReason::ControlStreamError))
+        }
+
+        async fn closed(&self) -> CloseReason {
+            CloseReason::Session(SessionCloseReason::ControlStreamError)
         }
 
         async fn open_bi(
@@ -483,6 +597,28 @@ mod tests {
         assert_eq!(writer.stream_id().await.unwrap(), VarInt::from_u32(0));
 
         assert_eq!(mock.stream_calls(), vec!["open_bi", "open_uni"]);
+    }
+
+    #[tokio::test]
+    async fn dyn_session_delegates_drain_close_drained_and_closed() {
+        let session = TestSession::new(wt_session_id(44));
+        let dyn_session: &dyn DynSession = &session;
+        let close = CloseSession::try_from((5_u32, "bye")).expect("valid close");
+
+        dyn_session.drain().await.expect("dyn drain succeeds");
+        assert_eq!(
+            dyn_session.drained().await,
+            SessionDrain::Requested(DrainReason::Session(SessionDrainReason::Local))
+        );
+
+        dyn_session
+            .close(close.clone())
+            .await
+            .expect("dyn close succeeds");
+        assert_eq!(
+            dyn_session.closed().await,
+            CloseReason::Session(SessionCloseReason::Local(close))
+        );
     }
 
     #[tokio::test]
