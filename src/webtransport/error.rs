@@ -1,7 +1,10 @@
 use snafu::Snafu;
 
-use super::{InvalidSessionId, InvalidWebTransportStreamCount, WebTransportSessionId};
+use super::{
+    CloseSession, InvalidSessionId, InvalidWebTransportStreamCount, WebTransportSessionId,
+};
 use crate::{
+    dhttp::message::MessageStreamError,
     qpack::field::Protocol,
     quic::{ConnectionError, StreamError},
 };
@@ -39,6 +42,81 @@ pub enum SessionFlowControlError {
     StreamCount {
         source: InvalidWebTransportStreamCount,
     },
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionDrain {
+    Requested(DrainReason),
+    Closed(CloseReason),
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainReason {
+    Session(SessionDrainReason),
+    HttpGoaway(crate::connection::ConnectionGoaway),
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionDrainReason {
+    Local,
+    Remote,
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub enum CloseReason {
+    Session(SessionCloseReason),
+    Connection(crate::quic::ConnectionError),
+}
+
+impl PartialEq for CloseReason {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Session(left), Self::Session(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCloseReason {
+    Local(CloseSession),
+    Remote(CloseSession),
+    Protocol { code: crate::error::Code },
+    ControlStreamError,
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module, visibility(pub))]
+pub enum DrainSessionError {
+    #[snafu(display("webtransport session closed"))]
+    Closed { source: SessionClosed },
+    #[snafu(display("failed to send webtransport drain command"))]
+    Command { source: ControlCommandError },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module, visibility(pub))]
+pub enum CloseSessionError {
+    #[snafu(display("webtransport session closed"))]
+    Closed { source: SessionClosed },
+    #[snafu(display("failed to send webtransport close command"))]
+    Command { source: ControlCommandError },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module, visibility(pub(in crate::webtransport)))]
+pub enum ControlCommandError {
+    #[snafu(display("webtransport control task is closed"))]
+    Closed,
+    #[snafu(display("webtransport control task dropped response"))]
+    ResponseDropped,
+    #[snafu(display("failed to write webtransport control capsule"))]
+    Write { source: MessageStreamError },
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

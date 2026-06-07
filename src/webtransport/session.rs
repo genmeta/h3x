@@ -9,23 +9,34 @@
 
 use std::{fmt, sync::Arc};
 
-use snafu::ResultExt;
-use tokio::{io::AsyncWriteExt, sync::mpsc};
+use snafu::{ResultExt, Snafu};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt},
+    sync::{mpsc, oneshot},
+};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
 use super::{
-    WebTransportSessionId,
+    CloseSession, DecodeCloseSessionError, WebTransportSessionId,
     error::{
-        AcceptStreamError, DatagramError, OpenStreamError, RegisterSessionError, SessionClosed,
-        UnsupportedSnafu, accept_stream_error, open_stream_error, register_session_error,
+        AcceptStreamError, CloseReason, CloseSessionError, ControlCommandError, DatagramError,
+        DrainReason, DrainSessionError, OpenStreamError, RegisterSessionError, SessionCloseReason,
+        SessionClosed, SessionDrain, SessionDrainReason, UnsupportedSnafu, accept_stream_error,
+        close_session_error, control_command_error, drain_session_error, open_stream_error,
+        register_session_error,
     },
     protocol::{WEBTRANSPORT_BIDI_SIGNAL, WEBTRANSPORT_H3, WEBTRANSPORT_UNI_SIGNAL},
     registry::{RegisteredSession, SessionState},
 };
 use crate::{
-    codec::{EncodeExt, EncodeInto, SinkWriter},
-    extended_connect::EstablishedConnect,
+    buflist::BufList,
+    codec::{DecodeExt, EncodeExt, EncodeInto, SinkWriter, StreamReader},
+    dhttp::{
+        message::{MessageStreamError, MessageWriter},
+        webtransport::capsule::{Capsule, CapsuleType},
+    },
+    extended_connect::{EstablishedConnect, IntoStreamsError},
     quic::{self, BoxQuicStreamReader, BoxQuicStreamWriter, GetStreamIdExt},
     stream_id::StreamId,
     varint::VarInt,
@@ -34,6 +45,9 @@ use crate::{
 pub(in crate::webtransport) mod stream;
 
 use stream::{WebTransportStreamReader, WebTransportStreamWriter};
+
+const CONTROL_CAPSULE_SKIP_CHUNK_SIZE: usize = 8 * 1024;
+const CLOSE_SESSION_CAPSULE_MAX_PAYLOAD: u64 = 4 + 1024;
 
 // ============================================================================
 // Stream type aliases
@@ -63,7 +77,73 @@ pub struct WebTransportSession {
     bidi_rx: tokio::sync::Mutex<mpsc::Receiver<RoutedBiStream>>,
     uni_rx: tokio::sync::Mutex<mpsc::Receiver<RoutedUniStream>>,
     conn: Arc<dyn quic::DynConnection>,
+    control: ControlHandle,
     _control_task: AbortOnDropHandle<()>,
+}
+
+enum ControlCommand {
+    Drain {
+        ack: oneshot::Sender<Result<(), ControlCommandError>>,
+    },
+    Close {
+        close: CloseSession,
+        ack: oneshot::Sender<Result<(), ControlCommandError>>,
+    },
+}
+
+enum RemoteControlCapsule {
+    Close(CloseSession),
+    Drain,
+    Ignored,
+}
+
+#[derive(Clone)]
+struct ControlHandle {
+    tx: mpsc::Sender<ControlCommand>,
+}
+
+impl ControlHandle {
+    async fn drain(&self) -> Result<(), ControlCommandError> {
+        let (ack, rx) = oneshot::channel();
+        if self.tx.send(ControlCommand::Drain { ack }).await.is_err() {
+            return Err(ControlCommandError::Closed);
+        }
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(ControlCommandError::ResponseDropped),
+        }
+    }
+
+    async fn close(&self, close: CloseSession) -> Result<(), ControlCommandError> {
+        let (ack, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(ControlCommand::Close { close, ack })
+            .await
+            .is_err()
+        {
+            return Err(ControlCommandError::Closed);
+        }
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(ControlCommandError::ResponseDropped),
+        }
+    }
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module(control_task_error), visibility(pub(super)))]
+enum ControlTaskError {
+    #[snafu(display("failed to take over webtransport connect stream"))]
+    Takeover { source: IntoStreamsError },
+    #[snafu(display("failed to decode webtransport control capsule"))]
+    DecodeCapsule { source: std::io::Error },
+    #[snafu(display("webtransport close session capsule payload is too large"))]
+    CloseSessionPayloadTooLarge,
+    #[snafu(display("webtransport drain session capsule has a payload"))]
+    DrainSessionPayload,
+    #[snafu(display("invalid webtransport close session capsule"))]
+    CloseSessionPayload { source: DecodeCloseSessionError },
 }
 
 impl WebTransportSession {
@@ -74,36 +154,16 @@ impl WebTransportSession {
     ) -> Self {
         let state = registered.state;
         let task_state = Arc::clone(&state);
-        let control_task = async move {
-            match connect.into_streams().await {
-                Ok((mut read, _write)) => loop {
-                    match read.read_data_chunk().await {
-                        Ok(Some(_chunk)) => {}
-                        Ok(None) => break,
-                        Err(error) => {
-                            tracing::debug!(
-                                error = %snafu::Report::from_error(&error),
-                                "webtransport connect stream read failed"
-                            );
-                            break;
-                        }
-                    }
-                },
-                Err(error) => {
-                    tracing::debug!(
-                        error = %snafu::Report::from_error(&error),
-                        "failed to take over webtransport connect stream"
-                    );
-                }
-            }
-            task_state.close();
-        };
+        let (control_tx, control_rx) = mpsc::channel(8);
+        let control = ControlHandle { tx: control_tx };
+        let control_task = run_control_task(task_state, connect, control_rx);
 
         Self {
             state,
             bidi_rx: tokio::sync::Mutex::new(registered.bidi_rx),
             uni_rx: tokio::sync::Mutex::new(registered.uni_rx),
             conn,
+            control,
             _control_task: AbortOnDropHandle::new(tokio::spawn(control_task.in_current_span())),
         }
     }
@@ -268,6 +328,258 @@ impl WebTransportSession {
     pub async fn recv_datagram(&self) -> Result<Vec<u8>, DatagramError> {
         UnsupportedSnafu.fail()
     }
+
+    pub async fn drain(&self) -> Result<(), DrainSessionError> {
+        self.state
+            .check_open()
+            .context(drain_session_error::ClosedSnafu)?;
+        self.control
+            .drain()
+            .await
+            .context(drain_session_error::CommandSnafu)
+    }
+
+    pub async fn close(&self, close: CloseSession) -> Result<(), CloseSessionError> {
+        self.state
+            .check_open()
+            .context(close_session_error::ClosedSnafu)?;
+        self.control
+            .close(close)
+            .await
+            .context(close_session_error::CommandSnafu)
+    }
+
+    pub async fn closed(&self) -> CloseReason {
+        self.state.closed().await
+    }
+
+    pub async fn drained(&self) -> SessionDrain {
+        self.state.drained().await
+    }
+}
+
+async fn run_control_task(
+    state: Arc<SessionState>,
+    connect: EstablishedConnect,
+    commands: mpsc::Receiver<ControlCommand>,
+) {
+    let result = drive_control_task(Arc::clone(&state), connect, commands).await;
+    if let Err(error) = result {
+        tracing::debug!(
+            error = %snafu::Report::from_error(&error),
+            "webtransport control task failed"
+        );
+    }
+    state.close();
+}
+
+async fn drive_control_task(
+    state: Arc<SessionState>,
+    connect: EstablishedConnect,
+    mut commands: mpsc::Receiver<ControlCommand>,
+) -> Result<(), ControlTaskError> {
+    let (reader, mut writer) = connect
+        .into_streams()
+        .await
+        .context(control_task_error::TakeoverSnafu)?;
+    let mut reader = StreamReader::new(reader.into_box_reader());
+
+    loop {
+        tokio::select! {
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                if handle_control_command(&state, &mut writer, command).await {
+                    break;
+                }
+            }
+            capsule = read_remote_control_capsule(&mut reader) => match capsule? {
+                Some(RemoteControlCapsule::Close(close)) => {
+                    state.close_with_reason(CloseReason::Session(SessionCloseReason::Remote(close)));
+                    break;
+                }
+                Some(RemoteControlCapsule::Drain) => {
+                    state.drain_with_reason(SessionDrain::Requested(DrainReason::Session(
+                        SessionDrainReason::Remote,
+                    )));
+                }
+                Some(RemoteControlCapsule::Ignored) => {}
+                None => break,
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn read_remote_control_capsule<S>(
+    reader: &mut S,
+) -> Result<Option<RemoteControlCapsule>, ControlTaskError>
+where
+    S: AsyncRead + tokio::io::AsyncBufRead + Unpin + Send,
+{
+    if reader
+        .fill_buf()
+        .await
+        .context(control_task_error::DecodeCapsuleSnafu)?
+        .is_empty()
+    {
+        return Ok(None);
+    }
+
+    let r#type = CapsuleType::from(
+        reader
+            .decode_one::<VarInt>()
+            .await
+            .context(control_task_error::DecodeCapsuleSnafu)?,
+    );
+    let length = reader
+        .decode_one::<VarInt>()
+        .await
+        .context(control_task_error::DecodeCapsuleSnafu)?;
+
+    match r#type {
+        CapsuleType::WT_CLOSE_SESSION => {
+            if length.into_inner() > CLOSE_SESSION_CAPSULE_MAX_PAYLOAD {
+                skip_control_capsule_payload(reader, length)
+                    .await
+                    .context(control_task_error::DecodeCapsuleSnafu)?;
+                return Err(ControlTaskError::CloseSessionPayloadTooLarge);
+            }
+            let payload = read_control_capsule_payload(reader, length)
+                .await
+                .context(control_task_error::DecodeCapsuleSnafu)?;
+            let close = payload
+                .decode::<CloseSession>()
+                .await
+                .context(control_task_error::CloseSessionPayloadSnafu)?;
+            Ok(Some(RemoteControlCapsule::Close(close)))
+        }
+        CapsuleType::WT_DRAIN_SESSION => {
+            if length != VarInt::from_u32(0) {
+                skip_control_capsule_payload(reader, length)
+                    .await
+                    .context(control_task_error::DecodeCapsuleSnafu)?;
+                return Err(ControlTaskError::DrainSessionPayload);
+            }
+            Ok(Some(RemoteControlCapsule::Drain))
+        }
+        _ => {
+            skip_control_capsule_payload(reader, length)
+                .await
+                .context(control_task_error::DecodeCapsuleSnafu)?;
+            Ok(Some(RemoteControlCapsule::Ignored))
+        }
+    }
+}
+
+async fn read_control_capsule_payload<S>(
+    reader: &mut S,
+    length: VarInt,
+) -> Result<BufList, std::io::Error>
+where
+    S: AsyncRead + Unpin + Send,
+{
+    let mut remaining = length.into_inner();
+    let mut payload = BufList::new();
+    while remaining > 0 {
+        let len = remaining.min(CONTROL_CAPSULE_SKIP_CHUNK_SIZE as u64) as usize;
+        let mut bytes = vec![0; len];
+        reader.read_exact(&mut bytes).await?;
+        payload.write(bytes.as_slice());
+        remaining -= len as u64;
+    }
+    Ok(payload)
+}
+
+async fn skip_control_capsule_payload<S>(
+    reader: &mut S,
+    length: VarInt,
+) -> Result<(), std::io::Error>
+where
+    S: AsyncRead + Unpin + Send,
+{
+    let mut remaining = length.into_inner();
+    let mut scratch = vec![0; CONTROL_CAPSULE_SKIP_CHUNK_SIZE];
+    while remaining > 0 {
+        let len = remaining.min(scratch.len() as u64) as usize;
+        reader.read_exact(&mut scratch[..len]).await?;
+        remaining -= len as u64;
+    }
+    Ok(())
+}
+
+async fn handle_control_command(
+    state: &Arc<SessionState>,
+    writer: &mut MessageWriter,
+    command: ControlCommand,
+) -> bool {
+    match command {
+        ControlCommand::Drain { ack } => {
+            let result = write_drain_capsule(writer)
+                .await
+                .context(control_command_error::WriteSnafu);
+            if result.is_ok() {
+                state.drain_with_reason(SessionDrain::Requested(DrainReason::Session(
+                    SessionDrainReason::Local,
+                )));
+            }
+            let should_close = result.is_err();
+            _ = ack.send(result);
+            should_close
+        }
+        ControlCommand::Close { close, ack } => {
+            let result = async {
+                write_close_capsule(writer, close.clone())
+                    .await
+                    .context(control_command_error::WriteSnafu)?;
+                writer
+                    .close()
+                    .await
+                    .context(control_command_error::WriteSnafu)?;
+                Ok(())
+            }
+            .await;
+            if result.is_ok() {
+                state.close_with_reason(CloseReason::Session(SessionCloseReason::Local(close)));
+            }
+            _ = ack.send(result);
+            true
+        }
+    }
+}
+
+async fn write_drain_capsule(writer: &mut MessageWriter) -> Result<(), MessageStreamError> {
+    let capsule = Capsule::new(CapsuleType::WT_DRAIN_SESSION, BufList::new())
+        .expect("empty webtransport drain capsule payload is a valid varint length");
+    write_control_capsule(writer, capsule).await
+}
+
+async fn write_close_capsule(
+    writer: &mut MessageWriter,
+    close: CloseSession,
+) -> Result<(), MessageStreamError> {
+    let payload = BufList::new()
+        .encode(close)
+        .await
+        .expect("encoding webtransport close session payload into a buflist is infallible");
+    let capsule = Capsule::new(CapsuleType::WT_CLOSE_SESSION, payload)
+        .expect("validated webtransport close session payload is a valid varint length");
+    write_control_capsule(writer, capsule).await
+}
+
+async fn write_control_capsule(
+    writer: &mut MessageWriter,
+    capsule: Capsule<BufList>,
+) -> Result<(), MessageStreamError> {
+    let payload = BufList::new()
+        .encode(capsule)
+        .await
+        .expect("encoding webtransport capsule into a buflist is infallible");
+    writer.write_data(payload).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 impl TryFrom<EstablishedConnect> for WebTransportSession {
@@ -379,25 +691,31 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::StreamReader,
+        buflist::BufList,
+        codec::{DecodeExt, SinkWriter, StreamReader},
         connection::{ConnectionState, tests::MockConnection},
         dhttp::{
             message::{
-                MessageReader, guard,
+                MessageReader, MessageWriter, guard,
                 test::{read_stream_for_test, write_stream_for_test},
             },
             protocol::DHttpProtocol,
             settings::Settings,
+            webtransport::capsule::{Capsule, CapsuleType},
         },
         error::Code,
         extended_connect::EstablishedConnect,
         protocol::Protocols,
-        qpack::{field::Protocol, protocol::QPackDecoder},
+        qpack::{
+            field::Protocol,
+            protocol::{QPackDecoder, QPackEncoder},
+        },
         quic,
         stream_id::StreamId,
         varint::VarInt,
         webtransport::{
-            WEBTRANSPORT_H3, WebTransportProtocol, WebTransportSessionId, registry::Registry,
+            CloseSession, WEBTRANSPORT_H3, WebTransportProtocol, WebTransportSessionId,
+            registry::Registry,
         },
     };
 
@@ -1041,6 +1359,11 @@ mod tests {
         AbortOnDropHandle::new(tokio::spawn(async {}.in_current_span()))
     }
 
+    fn noop_control_handle() -> ControlHandle {
+        let (tx, _rx) = mpsc::channel(1);
+        ControlHandle { tx }
+    }
+
     fn session_with_connection(
         session_id: StreamId,
         conn: Arc<dyn quic::DynConnection>,
@@ -1054,6 +1377,7 @@ mod tests {
             bidi_rx: tokio::sync::Mutex::new(registered.bidi_rx),
             uni_rx: tokio::sync::Mutex::new(registered.uni_rx),
             conn,
+            control: noop_control_handle(),
             _control_task: noop_task(),
         };
         (registry, session)
@@ -1075,6 +1399,7 @@ mod tests {
             bidi_rx: tokio::sync::Mutex::new(bidi_rx),
             uni_rx: tokio::sync::Mutex::new(uni_rx),
             conn,
+            control: noop_control_handle(),
             _control_task: noop_task(),
         }
     }
@@ -1106,6 +1431,179 @@ mod tests {
         Box::pin(futures::stream::empty::<
             Result<crate::qpack::encoder::EncoderInstruction, crate::connection::StreamError>,
         >())
+    }
+
+    fn qpack_encoder_sink() -> Pin<
+        Box<
+            dyn Sink<
+                    crate::qpack::encoder::EncoderInstruction,
+                    Error = crate::connection::StreamError,
+                > + Send,
+        >,
+    > {
+        Box::pin(
+            futures::sink::drain::<crate::qpack::encoder::EncoderInstruction>()
+                .sink_map_err(|never| match never {}),
+        )
+    }
+
+    fn qpack_encoder_stream() -> Pin<
+        Box<
+            dyn Stream<
+                    Item = Result<
+                        crate::qpack::decoder::DecoderInstruction,
+                        crate::connection::StreamError,
+                    >,
+                > + Send,
+        >,
+    > {
+        Box::pin(futures::stream::empty::<
+            Result<crate::qpack::decoder::DecoderInstruction, crate::connection::StreamError>,
+        >())
+    }
+
+    fn message_reader_from_quic_reader(
+        stream_id: VarInt,
+        reader: crate::quic::BoxQuicStreamReader,
+    ) -> MessageReader {
+        let quic = Arc::new(MockConnection::new());
+        let erased: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased.clone()));
+        let state = ConnectionState::new_for_test(quic, Arc::new(protocols)).erase();
+
+        MessageReader::new(
+            stream_id,
+            StreamReader::new(guard::GuardQuicReader::new(reader)),
+            Arc::new(QPackDecoder::new(
+                Arc::new(Settings::default()),
+                qpack_decoder_sink(),
+                qpack_decoder_stream(),
+            )),
+            state,
+        )
+    }
+
+    fn message_writer_from_quic_writer(writer: crate::quic::BoxQuicStreamWriter) -> MessageWriter {
+        let quic = Arc::new(MockConnection::new());
+        let erased: Arc<dyn quic::DynConnection> = quic.clone();
+        let mut protocols = Protocols::new();
+        protocols.insert(DHttpProtocol::new_for_test(erased.clone()));
+        let state = ConnectionState::new_for_test(quic, Arc::new(protocols)).erase();
+
+        MessageWriter::new(
+            SinkWriter::new(guard::GuardQuicWriter::new(writer)),
+            Arc::new(QPackEncoder::new(
+                Arc::new(Settings::default()),
+                qpack_encoder_sink(),
+                qpack_encoder_stream(),
+            )),
+            state,
+        )
+    }
+
+    struct ConnectStreamState {
+        outgoing_reader: tokio::sync::Mutex<MessageReader>,
+        incoming_writer: tokio::sync::Mutex<MessageWriter>,
+    }
+
+    impl ConnectStreamState {
+        async fn inject_capsule(&self, capsule: Capsule<BufList>) {
+            let mut writer = self.incoming_writer.lock().await;
+            write_control_capsule(&mut writer, capsule)
+                .await
+                .expect("injected control capsule should write");
+        }
+
+        async fn inject_close(&self, close: CloseSession) {
+            let payload = BufList::new()
+                .encode(close)
+                .await
+                .expect("close payload should encode");
+            let capsule = Capsule::new(CapsuleType::WT_CLOSE_SESSION, payload)
+                .expect("close payload length is valid");
+            self.inject_capsule(capsule).await;
+        }
+
+        async fn inject_drain(&self) {
+            let capsule = Capsule::new(CapsuleType::WT_DRAIN_SESSION, BufList::new())
+                .expect("empty drain payload length is valid");
+            self.inject_capsule(capsule).await;
+        }
+
+        async fn next_capsule(&self) -> Capsule<BufList> {
+            let mut reader = self.outgoing_reader.lock().await;
+            let mut payload = BufList::new();
+            loop {
+                let bytes = timeout(Duration::from_secs(1), reader.read_data_chunk())
+                    .await
+                    .expect("control capsule should be written")
+                    .expect("control data frame should decode")
+                    .expect("control writer should not close before capsule");
+                payload.write(bytes);
+                if let Ok(capsule) = payload.clone().decode::<Capsule<BufList>>().await {
+                    return capsule;
+                }
+            }
+        }
+
+        async fn next_close_capsule(&self) -> CloseSession {
+            let capsule = self.next_capsule().await;
+            assert_eq!(capsule.r#type(), CapsuleType::WT_CLOSE_SESSION);
+            capsule
+                .into_payload()
+                .decode::<CloseSession>()
+                .await
+                .expect("close session capsule payload should decode")
+        }
+
+        async fn next_drain_capsule(&self) {
+            let capsule = self.next_capsule().await;
+            assert_eq!(capsule.r#type(), CapsuleType::WT_DRAIN_SESSION);
+            assert_eq!(capsule.length(), VarInt::from_u32(0));
+        }
+
+        async fn writer_closed(&self) -> bool {
+            let mut reader = self.outgoing_reader.lock().await;
+            matches!(
+                timeout(Duration::from_millis(50), reader.read_data_chunk()).await,
+                Ok(Ok(None))
+            )
+        }
+    }
+
+    fn webtransport_session_with_observed_connect_stream(
+        session_id: StreamId,
+    ) -> (WebTransportSession, ConnectStreamState) {
+        let registry = Registry::default();
+        let registered = registry
+            .register(wt_session_id(session_id))
+            .expect("session registration should succeed");
+        let conn: Arc<dyn quic::DynConnection> = Arc::new(TestConnection {
+            state: Arc::new(StreamState::default()),
+        });
+
+        let (incoming_reader, incoming_writer) = quic::test::mock_stream_pair(session_id.0);
+        let (outgoing_reader, outgoing_writer) = quic::test::mock_stream_pair(session_id.0);
+        let connect = EstablishedConnect::ready(
+            session_id,
+            Some(Protocol::new(WEBTRANSPORT_H3)),
+            connection_without_webtransport(),
+            message_reader_from_quic_reader(session_id.0, Box::pin(incoming_reader)),
+            message_writer_from_quic_writer(Box::pin(outgoing_writer)),
+        );
+        let session = WebTransportSession::from_registered(registered, conn, connect);
+        let state = ConnectStreamState {
+            outgoing_reader: tokio::sync::Mutex::new(message_reader_from_quic_reader(
+                session_id.0,
+                Box::pin(outgoing_reader),
+            )),
+            incoming_writer: tokio::sync::Mutex::new(message_writer_from_quic_writer(Box::pin(
+                incoming_writer,
+            ))),
+        };
+
+        (session, state)
     }
 
     async fn read_stream_with_bytes(stream_id: u32, bytes: &[u8]) -> MessageReader {
@@ -1838,6 +2336,69 @@ mod tests {
                 .expect_err("recv_datagram should be unsupported"),
             DatagramError::Unsupported
         ));
+    }
+
+    #[tokio::test]
+    async fn close_sends_close_capsule_finishes_connect_stream_and_closes_session() {
+        let (session, connect_state) =
+            webtransport_session_with_observed_connect_stream(StreamId::from(VarInt::from_u32(4)));
+        let close = CloseSession::try_from((7_u32, "done")).expect("valid close");
+
+        session.close(close.clone()).await.expect("close succeeds");
+
+        assert!(matches!(session.state.check_open(), Err(SessionClosed)));
+        assert_eq!(connect_state.next_close_capsule().await, close);
+        assert!(connect_state.writer_closed().await);
+    }
+
+    #[tokio::test]
+    async fn drain_sends_drain_capsule_without_closing_session() {
+        let (session, connect_state) =
+            webtransport_session_with_observed_connect_stream(StreamId::from(VarInt::from_u32(4)));
+
+        session.drain().await.expect("drain succeeds");
+
+        assert!(session.state.check_open().is_ok());
+        connect_state.next_drain_capsule().await;
+        assert!(!connect_state.writer_closed().await);
+    }
+
+    #[tokio::test]
+    async fn remote_close_capsule_closes_session_and_reports_remote_reason() {
+        let (session, connect_state) =
+            webtransport_session_with_observed_connect_stream(StreamId::from(VarInt::from_u32(4)));
+        let close = CloseSession::try_from((9_u32, "remote done")).expect("valid close");
+
+        connect_state.inject_close(close.clone()).await;
+        let reason = timeout(Duration::from_secs(1), session.closed())
+            .await
+            .expect("remote close should close session");
+
+        assert_eq!(
+            reason,
+            CloseReason::Session(SessionCloseReason::Remote(close))
+        );
+        assert!(matches!(
+            session.open_uni().await,
+            Err(OpenStreamError::Closed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_drain_capsule_wakes_drained_without_closing_session() {
+        let (session, connect_state) =
+            webtransport_session_with_observed_connect_stream(StreamId::from(VarInt::from_u32(4)));
+
+        connect_state.inject_drain().await;
+        let drain = timeout(Duration::from_secs(1), session.drained())
+            .await
+            .expect("remote drain should update drain state");
+
+        assert_eq!(
+            drain,
+            SessionDrain::Requested(DrainReason::Session(SessionDrainReason::Remote))
+        );
+        assert!(session.state.check_open().is_ok());
     }
 
     #[tokio::test]

@@ -8,13 +8,14 @@ use std::{
 
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use snafu::ResultExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::Instrument;
 
 use super::{
     WebTransportSessionId, WebTransportStreamCount,
     error::{
-        RegisterSessionError, SessionClosed, SessionFlowControlError, session_flow_control_error,
+        CloseReason, RegisterSessionError, SessionCloseReason, SessionClosed, SessionDrain,
+        SessionFlowControlError, session_flow_control_error,
     },
     session::{
         RoutedBiStream, RoutedUniStream,
@@ -235,6 +236,8 @@ pub(super) struct SessionState {
     session_id: WebTransportSessionId,
     registry: Registry,
     closed: AtomicBool,
+    close_reason: watch::Sender<Option<CloseReason>>,
+    drain_status: watch::Sender<Option<SessionDrain>>,
     bidi_tx: mpsc::Sender<RoutedBiStream>,
     uni_tx: mpsc::Sender<RoutedUniStream>,
     bidi_credit: Mutex<IncomingStreamCredit>,
@@ -257,10 +260,14 @@ impl SessionState {
         bidi_queue_capacity: usize,
         uni_queue_capacity: usize,
     ) -> Self {
+        let (close_reason, _close_rx) = watch::channel(None);
+        let (drain_status, _drain_rx) = watch::channel(None);
         Self {
             session_id,
             registry,
             closed: AtomicBool::new(false),
+            close_reason,
+            drain_status,
             bidi_tx,
             uni_tx,
             bidi_credit: Mutex::new(IncomingStreamCredit::new(bidi_credit)),
@@ -285,10 +292,48 @@ impl SessionState {
     }
 
     pub(super) fn close(&self) {
+        self.close_with_reason(CloseReason::Session(SessionCloseReason::ControlStreamError));
+    }
+
+    pub(super) fn close_with_reason(&self, reason: CloseReason) {
         if !self.closed.swap(true, Ordering::AcqRel) {
+            let _ = self.close_reason.send(Some(reason.clone()));
+            let _ = self.drain_status.send(Some(SessionDrain::Closed(reason)));
             self.registry.unregister(self.session_id);
             let (readers, writers) = self.take_tracked_streams();
             spawn_tracked_stream_cleanup(self.session_id, readers, writers);
+        }
+    }
+
+    pub(super) fn drain_with_reason(&self, drain: SessionDrain) {
+        if self.drain_status.borrow().is_none() {
+            let _ = self.drain_status.send(Some(drain));
+        }
+    }
+
+    pub(super) async fn closed(&self) -> CloseReason {
+        let mut reason = self.close_reason.subscribe();
+        loop {
+            if let Some(reason) = reason.borrow().clone() {
+                return reason;
+            }
+            if reason.changed().await.is_err() {
+                return CloseReason::Session(SessionCloseReason::ControlStreamError);
+            }
+        }
+    }
+
+    pub(super) async fn drained(&self) -> SessionDrain {
+        let mut drain = self.drain_status.subscribe();
+        loop {
+            if let Some(drain) = drain.borrow().clone() {
+                return drain;
+            }
+            if drain.changed().await.is_err() {
+                return SessionDrain::Closed(CloseReason::Session(
+                    SessionCloseReason::ControlStreamError,
+                ));
+            }
         }
     }
 

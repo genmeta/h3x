@@ -48,7 +48,9 @@ pub use close::{
     TryFromCloseSessionMessageBytesError, TryFromCloseSessionPartsError,
 };
 pub use error::{
-    AcceptStreamError, DatagramError, OpenStreamError, RegisterSessionError, SessionClosed,
+    AcceptStreamError, CloseReason, CloseSessionError, ControlCommandError, DatagramError,
+    DrainReason, DrainSessionError, OpenStreamError, RegisterSessionError, SessionCloseReason,
+    SessionClosed, SessionDrain, SessionDrainReason,
 };
 #[cfg(feature = "rpc")]
 pub(crate) use error::{accept_stream_error, open_stream_error};
