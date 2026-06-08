@@ -1220,7 +1220,7 @@ mod tests {
         let fields = futures::stream::iter([
             Ok(FieldLine {
                 name: Bytes::from_static(b"host"),
-                value: Bytes::from_static(b"reimu.pilot.genmeta.net"),
+                value: Bytes::from_static(b"reimu.pilot.dhttp.net"),
             }),
             Ok(FieldLine {
                 name: Bytes::from_static(b":method"),

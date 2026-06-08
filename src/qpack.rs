@@ -117,7 +117,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("https://h3x.demo.lab.genmeta.net/api/v1/upload")
+            .uri("https://h3x.demo.lab.dhttp.net/api/v1/upload")
             .header("user-agent", "genemta-curl/0.3.0")
             .header("accept", "*/*")
             .body("Hello, World!")
@@ -881,7 +881,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("https://h3x.demo.lab.genmeta.net/api/v1/upload")
+            .uri("https://h3x.demo.lab.dhttp.net/api/v1/upload")
             .header("user-agent", "genmeta-curl/0.3.0")
             .header("accept", "*/*")
             .header("x-custom-header", "custom-value")

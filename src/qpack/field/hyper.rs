@@ -399,7 +399,7 @@ mod tests {
             PseudoHeaders::Request {
                 method: Some(http::Method::GET),
                 scheme: None,
-                authority: Some("reimu.pilot.genmeta.net".parse().unwrap()),
+                authority: Some("reimu.pilot.dhttp.net".parse().unwrap()),
                 path: None,
                 protocol: None,
             },
@@ -437,7 +437,7 @@ mod tests {
     fn validated_request_parts_rejects_authority_only_get() {
         let request = http::Request::builder()
             .method(http::Method::GET)
-            .uri("reimu.pilot.genmeta.net")
+            .uri("reimu.pilot.dhttp.net")
             .body(())
             .unwrap();
         let (parts, ()) = request.into_parts();
@@ -456,7 +456,7 @@ mod tests {
             PseudoHeaders::Request {
                 method: Some(http::Method::GET),
                 scheme: Some(http::uri::Scheme::HTTPS),
-                authority: Some("reimu.pilot.genmeta.net".parse().unwrap()),
+                authority: Some("reimu.pilot.dhttp.net".parse().unwrap()),
                 path: Some("/".parse().unwrap()),
                 protocol: Some(Protocol::new("webtransport")),
             },
@@ -475,7 +475,7 @@ mod tests {
     fn validated_request_parts_rejects_protocol_on_get() {
         let mut request = http::Request::builder()
             .method(http::Method::GET)
-            .uri("https://reimu.pilot.genmeta.net/")
+            .uri("https://reimu.pilot.dhttp.net/")
             .body(())
             .unwrap();
         request
