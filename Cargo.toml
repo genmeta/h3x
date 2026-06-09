@@ -28,10 +28,10 @@ tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
 tracing = "0.1"
 tower-service = "0.3"
 
-dhttp-identity = { git = "https://github.com/genmeta/dhttp.git", branch = "main" }
+dhttp-identity = { git = "https://github.com/genmeta/dhttp.git", branch = "main", version = "0.1.0" }
 
 # feature dquic
-dquic = { git = "https://github.com/genmeta/dquic.git", branch = "feat/v0.5.1", optional = true }
+dquic = { git = "https://github.com/genmeta/dquic.git", branch = "feat/v0.5.1", version = "0.5.1", optional = true }
 
 # feature hyper
 http-body = { version = "1", optional = true }
@@ -104,11 +104,3 @@ remoc = { version = "0.18", default-features = false, features = [
 ] }
 serde_json = "1"
 
-# Root-only local stack coherence patches. These keep h3x aligned with the
-# sibling repositories in this multi-repo checkout when Cargo.lock has stale
-# git revisions.
-[patch."https://github.com/genmeta/dhttp.git"]
-dhttp-identity = { path = "../dhttp/identity" }
-
-[patch."https://github.com/genmeta/dquic.git"]
-dquic = { path = "../dquic/dquic" }
