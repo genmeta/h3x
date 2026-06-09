@@ -88,7 +88,7 @@ where
 /// The read future yields either a delivered item plus the returned stream
 /// state, EOF plus the returned stream state, or an internally interrupted
 /// stream state. The stop future is a separate operation so callers can adapt
-/// states whose stop behavior is not expressed directly as a [`StopStream`]
+/// states whose stop behavior is not expressed directly as a [`crate::quic::StopStream`]
 /// implementation.
 pub fn unfold<StreamState, Read, Stop, ReadFuture, StopFuture, Item>(
     init: StreamState,
