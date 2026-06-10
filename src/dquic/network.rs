@@ -81,9 +81,12 @@ use crate::dquic::{
 use crate::dquic::{
     qbase::packet::Packet,
     qconnection::builder::ConnectionFoundation,
-    qinterface::component::{
-        location::LocationsComponent,
-        route::{QuicRouterComponent, Way},
+    qinterface::{
+        component::{
+            location::LocationsComponent,
+            route::{QuicRouterComponent, Way},
+        },
+        device::InterfaceEvent,
     },
     qtraversal::{
         nat::{client::StunClientsComponent, router::StunRouterComponent},
@@ -99,6 +102,11 @@ fn interface_contains(interface: &::dquic::qinterface::device::Interface, ip: Ip
         IpAddr::V4(ip) => interface.ipv4.iter().any(|net| net.contains(&ip)),
         IpAddr::V6(ip) => interface.ipv6.iter().any(|net| net.contains(&ip)),
     }
+}
+
+fn iface_bind_uri_device(uri: &BindUri) -> Option<&str> {
+    uri.as_iface_bind_uri()
+        .map(|(_family, device, _port)| device)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -459,18 +467,12 @@ impl QuicBindDriver {
             .lock()
             .expect("bind_registry poisoned");
         let quic_driver = self.registry_id();
-        registry
-            .iter()
-            .filter(|(key, _)| key.driver == quic_driver)
-            .map(|(_, entry)| entry)
-            .flat_map(|entry| {
-                let bound = entry.bound.lock().expect("bound mutex poisoned");
-                bound
-                    .values()
-                    .map(|(uri, iface)| map(uri, iface))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+        let mut items = Vec::new();
+        for (_, entry) in registry.iter().filter(|(key, _)| key.driver == quic_driver) {
+            let bound = entry.bound.lock().expect("bound mutex poisoned");
+            items.extend(bound.values().map(|(uri, iface)| map(uri, iface)));
+        }
+        items
     }
 
     /// Return all currently bound interfaces owned by this QUIC driver.
@@ -691,6 +693,56 @@ struct BindsEntry {
     /// the outer `bind_registry` mutex so the reconcile task can perform
     /// async bind/unbind without holding the registry lock.
     bound: Mutex<BoundInterfaces>,
+}
+
+impl BindsEntry {
+    fn missing_bind_uris(&self, pattern: &BindPattern, device: &str) -> Vec<(String, BindUri)> {
+        let bound = self.bound.lock().expect("bound mutex poisoned");
+        pattern
+            .interface_bind_uris(device)
+            .filter_map(|uri| {
+                let bind_key = uri.identity_key();
+                (!bound.contains_key(&bind_key)).then_some((bind_key, uri))
+            })
+            .collect()
+    }
+
+    fn insert_bind(
+        &self,
+        bind_key: String,
+        uri: BindUri,
+        iface: BindInterface,
+    ) -> Option<BindInterface> {
+        let mut bound = self.bound.lock().expect("bound mutex poisoned");
+        match bound.entry(bind_key) {
+            hash_map::Entry::Vacant(slot) => {
+                slot.insert((uri, iface));
+                None
+            }
+            hash_map::Entry::Occupied(_) => Some(iface),
+        }
+    }
+
+    fn remove_device_bindings(&self, device: &str) {
+        let mut bound = self.bound.lock().expect("bound mutex poisoned");
+        bound.retain(|_, (uri, _)| iface_bind_uri_device(uri) != Some(device));
+    }
+
+    fn bind_keys_on_device(&self, device: &str) -> Vec<String> {
+        let bound = self.bound.lock().expect("bound mutex poisoned");
+        bound
+            .iter()
+            .filter(|(_, (uri, _))| iface_bind_uri_device(uri) == Some(device))
+            .map(|(bind_key, _)| bind_key.clone())
+            .collect()
+    }
+
+    fn current_binding(&self, bind_key: &str) -> Option<(Arc<dyn BindDriver>, BindInterface)> {
+        let bound = self.bound.lock().expect("bound mutex poisoned");
+        bound
+            .get(bind_key)
+            .map(|(_, iface)| (self.driver.clone(), iface.clone()))
+    }
 }
 
 /// RAII handle returned by [`QuicBindDriver::bind`] or [`Network::bind_with`].
@@ -1003,59 +1055,107 @@ impl Network {
             let Some(network) = network.upgrade() else {
                 break;
             };
-            tracing::debug!(?event, "network interface change, reconciling binds");
-            network.reconcile_once().await;
+            tracing::debug!(
+                ?event,
+                "network interface change, reconciling affected binds"
+            );
+            network.reconcile_event(event.as_ref()).await;
+        }
+    }
+
+    async fn bind_added_device(&self, device: &str) {
+        if self.devices.get(device).is_none() {
+            return;
+        }
+
+        let mut pending_binds = Vec::new();
+        {
+            let registry = self.bind_registry.lock().expect("bind_registry poisoned");
+            for (key, entry) in registry.iter() {
+                let driver = entry.driver.clone();
+                for (bind_key, uri) in entry.missing_bind_uris(&key.pattern, device) {
+                    pending_binds.push((key.clone(), driver.clone(), bind_key, uri));
+                }
+            }
+        }
+
+        for (key, driver, bind_key, uri) in pending_binds {
+            let iface = driver.bind(self, uri.clone()).await;
+            let device_exists = self.devices.get(device).is_some();
+            let unbound = if device_exists {
+                let registry = self.bind_registry.lock().expect("bind_registry poisoned");
+                if let Some(entry) = registry.get(&key) {
+                    entry.insert_bind(bind_key, uri, iface)
+                } else {
+                    Some(iface)
+                }
+            } else {
+                Some(iface)
+            };
+
+            if let Some(iface) = unbound {
+                iface.close().await.ok();
+            }
+            if !device_exists {
+                return;
+            }
+        }
+    }
+
+    fn remove_device_bindings(&self, device: &str) {
+        let registry = self.bind_registry.lock().expect("bind_registry poisoned");
+
+        for entry in registry.values() {
+            entry.remove_device_bindings(device);
+        }
+    }
+
+    async fn rebind_changed_device(&self, device: &str) {
+        if self.devices.get(device).is_none() {
+            return;
+        }
+
+        let mut pending_rebinds = Vec::new();
+        {
+            let registry = self.bind_registry.lock().expect("bind_registry poisoned");
+            for (key, entry) in registry.iter() {
+                for bind_key in entry.bind_keys_on_device(device) {
+                    pending_rebinds.push((key.clone(), bind_key));
+                }
+            }
+        }
+
+        for (key, bind_key) in pending_rebinds {
+            if self.devices.get(device).is_none() {
+                return;
+            }
+
+            let current = {
+                let registry = self.bind_registry.lock().expect("bind_registry poisoned");
+                registry
+                    .get(&key)
+                    .and_then(|entry| entry.current_binding(&bind_key))
+            };
+
+            if let Some((driver, iface)) = current {
+                driver.rebind(self, &iface).await;
+            }
         }
     }
 
     /// Extracted reconcile logic, run per interface change.
-    async fn reconcile_once(&self) {
-        let entries: Vec<(BindRegistryKey, BoundInterfaces, Arc<dyn BindDriver>)> = {
-            let registry = self.bind_registry.lock().expect("bind_registry poisoned");
-            registry
-                .iter()
-                .map(|(key, entry)| {
-                    let bound = entry.bound.lock().expect("bound mutex poisoned");
-                    (key.clone(), bound.clone(), entry.driver.clone())
-                })
-                .collect()
-        };
+    async fn reconcile_event(&self, event: &InterfaceEvent) {
+        let device = event.device();
 
-        for (key, mut bound, driver) in entries {
-            let desired_uris: Vec<BindUri> = key
-                .pattern
-                .to_bind_uris(self.devices.interfaces().keys().map(String::as_str))
-                .collect();
-            let desired_keys: std::collections::HashSet<String> =
-                desired_uris.iter().map(BindUri::identity_key).collect();
-            bound.retain(|bind_key, _| desired_keys.contains(bind_key));
-
-            for (_, iface) in bound.values() {
-                driver.rebind(self, iface).await;
+        match event {
+            InterfaceEvent::Added { .. } => {
+                self.bind_added_device(device).await;
             }
-
-            for uri in desired_uris {
-                let bind_key = uri.identity_key();
-                if let std::collections::hash_map::Entry::Vacant(e) = bound.entry(bind_key) {
-                    let iface = driver.bind(self, uri.clone()).await;
-                    e.insert((uri.clone(), iface));
-                }
+            InterfaceEvent::Removed { .. } => {
+                self.remove_device_bindings(device);
             }
-
-            if let Some(entry) = self
-                .bind_registry
-                .lock()
-                .expect("bind_registry poisoned")
-                .get(&key)
-            {
-                let mut target = entry.bound.lock().expect("bound mutex poisoned");
-                // Retain only interfaces that still match current
-                // devices, then merge reconcile's additions without
-                // clobbering concurrent insertions from bind().
-                target.retain(|k, _| desired_keys.contains(k));
-                for (k, v) in bound {
-                    target.entry(k).or_insert(v);
-                }
+            InterfaceEvent::Changed { .. } => {
+                self.rebind_changed_device(device).await;
             }
         }
     }
@@ -1134,10 +1234,18 @@ impl Drop for BindHandle {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, str::FromStr, time::Duration};
+    use std::{
+        net::SocketAddr,
+        str::FromStr,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
 
-    use dquic::prelude::{IO, handy::NoopTokenRegistry};
-    use futures::StreamExt;
+    use dquic::{
+        prelude::{IO, handy::NoopTokenRegistry},
+        qinterface::device::{Interface, InterfaceEvent},
+    };
+    use futures::{FutureExt, StreamExt, future::BoxFuture};
     use rustls::ClientConfig as TlsClientConfig;
 
     use super::*;
@@ -1193,6 +1301,96 @@ mod tests {
         fn bind<'a>(&'a self, _network: &'a Network, uri: BindUri) -> BoxFuture<'a, BindInterface> {
             async move { self.manager.bind(uri, Arc::new(NullIo::new)).await }.boxed()
         }
+    }
+
+    fn dummy_interface_named(name: &str) -> Interface {
+        let mut interface = Interface::dummy();
+        interface.name = name.to_owned();
+        interface
+    }
+
+    fn added_event(device: &str) -> InterfaceEvent {
+        InterfaceEvent::Added {
+            device: device.to_owned(),
+            new_interface: dummy_interface_named(device),
+        }
+    }
+
+    fn removed_event(device: &str) -> InterfaceEvent {
+        InterfaceEvent::Removed {
+            device: device.to_owned(),
+            old_interface: dummy_interface_named(device),
+        }
+    }
+
+    fn changed_event(device: &str) -> InterfaceEvent {
+        InterfaceEvent::Changed {
+            device: device.to_owned(),
+            old_interface: dummy_interface_named(device),
+            new_interface: dummy_interface_named(device),
+        }
+    }
+
+    struct CountingDriver {
+        manager: Arc<crate::dquic::net::InterfaceManager>,
+        binds: AtomicUsize,
+        rebinds: AtomicUsize,
+    }
+
+    impl CountingDriver {
+        fn new() -> Self {
+            Self {
+                manager: Arc::new(crate::dquic::net::InterfaceManager::new()),
+                binds: AtomicUsize::new(0),
+                rebinds: AtomicUsize::new(0),
+            }
+        }
+
+        fn bind_count(&self) -> usize {
+            self.binds.load(Ordering::Relaxed)
+        }
+
+        fn rebind_count(&self) -> usize {
+            self.rebinds.load(Ordering::Relaxed)
+        }
+    }
+
+    impl BindDriver for CountingDriver {
+        fn bind<'a>(&'a self, _network: &'a Network, uri: BindUri) -> BoxFuture<'a, BindInterface> {
+            async move {
+                self.binds.fetch_add(1, Ordering::Relaxed);
+                self.manager.bind(uri, Arc::new(NullIoFactory)).await
+            }
+            .boxed()
+        }
+
+        fn rebind<'a>(
+            &'a self,
+            _network: &'a Network,
+            _iface: &'a BindInterface,
+        ) -> BoxFuture<'a, ()> {
+            async move {
+                self.rebinds.fetch_add(1, Ordering::Relaxed);
+            }
+            .boxed()
+        }
+    }
+
+    fn clear_bound_for_test(
+        network: &Network,
+        driver: &Arc<CountingDriver>,
+        pattern: &BindPattern,
+    ) {
+        let key = BindRegistryKey {
+            driver: bind_driver_id(driver),
+            pattern: pattern.clone(),
+        };
+        let registry = network
+            .bind_registry
+            .lock()
+            .expect("bind_registry poisoned");
+        let entry = registry.get(&key).expect("registered pattern");
+        entry.bound.lock().expect("bound mutex poisoned").clear();
     }
 
     #[derive(Debug)]
@@ -1898,57 +2096,150 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_rebinds_existing_driver_bindings() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        use futures::{FutureExt, future::BoxFuture};
-
-        struct CountingDriver {
-            manager: Arc<crate::dquic::net::InterfaceManager>,
-            rebinds: AtomicUsize,
-        }
-
-        impl CountingDriver {
-            fn new() -> Self {
-                Self {
-                    manager: Arc::new(crate::dquic::net::InterfaceManager::new()),
-                    rebinds: AtomicUsize::new(0),
-                }
-            }
-        }
-
-        impl BindDriver for CountingDriver {
-            fn bind<'a>(
-                &'a self,
-                _network: &'a Network,
-                uri: BindUri,
-            ) -> BoxFuture<'a, BindInterface> {
-                async move { self.manager.bind(uri, Arc::new(NullIoFactory)).await }.boxed()
-            }
-
-            fn rebind<'a>(
-                &'a self,
-                _network: &'a Network,
-                _iface: &'a BindInterface,
-            ) -> BoxFuture<'a, ()> {
-                async move {
-                    self.rebinds.fetch_add(1, Ordering::Relaxed);
-                }
-                .boxed()
-            }
-        }
-
+    async fn reconcile_event_rebinds_matching_changed_interface_bindings() {
         let network = Network::builder().build();
         let driver = Arc::new(CountingDriver::new());
         let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
 
         let mut handle = network.bind_with(driver.clone(), pattern).await;
+        assert!(driver.bind_count() > 0, "initial bind should create iface");
 
-        network.reconcile_once().await;
+        network.reconcile_event(&changed_event("lo")).await;
 
-        assert!(driver.rebinds.load(Ordering::Relaxed) > 0);
+        assert!(
+            driver.rebind_count() > 0,
+            "matching changed event should rebind existing lo iface"
+        );
 
         handle.unbind().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_event_skips_unrelated_changed_interface_bindings() {
+        let network = Network::builder().build();
+        let driver = Arc::new(CountingDriver::new());
+        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+
+        let mut handle = network.bind_with(driver.clone(), pattern).await;
+        assert!(driver.bind_count() > 0, "initial bind should create iface");
+
+        network
+            .reconcile_event(&changed_event("__unrelated__"))
+            .await;
+
+        assert_eq!(
+            driver.rebind_count(),
+            0,
+            "unrelated changed event must not rebind lo iface"
+        );
+
+        handle.unbind().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_event_skips_inet_bindings() {
+        let network = Network::builder().build();
+        let driver = Arc::new(CountingDriver::new());
+        let pattern = BindPattern::from_str("inet://127.0.0.1:0").expect("valid pattern");
+
+        let mut handle = network.bind_with(driver.clone(), pattern).await;
+        assert_eq!(
+            driver.bind_count(),
+            1,
+            "initial inet bind should create one iface"
+        );
+
+        network.reconcile_event(&changed_event("lo")).await;
+
+        assert_eq!(
+            driver.rebind_count(),
+            0,
+            "interface changed event must not rebind inet iface"
+        );
+
+        handle.unbind().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_event_added_binds_missing_matching_membership_without_rebind() {
+        let network = Network::builder().build();
+        let driver = Arc::new(CountingDriver::new());
+        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+
+        let mut handle = network.bind_with(driver.clone(), pattern.clone()).await;
+        let initial_binds = driver.bind_count();
+        assert!(initial_binds > 0, "initial bind should create iface");
+
+        clear_bound_for_test(&network, &driver, &pattern);
+
+        network.reconcile_event(&added_event("lo")).await;
+
+        assert!(
+            driver.bind_count() > initial_binds,
+            "matching added event should create missing bound membership"
+        );
+        assert_eq!(
+            driver.rebind_count(),
+            0,
+            "added event must not rebind existing bindings"
+        );
+        assert!(
+            network
+                .get_interfaces_with(&driver, &pattern)
+                .is_some_and(|interfaces| !interfaces.is_empty()),
+            "added reconcile should repopulate registry membership"
+        );
+
+        handle.unbind().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_event_removed_removes_matching_membership_without_rebind() {
+        let network = Network::builder().build();
+        let driver = Arc::new(CountingDriver::new());
+        let pattern = BindPattern::from_str("iface://v4.__removed__:0").expect("valid pattern");
+        let uri: BindUri = "iface://v4.__removed__:0".parse().expect("valid bind uri");
+        let key = BindRegistryKey {
+            driver: bind_driver_id(&driver),
+            pattern: pattern.clone(),
+        };
+        let iface = driver.bind(&network, uri.clone()).await;
+
+        {
+            let mut registry = network
+                .bind_registry
+                .lock()
+                .expect("bind_registry poisoned");
+            registry.insert(
+                key,
+                BindsEntry {
+                    refcount: 1,
+                    driver: driver.clone(),
+                    bound: Mutex::new(HashMap::from([(uri.identity_key(), (uri, iface))])),
+                },
+            );
+        }
+
+        network.reconcile_event(&removed_event("__removed__")).await;
+
+        assert!(
+            network
+                .get_interfaces_with(&driver, &pattern)
+                .is_some_and(|interfaces| interfaces.is_empty()),
+            "removed event should remove stale bound iface for the removed device"
+        );
+        assert_eq!(
+            driver.rebind_count(),
+            0,
+            "removed event must not rebind remaining bindings"
+        );
+
+        network
+            .unbind(&BindRegistryKey {
+                driver: bind_driver_id(&driver),
+                pattern,
+            })
+            .await;
     }
 
     #[tokio::test]

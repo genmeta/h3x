@@ -252,7 +252,7 @@ impl<Out, In> Stream for RpcFrameIo<Out, In> {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use futures::{FutureExt as _, SinkExt as _, StreamExt as _, future::poll_fn};
+    use futures::{SinkExt as _, StreamExt as _, future::poll_fn};
 
     use super::*;
     use crate::rpc::stream::frame::{ReadCommand, ReadEvent};

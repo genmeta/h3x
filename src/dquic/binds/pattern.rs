@@ -69,6 +69,20 @@ mod tests {
     }
 
     #[test]
+    fn interface_bind_uris_expand_only_iface_patterns() {
+        let iface_pattern: BindPattern = "iface://v4.lo:8080".parse().unwrap();
+        let inet_pattern: BindPattern = "inet://127.0.0.1:8080".parse().unwrap();
+
+        let iface_uris: Vec<_> = iface_pattern
+            .interface_bind_uris("lo")
+            .map(|uri| uri.to_string())
+            .collect();
+
+        assert_eq!(iface_uris, ["iface://v4.lo:8080/"]);
+        assert!(inet_pattern.interface_bind_uris("lo").next().is_none());
+    }
+
+    #[test]
     fn unknown_explicit_scheme_falls_back_to_iface() {
         let pattern: BindPattern = "custom://v4.en*:8080/path?query".parse().unwrap();
 
@@ -282,6 +296,19 @@ impl BindPattern {
             Scheme::Iface => self.matches_iface_bind_uri(bind_uri),
             Scheme::Inet => self.matches_inet_bind_uri(bind_uri),
             _ => false,
+        }
+    }
+
+    pub(crate) fn interface_bind_uris<'a>(
+        &'a self,
+        interface: &'a str,
+    ) -> impl Iterator<Item = BindUri> + use<'a> {
+        let template = self.template();
+        match self.scheme {
+            Scheme::Iface => {
+                Either::Left(self.match_interface_links(interface).filter_map(template))
+            }
+            _ => Either::Right(std::iter::empty()),
         }
     }
 
