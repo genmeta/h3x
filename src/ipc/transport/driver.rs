@@ -302,13 +302,12 @@ async fn reader_loop(
 #[cfg(not(target_os = "linux"))]
 fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
     use nix::fcntl::{F_GETFD, F_SETFD, FdFlag, fcntl};
-    let raw = fd.as_raw_fd();
-    let bits = match fcntl(raw, F_GETFD) {
+    let bits = match fcntl(fd, F_GETFD) {
         Ok(bits) => bits,
         Err(error) => return Err(io::Error::from(error)),
     };
     let new_flags = FdFlag::from_bits_truncate(bits) | FdFlag::FD_CLOEXEC;
-    if let Err(error) = fcntl(raw, F_SETFD(new_flags)) {
+    if let Err(error) = fcntl(fd, F_SETFD(new_flags)) {
         return Err(io::Error::from(error));
     }
     Ok(())
