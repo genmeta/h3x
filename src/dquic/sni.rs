@@ -53,12 +53,10 @@ pub(crate) struct RegistryGuard {
 
 impl Drop for RegistryGuard {
     fn drop(&mut self) {
-        if let Some(registry) = self.registry.upgrade()
-            && let Some(kv) = registry.get(&self.name)
-            && Weak::ptr_eq(&self.self_entry, kv.value())
-        {
-            drop(kv);
-            registry.remove(&self.name);
+        if let Some(registry) = self.registry.upgrade() {
+            registry.remove_if(&self.name, |_name, entry| {
+                Weak::ptr_eq(&self.self_entry, entry)
+            });
         }
     }
 }

@@ -368,14 +368,13 @@ impl QuicBindDriver {
         Ok(slot)
     }
 
-    pub async fn bind_server(
-        self: Arc<Self>,
+    fn new_server_binding(
+        &self,
+        name: Name<'static>,
         identity: Arc<Identity>,
         server_config: ServerQuicConfig,
         bind_patterns: Arc<Vec<BindPattern>>,
     ) -> Result<ServerBinding, BindServerError> {
-        let name = identity.name.clone();
-
         let slot = self.compatible_server_slot(&server_config)?;
 
         let certified_key = crate::dquic::identity::build_certified_key(&identity)?;
@@ -395,25 +394,43 @@ impl QuicBindDriver {
             bind: bind_patterns.clone(),
         });
 
+        Ok(ServerBinding { entry })
+    }
+
+    pub async fn bind_server(
+        self: Arc<Self>,
+        identity: Arc<Identity>,
+        server_config: ServerQuicConfig,
+        bind_patterns: Arc<Vec<BindPattern>>,
+    ) -> Result<ServerBinding, BindServerError> {
+        use bind_server_error::*;
         use dashmap::mapref::entry::Entry;
+
+        let name = identity.name.clone();
+
         match self.sni_registry.entry(name.clone()) {
             Entry::Occupied(mut occupied) => match occupied.get().upgrade() {
                 Some(existing) if Arc::ptr_eq(&existing.identity, &identity) => {
-                    return Ok(Self::server_binding_for_existing(&existing));
+                    if !existing.config.config.is_compatible_with(&server_config) {
+                        return ServerConfigConflictSnafu.fail();
+                    }
+                    Ok(Self::server_binding_for_existing(&existing))
                 }
-                Some(_) => {
-                    return bind_server_error::SniInUseSnafu { name }.fail();
-                }
+                Some(_) => SniInUseSnafu { name }.fail(),
                 None => {
-                    occupied.insert(Arc::downgrade(&entry));
+                    let binding =
+                        self.new_server_binding(name, identity, server_config, bind_patterns)?;
+                    occupied.insert(Arc::downgrade(&binding.entry));
+                    Ok(binding)
                 }
             },
             Entry::Vacant(vacant) => {
-                vacant.insert(Arc::downgrade(&entry));
+                let binding =
+                    self.new_server_binding(name, identity, server_config, bind_patterns)?;
+                vacant.insert(Arc::downgrade(&binding.entry));
+                Ok(binding)
             }
         }
-
-        Ok(ServerBinding { entry })
     }
 
     #[cfg(test)]
@@ -2187,6 +2204,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bind_server_different_identity_same_sni_prefers_sni_in_use_over_config_conflict() {
+        let network = Network::builder().build();
+        let identity_a = make_identity("conflict.example.com");
+        let identity_b = make_identity("conflict.example.com");
+        let cfg_a = make_server_config();
+        let cfg_b = ServerQuicConfig {
+            alpns: vec![b"altproto".to_vec()],
+            ..Default::default()
+        };
+
+        let binding_a = network
+            .quic()
+            .bind_server(identity_a, cfg_a, Arc::new(Vec::new()))
+            .await
+            .expect("first bind should succeed");
+
+        let error = network
+            .quic()
+            .bind_server(identity_b, cfg_b, Arc::new(Vec::new()))
+            .await
+            .expect_err("different identity should fail before config compatibility");
+
+        assert!(
+            matches!(
+                error,
+                BindServerError::SniInUse { ref name } if name == binding_a.name()
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_bind_server_same_identity_reuse() {
         let network = Network::builder().build();
         let identity = make_identity("test.example.com");
@@ -2240,12 +2289,15 @@ mod tests {
             let identity = identity.clone();
             let config = config.clone();
             let barrier = barrier.clone();
-            tasks.push(tokio::spawn(async move {
-                barrier.wait().await;
-                quic.bind_server(identity, config, Arc::new(Vec::new()))
-                    .await
-                    .expect("concurrent same-identity bind should succeed")
-            }));
+            tasks.push(tokio::spawn(
+                async move {
+                    barrier.wait().await;
+                    quic.bind_server(identity, config, Arc::new(Vec::new()))
+                        .await
+                        .expect("concurrent same-identity bind should succeed")
+                }
+                .in_current_span(),
+            ));
         }
 
         let mut bindings = Vec::with_capacity(TASKS);
