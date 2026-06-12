@@ -96,7 +96,7 @@ use crate::dquic::{
 };
 
 pub(crate) type SniRegistry = Arc<DashMap<Name<'static>, Weak<ServerEntry>>>;
-type BoundInterfaces = HashMap<String, (BindUri, BindInterface)>;
+type BoundInterfaces = HashMap<BindUri, BindInterface>;
 
 fn interface_contains(interface: &::dquic::qinterface::device::Interface, ip: IpAddr) -> bool {
     match ip {
@@ -471,7 +471,7 @@ impl QuicBindDriver {
         let mut items = Vec::new();
         for (_, entry) in registry.iter().filter(|(key, _)| key.driver == quic_driver) {
             let state = entry.lock_state();
-            items.extend(state.bound.values().map(|(uri, iface)| map(uri, iface)));
+            items.extend(state.bound.iter().map(|(uri, iface)| map(uri, iface)));
         }
         items
     }
@@ -491,7 +491,6 @@ impl QuicBindDriver {
     /// Return the currently bound interface for an exact [`BindUri`].
     #[must_use]
     pub fn get_iface(&self, uri: &BindUri) -> Option<BindInterface> {
-        let key = uri.identity_key();
         let network = self.network();
         let registry = network
             .bind_registry
@@ -504,7 +503,7 @@ impl QuicBindDriver {
             .map(|(_, entry)| entry)
             .find_map(|entry| {
                 let state = entry.lock_state();
-                state.bound.get(&key).map(|(_uri, iface)| iface.clone())
+                state.bound.get(uri).cloned()
             })
     }
 
@@ -523,14 +522,9 @@ impl QuicBindDriver {
             .bind_registry
             .lock()
             .expect("bind_registry poisoned");
-        registry.get(&key).map(|entry| {
-            entry
-                .lock_state()
-                .bound
-                .values()
-                .map(|(_, iface)| iface.clone())
-                .collect()
-        })
+        registry
+            .get(&key)
+            .map(|entry| entry.lock_state().bound.values().cloned().collect())
     }
 
     /// Connectionless packet dispatcher installed on the [`QuicRouter`].
@@ -695,9 +689,9 @@ struct BindsEntry {
 struct BindsState {
     refcount: usize,
     closing: bool,
-    /// Live bindings keyed by [`BindUri::identity_key`]. Holds strong
-    /// [`BindInterface`] references so that the interfaces (and their
-    /// installed components) stay alive.
+    /// Live bindings keyed by full [`BindUri`] identity. Holds strong
+    /// [`BindInterface`] references so that the interfaces and their
+    /// installed components stay alive.
     bound: BoundInterfaces,
 }
 
@@ -743,14 +737,24 @@ impl BindsState {
     ) -> Vec<BindUri> {
         pattern
             .to_bind_uris(devices.interfaces().keys().map(String::as_str))
-            .filter(|uri| !self.bound.contains_key(&uri.identity_key()))
+            .filter(|candidate| {
+                !self
+                    .bound
+                    .keys()
+                    .any(|bound| bound.matches_reconcile_candidate(candidate))
+            })
             .collect()
     }
 
     fn missing_added_device_uris(&self, pattern: &BindPattern, device: &str) -> Vec<BindUri> {
         pattern
             .interface_bind_uris(device)
-            .filter(|uri| !self.bound.contains_key(&uri.identity_key()))
+            .filter(|candidate| {
+                !self
+                    .bound
+                    .keys()
+                    .any(|bound| bound.matches_reconcile_candidate(candidate))
+            })
             .collect()
     }
 
@@ -758,11 +762,11 @@ impl BindsState {
         let mut retained = HashMap::with_capacity(self.bound.len());
         let mut close = CloseBatch::new();
 
-        for (key, (uri, iface)) in mem::take(&mut self.bound) {
+        for (uri, iface) in mem::take(&mut self.bound) {
             if iface_bind_uri_device(&uri) == Some(device) {
                 close.push(iface);
             } else {
-                retained.insert(key, (uri, iface));
+                retained.insert(uri, iface);
             }
         }
 
@@ -772,7 +776,7 @@ impl BindsState {
 
     fn changed_device_targets(&self, device: &str) -> Vec<BindInterface> {
         self.bound
-            .values()
+            .iter()
             .filter(|(uri, _iface)| iface_bind_uri_device(uri) == Some(device))
             .map(|(_uri, iface)| iface.clone())
             .collect()
@@ -865,7 +869,7 @@ struct EntryRelease {
 struct PendingBindRegistration {
     network: Arc<Network>,
     permit: Option<BindEntryPermit>,
-    new_bindings: Vec<(String, BindUri, BindInterface)>,
+    new_bindings: Vec<(BindUri, BindInterface)>,
 }
 
 impl BindEntryPermit {
@@ -888,19 +892,19 @@ impl BindEntryPermit {
     fn commit_added_device(
         &self,
         device_exists: bool,
-        new_bindings: Vec<(String, BindUri, BindInterface)>,
+        new_bindings: Vec<(BindUri, BindInterface)>,
     ) -> CloseBatch {
         let mut state = self.entry.lock_state();
         let mut close = CloseBatch::new();
 
         if state.closing || !device_exists {
-            close.extend(new_bindings.into_iter().map(|(_, _, iface)| iface));
+            close.extend(new_bindings.into_iter().map(|(_, iface)| iface));
             return close;
         }
 
-        for (key, uri, iface) in new_bindings {
-            if let std::collections::hash_map::Entry::Vacant(slot) = state.bound.entry(key) {
-                slot.insert((uri, iface));
+        for (uri, iface) in new_bindings {
+            if let std::collections::hash_map::Entry::Vacant(slot) = state.bound.entry(uri) {
+                slot.insert(iface);
             } else {
                 close.push(iface);
             }
@@ -934,7 +938,7 @@ impl BindEntryPermit {
             state.refcount -= 1;
             if state.refcount == 0 {
                 state.closing = true;
-                close.extend(state.bound.drain().map(|(_, (_, iface))| iface));
+                close.extend(state.bound.drain().map(|(_, iface)| iface));
                 remove_entry = true;
             }
         }
@@ -1012,7 +1016,7 @@ impl PendingBindRegistration {
         close.extend(
             mem::take(&mut self.new_bindings)
                 .into_iter()
-                .map(|(_, _, iface)| iface),
+                .map(|(_, iface)| iface),
         );
         close
     }
@@ -1066,7 +1070,7 @@ impl PendingBindRegistration {
     }
 
     fn push_new_binding(&mut self, uri: BindUri, iface: BindInterface) {
-        self.new_bindings.push((uri.identity_key(), uri, iface));
+        self.new_bindings.push((uri, iface));
     }
 
     fn commit_into_handle(mut self, network: Arc<Network>) -> BindHandle {
@@ -1078,9 +1082,9 @@ impl PendingBindRegistration {
             debug_assert!(!state.closing, "permit should not commit a closing entry");
             state.refcount += 1;
             let mut close = CloseBatch::new();
-            for (key, uri, iface) in new_bindings {
-                if let std::collections::hash_map::Entry::Vacant(slot) = state.bound.entry(key) {
-                    slot.insert((uri, iface));
+            for (uri, iface) in new_bindings {
+                if let std::collections::hash_map::Entry::Vacant(slot) = state.bound.entry(uri) {
+                    slot.insert(iface);
                 } else {
                     close.push(iface);
                 }
@@ -1437,14 +1441,9 @@ impl Network {
             pattern: pattern.clone(),
         };
         let registry = self.bind_registry.lock().expect("bind_registry poisoned");
-        registry.get(&key).map(|entry| {
-            entry
-                .lock_state()
-                .bound
-                .values()
-                .map(|(_, iface)| iface.clone())
-                .collect()
-        })
+        registry
+            .get(&key)
+            .map(|entry| entry.lock_state().bound.values().cloned().collect())
     }
 
     /// Background task that reconciles bound interfaces with device changes.
@@ -1482,7 +1481,7 @@ impl Network {
                     break;
                 }
                 let iface = permit.entry.driver.bind(self, uri.clone()).await;
-                new_bindings.push((uri.identity_key(), uri, iface));
+                new_bindings.push((uri, iface));
             }
 
             let mut close =
@@ -2088,7 +2087,7 @@ mod tests {
             let entry = registry.get(&key).expect("registered pattern");
             let mut state = entry.lock_state();
             let mut close = CloseBatch::new();
-            close.extend(state.bound.drain().map(|(_, (_, iface))| iface));
+            close.extend(state.bound.drain().map(|(_, iface)| iface));
             close
         };
         close.close_all().await;
@@ -2276,6 +2275,12 @@ mod tests {
 
         if let Some(uri) = quic_uris.first() {
             assert!(quic.get_iface(uri).is_some());
+            let mut query_changed = uri.clone();
+            query_changed.add_prop(BindUri::ALLOC_PORT_ID, "synthetic-test-id");
+            assert!(
+                quic.get_iface(&query_changed).is_none(),
+                "get_iface must use full BindUri identity, not reconciliation identity"
+            );
         }
 
         assert_eq!(
@@ -2704,6 +2709,52 @@ mod tests {
         assert!(
             driver.close_count() > 0,
             "canceled pending registration should close uncommitted interfaces"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_state_reconciliation_ignores_only_alloc_port_id() {
+        let network = Network::builder().build();
+        let driver = Arc::new(TestNullDriver::new());
+        let driver_erased: Arc<dyn BindDriver> = driver.clone();
+        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+        let key = BindRegistryKey {
+            driver: bind_driver_id(&driver),
+            pattern: pattern.clone(),
+        };
+        let permit = network
+            .acquire_or_insert_entry(key, driver_erased.clone())
+            .await;
+
+        let existing = BindUri::from_str("iface://v4.lo:0")
+            .expect("valid bind uri")
+            .alloc_port();
+        let iface = driver_erased.bind(&network, existing.clone()).await;
+        {
+            let mut state = permit.entry.lock_state();
+            state.bound.insert(existing, iface);
+        }
+
+        assert!(
+            permit
+                .entry
+                .lock_state()
+                .missing_added_device_uris(&pattern, "lo")
+                .is_empty(),
+            "reconciliation should not bind a duplicate when only alloc_port_id differs"
+        );
+
+        let different_stun: BindUri = "iface://v4.lo:0/?stun=true"
+            .parse()
+            .expect("valid bind uri");
+        assert!(
+            permit
+                .entry
+                .lock_state()
+                .bound
+                .keys()
+                .all(|uri| !uri.matches_reconcile_candidate(&different_stun)),
+            "stun query changes remain semantic"
         );
     }
 
