@@ -28,9 +28,16 @@ pub(crate) struct ServerEntry {
     pub(crate) incomings_tx: async_channel::Sender<Arc<Connection>>,
     pub(crate) incomings_rx: async_channel::Receiver<Arc<Connection>>,
     /// Shared server-side QUIC/TLS configuration for this entry.
+    #[allow(
+        dead_code,
+        reason = "held to keep the shared server configuration alive for this SNI entry"
+    )]
     pub(crate) config: Arc<ServerConfig>,
-    /// Shared guard — cloned into every `ServerBinding`. When the last
-    /// clone drops, the entry is removed from `sni_registry`.
+    /// Shared guard — dropped with the entry to remove it from `sni_registry`.
+    #[allow(
+        dead_code,
+        reason = "held for RAII SNI unregister when the last entry reference drops"
+    )]
     pub(crate) guard: Arc<RegistryGuard>,
     /// Bind patterns associated with this server entry.
     pub(crate) bind: Arc<Vec<BindPattern>>,

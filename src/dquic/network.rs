@@ -328,11 +328,9 @@ impl QuicBindDriver {
     }
 
     fn server_binding_for_existing(existing: &Arc<ServerEntry>) -> ServerBinding {
-        let entry = existing.clone();
-        // ServerEntry holds config and guard for their drop/lifetime effects;
-        // reuse keeps those fields on the shared entry instead of rebuilding it.
-        let _ = (&entry.config, &entry.guard);
-        ServerBinding { entry }
+        ServerBinding {
+            entry: existing.clone(),
+        }
     }
 
     fn compatible_server_slot(
@@ -395,27 +393,10 @@ impl QuicBindDriver {
         }
 
         let certified_key = crate::dquic::identity::build_certified_key(&identity)?;
-
-        use dashmap::mapref::entry::Entry;
-        match self.sni_registry.entry(name.clone()) {
-            Entry::Occupied(occupied) => match occupied.get().upgrade() {
-                Some(existing) if Arc::ptr_eq(&existing.identity, &identity) => {
-                    return Ok(Self::server_binding_for_existing(&existing));
-                }
-                Some(_) => {
-                    return bind_server_error::SniInUseSnafu { name }.fail();
-                }
-                None => {
-                    occupied.remove();
-                }
-            },
-            Entry::Vacant(_) => {}
-        }
-
         let (incomings_tx, incomings_rx) = async_channel::bounded(server_config.backlog);
 
         let entry = Arc::new_cyclic(|weak_entry| ServerEntry {
-            identity,
+            identity: identity.clone(),
             certified_key,
             incomings_tx,
             incomings_rx,
@@ -428,8 +409,23 @@ impl QuicBindDriver {
             bind: bind_patterns.clone(),
         });
 
-        self.sni_registry
-            .insert(name.clone(), Arc::downgrade(&entry));
+        use dashmap::mapref::entry::Entry;
+        match self.sni_registry.entry(name.clone()) {
+            Entry::Occupied(mut occupied) => match occupied.get().upgrade() {
+                Some(existing) if Arc::ptr_eq(&existing.identity, &identity) => {
+                    return Ok(Self::server_binding_for_existing(&existing));
+                }
+                Some(_) => {
+                    return bind_server_error::SniInUseSnafu { name }.fail();
+                }
+                None => {
+                    occupied.insert(Arc::downgrade(&entry));
+                }
+            },
+            Entry::Vacant(vacant) => {
+                vacant.insert(Arc::downgrade(&entry));
+            }
+        }
 
         Ok(ServerBinding { entry })
     }
@@ -2241,6 +2237,52 @@ mod tests {
             .and_then(|kv| kv.value().upgrade())
             .expect("reused binding should keep SNI registered");
         assert!(Arc::ptr_eq(&entry_after_drop, &binding_b.entry));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_identity_bind_server_reuses_one_entry() {
+        const TASKS: usize = 16;
+
+        let network = Network::builder().build();
+        let identity = make_identity("test.example.com");
+        let config = make_server_config();
+        let barrier = Arc::new(tokio::sync::Barrier::new(TASKS));
+
+        let mut tasks = Vec::with_capacity(TASKS);
+        for _ in 0..TASKS {
+            let quic = network.quic();
+            let identity = identity.clone();
+            let config = config.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                quic.bind_server(identity, config, Arc::new(Vec::new()))
+                    .await
+                    .expect("concurrent same-identity bind should succeed")
+            }));
+        }
+
+        let mut bindings = Vec::with_capacity(TASKS);
+        for task in tasks {
+            bindings.push(task.await.expect("bind task should not panic"));
+        }
+
+        let first = bindings.first().expect("at least one binding");
+        assert!(
+            bindings
+                .iter()
+                .all(|binding| Arc::ptr_eq(&binding.entry, &first.entry)),
+            "all bindings should share the same server entry"
+        );
+
+        let quic = network.quic();
+        assert_eq!(quic.sni_registry.len(), 1);
+        let registered = quic
+            .sni_registry
+            .get(first.name())
+            .and_then(|kv| kv.value().upgrade())
+            .expect("registry should hold the shared entry");
+        assert!(Arc::ptr_eq(&registered, &first.entry));
     }
 
     #[tokio::test]
