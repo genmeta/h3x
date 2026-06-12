@@ -2273,15 +2273,16 @@ mod tests {
 
         let quic_uris = quic.current_bind_uris();
 
-        if let Some(uri) = quic_uris.first() {
-            assert!(quic.get_iface(uri).is_some());
-            let mut query_changed = uri.clone();
-            query_changed.add_prop(BindUri::ALLOC_PORT_ID, "synthetic-test-id");
-            assert!(
-                quic.get_iface(&query_changed).is_none(),
-                "get_iface must use full BindUri identity, not reconciliation identity"
-            );
-        }
+        let uri = quic_uris
+            .first()
+            .expect("quic bind should expose at least one current bind uri");
+        assert!(quic.get_iface(uri).is_some());
+        let mut query_changed = uri.clone();
+        query_changed.add_prop(BindUri::ALLOC_PORT_ID, "synthetic-test-id");
+        assert!(
+            quic.get_iface(&query_changed).is_none(),
+            "get_iface must use full BindUri identity, not reconciliation identity"
+        );
 
         assert_eq!(
             quic.get_interfaces(&pattern)
@@ -2742,6 +2743,17 @@ mod tests {
                 .missing_added_device_uris(&pattern, "lo")
                 .is_empty(),
             "reconciliation should not bind a duplicate when only alloc_port_id differs"
+        );
+
+        let stun_pattern =
+            BindPattern::from_str("iface://v4.lo:0/?stun=true").expect("valid pattern");
+        assert!(
+            !permit
+                .entry
+                .lock_state()
+                .missing_added_device_uris(&stun_pattern, "lo")
+                .is_empty(),
+            "semantic query differences must remain missing reconciliation candidates"
         );
 
         let different_stun: BindUri = "iface://v4.lo:0/?stun=true"
