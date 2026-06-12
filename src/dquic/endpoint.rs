@@ -460,6 +460,7 @@ impl quic::Connect for QuicEndpoint {
                         connection.clone(),
                         server_eps,
                         observer,
+                        local_addresses,
                     );
                     tracing::debug!(server = server_str, "quic endpoint handshaked before agent path");
                     return Ok(connection);
@@ -473,6 +474,7 @@ impl quic::Connect for QuicEndpoint {
                         connection.clone(),
                         server_eps,
                         observer,
+                        local_addresses,
                     );
                     return Ok(connection);
                 }
@@ -516,6 +518,7 @@ impl quic::Connect for QuicEndpoint {
                         connection.clone(),
                         server_eps,
                         observer,
+                        local_addresses,
                     );
                     tracing::debug!(server = server_str, "quic endpoint has at least one path");
                     return Ok(connection);
@@ -862,6 +865,7 @@ impl QuicEndpoint {
         connection: Arc<Connection>,
         mut server_eps: S,
         mut observer: crate::dquic::qinterface::component::location::Observer,
+        local_addresses: LocalAddressTracker,
     ) where
         S: Stream<Item = (Source, EndpointAddr)> + Unpin + Send + 'static,
     {
@@ -873,7 +877,7 @@ impl QuicEndpoint {
         // DNS and observer streams are exhausted.
         tokio::spawn(
             async move {
-                let mut local_addresses = LocalAddressTracker::default();
+                let mut local_addresses = local_addresses;
                 let mut dns_done = false;
                 let mut locations_done = false;
                 loop {
@@ -1347,6 +1351,82 @@ mod tests {
             !QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
             "removing the direct local endpoint should deactivate its path"
         );
+    }
+
+    #[tokio::test]
+    async fn local_address_tracker_preserves_connect_state_after_move() {
+        use crate::dquic::qinterface::component::location::{AddressEvent, Locations};
+
+        let bind_pattern = BindPattern::from_str("inet://127.0.0.1:0").expect("valid bind pattern");
+        let bind = Arc::new(vec![bind_pattern.clone()]);
+        let endpoint = QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .bind(bind.clone())
+            .build()
+            .await;
+        let tls = endpoint.ensure_client().expect("client tls");
+        let connection = endpoint
+            .build_client_connection("remote.test", tls)
+            .expect("client connection");
+        let iface = endpoint
+            .network()
+            .quic()
+            .get_interfaces(&bind_pattern)
+            .expect("registered bind")
+            .into_iter()
+            .next()
+            .expect("bound interface");
+
+        use crate::dquic::net::IO as _;
+        let bind_uri = iface.bind_uri();
+        let local_addr = iface.borrow().bound_addr().expect("bound address");
+        let remote_port = if local_addr.port() == u16::MAX {
+            local_addr.port() - 1
+        } else {
+            local_addr.port() + 1
+        };
+        let remote_addr = SocketAddr::new(local_addr.ip(), remote_port);
+        let mut tracker = LocalAddressTracker::default();
+
+        tracker.handle(&connection, bind_uri.clone(), {
+            let data: Arc<dyn Any + Send + Sync> =
+                Arc::new(Ok::<SocketAddr, std::io::Error>(local_addr));
+            AddressEvent::Upsert(data)
+        });
+        QuicEndpoint::add_resolved_peer_endpoint(
+            &connection,
+            Source::System,
+            EndpointAddr::direct(remote_addr),
+        );
+        assert!(
+            QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
+            "direct local endpoint should pair with direct remote endpoint before tracker handoff"
+        );
+
+        let locations = Locations::new();
+        let observer = locations.subscribe();
+        QuicEndpoint::spawn_path_discovery_companion(
+            bind,
+            connection.clone(),
+            futures::stream::empty(),
+            observer,
+            tracker,
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                locations.remove::<std::io::Result<SocketAddr>>(bind_uri.clone());
+                if !matches!(
+                    QuicEndpoint::connection_has_paths(&connection, false),
+                    Ok(true)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("moved tracker should remove the pre-connect direct local endpoint");
     }
 
     #[tokio::test]
