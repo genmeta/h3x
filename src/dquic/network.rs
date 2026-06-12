@@ -779,13 +779,19 @@ impl BindsState {
     }
 }
 
+#[derive(Default)]
 struct CloseBatch {
+    current: Option<BoxFuture<'static, ()>>,
     ifaces: Vec<BindInterface>,
 }
 
 impl CloseBatch {
     fn new() -> Self {
-        Self { ifaces: Vec::new() }
+        Self::default()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.current.is_none() && self.ifaces.is_empty()
     }
 
     fn push(&mut self, iface: BindInterface) {
@@ -796,28 +802,44 @@ impl CloseBatch {
         self.ifaces.extend(ifaces);
     }
 
-    async fn close_all(mut self) {
-        let ifaces = mem::take(&mut self.ifaces);
-        for iface in ifaces {
+    fn close_iface(iface: BindInterface) -> BoxFuture<'static, ()> {
+        async move {
             iface.close().await.ok();
+        }
+        .boxed()
+    }
+
+    async fn close_all(&mut self) {
+        loop {
+            if self.current.is_none() {
+                self.current = self.ifaces.pop().map(Self::close_iface);
+            }
+
+            let Some(current) = self.current.as_mut() else {
+                return;
+            };
+
+            current.as_mut().await;
+            self.current = None;
         }
     }
 }
 
 impl Drop for CloseBatch {
     fn drop(&mut self) {
-        if self.ifaces.is_empty() {
+        if self.is_empty() {
             return;
         }
 
-        let ifaces = mem::take(&mut self.ifaces);
+        let mut close = Self {
+            current: self.current.take(),
+            ifaces: mem::take(&mut self.ifaces),
+        };
         // Inherent termination: the spawned task owns a finite list of
         // already-drained interfaces and exits after closing each one.
         tokio::spawn(
             async move {
-                for iface in ifaces {
-                    iface.close().await.ok();
-                }
+                close.close_all().await;
             }
             .in_current_span(),
         );
@@ -831,18 +853,25 @@ struct BindEntryPermit {
 }
 
 struct EntryRelease {
+    network: Arc<Network>,
+    key: BindRegistryKey,
+    entry: Arc<BindsEntry>,
+    permit: Option<BindEntryPermit>,
     remove_entry: bool,
     close: CloseBatch,
+    completed: bool,
 }
 
 struct PendingBindRegistration {
+    network: Arc<Network>,
     permit: Option<BindEntryPermit>,
     new_bindings: Vec<(String, BindUri, BindInterface)>,
 }
 
 impl BindEntryPermit {
-    fn begin_bind_registration(self) -> PendingBindRegistration {
+    fn begin_bind_registration(self, network: Arc<Network>) -> PendingBindRegistration {
         PendingBindRegistration {
+            network,
             permit: Some(self),
             new_bindings: Vec::new(),
         }
@@ -896,35 +925,137 @@ impl BindEntryPermit {
         state.changed_device_targets(device)
     }
 
-    fn release_one_handle(&self) -> EntryRelease {
+    fn release_one_handle(self, network: Arc<Network>) -> EntryRelease {
         let mut state = self.entry.lock_state();
         let mut close = CloseBatch::new();
+        let mut remove_entry = false;
 
-        if state.closing || state.refcount == 0 {
-            return EntryRelease {
-                remove_entry: false,
-                close,
-            };
+        if !state.closing && state.refcount > 0 {
+            state.refcount -= 1;
+            if state.refcount == 0 {
+                state.closing = true;
+                close.extend(state.bound.drain().map(|(_, (_, iface))| iface));
+                remove_entry = true;
+            }
         }
 
-        state.refcount -= 1;
-        if state.refcount == 0 {
-            state.closing = true;
-            close.extend(state.bound.drain().map(|(_, (_, iface))| iface));
-            return EntryRelease {
-                remove_entry: true,
-                close,
-            };
-        }
+        drop(state);
 
         EntryRelease {
-            remove_entry: false,
+            network,
+            key: self.key.clone(),
+            entry: self.entry.clone(),
+            permit: Some(self),
+            remove_entry,
             close,
+            completed: false,
         }
     }
 }
 
+impl EntryRelease {
+    async fn finish(mut self) {
+        self.close.close_all().await;
+
+        if self.remove_entry {
+            self.network.remove_entry_if_current(&self.key, &self.entry);
+            self.remove_entry = false;
+        }
+
+        self.completed = true;
+    }
+}
+
+impl Drop for EntryRelease {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+
+        if self.close.is_empty() {
+            if self.remove_entry {
+                self.network.remove_entry_if_current(&self.key, &self.entry);
+                self.remove_entry = false;
+            }
+            return;
+        }
+
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        let network = self.network.clone();
+        let key = self.key.clone();
+        let entry = self.entry.clone();
+        let remove_entry = self.remove_entry;
+        self.remove_entry = false;
+        let mut close = mem::take(&mut self.close);
+
+        // Inherent termination: the spawned task owns the exact entry permit
+        // plus a finite close batch, then removes the same registry entry if
+        // this was the final release.
+        tokio::spawn(
+            async move {
+                let _permit = permit;
+                close.close_all().await;
+                if remove_entry {
+                    network.remove_entry_if_current(&key, &entry);
+                }
+            }
+            .in_current_span(),
+        );
+    }
+}
+
 impl PendingBindRegistration {
+    fn close_new_bindings(&mut self) -> CloseBatch {
+        let mut close = CloseBatch::new();
+        close.extend(
+            mem::take(&mut self.new_bindings)
+                .into_iter()
+                .map(|(_, _, iface)| iface),
+        );
+        close
+    }
+
+    fn abandon_uncommitted_entry(
+        network: Arc<Network>,
+        permit: BindEntryPermit,
+        mut close: CloseBatch,
+    ) {
+        let remove_entry = {
+            let mut state = permit.entry.lock_state();
+            let remove_entry = state.refcount == 0 && state.bound.is_empty();
+            if remove_entry {
+                state.closing = true;
+            }
+            remove_entry
+        };
+
+        if close.is_empty() {
+            if remove_entry {
+                network.remove_entry_if_current(&permit.key, &permit.entry);
+            }
+            return;
+        }
+
+        let key = permit.key.clone();
+        let entry = permit.entry.clone();
+
+        // Inherent termination: the spawned task owns the uncommitted
+        // interfaces and exact entry permit, closes the finite batch, then
+        // removes the still-unowned registry entry when appropriate.
+        tokio::spawn(
+            async move {
+                let _permit = permit;
+                close.close_all().await;
+                if remove_entry {
+                    network.remove_entry_if_current(&key, &entry);
+                }
+            }
+            .in_current_span(),
+        );
+    }
+
     fn plan_current_devices_bind(&self, devices: &'static Devices) -> Vec<BindUri> {
         let permit = self.permit.as_ref().expect("pending bind has permit");
         let state = permit.entry.lock_state();
@@ -946,11 +1077,15 @@ impl PendingBindRegistration {
             let mut state = permit.entry.lock_state();
             debug_assert!(!state.closing, "permit should not commit a closing entry");
             state.refcount += 1;
+            let mut close = CloseBatch::new();
             for (key, uri, iface) in new_bindings {
                 if let std::collections::hash_map::Entry::Vacant(slot) = state.bound.entry(key) {
                     slot.insert((uri, iface));
+                } else {
+                    close.push(iface);
                 }
             }
+            drop(close);
         }
 
         BindHandle {
@@ -964,17 +1099,13 @@ impl PendingBindRegistration {
 
 impl Drop for PendingBindRegistration {
     fn drop(&mut self) {
-        if self.new_bindings.is_empty() {
+        let close = self.close_new_bindings();
+        let Some(permit) = self.permit.take() else {
+            drop(close);
             return;
-        }
+        };
 
-        let mut close = CloseBatch::new();
-        close.extend(
-            mem::take(&mut self.new_bindings)
-                .into_iter()
-                .map(|(_, _, iface)| iface),
-        );
-        drop(close);
+        Self::abandon_uncommitted_entry(self.network.clone(), permit, close);
     }
 }
 
@@ -1230,7 +1361,7 @@ impl Network {
         let permit = self
             .acquire_or_insert_entry(key, driver_erased.clone())
             .await;
-        let mut pending = permit.begin_bind_registration();
+        let mut pending = permit.begin_bind_registration(self.clone());
 
         for uri in pending.plan_current_devices_bind(self.devices) {
             let iface = driver_erased.bind(self, uri.clone()).await;
@@ -1242,7 +1373,7 @@ impl Network {
 
     /// Release a previously registered [`BindPattern`] and its bound
     /// interfaces.
-    async fn release_exact_entry(&self, key: BindRegistryKey, entry: Arc<BindsEntry>) {
+    async fn release_exact_entry(self: &Arc<Self>, key: BindRegistryKey, entry: Arc<BindsEntry>) {
         let Some(permit) = self
             .acquire_existing_entry(key.clone(), entry.clone())
             .await
@@ -1250,13 +1381,7 @@ impl Network {
             return;
         };
 
-        let release = permit.release_one_handle();
-        let remove_entry = release.remove_entry;
-        release.close.close_all().await;
-
-        if remove_entry {
-            self.remove_entry_if_current(&key, &entry);
-        }
+        permit.release_one_handle(self.clone()).finish().await;
     }
 
     /// Resolve the current address for a device and IP family.
@@ -1360,7 +1485,7 @@ impl Network {
                 new_bindings.push((uri.identity_key(), uri, iface));
             }
 
-            let close =
+            let mut close =
                 permit.commit_added_device(self.devices.get(device).is_some(), new_bindings);
             close.close_all().await;
 
@@ -1379,7 +1504,8 @@ impl Network {
                 continue;
             };
 
-            permit.drain_removed_device(device).close_all().await;
+            let mut close = permit.drain_removed_device(device);
+            close.close_all().await;
         }
     }
 
@@ -1503,7 +1629,11 @@ mod tests {
     use std::{
         net::SocketAddr,
         str::FromStr,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Mutex as StdMutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        task::Waker,
         time::Duration,
     };
 
@@ -1737,6 +1867,169 @@ mod tests {
         }
     }
 
+    struct BlockingCloseControl {
+        close_started: AtomicBool,
+        release_close: AtomicBool,
+        close_waker: StdMutex<Option<Waker>>,
+        close_completed: AtomicUsize,
+        close_started_notify: tokio::sync::Notify,
+    }
+
+    impl BlockingCloseControl {
+        fn new() -> Self {
+            Self {
+                close_started: AtomicBool::new(false),
+                release_close: AtomicBool::new(false),
+                close_waker: StdMutex::new(None),
+                close_completed: AtomicUsize::new(0),
+                close_started_notify: tokio::sync::Notify::new(),
+            }
+        }
+
+        async fn wait_close_started(&self) {
+            if self.close_started.load(Ordering::SeqCst) {
+                return;
+            }
+            self.close_started_notify.notified().await;
+        }
+
+        fn release_close(&self) {
+            self.release_close.store(true, Ordering::SeqCst);
+            if let Some(waker) = self
+                .close_waker
+                .lock()
+                .expect("close waker mutex poisoned")
+                .take()
+            {
+                waker.wake();
+            }
+        }
+
+        fn complete_count(&self) -> usize {
+            self.close_completed.load(Ordering::SeqCst)
+        }
+    }
+
+    struct BlockingCloseFactory {
+        control: Arc<BlockingCloseControl>,
+    }
+
+    struct BlockingCloseIo {
+        bind_uri: BindUri,
+        control: Arc<BlockingCloseControl>,
+        closed: bool,
+    }
+
+    impl ProductIO for BlockingCloseFactory {
+        fn bind(&self, bind_uri: BindUri) -> Box<dyn crate::dquic::net::IO> {
+            Box::new(BlockingCloseIo {
+                bind_uri,
+                control: self.control.clone(),
+                closed: false,
+            })
+        }
+    }
+
+    impl crate::dquic::net::IO for BlockingCloseIo {
+        fn bind_uri(&self) -> BindUri {
+            self.bind_uri.clone()
+        }
+
+        fn bound_addr(&self) -> io::Result<SocketAddr> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "not needed"))
+        }
+
+        fn max_segment_size(&self) -> io::Result<usize> {
+            Ok(1200)
+        }
+
+        fn max_segments(&self) -> io::Result<usize> {
+            Ok(1)
+        }
+
+        fn poll_send(
+            &self,
+            _cx: &mut Context,
+            _pkts: &[io::IoSlice],
+            _route: crate::dquic::qbase::net::route::Route,
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut Context,
+            _pkts: &mut [bytes::BytesMut],
+            _route: &mut [crate::dquic::qbase::net::route::Route],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_close(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+            if self.closed {
+                return Poll::Ready(Ok(()));
+            }
+
+            self.control.close_started.store(true, Ordering::SeqCst);
+            self.control.close_started_notify.notify_one();
+
+            if self.control.release_close.load(Ordering::SeqCst) {
+                self.closed = true;
+                self.control.close_completed.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok(()))
+            } else {
+                *self
+                    .control
+                    .close_waker
+                    .lock()
+                    .expect("close waker mutex poisoned") = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    struct BlockingCloseDriver {
+        manager: Arc<crate::dquic::net::InterfaceManager>,
+        control: Arc<BlockingCloseControl>,
+    }
+
+    impl BlockingCloseDriver {
+        fn new() -> Self {
+            Self {
+                manager: Arc::new(crate::dquic::net::InterfaceManager::new()),
+                control: Arc::new(BlockingCloseControl::new()),
+            }
+        }
+
+        async fn wait_close_started(&self) {
+            self.control.wait_close_started().await;
+        }
+
+        fn release_close(&self) {
+            self.control.release_close();
+        }
+
+        fn complete_count(&self) -> usize {
+            self.control.complete_count()
+        }
+    }
+
+    impl BindDriver for BlockingCloseDriver {
+        fn bind<'a>(&'a self, _network: &'a Network, uri: BindUri) -> BoxFuture<'a, BindInterface> {
+            async move {
+                self.manager
+                    .bind(
+                        uri,
+                        Arc::new(BlockingCloseFactory {
+                            control: self.control.clone(),
+                        }),
+                    )
+                    .await
+            }
+            .boxed()
+        }
+    }
+
     struct SlowCountingDriver {
         manager: Arc<crate::dquic::net::InterfaceManager>,
         active: AtomicUsize,
@@ -1787,7 +2080,7 @@ mod tests {
             driver: bind_driver_id(driver),
             pattern: pattern.clone(),
         };
-        let close = {
+        let mut close = {
             let registry = network
                 .bind_registry
                 .lock()
@@ -2377,6 +2670,99 @@ mod tests {
 
         first.unbind().await;
         second.unbind().await;
+    }
+
+    #[tokio::test]
+    async fn canceled_pending_bind_registration_removes_unowned_entry_after_closing() {
+        let network = Network::builder().build();
+        let driver = Arc::new(CloseCountingDriver::new());
+        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+        let key = BindRegistryKey {
+            driver: bind_driver_id(&driver),
+            pattern,
+        };
+        let driver_erased: Arc<dyn BindDriver> = driver.clone();
+
+        let permit = network
+            .acquire_or_insert_entry(key.clone(), driver_erased.clone())
+            .await;
+        let mut pending = permit.begin_bind_registration(network.clone());
+        let uri: BindUri = "iface://v4.lo:0".parse().expect("valid bind uri");
+        let iface = driver_erased.bind(&network, uri.clone()).await;
+        pending.push_new_binding(uri, iface);
+
+        drop(pending);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while network.get_interfaces_with(&driver, &key.pattern).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("canceled pending registration should remove the unowned registry entry");
+
+        assert!(
+            driver.close_count() > 0,
+            "canceled pending registration should close uncommitted interfaces"
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_unbind_completes_cleanup_before_rebind() {
+        let network = Network::builder().build();
+        let driver = Arc::new(BlockingCloseDriver::new());
+        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+
+        let mut handle = network.bind_with(driver.clone(), pattern.clone()).await;
+        let unbind = tokio::spawn({
+            async move {
+                handle.unbind().await;
+            }
+            .in_current_span()
+        });
+
+        driver.wait_close_started().await;
+        unbind.abort();
+        let aborted = unbind.await.expect_err("unbind task should be aborted");
+        assert!(aborted.is_cancelled());
+
+        driver.release_close();
+
+        let mut rebound = tokio::time::timeout(
+            Duration::from_secs(1),
+            network.bind_with(driver.clone(), pattern),
+        )
+        .await
+        .expect("canceled unbind cleanup should not strand the bind key");
+
+        assert!(
+            driver.complete_count() > 0,
+            "canceled unbind cleanup should complete the pending close"
+        );
+
+        rebound.unbind().await;
+    }
+
+    #[tokio::test]
+    async fn release_exact_entry_does_not_remove_replaced_entry() {
+        let network = Network::builder().build();
+        let driver = Arc::new(TestNullDriver::new());
+        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+
+        let mut first = network.bind_with(driver.clone(), pattern.clone()).await;
+        let stale_entry = first.entry.clone();
+        let key = first.key.clone();
+        first.unbind().await;
+
+        let mut replacement = network.bind_with(driver.clone(), pattern.clone()).await;
+        network.release_exact_entry(key, stale_entry).await;
+
+        assert!(
+            network.get_interfaces_with(&driver, &pattern).is_some(),
+            "stale exact-entry release must not remove replacement entry"
+        );
+
+        replacement.unbind().await;
     }
 
     #[tokio::test]
