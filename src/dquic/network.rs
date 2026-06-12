@@ -376,21 +376,7 @@ impl QuicBindDriver {
     ) -> Result<ServerBinding, BindServerError> {
         let name = identity.name.clone();
 
-        if let Some(kv) = self.sni_registry.get(&name)
-            && let Some(existing) = kv.value().upgrade()
-            && !Arc::ptr_eq(&existing.identity, &identity)
-        {
-            return bind_server_error::SniInUseSnafu { name }.fail();
-        }
-
         let slot = self.compatible_server_slot(&server_config)?;
-
-        if let Some(kv) = self.sni_registry.get(&name)
-            && let Some(existing) = kv.value().upgrade()
-            && Arc::ptr_eq(&existing.identity, &identity)
-        {
-            return Ok(Self::server_binding_for_existing(&existing));
-        }
 
         let certified_key = crate::dquic::identity::build_certified_key(&identity)?;
         let (incomings_tx, incomings_rx) = async_channel::bounded(server_config.backlog);
