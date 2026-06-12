@@ -327,21 +327,12 @@ impl QuicBindDriver {
         });
     }
 
-    fn server_binding_for_existing(
-        existing: &Arc<ServerEntry>,
-        bind_patterns: Arc<Vec<BindPattern>>,
-    ) -> ServerBinding {
-        ServerBinding {
-            entry: Arc::new(ServerEntry {
-                identity: existing.identity.clone(),
-                certified_key: existing.certified_key.clone(),
-                incomings_tx: existing.incomings_tx.clone(),
-                incomings_rx: existing.incomings_rx.clone(),
-                config: existing.config.clone(),
-                guard: existing.guard.clone(),
-                bind: bind_patterns,
-            }),
-        }
+    fn server_binding_for_existing(existing: &Arc<ServerEntry>) -> ServerBinding {
+        let entry = existing.clone();
+        // ServerEntry holds config and guard for their drop/lifetime effects;
+        // reuse keeps those fields on the shared entry instead of rebuilding it.
+        let _ = (&entry.config, &entry.guard);
+        ServerBinding { entry }
     }
 
     fn compatible_server_slot(
@@ -386,20 +377,21 @@ impl QuicBindDriver {
         bind_patterns: Arc<Vec<BindPattern>>,
     ) -> Result<ServerBinding, BindServerError> {
         let name = identity.name.clone();
+
+        if let Some(kv) = self.sni_registry.get(&name)
+            && let Some(existing) = kv.value().upgrade()
+            && !Arc::ptr_eq(&existing.identity, &identity)
+        {
+            return bind_server_error::SniInUseSnafu { name }.fail();
+        }
+
         let slot = self.compatible_server_slot(&server_config)?;
 
         if let Some(kv) = self.sni_registry.get(&name)
             && let Some(existing) = kv.value().upgrade()
             && Arc::ptr_eq(&existing.identity, &identity)
         {
-            // NOTE: creates a new Arc<ServerEntry> sharing the existing
-            // guard. When the original entry drops before this clone,
-            // a zombie Weak<ServerEntry> lingers in sni_registry until
-            // the next bind_server call. This is benign:
-            // - SniCertResolver::resolve returns None for dead Weak
-            // - InterfaceAuthClient::verify_client_name returns SilentRefuse
-            // - Next bind_server removes the zombie via occupied.remove()
-            return Ok(Self::server_binding_for_existing(&existing, bind_patterns));
+            return Ok(Self::server_binding_for_existing(&existing));
         }
 
         let certified_key = crate::dquic::identity::build_certified_key(&identity)?;
@@ -408,12 +400,12 @@ impl QuicBindDriver {
         match self.sni_registry.entry(name.clone()) {
             Entry::Occupied(occupied) => match occupied.get().upgrade() {
                 Some(existing) if Arc::ptr_eq(&existing.identity, &identity) => {
-                    // NOTE: same shared-guard pattern as the
-                    // pre-check path above; see that comment for
-                    // the benign zombie Weak explanation.
-                    return Ok(Self::server_binding_for_existing(&existing, bind_patterns));
+                    return Ok(Self::server_binding_for_existing(&existing));
                 }
-                _ => {
+                Some(_) => {
+                    return bind_server_error::SniInUseSnafu { name }.fail();
+                }
+                None => {
                     occupied.remove();
                 }
             },
@@ -2180,7 +2172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bind_server_overwrite() {
+    async fn test_bind_server_rejects_different_identity_for_same_sni() {
         let network = Network::builder().build();
         let identity_a = make_identity("test.example.com");
         let identity_b = make_identity("test.example.com");
@@ -2192,22 +2184,24 @@ mod tests {
             .await
             .expect("first bind should succeed");
 
-        let binding_b = network
+        let err = network
             .quic()
             .bind_server(identity_b.clone(), config.clone(), Arc::new(Vec::new()))
             .await
-            .expect("second bind with different identity should succeed (overwrite)");
+            .expect_err("second bind with different identity should be rejected");
 
-        assert_eq!(binding_a.name(), binding_b.name());
+        assert!(matches!(
+            err,
+            BindServerError::SniInUse { ref name } if name == binding_a.name()
+        ));
         let quic = network.quic();
         assert_eq!(quic.sni_registry.len(), 1);
-
         let entry = quic
             .sni_registry
-            .get(binding_b.name())
+            .get(binding_a.name())
             .and_then(|kv| kv.value().upgrade())
-            .expect("registry should have the new entry");
-        assert!(Arc::ptr_eq(&entry.identity, &identity_b));
+            .expect("registry should keep the original entry");
+        assert!(Arc::ptr_eq(&entry.identity, &identity_a));
     }
 
     #[tokio::test]
@@ -2232,18 +2226,21 @@ mod tests {
         let quic = network.quic();
         assert_eq!(quic.sni_registry.len(), 1);
 
-        let entry_a = quic
+        let entry = quic
             .sni_registry
             .get(binding_a.name())
             .and_then(|kv| kv.value().upgrade())
-            .expect("registry should have the entry");
-        let entry_b = quic
+            .expect("registry should hold the shared entry");
+        assert!(Arc::ptr_eq(&entry, &binding_a.entry));
+        assert!(Arc::ptr_eq(&entry, &binding_b.entry));
+
+        drop(binding_a);
+        let entry_after_drop = quic
             .sni_registry
             .get(binding_b.name())
             .and_then(|kv| kv.value().upgrade())
-            .expect("registry should have the entry");
-
-        assert!(Arc::ptr_eq(&entry_a, &entry_b));
+            .expect("reused binding should keep SNI registered");
+        assert!(Arc::ptr_eq(&entry_after_drop, &binding_b.entry));
     }
 
     #[tokio::test]
