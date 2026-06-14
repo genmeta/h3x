@@ -2365,6 +2365,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipv4_and_ipv6_wildcard_binds_can_share_a_port_when_registered_separately() {
+        let reserve = std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve port");
+        let port = reserve.local_addr().expect("reserve addr").port();
+        drop(reserve);
+
+        let network = Network::builder().build();
+        let quic = network.quic();
+        let v6_pattern =
+            BindPattern::from_str(&format!("inet://[::]:{port}")).expect("valid v6 pattern");
+        let v4_pattern =
+            BindPattern::from_str(&format!("inet://0.0.0.0:{port}")).expect("valid v4 pattern");
+
+        let mut v6_handle = quic.clone().bind(v6_pattern.clone()).await;
+        let mut v4_handle = quic.clone().bind(v4_pattern.clone()).await;
+
+        use crate::dquic::net::IO as _;
+
+        let v6_ifaces = quic
+            .get_interfaces(&v6_pattern)
+            .expect("v6 bind should stay registered");
+        let v4_ifaces = quic
+            .get_interfaces(&v4_pattern)
+            .expect("v4 bind should stay registered");
+
+        assert_eq!(v6_ifaces.len(), 1);
+        assert_eq!(v4_ifaces.len(), 1);
+        assert!(matches!(
+            v6_ifaces[0].borrow().bound_addr().expect("v6 bound addr"),
+            std::net::SocketAddr::V6(_)
+        ));
+        assert!(matches!(
+            v4_ifaces[0].borrow().bound_addr().expect("v4 bound addr"),
+            std::net::SocketAddr::V4(_)
+        ));
+
+        v4_handle.unbind().await;
+        v6_handle.unbind().await;
+    }
+
+    #[tokio::test]
     async fn network_drop_is_not_prevented_by_background_callbacks() {
         let network = Network::builder().build();
         let weak = Arc::downgrade(&network);
