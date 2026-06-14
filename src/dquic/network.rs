@@ -3359,5 +3359,4 @@ mod tests {
         assert_ne!(before, after, "quic bind driver must replace stale IO");
         assert_eq!(factory.bind_count.load(Ordering::SeqCst), 2);
     }
-
 }
