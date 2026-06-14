@@ -818,26 +818,15 @@ impl CloseBatch {
             self.current = None;
         }
     }
-}
 
-impl Drop for CloseBatch {
-    fn drop(&mut self) {
-        if self.is_empty() {
-            return;
-        }
-
-        let mut close = Self {
-            current: self.current.take(),
-            ifaces: mem::take(&mut self.ifaces),
-        };
-        // Inherent termination: the spawned task owns a finite list of
-        // already-drained interfaces and exits after closing each one.
+    fn detach(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(
             async move {
+                let mut close = self;
                 close.close_all().await;
             }
             .in_current_span(),
-        );
+        )
     }
 }
 
@@ -1080,7 +1069,9 @@ impl PendingBindRegistration {
                     close.push(iface);
                 }
             }
-            drop(close);
+            if !close.is_empty() {
+                let _task = close.detach();
+            }
         }
 
         BindHandle {
@@ -1096,7 +1087,9 @@ impl Drop for PendingBindRegistration {
     fn drop(&mut self) {
         let close = self.close_new_bindings();
         let Some(permit) = self.permit.take() else {
-            drop(close);
+            if !close.is_empty() {
+                let _task = close.detach();
+            }
             return;
         };
 
@@ -2790,6 +2783,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aborted_detached_close_batch_does_not_respawn_cleanup() {
+        const CHILD_ENV: &str = "H3X_ABORTED_DETACHED_CLOSE_BATCH_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+
+            runtime.block_on(async {
+                let network = Network::builder().build();
+                let driver = Arc::new(BlockingCloseDriver::new());
+                let uri: BindUri = "iface://v4.lo:0".parse().expect("valid bind uri");
+                let iface = driver.bind(&network, uri).await;
+
+                let mut close = CloseBatch::new();
+                close.push(iface);
+
+                let task = close.detach();
+                driver.wait_close_started().await;
+
+                task.abort();
+                let aborted = task
+                    .await
+                    .expect_err("detached close task should be aborted");
+                assert!(aborted.is_cancelled());
+            });
+
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .arg("--exact")
+            .arg("dquic::network::tests::aborted_detached_close_batch_does_not_respawn_cleanup")
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("spawn child test binary");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "child process must exit cleanly, stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[tokio::test]
     async fn bind_state_reconciliation_ignores_only_alloc_port_id() {
         let network = Network::builder().build();
@@ -3318,4 +3359,5 @@ mod tests {
         assert_ne!(before, after, "quic bind driver must replace stale IO");
         assert_eq!(factory.bind_count.load(Ordering::SeqCst), 2);
     }
+
 }
