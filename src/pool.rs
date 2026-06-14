@@ -158,7 +158,7 @@ impl<C: quic::Connection> Pool<C> {
         );
     }
 
-    #[tracing::instrument(level = "debug", skip(self, connector), err)]
+    #[tracing::instrument(level = "debug", skip(self, connector))]
     pub async fn reuse_or_connect_with<Client>(
         &self,
         connector: &Client,
@@ -291,6 +291,7 @@ mod tests {
     use http::uri::Authority;
     use tokio::sync::Semaphore;
     use tokio_util::task::AbortOnDropHandle;
+    use tracing::Level;
 
     use super::{ConnectError, InsertError, Pool, ReuseableConnection};
     use crate::{
@@ -316,6 +317,20 @@ mod tests {
 
     fn abort_handle() -> AbortOnDropHandle<()> {
         AbortOnDropHandle::new(tokio::spawn(async {}))
+    }
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("log buffer poisoned").extend(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     fn matching_server() -> Authority {
@@ -1142,6 +1157,41 @@ mod tests {
         })
         .await;
         assert!(pool.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pool_error_path_does_not_emit_automatic_instrument_error_event() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(Level::DEBUG)
+            .with_writer({
+                let captured = Arc::clone(&captured);
+                move || SharedWriter(Arc::clone(&captured))
+            })
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let connector = TestConnector::fail("dial failed");
+        let error = pool
+            .reuse_or_connect_with(
+                &connector,
+                Arc::new(ConnectionBuilder::default()),
+                matching_server(),
+            )
+            .await
+            .expect_err("connector should fail");
+
+        assert!(matches!(error, ConnectError::Connector { .. }));
+
+        let output = String::from_utf8(captured.lock().expect("log buffer poisoned").clone())
+            .expect("log output must be valid UTF-8");
+        assert!(
+            !output.contains("ERROR"),
+            "unexpected automatic error event: {output}",
+        );
     }
 
     #[tokio::test]
