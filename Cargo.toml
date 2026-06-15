@@ -1,7 +1,7 @@
 [package]
 name = "h3x"
 description = "Peer-to-peer DHTTP/3 transport over QUIC"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 readme = "README.md"
 repository = "https://github.com/genmeta/h3x"
@@ -28,10 +28,10 @@ tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
 tracing = "0.1"
 tower-service = "0.3"
 
-dhttp-identity = { git = "https://github.com/genmeta/dhttp.git", branch = "publish", version = "0.1.0" }
+dhttp-identity = "0.1.0"
 
 # feature dquic
-dquic = { git = "https://github.com/genmeta/dquic.git", tag = "v0.5.1", version = "0.5.1", optional = true }
+dquic = { version = "0.5.1", optional = true }
 
 # feature hyper
 http-body = { version = "1", optional = true }
