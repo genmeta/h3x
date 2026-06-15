@@ -46,8 +46,60 @@ jobs:
             mode=dry-run
           fi
 
-          if [[ "$mode" == "dry-run" ]]; then
-            cargo publish --dry-run
-          else
-            cargo publish
+          package_name=h3x
+          package_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+
+          crate_state="$(
+            python3 - <<'PY' "$package_name" "$package_version"
+          import sys
+          import urllib.error
+          import urllib.request
+
+          name, version = sys.argv[1], sys.argv[2]
+          headers = {"User-Agent": "genmeta h3x publish workflow"}
+          version_url = f"https://crates.io/api/v1/crates/{name}/{version}"
+          version_request = urllib.request.Request(version_url, headers=headers)
+          try:
+              with urllib.request.urlopen(version_request, timeout=20) as response:
+                  if response.status == 200:
+                      print("published_version")
+                  else:
+                      raise SystemExit(f"unexpected crates.io status for {name} {version}: {response.status}")
+          except urllib.error.HTTPError as error:
+              if error.code == 404:
+                  crate_url = f"https://crates.io/api/v1/crates/{name}"
+                  crate_request = urllib.request.Request(crate_url, headers=headers)
+                  try:
+                      with urllib.request.urlopen(crate_request, timeout=20) as response:
+                          if response.status == 200:
+                              print("missing_version")
+                          else:
+                              raise SystemExit(f"unexpected crates.io crate status for {name}: {response.status}")
+                  except urllib.error.HTTPError as crate_error:
+                      if crate_error.code == 404:
+                          print("missing_crate")
+                      else:
+                          raise
+              else:
+                  raise
+          PY
+          )"
+
+          if [[ "$crate_state" == "published_version" ]]; then
+            echo "skip $package_name $package_version (already on crates.io)"
+            exit 0
           fi
+
+          if [[ "$crate_state" == "missing_crate" ]]; then
+            echo "skip $package_name $package_version (crate not yet initialized on crates.io)"
+            exit 0
+          fi
+
+          if [[ "$mode" == "dry-run" ]]; then
+            echo "dry-run $package_name $package_version"
+            cargo publish --dry-run
+            exit 0
+          fi
+
+          echo "publish $package_name $package_version"
+          cargo publish
