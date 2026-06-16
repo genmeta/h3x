@@ -5,4 +5,5 @@ pub mod message;
 pub mod protocol;
 pub mod settings;
 pub mod stream;
+#[cfg(feature = "webtransport")]
 pub mod webtransport;

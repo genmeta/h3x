@@ -713,21 +713,17 @@ pub(crate) mod tests {
     use futures::{Sink, SinkExt, future::BoxFuture, stream::Stream};
     use tracing::Instrument;
 
-    #[cfg(feature = "dquic")]
-    use super::ConnectionBuilder;
-    use super::{Connection, ConnectionState, LifecycleExt, StreamError};
-    #[cfg(feature = "dquic")]
+    use super::{Connection, ConnectionBuilder, ConnectionState, LifecycleExt, StreamError};
     use crate::{
         codec::{BoxPeekableStreamReader, BoxStreamWriter},
-        dhttp::settings::{MaxFieldSectionSize, Settings},
-        protocol::{ProductProtocol, Protocol, StreamVerdict},
-    };
-    use crate::{
+        dhttp::settings::Settings,
         error::{Code, H3MessageError, H3MissingSettings},
-        protocol::Protocols,
+        protocol::{Protocol, Protocols, StreamVerdict},
         quic::{self, ConnectionError, ResetStreamExt, StopStreamExt},
         varint::VarInt,
     };
+    #[cfg(feature = "dquic")]
+    use crate::{dhttp::settings::MaxFieldSectionSize, protocol::ProductProtocol};
 
     #[derive(Debug)]
     pub(crate) struct TestLocalAuthority;
@@ -879,6 +875,7 @@ pub(crate) mod tests {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
+        #[cfg(feature = "dquic")]
         pub(crate) fn disable_stream_ops(&self) {
             self.state
                 .stream_ops_available
@@ -1049,11 +1046,9 @@ pub(crate) mod tests {
     }
 
     /// Local mock protocol for builder tests.
-    #[cfg(feature = "dquic")]
     #[derive(Debug)]
     struct MockProtocol;
 
-    #[cfg(feature = "dquic")]
     impl Protocol for MockProtocol {
         fn accept_uni<'a>(
             &'a self,

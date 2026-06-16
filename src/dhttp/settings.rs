@@ -73,8 +73,18 @@ impl H3ConnectionError for InvalidSettingValue {
 const fn is_boolean_setting(id: VarInt) -> bool {
     let id = id.into_inner();
     id == crate::extended_connect::settings::EnableConnectProtocol::ID.into_inner()
-        || id == crate::dhttp::webtransport::settings::EnableWebTransport::ID.into_inner()
         || id == crate::dhttp::datagram::settings::H3Datagram::ID.into_inner()
+        || is_webtransport_boolean_setting(id)
+}
+
+#[cfg(feature = "webtransport")]
+const fn is_webtransport_boolean_setting(id: u64) -> bool {
+    id == crate::dhttp::webtransport::settings::EnableWebTransport::ID.into_inner()
+}
+
+#[cfg(not(feature = "webtransport"))]
+const fn is_webtransport_boolean_setting(_id: u64) -> bool {
+    false
 }
 
 impl<S: AsyncRead + Send> DecodeFrom<S> for Setting {
@@ -354,10 +364,12 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use super::*;
+    #[cfg(feature = "webtransport")]
+    use crate::dhttp::webtransport::settings::EnableWebTransport;
     use crate::{
         codec::{DecodeError, DecodeExt, EncodeExt},
         connection,
-        dhttp::{datagram::settings::H3Datagram, webtransport::settings::EnableWebTransport},
+        dhttp::datagram::settings::H3Datagram,
         extended_connect::settings::EnableConnectProtocol,
         quic,
         varint::VarInt,
@@ -513,14 +525,18 @@ mod tests {
 
     #[test]
     fn boolean_setting_validation_uses_new_owner_modules() {
-        for id in [
-            EnableConnectProtocol::ID,
-            EnableWebTransport::ID,
-            H3Datagram::ID,
-        ] {
+        for id in [EnableConnectProtocol::ID, H3Datagram::ID] {
             let err = Setting::new(id, VarInt::from_u32(2))
                 .check()
                 .expect_err("boolean setting value 2 must be rejected");
+            assert!(matches!(err, InvalidSettingValue::BoolSetting { .. }));
+        }
+
+        #[cfg(feature = "webtransport")]
+        {
+            let err = Setting::new(EnableWebTransport::ID, VarInt::from_u32(2))
+                .check()
+                .expect_err("webtransport boolean setting value 2 must be rejected");
             assert!(matches!(err, InvalidSettingValue::BoolSetting { .. }));
         }
     }
@@ -596,6 +612,7 @@ mod tests {
         );
         assert!(settings.enable_connect_protocol());
         assert!(settings.h3_datagram());
+        #[cfg(feature = "webtransport")]
         assert!(!settings.enable_webtransport());
 
         let borrowed: Vec<_> = (&settings).into_iter().collect();
@@ -754,7 +771,7 @@ mod tests {
 
         let mut invalid = BufList::new();
         invalid
-            .encode_one(Setting::new(EnableWebTransport::ID, VarInt::from_u32(2)))
+            .encode_one(Setting::new(H3Datagram::ID, VarInt::from_u32(2)))
             .await
             .expect("setting encoding into buflist is infallible");
         let error = invalid
@@ -762,6 +779,24 @@ mod tests {
             .await
             .err()
             .expect("invalid boolean setting must fail to decode");
+        assert_h3_connection_code(error, Code::H3_SETTINGS_ERROR);
+    }
+
+    #[cfg(feature = "webtransport")]
+    #[tokio::test]
+    async fn setting_decode_rejects_invalid_webtransport_bool_when_feature_enabled() {
+        let mut invalid = BufList::new();
+        invalid
+            .encode_one(Setting::new(EnableWebTransport::ID, VarInt::from_u32(2)))
+            .await
+            .expect("setting encoding into buflist is infallible");
+
+        let error = invalid
+            .decode::<Setting>()
+            .await
+            .err()
+            .expect("invalid webtransport boolean setting must fail to decode");
+
         assert_h3_connection_code(error, Code::H3_SETTINGS_ERROR);
     }
 

@@ -18,20 +18,26 @@ Peer-to-peer DHTTP/3 transport over QUIC, implemented in Rust.
 h3x includes `dquic` as its built-in QUIC backend (feature `dquic`, enabled by default). Wrap a `QuicEndpoint` in an `H3Endpoint` to get HTTP/3 client and server semantics on top of QUIC.
 
 ```rust,no_run
+use bytes::Bytes;
 use h3x::{dquic::QuicEndpoint, endpoint::H3Endpoint};
+use http_body_util::{BodyExt, Empty};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = H3Endpoint::new(QuicEndpoint::new().await);
 
-    let mut response = endpoint.get("https://example.com:4433/hello".parse()?).await?;
+    let connection = endpoint.connect("example.com:4433".parse()?).await?;
+    let request = http::Request::get("https://example.com:4433/hello")
+        .body(Empty::<Bytes>::new())?;
+    let response = connection.execute_hyper_request(request).await?;
     assert_eq!(response.status(), http::StatusCode::OK);
-    println!("{}", response.read_to_string().await?);
+    let body = response.into_body().collect().await?.to_bytes();
+    println!("{}", String::from_utf8_lossy(&body));
     Ok(())
 }
 ```
 
-```rust,no_run
+```rust,ignore
 use std::sync::Arc;
 use axum::{Router as AxumRouter, routing::get};
 use h3x::{
@@ -43,7 +49,7 @@ use h3x::{
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let identity = Arc::new(Identity {
-        name: Name::from_static("localhost")?,
+        name: "localhost".parse()?,
         certs: todo!("load your certificate chain"),
         key: todo!("load your private key"),
         ocsp: Arc::new(None),
@@ -73,7 +79,7 @@ h3x provides adapters to bridge the Tower / hyper service ecosystem into DHTTP/3
 > - `h3x::hyper::upgrade` — stream takeover for Extended CONNECT tunnels (instead of `hyper::upgrade`)
 > - `h3x::hyper::ext::Protocol` — protocol indication in CONNECT requests (instead of `hyper::ext::Protocol`)
 
-```rust,no_run
+```rust,ignore
 use std::sync::Arc;
 use axum::{Router as AxumRouter, routing::get};
 use h3x::{
@@ -89,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = TowerService(router.into_service());
 
     let identity = Arc::new(Identity {
-        name: Name::from_static("localhost")?,
+        name: "localhost".parse()?,
         certs: todo!("load your certificate chain"),
         key: todo!("load your private key"),
         ocsp: Arc::new(None),
@@ -107,15 +113,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 ```rust,no_run
+use bytes::Bytes;
 use h3x::{dquic::QuicEndpoint, endpoint::H3Endpoint};
+use http_body_util::{BodyExt, Empty};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = H3Endpoint::new(QuicEndpoint::new().await);
 
-    let mut response = endpoint.get("https://example.com:4433/hello".parse()?).await?;
+    let connection = endpoint.connect("example.com:4433".parse()?).await?;
+    let request = http::Request::get("https://example.com:4433/hello")
+        .body(Empty::<Bytes>::new())?;
+    let response = connection.execute_hyper_request(request).await?;
     assert_eq!(response.status(), http::StatusCode::OK);
-    let body = response.read_to_bytes().await?;
+    let body = response.into_body().collect().await?.to_bytes();
     println!("{}", String::from_utf8_lossy(&body));
     Ok(())
 }
