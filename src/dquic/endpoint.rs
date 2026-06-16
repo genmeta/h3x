@@ -217,6 +217,14 @@ impl QuicEndpoint {
     }
 }
 
+impl quic::WithLocalAuthority for QuicEndpoint {
+    type LocalAuthority = Identity;
+
+    async fn local_authority(&self) -> Result<Option<Self::LocalAuthority>, quic::ConnectionError> {
+        Ok(self.identity().as_deref().cloned())
+    }
+}
+
 #[bon]
 impl QuicEndpoint {
     #[builder]
@@ -968,17 +976,34 @@ impl QuicEndpoint {
 mod tests {
     use std::any::TypeId;
 
+    use dhttp_identity::identity::LocalAuthority as IdentityLocalAuthority;
     use rustls::{RootCertStore, client::WebPkiServerVerifier, pki_types::PrivateKeyDer};
 
     use super::*;
-    use crate::dquic::{cert::handy::ToCertificate, resolver::handy::SystemResolver};
+    use crate::{
+        dquic::{
+            cert::handy::{ToCertificate, ToPrivateKey},
+            resolver::handy::SystemResolver,
+        },
+        quic::WithLocalAuthority as _,
+    };
 
     const CA_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/ca.cert");
+    const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");
+    const SERVER_KEY: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
 
     fn root_store_with_ca() -> RootCertStore {
         let mut store = RootCertStore::empty();
         store.add_parsable_certificates(CA_CERT.to_certificate());
         store
+    }
+
+    fn make_signing_identity(name: &str) -> Identity {
+        Identity::new(
+            name.parse().expect("valid identity name"),
+            SERVER_CERT.to_certificate(),
+            SERVER_KEY.to_private_key(),
+        )
     }
 
     #[tokio::test]
@@ -1017,6 +1042,57 @@ mod tests {
 
         let result = endpoint.accept().await;
         assert!(matches!(result, Err(AcceptError::ServerUnavailable)));
+    }
+
+    #[tokio::test]
+    async fn local_authority_is_none_for_anonymous_endpoint() {
+        let endpoint = make_endpoint().await;
+
+        let local = endpoint
+            .local_authority()
+            .await
+            .expect("endpoint local authority lookup should not fail");
+
+        assert!(local.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_authority_returns_configured_identity() {
+        let identity = Arc::new(make_signing_identity("localhost"));
+        let endpoint = QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .resolver(Arc::new(SystemResolver))
+            .identity(identity.clone())
+            .client(ClientQuicConfig::default())
+            .server(ServerQuicConfig::default())
+            .build()
+            .await;
+
+        let local = endpoint
+            .local_authority()
+            .await
+            .expect("endpoint local authority lookup should not fail")
+            .expect("configured endpoint should expose local authority");
+
+        assert_eq!(IdentityLocalAuthority::name(&local), identity.name.as_str());
+        assert_eq!(
+            IdentityLocalAuthority::cert_chain(&local),
+            identity.cert_chain()
+        );
+
+        let signature = IdentityLocalAuthority::sign(&local, b"payload")
+            .await
+            .expect("signature");
+        assert!(
+            IdentityLocalAuthority::verify(&local, b"payload", &signature)
+                .await
+                .expect("verification should run")
+        );
+        assert!(
+            !IdentityLocalAuthority::verify(&local, b"different payload", &signature)
+                .await
+                .expect("verification should run")
+        );
     }
 
     #[tokio::test]
