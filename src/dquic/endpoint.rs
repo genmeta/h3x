@@ -389,14 +389,18 @@ impl QuicEndpoint {
         // Inherent termination: this companion task tracks local
         // address changes for the accepted connection. It exits when
         // (a) conn is dropped (weak.upgrade fails), (b) conn terminates,
-        // or (c) the locations observer channel is exhausted.
+        // or (c) the locations observer channel is exhausted. The
+        // terminated future is created from a temporary strong reference
+        // that is dropped before the task waits on close or location events.
         tokio::spawn(
             async move {
                 let mut local_addresses = LocalAddressTracker::default();
                 loop {
-                    let Some(c) = weak.upgrade() else { break };
+                    let Some(terminated) = weak.upgrade().map(|c| c.terminated()) else {
+                        break;
+                    };
                     tokio::select! {
-                        _ = c.terminated() => break,
+                        _ = terminated => break,
                         event = observer.recv() => {
                             let Some((bind_uri, event)) = event else { break };
                             if !patterns.iter().any(|p| p.matches(&bind_uri)) {
@@ -880,9 +884,11 @@ impl QuicEndpoint {
         let weak = Arc::downgrade(&connection);
         // Inherent termination: this path-discovery companion drains remaining
         // DNS results and local address events after connect has established
-        // that the connection will not leak. It exits when (a) connection is
-        // dropped (weak.upgrade fails), (b) connection terminates, or (c) both
-        // DNS and observer streams are exhausted.
+        // that the connection will not leak. It creates the terminated future
+        // from a temporary strong reference, then drops that reference before
+        // awaiting DNS, location, or close events. It exits when (a) connection
+        // is dropped (weak.upgrade fails), (b) connection terminates, or (c)
+        // both DNS and observer streams are exhausted.
         tokio::spawn(
             async move {
                 let mut local_addresses = local_addresses;
@@ -892,10 +898,12 @@ impl QuicEndpoint {
                     if dns_done && locations_done {
                         break;
                     }
-                    let Some(c) = weak.upgrade() else { break };
+                    let Some(terminated) = weak.upgrade().map(|c| c.terminated()) else {
+                        break;
+                    };
                     tokio::select! {
                         biased;
-                        _ = c.terminated() => break,
+                        _ = terminated => break,
                         result = server_eps.next(), if !dns_done => {
                             let Some((s, e)) = result else {
                                 dns_done = true;
@@ -1503,6 +1511,49 @@ mod tests {
         })
         .await
         .expect("moved tracker should remove the pre-connect direct local endpoint");
+    }
+
+    #[tokio::test]
+    async fn path_discovery_companion_does_not_hold_connection_while_waiting_for_events() {
+        use crate::dquic::qinterface::component::location::Locations;
+
+        let endpoint = QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .build()
+            .await;
+        let tls = endpoint.ensure_client().expect("client tls");
+        let connection = endpoint
+            .build_client_connection("remote.test", tls)
+            .expect("client connection");
+        let locations = Locations::new();
+        let observer = locations.subscribe();
+        let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+        let mut polled_tx = Some(polled_tx);
+        let server_eps = futures::stream::poll_fn(move |_cx| {
+            if let Some(tx) = polled_tx.take() {
+                let _ = tx.send(());
+            }
+            std::task::Poll::Pending
+        });
+
+        QuicEndpoint::spawn_path_discovery_companion(
+            Arc::new(Vec::new()),
+            connection.clone(),
+            server_eps,
+            observer,
+            LocalAddressTracker::default(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), polled_rx)
+            .await
+            .expect("companion should poll the DNS stream")
+            .expect("poll signal should be delivered");
+
+        assert_eq!(
+            Arc::strong_count(&connection),
+            1,
+            "idle companion task must not keep the connection alive"
+        );
     }
 
     #[tokio::test]
