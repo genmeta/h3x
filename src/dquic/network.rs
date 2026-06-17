@@ -48,6 +48,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use dashmap::DashMap;
@@ -80,7 +81,11 @@ use crate::dquic::{
 };
 // Internal implementation types — not part of curated domain modules
 use crate::dquic::{
-    qbase::packet::Packet,
+    qbase::{
+        error::{Error as QuicBaseError, ErrorKind, QuicError},
+        frame::ConnectionCloseFrame,
+        packet::Packet,
+    },
     qconnection::builder::ConnectionFoundation,
     qinterface::{
         component::{
@@ -97,6 +102,38 @@ use crate::dquic::{
 
 pub(crate) type SniRegistry = Arc<DashMap<Name<'static>, Weak<ServerEntry>>>;
 type BoundInterfaces = HashMap<BindUri, BindInterface>;
+const SERVER_NAME_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const PENDING_CONNECTION_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn close_pending_connection(conn: Arc<Connection>, reason: &'static str) {
+    let error = QuicError::with_default_fty(ErrorKind::ConnectionRefused, reason);
+    if let Err(error) = conn.enter_closing(error.clone()) {
+        tracing::trace!(
+            error = %error,
+            reason,
+            "pending quic connection already closing"
+        );
+    }
+    if !conn.enter_draining(ConnectionCloseFrame::from(QuicBaseError::Quic(error))) {
+        tracing::trace!(reason, "pending quic connection already draining");
+    }
+
+    match tokio::time::timeout(PENDING_CONNECTION_TERMINATION_TIMEOUT, conn.terminated()).await {
+        Ok(error) => {
+            tracing::trace!(
+                error = %error,
+                reason,
+                "pending quic connection terminated"
+            );
+        }
+        Err(_) => {
+            tracing::debug!(
+                reason,
+                "timed out waiting for pending quic connection termination"
+            );
+        }
+    }
+}
 
 fn interface_contains(interface: &::dquic::qinterface::device::Interface, ip: IpAddr) -> bool {
     match ip {
@@ -363,7 +400,14 @@ impl QuicBindDriver {
         let slot = Arc::new(ServerConfig {
             config: server_config.clone(),
             rustls_config,
+            handshake_backlog: Arc::new(tokio::sync::Semaphore::new(server_config.backlog)),
         });
+        tracing::info!(
+            backlog = server_config.backlog,
+            handshake_timeout_ms = SERVER_NAME_HANDSHAKE_TIMEOUT.as_millis(),
+            cleanup_timeout_ms = PENDING_CONNECTION_TERMINATION_TIMEOUT.as_millis(),
+            "quic sni handshake guard enabled"
+        );
         *slot_guard = Arc::downgrade(&slot);
         Ok(slot)
     }
@@ -558,6 +602,10 @@ impl QuicBindDriver {
         // Build the connection synchronously so the CID is registered in
         // QuicRouter before the first packet is delivered.
         let sni_registry = driver.sni_registry.clone();
+        let Ok(handshake_permit) = slot.handshake_backlog.clone().try_acquire_owned() else {
+            tracing::debug!("quic handshake backlog full, dropping initial packet");
+            return;
+        };
 
         let foundation = Connection::new_server(slot.config.token_provider.clone())
             .with_parameters(slot.config.parameters.clone())
@@ -587,22 +635,33 @@ impl QuicBindDriver {
         // closed, or connection name resolution fails.
         tokio::spawn(
             async move {
+                let _handshake_permit = handshake_permit;
+
                 quic_router.deliver(packet, (bind_uri, pathway, link)).await;
 
                 // server_name() waits for TLS handshake info — do NOT call
                 // handshaked() here; for server role it blocks until a Data
                 // packet arrives, which would deadlock the test until timeout.
-                let sni = match conn.server_name().await {
-                    Ok(name) => name,
-                    Err(e) => {
-                        let report = snafu::Report::from_error(&e);
-                        tracing::debug!(
-                            error = %report,
-                            "failed to get server name"
-                        );
-                        return;
-                    }
-                };
+                let sni =
+                    match tokio::time::timeout(SERVER_NAME_HANDSHAKE_TIMEOUT, conn.server_name())
+                        .await
+                    {
+                        Err(_) => {
+                            tracing::debug!("timed out waiting for server name");
+                            close_pending_connection(conn, "server name timeout").await;
+                            return;
+                        }
+                        Ok(Ok(name)) => name,
+                        Ok(Err(e)) => {
+                            let report = snafu::Report::from_error(&e);
+                            tracing::debug!(
+                                error = %report,
+                                "failed to get server name"
+                            );
+                            close_pending_connection(conn, "server name failed").await;
+                            return;
+                        }
+                    };
 
                 let sni_lower = sni.to_ascii_lowercase();
                 if let Some(entry) = sni_registry
@@ -611,11 +670,22 @@ impl QuicBindDriver {
                 {
                     let incomings_tx = entry.incomings_tx.clone();
                     drop(entry);
-                    if incomings_tx.send(conn).await.is_err() {
-                        tracing::debug!(
-                            name = %sni,
-                            "sni channel closed"
-                        );
+                    match incomings_tx.try_send(conn) {
+                        Ok(()) => {}
+                        Err(async_channel::TrySendError::Full(conn)) => {
+                            tracing::debug!(
+                                name = %sni,
+                                "sni queue full, dropping connection"
+                            );
+                            close_pending_connection(conn, "sni queue full").await;
+                        }
+                        Err(async_channel::TrySendError::Closed(conn)) => {
+                            tracing::debug!(
+                                name = %sni,
+                                "sni channel closed"
+                            );
+                            close_pending_connection(conn, "sni channel closed").await;
+                        }
                     }
                     return;
                 }
@@ -623,6 +693,7 @@ impl QuicBindDriver {
                     name = %sni,
                     "no endpoint registered for SNI"
                 );
+                close_pending_connection(conn, "unregistered sni").await;
             }
             .in_current_span(),
         );

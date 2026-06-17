@@ -2005,6 +2005,7 @@ mod tests {
         let sni_config = Arc::new(SniServerConfig {
             config: ServerQuicConfig::default(),
             rustls_config,
+            handshake_backlog: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
         let entry = Arc::new(ServerEntry {
