@@ -84,6 +84,7 @@ use crate::dquic::{
     qconnection::builder::ConnectionFoundation,
     qinterface::{
         component::{
+            alive::is_alive,
             location::LocationsComponent,
             route::{QuicRouterComponent, Way},
         },
@@ -210,13 +211,50 @@ impl BindDriver for QuicBindDriver {
 
     fn rebind<'a>(&'a self, _network: &'a Network, iface: &'a BindInterface) -> BoxFuture<'a, ()> {
         async move {
-            iface.rebind().await;
+            if self.should_rebind_changed_iface(iface).await {
+                iface.rebind().await;
+            }
         }
         .boxed()
     }
 }
 
 impl QuicBindDriver {
+    async fn should_rebind_changed_iface(&self, iface: &BindInterface) -> bool {
+        let bind_uri = iface.bind_uri();
+        if bind_uri.is_temporary() || bind_uri.as_iface_bind_uri().is_none() {
+            return true;
+        }
+
+        match is_alive(&iface.borrow()).await {
+            Ok(()) => {
+                tracing::debug!(
+                    bind_uri = %bind_uri,
+                    "skipping interface-change rebind because interface is still alive"
+                );
+                false
+            }
+            Err(error) if error.is_recoverable() => {
+                let report = snafu::Report::from_error(&error);
+                tracing::debug!(
+                    bind_uri = %bind_uri,
+                    error = %report,
+                    "rebind interface after changed-interface health check failed"
+                );
+                true
+            }
+            Err(error) => {
+                let report = snafu::Report::from_error(&error);
+                tracing::debug!(
+                    bind_uri = %bind_uri,
+                    error = %report,
+                    "skipping interface-change rebind after unrecoverable health-check failure"
+                );
+                false
+            }
+        }
+    }
+
     fn registry_id(&self) -> BindDriverId {
         BindDriverId(self as *const Self as *const () as usize)
     }
@@ -3398,5 +3436,290 @@ mod tests {
         let after = iface.borrow().bound_addr().expect("rebound addr");
         assert_ne!(before, after, "quic bind driver must replace stale IO");
         assert_eq!(factory.bind_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn quic_bind_driver_changed_event_skips_rebind_when_interface_is_alive() {
+        use std::{
+            net::SocketAddr,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::Poll,
+        };
+
+        use bytes::BytesMut;
+        use dquic::qbase::net::route::Route;
+
+        #[derive(Debug)]
+        struct HealthyIfaceFactory {
+            bind_count: AtomicUsize,
+        }
+
+        #[derive(Debug)]
+        struct HealthyIfaceIo {
+            bind_uri: BindUri,
+            addr: SocketAddr,
+        }
+
+        impl ProductIO for HealthyIfaceFactory {
+            fn bind(&self, bind_uri: BindUri) -> Box<dyn crate::dquic::net::IO> {
+                let bind_count = self.bind_count.fetch_add(1, Ordering::SeqCst);
+                Box::new(HealthyIfaceIo {
+                    bind_uri,
+                    addr: SocketAddr::from(([127, 0, 0, 1], 20_000 + bind_count as u16)),
+                })
+            }
+        }
+
+        impl crate::dquic::net::IO for HealthyIfaceIo {
+            fn bind_uri(&self) -> BindUri {
+                self.bind_uri.clone()
+            }
+
+            fn bound_addr(&self) -> io::Result<SocketAddr> {
+                Ok(self.addr)
+            }
+
+            fn max_segment_size(&self) -> io::Result<usize> {
+                Ok(1200)
+            }
+
+            fn max_segments(&self) -> io::Result<usize> {
+                Ok(1)
+            }
+
+            fn poll_send(
+                &self,
+                _cx: &mut Context,
+                _pkts: &[io::IoSlice],
+                _route: Route,
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(1))
+            }
+
+            fn poll_recv(
+                &self,
+                _cx: &mut Context,
+                _pkts: &mut [BytesMut],
+                _route: &mut [Route],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+
+            fn poll_close(&mut self, _cx: &mut Context) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let factory = Arc::new(HealthyIfaceFactory {
+            bind_count: AtomicUsize::new(0),
+        });
+        let manager = Arc::new(InterfaceManager::new());
+        let network = Network::build_with_quic_driver(Devices::global(), |network| {
+            QuicBindDriver::builder()
+                .network(network)
+                .iface_manager(manager)
+                .io_factory(factory.clone())
+                .build()
+        });
+        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid bind pattern");
+
+        let quic = network.quic();
+        let mut handle = quic.clone().bind(pattern).await;
+
+        network.reconcile_event(&changed_event("lo")).await;
+
+        assert_eq!(
+            factory.bind_count.load(Ordering::SeqCst),
+            1,
+            "changed event must not rebind an interface that still passes the liveness check"
+        );
+
+        handle.unbind().await;
+    }
+
+    #[tokio::test]
+    async fn quic_bind_driver_changed_event_rebinds_when_interface_is_broken() {
+        use std::{
+            net::SocketAddr,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+            },
+            task::Poll,
+        };
+
+        use bytes::BytesMut;
+        use dquic::qbase::net::route::Route;
+
+        #[derive(Debug)]
+        struct RecoveringIfaceFactory {
+            bind_count: AtomicUsize,
+            broken: Arc<AtomicBool>,
+        }
+
+        #[derive(Debug)]
+        struct ChangeSensitiveIo {
+            bind_uri: BindUri,
+            broken: Arc<AtomicBool>,
+            healthy_addr: SocketAddr,
+            broken_addr: SocketAddr,
+        }
+
+        #[derive(Debug)]
+        struct RecoveredIo {
+            bind_uri: BindUri,
+            addr: SocketAddr,
+        }
+
+        impl ProductIO for RecoveringIfaceFactory {
+            fn bind(&self, bind_uri: BindUri) -> Box<dyn crate::dquic::net::IO> {
+                let bind_count = self.bind_count.fetch_add(1, Ordering::SeqCst);
+                if bind_count == 0 {
+                    Box::new(ChangeSensitiveIo {
+                        bind_uri,
+                        broken: self.broken.clone(),
+                        healthy_addr: SocketAddr::from(([127, 0, 0, 1], 21_000)),
+                        broken_addr: SocketAddr::from(([127, 0, 0, 2], 21_000)),
+                    })
+                } else {
+                    Box::new(RecoveredIo {
+                        bind_uri,
+                        addr: SocketAddr::from(([127, 0, 0, 1], 21_001)),
+                    })
+                }
+            }
+        }
+
+        impl crate::dquic::net::IO for ChangeSensitiveIo {
+            fn bind_uri(&self) -> BindUri {
+                self.bind_uri.clone()
+            }
+
+            fn bound_addr(&self) -> io::Result<SocketAddr> {
+                Ok(if self.broken.load(Ordering::SeqCst) {
+                    self.broken_addr
+                } else {
+                    self.healthy_addr
+                })
+            }
+
+            fn max_segment_size(&self) -> io::Result<usize> {
+                Ok(1200)
+            }
+
+            fn max_segments(&self) -> io::Result<usize> {
+                Ok(1)
+            }
+
+            fn poll_send(
+                &self,
+                _cx: &mut Context,
+                _pkts: &[io::IoSlice],
+                _route: Route,
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(1))
+            }
+
+            fn poll_recv(
+                &self,
+                _cx: &mut Context,
+                _pkts: &mut [BytesMut],
+                _route: &mut [Route],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+
+            fn poll_close(&mut self, _cx: &mut Context) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl crate::dquic::net::IO for RecoveredIo {
+            fn bind_uri(&self) -> BindUri {
+                self.bind_uri.clone()
+            }
+
+            fn bound_addr(&self) -> io::Result<SocketAddr> {
+                Ok(self.addr)
+            }
+
+            fn max_segment_size(&self) -> io::Result<usize> {
+                Ok(1200)
+            }
+
+            fn max_segments(&self) -> io::Result<usize> {
+                Ok(1)
+            }
+
+            fn poll_send(
+                &self,
+                _cx: &mut Context,
+                _pkts: &[io::IoSlice],
+                _route: Route,
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(1))
+            }
+
+            fn poll_recv(
+                &self,
+                _cx: &mut Context,
+                _pkts: &mut [BytesMut],
+                _route: &mut [Route],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+
+            fn poll_close(&mut self, _cx: &mut Context) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let broken = Arc::new(AtomicBool::new(false));
+        let factory = Arc::new(RecoveringIfaceFactory {
+            bind_count: AtomicUsize::new(0),
+            broken: broken.clone(),
+        });
+        let manager = Arc::new(InterfaceManager::new());
+        let network = Network::build_with_quic_driver(Devices::global(), |network| {
+            QuicBindDriver::builder()
+                .network(network)
+                .iface_manager(manager)
+                .io_factory(factory.clone())
+                .build()
+        });
+        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid bind pattern");
+
+        let quic = network.quic();
+        let mut handle = quic.clone().bind(pattern.clone()).await;
+        let before = quic
+            .get_interfaces(&pattern)
+            .and_then(|mut ifaces| ifaces.pop())
+            .expect("bound interface must exist")
+            .borrow()
+            .bound_addr()
+            .expect("initial bound addr");
+
+        broken.store(true, Ordering::SeqCst);
+        network.reconcile_event(&changed_event("lo")).await;
+
+        let after = quic
+            .get_interfaces(&pattern)
+            .and_then(|mut ifaces| ifaces.pop())
+            .expect("bound interface must stay registered")
+            .borrow()
+            .bound_addr()
+            .expect("recovered bound addr");
+
+        assert_ne!(
+            before, after,
+            "failed changed-interface health checks must replace the stale IO"
+        );
+        assert_eq!(
+            factory.bind_count.load(Ordering::SeqCst),
+            2,
+            "failed changed-interface health checks should trigger exactly one rebind"
+        );
+
+        handle.unbind().await;
     }
 }

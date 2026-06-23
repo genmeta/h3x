@@ -186,10 +186,12 @@ impl<C: quic::Connection> Pool<C> {
                 }
 
                 let try_connect = async || {
+                    tracing::trace!("establishing quic connection for h3 pool entry");
                     let quic_conn = connector
                         .connect(&server)
                         .await
                         .context(connect_error::ConnectorSnafu)?;
+                    tracing::trace!("quic connection established, building h3 connection");
                     let connection = builder.build(quic_conn).await?;
 
                     tracing::trace!("h3 connection established, verifying peer identity");
@@ -772,6 +774,38 @@ mod tests {
             2,
             "different authorities must produce different pool entries",
         );
+    }
+
+    #[test]
+    fn test_pool_key_plain_and_selector_authority_different_entry() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let auth_plain: Authority = "example.com".parse().unwrap();
+        let auth_selected: Authority = "example.com:0".parse().unwrap();
+
+        pool.connections
+            .entry(auth_plain)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+        pool.connections
+            .entry(auth_selected)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+
+        assert_eq!(pool.connections.len(), 2);
+    }
+
+    #[test]
+    fn test_pool_key_different_selector_authorities_different_entry() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let auth0: Authority = "example.com:0".parse().unwrap();
+        let auth1: Authority = "example.com:1".parse().unwrap();
+
+        pool.connections
+            .entry(auth0)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+        pool.connections
+            .entry(auth1)
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()));
+
+        assert_eq!(pool.connections.len(), 2);
     }
 
     #[tokio::test]

@@ -1,8 +1,6 @@
 //! QUIC-only endpoint built on top of a shared [`Network`].
 
-use std::{
-    any::Any, collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration,
-};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bon::bon;
@@ -17,7 +15,7 @@ use crate::{
         client::{ClientQuicConfig, ServerCertVerifierChoice},
         connection::Connection,
         identity::Identity,
-        net::{BindUri, ConnectionId, EndpointAddr},
+        net::{ConnectionId, EndpointAddr},
         network::{BindHandle, BindServerError, Network, ServerBinding},
         resolver::{Resolve, Source},
         server::ServerQuicConfig,
@@ -383,37 +381,7 @@ impl QuicEndpoint {
     pub async fn accept(&self) -> Result<Arc<Connection>, AcceptError> {
         let binding = self.ensure_server().await?;
         let conn = binding.recv().await.ok_or(AcceptError::Shutdown)?;
-        let mut observer = self.network.quic().locations().subscribe();
-        let weak = Arc::downgrade(&conn);
-        let patterns: Vec<BindPattern> = self.bind.iter().cloned().collect();
-        // Inherent termination: this companion task tracks local
-        // address changes for the accepted connection. It exits when
-        // (a) conn is dropped (weak.upgrade fails), (b) conn terminates,
-        // or (c) the locations observer channel is exhausted. The
-        // terminated future is created from a temporary strong reference
-        // that is dropped before the task waits on close or location events.
-        tokio::spawn(
-            async move {
-                let mut local_addresses = LocalAddressTracker::default();
-                loop {
-                    let Some(terminated) = weak.upgrade().map(|c| c.terminated()) else {
-                        break;
-                    };
-                    tokio::select! {
-                        _ = terminated => break,
-                        event = observer.recv() => {
-                            let Some((bind_uri, event)) = event else { break };
-                            if !patterns.iter().any(|p| p.matches(&bind_uri)) {
-                                continue;
-                            }
-                            let Some(c) = weak.upgrade() else { break };
-                            local_addresses.handle(&c, bind_uri, event);
-                        }
-                    }
-                }
-            }
-            .in_current_span(),
-        );
+        self.subscribe_connection_local_addresses(conn.clone());
         Ok(conn)
     }
 }
@@ -428,111 +396,82 @@ impl quic::Connect for QuicEndpoint {
     ) -> Result<Arc<Self::Connection>, Self::Error> {
         use connect_error::{DnsSnafu, TlsSnafu};
 
-        let full = server.as_str();
-        let server_str = full.rsplit_once('@').map_or(full, |(_, host)| host);
+        let lookup_name = lookup_server_name(server);
+        let transport_name = transport_server_name(server);
 
-        tracing::debug!(server = server_str, "connecting quic endpoint");
+        tracing::debug!(
+            logical_server = %server,
+            lookup = lookup_name,
+            tls = transport_name,
+            "connecting quic endpoint"
+        );
         let tls = self.ensure_client().context(TlsSnafu)?;
         let mut server_eps =
-            futures::StreamExt::fuse(self.resolver.lookup(server_str).await.context(DnsSnafu)?);
+            futures::StreamExt::fuse(self.resolver.lookup(lookup_name).await.context(DnsSnafu)?);
         let connection = self
-            .build_client_connection(server_str, tls)
+            .build_client_connection(transport_name, tls)
             .context(TlsSnafu)?;
         tracing::trace!(
-            server = server_str,
+            logical_server = %server,
+            lookup = lookup_name,
+            tls = transport_name,
             timeout_ms = self.connect_path_timeout().as_millis(),
             bind_pattern_count = self.bind.len(),
             "waiting for quic path"
         );
 
-        // Two legs driving path establishment:
-        //   1. DNS results      → add peer endpoints
-        //   2. Locations events → add local endpoints
-        //
-        // Locations replays the current bound addresses when a subscriber is
-        // registered, so connect does not scan bound interfaces and synthesize
-        // local addresses on its own.
-        let mut observer = self.network.quic().locations().subscribe();
-        let bind = self.bind.clone();
+        self.subscribe_connection_local_addresses(connection.clone());
+
         let connect_timeout = tokio::time::sleep(self.connect_path_timeout());
         tokio::pin!(connect_timeout);
-        let mut peer_agent_seen = false;
-        let mut local_addresses = LocalAddressTracker::default();
-
         loop {
             tokio::select! {
                 biased;
                 _ = connection.terminated() => {
                     return Err(ConnectError::NoReachableEndpoint);
                 }
-                result = connection.handshaked(), if peer_agent_seen => {
+                result = connection.handshaked() => {
                     result.map_err(|_| ConnectError::NoReachableEndpoint)?;
-                    Self::spawn_path_discovery_companion(
-                        bind.clone(),
+                    Self::spawn_peer_endpoint_companion(
                         connection.clone(),
                         server_eps,
-                        observer,
-                        local_addresses,
                     );
-                    tracing::debug!(server = server_str, "quic endpoint handshaked before agent path");
+                    tracing::debug!(server = lookup_name, "quic endpoint handshaked");
                     return Ok(connection);
                 }
                 _ = &mut connect_timeout => {
                     connection
                         .validate()
                         .map_err(|_| ConnectError::NoReachableEndpoint)?;
-                    Self::spawn_path_discovery_companion(
-                        bind.clone(),
+                    Self::spawn_peer_endpoint_companion(
                         connection.clone(),
                         server_eps,
-                        observer,
-                        local_addresses,
                     );
                     return Ok(connection);
                 }
                 Some((source, server_ep)) = server_eps.next() => {
                     tracing::trace!(
-                        server = server_str,
+                        server = lookup_name,
                         ?source,
                         endpoint = ?server_ep,
                         "resolved peer endpoint"
                     );
-                    peer_agent_seen |= Self::endpoint_is_agent(server_ep);
                     Self::add_resolved_peer_endpoint(
                         &connection,
                         source,
                         server_ep,
                     );
                     // Resolver streams often contain a batch of equivalent endpoints
-                    // that are ready immediately (for example STUN-agent and
-                    // same-link direct records). Install the ready batch before
-                    // evaluating readiness so a Direct record cannot return before
-                    // a peer Agent record in the same DNS response is observed.
-                    peer_agent_seen |= Self::drain_ready_peer_endpoints(
-                        &connection,
-                        &mut server_eps,
-                    );
-                }
-                Some((bind_uri, event)) = observer.recv() => {
-                    if !bind.iter().any(|p| p.matches(&bind_uri)) {
-                        tracing::trace!(%bind_uri, "ignoring location event outside bind patterns");
-                        continue;
-                    }
-                    tracing::trace!(%bind_uri, "handling location event for connect");
-                    local_addresses.handle(&connection, bind_uri, event);
+                    // that are ready immediately. Install the ready batch before
+                    // evaluating connection readiness.
+                    Self::drain_ready_peer_endpoints(&connection, &mut server_eps);
                 }
             }
 
-            match Self::connection_has_paths(&connection, peer_agent_seen) {
+            match connection.has_viable_path() {
                 Ok(true) => {
-                    Self::spawn_path_discovery_companion(
-                        bind.clone(),
-                        connection.clone(),
-                        server_eps,
-                        observer,
-                        local_addresses,
-                    );
-                    tracing::debug!(server = server_str, "quic endpoint has at least one path");
+                    Self::spawn_peer_endpoint_companion(connection.clone(), server_eps);
+                    tracing::debug!(server = lookup_name, "quic endpoint has at least one path");
                     return Ok(connection);
                 }
                 Ok(false) => {} // no paths yet — continue loop
@@ -670,168 +609,6 @@ impl<'a> Drop for IdentityMutGuard<'a> {
     }
 }
 
-#[derive(Default)]
-struct LocalAddressTracker {
-    direct: HashMap<BindUri, SocketAddr>,
-    stun: HashMap<BindUri, EndpointAddr>,
-}
-
-impl LocalAddressTracker {
-    fn handle(
-        &mut self,
-        conn: &Connection,
-        bind_uri: BindUri,
-        event: crate::dquic::qinterface::component::location::AddressEvent<dyn Any + Send + Sync>,
-    ) {
-        use crate::dquic::qinterface::component::location::AddressEvent;
-
-        let event = match event.downcast::<std::io::Result<SocketAddr>>() {
-            Ok(event) => {
-                self.handle_direct(conn, bind_uri, event);
-                return;
-            }
-            Err(event) => event,
-        };
-
-        match event.downcast::<crate::dquic::qtraversal::nat::client::ClientLocationData>() {
-            Ok(event) => self.handle_stun(conn, bind_uri, event),
-            Err(AddressEvent::Upsert(data)) => {
-                let type_id = data.as_ref().type_id();
-                tracing::trace!(
-                    %bind_uri,
-                    ?type_id,
-                    "ignoring unknown local address upsert event"
-                );
-            }
-            Err(AddressEvent::Remove(type_id)) => {
-                tracing::trace!(
-                    %bind_uri,
-                    ?type_id,
-                    "ignoring unknown local address remove event"
-                );
-            }
-            Err(AddressEvent::Closed) => self.remove_all(conn, &bind_uri),
-        }
-    }
-
-    fn handle_direct(
-        &mut self,
-        conn: &Connection,
-        bind_uri: BindUri,
-        event: crate::dquic::qinterface::component::location::AddressEvent<
-            std::io::Result<SocketAddr>,
-        >,
-    ) {
-        use crate::dquic::qinterface::component::location::AddressEvent;
-
-        match event {
-            AddressEvent::Upsert(data) => match data.as_ref() {
-                Ok(addr) => self.upsert_direct(conn, bind_uri, *addr),
-                Err(error) => {
-                    tracing::trace!(
-                        %bind_uri,
-                        error = %Report::from_error(error),
-                        "direct local address update failed"
-                    );
-                    self.remove_direct(conn, &bind_uri);
-                }
-            },
-            AddressEvent::Remove(_type_id) => self.remove_direct(conn, &bind_uri),
-            AddressEvent::Closed => self.remove_all(conn, &bind_uri),
-        }
-    }
-
-    fn handle_stun(
-        &mut self,
-        conn: &Connection,
-        bind_uri: BindUri,
-        event: crate::dquic::qinterface::component::location::AddressEvent<
-            crate::dquic::qtraversal::nat::client::ClientLocationData,
-        >,
-    ) {
-        use crate::dquic::qinterface::component::location::AddressEvent;
-
-        match event {
-            AddressEvent::Upsert(data) => match data.as_ref() {
-                Ok(endpoint) => self.upsert_stun(conn, bind_uri, *endpoint),
-                Err(error) => {
-                    tracing::trace!(
-                        %bind_uri,
-                        error = %Report::from_error(error),
-                        "stun local address update failed"
-                    );
-                    self.remove_stun(conn, &bind_uri);
-                }
-            },
-            AddressEvent::Remove(_type_id) => self.remove_stun(conn, &bind_uri),
-            AddressEvent::Closed => self.remove_all(conn, &bind_uri),
-        }
-    }
-
-    fn upsert_direct(&mut self, conn: &Connection, bind_uri: BindUri, addr: SocketAddr) {
-        if self.direct.get(&bind_uri) == Some(&addr) {
-            return;
-        }
-        if let Some(previous) = self.direct.insert(bind_uri.clone(), addr) {
-            self.remove_endpoint(conn, &bind_uri, EndpointAddr::direct(previous));
-        }
-        if let Err(error) = conn.add_local_endpoint(bind_uri, EndpointAddr::direct(addr)) {
-            tracing::trace!(
-                error = %Report::from_error(&error),
-                "failed to add local endpoint"
-            );
-        }
-    }
-
-    fn remove_direct(&mut self, conn: &Connection, bind_uri: &BindUri) {
-        if let Some(previous) = self.direct.remove(bind_uri) {
-            self.remove_endpoint(conn, bind_uri, EndpointAddr::direct(previous));
-        }
-    }
-
-    fn upsert_stun(&mut self, conn: &Connection, bind_uri: BindUri, endpoint: EndpointAddr) {
-        if self.stun.get(&bind_uri) == Some(&endpoint) {
-            return;
-        }
-        if let Some(previous) = self.stun.insert(bind_uri.clone(), endpoint) {
-            self.remove_stun_endpoint(conn, &bind_uri, previous);
-        }
-        QuicEndpoint::add_local_endpoint_for_peer(conn, bind_uri, endpoint);
-    }
-
-    fn remove_stun(&mut self, conn: &Connection, bind_uri: &BindUri) {
-        if let Some(previous) = self.stun.remove(bind_uri) {
-            self.remove_stun_endpoint(conn, bind_uri, previous);
-        }
-    }
-
-    fn remove_stun_endpoint(&self, conn: &Connection, bind_uri: &BindUri, endpoint: EndpointAddr) {
-        self.remove_endpoint(conn, bind_uri, endpoint);
-        if matches!(endpoint, EndpointAddr::Agent { .. })
-            && let Err(error) = conn.remove_address(endpoint.addr())
-        {
-            tracing::trace!(
-                error = %Report::from_error(&error),
-                "failed to remove local punch endpoint"
-            );
-        }
-    }
-
-    fn remove_endpoint(&self, conn: &Connection, bind_uri: &BindUri, endpoint: EndpointAddr) {
-        if let Err(error) = conn.remove_local_endpoint(bind_uri, endpoint) {
-            tracing::trace!(
-                error = %Report::from_error(&error),
-                "failed to remove local endpoint"
-            );
-        }
-    }
-
-    fn remove_all(&mut self, conn: &Connection, bind_uri: &BindUri) {
-        self.remove_direct(conn, bind_uri);
-        self.remove_stun(conn, bind_uri);
-    }
-}
-
 impl QuicEndpoint {
     fn connect_path_timeout(&self) -> Duration {
         self.client
@@ -842,85 +619,115 @@ impl QuicEndpoint {
             .unwrap_or(Duration::from_secs(20))
     }
 
-    fn connection_has_paths(
-        connection: &Connection,
-        require_agent_path: bool,
-    ) -> Result<bool, crate::dquic::qbase::error::Error> {
-        let ctx = connection.path_context()?;
-        Ok(ctx
-            .paths::<Vec<_>>()
-            .into_iter()
-            .any(|(pathway, _)| Self::pathway_is_connect_ready(pathway, require_agent_path)))
-    }
-
-    fn pathway_is_connect_ready(
-        pathway: crate::dquic::qbase::net::route::Pathway,
-        require_agent_path: bool,
-    ) -> bool {
-        match (pathway.local(), pathway.remote()) {
-            (EndpointAddr::Direct { addr: local }, EndpointAddr::Direct { addr: remote }) => {
-                if require_agent_path {
-                    return false;
-                }
-                Self::direct_path_is_connect_ready(local, remote)
-            }
-            _ => true,
-        }
-    }
-
-    fn direct_path_is_connect_ready(local: SocketAddr, remote: SocketAddr) -> bool {
-        local.ip().is_loopback() == remote.ip().is_loopback()
-    }
-
-    fn spawn_path_discovery_companion<S>(
-        bind: Arc<Vec<BindPattern>>,
-        connection: Arc<Connection>,
-        mut server_eps: S,
-        mut observer: crate::dquic::qinterface::component::location::Observer,
-        local_addresses: LocalAddressTracker,
-    ) where
-        S: Stream<Item = (Source, EndpointAddr)> + Unpin + Send + 'static,
-    {
+    fn subscribe_connection_local_addresses(&self, connection: Arc<Connection>) {
+        let mut observer = self.network.quic().locations().subscribe();
         let weak = Arc::downgrade(&connection);
-        // Inherent termination: this path-discovery companion drains remaining
-        // DNS results and local address events after connect has established
-        // that the connection will not leak. It creates the terminated future
-        // from a temporary strong reference, then drops that reference before
-        // awaiting DNS, location, or close events. It exits when (a) connection
-        // is dropped (weak.upgrade fails), (b) connection terminates, or (c)
-        // both DNS and observer streams are exhausted.
+        let bind = self.bind.clone();
+        // Inherent termination: this task subscribes an h3x endpoint connection
+        // to endpoint-selected local address events. It exits when (a) the
+        // connection is dropped, (b) the connection terminates, or (c) the
+        // locations observer channel is exhausted. The terminated future is
+        // created from a temporary strong reference and then dropped before the
+        // task waits on close or location events.
         tokio::spawn(
             async move {
-                let mut local_addresses = local_addresses;
-                let mut dns_done = false;
-                let mut locations_done = false;
                 loop {
-                    if dns_done && locations_done {
-                        break;
-                    }
                     let Some(terminated) = weak.upgrade().map(|c| c.terminated()) else {
                         break;
                     };
                     tokio::select! {
                         biased;
                         _ = terminated => break,
-                        result = server_eps.next(), if !dns_done => {
-                            let Some((s, e)) = result else {
-                                dns_done = true;
+                        event = observer.recv() => {
+                            let Some((bind_uri, event)) = event else { break };
+                            if !bind.iter().any(|pattern| pattern.matches(&bind_uri)) {
                                 continue;
+                            }
+                            let Some(connection) = weak.upgrade() else {
+                                break;
+                            };
+                            Self::handle_connection_local_address_event(&connection, bind_uri, event);
+                        }
+                    }
+                }
+            }
+            .in_current_span(),
+        );
+    }
+
+    fn handle_connection_local_address_event(
+        connection: &Connection,
+        bind_uri: crate::dquic::net::BindUri,
+        event: crate::dquic::qinterface::component::location::AddressEvent,
+    ) {
+        match event.downcast::<crate::dquic::qinterface::component::location::LocalEndpointSet>() {
+            Ok(crate::dquic::qinterface::component::location::AddressEvent::Upsert(endpoints)) => {
+                if let Err(error) = connection
+                    .upsert_local_endpoints(bind_uri, endpoints.endpoints().iter().copied())
+                {
+                    tracing::trace!(
+                        error = %Report::from_error(&error),
+                        "failed to upsert local endpoints"
+                    );
+                }
+            }
+            Ok(
+                crate::dquic::qinterface::component::location::AddressEvent::Remove(_)
+                | crate::dquic::qinterface::component::location::AddressEvent::Closed,
+            ) => {
+                Self::remove_connection_local_endpoints(connection, &bind_uri);
+            }
+            Err(crate::dquic::qinterface::component::location::AddressEvent::Upsert(data)) => {
+                let type_id = data.as_ref().type_id();
+                tracing::trace!(%bind_uri, ?type_id, "ignoring unknown local address upsert event");
+            }
+            Err(crate::dquic::qinterface::component::location::AddressEvent::Remove(type_id)) => {
+                tracing::trace!(%bind_uri, ?type_id, "ignoring unknown local address remove event");
+            }
+            Err(crate::dquic::qinterface::component::location::AddressEvent::Closed) => {
+                Self::remove_connection_local_endpoints(connection, &bind_uri);
+            }
+        }
+    }
+
+    fn remove_connection_local_endpoints(
+        connection: &Connection,
+        bind_uri: &crate::dquic::net::BindUri,
+    ) {
+        if let Err(error) = connection.remove_local_endpoints(bind_uri) {
+            tracing::trace!(
+                error = %Report::from_error(&error),
+                "failed to remove local endpoints"
+            );
+        }
+    }
+
+    fn spawn_peer_endpoint_companion<S>(connection: Arc<Connection>, mut server_eps: S)
+    where
+        S: Stream<Item = (Source, EndpointAddr)> + Unpin + Send + 'static,
+    {
+        let weak = Arc::downgrade(&connection);
+        // Inherent termination: this companion drains remaining DNS results
+        // after connect has established that the connection will not leak. It
+        // creates the terminated future from a temporary strong reference, then
+        // drops that reference before awaiting DNS or close events. It exits
+        // when (a) connection is dropped, (b) connection terminates, or (c)
+        // the DNS stream is exhausted.
+        tokio::spawn(
+            async move {
+                loop {
+                    let Some(terminated) = weak.upgrade().map(|c| c.terminated()) else {
+                        break;
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = terminated => break,
+                        result = server_eps.next() => {
+                            let Some((s, e)) = result else {
+                                break;
                             };
                             let Some(c) = weak.upgrade() else { break };
                             Self::add_resolved_peer_endpoint(&c, s, e);
-                        }
-                        result = observer.recv(), if !locations_done => {
-                            let Some((uri, e)) = result else {
-                                locations_done = true;
-                                continue;
-                            };
-                            let Some(c) = weak.upgrade() else { break };
-                            if bind.iter().any(|p| p.matches(&uri)) {
-                                local_addresses.handle(&c, uri, e);
-                            }
                         }
                     }
                 }
@@ -937,60 +744,38 @@ impl QuicEndpoint {
         let _ = connection.add_peer_endpoint(server_ep, source);
     }
 
-    fn drain_ready_peer_endpoints<S>(connection: &Connection, server_eps: &mut S) -> bool
+    fn drain_ready_peer_endpoints<S>(connection: &Connection, server_eps: &mut S)
     where
         S: Stream<Item = (Source, EndpointAddr)> + Unpin,
     {
-        let mut agent_seen = false;
         while let Some(Some((source, server_ep))) = server_eps.next().now_or_never() {
-            agent_seen |= Self::endpoint_is_agent(server_ep);
             Self::add_resolved_peer_endpoint(connection, source, server_ep);
-        }
-        agent_seen
-    }
-
-    fn endpoint_is_agent(endpoint: EndpointAddr) -> bool {
-        matches!(endpoint, EndpointAddr::Agent { .. })
-    }
-
-    fn add_local_endpoint_for_peer(conn: &Connection, bind_uri: BindUri, endpoint: EndpointAddr) {
-        if let Err(error) = conn.add_local_endpoint(bind_uri.clone(), endpoint) {
-            tracing::trace!(
-                error = %Report::from_error(&error),
-                "failed to add local endpoint"
-            );
-        }
-        if matches!(endpoint, EndpointAddr::Agent { .. }) {
-            match conn.add_local_punch_address(bind_uri, endpoint) {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::trace!(
-                        error = %Report::from_error(&error),
-                        "failed to add local punch endpoint"
-                    );
-                }
-                Err(error) => {
-                    tracing::trace!(
-                        error = %Report::from_error(&error),
-                        "failed to add local punch endpoint"
-                    );
-                }
-            }
         }
     }
 }
 
+fn lookup_server_name(server: &http::uri::Authority) -> &str {
+    let full = server.as_str();
+    full.rsplit_once('@').map_or(full, |(_, host)| host)
+}
+
+fn transport_server_name(server: &http::uri::Authority) -> &str {
+    server.host()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::any::TypeId;
+    use std::{any::Any, net::SocketAddr};
 
     use dhttp_identity::identity::LocalAuthority as IdentityLocalAuthority;
+    use http::uri::Authority;
     use rustls::{RootCertStore, client::WebPkiServerVerifier, pki_types::PrivateKeyDer};
 
     use super::*;
     use crate::{
         dquic::{
             cert::handy::{ToCertificate, ToPrivateKey},
+            net::BindUri,
             resolver::handy::SystemResolver,
         },
         quic::WithLocalAuthority as _,
@@ -999,6 +784,66 @@ mod tests {
     const CA_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/ca.cert");
     const SERVER_CERT: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");
     const SERVER_KEY: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
+
+    #[test]
+    fn authority_names_keep_selector_for_lookup_but_not_for_tls() {
+        let authority: Authority = "alice@reimu.hakurei.dhttp.net:0".parse().unwrap();
+
+        assert_eq!(lookup_server_name(&authority), "reimu.hakurei.dhttp.net:0");
+        assert_eq!(transport_server_name(&authority), "reimu.hakurei.dhttp.net");
+    }
+
+    #[test]
+    fn authority_names_keep_real_transport_port_for_resolver_lookup() {
+        let authority: Authority = "dns.genmeta.net:4433".parse().unwrap();
+
+        assert_eq!(lookup_server_name(&authority), "dns.genmeta.net:4433");
+        assert_eq!(transport_server_name(&authority), "dns.genmeta.net");
+    }
+
+    #[test]
+    fn production_endpoint_does_not_inspect_or_create_paths() {
+        let source = include_str!("endpoint.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("test module boundary");
+
+        for forbidden in [
+            ["path", "_context", "()"].concat(),
+            ["add", "_path", "("].concat(),
+            ["add", "_local", "_endpoint", "("].concat(),
+            ["add", "_local", "_punch", "_address", "("].concat(),
+            ["remove", "_local", "_endpoint", "("].concat(),
+            ["remove", "_address", "("].concat(),
+            ["upsert", "_local", "_direct", "_endpoint", "("].concat(),
+            ["upsert", "_local", "_stun", "_endpoint", "("].concat(),
+            ["close", "_local", "_bind", "_uri", "("].concat(),
+        ] {
+            assert!(
+                !production.contains(&forbidden),
+                "h3x QuicEndpoint must not inspect or create dquic paths: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_endpoint_owns_local_address_event_parsing() {
+        let source = include_str!("endpoint.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("test module boundary");
+
+        assert!(
+            !production.contains("subscribe_local_address_matching"),
+            "QuicEndpoint must not delegate local-address event subscription/parsing into Connection"
+        );
+        assert!(
+            production.contains("handle_connection_local_address_event"),
+            "QuicEndpoint should parse local-address events and call Connection address-book APIs"
+        );
+    }
 
     fn root_store_with_ca() -> RootCertStore {
         let mut store = RootCertStore::empty();
@@ -1112,10 +957,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dual_task_connect_structure() {
-        // Verify that connect() sets up the dual-task model infrastructure
-        // This test verifies the structure is in place, even if full Task A
-        // implementation depends on Locations API details
+    async fn test_connection_owned_local_address_structure() {
+        // Verify that endpoint construction exposes the infrastructure needed
+        // for connection-owned local address subscription.
         let network = Network::builder().build();
         let resolver = Arc::new(SystemResolver);
         let client = ClientQuicConfig::default();
@@ -1128,14 +972,10 @@ mod tests {
             .server(server)
             .build()
             .await;
-
-        // The dual-task model is set up internally in connect()
-        // We verify it doesn't panic or error during setup
-        // (actual connection would require valid DNS resolution)
     }
 
     #[tokio::test]
-    async fn local_location_before_dns_peer_still_creates_path() {
+    async fn connection_address_book_pairs_replayed_local_with_later_peer_endpoint() {
         let bind_pattern = BindPattern::from_str("inet://127.0.0.1:0").expect("valid bind pattern");
         let bind = Arc::new(vec![bind_pattern.clone()]);
         let endpoint = QuicEndpoint::builder()
@@ -1157,14 +997,8 @@ mod tests {
             .expect("bound interface");
 
         use crate::dquic::net::IO as _;
-        let bind_uri = iface.bind_uri();
         let local_addr = iface.borrow().bound_addr().expect("bound address");
-        let data: Arc<dyn Any + Send + Sync> =
-            Arc::new(Ok::<SocketAddr, std::io::Error>(local_addr));
-        let event = crate::dquic::qinterface::component::location::AddressEvent::Upsert(data);
-
-        let mut local_addresses = LocalAddressTracker::default();
-        local_addresses.handle(&connection, bind_uri, event);
+        endpoint.subscribe_connection_local_addresses(connection.clone());
 
         let remote_addr = SocketAddr::new(local_addr.ip(), local_addr.port() + 1);
         QuicEndpoint::add_resolved_peer_endpoint(
@@ -1173,10 +1007,16 @@ mod tests {
             EndpointAddr::direct(remote_addr),
         );
 
-        assert!(
-            QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
-            "local endpoint replayed before DNS peer must be retained for peer pairing"
-        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if connection.has_viable_path().expect("connection path state") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("local endpoint replayed before DNS peer must be retained for peer pairing");
     }
 
     #[tokio::test]
@@ -1203,14 +1043,9 @@ mod tests {
         use crate::dquic::net::IO as _;
         let bind_uri = iface.bind_uri();
         let local_addr = iface.borrow().bound_addr().expect("bound address");
-        let data: Arc<dyn Any + Send + Sync> =
-            Arc::new(Ok::<SocketAddr, std::io::Error>(local_addr));
-        let mut local_addresses = LocalAddressTracker::default();
-        local_addresses.handle(
-            &connection,
-            bind_uri,
-            crate::dquic::qinterface::component::location::AddressEvent::Upsert(data),
-        );
+        connection
+            .upsert_local_endpoints(bind_uri, [EndpointAddr::direct(local_addr)])
+            .expect("local endpoint");
 
         QuicEndpoint::add_resolved_peer_endpoint(
             &connection,
@@ -1221,13 +1056,13 @@ mod tests {
         );
 
         assert!(
-            !QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
+            !connection.has_viable_path().expect("connection path state"),
             "loopback-to-non-loopback direct paths are not ready for client handshake"
         );
     }
 
     #[tokio::test]
-    async fn peer_agent_requires_agent_path_before_connect_ready() {
+    async fn peer_agent_endpoint_does_not_gate_direct_path_readiness() {
         let bind_pattern = BindPattern::from_str("inet://127.0.0.1:0").expect("valid bind pattern");
         let endpoint = QuicEndpoint::builder()
             .network(Network::builder().build())
@@ -1253,17 +1088,9 @@ mod tests {
         let remote_direct = SocketAddr::new(local_addr.ip(), local_addr.port() + 1);
         let stun_agent: SocketAddr = "10.10.0.2:20004".parse().expect("stun agent");
 
-        let mut local_addresses = LocalAddressTracker::default();
-        local_addresses.handle(
-            &connection,
-            bind_uri.clone(),
-            crate::dquic::qinterface::component::location::AddressEvent::Upsert(Arc::new(Ok::<
-                SocketAddr,
-                std::io::Error,
-            >(
-                local_addr,
-            ))),
-        );
+        connection
+            .upsert_local_endpoints(bind_uri.clone(), [EndpointAddr::direct(local_addr)])
+            .expect("local endpoint");
         QuicEndpoint::add_resolved_peer_endpoint(
             &connection,
             Source::H3 {
@@ -1280,21 +1107,161 @@ mod tests {
         );
 
         assert!(
-            QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
-            "direct loopback path is connect-ready when no Agent path is required"
+            connection.has_viable_path().expect("connection path state"),
+            "direct loopback path is connect-ready independently of peer Agent endpoints"
         );
         assert!(
-            !QuicEndpoint::connection_has_paths(&connection, true).expect("path context"),
-            "peer Agent endpoints must not return on Direct-only paths"
+            connection.has_viable_path().expect("connection path state"),
+            "peer Agent endpoints must not make h3x wait for a local Agent endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_local_address_subscription_applies_bind_filter() {
+        let locations = Arc::new(crate::dquic::qinterface::component::location::Locations::new());
+        let bind_pattern = BindPattern::from_str("inet://127.0.0.1:0").expect("bind pattern");
+        let endpoint = QuicEndpoint::builder()
+            .network(Network::builder().locations(locations.clone()).build())
+            .bind(Arc::new(vec![bind_pattern.clone()]))
+            .build()
+            .await;
+        let tls = endpoint.ensure_client().expect("client tls");
+        let connection = endpoint
+            .build_client_connection("server.example", tls)
+            .expect("client connection");
+        let iface = endpoint
+            .network()
+            .quic()
+            .get_interfaces(&bind_pattern)
+            .expect("registered bind")
+            .into_iter()
+            .next()
+            .expect("bound interface");
+        use crate::dquic::net::IO as _;
+        let allowed_bind = iface.bind_uri();
+        let allowed_local = iface.borrow().bound_addr().expect("allowed local");
+        let rejected_bind: BindUri = "inet://127.0.0.1:40001".parse().expect("rejected bind");
+
+        locations.remove::<crate::dquic::qinterface::component::location::LocalEndpointSet>(
+            allowed_bind.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        endpoint.subscribe_connection_local_addresses(connection.clone());
+
+        let rejected_local: SocketAddr = "127.0.0.1:41001".parse().expect("rejected local");
+        let remote: SocketAddr = "127.0.0.1:41002".parse().expect("remote");
+        locations.upsert(
+            rejected_bind,
+            Arc::new(
+                crate::dquic::qinterface::component::location::LocalEndpointSet::from_endpoints([
+                    EndpointAddr::direct(rejected_local),
+                ]),
+            ),
+        );
+        QuicEndpoint::add_resolved_peer_endpoint(
+            &connection,
+            Source::System,
+            EndpointAddr::direct(remote),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !connection.has_viable_path().expect("connection path state"),
+            "local address events rejected by the endpoint bind filter must not reach the connection address book"
         );
 
-        connection
-            .add_local_endpoint(bind_uri, EndpointAddr::with_agent(stun_agent, local_addr))
-            .expect("local agent endpoint");
-        assert!(
-            QuicEndpoint::connection_has_paths(&connection, true).expect("path context"),
-            "local Agent endpoint should make peer Agent connection ready"
+        locations.upsert(
+            allowed_bind,
+            Arc::new(
+                crate::dquic::qinterface::component::location::LocalEndpointSet::from_endpoints([
+                    EndpointAddr::direct(allowed_local),
+                ]),
+            ),
         );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if connection.has_viable_path().expect("connection path state") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("allowed local address should pair with the retained peer endpoint");
+    }
+
+    #[tokio::test]
+    async fn peer_agent_endpoint_does_not_create_local_stun_client() {
+        #[derive(Debug)]
+        struct SingleEndpointResolver(EndpointAddr);
+
+        impl std::fmt::Display for SingleEndpointResolver {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("single endpoint resolver")
+            }
+        }
+
+        impl Resolve for SingleEndpointResolver {
+            fn lookup<'a>(&'a self, _name: &'a str) -> crate::dquic::resolver::ResolveFuture<'a> {
+                let endpoint = self.0;
+                async move { Ok(futures::stream::iter([(Source::System, endpoint)]).boxed()) }
+                    .boxed()
+            }
+        }
+
+        let bind_pattern = BindPattern::from_str("inet://127.0.0.1:0").expect("valid bind pattern");
+        let mut client = ClientQuicConfig::default();
+        client
+            .parameters
+            .set(
+                crate::dquic::qbase::param::ParameterId::MaxIdleTimeout,
+                Duration::from_millis(50),
+            )
+            .expect("max idle timeout parameter");
+        let mut endpoint = QuicEndpoint::builder()
+            .network(
+                Network::builder()
+                    .stun_server(Arc::from("127.0.0.1:9"))
+                    .build(),
+            )
+            .bind(Arc::new(vec![bind_pattern.clone()]))
+            .client(client)
+            .build()
+            .await;
+        let iface = endpoint
+            .network()
+            .quic()
+            .get_interfaces(&bind_pattern)
+            .expect("registered bind")
+            .into_iter()
+            .next()
+            .expect("bound interface");
+
+        use crate::dquic::net::IO as _;
+        let local_addr = iface.borrow().bound_addr().expect("bound address");
+        let stun_agent = SocketAddr::new(local_addr.ip(), local_addr.port() + 1);
+        let has_agent_client = || {
+            iface
+                .borrow()
+                .with_component(
+                    |clients: &crate::dquic::qtraversal::nat::client::StunClientsComponent| {
+                        clients.with_clients(|clients| clients.contains_key(&stun_agent))
+                    },
+                )
+                .expect("interface was not rebound")
+                .expect("stun clients component")
+        };
+
+        assert!(!has_agent_client());
+
+        endpoint.set_resolver(Arc::new(SingleEndpointResolver(EndpointAddr::with_agent(
+            stun_agent, local_addr,
+        ))));
+        let authority: Authority = "server.example".parse().expect("authority");
+
+        let result = quic::Connect::connect(&endpoint, &authority).await;
+
+        assert!(matches!(result, Err(ConnectError::NoReachableEndpoint)));
+        assert!(!has_agent_client());
     }
 
     #[tokio::test]
@@ -1351,14 +1318,9 @@ mod tests {
         use crate::dquic::net::IO as _;
         let bind_uri = iface.bind_uri();
         let local_addr = iface.borrow().bound_addr().expect("bound address");
-        let data: Arc<dyn Any + Send + Sync> =
-            Arc::new(Ok::<SocketAddr, std::io::Error>(local_addr));
-        let mut local_addresses = LocalAddressTracker::default();
-        local_addresses.handle(
-            &connection,
-            bind_uri,
-            crate::dquic::qinterface::component::location::AddressEvent::Upsert(data),
-        );
+        connection
+            .upsert_local_endpoints(bind_uri, [EndpointAddr::direct(local_addr)])
+            .expect("local endpoint");
 
         let mut endpoints = futures::stream::iter([
             (
@@ -1372,75 +1334,13 @@ mod tests {
         ]);
         QuicEndpoint::drain_ready_peer_endpoints(&connection, &mut endpoints);
         assert!(
-            QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
+            connection.has_viable_path().expect("connection path state"),
             "ready peer endpoints should pair with the retained local endpoint"
         );
     }
 
     #[tokio::test]
-    async fn local_address_tracker_removes_direct_endpoint_on_remove() {
-        use crate::dquic::qinterface::component::location::AddressEvent;
-
-        let bind_pattern = BindPattern::from_str("inet://127.0.0.1:0").expect("valid bind pattern");
-        let endpoint = QuicEndpoint::builder()
-            .network(Network::builder().build())
-            .bind(Arc::new(vec![bind_pattern.clone()]))
-            .build()
-            .await;
-        let tls = endpoint.ensure_client().expect("client tls");
-        let connection = endpoint
-            .build_client_connection("remote.test", tls)
-            .expect("client connection");
-        let iface = endpoint
-            .network()
-            .quic()
-            .get_interfaces(&bind_pattern)
-            .expect("registered bind")
-            .into_iter()
-            .next()
-            .expect("bound interface");
-
-        use crate::dquic::net::IO as _;
-        let bind_uri = iface.bind_uri();
-        let local_addr = iface.borrow().bound_addr().expect("bound address");
-        let remote_port = if local_addr.port() == u16::MAX {
-            local_addr.port() - 1
-        } else {
-            local_addr.port() + 1
-        };
-        let remote_addr = SocketAddr::new(local_addr.ip(), remote_port);
-        let mut tracker = LocalAddressTracker::default();
-
-        tracker.handle(&connection, bind_uri.clone(), {
-            let data: Arc<dyn Any + Send + Sync> =
-                Arc::new(Ok::<SocketAddr, std::io::Error>(local_addr));
-            AddressEvent::Upsert(data)
-        });
-        QuicEndpoint::add_resolved_peer_endpoint(
-            &connection,
-            Source::System,
-            EndpointAddr::direct(remote_addr),
-        );
-        assert!(
-            QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
-            "direct local endpoint should pair with direct remote endpoint"
-        );
-
-        tracker.handle(
-            &connection,
-            bind_uri,
-            AddressEvent::Remove(TypeId::of::<std::io::Result<SocketAddr>>()),
-        );
-        assert!(
-            !QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
-            "removing the direct local endpoint should deactivate its path"
-        );
-    }
-
-    #[tokio::test]
-    async fn local_address_tracker_preserves_connect_state_after_move() {
-        use crate::dquic::qinterface::component::location::{AddressEvent, Locations};
-
+    async fn connection_local_address_subscription_removes_direct_endpoint_on_remove() {
         let bind_pattern = BindPattern::from_str("inet://127.0.0.1:0").expect("valid bind pattern");
         let bind = Arc::new(vec![bind_pattern.clone()]);
         let endpoint = QuicEndpoint::builder()
@@ -1470,53 +1370,45 @@ mod tests {
             local_addr.port() + 1
         };
         let remote_addr = SocketAddr::new(local_addr.ip(), remote_port);
-        let mut tracker = LocalAddressTracker::default();
 
-        tracker.handle(&connection, bind_uri.clone(), {
-            let data: Arc<dyn Any + Send + Sync> =
-                Arc::new(Ok::<SocketAddr, std::io::Error>(local_addr));
-            AddressEvent::Upsert(data)
-        });
+        endpoint.subscribe_connection_local_addresses(connection.clone());
         QuicEndpoint::add_resolved_peer_endpoint(
             &connection,
             Source::System,
             EndpointAddr::direct(remote_addr),
         );
-        assert!(
-            QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
-            "direct local endpoint should pair with direct remote endpoint before tracker handoff"
-        );
-
-        let locations = Locations::new();
-        let observer = locations.subscribe();
-        QuicEndpoint::spawn_path_discovery_companion(
-            bind,
-            connection.clone(),
-            futures::stream::empty(),
-            observer,
-            tracker,
-        );
-
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                locations.remove::<std::io::Result<SocketAddr>>(bind_uri.clone());
-                if !matches!(
-                    QuicEndpoint::connection_has_paths(&connection, false),
-                    Ok(true)
-                ) {
+                if connection.has_viable_path().expect("connection path state") {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("moved tracker should remove the pre-connect direct local endpoint");
+        .expect("direct local endpoint should pair with direct remote endpoint");
+
+        endpoint
+            .network()
+            .quic()
+            .locations()
+            .remove::<crate::dquic::qinterface::component::location::LocalEndpointSet>(
+            bind_uri.clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !matches!(connection.has_viable_path(), Ok(true)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("removing the direct local endpoint should deactivate its path");
     }
 
     #[tokio::test]
-    async fn path_discovery_companion_does_not_hold_connection_while_waiting_for_events() {
-        use crate::dquic::qinterface::component::location::Locations;
-
+    async fn peer_endpoint_companion_does_not_hold_connection_while_waiting_for_dns() {
         let endpoint = QuicEndpoint::builder()
             .network(Network::builder().build())
             .build()
@@ -1525,8 +1417,6 @@ mod tests {
         let connection = endpoint
             .build_client_connection("remote.test", tls)
             .expect("client connection");
-        let locations = Locations::new();
-        let observer = locations.subscribe();
         let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
         let mut polled_tx = Some(polled_tx);
         let server_eps = futures::stream::poll_fn(move |_cx| {
@@ -1536,13 +1426,7 @@ mod tests {
             std::task::Poll::Pending
         });
 
-        QuicEndpoint::spawn_path_discovery_companion(
-            Arc::new(Vec::new()),
-            connection.clone(),
-            server_eps,
-            observer,
-            LocalAddressTracker::default(),
-        );
+        QuicEndpoint::spawn_peer_endpoint_companion(connection.clone(), server_eps);
 
         tokio::time::timeout(Duration::from_secs(1), polled_rx)
             .await
@@ -1557,23 +1441,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_address_tracker_ignores_unknown_payloads() {
-        use crate::dquic::qinterface::component::location::AddressEvent;
-
-        let endpoint = make_endpoint().await;
+    async fn connection_local_address_subscription_ignores_unknown_payloads() {
+        let locations = Arc::new(crate::dquic::qinterface::component::location::Locations::new());
+        let bind_pattern = BindPattern::from_str("inet://127.0.0.1:0").expect("bind pattern");
+        let endpoint = QuicEndpoint::builder()
+            .network(Network::builder().locations(locations.clone()).build())
+            .bind(Arc::new(vec![bind_pattern.clone()]))
+            .build()
+            .await;
         let tls = endpoint.ensure_client().expect("client tls");
         let connection = endpoint
             .build_client_connection("remote.test", tls)
             .expect("client connection");
-        let bind_uri: BindUri = "inet://127.0.0.1:0".parse().expect("bind uri");
-        let mut tracker = LocalAddressTracker::default();
+        let iface = endpoint
+            .network()
+            .quic()
+            .get_interfaces(&bind_pattern)
+            .expect("registered bind")
+            .into_iter()
+            .next()
+            .expect("bound interface");
+        let bind_uri = iface.bind_uri();
+        locations.remove::<crate::dquic::qinterface::component::location::LocalEndpointSet>(
+            bind_uri.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let unknown_payload: Arc<dyn Any + Send + Sync> = Arc::new("not a location payload");
-        tracker.handle(&connection, bind_uri, AddressEvent::Upsert(unknown_payload));
+        endpoint.subscribe_connection_local_addresses(connection.clone());
+        locations.publish(
+            bind_uri,
+            crate::dquic::qinterface::component::location::AddressEvent::Upsert(unknown_payload),
+        );
+        QuicEndpoint::add_resolved_peer_endpoint(
+            &connection,
+            Source::System,
+            EndpointAddr::direct("127.0.0.1:41002".parse().expect("remote")),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert!(
-            !QuicEndpoint::connection_has_paths(&connection, false).expect("path context"),
-            "unknown events should not create paths"
+            !connection.has_viable_path().expect("connection path state"),
+            "unknown events should not reach the connection address book"
         );
     }
 
