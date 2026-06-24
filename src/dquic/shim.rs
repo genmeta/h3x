@@ -578,8 +578,8 @@ mod tests {
             .with_router(Arc::new(
                 dquic::qinterface::component::route::QuicRouter::default(),
             ))
-            .with_locations(Arc::new(
-                dquic::qinterface::component::location::Locations::new(),
+            .with_local_endpoints(Arc::new(
+                dquic::qinterface::component::local_endpoint::LocalEndpoints::new(),
             ))
             .without_client_cert_verifier()
             .listen(1)

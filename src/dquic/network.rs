@@ -67,7 +67,7 @@ use crate::dquic::{
     connection::Connection,
     identity::Identity,
     net::{
-        BindInterface, BindUri, Devices, Family, InterfaceManager, Locations, ProductIO,
+        BindInterface, BindUri, Devices, Family, InterfaceManager, LocalEndpoints, ProductIO,
         QuicRouter, handy::DEFAULT_IO_FACTORY,
     },
     resolver::{Resolve, handy::SystemResolver},
@@ -85,7 +85,7 @@ use crate::dquic::{
     qinterface::{
         component::{
             alive::is_alive,
-            location::LocationsComponent,
+            local_endpoint::LocalEndpointsComponent,
             route::{QuicRouterComponent, Way},
         },
         device::InterfaceEvent,
@@ -151,7 +151,7 @@ pub struct QuicBindDriver {
     stun_resolver: Arc<dyn Resolve + Send + Sync>,
     stun_server: Option<Arc<str>>,
     quic_router: Arc<QuicRouter>,
-    locations: Arc<Locations>,
+    local_endpoints: Arc<LocalEndpoints>,
     sni_registry: SniRegistry,
     server_slot: RwLock<Weak<sni::ServerConfig>>,
 }
@@ -170,7 +170,7 @@ impl QuicBindDriver {
         >,
         stun_server: Option<Arc<str>>,
         #[builder(default = Arc::new(QuicRouter::new()))] quic_router: Arc<QuicRouter>,
-        #[builder(default = Arc::new(Locations::new()))] locations: Arc<Locations>,
+        #[builder(default = Arc::new(LocalEndpoints::new()))] local_endpoints: Arc<LocalEndpoints>,
     ) -> Arc<Self> {
         let driver = Arc::new(Self {
             network,
@@ -179,7 +179,7 @@ impl QuicBindDriver {
             stun_resolver,
             stun_server,
             quic_router,
-            locations,
+            local_endpoints,
             sni_registry: Arc::new(DashMap::new()),
             server_slot: RwLock::new(Weak::new()),
         });
@@ -281,8 +281,8 @@ impl QuicBindDriver {
     }
 
     #[must_use]
-    pub fn locations(&self) -> Arc<Locations> {
-        self.locations.clone()
+    pub fn local_endpoints(&self) -> Arc<LocalEndpoints> {
+        self.local_endpoints.clone()
     }
 
     #[must_use]
@@ -303,7 +303,6 @@ impl QuicBindDriver {
             .with_iface_manager(self.iface_manager.clone())
             .with_iface_factory(self.io_factory.clone())
             .with_quic_router(self.quic_router.clone())
-            .with_locations(self.locations.clone())
     }
 
     fn init_quic_iface_components(&self, bind_iface: &BindInterface) {
@@ -325,9 +324,12 @@ impl QuicBindDriver {
                 let stun_router = components
                     .init_with(|| StunRouterComponent::new(iface.downgrade()))
                     .router();
-                let loc = components
+                let local_endpoints = components
                     .init_with(|| {
-                        LocationsComponent::new(iface.downgrade(), self.locations.clone())
+                        LocalEndpointsComponent::new(
+                            iface.downgrade(),
+                            self.local_endpoints.clone(),
+                        )
                     })
                     .clone();
                 let clients = components
@@ -338,7 +340,7 @@ impl QuicBindDriver {
                             self.stun_resolver.clone(),
                             stun_server,
                             Vec::new(),
-                            Some(loc),
+                            Some(local_endpoints),
                         )
                     })
                     .clone();
@@ -354,7 +356,7 @@ impl QuicBindDriver {
                 });
             } else {
                 components.init_with(|| {
-                    LocationsComponent::new(iface.downgrade(), self.locations.clone())
+                    LocalEndpointsComponent::new(iface.downgrade(), self.local_endpoints.clone())
                 });
                 components.init_with(|| {
                     ReceiveAndDeliverPacketComponent::builder(iface.downgrade())
@@ -1240,7 +1242,7 @@ impl Network {
             dyn Resolve + Send + Sync,
         >,
         #[builder(default = Arc::new(QuicRouter::new()))] quic_router: Arc<QuicRouter>,
-        #[builder(default = Arc::new(Locations::new()))] locations: Arc<Locations>,
+        #[builder(default = Arc::new(LocalEndpoints::new()))] local_endpoints: Arc<LocalEndpoints>,
         #[builder(default = Devices::global())] devices: &'static Devices,
     ) -> Arc<Self> {
         Self::build_with_quic_driver(devices, |network| {
@@ -1251,7 +1253,7 @@ impl Network {
                 .stun_resolver(stun_resolver)
                 .maybe_stun_server(stun_server)
                 .quic_router(quic_router)
-                .locations(locations)
+                .local_endpoints(local_endpoints)
                 .build()
         })
     }
@@ -2144,7 +2146,7 @@ mod tests {
         let io_factory: Arc<dyn ProductIO + 'static> = Arc::new(NullIoFactory);
         let stun_resolver: Arc<dyn Resolve + Send + Sync> = Arc::new(MarkerResolver);
         let quic_router = Arc::new(QuicRouter::new());
-        let locations = Arc::new(Locations::new());
+        let local_endpoints = Arc::new(LocalEndpoints::new());
 
         let network = Network::builder()
             .iface_manager(iface_manager.clone())
@@ -2152,7 +2154,7 @@ mod tests {
             .stun_resolver(stun_resolver.clone())
             .stun_server(Arc::from("builder.stun.example:3478"))
             .quic_router(quic_router.clone())
-            .locations(locations.clone())
+            .local_endpoints(local_endpoints.clone())
             .build();
         let quic = network.quic();
 
@@ -2164,7 +2166,7 @@ mod tests {
             Some("builder.stun.example:3478")
         );
         assert!(Arc::ptr_eq(&quic.quic_router, &quic_router));
-        assert!(Arc::ptr_eq(&quic.locations, &locations));
+        assert!(Arc::ptr_eq(&quic.local_endpoints, &local_endpoints));
     }
 
     #[test]
@@ -2361,10 +2363,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_network_locations() {
+    async fn test_network_local_endpoints() {
         let network = Network::builder().build();
-        let locations = network.quic().locations();
-        let _cloned = locations.clone();
+        let local_endpoints = network.quic().local_endpoints();
+        let _cloned = local_endpoints.clone();
     }
 
     #[tokio::test]
@@ -2372,7 +2374,10 @@ mod tests {
         let network = Network::builder().build();
         let quic: Arc<QuicBindDriver> = network.quic();
         assert!(Arc::ptr_eq(&quic, &network.quic()));
-        assert!(Arc::ptr_eq(&quic.locations(), &network.quic().locations()));
+        assert!(Arc::ptr_eq(
+            &quic.local_endpoints(),
+            &network.quic().local_endpoints()
+        ));
 
         let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
         let mut handle = quic.clone().bind(pattern.clone()).await;

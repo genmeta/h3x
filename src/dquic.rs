@@ -94,7 +94,7 @@ pub mod net {
         qinterface::{
             BindInterface,
             bind_uri::{BindUri, ParseError, Scheme},
-            component::{location::Locations, route::QuicRouter},
+            component::{local_endpoint::LocalEndpoints, route::QuicRouter},
             device::Devices,
             io::ProductIO,
             manager::InterfaceManager,
