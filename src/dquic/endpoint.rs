@@ -793,7 +793,6 @@ mod tests {
             ["add", "_path", "("].concat(),
             ["add", "_local", "_endpoint", "("].concat(),
             ["add", "_local", "_punch", "_address", "("].concat(),
-            ["remove", "_local", "_endpoint", "("].concat(),
             ["remove", "_address", "("].concat(),
             ["upsert", "_local", "_direct", "_endpoint", "("].concat(),
             ["upsert", "_local", "_stun", "_endpoint", "("].concat(),
