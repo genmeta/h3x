@@ -44,10 +44,12 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     io, mem,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use dashmap::DashMap;
@@ -98,6 +100,22 @@ use crate::dquic::{
 
 pub(crate) type SniRegistry = Arc<DashMap<Name<'static>, Weak<ServerEntry>>>;
 type BoundInterfaces = HashMap<BindUri, BindInterface>;
+const DISPATCH_INITIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+
+async fn await_initial_path_attempt_or_validate<F, V, E>(
+    timeout: Duration,
+    attempted: F,
+    validate: V,
+) -> Result<(), E>
+where
+    F: Future<Output = Result<(), E>>,
+    V: FnOnce() -> Result<(), E>,
+{
+    match tokio::time::timeout(timeout, attempted).await {
+        Ok(result) => result,
+        Err(_) => validate(),
+    }
+}
 
 fn interface_contains(interface: &::dquic::qinterface::device::Interface, ip: IpAddr) -> bool {
     match ip {
@@ -628,6 +646,20 @@ impl QuicBindDriver {
         tokio::spawn(
             async move {
                 quic_router.deliver(packet, (bind_uri, pathway, link)).await;
+                if let Err(error) = await_initial_path_attempt_or_validate(
+                    DISPATCH_INITIAL_ATTEMPT_TIMEOUT,
+                    conn.attempted(),
+                    || conn.validate(),
+                )
+                .await
+                {
+                    let report = snafu::Report::from_error(&error);
+                    tracing::debug!(
+                        error = %report,
+                        "initial path attempt failed"
+                    );
+                    return;
+                }
 
                 // server_name() waits for TLS handshake info — do NOT call
                 // handshaked() here; for server role it blocks until a Data
@@ -1692,6 +1724,17 @@ mod tests {
         ServerQuicConfig::default()
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct DispatchAttemptTestError;
+
+    impl std::fmt::Display for DispatchAttemptTestError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("dispatch attempt test error")
+        }
+    }
+
+    impl std::error::Error for DispatchAttemptTestError {}
+
     fn make_local_authority(name: &str) -> LocalAuthority {
         let identity = make_identity(name);
         let certified_key =
@@ -2638,6 +2681,72 @@ mod tests {
 
         let _foundation = network.quic().configure_connection(new_builder());
         let _foundation = network.quic().configure_connection(new_builder());
+    }
+
+    #[tokio::test]
+    async fn await_initial_path_attempt_validates_after_timeout() {
+        let validated = AtomicBool::new(false);
+
+        await_initial_path_attempt_or_validate(
+            Duration::from_millis(1),
+            std::future::pending::<Result<(), DispatchAttemptTestError>>(),
+            || {
+                validated.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect("validation should decide timed-out attempts");
+
+        assert!(
+            validated.load(Ordering::SeqCst),
+            "validate should run when attempted state does not arrive"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_initial_path_attempt_skips_validate_after_attempted() {
+        let validated = AtomicBool::new(false);
+
+        await_initial_path_attempt_or_validate(
+            Duration::from_secs(1),
+            std::future::ready(Ok::<(), DispatchAttemptTestError>(())),
+            || {
+                validated.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect("attempted connection should pass");
+
+        assert!(
+            !validated.load(Ordering::SeqCst),
+            "validate should not run after attempted state"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_initial_path_attempt_returns_attempt_error_without_validate() {
+        let validated = AtomicBool::new(false);
+
+        let error = await_initial_path_attempt_or_validate(
+            Duration::from_secs(1),
+            std::future::ready(Err::<(), DispatchAttemptTestError>(
+                DispatchAttemptTestError,
+            )),
+            || {
+                validated.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("attempt error should be returned");
+
+        assert_eq!(error, DispatchAttemptTestError);
+        assert!(
+            !validated.load(Ordering::SeqCst),
+            "validate should not run after connection termination"
+        );
     }
 
     #[test]

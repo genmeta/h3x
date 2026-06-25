@@ -1,12 +1,11 @@
 use std::{
     borrow::Cow,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
-use dashmap::{DashMap, mapref::entry::Entry};
 use dhttp_identity::identity::{self as authority, SignError};
 use futures::{Sink, Stream, future::BoxFuture};
 use rustls::{pki_types::CertificateDer, sign::CertifiedKey};
@@ -42,88 +41,6 @@ pub fn convert_connection_error(error: dquic::prelude::Error) -> quic::Connectio
             })
         }
     }
-}
-
-type DquicConnectionId = dquic::qbase::cid::ConnectionId;
-
-#[derive(Clone)]
-struct LatchedConnectionError {
-    origin_dcid: Option<DquicConnectionId>,
-    error: quic::ConnectionError,
-}
-
-fn dquic_connection_latches() -> &'static DashMap<usize, LatchedConnectionError> {
-    static LATCHES: OnceLock<DashMap<usize, LatchedConnectionError>> = OnceLock::new();
-    LATCHES.get_or_init(DashMap::new)
-}
-
-fn dquic_connection_key(connection: &dquic::prelude::Connection) -> usize {
-    std::ptr::from_ref(connection).cast::<()>() as usize
-}
-
-fn dquic_origin_dcid(connection: &dquic::prelude::Connection) -> Option<DquicConnectionId> {
-    connection.origin_dcid().ok()
-}
-
-fn is_stale_latch(
-    stored_origin: Option<DquicConnectionId>,
-    current_origin: Option<DquicConnectionId>,
-) -> bool {
-    match (stored_origin, current_origin) {
-        (Some(stored), Some(current)) => stored != current,
-        (None, Some(_)) => true,
-        _ => false,
-    }
-}
-
-fn latched_connection_error(
-    connection: &dquic::prelude::Connection,
-) -> Option<quic::ConnectionError> {
-    let key = dquic_connection_key(connection);
-    let entry = dquic_connection_latches().get(&key)?;
-    if is_stale_latch(entry.origin_dcid, dquic_origin_dcid(connection)) {
-        drop(entry);
-        dquic_connection_latches().remove(&key);
-        None
-    } else {
-        Some(entry.error.clone())
-    }
-}
-
-fn latch_connection_error(
-    connection: &dquic::prelude::Connection,
-    origin_dcid: Option<DquicConnectionId>,
-    error: quic::ConnectionError,
-) -> quic::ConnectionError {
-    let key = dquic_connection_key(connection);
-    match dquic_connection_latches().entry(key) {
-        Entry::Occupied(mut entry) => {
-            if is_stale_latch(entry.get().origin_dcid, origin_dcid) {
-                entry.insert(LatchedConnectionError {
-                    origin_dcid,
-                    error: error.clone(),
-                });
-                error
-            } else {
-                entry.get().error.clone()
-            }
-        }
-        Entry::Vacant(entry) => {
-            entry.insert(LatchedConnectionError {
-                origin_dcid,
-                error: error.clone(),
-            });
-            error
-        }
-    }
-}
-
-fn convert_and_latch_connection_error(
-    connection: &dquic::prelude::Connection,
-    error: dquic::prelude::Error,
-) -> quic::ConnectionError {
-    let origin_dcid = dquic_origin_dcid(connection);
-    latch_connection_error(connection, origin_dcid, convert_connection_error(error))
 }
 
 pub fn convert_stream_error(error: dquic::prelude::StreamError) -> quic::StreamError {
@@ -271,17 +188,13 @@ impl quic::ManageStream for dquic::prelude::Connection {
         let stream = self
             .open_bi_stream()
             .await
-            .map_err(|error| convert_and_latch_connection_error(self, error))?;
+            .map_err(convert_connection_error)?;
         let (stream_id, (reader, writer)) = stream.ok_or_else(|| {
-            latch_connection_error(
-                self,
-                dquic_origin_dcid(self),
-                quic::ConnectionError::from(quic::TransportError {
-                    kind: VarInt::from_u32(0x04), // STREAM_LIMIT_ERROR
-                    frame_type: VarInt::from_u32(0),
-                    reason: "stream ID space exhausted".into(),
-                }),
-            )
+            quic::ConnectionError::from(quic::TransportError {
+                kind: VarInt::from_u32(0x04), // STREAM_LIMIT_ERROR
+                frame_type: VarInt::from_u32(0),
+                reason: "stream ID space exhausted".into(),
+            })
         })?;
         let stream_id = convert_varint(stream_id.into());
         let reader = StreamReader { stream_id, reader };
@@ -293,17 +206,13 @@ impl quic::ManageStream for dquic::prelude::Connection {
         let stream = self
             .open_uni_stream()
             .await
-            .map_err(|error| convert_and_latch_connection_error(self, error))?;
+            .map_err(convert_connection_error)?;
         let (stream_id, writer) = stream.ok_or_else(|| {
-            latch_connection_error(
-                self,
-                dquic_origin_dcid(self),
-                quic::ConnectionError::from(quic::TransportError {
-                    kind: VarInt::from_u32(0x04), // STREAM_LIMIT_ERROR
-                    frame_type: VarInt::from_u32(0),
-                    reason: "stream ID space exhausted".into(),
-                }),
-            )
+            quic::ConnectionError::from(quic::TransportError {
+                kind: VarInt::from_u32(0x04), // STREAM_LIMIT_ERROR
+                frame_type: VarInt::from_u32(0),
+                reason: "stream ID space exhausted".into(),
+            })
         })?;
         let stream_id = convert_varint(stream_id.into());
         Ok(StreamWriter { stream_id, writer })
@@ -315,7 +224,7 @@ impl quic::ManageStream for dquic::prelude::Connection {
         let (stream_id, (reader, writer)) = self
             .accept_bi_stream()
             .await
-            .map_err(|error| convert_and_latch_connection_error(self, error))?;
+            .map_err(convert_connection_error)?;
         let stream_id = convert_varint(stream_id.into());
         let reader = StreamReader { stream_id, reader };
         let writer = StreamWriter { stream_id, writer };
@@ -326,7 +235,7 @@ impl quic::ManageStream for dquic::prelude::Connection {
         let (stream_id, reader) = self
             .accept_uni_stream()
             .await
-            .map_err(|error| convert_and_latch_connection_error(self, error))?;
+            .map_err(convert_connection_error)?;
         let stream_id = convert_varint(stream_id.into());
         Ok(StreamReader { stream_id, reader })
     }
@@ -372,10 +281,9 @@ impl quic::WithLocalAuthority for dquic::prelude::Connection {
     type LocalAuthority = DquicLocalAuthority;
 
     async fn local_authority(&self) -> Result<Option<DquicLocalAuthority>, quic::ConnectionError> {
-        let authority = self
-            .local_authority()
+        let authority = dquic::prelude::Connection::local_authority(self)
             .await
-            .map_err(|error| convert_and_latch_connection_error(self, error))?;
+            .map_err(convert_connection_error)?;
         Ok(authority.map(|authority| {
             let name = AsRef::<Arc<str>>::as_ref(&authority).clone();
             let certified_key = AsRef::<Arc<CertifiedKey>>::as_ref(&authority).clone();
@@ -393,10 +301,9 @@ impl quic::WithRemoteAuthority for dquic::prelude::Connection {
     async fn remote_authority(
         &self,
     ) -> Result<Option<DquicRemoteAuthority>, quic::ConnectionError> {
-        let authority = self
-            .remote_authority()
+        let authority = dquic::prelude::Connection::remote_authority(self)
             .await
-            .map_err(|error| convert_and_latch_connection_error(self, error))?;
+            .map_err(convert_connection_error)?;
         Ok(authority.map(|authority| {
             let name = AsRef::<Arc<str>>::as_ref(&authority).clone();
             let cert_chain = AsRef::<Arc<[CertificateDer]>>::as_ref(&authority).clone();
@@ -411,20 +318,11 @@ impl quic::Lifecycle for dquic::prelude::Connection {
     }
 
     fn check(&self) -> Result<(), quic::ConnectionError> {
-        if let Some(error) = latched_connection_error(self) {
-            return Err(error);
-        }
-        self.validate()
-            .map_err(|error| convert_and_latch_connection_error(self, error))
+        self.validate().map_err(convert_connection_error)
     }
 
     async fn closed(&self) -> quic::ConnectionError {
-        if let Some(error) = latched_connection_error(self) {
-            return error;
-        }
-        let origin_dcid = dquic_origin_dcid(self);
-        let error = convert_connection_error(dquic::prelude::Connection::terminated(self).await);
-        latch_connection_error(self, origin_dcid, error)
+        convert_connection_error(dquic::prelude::Connection::terminated(self).await)
     }
 }
 
@@ -490,7 +388,8 @@ impl quic::Connect for Arc<dquic::prelude::QuicClient> {
         } else {
             server.host().to_string()
         };
-        dquic::prelude::QuicClient::connect(self, &name).await
+        let connection = dquic::prelude::QuicClient::connect(self, &name).await?;
+        Ok(connection)
     }
 }
 
@@ -506,7 +405,7 @@ mod tests {
 
     use dquic::{
         prelude::{
-            IO,
+            Connection, IO,
             handy::{ToCertificate, ToPrivateKey},
         },
         qbase::{
@@ -589,8 +488,8 @@ mod tests {
     struct ConnectedPair {
         _client_endpoint: crate::dquic::QuicEndpoint,
         _server_endpoint: crate::dquic::QuicEndpoint,
-        client: Arc<dquic::prelude::Connection>,
-        server: Arc<dquic::prelude::Connection>,
+        client: Arc<Connection>,
+        server: Arc<Connection>,
     }
 
     async fn connected_pair() -> ConnectedPair {
@@ -640,14 +539,6 @@ mod tests {
         }
     }
 
-    fn transport_connection_error(kind: u32) -> quic::ConnectionError {
-        quic::ConnectionError::from(quic::TransportError {
-            kind: VarInt::from_u32(kind),
-            frame_type: VarInt::from_u32(0),
-            reason: format!("test transport {kind}").into(),
-        })
-    }
-
     fn assert_transport_error(
         error: quic::ConnectionError,
         expected_kind: VarInt,
@@ -667,18 +558,6 @@ mod tests {
         let value = DquicVarInt::from_u64(0x1234_5678).expect("dquic varint");
 
         assert_eq!(convert_varint(value), VarInt::from_u32(0x1234_5678));
-    }
-
-    #[test]
-    fn stale_latch_detection_matches_origin_pairs() {
-        let first = DquicConnectionId::from_slice(b"first");
-        let second = DquicConnectionId::from_slice(b"second");
-
-        assert!(is_stale_latch(Some(first), Some(second)));
-        assert!(is_stale_latch(None, Some(first)));
-        assert!(!is_stale_latch(Some(first), Some(first)));
-        assert!(!is_stale_latch(Some(first), None));
-        assert!(!is_stale_latch(None, None));
     }
 
     #[test]
@@ -824,79 +703,12 @@ mod tests {
             error.is_application() || error.is_transport(),
             "closed should report a terminal connection error"
         );
-        let checked = Lifecycle::check(server.as_ref()).expect_err("terminal error is latched");
+        let checked = Lifecycle::check(server.as_ref()).expect_err("terminal error is sticky");
         assert_eq!(checked.to_string(), error.to_string());
         let repeated = Lifecycle::closed(server.as_ref())
             .now_or_never()
-            .expect("latched closed should resolve immediately");
+            .expect("terminal closed should resolve immediately");
         assert_eq!(repeated.to_string(), error.to_string());
-    }
-
-    #[tokio::test]
-    async fn stale_latched_connection_error_is_discarded() {
-        let pair = connected_pair().await;
-        let connection = pair.client.as_ref();
-        let key = dquic_connection_key(connection);
-        let stale_origin = Some(DquicConnectionId::from_slice(b"not-current"));
-
-        latch_connection_error(connection, stale_origin, transport_connection_error(0x31));
-
-        assert!(latched_connection_error(connection).is_none());
-        assert!(dquic_connection_latches().get(&key).is_none());
-        close_pair(&pair);
-    }
-
-    #[tokio::test]
-    async fn connection_error_latch_reuses_current_origin_and_replaces_stale_origin() {
-        let pair = connected_pair().await;
-        let connection = pair.client.as_ref();
-        let key = dquic_connection_key(connection);
-        let origin = dquic_origin_dcid(connection);
-        let stale_origin = Some(DquicConnectionId::from_slice(b"not-current"));
-        dquic_connection_latches().remove(&key);
-
-        let first = latch_connection_error(connection, origin, transport_connection_error(0x32));
-        assert_transport_error(
-            first,
-            VarInt::from_u32(0x32),
-            VarInt::from_u32(0),
-            "test transport 50",
-        );
-
-        let reused = latch_connection_error(connection, origin, transport_connection_error(0x33));
-        assert_transport_error(
-            reused,
-            VarInt::from_u32(0x32),
-            VarInt::from_u32(0),
-            "test transport 50",
-        );
-
-        let replaced =
-            latch_connection_error(connection, stale_origin, transport_connection_error(0x34));
-        assert_transport_error(
-            replaced,
-            VarInt::from_u32(0x34),
-            VarInt::from_u32(0),
-            "test transport 52",
-        );
-        assert!(latched_connection_error(connection).is_none());
-
-        let converted = convert_and_latch_connection_error(
-            connection,
-            DquicError::Quic(QuicError::with_default_fty(
-                ErrorKind::ProtocolViolation,
-                "converted failure",
-            )),
-        );
-        assert_transport_error(
-            converted,
-            VarInt::from_u32(0x0a),
-            VarInt::from_u32(0),
-            "converted failure",
-        );
-
-        dquic_connection_latches().remove(&key);
-        close_pair(&pair);
     }
 
     #[tokio::test]
