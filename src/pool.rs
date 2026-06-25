@@ -1229,6 +1229,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_attempt_drop_releases_entry_closed_during_attempt() {
+        let pool = Pool::<crate::connection::tests::MockConnection>::empty();
+        let server = matching_server();
+        let builder = Arc::new(ConnectionBuilder::default());
+        let first_quic = crate::connection::tests::MockConnection::new();
+        let first = Arc::new(mock_connection_with_dhttp(first_quic.clone()));
+        let reusable = Arc::new(ReuseableConnection::pending());
+
+        reusable.insert(first.clone(), abort_handle()).await;
+        pool.connections.insert(server.clone(), reusable);
+
+        // Force the next caller down the connect-attempt path while the old
+        // connection is still present in the entry. This models an active
+        // replacement attempt holding the same ReuseableConnection entry.
+        first
+            .dhttp()
+            .peer_goaway
+            .set(Goaway::new(VarInt::from_u32(1)));
+
+        let (replacement_connector, replacement_gate) =
+            TestConnector::succeed_with_first_call_gate();
+        let replacement =
+            pool.reuse_or_connect_with(&replacement_connector, builder, server.clone());
+        let mut replacement = std::pin::pin!(replacement);
+
+        assert!(
+            futures::poll!(replacement.as_mut()).is_pending(),
+            "replacement connect should be gated while holding the pool entry",
+        );
+        assert_eq!(
+            replacement_connector.call_count(),
+            1,
+            "replacement attempt should have started one dial",
+        );
+
+        wait_until("replacement attempt to hold the existing entry", || {
+            let Some(entry) = pool.connections.get(&server) else {
+                return false;
+            };
+            Arc::strong_count(entry.value()) >= 2
+        })
+        .await;
+
+        first_quic.set_terminal_error(test_connection_error("closed during replacement"));
+
+        // Deterministically model the close watcher trying to release while the
+        // replacement connect attempt still holds the entry. The release must
+        // not remove the entry yet, otherwise a later caller could create a
+        // parallel same-authority entry.
+        pool.clone().spawn_try_release(server.clone());
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            pool.len(),
+            1,
+            "active replacement attempt must keep the stale entry serialized",
+        );
+
+        drop(replacement);
+        drop(replacement_gate);
+
+        wait_until("stale entry release after replacement attempt drop", || {
+            pool.is_empty()
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn spawn_try_release_waits_until_no_other_waiter_holds_entry() {
         let pool = Pool::<crate::connection::tests::MockConnection>::empty();
         let quic = crate::connection::tests::MockConnection::new();
