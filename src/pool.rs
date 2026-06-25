@@ -85,10 +85,49 @@ impl<C: quic::Connection> Clone for Pool<C> {
     }
 }
 
+#[derive(Debug)]
+struct ReuseableConnectionGuard<C: quic::Connection> {
+    pool: Pool<C>,
+    identify: Authority,
+    entry: Option<Arc<ReuseableConnection<C>>>,
+}
+
+impl<C: quic::Connection> std::ops::Deref for ReuseableConnectionGuard<C> {
+    type Target = ReuseableConnection<C>;
+
+    fn deref(&self) -> &Self::Target {
+        self.entry
+            .as_deref()
+            .expect("reuseable connection guard used after drop")
+    }
+}
+
+impl<C: quic::Connection> Drop for ReuseableConnectionGuard<C> {
+    fn drop(&mut self) {
+        let entry = self.entry.take();
+        drop(entry);
+        self.pool.clone().spawn_try_release(self.identify.clone());
+    }
+}
+
 impl<C: quic::Connection> Pool<C> {
     pub fn empty() -> Self {
         Self {
             connections: Default::default(),
+        }
+    }
+
+    fn checkout(&self, identify: Authority) -> ReuseableConnectionGuard<C> {
+        let connection = self
+            .connections
+            .entry(identify.clone())
+            .or_insert_with(|| Arc::new(ReuseableConnection::pending()))
+            .clone();
+
+        ReuseableConnectionGuard {
+            pool: self.clone(),
+            identify,
+            entry: Some(connection),
         }
     }
 
@@ -147,10 +186,17 @@ impl<C: quic::Connection> Pool<C> {
         tokio::spawn(
             async move {
                 (self.connections.as_ref()).remove_if(&identify, |_, connection| {
-                    // only drop the entry when no other waiter holds it; otherwise we would
-                    // orphan the waiters and let a concurrent caller create a parallel entry
-                    // at the same key, causing unbounded connection fission on persistent
-                    // handshake failures.
+                    // Only drop the entry when no active holder keeps it
+                    // serialized. The pool never creates Weak references to
+                    // ReuseableConnection, so strong_count == 1 means the
+                    // DashMap slot is the only strong owner. If Weak is ever
+                    // introduced for this type, this predicate must be
+                    // reviewed because Weak::upgrade could create a new
+                    // strong holder after this check.
+                    //
+                    // The reuse check is also required: a unique entry that
+                    // still contains a live reusable connection is the normal
+                    // steady-state pool cache and must be retained.
                     Arc::strong_count(connection) == 1 && connection.reuse().is_none()
                 });
             }
@@ -168,11 +214,7 @@ impl<C: quic::Connection> Pool<C> {
     where
         Client: quic::Connect<Connection = C>,
     {
-        let reuseable_connection = self
-            .connections
-            .entry(server.clone())
-            .or_insert_with(|| Arc::new(ReuseableConnection::pending()))
-            .clone();
+        let reuseable_connection = self.checkout(server.clone());
         // break borrow of dashmap::Entry to avoid deadlock
 
         let result = {
@@ -235,7 +277,7 @@ impl<C: quic::Connection> Pool<C> {
 
         match &result {
             Ok(..) => tracing::trace!("connection ready to use"),
-            Err(..) => self.clone().spawn_try_release(server),
+            Err(..) => tracing::trace!("connection attempt failed"),
         }
 
         result
@@ -1250,9 +1292,8 @@ mod tests {
 
         let (replacement_connector, replacement_gate) =
             TestConnector::succeed_with_first_call_gate();
-        let replacement =
-            pool.reuse_or_connect_with(&replacement_connector, builder, server.clone());
-        let mut replacement = std::pin::pin!(replacement);
+        let mut replacement =
+            Box::pin(pool.reuse_or_connect_with(&replacement_connector, builder, server.clone()));
 
         assert!(
             futures::poll!(replacement.as_mut()).is_pending(),
