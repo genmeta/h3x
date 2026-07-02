@@ -1,4 +1,10 @@
 [![License: Apache-2.0](https://img.shields.io/github/license/genmeta/h3x)](https://www.apache.org/licenses/LICENSE-2.0)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/genmeta/h3x/ci.yml)](https://github.com/genmeta/h3x/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/genmeta/h3x/graph/badge.svg)](https://codecov.io/gh/genmeta/h3x)
+[![crates.io](https://img.shields.io/crates/v/h3x.svg)](https://crates.io/crates/h3x)
+[![Documentation](https://docs.rs/h3x/badge.svg)](https://docs.rs/h3x/)
+[![Dependencies](https://img.shields.io/deps-rs/repo/github/genmeta/h3x)](https://github.com/genmeta/h3x/network/dependencies)
+![MSRV](https://img.shields.io/crates/msrv/h3x)
 
 Peer-to-peer DHTTP/3 transport over QUIC, implemented in Rust.
 
