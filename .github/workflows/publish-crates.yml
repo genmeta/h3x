@@ -119,5 +119,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --verify-tag \
             --title "$GITHUB_REF_NAME" \
-            --notes-from-tag \
-            --repo "$GITHUB_REPOSITORY"
+            --notes-from-tag
