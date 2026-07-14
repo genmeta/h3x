@@ -12,6 +12,7 @@ Peer-to-peer DHTTP/3 transport over QUIC, implemented in Rust.
 - **Asynchronous I/O**: Built on the Rust asynchronous ecosystem, providing high-performance I/O processing capabilities.
 - **Zero-Copy**: Achieves full-link *zero-copy* from the QUIC layer to the application layer.
 - **Multipath QUIC**: Integrates the `dquic` implementation, featuring efficient transmission, robust authentication capabilities, and high extensibility.
+- **Network Interface Monitoring** *(feature `netwatcher`, opt-in)*: Enables dquic to react to local network-interface changes.
 - **Hyper / Tower Compatibility** *(feature `hyper`, enabled by default)*: Provides a single-file `h3x::hyper` facade for hyper-facing integrations. The facade exposes `TowerService`, `HyperService`, request execution errors, upgrade/takeover helpers, Extended CONNECT helpers, and protocol extension helpers. Lower-level hyper adapters also remain available from their semantic owners: `dhttp::message::hyper`, `endpoint::hyper`, `qpack::field::hyper`, and `extended_connect::hyper`.
 - **RPC / IPC** *(features `rpc` and `ipc`, experimental)*: Optional [`remoc`](https://crates.io/crates/remoc) integration for remote trait calls (RTC) over QUIC connections, with optional IPC transport support. Consumers must select exactly one `remoc/default-codec-*` feature; h3x tests use the bincode codec through a dev-dependency.
 - **Extended CONNECT**: Supports [Extended CONNECT (RFC9220)](https://datatracker.ietf.org/doc/html/rfc9220) for protocol tunneling over HTTP/3.
@@ -146,12 +147,12 @@ h3x uses one canonical test entrypoint for local development and CI:
 cargo test --all-features --all-targets
 ```
 
-All feature-gated paths, including `rpc`, `ipc`, `webtransport`, `dquic`, and `hyper`, must compile and test through that command. The dev-dependency on `remoc` selects the bincode default codec for tests so `rpc`/`ipc` can compile under `--all-features`.
+All feature-gated paths, including `rpc`, `ipc`, `webtransport`, `dquic`, `netwatcher`, and `hyper`, must compile and test through that command. The dev-dependency on `remoc` selects the bincode default codec for tests so `rpc`/`ipc` can compile under `--all-features`.
 
 Documentation is checked with warnings denied for all non-`rpc`/`ipc` features:
 
 ```bash
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features --features dquic,hyper,serde,testing,webtransport
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features --features dquic,hyper,netwatcher,serde,testing,webtransport
 ```
 
 Coverage uses `cargo-llvm-cov` directly:

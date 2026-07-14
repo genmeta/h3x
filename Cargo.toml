@@ -31,7 +31,7 @@ tower-service = "0.3"
 dhttp-identity = "0.3.0-beta.1"
 
 # feature dquic
-dquic = { version = "0.7.0-beta.2", optional = true }
+dquic = { git = "https://github.com/genmeta/dquic.git", branch = "feat/optional-netwatcher", optional = true }
 
 # feature hyper
 http-body = { version = "1", optional = true }
@@ -75,6 +75,8 @@ dquic = [
     "dep:peg",
     "tokio/time",
 ]
+# Enables dquic's optional network-interface change watcher.
+netwatcher = ["dquic", "dquic/netwatcher"]
 hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
 serde = ["dep:serde"]
 # EXPERIMENTAL — consumer crates must also enable exactly one remoc default-codec-* feature.
