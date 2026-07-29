@@ -5,7 +5,7 @@
 //! the layered stream routing architecture.
 
 use std::{
-    fmt, ops,
+    fmt, io, ops,
     pin::{Pin, pin},
     sync::Arc,
 };
@@ -17,7 +17,7 @@ use futures::{
     stream::{self, FusedStream},
 };
 use snafu::Snafu;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::{io::AsyncBufReadExt as _, sync::Mutex as AsyncMutex};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
@@ -41,7 +41,7 @@ use crate::{
     },
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     quic::{self, ConnectionError, GetStreamIdExt, ResetStreamExt, StopStreamExt},
-    util::{ring_channel::RingChannel, set_once::SetOnce, watch::Watch},
+    util::{diagnostic_hex_prefix, ring_channel::RingChannel, set_once::SetOnce, watch::Watch},
     varint::VarInt,
 };
 
@@ -355,7 +355,7 @@ mod tests {
             StreamVerdict::Passed(_)
         ));
 
-        let bi = test_peekable_bi_stream_with_bytes(28, &[0x41]).await;
+        let bi = test_peekable_bi_stream_with_bytes(28, &[0x40, 0x41]).await;
         assert!(matches!(
             Protocol::accept_bi(state.dhttp(), bi)
                 .await
@@ -748,17 +748,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_bi_passes_stream_when_frame_type_cannot_be_decoded() {
+    async fn accept_bi_rejects_stream_when_frame_type_cannot_be_decoded() {
         let state = test_connection_state();
         let stream = test_empty_peekable_bi_stream(0);
 
+        let Err(error) = state.dhttp().accept_bi(stream).await else {
+            panic!("empty bidi stream should be rejected");
+        };
         assert!(matches!(
-            state
-                .dhttp()
-                .accept_bi(stream)
-                .await
-                .expect("empty bidi verdict"),
-            StreamVerdict::Passed(_)
+            error,
+            StreamError::Reset { code } if code == Code::H3_FRAME_ERROR.into_inner()
         ));
     }
 
@@ -801,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn accept_bi_passes_unknown_frame_type() {
         let state = test_connection_state();
-        let stream = test_peekable_bi_stream_with_bytes(20, &[0x41]).await;
+        let stream = test_peekable_bi_stream_with_bytes(20, &[0x40, 0x41]).await;
 
         assert!(matches!(
             state
@@ -1407,6 +1406,15 @@ impl std::fmt::Debug for DHttpProtocol {
 }
 
 impl DHttpProtocol {
+    fn classification_error(error: io::Error) -> StreamError {
+        match quic::StreamError::try_from(error) {
+            Ok(error) => error.into(),
+            Err(_) => StreamError::Reset {
+                code: Code::H3_FRAME_ERROR.into_inner(),
+            },
+        }
+    }
+
     pub async fn max_unresolved_request_streams(&self) -> usize {
         self.unresolved_request_streams.capacity()
     }
@@ -1499,16 +1507,52 @@ impl DHttpProtocol {
         // accepted. Note that reserved frames MAY appear before HEADERS on a
         // request stream (RFC 9114 §7.2.8). Everything else is passed to the
         // next protocol layer.
-        let frame_type = match reader.decode_one::<VarInt>().await {
-            Ok(v) => v,
-            Err(_) => {
-                // Stream closed or error before we could read a frame type.
-                // Cannot determine protocol — pass to the next layer.
-                return Ok(StreamVerdict::Passed((reader, writer)));
+        let stream_id = match reader.stream_id().await {
+            Ok(stream_id) => Some(stream_id),
+            Err(error) => {
+                tracing::warn!(?error, "DHTTP classifier could not resolve stream id");
+                None
+            }
+        };
+        let (first_chunk_bytes, prefix) = match reader.fill_buf().await {
+            Ok(bytes) => (bytes.len(), diagnostic_hex_prefix(bytes)),
+            Err(error) => {
+                tracing::warn!(
+                    boundary = "dhttp-classifier",
+                    stream_id = ?stream_id.map(|id| id.into_inner()),
+                    ?error,
+                    "DHTTP classifier could not peek stream payload"
+                );
+                return Err(Self::classification_error(error));
             }
         };
 
-        if Self::is_http3_frame_type(frame_type) {
+        let frame_type = match reader.decode_one::<VarInt>().await {
+            Ok(v) => v,
+            Err(error) => {
+                tracing::warn!(
+                    boundary = "dhttp-classifier",
+                    stream_id = ?stream_id.map(|id| id.into_inner()),
+                    bytes = first_chunk_bytes,
+                    prefix = %prefix,
+                    ?error,
+                    "DHTTP bidirectional stream frame type decode failed"
+                );
+                return Err(Self::classification_error(error));
+            }
+        };
+
+        let recognized = Self::is_http3_frame_type(frame_type);
+        if recognized {
+            tracing::info!(
+                boundary = "dhttp-classifier",
+                stream_id = ?stream_id.map(|id| id.into_inner()),
+                bytes = first_chunk_bytes,
+                prefix = %prefix,
+                frame_type = frame_type.into_inner(),
+                recognized,
+                "DHTTP bidirectional stream classified"
+            );
             // This is an HTTP/3 request stream. Reset the peek cursor so the
             // frame type can be re-read by FrameStream during request processing.
             Pin::new(&mut reader).reset();
@@ -1526,6 +1570,16 @@ impl DHttpProtocol {
         } else {
             // Not an HTTP/3 frame type. Reset cursor so the next protocol
             // layer can re-read the first bytes.
+            Pin::new(&mut reader).reset();
+            tracing::warn!(
+                boundary = "dhttp-classifier",
+                stream_id = ?stream_id.map(|id| id.into_inner()),
+                bytes = first_chunk_bytes,
+                prefix = %prefix,
+                frame_type = frame_type.into_inner(),
+                recognized,
+                "DHTTP bidirectional stream rejected by classifier"
+            );
             Ok(StreamVerdict::Passed((reader, writer)))
         }
     }
