@@ -1635,7 +1635,7 @@ impl DHttpProtocolFactory {
             connection,
             control_stream: AsyncMutex::new(control_stream),
             handle_control_stream: SetOnce::new(),
-            unresolved_request_streams: RingChannel::new(32), // TODO: configurable capacity
+            unresolved_request_streams: RingChannel::new(256), // TODO: configurable capacity
         })
     }
 }
