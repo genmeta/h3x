@@ -3,6 +3,8 @@
 //! This module is the single home for typed stream command/event drivers used
 //! by RPC, IPC, and WebTransport IPC stream forwarding.
 
+use crate::util::diagnostic_hex_prefix;
+
 pub(crate) mod drain;
 pub(crate) mod error;
 pub(crate) mod frame;

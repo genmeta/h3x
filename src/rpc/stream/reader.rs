@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::{Stream, stream::FusedStream};
 
 use super::{
-    drain,
+    diagnostic_hex_prefix, drain,
     error::{
         DeferredStreamError, DriverProtocolError, defer_err_conn, latch_frame_io_error,
         latch_protocol_error, stream_bridge_eof,
@@ -139,6 +139,7 @@ pin_project_lite::pin_project! {
         send_state: SendState<ReadOperation>,
         recv_state: ReaderRecvState,
         results: ReaderResults,
+        first_push_logged: bool,
         _error: PhantomData<fn(E)>,
     }
 }
@@ -160,6 +161,7 @@ where
                 send_state: SendState::default(),
                 recv_state: ReaderRecvState::default(),
                 results: ReaderResults::default(),
+                first_push_logged: false,
                 _error: PhantomData,
             }),
         }
@@ -274,12 +276,24 @@ where
 
     fn pair_response(
         lifecycle: &Arc<L>,
+        stream_id: VarInt,
+        first_push_logged: &mut bool,
         results: &mut ReaderResults,
         sent: ReadOperation,
         frame: ReadEvent,
     ) -> Result<(), ReaderFault> {
         match (sent, frame) {
             (ReadOperation::Pull, ReadEvent::Push { data }) => {
+                if !*first_push_logged {
+                    *first_push_logged = true;
+                    tracing::info!(
+                        boundary = "ipc-worker",
+                        stream_id = stream_id.into_inner(),
+                        bytes = data.len(),
+                        prefix = %diagnostic_hex_prefix(&data),
+                        "IPC worker stream first payload chunk"
+                    );
+                }
                 results.pull = Some(ReaderPullResult::Push(data));
                 Ok(())
             }
@@ -365,7 +379,14 @@ where
                     match ready!(this.bridge.as_mut().poll_next(cx)) {
                         Some(Ok(frame)) => {
                             *this.recv_state = ReaderRecvState::Idle;
-                            Self::pair_response(this.lifecycle, this.results, sent, frame)?;
+                            Self::pair_response(
+                                this.lifecycle,
+                                *this.stream_id,
+                                this.first_push_logged,
+                                this.results,
+                                sent,
+                                frame,
+                            )?;
                         }
                         Some(Err(error)) => {
                             return Poll::Ready(Err(Self::frame_io_fault_for(
@@ -374,6 +395,12 @@ where
                             )));
                         }
                         None => {
+                            tracing::warn!(
+                                boundary = "ipc-worker",
+                                stream_id = this.stream_id.into_inner(),
+                                operation = ?sent,
+                                "IPC worker read-event channel reached EOF while awaiting response"
+                            );
                             return Poll::Ready(Err(Self::protocol_fault_for(
                                 this.lifecycle,
                                 DriverProtocolError::FrameEof,
@@ -757,7 +784,16 @@ where
     ) -> Poll<Result<(), quic::StreamError>> {
         match self.as_mut().project() {
             BridgeStreamReaderProj::Active { active } => {
+                let stream_id = active.as_ref().get_ref().stream_id;
                 let commit = active.as_mut().commit_stop_pinned(code);
+                if commit == CommitResult::Committed {
+                    tracing::info!(
+                        boundary = "ipc-worker",
+                        stream_id = stream_id.into_inner(),
+                        code = code.into_inner(),
+                        "IPC worker stream stop committed"
+                    );
+                }
                 let committed_code = match commit {
                     CommitResult::Committed | CommitResult::Duplicate => code,
                     CommitResult::Conflict => active
@@ -768,6 +804,12 @@ where
 
                 match ready!(active.as_mut().drive_stop(cx, committed_code)) {
                     Ok(()) => {
+                        tracing::info!(
+                            boundary = "ipc-worker",
+                            stream_id = stream_id.into_inner(),
+                            code = committed_code.into_inner(),
+                            "IPC worker stream stop completed"
+                        );
                         if active.as_ref().has_pull_eos() {
                             let stream_id = active.as_ref().get_ref().stream_id;
                             self.as_mut().project_replace(Self::Eos { stream_id });
@@ -775,6 +817,12 @@ where
                         Poll::Ready(Ok(()))
                     }
                     Err(fault) => {
+                        tracing::warn!(
+                            boundary = "ipc-worker",
+                            stream_id = stream_id.into_inner(),
+                            code = committed_code.into_inner(),
+                            "IPC worker stream stop failed"
+                        );
                         let error = ready!(self.as_mut().close_with_fault(cx, fault));
                         Poll::Ready(Err(error))
                     }

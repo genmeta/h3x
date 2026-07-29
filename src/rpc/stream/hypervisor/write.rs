@@ -5,7 +5,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use snafu::Snafu;
 
 use crate::{
-    quic,
+    quic::{self, GetStreamIdExt as _},
     rpc::stream::{
         frame::{WriteCommand, WriteEvent},
         io::FrameIo,
@@ -42,15 +42,56 @@ where
     Io: FrameIo<WriteEvent, WriteCommand, E> + Send + Unpin,
     E: Error + Send + 'static,
 {
+    let stream_id = match writer.stream_id().await {
+        Ok(stream_id) => Some(stream_id),
+        Err(error) => {
+            tracing::warn!(?error, "QUIC write bridge could not resolve stream id");
+            None
+        }
+    };
     send_write_event(&mut bridge, WriteEvent::Pull).await;
 
     let mut queue = VecDeque::new();
     let mut reset_code = None;
     let mut inbound_closed = false;
     let mut credit_outstanding = true;
+    let mut push_sequence = 0_u64;
 
     loop {
         if let Some(job) = queue.pop_front() {
+            match &job {
+                HyperWriteJob::Push { data } => {
+                    push_sequence += 1;
+                    tracing::info!(
+                        stream_id = ?stream_id.map(|id| id.into_inner()),
+                        sequence = push_sequence,
+                        bytes = data.len(),
+                        "QUIC write bridge push started"
+                    );
+                }
+                HyperWriteJob::Flush => {
+                    tracing::info!(
+                        stream_id = ?stream_id.map(|id| id.into_inner()),
+                        sequence = push_sequence,
+                        "QUIC write bridge flush started"
+                    );
+                }
+                HyperWriteJob::Reset { code } => {
+                    tracing::info!(
+                        boundary = "quic-root",
+                        stream_id = ?stream_id.map(|id| id.into_inner()),
+                        code = code.into_inner(),
+                        "QUIC write bridge reset started"
+                    );
+                }
+                HyperWriteJob::Eos => {
+                    tracing::info!(
+                        boundary = "quic-root",
+                        stream_id = ?stream_id.map(|id| id.into_inner()),
+                        "QUIC write bridge EOS started"
+                    );
+                }
+            }
             let done = {
                 let mut current = Box::pin(run_write_job(&mut writer, job));
                 loop {
@@ -84,6 +125,11 @@ where
 
             match done {
                 Ok(HyperWriteDone::Push) => {
+                    tracing::info!(
+                        stream_id = ?stream_id.map(|id| id.into_inner()),
+                        sequence = push_sequence,
+                        "QUIC write bridge push completed"
+                    );
                     if should_send_credit(inbound_closed, reset_code, &queue, credit_outstanding)
                         && !send_write_credit(
                             &mut bridge,
@@ -98,6 +144,11 @@ where
                     }
                 }
                 Ok(HyperWriteDone::Flush) => {
+                    tracing::info!(
+                        stream_id = ?stream_id.map(|id| id.into_inner()),
+                        sequence = push_sequence,
+                        "QUIC write bridge flush completed"
+                    );
                     send_write_event(&mut bridge, WriteEvent::FlushAck).await;
                     if should_send_credit(inbound_closed, reset_code, &queue, credit_outstanding)
                         && !send_write_credit(
@@ -113,10 +164,21 @@ where
                     }
                 }
                 Ok(HyperWriteDone::Eos) => {
+                    tracing::info!(
+                        boundary = "quic-root",
+                        stream_id = ?stream_id.map(|id| id.into_inner()),
+                        "QUIC write bridge EOS completed"
+                    );
                     send_write_event(&mut bridge, WriteEvent::EosAck).await;
                     return;
                 }
                 Ok(HyperWriteDone::Reset { code }) => {
+                    tracing::info!(
+                        boundary = "quic-root",
+                        stream_id = ?stream_id.map(|id| id.into_inner()),
+                        code = code.into_inner(),
+                        "QUIC write bridge reset completed"
+                    );
                     send_write_event(&mut bridge, WriteEvent::ResetAck { code }).await;
                     return;
                 }

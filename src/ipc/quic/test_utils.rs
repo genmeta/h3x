@@ -891,24 +891,30 @@ async fn open_bi_data_transfer() {
     let (mut reader, mut writer) = quic::ManageStream::open_bi(handle.as_ref()).await.unwrap();
 
     // Server → Client: inject data into the mock QUIC reader → bridge → pipe → PipeReader
-    test_handles
-        .tx_to_reader
-        .send(Bytes::from_static(b"hello from server"))
-        .await
-        .unwrap();
-
-    let chunk = reader.next().await.unwrap().unwrap();
-    assert_eq!(chunk.as_ref(), b"hello from server");
+    for index in 0..16 {
+        test_handles
+            .tx_to_reader
+            .send(Bytes::from(format!("server-{index}")))
+            .await
+            .unwrap();
+    }
+    for index in 0..16 {
+        let chunk = reader.next().await.unwrap().unwrap();
+        assert_eq!(chunk, Bytes::from(format!("server-{index}")));
+    }
 
     // Client → Server: PipeWriter → pipe → bridge → mock QUIC writer → test rx
     use futures::SinkExt;
-    writer
-        .send(Bytes::from_static(b"hello from client"))
-        .await
-        .unwrap();
-
-    let received = test_handles.rx_from_writer.recv().await.unwrap();
-    assert_eq!(received.as_ref(), b"hello from client");
+    for index in 0..16 {
+        writer
+            .send(Bytes::from(format!("client-{index}")))
+            .await
+            .unwrap();
+    }
+    for index in 0..16 {
+        let received = test_handles.rx_from_writer.recv().await.unwrap();
+        assert_eq!(received, Bytes::from(format!("client-{index}")));
+    }
 }
 
 #[tokio::test]

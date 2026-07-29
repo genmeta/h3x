@@ -214,14 +214,29 @@ impl<M> ConnectionAdapter<M> {
         }
     }
 
-    fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+    fn spawn_task(
+        &self,
+        task_kind: &'static str,
+        stream_id: Option<VarInt>,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) {
         let handle = AbortOnDropHandle::new(tokio::spawn(task.in_current_span()));
         let mut tasks = self
             .tasks
             .lock()
             .expect("connection adapter task registry should not be poisoned");
+        let before = tasks.len();
         tasks.retain(|task| !task.is_finished());
+        let reaped = before - tasks.len();
         tasks.push(handle);
+        tracing::info!(
+            boundary = "ipc-root-task-registry",
+            task_kind,
+            stream_id = ?stream_id.map(|id| id.into_inner()),
+            active_tasks = tasks.len(),
+            reaped_tasks = reaped,
+            "IPC root bridge task registered"
+        );
     }
 }
 
@@ -271,7 +286,7 @@ where
         match quic::WithLocalAuthority::local_authority(self.inner.as_ref()).await? {
             Some(agent) => {
                 let (server, client) = LocalAuthorityServerShared::new(Arc::new(agent), 1);
-                self.spawn_task(async move {
+                self.spawn_task("local-authority", None, async move {
                     let _ = server.serve(true).await;
                 });
                 Ok(Some(client))
@@ -284,7 +299,7 @@ where
         match quic::WithRemoteAuthority::remote_authority(self.inner.as_ref()).await? {
             Some(agent) => {
                 let (server, client) = RemoteAuthorityServerShared::new(Arc::new(agent), 1);
-                self.spawn_task(async move {
+                self.spawn_task("remote-authority", None, async move {
                     let _ = server.serve(true).await;
                 });
                 Ok(Some(client))
@@ -357,6 +372,7 @@ where
         mut writer: M::StreamWriter,
         stream_id: VarInt,
     ) -> Result<IpcBiHandle, IpcPlumbingError> {
+        let fd_id = delivery.id();
         // Socketpair for the reader direction: server read hypervisor ↔ client read bridge
         let (srv_a, cli_a) = UnixStream::pair().map_err(|e| ipc_io_plumbing(e, "socketpair"))?;
         // Socketpair for the writer direction: server write hypervisor ↔ client write bridge
@@ -379,11 +395,33 @@ where
             return Err(ipc_io_plumbing(error, "deliver fds"));
         }
 
+        tracing::info!(
+            boundary = "ipc-root-fd-delivery",
+            fd_id = fd_id.into_inner(),
+            stream_id = stream_id.into_inner(),
+            fd_count = 2,
+            "IPC bidirectional stream FDs queued"
+        );
+
         // Bridge reader direction: real QUIC reader ↔ read frame IO on srv_a.
-        self.spawn_task(bridge_reader(reader, srv_a));
+        self.spawn_task("stream-reader", Some(stream_id), async move {
+            bridge_reader(reader, srv_a).await;
+            tracing::info!(
+                boundary = "ipc-root-task-registry",
+                stream_id = stream_id.into_inner(),
+                "IPC root stream reader bridge task finished"
+            );
+        });
 
         // Bridge writer direction: write frame IO on srv_b ↔ real QUIC writer.
-        self.spawn_task(bridge_writer(srv_b, writer));
+        self.spawn_task("stream-writer", Some(stream_id), async move {
+            bridge_writer(srv_b, writer).await;
+            tracing::info!(
+                boundary = "ipc-root-task-registry",
+                stream_id = stream_id.into_inner(),
+                "IPC root stream writer bridge task finished"
+            );
+        });
 
         Ok(IpcBiHandle { stream_id })
     }
@@ -406,7 +444,14 @@ where
         }
 
         // Write frame IO on srv ↔ real QUIC writer.
-        self.spawn_task(bridge_writer(srv, writer));
+        self.spawn_task("stream-writer", Some(stream_id), async move {
+            bridge_writer(srv, writer).await;
+            tracing::info!(
+                boundary = "ipc-root-task-registry",
+                stream_id = stream_id.into_inner(),
+                "IPC root stream writer bridge task finished"
+            );
+        });
 
         Ok(Resolved::ok(IpcUniHandle { stream_id }))
     }
@@ -429,7 +474,14 @@ where
         }
 
         // Real QUIC reader ↔ read frame IO on srv.
-        self.spawn_task(bridge_reader(reader, srv));
+        self.spawn_task("stream-reader", Some(stream_id), async move {
+            bridge_reader(reader, srv).await;
+            tracing::info!(
+                boundary = "ipc-root-task-registry",
+                stream_id = stream_id.into_inner(),
+                "IPC root stream reader bridge task finished"
+            );
+        });
 
         Ok(Resolved::ok(IpcUniHandle { stream_id }))
     }

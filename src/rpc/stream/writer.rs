@@ -1225,7 +1225,16 @@ where
     ) -> Poll<Result<(), quic::StreamError>> {
         match self.as_mut().project() {
             BridgeStreamWriterProj::Active { active } => {
+                let stream_id = active.as_ref().get_ref().stream_id;
                 let commit = active.as_mut().commit_reset_pinned(code);
+                if commit == CommitResult::Committed {
+                    tracing::info!(
+                        boundary = "ipc-worker",
+                        stream_id = stream_id.into_inner(),
+                        code = code.into_inner(),
+                        "IPC worker stream reset committed"
+                    );
+                }
                 let committed_code = match commit {
                     CommitResult::Committed | CommitResult::Duplicate => {
                         active.as_ref().committed_reset_code().unwrap_or(code)
@@ -1238,16 +1247,34 @@ where
 
                 match ready!(active.as_mut().drive_reset(cx, committed_code)) {
                     Ok(ResetDrive::Acked) => {
+                        tracing::info!(
+                            boundary = "ipc-worker",
+                            stream_id = stream_id.into_inner(),
+                            code = committed_code.into_inner(),
+                            "IPC worker stream reset completed"
+                        );
                         active.as_mut().take_reset_result_pinned(committed_code);
                         self.as_mut().transition_reset(committed_code);
                         Poll::Ready(Ok(()))
                     }
                     Ok(ResetDrive::CoveredByEos) => {
+                        tracing::info!(
+                            boundary = "ipc-worker",
+                            stream_id = stream_id.into_inner(),
+                            code = committed_code.into_inner(),
+                            "IPC worker stream reset covered by EOS"
+                        );
                         active.as_mut().take_eos_result_pinned();
                         self.as_mut().transition_eos();
                         Poll::Ready(Ok(()))
                     }
                     Err(fault) => {
+                        tracing::warn!(
+                            boundary = "ipc-worker",
+                            stream_id = stream_id.into_inner(),
+                            code = committed_code.into_inner(),
+                            "IPC worker stream reset failed"
+                        );
                         let error = ready!(self.as_mut().close_with_fault(cx, fault));
                         Poll::Ready(Err(error))
                     }

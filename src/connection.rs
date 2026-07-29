@@ -21,7 +21,7 @@ use crate::{
     error::{Code, H3ConnectionError, H3StreamError},
     protocol::{IdentifiedProtocolInitializer, ProductProtocol, Protocols, StreamVerdict},
     qpack::protocol::QPackProtocolFactory,
-    quic::{self, ResetStreamExt, StopStreamExt},
+    quic::{self, GetStreamIdExt as _, ResetStreamExt, StopStreamExt},
     varint::VarInt,
 };
 
@@ -543,6 +543,7 @@ impl<C: quic::Connection> ConnectionState<C> {
                 let (reader, writer) = match quic::ManageStream::accept_bi(&*state.quic).await {
                     Ok(bi_stream) => bi_stream,
                     Err(error) => {
+                        tracing::warn!(?error, "bidirectional stream accept failed");
                         state.quic.handle_connection_error(error.into()).await;
                         return;
                     }
@@ -551,7 +552,19 @@ impl<C: quic::Connection> ConnectionState<C> {
                     StreamReader::new(Box::pin(reader) as crate::quic::BoxQuicStreamReader);
                 let stream_writer =
                     SinkWriter::new(Box::pin(writer) as crate::quic::BoxQuicStreamWriter);
-                let peekable_bi_stream = (PeekableStreamReader::new(stream_reader), stream_writer);
+                let mut peekable_bi_stream =
+                    (PeekableStreamReader::new(stream_reader), stream_writer);
+                let stream_id = match peekable_bi_stream.0.stream_id().await {
+                    Ok(stream_id) => Some(stream_id),
+                    Err(error) => {
+                        tracing::warn!(?error, "accepted bidirectional stream has no stream id");
+                        None
+                    }
+                };
+                tracing::info!(
+                    stream_id = ?stream_id.map(|id| id.into_inner()),
+                    "bidirectional stream accepted for protocol classification"
+                );
 
                 match state.protocols.accept_bi(peekable_bi_stream).await {
                     Ok(StreamVerdict::Accepted) => continue,
@@ -567,7 +580,20 @@ impl<C: quic::Connection> ConnectionState<C> {
                     // https://datatracker.ietf.org/doc/html/rfc9114#section-9-4
                     Ok(StreamVerdict::Passed((mut stream_reader, mut stream_writer))) => {
                         let code = Code::H3_STREAM_CREATION_ERROR.into_inner();
-                        _ = tokio::join!(stream_reader.stop(code), stream_writer.reset(code))
+                        tracing::warn!(
+                            stream_id = ?stream_id.map(|id| id.into_inner()),
+                            code = code.into_inner(),
+                            "unrecognized bidirectional stream cleanup started"
+                        );
+                        let (stop_result, reset_result) =
+                            tokio::join!(stream_reader.stop(code), stream_writer.reset(code));
+                        tracing::info!(
+                            stream_id = ?stream_id.map(|id| id.into_inner()),
+                            code = code.into_inner(),
+                            ?stop_result,
+                            ?reset_result,
+                            "unrecognized bidirectional stream cleanup completed"
+                        );
                     }
                     Err(stream_error) => {
                         // The stream has been consumed by protocol matching
@@ -584,8 +610,12 @@ impl<C: quic::Connection> ConnectionState<C> {
             }
         };
         tokio::select! {
-            _ = task => {},
-            _ = state.quic.closed() => {},
+            _ = task => {
+                tracing::warn!("bidirectional stream accept task exited");
+            },
+            error = state.quic.closed() => {
+                tracing::warn!(?error, "bidirectional stream accept task stopped by connection lifecycle");
+            },
         }
     }
 
