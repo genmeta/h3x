@@ -12,7 +12,7 @@ use super::{
     drain,
     error::{
         DeferredStreamError, DriverProtocolError, defer_err_conn, latch_frame_io_error,
-        latch_protocol_error,
+        latch_protocol_error, stream_bridge_eof,
     },
     frame::{ReadCommand, ReadEvent},
 };
@@ -261,7 +261,11 @@ where
     quic::ConnectionError: From<E>,
 {
     fn protocol_fault_for(lifecycle: &Arc<L>, error: DriverProtocolError) -> ReaderFault {
-        ReaderFault::Stream(latch_protocol_error(lifecycle.as_ref(), error))
+        let error = match error {
+            DriverProtocolError::FrameEof => stream_bridge_eof(),
+            error => latch_protocol_error(lifecycle.as_ref(), error),
+        };
+        ReaderFault::Stream(error)
     }
 
     fn frame_io_fault_for(lifecycle: &Arc<L>, error: E) -> ReaderFault {
@@ -1259,8 +1263,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frame_io_eof_before_read_eos_latches_connection_frame_eof() {
-        let (mut bridge, mut hypervisor, lifecycle) = reader(VarInt::from_u32(18));
+    async fn frame_io_eof_before_read_eos_cancels_only_the_stream() {
+        let (mut bridge, mut hypervisor, _lifecycle) = reader(VarInt::from_u32(18));
 
         assert!(
             poll_fn(|cx| bridge.poll_next_unpin(cx))
@@ -1273,19 +1277,10 @@ mod tests {
         let Some(Err(error)) = bridge.next().await else {
             panic!("frame eof should return a stream error");
         };
-        let source = stream_connection(error);
-        assert_eq!(
-            transport(&source).reason.as_ref(),
-            "typed frame stream ended before operation completed"
-        );
-        assert_eq!(
-            transport(&source).reason.as_ref(),
-            quic::Lifecycle::closed(lifecycle.as_ref())
-                .await
-                .transport()
-                .reason
-                .as_ref()
-        );
+        let quic::StreamError::Reset { code } = error else {
+            panic!("frame eof should remain stream-scoped");
+        };
+        assert_eq!(code, crate::error::Code::H3_REQUEST_CANCELLED.into_inner());
     }
 
     trait TransportExt {

@@ -5,7 +5,7 @@ use std::{borrow::Cow, sync::Arc};
 use futures::future::BoxFuture;
 use snafu::Snafu;
 
-use crate::{quic, rpc::lifecycle::LifecycleExt, varint::VarInt};
+use crate::{error::Code, quic, rpc::lifecycle::LifecycleExt, varint::VarInt};
 
 const DRIVER_PROTOCOL_ERROR_KIND: VarInt = VarInt::from_u32(0x3f00);
 const DRIVER_PROTOCOL_ERROR_FRAME_TYPE: VarInt = VarInt::from_u32(0x3f01);
@@ -61,6 +61,12 @@ where
         .latch()
         .latch_with(|| protocol_connection_error(error));
     quic::StreamError::Connection { source }
+}
+
+pub(crate) fn stream_bridge_eof() -> quic::StreamError {
+    quic::StreamError::Reset {
+        code: Code::H3_REQUEST_CANCELLED.into_inner(),
+    }
 }
 
 pub(crate) fn latch_frame_io_error<L, E>(lifecycle: &L, error: E) -> quic::StreamError

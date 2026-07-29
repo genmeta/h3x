@@ -12,7 +12,7 @@ use super::{
     drain,
     error::{
         DeferredStreamError, DriverProtocolError, defer_err_conn, latch_frame_io_error,
-        latch_protocol_error,
+        latch_protocol_error, stream_bridge_eof,
     },
     frame::{WriteCommand, WriteEvent},
 };
@@ -434,7 +434,11 @@ where
     quic::ConnectionError: From<E>,
 {
     fn protocol_fault_for(lifecycle: &Arc<L>, error: DriverProtocolError) -> WriterFault {
-        WriterFault::Stream(latch_protocol_error(lifecycle.as_ref(), error))
+        let error = match error {
+            DriverProtocolError::FrameEof => stream_bridge_eof(),
+            error => latch_protocol_error(lifecycle.as_ref(), error),
+        };
+        WriterFault::Stream(error)
     }
 
     fn frame_io_fault_for(lifecycle: &Arc<L>, error: E) -> WriterFault {
@@ -2076,8 +2080,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frame_io_eof_before_terminal_ack_latches_connection_frame_eof() {
-        let (mut bridge, mut hypervisor, lifecycle) = writer(VarInt::from_u32(131));
+    async fn frame_io_eof_before_terminal_ack_cancels_only_the_stream() {
+        let (mut bridge, mut hypervisor, _lifecycle) = writer(VarInt::from_u32(131));
 
         assert!(
             poll_fn(|cx| Pin::new(&mut bridge).poll_close(cx))
@@ -2091,19 +2095,7 @@ mod tests {
             .close()
             .await
             .expect_err("frame eof should fail close");
-        let source = stream_connection(error);
-        assert_eq!(
-            transport(&source).reason.as_ref(),
-            "typed frame stream ended before operation completed"
-        );
-        assert_eq!(
-            transport(&source).reason.as_ref(),
-            quic::Lifecycle::closed(lifecycle.as_ref())
-                .await
-                .transport()
-                .reason
-                .as_ref()
-        );
+        assert_reset(error, crate::error::Code::H3_REQUEST_CANCELLED.into_inner());
     }
 
     trait TransportExt {
