@@ -1494,7 +1494,7 @@ impl DHttpProtocol {
 
     async fn accept_bi(
         &self,
-        (mut reader, writer): (BoxPeekableStreamReader, BoxStreamWriter),
+        (mut reader, mut writer): (BoxPeekableStreamReader, BoxStreamWriter),
     ) -> Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError> {
         // HTTP/3 bidirectional streams are request streams (RFC 9114 §4.1).
         // The first bytes on a request stream are HTTP/3 frames, starting with
@@ -1507,7 +1507,7 @@ impl DHttpProtocol {
         // accepted. Note that reserved frames MAY appear before HEADERS on a
         // request stream (RFC 9114 §7.2.8). Everything else is passed to the
         // next protocol layer.
-        let stream_id = match reader.stream_id().await {
+        let stream_id = match writer.stream_id().await {
             Ok(stream_id) => Some(stream_id),
             Err(error) => {
                 tracing::warn!(?error, "DHTTP classifier could not resolve stream id");
