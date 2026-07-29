@@ -1,181 +1,23 @@
-[![License: Apache-2.0](https://img.shields.io/github/license/genmeta/h3x)](https://www.apache.org/licenses/LICENSE-2.0)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/genmeta/h3x/ci.yml)](https://github.com/genmeta/h3x/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/genmeta/h3x/graph/badge.svg)](https://codecov.io/gh/genmeta/h3x)
-[![crates.io](https://img.shields.io/crates/v/h3x.svg)](https://crates.io/crates/h3x)
-[![Documentation](https://docs.rs/h3x/badge.svg)](https://docs.rs/h3x/)
-[![Dependencies](https://img.shields.io/deps-rs/repo/github/genmeta/h3x)](https://github.com/genmeta/h3x/network/dependencies)
-![MSRV](https://img.shields.io/crates/msrv/h3x)
+<p align="center">
+  <img src="assets/logo/h3x-logo.svg" alt="h3x" width="100%" />
+</p>
 
-Peer-to-peer DHTTP/3 transport over QUIC, implemented in Rust.
+<p align="center">
+  <a href="https://www.apache.org/licenses/LICENSE-2.0"><img src="https://img.shields.io/github/license/genmeta/h3x" alt="License: Apache-2.0" /></a>
+  <a href="https://github.com/genmeta/h3x/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/genmeta/h3x/ci.yml" alt="Build Status" /></a>
+  <a href="https://codecov.io/gh/genmeta/h3x"><img src="https://codecov.io/gh/genmeta/h3x/graph/badge.svg" alt="codecov" /></a>
+  <a href="https://crates.io/crates/h3x"><img src="https://img.shields.io/crates/v/h3x.svg" alt="crates.io" /></a>
+  <a href="https://docs.rs/h3x/"><img src="https://docs.rs/h3x/badge.svg" alt="Documentation" /></a>
+  <a href="https://github.com/genmeta/h3x/network/dependencies"><img src="https://img.shields.io/deps-rs/repo/github/genmeta/h3x" alt="Dependencies" /></a>
+  <img src="https://img.shields.io/crates/msrv/h3x" alt="MSRV" />
+</p>
 
-- **Peer-to-Peer**: Extends [HTTP3(RFC9114)](https://datatracker.ietf.org/doc/html/rfc9114) to *DHTTP/3*, allowing both sides of the connection to initiate and handle HTTP3 requests (achieved by disabling server push).
-- **Asynchronous I/O**: Built on the Rust asynchronous ecosystem, providing high-performance I/O processing capabilities.
-- **Zero-Copy**: Achieves full-link *zero-copy* from the QUIC layer to the application layer.
-- **Multipath QUIC**: Integrates the `dquic` implementation, featuring efficient transmission, robust authentication capabilities, and high extensibility.
-- **Hyper / Tower Compatibility** *(feature `hyper`, enabled by default)*: Provides a single-file `h3x::hyper` facade for hyper-facing integrations. The facade exposes `TowerService`, `HyperService`, request execution errors, upgrade/takeover helpers, Extended CONNECT helpers, and protocol extension helpers. Lower-level hyper adapters also remain available from their semantic owners: `dhttp::message::hyper`, `endpoint::hyper`, `qpack::field::hyper`, and `extended_connect::hyper`.
-- **RPC / IPC** *(features `rpc` and `ipc`, experimental)*: Optional [`remoc`](https://crates.io/crates/remoc) integration for remote trait calls (RTC) over QUIC connections, with optional IPC transport support. Consumers must select exactly one `remoc/default-codec-*` feature; h3x tests use the bincode codec through a dev-dependency.
-- **Extended CONNECT**: Supports [Extended CONNECT (RFC9220)](https://datatracker.ietf.org/doc/html/rfc9220) for protocol tunneling over HTTP/3.
-- **Future Extensions**: Plans to support extensions such as [WebTransport over HTTP/3 (Draft)](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-14).
+h3x is an HTTP/3 library implemented for [dquic](https://github.com/genmeta/dquic). It provides familiar APIs for `Request` and `Response`. It is not recommended for direct use; use [dhttp](https://github.com/genmeta/dhttp) instead.
 
-### Examples
+## Server-Initiated Requests
 
-> ⚠️ Currently, h3x is in the early stages of development, and the API may undergo significant changes.
+Beneath the hood of a standard QUIC connection, both endpoints have equal ability to concurrently open bidirectional or unidirectional streams. However, the baseline HTTP/3 specification deliberately leaves server-initiated bidirectional streams unexploited. As explicitly stipulated in [**RFC 9114 - HTTP/3 Section 6.1**](https://datatracker.ietf.org/doc/html/rfc9114#section-6.1):
 
-h3x includes `dquic` as its built-in QUIC backend (feature `dquic`, enabled by default). Wrap a `QuicEndpoint` in an `H3Endpoint` to get HTTP/3 client and server semantics on top of QUIC.
+> HTTP/3 does not use server-initiated bidirectional streams, though an extension could define a use for these streams. Clients MUST treat receipt of a server-initiated bidirectional stream as a connection error of type H3_STREAM_CREATION_ERROR unless such an extension has been negotiated.
 
-```rust,no_run
-use bytes::Bytes;
-use h3x::{dquic::QuicEndpoint, endpoint::H3Endpoint};
-use http_body_util::{BodyExt, Empty};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let endpoint = H3Endpoint::new(QuicEndpoint::new().await);
-
-    let connection = endpoint.connect("example.com:4433".parse()?).await?;
-    let request = http::Request::get("https://example.com:4433/hello")
-        .body(Empty::<Bytes>::new())?;
-    let response = connection.execute_hyper_request(request).await?;
-    assert_eq!(response.status(), http::StatusCode::OK);
-    let body = response.into_body().collect().await?.to_bytes();
-    println!("{}", String::from_utf8_lossy(&body));
-    Ok(())
-}
-```
-
-```rust,ignore
-use std::sync::Arc;
-use axum::{Router as AxumRouter, routing::get};
-use h3x::{
-    dquic::{Identity, Name, QuicEndpoint},
-    endpoint::H3Endpoint,
-    hyper::TowerService,
-};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let identity = Arc::new(Identity {
-        name: "localhost".parse()?,
-        certs: todo!("load your certificate chain"),
-        key: todo!("load your private key"),
-        ocsp: Arc::new(None),
-    });
-    let endpoint = H3Endpoint::new(
-        QuicEndpoint::builder()
-            .identity(identity)
-            .bind(Arc::new(vec!["127.0.0.1:4433".parse()?]))
-            .build().await,
-    );
-
-    let router = AxumRouter::new().route("/hello", get(|| async { "Hello, World!" }));
-    let service = TowerService(router.into_service());
-    endpoint.listen(service).await?;
-    Ok(())
-}
-```
-
-#### Hyper / Tower Integration
-
-h3x provides adapters to bridge the Tower / hyper service ecosystem into DHTTP/3, available under the `hyper` feature (enabled by default).
-
-- `TowerService(S)` — wraps a `tower::Service` (e.g. an axum `Router`)
-- `HyperService(S)` — wraps a `hyper::service::Service`
-
-> **API note:** h3x cannot construct hyper's internal types directly, so the `h3x::hyper` module provides its own alternatives:
-> - `h3x::hyper::upgrade` — stream takeover for Extended CONNECT tunnels (instead of `hyper::upgrade`)
-> - `h3x::hyper::ext::Protocol` — protocol indication in CONNECT requests (instead of `hyper::ext::Protocol`)
-
-```rust,ignore
-use std::sync::Arc;
-use axum::{Router as AxumRouter, routing::get};
-use h3x::{
-    dquic::{Identity, Name, QuicEndpoint},
-    endpoint::H3Endpoint,
-    hyper::TowerService,
-};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let router = AxumRouter::new()
-        .route("/hello", get(|| async { "Hello from DHTTP/3!" }));
-    let service = TowerService(router.into_service());
-
-    let identity = Arc::new(Identity {
-        name: "localhost".parse()?,
-        certs: todo!("load your certificate chain"),
-        key: todo!("load your private key"),
-        ocsp: Arc::new(None),
-    });
-    H3Endpoint::new(
-        QuicEndpoint::builder()
-            .identity(identity)
-            .bind(Arc::new(vec!["127.0.0.1:4433".parse()?]))
-            .build().await,
-    )
-    .listen(service)
-    .await?;
-    Ok(())
-}
-```
-
-```rust,no_run
-use bytes::Bytes;
-use h3x::{dquic::QuicEndpoint, endpoint::H3Endpoint};
-use http_body_util::{BodyExt, Empty};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let endpoint = H3Endpoint::new(QuicEndpoint::new().await);
-
-    let connection = endpoint.connect("example.com:4433".parse()?).await?;
-    let request = http::Request::get("https://example.com:4433/hello")
-        .body(Empty::<Bytes>::new())?;
-    let response = connection.execute_hyper_request(request).await?;
-    assert_eq!(response.status(), http::StatusCode::OK);
-    let body = response.into_body().collect().await?.to_bytes();
-    println!("{}", String::from_utf8_lossy(&body));
-    Ok(())
-}
-```
-
-### Testing and Coverage
-
-h3x uses one canonical test entrypoint for local development and CI:
-
-```bash
-cargo test --all-features --all-targets
-```
-
-All feature-gated paths, including `rpc`, `ipc`, `webtransport`, `dquic`, and `hyper`, must compile and test through that command. The dev-dependency on `remoc` selects the bincode default codec for tests so `rpc`/`ipc` can compile under `--all-features`.
-
-Documentation is checked with warnings denied for all non-`rpc`/`ipc` features:
-
-```bash
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features --features dquic,hyper,serde,testing,webtransport
-```
-
-Coverage uses `cargo-llvm-cov` directly:
-
-```bash
-cargo llvm-cov clean
-mkdir -p target/llvm-cov
-cargo llvm-cov \
-  --all-features \
-  --all-targets \
-  --summary-only \
-  --json \
-  --output-path target/llvm-cov/coverage.json \
-  --fail-under-lines 62 \
-  --fail-under-functions 56 \
-  --fail-under-regions 64
-cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
-cargo llvm-cov report --html --output-dir target/llvm-cov
-```
-
-The HTML report entrypoint is:
-
-```text
-target/llvm-cov/html/index.html
-```
-
-The initial coverage gate preserves the current baseline. Raise the gate only in commits that add meaningful tests or remove dead code.
+h3x uses exactly these server-initiated bidirectional streams so that the "server" can initiate requests to the "client."
