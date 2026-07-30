@@ -12,7 +12,7 @@ use super::{
     drain,
     error::{
         DeferredStreamError, DriverProtocolError, defer_err_conn, latch_frame_io_error,
-        latch_protocol_error,
+        latch_protocol_error, stream_bridge_eof,
     },
     frame::{ReadCommand, ReadEvent},
 };
@@ -139,6 +139,7 @@ pin_project_lite::pin_project! {
         send_state: SendState<ReadOperation>,
         recv_state: ReaderRecvState,
         results: ReaderResults,
+        first_push_logged: bool,
         _error: PhantomData<fn(E)>,
     }
 }
@@ -160,6 +161,7 @@ where
                 send_state: SendState::default(),
                 recv_state: ReaderRecvState::default(),
                 results: ReaderResults::default(),
+                first_push_logged: false,
                 _error: PhantomData,
             }),
         }
@@ -261,7 +263,11 @@ where
     quic::ConnectionError: From<E>,
 {
     fn protocol_fault_for(lifecycle: &Arc<L>, error: DriverProtocolError) -> ReaderFault {
-        ReaderFault::Stream(latch_protocol_error(lifecycle.as_ref(), error))
+        let error = match error {
+            DriverProtocolError::FrameEof => stream_bridge_eof(),
+            error => latch_protocol_error(lifecycle.as_ref(), error),
+        };
+        ReaderFault::Stream(error)
     }
 
     fn frame_io_fault_for(lifecycle: &Arc<L>, error: E) -> ReaderFault {
@@ -270,12 +276,23 @@ where
 
     fn pair_response(
         lifecycle: &Arc<L>,
+        stream_id: VarInt,
+        first_push_logged: &mut bool,
         results: &mut ReaderResults,
         sent: ReadOperation,
         frame: ReadEvent,
     ) -> Result<(), ReaderFault> {
         match (sent, frame) {
             (ReadOperation::Pull, ReadEvent::Push { data }) => {
+                if !*first_push_logged {
+                    *first_push_logged = true;
+                    tracing::trace!(
+                        boundary = "ipc-worker",
+                        stream_id = stream_id.into_inner(),
+                        bytes = data.len(),
+                        "IPC worker stream first payload chunk"
+                    );
+                }
                 results.pull = Some(ReaderPullResult::Push(data));
                 Ok(())
             }
@@ -361,7 +378,14 @@ where
                     match ready!(this.bridge.as_mut().poll_next(cx)) {
                         Some(Ok(frame)) => {
                             *this.recv_state = ReaderRecvState::Idle;
-                            Self::pair_response(this.lifecycle, this.results, sent, frame)?;
+                            Self::pair_response(
+                                this.lifecycle,
+                                *this.stream_id,
+                                this.first_push_logged,
+                                this.results,
+                                sent,
+                                frame,
+                            )?;
                         }
                         Some(Err(error)) => {
                             return Poll::Ready(Err(Self::frame_io_fault_for(
@@ -370,6 +394,12 @@ where
                             )));
                         }
                         None => {
+                            tracing::warn!(
+                                boundary = "ipc-worker",
+                                stream_id = this.stream_id.into_inner(),
+                                operation = ?sent,
+                                "IPC worker read-event channel reached EOF while awaiting response"
+                            );
                             return Poll::Ready(Err(Self::protocol_fault_for(
                                 this.lifecycle,
                                 DriverProtocolError::FrameEof,
@@ -753,7 +783,16 @@ where
     ) -> Poll<Result<(), quic::StreamError>> {
         match self.as_mut().project() {
             BridgeStreamReaderProj::Active { active } => {
+                let stream_id = active.as_ref().get_ref().stream_id;
                 let commit = active.as_mut().commit_stop_pinned(code);
+                if commit == CommitResult::Committed {
+                    tracing::info!(
+                        boundary = "ipc-worker",
+                        stream_id = stream_id.into_inner(),
+                        code = code.into_inner(),
+                        "IPC worker stream stop committed"
+                    );
+                }
                 let committed_code = match commit {
                     CommitResult::Committed | CommitResult::Duplicate => code,
                     CommitResult::Conflict => active
@@ -764,6 +803,12 @@ where
 
                 match ready!(active.as_mut().drive_stop(cx, committed_code)) {
                     Ok(()) => {
+                        tracing::info!(
+                            boundary = "ipc-worker",
+                            stream_id = stream_id.into_inner(),
+                            code = committed_code.into_inner(),
+                            "IPC worker stream stop completed"
+                        );
                         if active.as_ref().has_pull_eos() {
                             let stream_id = active.as_ref().get_ref().stream_id;
                             self.as_mut().project_replace(Self::Eos { stream_id });
@@ -771,6 +816,12 @@ where
                         Poll::Ready(Ok(()))
                     }
                     Err(fault) => {
+                        tracing::warn!(
+                            boundary = "ipc-worker",
+                            stream_id = stream_id.into_inner(),
+                            code = committed_code.into_inner(),
+                            "IPC worker stream stop failed"
+                        );
                         let error = ready!(self.as_mut().close_with_fault(cx, fault));
                         Poll::Ready(Err(error))
                     }
@@ -1259,8 +1310,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frame_io_eof_before_read_eos_latches_connection_frame_eof() {
-        let (mut bridge, mut hypervisor, lifecycle) = reader(VarInt::from_u32(18));
+    async fn frame_io_eof_before_read_eos_cancels_only_the_stream() {
+        let (mut bridge, mut hypervisor, _lifecycle) = reader(VarInt::from_u32(18));
 
         assert!(
             poll_fn(|cx| bridge.poll_next_unpin(cx))
@@ -1273,19 +1324,10 @@ mod tests {
         let Some(Err(error)) = bridge.next().await else {
             panic!("frame eof should return a stream error");
         };
-        let source = stream_connection(error);
-        assert_eq!(
-            transport(&source).reason.as_ref(),
-            "typed frame stream ended before operation completed"
-        );
-        assert_eq!(
-            transport(&source).reason.as_ref(),
-            quic::Lifecycle::closed(lifecycle.as_ref())
-                .await
-                .transport()
-                .reason
-                .as_ref()
-        );
+        let quic::StreamError::Reset { code } = error else {
+            panic!("frame eof should remain stream-scoped");
+        };
+        assert_eq!(code, crate::error::Code::H3_REQUEST_CANCELLED.into_inner());
     }
 
     trait TransportExt {
