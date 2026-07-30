@@ -17,15 +17,15 @@ use futures::{
     stream::{self, FusedStream},
 };
 use snafu::Snafu;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::{io::AsyncBufReadExt as _, sync::Mutex as AsyncMutex};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 
 use crate::{
     buflist::BufList,
     codec::{
-        BoxPeekableStreamReader, BoxStreamWriter, DecodeExt, EncodeExt, Feed, SinkWriter,
-        StreamReader,
+        BoxPeekableStreamReader, BoxStreamWriter, DecodeError, DecodeExt, EncodeExt, Feed,
+        SinkWriter, StreamDecodeError, StreamReader,
     },
     connection::{ConnectionGoaway, ConnectionState, LifecycleExt, StreamError},
     dhttp::{
@@ -36,8 +36,8 @@ use crate::{
         stream::UnidirectionalStream,
     },
     error::{
-        Code, H3CriticalStreamClosed, H3FrameUnexpected, H3IdError, H3MissingSettings,
-        H3StreamCreationError,
+        Code, H3CriticalStreamClosed, H3FrameDecodeError, H3FrameUnexpected, H3IdError,
+        H3MissingSettings, H3StreamCreationError,
     },
     protocol::{ProductProtocol, Protocol, Protocols, StreamVerdict},
     quic::{self, ConnectionError, GetStreamIdExt, ResetStreamExt, StopStreamExt},
@@ -231,13 +231,22 @@ mod tests {
         )
     }
 
-    fn test_empty_peekable_bi_stream(stream_id: u32) -> (BoxPeekableStreamReader, BoxStreamWriter) {
+    fn test_empty_peekable_bi_stream_with_response_observer(
+        stream_id: u32,
+    ) -> (
+        (BoxPeekableStreamReader, BoxStreamWriter),
+        impl quic::ReadStream + Unpin,
+    ) {
         let stream_id = VarInt::from_u32(stream_id);
+        let (response_reader, response_writer) = quic::test::mock_stream_pair(stream_id);
         (
-            PeekableStreamReader::new(StreamReader::new(
-                Box::pin(TestReadStream { stream_id }) as BoxQuicStreamReader
-            )),
-            SinkWriter::new(Box::pin(TestWriteStream { stream_id }) as BoxQuicStreamWriter),
+            (
+                PeekableStreamReader::new(StreamReader::new(
+                    Box::pin(TestReadStream { stream_id }) as BoxQuicStreamReader,
+                )),
+                SinkWriter::new(Box::pin(response_writer) as BoxQuicStreamWriter),
+            ),
+            response_reader,
         )
     }
 
@@ -355,7 +364,7 @@ mod tests {
             StreamVerdict::Passed(_)
         ));
 
-        let bi = test_peekable_bi_stream_with_bytes(28, &[0x41]).await;
+        let bi = test_peekable_bi_stream_with_bytes(28, &[0x40, 0x41]).await;
         assert!(matches!(
             Protocol::accept_bi(state.dhttp(), bi)
                 .await
@@ -748,17 +757,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_bi_passes_stream_when_frame_type_cannot_be_decoded() {
+    async fn accept_bi_resets_empty_request_stream_as_incomplete() {
         let state = test_connection_state();
-        let stream = test_empty_peekable_bi_stream(0);
+        let (stream, mut response_reader) = test_empty_peekable_bi_stream_with_response_observer(0);
 
         assert!(matches!(
             state
                 .dhttp()
                 .accept_bi(stream)
                 .await
-                .expect("empty bidi verdict"),
-            StreamVerdict::Passed(_)
+                .expect("empty request cleanup"),
+            StreamVerdict::Accepted
+        ));
+        assert!(matches!(
+            response_reader.next().await,
+            Some(Err(quic::StreamError::Reset { code }))
+                if code == Code::H3_REQUEST_INCOMPLETE.into_inner()
+        ));
+    }
+
+    #[tokio::test]
+    async fn accept_bi_escalates_truncated_frame_type_to_connection_error() {
+        let state = test_connection_state();
+        let stream = test_peekable_bi_stream_with_bytes(4, &[0x40]).await;
+
+        let Err(error) = state.dhttp().accept_bi(stream).await else {
+            panic!("truncated frame type must close the connection");
+        };
+        assert_stream_connection_code(error, Code::H3_FRAME_ERROR);
+    }
+
+    #[tokio::test]
+    async fn accept_bi_preserves_request_reset_and_resets_response_side() {
+        let state = test_connection_state();
+        let stream_id = VarInt::from_u32(8);
+        let reset_code = VarInt::from_u32(77);
+        let (incoming_reader, mut incoming_writer) = quic::test::mock_stream_pair(stream_id);
+        incoming_writer
+            .reset(reset_code)
+            .await
+            .expect("reset request stream");
+        let (mut response_reader, response_writer) = quic::test::mock_stream_pair(stream_id);
+        let stream = (
+            PeekableStreamReader::new(StreamReader::new(
+                Box::pin(incoming_reader) as BoxQuicStreamReader
+            )),
+            SinkWriter::new(Box::pin(response_writer) as BoxQuicStreamWriter),
+        );
+
+        let Err(error) = state.dhttp().accept_bi(stream).await else {
+            panic!("request reset should remain stream-scoped");
+        };
+        assert!(matches!(error, StreamError::Reset { code } if code == reset_code));
+        assert!(matches!(
+            response_reader.next().await,
+            Some(Err(quic::StreamError::Reset { code }))
+                if code == Code::H3_REQUEST_INCOMPLETE.into_inner()
         ));
     }
 
@@ -801,7 +855,7 @@ mod tests {
     #[tokio::test]
     async fn accept_bi_passes_unknown_frame_type() {
         let state = test_connection_state();
-        let stream = test_peekable_bi_stream_with_bytes(20, &[0x41]).await;
+        let stream = test_peekable_bi_stream_with_bytes(20, &[0x40, 0x41]).await;
 
         assert!(matches!(
             state
@@ -814,10 +868,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_bi_evicts_oldest_unresolved_stream_when_ring_is_full() {
+    async fn accept_bi_waits_for_capacity_without_losing_unresolved_streams() {
         let state = test_connection_state();
 
-        for stream_id in 0..=32 {
+        for stream_id in 0..32 {
             let stream = test_peekable_bi_stream_with_bytes(stream_id, &[0x01]).await;
             assert!(matches!(
                 state
@@ -829,11 +883,39 @@ mod tests {
             ));
         }
 
+        let stream = test_peekable_bi_stream_with_bytes(32, &[0x01]).await;
+        let blocked_state = state.clone();
+        let mut blocked_accept =
+            tokio::spawn(async move { blocked_state.dhttp().accept_bi(stream).await });
+        assert!(
+            timeout(Duration::from_millis(20), &mut blocked_accept)
+                .await
+                .is_err(),
+            "the next stream must wait while the unresolved queue is full"
+        );
+
         let (mut reader, _writer) = state.dhttp().unresolved_request_streams.receive().await;
         assert_eq!(
-            reader.stream_id().await.expect("oldest retained stream id"),
-            VarInt::from_u32(1)
+            reader.stream_id().await.expect("first queued stream id"),
+            VarInt::from_u32(0)
         );
+
+        assert!(matches!(
+            timeout(Duration::from_millis(50), blocked_accept)
+                .await
+                .expect("blocked classifier should resume when capacity is released")
+                .expect("classifier task should not panic")
+                .expect("known frame verdict"),
+            StreamVerdict::Accepted
+        ));
+
+        for expected_stream_id in 1..=32 {
+            let (mut reader, _writer) = state.dhttp().unresolved_request_streams.receive().await;
+            assert_eq!(
+                reader.stream_id().await.expect("queued stream id"),
+                VarInt::from_u32(expected_stream_id)
+            );
+        }
     }
 
     #[test]
@@ -1089,10 +1171,11 @@ mod tests {
             .dhttp()
             .peer_goaway
             .set(Goaway::new(VarInt::from_u32(4)));
-        _ = state
+        state
             .dhttp()
             .unresolved_request_streams
-            .send(test_erased_streams(6));
+            .send(test_erased_streams(6))
+            .await;
 
         let (mut reader, _writer) = state
             .accept_raw_message_stream()
@@ -1112,10 +1195,11 @@ mod tests {
             .dhttp()
             .local_goaway
             .set(Goaway::new(VarInt::from_u32(9)));
-        _ = state
+        state
             .dhttp()
             .unresolved_request_streams
-            .send(test_erased_streams(9));
+            .send(test_erased_streams(9))
+            .await;
 
         let error = state
             .accept_raw_message_stream()
@@ -1138,10 +1222,11 @@ mod tests {
             .dhttp()
             .local_goaway
             .set(Goaway::new(VarInt::from_u32(7)));
-        _ = state
+        state
             .dhttp()
             .unresolved_request_streams
-            .send(test_erased_streams(3));
+            .send(test_erased_streams(3))
+            .await;
 
         let (mut reader, _writer) = state
             .accept_raw_message_stream()
@@ -1161,14 +1246,16 @@ mod tests {
             .dhttp()
             .local_goaway
             .set(Goaway::new(VarInt::from_u32(6)));
-        _ = state
+        state
             .dhttp()
             .unresolved_request_streams
-            .send(test_erased_streams(4));
-        _ = state
+            .send(test_erased_streams(4))
+            .await;
+        state
             .dhttp()
             .unresolved_request_streams
-            .send(test_erased_streams(8));
+            .send(test_erased_streams(8))
+            .await;
 
         let (mut reader, _writer) = state
             .accept_raw_message_stream()
@@ -1204,10 +1291,11 @@ mod tests {
             .dhttp()
             .local_goaway
             .set(Goaway::new(VarInt::from_u32(10)));
-        _ = state
+        state
             .dhttp()
             .unresolved_request_streams
-            .send(test_erased_streams(10));
+            .send(test_erased_streams(10))
+            .await;
 
         let error = timeout(Duration::from_millis(100), accept_task)
             .await
@@ -1407,6 +1495,17 @@ impl std::fmt::Debug for DHttpProtocol {
 }
 
 impl DHttpProtocol {
+    async fn reject_incomplete_request(
+        mut reader: BoxPeekableStreamReader,
+        mut writer: BoxStreamWriter,
+    ) -> Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError> {
+        let code = Code::H3_REQUEST_INCOMPLETE.into_inner();
+        let (stop_result, reset_result) = tokio::join!(reader.stop(code), writer.reset(code));
+        stop_result?;
+        reset_result?;
+        Ok(StreamVerdict::Accepted)
+    }
+
     pub async fn max_unresolved_request_streams(&self) -> usize {
         self.unresolved_request_streams.capacity()
     }
@@ -1486,7 +1585,7 @@ impl DHttpProtocol {
 
     async fn accept_bi(
         &self,
-        (mut reader, writer): (BoxPeekableStreamReader, BoxStreamWriter),
+        (mut reader, mut writer): (BoxPeekableStreamReader, BoxStreamWriter),
     ) -> Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError> {
         // HTTP/3 bidirectional streams are request streams (RFC 9114 §4.1).
         // The first bytes on a request stream are HTTP/3 frames, starting with
@@ -1499,16 +1598,88 @@ impl DHttpProtocol {
         // accepted. Note that reserved frames MAY appear before HEADERS on a
         // request stream (RFC 9114 §7.2.8). Everything else is passed to the
         // next protocol layer.
-        let frame_type = match reader.decode_one::<VarInt>().await {
-            Ok(v) => v,
-            Err(_) => {
-                // Stream closed or error before we could read a frame type.
-                // Cannot determine protocol — pass to the next layer.
-                return Ok(StreamVerdict::Passed((reader, writer)));
+        let stream_id = match writer.stream_id().await {
+            Ok(stream_id) => Some(stream_id),
+            Err(error) => {
+                tracing::warn!(?error, "DHTTP classifier could not resolve stream id");
+                None
+            }
+        };
+        let first_chunk_bytes = match reader.fill_buf().await {
+            Ok(bytes) => bytes.len(),
+            Err(error) => {
+                tracing::warn!(
+                    boundary = "dhttp-classifier",
+                    stream_id = ?stream_id.map(|id| id.into_inner()),
+                    ?error,
+                    "DHTTP classifier could not peek stream payload"
+                );
+                return match StreamDecodeError::from(error) {
+                    StreamDecodeError::Connection { source } => {
+                        Err(StreamError::Connection { source })
+                    }
+                    StreamDecodeError::Reset { code } => {
+                        writer
+                            .reset(Code::H3_REQUEST_INCOMPLETE.into_inner())
+                            .await?;
+                        Err(StreamError::Reset { code })
+                    }
+                    StreamDecodeError::Decode { source } => {
+                        Err(H3FrameDecodeError { source }.into())
+                    }
+                };
             }
         };
 
-        if Self::is_http3_frame_type(frame_type) {
+        let frame_type = match reader.decode_one::<VarInt>().await {
+            Ok(v) => v,
+            Err(error) => {
+                let error = StreamDecodeError::from(error);
+                tracing::warn!(
+                    boundary = "dhttp-classifier",
+                    stream_id = ?stream_id.map(|id| id.into_inner()),
+                    bytes = first_chunk_bytes,
+                    ?error,
+                    "DHTTP bidirectional stream frame type decode failed"
+                );
+                return match error {
+                    StreamDecodeError::Connection { source } => {
+                        Err(StreamError::Connection { source })
+                    }
+                    StreamDecodeError::Reset { code } => {
+                        writer
+                            .reset(Code::H3_REQUEST_INCOMPLETE.into_inner())
+                            .await?;
+                        Err(StreamError::Reset { code })
+                    }
+                    StreamDecodeError::Decode {
+                        source: DecodeError::Incomplete,
+                    } if first_chunk_bytes == 0 => {
+                        tracing::warn!(
+                            boundary = "dhttp-classifier",
+                            stream_id = ?stream_id.map(|id| id.into_inner()),
+                            code = Code::H3_REQUEST_INCOMPLETE.into_inner().into_inner(),
+                            "empty HTTP/3 request stream rejected"
+                        );
+                        Self::reject_incomplete_request(reader, writer).await
+                    }
+                    StreamDecodeError::Decode { source } => {
+                        Err(H3FrameDecodeError { source }.into())
+                    }
+                };
+            }
+        };
+
+        let recognized = Self::is_http3_frame_type(frame_type);
+        if recognized {
+            tracing::trace!(
+                boundary = "dhttp-classifier",
+                stream_id = ?stream_id.map(|id| id.into_inner()),
+                bytes = first_chunk_bytes,
+                frame_type = frame_type.into_inner(),
+                recognized,
+                "DHTTP bidirectional stream classified"
+            );
             // This is an HTTP/3 request stream. Reset the peek cursor so the
             // frame type can be re-read by FrameStream during request processing.
             Pin::new(&mut reader).reset();
@@ -1516,16 +1687,20 @@ impl DHttpProtocol {
                 .into_stream_reader()
                 .map_stream(guard::GuardQuicReader::new);
             let writer = writer.map_sink(guard::GuardQuicWriter::new);
-            let item = (reader, writer);
-            if let Some(mut unresolved) = self.unresolved_request_streams.send(item) {
-                // Ring channel is full — reject the oldest unresolved request.
-                let code = Code::H3_REQUEST_REJECTED.into_inner();
-                _ = tokio::join!(unresolved.0.stop(code), unresolved.1.reset(code));
-            }
+            self.unresolved_request_streams.send((reader, writer)).await;
             Ok(StreamVerdict::Accepted)
         } else {
             // Not an HTTP/3 frame type. Reset cursor so the next protocol
             // layer can re-read the first bytes.
+            Pin::new(&mut reader).reset();
+            tracing::warn!(
+                boundary = "dhttp-classifier",
+                stream_id = ?stream_id.map(|id| id.into_inner()),
+                bytes = first_chunk_bytes,
+                frame_type = frame_type.into_inner(),
+                recognized,
+                "DHTTP bidirectional stream rejected by classifier"
+            );
             Ok(StreamVerdict::Passed((reader, writer)))
         }
     }
@@ -1635,7 +1810,7 @@ impl DHttpProtocolFactory {
             connection,
             control_stream: AsyncMutex::new(control_stream),
             handle_control_stream: SetOnce::new(),
-            unresolved_request_streams: RingChannel::new(32), // TODO: configurable capacity
+            unresolved_request_streams: RingChannel::new(256), // TODO: configurable capacity
         })
     }
 }
