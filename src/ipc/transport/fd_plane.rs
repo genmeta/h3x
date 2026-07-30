@@ -489,9 +489,13 @@ impl ReservedFdDelivery {
             }
         }
 
-        if let Err(source) = self.delivery.sender.send_fds(self.delivery.id, fds) {
-            return Err(DeliverFdsError::Queue { source });
-        }
+        // Keep the original descriptors process-reachable until the receiver
+        // confirms that SCM_RIGHTS externalization has completed.
+        let _fds = self
+            .delivery
+            .sender
+            .send_fds(self.delivery.id, fds)
+            .map_err(|source| DeliverFdsError::Queue { source })?;
 
         let mut phase = entry.phase.subscribe();
         loop {
