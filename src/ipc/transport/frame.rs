@@ -1,6 +1,7 @@
 use std::{
     io,
     os::fd::{AsRawFd, RawFd},
+    sync::Arc,
 };
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -22,7 +23,7 @@ const MAX_ID_FRAME_LEN: usize = 1 + VarInt::MAX_SIZE + VarInt::MAX_SIZE;
 #[derive(Debug)]
 pub(crate) enum OutboundFrame {
     Bytes(Bytes),
-    Fds { id: VarInt, fds: FdVec },
+    Fds { id: VarInt, fds: Arc<FdVec> },
     CancelFds { id: VarInt },
     AckFds { id: VarInt },
 }
@@ -48,7 +49,7 @@ pub(crate) enum PendingFrame {
         header: [u8; MAX_FDS_FRAME_LEN],
         header_len: usize,
         header_written: usize,
-        payload: FdVec,
+        payload: Arc<FdVec>,
         include_ancillary: bool,
     },
     Id {
@@ -73,7 +74,7 @@ impl PendingFrame {
         }
     }
 
-    fn new_fds(id: VarInt, fds: FdVec) -> Self {
+    fn new_fds(id: VarInt, fds: Arc<FdVec>) -> Self {
         let fd_count = VarInt::try_from(fds.len()).expect("fd count fits varint");
 
         let mut id_buf = [0u8; VarInt::MAX_SIZE];

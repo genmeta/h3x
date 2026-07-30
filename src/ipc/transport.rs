@@ -306,6 +306,8 @@ impl Stream for MuxStream {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd as _;
+
     use futures::{SinkExt, StreamExt, future::join_all};
     use smallvec::smallvec;
     use tokio::{
@@ -408,6 +410,33 @@ mod tests {
             .expect("delivery reservation task")
             .expect("reserve released delivery capacity");
         drop(reservation);
+    }
+
+    #[tokio::test]
+    async fn queued_fd_guard_retains_descriptors_after_writer_flush() {
+        let (left, _right) = MuxChannel::pair_for_test().expect("create pair");
+        let (mut sink, _stream) = left.split().expect("split sender");
+        let (fd, _peer) = StdUnixStream::pair().expect("fd pair");
+        let raw_fd = fd.as_raw_fd();
+
+        let guard = sink
+            .fd_sender()
+            .send_fds(VarInt::from_u32(7), smallvec![fd.into()])
+            .expect("queue fd");
+        timeout(Duration::from_secs(1), sink.flush())
+            .await
+            .expect("writer flush timeout")
+            .expect("writer flush");
+
+        // SAFETY: guard still owns raw_fd until it is dropped below.
+        assert_ne!(unsafe { nix::libc::fcntl(raw_fd, nix::libc::F_GETFD) }, -1);
+        drop(guard);
+        // SAFETY: fcntl reports EBADF for the integer without dereferencing it.
+        assert_eq!(unsafe { nix::libc::fcntl(raw_fd, nix::libc::F_GETFD) }, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(nix::libc::EBADF)
+        );
     }
 
     #[tokio::test]

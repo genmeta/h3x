@@ -92,14 +92,19 @@ impl FdSender {
         }
     }
 
-    pub(crate) fn send_fds(&self, id: VarInt, fds: FdVec) -> Result<(), QueueFdsError> {
+    pub(crate) fn send_fds(&self, id: VarInt, fds: FdVec) -> Result<Arc<FdVec>, QueueFdsError> {
         if fds.is_empty() {
             return Err(QueueFdsError::EmptyFds);
         }
         if fds.len() > MAX_FDS_PER_FRAME {
             return Err(QueueFdsError::TooManyFds { count: fds.len() });
         }
-        self.queue(frame::OutboundFrame::Fds { id, fds })
+        let fds = Arc::new(fds);
+        self.queue(frame::OutboundFrame::Fds {
+            id,
+            fds: fds.clone(),
+        })?;
+        Ok(fds)
     }
 
     pub(crate) fn cancel_fds(&self, id: VarInt) -> Result<(), QueueFdsError> {
