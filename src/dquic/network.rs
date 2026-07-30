@@ -82,7 +82,10 @@ use crate::dquic::{
 };
 // Internal implementation types — not part of curated domain modules
 use crate::dquic::{
-    qbase::packet::Packet,
+    qbase::{
+        error::{ErrorKind, QuicError},
+        packet::Packet,
+    },
     qconnection::builder::ConnectionFoundation,
     qinterface::{
         component::{
@@ -101,6 +104,16 @@ use crate::dquic::{
 pub(crate) type SniRegistry = Arc<DashMap<Name<'static>, Weak<ServerEntry>>>;
 type BoundInterfaces = HashMap<BindUri, BindInterface>;
 const DISPATCH_INITIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+const SERVER_NAME_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn refuse_pending_connection(conn: &Connection, anti_port_scan: bool, reason: &'static str) {
+    if anti_port_scan {
+        return;
+    }
+
+    let error = QuicError::with_default_fty(ErrorKind::ConnectionRefused, reason);
+    _ = conn.enter_closing(error);
+}
 
 async fn await_initial_path_attempt_or_validate<F, V, E>(
     timeout: Duration,
@@ -127,6 +140,47 @@ fn interface_contains(interface: &::dquic::qinterface::device::Interface, ip: Ip
 fn iface_bind_uri_device(uri: &BindUri) -> Option<&str> {
     uri.as_iface_bind_uri()
         .map(|(_family, device, _port)| device)
+}
+
+fn is_stun_probe_eligible(interface: &netdev::Interface) -> bool {
+    use netdev::interface::types::InterfaceType;
+
+    if !interface.is_up()
+        || interface.is_loopback()
+        || matches!(interface.if_type, InterfaceType::Loopback)
+    {
+        return false;
+    }
+
+    // A tunnel, bridge, or point-to-point device can be the host's actual
+    // egress path. Route selection is stronger evidence than interface type.
+    if interface.default {
+        return true;
+    }
+
+    if interface.is_point_to_point()
+        || matches!(
+            interface.if_type,
+            InterfaceType::ProprietaryVirtual
+                | InterfaceType::Tunnel
+                | InterfaceType::Bridge
+                | InterfaceType::PeerToPeerWireless
+        )
+    {
+        return false;
+    }
+
+    #[cfg(target_os = "linux")]
+    if !interface.default {
+        let sysfs_path = std::path::Path::new("/sys/class/net").join(&interface.name);
+        if std::fs::canonicalize(sysfs_path)
+            .is_ok_and(|path| path.starts_with("/sys/devices/virtual/"))
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -329,8 +383,13 @@ impl QuicBindDriver {
             Some(Arc::from(server.into_owned()))
         } else if let Some("false") = uri.prop(BindUri::STUN_PROP).as_deref() {
             None
-        } else {
+        } else if iface_bind_uri_device(&uri)
+            .and_then(|device| self.network().devices.get(device))
+            .is_none_or(|interface| is_stun_probe_eligible(&interface))
+        {
             self.stun_server.clone()
+        } else {
+            None
         };
 
         bind_iface.with_components_mut(|components, iface| {
@@ -421,6 +480,7 @@ impl QuicBindDriver {
         let slot = Arc::new(ServerConfig {
             config: server_config.clone(),
             rustls_config,
+            handshake_backlog: Arc::new(tokio::sync::Semaphore::new(server_config.backlog)),
         });
         *slot_guard = Arc::downgrade(&slot);
         Ok(slot)
@@ -616,6 +676,9 @@ impl QuicBindDriver {
         // Build the connection synchronously so the CID is registered in
         // QuicRouter before the first packet is delivered.
         let sni_registry = driver.sni_registry.clone();
+        let Ok(handshake_permit) = slot.handshake_backlog.clone().try_acquire_owned() else {
+            return;
+        };
 
         let foundation = Connection::new_server(slot.config.token_provider.clone())
             .with_parameters(slot.config.parameters.clone())
@@ -638,13 +701,14 @@ impl QuicBindDriver {
             .run();
 
         let quic_router = driver.quic_router.clone();
+        let anti_port_scan = slot.config.anti_port_scan;
 
-        // Spawn only async delivery and SNI dispatch work.
-        // Inherent termination: this task owns the newly-created server
-        // connection and exits once SNI dispatch succeeds, the SNI queue is
-        // closed, or connection name resolution fails.
+        // Spawn only async delivery and SNI dispatch work. The permit bounds
+        // connections waiting for SNI or accept-queue space.
         tokio::spawn(
             async move {
+                let _handshake_permit = handshake_permit;
+
                 quic_router.deliver(packet, (bind_uri, pathway, link)).await;
                 if let Err(error) = await_initial_path_attempt_or_validate(
                     DISPATCH_INITIAL_ATTEMPT_TIMEOUT,
@@ -658,23 +722,32 @@ impl QuicBindDriver {
                         error = %report,
                         "initial path attempt failed"
                     );
+                    refuse_pending_connection(&conn, anti_port_scan, "initial path attempt failed");
                     return;
                 }
 
                 // server_name() waits for TLS handshake info — do NOT call
                 // handshaked() here; for server role it blocks until a Data
                 // packet arrives, which would deadlock the test until timeout.
-                let sni = match conn.server_name().await {
-                    Ok(name) => name,
-                    Err(e) => {
-                        let report = snafu::Report::from_error(&e);
-                        tracing::debug!(
-                            error = %report,
-                            "failed to get server name"
-                        );
-                        return;
-                    }
-                };
+                let sni =
+                    match tokio::time::timeout(SERVER_NAME_HANDSHAKE_TIMEOUT, conn.server_name())
+                        .await
+                    {
+                        Err(_) => {
+                            refuse_pending_connection(&conn, anti_port_scan, "server name timeout");
+                            return;
+                        }
+                        Ok(Ok(name)) => name,
+                        Ok(Err(error)) => {
+                            let report = snafu::Report::from_error(&error);
+                            tracing::debug!(
+                                error = %report,
+                                "failed to get server name"
+                            );
+                            refuse_pending_connection(&conn, anti_port_scan, "server name failed");
+                            return;
+                        }
+                    };
 
                 let sni_lower = sni.to_ascii_lowercase();
                 if let Some(entry) = sni_registry
@@ -683,11 +756,18 @@ impl QuicBindDriver {
                 {
                     let incomings_tx = entry.incomings_tx.clone();
                     drop(entry);
-                    if incomings_tx.send(conn).await.is_err() {
-                        tracing::debug!(
-                            name = %sni,
-                            "sni channel closed"
-                        );
+                    match incomings_tx.try_send(conn) {
+                        Ok(()) => {}
+                        Err(async_channel::TrySendError::Full(conn)) => {
+                            refuse_pending_connection(&conn, anti_port_scan, "sni queue full");
+                        }
+                        Err(async_channel::TrySendError::Closed(conn)) => {
+                            tracing::debug!(
+                                name = %sni,
+                                "sni channel closed"
+                            );
+                            refuse_pending_connection(&conn, anti_port_scan, "sni channel closed");
+                        }
                     }
                     return;
                 }
@@ -695,6 +775,7 @@ impl QuicBindDriver {
                     name = %sni,
                     "no endpoint registered for SNI"
                 );
+                refuse_pending_connection(&conn, anti_port_scan, "unregistered sni");
             }
             .in_current_span(),
         );
@@ -1747,6 +1828,22 @@ mod tests {
         RemoteAuthority::new(Arc::from(name), Arc::from(identity.certs.as_slice()))
     }
 
+    fn up_interface(if_type: netdev::interface::types::InterfaceType) -> Interface {
+        let mut interface = Interface::dummy();
+        interface.name = "__stun_test_interface__".to_owned();
+        interface.flags = netdev::interface::flags::IFF_UP as u32;
+        interface.if_type = if_type;
+        interface
+    }
+
+    fn has_stun_clients(interface: &BindInterface) -> bool {
+        interface
+            .borrow()
+            .with_component(|_: &StunClientsComponent| ())
+            .expect("interface was not rebound")
+            .is_some()
+    }
+
     struct TestNullDriver {
         manager: Arc<crate::dquic::net::InterfaceManager>,
     }
@@ -1769,6 +1866,19 @@ mod tests {
         let mut interface = Interface::dummy();
         interface.name = name.to_owned();
         interface
+    }
+
+    fn ipv4_loopback_device() -> String {
+        Devices::global()
+            .interfaces()
+            .into_values()
+            .find(|interface| interface.is_loopback() && !interface.ipv4.is_empty())
+            .map(|interface| interface.name)
+            .expect("test host has an IPv4 loopback interface")
+    }
+
+    fn ipv4_loopback_pattern(device: &str) -> BindPattern {
+        BindPattern::from_str(&format!("iface://v4.{device}:0")).expect("valid loopback pattern")
     }
 
     fn added_event(device: &str) -> InterfaceEvent {
@@ -2312,6 +2422,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_sni_handshake_backlog_is_bounded_and_shared() {
+        let network = Network::builder().build();
+        let mut config = make_server_config();
+        config.backlog = 2;
+
+        let first_binding = network
+            .quic()
+            .bind_server(
+                make_identity("first.example.com"),
+                config.clone(),
+                Arc::new(Vec::new()),
+            )
+            .await
+            .expect("first bind should succeed");
+        let second_binding = network
+            .quic()
+            .bind_server(
+                make_identity("second.example.com"),
+                config,
+                Arc::new(Vec::new()),
+            )
+            .await
+            .expect("second bind should reuse the server slot");
+
+        let backlog = first_binding.entry.config.handshake_backlog.clone();
+        assert!(Arc::ptr_eq(
+            &backlog,
+            &second_binding.entry.config.handshake_backlog
+        ));
+
+        let first_permit = backlog
+            .clone()
+            .try_acquire_owned()
+            .expect("first pending handshake should fit");
+        let _second_permit = backlog
+            .clone()
+            .try_acquire_owned()
+            .expect("second pending handshake should fit");
+        assert!(
+            backlog.clone().try_acquire_owned().is_err(),
+            "pending handshakes must not exceed the configured backlog"
+        );
+
+        drop(first_permit);
+        assert!(backlog.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
     async fn test_bind_server_same_identity_reuse() {
         let network = Network::builder().build();
         let identity = make_identity("test.example.com");
@@ -2422,7 +2580,8 @@ mod tests {
             &network.quic().local_endpoints()
         ));
 
-        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+        let device = ipv4_loopback_device();
+        let pattern = ipv4_loopback_pattern(&device);
         let mut handle = quic.clone().bind(pattern.clone()).await;
 
         let quic_interfaces = quic.interfaces();
@@ -2871,7 +3030,8 @@ mod tests {
         let network = Network::builder().build();
         let driver_a = Arc::new(TestNullDriver::new());
         let driver_b = Arc::new(TestNullDriver::new());
-        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+        let device = ipv4_loopback_device();
+        let pattern = ipv4_loopback_pattern(&device);
 
         let mut handle_a = network.bind_with(driver_a.clone(), pattern.clone()).await;
         let mut handle_b = network.bind_with(driver_b.clone(), pattern.clone()).await;
@@ -2907,7 +3067,8 @@ mod tests {
     async fn bind_entry_operations_are_serialized_per_key() {
         let network = Network::builder().build();
         let driver = Arc::new(SlowCountingDriver::new());
-        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+        let device = ipv4_loopback_device();
+        let pattern = ipv4_loopback_pattern(&device);
 
         let first = tokio::spawn({
             let network = network.clone();
@@ -3084,7 +3245,8 @@ mod tests {
     async fn canceled_unbind_completes_cleanup_before_rebind() {
         let network = Network::builder().build();
         let driver = Arc::new(BlockingCloseDriver::new());
-        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+        let device = ipv4_loopback_device();
+        let pattern = ipv4_loopback_pattern(&device);
 
         let mut handle = network.bind_with(driver.clone(), pattern.clone()).await;
         let unbind = tokio::spawn({
@@ -3277,8 +3439,14 @@ mod tests {
 
     #[tokio::test]
     async fn quic_bind_driver_initializes_stun_component_branches() {
+        let devices = Devices::global();
+        let loopback = devices
+            .interfaces()
+            .into_values()
+            .find(Interface::is_loopback)
+            .expect("test host has a loopback interface");
         let manager = Arc::new(InterfaceManager::new());
-        let network = Network::build_with_quic_driver(Devices::global(), |network| {
+        let network = Network::build_with_quic_driver(devices, |network| {
             QuicBindDriver::builder()
                 .network(network)
                 .iface_manager(manager)
@@ -3288,31 +3456,75 @@ mod tests {
         });
         let quic = network.quic();
 
-        let disabled: BindUri = "iface://v4.lo:0/?stun=false"
+        let default: BindUri = format!("iface://v4.{}:0", loopback.name)
             .parse()
             .expect("valid bind uri");
-        let _disabled_iface = BindDriver::bind(quic.as_ref(), &network, disabled).await;
+        let default_iface = BindDriver::bind(quic.as_ref(), &network, default).await;
+        assert!(!has_stun_clients(&default_iface));
 
-        let explicit: BindUri = "iface://v4.lo:1/?stun_server=explicit.stun.example:3478"
+        let disabled: BindUri = format!("iface://v4.{}:1/?stun=false", loopback.name)
             .parse()
             .expect("valid bind uri");
-        let _explicit_iface = BindDriver::bind(quic.as_ref(), &network, explicit).await;
+        let disabled_iface = BindDriver::bind(quic.as_ref(), &network, disabled).await;
+        assert!(!has_stun_clients(&disabled_iface));
+
+        let explicit: BindUri = format!(
+            "iface://v4.{}:2/?stun_server=explicit.stun.example:3478",
+            loopback.name
+        )
+        .parse()
+        .expect("valid bind uri");
+        let explicit_iface = BindDriver::bind(quic.as_ref(), &network, explicit).await;
+        assert!(has_stun_clients(&explicit_iface));
+    }
+
+    #[test]
+    fn stun_probe_eligibility_prefers_routes_over_interface_type() {
+        use netdev::interface::types::InterfaceType;
+
+        let mut down = Interface::dummy();
+        down.if_type = InterfaceType::Ethernet;
+        assert!(!is_stun_probe_eligible(&down));
+
+        for if_type in [
+            InterfaceType::Loopback,
+            InterfaceType::ProprietaryVirtual,
+            InterfaceType::Tunnel,
+            InterfaceType::Bridge,
+            InterfaceType::PeerToPeerWireless,
+        ] {
+            assert!(!is_stun_probe_eligible(&up_interface(if_type)));
+        }
+
+        assert!(is_stun_probe_eligible(&up_interface(
+            InterfaceType::Ethernet
+        )));
+        assert!(is_stun_probe_eligible(&up_interface(
+            InterfaceType::Wireless80211
+        )));
+
+        for if_type in [InterfaceType::Tunnel, InterfaceType::Bridge] {
+            let mut default_egress = up_interface(if_type);
+            default_egress.default = true;
+            assert!(is_stun_probe_eligible(&default_egress));
+        }
     }
 
     #[tokio::test]
     async fn reconcile_event_rebinds_matching_changed_interface_bindings() {
         let network = Network::builder().build();
         let driver = Arc::new(CountingDriver::new());
-        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+        let device = ipv4_loopback_device();
+        let pattern = ipv4_loopback_pattern(&device);
 
         let mut handle = network.bind_with(driver.clone(), pattern).await;
         assert!(driver.bind_count() > 0, "initial bind should create iface");
 
-        network.reconcile_event(&changed_event("lo")).await;
+        network.reconcile_event(&changed_event(&device)).await;
 
         assert!(
             driver.rebind_count() > 0,
-            "matching changed event should rebind existing lo iface"
+            "matching changed event should rebind the loopback iface"
         );
 
         handle.unbind().await;
@@ -3322,7 +3534,8 @@ mod tests {
     async fn reconcile_event_skips_unrelated_changed_interface_bindings() {
         let network = Network::builder().build();
         let driver = Arc::new(CountingDriver::new());
-        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+        let device = ipv4_loopback_device();
+        let pattern = ipv4_loopback_pattern(&device);
 
         let mut handle = network.bind_with(driver.clone(), pattern).await;
         assert!(driver.bind_count() > 0, "initial bind should create iface");
@@ -3334,7 +3547,7 @@ mod tests {
         assert_eq!(
             driver.rebind_count(),
             0,
-            "unrelated changed event must not rebind lo iface"
+            "unrelated changed event must not rebind the loopback iface"
         );
 
         handle.unbind().await;
@@ -3368,7 +3581,8 @@ mod tests {
     async fn reconcile_event_added_binds_missing_matching_membership_without_rebind() {
         let network = Network::builder().build();
         let driver = Arc::new(CountingDriver::new());
-        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+        let device = ipv4_loopback_device();
+        let pattern = ipv4_loopback_pattern(&device);
 
         let mut handle = network.bind_with(driver.clone(), pattern.clone()).await;
         let initial_binds = driver.bind_count();
@@ -3376,7 +3590,7 @@ mod tests {
 
         clear_bound_for_test(&network, &driver, &pattern).await;
 
-        network.reconcile_event(&added_event("lo")).await;
+        network.reconcile_event(&added_event(&device)).await;
 
         assert!(
             driver.bind_count() > initial_binds,
@@ -3401,7 +3615,8 @@ mod tests {
     async fn reconcile_event_removed_removes_matching_membership_without_rebind() {
         let network = Network::builder().build();
         let driver = Arc::new(CountingDriver::new());
-        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+        let device = ipv4_loopback_device();
+        let pattern = ipv4_loopback_pattern(&device);
 
         let mut handle = network.bind_with(driver.clone(), pattern.clone()).await;
         assert!(
@@ -3411,7 +3626,7 @@ mod tests {
             "initial bind should create membership"
         );
 
-        network.reconcile_event(&removed_event("lo")).await;
+        network.reconcile_event(&removed_event(&device)).await;
 
         assert!(
             network
@@ -3432,7 +3647,8 @@ mod tests {
     async fn removed_device_then_release_closes_each_binding_once() {
         let network = Network::builder().build();
         let driver = Arc::new(CloseCountingDriver::new());
-        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid pattern");
+        let device = ipv4_loopback_device();
+        let pattern = ipv4_loopback_pattern(&device);
 
         let mut handle = network.bind_with(driver.clone(), pattern.clone()).await;
         let initial = network
@@ -3441,7 +3657,7 @@ mod tests {
             .len();
         assert!(initial > 0, "test expects loopback bindings");
 
-        network.reconcile_event(&removed_event("lo")).await;
+        network.reconcile_event(&removed_event(&device)).await;
         assert_eq!(
             driver.close_count(),
             initial,
@@ -3635,12 +3851,13 @@ mod tests {
                 .io_factory(factory.clone())
                 .build()
         });
-        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid bind pattern");
+        let device = ipv4_loopback_device();
+        let pattern = ipv4_loopback_pattern(&device);
 
         let quic = network.quic();
         let mut handle = quic.clone().bind(pattern).await;
 
-        network.reconcile_event(&changed_event("lo")).await;
+        network.reconcile_event(&changed_event(&device)).await;
 
         assert_eq!(
             factory.bind_count.load(Ordering::SeqCst),
@@ -3801,7 +4018,8 @@ mod tests {
                 .io_factory(factory.clone())
                 .build()
         });
-        let pattern = BindPattern::from_str("iface://v4.lo:0").expect("valid bind pattern");
+        let device = ipv4_loopback_device();
+        let pattern = ipv4_loopback_pattern(&device);
 
         let quic = network.quic();
         let mut handle = quic.clone().bind(pattern.clone()).await;
@@ -3814,7 +4032,7 @@ mod tests {
             .expect("initial bound addr");
 
         broken.store(true, Ordering::SeqCst);
-        network.reconcile_event(&changed_event("lo")).await;
+        network.reconcile_event(&changed_event(&device)).await;
 
         let after = quic
             .get_interfaces(&pattern)

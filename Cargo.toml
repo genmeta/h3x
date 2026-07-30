@@ -32,6 +32,7 @@ dhttp-identity = "0.3.0-beta.1"
 
 # feature dquic
 dquic = { version = "0.7.0-beta.4", optional = true }
+netdev = { version = "0.45", optional = true }
 
 # feature hyper
 http-body = { version = "1", optional = true }
@@ -68,6 +69,7 @@ peg = { version = "0.8", optional = true }
 default = ["dquic", "hyper"]
 dquic = [
     "dep:dquic",
+    "dep:netdev",
     "dep:arc-swap",
     "dep:async-channel",
     "dep:either",
