@@ -59,7 +59,7 @@ use crate::{
             connection::{IPC_ERROR_KIND, IPC_FRAME_TYPE, bridge_reader, bridge_writer},
             stream::{reader as ipc_reader, writer as ipc_writer},
         },
-        transport::{FdDelivery, FdTransfer, ReceivedFds},
+        transport::{FdTransfer, ReceivedFds, ReservedFdDelivery},
     },
     quic::{
         self, BoxQuicStreamReader, BoxQuicStreamWriter, ConnectionError, DynLifecycle,
@@ -331,7 +331,12 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     }
 
     async fn open_bi(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportOpenError> {
-        let delivery = self.fd_transfer.delivery(fd_id);
+        let delivery = self
+            .fd_transfer
+            .delivery(fd_id)
+            .reserve()
+            .await
+            .map_err(|error| ipc_open_io(error, "reserve fd delivery"))?;
         let (mut reader, writer) = self.session.open_bi().await?;
 
         let stream_id = GetStreamIdExt::stream_id(&mut reader)
@@ -348,7 +353,12 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     }
 
     async fn accept_bi(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportAcceptError> {
-        let delivery = self.fd_transfer.delivery(fd_id);
+        let delivery = self
+            .fd_transfer
+            .delivery(fd_id)
+            .reserve()
+            .await
+            .map_err(|error| ipc_accept_io(error, "reserve fd delivery"))?;
         let (mut reader, writer) = match self.session.accept_bi().await {
             Ok(streams) => streams,
             Err(error) => return Err(error.into()),
@@ -368,7 +378,12 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     }
 
     async fn open_uni(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportOpenError> {
-        let delivery = self.fd_transfer.delivery(fd_id);
+        let delivery = self
+            .fd_transfer
+            .delivery(fd_id)
+            .reserve()
+            .await
+            .map_err(|error| ipc_open_io(error, "reserve fd delivery"))?;
         let mut writer = self.session.open_uni().await?;
 
         let stream_id = GetStreamIdExt::stream_id(&mut writer)
@@ -389,7 +404,12 @@ impl IpcWebTransportSession for WebTransportSessionAdapter {
     }
 
     async fn accept_uni(&self, fd_id: VarInt) -> Result<VarInt, IpcWebTransportAcceptError> {
-        let delivery = self.fd_transfer.delivery(fd_id);
+        let delivery = self
+            .fd_transfer
+            .delivery(fd_id)
+            .reserve()
+            .await
+            .map_err(|error| ipc_accept_io(error, "reserve fd delivery"))?;
         let mut reader = match self.session.accept_uni().await {
             Ok(stream) => stream,
             Err(error) => return Err(error.into()),
@@ -417,7 +437,7 @@ impl WebTransportSessionAdapter {
     /// Shared logic for open_bi: create 2 socketpairs and bridge.
     async fn bridge_bi(
         &self,
-        delivery: FdDelivery,
+        delivery: ReservedFdDelivery,
         mut reader: BoxQuicStreamReader,
         mut writer: BoxQuicStreamWriter,
         stream_id: VarInt,
@@ -450,7 +470,7 @@ impl WebTransportSessionAdapter {
     /// Shared logic for accept_bi: create 2 socketpairs and bridge.
     async fn bridge_bi_accept(
         &self,
-        delivery: FdDelivery,
+        delivery: ReservedFdDelivery,
         mut reader: BoxQuicStreamReader,
         mut writer: BoxQuicStreamWriter,
         stream_id: VarInt,
@@ -1025,20 +1045,36 @@ mod tests {
         }
     }
 
-    fn fd_transfer_for_test() -> crate::ipc::transport::FdTransfer {
-        let (mux, _peer) =
-            crate::ipc::transport::MuxChannel::pair_for_test().expect("mux channel pair");
-        let (sink, stream) = mux.split().expect("split mux channel");
-        stream.fd_transfer(sink.fd_sender())
+    struct TestFdTransfer {
+        transfer: FdTransfer,
+        _sink: crate::ipc::transport::MuxSink,
+        _stream: crate::ipc::transport::MuxStream,
+        _peer: crate::ipc::transport::MuxChannel,
     }
 
-    fn webtransport_adapter(reason: &'static str) -> WebTransportSessionAdapter {
+    fn fd_transfer_for_test() -> TestFdTransfer {
+        let (mux, peer) =
+            crate::ipc::transport::MuxChannel::pair_for_test().expect("mux channel pair");
+        let (sink, stream) = mux.split().expect("split mux channel");
+        TestFdTransfer {
+            transfer: stream.fd_transfer(sink.fd_sender()),
+            _sink: sink,
+            _stream: stream,
+            _peer: peer,
+        }
+    }
+
+    fn webtransport_adapter(reason: &'static str) -> (WebTransportSessionAdapter, TestFdTransfer) {
         let mock = Arc::new(MockConnection::new());
         let session =
             webtransport_session_for_test(mock.clone(), StreamId::from(VarInt::from_u32(4)));
         mock.set_terminal_error(connection_error(reason));
         let lifecycle: Arc<dyn DynLifecycle> = mock;
-        WebTransportSessionAdapter::new(session, fd_transfer_for_test(), lifecycle)
+        let fd_transfer = fd_transfer_for_test();
+        (
+            WebTransportSessionAdapter::new(session, fd_transfer.transfer.clone(), lifecycle),
+            fd_transfer,
+        )
     }
 
     #[test]
@@ -1066,21 +1102,21 @@ mod tests {
 
     #[tokio::test]
     async fn webtransport_adapter_preserves_connection_closed_accepts() {
-        let adapter = webtransport_adapter("accept_bi connection closed");
+        let (adapter, _fd_transfer) = webtransport_adapter("accept_bi connection closed");
         let error = IpcWebTransportSession::accept_bi(&adapter, VarInt::from_u32(1))
             .await
             .expect_err("accept_bi should preserve connection failure");
         let IpcWebTransportAcceptError::Connection { source } = error else {
-            panic!("expected accept_bi connection error");
+            panic!("expected accept_bi connection error, got {error:?}");
         };
         assert_transport_reason(&source, "accept_bi connection closed");
 
-        let adapter = webtransport_adapter("accept_uni connection closed");
+        let (adapter, _fd_transfer) = webtransport_adapter("accept_uni connection closed");
         let error = IpcWebTransportSession::accept_uni(&adapter, VarInt::from_u32(2))
             .await
             .expect_err("accept_uni should preserve connection failure");
         let IpcWebTransportAcceptError::Connection { source } = error else {
-            panic!("expected accept_uni connection error");
+            panic!("expected accept_uni connection error, got {error:?}");
         };
         assert_transport_reason(&source, "accept_uni connection closed");
     }
@@ -1093,10 +1129,11 @@ mod tests {
         let session = Arc::new(TestIpcSession::new());
         let (_server_task, client) = spawn_ipc_session(session);
         let handle_lifecycle: Arc<dyn DynLifecycle> = lifecycle;
+        let fd_transfer = fd_transfer_for_test();
         let handle = IpcWebTransportSessionHandle::new(
             session_id,
             client,
-            fd_transfer_for_test(),
+            fd_transfer.transfer.clone(),
             handle_lifecycle,
         );
         let close = CloseSession::try_from((5_u32, "bye")).expect("valid close");

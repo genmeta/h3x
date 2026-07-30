@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_bridge_io_eof_latches_connection_error() {
+    async fn writer_bridge_io_eof_cancels_only_the_stream() {
         let stream_id = VarInt::from_u32(32);
         let (worker_socket, peer_socket) = UnixStream::pair().unwrap();
         let lifecycle = Arc::new(TestLifecycle::new());
@@ -197,7 +197,11 @@ mod tests {
         drop(peer_socket);
 
         let error = writer.send(Bytes::from_static(b"lost")).await.unwrap_err();
-        assert!(matches!(error, quic::StreamError::Connection { .. }));
-        assert!(quic::Lifecycle::check(lifecycle.as_ref()).is_err());
+        assert!(matches!(
+            error,
+            quic::StreamError::Reset { code }
+                if code == crate::error::Code::H3_REQUEST_CANCELLED.into_inner()
+        ));
+        assert!(quic::Lifecycle::check(lifecycle.as_ref()).is_ok());
     }
 }

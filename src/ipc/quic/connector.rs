@@ -158,7 +158,12 @@ where
         fd_id: VarInt,
     ) -> Result<VarInt, ConnectionError> {
         let authority = Authority::try_from(server).map_err(|e| connect_error(e, "authority"))?;
-        let delivery = self.fd_transfer.delivery(fd_id);
+        let delivery = self
+            .fd_transfer
+            .delivery(fd_id)
+            .reserve()
+            .await
+            .map_err(|error| connect_error(error, "reserve fd delivery"))?;
         let connection = quic::Connect::connect(&self.inner, &authority)
             .await
             .map_err(|e| connect_error(e, "connect"))?;
