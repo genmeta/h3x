@@ -2,15 +2,19 @@ use std::{
     mem,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::Bytes;
-use futures::{Sink, Stream};
+use futures::{Sink, Stream, StreamExt as _};
 use tracing::Instrument;
 
 use crate::{
     error::Code,
-    quic::{self, BoxQuicStreamReader, BoxQuicStreamWriter, ResetStreamExt, StopStreamExt},
+    quic::{
+        self, BoxQuicStreamReader, BoxQuicStreamWriter, GetStreamIdExt as _, ResetStreamExt,
+        StopStreamExt,
+    },
     varint::VarInt,
 };
 
@@ -28,6 +32,45 @@ fn writer_closed_before_stream_id_observed() -> ! {
 
 fn writer_used_after_closed() -> ! {
     panic!("guarded QUIC writer used after send side closed, this is a bug")
+}
+
+const READER_DROP_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+const READER_DROP_DRAIN_LIMIT: usize = 64 * 1024;
+
+async fn drain_reader_on_drop(mut stream: BoxQuicStreamReader) {
+    let drain_result = tokio::time::timeout(READER_DROP_DRAIN_TIMEOUT, async {
+        let stream_id = stream.stream_id().await.ok();
+        let mut bytes = 0usize;
+        loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    bytes = bytes.saturating_add(chunk.len());
+                    if bytes > READER_DROP_DRAIN_LIMIT {
+                        return (stream_id, false);
+                    }
+                }
+                Some(Err(_)) | None => return (stream_id, true),
+            }
+        }
+    })
+    .await;
+    let (stream_id, drained) = drain_result.unwrap_or((None, false));
+
+    if drained {
+        tracing::trace!(
+            boundary = "quic-reader-drop",
+            stream_id = ?stream_id.map(|id| id.into_inner()),
+            "QUIC reader reached end while draining on drop"
+        );
+    } else {
+        tracing::info!(
+            boundary = "quic-reader-drop",
+            stream_id = ?stream_id.map(|id| id.into_inner()),
+            code = Code::H3_NO_ERROR.into_inner().into_inner(),
+            "QUIC reader drop drain incomplete; sending STOP_SENDING"
+        );
+        _ = stream.stop(Code::H3_NO_ERROR.into()).await;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -252,16 +295,8 @@ impl quic::GetStreamId for GuardQuicReader {
 
 impl Drop for GuardQuicReader {
     fn drop(&mut self) {
-        if let QuicReaderState::Open { mut stream } = self.state.take() {
-            // Inherent termination: the task owns the only remaining stream
-            // handle and exits once the committed STOP_SENDING operation
-            // resolves or the underlying stream reports failure.
-            tokio::spawn(
-                async move {
-                    _ = stream.stop(Code::H3_NO_ERROR.into()).await;
-                }
-                .in_current_span(),
-            );
+        if let QuicReaderState::Open { stream } = self.state.take() {
+            tokio::spawn(drain_reader_on_drop(stream).in_current_span());
         }
     }
 }
@@ -556,6 +591,41 @@ mod tests {
     struct TestReader {
         state: ReaderState,
         stop_tx: mpsc::UnboundedSender<VarInt>,
+    }
+
+    struct PendingStreamIdReader {
+        stop_tx: mpsc::UnboundedSender<VarInt>,
+    }
+
+    impl Stream for PendingStreamIdReader {
+        type Item = Result<Bytes, quic::StreamError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl quic::StopStream for PendingStreamIdReader {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            self.get_mut()
+                .stop_tx
+                .send(code)
+                .expect("reader stop receiver should still be alive");
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl quic::GetStreamId for PendingStreamIdReader {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Pending
+        }
     }
 
     impl Stream for TestReader {
@@ -864,16 +934,7 @@ mod tests {
         drop(guard);
         drop(taken);
 
-        assert_eq!(
-            timeout(Duration::from_secs(1), async move {
-                let mut stop_rx = stop_rx;
-                stop_rx.recv().await
-            })
-            .await
-            .expect("reader drop cleanup should run")
-            .expect("reader stop code should be sent"),
-            VarInt::from(Code::H3_NO_ERROR),
-        );
+        assert_no_code(stop_rx).await;
     }
 
     #[tokio::test]
@@ -906,7 +967,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reader_stop_ok_keeps_receive_side_open_for_drop_cleanup() {
+    async fn reader_stop_ok_allows_drop_cleanup_to_drain_eof() {
         let (mut guard, mut stop_rx) = reader_guard(12, [], [Ok(())]);
 
         poll_fn(|cx| Pin::new(&mut guard).poll_stop(cx, VarInt::from_u32(33)))
@@ -921,13 +982,7 @@ mod tests {
         );
 
         drop(guard);
-        assert_eq!(
-            timeout(Duration::from_secs(1), stop_rx.recv())
-                .await
-                .expect("drop cleanup should stop the still-open receive side")
-                .expect("drop stop code should be present"),
-            VarInt::from(Code::H3_NO_ERROR),
-        );
+        assert_no_code(stop_rx).await;
     }
 
     #[tokio::test]
@@ -951,6 +1006,22 @@ mod tests {
 
         drop(guard);
         assert_no_code(stop_rx).await;
+    }
+
+    #[tokio::test]
+    async fn reader_drop_timeout_covers_pending_stream_id_lookup() {
+        let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
+        let guard = GuardQuicReader::new(Box::pin(PendingStreamIdReader { stop_tx }));
+
+        drop(guard);
+
+        assert_eq!(
+            timeout(Duration::from_secs(1), stop_rx.recv())
+                .await
+                .expect("drop cleanup should time out pending stream id lookup")
+                .expect("drop cleanup should send stop code"),
+            Code::H3_NO_ERROR.into_inner(),
+        );
     }
 
     #[tokio::test]

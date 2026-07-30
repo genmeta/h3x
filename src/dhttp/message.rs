@@ -2322,9 +2322,9 @@ mod tests {
         assert_eq!(
             timeout(Duration::from_secs(1), stop_rx.recv())
                 .await
-                .expect("taken read stream drop should stop")
-                .expect("stop code should be sent"),
-            VarInt::from(Code::H3_NO_ERROR),
+                .expect("drop cleanup should finish after draining reader EOF"),
+            None,
+            "drop cleanup should not send STOP_SENDING after draining reader EOF"
         );
     }
 
