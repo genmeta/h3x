@@ -225,14 +225,11 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        ready!(self.as_mut().poll_flush(cx))?;
         self.sender = None;
         self.reserve = None;
         self.permit = None;
-        self.sending.clear();
         Poll::Ready(Ok(()))
     }
 }
@@ -340,5 +337,30 @@ mod tests {
             Some(ReadCommand::Stop { code: stop })
         );
         flush.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_flushes_started_remoc_sends_before_closing_channel() {
+        let (outbound, mut outbound_rx): (ReadOutSender, mpsc::Receiver<ReadCommand>) =
+            mpsc::channel(CHANNEL_CAPACITY);
+        let (_inbound_tx, inbound): (mpsc::Sender<ReadEvent>, ReadInReceiver) =
+            mpsc::channel(CHANNEL_CAPACITY);
+        let mut io = RpcFrameIo::new(outbound, inbound);
+
+        poll_fn(|cx| Pin::new(&mut io).poll_ready(cx))
+            .await
+            .unwrap();
+        Pin::new(&mut io).start_send(ReadCommand::Pull).unwrap();
+
+        let close = poll_fn(|cx| Pin::new(&mut io).poll_close(cx));
+        tokio::pin!(close);
+        assert!(
+            close.as_mut().now_or_never().is_none(),
+            "close must wait for an already-started remoc send"
+        );
+
+        assert_eq!(outbound_rx.recv().await.unwrap(), Some(ReadCommand::Pull));
+        close.await.unwrap();
+        assert_eq!(outbound_rx.recv().await.unwrap(), None);
     }
 }
