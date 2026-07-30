@@ -55,7 +55,7 @@ use crate::{
             reader::{self as ipc_reader, IpcReadHypervisorIo},
             writer::{self as ipc_writer, IpcWriteHypervisorIo},
         },
-        transport::{FdDelivery, FdTransfer, ReceivedFds},
+        transport::{FdTransfer, ReceivedFds, ReservedFdDelivery},
     },
     quic::{
         self, BoxQuicStreamReader, BoxQuicStreamWriter, ConnectionError, GetStreamIdExt,
@@ -214,14 +214,29 @@ impl<M> ConnectionAdapter<M> {
         }
     }
 
-    fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+    fn spawn_task(
+        &self,
+        task_kind: &'static str,
+        stream_id: Option<VarInt>,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) {
         let handle = AbortOnDropHandle::new(tokio::spawn(task.in_current_span()));
         let mut tasks = self
             .tasks
             .lock()
             .expect("connection adapter task registry should not be poisoned");
+        let before = tasks.len();
         tasks.retain(|task| !task.is_finished());
+        let reaped = before - tasks.len();
         tasks.push(handle);
+        tracing::trace!(
+            boundary = "ipc-root-task-registry",
+            task_kind,
+            stream_id = ?stream_id.map(|id| id.into_inner()),
+            active_tasks = tasks.len(),
+            reaped_tasks = reaped,
+            "IPC root bridge task registered"
+        );
     }
 }
 
@@ -271,7 +286,7 @@ where
         match quic::WithLocalAuthority::local_authority(self.inner.as_ref()).await? {
             Some(agent) => {
                 let (server, client) = LocalAuthorityServerShared::new(Arc::new(agent), 1);
-                self.spawn_task(async move {
+                self.spawn_task("local-authority", None, async move {
                     let _ = server.serve(true).await;
                 });
                 Ok(Some(client))
@@ -284,7 +299,7 @@ where
         match quic::WithRemoteAuthority::remote_authority(self.inner.as_ref()).await? {
             Some(agent) => {
                 let (server, client) = RemoteAuthorityServerShared::new(Arc::new(agent), 1);
-                self.spawn_task(async move {
+                self.spawn_task("remote-authority", None, async move {
                     let _ = server.serve(true).await;
                 });
                 Ok(Some(client))
@@ -321,7 +336,13 @@ where
         &self,
         fd_id: VarInt,
     ) -> Result<Resolved<IpcBiHandle, StreamError>, IpcOpenError> {
-        let delivery = self.fd_transfer.delivery(fd_id);
+        let delivery = self
+            .fd_transfer
+            .delivery(fd_id)
+            .reserve()
+            .await
+            .map_err(|error| ipc_io_plumbing(error, "reserve fd delivery"))
+            .map_err(IpcOpenError::from)?;
         let (mut reader, writer) = ManageStream::open_bi(self.inner.as_ref()).await?;
         let stream_id = match reader.stream_id().await {
             Ok(id) => id,
@@ -337,7 +358,13 @@ where
         &self,
         fd_id: VarInt,
     ) -> Result<Resolved<IpcBiHandle, StreamError>, IpcAcceptError> {
-        let delivery = self.fd_transfer.delivery(fd_id);
+        let delivery = self
+            .fd_transfer
+            .delivery(fd_id)
+            .reserve()
+            .await
+            .map_err(|error| ipc_io_plumbing(error, "reserve fd delivery"))
+            .map_err(IpcAcceptError::from)?;
         let (mut reader, writer) = ManageStream::accept_bi(self.inner.as_ref()).await?;
         let stream_id = match reader.stream_id().await {
             Ok(id) => id,
@@ -352,11 +379,12 @@ where
     /// Shared logic for open_bi / accept_bi after obtaining the real streams.
     async fn bridge_bi(
         &self,
-        delivery: FdDelivery,
+        delivery: ReservedFdDelivery,
         mut reader: M::StreamReader,
         mut writer: M::StreamWriter,
         stream_id: VarInt,
     ) -> Result<IpcBiHandle, IpcPlumbingError> {
+        let fd_id = delivery.id();
         // Socketpair for the reader direction: server read hypervisor ↔ client read bridge
         let (srv_a, cli_a) = UnixStream::pair().map_err(|e| ipc_io_plumbing(e, "socketpair"))?;
         // Socketpair for the writer direction: server write hypervisor ↔ client write bridge
@@ -379,11 +407,33 @@ where
             return Err(ipc_io_plumbing(error, "deliver fds"));
         }
 
+        tracing::trace!(
+            boundary = "ipc-root-fd-delivery",
+            fd_id = fd_id.into_inner(),
+            stream_id = stream_id.into_inner(),
+            fd_count = 2,
+            "IPC bidirectional stream FDs queued"
+        );
+
         // Bridge reader direction: real QUIC reader ↔ read frame IO on srv_a.
-        self.spawn_task(bridge_reader(reader, srv_a));
+        self.spawn_task("stream-reader", Some(stream_id), async move {
+            bridge_reader(reader, srv_a).await;
+            tracing::trace!(
+                boundary = "ipc-root-task-registry",
+                stream_id = stream_id.into_inner(),
+                "IPC root stream reader bridge task finished"
+            );
+        });
 
         // Bridge writer direction: write frame IO on srv_b ↔ real QUIC writer.
-        self.spawn_task(bridge_writer(srv_b, writer));
+        self.spawn_task("stream-writer", Some(stream_id), async move {
+            bridge_writer(srv_b, writer).await;
+            tracing::trace!(
+                boundary = "ipc-root-task-registry",
+                stream_id = stream_id.into_inner(),
+                "IPC root stream writer bridge task finished"
+            );
+        });
 
         Ok(IpcBiHandle { stream_id })
     }
@@ -392,7 +442,13 @@ where
         &self,
         fd_id: VarInt,
     ) -> Result<Resolved<IpcUniHandle, StreamError>, IpcOpenError> {
-        let delivery = self.fd_transfer.delivery(fd_id);
+        let delivery = self
+            .fd_transfer
+            .delivery(fd_id)
+            .reserve()
+            .await
+            .map_err(|error| ipc_io_plumbing(error, "reserve fd delivery"))
+            .map_err(IpcOpenError::from)?;
         let mut writer = ManageStream::open_uni(self.inner.as_ref()).await?;
         let stream_id = match writer.stream_id().await {
             Ok(id) => id,
@@ -406,7 +462,14 @@ where
         }
 
         // Write frame IO on srv ↔ real QUIC writer.
-        self.spawn_task(bridge_writer(srv, writer));
+        self.spawn_task("stream-writer", Some(stream_id), async move {
+            bridge_writer(srv, writer).await;
+            tracing::trace!(
+                boundary = "ipc-root-task-registry",
+                stream_id = stream_id.into_inner(),
+                "IPC root stream writer bridge task finished"
+            );
+        });
 
         Ok(Resolved::ok(IpcUniHandle { stream_id }))
     }
@@ -415,7 +478,13 @@ where
         &self,
         fd_id: VarInt,
     ) -> Result<Resolved<IpcUniHandle, StreamError>, IpcAcceptError> {
-        let delivery = self.fd_transfer.delivery(fd_id);
+        let delivery = self
+            .fd_transfer
+            .delivery(fd_id)
+            .reserve()
+            .await
+            .map_err(|error| ipc_io_plumbing(error, "reserve fd delivery"))
+            .map_err(IpcAcceptError::from)?;
         let mut reader = ManageStream::accept_uni(self.inner.as_ref()).await?;
         let stream_id = match reader.stream_id().await {
             Ok(id) => id,
@@ -429,7 +498,14 @@ where
         }
 
         // Real QUIC reader ↔ read frame IO on srv.
-        self.spawn_task(bridge_reader(reader, srv));
+        self.spawn_task("stream-reader", Some(stream_id), async move {
+            bridge_reader(reader, srv).await;
+            tracing::trace!(
+                boundary = "ipc-root-task-registry",
+                stream_id = stream_id.into_inner(),
+                "IPC root stream reader bridge task finished"
+            );
+        });
 
         Ok(Resolved::ok(IpcUniHandle { stream_id }))
     }

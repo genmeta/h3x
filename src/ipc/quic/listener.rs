@@ -136,7 +136,12 @@ where
     Codec: remoc::codec::Codec,
 {
     async fn accept(&mut self, fd_id: VarInt) -> Result<VarInt, ConnectionError> {
-        let delivery = self.fd_transfer.delivery(fd_id);
+        let delivery = self
+            .fd_transfer
+            .delivery(fd_id)
+            .reserve()
+            .await
+            .map_err(|error| ipc_listen_error(error, "reserve fd delivery"))?;
         let connection = quic::Listen::accept(&mut self.inner)
             .await
             .map_err(|e| ipc_listen_error(e, "accept"))?;

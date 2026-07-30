@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::{Future, IntoFuture},
     os::fd::OwnedFd,
     pin::Pin,
@@ -11,21 +11,49 @@ use std::{
 };
 
 use futures::ready;
-use tokio::sync::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 use super::{DeliverFdsError, FdVec, QueueFdsError, TakeFdsError, WaitFdsError, driver::FdSender};
 use crate::varint::{VARINT_MAX, VarInt};
+
+// Bound descriptor ownership retained between sendmsg and the receiver ACK.
+// The ACK round trip is local and only gates bridge setup, not stream I/O.
+pub(super) const MAX_IN_FLIGHT_FD_DELIVERIES: usize = 32;
+const MAX_PENDING_FD_CANCELLATIONS: usize = 1024;
 
 #[derive(Debug)]
 pub(crate) struct FdPlaneCore {
     next_id: AtomicU64,
     receivers: Mutex<ReceiverState>,
+    deliveries: Mutex<DeliveryState>,
+    delivery_permits: Arc<Semaphore>,
 }
 
 #[derive(Debug)]
 struct ReceiverState {
     slots: HashMap<VarInt, oneshot::Sender<Result<FdVec, WaitFdsError>>>,
     closed: bool,
+}
+
+#[derive(Debug, Default)]
+struct DeliveryState {
+    entries: HashMap<VarInt, Arc<DeliveryEntry>>,
+    pending_cancellations: VecDeque<VarInt>,
+    closed: bool,
+}
+
+#[derive(Debug)]
+struct DeliveryEntry {
+    phase: watch::Sender<DeliveryPhase>,
+    _phase_rx: watch::Receiver<DeliveryPhase>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryPhase {
+    Open,
+    Sent,
+    Acked,
+    Cancelled,
 }
 
 impl FdPlaneCore {
@@ -36,6 +64,8 @@ impl FdPlaneCore {
                 slots: HashMap::new(),
                 closed: false,
             }),
+            deliveries: Mutex::new(DeliveryState::default()),
+            delivery_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_FD_DELIVERIES)),
         }
     }
 
@@ -83,9 +113,79 @@ impl FdPlaneCore {
         }
     }
 
-    fn remove_receiver(&self, id: VarInt) {
+    fn cancel_receiver(&self, id: VarInt) {
         let mut state = self.receivers.lock().expect("fd receiver state poisoned");
         state.slots.remove(&id);
+    }
+
+    pub(crate) fn mark_cancelled(&self, id: VarInt) {
+        let entry = {
+            let mut deliveries = self.deliveries.lock().expect("fd delivery state poisoned");
+            if deliveries.closed {
+                return;
+            }
+            if let Some(entry) = deliveries.entries.get(&id) {
+                Some(entry.clone())
+            } else if deliveries.pending_cancellations.len() >= MAX_PENDING_FD_CANCELLATIONS {
+                // Evicting an old tombstone could revive a delayed RPC request.
+                // Reject all delivery work rather than allowing that cancellation bypass.
+                None
+            } else {
+                let (phase, _phase_rx) = watch::channel(DeliveryPhase::Cancelled);
+                let entry = Arc::new(DeliveryEntry { phase, _phase_rx });
+                deliveries.entries.insert(id, entry.clone());
+                deliveries.pending_cancellations.push_back(id);
+                Some(entry)
+            }
+        };
+
+        let Some(entry) = entry else {
+            self.close();
+            return;
+        };
+        let _ = entry.phase.send(DeliveryPhase::Cancelled);
+    }
+
+    pub(crate) fn mark_acked(&self, id: VarInt) {
+        let entry = {
+            let deliveries = self.deliveries.lock().expect("fd delivery state poisoned");
+            if deliveries.closed {
+                return;
+            }
+            deliveries.entries.get(&id).cloned()
+        };
+        let Some(entry) = entry else { return };
+        let current = *entry.phase.borrow();
+        if current != DeliveryPhase::Cancelled {
+            let _ = entry.phase.send(DeliveryPhase::Acked);
+        }
+    }
+
+    fn entry(&self, id: VarInt) -> Arc<DeliveryEntry> {
+        let mut deliveries = self.deliveries.lock().expect("fd delivery state poisoned");
+        if deliveries.closed {
+            let (phase, _phase_rx) = watch::channel(DeliveryPhase::Cancelled);
+            return Arc::new(DeliveryEntry { phase, _phase_rx });
+        }
+        if let Some(entry) = deliveries.entries.get(&id).cloned() {
+            deliveries
+                .pending_cancellations
+                .retain(|pending| *pending != id);
+            return entry;
+        }
+
+        let (phase, _phase_rx) = watch::channel(DeliveryPhase::Open);
+        let entry = Arc::new(DeliveryEntry { phase, _phase_rx });
+        deliveries.entries.insert(id, entry.clone());
+        entry
+    }
+
+    fn remove_delivery(&self, id: VarInt) {
+        let mut deliveries = self.deliveries.lock().expect("fd delivery state poisoned");
+        deliveries.entries.remove(&id);
+        deliveries
+            .pending_cancellations
+            .retain(|pending| *pending != id);
     }
 
     pub(crate) fn close(&self) {
@@ -97,6 +197,18 @@ impl FdPlaneCore {
         for (_, waiter) in receivers.slots.drain() {
             let _ = waiter.send(Err(WaitFdsError::Closed));
         }
+        drop(receivers);
+
+        let deliveries: Vec<_> = {
+            let mut state = self.deliveries.lock().expect("fd delivery state poisoned");
+            state.closed = true;
+            state.pending_cancellations.clear();
+            state.entries.drain().map(|(_, entry)| entry).collect()
+        };
+        for delivery in deliveries {
+            let _ = delivery.phase.send(DeliveryPhase::Cancelled);
+        }
+        self.delivery_permits.close();
     }
 }
 
@@ -115,18 +227,19 @@ impl FdTransfer {
         let id = match self.plane.next_id() {
             Ok(id) => id,
             Err(error) => {
-                return FdReceiver::ready(VarInt::from_u32(0), error);
+                return FdReceiver::ready(self.sender.clone(), VarInt::from_u32(0), error);
             }
         };
         match self.plane.reserve(id) {
             Ok(rx) => FdReceiver {
                 id,
+                sender: self.sender.clone(),
                 plane: Arc::downgrade(&self.plane),
                 rx: Some(rx),
                 ready: None,
                 active: true,
             },
-            Err(error) => FdReceiver::ready(id, error),
+            Err(error) => FdReceiver::ready(self.sender.clone(), id, error),
         }
     }
 
@@ -134,6 +247,9 @@ impl FdTransfer {
         FdDelivery {
             id,
             sender: self.sender.clone(),
+            plane: Arc::downgrade(&self.plane),
+            entry: Some(self.plane.entry(id)),
+            active: true,
         }
     }
 }
@@ -141,6 +257,7 @@ impl FdTransfer {
 #[derive(Debug)]
 pub struct FdReceiver {
     id: VarInt,
+    sender: FdSender,
     plane: Weak<FdPlaneCore>,
     rx: Option<oneshot::Receiver<Result<FdVec, WaitFdsError>>>,
     ready: Option<Result<FdVec, WaitFdsError>>,
@@ -148,9 +265,10 @@ pub struct FdReceiver {
 }
 
 impl FdReceiver {
-    fn ready(id: VarInt, error: WaitFdsError) -> Self {
+    fn ready(sender: FdSender, id: VarInt, error: WaitFdsError) -> Self {
         Self {
             id,
+            sender,
             plane: Weak::new(),
             rx: None,
             ready: Some(Err(error)),
@@ -174,8 +292,9 @@ impl Drop for FdReceiver {
             return;
         }
         if let Some(plane) = self.plane.upgrade() {
-            plane.remove_receiver(self.id);
+            plane.cancel_receiver(self.id);
         }
+        let _ = self.sender.cancel_fds(self.id);
         self.active = false;
     }
 }
@@ -210,6 +329,10 @@ impl Future for FdReceiverFuture {
             }
         };
 
+        if let Err(source) = self.receiver.sender.ack_fds(self.receiver.id) {
+            self.receiver.disarm();
+            return Poll::Ready(Err(WaitFdsError::Ack { source }));
+        }
         self.receiver.disarm();
         Poll::Ready(Ok(ReceivedFds::new(fds)))
     }
@@ -274,6 +397,9 @@ impl ReceivedFds {
 pub struct FdDelivery {
     id: VarInt,
     sender: FdSender,
+    plane: Weak<FdPlaneCore>,
+    entry: Option<Arc<DeliveryEntry>>,
+    active: bool,
 }
 
 impl FdDelivery {
@@ -281,11 +407,124 @@ impl FdDelivery {
         self.id
     }
 
+    pub async fn cancelled(&mut self) -> bool {
+        let Some(entry) = &self.entry else {
+            return true;
+        };
+        let mut phase = entry.phase.subscribe();
+        loop {
+            let current = *phase.borrow_and_update();
+            match current {
+                DeliveryPhase::Cancelled => return true,
+                DeliveryPhase::Acked => return false,
+                DeliveryPhase::Open | DeliveryPhase::Sent => {
+                    if phase.changed().await.is_err() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        let Some(entry) = &self.entry else {
+            return true;
+        };
+        *entry.phase.borrow() == DeliveryPhase::Cancelled
+    }
+
+    /// Reserve capacity for this delivery before allocating the descriptors.
+    pub async fn reserve(self) -> Result<ReservedFdDelivery, DeliverFdsError> {
+        let Some(entry) = self.entry.as_ref().cloned() else {
+            return Err(DeliverFdsError::Cancelled);
+        };
+        let Some(plane) = self.plane.upgrade() else {
+            return Err(DeliverFdsError::ChannelClosed);
+        };
+        let Ok(permit) = plane.delivery_permits.clone().acquire_owned().await else {
+            return Err(DeliverFdsError::ChannelClosed);
+        };
+
+        let current = *entry.phase.borrow();
+        match current {
+            DeliveryPhase::Open => Ok(ReservedFdDelivery {
+                delivery: self,
+                _permit: permit,
+            }),
+            DeliveryPhase::Cancelled => return Err(DeliverFdsError::Cancelled),
+            DeliveryPhase::Sent | DeliveryPhase::Acked => Err(DeliverFdsError::UnexpectedAck),
+        }
+    }
+
     pub async fn deliver(self, fds: FdVec) -> Result<FdDelivered, DeliverFdsError> {
-        if let Err(source) = self.sender.send_fds(self.id, fds) {
+        self.reserve().await?.deliver(fds).await
+    }
+}
+
+/// Capacity reserved for one FD delivery and its acknowledgement wait.
+#[derive(Debug)]
+pub struct ReservedFdDelivery {
+    delivery: FdDelivery,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ReservedFdDelivery {
+    pub fn id(&self) -> VarInt {
+        self.delivery.id()
+    }
+
+    pub async fn deliver(mut self, fds: FdVec) -> Result<FdDelivered, DeliverFdsError> {
+        let Some(entry) = self.delivery.entry.as_ref().cloned() else {
+            return Err(DeliverFdsError::Cancelled);
+        };
+
+        let current = *entry.phase.borrow();
+        match current {
+            DeliveryPhase::Open => {
+                let _ = entry.phase.send(DeliveryPhase::Sent);
+            }
+            DeliveryPhase::Cancelled => return Err(DeliverFdsError::Cancelled),
+            DeliveryPhase::Sent | DeliveryPhase::Acked => {
+                return Err(DeliverFdsError::UnexpectedAck);
+            }
+        }
+
+        if let Err(source) = self.delivery.sender.send_fds(self.delivery.id, fds) {
             return Err(DeliverFdsError::Queue { source });
         }
-        Ok(FdDelivered { id: self.id })
+
+        let mut phase = entry.phase.subscribe();
+        loop {
+            let current = *phase.borrow_and_update();
+            match current {
+                DeliveryPhase::Acked => {
+                    self.delivery.active = false;
+                    if let Some(plane) = self.delivery.plane.upgrade() {
+                        plane.remove_delivery(self.delivery.id);
+                    }
+                    return Ok(FdDelivered {
+                        id: self.delivery.id,
+                    });
+                }
+                DeliveryPhase::Cancelled => return Err(DeliverFdsError::Cancelled),
+                DeliveryPhase::Open | DeliveryPhase::Sent => {
+                    if phase.changed().await.is_err() {
+                        return Err(DeliverFdsError::ChannelClosed);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for FdDelivery {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(plane) = self.plane.upgrade() {
+            plane.remove_delivery(self.id);
+        }
     }
 }
 
@@ -303,5 +542,52 @@ impl FdDelivered {
 impl From<QueueFdsError> for DeliverFdsError {
     fn from(source: QueueFdsError) -> Self {
         Self::Queue { source }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unmatched_cancellation_overflow_closes_fd_plane() {
+        let plane = FdPlaneCore::new();
+        let active = plane.entry(VarInt::from_u32(2_000));
+
+        for id in 0..MAX_PENDING_FD_CANCELLATIONS {
+            plane.mark_cancelled(VarInt::try_from(id).expect("test id fits varint"));
+        }
+        plane.mark_cancelled(
+            VarInt::try_from(MAX_PENDING_FD_CANCELLATIONS).expect("test id fits varint"),
+        );
+
+        let deliveries = plane.deliveries.lock().expect("fd delivery state poisoned");
+        assert!(deliveries.closed);
+        assert!(deliveries.pending_cancellations.is_empty());
+        assert!(deliveries.entries.is_empty());
+        drop(deliveries);
+        assert_eq!(*active.phase.borrow(), DeliveryPhase::Cancelled);
+        assert!(plane.delivery_permits.is_closed());
+        assert!(matches!(
+            plane.reserve(VarInt::from_u32(3_000)),
+            Err(WaitFdsError::Closed)
+        ));
+
+        let late = plane.entry(VarInt::from_u32(4_000));
+        assert_eq!(*late.phase.borrow(), DeliveryPhase::Cancelled);
+    }
+
+    #[test]
+    fn creating_delivery_consumes_pending_cancellation_tombstone() {
+        let plane = FdPlaneCore::new();
+        let id = VarInt::from_u32(17);
+        plane.mark_cancelled(id);
+
+        let entry = plane.entry(id);
+        assert_eq!(*entry.phase.borrow(), DeliveryPhase::Cancelled);
+
+        let deliveries = plane.deliveries.lock().expect("fd delivery state poisoned");
+        assert!(deliveries.pending_cancellations.is_empty());
+        assert!(deliveries.entries.contains_key(&id));
     }
 }

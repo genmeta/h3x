@@ -4,14 +4,15 @@
 //!
 //! - the receiving side calls [`FdTransfer::receive`] to reserve an id;
 //! - the id travels in the RPC request;
-//! - the sending side calls [`FdTransfer::delivery`] and consumes the returned
-//!   [`FdDelivery`] with [`FdDelivery::deliver`];
-//! - [`FdDelivery::deliver`] returns after the FD frame is queued to the local
-//!   mux writer FIFO.
+//! - the sending side calls [`FdTransfer::delivery`], reserves bounded delivery
+//!   capacity with [`FdDelivery::reserve`], and then allocates and delivers FDs;
+//! - [`FdDelivery::deliver`] returns only after the receiver has acknowledged
+//!   the FD frame.
 //!
-//! `MuxChannel` runs independent reader and writer tasks. FD delivery is not
-//! receiver-acknowledged; remoc cancellation is the sender-visible cancellation
-//! mechanism for RPC operations that carry receiver-chosen FD ids.
+//! `MuxChannel` runs independent reader and writer tasks. Control frames
+//! (`fds`, `cancel`, `ack`) are therefore not dependent on the remoc future that
+//! happens to be polling bytes. A dropped receiver is visible to the sender
+//! before it commits a stream bridge whose peer has already disappeared.
 
 use std::{
     io,
@@ -38,7 +39,9 @@ mod fd_plane;
 mod frame;
 
 pub use driver::FdSender;
-pub use fd_plane::{FdDelivered, FdDelivery, FdReceiver, FdTransfer, ReceivedFds};
+pub use fd_plane::{
+    FdDelivered, FdDelivery, FdReceiver, FdTransfer, ReceivedFds, ReservedFdDelivery,
+};
 
 /// Alias for a small-vec optimised FD collection.
 ///
@@ -71,6 +74,8 @@ pub enum WaitFdsError {
     ChannelClosed,
     #[snafu(display("fd id space is exhausted"))]
     IdExhausted,
+    #[snafu(display("failed to queue fd ack"))]
+    Ack { source: QueueFdsError },
 }
 
 #[derive(Debug, snafu::Snafu)]
@@ -83,6 +88,12 @@ pub enum TakeFdsError {
 #[derive(Debug, snafu::Snafu)]
 #[snafu(module)]
 pub enum DeliverFdsError {
+    #[snafu(display("fd delivery was cancelled"))]
+    Cancelled,
+    #[snafu(display("fd delivery received ack before fds were sent"))]
+    UnexpectedAck,
+    #[snafu(display("fd delivery confirmation channel closed unexpectedly"))]
+    ChannelClosed,
     #[snafu(display("failed to queue fd delivery"))]
     Queue { source: QueueFdsError },
 }
@@ -295,9 +306,12 @@ impl Stream for MuxStream {
 
 #[cfg(test)]
 mod tests {
-    use futures::{SinkExt, StreamExt};
+    use futures::{SinkExt, StreamExt, future::join_all};
     use smallvec::smallvec;
-    use tokio::time::{Duration, timeout};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        time::{Duration, timeout},
+    };
 
     use super::*;
 
@@ -326,7 +340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fd_delivery_deliver_completes_after_local_queue() {
+    async fn fd_delivery_deliver_waits_until_receiver_ack() {
         let ((sink_a, stream_a), (sink_b, stream_b)) = make_pair();
         let transfer_a = stream_a.fd_transfer(sink_a.fd_sender());
         let transfer_b = stream_b.fd_transfer(sink_b.fd_sender());
@@ -335,24 +349,154 @@ mod tests {
         let id = receiver.id();
         let delivery = transfer_a.delivery(id);
         let (fd, _peer) = StdUnixStream::pair().expect("fd pair");
-        let delivered = timeout(
-            Duration::from_secs(1),
-            delivery.deliver(smallvec![fd.into()]),
-        )
-        .await
-        .expect("deliver queue timeout")
-        .expect("deliver should complete once queued");
-        assert_eq!(delivered.id(), id);
+        let mut deliver_task = tokio::spawn(async move {
+            delivery
+                .deliver(smallvec![fd.into()])
+                .await
+                .expect("deliver should be acked")
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !deliver_task.is_finished(),
+            "deliver must not finish before the receiver acknowledges the fd"
+        );
 
         let received = timeout(Duration::from_secs(1), receiver)
             .await
             .expect("receiver timeout")
             .expect("receive fds");
         assert_eq!(received.len(), 1);
+
+        let delivered = timeout(Duration::from_secs(1), &mut deliver_task)
+            .await
+            .expect("deliver ack timeout")
+            .expect("deliver task join");
+        assert_eq!(delivered.id(), id);
     }
 
     #[tokio::test]
-    async fn receiver_drop_only_removes_local_waiting_slot() {
+    async fn fd_delivery_capacity_can_be_reserved_before_allocating_fds() {
+        let ((sink_a, stream_a), (_sink_b, _stream_b)) = make_pair();
+        let transfer_a = stream_a.fd_transfer(sink_a.fd_sender());
+        let mut reservations = Vec::with_capacity(fd_plane::MAX_IN_FLIGHT_FD_DELIVERIES);
+
+        for id in 0..fd_plane::MAX_IN_FLIGHT_FD_DELIVERIES {
+            reservations.push(
+                transfer_a
+                    .delivery(VarInt::try_from(id).expect("test id fits varint"))
+                    .reserve()
+                    .await
+                    .expect("reserve delivery capacity"),
+            );
+        }
+
+        let next = transfer_a.delivery(
+            VarInt::try_from(fd_plane::MAX_IN_FLIGHT_FD_DELIVERIES).expect("test id fits varint"),
+        );
+        let mut waiter = tokio::spawn(async move { next.reserve().await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !waiter.is_finished(),
+            "delivery reservation must wait when capacity is exhausted"
+        );
+
+        drop(reservations.pop());
+        let reservation = timeout(Duration::from_secs(1), &mut waiter)
+            .await
+            .expect("delivery reservation timeout")
+            .expect("delivery reservation task")
+            .expect("reserve released delivery capacity");
+        drop(reservation);
+    }
+
+    #[tokio::test]
+    async fn burst_fd_pair_delivery_preserves_pair_identity() {
+        const PAIRS: usize = 512;
+
+        let ((sink_a, stream_a), (sink_b, stream_b)) = make_pair();
+        let transfer_a = stream_a.fd_transfer(sink_a.fd_sender());
+        let transfer_b = stream_b.fd_transfer(sink_b.fd_sender());
+        let mut pending = Vec::with_capacity(PAIRS);
+        let mut peers = Vec::with_capacity(PAIRS);
+
+        for index in 0..PAIRS {
+            let receiver = transfer_b.receive();
+            let id = receiver.id();
+            let (mut peer_a, delivered_a) = tokio::net::UnixStream::pair().expect("reader pair");
+            let (mut peer_b, delivered_b) = tokio::net::UnixStream::pair().expect("writer pair");
+            let delivered_a = delivered_a.into_std().expect("reader delivery fd");
+            let delivered_b = delivered_b.into_std().expect("writer delivery fd");
+            let payload_a = [b'a', (index >> 8) as u8, index as u8];
+            let payload_b = [b'b', (index >> 8) as u8, index as u8];
+
+            peer_a
+                .write_all(&payload_a)
+                .await
+                .expect("write reader peer");
+            peer_b
+                .write_all(&payload_b)
+                .await
+                .expect("write writer peer");
+
+            let delivery = transfer_a.delivery(id);
+            pending.push(async move {
+                let deliver = delivery.deliver(smallvec![delivered_a.into(), delivered_b.into(),]);
+                let (delivered, received) = tokio::join!(deliver, receiver.into_future());
+                let delivered = delivered.expect("deliver fd pair");
+                let received = received.expect("receive fd pair");
+                assert_eq!(delivered.id(), id);
+
+                let (fd_a, fd_b) = received.into_pair().expect("fd pair");
+                let mut received_a = tokio::net::UnixStream::from_std(StdUnixStream::from(fd_a))
+                    .expect("reader socket");
+                let mut received_b = tokio::net::UnixStream::from_std(StdUnixStream::from(fd_b))
+                    .expect("writer socket");
+                let mut actual_a = [0_u8; 3];
+                let mut actual_b = [0_u8; 3];
+
+                timeout(Duration::from_secs(1), received_a.read_exact(&mut actual_a))
+                    .await
+                    .expect("reader socket timeout")
+                    .unwrap_or_else(|error| panic!("read reader socket at pair {index}: {error}"));
+                timeout(Duration::from_secs(1), received_b.read_exact(&mut actual_b))
+                    .await
+                    .expect("writer socket timeout")
+                    .unwrap_or_else(|error| panic!("read writer socket at pair {index}: {error}"));
+
+                assert_eq!(actual_a, payload_a, "reader fd mismatch at pair {index}");
+                assert_eq!(actual_b, payload_b, "writer fd mismatch at pair {index}");
+                (received_a, received_b)
+            });
+            peers.push((peer_a, peer_b));
+        }
+
+        let received_streams = timeout(Duration::from_secs(10), join_all(pending))
+            .await
+            .expect("burst fd delivery timeout");
+        drop(received_streams);
+        drop(peers);
+    }
+
+    #[tokio::test]
+    async fn receiver_drop_cancels_delivery_without_polling_mux_stream() {
+        let ((sink_a, stream_a), (sink_b, stream_b)) = make_pair();
+        let transfer_a = stream_a.fd_transfer(sink_a.fd_sender());
+        let transfer_b = stream_b.fd_transfer(sink_b.fd_sender());
+
+        let receiver = transfer_b.receive();
+        let id = receiver.id();
+        let mut delivery = transfer_a.delivery(id);
+        drop(receiver);
+
+        let cancelled = timeout(Duration::from_secs(1), delivery.cancelled())
+            .await
+            .expect("cancel timeout");
+        assert!(cancelled, "receiver drop should notify the delivery");
+    }
+
+    #[tokio::test]
+    async fn cancel_before_delivery_is_replayed_to_delivery_handle() {
         let ((sink_a, stream_a), (sink_b, stream_b)) = make_pair();
         let transfer_a = stream_a.fd_transfer(sink_a.fd_sender());
         let transfer_b = stream_b.fd_transfer(sink_b.fd_sender());
@@ -361,15 +505,13 @@ mod tests {
         let id = receiver.id();
         drop(receiver);
 
-        let (fd, _peer) = StdUnixStream::pair().expect("fd pair");
-        let delivered = timeout(
-            Duration::from_secs(1),
-            transfer_a.delivery(id).deliver(smallvec![fd.into()]),
-        )
-        .await
-        .expect("delivery should not wait for dropped receiver")
-        .expect("dropped receiver should not be sender-visible");
-        assert_eq!(delivered.id(), id);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut delivery = transfer_a.delivery(id);
+        let cancelled = timeout(Duration::from_secs(1), delivery.cancelled())
+            .await
+            .expect("cancel timeout");
+        assert!(cancelled, "cancel should be replayed to late delivery");
     }
 
     #[tokio::test]
@@ -379,14 +521,14 @@ mod tests {
         let id = VarInt::from_u32(7);
         let delivery = transfer_a.delivery(id);
         let (fd, _peer) = StdUnixStream::pair().expect("fd pair");
-        let delivered = timeout(
-            Duration::from_secs(1),
-            delivery.deliver(smallvec![fd.into()]),
-        )
-        .await
-        .expect("unknown fd delivery should queue")
-        .expect("unknown fd id should not cancel delivery");
-        assert_eq!(delivered.id(), id);
+        let deliver_task =
+            tokio::spawn(async move { delivery.deliver(smallvec![fd.into()]).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !deliver_task.is_finished(),
+            "unknown fd delivery must not be acknowledged"
+        );
 
         sink_a
             .send(Bytes::from_static(b"after-unknown-fd"))
@@ -398,5 +540,8 @@ mod tests {
             .expect("stream item")
             .expect("unknown fd should not be a protocol error");
         assert_eq!(received, Bytes::from_static(b"after-unknown-fd"));
+
+        deliver_task.abort();
+        let _ = deliver_task.await;
     }
 }
