@@ -68,6 +68,7 @@ impl Drop for RegistryGuard {
 pub(crate) struct ServerConfig {
     pub(crate) config: crate::dquic::server::ServerQuicConfig,
     pub(crate) rustls_config: Arc<rustls::ServerConfig>,
+    pub(crate) handshake_backlog: Arc<tokio::sync::Semaphore>,
 }
 
 /// Public handle returned by
@@ -179,6 +180,7 @@ mod tests {
                         registry: Weak::new(),
                     })),
             ),
+            handshake_backlog: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
         Arc::new_cyclic(|self_entry| ServerEntry {
