@@ -35,6 +35,7 @@ fn writer_used_after_closed() -> ! {
 }
 
 const READER_DROP_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+const READER_DROP_STOP_TIMEOUT: Duration = Duration::from_millis(100);
 const READER_DROP_DRAIN_LIMIT: usize = 64 * 1024;
 
 async fn drain_reader_on_drop(mut stream: BoxQuicStreamReader) {
@@ -69,7 +70,20 @@ async fn drain_reader_on_drop(mut stream: BoxQuicStreamReader) {
             code = Code::H3_NO_ERROR.into_inner().into_inner(),
             "QUIC reader drop drain incomplete; sending STOP_SENDING"
         );
-        _ = stream.stop(Code::H3_NO_ERROR.into()).await;
+        if tokio::time::timeout(
+            READER_DROP_STOP_TIMEOUT,
+            stream.stop(Code::H3_NO_ERROR.into()),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                boundary = "quic-reader-drop",
+                stream_id = ?stream_id.map(|id| id.into_inner()),
+                code = Code::H3_NO_ERROR.into_inner().into_inner(),
+                "QUIC reader STOP_SENDING timed out; dropping stream"
+            );
+        }
     }
 }
 
@@ -597,6 +611,12 @@ mod tests {
         stop_tx: mpsc::UnboundedSender<VarInt>,
     }
 
+    struct PendingStopReader {
+        stream_id: VarInt,
+        stop_tx: Option<mpsc::UnboundedSender<VarInt>>,
+        drop_tx: Option<mpsc::UnboundedSender<()>>,
+    }
+
     impl Stream for PendingStreamIdReader {
         type Item = Result<Bytes, quic::StreamError>;
 
@@ -625,6 +645,46 @@ mod tests {
             _cx: &mut Context,
         ) -> Poll<Result<VarInt, quic::StreamError>> {
             Poll::Pending
+        }
+    }
+
+    impl Stream for PendingStopReader {
+        type Item = Result<Bytes, quic::StreamError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl quic::StopStream for PendingStopReader {
+        fn poll_stop(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+            code: VarInt,
+        ) -> Poll<Result<(), quic::StreamError>> {
+            if let Some(stop_tx) = self.get_mut().stop_tx.take() {
+                stop_tx
+                    .send(code)
+                    .expect("reader stop receiver should still be alive");
+            }
+            Poll::Pending
+        }
+    }
+
+    impl quic::GetStreamId for PendingStopReader {
+        fn poll_stream_id(
+            self: Pin<&mut Self>,
+            _cx: &mut Context,
+        ) -> Poll<Result<VarInt, quic::StreamError>> {
+            Poll::Ready(Ok(self.get_mut().stream_id))
+        }
+    }
+
+    impl Drop for PendingStopReader {
+        fn drop(&mut self) {
+            if let Some(drop_tx) = self.drop_tx.take() {
+                _ = drop_tx.send(());
+            }
         }
     }
 
@@ -1022,6 +1082,31 @@ mod tests {
                 .expect("drop cleanup should send stop code"),
             Code::H3_NO_ERROR.into_inner(),
         );
+    }
+
+    #[tokio::test]
+    async fn reader_drop_timeout_covers_pending_stop() {
+        let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
+        let (drop_tx, mut drop_rx) = mpsc::unbounded_channel();
+        let guard = GuardQuicReader::new(Box::pin(PendingStopReader {
+            stream_id: VarInt::from_u32(112),
+            stop_tx: Some(stop_tx),
+            drop_tx: Some(drop_tx),
+        }));
+
+        drop(guard);
+
+        assert_eq!(
+            timeout(Duration::from_secs(1), stop_rx.recv())
+                .await
+                .expect("drop cleanup should attempt STOP_SENDING")
+                .expect("stop code should be present"),
+            Code::H3_NO_ERROR.into_inner(),
+        );
+        timeout(Duration::from_secs(1), drop_rx.recv())
+            .await
+            .expect("drop cleanup should time out pending STOP_SENDING")
+            .expect("inner reader drop should be observed");
     }
 
     #[tokio::test]
