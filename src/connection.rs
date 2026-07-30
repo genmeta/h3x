@@ -536,6 +536,14 @@ impl<C: ?Sized + quic::DynWithRemoteAuthority> ConnectionState<C> {
     }
 }
 
+fn is_graceful_connection_close(error: &quic::ConnectionError) -> bool {
+    matches!(
+        error,
+        quic::ConnectionError::Application { source }
+            if source.code == Code::H3_NO_ERROR
+    )
+}
+
 impl<C: quic::Connection> ConnectionState<C> {
     async fn accept_bi_stream_task(state: Self) {
         let task = async {
@@ -543,7 +551,14 @@ impl<C: quic::Connection> ConnectionState<C> {
                 let (reader, writer) = match quic::ManageStream::accept_bi(&*state.quic).await {
                     Ok(bi_stream) => bi_stream,
                     Err(error) => {
-                        tracing::warn!(?error, "bidirectional stream accept failed");
+                        if is_graceful_connection_close(&error) {
+                            tracing::debug!(
+                                ?error,
+                                "bidirectional stream accept stopped by graceful connection close"
+                            );
+                        } else {
+                            tracing::warn!(?error, "bidirectional stream accept failed");
+                        }
                         state.quic.handle_connection_error(error.into()).await;
                         return;
                     }
@@ -611,10 +626,14 @@ impl<C: quic::Connection> ConnectionState<C> {
         };
         tokio::select! {
             _ = task => {
-                tracing::warn!("bidirectional stream accept task exited");
+                tracing::debug!("bidirectional stream accept task exited");
             },
             error = state.quic.closed() => {
-                tracing::warn!(?error, "bidirectional stream accept task stopped by connection lifecycle");
+                if is_graceful_connection_close(&error) {
+                    tracing::debug!(?error, "bidirectional stream accept task stopped by graceful connection close");
+                } else {
+                    tracing::warn!(?error, "bidirectional stream accept task stopped by connection lifecycle");
+                }
             },
         }
     }
@@ -743,7 +762,10 @@ pub(crate) mod tests {
     use futures::{Sink, SinkExt, future::BoxFuture, stream::Stream};
     use tracing::Instrument;
 
-    use super::{Connection, ConnectionBuilder, ConnectionState, LifecycleExt, StreamError};
+    use super::{
+        Connection, ConnectionBuilder, ConnectionState, LifecycleExt, StreamError,
+        is_graceful_connection_close,
+    };
     use crate::{
         codec::{BoxPeekableStreamReader, BoxStreamWriter},
         dhttp::settings::Settings,
@@ -1459,6 +1481,28 @@ pub(crate) mod tests {
         assert!(Arc::ptr_eq(state.protocols(), &protocols));
         assert!(state.protocol::<MockProtocol>().is_none());
         assert!(format!("{state:?}").contains("ConnectionState"));
+    }
+
+    #[test]
+    fn graceful_close_requires_h3_no_error_application_code() {
+        let graceful = quic::ConnectionError::Application {
+            source: quic::ApplicationError {
+                code: Code::H3_NO_ERROR,
+                reason: "no error".into(),
+            },
+        };
+        let application_failure = quic::ConnectionError::Application {
+            source: quic::ApplicationError {
+                code: Code::H3_INTERNAL_ERROR,
+                reason: "internal error".into(),
+            },
+        };
+
+        assert!(is_graceful_connection_close(&graceful));
+        assert!(!is_graceful_connection_close(&application_failure));
+        assert!(!is_graceful_connection_close(&test_connection_error(
+            "transport failure"
+        )));
     }
 
     #[tokio::test]
