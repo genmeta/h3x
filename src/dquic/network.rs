@@ -91,7 +91,7 @@ use crate::dquic::{
         component::{
             alive::is_alive,
             local_endpoint::LocalEndpointsComponent,
-            route::{QuicRouterComponent, Way},
+            route::{QuicRouterComponent, ReceivedPacket, Way},
         },
         device::InterfaceEvent,
     },
@@ -642,7 +642,11 @@ impl QuicBindDriver {
     /// existing connection. Spawns a new server [`Connection`] using the
     /// shared server slot, waits for the TLS handshake to reveal the SNI,
     /// and fans the connection into the matching [`ServerBinding`]'s queue.
-    fn dispatch_initial_packet(driver: Arc<Self>, packet: Packet, way: Way) {
+    fn dispatch_initial_packet(
+        driver: Arc<Self>,
+        (packet, datagram_size): ReceivedPacket,
+        way: Way,
+    ) {
         use crate::dquic::qbase::packet::{
             DataHeader,
             header::{self, GetDcid},
@@ -709,7 +713,9 @@ impl QuicBindDriver {
             async move {
                 let _handshake_permit = handshake_permit;
 
-                quic_router.deliver(packet, (bind_uri, pathway, link)).await;
+                quic_router
+                    .deliver((packet, datagram_size), (bind_uri, pathway, link))
+                    .await;
                 if let Err(error) = await_initial_path_attempt_or_validate(
                     DISPATCH_INITIAL_ATTEMPT_TIMEOUT,
                     conn.attempted(),
