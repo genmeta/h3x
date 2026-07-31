@@ -69,6 +69,7 @@ impl FdPlaneCore {
         }
     }
 
+    #[allow(deprecated)] // `try_update` is unavailable on the crate's MSRV.
     fn next_id(&self) -> Result<VarInt, WaitFdsError> {
         let id_raw =
             match self
