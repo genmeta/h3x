@@ -31,7 +31,7 @@ tower-service = "0.3"
 dhttp-identity = "0.3.0-beta.1"
 
 # feature dquic
-dquic = { git = "https://github.com/genmeta/dquic.git", branch = "main", optional = true }
+dquic = { version = "0.7.0-beta.6", optional = true }
 netdev = { version = "0.45", optional = true }
 
 # feature hyper
