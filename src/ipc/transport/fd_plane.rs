@@ -144,7 +144,13 @@ impl FdPlaneCore {
             self.close();
             return;
         };
-        let _ = entry.phase.send(DeliveryPhase::Cancelled);
+        entry.phase.send_if_modified(|phase| match phase {
+            DeliveryPhase::Open | DeliveryPhase::Sent => {
+                *phase = DeliveryPhase::Cancelled;
+                true
+            }
+            DeliveryPhase::Acked | DeliveryPhase::Cancelled => false,
+        });
     }
 
     pub(crate) fn mark_acked(&self, id: VarInt) {
@@ -156,10 +162,13 @@ impl FdPlaneCore {
             deliveries.entries.get(&id).cloned()
         };
         let Some(entry) = entry else { return };
-        let current = *entry.phase.borrow();
-        if current != DeliveryPhase::Cancelled {
-            let _ = entry.phase.send(DeliveryPhase::Acked);
-        }
+        entry.phase.send_if_modified(|phase| match phase {
+            DeliveryPhase::Open | DeliveryPhase::Sent => {
+                *phase = DeliveryPhase::Acked;
+                true
+            }
+            DeliveryPhase::Acked | DeliveryPhase::Cancelled => false,
+        });
     }
 
     fn entry(&self, id: VarInt) -> Arc<DeliveryEntry> {
@@ -452,7 +461,7 @@ impl FdDelivery {
                 delivery: self,
                 _permit: permit,
             }),
-            DeliveryPhase::Cancelled => return Err(DeliverFdsError::Cancelled),
+            DeliveryPhase::Cancelled => Err(DeliverFdsError::Cancelled),
             DeliveryPhase::Sent | DeliveryPhase::Acked => Err(DeliverFdsError::UnexpectedAck),
         }
     }
@@ -479,15 +488,20 @@ impl ReservedFdDelivery {
             return Err(DeliverFdsError::Cancelled);
         };
 
-        let current = *entry.phase.borrow();
-        match current {
-            DeliveryPhase::Open => {
-                let _ = entry.phase.send(DeliveryPhase::Sent);
+        if !entry.phase.send_if_modified(|phase| {
+            if *phase == DeliveryPhase::Open {
+                *phase = DeliveryPhase::Sent;
+                true
+            } else {
+                false
             }
-            DeliveryPhase::Cancelled => return Err(DeliverFdsError::Cancelled),
-            DeliveryPhase::Sent | DeliveryPhase::Acked => {
-                return Err(DeliverFdsError::UnexpectedAck);
-            }
+        }) {
+            return match *entry.phase.borrow() {
+                DeliveryPhase::Cancelled => Err(DeliverFdsError::Cancelled),
+                DeliveryPhase::Open | DeliveryPhase::Sent | DeliveryPhase::Acked => {
+                    Err(DeliverFdsError::UnexpectedAck)
+                }
+            };
         }
 
         // Keep the original descriptors process-reachable until the receiver
