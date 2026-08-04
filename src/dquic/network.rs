@@ -96,7 +96,7 @@ use crate::dquic::{
         device::InterfaceEvent,
     },
     qtraversal::{
-        nat::{client::StunClientsComponent, router::StunRouterComponent},
+        nat::{client::StunClientComponent, router::StunRouterComponent},
         route::{ForwardersComponent, ReceiveAndDeliverPacketComponent},
     },
 };
@@ -140,47 +140,6 @@ fn interface_contains(interface: &::dquic::qinterface::device::Interface, ip: Ip
 fn iface_bind_uri_device(uri: &BindUri) -> Option<&str> {
     uri.as_iface_bind_uri()
         .map(|(_family, device, _port)| device)
-}
-
-fn is_stun_probe_eligible(interface: &netdev::Interface) -> bool {
-    use netdev::interface::types::InterfaceType;
-
-    if !interface.is_up()
-        || interface.is_loopback()
-        || matches!(interface.if_type, InterfaceType::Loopback)
-    {
-        return false;
-    }
-
-    // A tunnel, bridge, or point-to-point device can be the host's actual
-    // egress path. Route selection is stronger evidence than interface type.
-    if interface.default {
-        return true;
-    }
-
-    if interface.is_point_to_point()
-        || matches!(
-            interface.if_type,
-            InterfaceType::ProprietaryVirtual
-                | InterfaceType::Tunnel
-                | InterfaceType::Bridge
-                | InterfaceType::PeerToPeerWireless
-        )
-    {
-        return false;
-    }
-
-    #[cfg(target_os = "linux")]
-    if !interface.default {
-        let sysfs_path = std::path::Path::new("/sys/class/net").join(&interface.name);
-        if std::fs::canonicalize(sysfs_path)
-            .is_ok_and(|path| path.starts_with("/sys/devices/virtual/"))
-        {
-            return false;
-        }
-    }
-
-    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -385,7 +344,15 @@ impl QuicBindDriver {
             None
         } else if iface_bind_uri_device(&uri)
             .and_then(|device| self.network().devices.get(device))
-            .is_none_or(|interface| is_stun_probe_eligible(&interface))
+            // Reachability is dynamic: a bridge or tunnel can become the
+            // active egress path. qtraversal probes non-loopback candidates.
+            .is_none_or(|interface| {
+                !interface.is_loopback()
+                    && !matches!(
+                        interface.if_type,
+                        netdev::interface::types::InterfaceType::Loopback
+                    )
+            })
         {
             self.stun_server.clone()
         } else {
@@ -409,20 +376,20 @@ impl QuicBindDriver {
                         )
                     })
                     .clone();
-                let clients = components
+                let stun_client = components
                     .init_with(|| {
-                        StunClientsComponent::new(
+                        StunClientComponent::new(
                             iface.downgrade(),
                             stun_router.clone(),
                             self.stun_resolver.clone(),
                             stun_server,
-                            Vec::new(),
+                            None,
                             Some(local_endpoints),
                         )
                     })
                     .clone();
                 let forwarder = components
-                    .init_with(|| ForwardersComponent::new_client(clients))
+                    .init_with(|| ForwardersComponent::new_client(stun_client))
                     .forwarder();
                 components.init_with(|| {
                     ReceiveAndDeliverPacketComponent::builder(iface.downgrade())
@@ -1834,18 +1801,10 @@ mod tests {
         RemoteAuthority::new(Arc::from(name), Arc::from(identity.certs.as_slice()))
     }
 
-    fn up_interface(if_type: netdev::interface::types::InterfaceType) -> Interface {
-        let mut interface = Interface::dummy();
-        interface.name = "__stun_test_interface__".to_owned();
-        interface.flags = netdev::interface::flags::IFF_UP as u32;
-        interface.if_type = if_type;
-        interface
-    }
-
-    fn has_stun_clients(interface: &BindInterface) -> bool {
+    fn has_stun_client(interface: &BindInterface) -> bool {
         interface
             .borrow()
-            .with_component(|_: &StunClientsComponent| ())
+            .with_component(|_: &StunClientComponent| ())
             .expect("interface was not rebound")
             .is_some()
     }
@@ -3466,13 +3425,13 @@ mod tests {
             .parse()
             .expect("valid bind uri");
         let default_iface = BindDriver::bind(quic.as_ref(), &network, default).await;
-        assert!(!has_stun_clients(&default_iface));
+        assert!(!has_stun_client(&default_iface));
 
         let disabled: BindUri = format!("iface://v4.{}:1/?stun=false", loopback.name)
             .parse()
             .expect("valid bind uri");
         let disabled_iface = BindDriver::bind(quic.as_ref(), &network, disabled).await;
-        assert!(!has_stun_clients(&disabled_iface));
+        assert!(!has_stun_client(&disabled_iface));
 
         let explicit: BindUri = format!(
             "iface://v4.{}:2/?stun_server=explicit.stun.example:3478",
@@ -3481,39 +3440,7 @@ mod tests {
         .parse()
         .expect("valid bind uri");
         let explicit_iface = BindDriver::bind(quic.as_ref(), &network, explicit).await;
-        assert!(has_stun_clients(&explicit_iface));
-    }
-
-    #[test]
-    fn stun_probe_eligibility_prefers_routes_over_interface_type() {
-        use netdev::interface::types::InterfaceType;
-
-        let mut down = Interface::dummy();
-        down.if_type = InterfaceType::Ethernet;
-        assert!(!is_stun_probe_eligible(&down));
-
-        for if_type in [
-            InterfaceType::Loopback,
-            InterfaceType::ProprietaryVirtual,
-            InterfaceType::Tunnel,
-            InterfaceType::Bridge,
-            InterfaceType::PeerToPeerWireless,
-        ] {
-            assert!(!is_stun_probe_eligible(&up_interface(if_type)));
-        }
-
-        assert!(is_stun_probe_eligible(&up_interface(
-            InterfaceType::Ethernet
-        )));
-        assert!(is_stun_probe_eligible(&up_interface(
-            InterfaceType::Wireless80211
-        )));
-
-        for if_type in [InterfaceType::Tunnel, InterfaceType::Bridge] {
-            let mut default_egress = up_interface(if_type);
-            default_egress.default = true;
-            assert!(is_stun_probe_eligible(&default_egress));
-        }
+        assert!(has_stun_client(&explicit_iface));
     }
 
     #[tokio::test]
