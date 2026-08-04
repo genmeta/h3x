@@ -1226,8 +1226,10 @@ mod tests {
             iface
                 .borrow()
                 .with_component(
-                    |clients: &crate::dquic::qtraversal::nat::client::StunClientsComponent| {
-                        clients.with_clients(|clients| clients.contains_key(&stun_agent))
+                    |component: &crate::dquic::qtraversal::nat::client::StunClientComponent| {
+                        component.with_client(|client| {
+                            client.is_some_and(|client| client.agent_addr() == stun_agent)
+                        })
                     },
                 )
                 .expect("interface was not rebound")
