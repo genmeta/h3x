@@ -29,11 +29,15 @@ pub(crate) fn build_certified_key(
         .key_provider
         .load_private_key(identity.key.clone_key())
         .context(LoadKeySnafu)?;
-    Ok(Arc::new(rustls::sign::CertifiedKey {
+    let certified_key = rustls::sign::CertifiedKey {
         cert: identity.certs.iter().cloned().collect(),
         key,
         ocsp: identity.ocsp.as_ref().clone(),
-    }))
+    };
+    certified_key
+        .keys_match()
+        .context(crate::dquic::network::bind_server_error::KeyMismatchSnafu)?;
+    Ok(Arc::new(certified_key))
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@
 
 use std::sync::{Arc, Weak};
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use dhttp_identity::name::Name;
 use rustls::{
@@ -18,13 +19,28 @@ use rustls::{
 
 use crate::dquic::{binds::BindPattern, connection::Connection, identity::Identity};
 
+/// Atomically replaced certificate and private-key material for one SNI.
+pub(crate) struct ServerCredentials {
+    pub(crate) identity: Arc<Identity>,
+    pub(crate) certified_key: Arc<CertifiedKey>,
+}
+
+impl ServerCredentials {
+    pub(crate) fn new(identity: Arc<Identity>, certified_key: Arc<CertifiedKey>) -> Self {
+        Self {
+            identity,
+            certified_key,
+        }
+    }
+}
+
 /// Per-SNI entry stored behind a `Weak` in the QUIC driver's registry.
 ///
 /// Holds an mpmc channel so multiple [`ServerBinding`] clones share the
 /// same inbound connection queue.
 pub(crate) struct ServerEntry {
-    pub(crate) identity: Arc<Identity>,
-    pub(crate) certified_key: Arc<CertifiedKey>,
+    pub(crate) name: Name<'static>,
+    pub(crate) credentials: ArcSwap<ServerCredentials>,
     pub(crate) incomings_tx: async_channel::Sender<Arc<Connection>>,
     pub(crate) incomings_rx: async_channel::Receiver<Arc<Connection>>,
     /// Shared server-side QUIC/TLS configuration for this entry.
@@ -92,7 +108,7 @@ impl Clone for ServerBinding {
 impl std::fmt::Debug for ServerBinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerBinding")
-            .field("name", &self.entry.identity.name)
+            .field("name", &self.entry.name)
             .finish_non_exhaustive()
     }
 }
@@ -100,7 +116,12 @@ impl std::fmt::Debug for ServerBinding {
 impl ServerBinding {
     /// Return the server name this binding was registered under.
     pub fn name(&self) -> &Name<'static> {
-        &self.entry.identity.name
+        &self.entry.name
+    }
+
+    pub(crate) fn replace_credentials(&self, credentials: Arc<ServerCredentials>) {
+        debug_assert_eq!(self.entry.name, credentials.identity.name);
+        self.entry.credentials.store(credentials);
     }
 
     /// Receive the next accepted connection for this SNI.
@@ -134,7 +155,7 @@ impl ResolvesServerCert for SniCertResolver {
         registry
             .get::<str>(&sni_lower)
             .and_then(|item| item.value().upgrade())
-            .map(|entry| entry.certified_key.clone())
+            .map(|entry| entry.credentials.load_full().certified_key.clone())
     }
 }
 
@@ -184,8 +205,11 @@ mod tests {
         });
 
         Arc::new_cyclic(|self_entry| ServerEntry {
-            identity: identity.clone(),
-            certified_key,
+            name: identity.name.clone(),
+            credentials: ArcSwap::from_pointee(ServerCredentials::new(
+                identity.clone(),
+                certified_key,
+            )),
             incomings_tx,
             incomings_rx,
             config,
