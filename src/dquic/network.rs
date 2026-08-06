@@ -74,7 +74,7 @@ use crate::dquic::{
     },
     resolver::{Resolve, handy::SystemResolver},
     server::ServerQuicConfig,
-    sni::{self, RegistryGuard, ServerConfig, ServerEntry, SniCertResolver},
+    sni::{self, RegistryGuard, ServerConfig, ServerCredentials, ServerEntry, SniCertResolver},
     tls::{
         AuthClient, ClientAuthorityVerifyResult, ClientNameVerifyResult, LocalAuthority,
         RemoteAuthority,
@@ -466,8 +466,11 @@ impl QuicBindDriver {
         let (incomings_tx, incomings_rx) = async_channel::bounded(server_config.backlog);
 
         let entry = Arc::new_cyclic(|weak_entry| ServerEntry {
-            identity: identity.clone(),
-            certified_key,
+            name: name.clone(),
+            credentials: arc_swap::ArcSwap::from_pointee(ServerCredentials::new(
+                identity.clone(),
+                certified_key,
+            )),
             incomings_tx,
             incomings_rx,
             config: slot,
@@ -495,7 +498,9 @@ impl QuicBindDriver {
 
         match self.sni_registry.entry(name.clone()) {
             Entry::Occupied(mut occupied) => match occupied.get().upgrade() {
-                Some(existing) if Arc::ptr_eq(&existing.identity, &identity) => {
+                Some(existing)
+                    if Arc::ptr_eq(&existing.credentials.load_full().identity, &identity) =>
+                {
                     if !existing.config.config.is_compatible_with(&server_config) {
                         return ServerConfigConflictSnafu.fail();
                     }
@@ -773,6 +778,12 @@ pub enum BindServerError {
     /// Loading the identity's private key into rustls failed.
     #[snafu(display("failed to load server private key"))]
     LoadKey {
+        /// Underlying rustls error.
+        source: rustls::Error,
+    },
+    /// The private key does not match the leaf certificate.
+    #[snafu(display("server private key does not match the leaf certificate"))]
+    KeyMismatch {
         /// Underlying rustls error.
         source: rustls::Error,
     },
@@ -2351,7 +2362,10 @@ mod tests {
             .get(binding_a.name())
             .and_then(|kv| kv.value().upgrade())
             .expect("registry should keep the original entry");
-        assert!(Arc::ptr_eq(&entry.identity, &identity_a));
+        assert!(Arc::ptr_eq(
+            &entry.credentials.load_full().identity,
+            &identity_a
+        ));
     }
 
     #[tokio::test]

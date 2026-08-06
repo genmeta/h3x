@@ -14,11 +14,12 @@ use crate::{
         binds::BindPattern,
         client::{ClientQuicConfig, ServerCertVerifierChoice},
         connection::Connection,
-        identity::Identity,
+        identity::{self, Identity, Name},
         net::{ConnectionId, EndpointAddr},
         network::{BindHandle, BindServerError, Network, ServerBinding},
         resolver::{Resolve, Source},
         server::ServerQuicConfig,
+        sni::ServerCredentials,
     },
     quic,
     util::tls::DangerousServerCertVerifier,
@@ -87,6 +88,30 @@ pub enum AcceptError {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceIdentityOutcome {
+    Updated,
+    Unchanged,
+}
+
+/// Error returned when replacing a live endpoint identity.
+#[derive(Debug, Snafu)]
+#[snafu(module, visibility(pub))]
+pub enum ReplaceIdentityError {
+    /// Live replacement requires an existing named identity.
+    #[snafu(display("cannot replace the identity of an anonymous endpoint"))]
+    MissingCurrentIdentity,
+    /// SNI ownership cannot change during live replacement.
+    #[snafu(display("replacement identity name changed from {current} to {replacement}"))]
+    NameChanged {
+        current: Name<'static>,
+        replacement: Name<'static>,
+    },
+    /// The replacement certificate and key could not be prepared for rustls.
+    #[snafu(display("failed to prepare replacement identity"))]
+    Prepare { source: BindServerError },
+}
+
 /// Back-compat alias.
 pub type EndpointError = ConnectError;
 
@@ -105,8 +130,10 @@ pub struct QuicEndpoint {
     /// Bind patterns for interface filtering (shared by client and server roles).
     pub(crate) bind: Arc<Vec<BindPattern>>,
     _binds: Arc<Vec<BindHandle>>,
-    client_tls_cache: ArcSwapOption<ClientConfig>,
-    server_binding_cache: ArcSwapOption<ServerBinding>,
+    client_tls_cache: Arc<ArcSwapOption<ClientConfig>>,
+    server_binding_cache: Arc<ArcSwapOption<ServerBinding>>,
+    identity_update: Arc<tokio::sync::Mutex<()>>,
+    client_identity_update: Arc<std::sync::Mutex<()>>,
 }
 
 impl Clone for QuicEndpoint {
@@ -119,8 +146,10 @@ impl Clone for QuicEndpoint {
             server: self.server.clone(),
             bind: self.bind.clone(),
             _binds: self._binds.clone(),
-            client_tls_cache: ArcSwapOption::empty(),
-            server_binding_cache: ArcSwapOption::empty(),
+            client_tls_cache: self.client_tls_cache.clone(),
+            server_binding_cache: self.server_binding_cache.clone(),
+            identity_update: self.identity_update.clone(),
+            client_identity_update: self.client_identity_update.clone(),
         }
     }
 }
@@ -200,6 +229,48 @@ impl QuicEndpoint {
         self.identity.load_full()
     }
 
+    /// Replace certificate and key material without unregistering the SNI.
+    ///
+    /// Existing connections keep their negotiated identity. New handshakes
+    /// observe either the complete old credentials or the complete new
+    /// credentials.
+    pub async fn replace_identity(
+        &self,
+        identity: Arc<Identity>,
+    ) -> Result<ReplaceIdentityOutcome, ReplaceIdentityError> {
+        use replace_identity_error::PrepareSnafu;
+
+        let _update = self.identity_update.lock().await;
+        let current = self
+            .identity
+            .load_full()
+            .ok_or(ReplaceIdentityError::MissingCurrentIdentity)?;
+        if current.name != identity.name {
+            return Err(ReplaceIdentityError::NameChanged {
+                current: current.name.clone(),
+                replacement: identity.name.clone(),
+            });
+        }
+        if current.as_ref() == identity.as_ref() {
+            return Ok(ReplaceIdentityOutcome::Unchanged);
+        }
+
+        let certified_key = identity::build_certified_key(&identity).context(PrepareSnafu)?;
+        let _client_update = self
+            .client_identity_update
+            .lock()
+            .expect("client identity update mutex poisoned");
+        if let Some(binding) = self.server_binding_cache.load_full() {
+            binding.replace_credentials(Arc::new(ServerCredentials::new(
+                identity.clone(),
+                certified_key,
+            )));
+        }
+        self.identity.store(Some(identity));
+        self.client_tls_cache.store(None);
+        Ok(ReplaceIdentityOutcome::Updated)
+    }
+
     /// Bind patterns governing which interfaces this endpoint uses.
     pub fn bind_patterns(&self) -> &Arc<Vec<BindPattern>> {
         &self.bind
@@ -251,8 +322,10 @@ impl QuicEndpoint {
             server: Arc::new(ArcSwap::from_pointee(server)),
             bind,
             _binds: Arc::new(binds),
-            client_tls_cache: ArcSwapOption::empty(),
-            server_binding_cache: ArcSwapOption::empty(),
+            client_tls_cache: Arc::new(ArcSwapOption::empty()),
+            server_binding_cache: Arc::new(ArcSwapOption::empty()),
+            identity_update: Arc::new(tokio::sync::Mutex::new(())),
+            client_identity_update: Arc::new(std::sync::Mutex::new(())),
         };
         endpoint.init_client();
         endpoint.init_server().await;
@@ -262,6 +335,10 @@ impl QuicEndpoint {
 
 impl QuicEndpoint {
     fn ensure_client(&self) -> Result<Arc<ClientConfig>, BuildClientTlsError> {
+        let _update = self
+            .client_identity_update
+            .lock()
+            .expect("client identity update mutex poisoned");
         if let Some(cached) = self.client_tls_cache.load_full() {
             return Ok(cached);
         }
@@ -343,6 +420,7 @@ impl QuicEndpoint {
     async fn ensure_server(&self) -> Result<ServerBinding, AcceptError> {
         use accept_error::BindServerSnafu;
 
+        let _update = self.identity_update.lock().await;
         let named = match self.identity.load_full() {
             None => return Err(AcceptError::ServerUnavailable),
             Some(id) => id,
@@ -1437,6 +1515,17 @@ mod tests {
         }
     }
 
+    fn make_tls_identity(name: &str, ocsp: Option<Vec<u8>>) -> Identity {
+        use crate::dquic::cert::handy::{ToCertificate, ToPrivateKey};
+
+        Identity {
+            name: name.parse().unwrap(),
+            certs: Arc::new(SERVER_CERT.to_certificate()),
+            key: Arc::new(SERVER_KEY.to_private_key()),
+            ocsp: Arc::new(ocsp),
+        }
+    }
+
     async fn make_endpoint() -> QuicEndpoint {
         QuicEndpoint::builder()
             .network(Network::builder().build())
@@ -1476,7 +1565,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_client_caches_tls_but_clone_does_not_share_cache() {
+    async fn ensure_client_cache_is_shared_by_clones() {
         let endpoint = make_endpoint().await;
 
         let first = endpoint.ensure_client().expect("client tls should build");
@@ -1486,7 +1575,81 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
 
         let cloned = endpoint.clone();
-        assert!(cloned.client_tls_cache.load_full().is_none());
+        assert!(Arc::ptr_eq(
+            &first,
+            &cloned
+                .ensure_client()
+                .expect("clone should reuse client tls")
+        ));
+    }
+
+    #[tokio::test]
+    async fn replace_identity_updates_shared_binding_in_place() {
+        let endpoint = QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .identity(Arc::new(make_tls_identity("localhost", None)))
+            .resolver(Arc::new(SystemResolver))
+            .build()
+            .await;
+        let cloned = endpoint.clone();
+        let binding = endpoint
+            .server_binding_cache
+            .load_full()
+            .expect("named endpoint should be registered");
+        let entry = binding.entry.clone();
+        let old_client_tls = endpoint
+            .ensure_client()
+            .expect("initial client TLS should be cached");
+
+        let outcome = cloned
+            .replace_identity(Arc::new(make_tls_identity(
+                "localhost",
+                Some(vec![1, 2, 3]),
+            )))
+            .await
+            .expect("same-name identity should replace");
+
+        assert_eq!(outcome, ReplaceIdentityOutcome::Updated);
+        assert_eq!(
+            endpoint.identity().unwrap().ocsp.as_deref(),
+            Some(&[1, 2, 3][..])
+        );
+        assert!(Arc::ptr_eq(
+            &entry,
+            &endpoint.server_binding_cache.load_full().unwrap().entry
+        ));
+        assert_eq!(
+            entry.credentials.load_full().certified_key.ocsp.as_deref(),
+            Some(&[1, 2, 3][..])
+        );
+        let new_client_tls = endpoint
+            .ensure_client()
+            .expect("replacement client TLS should rebuild");
+        assert!(!Arc::ptr_eq(&old_client_tls, &new_client_tls));
+        assert!(Arc::ptr_eq(
+            &new_client_tls,
+            &cloned
+                .ensure_client()
+                .expect("clone shares rebuilt client TLS")
+        ));
+    }
+
+    #[tokio::test]
+    async fn replace_identity_rejects_name_change_without_mutation() {
+        let endpoint = QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .identity(Arc::new(make_tls_identity("localhost", None)))
+            .resolver(Arc::new(SystemResolver))
+            .build()
+            .await;
+
+        let error = endpoint
+            .replace_identity(Arc::new(make_tls_identity("other.test", None)))
+            .await
+            .expect_err("replacement must keep the registered SNI");
+
+        assert!(matches!(error, ReplaceIdentityError::NameChanged { .. }));
+        assert_eq!(endpoint.identity().unwrap().name.as_str(), "localhost");
     }
 
     #[tokio::test]
@@ -1911,8 +2074,8 @@ mod tests {
         });
 
         let entry = Arc::new(ServerEntry {
-            identity,
-            certified_key,
+            name: identity.name.clone(),
+            credentials: ArcSwap::from_pointee(ServerCredentials::new(identity, certified_key)),
             incomings_tx: tx,
             incomings_rx: rx,
             config: sni_config,
