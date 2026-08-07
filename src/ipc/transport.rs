@@ -306,7 +306,10 @@ impl Stream for MuxStream {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::AsRawFd as _;
+    use std::{
+        mem::MaybeUninit,
+        os::fd::{AsRawFd as _, RawFd},
+    };
 
     use futures::{SinkExt, StreamExt, future::join_all};
     use smallvec::smallvec;
@@ -322,6 +325,18 @@ mod tests {
         let left = left.split().expect("split left");
         let right = right.split().expect("split right");
         (left, right)
+    }
+
+    fn fd_identity(raw_fd: RawFd) -> Option<(nix::libc::dev_t, nix::libc::ino_t)> {
+        let mut stat = MaybeUninit::<nix::libc::stat>::uninit();
+        // SAFETY: `stat` points to writable storage for the libc call.
+        let result = unsafe { nix::libc::fstat(raw_fd, stat.as_mut_ptr()) };
+        if result == -1 {
+            return None;
+        }
+        // SAFETY: `fstat` initialized `stat` on success.
+        let stat = unsafe { stat.assume_init() };
+        Some((stat.st_dev, stat.st_ino))
     }
 
     #[tokio::test]
@@ -430,13 +445,21 @@ mod tests {
 
         // SAFETY: guard still owns raw_fd until it is dropped below.
         assert_ne!(unsafe { nix::libc::fcntl(raw_fd, nix::libc::F_GETFD) }, -1);
+        let original_identity = fd_identity(raw_fd).expect("fd identity");
         drop(guard);
-        // SAFETY: fcntl reports EBADF for the integer without dereferencing it.
-        assert_eq!(unsafe { nix::libc::fcntl(raw_fd, nix::libc::F_GETFD) }, -1);
-        assert_eq!(
-            io::Error::last_os_error().raw_os_error(),
-            Some(nix::libc::EBADF)
-        );
+
+        // Parallel tests can reuse the integer immediately after the guard
+        // closes it, so distinguish a closed descriptor from a reused one.
+        match fd_identity(raw_fd) {
+            Some(reused_identity) => assert_ne!(
+                reused_identity, original_identity,
+                "fd number was reused after the original descriptor closed"
+            ),
+            None => assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(nix::libc::EBADF)
+            ),
+        }
     }
 
     #[tokio::test]
