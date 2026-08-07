@@ -74,7 +74,10 @@ use crate::dquic::{
     },
     resolver::{Resolve, handy::SystemResolver},
     server::ServerQuicConfig,
-    sni::{self, RegistryGuard, ServerConfig, ServerCredentials, ServerEntry, SniCertResolver},
+    sni::{
+        self, RegistryGuard, ServerConfig, ServerCredentials, ServerEntry, ServerOwner,
+        ServerOwnerKey, SniCertResolver,
+    },
     tls::{
         AuthClient, ClientAuthorityVerifyResult, ClientNameVerifyResult, LocalAuthority,
         RemoteAuthority,
@@ -411,10 +414,47 @@ impl QuicBindDriver {
         });
     }
 
-    fn server_binding_for_existing(existing: &Arc<ServerEntry>) -> ServerBinding {
-        ServerBinding {
-            entry: existing.clone(),
+    fn reuse_server_binding(
+        &self,
+        existing: &Arc<ServerEntry>,
+        owner: &ServerOwnerKey,
+        server_config: &ServerQuicConfig,
+    ) -> Result<ServerBinding, BindServerError> {
+        use bind_server_error::{ServerConfigConflictSnafu, SniInUseSnafu};
+
+        debug_assert!(
+            existing
+                .guard
+                .registry
+                .upgrade()
+                .is_some_and(|registry| Arc::ptr_eq(&registry, &self.sni_registry)),
+            "registered server entry must belong to this QUIC driver"
+        );
+        if !existing.is_owned_by(owner) {
+            return SniInUseSnafu {
+                name: existing.name.clone(),
+            }
+            .fail();
         }
+        if !existing.config.config.is_compatible_with(server_config) {
+            return ServerConfigConflictSnafu.fail();
+        }
+        Ok(ServerBinding {
+            entry: existing.clone(),
+        })
+    }
+
+    pub(crate) fn reuse_owned_server_binding(
+        &self,
+        binding: &ServerBinding,
+        owner: &Arc<ServerOwner>,
+        server_config: &ServerQuicConfig,
+    ) -> Result<ServerBinding, BindServerError> {
+        self.reuse_server_binding(
+            &binding.entry,
+            &ServerOwnerKey::Endpoint(owner.clone()),
+            server_config,
+        )
     }
 
     fn compatible_server_slot(
@@ -456,6 +496,7 @@ impl QuicBindDriver {
     fn new_server_binding(
         &self,
         name: Name<'static>,
+        owner: ServerOwnerKey,
         identity: Arc<Identity>,
         server_config: ServerQuicConfig,
         bind_patterns: Arc<Vec<BindPattern>>,
@@ -467,6 +508,7 @@ impl QuicBindDriver {
 
         let entry = Arc::new_cyclic(|weak_entry| ServerEntry {
             name: name.clone(),
+            owner,
             credentials: arc_swap::ArcSwap::from_pointee(ServerCredentials::new(
                 identity.clone(),
                 certified_key,
@@ -491,6 +533,32 @@ impl QuicBindDriver {
         server_config: ServerQuicConfig,
         bind_patterns: Arc<Vec<BindPattern>>,
     ) -> Result<ServerBinding, BindServerError> {
+        let owner = ServerOwnerKey::Identity(identity.clone());
+        self.bind_server_for(owner, identity, server_config, bind_patterns)
+    }
+
+    pub(crate) async fn bind_server_owned(
+        self: Arc<Self>,
+        owner: Arc<ServerOwner>,
+        identity: Arc<Identity>,
+        server_config: ServerQuicConfig,
+        bind_patterns: Arc<Vec<BindPattern>>,
+    ) -> Result<ServerBinding, BindServerError> {
+        self.bind_server_for(
+            ServerOwnerKey::Endpoint(owner),
+            identity,
+            server_config,
+            bind_patterns,
+        )
+    }
+
+    fn bind_server_for(
+        &self,
+        owner: ServerOwnerKey,
+        identity: Arc<Identity>,
+        server_config: ServerQuicConfig,
+        bind_patterns: Arc<Vec<BindPattern>>,
+    ) -> Result<ServerBinding, BindServerError> {
         use bind_server_error::*;
         use dashmap::mapref::entry::Entry;
 
@@ -498,25 +566,25 @@ impl QuicBindDriver {
 
         match self.sni_registry.entry(name.clone()) {
             Entry::Occupied(mut occupied) => match occupied.get().upgrade() {
-                Some(existing)
-                    if Arc::ptr_eq(&existing.credentials.load_full().identity, &identity) =>
-                {
-                    if !existing.config.config.is_compatible_with(&server_config) {
-                        return ServerConfigConflictSnafu.fail();
-                    }
-                    Ok(Self::server_binding_for_existing(&existing))
+                Some(existing) if existing.is_owned_by(&owner) => {
+                    self.reuse_server_binding(&existing, &owner, &server_config)
                 }
                 Some(_) => SniInUseSnafu { name }.fail(),
                 None => {
-                    let binding =
-                        self.new_server_binding(name, identity, server_config, bind_patterns)?;
+                    let binding = self.new_server_binding(
+                        name,
+                        owner,
+                        identity,
+                        server_config,
+                        bind_patterns,
+                    )?;
                     occupied.insert(Arc::downgrade(&binding.entry));
                     Ok(binding)
                 }
             },
             Entry::Vacant(vacant) => {
                 let binding =
-                    self.new_server_binding(name, identity, server_config, bind_patterns)?;
+                    self.new_server_binding(name, owner, identity, server_config, bind_patterns)?;
                 vacant.insert(Arc::downgrade(&binding.entry));
                 Ok(binding)
             }

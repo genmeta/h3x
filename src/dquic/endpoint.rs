@@ -1,8 +1,11 @@
 //! QUIC-only endpoint built on top of a shared [`Network`].
 
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{
+    str::FromStr,
+    sync::{Arc, Mutex, RwLock},
+    time::Duration,
+};
 
-use arc_swap::{ArcSwap, ArcSwapOption};
 use bon::bon;
 use futures::{FutureExt, Stream, StreamExt, future::join_all};
 use rustls::ClientConfig;
@@ -19,7 +22,7 @@ use crate::{
         network::{BindHandle, BindServerError, Network, ServerBinding},
         resolver::{Resolve, Source},
         server::ServerQuicConfig,
-        sni::ServerCredentials,
+        sni::{ServerCredentials, ServerOwner},
     },
     quic,
     util::tls::DangerousServerCertVerifier,
@@ -110,107 +113,169 @@ pub enum ReplaceIdentityError {
     /// The replacement certificate and key could not be prepared for rustls.
     #[snafu(display("failed to prepare replacement identity"))]
     Prepare { source: BindServerError },
+    /// The endpoint no longer owns the credentials it is trying to replace.
+    #[snafu(display("server registration for {name} has newer credentials"))]
+    StaleRegistration { name: Name<'static> },
 }
 
 /// Back-compat alias.
 pub type EndpointError = ConnectError;
 
+struct ClientRuntime {
+    identity: Option<Arc<Identity>>,
+    client: Arc<ClientQuicConfig>,
+    tls: Arc<ClientConfig>,
+}
+
+/// Authoritative endpoint configuration. Runtime caches are derived from one
+/// coherent read of this aggregate.
+#[derive(Clone)]
+struct EndpointConfig {
+    identity: Option<Arc<Identity>>,
+    client: Arc<ClientQuicConfig>,
+    server: Arc<ServerQuicConfig>,
+}
+
+impl EndpointConfig {
+    fn same_server_state(&self, other: &Self) -> bool {
+        self.identity.as_deref() == other.identity.as_deref()
+            && self.server.as_ref() == other.server.as_ref()
+    }
+}
+
+/// State shared by an endpoint and its clones. Code taking multiple locks must
+/// acquire `config` before either derived-state mutex.
+struct EndpointState {
+    config: RwLock<EndpointConfig>,
+    client_runtime: Mutex<Option<Arc<ClientRuntime>>>,
+    server_registration: Mutex<Option<ServerBinding>>,
+    server_owner: Arc<ServerOwner>,
+}
+
+impl EndpointState {
+    fn new(
+        identity: Option<Arc<Identity>>,
+        client: ClientQuicConfig,
+        server: ServerQuicConfig,
+    ) -> Self {
+        Self {
+            config: RwLock::new(EndpointConfig {
+                identity,
+                client: Arc::new(client),
+                server: Arc::new(server),
+            }),
+            client_runtime: Mutex::new(None),
+            server_registration: Mutex::new(None),
+            server_owner: Arc::new(ServerOwner),
+        }
+    }
+}
+
 /// A QUIC-only endpoint backed by a shared [`Network`].
 pub struct QuicEndpoint {
     /// Shared network infrastructure.
     pub(crate) network: Arc<Network>,
-    /// TLS identity for this endpoint (`None` for anonymous/client-only).
-    pub(crate) identity: Arc<ArcSwapOption<Identity>>,
+    state: Arc<EndpointState>,
     /// Resolver used when establishing outbound connections.
     pub(crate) resolver: Arc<dyn Resolve + Send + Sync>,
-    /// Client-side configuration.
-    pub(crate) client: Arc<ArcSwap<ClientQuicConfig>>,
-    /// Server-side configuration.
-    pub(crate) server: Arc<ArcSwap<ServerQuicConfig>>,
     /// Bind patterns for interface filtering (shared by client and server roles).
     pub(crate) bind: Arc<Vec<BindPattern>>,
     _binds: Arc<Vec<BindHandle>>,
-    client_tls_cache: Arc<ArcSwapOption<ClientConfig>>,
-    server_binding_cache: Arc<ArcSwapOption<ServerBinding>>,
-    identity_update: Arc<tokio::sync::Mutex<()>>,
-    client_identity_update: Arc<std::sync::Mutex<()>>,
 }
 
 impl Clone for QuicEndpoint {
     fn clone(&self) -> Self {
         Self {
             network: self.network.clone(),
-            identity: self.identity.clone(),
+            state: self.state.clone(),
             resolver: self.resolver.clone(),
-            client: self.client.clone(),
-            server: self.server.clone(),
             bind: self.bind.clone(),
             _binds: self._binds.clone(),
-            client_tls_cache: self.client_tls_cache.clone(),
-            server_binding_cache: self.server_binding_cache.clone(),
-            identity_update: self.identity_update.clone(),
-            client_identity_update: self.client_identity_update.clone(),
         }
     }
 }
 
 /// RAII guard for mutable access to [`QuicEndpoint`]'s client configuration.
 ///
-/// On drop, invalidates the endpoint's `client_tls_cache` so that the next
-/// `connect()` call rebuilds the TLS configuration.
+/// If changed, dropping the guard invalidates the cached client runtime so the
+/// next `connect()` call rebuilds the TLS configuration.
 pub struct ClientConfigMutGuard<'a> {
-    config: Arc<ClientQuicConfig>,
-    target: &'a ArcSwap<ClientQuicConfig>,
-    cache: &'a ArcSwapOption<ClientConfig>,
+    state: &'a EndpointState,
+    original: Arc<ClientQuicConfig>,
+    value: Arc<ClientQuicConfig>,
 }
 
 impl<'a> std::ops::Deref for ClientConfigMutGuard<'a> {
     type Target = ClientQuicConfig;
     fn deref(&self) -> &Self::Target {
-        self.config.as_ref()
+        self.value.as_ref()
     }
 }
 
 impl<'a> std::ops::DerefMut for ClientConfigMutGuard<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        Arc::make_mut(&mut self.config)
+        Arc::make_mut(&mut self.value)
     }
 }
 
 impl<'a> Drop for ClientConfigMutGuard<'a> {
     fn drop(&mut self) {
-        self.target.store(self.config.clone());
-        self.cache.store(None);
+        if self.value.as_ref() == self.original.as_ref() {
+            return;
+        }
+        let mut config = self
+            .state
+            .config
+            .write()
+            .expect("endpoint config lock poisoned");
+        config.client = self.value.clone();
+        self.state
+            .client_runtime
+            .lock()
+            .expect("client runtime mutex poisoned")
+            .take();
     }
 }
 
 /// RAII guard for mutable access to [`QuicEndpoint`]'s server configuration.
 ///
-/// On drop, invalidates the endpoint's `server_binding_cache` so that the next
-/// `accept()` call rebuilds the server binding.
+/// If changed, dropping the guard unregisters the active server binding so the
+/// next `accept()` call rebuilds it.
 pub struct ServerConfigMutGuard<'a> {
-    config: Arc<ServerQuicConfig>,
-    target: &'a ArcSwap<ServerQuicConfig>,
-    cache: &'a ArcSwapOption<ServerBinding>,
+    state: &'a EndpointState,
+    original: Arc<ServerQuicConfig>,
+    value: Arc<ServerQuicConfig>,
 }
 
 impl<'a> std::ops::Deref for ServerConfigMutGuard<'a> {
     type Target = ServerQuicConfig;
     fn deref(&self) -> &Self::Target {
-        self.config.as_ref()
+        self.value.as_ref()
     }
 }
 
 impl<'a> std::ops::DerefMut for ServerConfigMutGuard<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        Arc::make_mut(&mut self.config)
+        Arc::make_mut(&mut self.value)
     }
 }
 
 impl<'a> Drop for ServerConfigMutGuard<'a> {
     fn drop(&mut self) {
-        self.target.store(self.config.clone());
-        self.cache.store(None);
+        if self.value.as_ref() == self.original.as_ref() {
+            return;
+        }
+        let mut config = self
+            .state
+            .config
+            .write()
+            .expect("endpoint config lock poisoned");
+        config.server = self.value.clone();
+        self.state
+            .server_registration
+            .lock()
+            .expect("server registration mutex poisoned")
+            .take();
     }
 }
 
@@ -226,7 +291,12 @@ impl QuicEndpoint {
 
     /// Current TLS identity, if any.
     pub fn identity(&self) -> Option<Arc<Identity>> {
-        self.identity.load_full()
+        self.state
+            .config
+            .read()
+            .expect("endpoint config lock poisoned")
+            .identity
+            .clone()
     }
 
     /// Replace certificate and key material without unregistering the SNI.
@@ -240,10 +310,14 @@ impl QuicEndpoint {
     ) -> Result<ReplaceIdentityOutcome, ReplaceIdentityError> {
         use replace_identity_error::PrepareSnafu;
 
-        let _update = self.identity_update.lock().await;
-        let current = self
+        let mut config = self
+            .state
+            .config
+            .write()
+            .expect("endpoint config lock poisoned");
+        let current = config
             .identity
-            .load_full()
+            .as_ref()
             .ok_or(ReplaceIdentityError::MissingCurrentIdentity)?;
         if current.name != identity.name {
             return Err(ReplaceIdentityError::NameChanged {
@@ -254,20 +328,26 @@ impl QuicEndpoint {
         if current.as_ref() == identity.as_ref() {
             return Ok(ReplaceIdentityOutcome::Unchanged);
         }
-
         let certified_key = identity::build_certified_key(&identity).context(PrepareSnafu)?;
-        let _client_update = self
-            .client_identity_update
+        let credentials = Arc::new(ServerCredentials::new(identity.clone(), certified_key));
+        let registration = self
+            .state
+            .server_registration
             .lock()
-            .expect("client identity update mutex poisoned");
-        if let Some(binding) = self.server_binding_cache.load_full() {
-            binding.replace_credentials(Arc::new(ServerCredentials::new(
-                identity.clone(),
-                certified_key,
-            )));
+            .expect("server registration mutex poisoned");
+        if let Some(registration) = registration.as_ref()
+            && !registration.replace_credentials(current, credentials)
+        {
+            return Err(ReplaceIdentityError::StaleRegistration {
+                name: registration.name().clone(),
+            });
         }
-        self.identity.store(Some(identity));
-        self.client_tls_cache.store(None);
+        config.identity = Some(identity);
+        self.state
+            .client_runtime
+            .lock()
+            .expect("client runtime mutex poisoned")
+            .take();
         Ok(ReplaceIdentityOutcome::Updated)
     }
 
@@ -316,16 +396,10 @@ impl QuicEndpoint {
             join_all(bind.iter().map(|p| network.quic().bind(p.clone()))).await;
         let endpoint = Self {
             network,
-            identity: Arc::new(ArcSwapOption::from(identity)),
+            state: Arc::new(EndpointState::new(identity, client, server)),
             resolver,
-            client: Arc::new(ArcSwap::from_pointee(client)),
-            server: Arc::new(ArcSwap::from_pointee(server)),
             bind,
             _binds: Arc::new(binds),
-            client_tls_cache: Arc::new(ArcSwapOption::empty()),
-            server_binding_cache: Arc::new(ArcSwapOption::empty()),
-            identity_update: Arc::new(tokio::sync::Mutex::new(())),
-            client_identity_update: Arc::new(std::sync::Mutex::new(())),
         };
         endpoint.init_client();
         endpoint.init_server().await;
@@ -335,19 +409,41 @@ impl QuicEndpoint {
 
 impl QuicEndpoint {
     fn ensure_client(&self) -> Result<Arc<ClientConfig>, BuildClientTlsError> {
-        let _update = self
-            .client_identity_update
-            .lock()
-            .expect("client identity update mutex poisoned");
-        if let Some(cached) = self.client_tls_cache.load_full() {
-            return Ok(cached);
-        }
-        let config = Arc::new(self.build_client_tls()?);
-        self.client_tls_cache.store(Some(config.clone()));
-        Ok(config)
+        Ok(self.ensure_client_runtime()?.tls.clone())
     }
 
-    fn build_client_tls(&self) -> Result<ClientConfig, BuildClientTlsError> {
+    fn ensure_client_runtime(&self) -> Result<Arc<ClientRuntime>, BuildClientTlsError> {
+        let config = self
+            .state
+            .config
+            .read()
+            .expect("endpoint config lock poisoned");
+        let mut cache = self
+            .state
+            .client_runtime
+            .lock()
+            .expect("client runtime mutex poisoned");
+        if let Some(cached) = cache.as_ref() {
+            return Ok(cached.clone());
+        }
+
+        let tls = Arc::new(Self::build_client_tls_from(
+            &config.client,
+            config.identity.as_deref(),
+        )?);
+        let runtime = Arc::new(ClientRuntime {
+            identity: config.identity.clone(),
+            client: config.client.clone(),
+            tls,
+        });
+        *cache = Some(runtime.clone());
+        Ok(runtime)
+    }
+
+    fn build_client_tls_from(
+        client: &ClientQuicConfig,
+        identity: Option<&Identity>,
+    ) -> Result<ClientConfig, BuildClientTlsError> {
         use build_client_tls_error::{ClientAuthSnafu, VersionSnafu};
 
         const TLS13: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
@@ -355,7 +451,6 @@ impl QuicEndpoint {
         let builder = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(TLS13)
             .context(VersionSnafu)?;
-        let client = self.client.load_full();
         let builder = match &client.verifier {
             ServerCertVerifierChoice::Dangerous => builder
                 .dangerous()
@@ -365,7 +460,7 @@ impl QuicEndpoint {
                 .dangerous()
                 .with_custom_certificate_verifier(v.clone()),
         };
-        let mut tls = match self.identity.load_full() {
+        let mut tls = match identity {
             None => builder.with_no_client_auth(),
             Some(id) => builder
                 .with_client_auth_cert(id.certs.iter().cloned().collect(), id.key.clone_key())
@@ -378,20 +473,15 @@ impl QuicEndpoint {
 }
 
 impl QuicEndpoint {
-    fn build_client_connection(
+    fn build_client_connection_from_runtime(
         &self,
         server_name: &str,
-        tls: Arc<ClientConfig>,
+        runtime: &ClientRuntime,
     ) -> Result<Arc<Connection>, BuildClientTlsError> {
         use build_client_tls_error::SetParameterSnafu;
 
-        // Propagate the endpoint's named identity into the QUIC transport
-        // `ClientName` parameter so the peer can populate its
-        // `remote_authority` (identity-based access control on the server
-        // relies on this).
-        let client = self.client.load_full();
-        let mut parameters = client.parameters.clone();
-        if let Some(named) = self.identity.load_full() {
+        let mut parameters = runtime.client.parameters.clone();
+        if let Some(named) = runtime.identity.as_ref() {
             parameters
                 .set(
                     crate::dquic::qbase::param::ParameterId::ClientName,
@@ -399,18 +489,19 @@ impl QuicEndpoint {
                 )
                 .context(SetParameterSnafu)?;
         }
-        let builder = Connection::new_client(server_name.to_owned(), client.token_sink.clone())
-            .with_parameters(parameters)
-            .with_tls_config((*tls).clone())
-            .with_streams_concurrency_strategy(client.stream_strategy_factory.as_ref())
-            .with_zero_rtt(client.enable_0rtt);
+        let builder =
+            Connection::new_client(server_name.to_owned(), runtime.client.token_sink.clone())
+                .with_parameters(parameters)
+                .with_tls_config((*runtime.tls).clone())
+                .with_streams_concurrency_strategy(runtime.client.stream_strategy_factory.as_ref())
+                .with_zero_rtt(runtime.client.enable_0rtt);
         let connection = self
             .network
             .quic()
             .configure_connection(builder)
-            .with_defer_idle_timeout(client.defer_idle_timeout)
+            .with_defer_idle_timeout(runtime.client.defer_idle_timeout)
             .with_cids(ConnectionId::random_gen(8))
-            .with_qlog(client.qlogger.clone())
+            .with_qlog(runtime.client.qlogger.clone())
             .run();
         Ok(connection)
     }
@@ -420,24 +511,71 @@ impl QuicEndpoint {
     async fn ensure_server(&self) -> Result<ServerBinding, AcceptError> {
         use accept_error::BindServerSnafu;
 
-        let _update = self.identity_update.lock().await;
-        let named = match self.identity.load_full() {
-            None => return Err(AcceptError::ServerUnavailable),
-            Some(id) => id,
-        };
-        if let Some(cached) = self.server_binding_cache.load_full() {
-            return Ok(cached.as_ref().clone());
+        loop {
+            let (snapshot, identity) = {
+                let config = self
+                    .state
+                    .config
+                    .read()
+                    .expect("endpoint config lock poisoned");
+                let identity = config
+                    .identity
+                    .clone()
+                    .ok_or(AcceptError::ServerUnavailable)?;
+                let registration = self
+                    .state
+                    .server_registration
+                    .lock()
+                    .expect("server registration mutex poisoned");
+                if let Some(binding) = registration.as_ref() {
+                    return self
+                        .network
+                        .quic()
+                        .reuse_owned_server_binding(
+                            binding,
+                            &self.state.server_owner,
+                            &config.server,
+                        )
+                        .context(BindServerSnafu);
+                }
+                (config.clone(), identity)
+            };
+
+            let binding = self
+                .network
+                .quic()
+                .bind_server_owned(
+                    self.state.server_owner.clone(),
+                    identity,
+                    (*snapshot.server).clone(),
+                    self.bind.clone(),
+                )
+                .await;
+
+            let config = self
+                .state
+                .config
+                .read()
+                .expect("endpoint config lock poisoned");
+            if !snapshot.same_server_state(&config) {
+                continue;
+            }
+            let mut registration = self
+                .state
+                .server_registration
+                .lock()
+                .expect("server registration mutex poisoned");
+            if let Some(existing) = registration.as_ref() {
+                return self
+                    .network
+                    .quic()
+                    .reuse_owned_server_binding(existing, &self.state.server_owner, &config.server)
+                    .context(BindServerSnafu);
+            }
+            let binding = binding.context(BindServerSnafu)?;
+            *registration = Some(binding.clone());
+            return Ok(binding);
         }
-        let server = self.server.load_full();
-        let binding = self
-            .network
-            .quic()
-            .bind_server(named, (*server).clone(), self.bind.clone())
-            .await
-            .context(BindServerSnafu)?;
-        self.server_binding_cache
-            .store(Some(Arc::new(binding.clone())));
-        Ok(binding)
     }
 
     /// Eagerly build the client TLS configuration so the first `connect()`
@@ -450,7 +588,14 @@ impl QuicEndpoint {
     /// Eagerly register the server SNI so `accept()` can return immediately.
     /// No-op when no identity is configured. Silently ignores errors.
     async fn init_server(&self) {
-        if self.identity.load_full().is_some() {
+        if self
+            .state
+            .config
+            .read()
+            .expect("endpoint config lock poisoned")
+            .identity
+            .is_some()
+        {
             let _ = self.ensure_server().await;
         }
     }
@@ -483,24 +628,37 @@ impl quic::Connect for QuicEndpoint {
             tls = transport_name,
             "connecting quic endpoint"
         );
-        let tls = self.ensure_client().context(TlsSnafu)?;
+        let runtime = self.ensure_client_runtime().context(TlsSnafu)?;
         let mut server_eps =
             futures::StreamExt::fuse(self.resolver.lookup(lookup_name).await.context(DnsSnafu)?);
         let connection = self
-            .build_client_connection(transport_name, tls)
+            .build_client_connection_from_runtime(transport_name, &runtime)
             .context(TlsSnafu)?;
         tracing::trace!(
             logical_server = %server,
             lookup = lookup_name,
             tls = transport_name,
-            timeout_ms = self.connect_path_timeout().as_millis(),
+            timeout_ms = runtime
+                .client
+                .parameters
+                .get::<Duration>(crate::dquic::qbase::param::ParameterId::MaxIdleTimeout)
+                .filter(|timeout| !timeout.is_zero())
+                .unwrap_or(Duration::from_secs(20))
+                .as_millis(),
             bind_pattern_count = self.bind.len(),
             "waiting for quic path"
         );
 
         self.subscribe_connection_local_endpoints(connection.clone());
 
-        let connect_timeout = tokio::time::sleep(self.connect_path_timeout());
+        let connect_timeout = tokio::time::sleep(
+            runtime
+                .client
+                .parameters
+                .get::<Duration>(crate::dquic::qbase::param::ParameterId::MaxIdleTimeout)
+                .filter(|timeout| !timeout.is_zero())
+                .unwrap_or(Duration::from_secs(20)),
+        );
         tokio::pin!(connect_timeout);
         loop {
             tokio::select! {
@@ -568,7 +726,11 @@ impl quic::Listen for QuicEndpoint {
     }
 
     async fn shutdown(&self) -> Result<(), Self::Error> {
-        self.server_binding_cache.store(None);
+        self.state
+            .server_registration
+            .lock()
+            .expect("server registration mutex poisoned")
+            .take();
         Ok(())
     }
 }
@@ -586,33 +748,24 @@ impl quic::Listen for &QuicEndpoint {
     }
 }
 
-#[allow(dead_code)]
 impl QuicEndpoint {
-    fn invalidate_client_cache(&self) {
-        self.client_tls_cache.store(None);
-    }
-
-    fn invalidate_server_cache(&self) {
-        self.server_binding_cache.store(None);
-    }
-
-    fn invalidate_caches(&self) {
-        self.invalidate_client_cache();
-        self.invalidate_server_cache();
-    }
-
     /// Obtain a mutable guard for the endpoint's identity.
     ///
     /// The guard implements [`DerefMut`](std::ops::DerefMut) targeting
     /// `Option<Arc<Identity>>`, so callers may inspect, mutate, set, or
-    /// clear the identity. Caches are invalidated when the guard is dropped.
+    /// clear the identity. Dependent state is refreshed when a change is made.
     pub fn identity_mut(&mut self) -> IdentityMutGuard<'_> {
-        let value = self.identity.load_full();
+        let state = self.state.as_ref();
+        let value = state
+            .config
+            .read()
+            .expect("endpoint config lock poisoned")
+            .identity
+            .clone();
         IdentityMutGuard {
-            identity: self.identity.as_ref(),
+            state,
+            original: value.clone(),
             value,
-            client_cache: &self.client_tls_cache,
-            server_cache: &self.server_binding_cache,
         }
     }
 
@@ -631,12 +784,19 @@ impl QuicEndpoint {
     ///
     /// The guard implements [`DerefMut`](std::ops::DerefMut) targeting
     /// [`ClientQuicConfig`], so callers can mutate fields directly.
-    /// When the guard is dropped, the `client_tls_cache` is invalidated.
+    /// When a changed guard is dropped, the cached client runtime is invalidated.
     pub fn client_config_mut(&mut self) -> ClientConfigMutGuard<'_> {
+        let state = self.state.as_ref();
+        let value = state
+            .config
+            .read()
+            .expect("endpoint config lock poisoned")
+            .client
+            .clone();
         ClientConfigMutGuard {
-            config: self.client.load_full(),
-            target: self.client.as_ref(),
-            cache: &self.client_tls_cache,
+            state,
+            original: value.clone(),
+            value,
         }
     }
 
@@ -644,26 +804,31 @@ impl QuicEndpoint {
     ///
     /// The guard implements [`DerefMut`](std::ops::DerefMut) targeting
     /// [`ServerQuicConfig`], so callers can mutate fields directly.
-    /// When the guard is dropped, the `server_binding_cache` is invalidated.
+    /// When a changed guard is dropped, the active server binding is unregistered.
     pub fn server_config_mut(&mut self) -> ServerConfigMutGuard<'_> {
+        let state = self.state.as_ref();
+        let value = state
+            .config
+            .read()
+            .expect("endpoint config lock poisoned")
+            .server
+            .clone();
         ServerConfigMutGuard {
-            config: self.server.load_full(),
-            target: self.server.as_ref(),
-            cache: &self.server_binding_cache,
+            state,
+            original: value.clone(),
+            value,
         }
     }
 }
 
 /// RAII guard for mutable access to [`QuicEndpoint`]'s identity.
 ///
-/// On drop, stores the modified identity back into the endpoint's
-/// `ArcSwapOption<Identity>` and invalidates both caches (identity changes
-/// affect both client TLS auth cert and server SNI binding).
+/// On drop, commits a modified identity. A same-name identity updates an active
+/// registration in place; clearing or renaming it drops that registration.
 pub struct IdentityMutGuard<'a> {
-    identity: &'a ArcSwapOption<Identity>,
+    state: &'a EndpointState,
+    original: Option<Arc<Identity>>,
     value: Option<Arc<Identity>>,
-    client_cache: &'a ArcSwapOption<ClientConfig>,
-    server_cache: &'a ArcSwapOption<ServerBinding>,
 }
 
 impl<'a> std::ops::Deref for IdentityMutGuard<'a> {
@@ -681,22 +846,54 @@ impl<'a> std::ops::DerefMut for IdentityMutGuard<'a> {
 
 impl<'a> Drop for IdentityMutGuard<'a> {
     fn drop(&mut self) {
-        self.identity.store(self.value.take());
-        self.client_cache.store(None);
-        self.server_cache.store(None);
+        if self.value.as_deref() == self.original.as_deref() {
+            return;
+        }
+
+        let mut config = self
+            .state
+            .config
+            .write()
+            .expect("endpoint config lock poisoned");
+        if self.value.as_deref() == config.identity.as_deref() {
+            return;
+        }
+        let previous = config.identity.clone();
+        let mut registration = self
+            .state
+            .server_registration
+            .lock()
+            .expect("server registration mutex poisoned");
+        let can_reuse = match (
+            registration.as_ref(),
+            previous.as_ref(),
+            self.value.as_ref(),
+        ) {
+            (Some(active), Some(previous), Some(identity))
+                if active.name() == &identity.name && previous.name == identity.name =>
+            {
+                identity::build_certified_key(identity).is_ok_and(|certified_key| {
+                    active.replace_credentials(
+                        previous,
+                        Arc::new(ServerCredentials::new(identity.clone(), certified_key)),
+                    )
+                })
+            }
+            _ => false,
+        };
+        if !can_reuse {
+            registration.take();
+        }
+        config.identity = self.value.take();
+        self.state
+            .client_runtime
+            .lock()
+            .expect("client runtime mutex poisoned")
+            .take();
     }
 }
 
 impl QuicEndpoint {
-    fn connect_path_timeout(&self) -> Duration {
-        self.client
-            .load_full()
-            .parameters
-            .get::<Duration>(crate::dquic::qbase::param::ParameterId::MaxIdleTimeout)
-            .filter(|timeout| !timeout.is_zero())
-            .unwrap_or(Duration::from_secs(20))
-    }
-
     fn subscribe_connection_local_endpoints(&self, connection: Arc<Connection>) {
         let mut subscriber = self.network.quic().local_endpoints().subscribe();
         let weak = Arc::downgrade(&connection);
@@ -1041,10 +1238,7 @@ mod tests {
             .bind(bind.clone())
             .build()
             .await;
-        let tls = endpoint.ensure_client().expect("client tls");
-        let connection = endpoint
-            .build_client_connection("remote.test", tls)
-            .expect("client connection");
+        let connection = build_test_connection(&endpoint, "remote.test");
         let iface = endpoint
             .network()
             .quic()
@@ -1085,10 +1279,7 @@ mod tests {
             .bind(Arc::new(vec![bind_pattern.clone()]))
             .build()
             .await;
-        let tls = bind_endpoint.ensure_client().expect("client tls");
-        let connection = bind_endpoint
-            .build_client_connection("server.example", tls)
-            .expect("client connection");
+        let connection = build_test_connection(&bind_endpoint, "server.example");
         let iface = bind_endpoint
             .network()
             .quic()
@@ -1131,10 +1322,7 @@ mod tests {
             .bind(Arc::new(vec![bind_pattern.clone()]))
             .build()
             .await;
-        let tls = endpoint.ensure_client().expect("client tls");
-        let connection = endpoint
-            .build_client_connection("server.example", tls)
-            .expect("client connection");
+        let connection = build_test_connection(&endpoint, "server.example");
         let iface = endpoint
             .network()
             .quic()
@@ -1195,10 +1383,7 @@ mod tests {
             .bind(Arc::new(vec![bind_pattern.clone()]))
             .build()
             .await;
-        let tls = endpoint.ensure_client().expect("client tls");
-        let connection = endpoint
-            .build_client_connection("server.example", tls)
-            .expect("client connection");
+        let connection = build_test_connection(&endpoint, "server.example");
         let iface = endpoint
             .network()
             .quic()
@@ -1338,7 +1523,7 @@ mod tests {
             client.verifier = ServerCertVerifierChoice::WebPki(webpki);
         }
         endpoint
-            .build_client_tls()
+            .ensure_client_runtime()
             .expect("webpki verifier client tls");
 
         {
@@ -1346,17 +1531,15 @@ mod tests {
             client.verifier =
                 ServerCertVerifierChoice::Custom(Arc::new(DangerousServerCertVerifier));
         }
-        let tls = Arc::new(
-            endpoint
-                .build_client_tls()
-                .expect("custom verifier client tls"),
-        );
         {
             let mut identity = endpoint.identity_mut();
-            *identity = Some(Arc::new(make_identity("client-name.test")));
+            *identity = Some(Arc::new(make_tls_identity("client-name.test", None)));
         }
+        let runtime = endpoint
+            .ensure_client_runtime()
+            .expect("custom verifier client runtime");
         endpoint
-            .build_client_connection("server.example", tls)
+            .build_client_connection_from_runtime("server.example", &runtime)
             .expect("client connection with identity parameter");
 
         let bind_pattern = BindPattern::from_str("inet://127.0.0.1:0").expect("valid bind pattern");
@@ -1365,10 +1548,7 @@ mod tests {
             .bind(Arc::new(vec![bind_pattern.clone()]))
             .build()
             .await;
-        let tls = bind_endpoint.ensure_client().expect("client tls");
-        let connection = bind_endpoint
-            .build_client_connection("server.example", tls)
-            .expect("client connection");
+        let connection = build_test_connection(&bind_endpoint, "server.example");
         let iface = bind_endpoint
             .network()
             .quic()
@@ -1420,10 +1600,7 @@ mod tests {
             .bind(bind.clone())
             .build()
             .await;
-        let tls = endpoint.ensure_client().expect("client tls");
-        let connection = endpoint
-            .build_client_connection("remote.test", tls)
-            .expect("client connection");
+        let connection = build_test_connection(&endpoint, "remote.test");
         let iface = endpoint
             .network()
             .quic()
@@ -1479,10 +1656,7 @@ mod tests {
             .network(Network::builder().build())
             .build()
             .await;
-        let tls = endpoint.ensure_client().expect("client tls");
-        let connection = endpoint
-            .build_client_connection("remote.test", tls)
-            .expect("client connection");
+        let connection = build_test_connection(&endpoint, "remote.test");
         let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
         let mut polled_tx = Some(polled_tx);
         let server_eps = futures::stream::poll_fn(move |_cx| {
@@ -1536,6 +1710,15 @@ mod tests {
             .await
     }
 
+    fn build_test_connection(endpoint: &QuicEndpoint, server_name: &str) -> Arc<Connection> {
+        let runtime = endpoint
+            .ensure_client_runtime()
+            .expect("client runtime should build");
+        endpoint
+            .build_client_connection_from_runtime(server_name, &runtime)
+            .expect("client connection should build")
+    }
+
     #[tokio::test]
     async fn public_new_uses_default_anonymous_endpoint_shape() {
         let endpoint = QuicEndpoint::new().await;
@@ -1543,8 +1726,8 @@ mod tests {
         assert!(endpoint.identity().is_none());
         assert_eq!(endpoint.bind_patterns().len(), 1);
         assert_eq!(endpoint.bind_patterns()[0].to_string(), "iface://*");
-        assert!(endpoint.client_tls_cache.load_full().is_some());
-        assert!(endpoint.server_binding_cache.load_full().is_none());
+        assert!(endpoint.state.client_runtime.lock().unwrap().is_some());
+        assert!(endpoint.state.server_registration.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1584,6 +1767,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_runtime_snapshot_keeps_identity_and_config_coherent() {
+        let mut endpoint = QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .identity(Arc::new(make_tls_identity("localhost", None)))
+            .resolver(Arc::new(SystemResolver))
+            .build()
+            .await;
+        let initial = endpoint
+            .ensure_client_runtime()
+            .expect("initial client runtime should build");
+        assert!(!initial.client.enable_0rtt);
+        assert_eq!(initial.identity.as_ref().unwrap().ocsp.as_deref(), None);
+
+        {
+            let mut client = endpoint.client_config_mut();
+            client.enable_0rtt = true;
+        }
+        {
+            let mut identity = endpoint.identity_mut();
+            *identity = Some(Arc::new(make_tls_identity(
+                "localhost",
+                Some(vec![7, 8, 9]),
+            )));
+        }
+
+        assert!(!initial.client.enable_0rtt);
+        assert_eq!(initial.identity.as_ref().unwrap().ocsp.as_deref(), None);
+        let current = endpoint
+            .ensure_client_runtime()
+            .expect("updated client runtime should build");
+        assert!(current.client.enable_0rtt);
+        assert_eq!(
+            current.identity.as_ref().unwrap().ocsp.as_deref(),
+            Some(&[7, 8, 9][..])
+        );
+        assert!(!Arc::ptr_eq(&initial, &current));
+    }
+
+    #[tokio::test]
     async fn replace_identity_updates_shared_binding_in_place() {
         let endpoint = QuicEndpoint::builder()
             .network(Network::builder().build())
@@ -1593,8 +1815,11 @@ mod tests {
             .await;
         let cloned = endpoint.clone();
         let binding = endpoint
-            .server_binding_cache
-            .load_full()
+            .state
+            .server_registration
+            .lock()
+            .unwrap()
+            .clone()
             .expect("named endpoint should be registered");
         let entry = binding.entry.clone();
         let old_client_tls = endpoint
@@ -1616,7 +1841,14 @@ mod tests {
         );
         assert!(Arc::ptr_eq(
             &entry,
-            &endpoint.server_binding_cache.load_full().unwrap().entry
+            &endpoint
+                .state
+                .server_registration
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap()
+                .entry
         ));
         assert_eq!(
             entry.credentials.load_full().certified_key.ocsp.as_deref(),
@@ -1632,6 +1864,54 @@ mod tests {
                 .ensure_client()
                 .expect("clone shares rebuilt client TLS")
         ));
+    }
+
+    #[tokio::test]
+    async fn independent_endpoints_cannot_share_an_sni_by_reusing_an_identity_arc() {
+        let network = Network::builder().build();
+        let identity = Arc::new(make_tls_identity("localhost", None));
+        let server = ServerQuicConfig::default();
+        let first = QuicEndpoint::builder()
+            .network(network.clone())
+            .identity(identity.clone())
+            .resolver(Arc::new(SystemResolver))
+            .server(server.clone())
+            .build()
+            .await;
+        let second = QuicEndpoint::builder()
+            .network(network)
+            .identity(identity)
+            .resolver(Arc::new(SystemResolver))
+            .server(server)
+            .build()
+            .await;
+        let old_second_identity = second.identity().unwrap();
+        let old_second_client_tls = second.ensure_client().expect("client TLS should be cached");
+        assert!(first.state.server_registration.lock().unwrap().is_some());
+        assert!(second.state.server_registration.lock().unwrap().is_none());
+        assert!(matches!(
+            second.ensure_server().await,
+            Err(AcceptError::BindServer {
+                source: BindServerError::SniInUse { .. }
+            })
+        ));
+
+        first
+            .replace_identity(Arc::new(make_tls_identity(
+                "localhost",
+                Some(vec![1, 2, 3]),
+            )))
+            .await
+            .expect("first owner should replace the shared identity");
+
+        assert!(Arc::ptr_eq(
+            &second.identity().unwrap(),
+            &old_second_identity
+        ));
+        let new_second_client_tls = second
+            .ensure_client()
+            .expect("the second owner's client TLS should remain cached");
+        assert!(Arc::ptr_eq(&old_second_client_tls, &new_second_client_tls));
     }
 
     #[tokio::test]
@@ -1662,10 +1942,15 @@ mod tests {
         }
 
         let tls = endpoint
-            .build_client_tls()
-            .expect("client tls should build");
+            .ensure_client_runtime()
+            .expect("client runtime should build")
+            .tls
+            .clone();
 
-        assert_eq!(tls.alpn_protocols, endpoint.client.load_full().alpns);
+        assert_eq!(
+            tls.alpn_protocols,
+            endpoint.state.config.read().unwrap().client.alpns
+        );
         assert!(tls.enable_early_data);
     }
 
@@ -1749,13 +2034,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identity_guard_deref_and_invalidate_caches_cover_direct_helpers() {
+    async fn identity_guard_deref_commits_the_new_identity() {
         let mut endpoint = make_endpoint().await;
-        endpoint.client_tls_cache.store(Some(Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth(),
-        )));
 
         {
             let mut guard = endpoint.identity_mut();
@@ -1771,68 +2051,106 @@ mod tests {
             );
         }
         assert!(endpoint.identity().is_some());
-
-        endpoint.client_tls_cache.store(Some(Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth(),
-        )));
-        endpoint.invalidate_caches();
-        assert!(endpoint.client_tls_cache.load_full().is_none());
-        assert!(endpoint.server_binding_cache.load_full().is_none());
     }
 
     #[tokio::test]
     async fn test_client_config_mut() {
-        let mut endpoint = make_endpoint().await;
-        assert!(!endpoint.client.load_full().enable_0rtt);
+        let mut endpoint = QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .identity(Arc::new(make_tls_identity("client-config.test", None)))
+            .build()
+            .await;
+        let server_entry = endpoint
+            .state
+            .server_registration
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .entry
+            .clone();
+        assert!(!endpoint.state.config.read().unwrap().client.enable_0rtt);
 
         {
             let mut guard = endpoint.client_config_mut();
             guard.enable_0rtt = true;
         } // guard dropped → cache invalidated
 
-        assert!(endpoint.client.load_full().enable_0rtt);
+        assert!(endpoint.state.config.read().unwrap().client.enable_0rtt);
+        assert!(endpoint.state.client_runtime.lock().unwrap().is_none());
+        assert!(Arc::ptr_eq(
+            &server_entry,
+            &endpoint
+                .state
+                .server_registration
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .entry
+        ));
     }
 
     #[tokio::test]
-    async fn test_client_config_mut_drop_invalidates_cache() {
+    async fn unmodified_client_config_guard_keeps_cached_runtime() {
         let mut endpoint = make_endpoint().await;
         // Pre-fill the cache by triggering ensure_client
         let _ = endpoint.ensure_client().is_ok();
-        assert!(endpoint.client_tls_cache.load_full().is_some());
+        assert!(endpoint.state.client_runtime.lock().unwrap().is_some());
 
         {
             let _guard = endpoint.client_config_mut();
-            // No mutation needed — just creating and dropping should invalidate
+            // Reading through the guard is not a configuration change.
         }
 
-        assert!(endpoint.client_tls_cache.load_full().is_none());
+        assert!(endpoint.state.client_runtime.lock().unwrap().is_some());
     }
 
     #[tokio::test]
     async fn test_server_config_mut() {
         let mut endpoint = make_endpoint().await;
-        assert!(!endpoint.server.load_full().anti_port_scan);
+        assert!(!endpoint.state.config.read().unwrap().server.anti_port_scan);
 
         {
             let mut guard = endpoint.server_config_mut();
             guard.anti_port_scan = true;
         }
 
-        assert!(endpoint.server.load_full().anti_port_scan);
+        assert!(endpoint.state.config.read().unwrap().server.anti_port_scan);
     }
 
     #[tokio::test]
-    async fn test_server_config_mut_drop_invalidates_cache() {
-        let mut endpoint = make_endpoint().await;
+    async fn changed_server_config_drops_the_registration() {
+        let mut endpoint = QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .identity(Arc::new(make_tls_identity("server-config.test", None)))
+            .build()
+            .await;
+        assert!(endpoint.state.server_registration.lock().unwrap().is_some());
+        let client_runtime = endpoint
+            .state
+            .client_runtime
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
 
         {
-            let _guard = endpoint.server_config_mut();
+            let mut guard = endpoint.server_config_mut();
+            guard.anti_port_scan = true;
         }
 
-        // Guard drop should clear the cache (whether it was filled or not)
-        assert!(endpoint.server_binding_cache.load_full().is_none());
+        assert!(endpoint.state.server_registration.lock().unwrap().is_none());
+        assert!(Arc::ptr_eq(
+            &client_runtime,
+            endpoint
+                .state
+                .client_runtime
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+        ));
     }
 
     #[tokio::test]
@@ -1860,6 +2178,68 @@ mod tests {
         }
 
         assert!(endpoint.identity().is_none());
+    }
+
+    #[tokio::test]
+    async fn detached_guards_commit_only_their_own_config_field() {
+        let mut endpoint = QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .identity(Arc::new(make_tls_identity("guard-fields.test", None)))
+            .build()
+            .await;
+        let mut cloned = endpoint.clone();
+        let mut identity = endpoint.identity_mut();
+        let mut client = cloned.client_config_mut();
+
+        *identity = Some(Arc::new(make_tls_identity(
+            "guard-fields.test",
+            Some(vec![1, 2, 3]),
+        )));
+        client.enable_0rtt = true;
+        drop(identity);
+        drop(client);
+
+        assert_eq!(
+            endpoint.identity().unwrap().ocsp.as_deref(),
+            Some(&[1, 2, 3][..])
+        );
+        assert!(endpoint.state.config.read().unwrap().client.enable_0rtt);
+    }
+
+    #[tokio::test]
+    async fn identity_guard_last_commit_wins_in_config_and_registration() {
+        let mut endpoint = QuicEndpoint::builder()
+            .network(Network::builder().build())
+            .identity(Arc::new(make_tls_identity("guard-order.test", None)))
+            .build()
+            .await;
+        let mut cloned = endpoint.clone();
+        let mut first = endpoint.identity_mut();
+        let mut second = cloned.identity_mut();
+
+        *first = Some(Arc::new(make_tls_identity(
+            "guard-order.test",
+            Some(vec![1]),
+        )));
+        *second = Some(Arc::new(make_tls_identity(
+            "guard-order.test",
+            Some(vec![2]),
+        )));
+        drop(first);
+        drop(second);
+
+        assert_eq!(endpoint.identity().unwrap().ocsp.as_deref(), Some(&[2][..]));
+        let credentials = endpoint
+            .state
+            .server_registration
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .entry
+            .credentials
+            .load_full();
+        assert_eq!(credentials.identity.ocsp.as_deref(), Some(&[2][..]));
     }
 
     #[tokio::test]
@@ -1994,240 +2374,6 @@ mod tests {
         fn _accept_connect_error(_: ConnectError) {}
     }
 
-    #[test]
-    fn test_server_config_guard_derefmut() {
-        let config = Arc::new(ServerQuicConfig::default());
-        let target = ArcSwap::from(config);
-        let cache = ArcSwapOption::<ServerBinding>::new(None);
-        {
-            let mut guard = ServerConfigMutGuard {
-                config: target.load_full(),
-                target: &target,
-                cache: &cache,
-            };
-            assert!(!guard.anti_port_scan);
-            guard.anti_port_scan = true;
-            assert!(guard.anti_port_scan);
-        }
-        assert!(target.load_full().anti_port_scan);
-    }
-
-    #[test]
-    fn test_server_config_guard_drop_invalidates_cache() {
-        use std::sync::Weak;
-
-        use dashmap::DashMap;
-        use rustls::{pki_types::CertificateDer, sign::CertifiedKey};
-
-        use crate::dquic::{
-            cert::handy::{ToCertificate, ToPrivateKey},
-            sni::{RegistryGuard, ServerConfig as SniServerConfig, ServerEntry},
-        };
-
-        let config = Arc::new(ServerQuicConfig::default());
-        let target = ArcSwap::from(config);
-        let cache = ArcSwapOption::new(None);
-
-        let cert_bytes: &[u8] = include_bytes!("../../tests/keychain/localhost/server.cert");
-        let key_bytes: &[u8] = include_bytes!("../../tests/keychain/localhost/server.key");
-        let certs: Vec<CertificateDer<'static>> = cert_bytes.to_certificate();
-        let key: PrivateKeyDer<'static> = key_bytes.to_private_key();
-
-        let identity = Arc::new(Identity {
-            name: "localhost".parse().unwrap(),
-            certs: Arc::new(certs.clone()),
-            key: Arc::new(key.clone_key()),
-            ocsp: Arc::new(None),
-        });
-
-        let provider = rustls::ServerConfig::builder().crypto_provider().clone();
-        let signing_key = provider
-            .key_provider
-            .load_private_key(identity.key.clone_key())
-            .expect("valid private key");
-        let certified_key = Arc::new(CertifiedKey {
-            cert: identity.certs.iter().cloned().collect(),
-            key: signing_key,
-            ocsp: None,
-        });
-
-        let rustls_config = Arc::new(
-            rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .expect("valid server config"),
-        );
-
-        let (tx, rx) = async_channel::unbounded();
-
-        let registry = Arc::new(DashMap::new());
-        let reg_guard = Arc::new(RegistryGuard {
-            name: "localhost".parse().unwrap(),
-            registry: Arc::downgrade(&registry),
-            self_entry: Weak::new(),
-        });
-
-        let sni_config = Arc::new(SniServerConfig {
-            config: ServerQuicConfig::default(),
-            rustls_config,
-            handshake_backlog: Arc::new(tokio::sync::Semaphore::new(1)),
-        });
-
-        let entry = Arc::new(ServerEntry {
-            name: identity.name.clone(),
-            credentials: ArcSwap::from_pointee(ServerCredentials::new(identity, certified_key)),
-            incomings_tx: tx,
-            incomings_rx: rx,
-            config: sni_config,
-            guard: reg_guard,
-            bind: Arc::new(vec![]),
-        });
-
-        let binding = ServerBinding { entry };
-        cache.store(Some(Arc::new(binding)));
-
-        assert!(cache.load_full().is_some());
-
-        {
-            let _guard = ServerConfigMutGuard {
-                config: target.load_full(),
-                target: &target,
-                cache: &cache,
-            };
-        }
-
-        assert!(cache.load_full().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_identity_guard_set() {
-        let endpoint = make_endpoint().await;
-        assert!(endpoint.identity().is_none());
-
-        let identity = make_identity("guard-set.test");
-        {
-            let mut guard = IdentityMutGuard {
-                identity: endpoint.identity.as_ref(),
-                value: endpoint.identity.load_full(),
-                client_cache: &endpoint.client_tls_cache,
-                server_cache: &endpoint.server_binding_cache,
-            };
-            *guard = Some(Arc::new(identity));
-        }
-
-        let id = endpoint.identity();
-        assert!(id.is_some());
-        assert_eq!(id.unwrap().name.as_str(), "guard-set.test");
-    }
-
-    #[tokio::test]
-    async fn test_identity_guard_clear() {
-        let mut endpoint = make_endpoint().await;
-        let identity = make_identity("guard-clear.test");
-        {
-            let mut guard = endpoint.identity_mut();
-            *guard = Some(Arc::new(identity));
-        }
-        assert!(endpoint.identity().is_some());
-
-        {
-            let mut guard = IdentityMutGuard {
-                identity: endpoint.identity.as_ref(),
-                value: endpoint.identity.load_full(),
-                client_cache: &endpoint.client_tls_cache,
-                server_cache: &endpoint.server_binding_cache,
-            };
-            *guard = None;
-        }
-
-        assert!(endpoint.identity().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_identity_guard_mutate() {
-        let mut endpoint = make_endpoint().await;
-        let identity = make_identity("guard-mutate.test");
-        {
-            let mut guard = endpoint.identity_mut();
-            *guard = Some(Arc::new(identity));
-        }
-        assert!(endpoint.identity().unwrap().ocsp.is_none());
-
-        {
-            let mut guard = IdentityMutGuard {
-                identity: endpoint.identity.as_ref(),
-                value: endpoint.identity.load_full(),
-                client_cache: &endpoint.client_tls_cache,
-                server_cache: &endpoint.server_binding_cache,
-            };
-            if let Some(arc) = guard.as_mut() {
-                Arc::make_mut(arc).ocsp = Arc::new(Some(vec![10, 20, 30]));
-            }
-        }
-
-        let id = endpoint.identity().unwrap();
-        assert_eq!(id.ocsp.as_deref(), Some(&[10u8, 20, 30][..]));
-    }
-
-    #[tokio::test]
-    async fn test_identity_guard_drop_invalidates_both_caches() {
-        let mut endpoint = make_endpoint().await;
-        let identity = make_identity("cache-inval.test");
-        {
-            let mut guard = endpoint.identity_mut();
-            *guard = Some(Arc::new(identity));
-        }
-
-        // Pre-fill client TLS cache
-        let client_config = rustls::ClientConfig::builder()
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_no_client_auth();
-        endpoint
-            .client_tls_cache
-            .store(Some(Arc::new(client_config)));
-
-        // Pre-fill server binding cache — construct a minimal ServerBinding
-        // through the network infrastructure
-        endpoint.init_server().await;
-
-        {
-            let guard = IdentityMutGuard {
-                identity: endpoint.identity.as_ref(),
-                value: endpoint.identity.load_full(),
-                client_cache: &endpoint.client_tls_cache,
-                server_cache: &endpoint.server_binding_cache,
-            };
-            // no mutation — guard drops here
-            let _ = &guard;
-        }
-
-        assert!(
-            endpoint.client_tls_cache.load_full().is_none(),
-            "client TLS cache should be invalidated on guard drop"
-        );
-        assert!(
-            endpoint.server_binding_cache.load_full().is_none(),
-            "server binding cache should be invalidated on guard drop"
-        );
-    }
-
-    #[test]
-    fn test_client_config_guard_derefmut() {
-        let config = Arc::new(ClientQuicConfig::default());
-        let target = ArcSwap::from(config);
-        let cache = ArcSwapOption::<ClientConfig>::new(None);
-        {
-            let mut guard = ClientConfigMutGuard {
-                config: target.load_full(),
-                target: &target,
-                cache: &cache,
-            };
-            assert!(!std::ops::Deref::deref(&guard).enable_0rtt);
-            guard.enable_0rtt = true;
-        }
-        assert!(target.load_full().enable_0rtt);
-    }
-
     #[tokio::test]
     async fn quic_listen_trait_impls_delegate_accept_and_shutdown() {
         let mut owned = make_endpoint().await;
@@ -2250,76 +2396,5 @@ mod tests {
         <&QuicEndpoint as quic::Listen>::shutdown(&shared)
             .await
             .expect("shared shutdown");
-    }
-
-    #[test]
-    fn test_client_config_guard_drop_invalidates_cache() {
-        let config = Arc::new(ClientQuicConfig::default());
-        let target = ArcSwap::from(config);
-        let cache = ArcSwapOption::new(Some(Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth(),
-        )));
-
-        assert!(cache.load_full().is_some());
-
-        {
-            let _guard = ClientConfigMutGuard {
-                config: target.load_full(),
-                target: &target,
-                cache: &cache,
-            };
-        }
-
-        assert!(cache.load_full().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_cache_invalidation_is_precise() {
-        let endpoint = make_endpoint().await;
-
-        // Pre-fill client cache
-        let dummy_client_tls = rustls::ClientConfig::builder()
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_no_client_auth();
-        endpoint
-            .client_tls_cache
-            .store(Some(Arc::new(dummy_client_tls)));
-
-        assert!(endpoint.client_tls_cache.load_full().is_some());
-        assert!(endpoint.server_binding_cache.load_full().is_none());
-
-        // Client cache invalidation should NOT affect server cache
-        endpoint.invalidate_client_cache();
-        assert!(endpoint.client_tls_cache.load_full().is_none());
-        assert!(endpoint.server_binding_cache.load_full().is_none());
-
-        // Re-fill client, invalidate server — client should remain intact
-        endpoint.client_tls_cache.store(Some(Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth(),
-        )));
-        endpoint.invalidate_server_cache();
-        assert!(endpoint.client_tls_cache.load_full().is_some());
-        assert!(endpoint.server_binding_cache.load_full().is_none());
-    }
-
-    #[test]
-    fn test_invalidate_caches_clears_both() {
-        // Verify the method structure compiles and that invalidate_caches
-        // delegates to both precise helpers.
-        let cache_client: ArcSwapOption<rustls::ClientConfig> = ArcSwapOption::empty();
-        let cache_server: ArcSwapOption<ServerBinding> = ArcSwapOption::empty();
-
-        // Populate client cache
-        let client_config = rustls::ClientConfig::builder()
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_no_client_auth();
-        cache_client.store(Some(Arc::new(client_config)));
-
-        assert!(cache_client.load_full().is_some());
-        assert!(cache_server.load_full().is_none());
     }
 }

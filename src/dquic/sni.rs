@@ -3,9 +3,9 @@
 //! [`QuicEndpoint`](super::QuicEndpoint) instances.
 //!
 //! A [`ServerBinding`] is cheap to clone: each clone shares the same
-//! mpmc [`async_channel`] tail, so multiple endpoints that registered the
-//! same SNI cooperatively drain inbound connections. Dropping the last
-//! strong reference unregisters the SNI entry from the QUIC driver.
+//! mpmc [`async_channel`] tail, so bindings owned by one logical endpoint
+//! cooperatively drain inbound connections. Dropping the last strong reference
+//! unregisters the SNI entry from the QUIC driver.
 
 use std::sync::{Arc, Weak};
 
@@ -18,6 +18,27 @@ use rustls::{
 };
 
 use crate::dquic::{binds::BindPattern, connection::Connection, identity::Identity};
+
+/// Stable ownership token for one logical endpoint and all of its clones.
+#[derive(Debug)]
+pub(crate) struct ServerOwner;
+
+pub(crate) enum ServerOwnerKey {
+    /// High-level endpoint ownership is independent of certificate identity.
+    Endpoint(Arc<ServerOwner>),
+    /// Preserve identity-based sharing for the public low-level bind API.
+    Identity(Arc<Identity>),
+}
+
+impl ServerOwnerKey {
+    pub(crate) fn is_same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Endpoint(left), Self::Endpoint(right)) => Arc::ptr_eq(left, right),
+            (Self::Identity(left), Self::Identity(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
 
 /// Atomically replaced certificate and private-key material for one SNI.
 pub(crate) struct ServerCredentials {
@@ -40,6 +61,7 @@ impl ServerCredentials {
 /// same inbound connection queue.
 pub(crate) struct ServerEntry {
     pub(crate) name: Name<'static>,
+    pub(crate) owner: ServerOwnerKey,
     pub(crate) credentials: ArcSwap<ServerCredentials>,
     pub(crate) incomings_tx: async_channel::Sender<Arc<Connection>>,
     pub(crate) incomings_rx: async_channel::Receiver<Arc<Connection>>,
@@ -57,6 +79,26 @@ pub(crate) struct ServerEntry {
     pub(crate) guard: Arc<RegistryGuard>,
     /// Bind patterns associated with this server entry.
     pub(crate) bind: Arc<Vec<BindPattern>>,
+}
+
+impl ServerEntry {
+    pub(crate) fn is_owned_by(&self, owner: &ServerOwnerKey) -> bool {
+        self.owner.is_same(owner)
+    }
+
+    pub(crate) fn replace_credentials(
+        &self,
+        expected: &Arc<Identity>,
+        credentials: Arc<ServerCredentials>,
+    ) -> bool {
+        debug_assert_eq!(self.name, credentials.identity.name);
+        let current = self.credentials.load_full();
+        if !Arc::ptr_eq(&current.identity, expected) {
+            return false;
+        }
+        let previous = self.credentials.compare_and_swap(&current, credentials);
+        Arc::ptr_eq(&current, &previous)
+    }
 }
 
 /// RAII guard that removes an SNI entry from the registry when the last
@@ -119,9 +161,12 @@ impl ServerBinding {
         &self.entry.name
     }
 
-    pub(crate) fn replace_credentials(&self, credentials: Arc<ServerCredentials>) {
-        debug_assert_eq!(self.entry.name, credentials.identity.name);
-        self.entry.credentials.store(credentials);
+    pub(crate) fn replace_credentials(
+        &self,
+        expected: &Arc<Identity>,
+        credentials: Arc<ServerCredentials>,
+    ) -> bool {
+        self.entry.replace_credentials(expected, credentials)
     }
 
     /// Receive the next accepted connection for this SNI.
@@ -206,6 +251,7 @@ mod tests {
 
         Arc::new_cyclic(|self_entry| ServerEntry {
             name: identity.name.clone(),
+            owner: ServerOwnerKey::Identity(identity.clone()),
             credentials: ArcSwap::from_pointee(ServerCredentials::new(
                 identity.clone(),
                 certified_key,
@@ -273,6 +319,34 @@ mod tests {
         drop(current);
         drop(second);
         assert!(registry.get(&name).is_none());
+    }
+
+    #[test]
+    fn credential_replacement_allows_only_one_winner_for_the_same_expected_identity() {
+        let registry = Arc::new(DashMap::new());
+        let entry = make_server_entry(&registry, "test.example.com");
+        let expected = entry.credentials.load_full().identity.clone();
+        let first = make_identity("test.example.com");
+        let second = make_identity("test.example.com");
+        let first_key = identity::build_certified_key(&first).expect("first key should load");
+        let second_key = identity::build_certified_key(&second).expect("second key should load");
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let replace = |identity: Arc<Identity>, key: Arc<CertifiedKey>| {
+            let entry = entry.clone();
+            let expected = expected.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                entry
+                    .replace_credentials(&expected, Arc::new(ServerCredentials::new(identity, key)))
+            })
+        };
+        let first = replace(first, first_key);
+        let second = replace(second, second_key);
+        barrier.wait();
+
+        assert_ne!(first.join().unwrap(), second.join().unwrap());
     }
 
     #[test]
