@@ -630,8 +630,12 @@ impl quic::Connect for QuicEndpoint {
             "connecting quic endpoint"
         );
         let runtime = self.ensure_client_runtime().context(TlsSnafu)?;
-        let mut server_eps =
-            futures::StreamExt::fuse(self.resolver.lookup(lookup_name.as_ref()).await.context(DnsSnafu)?);
+        let mut server_eps = futures::StreamExt::fuse(
+            self.resolver
+                .lookup(lookup_name.as_ref())
+                .await
+                .context(DnsSnafu)?,
+        );
         let connection = self
             .build_client_connection_from_runtime(transport_name, &runtime)
             .context(TlsSnafu)?;
@@ -1057,7 +1061,10 @@ mod tests {
     fn authority_names_default_lookup_port_to_https() {
         let authority: Authority = "reimu.hakurei.dhttp.net".parse().unwrap();
 
-        assert_eq!(lookup_server_name(&authority), "reimu.hakurei.dhttp.net:443");
+        assert_eq!(
+            lookup_server_name(&authority),
+            "reimu.hakurei.dhttp.net:443"
+        );
         assert_eq!(transport_server_name(&authority), "reimu.hakurei.dhttp.net");
     }
 
