@@ -70,7 +70,7 @@ use crate::dquic::{
     identity::Identity,
     net::{
         BindInterface, BindUri, Devices, Family, InterfaceManager, LocalEndpoints, ProductIO,
-        QuicRouter, handy::DEFAULT_IO_FACTORY,
+        QuicRouter, Scheme, handy::DEFAULT_IO_FACTORY,
     },
     resolver::{Resolve, handy::SystemResolver},
     server::ServerQuicConfig,
@@ -96,7 +96,7 @@ use crate::dquic::{
             local_endpoint::LocalEndpointsComponent,
             route::{QuicRouterComponent, ReceivedPacket, Way},
         },
-        device::InterfaceEvent,
+        device::{Interface, InterfaceEvent},
     },
     qtraversal::{
         nat::{client::StunClientComponent, router::StunRouterComponent},
@@ -143,6 +143,51 @@ fn interface_contains(interface: &::dquic::qinterface::device::Interface, ip: Ip
 fn iface_bind_uri_device(uri: &BindUri) -> Option<&str> {
     uri.as_iface_bind_uri()
         .map(|(_family, device, _port)| device)
+}
+
+fn pattern_uses_automatic_device_selection(pattern: &BindPattern) -> bool {
+    pattern.scheme == Scheme::Iface && pattern.host.is_glob()
+}
+
+fn interface_is_operational(interface: &Interface) -> bool {
+    interface.is_oper_up()
+        || (interface.oper_state == netdev::interface::state::OperState::Unknown
+            && interface.is_up())
+}
+
+fn interface_has_bindable_family_address(interface: &Interface, family: Family) -> bool {
+    match family {
+        Family::V4 => interface
+            .ipv4
+            .iter()
+            .map(|net| net.addr())
+            .any(|addr| !addr.is_unspecified() && !addr.is_multicast() && !addr.is_broadcast()),
+        Family::V6 => interface
+            .ipv6
+            .iter()
+            .map(|net| net.addr())
+            .any(|addr| !addr.is_unspecified() && !addr.is_multicast()),
+    }
+}
+
+fn automatic_bind_candidate_is_eligible(interface: &Interface, candidate: &BindUri) -> bool {
+    let Some((family, device, _port)) = candidate.as_iface_bind_uri() else {
+        return false;
+    };
+
+    interface.name == device
+        && interface_is_operational(interface)
+        && interface_has_bindable_family_address(interface, family)
+}
+
+fn pattern_allows_bind_candidate(
+    pattern: &BindPattern,
+    candidate: &BindUri,
+    interface: Option<&Interface>,
+) -> bool {
+    !pattern_uses_automatic_device_selection(pattern)
+        || interface
+            .is_some_and(|interface| automatic_bind_candidate_is_eligible(interface, candidate))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -931,8 +976,14 @@ impl BindsState {
         pattern: &BindPattern,
         devices: &'static Devices,
     ) -> Vec<BindUri> {
+        let interfaces = devices.interfaces();
         pattern
-            .to_bind_uris(devices.interfaces().keys().map(String::as_str))
+            .to_bind_uris(interfaces.keys().map(String::as_str))
+            .filter(|candidate| {
+                let interface =
+                    iface_bind_uri_device(candidate).and_then(|device| interfaces.get(device));
+                pattern_allows_bind_candidate(pattern, candidate, interface)
+            })
             .filter(|candidate| {
                 !self
                     .bound
@@ -942,9 +993,14 @@ impl BindsState {
             .collect()
     }
 
-    fn missing_added_device_uris(&self, pattern: &BindPattern, device: &str) -> Vec<BindUri> {
+    fn missing_added_device_uris(
+        &self,
+        pattern: &BindPattern,
+        interface: &Interface,
+    ) -> Vec<BindUri> {
         pattern
-            .interface_bind_uris(device)
+            .interface_bind_uris(&interface.name)
+            .filter(|candidate| pattern_allows_bind_candidate(pattern, candidate, Some(interface)))
             .filter(|candidate| {
                 !self
                     .bound
@@ -952,6 +1008,30 @@ impl BindsState {
                     .any(|bound| bound.matches_reconcile_candidate(candidate))
             })
             .collect()
+    }
+
+    fn drain_ineligible_device_bindings(
+        &mut self,
+        pattern: &BindPattern,
+        interface: &Interface,
+    ) -> CloseBatch {
+        if !pattern_uses_automatic_device_selection(pattern) {
+            return CloseBatch::new();
+        }
+
+        let mut retained = HashMap::with_capacity(self.bound.len());
+        let mut close = CloseBatch::new();
+        for (uri, iface) in mem::take(&mut self.bound) {
+            let should_close = iface_bind_uri_device(&uri) == Some(interface.name.as_str())
+                && !pattern_allows_bind_candidate(pattern, &uri, Some(interface));
+            if should_close {
+                close.push(iface);
+            } else {
+                retained.insert(uri, iface);
+            }
+        }
+        self.bound = retained;
+        close
     }
 
     fn drain_device_bindings(&mut self, device: &str) -> CloseBatch {
@@ -1066,12 +1146,12 @@ impl BindEntryPermit {
         }
     }
 
-    fn plan_added_device_bind(&self, device: &str) -> Vec<BindUri> {
+    fn plan_added_device_bind(&self, interface: &Interface) -> Vec<BindUri> {
         let state = self.entry.lock_state();
         if state.closing {
             return Vec::new();
         }
-        state.missing_added_device_uris(&self.entry.pattern, device)
+        state.missing_added_device_uris(&self.entry.pattern, interface)
     }
 
     fn commit_added_device(
@@ -1104,6 +1184,14 @@ impl BindEntryPermit {
             return CloseBatch::new();
         }
         state.drain_device_bindings(device)
+    }
+
+    fn drain_ineligible_changed_device(&self, interface: &Interface) -> CloseBatch {
+        let mut state = self.entry.lock_state();
+        if state.closing {
+            return CloseBatch::new();
+        }
+        state.drain_ineligible_device_bindings(&self.entry.pattern, interface)
     }
 
     fn targets_for_changed_device(&self, device: &str) -> Vec<BindInterface> {
@@ -1651,9 +1739,9 @@ impl Network {
     }
 
     async fn bind_added_device(&self, device: &str) {
-        if self.devices.get(device).is_none() {
+        let Some(interface) = self.devices.get(device) else {
             return;
-        }
+        };
 
         for entry_ref in self.entries_matching_device(device) {
             let Some(permit) = self
@@ -1663,7 +1751,7 @@ impl Network {
                 continue;
             };
 
-            let missing = permit.plan_added_device_bind(device);
+            let missing = permit.plan_added_device_bind(&interface);
             let mut new_bindings = Vec::with_capacity(missing.len());
             for uri in missing {
                 if self.devices.get(device).is_none() {
@@ -1693,6 +1781,20 @@ impl Network {
             };
 
             let mut close = permit.drain_removed_device(device);
+            close.close_all().await;
+        }
+    }
+
+    async fn remove_ineligible_changed_device_bindings(&self, interface: &Interface) {
+        for entry_ref in self.entries_matching_device(&interface.name) {
+            let Some(permit) = self
+                .acquire_existing_entry(entry_ref.key, entry_ref.entry)
+                .await
+            else {
+                continue;
+            };
+
+            let mut close = permit.drain_ineligible_changed_device(interface);
             close.close_all().await;
         }
     }
@@ -1732,7 +1834,13 @@ impl Network {
                 self.remove_device_bindings(device).await;
             }
             InterfaceEvent::Changed { .. } => {
+                let Some(interface) = self.devices.get(device) else {
+                    return;
+                };
+                self.remove_ineligible_changed_device_bindings(&interface)
+                    .await;
                 self.rebind_changed_device(device).await;
+                self.bind_added_device(device).await;
             }
         }
     }
@@ -1909,6 +2017,15 @@ mod tests {
     fn dummy_interface_named(name: &str) -> Interface {
         let mut interface = Interface::dummy();
         interface.name = name.to_owned();
+        interface
+    }
+
+    fn active_ipv4_interface_named(name: &str, addr: &str) -> Interface {
+        let mut interface = dummy_interface_named(name);
+        interface.oper_state = netdev::interface::state::OperState::Up;
+        interface
+            .ipv4
+            .push(addr.parse().expect("valid IPv4 network"));
         interface
     }
 
@@ -3258,7 +3375,7 @@ mod tests {
             permit
                 .entry
                 .lock_state()
-                .missing_added_device_uris(&pattern, "lo")
+                .missing_added_device_uris(&pattern, &dummy_interface_named("lo"))
                 .is_empty(),
             "reconciliation should not bind a duplicate when only alloc_port_id differs"
         );
@@ -3269,7 +3386,7 @@ mod tests {
             !permit
                 .entry
                 .lock_state()
-                .missing_added_device_uris(&stun_pattern, "lo")
+                .missing_added_device_uris(&stun_pattern, &dummy_interface_named("lo"))
                 .is_empty(),
             "semantic query differences must remain missing reconciliation candidates"
         );
@@ -3286,6 +3403,52 @@ mod tests {
                 .all(|uri| !uri.matches_reconcile_candidate(&different_stun)),
             "stun query changes remain semantic"
         );
+    }
+
+    #[test]
+    fn automatic_bind_patterns_require_an_operational_family_address() {
+        let wildcard: BindPattern = "iface://v4.*:0".parse().expect("valid wildcard");
+        let candidate: BindUri = "iface://v4.docker0:0".parse().expect("valid bind URI");
+        let mut docker = active_ipv4_interface_named("docker0", "172.17.0.1/16");
+        docker.if_type = netdev::interface::types::InterfaceType::Bridge;
+
+        assert!(pattern_uses_automatic_device_selection(&wildcard));
+        assert!(pattern_allows_bind_candidate(
+            &wildcard,
+            &candidate,
+            Some(&docker)
+        ));
+
+        docker.oper_state = netdev::interface::state::OperState::Down;
+        assert!(!pattern_allows_bind_candidate(
+            &wildcard,
+            &candidate,
+            Some(&docker)
+        ));
+
+        docker.oper_state = netdev::interface::state::OperState::Up;
+        docker.ipv4.clear();
+        assert!(!pattern_allows_bind_candidate(
+            &wildcard,
+            &candidate,
+            Some(&docker)
+        ));
+    }
+
+    #[test]
+    fn explicit_interface_patterns_bypass_automatic_eligibility() {
+        let explicit: BindPattern = "iface://v4.docker0:0"
+            .parse()
+            .expect("valid explicit pattern");
+        let candidate: BindUri = "iface://v4.docker0:0".parse().expect("valid bind URI");
+        let unavailable = dummy_interface_named("docker0");
+
+        assert!(!pattern_uses_automatic_device_selection(&explicit));
+        assert!(pattern_allows_bind_candidate(
+            &explicit,
+            &candidate,
+            Some(&unavailable)
+        ));
     }
 
     #[tokio::test]
