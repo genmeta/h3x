@@ -87,14 +87,14 @@ impl BindHost {
         }
     }
 
-    /// Returns `true` if this host contains glob meta-characters (`*`, `[`).
+    /// Returns `true` if this host contains glob meta-characters.
     #[must_use]
     pub fn is_glob(&self) -> bool {
         match self {
             Self::Ip { .. } | Self::Exact { .. } => false,
             Self::Glob { matcher, .. } => {
                 let pat = matcher.glob().glob();
-                pat.contains('*') || pat.contains('[')
+                pat.contains(['*', '?', '[', '{'])
             }
         }
     }
@@ -274,6 +274,13 @@ mod tests {
         assert!(glob.is_glob());
         assert_eq!(glob.as_str(), "en*");
         assert_eq!(glob.families(), [Family::V4, Family::V6]);
+
+        assert!(BindHost::classify("en?", None).unwrap().is_glob());
+        assert!(
+            BindHost::classify("{docker,bridge}0", None)
+                .unwrap()
+                .is_glob()
+        );
     }
 
     #[test]
