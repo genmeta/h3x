@@ -383,11 +383,7 @@ impl quic::Connect for Arc<dquic::prelude::QuicClient> {
         &self,
         server: &http::uri::Authority,
     ) -> Result<Arc<Self::Connection>, Self::Error> {
-        let name = if let Some(port) = server.port_u16() {
-            format!("{}:{}", server.host(), port)
-        } else {
-            server.host().to_string()
-        };
+        let name = format!("{}:{}", server.host(), server.port_u16().unwrap_or(443));
         let connection = dquic::prelude::QuicClient::connect(self, &name).await?;
         Ok(connection)
     }
@@ -771,7 +767,10 @@ mod tests {
 
         assert_eq!(
             resolver.names(),
-            vec!["example.test:8443".to_owned(), "example.test".to_owned()]
+            vec![
+                "example.test:8443".to_owned(),
+                "example.test:443".to_owned()
+            ]
         );
         assert_eq!(format!("{}", resolver.as_ref()), "recording resolver");
         Lifecycle::close(first.as_ref(), Code::H3_NO_ERROR, Cow::Borrowed(""));

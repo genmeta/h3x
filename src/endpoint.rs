@@ -10,7 +10,7 @@
 use std::{any::Any, error::Error, sync::Arc};
 
 use bon::bon;
-use http::uri::Authority;
+use http::uri::{Authority, Scheme};
 use snafu::ResultExt;
 use tower_service::Service;
 use tracing::Instrument;
@@ -160,6 +160,36 @@ where
         &self,
         server: Authority,
     ) -> Result<Arc<H3Connection<C>>, pool::ConnectError<Q::Error>> {
+        self.connect_with_default_port(443, server).await
+    }
+
+    /// Obtain (or reuse) an HTTP/3 connection using the scheme's default port
+    /// when `server` does not specify one.
+    pub async fn connect_with_scheme(
+        &self,
+        scheme: &Scheme,
+        server: Authority,
+    ) -> Result<Arc<H3Connection<C>>, pool::ConnectError<Q::Error>> {
+        let default_port = if scheme.as_str().eq_ignore_ascii_case("http") {
+            80
+        } else {
+            443
+        };
+        self.connect_with_default_port(default_port, server).await
+    }
+
+    async fn connect_with_default_port(
+        &self,
+        default_port: u16,
+        server: Authority,
+    ) -> Result<Arc<H3Connection<C>>, pool::ConnectError<Q::Error>> {
+        let server = if server.port_u16().is_some() {
+            server
+        } else {
+            format!("{server}:{default_port}")
+                .parse()
+                .expect("default port must produce a valid authority")
+        };
         self.pool
             .reuse_or_connect_with(&self.quic, self.builder.clone(), server)
             .await
@@ -1251,6 +1281,36 @@ mod tests {
             &[server],
         );
         assert_eq!(endpoint.pool_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn connect_with_scheme_uses_http_and_https_default_ports() {
+        let connector = CountingConnect::succeed(IdentifiedConnection::new("test-remote"));
+        let servers = connector.servers.clone();
+        let endpoint = H3Endpoint::new(connector);
+        let http = "http".parse::<Scheme>().expect("http scheme parses");
+        let https = "https".parse::<Scheme>().expect("https scheme parses");
+        let server: Authority = "test-remote".parse().unwrap();
+
+        endpoint
+            .connect_with_scheme(&http, server.clone())
+            .await
+            .expect("http connection should build");
+        endpoint
+            .connect_with_scheme(&https, server)
+            .await
+            .expect("https connection should build");
+
+        assert_eq!(
+            servers
+                .lock()
+                .expect("server log mutex should not be poisoned")
+                .as_slice(),
+            &[
+                "test-remote:80".parse::<Authority>().unwrap(),
+                "test-remote:443".parse::<Authority>().unwrap(),
+            ]
+        );
     }
 
     #[tokio::test]
