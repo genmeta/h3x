@@ -1254,6 +1254,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inherent_connect_preserves_authority_without_port() {
+        let connector = CountingConnect::succeed(IdentifiedConnection::new("test-remote"));
+        let servers = connector.servers.clone();
+        let endpoint = H3Endpoint::new(connector);
+        let server: Authority = "test-remote".parse().unwrap();
+
+        endpoint
+            .connect(server.clone())
+            .await
+            .expect("connection should build");
+
+        assert_eq!(
+            servers
+                .lock()
+                .expect("server log mutex should not be poisoned")
+                .as_slice(),
+            &[server],
+        );
+    }
+
+    #[tokio::test]
     async fn inherent_connect_returns_connector_error() {
         let endpoint = H3Endpoint::<_, IdentifiedConnection>::new(CountingConnect::fail(
             test_connection_error("connector failed"),

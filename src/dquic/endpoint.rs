@@ -1,7 +1,6 @@
 //! QUIC-only endpoint built on top of a shared [`Network`].
 
 use std::{
-    borrow::Cow,
     str::FromStr,
     sync::{Arc, Mutex, RwLock},
     time::Duration,
@@ -630,12 +629,8 @@ impl quic::Connect for QuicEndpoint {
             "connecting quic endpoint"
         );
         let runtime = self.ensure_client_runtime().context(TlsSnafu)?;
-        let mut server_eps = futures::StreamExt::fuse(
-            self.resolver
-                .lookup(lookup_name.as_ref())
-                .await
-                .context(DnsSnafu)?,
-        );
+        let mut server_eps =
+            futures::StreamExt::fuse(self.resolver.lookup(lookup_name).await.context(DnsSnafu)?);
         let connection = self
             .build_client_connection_from_runtime(transport_name, &runtime)
             .context(TlsSnafu)?;
@@ -1012,14 +1007,9 @@ impl QuicEndpoint {
     }
 }
 
-fn lookup_server_name(server: &http::uri::Authority) -> Cow<'_, str> {
+fn lookup_server_name(server: &http::uri::Authority) -> &str {
     let full = server.as_str();
-    let host = full.rsplit_once('@').map_or(full, |(_, host)| host);
-    if server.port_u16().is_some() {
-        Cow::Borrowed(host)
-    } else {
-        Cow::Owned(format!("{host}:443"))
-    }
+    full.rsplit_once('@').map_or(full, |(_, host)| host)
 }
 
 fn transport_server_name(server: &http::uri::Authority) -> &str {
@@ -1058,13 +1048,10 @@ mod tests {
     }
 
     #[test]
-    fn authority_names_default_lookup_port_to_https() {
+    fn authority_names_without_port_remain_logical_names() {
         let authority: Authority = "reimu.hakurei.dhttp.net".parse().unwrap();
 
-        assert_eq!(
-            lookup_server_name(&authority),
-            "reimu.hakurei.dhttp.net:443"
-        );
+        assert_eq!(lookup_server_name(&authority), "reimu.hakurei.dhttp.net");
         assert_eq!(transport_server_name(&authority), "reimu.hakurei.dhttp.net");
     }
 

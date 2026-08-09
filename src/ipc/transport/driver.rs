@@ -366,9 +366,7 @@ fn recv_frame_data(fd: RawFd, data_buf: &mut [u8], cmsg_buf: &mut [u8]) -> io::R
                 // SAFETY: SCM_RIGHTS transfers ownership of a new fd to the receiver.
                 let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
                 #[cfg(not(target_os = "linux"))]
-                if let Err(source) = set_cloexec(&fd) {
-                    return Err(source);
-                }
+                set_cloexec(&fd)?;
                 fds.push(fd);
             }
         }
