@@ -629,8 +629,12 @@ impl quic::Connect for QuicEndpoint {
             "connecting quic endpoint"
         );
         let runtime = self.ensure_client_runtime().context(TlsSnafu)?;
-        let mut server_eps =
-            futures::StreamExt::fuse(self.resolver.lookup(lookup_name).await.context(DnsSnafu)?);
+        let mut server_eps = futures::StreamExt::fuse(
+            self.resolver
+                .lookup(lookup_name, "", None)
+                .await
+                .context(DnsSnafu)?,
+        );
         let connection = self
             .build_client_connection_from_runtime(transport_name, &runtime)
             .context(TlsSnafu)?;
@@ -1358,7 +1362,7 @@ mod tests {
             Source::H3 {
                 server: Arc::from("https://dns.genmeta.net:4433"),
             },
-            EndpointAddr::with_agent(stun_agent, "10.10.0.40:20000".parse().expect("outer addr")),
+            EndpointAddr::mediate(stun_agent, "10.10.0.40:20000".parse().expect("outer addr")),
         );
         QuicEndpoint::add_resolved_peer_endpoint(
             &connection,
@@ -1455,7 +1459,12 @@ mod tests {
         }
 
         impl Resolve for SingleEndpointResolver {
-            fn lookup<'a>(&'a self, _name: &'a str) -> crate::dquic::resolver::ResolveFuture<'a> {
+            fn lookup<'a>(
+                &'a self,
+                _hostname: &'a str,
+                _servname: &'a str,
+                _family: Option<crate::dquic::qresolve::Family>,
+            ) -> crate::dquic::resolver::ResolveFuture<'a> {
                 let endpoint = self.0;
                 async move { Ok(futures::stream::iter([(Source::System, endpoint)]).boxed()) }
                     .boxed()
@@ -1509,7 +1518,7 @@ mod tests {
 
         assert!(!has_agent_client());
 
-        endpoint.set_resolver(Arc::new(SingleEndpointResolver(EndpointAddr::with_agent(
+        endpoint.set_resolver(Arc::new(SingleEndpointResolver(EndpointAddr::mediate(
             stun_agent, local_addr,
         ))));
         let authority: Authority = "server.example".parse().expect("authority");

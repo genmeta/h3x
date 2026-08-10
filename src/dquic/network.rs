@@ -2552,7 +2552,12 @@ mod tests {
     }
 
     impl Resolve for MarkerResolver {
-        fn lookup<'a>(&'a self, _name: &'a str) -> crate::dquic::resolver::ResolveFuture<'a> {
+        fn lookup<'a>(
+            &'a self,
+            _hostname: &'a str,
+            _servname: &'a str,
+            _family: Option<crate::dquic::qresolve::Family>,
+        ) -> crate::dquic::resolver::ResolveFuture<'a> {
             async move { Ok(futures::stream::empty().boxed()) }.boxed()
         }
     }

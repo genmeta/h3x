@@ -517,12 +517,12 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct RecordingResolver {
-        names: Mutex<Vec<String>>,
+        lookups: Mutex<Vec<(String, String, Option<crate::dquic::qresolve::Family>)>>,
     }
 
     impl RecordingResolver {
-        fn names(&self) -> Vec<String> {
-            self.names.lock().unwrap().clone()
+        fn lookups(&self) -> Vec<(String, String, Option<crate::dquic::qresolve::Family>)> {
+            self.lookups.lock().unwrap().clone()
         }
     }
 
@@ -533,8 +533,16 @@ mod tests {
     }
 
     impl Resolve for RecordingResolver {
-        fn lookup<'l>(&'l self, name: &'l str) -> ResolveFuture<'l> {
-            self.names.lock().unwrap().push(name.to_owned());
+        fn lookup<'l>(
+            &'l self,
+            hostname: &'l str,
+            servname: &'l str,
+            family: Option<crate::dquic::qresolve::Family>,
+        ) -> ResolveFuture<'l> {
+            self.lookups
+                .lock()
+                .unwrap()
+                .push((hostname.to_owned(), servname.to_owned(), family));
             async { Ok(stream::empty::<Record>().boxed()) }.boxed()
         }
     }
@@ -770,8 +778,11 @@ mod tests {
             .expect("connect without port");
 
         assert_eq!(
-            resolver.names(),
-            vec!["example.test:8443".to_owned(), "example.test".to_owned()]
+            resolver.lookups(),
+            vec![
+                ("example.test:8443".to_owned(), "443".to_owned(), None),
+                ("example.test".to_owned(), "443".to_owned(), None),
+            ]
         );
         assert_eq!(format!("{}", resolver.as_ref()), "recording resolver");
         Lifecycle::close(first.as_ref(), Code::H3_NO_ERROR, Cow::Borrowed(""));
