@@ -145,8 +145,20 @@ fn iface_bind_uri_device(uri: &BindUri) -> Option<&str> {
         .map(|(_family, device, _port)| device)
 }
 
+/// Return whether a pattern expands across the current device snapshot.
 fn pattern_uses_automatic_device_selection(pattern: &BindPattern) -> bool {
     pattern.scheme == Scheme::Iface && pattern.host.is_glob()
+}
+
+/// Controls the extra interface constraints applied to wildcard bind patterns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum WildcardInterfacePolicy {
+    /// Accept every interface that passes the existing operational and address checks.
+    #[default]
+    AnyEligible,
+
+    /// Accept interfaces suitable for link-local multicast protocols such as mDNS.
+    LanMulticast,
 }
 
 fn interface_is_operational(interface: &Interface) -> bool {
@@ -180,20 +192,62 @@ fn automatic_bind_candidate_is_eligible(interface: &Interface, candidate: &BindU
         && interface_has_bindable_family_address(interface, family)
 }
 
+/// Apply a registration's additional wildcard-only interface constraints.
+fn wildcard_policy_allows_interface(
+    policy: WildcardInterfacePolicy,
+    interface: &Interface,
+) -> bool {
+    match policy {
+        WildcardInterfacePolicy::AnyEligible => true,
+        WildcardInterfacePolicy::LanMulticast => {
+            interface.is_multicast()
+                && !interface.is_loopback()
+                && !interface.is_point_to_point()
+                && !matches!(
+                    interface.if_type,
+                    netdev::interface::types::InterfaceType::Tunnel
+                )
+        }
+    }
+}
+
+/// Remove policy differences that cannot affect explicit interface patterns.
+fn normalize_wildcard_policy(
+    pattern: &BindPattern,
+    policy: WildcardInterfacePolicy,
+) -> WildcardInterfacePolicy {
+    if pattern_uses_automatic_device_selection(pattern) {
+        policy
+    } else {
+        WildcardInterfacePolicy::AnyEligible
+    }
+}
+
+/// Apply both the general eligibility rules and the registration policy.
 fn pattern_allows_bind_candidate(
     pattern: &BindPattern,
     candidate: &BindUri,
     interface: Option<&Interface>,
+    wildcard_policy: WildcardInterfacePolicy,
 ) -> bool {
     !pattern_uses_automatic_device_selection(pattern)
-        || interface
-            .is_some_and(|interface| automatic_bind_candidate_is_eligible(interface, candidate))
+        || interface.is_some_and(|interface| {
+            automatic_bind_candidate_is_eligible(interface, candidate)
+                && wildcard_policy_allows_interface(wildcard_policy, interface)
+        })
 }
 
+/// Identifies one reference-counted bind registration.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BindRegistryKey {
+    /// Identity of the protocol binding backend.
     driver: BindDriverId,
+
+    /// Pattern whose concrete bindings are shared by matching handles.
     pattern: BindPattern,
+
+    /// Normalized wildcard policy; explicit patterns always use `AnyEligible`.
+    wildcard_policy: WildcardInterfacePolicy,
 }
 
 /// Opaque identity of an [`Arc`]-backed [`BindDriver`].
@@ -711,6 +765,7 @@ impl QuicBindDriver {
         let key = BindRegistryKey {
             driver: self.registry_id(),
             pattern: pattern.clone(),
+            wildcard_policy: WildcardInterfacePolicy::AnyEligible,
         };
         let registry = network
             .bind_registry
@@ -975,6 +1030,7 @@ impl BindsState {
         &self,
         pattern: &BindPattern,
         devices: &'static Devices,
+        wildcard_policy: WildcardInterfacePolicy,
     ) -> Vec<BindUri> {
         let interfaces = devices.interfaces();
         pattern
@@ -982,7 +1038,7 @@ impl BindsState {
             .filter(|candidate| {
                 let interface =
                     iface_bind_uri_device(candidate).and_then(|device| interfaces.get(device));
-                pattern_allows_bind_candidate(pattern, candidate, interface)
+                pattern_allows_bind_candidate(pattern, candidate, interface, wildcard_policy)
             })
             .filter(|candidate| {
                 !self
@@ -997,10 +1053,13 @@ impl BindsState {
         &self,
         pattern: &BindPattern,
         interface: &Interface,
+        wildcard_policy: WildcardInterfacePolicy,
     ) -> Vec<BindUri> {
         pattern
             .interface_bind_uris(&interface.name)
-            .filter(|candidate| pattern_allows_bind_candidate(pattern, candidate, Some(interface)))
+            .filter(|candidate| {
+                pattern_allows_bind_candidate(pattern, candidate, Some(interface), wildcard_policy)
+            })
             .filter(|candidate| {
                 !self
                     .bound
@@ -1014,6 +1073,7 @@ impl BindsState {
         &mut self,
         pattern: &BindPattern,
         interface: &Interface,
+        wildcard_policy: WildcardInterfacePolicy,
     ) -> CloseBatch {
         if !pattern_uses_automatic_device_selection(pattern) {
             return CloseBatch::new();
@@ -1023,7 +1083,7 @@ impl BindsState {
         let mut close = CloseBatch::new();
         for (uri, iface) in mem::take(&mut self.bound) {
             let should_close = iface_bind_uri_device(&uri) == Some(interface.name.as_str())
-                && !pattern_allows_bind_candidate(pattern, &uri, Some(interface));
+                && !pattern_allows_bind_candidate(pattern, &uri, Some(interface), wildcard_policy);
             if should_close {
                 close.push(iface);
             } else {
@@ -1151,7 +1211,11 @@ impl BindEntryPermit {
         if state.closing {
             return Vec::new();
         }
-        state.missing_added_device_uris(&self.entry.pattern, interface)
+        state.missing_added_device_uris(
+            &self.entry.pattern,
+            interface,
+            self.entry.key.wildcard_policy,
+        )
     }
 
     fn commit_added_device(
@@ -1191,7 +1255,11 @@ impl BindEntryPermit {
         if state.closing {
             return CloseBatch::new();
         }
-        state.drain_ineligible_device_bindings(&self.entry.pattern, interface)
+        state.drain_ineligible_device_bindings(
+            &self.entry.pattern,
+            interface,
+            self.entry.key.wildcard_policy,
+        )
     }
 
     fn targets_for_changed_device(&self, device: &str) -> Vec<BindInterface> {
@@ -1339,7 +1407,11 @@ impl PendingBindRegistration {
         if state.closing {
             return Vec::new();
         }
-        state.missing_current_device_uris(&permit.entry.pattern, devices)
+        state.missing_current_device_uris(
+            &permit.entry.pattern,
+            devices,
+            permit.entry.key.wildcard_policy,
+        )
     }
 
     fn push_new_binding(&mut self, uri: BindUri, iface: BindInterface) {
@@ -1633,8 +1705,23 @@ impl Network {
     where
         D: BindDriver + 'static,
     {
+        self.bind_with_policy(driver, pattern, WildcardInterfacePolicy::AnyEligible)
+            .await
+    }
+
+    /// Register a bind pattern with an explicit wildcard interface policy.
+    pub async fn bind_with_policy<D>(
+        self: &Arc<Self>,
+        driver: Arc<D>,
+        pattern: BindPattern,
+        wildcard_policy: WildcardInterfacePolicy,
+    ) -> BindHandle
+    where
+        D: BindDriver + 'static,
+    {
         let key = BindRegistryKey {
             driver: bind_driver_id(&driver),
+            wildcard_policy: normalize_wildcard_policy(&pattern, wildcard_policy),
             pattern,
         };
         let driver_erased: Arc<dyn BindDriver> = driver;
@@ -1716,6 +1803,29 @@ impl Network {
         let key = BindRegistryKey {
             driver: bind_driver_id(driver),
             pattern: pattern.clone(),
+            wildcard_policy: WildcardInterfacePolicy::AnyEligible,
+        };
+        let registry = self.bind_registry.lock().expect("bind_registry poisoned");
+        registry
+            .get(&key)
+            .map(|entry| entry.lock_state().bound.values().cloned().collect())
+    }
+
+    /// Return all currently bound interfaces for a pattern and wildcard policy.
+    #[must_use]
+    pub fn get_interfaces_with_policy<D>(
+        &self,
+        driver: &Arc<D>,
+        pattern: &BindPattern,
+        wildcard_policy: WildcardInterfacePolicy,
+    ) -> Option<Vec<BindInterface>>
+    where
+        D: BindDriver + ?Sized,
+    {
+        let key = BindRegistryKey {
+            driver: bind_driver_id(driver),
+            pattern: pattern.clone(),
+            wildcard_policy: normalize_wildcard_policy(pattern, wildcard_policy),
         };
         let registry = self.bind_registry.lock().expect("bind_registry poisoned");
         registry
@@ -2416,6 +2526,7 @@ mod tests {
         let key = BindRegistryKey {
             driver: bind_driver_id(driver),
             pattern: pattern.clone(),
+            wildcard_policy: WildcardInterfacePolicy::AnyEligible,
         };
         let mut close = {
             let registry = network
@@ -3273,6 +3384,7 @@ mod tests {
         let key = BindRegistryKey {
             driver: bind_driver_id(&driver),
             pattern,
+            wildcard_policy: WildcardInterfacePolicy::AnyEligible,
         };
         let driver_erased: Arc<dyn BindDriver> = driver.clone();
 
@@ -3357,6 +3469,7 @@ mod tests {
         let key = BindRegistryKey {
             driver: bind_driver_id(&driver),
             pattern: pattern.clone(),
+            wildcard_policy: WildcardInterfacePolicy::AnyEligible,
         };
         let permit = network
             .acquire_or_insert_entry(key, driver_erased.clone())
@@ -3375,7 +3488,11 @@ mod tests {
             permit
                 .entry
                 .lock_state()
-                .missing_added_device_uris(&pattern, &dummy_interface_named("lo"))
+                .missing_added_device_uris(
+                    &pattern,
+                    &dummy_interface_named("lo"),
+                    WildcardInterfacePolicy::AnyEligible,
+                )
                 .is_empty(),
             "reconciliation should not bind a duplicate when only alloc_port_id differs"
         );
@@ -3386,7 +3503,11 @@ mod tests {
             !permit
                 .entry
                 .lock_state()
-                .missing_added_device_uris(&stun_pattern, &dummy_interface_named("lo"))
+                .missing_added_device_uris(
+                    &stun_pattern,
+                    &dummy_interface_named("lo"),
+                    WildcardInterfacePolicy::AnyEligible,
+                )
                 .is_empty(),
             "semantic query differences must remain missing reconciliation candidates"
         );
@@ -3416,14 +3537,16 @@ mod tests {
         assert!(pattern_allows_bind_candidate(
             &wildcard,
             &candidate,
-            Some(&docker)
+            Some(&docker),
+            WildcardInterfacePolicy::AnyEligible,
         ));
 
         docker.oper_state = netdev::interface::state::OperState::Down;
         assert!(!pattern_allows_bind_candidate(
             &wildcard,
             &candidate,
-            Some(&docker)
+            Some(&docker),
+            WildcardInterfacePolicy::AnyEligible,
         ));
 
         docker.oper_state = netdev::interface::state::OperState::Up;
@@ -3431,7 +3554,8 @@ mod tests {
         assert!(!pattern_allows_bind_candidate(
             &wildcard,
             &candidate,
-            Some(&docker)
+            Some(&docker),
+            WildcardInterfacePolicy::AnyEligible,
         ));
     }
 
@@ -3447,8 +3571,62 @@ mod tests {
         assert!(pattern_allows_bind_candidate(
             &explicit,
             &candidate,
-            Some(&unavailable)
+            Some(&unavailable),
+            WildcardInterfacePolicy::LanMulticast,
         ));
+    }
+
+    #[test]
+    fn lan_multicast_policy_filters_wildcard_interfaces() {
+        let wildcard: BindPattern = "iface://v4.*:0".parse().expect("valid wildcard");
+        let candidate: BindUri = "iface://v4.en0:0".parse().expect("valid bind URI");
+        let mut interface = active_ipv4_interface_named("en0", "192.0.2.10/24");
+        interface.flags |= netdev::interface::flags::IFF_MULTICAST as u32;
+
+        assert!(pattern_allows_bind_candidate(
+            &wildcard,
+            &candidate,
+            Some(&interface),
+            WildcardInterfacePolicy::LanMulticast,
+        ));
+
+        interface.flags |= netdev::interface::flags::IFF_LOOPBACK as u32;
+        assert!(!pattern_allows_bind_candidate(
+            &wildcard,
+            &candidate,
+            Some(&interface),
+            WildcardInterfacePolicy::LanMulticast,
+        ));
+        assert!(pattern_allows_bind_candidate(
+            &wildcard,
+            &candidate,
+            Some(&interface),
+            WildcardInterfacePolicy::AnyEligible,
+        ));
+
+        interface.flags &= !(netdev::interface::flags::IFF_LOOPBACK as u32);
+        interface.if_type = netdev::interface::types::InterfaceType::Tunnel;
+        assert!(!pattern_allows_bind_candidate(
+            &wildcard,
+            &candidate,
+            Some(&interface),
+            WildcardInterfacePolicy::LanMulticast,
+        ));
+    }
+
+    #[test]
+    fn explicit_patterns_normalize_wildcard_policy() {
+        let explicit: BindPattern = "iface://v4.en0:0".parse().expect("valid explicit pattern");
+        let wildcard: BindPattern = "iface://v4.*:0".parse().expect("valid wildcard pattern");
+
+        assert_eq!(
+            normalize_wildcard_policy(&explicit, WildcardInterfacePolicy::LanMulticast),
+            WildcardInterfacePolicy::AnyEligible
+        );
+        assert_eq!(
+            normalize_wildcard_policy(&wildcard, WildcardInterfacePolicy::LanMulticast),
+            WildcardInterfacePolicy::LanMulticast
+        );
     }
 
     #[tokio::test]
