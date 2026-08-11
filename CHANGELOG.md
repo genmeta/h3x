@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.6.1-beta.3] - 2026-08-11
+## [0.6.1] - 2026-08-11
 
 ### Changed
 
@@ -10,4 +10,4 @@
 
 ### Dependencies
 
-- Release manifests target `dquic` v0.7.1-beta.1.
+- Release manifests target `dquic` v0.7.1.
