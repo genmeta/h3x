@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo/h3x-logo.svg" alt="h3x" width="100%" />
+  <img src="https://media.dhttp.net/img/h3x/h3x-logo.svg" alt="h3x" width="100%" />
 </p>
 
 <p align="center">
