@@ -32,7 +32,7 @@ dhttp-identity = "0.3.0"
 
 # feature dquic
 dquic = { version = "0.7.1", optional = true }
-netdev = { version = "0.45", optional = true }
+netdev = { version = "0.46", optional = true }
 
 # feature hyper
 http-body = { version = "1", optional = true }
