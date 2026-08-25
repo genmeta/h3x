@@ -554,8 +554,19 @@ impl MessageWriter {
     }
 
     pub async fn close(&mut self) -> Result<(), MessageStreamError> {
-        self.try_stream_write(async move |this| Ok(this.stream.close().await?))
+        match self
+            .try_stream_write(async move |this| Ok(this.stream.close().await?))
             .await
+        {
+            // RFC 9114 Section 4.1 permits a peer to stop receiving the remainder
+            // of an HTTP message with H3_NO_ERROR.  That terminates only this send
+            // direction; the response receive direction can still contain a
+            // complete message and must remain usable by the caller.
+            Err(MessageStreamError::Quic {
+                source: quic::StreamError::Reset { code },
+            }) if code == Code::H3_NO_ERROR.into_inner() => Ok(()),
+            result => result,
+        }
     }
 
     pub async fn reset(&mut self, code: Code) -> Result<(), MessageStreamError> {
@@ -763,6 +774,7 @@ mod tests {
 
     use bytes::{Buf, Bytes};
     use futures::{Sink, SinkExt, Stream, future::poll_fn};
+    use http::StatusCode;
     use tokio::{sync::mpsc, time::timeout};
 
     use super::{MessageReader, MessageStreamError, MessageWriter, guard};
@@ -780,7 +792,10 @@ mod tests {
         },
         error::Code,
         protocol::{Protocol, Protocols, StreamVerdict},
-        qpack::protocol::{QPackDecoder, QPackEncoder, QPackProtocolFactory},
+        qpack::{
+            field::FieldLine,
+            protocol::{QPackDecoder, QPackEncoder, QPackProtocolFactory},
+        },
         quic::{self, GetStreamId, GetStreamIdExt, ResetStream, StopStream},
         varint::VarInt,
     };
@@ -903,6 +918,7 @@ mod tests {
     #[derive(Debug)]
     struct TestWriteStream {
         stream_id: VarInt,
+        close_result: Result<(), quic::StreamError>,
     }
 
     impl quic::GetStreamId for TestWriteStream {
@@ -949,7 +965,7 @@ mod tests {
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
         ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
+            Poll::Ready(self.get_mut().close_result.clone())
         }
     }
 
@@ -1245,6 +1261,25 @@ mod tests {
         (read_stream, write_stream)
     }
 
+    fn write_stream_with_close_error(
+        stream_id: u32,
+        close_error: quic::StreamError,
+    ) -> MessageWriter {
+        MessageWriter::new(
+            SinkWriter::new(guard::GuardQuicWriter::new(Box::pin(TestWriteStream {
+                stream_id: VarInt::from_u32(stream_id),
+                close_result: Err(close_error),
+            })
+                as crate::quic::BoxQuicStreamWriter)),
+            Arc::new(QPackEncoder::new(
+                Arc::new(Settings::default()),
+                qpack_encoder_sink(),
+                qpack_encoder_stream(),
+            )),
+            state_without_qpack(Arc::new(MockConnection::new())).erase(),
+        )
+    }
+
     #[tokio::test]
     async fn read_stream_try_stream_read_aborts_when_peer_goaway_covers_stream() {
         let erased: Arc<dyn quic::DynConnection> = Arc::new(MockConnection::new());
@@ -1297,6 +1332,7 @@ mod tests {
 
         let writer = SinkWriter::new(guard::GuardQuicWriter::new(Box::pin(TestWriteStream {
             stream_id: VarInt::from_u32(12),
+            close_result: Ok(()),
         })
             as crate::quic::BoxQuicStreamWriter));
         let mut write_stream = MessageWriter::new(
@@ -1530,6 +1566,7 @@ mod tests {
         let state = state_without_qpack(quic.clone()).erase();
         let writer = SinkWriter::new(guard::GuardQuicWriter::new(Box::pin(TestWriteStream {
             stream_id: VarInt::from_u32(3),
+            close_result: Ok(()),
         })
             as crate::quic::BoxQuicStreamWriter));
         let mut stream = MessageWriter::new(
@@ -1811,6 +1848,7 @@ mod tests {
         write_quic.set_terminal_error(transport_error("write try_stream_write connection close"));
         let writer = SinkWriter::new(guard::GuardQuicWriter::new(Box::pin(TestWriteStream {
             stream_id: VarInt::from_u32(27),
+            close_result: Ok(()),
         })
             as crate::quic::BoxQuicStreamWriter));
         let mut write_stream = MessageWriter::new(
@@ -1929,6 +1967,7 @@ mod tests {
 
         let mut writer = TestWriteStream {
             stream_id: VarInt::from_u32(33),
+            close_result: Ok(()),
         };
         poll_fn(|cx| Pin::new(&mut writer).poll_ready(cx))
             .await
@@ -2322,9 +2361,9 @@ mod tests {
         assert_eq!(
             timeout(Duration::from_secs(1), stop_rx.recv())
                 .await
-                .expect("drop cleanup should finish after draining reader EOF"),
-            None,
-            "drop cleanup should not send STOP_SENDING after draining reader EOF"
+                .expect("taken reader drop should stop the receive side")
+                .expect("stop code should be present"),
+            Code::H3_NO_ERROR.into_inner(),
         );
     }
 
@@ -2381,6 +2420,78 @@ mod tests {
             .expect_err("write after close should fail at message layer");
 
         assert!(matches!(error, MessageStreamError::MessageWriterClosed));
+    }
+
+    #[tokio::test]
+    async fn close_treats_h3_no_error_stop_as_clean_send_termination() {
+        let (mut response_reader, mut response_writer) = paired_message_streams(40);
+        response_writer
+            .write_header([FieldLine::from(StatusCode::OK)])
+            .await
+            .expect("write response headers");
+        response_writer
+            .write_data(Bytes::from_static(b"ok"))
+            .await
+            .expect("write response body");
+        response_writer.close().await.expect("complete response");
+
+        let code = Code::H3_NO_ERROR.into_inner();
+        let mut stream = write_stream_with_close_error(40, quic::StreamError::Reset { code });
+
+        stream
+            .close()
+            .await
+            .expect("H3_NO_ERROR should terminate only the send direction");
+
+        let error = stream
+            .write_data(Bytes::from_static(b"after peer stop"))
+            .await
+            .expect_err("the stopped send direction must remain unusable");
+        assert!(matches!(
+            error,
+            MessageStreamError::Quic {
+                source: quic::StreamError::Reset { code: actual }
+            } if actual == code
+        ));
+
+        let response_header = response_reader
+            .read_header()
+            .await
+            .expect("read response headers after the request send side stopped")
+            .expect("response should contain headers");
+        assert_eq!(response_header.status(), StatusCode::OK);
+        assert_eq!(
+            response_reader
+                .read_data_frame_chunk()
+                .await
+                .expect("read response body after the request send side stopped"),
+            Some(Bytes::from_static(b"ok"))
+        );
+        assert_eq!(
+            response_reader
+                .read_data_frame_chunk()
+                .await
+                .expect("read complete response EOF"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn close_preserves_non_no_error_peer_reset() {
+        let code = Code::H3_REQUEST_CANCELLED.into_inner();
+        let mut stream = write_stream_with_close_error(44, quic::StreamError::Reset { code });
+
+        let error = stream
+            .close()
+            .await
+            .expect_err("request cancellation must remain visible to the caller");
+
+        assert!(matches!(
+            error,
+            MessageStreamError::Quic {
+                source: quic::StreamError::Reset { code: actual }
+            } if actual == code
+        ));
     }
 
     #[tokio::test]

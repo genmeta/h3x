@@ -6,15 +6,12 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{Sink, Stream, StreamExt as _};
+use futures::{Sink, Stream};
 use tracing::Instrument;
 
 use crate::{
     error::Code,
-    quic::{
-        self, BoxQuicStreamReader, BoxQuicStreamWriter, GetStreamIdExt as _, ResetStreamExt,
-        StopStreamExt,
-    },
+    quic::{self, BoxQuicStreamReader, BoxQuicStreamWriter, ResetStreamExt, StopStreamExt},
     varint::VarInt,
 };
 
@@ -34,56 +31,27 @@ fn writer_used_after_closed() -> ! {
     panic!("guarded QUIC writer used after send side closed, this is a bug")
 }
 
-const READER_DROP_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const READER_DROP_STOP_TIMEOUT: Duration = Duration::from_millis(100);
-const READER_DROP_DRAIN_LIMIT: usize = 64 * 1024;
-
-async fn drain_reader_on_drop(mut stream: BoxQuicStreamReader) {
-    let drain_result = tokio::time::timeout(READER_DROP_DRAIN_TIMEOUT, async {
-        let stream_id = stream.stream_id().await.ok();
-        let mut bytes = 0usize;
-        loop {
-            match stream.next().await {
-                Some(Ok(chunk)) => {
-                    bytes = bytes.saturating_add(chunk.len());
-                    if bytes > READER_DROP_DRAIN_LIMIT {
-                        return (stream_id, false);
-                    }
-                }
-                Some(Err(_)) | None => return (stream_id, true),
-            }
-        }
-    })
-    .await;
-    let (stream_id, drained) = drain_result.unwrap_or((None, false));
-
-    if drained {
-        tracing::trace!(
-            boundary = "quic-reader-drop",
-            stream_id = ?stream_id.map(|id| id.into_inner()),
-            "QUIC reader reached end while draining on drop"
-        );
-    } else {
-        tracing::info!(
+async fn stop_reader_on_drop(mut stream: BoxQuicStreamReader, stream_id: Option<VarInt>) {
+    tracing::trace!(
+        boundary = "quic-reader-drop",
+        stream_id = ?stream_id.map(|id| id.into_inner()),
+        code = Code::H3_NO_ERROR.into_inner().into_inner(),
+        "QUIC reader dropped before EOF; sending STOP_SENDING"
+    );
+    if tokio::time::timeout(
+        READER_DROP_STOP_TIMEOUT,
+        stream.stop(Code::H3_NO_ERROR.into()),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
             boundary = "quic-reader-drop",
             stream_id = ?stream_id.map(|id| id.into_inner()),
             code = Code::H3_NO_ERROR.into_inner().into_inner(),
-            "QUIC reader drop drain incomplete; sending STOP_SENDING"
+            "QUIC reader STOP_SENDING timed out; dropping stream"
         );
-        if tokio::time::timeout(
-            READER_DROP_STOP_TIMEOUT,
-            stream.stop(Code::H3_NO_ERROR.into()),
-        )
-        .await
-        .is_err()
-        {
-            tracing::warn!(
-                boundary = "quic-reader-drop",
-                stream_id = ?stream_id.map(|id| id.into_inner()),
-                code = Code::H3_NO_ERROR.into_inner().into_inner(),
-                "QUIC reader STOP_SENDING timed out; dropping stream"
-            );
-        }
     }
 }
 
@@ -97,16 +65,26 @@ pub(super) enum QuicWriterStateSnapshot {
 }
 
 enum QuicReaderState {
-    Open { stream: BoxQuicStreamReader },
+    Open {
+        stream: BoxQuicStreamReader,
+        stop_sent: bool,
+    },
     Closed,
-    Reset { code: VarInt },
-    ConnectionClosed { source: quic::ConnectionError },
+    Reset {
+        code: VarInt,
+    },
+    ConnectionClosed {
+        source: quic::ConnectionError,
+    },
     Taken,
 }
 
 impl QuicReaderState {
     fn open(stream: BoxQuicStreamReader) -> Self {
-        Self::Open { stream }
+        Self::Open {
+            stream,
+            stop_sent: false,
+        }
     }
 
     fn take(&mut self) -> Self {
@@ -178,7 +156,7 @@ impl GuardQuicReader {
     /// Consume this guard and return the protected stream without running drop cleanup.
     pub(super) fn into_inner(mut self) -> BoxQuicStreamReader {
         match self.state.take() {
-            QuicReaderState::Open { stream } => stream,
+            QuicReaderState::Open { stream, .. } => stream,
             QuicReaderState::Closed => {
                 panic!("closed guarded QUIC reader cannot be taken as an open stream")
             }
@@ -215,7 +193,7 @@ impl Stream for GuardQuicReader {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let result = match &mut this.state {
-            QuicReaderState::Open { stream } => stream.as_mut().poll_next(cx),
+            QuicReaderState::Open { stream, .. } => stream.as_mut().poll_next(cx),
             QuicReaderState::Closed => return Poll::Ready(None),
             QuicReaderState::Reset { code } => {
                 return Poll::Ready(Some(Err(quic::StreamError::Reset { code: *code })));
@@ -249,7 +227,18 @@ impl quic::StopStream for GuardQuicReader {
     ) -> Poll<Result<(), quic::StreamError>> {
         let this = self.get_mut();
         let result = match &mut this.state {
-            QuicReaderState::Open { stream } => stream.as_mut().poll_stop(cx, code),
+            QuicReaderState::Open { stream, stop_sent } => {
+                if *stop_sent {
+                    return Poll::Ready(Ok(()));
+                }
+                match stream.as_mut().poll_stop(cx, code) {
+                    Poll::Ready(Ok(())) => {
+                        *stop_sent = true;
+                        Poll::Ready(Ok(()))
+                    }
+                    result => result,
+                }
+            }
             QuicReaderState::Closed => return Poll::Ready(Ok(())),
             QuicReaderState::Reset { code } => {
                 return Poll::Ready(Err(quic::StreamError::Reset { code: *code }));
@@ -276,7 +265,7 @@ impl quic::GetStreamId for GuardQuicReader {
     ) -> Poll<Result<VarInt, quic::StreamError>> {
         let this = self.get_mut();
         let result = match &mut this.state {
-            QuicReaderState::Open { stream } => {
+            QuicReaderState::Open { stream, .. } => {
                 if let Some(stream_id) = this.stream_id {
                     return Poll::Ready(Ok(stream_id));
                 }
@@ -309,8 +298,10 @@ impl quic::GetStreamId for GuardQuicReader {
 
 impl Drop for GuardQuicReader {
     fn drop(&mut self) {
-        if let QuicReaderState::Open { stream } = self.state.take() {
-            tokio::spawn(drain_reader_on_drop(stream).in_current_span());
+        if let QuicReaderState::Open { stream, stop_sent } = self.state.take()
+            && !stop_sent
+        {
+            tokio::spawn(stop_reader_on_drop(stream, self.stream_id).in_current_span());
         }
     }
 }
@@ -968,7 +959,7 @@ mod tests {
 
     #[tokio::test]
     async fn reader_take_moves_inner_stream_and_panics_on_original_use() {
-        let (mut guard, stop_rx) = reader_guard(7, [], [Ok(())]);
+        let (mut guard, mut stop_rx) = reader_guard(7, [], [Ok(())]);
         guard.set_stream_id(VarInt::from_u32(7));
         let mut taken = GuardQuicReader::take(&mut guard);
 
@@ -992,9 +983,21 @@ mod tests {
         });
 
         drop(guard);
-        drop(taken);
+        assert!(
+            timeout(Duration::from_millis(50), stop_rx.recv())
+                .await
+                .is_err(),
+            "the original guard must not stop the stream after take"
+        );
 
-        assert_no_code(stop_rx).await;
+        drop(taken);
+        assert_eq!(
+            timeout(Duration::from_secs(1), stop_rx.recv())
+                .await
+                .expect("taken reader drop should stop the receive side")
+                .expect("stop code should be present"),
+            Code::H3_NO_ERROR.into_inner(),
+        );
     }
 
     #[tokio::test]
@@ -1027,7 +1030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reader_stop_ok_allows_drop_cleanup_to_drain_eof() {
+    async fn reader_stop_ok_skips_duplicate_drop_cleanup() {
         let (mut guard, mut stop_rx) = reader_guard(12, [], [Ok(())]);
 
         poll_fn(|cx| Pin::new(&mut guard).poll_stop(cx, VarInt::from_u32(33)))
@@ -1069,7 +1072,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reader_drop_timeout_covers_pending_stream_id_lookup() {
+    async fn reader_drop_does_not_wait_for_stream_id_lookup() {
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
         let guard = GuardQuicReader::new(Box::pin(PendingStreamIdReader { stop_tx }));
 
@@ -1078,7 +1081,7 @@ mod tests {
         assert_eq!(
             timeout(Duration::from_secs(1), stop_rx.recv())
                 .await
-                .expect("drop cleanup should time out pending stream id lookup")
+                .expect("drop cleanup should not wait for stream id lookup")
                 .expect("drop cleanup should send stop code"),
             Code::H3_NO_ERROR.into_inner(),
         );
