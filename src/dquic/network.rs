@@ -839,6 +839,7 @@ impl QuicBindDriver {
             .configure_connection(foundation)
             .with_streams_concurrency_strategy(slot.config.stream_strategy_factory.as_ref())
             .with_defer_idle_timeout(slot.config.defer_idle_timeout)
+            .with_heartbeat_interval(slot.config.heartbeat_interval)
             .with_zero_rtt(slot.config.enable_0rtt)
             .with_cids(origin_dcid)
             .with_qlog(slot.config.qlogger.clone())

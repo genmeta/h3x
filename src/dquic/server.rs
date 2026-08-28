@@ -19,6 +19,7 @@ use rustls::server::{NoClientAuth, danger::ClientCertVerifier};
 use crate::dquic::{
     log::{QLog, handy::NoopLogger},
     param::{ServerParameters, handy::server_parameters},
+    qbase::time::DEFAULT_HEARTBEAT_INTERVAL,
     stream::{ProductStreamsConcurrencyController, handy::ConsistentConcurrency},
     tls::{AuthClient, handy::AcceptAllClientAuther},
     token::{TokenProvider, handy::NoopTokenRegistry},
@@ -51,6 +52,9 @@ pub struct ServerQuicConfig {
     /// How long the connection should keep sending probe packets after going
     /// idle. `Duration::ZERO` (the default) disables deferred idle timeouts.
     pub defer_idle_timeout: Duration,
+    /// Interval between path heartbeat PINGs while active keep-alive is enabled.
+    /// Defaults to 20 seconds.
+    pub heartbeat_interval: Duration,
     /// Factory producing per-connection streams concurrency controllers.
     pub stream_strategy_factory: Arc<dyn ProductStreamsConcurrencyController>,
     /// QUIC-events logger (qlog). Defaults to a no-op logger.
@@ -85,6 +89,7 @@ impl Default for ServerQuicConfig {
     fn default() -> Self {
         Self {
             defer_idle_timeout: Duration::ZERO,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             stream_strategy_factory: Arc::new(ConsistentConcurrency::new),
             qlogger: Arc::new(NoopLogger),
             enable_0rtt: false,
@@ -104,6 +109,7 @@ impl std::fmt::Debug for ServerQuicConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerQuicConfig")
             .field("defer_idle_timeout", &self.defer_idle_timeout)
+            .field("heartbeat_interval", &self.heartbeat_interval)
             .field("enable_0rtt", &self.enable_0rtt)
             .field("enable_sslkeylog", &self.enable_sslkeylog)
             .field("alpns", &self.alpns.len())
@@ -116,6 +122,7 @@ impl std::fmt::Debug for ServerQuicConfig {
 impl PartialEq for ServerQuicConfig {
     fn eq(&self, other: &Self) -> bool {
         self.defer_idle_timeout == other.defer_idle_timeout
+            && self.heartbeat_interval == other.heartbeat_interval
             && self.enable_0rtt == other.enable_0rtt
             && self.enable_sslkeylog == other.enable_sslkeylog
             && Arc::ptr_eq(
@@ -134,6 +141,17 @@ impl PartialEq for ServerQuicConfig {
 }
 
 impl ServerQuicConfig {
+    /// Configure active connection keep-alive.
+    ///
+    /// `duration` is the maximum window for initiating keep-alive PINGs after
+    /// the most recent effective payload. `heartbeat_interval` is the interval
+    /// between path heartbeat PINGs during that window.
+    pub fn keep_alive(mut self, duration: Duration, heartbeat_interval: Duration) -> Self {
+        self.defer_idle_timeout = duration;
+        self.heartbeat_interval = heartbeat_interval;
+        self
+    }
+
     /// Returns `true` when `self` and `other` describe the same server configuration.
     ///
     /// Compares every field individually. Trait-object fields use
@@ -184,6 +202,7 @@ mod server_tests {
     fn test_server_quic_config_default() {
         let cfg = ServerQuicConfig::default();
         assert_eq!(cfg.defer_idle_timeout, Duration::ZERO);
+        assert_eq!(cfg.heartbeat_interval, Duration::from_secs(20));
         assert!(!cfg.enable_0rtt);
         assert!(!cfg.enable_sslkeylog);
         assert!(cfg.alpns.is_empty());
@@ -231,6 +250,7 @@ mod server_tests {
     fn test_server_quic_config_debug_reports_public_value_fields() {
         let cfg = ServerQuicConfig {
             defer_idle_timeout: Duration::from_secs(3),
+            heartbeat_interval: Duration::from_secs(1),
             enable_0rtt: true,
             enable_sslkeylog: true,
             alpns: vec![b"h3".to_vec(), b"dhttp".to_vec()],
@@ -242,6 +262,7 @@ mod server_tests {
         let debug = format!("{cfg:?}");
 
         assert!(debug.contains("defer_idle_timeout: 3s"));
+        assert!(debug.contains("heartbeat_interval: 1s"));
         assert!(debug.contains("enable_0rtt: true"));
         assert!(debug.contains("enable_sslkeylog: true"));
         assert!(debug.contains("alpns: 2"));
@@ -259,6 +280,10 @@ mod server_tests {
         assert_ne!(a, b);
 
         let mut b = a.clone();
+        b.heartbeat_interval = Duration::from_secs(1);
+        assert_ne!(a, b);
+
+        let mut b = a.clone();
         b.enable_0rtt = true;
         assert_ne!(a, b);
 
@@ -273,6 +298,7 @@ mod server_tests {
         let b = ServerQuicConfig::default();
 
         assert_eq!(a.defer_idle_timeout, b.defer_idle_timeout);
+        assert_eq!(a.heartbeat_interval, b.heartbeat_interval);
         assert_eq!(a.enable_0rtt, b.enable_0rtt);
         assert_eq!(a.enable_sslkeylog, b.enable_sslkeylog);
         assert_eq!(a.parameters, b.parameters);
@@ -292,6 +318,7 @@ mod server_tests {
         let b = a.clone();
         // Plain-value fields clone independently
         assert_eq!(a.defer_idle_timeout, b.defer_idle_timeout);
+        assert_eq!(a.heartbeat_interval, b.heartbeat_interval);
         assert_eq!(a.enable_0rtt, b.enable_0rtt);
         assert_eq!(a.enable_sslkeylog, b.enable_sslkeylog);
         assert_eq!(a.alpns, b.alpns);
@@ -321,6 +348,7 @@ mod server_tests {
         a.backlog = 256;
 
         assert_eq!(b.defer_idle_timeout, Duration::ZERO);
+        assert_eq!(b.heartbeat_interval, Duration::from_secs(20));
         assert_eq!(b.backlog, 128);
         assert_eq!(a.defer_idle_timeout, Duration::from_secs(42));
         assert_eq!(a.backlog, 256);
@@ -342,6 +370,7 @@ mod server_tests {
         a.defer_idle_timeout = Duration::from_secs(1);
         a.defer_idle_timeout = Duration::ZERO;
         assert_eq!(a.defer_idle_timeout, b.defer_idle_timeout);
+        assert_eq!(a.heartbeat_interval, b.heartbeat_interval);
         assert!(a.is_compatible_with(&b));
     }
 
@@ -398,5 +427,14 @@ mod server_tests {
             .expect("default verifier should produce a rustls config");
 
         assert_eq!(tls.max_early_data_size, 0);
+    }
+
+    #[test]
+    fn test_server_quic_config_keep_alive_sets_both_parameters() {
+        let cfg = ServerQuicConfig::default()
+            .keep_alive(Duration::from_secs(120), Duration::from_secs(20));
+
+        assert_eq!(cfg.defer_idle_timeout, Duration::from_secs(120));
+        assert_eq!(cfg.heartbeat_interval, Duration::from_secs(20));
     }
 }

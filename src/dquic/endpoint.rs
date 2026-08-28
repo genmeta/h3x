@@ -500,6 +500,7 @@ impl QuicEndpoint {
             .quic()
             .configure_connection(builder)
             .with_defer_idle_timeout(runtime.client.defer_idle_timeout)
+            .with_heartbeat_interval(runtime.client.heartbeat_interval)
             .with_cids(ConnectionId::random_gen(8))
             .with_qlog(runtime.client.qlogger.clone())
             .run();

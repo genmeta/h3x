@@ -14,6 +14,7 @@ use rustls::client::{WebPkiServerVerifier, danger::ServerCertVerifier};
 use crate::dquic::{
     log::{QLog, handy::NoopLogger},
     param::{ClientParameters, handy::client_parameters},
+    qbase::time::DEFAULT_HEARTBEAT_INTERVAL,
     stream::{ProductStreamsConcurrencyController, handy::ConsistentConcurrency},
     token::{TokenSink, handy::NoopTokenRegistry},
 };
@@ -89,6 +90,9 @@ pub struct ClientQuicConfig {
     /// How long the connection should keep sending probe packets after going
     /// idle. `Duration::ZERO` (the default) disables deferred idle timeouts.
     pub defer_idle_timeout: Duration,
+    /// Interval between path heartbeat PINGs while active keep-alive is enabled.
+    /// Defaults to 20 seconds.
+    pub heartbeat_interval: Duration,
     /// Factory producing per-connection streams concurrency controllers.
     pub stream_strategy_factory: Arc<dyn ProductStreamsConcurrencyController>,
     /// QUIC-events logger (qlog). Defaults to a no-op logger.
@@ -114,6 +118,7 @@ impl Default for ClientQuicConfig {
         Self {
             // CommonQuicConfig::default() values
             defer_idle_timeout: Duration::ZERO,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             stream_strategy_factory: Arc::new(ConsistentConcurrency::new),
             qlogger: Arc::new(NoopLogger),
             enable_0rtt: false,
@@ -131,6 +136,7 @@ impl std::fmt::Debug for ClientQuicConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientQuicConfig")
             .field("defer_idle_timeout", &self.defer_idle_timeout)
+            .field("heartbeat_interval", &self.heartbeat_interval)
             .field("enable_0rtt", &self.enable_0rtt)
             .field("enable_sslkeylog", &self.enable_sslkeylog)
             .field("alpns", &self.alpns.len())
@@ -142,6 +148,7 @@ impl std::fmt::Debug for ClientQuicConfig {
 impl PartialEq for ClientQuicConfig {
     fn eq(&self, other: &Self) -> bool {
         self.defer_idle_timeout == other.defer_idle_timeout
+            && self.heartbeat_interval == other.heartbeat_interval
             && self.enable_0rtt == other.enable_0rtt
             && self.enable_sslkeylog == other.enable_sslkeylog
             && self.parameters == other.parameters
@@ -153,6 +160,19 @@ impl PartialEq for ClientQuicConfig {
             )
             && Arc::ptr_eq(&self.qlogger, &other.qlogger)
             && Arc::ptr_eq(&self.token_sink, &other.token_sink)
+    }
+}
+
+impl ClientQuicConfig {
+    /// Configure active connection keep-alive.
+    ///
+    /// `duration` is the maximum window for initiating keep-alive PINGs after
+    /// the most recent effective payload. `heartbeat_interval` is the interval
+    /// between path heartbeat PINGs during that window.
+    pub fn keep_alive(mut self, duration: Duration, heartbeat_interval: Duration) -> Self {
+        self.defer_idle_timeout = duration;
+        self.heartbeat_interval = heartbeat_interval;
+        self
     }
 }
 
@@ -188,6 +208,7 @@ mod client_tests {
     fn test_common_quic_config_default() {
         let cfg = CommonQuicConfig::default();
         assert_eq!(cfg.defer_idle_timeout, Duration::ZERO);
+        assert_eq!(cfg.heartbeat_interval, Duration::from_secs(20));
         assert!(!cfg.enable_0rtt);
         assert!(!cfg.enable_sslkeylog);
     }
@@ -346,6 +367,10 @@ mod client_tests {
         let mut b = a.clone();
         b.defer_idle_timeout = Duration::from_secs(99);
         assert_ne!(a, b);
+
+        let mut b = a.clone();
+        b.heartbeat_interval = Duration::from_secs(5);
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -392,6 +417,7 @@ mod client_tests {
         let rendered = format!("{cfg:?}");
         assert!(rendered.contains("ClientQuicConfig"));
         assert!(rendered.contains("defer_idle_timeout: 0ns"));
+        assert!(rendered.contains("heartbeat_interval: 20s"));
         assert!(rendered.contains("enable_0rtt: false"));
         assert!(rendered.contains("enable_sslkeylog: false"));
         assert!(rendered.contains("alpns: 1"));
@@ -413,6 +439,7 @@ mod client_tests {
         assert!(Arc::ptr_eq(&a.token_sink, &b.token_sink));
         // Scalar / owned values are equal by value
         assert_eq!(a.defer_idle_timeout, b.defer_idle_timeout);
+        assert_eq!(a.heartbeat_interval, b.heartbeat_interval);
         assert_eq!(a.enable_0rtt, b.enable_0rtt);
         assert_eq!(a.enable_sslkeylog, b.enable_sslkeylog);
         assert_eq!(a.parameters, b.parameters);
@@ -431,6 +458,7 @@ mod client_tests {
 
         // Original is unchanged
         assert_eq!(a.defer_idle_timeout, Duration::ZERO);
+        assert_eq!(a.heartbeat_interval, Duration::from_secs(20));
         assert!(a.alpns.is_empty());
         // b has the new values
         assert_eq!(b.defer_idle_timeout, Duration::from_secs(99));
@@ -449,6 +477,7 @@ mod client_tests {
 
         // Other value fields stay unchanged and only trait-object identities diverge.
         assert_eq!(a.defer_idle_timeout, b.defer_idle_timeout);
+        assert_eq!(a.heartbeat_interval, b.heartbeat_interval);
         assert_eq!(a.enable_0rtt, b.enable_0rtt);
         assert_eq!(a.enable_sslkeylog, b.enable_sslkeylog);
         assert_eq!(a.parameters, b.parameters);
@@ -460,5 +489,14 @@ mod client_tests {
         ));
         assert!(!Arc::ptr_eq(&a.qlogger, &b.qlogger));
         assert!(!Arc::ptr_eq(&a.token_sink, &b.token_sink));
+    }
+
+    #[test]
+    fn test_client_quic_config_keep_alive_sets_both_parameters() {
+        let cfg = ClientQuicConfig::default()
+            .keep_alive(Duration::from_secs(120), Duration::from_secs(20));
+
+        assert_eq!(cfg.defer_idle_timeout, Duration::from_secs(120));
+        assert_eq!(cfg.heartbeat_interval, Duration::from_secs(20));
     }
 }

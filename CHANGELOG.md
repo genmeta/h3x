@@ -2,6 +2,12 @@
 
 ## [0.6.2] - 2026-08-24
 
+### Changed
+
+- Adapt QUIC client and server configuration to dquic's consolidated
+  `keep_alive(duration, heartbeat_interval)` interface and pass both values to
+  every connection.
+
 ### Dependencies
 
 - Align the direct `netdev` dependency with dquic's public interface types by
