@@ -44,7 +44,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 
 # feature rpc (implemented with remoc crate)
 # NOTE: no codec feature here — downstream chooses the codec
-remoc = { version = "0.18", default-features = false, optional = true, features = [
+remoc = { version = "0.20", default-features = false, optional = true, features = [
     "remoc_macro",
     "rtc",
     "serde",
@@ -101,7 +101,7 @@ tokio = { version = "1", features = [
 tracing-appender = "0.2"
 tracing-subscriber = "0.3"
 proptest = "1"
-remoc = { version = "0.18", default-features = false, features = [
+remoc = { version = "0.20", default-features = false, features = [
     "default-codec-bincode",
 ] }
 serde_json = "1"
