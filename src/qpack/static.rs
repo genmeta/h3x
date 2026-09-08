@@ -39,6 +39,7 @@ macro_rules! static_table {
             STATIC_TABLE.get(index as usize).map(|(name, _)| *name)
         }
 
+        #[cfg(test)]
         pub fn get_value(index: u64) -> Option<&'static str> {
             STATIC_TABLE.get(index as usize).map(|(_, value)| *value)
         }

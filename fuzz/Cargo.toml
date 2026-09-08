@@ -9,18 +9,18 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-tokio = { version = "1", features = ["rt", "io-util"] }
-bytes = "1"
-futures = "0.3"
-httlib-huffman = "0.3"
-
-[dependencies.h3x]
-path = ".."
-features = ["testing"]
+h3x = { path = "..", features = ["fuzzing"] }
 
 [[bin]]
-name = "fuzz_varint"
-path = "fuzz_targets/fuzz_varint.rs"
+name = "fuzz_frame"
+path = "fuzz_targets/fuzz_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_field_section"
+path = "fuzz_targets/fuzz_field_section.rs"
 test = false
 doc = false
 bench = false
@@ -40,43 +40,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "fuzz_qpack_field"
-path = "fuzz_targets/fuzz_qpack_field.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "fuzz_qpack_instruction"
 path = "fuzz_targets/fuzz_qpack_instruction.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_dhttp_setting"
-path = "fuzz_targets/fuzz_dhttp_setting.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_frame"
-path = "fuzz_targets/fuzz_frame.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_unidirectional_stream"
-path = "fuzz_targets/fuzz_unidirectional_stream.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_dhttp_settings"
-path = "fuzz_targets/fuzz_dhttp_settings.rs"
 test = false
 doc = false
 bench = false
@@ -89,36 +54,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "fuzz_qpack_ric"
-path = "fuzz_targets/fuzz_qpack_ric.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_huffman"
-path = "fuzz_targets/fuzz_huffman.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_field_section"
-path = "fuzz_targets/fuzz_field_section.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_qpack_dynamic_roundtrip"
-path = "fuzz_targets/fuzz_qpack_dynamic_roundtrip.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_qpack_decoder_state"
-path = "fuzz_targets/fuzz_qpack_decoder_state.rs"
+name = "fuzz_unidirectional_stream"
+path = "fuzz_targets/fuzz_unidirectional_stream.rs"
 test = false
 doc = false
 bench = false

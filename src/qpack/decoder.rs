@@ -1,1856 +1,490 @@
-use std::{
-    collections::VecDeque,
-    ops::DerefMut,
-    pin::{Pin, pin},
-    sync::{Arc, Mutex as SyncMutex},
-    task::{Context, Poll},
-};
+use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use futures::{Sink, SinkExt, Stream, StreamExt, stream};
-use snafu::Snafu;
-use tokio::{
-    io::{AsyncBufRead, AsyncReadExt, AsyncWrite},
-    sync::Mutex as AsyncMutex,
-};
 
-use crate::{
-    codec::{DecodeExt, DecodeFrom, EncodeInto, Feed, StreamDecodeError},
-    connection::StreamError,
-    dhttp::settings::Settings,
-    error::{
-        Code, H3ConnectionError, H3CriticalStreamClosed, H3FrameDecodeError,
-        QpackDecompressionFailed,
-    },
-    qpack::{
-        dynamic::DynamicTable,
-        encoder::EncoderInstruction,
-        field::{EncodedFieldSectionPrefix, FieldLine, FieldLineRepresentation, FieldSection},
-        integer::{decode_integer, encode_integer},
-        r#static,
-    },
-    quic::{self, GetStreamId, GetStreamIdExt, ReadStream, StopStream},
-    varint::VarInt,
+use super::{
+    Field, decode_prefixed_integer, decode_string,
+    instruction::EncoderInstruction,
+    qpack_error, static_table,
+    table::{Table, TableError},
 };
+use crate::{Code, Error, StreamId};
 
 #[derive(Debug)]
-pub struct DecoderState {
-    pub(crate) settings: Arc<Settings>,
-    pub(crate) dynamic_table: DynamicTable,
-    pub(crate) pending_instructions: VecDeque<DecoderInstruction>,
+pub(super) enum Decode {
+    Ready {
+        fields: Vec<Field>,
+        used_dynamic_table: bool,
+    },
+    Blocked,
 }
 
-impl DecoderState {
-    pub const fn new(settings: Arc<Settings>) -> Self {
+/// Connection-scoped QPACK decoder state.
+#[derive(Debug)]
+pub(super) struct Decoder {
+    table: Table,
+    max_blocked_streams: u64,
+    max_field_section_size: Option<u64>,
+    blocked: BTreeMap<StreamId, u64>,
+}
+
+impl Decoder {
+    pub(super) const fn new(
+        max_capacity: u64,
+        max_blocked_streams: u64,
+        max_field_section_size: Option<u64>,
+    ) -> Self {
         Self {
-            settings,
-            dynamic_table: DynamicTable::new(),
-            pending_instructions: VecDeque::new(),
+            table: Table::new(max_capacity),
+            max_blocked_streams,
+            max_field_section_size,
+            blocked: BTreeMap::new(),
         }
     }
 
-    pub fn table_inserted_count(&self) -> u64 {
-        self.dynamic_table.inserted_count
-    }
-}
-
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-pub enum QPackEncoderStreamError {
-    #[snafu(display("setting dynamic table capacity exceeded maximum allowed"))]
-    SetDynamicTableCapacityExceeded,
-    #[snafu(display("no evictable entry for insertion, cannot insert new entry"))]
-    NoEvictableEntryForInsertion,
-    #[snafu(display("referenced static table entry {index} does not exist"))]
-    ReferencedStaticEntryNotExisted { index: u64 },
-    #[snafu(display("referenced dynamic table entry {index} does not exist"))]
-    ReferencedDynamicEntryNotExisted { index: u64 },
-}
-
-impl H3ConnectionError for QPackEncoderStreamError {
-    fn code(&self) -> Code {
-        Code::QPACK_ENCODER_STREAM_ERROR
-    }
-}
-
-impl DecoderState {
-    pub fn emit(&mut self, instruction: DecoderInstruction) {
-        use DecoderInstruction::*;
-        match (self.pending_instructions.back_mut(), instruction) {
-            // reduce redundant InsertCountIncrement instructions
-            (
-                Some(InsertCountIncrement { increment }),
-                InsertCountIncrement {
-                    increment: new_increment,
-                },
-            ) => {
-                *increment += new_increment;
+    pub(super) fn apply(&mut self, instruction: EncoderInstruction) -> Result<bool, Error> {
+        match instruction {
+            EncoderInstruction::SetCapacity(capacity) => {
+                self.table
+                    .set_capacity(capacity)
+                    .map_err(encoder_table_error)?;
+                Ok(false)
             }
-            // reduce redundant StreamCancellation instructions
-            (
-                Some(StreamCancellation { stream_id }),
-                StreamCancellation {
-                    stream_id: another_stream_id,
-                },
-            ) if stream_id == &another_stream_id => {}
-            (.., instruction) => self.pending_instructions.push_back(instruction),
-        };
+            EncoderInstruction::InsertNameReference {
+                is_static,
+                index,
+                value,
+            } => {
+                let name = if is_static {
+                    Bytes::from_static(
+                        static_table::get_name(index)
+                            .ok_or_else(|| {
+                                encoder_stream_error(
+                                    "QPACK encoder instruction references an unknown static name",
+                                )
+                            })?
+                            .as_bytes(),
+                    )
+                } else {
+                    let absolute = self
+                        .table
+                        .resolve_encoder_relative(index)
+                        .map_err(encoder_table_error)?;
+                    self.table
+                        .get(absolute)
+                        .ok_or_else(|| {
+                            encoder_stream_error(
+                                "QPACK encoder instruction references an evicted dynamic name",
+                            )
+                        })?
+                        .name
+                        .clone()
+                };
+                self.table
+                    .insert_decoder(Field { name, value })
+                    .map_err(encoder_table_error)?;
+                Ok(true)
+            }
+            EncoderInstruction::InsertLiteral { name, value } => {
+                self.table
+                    .insert_decoder(Field { name, value })
+                    .map_err(encoder_table_error)?;
+                Ok(true)
+            }
+            EncoderInstruction::Duplicate(index) => {
+                let absolute = self
+                    .table
+                    .resolve_encoder_relative(index)
+                    .map_err(encoder_table_error)?;
+                let field = self.table.get(absolute).cloned().ok_or_else(|| {
+                    encoder_stream_error("QPACK duplicate instruction references an evicted entry")
+                })?;
+                self.table
+                    .insert_decoder(field)
+                    .map_err(encoder_table_error)?;
+                Ok(true)
+            }
+        }
     }
 
-    pub fn update_known_received_count(&mut self, new_count: u64) {
-        debug_assert!(new_count > self.dynamic_table.known_received_count);
-        if let Some(instruction) = self.pending_instructions.back_mut()
-            && let DecoderInstruction::InsertCountIncrement { increment } = instruction
-        {
-            *increment += new_count - self.dynamic_table.known_received_count;
+    pub(super) fn decode(
+        &mut self,
+        stream_id: StreamId,
+        mut encoded: &[u8],
+    ) -> Result<Decode, Error> {
+        let (wire_insert_count, consumed) = decode_prefixed_integer(encoded, 8)?;
+        encoded = &encoded[consumed..];
+        let sign = encoded
+            .first()
+            .copied()
+            .ok_or_else(|| qpack_error("missing QPACK delta-base prefix"))?
+            & 0x80
+            != 0;
+        let (delta_base, consumed) = decode_prefixed_integer(encoded, 7)?;
+        encoded = &encoded[consumed..];
+
+        let required_insert_count = decode_required_insert_count(
+            wire_insert_count,
+            self.table.max_entries(),
+            self.table.insert_count(),
+        )?;
+        let base = if sign {
+            required_insert_count
+                .checked_sub(delta_base)
+                .and_then(|base| base.checked_sub(1))
+                .ok_or_else(|| qpack_error("QPACK delta base makes the base negative"))?
         } else {
-            self.emit(DecoderInstruction::InsertCountIncrement {
-                increment: new_count - self.dynamic_table.known_received_count,
-            });
-        }
-        self.dynamic_table.known_received_count = new_count;
-    }
-
-    pub fn set_dynamic_table_capacity(
-        &mut self,
-        new_capacity: u64,
-    ) -> Result<(), QPackEncoderStreamError> {
-        if new_capacity > self.settings.qpack_max_table_capacity().into_inner() {
-            return Err(QPackEncoderStreamError::SetDynamicTableCapacityExceeded);
-        }
-        self.dynamic_table.capacity = new_capacity;
-        while self.dynamic_table.size > new_capacity {
-            self.dynamic_table.evict();
-        }
-        Ok(())
-    }
-
-    pub fn insert_with_name_reference(
-        &mut self,
-        is_static: bool,
-        name_index: u64,
-        value: Bytes,
-    ) -> Result<(), QPackEncoderStreamError> {
-        use QPackEncoderStreamError::*;
-        let name = match is_static {
-            true => Bytes::from_static(
-                r#static::get_name(name_index)
-                    .ok_or(ReferencedStaticEntryNotExisted { index: name_index })?
-                    .as_bytes(),
-            ),
-            false => self
-                .dynamic_table
-                .get(name_index)
-                .ok_or(ReferencedDynamicEntryNotExisted { index: name_index })?
-                .name
-                .clone(),
+            required_insert_count
+                .checked_add(delta_base)
+                .ok_or_else(|| qpack_error("QPACK base overflow"))?
         };
 
-        let entry = FieldLine { name, value };
-
-        while self.dynamic_table.size + entry.size() > self.dynamic_table.capacity {
-            if self.dynamic_table.is_empty() {
-                return Err(NoEvictableEntryForInsertion);
-            }
-            self.dynamic_table.evict();
-        }
-        self.dynamic_table.index(entry);
-        if self.dynamic_table.inserted_count > self.dynamic_table.known_received_count {
-            self.update_known_received_count(self.dynamic_table.inserted_count);
-        }
-        Ok(())
-    }
-
-    pub fn insert_with_literal_name(
-        &mut self,
-        name: Bytes,
-        value: Bytes,
-    ) -> Result<(), QPackEncoderStreamError> {
-        use QPackEncoderStreamError::*;
-        let entry = FieldLine { name, value };
-        while self.dynamic_table.size + entry.size() > self.dynamic_table.capacity {
-            if self.dynamic_table.is_empty() {
-                return Err(NoEvictableEntryForInsertion);
-            }
-            self.dynamic_table.evict();
-        }
-        self.dynamic_table.index(entry);
-        if self.dynamic_table.inserted_count > self.dynamic_table.known_received_count {
-            self.update_known_received_count(self.dynamic_table.inserted_count);
-        }
-        Ok(())
-    }
-
-    pub fn duplicate(&mut self, index: u64) -> Result<(), QPackEncoderStreamError> {
-        use QPackEncoderStreamError::*;
-        let duplicated_entry = self
-            .dynamic_table
-            .get(index)
-            .ok_or(ReferencedDynamicEntryNotExisted { index })?
-            .clone();
-        while self.dynamic_table.size + duplicated_entry.size() > self.dynamic_table.capacity {
-            if self.dynamic_table.is_empty() {
-                return Err(NoEvictableEntryForInsertion);
-            }
-            self.dynamic_table.evict();
-        }
-        self.dynamic_table.index(duplicated_entry);
-        if self.dynamic_table.inserted_count > self.dynamic_table.known_received_count {
-            self.update_known_received_count(self.dynamic_table.inserted_count);
-        }
-        Ok(())
-    }
-
-    pub fn decompress(
-        &self,
-        representation: &FieldLineRepresentation,
-        base: u64,
-    ) -> Result<FieldLine, InvalidDynamicTableReference> {
-        decompression_field_line_representation(representation, base, &self.dynamic_table)
-    }
-}
-
-pub struct Decoder<Ds, Es> {
-    pub(crate) state: SyncMutex<DecoderState>,
-    pub(crate) decoder_stream: AsyncMutex<Feed<Ds, DecoderInstruction>>,
-    pub(crate) encoder_stream: AsyncMutex<Es>,
-}
-
-impl<Ds, Es> Decoder<Ds, Es> {
-    pub(crate) fn emit(&self, instruction: DecoderInstruction) {
-        self.state
-            .lock()
-            .expect("lock is not poisoned")
-            .emit(instruction);
-    }
-
-    pub(crate) fn known_received_count(&self) -> u64 {
-        self.state
-            .lock()
-            .expect("lock is not poisoned")
-            .dynamic_table
-            .known_received_count
-    }
-}
-
-pub fn decompression_field_line_representation(
-    representation: &FieldLineRepresentation,
-    base: u64,
-    dynamic_table: &DynamicTable,
-) -> Result<FieldLine, InvalidDynamicTableReference> {
-    use InvalidDynamicTableReference::*;
-    // RFC 9204 §3.2.5: relative_index → absolute = base - relative - 1
-    let resolve_relative = |index| {
-        base.checked_sub(index)
-            .ok_or(IndexOverflow)?
-            .checked_sub(1)
-            .ok_or(IndexOverflow)
-    };
-    // RFC 9204 §3.2.6: post_base_index → absolute = base + post_base
-    let resolve_post_base = |index| base.checked_add(index).ok_or(IndexOverflow);
-    match representation {
-        FieldLineRepresentation::IndexedFieldLine { is_static, index } => match is_static {
-            true => r#static::get(*index)
-                .map(|(name, value)| FieldLine {
-                    name: Bytes::from_static(name.as_bytes()),
-                    value: Bytes::from_static(value.as_bytes()),
-                })
-                .ok_or(ReferencedStaticEntryNotExisted { index: *index }),
-            false => dynamic_table
-                .get(resolve_relative(*index)?)
-                .cloned()
-                .ok_or(ReferencedDynamicEntryNotExisted { index: *index }),
-        },
-        FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex { index } => {
-            let index = resolve_post_base(*index)?;
-            dynamic_table
-                .get(index)
-                .cloned()
-                .ok_or(ReferencedDynamicEntryNotExisted { index })
-        }
-        FieldLineRepresentation::LiteralFieldLineWithNameReference {
-            is_static,
-            name_index,
-            value,
-            ..
-        } => match is_static {
-            true => Ok(FieldLine {
-                name: Bytes::from_static(
-                    r#static::get_name(*name_index)
-                        .ok_or(ReferencedStaticEntryNotExisted { index: *name_index })?
-                        .as_bytes(),
-                ),
-                value: value.clone(),
-            }),
-            false => {
-                let name_index = resolve_relative(*name_index)?;
-                let name = &dynamic_table
-                    .get(name_index)
-                    .ok_or(ReferencedDynamicEntryNotExisted { index: name_index })?
-                    .name;
-                Ok(FieldLine {
-                    name: name.clone(),
-                    value: value.clone(),
-                })
-            }
-        },
-        FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
-            name_index,
-            value,
-            ..
-        } => {
-            let name_index = resolve_post_base(*name_index)?;
-            let name = &dynamic_table
-                .get(name_index)
-                .ok_or(ReferencedDynamicEntryNotExisted { index: name_index })?
-                .name;
-            Ok(FieldLine {
-                name: name.clone(),
-                value: value.clone(),
-            })
-        }
-        FieldLineRepresentation::LiteralFieldLineWithLiteralName { name, value, .. } => {
-            Ok(FieldLine {
-                name: name.clone(),
-                value: value.clone(),
-            })
-        }
-    }
-}
-
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-pub enum InvalidDynamicTableReference {
-    #[snafu(display("reference index overflow"))]
-    IndexOverflow,
-    #[snafu(display("referenced static table entry {index} does not exist"))]
-    ReferencedStaticEntryNotExisted { index: u64 },
-    #[snafu(display("referenced dynamic table entry {index} does not exist"))]
-    ReferencedDynamicEntryNotExisted { index: u64 },
-}
-
-impl H3ConnectionError for InvalidDynamicTableReference {
-    fn code(&self) -> Code {
-        Code::QPACK_DECOMPRESSION_FAILED
-    }
-}
-
-impl<Ds, Es> Decoder<Ds, Es>
-where
-    Ds: Sink<DecoderInstruction, Error = StreamError> + Unpin + Send,
-    Es: Stream<Item = Result<EncoderInstruction, StreamError>> + Unpin + Send,
-{
-    pub fn new(settings: Arc<Settings>, decoder_stream: Ds, encoder_stream: Es) -> Self {
-        Self {
-            state: SyncMutex::new(DecoderState::new(settings)),
-            decoder_stream: AsyncMutex::new(Feed::new(decoder_stream)),
-            encoder_stream: AsyncMutex::new(encoder_stream),
-        }
-    }
-
-    pub async fn decode(
-        &self,
-        header_frame: impl AsyncBufRead + GetStreamId + Send,
-    ) -> Result<FieldSection, StreamError> {
-        let mut header_frame = pin!(header_frame);
-        let stream_id = header_frame.stream_id().await?.into_inner();
-        let prefix: EncodedFieldSectionPrefix = header_frame.as_mut().decode_one().await?;
-
-        // RFC 9204 §4.5.1.1: Decode the wire-encoded insert count to true RIC
-        let (max_table_capacity, total_inserts) = {
-            let state = self.state.lock().expect("lock is not poisoned");
-            (
-                state.settings.qpack_max_table_capacity().into_inner(),
-                state.dynamic_table.inserted_count,
-            )
-        };
-        let required_insert_count = EncodedFieldSectionPrefix::decode_ric(
-            prefix.encoded_insert_count,
-            max_table_capacity,
-            total_inserts,
-        )
-        .map_err(|e| StreamError::from(QpackDecompressionFailed::Decode { source: e }))?;
-
-        // RFC 9204 §4.5.1.2: Resolve the true base
-        let base = EncodedFieldSectionPrefix::resolve_base(
-            required_insert_count,
-            prefix.sign,
-            prefix.delta_base,
-        )
-        .map_err(|e| StreamError::from(QpackDecompressionFailed::Decode { source: e }))?;
-
-        self.receive_instruction_until(required_insert_count)
-            .await?;
-
-        let max_field_section_size = self
-            .state
-            .lock()
-            .expect("lock is not poisoned")
-            .settings
-            .max_field_section_size()
-            .map(|v| v.into_inner());
-
-        let representations =
-            header_frame.into_decode_stream::<FieldLineRepresentation, StreamError>();
-        let mut accumulated_size: u64 = 0;
-        let field_lines = representations.map(|representation| {
-            representation.and_then(|representation| {
-                let field_line = decompression_field_line_representation(
-                    &representation,
-                    base,
-                    &self
-                        .state
-                        .lock()
-                        .expect("lock is not poisoned")
-                        .dynamic_table,
-                )
-                .map_err(StreamError::from)?;
-
-                accumulated_size += field_line.size();
-                if let Some(limit) = max_field_section_size.filter(|&l| accumulated_size > l) {
-                    return Err(StreamError::from(
-                        crate::error::H3ExcessiveFieldSectionSize {
-                            actual: accumulated_size,
-                            limit,
-                        },
+        if required_insert_count > self.table.insert_count() {
+            if !self.blocked.contains_key(&stream_id) {
+                if self.blocked.len() as u64 >= self.max_blocked_streams {
+                    return Err(Error::connection_protocol(
+                        Code::QPACK_DECOMPRESSION_FAILED,
+                        "peer exceeded SETTINGS_QPACK_BLOCKED_STREAMS",
                     ));
                 }
-
-                Ok(field_line)
-            })
-        });
-        let header_section = field_lines.decode().await?;
-
-        if required_insert_count > 0 {
-            self.emit(DecoderInstruction::SectionAcknowledgment { stream_id });
-        }
-        _ = self.flush_instructions().await;
-
-        Ok(header_section)
-    }
-
-    fn pending_instructions(&self) -> impl Iterator<Item = DecoderInstruction> {
-        std::iter::from_fn(move || {
-            self.state
-                .lock()
-                .expect("lock is not poisoned")
-                .pending_instructions
-                .pop_front()
-        })
-    }
-
-    pub async fn flush_instructions(&self) -> Result<(), StreamError> {
-        let mut decoder_stream = self.decoder_stream.lock().await;
-        let mut decoder_stream = Pin::new(decoder_stream.deref_mut());
-        let instructions = stream::iter(self.pending_instructions());
-        decoder_stream.as_mut().send_all(instructions).await?;
-        decoder_stream.as_mut().flush().await?;
-        Ok(())
-    }
-
-    pub async fn receive_instruction_until(
-        &self,
-        known_received_count: u64,
-    ) -> Result<(), StreamError> {
-        loop {
-            if self.known_received_count() >= known_received_count {
-                return Ok(());
+                self.blocked.insert(stream_id, required_insert_count);
             }
-            let instruction = {
-                let mut encoder_stream = self.encoder_stream.lock().await;
-                if self.known_received_count() >= known_received_count {
-                    return Ok(());
+            return Ok(Decode::Blocked);
+        }
+        self.blocked.remove(&stream_id);
+
+        let mut fields = Vec::new();
+        let mut largest_reference = None;
+        let mut decoded_size = 0u64;
+        while let Some(first) = encoded.first().copied() {
+            let field = if first & 0x80 != 0 {
+                let is_static = first & 0x40 != 0;
+                let (index, consumed) = decode_prefixed_integer(encoded, 6)?;
+                encoded = &encoded[consumed..];
+                if is_static {
+                    let (name, value) = static_table::get(index).ok_or_else(|| {
+                        qpack_error(format!("unknown QPACK static index {index}"))
+                    })?;
+                    Field {
+                        name: Bytes::from_static(name.as_bytes()),
+                        value: Bytes::from_static(value.as_bytes()),
+                    }
+                } else {
+                    let absolute = resolve_relative(base, index)?;
+                    self.dynamic_field(absolute, required_insert_count, &mut largest_reference)?
                 }
-                let instruction = encoder_stream.next().await;
-                instruction.ok_or(H3CriticalStreamClosed::QPackEncoder)??
+            } else if first & 0xf0 == 0x10 {
+                let (index, consumed) = decode_prefixed_integer(encoded, 4)?;
+                encoded = &encoded[consumed..];
+                let absolute = base
+                    .checked_add(index)
+                    .ok_or_else(|| qpack_error("QPACK post-base index overflow"))?;
+                self.dynamic_field(absolute, required_insert_count, &mut largest_reference)?
+            } else if first & 0xc0 == 0x40 {
+                let is_static = first & 0x10 != 0;
+                let (name_index, consumed) = decode_prefixed_integer(encoded, 4)?;
+                encoded = &encoded[consumed..];
+                let (value, consumed) = decode_string(encoded, 7)?;
+                encoded = &encoded[consumed..];
+                let name = if is_static {
+                    Bytes::from_static(
+                        static_table::get_name(name_index)
+                            .ok_or_else(|| {
+                                qpack_error(format!("unknown QPACK static name index {name_index}"))
+                            })?
+                            .as_bytes(),
+                    )
+                } else {
+                    let absolute = resolve_relative(base, name_index)?;
+                    self.dynamic_name(absolute, required_insert_count, &mut largest_reference)?
+                };
+                Field { name, value }
+            } else if first & 0xf0 == 0 {
+                let (name_index, consumed) = decode_prefixed_integer(encoded, 3)?;
+                encoded = &encoded[consumed..];
+                let (value, consumed) = decode_string(encoded, 7)?;
+                encoded = &encoded[consumed..];
+                let absolute = base
+                    .checked_add(name_index)
+                    .ok_or_else(|| qpack_error("QPACK post-base name index overflow"))?;
+                let name =
+                    self.dynamic_name(absolute, required_insert_count, &mut largest_reference)?;
+                Field { name, value }
+            } else if first & 0xe0 == 0x20 {
+                let name_huffman = first & 0x08 != 0;
+                let (name_len, consumed) = decode_prefixed_integer(encoded, 3)?;
+                encoded = &encoded[consumed..];
+                let name_len = usize::try_from(name_len)
+                    .map_err(|_| qpack_error("QPACK field name is too large"))?;
+                if encoded.len() < name_len {
+                    return Err(qpack_error("incomplete QPACK field name"));
+                }
+                let name = super::decode_octets(&encoded[..name_len], name_huffman)?;
+                encoded = &encoded[name_len..];
+                let (value, consumed) = decode_string(encoded, 7)?;
+                encoded = &encoded[consumed..];
+                Field { name, value }
+            } else {
+                return Err(qpack_error("unknown QPACK field-line representation"));
             };
 
-            let mut state = self.state.lock().expect("lock is not poisoned");
-            match instruction {
-                EncoderInstruction::SetDynamicTableCapacity { capacity } => {
-                    state.set_dynamic_table_capacity(capacity)?
-                }
-                EncoderInstruction::InsertWithNameReference {
-                    is_static,
-                    name_index,
-                    value,
-                    ..
-                } => {
-                    // RFC 9204 §3.2.4: Encoder instruction relative index →
-                    // absolute = inserted_count - relative - 1
-                    let abs_index = if is_static {
-                        name_index
-                    } else {
-                        state.dynamic_table.inserted_count - name_index - 1
-                    };
-                    state.insert_with_name_reference(is_static, abs_index, value)?
-                }
-                EncoderInstruction::InsertWithLiteralName { name, value, .. } => {
-                    state.insert_with_literal_name(name, value)?
-                }
-                EncoderInstruction::Duplicate { index } => {
-                    // RFC 9204 §3.2.4: Encoder instruction relative index →
-                    // absolute = inserted_count - relative - 1
-                    let abs_index = state.dynamic_table.inserted_count - index - 1;
-                    state.duplicate(abs_index)?
-                }
+            decoded_size = decoded_size
+                .checked_add(field.name.len() as u64 + field.value.len() as u64 + 32)
+                .ok_or_else(|| qpack_error("decoded QPACK field section size overflow"))?;
+            if self
+                .max_field_section_size
+                .is_some_and(|limit| decoded_size > limit)
+            {
+                return Err(Error::stream(
+                    Some(Code::H3_EXCESSIVE_LOAD),
+                    "decoded field section exceeds SETTINGS_MAX_FIELD_SECTION_SIZE",
+                ));
             }
+            fields.push(field);
         }
-    }
-}
 
-pin_project_lite::pin_project! {
-    /// A QPACK-aware message read stream wrapper that emits stream cancellation
-    /// instructions when reset is received or STOP_SENDING is called.
-    pub struct QPackMessageStreamReader<S: ReadStream, D> {
-        stream_id: VarInt,
-        stream_cancellation_emitted: bool,
-        decoder: Arc<D>,
-        #[pin]
-        stream: S,
-    }
-
-}
-
-impl<S: ReadStream, D> QPackMessageStreamReader<S, D> {
-    pub fn new(stream_id: VarInt, stream: S, decoder: Arc<D>) -> Self {
-        Self {
-            stream_id,
-            stream_cancellation_emitted: false,
-            stream,
-            decoder,
+        let actual_required = largest_reference.map_or(0, |absolute| absolute + 1);
+        if actual_required != required_insert_count {
+            return Err(qpack_error(
+                "QPACK Required Insert Count is not the minimum needed by the field section",
+            ));
         }
-    }
-}
 
-impl<S: ReadStream, Ds, Es> StopStream for QPackMessageStreamReader<S, Decoder<Ds, Es>> {
-    fn poll_stop(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        code: VarInt,
-    ) -> Poll<Result<(), quic::StreamError>> {
-        let project = self.project();
-        let poll = project.stream.poll_stop(cx, code);
-        if !*project.stream_cancellation_emitted {
-            project
-                .decoder
-                .emit(DecoderInstruction::StreamCancellation {
-                    stream_id: project.stream_id.into_inner(),
-                });
-            *project.stream_cancellation_emitted = true;
-        }
-        poll
-    }
-}
-
-impl<S: ReadStream, D> GetStreamId for QPackMessageStreamReader<S, D> {
-    fn poll_stream_id(
-        self: Pin<&mut Self>,
-        _cx: &mut Context,
-    ) -> Poll<Result<VarInt, quic::StreamError>> {
-        Poll::Ready(Ok(*self.project().stream_id))
-    }
-}
-
-impl<S: ReadStream, Ds, Es> Stream for QPackMessageStreamReader<S, Decoder<Ds, Es>> {
-    type Item = S::Item;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let project = self.project();
-        let poll = project.stream.poll_next(cx);
-        if matches!(
-            poll,
-            Poll::Ready(Some(Err(quic::StreamError::Reset { .. })))
-        ) && !*project.stream_cancellation_emitted
-        {
-            project
-                .decoder
-                .emit(DecoderInstruction::StreamCancellation {
-                    stream_id: project.stream_id.into_inner(),
-                });
-            *project.stream_cancellation_emitted = true;
-        }
-        poll
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecoderInstruction {
-    /// ``` ignore
-    ///   0   1   2   3   4   5   6   7
-    /// +---+---+---+---+---+---+---+---+
-    /// | 1 |      Stream ID (7+)       |
-    /// +---+---------------------------+
-    /// ```
-    SectionAcknowledgment { stream_id: u64 },
-    /// ``` ignore
-    ///   0   1   2   3   4   5   6   7
-    /// +---+---+---+---+---+---+---+---+
-    /// | 0 | 1 |     Stream ID (6+)    |
-    /// +---+---+-----------------------+
-    /// ```
-    StreamCancellation { stream_id: u64 },
-    /// ``` ignore
-    ///   0   1   2   3   4   5   6   7
-    /// +---+---+---+---+---+---+---+---+
-    /// | 0 | 0 |     Increment (6+)    |
-    /// +---+---+-----------------------+
-    /// ```
-    InsertCountIncrement { increment: u64 },
-}
-
-impl<S: AsyncBufRead + Send> DecodeFrom<S> for DecoderInstruction {
-    type Error = StreamError;
-
-    async fn decode_from(stream: S) -> Result<Self, StreamError> {
-        let decode = async move {
-            let mut stream = pin!(stream);
-            let prefix = stream.read_u8().await?;
-            match prefix {
-                // 1xxxxxxx — Section Acknowledgment (7-bit prefix)
-                prefix if prefix & 0b1000_0000 == 0b1000_0000 => {
-                    let stream_id = decode_integer(stream, prefix, 7).await?;
-                    Ok(DecoderInstruction::SectionAcknowledgment { stream_id })
-                }
-                // 01xxxxxx — Stream Cancellation (6-bit prefix)
-                prefix if prefix & 0b1100_0000 == 0b0100_0000 => {
-                    let stream_id = decode_integer(stream, prefix, 6).await?;
-                    Ok(DecoderInstruction::StreamCancellation { stream_id })
-                }
-                // 00xxxxxx — Insert Count Increment (6-bit prefix)
-                _ => {
-                    let increment = decode_integer(stream, prefix, 6).await?;
-                    Ok(DecoderInstruction::InsertCountIncrement { increment })
-                }
-            }
-        };
-        decode.await.map_err(|error: StreamDecodeError| {
-            error
-                .escalate_critical_close(|| H3CriticalStreamClosed::QPackDecoder.into())
-                .into_stream_error(|decode_error| {
-                    H3FrameDecodeError {
-                        source: decode_error,
-                    }
-                    .into()
-                })
+        Ok(Decode::Ready {
+            fields,
+            used_dynamic_table: required_insert_count != 0,
         })
     }
+
+    pub(super) fn cancel(&mut self, stream_id: StreamId) -> bool {
+        self.blocked.remove(&stream_id);
+        self.table.max_capacity() != 0
+    }
+
+    fn dynamic_field(
+        &self,
+        absolute: u64,
+        required_insert_count: u64,
+        largest_reference: &mut Option<u64>,
+    ) -> Result<Field, Error> {
+        self.track_dynamic(absolute, required_insert_count, largest_reference)?;
+        self.table
+            .get(absolute)
+            .cloned()
+            .ok_or_else(|| qpack_error("QPACK field references an evicted dynamic entry"))
+    }
+
+    fn dynamic_name(
+        &self,
+        absolute: u64,
+        required_insert_count: u64,
+        largest_reference: &mut Option<u64>,
+    ) -> Result<Bytes, Error> {
+        self.track_dynamic(absolute, required_insert_count, largest_reference)?;
+        self.table
+            .get(absolute)
+            .map(|field| field.name.clone())
+            .ok_or_else(|| qpack_error("QPACK field references an evicted dynamic name"))
+    }
+
+    fn track_dynamic(
+        &self,
+        absolute: u64,
+        required_insert_count: u64,
+        largest_reference: &mut Option<u64>,
+    ) -> Result<(), Error> {
+        if absolute >= required_insert_count {
+            return Err(qpack_error(
+                "QPACK dynamic reference is not below Required Insert Count",
+            ));
+        }
+        *largest_reference =
+            Some(largest_reference.map_or(absolute, |current| current.max(absolute)));
+        Ok(())
+    }
 }
 
-impl<S> EncodeInto<S> for DecoderInstruction
-where
-    S: AsyncWrite + Send,
-{
-    type Output = ();
+fn resolve_relative(base: u64, relative: u64) -> Result<u64, Error> {
+    base.checked_sub(relative)
+        .and_then(|absolute| absolute.checked_sub(1))
+        .ok_or_else(|| qpack_error("QPACK relative index precedes the dynamic table"))
+}
 
-    type Error = StreamError;
+fn decode_required_insert_count(
+    encoded: u64,
+    max_entries: u64,
+    total_inserts: u64,
+) -> Result<u64, Error> {
+    if encoded == 0 {
+        return Ok(0);
+    }
+    let full_range = max_entries
+        .checked_mul(2)
+        .filter(|value| *value != 0)
+        .ok_or_else(|| qpack_error("non-zero QPACK insert count with zero table capacity"))?;
+    if encoded > full_range {
+        return Err(qpack_error(
+            "encoded QPACK insert count exceeds its full range",
+        ));
+    }
+    let max_value = total_inserts
+        .checked_add(max_entries)
+        .ok_or_else(|| qpack_error("QPACK insert count overflow"))?;
+    let max_wrapped = (max_value / full_range) * full_range;
+    let mut required = max_wrapped
+        .checked_add(encoded - 1)
+        .ok_or_else(|| qpack_error("QPACK required insert count overflow"))?;
+    if required > max_value {
+        if required <= full_range {
+            return Err(qpack_error("invalid wrapped QPACK insert count"));
+        }
+        required -= full_range;
+    }
+    if required == 0 {
+        return Err(qpack_error(
+            "QPACK insert count zero was not encoded as zero",
+        ));
+    }
+    Ok(required)
+}
 
-    async fn encode_into(self, stream: S) -> Result<Self::Output, Self::Error> {
-        let inst = self;
-        let encode = async move {
-            let mut stream = pin!(stream);
-            match inst {
-                DecoderInstruction::SectionAcknowledgment { stream_id } => {
-                    let prefix = 0b1000_0000;
-                    encode_integer(stream.as_mut(), prefix, 7, stream_id).await?;
-                    Ok(())
-                }
-                DecoderInstruction::StreamCancellation { stream_id } => {
-                    let prefix = 0b0100_0000;
-                    encode_integer(stream.as_mut(), prefix, 6, stream_id).await?;
-                    Ok(())
-                }
-                DecoderInstruction::InsertCountIncrement { increment } => {
-                    let prefix = 0b0000_0000;
-                    encode_integer(stream.as_mut(), prefix, 6, increment).await?;
-                    Ok(())
-                }
-            }
-        };
-        encode
-            .await
-            .map_err(|error: quic::StreamError| match error {
-                quic::StreamError::Connection { .. } => error.into(),
-                quic::StreamError::Reset { .. } => H3CriticalStreamClosed::QPackEncoder.into(),
-            })
+fn encoder_stream_error(message: &'static str) -> Error {
+    Error::connection_protocol(Code::QPACK_ENCODER_STREAM_ERROR, message)
+}
+
+fn encoder_table_error(error: TableError) -> Error {
+    match error {
+        TableError::CapacityExceeded => encoder_stream_error(
+            "QPACK encoder set a dynamic table capacity above the advertised limit",
+        ),
+        TableError::EntryTooLarge => {
+            encoder_stream_error("QPACK encoder inserted an entry larger than table capacity")
+        }
+        TableError::InvalidIndex => {
+            encoder_stream_error("QPACK encoder instruction has an invalid dynamic index")
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::VecDeque,
-        io::Cursor,
-        pin::Pin,
-        sync::{Arc, Mutex},
-        task::{Context, Poll},
-    };
+    use super::*;
 
-    use bytes::{Buf, Bytes};
-    use futures::{Sink, StreamExt, stream};
-    use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
-
-    use super::{
-        Decoder, DecoderInstruction, DecoderState, InvalidDynamicTableReference,
-        QPackEncoderStreamError, QPackMessageStreamReader, decompression_field_line_representation,
-    };
-    use crate::{
-        buflist::BufList,
-        codec::{DecodeFrom, EncodeInto},
-        connection::StreamError,
-        dhttp::settings::Settings,
-        error::{Code, H3ConnectionError},
-        qpack::{
-            dynamic::DynamicTable,
-            encoder::EncoderInstruction,
-            field::{EncodedFieldSectionPrefix, FieldLine, FieldLineRepresentation},
-            settings::QpackMaxTableCapacity,
-            r#static,
-        },
-        quic::{self, GetStreamId, StopStream, StopStreamExt},
-        varint::VarInt,
-    };
-
-    fn test_settings(capacity: u32) -> Arc<Settings> {
-        let mut settings = Settings::default();
-        settings.set(QpackMaxTableCapacity::setting(VarInt::from_u32(capacity)));
-        Arc::new(settings)
-    }
-
-    fn test_settings_with_max_field_section_size(capacity: u32, max_size: u32) -> Arc<Settings> {
-        let mut settings = Settings::default();
-        settings.set(QpackMaxTableCapacity::setting(VarInt::from_u32(capacity)));
-        settings.set(crate::dhttp::settings::MaxFieldSectionSize::setting(
-            VarInt::from_u32(max_size),
-        ));
-        Arc::new(settings)
-    }
-
-    fn assert_connection_h3_code(error: StreamError, expected: Code) {
-        match error {
-            StreamError::Connection {
-                source: crate::connection::ConnectionError::H3 { source },
-            } => assert_eq!(source.code(), expected),
-            error => panic!("unexpected error: {error:?}"),
-        }
-    }
-
-    async fn encode_decode_roundtrip(
-        instruction: DecoderInstruction,
-    ) -> Result<DecoderInstruction, crate::connection::StreamError> {
-        let mut encoded = Vec::new();
-        instruction.encode_into(Cursor::new(&mut encoded)).await?;
-        DecoderInstruction::decode_from(Cursor::new(encoded)).await
-    }
-
-    fn dynamic_table_with_entries(entries: &[FieldLine]) -> DynamicTable {
-        let mut table = DynamicTable::new();
-        table.capacity = 512;
-        for entry in entries {
-            table.index(entry.clone());
-        }
-        table.known_received_count = table.inserted_count;
-        table
-    }
-
-    #[derive(Clone, Default)]
-    struct RecordingDecoderSink {
-        instructions: Arc<Mutex<Vec<DecoderInstruction>>>,
-    }
-
-    type RecordedDecoderInstructions = Arc<Mutex<Vec<DecoderInstruction>>>;
-    type TestEncoderStream =
-        stream::Iter<std::vec::IntoIter<Result<EncoderInstruction, StreamError>>>;
-    type TestDecoder = Decoder<RecordingDecoderSink, TestEncoderStream>;
-
-    impl Sink<DecoderInstruction> for RecordingDecoderSink {
-        type Error = StreamError;
-
-        fn poll_ready(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn start_send(self: Pin<&mut Self>, item: DecoderInstruction) -> Result<(), Self::Error> {
-            self.instructions
-                .lock()
-                .expect("lock is not poisoned")
-                .push(item);
-            Ok(())
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    fn test_decoder(
-        settings: Arc<Settings>,
-        instructions: Vec<Result<EncoderInstruction, StreamError>>,
-    ) -> (TestDecoder, RecordedDecoderInstructions) {
-        let sink = RecordingDecoderSink::default();
-        let sent = sink.instructions.clone();
-        (
-            Decoder::new(settings, sink, stream::iter(instructions)),
-            sent,
-        )
-    }
-
-    pin_project_lite::pin_project! {
-        struct TestHeaderFrame {
-            stream_id: VarInt,
-            #[pin]
-            payload: Cursor<Vec<u8>>,
-        }
-    }
-
-    impl AsyncRead for TestHeaderFrame {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            self.project().payload.poll_read(cx, buf)
-        }
-    }
-
-    impl AsyncBufRead for TestHeaderFrame {
-        fn poll_fill_buf(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<&[u8]>> {
-            self.project().payload.poll_fill_buf(cx)
-        }
-
-        fn consume(self: Pin<&mut Self>, amt: usize) {
-            self.project().payload.consume(amt);
-        }
-    }
-
-    impl GetStreamId for TestHeaderFrame {
-        fn poll_stream_id(
-            self: Pin<&mut Self>,
-            _cx: &mut Context,
-        ) -> Poll<Result<VarInt, quic::StreamError>> {
-            let this = self.project();
-            Poll::Ready(Ok(*this.stream_id))
-        }
-    }
-
-    async fn encode_header_payload(
-        prefix: EncodedFieldSectionPrefix,
-        representations: Vec<FieldLineRepresentation>,
-    ) -> Vec<u8> {
-        let mut payload = BufList::new();
-        prefix
-            .encode_into(&mut payload)
-            .await
-            .expect("prefix should encode");
-        for representation in representations {
-            representation
-                .encode_into(&mut payload)
-                .await
-                .expect("field line representation should encode");
-        }
-        payload.copy_to_bytes(payload.remaining()).to_vec()
-    }
-
-    struct TestReadStream {
-        stream_id: VarInt,
-        stop_codes: Arc<Mutex<Vec<VarInt>>>,
-        items: VecDeque<Result<Bytes, quic::StreamError>>,
-    }
-
-    impl futures::Stream for TestReadStream {
-        type Item = Result<Bytes, quic::StreamError>;
-
-        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Poll::Ready(self.items.pop_front())
-        }
-    }
-
-    struct PendingStopReadStream {
-        stop_codes: Arc<Mutex<Vec<VarInt>>>,
-    }
-
-    struct ResetWithoutStreamIdReadStream {
-        items: VecDeque<Result<Bytes, quic::StreamError>>,
-    }
-
-    impl futures::Stream for PendingStopReadStream {
-        type Item = Result<Bytes, quic::StreamError>;
-
-        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Poll::Pending
-        }
-    }
-
-    impl futures::Stream for ResetWithoutStreamIdReadStream {
-        type Item = Result<Bytes, quic::StreamError>;
-
-        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Poll::Ready(self.items.pop_front())
-        }
-    }
-
-    impl GetStreamId for PendingStopReadStream {
-        fn poll_stream_id(
-            self: Pin<&mut Self>,
-            _cx: &mut Context,
-        ) -> Poll<Result<VarInt, quic::StreamError>> {
-            panic!("message stream reader stop should use constructor stream id")
-        }
-    }
-
-    impl GetStreamId for ResetWithoutStreamIdReadStream {
-        fn poll_stream_id(
-            self: Pin<&mut Self>,
-            _cx: &mut Context,
-        ) -> Poll<Result<VarInt, quic::StreamError>> {
-            panic!("message stream reader reset should use constructor stream id")
-        }
-    }
-
-    impl StopStream for PendingStopReadStream {
-        fn poll_stop(
-            self: Pin<&mut Self>,
-            _cx: &mut Context,
-            code: VarInt,
-        ) -> Poll<Result<(), quic::StreamError>> {
-            self.stop_codes
-                .lock()
-                .expect("lock is not poisoned")
-                .push(code);
-            Poll::Pending
-        }
-    }
-
-    impl StopStream for ResetWithoutStreamIdReadStream {
-        fn poll_stop(
-            self: Pin<&mut Self>,
-            _cx: &mut Context,
-            _code: VarInt,
-        ) -> Poll<Result<(), quic::StreamError>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    impl GetStreamId for TestReadStream {
-        fn poll_stream_id(
-            self: Pin<&mut Self>,
-            _cx: &mut Context,
-        ) -> Poll<Result<VarInt, quic::StreamError>> {
-            Poll::Ready(Ok(self.stream_id))
-        }
-    }
-
-    impl StopStream for TestReadStream {
-        fn poll_stop(
-            self: Pin<&mut Self>,
-            _cx: &mut Context,
-            code: VarInt,
-        ) -> Poll<Result<(), quic::StreamError>> {
-            self.stop_codes
-                .lock()
-                .expect("lock is not poisoned")
-                .push(code);
-            Poll::Ready(Ok(()))
+    fn insert(name: &'static [u8], value: &'static [u8]) -> EncoderInstruction {
+        EncoderInstruction::InsertLiteral {
+            name: Bytes::from_static(name),
+            value: Bytes::from_static(value),
         }
     }
 
     #[test]
-    fn decoder_state_default_construction() {
-        let state = DecoderState::new(test_settings(0));
-        assert_eq!(state.dynamic_table.capacity, 0);
-        assert_eq!(state.dynamic_table.inserted_count, 0);
-        assert_eq!(state.dynamic_table.known_received_count, 0);
-        assert!(state.pending_instructions.is_empty());
-    }
-
-    #[test]
-    fn decoder_error_types_report_qpack_error_codes() {
-        let encoder_stream_errors = [
-            QPackEncoderStreamError::SetDynamicTableCapacityExceeded,
-            QPackEncoderStreamError::NoEvictableEntryForInsertion,
-            QPackEncoderStreamError::ReferencedStaticEntryNotExisted { index: 7 },
-            QPackEncoderStreamError::ReferencedDynamicEntryNotExisted { index: 11 },
-        ];
-
-        for error in encoder_stream_errors {
-            assert_eq!(error.code(), Code::QPACK_ENCODER_STREAM_ERROR);
-        }
-
-        let invalid_references = [
-            InvalidDynamicTableReference::IndexOverflow,
-            InvalidDynamicTableReference::ReferencedStaticEntryNotExisted { index: 7 },
-            InvalidDynamicTableReference::ReferencedDynamicEntryNotExisted { index: 11 },
-        ];
-
-        for error in invalid_references {
-            assert_eq!(error.code(), Code::QPACK_DECOMPRESSION_FAILED);
-        }
-    }
-
-    #[test]
-    fn decoder_wrapper_emit_and_known_received_count_delegate_to_state() {
-        let (decoder, _) = test_decoder(test_settings(128), Vec::new());
-
-        decoder.emit(DecoderInstruction::StreamCancellation { stream_id: 9 });
-
-        assert_eq!(decoder.known_received_count(), 0);
-        let state = decoder.state.lock().expect("lock is not poisoned");
-        assert_eq!(
-            state.pending_instructions.front(),
-            Some(&DecoderInstruction::StreamCancellation { stream_id: 9 })
-        );
-    }
-
-    #[test]
-    fn emit_insert_count_increment() {
-        let mut state = DecoderState::new(test_settings(256));
-        state.emit(DecoderInstruction::InsertCountIncrement { increment: 1 });
-        assert_eq!(state.pending_instructions.len(), 1);
-        assert_eq!(
-            state.pending_instructions[0],
-            DecoderInstruction::InsertCountIncrement { increment: 1 }
-        );
-    }
-
-    #[test]
-    fn emit_merges_consecutive_insert_count_increments() {
-        let mut state = DecoderState::new(test_settings(256));
-        state.emit(DecoderInstruction::InsertCountIncrement { increment: 1 });
-        state.emit(DecoderInstruction::InsertCountIncrement { increment: 3 });
-        assert_eq!(state.pending_instructions.len(), 1);
-        assert_eq!(
-            state.pending_instructions[0],
-            DecoderInstruction::InsertCountIncrement { increment: 4 }
-        );
-    }
-
-    #[test]
-    fn emit_deduplicates_stream_cancellation() {
-        let mut state = DecoderState::new(test_settings(256));
-        state.emit(DecoderInstruction::StreamCancellation { stream_id: 42 });
-        state.emit(DecoderInstruction::StreamCancellation { stream_id: 42 });
-        assert_eq!(state.pending_instructions.len(), 1);
-    }
-
-    #[test]
-    fn emit_does_not_deduplicate_different_stream_cancellations() {
-        let mut state = DecoderState::new(test_settings(256));
-        state.emit(DecoderInstruction::StreamCancellation { stream_id: 1 });
-        state.emit(DecoderInstruction::StreamCancellation { stream_id: 2 });
-        assert_eq!(state.pending_instructions.len(), 2);
-    }
-
-    #[test]
-    fn emit_section_acknowledgment() {
-        let mut state = DecoderState::new(test_settings(256));
-        state.emit(DecoderInstruction::SectionAcknowledgment { stream_id: 10 });
-        assert_eq!(state.pending_instructions.len(), 1);
-        assert_eq!(
-            state.pending_instructions[0],
-            DecoderInstruction::SectionAcknowledgment { stream_id: 10 }
-        );
-    }
-
-    #[tokio::test]
-    async fn decoder_instruction_roundtrip_all_variants() {
-        let instructions = [
-            DecoderInstruction::SectionAcknowledgment { stream_id: 7 },
-            DecoderInstruction::StreamCancellation { stream_id: 11 },
-            DecoderInstruction::InsertCountIncrement { increment: 5 },
-        ];
-
-        for instruction in instructions {
-            let decoded = encode_decode_roundtrip(instruction)
-                .await
-                .expect("instruction should roundtrip");
-            assert_eq!(decoded, instruction);
-        }
-    }
-
-    #[test]
-    fn set_dynamic_table_capacity_within_limit() {
-        let mut state = DecoderState::new(test_settings(256));
-        assert!(state.set_dynamic_table_capacity(128).is_ok());
-        assert_eq!(state.dynamic_table.capacity, 128);
-    }
-
-    #[test]
-    fn set_dynamic_table_capacity_exceeds_max() {
-        let mut state = DecoderState::new(test_settings(256));
-        assert!(state.set_dynamic_table_capacity(512).is_err());
-    }
-
-    #[test]
-    fn update_known_received_count_merges_pending_increment() {
-        let mut state = DecoderState::new(test_settings(256));
-
-        state.update_known_received_count(1);
-        state.update_known_received_count(3);
-
-        assert_eq!(state.dynamic_table.known_received_count, 3);
-        assert_eq!(state.pending_instructions.len(), 1);
-        assert_eq!(
-            state.pending_instructions[0],
-            DecoderInstruction::InsertCountIncrement { increment: 3 }
-        );
-    }
-
-    #[test]
-    fn set_dynamic_table_capacity_evicts_entries_until_within_limit() {
-        let mut state = DecoderState::new(test_settings(128));
-        state.set_dynamic_table_capacity(128).unwrap();
-        state
-            .insert_with_literal_name(
-                Bytes::from_static(b"header-1"),
-                Bytes::from_static(b"value-1"),
-            )
-            .unwrap();
-        state
-            .insert_with_literal_name(
-                Bytes::from_static(b"header-2"),
-                Bytes::from_static(b"value-2"),
-            )
-            .unwrap();
-
-        state.set_dynamic_table_capacity(64).unwrap();
-
-        assert_eq!(state.dynamic_table.capacity, 64);
-        assert_eq!(state.dynamic_table.dropped_count, 1);
-        assert_eq!(
-            state
-                .dynamic_table
-                .entries()
-                .map(|(index, entry)| (index, entry.name.clone()))
-                .collect::<Vec<_>>(),
-            vec![(1, Bytes::from_static(b"header-2"))]
-        );
-    }
-
-    #[test]
-    fn insert_with_literal_name() {
-        let mut state = DecoderState::new(test_settings(4096));
-        state.set_dynamic_table_capacity(4096).unwrap();
-        state
-            .insert_with_literal_name(
-                Bytes::from_static(b"x-custom"),
-                Bytes::from_static(b"value"),
-            )
-            .unwrap();
-        assert_eq!(state.dynamic_table.inserted_count, 1);
-        let entry = state.dynamic_table.get(0).unwrap();
-        assert_eq!(&entry.name[..], b"x-custom");
-        assert_eq!(&entry.value[..], b"value");
-    }
-
-    #[test]
-    fn insert_with_static_name_reference() {
-        let mut state = DecoderState::new(test_settings(4096));
-        state.set_dynamic_table_capacity(4096).unwrap();
-        // Index 0 in static table is ":authority"
-        state
-            .insert_with_name_reference(true, 0, Bytes::from_static(b"example.com"))
-            .unwrap();
-        let entry = state.dynamic_table.get(0).unwrap();
-        assert_eq!(&entry.name[..], b":authority");
-        assert_eq!(&entry.value[..], b"example.com");
-    }
-
-    #[test]
-    fn insert_with_dynamic_name_reference_reuses_existing_name() {
-        let mut state = DecoderState::new(test_settings(128));
-        state.set_dynamic_table_capacity(128).unwrap();
-        state
-            .insert_with_literal_name(Bytes::from_static(b"x-name"), Bytes::from_static(b"old"))
-            .expect("seed entry should fit");
-
-        state
-            .insert_with_name_reference(false, 0, Bytes::from_static(b"new"))
-            .expect("dynamic name reference should insert");
-
-        let entry = state
-            .dynamic_table
-            .get(1)
-            .expect("second entry should exist");
-        assert_eq!(entry.name, Bytes::from_static(b"x-name"));
-        assert_eq!(entry.value, Bytes::from_static(b"new"));
-        assert_eq!(state.table_inserted_count(), 2);
-    }
-
-    #[test]
-    fn insert_with_name_reference_evicts_acknowledged_entry_when_needed() {
-        let mut state = DecoderState::new(test_settings(80));
-        state.set_dynamic_table_capacity(80).unwrap();
-        state
-            .insert_with_literal_name(Bytes::from_static(b"x-old"), Bytes::from_static(b"old"))
-            .expect("seed entry should fit");
-
-        state
-            .insert_with_name_reference(true, 1, Bytes::from_static(b"/very/long/path/value"))
-            .expect("new entry should fit after eviction");
-
-        assert_eq!(state.dynamic_table.dropped_count, 1);
-        assert!(state.dynamic_table.get(0).is_none());
-        let entry = state
-            .dynamic_table
-            .get(1)
-            .expect("inserted entry should remain");
-        assert_eq!(entry.name, Bytes::from_static(b":path"));
-        assert_eq!(entry.value, Bytes::from_static(b"/very/long/path/value"));
-    }
-
-    #[test]
-    fn insert_with_literal_name_evicts_acknowledged_entry_when_needed() {
-        let mut state = DecoderState::new(test_settings(80));
-        state.set_dynamic_table_capacity(80).unwrap();
-        state
-            .insert_with_literal_name(Bytes::from_static(b"x-old"), Bytes::from_static(b"old"))
-            .expect("seed entry should fit");
-
-        state
-            .insert_with_literal_name(
-                Bytes::from_static(b"x-new"),
-                Bytes::from_static(b"larger-new-value"),
-            )
-            .expect("new literal should fit after eviction");
-
-        assert_eq!(state.dynamic_table.dropped_count, 1);
-        assert!(state.dynamic_table.get(0).is_none());
-        let entry = state
-            .dynamic_table
-            .get(1)
-            .expect("inserted entry should remain");
-        assert_eq!(entry.name, Bytes::from_static(b"x-new"));
-        assert_eq!(entry.value, Bytes::from_static(b"larger-new-value"));
-    }
-
-    #[test]
-    fn insert_with_name_reference_errors_for_missing_references() {
-        let mut state = DecoderState::new(test_settings(4096));
-        state.set_dynamic_table_capacity(4096).unwrap();
-
-        let missing_static =
-            state.insert_with_name_reference(true, 9999, Bytes::from_static(b"value"));
-        let missing_dynamic =
-            state.insert_with_name_reference(false, 0, Bytes::from_static(b"value"));
-
-        assert!(
-            matches!(
-                missing_static,
-                Err(QPackEncoderStreamError::ReferencedStaticEntryNotExisted { index: 9999 })
-            ),
-            "unexpected static result: {missing_static:?}"
-        );
-        assert!(
-            matches!(
-                missing_dynamic,
-                Err(QPackEncoderStreamError::ReferencedDynamicEntryNotExisted { index: 0 })
-            ),
-            "unexpected dynamic result: {missing_dynamic:?}"
-        );
-    }
-
-    #[test]
-    fn insert_fails_when_capacity_too_small() {
-        let mut state = DecoderState::new(test_settings(4096));
-        // Set capacity very small — a FieldLine has 32 bytes overhead + name + value
-        state.set_dynamic_table_capacity(10).unwrap();
-        let result =
-            state.insert_with_literal_name(Bytes::from_static(b"name"), Bytes::from_static(b"v"));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn duplicate_errors_for_missing_dynamic_entry() {
-        let mut state = DecoderState::new(test_settings(256));
-        state.set_dynamic_table_capacity(256).unwrap();
-
-        let result = state.duplicate(0);
-
-        assert!(
-            matches!(
-                result,
-                Err(QPackEncoderStreamError::ReferencedDynamicEntryNotExisted { index: 0 })
-            ),
-            "Expected missing dynamic entry error, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn duplicate_existing_entry_evicts_when_needed_and_updates_count() {
-        let mut state = DecoderState::new(test_settings(50));
-        state.set_dynamic_table_capacity(50).unwrap();
-        state
-            .insert_with_literal_name(Bytes::from_static(b"x-name"), Bytes::from_static(b"value"))
-            .expect("seed entry should fit");
-        state.pending_instructions.clear();
-
-        state
-            .duplicate(0)
-            .expect("duplicate should fit after eviction");
-
-        assert_eq!(state.dynamic_table.dropped_count, 1);
-        assert!(state.dynamic_table.get(0).is_none());
-        let entry = state.dynamic_table.get(1).expect("duplicate should remain");
-        assert_eq!(entry.name, Bytes::from_static(b"x-name"));
-        assert_eq!(entry.value, Bytes::from_static(b"value"));
-        assert_eq!(state.dynamic_table.known_received_count, 2);
-        assert_eq!(
-            state.pending_instructions.back(),
-            Some(&DecoderInstruction::InsertCountIncrement { increment: 1 })
-        );
-    }
-
-    #[tokio::test]
-    async fn receive_instruction_until_applies_encoder_stream_mutations() {
-        let instructions = vec![
-            Ok(EncoderInstruction::SetDynamicTableCapacity { capacity: 128 }),
-            Ok(EncoderInstruction::InsertWithLiteralName {
-                name_huffman: false,
-                name: Bytes::from_static(b"x-name"),
-                value_huffman: false,
-                value: Bytes::from_static(b"value"),
-            }),
-            Ok(EncoderInstruction::InsertWithNameReference {
-                is_static: false,
-                name_index: 0,
-                huffman: false,
-                value: Bytes::from_static(b"referenced"),
-            }),
-            Ok(EncoderInstruction::Duplicate { index: 0 }),
-        ];
-        let (decoder, _) = test_decoder(test_settings(128), instructions);
-
-        decoder
-            .receive_instruction_until(3)
-            .await
-            .expect("encoder instructions should be applied");
-
-        let state = decoder.state.lock().expect("lock is not poisoned");
-        assert_eq!(state.dynamic_table.capacity, 128);
-        assert_eq!(state.dynamic_table.inserted_count, 3);
-        assert_eq!(
-            state.dynamic_table.get(1).expect("referenced entry").name,
-            Bytes::from_static(b"x-name")
-        );
-        assert_eq!(
-            state.dynamic_table.get(2).expect("duplicate entry").value,
-            Bytes::from_static(b"referenced")
-        );
-    }
-
-    #[tokio::test]
-    async fn receive_instruction_until_returns_when_count_already_known() {
-        let (decoder, _) = test_decoder(test_settings(128), Vec::new());
-
-        decoder
-            .receive_instruction_until(0)
-            .await
-            .expect("zero required count is already known");
-    }
-
-    #[tokio::test]
-    async fn receive_instruction_until_reports_closed_encoder_stream() {
-        let (decoder, _) = test_decoder(test_settings(128), Vec::new());
-
-        let error = decoder
-            .receive_instruction_until(1)
-            .await
-            .expect_err("missing encoder stream instruction should close the connection");
-
-        assert_connection_h3_code(error, Code::H3_CLOSED_CRITICAL_STREAM);
-    }
-
-    #[tokio::test]
-    async fn receive_instruction_until_propagates_encoder_stream_read_error() {
-        let (decoder, _) = test_decoder(
-            test_settings(128),
-            vec![Err(StreamError::Reset {
-                code: VarInt::from_u32(33),
-            })],
-        );
-
-        let error = decoder
-            .receive_instruction_until(1)
-            .await
-            .expect_err("encoder stream read error should propagate");
+    fn blocked_field_section_resolves_after_the_encoder_instruction() {
+        let stream_id = crate::stream_id::from_u64_unchecked(0);
+        let encoded = [2, 0, 0x80];
+        let mut decoder = Decoder::new(256, 1, None);
+        decoder.apply(EncoderInstruction::SetCapacity(256)).unwrap();
 
         assert!(matches!(
-            error,
-            StreamError::Reset { code } if code == VarInt::from_u32(33)
+            decoder.decode(stream_id, &encoded).unwrap(),
+            Decode::Blocked
         ));
-    }
-
-    #[tokio::test]
-    async fn receive_instruction_until_rejects_invalid_encoder_instructions() {
-        let cases = [
-            vec![Ok(EncoderInstruction::SetDynamicTableCapacity {
-                capacity: 256,
-            })],
-            vec![
-                Ok(EncoderInstruction::SetDynamicTableCapacity { capacity: 64 }),
-                Ok(EncoderInstruction::InsertWithNameReference {
-                    is_static: true,
-                    name_index: 9999,
-                    huffman: false,
-                    value: Bytes::from_static(b"value"),
-                }),
-            ],
-            vec![
-                Ok(EncoderInstruction::SetDynamicTableCapacity { capacity: 0 }),
-                Ok(EncoderInstruction::InsertWithLiteralName {
-                    name_huffman: false,
-                    name: Bytes::from_static(b"name"),
-                    value_huffman: false,
-                    value: Bytes::from_static(b"value"),
-                }),
-            ],
-        ];
-
-        for instructions in cases {
-            let (decoder, _) = test_decoder(test_settings(128), instructions);
-            let error = decoder
-                .receive_instruction_until(1)
-                .await
-                .expect_err("invalid encoder instruction should close the connection");
-
-            assert_connection_h3_code(error, Code::QPACK_ENCODER_STREAM_ERROR);
-        }
-    }
-
-    #[tokio::test]
-    async fn flush_instructions_sends_and_drains_pending_queue() {
-        let (decoder, sent) = test_decoder(test_settings(128), Vec::new());
-        decoder.emit(DecoderInstruction::StreamCancellation { stream_id: 1 });
-        decoder.emit(DecoderInstruction::StreamCancellation { stream_id: 2 });
-
-        decoder
-            .flush_instructions()
-            .await
-            .expect("pending instructions should flush");
-
-        assert_eq!(
-            sent.lock().expect("lock is not poisoned").as_slice(),
-            &[
-                DecoderInstruction::StreamCancellation { stream_id: 1 },
-                DecoderInstruction::StreamCancellation { stream_id: 2 },
-            ]
-        );
-        assert!(
-            decoder
-                .state
-                .lock()
-                .expect("lock is not poisoned")
-                .pending_instructions
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn decode_emits_section_acknowledgment_for_dynamic_reference() {
-        let (decoder, sent) = test_decoder(test_settings(128), Vec::new());
-        {
-            let mut state = decoder.state.lock().expect("lock is not poisoned");
-            state.set_dynamic_table_capacity(128).unwrap();
-            state
-                .insert_with_literal_name(Bytes::from_static(b"x-name"), Bytes::from_static(b"ok"))
-                .expect("seed entry should fit");
-            state.pending_instructions.clear();
-        }
-
-        let prefix = EncodedFieldSectionPrefix {
-            encoded_insert_count: EncodedFieldSectionPrefix::encode_ric(1, 128),
-            sign: false,
-            delta_base: 0,
+        assert!(decoder.apply(insert(b"x-test", b"value")).unwrap());
+        let Decode::Ready {
+            fields,
+            used_dynamic_table,
+        } = decoder.decode(stream_id, &encoded).unwrap()
+        else {
+            panic!("field section should be ready");
         };
-        let payload = encode_header_payload(
-            prefix,
-            vec![FieldLineRepresentation::IndexedFieldLine {
-                is_static: false,
+        assert!(used_dynamic_table);
+        assert_eq!(
+            fields,
+            vec![Field {
+                name: Bytes::from_static(b"x-test"),
+                value: Bytes::from_static(b"value"),
+            }]
+        );
+    }
+
+    #[test]
+    fn post_base_reference_decodes() {
+        let stream_id = crate::stream_id::from_u64_unchecked(0);
+        let mut decoder = Decoder::new(256, 1, None);
+        decoder.apply(EncoderInstruction::SetCapacity(256)).unwrap();
+        decoder.apply(insert(b"x-test", b"value")).unwrap();
+
+        let Decode::Ready { fields, .. } = decoder.decode(stream_id, &[2, 0x80, 0x10]).unwrap()
+        else {
+            panic!("field section should be ready");
+        };
+        assert_eq!(fields[0].name, Bytes::from_static(b"x-test"));
+    }
+
+    #[test]
+    fn decodes_rfc_9204_appendix_b_dynamic_field_section() {
+        let mut decoder = Decoder::new(220, 1, None);
+        decoder.apply(EncoderInstruction::SetCapacity(220)).unwrap();
+        decoder
+            .apply(EncoderInstruction::InsertNameReference {
+                is_static: true,
                 index: 0,
-            }],
-        )
-        .await;
-        let frame = TestHeaderFrame {
-            stream_id: VarInt::from_u32(23),
-            payload: Cursor::new(payload),
+                value: Bytes::from_static(b"www.example.com"),
+            })
+            .unwrap();
+        decoder
+            .apply(EncoderInstruction::InsertNameReference {
+                is_static: true,
+                index: 1,
+                value: Bytes::from_static(b"/sample/path"),
+            })
+            .unwrap();
+
+        let Decode::Ready { fields, .. } = decoder
+            .decode(
+                crate::stream_id::from_u64_unchecked(4),
+                &[0x03, 0x81, 0x10, 0x11],
+            )
+            .unwrap()
+        else {
+            panic!("RFC field section should decode immediately");
         };
-
-        let section = decoder.decode(frame).await.expect("header should decode");
-
         assert_eq!(
-            section.header_map.get("x-name").expect("x-name header"),
-            "ok"
-        );
-        assert_eq!(
-            sent.lock().expect("lock is not poisoned").as_slice(),
-            &[DecoderInstruction::SectionAcknowledgment { stream_id: 23 }]
-        );
-    }
-
-    #[tokio::test]
-    async fn decode_rejects_field_section_that_exceeds_configured_limit() {
-        let (decoder, _) = test_decoder(
-            test_settings_with_max_field_section_size(128, 1),
-            Vec::new(),
-        );
-        let payload = encode_header_payload(
-            EncodedFieldSectionPrefix {
-                encoded_insert_count: 0,
-                sign: false,
-                delta_base: 0,
-            },
-            vec![FieldLineRepresentation::LiteralFieldLineWithLiteralName {
-                never_dynamic: false,
-                name_huffman: false,
-                name: Bytes::from_static(b"x-large"),
-                value_huffman: false,
-                value: Bytes::from_static(b"value"),
-            }],
-        )
-        .await;
-        let frame = TestHeaderFrame {
-            stream_id: VarInt::from_u32(31),
-            payload: Cursor::new(payload),
-        };
-
-        let error = decoder
-            .decode(frame)
-            .await
-            .expect_err("limit should reject field");
-
-        match error {
-            StreamError::H3 { source } => assert_eq!(source.code(), Code::H3_EXCESSIVE_LOAD),
-            error => panic!("unexpected error: {error:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn message_stream_reader_stop_and_reset_emit_stream_cancellation() {
-        let (decoder, _) = test_decoder(test_settings(128), Vec::new());
-        let decoder = Arc::new(decoder);
-        let stop_codes = Arc::new(Mutex::new(Vec::new()));
-        let mut stopped_reader = QPackMessageStreamReader::new(
-            VarInt::from_u32(41),
-            TestReadStream {
-                stream_id: VarInt::from_u32(41),
-                stop_codes: stop_codes.clone(),
-                items: VecDeque::new(),
-            },
-            decoder.clone(),
-        );
-
-        stopped_reader
-            .stop(VarInt::from_u32(7))
-            .await
-            .expect("stop should be forwarded");
-
-        assert_eq!(
-            stop_codes.lock().expect("lock is not poisoned").as_slice(),
-            &[VarInt::from_u32(7)]
-        );
-        assert_eq!(
-            decoder
-                .state
-                .lock()
-                .expect("lock is not poisoned")
-                .pending_instructions
-                .back(),
-            Some(&DecoderInstruction::StreamCancellation { stream_id: 41 })
-        );
-
-        let mut reset_reader = QPackMessageStreamReader::new(
-            VarInt::from_u32(43),
-            TestReadStream {
-                stream_id: VarInt::from_u32(43),
-                stop_codes,
-                items: VecDeque::from([Err(quic::StreamError::Reset {
-                    code: VarInt::from_u32(11),
-                })]),
-            },
-            decoder.clone(),
-        );
-
-        let item = reset_reader
-            .next()
-            .await
-            .expect("reset item should be yielded");
-        assert!(matches!(
-            item,
-            Err(quic::StreamError::Reset { code }) if code == VarInt::from_u32(11)
-        ));
-        assert_eq!(
-            decoder
-                .state
-                .lock()
-                .expect("lock is not poisoned")
-                .pending_instructions
-                .back(),
-            Some(&DecoderInstruction::StreamCancellation { stream_id: 43 })
-        );
-    }
-
-    #[test]
-    fn message_stream_reader_pending_stop_emits_stream_cancellation_once() {
-        let (decoder, _) = test_decoder(test_settings(128), Vec::new());
-        let decoder = Arc::new(decoder);
-        let stop_codes = Arc::new(Mutex::new(Vec::new()));
-        let mut reader = Box::pin(QPackMessageStreamReader::new(
-            VarInt::from_u32(45),
-            PendingStopReadStream {
-                stop_codes: stop_codes.clone(),
-            },
-            decoder.clone(),
-        ));
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        assert!(matches!(
-            reader.as_mut().poll_stop(&mut cx, VarInt::from_u32(7)),
-            Poll::Pending
-        ));
-        assert!(matches!(
-            reader.as_mut().poll_stop(&mut cx, VarInt::from_u32(7)),
-            Poll::Pending
-        ));
-
-        assert_eq!(
-            stop_codes.lock().expect("lock is not poisoned").as_slice(),
-            &[VarInt::from_u32(7), VarInt::from_u32(7)]
-        );
-        let state = decoder.state.lock().expect("lock is not poisoned");
-        assert_eq!(state.pending_instructions.len(), 1);
-        assert_eq!(
-            state.pending_instructions.back(),
-            Some(&DecoderInstruction::StreamCancellation { stream_id: 45 })
-        );
-    }
-
-    #[tokio::test]
-    async fn message_stream_reader_does_not_emit_duplicate_cancellation_after_stop() {
-        let (decoder, _) = test_decoder(test_settings(128), Vec::new());
-        let decoder = Arc::new(decoder);
-        let stop_codes = Arc::new(Mutex::new(Vec::new()));
-        let mut reader = QPackMessageStreamReader::new(
-            VarInt::from_u32(46),
-            TestReadStream {
-                stream_id: VarInt::from_u32(46),
-                stop_codes,
-                items: VecDeque::from([Err(quic::StreamError::Reset {
-                    code: VarInt::from_u32(11),
-                })]),
-            },
-            decoder.clone(),
-        );
-
-        reader
-            .stop(VarInt::from_u32(7))
-            .await
-            .expect("stop should be forwarded");
-        decoder.emit(DecoderInstruction::InsertCountIncrement { increment: 1 });
-
-        let item = reader.next().await.expect("reset item should be yielded");
-        assert!(matches!(
-            item,
-            Err(quic::StreamError::Reset { code }) if code == VarInt::from_u32(11)
-        ));
-
-        let state = decoder.state.lock().expect("lock is not poisoned");
-        assert_eq!(
-            state.pending_instructions.iter().collect::<Vec<_>>(),
+            fields,
             vec![
-                &DecoderInstruction::StreamCancellation { stream_id: 46 },
-                &DecoderInstruction::InsertCountIncrement { increment: 1 },
+                Field {
+                    name: Bytes::from_static(b":authority"),
+                    value: Bytes::from_static(b"www.example.com"),
+                },
+                Field {
+                    name: Bytes::from_static(b":path"),
+                    value: Bytes::from_static(b"/sample/path"),
+                },
             ]
         );
     }
 
-    #[tokio::test]
-    async fn message_stream_reader_reset_uses_constructor_stream_id() {
-        let (decoder, _) = test_decoder(test_settings(128), Vec::new());
-        let decoder = Arc::new(decoder);
-        let mut reader = QPackMessageStreamReader::new(
-            VarInt::from_u32(47),
-            ResetWithoutStreamIdReadStream {
-                items: VecDeque::from([Err(quic::StreamError::Reset {
-                    code: VarInt::from_u32(11),
-                })]),
-            },
-            decoder.clone(),
-        );
-
-        let item = reader.next().await.expect("reset item should be yielded");
+    #[test]
+    fn peer_cannot_exceed_the_advertised_blocked_stream_limit() {
+        let mut decoder = Decoder::new(256, 1, None);
+        decoder.apply(EncoderInstruction::SetCapacity(256)).unwrap();
         assert!(matches!(
-            item,
-            Err(quic::StreamError::Reset { code }) if code == VarInt::from_u32(11)
-        ));
-
-        assert_eq!(
             decoder
-                .state
-                .lock()
-                .expect("lock is not poisoned")
-                .pending_instructions
-                .back(),
-            Some(&DecoderInstruction::StreamCancellation { stream_id: 47 })
-        );
+                .decode(crate::stream_id::from_u64_unchecked(0), &[2, 0, 0x80])
+                .unwrap(),
+            Decode::Blocked
+        ));
+        let error = decoder
+            .decode(crate::stream_id::from_u64_unchecked(4), &[2, 0, 0x80])
+            .unwrap_err();
+        assert!(matches!(&error, crate::Error::Connection { .. }));
+        assert_eq!(error.code(), Some(Code::QPACK_DECOMPRESSION_FAILED));
     }
 
     #[test]
-    fn static_table_lookup() {
-        // Verify well-known static table entries
-        assert_eq!(r#static::get_name(0), Some(":authority"));
-        assert_eq!(r#static::get_name(1), Some(":path"));
-        assert_eq!(r#static::get(1), Some((":path", "/")));
-        assert!(r#static::get(99).is_none());
-    }
-
-    #[test]
-    fn decompression_static_indexed_field_line() {
-        let dt = DynamicTable::new();
-        let repr = FieldLineRepresentation::IndexedFieldLine {
-            is_static: true,
-            index: 1, // :path /
-        };
-        let fl = decompression_field_line_representation(&repr, 0, &dt).unwrap();
-        assert_eq!(&fl.name[..], b":path");
-        assert_eq!(&fl.value[..], b"/");
-    }
-
-    #[test]
-    fn decompression_literal_with_literal_name() {
-        let dt = DynamicTable::new();
-        let repr = FieldLineRepresentation::LiteralFieldLineWithLiteralName {
-            never_dynamic: false,
-            name_huffman: false,
-            value_huffman: false,
-            name: Bytes::from_static(b"x-test"),
-            value: Bytes::from_static(b"hello"),
-        };
-        let fl = decompression_field_line_representation(&repr, 0, &dt).unwrap();
-        assert_eq!(&fl.name[..], b"x-test");
-        assert_eq!(&fl.value[..], b"hello");
-    }
-
-    #[test]
-    fn decompression_invalid_static_index() {
-        let dt = DynamicTable::new();
-        let repr = FieldLineRepresentation::IndexedFieldLine {
-            is_static: true,
-            index: 9999,
-        };
-        assert!(decompression_field_line_representation(&repr, 0, &dt).is_err());
-    }
-
-    #[test]
-    fn decompression_dynamic_references_resolve_relative_and_post_base_indices() {
-        let dt = dynamic_table_with_entries(&[
-            FieldLine {
-                name: Bytes::from_static(b"header-1"),
-                value: Bytes::from_static(b"value-1"),
-            },
-            FieldLine {
-                name: Bytes::from_static(b"header-2"),
-                value: Bytes::from_static(b"value-2"),
-            },
-            FieldLine {
-                name: Bytes::from_static(b"header-3"),
-                value: Bytes::from_static(b"value-3"),
-            },
-        ]);
-
-        let indexed = FieldLineRepresentation::IndexedFieldLine {
-            is_static: false,
-            index: 0,
-        };
-        let indexed_post_base =
-            FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex { index: 0 };
-        let literal_name_ref = FieldLineRepresentation::LiteralFieldLineWithNameReference {
-            never_dynamic: false,
-            is_static: false,
-            name_index: 1,
-            huffman: false,
-            value: Bytes::from_static(b"patched"),
-        };
-        let literal_post_base =
-            FieldLineRepresentation::LiteralFieldLineWithPostBaseNameReference {
-                never_dynamic: false,
-                name_index: 0,
-                huffman: false,
-                value: Bytes::from_static(b"patched-post"),
-            };
-
-        assert_eq!(
-            decompression_field_line_representation(&indexed, 3, &dt).unwrap(),
-            FieldLine {
-                name: Bytes::from_static(b"header-3"),
-                value: Bytes::from_static(b"value-3"),
-            }
-        );
-        assert_eq!(
-            decompression_field_line_representation(&indexed_post_base, 2, &dt).unwrap(),
-            FieldLine {
-                name: Bytes::from_static(b"header-3"),
-                value: Bytes::from_static(b"value-3"),
-            }
-        );
-        assert_eq!(
-            decompression_field_line_representation(&literal_name_ref, 3, &dt).unwrap(),
-            FieldLine {
-                name: Bytes::from_static(b"header-2"),
-                value: Bytes::from_static(b"patched"),
-            }
-        );
-        assert_eq!(
-            decompression_field_line_representation(&literal_post_base, 2, &dt).unwrap(),
-            FieldLine {
-                name: Bytes::from_static(b"header-3"),
-                value: Bytes::from_static(b"patched-post"),
-            }
-        );
-    }
-
-    #[test]
-    fn decompression_reports_index_overflow_and_missing_dynamic_entry() {
-        let dt = dynamic_table_with_entries(&[FieldLine {
-            name: Bytes::from_static(b"header-1"),
-            value: Bytes::from_static(b"value-1"),
-        }]);
-
-        let overflow = FieldLineRepresentation::IndexedFieldLine {
-            is_static: false,
-            index: 1,
-        };
-        let missing = FieldLineRepresentation::IndexedFieldLineWithPostBaseIndex { index: 10 };
-
-        assert!(
-            matches!(
-                decompression_field_line_representation(&overflow, 0, &dt),
-                Err(InvalidDynamicTableReference::IndexOverflow)
-            ),
-            "expected relative index overflow"
-        );
-        assert!(
-            matches!(
-                decompression_field_line_representation(&missing, 1, &dt),
-                Err(InvalidDynamicTableReference::ReferencedDynamicEntryNotExisted { index: 11 })
-            ),
-            "expected missing post-base entry"
-        );
+    fn capacity_above_settings_is_an_encoder_stream_error() {
+        let error = Decoder::new(128, 0, None)
+            .apply(EncoderInstruction::SetCapacity(129))
+            .unwrap_err();
+        assert_eq!(error.code(), Some(Code::QPACK_ENCODER_STREAM_ERROR));
     }
 }

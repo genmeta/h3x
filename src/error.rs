@@ -1,550 +1,408 @@
-use std::{error::Error as StdError, fmt::Display};
+use std::{borrow::Cow, error::Error as StdError, fmt, sync::Arc};
 
-use snafu::Snafu;
+use crate::StreamId;
 
-use crate::varint::VarInt;
+type SharedError = Arc<dyn StdError + Send + Sync + 'static>;
 
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Code(VarInt);
+/// An HTTP/3, QPACK, or enabled extension application error code.
+///
+/// Unknown peer codes are retained, provided they fit in a QUIC variable-length
+/// integer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Code(u64);
 
-impl From<VarInt> for Code {
-    fn from(value: VarInt) -> Self {
+impl Code {
+    pub const H3_NO_ERROR: Self = Self(0x0100);
+    pub const H3_GENERAL_PROTOCOL_ERROR: Self = Self(0x0101);
+    pub const H3_INTERNAL_ERROR: Self = Self(0x0102);
+    pub const H3_STREAM_CREATION_ERROR: Self = Self(0x0103);
+    pub const H3_CLOSED_CRITICAL_STREAM: Self = Self(0x0104);
+    pub const H3_FRAME_UNEXPECTED: Self = Self(0x0105);
+    pub const H3_FRAME_ERROR: Self = Self(0x0106);
+    pub const H3_EXCESSIVE_LOAD: Self = Self(0x0107);
+    pub const H3_ID_ERROR: Self = Self(0x0108);
+    pub const H3_SETTINGS_ERROR: Self = Self(0x0109);
+    pub const H3_MISSING_SETTINGS: Self = Self(0x010a);
+    pub const H3_REQUEST_REJECTED: Self = Self(0x010b);
+    pub const H3_REQUEST_CANCELLED: Self = Self(0x010c);
+    pub const H3_REQUEST_INCOMPLETE: Self = Self(0x010d);
+    pub const H3_MESSAGE_ERROR: Self = Self(0x010e);
+    pub const H3_CONNECT_ERROR: Self = Self(0x010f);
+    pub const H3_VERSION_FALLBACK: Self = Self(0x0110);
+
+    pub const QPACK_DECOMPRESSION_FAILED: Self = Self(0x0200);
+    pub const QPACK_ENCODER_STREAM_ERROR: Self = Self(0x0201);
+    pub const QPACK_DECODER_STREAM_ERROR: Self = Self(0x0202);
+
+    #[cfg(feature = "webtransport")]
+    pub const H3_DATAGRAM_ERROR: Self = Self(0x0033);
+    #[cfg(feature = "webtransport")]
+    pub const WT_BUFFERED_STREAM_REJECTED: Self = Self(0x3994_bd84);
+    #[cfg(feature = "webtransport")]
+    pub const WT_SESSION_GONE: Self = Self(0x170d_7b68);
+    #[cfg(feature = "webtransport")]
+    pub const WT_FLOW_CONTROL_ERROR: Self = Self(0x045d_4487);
+    #[cfg(feature = "webtransport")]
+    pub const WT_ALPN_ERROR: Self = Self(0x0817_b3dd);
+    #[cfg(feature = "webtransport")]
+    pub const WT_REQUIREMENTS_NOT_MET: Self = Self(0x212c_0d48);
+
+    /// Returns the numeric QUIC application error code.
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    #[cfg(feature = "webtransport")]
+    pub(crate) const fn new_unchecked(value: u64) -> Self {
         Self(value)
     }
 }
 
-impl From<Code> for VarInt {
+impl TryFrom<u64> for Code {
+    type Error = qbase::varint::err::Overflow;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        qbase::varint::VarInt::try_from(value).map(|_| Self(value))
+    }
+}
+
+impl From<Code> for u64 {
     fn from(value: Code) -> Self {
-        value.0
+        value.as_u64()
     }
 }
 
-impl Code {
-    pub const fn into_inner(self) -> VarInt {
-        self.0
-    }
-}
+impl fmt::Display for Code {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match *self {
+            Self::H3_NO_ERROR => Some("H3_NO_ERROR"),
+            Self::H3_GENERAL_PROTOCOL_ERROR => Some("H3_GENERAL_PROTOCOL_ERROR"),
+            Self::H3_INTERNAL_ERROR => Some("H3_INTERNAL_ERROR"),
+            Self::H3_STREAM_CREATION_ERROR => Some("H3_STREAM_CREATION_ERROR"),
+            Self::H3_CLOSED_CRITICAL_STREAM => Some("H3_CLOSED_CRITICAL_STREAM"),
+            Self::H3_FRAME_UNEXPECTED => Some("H3_FRAME_UNEXPECTED"),
+            Self::H3_FRAME_ERROR => Some("H3_FRAME_ERROR"),
+            Self::H3_EXCESSIVE_LOAD => Some("H3_EXCESSIVE_LOAD"),
+            Self::H3_ID_ERROR => Some("H3_ID_ERROR"),
+            Self::H3_SETTINGS_ERROR => Some("H3_SETTINGS_ERROR"),
+            Self::H3_MISSING_SETTINGS => Some("H3_MISSING_SETTINGS"),
+            Self::H3_REQUEST_REJECTED => Some("H3_REQUEST_REJECTED"),
+            Self::H3_REQUEST_CANCELLED => Some("H3_REQUEST_CANCELLED"),
+            Self::H3_REQUEST_INCOMPLETE => Some("H3_REQUEST_INCOMPLETE"),
+            Self::H3_MESSAGE_ERROR => Some("H3_MESSAGE_ERROR"),
+            Self::H3_CONNECT_ERROR => Some("H3_CONNECT_ERROR"),
+            Self::H3_VERSION_FALLBACK => Some("H3_VERSION_FALLBACK"),
+            Self::QPACK_DECOMPRESSION_FAILED => Some("QPACK_DECOMPRESSION_FAILED"),
+            Self::QPACK_ENCODER_STREAM_ERROR => Some("QPACK_ENCODER_STREAM_ERROR"),
+            Self::QPACK_DECODER_STREAM_ERROR => Some("QPACK_DECODER_STREAM_ERROR"),
+            #[cfg(feature = "webtransport")]
+            Self::H3_DATAGRAM_ERROR => Some("H3_DATAGRAM_ERROR"),
+            #[cfg(feature = "webtransport")]
+            Self::WT_BUFFERED_STREAM_REJECTED => Some("WT_BUFFERED_STREAM_REJECTED"),
+            #[cfg(feature = "webtransport")]
+            Self::WT_SESSION_GONE => Some("WT_SESSION_GONE"),
+            #[cfg(feature = "webtransport")]
+            Self::WT_FLOW_CONTROL_ERROR => Some("WT_FLOW_CONTROL_ERROR"),
+            #[cfg(feature = "webtransport")]
+            Self::WT_ALPN_ERROR => Some("WT_ALPN_ERROR"),
+            #[cfg(feature = "webtransport")]
+            Self::WT_REQUIREMENTS_NOT_MET => Some("WT_REQUIREMENTS_NOT_MET"),
+            _ => None,
+        };
 
-macro_rules! codes {
-    (
-        $(
-            $(#[$meta:meta])*
-            pub const $name:ident = $value:expr;
-        )*
-    ) => {
-        impl Code {
-            $(
-                $(#[$meta])*
-                pub const $name: Self = Self(VarInt::from_u32($value));
-            )*
+        match name {
+            Some(name) => write!(f, "{name} (0x{:x})", self.0),
+            None => write!(f, "HTTP/3 application error 0x{:x}", self.0),
         }
+    }
+}
 
-        impl Display for Code {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                match *self {
-                    $(
-                        Self::$name => write!(f, "{} (0x{:x})", stringify!($name), $value),
-                    )*
-                    _ => write!(f, "Code 0x{:x}", self.0),
-                }
-            }
+/// Error returned by every public h3x operation and by [`crate::Body`].
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum Error {
+    Connection {
+        code: Code,
+        source: Option<SharedError>,
+    },
+    Stream {
+        code: Code,
+        source: Option<SharedError>,
+    },
+    Goaway {
+        boundary: StreamId,
+    },
+    Draining,
+    InvalidState {
+        operation: &'static str,
+    },
+    InvalidSettings {
+        source: SharedError,
+    },
+    InvalidMessage {
+        source: SharedError,
+    },
+    Body {
+        source: SharedError,
+    },
+    Transport {
+        source: SharedError,
+    },
+}
+
+impl Error {
+    /// Returns the HTTP/3, QPACK, or extension application code when one exists.
+    pub const fn code(&self) -> Option<Code> {
+        match self {
+            Self::Connection { code, .. } | Self::Stream { code, .. } => Some(*code),
+            _ => None,
         }
-    };
-}
-
-codes! {
-    // https://datatracker.ietf.org/doc/html/rfc9114#name-http-3-error-codes
-    /// No error. This is used when the connection or stream needs to be closed, but there is no error to signal.
-    pub const H3_NO_ERROR = 0x0100;
-    /// Peer violated protocol requirements in a way that does not match a more specific error code or endpoint declines to use the more specific error code.
-    pub const H3_GENERAL_PROTOCOL_ERROR = 0x0101;
-    /// An internal error has occurred in the HTTP stack.
-    pub const H3_INTERNAL_ERROR = 0x0102;
-    /// The endpoint detected that its peer created a stream that it will not accept.
-    pub const H3_STREAM_CREATION_ERROR = 0x0103;
-    /// A stream required by the HTTP/3 connection was closed or reset.
-    pub const H3_CLOSED_CRITICAL_STREAM = 0x0104;
-    /// A frame was received that was not permitted in the current state or on the current stream.
-    pub const H3_FRAME_UNEXPECTED = 0x0105;
-    /// A frame that fails to satisfy layout requirements or with an invalid size was received.
-    pub const H3_FRAME_ERROR = 0x0106;
-    /// The endpoint detected that its peer is exhibiting a behavior that might be generating excessive load.
-    pub const H3_EXCESSIVE_LOAD = 0x0107;
-    /// A stream ID or push ID was used incorrectly, such as exceeding a limit, reducing a limit, or being reused.
-    pub const H3_ID_ERROR = 0x0108;
-    /// An endpoint detected an error in the payload of a SETTINGS frame.
-    pub const H3_SETTINGS_ERROR = 0x0109;
-    /// No SETTINGS frame was received at the beginning of the control stream.
-    pub const H3_MISSING_SETTINGS = 0x010a;
-    /// A server rejected a request without performing any application processing.
-    pub const H3_REQUEST_REJECTED = 0x010b;
-    /// The request or its response (including pushed response) is cancelled.
-    pub const H3_REQUEST_CANCELLED = 0x010c;
-    /// The client's stream terminated without containing a fully formed request.
-    pub const H3_REQUEST_INCOMPLETE = 0x010d;
-    /// An HTTP message was malformed and cannot be processed.
-    ///
-    /// A malformed request or response is one that is an otherwise valid sequence of frames but is invalid due to:
-    ///
-    /// - the presence of prohibited fields or pseudo-header fields,
-    /// - the absence of mandatory pseudo-header fields,
-    /// - invalid values for pseudo-header fields,
-    /// - pseudo-header fields after fields,
-    /// - an invalid sequence of HTTP messages,
-    /// - the inclusion of uppercase field names, or
-    /// - the inclusion of invalid characters in field names or values.
-    ///
-    /// <https://datatracker.ietf.org/doc/html/rfc9114#name-malformed-requests-and-resp>
-    pub const H3_MESSAGE_ERROR = 0x010e;
-    /// The TCP connection established in response to a CONNECT request was reset or abnormally closed.
-    pub const H3_CONNECT_ERROR = 0x010f;
-    /// The requested operation cannot be served over HTTP/3. The peer should retry over HTTP/1.1.
-    pub const H3_VERSION_FALLBACK = 0x0110;
-
-    // https://www.rfc-editor.org/rfc/rfc9297#section-3.3
-    /// HTTP Datagram or Capsule Protocol error.
-    pub const H3_DATAGRAM_ERROR = 0x33;
-
-    // https://datatracker.ietf.org/doc/html/rfc9204#name-error-handling
-    /// The decoder failed to interpret an encoded field section and is not able to continue decoding that field section.
-    pub const QPACK_DECOMPRESSION_FAILED = 0x200;
-    /// The decoder failed to interpret an encoder instruction received on the encoder stream.
-    pub const QPACK_ENCODER_STREAM_ERROR = 0x201;
-    /// The encoder failed to interpret a decoder instruction received on the decoder stream.
-    pub const QPACK_DECODER_STREAM_ERROR = 0x202;
-
-    // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3#section-9.5
-    /// WebTransport stream belongs to a session that is gone.
-    pub const WT_SESSION_GONE = 0x170d7b68;
-    /// WebTransport stream rejected because h3x does not buffer unknown sessions.
-    pub const WT_BUFFERED_STREAM_REJECTED = 0x3994bd84;
-    /// WebTransport session aborted because a flow control error was encountered.
-    pub const WT_FLOW_CONTROL_ERROR = 0x045d4487;
-}
-
-impl Code {
-    pub const fn new(code: VarInt) -> Self {
-        Self(code)
     }
 
-    pub const fn value(&self) -> VarInt {
-        self.0
+    pub(crate) const fn is_connection(&self) -> bool {
+        matches!(self, Self::Connection { .. } | Self::Transport { .. })
     }
-}
 
-#[non_exhaustive]
-#[allow(clippy::enum_variant_names)]
-#[derive(Debug, Snafu, Clone, Copy)]
-pub enum H3StreamCreationError {
-    #[snafu(display("control stream already exists"))]
-    DuplicateControlStream,
-    #[snafu(display("qpack encoder stream already exists"))]
-    DuplicateQpackEncoderStream,
-    #[snafu(display("qpack decoder stream already exists"))]
-    DuplicateQpackDecoderStream,
-}
-
-impl H3ConnectionError for H3StreamCreationError {
-    fn code(&self) -> Code {
-        Code::H3_STREAM_CREATION_ERROR
+    pub(crate) const fn is_stream(&self) -> bool {
+        matches!(self, Self::Stream { .. })
     }
-}
 
-// TODO: add reset code info(if any)
-#[non_exhaustive]
-#[derive(Debug, Snafu)]
-pub enum H3CriticalStreamClosed {
-    #[snafu(display("qpack encoder stream closed unexpectedly"))]
-    QPackEncoder,
-    #[snafu(display("qpack decoder stream closed unexpectedly"))]
-    QPackDecoder,
-    #[snafu(display("control stream closed unexpectedly"))]
-    Control,
-}
-
-impl H3ConnectionError for H3CriticalStreamClosed {
-    fn code(&self) -> Code {
-        Code::H3_CLOSED_CRITICAL_STREAM
+    pub(crate) fn into_invalid_message(self) -> Self {
+        match self {
+            Self::Stream {
+                code: Code::H3_MESSAGE_ERROR,
+                source: Some(source),
+            } => Self::InvalidMessage { source },
+            error => error,
+        }
     }
-}
 
-// todo: more error variants instead of direct Code::H3_FRAME_UNEXPECTED usage
-#[non_exhaustive]
-#[derive(Debug, Snafu, Clone, Copy)]
-pub enum H3FrameUnexpected {
-    #[snafu(display("received subsequent SETTINGS frame"))]
-    DuplicateSettings,
-    #[snafu(display("unexpected frame type on request stream"))]
-    UnexpectedFrameType,
-    #[snafu(display("unexpected frame during trailer reading"))]
-    UnexpectedFrameDuringTrailer,
-}
-impl H3ConnectionError for H3FrameUnexpected {
-    fn code(&self) -> Code {
-        Code::H3_FRAME_UNEXPECTED
+    pub(crate) fn connection(
+        code: Option<Code>,
+        message: impl Into<Cow<'static, str>>,
+        source: impl StdError + Send + Sync + 'static,
+    ) -> Self {
+        let source = context_source(message, source);
+        match code {
+            Some(code) => Self::Connection {
+                code,
+                source: Some(source),
+            },
+            None => Self::Transport { source },
+        }
+    }
+
+    pub(crate) fn connection_protocol(code: Code, message: impl Into<Cow<'static, str>>) -> Self {
+        Self::Connection {
+            code,
+            source: Some(message_source(message)),
+        }
+    }
+
+    pub(crate) fn stream(code: Option<Code>, message: impl Into<Cow<'static, str>>) -> Self {
+        let source = message_source(message);
+        match code {
+            Some(code) => Self::Stream {
+                code,
+                source: Some(source),
+            },
+            None => Self::InvalidMessage { source },
+        }
+    }
+
+    pub(crate) fn stream_with_source(
+        code: Option<Code>,
+        message: impl Into<Cow<'static, str>>,
+        source: impl StdError + Send + Sync + 'static,
+    ) -> Self {
+        let source = context_source(message, source);
+        match code {
+            Some(code) => Self::Stream {
+                code,
+                source: Some(source),
+            },
+            None => Self::Transport { source },
+        }
+    }
+
+    pub(crate) fn send_body(source: impl StdError + Send + Sync + 'static) -> Self {
+        Self::Body {
+            source: context_source("failed to read the outgoing HTTP body", source),
+        }
+    }
+
+    pub(crate) fn request_rejected(message: impl Into<Cow<'static, str>>) -> Self {
+        Self::Stream {
+            code: Code::H3_REQUEST_REJECTED,
+            source: Some(message_source(message)),
+        }
+    }
+
+    pub(crate) fn request_rejected_with_source(
+        message: impl Into<Cow<'static, str>>,
+        source: impl StdError + Send + Sync + 'static,
+    ) -> Self {
+        Self::Stream {
+            code: Code::H3_REQUEST_REJECTED,
+            source: Some(context_source(message, source)),
+        }
+    }
+
+    pub(crate) fn draining(_message: impl Into<Cow<'static, str>>) -> Self {
+        Self::Draining
+    }
+
+    pub(crate) fn closed(_message: impl Into<Cow<'static, str>>) -> Self {
+        Self::Draining
+    }
+
+    pub(crate) fn invalid_stream_id(value: u64) -> Self {
+        Self::InvalidMessage {
+            source: message_source(format!(
+                "stream ID {value} exceeds the QUIC variable-length integer range"
+            )),
+        }
+    }
+
+    pub(crate) const fn invalid_state(operation: &'static str) -> Self {
+        Self::InvalidState { operation }
+    }
+
+    pub(crate) fn invalid_settings(source: impl StdError + Send + Sync + 'static) -> Self {
+        Self::InvalidSettings {
+            source: Arc::new(source),
+        }
     }
 }
 
-// TODO: use Error::provide api in the future
-/// H3 error whose scope is a single stream (will cause `RESET_STREAM`).
-///
-/// Static scope dispatch: types that are always stream-scoped implement this
-/// trait and convert to [`crate::connection::StreamError`] via a blanket
-/// `From` impl.
-pub trait H3StreamError: StdError + Send + Sync {
-    fn code(&self) -> Code;
-}
-
-/// H3 error whose scope is the whole connection (will cause `CONNECTION_CLOSE`).
-///
-/// Static scope dispatch: types that are always connection-scoped implement
-/// this trait and convert to [`crate::connection::ConnectionError`] via a
-/// blanket `From` impl.
-pub trait H3ConnectionError: StdError + Send + Sync {
-    fn code(&self) -> Code;
-}
-
-#[derive(Debug, Snafu, Clone, Copy)]
-#[snafu(display("no error"))]
-pub struct H3NoError;
-
-impl H3ConnectionError for H3NoError {
-    fn code(&self) -> Code {
-        Code::H3_NO_ERROR
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connection { code, .. } => write!(f, "HTTP/3 connection error: {code}"),
+            Self::Stream { code, .. } => write!(f, "HTTP/3 stream error: {code}"),
+            Self::Goaway { boundary } => write!(f, "peer GOAWAY boundary: {boundary}"),
+            Self::Draining => f.write_str("HTTP/3 connection is draining"),
+            Self::InvalidState { operation } => write!(f, "invalid state for {operation}"),
+            Self::InvalidSettings { .. } => f.write_str("invalid HTTP/3 settings"),
+            Self::InvalidMessage { .. } => f.write_str("invalid HTTP/3 message"),
+            Self::Body { .. } => f.write_str("HTTP body error"),
+            Self::Transport { .. } => f.write_str("QUIC transport error"),
+        }
     }
 }
 
-#[non_exhaustive]
-#[derive(Debug, Snafu, Clone, Copy)]
-pub enum H3MessageError {
-    #[snafu(display("missing header section in HTTP message"))]
-    MissingHeaderSection,
-    #[snafu(display("unexpected headers frame in message body"))]
-    UnexpectedHeadersInBody,
-}
-
-impl H3StreamError for H3MessageError {
-    fn code(&self) -> Code {
-        Code::H3_MESSAGE_ERROR
+impl StdError for Error {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Connection { source, .. } | Self::Stream { source, .. } => source
+                .as_deref()
+                .map(|source| source as &(dyn StdError + 'static)),
+            Self::InvalidSettings { source }
+            | Self::InvalidMessage { source }
+            | Self::Body { source }
+            | Self::Transport { source } => Some(source.as_ref()),
+            Self::Goaway { .. } | Self::Draining | Self::InvalidState { .. } => None,
+        }
     }
 }
 
-#[derive(Debug, Snafu, Clone, Copy)]
-#[snafu(display("no SETTINGS frame at beginning of control stream"))]
-pub struct H3MissingSettings;
+#[derive(Debug)]
+struct ContextError {
+    message: Cow<'static, str>,
+    source: Option<SharedError>,
+}
 
-impl H3ConnectionError for H3MissingSettings {
-    fn code(&self) -> Code {
-        Code::H3_MISSING_SETTINGS
+impl fmt::Display for ContextError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
     }
 }
 
-#[non_exhaustive]
-#[derive(Debug, Snafu, Clone)]
-#[snafu(module)]
-pub enum H3GeneralProtocolError {
-    #[snafu(display("trailing payload in GOAWAY frame"))]
-    TrailingPayload,
-    #[snafu(display("protocol decode error"))]
-    Decode { source: crate::codec::DecodeError },
-}
-
-impl H3ConnectionError for H3GeneralProtocolError {
-    fn code(&self) -> Code {
-        Code::H3_GENERAL_PROTOCOL_ERROR
+impl StdError for ContextError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn StdError + 'static))
     }
 }
 
-#[non_exhaustive]
-#[derive(Debug, Snafu)]
-pub enum H3InternalError {
-    #[snafu(display("QPACK encoder encode failure"))]
-    QPackEncoderEncode { source: crate::codec::EncodeError },
-    #[snafu(display("missing server name (SNI) on incoming connection"))]
-    MissingServerName,
+fn message_source(message: impl Into<Cow<'static, str>>) -> SharedError {
+    Arc::new(ContextError {
+        message: message.into(),
+        source: None,
+    })
 }
 
-impl H3ConnectionError for H3InternalError {
-    fn code(&self) -> Code {
-        Code::H3_INTERNAL_ERROR
-    }
-}
-
-#[cfg(test)]
-mod webtransport_code_tests {
-    use super::*;
-
-    #[test]
-    fn webtransport_codes_are_associated_constants() {
-        assert_eq!(Code::H3_DATAGRAM_ERROR.into_inner(), VarInt::from_u32(0x33));
-        assert_eq!(
-            Code::WT_SESSION_GONE.into_inner(),
-            VarInt::from_u32(0x170d7b68)
-        );
-        assert_eq!(
-            Code::WT_BUFFERED_STREAM_REJECTED.into_inner(),
-            VarInt::from_u32(0x3994bd84)
-        );
-        assert_eq!(
-            Code::WT_FLOW_CONTROL_ERROR.into_inner(),
-            VarInt::from_u32(0x045d4487)
-        );
-    }
-}
-
-#[derive(Debug, Snafu, Clone)]
-#[snafu(display("frame decode error"))]
-pub struct H3FrameDecodeError {
-    pub source: crate::codec::DecodeError,
-}
-
-impl H3ConnectionError for H3FrameDecodeError {
-    fn code(&self) -> Code {
-        Code::H3_FRAME_ERROR
-    }
-}
-
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-pub enum QpackDecompressionFailed {
-    #[snafu(display("QPACK decompression decode error"))]
-    Decode { source: crate::codec::DecodeError },
-}
-
-impl H3ConnectionError for QpackDecompressionFailed {
-    fn code(&self) -> Code {
-        Code::QPACK_DECOMPRESSION_FAILED
-    }
-}
-
-#[derive(Debug, Snafu, Clone)]
-#[snafu(display("field section size {actual} exceeds limit {limit}"))]
-pub struct H3ExcessiveFieldSectionSize {
-    pub actual: u64,
-    pub limit: u64,
-}
-
-impl H3StreamError for H3ExcessiveFieldSectionSize {
-    fn code(&self) -> Code {
-        Code::H3_EXCESSIVE_LOAD
-    }
-}
-
-#[non_exhaustive]
-#[derive(Debug, Snafu, Clone, Copy)]
-pub enum H3IdError {
-    #[snafu(display("push ID exceeds limit"))]
-    PushIdExceedsLimit,
-    #[snafu(display("GOAWAY stream ID ordering violation"))]
-    GoawayStreamIdOrdering,
-}
-impl H3ConnectionError for H3IdError {
-    fn code(&self) -> Code {
-        Code::H3_ID_ERROR
-    }
+fn context_source(
+    message: impl Into<Cow<'static, str>>,
+    source: impl StdError + Send + Sync + 'static,
+) -> SharedError {
+    Arc::new(ContextError {
+        message: message.into(),
+        source: Some(Arc::new(source)),
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::*;
-    use crate::{
-        codec::{DecodeError, EncodeError},
-        connection::{ConnectionError, StreamError},
-    };
-
-    fn varint(value: u32) -> VarInt {
-        VarInt::from_u32(value)
-    }
-
-    fn assert_connection_error<E>(error: E, expected_code: Code, expected_display: &str)
-    where
-        E: H3ConnectionError + 'static,
-    {
-        assert_eq!(error.code(), expected_code);
-        assert_eq!(error.to_string(), expected_display);
-
-        let ConnectionError::H3 { source } = ConnectionError::from(error) else {
-            panic!("expected h3 connection error");
-        };
-        assert_eq!(source.code(), expected_code);
-        assert_eq!(source.to_string(), expected_display);
-    }
-
-    fn assert_stream_error<E>(error: E, expected_code: Code, expected_display: &str)
-    where
-        E: H3StreamError + 'static,
-    {
-        assert_eq!(error.code(), expected_code);
-        assert_eq!(error.to_string(), expected_display);
-
-        let StreamError::H3 { source } = StreamError::from(error) else {
-            panic!("expected h3 stream error");
-        };
-        assert_eq!(source.code(), expected_code);
-        assert_eq!(source.to_string(), expected_display);
-    }
 
     #[test]
-    fn code_conversions_and_display_cover_known_and_unknown_codes() {
-        let known = Code::H3_NO_ERROR;
-        assert_eq!(known.into_inner(), varint(0x100));
-        assert_eq!(known.value(), varint(0x100));
-        assert_eq!(VarInt::from(known), varint(0x100));
-        assert_eq!(known.to_string(), "H3_NO_ERROR (0x100)");
+    fn keeps_variant_code_and_source_chain() {
+        let error = Error::connection(
+            Some(Code::H3_SETTINGS_ERROR),
+            "invalid peer settings",
+            io::Error::new(io::ErrorKind::InvalidData, "duplicate setting"),
+        );
 
-        let custom = Code::from(varint(0x12345));
-        assert_eq!(custom.into_inner(), varint(0x12345));
-        assert_eq!(custom.value(), varint(0x12345));
-        assert_eq!(custom.to_string(), "Code 0x12345");
-
-        let constructed = Code::new(varint(0x201));
-        assert_eq!(constructed, Code::QPACK_ENCODER_STREAM_ERROR);
+        assert!(matches!(
+            error,
+            Error::Connection {
+                code: Code::H3_SETTINGS_ERROR,
+                ..
+            }
+        ));
         assert_eq!(
-            constructed.to_string(),
-            "QPACK_ENCODER_STREAM_ERROR (0x201)"
+            error.source().expect("source is retained").to_string(),
+            "invalid peer settings"
+        );
+        assert_eq!(
+            error.source().unwrap().source().unwrap().to_string(),
+            "duplicate setting"
         );
     }
 
     #[test]
-    fn connection_error_types_report_their_codes_and_messages() {
-        for error in [
-            H3StreamCreationError::DuplicateControlStream,
-            H3StreamCreationError::DuplicateQpackEncoderStream,
-            H3StreamCreationError::DuplicateQpackDecoderStream,
-        ] {
-            assert_connection_error(
-                error,
-                Code::H3_STREAM_CREATION_ERROR,
-                match error {
-                    H3StreamCreationError::DuplicateControlStream => {
-                        "control stream already exists"
-                    }
-                    H3StreamCreationError::DuplicateQpackEncoderStream => {
-                        "qpack encoder stream already exists"
-                    }
-                    H3StreamCreationError::DuplicateQpackDecoderStream => {
-                        "qpack decoder stream already exists"
-                    }
-                },
-            );
-        }
+    fn preserves_unknown_application_codes() {
+        let code = Code::try_from(0xface).expect("unknown code is a valid varint");
 
-        assert_connection_error(
-            H3CriticalStreamClosed::QPackEncoder,
-            Code::H3_CLOSED_CRITICAL_STREAM,
-            "qpack encoder stream closed unexpectedly",
-        );
-        assert_connection_error(
-            H3CriticalStreamClosed::QPackDecoder,
-            Code::H3_CLOSED_CRITICAL_STREAM,
-            "qpack decoder stream closed unexpectedly",
-        );
-        assert_connection_error(
-            H3CriticalStreamClosed::Control,
-            Code::H3_CLOSED_CRITICAL_STREAM,
-            "control stream closed unexpectedly",
-        );
-
-        for error in [
-            H3FrameUnexpected::DuplicateSettings,
-            H3FrameUnexpected::UnexpectedFrameType,
-            H3FrameUnexpected::UnexpectedFrameDuringTrailer,
-        ] {
-            assert_connection_error(
-                error,
-                Code::H3_FRAME_UNEXPECTED,
-                match error {
-                    H3FrameUnexpected::DuplicateSettings => "received subsequent SETTINGS frame",
-                    H3FrameUnexpected::UnexpectedFrameType => {
-                        "unexpected frame type on request stream"
-                    }
-                    H3FrameUnexpected::UnexpectedFrameDuringTrailer => {
-                        "unexpected frame during trailer reading"
-                    }
-                },
-            );
-        }
-
-        assert_connection_error(H3NoError, Code::H3_NO_ERROR, "no error");
-        assert_connection_error(
-            H3MissingSettings,
-            Code::H3_MISSING_SETTINGS,
-            "no SETTINGS frame at beginning of control stream",
-        );
-        assert_connection_error(
-            H3GeneralProtocolError::TrailingPayload,
-            Code::H3_GENERAL_PROTOCOL_ERROR,
-            "trailing payload in GOAWAY frame",
-        );
-        assert_connection_error(
-            H3GeneralProtocolError::Decode {
-                source: DecodeError::ArithmeticOverflow,
-            },
-            Code::H3_GENERAL_PROTOCOL_ERROR,
-            "protocol decode error",
-        );
-        assert_connection_error(
-            H3InternalError::QPackEncoderEncode {
-                source: EncodeError::HuffmanEncoding,
-            },
-            Code::H3_INTERNAL_ERROR,
-            "QPACK encoder encode failure",
-        );
-        assert_connection_error(
-            H3InternalError::MissingServerName,
-            Code::H3_INTERNAL_ERROR,
-            "missing server name (SNI) on incoming connection",
-        );
-        assert_connection_error(
-            H3FrameDecodeError {
-                source: DecodeError::IntegerOverflow,
-            },
-            Code::H3_FRAME_ERROR,
-            "frame decode error",
-        );
-        assert_connection_error(
-            QpackDecompressionFailed::Decode {
-                source: DecodeError::DecompressionFailed,
-            },
-            Code::QPACK_DECOMPRESSION_FAILED,
-            "QPACK decompression decode error",
-        );
-
-        for error in [
-            H3IdError::PushIdExceedsLimit,
-            H3IdError::GoawayStreamIdOrdering,
-        ] {
-            assert_connection_error(
-                error,
-                Code::H3_ID_ERROR,
-                match error {
-                    H3IdError::PushIdExceedsLimit => "push ID exceeds limit",
-                    H3IdError::GoawayStreamIdOrdering => "GOAWAY stream ID ordering violation",
-                },
-            );
-        }
+        assert_eq!(code.as_u64(), 0xface);
+        assert_eq!(code.to_string(), "HTTP/3 application error 0xface");
     }
 
     #[test]
-    fn stream_error_types_report_their_codes_and_messages() {
-        assert_stream_error(
-            H3MessageError::MissingHeaderSection,
-            Code::H3_MESSAGE_ERROR,
-            "missing header section in HTTP message",
+    fn body_error_has_a_distinct_variant_and_source() {
+        let error = Error::send_body(io::Error::other("producer failed"));
+
+        assert!(matches!(error, Error::Body { .. }));
+        assert_eq!(
+            error.source().unwrap().source().unwrap().to_string(),
+            "producer failed"
         );
-        assert_stream_error(
-            H3MessageError::UnexpectedHeadersInBody,
-            Code::H3_MESSAGE_ERROR,
-            "unexpected headers frame in message body",
-        );
-        assert_stream_error(
-            H3ExcessiveFieldSectionSize {
-                actual: 8192,
-                limit: 4096,
-            },
-            Code::H3_EXCESSIVE_LOAD,
-            "field section size 8192 exceeds limit 4096",
-        );
+    }
+
+    #[test]
+    fn lifecycle_categories_do_not_invent_wire_codes() {
+        assert!(matches!(Error::draining("draining"), Error::Draining));
+        assert!(matches!(Error::closed("closed"), Error::Draining));
+        assert!(matches!(
+            Error::request_rejected("not delivered"),
+            Error::Stream {
+                code: Code::H3_REQUEST_REJECTED,
+                ..
+            }
+        ));
     }
 }

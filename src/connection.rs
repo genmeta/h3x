@@ -1,2087 +1,2580 @@
 use std::{
-    any::Any,
-    fmt::{self, Debug},
-    hash::{Hash, Hasher},
-    io,
-    marker::PhantomData,
-    ops,
-    sync::Arc,
+    collections::BTreeSet,
+    error::Error as StdError,
+    fmt,
+    pin::{Pin, pin},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
-use dhttp_identity::identity as authority;
-use futures::future::BoxFuture;
-use snafu::Snafu;
-use tokio::task::JoinHandle;
-use tokio_util::task::AbortOnDropHandle;
-use tracing::Instrument;
+use bytes::{Buf, Bytes};
+use futures::SinkExt;
+use http::{HeaderMap, Request as HttpRequest, Response as HttpResponse, header::CONTENT_LENGTH};
+use http_body::{Body as HttpBody, Frame as HttpFrame};
+use http_body_util::{BodyExt, StreamBody};
+use tokio::{
+    sync::{Mutex as AsyncMutex, Notify, mpsc, watch},
+    task::{JoinHandle, JoinSet},
+};
 
 use crate::{
-    codec::{PeekableStreamReader, SinkWriter, StreamReader},
-    dhttp::{protocol::DHttpProtocolFactory, settings::Settings},
-    error::{Code, H3ConnectionError, H3StreamError},
-    protocol::{IdentifiedProtocolInitializer, ProductProtocol, Protocols, StreamVerdict},
-    qpack::protocol::QPackProtocolFactory,
-    quic::{self, GetStreamIdExt as _, ResetStreamExt, StopStreamExt},
-    varint::VarInt,
+    Body, Code, Error, Settings, StreamId, qpack,
+    stream_id::{MAX_VARINT, StreamIdExt as _},
+    transport::{self, RecvStream as _, SendStream as _},
+    wire::{
+        self, CONTROL_STREAM_TYPE, ChunkReader, FrameHeader, FrameReader, FrameType,
+        GOAWAY_FRAME_TYPE, PUSH_STREAM_TYPE, PayloadBudget, QPACK_DECODER_STREAM_TYPE,
+        QPACK_ENCODER_STREAM_TYPE,
+    },
 };
 
-/// H3 connection-level error: a QUIC transport/application error, or an
-/// H3-defined connection-scope protocol violation.
-#[derive(Debug, Snafu, Clone)]
-pub enum ConnectionError {
-    #[snafu(transparent)]
-    Quic { source: quic::ConnectionError },
-    #[snafu(display("h3 connection-scope protocol error"))]
-    #[snafu(context(false))]
-    H3 {
-        source: Arc<dyn H3ConnectionError + 'static>,
-    },
+type BoxSendStream = Box<dyn transport::SendStream>;
+type FailConnection = Arc<dyn Fn(Error) + Send + Sync>;
+const PENDING_REQUEST_LIMIT: usize = 256;
+
+struct OptionalWebTransport<S> {
+    #[cfg(feature = "webtransport")]
+    hooks: Option<crate::webtransport::Hooks<S>>,
+    #[cfg(not(feature = "webtransport"))]
+    marker: std::marker::PhantomData<fn(S)>,
 }
 
-impl<E: H3ConnectionError + 'static> From<E> for ConnectionError {
-    fn from(value: E) -> Self {
-        ConnectionError::H3 {
-            source: Arc::new(value),
-        }
-    }
-}
-
-impl From<ConnectionError> for io::Error {
-    fn from(value: ConnectionError) -> Self {
-        io::Error::new(io::ErrorKind::BrokenPipe, value)
-    }
-}
-
-/// Recovers a `ConnectionError` from `io::Error`.
-///
-/// Recovery chain: `ConnectionError` (downcast) → `quic::ConnectionError` →
-/// `Arc<dyn H3ConnectionError>`.
-impl From<io::Error> for ConnectionError {
-    fn from(source: io::Error) -> Self {
-        let error = match source.downcast::<ConnectionError>() {
-            Ok(error) => return error,
-            Err(error) => error,
-        };
-        let error = match error.downcast::<quic::ConnectionError>() {
-            Ok(error) => return Self::Quic { source: error },
-            Err(error) => error,
-        };
-        match error.downcast::<Arc<dyn H3ConnectionError + 'static>>() {
-            Ok(error) => Self::H3 { source: error },
-            Err(error) => unreachable!(
-                "io::Error({error:?}) cannot be converted to connection::ConnectionError, \
-                 this is a bug"
-            ),
-        }
-    }
-}
-
-/// Error observed on an H3 stream.
-///
-/// Three variants mirror the semantics of [`quic::StreamError`] but extended
-/// with H3-level protocol errors:
-///
-/// - `Connection` — the underlying connection failed (QUIC transport/application
-///   error, or H3 connection-scope protocol violation). This is the "connection
-///   error projected onto a stream-returning API" case.
-/// - `Reset` — the peer sent `RESET_STREAM` (or locally the stream was reset
-///   with a raw VarInt code).
-/// - `H3` — an H3 stream-scope protocol violation (e.g. malformed message).
-///
-/// # On the missing "pure stream error" type
-///
-/// Algebraically, `{Reset, H3}` forms a pure-stream subset distinct from
-/// `ConnectionError`. We deliberately did **not** introduce a dedicated type
-/// for that subset because:
-///
-/// 1. No current call site needs a type contract that excludes the
-///    `Connection` variant — every `match` on `StreamError` must handle it.
-/// 2. The quic layer below is itself flat (`Connection | Reset`); keeping the
-///    H3 layer flat preserves structural correspondence.
-/// 3. No natural domain term exists for the subset. Candidates considered and
-///    rejected for lack of fit: `PureStreamError`, `LocalStreamError`,
-///    `StreamFault`, `InStreamError`, `StreamScopeError`.
-///
-/// If a future consumer needs the contract ("this cannot be a connection
-/// error"), a 2-variant `{Reset, H3}` type can be added non-breakingly with
-/// `From<_> for StreamError` and `TryFrom<StreamError>` conversions.
-#[derive(Debug, Snafu, Clone)]
-pub enum StreamError {
-    #[snafu(transparent)]
-    Connection { source: ConnectionError },
-    #[snafu(display("stream reset with code {code}"))]
-    Reset { code: VarInt },
-    #[snafu(display("h3 stream-scope protocol error"))]
-    #[snafu(context(false))]
-    H3 {
-        source: Arc<dyn H3StreamError + 'static>,
-    },
-}
-
-impl StreamError {
-    pub fn map_stream_reset(self, map: impl FnOnce(VarInt) -> Self) -> Self {
-        match self {
-            StreamError::Reset { code } => map(code),
-            error => error,
-        }
-    }
-}
-
-impl From<quic::StreamError> for StreamError {
-    fn from(value: quic::StreamError) -> Self {
-        match value {
-            quic::StreamError::Connection { source } => Self::Connection {
-                source: source.into(),
-            },
-            quic::StreamError::Reset { code } => Self::Reset { code },
-        }
-    }
-}
-
-impl From<quic::ConnectionError> for StreamError {
-    fn from(value: quic::ConnectionError) -> Self {
-        Self::Connection {
-            source: value.into(),
-        }
-    }
-}
-
-impl<E: H3StreamError + 'static> From<E> for StreamError {
-    fn from(value: E) -> Self {
-        StreamError::H3 {
-            source: Arc::new(value),
-        }
-    }
-}
-
-/// Registry of [`H3ConnectionError`] types that are allowed to flow into
-/// stream-returning APIs. Each entry generates
-/// `impl From<$ty> for StreamError` that wraps the value into
-/// [`StreamError::Connection`] via [`ConnectionError::from`].
-///
-/// # Why a registry?
-///
-/// Rust coherence forbids two blanket impls
-/// `impl<E: H3StreamError> From<E> for StreamError` and
-/// `impl<E: H3ConnectionError> From<E> for StreamError` from coexisting
-/// because the compiler cannot prove the bounds are mutually exclusive.
-///
-/// Since stream-scope and connection-scope errors are both legitimately
-/// produced by stream-returning operations (a stream can fail with a
-/// connection-level protocol violation), we register each connection-scope
-/// H3 error type here explicitly. The registry acts as a documented opt-in:
-/// adding a new connection-scope H3 type to the registry is the type-level
-/// signal that it may be surfaced through a stream-returning API.
-///
-/// Alternative considered and rejected: requiring every call site to write
-/// `ConnectionError::from(e).into()`. Too noisy at `?` sites.
-macro_rules! h3_connection_error_into_stream_error {
-    ($($ty:ty),+ $(,)?) => {
-        $(
-            impl From<$ty> for StreamError {
-                fn from(value: $ty) -> Self {
-                    Self::Connection {
-                        source: ConnectionError::from(value),
-                    }
-                }
-            }
-        )+
-    };
-}
-
-h3_connection_error_into_stream_error!(
-    crate::error::H3NoError,
-    crate::error::H3StreamCreationError,
-    crate::error::H3CriticalStreamClosed,
-    crate::error::H3FrameUnexpected,
-    crate::error::H3MissingSettings,
-    crate::error::H3GeneralProtocolError,
-    crate::error::H3InternalError,
-    crate::error::H3FrameDecodeError,
-    crate::error::QpackDecompressionFailed,
-    crate::error::H3IdError,
-    crate::dhttp::settings::InvalidSettingValue,
-    crate::qpack::encoder::QPackDecoderStreamError,
-    crate::qpack::decoder::QPackEncoderStreamError,
-    crate::qpack::decoder::InvalidDynamicTableReference,
-);
-
-/// Error converting between `StreamError` and `io::Error`.
-///
-/// The `StreamError` is preserved as the inner error for later recovery via
-/// downcast. `Reset` maps to `BrokenPipe` to mirror `quic::StreamError`.
-impl From<StreamError> for io::Error {
-    fn from(value: StreamError) -> Self {
-        match value {
-            error @ StreamError::Reset { .. } => io::Error::new(io::ErrorKind::BrokenPipe, error),
-            StreamError::Connection { source } => io::Error::from(source),
-            error @ StreamError::H3 { .. } => io::Error::other(error),
-        }
-    }
-}
-
-/// Reverse conversion: recovers a `StreamError` from an `io::Error`.
-///
-/// Recovery chain: `StreamError` (downcast) → `quic::StreamError` →
-/// `ConnectionError` → `Arc<dyn H3StreamError>`.
-impl From<io::Error> for StreamError {
-    fn from(source: io::Error) -> Self {
-        let error = match source.downcast::<StreamError>() {
-            Ok(error) => return error,
-            Err(error) => error,
-        };
-        let error = match quic::StreamError::try_from(error) {
-            Ok(error) => return error.into(),
-            Err(error) => error,
-        };
-        let error = match error.downcast::<ConnectionError>() {
-            Ok(error) => {
-                return Self::Connection { source: error };
-            }
-            Err(error) => error,
-        };
-        match error.downcast::<Arc<dyn H3StreamError + 'static>>() {
-            Ok(error) => Self::H3 { source: error },
-            Err(error) => unreachable!(
-                "io::Error({error:?}) cannot be converted to connection::StreamError, this is a bug"
-            ),
-        }
-    }
-}
-
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Snafu, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionGoaway {
-    #[snafu(display("local goaway"))]
-    Local,
-    #[snafu(display("peer goaway"))]
-    Peer,
-}
-
-/// Extension trait providing error-handling helpers on any `Lifecycle` type.
-pub trait LifecycleExt: quic::DynLifecycle + Sync {
-    /// Handle an H3 connection-scope error.
-    ///
-    /// - `ConnectionError::Quic` — the connection has already failed; just
-    ///   return the reported error unchanged.
-    /// - `ConnectionError::H3` — a freshly detected connection-scope H3
-    ///   protocol violation. Close the QUIC connection with the H3 error
-    ///   code (unless the connection is already closed) and await the
-    ///   definitive close reason.
-    ///
-    /// Callers never need to drive `self.close(...)` themselves for H3
-    /// errors; this helper is the single place where the side effect
-    /// happens.
-    fn handle_connection_error(
-        &self,
-        error: ConnectionError,
-    ) -> impl Future<Output = quic::ConnectionError> + Send + '_ {
-        async move {
-            match error {
-                ConnectionError::Quic { source } => source,
-                ConnectionError::H3 { source } => {
-                    // Avoid a redundant `to_string()` allocation if the
-                    // connection has already closed.
-                    if let Err(error) = self.check() {
-                        return error;
-                    }
-                    self.close(source.code(), source.to_string().into());
-                    self.closed().await
-                }
-            }
-        }
-    }
-}
-
-impl<T: quic::DynLifecycle + Sync + ?Sized> LifecycleExt for T {}
-
-/// RAII guard that closes the wrapped QUIC connection on drop.
-///
-/// Used during [`ConnectionBuilder::build`] so that a partially-constructed
-/// connection (init failed, or the future was cancelled) does not leak. On
-/// successful build the guard is [defused](Self::defuse) and ownership of the
-/// `Arc<C>` is transferred into the live `Connection<C>`.
-struct CloseOnDrop<C: ?Sized + quic::DynLifecycle>(Option<Arc<C>>);
-
-impl<C: ?Sized + quic::DynLifecycle> CloseOnDrop<C> {
-    fn new(quic: Arc<C>) -> Self {
-        Self(Some(quic))
-    }
-
-    fn defuse(mut self) -> Arc<C> {
-        self.0.take().expect("CloseOnDrop already defused")
-    }
-}
-
-impl<C: ?Sized + quic::DynLifecycle> ops::Deref for CloseOnDrop<C> {
-    type Target = Arc<C>;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref().expect("CloseOnDrop already defused")
-    }
-}
-
-impl<C: ?Sized + quic::DynLifecycle> Drop for CloseOnDrop<C> {
-    fn drop(&mut self) {
-        if let Some(quic) = self.0.take() {
-            quic.close(Code::H3_NO_ERROR, "h3 build aborted".into());
-        }
-    }
-}
-
-pub struct ConnectionBuilder<C: Any> {
-    initializers: Vec<IdentifiedProtocolInitializer<C>>,
-    _connection: PhantomData<C>,
-}
-
-impl<C: Any> fmt::Debug for ConnectionBuilder<C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConnectionBuilder")
-            .field("protocols", &self.initializers)
-            .finish()
-    }
-}
-
-impl<C: Any> fmt::Display for ConnectionBuilder<C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ConnectionBuilder[")?;
-        for (i, entry) in self.initializers.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            write!(f, "{}", entry)?;
-        }
-        write!(f, "]")
-    }
-}
-
-impl<C: quic::Connection> Default for ConnectionBuilder<C> {
+impl<S> Default for OptionalWebTransport<S> {
     fn default() -> Self {
-        Self::new(Arc::new(Settings::default()))
+        Self {
+            #[cfg(feature = "webtransport")]
+            hooks: None,
+            #[cfg(not(feature = "webtransport"))]
+            marker: std::marker::PhantomData,
+        }
     }
 }
 
-impl<C: quic::Connection> ConnectionBuilder<C> {
-    pub fn new(settings: Arc<Settings>) -> Self {
-        let builder = Self {
-            initializers: Vec::new(),
-            _connection: PhantomData,
+impl<S> Clone for OptionalWebTransport<S> {
+    fn clone(&self) -> Self {
+        Self {
+            #[cfg(feature = "webtransport")]
+            hooks: self.hooks.clone(),
+            #[cfg(not(feature = "webtransport"))]
+            marker: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "webtransport")]
+impl<S> OptionalWebTransport<S> {
+    fn new(hooks: crate::webtransport::Hooks<S>) -> Self {
+        Self { hooks: Some(hooks) }
+    }
+
+    fn runtime(&self) -> Option<Arc<crate::webtransport::Runtime>> {
+        self.hooks.as_ref().map(|hooks| Arc::clone(hooks.runtime()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Running,
+    Draining,
+    Closed,
+}
+
+#[derive(Debug)]
+struct State {
+    phase: Phase,
+    max_received_stream_id: Option<StreamId>,
+    local_goaway_boundary: Option<StreamId>,
+    peer_goaway_boundary: Option<StreamId>,
+    outgoing_streams: BTreeSet<StreamId>,
+    active_incoming: usize,
+    terminal: Option<Error>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            phase: Phase::Running,
+            max_received_stream_id: None,
+            local_goaway_boundary: None,
+            peer_goaway_boundary: None,
+            outgoing_streams: BTreeSet::new(),
+            active_incoming: 0,
+            terminal: None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct Shared {
+    state: Mutex<State>,
+    local_role_bit: u64,
+    closed: Notify,
+    goaway: Notify,
+    exchanges_finished: Notify,
+    payload_budget: PayloadBudget,
+}
+
+impl Shared {
+    fn terminal(&self) -> Option<Error> {
+        self.state
+            .lock()
+            .expect("connection state lock poisoned")
+            .terminal
+            .clone()
+    }
+
+    fn check_send(&self) -> Result<(), Error> {
+        let state = self.state.lock().expect("connection state lock poisoned");
+        match state.phase {
+            Phase::Closed => Err(Error::closed("HTTP/3 connection is closed")),
+            Phase::Draining => Err(Error::draining("HTTP/3 connection is draining")),
+            Phase::Running if state.peer_goaway_boundary.is_some() => Err(Error::Goaway {
+                boundary: state.peer_goaway_boundary.expect("checked above"),
+            }),
+            Phase::Running => Ok(()),
+        }
+    }
+
+    fn register_incoming(&self, _stream_id: StreamId) -> bool {
+        let state = self.state.lock().expect("connection state lock poisoned");
+        if state.phase != Phase::Running {
+            return false;
+        }
+        true
+    }
+
+    fn register_outgoing(&self, stream_id: StreamId) -> Result<(), Error> {
+        let mut state = self.state.lock().expect("connection state lock poisoned");
+        match state.phase {
+            Phase::Closed => return Err(Error::closed("HTTP/3 connection is closed")),
+            Phase::Draining => return Err(Error::draining("HTTP/3 connection is draining")),
+            Phase::Running => {}
+        }
+        if let Some(boundary) = state.peer_goaway_boundary {
+            return Err(Error::Goaway { boundary });
+        }
+        state.outgoing_streams.insert(stream_id);
+        Ok(())
+    }
+
+    fn unregister_outgoing(&self, stream_id: StreamId) {
+        let removed = self
+            .state
+            .lock()
+            .expect("connection state lock poisoned")
+            .outgoing_streams
+            .remove(&stream_id);
+        if removed {
+            self.exchanges_finished.notify_waiters();
+        }
+    }
+
+    fn register_incoming_delivery(&self, stream_id: StreamId) -> Result<(), Error> {
+        let mut state = self.state.lock().expect("connection state lock poisoned");
+        if state.phase != Phase::Running {
+            return Err(Error::request_rejected(
+                "request was not delivered because the connection is draining",
+            ));
+        }
+        state.max_received_stream_id = Some(
+            state
+                .max_received_stream_id
+                .map_or(stream_id, |current| current.max(stream_id)),
+        );
+        state.active_incoming += 1;
+        Ok(())
+    }
+
+    fn finish_incoming(&self) {
+        let mut state = self.state.lock().expect("connection state lock poisoned");
+        debug_assert!(state.active_incoming > 0);
+        state.active_incoming = state.active_incoming.saturating_sub(1);
+        drop(state);
+        self.exchanges_finished.notify_waiters();
+    }
+
+    fn begin_shutdown(&self) -> Option<StreamId> {
+        let mut state = self.state.lock().expect("connection state lock poisoned");
+        if state.phase != Phase::Running {
+            return state.local_goaway_boundary;
+        }
+
+        let boundary = match state.max_received_stream_id {
+            None => Some(crate::stream_id::from_u64_unchecked(0)),
+            Some(stream_id) => stream_id
+                .as_u64()
+                .checked_add(4)
+                .filter(|value| *value <= MAX_VARINT)
+                .map(crate::stream_id::from_u64_unchecked),
         };
-        builder
-            .protocol(DHttpProtocolFactory::new(settings))
-            .protocol(QPackProtocolFactory::new())
+        state.phase = Phase::Draining;
+        state.local_goaway_boundary = boundary;
+        boundary
     }
 
-    pub fn protocol<F: ProductProtocol<C>>(mut self, factory: F) -> Self {
-        self.initializers
-            .push(IdentifiedProtocolInitializer::new(factory));
-        self
-    }
-
-    pub async fn build(&self, quic: Arc<C>) -> Result<Connection<C>, quic::ConnectionError>
-    where
-        C: Sized,
-    {
-        // If any initializer fails (or this future is dropped before completion),
-        // close the underlying QUIC connection so it does not leak. Defused on
-        // success so the live `Connection<C>` keeps ownership.
-        let quic = CloseOnDrop::new(quic);
-        let mut protocols = Protocols::new();
-
-        for initializer in &self.initializers {
-            initializer.init_protocols(&quic, &mut protocols).await?;
+    fn apply_peer_goaway(&self, boundary: StreamId) -> Result<(), Error> {
+        let mut state = self.state.lock().expect("connection state lock poisoned");
+        let raw = boundary.as_u64();
+        if raw != 0 && (raw & 0x02 != 0 || raw & 0x01 != self.local_role_bit) {
+            return Err(Error::connection_protocol(
+                Code::H3_ID_ERROR,
+                "GOAWAY boundary is not a locally initiated bidirectional stream ID",
+            ));
         }
-
-        let quic = quic.defuse();
-        let protocols = Arc::new(protocols);
-        let state = ConnectionState { quic, protocols };
-        // Terminates when the QUIC connection closes and stream acceptance returns an error.
-        // Wrapped in `AbortOnDropHandle` so dropping the owning `Connection<C>` aborts the
-        // tasks immediately, breaking the strong-reference cycle that would otherwise keep
-        // the underlying QUIC connection alive.
-        let accept_uni: JoinHandle<()> =
-            tokio::spawn(ConnectionState::accept_uni_stream_task(state.clone()).in_current_span());
-        let accept_bi: JoinHandle<()> =
-            tokio::spawn(ConnectionState::accept_bi_stream_task(state.clone()).in_current_span());
-
-        Ok(Connection {
-            state,
-            _accept_tasks: [
-                AbortOnDropHandle::new(accept_uni),
-                AbortOnDropHandle::new(accept_bi),
-            ],
-        })
+        if let Some(previous) = state.peer_goaway_boundary
+            && boundary > previous
+        {
+            return Err(Error::connection_protocol(
+                Code::H3_ID_ERROR,
+                format!(
+                    "GOAWAY boundary increased from {} to {}",
+                    previous.as_u64(),
+                    boundary.as_u64()
+                ),
+            ));
+        }
+        state.peer_goaway_boundary = Some(boundary);
+        drop(state);
+        self.goaway.notify_waiters();
+        Ok(())
     }
-}
 
-impl<C: Any> Hash for ConnectionBuilder<C> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        for initializer in &self.initializers {
-            initializer.hash(state);
+    fn is_accepting(&self) -> bool {
+        self.state
+            .lock()
+            .expect("connection state lock poisoned")
+            .phase
+            == Phase::Running
+    }
+
+    fn is_draining(&self) -> bool {
+        let state = self.state.lock().expect("connection state lock poisoned");
+        state.phase != Phase::Running || state.peer_goaway_boundary.is_some()
+    }
+
+    fn fail(&self, error: Error) {
+        let mut state = self.state.lock().expect("connection state lock poisoned");
+        if state.terminal.is_none() {
+            state.phase = Phase::Closed;
+            state.terminal = Some(error);
+            drop(state);
+            self.closed.notify_waiters();
+        }
+    }
+
+    async fn wait_closed(&self) -> Error {
+        loop {
+            let notified = self.closed.notified();
+            if let Some(error) = self.terminal() {
+                return error;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_peer_goaway_covering(&self, stream_id: StreamId) -> StreamId {
+        loop {
+            let notified = self.goaway.notified();
+            if let Some(boundary) = self
+                .state
+                .lock()
+                .expect("connection state lock poisoned")
+                .peer_goaway_boundary
+                .filter(|boundary| stream_id >= *boundary)
+            {
+                return boundary;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_for_exchanges(&self) {
+        loop {
+            let notified = self.exchanges_finished.notified();
+            let finished = {
+                let state = self.state.lock().expect("connection state lock poisoned");
+                state.outgoing_streams.is_empty() && state.active_incoming == 0
+            };
+            if finished {
+                return;
+            }
+            notified.await;
         }
     }
 }
 
-impl<C: Any> PartialEq for ConnectionBuilder<C> {
-    fn eq(&self, other: &Self) -> bool {
-        self.initializers == other.initializers
+#[derive(Debug, Default)]
+struct PeerCriticalStreams {
+    control: AtomicBool,
+    qpack_encoder: AtomicBool,
+    qpack_decoder: AtomicBool,
+}
+
+impl PeerCriticalStreams {
+    fn claim(flag: &AtomicBool, name: &'static str) -> Result<(), Error> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| {
+                Error::connection_protocol(
+                    Code::H3_STREAM_CREATION_ERROR,
+                    format!("duplicate peer {name} stream"),
+                )
+            })
     }
 }
 
-impl<C: Any> Eq for ConnectionBuilder<C> {}
-
-pub struct ConnectionState<C: ?Sized> {
-    quic: Arc<C>,
-    protocols: Arc<Protocols>,
+struct LocalCriticalStreams {
+    control: AsyncMutex<BoxSendStream>,
 }
 
-// Manual `Debug` so that `ConnectionState<dyn DynConnection>` (which does not
-// implement `Debug`) is still formattable. `quic` is intentionally omitted
-// because most `dyn` connections do not implement `Debug`.
-impl<C: ?Sized> fmt::Debug for ConnectionState<C> {
+type AcceptedRequest = (HttpRequest<Body>, Response);
+
+struct Inner<T: transport::Connection> {
+    transport: Arc<T>,
+    shared: Arc<Shared>,
+    requests: AsyncMutex<mpsc::Receiver<AcceptedRequest>>,
+    stop_accepting: watch::Sender<bool>,
+    cancel: watch::Sender<bool>,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    critical: LocalCriticalStreams,
+    qpack: Arc<qpack::Qpack>,
+    fail_connection: FailConnection,
+    #[cfg_attr(not(feature = "webtransport"), allow(dead_code))]
+    webtransport: OptionalWebTransport<T::SendStream>,
+}
+
+impl<T: transport::Connection> Drop for Inner<T> {
+    fn drop(&mut self) {
+        let _ = self.stop_accepting.send(true);
+        let _ = self.cancel.send(true);
+        self.transport
+            .close(Code::H3_NO_ERROR, b"last h3x connection handle dropped");
+        #[cfg(feature = "webtransport")]
+        if let Some(runtime) = self.webtransport.runtime() {
+            runtime.fail(Error::closed("HTTP/3 connection handle was dropped"));
+        }
+        for task in self.tasks.lock().expect("task lock poisoned").drain(..) {
+            task.abort();
+        }
+    }
+}
+
+impl<T: transport::Connection> Inner<T> {
+    async fn join_tasks(&self) -> Result<(), Error> {
+        let tasks: Vec<_> = self
+            .tasks
+            .lock()
+            .expect("task lock poisoned")
+            .drain(..)
+            .collect();
+        for task in tasks {
+            match task.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    return Err(Error::connection(
+                        Some(Code::H3_INTERNAL_ERROR),
+                        "HTTP/3 supervisor task failed",
+                        error,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Symmetric HTTP/3 protocol running over an established QUIC connection.
+pub struct Connection<T: transport::Connection> {
+    inner: Arc<Inner<T>>,
+}
+
+impl<T: transport::Connection> Clone for Connection<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T: transport::Connection> fmt::Debug for Connection<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConnectionState")
-            .field("protocols", &self.protocols)
+        f.debug_struct("Connection")
+            .field("draining", &self.is_draining())
             .finish_non_exhaustive()
     }
 }
 
-impl<C: ?Sized> ConnectionState<C> {
-    pub fn quic(&self) -> &Arc<C> {
-        &self.quic
+impl<T: transport::Connection> Connection<T> {
+    pub async fn new(transport: T, settings: Settings) -> Result<Self, Error> {
+        let transport = Arc::new(transport);
+        let tasks = Arc::new(Mutex::new(Vec::new()));
+        Self::new_inner(transport, settings, tasks, OptionalWebTransport::default()).await
     }
 
-    pub fn protocol<P: Any>(&self) -> Option<&P> {
-        self.protocols.get::<P>()
+    async fn new_inner(
+        transport: Arc<T>,
+        settings: Settings,
+        tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+        webtransport: OptionalWebTransport<T::SendStream>,
+    ) -> Result<Self, Error> {
+        validate_settings(&settings)?;
+
+        let mut control = open_critical_stream(&*transport, CONTROL_STREAM_TYPE)
+            .await
+            .inspect_err(|error| close_after_init_failure(&*transport, error))?;
+        send_bytes(&mut control, wire::encode_settings_frame(&settings)?)
+            .await
+            .inspect_err(|error| close_after_init_failure(&*transport, error))?;
+
+        let qpack_encoder = open_critical_stream(&*transport, QPACK_ENCODER_STREAM_TYPE)
+            .await
+            .inspect_err(|error| close_after_init_failure(&*transport, error))?;
+        let qpack_decoder = open_critical_stream(&*transport, QPACK_DECODER_STREAM_TYPE)
+            .await
+            .inspect_err(|error| close_after_init_failure(&*transport, error))?;
+
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State::default()),
+            local_role_bit: control.id().as_u64() & 0x01,
+            closed: Notify::new(),
+            goaway: Notify::new(),
+            exchanges_finished: Notify::new(),
+            payload_budget: PayloadBudget::default(),
+        });
+        let fail_connection = {
+            let transport = Arc::clone(&transport);
+            let shared = Arc::clone(&shared);
+            Arc::new(move |error| fail_protocol(&*transport, &shared, error))
+                as Arc<dyn Fn(Error) + Send + Sync>
+        };
+        let (qpack, qpack_decoder_writer) = qpack::Qpack::new(
+            &settings,
+            qpack_encoder,
+            qpack_decoder,
+            Arc::clone(&fail_connection),
+        );
+
+        let peer_critical = Arc::new(PeerCriticalStreams::default());
+        let (requests_tx, requests_rx) = mpsc::channel(PENDING_REQUEST_LIMIT);
+        let (stop_accepting, stop_accepting_rx) = watch::channel(false);
+        let (cancel, cancel_rx) = watch::channel(false);
+        #[cfg(feature = "webtransport")]
+        let webtransport_runtime = webtransport.runtime();
+
+        let inner = Arc::new(Inner {
+            transport: Arc::clone(&transport),
+            shared: Arc::clone(&shared),
+            requests: AsyncMutex::new(requests_rx),
+            stop_accepting,
+            cancel,
+            tasks,
+            critical: LocalCriticalStreams {
+                control: AsyncMutex::new(control),
+            },
+            qpack: Arc::clone(&qpack),
+            fail_connection: Arc::clone(&fail_connection),
+            webtransport: webtransport.clone(),
+        });
+
+        let closed_task = tokio::spawn(watch_transport_closed(
+            Arc::clone(&transport),
+            Arc::clone(&shared),
+        ));
+        let request_dispatch = RequestDispatch {
+            shared: Arc::clone(&shared),
+            requests: requests_tx,
+            qpack: Arc::clone(&qpack),
+            fail_connection: Arc::clone(&fail_connection),
+            shutdown: stop_accepting_rx,
+            #[cfg(feature = "webtransport")]
+            connection: Some(Arc::clone(&inner) as Arc<dyn Send + Sync>),
+        };
+        let bi_task = tokio::spawn(accept_bidi_streams(
+            Arc::clone(&transport),
+            request_dispatch,
+            webtransport.clone(),
+        ));
+        let uni_task = tokio::spawn(accept_uni_streams(
+            Arc::clone(&transport),
+            Arc::clone(&shared),
+            peer_critical,
+            Arc::clone(&qpack),
+            Arc::clone(&fail_connection),
+            cancel_rx,
+            webtransport,
+        ));
+        let qpack_writer_task = tokio::spawn(supervise_qpack_decoder_writer(
+            Arc::clone(&transport),
+            Arc::clone(&shared),
+            qpack_decoder_writer,
+            inner.cancel.subscribe(),
+        ));
+        let qpack_lifecycle_task = tokio::spawn(supervise_qpack_lifecycle(
+            Arc::clone(&shared),
+            Arc::clone(&qpack),
+        ));
+        inner.tasks.lock().expect("task lock poisoned").extend([
+            closed_task,
+            bi_task,
+            uni_task,
+            qpack_writer_task,
+            qpack_lifecycle_task,
+        ]);
+
+        #[cfg(feature = "webtransport")]
+        if let Some(runtime) = webtransport_runtime {
+            let datagram_task = tokio::spawn(supervise_webtransport_datagrams(
+                Arc::clone(&transport),
+                Arc::clone(&shared),
+                Arc::clone(&runtime),
+                inner.cancel.subscribe(),
+            ));
+            let lifecycle_task = tokio::spawn(supervise_webtransport_lifecycle(
+                Arc::clone(&shared),
+                runtime,
+            ));
+            inner
+                .tasks
+                .lock()
+                .expect("task lock poisoned")
+                .extend([datagram_task, lifecycle_task]);
+        }
+
+        Ok(Self { inner })
     }
 
-    pub fn protocols(&self) -> &Arc<Protocols> {
-        &self.protocols
-    }
-}
-
-impl<C: quic::Connection> ConnectionState<C> {
-    /// Erase the concrete QUIC connection type, yielding a state that is
-    /// usable as `ConnectionState<dyn quic::DynConnection>`.
+    /// Opens a request stream and sends its HEADERS.
     ///
-    /// Used on the server path so that [`UnresolvedRequest`](crate::endpoint::UnresolvedRequest)
-    /// can carry a single type-erased connection handle regardless of the
-    /// underlying QUIC implementation.
-    #[must_use]
-    pub fn erase(&self) -> ConnectionState<dyn quic::DynConnection> {
-        // `Arc<C>` coerces to `Arc<dyn DynConnection>` because `C: Connection`
-        // implies `C: DynConnection + Sized + 'static` via the blanket impl in
-        // [`crate::quic`].
-        let quic: Arc<dyn quic::DynConnection> = self.quic.clone();
-        ConnectionState {
-            quic,
-            protocols: self.protocols.clone(),
+    /// Request DATA, trailers, FIN, and the response are driven explicitly by
+    /// the returned stream; no body pump is started in the background.
+    pub async fn request(&self, parts: http::request::Parts) -> Result<RequestStream, Error> {
+        self.inner.shared.check_send()?;
+        let remaining = content_length(&parts.headers).map_err(Error::into_invalid_message)?;
+        let (mut reader, mut writer) = fail_on_connection(
+            self.inner
+                .transport
+                .open_bi()
+                .await
+                .map_err(map_connection_error),
+            &self.inner.fail_connection,
+        )?;
+        let stream_id = reader.id();
+        if stream_id != writer.id() || stream_id.as_u64() & 0x02 != 0 {
+            let error = Error::connection_protocol(
+                Code::H3_ID_ERROR,
+                "transport returned an invalid bidirectional stream pair",
+            );
+            let _ = reader.stop(Code::H3_ID_ERROR);
+            let _ = writer.reset(Code::H3_ID_ERROR);
+            fail_protocol(&*self.inner.transport, &self.inner.shared, error.clone());
+            return Err(error);
+        }
+        if let Err(error) = self.inner.shared.register_outgoing(stream_id) {
+            let _ = reader.stop(Code::H3_REQUEST_REJECTED);
+            let _ = writer.reset(Code::H3_REQUEST_REJECTED);
+            return Err(error);
+        }
+
+        let exchange = OutgoingExchange {
+            shared: Arc::clone(&self.inner.shared),
+            stream_id,
+        };
+        let headers = match self.inner.qpack.encode_request(stream_id, parts).await {
+            Ok(headers) => headers,
+            Err(error) => {
+                let _ = reader.stop(error.code().unwrap_or(Code::H3_REQUEST_CANCELLED));
+                let _ = writer.reset(error.code().unwrap_or(Code::H3_REQUEST_CANCELLED));
+                return Err(error);
+            }
+        };
+        let mut writer: BoxSendStream = Box::new(writer);
+        if let Err(error) = fail_on_connection(
+            write_h3_frame(&mut writer, wire::HEADERS_FRAME_TYPE, &headers).await,
+            &self.inner.fail_connection,
+        ) {
+            let _ = writer.reset(error.code().unwrap_or(Code::H3_REQUEST_CANCELLED));
+            return Err(error);
+        }
+
+        Ok(RequestStream {
+            stream_id,
+            send: AsyncMutex::new(RequestSendState {
+                writer: Some(writer),
+                remaining,
+                phase: RequestSendPhase::Open,
+            }),
+            response: AsyncMutex::new(RequestResponseState {
+                reader: Some(FrameReader::new(
+                    ChunkReader::new(reader),
+                    self.inner.shared.payload_budget.clone(),
+                )),
+                phase: RequestResponsePhase::Waiting,
+            }),
+            response_waiting: AtomicBool::new(false),
+            exchange: Mutex::new(Some(exchange)),
+            shared: Arc::clone(&self.inner.shared),
+            qpack: Arc::clone(&self.inner.qpack),
+            fail_connection: Arc::clone(&self.inner.fail_connection),
+            #[cfg(feature = "webtransport")]
+            webtransport: self.inner.webtransport.runtime(),
+        })
+    }
+
+    pub async fn accept(&self) -> Result<Option<AcceptedRequest>, Error> {
+        if !self.inner.shared.is_accepting() {
+            return Ok(None);
+        }
+
+        let mut requests = self.inner.requests.lock().await;
+        tokio::select! {
+            request = requests.recv() => match request {
+                Some(request) => Ok(Some(request)),
+                None => self.inner.shared.terminal().map_or(Ok(None), Err),
+            },
+            error = self.inner.shared.wait_closed() => Err(error),
+        }
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.inner.shared.is_draining()
+    }
+
+    pub async fn shutdown(&self) -> Result<(), Error> {
+        if let Some(error) = self.inner.shared.terminal() {
+            return if error.code() == Some(Code::H3_NO_ERROR) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+
+        if let Some(boundary) = self.inner.shared.begin_shutdown() {
+            let mut payload = Vec::with_capacity(8);
+            wire::encode_varint(boundary.as_u64(), &mut payload)?;
+            let goaway = wire::encode_frame(GOAWAY_FRAME_TYPE, &payload)?;
+            let mut control = self.inner.critical.control.lock().await;
+            send_bytes(&mut control, goaway).await?;
+        }
+
+        let _ = self.inner.stop_accepting.send(true);
+        let mut requests = self.inner.requests.lock().await;
+        while let Ok(request) = requests.try_recv() {
+            drop(request);
+        }
+        drop(requests);
+
+        self.inner.shared.wait_for_exchanges().await;
+
+        self.inner
+            .transport
+            .close(Code::H3_NO_ERROR, b"graceful HTTP/3 shutdown");
+        let result = self.closed().await;
+        let _ = self.inner.cancel.send(true);
+        let tasks = self.inner.join_tasks().await;
+        result.and(tasks)
+    }
+
+    pub fn close(&self, code: Code, reason: &[u8]) {
+        self.inner.shared.begin_shutdown();
+        let _ = self.inner.stop_accepting.send(true);
+        let _ = self.inner.cancel.send(true);
+        self.inner.transport.close(code, reason);
+    }
+
+    pub async fn closed(&self) -> Result<(), Error> {
+        let error = self.inner.shared.wait_closed().await;
+        if error.code() == Some(Code::H3_NO_ERROR) {
+            Ok(())
+        } else {
+            Err(error)
         }
     }
 }
 
-impl<C: ?Sized + quic::DynLifecycle> ConnectionState<C> {
-    pub fn check(&self) -> Result<(), quic::ConnectionError> {
-        self.quic.check()
+#[cfg(feature = "webtransport")]
+impl<T: transport::webtransport::Connection> Connection<T> {
+    pub async fn new_webtransport(transport: T, mut settings: Settings) -> Result<Self, Error> {
+        settings.enable_webtransport();
+        let transport = Arc::new(transport);
+        let tasks = Arc::new(Mutex::new(Vec::new()));
+        let hooks = match crate::webtransport::configure(
+            Arc::clone(&transport),
+            crate::webtransport::Config::default(),
+            Arc::clone(&tasks),
+        ) {
+            Ok(hooks) => hooks,
+            Err(error) => {
+                close_after_init_failure(&*transport, &error);
+                return Err(error);
+            }
+        };
+        Self::new_inner(transport, settings, tasks, OptionalWebTransport::new(hooks)).await
     }
 
-    pub fn closed(&self) -> BoxFuture<'_, quic::ConnectionError> {
-        self.quic.closed()
-    }
+    pub async fn webtransport(
+        &self,
+        mut request: HttpRequest<()>,
+    ) -> Result<crate::webtransport::ConnectResponse, Error> {
+        self.inner.shared.check_send()?;
+        if self.inner.shared.local_role_bit != 0 {
+            return Err(Error::invalid_state("webtransport"));
+        }
+        if request.method() != http::Method::CONNECT {
+            return Err(Error::stream(None, "WebTransport requires CONNECT"));
+        }
+        if !request
+            .uri()
+            .scheme()
+            .is_some_and(|scheme| scheme.as_str().eq_ignore_ascii_case("https"))
+        {
+            return Err(Error::stream(None, "WebTransport requires an https URI"));
+        }
+        if content_length(request.headers())
+            .map_err(Error::into_invalid_message)?
+            .is_some()
+        {
+            return Err(Error::stream(
+                None,
+                "WebTransport CONNECT request cannot declare Content-Length",
+            ));
+        }
+        let runtime = self
+            .inner
+            .webtransport
+            .runtime()
+            .ok_or_else(|| Error::invalid_state("webtransport"))?;
+        runtime.wait_server_support().await?;
 
-    pub fn close(&self, code: Code, reason: impl Into<std::borrow::Cow<'static, str>>) {
-        self.quic.close(code, reason.into());
-    }
+        request
+            .extensions_mut()
+            .insert(crate::webtransport::ProtocolMarker);
+        let (parts, ()) = request.into_parts();
+        let (mut reader, mut writer) = fail_on_connection(
+            self.inner
+                .transport
+                .open_bi()
+                .await
+                .map_err(map_connection_error),
+            &self.inner.fail_connection,
+        )?;
+        let stream_id = reader.id();
+        if stream_id != writer.id() || stream_id.as_u64() & 0x03 != 0 {
+            let error = Error::connection_protocol(
+                Code::H3_ID_ERROR,
+                "WebTransport CONNECT must use a client-initiated bidirectional stream",
+            );
+            let _ = reader.stop(Code::H3_ID_ERROR);
+            let _ = writer.reset(Code::H3_ID_ERROR);
+            fail_protocol(&*self.inner.transport, &self.inner.shared, error.clone());
+            return Err(error);
+        }
+        if let Err(error) = self.inner.shared.register_outgoing(stream_id) {
+            let _ = reader.stop(Code::H3_REQUEST_REJECTED);
+            let _ = writer.reset(Code::H3_REQUEST_REJECTED);
+            return Err(error);
+        }
 
-    #[cfg(test)]
-    pub(crate) fn new_for_test(quic: Arc<C>, protocols: Arc<Protocols>) -> Self {
-        Self { quic, protocols }
+        let exchange = OutgoingExchange {
+            shared: Arc::clone(&self.inner.shared),
+            stream_id,
+        };
+        let mut writer = ResetOnDrop::new(Box::new(writer), Code::H3_REQUEST_CANCELLED);
+        let pending =
+            match runtime.prepare(stream_id, Arc::clone(&self.inner) as Arc<dyn Send + Sync>) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    let code = error.code().unwrap_or(Code::H3_REQUEST_CANCELLED);
+                    let _ = reader.stop(code);
+                    let _ = writer.writer().reset(code);
+                    writer.disarm();
+                    return Err(error);
+                }
+            };
+        let mut qpack_cancellation =
+            QpackCancelOnDrop::new(Arc::clone(&self.inner.qpack), stream_id);
+        let headers = self.inner.qpack.encode_request(stream_id, parts).await?;
+        fail_on_connection(
+            write_h3_frame(writer.writer(), wire::HEADERS_FRAME_TYPE, &headers).await,
+            &self.inner.fail_connection,
+        )?;
+        let mut reader = FrameReader::new(
+            ChunkReader::new(reader),
+            self.inner.shared.payload_budget.clone(),
+        );
+
+        tokio::select! {
+            result = async { loop {
+                let frame = read_h3_frame(&mut reader, &self.inner.fail_connection, Some(&runtime))
+                    .await.map_err(map_outgoing_request_error)?;
+            let Some(frame) = frame else {
+                return Err(Error::stream(
+                    Some(Code::H3_REQUEST_INCOMPLETE),
+                    "WebTransport CONNECT ended before final response headers",
+                ));
+            };
+            match frame.frame_type {
+                FrameType::Headers => {
+                    let payload = read_h3_payload(&mut reader, &self.inner.fail_connection).await?;
+                    let mut parts = self
+                        .inner
+                        .qpack
+                        .decode_response(stream_id, &payload)
+                        .await
+                        .map_err(map_outgoing_request_error)?;
+                    if parts.status.is_informational() {
+                        continue;
+                    }
+                    let accepted = parts.status.is_success();
+                    if accepted && content_length(&parts.headers)?.is_some() {
+                        return Err(Error::stream(
+                            Some(Code::H3_MESSAGE_ERROR),
+                            "successful WebTransport response cannot declare Content-Length",
+                        ));
+                    }
+                    parts.extensions.insert(stream_id);
+                    let body = ReceivedBody {
+                        reader,
+                        is_response: true,
+                        qpack: Arc::clone(&self.inner.qpack),
+                        fail_connection: Arc::clone(&self.inner.fail_connection),
+                        stream_id,
+                        remaining: None,
+                        trailers_received: false,
+                        finished: false,
+                        stop_code: Code::WT_SESSION_GONE,
+                        _exchange: Some(BodyExchange::outgoing(exchange)),
+                        webtransport: Some(Arc::clone(&runtime)),
+                    }
+                    .into_body();
+                    qpack_cancellation.disarm();
+                    if accepted {
+                        let response = HttpResponse::from_parts(parts, ());
+                        let session = pending.start(body, writer.take());
+                        return Ok(crate::webtransport::ConnectResponse::Accepted {
+                            response,
+                            session,
+                        });
+                    }
+
+                    fail_on_connection(
+                        writer
+                            .writer()
+                            .close()
+                            .await
+                            .map_err(wire::map_stream_error),
+                        &self.inner.fail_connection,
+                    )?;
+                    writer.disarm();
+                    return Ok(crate::webtransport::ConnectResponse::Rejected(
+                        HttpResponse::from_parts(parts, body),
+                    ));
+                }
+                FrameType::Data => {
+                    return Err(unexpected_frame(&self.inner.fail_connection));
+                }
+                FrameType::PushPromise => {
+                    return Err(
+                        reject_push_promise(&mut reader, &self.inner.fail_connection).await,
+                    );
+                }
+                FrameType::Unknown(_) => {
+                    discard_h3_payload(&mut reader, &self.inner.fail_connection).await?
+                }
+                _ => return Err(unexpected_frame(&self.inner.fail_connection)),
+            }
+            } } => result,
+            boundary = self.inner.shared.wait_peer_goaway_covering(stream_id) => Err(Error::Goaway { boundary }),
+        }
     }
 }
 
-impl<C: quic::ManageStream + quic::Lifecycle + Sync> ConnectionState<C> {
-    pub async fn open_bi(
-        &self,
-    ) -> Result<(C::StreamReader, C::StreamWriter), quic::ConnectionError> {
-        match { self.quic.open_bi() }.await {
-            Ok(streams) => Ok(streams),
-            Err(error) => Err(self.quic.handle_connection_error(error.into()).await),
+#[derive(Clone)]
+enum RequestSendPhase {
+    Open,
+    Finished,
+    Failed(Error),
+}
+
+struct RequestSendState {
+    writer: Option<BoxSendStream>,
+    remaining: Option<u64>,
+    phase: RequestSendPhase,
+}
+
+#[derive(Clone)]
+enum RequestResponsePhase {
+    Waiting,
+    Delivered,
+    Failed(Error),
+}
+
+struct RequestResponseState {
+    reader: Option<FrameReader>,
+    phase: RequestResponsePhase,
+}
+
+/// One outbound HTTP/3 request stream.
+pub struct RequestStream {
+    stream_id: StreamId,
+    send: AsyncMutex<RequestSendState>,
+    response: AsyncMutex<RequestResponseState>,
+    response_waiting: AtomicBool,
+    exchange: Mutex<Option<OutgoingExchange>>,
+    shared: Arc<Shared>,
+    qpack: Arc<qpack::Qpack>,
+    fail_connection: FailConnection,
+    #[cfg(feature = "webtransport")]
+    webtransport: Option<Arc<crate::webtransport::Runtime>>,
+}
+
+impl fmt::Debug for RequestStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestStream")
+            .field("stream_id", &self.stream_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RequestStream {
+    pub const fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub async fn write(&self, data: Bytes) -> Result<(), Error> {
+        let mut state = self.send.lock().await;
+        match &state.phase {
+            RequestSendPhase::Open => {}
+            RequestSendPhase::Finished => {
+                return Err(Error::invalid_state("write"));
+            }
+            RequestSendPhase::Failed(error) => return Err(error.clone()),
+        }
+
+        let remaining = match state.remaining {
+            Some(remaining) => Some(remaining.checked_sub(data.len() as u64).ok_or_else(|| {
+                Error::stream(
+                    Some(Code::H3_MESSAGE_ERROR),
+                    "outgoing body exceeds Content-Length",
+                )
+            })?),
+            None => None,
+        };
+        let frame = wire::encode_frame(wire::DATA_FRAME_TYPE, &data)?;
+        let mut commit = RequestSendCommit::new(&mut state);
+        if let Err(error) = send_bytes(commit.writer(), frame).await {
+            commit.fail(error.clone());
+            return fail_on_connection(Err(error), &self.fail_connection);
+        }
+        commit.disarm();
+        drop(commit);
+        state.remaining = remaining;
+        Ok(())
+    }
+
+    pub async fn trailers(&self, trailers: HeaderMap) -> Result<(), Error> {
+        let mut state = self.send.lock().await;
+        match &state.phase {
+            RequestSendPhase::Open => {}
+            RequestSendPhase::Finished => {
+                return Err(Error::invalid_state("trailers"));
+            }
+            RequestSendPhase::Failed(error) => return Err(error.clone()),
+        }
+        if state.remaining.is_some_and(|remaining| remaining != 0) {
+            return Err(Error::stream(
+                Some(Code::H3_MESSAGE_ERROR),
+                "outgoing body length does not match Content-Length",
+            ));
+        }
+
+        let trailers = self.qpack.encode_trailers(self.stream_id, trailers).await?;
+        let mut commit = RequestSendCommit::new(&mut state);
+        let result = async {
+            write_h3_frame(commit.writer(), wire::HEADERS_FRAME_TYPE, &trailers).await?;
+            commit
+                .writer()
+                .close()
+                .await
+                .map_err(wire::map_stream_error)
+        }
+        .await;
+        if let Err(error) = result {
+            commit.fail(error.clone());
+            return fail_on_connection(Err(error), &self.fail_connection);
+        }
+        commit.finish();
+        Ok(())
+    }
+
+    pub async fn finish(&self) -> Result<(), Error> {
+        let mut state = self.send.lock().await;
+        match &state.phase {
+            RequestSendPhase::Finished => return Ok(()),
+            RequestSendPhase::Failed(error) => return Err(error.clone()),
+            RequestSendPhase::Open => {}
+        }
+        if state.remaining.is_some_and(|remaining| remaining != 0) {
+            return Err(Error::stream(
+                Some(Code::H3_MESSAGE_ERROR),
+                "outgoing body length does not match Content-Length",
+            ));
+        }
+
+        let mut commit = RequestSendCommit::new(&mut state);
+        if let Err(error) = commit
+            .writer()
+            .close()
+            .await
+            .map_err(wire::map_stream_error)
+        {
+            commit.fail(error.clone());
+            return fail_on_connection(Err(error), &self.fail_connection);
+        }
+        commit.finish();
+        Ok(())
+    }
+
+    /// Waits for the final response headers.
+    ///
+    /// Dropping this future once reading begins stops the response direction;
+    /// it cannot be retried after a partial frame. Uploading remains independent.
+    pub async fn response(&self) -> Result<HttpResponse<Body>, Error> {
+        if self
+            .response_waiting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(Error::invalid_state("response"));
+        }
+        let _waiting = ResponseWaitGuard(&self.response_waiting);
+        let mut state = self.response.lock().await;
+        match &state.phase {
+            RequestResponsePhase::Waiting => {}
+            RequestResponsePhase::Delivered => {
+                return Err(Error::invalid_state("response"));
+            }
+            RequestResponsePhase::Failed(error) => return Err(error.clone()),
+        }
+
+        let cancellation = ResponseReadGuard {
+            state: &mut state,
+            qpack: &self.qpack,
+            stream_id: self.stream_id,
+        };
+        let state = &mut *cancellation.state;
+        let result = tokio::select! {
+            result = async {
+            loop {
+                let frame = read_h3_frame(
+                    state.reader.as_mut().expect("response reader is present"),
+                    &self.fail_connection,
+                    #[cfg(feature = "webtransport")]
+                    self.webtransport.as_ref(),
+                ).await.map_err(map_outgoing_request_error);
+                let frame = frame?;
+                let Some(frame) = frame else {
+                    return Err(Error::stream(
+                        Some(Code::H3_REQUEST_INCOMPLETE),
+                        "response stream ended before final response headers",
+                    ));
+                };
+                match frame.frame_type {
+                    FrameType::Headers => {
+                        let payload = read_h3_payload(
+                            state.reader.as_mut().expect("response reader is present"),
+                            &self.fail_connection,
+                        )
+                        .await?;
+                        let mut parts = self
+                            .qpack
+                            .decode_response(self.stream_id, &payload)
+                            .await
+                            .map_err(map_outgoing_request_error)?;
+                        if parts.status.is_informational() {
+                            continue;
+                        }
+                        parts.extensions.insert(self.stream_id);
+                        let remaining = content_length(&parts.headers)?;
+                        let body = ReceivedBody {
+                            reader: state.reader.take().expect("response reader is present"),
+                            is_response: true,
+                            qpack: Arc::clone(&self.qpack),
+                            fail_connection: Arc::clone(&self.fail_connection),
+                            stream_id: self.stream_id,
+                            remaining,
+                            trailers_received: false,
+                            finished: false,
+                            stop_code: Code::H3_REQUEST_CANCELLED,
+                            _exchange: self
+                                .exchange
+                                .lock()
+                                .expect("request exchange lock poisoned")
+                                .take()
+                                .map(BodyExchange::outgoing),
+                            #[cfg(feature = "webtransport")]
+                            webtransport: self.webtransport.clone(),
+                        }
+                        .into_body();
+                        state.phase = RequestResponsePhase::Delivered;
+                        return Ok(HttpResponse::from_parts(parts, body));
+                    }
+                    FrameType::Data => return Err(unexpected_frame(&self.fail_connection)),
+                    FrameType::PushPromise => {
+                        return Err(reject_push_promise(
+                            state.reader.as_mut().expect("response reader is present"),
+                            &self.fail_connection,
+                        )
+                        .await);
+                    }
+                    FrameType::Unknown(_) => {
+                        discard_h3_payload(
+                            state.reader.as_mut().expect("response reader is present"),
+                            &self.fail_connection,
+                        )
+                        .await?
+                    }
+                    _ => return Err(unexpected_frame(&self.fail_connection)),
+                }
+            }
+            } => result,
+            boundary = self.shared.wait_peer_goaway_covering(self.stream_id) => Err(Error::Goaway { boundary }),
+        };
+        if let Err(error) = &result {
+            state.phase = RequestResponsePhase::Failed(error.clone());
+        }
+        result
+    }
+}
+
+impl Drop for RequestStream {
+    fn drop(&mut self) {
+        let send = self.send.get_mut();
+        if matches!(send.phase, RequestSendPhase::Open)
+            && let Some(writer) = &mut send.writer
+        {
+            let _ = writer.reset(Code::H3_REQUEST_CANCELLED);
+        }
+        let response = self.response.get_mut();
+        if matches!(response.phase, RequestResponsePhase::Waiting) {
+            self.qpack.cancel_stream(self.stream_id);
+            if let Some(reader) = &mut response.reader {
+                let _ = reader.stop(Code::H3_REQUEST_CANCELLED);
+            }
+        }
+    }
+}
+
+struct RequestSendCommit<'a> {
+    state: &'a mut RequestSendState,
+    armed: bool,
+}
+
+impl<'a> RequestSendCommit<'a> {
+    fn new(state: &'a mut RequestSendState) -> Self {
+        Self { state, armed: true }
+    }
+
+    fn writer(&mut self) -> &mut BoxSendStream {
+        self.state.writer.as_mut().expect("request writer is open")
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn finish(mut self) {
+        self.armed = false;
+        self.state.writer.take();
+        self.state.phase = RequestSendPhase::Finished;
+    }
+
+    fn fail(&mut self, error: Error) {
+        if let Some(writer) = &mut self.state.writer {
+            let _ = writer.reset(error.code().unwrap_or(Code::H3_REQUEST_CANCELLED));
+        }
+        self.state.writer.take();
+        self.state.phase = RequestSendPhase::Failed(error);
+        self.armed = false;
+    }
+}
+
+impl Drop for RequestSendCommit<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let error = Error::stream(
+                Some(Code::H3_REQUEST_CANCELLED),
+                "request send was cancelled after frame submission began",
+            );
+            if let Some(writer) = &mut self.state.writer {
+                let _ = writer.reset(Code::H3_REQUEST_CANCELLED);
+            }
+            self.state.writer.take();
+            self.state.phase = RequestSendPhase::Failed(error);
+        }
+    }
+}
+
+// A cancelled response read cannot restart after consuming part of an envelope or QPACK section.
+struct ResponseReadGuard<'a> {
+    state: &'a mut RequestResponseState,
+    qpack: &'a qpack::Qpack,
+    stream_id: StreamId,
+}
+
+impl Drop for ResponseReadGuard<'_> {
+    fn drop(&mut self) {
+        if matches!(self.state.phase, RequestResponsePhase::Delivered) {
+            return;
+        }
+        if matches!(self.state.phase, RequestResponsePhase::Waiting) {
+            self.state.phase = RequestResponsePhase::Failed(Error::stream(
+                Some(Code::H3_REQUEST_CANCELLED),
+                "response read was cancelled",
+            ));
+        }
+        if let Some(mut reader) = self.state.reader.take() {
+            let code = match &self.state.phase {
+                RequestResponsePhase::Failed(error) => {
+                    error.code().unwrap_or(Code::H3_REQUEST_CANCELLED)
+                }
+                _ => Code::H3_REQUEST_CANCELLED,
+            };
+            let _ = reader.stop(code);
+        }
+        self.qpack.cancel_stream(self.stream_id);
+    }
+}
+
+struct ResponseWaitGuard<'a>(&'a AtomicBool);
+
+impl Drop for ResponseWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Accepted request stream whose QPACK header resolution is caller-scheduled.
+struct RequestResolver {
+    first: Option<FrameHeader>,
+    stream_id: StreamId,
+    shared: Arc<Shared>,
+    reader: Option<FrameReader>,
+    writer: Option<BoxSendStream>,
+    qpack: Arc<qpack::Qpack>,
+    fail_connection: FailConnection,
+    qpack_cancellation_armed: bool,
+    #[cfg(feature = "webtransport")]
+    webtransport: Option<Arc<crate::webtransport::Runtime>>,
+    #[cfg(feature = "webtransport")]
+    connection: Option<Arc<dyn Send + Sync>>,
+}
+
+impl fmt::Debug for RequestResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestResolver")
+            .field("stream_id", &self.stream_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RequestResolver {
+    async fn resolve(mut self) -> Result<(HttpRequest<Body>, Response), Error> {
+        let reader = self.reader.take().expect("resolver reader is present");
+        let writer = self.writer.take().expect("resolver writer is present");
+        let mut streams = RejectOnDrop::new(reader, writer);
+
+        loop {
+            let frame = match if let Some(first) = self.first.take() {
+                Ok(Some(first))
+            } else {
+                read_h3_frame(
+                    streams.reader(),
+                    &self.fail_connection,
+                    #[cfg(feature = "webtransport")]
+                    self.webtransport.as_ref(),
+                )
+                .await
+            } {
+                Ok(frame) => frame,
+                Err(error) => {
+                    streams.code = error.code().unwrap_or(Code::H3_REQUEST_INCOMPLETE);
+                    return Err(error);
+                }
+            };
+            let Some(frame) = frame else {
+                streams.code = Code::H3_REQUEST_INCOMPLETE;
+                return Err(Error::stream(
+                    Some(Code::H3_REQUEST_INCOMPLETE),
+                    "request stream ended before HEADERS",
+                ));
+            };
+            match frame.frame_type {
+                FrameType::Headers => {
+                    let payload = read_h3_payload(streams.reader(), &self.fail_connection).await?;
+                    let mut parts = match self.qpack.decode_request(self.stream_id, &payload).await
+                    {
+                        Ok(parts) => parts,
+                        Err(error) => {
+                            streams.code = error.code().unwrap_or(Code::H3_MESSAGE_ERROR);
+                            return Err(error);
+                        }
+                    };
+                    #[cfg(feature = "webtransport")]
+                    if parts
+                        .extensions
+                        .get::<crate::webtransport::ProtocolMarker>()
+                        .is_some()
+                        && let Some(webtransport) = &self.webtransport
+                        && let Err(error) = webtransport.wait_client_support().await
+                    {
+                        streams.code = error.code().unwrap_or(Code::H3_MESSAGE_ERROR);
+                        return Err(error);
+                    }
+                    parts.extensions.insert(self.stream_id);
+                    let remaining = match content_length(&parts.headers) {
+                        Ok(remaining) => remaining,
+                        Err(error) => {
+                            streams.code = error.code().unwrap_or(Code::H3_MESSAGE_ERROR);
+                            return Err(error);
+                        }
+                    };
+                    let (reader, writer) = streams.take();
+                    if let Err(error) = self.shared.register_incoming_delivery(self.stream_id) {
+                        let mut streams = RejectOnDrop::new(reader, writer);
+                        streams.code = Code::H3_REQUEST_REJECTED;
+                        return Err(error);
+                    }
+                    let exchange = Arc::new(IncomingExchange {
+                        shared: Arc::clone(&self.shared),
+                    });
+                    #[cfg(feature = "webtransport")]
+                    let body_stop_code = if parts
+                        .extensions
+                        .get::<crate::webtransport::ProtocolMarker>()
+                        .is_some()
+                    {
+                        Code::WT_SESSION_GONE
+                    } else {
+                        Code::H3_REQUEST_CANCELLED
+                    };
+                    #[cfg(not(feature = "webtransport"))]
+                    let body_stop_code = Code::H3_REQUEST_CANCELLED;
+                    let body = ReceivedBody {
+                        reader,
+                        is_response: false,
+                        qpack: Arc::clone(&self.qpack),
+                        fail_connection: Arc::clone(&self.fail_connection),
+                        stream_id: self.stream_id,
+                        remaining,
+                        trailers_received: false,
+                        finished: false,
+                        stop_code: body_stop_code,
+                        _exchange: Some(BodyExchange::incoming(Arc::clone(&exchange))),
+                        #[cfg(feature = "webtransport")]
+                        webtransport: self.webtransport.clone(),
+                    }
+                    .into_body();
+                    self.qpack_cancellation_armed = false;
+                    let request = HttpRequest::from_parts(parts, body);
+                    let response_sender = Response {
+                        stream_id: self.stream_id,
+                        writer: Some(writer),
+                        _exchange: Some(exchange),
+                        qpack: Arc::clone(&self.qpack),
+                        fail_connection: Arc::clone(&self.fail_connection),
+                        #[cfg(feature = "webtransport")]
+                        webtransport: self.webtransport.clone(),
+                        #[cfg(feature = "webtransport")]
+                        connection: self.connection.take(),
+                    };
+                    return Ok((request, response_sender));
+                }
+                FrameType::Data => {
+                    streams.code = Code::H3_FRAME_UNEXPECTED;
+                    return Err(unexpected_frame(&self.fail_connection));
+                }
+                FrameType::Unknown(_) => {
+                    discard_h3_payload(streams.reader(), &self.fail_connection).await?
+                }
+                _ => return Err(unexpected_frame(&self.fail_connection)),
+            }
+        }
+    }
+}
+
+impl Drop for RequestResolver {
+    fn drop(&mut self) {
+        if self.qpack_cancellation_armed {
+            self.qpack.cancel_stream(self.stream_id);
+        }
+        if let Some(reader) = &mut self.reader {
+            let _ = reader.stop(Code::H3_REQUEST_REJECTED);
+        }
+        if let Some(writer) = &mut self.writer {
+            let _ = writer.reset(Code::H3_REQUEST_REJECTED);
+        }
+    }
+}
+
+/// Single-use response direction paired with an accepted request stream.
+pub struct Response {
+    stream_id: StreamId,
+    writer: Option<BoxSendStream>,
+    _exchange: Option<Arc<IncomingExchange>>,
+    qpack: Arc<qpack::Qpack>,
+    fail_connection: FailConnection,
+    #[cfg(feature = "webtransport")]
+    webtransport: Option<Arc<crate::webtransport::Runtime>>,
+    #[cfg(feature = "webtransport")]
+    connection: Option<Arc<dyn Send + Sync>>,
+}
+
+impl fmt::Debug for Response {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Response")
+            .field("stream_id", &self.stream_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Response {
+    pub const fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub async fn send<B>(mut self, response: HttpResponse<B>) -> Result<(), Error>
+    where
+        B: HttpBody + Send,
+        B::Data: Buf + Send,
+        B::Error: StdError + Send + Sync + 'static,
+    {
+        if response.status().is_informational() {
+            return Err(Error::stream(
+                Some(Code::H3_MESSAGE_ERROR),
+                "Response requires one final response",
+            ));
+        }
+        let (parts, body) = response.into_parts();
+        let content_length = content_length(&parts.headers).map_err(Error::into_invalid_message)?;
+        let headers = self.qpack.encode_response(self.stream_id, parts).await?;
+        let writer = self.writer.take().expect("response writer is present");
+        let result = send_message(
+            writer,
+            headers,
+            body,
+            content_length,
+            Arc::clone(&self.qpack),
+            self.stream_id,
+        )
+        .await;
+        fail_on_connection(result, &self.fail_connection)
+    }
+
+    #[cfg(feature = "webtransport")]
+    pub(crate) fn webtransport_runtime(&self) -> Option<Arc<crate::webtransport::Runtime>> {
+        self.webtransport.clone()
+    }
+
+    #[cfg(feature = "webtransport")]
+    pub(crate) fn webtransport_keepalive(&self) -> Arc<dyn Send + Sync> {
+        self.connection
+            .as_ref()
+            .cloned()
+            .expect("an accepted response sender retains its connection")
+    }
+
+    #[cfg(feature = "webtransport")]
+    pub(crate) fn reject(mut self, code: Code) {
+        if let Some(writer) = &mut self.writer {
+            let _ = writer.reset(code);
+        }
+        self.writer.take();
+    }
+
+    #[cfg(feature = "webtransport")]
+    pub(crate) async fn start_webtransport_response(
+        mut self,
+        response: HttpResponse<()>,
+    ) -> Result<BoxSendStream, Error> {
+        if content_length(response.headers())
+            .map_err(Error::into_invalid_message)?
+            .is_some()
+        {
+            return Err(Error::stream(
+                Some(Code::H3_MESSAGE_ERROR),
+                "WebTransport CONNECT response cannot declare Content-Length",
+            ));
+        }
+        let (parts, ()) = response.into_parts();
+        let headers = self.qpack.encode_response(self.stream_id, parts).await?;
+        let writer = self.writer.take().expect("response writer is present");
+        let mut writer = ResetOnDrop::new(writer, Code::H3_REQUEST_CANCELLED);
+        fail_on_connection(
+            write_h3_frame(writer.writer(), wire::HEADERS_FRAME_TYPE, &headers).await,
+            &self.fail_connection,
+        )?;
+        Ok(writer.take())
+    }
+}
+
+impl Drop for Response {
+    fn drop(&mut self) {
+        if let Some(writer) = &mut self.writer {
+            let _ = writer.reset(Code::H3_REQUEST_CANCELLED);
+        }
+    }
+}
+
+struct RejectOnDrop {
+    reader: Option<FrameReader>,
+    writer: Option<BoxSendStream>,
+    code: Code,
+}
+
+impl RejectOnDrop {
+    fn new(reader: FrameReader, writer: BoxSendStream) -> Self {
+        Self {
+            reader: Some(reader),
+            writer: Some(writer),
+            code: Code::H3_REQUEST_REJECTED,
         }
     }
 
-    pub async fn open_uni(&self) -> Result<C::StreamWriter, quic::ConnectionError> {
-        match { self.quic.open_uni() }.await {
-            Ok(stream) => Ok(stream),
-            Err(error) => Err(self.quic.handle_connection_error(error.into()).await),
+    fn reader(&mut self) -> &mut FrameReader {
+        self.reader.as_mut().expect("request reader is present")
+    }
+
+    fn take(&mut self) -> (FrameReader, BoxSendStream) {
+        (
+            self.reader.take().expect("request reader is present"),
+            self.writer.take().expect("response writer is present"),
+        )
+    }
+}
+
+impl Drop for RejectOnDrop {
+    fn drop(&mut self) {
+        if let Some(reader) = &mut self.reader {
+            let _ = reader.stop(self.code);
+        }
+        if let Some(writer) = &mut self.writer {
+            let _ = writer.reset(self.code);
         }
     }
 }
 
-impl<C: ?Sized + quic::DynWithLocalAuthority> ConnectionState<C> {
-    pub async fn local_authority(
-        &self,
-    ) -> Result<Option<Arc<dyn authority::LocalAuthority>>, quic::ConnectionError> {
-        // Goes through the object-safe trait so that this impl applies
-        // uniformly to both sized `C: WithLocalAuthority` (via the blanket impl)
-        // and `dyn DynConnection`.
-        quic::DynWithLocalAuthority::local_authority(&*self.quic).await
+struct ResetOnDrop {
+    writer: Option<BoxSendStream>,
+    code: Code,
+}
+
+#[cfg(feature = "webtransport")]
+struct QpackCancelOnDrop {
+    qpack: Arc<qpack::Qpack>,
+    stream_id: StreamId,
+    armed: bool,
+}
+
+#[cfg(feature = "webtransport")]
+impl QpackCancelOnDrop {
+    fn new(qpack: Arc<qpack::Qpack>, stream_id: StreamId) -> Self {
+        Self {
+            qpack,
+            stream_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
-impl<C: ?Sized + quic::DynWithRemoteAuthority> ConnectionState<C> {
-    pub async fn remote_authority(
-        &self,
-    ) -> Result<Option<Arc<dyn authority::RemoteAuthority>>, quic::ConnectionError> {
-        quic::DynWithRemoteAuthority::remote_authority(&*self.quic).await
+#[cfg(feature = "webtransport")]
+impl Drop for QpackCancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.qpack.cancel_stream(self.stream_id);
+        }
     }
 }
 
-fn is_graceful_connection_close(error: &quic::ConnectionError) -> bool {
-    matches!(
-        error,
-        quic::ConnectionError::Application { source }
-            if source.code == Code::H3_NO_ERROR
+impl ResetOnDrop {
+    fn new(writer: BoxSendStream, code: Code) -> Self {
+        Self {
+            writer: Some(writer),
+            code,
+        }
+    }
+
+    fn writer(&mut self) -> &mut BoxSendStream {
+        self.writer.as_mut().expect("writer guard is armed")
+    }
+
+    #[cfg(feature = "webtransport")]
+    fn take(mut self) -> BoxSendStream {
+        self.writer.take().expect("writer guard is armed")
+    }
+
+    fn disarm(mut self) {
+        self.writer.take();
+    }
+}
+
+impl Drop for ResetOnDrop {
+    fn drop(&mut self) {
+        if let Some(writer) = &mut self.writer {
+            let _ = writer.reset(self.code);
+        }
+    }
+}
+
+async fn send_message<B>(
+    writer: BoxSendStream,
+    headers: Bytes,
+    body: B,
+    content_length: Option<u64>,
+    qpack: Arc<qpack::Qpack>,
+    stream_id: StreamId,
+) -> Result<(), Error>
+where
+    B: HttpBody + Send,
+    B::Data: Buf + Send,
+    B::Error: StdError + Send + Sync + 'static,
+{
+    let mut writer = ResetOnDrop::new(writer, Code::H3_REQUEST_CANCELLED);
+    write_h3_frame(writer.writer(), wire::HEADERS_FRAME_TYPE, &headers).await?;
+    send_body(writer.writer(), body, content_length, &qpack, stream_id).await?;
+    writer
+        .writer()
+        .close()
+        .await
+        .map_err(wire::map_stream_error)?;
+    writer.disarm();
+    Ok(())
+}
+
+async fn send_body<B>(
+    writer: &mut BoxSendStream,
+    body: B,
+    mut content_length: Option<u64>,
+    qpack: &qpack::Qpack,
+    stream_id: StreamId,
+) -> Result<(), Error>
+where
+    B: HttpBody + Send,
+    B::Data: Buf + Send,
+    B::Error: StdError + Send + Sync + 'static,
+{
+    let mut body = pin!(body);
+    let mut trailers_sent = false;
+
+    loop {
+        wait_writer_ready(writer).await?;
+        let Some(frame) = body.as_mut().frame().await else {
+            return if content_length.is_some_and(|remaining| remaining != 0) {
+                Err(Error::stream(
+                    Some(Code::H3_MESSAGE_ERROR),
+                    "outgoing body length does not match Content-Length",
+                ))
+            } else {
+                Ok(())
+            };
+        };
+        let frame = frame.map_err(Error::send_body)?;
+
+        let frame = match frame.into_data() {
+            Ok(mut data) => {
+                if trailers_sent {
+                    return Err(Error::stream(
+                        Some(Code::H3_MESSAGE_ERROR),
+                        "outgoing body produced DATA after trailers",
+                    ));
+                }
+                let remaining = data.remaining();
+                if let Some(expected) = &mut content_length {
+                    *expected = expected.checked_sub(remaining as u64).ok_or_else(|| {
+                        Error::stream(
+                            Some(Code::H3_MESSAGE_ERROR),
+                            "outgoing body exceeds Content-Length",
+                        )
+                    })?;
+                }
+                wire::encode_frame(wire::DATA_FRAME_TYPE, &data.copy_to_bytes(remaining))?
+            }
+            Err(frame) => match frame.into_trailers() {
+                Ok(trailers) => {
+                    if trailers_sent {
+                        return Err(Error::stream(
+                            Some(Code::H3_MESSAGE_ERROR),
+                            "outgoing body produced more than one trailer section",
+                        ));
+                    }
+                    trailers_sent = true;
+                    let trailers = qpack.encode_trailers(stream_id, trailers).await?;
+                    wire::encode_frame(wire::HEADERS_FRAME_TYPE, &trailers)?
+                }
+                Err(_unknown) => continue,
+            },
+        };
+
+        Pin::new(&mut **writer)
+            .start_send(frame)
+            .map_err(wire::map_stream_error)?;
+        writer.flush().await.map_err(wire::map_stream_error)?;
+    }
+}
+
+async fn wait_writer_ready(writer: &mut BoxSendStream) -> Result<(), Error> {
+    futures::future::poll_fn(|cx| Pin::new(&mut **writer).poll_ready(cx))
+        .await
+        .map_err(wire::map_stream_error)
+}
+
+async fn write_h3_frame(
+    writer: &mut BoxSendStream,
+    frame_type: u64,
+    payload: &[u8],
+) -> Result<(), Error> {
+    send_bytes(writer, wire::encode_frame(frame_type, payload)?).await
+}
+
+fn fail_on_connection<T>(
+    result: Result<T, Error>,
+    fail_connection: &FailConnection,
+) -> Result<T, Error> {
+    if let Err(error) = &result
+        && error.is_connection()
+    {
+        fail_connection(error.clone());
+    }
+    result
+}
+
+async fn read_h3_frame(
+    reader: &mut FrameReader,
+    fail_connection: &FailConnection,
+    #[cfg(feature = "webtransport")] webtransport: Option<&Arc<crate::webtransport::Runtime>>,
+) -> Result<Option<FrameHeader>, Error> {
+    let result = async {
+        #[cfg(feature = "webtransport")]
+        if webtransport.is_some() {
+            let Some(frame_type) = reader.next_type().await? else {
+                return Ok(None);
+            };
+            if frame_type == wire::WEBTRANSPORT_BIDI_SIGNAL {
+                return Err(Error::connection_protocol(
+                    Code::H3_FRAME_ERROR,
+                    "WT_STREAM is only valid at the beginning of a WebTransport stream",
+                ));
+            }
+            return reader.header_after_type(frame_type).await.map(Some);
+        }
+        reader.next_header().await
+    }
+    .await;
+    fail_on_connection(result, fail_connection)
+}
+
+async fn read_h3_payload(
+    reader: &mut FrameReader,
+    fail_connection: &FailConnection,
+) -> Result<wire::BufferedPayload, Error> {
+    fail_on_connection(
+        reader.read_payload(wire::MAX_BUFFERED_FRAME_PAYLOAD).await,
+        fail_connection,
     )
 }
 
-impl<C: quic::Connection> ConnectionState<C> {
-    async fn accept_bi_stream_task(state: Self) {
-        let task = async {
-            loop {
-                let (reader, writer) = match quic::ManageStream::accept_bi(&*state.quic).await {
-                    Ok(bi_stream) => bi_stream,
-                    Err(error) => {
-                        if is_graceful_connection_close(&error) {
-                            tracing::debug!(
-                                ?error,
-                                "bidirectional stream accept stopped by graceful connection close"
-                            );
-                        } else {
-                            tracing::warn!(?error, "bidirectional stream accept failed");
-                        }
-                        state.quic.handle_connection_error(error.into()).await;
-                        return;
-                    }
-                };
-                let stream_reader =
-                    StreamReader::new(Box::pin(reader) as crate::quic::BoxQuicStreamReader);
-                let stream_writer =
-                    SinkWriter::new(Box::pin(writer) as crate::quic::BoxQuicStreamWriter);
-                let mut peekable_bi_stream =
-                    (PeekableStreamReader::new(stream_reader), stream_writer);
-                let stream_id = match peekable_bi_stream.1.stream_id().await {
-                    Ok(stream_id) => Some(stream_id),
-                    Err(error) => {
-                        tracing::warn!(?error, "accepted bidirectional stream has no stream id");
-                        None
-                    }
-                };
-                tracing::trace!(
-                    stream_id = ?stream_id.map(|id| id.into_inner()),
-                    "bidirectional stream accepted for protocol classification"
-                );
+async fn discard_h3_payload(
+    reader: &mut FrameReader,
+    fail_connection: &FailConnection,
+) -> Result<(), Error> {
+    fail_on_connection(reader.discard_payload().await, fail_connection)
+}
 
-                match state.protocols.accept_bi(peekable_bi_stream).await {
-                    Ok(StreamVerdict::Accepted) => continue,
-                    // If the stream header indicates a stream type that is not supported by
-                    // the recipient, the remainder of the stream cannot be consumed as the
-                    // semantics are unknown. Recipients of unknown stream types MUST
-                    // either abort reading of the stream or discard incoming data without
-                    // further processing. If reading is aborted, the recipient SHOULD use
-                    // the H3_STREAM_CREATION_ERROR error code or a reserved error code
-                    // (Section 8.1). The recipient MUST NOT consider unknown stream types
-                    // to be a connection error of any kind.
-                    //
-                    // https://datatracker.ietf.org/doc/html/rfc9114#section-9-4
-                    Ok(StreamVerdict::Passed((mut stream_reader, mut stream_writer))) => {
-                        let code = Code::H3_STREAM_CREATION_ERROR.into_inner();
-                        tracing::warn!(
-                            stream_id = ?stream_id.map(|id| id.into_inner()),
-                            code = code.into_inner(),
-                            "unrecognized bidirectional stream cleanup started"
-                        );
-                        let (stop_result, reset_result) =
-                            tokio::join!(stream_reader.stop(code), stream_writer.reset(code));
-                        tracing::info!(
-                            stream_id = ?stream_id.map(|id| id.into_inner()),
-                            code = code.into_inner(),
-                            ?stop_result,
-                            ?reset_result,
-                            "unrecognized bidirectional stream cleanup completed"
-                        );
-                    }
-                    Err(stream_error) => {
-                        // The stream has been consumed by protocol matching
-                        // and is no longer reachable here; we can only drive
-                        // connection close for connection-scope errors. For
-                        // stream-scope errors the stream itself is already
-                        // being torn down inside the protocol code.
-                        if let StreamError::Connection { source } = stream_error {
-                            state.quic.handle_connection_error(source).await;
-                        }
-                        continue;
-                    }
-                };
-            }
-        };
-        tokio::select! {
-            _ = task => {
-                tracing::debug!("bidirectional stream accept task exited");
-            },
-            error = state.quic.closed() => {
-                if is_graceful_connection_close(&error) {
-                    tracing::debug!(?error, "bidirectional stream accept task stopped by graceful connection close");
-                } else {
-                    tracing::warn!(?error, "bidirectional stream accept task stopped by connection lifecycle");
-                }
-            },
+async fn reject_push_promise(reader: &mut FrameReader, fail_connection: &FailConnection) -> Error {
+    // Neither endpoint advertises push IDs; parse only the ID, never the QPACK payload.
+    let error = match reader.read_payload_varint().await {
+        Err(error) => error,
+        Ok(_) => {
+            Error::connection_protocol(Code::H3_ID_ERROR, "peer promised an unauthorized push ID")
         }
+    };
+    if error.is_connection() {
+        fail_connection(error.clone());
     }
-
-    async fn accept_uni_stream_task(state: Self) {
-        let task = async {
-            loop {
-                let stream_reader = match quic::ManageStream::accept_uni(&*state.quic).await {
-                    Ok(uni_stream) => uni_stream,
-                    Err(error) => {
-                        state.quic.handle_connection_error(error.into()).await;
-                        return;
-                    }
-                };
-                let stream_reader =
-                    StreamReader::new(Box::pin(stream_reader) as crate::quic::BoxQuicStreamReader);
-                let peekable_uni_stream = PeekableStreamReader::new(stream_reader);
-
-                match state.protocols.accept_uni(peekable_uni_stream).await {
-                    Ok(StreamVerdict::Accepted) => continue,
-                    // If the stream header indicates a stream type that is not supported by
-                    // the recipient, the remainder of the stream cannot be consumed as the
-                    // semantics are unknown. Recipients of unknown stream types MUST
-                    // either abort reading of the stream or discard incoming data without
-                    // further processing. If reading is aborted, the recipient SHOULD use
-                    // the H3_STREAM_CREATION_ERROR error code or a reserved error code
-                    // (Section 8.1). The recipient MUST NOT consider unknown stream types
-                    // to be a connection error of any kind.
-                    //
-                    // https://datatracker.ietf.org/doc/html/rfc9114#section-9-4
-                    Ok(StreamVerdict::Passed(mut stream_reader)) => {
-                        let code = Code::H3_STREAM_CREATION_ERROR.into_inner();
-                        let _ = stream_reader.stop(code).await;
-                    }
-                    Err(stream_error) => {
-                        // Same rationale as `accept_bi_stream_task`.
-                        if let StreamError::Connection { source } = stream_error {
-                            state.quic.handle_connection_error(source).await;
-                        }
-                        continue;
-                    }
-                };
-            }
-        };
-        tokio::select! {
-            _ = task => {},
-            _ = state.quic.closed() => {},
-        }
-    }
+    error
 }
 
-impl<C: ?Sized> Clone for ConnectionState<C> {
-    fn clone(&self) -> Self {
-        Self {
-            quic: self.quic.clone(),
-            protocols: self.protocols.clone(),
-        }
-    }
+fn unexpected_frame(fail_connection: &FailConnection) -> Error {
+    let error = Error::connection_protocol(
+        Code::H3_FRAME_UNEXPECTED,
+        "frame is forbidden in this HTTP stream phase",
+    );
+    fail_connection(error.clone());
+    error
 }
 
-#[derive(Debug)]
-pub struct Connection<C: quic::Connection> {
-    state: ConnectionState<C>,
-    /// Background stream-acceptance tasks, aborted when the `Connection<C>` is dropped.
-    /// The tasks each hold a clone of `ConnectionState<C>` (which contains `Arc<C>`),
-    /// so without abort-on-drop the strong reference cycle would keep the QUIC
-    /// connection alive long after the owner has released its handle.
-    _accept_tasks: [AbortOnDropHandle<()>; 2],
+struct OutgoingExchange {
+    shared: Arc<Shared>,
+    stream_id: StreamId,
 }
 
-impl<C: quic::Connection> ops::Deref for Connection<C> {
-    type Target = ConnectionState<C>;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.state
-    }
-}
-
-impl<C: quic::Connection> Connection<C> {
-    pub async fn new(settings: Arc<Settings>, quic: Arc<C>) -> Result<Self, quic::ConnectionError> {
-        ConnectionBuilder::new(settings).build(quic).await
-    }
-}
-
-impl<C: quic::Connection> Connection<C> {
-    #[cfg(test)]
-    pub(crate) fn from_state_for_test(state: ConnectionState<C>) -> Self {
-        let noop = || AbortOnDropHandle::new(tokio::spawn(async {}));
-        Self {
-            state,
-            _accept_tasks: [noop(), noop()],
-        }
-    }
-}
-
-impl<C: quic::Connection> Drop for Connection<C> {
+impl Drop for OutgoingExchange {
     fn drop(&mut self) {
-        // Send a graceful close before aborting the accept tasks. The accept tasks
-        // hold cloned `Arc<C>` references; aborting them via `AbortOnDropHandle`
-        // releases those references so the underlying QUIC connection can be
-        // dropped (and its own RAII close logic, if any, runs).
-        self.close(Code::H3_NO_ERROR, "no error");
+        self.shared.unregister_outgoing(self.stream_id);
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
-    #[cfg(feature = "dquic")]
-    use std::{
-        collections::hash_map::DefaultHasher,
-        fmt,
-        hash::{Hash, Hasher},
-        marker::PhantomData,
-    };
-    use std::{
-        error::Error as _,
-        future::pending,
-        io,
-        pin::Pin,
-        sync::{Arc, Mutex},
-    };
+struct IncomingExchange {
+    shared: Arc<Shared>,
+}
 
-    use bytes::Bytes;
-    use dhttp_identity::identity as authority;
-    use futures::{Sink, SinkExt, future::BoxFuture, stream::Stream};
-    use tracing::Instrument;
+impl Drop for IncomingExchange {
+    fn drop(&mut self) {
+        self.shared.finish_incoming();
+    }
+}
 
-    use super::{
-        Connection, ConnectionBuilder, ConnectionState, LifecycleExt, StreamError,
-        is_graceful_connection_close,
-    };
-    use crate::{
-        codec::{BoxPeekableStreamReader, BoxStreamWriter},
-        dhttp::settings::Settings,
-        error::{Code, H3MessageError, H3MissingSettings},
-        protocol::{Protocol, Protocols, StreamVerdict},
-        quic::{self, ConnectionError, ResetStreamExt, StopStreamExt},
-        varint::VarInt,
-    };
-    #[cfg(feature = "dquic")]
-    use crate::{dhttp::settings::MaxFieldSectionSize, protocol::ProductProtocol};
+struct BodyExchange {
+    _outgoing: Option<OutgoingExchange>,
+    _incoming: Option<Arc<IncomingExchange>>,
+}
 
-    #[derive(Debug)]
-    pub(crate) struct TestLocalAuthority;
-
-    impl authority::LocalAuthority for TestLocalAuthority {
-        fn name(&self) -> &str {
-            "test-local"
-        }
-
-        fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
-            &[]
-        }
-        fn sign(&self, _data: &[u8]) -> BoxFuture<'_, Result<Vec<u8>, authority::SignError>> {
-            Box::pin(async { Ok(Vec::new()) })
+impl BodyExchange {
+    fn outgoing(exchange: OutgoingExchange) -> Self {
+        Self {
+            _outgoing: Some(exchange),
+            _incoming: None,
         }
     }
 
-    #[derive(Debug)]
-    pub(crate) struct TestRemoteAuthority;
-
-    impl authority::RemoteAuthority for TestRemoteAuthority {
-        fn name(&self) -> &str {
-            "test-remote"
-        }
-
-        fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
-            &[]
+    fn incoming(exchange: Arc<IncomingExchange>) -> Self {
+        Self {
+            _outgoing: None,
+            _incoming: Some(exchange),
         }
     }
+}
 
-    #[derive(Debug)]
-    pub(crate) struct TestReadStream;
+struct ReceivedBody {
+    reader: FrameReader,
+    is_response: bool,
+    qpack: Arc<qpack::Qpack>,
+    fail_connection: FailConnection,
+    stream_id: StreamId,
+    remaining: Option<u64>,
+    trailers_received: bool,
+    finished: bool,
+    stop_code: Code,
+    _exchange: Option<BodyExchange>,
+    #[cfg(feature = "webtransport")]
+    webtransport: Option<Arc<crate::webtransport::Runtime>>,
+}
 
-    impl quic::GetStreamId for TestReadStream {
-        fn poll_stream_id(
-            self: Pin<&mut Self>,
-            _cx: &mut std::task::Context,
-        ) -> std::task::Poll<Result<VarInt, quic::StreamError>> {
-            let _ = self;
-            std::task::Poll::Ready(Ok(VarInt::from_u32(0)))
-        }
+impl ReceivedBody {
+    fn into_body(self) -> Body {
+        let frames = futures::stream::try_unfold(self, |mut state| async move {
+            state
+                .next_frame()
+                .await
+                .map(|frame| frame.map(|frame| (frame, state)))
+        });
+        Body::new(StreamBody::new(frames))
     }
 
-    impl quic::StopStream for TestReadStream {
-        fn poll_stop(
-            self: Pin<&mut Self>,
-            _cx: &mut std::task::Context,
-            _code: VarInt,
-        ) -> std::task::Poll<Result<(), quic::StreamError>> {
-            let _ = self;
-            std::task::Poll::Ready(Ok(()))
-        }
+    async fn next_frame(&mut self) -> Result<Option<HttpFrame<Bytes>>, Error> {
+        let result = self.next_frame_inner().await;
+        fail_on_connection(result, &self.fail_connection)
     }
 
-    impl Stream for TestReadStream {
-        type Item = Result<Bytes, quic::StreamError>;
-
-        fn poll_next(
-            self: Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Option<Self::Item>> {
-            let _ = self;
-            std::task::Poll::Ready(None)
-        }
-    }
-
-    #[derive(Debug)]
-    pub(crate) struct TestWriteStream;
-
-    impl quic::GetStreamId for TestWriteStream {
-        fn poll_stream_id(
-            self: Pin<&mut Self>,
-            _cx: &mut std::task::Context,
-        ) -> std::task::Poll<Result<VarInt, quic::StreamError>> {
-            let _ = self;
-            std::task::Poll::Ready(Ok(VarInt::from_u32(0)))
-        }
-    }
-
-    impl quic::ResetStream for TestWriteStream {
-        fn poll_reset(
-            self: Pin<&mut Self>,
-            _cx: &mut std::task::Context,
-            _code: VarInt,
-        ) -> std::task::Poll<Result<(), quic::StreamError>> {
-            let _ = self;
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
-
-    impl Sink<Bytes> for TestWriteStream {
-        type Error = quic::StreamError;
-
-        fn poll_ready(
-            self: Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), Self::Error>> {
-            let _ = self;
-            std::task::Poll::Ready(Ok(()))
-        }
-
-        fn start_send(self: Pin<&mut Self>, _item: Bytes) -> Result<(), Self::Error> {
-            let _ = self;
-            Ok(())
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), Self::Error>> {
-            let _ = self;
-            std::task::Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), Self::Error>> {
-            let _ = self;
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
-
-    #[derive(Debug, Default)]
-    pub(crate) struct MockConnectionState {
-        terminal_error: crate::util::set_once::SetOnce<quic::ConnectionError>,
-        close_calls: Mutex<Vec<(Code, String)>>,
-        stream_calls: Mutex<Vec<&'static str>>,
-        stream_ops_available: std::sync::atomic::AtomicBool,
-    }
-
-    #[derive(Debug, Clone, Default)]
-    pub(crate) struct MockConnection {
-        state: Arc<MockConnectionState>,
-    }
-
-    impl MockConnection {
-        pub(crate) fn new() -> Self {
-            Self::default()
-        }
-
-        pub(crate) fn set_terminal_error(&self, error: quic::ConnectionError) {
-            let _ = self.state.terminal_error.set(error);
-        }
-
-        pub(crate) fn enable_stream_ops(&self) {
-            self.state
-                .stream_ops_available
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        #[cfg(feature = "dquic")]
-        pub(crate) fn disable_stream_ops(&self) {
-            self.state
-                .stream_ops_available
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        pub(crate) fn close_calls(&self) -> Vec<(Code, String)> {
-            self.state
-                .close_calls
-                .lock()
-                .expect("close call log poisoned")
-                .clone()
-        }
-
-        pub(crate) fn stream_calls(&self) -> Vec<&'static str> {
-            self.state
-                .stream_calls
-                .lock()
-                .expect("stream call log poisoned")
-                .clone()
-        }
-
-        fn record_stream_call(&self, call: &'static str) {
-            self.state
-                .stream_calls
-                .lock()
-                .expect("stream call log poisoned")
-                .push(call);
-        }
-
-        fn stream_ops_available(&self) -> bool {
-            self.state
-                .stream_ops_available
-                .load(std::sync::atomic::Ordering::Relaxed)
-        }
-    }
-
-    impl quic::ManageStream for MockConnection {
-        type StreamReader = TestReadStream;
-        type StreamWriter = TestWriteStream;
-
-        async fn open_bi(
-            &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
-            self.record_stream_call("open_bi");
-            if self.stream_ops_available() {
-                Ok((TestReadStream, TestWriteStream))
-            } else {
-                Err(test_connection_error("open_bi unavailable"))
+    async fn next_frame_inner(&mut self) -> Result<Option<HttpFrame<Bytes>>, Error> {
+        loop {
+            // Only DATA can survive a successful iteration with payload left unread.
+            if self.reader.remaining() != 0 {
+                let bytes = self
+                    .reader
+                    .read_payload_chunk(wire::MAX_DATA_CHUNK)
+                    .await?
+                    .expect("DATA has remaining payload");
+                return Ok(Some(HttpFrame::data(bytes)));
             }
-        }
-
-        async fn open_uni(&self) -> Result<Self::StreamWriter, ConnectionError> {
-            self.record_stream_call("open_uni");
-            if self.stream_ops_available() {
-                Ok(TestWriteStream)
-            } else {
-                Err(test_connection_error("open_uni unavailable"))
-            }
-        }
-
-        async fn accept_bi(
-            &self,
-        ) -> Result<(Self::StreamReader, Self::StreamWriter), ConnectionError> {
-            self.record_stream_call("accept_bi");
-            if self.stream_ops_available() {
-                Ok((TestReadStream, TestWriteStream))
-            } else {
-                Err(test_connection_error("accept_bi unavailable"))
-            }
-        }
-
-        async fn accept_uni(&self) -> Result<Self::StreamReader, ConnectionError> {
-            self.record_stream_call("accept_uni");
-            if self.stream_ops_available() {
-                Ok(TestReadStream)
-            } else {
-                Err(test_connection_error("accept_uni unavailable"))
-            }
-        }
-    }
-
-    impl quic::WithLocalAuthority for MockConnection {
-        type LocalAuthority = TestLocalAuthority;
-
-        async fn local_authority(&self) -> Result<Option<Self::LocalAuthority>, ConnectionError> {
-            Ok(Some(TestLocalAuthority))
-        }
-    }
-
-    impl quic::WithRemoteAuthority for MockConnection {
-        type RemoteAuthority = TestRemoteAuthority;
-
-        async fn remote_authority(&self) -> Result<Option<Self::RemoteAuthority>, ConnectionError> {
-            Ok(Some(TestRemoteAuthority))
-        }
-    }
-
-    impl quic::Lifecycle for MockConnection {
-        fn close(&self, code: crate::error::Code, reason: std::borrow::Cow<'static, str>) {
-            self.state
-                .close_calls
-                .lock()
-                .expect("close call log poisoned")
-                .push((code, reason.into_owned()));
-        }
-
-        fn check(&self) -> Result<(), ConnectionError> {
-            match self.state.terminal_error.peek() {
-                Some(error) => Err(error),
-                None => Ok(()),
-            }
-        }
-
-        async fn closed(&self) -> ConnectionError {
-            match self.state.terminal_error.get().await {
-                Some(error) => error,
-                None => pending().await,
-            }
-        }
-    }
-
-    fn test_connection_error(reason: &str) -> quic::ConnectionError {
-        quic::ConnectionError::Transport {
-            source: quic::TransportError {
-                kind: VarInt::from_u32(0x01),
-                frame_type: VarInt::from_u32(0x00),
-                reason: reason.to_owned().into(),
-            },
-        }
-    }
-
-    fn assert_transport_reason(error: &quic::ConnectionError, expected_reason: &str) {
-        match error {
-            quic::ConnectionError::Transport { source } => {
-                assert_eq!(source.reason.as_ref(), expected_reason);
-            }
-            other => panic!("expected transport error, got {other:?}"),
-        }
-    }
-
-    fn assert_connection_h3_code(error: super::ConnectionError, expected_code: Code) {
-        match error {
-            super::ConnectionError::H3 { source } => assert_eq!(source.code(), expected_code),
-            other => panic!("expected h3 connection error, got {other:?}"),
-        }
-    }
-
-    fn assert_stream_reset(error: StreamError, expected_code: VarInt) {
-        match error {
-            StreamError::Reset { code } => assert_eq!(code, expected_code),
-            other => panic!("expected stream reset, got {other:?}"),
-        }
-    }
-
-    fn assert_stream_h3_code(error: StreamError, expected_code: Code) {
-        match error {
-            StreamError::H3 { source } => assert_eq!(source.code(), expected_code),
-            other => panic!("expected h3 stream error, got {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "dquic")]
-    fn hash_of<T: Hash>(val: &T) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        val.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    /// Local mock protocol for builder tests.
-    #[derive(Debug)]
-    struct MockProtocol;
-
-    impl Protocol for MockProtocol {
-        fn accept_uni<'a>(
-            &'a self,
-            stream: BoxPeekableStreamReader,
-        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableStreamReader>, StreamError>> {
-            Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
-        }
-
-        fn accept_bi<'a>(
-            &'a self,
-            stream: (BoxPeekableStreamReader, BoxStreamWriter),
-        ) -> BoxFuture<
-            'a,
-            Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError>,
-        > {
-            Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
-        }
-    }
-
-    /// Local mock factory for builder tests.
-    #[cfg(feature = "dquic")]
-    #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-    struct MockFactory(u64);
-
-    #[cfg(feature = "dquic")]
-    impl fmt::Display for MockFactory {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "MockFactory")
-        }
-    }
-
-    #[cfg(feature = "dquic")]
-    impl<C: quic::Connection> ProductProtocol<C> for MockFactory {
-        type Protocol = MockProtocol;
-
-        fn init<'a>(
-            &'a self,
-            _: &'a Arc<C>,
-            _: &'a Protocols,
-        ) -> BoxFuture<'a, Result<Self::Protocol, ConnectionError>> {
-            Box::pin(async { Ok(MockProtocol) })
-        }
-    }
-
-    #[cfg(feature = "dquic")]
-    #[derive(Debug)]
-    struct PassThenDisableProtocol {
-        quic: MockConnection,
-    }
-
-    #[cfg(feature = "dquic")]
-    impl Protocol for PassThenDisableProtocol {
-        fn accept_uni<'a>(
-            &'a self,
-            stream: BoxPeekableStreamReader,
-        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableStreamReader>, StreamError>> {
-            self.quic.disable_stream_ops();
-            Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
-        }
-
-        fn accept_bi<'a>(
-            &'a self,
-            stream: (BoxPeekableStreamReader, BoxStreamWriter),
-        ) -> BoxFuture<
-            'a,
-            Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError>,
-        > {
-            self.quic.disable_stream_ops();
-            Box::pin(async move { Ok(StreamVerdict::Passed(stream)) })
-        }
-    }
-
-    #[cfg(feature = "dquic")]
-    #[derive(Debug, Clone, Copy)]
-    enum ErrKind {
-        Connection,
-        Reset,
-    }
-
-    #[cfg(feature = "dquic")]
-    #[derive(Debug)]
-    struct ErrThenDisableProtocol {
-        quic: MockConnection,
-        kind: ErrKind,
-    }
-
-    #[cfg(feature = "dquic")]
-    impl ErrThenDisableProtocol {
-        fn make_error(&self) -> StreamError {
-            match self.kind {
-                ErrKind::Connection => StreamError::from(H3MissingSettings),
-                ErrKind::Reset => StreamError::Reset {
-                    code: VarInt::from_u32(7),
-                },
-            }
-        }
-    }
-
-    #[cfg(feature = "dquic")]
-    impl Protocol for ErrThenDisableProtocol {
-        fn accept_uni<'a>(
-            &'a self,
-            _stream: BoxPeekableStreamReader,
-        ) -> BoxFuture<'a, Result<StreamVerdict<BoxPeekableStreamReader>, StreamError>> {
-            self.quic.disable_stream_ops();
-            let err = self.make_error();
-            Box::pin(async move { Err(err) })
-        }
-
-        fn accept_bi<'a>(
-            &'a self,
-            _stream: (BoxPeekableStreamReader, BoxStreamWriter),
-        ) -> BoxFuture<
-            'a,
-            Result<StreamVerdict<(BoxPeekableStreamReader, BoxStreamWriter)>, StreamError>,
-        > {
-            self.quic.disable_stream_ops();
-            let err = self.make_error();
-            Box::pin(async move { Err(err) })
-        }
-    }
-
-    #[cfg(feature = "dquic")]
-    type C = dquic::prelude::Connection;
-
-    /// Hash equality and determinism: identical inputs must produce equal hashes.
-    #[cfg(feature = "dquic")]
-    #[test]
-    fn hash_equality_and_determinism() {
-        let s = || Arc::new(Settings::default());
-
-        // Build a reference builder for the "same builder twice" determinism check.
-        let det_builder = ConnectionBuilder::<C>::new(s()).protocol(MockFactory(99));
-        let h_det = hash_of(&det_builder);
-
-        // All cases where hash must be equal (rebuild from identical inputs).
-        let cases: [(&str, ConnectionBuilder<C>, ConnectionBuilder<C>); 3] = [
-            (
-                "same settings",
-                ConnectionBuilder::<C>::new(s()),
-                ConnectionBuilder::<C>::new(s()),
-            ),
-            (
-                "same protocol",
-                ConnectionBuilder::<C>::new(s()).protocol(MockFactory(42)),
-                ConnectionBuilder::<C>::new(s()).protocol(MockFactory(42)),
-            ),
-            (
-                "clone-like rebuild",
-                ConnectionBuilder::<C>::new(s()).protocol(MockFactory(100)),
-                ConnectionBuilder::<C>::new(s()).protocol(MockFactory(100)),
-            ),
-        ];
-
-        for (name, a, b) in &cases {
-            assert_eq!(hash_of(a), hash_of(b), "hash equality: {name}");
-        }
-
-        // Same builder hashed twice must be deterministic.
-        assert_eq!(
-            hash_of(&det_builder),
-            h_det,
-            "hashing the same builder twice must be deterministic"
-        );
-
-        // An identically-constructed builder must produce the same hash.
-        let builder2 = ConnectionBuilder::<C>::new(s()).protocol(MockFactory(99));
-        assert_eq!(
-            h_det,
-            hash_of(&builder2),
-            "identical builders must hash equally"
-        );
-    }
-
-    #[cfg(feature = "dquic")]
-    #[test]
-    fn display_lists_each_initializer_separated_by_commas() {
-        let s = || Arc::new(Settings::default());
-
-        let empty = ConnectionBuilder::<C> {
-            initializers: Vec::new(),
-            _connection: PhantomData,
-        };
-        assert_eq!(format!("{}", empty), "ConnectionBuilder[]");
-
-        let one = ConnectionBuilder::<C> {
-            initializers: Vec::new(),
-            _connection: PhantomData,
-        }
-        .protocol(MockFactory(1));
-        assert_eq!(format!("{}", one), "ConnectionBuilder[MockFactory]");
-
-        let two = ConnectionBuilder::<C> {
-            initializers: Vec::new(),
-            _connection: PhantomData,
-        }
-        .protocol(MockFactory(1))
-        .protocol(MockFactory(2));
-        assert_eq!(
-            format!("{}", two),
-            "ConnectionBuilder[MockFactory, MockFactory]"
-        );
-
-        let default_with_extra = ConnectionBuilder::<C>::new(s()).protocol(MockFactory(99));
-        let rendered = format!("{}", default_with_extra);
-        assert!(rendered.starts_with("ConnectionBuilder["));
-        assert!(rendered.ends_with(']'));
-        assert!(rendered.contains("MockFactory"));
-        assert_eq!(rendered.matches(", ").count(), 2);
-    }
-
-    /// Different settings produce different hashes.
-    #[cfg(feature = "dquic")]
-    #[test]
-    fn hash_ne_different_settings() {
-        let s1 = Arc::new(Settings::default());
-        let mut s2_inner = Settings::default();
-        s2_inner.set(MaxFieldSectionSize::setting(VarInt::from_u32(9999)));
-        let s2 = Arc::new(s2_inner);
-        let a = ConnectionBuilder::<C>::new(s1);
-        let b = ConnectionBuilder::<C>::new(s2);
-        assert_ne!(hash_of(&a), hash_of(&b));
-    }
-
-    /// Different protocol stacks produce different hashes.
-    #[cfg(feature = "dquic")]
-    #[test]
-    fn hash_ne_different_protocols() {
-        let s = || Arc::new(Settings::default());
-
-        let cases: [(&str, ConnectionBuilder<C>, ConnectionBuilder<C>); 3] = [
-            (
-                "extra protocol",
-                ConnectionBuilder::<C>::new(s()),
-                ConnectionBuilder::<C>::new(s()).protocol(MockFactory(42)),
-            ),
-            (
-                "different protocol value",
-                ConnectionBuilder::<C>::new(s()).protocol(MockFactory(1)),
-                ConnectionBuilder::<C>::new(s()).protocol(MockFactory(2)),
-            ),
-            (
-                "mock factory included in hash",
-                ConnectionBuilder::<C>::new(s()),
-                ConnectionBuilder::<C>::new(s()).protocol(MockFactory(42)),
-            ),
-        ];
-
-        for (name, a, b) in &cases {
-            assert_ne!(hash_of(a), hash_of(b), "hash inequality: {name}");
-        }
-    }
-
-    /// Different protocol ordering produces different hashes.
-    #[cfg(feature = "dquic")]
-    #[test]
-    fn hash_ne_different_order() {
-        let s = Arc::new(Settings::default());
-        // a: DHttpProtocolFactory, QPackProtocolFactory, MockFactory (from new + protocol)
-        let a = ConnectionBuilder::<C>::new(s.clone()).protocol(MockFactory(7));
-        // b: MockFactory first, then DHttpProtocolFactory, QPackProtocolFactory
-        let b = {
-            let builder = ConnectionBuilder::<C> {
-                initializers: Vec::new(),
-                _connection: std::marker::PhantomData,
+            let Some(frame) = read_h3_frame(
+                &mut self.reader,
+                &self.fail_connection,
+                #[cfg(feature = "webtransport")]
+                self.webtransport.as_ref(),
+            )
+            .await?
+            else {
+                self.finished = true;
+                if self.remaining.is_some_and(|remaining| remaining != 0) {
+                    return Err(Error::stream(
+                        Some(Code::H3_MESSAGE_ERROR),
+                        "Content-Length does not match received DATA length",
+                    ));
+                }
+                return Ok(None);
             };
-            builder
-                .protocol(MockFactory(7))
-                .protocol(crate::dhttp::protocol::DHttpProtocolFactory::new(s))
-                .protocol(crate::qpack::protocol::QPackProtocolFactory::new())
+
+            match frame.frame_type {
+                FrameType::Data => {
+                    if self.trailers_received {
+                        return Err(unexpected_frame(&self.fail_connection));
+                    }
+                    if let Some(remaining) = &mut self.remaining {
+                        *remaining = remaining.checked_sub(frame.length).ok_or_else(|| {
+                            Error::stream(
+                                Some(Code::H3_MESSAGE_ERROR),
+                                "received more DATA than Content-Length",
+                            )
+                        })?;
+                    }
+                    // Zero-length DATA is not EOF; the next iteration reads another header.
+                }
+                FrameType::Headers => {
+                    if self.trailers_received {
+                        return Err(unexpected_frame(&self.fail_connection));
+                    }
+                    if self.remaining.is_some_and(|remaining| remaining != 0) {
+                        return Err(Error::stream(
+                            Some(Code::H3_MESSAGE_ERROR),
+                            "trailers received before Content-Length was satisfied",
+                        ));
+                    }
+                    let payload = read_h3_payload(&mut self.reader, &self.fail_connection).await?;
+                    let trailers = self.qpack.decode_trailers(self.stream_id, &payload).await?;
+                    self.trailers_received = true;
+                    return Ok(Some(HttpFrame::trailers(trailers)));
+                }
+                FrameType::PushPromise if self.is_response => {
+                    return Err(reject_push_promise(&mut self.reader, &self.fail_connection).await);
+                }
+                FrameType::Unknown(_) => self.reader.discard_payload().await?,
+                _ => return Err(unexpected_frame(&self.fail_connection)),
+            }
+        }
+    }
+}
+
+impl Drop for ReceivedBody {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.qpack.cancel_stream(self.stream_id);
+            let _ = self.reader.stop(self.stop_code);
+        }
+    }
+}
+
+fn content_length(headers: &HeaderMap) -> Result<Option<u64>, Error> {
+    let mut parsed = None;
+    for value in headers.get_all(CONTENT_LENGTH) {
+        let value = value.to_str().map_err(|source| {
+            Error::stream_with_source(
+                Some(Code::H3_MESSAGE_ERROR),
+                "Content-Length is not ASCII",
+                source,
+            )
+        })?;
+        for value in value.split(',') {
+            let value = value.trim().parse::<u64>().map_err(|source| {
+                Error::stream_with_source(
+                    Some(Code::H3_MESSAGE_ERROR),
+                    "Content-Length is not a non-negative integer",
+                    source,
+                )
+            })?;
+            if parsed.is_some_and(|previous| previous != value) {
+                return Err(Error::stream(
+                    Some(Code::H3_MESSAGE_ERROR),
+                    "conflicting Content-Length values",
+                ));
+            }
+            parsed = Some(value);
+        }
+    }
+    Ok(parsed)
+}
+
+async fn open_critical_stream<T: transport::Connection>(
+    transport: &T,
+    stream_type: u64,
+) -> Result<BoxSendStream, Error> {
+    let mut stream: BoxSendStream =
+        Box::new(transport.open_uni().await.map_err(map_connection_error)?);
+    if stream.id().as_u64() & 0x02 == 0 {
+        return Err(Error::connection_protocol(
+            Code::H3_STREAM_CREATION_ERROR,
+            format!(
+                "transport returned bidirectional stream {} from open_uni",
+                stream.id()
+            ),
+        ));
+    }
+    send_bytes(&mut stream, wire::encode_stream_type(stream_type)?).await?;
+    Ok(stream)
+}
+
+async fn send_bytes(stream: &mut BoxSendStream, bytes: Bytes) -> Result<(), Error> {
+    stream.send(bytes).await.map_err(wire::map_stream_error)
+}
+
+fn validate_settings(settings: &Settings) -> Result<(), Error> {
+    for (name, value) in [
+        ("max_field_section_size", settings.max_field_section_size()),
+        (
+            "qpack_max_table_capacity",
+            Some(settings.qpack_max_table_capacity()),
+        ),
+        (
+            "qpack_blocked_streams",
+            Some(settings.qpack_blocked_streams()),
+        ),
+    ] {
+        if value.is_some_and(|value| value > MAX_VARINT) {
+            return Err(Error::invalid_settings(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{name} exceeds the QUIC variable-length integer range"),
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn map_connection_error(error: transport::ConnectionError) -> Error {
+    Error::connection(error.code(), "QUIC connection failed", error)
+}
+
+fn map_outgoing_request_error(error: Error) -> Error {
+    if error.code() == Some(Code::H3_REQUEST_REJECTED) {
+        Error::request_rejected_with_source("peer rejected the request", error)
+    } else {
+        error
+    }
+}
+
+fn close_after_init_failure<T: transport::Connection>(transport: &T, error: &Error) {
+    transport.close(
+        error.code().unwrap_or(Code::H3_INTERNAL_ERROR),
+        error.to_string().as_bytes(),
+    );
+}
+
+async fn watch_transport_closed<T: transport::Connection>(transport: Arc<T>, shared: Arc<Shared>) {
+    shared.fail(map_connection_error(transport.closed().await));
+}
+
+async fn supervise_qpack_decoder_writer<T: transport::Connection>(
+    transport: Arc<T>,
+    shared: Arc<Shared>,
+    writer: qpack::DecoderWriter,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let result = tokio::select! {
+        result = writer.run() => Some(result),
+        _ = shutdown.changed() => None,
+        _ = shared.wait_closed() => None,
+    };
+    if let Some(Err(error)) = result {
+        fail_protocol(&*transport, &shared, error);
+    }
+}
+
+async fn supervise_qpack_lifecycle(shared: Arc<Shared>, qpack: Arc<qpack::Qpack>) {
+    qpack.fail(shared.wait_closed().await);
+}
+
+#[cfg(feature = "webtransport")]
+async fn supervise_webtransport_datagrams<T: transport::Connection>(
+    transport: Arc<T>,
+    shared: Arc<Shared>,
+    webtransport: Arc<crate::webtransport::Runtime>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let result = tokio::select! {
+        result = webtransport.run_datagrams() => Some(result),
+        _ = shutdown.changed() => None,
+        _ = shared.wait_closed() => None,
+    };
+    if let Some(Err(error)) = result {
+        webtransport.fail(error.clone());
+        fail_protocol(&*transport, &shared, error);
+    }
+}
+
+#[cfg(feature = "webtransport")]
+async fn supervise_webtransport_lifecycle(
+    shared: Arc<Shared>,
+    webtransport: Arc<crate::webtransport::Runtime>,
+) {
+    webtransport.fail(shared.wait_closed().await);
+}
+
+#[derive(Clone)]
+struct RequestDispatch {
+    shared: Arc<Shared>,
+    requests: mpsc::Sender<AcceptedRequest>,
+    qpack: Arc<qpack::Qpack>,
+    fail_connection: FailConnection,
+    shutdown: watch::Receiver<bool>,
+    #[cfg(feature = "webtransport")]
+    connection: Option<Arc<dyn Send + Sync>>,
+}
+
+impl RequestDispatch {
+    async fn enqueue(
+        &self,
+        first: Option<FrameHeader>,
+        reader: FrameReader,
+        writer: BoxSendStream,
+        stream_id: StreamId,
+        #[cfg(feature = "webtransport")] webtransport: Option<Arc<crate::webtransport::Runtime>>,
+    ) -> Result<(), Error> {
+        #[cfg(feature = "webtransport")]
+        let webtransport_enabled = webtransport.is_some();
+        let resolver = RequestResolver {
+            first,
+            stream_id,
+            shared: Arc::clone(&self.shared),
+            reader: Some(reader),
+            writer: Some(writer),
+            qpack: Arc::clone(&self.qpack),
+            fail_connection: Arc::clone(&self.fail_connection),
+            qpack_cancellation_armed: true,
+            #[cfg(feature = "webtransport")]
+            webtransport,
+            #[cfg(feature = "webtransport")]
+            connection: self.connection.clone(),
         };
-        assert_ne!(hash_of(&a), hash_of(&b));
-    }
+        #[cfg(feature = "webtransport")]
+        if webtransport_enabled {
+            let permit = match self.requests.try_reserve() {
+                Ok(permit) => permit,
+                Err(mpsc::error::TrySendError::Full(_)) => return Ok(()),
+                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+            };
+            let request = resolver.resolve().await?;
+            permit.send(request);
+            return Ok(());
+        }
 
-    #[cfg(feature = "dquic")]
-    #[test]
-    fn builder_same_settings_eq() {
-        let s = Arc::new(Settings::default());
-        let a = ConnectionBuilder::<C>::new(s.clone());
-        let b = ConnectionBuilder::<C>::new(s);
-        assert_eq!(a, b);
-    }
-
-    #[cfg(feature = "dquic")]
-    #[test]
-    fn builder_different_settings_not_eq() {
-        let s1 = Arc::new(Settings::default());
-        let mut s2_inner = Settings::default();
-        s2_inner.set(MaxFieldSectionSize::setting(VarInt::from_u32(9999)));
-        let s2 = Arc::new(s2_inner);
-        let a = ConnectionBuilder::<C>::new(s1);
-        let b = ConnectionBuilder::<C>::new(s2);
-        assert_ne!(a, b);
-    }
-
-    #[cfg(feature = "dquic")]
-    #[test]
-    fn builder_display_and_debug_list_protocol_initializers() {
-        let builder =
-            ConnectionBuilder::<C>::new(Arc::new(Settings::default())).protocol(MockFactory(7));
-
-        assert_eq!(
-            builder.to_string(),
-            "ConnectionBuilder[DHTTP/3, QPACK, MockFactory]"
-        );
-        let debug = format!("{builder:?}");
-        assert!(debug.contains("ConnectionBuilder"));
-        assert!(debug.contains("DHttpProtocolFactory"));
-        assert!(debug.contains("QPackProtocolFactory"));
-        assert!(debug.contains("MockFactory"));
-    }
-
-    #[tokio::test]
-    async fn builder_closes_quic_when_initial_protocol_init_fails() {
-        let quic = Arc::new(MockConnection::new());
-        let result = ConnectionBuilder::new(Arc::new(Settings::default()))
-            .build(quic.clone())
-            .await;
-
-        let error = result.expect_err("open_uni failure should abort connection build");
-        assert_transport_reason(&error, "open_uni unavailable");
-        assert_eq!(
-            quic.close_calls(),
-            vec![(Code::H3_NO_ERROR, "h3 build aborted".to_owned())]
-        );
-    }
-
-    #[tokio::test]
-    async fn builder_success_initializes_dhttp_and_qpack_protocols() {
-        let quic = Arc::new(MockConnection::new());
-        quic.enable_stream_ops();
-        let settings = Arc::new(Settings::default());
-
-        let connection = ConnectionBuilder::new(settings.clone())
-            .build(quic.clone())
-            .await
-            .expect("builder should initialize built-in protocols");
-
-        assert!(
-            connection
-                .protocol::<crate::dhttp::protocol::DHttpProtocol>()
-                .is_some()
-        );
-        assert!(connection.qpack().is_ok());
-        assert!(Arc::ptr_eq(&connection.settings(), &settings));
-        assert_eq!(quic.stream_calls()[0], "open_uni");
-
-        drop(connection);
-        assert!(
-            quic.close_calls()
-                .iter()
-                .any(|(code, reason)| *code == Code::H3_NO_ERROR && reason == "no error")
-        );
-    }
-
-    #[cfg(feature = "dquic")]
-    #[tokio::test]
-    async fn builder_initializes_custom_protocol_factory() {
-        let quic = Arc::new(MockConnection::new());
-        quic.enable_stream_ops();
-
-        let connection = ConnectionBuilder::new(Arc::new(Settings::default()))
-            .protocol(MockFactory(7))
-            .build(quic)
-            .await
-            .expect("custom protocol factory should initialize");
-
-        assert!(connection.protocol::<MockProtocol>().is_some());
-    }
-
-    #[test]
-    fn state_accessors_return_underlying_quic_and_protocol_registry() {
-        let quic = Arc::new(MockConnection::new());
-        let protocols = Arc::new(Protocols::new());
-        let state = ConnectionState::new_for_test(quic.clone(), protocols.clone());
-
-        assert!(Arc::ptr_eq(state.quic(), &quic));
-        assert!(Arc::ptr_eq(state.protocols(), &protocols));
-        assert!(state.protocol::<MockProtocol>().is_none());
-        assert!(format!("{state:?}").contains("ConnectionState"));
-    }
-
-    #[test]
-    fn graceful_close_requires_h3_no_error_application_code() {
-        let graceful = quic::ConnectionError::Application {
-            source: quic::ApplicationError {
-                code: Code::H3_NO_ERROR,
-                reason: "no error".into(),
+        let mut shutdown = self.shutdown.clone();
+        let permit = tokio::select! {
+            result = self.requests.reserve() => match result {
+                Ok(permit) => permit,
+                Err(_) => return Ok(()),
             },
+            _ = shutdown.changed() => return Ok(()),
+            _ = self.shared.wait_closed() => return Ok(()),
         };
-        let application_failure = quic::ConnectionError::Application {
-            source: quic::ApplicationError {
-                code: Code::H3_INTERNAL_ERROR,
-                reason: "internal error".into(),
+        let request = resolver.resolve().await?;
+        permit.send(request);
+        Ok(())
+    }
+}
+
+async fn accept_bidi_streams<T: transport::Connection>(
+    transport: Arc<T>,
+    dispatch: RequestDispatch,
+    webtransport: OptionalWebTransport<T::SendStream>,
+) {
+    #[cfg(not(feature = "webtransport"))]
+    let _ = &webtransport;
+    let mut shutdown = dispatch.shutdown.clone();
+    let mut classifiers: JoinSet<Result<(), Error>> = JoinSet::new();
+    let classifier_limit = dispatch.requests.max_capacity();
+
+    loop {
+        let accepted = tokio::select! {
+            _ = shutdown.changed() => break,
+            accepted = transport.accept_bi(), if classifiers.len() < classifier_limit => Some(accepted),
+            _ = dispatch.shared.wait_closed() => break,
+            completed = classifiers.join_next(), if !classifiers.is_empty() => {
+                match completed {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(error))) if error.is_connection() => {
+                        fail_protocol(&*transport, &dispatch.shared, error);
+                        break;
+                    }
+                    Some(Ok(Err(_stream_error))) => {}
+                    Some(Err(join_error)) => {
+                        let error = Error::connection(
+                            Some(Code::H3_INTERNAL_ERROR),
+                            "bidirectional stream classifier failed",
+                            join_error,
+                        );
+                        fail_protocol(&*transport, &dispatch.shared, error);
+                        break;
+                    }
+                    None => {}
+                }
+                None
+            }
+        };
+        let Some(accepted) = accepted else {
+            continue;
+        };
+        let (reader, mut writer) = match accepted {
+            Ok(streams) => streams,
+            Err(error) => {
+                dispatch.shared.fail(map_connection_error(error));
+                break;
+            }
+        };
+
+        let stream_id = reader.id();
+        if stream_id != writer.id() || stream_id.as_u64() & 0x02 != 0 {
+            let error = Error::connection_protocol(
+                Code::H3_ID_ERROR,
+                "transport returned an invalid bidirectional stream pair",
+            );
+            writer
+                .reset(error.code().expect("protocol error has a code"))
+                .ok();
+            fail_protocol(&*transport, &dispatch.shared, error);
+            break;
+        }
+        #[cfg(feature = "webtransport")]
+        if let Some(hooks) = webtransport.hooks.clone() {
+            let dispatch = dispatch.clone();
+            classifiers.spawn(async move {
+                classify_bidi_stream(reader, writer, stream_id, dispatch, hooks).await
+            });
+            continue;
+        }
+
+        if !dispatch.shared.register_incoming(stream_id) {
+            let mut reader = reader;
+            let _ = reader.stop(Code::H3_REQUEST_REJECTED);
+            let _ = writer.reset(Code::H3_REQUEST_REJECTED);
+            continue;
+        }
+        let request_dispatch = dispatch.clone();
+        classifiers.spawn(async move {
+            request_dispatch
+                .enqueue(
+                    None,
+                    FrameReader::new(
+                        ChunkReader::new(reader),
+                        request_dispatch.shared.payload_budget.clone(),
+                    ),
+                    Box::new(writer),
+                    stream_id,
+                    #[cfg(feature = "webtransport")]
+                    None,
+                )
+                .await
+        });
+    }
+
+    classifiers.abort_all();
+    while classifiers.join_next().await.is_some() {}
+}
+
+#[cfg(feature = "webtransport")]
+async fn classify_bidi_stream<R, S>(
+    reader: R,
+    writer: S,
+    stream_id: StreamId,
+    dispatch: RequestDispatch,
+    hooks: crate::webtransport::Hooks<S>,
+) -> Result<(), Error>
+where
+    R: transport::RecvStream,
+    S: transport::SendStream,
+{
+    let mut reader = ChunkReader::new(reader);
+    let first_type = reader.read_varint().await?;
+    if first_type == wire::WEBTRANSPORT_BIDI_SIGNAL {
+        let session_id = crate::stream_id::try_from_u64(reader.read_varint().await?)?;
+        if let Err(error) = hooks.runtime().wait_client_support().await {
+            if error.is_connection() {
+                return Err(error);
+            }
+            let code = error.code().unwrap_or(Code::H3_MESSAGE_ERROR);
+            let _ = reader.stop(code);
+            let mut writer = hooks.wrap_writer(writer);
+            let _ = writer.reset_at(code, 0);
+            return Ok(());
+        }
+        return hooks
+            .runtime()
+            .route_bidi(session_id, reader, hooks.wrap_writer(writer));
+    }
+
+    let length = reader.read_varint().await?;
+    let first = FrameHeader {
+        frame_type: first_type.into(),
+        length,
+    };
+    let mut reader =
+        FrameReader::after_header(reader, dispatch.shared.payload_budget.clone(), length);
+
+    if !dispatch.shared.register_incoming(stream_id) {
+        let _ = reader.stop(Code::H3_REQUEST_REJECTED);
+        let mut writer = writer;
+        let _ = writer.reset(Code::H3_REQUEST_REJECTED);
+        return Ok(());
+    }
+    dispatch
+        .enqueue(
+            Some(first),
+            reader,
+            Box::new(writer),
+            stream_id,
+            Some(Arc::clone(hooks.runtime())),
+        )
+        .await
+}
+
+async fn accept_uni_streams<T: transport::Connection>(
+    transport: Arc<T>,
+    shared: Arc<Shared>,
+    peer_critical: Arc<PeerCriticalStreams>,
+    qpack: Arc<qpack::Qpack>,
+    fail_connection: FailConnection,
+    mut shutdown: watch::Receiver<bool>,
+    webtransport: OptionalWebTransport<T::SendStream>,
+) {
+    #[cfg(not(feature = "webtransport"))]
+    let _ = &webtransport;
+    let mut streams = JoinSet::new();
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = shared.wait_closed() => break,
+            accepted = transport.accept_uni() => match accepted {
+                Ok(stream) => {
+                    let shared = Arc::clone(&shared);
+                    let peer_critical = Arc::clone(&peer_critical);
+                    let qpack = Arc::clone(&qpack);
+                    let fail_connection = Arc::clone(&fail_connection);
+                    #[cfg(feature = "webtransport")]
+                    let webtransport = webtransport.runtime();
+                    streams.spawn(async move {
+                        handle_uni_stream(
+                            ChunkReader::new(stream),
+                            shared,
+                            peer_critical,
+                            qpack,
+                            fail_connection,
+                            #[cfg(feature = "webtransport")]
+                            webtransport,
+                        )
+                        .await
+                    });
+                }
+                Err(error) => {
+                    shared.fail(map_connection_error(error));
+                    break;
+                }
             },
-        };
-
-        assert!(is_graceful_connection_close(&graceful));
-        assert!(!is_graceful_connection_close(&application_failure));
-        assert!(!is_graceful_connection_close(&test_connection_error(
-            "transport failure"
-        )));
-    }
-
-    #[tokio::test]
-    async fn state_open_stream_helpers_delegate_success_and_error_paths() {
-        let quic = MockConnection::new();
-        let state =
-            ConnectionState::new_for_test(Arc::new(quic.clone()), Arc::new(Protocols::new()));
-
-        let bi_error = state
-            .open_bi()
-            .await
-            .expect_err("open_bi should fail before enabled");
-        assert_transport_reason(&bi_error, "open_bi unavailable");
-        let uni_error = state
-            .open_uni()
-            .await
-            .expect_err("open_uni should fail before enabled");
-        assert_transport_reason(&uni_error, "open_uni unavailable");
-
-        quic.enable_stream_ops();
-        state
-            .open_bi()
-            .await
-            .expect("open_bi should delegate success");
-        state
-            .open_uni()
-            .await
-            .expect("open_uni should delegate success");
-
-        assert_eq!(
-            quic.stream_calls(),
-            vec!["open_bi", "open_uni", "open_bi", "open_uni"]
-        );
-    }
-
-    #[tokio::test]
-    async fn local_and_remote_authority_accessors_delegate_on_concrete_state() {
-        let quic = MockConnection::new();
-        let state = ConnectionState::new_for_test(Arc::new(quic), Arc::new(Protocols::new()));
-
-        let local = state
-            .local_authority()
-            .await
-            .expect("local authority lookup should succeed")
-            .expect("local authority should be present");
-        assert_eq!(local.name(), "test-local");
-
-        let remote = state
-            .remote_authority()
-            .await
-            .expect("remote authority lookup should succeed")
-            .expect("remote authority should be present");
-        assert_eq!(remote.name(), "test-remote");
-    }
-
-    #[tokio::test]
-    async fn accept_tasks_handle_accept_errors_without_closing_again() {
-        let bi_quic = MockConnection::new();
-        let bi_state =
-            ConnectionState::new_for_test(Arc::new(bi_quic.clone()), Arc::new(Protocols::new()));
-        ConnectionState::accept_bi_stream_task(bi_state).await;
-        assert_eq!(bi_quic.stream_calls(), vec!["accept_bi"]);
-        assert!(bi_quic.close_calls().is_empty());
-
-        let uni_quic = MockConnection::new();
-        let uni_state =
-            ConnectionState::new_for_test(Arc::new(uni_quic.clone()), Arc::new(Protocols::new()));
-        ConnectionState::accept_uni_stream_task(uni_state).await;
-        assert_eq!(uni_quic.stream_calls(), vec!["accept_uni"]);
-        assert!(uni_quic.close_calls().is_empty());
-    }
-
-    #[cfg(feature = "dquic")]
-    #[tokio::test]
-    async fn accept_tasks_pass_unknown_streams_to_stop_and_reset_paths() {
-        let bi_quic = MockConnection::new();
-        bi_quic.enable_stream_ops();
-        let bi_protocols = {
-            let mut protocols = Protocols::new();
-            protocols.insert(PassThenDisableProtocol {
-                quic: bi_quic.clone(),
-            });
-            Arc::new(protocols)
-        };
-        let bi_state = ConnectionState::new_for_test(Arc::new(bi_quic.clone()), bi_protocols);
-        ConnectionState::accept_bi_stream_task(bi_state).await;
-        assert_eq!(bi_quic.stream_calls(), vec!["accept_bi", "accept_bi"]);
-
-        let uni_quic = MockConnection::new();
-        uni_quic.enable_stream_ops();
-        let uni_protocols = {
-            let mut protocols = Protocols::new();
-            protocols.insert(PassThenDisableProtocol {
-                quic: uni_quic.clone(),
-            });
-            Arc::new(protocols)
-        };
-        let uni_state = ConnectionState::new_for_test(Arc::new(uni_quic.clone()), uni_protocols);
-        ConnectionState::accept_uni_stream_task(uni_state).await;
-        assert_eq!(uni_quic.stream_calls(), vec!["accept_uni", "accept_uni"]);
-    }
-
-    #[cfg(feature = "dquic")]
-    #[tokio::test]
-    async fn accept_bi_task_calls_handle_connection_error_for_connection_scope_errors() {
-        let bi_quic = MockConnection::new();
-        bi_quic.enable_stream_ops();
-
-        let protocols = {
-            let mut protocols = Protocols::new();
-            protocols.insert(ErrThenDisableProtocol {
-                quic: bi_quic.clone(),
-                kind: ErrKind::Connection,
-            });
-            Arc::new(protocols)
-        };
-        let state = ConnectionState::new_for_test(Arc::new(bi_quic.clone()), protocols);
-        let task = tokio::spawn(ConnectionState::accept_bi_stream_task(state).in_current_span());
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if !bi_quic.close_calls().is_empty() {
-                    break;
+            completed = streams.join_next(), if !streams.is_empty() => {
+                match completed {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(error))) if error.is_connection() => {
+                        fail_protocol(&*transport, &shared, error);
+                        break;
+                    }
+                    Some(Ok(Err(_stream_error))) => {}
+                    Some(Err(join_error)) => {
+                        let error = Error::connection(
+                            Some(Code::H3_INTERNAL_ERROR),
+                            "unidirectional stream task failed",
+                            join_error,
+                        );
+                        fail_protocol(&*transport, &shared, error);
+                        break;
+                    }
+                    None => {}
                 }
-                tokio::task::yield_now().await;
             }
-        })
-        .await
-        .expect("connection-scope error should trigger close");
-
-        bi_quic.set_terminal_error(test_connection_error("bi terminal"));
-        tokio::time::timeout(std::time::Duration::from_secs(1), task)
-            .await
-            .expect("accept_bi task should terminate")
-            .expect("task should not panic");
-
-        assert!(bi_quic.stream_calls().contains(&"accept_bi"));
-        assert_eq!(bi_quic.close_calls().len(), 1);
-        assert_eq!(bi_quic.close_calls()[0].0, Code::H3_MISSING_SETTINGS);
+        }
     }
 
-    #[cfg(feature = "dquic")]
-    #[tokio::test]
-    async fn accept_uni_task_calls_handle_connection_error_for_connection_scope_errors() {
-        let uni_quic = MockConnection::new();
-        uni_quic.enable_stream_ops();
+    streams.abort_all();
+    while streams.join_next().await.is_some() {}
+}
 
-        let protocols = {
-            let mut protocols = Protocols::new();
-            protocols.insert(ErrThenDisableProtocol {
-                quic: uni_quic.clone(),
-                kind: ErrKind::Connection,
-            });
-            Arc::new(protocols)
-        };
-        let state = ConnectionState::new_for_test(Arc::new(uni_quic.clone()), protocols);
-        let task = tokio::spawn(ConnectionState::accept_uni_stream_task(state).in_current_span());
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if !uni_quic.close_calls().is_empty() {
-                    break;
+async fn handle_uni_stream(
+    mut reader: ChunkReader,
+    shared: Arc<Shared>,
+    peer_critical: Arc<PeerCriticalStreams>,
+    qpack: Arc<qpack::Qpack>,
+    fail_connection: FailConnection,
+    #[cfg(feature = "webtransport")] webtransport: Option<Arc<crate::webtransport::Runtime>>,
+) -> Result<(), Error> {
+    match reader.read_varint().await? {
+        CONTROL_STREAM_TYPE => {
+            PeerCriticalStreams::claim(&peer_critical.control, "control")?;
+            critical_stream_result(
+                handle_control_stream(
+                    reader,
+                    shared,
+                    qpack,
+                    fail_connection,
+                    #[cfg(feature = "webtransport")]
+                    webtransport,
+                )
+                .await,
+                "control",
+            )
+        }
+        QPACK_ENCODER_STREAM_TYPE => {
+            PeerCriticalStreams::claim(&peer_critical.qpack_encoder, "QPACK encoder")?;
+            critical_stream_result(qpack.handle_encoder_stream(reader).await, "QPACK encoder")
+        }
+        QPACK_DECODER_STREAM_TYPE => {
+            PeerCriticalStreams::claim(&peer_critical.qpack_decoder, "QPACK decoder")?;
+            critical_stream_result(qpack.handle_decoder_stream(reader).await, "QPACK decoder")
+        }
+        PUSH_STREAM_TYPE => Err(Error::connection_protocol(
+            if shared.local_role_bit == 1 {
+                Code::H3_STREAM_CREATION_ERROR
+            } else {
+                Code::H3_ID_ERROR
+            },
+            "server push is not supported by the symmetric h3x profile",
+        )),
+        #[cfg(feature = "webtransport")]
+        wire::WEBTRANSPORT_UNI_STREAM_TYPE => {
+            let Some(webtransport) = webtransport else {
+                return reader.drain_to_end().await;
+            };
+            let session_id = crate::stream_id::try_from_u64(reader.read_varint().await?)?;
+            if let Err(error) = webtransport.wait_client_support().await {
+                if error.is_connection() {
+                    return Err(error);
                 }
-                tokio::task::yield_now().await;
+                let _ = reader.stop(error.code().unwrap_or(Code::H3_MESSAGE_ERROR));
+                return Ok(());
             }
-        })
-        .await
-        .expect("connection-scope error should trigger close");
+            webtransport.route_uni(session_id, reader)
+        }
+        _unknown => reader.drain_to_end().await,
+    }
+}
 
-        uni_quic.set_terminal_error(test_connection_error("uni terminal"));
-        tokio::time::timeout(std::time::Duration::from_secs(1), task)
-            .await
-            .expect("accept_uni task should terminate")
-            .expect("task should not panic");
+fn critical_stream_result(result: Result<(), Error>, name: &'static str) -> Result<(), Error> {
+    match result {
+        Err(error) if error.is_stream() => Err(Error::connection(
+            Some(Code::H3_CLOSED_CRITICAL_STREAM),
+            format!("peer {name} stream was reset"),
+            error,
+        )),
+        other => other,
+    }
+}
 
-        assert!(uni_quic.stream_calls().contains(&"accept_uni"));
-        assert_eq!(uni_quic.close_calls().len(), 1);
-        assert_eq!(uni_quic.close_calls()[0].0, Code::H3_MISSING_SETTINGS);
+async fn handle_control_stream(
+    reader: ChunkReader,
+    shared: Arc<Shared>,
+    qpack: Arc<qpack::Qpack>,
+    fail_connection: FailConnection,
+    #[cfg(feature = "webtransport")] webtransport: Option<Arc<crate::webtransport::Runtime>>,
+) -> Result<(), Error> {
+    let mut reader = FrameReader::new(reader, shared.payload_budget.clone());
+    let Some(first) = read_h3_frame(
+        &mut reader,
+        &fail_connection,
+        #[cfg(feature = "webtransport")]
+        webtransport.as_ref(),
+    )
+    .await?
+    else {
+        return Err(Error::connection_protocol(
+            Code::H3_CLOSED_CRITICAL_STREAM,
+            "peer control stream closed before SETTINGS",
+        ));
+    };
+    if first.frame_type != FrameType::Settings {
+        return Err(Error::connection_protocol(
+            Code::H3_MISSING_SETTINGS,
+            "SETTINGS is not the first frame on the peer control stream",
+        ));
+    }
+    let peer_settings = {
+        let payload = read_h3_payload(&mut reader, &fail_connection).await?;
+        wire::decode_settings_payload(&payload)?
+    };
+    qpack.apply_peer_settings(&peer_settings).await?;
+    #[cfg(feature = "webtransport")]
+    if let Some(ref webtransport) = webtransport {
+        webtransport.apply_peer_settings(&peer_settings);
     }
 
-    #[cfg(feature = "dquic")]
-    #[tokio::test]
-    async fn accept_bi_task_skips_close_for_stream_scope_errors() {
-        let bi_quic = MockConnection::new();
-        bi_quic.enable_stream_ops();
-
-        let protocols = {
-            let mut protocols = Protocols::new();
-            protocols.insert(ErrThenDisableProtocol {
-                quic: bi_quic.clone(),
-                kind: ErrKind::Reset,
-            });
-            Arc::new(protocols)
-        };
-        let state = ConnectionState::new_for_test(Arc::new(bi_quic.clone()), protocols);
-        let task = tokio::spawn(ConnectionState::accept_bi_stream_task(state).in_current_span());
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if bi_quic.stream_calls().contains(&"accept_bi") {
-                    break;
+    let mut max_push_id = None;
+    while let Some(frame) = read_h3_frame(
+        &mut reader,
+        &fail_connection,
+        #[cfg(feature = "webtransport")]
+        webtransport.as_ref(),
+    )
+    .await?
+    {
+        match frame.frame_type {
+            FrameType::Settings => {
+                return Err(Error::connection_protocol(
+                    Code::H3_FRAME_UNEXPECTED,
+                    "peer sent a second SETTINGS frame",
+                ));
+            }
+            FrameType::Goaway => {
+                let boundary = reader.read_id_payload().await?;
+                if boundary & 0x02 != 0 {
+                    return Err(Error::connection_protocol(
+                        Code::H3_ID_ERROR,
+                        "GOAWAY does not identify a bidirectional stream",
+                    ));
                 }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("task should call accept_bi");
-
-        // give the stream-scope error path a chance to execute
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
-
-        bi_quic.set_terminal_error(test_connection_error("bi reset terminal"));
-        tokio::time::timeout(std::time::Duration::from_secs(1), task)
-            .await
-            .expect("accept_bi task should terminate")
-            .expect("task should not panic");
-
-        assert!(
-            bi_quic.close_calls().is_empty(),
-            "stream-scope errors must not trigger connection close"
-        );
-    }
-
-    #[cfg(feature = "dquic")]
-    #[tokio::test]
-    async fn accept_uni_task_skips_close_for_stream_scope_errors() {
-        let uni_quic = MockConnection::new();
-        uni_quic.enable_stream_ops();
-
-        let protocols = {
-            let mut protocols = Protocols::new();
-            protocols.insert(ErrThenDisableProtocol {
-                quic: uni_quic.clone(),
-                kind: ErrKind::Reset,
-            });
-            Arc::new(protocols)
-        };
-        let state = ConnectionState::new_for_test(Arc::new(uni_quic.clone()), protocols);
-        let task = tokio::spawn(ConnectionState::accept_uni_stream_task(state).in_current_span());
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if uni_quic.stream_calls().contains(&"accept_uni") {
-                    break;
+                shared.apply_peer_goaway(crate::stream_id::try_from_u64(boundary)?)?;
+                #[cfg(feature = "webtransport")]
+                if let Some(webtransport) = &webtransport {
+                    webtransport.mark_active_draining();
                 }
-                tokio::task::yield_now().await;
             }
-        })
-        .await
-        .expect("task should call accept_uni");
-
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
-
-        uni_quic.set_terminal_error(test_connection_error("uni reset terminal"));
-        tokio::time::timeout(std::time::Duration::from_secs(1), task)
-            .await
-            .expect("accept_uni task should terminate")
-            .expect("task should not panic");
-
-        assert!(uni_quic.close_calls().is_empty());
-    }
-
-    #[tokio::test]
-    async fn lifecycle_ext_h3_error_closes_then_returns_terminal_error() {
-        let quic = MockConnection::new();
-        let quic_for_task = quic.clone();
-        let task = tokio::spawn(
-            async move {
-                quic_for_task
-                    .handle_connection_error(super::ConnectionError::from(H3MissingSettings))
-                    .await
-            }
-            .in_current_span(),
-        );
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if !quic.close_calls().is_empty() {
-                    break;
+            FrameType::MaxPushId => {
+                let value = reader.read_id_payload().await?;
+                if max_push_id.is_some_and(|previous| value < previous) {
+                    return Err(Error::connection_protocol(
+                        Code::H3_ID_ERROR,
+                        "MAX_PUSH_ID decreased",
+                    ));
                 }
-                tokio::task::yield_now().await;
+                max_push_id = Some(value);
             }
-        })
-        .await
-        .expect("h3 error should close promptly");
-
-        assert_eq!(
-            quic.close_calls(),
-            vec![(
-                Code::H3_MISSING_SETTINGS,
-                "no SETTINGS frame at beginning of control stream".to_owned()
-            )]
-        );
-
-        quic.set_terminal_error(test_connection_error("after h3 close"));
-        let error = tokio::time::timeout(std::time::Duration::from_secs(1), task)
-            .await
-            .expect("closed should resolve")
-            .expect("task should not panic");
-        assert_transport_reason(&error, "after h3 close");
-    }
-
-    #[tokio::test]
-    async fn lifecycle_ext_h3_error_returns_existing_terminal_error_without_closing() {
-        let quic = MockConnection::new();
-        quic.set_terminal_error(test_connection_error("already closed"));
-
-        let error = quic
-            .handle_connection_error(super::ConnectionError::from(H3MissingSettings))
-            .await;
-
-        assert_transport_reason(&error, "already closed");
-        assert!(quic.close_calls().is_empty());
-    }
-
-    #[test]
-    fn stream_error_from_connection_scope_h3_registry_variant() {
-        let error = StreamError::from(H3MissingSettings);
-
-        match error {
-            StreamError::Connection { source } => {
-                assert_connection_h3_code(source, Code::H3_MISSING_SETTINGS);
+            FrameType::CancelPush => {
+                reader.read_id_payload().await?;
+                return Err(Error::connection_protocol(
+                    Code::H3_ID_ERROR,
+                    "no push was promised",
+                ));
             }
-            other => panic!("expected connection-scope stream error, got {other:?}"),
+            FrameType::Unknown(_) => reader.discard_payload().await?,
+            _ => {
+                return Err(Error::connection_protocol(
+                    Code::H3_FRAME_UNEXPECTED,
+                    "message frame received on the control stream",
+                ));
+            }
         }
     }
 
-    #[test]
-    fn h3_error_display_and_sources_are_layered() {
-        let connection_error = super::ConnectionError::from(H3MissingSettings);
-        assert_eq!(
-            connection_error.to_string(),
-            "h3 connection-scope protocol error"
-        );
-        assert_eq!(
-            connection_error
-                .source()
-                .expect("h3 connection source")
-                .to_string(),
-            "no SETTINGS frame at beginning of control stream"
-        );
+    Err(Error::connection_protocol(
+        Code::H3_CLOSED_CRITICAL_STREAM,
+        "peer control stream closed",
+    ))
+}
 
-        let stream_error = StreamError::from(H3MessageError::MissingHeaderSection);
-        assert_eq!(stream_error.to_string(), "h3 stream-scope protocol error");
-        assert_eq!(
-            stream_error.source().expect("h3 stream source").to_string(),
-            "missing header section in HTTP message"
-        );
-    }
-
-    #[test]
-    fn stream_error_h3_io_roundtrip_preserves_source() {
-        let io_error = io::Error::from(StreamError::from(H3MessageError::MissingHeaderSection));
-        assert_eq!(io_error.kind(), io::ErrorKind::Other);
-
-        let recovered = StreamError::from(io_error);
-        assert_stream_h3_code(recovered, Code::H3_MESSAGE_ERROR);
-    }
-
-    #[test]
-    fn connection_error_recovery_rejects_untyped_io_error() {
-        let result = std::panic::catch_unwind(|| {
-            let _ = super::ConnectionError::from(io::Error::other("opaque"));
-        });
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn stream_error_recovery_rejects_untyped_io_error() {
-        let result = std::panic::catch_unwind(|| {
-            let _ = StreamError::from(io::Error::other("opaque"));
-        });
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn stream_error_map_stream_reset_maps_only_reset_code() {
-        let reset_code = VarInt::from_u32(0x123);
-        let mapped = StreamError::Reset { code: reset_code }.map_stream_reset(|code| {
-            assert_eq!(code, reset_code);
-            StreamError::from(H3MessageError::MissingHeaderSection)
-        });
-
-        assert_stream_h3_code(mapped, Code::H3_MESSAGE_ERROR);
-    }
-
-    #[test]
-    fn connection_error_recovers_from_io_error_layers() {
-        let connection_error = super::ConnectionError::from(test_connection_error("wrapped"));
-        let recovered = super::ConnectionError::from(io::Error::from(connection_error));
-        match recovered {
-            super::ConnectionError::Quic { source } => assert_transport_reason(&source, "wrapped"),
-            other => panic!("expected quic connection error, got {other:?}"),
-        }
-
-        let quic_error = test_connection_error("quic");
-        let recovered = super::ConnectionError::from(io::Error::from(quic_error));
-        match recovered {
-            super::ConnectionError::Quic { source } => assert_transport_reason(&source, "quic"),
-            other => panic!("expected quic connection error, got {other:?}"),
-        }
-
-        let h3_error = super::ConnectionError::from(H3MissingSettings);
-        let super::ConnectionError::H3 { source } = h3_error else {
-            panic!("expected h3 connection error");
-        };
-        let h3_source: Arc<dyn crate::error::H3ConnectionError> = source;
-        let recovered = super::ConnectionError::from(io::Error::other(h3_source));
-        assert_connection_h3_code(recovered, Code::H3_MISSING_SETTINGS);
-    }
-
-    #[test]
-    fn stream_error_recovers_from_io_error_layers() {
-        let reset_code = VarInt::from_u32(0x41);
-        let reset = StreamError::Reset { code: reset_code };
-        assert_stream_reset(StreamError::from(io::Error::from(reset)), reset_code);
-
-        let quic_reset_code = VarInt::from_u32(0x42);
-        let quic_reset = quic::StreamError::Reset {
-            code: quic_reset_code,
-        };
-        assert_stream_reset(
-            StreamError::from(io::Error::from(quic_reset)),
-            quic_reset_code,
-        );
-
-        let connection_error = super::ConnectionError::from(test_connection_error("stream"));
-        let recovered = StreamError::from(io::Error::from(connection_error));
-        match recovered {
-            StreamError::Connection {
-                source: super::ConnectionError::Quic { source },
-            } => assert_transport_reason(&source, "stream"),
-            other => panic!("expected stream connection error, got {other:?}"),
-        }
-
-        let h3 = StreamError::from(H3MessageError::MissingHeaderSection);
-        let StreamError::H3 { source } = h3 else {
-            panic!("expected h3 stream error");
-        };
-        let h3_source: Arc<dyn crate::error::H3StreamError> = source;
-        let recovered = StreamError::from(io::Error::other(h3_source));
-        assert_stream_h3_code(recovered, Code::H3_MESSAGE_ERROR);
-    }
-
-    #[test]
-    fn map_stream_reset_leaves_non_reset_errors_unchanged() {
-        let mut mapper_called = false;
-        let error = StreamError::from(H3MessageError::UnexpectedHeadersInBody);
-        let mapped = error.map_stream_reset(|code| {
-            mapper_called = true;
-            StreamError::Reset { code }
-        });
-
-        assert!(!mapper_called);
-        assert_stream_h3_code(mapped, Code::H3_MESSAGE_ERROR);
-    }
-
-    #[tokio::test]
-    async fn test_stream_helpers_cover_stop_reset_and_close() {
-        let mut reader = TestReadStream;
-        reader
-            .stop(VarInt::from_u32(0x103))
-            .await
-            .expect("test reader stop should succeed");
-
-        let mut writer = TestWriteStream;
-        writer
-            .reset(VarInt::from_u32(0x103))
-            .await
-            .expect("test writer reset should succeed");
-        writer
-            .close()
-            .await
-            .expect("test writer close should succeed");
-    }
-
-    #[tokio::test]
-    async fn erased_connection_state_delegates_dyn_connection_operations() {
-        let quic = MockConnection::new();
-        quic.enable_stream_ops();
-        let state =
-            ConnectionState::new_for_test(Arc::new(quic.clone()), Arc::new(Protocols::new()));
-        let erased = state.erase();
-
-        assert!(Arc::ptr_eq(state.protocols(), erased.protocols()));
-        assert_eq!(
-            erased
-                .local_authority()
-                .await
-                .expect("local authority delegated")
-                .expect("local authority present")
-                .name(),
-            "test-local"
-        );
-        assert_eq!(
-            erased
-                .remote_authority()
-                .await
-                .expect("remote authority delegated")
-                .expect("remote authority present")
-                .name(),
-            "test-remote"
-        );
-        assert!(erased.check().is_ok());
-
-        let _ = quic::DynManageStream::open_bi(&**erased.quic())
-            .await
-            .expect("open_bi delegated");
-        let _ = quic::DynManageStream::open_uni(&**erased.quic())
-            .await
-            .expect("open_uni delegated");
-        let _ = quic::DynManageStream::accept_bi(&**erased.quic())
-            .await
-            .expect("accept_bi delegated");
-        let _ = quic::DynManageStream::accept_uni(&**erased.quic())
-            .await
-            .expect("accept_uni delegated");
-
-        assert_eq!(
-            quic.stream_calls(),
-            vec!["open_bi", "open_uni", "accept_bi", "accept_uni"]
-        );
-
-        erased.close(Code::H3_NO_ERROR, "dyn close");
-        assert_eq!(
-            quic.close_calls(),
-            vec![(Code::H3_NO_ERROR, "dyn close".to_owned())]
-        );
-
-        quic.set_terminal_error(test_connection_error("dyn closed"));
-        let closed = erased.closed().await;
-        assert_transport_reason(&closed, "dyn closed");
-    }
-
-    #[tokio::test]
-    async fn connection_from_state_for_test_closes_on_drop() {
-        let quic = MockConnection::new();
-        let state =
-            ConnectionState::new_for_test(Arc::new(quic.clone()), Arc::new(Protocols::new()));
-        let connection = Connection::from_state_for_test(state);
-
-        assert!(quic.close_calls().is_empty());
-        drop(connection);
-
-        assert_eq!(
-            quic.close_calls(),
-            vec![(Code::H3_NO_ERROR, "no error".to_owned())]
-        );
-    }
-
-    #[test]
-    fn check_latches_terminal_error_after_closed_is_observed() {
-        let quic = MockConnection::new();
-        let protocols = Arc::new(Protocols::new());
-        let state = ConnectionState::new_for_test(Arc::new(quic.clone()), protocols);
-        let expected = test_connection_error("closed");
-
-        // Initially healthy.
-        assert!(state.check().is_ok());
-
-        // Simulate connection death at the QUIC layer.
-        quic.set_terminal_error(expected.clone());
-
-        // check() sees the latched error.
-        let check_error = state.check().expect_err("should be dead");
-        assert_transport_reason(&check_error, "closed");
-
-        // closed() returns the same error immediately.
-        let observed = futures::executor::block_on(state.closed());
-        assert_transport_reason(&observed, "closed");
-
-        // Subsequent check() still returns the same error.
-        let check_again = state.check().expect_err("still dead");
-        assert_transport_reason(&check_again, "closed");
-    }
+fn fail_protocol<T: transport::Connection>(transport: &T, shared: &Shared, error: Error) {
+    transport.close(
+        error.code().unwrap_or(Code::H3_INTERNAL_ERROR),
+        error.to_string().as_bytes(),
+    );
+    shared.fail(error);
 }
