@@ -14,7 +14,9 @@
 
 h3x is the symmetric HTTP/3 protocol core used by [dhttp](https://github.com/genmeta/dhttp). It runs on an already-established QUIC connection and provides streaming `http::Request` / `http::Response` APIs.
 
-h3x deliberately does not connect, listen, resolve DNS names, inspect TLS identities, pool connections, or run application services. A transport adapter implements `h3x::transport::Connection`; dhttp owns the surrounding endpoint and identity policy.
+The crate has three layers: `api` for convenient requests, `runtime` for identity, pooling and services, and `protocol` for HTTP/3. See [the architecture](design/architecture.md). The protocol adopts an established transport through `transport::PendingTransport<T>`; authentication facts remain in the runtime.
+
+**Protocol API:** `protocol::new` returns a cloneable `Sender` and an exclusive `Connection`, backed by shared internal state. The runtime service loop owns the protocol connection and exposes the sender through `runtime::Connection::sender()`.
 
 ## Server-Initiated Requests
 
@@ -22,32 +24,31 @@ Beneath the hood of a standard QUIC connection, both endpoints have equal abilit
 
 > HTTP/3 does not use server-initiated bidirectional streams, though an extension could define a use for these streams. Clients MUST treat receipt of a server-initiated bidirectional stream as a connection error of type H3_STREAM_CREATION_ERROR unless such an extension has been negotiated.
 
-h3x uses these bidirectional streams as a negotiated symmetric `b"h3"` profile: either peer can initiate one request and receive one final response on the reverse direction of the same stream. Both peers use the same streaming `Connection::request` and `Connection::accept` API.
+Either peer can initiate a request and receive its response on the reverse direction of the same bidirectional stream. Construction returns `(Sender, Connection)`; local sends and incoming stream acceptance are independent.
 
-```rust,no_run
-use h3x::{Connection, Error, transport};
-use http::{Request, Response};
-use http_body_util::Empty;
+```rust,ignore
+use h3x::{Error, Settings, protocol, transport};
+use http_body_util::{BodyExt, Full};
 
-async fn send<T: transport::Connection>(
-    h3: &Connection<T>,
-    request: Request<()>,
-) -> Result<Response<h3x::Body>, Error> {
-    let (head, ()) = request.into_parts();
-    let stream = h3.request(head).await?;
-    stream.finish().await?;
-    stream.response().await
-}
+async fn request<T: transport::Connection>(
+    pending: transport::PendingTransport<T>,
+) -> Result<(), Error> {
+    let (sender, mut connection) = protocol::new(pending, Settings::default()).await?;
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://example.test/echo")
+        .body(Full::new(bytes::Bytes::from_static(b"hello")))
+        .unwrap();
 
-async fn accept_one<T: transport::Connection>(h3: &Connection<T>) -> Result<(), Error> {
-    if let Some((_request, response)) = h3.accept().await? {
-        response.send(Response::new(Empty::<bytes::Bytes>::new())).await?;
-    }
-    Ok(())
+    let response = sender.request(request).await?;
+    response.into_body().collect().await?;
+    connection.shutdown().await
 }
 ```
 
-Request body writes and response reads are independent. Callers can drive `RequestStream::write` and `RequestStream::response` concurrently without a background body pump. `accept` returns a decoded request and its single-use response right.
+`Connection::accept(&mut self)` returns `http::Request<ChunkBody>` and a `ResponseSender`. `Sender::request` takes the request directly and returns the final response without first waiting for upload completion. `Sender::request_streaming` takes the headers and returns BodyWriter/ResponseFuture after HEADERS are committed. ResponseSender retains the one-shot right to reply to an accepted request; its send completes after FIN. Protocol responses are standard `http::Response<ChunkBody>` values. The API layer attaches runtime authentication facts to its own `Response` and `ResponseFuture` wrappers.
+
+`Sender::close` and `Connection::close` close immediately; `Connection::shutdown(&mut self)` drains admitted requests. Shutdown can be initiated only once; later calls return `InvalidState`. Dropping the protocol connection owner closes the transport; dropping a sender clone does not. Keep the connection owner alive while sending requests. The caller decides how long to wait and may explicitly close after a timeout. There is no public connection driver or outbound work queue. Protocol `closed()` waits for protocol resources only. The separate `runtime::shutdown()` stops and joins native dialing and service tasks; it currently performs a forced runtime stop, not automatic graceful draining.
 
 ## Dynamic QPACK
 
@@ -63,30 +64,12 @@ h3x owns one encoder stream, one decoder stream, and both dynamic-table states f
 
 ## WebTransport
 
-The optional `webtransport` feature implements WebTransport over HTTP/3 draft 16 without changing `ALPN` (`b"h3"`). Create the connection with `Connection::new_webtransport`; the transport adapter must additionally implement `transport::webtransport::Connection`, including QUIC DATAGRAM and negotiated `RESET_STREAM_AT` support.
+The optional `webtransport` module retains the draft-16 protocol codecs and session helpers. Connection initialization and upgrade integration are still pending in this API skeleton; do not treat an enabled feature or a successful library check as a working WebTransport connection.
 
-The module provides extended CONNECT, bidirectional and unidirectional WebTransport streams, HTTP Datagrams, `WT_DRAIN_SESSION`, `WT_CLOSE_SESSION`, application error-code mapping, and reliable stream reset. Without WebTransport session flow-control negotiation, h3x deliberately permits one active session per HTTP/3 connection and ignores flow-control capsules.
+## Native runtime boundary
 
-Authorization remains above h3x. A server first resolves the HTTP request and applies its identity, Origin, and URL policy, then accepts it:
+On native targets, pooling and the runtime are included by default. `init` registers already configured QUIC clients/listeners once. `Pool::get` returns `Arc<runtime::Connection>`; use `sender()` for the HTTP/3 sender and `remote_authority()` for authenticated identity. The protocol connection no longer exposes identity or reuse-target accessors. DQUIC adaptation is exported as `runtime::DquicTransport`.
 
-```rust,no_run
-# #[cfg(feature = "webtransport")]
-# use h3x::{Connection, Error, transport};
-# #[cfg(feature = "webtransport")]
-# async fn accept_webtransport<T: transport::webtransport::Connection>(
-#     h3: &Connection<T>,
-# ) -> Result<(), Error> {
-let (request, response_sender) = h3.accept().await?.expect("connection is accepting requests");
-if h3x::webtransport::is_request(&request) {
-    // Authorize `request` before accepting the session.
-    let session = h3x::webtransport::accept(
-        request,
-        response_sender,
-        http::Response::new(()),
-    )
-    .await?;
-    let (_receive, _send) = session.accept_bi().await?;
-}
-# Ok(())
-# }
-```
+`Endpoint`, `Request`, and `Response` live in `src/endpoint.rs`, `src/request.rs`, and `src/response.rs` and are exported directly from the crate root; there is no `api` module. Requests build `http::Request` directly and responses wrap `http::Response`. Ordinary HTTP send/receive and Body budgets are wired; protocol behavior verification and WebTransport integration remain pending.
+
+`Endpoint::listen` accepts any `tower_service::Service<Request<ChunkBody>>` whose response body implements `http_body::Body<Data = Bytes>`. Listening is available on native targets without a framework feature; an Axum router implements this service interface directly, so h3x does not depend on Axum.

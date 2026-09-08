@@ -1,8 +1,14 @@
 use std::{borrow::Cow, error::Error as StdError, fmt, sync::Arc};
 
-use crate::StreamId;
+use crate::{
+    StreamId,
+    platform::{MaybeSend, MaybeSync},
+};
 
+#[cfg(not(target_arch = "wasm32"))]
 type SharedError = Arc<dyn StdError + Send + Sync + 'static>;
+#[cfg(target_arch = "wasm32")]
+type SharedError = Arc<dyn StdError + 'static>;
 
 /// An HTTP/3, QPACK, or enabled extension application error code.
 ///
@@ -117,7 +123,7 @@ impl fmt::Display for Code {
     }
 }
 
-/// Error returned by every public h3x operation and by [`crate::Body`].
+/// Error returned by every public h3x operation and by [`crate::ChunkBody`].
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum Error {
@@ -133,6 +139,27 @@ pub enum Error {
         boundary: StreamId,
     },
     Draining,
+    Cancelled,
+    BodyAborted,
+    Capacity,
+    OwnerStopped,
+    NotInitialized,
+    AlreadyInitialized,
+    AlreadyListening,
+    IdentityInUse,
+    IdentityMismatch,
+    CertificateRevoked,
+    TimedOut,
+    DrainTimedOut,
+    Unsupported {
+        operation: &'static str,
+    },
+    InvalidEndpoint {
+        source: SharedError,
+    },
+    InvalidConfig {
+        source: SharedError,
+    },
     InvalidState {
         operation: &'static str,
     },
@@ -180,7 +207,7 @@ impl Error {
     pub(crate) fn connection(
         code: Option<Code>,
         message: impl Into<Cow<'static, str>>,
-        source: impl StdError + Send + Sync + 'static,
+        source: impl StdError + MaybeSend + MaybeSync + 'static,
     ) -> Self {
         let source = context_source(message, source);
         match code {
@@ -213,7 +240,7 @@ impl Error {
     pub(crate) fn stream_with_source(
         code: Option<Code>,
         message: impl Into<Cow<'static, str>>,
-        source: impl StdError + Send + Sync + 'static,
+        source: impl StdError + MaybeSend + MaybeSync + 'static,
     ) -> Self {
         let source = context_source(message, source);
         match code {
@@ -225,7 +252,7 @@ impl Error {
         }
     }
 
-    pub(crate) fn send_body(source: impl StdError + Send + Sync + 'static) -> Self {
+    pub(crate) fn send_body(source: impl StdError + MaybeSend + MaybeSync + 'static) -> Self {
         Self::Body {
             source: context_source("failed to read the outgoing HTTP body", source),
         }
@@ -236,24 +263,6 @@ impl Error {
             code: Code::H3_REQUEST_REJECTED,
             source: Some(message_source(message)),
         }
-    }
-
-    pub(crate) fn request_rejected_with_source(
-        message: impl Into<Cow<'static, str>>,
-        source: impl StdError + Send + Sync + 'static,
-    ) -> Self {
-        Self::Stream {
-            code: Code::H3_REQUEST_REJECTED,
-            source: Some(context_source(message, source)),
-        }
-    }
-
-    pub(crate) fn draining(_message: impl Into<Cow<'static, str>>) -> Self {
-        Self::Draining
-    }
-
-    pub(crate) fn closed(_message: impl Into<Cow<'static, str>>) -> Self {
-        Self::Draining
     }
 
     pub(crate) fn invalid_stream_id(value: u64) -> Self {
@@ -268,11 +277,6 @@ impl Error {
         Self::InvalidState { operation }
     }
 
-    pub(crate) fn invalid_settings(source: impl StdError + Send + Sync + 'static) -> Self {
-        Self::InvalidSettings {
-            source: Arc::new(source),
-        }
-    }
 }
 
 impl fmt::Display for Error {
@@ -282,6 +286,21 @@ impl fmt::Display for Error {
             Self::Stream { code, .. } => write!(f, "HTTP/3 stream error: {code}"),
             Self::Goaway { boundary } => write!(f, "peer GOAWAY boundary: {boundary}"),
             Self::Draining => f.write_str("HTTP/3 connection is draining"),
+            Self::Cancelled => f.write_str("HTTP exchange was cancelled"),
+            Self::BodyAborted => f.write_str("HTTP upload was dropped without finishing"),
+            Self::Capacity => f.write_str("HTTP runtime capacity exhausted"),
+            Self::OwnerStopped => f.write_str("HTTP runtime owner stopped"),
+            Self::NotInitialized => f.write_str("HTTP pool is not initialized"),
+            Self::AlreadyInitialized => f.write_str("HTTP pool is already initialized"),
+            Self::AlreadyListening => f.write_str("endpoint is already listening"),
+            Self::IdentityInUse => f.write_str("endpoint name is owned by another instance"),
+            Self::CertificateRevoked => f.write_str("certificate is revoked"),
+            Self::IdentityMismatch => f.write_str("handshake identity does not match the request"),
+            Self::TimedOut => f.write_str("HTTP connection deadline expired"),
+            Self::DrainTimedOut => f.write_str("HTTP drain deadline expired"),
+            Self::Unsupported { operation } => write!(f, "transport does not support {operation}"),
+            Self::InvalidEndpoint { .. } => f.write_str("invalid endpoint material"),
+            Self::InvalidConfig { .. } => f.write_str("invalid HTTP pool configuration"),
             Self::InvalidState { operation } => write!(f, "invalid state for {operation}"),
             Self::InvalidSettings { .. } => f.write_str("invalid HTTP/3 settings"),
             Self::InvalidMessage { .. } => f.write_str("invalid HTTP/3 message"),
@@ -300,8 +319,25 @@ impl StdError for Error {
             Self::InvalidSettings { source }
             | Self::InvalidMessage { source }
             | Self::Body { source }
-            | Self::Transport { source } => Some(source.as_ref()),
-            Self::Goaway { .. } | Self::Draining | Self::InvalidState { .. } => None,
+            | Self::Transport { source }
+            | Self::InvalidEndpoint { source }
+            | Self::InvalidConfig { source } => Some(source.as_ref()),
+            Self::Goaway { .. }
+            | Self::Draining
+            | Self::InvalidState { .. }
+            | Self::Cancelled
+            | Self::BodyAborted
+            | Self::Capacity
+            | Self::OwnerStopped
+            | Self::NotInitialized
+            | Self::AlreadyInitialized
+            | Self::AlreadyListening
+            | Self::IdentityInUse
+            | Self::IdentityMismatch
+            | Self::CertificateRevoked
+            | Self::TimedOut
+            | Self::DrainTimedOut
+            | Self::Unsupported { .. } => None,
         }
     }
 }
@@ -335,7 +371,7 @@ fn message_source(message: impl Into<Cow<'static, str>>) -> SharedError {
 
 fn context_source(
     message: impl Into<Cow<'static, str>>,
-    source: impl StdError + Send + Sync + 'static,
+    source: impl StdError + MaybeSend + MaybeSync + 'static,
 ) -> SharedError {
     Arc::new(ContextError {
         message: message.into(),
@@ -395,8 +431,6 @@ mod tests {
 
     #[test]
     fn lifecycle_categories_do_not_invent_wire_codes() {
-        assert!(matches!(Error::draining("draining"), Error::Draining));
-        assert!(matches!(Error::closed("closed"), Error::Draining));
         assert!(matches!(
             Error::request_rejected("not delivered"),
             Error::Stream {

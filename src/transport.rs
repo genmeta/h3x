@@ -4,14 +4,45 @@
 //! establishment, TLS identities, DNS, listeners and connection pools belong
 //! to the caller.
 
-use std::{error::Error as StdError, fmt, future::Future, sync::Arc};
+use std::{error::Error as StdError, fmt, future::Future, pin::Pin, sync::Arc, task::{Context, Poll}};
 
 use bytes::Bytes;
-use futures::{Sink, Stream};
+use futures::Sink;
 
-use crate::{Code, StreamId};
+use crate::{
+    Code, StreamId,
+    platform::{MaybeSend, MaybeSync},
+};
 
+pub use qbase::role::Role;
+
+/// A transport awaiting adoption by the protocol.
+/// Authentication and reuse policy belong to the runtime, not the protocol.
+/// Dropping before adoption closes the transport.
+pub struct PendingTransport<T: Connection> {
+    pub(crate) transport: Option<T>,
+}
+
+impl<T: Connection> PendingTransport<T> {
+    pub fn new(transport: T) -> Self {
+        Self {
+            transport: Some(transport),
+        }
+    }
+}
+
+impl<T: Connection> Drop for PendingTransport<T> {
+    fn drop(&mut self) {
+        if let Some(transport) = &self.transport {
+            transport.close(Code::H3_REQUEST_CANCELLED, b"unadopted transport dropped");
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 type SharedError = Arc<dyn StdError + Send + Sync + 'static>;
+#[cfg(target_arch = "wasm32")]
+type SharedError = Arc<dyn StdError + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionErrorKind {
@@ -30,7 +61,7 @@ pub struct ConnectionError {
 
 impl ConnectionError {
     /// Constructs a QUIC transport failure and retains its original source.
-    pub fn transport(source: impl StdError + Send + Sync + 'static) -> Self {
+    pub fn transport(source: impl StdError + MaybeSend + MaybeSync + 'static) -> Self {
         Self {
             kind: ConnectionErrorKind::Transport,
             code: None,
@@ -53,7 +84,7 @@ impl ConnectionError {
     pub fn application_with_source(
         code: Code,
         reason: impl Into<Bytes>,
-        source: impl StdError + Send + Sync + 'static,
+        source: impl StdError + MaybeSend + MaybeSync + 'static,
     ) -> Self {
         Self {
             kind: ConnectionErrorKind::Application,
@@ -178,41 +209,75 @@ impl From<ConnectionError> for StreamError {
 }
 
 /// An established QUIC connection capable of opening and accepting streams.
-pub trait Connection: Send + Sync + 'static {
+pub trait Connection: MaybeSend + MaybeSync + 'static {
     type RecvStream: RecvStream;
     type SendStream: SendStream;
 
+    /// The local QUIC role, independent of which peer initiates an HTTP request.
+    /// Returns the connection error if the transport can no longer provide it.
+    fn role(&self) -> Result<Role, ConnectionError>;
+
     fn open_bi(
         &self,
-    ) -> impl Future<Output = Result<(Self::RecvStream, Self::SendStream), ConnectionError>> + Send;
+    ) -> impl Future<Output = Result<(StreamId, (Self::RecvStream, Self::SendStream)), ConnectionError>> + MaybeSend;
 
-    fn open_uni(&self) -> impl Future<Output = Result<Self::SendStream, ConnectionError>> + Send;
+    fn open_uni(
+        &self,
+    ) -> impl Future<Output = Result<(StreamId, Self::SendStream), ConnectionError>> + MaybeSend;
 
     fn accept_bi(
         &self,
-    ) -> impl Future<Output = Result<(Self::RecvStream, Self::SendStream), ConnectionError>> + Send;
+    ) -> impl Future<Output = Result<(StreamId, (Self::RecvStream, Self::SendStream)), ConnectionError>> + MaybeSend;
 
-    fn accept_uni(&self) -> impl Future<Output = Result<Self::RecvStream, ConnectionError>> + Send;
+    fn accept_uni(
+        &self,
+    ) -> impl Future<Output = Result<(StreamId, Self::RecvStream), ConnectionError>> + MaybeSend;
 
     fn close(&self, code: Code, reason: &[u8]);
 
-    fn closed(&self) -> impl Future<Output = ConnectionError> + Send;
+    fn closed(&self) -> impl Future<Output = ConnectionError> + MaybeSend;
 }
 
-/// Receive half of a QUIC stream.
-pub trait RecvStream: Stream<Item = Result<Bytes, StreamError>> + Send + Unpin + 'static {
-    fn id(&self) -> StreamId;
+/// Receive half of a QUIC stream; its ID is returned by the connection.
+pub trait RecvStream: MaybeSend + Unpin + 'static {
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, StreamError>>>;
 
     /// Submits STOP_SENDING to the transport. It does not wait for a peer ACK.
     fn stop(&mut self, code: Code) -> Result<(), StreamError>;
 }
 
-/// Send half of a QUIC stream.
-pub trait SendStream: Sink<Bytes, Error = StreamError> + Send + Unpin + 'static {
-    fn id(&self) -> StreamId;
+/// Send half of a QUIC stream; its ID is returned by the connection.
+pub trait SendStream: MaybeSend + Unpin + 'static {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>>;
+
+    /// Submits bytes to QUIC after poll_ready succeeds, without buffering in the adapter.
+    fn start_send(&mut self, item: Bytes) -> Result<(), StreamError>;
+
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>>;
 
     /// Submits RESET_STREAM to the transport. It does not wait for a peer ACK.
     fn reset(&mut self, code: Code) -> Result<(), StreamError>;
+}
+
+impl Sink<Bytes> for dyn SendStream {
+    type Error = StreamError;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        SendStream::poll_ready(self.get_mut(), cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+        SendStream::start_send(self.get_mut(), item)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // start_send submits directly to QUIC; HTTP/3 does not wait for peer ACKs.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        SendStream::poll_close(self.get_mut(), cx)
+    }
 }
 
 /// Optional QUIC capabilities required by WebTransport over HTTP/3.
@@ -231,9 +296,11 @@ pub mod webtransport {
         fn send_datagram(
             &self,
             datagram: Bytes,
-        ) -> impl Future<Output = Result<(), ConnectionError>> + Send;
+        ) -> impl Future<Output = Result<(), ConnectionError>> + MaybeSend;
 
-        fn receive_datagram(&self) -> impl Future<Output = Result<Bytes, ConnectionError>> + Send;
+        fn receive_datagram(
+            &self,
+        ) -> impl Future<Output = Result<Bytes, ConnectionError>> + MaybeSend;
 
         /// Resets `stream` while reliably delivering at least `reliable_size`
         /// bytes from the beginning of its send direction.
@@ -269,9 +336,9 @@ mod tests {
     }
 
     impl RecvStream for Recv {
-        fn id(&self) -> StreamId {
-            crate::stream_id::from_u64_unchecked(0)
-        }
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, StreamError>>> {
+        Stream::poll_next(Pin::new(self), cx)
+    }
 
         fn stop(&mut self, _code: Code) -> Result<(), StreamError> {
             Ok(())
@@ -310,9 +377,17 @@ mod tests {
     }
 
     impl SendStream for Send {
-        fn id(&self) -> StreamId {
-            crate::stream_id::from_u64_unchecked(0)
-        }
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        Sink::poll_ready(Pin::new(self), cx)
+    }
+
+    fn start_send(&mut self, item: Bytes) -> Result<(), StreamError> {
+        Sink::start_send(Pin::new(self), item)
+    }
+
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        Sink::poll_close(Pin::new(self), cx)
+    }
 
         fn reset(&mut self, _code: Code) -> Result<(), StreamError> {
             Ok(())
@@ -341,11 +416,10 @@ mod tests {
     }
 
     #[test]
-    fn stream_traits_use_synchronous_ids_and_control_actions() {
+    fn stream_traits_use_synchronous_control_actions() {
         let mut recv = Recv;
         let mut send = Send;
 
-        assert_eq!(recv.id(), send.id());
         recv.stop(Code::H3_REQUEST_CANCELLED).unwrap();
         send.reset(Code::H3_REQUEST_CANCELLED).unwrap();
     }

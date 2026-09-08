@@ -1,410 +1,17 @@
-use std::{
-    io,
-    pin::Pin,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::{io, sync::atomic::Ordering, time::Duration};
 
 use bytes::Bytes;
 #[cfg(feature = "webtransport")]
 use futures::StreamExt;
-use futures::{FutureExt, Sink, SinkExt, Stream, future::BoxFuture};
-use h3x::{
-    Code, Connection, Settings,
-    transport::{self, RecvStream, SendStream},
-};
+use futures::{FutureExt, SinkExt};
+use h3x::{Code, Settings, transport};
 use http_body_util::{BodyExt, Full};
 #[cfg(feature = "webtransport")]
 use tokio::sync::oneshot;
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 
-type BiStream = (MemoryRecv, MemorySend);
-
-trait StreamIdValue {
-    fn as_u64(&self) -> u64;
-}
-
-impl StreamIdValue for h3x::StreamId {
-    fn as_u64(&self) -> u64 {
-        (*self).into()
-    }
-}
-
-trait TestRequestExt {
-    fn send(
-        &self,
-        request: http::Request<Full<Bytes>>,
-    ) -> BoxFuture<'_, Result<http::Response<h3x::Body>, h3x::Error>>;
-}
-
-impl<T: transport::Connection> TestRequestExt for Connection<T> {
-    fn send(
-        &self,
-        request: http::Request<Full<Bytes>>,
-    ) -> BoxFuture<'_, Result<http::Response<h3x::Body>, h3x::Error>> {
-        async move {
-            let (parts, body) = request.into_parts();
-            let request = self.request(parts).await?;
-            let data = body.collect().await.unwrap().to_bytes();
-            if !data.is_empty() {
-                request.write(data).await?;
-            }
-            request.finish().await?;
-            request.response().await
-        }
-        .boxed()
-    }
-}
-
-#[cfg(feature = "webtransport")]
-fn accepted(
-    response: h3x::webtransport::ConnectResponse,
-) -> (http::Response<()>, h3x::webtransport::Session) {
-    match response {
-        h3x::webtransport::ConnectResponse::Accepted { response, session } => (response, session),
-        h3x::webtransport::ConnectResponse::Rejected(response) => {
-            panic!(
-                "WebTransport CONNECT was rejected with {}",
-                response.status()
-            )
-        }
-    }
-}
-
-#[derive(Default)]
-struct CloseState {
-    error: Mutex<Option<transport::ConnectionError>>,
-    notify: Notify,
-}
-
-impl CloseState {
-    fn close(&self, error: transport::ConnectionError) {
-        let mut current = self.error.lock().expect("close state poisoned");
-        if current.is_none() {
-            *current = Some(error);
-            drop(current);
-            self.notify.notify_waiters();
-        }
-    }
-
-    fn current(&self) -> Option<transport::ConnectionError> {
-        self.error.lock().expect("close state poisoned").clone()
-    }
-
-    async fn closed(&self) -> transport::ConnectionError {
-        loop {
-            let notified = self.notify.notified();
-            if let Some(error) = self.current() {
-                return error;
-            }
-            notified.await;
-        }
-    }
-}
-
-#[derive(Clone)]
-struct MemoryTransport {
-    next_bi: Arc<AtomicU64>,
-    next_uni: Arc<AtomicU64>,
-    incoming_bi: Arc<AsyncMutex<mpsc::UnboundedReceiver<BiStream>>>,
-    incoming_uni: Arc<AsyncMutex<mpsc::UnboundedReceiver<MemoryRecv>>>,
-    peer_bi: mpsc::UnboundedSender<BiStream>,
-    peer_uni: mpsc::UnboundedSender<MemoryRecv>,
-    #[cfg(feature = "webtransport")]
-    incoming_datagrams: Arc<AsyncMutex<mpsc::UnboundedReceiver<Bytes>>>,
-    #[cfg(feature = "webtransport")]
-    peer_datagrams: mpsc::UnboundedSender<Bytes>,
-    #[cfg(feature = "webtransport")]
-    reliable_resets: Arc<Mutex<Vec<(h3x::StreamId, Code, u64)>>>,
-    close: Arc<CloseState>,
-}
-
-impl MemoryTransport {
-    fn pair() -> (Self, Self) {
-        let (a_bi_tx, a_bi_rx) = mpsc::unbounded_channel();
-        let (b_bi_tx, b_bi_rx) = mpsc::unbounded_channel();
-        let (a_uni_tx, a_uni_rx) = mpsc::unbounded_channel();
-        let (b_uni_tx, b_uni_rx) = mpsc::unbounded_channel();
-        #[cfg(feature = "webtransport")]
-        let (a_datagram_tx, a_datagram_rx) = mpsc::unbounded_channel();
-        #[cfg(feature = "webtransport")]
-        let (b_datagram_tx, b_datagram_rx) = mpsc::unbounded_channel();
-        let close = Arc::new(CloseState::default());
-
-        let a = Self {
-            next_bi: Arc::new(AtomicU64::new(0)),
-            next_uni: Arc::new(AtomicU64::new(2)),
-            incoming_bi: Arc::new(AsyncMutex::new(a_bi_rx)),
-            incoming_uni: Arc::new(AsyncMutex::new(a_uni_rx)),
-            peer_bi: b_bi_tx,
-            peer_uni: b_uni_tx,
-            #[cfg(feature = "webtransport")]
-            incoming_datagrams: Arc::new(AsyncMutex::new(a_datagram_rx)),
-            #[cfg(feature = "webtransport")]
-            peer_datagrams: b_datagram_tx,
-            #[cfg(feature = "webtransport")]
-            reliable_resets: Arc::new(Mutex::new(Vec::new())),
-            close: Arc::clone(&close),
-        };
-        let b = Self {
-            next_bi: Arc::new(AtomicU64::new(1)),
-            next_uni: Arc::new(AtomicU64::new(3)),
-            incoming_bi: Arc::new(AsyncMutex::new(b_bi_rx)),
-            incoming_uni: Arc::new(AsyncMutex::new(b_uni_rx)),
-            peer_bi: a_bi_tx,
-            peer_uni: a_uni_tx,
-            #[cfg(feature = "webtransport")]
-            incoming_datagrams: Arc::new(AsyncMutex::new(b_datagram_rx)),
-            #[cfg(feature = "webtransport")]
-            peer_datagrams: a_datagram_tx,
-            #[cfg(feature = "webtransport")]
-            reliable_resets: Arc::new(Mutex::new(Vec::new())),
-            close,
-        };
-        (a, b)
-    }
-
-    fn check_open(&self) -> Result<(), transport::ConnectionError> {
-        match self.close.current() {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-}
-
-#[cfg(feature = "webtransport")]
-impl transport::webtransport::Connection for MemoryTransport {
-    fn supports_reset_stream_at(&self) -> bool {
-        true
-    }
-
-    fn max_datagram_size(&self) -> usize {
-        1200
-    }
-
-    async fn send_datagram(&self, datagram: Bytes) -> Result<(), transport::ConnectionError> {
-        self.check_open()?;
-        self.peer_datagrams
-            .send(datagram)
-            .map_err(|_| transport::ConnectionError::transport(io::Error::other("peer closed")))
-    }
-
-    async fn receive_datagram(&self) -> Result<Bytes, transport::ConnectionError> {
-        tokio::select! {
-            datagram = async { self.incoming_datagrams.lock().await.recv().await } => {
-                datagram.ok_or_else(|| transport::ConnectionError::transport(io::Error::other("peer closed")))
-            }
-            error = self.close.closed() => Err(error),
-        }
-    }
-
-    fn reset_stream_at(
-        &self,
-        stream: &mut Self::SendStream,
-        code: Code,
-        reliable_size: u64,
-    ) -> Result<(), transport::StreamError> {
-        self.reliable_resets
-            .lock()
-            .expect("reliable reset actions poisoned")
-            .push((stream.id(), code, reliable_size));
-        stream.reset(code)
-    }
-}
-
-impl transport::Connection for MemoryTransport {
-    type RecvStream = MemoryRecv;
-    type SendStream = MemorySend;
-
-    async fn open_bi(
-        &self,
-    ) -> Result<(Self::RecvStream, Self::SendStream), transport::ConnectionError> {
-        self.check_open()?;
-        let id = self.next_bi.fetch_add(4, Ordering::Relaxed);
-        let (local_recv, peer_send) = stream_direction(id);
-        let (peer_recv, local_send) = stream_direction(id);
-        self.peer_bi
-            .send((peer_recv, peer_send))
-            .map_err(|_| transport::ConnectionError::transport(io::Error::other("peer closed")))?;
-        Ok((local_recv, local_send))
-    }
-
-    async fn open_uni(&self) -> Result<Self::SendStream, transport::ConnectionError> {
-        self.check_open()?;
-        let id = self.next_uni.fetch_add(4, Ordering::Relaxed);
-        let (peer_recv, local_send) = stream_direction(id);
-        self.peer_uni
-            .send(peer_recv)
-            .map_err(|_| transport::ConnectionError::transport(io::Error::other("peer closed")))?;
-        Ok(local_send)
-    }
-
-    async fn accept_bi(
-        &self,
-    ) -> Result<(Self::RecvStream, Self::SendStream), transport::ConnectionError> {
-        tokio::select! {
-            stream = async { self.incoming_bi.lock().await.recv().await } => {
-                stream.ok_or_else(|| transport::ConnectionError::transport(io::Error::other("peer closed")))
-            }
-            error = self.close.closed() => Err(error),
-        }
-    }
-
-    async fn accept_uni(&self) -> Result<Self::RecvStream, transport::ConnectionError> {
-        tokio::select! {
-            stream = async { self.incoming_uni.lock().await.recv().await } => {
-                stream.ok_or_else(|| transport::ConnectionError::transport(io::Error::other("peer closed")))
-            }
-            error = self.close.closed() => Err(error),
-        }
-    }
-
-    fn close(&self, code: Code, reason: &[u8]) {
-        self.close.close(transport::ConnectionError::application(
-            code,
-            Bytes::copy_from_slice(reason),
-        ));
-    }
-
-    async fn closed(&self) -> transport::ConnectionError {
-        self.close.closed().await
-    }
-}
-
-#[derive(Default)]
-struct StreamActions {
-    stops: Mutex<Vec<Code>>,
-    resets: Mutex<Vec<Code>>,
-}
-
-struct MemoryRecv {
-    id: h3x::StreamId,
-    receiver: mpsc::UnboundedReceiver<Result<Bytes, transport::StreamError>>,
-    actions: Arc<StreamActions>,
-}
-
-impl Stream for MemoryRecv {
-    type Item = Result<Bytes, transport::StreamError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.receiver.poll_recv(cx)
-    }
-}
-
-impl RecvStream for MemoryRecv {
-    fn id(&self) -> h3x::StreamId {
-        self.id
-    }
-
-    fn stop(&mut self, code: Code) -> Result<(), transport::StreamError> {
-        self.actions
-            .stops
-            .lock()
-            .expect("stop actions poisoned")
-            .push(code);
-        self.receiver.close();
-        Ok(())
-    }
-}
-
-struct MemorySend {
-    id: h3x::StreamId,
-    sender: Option<mpsc::UnboundedSender<Result<Bytes, transport::StreamError>>>,
-    actions: Arc<StreamActions>,
-}
-
-impl Sink<Bytes> for MemorySend {
-    type Error = transport::StreamError;
-
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if self.sender.is_some() {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Ready(Err(transport::StreamError::reset(
-                Code::H3_REQUEST_CANCELLED,
-            )))
-        }
-    }
-
-    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        self.sender
-            .as_ref()
-            .ok_or_else(|| transport::StreamError::reset(Code::H3_REQUEST_CANCELLED))?
-            .send(Ok(item))
-            .map_err(|_| transport::StreamError::reset(Code::H3_REQUEST_CANCELLED))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        self.sender.take();
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl SendStream for MemorySend {
-    fn id(&self) -> h3x::StreamId {
-        self.id
-    }
-
-    fn reset(&mut self, code: Code) -> Result<(), transport::StreamError> {
-        self.actions
-            .resets
-            .lock()
-            .expect("reset actions poisoned")
-            .push(code);
-        if let Some(sender) = self.sender.take() {
-            let _ = sender.send(Err(transport::StreamError::reset(code)));
-        }
-        Ok(())
-    }
-}
-
-fn stream_direction(id: u64) -> (MemoryRecv, MemorySend) {
-    let id =
-        h3x::StreamId::from(qbase::varint::VarInt::try_from(id).expect("test stream ID is valid"));
-    let (sender, receiver) = mpsc::unbounded_channel();
-    let actions = Arc::new(StreamActions::default());
-    (
-        MemoryRecv {
-            id,
-            receiver,
-            actions: Arc::clone(&actions),
-        },
-        MemorySend {
-            id,
-            sender: Some(sender),
-            actions,
-        },
-    )
-}
-
-async fn connection_pair() -> (Connection<MemoryTransport>, Connection<MemoryTransport>) {
-    let (a, b) = MemoryTransport::pair();
-    let (a, b) = tokio::join!(
-        Connection::new(a, Settings::default()),
-        Connection::new(b, Settings::default())
-    );
-    (a.expect("left connection"), b.expect("right connection"))
-}
-
-async fn connection_pair_with_settings(
-    left: Settings,
-    right: Settings,
-) -> (Connection<MemoryTransport>, Connection<MemoryTransport>) {
-    let (a, b) = MemoryTransport::pair();
-    let (a, b) = tokio::join!(Connection::new(a, left), Connection::new(b, right));
-    (a.expect("left connection"), b.expect("right connection"))
-}
+mod support;
+use support::*;
+use tokio::io::AsyncWriteExt;
 
 #[tokio::test]
 async fn request_response_body_and_stream_id_round_trip() {
@@ -444,10 +51,10 @@ async fn request_response_body_and_stream_id_round_trip() {
         .body(Bytes::from_static(b"ping"))
         .unwrap()
         .into_parts();
-    let request = requester.request(head).await.expect("open request");
-    request.write(body).await.expect("write request body");
-    request.finish().await.expect("finish request body");
-    let response = request.response().await.expect("receive response");
+    let (mut writer, response) = requester.request(head).await.expect("open request");
+    writer.write_all(&body).await.expect("write request body");
+    writer.finish().await.expect("finish request body");
+    let response = response.await.expect("receive response");
     let response_id = *response
         .extensions()
         .get::<h3x::StreamId>()
@@ -574,7 +181,7 @@ async fn stalled_request_headers_do_not_block_a_later_request() {
         Connection::new(raw_a.clone(), Settings::default()),
         Connection::new(raw_b, Settings::default())
     );
-    let (_recv, _send) = transport::Connection::open_bi(&raw_a)
+    let (_id, (_recv, _send)) = transport::Connection::open_bi(&raw_a)
         .await
         .expect("open raw request stream without writing headers");
 
@@ -613,7 +220,7 @@ async fn malformed_frame_in_resolver_closes_the_connection() {
     let client = client.expect("client connection");
     let server = server.expect("server connection");
 
-    let (_reader, mut writer) = transport::Connection::open_bi(&raw_client)
+    let (_id, (_reader, mut writer)) = transport::Connection::open_bi(&raw_client)
         .await
         .expect("open raw request stream");
     writer
@@ -680,17 +287,14 @@ async fn response_headers_can_arrive_before_request_body_finishes() {
         .body(())
         .unwrap()
         .into_parts();
-    let request = requester.request(head).await.unwrap();
-    let response = tokio::time::timeout(Duration::from_millis(100), request.response())
+    let (mut writer, response) = requester.request(head).await.unwrap();
+    let response = tokio::time::timeout(Duration::from_millis(100), response)
         .await
         .expect("response must not wait for the request body")
         .expect("response headers");
 
-    request
-        .write(Bytes::from_static(b"after-headers"))
-        .await
-        .unwrap();
-    request.finish().await.unwrap();
+    writer.write_all(b"after-headers").await.unwrap();
+    writer.finish().await.unwrap();
     assert!(
         response
             .into_body()
@@ -728,109 +332,93 @@ async fn content_length_mismatch_fails_the_request_stream() {
 
 #[tokio::test]
 async fn peer_goaway_rejects_new_sends_but_does_not_close_accept() {
-    let (a, b) = connection_pair().await;
-    let a_send = {
-        let a = a.clone();
-        tokio::spawn(async move {
-            a.send(
-                http::Request::builder()
-                    .uri("https://example.test/in-flight")
-                    .body(Full::new(Bytes::new()))
-                    .unwrap(),
-            )
-            .await
-        })
-    };
-    let (request, sender) = b.accept().await.unwrap().unwrap();
-
-    let shutdown = {
-        let a = a.clone();
-        tokio::spawn(async move { a.shutdown().await })
-    };
+    let (raw_a, raw_b) = MemoryTransport::pair();
+    let (a, b) = tokio::join!(
+        Connection::new(raw_a.clone(), Settings::default()),
+        Connection::new(raw_b, Settings::default())
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    raw_a.uni_writes.lock().unwrap()[0]
+        .send(Ok(Bytes::from_static(&[7, 1, 0])))
+        .unwrap();
     tokio::time::timeout(Duration::from_millis(100), async {
         while !b.is_draining() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("peer GOAWAY must be observed");
-
-    let error = b
-        .send(
+    .unwrap();
+    let parts = http::Request::builder()
+        .uri("https://example.test/rejected")
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    assert!(matches!(
+        b.request(parts).await,
+        Err(h3x::Error::Goaway { .. })
+    ));
+    let request = tokio::spawn(async move {
+        a.send(
             http::Request::builder()
-                .uri("https://example.test/too-late")
+                .uri("https://example.test/accepted")
                 .body(Full::new(Bytes::new()))
                 .unwrap(),
         )
         .await
-        .expect_err("new send must be rejected after GOAWAY");
-    assert!(matches!(
-        &error,
-        h3x::Error::Goaway { boundary } if u64::from(*boundary) == 0
-    ));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(25), b.accept())
-            .await
-            .is_err()
-    );
-
+    });
+    let (incoming, sender) = b.accept().await.unwrap().unwrap();
+    drop(incoming);
     sender
         .send(http::Response::new(Full::new(Bytes::new())))
         .await
         .unwrap();
-    drop(request);
-    let response = a_send.await.unwrap().unwrap();
-    response.into_body().collect().await.unwrap();
-    shutdown.await.unwrap().unwrap();
-}
-
-#[tokio::test]
-async fn goaway_boundary_excludes_the_last_delivered_request() {
-    let (a, b) = connection_pair().await;
-    let b_send = {
-        let b = b.clone();
-        tokio::spawn(async move {
-            b.send(
-                http::Request::builder()
-                    .uri("https://example.test/covered")
-                    .body(Full::new(Bytes::new()))
-                    .unwrap(),
-            )
-            .await
-        })
-    };
-    let (request, sender) = a.accept().await.unwrap().unwrap();
-    assert_eq!(sender.stream_id().as_u64(), 1);
-
-    let shutdown = {
-        let a = a.clone();
-        tokio::spawn(async move { a.shutdown().await })
-    };
-    sender
-        .send(http::Response::new(Full::new(Bytes::new())))
-        .await
-        .unwrap();
-    drop(request);
-    b_send
+    request
         .await
         .unwrap()
-        .expect("GOAWAY boundary must not cover stream 1")
+        .unwrap()
         .into_body()
         .collect()
         .await
         .unwrap();
-    shutdown.await.unwrap().unwrap();
 }
 
 #[tokio::test]
-async fn graceful_shutdown_marks_both_ends_closed_without_an_error() {
-    let (a, b) = connection_pair().await;
-    let (shutdown, peer_closed) = tokio::join!(a.shutdown(), b.closed());
+async fn peer_goaway_does_not_cover_an_earlier_request() {
+    let (raw_client, raw_server) = MemoryTransport::pair();
+    let client = Connection::new(raw_client, Settings::default())
+        .await
+        .unwrap();
+    let parts = http::Request::builder()
+        .uri("https://example.test/")
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    let (writer, response) = client.request(parts).await.unwrap();
+    writer.finish().await.unwrap();
+    let (_id, (_upload, mut reply)) = transport::Connection::accept_bi(&raw_server).await.unwrap();
+    let (_id, mut control) = transport::Connection::open_uni(&raw_server).await.unwrap();
+    control
+        .send(Bytes::from_static(&[0, 4, 0, 7, 1, 4]))
+        .await
+        .unwrap();
+    reply
+        .send(Bytes::from_static(&[1, 3, 0, 0, 0xd9]))
+        .await
+        .unwrap();
+    reply.close().await.unwrap();
+    assert_eq!(response.await.unwrap().status(), 200);
+}
 
-    shutdown.expect("local graceful shutdown");
-    peer_closed.expect("peer observes H3_NO_ERROR");
+#[tokio::test]
+async fn explicit_close_marks_both_ends_closed_without_an_error() {
+    let (a, b) = connection_pair().await;
+    a.close(Code::H3_NO_ERROR, b"done");
+    let (local, peer) = tokio::join!(a.closed(), b.closed());
+    local.unwrap();
+    peer.unwrap();
     assert!(a.is_draining());
-    a.shutdown().await.expect("shutdown is idempotent");
 }
 
 #[cfg(feature = "webtransport")]
@@ -1039,7 +627,7 @@ async fn webtransport_reset_reliably_covers_the_stream_header() {
 async fn a_stalled_bidi_discriminator_does_not_block_later_webtransport_connect() {
     let (client, server, raw_client, _) = webtransport_connection_pair().await;
     let server_keepalive = server.clone();
-    let (_stalled_reader, _stalled_writer) = transport::Connection::open_bi(&raw_client)
+    let (_id, (_stalled_reader, _stalled_writer)) = transport::Connection::open_bi(&raw_client)
         .await
         .expect("open stalled bidi stream");
     let server_task = tokio::spawn(async move {
@@ -1141,7 +729,7 @@ async fn malformed_http3_datagram_closes_the_connection() {
 #[tokio::test]
 async fn webtransport_signal_after_headers_closes_http3_without_waiting_for_a_length() {
     let (client, server, raw_client, _) = webtransport_connection_pair().await;
-    let (_reader, mut writer) = transport::Connection::open_bi(&raw_client)
+    let (_id, (_reader, mut writer)) = transport::Connection::open_bi(&raw_client)
         .await
         .expect("open raw request stream");
 
@@ -1222,7 +810,7 @@ async fn unnegotiated_webtransport_stream_is_rejected_without_closing_http3() {
 #[cfg(feature = "webtransport")]
 #[tokio::test]
 async fn http3_goaway_marks_the_active_webtransport_session_draining() {
-    let (client, server, _, _) = webtransport_connection_pair().await;
+    let (client, server, raw_client, _) = webtransport_connection_pair().await;
     let (session_tx, session_rx) = oneshot::channel();
     let server_task = tokio::spawn(async move {
         let (request, sender) = server.accept().await.unwrap().unwrap();
@@ -1246,7 +834,9 @@ async fn http3_goaway_marks_the_active_webtransport_session_draining() {
             .unwrap(),
     );
     let server_session = session_rx.await.unwrap();
-    let shutdown = tokio::spawn(async move { client.shutdown().await });
+    raw_client.uni_writes.lock().unwrap()[0]
+        .send(Ok(Bytes::from_static(&[7, 1, 0])))
+        .unwrap();
 
     tokio::time::timeout(Duration::from_millis(100), server_session.drained())
         .await
@@ -1256,7 +846,6 @@ async fn http3_goaway_marks_the_active_webtransport_session_draining() {
     let peer_close = client_session.closed().await.unwrap();
     assert_eq!(peer_close.message(), "shutdown");
     assert_eq!(server_task.await.unwrap().message(), "shutdown");
-    shutdown.await.unwrap().unwrap();
 }
 
 #[cfg(feature = "webtransport")]
@@ -1371,7 +960,7 @@ async fn a_partial_data_frame_is_delivered_before_its_tail_arrives() {
     let server = Connection::new(raw_server, Settings::default())
         .await
         .unwrap();
-    let (_recv, mut send) = transport::Connection::open_bi(&raw_client).await.unwrap();
+    let (_id, (_recv, mut send)) = transport::Connection::open_bi(&raw_client).await.unwrap();
     let mut first = vec![0x21, 2, 99, 99]; // Unknown before initial HEADERS.
     first.extend_from_slice(&raw_get_headers());
     first.extend_from_slice(&[0, 4, b'a', b'b']);
@@ -1405,7 +994,7 @@ async fn forbidden_initial_frames_fail_before_reading_their_payload() {
         let server = Connection::new(raw_server, Settings::default())
             .await
             .unwrap();
-        let (_recv, mut send) = transport::Connection::open_bi(&raw_client).await.unwrap();
+        let (_id, (_recv, mut send)) = transport::Connection::open_bi(&raw_client).await.unwrap();
         // A legal length varint declaring 16384 bytes; no payload ever arrives.
         send.send(Bytes::from(vec![frame_type, 0x80, 0, 0x40, 0]))
             .await
@@ -1420,13 +1009,13 @@ async fn forbidden_initial_frames_fail_before_reading_their_payload() {
 }
 
 #[tokio::test]
-async fn cancelled_response_read_cannot_resume_mid_frame_but_upload_can_continue() {
+async fn cancelled_response_read_stops_its_stream_but_upload_can_continue() {
     for prefix in [&[1, 0x40][..], &[1, 4, 0][..]] {
         let (raw_client, raw_server) = MemoryTransport::pair();
         let client = Connection::new(raw_client, Settings::default())
             .await
             .unwrap();
-        let request = client
+        let (mut writer, waiting) = client
             .request(
                 http::Request::builder()
                     .method("POST")
@@ -1438,13 +1027,12 @@ async fn cancelled_response_read_cannot_resume_mid_frame_but_upload_can_continue
             )
             .await
             .unwrap();
-        let (_upload, mut response) = transport::Connection::accept_bi(&raw_server).await.unwrap();
+        let (_id, (_upload, mut response)) = transport::Connection::accept_bi(&raw_server).await.unwrap();
         response.send(Bytes::copy_from_slice(prefix)).await.unwrap();
-        let mut waiting = Box::pin(request.response());
+        let mut waiting = waiting;
         assert!(waiting.as_mut().now_or_never().is_none());
         drop(waiting);
-        let error = request.response().await.unwrap_err();
-        assert_eq!(error.code(), Some(Code::H3_REQUEST_CANCELLED));
+        tokio::task::yield_now().await;
         assert!(
             response
                 .actions
@@ -1453,11 +1041,8 @@ async fn cancelled_response_read_cannot_resume_mid_frame_but_upload_can_continue
                 .unwrap()
                 .contains(&Code::H3_REQUEST_CANCELLED)
         );
-        request
-            .write(Bytes::from_static(b"still uploading"))
-            .await
-            .unwrap();
-        request.finish().await.unwrap();
+        writer.write_all(b"still uploading").await.unwrap();
+        writer.finish().await.unwrap();
     }
 }
 
@@ -1467,7 +1052,7 @@ async fn unknown_first_control_frame_is_not_skipped() {
     let server = Connection::new(raw_server, Settings::default())
         .await
         .unwrap();
-    let mut send = transport::Connection::open_uni(&raw_client).await.unwrap();
+    let (_id, mut send) = transport::Connection::open_uni(&raw_client).await.unwrap();
     send.send(Bytes::from_static(&[0, 0x21, 1])).await.unwrap();
     let error = tokio::time::timeout(Duration::from_millis(100), server.closed())
         .await
@@ -1482,7 +1067,7 @@ async fn transport_failure_during_body_read_closes_the_connection_without_invent
     let server = Connection::new(raw_server, Settings::default())
         .await
         .unwrap();
-    let (_recv, mut send) = transport::Connection::open_bi(&raw_client).await.unwrap();
+    let (_id, (_recv, mut send)) = transport::Connection::open_bi(&raw_client).await.unwrap();
     let mut bytes = raw_get_headers();
     bytes.extend_from_slice(&[0, 4, 1]);
     send.send(Bytes::from(bytes)).await.unwrap();
@@ -1510,7 +1095,7 @@ async fn goaway_interrupts_a_partial_response_payload() {
     let client = Connection::new(raw_client, Settings::default())
         .await
         .unwrap();
-    let request = client
+    let (_writer, waiting) = client
         .request(
             http::Request::builder()
                 .uri("https://example.test/")
@@ -1521,11 +1106,11 @@ async fn goaway_interrupts_a_partial_response_payload() {
         )
         .await
         .unwrap();
-    let (_upload, mut response) = transport::Connection::accept_bi(&raw_server).await.unwrap();
+    let (_id, (_upload, mut response)) = transport::Connection::accept_bi(&raw_server).await.unwrap();
     response.send(Bytes::from_static(&[1, 4, 0])).await.unwrap();
-    let mut waiting = Box::pin(request.response());
+    let mut waiting = waiting;
     assert!(waiting.as_mut().now_or_never().is_none());
-    let mut control = transport::Connection::open_uni(&raw_server).await.unwrap();
+    let (_id, mut control) = transport::Connection::open_uni(&raw_server).await.unwrap();
     control
         .send(Bytes::from_static(&[0, 4, 0, 7, 1, 0]))
         .await
@@ -1549,7 +1134,7 @@ async fn control_frame_structure_and_semantic_errors_stay_distinct() {
         let server = Connection::new(raw_server, Settings::default())
             .await
             .unwrap();
-        let mut control = transport::Connection::open_uni(&raw_client).await.unwrap();
+        let (_id, mut control) = transport::Connection::open_uni(&raw_client).await.unwrap();
         control.send(Bytes::copy_from_slice(bytes)).await.unwrap();
         let error = tokio::time::timeout(Duration::from_millis(100), server.closed())
             .await
@@ -1557,4 +1142,165 @@ async fn control_frame_structure_and_semantic_errors_stay_distinct() {
             .unwrap_err();
         assert_eq!(error.code(), Some(expected));
     }
+}
+
+#[tokio::test]
+async fn upload_remains_owned_after_response_eof() {
+    let (requester, responder) = connection_pair().await;
+    let responder_task = tokio::spawn(async move {
+        let (request, sender) = responder.accept().await.unwrap().unwrap();
+        sender
+            .send(http::Response::new(Full::new(Bytes::new())))
+            .await
+            .unwrap();
+        assert_eq!(
+            request.into_body().collect().await.unwrap().to_bytes(),
+            "still uploading"
+        );
+    });
+    let parts = http::Request::builder()
+        .uri("https://example.test/upload")
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    let (mut writer, response) = requester.request(parts).await.unwrap();
+    response.await.unwrap().into_body().collect().await.unwrap();
+    writer.write_all(b"still uploading").await.unwrap();
+    writer.finish().await.unwrap();
+    responder_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_request_headers_are_rejected_before_opening_a_stream() {
+    let (raw, peer) = MemoryTransport::pair();
+    let opened = raw.next_bi.clone();
+    let (requester, responder) = tokio::join!(
+        Connection::new(raw, Settings::default()),
+        Connection::new(peer, Settings::default()),
+    );
+    let requester = requester.unwrap();
+    let _responder = responder.unwrap();
+    let before = opened.load(Ordering::Relaxed);
+    let parts = http::Request::builder()
+        .uri("https://example.test/invalid")
+        .header("connection", "close")
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    assert!(matches!(
+        requester.request(parts).await,
+        Err(h3x::Error::InvalidMessage { .. })
+    ));
+    assert_eq!(opened.load(Ordering::Relaxed), before);
+}
+
+#[tokio::test]
+async fn dropping_an_unpolled_driver_closes_the_transport() {
+    let (raw, _peer) = MemoryTransport::pair();
+    let (connection, driver) = h3x::Connection::new(raw.clone(), Settings::default())
+        .await
+        .unwrap();
+    let work = driver.run(|_, _| async {});
+    drop(work);
+    assert!(raw.close.error.lock().unwrap().is_some());
+    assert!(matches!(
+        connection.closed().await,
+        Err(h3x::Error::OwnerStopped)
+    ));
+}
+
+#[tokio::test]
+async fn dropping_unpolled_exchange_work_stops_both_directions() {
+    let (raw, peer) = MemoryTransport::pair();
+    let (connection, _driver) = h3x::Connection::new(raw, Settings::default())
+        .await
+        .unwrap();
+    let parts = http::Request::builder()
+        .uri("https://example.test/")
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    let (upload, response, work) = connection.request(parts).await.unwrap();
+    let (_id, (recv, send)) = transport::Connection::accept_bi(&peer).await.unwrap();
+    drop(work);
+    assert!(
+        recv.actions
+            .resets
+            .lock()
+            .unwrap()
+            .contains(&Code::H3_REQUEST_CANCELLED)
+    );
+    assert!(
+        send.actions
+            .stops
+            .lock()
+            .unwrap()
+            .contains(&Code::H3_REQUEST_CANCELLED)
+    );
+    assert!(matches!(
+        upload.finish().await,
+        Err(h3x::Error::OwnerStopped)
+    ));
+    assert!(matches!(response.await, Err(h3x::Error::OwnerStopped)));
+}
+
+#[tokio::test]
+async fn receive_queue_preserves_the_transport_bytes() {
+    let (raw, server) = MemoryTransport::pair();
+    let server = Connection::new(server, Settings::default()).await.unwrap();
+    let (_id, (_reply, mut send)) = transport::Connection::open_bi(&raw).await.unwrap();
+    send.send(Bytes::from(raw_get_headers())).await.unwrap();
+    let data = Bytes::from_static(&[0, 5, b'h', b'e', b'l', b'l', b'o']);
+    send.send(data.clone()).await.unwrap();
+    send.close().await.unwrap();
+    let (request, _sender) = server.accept().await.unwrap().unwrap();
+    let mut body = request.into_body();
+    let received = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(received, &b"hello"[..]);
+    assert_eq!(
+        received.as_ptr(),
+        data.slice(2..).as_ptr(),
+        "queue must move Bytes, not copy it"
+    );
+    assert!(body.frame().await.is_none());
+}
+
+#[tokio::test]
+async fn a_full_body_queue_does_not_block_control_processing() {
+    let (raw, server) = MemoryTransport::pair();
+    let server = Connection::new(server, Settings::default()).await.unwrap();
+    let (_id, (_reply, mut send)) = transport::Connection::open_bi(&raw).await.unwrap();
+    send.send(Bytes::from(raw_get_headers())).await.unwrap();
+    for _ in 0..10 {
+        send.send(Bytes::from_static(&[0, 1, b'x'])).await.unwrap();
+    }
+    let (_request, _sender) = server.accept().await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while send.actions.reads.load(Ordering::Relaxed) < 5 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        send.actions.reads.load(Ordering::Relaxed),
+        5,
+        "one HEADERS and four queued DATA chunks"
+    );
+    let (_id, mut control) = transport::Connection::open_uni(&raw).await.unwrap();
+    control
+        .send(Bytes::from_static(&[0, 4, 0, 4, 0]))
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_millis(100), server.closed())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code(), Some(Code::H3_FRAME_UNEXPECTED));
 }

@@ -6,7 +6,7 @@ use http_body_util::BodyExt;
 use tokio::sync::mpsc;
 
 use super::{Close, ControlCommand, SessionState};
-use crate::{Body, Code, Error, transport, wire};
+use crate::{ChunkBody, Code, Error, transport, wire};
 
 const WT_CLOSE_SESSION: u64 = 0x2843;
 const WT_DRAIN_SESSION: u64 = 0x78ae;
@@ -18,13 +18,13 @@ enum Capsule {
 }
 
 struct CapsuleReader {
-    body: Body,
+    body: ChunkBody,
     buffered: BytesMut,
     ended: bool,
 }
 
 impl CapsuleReader {
-    fn new(body: Body) -> Self {
+    fn new(body: ChunkBody) -> Self {
         Self {
             body,
             buffered: BytesMut::new(),
@@ -144,7 +144,7 @@ impl CapsuleReader {
 
 pub(super) async fn run(
     state: Arc<SessionState>,
-    body: Body,
+    body: ChunkBody,
     mut writer: Box<dyn transport::SendStream>,
     mut commands: mpsc::Receiver<ControlCommand>,
 ) {

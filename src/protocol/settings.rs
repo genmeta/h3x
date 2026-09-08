@@ -75,7 +75,7 @@ impl Settings {
         matches!(self.webtransport, Some(true))
     }
 
-    #[cfg(feature = "webtransport")]
+    #[cfg(all(test, feature = "webtransport"))]
     pub(crate) fn enable_webtransport(&mut self) {
         self.enable_connect_protocol = Some(true);
         self.h3_datagram = Some(true);

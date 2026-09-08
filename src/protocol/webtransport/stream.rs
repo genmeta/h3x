@@ -11,10 +11,14 @@ use bytes::Bytes;
 use futures::{Sink, Stream};
 
 use super::{SessionState, application_error_code, map_application_error};
-use crate::{Code, Error, StreamId, transport, wire};
+use crate::{
+    Code, Error, StreamId,
+    platform::{MaybeSend, MaybeSync},
+    transport, wire,
+};
 
 pub(crate) trait Writer:
-    Sink<Bytes, Error = transport::StreamError> + Send + Unpin + 'static
+    Sink<Bytes, Error = transport::StreamError> + MaybeSend + Unpin + 'static
 {
     fn id(&self) -> StreamId;
     fn reset_at(&mut self, code: Code, reliable_size: u64) -> Result<(), transport::StreamError>;
@@ -23,6 +27,7 @@ pub(crate) trait Writer:
 pub(crate) type BoxWriter = Box<dyn Writer>;
 
 struct AdaptedWriter<T: transport::webtransport::Connection> {
+    id: StreamId,
     transport: Arc<T>,
     stream: T::SendStream,
 }
@@ -31,25 +36,25 @@ impl<T: transport::webtransport::Connection> Sink<Bytes> for AdaptedWriter<T> {
     type Error = transport::StreamError;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.stream).poll_ready(cx)
+        transport::SendStream::poll_ready(&mut self.stream, cx)
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        Pin::new(&mut self.stream).start_send(item)
+        transport::SendStream::start_send(&mut self.stream, item)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.stream).poll_close(cx)
+        transport::SendStream::poll_close(&mut self.stream, cx)
     }
 }
 
 impl<T: transport::webtransport::Connection> Writer for AdaptedWriter<T> {
     fn id(&self) -> StreamId {
-        transport::SendStream::id(&self.stream)
+        self.id
     }
 
     fn reset_at(&mut self, code: Code, reliable_size: u64) -> Result<(), transport::StreamError> {
@@ -58,14 +63,14 @@ impl<T: transport::webtransport::Connection> Writer for AdaptedWriter<T> {
     }
 }
 
-pub(crate) fn adapt_writer<T>(transport: Arc<T>, stream: T::SendStream) -> BoxWriter
+pub(crate) fn adapt_writer<T>(transport: Arc<T>, id: StreamId, stream: T::SendStream) -> BoxWriter
 where
     T: transport::webtransport::Connection,
 {
-    Box::new(AdaptedWriter { transport, stream })
+    Box::new(AdaptedWriter { id, transport, stream })
 }
 
-pub(crate) trait AbortStream: Send + Sync {
+pub(crate) trait AbortStream: MaybeSend + MaybeSync {
     fn abort(&self, code: Code);
     fn finished(&self) -> bool;
 }

@@ -3,6 +3,11 @@
 //! The module owns only the WebTransport wire protocol. Identity, URL
 //! authorization and application dispatch remain the caller's responsibility.
 
+#![expect(
+    dead_code,
+    reason = "WebTransport connection integration is pending; see README"
+)]
+
 use std::{
     collections::BTreeSet,
     fmt,
@@ -13,17 +18,15 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{SinkExt, future::BoxFuture};
+use futures::SinkExt;
 use http::{Method, Request, Response as HttpResponse};
-use tokio::{
-    sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot},
-    task::JoinHandle,
-};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 
 use crate::{
-    Body, Code, Error, Response, Settings, StreamId,
+    ChunkBody, Code, Error, ResponseSender, Settings, StreamId,
+    platform::{BoxFuture, MaybeSend, MaybeSync},
     stream_id::{MAX_VARINT, StreamIdExt as _},
-    transport::{self, RecvStream as _, SendStream as _},
+    transport,
     wire,
 };
 
@@ -41,14 +44,14 @@ pub enum ConnectResponse {
         response: HttpResponse<()>,
         session: Session,
     },
-    Rejected(HttpResponse<Body>),
+    Rejected(HttpResponse<ChunkBody>),
 }
 
 const CLOSE_MESSAGE_LIMIT: usize = 1024;
 const APPLICATION_ERROR_FIRST: u64 = 0x52e4_a40f_a8db;
 const APPLICATION_ERROR_LAST: u64 = 0x52e5_ac98_3162;
 
-pub(crate) type TaskList = Arc<Mutex<Vec<JoinHandle<()>>>>;
+pub(crate) type TaskList = mpsc::UnboundedSender<BoxFuture<'static, ()>>;
 
 /// Local queue limits for the optional WebTransport module.
 #[derive(Clone, Debug)]
@@ -122,7 +125,7 @@ pub fn is_request<B>(request: &Request<B>) -> bool {
     request.method() == Method::CONNECT && request.extensions().get::<ProtocolMarker>().is_some()
 }
 
-trait Driver: Send + Sync {
+trait Driver: MaybeSend + MaybeSync {
     fn open_bi(&self) -> BoxFuture<'static, Result<(wire::ChunkReader, stream::BoxWriter), Error>>;
 
     fn open_uni(&self) -> BoxFuture<'static, Result<stream::BoxWriter, Error>>;
@@ -144,17 +147,16 @@ impl<T: transport::webtransport::Connection> Driver for DriverImpl<T> {
     fn open_bi(&self) -> BoxFuture<'static, Result<(wire::ChunkReader, stream::BoxWriter), Error>> {
         let transport = Arc::clone(&self.transport);
         Box::pin(async move {
-            let (reader, writer) = transport.open_bi().await.map_err(map_connection_error)?;
-            let reader_id = reader.id();
-            if reader_id != writer.id() || reader_id.as_u64() & 0x02 != 0 {
+            let (id, (reader, writer)) = transport.open_bi().await.map_err(map_connection_error)?;
+            if id.as_u64() & 0x02 != 0 {
                 return Err(Error::connection_protocol(
                     Code::H3_ID_ERROR,
                     "transport returned an invalid WebTransport bidirectional stream pair",
                 ));
             }
             Ok((
-                wire::ChunkReader::new(reader),
-                stream::adapt_writer(transport, writer),
+                wire::ChunkReader::new(id, reader),
+                stream::adapt_writer(transport, id, writer),
             ))
         })
     }
@@ -162,14 +164,14 @@ impl<T: transport::webtransport::Connection> Driver for DriverImpl<T> {
     fn open_uni(&self) -> BoxFuture<'static, Result<stream::BoxWriter, Error>> {
         let transport = Arc::clone(&self.transport);
         Box::pin(async move {
-            let writer = transport.open_uni().await.map_err(map_connection_error)?;
-            if writer.id().as_u64() & 0x02 == 0 {
+            let (id, writer) = transport.open_uni().await.map_err(map_connection_error)?;
+            if id.as_u64() & 0x02 == 0 {
                 return Err(Error::connection_protocol(
                     Code::H3_STREAM_CREATION_ERROR,
                     "transport returned a bidirectional stream from WebTransport open_uni",
                 ));
             }
-            Ok(stream::adapt_writer(transport, writer))
+            Ok(stream::adapt_writer(transport, id, writer))
         })
     }
 
@@ -202,9 +204,14 @@ impl<T: transport::webtransport::Connection> Driver for DriverImpl<T> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+type WrapWriter<S> = Arc<dyn Fn(StreamId, S) -> stream::BoxWriter + Send + Sync>;
+#[cfg(target_arch = "wasm32")]
+type WrapWriter<S> = Arc<dyn Fn(StreamId, S) -> stream::BoxWriter>;
+
 pub(crate) struct Hooks<S> {
     runtime: Arc<Runtime>,
-    wrap_writer: Arc<dyn Fn(S) -> stream::BoxWriter + Send + Sync>,
+    wrap_writer: WrapWriter<S>,
 }
 
 impl<S> Clone for Hooks<S> {
@@ -221,8 +228,8 @@ impl<S> Hooks<S> {
         &self.runtime
     }
 
-    pub(crate) fn wrap_writer(&self, writer: S) -> stream::BoxWriter {
-        (self.wrap_writer)(writer)
+    pub(crate) fn wrap_writer(&self, id: StreamId, writer: S) -> stream::BoxWriter {
+        (self.wrap_writer)(id, writer)
     }
 }
 
@@ -251,7 +258,7 @@ where
         transport: Arc::clone(&transport),
     });
     let runtime = Arc::new(Runtime::new(driver, config, tasks));
-    let wrap_writer = Arc::new(move |writer| stream::adapt_writer(Arc::clone(&transport), writer));
+    let wrap_writer = Arc::new(move |id, writer| stream::adapt_writer(Arc::clone(&transport), id, writer));
     Ok(Hooks {
         runtime,
         wrap_writer,
@@ -401,7 +408,7 @@ impl Runtime {
     fn register(
         self: &Arc<Self>,
         id: StreamId,
-        connection: Arc<dyn Send + Sync>,
+        connection: crate::platform::KeepAlive,
     ) -> Result<PreparedSession, Error> {
         validate_session_id(id)?;
         if let Some(error) = self
@@ -459,7 +466,7 @@ impl Runtime {
     pub(crate) fn prepare(
         self: &Arc<Self>,
         id: StreamId,
-        connection: Arc<dyn Send + Sync>,
+        connection: crate::platform::KeepAlive,
     ) -> Result<PendingSession, Error> {
         Ok(PendingSession {
             prepared: Some(self.register(id, connection)?),
@@ -582,10 +589,8 @@ impl Runtime {
         }
     }
 
-    fn track(&self, task: JoinHandle<()>) {
-        let mut tasks = self.tasks.lock().expect("task lock poisoned");
-        tasks.retain(|task| !task.is_finished());
-        tasks.push(task);
+    pub(crate) fn track(&self, task: BoxFuture<'static, ()>) {
+        let _ = self.tasks.send(task);
     }
 }
 
@@ -750,7 +755,11 @@ pub(crate) struct PendingSession {
 }
 
 impl PendingSession {
-    pub(crate) fn start(mut self, body: Body, writer: Box<dyn transport::SendStream>) -> Session {
+    pub(crate) fn start(
+        mut self,
+        body: ChunkBody,
+        writer: Box<dyn transport::SendStream>,
+    ) -> Session {
         let prepared = self
             .prepared
             .take()
@@ -788,7 +797,7 @@ pub(crate) enum ControlCommand {
 pub struct Session {
     state: Arc<SessionState>,
     commands: mpsc::Sender<ControlCommand>,
-    _connection: Arc<dyn Send + Sync>,
+    _connection: crate::platform::KeepAlive,
 }
 
 impl fmt::Debug for Session {
@@ -935,8 +944,8 @@ impl Session {
 
 /// Accepts a decoded WebTransport CONNECT after the caller has authorized it.
 pub async fn accept(
-    request: Request<Body>,
-    response_sender: Response,
+    request: Request<ChunkBody>,
+    response_sender: ResponseSender,
     response: HttpResponse<()>,
 ) -> Result<Session, Error> {
     if !is_request(&request) {
@@ -1006,7 +1015,11 @@ pub async fn accept(
     Ok(pending.start(body, writer))
 }
 
-fn start_control(prepared: PreparedSession, body: Body, writer: Box<dyn transport::SendStream>) {
+fn start_control(
+    prepared: PreparedSession,
+    body: ChunkBody,
+    writer: Box<dyn transport::SendStream>,
+) {
     let PreparedSession {
         session,
         command_rx,
@@ -1017,7 +1030,7 @@ fn start_control(prepared: PreparedSession, body: Body, writer: Box<dyn transpor
         .upgrade()
         .expect("a registered WebTransport session retains its runtime");
     drop(session);
-    let task = tokio::spawn(async move {
+    let task = Box::pin(async move {
         capsule::run(Arc::clone(&state), body, writer, command_rx).await;
     });
     runtime.track(task);

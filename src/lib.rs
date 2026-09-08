@@ -1,24 +1,31 @@
 #![doc = include_str!("../README.md")]
 
-mod body;
-mod config;
-mod connection;
+mod endpoint;
 mod error;
-mod qpack;
-mod stream_id;
-mod wire;
-
+pub mod protocol;
+mod request;
+mod response;
+pub mod runtime;
 pub mod transport;
-#[cfg(feature = "webtransport")]
-pub mod webtransport;
-
-pub use body::Body;
-pub use config::Settings;
-pub use connection::{Connection, RequestStream, Response};
+pub use endpoint::{Endpoint, RemoteAuthority, RequestAuthority};
 pub use error::{Code, Error};
-pub use stream_id::StreamId;
+#[cfg(feature = "webtransport")]
+pub use protocol::webtransport;
+pub use protocol::{
+    BodyWriter, Chunk, ChunkBody, Connection, Fixed, ResponseSender, Sender, Settings, StreamId,
+};
+pub use request::{ChunkRequestFuture, Request, RequestFuture};
+pub use response::{Response, ResponseFuture};
+#[cfg(not(target_arch = "wasm32"))]
+pub use runtime::{Pool, init, shutdown};
+pub type EndpointError = Error;
+pub type PoolError = Error;
+use protocol::{body, connection, platform, qpack, stream_id, wire};
 
+#[cfg(not(target_arch = "wasm32"))]
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+#[cfg(target_arch = "wasm32")]
+pub type BoxError = Box<dyn std::error::Error + 'static>;
 
 /// ALPN token used by the symmetric HTTP/3 wire profile.
 pub const ALPN: &[u8] = b"h3";

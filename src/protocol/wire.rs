@@ -1,48 +1,18 @@
 use std::{
     collections::BTreeSet,
-    ops::Deref,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, future::poll_fn};
 use qbase::varint::{VarInt, WriteVarInt, be_varint};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{Code, Error, Settings, transport};
 
 pub(crate) type BoxRecvStream = Box<dyn transport::RecvStream>;
 pub(crate) const MAX_BUFFERED_FRAME_PAYLOAD: usize = 64 * 1024;
 pub(crate) const MAX_DATA_CHUNK: usize = 16 * 1024;
-const MAX_BUFFERED_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
-
-/// Per-connection reservation for payloads being read, decoded, or QPACK-blocked.
-#[derive(Clone, Debug)]
-pub(crate) struct PayloadBudget(Arc<Semaphore>);
-
-impl Default for PayloadBudget {
-    fn default() -> Self {
-        Self(Arc::new(Semaphore::new(MAX_BUFFERED_PAYLOAD_BYTES)))
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct BufferedPayload {
-    bytes: Bytes,
-    // Keep the reservation until decoding (including a QPACK wait) has finished.
-    _permit: OwnedSemaphorePermit,
-}
-
-impl Deref for BufferedPayload {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FrameType {
     Data,
@@ -80,19 +50,25 @@ pub(crate) struct FrameHeader {
 
 /// Preserves transport chunk boundaries without copying DATA into an accumulator.
 pub(crate) struct ChunkReader {
+    #[cfg(feature = "webtransport")]
+    id: crate::StreamId,
     stream: BoxRecvStream,
     pending: Bytes,
     ended: bool,
     ready_reads: u8,
+    stop_code: Code,
 }
 
 impl ChunkReader {
-    pub(crate) fn new(stream: impl transport::RecvStream) -> Self {
+    pub(crate) fn new(_id: crate::StreamId, stream: impl transport::RecvStream) -> Self {
         Self {
+            #[cfg(feature = "webtransport")]
+            id: _id,
             stream: Box::new(stream),
             pending: Bytes::new(),
             ended: false,
             ready_reads: 0,
+            stop_code: Code::H3_REQUEST_CANCELLED,
         }
     }
 
@@ -104,7 +80,7 @@ impl ChunkReader {
 
     #[cfg(feature = "webtransport")]
     pub(crate) fn stream_id(&self) -> crate::StreamId {
-        self.stream.id()
+        self.id
     }
 
     fn poll_chunk(
@@ -127,7 +103,7 @@ impl ChunkReader {
             if self.ended {
                 return Poll::Ready(Ok(None));
             }
-            match Pin::new(&mut self.stream).poll_next(cx) {
+            match self.stream.poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => self.pending = bytes,
                 Poll::Ready(Some(Err(error))) => {
                     self.ended = true;
@@ -149,11 +125,6 @@ impl ChunkReader {
     /// Raw QPACK and WebTransport bytes, including any unconsumed prefix chunk.
     pub(crate) async fn read_chunk(&mut self) -> Result<Option<Bytes>, Error> {
         self.read_chunk_limited(usize::MAX).await
-    }
-
-    pub(crate) async fn drain_to_end(&mut self) -> Result<(), Error> {
-        while self.read_chunk_limited(MAX_DATA_CHUNK).await?.is_some() {}
-        Ok(())
     }
 
     /// Cancellation terminates this reader; a partially consumed varint cannot be retried.
@@ -183,6 +154,14 @@ impl ChunkReader {
     }
 }
 
+impl Drop for ChunkReader {
+    fn drop(&mut self) {
+        if !self.ended {
+            let _ = self.stop(self.stop_code);
+        }
+    }
+}
+
 impl futures::Stream for ChunkReader {
     type Item = Result<Bytes, Error>;
 
@@ -195,24 +174,13 @@ impl futures::Stream for ChunkReader {
 pub(crate) struct FrameReader {
     input: ChunkReader,
     remaining: u64,
-    budget: PayloadBudget,
 }
 
 impl FrameReader {
-    pub(crate) fn new(input: ChunkReader, budget: PayloadBudget) -> Self {
+    pub(crate) fn new(input: ChunkReader) -> Self {
         Self {
             input,
             remaining: 0,
-            budget,
-        }
-    }
-
-    #[cfg(feature = "webtransport")]
-    pub(crate) fn after_header(input: ChunkReader, budget: PayloadBudget, length: u64) -> Self {
-        Self {
-            input,
-            remaining: length,
-            budget,
         }
     }
 
@@ -301,35 +269,21 @@ impl FrameReader {
         Ok(value)
     }
 
-    pub(crate) async fn read_payload(&mut self, limit: usize) -> Result<BufferedPayload, Error> {
+    pub(crate) async fn read_payload(&mut self, limit: usize) -> Result<Bytes, Error> {
         let len = usize::try_from(self.remaining)
             .ok()
             .filter(|len| *len <= limit.min(MAX_BUFFERED_FRAME_PAYLOAD))
             .ok_or_else(|| excessive_load("buffered frame payload exceeds implementation limit"))?;
-        let permit = Arc::clone(&self.budget.0)
-            .try_acquire_many_owned(len as u32)
-            .map_err(|_| excessive_load("connection buffered payload budget exhausted"))?;
         let mut bytes = BytesMut::with_capacity(len);
         while let Some(chunk) = self.read_payload_chunk(MAX_DATA_CHUNK).await? {
             bytes.extend_from_slice(&chunk);
         }
-        Ok(BufferedPayload {
-            bytes: bytes.freeze(),
-            _permit: permit,
-        })
+        Ok(bytes.freeze())
     }
 
     pub(crate) async fn discard_payload(&mut self) -> Result<(), Error> {
         while self.read_payload_chunk(MAX_DATA_CHUNK).await?.is_some() {}
         Ok(())
-    }
-}
-
-impl Drop for FrameReader {
-    fn drop(&mut self) {
-        if !self.input.ended {
-            let _ = self.input.stop(Code::H3_REQUEST_CANCELLED);
-        }
     }
 }
 
@@ -543,8 +497,11 @@ impl Stream for TestInput {
 
 #[cfg(any(test, feature = "fuzzing"))]
 impl transport::RecvStream for TestInput {
-    fn id(&self) -> crate::StreamId {
-        crate::stream_id::from_u64_unchecked(0)
+    fn poll_next(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, transport::StreamError>>> {
+        Stream::poll_next(Pin::new(self), cx)
     }
 
     fn stop(&mut self, _code: Code) -> Result<(), transport::StreamError> {
@@ -563,7 +520,10 @@ pub(crate) fn fuzz_frame(data: &[u8]) {
             .collect(),
         pending: false,
     };
-    let mut frames = FrameReader::new(ChunkReader::new(input), PayloadBudget::default());
+    let mut frames = FrameReader::new(ChunkReader::new(
+        crate::stream_id::from_u64_unchecked(0),
+        input,
+    ));
     let _: Result<(), Error> = futures::executor::block_on(async {
         while let Some(header) = frames.next_header().await? {
             match header.frame_type {
@@ -591,13 +551,13 @@ mod tests {
     use crate::stream_id::MAX_VARINT;
 
     fn frames(chunks: impl IntoIterator<Item = Bytes>) -> FrameReader {
-        FrameReader::new(
-            ChunkReader::new(TestInput {
+        FrameReader::new(ChunkReader::new(
+            crate::stream_id::from_u64_unchecked(0),
+            TestInput {
                 chunks: chunks.into_iter().map(Ok).collect(),
                 pending: true,
-            }),
-            PayloadBudget::default(),
-        )
+            },
+        ))
     }
 
     #[test]
@@ -610,14 +570,18 @@ mod tests {
             }
         }
         impl transport::RecvStream for Empty {
-            fn id(&self) -> crate::StreamId {
-                crate::stream_id::from_u64_unchecked(0)
+            fn poll_next(
+                &mut self,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Bytes, transport::StreamError>>> {
+                Stream::poll_next(Pin::new(self), cx)
             }
+
             fn stop(&mut self, _: Code) -> Result<(), transport::StreamError> {
                 Ok(())
             }
         }
-        let mut reader = ChunkReader::new(Empty);
+        let mut reader = ChunkReader::new(crate::stream_id::from_u64_unchecked(0), Empty);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(reader.poll_chunk(&mut cx, 1).is_pending());
         assert!(reader.poll_chunk(&mut cx, 1).is_pending());
@@ -662,13 +626,16 @@ mod tests {
         for value in [0, 63, 64, 16383, 16384, (1 << 30) - 1, 1 << 30, MAX_VARINT] {
             let mut bytes = Vec::new();
             encode_varint(value, &mut bytes).unwrap();
-            let mut reader = ChunkReader::new(TestInput {
-                chunks: bytes
-                    .into_iter()
-                    .map(|byte| Ok(Bytes::from(vec![byte])))
-                    .collect(),
-                pending: true,
-            });
+            let mut reader = ChunkReader::new(
+                crate::stream_id::from_u64_unchecked(0),
+                TestInput {
+                    chunks: bytes
+                        .into_iter()
+                        .map(|byte| Ok(Bytes::from(vec![byte])))
+                        .collect(),
+                    pending: true,
+                },
+            );
             assert_eq!(reader.read_varint_opt().await.unwrap(), Some(value));
             assert_eq!(reader.read_varint_opt().await.unwrap(), None);
         }
@@ -716,13 +683,13 @@ mod tests {
             )),
         ] {
             for input in [&[0x40][..], &[0, 0x40][..], &[0, 2, 1][..]] {
-                let mut reader = FrameReader::new(
-                    ChunkReader::new(TestInput {
+                let mut reader = FrameReader::new(ChunkReader::new(
+                    crate::stream_id::from_u64_unchecked(0),
+                    TestInput {
                         chunks: [Ok(Bytes::copy_from_slice(input)), Err(error.clone())].into(),
                         pending: true,
-                    }),
-                    PayloadBudget::default(),
-                );
+                    },
+                ));
                 let actual = async {
                     reader.next_header().await?;
                     reader.discard_payload().await
@@ -737,25 +704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn payload_reservations_cover_reading_and_decoding_and_release_on_drop() {
-        let mut reader = frames([Bytes::from_static(&[1, 3, 1, 2, 3])]);
-        let budget = PayloadBudget(Arc::new(Semaphore::new(3)));
-        reader.budget = budget.clone();
-        reader.next_header().await.unwrap();
-        let payload = reader.read_payload(3).await.unwrap();
-        assert_eq!(budget.0.available_permits(), 0);
-        let mut other = frames([Bytes::from_static(&[1, 1, 0])]);
-        other.budget = budget.clone();
-        other.next_header().await.unwrap();
-        assert_eq!(
-            other.read_payload(1).await.unwrap_err().code(),
-            Some(Code::H3_EXCESSIVE_LOAD)
-        );
-        drop(payload);
-        assert_eq!(budget.0.available_permits(), 3);
-        assert_eq!(&*other.read_payload(1).await.unwrap(), &[0]);
-        assert_eq!(budget.0.available_permits(), 3);
-
+    async fn buffered_payload_size_is_bounded() {
         let mut large = Vec::new();
         encode_varint(1, &mut large).unwrap();
         encode_varint((MAX_BUFFERED_FRAME_PAYLOAD + 1) as u64, &mut large).unwrap();
@@ -765,20 +714,6 @@ mod tests {
             reader.read_payload(usize::MAX).await.unwrap_err().code(),
             Some(Code::H3_EXCESSIVE_LOAD)
         );
-    }
-
-    #[tokio::test]
-    async fn cancelled_payload_read_releases_its_reservation() {
-        use futures::FutureExt;
-        let mut reader = frames([Bytes::from_static(&[1, 4]), Bytes::from_static(&[1])]);
-        reader.next_header().await.unwrap();
-        let budget = reader.budget.clone();
-        let mut reading = Box::pin(reader.read_payload(4));
-        assert!(reading.as_mut().now_or_never().is_none());
-        assert_eq!(budget.0.available_permits(), MAX_BUFFERED_PAYLOAD_BYTES - 4);
-        drop(reading);
-        drop(reader); // Never resume a cancelled partial payload.
-        assert_eq!(budget.0.available_permits(), MAX_BUFFERED_PAYLOAD_BYTES);
     }
 
     #[tokio::test]
