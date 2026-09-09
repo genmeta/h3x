@@ -14,7 +14,14 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 #[test]
 fn endpoint_validates_certificate_and_signed_ocsp() {
-    let generated = rcgen::generate_simple_self_signed(vec!["test.example".into()]).unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["test.example".into()]).unwrap();
+    // 128 requires a DER sign-padding zero; random serials only rarely exercise it.
+    params.serial_number = Some(128u64.into());
+    let signing_key = rcgen::KeyPair::generate().unwrap();
+    let generated = rcgen::CertifiedKey {
+        cert: params.self_signed(&signing_key).unwrap(),
+        signing_key,
+    };
     let cert = generated.cert.der();
     let (_, parsed) = X509Certificate::from_der(cert).unwrap();
     let make = |name: &str, staple: Option<Vec<u8>>| {
@@ -84,7 +91,12 @@ fn endpoint_validates_certificate_and_signed_ocsp() {
     };
     let encode = |basic| encode_with(basic, &generated.signing_key);
     let good = encode(basic.clone());
-    assert!(make("test.example", Some(good.clone())).is_ok());
+    let result = make("test.example", Some(good.clone()));
+    assert!(
+        result.is_ok(),
+        "valid OCSP failed: {result:?}; serial={:x?}",
+        parsed.raw_serial()
+    );
     let mut trailing = good.clone();
     trailing.push(0);
     assert!(make("test.example", Some(trailing)).is_err());

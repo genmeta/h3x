@@ -136,12 +136,13 @@ pub(super) fn check(chain: &[CertificateDer<'_>], data: &[u8]) -> Result<(), Err
     x509_parser::verify::verify_signature(signer.public_key(), &algorithm, &signature, &signed)
         .map_err(invalid)?;
 
+    let leaf_serial = der::asn1::UintRef::new(leaf.raw_serial()).map_err(invalid)?;
     let mut matched = None;
     for single in &tbs.responses {
         let id = &single.cert_id;
         // x509-cert also accepts negative serials for compatibility; OCSP does not.
-        der::asn1::UintRef::from_der(&id.serial_number.to_der().map_err(invalid)?)
-            .map_err(invalid)?;
+        let serial_der = id.serial_number.to_der().map_err(invalid)?;
+        let serial = der::asn1::UintRef::from_der(&serial_der).map_err(invalid)?;
         let algorithm = match id.hash_algorithm.oid.to_string().as_str() {
             "1.3.14.3.2.26" => &digest::SHA1_FOR_LEGACY_USE_ONLY,
             "2.16.840.1.101.3.4.2.1" => &digest::SHA256,
@@ -149,11 +150,7 @@ pub(super) fn check(chain: &[CertificateDer<'_>], data: &[u8]) -> Result<(), Err
             "2.16.840.1.101.3.4.2.3" => &digest::SHA512,
             _ => return Err(invalid("unsupported OCSP CertID hash")),
         };
-        if id.serial_number.as_bytes()
-            != leaf
-                .raw_serial()
-                .strip_prefix(&[0])
-                .unwrap_or(leaf.raw_serial())
+        if serial != leaf_serial
             || id.issuer_name_hash.as_bytes()
                 != digest::digest(algorithm, issuer.subject().as_raw()).as_ref()
             || id.issuer_key_hash.as_bytes()
