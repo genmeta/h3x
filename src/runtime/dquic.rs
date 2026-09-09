@@ -1,90 +1,26 @@
-use std::{
-    io,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use std::{io, sync::Arc};
 
-use bytes::Bytes;
-use futures::{Sink, Stream};
+use dquic::prelude::{StreamReader, StreamWriter};
 use http::uri::Authority;
 
-use crate::{Endpoint, Error, RemoteAuthority, transport::PendingTransport};
+use crate::{Endpoint, Error, RemoteAuthority};
 
-#[derive(Clone)]
-pub struct DquicTransport(pub(crate) Arc<dquic::prelude::Connection>);
-
-fn connection_error(error: dquic::prelude::Error) -> crate::transport::ConnectionError {
-    match error {
-        dquic::prelude::Error::Quic(error) => crate::transport::ConnectionError::transport(error),
-        dquic::prelude::Error::App(error) => {
-            crate::transport::ConnectionError::application_with_source(
-                crate::Code::try_from(error.error_code())
-                    .expect("QUIC application code fits a varint"),
-                Bytes::copy_from_slice(error.reason().as_bytes()),
-                error,
-            )
-        }
-    }
-}
-
-fn stream_error(error: dquic::prelude::StreamError) -> crate::transport::StreamError {
-    match error {
-        dquic::prelude::StreamError::Connection(error) => connection_error(error).into(),
-        dquic::prelude::StreamError::Reset(error) => crate::transport::StreamError::reset(
-            crate::Code::try_from(error.error_code()).expect("QUIC reset code fits a varint"),
-        ),
-        dquic::prelude::StreamError::EosSent => {
-            crate::transport::ConnectionError::transport(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "QUIC send direction already finished",
-            ))
-            .into()
-        }
-    }
-}
-
-impl crate::transport::RecvStream for dquic::prelude::StreamReader {
-    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, crate::transport::StreamError>>> {
-        Stream::poll_next(Pin::new(self), cx)
-            .map(|item| item.map(|item| item.map_err(stream_error)))
-    }
-
-    fn stop(&mut self, code: crate::Code) -> Result<(), crate::transport::StreamError> {
-        dquic::prelude::StopSending::stop(self, code.as_u64());
-        Ok(())
-    }
-}
-
-impl crate::transport::SendStream for dquic::prelude::StreamWriter {
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), crate::transport::StreamError>> {
-        Sink::poll_ready(Pin::new(self), cx).map_err(stream_error)
-    }
-
-    fn start_send(&mut self, item: Bytes) -> Result<(), crate::transport::StreamError> {
-        Sink::start_send(Pin::new(self), item).map_err(stream_error)
-    }
-
-    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), crate::transport::StreamError>> {
-        Sink::poll_close(Pin::new(self), cx).map_err(stream_error)
-    }
-
-    fn reset(&mut self, code: crate::Code) -> Result<(), crate::transport::StreamError> {
-        dquic::prelude::CancelStream::cancel(self, code.as_u64());
-        Ok(())
-    }
-}
-
-impl crate::transport::Connection for DquicTransport {
-    type RecvStream = dquic::prelude::StreamReader;
-    type SendStream = dquic::prelude::StreamWriter;
-
+impl crate::transport::Connection for Arc<dquic::prelude::Connection> {
     fn role(&self) -> Result<crate::transport::Role, crate::transport::ConnectionError> {
-        self.0.role().map_err(connection_error)
+        self.as_ref()
+            .role()
+            .map_err(crate::transport::ConnectionError::from)
     }
 
-    async fn open_bi(&self) -> Result<(crate::StreamId, (Self::RecvStream, Self::SendStream)), crate::transport::ConnectionError> {
-        let Some((id, (recv, send))) = self.0.open_bi_stream().await.map_err(connection_error)?
+    async fn open_bi(
+        &self,
+    ) -> Result<(crate::StreamId, (StreamReader, StreamWriter)), crate::transport::ConnectionError>
+    {
+        let Some((id, (recv, send))) = self
+            .as_ref()
+            .open_bi_stream()
+            .await
+            .map_err(crate::transport::ConnectionError::from)?
         else {
             return Err(crate::transport::ConnectionError::transport(
                 io::Error::other("QUIC bidirectional stream ID space exhausted"),
@@ -93,8 +29,15 @@ impl crate::transport::Connection for DquicTransport {
         Ok((id, (recv, send)))
     }
 
-    async fn open_uni(&self) -> Result<(crate::StreamId, Self::SendStream), crate::transport::ConnectionError> {
-        let Some((id, send)) = self.0.open_uni_stream().await.map_err(connection_error)? else {
+    async fn open_uni(
+        &self,
+    ) -> Result<(crate::StreamId, StreamWriter), crate::transport::ConnectionError> {
+        let Some((id, send)) = self
+            .as_ref()
+            .open_uni_stream()
+            .await
+            .map_err(crate::transport::ConnectionError::from)?
+        else {
             return Err(crate::transport::ConnectionError::transport(
                 io::Error::other("QUIC unidirectional stream ID space exhausted"),
             ));
@@ -104,24 +47,35 @@ impl crate::transport::Connection for DquicTransport {
 
     async fn accept_bi(
         &self,
-    ) -> Result<(crate::StreamId, (Self::RecvStream, Self::SendStream)), crate::transport::ConnectionError> {
-        let (id, (recv, send)) = self.0.accept_bi_stream().await.map_err(connection_error)?;
+    ) -> Result<(crate::StreamId, (StreamReader, StreamWriter)), crate::transport::ConnectionError>
+    {
+        let (id, (recv, send)) = self
+            .as_ref()
+            .accept_bi_stream()
+            .await
+            .map_err(crate::transport::ConnectionError::from)?;
         Ok((id, (recv, send)))
     }
 
-    async fn accept_uni(&self) -> Result<(crate::StreamId, Self::RecvStream), crate::transport::ConnectionError> {
-        let (id, recv) = self.0.accept_uni_stream().await.map_err(connection_error)?;
+    async fn accept_uni(
+        &self,
+    ) -> Result<(crate::StreamId, StreamReader), crate::transport::ConnectionError> {
+        let (id, recv) = self
+            .as_ref()
+            .accept_uni_stream()
+            .await
+            .map_err(crate::transport::ConnectionError::from)?;
         Ok((id, recv))
     }
 
     fn close(&self, code: crate::Code, reason: &[u8]) {
         let _ = self
-            .0
+            .as_ref()
             .close(String::from_utf8_lossy(reason).into_owned(), code.as_u64());
     }
 
     async fn closed(&self) -> crate::transport::ConnectionError {
-        connection_error(self.0.terminated().await)
+        crate::transport::ConnectionError::from(self.as_ref().terminated().await)
     }
 }
 
@@ -131,12 +85,13 @@ pub(crate) fn transport_error(source: impl std::error::Error + Send + Sync + 'st
     }
 }
 
+// TODO：这个有 quic 交付一个带身份握手完成的 Connection
 pub(crate) async fn authenticate(
-    handshake: PendingTransport<DquicTransport>,
+    transport: Arc<dquic::prelude::Connection>,
     local: Option<Arc<Endpoint>>,
     target: Option<Authority>,
 ) -> Result<Authenticated, Error> {
-    let raw = &handshake.transport.as_ref().expect("unadopted transport").0;
+    let raw = &transport;
     raw.handshaked().await.map_err(transport_error)?;
     if raw
         .negotiated_alpn()
@@ -171,35 +126,21 @@ pub(crate) async fn authenticate(
             RemoteAuthority::from_authenticated(remote.name(), remote.cert_chain().to_vec())
         })
         .transpose()?;
-    let target = match target {
-        Some(target) => {
-            if remote.as_ref().map(RemoteAuthority::name) != Some(target.host()) {
-                return Err(Error::IdentityMismatch);
-            }
-            Some(target)
-        }
-        None => remote
-            .as_ref()
-            .filter(|remote| remote.name() == "dhttp.net" || remote.name().ends_with(".dhttp.net"))
-            .map(|remote| {
-                remote
-                    .name()
-                    .parse()
-                    .expect("validated DHTTP name is an authority")
-            }),
-    };
+    if let Some(target) = target
+        && remote.as_ref().map(RemoteAuthority::name) != Some(target.host())
+    {
+        return Err(Error::IdentityMismatch);
+    }
     Ok(Authenticated {
-        transport: handshake,
+        transport,
         local,
         remote,
-        target,
     })
 }
 
 /// Authentication facts remain in the runtime when transport is adopted by HTTP/3.
 pub(super) struct Authenticated {
-    pub(super) transport: PendingTransport<DquicTransport>,
+    pub(super) transport: Arc<dquic::prelude::Connection>,
     pub(super) local: Option<Arc<Endpoint>>,
     pub(super) remote: Option<RemoteAuthority>,
-    pub(super) target: Option<Authority>,
 }

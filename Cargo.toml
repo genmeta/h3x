@@ -16,6 +16,7 @@ http = "1"
 http-body = "1"
 http-body-util = "0.1"
 httlib-huffman = "0.3"
+nom = "8"
 qbase = "0.6.4"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 dhttp-identity = "0.3.0"

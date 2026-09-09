@@ -181,9 +181,11 @@ impl Encoder {
     pub(super) fn apply(&mut self, instruction: DecoderInstruction) -> Result<(), Error> {
         match instruction {
             DecoderInstruction::SectionAcknowledgement(stream_id) => {
-                let stream_id = crate::stream_id::try_from_u64(stream_id).map_err(|_| {
-                    decoder_stream_error("invalid stream ID in QPACK acknowledgement")
-                })?;
+                let stream_id = qbase::varint::VarInt::try_from(stream_id)
+                    .map(StreamId::from)
+                    .map_err(|_| {
+                        decoder_stream_error("invalid stream ID in QPACK acknowledgement")
+                    })?;
                 let sections = self.sections.get_mut(&stream_id).ok_or_else(|| {
                     decoder_stream_error("QPACK acknowledgement has no outstanding field section")
                 })?;
@@ -198,7 +200,8 @@ impl Encoder {
                 self.release(section.references)?;
             }
             DecoderInstruction::StreamCancellation(stream_id) => {
-                let stream_id = crate::stream_id::try_from_u64(stream_id)
+                let stream_id = qbase::varint::VarInt::try_from(stream_id)
+                    .map(StreamId::from)
                     .map_err(|_| decoder_stream_error("invalid stream ID in QPACK cancellation"))?;
                 if let Some(sections) = self.sections.remove(&stream_id) {
                     for section in sections {
@@ -284,7 +287,7 @@ mod tests {
 
     #[test]
     fn encoder_inserts_then_waits_for_confirmation_before_referencing() {
-        let stream = crate::stream_id::from_u64_unchecked(0);
+        let stream = crate::StreamId::from(qbase::varint::VarInt::from_u32(0));
         let mut encoder = Encoder::new();
         let capacity = encoder.configure(256).unwrap();
         assert!(matches!(
@@ -298,7 +301,7 @@ mod tests {
 
         let second = encoder
             .encode(
-                crate::stream_id::from_u64_unchecked(4),
+                crate::StreamId::from(qbase::varint::VarInt::from_u32(4)),
                 [field(b"x-test", b"same")],
             )
             .unwrap();
@@ -309,7 +312,7 @@ mod tests {
             .unwrap();
         let third = encoder
             .encode(
-                crate::stream_id::from_u64_unchecked(8),
+                crate::StreamId::from(qbase::varint::VarInt::from_u32(8)),
                 [field(b"x-test", b"same")],
             )
             .unwrap();
@@ -323,7 +326,7 @@ mod tests {
         encoder.configure(256).unwrap();
         let encoded = encoder
             .encode(
-                crate::stream_id::from_u64_unchecked(0),
+                crate::StreamId::from(qbase::varint::VarInt::from_u32(0)),
                 [field(b"authorization", b"secret")],
             )
             .unwrap();
@@ -342,8 +345,8 @@ mod tests {
 
     #[test]
     fn acknowledgement_and_cancellation_release_dynamic_references() {
-        let first_stream = crate::stream_id::from_u64_unchecked(0);
-        let second_stream = crate::stream_id::from_u64_unchecked(4);
+        let first_stream = crate::StreamId::from(qbase::varint::VarInt::from_u32(0));
+        let second_stream = crate::StreamId::from(qbase::varint::VarInt::from_u32(4));
         let mut encoder = Encoder::new();
         encoder.configure(38).unwrap();
 

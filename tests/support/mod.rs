@@ -101,7 +101,7 @@ impl<T: transport::Connection> Connection<T> {
         tokio::spawn(work);
         Ok((
             writer,
-            Box::pin(async move { response.await.map(h3x::Response::into_http) }),
+            Box::pin(async move { response.await.map(h3x::client::Response::into_http) }),
         ))
     }
 

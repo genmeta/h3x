@@ -1,7 +1,8 @@
 use bytes::Bytes;
 use httlib_huffman::DecoderSpeed;
+use qbase::varint::VARINT_MAX;
 
-use crate::{Code, Error, stream_id::MAX_VARINT};
+use crate::{Code, Error};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum EncoderInstruction {
@@ -173,7 +174,7 @@ fn encode_integer(
     high_bits: u8,
     output: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    if value > MAX_VARINT {
+    if value > VARINT_MAX {
         return Err(Error::connection_protocol(
             Code::QPACK_DECODER_STREAM_ERROR,
             "QPACK integer exceeds 62 bits",
@@ -216,7 +217,7 @@ fn decode_integer(encoded: &[u8], prefix_bits: u8) -> Result<Option<(u64, usize)
         value = value
             .checked_add(term)
             .ok_or("QPACK prefixed integer overflow")?;
-        if value > MAX_VARINT {
+        if value > VARINT_MAX {
             return Err("QPACK integer exceeds 62 bits");
         }
         if byte & 0x80 == 0 {

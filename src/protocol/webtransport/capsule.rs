@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
+use dquic::prelude::StreamWriter;
 use futures::SinkExt;
 use http_body_util::BodyExt;
+use qbase::varint::{VarInt, WriteVarInt, be_varint};
 use tokio::sync::mpsc;
 
 use super::{Close, ControlCommand, SessionState};
-use crate::{ChunkBody, Code, Error, transport, wire};
+use crate::{ChunkBody, Code, Error, wire};
 
 const WT_CLOSE_SESSION: u64 = 0x2843;
 const WT_DRAIN_SESSION: u64 = 0x78ae;
@@ -88,15 +90,10 @@ impl CapsuleReader {
         if self.buffered.len() < len {
             return Err(message_error("capsule contains an incomplete varint"));
         }
-        let (value, consumed) = wire::decode_varint(&self.buffered[..len]).map_err(|source| {
-            Error::stream_with_source(
-                Some(Code::H3_MESSAGE_ERROR),
-                "capsule contains an invalid varint",
-                source,
-            )
-        })?;
-        self.buffered.advance(consumed);
-        Ok(Some(value))
+        let (_, value) = be_varint(&self.buffered[..len])
+            .map_err(|_| message_error("capsule contains an invalid varint"))?;
+        self.buffered.advance(len);
+        Ok(Some(value.into_u64()))
     }
 
     async fn read_exact(&mut self, len: usize) -> Result<Bytes, Error> {
@@ -145,7 +142,7 @@ impl CapsuleReader {
 pub(super) async fn run(
     state: Arc<SessionState>,
     body: ChunkBody,
-    mut writer: Box<dyn transport::SendStream>,
+    mut writer: StreamWriter,
     mut commands: mpsc::Receiver<ControlCommand>,
 ) {
     let mut reader = CapsuleReader::new(body);
@@ -234,10 +231,7 @@ pub(super) async fn run(
     }
 }
 
-async fn send_close(
-    writer: &mut Box<dyn transport::SendStream>,
-    close: &Close,
-) -> Result<(), Error> {
+async fn send_close(writer: &mut StreamWriter, close: &Close) -> Result<(), Error> {
     let mut payload = Vec::with_capacity(4 + close.message.len());
     payload.extend_from_slice(&close.code.to_be_bytes());
     payload.extend_from_slice(close.message.as_bytes());
@@ -245,26 +239,40 @@ async fn send_close(
 }
 
 async fn send_capsule(
-    writer: &mut Box<dyn transport::SendStream>,
+    writer: &mut StreamWriter,
     capsule_type: u64,
     payload: &[u8],
 ) -> Result<(), Error> {
     let mut capsule = Vec::with_capacity(16 + payload.len());
-    wire::encode_varint(capsule_type, &mut capsule)?;
-    wire::encode_varint(payload.len() as u64, &mut capsule)?;
+    capsule.put_varint(&VarInt::try_from(capsule_type).expect("known capsule type"));
+    capsule.put_varint(
+        &VarInt::try_from(payload.len() as u64)
+            .map_err(|_| message_error("capsule payload is too large"))?,
+    );
     capsule.extend_from_slice(payload);
+    let mut frame = Vec::new();
+    wire::WriteFrame::put_frame(
+        &mut frame,
+        &wire::frame::DataFrame {
+            length: capsule.len() as u64,
+        },
+    )?;
+    frame.extend_from_slice(&capsule);
     writer
-        .send(wire::encode_frame(wire::DATA_FRAME_TYPE, &capsule)?)
+        .feed(Bytes::from(frame))
         .await
         .map_err(wire::map_stream_error)
 }
 
-async fn close_writer(writer: &mut Box<dyn transport::SendStream>) -> Result<(), Error> {
+async fn close_writer(writer: &mut StreamWriter) -> Result<(), Error> {
     writer.close().await.map_err(wire::map_stream_error)
 }
 
-fn fail(state: &SessionState, writer: &mut Box<dyn transport::SendStream>, error: Error) {
-    let _ = writer.reset(error.code().unwrap_or(Code::H3_MESSAGE_ERROR));
+fn fail(state: &SessionState, writer: &mut StreamWriter, error: Error) {
+    dquic::prelude::CancelStream::cancel(
+        writer,
+        error.code().unwrap_or(Code::H3_MESSAGE_ERROR).as_u64(),
+    );
     state.terminate(Err(error));
 }
 

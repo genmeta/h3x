@@ -75,11 +75,9 @@ impl RemoteAuthority {
     }
 }
 
+/// The local endpoint authenticated for a connection.
 #[derive(Debug, Clone)]
-pub enum RequestAuthority {
-    Local(Arc<Endpoint>),
-    Peer(RemoteAuthority),
-}
+pub struct LocalAuthority(pub Arc<Endpoint>);
 
 pub(crate) fn invalid(message: impl fmt::Display) -> Error {
     Error::InvalidEndpoint {

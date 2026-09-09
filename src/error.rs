@@ -286,7 +286,7 @@ impl fmt::Display for Error {
             Self::Stream { code, .. } => write!(f, "HTTP/3 stream error: {code}"),
             Self::Goaway { boundary } => write!(f, "peer GOAWAY boundary: {boundary}"),
             Self::Draining => f.write_str("HTTP/3 connection is draining"),
-            Self::Cancelled => f.write_str("HTTP exchange was cancelled"),
+            Self::Cancelled => f.write_str("HTTP request was cancelled"),
             Self::BodyAborted => f.write_str("HTTP upload was dropped without finishing"),
             Self::Capacity => f.write_str("HTTP runtime capacity exhausted"),
             Self::OwnerStopped => f.write_str("HTTP runtime owner stopped"),

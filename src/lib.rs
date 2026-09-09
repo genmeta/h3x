@@ -1,26 +1,24 @@
 #![doc = include_str!("../README.md")]
 
+pub mod client;
 mod endpoint;
 mod error;
 pub mod protocol;
-mod request;
-mod response;
 pub mod runtime;
+pub mod server;
 pub mod transport;
-pub use endpoint::{Endpoint, RemoteAuthority, RequestAuthority};
+pub use endpoint::{Endpoint, LocalAuthority, RemoteAuthority};
 pub use error::{Code, Error};
 #[cfg(feature = "webtransport")]
 pub use protocol::webtransport;
 pub use protocol::{
-    BodyWriter, Chunk, ChunkBody, Connection, Fixed, ResponseSender, Sender, Settings, StreamId,
+    BodyWriter, Chunk, ChunkBody, Connection, Fixed, ResponseSender, Settings, StreamId,
 };
-pub use request::{ChunkRequestFuture, Request, RequestFuture};
-pub use response::{Response, ResponseFuture};
 #[cfg(not(target_arch = "wasm32"))]
 pub use runtime::{Pool, init, shutdown};
 pub type EndpointError = Error;
 pub type PoolError = Error;
-use protocol::{body, connection, platform, qpack, stream_id, wire};
+use protocol::{body, platform, qpack, wire};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -58,13 +56,13 @@ pub mod fuzzing {
     }
 
     pub fn goaway(data: &[u8]) {
-        if let Ok((0x07, payload, consumed)) = crate::wire::decode_frame(data) {
-            let _ = crate::wire::decode_varint(payload)
-                .map(|(_, payload_len)| consumed == data.len() && payload_len == payload.len());
-        }
+        let _ = crate::wire::frame::be_complete_frame(&bytes::Bytes::copy_from_slice(data));
     }
 
     pub fn unidirectional_stream(data: &[u8]) {
-        let _ = crate::wire::decode_varint(data);
+        let _ = qbase::varint::be_varint(data);
     }
 }
+
+#[cfg(any(test, feature = "fuzzing"))]
+mod test_streams;

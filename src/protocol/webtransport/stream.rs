@@ -8,6 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use dquic::prelude::StreamWriter;
 use futures::{Sink, Stream};
 
 use super::{SessionState, application_error_code, map_application_error};
@@ -29,18 +30,18 @@ pub(crate) type BoxWriter = Box<dyn Writer>;
 struct AdaptedWriter<T: transport::webtransport::Connection> {
     id: StreamId,
     transport: Arc<T>,
-    stream: T::SendStream,
+    stream: StreamWriter,
 }
 
 impl<T: transport::webtransport::Connection> Sink<Bytes> for AdaptedWriter<T> {
     type Error = transport::StreamError;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        transport::SendStream::poll_ready(&mut self.stream, cx)
+        Sink::poll_ready(Pin::new(&mut self.stream), cx).map_err(Into::into)
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        transport::SendStream::start_send(&mut self.stream, item)
+        Sink::start_send(Pin::new(&mut self.stream), item).map_err(Into::into)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -48,7 +49,7 @@ impl<T: transport::webtransport::Connection> Sink<Bytes> for AdaptedWriter<T> {
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        transport::SendStream::poll_close(&mut self.stream, cx)
+        Sink::poll_close(Pin::new(&mut self.stream), cx).map_err(Into::into)
     }
 }
 
@@ -63,11 +64,15 @@ impl<T: transport::webtransport::Connection> Writer for AdaptedWriter<T> {
     }
 }
 
-pub(crate) fn adapt_writer<T>(transport: Arc<T>, id: StreamId, stream: T::SendStream) -> BoxWriter
+pub(crate) fn adapt_writer<T>(transport: Arc<T>, id: StreamId, stream: StreamWriter) -> BoxWriter
 where
     T: transport::webtransport::Connection,
 {
-    Box::new(AdaptedWriter { id, transport, stream })
+    Box::new(AdaptedWriter {
+        id,
+        transport,
+        stream,
+    })
 }
 
 pub(crate) trait AbortStream: MaybeSend + MaybeSync {

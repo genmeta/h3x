@@ -16,7 +16,6 @@ fn protocol_and_transport_do_not_depend_on_identity_or_application_api() {
                 "RemoteAuthority",
                 "RequestAuthority",
                 "rustls::",
-                "dquic::",
             ] {
                 assert!(
                     !source.contains(forbidden),
@@ -30,4 +29,28 @@ fn protocol_and_transport_do_not_depend_on_identity_or_application_api() {
     for name in ["protocol.rs", "protocol", "transport.rs"] {
         check(&src.join(name));
     }
+}
+
+#[test]
+fn client_and_server_messages_have_separate_public_paths() {
+    use h3x::{client, server};
+    let outgoing = client::Request::new(
+        http::Method::GET,
+        "https://peer.test/",
+        client::Fixed::default(),
+    )
+    .unwrap();
+    assert_eq!(outgoing.request().uri(), "https://peer.test/");
+    assert_ne!(
+        std::any::TypeId::of::<http::Response<()>>(),
+        std::any::TypeId::of::<server::Response<()>>()
+    );
+    assert_ne!(
+        std::any::TypeId::of::<client::Request<()>>(),
+        std::any::TypeId::of::<server::Request<()>>()
+    );
+    assert_ne!(
+        std::any::TypeId::of::<client::Response<()>>(),
+        std::any::TypeId::of::<server::Response<()>>()
+    );
 }

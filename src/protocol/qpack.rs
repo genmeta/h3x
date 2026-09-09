@@ -4,9 +4,11 @@ use std::sync::{
 };
 
 use bytes::{Buf, Bytes, BytesMut};
+use dquic::prelude::StreamWriter;
 use futures::SinkExt;
 use httlib_huffman::DecoderSpeed;
 use http::HeaderMap;
+use qbase::varint::VARINT_MAX;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 
 #[cfg(test)]
@@ -14,12 +16,7 @@ use super::headers::request_fields;
 use super::headers::{
     regular_fields, request_parts, response_fields, response_parts, trailer_fields,
 };
-use crate::{
-    Code, Error, Settings, StreamId,
-    stream_id::{MAX_VARINT, StreamIdExt as _},
-    transport,
-    wire::ChunkReader,
-};
+use crate::{Code, Error, Settings, StreamId, wire::ChunkReader};
 
 mod decoder;
 mod encoder;
@@ -34,14 +31,12 @@ pub(crate) struct Field {
     pub(crate) value: Bytes,
 }
 
-type BoxSendStream = Box<dyn transport::SendStream>;
-
 const MAX_PENDING_DECODER_INSTRUCTION_BYTES: usize = 64 * 1024;
 const MIN_ENCODER_INSTRUCTION_BUFFER_BYTES: usize = 64;
 
 struct EncoderSide {
     state: encoder::Encoder,
-    stream: BoxSendStream,
+    stream: StreamWriter,
 }
 
 /// Connection-scoped QPACK state shared by every request stream.
@@ -53,11 +48,11 @@ pub(crate) struct Qpack {
     failure: Mutex<Option<Error>>,
     failed: Notify,
     decoder_instructions: Arc<InstructionQueue>,
-    connection_state: Arc<crate::connection::ConnectionState>,
+    fail_connection: Box<dyn Fn(Error) + Send + Sync>,
 }
 
 pub(crate) struct DecoderWriter {
-    stream: BoxSendStream,
+    stream: StreamWriter,
     commands: mpsc::UnboundedReceiver<Bytes>,
     queue: Arc<InstructionQueue>,
 }
@@ -72,9 +67,9 @@ struct InstructionQueue {
 impl Qpack {
     pub(crate) fn new(
         settings: &Settings,
-        encoder_stream: BoxSendStream,
-        decoder_stream: BoxSendStream,
-        connection_state: Arc<crate::connection::ConnectionState>,
+        encoder_stream: StreamWriter,
+        decoder_stream: StreamWriter,
+        fail_connection: Box<dyn Fn(Error) + Send + Sync>,
     ) -> (Arc<Self>, DecoderWriter) {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let queue = Arc::new(InstructionQueue {
@@ -102,7 +97,7 @@ impl Qpack {
             failure: Mutex::new(None),
             failed: Notify::new(),
             decoder_instructions: Arc::clone(&queue),
-            connection_state,
+            fail_connection,
         });
         let writer = DecoderWriter {
             stream: decoder_stream,
@@ -127,14 +122,6 @@ impl Qpack {
         self.fail_on_connection(result)
     }
 
-    pub(crate) async fn encode_fields(
-        &self,
-        stream_id: StreamId,
-        fields: Vec<Field>,
-    ) -> Result<Bytes, Error> {
-        self.encode(stream_id, fields).await
-    }
-
     pub(crate) async fn decode_request(
         &self,
         stream_id: StreamId,
@@ -148,7 +135,7 @@ impl Qpack {
         stream_id: StreamId,
         parts: http::response::Parts,
     ) -> Result<Bytes, Error> {
-        self.encode(
+        self.encode_fields(
             stream_id,
             response_fields(parts).map_err(Error::into_invalid_message)?,
         )
@@ -168,7 +155,7 @@ impl Qpack {
         stream_id: StreamId,
         trailers: HeaderMap,
     ) -> Result<Bytes, Error> {
-        self.encode(
+        self.encode_fields(
             stream_id,
             regular_fields(trailers).map_err(Error::into_invalid_message)?,
         )
@@ -191,7 +178,7 @@ impl Qpack {
             .cancel(stream_id);
         if should_send
             && let Err(error) = self.decoder_instructions.enqueue(
-                instruction::DecoderInstruction::StreamCancellation(stream_id.as_u64()),
+                instruction::DecoderInstruction::StreamCancellation(u64::from(stream_id)),
             )
         {
             let _ = self.fail_on_connection::<()>(Err(error));
@@ -281,7 +268,11 @@ impl Qpack {
             .clone()
     }
 
-    async fn encode(&self, stream_id: StreamId, fields: Vec<Field>) -> Result<Bytes, Error> {
+    pub(crate) async fn encode_fields(
+        &self,
+        stream_id: StreamId,
+        fields: Vec<Field>,
+    ) -> Result<Bytes, Error> {
         let result = async {
             let mut encoder = self.encoder.lock().await;
             let encoded = encoder.state.encode(stream_id, fields)?;
@@ -317,9 +308,9 @@ impl Qpack {
                 } => {
                     if used_dynamic_table
                         && let Err(error) = self.decoder_instructions.enqueue(
-                            instruction::DecoderInstruction::SectionAcknowledgement(
-                                stream_id.as_u64(),
-                            ),
+                            instruction::DecoderInstruction::SectionAcknowledgement(u64::from(
+                                stream_id,
+                            )),
                         )
                     {
                         return self.fail_on_connection(Err(error));
@@ -336,12 +327,12 @@ impl Qpack {
         }
     }
 
-    fn fail_on_connection<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
+    pub(super) fn fail_on_connection<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
         if let Err(error) = &result
             && error.is_connection()
         {
             self.fail(error.clone());
-            self.connection_state.terminate(error.clone());
+            (self.fail_connection)(error.clone());
         }
         result
     }
@@ -420,11 +411,12 @@ impl InstructionQueue {
 }
 
 async fn send_critical(
-    stream: &mut BoxSendStream,
+    stream: &mut StreamWriter,
     bytes: Bytes,
     name: &'static str,
 ) -> Result<(), Error> {
-    stream.send(bytes).await.map_err(|error| {
+    stream.feed(bytes).await.map_err(|error| {
+        let error = crate::transport::StreamError::from(error);
         if error.is_connection() {
             Error::connection(
                 error.code(),
@@ -580,7 +572,7 @@ pub(super) fn encode_prefixed_integer(
     high_bits: u8,
     output: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    if value > MAX_VARINT {
+    if value > VARINT_MAX {
         return Err(qpack_error("QPACK integer exceeds 62 bits"));
     }
     let limit = (1u64 << prefix_bits) - 1;
@@ -623,7 +615,7 @@ pub(crate) fn decode_prefixed_integer(
         value = value
             .checked_add(term)
             .ok_or_else(|| qpack_error("QPACK integer overflow"))?;
-        if value > MAX_VARINT {
+        if value > VARINT_MAX {
             return Err(qpack_error("QPACK integer exceeds 62 bits"));
         }
         if byte & 0x80 == 0 {
@@ -687,88 +679,11 @@ pub(super) fn qpack_error(message: impl Into<std::borrow::Cow<'static, str>>) ->
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        pin::Pin,
-        task::{Context, Poll},
-        time::Duration,
-    };
+    use std::time::Duration;
 
-    use futures::{Sink, Stream};
     use http::{HeaderValue, Method, StatusCode, Version, header::CONNECTION};
 
     use super::*;
-
-    struct TestSendStream;
-
-    struct TestRecvStream(Option<Bytes>);
-
-    impl Stream for TestRecvStream {
-        type Item = Result<Bytes, transport::StreamError>;
-
-        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Poll::Ready(self.0.take().map(Ok))
-        }
-    }
-
-    impl transport::RecvStream for TestRecvStream {
-        fn poll_next(
-            &mut self,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Bytes, transport::StreamError>>> {
-            Stream::poll_next(Pin::new(self), cx)
-        }
-
-        fn stop(&mut self, _code: Code) -> Result<(), transport::StreamError> {
-            Ok(())
-        }
-    }
-
-    impl Sink<Bytes> for TestSendStream {
-        type Error = transport::StreamError;
-
-        fn poll_ready(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn start_send(self: Pin<&mut Self>, _item: Bytes) -> Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    impl transport::SendStream for TestSendStream {
-        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), transport::StreamError>> {
-            Sink::poll_ready(Pin::new(self), cx)
-        }
-
-        fn start_send(&mut self, item: Bytes) -> Result<(), transport::StreamError> {
-            Sink::start_send(Pin::new(self), item)
-        }
-
-        fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), transport::StreamError>> {
-            Sink::poll_close(Pin::new(self), cx)
-        }
-
-        fn reset(&mut self, _code: Code) -> Result<(), transport::StreamError> {
-            Ok(())
-        }
-    }
 
     #[test]
     fn request_round_trip_preserves_pseudo_headers_and_repeated_fields() {
@@ -859,15 +774,18 @@ mod tests {
         settings.set_qpack_blocked_streams(1);
         let (qpack, _writer) = Qpack::new(
             &settings,
-            Box::new(TestSendStream),
-            Box::new(TestSendStream),
-            Arc::new(crate::connection::ConnectionState::new()),
+            crate::test_streams::writer(),
+            crate::test_streams::writer(),
+            Box::new(|_| {}),
         );
         let blocked = {
             let qpack = Arc::clone(&qpack);
             tokio::spawn(async move {
                 qpack
-                    .decode(crate::stream_id::from_u64_unchecked(0), &[2, 0, 0x80])
+                    .decode(
+                        crate::StreamId::from(qbase::varint::VarInt::from_u32(0)),
+                        &[2, 0, 0x80],
+                    )
                     .await
             })
         };
@@ -890,25 +808,33 @@ mod tests {
     #[tokio::test]
     async fn incomplete_encoder_instruction_is_bounded_by_table_capacity() {
         let settings = Settings::default();
+        let failure = Arc::new(Mutex::new(None));
+        let reported = failure.clone();
         let (qpack, _writer) = Qpack::new(
             &settings,
-            Box::new(TestSendStream),
-            Box::new(TestSendStream),
-            Arc::new(crate::connection::ConnectionState::new()),
+            crate::test_streams::writer(),
+            crate::test_streams::writer(),
+            Box::new(move |error| {
+                *reported.lock().unwrap() = Some(error);
+            }),
         );
         let mut instruction = vec![0x5f, 69];
         instruction.extend(std::iter::repeat_n(0, 63));
 
         let error = qpack
             .handle_encoder_stream(ChunkReader::new(
-                crate::stream_id::from_u64_unchecked(6),
-                TestRecvStream(Some(Bytes::from(instruction))),
+                crate::StreamId::from(qbase::varint::VarInt::from_u32(6)),
+                crate::test_streams::reader([Ok(Bytes::from(instruction))]),
             ))
             .await
             .expect_err("an incomplete instruction cannot grow without a bound");
 
         assert!(matches!(&error, Error::Connection { .. }));
         assert_eq!(error.code(), Some(Code::QPACK_ENCODER_STREAM_ERROR));
+        assert_eq!(
+            failure.lock().unwrap().as_ref().and_then(Error::code),
+            error.code()
+        );
     }
 
     #[test]

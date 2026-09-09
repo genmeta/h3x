@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn blocked_field_section_resolves_after_the_encoder_instruction() {
-        let stream_id = crate::stream_id::from_u64_unchecked(0);
+        let stream_id = crate::StreamId::from(qbase::varint::VarInt::from_u32(0));
         let encoded = [2, 0, 0x80];
         let mut decoder = Decoder::new(256, 1, None);
         decoder.apply(EncoderInstruction::SetCapacity(256)).unwrap();
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn post_base_reference_decodes() {
-        let stream_id = crate::stream_id::from_u64_unchecked(0);
+        let stream_id = crate::StreamId::from(qbase::varint::VarInt::from_u32(0));
         let mut decoder = Decoder::new(256, 1, None);
         decoder.apply(EncoderInstruction::SetCapacity(256)).unwrap();
         decoder.apply(insert(b"x-test", b"value")).unwrap();
@@ -441,7 +441,7 @@ mod tests {
 
         let Decode::Ready { fields, .. } = decoder
             .decode(
-                crate::stream_id::from_u64_unchecked(4),
+                crate::StreamId::from(qbase::varint::VarInt::from_u32(4)),
                 &[0x03, 0x81, 0x10, 0x11],
             )
             .unwrap()
@@ -469,12 +469,18 @@ mod tests {
         decoder.apply(EncoderInstruction::SetCapacity(256)).unwrap();
         assert!(matches!(
             decoder
-                .decode(crate::stream_id::from_u64_unchecked(0), &[2, 0, 0x80])
+                .decode(
+                    crate::StreamId::from(qbase::varint::VarInt::from_u32(0)),
+                    &[2, 0, 0x80]
+                )
                 .unwrap(),
             Decode::Blocked
         ));
         let error = decoder
-            .decode(crate::stream_id::from_u64_unchecked(4), &[2, 0, 0x80])
+            .decode(
+                crate::StreamId::from(qbase::varint::VarInt::from_u32(4)),
+                &[2, 0, 0x80],
+            )
             .unwrap_err();
         assert!(matches!(&error, crate::Error::Connection { .. }));
         assert_eq!(error.code(), Some(Code::QPACK_DECOMPRESSION_FAILED));

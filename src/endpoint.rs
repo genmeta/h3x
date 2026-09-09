@@ -6,10 +6,11 @@ use rustls::{
     sign::CertifiedKey,
 };
 
-pub use crate::runtime::identity::{RemoteAuthority, RequestAuthority};
-use crate::{Chunk, Error, Fixed, Request, platform::MaybeSend, runtime::identity};
+pub use crate::runtime::identity::{LocalAuthority, RemoteAuthority};
+use crate::{Chunk, Error, Fixed, client::Request, platform::MaybeSend, runtime::identity};
 
 /// A local name and immutable certificate/key/OCSP material for this process.
+/// 移动到 dquic，在这里实现 http trait
 pub struct Endpoint {
     name: String,
     certificate: Arc<CertifiedKey>,
@@ -71,10 +72,10 @@ impl rustls::client::ResolvesClientCert for Endpoint {
 }
 
 impl Endpoint {
-    /// Registers a service for this identity. Axum routers can be passed directly.
+    /// Registers a service receiving server::Request with connection identity.
     pub async fn listen<S, B>(self: &Arc<Self>, service: S) -> Result<(), Error>
     where
-        S: tower_service::Service<http::Request<crate::ChunkBody>, Response = http::Response<B>>
+        S: tower_service::Service<crate::server::Request, Response = crate::server::Response<B>>
             + MaybeSend
             + 'static,
         S::Future: MaybeSend + 'static,
@@ -99,7 +100,8 @@ impl Endpoint {
 macro_rules! methods {
     ($($name:ident: $method:ident),* $(,)?) => { impl Endpoint { $(
         pub fn $name(self: &Arc<Self>, url: &str) -> Result<Request<Fixed>, Error> {
-            Request::new(self.clone(), http::Method::$method, url, Fixed::default())
+            Request::new(http::Method::$method, url, Fixed::default())
+                .map(|request| request.with_identity(self.clone()))
         }
     )* } };
 }
@@ -108,10 +110,12 @@ options: OPTIONS, trace: TRACE, connect: CONNECT }
 
 impl Endpoint {
     pub fn streaming_post(self: &Arc<Self>, url: &str) -> Result<Request<Chunk>, Error> {
-        Request::new(self.clone(), http::Method::POST, url, Chunk)
+        Request::new(http::Method::POST, url, Chunk)
+            .map(|request| request.with_identity(self.clone()))
     }
 
     pub fn streaming_put(self: &Arc<Self>, url: &str) -> Result<Request<Chunk>, Error> {
-        Request::new(self.clone(), http::Method::PUT, url, Chunk)
+        Request::new(http::Method::PUT, url, Chunk)
+            .map(|request| request.with_identity(self.clone()))
     }
 }

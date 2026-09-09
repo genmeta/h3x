@@ -12,7 +12,7 @@ use std::{
 use bytes::Bytes;
 use futures::FutureExt;
 use h3x::{
-    Endpoint, Error, Pool, PoolConfig, RemoteAuthority, RequestAuthority,
+    Endpoint, Error, Pool, PoolConfig, RemoteAuthority,
     transport::{Backend, PendingTransport},
 };
 use http_body_util::BodyExt;
@@ -143,10 +143,7 @@ async fn scenario() {
             }),
         )
         .fallback(|request: axum::extract::Request| async move {
-            assert!(matches!(
-                request.extensions().get::<RequestAuthority>(),
-                Some(RequestAuthority::Peer(_))
-            ));
+            assert!(request.extensions().get::<RemoteAuthority>().is_some());
             http::Response::new(request.into_body())
         });
     alice.listen(service.clone()).await.unwrap();
@@ -162,7 +159,7 @@ async fn scenario() {
         .unwrap()
         .header("bad\nname", "x");
     assert_eq!(connections.load(Ordering::Relaxed), 0);
-    assert!(matches!(invalid.await, Err(Error::InvalidMessage { .. })));
+    assert!(matches!(invalid, Err(Error::InvalidMessage { .. })));
     assert_eq!(connections.load(Ordering::Relaxed), 0);
 
     // Both waiters leave; the shared dial remains available to the next request.
@@ -180,7 +177,7 @@ async fn scenario() {
         .unwrap()
         .await
         .unwrap();
-    assert_eq!(response.authority().unwrap().name(), bob.name());
+    assert_eq!(response.authority().name(), bob.name());
     assert!(
         response
             .into_body()
@@ -228,7 +225,7 @@ async fn scenario() {
         .unwrap()
         .await
         .unwrap();
-    assert_eq!(reverse.authority().unwrap().name(), alice.name());
+    assert_eq!(reverse.authority().name(), alice.name());
     reverse.into_body().collect().await.unwrap();
     assert_eq!(connections.load(Ordering::Relaxed), 1);
 

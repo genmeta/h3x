@@ -18,16 +18,16 @@ use std::{
 };
 
 use bytes::Bytes;
+use dquic::prelude::StreamWriter;
 use futures::SinkExt;
 use http::{Method, Request, Response as HttpResponse};
+use qbase::varint::{VARINT_MAX, VarInt, WriteVarInt, be_varint};
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 
 use crate::{
     ChunkBody, Code, Error, ResponseSender, Settings, StreamId,
     platform::{BoxFuture, MaybeSend, MaybeSync},
-    stream_id::{MAX_VARINT, StreamIdExt as _},
-    transport,
-    wire,
+    transport, wire,
 };
 
 mod capsule;
@@ -148,7 +148,7 @@ impl<T: transport::webtransport::Connection> Driver for DriverImpl<T> {
         let transport = Arc::clone(&self.transport);
         Box::pin(async move {
             let (id, (reader, writer)) = transport.open_bi().await.map_err(map_connection_error)?;
-            if id.as_u64() & 0x02 != 0 {
+            if u64::from(id) & 0x02 != 0 {
                 return Err(Error::connection_protocol(
                     Code::H3_ID_ERROR,
                     "transport returned an invalid WebTransport bidirectional stream pair",
@@ -165,7 +165,7 @@ impl<T: transport::webtransport::Connection> Driver for DriverImpl<T> {
         let transport = Arc::clone(&self.transport);
         Box::pin(async move {
             let (id, writer) = transport.open_uni().await.map_err(map_connection_error)?;
-            if id.as_u64() & 0x02 == 0 {
+            if u64::from(id) & 0x02 == 0 {
                 return Err(Error::connection_protocol(
                     Code::H3_STREAM_CREATION_ERROR,
                     "transport returned a bidirectional stream from WebTransport open_uni",
@@ -237,7 +237,7 @@ pub(crate) fn configure<T>(
     transport: Arc<T>,
     config: Config,
     tasks: TaskList,
-) -> Result<Hooks<T::SendStream>, Error>
+) -> Result<Hooks<StreamWriter>, Error>
 where
     T: transport::webtransport::Connection,
 {
@@ -258,7 +258,8 @@ where
         transport: Arc::clone(&transport),
     });
     let runtime = Arc::new(Runtime::new(driver, config, tasks));
-    let wrap_writer = Arc::new(move |id, writer| stream::adapt_writer(Arc::clone(&transport), id, writer));
+    let wrap_writer =
+        Arc::new(move |id, writer| stream::adapt_writer(Arc::clone(&transport), id, writer));
     Ok(Hooks {
         runtime,
         wrap_writer,
@@ -569,20 +570,23 @@ impl Runtime {
     pub(crate) async fn run_datagrams(&self) -> Result<(), Error> {
         loop {
             let datagram = self.driver.receive_datagram().await?;
-            let (quarter_id, consumed) = wire::decode_varint(&datagram).map_err(|source| {
-                Error::connection(
-                    Some(Code::H3_DATAGRAM_ERROR),
+            let (remaining, quarter_id) = be_varint(&datagram).map_err(|_| {
+                Error::connection_protocol(
+                    Code::H3_DATAGRAM_ERROR,
                     "HTTP/3 datagram is missing a valid Quarter Stream ID",
-                    source,
                 )
             })?;
-            if quarter_id > MAX_VARINT / 4 {
+            let consumed = datagram.len() - remaining.len();
+            let quarter_id = quarter_id.into_u64();
+            if quarter_id > VARINT_MAX / 4 {
                 return Err(Error::connection_protocol(
                     Code::H3_DATAGRAM_ERROR,
                     "HTTP/3 datagram Quarter Stream ID is too large",
                 ));
             }
-            let id = crate::stream_id::try_from_u64(quarter_id * 4)?;
+            let id = VarInt::try_from(quarter_id * 4)
+                .map(StreamId::from)
+                .map_err(|_| Error::invalid_stream_id(quarter_id * 4))?;
             if let Ok(session) = self.session_for(id) {
                 let _ = session.datagram_tx.try_send(datagram.slice(consumed..));
             }
@@ -755,11 +759,7 @@ pub(crate) struct PendingSession {
 }
 
 impl PendingSession {
-    pub(crate) fn start(
-        mut self,
-        body: ChunkBody,
-        writer: Box<dyn transport::SendStream>,
-    ) -> Session {
+    pub(crate) fn start(mut self, body: ChunkBody, writer: StreamWriter) -> Session {
         let prepared = self
             .prepared
             .take()
@@ -815,8 +815,9 @@ impl Session {
 
     pub fn max_datagram_size(&self) -> usize {
         let mut prefix = Vec::with_capacity(8);
-        wire::encode_varint(self.id().as_u64() / 4, &mut prefix)
-            .expect("a valid session ID has a valid Quarter Stream ID");
+        prefix.put_varint(
+            &VarInt::try_from(u64::from(self.id()) / 4).expect("valid Quarter Stream ID"),
+        );
         self.state
             .driver
             .max_datagram_size()
@@ -838,7 +839,7 @@ impl Session {
         self.state.check_open()?;
         let mut writer = self.state.driver.open_uni().await?;
         let reliable_size =
-            write_stream_header(&mut writer, wire::WEBTRANSPORT_UNI_STREAM_TYPE, self.id()).await?;
+            write_stream_header(&mut writer, u64::from(wire::StreamType::WebTransport), self.id()).await?;
         let send = SendStream::new(writer, reliable_size, &self.state);
         self.state.check_open()?;
         Ok(send)
@@ -869,7 +870,9 @@ impl Session {
     pub async fn send_datagram(&self, payload: Bytes) -> Result<(), Error> {
         self.state.check_open()?;
         let mut datagram = Vec::with_capacity(8 + payload.len());
-        wire::encode_varint(self.id().as_u64() / 4, &mut datagram)?;
+        datagram.put_varint(
+            &VarInt::try_from(u64::from(self.id()) / 4).expect("valid Quarter Stream ID"),
+        );
         datagram.extend_from_slice(&payload);
         if datagram.len() > self.state.driver.max_datagram_size() {
             return Err(Error::stream(
@@ -1015,11 +1018,7 @@ pub async fn accept(
     Ok(pending.start(body, writer))
 }
 
-fn start_control(
-    prepared: PreparedSession,
-    body: ChunkBody,
-    writer: Box<dyn transport::SendStream>,
-) {
+fn start_control(prepared: PreparedSession, body: ChunkBody, writer: StreamWriter) {
     let PreparedSession {
         session,
         command_rx,
@@ -1042,10 +1041,10 @@ async fn write_stream_header(
     session_id: StreamId,
 ) -> Result<u64, Error> {
     let mut header = Vec::with_capacity(16);
-    wire::encode_varint(discriminator, &mut header)?;
-    wire::encode_varint(session_id.as_u64(), &mut header)?;
+    header.put_varint(&VarInt::try_from(discriminator).expect("known WebTransport stream type"));
+    header.put_varint(&VarInt::try_from(u64::from(session_id)).expect("valid session ID"));
     let reliable_size = header.len() as u64;
-    if let Err(source) = writer.send(Bytes::from(header)).await {
+    if let Err(source) = writer.feed(Bytes::from(header)).await {
         let error = map_data_stream_error(source);
         let _ = writer.reset_at(error.code().unwrap_or(Code::WT_SESSION_GONE), reliable_size);
         return Err(error);
@@ -1063,7 +1062,7 @@ fn reject_uni(mut reader: wire::ChunkReader, code: Code) {
 }
 
 fn validate_session_id(id: StreamId) -> Result<(), Error> {
-    if id.as_u64() & 0x03 == 0 {
+    if u64::from(id) & 0x03 == 0 {
         Ok(())
     } else {
         Err(invalid_session_id_error(id))
@@ -1075,7 +1074,7 @@ fn invalid_session_id_error(id: StreamId) -> Error {
         Code::H3_ID_ERROR,
         format!(
             "WebTransport session ID {} is not client-initiated bidi",
-            id.as_u64()
+            u64::from(id)
         ),
     )
 }
