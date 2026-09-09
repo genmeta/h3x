@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version,
-    header::{CONNECTION, HOST, TE, TRANSFER_ENCODING, UPGRADE},
+    header::{CONNECTION, COOKIE, HOST, TE, TRANSFER_ENCODING, UPGRADE},
 };
 
 use super::qpack::Field;
@@ -180,6 +180,19 @@ fn parse_fields(fields: Vec<Field>) -> Result<ParsedFields, Error> {
             .map_err(message_source("invalid HTTP field value"))?;
         validate_regular_field(&name, &value)?;
         headers.append(name, value);
+    }
+    // RFC 9114 §4.2.1: generic HTTP applications receive one Cookie field.
+    if headers.get_all(COOKIE).iter().nth(1).is_some() {
+        let cookies = headers
+            .get_all(COOKIE)
+            .iter()
+            .map(HeaderValue::as_bytes)
+            .collect::<Vec<_>>()
+            .join(b"; ".as_slice());
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_bytes(&cookies).map_err(message_source("invalid Cookie field"))?,
+        );
     }
     Ok(ParsedFields { pseudo, headers })
 }
@@ -431,6 +444,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_cookies_are_combined_for_http_applications() {
+        let fields = [
+            ("cookie", "session=abc"),
+            ("set-cookie", "one=1"),
+            ("cookie", "theme=dark; lang=zh"),
+            ("set-cookie", "two=2"),
+            ("cookie", "last=3"),
+        ]
+        .into_iter()
+        .map(|(name, value)| Field {
+            name: Bytes::from_static(name.as_bytes()),
+            value: Bytes::from_static(value.as_bytes()),
+        })
+        .collect();
+        let parsed = parse_fields(fields).unwrap();
+        assert_eq!(
+            parsed.headers[http::header::COOKIE],
+            "session=abc; theme=dark; lang=zh; last=3"
+        );
+        assert_eq!(
+            parsed.headers.get_all(http::header::COOKIE).iter().count(),
+            1
+        );
+        assert_eq!(
+            parsed
+                .headers
+                .get_all(http::header::SET_COOKIE)
+                .iter()
+                .count(),
+            2
+        );
+    }
 
     #[test]
     fn rejects_invalid_raw_field_names_and_contextual_pseudo_headers() {

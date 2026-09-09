@@ -24,6 +24,14 @@ async fn request_response_body_and_stream_id_round_trip() {
             Some(&accepted_id)
         );
         assert_eq!(request.uri(), "https://example.test/echo");
+        assert_eq!(
+            request.headers()[http::header::COOKIE],
+            "session=abc; theme=dark"
+        );
+        assert_eq!(
+            request.headers().get_all(http::header::COOKIE).iter().count(),
+            1
+        );
         let body = request.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from_static(b"ping"));
 
@@ -43,6 +51,8 @@ async fn request_response_body_and_stream_id_round_trip() {
         .method("POST")
         .uri("https://example.test/echo")
         .header("content-length", "4")
+        .header("cookie", "session=abc")
+        .header("cookie", "theme=dark")
         .body(Bytes::from_static(b"ping"))
         .unwrap()
         .into_parts();
