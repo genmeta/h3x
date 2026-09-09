@@ -31,6 +31,9 @@ pub(crate) struct Streams {
 }
 impl Streams {
     pub(crate) fn new() -> Self {
+        Self::with_uni_credit(1 << 20)
+    }
+    pub(crate) fn with_uni_credit(credit: u64) -> Self {
         let mut client = client_parameters();
         client
             .set(
@@ -38,7 +41,13 @@ impl Streams {
                 VarInt::try_from(qbase::varint::VARINT_MAX).unwrap(),
             )
             .unwrap();
-        let server = server_parameters();
+        let mut server = server_parameters();
+        server
+            .set(
+                qbase::param::ParameterId::InitialMaxStreamDataUni,
+                VarInt::try_from(credit).unwrap(),
+            )
+            .unwrap();
         let controls = ArcReliableFrameDeque::with_capacity_and_wakers(16, Default::default());
         Self {
             data: DataStreams::new(

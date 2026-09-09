@@ -18,9 +18,9 @@ impl<T: transport::Connection> Connection<T> {
     ) -> impl Future<Output = Result<Option<(http::Request<ChunkBody>, ResponseSender)>, Error>>
     + Send
     + 'static {
-        let inner = self.inner.clone();
+        let inner = self.inner().clone();
         let mut reader = ChunkReader::new(id, recv);
-        let mut writer = ResetOnDrop::new(send);
+        let mut writer = BodyWriter::new(send, inner.qpack.clone(), id, MessageBody::Unknown);
         async move {
             let _admission = {
                 let goaway = inner.goaway.lock().unwrap();
@@ -32,7 +32,7 @@ impl<T: transport::Connection> Connection<T> {
                     reader.stop(Code::H3_REQUEST_REJECTED);
                     return Err(Error::request_rejected("connection draining"));
                 }
-                inner.drain.track()
+                inner.drain.guard()
             };
             let work = async {
                 let Some(first) = reader.read_varint().await? else {
@@ -51,10 +51,10 @@ impl<T: transport::Connection> Connection<T> {
                     return Ok(None);
                 }
                 let mut reader = MessageReader::new(reader, inner.qpack.clone(), id);
-                let reading = inner.drain.track();
-                let writing = inner.drain.track();
+                let reading = inner.drain.guard();
+                let writing = inner.drain.guard();
                 reader.on_finish(move || drop(reading));
-                writer.on_finish(move || drop(writing));
+                writer.writing = Some(writing);
                 let (parts, message_body) = reader.request(first).await?;
                 // Delivery and GOAWAY share the lock: either this request is included
                 // in the drain boundary, or it is rejected before reaching the service.
@@ -100,7 +100,7 @@ impl<T: transport::Connection> Connection<T> {
 pub struct ResponseSender {
     pub(super) stream_id: StreamId,
     pub(super) method: http::Method,
-    pub(super) writer: ResetOnDrop,
+    pub(super) writer: BodyWriter,
     pub(super) qpack: Arc<qpack::Qpack>,
     pub(super) terminal: watch::Sender<Option<Error>>,
 }
@@ -136,7 +136,7 @@ impl ResponseSender {
             error = stopped(&self.terminal) => Err(error),
             result = async {
                 let encoded = self.qpack.encode_fields(self.stream_id, fields).await?;
-                write_frame(self.writer.writer(), wire::FrameType::Headers, encoded).await?;
+                write_frame(self.writer.stream(), wire::FrameType::Headers, encoded).await?;
                 send_body(&mut self.writer, &mut body, message_body, &self.qpack, self.stream_id).await
             } => result,
         };

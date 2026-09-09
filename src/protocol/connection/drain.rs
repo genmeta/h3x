@@ -12,18 +12,19 @@ pub(super) struct Drain {
     finished: Notify,
 }
 
+pub(in crate::protocol) struct Guard(Arc<Drain>);
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.finished.notify_one();
+        }
+    }
+}
+
 impl Drain {
     // Admission is checked under the GOAWAY lock before acquiring a guard.
     // Transfers acquire the next guard before releasing the previous one.
-    pub(super) fn track(self: &Arc<Self>) -> impl Drop + Send + 'static {
-        struct Guard(Arc<Drain>);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    self.0.finished.notify_one();
-                }
-            }
-        }
+    pub(in crate::protocol) fn guard(self: &Arc<Self>) -> Guard {
         self.active.fetch_add(1, Ordering::Relaxed);
         Guard(self.clone())
     }

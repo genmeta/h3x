@@ -109,20 +109,33 @@ impl Qpack {
     pub(crate) async fn apply_peer_settings(&self, settings: &Settings) -> Result<(), Error> {
         let work = async {
             let mut encoder = self.encoder.lock().await;
-            let instruction = encoder
-                .state
-                .configure(settings.qpack_max_table_capacity())?;
-            if !instruction.is_empty() {
-                send_critical(&mut encoder.stream, instruction, "QPACK encoder").await?;
+            if let Some(error) = self.failure() {
+                return Err(error);
             }
-            Ok(())
+            let result = async {
+                futures::future::poll_fn(|cx| encoder.stream.poll_ready(cx))
+                    .await
+                    .map_err(|error| critical_error(error.into(), "QPACK encoder"))?;
+                let instruction = encoder
+                    .state
+                    .configure(settings.qpack_max_table_capacity())?;
+                if !instruction.is_empty() {
+                    encoder
+                        .stream
+                        .write(instruction)
+                        .map_err(|error| critical_error(error.into(), "QPACK encoder"))?;
+                }
+                Ok(())
+            }
+            .await;
+            // Publish failure before another request can acquire the encoder.
+            self.terminate_on_connection_error(result)
         };
-        let result = tokio::select! {
+        tokio::select! {
             biased;
             error = self.stopped() => Err(error),
             result = work => result,
-        };
-        self.terminate_on_connection_error(result)
+        }
     }
 
     pub(crate) fn cancel_stream(&self, stream_id: StreamId) {
@@ -226,18 +239,32 @@ impl Qpack {
     ) -> Result<Bytes, Error> {
         let work = async {
             let mut encoder = self.encoder.lock().await;
-            let encoded = encoder.state.encode(stream_id, fields)?;
-            if !encoded.instructions.is_empty() {
-                send_critical(&mut encoder.stream, encoded.instructions, "QPACK encoder").await?;
+            if let Some(error) = self.failure() {
+                return Err(error);
             }
-            Ok(encoded.field_section)
+            let result = async {
+                futures::future::poll_fn(|cx| encoder.stream.poll_ready(cx))
+                    .await
+                    .map_err(|error| critical_error(error.into(), "QPACK encoder"))?;
+                // No suspension between changing shared state and transport ownership.
+                let encoded = encoder.state.encode(stream_id, fields)?;
+                if !encoded.instructions.is_empty() {
+                    encoder
+                        .stream
+                        .write(encoded.instructions)
+                        .map_err(|error| critical_error(error.into(), "QPACK encoder"))?;
+                }
+                Ok(encoded.field_section)
+            }
+            .await;
+            // Publish failure before another request can acquire the encoder.
+            self.terminate_on_connection_error(result)
         };
-        let result = tokio::select! {
+        tokio::select! {
             biased;
             error = self.stopped() => Err(error),
             result = work => result,
-        };
-        self.terminate_on_connection_error(result)
+        }
     }
 
     pub(crate) async fn decode_fields(
@@ -352,22 +379,26 @@ async fn send_critical(
     bytes: Bytes,
     name: &'static str,
 ) -> Result<(), Error> {
-    stream.feed(bytes).await.map_err(|error| {
-        let error = crate::transport::StreamError::from(error);
-        if error.is_connection() {
-            Error::connection(
-                error.code(),
-                format!("connection failed while writing the {name} stream"),
-                error,
-            )
-        } else {
-            Error::connection(
-                Some(Code::H3_CLOSED_CRITICAL_STREAM),
-                format!("{name} stream was reset"),
-                error,
-            )
-        }
-    })
+    stream
+        .feed(bytes)
+        .await
+        .map_err(|error| critical_error(error.into(), name))
+}
+
+fn critical_error(error: crate::transport::StreamError, name: &'static str) -> Error {
+    if error.is_connection() {
+        Error::connection(
+            error.code(),
+            format!("connection failed while writing the {name} stream"),
+            error,
+        )
+    } else {
+        Error::connection(
+            Some(Code::H3_CLOSED_CRITICAL_STREAM),
+            format!("{name} stream was reset"),
+            error,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -622,6 +653,131 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn cancelled_encoder_backpressure_preserves_peer_table() {
+        use crate::protocol::test_streams::Streams;
+        let streams = Streams::with_uni_credit(3);
+        let (encoder_id, encoder_stream) = streams.writer();
+        let (_, decoder_stream) = streams.writer();
+        let (terminal, receiver) = watch::channel(None);
+        let owner = Arc::new(std::sync::OnceLock::<std::sync::Weak<Qpack>>::new());
+        let on_failure = owner.clone();
+        let mut settings = Settings::default();
+        settings.set_qpack_max_table_capacity(4096);
+        let (qpack, _writer) = Qpack::new(
+            &settings,
+            encoder_stream,
+            decoder_stream,
+            receiver,
+            Box::new(move |error| {
+                let qpack = on_failure.get().unwrap().upgrade().unwrap();
+                assert!(
+                    qpack.encoder.try_lock().is_err(),
+                    "failure must be published before unlocking shared state"
+                );
+                terminal.send_replace(Some(error));
+            }),
+        );
+        owner.set(Arc::downgrade(&qpack)).unwrap();
+        // Valid instructions fill the native send buffer without changing table contents.
+        let capacity =
+            instruction::encode_encoder(&instruction::EncoderInstruction::SetCapacity(4096))
+                .unwrap();
+        qpack
+            .encoder
+            .lock()
+            .await
+            .stream
+            .write(capacity.clone())
+            .unwrap();
+        let mut configure = Box::pin(qpack.apply_peer_settings(&settings));
+        assert!(futures::poll!(configure.as_mut()).is_pending());
+        drop(configure);
+        let credit = |value| {
+            streams
+                .data
+                .recv_stream_control(
+                    qbase::frame::MaxStreamDataFrame::new(
+                        encoder_id,
+                        qbase::varint::VarInt::from_u32(value),
+                    )
+                    .into(),
+                )
+                .unwrap()
+        };
+        credit(6);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            streams.drive(qpack.apply_peer_settings(&settings)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let field = |value| {
+            vec![Field {
+                name: Bytes::from_static(b"x-review"),
+                value: Bytes::from_static(value),
+            }]
+        };
+        let id = |value| StreamId::from(qbase::varint::VarInt::from_u32(value));
+        let mut cancelled = Box::pin(qpack.encode_fields(id(0), field(b"one")));
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        drop(cancelled);
+        credit(1024);
+        let encoded = tokio::time::timeout(
+            Duration::from_secs(2),
+            streams.drive(qpack.encode_fields(id(4), field(b"two"))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        while !streams.drain().0.is_empty() {}
+        let mut peer = decoder::Decoder::new(4096, 0, None);
+        let mut bytes = BytesMut::new();
+        for (frame, data) in streams.sent.lock().unwrap().iter() {
+            if frame.stream_id() == encoder_id {
+                bytes.extend_from_slice(data);
+            }
+        }
+        while !bytes.is_empty() {
+            let (command, consumed) = instruction::decode_encoder(&bytes).unwrap().unwrap();
+            peer.apply(command).unwrap();
+            bytes.advance(consumed);
+        }
+        assert!(
+            matches!(peer.decode(id(4), &encoded).unwrap(), decoder::Decode::Ready { fields, .. } if fields == field(b"two"))
+        );
+        qpack
+            .encoder
+            .lock()
+            .await
+            .state
+            .apply(instruction::DecoderInstruction::InsertCountIncrement(1))
+            .unwrap();
+        let encoded = qpack.encode_fields(id(8), field(b"two")).await.unwrap();
+        assert!(
+            matches!(peer.decode(id(8), &encoded).unwrap(), decoder::Decode::Ready { fields, used_dynamic_table: true } if fields == field(b"two"))
+        );
+        dquic::prelude::CancelStream::cancel(
+            &mut qpack.encoder.lock().await.stream,
+            Code::H3_REQUEST_CANCELLED.as_u64(),
+        );
+        let error = qpack
+            .encode_fields(id(12), field(b"three"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some(Code::H3_CLOSED_CRITICAL_STREAM));
+        assert_eq!(qpack.failure().unwrap().code(), error.code());
+        assert_eq!(
+            qpack
+                .encode_fields(id(16), Vec::new())
+                .await
+                .unwrap_err()
+                .code(),
+            error.code()
+        );
+    }
+
     #[test]
     fn request_round_trip_preserves_pseudo_headers_and_repeated_fields() {
         let mut request = http::Request::builder()
@@ -712,8 +868,8 @@ mod tests {
         let (terminal, subscription) = watch::channel(None);
         let (qpack, writer) = Qpack::new(
             &settings,
-            crate::test_streams::writer(),
-            crate::test_streams::writer(),
+            crate::protocol::test_streams::writer(),
+            crate::protocol::test_streams::writer(),
             subscription,
             Box::new(|_| {}),
         );
@@ -755,8 +911,8 @@ mod tests {
         let reported = terminal.clone();
         let (qpack, writer) = Qpack::new(
             &settings,
-            crate::test_streams::writer(),
-            crate::test_streams::writer(),
+            crate::protocol::test_streams::writer(),
+            crate::protocol::test_streams::writer(),
             subscription,
             Box::new(move |error| {
                 reported.send_replace(Some(error));
@@ -793,8 +949,8 @@ mod tests {
         let reported = failure.clone();
         let (qpack, _writer) = Qpack::new(
             &settings,
-            crate::test_streams::writer(),
-            crate::test_streams::writer(),
+            crate::protocol::test_streams::writer(),
+            crate::protocol::test_streams::writer(),
             subscription,
             Box::new(move |error| {
                 reported.send_replace(Some(error));
@@ -806,7 +962,7 @@ mod tests {
         let error = qpack
             .handle_encoder_stream(ChunkReader::new(
                 crate::StreamId::from(qbase::varint::VarInt::from_u32(6)),
-                crate::test_streams::reader([Ok(Bytes::from(instruction))]),
+                crate::protocol::test_streams::reader([Ok(Bytes::from(instruction))]),
             ))
             .await
             .expect_err("an incomplete instruction cannot grow without a bound");

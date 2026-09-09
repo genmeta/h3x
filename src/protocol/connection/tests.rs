@@ -7,7 +7,7 @@ use http::Method;
 use http_body_util::BodyExt;
 
 use super::*;
-use crate::test_streams::Streams;
+use crate::protocol::test_streams::Streams;
 
 struct EarlyResponseTransport {
     opening: u8,
@@ -94,7 +94,7 @@ impl crate::transport::Connection for EarlyResponseTransport {
 
 #[tokio::test]
 async fn initialization_closes_transport_on_unpolled_drop_cancel_and_failure() {
-    for opening in [0, 1, 2] {
+    for (opening, authenticating) in [(0, false), (1, false), (2, false), (0, true)] {
         let (closed, mut observed) = watch::channel(None);
         let transport = EarlyResponseTransport {
             opening,
@@ -102,8 +102,14 @@ async fn initialization_closes_transport_on_unpolled_drop_cancel_and_failure() {
             role_queries: Arc::new(AtomicUsize::new(0)),
             closed,
         };
-        let mut initialization =
-            Box::pin(crate::protocol::new(transport, crate::Settings::default()));
+        let mut initialization: futures::future::BoxFuture<'_, _> = if authenticating {
+            Box::pin(
+                Connection::pending(transport, Code::H3_REQUEST_CANCELLED)
+                    .initialize(crate::Settings::default()),
+            )
+        } else {
+            Box::pin(crate::protocol::new(transport, crate::Settings::default()))
+        };
         match opening {
             1 => assert!(futures::poll!(initialization.as_mut()).is_pending()),
             2 => assert!(initialization.as_mut().await.is_err()),
@@ -119,7 +125,11 @@ async fn initialization_closes_transport_on_unpolled_drop_cancel_and_failure() {
         .unwrap();
         assert_eq!(
             closed.as_ref().unwrap().code(),
-            Some(Code::H3_INTERNAL_ERROR)
+            Some(if authenticating {
+                Code::H3_REQUEST_CANCELLED
+            } else {
+                Code::H3_INTERNAL_ERROR
+            })
         );
     }
 }
@@ -162,10 +172,10 @@ async fn early_response_keeps_upload_active_until_finished() {
             trailers.insert("x-finished", "yes".parse().unwrap());
             writer.trailers(trailers).await.unwrap();
             let before = role_queries.load(Ordering::Relaxed);
-            connection.inner.on_peer_goaway(4).unwrap();
+            connection.inner().on_peer_goaway(4).unwrap();
             assert!(role_queries.load(Ordering::Relaxed) > before);
             connection.shutdown().await.unwrap();
-            assert!(connection.inner.on_peer_goaway(4).is_err());
+            assert!(connection.inner().on_peer_goaway(4).is_err());
         }),
     )
     .await
@@ -188,20 +198,25 @@ async fn response_owns_send_direction_until_completion_or_drop() {
         let (id, (read_stream, write_stream)) = streams.open_bi();
         let mut reader = MessageReader::new(
             ChunkReader::new(id, read_stream),
-            connection.inner.qpack.clone(),
+            connection.inner().qpack.clone(),
             id,
         );
-        let mut writer = ResetOnDrop::new(write_stream);
-        let reading = connection.inner.drain.track();
-        let writing = connection.inner.drain.track();
+        let mut writer = BodyWriter::new(
+            write_stream,
+            connection.inner().qpack.clone(),
+            id,
+            MessageBody::Unknown,
+        );
+        let reading = connection.inner().drain.guard();
+        let writing = connection.inner().drain.guard();
         reader.on_finish(move || drop(reading));
-        writer.on_finish(move || drop(writing));
+        writer.writing = Some(writing);
         let sender = ResponseSender {
             stream_id: id,
             method: Method::GET,
             writer,
-            qpack: connection.inner.qpack.clone(),
-            terminal: connection.inner.terminal.clone(),
+            qpack: connection.inner().qpack.clone(),
+            terminal: connection.inner().terminal.clone(),
         };
         if cancelled {
             drop(sender);
@@ -226,7 +241,7 @@ async fn response_owns_send_direction_until_completion_or_drop() {
         }
         assert_request_state(&connection, true, false);
         drop(reader);
-        assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+        assert!(connection.inner().drain.active.load(Ordering::Acquire) == 0);
     }
 }
 
@@ -252,7 +267,7 @@ fn assert_request_state(
     reading: bool,
     writing: bool,
 ) {
-    let active = connection.inner.drain.active.load(Ordering::Acquire);
+    let active = connection.inner().drain.active.load(Ordering::Acquire);
     assert_eq!(active, usize::from(reading) + usize::from(writing));
 }
 
@@ -268,13 +283,13 @@ async fn shutdown_cancels_preparation_and_waits_for_its_cleanup() {
                 .unwrap();
             let mut pending = Box::pin(connection.request(request));
             assert!(futures::poll!(pending.as_mut()).is_pending());
-            assert_eq!(connection.inner.drain.active.load(Ordering::Acquire), 1);
+            assert_eq!(connection.inner().drain.active.load(Ordering::Acquire), 1);
             let mut shutdown = Box::pin(connection.shutdown());
             assert!(futures::poll!(shutdown.as_mut()).is_pending());
             // Cancellation signals do not themselves unregister preparation.
-            assert_eq!(connection.inner.drain.active.load(Ordering::Acquire), 1);
+            assert_eq!(connection.inner().drain.active.load(Ordering::Acquire), 1);
             assert!(matches!(pending.await, Err(Error::Cancelled)));
-            assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+            assert!(connection.inner().drain.active.load(Ordering::Acquire) == 0);
             tokio::time::timeout(std::time::Duration::from_secs(1), shutdown)
                 .await
                 .unwrap()
@@ -301,9 +316,9 @@ async fn response_eof_finishes_reading_while_body_is_retained() {
             assert_request_state(&connection, false, true);
             drop(writer);
             connection.shutdown().await.unwrap();
-            assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+            assert!(connection.inner().drain.active.load(Ordering::Acquire) == 0);
             drop(body);
-            assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+            assert!(connection.inner().drain.active.load(Ordering::Acquire) == 0);
         })
         .await;
 }
@@ -326,7 +341,7 @@ async fn cancellation_stops_both_normal_directions_but_streaming_can_cancel_uplo
             drop(pending);
             tokio::time::timeout(
                 std::time::Duration::from_secs(1),
-                connection.inner.drain.wait(),
+                connection.inner().drain.wait(),
             )
             .await
             .unwrap();
@@ -358,9 +373,9 @@ async fn preparation_tracking_has_no_fixed_request_limit() {
         assert!(futures::poll!(pending.as_mut()).is_pending());
         preparations.push(pending);
     }
-    assert_eq!(connection.inner.drain.active.load(Ordering::Acquire), 300);
+    assert_eq!(connection.inner().drain.active.load(Ordering::Acquire), 300);
     drop(preparations);
-    assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+    assert!(connection.inner().drain.active.load(Ordering::Acquire) == 0);
 }
 
 #[tokio::test]
@@ -371,7 +386,7 @@ async fn dropping_unpolled_request_reader_cancels_both_stream_directions() {
     drop(connection.read_request(id, recv, send));
     streams.drain();
     assert!(streams.reset.load(Ordering::Relaxed));
-    assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+    assert!(connection.inner().drain.active.load(Ordering::Acquire) == 0);
 }
 
 #[tokio::test]
@@ -387,16 +402,16 @@ async fn incoming_headers_are_cancelled_on_shutdown_or_drop() {
             let mut reading = Box::pin(connection.read_request(id, recv, send));
             assert!(futures::poll!(reading.as_mut()).is_pending());
             assert_eq!(
-                connection.inner.drain.active.load(Ordering::Acquire),
+                connection.inner().drain.active.load(Ordering::Acquire),
                 if prefix.is_empty() { 1 } else { 3 }
             );
             if shutdown {
-                connection.inner.begin_shutdown().unwrap();
+                connection.inner().begin_shutdown().unwrap();
                 assert!(matches!(reading.await, Err(Error::Cancelled)));
             } else {
                 drop(reading);
             }
-            assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+            assert!(connection.inner().drain.active.load(Ordering::Acquire) == 0);
             streams.drain();
             assert!(streams.reset.load(Ordering::Relaxed));
         }
@@ -417,7 +432,7 @@ async fn read_request_delivers_body_and_reply_before_shutdown() {
                 .into_parts()
                 .0;
             let encoded = connection
-                .inner
+                .inner()
                 .qpack
                 .encode_fields(id, headers::request_fields(head).unwrap())
                 .await
@@ -434,17 +449,17 @@ async fn read_request_delivers_body_and_reply_before_shutdown() {
             assert_eq!(request.uri(), "https://example.test/");
             assert_eq!(reply.stream_id(), id);
             assert_eq!(
-                connection.inner.goaway.lock().unwrap().max_delivered,
+                connection.inner().goaway.lock().unwrap().max_delivered,
                 Some(id)
             );
-            connection.inner.begin_shutdown().unwrap();
+            connection.inner().begin_shutdown().unwrap();
             assert_request_state(&connection, true, true);
             assert!(request.body_mut().frame().await.is_none());
             reply
                 .send(http::Response::new(http_body_util::Empty::<Bytes>::new()))
                 .await
                 .unwrap();
-            assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+            assert!(connection.inner().drain.active.load(Ordering::Acquire) == 0);
         })
         .await;
 }
@@ -474,7 +489,7 @@ async fn force_close_finishes_with_an_unread_body_still_owned_by_application() {
                 .unwrap();
             assert_request_state(&connection, true, false);
             assert!(body.frame().await.unwrap().is_err());
-            assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+            assert!(connection.inner().drain.active.load(Ordering::Acquire) == 0);
         })
         .await;
 }
@@ -488,25 +503,30 @@ async fn stream_cleanup_counts_each_direction_once() {
         let (id, (read_stream, write_stream)) = streams.open_bi();
         let mut reader = MessageReader::new(
             ChunkReader::new(id, read_stream),
-            connection.inner.qpack.clone(),
+            connection.inner().qpack.clone(),
             id,
         );
-        let mut writer = ResetOnDrop::new(write_stream);
-        let reading = connection.inner.drain.track();
-        let writing = connection.inner.drain.track();
+        let mut writer = BodyWriter::new(
+            write_stream,
+            connection.inner().qpack.clone(),
+            id,
+            MessageBody::Unknown,
+        );
+        let reading = connection.inner().drain.guard();
+        let writing = connection.inner().drain.guard();
         reader.on_finish(move || drop(reading));
-        writer.on_finish(move || drop(writing));
+        writer.writing = Some(writing);
         requests.push((id, reader, writer));
     }
     let (_, reader, mut writer) = requests.pop().unwrap();
     drop(reader);
-    assert_eq!(connection.inner.drain.active.load(Ordering::Acquire), 3);
+    assert_eq!(connection.inner().drain.active.load(Ordering::Acquire), 3);
     writer.reset(Code::H3_REQUEST_CANCELLED);
     writer.reset(Code::H3_REQUEST_CANCELLED);
     drop(writer);
     assert_request_state(&connection, true, true);
     drop(requests);
-    assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+    assert!(connection.inner().drain.active.load(Ordering::Acquire) == 0);
 }
 
 #[tokio::test]
@@ -521,9 +541,9 @@ async fn incoming_reads_use_local_guards_without_a_protocol_concurrency_limit() 
         assert!(futures::poll!(reading.as_mut()).is_pending());
         pending.push((stream, reading));
     }
-    assert_eq!(connection.inner.drain.active.load(Ordering::Acquire), 300);
+    assert_eq!(connection.inner().drain.active.load(Ordering::Acquire), 300);
     drop(pending);
-    assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+    assert!(connection.inner().drain.active.load(Ordering::Acquire) == 0);
 }
 
 #[tokio::test]
@@ -656,7 +676,7 @@ async fn qpack_failure_synchronously_closes_admission_and_preserves_first_cause(
     let connection = test_connection(&streams, 0).await;
     let id = StreamId::from(VarInt::from_u32(0));
     let error = connection
-        .inner
+        .inner()
         .qpack
         .decode_fields(id, &[0, 0, 0x80])
         .await
@@ -670,11 +690,11 @@ async fn qpack_failure_synchronously_closes_admission_and_preserves_first_cause(
         connection.request(request).await.unwrap_err().code(),
         error.code()
     );
-    connection.inner.terminate(Error::OwnerStopped);
-    assert_eq!(connection.inner.failure().code(), error.code());
+    connection.inner().terminate(Error::OwnerStopped);
+    assert_eq!(connection.inner().failure().code(), error.code());
     assert_eq!(
         connection
-            .inner
+            .inner()
             .qpack
             .encode_fields(id, Vec::new())
             .await
@@ -723,7 +743,7 @@ async fn streaming_length_errors_fail_the_writer_and_pending_response() {
         );
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            streams.drive(connection.inner.drain.wait()),
+            streams.drive(connection.inner().drain.wait()),
         )
         .await
         .unwrap();
@@ -744,13 +764,13 @@ async fn goaway_broadcast_rejects_only_covered_responses_even_before_their_first
             if poll_first {
                 tokio::task::yield_now().await;
             }
-            connection.inner.on_peer_goaway(4).unwrap();
+            connection.inner().on_peer_goaway(4).unwrap();
             assert!(matches!(second.await, Err(Error::Goaway { boundary }) if u64::from(boundary) == 4));
             assert!(futures::poll!(first.as_mut()).is_pending());
-            connection.inner.on_peer_goaway(0).unwrap();
+            connection.inner().on_peer_goaway(0).unwrap();
             assert!(matches!(first.await, Err(Error::Goaway { boundary }) if u64::from(boundary) == 0));
             drop((first_writer, second_writer));
-            assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+            assert!(connection.inner().drain.active.load(Ordering::Acquire) == 0);
             connection.shutdown().await.unwrap();
         }).await;
     }
@@ -766,7 +786,7 @@ async fn peer_goaway_cancels_a_request_still_waiting_to_open_a_stream() {
         .unwrap();
     let mut pending = Box::pin(connection.request(request));
     assert!(futures::poll!(pending.as_mut()).is_pending());
-    connection.inner.on_peer_goaway(0).unwrap();
+    connection.inner().on_peer_goaway(0).unwrap();
     assert!(matches!(pending.await, Err(Error::Goaway { .. })));
-    assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+    assert!(connection.inner().drain.active.load(Ordering::Acquire) == 0);
 }

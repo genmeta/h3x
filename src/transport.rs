@@ -8,66 +8,9 @@ use std::{error::Error as StdError, fmt, future::Future, sync::Arc};
 
 use bytes::Bytes;
 use dquic::prelude::{StreamReader, StreamWriter};
-use futures::SinkExt;
 pub use qbase::role::Role;
 
 use crate::{Code, StreamId};
-
-pub(crate) struct ResetOnDrop {
-    writer: Option<StreamWriter>,
-    on_finish: Option<Box<dyn FnOnce() + Send>>,
-}
-impl ResetOnDrop {
-    pub(crate) fn new(writer: StreamWriter) -> Self {
-        Self {
-            writer: Some(writer),
-            on_finish: None,
-        }
-    }
-
-    pub(crate) fn on_finish(&mut self, callback: impl FnOnce() + Send + 'static) {
-        self.on_finish = Some(Box::new(callback));
-    }
-
-    pub(crate) fn writer(&mut self) -> &mut StreamWriter {
-        self.writer.as_mut().unwrap()
-    }
-
-    pub(crate) fn reset(&mut self, code: Code) {
-        if let Some(mut writer) = self.writer.take() {
-            dquic::prelude::CancelStream::cancel(&mut writer, code.as_u64());
-        }
-        if let Some(callback) = self.on_finish.take() {
-            callback();
-        }
-    }
-
-    pub(crate) async fn finish(&mut self) -> Result<(), dquic::prelude::StreamError> {
-        self.writer().close().await?;
-        self.writer.take();
-        if let Some(callback) = self.on_finish.take() {
-            callback();
-        }
-        Ok(())
-    }
-}
-impl Drop for ResetOnDrop {
-    fn drop(&mut self) {
-        self.reset(Code::H3_REQUEST_CANCELLED);
-    }
-}
-
-/// Internal cleanup for work that owns a connection until successful handoff.
-/// Construct outside async work so cancellation before its first poll also closes.
-pub(crate) struct CloseOnDrop<T: Connection>(pub(crate) Option<Arc<T>>, pub(crate) Code);
-
-impl<T: Connection> Drop for CloseOnDrop<T> {
-    fn drop(&mut self) {
-        if let Some(transport) = &self.0 {
-            transport.close(self.1, b"connection work dropped");
-        }
-    }
-}
 
 type SharedError = Arc<dyn StdError + Send + Sync + 'static>;
 

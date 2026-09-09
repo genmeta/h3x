@@ -27,12 +27,11 @@ use crate::{
         message::{self, MessageBody, MessageReader},
         request::ResponseFuture,
     },
-    qpack,
-    transport::{self, CloseOnDrop, ResetOnDrop},
+    qpack, transport,
     wire::{self, ChunkReader, FrameReader, FrameType, write_frame},
 };
 mod client;
-mod drain;
+pub(super) mod drain;
 mod goaway;
 mod server;
 #[cfg(test)]
@@ -48,7 +47,9 @@ const MAX_CLASSIFYING: usize = 32;
 /// HTTP/3 connection: request sending, stream reading and graceful shutdown.
 /// Share with Arc when needed; dropping the connection closes its transport.
 pub struct Connection<T: transport::Connection> {
-    inner: Arc<H3Connection<T>>,
+    inner: Option<Arc<H3Connection<T>>>,
+    transport: Arc<T>,
+    drop_code: Code,
     control: Mutex<Option<StreamWriter>>,
 }
 
@@ -68,11 +69,25 @@ struct H3Connection<T: transport::Connection> {
 /// Protocol work runs in the background; Connection owns connection shutdown.
 pub fn new<T: transport::Connection>(
     transport: T,
-    mut settings: Settings,
+    settings: Settings,
 ) -> impl std::future::Future<Output = Result<Connection<T>, Error>> + Send {
-    let transport = Arc::new(transport);
-    let close_guard = CloseOnDrop(Some(transport.clone()), Code::H3_INTERNAL_ERROR);
-    async move {
+    Connection::pending(transport, Code::H3_INTERNAL_ERROR).initialize(settings)
+}
+
+impl<T: transport::Connection> Connection<T> {
+    // Own the transport before any initialization or authentication future is polled.
+    pub(crate) fn pending(transport: T, drop_code: Code) -> Self {
+        Self {
+            inner: None,
+            transport: Arc::new(transport),
+            control: Mutex::new(None),
+            drop_code,
+        }
+    }
+
+    pub(crate) async fn initialize(mut self, mut settings: Settings) -> Result<Self, Error> {
+        self.drop_code = Code::H3_INTERNAL_ERROR;
+        let transport = self.transport.clone();
         if settings.max_field_section_size().is_none() {
             settings.set_max_field_section_size(Some(32 * 1024));
         }
@@ -94,36 +109,41 @@ pub fn new<T: transport::Connection>(
         let (id, decoder) = transport.open_uni().await.map_err(map_connection_error)?;
         let decoder = prepare_critical(id, decoder, wire::StreamType::QpackDecoder).await?;
         let (inner, decoder, closed) =
-            H3Connection::shared_state(transport, &settings, encoder, decoder);
-        let root = inner.clone();
+            H3Connection::shared_state(transport.clone(), &settings, encoder, decoder);
+        let root = Connection {
+            inner: Some(inner.clone()),
+            transport: transport.clone(),
+            control: Mutex::new(None),
+            drop_code: Code::H3_INTERNAL_ERROR,
+        };
         tokio::spawn(async move {
-            let _close = close_guard;
-            root.run(decoder, closed).await;
+            root.inner().clone().run(decoder, closed).await;
         });
-        Ok(Connection {
-            inner,
-            control: Mutex::new(Some(control)),
-        })
+        self.inner = Some(inner);
+        *self.control.get_mut().unwrap() = Some(control);
+        self.drop_code = Code::H3_NO_ERROR;
+        Ok(self)
     }
-}
 
-impl<T: transport::Connection> Connection<T> {
+    fn inner(&self) -> &Arc<H3Connection<T>> {
+        self.inner.as_ref().expect("connection initialized")
+    }
     /// The underlying QUIC connection, including its transport termination signal.
     /// HTTP requests use request()/request_streaming() to retain protocol checks.
     pub fn transport(&self) -> &T {
-        &self.inner.transport
+        &self.inner().transport
     }
 
     pub fn is_draining(&self) -> bool {
-        self.inner.is_draining()
+        self.inner().is_draining()
     }
 
     pub fn close(&self, code: Code, reason: &[u8]) {
-        self.inner.close(code, reason);
+        self.inner().close(code, reason);
     }
 
     pub async fn closed(&self) -> Result<(), Error> {
-        self.inner
+        self.inner()
             .closed_rx
             .clone()
             .await
@@ -133,23 +153,27 @@ impl<T: transport::Connection> Connection<T> {
     /// Starts graceful shutdown once. Later calls return InvalidState.
     /// Dropping this waiter does not cancel the shutdown; use closed() to wait again.
     pub async fn shutdown(&self) -> Result<(), Error> {
-        let payload = self.inner.begin_shutdown()?;
+        let payload = self.inner().begin_shutdown()?;
         let control = self
             .control
             .lock()
             .unwrap()
             .take()
             .ok_or_else(|| Error::invalid_state("shutdown"))?;
-        self.inner.tasks.spawn(
-            self.inner.clone(),
-            self.inner.clone().drain(control, payload),
+        self.inner().tasks.spawn(
+            self.inner().clone(),
+            self.inner().clone().drain(control, payload),
         );
         self.closed().await
     }
 }
 impl<T: transport::Connection> Drop for Connection<T> {
     fn drop(&mut self) {
-        self.close(Code::H3_NO_ERROR, b"connection dropped");
+        if let Some(inner) = &self.inner {
+            inner.close(self.drop_code, b"connection dropped");
+        } else {
+            self.transport.close(self.drop_code, b"connection dropped");
+        }
     }
 }
 

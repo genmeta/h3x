@@ -114,12 +114,5 @@ pub(crate) fn check_name(name: &str, certs: &[CertificateDer<'_>]) -> Result<(),
             source: Arc::new(source),
         }
     })?;
-    if name == "dhttp.net" || name.ends_with(".dhttp.net") {
-        dhttp_identity::identity::extract_dhttp_subject_key_identifier(certs).map_err(
-            |source| Error::InvalidEndpoint {
-                source: Arc::new(source),
-            },
-        )?;
-    }
     Ok(())
 }

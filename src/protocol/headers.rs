@@ -56,12 +56,21 @@ pub(crate) fn request_fields(parts: http::request::Parts) -> Result<Vec<Field>, 
 pub(super) fn request_parts(fields: Vec<Field>) -> Result<http::request::Parts, Error> {
     let ParsedFields { pseudo, headers } = parse_fields(fields)?;
 
+    for field in &pseudo {
+        if !matches!(
+            field.name.as_ref(),
+            b":method" | b":scheme" | b":authority" | b":path" | b":protocol"
+        ) {
+            return Err(message_error("pseudo-header not allowed in request"));
+        }
+    }
+
     let method = required_pseudo(&pseudo, b":method")?;
     let method = Method::from_bytes(method).map_err(message_source("invalid :method"))?;
-    let scheme = pseudo_value(&pseudo, b":scheme")?;
-    let authority = pseudo_value(&pseudo, b":authority")?;
-    let path = pseudo_value(&pseudo, b":path")?;
-    let protocol = pseudo_value(&pseudo, b":protocol")?;
+    let scheme = pseudo_value(&pseudo, b":scheme");
+    let authority = pseudo_value(&pseudo, b":authority");
+    let path = pseudo_value(&pseudo, b":path");
+    let protocol = pseudo_value(&pseudo, b":protocol");
     validate_request_pseudo(&method, scheme, authority, path, protocol, &headers)?;
 
     let uri = build_request_uri(&method, scheme, authority, path)?;
@@ -165,7 +174,7 @@ fn parse_fields(fields: Vec<Field>) -> Result<ParsedFields, Error> {
         }
 
         regular_seen = true;
-        let name = HeaderName::from_bytes(&field.name)
+        let name = HeaderName::from_lowercase(&field.name)
             .map_err(message_source("invalid HTTP field name"))?;
         let value = HeaderValue::from_bytes(&field.value)
             .map_err(message_source("invalid HTTP field value"))?;
@@ -383,7 +392,7 @@ fn build_request_uri(
 }
 
 fn required_pseudo<'a>(pseudo: &'a [Field], name: &[u8]) -> Result<&'a [u8], Error> {
-    pseudo_value(pseudo, name)?.ok_or_else(|| {
+    pseudo_value(pseudo, name).ok_or_else(|| {
         message_error(format!(
             "missing {} pseudo-header",
             String::from_utf8_lossy(name)
@@ -391,22 +400,11 @@ fn required_pseudo<'a>(pseudo: &'a [Field], name: &[u8]) -> Result<&'a [u8], Err
     })
 }
 
-fn pseudo_value<'a>(pseudo: &'a [Field], name: &[u8]) -> Result<Option<&'a [u8]>, Error> {
-    for field in pseudo {
-        match field.name.as_ref() {
-            b":method" | b":scheme" | b":authority" | b":path" | b":protocol" | b":status" => {}
-            _ => {
-                return Err(message_error(format!(
-                    "unknown pseudo-header {}",
-                    String::from_utf8_lossy(&field.name)
-                )));
-            }
-        }
-        if field.name.as_ref() == name {
-            return Ok(Some(&field.value));
-        }
-    }
-    Ok(None)
+fn pseudo_value<'a>(pseudo: &'a [Field], name: &[u8]) -> Option<&'a [u8]> {
+    pseudo
+        .iter()
+        .find(|field| field.name.as_ref() == name)
+        .map(|field| field.value.as_ref())
 }
 
 fn required_bytes<'a>(value: Option<&'a [u8]>, name: &str) -> Result<&'a [u8], Error> {
@@ -433,6 +431,64 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_invalid_raw_field_names_and_contextual_pseudo_headers() {
+        let request = || {
+            request_fields(
+                http::Request::builder()
+                    .uri("https://peer.test/")
+                    .body(())
+                    .unwrap()
+                    .into_parts()
+                    .0,
+            )
+            .unwrap()
+        };
+        for name in [b":status".as_slice(), b":unknown", b":Method"] {
+            for position in 0..=request().len() {
+                let mut fields = request();
+                fields.insert(
+                    position,
+                    Field {
+                        name: Bytes::copy_from_slice(name),
+                        value: Bytes::from_static(b"200"),
+                    },
+                );
+                assert_eq!(
+                    request_parts(fields).unwrap_err().code(),
+                    Some(Code::H3_MESSAGE_ERROR)
+                );
+            }
+        }
+        let uppercase = Field {
+            name: Bytes::from_static(b"X-Review"),
+            value: Bytes::from_static(b"one"),
+        };
+        let mut fields = request();
+        fields.push(uppercase.clone());
+        assert!(request_parts(fields).is_err());
+        assert!(
+            response_parts(vec![
+                Field {
+                    name: Bytes::from_static(b":status"),
+                    value: Bytes::from_static(b"200")
+                },
+                uppercase.clone()
+            ])
+            .is_err()
+        );
+        assert!(trailer_fields(vec![uppercase]).is_err());
+        for name in [b":method".as_slice(), b":unknown"] {
+            let field = Field {
+                name: Bytes::copy_from_slice(name),
+                value: Bytes::from_static(b"GET"),
+            };
+            assert!(response_parts(vec![field.clone()]).is_err());
+            assert!(trailer_fields(vec![field]).is_err());
+        }
+        assert!(request_parts(request()).is_ok());
+    }
 
     #[test]
     fn inbound_validation_retains_authority_and_host_rules_for_custom_schemes() {

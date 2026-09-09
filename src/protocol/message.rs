@@ -8,10 +8,9 @@ use http_body::{Frame, SizeHint};
 use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
 
 use crate::{
-    Code, Error, StreamId,
+    BodyWriter, Code, Error, StreamId,
     protocol::headers::{self, message_error},
     qpack,
-    transport::ResetOnDrop,
     wire::{self, ChunkReader, FrameReader, FrameType, write_frame},
 };
 
@@ -115,7 +114,7 @@ fn unexpected() -> Error {
 }
 
 pub(super) async fn send_body(
-    writer: &mut ResetOnDrop,
+    writer: &mut BodyWriter,
     body: &mut UnsyncBoxBody<Bytes, Error>,
     mut message_body: MessageBody,
     qpack: &qpack::Qpack,
@@ -127,14 +126,19 @@ pub(super) async fn send_body(
         yield_after_batch(&mut ready_steps).await;
         let frame = frame?;
         match frame.into_data() {
-            Ok(data) => {
+            Ok(mut data) => {
                 if trailers_sent {
                     return Err(message_error("DATA after trailers"));
                 }
                 if data.is_empty() {
                     continue;
                 }
-                send_data(writer, data, &mut message_body, &mut ready_steps).await?;
+                message_body.data(data.len() as u64)?;
+                while !data.is_empty() {
+                    yield_after_batch(&mut ready_steps).await;
+                    let len = data.len().min(wire::MAX_DATA_CHUNK);
+                    write_frame(writer.stream(), wire::FrameType::Data, data.split_to(len)).await?;
+                }
             }
             Err(frame) => {
                 if let Ok(trailers) = frame.into_trailers() {
@@ -148,11 +152,11 @@ pub(super) async fn send_body(
         }
     }
     message_body.finish()?;
-    writer.finish().await.map_err(wire::map_stream_error)
+    writer.finish_send().await.map_err(wire::map_stream_error)
 }
 
 pub(super) async fn send_trailers(
-    writer: &mut ResetOnDrop,
+    writer: &mut BodyWriter,
     trailers: http::HeaderMap,
     message_body: &MessageBody,
     qpack: &qpack::Qpack,
@@ -164,25 +168,7 @@ pub(super) async fn send_trailers(
     message_body.finish()?;
     let fields = headers::regular_fields(trailers).map_err(Error::into_invalid_message)?;
     let encoded = qpack.encode_fields(id, fields).await?;
-    write_frame(writer.writer(), wire::FrameType::Headers, encoded).await
-}
-
-async fn send_data(
-    writer: &mut ResetOnDrop,
-    mut data: Bytes,
-    message_body: &mut MessageBody,
-    ready_steps: &mut u8,
-) -> Result<(), Error> {
-    if data.is_empty() {
-        return Ok(());
-    }
-    message_body.data(data.len() as u64)?;
-    while !data.is_empty() {
-        yield_after_batch(ready_steps).await;
-        let len = data.len().min(wire::MAX_DATA_CHUNK);
-        write_frame(writer.writer(), wire::FrameType::Data, data.split_to(len)).await?;
-    }
-    Ok(())
+    write_frame(writer.stream(), wire::FrameType::Headers, encoded).await
 }
 
 async fn yield_after_batch(steps: &mut u8) {

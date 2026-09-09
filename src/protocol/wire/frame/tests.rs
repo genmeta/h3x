@@ -123,7 +123,22 @@ mod tests {
 #[test]
 fn wire_types_round_trip() {
     use crate::wire::StreamType;
-    for value in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0x0d, 0x54, 0x21, (1 << 62) - 1] {
+    for value in [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        0x0d,
+        0x54,
+        0x21,
+        (1 << 62) - 1,
+    ] {
         assert_eq!(u64::from(FrameType::from(value)), value);
         assert_eq!(u64::from(StreamType::from(value)), value);
     }

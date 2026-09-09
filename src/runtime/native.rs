@@ -15,7 +15,7 @@ use super::{
     dquic::{Authenticated, authenticate, transport_error},
     pool::{Entry, Pool},
 };
-use crate::{Endpoint, Error, LocalAuthority, RemoteAuthority, Settings, transport::CloseOnDrop};
+use crate::{Endpoint, Error, LocalAuthority, RemoteAuthority, Settings};
 
 pub(super) type Key = (Option<String>, String);
 pub(super) type Connected = Result<Arc<Connection>, Error>;
@@ -62,17 +62,9 @@ pub fn init(
     tokio::runtime::Handle::try_current().map_err(|_| Error::OwnerStopped)?;
     let mut registered = HashMap::new();
     for (endpoint, client) in endpoints {
-        let server = listeners
+        listeners
             .get_server(endpoint.name())
             .ok_or_else(|| invalid_config("endpoint has no prepared listener"))?;
-        let expected = endpoint.certificate();
-        let actual = server.certified_key();
-        if actual.cert != expected.cert
-            || !Arc::ptr_eq(&actual.key, &expected.key)
-            || actual.ocsp != expected.ocsp
-        {
-            return Err(Error::IdentityMismatch);
-        }
         if registered
             .insert(endpoint.name().to_owned(), (endpoint, client))
             .is_some()
@@ -148,9 +140,6 @@ impl Runtime {
         let Some(remote) = connection.remote_authority() else {
             return Ok(false);
         };
-        if remote.name() != "dhttp.net" && !remote.name().ends_with(".dhttp.net") {
-            return Ok(false);
-        }
         let key = (
             connection
                 .local_endpoint()
@@ -200,49 +189,54 @@ impl Runtime {
             None => &self.anonymous,
         };
         let handshake = client.connect(&target).await.map_err(transport_error)?;
-        let mut close_guard = CloseOnDrop(
-            Some(Arc::new(handshake.clone())),
+        let protocol = crate::protocol::Connection::pending(
+            handshake.clone(),
             crate::Code::H3_REQUEST_CANCELLED,
-        );
+        )
+        .initialize(Settings::default());
         let handshake = authenticate(handshake, local, Some(&target)).await?;
-        let connection = Self::adopt_connection(handshake).await?;
+        let connection = Self::adopt_connection(handshake, protocol.await?);
         self.tasks
             .spawn(self.serve_connection(connection.clone()))?;
-        close_guard.0.take();
         Ok(connection)
     }
 
-    async fn adopt_connection(handshake: Authenticated) -> Result<Arc<Connection>, Error> {
-        let Authenticated {
-            transport,
-            local,
-            remote,
-        } = handshake;
-        let protocol = crate::protocol::new(transport, Settings::default()).await?;
-        let handle = Arc::new(Connection {
+    fn adopt_connection(
+        handshake: Authenticated,
+        protocol: crate::protocol::Connection<Arc<::dquic::prelude::Connection>>,
+    ) -> Arc<Connection> {
+        let Authenticated { local, remote } = handshake;
+        Arc::new(Connection {
             protocol,
             local: local.map(LocalAuthority),
             remote,
-        });
-        Ok(handle)
+        })
     }
 
-    async fn accept_connection(
+    fn accept_connection(
         &'static self,
         handshake: Arc<::dquic::prelude::Connection>,
         local: Arc<Endpoint>,
-    ) -> Result<(), Error> {
-        let handshake = authenticate(handshake, Some(local), None).await?;
-        let connection = Self::adopt_connection(handshake).await?;
-        self.tasks
-            .spawn(self.serve_connection(connection.clone()))?;
-        if let Err(error) = self.cache_connection(connection.clone()) {
-            connection
-                .protocol
-                .close(crate::Code::H3_INTERNAL_ERROR, b"invalid pool admission");
-            return Err(error);
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        // The protocol connection owns shutdown even before authentication is polled.
+        let protocol = crate::protocol::Connection::pending(
+            handshake.clone(),
+            crate::Code::H3_REQUEST_CANCELLED,
+        )
+        .initialize(Settings::default());
+        async move {
+            let handshake = authenticate(handshake, Some(local), None).await?;
+            let connection = Self::adopt_connection(handshake, protocol.await?);
+            self.tasks
+                .spawn(self.serve_connection(connection.clone()))?;
+            if let Err(error) = self.cache_connection(connection.clone()) {
+                connection
+                    .protocol
+                    .close(crate::Code::H3_INTERNAL_ERROR, b"invalid pool admission");
+                return Err(error);
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     async fn accept_connections(&'static self) {
@@ -253,18 +247,13 @@ impl Runtime {
                 _ = stopping.wait_for(|value| *value) => break,
                 incoming = self.listeners.accept(), if handshakes.len() < MAX_HANDSHAKES => {
                     let Ok((handshake, name, _, _)) = incoming else { break };
-                    let mut close_guard = CloseOnDrop(
-                        Some(Arc::new(handshake.clone())), crate::Code::H3_REQUEST_CANCELLED,
-                    );
-                    let Some((local, _)) = self.endpoints.get(&name) else { continue };
-                    let local = local.clone();
+                    let Some((local, _)) = self.endpoints.get(&name) else {
+                        let _ = handshake.close("unknown endpoint", crate::Code::H3_REQUEST_CANCELLED.as_u64());
+                        continue;
+                    };
+                    let connection = self.accept_connection(handshake, local.clone());
                     handshakes.push(async move {
-                        let result = tokio::time::timeout(
-                            HANDSHAKE_TIMEOUT, self.accept_connection(handshake, local),
-                        ).await;
-                        if matches!(result, Ok(Ok(()))) {
-                            close_guard.0.take();
-                        }
+                        let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, connection).await;
                     });
                 }
                 _ = handshakes.next(), if !handshakes.is_empty() => {}

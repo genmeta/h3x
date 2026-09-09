@@ -13,6 +13,26 @@ use x509_ocsp::{
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 #[test]
+fn certificate_name_validation_is_domain_independent() {
+    for name in ["dhttp.net", "peer.dhttp.net", "genmeta.net"] {
+        let generated = rcgen::generate_simple_self_signed(vec![name.into()]).unwrap();
+        let certs = vec![generated.cert.der().clone()];
+        assert!(
+            Endpoint::new(
+                name,
+                certs.clone(),
+                rustls::pki_types::PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der())
+                    .into(),
+                None,
+            )
+            .is_ok()
+        );
+        assert!(h3x::RemoteAuthority::from_authenticated(name, certs.clone()).is_ok());
+        assert!(h3x::RemoteAuthority::from_authenticated("other.example", certs).is_err());
+    }
+}
+
+#[test]
 fn endpoint_validates_certificate_and_signed_ocsp() {
     let mut params = rcgen::CertificateParams::new(vec!["test.example".into()]).unwrap();
     // 128 requires a DER sign-padding zero; random serials only rarely exercise it.

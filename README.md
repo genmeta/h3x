@@ -14,11 +14,37 @@
 
 h3x is the symmetric HTTP/3 protocol core used by [dhttp](https://github.com/genmeta/dhttp). It runs on an already-established QUIC connection and provides streaming `http::Request` / `http::Response` APIs.
 
-The crate has three layers: `client` / `server` for outgoing and incoming messages, `runtime` for identity, pooling and services, and `protocol` for HTTP/3. See [the current design status](design/http3-wire-codec.md). The protocol adopts an established transport directly as `T: transport::Connection`; authentication facts remain in the runtime.
+The crate has three layers: `client` / `server` for outgoing and incoming messages, `runtime` for identity, pooling and services, and `protocol` for HTTP/3. The ownership and execution flow are described below. The protocol adopts an established transport directly as `T: transport::Connection`; authentication facts remain in the runtime.
 
 **Protocol API:** `protocol::new` returns one `Connection` supporting both outgoing requests and incoming acceptance. Share it with `Arc` when needed. `runtime::Connection::protocol()` exposes this connection; `Connection::transport()` borrows its existing QUIC transport without retaining another handle.
 
 Public message paths are separate: `client::Request` builds and executes outgoing requests, and `client::Response` carries the authenticated reply. `server::Request` combines an HTTP request with a required local identity and an optional remote connection identity; `server::Response` combines an HTTP response with the same identities, inherited through `request.response(message)`; `server::ResponseSender` sends the reply on the accepted stream. Client and server describe each request's direction, not the QUIC endpoint role. `Request` and `Response` are not re-exported at the crate root.
+
+## Top-level API example
+
+Run `cargo run --example top_level` on a native target. The complete
+[example](examples/top_level.rs) demonstrates `Endpoint::listen`, anonymous
+`client::Request<Fixed>`, identity-bearing `Endpoint::post`, streaming uploads
+with `BodyWriter`, authenticated responses, `Pool::get` reuse, and `shutdown`.
+It asserts the returned bodies and connection reuse over real loopback QUIC.
+
+[Setup](examples/support/mod.rs) generates temporary self-signed identities,
+trusts them in a private root store, binds ephemeral loopback ports, and calls
+`h3x::init`. No external server, DNS setup, or certificate files are needed.
+
+For an external HTTP/3 conformance endpoint, build `cargo build --example
+conformance_client` and run:
+
+```sh
+./target/debug/examples/conformance_client https://conformance.pqcrypta.com:4481/ /etc/ssl/cert.pem
+```
+
+The second argument is a trusted CA bundle in PEM format. The client uses IPv4,
+validates TLS and ALPN, enables dynamic QPACK, and sends two GETs on the same
+connection. It uses the protocol API directly to support the suite's per-test
+ports. An optional third argument overrides the DNS host without changing TLS
+SNI. Client exit codes are diagnostic; conformance verdicts come from the suite's
+server-side report. This probe does not exercise resumed/0-RTT connections.
 
 ## Server-Initiated Requests
 
@@ -65,6 +91,48 @@ transport.accept_bi() → (id, recv, send)
 
 There is no intermediate HTTP request queue. Header parsing is cancellable; direct protocol callers supply their own concurrency limit, while the native runtime limits request tasks to 256; `read_request` commits delivery under the GOAWAY lock before returning. Request bodies continue reading from the same receive stream on demand, and `ResponseSender` owns that stream's send direction.
 
+`read_request` is the low-level integration interface replacing `accept()`. Direct protocol users own admission, service-task cancellation and joining. This complete receive loop uses a caller-supplied stop signal and includes stalled header reads in its limit:
+
+```no_run
+use bytes::Bytes;
+use h3x::{Code, protocol::Connection, transport};
+use http_body_util::Full;
+
+async fn serve<T: transport::Connection>(
+    connection: Connection<T>,
+    stop: impl std::future::Future<Output = ()>,
+) {
+    let mut tasks = tokio::task::JoinSet::new();
+    tokio::pin!(stop);
+    loop {
+        tokio::select! {
+            _ = &mut stop => break,
+            _ = connection.closed() => break,
+            incoming = connection.transport().accept_bi(), if tasks.len() < 256 => {
+                let Ok((id, (recv, send))) = incoming else { break };
+                // Construct before spawning so even an unpolled task owns cancellation.
+                let request = connection.read_request(id, recv, send);
+                tasks.spawn(async move {
+                    if let Ok(Some((_request, reply))) = request.await {
+                        let response = http::Response::new(Full::new(Bytes::from_static(b"ok")));
+                        let _ = reply.send(response).await;
+                    }
+                });
+            }
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if matches!(result, Some(Err(_))) {
+                    connection.close(Code::H3_INTERNAL_ERROR, b"service task failed");
+                    break;
+                }
+            }
+        }
+    }
+    connection.close(Code::H3_NO_ERROR, b"server stopping");
+    tasks.shutdown().await;
+    let _ = connection.closed().await;
+}
+```
+
 The connection stores GOAWAY directly. A separate Drain tracks active work through one count and local guards, without distinguishing request stages. Opening and header-reading functions own their drain guards; each response task owns its reply channel and observes upload failure, connection termination, and the peer's GOAWAY boundary. Local shutdown cancels unfinished admission without cancelling already delivered exchanges.
 
 ## Dynamic QPACK
@@ -101,8 +169,8 @@ Stream I/O uses `dquic::prelude::StreamReader` and `StreamWriter` directly. The 
 
 `BodyWriter` directly owns the HTTP/3 send direction. Each `AsyncWrite` call submits at most 16 KiB of DATA as one complete frame through the native `Sink<Bytes>`; pending writes consume no caller bytes. There is no streaming-upload task, pipe or command queue. `flush()` confirms submission to QUIC and does not wait for ACKs. `finish()` / `trailers()` preserve pending work until FIN completes; dropping an unfinished writer cancels only that direction and fails a still-pending response. Ordinary `request<B>` retains its independent automatic-upload task, including after response headers arrive.
 
-QPACK encodes and decodes field collections; the message layer handles HTTP semantics once. QPACK and its instruction writer subscribe to the connection's terminal notification. Admission closes synchronously under the existing state lock. `closed()` is the later protocol-task cleanup result; it is not the terminal notification or application runtime shutdown.
+QPACK waits for encoder-stream readiness before changing shared encoding state, then submits the resulting instructions synchronously; cancellation cannot discard instructions after a table update. QPACK encodes and decodes field collections; the message layer handles HTTP semantics once. QPACK and its instruction writer subscribe to the connection's terminal notification. Admission closes synchronously under the existing state lock. `closed()` is the later protocol-task cleanup result; it is not the terminal notification or application runtime shutdown.
 
 The public `Fixed`, `Chunk`, `Executing`, `Streaming`, identity-bearing server messages, `Pool::get`, and asynchronous `Endpoint::listen` contracts remain unchanged. This implementation targets native dquic/Tokio execution with `Send + Sync`; no WASM adapter is provided.
 
-For the current checkout, run `cargo test --all-targets --no-run`, `cargo test --all-targets --all-features`, and `cargo test --doc`. See the dated snapshot in [the wire design](design/http3-wire-codec.md); its historical proposal and old test claims are not evidence for a different checkout.
+For the current checkout, run `cargo test --all-targets --no-run`, `cargo test --all-targets --all-features`, and `cargo test --doc`. Test results apply only to the checkout on which these commands were run.

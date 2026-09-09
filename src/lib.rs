@@ -63,6 +63,3 @@ pub mod fuzzing {
         let _ = qbase::varint::be_varint(data);
     }
 }
-
-#[cfg(any(test, feature = "fuzzing"))]
-mod test_streams;

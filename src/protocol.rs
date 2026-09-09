@@ -13,3 +13,7 @@ pub use connection::{Connection, ResponseSender, new};
 pub use qbase::sid::StreamId;
 pub use request::ResponseFuture;
 pub use settings::Settings;
+
+#[cfg(any(test, feature = "fuzzing"))]
+#[path = "../tests/support/streams.rs"]
+mod test_streams;

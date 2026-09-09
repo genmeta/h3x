@@ -19,7 +19,7 @@ impl<T: transport::Connection> Connection<T> {
         let fields = headers::request_fields(parts).map_err(Error::into_invalid_message)?;
         message_body.validate_size(body.size_hint())?;
         let (response, work) = self
-            .inner
+            .inner()
             .exec(
                 (method, fields, message_body),
                 Some(
@@ -48,7 +48,7 @@ impl<T: transport::Connection> Connection<T> {
         let method = parts.method.clone();
         let fields = headers::request_fields(parts).map_err(Error::into_invalid_message)?;
         let (response, work) = self
-            .inner
+            .inner()
             .exec((method, fields, message_body), None)
             .await?;
         let RequestWork::Streaming(writer) = work else {
@@ -76,7 +76,7 @@ impl<T: transport::Connection> H3Connection<T> {
             if goaway.local_boundary.is_some() {
                 return Err(Error::Draining);
             }
-            self.drain.track()
+            self.drain.guard()
         };
         let work = async {
             let (stream_id, (read_stream, write_stream)) = tokio::select! {
@@ -88,7 +88,8 @@ impl<T: transport::Connection> H3Connection<T> {
                 self.qpack.clone(),
                 stream_id,
             );
-            let mut writer = ResetOnDrop::new(write_stream);
+            let mut writer =
+                BodyWriter::new(write_stream, self.qpack.clone(), stream_id, message_body);
             let (reply, receive) = oneshot::channel();
             let (stop, response_cancel) = AbortHandle::new_pair();
             let response_waiter = ResponseFuture {
@@ -96,15 +97,15 @@ impl<T: transport::Connection> H3Connection<T> {
                 stop: Some(stop),
             };
             let (upload_failed, upload_error) = oneshot::channel();
-            let reading = self.drain.track();
-            let writing = self.drain.track();
+            let reading = self.drain.guard();
+            let writing = self.drain.guard();
             reader.on_finish(move || drop(reading));
-            writer.on_finish(move || drop(writing));
+            writer.writing = Some(writing);
             tokio::select! {
                 error = self.peer_rejected(Some(stream_id)) => return Err(error),
                 result = async {
                     let encoded = self.qpack.encode_fields(stream_id, fields).await?;
-                    write_frame(writer.writer(), wire::FrameType::Headers, encoded).await
+                    write_frame(writer.stream(), wire::FrameType::Headers, encoded).await
                 } => result?,
             }
 
@@ -139,15 +140,10 @@ impl<T: transport::Connection> H3Connection<T> {
                     });
                     RequestWork::Automatic(AbortOnDrop(Some(write_body_handler)))
                 }
-                None => RequestWork::Streaming(BodyWriter::new(
-                    writer,
-                    self.qpack.clone(),
-                    stream_id,
-                    message_body,
-                    move |error| {
-                        let _ = upload_failed.send(error);
-                    },
-                )),
+                None => {
+                    writer.report_upload_failure(upload_failed);
+                    RequestWork::Streaming(writer)
+                }
             };
             self.tasks.spawn(
                 self.clone(),
@@ -180,7 +176,7 @@ impl<T: transport::Connection> H3Connection<T> {
     async fn write_body(
         &self,
         stream_id: StreamId,
-        mut writer: ResetOnDrop,
+        mut writer: BodyWriter,
         mut body: UnsyncBoxBody<Bytes, Error>,
         message_body: MessageBody,
         upload_cancel: AbortRegistration,

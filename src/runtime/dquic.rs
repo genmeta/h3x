@@ -130,16 +130,11 @@ pub(crate) async fn authenticate(
     {
         return Err(Error::IdentityMismatch);
     }
-    Ok(Authenticated {
-        transport,
-        local,
-        remote,
-    })
+    Ok(Authenticated { local, remote })
 }
 
 /// Authentication facts remain in the runtime when transport is adopted by HTTP/3.
 pub(super) struct Authenticated {
-    pub(super) transport: Arc<dquic::prelude::Connection>,
     pub(super) local: Option<Arc<Endpoint>>,
     pub(super) remote: Option<RemoteAuthority>,
 }

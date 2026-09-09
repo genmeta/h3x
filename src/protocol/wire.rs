@@ -340,7 +340,7 @@ pub(crate) fn map_stream_error(error: impl Into<transport::StreamError>) -> Erro
 }
 
 #[cfg(feature = "fuzzing")]
-pub(crate) use crate::test_streams::fuzz_frame;
+pub(crate) use crate::protocol::test_streams::fuzz_frame;
 
 /// Header and payload are separate Sink items; DATA retains its Bytes allocation.
 pub(crate) async fn write_frame(

@@ -111,13 +111,14 @@ impl HttpBody for ChunkBody {
 /// DATA writes are submitted as complete, bounded frames. Flush waits only for
 /// submission, while shutdown waits for FIN completion. Drop cancels this direction.
 pub struct BodyWriter {
-    writer: Option<crate::transport::ResetOnDrop>,
+    writer: Option<dquic::prelude::StreamWriter>,
+    pub(super) writing: Option<super::connection::drain::Guard>,
     qpack: Arc<crate::qpack::Qpack>,
     stream_id: crate::StreamId,
     message_body: super::message::MessageBody,
     finishing: Option<futures::future::BoxFuture<'static, Result<(), Error>>>,
     result: Option<Result<(), Error>>,
-    on_error: Option<Box<dyn FnOnce(Error) + Send>>,
+    upload_failed: Option<tokio::sync::oneshot::Sender<Error>>,
 }
 
 impl fmt::Debug for BodyWriter {
@@ -134,33 +135,53 @@ impl fmt::Debug for BodyWriter {
 
 impl BodyWriter {
     pub(super) fn new(
-        writer: crate::transport::ResetOnDrop,
+        writer: dquic::prelude::StreamWriter,
         qpack: Arc<crate::qpack::Qpack>,
         stream_id: crate::StreamId,
         message_body: super::message::MessageBody,
-        on_error: impl FnOnce(Error) + Send + 'static,
     ) -> Self {
         Self {
             writer: Some(writer),
+            writing: None,
             qpack,
             stream_id,
             message_body,
             finishing: None,
             result: None,
-            on_error: Some(Box::new(on_error)),
+            upload_failed: None,
         }
     }
 
-    fn fail(&mut self, error: Error) -> Error {
+    pub(super) fn stream(&mut self) -> &mut dquic::prelude::StreamWriter {
+        self.writer.as_mut().expect("send direction finished")
+    }
+
+    pub(super) fn reset(&mut self, code: crate::Code) {
         if let Some(mut writer) = self.writer.take() {
-            writer.reset(error.code().unwrap_or(crate::Code::H3_REQUEST_CANCELLED));
+            dquic::prelude::CancelStream::cancel(&mut writer, code.as_u64());
         }
+        self.writing.take();
+    }
+
+    pub(super) async fn finish_send(&mut self) -> Result<(), dquic::prelude::StreamError> {
+        futures::SinkExt::close(self.stream()).await?;
+        self.writer.take();
+        self.writing.take();
+        Ok(())
+    }
+
+    pub(super) fn report_upload_failure(&mut self, sender: tokio::sync::oneshot::Sender<Error>) {
+        self.upload_failed = Some(sender);
+    }
+
+    fn fail(&mut self, error: Error) -> Error {
+        self.reset(error.code().unwrap_or(crate::Code::H3_REQUEST_CANCELLED));
         self.finishing.take();
         let _ = self
             .qpack
             .terminate_on_connection_error::<()>(Err(error.clone()));
-        if let Some(on_error) = self.on_error.take() {
-            on_error(error.clone());
+        if let Some(upload_failed) = self.upload_failed.take() {
+            let _ = upload_failed.send(error.clone());
         }
         self.result = Some(Err(error.clone()));
         error
@@ -189,7 +210,13 @@ impl BodyWriter {
             if let Err(error) = self.message_body.finish() {
                 return Poll::Ready(Err(self.fail(error)));
             }
-            let mut writer = self.writer.take().unwrap();
+            let mut writer = Self::new(
+                self.writer.take().unwrap(),
+                self.qpack.clone(),
+                self.stream_id,
+                self.message_body,
+            );
+            writer.writing = self.writing.take();
             let qpack = self.qpack.clone();
             let stream_id = self.stream_id;
             let message_body = self.message_body;
@@ -202,7 +229,7 @@ impl BodyWriter {
                         if let Some(trailers) = trailers {
                             super::message::send_trailers(&mut writer, trailers, &message_body, &qpack, stream_id).await?;
                         }
-                        writer.finish().await.map_err(crate::wire::map_stream_error)
+                        writer.finish_send().await.map_err(crate::wire::map_stream_error)
                     } => result,
                 };
                 if let Err(error) = &result {
@@ -216,7 +243,7 @@ impl BodyWriter {
         if let Err(error) = result {
             return Poll::Ready(Err(self.fail(error)));
         }
-        self.on_error.take();
+        self.upload_failed.take();
         self.result = Some(Ok(()));
         Poll::Ready(Ok(()))
     }
@@ -235,10 +262,10 @@ impl BodyWriter {
 
 impl Drop for BodyWriter {
     fn drop(&mut self) {
-        self.writer.take();
+        self.reset(crate::Code::H3_REQUEST_CANCELLED);
         self.finishing.take();
-        if let Some(on_error) = self.on_error.take() {
-            on_error(Error::Cancelled);
+        if let Some(upload_failed) = self.upload_failed.take() {
+            let _ = upload_failed.send(Error::Cancelled);
         }
     }
 }
@@ -261,7 +288,7 @@ impl AsyncWrite for BodyWriter {
         if let Err(error) = message_body.data(count as u64) {
             return Poll::Ready(Err(io::Error::other(self.fail(error))));
         }
-        if let Err(error) = ready!(self.writer.as_mut().unwrap().writer().poll_ready(cx)) {
+        if let Err(error) = ready!(self.stream().poll_ready(cx)) {
             return Poll::Ready(Err(io::Error::other(
                 self.fail(crate::wire::map_stream_error(error)),
             )));
@@ -279,10 +306,7 @@ impl AsyncWrite for BodyWriter {
             return Poll::Ready(Err(io::Error::other(self.fail(error))));
         }
         frame.extend_from_slice(&buf[..count]);
-        if let Err(error) = futures::Sink::start_send(
-            Pin::new(self.writer.as_mut().unwrap().writer()),
-            Bytes::from(frame),
-        ) {
+        if let Err(error) = futures::Sink::start_send(Pin::new(self.stream()), Bytes::from(frame)) {
             return Poll::Ready(Err(io::Error::other(
                 self.fail(crate::wire::map_stream_error(error)),
             )));
