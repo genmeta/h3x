@@ -1,14 +1,8 @@
 use std::{borrow::Cow, error::Error as StdError, fmt, sync::Arc};
 
-use crate::{
-    StreamId,
-    platform::{MaybeSend, MaybeSync},
-};
+use crate::StreamId;
 
-#[cfg(not(target_arch = "wasm32"))]
 type SharedError = Arc<dyn StdError + Send + Sync + 'static>;
-#[cfg(target_arch = "wasm32")]
-type SharedError = Arc<dyn StdError + 'static>;
 
 /// An HTTP/3, QPACK, or enabled extension application error code.
 ///
@@ -207,7 +201,7 @@ impl Error {
     pub(crate) fn connection(
         code: Option<Code>,
         message: impl Into<Cow<'static, str>>,
-        source: impl StdError + MaybeSend + MaybeSync + 'static,
+        source: impl StdError + Send + Sync + 'static,
     ) -> Self {
         let source = context_source(message, source);
         match code {
@@ -240,7 +234,7 @@ impl Error {
     pub(crate) fn stream_with_source(
         code: Option<Code>,
         message: impl Into<Cow<'static, str>>,
-        source: impl StdError + MaybeSend + MaybeSync + 'static,
+        source: impl StdError + Send + Sync + 'static,
     ) -> Self {
         let source = context_source(message, source);
         match code {
@@ -249,12 +243,6 @@ impl Error {
                 source: Some(source),
             },
             None => Self::Transport { source },
-        }
-    }
-
-    pub(crate) fn send_body(source: impl StdError + MaybeSend + MaybeSync + 'static) -> Self {
-        Self::Body {
-            source: context_source("failed to read the outgoing HTTP body", source),
         }
     }
 
@@ -276,7 +264,6 @@ impl Error {
     pub(crate) const fn invalid_state(operation: &'static str) -> Self {
         Self::InvalidState { operation }
     }
-
 }
 
 impl fmt::Display for Error {
@@ -371,7 +358,7 @@ fn message_source(message: impl Into<Cow<'static, str>>) -> SharedError {
 
 fn context_source(
     message: impl Into<Cow<'static, str>>,
-    source: impl StdError + MaybeSend + MaybeSync + 'static,
+    source: impl StdError + Send + Sync + 'static,
 ) -> SharedError {
     Arc::new(ContextError {
         message: message.into(),
@@ -420,13 +407,12 @@ mod tests {
 
     #[test]
     fn body_error_has_a_distinct_variant_and_source() {
-        let error = Error::send_body(io::Error::other("producer failed"));
+        let error = Error::Body {
+            source: Arc::new(io::Error::other("producer failed")),
+        };
 
         assert!(matches!(error, Error::Body { .. }));
-        assert_eq!(
-            error.source().unwrap().source().unwrap().to_string(),
-            "producer failed"
-        );
+        assert_eq!(error.source().unwrap().to_string(), "producer failed");
     }
 
     #[test]

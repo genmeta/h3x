@@ -6,11 +6,12 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use http::{HeaderName, HeaderValue};
 use http_body::Body as _;
 
 use super::Response;
-use crate::{BodyWriter, Chunk, Endpoint, Error, Fixed, platform::BoxFuture};
+use crate::{BodyWriter, Chunk, Endpoint, Error, Fixed};
 
 /// A one-shot client request. Construction never starts network or body work.
 pub struct Request<B> {

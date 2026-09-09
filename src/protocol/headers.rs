@@ -5,10 +5,7 @@ use http::{
 };
 
 use super::qpack::Field;
-use crate::{
-    Code, Error,
-    platform::{MaybeSend, MaybeSync},
-};
+use crate::{Code, Error};
 
 pub(crate) fn content_length(headers: &HeaderMap) -> Result<Option<u64>, Error> {
     let mut parsed = None;
@@ -31,22 +28,6 @@ pub(crate) fn content_length(headers: &HeaderMap) -> Result<Option<u64>, Error> 
         }
     }
     Ok(parsed)
-}
-
-pub(crate) fn validate_request(parts: &http::request::Parts) -> Result<(), Error> {
-    #[cfg(feature = "webtransport")]
-    let protocol = parts
-        .extensions
-        .get::<crate::webtransport::ProtocolMarker>()
-        .map(|_| crate::webtransport::PROTOCOL.as_bytes());
-    #[cfg(not(feature = "webtransport"))]
-    let protocol = None;
-    request_pseudo_fields(&parts.method, &parts.uri, &parts.headers, protocol)?;
-    for (name, value) in &parts.headers {
-        validate_regular_field(name, value)?;
-    }
-    content_length(&parts.headers)?;
-    Ok(())
 }
 
 pub(crate) fn request_fields(parts: http::request::Parts) -> Result<Vec<Field>, Error> {
@@ -360,22 +341,21 @@ fn validate_request_pseudo(
     {
         return Err(message_error("WebTransport requires the https scheme"));
     }
-    let scheme = scheme.ok_or_else(|| message_error("request is missing :scheme"))?;
+    scheme.ok_or_else(|| message_error("request is missing :scheme"))?;
     let path = path.ok_or_else(|| message_error("request is missing :path"))?;
     if path.is_empty() || (path != b"*" && !path.starts_with(b"/")) {
         return Err(message_error("request :path is not path-absolute"));
     }
-    if scheme.eq_ignore_ascii_case(b"http") || scheme.eq_ignore_ascii_case(b"https") {
-        let wire_authority = authority.filter(|value| !value.is_empty());
-        let host = headers.get(HOST).filter(|value| !value.is_empty());
-        if wire_authority.is_none() && host.is_none() {
-            return Err(message_error("HTTP request is missing authority and Host"));
-        }
-        if let (Some(authority), Some(host)) = (wire_authority, host)
-            && authority != host.as_bytes()
-        {
-            return Err(message_error("request :authority and Host disagree"));
-        }
+    // Match outbound URI validation for every scheme, including an explicitly empty Host.
+    let wire_authority = authority.filter(|value| !value.is_empty());
+    let host = headers.get(HOST);
+    if wire_authority.is_none() && host.is_none_or(HeaderValue::is_empty) {
+        return Err(message_error("HTTP request is missing authority and Host"));
+    }
+    if let (Some(authority), Some(host)) = (wire_authority, host)
+        && authority != host.as_bytes()
+    {
+        return Err(message_error("request :authority and Host disagree"));
     }
     Ok(())
 }
@@ -444,8 +424,50 @@ pub(super) fn message_error(message: impl Into<std::borrow::Cow<'static, str>>) 
 
 fn message_source<E>(message: impl Into<std::borrow::Cow<'static, str>>) -> impl FnOnce(E) -> Error
 where
-    E: std::error::Error + MaybeSend + MaybeSync + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
     let message = message.into();
     move |source| Error::stream_with_source(Some(Code::H3_MESSAGE_ERROR), message, source)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbound_validation_retains_authority_and_host_rules_for_custom_schemes() {
+        let fields = || {
+            vec![
+                Field {
+                    name: Bytes::from_static(b":method"),
+                    value: Bytes::from_static(b"GET"),
+                },
+                Field {
+                    name: Bytes::from_static(b":scheme"),
+                    value: Bytes::from_static(b"custom"),
+                },
+                Field {
+                    name: Bytes::from_static(b":path"),
+                    value: Bytes::from_static(b"/"),
+                },
+            ]
+        };
+        assert!(request_parts(fields()).is_err());
+        let mut valid = fields();
+        valid.push(Field {
+            name: Bytes::from_static(b":authority"),
+            value: Bytes::from_static(b"peer.test"),
+        });
+        assert_eq!(
+            request_parts(valid.clone()).unwrap().uri,
+            "custom://peer.test/"
+        );
+        valid.push(Field {
+            name: Bytes::from_static(b"host"),
+            value: Bytes::from_static(b"other.test"),
+        });
+        assert!(request_parts(valid.clone()).is_err());
+        valid.last_mut().unwrap().value = Bytes::new();
+        assert!(request_parts(valid).is_err());
+    }
 }

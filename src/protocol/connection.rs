@@ -32,30 +32,23 @@ use crate::{
     wire::{self, ChunkReader, FrameReader, FrameType, write_frame},
 };
 mod client;
+mod drain;
+mod goaway;
 mod server;
-mod state;
 #[cfg(test)]
 mod tests;
+use drain::Drain;
+use goaway::*;
 pub use server::ResponseSender;
-use state::*;
 
-struct QueuedRequest {
-    stream_id: StreamId,
-    request_head: http::request::Parts,
-    reader: MessageReader,
-    message_body: MessageBody,
-    writer: ResetOnDrop,
-}
 type ResponseReply = oneshot::Sender<Result<http::Response<ChunkBody>, Error>>;
 
-const REQUEST_QUEUE_SIZE: usize = 256;
 const MAX_CLASSIFYING: usize = 32;
 
-/// HTTP/3 connection: request sending, serialized acceptance and graceful shutdown.
+/// HTTP/3 connection: request sending, stream reading and graceful shutdown.
 /// Share with Arc when needed; dropping the connection closes its transport.
 pub struct Connection<T: transport::Connection> {
     inner: Arc<H3Connection<T>>,
-    accepting: tokio::sync::Mutex<()>,
     control: Mutex<Option<StreamWriter>>,
 }
 
@@ -64,11 +57,11 @@ struct H3Connection<T: transport::Connection> {
     qpack: Arc<qpack::Qpack>,
     tasks: ConnectionTasks,
     closed_rx: Shared<oneshot::Receiver<Result<(), Error>>>,
-    // Boundary checks and request registration share one atomic update.
-    state: Mutex<ConnectionState>,
+    // Admission and delivery are serialized with GOAWAY and termination.
+    goaway: Mutex<Goaway>,
+    drain: Arc<Drain>,
     terminal: watch::Sender<Option<Error>>,
-    state_changed: Notify,
-    request_ready: Notify,
+    admission_changed: watch::Sender<()>,
 }
 
 /// Adopts a transport and returns the HTTP/3 connection.
@@ -76,7 +69,7 @@ struct H3Connection<T: transport::Connection> {
 pub fn new<T: transport::Connection>(
     transport: T,
     mut settings: Settings,
-) -> impl std::future::Future<Output = Result<Connection<T>, Error>> + crate::platform::MaybeSend {
+) -> impl std::future::Future<Output = Result<Connection<T>, Error>> + Send {
     let transport = Arc::new(transport);
     let close_guard = CloseOnDrop(Some(transport.clone()), Code::H3_INTERNAL_ERROR);
     async move {
@@ -109,7 +102,6 @@ pub fn new<T: transport::Connection>(
         });
         Ok(Connection {
             inner,
-            accepting: tokio::sync::Mutex::new(()),
             control: Mutex::new(Some(control)),
         })
     }
@@ -168,14 +160,14 @@ impl<T: transport::Connection> H3Connection<T> {
         payload: Bytes,
     ) -> Result<(), Error> {
         let sent = self
-            .until_stopped(write_frame(&mut control, wire::FrameType::Goaway, payload))
+            .run_or_terminate(write_frame(&mut control, wire::FrameType::Goaway, payload))
             .await;
         if let Err(error) = sent {
             self.terminate(error.clone());
             return Err(error);
         }
         tokio::select! {
-            _ = self.drained() => {},
+            _ = self.drain.wait() => {},
             _ = stopped(&self.terminal) => {},
         }
         self.close(Code::H3_NO_ERROR, b"HTTP/3 drained");
@@ -199,7 +191,7 @@ impl<T: transport::Connection> H3Connection<T> {
             let seen = seen.clone();
             self.tasks.spawn(self.clone(), async move {
                 inner
-                    .until_stopped(inner.handle_uni_stream(id, recv, permit, &seen))
+                    .run_or_terminate(inner.handle_uni_stream(id, recv, permit, &seen))
                     .await
             });
         }
@@ -245,7 +237,8 @@ impl<T: transport::Connection> H3Connection<T> {
             ));
         }
         // Unknown streams cannot hold an unbounded population of drain tasks.
-        reader.stop(Code::H3_NO_ERROR)
+        reader.stop(Code::H3_NO_ERROR);
+        Ok(())
     }
 
     async fn read_control_stream(&self, reader: ChunkReader) -> Result<(), Error> {
@@ -356,6 +349,7 @@ impl<T: transport::Connection> H3Connection<T> {
         oneshot::Sender<Result<(), Error>>,
     ) {
         let (closed, closed_rx) = oneshot::channel();
+        let (terminal, _) = watch::channel(None);
         let mut decoder_writer = None;
         let inner = Arc::new_cyclic(|weak: &std::sync::Weak<Self>| {
             let weak = weak.clone();
@@ -363,6 +357,7 @@ impl<T: transport::Connection> H3Connection<T> {
                 settings,
                 encoder,
                 decoder,
+                terminal.subscribe(),
                 Box::new(move |error| {
                     if let Some(connection) = weak.upgrade() {
                         connection.terminate(error);
@@ -375,10 +370,10 @@ impl<T: transport::Connection> H3Connection<T> {
                 qpack,
                 tasks: ConnectionTasks::default(),
                 closed_rx: closed_rx.shared(),
-                state: Mutex::new(ConnectionState::default()),
-                terminal: watch::channel(None).0,
-                state_changed: Notify::new(),
-                request_ready: Notify::new(),
+                goaway: Mutex::new(Goaway::default()),
+                drain: Arc::new(Drain::default()),
+                terminal,
+                admission_changed: watch::channel(()).0,
             }
         });
         (
@@ -394,14 +389,10 @@ impl<T: transport::Connection> H3Connection<T> {
         closed: oneshot::Sender<Result<(), Error>>,
     ) {
         if std::panic::AssertUnwindSafe(async {
-            let inner = self.clone();
-            self.tasks.spawn(self.clone(), async move {
-                inner.until_stopped(decoder.run()).await
-            });
+            self.tasks.spawn(self.clone(), decoder.run());
             let result = tokio::select! {
                 error = stopped(&self.terminal) => Err(error),
                 error = self.transport.closed() => Err(map_connection_error(error)),
-                result = self.accept_requests() => result,
                 result = self.accept_uni_loop() => result,
                 _ = self.tasks.reap(&self) => unreachable!(),
             };
@@ -420,7 +411,6 @@ impl<T: transport::Connection> H3Connection<T> {
             error.code().unwrap_or(Code::H3_INTERNAL_ERROR),
             error.to_string().as_bytes(),
         );
-        self.qpack.fail(error);
         self.tasks.join(&self).await;
         let error = self.failure();
         let _ = closed.send(if error.code() == Some(Code::H3_NO_ERROR) {
@@ -569,7 +559,8 @@ impl<T: transport::Connection> H3Connection<T> {
         ));
     }
 
-    pub(super) async fn until_stopped<V>(
+    /// Race work with termination; connection errors synchronously close admission.
+    pub(super) async fn run_or_terminate<V>(
         &self,
         work: impl Future<Output = Result<V, Error>>,
     ) -> Result<V, Error> {
@@ -577,7 +568,7 @@ impl<T: transport::Connection> H3Connection<T> {
             error = stopped(&self.terminal) => Err(error),
             result = work => result,
         };
-        self.check(result)
+        self.terminate_on_connection_error(result)
     }
 }
 

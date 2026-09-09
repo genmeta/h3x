@@ -12,14 +12,10 @@ use dquic::prelude::StreamWriter;
 use futures::{Sink, Stream};
 
 use super::{SessionState, application_error_code, map_application_error};
-use crate::{
-    Code, Error, StreamId,
-    platform::{MaybeSend, MaybeSync},
-    transport, wire,
-};
+use crate::{Code, Error, StreamId, transport, wire};
 
 pub(crate) trait Writer:
-    Sink<Bytes, Error = transport::StreamError> + MaybeSend + Unpin + 'static
+    Sink<Bytes, Error = transport::StreamError> + Send + Unpin + 'static
 {
     fn id(&self) -> StreamId;
     fn reset_at(&mut self, code: Code, reliable_size: u64) -> Result<(), transport::StreamError>;
@@ -75,7 +71,7 @@ where
     })
 }
 
-pub(crate) trait AbortStream: MaybeSend + MaybeSync {
+pub(crate) trait AbortStream: Send + Sync {
     fn abort(&self, code: Code);
     fn finished(&self) -> bool;
 }
@@ -102,8 +98,7 @@ impl AbortStream for RecvCore {
                 "WebTransport receive stream was aborted",
             ));
             drop(error);
-            let _ = self
-                .reader
+            self.reader
                 .lock()
                 .expect("WebTransport receive stream lock poisoned")
                 .stop(code);
@@ -160,7 +155,8 @@ impl RecvStream {
             .reader
             .lock()
             .expect("WebTransport receive stream lock poisoned")
-            .stop(code)
+            .stop(code);
+        Ok(())
     }
 
     fn finish(&self) {

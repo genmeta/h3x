@@ -93,10 +93,41 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn normalized_targets_preserve_constraints_and_local_identity_partitioning() {
+        let target = super::super::identity::normalize_name("peer.test.").unwrap();
+        assert_eq!(target, "peer.test");
+        for target in [
+            "peer.test:443",
+            "https://peer.test",
+            "*.test",
+            "peer.test/path",
+            "peer.test?key=x",
+            "peer.test#key",
+        ] {
+            assert!(
+                super::super::identity::normalize_name(target).is_err(),
+                "{target}"
+            );
+        }
+        let pool = Pool::default();
+        let mut publishers = Vec::new();
+        for local in [
+            None,
+            Some("alice.test".to_owned()),
+            Some("bob.test".to_owned()),
+        ] {
+            let key = (local, target.clone());
+            publishers.push(pool.reserve(&key).unwrap().1.unwrap());
+            assert!(pool.reserve(&key).unwrap().1.is_none());
+        }
+        assert_eq!(pool.entries.lock().unwrap().len(), 3);
+    }
+
     #[tokio::test]
     async fn shared_dial_capacity_and_failed_dial_cleanup() {
         let pool = Pool::default();
-        let key = (None, "bob.dhttp.net".parse().unwrap());
+        let key = (None, "bob.dhttp.net".to_owned());
         let (_, publish) = pool.reserve(&key).unwrap();
         let publish = publish.unwrap();
         let (entry, duplicate) = pool.reserve(&key).unwrap();
@@ -115,20 +146,17 @@ mod tests {
         let mut senders = vec![retry.unwrap()];
         for i in 1..MAX_PENDING {
             senders.push(
-                pool.reserve(&(None, format!("peer{i}.dhttp.net").parse().unwrap()))
+                pool.reserve(&(None, format!("peer{i}.dhttp.net")))
                     .unwrap()
                     .1
                     .unwrap(),
             );
         }
         assert!(matches!(
-            pool.reserve(&(None, "extra.dhttp.net".parse().unwrap())),
+            pool.reserve(&(None, "extra.dhttp.net".to_owned())),
             Err(Error::Capacity)
         ));
         drop(senders);
-        assert!(
-            pool.reserve(&(None, "extra.dhttp.net".parse().unwrap()))
-                .is_ok()
-        );
+        assert!(pool.reserve(&(None, "extra.dhttp.net".to_owned())).is_ok());
     }
 }

@@ -1,8 +1,9 @@
 use std::{
     fmt,
-    future::{Future, poll_fn},
+    future::poll_fn,
     io,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll, ready},
 };
 
@@ -10,10 +11,7 @@ use bytes::Bytes;
 use http::HeaderMap;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
-use tokio::{
-    io::{AsyncWrite, ReadHalf, SimplexStream, WriteHalf},
-    sync::{mpsc, oneshot},
-};
+use tokio::io::AsyncWrite;
 
 use crate::Error;
 
@@ -109,122 +107,73 @@ impl HttpBody for ChunkBody {
     }
 }
 
-pub(crate) enum Control {
-    Flush {
-        through: u64,
-        reply: oneshot::Sender<Result<(), Error>>,
-    },
-    Finish {
-        through: u64,
-        trailers: Option<HeaderMap>,
-    },
-}
-
-impl Control {
-    pub(crate) fn through(&self) -> u64 {
-        match self {
-            Self::Flush { through, .. } | Self::Finish { through, .. } => *through,
-        }
-    }
-}
-
-/// An exclusive, bounded byte producer for one HTTP request direction.
-///
-/// A successful write accepts bytes locally. Flush and shutdown wait for the
-/// transport; dropping an unfinished writer aborts only the upload.
+/// Owns the send direction of a streaming request.
+/// DATA writes are submitted as complete, bounded frames. Flush waits only for
+/// submission, while shutdown waits for FIN completion. Drop cancels this direction.
 pub struct BodyWriter {
-    write_body_handler: Option<futures::future::AbortHandle>,
-    pipe: WriteHalf<SimplexStream>,
-    control: mpsc::Sender<Control>,
-    done: oneshot::Receiver<Result<(), Error>>,
-    flush: Option<oneshot::Receiver<Result<(), Error>>>,
-    written: u64,
-    ending: bool,
+    writer: Option<crate::transport::ResetOnDrop>,
+    qpack: Arc<crate::qpack::Qpack>,
+    stream_id: crate::StreamId,
+    message_body: super::message::MessageBody,
+    finishing: Option<futures::future::BoxFuture<'static, Result<(), Error>>>,
     result: Option<Result<(), Error>>,
+    on_error: Option<Box<dyn FnOnce(Error) + Send>>,
 }
 
-impl std::fmt::Debug for BodyWriter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for BodyWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BodyWriter")
-            .field("ending", &self.ending)
+            .field("stream_id", &self.stream_id)
+            .field(
+                "ending",
+                &(self.finishing.is_some() || self.result.is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
 
-/// Created before scheduling so destroying an unpolled owner wakes the writer.
-pub(crate) struct Upload {
-    pub(crate) pipe: ReadHalf<SimplexStream>,
-    pub(crate) control: mpsc::Receiver<Control>,
-    done: oneshot::Sender<Result<(), Error>>,
-}
-
-impl Upload {
-    pub(crate) fn complete(self, result: Result<(), Error>) {
-        let _ = self.done.send(result);
-    }
-}
-
-impl Drop for BodyWriter {
-    fn drop(&mut self) {
-        if let Some(handler) = self.write_body_handler.take() {
-            handler.abort();
-        }
-    }
-}
-
 impl BodyWriter {
-    pub(crate) fn cancel_with(&mut self, handler: futures::future::AbortHandle) {
-        self.write_body_handler = Some(handler);
-    }
-    pub(crate) fn channel() -> (Self, Upload) {
-        let (reader, pipe) = tokio::io::simplex(64 * 1024);
-        let (control, commands) = mpsc::channel(1);
-        let (done, result) = oneshot::channel();
-        (
-            Self {
-                write_body_handler: None,
-                pipe,
-                control,
-                done: result,
-                flush: None,
-                written: 0,
-                ending: false,
-                result: None,
-            },
-            Upload {
-                pipe: reader,
-                control: commands,
-                done,
-            },
-        )
+    pub(super) fn new(
+        writer: crate::transport::ResetOnDrop,
+        qpack: Arc<crate::qpack::Qpack>,
+        stream_id: crate::StreamId,
+        message_body: super::message::MessageBody,
+        on_error: impl FnOnce(Error) + Send + 'static,
+    ) -> Self {
+        Self {
+            writer: Some(writer),
+            qpack,
+            stream_id,
+            message_body,
+            finishing: None,
+            result: None,
+            on_error: Some(Box::new(on_error)),
+        }
     }
 
-    fn poll_result(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    fn fail(&mut self, error: Error) -> Error {
+        if let Some(mut writer) = self.writer.take() {
+            writer.reset(error.code().unwrap_or(crate::Code::H3_REQUEST_CANCELLED));
+        }
+        self.finishing.take();
+        let _ = self
+            .qpack
+            .terminate_on_connection_error::<()>(Err(error.clone()));
+        if let Some(on_error) = self.on_error.take() {
+            on_error(error.clone());
+        }
+        self.result = Some(Err(error.clone()));
+        error
+    }
+
+    fn check_connection(&mut self) -> Result<(), Error> {
         if let Some(result) = &self.result {
-            return Poll::Ready(result.clone());
+            return result.clone();
         }
-        let result = ready!(Pin::new(&mut self.done).poll(cx)).unwrap_or(Err(Error::OwnerStopped));
-        self.result = Some(result.clone());
-        Poll::Ready(result)
-    }
-
-    fn poll_pending_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        if let Some(flush) = &mut self.flush {
-            // An owner failure must wake even if it never polled the flush command.
-            if let Poll::Ready(result) = Pin::new(flush).poll(cx) {
-                self.flush = None;
-                return match result {
-                    Ok(result) => Poll::Ready(result),
-                    Err(_) => self.poll_result(cx),
-                };
-            }
-            if let Poll::Ready(result) = self.poll_result(cx) {
-                self.flush = None;
-                return Poll::Ready(result);
-            }
-            return Poll::Pending;
+        match self.qpack.failure() {
+            Some(error) => Err(self.fail(error)),
+            None => Ok(()),
         }
-        Poll::Ready(Ok(()))
     }
 
     fn poll_finish(
@@ -232,23 +181,44 @@ impl BodyWriter {
         cx: &mut Context<'_>,
         trailers: &mut Option<HeaderMap>,
     ) -> Poll<Result<(), Error>> {
-        if !self.ending {
-            ready!(self.poll_pending_flush(cx))?;
-            if let Poll::Ready(result) = self.poll_result(cx) {
-                return Poll::Ready(result);
-            }
-            let command = Control::Finish {
-                through: self.written,
-                trailers: trailers.take(),
-            };
-            if self.control.try_send(command).is_err() {
-                return self.poll_result(cx);
-            }
-            self.ending = true;
-            // The end intention is in the control queue before the pipe can report EOF.
-            ready!(Pin::new(&mut self.pipe).poll_shutdown(cx)).map_err(|_| Error::OwnerStopped)?;
+        self.check_connection()?;
+        if let Some(result) = &self.result {
+            return Poll::Ready(result.clone());
         }
-        self.poll_result(cx)
+        if self.finishing.is_none() {
+            if let Err(error) = self.message_body.finish() {
+                return Poll::Ready(Err(self.fail(error)));
+            }
+            let mut writer = self.writer.take().unwrap();
+            let qpack = self.qpack.clone();
+            let stream_id = self.stream_id;
+            let message_body = self.message_body;
+            let trailers = trailers.take();
+            self.finishing = Some(Box::pin(async move {
+                let result = tokio::select! {
+                    biased;
+                    error = qpack.stopped() => Err(error),
+                    result = async {
+                        if let Some(trailers) = trailers {
+                            super::message::send_trailers(&mut writer, trailers, &message_body, &qpack, stream_id).await?;
+                        }
+                        writer.finish().await.map_err(crate::wire::map_stream_error)
+                    } => result,
+                };
+                if let Err(error) = &result {
+                    writer.reset(error.code().unwrap_or(crate::Code::H3_REQUEST_CANCELLED));
+                }
+                result
+            }));
+        }
+        let result = ready!(self.finishing.as_mut().unwrap().as_mut().poll(cx));
+        self.finishing.take();
+        if let Err(error) = result {
+            return Poll::Ready(Err(self.fail(error)));
+        }
+        self.on_error.take();
+        self.result = Some(Ok(()));
+        Poll::Ready(Ok(()))
     }
 
     /// Submits FIN and waits for the final transport result of the upload.
@@ -256,15 +226,21 @@ impl BodyWriter {
         poll_fn(|cx| self.poll_finish(cx, &mut None)).await
     }
 
-    /// Sends one trailing field section after all accepted bytes, then FIN.
+    /// Sends one trailing field section after all submitted DATA, then FIN.
     pub async fn trailers(mut self, trailers: HeaderMap) -> Result<(), Error> {
         let mut trailers = Some(trailers);
         poll_fn(|cx| self.poll_finish(cx, &mut trailers)).await
     }
 }
 
-fn io_error(error: Error) -> io::Error {
-    io::Error::other(error)
+impl Drop for BodyWriter {
+    fn drop(&mut self) {
+        self.writer.take();
+        self.finishing.take();
+        if let Some(on_error) = self.on_error.take() {
+            on_error(Error::Cancelled);
+        }
+    }
 }
 
 impl AsyncWrite for BodyWriter {
@@ -273,52 +249,58 @@ impl AsyncWrite for BodyWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.ending {
-            return Poll::Ready(Err(io_error(Error::invalid_state("write"))));
+        self.check_connection().map_err(io::Error::other)?;
+        if self.finishing.is_some() || self.result.is_some() {
+            return Poll::Ready(Err(io::Error::other(Error::invalid_state("write"))));
         }
-        ready!(self.poll_pending_flush(cx)).map_err(io_error)?;
-        if let Poll::Ready(result) = self.poll_result(cx) {
-            return Poll::Ready(Err(io_error(
-                result.err().unwrap_or(Error::invalid_state("write")),
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let count = buf.len().min(crate::wire::MAX_DATA_CHUNK);
+        let mut message_body = self.message_body;
+        if let Err(error) = message_body.data(count as u64) {
+            return Poll::Ready(Err(io::Error::other(self.fail(error))));
+        }
+        if let Err(error) = ready!(self.writer.as_mut().unwrap().writer().poll_ready(cx)) {
+            return Poll::Ready(Err(io::Error::other(
+                self.fail(crate::wire::map_stream_error(error)),
             )));
         }
-        let count = match ready!(Pin::new(&mut self.pipe).poll_write(cx, buf)) {
-            Ok(count) => count,
-            Err(_) => {
-                return self
-                    .poll_result(cx)
-                    .map(|result| Err(io_error(result.err().unwrap_or(Error::OwnerStopped))));
-            }
-        };
-        self.written += count as u64;
+        // Sink accepts one Bytes atomically. Keeping header and payload together
+        // avoids leaving a half-submitted frame when a pending write is cancelled.
+        let mut frame = Vec::with_capacity(count + 16);
+        if let Err(error) = crate::wire::WriteFrame::put_frame(
+            &mut frame,
+            &crate::wire::FrameHeader {
+                frame_type: crate::wire::FrameType::Data,
+                length: count as u64,
+            },
+        ) {
+            return Poll::Ready(Err(io::Error::other(self.fail(error))));
+        }
+        frame.extend_from_slice(&buf[..count]);
+        if let Err(error) = futures::Sink::start_send(
+            Pin::new(self.writer.as_mut().unwrap().writer()),
+            Bytes::from(frame),
+        ) {
+            return Poll::Ready(Err(io::Error::other(
+                self.fail(crate::wire::map_stream_error(error)),
+            )));
+        }
+        self.message_body = message_body;
         Poll::Ready(Ok(count))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.ending {
-            return self.poll_result(cx).map_err(io_error);
+        if self.finishing.is_some() {
+            return self.poll_finish(cx, &mut None).map_err(io::Error::other);
         }
-        if self.flush.is_none() {
-            if let Poll::Ready(result) = self.poll_result(cx) {
-                return Poll::Ready(result.map_err(io_error));
-            }
-            let (reply, receive) = oneshot::channel();
-            if self
-                .control
-                .try_send(Control::Flush {
-                    through: self.written,
-                    reply,
-                })
-                .is_err()
-            {
-                return self.poll_result(cx).map_err(io_error);
-            }
-            self.flush = Some(receive);
-        }
-        self.poll_pending_flush(cx).map_err(io_error)
+        // Each successful write already submitted a complete DATA frame. Native
+        // StreamWriter::poll_flush waits for ACKs, which is not this API's barrier.
+        Poll::Ready(self.check_connection().map_err(io::Error::other))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_finish(cx, &mut None).map_err(io_error)
+        self.poll_finish(cx, &mut None).map_err(io::Error::other)
     }
 }

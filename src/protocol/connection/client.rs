@@ -3,7 +3,6 @@ use http_body::Body;
 use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
 
 use super::*;
-use crate::{body, platform::MaybeSend};
 
 impl<T: transport::Connection> Connection<T> {
     pub async fn request<B>(
@@ -11,18 +10,19 @@ impl<T: transport::Connection> Connection<T> {
         request: http::Request<B>,
     ) -> Result<http::Response<ChunkBody>, Error>
     where
-        B: Body<Data = Bytes> + MaybeSend + 'static,
+        B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<crate::BoxError>,
     {
         let (parts, body) = request.into_parts();
-        headers::validate_request(&parts).map_err(Error::into_invalid_message)?;
-        let message_body = message::request_body(&parts)?;
+        let message_body = message::request_body(&parts).map_err(Error::into_invalid_message)?;
+        let method = parts.method.clone();
+        let fields = headers::request_fields(parts).map_err(Error::into_invalid_message)?;
         message_body.validate_size(body.size_hint())?;
-        let (response, write_body_handler) = self
+        let (response, work) = self
             .inner
             .exec(
-                parts,
-                Outgoing::Body(
+                (method, fields, message_body),
+                Some(
                     body.map_err(|e| Error::Body {
                         source: Arc::from(e.into()),
                     })
@@ -30,7 +30,9 @@ impl<T: transport::Connection> Connection<T> {
                 ),
             )
             .await?;
-        let mut cancellation = AbortOnDrop(Some(write_body_handler));
+        let RequestWork::Automatic(mut cancellation) = work else {
+            unreachable!()
+        };
         let result = response.await;
         if result.is_ok() {
             cancellation.0.take();
@@ -42,11 +44,16 @@ impl<T: transport::Connection> Connection<T> {
         &self,
         parts: http::request::Parts,
     ) -> Result<(BodyWriter, ResponseFuture), Error> {
-        headers::validate_request(&parts).map_err(Error::into_invalid_message)?;
-        let (mut writer, upload) = BodyWriter::channel();
-        let (response, write_body_handler) =
-            self.inner.exec(parts, Outgoing::Upload(upload)).await?;
-        writer.cancel_with(write_body_handler);
+        let message_body = message::request_body(&parts).map_err(Error::into_invalid_message)?;
+        let method = parts.method.clone();
+        let fields = headers::request_fields(parts).map_err(Error::into_invalid_message)?;
+        let (response, work) = self
+            .inner
+            .exec((method, fields, message_body), None)
+            .await?;
+        let RequestWork::Streaming(writer) = work else {
+            unreachable!()
+        };
         Ok((writer, response))
     }
 }
@@ -54,68 +61,117 @@ impl<T: transport::Connection> Connection<T> {
 impl<T: transport::Connection> H3Connection<T> {
     async fn exec(
         self: &Arc<Self>,
-        request_head: http::request::Parts,
-        request_body: Outgoing,
-    ) -> Result<(ResponseFuture, AbortHandle), Error> {
-        let message_body =
-            message::request_body(&request_head).map_err(Error::into_invalid_message)?;
-        let method = request_head.method.clone();
-        let fields = headers::request_fields(request_head).map_err(Error::into_invalid_message)?;
-        let (preparation, preparation_cancel) = self.prepare_request()?;
+        prepared: (http::Method, Vec<qpack::Field>, MessageBody),
+        request_body: Option<UnsyncBoxBody<Bytes, Error>>,
+    ) -> Result<(ResponseFuture, RequestWork), Error> {
+        let (method, fields, message_body) = prepared;
+        let preparation = {
+            let goaway = self.goaway.lock().unwrap();
+            if self.terminal.borrow().is_some() {
+                return Err(self.failure());
+            }
+            if let Some(boundary) = goaway.peer_boundary {
+                return Err(Error::Goaway { boundary });
+            }
+            if goaway.local_boundary.is_some() {
+                return Err(Error::Draining);
+            }
+            self.drain.track()
+        };
         let work = async {
-            let (stream_id, (read_stream, write_stream)) = self
-                .transport
-                .open_bi()
-                .await
-                .map_err(map_connection_error)?;
+            let (stream_id, (read_stream, write_stream)) = tokio::select! {
+                error = self.peer_rejected(None) => return Err(error),
+                result = self.transport.open_bi() => result.map_err(map_connection_error)?,
+            };
             let mut reader = MessageReader::new(
                 ChunkReader::new(stream_id, read_stream),
                 self.qpack.clone(),
                 stream_id,
             );
             let mut writer = ResetOnDrop::new(write_stream);
-            let (response_waiter, pending_response, response_cancel) =
-                self.register_pending_response(stream_id)?;
-            self.track_request(&mut reader, &mut writer);
-            let encoded_headers = self.qpack.encode_fields(stream_id, fields).await?;
-            write_frame(writer.writer(), wire::FrameType::Headers, encoded_headers).await?;
+            let (reply, receive) = oneshot::channel();
+            let (stop, response_cancel) = AbortHandle::new_pair();
+            let response_waiter = ResponseFuture {
+                reply: receive,
+                stop: Some(stop),
+            };
+            let (upload_failed, upload_error) = oneshot::channel();
+            let reading = self.drain.track();
+            let writing = self.drain.track();
+            reader.on_finish(move || drop(reading));
+            writer.on_finish(move || drop(writing));
+            tokio::select! {
+                error = self.peer_rejected(Some(stream_id)) => return Err(error),
+                result = async {
+                    let encoded = self.qpack.encode_fields(stream_id, fields).await?;
+                    write_frame(writer.writer(), wire::FrameType::Headers, encoded).await
+                } => result?,
+            }
 
-            // Shutdown and task handoff are decided under the same state lock.
-            let state = self.state.lock().unwrap();
-            if state.terminated {
+            // Declare the owned handoff before the lock so unwinding releases
+            // the admission lock before a streaming writer runs its cleanup.
+            let sending;
+            // Shutdown and task handoff are decided under the same GOAWAY lock.
+            let goaway = self.goaway.lock().unwrap();
+            if self.terminal.borrow().is_some() {
                 return Err(self.failure());
             }
-            if state.goaway.local_boundary.is_some() {
+            if goaway.local_boundary.is_some() {
                 return Err(Error::Draining);
             }
-            if !state.pending_responses.contains_key(&stream_id) {
-                return Err(state
-                    .goaway
-                    .peer_boundary
-                    .map_or(Error::Cancelled, |boundary| Error::Goaway { boundary }));
+            if let Some(boundary) = goaway.peer_boundary
+                && stream_id >= boundary
+            {
+                return Err(Error::Goaway { boundary });
             }
-            let inner = self.clone();
-            let (write_body_handler, upload_cancel) = AbortHandle::new_pair();
-            self.tasks.spawn(self.clone(), async move {
-                inner
-                    .write_body(stream_id, writer, request_body, message_body, upload_cancel)
-                    .await
-            });
-            let mut upload_start = AbortOnDrop(Some(write_body_handler));
+            sending = match request_body {
+                Some(body) => {
+                    let inner = self.clone();
+                    let (write_body_handler, upload_cancel) = AbortHandle::new_pair();
+                    self.tasks.spawn(self.clone(), async move {
+                        let result = inner
+                            .write_body(stream_id, writer, body, message_body, upload_cancel)
+                            .await;
+                        if let Err(error) = &result {
+                            let _ = upload_failed.send(error.clone());
+                        }
+                        result
+                    });
+                    RequestWork::Automatic(AbortOnDrop(Some(write_body_handler)))
+                }
+                None => RequestWork::Streaming(BodyWriter::new(
+                    writer,
+                    self.qpack.clone(),
+                    stream_id,
+                    message_body,
+                    move |error| {
+                        let _ = upload_failed.send(error);
+                    },
+                )),
+            };
             self.tasks.spawn(
                 self.clone(),
-                cancel_on_abort(
-                    self.clone().read_response(pending_response, reader, method),
+                self.clone().read_response(
+                    stream_id,
+                    reader,
+                    method,
+                    reply,
+                    upload_error,
                     response_cancel,
                 ),
             );
-            drop(state);
-            Ok((response_waiter, upload_start.0.take().unwrap()))
+            drop(goaway);
+            Ok((response_waiter, sending))
         };
         let result = self
-            .until_stopped(cancel_on_abort(work, preparation_cancel))
+            .run_or_terminate(async {
+                tokio::select! {
+                    error = self.local_shutdown() => Err(error),
+                    result = work => result,
+                }
+            })
             .await;
-        // Stream cleanup now updates the request state; preparation can finish.
+        // The stream guards are now responsible for draining; release preparation.
         drop(preparation);
         result
     }
@@ -125,59 +181,65 @@ impl<T: transport::Connection> H3Connection<T> {
         &self,
         stream_id: StreamId,
         mut writer: ResetOnDrop,
-        mut outgoing: Outgoing,
+        mut body: UnsyncBoxBody<Bytes, Error>,
         message_body: MessageBody,
         upload_cancel: AbortRegistration,
     ) -> Result<(), Error> {
-        let work = async {
-            match &mut outgoing {
-                Outgoing::Body(body) => {
-                    message::send_body(&mut writer, body, message_body, &self.qpack, stream_id)
-                        .await
-                }
-                Outgoing::Upload(upload) => {
-                    message::send_upload(&mut writer, upload, message_body, &self.qpack, stream_id)
-                        .await
-                }
-            }
-        };
+        let work = message::send_body(&mut writer, &mut body, message_body, &self.qpack, stream_id);
         let result = self
-            .until_stopped(cancel_on_abort(work, upload_cancel))
+            .run_or_terminate(cancel_on_abort(work, upload_cancel))
             .await;
-        if let Outgoing::Upload(upload) = outgoing {
-            upload.complete(result.clone());
-        }
         if let Err(error) = &result {
             writer.reset(error.code().unwrap_or(Code::H3_REQUEST_CANCELLED));
-            self.complete_response(stream_id, Err(error.clone()));
         }
         result
     }
 
-    /// Final headers complete the waiter; the returned Body owns further reads.
+    /// This task owns its waiter and observes only its own upload/GOAWAY failures.
     async fn read_response(
         self: Arc<Self>,
-        pending: PendingResponse<T>,
+        stream_id: StreamId,
         mut reader: MessageReader,
         method: http::Method,
+        reply: ResponseReply,
+        mut upload_error: oneshot::Receiver<Error>,
+        cancellation: AbortRegistration,
     ) -> Result<(), Error> {
-        let result = async {
-            let (parts, message_body) = self.until_stopped(reader.response(&method)).await?;
+        let work = async {
+            let (parts, message_body) = tokio::select! {
+                biased;
+                Ok(error) = &mut upload_error => return Err(error),
+                error = self.peer_rejected(Some(stream_id)) => return Err(error),
+                result = reader.response(&method) => result?,
+            };
             let body = self.wrap_body(reader, message_body);
             let mut response = http::Response::from_parts(parts, body);
-            response.extensions_mut().insert(pending.stream_id);
+            response.extensions_mut().insert(stream_id);
+            // Final delivery and GOAWAY are decided under the same lock.
+            // Declare the response first so its Body is never dropped under that lock.
+            let goaway = self.goaway.lock().unwrap();
+            if self.terminal.borrow().is_some() {
+                return Err(self.failure());
+            }
+            if let Some(boundary) = goaway.peer_boundary
+                && stream_id >= boundary
+            {
+                return Err(Error::Goaway { boundary });
+            }
             Ok(response)
-        }
-        .await;
+        };
+        let result = self
+            .run_or_terminate(cancel_on_abort(work, cancellation))
+            .await;
         let completion = result.as_ref().map(|_| ()).map_err(Clone::clone);
-        self.complete_response(pending.stream_id, result);
+        let _ = reply.send(result);
         completion
     }
 }
 
-pub(super) enum Outgoing {
-    Body(UnsyncBoxBody<Bytes, Error>),
-    Upload(body::Upload),
+enum RequestWork {
+    Automatic(AbortOnDrop),
+    Streaming(BodyWriter),
 }
 
 pub(super) struct AbortOnDrop(pub(super) Option<AbortHandle>);

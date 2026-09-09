@@ -133,6 +133,3 @@ impl<B: BufMut> WriteFrame<SettingsFrame> for B {
 fn settings_error(message: impl Into<std::borrow::Cow<'static, str>>) -> Error {
     Error::connection_protocol(Code::H3_SETTINGS_ERROR, message)
 }
-
-#[cfg(test)]
-mod tests;

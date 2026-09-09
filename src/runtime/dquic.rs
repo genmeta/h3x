@@ -1,7 +1,6 @@
 use std::{io, sync::Arc};
 
 use dquic::prelude::{StreamReader, StreamWriter};
-use http::uri::Authority;
 
 use crate::{Endpoint, Error, RemoteAuthority};
 
@@ -89,7 +88,7 @@ pub(crate) fn transport_error(source: impl std::error::Error + Send + Sync + 'st
 pub(crate) async fn authenticate(
     transport: Arc<dquic::prelude::Connection>,
     local: Option<Arc<Endpoint>>,
-    target: Option<Authority>,
+    target: Option<&str>,
 ) -> Result<Authenticated, Error> {
     let raw = &transport;
     raw.handshaked().await.map_err(transport_error)?;
@@ -127,7 +126,7 @@ pub(crate) async fn authenticate(
         })
         .transpose()?;
     if let Some(target) = target
-        && remote.as_ref().map(RemoteAuthority::name) != Some(target.host())
+        && remote.as_ref().map(RemoteAuthority::name) != Some(target)
     {
         return Err(Error::IdentityMismatch);
     }

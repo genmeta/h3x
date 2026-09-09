@@ -1,134 +1,98 @@
-//! Incoming requests: accept, read headers, deliver, then respond on the same stream.
+//! Read a request and send its response on the same bidirectional stream.
 use dquic::prelude::{StreamReader, StreamWriter};
 use http_body::Body;
 use http_body_util::BodyExt;
 
 use super::*;
-use crate::{
-    platform::MaybeSend,
-    protocol::message::{response_body, send_body},
-};
+use crate::protocol::message::{response_body, send_body};
 
 impl<T: transport::Connection> Connection<T> {
-    pub async fn accept(
+    /// Read a request from a peer bidirectional stream and retain its reply direction.
+    /// Run each stream in its own task so stalled headers do not block other requests.
+    /// Dropping this future cancels both directions. An empty stream returns None.
+    pub fn read_request(
         &self,
-    ) -> Result<Option<(http::Request<ChunkBody>, ResponseSender)>, Error> {
-        let _accepting = self.accepting.lock().await;
-        loop {
-            let queued = {
-                let mut state = self.inner.state.lock().unwrap();
-                if state.terminated {
-                    let error = self.inner.failure();
-                    return if error.code() == Some(Code::H3_NO_ERROR) {
-                        Ok(None)
-                    } else {
-                        Err(error)
-                    };
-                }
-                let queued = state.queued.pop_front();
-                if let Some(queued) = &queued {
-                    state.goaway.max_delivered = Some(
-                        state
-                            .goaway
-                            .max_delivered
-                            .map_or(queued.stream_id, |previous| previous.max(queued.stream_id)),
-                    );
-                }
-                queued
-            };
-            let Some(queued) = queued else {
-                tokio::select! {
-                    _ = stopped(&self.inner.terminal) => {},
-                    _ = self.inner.request_ready.notified() => {},
-                }
-                continue;
-            };
-            let method = queued.request_head.method.clone();
-            let body = self.inner.wrap_body(queued.reader, queued.message_body);
-            let mut request = http::Request::from_parts(queued.request_head, body);
-            request.extensions_mut().insert(queued.stream_id);
-            let response_sender = ResponseSender {
-                stream_id: queued.stream_id,
-                method,
-                writer: queued.writer,
-                qpack: self.inner.qpack.clone(),
-                terminal: self.inner.terminal.clone(),
-            };
-            return Ok(Some((request, response_sender)));
-        }
-    }
-}
-
-impl<T: transport::Connection> H3Connection<T> {
-    pub(super) async fn accept_requests(self: &Arc<Self>) -> Result<(), Error> {
-        let classifying = Arc::new(Semaphore::new(MAX_CLASSIFYING));
-        loop {
-            tokio::task::consume_budget().await;
-            let (id, (mut recv, mut send)) = self
-                .transport
-                .accept_bi()
-                .await
-                .map_err(map_connection_error)?;
-            let Some(permit) = reserve_classification(&classifying, &mut recv, &mut send) else {
-                continue;
-            };
-            let inner = self.clone();
-            self.tasks.spawn(self.clone(), async move {
-                inner.read_request(id, recv, send, permit).await
-            });
-        }
-    }
-
-    pub(super) async fn read_request(
-        self: Arc<Self>,
         id: StreamId,
         recv: StreamReader,
         send: StreamWriter,
-        classification: OwnedSemaphorePermit,
-    ) -> Result<(), Error> {
+    ) -> impl Future<Output = Result<Option<(http::Request<ChunkBody>, ResponseSender)>, Error>>
+    + Send
+    + 'static {
+        let inner = self.inner.clone();
         let mut reader = ChunkReader::new(id, recv);
         let mut writer = ResetOnDrop::new(send);
-        let first = self.until_stopped(reader.read_varint()).await?;
-        let Some(first) = first else {
-            return Ok(());
-        };
-        #[cfg(feature = "webtransport")]
-        if first == wire::WEBTRANSPORT_BIDI_SIGNAL {
-            let _session = self
-                .until_stopped(reader.read_varint())
-                .await?
-                .ok_or_else(|| {
-                    Error::connection_protocol(
-                        Code::H3_FRAME_ERROR,
-                        "missing WebTransport session ID",
-                    )
-                })?;
-            // No WT transport hooks are attached to a plain HTTP connection.
-            reader.stop(Code::WT_BUFFERED_STREAM_REJECTED)?;
-            writer.reset(Code::WT_BUFFERED_STREAM_REJECTED);
-            return Ok(());
-        }
-        let (stop, registration) = AbortHandle::new_pair();
-        self.register_incoming(id, stop, &mut reader, &mut writer)?;
-        drop(classification);
-        let _pending = PendingIncoming {
-            connection: self.clone(),
-            stream_id: id,
-        };
-        let mut reader = MessageReader::new(reader, self.qpack.clone(), id);
-        self.track_request(&mut reader, &mut writer);
-        let work = async {
-            let (parts, message_body) = self.until_stopped(reader.request(first)).await?;
-            let queued = QueuedRequest {
-                stream_id: id,
-                request_head: parts,
-                reader,
-                message_body,
-                writer,
+        async move {
+            let _admission = {
+                let goaway = inner.goaway.lock().unwrap();
+                if inner.terminal.borrow().is_some() {
+                    return Err(inner.failure());
+                }
+                if goaway.local_boundary.is_some() {
+                    writer.reset(Code::H3_REQUEST_REJECTED);
+                    reader.stop(Code::H3_REQUEST_REJECTED);
+                    return Err(Error::request_rejected("connection draining"));
+                }
+                inner.drain.track()
             };
-            self.deliver_request(queued)
-        };
-        cancel_on_abort(work, registration).await
+            let work = async {
+                let Some(first) = reader.read_varint().await? else {
+                    return Ok(None);
+                };
+                #[cfg(feature = "webtransport")]
+                if first == wire::WEBTRANSPORT_BIDI_SIGNAL {
+                    reader.read_varint().await?.ok_or_else(|| {
+                        Error::connection_protocol(
+                            Code::H3_FRAME_ERROR,
+                            "missing WebTransport session ID",
+                        )
+                    })?;
+                    reader.stop(Code::WT_BUFFERED_STREAM_REJECTED);
+                    writer.reset(Code::WT_BUFFERED_STREAM_REJECTED);
+                    return Ok(None);
+                }
+                let mut reader = MessageReader::new(reader, inner.qpack.clone(), id);
+                let reading = inner.drain.track();
+                let writing = inner.drain.track();
+                reader.on_finish(move || drop(reading));
+                writer.on_finish(move || drop(writing));
+                let (parts, message_body) = reader.request(first).await?;
+                // Delivery and GOAWAY share the lock: either this request is included
+                // in the drain boundary, or it is rejected before reaching the service.
+                {
+                    let mut goaway = inner.goaway.lock().unwrap();
+                    if inner.terminal.borrow().is_some() {
+                        return Err(inner.failure());
+                    }
+                    if goaway.local_boundary.is_some() {
+                        drop(goaway);
+                        writer.reset(Code::H3_REQUEST_REJECTED);
+                        return Err(reader.fail(Error::request_rejected("connection draining")));
+                    }
+                    goaway.max_delivered =
+                        Some(goaway.max_delivered.map_or(id, |previous| previous.max(id)));
+                }
+                let method = parts.method.clone();
+                let mut request =
+                    http::Request::from_parts(parts, inner.wrap_body(reader, message_body));
+                request.extensions_mut().insert(id);
+                let reply = ResponseSender {
+                    stream_id: id,
+                    method,
+                    writer,
+                    qpack: inner.qpack.clone(),
+                    terminal: inner.terminal.clone(),
+                };
+                Ok(Some((request, reply)))
+            };
+            inner
+                .run_or_terminate(async {
+                    tokio::select! {
+                        error = inner.local_shutdown() => Err(error),
+                        result = work => result,
+                    }
+                })
+                .await
+        }
     }
 }
 
@@ -154,13 +118,14 @@ impl ResponseSender {
 
     pub async fn send<B>(mut self, response: http::Response<B>) -> Result<(), Error>
     where
-        B: Body<Data = Bytes> + MaybeSend + 'static,
+        B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<crate::BoxError>,
     {
         let (parts, body) = response.into_parts();
         let message_body =
             response_body(&self.method, &parts, true).map_err(Error::into_invalid_message)?;
         message_body.validate_size(body.size_hint())?;
+        let fields = headers::response_fields(parts).map_err(Error::into_invalid_message)?;
         let mut body = body
             .map_err(|e| Error::Body {
                 source: Arc::from(e.into()),
@@ -170,7 +135,7 @@ impl ResponseSender {
             biased;
             error = stopped(&self.terminal) => Err(error),
             result = async {
-                let encoded = self.qpack.encode_response(self.stream_id, parts).await?;
+                let encoded = self.qpack.encode_fields(self.stream_id, fields).await?;
                 write_frame(self.writer.writer(), wire::FrameType::Headers, encoded).await?;
                 send_body(&mut self.writer, &mut body, message_body, &self.qpack, self.stream_id).await
             } => result,
@@ -179,7 +144,7 @@ impl ResponseSender {
             self.writer
                 .reset(error.code().unwrap_or(Code::H3_REQUEST_CANCELLED));
         }
-        self.qpack.fail_on_connection(result)
+        self.qpack.terminate_on_connection_error(result)
     }
 
     #[cfg(feature = "webtransport")]
@@ -188,7 +153,7 @@ impl ResponseSender {
     }
 
     #[cfg(feature = "webtransport")]
-    pub(crate) fn webtransport_keepalive(&self) -> crate::platform::KeepAlive {
+    pub(crate) fn webtransport_keepalive(&self) -> std::sync::Arc<dyn Send + Sync> {
         Arc::new(())
     }
 
@@ -205,39 +170,5 @@ impl ResponseSender {
         Err(Error::Unsupported {
             operation: "WebTransport upgrade",
         })
-    }
-}
-
-impl<T: transport::Connection> H3Connection<T> {
-    pub(super) fn deliver_request(&self, mut queued: QueuedRequest) -> Result<(), Error> {
-        let mut state = self.state.lock().unwrap();
-        if state.terminated {
-            return Err(self.failure());
-        }
-        if state.goaway.local_boundary.is_some() || state.queued.len() == REQUEST_QUEUE_SIZE {
-            drop(state);
-            let error = Error::request_rejected("connection draining or request queue full");
-            queued.writer.reset(Code::H3_REQUEST_REJECTED);
-            queued.reader.fail(error.clone());
-            return Err(error);
-        }
-        state.queued.push_back(queued);
-        self.request_ready.notify_one();
-        Ok(())
-    }
-}
-
-pub(super) fn reserve_classification(
-    classifying: &Arc<Semaphore>,
-    recv: &mut StreamReader,
-    send: &mut StreamWriter,
-) -> Option<OwnedSemaphorePermit> {
-    match classifying.clone().try_acquire_owned() {
-        Ok(permit) => Some(permit),
-        Err(_) => {
-            dquic::prelude::StopSending::stop(recv, Code::H3_REQUEST_REJECTED.as_u64());
-            dquic::prelude::CancelStream::cancel(send, Code::H3_REQUEST_REJECTED.as_u64());
-            None
-        }
     }
 }

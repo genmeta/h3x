@@ -18,7 +18,7 @@ pub use protocol::{
 pub use runtime::{Pool, init, shutdown};
 pub type EndpointError = Error;
 pub type PoolError = Error;
-use protocol::{body, platform, qpack, wire};
+use protocol::{qpack, wire};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;

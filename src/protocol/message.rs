@@ -6,10 +6,9 @@ use bytes::Bytes;
 use http::{Method, StatusCode};
 use http_body::{Frame, SizeHint};
 use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
-use tokio::io::AsyncReadExt;
 
 use crate::{
-    Code, Error, StreamId, body,
+    Code, Error, StreamId,
     protocol::headers::{self, message_error},
     qpack,
     transport::ResetOnDrop,
@@ -17,6 +16,7 @@ use crate::{
 };
 
 /// Content semantics and, when declared, the bytes still expected before EOF.
+#[derive(Clone, Copy)]
 pub(super) enum MessageBody {
     NoContent,
     Unknown,
@@ -34,7 +34,7 @@ impl MessageBody {
         }
     }
 
-    fn data(&mut self, len: u64) -> Result<(), Error> {
+    pub(super) fn data(&mut self, len: u64) -> Result<(), Error> {
         match self {
             Self::NoContent => {
                 return Err(message_error("DATA forbidden on a message without content"));
@@ -49,7 +49,7 @@ impl MessageBody {
         Ok(())
     }
 
-    fn finish(&self) -> Result<(), Error> {
+    pub(super) fn finish(&self) -> Result<(), Error> {
         if matches!(self, Self::Known { remaining } if *remaining != 0) {
             return Err(message_error("content shorter than Content-Length"));
         }
@@ -127,19 +127,14 @@ pub(super) async fn send_body(
         yield_after_batch(&mut ready_steps).await;
         let frame = frame?;
         match frame.into_data() {
-            Ok(mut data) => {
+            Ok(data) => {
                 if trailers_sent {
                     return Err(message_error("DATA after trailers"));
                 }
                 if data.is_empty() {
                     continue;
                 }
-                message_body.data(data.len() as u64)?;
-                while !data.is_empty() {
-                    yield_after_batch(&mut ready_steps).await;
-                    let len = data.len().min(wire::MAX_DATA_CHUNK);
-                    write_frame(writer.writer(), wire::FrameType::Data, data.split_to(len)).await?;
-                }
+                send_data(writer, data, &mut message_body, &mut ready_steps).await?;
             }
             Err(frame) => {
                 if let Ok(trailers) = frame.into_trailers() {
@@ -156,7 +151,7 @@ pub(super) async fn send_body(
     writer.finish().await.map_err(wire::map_stream_error)
 }
 
-async fn send_trailers(
+pub(super) async fn send_trailers(
     writer: &mut ResetOnDrop,
     trailers: http::HeaderMap,
     message_body: &MessageBody,
@@ -167,74 +162,27 @@ async fn send_trailers(
         return Err(message_error("trailers forbidden"));
     }
     message_body.finish()?;
-    let encoded = qpack.encode_trailers(id, trailers).await?;
+    let fields = headers::regular_fields(trailers).map_err(Error::into_invalid_message)?;
+    let encoded = qpack.encode_fields(id, fields).await?;
     write_frame(writer.writer(), wire::FrameType::Headers, encoded).await
 }
 
-pub(super) async fn send_upload(
+async fn send_data(
     writer: &mut ResetOnDrop,
-    upload: &mut body::Upload,
-    mut message_body: MessageBody,
-    qpack: &qpack::Qpack,
-    id: StreamId,
+    mut data: Bytes,
+    message_body: &mut MessageBody,
+    ready_steps: &mut u8,
 ) -> Result<(), Error> {
-    let mut consumed = 0u64;
-    let mut command = None;
-    let mut bytes = vec![0; wire::MAX_DATA_CHUNK];
-    let mut ready_steps = 0;
-    loop {
-        yield_after_batch(&mut ready_steps).await;
-        if command
-            .as_ref()
-            .is_some_and(|c: &body::Control| c.through() == consumed)
-        {
-            match command.take().unwrap() {
-                body::Control::Flush { reply, .. } => {
-                    // All bytes through this boundary have been submitted to QUIC.
-                    let _ = reply.send(Ok(()));
-                }
-                body::Control::Finish { trailers, .. } => {
-                    message_body.finish()?;
-                    if let Some(trailers) = trailers {
-                        send_trailers(writer, trailers, &message_body, qpack, id).await?;
-                    }
-                    return writer.finish().await.map_err(wire::map_stream_error);
-                }
-            }
-        }
-        let limit = command.as_ref().map_or(wire::MAX_DATA_CHUNK, |c| {
-            usize::try_from(c.through().saturating_sub(consumed))
-                .unwrap_or(usize::MAX)
-                .min(wire::MAX_DATA_CHUNK)
-        });
-        if limit == 0 {
-            continue;
-        }
-        tokio::select! {
-            biased;
-            next = upload.control.recv(), if command.is_none() => {
-                command = Some(next.ok_or(Error::BodyAborted)?);
-            },
-            count = upload.pipe.read(&mut bytes[..limit]) => {
-                let count = count.map_err(Error::send_body)?;
-                if count == 0 {
-                    // Finish is queued before the pipe closes. A bare EOF is abandonment.
-                    if command.is_none() {
-                        command = Some(upload.control.try_recv().map_err(|_| Error::BodyAborted)?);
-                    }
-                    if command.as_ref().unwrap().through() != consumed {
-                        return Err(Error::BodyAborted);
-                    }
-                    continue;
-                }
-                message_body.data(count as u64)?;
-                consumed = consumed.checked_add(count as u64)
-                    .ok_or_else(|| message_error("upload length overflow"))?;
-                let data = Bytes::copy_from_slice(&bytes[..count]);
-                write_frame(writer.writer(), wire::FrameType::Data, data).await?;
-            }
-        }
+    if data.is_empty() {
+        return Ok(());
     }
+    message_body.data(data.len() as u64)?;
+    while !data.is_empty() {
+        yield_after_batch(ready_steps).await;
+        let len = data.len().min(wire::MAX_DATA_CHUNK);
+        write_frame(writer.writer(), wire::FrameType::Data, data.split_to(len)).await?;
+    }
+    Ok(())
 }
 
 async fn yield_after_batch(steps: &mut u8) {
@@ -335,13 +283,13 @@ impl MessageReader {
     ) -> Result<(http::request::Parts, MessageBody), Error> {
         let result = async {
             let payload = self.initial(Some(first)).await?;
-            let parts = self.qpack.decode_request(self.id, &payload).await?;
-            headers::validate_request(&parts)?;
+            let fields = self.qpack.decode_fields(self.id, &payload).await?;
+            let parts = headers::request_parts(fields)?;
             let message_body = request_body(&parts)?;
             Ok((parts, message_body))
         }
         .await;
-        self.check(result)
+        self.qpack.terminate_on_connection_error(result)
     }
 
     pub(super) async fn response(
@@ -352,7 +300,8 @@ impl MessageReader {
         let result = async {
             loop {
                 let payload = self.initial(None).await?;
-                let parts = self.qpack.decode_response(self.id, &payload).await?;
+                let fields = self.qpack.decode_fields(self.id, &payload).await?;
+                let parts = headers::response_parts(fields)?;
                 let message_body = response_body(method, &parts, false)?;
                 if parts.status.is_informational() {
                     continue;
@@ -361,11 +310,7 @@ impl MessageReader {
             }
         }
         .await;
-        self.check(result)
-    }
-
-    fn check<V>(&self, result: Result<V, Error>) -> Result<V, Error> {
-        self.qpack.fail_on_connection(result)
+        self.qpack.terminate_on_connection_error(result)
     }
 
     pub(super) async fn next_frame(
@@ -412,7 +357,8 @@ impl MessageReader {
                         unreachable!()
                     };
                     let payload = frame.field_section;
-                    let trailers = self.qpack.decode_trailers(self.id, &payload).await?;
+                    let fields = self.qpack.decode_fields(self.id, &payload).await?;
+                    let trailers = headers::trailer_fields(fields)?;
                     self.trailers = true;
                     return Ok(Some(Frame::trailers(trailers)));
                 }
@@ -424,10 +370,11 @@ impl MessageReader {
     }
 
     pub(super) fn fail(&mut self, error: Error) -> Error {
-        let _ = self.qpack.fail_on_connection::<()>(Err(error.clone()));
-        self.qpack.cancel_stream(self.id);
         let _ = self
-            .frames
+            .qpack
+            .terminate_on_connection_error::<()>(Err(error.clone()));
+        self.qpack.cancel_stream(self.id);
+        self.frames
             .stop(error.code().unwrap_or(Code::H3_REQUEST_CANCELLED));
         self.finished = true;
         error
@@ -437,7 +384,7 @@ impl Drop for MessageReader {
     fn drop(&mut self) {
         if !self.finished {
             self.qpack.cancel_stream(self.id);
-            let _ = self.frames.stop(Code::H3_REQUEST_CANCELLED);
+            self.frames.stop(Code::H3_REQUEST_CANCELLED);
         }
         if let Some(callback) = self.on_finish.take() {
             callback();

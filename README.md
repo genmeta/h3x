@@ -14,7 +14,7 @@
 
 h3x is the symmetric HTTP/3 protocol core used by [dhttp](https://github.com/genmeta/dhttp). It runs on an already-established QUIC connection and provides streaming `http::Request` / `http::Response` APIs.
 
-The crate has three layers: `client` / `server` for outgoing and incoming messages, `runtime` for identity, pooling and services, and `protocol` for HTTP/3. See [the architecture](design/architecture.md). The protocol adopts an established transport directly as `T: transport::Connection`; authentication facts remain in the runtime.
+The crate has three layers: `client` / `server` for outgoing and incoming messages, `runtime` for identity, pooling and services, and `protocol` for HTTP/3. See [the current design status](design/http3-wire-codec.md). The protocol adopts an established transport directly as `T: transport::Connection`; authentication facts remain in the runtime.
 
 **Protocol API:** `protocol::new` returns one `Connection` supporting both outgoing requests and incoming acceptance. Share it with `Arc` when needed. `runtime::Connection::protocol()` exposes this connection; `Connection::transport()` borrows its existing QUIC transport without retaining another handle.
 
@@ -28,7 +28,7 @@ Beneath the hood of a standard QUIC connection, both endpoints have equal abilit
 
 Either peer can initiate a request and receive its response on the reverse direction of the same bidirectional stream. Construction returns `Connection`; local sends and incoming stream acceptance are independent.
 
-```rust,ignore
+```rust,no_run
 use h3x::{Error, Settings, protocol, transport};
 use http_body_util::{BodyExt, Full};
 
@@ -48,9 +48,24 @@ async fn request<T: transport::Connection>(
 }
 ```
 
-`Connection::accept(&self)` returns `http::Request<ChunkBody>` and a `ResponseSender`. `Connection::request` takes the request directly and returns the final response without first waiting for upload completion. `Connection::request_streaming` takes the headers and returns BodyWriter/ResponseFuture after HEADERS are committed. ResponseSender retains the one-shot right to reply to an accepted request; its send completes after FIN. Protocol responses are standard `http::Response<ChunkBody>` values. The API layer attaches runtime authentication facts to its own `Response`; `Executing` waits for either a fixed-request response or a streaming response.
+`Connection::read_request(id, recv, send)` reads a peer bidirectional stream and returns `Some((http::Request<ChunkBody>, ResponseSender))`, or `None` for an empty/rejected WebTransport stream. The caller accepts streams from `connection.transport()` and runs each read/service/reply sequence in its own task. `Connection::request` takes the request directly and returns the final response without first waiting for upload completion. `Connection::request_streaming` takes the headers and returns BodyWriter/ResponseFuture after HEADERS are committed. ResponseSender retains the one-shot right to reply to an accepted request; its send completes after FIN. Protocol responses are standard `http::Response<ChunkBody>` values. The API layer attaches runtime authentication facts to its own `Response`; `Executing` waits for either a fixed-request response or a streaming response.
 
-`Connection::close` closes immediately; `Connection::shutdown(&self)` drains admitted requests. Shutdown can be initiated only once; later calls return `InvalidState`. Dropping the connection closes its transport; when shared through `Arc`, this happens after the last owner is dropped. Acceptance is serialized without blocking concurrent request sending. The caller decides how long to wait and may explicitly close after a timeout. There is no public connection driver or outbound work queue. Protocol `closed()` waits for protocol resources only. The separate `runtime::shutdown()` stops and joins native dialing and service tasks; it currently performs a forced runtime stop, not automatic graceful draining.
+`Connection::close` closes immediately; `Connection::shutdown(&self)` drains admitted requests. Shutdown can be initiated only once; later calls return `InvalidState`. Dropping the connection closes its transport; when shared through `Arc`, this happens after the last owner is dropped. The native runtime accepts bidirectional streams directly and bounds per-connection request tasks at 256; control and QPACK streams run independently. Direct protocol callers own their stream tasks and must cancel/join them on connection closure. The caller decides how long to wait and may explicitly close after a timeout. There is no public connection driver or outbound work queue. Protocol `closed()` waits for protocol resources only. The separate `runtime::shutdown()` stops and joins native dialing and service tasks; it currently performs a forced runtime stop, not automatic graceful draining.
+
+The native receive path is in `runtime/native.rs::serve_connection`:
+
+```text
+transport.accept_bi() → (id, recv, send)
+  → spawn one request task
+      → protocol.read_request(id, recv, send)
+      → server::Request::new(request, local, remote)
+      → service(req) → server::Response
+      → reply.send(response.into_http())
+```
+
+There is no intermediate HTTP request queue. Header parsing is cancellable; direct protocol callers supply their own concurrency limit, while the native runtime limits request tasks to 256; `read_request` commits delivery under the GOAWAY lock before returning. Request bodies continue reading from the same receive stream on demand, and `ResponseSender` owns that stream's send direction.
+
+The connection stores GOAWAY directly. A separate Drain tracks active work through one count and local guards, without distinguishing request stages. Opening and header-reading functions own their drain guards; each response task owns its reply channel and observes upload failure, connection termination, and the peer's GOAWAY boundary. Local shutdown cancels unfinished admission without cancelling already delivered exchanges.
 
 ## Dynamic QPACK
 
@@ -72,7 +87,7 @@ The optional `webtransport` module retains the draft-16 protocol codecs and sess
 
 On native targets, pooling and the runtime are included by default. `init` registers already configured QUIC clients/listeners once. `Pool::get` returns `Arc<runtime::Connection>`; use `protocol()` for the HTTP/3 connection and `remote_authority()` for authenticated identity. The protocol connection no longer exposes identity or reuse-target accessors. `Arc<dquic::prelude::Connection>` directly implements the transport trait.
 
-`Endpoint` lives in `src/endpoint.rs`. Client messages live in `src/client/` and are exported as `client::Request` and `client::Response`; server messages are available through `server`. Client requests build `http::Request` directly and client responses wrap `http::Response`. Ordinary HTTP send/receive and Body budgets are wired; protocol behavior verification and WebTransport integration remain pending.
+`Endpoint` lives in `src/endpoint.rs`. Client messages live in `src/client/` and are exported as `client::Request` and `client::Response`; server messages are available through `server`. Client requests build `http::Request` directly and client responses wrap `http::Response`. Ordinary HTTP send/receive is covered by native dquic stream tests; WebTransport connection integration remains pending.
 
 `Endpoint::listen` accepts any `tower_service::Service<Request<ChunkBody>>` whose response body implements `http_body::Body<Data = Bytes>`. Listening is available on native targets without a framework feature; an Axum router implements this service interface directly, so h3x does not depend on Axum.
 
@@ -81,3 +96,13 @@ On native targets, pooling and the runtime are included by default. `init` regis
 Services registered with `Endpoint::listen` receive `server::Request`. Use `request()` to inspect the HTTP message, `local_authority()` / `remote_authority()` for connection identities, and `into_http()` when adapting to a service accepting `http::Request`. Anonymous peers have no remote authority; HTTP headers never establish identity.
 
 Stream I/O uses `dquic::prelude::StreamReader` and `StreamWriter` directly. The connection interface returns these concrete types; h3x has no custom receive/send stream traits or stream adapters. `StopSending` and `CancelStream` provide native cancellation. Frame submission uses `SinkExt::feed` so it does not wait for ACKs after every frame; normal FIN still uses the native close completion.
+
+## Current ownership and verification
+
+`BodyWriter` directly owns the HTTP/3 send direction. Each `AsyncWrite` call submits at most 16 KiB of DATA as one complete frame through the native `Sink<Bytes>`; pending writes consume no caller bytes. There is no streaming-upload task, pipe or command queue. `flush()` confirms submission to QUIC and does not wait for ACKs. `finish()` / `trailers()` preserve pending work until FIN completes; dropping an unfinished writer cancels only that direction and fails a still-pending response. Ordinary `request<B>` retains its independent automatic-upload task, including after response headers arrive.
+
+QPACK encodes and decodes field collections; the message layer handles HTTP semantics once. QPACK and its instruction writer subscribe to the connection's terminal notification. Admission closes synchronously under the existing state lock. `closed()` is the later protocol-task cleanup result; it is not the terminal notification or application runtime shutdown.
+
+The public `Fixed`, `Chunk`, `Executing`, `Streaming`, identity-bearing server messages, `Pool::get`, and asynchronous `Endpoint::listen` contracts remain unchanged. This implementation targets native dquic/Tokio execution with `Send + Sync`; no WASM adapter is provided.
+
+For the current checkout, run `cargo test --all-targets --no-run`, `cargo test --all-targets --all-features`, and `cargo test --doc`. See the dated snapshot in [the wire design](design/http3-wire-codec.md); its historical proposal and old test claims are not evidence for a different checkout.

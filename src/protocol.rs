@@ -2,7 +2,6 @@ pub(crate) mod body;
 pub(crate) mod connection;
 pub(crate) mod headers;
 pub(crate) mod message;
-pub(crate) mod platform;
 pub(crate) mod qpack;
 mod request;
 pub(crate) mod settings;

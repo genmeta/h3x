@@ -7,7 +7,7 @@ use rustls::{
 };
 
 pub use crate::runtime::identity::{LocalAuthority, RemoteAuthority};
-use crate::{Chunk, Error, Fixed, client::Request, platform::MaybeSend, runtime::identity};
+use crate::{Chunk, Error, Fixed, client::Request, runtime::identity};
 
 /// A local name and immutable certificate/key/OCSP material for this process.
 /// 移动到 dquic，在这里实现 http trait
@@ -76,11 +76,11 @@ impl Endpoint {
     pub async fn listen<S, B>(self: &Arc<Self>, service: S) -> Result<(), Error>
     where
         S: tower_service::Service<crate::server::Request, Response = crate::server::Response<B>>
-            + MaybeSend
+            + Send
             + 'static,
-        S::Future: MaybeSend + 'static,
+        S::Future: Send + 'static,
         S::Error: Into<crate::BoxError>,
-        B: http_body::Body<Data = bytes::Bytes> + MaybeSend + 'static,
+        B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
         B::Error: Into<crate::BoxError>,
     {
         #[cfg(not(target_arch = "wasm32"))]

@@ -12,7 +12,7 @@ pub(crate) struct GoawayFrame {
 pub(super) fn be_goaway_frame(input: &Bytes) -> ParseResult<'_, GoawayFrame> {
     let (remaining, id) = be_varint(input)
         .map_err(|error| error.map(|_| frame_error("invalid frame payload integer")))?;
-    Ok((remaining, GoawayFrame { id: id }))
+    Ok((remaining, GoawayFrame { id }))
 }
 
 impl<B: BufMut> WriteFrame<GoawayFrame> for B {

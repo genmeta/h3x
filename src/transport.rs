@@ -11,10 +11,7 @@ use dquic::prelude::{StreamReader, StreamWriter};
 use futures::SinkExt;
 pub use qbase::role::Role;
 
-use crate::{
-    Code, StreamId,
-    platform::{MaybeSend, MaybeSync},
-};
+use crate::{Code, StreamId};
 
 pub(crate) struct ResetOnDrop {
     writer: Option<StreamWriter>,
@@ -72,44 +69,40 @@ impl<T: Connection> Drop for CloseOnDrop<T> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 type SharedError = Arc<dyn StdError + Send + Sync + 'static>;
-#[cfg(target_arch = "wasm32")]
-type SharedError = Arc<dyn StdError + 'static>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum ConnectionErrorKind {
-    Transport,
-    Application,
+    Transport(SharedError),
+    Application {
+        code: Code,
+        reason: Bytes,
+        source: Option<SharedError>,
+    },
 }
 
 /// Terminal failure reported by the QUIC connection adapter.
 #[derive(Debug, Clone)]
 pub struct ConnectionError {
     kind: ConnectionErrorKind,
-    code: Option<Code>,
-    reason: Bytes,
-    source: Option<SharedError>,
 }
 
 impl ConnectionError {
     /// Constructs a QUIC transport failure and retains its original source.
-    pub fn transport(source: impl StdError + MaybeSend + MaybeSync + 'static) -> Self {
+    pub fn transport(source: impl StdError + Send + Sync + 'static) -> Self {
         Self {
-            kind: ConnectionErrorKind::Transport,
-            code: None,
-            reason: Bytes::new(),
-            source: Some(Arc::new(source)),
+            kind: ConnectionErrorKind::Transport(Arc::new(source)),
         }
     }
 
     /// Constructs a peer or local QUIC application close.
     pub fn application(code: Code, reason: impl Into<Bytes>) -> Self {
         Self {
-            kind: ConnectionErrorKind::Application,
-            code: Some(code),
-            reason: reason.into(),
-            source: None,
+            kind: ConnectionErrorKind::Application {
+                code,
+                reason: reason.into(),
+                source: None,
+            },
         }
     }
 
@@ -117,44 +110,49 @@ impl ConnectionError {
     pub fn application_with_source(
         code: Code,
         reason: impl Into<Bytes>,
-        source: impl StdError + MaybeSend + MaybeSync + 'static,
+        source: impl StdError + Send + Sync + 'static,
     ) -> Self {
         Self {
-            kind: ConnectionErrorKind::Application,
-            code: Some(code),
-            reason: reason.into(),
-            source: Some(Arc::new(source)),
+            kind: ConnectionErrorKind::Application {
+                code,
+                reason: reason.into(),
+                source: Some(Arc::new(source)),
+            },
         }
     }
 
     pub const fn is_transport(&self) -> bool {
-        matches!(self.kind, ConnectionErrorKind::Transport)
+        matches!(self.kind, ConnectionErrorKind::Transport(_))
     }
 
     pub const fn is_application(&self) -> bool {
-        matches!(self.kind, ConnectionErrorKind::Application)
+        matches!(self.kind, ConnectionErrorKind::Application { .. })
     }
 
     pub const fn code(&self) -> Option<Code> {
-        self.code
+        match &self.kind {
+            ConnectionErrorKind::Transport(_) => None,
+            ConnectionErrorKind::Application { code, .. } => Some(*code),
+        }
     }
 
-    /// Returns the QUIC application close reason, or an empty slice for a
-    /// transport failure.
+    /// Returns the QUIC application close reason, or an empty slice for a transport failure.
     pub fn reason(&self) -> &[u8] {
-        &self.reason
+        match &self.kind {
+            ConnectionErrorKind::Transport(_) => &[],
+            ConnectionErrorKind::Application { reason, .. } => reason,
+        }
     }
 }
 
 impl fmt::Display for ConnectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind {
-            ConnectionErrorKind::Transport => f.write_str("QUIC transport failure"),
-            ConnectionErrorKind::Application => {
-                let code = self.code.expect("application errors always carry a code");
+        match &self.kind {
+            ConnectionErrorKind::Transport(_) => f.write_str("QUIC transport failure"),
+            ConnectionErrorKind::Application { code, reason, .. } => {
                 write!(f, "QUIC application close: {code}")?;
-                if !self.reason.is_empty() {
-                    write!(f, ": {}", String::from_utf8_lossy(&self.reason))?;
+                if !reason.is_empty() {
+                    write!(f, ": {}", String::from_utf8_lossy(reason))?;
                 }
                 Ok(())
             }
@@ -164,74 +162,73 @@ impl fmt::Display for ConnectionError {
 
 impl StdError for ConnectionError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &(dyn StdError + 'static))
+        match &self.kind {
+            ConnectionErrorKind::Transport(source) => Some(source.as_ref()),
+            ConnectionErrorKind::Application { source, .. } => source
+                .as_deref()
+                .map(|source| source as &(dyn StdError + 'static)),
+        }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum StreamErrorKind {
-    Connection,
-    Reset,
+    Connection(ConnectionError),
+    Reset(Code),
 }
 
 /// Failure reported by a QUIC receive or send stream.
 #[derive(Debug, Clone)]
 pub struct StreamError {
     kind: StreamErrorKind,
-    code: Option<Code>,
-    connection: Option<ConnectionError>,
 }
 
 impl StreamError {
     pub fn connection(source: ConnectionError) -> Self {
         Self {
-            kind: StreamErrorKind::Connection,
-            code: source.code(),
-            connection: Some(source),
+            kind: StreamErrorKind::Connection(source),
         }
     }
 
     pub const fn reset(code: Code) -> Self {
         Self {
-            kind: StreamErrorKind::Reset,
-            code: Some(code),
-            connection: None,
+            kind: StreamErrorKind::Reset(code),
         }
     }
 
     pub const fn is_connection(&self) -> bool {
-        matches!(self.kind, StreamErrorKind::Connection)
+        matches!(self.kind, StreamErrorKind::Connection(_))
     }
 
     pub const fn is_reset(&self) -> bool {
-        matches!(self.kind, StreamErrorKind::Reset)
+        matches!(self.kind, StreamErrorKind::Reset(_))
     }
 
     pub const fn code(&self) -> Option<Code> {
-        self.code
+        match &self.kind {
+            StreamErrorKind::Connection(source) => source.code(),
+            StreamErrorKind::Reset(code) => Some(*code),
+        }
     }
 }
 
 impl fmt::Display for StreamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind {
-            StreamErrorKind::Connection => f.write_str("QUIC connection failed while using stream"),
-            StreamErrorKind::Reset => write!(
-                f,
-                "QUIC stream reset: {}",
-                self.code.expect("reset errors always carry a code")
-            ),
+        match &self.kind {
+            StreamErrorKind::Connection(_) => {
+                f.write_str("QUIC connection failed while using stream")
+            }
+            StreamErrorKind::Reset(code) => write!(f, "QUIC stream reset: {code}"),
         }
     }
 }
 
 impl StdError for StreamError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        self.connection
-            .as_ref()
-            .map(|source| source as &(dyn StdError + 'static))
+        match &self.kind {
+            StreamErrorKind::Connection(source) => Some(source),
+            StreamErrorKind::Reset(_) => None,
+        }
     }
 }
 
@@ -242,7 +239,7 @@ impl From<ConnectionError> for StreamError {
 }
 
 /// An established QUIC connection capable of opening and accepting streams.
-pub trait Connection: MaybeSend + MaybeSync + 'static {
+pub trait Connection: Send + Sync + 'static {
     /// The local QUIC role, independent of which peer initiates an HTTP request.
     /// Returns the connection error if the transport can no longer provide it.
     fn role(&self) -> Result<Role, ConnectionError>;
@@ -250,26 +247,24 @@ pub trait Connection: MaybeSend + MaybeSync + 'static {
     /// Returns a locally initiated bidirectional ID and its matching read/write ends.
     fn open_bi(
         &self,
-    ) -> impl Future<Output = Result<(StreamId, (StreamReader, StreamWriter)), ConnectionError>>
-    + MaybeSend;
+    ) -> impl Future<Output = Result<(StreamId, (StreamReader, StreamWriter)), ConnectionError>> + Send;
 
     fn open_uni(
         &self,
-    ) -> impl Future<Output = Result<(StreamId, StreamWriter), ConnectionError>> + MaybeSend;
+    ) -> impl Future<Output = Result<(StreamId, StreamWriter), ConnectionError>> + Send;
 
     /// Returns a peer-initiated bidirectional ID and its matching read/write ends.
     fn accept_bi(
         &self,
-    ) -> impl Future<Output = Result<(StreamId, (StreamReader, StreamWriter)), ConnectionError>>
-    + MaybeSend;
+    ) -> impl Future<Output = Result<(StreamId, (StreamReader, StreamWriter)), ConnectionError>> + Send;
 
     fn accept_uni(
         &self,
-    ) -> impl Future<Output = Result<(StreamId, StreamReader), ConnectionError>> + MaybeSend;
+    ) -> impl Future<Output = Result<(StreamId, StreamReader), ConnectionError>> + Send;
 
     fn close(&self, code: Code, reason: &[u8]);
 
-    fn closed(&self) -> impl Future<Output = ConnectionError> + MaybeSend;
+    fn closed(&self) -> impl Future<Output = ConnectionError> + Send;
 }
 
 /// Optional QUIC capabilities required by WebTransport over HTTP/3.
@@ -288,11 +283,9 @@ pub mod webtransport {
         fn send_datagram(
             &self,
             datagram: Bytes,
-        ) -> impl Future<Output = Result<(), ConnectionError>> + MaybeSend;
+        ) -> impl Future<Output = Result<(), ConnectionError>> + Send;
 
-        fn receive_datagram(
-            &self,
-        ) -> impl Future<Output = Result<Bytes, ConnectionError>> + MaybeSend;
+        fn receive_datagram(&self) -> impl Future<Output = Result<Bytes, ConnectionError>> + Send;
 
         /// Resets `stream` while reliably delivering at least `reliable_size`
         /// bytes from the beginning of its send direction.
@@ -321,15 +314,53 @@ mod tests {
     }
 
     #[test]
-    fn application_and_reset_codes_are_queryable() {
-        let connection = ConnectionError::application(Code::H3_NO_ERROR, "shutdown");
-        let stream = StreamError::reset(Code::H3_REQUEST_CANCELLED);
-
-        assert!(connection.is_application());
-        assert_eq!(connection.code(), Some(Code::H3_NO_ERROR));
-        assert_eq!(connection.reason(), b"shutdown");
-        assert!(stream.is_reset());
-        assert_eq!(stream.code(), Some(Code::H3_REQUEST_CANCELLED));
+    fn application_and_reset_codes_sources_and_display_are_preserved() {
+        let reset = StreamError::reset(Code::H3_REQUEST_CANCELLED);
+        assert!(reset.is_reset());
+        assert!(!reset.is_connection());
+        assert_eq!(reset.code(), Some(Code::H3_REQUEST_CANCELLED));
+        assert!(reset.source().is_none());
+        assert!(reset.to_string().contains("QUIC stream reset"));
+        for (connection, code, reason, source) in [
+            (
+                ConnectionError::transport(io::Error::other("network down")),
+                None,
+                "",
+                Some("network down"),
+            ),
+            (
+                ConnectionError::application(Code::H3_NO_ERROR, "shutdown"),
+                Some(Code::H3_NO_ERROR),
+                "shutdown",
+                None,
+            ),
+            (
+                ConnectionError::application_with_source(
+                    Code::H3_INTERNAL_ERROR,
+                    "failed",
+                    io::Error::other("cause"),
+                ),
+                Some(Code::H3_INTERNAL_ERROR),
+                "failed",
+                Some("cause"),
+            ),
+        ] {
+            let connection = connection.clone();
+            assert_eq!(connection.is_application(), code.is_some());
+            assert_eq!(connection.is_transport(), code.is_none());
+            assert_eq!(connection.code(), code);
+            assert_eq!(connection.reason(), reason.as_bytes());
+            assert_eq!(
+                connection.source().map(ToString::to_string).as_deref(),
+                source
+            );
+            assert!(connection.to_string().contains(reason));
+            let stream = StreamError::from(connection.clone());
+            assert!(stream.is_connection());
+            assert!(!stream.is_reset());
+            assert_eq!(stream.code(), code);
+            assert_eq!(stream.source().unwrap().to_string(), connection.to_string());
+        }
     }
 }
 

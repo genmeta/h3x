@@ -145,9 +145,6 @@ async fn early_response_keeps_upload_active_until_finished() {
             );
             let connection = shared.clone();
             drop(shared);
-            let accepting = connection.accept();
-            tokio::pin!(accepting);
-            assert!(futures::poll!(accepting.as_mut()).is_pending());
             let (parts, _) = http::Request::builder()
                 .method("POST")
                 .uri("https://example.test/")
@@ -169,7 +166,6 @@ async fn early_response_keeps_upload_active_until_finished() {
             assert!(role_queries.load(Ordering::Relaxed) > before);
             connection.shutdown().await.unwrap();
             assert!(connection.inner.on_peer_goaway(4).is_err());
-            assert!(accepting.await.unwrap().is_none());
         }),
     )
     .await
@@ -196,7 +192,10 @@ async fn response_owns_send_direction_until_completion_or_drop() {
             id,
         );
         let mut writer = ResetOnDrop::new(write_stream);
-        connection.inner.track_request(&mut reader, &mut writer);
+        let reading = connection.inner.drain.track();
+        let writing = connection.inner.drain.track();
+        reader.on_finish(move || drop(reading));
+        writer.on_finish(move || drop(writing));
         let sender = ResponseSender {
             stream_id: id,
             method: Method::GET,
@@ -227,7 +226,7 @@ async fn response_owns_send_direction_until_completion_or_drop() {
         }
         assert_request_state(&connection, true, false);
         drop(reader);
-        assert!(connection.inner.state.lock().unwrap().is_drained());
+        assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
     }
 }
 
@@ -253,11 +252,8 @@ fn assert_request_state(
     reading: bool,
     writing: bool,
 ) {
-    let state = connection.inner.state.lock().unwrap();
-    assert_eq!(
-        state.directions,
-        usize::from(reading) + usize::from(writing)
-    );
+    let active = connection.inner.drain.active.load(Ordering::Acquire);
+    assert_eq!(active, usize::from(reading) + usize::from(writing));
 }
 
 #[tokio::test]
@@ -272,13 +268,13 @@ async fn shutdown_cancels_preparation_and_waits_for_its_cleanup() {
                 .unwrap();
             let mut pending = Box::pin(connection.request(request));
             assert!(futures::poll!(pending.as_mut()).is_pending());
-            assert_eq!(connection.inner.state.lock().unwrap().preparations.len(), 1);
+            assert_eq!(connection.inner.drain.active.load(Ordering::Acquire), 1);
             let mut shutdown = Box::pin(connection.shutdown());
             assert!(futures::poll!(shutdown.as_mut()).is_pending());
             // Cancellation signals do not themselves unregister preparation.
-            assert_eq!(connection.inner.state.lock().unwrap().preparations.len(), 1);
+            assert_eq!(connection.inner.drain.active.load(Ordering::Acquire), 1);
             assert!(matches!(pending.await, Err(Error::Cancelled)));
-            assert!(connection.inner.state.lock().unwrap().is_drained());
+            assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
             tokio::time::timeout(std::time::Duration::from_secs(1), shutdown)
                 .await
                 .unwrap()
@@ -305,9 +301,9 @@ async fn response_eof_finishes_reading_while_body_is_retained() {
             assert_request_state(&connection, false, true);
             drop(writer);
             connection.shutdown().await.unwrap();
-            assert!(connection.inner.state.lock().unwrap().is_drained());
+            assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
             drop(body);
-            assert!(connection.inner.state.lock().unwrap().is_drained());
+            assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
         })
         .await;
 }
@@ -330,7 +326,7 @@ async fn cancellation_stops_both_normal_directions_but_streaming_can_cancel_uplo
             drop(pending);
             tokio::time::timeout(
                 std::time::Duration::from_secs(1),
-                connection.inner.drained(),
+                connection.inner.drain.wait(),
             )
             .await
             .unwrap();
@@ -351,81 +347,106 @@ async fn cancellation_stops_both_normal_directions_but_streaming_can_cancel_uplo
 #[tokio::test]
 async fn preparation_tracking_has_no_fixed_request_limit() {
     let streams = Arc::new(Streams::new());
-    let connection = test_connection(&streams, 0).await;
-    let preparations: Vec<_> = (0..300)
-        .map(|_| connection.inner.prepare_request().unwrap())
-        .collect();
-    assert_eq!(
-        connection.inner.state.lock().unwrap().preparations.len(),
-        300
-    );
+    let connection = test_connection(&streams, 3).await;
+    let mut preparations = Vec::new();
+    for _ in 0..300 {
+        let request = http::Request::builder()
+            .uri("https://example.test/")
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap();
+        let mut pending = Box::pin(connection.request(request));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        preparations.push(pending);
+    }
+    assert_eq!(connection.inner.drain.active.load(Ordering::Acquire), 300);
     drop(preparations);
-    assert!(connection.inner.state.lock().unwrap().is_drained());
+    assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
 }
 
 #[tokio::test]
-async fn queued_requests_are_revoked_on_shutdown_without_a_waiting_producer() {
-    for accept_first in [false, true] {
-        let streams = Arc::new(Streams::new());
-        streams
-            .drive(async {
-                let connection = test_connection(&streams, 0).await;
-                let mut accepting = Box::pin(connection.accept());
-                assert!(futures::poll!(accepting.as_mut()).is_pending());
-                let classifying = Arc::new(Semaphore::new(2));
-                let mut pending = Vec::new();
-                for _ in 0..1 {
-                    let (id, (read_stream, write_stream)) = streams.open_bi();
-                    let head = http::Request::builder()
-                        .uri("https://example.test/")
-                        .body(())
-                        .unwrap()
-                        .into_parts()
-                        .0;
-                    let encoded = connection
-                        .inner
-                        .qpack
-                        .encode_fields(id, headers::request_fields(head).unwrap())
-                        .await
-                        .unwrap();
-                    let mut frame = vec![1];
-                    frame.put_varint(&VarInt::try_from(encoded.len()).unwrap());
-                    frame.extend_from_slice(&encoded);
-                    streams.feed(id, 0, Bytes::from(frame), true);
-                    let permit = classifying.clone().try_acquire_owned().unwrap();
-                    pending.push(Box::pin(connection.inner.clone().read_request(
-                        id,
-                        read_stream,
-                        write_stream,
-                        permit,
-                    )));
-                }
-                pending.pop().unwrap().await.unwrap();
-                assert_request_state(&connection, true, true);
-                assert!(
-                    connection
-                        .inner
-                        .state
-                        .lock()
-                        .unwrap()
-                        .pending_accepts
-                        .is_empty()
-                );
-                if accept_first {
-                    let (mut request, sender) = accepting.await.unwrap().unwrap();
-                    assert_request_state(&connection, true, true);
-                    assert!(request.body_mut().frame().await.is_none());
-                    assert_request_state(&connection, false, true);
-                    drop(sender);
-                } else {
-                    connection.inner.begin_shutdown().unwrap();
-                    // No accept or producer task poll is needed to release queued streams.
-                    assert!(connection.inner.state.lock().unwrap().queued.is_empty());
-                }
-                assert!(connection.inner.state.lock().unwrap().is_drained());
-            })
-            .await;
+async fn dropping_unpolled_request_reader_cancels_both_stream_directions() {
+    let streams = Arc::new(Streams::new());
+    let connection = test_connection(&streams, 0).await;
+    let (id, (recv, send)) = streams.open_bi();
+    drop(connection.read_request(id, recv, send));
+    streams.drain();
+    assert!(streams.reset.load(Ordering::Relaxed));
+    assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+}
+
+#[tokio::test]
+async fn incoming_headers_are_cancelled_on_shutdown_or_drop() {
+    for prefix in [Bytes::new(), Bytes::from_static(&[1, 5, 0])] {
+        for shutdown in [false, true] {
+            let streams = Arc::new(Streams::new());
+            let connection = test_connection(&streams, 0).await;
+            let (id, (recv, send)) = streams.open_bi();
+            if !prefix.is_empty() {
+                streams.feed(id, 0, prefix.clone(), false);
+            }
+            let mut reading = Box::pin(connection.read_request(id, recv, send));
+            assert!(futures::poll!(reading.as_mut()).is_pending());
+            assert_eq!(
+                connection.inner.drain.active.load(Ordering::Acquire),
+                if prefix.is_empty() { 1 } else { 3 }
+            );
+            if shutdown {
+                connection.inner.begin_shutdown().unwrap();
+                assert!(matches!(reading.await, Err(Error::Cancelled)));
+            } else {
+                drop(reading);
+            }
+            assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+            streams.drain();
+            assert!(streams.reset.load(Ordering::Relaxed));
+        }
     }
+}
+
+#[tokio::test]
+async fn read_request_delivers_body_and_reply_before_shutdown() {
+    let streams = Arc::new(Streams::new());
+    streams
+        .drive(async {
+            let connection = test_connection(&streams, 0).await;
+            let (id, (recv, send)) = streams.open_bi();
+            let head = http::Request::builder()
+                .uri("https://example.test/")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0;
+            let encoded = connection
+                .inner
+                .qpack
+                .encode_fields(id, headers::request_fields(head).unwrap())
+                .await
+                .unwrap();
+            let mut frame = vec![1];
+            frame.put_varint(&VarInt::try_from(encoded.len()).unwrap());
+            frame.extend_from_slice(&encoded);
+            streams.feed(id, 0, Bytes::from(frame), true);
+            let (mut request, reply) = connection
+                .read_request(id, recv, send)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.uri(), "https://example.test/");
+            assert_eq!(reply.stream_id(), id);
+            assert_eq!(
+                connection.inner.goaway.lock().unwrap().max_delivered,
+                Some(id)
+            );
+            connection.inner.begin_shutdown().unwrap();
+            assert_request_state(&connection, true, true);
+            assert!(request.body_mut().frame().await.is_none());
+            reply
+                .send(http::Response::new(http_body_util::Empty::<Bytes>::new()))
+                .await
+                .unwrap();
+            assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -453,7 +474,7 @@ async fn force_close_finishes_with_an_unread_body_still_owned_by_application() {
                 .unwrap();
             assert_request_state(&connection, true, false);
             assert!(body.frame().await.unwrap().is_err());
-            assert!(connection.inner.state.lock().unwrap().is_drained());
+            assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
         })
         .await;
 }
@@ -471,70 +492,281 @@ async fn stream_cleanup_counts_each_direction_once() {
             id,
         );
         let mut writer = ResetOnDrop::new(write_stream);
-        connection.inner.track_request(&mut reader, &mut writer);
+        let reading = connection.inner.drain.track();
+        let writing = connection.inner.drain.track();
+        reader.on_finish(move || drop(reading));
+        writer.on_finish(move || drop(writing));
         requests.push((id, reader, writer));
     }
     let (_, reader, mut writer) = requests.pop().unwrap();
     drop(reader);
-    assert_eq!(connection.inner.state.lock().unwrap().directions, 3);
+    assert_eq!(connection.inner.drain.active.load(Ordering::Acquire), 3);
     writer.reset(Code::H3_REQUEST_CANCELLED);
     writer.reset(Code::H3_REQUEST_CANCELLED);
     drop(writer);
     assert_request_state(&connection, true, true);
     drop(requests);
-    assert!(connection.inner.state.lock().unwrap().is_drained());
+    assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
 }
 
 #[tokio::test]
-async fn full_request_queue_rejects_without_waiting() {
+async fn incoming_reads_use_local_guards_without_a_protocol_concurrency_limit() {
     let streams = Arc::new(Streams::new());
     let connection = test_connection(&streams, 0).await;
-    for index in 0..=REQUEST_QUEUE_SIZE {
-        // Separate native stream fixtures avoid depending on QUIC stream credit.
+    let mut pending = Vec::new();
+    for _ in 0..300 {
         let stream = Streams::new();
         let (id, (recv, send)) = stream.open_bi();
-        let mut reader = MessageReader::new(
-            ChunkReader::new(id, recv),
-            connection.inner.qpack.clone(),
-            id,
-        );
-        let mut writer = ResetOnDrop::new(send);
-        connection.inner.track_request(&mut reader, &mut writer);
-        let result = connection.inner.deliver_request(QueuedRequest {
-            stream_id: id,
-            request_head: http::Request::new(()).into_parts().0,
-            reader,
-            message_body: MessageBody::Unknown,
-            writer,
-        });
-        if index == REQUEST_QUEUE_SIZE {
-            assert_eq!(result.unwrap_err().code(), Some(Code::H3_REQUEST_REJECTED));
-        } else {
-            result.unwrap();
-        }
+        let mut reading = Box::pin(connection.read_request(id, recv, send));
+        assert!(futures::poll!(reading.as_mut()).is_pending());
+        pending.push((stream, reading));
     }
-    assert_eq!(
-        connection.inner.state.lock().unwrap().directions,
-        2 * REQUEST_QUEUE_SIZE
-    );
-    connection.close(Code::H3_NO_ERROR, b"test complete");
-    assert!(connection.inner.state.lock().unwrap().is_drained());
+    assert_eq!(connection.inner.drain.active.load(Ordering::Acquire), 300);
+    drop(pending);
+    assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
 }
 
 #[tokio::test]
-async fn dropping_unpolled_upload_wakes_writer_with_owner_stopped() {
+async fn streaming_flush_submits_without_acks_but_fin_waits_for_completion() {
     use tokio::io::AsyncWriteExt;
-    let (mut writer, upload) = BodyWriter::channel();
-    let mut flush = Box::pin(writer.flush());
-    assert!(futures::poll!(flush.as_mut()).is_pending());
-    drop(upload);
-    let error = tokio::time::timeout(std::time::Duration::from_secs(1), flush)
-        .await
+    for cancel_finish in [false, true] {
+        let streams = Arc::new(Streams::new());
+        let connection = test_connection(&streams, 5).await;
+        let parts = http::Request::builder()
+            .uri("https://example.test/")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let (mut writer, response) = connection.request_streaming(parts).await.unwrap();
+        writer.write_all(b"abc").await.unwrap();
+        assert!(matches!(
+            futures::poll!(Box::pin(writer.flush())),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert!(
+            streams.sent.lock().unwrap().is_empty(),
+            "flush must not require a packet or ACK"
+        );
+        let mut finish = Box::pin(writer.finish());
+        assert!(futures::poll!(finish.as_mut()).is_pending());
+        if cancel_finish {
+            drop(finish);
+            assert!(matches!(response.await, Err(Error::Cancelled)));
+            streams.drain();
+            assert!(streams.reset.load(Ordering::Relaxed));
+        } else {
+            streams.drive(finish).await.unwrap();
+            assert!(
+                streams
+                    .sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(frame, _)| u64::from(frame.stream_id()) == 0 && frame.is_fin())
+            );
+            drop(response);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_pending_write_preserves_frame_boundaries_and_byte_accounting() {
+    use tokio::io::AsyncWriteExt;
+    let streams = Arc::new(Streams::new());
+    let connection = test_connection(&streams, 5).await;
+    let parts = http::Request::builder()
+        .uri("https://example.test/")
+        .body(())
         .unwrap()
+        .into_parts()
+        .0;
+    let (mut writer, response) = connection.request_streaming(parts).await.unwrap();
+    let data = vec![b'x'; 2 * wire::MAX_DATA_CHUNK];
+    let mut accepted = 0;
+    loop {
+        let mut write = Box::pin(writer.write(&data));
+        match futures::poll!(write.as_mut()) {
+            std::task::Poll::Ready(result) => {
+                let count = result.unwrap();
+                assert_eq!(count, wire::MAX_DATA_CHUNK);
+                accepted += count;
+                assert!(
+                    accepted <= (1 << 20) + wire::MAX_DATA_CHUNK,
+                    "native byte backpressure must bound buffering"
+                );
+            }
+            std::task::Poll::Pending => break,
+        }
+    }
+    // The fixture ACKs packets but has no peer application to replenish stream credit.
+    streams
+        .data
+        .recv_stream_control(
+            qbase::frame::MaxStreamDataFrame::new(
+                StreamId::from(VarInt::from_u32(0)),
+                VarInt::from_u32(1 << 22),
+            )
+            .into(),
+        )
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        streams.drive(writer.write_all(b"tail")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        streams.drive(writer.finish()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(response);
+    let sent = streams.sent.lock().unwrap();
+    let mut bytes = Vec::new();
+    for (_, data) in sent
+        .iter()
+        .filter(|(frame, _)| u64::from(frame.stream_id()) == 0)
+    {
+        bytes.extend_from_slice(data);
+    }
+    let mut input = bytes.as_slice();
+    let mut body = Vec::new();
+    while !input.is_empty() {
+        let (rest, kind) = qbase::varint::be_varint(input).unwrap();
+        let (rest, len) = qbase::varint::be_varint(rest).unwrap();
+        let len = len.into_u64() as usize;
+        if kind.into_u64() == 0 {
+            assert!(len <= wire::MAX_DATA_CHUNK);
+            body.extend_from_slice(&rest[..len]);
+        }
+        input = &rest[len..];
+    }
+    assert_eq!(body.len(), accepted + 4);
+    assert!(body[..accepted].iter().all(|byte| *byte == b'x'));
+    assert_eq!(&body[accepted..], b"tail");
+}
+
+#[tokio::test]
+async fn qpack_failure_synchronously_closes_admission_and_preserves_first_cause() {
+    let streams = Arc::new(Streams::new());
+    let connection = test_connection(&streams, 0).await;
+    let id = StreamId::from(VarInt::from_u32(0));
+    let error = connection
+        .inner
+        .qpack
+        .decode_fields(id, &[0, 0, 0x80])
+        .await
         .unwrap_err();
-    assert!(matches!(
-        error.get_ref().unwrap().downcast_ref::<Error>(),
-        Some(Error::OwnerStopped)
-    ));
-    assert!(matches!(writer.finish().await, Err(Error::OwnerStopped)));
+    assert_eq!(error.code(), Some(Code::QPACK_DECOMPRESSION_FAILED));
+    let request = http::Request::builder()
+        .uri("https://example.test/")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+    assert_eq!(
+        connection.request(request).await.unwrap_err().code(),
+        error.code()
+    );
+    connection.inner.terminate(Error::OwnerStopped);
+    assert_eq!(connection.inner.failure().code(), error.code());
+    assert_eq!(
+        connection
+            .inner
+            .qpack
+            .encode_fields(id, Vec::new())
+            .await
+            .unwrap_err()
+            .code(),
+        error.code()
+    );
+    assert_eq!(connection.closed().await.unwrap_err().code(), error.code());
+}
+
+#[tokio::test]
+async fn streaming_length_errors_fail_the_writer_and_pending_response() {
+    use tokio::io::AsyncWriteExt;
+    for data in [b"a".as_slice(), b"abc".as_slice()] {
+        let streams = Arc::new(Streams::new());
+        let connection = test_connection(&streams, 5).await;
+        let parts = http::Request::builder()
+            .uri("https://example.test/")
+            .header("content-length", "2")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let (mut writer, response) = connection.request_streaming(parts).await.unwrap();
+        if data.len() < 2 {
+            writer.write_all(data).await.unwrap();
+            assert_eq!(
+                writer.finish().await.unwrap_err().code(),
+                Some(Code::H3_MESSAGE_ERROR)
+            );
+        } else {
+            let error = writer.write_all(data).await.unwrap_err();
+            assert_eq!(
+                error
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref::<Error>()
+                    .unwrap()
+                    .code(),
+                Some(Code::H3_MESSAGE_ERROR)
+            );
+        }
+        assert_eq!(
+            response.await.unwrap_err().code(),
+            Some(Code::H3_MESSAGE_ERROR)
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            streams.drive(connection.inner.drain.wait()),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn goaway_broadcast_rejects_only_covered_responses_even_before_their_first_poll() {
+    for poll_first in [false, true] {
+        let streams = Arc::new(Streams::new());
+        streams.drive(async {
+            let connection = test_connection(&streams, 5).await;
+            let head = || http::Request::builder().uri("https://example.test/")
+                .body(()).unwrap().into_parts().0;
+            let (first_writer, first) = connection.request_streaming(head()).await.unwrap();
+            let (second_writer, second) = connection.request_streaming(head()).await.unwrap();
+            let mut first = Box::pin(first);
+            if poll_first {
+                tokio::task::yield_now().await;
+            }
+            connection.inner.on_peer_goaway(4).unwrap();
+            assert!(matches!(second.await, Err(Error::Goaway { boundary }) if u64::from(boundary) == 4));
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            connection.inner.on_peer_goaway(0).unwrap();
+            assert!(matches!(first.await, Err(Error::Goaway { boundary }) if u64::from(boundary) == 0));
+            drop((first_writer, second_writer));
+            assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
+            connection.shutdown().await.unwrap();
+        }).await;
+    }
+}
+
+#[tokio::test]
+async fn peer_goaway_cancels_a_request_still_waiting_to_open_a_stream() {
+    let streams = Arc::new(Streams::new());
+    let connection = test_connection(&streams, 3).await;
+    let request = http::Request::builder()
+        .uri("https://example.test/")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+    let mut pending = Box::pin(connection.request(request));
+    assert!(futures::poll!(pending.as_mut()).is_pending());
+    connection.inner.on_peer_goaway(0).unwrap();
+    assert!(matches!(pending.await, Err(Error::Goaway { .. })));
+    assert!(connection.inner.drain.active.load(Ordering::Acquire) == 0);
 }

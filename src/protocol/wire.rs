@@ -23,7 +23,6 @@ pub(crate) struct ChunkReader {
     tail: Bytes,
     ended: bool,
     ready_reads: u8,
-    stop_code: Code,
 }
 
 impl ChunkReader {
@@ -36,16 +35,14 @@ impl ChunkReader {
             tail: Bytes::new(),
             ended: false,
             ready_reads: 0,
-            stop_code: Code::H3_REQUEST_CANCELLED,
         }
     }
 
-    pub(crate) fn stop(&mut self, code: Code) -> Result<(), Error> {
+    pub(crate) fn stop(&mut self, code: Code) {
         self.ended = true;
         self.pending = Bytes::new();
         self.tail = Bytes::new();
         dquic::prelude::StopSending::stop(&mut self.stream, code.as_u64());
-        Ok(())
     }
 
     #[cfg(feature = "webtransport")]
@@ -164,7 +161,7 @@ impl ChunkReader {
 impl Drop for ChunkReader {
     fn drop(&mut self) {
         if !self.ended {
-            let _ = self.stop(self.stop_code);
+            self.stop(Code::H3_REQUEST_CANCELLED);
         }
     }
 }
@@ -191,7 +188,7 @@ impl FrameReader {
         }
     }
 
-    pub(crate) fn stop(&mut self, code: Code) -> Result<(), Error> {
+    pub(crate) fn stop(&mut self, code: Code) {
         self.input.stop(code)
     }
 

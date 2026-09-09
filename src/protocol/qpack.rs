@@ -7,12 +7,14 @@ use bytes::{Buf, Bytes, BytesMut};
 use dquic::prelude::StreamWriter;
 use futures::SinkExt;
 use httlib_huffman::DecoderSpeed;
+#[cfg(test)]
 use http::HeaderMap;
 use qbase::varint::VARINT_MAX;
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, watch};
 
 #[cfg(test)]
 use super::headers::request_fields;
+#[cfg(test)]
 use super::headers::{
     regular_fields, request_parts, response_fields, response_parts, trailer_fields,
 };
@@ -45,8 +47,7 @@ pub(crate) struct Qpack {
     decoder: Mutex<decoder::Decoder>,
     insertions: Notify,
     max_encoder_instruction_buffer_bytes: usize,
-    failure: Mutex<Option<Error>>,
-    failed: Notify,
+    terminal: watch::Receiver<Option<Error>>,
     decoder_instructions: Arc<InstructionQueue>,
     fail_connection: Box<dyn Fn(Error) + Send + Sync>,
 }
@@ -55,13 +56,12 @@ pub(crate) struct DecoderWriter {
     stream: StreamWriter,
     commands: mpsc::UnboundedReceiver<Bytes>,
     queue: Arc<InstructionQueue>,
+    terminal: watch::Receiver<Option<Error>>,
 }
 
 struct InstructionQueue {
     commands: mpsc::UnboundedSender<Bytes>,
     pending_bytes: AtomicUsize,
-    failure: Mutex<Option<Error>>,
-    failed: Notify,
 }
 
 impl Qpack {
@@ -69,14 +69,13 @@ impl Qpack {
         settings: &Settings,
         encoder_stream: StreamWriter,
         decoder_stream: StreamWriter,
+        terminal: watch::Receiver<Option<Error>>,
         fail_connection: Box<dyn Fn(Error) + Send + Sync>,
     ) -> (Arc<Self>, DecoderWriter) {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let queue = Arc::new(InstructionQueue {
             commands: commands_tx,
             pending_bytes: AtomicUsize::new(0),
-            failure: Mutex::new(None),
-            failed: Notify::new(),
         });
         let qpack = Arc::new(Self {
             encoder: AsyncMutex::new(EncoderSide {
@@ -94,8 +93,7 @@ impl Qpack {
             )
             .unwrap_or(usize::MAX)
             .max(MIN_ENCODER_INSTRUCTION_BUFFER_BYTES),
-            failure: Mutex::new(None),
-            failed: Notify::new(),
+            terminal: terminal.clone(),
             decoder_instructions: Arc::clone(&queue),
             fail_connection,
         });
@@ -103,12 +101,13 @@ impl Qpack {
             stream: decoder_stream,
             commands: commands_rx,
             queue,
+            terminal,
         };
         (qpack, writer)
     }
 
     pub(crate) async fn apply_peer_settings(&self, settings: &Settings) -> Result<(), Error> {
-        let result = async {
+        let work = async {
             let mut encoder = self.encoder.lock().await;
             let instruction = encoder
                 .state
@@ -117,57 +116,13 @@ impl Qpack {
                 send_critical(&mut encoder.stream, instruction, "QPACK encoder").await?;
             }
             Ok(())
-        }
-        .await;
-        self.fail_on_connection(result)
-    }
-
-    pub(crate) async fn decode_request(
-        &self,
-        stream_id: StreamId,
-        payload: &[u8],
-    ) -> Result<http::request::Parts, Error> {
-        request_parts(self.decode(stream_id, payload).await?)
-    }
-
-    pub(crate) async fn encode_response(
-        &self,
-        stream_id: StreamId,
-        parts: http::response::Parts,
-    ) -> Result<Bytes, Error> {
-        self.encode_fields(
-            stream_id,
-            response_fields(parts).map_err(Error::into_invalid_message)?,
-        )
-        .await
-    }
-
-    pub(crate) async fn decode_response(
-        &self,
-        stream_id: StreamId,
-        payload: &[u8],
-    ) -> Result<http::response::Parts, Error> {
-        response_parts(self.decode(stream_id, payload).await?)
-    }
-
-    pub(crate) async fn encode_trailers(
-        &self,
-        stream_id: StreamId,
-        trailers: HeaderMap,
-    ) -> Result<Bytes, Error> {
-        self.encode_fields(
-            stream_id,
-            regular_fields(trailers).map_err(Error::into_invalid_message)?,
-        )
-        .await
-    }
-
-    pub(crate) async fn decode_trailers(
-        &self,
-        stream_id: StreamId,
-        payload: &[u8],
-    ) -> Result<HeaderMap, Error> {
-        trailer_fields(self.decode(stream_id, payload).await?)
+        };
+        let result = tokio::select! {
+            biased;
+            error = self.stopped() => Err(error),
+            result = work => result,
+        };
+        self.terminate_on_connection_error(result)
     }
 
     pub(crate) fn cancel_stream(&self, stream_id: StreamId) {
@@ -181,7 +136,7 @@ impl Qpack {
                 instruction::DecoderInstruction::StreamCancellation(u64::from(stream_id)),
             )
         {
-            let _ = self.fail_on_connection::<()>(Err(error));
+            let _ = self.terminate_on_connection_error::<()>(Err(error));
         }
     }
 
@@ -222,7 +177,7 @@ impl Qpack {
             ))
         }
         .await;
-        self.fail_on_connection(result)
+        self.terminate_on_connection_error(result)
     }
 
     pub(crate) async fn handle_decoder_stream(&self, mut reader: ChunkReader) -> Result<(), Error> {
@@ -247,25 +202,21 @@ impl Qpack {
             ))
         }
         .await;
-        self.fail_on_connection(result)
+        self.terminate_on_connection_error(result)
     }
 
-    pub(crate) fn fail(&self, error: Error) {
-        let mut failure = self.failure.lock().expect("QPACK failure lock poisoned");
-        if failure.is_some() {
-            return;
-        }
-        *failure = Some(error);
-        drop(failure);
-        self.failed.notify_waiters();
-        self.insertions.notify_waiters();
+    pub(crate) fn failure(&self) -> Option<Error> {
+        self.terminal.borrow().clone()
     }
 
-    fn failure(&self) -> Option<Error> {
-        self.failure
-            .lock()
-            .expect("QPACK failure lock poisoned")
+    pub(crate) async fn stopped(&self) -> Error {
+        self.terminal
             .clone()
+            .wait_for(Option::is_some)
+            .await
+            .expect("connection owns terminal sender")
+            .clone()
+            .unwrap()
     }
 
     pub(crate) async fn encode_fields(
@@ -273,33 +224,40 @@ impl Qpack {
         stream_id: StreamId,
         fields: Vec<Field>,
     ) -> Result<Bytes, Error> {
-        let result = async {
+        let work = async {
             let mut encoder = self.encoder.lock().await;
             let encoded = encoder.state.encode(stream_id, fields)?;
             if !encoded.instructions.is_empty() {
                 send_critical(&mut encoder.stream, encoded.instructions, "QPACK encoder").await?;
             }
             Ok(encoded.field_section)
-        }
-        .await;
-        self.fail_on_connection(result)
+        };
+        let result = tokio::select! {
+            biased;
+            error = self.stopped() => Err(error),
+            result = work => result,
+        };
+        self.terminate_on_connection_error(result)
     }
 
-    async fn decode(&self, stream_id: StreamId, payload: &[u8]) -> Result<Vec<Field>, Error> {
+    pub(crate) async fn decode_fields(
+        &self,
+        stream_id: StreamId,
+        payload: &[u8],
+    ) -> Result<Vec<Field>, Error> {
         loop {
             let notified = self.insertions.notified();
-            let failed = self.failed.notified();
             if let Some(error) = self.failure() {
                 return Err(error);
             }
-            let decoded = match self
+            let decoded = self
                 .decoder
                 .lock()
                 .expect("QPACK decoder lock poisoned")
-                .decode(stream_id, payload)
-            {
+                .decode(stream_id, payload);
+            let decoded = match decoded {
                 Ok(decoded) => decoded,
-                Err(error) => return self.fail_on_connection(Err(error)),
+                Err(error) => return self.terminate_on_connection_error(Err(error)),
             };
             match decoded {
                 decoder::Decode::Ready {
@@ -313,25 +271,27 @@ impl Qpack {
                             )),
                         )
                     {
-                        return self.fail_on_connection(Err(error));
+                        return self.terminate_on_connection_error(Err(error));
                     }
                     return Ok(fields);
                 }
                 decoder::Decode::Blocked => {
                     tokio::select! {
                         _ = notified => {}
-                        _ = failed => {}
+                        error = self.stopped() => return Err(error),
                     }
                 }
             }
         }
     }
 
-    pub(super) fn fail_on_connection<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
+    pub(super) fn terminate_on_connection_error<T>(
+        &self,
+        result: Result<T, Error>,
+    ) -> Result<T, Error> {
         if let Err(error) = &result
             && error.is_connection()
         {
-            self.fail(error.clone());
             (self.fail_connection)(error.clone());
         }
         result
@@ -340,23 +300,18 @@ impl Qpack {
 
 impl DecoderWriter {
     pub(crate) async fn run(mut self) -> Result<(), Error> {
-        loop {
-            let failed = self.queue.failed.notified();
-            if let Some(error) = self.queue.failure() {
-                return Err(error);
+        let work = async {
+            while let Some(command) = self.commands.recv().await {
+                let len = command.len();
+                send_critical(&mut self.stream, command, "QPACK decoder").await?;
+                self.queue.pending_bytes.fetch_sub(len, Ordering::AcqRel);
             }
-            tokio::select! {
-                biased;
-                _ = failed => {}
-                command = self.commands.recv() => {
-                    let Some(command) = command else {
-                        return Ok(());
-                    };
-                    let len = command.len();
-                    send_critical(&mut self.stream, command, "QPACK decoder").await?;
-                    self.queue.pending_bytes.fetch_sub(len, Ordering::AcqRel);
-                }
-            }
+            Ok(())
+        };
+        tokio::select! {
+            biased;
+            error = self.terminal.wait_for(Option::is_some) => Err(error.expect("connection owns terminal sender").clone().unwrap()),
+            result = work => result,
         }
     }
 }
@@ -378,7 +333,6 @@ impl InstructionQueue {
                 Code::H3_EXCESSIVE_LOAD,
                 "pending QPACK decoder instructions exceed the implementation limit",
             );
-            self.fail(error.clone());
             return Err(error);
         }
         if self.commands.send(bytes).is_err() {
@@ -387,26 +341,9 @@ impl InstructionQueue {
                 Code::H3_CLOSED_CRITICAL_STREAM,
                 "local QPACK decoder instruction writer stopped",
             );
-            self.fail(error.clone());
             return Err(error);
         }
         Ok(())
-    }
-
-    fn fail(&self, error: Error) {
-        let mut failure = self.failure.lock().expect("QPACK queue lock poisoned");
-        if failure.is_none() {
-            *failure = Some(error);
-            drop(failure);
-            self.failed.notify_waiters();
-        }
-    }
-
-    fn failure(&self) -> Option<Error> {
-        self.failure
-            .lock()
-            .expect("QPACK queue lock poisoned")
-            .clone()
     }
 }
 
@@ -772,17 +709,20 @@ mod tests {
         let mut settings = Settings::default();
         settings.set_qpack_max_table_capacity(256);
         settings.set_qpack_blocked_streams(1);
-        let (qpack, _writer) = Qpack::new(
+        let (terminal, subscription) = watch::channel(None);
+        let (qpack, writer) = Qpack::new(
             &settings,
             crate::test_streams::writer(),
             crate::test_streams::writer(),
+            subscription,
             Box::new(|_| {}),
         );
+        let writing = tokio::spawn(writer.run());
         let blocked = {
             let qpack = Arc::clone(&qpack);
             tokio::spawn(async move {
                 qpack
-                    .decode(
+                    .decode_fields(
                         crate::StreamId::from(qbase::varint::VarInt::from_u32(0)),
                         &[2, 0, 0x80],
                     )
@@ -791,10 +731,10 @@ mod tests {
         };
         tokio::task::yield_now().await;
 
-        qpack.fail(Error::connection_protocol(
+        terminal.send_replace(Some(Error::connection_protocol(
             Code::H3_INTERNAL_ERROR,
             "connection closed",
-        ));
+        )));
 
         let error = tokio::time::timeout(Duration::from_millis(100), blocked)
             .await
@@ -803,19 +743,61 @@ mod tests {
             .expect_err("connection failure must abort blocked decoding");
         assert!(matches!(&error, Error::Connection { .. }));
         assert_eq!(error.code(), Some(Code::H3_INTERNAL_ERROR));
+        assert_eq!(writing.await.unwrap().unwrap_err().code(), error.code());
+    }
+
+    #[tokio::test]
+    async fn decoder_queue_overflow_notifies_the_same_terminal_subscription() {
+        let mut settings = Settings::default();
+        settings.set_qpack_max_table_capacity(256);
+        settings.set_qpack_blocked_streams(1);
+        let (terminal, subscription) = watch::channel(None);
+        let reported = terminal.clone();
+        let (qpack, writer) = Qpack::new(
+            &settings,
+            crate::test_streams::writer(),
+            crate::test_streams::writer(),
+            subscription,
+            Box::new(move |error| {
+                reported.send_replace(Some(error));
+            }),
+        );
+        let id = StreamId::from(qbase::varint::VarInt::from_u32(0));
+        let mut blocked = Box::pin(qpack.decode_fields(id, &[2, 0, 0x80]));
+        assert!(futures::poll!(blocked.as_mut()).is_pending());
+        for _ in 0..MAX_PENDING_DECODER_INSTRUCTION_BYTES {
+            qpack
+                .decoder_instructions
+                .enqueue(instruction::DecoderInstruction::InsertCountIncrement(1))
+                .unwrap();
+        }
+        qpack.cancel_stream(id);
+        assert_eq!(
+            terminal.borrow().as_ref().and_then(Error::code),
+            Some(Code::H3_EXCESSIVE_LOAD)
+        );
+        assert_eq!(
+            blocked.await.unwrap_err().code(),
+            Some(Code::H3_EXCESSIVE_LOAD)
+        );
+        assert_eq!(
+            writer.run().await.unwrap_err().code(),
+            Some(Code::H3_EXCESSIVE_LOAD)
+        );
     }
 
     #[tokio::test]
     async fn incomplete_encoder_instruction_is_bounded_by_table_capacity() {
         let settings = Settings::default();
-        let failure = Arc::new(Mutex::new(None));
+        let (failure, subscription) = watch::channel(None);
         let reported = failure.clone();
         let (qpack, _writer) = Qpack::new(
             &settings,
             crate::test_streams::writer(),
             crate::test_streams::writer(),
+            subscription,
             Box::new(move |error| {
-                *reported.lock().unwrap() = Some(error);
+                reported.send_replace(Some(error));
             }),
         );
         let mut instruction = vec![0x5f, 69];
@@ -832,7 +814,7 @@ mod tests {
         assert!(matches!(&error, Error::Connection { .. }));
         assert_eq!(error.code(), Some(Code::QPACK_ENCODER_STREAM_ERROR));
         assert_eq!(
-            failure.lock().unwrap().as_ref().and_then(Error::code),
+            failure.borrow().as_ref().and_then(Error::code),
             error.code()
         );
     }

@@ -8,7 +8,6 @@ use std::{
 use ::dquic::prelude::{QuicClient, QuicListeners};
 use bytes::Bytes;
 use futures::{StreamExt, stream::FuturesUnordered};
-use http::uri::Authority;
 use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
 use tokio::sync::watch;
 
@@ -18,7 +17,7 @@ use super::{
 };
 use crate::{Endpoint, Error, LocalAuthority, RemoteAuthority, Settings, transport::CloseOnDrop};
 
-pub(super) type Key = (Option<String>, Authority);
+pub(super) type Key = (Option<String>, String);
 pub(super) type Connected = Result<Arc<Connection>, Error>;
 
 pub struct Runtime {
@@ -34,13 +33,14 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HANDSHAKES: usize = 64;
+const MAX_REQUESTS: usize = 256;
 
 type ResponseBody = UnsyncBoxBody<Bytes, crate::BoxError>;
 
 type Service = Arc<
     dyn Fn(
             crate::server::Request<crate::ChunkBody>,
-        ) -> crate::platform::BoxFuture<
+        ) -> futures::future::BoxFuture<
             'static,
             Result<crate::server::Response<ResponseBody>, crate::BoxError>,
         > + Send
@@ -118,12 +118,7 @@ impl Runtime {
         runtime.check_local(local.as_ref())?;
         // Name validation rejects ports, selectors and URLs instead of silently
         // dropping a caller's target constraints.
-        let target: Authority =
-            super::identity::normalize_name(target)?
-                .parse()
-                .map_err(|source| Error::InvalidEndpoint {
-                    source: Arc::new(source),
-                })?;
+        let target = super::identity::normalize_name(target)?;
         let key = (local.as_ref().map(|local| local.name().to_owned()), target);
         let (entry, publish) = runtime.pool.reserve(&key)?;
         if let Some(publish) = publish
@@ -148,7 +143,7 @@ impl Runtime {
 
     /// Admit an authenticated, initialized connection to the reuse cache.
     /// False means it remains usable but was not selected for caching.
-    fn accept(&self, connection: Arc<Connection>) -> Result<bool, Error> {
+    fn cache_connection(&self, connection: Arc<Connection>) -> Result<bool, Error> {
         self.check_local(connection.local_endpoint())?;
         let Some(remote) = connection.remote_authority() else {
             return Ok(false);
@@ -160,7 +155,7 @@ impl Runtime {
             connection
                 .local_endpoint()
                 .map(|local| local.name().to_owned()),
-            remote.name().parse().map_err(|_| Error::IdentityMismatch)?,
+            remote.name().to_owned(),
         );
         Ok(self.pool.admit(key, connection))
     }
@@ -198,30 +193,26 @@ impl Runtime {
     async fn connect(
         &'static self,
         local: Option<Arc<Endpoint>>,
-        target: Authority,
+        target: String,
     ) -> Result<Arc<Connection>, Error> {
         let client = match &local {
             Some(local) => &self.endpoints[local.name()].1,
             None => &self.anonymous,
         };
-        let handshake = client
-            .connect(target.host())
-            .await
-            .map_err(transport_error)?;
+        let handshake = client.connect(&target).await.map_err(transport_error)?;
         let mut close_guard = CloseOnDrop(
             Some(Arc::new(handshake.clone())),
             crate::Code::H3_REQUEST_CANCELLED,
         );
-        let handshake = authenticate(handshake, local, Some(target)).await?;
-        let connection = self.start_connection(handshake).await?;
+        let handshake = authenticate(handshake, local, Some(&target)).await?;
+        let connection = Self::adopt_connection(handshake).await?;
+        self.tasks
+            .spawn(self.serve_connection(connection.clone()))?;
         close_guard.0.take();
         Ok(connection)
     }
 
-    async fn start_connection(
-        &'static self,
-        handshake: Authenticated,
-    ) -> Result<Arc<Connection>, Error> {
+    async fn adopt_connection(handshake: Authenticated) -> Result<Arc<Connection>, Error> {
         let Authenticated {
             transport,
             local,
@@ -233,12 +224,6 @@ impl Runtime {
             local: local.map(LocalAuthority),
             remote,
         });
-        if let Err(error) = self.tasks.spawn(self.serve_connection(handle.clone())) {
-            handle
-                .protocol
-                .close(crate::Code::H3_NO_ERROR, b"runtime stopping");
-            return Err(error);
-        }
         Ok(handle)
     }
 
@@ -248,8 +233,10 @@ impl Runtime {
         local: Arc<Endpoint>,
     ) -> Result<(), Error> {
         let handshake = authenticate(handshake, Some(local), None).await?;
-        let connection = self.start_connection(handshake).await?;
-        if let Err(error) = self.accept(connection.clone()) {
+        let connection = Self::adopt_connection(handshake).await?;
+        self.tasks
+            .spawn(self.serve_connection(connection.clone()))?;
+        if let Err(error) = self.cache_connection(connection.clone()) {
             connection
                 .protocol
                 .close(crate::Code::H3_INTERNAL_ERROR, b"invalid pool admission");
@@ -331,81 +318,63 @@ impl Runtime {
         Ok(())
     }
 
-    async fn serve_request(
-        &self,
-        connection: Arc<Connection>,
-        request: http::Request<crate::ChunkBody>,
-        reply: crate::server::ResponseSender,
-    ) {
-        let Some(local) = connection.local.as_ref() else {
-            // Anonymous local connections cannot host an identified service.
-            let _ = reply
-                .send(empty_response(http::StatusCode::NOT_FOUND))
-                .await;
-            return;
-        };
-        let request =
-            crate::server::Request::new(request, local.clone(), connection.remote.clone());
-        let service = connection
-            .local_endpoint()
-            .and_then(|local| self.services.lock().unwrap().get(local.name()).cloned());
-        let fallback = |status| {
-            crate::server::Response::new(
-                empty_response(status),
-                local.clone(),
-                connection.remote.clone(),
-            )
-        };
-        let response = match service {
-            Some(service) => service(request)
-                .await
-                .unwrap_or_else(|_| fallback(http::StatusCode::INTERNAL_SERVER_ERROR)),
-            None => fallback(http::StatusCode::NOT_FOUND),
-        };
-        // A service may return a response retained from another request.
-        let response = if response.matches_authorities(local, connection.remote.as_ref()) {
-            response
-        } else {
-            fallback(http::StatusCode::INTERNAL_SERVER_ERROR)
-        };
-        let _ = reply.send(response.into_http()).await;
-    }
-
-    async fn serve_connection(&'static self, handle: Arc<Connection>) {
+    async fn serve_connection(&'static self, connection: Arc<Connection>) {
         let mut tasks = tokio::task::JoinSet::new();
-        let mut accepting = true;
         let mut stopping = self.tasks.subscribe();
         loop {
             tokio::select! {
                 _ = stopping.wait_for(|value| *value) => {
-                    handle.protocol.close(crate::Code::H3_NO_ERROR, b"runtime stopping");
+                    connection.protocol.close(crate::Code::H3_NO_ERROR, b"runtime stopping");
                     break;
                 },
-                incoming = handle.protocol.accept(), if accepting => {
-                    match incoming {
-                        Ok(Some((request, reply))) => {
-                            tasks.spawn(self.serve_request(handle.clone(), request, reply));
-                        }
-                        Ok(None) => accepting = false,
+                incoming = crate::transport::Connection::accept_bi(connection.protocol.transport()),
+                    if tasks.len() < MAX_REQUESTS => {
+                    let (id, (recv, send)) = match incoming {
+                        Ok(stream) => stream,
                         Err(_) => break,
-                    }
+                    };
+                    let request = connection.protocol.read_request(id, recv, send);
+                    let connection = connection.clone();
+                    tasks.spawn(async move {
+                        let Ok(Some((request, reply))) = request.await else {
+                            return;
+                        };
+                        let Some(local) = connection.local.as_ref() else {
+                            let _ = reply.send(empty_response(http::StatusCode::NOT_FOUND)).await;
+                            return;
+                        };
+                        let req = crate::server::Request::new(
+                            request, local.clone(), connection.remote.clone(),
+                        );
+                        let service = self.services.lock().unwrap().get(local.0.name()).cloned();
+                        let fallback = |status| crate::server::Response::new(
+                            empty_response(status), local.clone(), connection.remote.clone(),
+                        );
+                        let response = match service {
+                            Some(service) => service(req).await.unwrap_or_else(|_| {
+                                fallback(http::StatusCode::INTERNAL_SERVER_ERROR)
+                            }),
+                            None => fallback(http::StatusCode::NOT_FOUND),
+                        };
+                        let response = if response.matches_authorities(local, connection.remote.as_ref()) {
+                            response
+                        } else {
+                            fallback(http::StatusCode::INTERNAL_SERVER_ERROR)
+                        };
+                        let _ = reply.send(response.into_http()).await;
+                    });
                 }
-                _ = crate::transport::Connection::closed(handle.protocol.transport()) => break,
-                _ = handle.protocol.closed() => break,
+                _ = connection.protocol.closed() => break,
                 result = tasks.join_next(), if !tasks.is_empty() => {
                     if matches!(result, Some(Err(_))) {
-                        handle.protocol.close(crate::Code::H3_INTERNAL_ERROR, b"service task failed");
+                        connection.protocol.close(crate::Code::H3_INTERNAL_ERROR, b"service task failed");
                         break;
                     }
                 }
-                else => break,
-            }
-            if !accepting && tasks.is_empty() {
-                break;
             }
         }
         tasks.shutdown().await;
-        let _ = handle.protocol.closed().await;
+        let _ = connection.protocol.closed().await;
     }
 }
 

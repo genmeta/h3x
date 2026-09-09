@@ -19,16 +19,12 @@ use std::{
 
 use bytes::Bytes;
 use dquic::prelude::StreamWriter;
-use futures::SinkExt;
+use futures::{SinkExt, future::BoxFuture};
 use http::{Method, Request, Response as HttpResponse};
 use qbase::varint::{VARINT_MAX, VarInt, WriteVarInt, be_varint};
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 
-use crate::{
-    ChunkBody, Code, Error, ResponseSender, Settings, StreamId,
-    platform::{BoxFuture, MaybeSend, MaybeSync},
-    transport, wire,
-};
+use crate::{ChunkBody, Code, Error, ResponseSender, Settings, StreamId, transport, wire};
 
 mod capsule;
 mod stream;
@@ -125,7 +121,7 @@ pub fn is_request<B>(request: &Request<B>) -> bool {
     request.method() == Method::CONNECT && request.extensions().get::<ProtocolMarker>().is_some()
 }
 
-trait Driver: MaybeSend + MaybeSync {
+trait Driver: Send + Sync {
     fn open_bi(&self) -> BoxFuture<'static, Result<(wire::ChunkReader, stream::BoxWriter), Error>>;
 
     fn open_uni(&self) -> BoxFuture<'static, Result<stream::BoxWriter, Error>>;
@@ -204,10 +200,7 @@ impl<T: transport::webtransport::Connection> Driver for DriverImpl<T> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 type WrapWriter<S> = Arc<dyn Fn(StreamId, S) -> stream::BoxWriter + Send + Sync>;
-#[cfg(target_arch = "wasm32")]
-type WrapWriter<S> = Arc<dyn Fn(StreamId, S) -> stream::BoxWriter>;
 
 pub(crate) struct Hooks<S> {
     runtime: Arc<Runtime>,
@@ -409,7 +402,7 @@ impl Runtime {
     fn register(
         self: &Arc<Self>,
         id: StreamId,
-        connection: crate::platform::KeepAlive,
+        connection: std::sync::Arc<dyn Send + Sync>,
     ) -> Result<PreparedSession, Error> {
         validate_session_id(id)?;
         if let Some(error) = self
@@ -467,7 +460,7 @@ impl Runtime {
     pub(crate) fn prepare(
         self: &Arc<Self>,
         id: StreamId,
-        connection: crate::platform::KeepAlive,
+        connection: std::sync::Arc<dyn Send + Sync>,
     ) -> Result<PendingSession, Error> {
         Ok(PendingSession {
             prepared: Some(self.register(id, connection)?),
@@ -541,7 +534,7 @@ impl Runtime {
             Ok(session) => session,
             Err(Code::H3_ID_ERROR) => return Err(invalid_session_id_error(id)),
             Err(code) => {
-                let _ = reader.stop(code);
+                reader.stop(code);
                 let _ = writer.reset_at(code, 0);
                 return Ok(());
             }
@@ -559,7 +552,7 @@ impl Runtime {
             Ok(session) => session,
             Err(Code::H3_ID_ERROR) => return Err(invalid_session_id_error(id)),
             Err(code) => {
-                let _ = reader.stop(code);
+                reader.stop(code);
                 return Ok(());
             }
         };
@@ -797,7 +790,7 @@ pub(crate) enum ControlCommand {
 pub struct Session {
     state: Arc<SessionState>,
     commands: mpsc::Sender<ControlCommand>,
-    _connection: crate::platform::KeepAlive,
+    _connection: std::sync::Arc<dyn Send + Sync>,
 }
 
 impl fmt::Debug for Session {
@@ -838,8 +831,12 @@ impl Session {
     pub async fn open_uni(&self) -> Result<SendStream, Error> {
         self.state.check_open()?;
         let mut writer = self.state.driver.open_uni().await?;
-        let reliable_size =
-            write_stream_header(&mut writer, u64::from(wire::StreamType::WebTransport), self.id()).await?;
+        let reliable_size = write_stream_header(
+            &mut writer,
+            u64::from(wire::StreamType::WebTransport),
+            self.id(),
+        )
+        .await?;
         let send = SendStream::new(writer, reliable_size, &self.state);
         self.state.check_open()?;
         Ok(send)
@@ -1053,12 +1050,12 @@ async fn write_stream_header(
 }
 
 fn reject_bidi(mut reader: wire::ChunkReader, mut writer: stream::BoxWriter, code: Code) {
-    let _ = reader.stop(code);
+    reader.stop(code);
     let _ = writer.reset_at(code, 0);
 }
 
 fn reject_uni(mut reader: wire::ChunkReader, code: Code) {
-    let _ = reader.stop(code);
+    reader.stop(code);
 }
 
 fn validate_session_id(id: StreamId) -> Result<(), Error> {
