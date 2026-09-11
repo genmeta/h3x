@@ -213,3 +213,108 @@ impl<B: BufMut> Write<H3Frame> for B {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn every_frame_round_trips_without_consuming_the_next_frame() {
+        for value in [
+            0u64,
+            63,
+            64,
+            16383,
+            16384,
+            (1 << 30) - 1,
+            1 << 30,
+            (1 << 62) - 1,
+        ] {
+            let id = VarInt::try_from(value).unwrap();
+            let frames = [
+                H3Frame::Data(Frame::new(Data(3)).unwrap()),
+                H3Frame::Headers(
+                    Frame::new(Headers {
+                        field_section: Bytes::from_static(b"abc"),
+                    })
+                    .unwrap(),
+                ),
+                H3Frame::CancelPush(Frame::new(CancelPush { push_id: id.into() }).unwrap()),
+                H3Frame::Settings(Frame::new(Settings::default()).unwrap()),
+                H3Frame::PushPromise(
+                    Frame::new(PushPromise {
+                        push_id: id,
+                        field_section: Bytes::from_static(b"abc"),
+                    })
+                    .unwrap(),
+                ),
+                H3Frame::Goaway(Frame::new(Goaway { id }).unwrap()),
+                H3Frame::MaxPushId(Frame::new(MaxPushId { push_id: id }).unwrap()),
+            ];
+            for (frame, ty) in frames.into_iter().zip([0, 1, 3, 4, 5, 7, 13]) {
+                let mut encoded = Vec::new();
+                encoded.put_frame(&frame);
+                assert_eq!(encoded[0], ty);
+                assert_eq!(frame.frame_type(), FrameType::try_from(ty as u64).unwrap());
+                let mut envelope = encoded.as_slice();
+                assert_eq!(
+                    be_varint(&mut envelope).await.unwrap().into_u64(),
+                    ty as u64
+                );
+                assert_eq!(
+                    be_varint(&mut envelope).await.unwrap().into_u64(),
+                    frame.encoding_size() as u64
+                );
+                if ty == 0 {
+                    encoded.extend_from_slice(b"abc");
+                }
+                encoded.extend_from_slice(&[0, 0]);
+                let mut input = encoded.as_slice();
+                assert_eq!(be_frame(&mut input).await.unwrap(), frame);
+                if ty == 0 {
+                    assert_eq!(&input[..3], b"abc");
+                    input = &input[3..];
+                }
+                assert_eq!(
+                    be_frame(&mut input).await.unwrap(),
+                    H3Frame::Data(Frame::new(Data(0)).unwrap())
+                );
+                assert!(input.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_control_frame_lengths_and_unknown_types() {
+        for ty in [3, 7, 13] {
+            for payload in [&[0][..], &[2, 0, 0], &[1, 0x40], &[9]] {
+                let mut encoded = vec![ty];
+                encoded.extend_from_slice(payload);
+                assert_eq!(
+                    be_frame(&mut encoded.as_slice()).await.unwrap_err(),
+                    Error::H3_FRAME_ERROR
+                );
+            }
+        }
+        for ty in [1, 4, 5] {
+            let mut encoded = vec![ty];
+            encoded.put_varint(&VarInt::try_from(MAX_BUFFERED_FRAME_PAYLOAD + 1).unwrap());
+            assert_eq!(
+                be_frame(&mut encoded.as_slice()).await.unwrap_err(),
+                Error::H3_EXCESSIVE_LOAD
+            );
+        }
+        assert_eq!(
+            be_frame(&mut &[2][..]).await.unwrap_err(),
+            Error::H3_FRAME_UNEXPECTED
+        );
+        assert_eq!(
+            be_frame(&mut &[5, 0][..]).await.unwrap_err(),
+            Error::H3_FRAME_ERROR
+        );
+        assert_eq!(
+            check_payload_length(MAX_BUFFERED_FRAME_PAYLOAD as u64).unwrap(),
+            MAX_BUFFERED_FRAME_PAYLOAD
+        );
+    }
+}
