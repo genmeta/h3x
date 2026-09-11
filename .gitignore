@@ -3,3 +3,4 @@ Cargo.lock
 AGENTS.md
 .sisyphus/
 test_locations
+/design
