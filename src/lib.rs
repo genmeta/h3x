@@ -8,3 +8,7 @@ pub const ALPN: &[u8] = b"h3";
 // Protocol primitives are connected to message I/O in the final stage.
 #[allow(dead_code, unused_imports)]
 mod protocol;
+
+#[allow(dead_code)]
+mod wnd_buf;
+pub use wnd_buf::ArcWndBuf;
