@@ -522,4 +522,46 @@ mod tests {
         assert_eq!(sent.unwrap_err(), Error::H3_INTERNAL_ERROR);
         assert_eq!(produced.unwrap_err(), Error::H3_REQUEST_CANCELLED);
     }
+
+    #[tokio::test]
+    async fn body_trailers_enforce_order_and_content_length() {
+        let mut trailers = Vec::new();
+        let mut field_section = Vec::new();
+        field_section
+            .put_field_section(vec![qpack::Field {
+                never_index: false,
+                name: Bytes::from_static(b"x-checksum"),
+                value: Bytes::from_static(b"ok"),
+            }])
+            .unwrap();
+        trailers.put_frame(
+            &Frame::new(Headers {
+                field_section: field_section.into(),
+            })
+            .unwrap(),
+        );
+        for (suffix, length, expected) in [
+            (&[][..], None, Ok(())),
+            (&[][..], Some(0), Ok(())),
+            (&[][..], Some(1), Err(Error::H3_MESSAGE_ERROR)),
+            (trailers.as_slice(), None, Err(Error::H3_FRAME_UNEXPECTED)),
+            (&[0, 0][..], None, Err(Error::H3_FRAME_UNEXPECTED)),
+        ] {
+            let encoded = [trailers.as_slice(), suffix].concat();
+            let mut input = encoded.as_slice();
+            let mut body = Vec::new();
+            assert_eq!(
+                read_request_body(&mut input, &mut body, length).await,
+                expected
+            );
+            assert!(body.is_empty());
+        }
+        let mut input = &[7, 1, 0][..]; // GOAWAY is forbidden in a message body.
+        let mut body = Vec::new();
+        let length = None;
+        assert_eq!(
+            read_request_body(&mut input, &mut body, length).await,
+            Err(Error::H3_FRAME_UNEXPECTED)
+        );
+    }
 }
