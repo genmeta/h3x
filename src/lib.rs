@@ -1,14 +1,18 @@
-mod error;
+#![doc = include_str!("../README.md")]
 
+pub mod client;
+mod common;
+mod error;
+mod protocol;
+pub mod server;
+mod wnd_buf;
+
+pub use common::message::{
+    ReadBody, ReadRequest, ReadResponse, ReadStream, WriteBody, WriteRequest, WriteResponse,
+    WriteStream,
+};
 pub use error::{Error, Result};
+pub use wnd_buf::ArcWndBuf;
 
 /// ALPN token used by HTTP/3.
 pub const ALPN: &[u8] = b"h3";
-
-// Protocol primitives are connected to message I/O in the final stage.
-#[allow(dead_code, unused_imports)]
-mod protocol;
-
-#[allow(dead_code)]
-mod wnd_buf;
-pub use wnd_buf::ArcWndBuf;
