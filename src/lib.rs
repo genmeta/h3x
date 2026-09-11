@@ -1,33 +1,6 @@
-#![doc = include_str!("../README.md")]
+mod error;
 
-pub mod buflist;
-pub mod codec;
-pub mod connection;
-pub mod dhttp;
-pub mod error;
-pub mod extended_connect;
-pub mod pool;
-pub mod protocol;
-pub mod qpack;
-pub mod quic;
-pub mod stream;
-pub mod stream_id;
-mod util;
-pub mod varint;
+pub use error::{Error, Result};
 
-#[cfg(feature = "dquic")]
-pub mod dquic;
-
-pub mod endpoint;
-
-#[cfg(feature = "hyper")]
-pub mod hyper;
-
-#[cfg(feature = "ipc")]
-pub mod ipc;
-
-#[cfg(feature = "rpc")]
-pub mod rpc;
-
-#[cfg(feature = "webtransport")]
-pub mod webtransport;
+/// ALPN token used by HTTP/3.
+pub const ALPN: &[u8] = b"h3";

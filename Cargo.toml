@@ -1,6 +1,6 @@
 [package]
 name = "h3x"
-description = "Peer-to-peer DHTTP/3 transport over QUIC"
+description = "HTTP/3 message, frame, and stream primitives"
 version = "0.6.2"
 edition = "2024"
 readme = "README.md"
@@ -10,98 +10,9 @@ keywords = ["async", "quic", "http3"]
 categories = ["network-programming", "asynchronous"]
 
 [dependencies]
-bon = "3"
+async-trait = "0.1"
 bytes = "1"
-dashmap = "6"
-futures = "0.3"
 http = "1"
 httlib-huffman = "0.3"
-pin-project-lite = "0.2"
-ring = "0.17"
-rustls = { version = "0.23", default-features = false, features = [
-    "logging",
-    "std",
-] }
-snafu = "0.9"
-tokio = { version = "1", features = ["rt", "macros", "sync", "io-util"] }
-tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
-tracing = "0.1"
-tower-service = "0.3"
-
-dhttp-identity = "0.3.0"
-
-# feature dquic
-dquic = { version = "0.7.2", optional = true }
-netdev = { version = "0.46", optional = true }
-
-# feature hyper
-http-body = { version = "1", optional = true }
-http-body-util = { version = "0.1", optional = true }
-hyper = { version = "1", features = ["http2"], optional = true }
-
-# feature serde
-serde = { version = "1", features = ["derive"], optional = true }
-
-# feature rpc (implemented with remoc crate)
-# NOTE: no codec feature here — downstream chooses the codec
-remoc = { version = "0.18", default-features = false, optional = true, features = [
-    "remoc_macro",
-    "rtc",
-    "serde",
-] }
-
-# feature pipe
-nix = { version = "0.31", default-features = false, optional = true, features = [
-    "fs",
-    "socket",
-    "uio",
-] }
-smallvec = { version = "1", optional = true }
-
-# feature endpoint
-arc-swap = { version = "1", optional = true }
-async-channel = { version = "2", optional = true }
-either = { version = "1", optional = true }
-globset = { version = "0.4", optional = true }
-peg = { version = "0.8", optional = true }
-
-[features]
-default = ["dquic", "hyper"]
-dquic = [
-    "dep:dquic",
-    "dep:netdev",
-    "dep:arc-swap",
-    "dep:async-channel",
-    "dep:either",
-    "dep:globset",
-    "dep:peg",
-    "tokio/time",
-]
-hyper = ["dep:http-body", "dep:http-body-util", "dep:hyper"]
-serde = ["dep:serde"]
-# EXPERIMENTAL — consumer crates must also enable exactly one remoc default-codec-* feature.
-# h3x tests select default-codec-bincode in [dev-dependencies] for all-features CI.
-rpc = ["dep:remoc", "serde", "bytes/serde"]
-# EXPERIMENTAL — depends on rpc and the same consumer-selected remoc codec.
-ipc = ["rpc", "dep:nix", "dep:smallvec", "tokio/net"]
-webtransport = []
-testing = []
-
-[dev-dependencies]
-rustls = { version = "0.23", default-features = false, features = [
-    "ring",
-    "logging",
-] }
-tokio = { version = "1", features = [
-    "macros",
-    "test-util",
-    "io-util",
-    "rt-multi-thread",
-] }
-tracing-appender = "0.2"
-tracing-subscriber = "0.3"
-proptest = "1"
-remoc = { version = "0.18", default-features = false, features = [
-    "default-codec-bincode",
-] }
-serde_json = "1"
+qbase = "0.6.4"
+tokio = { version = "1", features = ["macros", "rt", "io-util"] }
