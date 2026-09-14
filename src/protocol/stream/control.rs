@@ -9,14 +9,14 @@ use crate::{
     Error, Result, Role,
     protocol::{
         connection::{Goaway, Settings},
-        frame::{self, FrameType, H3Frame, Write as _},
+        frame::{self, Frame, FrameType, H3Frame, Write as _},
         qpack::{self, Qpack},
     },
 };
 
 pub(crate) struct Control {
     pub(crate) sender: mpsc::Sender<(H3Frame, oneshot::Sender<Result<()>>)>,
-    pub(crate) receiver: AsyncMutex<mpsc::Receiver<(H3Frame, oneshot::Sender<Result<()>>)>>,
+    receiver: AsyncMutex<mpsc::Receiver<(H3Frame, oneshot::Sender<Result<()>>)>>,
 }
 
 impl Default for Control {
@@ -29,17 +29,24 @@ impl Default for Control {
     }
 }
 
-pub(crate) struct ControlStream<S> {
-    send: S,
-}
-
-impl<S: AsyncWrite + Unpin> ControlStream<S> {
-    pub(crate) fn new(send: S) -> Self {
-        Self { send }
-    }
-
-    pub(crate) async fn write(&mut self, frame: &H3Frame) -> Result<()> {
-        write(&mut self.send, frame).await
+impl Control {
+    pub(crate) async fn send<W: AsyncWrite + Unpin>(
+        &self,
+        send: &mut W,
+        settings: &frame::Settings,
+    ) -> Result<()> {
+        send.write_all(&[0])
+            .await
+            .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+        write(send, &H3Frame::Settings(Frame::new(settings.clone())?)).await?;
+        let mut receiver = self.receiver.lock().await;
+        while let Some((frame, completed)) = receiver.recv().await {
+            // The driver owns each write even if its caller stops waiting.
+            let result = write(send, &frame).await;
+            let _ = completed.send(result);
+            result?;
+        }
+        Err(Error::H3_CLOSED_CRITICAL_STREAM)
     }
 }
 
@@ -79,17 +86,10 @@ pub(crate) async fn receive_control<R: AsyncRead + Unpin, W>(
         }
         if let H3Frame::Goaway(frame) = frame {
             let id = frame.payload.id.into_u64();
-            {
-                let mut state = goaway.state.lock().unwrap();
-                if state.peer.is_some_and(|previous| id > previous) {
-                    return Err(Error::H3_ID_ERROR);
-                }
-                state.peer = Some(id);
-            }
+            goaway.receive(id)?;
             if *role == Role::Client {
                 bi.goaway(id, qpack);
             }
-            goaway.changed.notify_waiters();
         }
     }
 }
@@ -122,13 +122,9 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(recv: &mut R, first: bool) -> Res
                 .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
             return frame::be_frame_payload(&mut payload.as_slice(), ty, length).await;
         }
-        let mut payload = recv.take(length.into_u64());
-        tokio::io::copy(&mut payload, &mut tokio::io::sink())
+        frame::skip_payload(recv, length.into_u64())
             .await
             .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-        if payload.limit() != 0 {
-            return Err(Error::H3_CLOSED_CRITICAL_STREAM);
-        }
     }
 }
 

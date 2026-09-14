@@ -31,6 +31,7 @@ async fn request_accept_and_respond() {
             )
             .await?;
             assert_eq!(request.method(), Method::POST);
+            let method = request.method();
             let server::Request::Bytes(request) = request else {
                 panic!("expected buffered request")
             };
@@ -43,6 +44,7 @@ async fn request_accept_and_respond() {
                 response,
                 H3WriteStream::new(0, server_send),
                 Arc::new(Qpack::default()),
+                &method,
             )
             .await
         }
@@ -89,6 +91,7 @@ async fn streaming_echo() {
                 Arc::new(Qpack::default()),
             )
             .await?;
+            let method = request.method();
             let server::Request::Streaming(mut request) = request else {
                 panic!("expected streaming request")
             };
@@ -102,7 +105,8 @@ async fn streaming_echo() {
                 server::respond(
                     response,
                     H3WriteStream::new(0, server_send),
-                    Arc::new(Qpack::default())
+                    Arc::new(Qpack::default()),
+                    &method,
                 ),
                 async {
                     let mut buf = [0; 3];

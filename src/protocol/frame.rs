@@ -14,7 +14,7 @@ mod push_promise;
 mod settings;
 mod varint;
 
-pub(crate) use varint::be_varint;
+pub(crate) use varint::{be_varint, be_varint_or_eof};
 
 pub(crate) const MAX_BUFFERED_FRAME_PAYLOAD: usize = 64 * 1024;
 pub(crate) const MAX_DATA_CHUNK: usize = 16 * 1024;
@@ -39,12 +39,15 @@ pub(crate) enum FrameType {
     CancelPush,
     PushPromise,
     MaxPushId,
+    Unknown(VarInt),
 }
 
 impl TryFrom<u64> for FrameType {
     type Error = Error;
 
-    fn try_from(value: u64) -> std::result::Result<Self, Self::Error> {
+    /// Unknown extension types are skippable; HTTP/2-only types are forbidden
+    /// (RFC 9114 sections 7.2.8 and 9).
+    fn try_from(value: u64) -> Result<Self> {
         match value {
             0x00 => Ok(Self::Data),
             0x01 => Ok(Self::Headers),
@@ -53,7 +56,10 @@ impl TryFrom<u64> for FrameType {
             0x05 => Ok(Self::PushPromise),
             0x07 => Ok(Self::Goaway),
             0x0d => Ok(Self::MaxPushId),
-            _ => Err(Error::H3_FRAME_UNEXPECTED),
+            0x02 | 0x06 | 0x08 | 0x09 => Err(Error::H3_FRAME_UNEXPECTED),
+            _ => VarInt::try_from(value)
+                .map(Self::Unknown)
+                .map_err(|_| Error::H3_FRAME_ERROR),
         }
     }
 }
@@ -89,6 +95,11 @@ pub(crate) enum H3Frame {
     PushPromise(Frame<PushPromise>),
     Goaway(Frame<Goaway>),
     MaxPushId(Frame<MaxPushId>),
+    /// Only the envelope is decoded; the caller must discard the payload.
+    Unknown {
+        ty: VarInt,
+        length: VarInt,
+    },
 }
 
 impl GetFrameType for H3Frame {
@@ -101,27 +112,15 @@ impl GetFrameType for H3Frame {
             Self::PushPromise(payload) => payload.frame_type(),
             Self::Goaway(payload) => payload.frame_type(),
             Self::MaxPushId(payload) => payload.frame_type(),
+            Self::Unknown { ty, .. } => FrameType::Unknown(*ty),
         }
     }
 }
 
-impl EncodeSize for H3Frame {
-    fn encoding_size(&self) -> usize {
-        match self {
-            Self::Data(data) => data.payload.encoding_size(),
-            Self::Headers(headers) => headers.payload.encoding_size(),
-            Self::CancelPush(cancel_push) => cancel_push.payload.encoding_size(),
-            Self::Settings(settings) => settings.payload.encoding_size(),
-            Self::PushPromise(push_promise) => push_promise.payload.encoding_size(),
-            Self::Goaway(goaway) => goaway.payload.encoding_size(),
-            Self::MaxPushId(max_push_id) => max_push_id.payload.encoding_size(),
-        }
-    }
-}
-
-/// Read Type, Length, and one payload. DATA bytes remain in the reader and must
-/// be consumed before calling again. HEADERS/PUSH_PROMISE retain encoded QPACK bytes;
-/// after validating placement, call the frame's decode(input) to resolve its fields.
+/// Read Type, Length, and one payload. DATA and unknown payload bytes remain in
+/// the reader and must be consumed before calling again. HEADERS/PUSH_PROMISE
+/// retain encoded QPACK bytes; after validating placement, pass the field section
+/// to Qpack::decode to resolve its fields.
 /// EOF (including a partial frame) is an error.
 /// Cancellation can consume a prefix; keep polling the same future.
 pub(crate) async fn be_frame<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<H3Frame> {
@@ -130,7 +129,21 @@ pub(crate) async fn be_frame<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> R
     be_frame_payload(reader, ty, length).await
 }
 
-/// Decode a known payload after the caller has validated its stream placement.
+/// Discard exactly `length` bytes without allocating a buffer of that size.
+pub(crate) async fn skip_payload<T: AsyncRead + Unpin + ?Sized>(
+    reader: &mut T,
+    length: u64,
+) -> Result<()> {
+    let mut payload = reader.take(length);
+    tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
+    if payload.limit() != 0 {
+        return Err(Error::H3_FRAME_ERROR);
+    }
+    Ok(())
+}
+
+/// Decode a payload after the caller has validated its stream placement.
+/// DATA and unknown payloads remain in the reader for the caller to consume.
 pub(crate) async fn be_frame_payload<T: AsyncRead + Unpin + ?Sized>(
     reader: &mut T,
     ty: FrameType,
@@ -153,6 +166,7 @@ pub(crate) async fn be_frame_payload<T: AsyncRead + Unpin + ?Sized>(
         FrameType::MaxPushId => {
             H3Frame::MaxPushId(max_push_id::be_max_push_id_frame(reader, length).await?)
         }
+        FrameType::Unknown(ty) => H3Frame::Unknown { ty, length },
     };
     Ok(frame)
 }
@@ -206,6 +220,7 @@ impl From<FrameType> for VarInt {
             FrameType::PushPromise => VarInt::from_u32(0x05),
             FrameType::Goaway => VarInt::from_u32(0x07),
             FrameType::MaxPushId => VarInt::from_u32(0x0d),
+            FrameType::Unknown(ty) => ty,
         }
     }
 }
@@ -220,6 +235,7 @@ impl<B: BufMut> Write<H3Frame> for B {
             H3Frame::PushPromise(frame) => self.put_frame(frame),
             H3Frame::Goaway(frame) => self.put_frame(frame),
             H3Frame::MaxPushId(frame) => self.put_frame(frame),
+            H3Frame::Unknown { .. } => unreachable!("unknown frames cannot be serialized"),
         }
     }
 }
@@ -227,6 +243,155 @@ impl<B: BufMut> Write<H3Frame> for B {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writing_unknown_frames_panics_without_mutating_the_buffer() {
+        let frame = H3Frame::Unknown {
+            ty: VarInt::from_u32(0x21),
+            length: VarInt::from_u32(3),
+        };
+        let mut encoded = vec![4, 0];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            encoded.put_frame(&frame);
+        }));
+        assert!(result.is_err());
+        assert_eq!(encoded, [4, 0]);
+    }
+
+    #[tokio::test]
+    async fn decodes_one_unknown_frame_envelope_at_a_time() {
+        // Unknown payload bytes can look like forbidden types or partial headers.
+        let mut input = &[0x21, 3, 2, 0, 0x40, 0x22, 0, 0, 2, b'o', b'k'][..];
+        assert_eq!(
+            be_frame(&mut input).await.unwrap(),
+            H3Frame::Unknown {
+                ty: VarInt::from_u32(0x21),
+                length: VarInt::from_u32(3),
+            }
+        );
+        assert_eq!(&input[..3], &[2, 0, 0x40]);
+        skip_payload(&mut input, 3).await.unwrap();
+        assert_eq!(
+            be_frame(&mut input).await.unwrap(),
+            H3Frame::Unknown {
+                ty: VarInt::from_u32(0x22),
+                length: VarInt::from_u32(0),
+            }
+        );
+        skip_payload(&mut input, 0).await.unwrap();
+        assert_eq!(
+            be_frame(&mut input).await.unwrap(),
+            H3Frame::Data(Frame::new(Data(2)).unwrap())
+        );
+        assert_eq!(input, b"ok");
+    }
+
+    #[tokio::test]
+    async fn skips_large_unknown_frames_with_bounded_reads() {
+        use std::{
+            io,
+            pin::Pin,
+            task::{Context, Poll},
+        };
+
+        use tokio::io::ReadBuf;
+
+        struct BoundedRead<'a>(&'a [u8]);
+
+        impl AsyncRead for BoundedRead<'_> {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                assert!(buf.remaining() <= MAX_DATA_CHUNK);
+                Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+            }
+        }
+
+        for ty in [0x0au64, 0x21, 0x22, 0x40, 0x4000, 1 << 30, (1 << 62) - 1] {
+            for length in [0, MAX_BUFFERED_FRAME_PAYLOAD + 1] {
+                let mut encoded = Vec::new();
+                encoded.put_varint(&VarInt::try_from(ty).unwrap());
+                encoded.put_varint(&VarInt::try_from(length).unwrap());
+                encoded.resize(encoded.len() + length, 0xff);
+                encoded.extend_from_slice(&[0, 0]);
+                let mut reader = BoundedRead(&encoded);
+                assert_eq!(
+                    be_frame(&mut reader).await.unwrap(),
+                    H3Frame::Unknown {
+                        ty: VarInt::try_from(ty).unwrap(),
+                        length: VarInt::try_from(length).unwrap(),
+                    }
+                );
+                skip_payload(&mut reader, length as u64).await.unwrap();
+                assert_eq!(
+                    be_frame(&mut reader).await.unwrap(),
+                    H3Frame::Data(Frame::new(Data(0)).unwrap())
+                );
+                assert_eq!(
+                    be_frame(&mut reader).await.unwrap_err(),
+                    Error::H3_FRAME_ERROR
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preserves_eof_errors_and_rejects_truncated_frames() {
+        for complete in [&[][..], &[0x21, 0][..], &[0x21, 1, 0x40, 0x22, 0][..]] {
+            let mut input = complete;
+            while !input.is_empty() {
+                let H3Frame::Unknown { length, .. } = be_frame(&mut input).await.unwrap() else {
+                    panic!("expected unknown frame")
+                };
+                skip_payload(&mut input, length.into_u64()).await.unwrap();
+            }
+            // The caller checks EOF; be_frame itself still reports an error.
+            assert_eq!(
+                be_frame(&mut input).await.unwrap_err(),
+                Error::H3_FRAME_ERROR
+            );
+        }
+
+        let mut truncated = vec![vec![0], vec![1, 3, 0, 0], vec![0x21, 2, 0]];
+        for ty in [0x21u64, 0x40, 0x4000, 1 << 30, (1 << 62) - 1] {
+            let mut encoded = Vec::new();
+            encoded.put_varint(&VarInt::try_from(ty).unwrap());
+            for end in 1..encoded.len() {
+                truncated.push(encoded[..end].to_vec());
+            }
+        }
+        for length in [0u64, 64, 16384, 1 << 30, (1 << 62) - 1] {
+            let mut encoded = vec![0x21];
+            encoded.put_varint(&VarInt::try_from(length).unwrap());
+            for end in 1..encoded.len() {
+                truncated.push(encoded[..end].to_vec());
+            }
+            if length != 0 {
+                // Even a huge declared length must be skipped without allocating it.
+                truncated.push(encoded);
+            }
+        }
+        for partial in truncated {
+            for prefix in [&[][..], &[0x21, 0][..]] {
+                let encoded = [prefix, partial.as_slice()].concat();
+                let mut input = encoded.as_slice();
+                let error = loop {
+                    match be_frame(&mut input).await {
+                        Err(error) => break error,
+                        Ok(H3Frame::Unknown { length, .. }) => {
+                            if let Err(error) = skip_payload(&mut input, length.into_u64()).await {
+                                break error;
+                            }
+                        }
+                        Ok(_) => panic!("expected truncated frame"),
+                    }
+                };
+                assert_eq!(error, Error::H3_FRAME_ERROR, "{encoded:x?}");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn every_frame_round_trips_without_consuming_the_next_frame() {
@@ -261,7 +426,15 @@ mod tests {
                 H3Frame::Goaway(Frame::new(Goaway { id }).unwrap()),
                 H3Frame::MaxPushId(Frame::new(MaxPushId { push_id: id }).unwrap()),
             ];
-            for (frame, ty) in frames.into_iter().zip([0, 1, 3, 4, 5, 7, 13]) {
+            for (frame, (ty, length)) in frames.into_iter().zip([
+                (0, 3),
+                (1, 3),
+                (3, id.encoding_size()),
+                (4, 0),
+                (5, id.encoding_size() + 3),
+                (7, id.encoding_size()),
+                (13, id.encoding_size()),
+            ]) {
                 let mut encoded = Vec::new();
                 encoded.put_frame(&frame);
                 assert_eq!(encoded[0], ty);
@@ -273,7 +446,7 @@ mod tests {
                 );
                 assert_eq!(
                     be_varint(&mut envelope).await.unwrap().into_u64(),
-                    frame.encoding_size() as u64
+                    length as u64
                 );
                 if ty == 0 {
                     encoded.extend_from_slice(b"abc");
@@ -295,7 +468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_invalid_control_frame_lengths_and_unknown_types() {
+    async fn rejects_invalid_frame_lengths_and_forbidden_types() {
         for ty in [3, 7, 13] {
             for payload in [&[0][..], &[2, 0, 0], &[1, 0x40], &[9]] {
                 let mut encoded = vec![ty];
@@ -314,10 +487,12 @@ mod tests {
                 Error::H3_EXCESSIVE_LOAD
             );
         }
-        assert_eq!(
-            be_frame(&mut &[2][..]).await.unwrap_err(),
-            Error::H3_FRAME_UNEXPECTED
-        );
+        for ty in [2, 6, 8, 9] {
+            assert_eq!(
+                be_frame(&mut &[ty][..]).await.unwrap_err(),
+                Error::H3_FRAME_UNEXPECTED
+            );
+        }
         assert_eq!(
             be_frame(&mut &[5, 0][..]).await.unwrap_err(),
             Error::H3_FRAME_ERROR

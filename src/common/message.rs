@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::{Future, poll_fn},
     io,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -8,7 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Method, StatusCode, Uri};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{Error, Result, protocol::qpack::Field};
@@ -19,7 +20,8 @@ pub(crate) struct ArcMessage<B>(pub(crate) Arc<Mutex<Message<B>>>);
 /// Construction does not start network or body work.
 #[derive(Debug, Default)]
 pub(crate) struct Message<B> {
-    headers: HashMap<String, HeaderValue>,
+    headers: HeaderMap,
+    pseudo_headers: HashMap<&'static str, HeaderValue>,
     body: B,
 }
 
@@ -35,24 +37,22 @@ impl<B> Message<B> {
             return Err(Error::H3_MESSAGE_ERROR);
         }
         let mut message = Self {
-            headers: HashMap::new(),
+            headers: HeaderMap::new(),
+            pseudo_headers: HashMap::new(),
             body,
         };
-        message.headers.insert(
-            ":method".into(),
-            HeaderValue::from_str(method.as_str()).unwrap(),
-        );
-        message.headers.insert(
-            ":authority".into(),
+        message.set_pseudo_header(":method", HeaderValue::from_str(method.as_str()).unwrap());
+        message.set_pseudo_header(
+            ":authority",
             HeaderValue::from_str(uri.authority().unwrap().as_str()).unwrap(),
         );
         if method != Method::CONNECT {
-            message.headers.insert(
-                ":scheme".into(),
+            message.set_pseudo_header(
+                ":scheme",
                 HeaderValue::from_str(uri.scheme_str().unwrap()).unwrap(),
             );
-            message.headers.insert(
-                ":path".into(),
+            message.set_pseudo_header(
+                ":path",
                 HeaderValue::from_str(uri.path_and_query().map_or("/", |value| value.as_str()))
                     .unwrap(),
             );
@@ -61,39 +61,49 @@ impl<B> Message<B> {
     }
 
     pub(crate) fn fields(&self) -> Vec<Field> {
-        let mut fields: Vec<_> = self
-            .headers()
+        self.headers()
             .map(|(name, value)| Field {
                 name: Bytes::copy_from_slice(name.as_bytes()),
                 value: Bytes::copy_from_slice(value.as_bytes()),
                 never_index: value.is_sensitive(),
             })
-            .collect();
-        fields.sort_by_key(|field| !field.name.starts_with(b":"));
-        fields
+            .collect()
     }
 
     pub(crate) fn headers(&self) -> impl Iterator<Item = (&str, &HeaderValue)> {
-        self.headers
+        self.pseudo_headers
             .iter()
-            .map(|(name, value)| (name.as_str(), value))
+            .map(|(name, value)| (*name, value))
+            .chain(
+                self.headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value)),
+            )
     }
 
     pub fn with_body<T>(self, body: T) -> Message<T> {
         Message {
             headers: self.headers,
+            pseudo_headers: self.pseudo_headers,
             body,
         }
     }
 
+    /// Replace all existing values for this header name.
     pub fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
-        self.headers.insert(name.as_str().to_owned(), value);
+        self.headers.insert(name, value);
+        self
+    }
+
+    /// Append a value, preserving existing values for this header name.
+    pub fn append_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
+        self.headers.append(name, value);
         self
     }
 
     pub(crate) fn set_pseudo_header(&mut self, name: &'static str, value: HeaderValue) {
         debug_assert!(name.starts_with(':'));
-        self.headers.insert(name.into(), value);
+        self.pseudo_headers.insert(name, value);
     }
 }
 
@@ -137,6 +147,7 @@ pub trait WriteRequest: Sized {
         Self::new(url, Method::PATCH)
     }
 
+    /// Replace all existing values for this header name.
     fn header(self, key: HeaderName, value: HeaderValue) -> Self;
 }
 
@@ -150,7 +161,7 @@ pub trait WriteStream: Sized {
 
     async fn finish(&mut self) -> Result<()>;
 
-    /// Release the body; transport cancellation requires a body that cancels on drop.
+    /// Cancel the remaining body writes and release the application handle.
     async fn reset(self) -> Result<()>;
 }
 
@@ -181,7 +192,7 @@ pub trait ReadStream: Sized {
 
     async fn read_all(&mut self, buf: &mut [u8]) -> Result<usize>;
 
-    /// Release the body; transport cancellation requires a body that cancels on drop.
+    /// Stop receiving the body and release the application handle.
     async fn stop(self);
 }
 
@@ -203,7 +214,7 @@ impl<B: Default> WriteRequest for Message<B> {
 impl<B> ReadRequest for Message<B> {
     fn method(&self) -> Method {
         Method::from_bytes(
-            self.headers
+            self.pseudo_headers
                 .get(":method")
                 .expect("missing :method")
                 .as_bytes(),
@@ -212,21 +223,21 @@ impl<B> ReadRequest for Message<B> {
     }
 
     fn authority(&self) -> String {
-        self.headers
+        self.pseudo_headers
             .get(":authority")
             .map_or("", |value| value.to_str().expect("invalid :authority"))
             .to_owned()
     }
 
     fn path(&self) -> String {
-        self.headers
+        self.pseudo_headers
             .get(":path")
             .map_or("", |value| value.to_str().expect("invalid :path"))
             .to_owned()
     }
 
     fn scheme(&self) -> String {
-        self.headers
+        self.pseudo_headers
             .get(":scheme")
             .map_or("", |value| value.to_str().expect("invalid :scheme"))
             .to_owned()
@@ -235,10 +246,7 @@ impl<B> ReadRequest for Message<B> {
 
 impl<B> WriteResponse for Message<B> {
     fn set_status(&mut self, status: StatusCode) -> &mut Self {
-        self.headers.insert(
-            ":status".into(),
-            HeaderValue::from_str(status.as_str()).unwrap(),
-        );
+        self.set_pseudo_header(":status", HeaderValue::from_str(status.as_str()).unwrap());
         self
     }
 }
@@ -246,7 +254,7 @@ impl<B> WriteResponse for Message<B> {
 impl<B> ReadResponse for Message<B> {
     fn status(&self) -> StatusCode {
         StatusCode::from_bytes(
-            self.headers
+            self.pseudo_headers
                 .get(":status")
                 .expect("missing :status")
                 .as_bytes(),
@@ -307,7 +315,6 @@ impl<B: AsyncWrite + Unpin + Send> WriteStream for Message<B> {
         Ok(AsyncWriteExt::shutdown(self).await?)
     }
 
-    // Releasing the body delegates cancellation to its Drop implementation.
     async fn reset(self) -> Result<()> {
         drop(self);
         Ok(())
@@ -333,7 +340,6 @@ impl<B: AsyncRead + Unpin + Send> ReadStream for Message<B> {
         Ok(count)
     }
 
-    // Releasing the body delegates cancellation to its Drop implementation.
     async fn stop(self) {
         drop(self);
     }
@@ -347,17 +353,31 @@ impl<B> From<Message<B>> for ArcMessage<B> {
 
 impl<B> ArcMessage<B> {
     pub(crate) fn with_body<T>(&self, body: T) -> ArcMessage<T> {
+        let message = self.0.lock().unwrap();
         ArcMessage::from(Message {
-            headers: self.0.lock().unwrap().headers.clone(),
+            headers: message.headers.clone(),
+            pseudo_headers: message.pseudo_headers.clone(),
             body,
         })
     }
 }
 
 impl ArcMessage<crate::ArcWndBuf> {
+    /// Observe body errors and the loss of its last unfinished application owner.
+    pub(crate) fn body_error(&self) -> impl Future<Output = Error> + use<> {
+        let message = Arc::downgrade(&self.0);
+        let body = self.0.lock().unwrap().body.clone();
+        poll_fn(move |cx| match body.poll_finished(cx) {
+            Err(error) => Poll::Ready(error),
+            Ok(false) if message.strong_count() == 0 => Poll::Ready(Error::H3_REQUEST_CANCELLED),
+            _ => Poll::Pending,
+        })
+    }
+
     fn stream(&self) -> Message<crate::ArcWndBuf> {
         Message {
-            headers: HashMap::new(),
+            headers: HeaderMap::new(),
+            pseudo_headers: HashMap::new(),
             body: self.0.lock().unwrap().body.clone(),
         }
     }
@@ -412,6 +432,46 @@ impl Message<crate::ArcWndBuf> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn dropping_message_notifies_stream_without_cancelling_buffer() {
+        let mut body = crate::ArcWndBuf::new(1);
+        body.write_all(b"x").await.unwrap();
+        let message = ArcMessage::from(Message::<Bytes>::default().with_body(body.clone()));
+        let cancelled = message.body_error();
+        tokio::pin!(cancelled);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        drop(message.clone());
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        drop(message);
+        assert_eq!(
+            cancelled.as_mut().poll(&mut cx),
+            Poll::Ready(Error::H3_REQUEST_CANCELLED)
+        );
+
+        let mut bytes = [0];
+        body.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(bytes, *b"x");
+    }
+
+    #[tokio::test]
+    async fn finished_message_can_drop_before_or_after_stream_attachment() {
+        for finish_first in [false, true] {
+            let body = crate::ArcWndBuf::new(1);
+            let mut message = ArcMessage::from(Message::<Bytes>::default().with_body(body));
+            if finish_first {
+                message.finish().await.unwrap();
+            }
+            let cancelled = message.body_error();
+            if !finish_first {
+                message.finish().await.unwrap();
+            }
+            drop(message);
+            tokio::pin!(cancelled);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        }
+    }
+
     impl<B> Message<B> {
         pub(crate) fn header(&self, name: &HeaderName) -> Option<HeaderValue> {
             self.headers.get(name.as_str()).cloned()
@@ -425,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn message_metadata_and_body_modes() {
         let mut message = Message::<Bytes>::post("https://example.com/a?q=1").unwrap();
-        assert_eq!(message.headers[":method"], "POST");
+        assert_eq!(message.pseudo_headers[":method"], "POST");
         assert_eq!(message.method(), Method::POST);
         assert_eq!(message.authority(), "example.com");
         assert_eq!(message.scheme(), "https");
@@ -439,14 +499,11 @@ mod tests {
         message
             .set_status(StatusCode::CREATED)
             .set_body(Bytes::from_static(b"hello"));
-        assert_eq!(message.headers[":status"], "201");
+        assert_eq!(message.pseudo_headers[":status"], "201");
         assert_eq!(ReadBody::body(&message), Bytes::from_static(b"hello"));
         assert_eq!(ReadBody::body(&message), Bytes::from_static(b"hello"));
         let mut buf = [0; 3];
-        let mut stream = Message {
-            headers: message.headers,
-            body: &b"world"[..],
-        };
+        let mut stream = message.with_body(&b"world"[..]);
         assert_eq!(stream.status(), StatusCode::CREATED);
         assert_eq!(stream.read_all(&mut buf).await.unwrap(), 3);
         assert_eq!(&buf, b"wor");
@@ -463,8 +520,52 @@ mod tests {
         for url in ["example.com:443", "https://example.com:443/"] {
             let connect = Message::<Bytes>::connect(url).unwrap();
             assert_eq!(connect.authority(), "example.com:443");
-            assert!(!connect.headers.contains_key(":scheme"));
-            assert!(!connect.headers.contains_key(":path"));
+            assert!(!connect.pseudo_headers.contains_key(":scheme"));
+            assert!(!connect.pseudo_headers.contains_key(":path"));
         }
+    }
+
+    #[test]
+    fn header_values_survive_body_conversions_and_can_be_replaced() {
+        let mut message = Message::<Bytes>::default();
+        message.set_status(StatusCode::OK);
+        let name = http::header::SET_COOKIE;
+        let mut sensitive = HeaderValue::from_static("b=2");
+        sensitive.set_sensitive(true);
+        message
+            .set_header(name.clone(), HeaderValue::from_static("a=1"))
+            .append_header(name.clone(), sensitive.clone());
+
+        let message = message.with_body(Vec::<u8>::new());
+        assert_eq!(message.headers.get_all(&name).iter().count(), 2);
+        let original = ArcMessage::from(message);
+        let copied = original.with_body(Bytes::new());
+        let mut message = copied.0.lock().unwrap();
+        assert_eq!(message.status(), StatusCode::OK);
+        assert_eq!(
+            message.headers.get_all(&name).iter().collect::<Vec<_>>(),
+            [&HeaderValue::from_static("a=1"), &sensitive]
+        );
+        let fields = message.fields();
+        assert_eq!(fields[0].name, ":status");
+        assert_eq!(fields[1].name, "set-cookie");
+        assert_eq!(fields[2].name, "set-cookie");
+        assert!(!fields[1].never_index);
+        assert!(fields[2].never_index);
+
+        message.set_header(name.clone(), HeaderValue::from_static("c=3"));
+        assert_eq!(message.headers.get_all(&name).iter().count(), 1);
+        assert_eq!(message.headers[&name], "c=3");
+        assert_eq!(
+            original
+                .0
+                .lock()
+                .unwrap()
+                .headers
+                .get_all(&name)
+                .iter()
+                .count(),
+            2
+        );
     }
 }
