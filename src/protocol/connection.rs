@@ -15,8 +15,8 @@ use crate::{Error, Result, Transport};
 
 /// Local advertised settings and the independently received peer settings.
 pub struct Settings {
-    pub(in crate::protocol) local: frame::Settings,
-    pub(in crate::protocol) peer: Mutex<Option<frame::Settings>>,
+    pub(crate) local: frame::Settings,
+    pub(crate) peer: Mutex<Option<frame::Settings>>,
 }
 
 impl Settings {
@@ -60,16 +60,16 @@ impl Default for Settings {
 }
 
 #[derive(Default)]
-pub(in crate::protocol) struct GoawayState {
+pub(crate) struct GoawayState {
     local: Option<u64>,
-    pub(in crate::protocol) peer: Option<u64>,
+    pub(crate) peer: Option<u64>,
     accepted_boundary: u64,
 }
 
 #[derive(Default)]
-pub(in crate::protocol) struct Goaway {
-    pub(in crate::protocol) state: Mutex<GoawayState>,
-    pub(in crate::protocol) changed: Notify,
+pub(crate) struct Goaway {
+    pub(crate) state: Mutex<GoawayState>,
+    pub(crate) changed: Notify,
 }
 
 /// An HTTP/3 connection whose control and QPACK streams are driven automatically.
@@ -113,18 +113,6 @@ impl<T: Transport> H3Connection<T> {
             bi,
             task,
         })
-    }
-
-    pub fn qpack(&self) -> &Arc<Qpack> {
-        &self.uni.qpack
-    }
-
-    pub fn peer_settings_received(&self) -> bool {
-        self.uni.settings.peer.lock().unwrap().is_some()
-    }
-
-    pub fn received_goaway(&self) -> Option<u64> {
-        self.uni.goaway.state.lock().unwrap().peer
     }
 
     /// Open a bidirectional stream, returning (send, receive).
@@ -230,7 +218,11 @@ impl<T: Transport> H3Connection<T> {
     }
 
     pub async fn closed(&self) -> Result<()> {
-        let error = tokio::select! { error = self.uni.qpack.terminated() => error, error = self.transport.terminated() => { self.close(error); self.error().unwrap_or(error) } };
+        let error = tokio::select! {
+            error = self.uni.qpack.terminated() => error,
+            error = self.transport.terminated() => {
+                self.close(error); self.error().unwrap_or(error)
+        } };
         if error == Error::H3_NO_ERROR {
             Ok(())
         } else {
@@ -309,6 +301,21 @@ impl<T: Transport> Drop for H3Connection<T> {
     fn drop(&mut self) {
         self.close(Error::H3_NO_ERROR);
         self.task.abort();
+    }
+}
+
+#[cfg(test)]
+impl<T: Transport> H3Connection<T> {
+    pub(crate) fn peer_settings_received(&self) -> bool {
+        self.uni.settings.peer.lock().unwrap().is_some()
+    }
+
+    pub(crate) fn received_goaway(&self) -> Option<u64> {
+        self.uni.goaway.state.lock().unwrap().peer
+    }
+
+    pub fn qpack(&self) -> &Arc<Qpack> {
+        &self.uni.qpack
     }
 }
 

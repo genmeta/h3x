@@ -14,10 +14,9 @@ use crate::{
     },
 };
 
-pub(in crate::protocol) struct Control {
-    pub(in crate::protocol) sender: mpsc::Sender<(H3Frame, oneshot::Sender<Result<()>>)>,
-    pub(in crate::protocol) receiver:
-        AsyncMutex<mpsc::Receiver<(H3Frame, oneshot::Sender<Result<()>>)>>,
+pub(crate) struct Control {
+    pub(crate) sender: mpsc::Sender<(H3Frame, oneshot::Sender<Result<()>>)>,
+    pub(crate) receiver: AsyncMutex<mpsc::Receiver<(H3Frame, oneshot::Sender<Result<()>>)>>,
 }
 
 impl Default for Control {
@@ -30,21 +29,21 @@ impl Default for Control {
     }
 }
 
-pub(in crate::protocol) struct ControlStream<S> {
+pub(crate) struct ControlStream<S> {
     send: S,
 }
 
 impl<S: AsyncWrite + Unpin> ControlStream<S> {
-    pub(in crate::protocol) fn new(send: S) -> Self {
+    pub(crate) fn new(send: S) -> Self {
         Self { send }
     }
 
-    pub(in crate::protocol) async fn write(&mut self, frame: &H3Frame) -> Result<()> {
+    pub(crate) async fn write(&mut self, frame: &H3Frame) -> Result<()> {
         write(&mut self.send, frame).await
     }
 }
 
-pub(in crate::protocol) async fn receive_control<R: AsyncRead + Unpin, W>(
+pub(crate) async fn receive_control<R: AsyncRead + Unpin, W>(
     recv: &mut R,
     role: &Role,
     settings: &Settings,

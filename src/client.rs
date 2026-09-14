@@ -55,6 +55,7 @@ where
             }
         }
     };
+    //TODO: FIXME 服务端发送 stop sending， try_join! 会因发送错误丢掉响应结果
     let (_, response) = tokio::try_join!(sending, read_response(recv, qpack, Some(method)))?;
     Ok(response)
 }

@@ -22,15 +22,15 @@ use crate::{
 };
 
 /// Shared state maintained by the control and QPACK streams.
-pub(in crate::protocol) struct UniStreams {
-    pub(in crate::protocol) settings: Settings,
-    pub(in crate::protocol) qpack: Arc<Qpack>,
-    pub(in crate::protocol) goaway: Goaway,
-    pub(in crate::protocol) control: Control,
+pub(crate) struct UniStreams {
+    pub(crate) settings: Settings,
+    pub(crate) qpack: Arc<Qpack>,
+    pub(crate) goaway: Goaway,
+    pub(crate) control: Control,
 }
 
 impl UniStreams {
-    pub(in crate::protocol) fn new(settings: Settings, qpack: Arc<Qpack>) -> Self {
+    pub(crate) fn new(settings: Settings, qpack: Arc<Qpack>) -> Self {
         Self {
             settings,
             qpack,
@@ -39,11 +39,11 @@ impl UniStreams {
         }
     }
 
-    pub(in crate::protocol) async fn send<T: Transport>(&self, transport: &T) -> Result<()> {
+    pub(crate) async fn send<T: Transport>(&self, transport: &T) -> Result<()> {
         send_uni(transport, &self.settings.local, &self.qpack, &self.control).await
     }
 
-    pub(in crate::protocol) async fn receive<T: Transport>(
+    pub(crate) async fn receive<T: Transport>(
         &self,
         transport: &T,
         bi: &BiStreams<T::Recv, T::Send>,

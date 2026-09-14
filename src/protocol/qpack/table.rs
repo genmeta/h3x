@@ -41,11 +41,6 @@ impl DynamicTable {
         self.insert_count
     }
 
-    #[cfg(test)]
-    pub(crate) fn size(&self) -> u64 {
-        self.size
-    }
-
     pub(crate) fn capacity(&self) -> u64 {
         self.capacity
     }
@@ -283,6 +278,13 @@ pub(super) fn find_name(name: &[u8]) -> Option<usize> {
 
 pub(super) fn get(index: u64) -> Option<(&'static str, &'static str)> {
     STATIC_TABLE.get(usize::try_from(index).ok()?).copied()
+}
+
+#[cfg(test)]
+impl DynamicTable {
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
 }
 
 #[cfg(test)]

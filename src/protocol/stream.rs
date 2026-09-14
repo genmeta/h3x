@@ -11,13 +11,13 @@ use std::{
 };
 
 pub(crate) use read::H3ReadStream;
-pub(in crate::protocol) use uni::UniStreams;
+pub(crate) use uni::UniStreams;
 pub(crate) use write::H3WriteStream;
 
 use crate::{Error, protocol::frame::Goaway};
 
 /// State of one transport half, independent of its application handle.
-pub(in crate::protocol) enum StreamState<T> {
+pub(crate) enum StreamState<T> {
     Idle(T),
     Polling(T, Waker),
     Goaway(Goaway),
@@ -31,7 +31,7 @@ impl<T> StreamState<T> {
         matches!(self, Self::Goaway(_) | Self::Closed(_) | Self::Finished)
     }
 
-    pub(in crate::protocol) fn terminate(&mut self, terminal: Self) -> Option<Waker> {
+    pub(crate) fn terminate(&mut self, terminal: Self) -> Option<Waker> {
         if self.is_terminal() {
             return None;
         }

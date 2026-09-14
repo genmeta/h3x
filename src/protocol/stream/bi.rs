@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// The connection and both application handles refer to this same stream.
-pub(in crate::protocol) struct BiStream<R, W> {
+pub(crate) struct BiStream<R, W> {
     pub(super) id: u64,
     pub(super) recv: Mutex<StreamState<R>>,
     pub(super) send: Mutex<StreamState<W>>,
@@ -72,7 +72,7 @@ enum BiStreamsState {
     Closed(Error),
 }
 
-pub(in crate::protocol) struct BiStreams<R, W> {
+pub(crate) struct BiStreams<R, W> {
     // When both locks are needed, hold state before locking streams.
     state: Mutex<BiStreamsState>,
     streams: Mutex<HashMap<u64, Arc<BiStream<R, W>>>>,
@@ -89,14 +89,14 @@ impl<R, W> Default for BiStreams<R, W> {
 
 impl<R, W> BiStreams<R, W> {
     // Idle connections retain finished entries until the next insert or GOAWAY.
-    pub(in crate::protocol) fn cleanup(&self) {
+    pub(crate) fn cleanup(&self) {
         self.streams.lock().unwrap().retain(|_, stream| {
             !(stream.recv.lock().unwrap().is_terminal()
                 && stream.send.lock().unwrap().is_terminal())
         });
     }
 
-    pub(in crate::protocol) fn goaway(&self, id: u64, qpack: &Qpack) {
+    pub(crate) fn goaway(&self, id: u64, qpack: &Qpack) {
         let streams: Vec<_> = {
             let mut state = self.state.lock().unwrap();
             let cutoff = match *state {
@@ -123,7 +123,7 @@ impl<R, W> BiStreams<R, W> {
         self.cleanup();
     }
 
-    pub(in crate::protocol) fn close(&self, error: Error) {
+    pub(crate) fn close(&self, error: Error) {
         let (error, streams) = {
             let mut state = self.state.lock().unwrap();
             let error = match *state {
@@ -140,12 +140,7 @@ impl<R, W> BiStreams<R, W> {
         }
     }
 
-    #[cfg(test)]
-    pub(in crate::protocol) fn len(&self) -> usize {
-        self.streams.lock().unwrap().len()
-    }
-
-    pub(in crate::protocol) fn insert(
+    pub(crate) fn insert(
         &self,
         id: u64,
         recv: R,
@@ -176,6 +171,13 @@ impl<R, W> BiStreams<R, W> {
             },
             H3ReadStream { stream },
         ))
+    }
+}
+
+#[cfg(test)]
+impl<R, W> BiStreams<R, W> {
+    pub(crate) fn len(&self) -> usize {
+        self.streams.lock().unwrap().len()
     }
 }
 

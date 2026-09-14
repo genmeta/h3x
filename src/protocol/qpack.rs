@@ -45,7 +45,7 @@ pub(crate) struct Settings {
 }
 
 /// Extract compression and field-section limits from HTTP/3 SETTINGS.
-pub(in crate::protocol) fn limits(settings: &frame::Settings) -> (Settings, u64) {
+pub(crate) fn limits(settings: &frame::Settings) -> (Settings, u64) {
     let defaults = Settings::default();
     (
         Settings {

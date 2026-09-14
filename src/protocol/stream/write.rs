@@ -8,7 +8,9 @@ use std::{
 use tokio::io::AsyncWrite;
 
 use super::{StreamState, bi::BiStream};
-use crate::{Error, protocol::frame::Goaway};
+use crate::Error;
+#[cfg(test)]
+use crate::protocol::frame::Goaway;
 
 /// Write handle for a stream owned by the connection.
 /// `R` is the paired transport reader; standalone writers use `()`.
@@ -31,10 +33,6 @@ impl<W> H3WriteStream<W> {
 impl<W, R> H3WriteStream<W, R> {
     pub fn stream_id(&self) -> u64 {
         self.stream.id
-    }
-
-    pub fn on_recv(&mut self, goaway: Goaway) {
-        self.stream.terminate_write(StreamState::Goaway(goaway));
     }
 }
 
@@ -85,6 +83,13 @@ impl<W, R> Drop for H3WriteStream<W, R> {
     fn drop(&mut self) {
         self.stream
             .terminate_write(StreamState::Closed(Error::H3_REQUEST_CANCELLED));
+    }
+}
+
+#[cfg(test)]
+impl<W, R> H3WriteStream<W, R> {
+    pub(crate) fn on_recv(&mut self, goaway: Goaway) {
+        self.stream.terminate_write(StreamState::Goaway(goaway));
     }
 }
 
