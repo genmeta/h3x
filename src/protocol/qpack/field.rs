@@ -322,10 +322,12 @@ impl FieldLine {
 }
 
 /// Append a field section without dynamic-table references.
+#[cfg(test)]
 pub(crate) trait WriteFieldSection: BufMut {
     fn put_field_section(&mut self, fields: impl IntoIterator<Item = Field>) -> Result<()>;
 }
 
+#[cfg(test)]
 impl<B: BufMut> WriteFieldSection for B {
     fn put_field_section(&mut self, fields: impl IntoIterator<Item = Field>) -> Result<()> {
         self.put_slice(&[0, 0]); // Required Insert Count = 0, S = 0, Delta Base = 0.
@@ -359,6 +361,7 @@ impl<B: BufMut> WriteFieldSection for B {
 
 /// Parse a complete, bounded HEADERS payload without dynamic-table references.
 /// Success leaves no remaining input; use Input::decode_fields for the stateful path.
+#[cfg(test)]
 pub(crate) fn be_field_section(input: &[u8]) -> Result<(&[u8], Vec<Field>)> {
     let (mut input, prefix) = FieldSectionPrefix::read(input, 0, 0)?;
     let table = DynamicTable::default();

@@ -12,6 +12,11 @@ pub use common::message::{
     WriteStream,
 };
 pub use error::{Error, Result};
+pub use protocol::{
+    frame::Goaway,
+    qpack::Qpack,
+    stream::{read::H3ReadStream, write::H3WriteStream},
+};
 pub use wnd_buf::ArcWndBuf;
 
 /// ALPN token used by HTTP/3.

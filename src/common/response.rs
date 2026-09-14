@@ -29,7 +29,10 @@ impl<B: Default> Default for Response<Write, B> {
 /// Cloning shares the message and body stream.
 impl Clone for Response<Write, ArcWndBuf> {
     fn clone(&self) -> Self {
-        self.message.clone().into()
+        Self {
+            message: self.message.clone(),
+            _io: PhantomData,
+        }
     }
 }
 

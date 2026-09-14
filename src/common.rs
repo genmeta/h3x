@@ -22,7 +22,7 @@ pub enum Response<IO> {
     Streaming(response::Response<IO, ArcWndBuf>),
 }
 
-impl ReadRequest for Request<Read> {
+impl<IO> ReadRequest for Request<IO> {
     fn method(&self) -> http::Method {
         match self {
             Self::Bytes(request) => request.method(),

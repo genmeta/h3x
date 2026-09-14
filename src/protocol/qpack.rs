@@ -31,6 +31,7 @@ use decoder::Decoder;
 use encoder::Encoder;
 pub(crate) use field::Field;
 use field::should_never_index;
+#[cfg(test)]
 pub(crate) use field::{WriteFieldSection, be_field_section};
 
 /// Decoder-advertised limits, RFC 9204 section 5. Both default to zero.

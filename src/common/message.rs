@@ -1,14 +1,17 @@
 use std::{
     collections::HashMap,
+    io,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, StatusCode, Uri};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use crate::{Error, Result};
+use crate::{Error, Result, protocol::qpack::Field};
 
 #[derive(Default, Clone)]
 pub(crate) struct ArcMessage<B>(pub(crate) Arc<Mutex<Message<B>>>);
@@ -57,6 +60,18 @@ impl<B> Message<B> {
         Ok(message)
     }
 
+    pub(crate) fn fields(&self) -> Vec<Field> {
+        let mut fields: Vec<_> = self
+            .headers()
+            .map(|(name, value)| Field {
+                name: Bytes::copy_from_slice(name.as_bytes()),
+                value: Bytes::copy_from_slice(value.as_bytes()),
+                never_index: value.is_sensitive(),
+            })
+            .collect();
+        fields.sort_by_key(|field| !field.name.starts_with(b":"));
+        fields
+    }
     pub(crate) fn headers(&self) -> impl Iterator<Item = (&str, &HeaderValue)> {
         self.headers
             .iter()
@@ -249,14 +264,43 @@ impl ReadBody for Message<Bytes> {
     }
 }
 
+// Standard I/O operates on body bytes; protocol framing lives in protocol::body.
+impl<B: AsyncRead + Unpin> AsyncRead for Message<B> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().body).poll_read(cx, buf)
+    }
+}
+
+impl<B: AsyncWrite + Unpin> AsyncWrite for Message<B> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().body).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().body).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().body).poll_shutdown(cx)
+    }
+}
+
 #[async_trait]
 impl<B: AsyncWrite + Unpin + Send> WriteStream for Message<B> {
     async fn write<T: AsRef<[u8]> + Send>(&mut self, chunk: T) -> Result<usize> {
-        Ok(self.body.write(chunk.as_ref()).await?)
+        Ok(AsyncWriteExt::write(self, chunk.as_ref()).await?)
     }
 
     async fn finish(&mut self) -> Result<()> {
-        Ok(self.body.shutdown().await?)
+        Ok(AsyncWriteExt::shutdown(self).await?)
     }
 
     // Releasing the body delegates cancellation to its Drop implementation.
@@ -269,14 +313,14 @@ impl<B: AsyncWrite + Unpin + Send> WriteStream for Message<B> {
 #[async_trait]
 impl<B: AsyncRead + Unpin + Send> ReadStream for Message<B> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        Ok(self.body.read(buf).await?)
+        Ok(AsyncReadExt::read(self, buf).await?)
     }
 
     /// Read until the buffer is full or EOF; a short buffer leaves data unread.
     async fn read_all(&mut self, buf: &mut [u8]) -> Result<usize> {
         let mut count = 0;
         while count < buf.len() {
-            let read = self.body.read(&mut buf[count..]).await?;
+            let read = AsyncReadExt::read(self, &mut buf[count..]).await?;
             if read == 0 {
                 break;
             }
@@ -318,7 +362,7 @@ impl ArcMessage<crate::ArcWndBuf> {
 #[async_trait]
 impl ReadStream for ArcMessage<crate::ArcWndBuf> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.stream().read(buf).await
+        ReadStream::read(&mut self.stream(), buf).await
     }
 
     async fn read_all(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -337,7 +381,7 @@ impl ReadStream for ArcMessage<crate::ArcWndBuf> {
 #[async_trait]
 impl WriteStream for ArcMessage<crate::ArcWndBuf> {
     async fn write<T: AsRef<[u8]> + Send>(&mut self, chunk: T) -> Result<usize> {
-        self.stream().write(chunk).await
+        WriteStream::write(&mut self.stream(), chunk).await
     }
 
     async fn finish(&mut self) -> Result<()> {
@@ -351,6 +395,12 @@ impl WriteStream for ArcMessage<crate::ArcWndBuf> {
             .body
             .set_error(Error::H3_REQUEST_CANCELLED);
         Ok(())
+    }
+}
+
+impl Message<crate::ArcWndBuf> {
+    pub(crate) fn body_stream(&self) -> crate::ArcWndBuf {
+        self.body.clone()
     }
 }
 
@@ -400,7 +450,7 @@ mod tests {
         assert_eq!(stream.read_all(&mut buf).await.unwrap(), 0);
         stream.stop().await;
         let mut stream = Message::<Vec<u8>>::default();
-        assert_eq!(stream.write(b"hello").await.unwrap(), 5);
+        assert_eq!(WriteStream::write(&mut stream, b"hello").await.unwrap(), 5);
         stream.finish().await.unwrap();
         assert_eq!(stream.into_body(), b"hello");
         Message::<Vec<u8>>::default().reset().await.unwrap();

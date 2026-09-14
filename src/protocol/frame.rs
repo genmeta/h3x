@@ -21,7 +21,7 @@ pub(crate) const MAX_DATA_CHUNK: usize = 16 * 1024;
 
 pub(crate) use cancel_push::CancelPush;
 pub(crate) use data::Data;
-pub(crate) use goaway::Goaway;
+pub use goaway::Goaway;
 pub(crate) use headers::Headers;
 pub(crate) use max_push_id::MaxPushId;
 pub(crate) use push_promise::PushPromise;

@@ -21,9 +21,12 @@ pub struct Request<IO, B = Bytes> {
 }
 
 /// Cloning shares the message and body stream.
-impl Clone for Request<Write, ArcWndBuf> {
+impl<B: Clone> Clone for Request<Write, B> {
     fn clone(&self) -> Self {
-        self.message.clone().into()
+        Self {
+            message: self.message.clone(),
+            _io: PhantomData,
+        }
     }
 }
 
@@ -131,7 +134,7 @@ impl WriteStream for Request<Write, ArcWndBuf> {
     }
 }
 
-impl<B> ReadRequest for Request<Read, B> {
+impl<IO, B> ReadRequest for Request<IO, B> {
     fn method(&self) -> Method {
         self.message.0.lock().unwrap().method()
     }
