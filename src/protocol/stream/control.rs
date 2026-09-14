@@ -122,13 +122,9 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(recv: &mut R, first: bool) -> Res
                 .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
             return frame::be_frame_payload(&mut payload.as_slice(), ty, length).await;
         }
-        let mut payload = recv.take(length.into_u64());
-        tokio::io::copy(&mut payload, &mut tokio::io::sink())
+        frame::skip_payload(recv, length.into_u64())
             .await
             .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-        if payload.limit() != 0 {
-            return Err(Error::H3_CLOSED_CRITICAL_STREAM);
-        }
     }
 }
 

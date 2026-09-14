@@ -75,7 +75,9 @@ async fn write_bytes_request<WS: AsyncWrite + Unpin, SR>(
         return Err(Error::H3_MESSAGE_ERROR);
     }
     let mut frame = Vec::new();
-    frame.put_frame(&Frame::<Headers>::encode(fields, qpack, ws.stream_id())?);
+    frame.put_frame(&Frame::new(Headers {
+        field_section: qpack.encode(ws.stream_id(), fields)?,
+    })?);
     ws.write_all(&frame).await?;
     if !body.is_empty() {
         frame.clear();
@@ -97,7 +99,9 @@ async fn write_streaming_request<WS: AsyncWrite + Unpin, SR>(
     let parts = headers::request_parts(fields.clone())?;
     let length = headers::content_length(&parts.headers)?;
     let mut frame = Vec::new();
-    frame.put_frame(&Frame::<Headers>::encode(fields, qpack, ws.stream_id())?);
+    frame.put_frame(&Frame::new(Headers {
+        field_section: qpack.encode(ws.stream_id(), fields)?,
+    })?);
     ws.write_all(&frame).await?;
     body::write_body(
         &mut body,
@@ -122,10 +126,15 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'stati
     let mut rs = BufReader::new(rs);
     let (parts, mode) = async {
         let (parts, length) = loop {
-            let H3Frame::Headers(frame) = be_frame(&mut rs).await? else {
-                return Err(Error::H3_FRAME_UNEXPECTED);
+            let frame = match be_frame(&mut rs).await? {
+                H3Frame::Headers(frame) => frame,
+                H3Frame::Unknown { length, .. } => {
+                    frame::skip_payload(&mut rs, length.into_u64()).await?;
+                    continue;
+                }
+                _ => return Err(Error::H3_FRAME_UNEXPECTED),
             };
-            let fields = frame.decode(&qpack, stream_id).await?;
+            let fields = qpack.decode(stream_id, frame.payload.field_section).await?;
             let parts = headers::response_parts(fields)?;
             let length = headers::content_length(&parts.headers)?;
             if parts.status == StatusCode::SWITCHING_PROTOCOLS {

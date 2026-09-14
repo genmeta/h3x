@@ -24,13 +24,22 @@ async fn response_content_length_and_streaming() {
         let field_section = Bytes::from(field_section);
         output.put_frame(&Frame::<Headers>::new(Headers { field_section }).unwrap());
     }
-    for length in [Some("5"), None] {
-        let mut encoded = Vec::new();
+    let unknown = &[0x21, 3, 2, 0, 0x40, 0x22, 0, 0x40, 0x40, 0][..];
+    for (length, extension) in [
+        (Some("5"), &[][..]),
+        (None, &[][..]),
+        (Some("5"), unknown),
+        (None, unknown),
+    ] {
+        let mut encoded = extension.to_vec();
         headers(&mut encoded, "103", None);
+        encoded.extend_from_slice(extension);
         headers(&mut encoded, "200", length);
+        encoded.extend_from_slice(extension);
         for chunk in [&b"he"[..], &b"llo"[..]] {
             encoded.put_frame(&Frame::<Data>::new(Data(chunk.len())).unwrap());
             encoded.extend_from_slice(chunk);
+            encoded.extend_from_slice(extension);
         }
         let (mut writer, reader) = duplex(2);
         let ((), ()) = tokio::join!(
@@ -65,8 +74,9 @@ async fn response_content_length_and_streaming() {
         assert!(matches!(result, Err(Error::H3_MESSAGE_ERROR)));
     }
     for (status, length) in [("200", Some("0")), ("204", None), ("304", Some("100"))] {
-        let mut encoded = Vec::new();
+        let mut encoded = unknown.to_vec();
         headers(&mut encoded, status, length);
+        encoded.extend_from_slice(unknown);
         let crate::common::Response::Bytes(response) =
             read_response(Cursor::new(encoded)).await.unwrap()
         else {
@@ -100,4 +110,20 @@ async fn response_content_length_and_streaming() {
         read_response(Cursor::new(encoded)).await,
         Err(Error::H3_FRAME_ERROR)
     ));
+
+    for (suffix, expected) in [
+        (&[2, 0][..], Error::H3_FRAME_UNEXPECTED),
+        (&[0x21, 2, 0][..], Error::H3_FRAME_ERROR),
+    ] {
+        let mut encoded = Vec::new();
+        headers(&mut encoded, "200", None);
+        encoded.extend_from_slice(unknown);
+        encoded.extend_from_slice(suffix);
+        let crate::common::Response::Streaming(mut response) =
+            read_response(Cursor::new(encoded)).await.unwrap()
+        else {
+            panic!("expected streaming response")
+        };
+        assert_eq!(response.read(&mut [0]).await.unwrap_err(), expected);
+    }
 }

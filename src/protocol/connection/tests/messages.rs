@@ -135,11 +135,9 @@ async fn client_accepts_head_response_with_representation_content_length() {
                 };
                 // Supply a HEAD response on the wire without storing its request method.
                 let mut frame = Vec::new();
-                frame.put_frame(&Frame::<frame::Headers>::encode(
-                    fields,
-                    server.qpack(),
-                    send.stream_id(),
-                )?);
+                frame.put_frame(&Frame::new(frame::Headers {
+                    field_section: server.qpack().encode(send.stream_id(), fields)?,
+                })?);
                 send.write_all(&frame).await?;
                 send.shutdown().await?;
                 Ok::<_, Error>(())

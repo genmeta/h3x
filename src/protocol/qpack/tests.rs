@@ -335,7 +335,7 @@ async fn field_size_limits_are_enforced_by_each_direction_at_the_exact_boundary(
 }
 
 #[tokio::test]
-async fn frame_codecs_use_dynamic_fields_and_preserve_envelopes_and_ack_order() {
+async fn qpack_fields_preserve_frame_envelopes_and_ack_order() {
     use qbase::varint::VarInt;
     use tokio::io::{AsyncWriteExt, duplex};
 
@@ -364,7 +364,12 @@ async fn frame_codecs_use_dynamic_fields_and_preserve_envelopes_and_ack_order() 
                 .unwrap(),
             )
         } else {
-            H3Frame::Headers(Frame::<Headers>::encode(fields.clone(), &sender, 0).unwrap())
+            H3Frame::Headers(
+                Frame::new(Headers {
+                    field_section: sender.encode(0, fields.clone()).unwrap(),
+                })
+                .unwrap(),
+            )
         };
         let compressed = match &frame {
             H3Frame::Headers(frame) => &frame.payload.field_section,
@@ -384,7 +389,7 @@ async fn frame_codecs_use_dynamic_fields_and_preserve_envelopes_and_ack_order() 
         assert_eq!(parsed, frame); // Includes the encoded length and the multi-byte push ID.
         let decode = async {
             match parsed {
-                H3Frame::Headers(frame) => frame.decode(&receiver, 0).await,
+                H3Frame::Headers(frame) => receiver.decode(0, frame.payload.field_section).await,
                 H3Frame::PushPromise(frame) => {
                     assert_eq!(frame.payload.push_id.into_u64(), 64);
                     receiver.decode(0, frame.payload.field_section).await
@@ -433,13 +438,20 @@ async fn frame_codecs_use_dynamic_fields_and_preserve_envelopes_and_ack_order() 
                 .is_none()
         );
     }
-    // The same frame API also supports a connection with no dynamic capacity.
-    let frame = Frame::<Headers>::encode(
-        fields.clone(),
-        &Qpack::new(Settings::default(), Settings::default(), 0).unwrap(),
-        0,
-    )
+    // The same flow also supports a connection with no dynamic capacity.
+    let frame = Frame::new(Headers {
+        field_section: Qpack::new(Settings::default(), Settings::default(), 0)
+            .unwrap()
+            .encode(0, fields.clone())
+            .unwrap(),
+    })
     .unwrap();
     assert_eq!(frame.payload.field_section[0], 0);
-    assert_eq!(frame.decode(&Qpack::default(), 0).await.unwrap(), fields);
+    assert_eq!(
+        Qpack::default()
+            .decode(0, frame.payload.field_section)
+            .await
+            .unwrap(),
+        fields
+    );
 }

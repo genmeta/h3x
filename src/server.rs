@@ -63,10 +63,16 @@ pub async fn accept<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'static>(
     let stream_id = rs.stream_id();
     let mut rs = BufReader::new(rs);
     let (message, length) = async {
-        let H3Frame::Headers(frame) = be_frame(&mut rs).await? else {
-            return Err(Error::H3_FRAME_UNEXPECTED);
+        let frame = loop {
+            match be_frame(&mut rs).await? {
+                H3Frame::Headers(frame) => break frame,
+                H3Frame::Unknown { length, .. } => {
+                    frame::skip_payload(&mut rs, length.into_u64()).await?;
+                }
+                _ => return Err(Error::H3_FRAME_UNEXPECTED),
+            }
         };
-        let fields = frame.decode(&qpack, stream_id).await?;
+        let fields = qpack.decode(stream_id, frame.payload.field_section).await?;
         let parts = headers::request_parts(fields)?;
         let length = headers::content_length(&parts.headers)?;
 
@@ -175,7 +181,9 @@ async fn write_bytes_response<WS: AsyncWrite + Unpin, SR>(
         return Err(Error::H3_MESSAGE_ERROR);
     }
     let mut frame = Vec::new();
-    frame.put_frame(&Frame::<Headers>::encode(fields, qpack, ws.stream_id())?);
+    frame.put_frame(&Frame::new(Headers {
+        field_section: qpack.encode(ws.stream_id(), fields)?,
+    })?);
     ws.write_all(&frame).await?;
     if !body.is_empty() {
         frame.clear();
@@ -215,7 +223,9 @@ async fn write_streaming_response<WS: AsyncWrite + Unpin, SR>(
         (fields, mode)
     };
     let mut frame = Vec::new();
-    frame.put_frame(&Frame::<Headers>::encode(fields, qpack, ws.stream_id())?);
+    frame.put_frame(&Frame::new(Headers {
+        field_section: qpack.encode(ws.stream_id(), fields)?,
+    })?);
     ws.write_all(&frame).await?;
     body::write_body(&mut body, &mut ws, mode).await?;
     body.complete();
