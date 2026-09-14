@@ -25,7 +25,10 @@ pub(crate) use goaway::Goaway;
 pub(crate) use headers::Headers;
 pub(crate) use max_push_id::MaxPushId;
 pub(crate) use push_promise::PushPromise;
-pub(crate) use settings::Settings;
+pub(crate) use settings::{
+    SETTINGS_MAX_FIELD_SECTION_SIZE, SETTINGS_QPACK_BLOCKED_STREAMS,
+    SETTINGS_QPACK_MAX_TABLE_CAPACITY, Settings,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FrameType {
@@ -117,11 +120,22 @@ impl EncodeSize for H3Frame {
 }
 
 /// Read Type, Length, and one payload. DATA bytes remain in the reader and must
-/// be consumed before calling again. EOF (including a partial frame) is an error.
+/// be consumed before calling again. HEADERS/PUSH_PROMISE retain encoded QPACK bytes;
+/// after validating placement, call the frame's decode(input) to resolve its fields.
+/// EOF (including a partial frame) is an error.
 /// Cancellation can consume a prefix; keep polling the same future.
 pub(crate) async fn be_frame<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<H3Frame> {
     let ty: FrameType = be_varint(reader).await?.into_u64().try_into()?;
     let length = be_varint(reader).await?;
+    be_frame_payload(reader, ty, length).await
+}
+
+/// Decode a known payload after the caller has validated its stream placement.
+pub(crate) async fn be_frame_payload<T: AsyncRead + Unpin + ?Sized>(
+    reader: &mut T,
+    ty: FrameType,
+    length: VarInt,
+) -> Result<H3Frame> {
     let frame = match ty {
         FrameType::Data => H3Frame::Data(Frame {
             length,
@@ -151,15 +165,11 @@ pub(crate) trait EncodeSize {
     fn encoding_size(&self) -> usize;
 }
 
-fn check_payload_length(length: u64) -> Result<usize> {
-    usize::try_from(length)
-        .ok()
-        .filter(|&length| length <= MAX_BUFFERED_FRAME_PAYLOAD)
-        .ok_or(Error::H3_EXCESSIVE_LOAD)
-}
-
 async fn read_payload<T: AsyncRead + Unpin + ?Sized>(reader: &mut T, length: u64) -> Result<Bytes> {
-    let mut payload = vec![0; check_payload_length(length)?];
+    if length > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
+        return Err(Error::H3_EXCESSIVE_LOAD);
+    }
+    let mut payload = vec![0; length as usize];
     reader.read_exact(&mut payload).await?;
     Ok(payload.into())
 }
@@ -311,10 +321,6 @@ mod tests {
         assert_eq!(
             be_frame(&mut &[5, 0][..]).await.unwrap_err(),
             Error::H3_FRAME_ERROR
-        );
-        assert_eq!(
-            check_payload_length(MAX_BUFFERED_FRAME_PAYLOAD as u64).unwrap(),
-            MAX_BUFFERED_FRAME_PAYLOAD
         );
     }
 }
