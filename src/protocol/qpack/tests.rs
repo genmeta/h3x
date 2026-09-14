@@ -84,6 +84,15 @@ async fn cancellation_releases_registration_and_close_wakes_decode() {
         qpack.state.lock().unwrap().decoder.next_instruction(),
         Some(DecoderInstruction::StreamCancellation(0))
     );
+    assert!(
+        qpack
+            .state
+            .lock()
+            .unwrap()
+            .decoder
+            .next_instruction()
+            .is_none()
+    );
     let decode = qpack.decode(4, Bytes::from_static(&[2, 0, 0x80]));
     tokio::pin!(decode);
     poll_fn(|cx| {
@@ -93,10 +102,13 @@ async fn cancellation_releases_registration_and_close_wakes_decode() {
     .await;
     qpack.close(Error::H3_NO_ERROR);
     assert_eq!(decode.await, Err(Error::H3_NO_ERROR));
+    let mut state = qpack.state.lock().unwrap();
+    assert!(state.decoding.is_empty());
+    assert!(state.decoder.next_instruction().is_none());
 }
 
 #[tokio::test]
-async fn abandoned_decode_requires_explicit_cancellation() {
+async fn abandoned_decode_releases_registration_and_blocked_budget() {
     let qpack = Arc::new(
         Qpack::new(
             Settings {
@@ -108,21 +120,122 @@ async fn abandoned_decode_requires_explicit_cancellation() {
         )
         .unwrap(),
     );
+    let mut cx = Context::from_waker(Waker::noop());
+    // An unpolled future never registered anything and needs no cancellation.
+    drop(qpack.decode(0, Bytes::from_static(&[2, 0, 0x80])));
     {
-        let decode = qpack.decode(0, Bytes::from_static(&[2, 0, 0x80]));
-        tokio::pin!(decode);
-        poll_fn(|cx| {
-            assert!(decode.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
+        let mut state = qpack.state.lock().unwrap();
+        assert!(state.decoding.is_empty());
+        assert!(state.decoder.next_instruction().is_none());
     }
+    for (id, explicit_cancel) in [(0, false), (4, true), (8, false)] {
+        let mut decode = Box::pin(qpack.decode(id, Bytes::from_static(&[2, 0, 0x80])));
+        // Each decode consumes the only wait slot and the entire byte budget.
+        assert!(decode.as_mut().poll(&mut cx).is_pending());
+        let ready = qpack.decoder_ready.notified();
+        tokio::pin!(ready);
+        assert!(ready.as_mut().poll(&mut cx).is_pending());
+        if explicit_cancel {
+            qpack.cancel(id).unwrap();
+        }
+        drop(decode);
+        assert!(ready.as_mut().poll(&mut cx).is_ready());
+        assert_eq!(qpack.error(), None);
+        let mut state = qpack.state.lock().unwrap();
+        assert!(state.decoding.is_empty());
+        assert_eq!(
+            state.decoder.next_instruction(),
+            Some(DecoderInstruction::StreamCancellation(id))
+        );
+        assert!(state.decoder.next_instruction().is_none());
+    }
+
+    let decode = qpack.decode(12, Bytes::from_static(&[2, 0, 0x80]));
+    tokio::pin!(decode);
+    assert!(decode.as_mut().poll(&mut cx).is_pending());
+    {
+        let mut state = qpack.state.lock().unwrap();
+        state
+            .decoder
+            .on_encoder_instruction(EncoderInstruction::SetDynamicTableCapacity(128))
+            .unwrap();
+        state
+            .decoder
+            .on_encoder_instruction(EncoderInstruction::InsertWithLiteralName {
+                name: Bytes::from_static(b"x"),
+                value: Bytes::from_static(b"y"),
+            })
+            .unwrap();
+    }
+    assert_eq!(decode.await.unwrap()[0].value, "y");
+    let mut state = qpack.state.lock().unwrap();
+    assert!(state.decoding.is_empty());
+    assert_eq!(
+        state.decoder.next_instruction(),
+        Some(DecoderInstruction::SectionAcknowledgment(12))
+    );
+    assert!(state.decoder.next_instruction().is_none());
+}
+
+#[tokio::test]
+async fn rejected_decode_does_not_cancel_existing_registration() {
+    let qpack = Qpack::new(
+        Settings {
+            max_table_capacity: 128,
+            blocked_streams: 1,
+        },
+        Settings::default(),
+        1,
+    )
+    .unwrap();
+    let mut decode = Box::pin(qpack.decode(0, Bytes::from_static(&[2, 0, 0x80])));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(decode.as_mut().poll(&mut cx).is_pending());
     assert_eq!(
         qpack.decode(0, Bytes::from_static(&[0, 0, 0xd1])).await,
         Err(Error::H3_REQUEST_CANCELLED)
     );
-    qpack.cancel(0).unwrap();
-    assert!(qpack.state.lock().unwrap().decoding.is_empty());
+    assert!(decode.as_mut().poll(&mut cx).is_pending());
+    assert!(
+        qpack
+            .state
+            .lock()
+            .unwrap()
+            .decoder
+            .next_instruction()
+            .is_none()
+    );
+    drop(decode);
+    let mut state = qpack.state.lock().unwrap();
+    assert!(state.decoding.is_empty());
+    assert_eq!(
+        state.decoder.next_instruction(),
+        Some(DecoderInstruction::StreamCancellation(0))
+    );
+    assert!(state.decoder.next_instruction().is_none());
+}
+
+#[tokio::test]
+async fn invalid_prefix_releases_registration_without_cancellation_feedback() {
+    for payload in [&[][..], &[0][..], &[0, 0x80][..]] {
+        let qpack = Qpack::new(
+            Settings {
+                max_table_capacity: 128,
+                blocked_streams: 1,
+            },
+            Settings::default(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            qpack.decode(0, Bytes::copy_from_slice(payload)).await,
+            Err(Error::QPACK_DECOMPRESSION_FAILED)
+        );
+        assert_eq!(qpack.error(), Some(Error::QPACK_DECOMPRESSION_FAILED));
+        let mut state = qpack.state.lock().unwrap();
+        assert!(state.decoding.is_empty());
+        assert!(state.decoder.next_instruction().is_none());
+    }
 }
 
 #[tokio::test]

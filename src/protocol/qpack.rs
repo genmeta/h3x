@@ -79,6 +79,28 @@ struct State {
     writing: Option<VecDeque<DecoderInstruction>>,
 }
 
+/// Release a decode registration if its future exits before normal cleanup.
+struct DecodeGuard<'a> {
+    qpack: &'a Qpack,
+    stream_id: u64,
+}
+
+impl Drop for DecodeGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.qpack.state.lock().unwrap();
+        // Completion or explicit cancellation already released this decode.
+        if !state.decoding.remove(&self.stream_id) {
+            return;
+        }
+        if state.error.is_some() {
+            state.decoder.finish(self.stream_id);
+        } else {
+            let _ = state.decoder.cancel_stream(self.stream_id);
+            self.qpack.decoder_ready.notify_one();
+        }
+    }
+}
+
 impl Qpack {
     pub(crate) fn new(local: Settings, peer: Settings, max_blocked_bytes: usize) -> Result<Self> {
         Ok(Self {
@@ -157,7 +179,7 @@ impl Qpack {
         if id > qbase::varint::VARINT_MAX {
             return Err(Error::H3_ID_ERROR);
         }
-        let (offset, prefix) = {
+        let _guard = {
             let mut state = self.state.lock().unwrap();
             if let Some(error) = state.error {
                 return Err(error);
@@ -165,6 +187,13 @@ impl Qpack {
             if !state.decoding.insert(id) {
                 return Err(Error::H3_REQUEST_CANCELLED);
             }
+            DecodeGuard {
+                qpack: self,
+                stream_id: id,
+            }
+        };
+        let (offset, prefix) = {
+            let state = self.state.lock().unwrap();
             state
                 .decoder
                 .read_prefix(&payload)
@@ -195,8 +224,9 @@ impl Qpack {
         result
     }
 
-    /// Cancel reception on this stream, including an abandoned decode future.
-    /// Call once when abandoning a receive operation to release its decode wait.
+    /// Cancel reception on this stream and wake a pending decode.
+    /// Call once when abandoning reception; dropping a pending decode future
+    /// already releases its wait and queues cancellation.
     pub fn cancel(&self, stream_id: u64) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         state.decoding.remove(&stream_id);
