@@ -8,7 +8,10 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncWriteExt};
 
-use super::control::{self, Control, ControlStream};
+use super::{
+    bi::BiStreams,
+    control::{self, Control, ControlStream},
+};
 use crate::{
     Error, Result, Role, Transport,
     protocol::{
@@ -19,14 +22,14 @@ use crate::{
 };
 
 /// Shared state maintained by the control and QPACK streams.
-pub(in crate::protocol) struct UniStreams<S> {
+pub(in crate::protocol) struct UniStreams {
     pub(in crate::protocol) settings: Settings,
     pub(in crate::protocol) qpack: Arc<Qpack>,
     pub(in crate::protocol) goaway: Goaway,
-    pub(in crate::protocol) control: Control<S>,
+    pub(in crate::protocol) control: Control,
 }
 
-impl<S> UniStreams<S> {
+impl UniStreams {
     pub(in crate::protocol) fn new(settings: Settings, qpack: Arc<Qpack>) -> Self {
         Self {
             settings,
@@ -36,18 +39,16 @@ impl<S> UniStreams<S> {
         }
     }
 
-    pub(in crate::protocol) async fn send<T: Transport<Send = S>>(
-        &self,
-        transport: &T,
-    ) -> Result<()> {
+    pub(in crate::protocol) async fn send<T: Transport>(&self, transport: &T) -> Result<()> {
         send_uni(transport, &self.settings.local, &self.qpack, &self.control).await
     }
 
-    pub(in crate::protocol) async fn receive<T: Transport<Send = S>>(
+    pub(in crate::protocol) async fn receive<T: Transport>(
         &self,
         transport: &T,
+        bi: &BiStreams<T::Recv, T::Send>,
     ) -> Result<()> {
-        UniStreamReceiver::new().receive(transport, self).await
+        UniStreamReceiver::new().receive(transport, self, bi).await
     }
 }
 
@@ -133,7 +134,12 @@ impl<'a, T: Transport> UniStreamReceiver<'a, T> {
         }
     }
 
-    async fn receive(mut self, transport: &T, streams: &'a UniStreams<T::Send>) -> Result<()> {
+    async fn receive(
+        mut self,
+        transport: &T,
+        streams: &'a UniStreams,
+        bi: &'a BiStreams<T::Recv, T::Send>,
+    ) -> Result<()> {
         loop {
             tokio::select! {
                 accepted = transport.accept_uni_stream(),
@@ -159,7 +165,7 @@ impl<'a, T: Transport> UniStreamReceiver<'a, T> {
                         return Err(Error::H3_STREAM_CREATION_ERROR);
                     }
                     self.critical_stream_receivers[slot] =
-                        Some(Self::receive_critical_stream(kind, recv, transport.role(), streams));
+                        Some(Self::receive_critical_stream(kind, recv, transport.role(), streams, bi));
                 }
                 result = poll_fn(|cx| {
                     poll_critical_stream_receivers(&mut self.critical_stream_receivers, cx)
@@ -175,7 +181,8 @@ impl<'a, T: Transport> UniStreamReceiver<'a, T> {
         kind: CriticalStreamKind,
         mut recv: T::Recv,
         role: Role,
-        streams: &'a UniStreams<T::Send>,
+        streams: &'a UniStreams,
+        bi: &'a BiStreams<T::Recv, T::Send>,
     ) -> Receiving<'a, ()> {
         Box::pin(async move {
             match kind {
@@ -186,6 +193,7 @@ impl<'a, T: Transport> UniStreamReceiver<'a, T> {
                         &streams.settings,
                         &streams.qpack,
                         &streams.goaway,
+                        bi,
                     )
                     .await
                 }
@@ -201,7 +209,7 @@ async fn send_uni<T: Transport>(
     transport: &T,
     settings: &frame::Settings,
     qpack: &Qpack,
-    control: &Control<T::Send>,
+    control: &Control,
 ) -> Result<()> {
     tokio::try_join!(
         send_control(transport, settings, control),
@@ -214,7 +222,7 @@ async fn send_uni<T: Transport>(
 async fn send_control<T: Transport>(
     transport: &T,
     settings: &frame::Settings,
-    outgoing: &Control<T::Send>,
+    outgoing: &Control,
 ) -> Result<()> {
     let mut send = open_stream(transport).await?;
     send.write_all(&[0])
@@ -224,10 +232,14 @@ async fn send_control<T: Transport>(
     control
         .write(&H3Frame::Settings(Frame::new(settings.clone())?))
         .await?;
-    *outgoing.stream.lock().await = Some(control);
-    outgoing.ready.notify_waiters();
-    // Keep this driver pending while GOAWAY writes use the published control stream.
-    std::future::pending::<Result<()>>().await
+    let mut receiver = outgoing.receiver.lock().await;
+    while let Some((frame, completed)) = receiver.recv().await {
+        // The driver owns each write through completion, even if its caller stops waiting.
+        let result = control.write(&frame).await;
+        let _ = completed.send(result);
+        result?;
+    }
+    Err(Error::H3_CLOSED_CRITICAL_STREAM)
 }
 
 async fn send_encoder<T: Transport>(transport: &T, qpack: &Qpack) -> Result<()> {

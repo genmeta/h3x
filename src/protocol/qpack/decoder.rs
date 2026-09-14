@@ -24,6 +24,7 @@ pub(crate) struct Decoder {
     known_received_count: u64,
     instructions: VecDeque<DecoderInstruction>,
 }
+
 impl Decoder {
     pub(crate) fn new(local: Settings, max_blocked_bytes: usize) -> Result<Self> {
         if local.blocked_streams > VARINT_MAX {
@@ -40,6 +41,7 @@ impl Decoder {
             instructions: VecDeque::new(),
         })
     }
+
     pub(super) fn read_prefix<'a>(
         &self,
         payload: &'a [u8],
@@ -53,6 +55,7 @@ impl Decoder {
             self.table.insert_count(),
         )
     }
+
     pub(super) fn poll_decode(
         &mut self,
         id: u64,
@@ -96,6 +99,7 @@ impl Decoder {
         }
         Poll::Ready(result)
     }
+
     pub(crate) fn on_encoder_instruction(&mut self, instruction: EncoderInstruction) -> Result<()> {
         if self.table.max_capacity() == 0 {
             return Err(Error::QPACK_ENCODER_STREAM_ERROR);
@@ -109,11 +113,13 @@ impl Decoder {
         }
         Ok(())
     }
+
     pub(super) fn finish(&mut self, id: u64) {
         if let Some((_, bytes, _)) = self.waiting.remove(&id) {
             self.blocked_bytes -= bytes;
         }
     }
+
     pub(crate) fn cancel_stream(&mut self, id: u64) -> Result<()> {
         if id > VARINT_MAX {
             return Err(Error::H3_INTERNAL_ERROR);
@@ -128,11 +134,13 @@ impl Decoder {
         }
         Ok(())
     }
+
     pub(super) fn wake_all(&self) {
         for (_, _, waker) in self.waiting.values() {
             waker.wake_by_ref();
         }
     }
+
     /// Drain queued feedback, then emit any insertion progress not already covered by ACKs.
     pub(crate) fn next_instruction(&mut self) -> Option<DecoderInstruction> {
         if let Some(instruction) = self.instructions.pop_front() {

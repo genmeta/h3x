@@ -138,12 +138,15 @@ impl<IO, B> ReadRequest for Request<IO, B> {
     fn method(&self) -> Method {
         self.message.0.lock().unwrap().method()
     }
+
     fn authority(&self) -> String {
         self.message.0.lock().unwrap().authority()
     }
+
     fn path(&self) -> String {
         self.message.0.lock().unwrap().path()
     }
+
     fn scheme(&self) -> String {
         self.message.0.lock().unwrap().scheme()
     }

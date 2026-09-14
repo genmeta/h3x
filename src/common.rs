@@ -78,6 +78,7 @@ impl ReadResponse for Response<Read> {
         }
     }
 }
+
 impl WriteResponse for Response<Write> {
     fn set_status(&mut self, status: http::StatusCode) -> &mut Self {
         match self {

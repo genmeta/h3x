@@ -1,5 +1,6 @@
 //! Transfer body bytes between application buffers and HTTP/3 frames.
 
+use http::{Method, StatusCode};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use super::{
@@ -14,26 +15,30 @@ use crate::{Error, Result};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BodyMode {
     Forbidden,
-    Allowed { content_length: Option<u64> },
+    Infinity,
+    Length { content_length: u64 },
 }
 
 impl BodyMode {
-    /// Resolve body rules for a final response after header validation.
-    pub(crate) fn response(
-        method: Option<&http::Method>,
-        status: http::StatusCode,
-        content_length: Option<u64>,
-    ) -> Self {
-        if method == Some(&http::Method::HEAD)
-            || matches!(
-                status,
-                http::StatusCode::NO_CONTENT | http::StatusCode::NOT_MODIFIED
-            )
-        {
-            Self::Forbidden
-        } else {
-            Self::Allowed { content_length }
+    /// Resolve body rules from final response headers and the request method.
+    pub(crate) fn resolve(
+        response: &http::response::Parts,
+        method: Option<&Method>,
+    ) -> Result<Self> {
+        let content_length = headers::content_length(&response.headers)?;
+        if method == Some(&Method::HEAD) {
+            return Ok(Self::Forbidden);
         }
+        if matches!(
+            response.status,
+            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+        ) {
+            return Ok(Self::Forbidden);
+        }
+        Ok(match content_length {
+            Some(content_length) => Self::Length { content_length },
+            None => Self::Infinity,
+        })
     }
 
     /// Whether to receive the body as Streaming; otherwise use Bytes.
@@ -41,15 +46,17 @@ impl BodyMode {
     pub(crate) fn streaming(self) -> bool {
         match self {
             Self::Forbidden => false,
-            Self::Allowed { content_length } => content_length
-                .is_none_or(|length| length > frame::MAX_BUFFERED_FRAME_PAYLOAD as u64),
+            Self::Infinity => true,
+            Self::Length { content_length } => {
+                content_length > frame::MAX_BUFFERED_FRAME_PAYLOAD as u64
+            }
         }
     }
 
     pub(crate) fn content_length(self) -> Option<u64> {
         match self {
-            Self::Forbidden => None,
-            Self::Allowed { content_length } => content_length,
+            Self::Forbidden | Self::Infinity => None,
+            Self::Length { content_length } => Some(content_length),
         }
     }
 
@@ -60,8 +67,8 @@ impl BodyMode {
 
 /// Receive DATA into an application destination and validate trailing HEADERS.
 /// QPACK is used only to decode trailers. The destination is shut down at EOF.
-pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    receive: &mut BufReader<H3ReadStream<R>>,
+pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin, RW>(
+    receive: &mut BufReader<H3ReadStream<R, RW>>,
     destination: &mut W,
     mode: BodyMode,
     qpack: &Qpack,
@@ -123,8 +130,9 @@ pub(crate) async fn write_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             .ok_or(Error::H3_MESSAGE_ERROR)?;
         let invalid = match mode {
             BodyMode::Forbidden => count != 0,
-            BodyMode::Allowed { content_length } => {
-                content_length.is_some_and(|length| sent > length || (count == 0 && sent != length))
+            BodyMode::Infinity => false,
+            BodyMode::Length { content_length } => {
+                sent > content_length || (count == 0 && sent != content_length)
             }
         };
         if invalid {

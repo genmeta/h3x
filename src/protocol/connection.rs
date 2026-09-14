@@ -1,12 +1,15 @@
 use std::sync::{Arc, Mutex};
 
 use qbase::varint::{VARINT_MAX, VarInt};
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::{
+    sync::{Notify, oneshot},
+    task::JoinHandle,
+};
 
 use super::{
     frame::{self, Frame, H3Frame},
     qpack::{self, Qpack},
-    stream::{H3ReadStream, H3WriteStream, UniStreams},
+    stream::{H3ReadStream, H3WriteStream, UniStreams, bi::BiStreams},
 };
 use crate::{Error, Result, Transport};
 
@@ -49,6 +52,7 @@ impl Settings {
         })
     }
 }
+
 impl Default for Settings {
     fn default() -> Self {
         Self::new(65536, 4096, 16).unwrap()
@@ -72,7 +76,8 @@ pub(in crate::protocol) struct Goaway {
 /// Construct inside a Tokio runtime. Dropping the connection closes it and stops its driver.
 pub struct H3Connection<T: Transport> {
     transport: Arc<T>,
-    uni: Arc<UniStreams<T::Send>>,
+    uni: Arc<UniStreams>,
+    bi: Arc<BiStreams<T::Recv, T::Send>>,
     task: JoinHandle<()>,
 }
 
@@ -93,16 +98,19 @@ impl<T: Transport> H3Connection<T> {
         qpack.local_limit(max_fields);
         let transport = Arc::new(transport);
         let uni = Arc::new(UniStreams::new(settings, qpack));
+        let bi = Arc::new(BiStreams::default());
         let task = tokio::spawn({
+            let bi = Arc::clone(&bi);
             let transport = Arc::clone(&transport);
             let uni = Arc::clone(&uni);
             async move {
-                let _ = process_connection(transport.as_ref(), &uni).await;
+                let _ = process_connection(transport.as_ref(), &uni, &bi).await;
             }
         });
         Ok(Self {
             transport,
             uni,
+            bi,
             task,
         })
     }
@@ -120,7 +128,12 @@ impl<T: Transport> H3Connection<T> {
     }
 
     /// Open a bidirectional stream, returning (send, receive).
-    pub async fn open_bi(&self) -> Result<(H3WriteStream<T::Send>, H3ReadStream<T::Recv>)> {
+    pub async fn open_bi(
+        &self,
+    ) -> Result<(
+        H3WriteStream<T::Send, T::Recv>,
+        H3ReadStream<T::Recv, T::Send>,
+    )> {
         self.error().map_or(Ok(()), Err)?;
         let changed = self.uni.goaway.changed.notified();
         tokio::pin!(changed);
@@ -146,11 +159,16 @@ impl<T: Transport> H3Connection<T> {
         if draining {
             return Err(Error::H3_REQUEST_REJECTED);
         }
-        self.wrap(stream)
+        self.insert(stream)
     }
 
     /// Accept a bidirectional stream, returning (send, receive), before parsing HTTP.
-    pub async fn accept_bi(&self) -> Result<(H3WriteStream<T::Send>, H3ReadStream<T::Recv>)> {
+    pub async fn accept_bi(
+        &self,
+    ) -> Result<(
+        H3WriteStream<T::Send, T::Recv>,
+        H3ReadStream<T::Recv, T::Send>,
+    )> {
         self.error().map_or(Ok(()), Err)?;
         let changed = self.uni.goaway.changed.notified();
         tokio::pin!(changed);
@@ -182,24 +200,24 @@ impl<T: Transport> H3Connection<T> {
             }
             state.accepted_boundary = state.accepted_boundary.max(stream.0 + 4);
         }
-        self.wrap(stream)
+        self.insert(stream)
     }
 
     #[expect(
         clippy::type_complexity,
         reason = "Transport tuple keeps both halves and their ID together"
     )]
-    fn wrap(
+    fn insert(
         &self,
-        stream: (u64, (T::Recv, T::Send)),
-    ) -> Result<(H3WriteStream<T::Send>, H3ReadStream<T::Recv>)> {
-        if stream.0 > VARINT_MAX || !stream.0.is_multiple_of(4) {
+        (id, (recv, send)): (u64, (T::Recv, T::Send)),
+    ) -> Result<(
+        H3WriteStream<T::Send, T::Recv>,
+        H3ReadStream<T::Recv, T::Send>,
+    )> {
+        if id > VARINT_MAX || !id.is_multiple_of(4) {
             return Err(Error::H3_ID_ERROR);
         }
-        Ok((
-            H3WriteStream::new(stream.0, stream.1.1),
-            H3ReadStream::new(stream.0, stream.1.0),
-        ))
+        self.bi.insert(id, recv, send)
     }
 
     pub fn error(&self) -> Option<Error> {
@@ -208,6 +226,7 @@ impl<T: Transport> H3Connection<T> {
 
     pub fn close(&self, error: Error) {
         close_connection(self.transport.as_ref(), &self.uni.qpack, error);
+        self.bi.close(self.uni.qpack.error().unwrap_or(error));
     }
 
     pub async fn closed(&self) -> Result<()> {
@@ -219,71 +238,60 @@ impl<T: Transport> H3Connection<T> {
         }
     }
 
+    /// Queue GOAWAY and wait for the driver to finish writing it.
+    /// Cancelling this wait does not cancel a frame already queued for sending.
     pub async fn goaway(&self) -> Result<()> {
-        loop {
-            let ready = self.uni.control.ready.notified();
-            tokio::pin!(ready);
-            ready.as_mut().enable();
-            let mut slot = tokio::select! {
-                biased;
-                error = self.uni.qpack.terminated() => return Err(error),
-                slot = self.uni.control.stream.lock() => slot,
-            };
-            self.error().map_or(Ok(()), Err)?;
-            if let Some(control) = slot.as_mut() {
-                let id = {
-                    let mut state = self.uni.goaway.state.lock().unwrap();
-                    let id = state.accepted_boundary;
-                    if id > VARINT_MAX || state.local.is_some_and(|previous| id > previous) {
-                        return Err(Error::H3_ID_ERROR);
-                    }
-                    state.local = Some(id);
-                    id
-                };
-                let guard = Critical(self.transport.as_ref(), &self.uni.qpack);
-                self.uni.goaway.changed.notify_waiters();
-                let frame = H3Frame::Goaway(Frame::new(frame::Goaway {
-                    id: VarInt::try_from(id).unwrap(),
-                })?);
-                let result = tokio::select! {
-                    biased;
-                    error = self.uni.qpack.terminated() => Err(error),
-                    result = control.write(&frame) => result,
-                };
-                if let Err(error) = result {
-                    self.close(error);
-                } else {
-                    std::mem::forget(guard);
-                }
-                return result;
+        let permit = tokio::select! {
+            biased;
+            error = self.uni.qpack.terminated() => return Err(error),
+            permit = self.uni.control.sender.reserve() => {
+                permit.map_err(|_| self.error().unwrap_or(Error::H3_CLOSED_CRITICAL_STREAM))?
             }
-            drop(slot);
-            tokio::select! {
-                biased;
-                error = self.uni.qpack.terminated() => return Err(error),
-                _ = &mut ready => {}
+        };
+        let (completed, completion) = oneshot::channel();
+        {
+            let mut state = self.uni.goaway.state.lock().unwrap();
+            self.error().map_or(Ok(()), Err)?;
+            let id = state.accepted_boundary;
+            if id > VARINT_MAX || state.local.is_some_and(|previous| id > previous) {
+                return Err(Error::H3_ID_ERROR);
+            }
+            let frame = H3Frame::Goaway(Frame::new(frame::Goaway {
+                id: VarInt::try_from(id).unwrap(),
+            })?);
+            state.local = Some(id);
+            permit.send((frame, completed));
+        }
+        self.uni.goaway.changed.notify_waiters();
+        tokio::select! {
+            biased;
+            error = self.uni.qpack.terminated() => Err(error),
+            result = completion => {
+                result.unwrap_or_else(|_| Err(self.error().unwrap_or(Error::H3_CLOSED_CRITICAL_STREAM)))
             }
         }
     }
 }
 
-async fn process_connection<T: Transport>(transport: &T, uni: &UniStreams<T::Send>) -> Result<()> {
+async fn process_connection<T: Transport>(
+    transport: &T,
+    uni: &UniStreams,
+    bi: &BiStreams<T::Recv, T::Send>,
+) -> Result<()> {
     uni.qpack.error().map_or(Ok(()), Err)?;
-    let guard = Critical(transport, &uni.qpack);
-    let work = async {
-        tokio::try_join!(uni.send(transport), uni.receive(transport))?;
-        Ok(())
-    };
     let result = tokio::select! {
         biased;
         error = uni.qpack.terminated() => Err(error),
         error = transport.terminated() => Err(error),
-        result = work => result,
+        result = uni.send(transport) => result,
+        result = uni.receive(transport, bi) => result,
     };
-    if let Err(error) = result {
-        close_connection(transport, &uni.qpack, error);
-    }
-    drop(guard);
+    close_connection(
+        transport,
+        &uni.qpack,
+        result.err().unwrap_or(Error::H3_CLOSED_CRITICAL_STREAM),
+    );
+    bi.close(uni.qpack.error().unwrap_or(Error::H3_INTERNAL_ERROR));
     if result == Err(Error::H3_NO_ERROR) {
         Ok(())
     } else {
@@ -301,13 +309,6 @@ impl<T: Transport> Drop for H3Connection<T> {
     fn drop(&mut self) {
         self.close(Error::H3_NO_ERROR);
         self.task.abort();
-    }
-}
-/// Cancelling any partially progressed critical operation terminates the connection.
-struct Critical<'a, T: Transport>(&'a T, &'a Qpack);
-impl<T: Transport> Drop for Critical<'_, T> {
-    fn drop(&mut self) {
-        close_connection(self.0, self.1, Error::H3_CLOSED_CRITICAL_STREAM);
     }
 }
 
@@ -330,13 +331,16 @@ mod tests {
     };
 
     struct Cell<T>(Mutex<T>);
+
     impl<T: Copy> Cell<T> {
         fn new(value: T) -> Self {
             Self(Mutex::new(value))
         }
+
         fn get(&self) -> T {
             *self.0.lock().unwrap()
         }
+
         fn set(&self, value: T) {
             *self.0.lock().unwrap() = value;
         }
@@ -346,6 +350,7 @@ mod tests {
         values: Mutex<VecDeque<S>>,
         changed: Notify,
     }
+
     impl<S> Default for Queue<S> {
         fn default() -> Self {
             Self {
@@ -354,11 +359,13 @@ mod tests {
             }
         }
     }
+
     impl<S> Queue<S> {
         fn push(&self, value: S) {
             self.values.lock().unwrap().push_back(value);
             self.changed.notify_one();
         }
+
         async fn pop(&self) -> S {
             loop {
                 let changed = self.changed.notified();
@@ -380,6 +387,7 @@ mod tests {
         blocked_open: Cell<bool>,
         ended: Arc<(Cell<Option<Error>>, Notify)>,
     }
+
     fn pair() -> (Memory, Memory) {
         let uni_a = Arc::new(Queue::default());
         let uni_b = Arc::new(Queue::default());
@@ -409,6 +417,7 @@ mod tests {
             },
         )
     }
+
     impl Transport for Memory {
         fn role(&self) -> Role {
             if self.next_uni.get() % 4 == 2 {
@@ -422,9 +431,11 @@ mod tests {
         fn stop(recv: &mut DuplexStream, _: u64) {
             *recv = duplex(1).0;
         }
+
         fn cancel(send: &mut DuplexStream, _: u64) {
             *send = duplex(1).0;
         }
+
         async fn open_bi_stream(&self) -> Result<Option<Bi>> {
             if self.blocked_open.get() {
                 std::future::pending::<()>().await;
@@ -436,9 +447,11 @@ mod tests {
             self.outgoing_bi.push((id, (peer_recv, peer_send)));
             Ok(Some((id, (recv, send))))
         }
+
         async fn accept_bi_stream(&self) -> Result<Bi> {
             Ok(self.incoming_bi.pop().await)
         }
+
         async fn open_uni_stream(&self) -> Result<Option<(u64, DuplexStream)>> {
             let id = self.next_uni.get();
             self.next_uni.set(id + 4);
@@ -446,9 +459,11 @@ mod tests {
             self.outgoing_uni.push((id, recv));
             Ok(Some((id, send)))
         }
+
         async fn accept_uni_stream(&self) -> Result<(u64, DuplexStream)> {
             Ok(self.incoming_uni.pop().await)
         }
+
         fn close(&self, _: String, _: u64) -> Result<()> {
             if self.ended.0.get().is_none() {
                 self.ended.0.set(Some(Error::H3_NO_ERROR));
@@ -456,6 +471,7 @@ mod tests {
             self.ended.1.notify_waiters();
             Ok(())
         }
+
         async fn terminated(&self) -> Error {
             loop {
                 let changed = self.ended.1.notified();
@@ -484,6 +500,7 @@ mod tests {
         let response = client::request(request, recv, send, connection.qpack().clone()).await?;
         callback(response).await
     }
+
     async fn accept_on<F, Fut, R>(connection: &H3Connection<Memory>, handler: F) -> Result<()>
     where
         F: FnOnce(server::Request) -> Fut,
@@ -659,7 +676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goaway_stops_new_opens_but_does_not_own_delivered_streams() {
+    async fn goaway_stops_new_opens_and_preserves_admitted_streams() {
         use tokio::io::AsyncReadExt;
         let (a, b) = pair();
         let client = H3Connection::new(a);
@@ -693,6 +710,259 @@ mod tests {
         let (a, b, ()) = tokio::join!(client.closed(), server.closed(), work);
         a.unwrap();
         b.unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_goaway_rejects_delivered_streams_and_wakes_both_halves() {
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering},
+            task::{Wake, Waker},
+        };
+
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        #[derive(Default)]
+        struct Wakes(AtomicUsize);
+
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (a, b) = pair();
+        let client = H3Connection::new(a);
+        let server = H3Connection::new(b);
+        let (mut send, mut recv) = client.open_bi().await.unwrap();
+        assert_eq!(client.bi.len(), 1);
+        send.write_all(b"abc").await.unwrap(); // Fill the transport's three-byte window.
+        let wakes = Arc::new(Wakes::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut bytes = [0];
+        let mut buf = ReadBuf::new(&mut bytes);
+        assert!(
+            std::pin::Pin::new(&mut recv)
+                .poll_read(&mut cx, &mut buf)
+                .is_pending()
+        );
+        assert!(
+            std::pin::Pin::new(&mut send)
+                .poll_write(&mut cx, b"d")
+                .is_pending()
+        );
+
+        // The server has not accepted stream 0, so GOAWAY excludes it.
+        server.goaway().await.unwrap();
+        while client.received_goaway().is_none() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(client.received_goaway(), Some(0));
+        assert!(wakes.0.load(Ordering::SeqCst) >= 2);
+        let Poll::Ready(Err(error)) = std::pin::Pin::new(&mut recv).poll_read(&mut cx, &mut buf)
+        else {
+            panic!("GOAWAY must reject the pending read");
+        };
+        assert_eq!(Error::from(error), Error::H3_REQUEST_REJECTED);
+        assert_eq!(
+            Error::from(send.write_all(b"d").await.unwrap_err()),
+            Error::H3_REQUEST_REJECTED
+        );
+        assert_eq!(
+            Error::from(send.flush().await.unwrap_err()),
+            Error::H3_REQUEST_REJECTED
+        );
+        assert_eq!(
+            Error::from(send.shutdown().await.unwrap_err()),
+            Error::H3_REQUEST_REJECTED
+        );
+        // GOAWAY ends both directions even while their handles are retained.
+        tokio::task::yield_now().await;
+        assert_eq!(client.bi.len(), 0);
+        drop(recv);
+        drop(send);
+        tokio::task::yield_now().await;
+        assert_eq!(client.bi.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn lowering_peer_goaway_rejects_only_streams_at_or_above_the_boundary() {
+        use tokio::io::AsyncReadExt;
+        let (a, b) = pair();
+        let client = H3Connection::new(a);
+        let server = H3Connection::new(b);
+        let (mut send0, recv0) = client.open_bi().await.unwrap();
+        let (mut send4, recv4) = client.open_bi().await.unwrap();
+        let (_peer_send0, mut peer_recv0) = server.accept_bi().await.unwrap();
+        let (_peer_send4, mut peer_recv4) = server.accept_bi().await.unwrap();
+        server.goaway().await.unwrap();
+        while client.received_goaway() != Some(8) {
+            tokio::task::yield_now().await;
+        }
+        send4.write_all(b"a").await.unwrap();
+        let mut byte = [0];
+        peer_recv4.read_exact(&mut byte).await.unwrap();
+        // A peer may lower its boundary in a subsequent GOAWAY.
+        let (completed, completion) = oneshot::channel();
+        server
+            .uni
+            .control
+            .sender
+            .send((
+                H3Frame::Goaway(
+                    Frame::new(frame::Goaway {
+                        id: VarInt::from_u32(4),
+                    })
+                    .unwrap(),
+                ),
+                completed,
+            ))
+            .await
+            .unwrap();
+        completion.await.unwrap().unwrap();
+        while client.received_goaway() != Some(4) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            Error::from(send4.write_all(b"b").await.unwrap_err()),
+            Error::H3_REQUEST_REJECTED
+        );
+        send0.write_all(b"c").await.unwrap();
+        peer_recv0.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte, [b'c']);
+        drop((send0, recv0, send4, recv4));
+        assert_eq!(client.bi.len(), 1);
+        client.bi.cleanup();
+        assert_eq!(client.bi.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn client_goaway_does_not_reject_server_request_streams() {
+        use tokio::io::AsyncReadExt;
+        let (a, b) = pair();
+        let client = H3Connection::new(a);
+        let server = H3Connection::new(b);
+        let (_send, mut recv) = client.open_bi().await.unwrap();
+        let (mut peer_send, _peer_recv) = server.accept_bi().await.unwrap();
+        client.goaway().await.unwrap();
+        while server.received_goaway().is_none() {
+            tokio::task::yield_now().await;
+        }
+        peer_send.write_all(b"ok").await.unwrap();
+        let mut bytes = [0; 2];
+        recv.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"ok");
+    }
+
+    #[tokio::test]
+    async fn next_stream_reaps_completed_streams_while_handles_remain_alive() {
+        use tokio::io::AsyncReadExt;
+        for receive_first in [false, true] {
+            let (a, b) = pair();
+            let client = H3Connection::new(a);
+            let server = H3Connection::new(b);
+            let (mut send, mut recv) = client.open_bi().await.unwrap();
+            let (mut peer_send, mut peer_recv) = server.accept_bi().await.unwrap();
+            if !receive_first {
+                send.shutdown().await.unwrap();
+                // AsyncRead permits empty reads without having reached EOF.
+                assert_eq!(recv.read(&mut []).await.unwrap(), 0);
+                tokio::task::yield_now().await;
+                assert_eq!(client.bi.len(), 1);
+            }
+            peer_send.write_all(b"ok").await.unwrap();
+            peer_send.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            recv.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"ok");
+            if receive_first {
+                tokio::task::yield_now().await;
+                assert_eq!(client.bi.len(), 1);
+                send.shutdown().await.unwrap();
+            }
+            let mut request = Vec::new();
+            peer_recv.read_to_end(&mut request).await.unwrap();
+            assert_eq!(client.bi.len(), 1);
+            assert_eq!(server.bi.len(), 1);
+            let next = client.open_bi().await.unwrap();
+            let peer_next = server.accept_bi().await.unwrap();
+            assert_eq!(client.bi.len(), 1);
+            assert_eq!(server.bi.len(), 1);
+
+            // Retained handles keep their terminal results; completion is idempotent.
+            assert_eq!(recv.read(&mut [0]).await.unwrap(), 0);
+            assert_eq!(peer_recv.read(&mut [0]).await.unwrap(), 0);
+            send.shutdown().await.unwrap();
+            peer_send.shutdown().await.unwrap();
+            send.flush().await.unwrap();
+            assert_eq!(
+                send.write_all(b"x").await.unwrap_err().kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+            drop((send, recv, peer_send, peer_recv, next, peer_next));
+            client.bi.cleanup();
+            server.bi.cleanup();
+            tokio::task::yield_now().await;
+            assert_eq!(client.bi.len(), 0);
+            assert_eq!(server.bi.len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn releasing_one_handle_preserves_the_other_half() {
+        use tokio::io::AsyncReadExt;
+        let (a, b) = pair();
+        let client = H3Connection::new(a);
+        let server = H3Connection::new(b);
+        let (send, mut recv) = client.open_bi().await.unwrap();
+        let (mut peer_send, mut peer_recv) = server.accept_bi().await.unwrap();
+        drop(send);
+        assert_eq!(client.bi.len(), 1);
+        let mut bytes = [0; 2];
+        assert_eq!(peer_recv.read(&mut bytes).await.unwrap(), 0);
+        peer_send.write_all(b"ok").await.unwrap();
+        recv.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"ok");
+        drop(recv);
+        assert_eq!(client.bi.len(), 1);
+        client.bi.cleanup();
+        assert_eq!(client.bi.len(), 0);
+        assert!(peer_send.write_all(b"x").await.is_err());
+        drop((peer_recv, peer_send));
+        server.bi.cleanup();
+        assert_eq!(server.bi.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn closing_connection_releases_owned_streams_and_wakes_pending_io() {
+        use tokio::io::{AsyncRead, ReadBuf};
+        let (a, _b) = pair();
+        let connection = H3Connection::new(a);
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        let mut bytes = [0];
+        let mut buf = ReadBuf::new(&mut bytes);
+        poll_fn(|cx| {
+            assert!(
+                std::pin::Pin::new(&mut recv)
+                    .poll_read(cx, &mut buf)
+                    .is_pending()
+            );
+            Poll::Ready(())
+        })
+        .await;
+        connection.close(Error::H3_INTERNAL_ERROR);
+        assert_eq!(connection.bi.len(), 0);
+        let result = poll_fn(|cx| std::pin::Pin::new(&mut recv).poll_read(cx, &mut buf)).await;
+        assert_eq!(Error::from(result.unwrap_err()), Error::H3_INTERNAL_ERROR);
+        assert_eq!(
+            Error::from(send.write_all(b"x").await.unwrap_err()),
+            Error::H3_INTERNAL_ERROR
+        );
+        drop(connection);
+        assert_eq!(
+            Error::from(send.flush().await.unwrap_err()),
+            Error::H3_INTERNAL_ERROR
+        );
     }
 
     #[tokio::test]
@@ -957,6 +1227,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_goaway_wait_keeps_partial_frame_owned_by_driver() {
+        use tokio::io::AsyncReadExt;
+
+        use crate::protocol::stream::control;
+
+        let (peer, transport) = pair();
+        let connection = H3Connection::new(transport);
+        let (_, mut recv) = peer.accept_uni_stream().await.unwrap();
+        assert_eq!(recv.read_u8().await.unwrap(), 0);
+        assert!(matches!(
+            control::read(&mut recv, true).await.unwrap(),
+            H3Frame::Settings(_)
+        ));
+        connection
+            .uni
+            .goaway
+            .state
+            .lock()
+            .unwrap()
+            .accepted_boundary = 64;
+
+        let mut sending = Box::pin(connection.goaway());
+        poll_fn(|cx| {
+            assert!(sending.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        // This four-byte frame cannot fit in the three-byte transport buffer.
+        assert_eq!(recv.read_u8().await.unwrap(), 7);
+        drop(sending);
+        let mut remainder = [0; 3];
+        recv.read_exact(&mut remainder).await.unwrap();
+        assert_eq!(remainder, [2, 0x40, 0x40]);
+        assert_eq!(connection.error(), None);
+
+        let (sent, received) = tokio::join!(connection.goaway(), control::read(&mut recv, false));
+        sent.unwrap();
+        let H3Frame::Goaway(frame) = received.unwrap() else {
+            panic!()
+        };
+        assert_eq!(frame.payload.id.into_u64(), 64);
+        assert_eq!(connection.error(), None);
+    }
+
+    #[tokio::test]
+    async fn goaway_write_failure_closes_connection() {
+        use tokio::io::AsyncReadExt;
+
+        use crate::protocol::stream::control;
+
+        let (peer, transport) = pair();
+        let connection = H3Connection::new(transport);
+        let (_, mut recv) = peer.accept_uni_stream().await.unwrap();
+        assert_eq!(recv.read_u8().await.unwrap(), 0);
+        control::read(&mut recv, true).await.unwrap();
+        drop(recv);
+        assert_eq!(
+            connection.goaway().await,
+            Err(Error::H3_CLOSED_CRITICAL_STREAM)
+        );
+        assert_eq!(
+            connection.closed().await,
+            Err(Error::H3_CLOSED_CRITICAL_STREAM)
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_goaways_follow_settings() {
         let (a, b) = pair();
         let client = H3Connection::new(a);
@@ -993,18 +1330,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_pending_initialization_does_not_leak_driver() {
+    async fn dropping_connection_during_initialization_closes_before_aborting_driver() {
         let (a, _b) = pair();
         let connection = H3Connection::new(a);
         let qpack = connection.qpack().clone();
         // The tiny transport buffer leaves SETTINGS partially written.
         tokio::task::yield_now().await;
-        connection.task.abort();
-        assert_eq!(
-            connection.closed().await,
-            Err(Error::H3_CLOSED_CRITICAL_STREAM)
-        );
-        assert_eq!(qpack.error(), Some(Error::H3_CLOSED_CRITICAL_STREAM));
+        drop(connection);
+        assert_eq!(qpack.error(), Some(Error::H3_NO_ERROR));
     }
 
     #[tokio::test]

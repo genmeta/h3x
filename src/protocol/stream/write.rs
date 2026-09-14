@@ -1,81 +1,90 @@
 use std::{
-    io, mem,
+    io,
     pin::Pin,
-    task::{Context, Poll, Waker},
+    sync::Arc,
+    task::{Context, Poll},
 };
 
 use tokio::io::AsyncWrite;
 
-use crate::protocol::frame::Goaway;
+use super::{StreamState, bi::BiStream};
+use crate::{Error, protocol::frame::Goaway};
 
-pub enum H3WriteStream<WS> {
-    Idle(u64, WS),
-    Polling(u64, WS, Waker),
-    Goaway(u64, Goaway),
-    Transition,
+/// Write handle for a stream owned by the connection.
+/// `R` is the paired transport reader; standalone writers use `()`.
+pub struct H3WriteStream<W, R = ()> {
+    pub(super) stream: Arc<BiStream<R, W>>,
 }
 
-impl<WS> H3WriteStream<WS> {
-    pub fn new(stream_id: u64, stream: WS) -> Self {
-        Self::Idle(stream_id, stream)
+impl<W> H3WriteStream<W> {
+    pub fn new(stream_id: u64, stream: W) -> Self {
+        Self {
+            stream: Arc::new(BiStream::new(
+                stream_id,
+                StreamState::Closed(Error::H3_NO_ERROR),
+                StreamState::Idle(stream),
+            )),
+        }
     }
+}
+
+impl<W, R> H3WriteStream<W, R> {
     pub fn stream_id(&self) -> u64 {
-        match self {
-            Self::Idle(id, _) | Self::Polling(id, _, _) | Self::Goaway(id, _) => *id,
-            Self::Transition => unreachable!(),
-        }
+        self.stream.id
     }
+
     pub fn on_recv(&mut self, goaway: Goaway) {
-        let id = self.stream_id();
-        if let Self::Polling(_, _, waker) = mem::replace(self, Self::Goaway(id, goaway)) {
-            waker.wake();
-        }
+        self.stream.terminate_write(StreamState::Goaway(goaway));
     }
 }
 
-impl<WS: AsyncWrite + Unpin> H3WriteStream<WS> {
-    fn poll_io<T>(
+impl<W: AsyncWrite + Unpin, R> H3WriteStream<W, R> {
+    fn poll_io<O>(
         &mut self,
         cx: &mut Context<'_>,
-        poll: impl FnOnce(Pin<&mut WS>, &mut Context<'_>) -> Poll<io::Result<T>>,
-    ) -> Poll<io::Result<T>> {
-        match mem::replace(self, Self::Transition) {
-            Self::Idle(id, mut ws) | Self::Polling(id, mut ws, _) => {
-                match poll(Pin::new(&mut ws), cx) {
-                    Poll::Pending => {
-                        *self = Self::Polling(id, ws, cx.waker().clone());
-                        Poll::Pending
-                    }
-                    Poll::Ready(result) => {
-                        *self = Self::Idle(id, ws);
-                        Poll::Ready(result)
-                    }
-                }
-            }
-            Self::Goaway(id, goaway) => {
-                *self = Self::Goaway(id, goaway);
-                Poll::Ready(Err(crate::Error::H3_REQUEST_REJECTED.into()))
-            }
-            Self::Transition => unreachable!(),
+        finish: bool,
+        poll: impl FnOnce(Pin<&mut W>, &mut Context<'_>) -> Poll<io::Result<O>>,
+    ) -> Poll<io::Result<O>> {
+        let mut state = self.stream.send.lock().unwrap();
+        let result = state.poll_io(cx, poll);
+        if finish && matches!(result, Poll::Ready(Ok(_))) {
+            state.terminate(StreamState::Finished);
         }
+        result
     }
 }
 
-impl<WS: AsyncWrite + Unpin> AsyncWrite for H3WriteStream<WS> {
+impl<W: AsyncWrite + Unpin, R> AsyncWrite for H3WriteStream<W, R> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.get_mut().poll_io(cx, |ws, cx| ws.poll_write(cx, buf))
+        self.get_mut()
+            .poll_io(cx, false, |send, cx| send.poll_write(cx, buf))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().poll_io(cx, |ws, cx| ws.poll_flush(cx))
+        if matches!(*self.stream.send.lock().unwrap(), StreamState::Finished) {
+            return Poll::Ready(Ok(()));
+        }
+        self.get_mut()
+            .poll_io(cx, false, |send, cx| send.poll_flush(cx))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().poll_io(cx, |ws, cx| ws.poll_shutdown(cx))
+        if matches!(*self.stream.send.lock().unwrap(), StreamState::Finished) {
+            return Poll::Ready(Ok(()));
+        }
+        self.get_mut()
+            .poll_io(cx, true, |send, cx| send.poll_shutdown(cx))
+    }
+}
+
+impl<W, R> Drop for H3WriteStream<W, R> {
+    fn drop(&mut self) {
+        self.stream
+            .terminate_write(StreamState::Closed(Error::H3_REQUEST_CANCELLED));
     }
 }
 
@@ -95,11 +104,13 @@ mod tests {
     use crate::{Error, protocol::stream::H3ReadStream};
     #[derive(Default)]
     struct Wakes(AtomicUsize);
+
     impl Wake for Wakes {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
+
     #[test]
     fn goaway_wakes_pending_read_and_errors_all_write_operations() {
         let wakes = Arc::new(Wakes::default());
@@ -115,7 +126,7 @@ mod tests {
                 .poll_read(&mut cx, &mut buf)
                 .is_pending()
         );
-        recv.on_recv(Goaway {
+        recv.recv_goaway(Goaway {
             id: VarInt::from_u32(0),
         });
         assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
@@ -136,7 +147,9 @@ mod tests {
             );
         }
     }
+
     struct PendingWriter;
+
     impl AsyncWrite for PendingWriter {
         fn poll_write(
             self: Pin<&mut Self>,
@@ -145,13 +158,16 @@ mod tests {
         ) -> Poll<io::Result<usize>> {
             Poll::Pending
         }
+
         fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Pending
         }
+
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Pending
         }
     }
+
     #[test]
     fn pending_write_flush_and_shutdown_wake_the_latest_waiter() {
         for operation in 0..3 {
@@ -185,30 +201,48 @@ mod tests {
             assert_eq!(Error::from(error), Error::H3_REQUEST_REJECTED);
         }
     }
+
     #[tokio::test]
-    async fn original_variants_return_to_idle_after_ready_io() {
+    async fn stream_state_returns_to_idle_after_ready_io() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut recv =
-            H3ReadStream::Polling(4, std::io::Cursor::new(vec![7]), Waker::noop().clone());
+        let mut recv = H3ReadStream::new(4, std::io::Cursor::new(vec![7]));
+        *recv.stream.recv.lock().unwrap() =
+            StreamState::Polling(std::io::Cursor::new(vec![7]), Waker::noop().clone());
         let mut bytes = [0];
         recv.read_exact(&mut bytes).await.unwrap();
         assert_eq!(bytes, [7]);
-        assert!(matches!(recv, H3ReadStream::Idle(4, _)));
-        recv.on_recv(Goaway {
+        assert!(matches!(
+            *recv.stream.recv.lock().unwrap(),
+            StreamState::Idle(_)
+        ));
+        recv.recv_goaway(Goaway {
             id: VarInt::from_u32(4),
         });
-        assert!(matches!(recv, H3ReadStream::Goaway(4, _)));
+        assert!(matches!(
+            *recv.stream.recv.lock().unwrap(),
+            StreamState::Goaway(_)
+        ));
         assert_eq!(recv.stream_id(), 4);
-        let mut send = H3WriteStream::Polling(4, Vec::new(), Waker::noop().clone());
+        let mut send = H3WriteStream::new(4, Vec::new());
+        *send.stream.send.lock().unwrap() = StreamState::Polling(Vec::new(), Waker::noop().clone());
         send.write_all(b"x").await.unwrap();
-        assert!(matches!(send, H3WriteStream::Idle(4, _)));
+        assert!(matches!(
+            *send.stream.send.lock().unwrap(),
+            StreamState::Idle(_)
+        ));
         send.flush().await.unwrap();
         send.shutdown().await.unwrap();
-        assert!(matches!(send, H3WriteStream::Idle(4, _)));
+        assert!(matches!(
+            *send.stream.send.lock().unwrap(),
+            StreamState::Finished
+        ));
         send.on_recv(Goaway {
             id: VarInt::from_u32(4),
         });
-        assert!(matches!(send, H3WriteStream::Goaway(4, _)));
+        assert!(matches!(
+            *send.stream.send.lock().unwrap(),
+            StreamState::Finished
+        ));
         assert_eq!(send.stream_id(), 4);
     }
 }

@@ -378,11 +378,13 @@ mod tests {
             decoder.on_encoder_instruction(instruction).unwrap();
         }
     }
+
     #[derive(Debug, PartialEq)]
     enum DecodeResult {
         Decoded(Vec<Field>),
         Blocked { required_insert_count: u64 },
     }
+
     fn decode(decoder: &mut Decoder, id: u64, bytes: Bytes) -> Result<DecodeResult> {
         let (rest, prefix) = decoder.read_prefix(&bytes)?;
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());

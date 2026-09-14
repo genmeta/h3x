@@ -94,6 +94,7 @@ impl Qpack {
             closed: Notify::new(),
         })
     }
+
     pub(crate) fn configure(&self, peer: Settings, max_fields: u64) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         state.encoder.apply_peer_settings(peer)?;
@@ -215,6 +216,7 @@ impl Qpack {
             self.close(error);
         }
     }
+
     pub(crate) async fn receive_encoder<R: AsyncRead + Unpin>(&self, recv: &mut R) -> Result<()> {
         loop {
             let instruction = EncoderInstruction::read(recv).await?;
@@ -226,6 +228,7 @@ impl Qpack {
             self.decoder_ready.notify_one();
         }
     }
+
     pub(crate) async fn receive_decoder<R: AsyncRead + Unpin>(&self, recv: &mut R) -> Result<()> {
         loop {
             let instruction = DecoderInstruction::read(recv).await?;
@@ -243,6 +246,7 @@ impl Qpack {
             }
         }
     }
+
     pub(crate) async fn send_encoder<W: AsyncWrite + Unpin>(&self, send: &mut W) -> Result<()> {
         send.write_all(&[2])
             .await
@@ -277,6 +281,7 @@ impl Qpack {
             }
         }
     }
+
     pub(crate) async fn send_decoder<W: AsyncWrite + Unpin>(&self, send: &mut W) -> Result<()> {
         send.write_all(&[3])
             .await
@@ -303,6 +308,7 @@ impl Qpack {
         }
     }
 }
+
 impl Default for Qpack {
     fn default() -> Self {
         Self::new(Settings::default(), Settings::default(), 0).unwrap()

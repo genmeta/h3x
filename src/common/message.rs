@@ -72,6 +72,7 @@ impl<B> Message<B> {
         fields.sort_by_key(|field| !field.name.starts_with(b":"));
         fields
     }
+
     pub(crate) fn headers(&self) -> impl Iterator<Item = (&str, &HeaderValue)> {
         self.headers
             .iter()
@@ -209,18 +210,21 @@ impl<B> ReadRequest for Message<B> {
         )
         .expect("invalid :method")
     }
+
     fn authority(&self) -> String {
         self.headers
             .get(":authority")
             .map_or("", |value| value.to_str().expect("invalid :authority"))
             .to_owned()
     }
+
     fn path(&self) -> String {
         self.headers
             .get(":path")
             .map_or("", |value| value.to_str().expect("invalid :path"))
             .to_owned()
     }
+
     fn scheme(&self) -> String {
         self.headers
             .get(":scheme")

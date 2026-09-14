@@ -31,14 +31,15 @@ pub type Request<B = Bytes> = crate::common::request::Request<Write, B>;
 pub type Response = crate::common::Response<Read>;
 
 /// Send one request and read its response on an existing bidirectional stream.
-pub async fn request<RS, WS, R>(
+pub async fn request<RS, WS, R, RW, SR>(
     request: R,
-    recv: H3ReadStream<RS>,
-    send: H3WriteStream<WS>,
+    recv: H3ReadStream<RS, RW>,
+    send: H3WriteStream<WS, SR>,
     qpack: Arc<Qpack>,
 ) -> Result<Response>
 where
     RS: AsyncRead + Unpin + Send + 'static,
+    RW: Send + 'static,
     WS: AsyncWrite + Unpin,
     R: Into<common::Request<Write>>,
 {
@@ -58,9 +59,9 @@ where
     Ok(response)
 }
 
-async fn write_bytes_request<WS: AsyncWrite + Unpin>(
+async fn write_bytes_request<WS: AsyncWrite + Unpin, SR>(
     req: &Request<Bytes>,
-    mut ws: H3WriteStream<WS>,
+    mut ws: H3WriteStream<WS, SR>,
     qpack: &Qpack,
 ) -> Result<()> {
     let (fields, body) = {
@@ -85,9 +86,9 @@ async fn write_bytes_request<WS: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn write_streaming_request<WS: AsyncWrite + Unpin>(
+async fn write_streaming_request<WS: AsyncWrite + Unpin, SR>(
     req: &Request<ArcWndBuf>,
-    mut ws: H3WriteStream<WS>,
+    mut ws: H3WriteStream<WS, SR>,
     qpack: &Qpack,
 ) -> Result<()> {
     let mut body = req.message.0.lock().unwrap().body_stream().cancel_on_drop();
@@ -100,8 +101,9 @@ async fn write_streaming_request<WS: AsyncWrite + Unpin>(
     body::write_body(
         &mut body,
         &mut ws,
-        BodyMode::Allowed {
-            content_length: length,
+        match length {
+            Some(content_length) => BodyMode::Length { content_length },
+            None => BodyMode::Infinity,
         },
     )
     .await?;
@@ -110,8 +112,8 @@ async fn write_streaming_request<WS: AsyncWrite + Unpin>(
 }
 
 /// Reads ordinary responses; HEAD and CONNECT semantics require request-method input.
-async fn read_response<RS: AsyncRead + Unpin + Send + 'static>(
-    rs: H3ReadStream<RS>,
+async fn read_response<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'static>(
+    rs: H3ReadStream<RS, RW>,
     qpack: Arc<Qpack>,
     method: Option<http::Method>,
 ) -> Result<crate::common::Response<Read>> {
@@ -143,7 +145,7 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static>(
         {
             return Err(Error::H3_MESSAGE_ERROR);
         }
-        let mode = BodyMode::response(method.as_ref(), parts.status, length);
+        let mode = BodyMode::resolve(&parts, method.as_ref())?;
         Ok((parts, mode))
     }
     .await
@@ -200,7 +202,6 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static>(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use tokio::io::AsyncReadExt;
@@ -212,6 +213,7 @@ mod tests {
     ) -> Result<()> {
         super::write_bytes_request(request, H3WriteStream::new(0, send), &Qpack::default()).await
     }
+
     async fn write_streaming_request<W: AsyncWrite + Unpin>(
         request: &Request<ArcWndBuf>,
         send: W,
@@ -219,6 +221,7 @@ mod tests {
         super::write_streaming_request(request, H3WriteStream::new(0, send), &Qpack::default())
             .await
     }
+
     async fn read_response<R: AsyncRead + Unpin + Send + 'static>(recv: R) -> Result<Response> {
         super::read_response(H3ReadStream::new(0, recv), Arc::new(Qpack::default()), None).await
     }
@@ -297,6 +300,7 @@ mod tests {
             Error::H3_INTERNAL_ERROR
         );
     }
+
     #[tokio::test]
     async fn streaming_request_frames_and_errors() {
         for (body, length, valid) in [
@@ -373,6 +377,7 @@ mod tests {
         assert_eq!(sent.unwrap_err(), Error::H3_INTERNAL_ERROR);
         assert_eq!(produced.unwrap_err(), Error::H3_REQUEST_CANCELLED);
     }
+
     #[tokio::test]
     async fn response_content_length_and_streaming() {
         fn headers(output: &mut Vec<u8>, status: &'static str, length: Option<&'static str>) {
@@ -502,8 +507,9 @@ mod tests {
                 body::read_body(
                     &mut BufReader::new(H3ReadStream::new(0, &mut input)),
                     &mut body,
-                    BodyMode::Allowed {
-                        content_length: length
+                    match length {
+                        Some(content_length) => BodyMode::Length { content_length },
+                        None => BodyMode::Infinity,
                     },
                     &Qpack::default()
                 )
@@ -514,14 +520,11 @@ mod tests {
         }
         let mut input = &[7, 1, 0][..]; // GOAWAY is forbidden in a message body.
         let mut body = Vec::new();
-        let length = None;
         assert_eq!(
             body::read_body(
                 &mut BufReader::new(H3ReadStream::new(0, &mut input)),
                 &mut body,
-                BodyMode::Allowed {
-                    content_length: length
-                },
+                BodyMode::Infinity,
                 &Qpack::default()
             )
             .await,

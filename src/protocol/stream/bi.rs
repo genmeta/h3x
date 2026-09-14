@@ -1,0 +1,243 @@
+//! Connection ownership and GOAWAY dispatch for bidirectional streams.
+use std::{
+    collections::HashMap,
+    mem,
+    sync::{Arc, Mutex},
+};
+
+use qbase::varint::VarInt;
+
+use super::{H3ReadStream, H3WriteStream, StreamState};
+use crate::{
+    Error, Result,
+    protocol::{frame::Goaway, qpack::Qpack},
+};
+
+/// The connection and both application handles refer to this same stream.
+pub(in crate::protocol) struct BiStream<R, W> {
+    pub(super) id: u64,
+    pub(super) recv: Mutex<StreamState<R>>,
+    pub(super) send: Mutex<StreamState<W>>,
+}
+
+impl<R, W> BiStream<R, W> {
+    pub(super) fn new(id: u64, recv: StreamState<R>, send: StreamState<W>) -> Self {
+        Self {
+            id,
+            recv: Mutex::new(recv),
+            send: Mutex::new(send),
+        }
+    }
+
+    pub(super) fn terminate_read(&self, terminal: StreamState<R>) {
+        let waker = {
+            let mut state = self.recv.lock().unwrap();
+            if state.is_terminal() {
+                return;
+            }
+            state.terminate(terminal)
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    pub(super) fn terminate_write(&self, terminal: StreamState<W>) {
+        let waker = {
+            let mut state = self.send.lock().unwrap();
+            if state.is_terminal() {
+                return;
+            }
+            state.terminate(terminal)
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn goaway(&self, goaway: &Goaway) {
+        self.terminate_read(StreamState::Goaway(goaway.clone()));
+        self.terminate_write(StreamState::Goaway(goaway.clone()));
+    }
+
+    fn close(&self, error: Error) {
+        self.terminate_read(StreamState::Closed(error));
+        self.terminate_write(StreamState::Closed(error));
+    }
+}
+
+enum BiStreamsState {
+    Open,
+    Draining { cutoff: u64 },
+    Closed(Error),
+}
+
+pub(in crate::protocol) struct BiStreams<R, W> {
+    // When both locks are needed, hold state before locking streams.
+    state: Mutex<BiStreamsState>,
+    streams: Mutex<HashMap<u64, Arc<BiStream<R, W>>>>,
+}
+
+impl<R, W> Default for BiStreams<R, W> {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(BiStreamsState::Open),
+            streams: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<R, W> BiStreams<R, W> {
+    // Idle connections retain finished entries until the next insert or GOAWAY.
+    pub(in crate::protocol) fn cleanup(&self) {
+        self.streams.lock().unwrap().retain(|_, stream| {
+            !(stream.recv.lock().unwrap().is_terminal()
+                && stream.send.lock().unwrap().is_terminal())
+        });
+    }
+
+    pub(in crate::protocol) fn goaway(&self, id: u64, qpack: &Qpack) {
+        let streams: Vec<_> = {
+            let mut state = self.state.lock().unwrap();
+            let cutoff = match *state {
+                BiStreamsState::Open => id,
+                BiStreamsState::Draining { cutoff } => cutoff.min(id),
+                BiStreamsState::Closed(_) => return,
+            };
+            *state = BiStreamsState::Draining { cutoff };
+            self.streams
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(stream_id, _)| **stream_id >= id)
+                .map(|(_, stream)| Arc::clone(stream))
+                .collect()
+        };
+        let goaway = Goaway {
+            id: VarInt::try_from(id).unwrap(),
+        };
+        for stream in streams {
+            stream.goaway(&goaway);
+            let _ = qpack.cancel(stream.id);
+        }
+        self.cleanup();
+    }
+
+    pub(in crate::protocol) fn close(&self, error: Error) {
+        let (error, streams) = {
+            let mut state = self.state.lock().unwrap();
+            let error = match *state {
+                BiStreamsState::Closed(error) => error,
+                _ => {
+                    *state = BiStreamsState::Closed(error);
+                    error
+                }
+            };
+            (error, mem::take(&mut *self.streams.lock().unwrap()))
+        };
+        for stream in streams.into_values() {
+            stream.close(error);
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::protocol) fn len(&self) -> usize {
+        self.streams.lock().unwrap().len()
+    }
+
+    pub(in crate::protocol) fn insert(
+        &self,
+        id: u64,
+        recv: R,
+        send: W,
+    ) -> Result<(H3WriteStream<W, R>, H3ReadStream<R, W>)> {
+        self.cleanup();
+        let state = self.state.lock().unwrap();
+        match *state {
+            BiStreamsState::Closed(error) => return Err(error),
+            BiStreamsState::Draining { cutoff } if id >= cutoff => {
+                return Err(Error::H3_REQUEST_REJECTED);
+            }
+            _ => {}
+        }
+        let mut streams = self.streams.lock().unwrap();
+        if streams.contains_key(&id) {
+            return Err(Error::H3_ID_ERROR);
+        }
+        let stream = Arc::new(BiStream::new(
+            id,
+            StreamState::Idle(recv),
+            StreamState::Idle(send),
+        ));
+        streams.insert(id, Arc::clone(&stream));
+        Ok((
+            H3WriteStream {
+                stream: Arc::clone(&stream),
+            },
+            H3ReadStream { stream },
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::poll_fn,
+        io,
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
+
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    use super::*;
+
+    struct FailingShutdown(bool);
+
+    impl AsyncWrite for FailingShutdown {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if !self.0 {
+                self.0 = true;
+                Poll::Pending
+            } else {
+                Poll::Ready(Err(Error::H3_REQUEST_REJECTED.into()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_shutdown_keeps_entry_and_failure_reaps_without_dropping_handles() {
+        let streams = Arc::new(BiStreams::default());
+        let (mut send, mut recv) = streams
+            .insert(0, tokio::io::empty(), FailingShutdown(false))
+            .unwrap();
+        assert_eq!(recv.read(&mut [0]).await.unwrap(), 0);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut send).poll_shutdown(&mut cx).is_pending());
+        streams.cleanup();
+        assert_eq!(streams.len(), 1);
+        let error = poll_fn(|cx| Pin::new(&mut send).poll_shutdown(cx))
+            .await
+            .unwrap_err();
+        assert_eq!(Error::from(error), Error::H3_REQUEST_REJECTED);
+        streams.cleanup();
+        assert_eq!(streams.len(), 0);
+        assert_eq!(
+            Error::from(send.flush().await.unwrap_err()),
+            Error::H3_REQUEST_REJECTED
+        );
+        assert_eq!(recv.read(&mut [0]).await.unwrap(), 0);
+    }
+}

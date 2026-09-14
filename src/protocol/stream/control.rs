@@ -1,9 +1,10 @@
 //! Control stream state and frame I/O. Keep futures alive through partial I/O.
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{Mutex as AsyncMutex, Notify},
+    sync::{Mutex as AsyncMutex, mpsc, oneshot},
 };
 
+use super::bi::BiStreams;
 use crate::{
     Error, Result, Role,
     protocol::{
@@ -13,16 +14,18 @@ use crate::{
     },
 };
 
-pub(in crate::protocol) struct Control<S> {
-    pub(in crate::protocol) stream: AsyncMutex<Option<ControlStream<S>>>,
-    pub(in crate::protocol) ready: Notify,
+pub(in crate::protocol) struct Control {
+    pub(in crate::protocol) sender: mpsc::Sender<(H3Frame, oneshot::Sender<Result<()>>)>,
+    pub(in crate::protocol) receiver:
+        AsyncMutex<mpsc::Receiver<(H3Frame, oneshot::Sender<Result<()>>)>>,
 }
 
-impl<S> Default for Control<S> {
+impl Default for Control {
     fn default() -> Self {
+        let (sender, receiver) = mpsc::channel(1);
         Self {
-            stream: AsyncMutex::new(None),
-            ready: Notify::new(),
+            sender,
+            receiver: AsyncMutex::new(receiver),
         }
     }
 }
@@ -41,12 +44,13 @@ impl<S: AsyncWrite + Unpin> ControlStream<S> {
     }
 }
 
-pub(in crate::protocol) async fn receive_control<R: tokio::io::AsyncRead + Unpin>(
+pub(in crate::protocol) async fn receive_control<R: AsyncRead + Unpin, W>(
     recv: &mut R,
     role: &Role,
     settings: &Settings,
     qpack: &Qpack,
     goaway: &Goaway,
+    bi: &BiStreams<R, W>,
 ) -> Result<()> {
     let H3Frame::Settings(frame) = read(recv, true).await? else {
         return Err(Error::H3_MISSING_SETTINGS);
@@ -82,6 +86,9 @@ pub(in crate::protocol) async fn receive_control<R: tokio::io::AsyncRead + Unpin
                     return Err(Error::H3_ID_ERROR);
                 }
                 state.peer = Some(id);
+            }
+            if *role == Role::Client {
+                bi.goaway(id, qpack);
             }
             goaway.changed.notify_waiters();
         }
@@ -162,6 +169,7 @@ mod tests {
             Err(Error::H3_CLOSED_CRITICAL_STREAM)
         );
     }
+
     #[tokio::test]
     async fn control_types_and_unknown_payloads_keep_their_wire_boundaries() {
         use qbase::varint::{VarInt, WriteVarInt};

@@ -119,6 +119,7 @@ impl Clone for ArcWndBuf {
         Self(self.0.clone(), false)
     }
 }
+
 impl Drop for ArcWndBuf {
     fn drop(&mut self) {
         if self.1 {
@@ -126,12 +127,14 @@ impl Drop for ArcWndBuf {
         }
     }
 }
+
 impl ArcWndBuf {
     /// Give this handle responsibility for cancelling unfinished body I/O.
     pub(crate) fn cancel_on_drop(mut self) -> Self {
         self.1 = true;
         self
     }
+
     pub(crate) fn complete(&mut self) {
         self.1 = false;
     }
@@ -230,6 +233,7 @@ mod tests {
             self.poll_read(cx, &mut buf).map_ok(|()| buf.filled().len())
         }
     }
+
     impl<T: AsyncRead + Unpin> TestRead for T {}
 
     #[derive(Default)]
@@ -418,6 +422,7 @@ mod tests {
     fn zero_capacity_is_rejected() {
         WndBuf::new(0);
     }
+
     #[tokio::test]
     async fn body_cancellation_belongs_only_to_the_operation_handle() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
