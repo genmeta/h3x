@@ -61,6 +61,60 @@ async fn server_views_share_buffered_and_streaming_messages() {
 }
 
 #[tokio::test]
+async fn streaming_response_termination_reaches_the_producer() {
+    use std::{
+        future::Future,
+        task::{Context, Waker},
+        time::Duration,
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for (error, started) in [
+            (Error::H3_REQUEST_CANCELLED, true),
+            (Error::H3_REQUEST_REJECTED, true),
+            (Error::H3_INTERNAL_ERROR, true),
+            (Error::H3_INTERNAL_ERROR, false),
+        ] {
+            let mut response = Response::<Bytes>::default();
+            response.set_status(StatusCode::OK);
+            let response = response.streaming(1);
+            let mut producer = response.clone();
+            let qpack = Arc::new(Qpack::default());
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let mut sending = Box::pin(super::respond(
+                response,
+                H3WriteStream::new(0, tokio::io::sink())
+                    .with_stop_signal(async move { stopped.await.unwrap() }),
+                qpack.clone(),
+                &Method::GET,
+            ));
+            if started {
+                assert!(
+                    sending
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+            }
+            if error == Error::H3_REQUEST_CANCELLED {
+                drop(sending);
+            } else {
+                if error == Error::H3_REQUEST_REJECTED {
+                    stop.send(error).unwrap();
+                } else {
+                    qpack.on_error(error);
+                }
+                assert_eq!(sending.await, Err(error));
+            }
+            assert_eq!(producer.write(b"x").await, Err(error));
+            assert_eq!(producer.finish().await, Err(error));
+        }
+    })
+    .await
+    .expect("response termination must notify an idle body producer");
+}
+
+#[tokio::test]
 async fn dropping_streaming_request_stops_a_pump_waiting_on_network() {
     let (mut send, recv) = duplex(64);
     send.write_all(&request_frames(b"", None)).await.unwrap();

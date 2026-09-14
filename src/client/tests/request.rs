@@ -1,17 +1,27 @@
 use super::*;
 
-async fn write_bytes_request<W: AsyncWrite + Unpin>(
+async fn write_bytes_request<W: AsyncWrite + Unpin + Send + 'static>(
     request: &Request<Bytes>,
     send: W,
 ) -> Result<()> {
-    super::write_bytes_request(request, H3WriteStream::new(0, send), &Qpack::default()).await
+    super::write_bytes_request(
+        request,
+        H3WriteStream::new(0, send),
+        Arc::new(Qpack::default()),
+    )?
+    .await
 }
 
-async fn write_streaming_request<W: AsyncWrite + Unpin>(
+async fn write_streaming_request<W: AsyncWrite + Unpin + Send + 'static>(
     request: &Request<ArcWndBuf>,
     send: W,
 ) -> Result<()> {
-    super::write_streaming_request(request, H3WriteStream::new(0, send), &Qpack::default()).await
+    super::write_streaming_request(
+        request,
+        H3WriteStream::new(0, send),
+        Arc::new(Qpack::default()),
+    )?
+    .await
 }
 
 fn be_request(input: &[u8]) -> Result<(&[u8], http::request::Parts)> {
@@ -63,11 +73,13 @@ async fn request_frames_and_errors() {
     let req = Request::<Bytes>::get("https://example.com/")
         .unwrap()
         .header(header::CONTENT_LENGTH, HeaderValue::from_static("1"));
-    let mut output = Vec::new();
+    let (writer, mut reader) = duplex(3);
     assert_eq!(
-        write_bytes_request(&req, &mut output).await.unwrap_err(),
+        write_bytes_request(&req, writer).await.unwrap_err(),
         Error::H3_MESSAGE_ERROR
     );
+    let mut output = Vec::new();
+    reader.read_to_end(&mut output).await.unwrap();
     assert!(output.is_empty());
     let req = Request::<Bytes>::get("https://example.com/").unwrap();
     let (writer, reader) = duplex(3);
@@ -115,7 +127,7 @@ async fn streaming_request_frames_and_errors() {
             assert_eq!(sent.unwrap_err(), Error::H3_MESSAGE_ERROR);
             assert_eq!(
                 producer.write(b"x").await.unwrap_err(),
-                Error::H3_REQUEST_CANCELLED
+                Error::H3_MESSAGE_ERROR
             );
             continue;
         }
@@ -152,5 +164,5 @@ async fn streaming_request_frames_and_errors() {
         producer.write(b"b").await
     });
     assert_eq!(sent.unwrap_err(), Error::H3_INTERNAL_ERROR);
-    assert_eq!(produced.unwrap_err(), Error::H3_REQUEST_CANCELLED);
+    assert_eq!(produced.unwrap_err(), Error::H3_INTERNAL_ERROR);
 }

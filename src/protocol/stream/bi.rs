@@ -1,11 +1,14 @@
 //! Connection ownership and GOAWAY dispatch for bidirectional streams.
 use std::{
     collections::HashMap,
+    future::Future,
     mem,
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
 use qbase::varint::VarInt;
+use tokio::sync::Notify;
 
 use super::{H3ReadStream, H3WriteStream, StreamState};
 use crate::{
@@ -13,19 +16,35 @@ use crate::{
     protocol::{frame::Goaway, qpack::Qpack},
 };
 
+type StopSignal = Pin<Box<dyn Future<Output = Error> + Send>>;
+type ErrorHandler = Box<dyn FnOnce(Error) + Send>;
+
 /// The connection and both application handles refer to this same stream.
 pub(crate) struct BiStream<R, W> {
     pub(super) id: u64,
     pub(super) recv: Mutex<StreamState<R>>,
     pub(super) send: Mutex<StreamState<W>>,
+    pub(super) send_changed: Notify,
+    pub(super) send_stopped: Mutex<Option<StopSignal>>,
+    pub(super) send_error_handler: Mutex<Option<ErrorHandler>>,
+    finished: Option<Arc<Notify>>,
 }
 
 impl<R, W> BiStream<R, W> {
-    pub(super) fn new(id: u64, recv: StreamState<R>, send: StreamState<W>) -> Self {
+    pub(super) fn new(
+        id: u64,
+        recv: StreamState<R>,
+        send: StreamState<W>,
+        finished: Option<Arc<Notify>>,
+    ) -> Self {
         Self {
             id,
             recv: Mutex::new(recv),
             send: Mutex::new(send),
+            send_changed: Notify::new(),
+            send_stopped: Mutex::new(None),
+            send_error_handler: Mutex::new(None),
+            finished,
         }
     }
 
@@ -40,6 +59,7 @@ impl<R, W> BiStream<R, W> {
         if let Some(waker) = waker {
             waker.wake();
         }
+        self.notify_if_finished();
     }
 
     pub(super) fn terminate_write(&self, terminal: StreamState<W>) {
@@ -52,6 +72,32 @@ impl<R, W> BiStream<R, W> {
         };
         if let Some(waker) = waker {
             waker.wake();
+        }
+        self.notify_write();
+    }
+
+    pub(super) fn notify_write(&self) {
+        let (result, notify) = {
+            let state = self.send.lock().unwrap();
+            let Some(result) = state.result() else {
+                return;
+            };
+            (result, self.send_error_handler.lock().unwrap().take())
+        };
+        // A handler may wake application I/O; release the stream locks first.
+        if let (Err(error), Some(notify)) = (result, notify) {
+            notify(error);
+        }
+        self.send_changed.notify_waiters();
+        self.notify_if_finished();
+    }
+
+    pub(super) fn notify_if_finished(&self) {
+        if let Some(finished) = &self.finished
+            && self.recv.lock().unwrap().is_terminal()
+            && self.send.lock().unwrap().is_terminal()
+        {
+            finished.notify_waiters();
         }
     }
 
@@ -76,6 +122,7 @@ pub(crate) struct BiStreams<R, W> {
     // When both locks are needed, hold state before locking streams.
     state: Mutex<BiStreamsState>,
     streams: Mutex<HashMap<u64, Arc<BiStream<R, W>>>>,
+    stream_finished: Arc<Notify>,
 }
 
 impl<R, W> Default for BiStreams<R, W> {
@@ -83,11 +130,25 @@ impl<R, W> Default for BiStreams<R, W> {
         Self {
             state: Mutex::new(BiStreamsState::Open),
             streams: Mutex::new(HashMap::new()),
+            stream_finished: Arc::new(Notify::new()),
         }
     }
 }
 
 impl<R, W> BiStreams<R, W> {
+    /// Wait for both halves of every admitted stream to finish or be cancelled.
+    /// The caller must stop admitting streams before starting this wait.
+    pub(crate) async fn drained(&self) {
+        loop {
+            let finished = self.stream_finished.notified();
+            self.cleanup();
+            if self.streams.lock().unwrap().is_empty() {
+                return;
+            }
+            finished.await;
+        }
+    }
+
     // Idle connections retain finished entries until the next insert or GOAWAY.
     pub(crate) fn cleanup(&self) {
         self.streams.lock().unwrap().retain(|_, stream| {
@@ -163,6 +224,7 @@ impl<R, W> BiStreams<R, W> {
             id,
             StreamState::Idle(recv),
             StreamState::Idle(send),
+            Some(Arc::clone(&self.stream_finished)),
         ));
         streams.insert(id, Arc::clone(&stream));
         Ok((

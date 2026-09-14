@@ -1,18 +1,49 @@
-use std::{collections::VecDeque, future::poll_fn, task::Poll};
+use std::{
+    collections::VecDeque,
+    future::poll_fn,
+    sync::{Arc, Mutex},
+    task::Poll,
+};
 
 use bytes::Bytes;
+use qbase::varint::VarInt;
 use tokio::{
     io::{AsyncWriteExt, DuplexStream, duplex},
-    sync::Notify,
+    sync::{Notify, oneshot},
 };
 
-use super::*;
+use super::{H3Connection, goaway::GoawayState};
 use crate::{
-    ReadRequest, ReadResponse, ReadStream, Role, WriteBody, WriteRequest, WriteResponse,
-    WriteStream, client,
+    Error, ReadRequest, ReadResponse, ReadStream, Result, Role, Transport, WriteBody, WriteRequest,
+    WriteResponse, WriteStream, client,
     common::{self, Write},
+    protocol::{
+        frame::{self, Frame, H3Frame},
+        qpack::{self, Qpack},
+    },
     server,
 };
+
+mod close;
+mod control;
+mod goaway;
+mod messages;
+mod streams;
+mod uni;
+
+impl<T: Transport> H3Connection<T> {
+    pub(crate) fn peer_settings_received(&self) -> bool {
+        self.uni.settings.peer.lock().unwrap().is_some()
+    }
+
+    pub(crate) fn received_goaway(&self) -> Option<u64> {
+        self.uni.goaway.state.lock().unwrap().peer()
+    }
+
+    pub fn qpack(&self) -> &Arc<Qpack> {
+        &self.uni.qpack
+    }
+}
 
 struct Cell<T>(Mutex<T>);
 
@@ -60,15 +91,17 @@ impl<S> Queue<S> {
         }
     }
 }
-type Bi = (u64, (DuplexStream, DuplexStream));
+type Recv = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+type Bi = (u64, (Recv, DuplexStream));
 struct Memory {
-    incoming_uni: Arc<Queue<(u64, DuplexStream)>>,
-    outgoing_uni: Arc<Queue<(u64, DuplexStream)>>,
+    incoming_uni: Arc<Queue<(u64, Recv)>>,
+    outgoing_uni: Arc<Queue<(u64, Recv)>>,
     incoming_bi: Arc<Queue<Bi>>,
     outgoing_bi: Arc<Queue<Bi>>,
     next_uni: Cell<u64>,
     next_bi: Cell<u64>,
     blocked_open: Cell<bool>,
+    close_calls: Cell<usize>,
     ended: Arc<(Cell<Option<Error>>, Notify)>,
 }
 
@@ -87,6 +120,7 @@ fn pair() -> (Memory, Memory) {
             next_uni: Cell::new(2),
             next_bi: Cell::new(0),
             blocked_open: Cell::new(false),
+            close_calls: Cell::new(0),
             ended: ended.clone(),
         },
         Memory {
@@ -97,6 +131,7 @@ fn pair() -> (Memory, Memory) {
             next_uni: Cell::new(3),
             next_bi: Cell::new(1),
             blocked_open: Cell::new(false),
+            close_calls: Cell::new(0),
             ended,
         },
     )
@@ -110,14 +145,20 @@ impl Transport for Memory {
             Role::Server
         }
     }
-    type Recv = DuplexStream;
+    type Recv = Recv;
     type Send = DuplexStream;
-    fn stop(recv: &mut DuplexStream, _: u64) {
-        *recv = duplex(1).0;
+    fn stop(recv: &mut Recv, _: u64) {
+        *recv = Box::new(duplex(1).0);
     }
 
     fn cancel(send: &mut DuplexStream, _: u64) {
         *send = duplex(1).0;
+    }
+
+    fn is_stream_reset(error: &std::io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|source| source.is::<qbase::frame::ResetStreamError>())
     }
 
     async fn open_bi_stream(&self) -> Result<Option<Bi>> {
@@ -128,8 +169,9 @@ impl Transport for Memory {
         self.next_bi.set(id + 4);
         let (send, peer_recv) = duplex(3);
         let (peer_send, recv) = duplex(3);
-        self.outgoing_bi.push((id, (peer_recv, peer_send)));
-        Ok(Some((id, (recv, send))))
+        self.outgoing_bi
+            .push((id, (Box::new(peer_recv), peer_send)));
+        Ok(Some((id, (Box::new(recv), send))))
     }
 
     async fn accept_bi_stream(&self) -> Result<Bi> {
@@ -140,15 +182,16 @@ impl Transport for Memory {
         let id = self.next_uni.get();
         self.next_uni.set(id + 4);
         let (send, recv) = duplex(3);
-        self.outgoing_uni.push((id, recv));
+        self.outgoing_uni.push((id, Box::new(recv)));
         Ok(Some((id, send)))
     }
 
-    async fn accept_uni_stream(&self) -> Result<(u64, DuplexStream)> {
+    async fn accept_uni_stream(&self) -> Result<(u64, Recv)> {
         Ok(self.incoming_uni.pop().await)
     }
 
     fn close(&self, _: String, _: u64) -> Result<()> {
+        self.close_calls.set(self.close_calls.get() + 1);
         if self.ended.0.get().is_none() {
             self.ended.0.set(Some(Error::H3_NO_ERROR));
         }
@@ -167,6 +210,35 @@ impl Transport for Memory {
             changed.await;
         }
     }
+}
+
+impl Memory {
+    /// Model a transport-owned idle timeout without sending CONNECTION_CLOSE.
+    fn expire(&self) {
+        self.ended.0.set(Some(Error::H3_NO_ERROR));
+        self.ended.1.notify_waiters();
+    }
+}
+
+async fn assert_waiting_for_idle(connection: &H3Connection<Memory>) {
+    connection.bi.drained().await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), connection.closed())
+            .await
+            .is_err()
+    );
+    assert_eq!(connection.transport.close_calls.get(), 0);
+    assert_eq!(connection.transport.ended.0.get(), None);
+    assert_eq!(connection.error(), None);
+    assert_eq!(connection.bi.len(), 0);
+    assert!(!connection.task.is_finished());
+}
+
+async fn expire_transport(connection: &H3Connection<Memory>) {
+    connection.transport.expire();
+    connection.closed().await.unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(connection.transport.close_calls.get(), 0);
 }
 
 // Test-only adapters keep the existing protocol scenarios readable; public APIs return messages.
@@ -193,58 +265,7 @@ where
 {
     let (send, recv) = connection.accept_bi().await?;
     let request = server::accept(recv, connection.qpack().clone()).await?;
+    let method = request.method();
     let response = handler(request).await?.into();
-    server::respond(response, send, connection.qpack().clone()).await
-}
-
-mod close;
-mod control;
-mod goaway;
-mod messages;
-mod streams;
-mod uni;
-
-impl<T: Transport> H3Connection<T> {
-    pub(crate) fn peer_settings_received(&self) -> bool {
-        self.uni.settings.peer.lock().unwrap().is_some()
-    }
-
-    pub(crate) fn received_goaway(&self) -> Option<u64> {
-        self.uni.goaway.state.lock().unwrap().peer
-    }
-
-    pub fn qpack(&self) -> &Arc<Qpack> {
-        &self.uni.qpack
-    }
-}
-
-#[test]
-fn settings_accept_limits_and_reject_unrepresentable_values() {
-    let max = frame::MAX_BUFFERED_FRAME_PAYLOAD as u64;
-    for (fields, capacity, blocked) in [(0, 0, 0), (max, max, VARINT_MAX)] {
-        let settings = Settings::new(fields, capacity, blocked).unwrap();
-        assert_eq!(
-            settings
-                .local
-                .get(frame::SETTINGS_MAX_FIELD_SECTION_SIZE, 1),
-            fields
-        );
-        assert_eq!(
-            settings
-                .local
-                .get(frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY, 1),
-            capacity
-        );
-        assert_eq!(
-            settings.local.get(frame::SETTINGS_QPACK_BLOCKED_STREAMS, 1),
-            blocked
-        );
-        assert!(settings.peer.lock().unwrap().is_none());
-    }
-    for (fields, capacity, blocked) in [(max + 1, 0, 0), (0, max + 1, 0), (0, 0, VARINT_MAX + 1)] {
-        assert!(matches!(
-            Settings::new(fields, capacity, blocked),
-            Err(Error::H3_SETTINGS_ERROR)
-        ));
-    }
+    server::respond(response, send, connection.qpack().clone(), &method).await
 }

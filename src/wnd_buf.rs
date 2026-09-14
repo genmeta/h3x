@@ -16,6 +16,7 @@ pub(crate) struct WndBuf {
     len: usize,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
+    error_waker: Option<Waker>,
     fin: bool,
 }
 
@@ -30,6 +31,7 @@ impl WndBuf {
             len: 0,
             read_waker: None,
             write_waker: None,
+            error_waker: None,
             fin: false,
         }
     }
@@ -111,45 +113,43 @@ impl AsyncWrite for WndBuf {
 }
 
 /// Shared window; the first error terminates both reading and writing.
-#[derive(Debug)]
-pub struct ArcWndBuf(Arc<Mutex<crate::Result<WndBuf>>>, bool);
-
-impl Clone for ArcWndBuf {
-    fn clone(&self) -> Self {
-        Self(self.0.clone(), false)
-    }
+#[derive(Debug, Clone)]
+pub struct ArcWndBuf {
+    shared: Arc<Mutex<crate::Result<WndBuf>>>,
 }
 
 impl Drop for ArcWndBuf {
     fn drop(&mut self) {
-        if self.1 {
-            self.set_error(crate::Error::H3_REQUEST_CANCELLED);
+        // A pump may be waiting on network I/O when the application's body drops.
+        // Wake it to recheck its weak owner; dropping a clone does not cancel I/O.
+        let waker = match &mut *self.shared.lock().unwrap() {
+            Ok(window) => window.error_waker.take(),
+            Err(_) => None,
+        };
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
 
 impl ArcWndBuf {
-    /// Give this handle responsibility for cancelling unfinished body I/O.
-    pub(crate) fn cancel_on_drop(mut self) -> Self {
-        self.1 = true;
-        self
-    }
-
-    pub(crate) fn complete(&mut self) {
-        self.1 = false;
-    }
-
     pub fn new(capacity: usize) -> Self {
-        Self(Arc::new(Mutex::new(Ok(WndBuf::new(capacity)))), false)
+        Self {
+            shared: Arc::new(Mutex::new(Ok(WndBuf::new(capacity)))),
+        }
     }
 
     pub fn set_error(&self, error: crate::Error) {
-        let (reader, writer) = {
-            let mut state = self.0.lock().unwrap();
+        let (reader, writer, observer) = {
+            let mut state = self.shared.lock().unwrap();
             let Ok(window) = &mut *state else {
                 return;
             };
-            let wakers = (window.read_waker.take(), window.write_waker.take());
+            let wakers = (
+                window.read_waker.take(),
+                window.write_waker.take(),
+                window.error_waker.take(),
+            );
             *state = Err(error);
             wakers
         };
@@ -159,14 +159,18 @@ impl ArcWndBuf {
         if let Some(waker) = writer {
             waker.wake();
         }
+        if let Some(waker) = observer {
+            waker.wake();
+        }
     }
 
-    // Wake the receive pump even when it is waiting on network I/O rather than this window.
-    pub(crate) fn poll_error(&self, cx: &Context<'_>) -> crate::Result<()> {
-        match &mut *self.0.lock().unwrap() {
+    // Observe the producer's FIN and register the pump for errors or ownership changes.
+    // The observer has its own waker, independent of the buffer's reader and writer.
+    pub(crate) fn poll_finished(&self, cx: &Context<'_>) -> crate::Result<bool> {
+        match &mut *self.shared.lock().unwrap() {
             Ok(window) => {
-                window.write_waker = Some(cx.waker().clone());
-                Ok(())
+                window.error_waker = Some(cx.waker().clone());
+                Ok(window.fin)
             }
             Err(error) => Err(*error),
         }
@@ -176,7 +180,7 @@ impl ArcWndBuf {
         &self,
         poll: impl FnOnce(Pin<&mut WndBuf>) -> Poll<io::Result<T>>,
     ) -> Poll<io::Result<T>> {
-        match &mut *self.0.lock().unwrap() {
+        match &mut *self.shared.lock().unwrap() {
             Ok(window) => poll(Pin::new(window)),
             Err(error) => Poll::Ready(Err((*error).into())),
         }
@@ -421,27 +425,5 @@ mod tests {
     #[should_panic(expected = "window capacity must be nonzero")]
     fn zero_capacity_is_rejected() {
         WndBuf::new(0);
-    }
-
-    #[tokio::test]
-    async fn body_cancellation_belongs_only_to_the_operation_handle() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut body = ArcWndBuf::new(1);
-        let owner = body.clone().cancel_on_drop();
-        drop(owner.clone()); // Cloning does not copy cancellation responsibility.
-        body.write_all(b"x").await.unwrap();
-        drop(owner);
-        assert_eq!(
-            crate::Error::from(body.read(&mut [0; 1]).await.unwrap_err()),
-            crate::Error::H3_REQUEST_CANCELLED
-        );
-        let mut body = ArcWndBuf::new(1);
-        let mut owner = body.clone().cancel_on_drop();
-        body.write_all(b"y").await.unwrap();
-        owner.complete();
-        drop(owner);
-        let mut bytes = [0];
-        body.read_exact(&mut bytes).await.unwrap();
-        assert_eq!(bytes, *b"y");
     }
 }

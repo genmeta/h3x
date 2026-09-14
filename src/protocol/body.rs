@@ -100,8 +100,14 @@ pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin, RW>(
                 if remaining.is_some_and(|left| left != 0) {
                     return Err(Error::H3_MESSAGE_ERROR);
                 }
-                headers::trailer_fields(frame.decode(qpack, receive.get_ref().stream_id()).await?)?;
+                let fields = qpack
+                    .decode(receive.get_ref().stream_id(), frame.payload.field_section)
+                    .await?;
+                headers::trailer_fields(fields)?;
                 trailers = true;
+            }
+            H3Frame::Unknown { length, .. } => {
+                frame::skip_payload(receive, length.into_u64()).await?;
             }
             _ => {
                 return Err(Error::H3_FRAME_UNEXPECTED);
@@ -179,9 +185,11 @@ mod tests {
         for (suffix, length, expected) in [
             (&[][..], None, Ok(())),
             (&[][..], Some(0), Ok(())),
+            (&[0x21, 0][..], Some(0), Ok(())),
             (&[][..], Some(1), Err(Error::H3_MESSAGE_ERROR)),
             (trailers.as_slice(), None, Err(Error::H3_FRAME_UNEXPECTED)),
             (&[0, 0][..], None, Err(Error::H3_FRAME_UNEXPECTED)),
+            (&[0x21, 0, 0, 0][..], None, Err(Error::H3_FRAME_UNEXPECTED)),
         ] {
             let encoded = [trailers.as_slice(), suffix].concat();
             let mut input = encoded.as_slice();

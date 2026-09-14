@@ -60,44 +60,31 @@ impl Request<Write, Bytes> {
 }
 
 impl Request<Write, ArcWndBuf> {
+    fn streaming(url: &str, method: Method) -> Result<Self> {
+        let message = Message::new_with_body(url, method, ArcWndBuf::new(DEFAULT_STREAM_CAPACITY))?;
+        Ok(ArcMessage::from(message).into())
+    }
+
+    /// Body writes may precede sending; a full buffer waits for the send task to drain it.
     pub fn streaming_post(url: &str) -> Result<Self> {
-        Ok(ArcMessage::from(Message::new_with_body(
-            url,
-            Method::POST,
-            ArcWndBuf::new(DEFAULT_STREAM_CAPACITY),
-        )?)
-        .into())
+        Self::streaming(url, Method::POST)
     }
 
     pub fn streaming_put(url: &str) -> Result<Self> {
-        Ok(ArcMessage::from(Message::new_with_body(
-            url,
-            Method::PUT,
-            ArcWndBuf::new(DEFAULT_STREAM_CAPACITY),
-        )?)
-        .into())
+        Self::streaming(url, Method::PUT)
     }
 
     pub fn streaming_patch(url: &str) -> Result<Self> {
-        Ok(ArcMessage::from(Message::new_with_body(
-            url,
-            Method::PATCH,
-            ArcWndBuf::new(DEFAULT_STREAM_CAPACITY),
-        )?)
-        .into())
+        Self::streaming(url, Method::PATCH)
     }
 
     pub fn streaming_connect(url: &str) -> Result<Self> {
-        Ok(ArcMessage::from(Message::new_with_body(
-            url,
-            Method::CONNECT,
-            ArcWndBuf::new(DEFAULT_STREAM_CAPACITY),
-        )?)
-        .into())
+        Self::streaming(url, Method::CONNECT)
     }
 }
 
 impl<B> Request<Write, B> {
+    /// Replace all existing values for this header name.
     pub fn header(self, key: HeaderName, value: HeaderValue) -> Self {
         self.message.0.lock().unwrap().set_header(key, value);
         self
@@ -206,6 +193,62 @@ mod tests {
                 method == Method::CONNECT
             );
         }
+    }
+
+    #[tokio::test]
+    async fn streaming_body_backpressure_and_errors_before_sending() {
+        use std::{
+            future::Future,
+            sync::Arc,
+            task::{Context, Waker},
+            time::Duration,
+        };
+
+        use crate::protocol::{
+            qpack::Qpack,
+            stream::{H3ReadStream, H3WriteStream},
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for error in [Error::H3_REQUEST_CANCELLED, Error::H3_MESSAGE_ERROR] {
+                let mut request = Request::streaming_post("https://example.com/upload").unwrap();
+                if error == Error::H3_MESSAGE_ERROR {
+                    request =
+                        request.header(header::CONTENT_LENGTH, HeaderValue::from_static("invalid"));
+                }
+                assert_eq!(
+                    request
+                        .write(vec![b'x'; DEFAULT_STREAM_CAPACITY])
+                        .await
+                        .unwrap(),
+                    DEFAULT_STREAM_CAPACITY
+                );
+                let mut writer = request.clone();
+                let mut waiting = Box::pin(writer.write(b"y"));
+                assert!(
+                    waiting
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                if error == Error::H3_REQUEST_CANCELLED {
+                    request.reset().await.unwrap();
+                } else {
+                    let result = crate::client::request(
+                        request,
+                        H3ReadStream::new(0, tokio::io::empty()),
+                        H3WriteStream::new(0, tokio::io::sink()),
+                        Arc::new(Qpack::default()),
+                    )
+                    .await;
+                    assert!(matches!(result, Err(actual) if actual == error));
+                }
+                assert_eq!(waiting.await, Err(error));
+                assert_eq!(writer.finish().await, Err(error));
+            }
+        })
+        .await
+        .expect("body writes must use buffer capacity and errors before sending");
     }
 
     #[tokio::test]

@@ -95,9 +95,9 @@ async fn accept_returns_halves_before_any_http_bytes_arrive() {
     .await
     .unwrap();
     assert_eq!(id, peer_halves.0.stream_id());
-    assert_eq!(
-        server.uni.goaway.state.lock().unwrap().accepted_boundary,
-        id + 4
-    );
+    assert!(matches!(
+        *server.uni.goaway.state.lock().unwrap(),
+        GoawayState::Open { accepted_boundary, .. } if accepted_boundary == id + 4
+    ));
     drop((halves, peer_halves));
 }

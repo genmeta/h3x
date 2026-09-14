@@ -3,23 +3,26 @@ use std::{
     future::{Future, poll_fn},
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::Poll,
 };
-
-use tokio::io::{AsyncRead, AsyncWriteExt};
 
 use super::{
     bi::BiStreams,
-    control::{self, Control, ControlStream},
+    control::{self, Control},
 };
 use crate::{
-    Error, Result, Role, Transport,
+    Error, Result, Transport,
     protocol::{
         connection::{Goaway, Settings},
-        frame::{self, Frame, H3Frame},
+        frame,
         qpack::Qpack,
     },
 };
+
+// Bound the number of streams waiting for their type identifier.
+const MAX_PENDING_STREAM_TYPES: usize = 16;
+
+type Receiving<'a, O> = Pin<Box<dyn Future<Output = Result<O>> + Send + 'a>>;
 
 /// Shared state maintained by the control and QPACK streams.
 pub(crate) struct UniStreams {
@@ -40,7 +43,21 @@ impl UniStreams {
     }
 
     pub(crate) async fn send<T: Transport>(&self, transport: &T) -> Result<()> {
-        send_uni(transport, &self.settings.local, &self.qpack, &self.control).await
+        tokio::try_join!(
+            async {
+                let mut send = open_stream(transport).await?;
+                self.control.send(&mut send, &self.settings.local).await
+            },
+            async {
+                let mut send = open_stream(transport).await?;
+                self.qpack.send_encoder(&mut send).await
+            },
+            async {
+                let mut send = open_stream(transport).await?;
+                self.qpack.send_decoder(&mut send).await
+            },
+        )?;
+        Ok(())
     }
 
     pub(crate) async fn receive<T: Transport>(
@@ -48,127 +65,74 @@ impl UniStreams {
         transport: &T,
         bi: &BiStreams<T::Recv, T::Send>,
     ) -> Result<()> {
-        UniStreamReceiver::new().receive(transport, self, bi).await
-    }
-}
-
-// Bound the number of streams waiting for their type identifier.
-const MAX_PENDING_STREAM_TYPES: usize = 16;
-
-type Receiving<'a, O> = Pin<Box<dyn Future<Output = Result<O>> + Send + 'a>>;
-
-enum CriticalStreamKind {
-    Control,
-    QpackEncoder,
-    QpackDecoder,
-}
-
-impl CriticalStreamKind {
-    fn slot(&self) -> usize {
-        match self {
-            Self::Control => 0,
-            Self::QpackEncoder => 1,
-            Self::QpackDecoder => 2,
-        }
-    }
-}
-
-fn classify_stream_type(stream_type: u64) -> Result<Option<CriticalStreamKind>> {
-    match stream_type {
-        0 => Ok(Some(CriticalStreamKind::Control)),
-        2 => Ok(Some(CriticalStreamKind::QpackEncoder)),
-        3 => Ok(Some(CriticalStreamKind::QpackDecoder)),
-        1 => Err(Error::H3_ID_ERROR),
-        _ => Ok(None),
-    }
-}
-
-fn read_stream_type<R: AsyncRead + Unpin + Send + 'static>(
-    mut recv: R,
-) -> Receiving<'static, (u64, R)> {
-    Box::pin(async move {
-        let stream_type = frame::be_varint(&mut recv)
-            .await
-            .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?
-            .into_u64();
-        Ok((stream_type, recv))
-    })
-}
-
-fn poll_classified_stream<R>(
-    stream_type_reads: &mut Vec<Receiving<'_, (u64, R)>>,
-    cx: &mut Context<'_>,
-) -> Poll<Result<(u64, R)>> {
-    for index in 0..stream_type_reads.len() {
-        if let Poll::Ready(result) = stream_type_reads[index].as_mut().poll(cx) {
-            drop(stream_type_reads.swap_remove(index));
-            return Poll::Ready(result);
-        }
-    }
-    Poll::Pending
-}
-
-fn poll_critical_stream_receivers(
-    critical_stream_receivers: &mut [Option<Receiving<'_, ()>>; 3],
-    cx: &mut Context<'_>,
-) -> Poll<Result<()>> {
-    for receiver in critical_stream_receivers.iter_mut().flatten() {
-        if let Poll::Ready(result) = receiver.as_mut().poll(cx) {
-            return Poll::Ready(result);
-        }
-    }
-    Poll::Pending
-}
-
-/// Owns incoming stream classification and critical-stream receive progress.
-struct UniStreamReceiver<'a, T: Transport> {
-    stream_type_reads: Vec<Receiving<'static, (u64, T::Recv)>>,
-    critical_stream_receivers: [Option<Receiving<'a, ()>>; 3],
-}
-
-impl<'a, T: Transport> UniStreamReceiver<'a, T> {
-    fn new() -> Self {
-        Self {
-            stream_type_reads: Vec::new(),
-            critical_stream_receivers: [None, None, None],
-        }
-    }
-
-    async fn receive(
-        mut self,
-        transport: &T,
-        streams: &'a UniStreams,
-        bi: &'a BiStreams<T::Recv, T::Send>,
-    ) -> Result<()> {
+        let role = transport.role();
+        let mut pending_types: Vec<Receiving<'_, _>> = Vec::new();
+        let mut critical: [Option<Receiving<'_, ()>>; 3] = [None, None, None];
+        // Keep these futures across select iterations so partial reads are never restarted.
         loop {
             tokio::select! {
                 accepted = transport.accept_uni_stream(),
-                    if self.stream_type_reads.len() < MAX_PENDING_STREAM_TYPES =>
+                    if pending_types.len() < MAX_PENDING_STREAM_TYPES =>
                 {
-                    let (_, recv) = accepted?;
-                    self.stream_type_reads.push(read_stream_type(recv));
+                    let (_, mut recv) = accepted?;
+                    pending_types.push(Box::pin(async move {
+                        // FIN/RESET is stream-local until its full type is known.
+                        match frame::be_varint_or_eof(&mut recv).await {
+                            Ok(Some(ty)) => Ok(Some((ty.into_u64(), recv))),
+                            Ok(None) => Ok(None),
+                            Err(error) if T::is_stream_reset(&error) => Ok(None),
+                            Err(error) => Err(Error::from(error)),
+                        }
+                    }));
                 }
                 classified = poll_fn(|cx| {
-                    poll_classified_stream(&mut self.stream_type_reads, cx)
+                    for index in 0..pending_types.len() {
+                        if let Poll::Ready(result) = pending_types[index].as_mut().poll(cx) {
+                            drop(pending_types.swap_remove(index));
+                            return Poll::Ready(result);
+                        }
+                    }
+                    Poll::Pending
                 }) => {
-                    let (stream_type, mut recv) = classified?;
-                    let kind = match classify_stream_type(stream_type)? {
-                        Some(kind) => kind,
-                        None => {
+                    let Some((stream_type, mut recv)) = classified? else {
+                        continue;
+                    };
+                    let (slot, receive): (_, Receiving<'_, ()>) = match stream_type {
+                        0 => (0, Box::pin(async move {
+                            control::receive_control(
+                                &mut recv,
+                                &role,
+                                &self.settings,
+                                &self.qpack,
+                                &self.goaway,
+                                bi,
+                            ).await
+                        })),
+                        2 => (1, Box::pin(async move {
+                            self.qpack.receive_encoder(&mut recv).await
+                        })),
+                        3 => (2, Box::pin(async move {
+                            self.qpack.receive_decoder(&mut recv).await
+                        })),
+                        1 => return Err(Error::H3_ID_ERROR),
+                        _ => {
                             T::stop(&mut recv, Error::H3_NO_ERROR.as_u64());
                             continue;
                         }
                     };
-                    let slot = kind.slot();
                     // Each critical stream kind may only be established once.
-                    if self.critical_stream_receivers[slot].is_some() {
+                    if critical[slot].is_some() {
                         return Err(Error::H3_STREAM_CREATION_ERROR);
                     }
-                    self.critical_stream_receivers[slot] =
-                        Some(Self::receive_critical_stream(kind, recv, transport.role(), streams, bi));
+                    critical[slot] = Some(receive);
                 }
                 result = poll_fn(|cx| {
-                    poll_critical_stream_receivers(&mut self.critical_stream_receivers, cx)
+                    for receive in critical.iter_mut().flatten() {
+                        if let Poll::Ready(result) = receive.as_mut().poll(cx) {
+                            return Poll::Ready(result);
+                        }
+                    }
+                    Poll::Pending
                 }) => {
                     // Completion of any critical stream ends the connection driver.
                     return result;
@@ -176,80 +140,6 @@ impl<'a, T: Transport> UniStreamReceiver<'a, T> {
             }
         }
     }
-
-    fn receive_critical_stream(
-        kind: CriticalStreamKind,
-        mut recv: T::Recv,
-        role: Role,
-        streams: &'a UniStreams,
-        bi: &'a BiStreams<T::Recv, T::Send>,
-    ) -> Receiving<'a, ()> {
-        Box::pin(async move {
-            match kind {
-                CriticalStreamKind::Control => {
-                    control::receive_control(
-                        &mut recv,
-                        &role,
-                        &streams.settings,
-                        &streams.qpack,
-                        &streams.goaway,
-                        bi,
-                    )
-                    .await
-                }
-                CriticalStreamKind::QpackEncoder => streams.qpack.receive_encoder(&mut recv).await,
-                CriticalStreamKind::QpackDecoder => streams.qpack.receive_decoder(&mut recv).await,
-            }
-        })
-    }
-}
-
-/// Opens and drives the local control and QPACK streams.
-async fn send_uni<T: Transport>(
-    transport: &T,
-    settings: &frame::Settings,
-    qpack: &Qpack,
-    control: &Control,
-) -> Result<()> {
-    tokio::try_join!(
-        send_control(transport, settings, control),
-        send_encoder(transport, qpack),
-        send_decoder(transport, qpack),
-    )?;
-    Ok(())
-}
-
-async fn send_control<T: Transport>(
-    transport: &T,
-    settings: &frame::Settings,
-    outgoing: &Control,
-) -> Result<()> {
-    let mut send = open_stream(transport).await?;
-    send.write_all(&[0])
-        .await
-        .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-    let mut control = ControlStream::new(send);
-    control
-        .write(&H3Frame::Settings(Frame::new(settings.clone())?))
-        .await?;
-    let mut receiver = outgoing.receiver.lock().await;
-    while let Some((frame, completed)) = receiver.recv().await {
-        // The driver owns each write through completion, even if its caller stops waiting.
-        let result = control.write(&frame).await;
-        let _ = completed.send(result);
-        result?;
-    }
-    Err(Error::H3_CLOSED_CRITICAL_STREAM)
-}
-
-async fn send_encoder<T: Transport>(transport: &T, qpack: &Qpack) -> Result<()> {
-    let mut send = open_stream(transport).await?;
-    qpack.send_encoder(&mut send).await
-}
-
-async fn send_decoder<T: Transport>(transport: &T, qpack: &Qpack) -> Result<()> {
-    let mut send = open_stream(transport).await?;
-    qpack.send_decoder(&mut send).await
 }
 
 async fn open_stream<T: Transport>(transport: &T) -> Result<T::Send> {

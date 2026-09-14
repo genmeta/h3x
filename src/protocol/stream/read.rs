@@ -25,6 +25,7 @@ impl<R> H3ReadStream<R> {
                 stream_id,
                 StreamState::Idle(stream),
                 StreamState::Closed(Error::H3_NO_ERROR),
+                None,
             )),
         }
     }
@@ -54,6 +55,11 @@ impl<R: AsyncRead + Unpin, W> AsyncRead for H3ReadStream<R, W> {
         let result = state.poll_io(cx, |recv, cx| recv.poll_read(cx, buf));
         if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() == before {
             state.terminate(StreamState::Finished);
+        }
+        let terminal = state.is_terminal();
+        drop(state);
+        if terminal {
+            self.stream.notify_if_finished();
         }
         result
     }
