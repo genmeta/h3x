@@ -54,6 +54,7 @@ async fn preserves_set_cookie_headers_through_message_roundtrip() {
             outgoing,
             H3WriteStream::new(4, &mut reencoded),
             Arc::new(Qpack::default()),
+            &Method::GET,
         )
         .await
         .unwrap();

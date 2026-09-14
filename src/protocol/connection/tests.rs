@@ -193,8 +193,9 @@ where
 {
     let (send, recv) = connection.accept_bi().await?;
     let request = server::accept(recv, connection.qpack().clone()).await?;
+    let method = request.method();
     let response = handler(request).await?.into();
-    server::respond(response, send, connection.qpack().clone()).await
+    server::respond(response, send, connection.qpack().clone(), &method).await
 }
 
 mod close;

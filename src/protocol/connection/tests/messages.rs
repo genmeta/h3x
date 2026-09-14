@@ -77,6 +77,7 @@ async fn streaming_request_remains_writable_and_goaway_preserves_admitted_post()
             async {
                 let (send, recv) = server.accept_bi().await?;
                 let incoming = server::accept(recv, server.qpack().clone()).await?;
+                let method = incoming.method();
                 let mut response = server::Response::<Bytes>::default();
                 let server::Request::Streaming(mut incoming) = incoming else {
                     panic!()
@@ -84,7 +85,7 @@ async fn streaming_request_remains_writable_and_goaway_preserves_admitted_post()
                 response.set_status(http::StatusCode::OK);
                 server.goaway().await?;
                 assert_eq!(server.uni.goaway.state.lock().unwrap().accepted_boundary, 4);
-                server::respond(response, send, server.qpack().clone()).await?;
+                server::respond(response, send, server.qpack().clone(), &method).await?;
                 response_sent.notify_one();
                 let mut bytes = [0; 5];
                 incoming.read_all(&mut bytes).await?;
@@ -103,7 +104,7 @@ async fn streaming_request_remains_writable_and_goaway_preserves_admitted_post()
 }
 
 #[tokio::test]
-async fn client_accepts_head_response_with_representation_content_length() {
+async fn head_response_with_representation_content_length_roundtrips() {
     let (a, b) = pair();
     let client = H3Connection::new(a);
     let server = H3Connection::new(b);
@@ -121,26 +122,19 @@ async fn client_accepts_head_response_with_representation_content_length() {
                 }
             ),
             async {
-                use crate::protocol::frame::Write as _;
-
-                let (mut send, recv) = server.accept_bi().await?;
+                let (send, recv) = server.accept_bi().await?;
                 let request = server::accept(recv, server.qpack().clone()).await?;
-                assert_eq!(request.method(), http::Method::HEAD);
+                let method = request.method();
+                assert_eq!(method, http::Method::HEAD);
                 let mut response = server::Response::<Bytes>::default();
                 response.set_status(http::StatusCode::OK);
-                let fields = {
-                    let mut message = response.message.0.lock().unwrap();
-                    message.set_header(http::header::CONTENT_LENGTH, "5".parse().unwrap());
-                    message.fields()
-                };
-                // Supply a HEAD response on the wire without storing its request method.
-                let mut frame = Vec::new();
-                frame.put_frame(&Frame::new(frame::Headers {
-                    field_section: server.qpack().encode(send.stream_id(), fields)?,
-                })?);
-                send.write_all(&frame).await?;
-                send.shutdown().await?;
-                Ok::<_, Error>(())
+                response
+                    .message
+                    .0
+                    .lock()
+                    .unwrap()
+                    .set_header(http::header::CONTENT_LENGTH, "5".parse().unwrap());
+                server::respond(response, send, server.qpack().clone(), &method).await
             }
         );
         received.unwrap();
@@ -198,13 +192,14 @@ async fn messages_use_explicit_qpack_and_stream_owned_ids() {
                 let (send, recv) = server.accept_bi().await?;
                 assert_eq!(recv.stream_id(), send.stream_id());
                 let request = server::accept(recv, server.qpack().clone()).await?;
+                let method = request.method();
                 assert!(matches!(&request, server::Request::Bytes(_)));
                 let mut response = server::Response::<Bytes>::default();
                 response.set_status(http::StatusCode::OK);
                 let response = response.streaming(2);
                 let mut producer = response.clone();
                 let ((), ()) = tokio::try_join!(
-                    server::respond(response, send, server.qpack().clone()),
+                    server::respond(response, send, server.qpack().clone(), &method),
                     async {
                         assert_eq!(producer.write(b"ok").await?, 2);
                         producer.finish().await

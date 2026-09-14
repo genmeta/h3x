@@ -4,14 +4,26 @@ async fn write_bytes_response<W: AsyncWrite + Unpin>(
     response: &Response<Bytes>,
     send: W,
 ) -> Result<()> {
-    super::write_bytes_response(response, H3WriteStream::new(0, send), &Qpack::default()).await
+    super::write_bytes_response(
+        response,
+        H3WriteStream::new(0, send),
+        &Qpack::default(),
+        &Method::GET,
+    )
+    .await
 }
 
 async fn write_streaming_response<W: AsyncWrite + Unpin>(
     response: &Response<ArcWndBuf>,
     send: W,
 ) -> Result<()> {
-    super::write_streaming_response(response, H3WriteStream::new(0, send), &Qpack::default()).await
+    super::write_streaming_response(
+        response,
+        H3WriteStream::new(0, send),
+        &Qpack::default(),
+        &Method::GET,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -107,4 +119,47 @@ async fn writes_buffered_and_streaming_response_frames() {
     });
     assert_eq!(sent.unwrap_err(), Error::H3_INTERNAL_ERROR);
     assert_eq!(produced.unwrap_err(), Error::H3_REQUEST_CANCELLED);
+}
+
+#[tokio::test]
+async fn respond_sends_head_response_without_data() {
+    for buffered in [true, false] {
+        let mut response = Response::<Bytes>::default();
+        response.set_status(StatusCode::OK);
+        response
+            .message
+            .0
+            .lock()
+            .unwrap()
+            .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+        let response: common::Response<Write> = if buffered {
+            response.into()
+        } else {
+            let mut response = response.streaming(1);
+            response.finish().await.unwrap();
+            response.into()
+        };
+        let mut encoded = Vec::new();
+        super::respond(
+            response,
+            H3WriteStream::new(4, &mut encoded),
+            Arc::new(Qpack::default()),
+            &Method::HEAD,
+        )
+        .await
+        .unwrap();
+
+        let mut input = encoded.as_slice();
+        let H3Frame::Headers(frame) = be_frame(&mut input).await.unwrap() else {
+            panic!("expected HEADERS")
+        };
+        let fields = Qpack::default()
+            .decode(4, frame.payload.field_section)
+            .await
+            .unwrap();
+        let parts = headers::response_parts(fields).unwrap();
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(parts.headers[header::CONTENT_LENGTH], "5");
+        assert!(input.is_empty(), "HEAD response must not contain DATA");
+    }
 }

@@ -7,7 +7,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use http::{HeaderValue, StatusCode};
+use http::{HeaderValue, Method, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::{
@@ -29,10 +29,14 @@ pub type Request = crate::common::Request<Read>;
 pub type Response<B = Bytes> = crate::common::response::Response<Write, B>;
 
 /// Send one response on the accepted request's matching send stream.
+///
+/// `request_method` must be the original request's method so HEAD responses can
+/// preserve `Content-Length` without sending a body.
 pub async fn respond<WS, R, SR>(
     response: R,
     send: H3WriteStream<WS, SR>,
     qpack: Arc<Qpack>,
+    request_method: &Method,
 ) -> Result<()>
 where
     WS: AsyncWrite + Unpin,
@@ -45,10 +49,10 @@ where
         result = async {
             match response {
                 common::Response::Bytes(response) => {
-                    write_bytes_response(&response, send, &qpack).await
+                    write_bytes_response(&response, send, &qpack, request_method).await
                 }
                 common::Response::Streaming(response) => {
-                    write_streaming_response(&response, send, &qpack).await
+                    write_streaming_response(&response, send, &qpack, request_method).await
                 }
             }
         } => result,
@@ -151,11 +155,12 @@ pub async fn accept<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'static>(
     }
 }
 
-/// Writes an ordinary response.
+/// Writes a buffered response using the original request method.
 async fn write_bytes_response<WS: AsyncWrite + Unpin, SR>(
     response: &Response<Bytes>,
     mut ws: H3WriteStream<WS, SR>,
     qpack: &Qpack,
+    method: &Method,
 ) -> Result<()> {
     let (fields, mode, body) = {
         let message = response.message.0.lock().unwrap();
@@ -168,7 +173,7 @@ async fn write_bytes_response<WS: AsyncWrite + Unpin, SR>(
         if parts.status == StatusCode::NO_CONTENT && length.is_some() {
             return Err(Error::H3_MESSAGE_ERROR);
         }
-        let mode = BodyMode::resolve(&parts, None)?;
+        let mode = BodyMode::resolve(&parts, Some(method))?;
         (fields, mode, message.body())
     };
     if mode.is_forbidden() && !body.is_empty() {
@@ -195,11 +200,12 @@ async fn write_bytes_response<WS: AsyncWrite + Unpin, SR>(
     Ok(())
 }
 
-/// Writes a streaming response; HEAD and CONNECT semantics require request-method input.
+/// Writes a streaming response using the original request method.
 async fn write_streaming_response<WS: AsyncWrite + Unpin, SR>(
     response: &Response<ArcWndBuf>,
     mut ws: H3WriteStream<WS, SR>,
     qpack: &Qpack,
+    request_method: &Method,
 ) -> Result<()> {
     let mut body = response
         .message
@@ -219,7 +225,7 @@ async fn write_streaming_response<WS: AsyncWrite + Unpin, SR>(
         if parts.status == StatusCode::NO_CONTENT && length.is_some() {
             return Err(Error::H3_MESSAGE_ERROR);
         }
-        let mode = BodyMode::resolve(&parts, None)?;
+        let mode = BodyMode::resolve(&parts, Some(request_method))?;
         (fields, mode)
     };
     let mut frame = Vec::new();
