@@ -39,15 +39,9 @@ async fn raw_connections_support_explicit_message_io() {
             served.unwrap();
         }
         server.goaway().await.unwrap();
-        while client.received_goaway().is_none() {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(client.received_goaway(), Some(8));
-        assert_eq!(
-            client.open_bi().await.err(),
-            Some(Error::H3_REQUEST_REJECTED)
-        );
-        client.close(Error::H3_NO_ERROR);
+        assert_eq!(server.uni.goaway.state.lock().unwrap().local(), Some(8));
+        assert_waiting_for_idle(&server).await;
+        expire_transport(&server).await;
     };
     let (a, b, ()) = tokio::join!(client.closed(), server.closed(), requests);
     a.unwrap();
@@ -84,7 +78,10 @@ async fn streaming_request_remains_writable_and_goaway_preserves_admitted_post()
                 };
                 response.set_status(http::StatusCode::OK);
                 server.goaway().await?;
-                assert_eq!(server.uni.goaway.state.lock().unwrap().accepted_boundary, 4);
+                assert!(matches!(
+                    *server.uni.goaway.state.lock().unwrap(),
+                    GoawayState::Draining { boundary: 4, .. }
+                ));
                 server::respond(response, send, server.qpack().clone(), &method).await?;
                 response_sent.notify_one();
                 let mut bytes = [0; 5];

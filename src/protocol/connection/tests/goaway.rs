@@ -29,7 +29,8 @@ async fn goaway_stops_new_opens_and_preserves_admitted_streams() {
         read.unwrap();
         assert_eq!(&byte, b"x");
         drop((recv, send, peer_recv, peer_send));
-        client.close(Error::H3_NO_ERROR);
+        assert_waiting_for_idle(&server).await;
+        expire_transport(&server).await;
     };
     let (a, b, ()) = tokio::join!(client.closed(), server.closed(), work);
     a.unwrap();
@@ -57,8 +58,10 @@ async fn peer_goaway_rejects_delivered_streams_and_wakes_both_halves() {
     let (a, b) = pair();
     let client = H3Connection::new(a);
     let server = H3Connection::new(b);
+    let admitted = client.open_bi().await.unwrap();
+    let peer_admitted = server.accept_bi().await.unwrap();
     let (mut send, mut recv) = client.open_bi().await.unwrap();
-    assert_eq!(client.bi.len(), 1);
+    assert_eq!(client.bi.len(), 2);
     send.write_all(b"abc").await.unwrap(); // Fill the transport's three-byte window.
     let wakes = Arc::new(Wakes::default());
     let waker = Waker::from(wakes.clone());
@@ -76,12 +79,12 @@ async fn peer_goaway_rejects_delivered_streams_and_wakes_both_halves() {
             .is_pending()
     );
 
-    // The server has not accepted stream 0, so GOAWAY excludes it.
+    // The server accepted stream 0 but has not accepted stream 4, so GOAWAY excludes it.
     server.goaway().await.unwrap();
     while client.received_goaway().is_none() {
         tokio::task::yield_now().await;
     }
-    assert_eq!(client.received_goaway(), Some(0));
+    assert_eq!(client.received_goaway(), Some(4));
     assert!(wakes.0.load(Ordering::SeqCst) >= 2);
     let Poll::Ready(Err(error)) = std::pin::Pin::new(&mut recv).poll_read(&mut cx, &mut buf) else {
         panic!("GOAWAY must reject the pending read");
@@ -101,11 +104,12 @@ async fn peer_goaway_rejects_delivered_streams_and_wakes_both_halves() {
     );
     // GOAWAY ends both directions even while their handles are retained.
     tokio::task::yield_now().await;
-    assert_eq!(client.bi.len(), 0);
+    assert_eq!(client.bi.len(), 1);
     drop(recv);
     drop(send);
     tokio::task::yield_now().await;
-    assert_eq!(client.bi.len(), 0);
+    assert_eq!(client.bi.len(), 1);
+    drop((admitted, peer_admitted));
 }
 
 #[tokio::test]
@@ -183,6 +187,8 @@ async fn local_goaway_wakes_pending_accept_without_message_parsing() {
     let client = H3Connection::new(a);
     let server = H3Connection::new(b);
     let work = async {
+        let admitted = client.open_bi().await.unwrap();
+        let peer_admitted = server.accept_bi().await.unwrap();
         let accept = server.accept_bi();
         tokio::pin!(accept);
         poll_fn(|cx| {
@@ -192,6 +198,11 @@ async fn local_goaway_wakes_pending_accept_without_message_parsing() {
         .await;
         server.goaway().await.unwrap();
         assert_eq!(accept.await.err(), Some(Error::H3_REQUEST_REJECTED));
+        assert_eq!(
+            server.accept_bi().await.err(),
+            Some(Error::H3_REQUEST_REJECTED)
+        );
+        drop((admitted, peer_admitted));
         client.close(Error::H3_NO_ERROR);
     };
     let (a, b, ()) = tokio::join!(client.closed(), server.closed(), work);
@@ -200,47 +211,117 @@ async fn local_goaway_wakes_pending_accept_without_message_parsing() {
 }
 
 #[tokio::test]
-async fn peer_goaway_interrupts_a_pending_transport_open() {
-    let (a, b) = pair();
-    let client = H3Connection::new(a);
-    let server = H3Connection::new(b);
-    let work = async {
-        client.transport.blocked_open.set(true);
-        let open = client.open_bi();
-        tokio::pin!(open);
+async fn peer_goaway_keeps_accept_pending_until_a_stream_or_local_goaway() {
+    for initiate_local in [false, true] {
+        let (a, b) = pair();
+        let client = H3Connection::new(a);
+        let server = H3Connection::new(b);
+        let _admitted = client.open_bi().await.unwrap();
+        let _peer_admitted = server.accept_bi().await.unwrap();
+        let accept = server.accept_bi();
+        tokio::pin!(accept);
         poll_fn(|cx| {
-            assert!(open.as_mut().poll(cx).is_pending());
+            assert!(accept.as_mut().poll(cx).is_pending());
             Poll::Ready(())
         })
         .await;
-        server.goaway().await.unwrap();
-        assert_eq!(open.await.err(), Some(Error::H3_REQUEST_REJECTED));
-        assert_eq!(client.transport.next_bi.get(), 0);
-        client.close(Error::H3_NO_ERROR);
-    };
-    let (a, b, ()) = tokio::join!(client.closed(), server.closed(), work);
-    a.unwrap();
-    b.unwrap();
+
+        client.goaway().await.unwrap();
+        while server.received_goaway().is_none() {
+            tokio::task::yield_now().await;
+        }
+        poll_fn(|cx| {
+            assert!(accept.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        if initiate_local {
+            server.goaway().await.unwrap();
+            assert_eq!(accept.await.err(), Some(Error::H3_REQUEST_REJECTED));
+        } else {
+            // A request stream can still arrive after the peer's GOAWAY.
+            let (id, _halves) = client.transport.open_bi_stream().await.unwrap().unwrap();
+            let (send, recv) = accept.await.unwrap();
+            assert_eq!(send.stream_id(), id);
+            assert_eq!(recv.stream_id(), id);
+        }
+    }
+}
+
+#[tokio::test]
+async fn goaway_interrupts_a_pending_transport_open() {
+    for initiate_local in [false, true] {
+        let (a, b) = pair();
+        let client = H3Connection::new(a);
+        let server = H3Connection::new(b);
+        let work = async {
+            let admitted = client.open_bi().await.unwrap();
+            let peer_admitted = server.accept_bi().await.unwrap();
+            client.transport.blocked_open.set(true);
+            let open = client.open_bi();
+            tokio::pin!(open);
+            poll_fn(|cx| {
+                assert!(open.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            if initiate_local {
+                client.goaway().await.unwrap();
+            } else {
+                server.goaway().await.unwrap();
+            }
+            assert_eq!(open.await.err(), Some(Error::H3_REQUEST_REJECTED));
+            assert_eq!(
+                client.open_bi().await.err(),
+                Some(Error::H3_REQUEST_REJECTED)
+            );
+            assert_eq!(client.transport.next_bi.get(), 4);
+            drop((admitted, peer_admitted));
+            client.close(Error::H3_NO_ERROR);
+        };
+        let (a, b, ()) = tokio::join!(client.closed(), server.closed(), work);
+        a.unwrap();
+        b.unwrap();
+    }
 }
 
 #[tokio::test]
 async fn immediate_goaway_waits_for_initial_settings() {
-    let (a, b) = pair();
-    let client = H3Connection::new(a);
-    let server = H3Connection::new(b);
-    server.goaway().await.unwrap();
-    for _ in 0..1000 {
-        if client.received_goaway().is_some() {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(client.peer_settings_received());
-    assert_eq!(client.received_goaway(), Some(0));
-    assert_eq!(
-        client.open_bi().await.err(),
-        Some(Error::H3_REQUEST_REJECTED)
-    );
+    use tokio::io::AsyncReadExt;
+
+    use crate::protocol::stream::control;
+
+    let (peer, transport) = pair();
+    let connection = H3Connection::new(transport);
+    let sending = connection.goaway();
+    tokio::pin!(sending);
+    poll_fn(|cx| {
+        assert!(sending.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+
+    let (_, mut recv) = peer.accept_uni_stream().await.unwrap();
+    assert_eq!(recv.read_u8().await.unwrap(), 0);
+    // The initial SETTINGS does not fit in the tiny transport buffer yet.
+    poll_fn(|cx| {
+        assert!(sending.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert!(matches!(
+        control::read(&mut recv, true).await.unwrap(),
+        H3Frame::Settings(_)
+    ));
+    let H3Frame::Goaway(frame) = control::read(&mut recv, false).await.unwrap() else {
+        panic!("expected GOAWAY after SETTINGS");
+    };
+    assert_eq!(frame.payload.id.into_u64(), 0);
+    assert_waiting_for_idle(&connection).await;
+    expire_transport(&connection).await;
+    // Finishing the write succeeds even if the caller resumes after the idle timeout.
+    sending.await.unwrap();
 }
 
 #[tokio::test]
@@ -257,13 +338,10 @@ async fn cancelling_goaway_wait_keeps_partial_frame_owned_by_driver() {
         control::read(&mut recv, true).await.unwrap(),
         H3Frame::Settings(_)
     ));
-    connection
-        .uni
-        .goaway
-        .state
-        .lock()
-        .unwrap()
-        .accepted_boundary = 64;
+    *connection.uni.goaway.state.lock().unwrap() = GoawayState::Open {
+        accepted_boundary: 64,
+        peer: None,
+    };
 
     let mut sending = Box::pin(connection.goaway());
     poll_fn(|cx| {
@@ -277,15 +355,55 @@ async fn cancelling_goaway_wait_keeps_partial_frame_owned_by_driver() {
     let mut remainder = [0; 3];
     recv.read_exact(&mut remainder).await.unwrap();
     assert_eq!(remainder, [2, 0x40, 0x40]);
-    assert_eq!(connection.error(), None);
+    assert_waiting_for_idle(&connection).await;
+    expire_transport(&connection).await;
+    assert_eq!(connection.error(), Some(Error::H3_NO_ERROR));
+}
 
-    let (sent, received) = tokio::join!(connection.goaway(), control::read(&mut recv, false));
-    sent.unwrap();
-    let H3Frame::Goaway(frame) = received.unwrap() else {
-        panic!()
-    };
-    assert_eq!(frame.payload.id.into_u64(), 64);
-    assert_eq!(connection.error(), None);
+#[tokio::test]
+async fn qpack_remains_available_after_goaway_and_drain_until_idle_timeout() {
+    let (a, b) = pair();
+    let client = H3Connection::new(a);
+    let server = H3Connection::new(b);
+    let halves = client.open_bi().await.unwrap();
+    let peer_halves = server.accept_bi().await.unwrap();
+    while !client.peer_settings_received() || !server.peer_settings_received() {
+        tokio::task::yield_now().await;
+    }
+    server.goaway().await.unwrap();
+    drop((halves, peer_halves));
+    assert_waiting_for_idle(&server).await;
+
+    // Critical streams must remain open even with no admitted requests left.
+    for (sender, receiver) in [(&server, &client), (&client, &server)] {
+        let fields = vec![qpack::Field {
+            name: Bytes::from_static(b"x-after-drain"),
+            value: Bytes::from_static(b"critical-streams-alive"),
+            never_index: false,
+        }];
+        let encoded = sender.qpack().encode(0, fields.clone()).unwrap();
+        assert_ne!(
+            encoded[0], 0,
+            "decoding must require dynamic QPACK instructions"
+        );
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                receiver.qpack().decode(0, encoded)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            fields
+        );
+    }
+    assert_eq!(client.error(), None);
+    assert_eq!(server.error(), None);
+    assert_eq!(client.transport.close_calls.get(), 0);
+    assert_eq!(server.transport.close_calls.get(), 0);
+    expire_transport(&server).await;
+    client.closed().await.unwrap();
+    assert_eq!(client.transport.close_calls.get(), 0);
 }
 
 #[tokio::test]
@@ -311,22 +429,54 @@ async fn goaway_write_failure_closes_connection() {
 }
 
 #[tokio::test]
-async fn concurrent_goaways_follow_settings() {
-    let (a, b) = pair();
-    let client = H3Connection::new(a);
-    let server = H3Connection::new(b);
-    let (first, second, third) = tokio::join!(server.goaway(), server.goaway(), server.goaway());
-    first.unwrap();
-    second.unwrap();
-    third.unwrap();
-    for _ in 0..1000 {
-        if client.received_goaway().is_some() {
-            break;
-        }
-        tokio::task::yield_now().await;
+async fn concurrent_goaways_write_once_and_only_explicit_close_terminates_quic() {
+    for explicit_close in [false, true] {
+        use tokio::io::AsyncReadExt;
+
+        use crate::protocol::stream::control;
+
+        let (peer, transport) = pair();
+        let connection = H3Connection::new(transport);
+        let sending = async {
+            let (first, second, third) =
+                tokio::join!(connection.goaway(), connection.goaway(), async {
+                    if explicit_close {
+                        connection.close(Error::H3_NO_ERROR);
+                    }
+                    connection.goaway().await
+                });
+            first.unwrap();
+            second.unwrap();
+            third.unwrap();
+        };
+        let receiving = async {
+            let (_, mut recv) = peer.accept_uni_stream().await.unwrap();
+            assert_eq!(recv.read_u8().await.unwrap(), 0);
+            assert!(matches!(
+                control::read(&mut recv, true).await.unwrap(),
+                H3Frame::Settings(_)
+            ));
+            let H3Frame::Goaway(frame) = control::read(&mut recv, false).await.unwrap() else {
+                panic!("expected GOAWAY after SETTINGS");
+            };
+            assert_eq!(frame.payload.id.into_u64(), 0);
+            if !explicit_close {
+                assert_waiting_for_idle(&connection).await;
+                expire_transport(&connection).await;
+            }
+            let mut extra = Vec::new();
+            recv.read_to_end(&mut extra).await.unwrap();
+            assert!(extra.is_empty(), "shutdown must write GOAWAY only once");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(sending, receiving);
+            connection.closed().await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            connection.transport.close_calls.get(),
+            usize::from(explicit_close)
+        );
     }
-    assert!(client.peer_settings_received());
-    assert_eq!(client.received_goaway(), Some(0));
-    assert_eq!(client.error(), None);
-    assert_eq!(server.error(), None);
 }

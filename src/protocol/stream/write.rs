@@ -26,6 +26,7 @@ impl<W> H3WriteStream<W> {
                 stream_id,
                 StreamState::Closed(Error::H3_NO_ERROR),
                 StreamState::Idle(stream),
+                None,
             )),
         }
     }

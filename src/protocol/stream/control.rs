@@ -79,17 +79,10 @@ pub(crate) async fn receive_control<R: AsyncRead + Unpin, W>(
         }
         if let H3Frame::Goaway(frame) = frame {
             let id = frame.payload.id.into_u64();
-            {
-                let mut state = goaway.state.lock().unwrap();
-                if state.peer.is_some_and(|previous| id > previous) {
-                    return Err(Error::H3_ID_ERROR);
-                }
-                state.peer = Some(id);
-            }
+            goaway.receive(id)?;
             if *role == Role::Client {
                 bi.goaway(id, qpack);
             }
-            goaway.changed.notify_waiters();
         }
     }
 }
