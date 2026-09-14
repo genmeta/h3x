@@ -98,6 +98,7 @@ impl Request<Write, ArcWndBuf> {
 }
 
 impl<B> Request<Write, B> {
+    /// Replace all existing values for this header name.
     pub fn header(self, key: HeaderName, value: HeaderValue) -> Self {
         self.message.0.lock().unwrap().set_header(key, value);
         self

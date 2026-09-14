@@ -5,6 +5,89 @@ async fn read_response<R: AsyncRead + Unpin + Send + 'static>(recv: R) -> Result
 }
 
 #[tokio::test]
+async fn preserves_set_cookie_headers_through_message_roundtrip() {
+    let cookies = [
+        "a=1; Path=/; Expires=Wed, 21 Oct 2037 07:28:00 GMT",
+        "b=2; Path=/; HttpOnly",
+    ];
+    for buffered in [true, false] {
+        let mut fields = vec![qpack::Field {
+            never_index: false,
+            name: Bytes::from_static(b":status"),
+            value: Bytes::from_static(b"200"),
+        }];
+        for cookie in cookies {
+            fields.push(qpack::Field {
+                never_index: true,
+                name: Bytes::from_static(b"set-cookie"),
+                value: Bytes::from_static(cookie.as_bytes()),
+            });
+        }
+        if buffered {
+            fields.push(qpack::Field {
+                never_index: false,
+                name: Bytes::from_static(b"content-length"),
+                value: Bytes::from_static(b"0"),
+            });
+        }
+        let mut encoded = Vec::new();
+        encoded.put_frame(
+            &Frame::new(Headers {
+                field_section: Qpack::default().encode(0, fields).unwrap(),
+            })
+            .unwrap(),
+        );
+
+        let response = read_response(Cursor::new(encoded)).await.unwrap();
+        let outgoing: common::Response<Write> = match response {
+            Response::Bytes(response) => {
+                assert!(buffered);
+                crate::server::Response::from(response.message).into()
+            }
+            Response::Streaming(response) => {
+                assert!(!buffered);
+                crate::server::Response::from(response.message).into()
+            }
+        };
+        let mut reencoded = Vec::new();
+        crate::server::respond(
+            outgoing,
+            H3WriteStream::new(4, &mut reencoded),
+            Arc::new(Qpack::default()),
+        )
+        .await
+        .unwrap();
+
+        let H3Frame::Headers(frame) = be_frame(&mut reencoded.as_slice()).await.unwrap() else {
+            panic!("expected HEADERS")
+        };
+        let fields = Qpack::default()
+            .decode(4, frame.payload.field_section)
+            .await
+            .unwrap();
+        let parts = headers::response_parts(fields).unwrap();
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(
+            parts
+                .headers
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            cookies,
+            "buffered={buffered}"
+        );
+        assert!(
+            parts
+                .headers
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .all(HeaderValue::is_sensitive)
+        );
+    }
+}
+
+#[tokio::test]
 async fn response_content_length_and_streaming() {
     fn headers(output: &mut Vec<u8>, status: &'static str, length: Option<&'static str>) {
         let mut fields = vec![qpack::Field {

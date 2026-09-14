@@ -94,7 +94,7 @@ pub async fn accept<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'static>(
             }
         }
         for (name, value) in &parts.headers {
-            message.set_header(name.clone(), value.clone());
+            message.append_header(name.clone(), value.clone());
         }
         Ok((message, length))
     }

@@ -166,7 +166,7 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'stati
     let mut message = Message::<Bytes>::default();
     message.set_status(parts.status);
     for (name, value) in &parts.headers {
-        message.set_header(name.clone(), value.clone());
+        message.append_header(name.clone(), value.clone());
     }
     if !mode.streaming() {
         let mut body = Vec::new();
