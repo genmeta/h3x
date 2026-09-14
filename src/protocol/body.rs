@@ -148,3 +148,70 @@ pub(crate) async fn write_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         send.write_all(&buf[..count]).await?;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::protocol::{
+        frame::Headers,
+        qpack::{self, WriteFieldSection},
+    };
+
+    #[tokio::test]
+    async fn body_trailers_enforce_order_and_content_length() {
+        let mut trailers = Vec::new();
+        let mut field_section = Vec::new();
+        field_section
+            .put_field_section(vec![qpack::Field {
+                never_index: false,
+                name: Bytes::from_static(b"x-checksum"),
+                value: Bytes::from_static(b"ok"),
+            }])
+            .unwrap();
+        trailers.put_frame(
+            &Frame::new(Headers {
+                field_section: field_section.into(),
+            })
+            .unwrap(),
+        );
+        for (suffix, length, expected) in [
+            (&[][..], None, Ok(())),
+            (&[][..], Some(0), Ok(())),
+            (&[][..], Some(1), Err(Error::H3_MESSAGE_ERROR)),
+            (trailers.as_slice(), None, Err(Error::H3_FRAME_UNEXPECTED)),
+            (&[0, 0][..], None, Err(Error::H3_FRAME_UNEXPECTED)),
+        ] {
+            let encoded = [trailers.as_slice(), suffix].concat();
+            let mut input = encoded.as_slice();
+            let mut body = Vec::new();
+            assert_eq!(
+                read_body(
+                    &mut BufReader::new(H3ReadStream::new(0, &mut input)),
+                    &mut body,
+                    match length {
+                        Some(content_length) => BodyMode::Length { content_length },
+                        None => BodyMode::Infinity,
+                    },
+                    &Qpack::default()
+                )
+                .await,
+                expected
+            );
+            assert!(body.is_empty());
+        }
+        let mut input = &[7, 1, 0][..]; // GOAWAY is forbidden in a message body.
+        let mut body = Vec::new();
+        assert_eq!(
+            read_body(
+                &mut BufReader::new(H3ReadStream::new(0, &mut input)),
+                &mut body,
+                BodyMode::Infinity,
+                &Qpack::default()
+            )
+            .await,
+            Err(Error::H3_FRAME_UNEXPECTED)
+        );
+    }
+}
