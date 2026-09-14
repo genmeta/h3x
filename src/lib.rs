@@ -13,9 +13,11 @@ pub use common::message::{
 };
 pub use error::{Error, Result};
 pub use protocol::{
+    connection::{H3Connection, Settings},
     frame::Goaway,
     qpack::Qpack,
     stream::{read::H3ReadStream, write::H3WriteStream},
+    transport::{Role, Transport},
 };
 pub use wnd_buf::ArcWndBuf;
 
