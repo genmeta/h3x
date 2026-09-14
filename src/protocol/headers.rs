@@ -16,22 +16,18 @@ fn message_error<T>(_: T) -> Error {
 }
 
 pub(crate) fn content_length(headers: &HeaderMap) -> Result<Option<u64>> {
-    let mut parsed = None;
-    for value in headers.get_all(CONTENT_LENGTH) {
-        let value = value.to_str().map_err(message_error)?;
-        for item in value.split(',') {
-            let item = item.trim_matches([' ', '\t']);
-            if item.is_empty() || !item.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(Error::H3_MESSAGE_ERROR);
-            }
-            let value = item.parse::<u64>().map_err(message_error)?;
-            if parsed.is_some_and(|previous| previous != value) {
-                return Err(Error::H3_MESSAGE_ERROR);
-            }
-            parsed = Some(value);
-        }
+    let mut values = headers.get_all(CONTENT_LENGTH).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(Error::H3_MESSAGE_ERROR);
     }
-    Ok(parsed)
+    let value = value.to_str().map_err(message_error)?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Error::H3_MESSAGE_ERROR);
+    }
+    value.parse::<u64>().map(Some).map_err(message_error)
 }
 
 pub(crate) fn request_parts(fields: Vec<Field>) -> Result<RequestParts> {
@@ -264,9 +260,21 @@ mod tests {
         assert_eq!(response.status, StatusCode::OK);
 
         let mut headers = HeaderMap::new();
-        headers.append(http::header::CONTENT_LENGTH, "5, 5".parse().unwrap());
+        assert_eq!(content_length(&headers).unwrap(), None);
+        headers.append(CONTENT_LENGTH, "5".parse().unwrap());
         assert_eq!(content_length(&headers).unwrap(), Some(5));
-        headers.append(http::header::CONTENT_LENGTH, "6".parse().unwrap());
-        assert!(content_length(&headers).is_err());
+        headers.append(CONTENT_LENGTH, "5".parse().unwrap());
+        assert!(matches!(
+            content_length(&headers),
+            Err(Error::H3_MESSAGE_ERROR)
+        ));
+
+        for value in ["5, 5", "5, 6", "", "+5", "-5", "5x", "18446744073709551616"] {
+            headers.insert(CONTENT_LENGTH, value.parse().unwrap());
+            assert!(
+                matches!(content_length(&headers), Err(Error::H3_MESSAGE_ERROR)),
+                "{value:?}"
+            );
+        }
     }
 }

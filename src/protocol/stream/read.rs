@@ -1,65 +1,74 @@
 use std::{
-    io, mem,
+    io,
     pin::Pin,
-    task::{Context, Poll, Waker},
+    sync::Arc,
+    task::{Context, Poll},
 };
 
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::protocol::{frame::Goaway, stream::read::H3ReadStream::Idle};
+use super::{StreamState, bi::BiStream};
+use crate::Error;
+#[cfg(test)]
+use crate::protocol::frame::Goaway;
 
-pub enum H3ReadStream<RS> {
-    Idle(RS),
-    #[allow(dead_code, reason = "GOAWAY dispatch is not wired up yet")]
-    Polling(RS, Waker),
-    Goaway(Goaway),
-    Transition,
+/// Read handle for a stream owned by the connection.
+/// `W` is the paired transport writer; standalone readers use `()`.
+pub struct H3ReadStream<R, W = ()> {
+    pub(super) stream: Arc<BiStream<R, W>>,
 }
 
-impl<RS> H3ReadStream<RS> {
-    #[allow(dead_code, reason = "GOAWAY dispatch is not wired up yet")]
-    pub fn on_recv(&mut self, goaway: Goaway) {
-        if let Self::Polling(_, waker) = mem::replace(self, Self::Goaway(goaway)) {
-            waker.wake();
+impl<R> H3ReadStream<R> {
+    pub fn new(stream_id: u64, stream: R) -> Self {
+        Self {
+            stream: Arc::new(BiStream::new(
+                stream_id,
+                StreamState::Idle(stream),
+                StreamState::Closed(Error::H3_NO_ERROR),
+            )),
         }
     }
 }
 
-impl<RS: AsyncRead + Unpin> AsyncRead for H3ReadStream<RS> {
+impl<R, W> H3ReadStream<R, W> {
+    pub fn stream_id(&self) -> u64 {
+        self.stream.id
+    }
+}
+
+impl<R: AsyncRead + Unpin, W> AsyncRead for H3ReadStream<R, W> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-
-        match mem::replace(this, Self::Transition) {
-            Self::Idle(mut rs) | Self::Polling(mut rs, _) => {
-                match Pin::new(&mut rs).poll_read(cx, buf) {
-                    Poll::Pending => {
-                        *this = Self::Polling(rs, cx.waker().clone());
-                        Poll::Pending
-                    }
-                    Poll::Ready(result) => {
-                        *this = Self::Idle(rs);
-                        Poll::Ready(result)
-                    }
-                }
-            }
-            Self::Goaway(goaway) => {
-                *this = Self::Goaway(goaway);
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "received GOAWAY",
-                )))
-            }
-            Self::Transition => unreachable!(),
+        // A zero-capacity read is not evidence of EOF.
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
         }
+        let before = buf.filled().len();
+        let mut state = self.stream.recv.lock().unwrap();
+        if matches!(*state, StreamState::Finished) {
+            return Poll::Ready(Ok(()));
+        }
+        let result = state.poll_io(cx, |recv, cx| recv.poll_read(cx, buf));
+        if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() == before {
+            state.terminate(StreamState::Finished);
+        }
+        result
     }
 }
 
-impl<RS: AsyncRead> From<RS> for H3ReadStream<RS> {
-    fn from(value: RS) -> Self {
-        Idle(value)
+impl<R, W> Drop for H3ReadStream<R, W> {
+    fn drop(&mut self) {
+        self.stream
+            .terminate_read(StreamState::Closed(Error::H3_REQUEST_CANCELLED));
+    }
+}
+
+#[cfg(test)]
+impl<R, W> H3ReadStream<R, W> {
+    pub(crate) fn recv_goaway(&mut self, goaway: Goaway) {
+        self.stream.terminate_read(StreamState::Goaway(goaway));
     }
 }

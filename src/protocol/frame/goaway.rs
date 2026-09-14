@@ -6,8 +6,8 @@ use super::{EncodeSize, Frame, FrameType, GetFrameType, Write, WriteFrameType, v
 use crate::{Error, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Goaway {
-    pub(crate) id: VarInt,
+pub struct Goaway {
+    pub id: VarInt,
 }
 
 pub(crate) async fn be_goaway_frame<T: AsyncRead + Unpin + ?Sized>(

@@ -1,0 +1,110 @@
+use super::*;
+
+async fn write_bytes_response<W: AsyncWrite + Unpin>(
+    response: &Response<Bytes>,
+    send: W,
+) -> Result<()> {
+    super::write_bytes_response(response, H3WriteStream::new(0, send), &Qpack::default()).await
+}
+
+async fn write_streaming_response<W: AsyncWrite + Unpin>(
+    response: &Response<ArcWndBuf>,
+    send: W,
+) -> Result<()> {
+    super::write_streaming_response(response, H3WriteStream::new(0, send), &Qpack::default()).await
+}
+
+#[tokio::test]
+async fn writes_buffered_and_streaming_response_frames() {
+    let mut fixed_response = Response::default();
+    fixed_response
+        .set_status(StatusCode::CREATED)
+        .set_body(Bytes::from_static(b"hello"));
+    fixed_response
+        .message
+        .0
+        .lock()
+        .unwrap()
+        .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+    let mut encoded = Vec::new();
+    write_bytes_response(&fixed_response, &mut encoded)
+        .await
+        .unwrap();
+    let mut input = encoded.as_slice();
+    let H3Frame::Headers(frame) = be_frame(&mut input).await.unwrap() else {
+        panic!("expected HEADERS")
+    };
+    assert_eq!(
+        headers::response_parts(
+            qpack::be_field_section(&frame.payload.field_section)
+                .unwrap()
+                .1
+        )
+        .unwrap()
+        .status,
+        StatusCode::CREATED
+    );
+    let H3Frame::Data(frame) = be_frame(&mut input).await.unwrap() else {
+        panic!("expected DATA")
+    };
+    assert_eq!(frame.length.into_u64(), 5);
+    assert_eq!(input, b"hello");
+
+    let message = Message::<Bytes>::default().with_body(ArcWndBuf::new(2));
+    let mut response = Response::from(ArcMessage::from(message));
+    response.set_status(StatusCode::OK);
+    let mut producer = Response::from(response.message.clone());
+    let mut encoded = Vec::new();
+    let (sent, produced) = tokio::join!(write_streaming_response(&response, &mut encoded), async {
+        let mut body = &b"stream"[..];
+        while !body.is_empty() {
+            let count = producer.write(body).await?;
+            body = &body[count..];
+        }
+        producer.finish().await
+    });
+    sent.unwrap();
+    produced.unwrap();
+    let mut input = encoded.as_slice();
+    let H3Frame::Headers(_) = be_frame(&mut input).await.unwrap() else {
+        panic!("expected HEADERS")
+    };
+    let mut body = Vec::new();
+    while !input.is_empty() {
+        let H3Frame::Data(frame) = be_frame(&mut input).await.unwrap() else {
+            panic!("expected DATA")
+        };
+        let count = frame.length.into_u64() as usize;
+        body.extend_from_slice(&input[..count]);
+        input = &input[count..];
+    }
+    assert_eq!(body, b"stream");
+
+    fixed_response
+        .message
+        .0
+        .lock()
+        .unwrap()
+        .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("1"));
+    let mut output = Vec::new();
+    assert_eq!(
+        write_bytes_response(&fixed_response, &mut output)
+            .await
+            .unwrap_err(),
+        Error::H3_MESSAGE_ERROR
+    );
+    assert!(output.is_empty());
+
+    let message = Message::<Bytes>::default().with_body(ArcWndBuf::new(1));
+    let mut response = Response::from(ArcMessage::from(message));
+    response.set_status(StatusCode::OK);
+    let mut producer = Response::from(response.message.clone());
+    let (writer, reader) = duplex(1);
+    drop(reader);
+    let (sent, produced) = tokio::join!(write_streaming_response(&response, writer), async {
+        producer.write(b"a").await?;
+        producer.write(b"b").await
+    });
+    assert_eq!(sent.unwrap_err(), Error::H3_INTERNAL_ERROR);
+    assert_eq!(produced.unwrap_err(), Error::H3_REQUEST_CANCELLED);
+}
