@@ -28,7 +28,16 @@ pub(crate) enum StreamState<T> {
 
 impl<T> StreamState<T> {
     pub(super) fn is_terminal(&self) -> bool {
-        matches!(self, Self::Goaway(_) | Self::Closed(_) | Self::Finished)
+        self.result().is_some()
+    }
+
+    pub(super) fn result(&self) -> Option<crate::Result<()>> {
+        match self {
+            Self::Finished => Some(Ok(())),
+            Self::Closed(error) => Some(Err(*error)),
+            Self::Goaway(_) => Some(Err(Error::H3_REQUEST_REJECTED)),
+            _ => None,
+        }
     }
 
     pub(crate) fn terminate(&mut self, terminal: Self) -> Option<Waker> {

@@ -1,11 +1,14 @@
 //! Connection ownership and GOAWAY dispatch for bidirectional streams.
 use std::{
     collections::HashMap,
+    future::Future,
     mem,
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
 use qbase::varint::VarInt;
+use tokio::sync::Notify;
 
 use super::{H3ReadStream, H3WriteStream, StreamState};
 use crate::{
@@ -13,11 +16,17 @@ use crate::{
     protocol::{frame::Goaway, qpack::Qpack},
 };
 
+type StopSignal = Pin<Box<dyn Future<Output = Error> + Send>>;
+type ErrorHandler = Box<dyn FnOnce(Error) + Send>;
+
 /// The connection and both application handles refer to this same stream.
 pub(crate) struct BiStream<R, W> {
     pub(super) id: u64,
     pub(super) recv: Mutex<StreamState<R>>,
     pub(super) send: Mutex<StreamState<W>>,
+    pub(super) send_changed: Notify,
+    pub(super) send_stopped: Mutex<Option<StopSignal>>,
+    pub(super) send_error_handler: Mutex<Option<ErrorHandler>>,
 }
 
 impl<R, W> BiStream<R, W> {
@@ -26,6 +35,9 @@ impl<R, W> BiStream<R, W> {
             id,
             recv: Mutex::new(recv),
             send: Mutex::new(send),
+            send_changed: Notify::new(),
+            send_stopped: Mutex::new(None),
+            send_error_handler: Mutex::new(None),
         }
     }
 
@@ -53,6 +65,22 @@ impl<R, W> BiStream<R, W> {
         if let Some(waker) = waker {
             waker.wake();
         }
+        self.notify_write();
+    }
+
+    pub(super) fn notify_write(&self) {
+        let (result, notify) = {
+            let state = self.send.lock().unwrap();
+            let Some(result) = state.result() else {
+                return;
+            };
+            (result, self.send_error_handler.lock().unwrap().take())
+        };
+        // A handler may wake application I/O; release the stream locks first.
+        if let (Err(error), Some(notify)) = (result, notify) {
+            notify(error);
+        }
+        self.send_changed.notify_waiters();
     }
 
     fn goaway(&self, goaway: &Goaway) {

@@ -27,6 +27,104 @@ async fn write_streaming_response<W: AsyncWrite + Unpin>(
 }
 
 #[tokio::test]
+async fn respond_sends_head_response_without_data() {
+    for buffered in [true, false] {
+        let mut response = Response::<Bytes>::default();
+        response.set_status(StatusCode::OK);
+        response
+            .message
+            .0
+            .lock()
+            .unwrap()
+            .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+        let response: common::Response<Write> = if buffered {
+            response.into()
+        } else {
+            let mut response = response.streaming(1);
+            response.finish().await.unwrap();
+            response.into()
+        };
+        let mut encoded = Vec::new();
+        super::respond(
+            response,
+            H3WriteStream::new(4, &mut encoded),
+            Arc::new(Qpack::default()),
+            &Method::HEAD,
+        )
+        .await
+        .unwrap();
+
+        let mut input = encoded.as_slice();
+        let H3Frame::Headers(frame) = be_frame(&mut input).await.unwrap() else {
+            panic!("expected HEADERS")
+        };
+        let fields = Qpack::default()
+            .decode(4, frame.payload.field_section)
+            .await
+            .unwrap();
+        let parts = headers::response_parts(fields).unwrap();
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(parts.headers[header::CONTENT_LENGTH], "5");
+        assert!(input.is_empty(), "HEAD response must not contain DATA");
+    }
+}
+
+#[tokio::test]
+async fn respond_rejects_length_mismatch_and_forbidden_body() {
+    for buffered in [true, false] {
+        for (method, body) in [(Method::GET, &b""[..]), (Method::HEAD, &b"hello"[..])] {
+            let mut response = Response::<Bytes>::default();
+            response.set_status(StatusCode::OK);
+            response
+                .message
+                .0
+                .lock()
+                .unwrap()
+                .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+            let response: common::Response<Write> = if buffered {
+                response.set_body(Bytes::copy_from_slice(body));
+                response.into()
+            } else {
+                let mut response = response.streaming(5);
+                assert_eq!(response.write(body).await.unwrap(), body.len());
+                response.finish().await.unwrap();
+                response.into()
+            };
+            let producer = match &response {
+                common::Response::Streaming(response) => Some(response.clone()),
+                _ => None,
+            };
+            let mut encoded = Vec::new();
+            assert_eq!(
+                super::respond(
+                    response,
+                    H3WriteStream::new(4, &mut encoded),
+                    Arc::new(Qpack::default()),
+                    &method,
+                )
+                .await,
+                Err(Error::H3_MESSAGE_ERROR),
+                "method={method}, buffered={buffered}"
+            );
+            if let Some(mut producer) = producer {
+                assert_eq!(producer.write(b"x").await, Err(Error::H3_MESSAGE_ERROR));
+                assert_eq!(producer.finish().await, Err(Error::H3_MESSAGE_ERROR));
+            }
+
+            // Streaming validation may follow HEADERS, but must precede DATA.
+            let mut input = encoded.as_slice();
+            if !input.is_empty() {
+                assert!(matches!(
+                    be_frame(&mut input).await.unwrap(),
+                    H3Frame::Headers(_)
+                ));
+            }
+            assert!(input.is_empty(), "invalid response must not contain DATA");
+        }
+    }
+}
+
+#[tokio::test]
 async fn writes_buffered_and_streaming_response_frames() {
     let mut fixed_response = Response::default();
     fixed_response
@@ -118,48 +216,5 @@ async fn writes_buffered_and_streaming_response_frames() {
         producer.write(b"b").await
     });
     assert_eq!(sent.unwrap_err(), Error::H3_INTERNAL_ERROR);
-    assert_eq!(produced.unwrap_err(), Error::H3_REQUEST_CANCELLED);
-}
-
-#[tokio::test]
-async fn respond_sends_head_response_without_data() {
-    for buffered in [true, false] {
-        let mut response = Response::<Bytes>::default();
-        response.set_status(StatusCode::OK);
-        response
-            .message
-            .0
-            .lock()
-            .unwrap()
-            .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
-        let response: common::Response<Write> = if buffered {
-            response.into()
-        } else {
-            let mut response = response.streaming(1);
-            response.finish().await.unwrap();
-            response.into()
-        };
-        let mut encoded = Vec::new();
-        super::respond(
-            response,
-            H3WriteStream::new(4, &mut encoded),
-            Arc::new(Qpack::default()),
-            &Method::HEAD,
-        )
-        .await
-        .unwrap();
-
-        let mut input = encoded.as_slice();
-        let H3Frame::Headers(frame) = be_frame(&mut input).await.unwrap() else {
-            panic!("expected HEADERS")
-        };
-        let fields = Qpack::default()
-            .decode(4, frame.payload.field_section)
-            .await
-            .unwrap();
-        let parts = headers::response_parts(fields).unwrap();
-        assert_eq!(parts.status, StatusCode::OK);
-        assert_eq!(parts.headers[header::CONTENT_LENGTH], "5");
-        assert!(input.is_empty(), "HEAD response must not contain DATA");
-    }
+    assert_eq!(produced.unwrap_err(), Error::H3_INTERNAL_ERROR);
 }

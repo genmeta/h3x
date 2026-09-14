@@ -10,5 +10,6 @@ use crate::{
     protocol::qpack::{self, WriteFieldSection},
 };
 
+mod lifecycle;
 mod request;
 mod response;

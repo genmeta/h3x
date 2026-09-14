@@ -1,4 +1,4 @@
-use std::future::Future;
+use std::{future::Future, pin::Pin};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -23,6 +23,15 @@ pub trait Transport: Send + Sync + 'static {
     fn stop(recv: &mut Self::Recv, error_code: u64);
 
     fn cancel(send: &mut Self::Send, error_code: u64);
+
+    /// Optionally observe peer STOP_SENDING while an upload waits for body data.
+    /// Return an owned notification future. Without it, write/shutdown errors still
+    /// report peer stops, but an idle upload cannot observe them immediately.
+    fn send_stopped(
+        _send: &Self::Send,
+    ) -> Option<Pin<Box<dyn Future<Output = Error> + Send + 'static>>> {
+        None
+    }
 
     fn open_bi_stream(
         &self,

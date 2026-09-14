@@ -205,7 +205,13 @@ impl<T: Transport> H3Connection<T> {
         if id > VARINT_MAX || !id.is_multiple_of(4) {
             return Err(Error::H3_ID_ERROR);
         }
-        self.bi.insert(id, recv, send)
+        let stopped = T::send_stopped(&send);
+        let (send, recv) = self.bi.insert(id, recv, send)?;
+        let send = match stopped {
+            Some(stopped) => send.with_stop_signal(stopped),
+            None => send,
+        };
+        Ok((send, recv))
     }
 
     pub fn error(&self) -> Option<Error> {

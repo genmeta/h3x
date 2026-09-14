@@ -165,7 +165,7 @@ async fn dropping_request_releases_transport_halves_and_upload() {
     let (_, (mut recv, mut send)) = peer.accept_bi_stream().await.unwrap();
     let mut partial = Vec::new();
     recv.read_to_end(&mut partial).await.unwrap(); // Drop closed the unfinished sending half.
-    assert!(!partial.is_empty());
+    // Cancellation can precede the upload task's first poll and send no bytes.
     assert!(send.write_all(b"response").await.is_err());
     assert_eq!(
         upload.write(b"body").await,

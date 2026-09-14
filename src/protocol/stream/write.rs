@@ -1,4 +1,5 @@
 use std::{
+    future::{Future, poll_fn},
     io,
     pin::Pin,
     sync::Arc,
@@ -34,6 +35,66 @@ impl<W, R> H3WriteStream<W, R> {
     pub fn stream_id(&self) -> u64 {
         self.stream.id
     }
+
+    pub(crate) fn reset(&self, error: Error) {
+        self.stream.terminate_write(StreamState::Closed(error));
+    }
+
+    /// Notify the message layer once if sending fails or is cancelled.
+    /// A completed send discards the handler; it cannot be cancelled by Drop.
+    pub(crate) fn on_error(&self, notify: impl FnOnce(Error) + Send + 'static) {
+        let result = {
+            let state = self.stream.send.lock().unwrap();
+            match state.result() {
+                Some(result) => result,
+                None => {
+                    *self.stream.send_error_handler.lock().unwrap() = Some(Box::new(notify));
+                    return;
+                }
+            }
+        };
+        if let Err(error) = result {
+            notify(error);
+        }
+    }
+
+    /// Attach an adapter's peer STOP_SENDING notification, independent of writes.
+    /// The future must own its notification handle rather than borrow this stream.
+    /// Without a signal, peer stops are observed by the next write or shutdown.
+    pub fn with_stop_signal(self, stopped: impl Future<Output = Error> + Send + 'static) -> Self {
+        *self.stream.send_stopped.lock().unwrap() = Some(Box::pin(stopped));
+        self.stream.send_changed.notify_waiters();
+        self
+    }
+
+    /// Observe send termination without borrowing the writer or replacing its I/O waker.
+    pub(crate) fn stopped(&self) -> impl Future<Output = Error> + use<W, R> {
+        let stream = Arc::clone(&self.stream);
+        async move {
+            loop {
+                let changed = stream.send_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if let Some(Err(error)) = stream.send.lock().unwrap().result() {
+                    return error;
+                }
+                tokio::select! {
+                    _ = &mut changed => {}
+                    error = poll_fn(|cx| {
+                        let mut signal = stream.send_stopped.lock().unwrap();
+                        let result = match signal.as_mut() {
+                            Some(signal) => signal.as_mut().poll(cx),
+                            None => Poll::Pending,
+                        };
+                        if result.is_ready() {
+                            *signal = None;
+                        }
+                        result
+                    }) => stream.terminate_write(StreamState::Closed(error)),
+                }
+            }
+        }
+    }
 }
 
 impl<W: AsyncWrite + Unpin, R> H3WriteStream<W, R> {
@@ -47,6 +108,11 @@ impl<W: AsyncWrite + Unpin, R> H3WriteStream<W, R> {
         let result = state.poll_io(cx, poll);
         if finish && matches!(result, Poll::Ready(Ok(_))) {
             state.terminate(StreamState::Finished);
+        }
+        let terminal = state.is_terminal();
+        drop(state);
+        if terminal {
+            self.stream.notify_write();
         }
         result
     }
@@ -81,8 +147,7 @@ impl<W: AsyncWrite + Unpin, R> AsyncWrite for H3WriteStream<W, R> {
 
 impl<W, R> Drop for H3WriteStream<W, R> {
     fn drop(&mut self) {
-        self.stream
-            .terminate_write(StreamState::Closed(Error::H3_REQUEST_CANCELLED));
+        self.reset(Error::H3_REQUEST_CANCELLED);
     }
 }
 
@@ -114,6 +179,35 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn error_handler_preserves_terminal_state() {
+        use tokio::io::AsyncWriteExt;
+
+        for already_failed in [false, true] {
+            let mut send = H3WriteStream::new(0, tokio::io::sink());
+            if already_failed {
+                send.reset(Error::H3_REQUEST_REJECTED);
+            }
+            let (notify, notified) = tokio::sync::oneshot::channel();
+            send.on_error(move |error| notify.send(error).unwrap());
+            send.reset(Error::H3_REQUEST_REJECTED);
+            send.reset(Error::H3_REQUEST_CANCELLED);
+            assert_eq!(
+                Error::from(send.flush().await.unwrap_err()),
+                Error::H3_REQUEST_REJECTED
+            );
+            drop(send);
+            assert_eq!(notified.await.unwrap(), Error::H3_REQUEST_REJECTED);
+        }
+
+        let mut send = H3WriteStream::new(0, tokio::io::sink());
+        send.shutdown().await.unwrap();
+        let (notify, notified) = tokio::sync::oneshot::channel();
+        send.on_error(move |error| notify.send(error).unwrap());
+        drop(send);
+        assert!(notified.await.is_err());
     }
 
     #[test]
