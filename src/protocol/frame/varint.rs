@@ -1,3 +1,5 @@
+use std::io;
+
 use qbase::varint::VarInt;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -6,13 +8,30 @@ use crate::{Error, Result};
 /// Read one QUIC varint.
 /// Cancellation may consume part of the integer; keep polling the same future.
 pub(crate) async fn be_varint<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<VarInt> {
+    be_varint_or_eof(reader).await?.ok_or(Error::H3_FRAME_ERROR)
+}
+
+/// Preserve transport errors and return `None` on FIN, including a partial integer.
+/// Cancellation may consume part of the integer; keep polling the same future.
+pub(crate) async fn be_varint_or_eof<T: AsyncRead + Unpin + ?Sized>(
+    reader: &mut T,
+) -> io::Result<Option<VarInt>> {
     let mut encoded = [0; VarInt::MAX_SIZE];
-    reader.read_exact(&mut encoded[..1]).await?;
+    if reader.read(&mut encoded[..1]).await? == 0 {
+        return Ok(None);
+    }
     let len = 1usize << (encoded[0] >> 6);
-    reader.read_exact(&mut encoded[1..len]).await?;
+    let mut read = 1;
+    while read < len {
+        let count = reader.read(&mut encoded[read..len]).await?;
+        if count == 0 {
+            return Ok(None);
+        }
+        read += count;
+    }
     qbase::varint::be_varint(&encoded[..len])
-        .map(|(_, value)| value)
-        .map_err(|_| Error::H3_FRAME_ERROR)
+        .map(|(_, value)| Some(value))
+        .map_err(|_| Error::H3_FRAME_ERROR.into())
 }
 
 #[cfg(test)]

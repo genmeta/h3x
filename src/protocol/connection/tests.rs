@@ -155,6 +155,12 @@ impl Transport for Memory {
         *send = duplex(1).0;
     }
 
+    fn is_stream_reset(error: &std::io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|source| source.is::<qbase::frame::ResetStreamError>())
+    }
+
     async fn open_bi_stream(&self) -> Result<Option<Bi>> {
         if self.blocked_open.get() {
             std::future::pending::<()>().await;

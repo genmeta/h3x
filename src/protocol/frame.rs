@@ -14,7 +14,7 @@ mod push_promise;
 mod settings;
 mod varint;
 
-pub(crate) use varint::be_varint;
+pub(crate) use varint::{be_varint, be_varint_or_eof};
 
 pub(crate) const MAX_BUFFERED_FRAME_PAYLOAD: usize = 64 * 1024;
 pub(crate) const MAX_DATA_CHUNK: usize = 16 * 1024;
