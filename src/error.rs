@@ -45,7 +45,10 @@ impl From<io::Error> for Error {
         error
             .get_ref()
             .and_then(|source| source.downcast_ref().copied())
-            .unwrap_or(Self::H3_INTERNAL_ERROR)
+            .unwrap_or(match error.kind() {
+                io::ErrorKind::UnexpectedEof => Self::H3_FRAME_ERROR,
+                _ => Self::H3_INTERNAL_ERROR,
+            })
     }
 }
 
@@ -66,5 +69,19 @@ mod tests {
         let error = Error::from(io::Error::from(Error::H3_MESSAGE_ERROR));
         assert_eq!(error, Error::H3_MESSAGE_ERROR);
         assert_eq!(error.as_u64(), 0x010e);
+        assert_eq!(
+            Error::from(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                Error::H3_REQUEST_REJECTED
+            )),
+            Error::H3_REQUEST_REJECTED,
+        );
+        for (kind, expected) in [
+            (io::ErrorKind::UnexpectedEof, Error::H3_FRAME_ERROR),
+            (io::ErrorKind::BrokenPipe, Error::H3_INTERNAL_ERROR),
+            (io::ErrorKind::ConnectionReset, Error::H3_INTERNAL_ERROR),
+        ] {
+            assert_eq!(Error::from(io::Error::from(kind)), expected);
+        }
     }
 }

@@ -7,15 +7,9 @@ use crate::{Error, Result};
 /// Cancellation may consume part of the integer; keep polling the same future.
 pub(crate) async fn be_varint<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<VarInt> {
     let mut encoded = [0; VarInt::MAX_SIZE];
-    reader
-        .read_exact(&mut encoded[..1])
-        .await
-        .map_err(|_| Error::H3_FRAME_ERROR)?;
+    reader.read_exact(&mut encoded[..1]).await?;
     let len = 1usize << (encoded[0] >> 6);
-    reader
-        .read_exact(&mut encoded[1..len])
-        .await
-        .map_err(|_| Error::H3_FRAME_ERROR)?;
+    reader.read_exact(&mut encoded[1..len]).await?;
     qbase::varint::be_varint(&encoded[..len])
         .map(|(_, value)| value)
         .map_err(|_| Error::H3_FRAME_ERROR)

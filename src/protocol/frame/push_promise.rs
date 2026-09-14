@@ -3,10 +3,10 @@ use qbase::varint::{VarInt, WriteVarInt};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{
-    EncodeSize, Frame, FrameType, GetFrameType, Write, WriteFrameType, check_payload_length,
+    EncodeSize, Frame, FrameType, GetFrameType, MAX_BUFFERED_FRAME_PAYLOAD, Write, WriteFrameType,
     read_payload, varint::be_varint,
 };
-use crate::Result;
+use crate::{Error, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PushPromise {
@@ -18,7 +18,9 @@ pub(crate) async fn be_push_promise_frame<T: AsyncRead + Unpin + ?Sized>(
     reader: &mut T,
     length: VarInt,
 ) -> Result<Frame<PushPromise>> {
-    check_payload_length(length.into_u64())?;
+    if length.into_u64() > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
+        return Err(Error::H3_EXCESSIVE_LOAD);
+    }
     let mut payload = reader.take(length.into_u64());
     let id = be_varint(&mut payload).await?;
     let remaining = payload.limit();

@@ -22,7 +22,7 @@ pub enum Response<IO> {
     Streaming(response::Response<IO, ArcWndBuf>),
 }
 
-impl ReadRequest for Request<Read> {
+impl<IO> ReadRequest for Request<IO> {
     fn method(&self) -> http::Method {
         match self {
             Self::Bytes(request) => request.method(),
@@ -78,6 +78,7 @@ impl ReadResponse for Response<Read> {
         }
     }
 }
+
 impl WriteResponse for Response<Write> {
     fn set_status(&mut self, status: http::StatusCode) -> &mut Self {
         match self {
