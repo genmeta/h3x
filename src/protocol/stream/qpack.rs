@@ -47,14 +47,14 @@ impl<T: Transport> Qpack<T> {
     pub(crate) async fn send_encoder(
         &self,
         mut receiver: mpsc::Receiver<Vec<EncoderInstruction>>,
-        bi: &BiStreams<T::Recv, T::Send>,
+        bi: &BiStreams<T::StreamReader, T::StreamWriter>,
     ) {
         // Keep the half alive until this task has handled its result.
         let mut send = None;
         let result: Result<()> = async {
             send = Some(
                 self.transport
-                    .open_uni_stream()
+                    .open_uni()
                     .await?
                     .ok_or(Error::H3_STREAM_CREATION_ERROR)?
                     .1,
@@ -103,12 +103,12 @@ impl<T: Transport> Qpack<T> {
         }
     }
 
-    pub(crate) async fn send_decoder(&self, bi: &BiStreams<T::Recv, T::Send>) {
+    pub(crate) async fn send_decoder(&self, bi: &BiStreams<T::StreamReader, T::StreamWriter>) {
         let mut send = None;
         let result: Result<()> = async {
             send = Some(
                 self.transport
-                    .open_uni_stream()
+                    .open_uni()
                     .await?
                     .ok_or(Error::H3_STREAM_CREATION_ERROR)?
                     .1,

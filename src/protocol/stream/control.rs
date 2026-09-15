@@ -20,7 +20,7 @@ pub(crate) async fn send<T: Transport>(
     settings: &Settings,
     qpack: &Qpack<T>,
     cursor: &StreamCursor,
-    bi: &BiStreams<T::Recv, T::Send>,
+    bi: &BiStreams<T::StreamReader, T::StreamWriter>,
     written: &ArcReceiving<Result<()>>,
 ) {
     let mut send = None;
@@ -33,7 +33,7 @@ pub(crate) async fn send<T: Transport>(
             return;
         },
         result = async {
-            send = Some(transport.open_uni_stream().await?
+            send = Some(transport.open_uni().await?
                 .ok_or(Error::H3_STREAM_CREATION_ERROR)?.1);
             let send = send.as_mut().unwrap();
             send.write_all(&[0]).await.map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
@@ -59,12 +59,12 @@ pub(crate) async fn send<T: Transport>(
 }
 
 pub(crate) async fn receive_control<T: Transport>(
-    recv: &mut T::Recv,
+    recv: &mut T::StreamReader,
     transport: &T,
     settings: &Settings,
     qpack: &Qpack<T>,
     cursor: &StreamCursor,
-    bi: &BiStreams<T::Recv, T::Send>,
+    bi: &BiStreams<T::StreamReader, T::StreamWriter>,
 ) -> Result<()> {
     let H3Frame::Settings(frame) = read(recv, true).await? else {
         return Err(Error::H3_MISSING_SETTINGS);
@@ -93,7 +93,7 @@ fn apply<T: Transport>(
     role: Role,
     qpack: &Qpack<T>,
     cursor: &StreamCursor,
-    bi: &BiStreams<T::Recv, T::Send>,
+    bi: &BiStreams<T::StreamReader, T::StreamWriter>,
     max_push: &mut Option<u64>,
     peer_boundary: &mut Option<StreamId>,
 ) -> Result<()> {
@@ -129,6 +129,7 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(recv: &mut R, first: bool) -> Res
         let ty = frame::be_varint(recv)
             .await
             .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?
+            .ok_or(Error::H3_CLOSED_CRITICAL_STREAM)?
             .into_u64();
         let ty = match (first, ty) {
             (true, 4) => Some(FrameType::Settings),
@@ -141,7 +142,8 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(recv: &mut R, first: bool) -> Res
         };
         let length = frame::be_varint(recv)
             .await
-            .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+            .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?
+            .ok_or(Error::H3_CLOSED_CRITICAL_STREAM)?;
         if let Some(ty) = ty {
             if length.into_u64() > frame::MAX_BUFFERED_FRAME_PAYLOAD as u64 {
                 return Err(Error::H3_EXCESSIVE_LOAD);

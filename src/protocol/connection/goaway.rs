@@ -35,7 +35,7 @@ impl StreamCursor {
         transport: Arc<T>,
         settings: Arc<Settings>,
         qpack: Arc<Qpack<T>>,
-        bi: Arc<BiStreams<T::Recv, T::Send>>,
+        bi: Arc<BiStreams<T::StreamReader, T::StreamWriter>>,
     ) -> (Arc<Self>, ArcReceiving<Result<()>>) {
         let cursor = Arc::new(Self::for_role(transport.role()));
         let written = ArcReceiving::default();

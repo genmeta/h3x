@@ -14,7 +14,7 @@ mod push_promise;
 mod settings;
 mod varint;
 
-pub(crate) use varint::{be_varint, be_varint_or_eof};
+pub(crate) use varint::be_varint;
 
 pub(crate) const MAX_BUFFERED_FRAME_PAYLOAD: usize = 64 * 1024;
 pub(crate) const MAX_DATA_CHUNK: usize = 16 * 1024;
@@ -124,8 +124,12 @@ impl GetFrameType for H3Frame {
 /// EOF (including a partial frame) is an error.
 /// Cancellation can consume a prefix; keep polling the same future.
 pub(crate) async fn be_frame<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<H3Frame> {
-    let ty: FrameType = be_varint(reader).await?.into_u64().try_into()?;
-    let length = be_varint(reader).await?;
+    let ty: FrameType = be_varint(reader)
+        .await?
+        .ok_or(Error::H3_FRAME_ERROR)?
+        .into_u64()
+        .try_into()?;
+    let length = be_varint(reader).await?.ok_or(Error::H3_FRAME_ERROR)?;
     be_frame_payload(reader, ty, length).await
 }
 
@@ -441,11 +445,11 @@ mod tests {
                 assert_eq!(frame.frame_type(), FrameType::try_from(ty as u64).unwrap());
                 let mut envelope = encoded.as_slice();
                 assert_eq!(
-                    be_varint(&mut envelope).await.unwrap().into_u64(),
+                    be_varint(&mut envelope).await.unwrap().unwrap().into_u64(),
                     ty as u64
                 );
                 assert_eq!(
-                    be_varint(&mut envelope).await.unwrap().into_u64(),
+                    be_varint(&mut envelope).await.unwrap().unwrap().into_u64(),
                     length as u64
                 );
                 if ty == 0 {

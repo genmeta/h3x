@@ -22,7 +22,9 @@ pub(crate) async fn be_push_promise_frame<T: AsyncRead + Unpin + ?Sized>(
         return Err(Error::H3_EXCESSIVE_LOAD);
     }
     let mut payload = reader.take(length.into_u64());
-    let id = be_varint(&mut payload).await?;
+    let id = be_varint(&mut payload)
+        .await?
+        .ok_or(Error::H3_FRAME_ERROR)?;
     let remaining = payload.limit();
     let fields = read_payload(&mut payload, remaining).await?;
     Ok(Frame {

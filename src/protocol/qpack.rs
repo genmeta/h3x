@@ -99,7 +99,7 @@ impl<T: Transport> Qpack<T> {
     pub(crate) fn new(
         transport: Arc<T>,
         settings: &super::connection::Settings,
-        bi: Arc<super::stream::bi::BiStreams<T::Recv, T::Send>>,
+        bi: Arc<super::stream::bi::BiStreams<T::StreamReader, T::StreamWriter>>,
     ) -> Result<Arc<Self>> {
         let (local, max_fields) = limits(&settings.local);
         let (sender, receiver) = mpsc::channel(16);

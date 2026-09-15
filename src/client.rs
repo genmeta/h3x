@@ -109,7 +109,7 @@ where
             } => result,
         };
         if let Err(error) = result {
-            ws.reset(error);
+            ws.cancel_with_error(error);
         }
         result
     })
@@ -156,7 +156,7 @@ where
             } => result,
         };
         if let Err(error) = result {
-            ws.reset(error);
+            ws.cancel_with_error(error);
             body.set_error(error);
         }
         result

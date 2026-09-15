@@ -85,21 +85,21 @@ struct Incoming {
 }
 
 impl Transport for Incoming {
-    type Recv = Reader;
-    type Send = Writer;
+    type StreamReader = Reader;
+    type StreamWriter = Writer;
     fn role(&self) -> Role {
         Role::Client
     }
-    async fn open_bi_stream(&self) -> Result<Option<(u64, (Reader, Writer))>> {
+    async fn open_bi(&self) -> Result<Option<(u64, (Reader, Writer))>> {
         Err(self.terminated().await)
     }
-    async fn accept_bi_stream(&self) -> Result<(u64, (Reader, Writer))> {
+    async fn accept_bi(&self) -> Result<(u64, (Reader, Writer))> {
         Err(self.terminated().await)
     }
-    async fn open_uni_stream(&self) -> Result<Option<(u64, Writer)>> {
+    async fn open_uni(&self) -> Result<Option<(u64, Writer)>> {
         Err(self.terminated().await)
     }
-    async fn accept_uni_stream(&self) -> Result<(u64, Reader)> {
+    async fn accept_uni(&self) -> Result<(u64, Reader)> {
         self.probe
             .accept_tasks
             .lock()

@@ -3,17 +3,11 @@ use std::io;
 use qbase::varint::VarInt;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::{Error, Result};
-
-/// Read one QUIC varint.
-/// Cancellation may consume part of the integer; keep polling the same future.
-pub(crate) async fn be_varint<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<VarInt> {
-    be_varint_or_eof(reader).await?.ok_or(Error::H3_FRAME_ERROR)
-}
+use crate::Error;
 
 /// Preserve transport errors and return `None` on FIN, including a partial integer.
 /// Cancellation may consume part of the integer; keep polling the same future.
-pub(crate) async fn be_varint_or_eof<T: AsyncRead + Unpin + ?Sized>(
+pub(crate) async fn be_varint<T: AsyncRead + Unpin + ?Sized>(
     reader: &mut T,
 ) -> io::Result<Option<VarInt>> {
     let mut encoded = [0; VarInt::MAX_SIZE];
@@ -54,12 +48,12 @@ mod tests {
             };
             let read = async {
                 for expected in [63, 16383, 1073741823, (1u64 << 62) - 1] {
-                    assert_eq!(be_varint(&mut reader).await.unwrap().into_u64(), expected);
+                    assert_eq!(
+                        be_varint(&mut reader).await.unwrap().unwrap().into_u64(),
+                        expected
+                    );
                 }
-                assert_eq!(
-                    be_varint(&mut reader).await.unwrap_err(),
-                    Error::H3_FRAME_ERROR
-                );
+                assert_eq!(be_varint(&mut reader).await.unwrap(), None);
             };
             tokio::join!(write, read);
         }
@@ -67,10 +61,7 @@ mod tests {
             let mut partial = [0xff; 8];
             partial[0] = prefix;
             for end in 1..len {
-                assert_eq!(
-                    be_varint(&mut &partial[..end]).await.unwrap_err(),
-                    Error::H3_FRAME_ERROR
-                );
+                assert_eq!(be_varint(&mut &partial[..end]).await.unwrap(), None);
             }
         }
     }

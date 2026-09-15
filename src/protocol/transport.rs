@@ -18,22 +18,22 @@ use crate::{Error, Result};
 )]
 pub trait Transport: Send + Sync + 'static {
     /// Report FIN as a successful read of zero bytes and retain RESET metadata in I/O errors.
-    type Recv: AsyncRead + StopSending + Unpin + Send + 'static;
-    type Send: AsyncWrite + CancelStream + Unpin + Send + 'static;
+    type StreamReader: AsyncRead + StopSending + Unpin + Send + 'static;
+    type StreamWriter: AsyncWrite + CancelStream + Unpin + Send + 'static;
 
     fn role(&self) -> Role;
 
-    fn open_bi_stream(
+    fn open_bi(
         &self,
-    ) -> impl Future<Output = Result<Option<(u64, (Self::Recv, Self::Send))>>> + Send;
+    ) -> impl Future<Output = Result<Option<(u64, (Self::StreamReader, Self::StreamWriter))>>> + Send;
 
-    fn accept_bi_stream(
+    fn accept_bi(
         &self,
-    ) -> impl Future<Output = Result<(u64, (Self::Recv, Self::Send))>> + Send;
+    ) -> impl Future<Output = Result<(u64, (Self::StreamReader, Self::StreamWriter))>> + Send;
 
-    fn open_uni_stream(&self) -> impl Future<Output = Result<Option<(u64, Self::Send)>>> + Send;
+    fn open_uni(&self) -> impl Future<Output = Result<Option<(u64, Self::StreamWriter)>>> + Send;
 
-    fn accept_uni_stream(&self) -> impl Future<Output = Result<(u64, Self::Recv)>> + Send;
+    fn accept_uni(&self) -> impl Future<Output = Result<(u64, Self::StreamReader)>> + Send;
 
     fn close(&self, reason: String, code: u64) -> Result<()>;
 

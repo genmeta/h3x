@@ -196,7 +196,7 @@ async fn write_bytes_response<WS: AsyncWrite + Unpin, SR, T: Transport>(
         } => result,
     };
     if let Err(error) = result {
-        ws.reset(error);
+        ws.cancel_with_error(error);
     }
     result
 }
@@ -240,7 +240,7 @@ fn write_streaming_response<WS: AsyncWrite + Unpin, SR, T: Transport>(
             } => result,
         };
         if let Err(error) = result {
-            ws.reset(error);
+            ws.cancel_with_error(error);
             body.set_error(error);
         }
         result

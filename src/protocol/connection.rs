@@ -1,19 +1,16 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 use qrecovery::{recv::StopSending, send::CancelStream};
 
 use super::{
-    frame,
     qpack::Qpack,
-    stream::{H3ReadStream, H3WriteStream, bi::BiStreams, control},
+    stream::{H3ReadStream, H3WriteStream, bi::BiStreams},
 };
 use crate::{Error, Result, Transport};
 
 mod goaway;
 mod settings;
+mod uni;
 
 pub(crate) use goaway::StreamCursor;
 pub use settings::Settings;
@@ -27,7 +24,7 @@ pub struct H3Connection<T: Transport> {
     qpack: Arc<Qpack<T>>,
     cursor: Arc<StreamCursor>,
     goaway_write: qbase::ArcReceiving<Result<()>>,
-    bi_streams: Arc<BiStreams<T::Recv, T::Send>>,
+    bi_streams: Arc<BiStreams<T::StreamReader, T::StreamWriter>>,
 }
 
 impl<T: Transport> H3Connection<T> {
@@ -52,8 +49,7 @@ impl<T: Transport> H3Connection<T> {
             goaway_write,
             bi_streams: bi,
         };
-        tokio::spawn(connection.clone().accept_uni());
-        tokio::spawn(connection.clone().accept_bi());
+        uni::spawn(connection.clone());
         Ok(connection)
     }
 
@@ -66,12 +62,12 @@ impl<T: Transport> H3Connection<T> {
     pub async fn open_bi(
         &self,
     ) -> Result<(
-        H3WriteStream<T::Send, T::Recv>,
-        H3ReadStream<T::Recv, T::Send>,
+        H3WriteStream<T::StreamWriter, T::StreamReader>,
+        H3ReadStream<T::StreamReader, T::StreamWriter>,
     )> {
         let (id, (recv, send)) = self
             .transport
-            .open_bi_stream()
+            .open_bi()
             .await?
             .ok_or(Error::H3_STREAM_CREATION_ERROR)?;
         self.bi_streams.insert(id, recv, send)
@@ -80,7 +76,6 @@ impl<T: Transport> H3Connection<T> {
     /// Consume this connection and exchange GOAWAY with the peer.
     /// Writes GOAWAY, waits for the peer and admitted requests, then closes QUIC.
     pub async fn goaway(self) -> Result<()> {
-        self.bi_streams.release_incoming();
         self.cursor.goaway()?;
         let transport = self.transport.as_ref();
         tokio::select! {
@@ -101,102 +96,27 @@ impl<T: Transport> H3Connection<T> {
 }
 
 impl<T: Transport> H3Connection<T> {
-    async fn accept_uni(self) {
-        let critical = Arc::new([
-            AtomicBool::new(false),
-            AtomicBool::new(false),
-            AtomicBool::new(false),
-        ]);
-        loop {
-            let (_, mut recv) = match self.transport.accept_uni_stream().await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    let error = self.qpack.close(error);
-                    self.bi_streams.close(error);
-                    return;
-                }
-            };
-            let connection = self.clone();
-            let critical = critical.clone();
-            tokio::spawn(async move {
-                let [control_seen, encoder_seen, decoder_seen] = critical.as_ref();
-                tokio::select! {
-                    biased;
-                    result = async {
-                        // FIN/RESET is stream-local until its full type is known.
-                        let stream_type = match frame::be_varint_or_eof(&mut recv).await {
-                            Ok(Some(ty)) => ty.into_u64(),
-                            Ok(None) => return Ok(()),
-                            Err(error) if error.get_ref().is_some_and(|source| {
-                                source.is::<qbase::frame::ResetStreamError>()
-                            }) => return Ok(()),
-                            Err(error) => return Err(Error::from(error)),
-                        };
-                        let seen = match stream_type {
-                            0 => control_seen,
-                            2 => encoder_seen,
-                            3 => decoder_seen,
-                            1 => return Err(Error::H3_ID_ERROR),
-                            _ => { recv.stop(Error::H3_NO_ERROR.as_u64()); return Ok(()); }
-                        };
-                        if seen.swap(true, Ordering::AcqRel) { return Err(Error::H3_STREAM_CREATION_ERROR); }
-                        match stream_type {
-                            0 => control::receive_control(&mut recv, connection.transport.as_ref(), &connection.settings, &connection.qpack, &connection.cursor, &connection.bi_streams).await,
-                            2 => connection.qpack.receive_encoder(&mut recv).await,
-                            3 => connection.qpack.receive_decoder(&mut recv).await,
-                            _ => unreachable!(),
-                        }
-                    } => if let Err(error) = result {
-                        // Prefer an existing transport result over a new protocol error.
-                        // The half stays alive throughout this task's failure handling.
-                        tokio::select! {
-                            biased;
-                            ended = connection.transport.terminated() => {
-                                let error = connection.qpack.close(ended);
-                                connection.bi_streams.close(error);
-                            },
-                            _ = std::future::ready(()) => {
-                                let error = connection.qpack.close(error);
-                                let _ = connection.transport.close(error.to_string(), error.as_u64());
-                                connection.bi_streams.close(error);
-                            },
-                        }
-                    },
-                    error = connection.transport.terminated() => {
-                        let error = connection.qpack.close(error);
-                        connection.bi_streams.close(error);
-                    },
-                }
-            });
+    /// Accept and register one peer bidirectional stream, returning (write, read).
+    /// The application drives acceptance; no background request queue is maintained.
+    pub async fn accept_bi(
+        &self,
+    ) -> Result<(
+        H3WriteStream<T::StreamWriter, T::StreamReader>,
+        H3ReadStream<T::StreamReader, T::StreamWriter>,
+    )> {
+        let (id, (mut read, mut write)) = self.transport.accept_bi().await?;
+        let mut state = self.cursor.local.lock().unwrap();
+        let stream_id = qbase::varint::VarInt::try_from(id)
+            .map(qbase::sid::StreamId::from)
+            .map_err(|_| Error::H3_ID_ERROR);
+        if let Err(error) = stream_id.and_then(|id| state.accept(id)) {
+            drop(state);
+            read.stop(Error::H3_REQUEST_REJECTED.as_u64());
+            write.cancel(Error::H3_REQUEST_REJECTED.as_u64());
+            return Err(error);
         }
-    }
-
-    async fn accept_bi(self) {
-        loop {
-            let (id, (mut recv, mut send)) = match self.transport.accept_bi_stream().await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    self.bi_streams.close_incoming(error);
-                    return;
-                }
-            };
-            let mut state = self.cursor.local.lock().unwrap();
-            let stream_id = qbase::varint::VarInt::try_from(id)
-                .map(qbase::sid::StreamId::from)
-                .map_err(|_| Error::H3_ID_ERROR);
-            if let Err(error) = stream_id.and_then(|id| state.accept(id)) {
-                drop(state);
-                recv.stop(Error::H3_REQUEST_REJECTED.as_u64());
-                send.cancel(Error::H3_REQUEST_REJECTED.as_u64());
-                self.bi_streams.close_incoming(error);
-                return;
-            }
-            // Admission, registration, and delivery share the cursor lock with GOAWAY.
-            if let Err(error) = self.bi_streams.insert_incoming(id, recv, send) {
-                self.bi_streams.close_incoming(error);
-                return;
-            }
-        }
+        // Keep admission and registration atomic with respect to local GOAWAY.
+        self.bi_streams.insert(id, read, write)
     }
 }
 

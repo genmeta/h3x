@@ -37,8 +37,12 @@ pub(crate) async fn be_setting_frame<T: AsyncRead + Unpin + ?Sized>(
     let mut payload = reader.take(length.into_u64());
     let mut values = HashMap::new();
     while payload.limit() != 0 {
-        let id = be_varint(&mut payload).await?;
-        let value = be_varint(&mut payload).await?;
+        let id = be_varint(&mut payload)
+            .await?
+            .ok_or(Error::H3_FRAME_ERROR)?;
+        let value = be_varint(&mut payload)
+            .await?
+            .ok_or(Error::H3_FRAME_ERROR)?;
         if matches!(id.into_u64(), 0x02..=0x05) || (id.into_u64() == 0x08 && value.into_u64() > 1) {
             return Err(Error::H3_SETTINGS_ERROR);
         }

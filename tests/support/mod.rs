@@ -54,24 +54,24 @@ impl CancelStream for Writer {
 }
 
 impl Transport for TestTransport {
-    type Recv = Reader;
-    type Send = Writer;
+    type StreamReader = Reader;
+    type StreamWriter = Writer;
     fn role(&self) -> Role {
         Role::Client
     }
-    async fn open_bi_stream(&self) -> Result<Option<(u64, (Reader, Writer))>> {
+    async fn open_bi(&self) -> Result<Option<(u64, (Reader, Writer))>> {
         Err(self.terminated().await)
     }
-    async fn accept_bi_stream(&self) -> Result<(u64, (Reader, Writer))> {
+    async fn accept_bi(&self) -> Result<(u64, (Reader, Writer))> {
         Err(self.terminated().await)
     }
-    async fn open_uni_stream(&self) -> Result<Option<(u64, Writer)>> {
+    async fn open_uni(&self) -> Result<Option<(u64, Writer)>> {
         if let Some(error) = *self.error.lock().unwrap() {
             return Err(error);
         }
         Ok(Some((2, Writer)))
     }
-    async fn accept_uni_stream(&self) -> Result<(u64, Reader)> {
+    async fn accept_uni(&self) -> Result<(u64, Reader)> {
         Err(self.terminated().await)
     }
     fn close(&self, _: String, code: u64) -> Result<()> {

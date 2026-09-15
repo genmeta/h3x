@@ -36,6 +36,12 @@ impl<R, W> H3ReadStream<R, W> {
     }
 }
 
+impl<R: qrecovery::recv::StopSending, W> qrecovery::recv::StopSending for H3ReadStream<R, W> {
+    fn stop(&mut self, error_code: u64) {
+        qrecovery::recv::StopSending::stop(&mut self.stream.as_ref(), error_code);
+    }
+}
+
 impl<R: AsyncRead + Unpin, W> AsyncRead for H3ReadStream<R, W> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -47,7 +53,7 @@ impl<R: AsyncRead + Unpin, W> AsyncRead for H3ReadStream<R, W> {
             return Poll::Ready(Ok(()));
         }
         let before = buf.filled().len();
-        let mut state = self.stream.recv.lock().unwrap();
+        let mut state = self.stream.read.lock().unwrap();
         if matches!(*state, StreamState::Finished) {
             return Poll::Ready(Ok(()));
         }
@@ -58,7 +64,11 @@ impl<R: AsyncRead + Unpin, W> AsyncRead for H3ReadStream<R, W> {
         let terminal = state.is_terminal();
         drop(state);
         if terminal {
-            self.stream.notify_if_finished();
+            if self.stream.read.lock().unwrap().is_terminal()
+                && self.stream.write.lock().unwrap().is_terminal()
+            {
+                self.stream.finished.obtain(());
+            }
         }
         result
     }
@@ -66,14 +76,39 @@ impl<R: AsyncRead + Unpin, W> AsyncRead for H3ReadStream<R, W> {
 
 impl<R, W> Drop for H3ReadStream<R, W> {
     fn drop(&mut self) {
-        self.stream
-            .terminate_read(StreamState::Closed(Error::H3_REQUEST_CANCELLED));
+        let waker = self
+            .stream
+            .read
+            .lock()
+            .unwrap()
+            .terminate(StreamState::Closed(Error::H3_REQUEST_CANCELLED));
+        if self.stream.read.lock().unwrap().is_terminal()
+            && self.stream.write.lock().unwrap().is_terminal()
+        {
+            self.stream.finished.obtain(());
+        }
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }
 
 #[cfg(test)]
 impl<R, W> H3ReadStream<R, W> {
     pub(crate) fn recv_goaway(&mut self, goaway: Goaway) {
-        self.stream.terminate_read(StreamState::Goaway(goaway));
+        let waker = self
+            .stream
+            .read
+            .lock()
+            .unwrap()
+            .terminate(StreamState::Goaway(goaway));
+        if self.stream.read.lock().unwrap().is_terminal()
+            && self.stream.write.lock().unwrap().is_terminal()
+        {
+            self.stream.finished.obtain(());
+        }
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }

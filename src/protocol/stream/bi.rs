@@ -1,12 +1,11 @@
 //! Connection ownership and GOAWAY dispatch for bidirectional streams.
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     mem,
     sync::{Arc, Mutex},
 };
 
 use qbase::{ArcReceiving, varint::VarInt};
-use tokio::sync::Notify;
 
 use super::{H3ReadStream, H3WriteStream, StreamState};
 use crate::{
@@ -17,72 +16,123 @@ use crate::{
 /// The connection and both application handles refer to this same stream.
 pub(crate) struct BiStream<R, W> {
     pub(super) id: u64,
-    pub(super) recv: Mutex<StreamState<R>>,
-    pub(super) send: Mutex<StreamState<W>>,
+    pub(super) read: Mutex<StreamState<R>>,
+    pub(super) write: Mutex<StreamState<W>>,
     // One completion signal for the connection's request-drain consumer.
-    finished: ArcReceiving<()>,
+    pub(super) finished: ArcReceiving<()>,
 }
 
 impl<R, W> BiStream<R, W> {
-    pub(super) fn new(id: u64, recv: StreamState<R>, send: StreamState<W>) -> Self {
+    pub(super) fn new(id: u64, read: StreamState<R>, write: StreamState<W>) -> Self {
         Self {
             id,
-            recv: Mutex::new(recv),
-            send: Mutex::new(send),
+            read: Mutex::new(read),
+            write: Mutex::new(write),
             finished: ArcReceiving::default(),
         }
     }
 
-    pub(super) fn terminate_read(&self, terminal: StreamState<R>) {
-        let waker = {
-            let mut state = self.recv.lock().unwrap();
-            state.terminate(terminal)
-        };
-        self.notify_if_finished();
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-
-    pub(super) fn terminate_write(&self, terminal: StreamState<W>) {
-        let waker = {
-            let mut state = self.send.lock().unwrap();
-            state.terminate(terminal)
-        };
-        self.notify_if_finished();
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-
-    pub(super) fn notify_if_finished(&self) {
-        if self.recv.lock().unwrap().is_terminal() && self.send.lock().unwrap().is_terminal() {
+    fn goaway(&self, goaway: &Goaway) {
+        let waker = self
+            .read
+            .lock()
+            .unwrap()
+            .terminate(StreamState::Goaway(goaway.clone()));
+        if self.read.lock().unwrap().is_terminal() && self.write.lock().unwrap().is_terminal() {
             self.finished.obtain(());
         }
-    }
-
-    fn goaway(&self, goaway: &Goaway) {
-        self.terminate_read(StreamState::Goaway(goaway.clone()));
-        self.terminate_write(StreamState::Goaway(goaway.clone()));
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        let waker = self
+            .write
+            .lock()
+            .unwrap()
+            .terminate(StreamState::Goaway(goaway.clone()));
+        if self.read.lock().unwrap().is_terminal() && self.write.lock().unwrap().is_terminal() {
+            self.finished.obtain(());
+        }
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
     fn close(&self, error: Error) {
-        self.terminate_read(StreamState::Closed(error));
-        self.terminate_write(StreamState::Closed(error));
+        let waker = self
+            .read
+            .lock()
+            .unwrap()
+            .terminate(StreamState::Closed(error));
+        if self.read.lock().unwrap().is_terminal() && self.write.lock().unwrap().is_terminal() {
+            self.finished.obtain(());
+        }
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        let waker = self
+            .write
+            .lock()
+            .unwrap()
+            .terminate(StreamState::Closed(error));
+        if self.read.lock().unwrap().is_terminal() && self.write.lock().unwrap().is_terminal() {
+            self.finished.obtain(());
+        }
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }
 
-pub(crate) type Halves<R, W> = (H3WriteStream<W, R>, H3ReadStream<R, W>);
+impl<R: qrecovery::recv::StopSending, W> qrecovery::recv::StopSending for &BiStream<R, W> {
+    fn stop(&mut self, error_code: u64) {
+        let waker = {
+            let mut state = self.read.lock().unwrap();
+            if let StreamState::Idle(io) | StreamState::Polling(io, _) = &mut *state {
+                io.stop(error_code);
+            }
+            state.terminate(StreamState::Closed(Error::H3_REQUEST_CANCELLED))
+        };
+        if self.read.lock().unwrap().is_terminal() && self.write.lock().unwrap().is_terminal() {
+            self.finished.obtain(());
+        }
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
 
-struct Incoming<R, W> {
-    pending: VecDeque<Halves<R, W>>,
-    error: Option<Error>,
+impl<R: qrecovery::recv::StopSending, W> qrecovery::recv::StopSending for BiStream<R, W> {
+    fn stop(&mut self, error_code: u64) {
+        qrecovery::recv::StopSending::stop(&mut &*self, error_code);
+    }
+}
+
+impl<R, W: qrecovery::send::CancelStream> qrecovery::send::CancelStream for &BiStream<R, W> {
+    fn cancel(&mut self, error_code: u64) {
+        let waker = {
+            let mut state = self.write.lock().unwrap();
+            if let StreamState::Idle(io) | StreamState::Polling(io, _) = &mut *state {
+                io.cancel(error_code);
+            }
+            state.terminate(StreamState::Closed(Error::H3_REQUEST_CANCELLED))
+        };
+        if self.read.lock().unwrap().is_terminal() && self.write.lock().unwrap().is_terminal() {
+            self.finished.obtain(());
+        }
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+impl<R, W: qrecovery::send::CancelStream> qrecovery::send::CancelStream for BiStream<R, W> {
+    fn cancel(&mut self, error_code: u64) {
+        qrecovery::send::CancelStream::cancel(&mut &*self, error_code);
+    }
 }
 
 pub(crate) struct BiStreams<R, W> {
     streams: Mutex<HashMap<u64, Arc<BiStream<R, W>>>>,
-    incoming: Mutex<Incoming<R, W>>,
-    incoming_changed: Notify,
 }
 
 impl<R, W> Default for BiStreams<R, W> {
@@ -95,54 +145,7 @@ impl<R, W> BiStreams<R, W> {
     pub(crate) fn new() -> Self {
         Self {
             streams: Mutex::new(HashMap::new()),
-            incoming: Mutex::new(Incoming {
-                pending: VecDeque::new(),
-                error: None,
-            }),
-            incoming_changed: Notify::new(),
         }
-    }
-
-    pub(crate) async fn accept(&self) -> Result<Halves<R, W>> {
-        loop {
-            let changed = self.incoming_changed.notified();
-            {
-                let mut incoming = self.incoming.lock().unwrap();
-                if let Some(stream) = incoming.pending.pop_front() {
-                    return Ok(stream);
-                }
-                if let Some(error) = incoming.error {
-                    return Err(error);
-                }
-            }
-            changed.await;
-        }
-    }
-
-    pub(crate) fn insert_incoming(&self, id: u64, recv: R, send: W) -> Result<()> {
-        let mut incoming = self.incoming.lock().unwrap();
-        if let Some(error) = incoming.error {
-            return Err(error);
-        }
-        incoming.pending.push_back(self.insert(id, recv, send)?);
-        drop(incoming);
-        self.incoming_changed.notify_waiters();
-        Ok(())
-    }
-
-    pub(crate) fn close_incoming(&self, error: Error) {
-        self.incoming.lock().unwrap().error.get_or_insert(error);
-        self.incoming_changed.notify_waiters();
-    }
-
-    pub(crate) fn release_incoming(&self) {
-        let pending = {
-            let mut incoming = self.incoming.lock().unwrap();
-            incoming.error.get_or_insert(Error::H3_REQUEST_CANCELLED);
-            mem::take(&mut incoming.pending)
-        };
-        self.incoming_changed.notify_waiters();
-        drop(pending);
     }
 
     pub(crate) fn running(&self) -> Vec<Arc<BiStream<R, W>>> {
@@ -165,8 +168,8 @@ impl<R, W> BiStreams<R, W> {
     // Idle connections retain finished entries until the next insert or GOAWAY.
     pub(crate) fn cleanup(&self) {
         self.streams.lock().unwrap().retain(|_, stream| {
-            !(stream.recv.lock().unwrap().is_terminal()
-                && stream.send.lock().unwrap().is_terminal())
+            !(stream.read.lock().unwrap().is_terminal()
+                && stream.write.lock().unwrap().is_terminal())
         });
     }
 
@@ -190,7 +193,6 @@ impl<R, W> BiStreams<R, W> {
     }
 
     pub(crate) fn close(&self, error: Error) {
-        self.close_incoming(error);
         let streams = mem::take(&mut *self.streams.lock().unwrap());
         for stream in streams.into_values() {
             stream.close(error);
@@ -241,63 +243,6 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::*;
-
-    #[tokio::test]
-    async fn incoming_streams_are_fifo_and_terminal_error_persists() {
-        let streams = BiStreams::new();
-        for id in [0, 4] {
-            streams
-                .insert_incoming(id, tokio::io::empty(), tokio::io::sink())
-                .unwrap();
-        }
-        streams.close_incoming(Error::H3_NO_ERROR);
-        for id in [0, 4] {
-            let (send, _) = streams.accept().await.unwrap();
-            assert_eq!(send.stream.id, id);
-        }
-        for _ in 0..2 {
-            assert!(matches!(streams.accept().await, Err(Error::H3_NO_ERROR)));
-        }
-        assert_eq!(
-            streams.insert_incoming(8, tokio::io::empty(), tokio::io::sink()),
-            Err(Error::H3_NO_ERROR)
-        );
-    }
-
-    #[tokio::test]
-    async fn incoming_close_wakes_all_waiters_and_release_drops_queued_streams() {
-        let streams = Arc::new(BiStreams::<tokio::io::Empty, tokio::io::Sink>::new());
-        let mut tasks = Vec::new();
-        for _ in 0..2 {
-            let streams = streams.clone();
-            tasks.push(tokio::spawn(async move {
-                assert!(matches!(
-                    streams.accept().await,
-                    Err(Error::H3_INTERNAL_ERROR)
-                ));
-            }));
-        }
-        tokio::task::yield_now().await;
-        streams.close(Error::H3_INTERNAL_ERROR);
-        for task in tasks {
-            tokio::time::timeout(std::time::Duration::from_secs(1), task)
-                .await
-                .unwrap()
-                .unwrap();
-        }
-
-        let streams = BiStreams::new();
-        streams
-            .insert_incoming(0, tokio::io::empty(), tokio::io::sink())
-            .unwrap();
-        streams.release_incoming();
-        streams.cleanup();
-        assert_eq!(streams.len(), 0);
-        assert!(matches!(
-            streams.accept().await,
-            Err(Error::H3_REQUEST_CANCELLED)
-        ));
-    }
 
     #[tokio::test]
     async fn drain_waits_for_both_halves_and_remembers_early_completion() {
@@ -357,6 +302,63 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn explicit_stop_and_cancel_forward_codes_once_and_complete_the_stream() {
+        use std::{
+            future::Future,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        use qrecovery::{recv::StopSending, send::CancelStream};
+
+        struct Recv(Arc<AtomicU64>);
+        impl StopSending for Recv {
+            fn stop(&mut self, code: u64) {
+                self.0.store(code, Ordering::SeqCst);
+            }
+        }
+        struct Send(Arc<AtomicU64>);
+        impl CancelStream for Send {
+            fn cancel(&mut self, code: u64) {
+                self.0.store(code, Ordering::SeqCst);
+            }
+        }
+        let read_code = Arc::new(AtomicU64::new(0));
+        let write_code = Arc::new(AtomicU64::new(0));
+        let streams = BiStreams::new();
+        let (mut send, mut recv) = streams
+            .insert(0, Recv(read_code.clone()), Send(write_code.clone()))
+            .unwrap();
+        let mut drained = Box::pin(streams.drained(streams.running()));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(drained.as_mut().poll(&mut cx).is_pending());
+        recv.stop(123);
+        assert!(drained.as_mut().poll(&mut cx).is_pending());
+        send.cancel(456);
+        assert!(drained.as_mut().poll(&mut cx).is_ready());
+        recv.stop(789);
+        send.cancel(789);
+        assert_eq!(read_code.load(Ordering::SeqCst), 123);
+        assert_eq!(write_code.load(Ordering::SeqCst), 456);
+
+        let mut stream = BiStream::new(
+            4,
+            StreamState::Idle(Recv(read_code.clone())),
+            StreamState::Idle(Send(write_code.clone())),
+        );
+        stream.stop(321);
+        assert!(stream.read.lock().unwrap().is_terminal());
+        assert!(!stream.write.lock().unwrap().is_terminal());
+        stream.cancel(654);
+        assert!(
+            Pin::new(&mut stream.finished.clone())
+                .poll(&mut cx)
+                .is_ready()
+        );
+        assert_eq!(read_code.load(Ordering::SeqCst), 321);
+        assert_eq!(write_code.load(Ordering::SeqCst), 654);
     }
 
     struct FailingShutdown(bool);
