@@ -6,11 +6,11 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 use qbase::varint::VARINT_MAX;
 
-use super::{Field, instruction::EncoderInstruction};
-use crate::{Error, Result};
+use super::{Field, codec::instruction::EncoderInstruction};
+use crate::{ErrorCode, Result};
 
 #[derive(Clone, Default)]
-pub(crate) struct DynamicTable {
+pub(super) struct DynamicTable {
     entries: VecDeque<Field>,
     /// Current table size in bytes: sum of each entry's uncompressed name/value
     /// lengths plus 32 bytes. Protocol accounting, not heap usage (section 3.2.1).
@@ -27,9 +27,10 @@ pub(crate) struct DynamicTable {
 }
 
 impl DynamicTable {
-    pub(crate) fn new(max_capacity: u64) -> Result<Self> {
+    pub(super) fn new(max_capacity: u64) -> Result<Self> {
         if max_capacity > VARINT_MAX {
-            return Err(Error::H3_SETTINGS_ERROR);
+            return Err(ErrorCode::H3_SETTINGS_ERROR
+                .with_reason("QPACK table capacity exceeds the QUIC variable-integer range"));
         }
         Ok(Self {
             max_capacity,
@@ -37,35 +38,37 @@ impl DynamicTable {
         })
     }
 
-    pub(crate) fn insert_count(&self) -> u64 {
+    pub(super) fn insert_count(&self) -> u64 {
         self.insert_count
     }
 
-    pub(crate) fn capacity(&self) -> u64 {
+    pub(super) fn capacity(&self) -> u64 {
         self.capacity
     }
 
-    pub(crate) fn max_capacity(&self) -> u64 {
+    pub(super) fn max_capacity(&self) -> u64 {
         self.max_capacity
     }
 
     /// Update the peer-advertised maximum without eviction or resetting insert_count.
     /// Reject values outside 62 bits or below the current capacity.
-    pub(crate) fn set_max_capacity(&mut self, max_capacity: u64) -> Result<()> {
+    pub(super) fn set_max_capacity(&mut self, max_capacity: u64) -> Result<()> {
         if max_capacity > VARINT_MAX || max_capacity < self.capacity {
-            return Err(Error::H3_SETTINGS_ERROR);
+            return Err(ErrorCode::H3_SETTINGS_ERROR.with_reason(
+                "QPACK maximum capacity is out of range or below the current capacity",
+            ));
         }
         self.max_capacity = max_capacity;
         Ok(())
     }
 
     /// First retained absolute index; equals insert_count when the table is empty.
-    pub(crate) fn oldest_index(&self) -> u64 {
+    pub(super) fn oldest_index(&self) -> u64 {
         self.insert_count - self.entries.len() as u64
     }
 
     /// Newest exact match's absolute index; caller still checks can_reference.
-    pub(crate) fn find_index(&self, name: &[u8], value: &[u8]) -> Option<u64> {
+    pub(super) fn find_index(&self, name: &[u8], value: &[u8]) -> Option<u64> {
         self.entries
             .iter()
             .rposition(|entry| entry.name == name && entry.value == value)
@@ -73,7 +76,7 @@ impl DynamicTable {
     }
 
     /// Newest name match's absolute index; caller still checks can_reference.
-    pub(crate) fn find_name(&self, name: &[u8]) -> Option<u64> {
+    pub(super) fn find_name(&self, name: &[u8]) -> Option<u64> {
         self.entries
             .iter()
             .rposition(|entry| entry.name == name)
@@ -87,7 +90,7 @@ impl DynamicTable {
         }
     }
 
-    pub(crate) fn get(&self, absolute: u64) -> Option<&Field> {
+    pub(super) fn get(&self, absolute: u64) -> Option<&Field> {
         let oldest = self.oldest_index();
         self.entries
             .get(usize::try_from(absolute.checked_sub(oldest)?).ok()?)
@@ -99,14 +102,18 @@ impl DynamicTable {
             .and_then(|v| v.checked_sub(1))
             .and_then(|id| self.get(id))
             .cloned()
-            .ok_or(Error::QPACK_ENCODER_STREAM_ERROR)
+            .ok_or_else(|| {
+                ErrorCode::QPACK_ENCODER_STREAM_ERROR
+                    .with_reason("dynamic table index is missing or has been evicted")
+            })
     }
 
-    pub(crate) fn apply(&mut self, instruction: EncoderInstruction) -> Result<()> {
+    pub(super) fn apply(&mut self, instruction: EncoderInstruction) -> Result<()> {
         let entry = match instruction {
             EncoderInstruction::SetDynamicTableCapacity(capacity) => {
                 if capacity > self.max_capacity {
-                    return Err(Error::QPACK_ENCODER_STREAM_ERROR);
+                    return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR
+                        .with_reason("dynamic table capacity exceeds the advertised maximum"));
                 }
                 self.evict_to(capacity);
                 self.capacity = capacity;
@@ -125,7 +132,10 @@ impl DynamicTable {
                 let name = if is_static {
                     Bytes::from_static(
                         get(index)
-                            .ok_or(Error::QPACK_ENCODER_STREAM_ERROR)?
+                            .ok_or_else(|| {
+                                ErrorCode::QPACK_ENCODER_STREAM_ERROR
+                                    .with_reason("static name index is out of range")
+                            })?
                             .0
                             .as_bytes(),
                     )
@@ -142,7 +152,8 @@ impl DynamicTable {
         };
         let size = entry.name.len() as u64 + entry.value.len() as u64 + 32;
         if size > self.capacity || self.insert_count == VARINT_MAX {
-            return Err(Error::QPACK_ENCODER_STREAM_ERROR);
+            return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR
+                .with_reason("entry exceeds table capacity or insert count is exhausted"));
         }
         self.evict_to(self.capacity - size);
         self.entries.push_back(entry);
@@ -281,13 +292,6 @@ pub(super) fn get(index: u64) -> Option<(&'static str, &'static str)> {
 }
 
 #[cfg(test)]
-impl DynamicTable {
-    pub(crate) fn size(&self) -> u64 {
-        self.size
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -300,8 +304,8 @@ mod tests {
         };
         assert_eq!(table.capacity, 0);
         assert_eq!(
-            table.apply(insert.clone()),
-            Err(Error::QPACK_ENCODER_STREAM_ERROR)
+            (table.apply(insert.clone())).map_err(ErrorCode::from),
+            Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR)
         );
         table
             .apply(EncoderInstruction::SetDynamicTableCapacity(68))
@@ -323,12 +327,12 @@ mod tests {
         assert_eq!(table.get(2).unwrap().value, "z");
         assert_eq!((table.size, table.insert_count), (68, 3));
         assert_eq!(
-            table.apply(EncoderInstruction::Duplicate(2)),
-            Err(Error::QPACK_ENCODER_STREAM_ERROR)
+            (table.apply(EncoderInstruction::Duplicate(2))).map_err(ErrorCode::from),
+            Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR)
         );
         assert_eq!(
-            table.apply(EncoderInstruction::SetDynamicTableCapacity(69)),
-            Err(Error::QPACK_ENCODER_STREAM_ERROR)
+            (table.apply(EncoderInstruction::SetDynamicTableCapacity(69))).map_err(ErrorCode::from),
+            Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR)
         );
         assert_eq!(
             (table.capacity, table.size, table.insert_count),
@@ -359,5 +363,125 @@ mod tests {
         assert_eq!(table.get(3).unwrap().name, ":authority");
         assert_eq!(table.size, 42);
         assert!(DynamicTable::new(VARINT_MAX + 1).is_err());
+    }
+
+    #[test]
+    fn rejected_updates_preserve_entries_and_capacity() {
+        let mut table = DynamicTable::new(68).unwrap();
+        table
+            .apply(EncoderInstruction::SetDynamicTableCapacity(68))
+            .unwrap();
+        table
+            .apply(EncoderInstruction::InsertWithLiteralName {
+                name: Bytes::from_static(b"x"),
+                value: Bytes::from_static(b"y"),
+            })
+            .unwrap();
+        for instruction in [
+            EncoderInstruction::SetDynamicTableCapacity(69),
+            EncoderInstruction::Duplicate(1),
+            EncoderInstruction::InsertWithNameReference {
+                static_table: true,
+                index: 99,
+                value: Bytes::new(),
+            },
+            EncoderInstruction::InsertWithNameReference {
+                static_table: false,
+                index: 1,
+                value: Bytes::new(),
+            },
+            EncoderInstruction::InsertWithLiteralName {
+                name: Bytes::from_static(b"x"),
+                value: Bytes::from(vec![0; 36]),
+            },
+        ] {
+            assert_eq!(
+                (table.apply(instruction)).map_err(ErrorCode::from),
+                Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR)
+            );
+            assert_eq!(
+                (table.capacity(), table.size(), table.insert_count()),
+                (68, 34, 1)
+            );
+            assert_eq!(table.get(0).unwrap().value, "y");
+        }
+        for maximum in [67, VARINT_MAX + 1] {
+            assert_eq!(
+                (table.set_max_capacity(maximum)).map_err(ErrorCode::from),
+                Err(ErrorCode::H3_SETTINGS_ERROR)
+            );
+            assert_eq!(table.max_capacity(), 68);
+        }
+        table.set_max_capacity(128).unwrap();
+        assert_eq!(
+            (table.capacity(), table.size(), table.insert_count()),
+            (68, 34, 1)
+        );
+        assert_eq!(table.max_capacity(), 128);
+    }
+
+    #[test]
+    fn lookups_prefer_newest_retained_match_and_survive_clear() {
+        let mut table = DynamicTable::new(68).unwrap();
+        table
+            .apply(EncoderInstruction::SetDynamicTableCapacity(68))
+            .unwrap();
+        for value in [b"a", b"a", b"b"] {
+            table
+                .apply(EncoderInstruction::InsertWithLiteralName {
+                    name: Bytes::from_static(b"x"),
+                    value: Bytes::from_static(value),
+                })
+                .unwrap();
+        }
+        assert_eq!(table.oldest_index(), 1);
+        assert_eq!(table.find_index(b"x", b"a"), Some(1));
+        assert_eq!(table.find_name(b"x"), Some(2));
+        assert_eq!(table.find_name(b"missing"), None);
+        assert!(table.get(0).is_none());
+        assert!(table.get(3).is_none());
+        table
+            .apply(EncoderInstruction::SetDynamicTableCapacity(0))
+            .unwrap();
+        assert_eq!(table.oldest_index(), 3);
+        assert_eq!(table.find_name(b"x"), None);
+        table
+            .apply(EncoderInstruction::SetDynamicTableCapacity(68))
+            .unwrap();
+        table
+            .apply(EncoderInstruction::InsertWithLiteralName {
+                name: Bytes::from_static(b"x"),
+                value: Bytes::from_static(b"c"),
+            })
+            .unwrap();
+        assert_eq!(table.find_index(b"x", b"c"), Some(3));
+    }
+
+    #[test]
+    fn insertion_count_overflow_does_not_evict_existing_entry() {
+        let mut table = DynamicTable::new(34).unwrap();
+        table
+            .apply(EncoderInstruction::SetDynamicTableCapacity(34))
+            .unwrap();
+        table
+            .apply(EncoderInstruction::InsertWithLiteralName {
+                name: Bytes::from_static(b"x"),
+                value: Bytes::from_static(b"y"),
+            })
+            .unwrap();
+        table.insert_count = VARINT_MAX;
+        assert_eq!(
+            (table.apply(EncoderInstruction::Duplicate(0))).map_err(ErrorCode::from),
+            Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR)
+        );
+        assert_eq!(table.insert_count(), VARINT_MAX);
+        assert_eq!(table.size(), 34);
+        assert_eq!(table.get(VARINT_MAX - 1).unwrap().value, "y");
+    }
+
+    impl DynamicTable {
+        pub(in crate::protocol::qpack) fn size(&self) -> u64 {
+            self.size
+        }
     }
 }

@@ -7,6 +7,8 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::Error;
+
 /// A bounded FIFO with one pending reader and one pending writer.
 #[derive(Debug)]
 pub(crate) struct WndBuf {
@@ -16,7 +18,6 @@ pub(crate) struct WndBuf {
     len: usize,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
-    error_waker: Option<Waker>,
     fin: bool,
 }
 
@@ -31,7 +32,6 @@ impl WndBuf {
             len: 0,
             read_waker: None,
             write_waker: None,
-            error_waker: None,
             fin: false,
         }
     }
@@ -118,20 +118,6 @@ pub struct ArcWndBuf {
     shared: Arc<Mutex<crate::Result<WndBuf>>>,
 }
 
-impl Drop for ArcWndBuf {
-    fn drop(&mut self) {
-        // A pump may be waiting on network I/O when the application's body drops.
-        // Wake it to recheck its weak owner; dropping a clone does not cancel I/O.
-        let waker = match &mut *self.shared.lock().unwrap() {
-            Ok(window) => window.error_waker.take(),
-            Err(_) => None,
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-}
-
 impl ArcWndBuf {
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -139,41 +125,29 @@ impl ArcWndBuf {
         }
     }
 
-    pub fn set_error(&self, error: crate::Error) {
-        let (reader, writer, observer) = {
-            let mut state = self.shared.lock().unwrap();
-            let Ok(window) = &mut *state else {
-                return;
-            };
-            let wakers = (
-                window.read_waker.take(),
-                window.write_waker.take(),
-                window.error_waker.take(),
-            );
+    pub(crate) fn on_error(&self, error: Error) {
+        let mut state = self.shared.lock().unwrap();
+        if let Ok(window) = &mut *state {
+            if let Some(waker) = window.read_waker.take() {
+                waker.wake();
+            }
+            if let Some(waker) = window.write_waker.take() {
+                waker.wake();
+            }
             *state = Err(error);
-            wakers
-        };
-        if let Some(waker) = reader {
-            waker.wake();
-        }
-        if let Some(waker) = writer {
-            waker.wake();
-        }
-        if let Some(waker) = observer {
-            waker.wake();
         }
     }
 
-    // Observe the producer's FIN and register the pump for errors or ownership changes.
-    // The observer has its own waker, independent of the buffer's reader and writer.
-    pub(crate) fn poll_finished(&self, cx: &Context<'_>) -> crate::Result<bool> {
-        match &mut *self.shared.lock().unwrap() {
+    /// The receive pump is the window's sole writer, including while waiting on QUIC.
+    pub(crate) async fn wait_error(&self) -> Error {
+        std::future::poll_fn(|cx| match &mut *self.shared.lock().unwrap() {
+            Err(error) => Poll::Ready(error.clone()),
             Ok(window) => {
-                window.error_waker = Some(cx.waker().clone());
-                Ok(window.fin)
+                window.write_waker = Some(cx.waker().clone());
+                Poll::Pending
             }
-            Err(error) => Err(*error),
-        }
+        })
+        .await
     }
 
     fn poll_io<T>(
@@ -182,7 +156,7 @@ impl ArcWndBuf {
     ) -> Poll<io::Result<T>> {
         match &mut *self.shared.lock().unwrap() {
             Ok(window) => poll(Pin::new(window)),
-            Err(error) => Poll::Ready(Err((*error).into())),
+            Err(error) => Poll::Ready(Err(error.clone().into())),
         }
     }
 }
@@ -396,8 +370,14 @@ mod tests {
                         .is_pending()
                 );
             }
-            reader.set_error(crate::Error::H3_REQUEST_CANCELLED);
-            writer.set_error(crate::Error::H3_INTERNAL_ERROR);
+            reader.on_error(
+                crate::ErrorCode::H3_REQUEST_CANCELLED
+                    .with_reason("test closes the shared body window"),
+            );
+            writer.on_error(
+                crate::ErrorCode::H3_INTERNAL_ERROR
+                    .with_reason("test closes the shared body window"),
+            );
             assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
             let results = [
                 Pin::new(&mut reader)
@@ -414,8 +394,8 @@ mod tests {
                     panic!("expected error")
                 };
                 assert_eq!(
-                    crate::Error::from(error),
-                    crate::Error::H3_REQUEST_CANCELLED
+                    crate::ErrorCode::from(error),
+                    crate::ErrorCode::H3_REQUEST_CANCELLED
                 );
             }
         }

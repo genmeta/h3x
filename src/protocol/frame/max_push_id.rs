@@ -3,7 +3,7 @@ use qbase::varint::{VarInt, WriteVarInt};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{EncodeSize, Frame, FrameType, GetFrameType, Write, WriteFrameType, varint::be_varint};
-use crate::{Error, Result};
+use crate::{ErrorCode, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MaxPushId {
@@ -15,12 +15,36 @@ pub(crate) async fn be_max_push_id_frame<T: AsyncRead + Unpin + ?Sized>(
     length: VarInt,
 ) -> Result<Frame<MaxPushId>> {
     if length.into_u64() > VarInt::MAX_SIZE as u64 {
-        return Err(Error::H3_FRAME_ERROR);
+        return Err(ErrorCode::H3_FRAME_ERROR
+            .with_reason("MAX_PUSH_ID payload exceeds the maximum identifier size"));
     }
     let mut payload = reader.take(length.into_u64());
-    let id = be_varint(&mut payload).await?;
+    let id = be_varint(&mut payload)
+        .await
+        .map_err(|error| {
+            let error = error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
+                .map_or(&error, std::sync::Arc::as_ref);
+            error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<crate::Error>())
+                .cloned()
+                .unwrap_or_else(|| {
+                    let code = if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                        ErrorCode::H3_FRAME_ERROR
+                    } else {
+                        ErrorCode::H3_INTERNAL_ERROR
+                    };
+                    code.with_reason(error.to_string())
+                })
+        })?
+        .ok_or_else(|| {
+            ErrorCode::H3_FRAME_ERROR
+                .with_reason("MAX_PUSH_ID payload is missing a complete identifier")
+        })?;
     if payload.limit() != 0 {
-        return Err(Error::H3_FRAME_ERROR);
+        return Err(ErrorCode::H3_FRAME_ERROR.with_reason("MAX_PUSH_ID payload has trailing bytes"));
     }
     Ok(Frame {
         length,

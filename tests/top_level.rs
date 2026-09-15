@@ -1,15 +1,16 @@
-use std::sync::Arc;
+mod support;
 
 use bytes::Bytes;
 use h3x::{
-    H3ReadStream, H3WriteStream, Qpack, ReadBody, ReadRequest, ReadResponse, ReadStream, WriteBody,
-    WriteRequest, WriteResponse, WriteStream, client, server,
+    ReadRequest, ReadResponse, ReadStream, WriteBody, WriteRequest, WriteResponse, WriteStream,
+    client, server,
 };
 use http::{Method, StatusCode, header};
 use tokio::io::duplex;
 
 #[tokio::test]
 async fn request_accept_and_respond() {
+    let connection = support::connection().await;
     let (client_send, server_recv) = duplex(64);
     let (server_send, client_recv) = duplex(64);
     let request = client::Request::post("https://example.com/echo")
@@ -18,32 +19,39 @@ async fn request_accept_and_respond() {
         .body(Bytes::from_static(b"hello"));
 
     let (response, served) = tokio::join!(
-        client::request(
-            request,
-            H3ReadStream::new(0, client_recv),
-            H3WriteStream::new(0, client_send),
-            Arc::new(Qpack::default())
-        ),
         async {
-            let request = server::accept(
-                H3ReadStream::new(0, server_recv),
-                Arc::new(Qpack::default()),
+            let response = client::write_bytes_request(
+                request,
+                support::write_stream(0, client_send),
+                support::read_stream(0, client_recv),
+                connection.qpack().clone(),
+            )?;
+            response.await
+        },
+        async {
+            let request = server::read_request(
+                support::read_stream(0, server_recv),
+                connection.qpack().clone(),
             )
             .await?;
             assert_eq!(request.method(), Method::POST);
             let method = request.method();
-            let server::Request::Bytes(request) = request else {
-                panic!("expected buffered request")
+            let server::Request::Streaming(mut request) = request else {
+                panic!("incoming requests are always streaming")
             };
             assert_eq!(request.method(), Method::POST);
-            assert_eq!(request.body(), b"hello"[..]);
+            let mut body = [0; 5];
+            assert_eq!(request.read_all(&mut body).await?, body.len());
+            assert_eq!(&body, b"hello");
 
             let mut response = server::Response::default();
-            response.set_status(StatusCode::OK).set_body(request.body());
-            server::respond(
+            response
+                .set_status(StatusCode::OK)
+                .set_body(Bytes::copy_from_slice(&body));
+            server::write_bytes_response(
                 response,
-                H3WriteStream::new(0, server_send),
-                Arc::new(Qpack::default()),
+                support::write_stream(0, server_send),
+                connection.qpack().clone(),
                 &method,
             )
             .await
@@ -64,6 +72,7 @@ async fn request_accept_and_respond() {
 
 #[tokio::test]
 async fn streaming_echo() {
+    let connection = support::connection().await;
     let (client_send, server_recv) = duplex(64);
     let (server_send, client_recv) = duplex(64);
 
@@ -73,12 +82,15 @@ async fn streaming_echo() {
     let expected = sentences.concat().into_bytes();
 
     let (response, uploaded, served) = tokio::join!(
-        client::request(
-            request,
-            H3ReadStream::new(0, client_recv),
-            H3WriteStream::new(0, client_send),
-            Arc::new(Qpack::default())
-        ),
+        async {
+            let response = client::write_streaming_request(
+                request,
+                support::write_stream(0, client_send),
+                support::read_stream(0, client_recv),
+                connection.qpack().clone(),
+            )?;
+            response.await
+        },
         async {
             for sentence in sentences {
                 assert_eq!(upload.write(sentence).await?, sentence.len());
@@ -86,9 +98,9 @@ async fn streaming_echo() {
             upload.finish().await
         },
         async {
-            let request = server::accept(
-                H3ReadStream::new(0, server_recv),
-                Arc::new(Qpack::default()),
+            let request = server::read_request(
+                support::read_stream(0, server_recv),
+                connection.qpack().clone(),
             )
             .await?;
             let method = request.method();
@@ -102,10 +114,10 @@ async fn streaming_echo() {
             let mut echo = response.clone();
 
             let (sent, echoed) = tokio::join!(
-                server::respond(
+                server::write_streaming_response(
                     response,
-                    H3WriteStream::new(0, server_send),
-                    Arc::new(Qpack::default()),
+                    support::write_stream(0, server_send),
+                    connection.qpack().clone(),
                     &method,
                 ),
                 async {
