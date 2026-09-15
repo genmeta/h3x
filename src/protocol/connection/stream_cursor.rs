@@ -1,4 +1,4 @@
-//! Local admission boundary and single-consumer GOAWAY notifications.
+//! Directional admission boundaries and single-consumer GOAWAY notifications.
 use std::sync::Mutex;
 
 use qbase::{
@@ -15,10 +15,12 @@ pub(super) enum Cursor {
     Max(StreamId),
     /// Frozen GOAWAY boundary; no more streams are admitted.
     Gone(StreamId),
+    Closed(Error),
 }
 
 pub(crate) struct StreamCursor {
     pub(super) local: Mutex<Cursor>,
+    pub(super) remote: Mutex<Cursor>,
     local_goaway: ArcReceiving<StreamId>,
     remote_goaway: ArcReceiving<StreamId>,
 }
@@ -27,6 +29,7 @@ impl StreamCursor {
     pub(super) fn new(role: Role) -> Self {
         Self {
             local: Mutex::new(Cursor::Max(StreamId::new(!role, Dir::Bi, 0))),
+            remote: Mutex::new(Cursor::Max(StreamId::new(role, Dir::Bi, 0))),
             local_goaway: ArcReceiving::default(),
             remote_goaway: ArcReceiving::default(),
         }
@@ -35,7 +38,9 @@ impl StreamCursor {
     pub(crate) fn goaway(&self) -> Result<()> {
         let id = {
             let mut local = self.local.lock().unwrap();
-            let (Cursor::Max(id) | Cursor::Gone(id)) = *local;
+            let (Cursor::Max(id) | Cursor::Gone(id)) = *local else {
+                return Ok(());
+            };
             *local = Cursor::Gone(id);
             id
         };
@@ -45,7 +50,20 @@ impl StreamCursor {
 
     /// The control reader validates each boundary before publishing the first one.
     pub(crate) fn receive_goaway(&self, id: StreamId) {
+        {
+            let mut remote = self.remote.lock().unwrap();
+            if matches!(*remote, Cursor::Closed(_)) {
+                return;
+            }
+            *remote = Cursor::Gone(id);
+        }
         self.remote_goaway.obtain(id);
+    }
+
+    /// Freeze both directions before the connection clears the stream registry.
+    pub(super) fn close(&self, error: Error) {
+        self.local.lock().unwrap().close(error);
+        self.remote.lock().unwrap().close(error);
     }
 
     pub(crate) async fn local_goaway(&self) -> Result<StreamId> {
@@ -66,6 +84,20 @@ impl StreamCursor {
 }
 
 impl Cursor {
+    pub(super) fn check_admission(&self) -> Result<()> {
+        match self {
+            Self::Max(_) => Ok(()),
+            Self::Gone(_) => Err(Error::H3_REQUEST_REJECTED),
+            Self::Closed(error) => Err(*error),
+        }
+    }
+
+    fn close(&mut self, error: Error) {
+        if !matches!(self, Self::Closed(_)) {
+            *self = Self::Closed(error);
+        }
+    }
+
     pub(super) fn accept(&mut self, id: StreamId) -> Result<()> {
         match self {
             Self::Max(boundary) => {
@@ -81,6 +113,7 @@ impl Cursor {
                 Ok(())
             }
             Self::Gone(_) => Err(Error::H3_REQUEST_REJECTED),
+            Self::Closed(error) => Err(*error),
         }
     }
 }

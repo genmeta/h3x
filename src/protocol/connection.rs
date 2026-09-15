@@ -53,17 +53,26 @@ impl<T: Transport> H3Connection<T> {
     }
 
     /// Open a bidirectional stream, returning (send, receive).
+    /// Admission stops on peer GOAWAY or connection close, not local GOAWAY.
     pub async fn open_bi(
         &self,
     ) -> Result<(
         H3WriteStream<T::StreamWriter>,
         H3ReadStream<T::StreamReader>,
     )> {
-        let (id, (recv, send)) = self
+        self.cursor.remote.lock().unwrap().check_admission()?;
+        let (id, (mut recv, mut send)) = self
             .transport
             .open_bi()
             .await?
             .ok_or(Error::H3_STREAM_CREATION_ERROR)?;
+        let state = self.cursor.remote.lock().unwrap();
+        if let Err(error) = state.check_admission() {
+            drop(state);
+            recv.stop(Error::H3_REQUEST_REJECTED.as_u64());
+            send.cancel(Error::H3_REQUEST_REJECTED.as_u64());
+            return Err(error);
+        }
         self.bi_streams.insert(id, recv, send)
     }
 
@@ -82,6 +91,7 @@ impl<T: Transport> H3Connection<T> {
 
 impl<T: Transport> H3Connection<T> {
     /// Accept and register one peer bidirectional stream, returning (write, read).
+    /// Admission stops on local GOAWAY or connection close, not peer GOAWAY.
     /// The application drives acceptance; no background request queue is maintained.
     pub async fn accept_bi(
         &self,
@@ -89,6 +99,7 @@ impl<T: Transport> H3Connection<T> {
         H3WriteStream<T::StreamWriter>,
         H3ReadStream<T::StreamReader>,
     )> {
+        self.cursor.local.lock().unwrap().check_admission()?;
         let (id, (mut read, mut write)) = self.transport.accept_bi().await?;
         let mut state = self.cursor.local.lock().unwrap();
         let stream_id = qbase::varint::VarInt::try_from(id)

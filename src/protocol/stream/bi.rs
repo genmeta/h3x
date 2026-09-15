@@ -68,7 +68,8 @@ impl<R, W> BiStreams<R, W> {
         }
     }
 
-    /// Wait for the fixed set admitted when peer GOAWAY arrived.
+    /// Wait for the fixed set after both GOAWAY directions froze admission.
+    /// The connection must freeze admission before calling this method.
     /// Each direction keeps the latest drain waiter alongside its I/O waiter.
     pub(crate) async fn drained(&self) {
         let running: Vec<_> = self.streams.lock().unwrap().values().cloned().collect();
