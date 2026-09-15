@@ -12,40 +12,61 @@ use std::{
 pub(crate) use read::H3ReadStream;
 pub(crate) use write::H3WriteStream;
 
-use crate::{Error, protocol::frame::Goaway};
+use crate::Error;
 
 /// State of one transport half, independent of its application handle.
-pub(crate) enum StreamState<T> {
+enum StreamStatus<T> {
     Idle(T),
     Polling(T, Waker),
-    Goaway(Goaway),
     Closed(Error),
     Finished,
     Transition,
 }
 
+/// I/O state and completion waiter, protected by the owning direction's mutex.
+pub(crate) struct StreamState<T> {
+    status: StreamStatus<T>,
+    finished_waker: Option<Waker>,
+}
+
 impl<T> StreamState<T> {
-    pub(super) fn is_terminal(&self) -> bool {
-        self.result().is_some()
-    }
-
-    pub(super) fn result(&self) -> Option<crate::Result<()>> {
-        match self {
-            Self::Finished => Some(Ok(())),
-            Self::Closed(error) => Some(Err(*error)),
-            Self::Goaway(_) => Some(Err(Error::H3_REQUEST_REJECTED)),
-            _ => None,
+    fn new(io: T) -> Self {
+        Self {
+            status: StreamStatus::Idle(io),
+            finished_waker: None,
         }
     }
 
-    pub(crate) fn terminate(&mut self, terminal: Self) -> Option<Waker> {
-        if self.is_terminal() {
-            return None;
+    fn is_finished(&self) -> bool {
+        matches!(
+            self.status,
+            StreamStatus::Closed(_) | StreamStatus::Finished
+        )
+    }
+
+    fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.is_finished() {
+            Poll::Ready(())
+        } else {
+            self.finished_waker = Some(cx.waker().clone());
+            Poll::Pending
         }
-        match mem::replace(self, terminal) {
-            Self::Polling(_, waker) => Some(waker),
-            _ => None,
-        }
+    }
+
+    // Return wakers so the caller can wake after releasing the state lock.
+    fn close(&mut self, error: Error, terminate: impl FnOnce(&mut T)) -> [Option<Waker>; 2] {
+        let io_waker = if self.is_finished() {
+            None
+        } else {
+            if let StreamStatus::Idle(io) | StreamStatus::Polling(io, _) = &mut self.status {
+                terminate(io);
+            }
+            match mem::replace(&mut self.status, StreamStatus::Closed(error)) {
+                StreamStatus::Polling(_, waker) => Some(waker),
+                _ => None,
+            }
+        };
+        [io_waker, self.finished_waker.take()]
     }
 }
 
@@ -55,18 +76,18 @@ impl<T: Unpin> StreamState<T> {
         cx: &mut Context<'_>,
         poll: impl FnOnce(Pin<&mut T>, &mut Context<'_>) -> Poll<io::Result<O>>,
     ) -> Poll<io::Result<O>> {
-        match mem::replace(self, Self::Transition) {
-            Self::Idle(mut io) | Self::Polling(mut io, _) => {
+        match mem::replace(&mut self.status, StreamStatus::Transition) {
+            StreamStatus::Idle(mut io) | StreamStatus::Polling(mut io, _) => {
                 let result = poll(Pin::new(&mut io), cx);
-                *self = match &result {
-                    Poll::Pending => Self::Polling(io, cx.waker().clone()),
+                self.status = match &result {
+                    Poll::Pending => StreamStatus::Polling(io, cx.waker().clone()),
                     Poll::Ready(Err(error))
                         if !matches!(
                             error.kind(),
                             io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
                         ) =>
                     {
-                        Self::Closed(
+                        StreamStatus::Closed(
                             error
                                 .get_ref()
                                 .and_then(|source| source.downcast_ref::<Error>())
@@ -74,23 +95,19 @@ impl<T: Unpin> StreamState<T> {
                                 .unwrap_or_else(|| Error::from(io::Error::from(error.kind()))),
                         )
                     }
-                    _ => Self::Idle(io),
+                    _ => StreamStatus::Idle(io),
                 };
                 result
             }
-            Self::Goaway(goaway) => {
-                *self = Self::Goaway(goaway);
-                Poll::Ready(Err(Error::H3_REQUEST_REJECTED.into()))
-            }
-            Self::Closed(error) => {
-                *self = Self::Closed(error);
+            StreamStatus::Closed(error) => {
+                self.status = StreamStatus::Closed(error);
                 Poll::Ready(Err(error.into()))
             }
-            Self::Finished => {
-                *self = Self::Finished;
+            StreamStatus::Finished => {
+                self.status = StreamStatus::Finished;
                 Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
             }
-            Self::Transition => unreachable!(),
+            StreamStatus::Transition => unreachable!(),
         }
     }
 }

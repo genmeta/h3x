@@ -67,8 +67,8 @@ impl BodyMode {
 
 /// Receive DATA into an application destination and validate trailing HEADERS.
 /// QPACK is used only to decode trailers. The destination is shut down at EOF.
-pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin, RW, T: Transport>(
-    receive: &mut BufReader<H3ReadStream<R, RW>>,
+pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin, T: Transport>(
+    receive: &mut BufReader<H3ReadStream<R>>,
     destination: &mut W,
     mode: BodyMode,
     qpack: &Qpack<T>,

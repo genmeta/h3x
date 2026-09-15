@@ -66,7 +66,17 @@ impl<T: Transport> H3Connection<T> {
 
 impl<T: Transport> H3Connection<T> {
     pub(super) async fn run_control(self) {
-        let mut send = None;
+        let mut send = match self.transport.open_uni().await {
+            Ok(Some((_, send))) => send,
+            Ok(None) => {
+                self.fail(Error::H3_STREAM_CREATION_ERROR).await;
+                return;
+            }
+            Err(error) => {
+                self.close(error);
+                return;
+            }
+        };
         let result = tokio::select! {
             biased;
             error = self.transport.terminated() => {
@@ -74,14 +84,7 @@ impl<T: Transport> H3Connection<T> {
                 return;
             }
             result = async {
-                send = Some(
-                    self.transport
-                        .open_uni()
-                        .await?
-                        .ok_or(Error::H3_STREAM_CREATION_ERROR)?
-                        .1,
-                );
-                self.send_control(send.as_mut().unwrap()).await?;
+                self.send_control(&mut send).await?;
                 self.cursor.peer_goaway().await?;
                 self.bi_streams.drained().await;
                 self.transport

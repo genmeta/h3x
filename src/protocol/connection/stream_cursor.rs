@@ -20,7 +20,7 @@ pub(super) enum Cursor {
 pub(crate) struct StreamCursor {
     pub(super) local: Mutex<Cursor>,
     local_goaway: ArcReceiving<StreamId>,
-    peer_goaway: ArcReceiving<StreamId>,
+    remote_goaway: ArcReceiving<StreamId>,
 }
 
 impl StreamCursor {
@@ -28,7 +28,7 @@ impl StreamCursor {
         Self {
             local: Mutex::new(Cursor::Max(StreamId::new(!role, Dir::Bi, 0))),
             local_goaway: ArcReceiving::default(),
-            peer_goaway: ArcReceiving::default(),
+            remote_goaway: ArcReceiving::default(),
         }
     }
 
@@ -45,7 +45,7 @@ impl StreamCursor {
 
     /// The control reader validates each boundary before publishing the first one.
     pub(crate) fn receive_goaway(&self, id: StreamId) {
-        self.peer_goaway.obtain(id);
+        self.remote_goaway.obtain(id);
     }
 
     pub(crate) async fn local_goaway(&self) -> Result<StreamId> {
@@ -57,7 +57,7 @@ impl StreamCursor {
     }
 
     pub(crate) async fn peer_goaway(&self) -> Result<StreamId> {
-        self.peer_goaway
+        self.remote_goaway
             .clone()
             .await
             .map_err(|_| Error::H3_INTERNAL_ERROR)?

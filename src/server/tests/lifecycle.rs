@@ -200,13 +200,7 @@ async fn streaming_response_termination_reaches_the_producer() {
                 .insert(0, crate::test_support::Reader, crate::test_support::Writer)
                 .unwrap();
             drop(recv);
-            let (stop, stopped) = tokio::sync::oneshot::channel();
-            let mut sending = Box::pin(super::respond(
-                response,
-                send.with_stop_signal(async move { stopped.await.unwrap() }),
-                qpack.clone(),
-                &Method::GET,
-            ));
+            let mut sending = Box::pin(super::respond(response, send, qpack.clone(), &Method::GET));
             if started {
                 assert!(
                     sending
@@ -220,10 +214,15 @@ async fn streaming_response_termination_reaches_the_producer() {
                 producer.clone().reset().await.unwrap();
             } else {
                 if error == Error::H3_REQUEST_REJECTED {
-                    stop.send(error).unwrap();
+                    bi.goaway(0, &qpack);
                 } else {
                     qpack.on_error(error);
+                    // These test writers are independent of the transport; apply
+                    // the connection's stream closure before resuming body I/O.
+                    bi.close(error);
                 }
+                // Resume body I/O so the send operation observes the terminal stream.
+                producer.write(b"x").await.unwrap();
                 assert_eq!(sending.await, Err(error));
             }
             assert_eq!(producer.write(b"x").await, Err(error));
@@ -231,7 +230,7 @@ async fn streaming_response_termination_reaches_the_producer() {
         }
     })
     .await
-    .expect("response termination must notify an idle body producer");
+    .expect("response termination must reach the producer when sending resumes");
 }
 
 #[tokio::test]

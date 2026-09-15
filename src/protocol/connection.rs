@@ -9,11 +9,11 @@ use super::{
 use crate::{Error, Result, Transport};
 
 mod control;
-mod goaway;
 mod settings;
+mod stream_cursor;
 
-pub(crate) use goaway::StreamCursor;
 pub use settings::Settings;
+pub(crate) use stream_cursor::StreamCursor;
 
 /// An HTTP/3 connection whose control and QPACK streams are driven automatically.
 /// Construct inside a Tokio runtime. Tasks run until the transport terminates.
@@ -56,8 +56,8 @@ impl<T: Transport> H3Connection<T> {
     pub async fn open_bi(
         &self,
     ) -> Result<(
-        H3WriteStream<T::StreamWriter, T::StreamReader>,
-        H3ReadStream<T::StreamReader, T::StreamWriter>,
+        H3WriteStream<T::StreamWriter>,
+        H3ReadStream<T::StreamReader>,
     )> {
         let (id, (recv, send)) = self
             .transport
@@ -86,8 +86,8 @@ impl<T: Transport> H3Connection<T> {
     pub async fn accept_bi(
         &self,
     ) -> Result<(
-        H3WriteStream<T::StreamWriter, T::StreamReader>,
-        H3ReadStream<T::StreamReader, T::StreamWriter>,
+        H3WriteStream<T::StreamWriter>,
+        H3ReadStream<T::StreamReader>,
     )> {
         let (id, (mut read, mut write)) = self.transport.accept_bi().await?;
         let mut state = self.cursor.local.lock().unwrap();

@@ -1,120 +1,86 @@
 use std::{
-    future::{Future, poll_fn},
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
 use tokio::io::AsyncWrite;
 
-use super::{StreamState, bi::BiStream};
+use super::{StreamState, StreamStatus};
 use crate::Error;
-#[cfg(test)]
-use crate::protocol::frame::Goaway;
 
-/// Write handle for a stream owned by the connection.
-/// `R` is the paired transport reader; standalone writers use `()`.
-pub struct H3WriteStream<W, R = ()> {
-    pub(super) stream: Arc<BiStream<R, W>>,
-    pub(super) stop_signal: Option<Pin<Box<dyn Future<Output = Error> + Send>>>,
+/// Application-owned write direction, observed weakly by the connection.
+pub struct H3WriteStream<W> {
+    id: u64,
+    pub(super) state: Arc<Mutex<StreamState<W>>>,
 }
 
 impl<W> H3WriteStream<W> {
     pub fn new(stream_id: u64, stream: W) -> Self {
         Self {
-            stream: Arc::new(BiStream::new(
-                stream_id,
-                StreamState::Closed(Error::H3_NO_ERROR),
-                StreamState::Idle(stream),
-            )),
-            stop_signal: None,
+            id: stream_id,
+            state: Arc::new(Mutex::new(StreamState::new(stream))),
         }
-    }
-}
-
-impl<W, R> H3WriteStream<W, R> {
-    pub fn stream_id(&self) -> u64 {
-        self.stream.id
     }
 
     pub(crate) fn cancel_with_error(&self, error: Error) {
-        let waker = self
-            .stream
-            .write
-            .lock()
-            .unwrap()
-            .terminate(StreamState::Closed(error));
-        if self.stream.read.lock().unwrap().is_terminal()
-            && self.stream.write.lock().unwrap().is_terminal()
-        {
-            self.stream.finished.obtain(());
-        }
-        if let Some(waker) = waker {
+        let wakers = self.state.lock().unwrap().close(error, |_| {});
+        for waker in wakers.into_iter().flatten() {
             waker.wake();
         }
     }
 
-    /// Attach an adapter's peer STOP_SENDING notification, independent of writes.
-    /// The future must own its notification handle rather than borrow this stream.
-    /// The message's send future consumes it when polled, including while waiting
-    /// for body data. An unpolled send future does not consume STOP notifications.
-    pub fn with_stop_signal(
-        mut self,
-        stopped: impl Future<Output = Error> + Send + 'static,
-    ) -> Self {
-        self.stop_signal = Some(Box::pin(stopped));
-        self
-    }
-
-    /// Move the optional STOP input into the one operation that will poll it.
-    pub(crate) fn stopped(&mut self) -> impl Future<Output = Error> + use<W, R> {
-        let mut stopped = self.stop_signal.take();
-        let stream = Arc::clone(&self.stream);
-        poll_fn(move |cx| {
-            if let Some(Err(error)) = stream.write.lock().unwrap().result() {
-                return Poll::Ready(error);
-            }
-            match stopped.as_mut() {
-                Some(stopped) => stopped.as_mut().poll(cx),
-                None => Poll::Pending,
-            }
-        })
+    pub fn stream_id(&self) -> u64 {
+        self.id
     }
 }
 
-impl<W: qrecovery::send::CancelStream, R> qrecovery::send::CancelStream for H3WriteStream<W, R> {
+impl<W: qrecovery::send::CancelStream> qrecovery::send::CancelStream for &H3WriteStream<W> {
     fn cancel(&mut self, error_code: u64) {
-        qrecovery::send::CancelStream::cancel(&mut self.stream.as_ref(), error_code);
+        let wakers = self
+            .state
+            .lock()
+            .unwrap()
+            .close(Error::H3_REQUEST_CANCELLED, |io| io.cancel(error_code));
+        for waker in wakers.into_iter().flatten() {
+            waker.wake();
+        }
     }
 }
 
-impl<W: AsyncWrite + Unpin, R> H3WriteStream<W, R> {
+impl<W: qrecovery::send::CancelStream> qrecovery::send::CancelStream for H3WriteStream<W> {
+    fn cancel(&mut self, error_code: u64) {
+        qrecovery::send::CancelStream::cancel(&mut &*self, error_code);
+    }
+}
+
+impl<W: AsyncWrite + Unpin> H3WriteStream<W> {
     fn poll_io<O>(
         &mut self,
         cx: &mut Context<'_>,
         finish: bool,
         poll: impl FnOnce(Pin<&mut W>, &mut Context<'_>) -> Poll<io::Result<O>>,
     ) -> Poll<io::Result<O>> {
-        let mut state = self.stream.write.lock().unwrap();
-        let result = state.poll_io(cx, poll);
+        let mut inner = self.state.lock().unwrap();
+        let result = inner.poll_io(cx, poll);
         if finish && matches!(result, Poll::Ready(Ok(_))) {
-            state.terminate(StreamState::Finished);
+            inner.status = StreamStatus::Finished;
         }
-        let terminal = state.is_terminal();
-        drop(state);
-        if terminal {
-            if self.stream.read.lock().unwrap().is_terminal()
-                && self.stream.write.lock().unwrap().is_terminal()
-            {
-                self.stream.finished.obtain(());
-            }
+        let waker = if inner.is_finished() {
+            inner.finished_waker.take()
+        } else {
+            None
+        };
+        drop(inner);
+        if let Some(waker) = waker {
+            waker.wake();
         }
         result
     }
 }
 
-impl<W: AsyncWrite + Unpin, R> AsyncWrite for H3WriteStream<W, R> {
+impl<W: AsyncWrite + Unpin> AsyncWrite for H3WriteStream<W> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -125,7 +91,7 @@ impl<W: AsyncWrite + Unpin, R> AsyncWrite for H3WriteStream<W, R> {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if matches!(*self.stream.write.lock().unwrap(), StreamState::Finished) {
+        if matches!(self.state.lock().unwrap().status, StreamStatus::Finished) {
             return Poll::Ready(Ok(()));
         }
         self.get_mut()
@@ -133,7 +99,7 @@ impl<W: AsyncWrite + Unpin, R> AsyncWrite for H3WriteStream<W, R> {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if matches!(*self.stream.write.lock().unwrap(), StreamState::Finished) {
+        if matches!(self.state.lock().unwrap().status, StreamStatus::Finished) {
             return Poll::Ready(Ok(()));
         }
         self.get_mut()
@@ -141,29 +107,9 @@ impl<W: AsyncWrite + Unpin, R> AsyncWrite for H3WriteStream<W, R> {
     }
 }
 
-impl<W, R> Drop for H3WriteStream<W, R> {
+impl<W> Drop for H3WriteStream<W> {
     fn drop(&mut self) {
         self.cancel_with_error(Error::H3_REQUEST_CANCELLED);
-    }
-}
-
-#[cfg(test)]
-impl<W, R> H3WriteStream<W, R> {
-    pub(crate) fn on_recv(&mut self, goaway: Goaway) {
-        let waker = self
-            .stream
-            .write
-            .lock()
-            .unwrap()
-            .terminate(StreamState::Goaway(goaway));
-        if self.stream.read.lock().unwrap().is_terminal()
-            && self.stream.write.lock().unwrap().is_terminal()
-        {
-            self.stream.finished.obtain(());
-        }
-        if let Some(waker) = waker {
-            waker.wake();
-        }
     }
 }
 
@@ -176,8 +122,6 @@ mod tests {
         },
         task::{Wake, Waker},
     };
-
-    use qbase::varint::VarInt;
 
     use super::*;
     use crate::{Error, protocol::stream::H3ReadStream};
@@ -205,17 +149,13 @@ mod tests {
                 .poll_read(&mut cx, &mut buf)
                 .is_pending()
         );
-        recv.recv_goaway(Goaway {
-            id: VarInt::from_u32(0),
-        });
+        recv.close(Error::H3_REQUEST_REJECTED);
         assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
         assert!(
             matches!(Pin::new(&mut recv).poll_read(&mut cx,&mut buf),Poll::Ready(Err(e)) if e.get_ref().and_then(|e|e.downcast_ref::<Error>())==Some(&Error::H3_REQUEST_REJECTED))
         );
         let mut send = H3WriteStream::new(4, tokio::io::sink());
-        send.on_recv(Goaway {
-            id: VarInt::from_u32(0),
-        });
+        send.cancel_with_error(Error::H3_REQUEST_REJECTED);
         for result in [
             Pin::new(&mut send).poll_write(&mut cx, b"x").map_ok(|_| ()),
             Pin::new(&mut send).poll_flush(&mut cx),
@@ -268,9 +208,7 @@ mod tests {
                     .is_pending()
                 );
             }
-            send.on_recv(Goaway {
-                id: VarInt::from_u32(4),
-            });
+            send.cancel_with_error(Error::H3_REQUEST_REJECTED);
             assert_eq!(old.0.load(Ordering::SeqCst), 0);
             assert_eq!(latest.0.load(Ordering::SeqCst), 1);
             let Poll::Ready(Err(error)) = poll(&mut send, &mut Context::from_waker(Waker::noop()))
@@ -285,43 +223,39 @@ mod tests {
     async fn stream_state_returns_to_idle_after_ready_io() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut recv = H3ReadStream::new(4, std::io::Cursor::new(vec![7]));
-        *recv.stream.read.lock().unwrap() =
-            StreamState::Polling(std::io::Cursor::new(vec![7]), Waker::noop().clone());
+        recv.state.lock().unwrap().status =
+            StreamStatus::Polling(std::io::Cursor::new(vec![7]), Waker::noop().clone());
         let mut bytes = [0];
         recv.read_exact(&mut bytes).await.unwrap();
         assert_eq!(bytes, [7]);
         assert!(matches!(
-            *recv.stream.read.lock().unwrap(),
-            StreamState::Idle(_)
+            recv.state.lock().unwrap().status,
+            StreamStatus::Idle(_)
         ));
-        recv.recv_goaway(Goaway {
-            id: VarInt::from_u32(4),
-        });
+        recv.close(Error::H3_REQUEST_REJECTED);
         assert!(matches!(
-            *recv.stream.read.lock().unwrap(),
-            StreamState::Goaway(_)
+            recv.state.lock().unwrap().status,
+            StreamStatus::Closed(Error::H3_REQUEST_REJECTED)
         ));
         assert_eq!(recv.stream_id(), 4);
         let mut send = H3WriteStream::new(4, Vec::new());
-        *send.stream.write.lock().unwrap() =
-            StreamState::Polling(Vec::new(), Waker::noop().clone());
+        send.state.lock().unwrap().status =
+            StreamStatus::Polling(Vec::new(), Waker::noop().clone());
         send.write_all(b"x").await.unwrap();
         assert!(matches!(
-            *send.stream.write.lock().unwrap(),
-            StreamState::Idle(_)
+            send.state.lock().unwrap().status,
+            StreamStatus::Idle(_)
         ));
         send.flush().await.unwrap();
         send.shutdown().await.unwrap();
         assert!(matches!(
-            *send.stream.write.lock().unwrap(),
-            StreamState::Finished
+            send.state.lock().unwrap().status,
+            StreamStatus::Finished
         ));
-        send.on_recv(Goaway {
-            id: VarInt::from_u32(4),
-        });
+        send.cancel_with_error(Error::H3_REQUEST_REJECTED);
         assert!(matches!(
-            *send.stream.write.lock().unwrap(),
-            StreamState::Finished
+            send.state.lock().unwrap().status,
+            StreamStatus::Finished
         ));
         assert_eq!(send.stream_id(), 4);
     }

@@ -295,16 +295,15 @@ async fn producer_fin_does_not_complete_transport_shutdown() {
 }
 
 #[tokio::test]
-async fn idle_peer_stop_reaches_the_producer_without_discarding_response() {
+async fn write_failure_after_idle_body_preserves_the_response() {
     timeout(Duration::from_secs(5), async {
         let mut producer = Request::streaming_post("https://example.com/upload").unwrap();
         let (send, mut peer_recv) = tokio::io::duplex(64);
         let (mut peer_send, recv) = tokio::io::duplex(64);
-        let (stop, stopped) = tokio::sync::oneshot::channel();
         let mut waiting = Box::pin(request(
             producer.clone(),
             H3ReadStream::new(0, recv),
-            H3WriteStream::new(0, send).with_stop_signal(async move { stopped.await.unwrap() }),
+            H3WriteStream::new(0, send),
             crate::protocol::qpack::tests::shared(),
         ));
         assert!(
@@ -317,20 +316,28 @@ async fn idle_peer_stop_reaches_the_producer_without_discarding_response() {
             be_frame(&mut peer_recv).await.unwrap(),
             H3Frame::Headers(_)
         ));
-        stop.send(Error::H3_REQUEST_REJECTED).unwrap();
+        drop(peer_recv);
+        // There is no independent STOP observer while the upload waits for body data.
         assert!(
             waiting
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
-        assert_eq!(producer.write(b"x").await, Err(Error::H3_REQUEST_REJECTED));
+        assert_eq!(producer.write(b"x").await, Ok(1));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(producer.write(b"x").await, Err(Error::H3_INTERNAL_ERROR));
         peer_send.write_all(&response_headers()).await.unwrap();
         peer_send.shutdown().await.unwrap();
         assert_eq!(waiting.await.unwrap().status(), StatusCode::OK);
     })
     .await
-    .expect("a stopped upload must still receive the peer's valid response");
+    .expect("a failed upload must still receive the peer's valid response");
 }
 
 #[tokio::test]
