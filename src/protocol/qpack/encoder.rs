@@ -7,20 +7,16 @@ use std::sync::{
 use bytes::Bytes;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    sync::{mpsc, watch},
-    task::JoinHandle,
+    sync::mpsc,
 };
 
 use super::{
-    Field, Qpack, Settings,
+    Field, Settings,
     codec::instruction::{
         DecoderInstruction, EncoderInstruction, WriteInstruction, be_decoder_instruction,
     },
 };
-use crate::{
-    Error, Result, Transport,
-    protocol::{frame::StreamType, stream::bi::BiStreams},
-};
+use crate::{Error, Result, protocol::frame::StreamType};
 
 mod state;
 use state::State;
@@ -28,26 +24,43 @@ use state::State;
 /// Each instruction carries the cumulative insert count after its table update.
 type Instructions = mpsc::Receiver<Vec<(EncoderInstruction, u64)>>;
 
-pub(super) struct Encoder {
+/// Queued instructions and their completed local write count.
+///
+/// ```text
+/// Encoder::write()                         Encoder::receive()
+///       |                                        |
+/// write_all(instruction).await                   | peer feedback
+///       |                                        v
+///       +-- store(n) --> completed: AtomicU64 <-- load
+///                                                |
+///                                 validate and apply feedback
+/// ```
+///
+/// Completion means the full instruction was accepted by the stream writer,
+/// not acknowledged by the peer. There is no progress notification or wait.
+pub(in crate::protocol) struct InstructionSource {
+    pub(super) instructions: Instructions,
+    completed: Arc<AtomicU64>,
+}
+
+pub(in crate::protocol) struct Encoder {
     state: Mutex<Result<State>>,
-    started: Arc<AtomicU64>,
-    completed: watch::Receiver<u64>,
-    write_task: Mutex<Option<JoinHandle<()>>>,
+    completed: Arc<AtomicU64>,
 }
 
 impl Encoder {
-    pub(super) fn new(peer: Settings) -> Result<(Self, Instructions, watch::Sender<u64>)> {
+    pub(super) fn new(peer: Settings) -> Result<(Self, InstructionSource)> {
         let (sender, receiver) = mpsc::channel(16);
-        let (completed, completion) = watch::channel(0);
+        let completed = Arc::new(AtomicU64::new(0));
         Ok((
             Self {
                 state: Mutex::new(Ok(State::new(peer, sender)?)),
-                started: Arc::new(AtomicU64::new(0)),
-                completed: completion,
-                write_task: Mutex::new(None),
+                completed: completed.clone(),
             },
-            receiver,
-            completed,
+            InstructionSource {
+                instructions: receiver,
+                completed,
+            },
         ))
     }
 
@@ -60,6 +73,7 @@ impl Encoder {
             .configure(peer, max_fields)
     }
 
+    #[cfg(test)]
     pub(super) fn error(&self) -> Option<Error> {
         self.state.lock().unwrap().as_ref().err().copied()
     }
@@ -71,9 +85,7 @@ impl Encoder {
             *state = Err(error);
             error
         };
-        if let Some(writer) = self.write_task.lock().unwrap().take() {
-            writer.abort();
-        }
+
         error
     }
 
@@ -86,106 +98,45 @@ impl Encoder {
             .encode(id, fields)
     }
 
-    /// The read task owns feedback; it keeps at most one instruction while waiting.
+    /// Read and validate peer feedback against completed local writes.
     pub(super) async fn receive<R: AsyncRead + Unpin>(&self, recv: &mut R) -> Result<()> {
-        let mut progress = self.completed.clone();
         loop {
             let instruction = be_decoder_instruction(recv).await?;
-            self.receive_feedback(instruction, &mut progress).await?;
+            self.on_decoder_instruction(instruction)?;
         }
     }
 
-    async fn receive_feedback(
-        &self,
-        instruction: DecoderInstruction,
-        progress: &mut watch::Receiver<u64>,
-    ) -> Result<()> {
-        loop {
-            let completed = *progress.borrow_and_update();
-            {
-                let mut state = self.state.lock().unwrap();
-                let state = state.as_mut().map_err(|error| *error)?;
-                let required = state.feedback_insert_count(&instruction)?;
-                if required > self.started.load(Ordering::Acquire) {
-                    return Err(Error::QPACK_DECODER_STREAM_ERROR);
-                }
-                if required <= completed {
-                    return state.on_decoder_instruction(instruction, completed);
-                }
-            }
-            // Only the writer can complete this instruction; do not hold the state lock.
-            progress
-                .changed()
-                .await
-                .map_err(|_| self.error().unwrap_or(Error::H3_CLOSED_CRITICAL_STREAM))?;
-        }
+    pub(super) fn on_decoder_instruction(&self, instruction: DecoderInstruction) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map_err(|error| *error)?
+            .on_decoder_instruction(instruction, self.completed.load(Ordering::Acquire))
     }
 
-    pub(super) fn start<T: Transport>(
-        &self,
-        qpack: &Arc<Qpack<T>>,
-        receiver: Instructions,
-        completed: watch::Sender<u64>,
-        bi: Arc<BiStreams<T::StreamReader, T::StreamWriter>>,
-    ) {
-        let mut write_task = self.write_task.lock().unwrap();
-        if write_task.is_some() || self.error().is_some() {
-            return;
-        }
-        let started = self.started.clone();
-        let transport = qpack.transport.clone();
-        let qpack = Arc::downgrade(qpack);
-
-        *write_task = Some(tokio::spawn(async move {
-            let stream = transport
-                .open_uni()
-                .await
-                .and_then(|stream| stream.ok_or(Error::H3_STREAM_CREATION_ERROR));
-
-            let (_, mut send) = match stream {
-                Ok(stream) => stream,
-                Err(error) => {
-                    if let Some(qpack) = qpack.upgrade() {
-                        qpack.fail(error, &bi);
-                    }
-                    return;
-                }
-            };
-
-            if let Err(error) =
-                Self::write_instructions(&started, &completed, receiver, &mut send).await
-                && let Some(qpack) = qpack.upgrade()
-            {
-                qpack.fail(error, &bi);
-            }
-        }));
-    }
-
-    async fn write_instructions<W: AsyncWrite + Unpin>(
-        started: &AtomicU64,
-        completed: &watch::Sender<u64>,
-        mut receiver: Instructions,
+    pub(in crate::protocol) async fn write<W: AsyncWrite + Unpin>(
+        instruction_source: InstructionSource,
         writer: &mut W,
     ) -> Result<()> {
+        let InstructionSource {
+            mut instructions,
+            completed,
+        } = instruction_source;
         writer
             .write_all(&[StreamType::QpackEncoder as u8])
             .await
             .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
         let mut buf = Vec::new();
-        while let Some(batch) = receiver.recv().await {
+        while let Some(batch) = instructions.recv().await {
             for (instruction, insert_count) in batch {
                 buf.clear();
                 buf.put_encoder_instruction(&instruction)?;
-                started.store(insert_count, Ordering::Release);
                 writer
                     .write_all(&buf)
                     .await
                     .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-                writer
-                    .flush()
-                    .await
-                    .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-                completed.send_replace(insert_count);
+                completed.store(insert_count, Ordering::Release);
             }
         }
         Err(Error::H3_CLOSED_CRITICAL_STREAM)
@@ -195,35 +146,12 @@ impl Encoder {
 /// Cross-direction codec tests simulate transport progress without exposing State.
 #[cfg(test)]
 impl Encoder {
-    pub(super) fn on_instruction_sent(
-        &self,
-        completed: &watch::Sender<u64>,
-        insert_count: u64,
-    ) -> Result<()> {
+    pub(super) fn on_instruction_sent(&self, insert_count: u64) -> Result<()> {
         if let Some(error) = self.error() {
             return Err(error);
         }
-        self.started.store(insert_count, Ordering::Release);
-        completed.send_replace(insert_count);
+        self.completed.store(insert_count, Ordering::Release);
         Ok(())
-    }
-
-    pub(super) fn on_decoder_instruction(&self, instruction: DecoderInstruction) -> Result<()> {
-        let completed = *self.completed.borrow();
-        self.state
-            .lock()
-            .unwrap()
-            .as_mut()
-            .map_err(|error| *error)?
-            .on_decoder_instruction(instruction, completed)
-    }
-}
-
-impl Drop for Encoder {
-    fn drop(&mut self) {
-        if let Some(writer) = self.write_task.get_mut().unwrap().take() {
-            writer.abort();
-        }
     }
 }
 
@@ -231,14 +159,38 @@ impl Drop for Encoder {
 mod tests {
     use std::{
         future::Future,
+        io,
+        pin::Pin,
         task::{Context, Poll, Waker},
     };
 
     use super::*;
 
-    #[tokio::test]
-    async fn decoder_feedback_waits_for_the_current_encoder_write_to_commit() {
-        let (encoder, mut receiver, completed) = Encoder::new(Settings::default()).unwrap();
+    struct Writer {
+        fail: bool,
+    }
+    impl AsyncWrite for Writer {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.fail {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            } else {
+                Poll::Ready(Ok(bytes.len()))
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            panic!("QPACK instructions must not wait for transport acknowledgments")
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn queued_insert() -> (Encoder, InstructionSource) {
+        let (encoder, source) = Encoder::new(Settings::default()).unwrap();
         encoder
             .configure(
                 Settings {
@@ -248,7 +200,6 @@ mod tests {
                 1024,
             )
             .unwrap();
-        receiver.try_recv().unwrap(); // Capacity does not advance the insertion count.
         encoder
             .encode(
                 0,
@@ -259,32 +210,42 @@ mod tests {
                 }],
             )
             .unwrap();
-        let batch = receiver.try_recv().unwrap();
-        assert_eq!(batch.len(), 1);
-        let insert_count = batch[0].1;
-        encoder.started.store(insert_count, Ordering::Release);
-        let mut progress = encoder.completed.clone();
-        let mut feedback = Box::pin(
-            encoder.receive_feedback(DecoderInstruction::SectionAcknowledgment(0), &mut progress),
+        (encoder, source)
+    }
+
+    #[tokio::test]
+    async fn completed_writes_allow_feedback_without_flushing() {
+        let (encoder, source) = queued_insert();
+        assert_eq!(
+            encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(0)),
+            Err(Error::QPACK_DECODER_STREAM_ERROR)
         );
+        let mut writer = Writer { fail: false };
+        let mut writing = Box::pin(Encoder::write(source, &mut writer));
         assert!(
-            feedback
+            writing
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
-        encoder
-            .on_instruction_sent(&completed, insert_count)
-            .unwrap();
+        assert_eq!(encoder.completed.load(Ordering::Acquire), 1);
         assert_eq!(
-            feedback
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Ok(()))
+            encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(0)),
+            Ok(())
         );
         assert_eq!(
             encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(0)),
             Err(Error::QPACK_DECODER_STREAM_ERROR)
         );
+    }
+
+    #[tokio::test]
+    async fn failed_writes_do_not_advance_completion() {
+        let (encoder, source) = queued_insert();
+        assert_eq!(
+            Encoder::write(source, &mut Writer { fail: true }).await,
+            Err(Error::H3_CLOSED_CRITICAL_STREAM)
+        );
+        assert_eq!(encoder.completed.load(Ordering::Acquire), 0);
     }
 }

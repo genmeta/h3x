@@ -5,7 +5,7 @@ use std::{
 };
 
 use qbase::varint::VARINT_MAX;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use super::super::{
     Field, Settings,
@@ -24,8 +24,7 @@ pub(super) struct State {
     waiting: HashMap<u64, (u64, usize, Waker)>,
     blocked_bytes: usize,
     max_blocked_bytes: usize,
-    sender: mpsc::UnboundedSender<(DecoderInstruction, u64)>,
-    inserted: watch::Sender<u64>,
+    sender: mpsc::UnboundedSender<DecoderInstruction>,
     pub(super) decoding_stream: HashSet<u64>,
 }
 
@@ -34,8 +33,7 @@ impl State {
         local: Settings,
         max_blocked_bytes: usize,
         max_fields: u64,
-        sender: mpsc::UnboundedSender<(DecoderInstruction, u64)>,
-        inserted: watch::Sender<u64>,
+        sender: mpsc::UnboundedSender<DecoderInstruction>,
     ) -> Result<Self> {
         if local.blocked_streams > VARINT_MAX {
             return Err(Error::H3_SETTINGS_ERROR);
@@ -48,7 +46,6 @@ impl State {
             blocked_bytes: 0,
             max_blocked_bytes,
             sender,
-            inserted,
             decoding_stream: HashSet::new(),
         })
     }
@@ -117,8 +114,16 @@ impl State {
         if self.table.max_capacity() == 0 {
             return Err(Error::QPACK_ENCODER_STREAM_ERROR);
         }
+        let previous_count = self.table.insert_count();
         self.table.apply(instruction)?;
-        self.inserted.send_replace(self.table.insert_count());
+        let increment = self.table.insert_count() - previous_count;
+        if increment != 0 {
+            // Queue progress before any ACK that can reference these insertions.
+            // All producers hold the decoder state lock, preserving this wire order.
+            self.sender
+                .send(DecoderInstruction::InsertCountIncrement(increment))
+                .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+        }
         let wakes = self
             .waiting
             .values()
@@ -140,7 +145,7 @@ impl State {
         }
         if self.table.max_capacity() != 0 {
             self.sender
-                .send((DecoderInstruction::StreamCancellation(id), 0))
+                .send(DecoderInstruction::StreamCancellation(id))
                 .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
         }
         self.decoding_stream.remove(&id);
@@ -162,10 +167,7 @@ impl State {
     fn acknowledge(&self, stream_id: u64, required_insert_count: u64) -> Result<()> {
         if required_insert_count != 0 {
             self.sender
-                .send((
-                    DecoderInstruction::SectionAcknowledgment(stream_id),
-                    required_insert_count,
-                ))
+                .send(DecoderInstruction::SectionAcknowledgment(stream_id))
                 .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
         }
         Ok(())

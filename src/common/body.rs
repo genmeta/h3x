@@ -1,6 +1,6 @@
 //! Application body handles, incoming-body driving, and HTTP/3 body framing.
 
-use std::{marker::PhantomData, sync::Arc};
+use std::marker::PhantomData;
 
 use bytes::Bytes;
 use http::{Method, StatusCode};
@@ -10,6 +10,7 @@ use super::{Read, Write};
 use crate::{
     ArcWndBuf, Error, Result, Transport,
     protocol::{
+        connection::H3Connection,
         frame::{self, Data, Frame, H3Frame, Write as _, be_frame},
         headers,
         qpack::Qpack,
@@ -114,7 +115,7 @@ impl Body<ArcWndBuf, Read> {
 pub(crate) async fn receive<RS, T>(
     mut rs: BufReader<H3ReadStream<RS>>,
     mode: BodyMode,
-    qpack: Arc<Qpack<T>>,
+    connection: H3Connection<T>,
 ) -> Result<super::Body<Read>>
 where
     RS: AsyncRead + Unpin + Send + 'static,
@@ -123,12 +124,11 @@ where
     let stream_id = rs.get_ref().stream_id();
     if !mode.streaming() {
         let mut bytes = Vec::new();
-        read_body(&mut rs, &mut bytes, mode, &qpack)
-            .await
-            .inspect_err(|error| {
-                let _ = qpack.cancel(stream_id);
-                qpack.on_error(*error);
-            })?;
+        if let Err(error) = read_body(&mut rs, &mut bytes, mode, connection.qpack()).await {
+            let _ = connection.qpack().cancel(stream_id);
+            connection.receive_error(error).await;
+            return Err(error);
+        }
         return Ok(super::Body::Bytes(Body::from_storage(Bytes::from(bytes))));
     }
 
@@ -139,11 +139,11 @@ where
         let result = tokio::select! {
             biased;
             error = cancellation.error() => Err(error),
-            result = read_body(&mut rs, &mut buffer, mode, &qpack) => result,
+            result = read_body(&mut rs, &mut buffer, mode, connection.qpack()) => result,
         };
         if let Err(error) = result {
-            let _ = qpack.cancel(stream_id);
-            qpack.on_error(error);
+            let _ = connection.qpack().cancel(stream_id);
+            connection.receive_error(error).await;
             buffer.set_error(error);
         }
         // read_body validates FIN/trailers and marks buffer EOF on success.
@@ -207,11 +207,11 @@ impl BodyMode {
 
 /// Receive DATA into an application destination and validate trailing HEADERS.
 /// QPACK is used only to decode trailers. The destination is shut down at EOF.
-pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin, T: Transport>(
+pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     receive: &mut BufReader<H3ReadStream<R>>,
     destination: &mut W,
     mode: BodyMode,
-    qpack: &Qpack<T>,
+    qpack: &Qpack,
 ) -> Result<()> {
     let mut remaining = mode.content_length();
     let mut trailers = false;
@@ -372,7 +372,7 @@ mod tests {
                         Some(content_length) => BodyMode::Length { content_length },
                         None => BodyMode::Infinity,
                     },
-                    &crate::protocol::qpack::tests::shared()
+                    crate::test_support::connection().qpack()
                 )
                 .await,
                 expected
@@ -386,7 +386,7 @@ mod tests {
                 &mut BufReader::new(H3ReadStream::new(0, &mut input)),
                 &mut body,
                 BodyMode::Infinity,
-                &crate::protocol::qpack::tests::shared()
+                crate::test_support::connection().qpack()
             )
             .await,
             Err(Error::H3_FRAME_UNEXPECTED)

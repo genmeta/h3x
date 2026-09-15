@@ -11,7 +11,7 @@ async fn dropping_last_producer_does_not_finish_or_cancel_sending() {
     let mut sending = Box::pin(crate::server::write_streaming_response(
         response,
         H3WriteStream::new(0, tokio::io::sink()),
-        crate::protocol::qpack::tests::shared(),
+        crate::test_support::connection(),
         &Method::GET,
     ));
     let mut cx = Context::from_waker(Waker::noop());
@@ -39,7 +39,7 @@ async fn finished_response_producer_can_drop_before_or_during_send() {
         let mut sending = Box::pin(super::respond(
             response,
             H3WriteStream::new(0, &mut encoded),
-            crate::protocol::qpack::tests::shared(),
+            crate::test_support::connection(),
             &Method::GET,
         ));
         if started {
@@ -157,12 +157,7 @@ async fn streaming_response_termination_reaches_the_producer() {
             let response = response.streaming(1);
             let mut producer = response.clone();
             let bi = Arc::new(crate::protocol::stream::bi::BiStreams::default());
-            let qpack = Qpack::new(
-                Arc::new(crate::test_support::TestTransport::default()),
-                &crate::Settings::default(),
-                bi.clone(),
-            )
-            .unwrap();
+            let qpack = crate::test_support::connection();
             let (send, recv) = bi
                 .insert(0, crate::test_support::Reader, crate::test_support::Writer)
                 .unwrap();
@@ -181,9 +176,11 @@ async fn streaming_response_termination_reaches_the_producer() {
                 producer.clone().reset().await.unwrap();
             } else {
                 if error == Error::H3_REQUEST_REJECTED {
-                    bi.goaway(0, &qpack);
+                    for id in bi.goaway(0) {
+                        qpack.qpack().cancel(id).unwrap();
+                    }
                 } else {
-                    qpack.on_error(error);
+                    qpack.fail(error).await;
                     // These test writers are independent of the transport; apply
                     // the connection's stream closure before resuming body I/O.
                     bi.close(error);
@@ -206,7 +203,7 @@ async fn explicit_stop_stops_a_pump_waiting_on_network() {
     send.write_all(&request_frames(b"", None)).await.unwrap();
     let request = super::accept(
         H3ReadStream::new(4, recv),
-        crate::protocol::qpack::tests::shared(),
+        crate::test_support::connection(),
     )
     .await
     .unwrap();
@@ -229,7 +226,7 @@ fn explicit_stop_cancels_body_after_request_pump_is_dropped() {
         send.write_all(&request_frames(b"", None)).await.unwrap();
         let Request::Streaming(request) = super::accept(
             H3ReadStream::new(4, recv),
-            crate::protocol::qpack::tests::shared(),
+            crate::test_support::connection(),
         )
         .await
         .unwrap() else {
@@ -296,7 +293,7 @@ async fn explicit_stop_stops_a_pump_blocked_on_full_window() {
     };
     let request = crate::server::read_request(
         H3ReadStream::new(0, reader),
-        crate::protocol::qpack::tests::shared(),
+        crate::test_support::connection(),
     )
     .await
     .unwrap();
@@ -322,7 +319,7 @@ async fn dropping_received_body_does_not_stop_network_reads() {
         send.write_all(&request_frames(b"", None)).await.unwrap();
         let Request::Streaming(request) = crate::server::read_request(
             H3ReadStream::new(0, recv),
-            crate::protocol::qpack::tests::shared(),
+            crate::test_support::connection(),
         )
         .await
         .unwrap() else {

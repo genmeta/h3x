@@ -21,7 +21,7 @@ pub(crate) use stream_cursor::StreamCursor;
 pub struct H3Connection<T: Transport> {
     transport: Arc<T>,
     settings: Arc<Settings>,
-    qpack: Arc<Qpack<T>>,
+    qpack: Arc<Qpack>,
     cursor: Arc<StreamCursor>,
     bi_streams: Arc<BiStreams<T::StreamReader, T::StreamWriter>>,
 }
@@ -33,7 +33,7 @@ impl<T: Transport> H3Connection<T> {
         let transport = Arc::new(transport);
         let settings = Arc::new(settings);
         let bi = Arc::new(BiStreams::new());
-        let qpack = Qpack::new(transport.clone(), &settings, bi.clone())?;
+        let (qpack, instruction, feedback) = Qpack::new(&settings)?;
         let cursor = Arc::new(StreamCursor::new(transport.role()));
         let connection = Self {
             transport,
@@ -42,13 +42,15 @@ impl<T: Transport> H3Connection<T> {
             cursor,
             bi_streams: bi,
         };
+        tokio::spawn(connection.clone().send_qpack_encoder(instruction));
+        tokio::spawn(connection.clone().send_qpack_decoder(feedback));
         tokio::spawn(connection.clone().send_uni());
         tokio::spawn(connection.clone().accept_uni());
         Ok(connection)
     }
 
     /// Compression state shared by messages on this connection.
-    pub fn qpack(&self) -> &Arc<Qpack<T>> {
+    pub fn qpack(&self) -> &Arc<Qpack> {
         &self.qpack
     }
 

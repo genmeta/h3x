@@ -5,9 +5,51 @@ use std::{
 };
 
 use codec::instruction::{DecoderInstruction, EncoderInstruction};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use crate::protocol::qpack::*;
+
+#[tokio::test]
+async fn insertion_feedback_uses_the_queue_and_capacity_changes_emit_nothing() {
+    let (decoder, mut source) = Decoder::new(
+        Settings {
+            max_table_capacity: 128,
+            blocked_streams: 1,
+        },
+        128,
+        1024,
+    )
+    .unwrap();
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    assert!(Decoder::poll_feedback(&mut source, &mut cx).is_pending());
+    decoder
+        .on_encoder_instruction(EncoderInstruction::SetDynamicTableCapacity(128))
+        .unwrap();
+    assert!(source.try_recv().is_err());
+    for value in [b"a", b"b"] {
+        decoder
+            .on_encoder_instruction(EncoderInstruction::InsertWithLiteralName {
+                name: Bytes::from_static(b"x"),
+                value: Bytes::from_static(value),
+            })
+            .unwrap();
+    }
+    assert!(wakes.0.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    for _ in 0..2 {
+        assert_eq!(
+            Decoder::poll_feedback(&mut source, &mut cx),
+            Poll::Ready(Ok(DecoderInstruction::InsertCountIncrement(1)))
+        );
+    }
+    assert!(Decoder::poll_feedback(&mut source, &mut cx).is_pending());
+    decoder.close(Error::H3_NO_ERROR);
+    assert_eq!(
+        Decoder::poll_feedback(&mut source, &mut cx),
+        Poll::Ready(Err(Error::H3_CLOSED_CRITICAL_STREAM))
+    );
+}
 
 #[tokio::test]
 async fn blocked_fields_live_in_future_and_resume_without_connection_results() {
@@ -42,6 +84,10 @@ async fn blocked_fields_live_in_future_and_resume_without_connection_results() {
         }
         assert_eq!(decode.await.unwrap()[0].value, "y");
     }
+    assert_eq!(
+        qpack.next_instruction(),
+        Some(DecoderInstruction::InsertCountIncrement(1))
+    );
     assert_eq!(
         qpack.next_instruction(),
         Some(DecoderInstruction::SectionAcknowledgment(0))
@@ -161,6 +207,10 @@ async fn abandoned_decode_releases_registration_and_blocked_budget() {
     assert!(state.decoding_stream.is_empty());
     assert_eq!(
         qpack.next_instruction(),
+        Some(DecoderInstruction::InsertCountIncrement(1))
+    );
+    assert_eq!(
+        qpack.next_instruction(),
         Some(DecoderInstruction::SectionAcknowledgment(12))
     );
     assert!(qpack.next_instruction().is_none());
@@ -213,8 +263,19 @@ async fn invalid_prefix_releases_registration_without_cancellation_feedback() {
             qpack.decode(0, Bytes::copy_from_slice(payload)).await,
             Err(Error::QPACK_DECOMPRESSION_FAILED)
         );
-        assert_eq!(qpack.error(), Some(Error::QPACK_DECOMPRESSION_FAILED));
-        assert!(qpack.decoder.state.lock().unwrap().is_err());
+        assert_eq!(qpack.error(), None);
+        assert!(
+            qpack
+                .decoder
+                .state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .decoding_stream
+                .is_empty()
+        );
+        assert!(qpack.next_instruction().is_none());
     }
 }
 
@@ -386,10 +447,7 @@ async fn qpack_fields_preserve_frame_envelopes_and_ack_order() {
             // Deliver encoder instructions only after the full HEADERS frame has arrived.
             while let Ok(batch) = sender.instructions.lock().unwrap().try_recv() {
                 for (instruction, insert_count) in batch {
-                    sender
-                        .encoder
-                        .on_instruction_sent(&sender.completed, insert_count)
-                        .unwrap();
+                    sender.encoder.on_instruction_sent(insert_count).unwrap();
                     receiver
                         .decoder
                         .state
@@ -403,6 +461,11 @@ async fn qpack_fields_preserve_frame_envelopes_and_ack_order() {
             }
         }
         assert_eq!(decode.await.unwrap(), fields);
+        if index == 0 {
+            let increment = receiver.next_instruction().unwrap();
+            assert_eq!(increment, DecoderInstruction::InsertCountIncrement(1));
+            sender.encoder.on_decoder_instruction(increment).unwrap();
+        }
         let feedback = receiver.next_instruction().unwrap();
         assert_eq!(feedback, DecoderInstruction::SectionAcknowledgment(0));
         sender.encoder.on_decoder_instruction(feedback).unwrap();
@@ -426,21 +489,16 @@ async fn qpack_fields_preserve_frame_envelopes_and_ack_order() {
     );
 }
 
-type Feedback = (
-    mpsc::UnboundedReceiver<(DecoderInstruction, u64)>,
-    watch::Receiver<u64>,
-    u64,
-);
+type Feedback = mpsc::UnboundedReceiver<DecoderInstruction>;
 
 struct Codec {
-    qpack: Qpack<crate::test_support::TestTransport>,
+    qpack: Qpack,
     instructions: Mutex<mpsc::Receiver<Vec<(EncoderInstruction, u64)>>>,
-    completed: watch::Sender<u64>,
     feedback: Mutex<Feedback>,
 }
 
 impl std::ops::Deref for Codec {
-    type Target = Qpack<crate::test_support::TestTransport>;
+    type Target = Qpack;
     fn deref(&self) -> &Self::Target {
         &self.qpack
     }
@@ -448,27 +506,21 @@ impl std::ops::Deref for Codec {
 
 impl Codec {
     fn new(local: Settings, peer: Settings, max_blocked_bytes: usize) -> Result<Self> {
-        let (encoder, receiver, completed) = Encoder::new(peer)?;
-        let (decoder, feedback, inserted) = Decoder::new(
+        let (encoder, instruction_source) = Encoder::new(peer)?;
+        let (decoder, feedback_source) = Decoder::new(
             local,
             max_blocked_bytes,
             frame::MAX_BUFFERED_FRAME_PAYLOAD as u64,
         )?;
         Ok(Self {
-            qpack: Qpack {
-                transport: Arc::new(crate::test_support::TestTransport::default()),
-                encoder,
-                decoder,
-            },
-            instructions: Mutex::new(receiver),
-            completed,
-            feedback: Mutex::new((feedback, inserted, 0)),
+            qpack: Qpack { encoder, decoder },
+            instructions: Mutex::new(instruction_source.instructions),
+            feedback: Mutex::new(feedback_source),
         })
     }
     fn poll_instruction(&self, cx: &mut Context<'_>) -> Poll<DecoderInstruction> {
         let mut feedback = self.feedback.lock().unwrap();
-        let (receiver, inserted, reported) = &mut *feedback;
-        Decoder::poll_feedback(receiver, inserted, reported, cx).map(Result::unwrap)
+        Decoder::poll_feedback(&mut feedback, cx).map(Result::unwrap)
     }
 
     fn next_instruction(&self) -> Option<DecoderInstruction> {

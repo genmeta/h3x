@@ -7,7 +7,7 @@ async fn write_bytes_response<W: AsyncWrite + Unpin>(
     super::send_bytes_response(
         response,
         H3WriteStream::new(0, send),
-        &crate::protocol::qpack::tests::shared(),
+        &crate::test_support::connection(),
         &Method::GET,
     )
     .await
@@ -20,7 +20,7 @@ async fn write_streaming_response<W: AsyncWrite + Unpin>(
     super::prepare_streaming_response(
         response,
         H3WriteStream::new(0, send),
-        crate::protocol::qpack::tests::shared(),
+        crate::test_support::connection(),
         &Method::GET,
     )
     .await
@@ -43,7 +43,7 @@ async fn respond_sends_head_response_without_data() {
         super::respond(
             response,
             H3WriteStream::new(4, &mut encoded),
-            crate::protocol::qpack::tests::shared(),
+            crate::test_support::connection(),
             &Method::HEAD,
         )
         .await
@@ -53,7 +53,8 @@ async fn respond_sends_head_response_without_data() {
         let H3Frame::Headers(frame) = be_frame(&mut input).await.unwrap() else {
             panic!("expected HEADERS")
         };
-        let fields = crate::protocol::qpack::tests::shared()
+        let fields = crate::test_support::connection()
+            .qpack()
             .decode(4, frame.payload.field_section)
             .await
             .unwrap();
@@ -89,7 +90,7 @@ async fn respond_rejects_length_mismatch_and_forbidden_body() {
                 super::respond(
                     response,
                     H3WriteStream::new(4, &mut encoded),
-                    crate::protocol::qpack::tests::shared(),
+                    crate::test_support::connection(),
                     &method,
                 )
                 .await,

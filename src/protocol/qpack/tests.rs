@@ -1,14 +1,5 @@
 use super::*;
 
-pub(crate) fn shared() -> Arc<Qpack<crate::test_support::TestTransport>> {
-    Qpack::new(
-        Arc::new(crate::test_support::TestTransport::default()),
-        &crate::Settings::default(),
-        Arc::new(crate::protocol::stream::bi::BiStreams::default()),
-    )
-    .unwrap()
-}
-
 #[test]
 fn limits_use_protocol_defaults_and_explicit_settings() {
     assert_eq!(
@@ -32,7 +23,8 @@ fn limits_use_protocol_defaults_and_explicit_settings() {
 
 #[tokio::test]
 async fn close_preserves_first_error_across_both_directions() {
-    let qpack = shared();
+    let connection = crate::test_support::connection();
+    let qpack = connection.qpack();
     assert_eq!(
         qpack.close(Error::H3_INTERNAL_ERROR),
         Error::H3_INTERNAL_ERROR
@@ -55,14 +47,15 @@ async fn close_preserves_first_error_across_both_directions() {
 
 #[tokio::test]
 async fn request_errors_leave_qpack_usable() {
-    let qpack = shared();
+    let connection = crate::test_support::connection();
+    let qpack = connection.qpack();
     for error in [
         Error::H3_REQUEST_CANCELLED,
         Error::H3_REQUEST_REJECTED,
         Error::H3_REQUEST_INCOMPLETE,
         Error::H3_MESSAGE_ERROR,
     ] {
-        qpack.on_error(error);
+        connection.receive_error(error).await;
         assert_eq!(qpack.error(), None);
         let payload = qpack
             .encode(
@@ -83,11 +76,14 @@ async fn request_errors_leave_qpack_usable() {
 
 #[tokio::test]
 async fn malformed_field_section_closes_both_directions() {
-    let qpack = shared();
-    assert_eq!(
-        qpack.decode(0, Bytes::from_static(&[0])).await,
-        Err(Error::QPACK_DECOMPRESSION_FAILED)
-    );
+    let connection = crate::test_support::connection();
+    let qpack = connection.qpack();
+    let result = crate::server::read_request(
+        crate::H3ReadStream::new(0, &b"\x01\x01\x00"[..]),
+        connection.clone(),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::QPACK_DECOMPRESSION_FAILED)));
     assert_eq!(qpack.error(), Some(Error::QPACK_DECOMPRESSION_FAILED));
     assert_eq!(
         qpack.encode(4, Vec::new()),
@@ -97,4 +93,10 @@ async fn malformed_field_section_closes_both_directions() {
         qpack.decode(4, Bytes::from_static(&[0, 0])).await,
         Err(Error::QPACK_DECOMPRESSION_FAILED)
     );
+}
+
+#[test]
+fn construction_does_not_require_a_runtime() {
+    let (qpack, _encoder, _decoder) = Qpack::new(&crate::Settings::default()).unwrap();
+    assert!(qpack.encode(0, Vec::new()).is_ok());
 }

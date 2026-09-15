@@ -8,7 +8,7 @@ use std::{
 };
 
 use super::{H3ReadStream, H3WriteStream, StreamState};
-use crate::{Error, Result, Transport, protocol::qpack::Qpack};
+use crate::{Error, Result};
 
 /// Observes application-owned directions without extending their lifetimes.
 pub(crate) struct BiStream<R, W> {
@@ -93,7 +93,7 @@ impl<R, W> BiStreams<R, W> {
         });
     }
 
-    pub(crate) fn goaway<T: Transport>(&self, id: u64, qpack: &Qpack<T>) {
+    pub(crate) fn goaway(&self, id: u64) -> Vec<u64> {
         let streams: Vec<_> = self
             .streams
             .lock()
@@ -102,11 +102,12 @@ impl<R, W> BiStreams<R, W> {
             .filter(|(stream_id, _)| **stream_id % 4 == id % 4 && **stream_id >= id)
             .map(|(_, stream)| Arc::clone(stream))
             .collect();
+        let rejected = streams.iter().map(|stream| stream.id).collect();
         for stream in streams {
             stream.close(Error::H3_REQUEST_REJECTED);
-            let _ = qpack.cancel(stream.id);
         }
         self.cleanup();
+        rejected
     }
 
     pub(crate) fn close(&self, error: Error) {

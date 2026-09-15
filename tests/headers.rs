@@ -80,7 +80,7 @@ async fn ordinary_headers_round_trip() {
                 async {
                     let recv = H3ReadStream::new(0, client_recv);
                     let send = H3WriteStream::new(0, client_send);
-                    let qpack = connection.qpack().clone();
+                    let qpack = connection.clone();
                     if buffered {
                         let request = request_headers(
                             client::Request::post("https://example.com/headers").unwrap(),
@@ -110,11 +110,9 @@ async fn ordinary_headers_round_trip() {
                     }
                 },
                 async {
-                    let request = server::read_request(
-                        H3ReadStream::new(0, server_recv),
-                        connection.qpack().clone(),
-                    )
-                    .await?;
+                    let request =
+                        server::read_request(H3ReadStream::new(0, server_recv), connection.clone())
+                            .await?;
                     assert_request_headers(&request, buffered);
                     let method = request.method();
                     match request {
@@ -144,7 +142,7 @@ async fn ordinary_headers_round_trip() {
                         .append_header(header::SET_COOKIE, HeaderValue::from_static("old=2"))
                         .set_header(header::SET_COOKIE, first_cookie);
                     let send = H3WriteStream::new(0, server_send);
-                    let qpack = connection.qpack().clone();
+                    let qpack = connection.clone();
                     if buffered {
                         response
                             .set_header(

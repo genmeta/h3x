@@ -344,25 +344,6 @@ impl State {
         Ok(())
     }
 
-    /// Identify the insertion progress needed by this feedback without changing state.
-    pub(super) fn feedback_insert_count(&self, instruction: &DecoderInstruction) -> Result<u64> {
-        match *instruction {
-            DecoderInstruction::SectionAcknowledgment(id) => self
-                .unacked_sections_by_stream
-                .get(&id)
-                .and_then(|sections| sections.front())
-                .map(|section| section.required_insert_count)
-                .ok_or(Error::QPACK_DECODER_STREAM_ERROR),
-            DecoderInstruction::InsertCountIncrement(increment) => self
-                .known_received_count
-                .checked_add(increment)
-                .filter(|_| increment != 0)
-                .ok_or(Error::QPACK_DECODER_STREAM_ERROR),
-            DecoderInstruction::StreamCancellation(id) if id <= VARINT_MAX => Ok(0),
-            DecoderInstruction::StreamCancellation(_) => Err(Error::QPACK_DECODER_STREAM_ERROR),
-        }
-    }
-
     /// Count distinct streams with any outstanding section whose RIC exceeds KRC.
     fn potentially_blocked_streams(&self) -> usize {
         self.unacked_sections_by_stream
@@ -446,9 +427,7 @@ mod tests {
 
     struct Decoder {
         state: DecoderState,
-        receiver: mpsc::UnboundedReceiver<(DecoderInstruction, u64)>,
-        inserted: tokio::sync::watch::Receiver<u64>,
-        reported: u64,
+        receiver: mpsc::UnboundedReceiver<DecoderInstruction>,
     }
 
     impl std::ops::Deref for Decoder {
@@ -460,21 +439,16 @@ mod tests {
 
     impl Decoder {
         fn new(local: Settings, max_blocked_bytes: usize, max_fields: u64) -> Result<Self> {
-            let (state, receiver, inserted) =
-                DecoderState::new(local, max_blocked_bytes, max_fields)?;
+            let (state, feedback_source) = DecoderState::new(local, max_blocked_bytes, max_fields)?;
             Ok(Self {
                 state,
-                receiver,
-                inserted,
-                reported: 0,
+                receiver: feedback_source,
             })
         }
 
         fn next_instruction(&mut self) -> Option<DecoderInstruction> {
             match DecoderState::poll_feedback(
                 &mut self.receiver,
-                &mut self.inserted,
-                &mut self.reported,
                 &mut std::task::Context::from_waker(std::task::Waker::noop()),
             ) {
                 std::task::Poll::Ready(result) => Some(result.unwrap()),
@@ -629,9 +603,9 @@ mod tests {
             DecodeResult::Decoded(vec![a.clone()])
         );
         assert_eq!(encoder.known_received_count, 0);
-        encoder
-            .on_decoder_instruction(decoder.next_instruction().unwrap())
-            .unwrap();
+        // Increments precede the ACK; applying that ACK must not count them twice.
+        feedback(&mut encoder, &mut decoder);
+        assert_eq!(encoder.known_received_count, 2);
         assert_eq!(encoder.unacked_sections_by_stream[&0].len(), 1);
         assert!(!encoder.is_evictable(0));
         assert_eq!(

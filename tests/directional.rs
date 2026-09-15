@@ -31,7 +31,7 @@ async fn directional_bodies_echo_with_backpressure() {
             request,
             H3WriteStream::new(0, cs),
             H3ReadStream::new(0, cr),
-            connection.qpack().clone(),
+            connection.clone(),
         )
         .unwrap();
         let payload = vec![b'x'; 128 * 1024];
@@ -44,8 +44,7 @@ async fn directional_bodies_echo_with_backpressure() {
             },
             async {
                 let request =
-                    server::read_request(H3ReadStream::new(0, sr), connection.qpack().clone())
-                        .await?;
+                    server::read_request(H3ReadStream::new(0, sr), connection.clone()).await?;
                 let method = request.method();
                 let mut input = request.into_body();
                 let mut output = Body::<WndBuf, W>::new(2);
@@ -55,7 +54,7 @@ async fn directional_bodies_echo_with_backpressure() {
                     server::write_streaming_response(
                         response,
                         H3WriteStream::new(0, ss),
-                        connection.qpack().clone(),
+                        connection.clone(),
                         &method
                     ),
                     async {
@@ -95,7 +94,7 @@ async fn response_does_not_need_upload_to_finish_or_even_start() {
     server::write_bytes_response(
         response,
         H3WriteStream::new(0, &mut encoded),
-        connection.qpack().clone(),
+        connection.clone(),
         &Method::HEAD,
     )
     .await
@@ -108,7 +107,7 @@ async fn response_does_not_need_upload_to_finish_or_even_start() {
         request,
         H3WriteStream::new(0, send),
         H3ReadStream::new(0, std::io::Cursor::new(encoded)),
-        connection.qpack().clone(),
+        connection.clone(),
     )
     .unwrap();
     let response = timeout(Duration::from_secs(1), receiving)
@@ -142,7 +141,7 @@ async fn dropping_response_future_preserves_upload() {
         request,
         H3WriteStream::new(0, send),
         H3ReadStream::new(0, tokio::io::empty()),
-        connection.qpack().clone(),
+        connection.clone(),
     )
     .unwrap();
     drop(receiving);
@@ -178,7 +177,7 @@ async fn explicit_reset_wakes_producer_after_upload_is_dropped() {
         request,
         H3WriteStream::new(0, tokio::io::sink()),
         H3ReadStream::new(0, tokio::io::empty()),
-        connection.qpack().clone(),
+        connection.clone(),
     )
     .unwrap();
     producer.write_all(b"x").await.unwrap();

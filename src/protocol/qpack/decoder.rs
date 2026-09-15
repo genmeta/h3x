@@ -1,35 +1,28 @@
 //! Incoming headers, table updates from the peer encoder, and decoder-stream feedback.
-use std::{
-    future::poll_fn,
-    sync::{Arc, Mutex},
-    task::Poll,
-};
+use std::{future::poll_fn, sync::Mutex, task::Poll};
 
 use bytes::Bytes;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    sync::{mpsc, watch},
-    task::JoinHandle,
+    sync::mpsc,
 };
 
 use super::{
-    Field, Qpack, Settings,
+    Field, Settings,
     codec::instruction::{DecoderInstruction, WriteInstruction, be_encoder_instruction},
 };
-use crate::{
-    Error, Result, Transport,
-    protocol::{frame::StreamType, stream::bi::BiStreams},
-};
+use crate::{Error, Result, protocol::frame::StreamType};
 
 mod state;
 use state::State;
 
-// ACKs retain their required insert count; cancellations carry zero.
-type Instructions = mpsc::UnboundedReceiver<(DecoderInstruction, u64)>;
+/// Insertions / decoded fields / cancellations -> feedback FIFO
+/// -> Decoder::write() -> decoder stream -> peer encoder.
+/// Enqueueing wakes the writer; increments precede dependent ACKs.
+pub(in crate::protocol) type Instructions = mpsc::UnboundedReceiver<DecoderInstruction>;
 
-pub(super) struct Decoder {
+pub(in crate::protocol) struct Decoder {
     state: Mutex<Result<State>>,
-    write_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Only a registered decode owns cancellation; rejected and unpolled futures do not.
@@ -68,17 +61,14 @@ impl Decoder {
         local: Settings,
         max_blocked_bytes: usize,
         max_fields: u64,
-    ) -> Result<(Self, Instructions, watch::Receiver<u64>)> {
+    ) -> Result<(Self, Instructions)> {
         let (sender, receiver) = mpsc::unbounded_channel();
-        let (inserted, insert_count) = watch::channel(0);
-        let state = State::new(local, max_blocked_bytes, max_fields, sender, inserted)?;
+        let state = State::new(local, max_blocked_bytes, max_fields, sender)?;
         Ok((
             Self {
                 state: Mutex::new(Ok(state)),
-                write_task: Mutex::new(None),
             },
             receiver,
-            insert_count,
         ))
     }
 
@@ -92,9 +82,7 @@ impl Decoder {
             *state = Err(error);
             wakes
         };
-        if let Some(writer) = self.write_task.lock().unwrap().take() {
-            writer.abort();
-        }
+
         for wake in wakes {
             wake.wake();
         }
@@ -168,86 +156,24 @@ impl Decoder {
         }
     }
 
-    pub(super) fn start<T: Transport>(
-        &self,
-        qpack: &Arc<Qpack<T>>,
-        receiver: Instructions,
-        insert_count: watch::Receiver<u64>,
-        bi: Arc<BiStreams<T::StreamReader, T::StreamWriter>>,
-    ) {
-        // Serialize handle installation with close; a closed direction cannot restart.
-        let mut writer = self.write_task.lock().unwrap();
-        if writer.is_some() || self.state.lock().unwrap().is_err() {
-            return;
-        }
-        let transport = qpack.transport.clone();
-        let qpack = Arc::downgrade(qpack);
-        *writer = Some(tokio::spawn(async move {
-            let stream = transport
-                .open_uni()
-                .await
-                .and_then(|stream| stream.ok_or(Error::H3_STREAM_CREATION_ERROR));
-            let (_, mut send) = match stream {
-                Ok(stream) => stream,
-                Err(error) => {
-                    if let Some(qpack) = qpack.upgrade() {
-                        qpack.fail(error, &bi);
-                    }
-                    return;
-                }
-            };
-
-            if let Err(error) = Self::write_instructions(receiver, insert_count, &mut send).await
-                && let Some(qpack) = qpack.upgrade()
-            {
-                qpack.fail(error, &bi);
-            }
-        }));
-    }
-
-    async fn write_instructions<W: AsyncWrite + Unpin>(
+    pub(in crate::protocol) async fn write<W: AsyncWrite + Unpin>(
         mut receiver: Instructions,
-        mut insert_count: watch::Receiver<u64>,
         writer: &mut W,
     ) -> Result<()> {
         writer
             .write_all(&[StreamType::QpackDecoder as u8])
             .await
             .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-        let mut reported = 0;
         let mut buf = Vec::new();
-        loop {
-            let instruction =
-                Self::next_instruction(&mut receiver, &mut insert_count, &mut reported).await?;
+        while let Some(instruction) = receiver.recv().await {
             buf.clear();
             buf.put_decoder_instruction(&instruction)?;
             writer
                 .write_all(&buf)
                 .await
                 .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-            writer
-                .flush()
-                .await
-                .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
         }
-    }
-
-    /// ACKs cover their required insert count; only report insertion progress beyond that.
-    async fn next_instruction(
-        receiver: &mut Instructions,
-        insert_count: &mut watch::Receiver<u64>,
-        reported: &mut u64,
-    ) -> Result<DecoderInstruction> {
-        let (instruction, count) = tokio::select! {
-            biased;
-            feedback = receiver.recv() => feedback.ok_or(Error::H3_CLOSED_CRITICAL_STREAM)?,
-            count = insert_count.wait_for(|count| *count > *reported) => {
-                let count = *count.map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-                (DecoderInstruction::InsertCountIncrement(count - *reported), count)
-            }
-        };
-        *reported = (*reported).max(count);
-        Ok(instruction)
+        Err(Error::H3_CLOSED_CRITICAL_STREAM)
     }
 }
 
@@ -268,14 +194,11 @@ impl Decoder {
 
     pub(super) fn poll_feedback(
         receiver: &mut Instructions,
-        inserted: &mut watch::Receiver<u64>,
-        reported: &mut u64,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<DecoderInstruction>> {
-        use std::future::Future;
-        Box::pin(Self::next_instruction(receiver, inserted, reported))
-            .as_mut()
-            .poll(cx)
+        receiver
+            .poll_recv(cx)
+            .map(|instruction| instruction.ok_or(Error::H3_CLOSED_CRITICAL_STREAM))
     }
 
     pub(super) fn read_prefix<'a>(
@@ -303,13 +226,5 @@ impl Decoder {
             .as_mut()
             .map_err(|error| *error)?
             .poll_decode(id, prefix, bytes, cx)
-    }
-}
-
-impl Drop for Decoder {
-    fn drop(&mut self) {
-        if let Some(writer) = self.write_task.get_mut().unwrap().take() {
-            writer.abort();
-        }
     }
 }

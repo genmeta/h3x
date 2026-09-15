@@ -78,6 +78,7 @@ impl Transport for TestTransport {
         let error = [
             Error::H3_NO_ERROR,
             Error::H3_INTERNAL_ERROR,
+            Error::H3_CLOSED_CRITICAL_STREAM,
             Error::H3_EXCESSIVE_LOAD,
             Error::H3_FRAME_UNEXPECTED,
             Error::QPACK_DECOMPRESSION_FAILED,

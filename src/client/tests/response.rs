@@ -3,7 +3,7 @@ use super::*;
 async fn read_response<R: AsyncRead + Unpin + Send + 'static>(recv: R) -> Result<Response> {
     super::read_response(
         H3ReadStream::new(0, recv),
-        crate::protocol::qpack::tests::shared(),
+        crate::test_support::connection(),
         None,
     )
     .await
@@ -38,7 +38,8 @@ async fn preserves_set_cookie_headers_through_message_roundtrip() {
         let mut encoded = Vec::new();
         encoded.put_frame(
             &Frame::new(Headers {
-                field_section: crate::protocol::qpack::tests::shared()
+                field_section: crate::test_support::connection()
+                    .qpack()
                     .encode(0, fields)
                     .unwrap(),
             })
@@ -58,7 +59,7 @@ async fn preserves_set_cookie_headers_through_message_roundtrip() {
         };
         let mut reencoded = Vec::new();
         let send = H3WriteStream::new(4, &mut reencoded);
-        let qpack = crate::protocol::qpack::tests::shared();
+        let qpack = crate::test_support::connection();
         match outgoing {
             common::Response::Bytes(response) => {
                 crate::server::write_bytes_response(response, send, qpack, &Method::GET).await
@@ -74,7 +75,8 @@ async fn preserves_set_cookie_headers_through_message_roundtrip() {
         let H3Frame::Headers(frame) = be_frame(&mut reencoded.as_slice()).await.unwrap() else {
             panic!("expected HEADERS")
         };
-        let fields = crate::protocol::qpack::tests::shared()
+        let fields = crate::test_support::connection()
+            .qpack()
             .decode(4, frame.payload.field_section)
             .await
             .unwrap();

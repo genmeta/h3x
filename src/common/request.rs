@@ -298,7 +298,7 @@ mod tests {
                         request,
                         H3WriteStream::new(0, tokio::io::sink()),
                         H3ReadStream::new(0, tokio::io::empty()),
-                        crate::protocol::qpack::tests::shared(),
+                        crate::test_support::connection(),
                     );
                     assert!(matches!(result, Err(actual) if actual == error));
                 }

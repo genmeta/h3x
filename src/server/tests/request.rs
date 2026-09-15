@@ -3,7 +3,7 @@ use super::*;
 async fn read_request<R: AsyncRead + Unpin + Send + 'static>(recv: R) -> Result<Request> {
     super::accept(
         H3ReadStream::new(0, recv),
-        crate::protocol::qpack::tests::shared(),
+        crate::test_support::connection(),
     )
     .await
 }
@@ -38,7 +38,8 @@ async fn preserves_request_headers_through_message_roundtrip() {
         let mut encoded = Vec::new();
         encoded.put_frame(
             &Frame::new(Headers {
-                field_section: crate::protocol::qpack::tests::shared()
+                field_section: crate::test_support::connection()
+                    .qpack()
                     .encode(0, fields)
                     .unwrap(),
             })
@@ -57,12 +58,14 @@ async fn preserves_request_headers_through_message_roundtrip() {
             }
         };
         let frame = Frame::new(Headers {
-            field_section: crate::protocol::qpack::tests::shared()
+            field_section: crate::test_support::connection()
+                .qpack()
                 .encode(4, fields)
                 .unwrap(),
         })
         .unwrap();
-        let fields = crate::protocol::qpack::tests::shared()
+        let fields = crate::test_support::connection()
+            .qpack()
             .decode(4, frame.payload.field_section)
             .await
             .unwrap();

@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::{io::Cursor, sync::Arc};
 
 use http::{HeaderValue, Method, header};
 use tokio::io::{AsyncReadExt, duplex};
@@ -22,7 +22,7 @@ fn request<RS, WS, R, T: Transport>(
     request: R,
     recv: H3ReadStream<RS>,
     send: H3WriteStream<WS>,
-    qpack: Arc<Qpack<T>>,
+    qpack: H3Connection<T>,
 ) -> impl Future<Output = Result<Response>> + Send
 where
     RS: AsyncRead + Unpin + Send + 'static,

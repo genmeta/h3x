@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::{io::Cursor, sync::Arc};
 
 use http::{Method, header};
 use tokio::io::duplex;
@@ -71,7 +71,7 @@ use crate::common::message::ArcMessage;
 fn respond<WS, R, T: Transport>(
     response: R,
     send: H3WriteStream<WS>,
-    qpack: Arc<Qpack<T>>,
+    qpack: H3Connection<T>,
     request_method: &Method,
 ) -> impl Future<Output = Result<()>>
 where

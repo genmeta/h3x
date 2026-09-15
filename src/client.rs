@@ -1,7 +1,7 @@
 //! Initiating requests and receiving authenticated responses.
 //! These roles apply per request, independently of the QUIC connection role.
 
-use std::{future::Future, sync::Arc};
+use std::future::Future;
 
 use bytes::Bytes;
 use http::StatusCode;
@@ -15,9 +15,9 @@ use crate::{
         message::{ArcMessage, Message, ReadBody, WriteResponse},
     },
     protocol::{
+        connection::H3Connection,
         frame::{self, Data, Frame, H3Frame, Headers, Write as _, be_frame},
         headers,
-        qpack::Qpack,
         stream::{H3ReadStream, H3WriteStream},
     },
 };
@@ -35,7 +35,7 @@ pub fn write_bytes_request<RS, WS, T: Transport>(
     request: Request<Bytes>,
     ws: H3WriteStream<WS>,
     rs: H3ReadStream<RS>,
-    qpack: Arc<Qpack<T>>,
+    connection: H3Connection<T>,
 ) -> Result<(
     impl Future<Output = Result<()>> + Send,
     impl Future<Output = Result<Response>> + Send,
@@ -46,8 +46,8 @@ where
 {
     use crate::ReadRequest;
     let method = request.method();
-    let sending = send_bytes_request(&request, ws, qpack.clone())?;
-    Ok((sending, read_response(rs, qpack, Some(method))))
+    let sending = send_bytes_request(&request, ws, connection.clone())?;
+    Ok((sending, read_response(rs, connection, Some(method))))
 }
 
 /// Prepare a streaming upload and independent response future.
@@ -57,7 +57,7 @@ pub fn write_streaming_request<RS, WS, T: Transport>(
     request: Request<ArcWndBuf>,
     ws: H3WriteStream<WS>,
     rs: H3ReadStream<RS>,
-    qpack: Arc<Qpack<T>>,
+    connection: H3Connection<T>,
 ) -> Result<(
     impl Future<Output = Result<()>> + Send,
     impl Future<Output = Result<Response>> + Send,
@@ -68,14 +68,14 @@ where
 {
     use crate::ReadRequest;
     let method = request.method();
-    let sending = send_streaming_request(&request, ws, qpack.clone())?;
-    Ok((sending, read_response(rs, qpack, Some(method))))
+    let sending = send_streaming_request(&request, ws, connection.clone())?;
+    Ok((sending, read_response(rs, connection, Some(method))))
 }
 
 fn send_bytes_request<WS, T: Transport>(
     req: &Request<Bytes>,
     mut ws: H3WriteStream<WS>,
-    qpack: Arc<Qpack<T>>,
+    connection: H3Connection<T>,
 ) -> Result<impl Future<Output = Result<()>> + Send + use<WS, T>>
 where
     WS: AsyncWrite + Unpin + Send + 'static,
@@ -89,7 +89,7 @@ where
         return Err(Error::H3_MESSAGE_ERROR);
     }
     let headers = Frame::new(Headers {
-        field_section: qpack.encode(ws.stream_id(), fields)?,
+        field_section: connection.qpack().encode(ws.stream_id(), fields)?,
     })?;
     Ok(async move {
         let result = async {
@@ -116,7 +116,7 @@ where
 fn send_streaming_request<WS, T: Transport>(
     req: &Request<ArcWndBuf>,
     mut ws: H3WriteStream<WS>,
-    qpack: Arc<Qpack<T>>,
+    connection: H3Connection<T>,
 ) -> Result<impl Future<Output = Result<()>> + Send + use<WS, T>>
 where
     WS: AsyncWrite + Unpin + Send + 'static,
@@ -133,7 +133,7 @@ where
             None => BodyMode::Infinity,
         };
         let headers = Frame::new(Headers {
-            field_section: qpack.encode(ws.stream_id(), fields)?,
+            field_section: connection.qpack().encode(ws.stream_id(), fields)?,
         })?;
         Ok::<_, Error>((headers, mode))
     })()
@@ -163,12 +163,12 @@ where
 /// Reads ordinary responses; HEAD and CONNECT semantics require request-method input.
 async fn read_response<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
     rs: H3ReadStream<RS>,
-    qpack: Arc<Qpack<T>>,
+    connection: H3Connection<T>,
     method: Option<http::Method>,
 ) -> Result<crate::common::Response<Read>> {
     let stream_id = rs.stream_id();
     let mut rs = BufReader::new(rs);
-    let (parts, mode) = async {
+    let result = async {
         let (parts, length) = loop {
             let frame = match be_frame(&mut rs).await? {
                 H3Frame::Headers(frame) => frame,
@@ -178,7 +178,10 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
                 }
                 _ => return Err(Error::H3_FRAME_UNEXPECTED),
             };
-            let fields = qpack.decode(stream_id, frame.payload.field_section).await?;
+            let fields = connection
+                .qpack()
+                .decode(stream_id, frame.payload.field_section)
+                .await?;
             let parts = headers::response_parts(fields)?;
             let length = headers::content_length(&parts.headers)?;
             if parts.status == StatusCode::SWITCHING_PROTOCOLS {
@@ -202,17 +205,21 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
         let mode = BodyMode::resolve(&parts, method.as_ref())?;
         Ok((parts, mode))
     }
-    .await
-    .inspect_err(|error| {
-        let _ = qpack.cancel(stream_id);
-        qpack.on_error(*error);
-    })?;
+    .await;
+    let (parts, mode) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = connection.qpack().cancel(stream_id);
+            connection.receive_error(error).await;
+            return Err(error);
+        }
+    };
     let mut message = Message::<Bytes>::default();
     message.set_status(parts.status);
     for (name, value) in &parts.headers {
         message.append_header(name.clone(), value.clone());
     }
-    Ok(match body::receive(rs, mode, qpack).await? {
+    Ok(match body::receive(rs, mode, connection).await? {
         common::Body::Bytes(body) => {
             common::Response::Bytes(ArcMessage::from(message.with_body(body)).into())
         }

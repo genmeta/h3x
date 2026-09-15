@@ -1,4 +1,4 @@
-//! Connection-level coordination for the two independent QPACK directions.
+//! Compression state for the two independent QPACK directions.
 
 use std::sync::Arc;
 
@@ -6,11 +6,11 @@ use bytes::Bytes;
 use qbase::varint::VARINT_MAX;
 
 use super::frame;
-use crate::{Error, Result, Transport};
+use crate::{Error, Result};
 
 mod codec;
-mod decoder;
-mod encoder;
+pub(super) mod decoder;
+pub(super) mod encoder;
 mod table;
 
 #[cfg(test)]
@@ -58,31 +58,21 @@ pub(crate) fn limits(settings: &frame::Settings) -> (Settings, u64) {
     )
 }
 
-/// Owns the outgoing encoder and incoming decoder; each direction drives its own I/O.
-pub struct Qpack<T: Transport> {
-    transport: Arc<T>,
+/// Owns the outgoing encoder and incoming decoder state.
+pub struct Qpack {
     encoder: Encoder,
     decoder: Decoder,
 }
 
-impl<T: Transport> Qpack<T> {
-    pub(crate) fn new(
-        transport: Arc<T>,
+impl Qpack {
+    pub(super) fn new(
         settings: &super::connection::Settings,
-        bi: Arc<super::stream::bi::BiStreams<T::StreamReader, T::StreamWriter>>,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<(Arc<Self>, encoder::InstructionSource, decoder::Instructions)> {
         let (local, max_fields) = limits(&settings.local);
-        let (encoder, receiver, completed) = Encoder::new(Settings::default())?;
-        let (decoder, feedback, insert_count) =
+        let (encoder, instruction) = Encoder::new(Settings::default())?;
+        let (decoder, feedback) =
             Decoder::new(local, frame::MAX_BUFFERED_FRAME_PAYLOAD, max_fields)?;
-        let qpack = Arc::new(Self {
-            transport,
-            encoder,
-            decoder,
-        });
-        qpack.encoder.start(&qpack, receiver, completed, bi.clone());
-        qpack.decoder.start(&qpack, feedback, insert_count, bi);
-        Ok(qpack)
+        Ok((Arc::new(Self { encoder, decoder }), instruction, feedback))
     }
 
     pub(super) async fn receive_encoder<R: tokio::io::AsyncRead + Unpin>(
@@ -115,45 +105,15 @@ impl<T: Transport> Qpack<T> {
     }
 
     pub(crate) fn encode(&self, id: u64, fields: Vec<Field>) -> Result<Bytes> {
-        self.encoder
-            .encode(id, fields)
-            .inspect_err(|error| self.on_error(*error))
+        self.encoder.encode(id, fields)
     }
 
     pub(crate) async fn decode(&self, id: u64, payload: Bytes) -> Result<Vec<Field>> {
-        self.decoder
-            .decode(id, payload)
-            .await
-            .inspect_err(|error| self.on_error(*error))
+        self.decoder.decode(id, payload).await
     }
 
     /// Cancel reception and synchronously submit any required QPACK feedback.
     pub fn cancel(&self, stream_id: u64) -> Result<()> {
-        self.decoder
-            .cancel(stream_id)
-            .inspect_err(|error| self.on_error(*error))
-    }
-
-    fn fail(
-        &self,
-        error: Error,
-        bi: &super::stream::bi::BiStreams<T::StreamReader, T::StreamWriter>,
-    ) {
-        let error = self.close(error);
-        let _ = self.transport.close(error.to_string(), error.as_u64());
-        bi.close(error);
-    }
-
-    pub(crate) fn on_error(&self, error: Error) {
-        if !matches!(
-            error,
-            Error::H3_REQUEST_CANCELLED
-                | Error::H3_REQUEST_REJECTED
-                | Error::H3_REQUEST_INCOMPLETE
-                | Error::H3_MESSAGE_ERROR
-        ) {
-            let error = self.close(error);
-            let _ = self.transport.close(error.to_string(), error.as_u64());
-        }
+        self.decoder.cancel(stream_id)
     }
 }

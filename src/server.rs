@@ -1,6 +1,6 @@
 //! Incoming requests and responses on the original stream.
 
-use std::{future::Future, sync::Arc};
+use std::future::Future;
 
 use bytes::Bytes;
 use http::{HeaderValue, Method, StatusCode};
@@ -14,9 +14,9 @@ use crate::{
         message::{ArcMessage, Message, ReadBody},
     },
     protocol::{
+        connection::H3Connection,
         frame::{self, Data, Frame, H3Frame, Headers, Write as _, be_frame},
         headers,
-        qpack::Qpack,
         stream::{H3ReadStream, H3WriteStream},
     },
 };
@@ -24,14 +24,14 @@ use crate::{
 pub type Request = crate::common::Request<Read>;
 pub type Response<B = Bytes> = crate::common::response::Response<Write, B>;
 
-/// Read an HTTP request using the receive stream's ID and explicit QPACK.
+/// Read an HTTP request using the receive stream's ID and owning connection.
 pub async fn read_request<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
     rs: H3ReadStream<RS>,
-    qpack: Arc<Qpack<T>>,
+    connection: H3Connection<T>,
 ) -> Result<crate::common::Request<Read>> {
     let stream_id = rs.stream_id();
     let mut rs = BufReader::new(rs);
-    let (message, length) = async {
+    let result = async {
         let frame = loop {
             match be_frame(&mut rs).await? {
                 H3Frame::Headers(frame) => break frame,
@@ -41,7 +41,10 @@ pub async fn read_request<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
                 _ => return Err(Error::H3_FRAME_UNEXPECTED),
             }
         };
-        let fields = qpack.decode(stream_id, frame.payload.field_section).await?;
+        let fields = connection
+            .qpack()
+            .decode(stream_id, frame.payload.field_section)
+            .await?;
         let parts = headers::request_parts(fields)?;
         let length = headers::content_length(&parts.headers)?;
 
@@ -67,16 +70,20 @@ pub async fn read_request<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
         }
         Ok((message, length))
     }
-    .await
-    .inspect_err(|error| {
-        let _ = qpack.cancel(stream_id);
-        qpack.on_error(*error);
-    })?;
+    .await;
+    let (message, length) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = connection.qpack().cancel(stream_id);
+            connection.receive_error(error).await;
+            return Err(error);
+        }
+    };
     let mode = match length {
         Some(content_length) => BodyMode::Length { content_length },
         None => BodyMode::Infinity,
     };
-    Ok(match body::receive(rs, mode, qpack).await? {
+    Ok(match body::receive(rs, mode, connection).await? {
         common::Body::Bytes(body) => {
             common::Request::Bytes(ArcMessage::from(message.with_body(body)).into())
         }
@@ -90,10 +97,10 @@ pub async fn read_request<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
 pub async fn write_bytes_response<WS: AsyncWrite + Unpin, T: Transport>(
     response: Response<Bytes>,
     ws: H3WriteStream<WS>,
-    qpack: Arc<Qpack<T>>,
+    connection: H3Connection<T>,
     method: &Method,
 ) -> Result<()> {
-    send_bytes_response(&response, ws, &qpack, method).await
+    send_bytes_response(&response, ws, &connection, method).await
 }
 
 /// Send a streaming response. Keep a body producer until finish/reset and drive
@@ -101,17 +108,17 @@ pub async fn write_bytes_response<WS: AsyncWrite + Unpin, T: Transport>(
 pub fn write_streaming_response<WS: AsyncWrite + Unpin, T: Transport>(
     response: Response<ArcWndBuf>,
     ws: H3WriteStream<WS>,
-    qpack: Arc<Qpack<T>>,
+    connection: H3Connection<T>,
     method: &Method,
 ) -> impl Future<Output = Result<()>> + use<WS, T> {
-    prepare_streaming_response(&response, ws, qpack, method)
+    prepare_streaming_response(&response, ws, connection, method)
 }
 
 /// Writes a buffered response using the original request method.
 async fn send_bytes_response<WS: AsyncWrite + Unpin, T: Transport>(
     response: &Response<Bytes>,
     mut ws: H3WriteStream<WS>,
-    qpack: &Qpack<T>,
+    connection: &H3Connection<T>,
     method: &Method,
 ) -> Result<()> {
     let (fields, mode, body) = {
@@ -138,7 +145,7 @@ async fn send_bytes_response<WS: AsyncWrite + Unpin, T: Transport>(
         return Err(Error::H3_MESSAGE_ERROR);
     }
     let headers = Frame::new(Headers {
-        field_section: qpack.encode(ws.stream_id(), fields)?,
+        field_section: connection.qpack().encode(ws.stream_id(), fields)?,
     })?;
     let result = async {
         let mut buf = Vec::new();
@@ -164,7 +171,7 @@ async fn send_bytes_response<WS: AsyncWrite + Unpin, T: Transport>(
 fn prepare_streaming_response<WS: AsyncWrite + Unpin, T: Transport>(
     response: &Response<ArcWndBuf>,
     mut ws: H3WriteStream<WS>,
-    qpack: Arc<Qpack<T>>,
+    connection: H3Connection<T>,
     request_method: &Method,
 ) -> impl Future<Output = Result<()>> + use<WS, T> {
     let (fields, mut body) = {
@@ -188,7 +195,7 @@ fn prepare_streaming_response<WS: AsyncWrite + Unpin, T: Transport>(
                 }
                 let mode = BodyMode::resolve(&parts, Some(&request_method))?;
                 let headers = Frame::new(Headers {
-                    field_section: qpack.encode(ws.stream_id(), fields)?,
+                    field_section: connection.qpack().encode(ws.stream_id(), fields)?,
                 })?;
                 let mut buf = Vec::new();
                 buf.put_frame(&headers);
