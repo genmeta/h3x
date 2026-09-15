@@ -10,7 +10,7 @@
   behavior group in that group's file. A directory does not need several files
   to be useful; avoid extra nesting for a small test.
 - Test shared protocol behavior in its owning module instead of duplicating it
-  for each caller. Body trailer rules, for example, belong in `protocol::body`.
+  for each caller. Body trailer rules, for example, belong in `common::body`.
 - Keep internal tests inside the crate when they need private state or test-only
   helpers. Do not widen the public API just to move a test into this directory.
 

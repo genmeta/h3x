@@ -1,26 +1,26 @@
 use super::*;
 
 async fn write_bytes_response<W: AsyncWrite + Unpin>(
-    response: &Response<Bytes>,
+    response: Response<Bytes>,
     send: W,
 ) -> Result<()> {
     super::write_bytes_response(
         response,
-        H3WriteStream::new(0, send),
-        &Qpack::default(),
+        crate::test_support::write_stream(0, send),
+        crate::test_support::connection().await.qpack().clone(),
         &Method::GET,
     )
     .await
 }
 
 async fn write_streaming_response<W: AsyncWrite + Unpin>(
-    response: &Response<ArcWndBuf>,
+    response: Response<ArcWndBuf>,
     send: W,
 ) -> Result<()> {
     super::write_streaming_response(
         response,
-        H3WriteStream::new(0, send),
-        &Qpack::default(),
+        crate::test_support::write_stream(0, send),
+        crate::test_support::connection().await.qpack().clone(),
         &Method::GET,
     )
     .await
@@ -31,12 +31,7 @@ async fn respond_sends_head_response_without_data() {
     for buffered in [true, false] {
         let mut response = Response::<Bytes>::default();
         response.set_status(StatusCode::OK);
-        response
-            .message
-            .0
-            .lock()
-            .unwrap()
-            .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+        response.set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
         let response: common::Response<Write> = if buffered {
             response.into()
         } else {
@@ -47,8 +42,8 @@ async fn respond_sends_head_response_without_data() {
         let mut encoded = Vec::new();
         super::respond(
             response,
-            H3WriteStream::new(4, &mut encoded),
-            Arc::new(Qpack::default()),
+            crate::test_support::write_stream(4, &mut encoded),
+            crate::test_support::connection().await.qpack().clone(),
             &Method::HEAD,
         )
         .await
@@ -58,13 +53,15 @@ async fn respond_sends_head_response_without_data() {
         let H3Frame::Headers(frame) = be_frame(&mut input).await.unwrap() else {
             panic!("expected HEADERS")
         };
-        let fields = Qpack::default()
+        let fields = crate::test_support::connection()
+            .await
+            .qpack()
             .decode(4, frame.payload.field_section)
             .await
             .unwrap();
-        let parts = headers::response_parts(fields).unwrap();
-        assert_eq!(parts.status, StatusCode::OK);
-        assert_eq!(parts.headers[header::CONTENT_LENGTH], "5");
+        let head = headers::be_response(fields).unwrap();
+        assert_eq!(head.status().unwrap(), StatusCode::OK);
+        assert_eq!(head.headers[header::CONTENT_LENGTH], "5");
         assert!(input.is_empty(), "HEAD response must not contain DATA");
     }
 }
@@ -75,12 +72,7 @@ async fn respond_rejects_length_mismatch_and_forbidden_body() {
         for (method, body) in [(Method::GET, &b""[..]), (Method::HEAD, &b"hello"[..])] {
             let mut response = Response::<Bytes>::default();
             response.set_status(StatusCode::OK);
-            response
-                .message
-                .0
-                .lock()
-                .unwrap()
-                .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+            response.set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
             let response: common::Response<Write> = if buffered {
                 response.set_body(Bytes::copy_from_slice(body));
                 response.into()
@@ -96,19 +88,26 @@ async fn respond_rejects_length_mismatch_and_forbidden_body() {
             };
             let mut encoded = Vec::new();
             assert_eq!(
-                super::respond(
+                (super::respond(
                     response,
-                    H3WriteStream::new(4, &mut encoded),
-                    Arc::new(Qpack::default()),
+                    crate::test_support::write_stream(4, &mut encoded),
+                    crate::test_support::connection().await.qpack().clone(),
                     &method,
                 )
-                .await,
-                Err(Error::H3_MESSAGE_ERROR),
+                .await)
+                    .map_err(ErrorCode::from),
+                Err(ErrorCode::H3_MESSAGE_ERROR),
                 "method={method}, buffered={buffered}"
             );
             if let Some(mut producer) = producer {
-                assert_eq!(producer.write(b"x").await, Err(Error::H3_MESSAGE_ERROR));
-                assert_eq!(producer.finish().await, Err(Error::H3_MESSAGE_ERROR));
+                assert_eq!(
+                    (producer.write(b"x").await).map_err(ErrorCode::from),
+                    Err(ErrorCode::H3_MESSAGE_ERROR)
+                );
+                assert_eq!(
+                    (producer.finish().await).map_err(ErrorCode::from),
+                    Err(ErrorCode::H3_MESSAGE_ERROR)
+                );
             }
 
             // Streaming validation may follow HEADERS, but must precede DATA.
@@ -130,14 +129,9 @@ async fn writes_buffered_and_streaming_response_frames() {
     fixed_response
         .set_status(StatusCode::CREATED)
         .set_body(Bytes::from_static(b"hello"));
-    fixed_response
-        .message
-        .0
-        .lock()
-        .unwrap()
-        .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+    fixed_response.set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
     let mut encoded = Vec::new();
-    write_bytes_response(&fixed_response, &mut encoded)
+    write_bytes_response(fixed_response, &mut encoded)
         .await
         .unwrap();
     let mut input = encoded.as_slice();
@@ -145,13 +139,14 @@ async fn writes_buffered_and_streaming_response_frames() {
         panic!("expected HEADERS")
     };
     assert_eq!(
-        headers::response_parts(
+        headers::be_response(
             qpack::be_field_section(&frame.payload.field_section)
                 .unwrap()
                 .1
         )
         .unwrap()
-        .status,
+        .status()
+        .unwrap(),
         StatusCode::CREATED
     );
     let H3Frame::Data(frame) = be_frame(&mut input).await.unwrap() else {
@@ -160,12 +155,13 @@ async fn writes_buffered_and_streaming_response_frames() {
     assert_eq!(frame.length.into_u64(), 5);
     assert_eq!(input, b"hello");
 
-    let message = Message::<Bytes>::default().with_body(ArcWndBuf::new(2));
+    let message = Message::<headers::ResponseHead, Bytes>::default()
+        .with_body(crate::Body::new(ArcWndBuf::new(2)));
     let mut response = Response::from(ArcMessage::from(message));
     response.set_status(StatusCode::OK);
     let mut producer = Response::from(response.message.clone());
     let mut encoded = Vec::new();
-    let (sent, produced) = tokio::join!(write_streaming_response(&response, &mut encoded), async {
+    let (sent, produced) = tokio::join!(write_streaming_response(response, &mut encoded), async {
         let mut body = &b"stream"[..];
         while !body.is_empty() {
             let count = producer.write(body).await?;
@@ -190,31 +186,39 @@ async fn writes_buffered_and_streaming_response_frames() {
     }
     assert_eq!(body, b"stream");
 
+    let mut fixed_response = Response::default();
     fixed_response
-        .message
-        .0
-        .lock()
-        .unwrap()
-        .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("1"));
+        .set_status(StatusCode::CREATED)
+        .set_body(Bytes::from_static(b"hello"));
+    fixed_response.set_header(header::CONTENT_LENGTH, HeaderValue::from_static("1"));
     let mut output = Vec::new();
     assert_eq!(
-        write_bytes_response(&fixed_response, &mut output)
-            .await
-            .unwrap_err(),
-        Error::H3_MESSAGE_ERROR
+        ErrorCode::from(
+            write_bytes_response(fixed_response, &mut output)
+                .await
+                .unwrap_err()
+        ),
+        ErrorCode::H3_MESSAGE_ERROR
     );
     assert!(output.is_empty());
 
-    let message = Message::<Bytes>::default().with_body(ArcWndBuf::new(1));
+    let message = Message::<headers::ResponseHead, Bytes>::default()
+        .with_body(crate::Body::new(ArcWndBuf::new(1)));
     let mut response = Response::from(ArcMessage::from(message));
     response.set_status(StatusCode::OK);
     let mut producer = Response::from(response.message.clone());
     let (writer, reader) = duplex(1);
     drop(reader);
-    let (sent, produced) = tokio::join!(write_streaming_response(&response, writer), async {
+    let (sent, produced) = tokio::join!(write_streaming_response(response, writer), async {
         producer.write(b"a").await?;
         producer.write(b"b").await
     });
-    assert_eq!(sent.unwrap_err(), Error::H3_INTERNAL_ERROR);
-    assert_eq!(produced.unwrap_err(), Error::H3_INTERNAL_ERROR);
+    assert_eq!(
+        ErrorCode::from(sent.unwrap_err()),
+        ErrorCode::H3_INTERNAL_ERROR
+    );
+    assert_eq!(
+        ErrorCode::from(produced.unwrap_err()),
+        ErrorCode::H3_INTERNAL_ERROR
+    );
 }

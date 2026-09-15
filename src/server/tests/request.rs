@@ -1,7 +1,11 @@
 use super::*;
 
 async fn read_request<R: AsyncRead + Unpin + Send + 'static>(recv: R) -> Result<Request> {
-    super::accept(H3ReadStream::new(0, recv), Arc::new(Qpack::default())).await
+    super::accept(
+        crate::test_support::read_stream(0, recv),
+        crate::test_support::connection().await.qpack().clone(),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -34,36 +38,45 @@ async fn preserves_request_headers_through_message_roundtrip() {
         let mut encoded = Vec::new();
         encoded.put_frame(
             &Frame::new(Headers {
-                field_section: Qpack::default().encode(0, fields).unwrap(),
+                field_section: crate::test_support::connection()
+                    .await
+                    .qpack()
+                    .encode(0, fields)
+                    .unwrap(),
             })
             .unwrap(),
         );
 
-        let fields = match read_request(Cursor::new(encoded)).await.unwrap() {
-            Request::Bytes(request) => {
-                assert!(buffered);
-                request.message.0.lock().unwrap().fields()
-            }
-            Request::Streaming(mut request) => {
-                assert!(!buffered);
-                assert_eq!(request.read(&mut [0]).await.unwrap(), 0);
-                request.message.0.lock().unwrap().fields()
-            }
+        let Request::Streaming(mut request) = read_request(Cursor::new(encoded)).await.unwrap()
+        else {
+            panic!("incoming requests are always streaming")
+        };
+        assert_eq!(request.read(&mut [0]).await.unwrap(), 0);
+        let fields = {
+            let head = request.message.head.lock().unwrap();
+            let mut fields = Vec::new();
+            fields.put_request(&head).unwrap();
+            fields
         };
         let frame = Frame::new(Headers {
-            field_section: Qpack::default().encode(4, fields).unwrap(),
+            field_section: crate::test_support::connection()
+                .await
+                .qpack()
+                .encode(4, fields)
+                .unwrap(),
         })
         .unwrap();
-        let fields = Qpack::default()
+        let fields = crate::test_support::connection()
+            .await
+            .qpack()
             .decode(4, frame.payload.field_section)
             .await
             .unwrap();
-        let parts = headers::request_parts(fields).unwrap();
-        assert_eq!(parts.method, Method::GET);
-        assert_eq!(parts.uri, "https://example.com/");
+        let head = headers::be_request(fields).unwrap();
+        assert_eq!(head.method, Method::GET);
+        assert_eq!(head.uri, "https://example.com/");
         assert_eq!(
-            parts
-                .headers
+            head.headers
                 .get_all(header::ACCEPT)
                 .iter()
                 .map(|value| value.to_str().unwrap())
@@ -71,26 +84,28 @@ async fn preserves_request_headers_through_message_roundtrip() {
             ["text/plain", "text/html"],
             "buffered={buffered}"
         );
-        assert_eq!(parts.headers.get_all(header::COOKIE).iter().count(), 1);
-        assert_eq!(parts.headers[header::COOKIE], "a=1; b=2");
-        assert!(parts.headers[header::COOKIE].is_sensitive());
+        assert_eq!(head.headers.get_all(header::COOKIE).iter().count(), 1);
+        assert_eq!(head.headers[header::COOKIE], "a=1; b=2");
+        assert!(head.headers[header::COOKIE].is_sensitive());
     }
 }
 
 #[tokio::test]
 async fn reads_buffered_and_streaming_request_frames() {
-    let crate::common::Request::Bytes(request) =
+    let crate::common::Request::Streaming(mut request) =
         read_request(Cursor::new(request_frames(b"hello", Some("5"))))
             .await
             .unwrap()
     else {
-        panic!("expected bytes request")
+        panic!("incoming requests are always streaming")
     };
     assert_eq!(request.method(), Method::POST);
     assert_eq!(request.authority(), "example.com");
     assert_eq!(request.scheme(), "https");
     assert_eq!(request.path(), "/echo?q=1");
-    assert_eq!(request.body(), "hello");
+    let mut body = [0; 5];
+    assert_eq!(request.read_all(&mut body).await.unwrap(), body.len());
+    assert_eq!(&body, b"hello");
 
     let crate::common::Request::Streaming(mut request) =
         read_request(Cursor::new(request_frames(b"streaming", None)))
@@ -103,12 +118,16 @@ async fn reads_buffered_and_streaming_request_frames() {
     assert_eq!(request.read_all(&mut body).await.unwrap(), body.len());
     assert_eq!(&body, b"streaming");
 
-    assert_eq!(
+    let crate::common::Request::Streaming(mut request) =
         read_request(Cursor::new(request_frames(b"short", Some("6"))))
             .await
-            .err()
-            .unwrap(),
-        Error::H3_MESSAGE_ERROR
+            .unwrap()
+    else {
+        panic!("incoming requests are always streaming")
+    };
+    assert_eq!(
+        (request.read_all(&mut [0; 6]).await).map_err(ErrorCode::from),
+        Err(ErrorCode::H3_MESSAGE_ERROR)
     );
     let mut encoded = request_frames(b"short", None);
     encoded.pop();
@@ -118,9 +137,38 @@ async fn reads_buffered_and_streaming_request_frames() {
         panic!("expected streaming request")
     };
     assert_eq!(
-        request.read_all(&mut [0; 5]).await.unwrap_err(),
-        Error::H3_FRAME_ERROR
+        ErrorCode::from(request.read_all(&mut [0; 5]).await.unwrap_err()),
+        ErrorCode::H3_FRAME_ERROR
     );
+}
+
+#[tokio::test]
+async fn known_length_request_returns_before_body_and_fin() {
+    use std::time::Duration;
+
+    let (mut writer, reader) = duplex(1024);
+    writer
+        .write_all(&request_frames(b"", Some("5")))
+        .await
+        .unwrap();
+    let Request::Streaming(mut request) =
+        tokio::time::timeout(Duration::from_secs(5), read_request(reader))
+            .await
+            .expect("request headers must be delivered before the fixed-length body")
+            .unwrap()
+    else {
+        panic!("incoming requests are always streaming")
+    };
+
+    let mut body = Vec::new();
+    body.put_frame(&Frame::new(Data(5)).unwrap());
+    body.extend_from_slice(b"hello");
+    writer.write_all(&body).await.unwrap();
+    writer.shutdown().await.unwrap();
+
+    let mut received = [0; 5];
+    assert_eq!(request.read_all(&mut received).await.unwrap(), 5);
+    assert_eq!(&received, b"hello");
 }
 
 #[tokio::test]
@@ -147,19 +195,13 @@ async fn requests_skip_unknown_frames_before_headers_between_data_and_before_fin
             },
             async {
                 let expected = chunks.concat();
-                match read_request(reader).await.unwrap() {
-                    Request::Bytes(request) => {
-                        assert!(length.is_some());
-                        assert_eq!(request.body(), expected);
-                    }
-                    Request::Streaming(mut request) => {
-                        assert!(length.is_none());
-                        let mut body = [0; 8];
-                        assert_eq!(request.read_all(&mut body).await.unwrap(), expected.len());
-                        assert_eq!(&body[..expected.len()], expected);
-                        assert_eq!(request.read(&mut body).await.unwrap(), 0);
-                    }
-                }
+                let Request::Streaming(mut request) = read_request(reader).await.unwrap() else {
+                    panic!("incoming requests are always streaming")
+                };
+                let mut body = [0; 8];
+                assert_eq!(request.read_all(&mut body).await.unwrap(), expected.len());
+                assert_eq!(&body[..expected.len()], expected);
+                assert_eq!(request.read(&mut body).await.unwrap(), 0);
             }
         );
     }
@@ -168,19 +210,19 @@ async fn requests_skip_unknown_frames_before_headers_between_data_and_before_fin
 #[tokio::test]
 async fn unknown_frames_do_not_hide_invalid_request_frames() {
     for (invalid, expected) in [
-        (&[2, 0][..], Error::H3_FRAME_UNEXPECTED),
-        (&[6, 0][..], Error::H3_FRAME_UNEXPECTED),
-        (&[8, 0][..], Error::H3_FRAME_UNEXPECTED),
-        (&[9, 0][..], Error::H3_FRAME_UNEXPECTED),
-        (&[3, 1, 0][..], Error::H3_FRAME_UNEXPECTED),
-        (&[4, 0][..], Error::H3_FRAME_UNEXPECTED),
-        (&[5, 3, 0, 0, 0][..], Error::H3_FRAME_UNEXPECTED),
-        (&[7, 1, 0][..], Error::H3_FRAME_UNEXPECTED),
-        (&[13, 1, 0][..], Error::H3_FRAME_UNEXPECTED),
-        (&[0x40][..], Error::H3_FRAME_ERROR),
-        (&[0x21][..], Error::H3_FRAME_ERROR),
-        (&[0x21, 0x40][..], Error::H3_FRAME_ERROR),
-        (&[0x21, 2, 0][..], Error::H3_FRAME_ERROR),
+        (&[2, 0][..], ErrorCode::H3_FRAME_UNEXPECTED),
+        (&[6, 0][..], ErrorCode::H3_FRAME_UNEXPECTED),
+        (&[8, 0][..], ErrorCode::H3_FRAME_UNEXPECTED),
+        (&[9, 0][..], ErrorCode::H3_FRAME_UNEXPECTED),
+        (&[3, 1, 0][..], ErrorCode::H3_FRAME_UNEXPECTED),
+        (&[4, 0][..], ErrorCode::H3_FRAME_UNEXPECTED),
+        (&[5, 3, 0, 0, 0][..], ErrorCode::H3_FRAME_UNEXPECTED),
+        (&[7, 1, 0][..], ErrorCode::H3_FRAME_UNEXPECTED),
+        (&[13, 1, 0][..], ErrorCode::H3_FRAME_UNEXPECTED),
+        (&[0x40][..], ErrorCode::H3_FRAME_ERROR),
+        (&[0x21][..], ErrorCode::H3_FRAME_ERROR),
+        (&[0x21, 0x40][..], ErrorCode::H3_FRAME_ERROR),
+        (&[0x21, 2, 0][..], ErrorCode::H3_FRAME_ERROR),
     ] {
         for before_headers in [true, false] {
             let mut encoded = if before_headers {
@@ -190,27 +232,112 @@ async fn unknown_frames_do_not_hide_invalid_request_frames() {
             };
             encoded.extend_from_slice(&[0x21, 0]);
             encoded.extend_from_slice(invalid);
-            assert_eq!(
-                read_request(Cursor::new(encoded)).await.err().unwrap(),
-                expected
-            );
+            if before_headers {
+                assert_eq!(
+                    ErrorCode::from(read_request(Cursor::new(encoded)).await.err().unwrap()),
+                    expected
+                );
+            } else {
+                let Request::Streaming(mut request) =
+                    read_request(Cursor::new(encoded)).await.unwrap()
+                else {
+                    panic!("incoming requests are always streaming")
+                };
+                assert_eq!(
+                    (request.read(&mut [0]).await).map_err(ErrorCode::from),
+                    Err(expected)
+                );
+            }
         }
     }
     for (suffix, expected) in [
-        (&[][..], Error::H3_FRAME_ERROR),
-        (&[0x21, 0][..], Error::H3_FRAME_ERROR),
-        (&[0, 0][..], Error::H3_FRAME_UNEXPECTED),
+        (&[][..], ErrorCode::H3_REQUEST_INCOMPLETE),
+        (&[0x21, 0][..], ErrorCode::H3_REQUEST_INCOMPLETE),
+        (&[0, 0][..], ErrorCode::H3_FRAME_UNEXPECTED),
     ] {
         let encoded = [&[0x21, 0][..], suffix].concat();
         assert_eq!(
-            read_request(Cursor::new(encoded)).await.err().unwrap(),
+            ErrorCode::from(read_request(Cursor::new(encoded)).await.err().unwrap()),
             expected
         );
     }
     let mut encoded = request_frames(b"", Some("1"));
     encoded.extend_from_slice(&[0x21, 1, b'x']);
+    let Request::Streaming(mut request) = read_request(Cursor::new(encoded)).await.unwrap() else {
+        panic!("incoming requests are always streaming")
+    };
     assert_eq!(
-        read_request(Cursor::new(encoded)).await.err().unwrap(),
-        Error::H3_MESSAGE_ERROR
+        (request.read(&mut [0]).await).map_err(ErrorCode::from),
+        Err(ErrorCode::H3_MESSAGE_ERROR)
     );
+}
+
+#[tokio::test]
+async fn malformed_request_stops_transport_with_message_error() {
+    use crate::test_support::TestStream;
+
+    for stage in ["headers", "body", "trailers"] {
+        let connection = crate::test_support::connection().await;
+        let mut wire = match stage {
+            "headers" => request_frames(b"", Some("invalid")),
+            "body" => request_frames(b"xx", Some("1")),
+            _ => request_frames(b"", None),
+        };
+        if stage == "trailers" {
+            let mut fields = Vec::new();
+            fields
+                .put_field_section(vec![qpack::Field {
+                    never_index: false,
+                    name: Bytes::from_static(b":method"),
+                    value: Bytes::from_static(b"GET"),
+                }])
+                .unwrap();
+            wire.put_frame(
+                &Frame::new(Headers {
+                    field_section: fields.into(),
+                })
+                .unwrap(),
+            );
+        }
+        let (mut peer, recv) = duplex(4096);
+        peer.write_all(&wire).await.unwrap();
+        // Keep the peer open: parsing must terminate QUIC without waiting for FIN/Drop.
+        let recv = TestStream::new(recv);
+        let stopped = recv.stopped.clone();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            match crate::server::read_request(
+                H3ReadStream::new(0, recv),
+                connection.qpack().clone(),
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(request) => request.into_body().collect().await.unwrap_err(),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR, "{stage}");
+        assert_eq!(
+            *stopped.lock().unwrap(),
+            [ErrorCode::H3_MESSAGE_ERROR.as_u64()],
+            "{stage}"
+        );
+        assert!(connection.qpack().error().is_none());
+    }
+}
+
+#[tokio::test]
+async fn incomplete_request_does_not_fail_connection() {
+    for wire in [vec![], vec![0x21, 0]] {
+        let connection = crate::test_support::connection().await;
+        let recv = crate::test_support::read_stream(0, Cursor::new(wire));
+        let error = super::accept(recv, connection.qpack().clone())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::H3_REQUEST_INCOMPLETE);
+        assert!(connection.qpack().error().is_none());
+        assert!(connection.qpack().encode(4, Vec::new()).is_ok());
+    }
 }

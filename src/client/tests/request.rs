@@ -4,10 +4,11 @@ async fn write_bytes_request<W: AsyncWrite + Unpin + Send + 'static>(
     request: &Request<Bytes>,
     send: W,
 ) -> Result<()> {
-    super::write_bytes_request(
+    let connection = crate::test_support::connection().await;
+    super::send_bytes_request(
         request,
-        H3WriteStream::new(0, send),
-        Arc::new(Qpack::default()),
+        crate::test_support::write_stream(0, send),
+        connection.qpack(),
     )?
     .await
 }
@@ -16,17 +17,18 @@ async fn write_streaming_request<W: AsyncWrite + Unpin + Send + 'static>(
     request: &Request<ArcWndBuf>,
     send: W,
 ) -> Result<()> {
-    super::write_streaming_request(
+    let connection = crate::test_support::connection().await;
+    super::send_streaming_request(
         request,
-        H3WriteStream::new(0, send),
-        Arc::new(Qpack::default()),
+        crate::test_support::write_stream(0, send),
+        connection.qpack(),
     )?
     .await
 }
 
-fn be_request(input: &[u8]) -> Result<(&[u8], http::request::Parts)> {
+fn be_request(input: &[u8]) -> Result<(&[u8], headers::RequestHead)> {
     let (input, fields) = qpack::be_field_section(input)?;
-    Ok((input, headers::request_parts(fields)?))
+    Ok((input, headers::be_request(fields)?))
 }
 
 #[tokio::test]
@@ -75,8 +77,8 @@ async fn request_frames_and_errors() {
         .header(header::CONTENT_LENGTH, HeaderValue::from_static("1"));
     let (writer, mut reader) = duplex(3);
     assert_eq!(
-        write_bytes_request(&req, writer).await.unwrap_err(),
-        Error::H3_MESSAGE_ERROR
+        ErrorCode::from(write_bytes_request(&req, writer).await.unwrap_err()),
+        ErrorCode::H3_MESSAGE_ERROR
     );
     let mut output = Vec::new();
     reader.read_to_end(&mut output).await.unwrap();
@@ -85,8 +87,8 @@ async fn request_frames_and_errors() {
     let (writer, reader) = duplex(3);
     drop(reader);
     assert_eq!(
-        write_bytes_request(&req, writer).await.unwrap_err(),
-        Error::H3_INTERNAL_ERROR
+        ErrorCode::from(write_bytes_request(&req, writer).await.unwrap_err()),
+        ErrorCode::H3_INTERNAL_ERROR
     );
 }
 
@@ -100,11 +102,14 @@ async fn streaming_request_frames_and_errors() {
         (&b"hello"[..], Some("6"), false),
         (&b"hello"[..], Some("invalid"), false),
     ] {
-        let mut message = Message::<Bytes>::post("https://example.com/upload").unwrap();
+        let mut message =
+            Message::<headers::RequestHead, Bytes>::post("https://example.com/upload").unwrap();
         if let Some(length) = length {
             message.set_header(header::CONTENT_LENGTH, length.parse().unwrap());
         }
-        let req = Request::from(ArcMessage::from(message.with_body(ArcWndBuf::new(2))));
+        let req = Request::from(ArcMessage::from(
+            message.with_body(crate::Body::new(ArcWndBuf::new(2))),
+        ));
         let mut producer = Request::from(req.message.clone());
         let (writer, mut reader) = duplex(3);
         let (sent, produced, received) = tokio::join!(
@@ -124,10 +129,13 @@ async fn streaming_request_frames_and_errors() {
             }
         );
         if !valid {
-            assert_eq!(sent.unwrap_err(), Error::H3_MESSAGE_ERROR);
             assert_eq!(
-                producer.write(b"x").await.unwrap_err(),
-                Error::H3_MESSAGE_ERROR
+                ErrorCode::from(sent.unwrap_err()),
+                ErrorCode::H3_MESSAGE_ERROR
+            );
+            assert_eq!(
+                ErrorCode::from(producer.write(b"x").await.unwrap_err()),
+                ErrorCode::H3_MESSAGE_ERROR
             );
             continue;
         }
@@ -152,9 +160,9 @@ async fn streaming_request_frames_and_errors() {
         assert_eq!(decoded, body);
     }
     let req = Request::from(ArcMessage::from(
-        Message::<Bytes>::post("https://example.com/")
+        Message::<headers::RequestHead, Bytes>::post("https://example.com/")
             .unwrap()
-            .with_body(ArcWndBuf::new(1)),
+            .with_body(crate::Body::new(ArcWndBuf::new(1))),
     ));
     let mut producer = Request::from(req.message.clone());
     let (writer, reader) = duplex(1);
@@ -163,6 +171,12 @@ async fn streaming_request_frames_and_errors() {
         producer.write(b"a").await?;
         producer.write(b"b").await
     });
-    assert_eq!(sent.unwrap_err(), Error::H3_INTERNAL_ERROR);
-    assert_eq!(produced.unwrap_err(), Error::H3_INTERNAL_ERROR);
+    assert_eq!(
+        ErrorCode::from(sent.unwrap_err()),
+        ErrorCode::H3_INTERNAL_ERROR
+    );
+    assert_eq!(
+        ErrorCode::from(produced.unwrap_err()),
+        ErrorCode::H3_INTERNAL_ERROR
+    );
 }

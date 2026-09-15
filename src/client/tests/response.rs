@@ -1,7 +1,14 @@
 use super::*;
+use crate::protocol::frame::Data;
 
 async fn read_response<R: AsyncRead + Unpin + Send + 'static>(recv: R) -> Result<Response> {
-    super::read_response(H3ReadStream::new(0, recv), Arc::new(Qpack::default()), None).await
+    let connection = crate::test_support::connection().await;
+    super::read_response(
+        crate::test_support::read_stream(0, recv),
+        connection.qpack().clone(),
+        None,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -33,44 +40,42 @@ async fn preserves_set_cookie_headers_through_message_roundtrip() {
         let mut encoded = Vec::new();
         encoded.put_frame(
             &Frame::new(Headers {
-                field_section: Qpack::default().encode(0, fields).unwrap(),
+                field_section: crate::test_support::connection()
+                    .await
+                    .qpack()
+                    .encode(0, fields)
+                    .unwrap(),
             })
             .unwrap(),
         );
 
-        let response = read_response(Cursor::new(encoded)).await.unwrap();
-        let outgoing: common::Response<Write> = match response {
-            Response::Bytes(response) => {
-                assert!(buffered);
-                crate::server::Response::from(response.message).into()
-            }
-            Response::Streaming(response) => {
-                assert!(!buffered);
-                crate::server::Response::from(response.message).into()
-            }
+        let Response::Streaming(response) = read_response(Cursor::new(encoded)).await.unwrap()
+        else {
+            panic!("incoming responses are always streaming")
         };
+        let outgoing = crate::server::Response::from(response.message.test_direction());
         let mut reencoded = Vec::new();
-        crate::server::respond(
-            outgoing,
-            H3WriteStream::new(4, &mut reencoded),
-            Arc::new(Qpack::default()),
-            &Method::GET,
-        )
-        .await
-        .unwrap();
+        let send = crate::test_support::write_stream(4, &mut reencoded);
+        let qpack = crate::test_support::connection().await.qpack().clone();
+        crate::server::write_streaming_response(outgoing, send, qpack, &Method::GET)
+            .await
+            .unwrap();
+        // Keep the receive handle alive until the shared body reaches EOF.
+        drop(response);
 
         let H3Frame::Headers(frame) = be_frame(&mut reencoded.as_slice()).await.unwrap() else {
             panic!("expected HEADERS")
         };
-        let fields = Qpack::default()
+        let fields = crate::test_support::connection()
+            .await
+            .qpack()
             .decode(4, frame.payload.field_section)
             .await
             .unwrap();
-        let parts = headers::response_parts(fields).unwrap();
-        assert_eq!(parts.status, StatusCode::OK);
+        let head = headers::be_response(fields).unwrap();
+        assert_eq!(head.status().unwrap(), StatusCode::OK);
         assert_eq!(
-            parts
-                .headers
+            head.headers
                 .get_all(header::SET_COOKIE)
                 .iter()
                 .map(|value| value.to_str().unwrap())
@@ -79,8 +84,7 @@ async fn preserves_set_cookie_headers_through_message_roundtrip() {
             "buffered={buffered}"
         );
         assert!(
-            parts
-                .headers
+            head.headers
                 .get_all(header::SET_COOKIE)
                 .iter()
                 .all(HeaderValue::is_sensitive)
@@ -132,20 +136,15 @@ async fn response_content_length_and_streaming() {
                 writer.shutdown().await.unwrap();
             },
             async {
-                match read_response(reader).await.unwrap() {
-                    crate::common::Response::Bytes(response) => {
-                        assert!(length.is_some());
-                        assert_eq!(response.status(), StatusCode::OK);
-                        assert_eq!(response.body(), "hello");
-                    }
-                    crate::common::Response::Streaming(mut response) => {
-                        assert!(length.is_none());
-                        assert_eq!(response.status(), StatusCode::OK);
-                        let mut buf = [0; 8];
-                        assert_eq!(response.read_all(&mut buf).await.unwrap(), 5);
-                        assert_eq!(&buf[..5], b"hello");
-                    }
-                }
+                let crate::common::Response::Streaming(mut response) =
+                    read_response(reader).await.unwrap()
+                else {
+                    panic!("incoming responses are always streaming")
+                };
+                assert_eq!(response.status(), StatusCode::OK);
+                let mut buf = [0; 8];
+                assert_eq!(response.read_all(&mut buf).await.unwrap(), 5);
+                assert_eq!(&buf[..5], b"hello");
             }
         );
     }
@@ -154,19 +153,36 @@ async fn response_content_length_and_streaming() {
         headers(&mut encoded, "200", Some(length));
         encoded.put_frame(&Frame::<Data>::new(Data(5)).unwrap());
         encoded.extend_from_slice(b"hello");
-        let result = read_response(Cursor::new(encoded)).await;
-        assert!(matches!(result, Err(Error::H3_MESSAGE_ERROR)));
+        if length == "invalid" {
+            assert!(matches!(
+                read_response(Cursor::new(encoded)).await,
+                Err(h3x::Error {
+                    code: ErrorCode::H3_MESSAGE_ERROR,
+                    ..
+                })
+            ));
+            continue;
+        }
+        let crate::common::Response::Streaming(mut response) =
+            read_response(Cursor::new(encoded)).await.unwrap()
+        else {
+            panic!("incoming responses are always streaming")
+        };
+        assert_eq!(
+            (response.read(&mut [0; 8]).await).map_err(ErrorCode::from),
+            Err(ErrorCode::H3_MESSAGE_ERROR)
+        );
     }
     for (status, length) in [("200", Some("0")), ("204", None), ("304", Some("100"))] {
         let mut encoded = unknown.to_vec();
         headers(&mut encoded, status, length);
         encoded.extend_from_slice(unknown);
-        let crate::common::Response::Bytes(response) =
+        let crate::common::Response::Streaming(mut response) =
             read_response(Cursor::new(encoded)).await.unwrap()
         else {
-            panic!("expected empty fixed body")
+            panic!("incoming responses are always streaming")
         };
-        assert!(response.body().is_empty());
+        assert_eq!(response.read(&mut [0]).await.unwrap(), 0);
     }
     // Unknown-length responses return after HEADERS, before body bytes arrive.
     let (mut writer, reader) = duplex(1024);
@@ -183,21 +199,26 @@ async fn response_content_length_and_streaming() {
     writer.write_all(&encoded).await.unwrap();
     writer.shutdown().await.unwrap();
     assert_eq!(
-        response.read(&mut [0; 5]).await.unwrap_err(),
-        Error::H3_FRAME_ERROR
+        ErrorCode::from(response.read(&mut [0; 5]).await.unwrap_err()),
+        ErrorCode::H3_FRAME_ERROR
     );
 
     let mut encoded = Vec::new();
     headers(&mut encoded, "200", Some("0"));
     encoded.push(0x40); // Truncated frame type is not a clean EOF.
-    assert!(matches!(
-        read_response(Cursor::new(encoded)).await,
-        Err(Error::H3_FRAME_ERROR)
-    ));
+    let crate::common::Response::Streaming(mut response) =
+        read_response(Cursor::new(encoded)).await.unwrap()
+    else {
+        panic!("incoming responses are always streaming")
+    };
+    assert_eq!(
+        (response.read(&mut [0]).await).map_err(ErrorCode::from),
+        Err(ErrorCode::H3_FRAME_ERROR)
+    );
 
     for (suffix, expected) in [
-        (&[2, 0][..], Error::H3_FRAME_UNEXPECTED),
-        (&[0x21, 2, 0][..], Error::H3_FRAME_ERROR),
+        (&[2, 0][..], ErrorCode::H3_FRAME_UNEXPECTED),
+        (&[0x21, 2, 0][..], ErrorCode::H3_FRAME_ERROR),
     ] {
         let mut encoded = Vec::new();
         headers(&mut encoded, "200", None);
@@ -208,6 +229,9 @@ async fn response_content_length_and_streaming() {
         else {
             panic!("expected streaming response")
         };
-        assert_eq!(response.read(&mut [0]).await.unwrap_err(), expected);
+        assert_eq!(
+            ErrorCode::from(response.read(&mut [0]).await.unwrap_err()),
+            expected
+        );
     }
 }

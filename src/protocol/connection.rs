@@ -1,297 +1,143 @@
 use std::sync::Arc;
 
-use qbase::varint::VARINT_MAX;
-use tokio::{sync::Notify, task::JoinHandle};
+use qrecovery::{recv::StopSending, send::CancelStream};
 
-use super::{
-    frame,
-    qpack::{self, Qpack},
-    stream::{H3ReadStream, H3WriteStream, UniStreams, bi::BiStreams},
-};
-use crate::{Error, Result, Transport};
+use super::stream::{H3ReadStream, H3WriteStream, bi::BiStreams};
+use crate::{ErrorCode, Result, Transport, protocol::qpack::ArcQpack};
 
-mod goaway;
+mod control;
 mod settings;
-
-pub(crate) use goaway::Goaway;
-use goaway::send_goaway;
+mod stream_cursor;
 pub use settings::Settings;
+pub(crate) use stream_cursor::StreamCursor;
 
-#[cfg(test)]
-mod tests;
+use crate::ErrorCode::H3_NO_ERROR;
 
 /// An HTTP/3 connection whose control and QPACK streams are driven automatically.
-/// Construct inside a Tokio runtime. Dropping the connection closes it and stops its driver.
+/// Construct inside a Tokio runtime. Tasks run until the transport terminates.
+/// Only an explicit goaway() drains requests and closes the transport.
 pub struct H3Connection<T: Transport> {
     transport: Arc<T>,
-    uni: Arc<UniStreams>,
-    bi: Arc<BiStreams<T::Recv, T::Send>>,
-    shutdown: Arc<Notify>,
-    task: JoinHandle<()>,
+    settings: Arc<Settings>,
+    qpack: ArcQpack,
+    cursor: Arc<StreamCursor<T::StreamWriter>>,
+    bi_streams: Arc<BiStreams<T::StreamReader, T::StreamWriter>>,
 }
 
 impl<T: Transport> H3Connection<T> {
-    /// Start HTTP/3 using default settings and the transport's endpoint role.
-    /// Panics if called outside a Tokio runtime.
-    pub fn new(transport: T) -> Self {
-        Self::with_settings(transport, Settings::default()).expect("valid default HTTP/3 settings")
+    /// Open the control stream and start SETTINGS and connection tasks.
+    pub async fn new(transport: T, settings: Settings) -> Result<Self> {
+        let transport = Arc::new(transport);
+        let settings = Arc::new(settings);
+        let bi = Arc::new(BiStreams::new());
+        let (qpack, encoder_rx, decoder_rx) = ArcQpack::new(&settings, transport.clone())?;
+
+        let control_stream = control::open_uni(transport.as_ref()).await?;
+        let cursor = Arc::new(StreamCursor::new(transport.role(), control_stream));
+        let control_stream = cursor.control_stream.clone().lock_owned().await;
+
+        tokio::spawn({
+            let qpack = qpack.clone();
+            let transport = transport.clone();
+            async move { qpack.sync_encoder(transport, encoder_rx).await }
+        });
+        tokio::spawn({
+            let qpack = qpack.clone();
+            let transport = transport.clone();
+            async move { qpack.sync_decoder(transport, decoder_rx).await }
+        });
+
+        let connection = Self {
+            transport,
+            settings,
+            qpack,
+            cursor,
+            bi_streams: bi,
+        };
+
+        tokio::spawn(connection.clone().send_settings(control_stream));
+        tokio::spawn(connection.clone().accept_and_process_uni());
+        Ok(connection)
     }
 
-    pub fn with_settings(transport: T, settings: Settings) -> Result<Self> {
-        let (local, max_fields) = qpack::limits(&settings.local);
-        let qpack = Arc::new(Qpack::new(
-            local,
-            qpack::Settings::default(),
-            frame::MAX_BUFFERED_FRAME_PAYLOAD,
-        )?);
-        qpack.local_limit(max_fields);
-        let transport = Arc::new(transport);
-        let uni = Arc::new(UniStreams::new(settings, qpack));
-        let bi = Arc::new(BiStreams::default());
-        let shutdown = Arc::new(Notify::new());
-        let task = tokio::spawn({
-            let bi = Arc::clone(&bi);
-            let transport = Arc::clone(&transport);
-            let uni = Arc::clone(&uni);
-            let shutdown = Arc::clone(&shutdown);
-            async move {
-                let _ = process_connection(transport.as_ref(), &uni, &bi, &shutdown).await;
-            }
-        });
-        Ok(Self {
-            transport,
-            uni,
-            bi,
-            shutdown,
-            task,
-        })
+    /// Compression state shared by messages on this connection.
+    pub fn qpack(&self) -> &ArcQpack {
+        &self.qpack
     }
 
     /// Open a bidirectional stream, returning (send, receive).
+    /// Admission stops on peer GOAWAY or connection close, not local GOAWAY.
     pub async fn open_bi(
         &self,
     ) -> Result<(
-        H3WriteStream<T::Send, T::Recv>,
-        H3ReadStream<T::Recv, T::Send>,
+        H3WriteStream<T::StreamWriter>,
+        H3ReadStream<T::StreamReader>,
     )> {
-        self.error().map_or(Ok(()), Err)?;
-        if self.uni.goaway.is_draining() {
-            return Err(Error::H3_REQUEST_REJECTED);
+        self.cursor.remote.lock().unwrap().not_goaway()?;
+        let (id, (mut recv, mut send)) = self.transport.open_bi().await?.ok_or_else(|| {
+            ErrorCode::H3_STREAM_CREATION_ERROR
+                .with_reason("transport cannot open a bidirectional stream")
+        })?;
+        // Recheck after the await and hold admission through registration.
+        if let Err(error) = self.cursor.remote.lock().unwrap().not_goaway() {
+            recv.stop(error.code.as_u64());
+            send.cancel(error.code.as_u64());
+            return Err(error);
         }
-        let stream = tokio::select! {
-            biased;
-            error = self.uni.qpack.terminated() => return Err(error),
-            _ = self.uni.goaway.draining() => return Err(Error::H3_REQUEST_REJECTED),
-            _ = self.uni.goaway.received() => return Err(Error::H3_REQUEST_REJECTED),
-            stream = self.transport.open_bi_stream() => stream?,
-        }
-        .ok_or(Error::H3_STREAM_CREATION_ERROR)?;
-        // Admission and the transition to draining share this lock. The driver
-        // cannot observe an empty connection while a stream is being admitted.
-        let state = self.uni.goaway.state.lock().unwrap();
-        if state.local().or(state.peer()).is_some() {
-            reject_stream::<T>(stream);
-            return Err(Error::H3_REQUEST_REJECTED);
-        }
-        self.insert(stream)
+        self.bi_streams.insert(id, recv, send)
     }
 
-    /// Accept a bidirectional stream, returning (send, receive), before parsing HTTP.
+    /// Consume this connection and exchange GOAWAY with the peer.
+    /// Wait for GOAWAY to be flushed, the peer GOAWAY, and admitted requests before closing QUIC.
+    /// This future is not cancellation-safe during GOAWAY writes; await it to completion.
+    pub async fn goaway(self) -> Result<()> {
+        if let Err(error) = self.send_goaway().await {
+            self.fail(error.clone());
+            return Err(error);
+        }
+        self.cursor.remote_goaway().await?;
+        self.bi_streams.drained().await;
+        self.transport.close(String::new(), H3_NO_ERROR.as_u64())
+    }
+}
+
+impl<T: Transport> H3Connection<T> {
+    /// Accept and register one peer bidirectional stream, returning (write, read).
+    /// Admission stops on local GOAWAY or connection close, not peer GOAWAY.
+    /// The application drives acceptance; no background request queue is maintained.
     pub async fn accept_bi(
         &self,
     ) -> Result<(
-        H3WriteStream<T::Send, T::Recv>,
-        H3ReadStream<T::Recv, T::Send>,
+        H3WriteStream<T::StreamWriter>,
+        H3ReadStream<T::StreamReader>,
     )> {
-        self.error().map_or(Ok(()), Err)?;
-        if self.uni.goaway.state.lock().unwrap().local().is_some() {
-            return Err(Error::H3_REQUEST_REJECTED);
+        self.cursor.local.lock().unwrap().not_goaway()?;
+        let (id, (mut read, mut write)) = self.transport.accept_bi().await?;
+        let stream_id = qbase::varint::VarInt::try_from(id)
+            .map(qbase::sid::StreamId::from)
+            .map_err(|error| {
+                ErrorCode::H3_ID_ERROR
+                    .with_reason(format!("invalid stream or push identifier: {error}"))
+            });
+        let mut admission = self.cursor.local.lock().unwrap();
+        if let Err(error) = stream_id.and_then(|id| admission.accept(id)) {
+            read.stop(ErrorCode::H3_REQUEST_REJECTED.as_u64());
+            write.cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64());
+            return Err(error);
         }
-        let stream = tokio::select! {
-            biased;
-            error = self.uni.qpack.terminated() => return Err(error),
-            _ = self.uni.goaway.draining() => return Err(Error::H3_REQUEST_REJECTED),
-            stream = self.transport.accept_bi_stream() => stream?,
-        };
-        if stream.0 > VARINT_MAX || !stream.0.is_multiple_of(4) {
-            return Err(Error::H3_ID_ERROR);
+        // Keep admission and registration atomic with respect to local GOAWAY.
+        self.bi_streams.insert(id, read, write)
+    }
+}
+
+impl<T: Transport> Clone for H3Connection<T> {
+    fn clone(&self) -> Self {
+        Self {
+            transport: self.transport.clone(),
+            settings: self.settings.clone(),
+            qpack: self.qpack.clone(),
+            cursor: self.cursor.clone(),
+            bi_streams: self.bi_streams.clone(),
         }
-        let mut state = self.uni.goaway.state.lock().unwrap();
-        if state.local().is_some() {
-            reject_stream::<T>(stream);
-            return Err(Error::H3_REQUEST_REJECTED);
-        }
-        let id = stream.0;
-        let halves = self.insert(stream)?;
-        state.accept(id)?;
-        Ok(halves)
-    }
-
-    #[expect(
-        clippy::type_complexity,
-        reason = "Transport tuple keeps both halves and their ID together"
-    )]
-    fn insert(
-        &self,
-        (id, (recv, send)): (u64, (T::Recv, T::Send)),
-    ) -> Result<(
-        H3WriteStream<T::Send, T::Recv>,
-        H3ReadStream<T::Recv, T::Send>,
-    )> {
-        if id > VARINT_MAX || !id.is_multiple_of(4) {
-            return Err(Error::H3_ID_ERROR);
-        }
-        let stopped = T::send_stopped(&send);
-        let (send, recv) = self.bi.insert(id, recv, send)?;
-        let send = match stopped {
-            Some(stopped) => send.with_stop_signal(stopped),
-            None => send,
-        };
-        Ok((send, recv))
-    }
-
-    pub fn error(&self) -> Option<Error> {
-        self.uni.qpack.error()
-    }
-
-    /// Explicitly close the QUIC connection. H3_NO_ERROR stops new request streams,
-    /// sends GOAWAY, and waits for admitted streams to finish in the background.
-    /// Other errors terminate QUIC immediately. Use closed() to wait.
-    pub fn close(&self, error: Error) {
-        if error == Error::H3_NO_ERROR && self.error().is_none() {
-            match self.uni.goaway.begin_draining() {
-                Ok(()) => {
-                    self.shutdown.notify_one();
-                    return;
-                }
-                Err(error) => {
-                    close_connection(self.transport.as_ref(), &self.uni.qpack, &self.bi, error);
-                    return;
-                }
-            }
-        }
-        close_connection(self.transport.as_ref(), &self.uni.qpack, &self.bi, error);
-    }
-
-    /// Wait until the transport connection has terminated.
-    /// This wait does not initiate transport closure.
-    pub async fn closed(&self) -> Result<()> {
-        let error = self.transport.terminated().await;
-        finish_connection(&self.uni.qpack, &self.bi, error)
-    }
-
-    /// Start draining and wait for the driver to finish writing GOAWAY.
-    /// After admitted streams finish, keep the QUIC connection and its critical
-    /// streams alive until transport termination, such as its configured idle timeout.
-    /// Cancelling this wait does not cancel GOAWAY. Use close() to explicitly close QUIC.
-    pub async fn goaway(&self) -> Result<()> {
-        self.error().map_or(Ok(()), Err)?;
-        self.uni.goaway.begin_draining()?;
-        self.uni.goaway.written(&self.uni.qpack).await
-    }
-}
-
-async fn process_connection<T: Transport>(
-    transport: &T,
-    uni: &UniStreams,
-    bi: &BiStreams<T::Recv, T::Send>,
-    shutdown: &Notify,
-) -> Result<()> {
-    uni.qpack.error().map_or(Ok(()), Err)?;
-    // Keep critical streams alive until the transport is closed. Dropping them
-    // first would expose FIN to the peer as H3_CLOSED_CRITICAL_STREAM.
-    let send = uni.send(transport);
-    let receive = uni.receive(transport, bi);
-    tokio::pin!(send, receive);
-    let error = tokio::select! {
-        biased;
-        error = transport.terminated() => return finish_connection(&uni.qpack, bi, error),
-        error = uni.qpack.terminated() => error,
-        result = &mut send => result.err().unwrap_or(Error::H3_CLOSED_CRITICAL_STREAM),
-        result = &mut receive => result.err().unwrap_or(Error::H3_CLOSED_CRITICAL_STREAM),
-        result = finish_close(uni, bi, shutdown) => result.err().unwrap_or(Error::H3_NO_ERROR),
-        result = drain_connection(transport, uni, bi) => result.unwrap_err(),
-    };
-    close_connection(transport, &uni.qpack, bi, error);
-    if error == Error::H3_NO_ERROR {
-        Ok(())
-    } else {
-        Err(error)
-    }
-}
-
-async fn finish_close<R, W>(
-    uni: &UniStreams,
-    bi: &BiStreams<R, W>,
-    shutdown: &Notify,
-) -> Result<()> {
-    shutdown.notified().await;
-    uni.goaway.written(&uni.qpack).await?;
-    bi.drained().await;
-    Ok(())
-}
-
-async fn drain_connection<T: Transport>(
-    transport: &T,
-    uni: &UniStreams,
-    bi: &BiStreams<T::Recv, T::Send>,
-) -> Result<()> {
-    uni.goaway.draining().await;
-    // Finishing HTTP/3 work must not end the critical-stream driver or close QUIC.
-    tokio::try_join!(
-        async {
-            send_goaway(uni).await?;
-            bi.drained().await;
-            Ok(())
-        },
-        reject_new_streams(transport),
-    )?;
-    Ok(())
-}
-
-async fn reject_new_streams<T: Transport>(transport: &T) -> Result<()> {
-    loop {
-        reject_stream::<T>(transport.accept_bi_stream().await?);
-        tokio::task::yield_now().await;
-    }
-}
-
-fn reject_stream<T: Transport>((_, (mut recv, mut send)): (u64, (T::Recv, T::Send))) {
-    T::stop(&mut recv, Error::H3_REQUEST_REJECTED.as_u64());
-    T::cancel(&mut send, Error::H3_REQUEST_REJECTED.as_u64());
-}
-
-fn close_connection<T: Transport>(
-    transport: &T,
-    qpack: &Qpack,
-    bi: &BiStreams<T::Recv, T::Send>,
-    error: Error,
-) {
-    qpack.close(error);
-    let error = qpack.error().unwrap_or(error);
-    let _ = transport.close(error.to_string(), error.as_u64());
-    bi.close(error);
-}
-
-fn finish_connection<R, W>(qpack: &Qpack, bi: &BiStreams<R, W>, error: Error) -> Result<()> {
-    qpack.close(error);
-    let error = qpack.error().unwrap_or(error);
-    bi.close(error);
-    if error == Error::H3_NO_ERROR {
-        Ok(())
-    } else {
-        Err(error)
-    }
-}
-
-impl<T: Transport> Drop for H3Connection<T> {
-    fn drop(&mut self) {
-        close_connection(
-            self.transport.as_ref(),
-            &self.uni.qpack,
-            &self.bi,
-            Error::H3_NO_ERROR,
-        );
-        self.task.abort();
     }
 }
