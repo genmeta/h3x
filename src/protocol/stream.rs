@@ -2,7 +2,6 @@ pub(crate) mod bi;
 pub(crate) mod control;
 pub(crate) mod qpack;
 pub(crate) mod read;
-pub(crate) mod uni;
 pub(crate) mod write;
 
 use std::{

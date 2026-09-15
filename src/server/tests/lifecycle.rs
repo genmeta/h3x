@@ -217,6 +217,7 @@ async fn streaming_response_termination_reaches_the_producer() {
             }
             if error == Error::H3_REQUEST_CANCELLED {
                 drop(sending);
+                producer.clone().reset().await.unwrap();
             } else {
                 if error == Error::H3_REQUEST_REJECTED {
                     stop.send(error).unwrap();
@@ -251,13 +252,13 @@ async fn dropping_streaming_request_stops_a_pump_waiting_on_network() {
 }
 
 #[test]
-fn cancelling_request_pump_publishes_an_error_without_returning() {
+fn explicit_stop_cancels_body_after_request_pump_is_dropped() {
     use std::task::{Context, Poll, Waker};
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    let (mut request, _peer) = runtime.block_on(async {
+    let (request, _peer) = runtime.block_on(async {
         let (mut send, recv) = duplex(64);
         send.write_all(&request_frames(b"", None)).await.unwrap();
         let Request::Streaming(request) = super::accept(
@@ -273,8 +274,16 @@ fn cancelling_request_pump_publishes_an_error_without_returning() {
     });
     // The body outlives the receive task aborted by runtime shutdown.
     drop(runtime);
+    let mut remaining = request.message.clone();
+    let mut stopping = Box::pin(crate::ReadStream::stop(request));
+    assert!(
+        stopping
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    );
     let mut bytes = [0];
-    let mut reading = Box::pin(request.read(&mut bytes));
+    let mut reading = Box::pin(crate::ReadStream::read(&mut remaining, &mut bytes));
     assert_eq!(
         reading
             .as_mut()

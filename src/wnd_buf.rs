@@ -1,7 +1,7 @@
 use std::{
     io,
     pin::Pin,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
 };
 
@@ -118,8 +118,6 @@ pub struct ArcWndBuf {
     shared: Arc<Mutex<crate::Result<WndBuf>>>,
 }
 
-pub(crate) type WeakWndBuf = Weak<Mutex<crate::Result<WndBuf>>>;
-
 impl Drop for ArcWndBuf {
     fn drop(&mut self) {
         // A pump may be waiting on network I/O when the application's body drops.
@@ -141,15 +139,7 @@ impl ArcWndBuf {
         }
     }
 
-    pub(crate) fn downgrade(&self) -> WeakWndBuf {
-        Arc::downgrade(&self.shared)
-    }
-
-    pub(crate) fn upgrade(shared: &WeakWndBuf) -> Option<Self> {
-        shared.upgrade().map(|shared| Self { shared })
-    }
-
-    pub fn set_error(&self, error: crate::Error) {
+    pub(crate) fn set_error(&self, error: crate::Error) {
         let (reader, writer, observer) = {
             let mut state = self.shared.lock().unwrap();
             let Ok(window) = &mut *state else {

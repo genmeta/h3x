@@ -9,9 +9,9 @@ use std::{
 use tokio::io::AsyncWrite;
 
 use super::{StreamState, bi::BiStream};
+use crate::Error;
 #[cfg(test)]
 use crate::protocol::frame::Goaway;
-use crate::{ArcWndBuf, Error};
 
 /// Write handle for a stream owned by the connection.
 /// `R` is the paired transport reader; standalone writers use `()`.
@@ -27,7 +27,6 @@ impl<W> H3WriteStream<W> {
                 stream_id,
                 StreamState::Closed(Error::H3_NO_ERROR),
                 StreamState::Idle(stream),
-                None,
             )),
             stop_signal: None,
         }
@@ -41,10 +40,6 @@ impl<W, R> H3WriteStream<W, R> {
 
     pub(crate) fn reset(&self, error: Error) {
         self.stream.terminate_write(StreamState::Closed(error));
-    }
-
-    pub(crate) fn bind_body(&self, body: &ArcWndBuf) {
-        self.stream.write_body(body);
     }
 
     /// Attach an adapter's peer STOP_SENDING notification, independent of writes.
@@ -90,7 +85,7 @@ impl<W: AsyncWrite + Unpin, R> H3WriteStream<W, R> {
         let terminal = state.is_terminal();
         drop(state);
         if terminal {
-            self.stream.notify_write();
+            self.stream.notify_if_finished();
         }
         result
     }

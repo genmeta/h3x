@@ -145,10 +145,14 @@ async fn setup(prefixes: &[&[u8]]) -> (H3Connection<Incoming>, Arc<Probe>, Vec<D
         peers.push(peer);
     }
     (
-        H3Connection::new(Incoming {
-            streams: Mutex::new(streams),
-            probe: probe.clone(),
-        }),
+        H3Connection::new(
+            Incoming {
+                streams: Mutex::new(streams),
+                probe: probe.clone(),
+            },
+            Default::default(),
+        )
+        .unwrap(),
         probe,
         peers,
     )
@@ -161,7 +165,7 @@ async fn bounded(work: impl Future<Output = ()>) {
 }
 
 #[tokio::test]
-async fn each_unidirectional_stream_has_a_task_and_drop_cancels_them() {
+async fn each_unidirectional_stream_has_a_task_and_transport_close_cancels_them() {
     let prefixes = vec![&[0x40][..]; 32];
     let (connection, probe, _peers) = setup(&prefixes).await;
     bounded(async {
@@ -178,6 +182,9 @@ async fn each_unidirectional_stream_has_a_task_and_drop_cancels_them() {
             .is_disjoint(&probe.accept_tasks.lock().unwrap())
     );
     drop(connection);
+    assert!(probe.closed.lock().unwrap().is_none());
+    *probe.closed.lock().unwrap() = Some(Error::H3_NO_ERROR);
+    probe.ended.notify_waiters();
     bounded(async {
         while probe.live.load(Ordering::SeqCst) != 0 {
             tokio::task::yield_now().await;
@@ -205,7 +212,7 @@ async fn stream_task_errors_close_before_dropping_receivers() {
             }
         })
         .await;
-        assert_eq!(connection.error(), Some(expected));
+        drop(connection);
         assert_eq!(*probe.closed.lock().unwrap(), Some(expected));
         assert!(!probe.dropped_before_close.load(Ordering::SeqCst));
     }

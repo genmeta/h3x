@@ -32,8 +32,7 @@ pub type Response = crate::common::Response<Read>;
 /// concurrently with this future when the peer waits for body data before responding.
 /// Sending errors never discard a valid response; streaming writers observe them
 /// through their shared body. After a valid response, remaining uploads run in the background.
-/// Streaming bodies bind when this function is called, so dropping its unpolled
-/// future also cancels body operations.
+/// Applications finish or reset streaming bodies explicitly.
 pub fn request<RS, WS, R, RW, SR, T: Transport>(
     request: R,
     recv: H3ReadStream<RS, RW>,
@@ -49,10 +48,7 @@ where
 {
     use crate::ReadRequest;
     let request = request.into();
-    if let common::Request::Streaming(request) = &request {
-        let body = request.message.0.lock().unwrap().body_stream();
-        send.bind_body(&body);
-    }
+
     async move {
         let method = request.method();
         let encoder = qpack.clone();
@@ -132,7 +128,6 @@ where
         let message = req.message.0.lock().unwrap();
         (message.fields(), message.body_stream())
     };
-    ws.bind_body(&body);
     // Validate before sending so malformed requests fail synchronously and wake producers.
     let (frame, mode) = (|| {
         let parts = headers::request_parts(fields.clone())?;
@@ -233,7 +228,6 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'stati
         Ok(common::Response::Bytes(response))
     } else {
         let mut body = ArcWndBuf::new(frame::MAX_DATA_CHUNK);
-        rs.get_ref().bind_body(&body);
         let response: common::response::Response<Read, _> =
             ArcMessage::from(message.with_body(body.clone())).into();
         let body_error = response.message.body_error();

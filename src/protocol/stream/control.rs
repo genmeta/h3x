@@ -1,14 +1,15 @@
 //! Control stream state and frame I/O. Keep futures alive through partial I/O.
-use std::sync::Mutex;
-
-use qbase::varint::VarInt;
+use qbase::{
+    ArcReceiving,
+    sid::{Dir, StreamId},
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::bi::BiStreams;
 use crate::{
     Error, Result, Role, Transport,
     protocol::{
-        connection::{Settings, StreamCursor, close_connection, finish_connection},
+        connection::{Settings, StreamCursor},
         frame::{self, Frame, FrameType, H3Frame, Write as _},
         qpack::{self, Qpack},
     },
@@ -18,37 +19,43 @@ pub(crate) async fn send<T: Transport>(
     transport: &T,
     settings: &Settings,
     qpack: &Qpack<T>,
-    cursor: &Mutex<StreamCursor>,
+    cursor: &StreamCursor,
     bi: &BiStreams<T::Recv, T::Send>,
+    written: &ArcReceiving<Result<()>>,
 ) {
     let mut send = None;
     tokio::select! {
         biased;
         error = transport.terminated() => {
-            StreamCursor::complete_write(cursor, Err(error));
-            finish_connection(qpack, bi, error);
+            written.obtain(Err(error));
+            let error = qpack.close(error);
+            bi.close(error);
             return;
         },
         result = async {
-            send = Some(super::uni::open_stream(transport).await?);
+            send = Some(transport.open_uni_stream().await?
+                .ok_or(Error::H3_STREAM_CREATION_ERROR)?.1);
             let send = send.as_mut().unwrap();
             send.write_all(&[0]).await.map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
             write(send, &H3Frame::Settings(Frame::new(settings.local.clone())?)).await?;
-            let id = StreamCursor::local(cursor).await;
+            let id = cursor.local_goaway().await?;
             write(send, &H3Frame::Goaway(Frame::new(frame::Goaway {
-                id: VarInt::try_from(id).map_err(|_| Error::H3_ID_ERROR)?,
+                id: id.into(),
             })?)).await
         } => {
-            StreamCursor::complete_write(cursor, result);
+            written.obtain(result);
             if let Err(error) = result {
-                close_connection(transport, qpack, bi, error);
+                let error = qpack.close(error);
+                let _ = transport.close(error.to_string(), error.as_u64());
+                bi.close(error);
                 return;
             }
         },
     }
     // A completed GOAWAY does not finish this critical stream: retain it without FIN.
     let error = transport.terminated().await;
-    finish_connection(qpack, bi, error);
+    let error = qpack.close(error);
+    bi.close(error);
 }
 
 pub(crate) async fn receive_control<T: Transport>(
@@ -56,7 +63,7 @@ pub(crate) async fn receive_control<T: Transport>(
     transport: &T,
     settings: &Settings,
     qpack: &Qpack<T>,
-    cursor: &Mutex<StreamCursor>,
+    cursor: &StreamCursor,
     bi: &BiStreams<T::Recv, T::Send>,
 ) -> Result<()> {
     let H3Frame::Settings(frame) = read(recv, true).await? else {
@@ -66,25 +73,18 @@ pub(crate) async fn receive_control<T: Transport>(
     qpack.configure(peer, max_fields)?;
     *settings.peer.lock().unwrap() = Some(frame.payload);
     let mut max_push = None;
+    let mut peer_boundary = None;
     loop {
         let frame = read(recv, false).await?;
-        if apply(frame, transport.role(), qpack, cursor, bi, &mut max_push)? {
-            break;
-        }
-    }
-    let running = bi.running();
-    tokio::select! {
-        result = async {
-            loop {
-                let frame = read(recv, false).await?;
-                apply(frame, transport.role(), qpack, cursor, bi, &mut max_push)?;
-            }
-        } => result,
-        result = async {
-            StreamCursor::written(cursor).await?;
-            bi.drained(running).await;
-            transport.close(Error::H3_NO_ERROR.to_string(), Error::H3_NO_ERROR.as_u64())
-        } => result,
+        apply(
+            frame,
+            transport.role(),
+            qpack,
+            cursor,
+            bi,
+            &mut max_push,
+            &mut peer_boundary,
+        )?;
     }
 }
 
@@ -92,25 +92,24 @@ fn apply<T: Transport>(
     frame: H3Frame,
     role: Role,
     qpack: &Qpack<T>,
-    cursor: &Mutex<StreamCursor>,
+    cursor: &StreamCursor,
     bi: &BiStreams<T::Recv, T::Send>,
     max_push: &mut Option<u64>,
-) -> Result<bool> {
+    peer_boundary: &mut Option<StreamId>,
+) -> Result<()> {
     match frame {
         H3Frame::Goaway(frame) => {
-            let id = frame.payload.id.into_u64();
-            let (peer, local) = {
-                let mut state = cursor.lock().unwrap();
-                (state.receive(id)?, state.goaway()?)
-            };
-            if let Some(wake) = local {
-                wake.wake();
+            let id = StreamId::from(frame.payload.id);
+            if id.role() != role
+                || id.dir() != Dir::Bi
+                || peer_boundary.is_some_and(|previous| id > previous)
+            {
+                return Err(Error::H3_ID_ERROR);
             }
-            bi.goaway(id, qpack);
-            if let Some(wake) = peer {
-                wake.wake();
-            }
-            Ok(true)
+            *peer_boundary = Some(id);
+            bi.goaway(u64::from(id), qpack);
+            cursor.receive_goaway(id);
+            Ok(())
         }
         H3Frame::MaxPushId(frame) if role == Role::Server => {
             let id = frame.payload.push_id.into_u64();
@@ -118,7 +117,7 @@ fn apply<T: Transport>(
                 return Err(Error::H3_ID_ERROR);
             }
             *max_push = Some(id);
-            Ok(false)
+            Ok(())
         }
         H3Frame::CancelPush(_) if role == Role::Server => Err(Error::H3_ID_ERROR),
         _ => Err(Error::H3_FRAME_UNEXPECTED),

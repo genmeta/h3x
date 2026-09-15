@@ -9,12 +9,9 @@ use tokio::{
 use super::bi::BiStreams;
 use crate::{
     Error, Result, Transport,
-    protocol::{
-        connection::{close_connection, finish_connection},
-        qpack::{
-            Qpack,
-            instruction::{DecoderInstruction, EncoderInstruction},
-        },
+    protocol::qpack::{
+        Qpack,
+        instruction::{DecoderInstruction, EncoderInstruction},
     },
 };
 
@@ -54,61 +51,96 @@ impl<T: Transport> Qpack<T> {
     ) {
         // Keep the half alive until this task has handled its result.
         let mut send = None;
-        tokio::select! {
-            biased;
-            error = self.transport.terminated() => finish_connection(self, bi, error),
-            result = async {
-                send = Some(super::uni::open_stream(self.transport.as_ref()).await?);
-                let send = send.as_mut().unwrap();
-                send.write_all(&[2]).await.map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-                loop {
-                    let batch = receiver.recv().await.ok_or_else(|| {
-                        self.encoder.lock().unwrap().as_ref().err().copied()
-                            .unwrap_or(Error::H3_CLOSED_CRITICAL_STREAM)
-                    })?;
-                    for instruction in batch {
-                        self.encoder.lock().unwrap().as_mut().map_err(|error| *error)?
-                            .start_instruction();
-                        send.write_all(&instruction.encode()?).await
-                            .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-                        send.flush().await.map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-                        self.encoder.lock().unwrap().as_mut().map_err(|error| *error)?
-                            .finish_instruction(&instruction)?;
-                    }
+        let result: Result<()> = async {
+            send = Some(
+                self.transport
+                    .open_uni_stream()
+                    .await?
+                    .ok_or(Error::H3_STREAM_CREATION_ERROR)?
+                    .1,
+            );
+            let send = send.as_mut().unwrap();
+            send.write_all(&[2])
+                .await
+                .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+            loop {
+                let batch = receiver.recv().await.ok_or_else(|| {
+                    self.encoder
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .err()
+                        .copied()
+                        .unwrap_or(Error::H3_CLOSED_CRITICAL_STREAM)
+                })?;
+                for instruction in batch {
+                    self.encoder
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .map_err(|error| *error)?
+                        .start_instruction();
+                    send.write_all(&instruction.encode()?)
+                        .await
+                        .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+                    send.flush()
+                        .await
+                        .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+                    self.encoder
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .map_err(|error| *error)?
+                        .finish_instruction(&instruction)?;
                 }
-            } => {
-                let result: Result<()> = result;
-                if let Err(error) = result {
-                    close_connection(self.transport.as_ref(), self, bi, error);
-                }
-            },
+            }
+        }
+        .await;
+        if let Err(error) = result {
+            let error = self.close(error);
+            let _ = self.transport.close(error.to_string(), error.as_u64());
+            bi.close(error);
         }
     }
 
     pub(crate) async fn send_decoder(&self, bi: &BiStreams<T::Recv, T::Send>) {
         let mut send = None;
-        tokio::select! {
-            biased;
-            error = self.transport.terminated() => finish_connection(self, bi, error),
-            result = async {
-                send = Some(super::uni::open_stream(self.transport.as_ref()).await?);
-                let send = send.as_mut().unwrap();
-                send.write_all(&[3]).await.map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-                loop {
-                    let instruction = poll_fn(|cx| {
-                        self.decoder.lock().unwrap().as_mut().map_err(|error| *error)?
-                            .poll_instruction(cx).map(Ok::<_, Error>)
-                    }).await?;
-                    send.write_all(&instruction.encode()?).await
-                        .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-                    send.flush().await.map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-                }
-            } => {
-                let result: Result<()> = result;
-                if let Err(error) = result {
-                    close_connection(self.transport.as_ref(), self, bi, error);
-                }
-            },
+        let result: Result<()> = async {
+            send = Some(
+                self.transport
+                    .open_uni_stream()
+                    .await?
+                    .ok_or(Error::H3_STREAM_CREATION_ERROR)?
+                    .1,
+            );
+            let send = send.as_mut().unwrap();
+            send.write_all(&[3])
+                .await
+                .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+            loop {
+                let instruction = poll_fn(|cx| {
+                    self.decoder
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .map_err(|error| *error)?
+                        .poll_instruction(cx)
+                        .map(Ok::<_, Error>)
+                })
+                .await?;
+                send.write_all(&instruction.encode()?)
+                    .await
+                    .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+                send.flush()
+                    .await
+                    .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+            }
+        }
+        .await;
+        if let Err(error) = result {
+            let error = self.close(error);
+            let _ = self.transport.close(error.to_string(), error.as_u64());
+            bi.close(error);
         }
     }
 }

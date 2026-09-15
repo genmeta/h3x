@@ -8,9 +8,9 @@ use std::{
 use tokio::io::{AsyncRead, ReadBuf};
 
 use super::{StreamState, bi::BiStream};
+use crate::Error;
 #[cfg(test)]
 use crate::protocol::frame::Goaway;
-use crate::{ArcWndBuf, Error};
 
 /// Read handle for a stream owned by the connection.
 /// `W` is the paired transport writer; standalone readers use `()`.
@@ -25,7 +25,6 @@ impl<R> H3ReadStream<R> {
                 stream_id,
                 StreamState::Idle(stream),
                 StreamState::Closed(Error::H3_NO_ERROR),
-                None,
             )),
         }
     }
@@ -34,10 +33,6 @@ impl<R> H3ReadStream<R> {
 impl<R, W> H3ReadStream<R, W> {
     pub fn stream_id(&self) -> u64 {
         self.stream.id
-    }
-
-    pub(crate) fn bind_body(&self, body: &ArcWndBuf) {
-        self.stream.read_body(body);
     }
 }
 
@@ -63,7 +58,7 @@ impl<R: AsyncRead + Unpin, W> AsyncRead for H3ReadStream<R, W> {
         let terminal = state.is_terminal();
         drop(state);
         if terminal {
-            self.stream.notify_read();
+            self.stream.notify_if_finished();
         }
         result
     }

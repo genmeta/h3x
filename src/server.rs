@@ -31,8 +31,7 @@ pub type Response<B = Bytes> = crate::common::response::Response<Write, B>;
 ///
 /// `request_method` must be the original request's method so HEAD responses can
 /// preserve `Content-Length` without sending a body.
-/// Streaming bodies bind before the returned future is polled, so dropping that
-/// future also cancels unfinished body operations.
+/// Applications finish or reset streaming bodies explicitly.
 pub fn respond<WS, R, SR, T: Transport>(
     response: R,
     send: H3WriteStream<WS, SR>,
@@ -44,10 +43,7 @@ where
     R: Into<common::Response<Write>>,
 {
     let response = response.into();
-    if let common::Response::Streaming(response) = &response {
-        let body = response.message.0.lock().unwrap().body_stream();
-        send.bind_body(&body);
-    }
+
     async move {
         match response {
             common::Response::Bytes(response) => {
@@ -127,7 +123,6 @@ pub async fn accept<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'static, 
         Ok(common::Request::Bytes(request))
     } else {
         let mut body = ArcWndBuf::new(frame::MAX_DATA_CHUNK);
-        rs.get_ref().bind_body(&body);
         let request: common::request::Request<Read, _> =
             ArcMessage::from(message.with_body(body.clone())).into();
         let body_error = request.message.body_error();
@@ -217,7 +212,6 @@ fn write_streaming_response<WS: AsyncWrite + Unpin, SR, T: Transport>(
         let message = response.message.0.lock().unwrap();
         (message.fields(), message.body_stream())
     };
-    ws.bind_body(&body);
     let body_error = response.message.body_error();
     let stopped = ws.stopped();
     let request_method = request_method.clone();

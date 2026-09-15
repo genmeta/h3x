@@ -155,9 +155,11 @@ pub trait WriteBody {
 pub trait WriteStream: Sized {
     async fn write<T: AsRef<[u8]> + Send>(&mut self, chunk: T) -> Result<usize>;
 
+    /// Close the producer. Buffered bytes remain readable and the send task
+    /// drains them before sending FIN; this does not wait for transport shutdown.
     async fn finish(&mut self) -> Result<()>;
 
-    /// Cancel the remaining body writes and release the application handle.
+    /// Cancel the body, discard buffered bytes, and wake pending operations.
     async fn reset(self) -> Result<()>;
 }
 
@@ -204,7 +206,7 @@ pub trait ReadStream: Sized {
 
     async fn read_all(&mut self, buf: &mut [u8]) -> Result<usize>;
 
-    /// Stop receiving the body and release the application handle.
+    /// Stop receiving, discard buffered bytes, and wake pending operations.
     async fn stop(self);
 }
 

@@ -1,5 +1,6 @@
 use std::future::Future;
 
+pub use qbase::role::Role;
 use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -37,11 +38,4 @@ pub trait Transport: Send + Sync + 'static {
     fn close(&self, reason: String, code: u64) -> Result<()>;
 
     fn terminated(&self) -> impl Future<Output = Error> + Send;
-}
-
-/// The local QUIC endpoint role, fixed for the lifetime of a connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Role {
-    Client,
-    Server,
 }

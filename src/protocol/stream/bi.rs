@@ -1,18 +1,17 @@
 //! Connection ownership and GOAWAY dispatch for bidirectional streams.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     mem,
     sync::{Arc, Mutex},
 };
 
-use qbase::varint::VarInt;
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
+use qbase::{ArcReceiving, varint::VarInt};
+use tokio::sync::Notify;
 
 use super::{H3ReadStream, H3WriteStream, StreamState};
 use crate::{
-    ArcWndBuf, Error, Result, Transport,
+    Error, Result, Transport,
     protocol::{frame::Goaway, qpack::Qpack},
-    wnd_buf::WeakWndBuf,
 };
 
 /// The connection and both application handles refer to this same stream.
@@ -20,36 +19,18 @@ pub(crate) struct BiStream<R, W> {
     pub(super) id: u64,
     pub(super) recv: Mutex<StreamState<R>>,
     pub(super) send: Mutex<StreamState<W>>,
-    // Lock the corresponding stream state before accessing its body binding.
-    recv_body: Mutex<Option<WeakWndBuf>>,
-    send_body: Mutex<Option<WeakWndBuf>>,
-    // Both halves notify the existing request-drain waiter when they finish.
-    finished: Option<Arc<Notify>>,
+    // One completion signal for the connection's request-drain consumer.
+    finished: ArcReceiving<()>,
 }
 
 impl<R, W> BiStream<R, W> {
-    pub(super) fn new(
-        id: u64,
-        recv: StreamState<R>,
-        send: StreamState<W>,
-        finished: Option<Arc<Notify>>,
-    ) -> Self {
+    pub(super) fn new(id: u64, recv: StreamState<R>, send: StreamState<W>) -> Self {
         Self {
             id,
             recv: Mutex::new(recv),
             send: Mutex::new(send),
-            recv_body: Mutex::new(None),
-            send_body: Mutex::new(None),
-            finished,
+            finished: ArcReceiving::default(),
         }
-    }
-
-    pub(super) fn read_body(&self, body: &ArcWndBuf) {
-        bind_body(&self.recv, &self.recv_body, body);
-    }
-
-    pub(super) fn write_body(&self, body: &ArcWndBuf) {
-        bind_body(&self.send, &self.send_body, body);
     }
 
     pub(super) fn terminate_read(&self, terminal: StreamState<R>) {
@@ -57,7 +38,7 @@ impl<R, W> BiStream<R, W> {
             let mut state = self.recv.lock().unwrap();
             state.terminate(terminal)
         };
-        self.notify_read();
+        self.notify_if_finished();
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -68,42 +49,15 @@ impl<R, W> BiStream<R, W> {
             let mut state = self.send.lock().unwrap();
             state.terminate(terminal)
         };
-        self.notify_write();
+        self.notify_if_finished();
         if let Some(waker) = waker {
             waker.wake();
         }
     }
 
-    pub(super) fn notify_read(&self) {
-        let (result, body) = {
-            let state = self.recv.lock().unwrap();
-            let Some(result) = state.result() else {
-                return;
-            };
-            (result, self.recv_body.lock().unwrap().take())
-        };
-        notify_body(result, body);
-        self.notify_if_finished();
-    }
-
-    pub(super) fn notify_write(&self) {
-        let (result, body) = {
-            let state = self.send.lock().unwrap();
-            let Some(result) = state.result() else {
-                return;
-            };
-            (result, self.send_body.lock().unwrap().take())
-        };
-        notify_body(result, body);
-        self.notify_if_finished();
-    }
-
     pub(super) fn notify_if_finished(&self) {
-        if let Some(finished) = &self.finished
-            && self.recv.lock().unwrap().is_terminal()
-            && self.send.lock().unwrap().is_terminal()
-        {
-            finished.notify_waiters();
+        if self.recv.lock().unwrap().is_terminal() && self.send.lock().unwrap().is_terminal() {
+            self.finished.obtain(());
         }
     }
 
@@ -118,101 +72,77 @@ impl<R, W> BiStream<R, W> {
     }
 }
 
-fn bind_body<T>(
-    state: &Mutex<StreamState<T>>,
-    binding: &Mutex<Option<WeakWndBuf>>,
-    body: &ArcWndBuf,
-) {
-    let result = {
-        let state = state.lock().unwrap();
-        match state.result() {
-            Some(result) => Some(result),
-            None => {
-                let weak = body.downgrade();
-                let mut binding = binding.lock().unwrap();
-                assert!(
-                    binding.as_ref().is_none_or(|bound| bound.ptr_eq(&weak)),
-                    "a stream direction can only bind one body"
-                );
-                *binding = Some(weak);
-                None
-            }
-        }
-    };
-    // set_error wakes body tasks, which may immediately access the stream again.
-    if let Some(Err(error)) = result {
-        body.set_error(error);
-    }
-}
-
-fn notify_body(result: Result<()>, body: Option<WeakWndBuf>) {
-    if let (Err(error), Some(body)) = (result, body)
-        && let Some(body) = ArcWndBuf::upgrade(&body)
-    {
-        body.set_error(error);
-    }
-}
-
 pub(crate) type Halves<R, W> = (H3WriteStream<W, R>, H3ReadStream<R, W>);
 
 struct Incoming<R, W> {
-    receiver: Option<mpsc::UnboundedReceiver<Result<Halves<R, W>>>>,
-    error: Error,
+    pending: VecDeque<Halves<R, W>>,
+    error: Option<Error>,
 }
 
 pub(crate) struct BiStreams<R, W> {
     streams: Mutex<HashMap<u64, Arc<BiStream<R, W>>>>,
-    stream_finished: Arc<Notify>,
-    incoming: AsyncMutex<Incoming<R, W>>,
+    incoming: Mutex<Incoming<R, W>>,
+    incoming_changed: Notify,
 }
 
 impl<R, W> Default for BiStreams<R, W> {
     fn default() -> Self {
-        Self::new().0
+        Self::new()
     }
 }
 
 impl<R, W> BiStreams<R, W> {
-    pub(crate) fn new() -> (Self, mpsc::UnboundedSender<Result<Halves<R, W>>>) {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        (
-            Self {
-                streams: Mutex::new(HashMap::new()),
-                stream_finished: Arc::new(Notify::new()),
-                incoming: AsyncMutex::new(Incoming {
-                    receiver: Some(receiver),
-                    error: Error::H3_REQUEST_CANCELLED,
-                }),
-            },
-            sender,
-        )
-    }
-
-    pub(crate) async fn accept(&self) -> Result<Halves<R, W>> {
-        let mut incoming = self.incoming.lock().await;
-        let result = match incoming.receiver.as_mut() {
-            Some(receiver) => receiver.recv().await,
-            None => None,
-        };
-        match result {
-            Some(Ok(stream)) => Ok(stream),
-            Some(Err(error)) => {
-                incoming.error = error;
-                Err(error)
-            }
-            None => Err(incoming.error),
+    pub(crate) fn new() -> Self {
+        Self {
+            streams: Mutex::new(HashMap::new()),
+            incoming: Mutex::new(Incoming {
+                pending: VecDeque::new(),
+                error: None,
+            }),
+            incoming_changed: Notify::new(),
         }
     }
 
+    pub(crate) async fn accept(&self) -> Result<Halves<R, W>> {
+        loop {
+            let changed = self.incoming_changed.notified();
+            {
+                let mut incoming = self.incoming.lock().unwrap();
+                if let Some(stream) = incoming.pending.pop_front() {
+                    return Ok(stream);
+                }
+                if let Some(error) = incoming.error {
+                    return Err(error);
+                }
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) fn insert_incoming(&self, id: u64, recv: R, send: W) -> Result<()> {
+        let mut incoming = self.incoming.lock().unwrap();
+        if let Some(error) = incoming.error {
+            return Err(error);
+        }
+        incoming.pending.push_back(self.insert(id, recv, send)?);
+        drop(incoming);
+        self.incoming_changed.notify_waiters();
+        Ok(())
+    }
+
+    pub(crate) fn close_incoming(&self, error: Error) {
+        self.incoming.lock().unwrap().error.get_or_insert(error);
+        self.incoming_changed.notify_waiters();
+    }
+
     pub(crate) fn release_incoming(&self) {
-        // An accept call borrows H3Connection, so it cannot overlap its Drop.
-        let receiver = self
-            .incoming
-            .try_lock()
-            .expect("connection has no accept borrower")
-            .receiver
-            .take();
-        drop(receiver);
+        let pending = {
+            let mut incoming = self.incoming.lock().unwrap();
+            incoming.error.get_or_insert(Error::H3_REQUEST_CANCELLED);
+            mem::take(&mut incoming.pending)
+        };
+        self.incoming_changed.notify_waiters();
+        drop(pending);
     }
 
     pub(crate) fn running(&self) -> Vec<Arc<BiStream<R, W>>> {
@@ -220,20 +150,16 @@ impl<R, W> BiStreams<R, W> {
     }
 
     /// Wait for the fixed set admitted when peer GOAWAY arrived.
+    /// The connection has one drain consumer; completion is not a broadcast.
     pub(crate) async fn drained(&self, running: Vec<Arc<BiStream<R, W>>>) {
-        loop {
-            let finished = self.stream_finished.notified();
-            tokio::pin!(finished);
-            finished.as_mut().enable();
-            if running.iter().all(|stream| {
-                stream.recv.lock().unwrap().is_terminal()
-                    && stream.send.lock().unwrap().is_terminal()
-            }) {
-                self.cleanup();
-                return;
-            }
-            finished.await;
+        for stream in running {
+            stream
+                .finished
+                .clone()
+                .await
+                .expect("stream completion is never cancelled");
         }
+        self.cleanup();
     }
 
     // Idle connections retain finished entries until the next insert or GOAWAY.
@@ -264,6 +190,7 @@ impl<R, W> BiStreams<R, W> {
     }
 
     pub(crate) fn close(&self, error: Error) {
+        self.close_incoming(error);
         let streams = mem::take(&mut *self.streams.lock().unwrap());
         for stream in streams.into_values() {
             stream.close(error);
@@ -282,7 +209,6 @@ impl<R, W> BiStreams<R, W> {
             id,
             StreamState::Idle(recv),
             StreamState::Idle(send),
-            Some(Arc::clone(&self.stream_finished)),
         ));
         streams.insert(id, Arc::clone(&stream));
         drop(streams);
@@ -315,6 +241,123 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::*;
+
+    #[tokio::test]
+    async fn incoming_streams_are_fifo_and_terminal_error_persists() {
+        let streams = BiStreams::new();
+        for id in [0, 4] {
+            streams
+                .insert_incoming(id, tokio::io::empty(), tokio::io::sink())
+                .unwrap();
+        }
+        streams.close_incoming(Error::H3_NO_ERROR);
+        for id in [0, 4] {
+            let (send, _) = streams.accept().await.unwrap();
+            assert_eq!(send.stream.id, id);
+        }
+        for _ in 0..2 {
+            assert!(matches!(streams.accept().await, Err(Error::H3_NO_ERROR)));
+        }
+        assert_eq!(
+            streams.insert_incoming(8, tokio::io::empty(), tokio::io::sink()),
+            Err(Error::H3_NO_ERROR)
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_close_wakes_all_waiters_and_release_drops_queued_streams() {
+        let streams = Arc::new(BiStreams::<tokio::io::Empty, tokio::io::Sink>::new());
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let streams = streams.clone();
+            tasks.push(tokio::spawn(async move {
+                assert!(matches!(
+                    streams.accept().await,
+                    Err(Error::H3_INTERNAL_ERROR)
+                ));
+            }));
+        }
+        tokio::task::yield_now().await;
+        streams.close(Error::H3_INTERNAL_ERROR);
+        for task in tasks {
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        let streams = BiStreams::new();
+        streams
+            .insert_incoming(0, tokio::io::empty(), tokio::io::sink())
+            .unwrap();
+        streams.release_incoming();
+        streams.cleanup();
+        assert_eq!(streams.len(), 0);
+        assert!(matches!(
+            streams.accept().await,
+            Err(Error::H3_REQUEST_CANCELLED)
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_both_halves_and_remembers_early_completion() {
+        use std::future::Future;
+
+        for early in [false, true] {
+            for read_first in [false, true] {
+                let streams = BiStreams::new();
+                let (mut send, mut recv) = streams
+                    .insert(0, tokio::io::empty(), tokio::io::sink())
+                    .unwrap();
+                let running = streams.running();
+                let mut draining = Box::pin(streams.drained(running));
+                let mut cx = Context::from_waker(Waker::noop());
+                if !early {
+                    assert!(draining.as_mut().poll(&mut cx).is_pending());
+                }
+                if read_first {
+                    assert_eq!(recv.read(&mut [0]).await.unwrap(), 0);
+                } else {
+                    send.shutdown().await.unwrap();
+                }
+                if !early {
+                    assert!(draining.as_mut().poll(&mut cx).is_pending());
+                }
+                if read_first {
+                    send.shutdown().await.unwrap();
+                } else {
+                    assert_eq!(recv.read(&mut [0]).await.unwrap(), 0);
+                }
+                // Repeated terminal notifications must not overwrite completion.
+                drop(send);
+                drop(recv);
+                tokio::time::timeout(std::time::Duration::from_secs(1), draining)
+                    .await
+                    .unwrap();
+                assert_eq!(streams.len(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn close_wakes_a_pending_drain() {
+        let streams = Arc::new(BiStreams::new());
+        let (_send, _recv) = streams
+            .insert(0, tokio::io::empty(), tokio::io::sink())
+            .unwrap();
+        let running = streams.running();
+        let draining = tokio::spawn({
+            let streams = streams.clone();
+            async move { streams.drained(running).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!draining.is_finished());
+        streams.close(Error::H3_INTERNAL_ERROR);
+        tokio::time::timeout(std::time::Duration::from_secs(1), draining)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     struct FailingShutdown(bool);
 
