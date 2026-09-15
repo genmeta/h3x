@@ -1,4 +1,5 @@
 use std::{
+    future::poll_fn,
     io,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -118,20 +119,6 @@ pub struct ArcWndBuf {
     shared: Arc<Mutex<crate::Result<WndBuf>>>,
 }
 
-impl Drop for ArcWndBuf {
-    fn drop(&mut self) {
-        // A pump may be waiting on network I/O when the application's body drops.
-        // Wake it to recheck its weak owner; dropping a clone does not cancel I/O.
-        let waker = match &mut *self.shared.lock().unwrap() {
-            Ok(window) => window.error_waker.take(),
-            Err(_) => None,
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-}
-
 impl ArcWndBuf {
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -164,16 +151,16 @@ impl ArcWndBuf {
         }
     }
 
-    // Observe the producer's FIN and register the pump for errors or ownership changes.
-    // The observer has its own waker, independent of the buffer's reader and writer.
-    pub(crate) fn poll_finished(&self, cx: &Context<'_>) -> crate::Result<bool> {
-        match &mut *self.shared.lock().unwrap() {
+    /// Observe explicit reset/stop or I/O failure even while a pump waits on the network.
+    pub(crate) async fn error(&self) -> crate::Error {
+        poll_fn(|cx| match &mut *self.shared.lock().unwrap() {
             Ok(window) => {
                 window.error_waker = Some(cx.waker().clone());
-                Ok(window.fin)
+                Poll::Pending
             }
-            Err(error) => Err(*error),
-        }
+            Err(error) => Poll::Ready(*error),
+        })
+        .await
     }
 
     fn poll_io<T>(

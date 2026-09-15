@@ -57,3 +57,39 @@ fn request_frames(body: &[u8], length: Option<&'static str>) -> Vec<u8> {
     }
     encoded
 }
+
+use super::read_request as accept;
+use crate::common::message::ArcMessage;
+/// Send one response on the accepted request's matching send stream.
+///
+/// For streaming responses, retain a producer clone until it finishes or resets
+/// the body. Dropping the last unfinished producer cancels sending.
+///
+/// `request_method` must be the original request's method so HEAD responses can
+/// preserve `Content-Length` without sending a body.
+/// Applications finish or reset streaming bodies explicitly.
+fn respond<WS, R, T: Transport>(
+    response: R,
+    send: H3WriteStream<WS>,
+    qpack: Arc<Qpack<T>>,
+    request_method: &Method,
+) -> impl Future<Output = Result<()>>
+where
+    WS: AsyncWrite + Unpin,
+    R: Into<common::Response<Write>>,
+{
+    let response = response.into();
+
+    async move {
+        match response {
+            common::Response::Bytes(response) => {
+                send_bytes_response(&response, send, &qpack, request_method).await
+            }
+            common::Response::Streaming(response) => {
+                let sending = prepare_streaming_response(&response, send, qpack, request_method);
+                drop(response);
+                sending.await
+            }
+        }
+    }
+}

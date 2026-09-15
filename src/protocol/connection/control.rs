@@ -4,7 +4,7 @@ use tokio::io::AsyncWriteExt;
 
 use super::H3Connection;
 use crate::{
-    Error, Result, Role, Transport,
+    Error, Result, Transport,
     protocol::{
         frame::{self, Control, Frame, StreamType, WriteControl as _, be_control},
         qpack,
@@ -72,7 +72,7 @@ impl<T: Transport> H3Connection<T> {
 }
 
 impl<T: Transport> H3Connection<T> {
-    pub(super) async fn run_control(self) {
+    pub(super) async fn send_uni(self) {
         let mut send = match self.transport.open_uni().await {
             Ok(Some((_, send))) => send,
             Ok(None) => {
@@ -132,44 +132,33 @@ impl<T: Transport> H3Connection<T> {
     }
 
     async fn receive_control(&self, recv: &mut T::StreamReader) -> Result<()> {
-        let Control::Settings(frame) = be_control(recv).await.map_err(|error| {
-            if error == Error::H3_FRAME_UNEXPECTED {
-                Error::H3_MISSING_SETTINGS
-            } else {
-                error
-            }
-        })?
-        else {
-            return Err(Error::H3_MISSING_SETTINGS);
+        let settings = match be_control(recv).await {
+            Ok(Control::Settings(frame)) => frame.payload,
+            Err(error) if error != Error::H3_FRAME_UNEXPECTED => return Err(error),
+            _ => return Err(Error::H3_MISSING_SETTINGS),
         };
-        let (peer, max_fields) = qpack::limits(&frame.payload);
+        let (peer, max_fields) = qpack::limits(&settings);
         self.qpack.configure(peer, max_fields)?;
-        *self.settings.peer.lock().unwrap() = Some(frame.payload);
-        let mut max_push = None;
-        let mut peer_boundary = None;
+        *self.settings.peer.lock().unwrap() = Some(settings);
+
+        let role = self.transport.role();
+        let mut last_goaway_id = None;
         loop {
-            let frame = be_control(recv).await?;
-            match frame {
+            match be_control(recv).await? {
                 Control::Goaway(frame) => {
                     let id = StreamId::from(frame.payload.id);
-                    if id.role() != self.transport.role()
+                    if id.role() != role
                         || id.dir() != Dir::Bi
-                        || peer_boundary.is_some_and(|previous| id > previous)
+                        || last_goaway_id.is_some_and(|previous| id > previous)
                     {
                         return Err(Error::H3_ID_ERROR);
                     }
-                    peer_boundary = Some(id);
+                    last_goaway_id = Some(id);
                     self.bi_streams.goaway(u64::from(id), &self.qpack);
                     self.cursor.receive_goaway(id);
                 }
-                Control::MaxPushId(frame) if self.transport.role() == Role::Server => {
-                    let id = frame.payload.push_id.into_u64();
-                    if max_push.is_some_and(|previous| id < previous) {
-                        return Err(Error::H3_ID_ERROR);
-                    }
-                    max_push = Some(id);
-                }
-                Control::CancelPush(_) if self.transport.role() == Role::Server => {
+                // Server push is not supported.
+                Control::MaxPushId(_) | Control::CancelPush(_) => {
                     return Err(Error::H3_ID_ERROR);
                 }
                 Control::Unknown { length, .. } => {

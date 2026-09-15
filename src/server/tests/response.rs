@@ -4,7 +4,7 @@ async fn write_bytes_response<W: AsyncWrite + Unpin>(
     response: &Response<Bytes>,
     send: W,
 ) -> Result<()> {
-    super::write_bytes_response(
+    super::send_bytes_response(
         response,
         H3WriteStream::new(0, send),
         &crate::protocol::qpack::tests::shared(),
@@ -17,7 +17,7 @@ async fn write_streaming_response<W: AsyncWrite + Unpin>(
     response: &Response<ArcWndBuf>,
     send: W,
 ) -> Result<()> {
-    super::write_streaming_response(
+    super::prepare_streaming_response(
         response,
         H3WriteStream::new(0, send),
         crate::protocol::qpack::tests::shared(),
@@ -145,7 +145,8 @@ async fn writes_buffered_and_streaming_response_frames() {
     assert_eq!(frame.length.into_u64(), 5);
     assert_eq!(input, b"hello");
 
-    let message = Message::<Bytes>::default().with_body(ArcWndBuf::new(2));
+    let message =
+        Message::<Bytes>::default().with_body(crate::Body::from_storage(ArcWndBuf::new(2)));
     let mut response = Response::from(ArcMessage::from(message));
     response.set_status(StatusCode::OK);
     let mut producer = Response::from(response.message.clone());
@@ -185,7 +186,8 @@ async fn writes_buffered_and_streaming_response_frames() {
     );
     assert!(output.is_empty());
 
-    let message = Message::<Bytes>::default().with_body(ArcWndBuf::new(1));
+    let message =
+        Message::<Bytes>::default().with_body(crate::Body::from_storage(ArcWndBuf::new(1)));
     let mut response = Response::from(ArcMessage::from(message));
     response.set_status(StatusCode::OK);
     let mut producer = Response::from(response.message.clone());

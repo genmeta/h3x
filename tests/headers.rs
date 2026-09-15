@@ -87,18 +87,30 @@ async fn ordinary_headers_round_trip() {
                         )
                         .header(header::CONTENT_LENGTH, HeaderValue::from_static("5"))
                         .body(Bytes::from_static(b"hello"));
-                        client::request(request, recv, send, qpack).await
+                        {
+                            let (sending, receiving) =
+                                client::write_bytes_request(request, send, recv, qpack)?;
+                            let (sent, received) = tokio::join!(sending, receiving);
+                            sent?;
+                            received
+                        }
                     } else {
                         let mut request = request_headers(
                             client::Request::streaming_post("https://example.com/headers").unwrap(),
                         );
                         request.write(b"hello").await?;
                         request.finish().await?;
-                        client::request(request, recv, send, qpack).await
+                        {
+                            let (sending, receiving) =
+                                client::write_streaming_request(request, send, recv, qpack)?;
+                            let (sent, received) = tokio::join!(sending, receiving);
+                            sent?;
+                            received
+                        }
                     }
                 },
                 async {
-                    let request = server::accept(
+                    let request = server::read_request(
                         H3ReadStream::new(0, server_recv),
                         connection.qpack().clone(),
                     )
@@ -142,7 +154,7 @@ async fn ordinary_headers_round_trip() {
                             .append_header(header::SET_COOKIE, second_cookie)
                             .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"))
                             .set_body(Bytes::from_static(b"world"));
-                        server::respond(response, send, qpack, &method).await
+                        server::write_bytes_response(response, send, qpack, &method).await
                     } else {
                         let mut response = response.streaming(5);
                         response
@@ -153,7 +165,7 @@ async fn ordinary_headers_round_trip() {
                             .append_header(header::SET_COOKIE, second_cookie);
                         response.write(b"world").await?;
                         response.finish().await?;
-                        server::respond(response, send, qpack, &method).await
+                        server::write_streaming_response(response, send, qpack, &method).await
                     }
                 }
             );

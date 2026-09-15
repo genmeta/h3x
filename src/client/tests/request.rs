@@ -4,7 +4,7 @@ async fn write_bytes_request<W: AsyncWrite + Unpin + Send + 'static>(
     request: &Request<Bytes>,
     send: W,
 ) -> Result<()> {
-    super::write_bytes_request(
+    super::send_bytes_request(
         request,
         H3WriteStream::new(0, send),
         crate::protocol::qpack::tests::shared(),
@@ -16,7 +16,7 @@ async fn write_streaming_request<W: AsyncWrite + Unpin + Send + 'static>(
     request: &Request<ArcWndBuf>,
     send: W,
 ) -> Result<()> {
-    super::write_streaming_request(
+    super::send_streaming_request(
         request,
         H3WriteStream::new(0, send),
         crate::protocol::qpack::tests::shared(),
@@ -104,7 +104,9 @@ async fn streaming_request_frames_and_errors() {
         if let Some(length) = length {
             message.set_header(header::CONTENT_LENGTH, length.parse().unwrap());
         }
-        let req = Request::from(ArcMessage::from(message.with_body(ArcWndBuf::new(2))));
+        let req = Request::from(ArcMessage::from(
+            message.with_body(crate::Body::from_storage(ArcWndBuf::new(2))),
+        ));
         let mut producer = Request::from(req.message.clone());
         let (writer, mut reader) = duplex(3);
         let (sent, produced, received) = tokio::join!(
@@ -154,7 +156,7 @@ async fn streaming_request_frames_and_errors() {
     let req = Request::from(ArcMessage::from(
         Message::<Bytes>::post("https://example.com/")
             .unwrap()
-            .with_body(ArcWndBuf::new(1)),
+            .with_body(crate::Body::from_storage(ArcWndBuf::new(1))),
     ));
     let mut producer = Request::from(req.message.clone());
     let (writer, reader) = duplex(1);

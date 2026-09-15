@@ -5,9 +5,60 @@ use crate::{
     common::message::{ReadRequest, ReadResponse, WriteRequest, WriteResponse},
 };
 
+pub(crate) mod body;
 pub mod message;
 pub(crate) mod request;
 pub(crate) mod response;
+pub mod wnd_buf;
+
+/// Body storage and direction are independent: IO is Read or Write.
+pub enum Body<IO> {
+    Bytes(body::Body<Bytes, IO>),
+    Streaming(body::Body<ArcWndBuf, IO>),
+}
+
+impl Clone for Body<Write> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Bytes(body) => Self::Bytes(body.clone()),
+            Self::Streaming(body) => Self::Streaming(body.clone()),
+        }
+    }
+}
+
+impl<IO> From<body::Body<Bytes, IO>> for Body<IO> {
+    fn from(body: body::Body<Bytes, IO>) -> Self {
+        Self::Bytes(body)
+    }
+}
+
+impl<IO> From<body::Body<ArcWndBuf, IO>> for Body<IO> {
+    fn from(body: body::Body<ArcWndBuf, IO>) -> Self {
+        Self::Streaming(body)
+    }
+}
+
+impl Body<Read> {
+    pub async fn read(&mut self, bytes: &mut [u8]) -> crate::Result<usize> {
+        match self {
+            Self::Bytes(body) => body.read(bytes).await,
+            Self::Streaming(body) => body.read(bytes).await,
+        }
+    }
+
+    pub async fn stop(self) {
+        if let Self::Streaming(body) = self {
+            body.stop().await;
+        }
+    }
+
+    pub async fn collect(self) -> crate::Result<Bytes> {
+        match self {
+            Self::Bytes(body) => body.collect().await,
+            Self::Streaming(body) => body.collect().await,
+        }
+    }
+}
 
 pub enum Read {}
 pub enum Write {}
@@ -155,6 +206,24 @@ impl<IO> From<response::Response<IO, ArcWndBuf>> for Response<IO> {
     }
 }
 
+impl<IO> Request<IO> {
+    pub fn into_body(self) -> Body<IO> {
+        match self {
+            Self::Bytes(message) => Body::Bytes(message.into_body()),
+            Self::Streaming(message) => Body::Streaming(message.into_body()),
+        }
+    }
+}
+
+impl<IO> Response<IO> {
+    pub fn into_body(self) -> Body<IO> {
+        match self {
+            Self::Bytes(message) => Body::Bytes(message.into_body()),
+            Self::Streaming(message) => Body::Streaming(message.into_body()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use http::{HeaderValue, Method, StatusCode, header};
@@ -183,9 +252,14 @@ mod tests {
             let Request::Bytes(request) = request else {
                 panic!("expected buffered request")
             };
-            let incoming: Request<Read> = request::Request::from(request.message.clone()).into();
-            let streaming: Request<Write> =
-                request::Request::from(request.message.with_body(ArcWndBuf::new(1))).into();
+            let incoming: Request<Read> =
+                request::Request::from(request.message.test_direction()).into();
+            let streaming: Request<Write> = request::Request::from(
+                request
+                    .message
+                    .with_body(body::Body::<ArcWndBuf, Write>::new(1)),
+            )
+            .into();
             let Request::Streaming(streaming) =
                 streaming.header(header::CONTENT_TYPE, HeaderValue::from_static("text/html"))
             else {
@@ -201,7 +275,10 @@ mod tests {
                     .unwrap(),
                 "text/html"
             );
-            for incoming in [incoming, request::Request::from(streaming.message).into()] {
+            for incoming in [
+                incoming,
+                request::Request::from(streaming.message.test_direction()).into(),
+            ] {
                 assert_eq!(incoming.method(), method);
                 assert_eq!(incoming.authority(), "example.com:443");
                 assert_eq!(
@@ -247,8 +324,12 @@ mod tests {
                 .set_header(header::SET_COOKIE, HeaderValue::from_static("a=1"))
                 .append_header(header::SET_COOKIE, HeaderValue::from_static("b=2"));
             let incoming: Response<Read> = match response {
-                Response::Bytes(response) => response::Response::from(response.message).into(),
-                Response::Streaming(response) => response::Response::from(response.message).into(),
+                Response::Bytes(response) => {
+                    response::Response::from(response.message.test_direction()).into()
+                }
+                Response::Streaming(response) => {
+                    response::Response::from(response.message.test_direction()).into()
+                }
             };
             assert_eq!(incoming.status(), StatusCode::ACCEPTED);
             assert_eq!(

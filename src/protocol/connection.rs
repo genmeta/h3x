@@ -42,7 +42,7 @@ impl<T: Transport> H3Connection<T> {
             cursor,
             bi_streams: bi,
         };
-        tokio::spawn(connection.clone().run_control());
+        tokio::spawn(connection.clone().send_uni());
         tokio::spawn(connection.clone().accept_uni());
         Ok(connection)
     }

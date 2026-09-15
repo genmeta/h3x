@@ -29,10 +29,10 @@ fn response_headers() -> Vec<u8> {
 async fn reset_wakes_a_blocked_producer_after_upload_is_dropped() {
     let message = Message::<Bytes>::post("https://example.com/upload")
         .unwrap()
-        .with_body(ArcWndBuf::new(1));
+        .with_body(crate::Body::from_storage(ArcWndBuf::new(1)));
     let mut producer = Request::from(ArcMessage::from(message));
     producer.write(b"x").await.unwrap();
-    let sending = write_streaming_request(
+    let sending = send_streaming_request(
         &producer,
         H3WriteStream::new(0, tokio::io::sink()),
         crate::protocol::qpack::tests::shared(),
@@ -59,7 +59,7 @@ async fn reset_wakes_a_blocked_producer_after_upload_is_dropped() {
 async fn reset_wakes_a_blocked_producer_after_request_is_dropped() {
     let message = Message::<Bytes>::post("https://example.com/upload")
         .unwrap()
-        .with_body(ArcWndBuf::new(1));
+        .with_body(crate::Body::from_storage(ArcWndBuf::new(1)));
     let mut producer = Request::from(ArcMessage::from(message));
     producer.write(b"x").await.unwrap();
     let waiting = request(
@@ -263,7 +263,7 @@ async fn producer_fin_does_not_complete_transport_shutdown() {
         producer.finish().await.unwrap();
         let polled = Arc::new(AtomicBool::new(false));
         let mut sending = Box::pin(
-            write_streaming_request(
+            send_streaming_request(
                 &producer,
                 H3WriteStream::new(
                     0,
@@ -341,13 +341,13 @@ async fn write_failure_after_idle_body_preserves_the_response() {
 }
 
 #[tokio::test]
-async fn last_unfinished_producer_stops_an_upload_waiting_on_network() {
+async fn explicit_reset_stops_an_upload_waiting_on_network() {
     timeout(Duration::from_secs(5), async {
         let request = Request::streaming_post("https://example.com/upload").unwrap();
         let mut body = request.message.0.lock().unwrap().body_stream();
         let (send, mut recv) = tokio::io::duplex(1);
         let sending = tokio::spawn(
-            write_streaming_request(
+            send_streaming_request(
                 &request,
                 H3WriteStream::new(0, send),
                 crate::protocol::qpack::tests::shared(),
@@ -359,7 +359,7 @@ async fn last_unfinished_producer_stops_an_upload_waiting_on_network() {
         tokio::task::yield_now().await;
         body.flush().await.unwrap();
 
-        drop(request);
+        request.reset().await.unwrap();
         assert_eq!(
             Error::from(body.read(&mut [0]).await.unwrap_err()),
             Error::H3_REQUEST_CANCELLED
@@ -370,7 +370,7 @@ async fn last_unfinished_producer_stops_an_upload_waiting_on_network() {
         assert!(!partial.is_empty());
     })
     .await
-    .expect("dropping the producer must wake the blocked upload");
+    .expect("reset must wake the blocked upload");
 }
 
 #[tokio::test]
@@ -379,7 +379,7 @@ async fn finished_producer_can_drop_while_upload_waits_on_network() {
         let mut request = Request::streaming_post("https://example.com/upload").unwrap();
         let (send, mut recv) = tokio::io::duplex(1);
         let sending = tokio::spawn(
-            write_streaming_request(
+            send_streaming_request(
                 &request,
                 H3WriteStream::new(0, send),
                 crate::protocol::qpack::tests::shared(),
@@ -410,7 +410,7 @@ async fn finished_producer_can_drop_while_upload_waits_on_network() {
 }
 
 #[tokio::test]
-async fn dropping_response_stops_a_receive_waiting_on_network() {
+async fn explicit_stop_stops_a_receive_waiting_on_network() {
     timeout(Duration::from_secs(5), async {
         let mut message = Message::<Bytes>::default();
         message.set_status(StatusCode::OK);
@@ -429,12 +429,12 @@ async fn dropping_response_stops_a_receive_waiting_on_network() {
             .unwrap();
         assert!(matches!(response, Response::Streaming(_)));
         tokio::task::yield_now().await;
-        drop(response);
+        response.into_body().stop().await;
         tokio::task::yield_now().await;
         assert!(send.write_all(b"x").await.is_err());
     })
     .await
-    .expect("dropping the response must stop its receive task");
+    .expect("stop must terminate the receive task");
 }
 
 #[test]

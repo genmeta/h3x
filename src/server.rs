@@ -10,10 +10,10 @@ use crate::{
     ArcWndBuf, Error, Result, Transport,
     common::{
         self, Read, Write,
+        body::{self, BodyMode},
         message::{ArcMessage, Message, ReadBody},
     },
     protocol::{
-        body::{self, BodyMode},
         frame::{self, Data, Frame, H3Frame, Headers, Write as _, be_frame},
         headers,
         qpack::Qpack,
@@ -24,42 +24,8 @@ use crate::{
 pub type Request = crate::common::Request<Read>;
 pub type Response<B = Bytes> = crate::common::response::Response<Write, B>;
 
-/// Send one response on the accepted request's matching send stream.
-///
-/// For streaming responses, retain a producer clone until it finishes or resets
-/// the body. Dropping the last unfinished producer cancels sending.
-///
-/// `request_method` must be the original request's method so HEAD responses can
-/// preserve `Content-Length` without sending a body.
-/// Applications finish or reset streaming bodies explicitly.
-pub fn respond<WS, R, T: Transport>(
-    response: R,
-    send: H3WriteStream<WS>,
-    qpack: Arc<Qpack<T>>,
-    request_method: &Method,
-) -> impl Future<Output = Result<()>>
-where
-    WS: AsyncWrite + Unpin,
-    R: Into<common::Response<Write>>,
-{
-    let response = response.into();
-
-    async move {
-        match response {
-            common::Response::Bytes(response) => {
-                write_bytes_response(&response, send, &qpack, request_method).await
-            }
-            common::Response::Streaming(response) => {
-                let sending = write_streaming_response(&response, send, qpack, request_method);
-                drop(response);
-                sending.await
-            }
-        }
-    }
-}
-
 /// Read an HTTP request using the receive stream's ID and explicit QPACK.
-pub async fn accept<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
+pub async fn read_request<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
     rs: H3ReadStream<RS>,
     qpack: Arc<Qpack<T>>,
 ) -> Result<crate::common::Request<Read>> {
@@ -110,43 +76,39 @@ pub async fn accept<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
         Some(content_length) => BodyMode::Length { content_length },
         None => BodyMode::Infinity,
     };
-    if !mode.streaming() {
-        let mut body = Vec::new();
-        body::read_body(&mut rs, &mut body, mode, &qpack)
-            .await
-            .inspect_err(|error| {
-                let _ = qpack.cancel(stream_id);
-                qpack.on_error(*error);
-            })?;
-        let request: common::request::Request<Read, _> =
-            ArcMessage::from(message.with_body(Bytes::from(body))).into();
-        Ok(common::Request::Bytes(request))
-    } else {
-        let mut body = ArcWndBuf::new(frame::MAX_DATA_CHUNK);
-        let request: common::request::Request<Read, _> =
-            ArcMessage::from(message.with_body(body.clone())).into();
-        let body_error = request.message.body_error();
-        tokio::spawn(async move {
-            let result = tokio::select! {
-                biased;
-                    error = body_error => Err(error),
-                result = body::read_body(&mut rs, &mut body, mode, &qpack) => result,
-            };
-            match result {
-                Ok(()) => {}
-                Err(error) => {
-                    let _ = qpack.cancel(stream_id);
-                    qpack.on_error(error);
-                    body.set_error(error);
-                }
-            }
-        });
-        Ok(crate::common::Request::Streaming(request))
-    }
+    Ok(match body::receive(rs, mode, qpack).await? {
+        common::Body::Bytes(body) => {
+            common::Request::Bytes(ArcMessage::from(message.with_body(body)).into())
+        }
+        common::Body::Streaming(body) => {
+            common::Request::Streaming(ArcMessage::from(message.with_body(body)).into())
+        }
+    })
+}
+
+/// Send a buffered response. The method belongs to the original request.
+pub async fn write_bytes_response<WS: AsyncWrite + Unpin, T: Transport>(
+    response: Response<Bytes>,
+    ws: H3WriteStream<WS>,
+    qpack: Arc<Qpack<T>>,
+    method: &Method,
+) -> Result<()> {
+    send_bytes_response(&response, ws, &qpack, method).await
+}
+
+/// Send a streaming response. Keep a body producer until finish/reset and drive
+/// this future concurrently with production. Use reset to cancel the body explicitly.
+pub fn write_streaming_response<WS: AsyncWrite + Unpin, T: Transport>(
+    response: Response<ArcWndBuf>,
+    ws: H3WriteStream<WS>,
+    qpack: Arc<Qpack<T>>,
+    method: &Method,
+) -> impl Future<Output = Result<()>> + use<WS, T> {
+    prepare_streaming_response(&response, ws, qpack, method)
 }
 
 /// Writes a buffered response using the original request method.
-async fn write_bytes_response<WS: AsyncWrite + Unpin, T: Transport>(
+async fn send_bytes_response<WS: AsyncWrite + Unpin, T: Transport>(
     response: &Response<Bytes>,
     mut ws: H3WriteStream<WS>,
     qpack: &Qpack<T>,
@@ -175,16 +137,17 @@ async fn write_bytes_response<WS: AsyncWrite + Unpin, T: Transport>(
     {
         return Err(Error::H3_MESSAGE_ERROR);
     }
-    let mut frame = Vec::new();
-    frame.put_frame(&Frame::new(Headers {
+    let headers = Frame::new(Headers {
         field_section: qpack.encode(ws.stream_id(), fields)?,
-    })?);
+    })?;
     let result = async {
-        ws.write_all(&frame).await?;
+        let mut buf = Vec::new();
+        buf.put_frame(&headers);
+        ws.write_all(&buf).await?;
         if !body.is_empty() {
-            frame.clear();
-            frame.put_frame(&Frame::<Data>::new(Data(body.len()))?);
-            ws.write_all(&frame).await?;
+            buf.clear();
+            buf.put_frame(&Frame::new(Data(body.len()))?);
+            ws.write_all(&buf).await?;
             ws.write_all(&body).await?;
         }
         ws.shutdown().await?;
@@ -198,7 +161,7 @@ async fn write_bytes_response<WS: AsyncWrite + Unpin, T: Transport>(
 }
 
 /// Writes a streaming response using the original request method.
-fn write_streaming_response<WS: AsyncWrite + Unpin, T: Transport>(
+fn prepare_streaming_response<WS: AsyncWrite + Unpin, T: Transport>(
     response: &Response<ArcWndBuf>,
     mut ws: H3WriteStream<WS>,
     qpack: Arc<Qpack<T>>,
@@ -208,13 +171,12 @@ fn write_streaming_response<WS: AsyncWrite + Unpin, T: Transport>(
         let message = response.message.0.lock().unwrap();
         (message.fields(), message.body_stream())
     };
-    let body_error = response.message.body_error();
+    let cancellation = body.clone();
     let request_method = request_method.clone();
-    // Capture body and headers, never Response/ArcMessage: producer Drop must remain observable.
     async move {
         let result = tokio::select! {
             biased;
-            error = body_error => Err(error),
+            error = cancellation.error() => Err(error),
             result = async {
                 let parts = headers::response_parts(fields.clone())?;
                 let length = headers::content_length(&parts.headers)?;
@@ -225,12 +187,15 @@ fn write_streaming_response<WS: AsyncWrite + Unpin, T: Transport>(
                     return Err(Error::H3_MESSAGE_ERROR);
                 }
                 let mode = BodyMode::resolve(&parts, Some(&request_method))?;
-                let mut frame = Vec::new();
-                frame.put_frame(&Frame::new(Headers {
+                let headers = Frame::new(Headers {
                     field_section: qpack.encode(ws.stream_id(), fields)?,
-                })?);
-                ws.write_all(&frame).await?;
-                body::write_body(&mut body, &mut ws, mode).await
+                })?;
+                let mut buf = Vec::new();
+                buf.put_frame(&headers);
+                ws.write_all(&buf).await?;
+                body::write_streaming_body(&mut body, &mut ws, mode).await?;
+                ws.shutdown().await?;
+                Ok::<_, Error>(())
             } => result,
         };
         if let Err(error) = result {

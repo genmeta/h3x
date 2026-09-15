@@ -49,21 +49,24 @@ async fn preserves_set_cookie_headers_through_message_roundtrip() {
         let outgoing: common::Response<Write> = match &response {
             Response::Bytes(response) => {
                 assert!(buffered);
-                crate::server::Response::from(response.message.clone()).into()
+                crate::server::Response::from(response.message.test_direction()).into()
             }
             Response::Streaming(response) => {
                 assert!(!buffered);
-                crate::server::Response::from(response.message.clone()).into()
+                crate::server::Response::from(response.message.test_direction()).into()
             }
         };
         let mut reencoded = Vec::new();
-        crate::server::respond(
-            outgoing,
-            H3WriteStream::new(4, &mut reencoded),
-            crate::protocol::qpack::tests::shared(),
-            &Method::GET,
-        )
-        .await
+        let send = H3WriteStream::new(4, &mut reencoded);
+        let qpack = crate::protocol::qpack::tests::shared();
+        match outgoing {
+            common::Response::Bytes(response) => {
+                crate::server::write_bytes_response(response, send, qpack, &Method::GET).await
+            }
+            common::Response::Streaming(response) => {
+                crate::server::write_streaming_response(response, send, qpack, &Method::GET).await
+            }
+        }
         .unwrap();
         // Keep the receive handle alive until the shared body reaches EOF.
         drop(response);

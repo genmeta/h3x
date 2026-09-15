@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    future::{Future, poll_fn},
     io,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -12,11 +11,19 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+use super::{Read, Write, body::Body};
 use crate::{Error, Result, protocol::qpack::Field};
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub(crate) struct ArcMessage<B>(pub(crate) Arc<Mutex<Message<B>>>);
-/// Shared client/server message. `B` is buffered bytes or a body stream.
+
+impl<B> Clone for ArcMessage<B> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+/// Shared client/server message. Application messages contain a directional Body.
 /// Construction does not start network or body work.
 #[derive(Debug, Default)]
 pub(crate) struct Message<B> {
@@ -306,7 +313,7 @@ impl ReadBody for Message<Bytes> {
     }
 }
 
-// Standard I/O operates on body bytes; protocol framing lives in protocol::body.
+// Standard I/O operates on body bytes; protocol framing lives in common::body.
 impl<B: AsyncRead + Unpin> AsyncRead for Message<B> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -392,116 +399,90 @@ impl<B> ArcMessage<B> {
     }
 }
 
-impl ArcMessage<crate::ArcWndBuf> {
-    /// Observe body errors and the loss of its last unfinished application owner.
-    /// The I/O pump must release its ArcMessage before polling this observer.
-    pub(crate) fn body_error(&self) -> impl Future<Output = Error> + use<> {
-        let message = Arc::downgrade(&self.0);
-        let body = self.0.lock().unwrap().body.clone();
-        poll_fn(move |cx| match body.poll_finished(cx) {
-            Err(error) => Poll::Ready(error),
-            Ok(false) if message.strong_count() == 0 => Poll::Ready(Error::H3_REQUEST_CANCELLED),
-            _ => Poll::Pending,
-        })
+impl<B: Clone, IO> ArcMessage<Body<B, IO>> {
+    pub(crate) fn body_handle(&self) -> Body<B, IO> {
+        Body::from_storage(self.0.lock().unwrap().body.storage.clone())
     }
 
-    fn stream(&self) -> Message<crate::ArcWndBuf> {
-        Message {
-            headers: HeaderMap::new(),
-            pseudo_headers: HashMap::new(),
-            body: self.0.lock().unwrap().body.clone(),
+    pub(crate) fn into_body(self) -> Body<B, IO> {
+        match Arc::try_unwrap(self.0) {
+            Ok(message) => message.into_inner().unwrap().body,
+            Err(message) => Body::from_storage(message.lock().unwrap().body.storage.clone()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_direction<D>(&self) -> ArcMessage<Body<B, D>> {
+        let message = self.0.lock().unwrap();
+        ArcMessage::from(Message {
+            headers: message.headers.clone(),
+            pseudo_headers: message.pseudo_headers.clone(),
+            body: Body::from_storage(message.body.storage.clone()),
+        })
     }
 }
 
 #[async_trait]
-impl ReadStream for ArcMessage<crate::ArcWndBuf> {
+impl ReadStream for ArcMessage<Body<crate::ArcWndBuf, Read>> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        ReadStream::read(&mut self.stream(), buf).await
+        self.body_handle().read(buf).await
     }
 
     async fn read_all(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.stream().read_all(buf).await
+        let mut body = self.body_handle();
+        let mut count = 0;
+        while count < buf.len() {
+            let n = body.read(&mut buf[count..]).await?;
+            if n == 0 {
+                break;
+            }
+            count += n;
+        }
+        Ok(count)
     }
 
     async fn stop(self) {
-        self.0
-            .lock()
-            .unwrap()
-            .body
-            .set_error(Error::H3_REQUEST_CANCELLED);
+        self.into_body().stop().await;
     }
 }
 
 #[async_trait]
-impl WriteStream for ArcMessage<crate::ArcWndBuf> {
+impl WriteStream for ArcMessage<Body<crate::ArcWndBuf, Write>> {
     async fn write<T: AsRef<[u8]> + Send>(&mut self, chunk: T) -> Result<usize> {
-        WriteStream::write(&mut self.stream(), chunk).await
+        self.body_handle().write(chunk).await
     }
 
     async fn finish(&mut self) -> Result<()> {
-        self.stream().finish().await
+        self.body_handle().finish().await
     }
 
     async fn reset(self) -> Result<()> {
-        self.0
-            .lock()
-            .unwrap()
-            .body
-            .set_error(Error::H3_REQUEST_CANCELLED);
-        Ok(())
+        self.into_body().reset().await
     }
 }
 
-impl Message<crate::ArcWndBuf> {
+impl<IO> Message<Body<crate::ArcWndBuf, IO>> {
     pub(crate) fn body_stream(&self) -> crate::ArcWndBuf {
-        self.body.clone()
+        self.body.storage.clone()
+    }
+}
+
+impl<IO> ReadBody for Message<Body<Bytes, IO>> {
+    fn body(&self) -> Bytes {
+        self.body.storage.clone()
+    }
+}
+
+impl WriteBody for Message<Body<Bytes, Write>> {
+    fn set_body(&mut self, bytes: Bytes) -> &mut Self {
+        self.body.storage = bytes;
+        self
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn dropping_message_notifies_stream_without_cancelling_buffer() {
-        let mut body = crate::ArcWndBuf::new(1);
-        body.write_all(b"x").await.unwrap();
-        let message = ArcMessage::from(Message::<Bytes>::default().with_body(body.clone()));
-        let cancelled = message.body_error();
-        tokio::pin!(cancelled);
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        drop(message.clone());
-        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
-        drop(message);
-        assert_eq!(
-            cancelled.as_mut().poll(&mut cx),
-            Poll::Ready(Error::H3_REQUEST_CANCELLED)
-        );
-
-        let mut bytes = [0];
-        body.read_exact(&mut bytes).await.unwrap();
-        assert_eq!(bytes, *b"x");
-    }
-
-    #[tokio::test]
-    async fn finished_message_can_drop_before_or_after_stream_attachment() {
-        for finish_first in [false, true] {
-            let body = crate::ArcWndBuf::new(1);
-            let mut message = ArcMessage::from(Message::<Bytes>::default().with_body(body));
-            if finish_first {
-                message.finish().await.unwrap();
-            }
-            let cancelled = message.body_error();
-            if !finish_first {
-                message.finish().await.unwrap();
-            }
-            drop(message);
-            tokio::pin!(cancelled);
-            let mut cx = Context::from_waker(std::task::Waker::noop());
-            assert!(cancelled.as_mut().poll(&mut cx).is_pending());
-        }
-    }
 
     impl<B> Message<B> {
         pub(crate) fn header(&self, name: &HeaderName) -> Option<HeaderValue> {

@@ -1,15 +1,155 @@
-//! Transfer body bytes between application buffers and HTTP/3 frames.
+//! Application body handles, incoming-body driving, and HTTP/3 body framing.
 
+use std::{marker::PhantomData, sync::Arc};
+
+use bytes::Bytes;
 use http::{Method, StatusCode};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-use super::{
-    frame::{self, Data, Frame, H3Frame, Write as _, be_frame},
-    headers,
-    qpack::Qpack,
-    stream::H3ReadStream,
+use super::{Read, Write};
+use crate::{
+    ArcWndBuf, Error, Result, Transport,
+    protocol::{
+        frame::{self, Data, Frame, H3Frame, Write as _, be_frame},
+        headers,
+        qpack::Qpack,
+        stream::H3ReadStream,
+    },
 };
-use crate::{Error, Result, Transport};
+
+/// Application body storage, independent of message headers and network streams.
+/// `B` is Bytes or WndBuf; `IO` is R (read) or W (write).
+#[derive(Debug)]
+pub struct Body<B, IO> {
+    pub(crate) storage: B,
+    _io: PhantomData<IO>,
+}
+
+impl<B, IO> Body<B, IO> {
+    pub(crate) fn from_storage(storage: B) -> Self {
+        Self {
+            storage,
+            _io: PhantomData,
+        }
+    }
+}
+
+impl<B: Default, IO> Default for Body<B, IO> {
+    fn default() -> Self {
+        Self::from_storage(B::default())
+    }
+}
+
+impl<B: Clone> Clone for Body<B, Write> {
+    fn clone(&self) -> Self {
+        Self::from_storage(self.storage.clone())
+    }
+}
+
+impl Body<Bytes, Write> {
+    pub fn new(bytes: Bytes) -> Self {
+        Self::from_storage(bytes)
+    }
+}
+
+impl Body<ArcWndBuf, Write> {
+    /// Panics if capacity is zero. One producer may be writing at a time.
+    pub fn new(capacity: usize) -> Self {
+        Self::from_storage(ArcWndBuf::new(capacity))
+    }
+
+    pub async fn write(&mut self, bytes: impl AsRef<[u8]> + Send) -> Result<usize> {
+        Ok(self.storage.write(bytes.as_ref()).await?)
+    }
+
+    pub async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        self.storage.write_all(bytes).await?;
+        Ok(())
+    }
+
+    /// Finish production. The send future must still drain data and finish the transport.
+    pub async fn finish(&mut self) -> Result<()> {
+        self.storage.shutdown().await?;
+        Ok(())
+    }
+
+    pub async fn reset(self) -> Result<()> {
+        self.storage.set_error(Error::H3_REQUEST_CANCELLED);
+        Ok(())
+    }
+}
+
+impl Body<Bytes, Read> {
+    pub async fn read(&mut self, bytes: &mut [u8]) -> Result<usize> {
+        let remaining = &mut self.storage;
+        let n = bytes.len().min(remaining.len());
+        bytes[..n].copy_from_slice(&remaining.split_to(n));
+        Ok(n)
+    }
+
+    pub fn into_bytes(self) -> Bytes {
+        self.storage
+    }
+
+    pub async fn collect(self) -> Result<Bytes> {
+        Ok(self.into_bytes())
+    }
+}
+
+impl Body<ArcWndBuf, Read> {
+    pub async fn read(&mut self, bytes: &mut [u8]) -> Result<usize> {
+        Ok(self.storage.read(bytes).await?)
+    }
+    pub async fn stop(self) {
+        self.storage.set_error(Error::H3_REQUEST_CANCELLED);
+    }
+    pub async fn collect(mut self) -> Result<Bytes> {
+        let mut bytes = Vec::new();
+        self.storage.read_to_end(&mut bytes).await?;
+        Ok(bytes.into())
+    }
+}
+
+/// Receive buffered bytes to completion, or return a window driven by a receive task.
+pub(crate) async fn receive<RS, T>(
+    mut rs: BufReader<H3ReadStream<RS>>,
+    mode: BodyMode,
+    qpack: Arc<Qpack<T>>,
+) -> Result<super::Body<Read>>
+where
+    RS: AsyncRead + Unpin + Send + 'static,
+    T: Transport,
+{
+    let stream_id = rs.get_ref().stream_id();
+    if !mode.streaming() {
+        let mut bytes = Vec::new();
+        read_body(&mut rs, &mut bytes, mode, &qpack)
+            .await
+            .inspect_err(|error| {
+                let _ = qpack.cancel(stream_id);
+                qpack.on_error(*error);
+            })?;
+        return Ok(super::Body::Bytes(Body::from_storage(Bytes::from(bytes))));
+    }
+
+    let mut buffer = ArcWndBuf::new(frame::MAX_DATA_CHUNK);
+    let body = Body::from_storage(buffer.clone());
+    let cancellation = buffer.clone();
+    tokio::spawn(async move {
+        let result = tokio::select! {
+            biased;
+            error = cancellation.error() => Err(error),
+            result = read_body(&mut rs, &mut buffer, mode, &qpack) => result,
+        };
+        if let Err(error) = result {
+            let _ = qpack.cancel(stream_id);
+            qpack.on_error(error);
+            buffer.set_error(error);
+        }
+        // read_body validates FIN/trailers and marks buffer EOF on success.
+    });
+    Ok(super::Body::Streaming(body))
+}
 
 /// Content rules resolved from the message headers and request/response semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,8 +261,8 @@ pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin, T: Tr
     Ok(())
 }
 
-/// Send an application source as DATA frames and shut down the send stream at EOF.
-pub(crate) async fn write_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+/// Send and validate a streaming body as DATA frames, leaving shutdown to the caller.
+pub(crate) async fn write_streaming_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     source: &mut R,
     send: &mut W,
     mode: BodyMode,
@@ -134,18 +274,16 @@ pub(crate) async fn write_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         sent = sent
             .checked_add(count as u64)
             .ok_or(Error::H3_MESSAGE_ERROR)?;
-        let invalid = match mode {
-            BodyMode::Forbidden => count != 0,
-            BodyMode::Infinity => false,
-            BodyMode::Length { content_length } => {
-                sent > content_length || (count == 0 && sent != content_length)
+        match mode {
+            BodyMode::Forbidden if count != 0 => return Err(Error::H3_MESSAGE_ERROR),
+            BodyMode::Length { content_length }
+                if sent > content_length || (count == 0 && sent != content_length) =>
+            {
+                return Err(Error::H3_MESSAGE_ERROR);
             }
-        };
-        if invalid {
-            return Err(Error::H3_MESSAGE_ERROR);
+            _ => {}
         }
         if count == 0 {
-            send.shutdown().await?;
             return Ok(());
         }
         let mut frame = Vec::new();
@@ -164,6 +302,38 @@ mod tests {
         frame::Headers,
         qpack::{self, WriteFieldSection},
     };
+
+    #[tokio::test]
+    async fn streaming_body_leaves_shutdown_to_the_caller() {
+        use std::{
+            future::Future,
+            task::{Context, Waker},
+        };
+        let (mut send, mut recv) = tokio::io::duplex(64);
+        write_streaming_body(
+            &mut &b"bc"[..],
+            &mut send,
+            BodyMode::Length { content_length: 2 },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            be_frame(&mut recv).await.unwrap(),
+            H3Frame::Data(_)
+        ));
+        let mut bytes = [0; 2];
+        recv.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"bc");
+        let mut reading = Box::pin(recv.read(&mut bytes));
+        assert!(
+            reading
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        send.shutdown().await.unwrap();
+        assert_eq!(reading.await.unwrap(), 0);
+    }
 
     #[tokio::test]
     async fn body_trailers_enforce_order_and_content_length() {

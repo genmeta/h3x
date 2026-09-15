@@ -5,7 +5,6 @@ mod common;
 mod error;
 mod protocol;
 pub mod server;
-mod wnd_buf;
 
 pub use common::message::{
     ReadBody, ReadRequest, ReadResponse, ReadStream, WriteBody, WriteRequest, WriteResponse,
@@ -19,7 +18,6 @@ pub use protocol::{
     stream::{read::H3ReadStream, write::H3WriteStream},
     transport::{Role, Transport},
 };
-pub use wnd_buf::ArcWndBuf;
 
 /// ALPN token used by HTTP/3.
 pub const ALPN: &[u8] = b"h3";
@@ -29,3 +27,11 @@ extern crate self as h3x;
 #[cfg(test)]
 #[path = "../tests/support/mod.rs"]
 mod test_support;
+
+/// Incoming body enum, containing a directional Bytes or WndBuf body.
+pub type IncomingBody = common::Body<R>;
+/// Outgoing body enum, containing a directional Bytes or WndBuf body.
+pub type OutgoingBody = common::Body<W>;
+/// Shared body storage, also available under its original ArcWndBuf name.
+pub use common::wnd_buf::ArcWndBuf;
+pub use common::{Read as R, Write as W, body::Body, wnd_buf::ArcWndBuf as WndBuf};

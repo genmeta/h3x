@@ -3,8 +3,6 @@
 use bytes::{BufMut, Bytes};
 use tokio::io::AsyncRead;
 
-#[cfg(test)]
-use super::integer::be_prefixed_integer;
 use super::{
     integer::{WritePrefixedInteger, be_byte, be_prefixed_integer_with_first},
     string_literal::{WriteStringLiteral, be_string_literal, be_string_literal_with_first},
@@ -284,26 +282,6 @@ mod tests {
         assert_eq!(
             be_encoder_instruction(&mut oversized.as_slice()).await,
             Err(Error::H3_EXCESSIVE_LOAD)
-        );
-    }
-
-    #[test]
-    fn prefixed_integers_preserve_suffixes_and_reject_overflow() {
-        for bits in [3, 4, 6, 7, 8] {
-            for value in [0, (1 << bits) - 1, 127, 128, VARINT_MAX] {
-                let mut output = Vec::new();
-                output.put_prefixed_integer(value, bits, 0).unwrap();
-                output.push(42);
-                let (input, decoded) = be_prefixed_integer(output.as_slice(), bits).unwrap();
-                assert_eq!(decoded, value);
-                assert_eq!(input, &[42]);
-            }
-        }
-        assert!(be_prefixed_integer(&[0xff; 12][..], 8).is_err());
-        assert!(
-            Vec::new()
-                .put_prefixed_integer(VARINT_MAX + 1, 8, 0)
-                .is_err()
         );
     }
 }

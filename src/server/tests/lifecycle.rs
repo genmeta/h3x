@@ -1,64 +1,26 @@
 use super::*;
 
 #[tokio::test]
-async fn dropping_last_response_producer_cancels_live_send() {
-    use std::{
-        sync::atomic::{AtomicUsize, Ordering},
-        task::{Context, Wake, Waker},
-        time::Duration,
-    };
-
-    #[derive(Default)]
-    struct Wakes(AtomicUsize);
-
-    impl Wake for Wakes {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    for started in [true, false] {
-        let mut response = Response::<Bytes>::default();
-        response.set_status(StatusCode::OK);
-        let response = response.streaming(1);
-        let producer = response.clone();
-        let mut body = response.message.0.lock().unwrap().body_stream();
-        let mut sending = Box::pin(super::respond(
-            response,
-            H3WriteStream::new(0, tokio::io::sink()),
-            crate::protocol::qpack::tests::shared(),
-            &Method::GET,
-        ));
-        let wakes = Arc::new(Wakes::default());
-        let waker = Waker::from(wakes.clone());
-        let mut cx = Context::from_waker(&waker);
-        if started {
-            // The sink cannot block HEADERS, so the sender must be waiting for body data.
-            assert!(sending.as_mut().poll(&mut cx).is_pending());
-            drop(producer.clone());
-            assert!(sending.as_mut().poll(&mut cx).is_pending());
-            body.flush().await.unwrap();
-        }
-
-        let previous_wakes = wakes.0.load(Ordering::SeqCst);
-        drop(producer);
-        if started {
-            assert!(
-                wakes.0.load(Ordering::SeqCst) > previous_wakes,
-                "dropping the last producer must wake the live sender"
-            );
-        }
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), &mut sending)
-                .await
-                .expect("the sender must cancel without peer or connection termination"),
-            Err(Error::H3_REQUEST_CANCELLED)
-        );
-        assert_eq!(
-            Error::from(body.flush().await.unwrap_err()),
-            Error::H3_REQUEST_CANCELLED
-        );
-    }
+async fn dropping_last_producer_does_not_finish_or_cancel_sending() {
+    use std::task::{Context, Waker};
+    let mut response = Response::<Bytes>::default();
+    response.set_status(StatusCode::OK);
+    let response = response.streaming(1);
+    let producer = response.body_handle();
+    let buffer = response.message.0.lock().unwrap().body_stream();
+    let mut sending = Box::pin(crate::server::write_streaming_response(
+        response,
+        H3WriteStream::new(0, tokio::io::sink()),
+        crate::protocol::qpack::tests::shared(),
+        &Method::GET,
+    ));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(sending.as_mut().poll(&mut cx).is_pending());
+    drop(producer);
+    assert!(sending.as_mut().poll(&mut cx).is_pending());
+    // Only an explicit buffer error terminates the send operation.
+    buffer.set_error(Error::H3_REQUEST_CANCELLED);
+    assert_eq!(sending.await, Err(Error::H3_REQUEST_CANCELLED));
 }
 
 #[tokio::test]
@@ -110,11 +72,13 @@ async fn finished_response_producer_can_drop_before_or_during_send() {
 }
 
 #[tokio::test]
-async fn server_views_share_buffered_and_streaming_messages() {
-    let message = Message::<Bytes>::post("https://example.com/echo?q=1").unwrap();
+async fn buffered_body_snapshots_and_shared_streams() {
+    let message = Message::<Bytes>::post("https://example.com/echo?q=1")
+        .unwrap()
+        .with_body(crate::Body::from_storage(Bytes::from_static(b"request")));
     let request = common::request::Request::<Read, _>::from(ArcMessage::from(message));
-    let mut incoming = common::request::Request::<Write, _>::from(request.message.clone());
-    incoming.set_body(Bytes::from_static(b"request"));
+    let mut incoming = common::request::Request::<Write, _>::from(request.message.test_direction());
+    incoming.set_body(Bytes::from_static(b"changed"));
     assert_eq!(request.method(), Method::POST);
     assert_eq!(request.authority(), "example.com");
     assert_eq!(request.scheme(), "https");
@@ -122,20 +86,23 @@ async fn server_views_share_buffered_and_streaming_messages() {
     assert_eq!(request.body(), Bytes::from_static(b"request"));
 
     let mut response = Response::default();
-    let outgoing = common::response::Response::<Read, _>::from(response.message.clone());
     response
         .set_status(StatusCode::CREATED)
         .set_body(request.body());
+    let outgoing = common::response::Response::<Read, _>::from(response.message.test_direction());
     assert_eq!(outgoing.status(), StatusCode::CREATED);
     assert_eq!(outgoing.body(), Bytes::from_static(b"request"));
 
-    let message = Message::<Bytes>::default().with_body(ArcWndBuf::new(2));
+    let message =
+        Message::<Bytes>::default().with_body(crate::Body::from_storage(ArcWndBuf::new(2)));
     let mut request = common::request::Request::<Read, _>::from(ArcMessage::from(message));
-    let mut incoming = common::request::Request::<Write, _>::from(request.message.clone());
-    let message = Message::<Bytes>::default().with_body(ArcWndBuf::new(2));
+    let mut incoming = common::request::Request::<Write, _>::from(request.message.test_direction());
+    let message =
+        Message::<Bytes>::default().with_body(crate::Body::from_storage(ArcWndBuf::new(2)));
     let mut response = Response::from(ArcMessage::from(message));
-    let mut outgoing = common::response::Response::<Read, _>::from(response.message.clone());
     response.set_status(StatusCode::OK);
+    let mut outgoing =
+        common::response::Response::<Read, _>::from(response.message.test_direction());
     let ((), (), ()) = tokio::join!(
         async {
             assert_eq!(incoming.write(b"ping").await.unwrap(), 2);
@@ -234,7 +201,7 @@ async fn streaming_response_termination_reaches_the_producer() {
 }
 
 #[tokio::test]
-async fn dropping_streaming_request_stops_a_pump_waiting_on_network() {
+async fn explicit_stop_stops_a_pump_waiting_on_network() {
     let (mut send, recv) = duplex(64);
     send.write_all(&request_frames(b"", None)).await.unwrap();
     let request = super::accept(
@@ -245,7 +212,7 @@ async fn dropping_streaming_request_stops_a_pump_waiting_on_network() {
     .unwrap();
     assert!(matches!(&request, Request::Streaming(_)));
     tokio::task::yield_now().await; // Let the receive pump wait for another frame.
-    drop(request);
+    request.into_body().stop().await;
     tokio::task::yield_now().await;
     assert!(send.write_all(b"x").await.is_err());
 }
@@ -289,4 +256,87 @@ fn explicit_stop_cancels_body_after_request_pump_is_dropped() {
             .poll(&mut Context::from_waker(Waker::noop())),
         Poll::Ready(Err(Error::H3_REQUEST_CANCELLED))
     );
+}
+
+#[tokio::test]
+async fn explicit_stop_stops_a_pump_blocked_on_full_window() {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use tokio::{
+        io::{AsyncRead, ReadBuf},
+        sync::oneshot,
+    };
+
+    struct Tracked {
+        bytes: io::Cursor<Vec<u8>>,
+        dropped: Option<oneshot::Sender<()>>,
+    }
+    impl AsyncRead for Tracked {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.bytes).poll_read(cx, buf)
+        }
+    }
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            let _ = self.dropped.take().unwrap().send(());
+        }
+    }
+    let (dropped, mut observed) = oneshot::channel();
+    let reader = Tracked {
+        bytes: io::Cursor::new(request_frames(&vec![b'x'; frame::MAX_DATA_CHUNK * 4], None)),
+        dropped: Some(dropped),
+    };
+    let request = crate::server::read_request(
+        H3ReadStream::new(0, reader),
+        crate::protocol::qpack::tests::shared(),
+    )
+    .await
+    .unwrap();
+    let body = request.into_body();
+    // The source is immediately ready; the pump runs until the window fills.
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        observed.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    body.stop().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), observed)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn dropping_received_body_does_not_stop_network_reads() {
+    use tokio::io::AsyncReadExt;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let (mut send, recv) = duplex(64);
+        send.write_all(&request_frames(b"", None)).await.unwrap();
+        let Request::Streaming(request) = crate::server::read_request(
+            H3ReadStream::new(0, recv),
+            crate::protocol::qpack::tests::shared(),
+        )
+        .await
+        .unwrap() else {
+            panic!("expected stream");
+        };
+        let mut buffer = request.message.0.lock().unwrap().body_stream();
+        drop(request.into_body());
+        send.write_all(&[0, 1, b'x']).await.unwrap();
+        let mut bytes = [0];
+        buffer.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(bytes, *b"x");
+        // Explicit cancellation cleans up the task; dropping Body did not do so.
+        buffer.set_error(Error::H3_REQUEST_CANCELLED);
+    })
+    .await
+    .unwrap();
 }

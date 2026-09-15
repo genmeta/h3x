@@ -1,11 +1,10 @@
-use std::marker::PhantomData;
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 
 use super::{
     Read, Write,
+    body::Body,
     message::{
         ArcMessage, Message, ReadBody, ReadRequest, ReadStream, WriteBody, WriteRequest,
         WriteStream,
@@ -16,26 +15,21 @@ use crate::{ArcWndBuf, Result};
 const DEFAULT_STREAM_CAPACITY: usize = 16 * 1024;
 
 pub struct Request<IO, B = Bytes> {
-    pub(crate) message: ArcMessage<B>,
-    _io: PhantomData<IO>,
+    pub(crate) message: ArcMessage<Body<B, IO>>,
 }
 
 /// Cloning shares the message and body stream.
-impl<B: Clone> Clone for Request<Write, B> {
+impl<B> Clone for Request<Write, B> {
     fn clone(&self) -> Self {
         Self {
             message: self.message.clone(),
-            _io: PhantomData,
         }
     }
 }
 
-impl<IO, B> From<ArcMessage<B>> for Request<IO, B> {
-    fn from(message: ArcMessage<B>) -> Self {
-        Self {
-            message,
-            _io: PhantomData,
-        }
+impl<IO, B> From<ArcMessage<Body<B, IO>>> for Request<IO, B> {
+    fn from(message: ArcMessage<Body<B, IO>>) -> Self {
+        Self { message }
     }
 }
 
@@ -61,7 +55,11 @@ impl Request<Write, Bytes> {
 
 impl Request<Write, ArcWndBuf> {
     fn streaming(url: &str, method: Method) -> Result<Self> {
-        let message = Message::new_with_body(url, method, ArcWndBuf::new(DEFAULT_STREAM_CAPACITY))?;
+        let message = Message::new_with_body(
+            url,
+            method,
+            Body::<ArcWndBuf, Write>::new(DEFAULT_STREAM_CAPACITY),
+        )?;
         Ok(ArcMessage::from(message).into())
     }
 
@@ -145,11 +143,32 @@ impl<IO, B> ReadRequest for Request<IO, B> {
 
 impl<B: Default> WriteRequest for Request<Write, B> {
     fn new(url: &str, method: Method) -> Result<Self> {
-        Ok(ArcMessage::from(Message::<B>::new(url, method)?).into())
+        Ok(ArcMessage::from(Message::<Body<B, Write>>::new(url, method)?).into())
     }
 
     fn header(self, key: HeaderName, value: HeaderValue) -> Self {
         Request::header(self, key, value)
+    }
+}
+
+impl<IO, B: Clone> Request<IO, B> {
+    /// Transfer application ownership to a directional body handle.
+    pub fn into_body(self) -> super::body::Body<B, IO> {
+        self.message.into_body()
+    }
+}
+
+impl<B: Clone> Request<Write, B> {
+    /// Retain a body producer independently of the message being sent.
+    pub fn body_handle(&self) -> super::body::Body<B, Write> {
+        self.message.body_handle()
+    }
+}
+
+impl Request<Write, Bytes> {
+    /// Attach an application body, retaining this message's headers.
+    pub fn with_body<C>(self, body: super::body::Body<C, Write>) -> Request<Write, C> {
+        self.message.with_body(body).into()
     }
 }
 
@@ -165,6 +184,47 @@ mod tests {
             response::Response,
         },
     };
+
+    #[test]
+    fn sharing_a_body_does_not_share_or_overwrite_headers() {
+        fn check<B: Clone>(body: Body<B, Write>) {
+            let first = crate::client::Request::post("https://example.com/first")
+                .unwrap()
+                .header(header::CONTENT_TYPE, "text/plain".parse().unwrap())
+                .with_body(body.clone());
+            let second = crate::client::Request::put("https://example.com/second")
+                .unwrap()
+                .header(header::CONTENT_TYPE, "application/json".parse().unwrap())
+                .with_body(body);
+            assert_eq!(first.method(), Method::POST);
+            assert_eq!(first.path(), "/first");
+            assert_eq!(first.headers()[header::CONTENT_TYPE], "text/plain");
+            assert_eq!(second.method(), Method::PUT);
+            assert_eq!(second.path(), "/second");
+            assert_eq!(second.headers()[header::CONTENT_TYPE], "application/json");
+        }
+        check(Body::<Bytes, Write>::new(Bytes::from_static(b"data")));
+        check(Body::<ArcWndBuf, Write>::new(1));
+    }
+
+    #[tokio::test]
+    async fn extracted_body_releases_headers() {
+        use std::sync::Arc;
+        for retain_clone in [false, true] {
+            let request = crate::client::Request::streaming_post("https://example.com/").unwrap();
+            let message = Arc::downgrade(&request.message.0);
+            let retained = retain_clone.then(|| request.clone());
+            let mut body = request.into_body();
+            assert_eq!(message.upgrade().is_some(), retain_clone);
+            drop(retained);
+            assert!(
+                message.upgrade().is_none(),
+                "body must not retain message headers"
+            );
+            body.write_all(b"x").await.unwrap();
+            body.finish().await.unwrap();
+        }
+    }
 
     #[test]
     fn streaming_constructors() {
@@ -234,13 +294,12 @@ mod tests {
                 if error == Error::H3_REQUEST_CANCELLED {
                     request.reset().await.unwrap();
                 } else {
-                    let result = crate::client::request(
+                    let result = crate::client::write_streaming_request(
                         request,
-                        H3ReadStream::new(0, tokio::io::empty()),
                         H3WriteStream::new(0, tokio::io::sink()),
+                        H3ReadStream::new(0, tokio::io::empty()),
                         crate::protocol::qpack::tests::shared(),
-                    )
-                    .await;
+                    );
                     assert!(matches!(result, Err(actual) if actual == error));
                 }
                 assert_eq!(waiting.await, Err(error));
@@ -257,22 +316,26 @@ mod tests {
             .unwrap()
             .header(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))
             .body(Bytes::from_static(b"hello"));
-        let reader = Request::<Read>::from(writer.message.clone());
+        let reader = Request::<Read>::from(writer.message.test_direction());
         assert_eq!(reader.method(), Method::POST);
         assert_eq!(reader.authority(), "example.com");
         assert_eq!(reader.path(), "/a?q=1");
         assert_eq!(reader.scheme(), "https");
         assert_eq!(reader.body(), Bytes::from_static(b"hello"));
         writer.set_body(Bytes::from_static(b"updated"));
-        assert_eq!(reader.body(), Bytes::from_static(b"updated"));
+        assert_eq!(reader.body(), Bytes::from_static(b"hello"));
+        assert_eq!(
+            writer.message.0.lock().unwrap().body(),
+            Bytes::from_static(b"updated")
+        );
         assert!(Request::<Write>::get("/relative").is_err());
 
-        let message = ArcMessage::from(Message::<Bytes>::default());
+        let message = ArcMessage::from(Message::<Body<Bytes, Write>>::default());
         let mut response = Response::<Write>::from(message.clone());
         response
             .set_status(StatusCode::CREATED)
             .set_body(Bytes::from_static(b"ok"));
-        let response = Response::<Read>::from(message);
+        let response = Response::<Read>::from(message.test_direction());
         assert_eq!(response.status(), StatusCode::CREATED);
         assert_eq!(response.body(), Bytes::from_static(b"ok"));
 
@@ -284,7 +347,7 @@ mod tests {
             &request.message.0,
             &writer.message.0
         ));
-        let mut reader = Request::<Read, _>::from(request.message);
+        let mut reader = Request::<Read, _>::from(request.message.test_direction());
         assert_eq!(reader.method(), Method::POST);
         assert_eq!(reader.authority(), "example.com");
         assert_eq!(
@@ -322,9 +385,11 @@ mod tests {
             Error::H3_REQUEST_CANCELLED
         );
 
-        let message = ArcMessage::from(Message::<Bytes>::default().with_body(ArcWndBuf::new(1)));
+        let message = ArcMessage::from(
+            Message::<Bytes>::default().with_body(crate::Body::from_storage(ArcWndBuf::new(1))),
+        );
         let mut writer = Response::<Write, _>::from(message.clone());
-        let reader = Response::<Read, _>::from(message);
+        let reader = Response::<Read, _>::from(message.test_direction());
         reader.stop().await;
         assert_eq!(
             writer.write(b"x").await.unwrap_err(),

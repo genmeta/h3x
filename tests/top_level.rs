@@ -19,14 +19,19 @@ async fn request_accept_and_respond() {
         .body(Bytes::from_static(b"hello"));
 
     let (response, served) = tokio::join!(
-        client::request(
-            request,
-            H3ReadStream::new(0, client_recv),
-            H3WriteStream::new(0, client_send),
-            connection.qpack().clone()
-        ),
         async {
-            let request = server::accept(
+            let (sending, receiving) = client::write_bytes_request(
+                request,
+                H3WriteStream::new(0, client_send),
+                H3ReadStream::new(0, client_recv),
+                connection.qpack().clone(),
+            )?;
+            let (sent, received) = tokio::join!(sending, receiving);
+            sent?;
+            received
+        },
+        async {
+            let request = server::read_request(
                 H3ReadStream::new(0, server_recv),
                 connection.qpack().clone(),
             )
@@ -41,7 +46,7 @@ async fn request_accept_and_respond() {
 
             let mut response = server::Response::default();
             response.set_status(StatusCode::OK).set_body(request.body());
-            server::respond(
+            server::write_bytes_response(
                 response,
                 H3WriteStream::new(0, server_send),
                 connection.qpack().clone(),
@@ -75,12 +80,17 @@ async fn streaming_echo() {
     let expected = sentences.concat().into_bytes();
 
     let (response, uploaded, served) = tokio::join!(
-        client::request(
-            request,
-            H3ReadStream::new(0, client_recv),
-            H3WriteStream::new(0, client_send),
-            connection.qpack().clone()
-        ),
+        async {
+            let (sending, receiving) = client::write_streaming_request(
+                request,
+                H3WriteStream::new(0, client_send),
+                H3ReadStream::new(0, client_recv),
+                connection.qpack().clone(),
+            )?;
+            let (sent, received) = tokio::join!(sending, receiving);
+            sent?;
+            received
+        },
         async {
             for sentence in sentences {
                 assert_eq!(upload.write(sentence).await?, sentence.len());
@@ -88,7 +98,7 @@ async fn streaming_echo() {
             upload.finish().await
         },
         async {
-            let request = server::accept(
+            let request = server::read_request(
                 H3ReadStream::new(0, server_recv),
                 connection.qpack().clone(),
             )
@@ -104,7 +114,7 @@ async fn streaming_echo() {
             let mut echo = response.clone();
 
             let (sent, echoed) = tokio::join!(
-                server::respond(
+                server::write_streaming_response(
                     response,
                     H3WriteStream::new(0, server_send),
                     connection.qpack().clone(),
