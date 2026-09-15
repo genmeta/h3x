@@ -8,9 +8,9 @@ use super::{
 };
 use crate::{Error, Result, Transport};
 
+mod control;
 mod goaway;
 mod settings;
-mod uni;
 
 pub(crate) use goaway::StreamCursor;
 pub use settings::Settings;
@@ -23,7 +23,6 @@ pub struct H3Connection<T: Transport> {
     settings: Arc<Settings>,
     qpack: Arc<Qpack<T>>,
     cursor: Arc<StreamCursor>,
-    goaway_write: qbase::ArcReceiving<Result<()>>,
     bi_streams: Arc<BiStreams<T::StreamReader, T::StreamWriter>>,
 }
 
@@ -35,21 +34,16 @@ impl<T: Transport> H3Connection<T> {
         let settings = Arc::new(settings);
         let bi = Arc::new(BiStreams::new());
         let qpack = Qpack::new(transport.clone(), &settings, bi.clone())?;
-        let (cursor, goaway_write) = StreamCursor::new(
-            transport.clone(),
-            settings.clone(),
-            qpack.clone(),
-            bi.clone(),
-        );
+        let cursor = Arc::new(StreamCursor::new(transport.role()));
         let connection = Self {
             transport,
             settings,
             qpack,
             cursor,
-            goaway_write,
             bi_streams: bi,
         };
-        uni::spawn(connection.clone());
+        tokio::spawn(connection.clone().run_control());
+        tokio::spawn(connection.clone().accept_uni());
         Ok(connection)
     }
 
@@ -74,24 +68,15 @@ impl<T: Transport> H3Connection<T> {
     }
 
     /// Consume this connection and exchange GOAWAY with the peer.
-    /// Writes GOAWAY, waits for the peer and admitted requests, then closes QUIC.
+    /// The control task writes GOAWAY, waits for the peer and admitted requests, then closes QUIC.
+    /// Waits for transport termination; H3_NO_ERROR is success.
+    /// Cancelling this wait does not cancel the triggered drain.
     pub async fn goaway(self) -> Result<()> {
         self.cursor.goaway()?;
-        let transport = self.transport.as_ref();
-        tokio::select! {
-            biased;
-            result = async {
-                self.goaway_write.clone().await
-                    .map_err(|_| Error::H3_INTERNAL_ERROR)?
-                    .ok_or(Error::H3_INTERNAL_ERROR)??;
-                self.cursor.peer_goaway().await?;
-                self.bi_streams.drained(self.bi_streams.running()).await;
-                transport.close(Error::H3_NO_ERROR.to_string(), Error::H3_NO_ERROR.as_u64())?;
-                Ok::<_, Error>(())
-            } => result?,
-            error = transport.terminated() => return Err(error),
+        match self.transport.terminated().await {
+            Error::H3_NO_ERROR => Ok(()),
+            error => Err(error),
         }
-        Ok(())
     }
 }
 
@@ -127,7 +112,6 @@ impl<T: Transport> Clone for H3Connection<T> {
             settings: self.settings.clone(),
             qpack: self.qpack.clone(),
             cursor: self.cursor.clone(),
-            goaway_write: self.goaway_write.clone(),
             bi_streams: self.bi_streams.clone(),
         }
     }

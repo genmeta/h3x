@@ -1,5 +1,5 @@
 //! Local admission boundary and single-consumer GOAWAY notifications.
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use qbase::{
     ArcReceiving,
@@ -7,14 +7,7 @@ use qbase::{
     varint::VarInt,
 };
 
-use crate::{
-    Error, Result, Role, Transport,
-    protocol::{
-        connection::Settings,
-        qpack::Qpack,
-        stream::{bi::BiStreams, control},
-    },
-};
+use crate::{Error, Result, Role};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Cursor {
@@ -31,33 +24,7 @@ pub(crate) struct StreamCursor {
 }
 
 impl StreamCursor {
-    pub(super) fn new<T: Transport>(
-        transport: Arc<T>,
-        settings: Arc<Settings>,
-        qpack: Arc<Qpack<T>>,
-        bi: Arc<BiStreams<T::StreamReader, T::StreamWriter>>,
-    ) -> (Arc<Self>, ArcReceiving<Result<()>>) {
-        let cursor = Arc::new(Self::for_role(transport.role()));
-        let written = ArcReceiving::default();
-        tokio::spawn({
-            let cursor = cursor.clone();
-            let written = written.clone();
-            async move {
-                control::send(
-                    transport.as_ref(),
-                    &settings,
-                    &qpack,
-                    &cursor,
-                    &bi,
-                    &written,
-                )
-                .await
-            }
-        });
-        (cursor, written)
-    }
-
-    fn for_role(role: Role) -> Self {
+    pub(super) fn new(role: Role) -> Self {
         Self {
             local: Mutex::new(Cursor::Max(StreamId::new(!role, Dir::Bi, 0))),
             local_goaway: ArcReceiving::default(),

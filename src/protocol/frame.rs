@@ -6,6 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::{Error, Result};
 
 mod cancel_push;
+mod control;
 mod data;
 mod goaway;
 mod headers;
@@ -20,6 +21,7 @@ pub(crate) const MAX_BUFFERED_FRAME_PAYLOAD: usize = 64 * 1024;
 pub(crate) const MAX_DATA_CHUNK: usize = 16 * 1024;
 
 pub(crate) use cancel_push::CancelPush;
+pub(crate) use control::{Control, StreamType, WriteControl, be_control, be_stream_type};
 pub(crate) use data::Data;
 pub use goaway::Goaway;
 pub(crate) use headers::Headers;

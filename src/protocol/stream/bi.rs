@@ -148,13 +148,10 @@ impl<R, W> BiStreams<R, W> {
         }
     }
 
-    pub(crate) fn running(&self) -> Vec<Arc<BiStream<R, W>>> {
-        self.streams.lock().unwrap().values().cloned().collect()
-    }
-
     /// Wait for the fixed set admitted when peer GOAWAY arrived.
     /// The connection has one drain consumer; completion is not a broadcast.
-    pub(crate) async fn drained(&self, running: Vec<Arc<BiStream<R, W>>>) {
+    pub(crate) async fn drained(&self) {
+        let running: Vec<_> = self.streams.lock().unwrap().values().cloned().collect();
         for stream in running {
             stream
                 .finished
@@ -254,8 +251,7 @@ mod tests {
                 let (mut send, mut recv) = streams
                     .insert(0, tokio::io::empty(), tokio::io::sink())
                     .unwrap();
-                let running = streams.running();
-                let mut draining = Box::pin(streams.drained(running));
+                let mut draining = Box::pin(streams.drained());
                 let mut cx = Context::from_waker(Waker::noop());
                 if !early {
                     assert!(draining.as_mut().poll(&mut cx).is_pending());
@@ -290,10 +286,9 @@ mod tests {
         let (_send, _recv) = streams
             .insert(0, tokio::io::empty(), tokio::io::sink())
             .unwrap();
-        let running = streams.running();
         let draining = tokio::spawn({
             let streams = streams.clone();
-            async move { streams.drained(running).await }
+            async move { streams.drained().await }
         });
         tokio::task::yield_now().await;
         assert!(!draining.is_finished());
@@ -331,7 +326,7 @@ mod tests {
         let (mut send, mut recv) = streams
             .insert(0, Recv(read_code.clone()), Send(write_code.clone()))
             .unwrap();
-        let mut drained = Box::pin(streams.drained(streams.running()));
+        let mut drained = Box::pin(streams.drained());
         let mut cx = Context::from_waker(Waker::noop());
         assert!(drained.as_mut().poll(&mut cx).is_pending());
         recv.stop(123);
