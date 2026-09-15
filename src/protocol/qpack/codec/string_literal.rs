@@ -3,7 +3,9 @@ use bytes::{BufMut, Bytes};
 use httlib_huffman::DecoderSpeed;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::instruction::{be_prefixed_integer, put_prefixed_integer, read_byte, read_integer};
+use super::integer::{
+    WritePrefixedInteger, be_byte, be_prefixed_integer, be_prefixed_integer_with_first,
+};
 use crate::{Error, Result, protocol::frame::MAX_BUFFERED_FRAME_PAYLOAD};
 
 /// Read one string literal from the QPACK encoder stream, including its first byte.
@@ -16,7 +18,7 @@ pub(super) async fn be_string_literal<T: AsyncRead + Unpin + ?Sized>(
     prefix_bits: u8,
 ) -> Result<Bytes> {
     validate_prefix_bits(prefix_bits).map_err(|_| Error::QPACK_ENCODER_STREAM_ERROR)?;
-    let first = read_byte(reader).await?;
+    let first = be_byte(reader).await?;
     be_string_literal_with_first(reader, first, prefix_bits).await
 }
 
@@ -27,7 +29,7 @@ pub(super) async fn be_string_literal_with_first<T: AsyncRead + Unpin + ?Sized>(
     prefix_bits: u8,
 ) -> Result<Bytes> {
     validate_prefix_bits(prefix_bits).map_err(|_| Error::QPACK_ENCODER_STREAM_ERROR)?;
-    let length = read_integer(
+    let length = be_prefixed_integer_with_first(
         reader,
         first,
         prefix_bits - 1,
@@ -54,7 +56,7 @@ pub(super) async fn be_string_literal_with_first<T: AsyncRead + Unpin + ?Sized>(
 }
 
 /// Parse a literal in an already buffered field section, retaining its suffix.
-pub(super) fn parse_string_literal(input: &[u8], prefix_bits: u8) -> Result<(&[u8], Bytes)> {
+pub(super) fn be_string_literal_slice(input: &[u8], prefix_bits: u8) -> Result<(&[u8], Bytes)> {
     validate_prefix_bits(prefix_bits)?;
     let first = *input.first().ok_or(Error::QPACK_DECOMPRESSION_FAILED)?;
     let (input, length) = be_prefixed_integer(input, prefix_bits - 1)?;
@@ -86,7 +88,7 @@ impl<B: BufMut> WriteStringLiteral for B {
         if u16::from(high_bits) & prefix_mask != 0 {
             return Err(Error::QPACK_DECOMPRESSION_FAILED);
         }
-        put_prefixed_integer(self, value.len() as u64, prefix_bits - 1, high_bits)?;
+        self.put_prefixed_integer(value.len() as u64, prefix_bits - 1, high_bits)?;
         self.put_slice(value);
         Ok(())
     }
@@ -140,7 +142,7 @@ mod tests {
             wire.put_string_literal(&value, bits, high).unwrap();
             assert_eq!(wire, expected);
             wire.push(42);
-            let (rest, decoded) = parse_string_literal(&wire, bits).unwrap();
+            let (rest, decoded) = be_string_literal_slice(&wire, bits).unwrap();
             assert_eq!(decoded.as_ref(), value);
             assert_eq!(rest, &[42]);
 
@@ -172,7 +174,7 @@ mod tests {
             let mut wire = prefix.to_vec();
             wire.extend_from_slice(&encoded);
             wire.push(42);
-            let (rest, value) = parse_string_literal(&wire, bits).unwrap();
+            let (rest, value) = be_string_literal_slice(&wire, bits).unwrap();
             assert_eq!(value, "www.example.com");
             assert_eq!(rest, &[42]);
             let mut input = wire.as_slice();
@@ -192,7 +194,7 @@ mod tests {
                 Err(Error::H3_CLOSED_CRITICAL_STREAM)
             );
             assert_eq!(
-                parse_string_literal(wire, 8),
+                be_string_literal_slice(wire, 8),
                 Err(Error::QPACK_DECOMPRESSION_FAILED)
             );
         }
@@ -207,12 +209,13 @@ mod tests {
                 Err(Error::QPACK_ENCODER_STREAM_ERROR)
             );
             assert_eq!(
-                parse_string_literal(wire, 8),
+                be_string_literal_slice(wire, 8),
                 Err(Error::QPACK_DECOMPRESSION_FAILED)
             );
         }
         let mut wire = Vec::new();
-        put_prefixed_integer(&mut wire, MAX_BUFFERED_FRAME_PAYLOAD as u64 + 1, 7, 0).unwrap();
+        wire.put_prefixed_integer(MAX_BUFFERED_FRAME_PAYLOAD as u64 + 1, 7, 0)
+            .unwrap();
         wire.push(42);
         let mut input = wire.as_slice();
         assert_eq!(
@@ -231,7 +234,7 @@ mod tests {
                 Err(Error::QPACK_ENCODER_STREAM_ERROR)
             );
             assert_eq!(input, &[0, 42]);
-            assert!(parse_string_literal(input, bits).is_err());
+            assert!(be_string_literal_slice(input, bits).is_err());
             let mut output = vec![42];
             assert!(output.put_string_literal(b"a", bits, 0).is_err());
             assert_eq!(output, &[42]);

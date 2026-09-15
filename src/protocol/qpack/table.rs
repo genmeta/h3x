@@ -6,11 +6,11 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 use qbase::varint::VARINT_MAX;
 
-use super::{Field, instruction::EncoderInstruction};
+use super::{Field, codec::instruction::EncoderInstruction};
 use crate::{Error, Result};
 
 #[derive(Clone, Default)]
-pub(crate) struct DynamicTable {
+pub(super) struct DynamicTable {
     entries: VecDeque<Field>,
     /// Current table size in bytes: sum of each entry's uncompressed name/value
     /// lengths plus 32 bytes. Protocol accounting, not heap usage (section 3.2.1).
@@ -27,7 +27,7 @@ pub(crate) struct DynamicTable {
 }
 
 impl DynamicTable {
-    pub(crate) fn new(max_capacity: u64) -> Result<Self> {
+    pub(super) fn new(max_capacity: u64) -> Result<Self> {
         if max_capacity > VARINT_MAX {
             return Err(Error::H3_SETTINGS_ERROR);
         }
@@ -37,21 +37,21 @@ impl DynamicTable {
         })
     }
 
-    pub(crate) fn insert_count(&self) -> u64 {
+    pub(super) fn insert_count(&self) -> u64 {
         self.insert_count
     }
 
-    pub(crate) fn capacity(&self) -> u64 {
+    pub(super) fn capacity(&self) -> u64 {
         self.capacity
     }
 
-    pub(crate) fn max_capacity(&self) -> u64 {
+    pub(super) fn max_capacity(&self) -> u64 {
         self.max_capacity
     }
 
     /// Update the peer-advertised maximum without eviction or resetting insert_count.
     /// Reject values outside 62 bits or below the current capacity.
-    pub(crate) fn set_max_capacity(&mut self, max_capacity: u64) -> Result<()> {
+    pub(super) fn set_max_capacity(&mut self, max_capacity: u64) -> Result<()> {
         if max_capacity > VARINT_MAX || max_capacity < self.capacity {
             return Err(Error::H3_SETTINGS_ERROR);
         }
@@ -60,12 +60,12 @@ impl DynamicTable {
     }
 
     /// First retained absolute index; equals insert_count when the table is empty.
-    pub(crate) fn oldest_index(&self) -> u64 {
+    pub(super) fn oldest_index(&self) -> u64 {
         self.insert_count - self.entries.len() as u64
     }
 
     /// Newest exact match's absolute index; caller still checks can_reference.
-    pub(crate) fn find_index(&self, name: &[u8], value: &[u8]) -> Option<u64> {
+    pub(super) fn find_index(&self, name: &[u8], value: &[u8]) -> Option<u64> {
         self.entries
             .iter()
             .rposition(|entry| entry.name == name && entry.value == value)
@@ -73,7 +73,7 @@ impl DynamicTable {
     }
 
     /// Newest name match's absolute index; caller still checks can_reference.
-    pub(crate) fn find_name(&self, name: &[u8]) -> Option<u64> {
+    pub(super) fn find_name(&self, name: &[u8]) -> Option<u64> {
         self.entries
             .iter()
             .rposition(|entry| entry.name == name)
@@ -87,7 +87,7 @@ impl DynamicTable {
         }
     }
 
-    pub(crate) fn get(&self, absolute: u64) -> Option<&Field> {
+    pub(super) fn get(&self, absolute: u64) -> Option<&Field> {
         let oldest = self.oldest_index();
         self.entries
             .get(usize::try_from(absolute.checked_sub(oldest)?).ok()?)
@@ -102,7 +102,7 @@ impl DynamicTable {
             .ok_or(Error::QPACK_ENCODER_STREAM_ERROR)
     }
 
-    pub(crate) fn apply(&mut self, instruction: EncoderInstruction) -> Result<()> {
+    pub(super) fn apply(&mut self, instruction: EncoderInstruction) -> Result<()> {
         let entry = match instruction {
             EncoderInstruction::SetDynamicTableCapacity(capacity) => {
                 if capacity > self.max_capacity {
@@ -282,7 +282,7 @@ pub(super) fn get(index: u64) -> Option<(&'static str, &'static str)> {
 
 #[cfg(test)]
 impl DynamicTable {
-    pub(crate) fn size(&self) -> u64 {
+    pub(super) fn size(&self) -> u64 {
         self.size
     }
 }

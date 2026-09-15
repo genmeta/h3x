@@ -3,11 +3,15 @@ use bytes::{BufMut, Bytes};
 use qbase::varint::VARINT_MAX;
 
 use super::{
-    instruction::{be_prefixed_integer, put_prefixed_integer},
-    string_literal::{WriteStringLiteral, parse_string_literal},
-    table::{self, DynamicTable},
+    integer::{WritePrefixedInteger, be_prefixed_integer},
+    string_literal::{WriteStringLiteral, be_string_literal_slice},
 };
-use crate::{Error, Result};
+#[cfg(test)]
+use crate::protocol::qpack::should_never_index;
+use crate::{
+    Error, Result,
+    protocol::qpack::table::{self, DynamicTable},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Field {
@@ -17,15 +21,7 @@ pub(crate) struct Field {
     pub(crate) never_index: bool,
 }
 
-/// Local policy permitted by RFC 9204 section 7.1.3; not an RFC-mandated list.
-pub(super) fn should_never_index(name: &[u8]) -> bool {
-    matches!(
-        name,
-        b"authorization" | b"proxy-authorization" | b"cookie" | b"set-cookie"
-    )
-}
-
-/// Values used for dependency checks and indexing. read() reconstructs them from
+/// Values used for dependency checks and indexing. be_field_section_prefix reconstructs them from
 /// the wire's modulo-encoded insert count and signed Delta Base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FieldSectionPrefix {
@@ -38,87 +34,8 @@ pub(crate) struct FieldSectionPrefix {
 }
 
 impl FieldSectionPrefix {
-    /// Decode RIC/Base using the advertised maximum capacity and cumulative insertion count.
-    pub(crate) fn read(
-        input: &[u8],
-        max_capacity: u64,
-        insert_count: u64,
-    ) -> Result<(&[u8], Self)> {
-        if max_capacity > VARINT_MAX || insert_count > VARINT_MAX {
-            return Err(Error::QPACK_DECOMPRESSION_FAILED);
-        }
-        let (input, encoded_insert_count) = be_prefixed_integer(input, 8)?;
-        let required_insert_count = if encoded_insert_count == 0 {
-            0
-        } else {
-            // RFC 9204 section 4.5.1.1: choose the wrap nearest the decoder's progress.
-            let max_entries = max_capacity / 32;
-            let full_range = 2 * max_entries;
-            if encoded_insert_count > full_range {
-                return Err(Error::QPACK_DECOMPRESSION_FAILED);
-            }
-            let max_value = insert_count + max_entries;
-            let max_wrapped = (max_value / full_range) * full_range;
-            let mut count = max_wrapped + encoded_insert_count - 1;
-            if count > max_value {
-                if count <= full_range {
-                    return Err(Error::QPACK_DECOMPRESSION_FAILED);
-                }
-                count -= full_range;
-            }
-            if count == 0 || count > VARINT_MAX {
-                return Err(Error::QPACK_DECOMPRESSION_FAILED);
-            }
-            count
-        };
-        let sign = *input.first().ok_or(Error::QPACK_DECOMPRESSION_FAILED)? & 0x80 != 0;
-        let (input, delta_base) = be_prefixed_integer(input, 7)?;
-        let base = if sign {
-            required_insert_count
-                .checked_sub(delta_base)
-                .and_then(|base| base.checked_sub(1))
-        } else {
-            required_insert_count.checked_add(delta_base)
-        }
-        .filter(|&base| base <= VARINT_MAX)
-        .ok_or(Error::QPACK_DECOMPRESSION_FAILED)?;
-        Ok((
-            input,
-            Self {
-                required_insert_count,
-                base,
-            },
-        ))
-    }
-
-    /// Write the modulo-encoded RIC and signed Delta Base (sections 4.5.1.1/4.5.1.2).
-    pub(crate) fn write(&self, output: &mut impl BufMut, max_capacity: u64) -> Result<()> {
-        if max_capacity > VARINT_MAX
-            || self.required_insert_count > VARINT_MAX
-            || self.base > VARINT_MAX
-        {
-            return Err(Error::QPACK_DECOMPRESSION_FAILED);
-        }
-        let encoded_insert_count = if self.required_insert_count == 0 {
-            0
-        } else {
-            let full_range = 2 * (max_capacity / 32);
-            if full_range == 0 {
-                return Err(Error::QPACK_DECOMPRESSION_FAILED);
-            }
-            self.required_insert_count % full_range + 1
-        };
-        let (sign, delta_base) = if self.base >= self.required_insert_count {
-            (0, self.base - self.required_insert_count)
-        } else {
-            (0x80, self.required_insert_count - self.base - 1)
-        };
-        put_prefixed_integer(output, encoded_insert_count, 8, 0)?;
-        put_prefixed_integer(output, delta_base, 7, sign)
-    }
-
     /// absolute = Base - 1 - index; reject underflow and absolute >= RIC.
-    pub(crate) fn relative_index(&self, index: u64) -> Result<u64> {
+    fn relative_index(&self, index: u64) -> Result<u64> {
         self.base
             .checked_sub(index)
             .and_then(|absolute| absolute.checked_sub(1))
@@ -127,7 +44,7 @@ impl FieldSectionPrefix {
     }
 
     /// absolute = Base + index; reject overflow and absolute >= RIC.
-    pub(crate) fn post_base_index(&self, index: u64) -> Result<u64> {
+    fn post_base_index(&self, index: u64) -> Result<u64> {
         self.base
             .checked_add(index)
             .filter(|&absolute| absolute < self.required_insert_count)
@@ -161,100 +78,6 @@ pub(crate) enum FieldLine {
 }
 
 impl FieldLine {
-    /// Parse one representation and return its unconsumed suffix; reuse existing
-    /// prefixed-integer/string/Huffman primitives. Do not look up dynamic entries yet.
-    pub(crate) fn read(input: &[u8]) -> Result<(&[u8], Self)> {
-        let first = *input.first().ok_or(Error::QPACK_DECOMPRESSION_FAILED)?;
-        if first & 0x80 != 0 {
-            let (input, index) = be_prefixed_integer(input, 6)?;
-            Ok((
-                input,
-                Self::Indexed {
-                    static_table: first & 0x40 != 0,
-                    index,
-                },
-            ))
-        } else if first & 0x40 != 0 {
-            let (input, index) = be_prefixed_integer(input, 4)?;
-            let (input, value) = parse_string_literal(input, 8)?;
-            Ok((
-                input,
-                Self::LiteralWithNameReference {
-                    never_index: first & 0x20 != 0,
-                    static_table: first & 0x10 != 0,
-                    index,
-                    value,
-                },
-            ))
-        } else if first & 0x20 != 0 {
-            let (input, name) = parse_string_literal(input, 4)?;
-            let (input, value) = parse_string_literal(input, 8)?;
-            Ok((
-                input,
-                Self::Literal(Field {
-                    never_index: first & 0x10 != 0,
-                    name,
-                    value,
-                }),
-            ))
-        } else if first & 0x10 != 0 {
-            let (input, index) = be_prefixed_integer(input, 4)?;
-            Ok((input, Self::IndexedPostBase { index }))
-        } else {
-            let (input, index) = be_prefixed_integer(input, 3)?;
-            let (input, value) = parse_string_literal(input, 8)?;
-            Ok((
-                input,
-                Self::LiteralWithPostBaseNameReference {
-                    never_index: first & 0x08 != 0,
-                    index,
-                    value,
-                },
-            ))
-        }
-    }
-
-    /// Write one representation, preserving N; reuse the existing H=0 string writer.
-    pub(crate) fn write(&self, output: &mut impl BufMut) -> Result<()> {
-        match self {
-            Self::Indexed {
-                static_table,
-                index,
-            } => put_prefixed_integer(output, *index, 6, 0x80 | (u8::from(*static_table) << 6)),
-            Self::IndexedPostBase { index } => put_prefixed_integer(output, *index, 4, 0x10),
-            Self::LiteralWithNameReference {
-                never_index,
-                static_table,
-                index,
-                value,
-            } => {
-                put_prefixed_integer(
-                    output,
-                    *index,
-                    4,
-                    0x40 | (u8::from(*never_index) << 5) | (u8::from(*static_table) << 4),
-                )?;
-                output.put_string_literal(value, 8, 0)
-            }
-            Self::LiteralWithPostBaseNameReference {
-                never_index,
-                index,
-                value,
-            } => {
-                put_prefixed_integer(output, *index, 3, u8::from(*never_index) << 3)?;
-                output.put_string_literal(value, 8, 0)
-            }
-            Self::Literal(field) => {
-                output.put_string_literal(
-                    &field.name,
-                    4,
-                    0x20 | (u8::from(field.never_index) << 4),
-                )?;
-                output.put_string_literal(&field.value, 8, 0)
-            }
-        }
-    }
-
     /// Return the referenced dynamic absolute index, including name-only references.
     /// Used to calculate/check RIC and retain encoder references; None means no dependency.
     pub(crate) fn dynamic_index(&self, prefix: FieldSectionPrefix) -> Result<Option<u64>> {
@@ -319,6 +142,187 @@ impl FieldLine {
     }
 }
 
+/// Append field-section wire representations to a caller-owned buffer.
+pub(crate) trait WriteField {
+    fn put_field_section_prefix(
+        &mut self,
+        prefix: &FieldSectionPrefix,
+        max_capacity: u64,
+    ) -> Result<()>;
+    fn put_field_line(&mut self, line: &FieldLine) -> Result<()>;
+}
+
+impl<B: BufMut> WriteField for B {
+    fn put_field_section_prefix(
+        &mut self,
+        prefix: &FieldSectionPrefix,
+        max_capacity: u64,
+    ) -> Result<()> {
+        if max_capacity > VARINT_MAX
+            || prefix.required_insert_count > VARINT_MAX
+            || prefix.base > VARINT_MAX
+        {
+            return Err(Error::QPACK_DECOMPRESSION_FAILED);
+        }
+        let encoded_insert_count = if prefix.required_insert_count == 0 {
+            0
+        } else {
+            let full_range = 2 * (max_capacity / 32);
+            if full_range == 0 {
+                return Err(Error::QPACK_DECOMPRESSION_FAILED);
+            }
+            prefix.required_insert_count % full_range + 1
+        };
+        let (sign, delta_base) = if prefix.base >= prefix.required_insert_count {
+            (0, prefix.base - prefix.required_insert_count)
+        } else {
+            (0x80, prefix.required_insert_count - prefix.base - 1)
+        };
+        self.put_prefixed_integer(encoded_insert_count, 8, 0)?;
+        self.put_prefixed_integer(delta_base, 7, sign)
+    }
+
+    fn put_field_line(&mut self, line: &FieldLine) -> Result<()> {
+        match line {
+            FieldLine::Indexed {
+                static_table,
+                index,
+            } => self.put_prefixed_integer(*index, 6, 0x80 | (u8::from(*static_table) << 6)),
+            FieldLine::IndexedPostBase { index } => self.put_prefixed_integer(*index, 4, 0x10),
+            FieldLine::LiteralWithNameReference {
+                never_index,
+                static_table,
+                index,
+                value,
+            } => {
+                self.put_prefixed_integer(
+                    *index,
+                    4,
+                    0x40 | (u8::from(*never_index) << 5) | (u8::from(*static_table) << 4),
+                )?;
+                self.put_string_literal(value, 8, 0)
+            }
+            FieldLine::LiteralWithPostBaseNameReference {
+                never_index,
+                index,
+                value,
+            } => {
+                self.put_prefixed_integer(*index, 3, u8::from(*never_index) << 3)?;
+                self.put_string_literal(value, 8, 0)
+            }
+            FieldLine::Literal(field) => {
+                self.put_string_literal(&field.name, 4, 0x20 | (u8::from(field.never_index) << 4))?;
+                self.put_string_literal(&field.value, 8, 0)
+            }
+        }
+    }
+}
+
+/// Reconstruct RIC/Base from the wire using the decoder table capacity and insert count.
+pub(crate) fn be_field_section_prefix(
+    input: &[u8],
+    max_capacity: u64,
+    insert_count: u64,
+) -> Result<(&[u8], FieldSectionPrefix)> {
+    if max_capacity > VARINT_MAX || insert_count > VARINT_MAX {
+        return Err(Error::QPACK_DECOMPRESSION_FAILED);
+    }
+    let (input, encoded_insert_count) = be_prefixed_integer(input, 8)?;
+    let required_insert_count = if encoded_insert_count == 0 {
+        0
+    } else {
+        // RFC 9204 section 4.5.1.1: choose the wrap nearest the decoder's progress.
+        let max_entries = max_capacity / 32;
+        let full_range = 2 * max_entries;
+        if encoded_insert_count > full_range {
+            return Err(Error::QPACK_DECOMPRESSION_FAILED);
+        }
+        let max_value = insert_count + max_entries;
+        let max_wrapped = (max_value / full_range) * full_range;
+        let mut count = max_wrapped + encoded_insert_count - 1;
+        if count > max_value {
+            if count <= full_range {
+                return Err(Error::QPACK_DECOMPRESSION_FAILED);
+            }
+            count -= full_range;
+        }
+        if count == 0 || count > VARINT_MAX {
+            return Err(Error::QPACK_DECOMPRESSION_FAILED);
+        }
+        count
+    };
+    let sign = *input.first().ok_or(Error::QPACK_DECOMPRESSION_FAILED)? & 0x80 != 0;
+    let (input, delta_base) = be_prefixed_integer(input, 7)?;
+    let base = if sign {
+        required_insert_count
+            .checked_sub(delta_base)
+            .and_then(|base| base.checked_sub(1))
+    } else {
+        required_insert_count.checked_add(delta_base)
+    }
+    .filter(|&base| base <= VARINT_MAX)
+    .ok_or(Error::QPACK_DECOMPRESSION_FAILED)?;
+    Ok((
+        input,
+        FieldSectionPrefix {
+            required_insert_count,
+            base,
+        },
+    ))
+}
+
+/// Parse one field-line representation and retain the unconsumed suffix.
+pub(crate) fn be_field_line(input: &[u8]) -> Result<(&[u8], FieldLine)> {
+    let first = *input.first().ok_or(Error::QPACK_DECOMPRESSION_FAILED)?;
+    if first & 0x80 != 0 {
+        let (input, index) = be_prefixed_integer(input, 6)?;
+        Ok((
+            input,
+            FieldLine::Indexed {
+                static_table: first & 0x40 != 0,
+                index,
+            },
+        ))
+    } else if first & 0x40 != 0 {
+        let (input, index) = be_prefixed_integer(input, 4)?;
+        let (input, value) = be_string_literal_slice(input, 8)?;
+        Ok((
+            input,
+            FieldLine::LiteralWithNameReference {
+                never_index: first & 0x20 != 0,
+                static_table: first & 0x10 != 0,
+                index,
+                value,
+            },
+        ))
+    } else if first & 0x20 != 0 {
+        let (input, name) = be_string_literal_slice(input, 4)?;
+        let (input, value) = be_string_literal_slice(input, 8)?;
+        Ok((
+            input,
+            FieldLine::Literal(Field {
+                never_index: first & 0x10 != 0,
+                name,
+                value,
+            }),
+        ))
+    } else if first & 0x10 != 0 {
+        let (input, index) = be_prefixed_integer(input, 4)?;
+        Ok((input, FieldLine::IndexedPostBase { index }))
+    } else {
+        let (input, index) = be_prefixed_integer(input, 3)?;
+        let (input, value) = be_string_literal_slice(input, 8)?;
+        Ok((
+            input,
+            FieldLine::LiteralWithPostBaseNameReference {
+                never_index: first & 0x08 != 0,
+                index,
+                value,
+            },
+        ))
+    }
+}
+
 /// Append a field section without dynamic-table references.
 #[cfg(test)]
 pub(crate) trait WriteFieldSection: BufMut {
@@ -334,11 +338,10 @@ impl<B: BufMut> WriteFieldSection for B {
             if !field.never_index
                 && let Some(static_index) = table::find_index(&field.name, &field.value)
             {
-                FieldLine::Indexed {
+                self.put_field_line(&FieldLine::Indexed {
                     static_table: true,
                     index: static_index as u64,
-                }
-                .write(self)?;
+                })?;
                 continue;
             }
             let line = if let Some(index) = table::find_name(&field.name) {
@@ -351,21 +354,21 @@ impl<B: BufMut> WriteFieldSection for B {
             } else {
                 FieldLine::Literal(field)
             };
-            line.write(self)?;
+            self.put_field_line(&line)?;
         }
         Ok(())
     }
 }
 
 /// Parse a complete, bounded HEADERS payload without dynamic-table references.
-/// Success leaves no remaining input; use Input::decode_fields for the stateful path.
+/// Success leaves no remaining input; use Decoder::decode for the stateful path.
 #[cfg(test)]
 pub(crate) fn be_field_section(input: &[u8]) -> Result<(&[u8], Vec<Field>)> {
-    let (mut input, prefix) = FieldSectionPrefix::read(input, 0, 0)?;
+    let (mut input, prefix) = be_field_section_prefix(input, 0, 0)?;
     let table = DynamicTable::default();
     let mut fields = Vec::new();
     while !input.is_empty() {
-        let (rest, line) = FieldLine::read(input)?;
+        let (rest, line) = be_field_line(input)?;
         fields.push(line.resolve(prefix, &table)?);
         input = rest;
     }
@@ -404,11 +407,11 @@ mod tests {
                 vec![(":authority", "www.example.com"), (":path", "/sample/path")],
             ),
         ] {
-            let (mut input, prefix) = FieldSectionPrefix::read(wire, 220, insert_count).unwrap();
+            let (mut input, prefix) = be_field_section_prefix(wire, 220, insert_count).unwrap();
             let mut output = Vec::new();
-            prefix.write(&mut output, 220).unwrap();
+            output.put_field_section_prefix(&prefix, 220).unwrap();
             for (name, value) in expected {
-                let (rest, line) = FieldLine::read(input).unwrap();
+                let (rest, line) = be_field_line(input).unwrap();
                 assert_eq!(
                     line.resolve(prefix, &table).unwrap(),
                     Field {
@@ -417,7 +420,7 @@ mod tests {
                         never_index: false,
                     }
                 );
-                line.write(&mut output).unwrap();
+                output.put_field_line(&line).unwrap();
                 input = rest;
             }
             assert!(input.is_empty());
@@ -428,7 +431,7 @@ mod tests {
     #[test]
     fn prefix_wraparound_bounds_and_index_coordinates() {
         // RFC section 4.5.1: 100-byte maximum, ten inserts, encoded RIC=4 -> RIC=9.
-        let (rest, prefix) = FieldSectionPrefix::read(&[4, 0x82, 42], 100, 10).unwrap();
+        let (rest, prefix) = be_field_section_prefix(&[4, 0x82, 42], 100, 10).unwrap();
         assert_eq!(rest, &[42]);
         assert_eq!(
             prefix,
@@ -452,7 +455,7 @@ mod tests {
         );
         // One wrap fewer than the largest candidate: 10 + 3 = 13, candidate 17 -> 11.
         assert_eq!(
-            FieldSectionPrefix::read(&[6, 0], 100, 10)
+            be_field_section_prefix(&[6, 0], 100, 10)
                 .unwrap()
                 .1
                 .required_insert_count,
@@ -466,9 +469,10 @@ mod tests {
                         base,
                     };
                     let mut wire = Vec::new();
-                    prefix.write(&mut wire, max_capacity).unwrap();
+                    wire.put_field_section_prefix(&prefix, max_capacity)
+                        .unwrap();
                     assert_eq!(
-                        FieldSectionPrefix::read(&wire, max_capacity, required_insert_count)
+                        be_field_section_prefix(&wire, max_capacity, required_insert_count)
                             .unwrap()
                             .1,
                         prefix
@@ -482,8 +486,8 @@ mod tests {
             base: VARINT_MAX,
         };
         let mut wire = Vec::new();
-        unused.write(&mut wire, 0).unwrap();
-        assert_eq!(FieldSectionPrefix::read(&wire, 0, 0).unwrap().1, unused);
+        wire.put_field_section_prefix(&unused, 0).unwrap();
+        assert_eq!(be_field_section_prefix(&wire, 0, 0).unwrap().1, unused);
         for (wire, capacity, count) in [
             (&[][..], 0, 0),
             (&[0][..], 0, 0),
@@ -499,14 +503,14 @@ mod tests {
             (&[0, 0][..], 0, VARINT_MAX + 1),
         ] {
             assert_eq!(
-                FieldSectionPrefix::read(wire, capacity, count).unwrap_err(),
+                be_field_section_prefix(wire, capacity, count).unwrap_err(),
                 Error::QPACK_DECOMPRESSION_FAILED
             );
         }
         // Both wire integers fit in 62 bits, but their reconstructed Base does not.
         let mut wire = vec![2]; // RIC=1 with a 100-byte maximum.
-        put_prefixed_integer(&mut wire, VARINT_MAX, 7, 0).unwrap();
-        assert!(FieldSectionPrefix::read(&wire, 100, 0).is_err());
+        wire.put_prefixed_integer(VARINT_MAX, 7, 0).unwrap();
+        assert!(be_field_section_prefix(&wire, 100, 0).is_err());
         for (prefix, capacity) in [
             (
                 FieldSectionPrefix {
@@ -531,7 +535,7 @@ mod tests {
             ),
         ] {
             let mut output = vec![42];
-            assert!(prefix.write(&mut output, capacity).is_err());
+            assert!(output.put_field_section_prefix(&prefix, capacity).is_err());
             assert_eq!(output, [42]);
         }
     }
@@ -569,7 +573,7 @@ mod tests {
         ] {
             let mut with_suffix = wire.to_vec();
             with_suffix.push(42);
-            let (rest, line) = FieldLine::read(&with_suffix).unwrap();
+            let (rest, line) = be_field_line(&with_suffix).unwrap();
             assert_eq!(rest, &[42]);
             assert_eq!(line.dynamic_index(prefix).unwrap(), dependency);
             assert_eq!(
@@ -581,10 +585,10 @@ mod tests {
                 }
             );
             let mut output = Vec::new();
-            line.write(&mut output).unwrap();
+            output.put_field_line(&line).unwrap();
             assert_eq!(output, wire);
             for end in 0..wire.len() {
-                assert!(FieldLine::read(&wire[..end]).is_err());
+                assert!(be_field_line(&wire[..end]).is_err());
             }
         }
         // Literal N=1 and Huffman-encoded name and value, independently encoded bytes.
@@ -595,7 +599,7 @@ mod tests {
         wire.extend(huffman);
         wire.push(0x8c);
         wire.extend(huffman);
-        let line = FieldLine::read(&wire).unwrap().1;
+        let line = be_field_line(&wire).unwrap().1;
         assert_eq!(
             line.resolve(prefix, &table).unwrap(),
             Field {
@@ -606,7 +610,7 @@ mod tests {
         );
         for wire in [&[0xff, 36][..], &[0x81][..], &[0x11][..]] {
             assert!(
-                FieldLine::read(wire)
+                be_field_line(wire)
                     .unwrap()
                     .1
                     .resolve(prefix, &table)
@@ -614,20 +618,20 @@ mod tests {
             );
         }
         for wire in [&[0x50, 0x81, 0xff][..], &[0xff; 12][..]] {
-            assert!(FieldLine::read(wire).is_err());
+            assert!(be_field_line(wire).is_err());
         }
         table
             .apply(EncoderInstruction::SetDynamicTableCapacity(34))
             .unwrap();
         assert!(
-            FieldLine::read(&[0x80])
+            be_field_line(&[0x80])
                 .unwrap()
                 .1
                 .resolve(prefix, &table)
                 .is_err()
         );
         assert!(
-            FieldLine::read(&[0x60, 0])
+            be_field_line(&[0x60, 0])
                 .unwrap()
                 .1
                 .resolve(prefix, &table)
@@ -643,27 +647,27 @@ mod tests {
             base: 0,
         };
         let input = [0xd1, 0x50, 1, b'a', 0x21, b'x', 1, b'y', 0xff];
-        let (rest, method) = FieldLine::read(&input).unwrap();
+        let (rest, method) = be_field_line(&input).unwrap();
         assert_eq!(method.resolve(prefix, &table).unwrap().value, "GET");
         assert_eq!(rest, &input[1..]);
-        let (rest, authority) = FieldLine::read(rest).unwrap();
+        let (rest, authority) = be_field_line(rest).unwrap();
         assert_eq!(authority.resolve(prefix, &table).unwrap().value, "a");
         assert_eq!(rest, &input[4..]);
-        let (rest, custom) = FieldLine::read(rest).unwrap();
+        let (rest, custom) = be_field_line(rest).unwrap();
         let custom = custom.resolve(prefix, &table).unwrap();
         assert_eq!(custom.name, "x");
         assert_eq!(custom.value, "y");
         assert_eq!(rest, &[0xff]);
         // A complete section must reject a malformed suffix, not silently stop.
         assert!(be_field_section(&[0, 0, 0xd1, 0xff]).is_err());
-        assert!(FieldLine::read(&[]).is_err());
+        assert!(be_field_line(&[]).is_err());
     }
 
     #[test]
     fn accepts_unused_base_and_preserves_never_index() {
         for delta_base in [0, 1, 127, VARINT_MAX] {
             let mut wire = vec![0];
-            put_prefixed_integer(&mut wire, delta_base, 7, 0).unwrap();
+            wire.put_prefixed_integer(delta_base, 7, 0).unwrap();
             wire.push(0xd1); // :method = GET
             assert_eq!(be_field_section(wire.as_slice()).unwrap().1[0].value, "GET");
         }

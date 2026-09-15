@@ -1,35 +1,34 @@
-//! Shared QPACK state. Encoder/Decoder own their directional protocol state.
+//! Connection-level coordination for the two independent QPACK directions.
 
-use std::{
-    future::poll_fn,
-    sync::{Arc, Mutex},
-    task::Poll,
-};
+use std::sync::Arc;
 
 use bytes::Bytes;
-use instruction::EncoderInstruction;
 use qbase::varint::VARINT_MAX;
-use tokio::sync::mpsc;
 
 use super::frame;
 use crate::{Error, Result, Transport};
 
+mod codec;
 mod decoder;
 mod encoder;
-mod field;
-pub(super) mod instruction;
-mod string_literal;
 mod table;
 
 #[cfg(test)]
 pub(crate) mod tests;
 
+pub(crate) use codec::field::Field;
+#[cfg(test)]
+pub(crate) use codec::field::{WriteFieldSection, be_field_section};
 use decoder::Decoder;
 use encoder::Encoder;
-pub(crate) use field::Field;
-use field::should_never_index;
-#[cfg(test)]
-pub(crate) use field::{WriteFieldSection, be_field_section};
+
+/// Local policy permitted by RFC 9204 section 7.1.3; not an RFC-mandated list.
+fn should_never_index(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"authorization" | b"proxy-authorization" | b"cookie" | b"set-cookie"
+    )
+}
 
 /// Decoder-advertised limits, RFC 9204 section 5. Both default to zero.
 /// These are extracted from HTTP/3 SETTINGS; codec constructors validate their ranges. Remembered 0-RTT limits never carry table contents into a new connection.
@@ -59,40 +58,11 @@ pub(crate) fn limits(settings: &frame::Settings) -> (Settings, u64) {
     )
 }
 
-/// Directional compression resources and the transport they belong to.
+/// Owns the outgoing encoder and incoming decoder; each direction drives its own I/O.
 pub struct Qpack<T: Transport> {
-    pub(crate) transport: Arc<T>,
-    pub(super) encoder: Mutex<Result<Encoder>>,
-    pub(super) decoder: Mutex<Result<Decoder>>,
-}
-
-/// Release a decode registration if its future exits before normal cleanup.
-struct DecodeGuard<'a, T: Transport> {
-    qpack: &'a Qpack<T>,
-    stream_id: u64,
-}
-
-impl<T: Transport> Drop for DecodeGuard<'_, T> {
-    fn drop(&mut self) {
-        let wakes = {
-            let mut state = self.qpack.decoder.lock().unwrap();
-            let Ok(decoder) = state.as_mut() else {
-                return;
-            };
-            if !decoder.decoding.remove(&self.stream_id) {
-                return;
-            }
-            decoder.cancel_stream(self.stream_id)
-        };
-        match wakes {
-            Ok(wakes) => {
-                for wake in wakes {
-                    wake.wake();
-                }
-            }
-            Err(error) => self.qpack.on_error(error),
-        }
-    }
+    transport: Arc<T>,
+    encoder: Encoder,
+    decoder: Decoder,
 }
 
 impl<T: Transport> Qpack<T> {
@@ -102,142 +72,76 @@ impl<T: Transport> Qpack<T> {
         bi: Arc<super::stream::bi::BiStreams<T::StreamReader, T::StreamWriter>>,
     ) -> Result<Arc<Self>> {
         let (local, max_fields) = limits(&settings.local);
-        let (sender, receiver) = mpsc::channel(16);
-        let mut decoder = Decoder::new(local, frame::MAX_BUFFERED_FRAME_PAYLOAD)?;
-        decoder.max_field_section_size = max_fields;
+        let (encoder, receiver, completed) = Encoder::new(Settings::default())?;
+        let (decoder, feedback, insert_count) =
+            Decoder::new(local, frame::MAX_BUFFERED_FRAME_PAYLOAD, max_fields)?;
         let qpack = Arc::new(Self {
             transport,
-            encoder: Mutex::new(Ok(Encoder::new(Settings::default(), sender)?)),
-            decoder: Mutex::new(Ok(decoder)),
+            encoder,
+            decoder,
         });
-        tokio::spawn({
-            let (qpack, bi) = (qpack.clone(), bi.clone());
-            async move { qpack.send_encoder(receiver, &bi).await }
-        });
-        tokio::spawn({
-            let qpack = qpack.clone();
-            async move { qpack.send_decoder(&bi).await }
-        });
+        qpack.encoder.start(&qpack, receiver, completed, bi.clone());
+        qpack.decoder.start(&qpack, feedback, insert_count, bi);
         Ok(qpack)
     }
 
-    pub(crate) fn configure(&self, peer: Settings, max_fields: u64) -> Result<()> {
-        let mut state = self.encoder.lock().unwrap();
-        let encoder = state.as_mut().map_err(|error| *error)?;
-        encoder.apply_peer_settings(peer)?;
-        encoder.max_field_section_size = max_fields.min(frame::MAX_BUFFERED_FRAME_PAYLOAD as u64);
-        if peer.max_table_capacity != 0 {
-            encoder.queue_instruction(EncoderInstruction::SetDynamicTableCapacity(
-                peer.max_table_capacity
-                    .min(frame::MAX_BUFFERED_FRAME_PAYLOAD as u64),
-            ))?;
-        }
-        Ok(())
+    pub(super) async fn receive_encoder<R: tokio::io::AsyncRead + Unpin>(
+        &self,
+        recv: &mut R,
+    ) -> Result<()> {
+        self.decoder.receive(recv).await
     }
 
+    pub(super) async fn receive_decoder<R: tokio::io::AsyncRead + Unpin>(
+        &self,
+        recv: &mut R,
+    ) -> Result<()> {
+        self.encoder.receive(recv).await
+    }
+
+    pub(crate) fn configure(&self, peer: Settings, max_fields: u64) -> Result<()> {
+        self.encoder.configure(peer, max_fields)
+    }
+
+    #[cfg(test)]
     pub(crate) fn error(&self) -> Option<Error> {
-        self.encoder.lock().unwrap().as_ref().err().copied()
+        self.encoder.error()
     }
 
     pub(crate) fn close(&self, error: Error) -> Error {
-        let (error, wakes) = {
-            let mut encoder = self.encoder.lock().unwrap();
-            let error = match *encoder {
-                Err(error) => error,
-                Ok(_) => {
-                    *encoder = Err(error);
-                    error
-                }
-            };
-            let mut decoder = self.decoder.lock().unwrap();
-            let wakes = match decoder.as_mut() {
-                Ok(decoder) => decoder.take_waiters(),
-                Err(_) => Vec::new(),
-            };
-            *decoder = Err(error);
-            (error, wakes)
-        };
-        for wake in wakes {
-            wake.wake();
-        }
+        let error = self.encoder.close(error);
+        self.decoder.close(error);
         error
     }
 
     pub(crate) fn encode(&self, id: u64, fields: Vec<Field>) -> Result<Bytes> {
-        let result = {
-            let mut state = self.encoder.lock().unwrap();
-            state.as_mut().map_err(|error| *error)?.encode(id, fields)
-        };
-        if let Err(error) = result {
-            self.on_error(error);
-        }
-        result
+        self.encoder
+            .encode(id, fields)
+            .inspect_err(|error| self.on_error(*error))
     }
 
     pub(crate) async fn decode(&self, id: u64, payload: Bytes) -> Result<Vec<Field>> {
-        let prefix = {
-            let mut state = self.decoder.lock().unwrap();
-            let decoder = state.as_mut().map_err(|error| *error)?;
-            if !decoder.decoding.insert(id) {
-                return Err(Error::H3_REQUEST_CANCELLED);
-            }
-            decoder
-                .read_prefix(&payload)
-                .map(|(rest, prefix)| (payload.len() - rest.len(), prefix))
-        };
-        let _guard = DecodeGuard {
-            qpack: self,
-            stream_id: id,
-        };
-        let (offset, prefix) = prefix.inspect_err(|error| self.on_error(*error))?;
-        poll_fn(|cx| {
-            let (result, wake) = {
-                let mut state = self.decoder.lock().unwrap();
-                let decoder = match state.as_mut() {
-                    Ok(decoder) => decoder,
-                    Err(error) => return Poll::Ready(Err(*error)),
-                };
-                if !decoder.decoding.contains(&id) {
-                    return Poll::Ready(Err(Error::H3_REQUEST_CANCELLED));
-                }
-                let result = decoder.poll_decode(id, prefix, &payload[offset..], cx);
-                if result.is_ready() {
-                    decoder.decoding.remove(&id);
-                }
-                (result, decoder.take_writer())
-            };
-            if let Some(wake) = wake {
-                wake.wake();
-            }
-            if let Poll::Ready(Err(error)) = result {
-                self.on_error(error);
-            }
-            result
-        })
-        .await
+        self.decoder
+            .decode(id, payload)
+            .await
+            .inspect_err(|error| self.on_error(*error))
     }
 
     /// Cancel reception and synchronously submit any required QPACK feedback.
     pub fn cancel(&self, stream_id: u64) -> Result<()> {
-        let wakes = {
-            let mut state = self.decoder.lock().unwrap();
-            state
-                .as_mut()
-                .map_err(|error| *error)?
-                .cancel_stream(stream_id)
-        };
-        match wakes {
-            Ok(wakes) => {
-                for wake in wakes {
-                    wake.wake();
-                }
-                Ok(())
-            }
-            Err(error) => {
-                self.on_error(error);
-                Err(error)
-            }
-        }
+        self.decoder
+            .cancel(stream_id)
+            .inspect_err(|error| self.on_error(*error))
+    }
+
+    fn fail(
+        &self,
+        error: Error,
+        bi: &super::stream::bi::BiStreams<T::StreamReader, T::StreamWriter>,
+    ) {
+        let error = self.close(error);
+        let _ = self.transport.close(error.to_string(), error.as_u64());
+        bi.close(error);
     }
 
     pub(crate) fn on_error(&self, error: Error) {

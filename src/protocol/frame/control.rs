@@ -23,11 +23,12 @@ pub(crate) enum Control {
 
 /// Type prefix of a peer unidirectional stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub(crate) enum StreamType {
-    Control,
-    Push,
-    QpackEncoder,
-    QpackDecoder,
+    Control = 0x00,
+    Push = 0x01,
+    QpackEncoder = 0x02,
+    QpackDecoder = 0x03,
 }
 
 impl TryFrom<VarInt> for StreamType {

@@ -1,5 +1,4 @@
 pub(crate) mod bi;
-pub(crate) mod qpack;
 pub(crate) mod read;
 pub(crate) mod write;
 

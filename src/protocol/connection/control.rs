@@ -37,8 +37,15 @@ impl<T: Transport> H3Connection<T> {
                 StreamType::QpackEncoder => self.qpack.receive_encoder(&mut recv).await,
                 StreamType::QpackDecoder => self.qpack.receive_decoder(&mut recv).await,
             }
-        }
-        .await;
+        };
+        let result = tokio::select! {
+            biased;
+            error = self.transport.terminated() => {
+                self.close(error);
+                return;
+            }
+            result = result => result,
+        };
         // Retain the half until failure handling completes, including transport close.
         if let Err(error) = result {
             self.fail(error).await;
@@ -101,7 +108,7 @@ impl<T: Transport> H3Connection<T> {
     }
 
     async fn send_control(&self, send: &mut T::StreamWriter) -> Result<()> {
-        let mut bytes = vec![0];
+        let mut bytes = vec![StreamType::Control as u8];
         bytes.put_control(&Control::Settings(Frame::new(self.settings.local.clone())?));
         async {
             send.write_all(&bytes).await?;
