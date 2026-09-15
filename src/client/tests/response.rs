@@ -1,7 +1,12 @@
 use super::*;
 
 async fn read_response<R: AsyncRead + Unpin + Send + 'static>(recv: R) -> Result<Response> {
-    super::read_response(H3ReadStream::new(0, recv), Arc::new(Qpack::default()), None).await
+    super::read_response(
+        H3ReadStream::new(0, recv),
+        crate::protocol::qpack::tests::shared(),
+        None,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -33,36 +38,40 @@ async fn preserves_set_cookie_headers_through_message_roundtrip() {
         let mut encoded = Vec::new();
         encoded.put_frame(
             &Frame::new(Headers {
-                field_section: Qpack::default().encode(0, fields).unwrap(),
+                field_section: crate::protocol::qpack::tests::shared()
+                    .encode(0, fields)
+                    .unwrap(),
             })
             .unwrap(),
         );
 
         let response = read_response(Cursor::new(encoded)).await.unwrap();
-        let outgoing: common::Response<Write> = match response {
+        let outgoing: common::Response<Write> = match &response {
             Response::Bytes(response) => {
                 assert!(buffered);
-                crate::server::Response::from(response.message).into()
+                crate::server::Response::from(response.message.clone()).into()
             }
             Response::Streaming(response) => {
                 assert!(!buffered);
-                crate::server::Response::from(response.message).into()
+                crate::server::Response::from(response.message.clone()).into()
             }
         };
         let mut reencoded = Vec::new();
         crate::server::respond(
             outgoing,
             H3WriteStream::new(4, &mut reencoded),
-            Arc::new(Qpack::default()),
+            crate::protocol::qpack::tests::shared(),
             &Method::GET,
         )
         .await
         .unwrap();
+        // Keep the receive handle alive until the shared body reaches EOF.
+        drop(response);
 
         let H3Frame::Headers(frame) = be_frame(&mut reencoded.as_slice()).await.unwrap() else {
             panic!("expected HEADERS")
         };
-        let fields = Qpack::default()
+        let fields = crate::protocol::qpack::tests::shared()
             .decode(4, frame.payload.field_section)
             .await
             .unwrap();

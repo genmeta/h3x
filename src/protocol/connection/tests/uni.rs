@@ -41,11 +41,11 @@ fn inject_uni(peer: &Memory, prefix: &[u8], error: Option<io::Error>) -> Arc<Not
     peer.next_uni.set(id + 4);
     peer.outgoing_uni.push((
         id,
-        Box::new(EndedStream {
+        Recv(Box::new(EndedStream {
             prefix: io::Cursor::new(prefix.to_vec()),
             error,
             dropped: dropped.clone(),
-        }),
+        })),
     ));
     dropped
 }
@@ -86,7 +86,7 @@ async fn requests_survive_unclassified_end(prefix: &[u8], mut error: Option<io::
             accept_on(&server, |request| async {
                 if request_index == 0 {
                     // End the extra stream while a normal request is still in flight.
-                    let dropped = inject_uni(&client.transport, prefix, error.take());
+                    let dropped = inject_uni(client.transport(), prefix, error.take());
                     dropped.notified().await;
                     assert_eq!(server.error(), None);
                     assert_eq!(client.error(), None);
@@ -159,7 +159,11 @@ async fn unclassified_uni_read_errors_preserve_connection_errors() {
                     Error::H3_INTERNAL_ERROR
                 });
                 inject_uni(&b, prefix, Some(error));
-                assert_eq!(connection.closed().await, Err(expected));
+                assert_eq!(
+                    wait_for_transport(connection.transport(), &connection.qpack, &connection.bi)
+                        .await,
+                    Err(expected)
+                );
                 assert_eq!(connection.error(), Some(expected));
             }
         }
@@ -185,7 +189,7 @@ async fn identified_critical_stream_fin_and_reset_still_close_connection() {
                 reset.then(|| reset_error(io::ErrorKind::BrokenPipe)),
             );
             assert_eq!(
-                connection.closed().await,
+                wait_for_transport(connection.transport(), &connection.qpack, &connection.bi).await,
                 Err(Error::H3_CLOSED_CRITICAL_STREAM)
             );
         }
@@ -193,17 +197,20 @@ async fn identified_critical_stream_fin_and_reset_still_close_connection() {
 }
 
 #[tokio::test]
-async fn ended_unclassified_streams_release_classification_slots() {
+async fn ended_unclassified_streams_do_not_block_following_control_stream() {
     let (a, b) = pair();
     let connection = H3Connection::new(a);
-    // More than MAX_PENDING_STREAM_TYPES must not starve the following control stream.
+    // Ended unclassified streams must not starve the following control stream.
     for _ in 0..32 {
         inject_uni(&b, &[], None);
         inject_uni(&b, &[0x40], Some(reset_error(io::ErrorKind::BrokenPipe)));
     }
     let (_, mut control) = b.open_uni_stream().await.unwrap().unwrap();
     control.write_all(&[0, 4, 0, 7, 1, 1]).await.unwrap();
-    assert_eq!(connection.closed().await, Err(Error::H3_ID_ERROR));
+    assert_eq!(
+        wait_for_transport(connection.transport(), &connection.qpack, &connection.bi).await,
+        Err(Error::H3_ID_ERROR)
+    );
     assert!(connection.peer_settings_received());
 }
 
@@ -223,7 +230,7 @@ async fn partial_stream_type_resumes_after_an_unknown_stream_is_discarded() {
     };
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         tokio::select! {
-            result = connection.closed() => result,
+            result = wait_for_transport(connection.transport(), &connection.qpack, &connection.bi) => result,
             _ = peer => unreachable!(),
         }
     })
@@ -243,9 +250,12 @@ async fn duplicate_qpack_streams_close_connection() {
         let (_, mut two) = b.open_uni_stream().await.unwrap().unwrap();
         // Uniqueness depends on the type's value, not its varint encoding.
         two.write_all(&[0x40, stream_type]).await.unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), connection.closed())
-            .await
-            .expect("duplicate QPACK streams must close the connection");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_transport(connection.transport(), &connection.qpack, &connection.bi),
+        )
+        .await
+        .expect("duplicate QPACK streams must close the connection");
         assert_eq!(result, Err(Error::H3_STREAM_CREATION_ERROR));
     }
 }
@@ -263,7 +273,7 @@ async fn slow_unclassified_stream_does_not_block_control_and_wrong_goaway_is_rej
     };
     tokio::pin!(peer);
     assert_eq!(
-        tokio::select! { result=connection.closed()=>result, _=&mut peer=>unreachable!() },
+        tokio::select! { result=wait_for_transport(connection.transport(), &connection.qpack, &connection.bi)=>result, _=&mut peer=>unreachable!() },
         Err(Error::H3_ID_ERROR)
     );
     assert!(connection.peer_settings_received());

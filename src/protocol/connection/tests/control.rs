@@ -16,7 +16,7 @@ async fn invalid_control_frames_close_with_the_exact_protocol_error() {
             std::future::pending::<()>().await
         };
         tokio::pin!(peer);
-        let error = tokio::select! { result=connection.closed()=>result.unwrap_err(), _=&mut peer=>unreachable!() };
+        let error = tokio::select! { result=wait_for_transport(connection.transport(), &connection.qpack, &connection.bi)=>result.unwrap_err(), _=&mut peer=>unreachable!() };
         assert_eq!(error, expected, "control bytes: {wire:?}");
         assert_eq!(connection.error(), Some(expected));
         assert_eq!(connection.qpack().error(), Some(expected));
@@ -36,7 +36,7 @@ async fn duplicate_control_stream_closes_connection() {
     };
     tokio::pin!(peer);
     assert_eq!(
-        tokio::select! { result=connection.closed()=>result, _=&mut peer=>unreachable!() },
+        tokio::select! { result=wait_for_transport(connection.transport(), &connection.qpack, &connection.bi)=>result, _=&mut peer=>unreachable!() },
         Err(Error::H3_STREAM_CREATION_ERROR)
     );
 }
@@ -69,10 +69,10 @@ async fn construction_drives_settings_without_any_connection_future() {
 async fn transport_role_selects_control_frame_rules() {
     for (role, frames, expected) in [
         (Role::Client, vec![7, 1, 3], Error::H3_ID_ERROR),
-        // A client GOAWAY carries a push ID, so 3 is valid. A subsequent DATA is not.
+        // In the symmetric extension, client GOAWAY identifies server bidirectional streams.
         (
             Role::Server,
-            vec![7, 1, 3, 0, 0],
+            vec![7, 1, 1, 0, 0],
             Error::H3_FRAME_UNEXPECTED,
         ),
         (Role::Server, vec![13, 1, 5, 13, 1, 4], Error::H3_ID_ERROR),
@@ -88,7 +88,7 @@ async fn transport_role_selects_control_frame_rules() {
             std::future::pending::<()>().await;
         };
         let error = tokio::select! {
-            result = connection.closed() => result.unwrap_err(),
+            result = wait_for_transport(connection.transport(), &connection.qpack, &connection.bi) => result.unwrap_err(),
             _ = peer => unreachable!(),
         };
         assert_eq!(error, expected, "role {role:?}");

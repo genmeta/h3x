@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::StatusCode;
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 
 use super::{
     Read, Write,
@@ -98,11 +98,25 @@ impl<B> ReadResponse for Response<Read, B> {
     fn status(&self) -> StatusCode {
         self.message.0.lock().unwrap().status()
     }
+
+    fn headers(&self) -> HeaderMap {
+        ReadResponse::headers(&*self.message.0.lock().unwrap())
+    }
 }
 
 impl<B> WriteResponse for Response<Write, B> {
     fn set_status(&mut self, status: StatusCode) -> &mut Self {
         self.message.0.lock().unwrap().set_status(status);
+        self
+    }
+
+    fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
+        self.message.0.lock().unwrap().set_header(name, value);
+        self
+    }
+
+    fn append_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
+        self.message.0.lock().unwrap().append_header(name, value);
         self
     }
 }

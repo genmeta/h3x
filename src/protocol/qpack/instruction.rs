@@ -1,10 +1,10 @@
 //! QPACK instruction wire format (RFC 9204 sections 4.3 and 4.4).
 //! Dynamic-table and outstanding-section validation belongs to the codec state.
 use bytes::{BufMut, Bytes};
-use httlib_huffman::DecoderSpeed;
 use qbase::varint::VARINT_MAX;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+use super::string_literal::{WriteStringLiteral, be_string_literal, be_string_literal_with_first};
 use crate::{Error, Result, protocol::frame::MAX_BUFFERED_FRAME_PAYLOAD};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +49,7 @@ impl EncoderInstruction {
                     return Err(Error::H3_EXCESSIVE_LOAD);
                 }
                 put_prefixed_integer(&mut out, *index, 6, 0x80 | (u8::from(*static_table) << 6))
-                    .and_then(|()| put_string_literal(&mut out, value, 8, 0))
+                    .and_then(|()| out.put_string_literal(value, 8, 0))
             }
             Self::InsertWithLiteralName { name, value } => {
                 if name.len() > MAX_BUFFERED_FRAME_PAYLOAD
@@ -57,8 +57,8 @@ impl EncoderInstruction {
                 {
                     return Err(Error::H3_EXCESSIVE_LOAD);
                 }
-                put_string_literal(&mut out, name, 6, 0x40)
-                    .and_then(|()| put_string_literal(&mut out, value, 8, 0))
+                out.put_string_literal(name, 6, 0x40)
+                    .and_then(|()| out.put_string_literal(value, 8, 0))
             }
         };
         result.map_err(|_| Error::QPACK_ENCODER_STREAM_ERROR)?;
@@ -73,17 +73,15 @@ impl EncoderInstruction {
             if static_table && super::table::get(index).is_none() {
                 return Err(Error::QPACK_ENCODER_STREAM_ERROR);
             }
-            let first = read_byte(reader).await?;
-            let value = read_string(reader, first, 8).await?;
+            let value = be_string_literal(reader, 8).await?;
             Ok(Self::InsertWithNameReference {
                 static_table,
                 index,
                 value,
             })
         } else if first & 0x40 != 0 {
-            let name = read_string(reader, first, 6).await?;
-            let first = read_byte(reader).await?;
-            let value = read_string(reader, first, 8).await?;
+            let name = be_string_literal_with_first(reader, first, 6).await?;
+            let value = be_string_literal(reader, 8).await?;
             Ok(Self::InsertWithLiteralName { name, value })
         } else {
             let value = read_integer(reader, first, 5, Error::QPACK_ENCODER_STREAM_ERROR).await?;
@@ -126,15 +124,15 @@ impl DecoderInstruction {
     }
 }
 
-async fn read_byte(reader: &mut (impl AsyncRead + Unpin)) -> Result<u8> {
+pub(super) async fn read_byte<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<u8> {
     reader
         .read_u8()
         .await
         .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)
 }
 
-async fn read_integer(
-    reader: &mut (impl AsyncRead + Unpin),
+pub(super) async fn read_integer<T: AsyncRead + Unpin + ?Sized>(
+    reader: &mut T,
     first: u8,
     bits: u8,
     error: Error,
@@ -159,28 +157,6 @@ async fn read_integer(
     be_prefixed_integer(&wire[..len], bits)
         .map(|(_, value)| value)
         .map_err(|_| error)
-}
-
-async fn read_string(reader: &mut (impl AsyncRead + Unpin), first: u8, bits: u8) -> Result<Bytes> {
-    let len = read_integer(reader, first, bits - 1, Error::QPACK_ENCODER_STREAM_ERROR).await?;
-    if len > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
-        return Err(Error::H3_EXCESSIVE_LOAD);
-    }
-    // Rebuild only the length prefix to reuse the existing Huffman decoder.
-    let mut wire = Vec::new();
-    put_prefixed_integer(&mut wire, len, bits - 1, first & (1 << (bits - 1)))?;
-    let start = wire.len();
-    wire.resize(start + len as usize, 0);
-    reader
-        .read_exact(&mut wire[start..])
-        .await
-        .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-    let (_, value) =
-        be_string_literal(&wire, bits).map_err(|_| Error::QPACK_ENCODER_STREAM_ERROR)?;
-    if value.len() > MAX_BUFFERED_FRAME_PAYLOAD {
-        return Err(Error::H3_EXCESSIVE_LOAD);
-    }
-    Ok(value)
 }
 
 /// RFC 9204 section 4.1.1; RFC 7541 section 5.1. Not a QUIC varint.
@@ -233,36 +209,6 @@ pub(super) fn be_prefixed_integer(mut input: &[u8], prefix_bits: u8) -> Result<(
         }
     }
     Err(Error::QPACK_DECOMPRESSION_FAILED)
-}
-
-/// RFC 9204 section 4.1.2: prefix_bits includes H; this encoder writes H = 0.
-pub(super) fn put_string_literal(
-    output: &mut impl BufMut,
-    value: &[u8],
-    prefix_bits: u8,
-    high_bits: u8,
-) -> Result<()> {
-    put_prefixed_integer(output, value.len() as u64, prefix_bits - 1, high_bits)?;
-    output.put_slice(value);
-    Ok(())
-}
-
-/// RFC 9204 section 4.1.2: prefix_bits includes the Huffman flag.
-pub(super) fn be_string_literal(input: &[u8], prefix_bits: u8) -> Result<(&[u8], Bytes)> {
-    let first = *input.first().ok_or(Error::QPACK_DECOMPRESSION_FAILED)?;
-    let huffman = first & (1 << (prefix_bits - 1)) != 0;
-    let (input, len) = be_prefixed_integer(input, prefix_bits - 1)?;
-    let len = usize::try_from(len).map_err(|_| Error::QPACK_DECOMPRESSION_FAILED)?;
-    let (encoded, rest) = input
-        .split_at_checked(len)
-        .ok_or(Error::QPACK_DECOMPRESSION_FAILED)?;
-    if !huffman {
-        return Ok((rest, Bytes::copy_from_slice(encoded)));
-    }
-    let mut decoded = Vec::new();
-    httlib_huffman::decode(encoded, &mut decoded, DecoderSpeed::FourBits)
-        .map_err(|_| Error::QPACK_DECOMPRESSION_FAILED)?;
-    Ok((rest, Bytes::from(decoded)))
 }
 
 #[cfg(test)]
@@ -422,12 +368,5 @@ mod tests {
         }
         assert!(be_prefixed_integer(&[0xff; 12][..], 8).is_err());
         assert!(put_prefixed_integer(&mut Vec::new(), VARINT_MAX + 1, 8, 0).is_err());
-    }
-
-    #[test]
-    fn string_literals_preserve_the_unconsumed_suffix() {
-        let (rest, value) = be_string_literal(&[1, b'a', 42], 8).unwrap();
-        assert_eq!(value, "a");
-        assert_eq!(rest, &[42]);
     }
 }

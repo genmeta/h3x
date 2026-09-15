@@ -50,6 +50,13 @@ impl<IO> ReadRequest for Request<IO> {
             Self::Streaming(request) => request.scheme(),
         }
     }
+
+    fn headers(&self) -> http::HeaderMap {
+        match self {
+            Self::Bytes(request) => request.headers(),
+            Self::Streaming(request) => request.headers(),
+        }
+    }
 }
 
 impl WriteRequest for Request<Write> {
@@ -77,6 +84,13 @@ impl ReadResponse for Response<Read> {
             Self::Streaming(response) => response.status(),
         }
     }
+
+    fn headers(&self) -> http::HeaderMap {
+        match self {
+            Self::Bytes(response) => response.headers(),
+            Self::Streaming(response) => response.headers(),
+        }
+    }
 }
 
 impl WriteResponse for Response<Write> {
@@ -89,6 +103,30 @@ impl WriteResponse for Response<Write> {
                 response.set_status(status);
             }
         };
+        self
+    }
+
+    fn set_header(&mut self, name: http::HeaderName, value: http::HeaderValue) -> &mut Self {
+        match self {
+            Self::Bytes(response) => {
+                response.set_header(name, value);
+            }
+            Self::Streaming(response) => {
+                response.set_header(name, value);
+            }
+        }
+        self
+    }
+
+    fn append_header(&mut self, name: http::HeaderName, value: http::HeaderValue) -> &mut Self {
+        match self {
+            Self::Bytes(response) => {
+                response.append_header(name, value);
+            }
+            Self::Streaming(response) => {
+                response.append_header(name, value);
+            }
+        }
         self
     }
 }
@@ -197,17 +235,33 @@ mod tests {
     }
 
     #[test]
-    fn response_enum_status_updates_both_body_modes() {
+    fn response_enum_metadata_updates_both_body_modes() {
         for mut response in [
             Response::<Write>::from(response::Response::<Write, Bytes>::default()),
             response::Response::default().streaming(1).into(),
         ] {
-            response.set_status(StatusCode::ACCEPTED);
+            response
+                .set_status(StatusCode::ACCEPTED)
+                .append_header(header::SET_COOKIE, HeaderValue::from_static("old=1"))
+                .append_header(header::SET_COOKIE, HeaderValue::from_static("old=2"))
+                .set_header(header::SET_COOKIE, HeaderValue::from_static("a=1"))
+                .append_header(header::SET_COOKIE, HeaderValue::from_static("b=2"));
             let incoming: Response<Read> = match response {
                 Response::Bytes(response) => response::Response::from(response.message).into(),
                 Response::Streaming(response) => response::Response::from(response.message).into(),
             };
             assert_eq!(incoming.status(), StatusCode::ACCEPTED);
+            assert_eq!(
+                incoming
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .collect::<Vec<_>>(),
+                [
+                    &HeaderValue::from_static("a=1"),
+                    &HeaderValue::from_static("b=2")
+                ]
+            );
         }
     }
 }

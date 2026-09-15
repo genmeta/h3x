@@ -1,13 +1,13 @@
 //! Incoming requests and responses on the original stream.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use bytes::Bytes;
 use http::{HeaderValue, Method, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::{
-    ArcWndBuf, Error, Result,
+    ArcWndBuf, Error, Result, Transport,
     common::{
         self, Read, Write,
         message::{ArcMessage, Message, ReadBody},
@@ -26,36 +26,46 @@ pub type Response<B = Bytes> = crate::common::response::Response<Write, B>;
 
 /// Send one response on the accepted request's matching send stream.
 ///
+/// For streaming responses, retain a producer clone until it finishes or resets
+/// the body. Dropping the last unfinished producer cancels sending.
+///
 /// `request_method` must be the original request's method so HEAD responses can
 /// preserve `Content-Length` without sending a body.
-pub async fn respond<WS, R, SR>(
+/// Streaming bodies bind before the returned future is polled, so dropping that
+/// future also cancels unfinished body operations.
+pub fn respond<WS, R, SR, T: Transport>(
     response: R,
     send: H3WriteStream<WS, SR>,
-    qpack: Arc<Qpack>,
+    qpack: Arc<Qpack<T>>,
     request_method: &Method,
-) -> Result<()>
+) -> impl Future<Output = Result<()>>
 where
     WS: AsyncWrite + Unpin,
     R: Into<common::Response<Write>>,
 {
-    match response.into() {
-        common::Response::Bytes(response) => {
-            tokio::select! {
-                biased;
-                error = qpack.terminated() => Err(error),
-                result = write_bytes_response(&response, send, &qpack, request_method) => result,
+    let response = response.into();
+    if let common::Response::Streaming(response) = &response {
+        let body = response.message.0.lock().unwrap().body_stream();
+        send.bind_body(&body);
+    }
+    async move {
+        match response {
+            common::Response::Bytes(response) => {
+                write_bytes_response(&response, send, &qpack, request_method).await
             }
-        }
-        common::Response::Streaming(response) => {
-            write_streaming_response(&response, send, &qpack, request_method).await
+            common::Response::Streaming(response) => {
+                let sending = write_streaming_response(&response, send, qpack, request_method);
+                drop(response);
+                sending.await
+            }
         }
     }
 }
 
 /// Read an HTTP request using the receive stream's ID and explicit QPACK.
-pub async fn accept<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'static>(
+pub async fn accept<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'static, T: Transport>(
     rs: H3ReadStream<RS, RW>,
-    qpack: Arc<Qpack>,
+    qpack: Arc<Qpack<T>>,
 ) -> Result<crate::common::Request<Read>> {
     let stream_id = rs.stream_id();
     let mut rs = BufReader::new(rs);
@@ -117,14 +127,14 @@ pub async fn accept<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'static>(
         Ok(common::Request::Bytes(request))
     } else {
         let mut body = ArcWndBuf::new(frame::MAX_DATA_CHUNK);
+        rs.get_ref().bind_body(&body);
         let request: common::request::Request<Read, _> =
             ArcMessage::from(message.with_body(body.clone())).into();
         let body_error = request.message.body_error();
         tokio::spawn(async move {
             let result = tokio::select! {
                 biased;
-                error = qpack.terminated() => Err(error),
-                error = body_error => Err(error),
+                    error = body_error => Err(error),
                 result = body::read_body(&mut rs, &mut body, mode, &qpack) => result,
             };
             match result {
@@ -141,10 +151,10 @@ pub async fn accept<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'static>(
 }
 
 /// Writes a buffered response using the original request method.
-async fn write_bytes_response<WS: AsyncWrite + Unpin, SR>(
+async fn write_bytes_response<WS: AsyncWrite + Unpin, SR, T: Transport>(
     response: &Response<Bytes>,
     mut ws: H3WriteStream<WS, SR>,
-    qpack: &Qpack,
+    qpack: &Qpack<T>,
     method: &Method,
 ) -> Result<()> {
     let (fields, mode, body) = {
@@ -174,40 +184,50 @@ async fn write_bytes_response<WS: AsyncWrite + Unpin, SR>(
     frame.put_frame(&Frame::new(Headers {
         field_section: qpack.encode(ws.stream_id(), fields)?,
     })?);
-    ws.write_all(&frame).await?;
-    if !body.is_empty() {
-        frame.clear();
-        frame.put_frame(&Frame::<Data>::new(Data(body.len()))?);
-        ws.write_all(&frame).await?;
-        ws.write_all(&body).await?;
-    }
-    ws.shutdown().await?;
-    Ok(())
-}
-
-/// Writes a streaming response using the original request method.
-async fn write_streaming_response<WS: AsyncWrite + Unpin, SR>(
-    response: &Response<ArcWndBuf>,
-    mut ws: H3WriteStream<WS, SR>,
-    qpack: &Qpack,
-    request_method: &Method,
-) -> Result<()> {
-    let mut body = response.message.0.lock().unwrap().body_stream();
-    ws.on_error({
-        let body = body.clone();
-        move |error| body.set_error(error)
-    });
-    let body_error = response.message.body_error();
     let stopped = ws.stopped();
     let result = tokio::select! {
         biased;
-        error = qpack.terminated() => Err(error),
         error = stopped => Err(error),
-        error = body_error => Err(error),
         result = async {
-            let (fields, mode) = {
-                let message = response.message.0.lock().unwrap();
-                let fields = message.fields();
+            ws.write_all(&frame).await?;
+            if !body.is_empty() {
+                frame.clear();
+                frame.put_frame(&Frame::<Data>::new(Data(body.len()))?);
+                ws.write_all(&frame).await?;
+                ws.write_all(&body).await?;
+            }
+            ws.shutdown().await?;
+            Ok::<_, Error>(())
+        } => result,
+    };
+    if let Err(error) = result {
+        ws.reset(error);
+    }
+    result
+}
+
+/// Writes a streaming response using the original request method.
+fn write_streaming_response<WS: AsyncWrite + Unpin, SR, T: Transport>(
+    response: &Response<ArcWndBuf>,
+    mut ws: H3WriteStream<WS, SR>,
+    qpack: Arc<Qpack<T>>,
+    request_method: &Method,
+) -> impl Future<Output = Result<()>> + use<WS, SR, T> {
+    let (fields, mut body) = {
+        let message = response.message.0.lock().unwrap();
+        (message.fields(), message.body_stream())
+    };
+    ws.bind_body(&body);
+    let body_error = response.message.body_error();
+    let stopped = ws.stopped();
+    let request_method = request_method.clone();
+    // Capture body and headers, never Response/ArcMessage: producer Drop must remain observable.
+    async move {
+        let result = tokio::select! {
+            biased;
+            error = stopped => Err(error),
+            error = body_error => Err(error),
+            result = async {
                 let parts = headers::response_parts(fields.clone())?;
                 let length = headers::content_length(&parts.headers)?;
                 if parts.status.is_informational() {
@@ -216,22 +236,21 @@ async fn write_streaming_response<WS: AsyncWrite + Unpin, SR>(
                 if parts.status == StatusCode::NO_CONTENT && length.is_some() {
                     return Err(Error::H3_MESSAGE_ERROR);
                 }
-                let mode = BodyMode::resolve(&parts, Some(request_method))?;
-                (fields, mode)
-            };
-            let mut frame = Vec::new();
-            frame.put_frame(&Frame::new(Headers {
-                field_section: qpack.encode(ws.stream_id(), fields)?,
-            })?);
-            ws.write_all(&frame).await?;
-            body::write_body(&mut body, &mut ws, mode).await
-        } => result,
-    };
-    if let Err(error) = result {
-        ws.reset(error);
-        body.set_error(error);
+                let mode = BodyMode::resolve(&parts, Some(&request_method))?;
+                let mut frame = Vec::new();
+                frame.put_frame(&Frame::new(Headers {
+                    field_section: qpack.encode(ws.stream_id(), fields)?,
+                })?);
+                ws.write_all(&frame).await?;
+                body::write_body(&mut body, &mut ws, mode).await
+            } => result,
+        };
+        if let Err(error) = result {
+            ws.reset(error);
+            body.set_error(error);
+        }
+        result
     }
-    result
 }
 
 #[cfg(test)]

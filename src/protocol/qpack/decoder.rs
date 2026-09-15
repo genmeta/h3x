@@ -1,6 +1,6 @@
 //! Decoder state and bounded wait registrations; field bytes stay in the decoding future.
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     task::{Context, Poll, Waker},
 };
 
@@ -23,6 +23,8 @@ pub(crate) struct Decoder {
     max_blocked_bytes: usize,
     known_received_count: u64,
     instructions: VecDeque<DecoderInstruction>,
+    pub(super) decoding: HashSet<u64>,
+    writer: Option<Waker>,
 }
 
 impl Decoder {
@@ -39,6 +41,8 @@ impl Decoder {
             max_blocked_bytes,
             known_received_count: 0,
             instructions: VecDeque::new(),
+            decoding: HashSet::new(),
+            writer: None,
         })
     }
 
@@ -100,18 +104,22 @@ impl Decoder {
         Poll::Ready(result)
     }
 
-    pub(crate) fn on_encoder_instruction(&mut self, instruction: EncoderInstruction) -> Result<()> {
+    pub(crate) fn on_encoder_instruction(
+        &mut self,
+        instruction: EncoderInstruction,
+    ) -> Result<Vec<Waker>> {
         if self.table.max_capacity() == 0 {
             return Err(Error::QPACK_ENCODER_STREAM_ERROR);
         }
         self.table.apply(instruction)?;
-        // ponytail: scan the bounded wait map; index by RIC if measured workloads require it.
-        for (ric, _, waker) in self.waiting.values() {
-            if *ric <= self.table.insert_count() {
-                waker.wake_by_ref();
-            }
-        }
-        Ok(())
+        let mut wakes: Vec<_> = self
+            .waiting
+            .values()
+            .filter(|(ric, _, _)| *ric <= self.table.insert_count())
+            .map(|(_, _, waker)| waker.clone())
+            .collect();
+        wakes.extend(self.take_writer());
+        Ok(wakes)
     }
 
     pub(super) fn finish(&mut self, id: u64) {
@@ -120,24 +128,49 @@ impl Decoder {
         }
     }
 
-    pub(crate) fn cancel_stream(&mut self, id: u64) -> Result<()> {
+    pub(crate) fn cancel_stream(&mut self, id: u64) -> Result<Vec<Waker>> {
         if id > VARINT_MAX {
             return Err(Error::H3_INTERNAL_ERROR);
         }
-        if let Some((_, _, waker)) = self.waiting.get(&id) {
-            waker.wake_by_ref();
+        self.decoding.remove(&id);
+        let mut wakes = Vec::new();
+        if let Some((_, bytes, waker)) = self.waiting.remove(&id) {
+            self.blocked_bytes -= bytes;
+            wakes.push(waker);
         }
-        self.finish(id);
         if self.table.max_capacity() != 0 {
             self.instructions
                 .push_back(DecoderInstruction::StreamCancellation(id));
         }
-        Ok(())
+        wakes.extend(self.take_writer());
+        Ok(wakes)
     }
 
-    pub(super) fn wake_all(&self) {
-        for (_, _, waker) in self.waiting.values() {
-            waker.wake_by_ref();
+    pub(super) fn take_waiters(&mut self) -> Vec<Waker> {
+        let mut wakes: Vec<_> = self
+            .waiting
+            .drain()
+            .map(|(_, (_, _, waker))| waker)
+            .collect();
+        wakes.extend(self.writer.take());
+        wakes
+    }
+
+    pub(super) fn take_writer(&mut self) -> Option<Waker> {
+        if !self.instructions.is_empty() || self.table.insert_count() > self.known_received_count {
+            self.writer.take()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn poll_instruction(&mut self, cx: &mut Context<'_>) -> Poll<DecoderInstruction> {
+        match self.next_instruction() {
+            Some(instruction) => Poll::Ready(instruction),
+            None => {
+                self.writer = Some(cx.waker().clone());
+                Poll::Pending
+            }
         }
     }
 

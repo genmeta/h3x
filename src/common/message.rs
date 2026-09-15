@@ -61,16 +61,6 @@ impl<B> Message<B> {
     }
 
     pub(crate) fn fields(&self) -> Vec<Field> {
-        self.headers()
-            .map(|(name, value)| Field {
-                name: Bytes::copy_from_slice(name.as_bytes()),
-                value: Bytes::copy_from_slice(value.as_bytes()),
-                never_index: value.is_sensitive(),
-            })
-            .collect()
-    }
-
-    pub(crate) fn headers(&self) -> impl Iterator<Item = (&str, &HeaderValue)> {
         self.pseudo_headers
             .iter()
             .map(|(name, value)| (*name, value))
@@ -79,6 +69,12 @@ impl<B> Message<B> {
                     .iter()
                     .map(|(name, value)| (name.as_str(), value)),
             )
+            .map(|(name, value)| Field {
+                name: Bytes::copy_from_slice(name.as_bytes()),
+                value: Bytes::copy_from_slice(value.as_bytes()),
+                never_index: value.is_sensitive(),
+            })
+            .collect()
     }
 
     pub fn with_body<T>(self, body: T) -> Message<T> {
@@ -174,16 +170,32 @@ pub trait ReadRequest: Sized {
     fn path(&self) -> String;
 
     fn scheme(&self) -> String;
+
+    /// Return an owned snapshot of the ordinary headers, excluding pseudo-headers.
+    /// Use [`HeaderMap::get_all`] to read multiple values for a name. Changing the
+    /// returned map does not change the request.
+    fn headers(&self) -> HeaderMap;
 }
 
-/// Server-side response status.
+/// Server-side response status and headers. Set these before sending the response.
 pub trait WriteResponse {
     fn set_status(&mut self, status: StatusCode) -> &mut Self;
+
+    /// Replace all existing values for this header name.
+    fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self;
+
+    /// Append a value, preserving existing values for this header name.
+    fn append_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self;
 }
 
-/// Client-side view of the response status.
+/// Client-side view of the response status and headers.
 pub trait ReadResponse {
     fn status(&self) -> StatusCode;
+
+    /// Return an owned snapshot of the ordinary headers, excluding pseudo-headers.
+    /// Use [`HeaderMap::get_all`] to read multiple values such as `Set-Cookie`.
+    /// Changing the returned map does not change the response.
+    fn headers(&self) -> HeaderMap;
 }
 
 #[async_trait]
@@ -242,12 +254,24 @@ impl<B> ReadRequest for Message<B> {
             .map_or("", |value| value.to_str().expect("invalid :scheme"))
             .to_owned()
     }
+
+    fn headers(&self) -> HeaderMap {
+        self.headers.clone()
+    }
 }
 
 impl<B> WriteResponse for Message<B> {
     fn set_status(&mut self, status: StatusCode) -> &mut Self {
         self.set_pseudo_header(":status", HeaderValue::from_str(status.as_str()).unwrap());
         self
+    }
+
+    fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
+        Message::set_header(self, name, value)
+    }
+
+    fn append_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
+        Message::append_header(self, name, value)
     }
 }
 
@@ -260,6 +284,10 @@ impl<B> ReadResponse for Message<B> {
                 .as_bytes(),
         )
         .expect("invalid :status")
+    }
+
+    fn headers(&self) -> HeaderMap {
+        self.headers.clone()
     }
 }
 
@@ -364,6 +392,7 @@ impl<B> ArcMessage<B> {
 
 impl ArcMessage<crate::ArcWndBuf> {
     /// Observe body errors and the loss of its last unfinished application owner.
+    /// The I/O pump must release its ArcMessage before polling this observer.
     pub(crate) fn body_error(&self) -> impl Future<Output = Error> + use<> {
         let message = Arc::downgrade(&self.0);
         let body = self.0.lock().unwrap().body.clone();

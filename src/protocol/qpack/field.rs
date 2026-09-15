@@ -3,9 +3,8 @@ use bytes::{BufMut, Bytes};
 use qbase::varint::VARINT_MAX;
 
 use super::{
-    instruction::{
-        be_prefixed_integer, be_string_literal, put_prefixed_integer, put_string_literal,
-    },
+    instruction::{be_prefixed_integer, put_prefixed_integer},
+    string_literal::{WriteStringLiteral, parse_string_literal},
     table::{self, DynamicTable},
 };
 use crate::{Error, Result};
@@ -177,7 +176,7 @@ impl FieldLine {
             ))
         } else if first & 0x40 != 0 {
             let (input, index) = be_prefixed_integer(input, 4)?;
-            let (input, value) = be_string_literal(input, 8)?;
+            let (input, value) = parse_string_literal(input, 8)?;
             Ok((
                 input,
                 Self::LiteralWithNameReference {
@@ -188,8 +187,8 @@ impl FieldLine {
                 },
             ))
         } else if first & 0x20 != 0 {
-            let (input, name) = be_string_literal(input, 4)?;
-            let (input, value) = be_string_literal(input, 8)?;
+            let (input, name) = parse_string_literal(input, 4)?;
+            let (input, value) = parse_string_literal(input, 8)?;
             Ok((
                 input,
                 Self::Literal(Field {
@@ -203,7 +202,7 @@ impl FieldLine {
             Ok((input, Self::IndexedPostBase { index }))
         } else {
             let (input, index) = be_prefixed_integer(input, 3)?;
-            let (input, value) = be_string_literal(input, 8)?;
+            let (input, value) = parse_string_literal(input, 8)?;
             Ok((
                 input,
                 Self::LiteralWithPostBaseNameReference {
@@ -235,7 +234,7 @@ impl FieldLine {
                     4,
                     0x40 | (u8::from(*never_index) << 5) | (u8::from(*static_table) << 4),
                 )?;
-                put_string_literal(output, value, 8, 0)
+                output.put_string_literal(value, 8, 0)
             }
             Self::LiteralWithPostBaseNameReference {
                 never_index,
@@ -243,16 +242,15 @@ impl FieldLine {
                 value,
             } => {
                 put_prefixed_integer(output, *index, 3, u8::from(*never_index) << 3)?;
-                put_string_literal(output, value, 8, 0)
+                output.put_string_literal(value, 8, 0)
             }
             Self::Literal(field) => {
-                put_string_literal(
-                    output,
+                output.put_string_literal(
                     &field.name,
                     4,
                     0x20 | (u8::from(field.never_index) << 4),
                 )?;
-                put_string_literal(output, &field.value, 8, 0)
+                output.put_string_literal(&field.value, 8, 0)
             }
         }
     }

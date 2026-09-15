@@ -1,62 +1,63 @@
 //! Control stream state and frame I/O. Keep futures alive through partial I/O.
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{Mutex as AsyncMutex, mpsc, oneshot},
-};
+use std::sync::Mutex;
+
+use qbase::varint::VarInt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::bi::BiStreams;
 use crate::{
-    Error, Result, Role,
+    Error, Result, Role, Transport,
     protocol::{
-        connection::{Goaway, Settings},
+        connection::{Settings, StreamCursor, close_connection, finish_connection},
         frame::{self, Frame, FrameType, H3Frame, Write as _},
         qpack::{self, Qpack},
     },
 };
 
-pub(crate) struct Control {
-    pub(crate) sender: mpsc::Sender<(H3Frame, oneshot::Sender<Result<()>>)>,
-    receiver: AsyncMutex<mpsc::Receiver<(H3Frame, oneshot::Sender<Result<()>>)>>,
-}
-
-impl Default for Control {
-    fn default() -> Self {
-        let (sender, receiver) = mpsc::channel(1);
-        Self {
-            sender,
-            receiver: AsyncMutex::new(receiver),
-        }
-    }
-}
-
-impl Control {
-    pub(crate) async fn send<W: AsyncWrite + Unpin>(
-        &self,
-        send: &mut W,
-        settings: &frame::Settings,
-    ) -> Result<()> {
-        send.write_all(&[0])
-            .await
-            .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-        write(send, &H3Frame::Settings(Frame::new(settings.clone())?)).await?;
-        let mut receiver = self.receiver.lock().await;
-        while let Some((frame, completed)) = receiver.recv().await {
-            // The driver owns each write even if its caller stops waiting.
-            let result = write(send, &frame).await;
-            let _ = completed.send(result);
-            result?;
-        }
-        Err(Error::H3_CLOSED_CRITICAL_STREAM)
-    }
-}
-
-pub(crate) async fn receive_control<R: AsyncRead + Unpin, W>(
-    recv: &mut R,
-    role: &Role,
+pub(crate) async fn send<T: Transport>(
+    transport: &T,
     settings: &Settings,
-    qpack: &Qpack,
-    goaway: &Goaway,
-    bi: &BiStreams<R, W>,
+    qpack: &Qpack<T>,
+    cursor: &Mutex<StreamCursor>,
+    bi: &BiStreams<T::Recv, T::Send>,
+) {
+    let mut send = None;
+    tokio::select! {
+        biased;
+        error = transport.terminated() => {
+            StreamCursor::complete_write(cursor, Err(error));
+            finish_connection(qpack, bi, error);
+            return;
+        },
+        result = async {
+            send = Some(super::uni::open_stream(transport).await?);
+            let send = send.as_mut().unwrap();
+            send.write_all(&[0]).await.map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+            write(send, &H3Frame::Settings(Frame::new(settings.local.clone())?)).await?;
+            let id = StreamCursor::local(cursor).await;
+            write(send, &H3Frame::Goaway(Frame::new(frame::Goaway {
+                id: VarInt::try_from(id).map_err(|_| Error::H3_ID_ERROR)?,
+            })?)).await
+        } => {
+            StreamCursor::complete_write(cursor, result);
+            if let Err(error) = result {
+                close_connection(transport, qpack, bi, error);
+                return;
+            }
+        },
+    }
+    // A completed GOAWAY does not finish this critical stream: retain it without FIN.
+    let error = transport.terminated().await;
+    finish_connection(qpack, bi, error);
+}
+
+pub(crate) async fn receive_control<T: Transport>(
+    recv: &mut T::Recv,
+    transport: &T,
+    settings: &Settings,
+    qpack: &Qpack<T>,
+    cursor: &Mutex<StreamCursor>,
+    bi: &BiStreams<T::Recv, T::Send>,
 ) -> Result<()> {
     let H3Frame::Settings(frame) = read(recv, true).await? else {
         return Err(Error::H3_MISSING_SETTINGS);
@@ -67,30 +68,60 @@ pub(crate) async fn receive_control<R: AsyncRead + Unpin, W>(
     let mut max_push = None;
     loop {
         let frame = read(recv, false).await?;
-        match (role, &frame) {
-            (Role::Client, H3Frame::Goaway(frame))
-                if !frame.payload.id.into_u64().is_multiple_of(4) =>
-            {
+        if apply(frame, transport.role(), qpack, cursor, bi, &mut max_push)? {
+            break;
+        }
+    }
+    let running = bi.running();
+    tokio::select! {
+        result = async {
+            loop {
+                let frame = read(recv, false).await?;
+                apply(frame, transport.role(), qpack, cursor, bi, &mut max_push)?;
+            }
+        } => result,
+        result = async {
+            StreamCursor::written(cursor).await?;
+            bi.drained(running).await;
+            transport.close(Error::H3_NO_ERROR.to_string(), Error::H3_NO_ERROR.as_u64())
+        } => result,
+    }
+}
+
+fn apply<T: Transport>(
+    frame: H3Frame,
+    role: Role,
+    qpack: &Qpack<T>,
+    cursor: &Mutex<StreamCursor>,
+    bi: &BiStreams<T::Recv, T::Send>,
+    max_push: &mut Option<u64>,
+) -> Result<bool> {
+    match frame {
+        H3Frame::Goaway(frame) => {
+            let id = frame.payload.id.into_u64();
+            let (peer, local) = {
+                let mut state = cursor.lock().unwrap();
+                (state.receive(id)?, state.goaway()?)
+            };
+            if let Some(wake) = local {
+                wake.wake();
+            }
+            bi.goaway(id, qpack);
+            if let Some(wake) = peer {
+                wake.wake();
+            }
+            Ok(true)
+        }
+        H3Frame::MaxPushId(frame) if role == Role::Server => {
+            let id = frame.payload.push_id.into_u64();
+            if max_push.is_some_and(|previous| id < previous) {
                 return Err(Error::H3_ID_ERROR);
             }
-            (_, H3Frame::Goaway(_)) => {}
-            (Role::Server, H3Frame::MaxPushId(frame)) => {
-                let id = frame.payload.push_id.into_u64();
-                if max_push.is_some_and(|previous| id < previous) {
-                    return Err(Error::H3_ID_ERROR);
-                }
-                max_push = Some(id);
-            }
-            (Role::Server, H3Frame::CancelPush(_)) => return Err(Error::H3_ID_ERROR),
-            _ => return Err(Error::H3_FRAME_UNEXPECTED),
+            *max_push = Some(id);
+            Ok(false)
         }
-        if let H3Frame::Goaway(frame) = frame {
-            let id = frame.payload.id.into_u64();
-            goaway.receive(id)?;
-            if *role == Role::Client {
-                bi.goaway(id, qpack);
-            }
-        }
+        H3Frame::CancelPush(_) if role == Role::Server => Err(Error::H3_ID_ERROR),
+        _ => Err(Error::H3_FRAME_UNEXPECTED),
     }
 }
 

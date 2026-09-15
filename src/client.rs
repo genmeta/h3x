@@ -8,7 +8,7 @@ use http::StatusCode;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::{
-    ArcWndBuf, Error, Result,
+    ArcWndBuf, Error, Result, Transport,
     common::{
         self, Read, Write,
         message::{ArcMessage, Message, ReadBody, WriteResponse},
@@ -32,12 +32,14 @@ pub type Response = crate::common::Response<Read>;
 /// concurrently with this future when the peer waits for body data before responding.
 /// Sending errors never discard a valid response; streaming writers observe them
 /// through their shared body. After a valid response, remaining uploads run in the background.
-pub async fn request<RS, WS, R, RW, SR>(
+/// Streaming bodies bind when this function is called, so dropping its unpolled
+/// future also cancels body operations.
+pub fn request<RS, WS, R, RW, SR, T: Transport>(
     request: R,
     recv: H3ReadStream<RS, RW>,
     send: H3WriteStream<WS, SR>,
-    qpack: Arc<Qpack>,
-) -> Result<Response>
+    qpack: Arc<Qpack<T>>,
+) -> impl Future<Output = Result<Response>> + Send
 where
     RS: AsyncRead + Unpin + Send + 'static,
     RW: Send + 'static,
@@ -47,30 +49,38 @@ where
 {
     use crate::ReadRequest;
     let request = request.into();
-    let method = request.method();
-    let encoder = qpack.clone();
-    let receiving = read_response(recv, qpack, Some(method));
-    let mut sending: Pin<Box<dyn Future<Output = Result<()>> + Send>> = match request {
-        common::Request::Bytes(request) => Box::pin(write_bytes_request(&request, send, encoder)?),
-        common::Request::Streaming(request) => {
-            Box::pin(write_streaming_request(&request, send, encoder)?)
-        }
-    };
-    tokio::pin!(receiving);
-    let response = tokio::select! {
-        response = &mut receiving => response,
-        _ = &mut sending => return receiving.await,
-    }?;
-    // Only a delivered response transfers the remaining upload to the background.
-    tokio::spawn(sending);
-    Ok(response)
+    if let common::Request::Streaming(request) = &request {
+        let body = request.message.0.lock().unwrap().body_stream();
+        send.bind_body(&body);
+    }
+    async move {
+        let method = request.method();
+        let encoder = qpack.clone();
+        let receiving = read_response(recv, qpack, Some(method));
+        let mut sending: Pin<Box<dyn Future<Output = Result<()>> + Send>> = match request {
+            common::Request::Bytes(request) => {
+                Box::pin(write_bytes_request(&request, send, encoder)?)
+            }
+            common::Request::Streaming(request) => {
+                Box::pin(write_streaming_request(&request, send, encoder)?)
+            }
+        };
+        tokio::pin!(receiving);
+        let response = tokio::select! {
+            response = &mut receiving => response,
+            _ = &mut sending => return receiving.await,
+        }?;
+        // Only a delivered response transfers the remaining upload to the background.
+        tokio::spawn(sending);
+        Ok(response)
+    }
 }
 
-fn write_bytes_request<WS, SR>(
+fn write_bytes_request<WS, SR, T: Transport>(
     req: &Request<Bytes>,
     mut ws: H3WriteStream<WS, SR>,
-    qpack: Arc<Qpack>,
-) -> Result<impl Future<Output = Result<()>> + Send + use<WS, SR>>
+    qpack: Arc<Qpack<T>>,
+) -> Result<impl Future<Output = Result<()>> + Send + use<WS, SR, T>>
 where
     WS: AsyncWrite + Unpin + Send + 'static,
     SR: Send + 'static,
@@ -92,9 +102,8 @@ where
     }
     let stopped = ws.stopped();
     Ok(async move {
-        tokio::select! {
+        let result = tokio::select! {
             biased;
-            error = qpack.terminated() => Err(error),
             error = stopped => Err(error),
             result = async {
                 ws.write_all(&frame).await?;
@@ -102,15 +111,19 @@ where
                 ws.shutdown().await?;
                 Ok::<_, Error>(())
             } => result,
+        };
+        if let Err(error) = result {
+            ws.reset(error);
         }
+        result
     })
 }
 
-fn write_streaming_request<WS, SR>(
+fn write_streaming_request<WS, SR, T: Transport>(
     req: &Request<ArcWndBuf>,
     mut ws: H3WriteStream<WS, SR>,
-    qpack: Arc<Qpack>,
-) -> Result<impl Future<Output = Result<()>> + Send + use<WS, SR>>
+    qpack: Arc<Qpack<T>>,
+) -> Result<impl Future<Output = Result<()>> + Send + use<WS, SR, T>>
 where
     WS: AsyncWrite + Unpin + Send + 'static,
     SR: Send + 'static,
@@ -119,6 +132,7 @@ where
         let message = req.message.0.lock().unwrap();
         (message.fields(), message.body_stream())
     };
+    ws.bind_body(&body);
     // Validate before sending so malformed requests fail synchronously and wake producers.
     let (frame, mode) = (|| {
         let parts = headers::request_parts(fields.clone())?;
@@ -133,17 +147,12 @@ where
         Ok::<_, Error>((frame, mode))
     })()
     .inspect_err(|error| body.set_error(*error))?;
-    ws.on_error({
-        let body = body.clone();
-        move |error| body.set_error(error)
-    });
     let body_error = req.message.body_error();
     let stopped = ws.stopped();
     // Capture body and headers, never Request/ArcMessage: producer Drop must remain observable.
     Ok(async move {
         let result = tokio::select! {
             biased;
-            error = qpack.terminated() => Err(error),
             error = stopped => Err(error),
             error = body_error => Err(error),
             result = async {
@@ -160,9 +169,9 @@ where
 }
 
 /// Reads ordinary responses; HEAD and CONNECT semantics require request-method input.
-async fn read_response<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'static>(
+async fn read_response<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'static, T: Transport>(
     rs: H3ReadStream<RS, RW>,
-    qpack: Arc<Qpack>,
+    qpack: Arc<Qpack<T>>,
     method: Option<http::Method>,
 ) -> Result<crate::common::Response<Read>> {
     let stream_id = rs.stream_id();
@@ -224,14 +233,14 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static, RW: Send + 'stati
         Ok(common::Response::Bytes(response))
     } else {
         let mut body = ArcWndBuf::new(frame::MAX_DATA_CHUNK);
+        rs.get_ref().bind_body(&body);
         let response: common::response::Response<Read, _> =
             ArcMessage::from(message.with_body(body.clone())).into();
         let body_error = response.message.body_error();
         tokio::spawn(async move {
             let result = tokio::select! {
                 biased;
-                error = qpack.terminated() => Err(error),
-                error = body_error => Err(error),
+                    error = body_error => Err(error),
                 result = body::read_body(&mut rs, &mut body, mode, &qpack) => result,
             };
             match result {

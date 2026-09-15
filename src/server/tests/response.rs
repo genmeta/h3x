@@ -7,7 +7,7 @@ async fn write_bytes_response<W: AsyncWrite + Unpin>(
     super::write_bytes_response(
         response,
         H3WriteStream::new(0, send),
-        &Qpack::default(),
+        &crate::protocol::qpack::tests::shared(),
         &Method::GET,
     )
     .await
@@ -20,7 +20,7 @@ async fn write_streaming_response<W: AsyncWrite + Unpin>(
     super::write_streaming_response(
         response,
         H3WriteStream::new(0, send),
-        &Qpack::default(),
+        crate::protocol::qpack::tests::shared(),
         &Method::GET,
     )
     .await
@@ -31,12 +31,7 @@ async fn respond_sends_head_response_without_data() {
     for buffered in [true, false] {
         let mut response = Response::<Bytes>::default();
         response.set_status(StatusCode::OK);
-        response
-            .message
-            .0
-            .lock()
-            .unwrap()
-            .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+        response.set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
         let response: common::Response<Write> = if buffered {
             response.into()
         } else {
@@ -48,7 +43,7 @@ async fn respond_sends_head_response_without_data() {
         super::respond(
             response,
             H3WriteStream::new(4, &mut encoded),
-            Arc::new(Qpack::default()),
+            crate::protocol::qpack::tests::shared(),
             &Method::HEAD,
         )
         .await
@@ -58,7 +53,7 @@ async fn respond_sends_head_response_without_data() {
         let H3Frame::Headers(frame) = be_frame(&mut input).await.unwrap() else {
             panic!("expected HEADERS")
         };
-        let fields = Qpack::default()
+        let fields = crate::protocol::qpack::tests::shared()
             .decode(4, frame.payload.field_section)
             .await
             .unwrap();
@@ -75,12 +70,7 @@ async fn respond_rejects_length_mismatch_and_forbidden_body() {
         for (method, body) in [(Method::GET, &b""[..]), (Method::HEAD, &b"hello"[..])] {
             let mut response = Response::<Bytes>::default();
             response.set_status(StatusCode::OK);
-            response
-                .message
-                .0
-                .lock()
-                .unwrap()
-                .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+            response.set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
             let response: common::Response<Write> = if buffered {
                 response.set_body(Bytes::copy_from_slice(body));
                 response.into()
@@ -99,7 +89,7 @@ async fn respond_rejects_length_mismatch_and_forbidden_body() {
                 super::respond(
                     response,
                     H3WriteStream::new(4, &mut encoded),
-                    Arc::new(Qpack::default()),
+                    crate::protocol::qpack::tests::shared(),
                     &method,
                 )
                 .await,
@@ -130,12 +120,7 @@ async fn writes_buffered_and_streaming_response_frames() {
     fixed_response
         .set_status(StatusCode::CREATED)
         .set_body(Bytes::from_static(b"hello"));
-    fixed_response
-        .message
-        .0
-        .lock()
-        .unwrap()
-        .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+    fixed_response.set_header(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
     let mut encoded = Vec::new();
     write_bytes_response(&fixed_response, &mut encoded)
         .await
@@ -190,12 +175,7 @@ async fn writes_buffered_and_streaming_response_frames() {
     }
     assert_eq!(body, b"stream");
 
-    fixed_response
-        .message
-        .0
-        .lock()
-        .unwrap()
-        .set_header(header::CONTENT_LENGTH, HeaderValue::from_static("1"));
+    fixed_response.set_header(header::CONTENT_LENGTH, HeaderValue::from_static("1"));
     let mut output = Vec::new();
     assert_eq!(
         write_bytes_response(&fixed_response, &mut output)

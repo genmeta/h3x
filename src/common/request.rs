@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Method};
+use http::{HeaderMap, HeaderName, HeaderValue, Method};
 
 use super::{
     Read, Write,
@@ -137,6 +137,10 @@ impl<IO, B> ReadRequest for Request<IO, B> {
     fn scheme(&self) -> String {
         self.message.0.lock().unwrap().scheme()
     }
+
+    fn headers(&self) -> HeaderMap {
+        ReadRequest::headers(&*self.message.0.lock().unwrap())
+    }
 }
 
 impl<B: Default> WriteRequest for Request<Write, B> {
@@ -199,15 +203,11 @@ mod tests {
     async fn streaming_body_backpressure_and_errors_before_sending() {
         use std::{
             future::Future,
-            sync::Arc,
             task::{Context, Waker},
             time::Duration,
         };
 
-        use crate::protocol::{
-            qpack::Qpack,
-            stream::{H3ReadStream, H3WriteStream},
-        };
+        use crate::protocol::stream::{H3ReadStream, H3WriteStream};
 
         tokio::time::timeout(Duration::from_secs(5), async {
             for error in [Error::H3_REQUEST_CANCELLED, Error::H3_MESSAGE_ERROR] {
@@ -238,7 +238,7 @@ mod tests {
                         request,
                         H3ReadStream::new(0, tokio::io::empty()),
                         H3WriteStream::new(0, tokio::io::sink()),
-                        Arc::new(Qpack::default()),
+                        crate::protocol::qpack::tests::shared(),
                     )
                     .await;
                     assert!(matches!(result, Err(actual) if actual == error));

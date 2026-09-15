@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 
 use bytes::Bytes;
 use qbase::varint::VARINT_MAX;
+use tokio::sync::mpsc;
 
 use super::{
     Field, Settings,
@@ -25,8 +26,9 @@ pub(crate) struct Encoder {
     /// Key: QUIC stream ID. Value: its unacknowledged sections in sending order.
     /// Only sections with RIC > 0 retain dynamic references.
     unacked_sections_by_stream: HashMap<u64, VecDeque<UnackedSection>>,
-    /// Committed table changes, in the same order as this encoder's local table.
-    instructions: VecDeque<EncoderInstruction>,
+    pub(super) sender: mpsc::Sender<Vec<EncoderInstruction>>,
+    // Feedback received while the current instruction is still being written.
+    writing: Option<VecDeque<DecoderInstruction>>,
 }
 
 /// A Section ACK releases the oldest such record on its stream.
@@ -39,7 +41,10 @@ struct UnackedSection {
 impl Encoder {
     /// Start with an empty table, capacity 0, KRC 0, and no outstanding references.
     /// Pass default peer settings until SETTINGS arrives; all integer limits are 62-bit.
-    pub(crate) fn new(peer: Settings) -> Result<Self> {
+    pub(crate) fn new(
+        peer: Settings,
+        sender: mpsc::Sender<Vec<EncoderInstruction>>,
+    ) -> Result<Self> {
         if peer.blocked_streams > VARINT_MAX {
             return Err(Error::H3_SETTINGS_ERROR);
         }
@@ -50,7 +55,8 @@ impl Encoder {
             max_blocked_streams: peer.blocked_streams,
             max_field_section_size: MAX_BUFFERED_FRAME_PAYLOAD as u64,
             unacked_sections_by_stream: HashMap::new(),
-            instructions: VecDeque::new(),
+            sender,
+            writing: None,
         })
     }
 
@@ -88,19 +94,38 @@ impl Encoder {
             bounded.push(field);
         }
         // Keep rollback local to this synchronous call; Bytes clones share string storage.
+        let permit = match self.sender.clone().try_reserve_owned() {
+            Ok(permit) => Some(permit),
+            Err(mpsc::error::TrySendError::Full(_)) => None,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(Error::H3_CLOSED_CRITICAL_STREAM);
+            }
+        };
         let original_table = self.table.clone();
-        let queued = self.instructions.len();
-        match self.encode_fields(stream_id, bounded) {
-            Ok(wire) => Ok(wire),
+        let mut instructions = Vec::new();
+        match self.encode_fields(stream_id, bounded, &mut instructions, permit.is_some()) {
+            Ok(wire) => {
+                if !instructions.is_empty() {
+                    permit
+                        .expect("table updates reserve queue space first")
+                        .send(instructions);
+                }
+                Ok(wire)
+            }
             Err(error) => {
                 self.table = original_table;
-                self.instructions.truncate(queued);
                 Err(error)
             }
         }
     }
 
-    fn encode_fields(&mut self, stream_id: u64, fields: Vec<Field>) -> Result<Bytes> {
+    fn encode_fields(
+        &mut self,
+        stream_id: u64,
+        fields: Vec<Field>,
+        instructions: &mut Vec<EncoderInstruction>,
+        queue_available: bool,
+    ) -> Result<Bytes> {
         let base = self.table.insert_count();
         let mut lines = Vec::new();
         let mut references = Vec::new();
@@ -111,7 +136,8 @@ impl Encoder {
             .flatten()
             .map(|section| 32 + section.references.capacity() * 8)
             .sum();
-        let allow_dynamic = retained + 32 + fields.len() * 8 <= MAX_BUFFERED_FRAME_PAYLOAD;
+        let allow_dynamic =
+            queue_available && retained + 32 + fields.len() * 8 <= MAX_BUFFERED_FRAME_PAYLOAD;
         for field in fields {
             if !field.never_index
                 && let Some(index) = table::find_index(&field.name, &field.value)
@@ -151,7 +177,7 @@ impl Encoder {
                     }
                 };
                 let absolute = self.table.insert_count();
-                if self.queue_update(instruction, &references)?
+                if self.queue_update(instruction, &references, instructions)?
                     && self.can_reference(stream_id, absolute)
                 {
                     full_index = Some(absolute);
@@ -231,10 +257,28 @@ impl Encoder {
 
     /// Commit and queue an update; Ok(false) means eviction is blocked by retained references.
     pub(crate) fn queue_instruction(&mut self, instruction: EncoderInstruction) -> Result<bool> {
-        self.queue_update(instruction, &[])
+        let permit = self
+            .sender
+            .clone()
+            .try_reserve_owned()
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => Error::H3_EXCESSIVE_LOAD,
+                mpsc::error::TrySendError::Closed(_) => Error::H3_CLOSED_CRITICAL_STREAM,
+            })?;
+        let mut instructions = Vec::new();
+        let queued = self.queue_update(instruction, &[], &mut instructions)?;
+        if queued {
+            permit.send(instructions);
+        }
+        Ok(queued)
     }
 
-    fn queue_update(&mut self, instruction: EncoderInstruction, protected: &[u64]) -> Result<bool> {
+    fn queue_update(
+        &mut self,
+        instruction: EncoderInstruction,
+        protected: &[u64],
+        instructions: &mut Vec<EncoderInstruction>,
+    ) -> Result<bool> {
         if self.table.max_capacity() == 0 {
             return Err(Error::QPACK_ENCODER_STREAM_ERROR);
         }
@@ -248,7 +292,7 @@ impl Encoder {
             }
         }
         self.table = next;
-        self.instructions.push_back(instruction);
+        instructions.push(instruction);
         Ok(true)
     }
 
@@ -288,10 +332,34 @@ impl Encoder {
         Ok(())
     }
 
-    /// Transfer the next committed instruction to the connection's ordered writer.
-    /// The caller retains it through backpressure and never drops or reorders it.
-    pub(crate) fn next_instruction(&mut self) -> Option<EncoderInstruction> {
-        self.instructions.pop_front()
+    pub(crate) fn start_instruction(&mut self) {
+        self.writing = Some(VecDeque::new());
+    }
+
+    pub(crate) fn finish_instruction(&mut self, instruction: &EncoderInstruction) -> Result<()> {
+        self.on_instruction_sent(instruction)?;
+        for feedback in self
+            .writing
+            .take()
+            .expect("an instruction is being written")
+        {
+            self.on_decoder_instruction(feedback)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn receive_feedback(&mut self, instruction: DecoderInstruction) -> Result<()> {
+        if let Some(feedback) = &mut self.writing {
+            if feedback.len()
+                >= MAX_BUFFERED_FRAME_PAYLOAD / std::mem::size_of::<DecoderInstruction>()
+            {
+                return Err(Error::H3_EXCESSIVE_LOAD);
+            }
+            feedback.push_back(instruction);
+            Ok(())
+        } else {
+            self.on_decoder_instruction(instruction)
+        }
     }
 
     /// The ordered writer calls this after each complete instruction is written, before
@@ -360,22 +428,32 @@ mod tests {
         }
     }
 
-    fn pair(capacity: u64, blocked_streams: u64) -> (Encoder, Decoder) {
+    fn pair(
+        capacity: u64,
+        blocked_streams: u64,
+    ) -> (Encoder, Decoder, mpsc::Receiver<Vec<EncoderInstruction>>) {
         let limits = Settings {
             max_table_capacity: capacity,
             blocked_streams,
         };
-        let mut encoder = Encoder::new(limits).unwrap();
+        let (sender, receiver) = mpsc::channel(16);
+        let mut encoder = Encoder::new(limits, sender).unwrap();
         encoder
             .queue_instruction(EncoderInstruction::SetDynamicTableCapacity(capacity))
             .unwrap();
-        (encoder, Decoder::new(limits, 1024).unwrap())
+        (encoder, Decoder::new(limits, 1024).unwrap(), receiver)
     }
 
-    fn updates(encoder: &mut Encoder, decoder: &mut Decoder) {
-        while let Some(instruction) = encoder.next_instruction() {
-            encoder.on_instruction_sent(&instruction).unwrap();
-            decoder.on_encoder_instruction(instruction).unwrap();
+    fn updates(
+        encoder: &mut Encoder,
+        decoder: &mut Decoder,
+        receiver: &mut mpsc::Receiver<Vec<EncoderInstruction>>,
+    ) {
+        while let Ok(batch) = receiver.try_recv() {
+            for instruction in batch {
+                encoder.on_instruction_sent(&instruction).unwrap();
+                decoder.on_encoder_instruction(instruction).unwrap();
+            }
         }
     }
 
@@ -404,7 +482,8 @@ mod tests {
 
     #[test]
     fn settings_enable_dynamic_capacity_without_resetting_existing_state() {
-        let mut encoder = Encoder::new(Settings::default()).unwrap();
+        let (sender, _receiver) = mpsc::channel(16);
+        let mut encoder = Encoder::new(Settings::default(), sender).unwrap();
         assert_eq!(
             encoder.queue_instruction(EncoderInstruction::SetDynamicTableCapacity(0)),
             Err(Error::QPACK_ENCODER_STREAM_ERROR)
@@ -450,7 +529,7 @@ mod tests {
 
     #[test]
     fn blocked_budget_is_per_stream_and_qpack_ack_releases_one_section() {
-        let (mut encoder, mut decoder) = pair(68, 1);
+        let (mut encoder, mut decoder, mut receiver) = pair(68, 1);
         let a = field(b"x", b"a");
         let b = field(b"y", b"b");
         let first = encoder.encode(0, [a.clone()]).unwrap();
@@ -473,7 +552,7 @@ mod tests {
             Err(Error::QPACK_DECODER_STREAM_ERROR)
         );
         assert_eq!(encoder.known_received_count, 0);
-        updates(&mut encoder, &mut decoder);
+        updates(&mut encoder, &mut decoder, &mut receiver);
         assert_eq!(
             decode(&mut decoder, 0, first).unwrap(),
             DecodeResult::Decoded(vec![a.clone()])
@@ -507,7 +586,7 @@ mod tests {
 
     #[test]
     fn zero_blocking_limit_seeds_table_then_reuses_acknowledged_entries() {
-        let (mut encoder, mut decoder) = pair(68, 0);
+        let (mut encoder, mut decoder, mut receiver) = pair(68, 0);
         let fields = vec![field(b"x", b"a")];
         let first = encoder.encode(0, fields.clone()).unwrap();
         assert_eq!(
@@ -515,7 +594,7 @@ mod tests {
             DecodeResult::Decoded(fields.clone())
         );
         assert!(encoder.unacked_sections_by_stream.is_empty());
-        updates(&mut encoder, &mut decoder);
+        updates(&mut encoder, &mut decoder, &mut receiver);
         feedback(&mut encoder, &mut decoder);
         let second = encoder.encode(4, fields.clone()).unwrap();
         assert_eq!(
@@ -531,14 +610,14 @@ mod tests {
 
     #[test]
     fn current_section_references_prevent_eviction_and_cancel_does_not_ack_insertions() {
-        let (mut encoder, mut decoder) = pair(68, 1);
+        let (mut encoder, mut decoder, mut receiver) = pair(68, 1);
         encoder
             .queue_instruction(EncoderInstruction::InsertWithLiteralName {
                 name: Bytes::from_static(b"x"),
                 value: Bytes::from_static(b"a"),
             })
             .unwrap();
-        updates(&mut encoder, &mut decoder);
+        updates(&mut encoder, &mut decoder, &mut receiver);
         feedback(&mut encoder, &mut decoder);
         let fields = vec![field(b"x", b"a"), field(b"y", b"b"), field(b"z", b"c")];
         let wire = encoder.encode(0, fields.clone()).unwrap();
@@ -565,23 +644,23 @@ mod tests {
                 .queue_instruction(EncoderInstruction::SetDynamicTableCapacity(0))
                 .unwrap()
         );
-        updates(&mut encoder, &mut decoder);
+        updates(&mut encoder, &mut decoder, &mut receiver);
         feedback(&mut encoder, &mut decoder);
         assert!(
             encoder
                 .queue_instruction(EncoderInstruction::SetDynamicTableCapacity(0))
                 .unwrap()
         );
-        updates(&mut encoder, &mut decoder);
+        updates(&mut encoder, &mut decoder, &mut receiver);
         assert_eq!(encoder.table.size(), 0);
         assert_eq!(encoder.table.insert_count(), 2);
     }
 
     #[test]
     fn duplicate_and_invalid_updates_are_atomic_and_sensitive_fields_stay_literal() {
-        let (mut encoder, mut decoder) = pair(34, 1);
+        let (mut encoder, mut decoder, mut receiver) = pair(34, 1);
         let wire = encoder.encode(0, [field(b"x", b"a")]).unwrap();
-        updates(&mut encoder, &mut decoder);
+        updates(&mut encoder, &mut decoder, &mut receiver);
         assert_eq!(
             decode(&mut decoder, 0, wire).unwrap(),
             DecodeResult::Decoded(vec![field(b"x", b"a")])
@@ -599,7 +678,7 @@ mod tests {
         );
         assert!(encoder.table.get(0).is_none());
         assert_eq!(encoder.table.get(1).unwrap().value, "a");
-        let queued = encoder.instructions.len();
+        let queued = receiver.len();
         for instruction in [
             EncoderInstruction::Duplicate(1),
             EncoderInstruction::SetDynamicTableCapacity(35),
@@ -608,7 +687,7 @@ mod tests {
                 encoder.queue_instruction(instruction),
                 Err(Error::QPACK_ENCODER_STREAM_ERROR)
             );
-            assert_eq!(encoder.instructions.len(), queued);
+            assert_eq!(receiver.len(), queued);
             assert_eq!(encoder.table.insert_count(), 2);
         }
         let private = Field {
@@ -620,7 +699,7 @@ mod tests {
             decode(&mut decoder, 4, wire).unwrap(),
             DecodeResult::Decoded(vec![private])
         );
-        assert_eq!(encoder.instructions.len(), queued);
+        assert_eq!(receiver.len(), queued);
         assert!(
             encoder
                 .encode(
@@ -632,15 +711,15 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(encoder.instructions.len(), queued);
+        assert_eq!(receiver.len(), queued);
         assert_eq!(encoder.table.insert_count(), 2);
     }
 
     #[test]
     fn retained_section_metadata_is_bounded_when_peer_withholds_section_acks() {
-        let (mut encoder, mut decoder) = pair(34, 0);
+        let (mut encoder, mut decoder, mut receiver) = pair(34, 0);
         encoder.encode(0, [field(b"x", b"a")]).unwrap();
-        updates(&mut encoder, &mut decoder);
+        updates(&mut encoder, &mut decoder, &mut receiver);
         feedback(&mut encoder, &mut decoder);
         encoder
             .encode(0, std::iter::repeat_n(field(b"x", b"a"), 1000))
@@ -655,5 +734,61 @@ mod tests {
         let (_, prefix) = FieldSectionPrefix::read(&last, 34, 1).unwrap();
         assert_eq!(prefix.required_insert_count, 0); // Falls back to literal at the local limit.
         assert!(encoder.unacked_sections_by_stream[&4].len() * 40 <= MAX_BUFFERED_FRAME_PAYLOAD);
+    }
+    #[test]
+    fn full_encoder_channel_falls_back_without_committing_table_changes() {
+        let limits = Settings {
+            max_table_capacity: 68,
+            blocked_streams: 1,
+        };
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut encoder = Encoder::new(limits, sender).unwrap();
+        let mut decoder = Decoder::new(limits, 1024).unwrap();
+        encoder
+            .queue_instruction(EncoderInstruction::SetDynamicTableCapacity(68))
+            .unwrap();
+        let fields = vec![field(b"x", b"a")];
+        let literal = encoder.encode(0, fields.clone()).unwrap();
+        assert_eq!(literal[0], 0);
+        assert_eq!(encoder.table.insert_count(), 0);
+        updates(&mut encoder, &mut decoder, &mut receiver);
+        let dynamic = encoder.encode(4, fields.clone()).unwrap();
+        assert_ne!(dynamic[0], 0);
+        assert_eq!(encoder.table.insert_count(), 1);
+        let other = encoder.encode(8, [field(b"y", b"b")]).unwrap();
+        assert_eq!(other[0], 0);
+        assert_eq!(encoder.table.insert_count(), 1);
+        assert_eq!(receiver.len(), 1);
+        updates(&mut encoder, &mut decoder, &mut receiver);
+        assert_eq!(
+            decode(&mut decoder, 4, dynamic).unwrap(),
+            DecodeResult::Decoded(fields)
+        );
+        drop(receiver);
+        assert_eq!(
+            encoder.encode(12, [field(b"z", b"c")]),
+            Err(Error::H3_CLOSED_CRITICAL_STREAM)
+        );
+        assert_eq!(encoder.table.insert_count(), 1);
+    }
+
+    #[test]
+    fn decoder_feedback_waits_for_the_current_encoder_write_to_commit() {
+        let (mut encoder, mut decoder, mut receiver) = pair(68, 1);
+        updates(&mut encoder, &mut decoder, &mut receiver);
+        encoder.encode(0, [field(b"x", b"a")]).unwrap();
+        let batch = receiver.try_recv().unwrap();
+        assert_eq!(batch.len(), 1);
+        encoder.start_instruction();
+        encoder
+            .receive_feedback(DecoderInstruction::SectionAcknowledgment(0))
+            .unwrap();
+        assert_eq!(encoder.known_received_count, 0);
+        assert_eq!(encoder.sent_insert_count, 0);
+        encoder.finish_instruction(&batch[0]).unwrap();
+        assert_eq!(encoder.known_received_count, 1);
+        assert_eq!(encoder.sent_insert_count, 1);
+        assert!(encoder.unacked_sections_by_stream.is_empty());
+        assert!(encoder.writing.is_none());
     }
 }

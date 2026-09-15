@@ -1,8 +1,8 @@
-use std::sync::Arc;
+mod support;
 
 use bytes::Bytes;
 use h3x::{
-    H3ReadStream, H3WriteStream, Qpack, ReadBody, ReadRequest, ReadResponse, ReadStream, WriteBody,
+    H3ReadStream, H3WriteStream, ReadBody, ReadRequest, ReadResponse, ReadStream, WriteBody,
     WriteRequest, WriteResponse, WriteStream, client, server,
 };
 use http::{Method, StatusCode, header};
@@ -10,6 +10,7 @@ use tokio::io::duplex;
 
 #[tokio::test]
 async fn request_accept_and_respond() {
+    let connection = support::connection();
     let (client_send, server_recv) = duplex(64);
     let (server_send, client_recv) = duplex(64);
     let request = client::Request::post("https://example.com/echo")
@@ -22,12 +23,12 @@ async fn request_accept_and_respond() {
             request,
             H3ReadStream::new(0, client_recv),
             H3WriteStream::new(0, client_send),
-            Arc::new(Qpack::default())
+            connection.qpack().clone()
         ),
         async {
             let request = server::accept(
                 H3ReadStream::new(0, server_recv),
-                Arc::new(Qpack::default()),
+                connection.qpack().clone(),
             )
             .await?;
             assert_eq!(request.method(), Method::POST);
@@ -43,7 +44,7 @@ async fn request_accept_and_respond() {
             server::respond(
                 response,
                 H3WriteStream::new(0, server_send),
-                Arc::new(Qpack::default()),
+                connection.qpack().clone(),
                 &method,
             )
             .await
@@ -64,6 +65,7 @@ async fn request_accept_and_respond() {
 
 #[tokio::test]
 async fn streaming_echo() {
+    let connection = support::connection();
     let (client_send, server_recv) = duplex(64);
     let (server_send, client_recv) = duplex(64);
 
@@ -77,7 +79,7 @@ async fn streaming_echo() {
             request,
             H3ReadStream::new(0, client_recv),
             H3WriteStream::new(0, client_send),
-            Arc::new(Qpack::default())
+            connection.qpack().clone()
         ),
         async {
             for sentence in sentences {
@@ -88,7 +90,7 @@ async fn streaming_echo() {
         async {
             let request = server::accept(
                 H3ReadStream::new(0, server_recv),
-                Arc::new(Qpack::default()),
+                connection.qpack().clone(),
             )
             .await?;
             let method = request.method();
@@ -105,7 +107,7 @@ async fn streaming_echo() {
                 server::respond(
                     response,
                     H3WriteStream::new(0, server_send),
-                    Arc::new(Qpack::default()),
+                    connection.qpack().clone(),
                     &method,
                 ),
                 async {

@@ -23,3 +23,9 @@ pub use wnd_buf::ArcWndBuf;
 
 /// ALPN token used by HTTP/3.
 pub const ALPN: &[u8] = b"h3";
+
+#[cfg(test)]
+extern crate self as h3x;
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;

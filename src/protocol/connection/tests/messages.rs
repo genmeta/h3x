@@ -38,14 +38,18 @@ async fn raw_connections_support_explicit_message_io() {
             received.unwrap();
             served.unwrap();
         }
+        let goaway = server.cursor.clone();
+        let transport = server.transport().clone();
         server.goaway().await.unwrap();
-        assert_eq!(server.uni.goaway.state.lock().unwrap().local(), Some(8));
-        assert_waiting_for_idle(&server).await;
-        expire_transport(&server).await;
+        assert_eq!(goaway.lock().unwrap().sent(), Some(8));
+        assert_eq!(transport.terminated().await, Error::H3_NO_ERROR);
+        assert!(transport.close_calls.get() >= 1);
     };
-    let (a, b, ()) = tokio::join!(client.closed(), server.closed(), requests);
-    a.unwrap();
-    b.unwrap();
+    let (closed, ()) = tokio::join!(
+        wait_for_transport(client.transport(), &client.qpack, &client.bi),
+        requests
+    );
+    closed.unwrap();
 }
 
 #[tokio::test]
@@ -54,13 +58,14 @@ async fn streaming_request_remains_writable_and_goaway_preserves_admitted_post()
     let client = H3Connection::new(a);
     let server = H3Connection::new(b);
     let response_sent = Notify::new();
+    let server_state = observe(&server);
     let work = async {
         let mut request = client::Request::streaming_post("https://example.com/upload").unwrap();
         let (send, recv) = client.open_bi().await.unwrap();
         assert_eq!(recv.stream_id(), 0);
         assert_eq!(send.stream_id(), 0);
         let response = client::request(request.clone(), recv, send, client.qpack().clone());
-        assert_eq!(client.transport.next_bi.get(), 4);
+        assert_eq!(client.transport().next_bi.get(), 4);
         let (response, produced, served) = tokio::join!(
             response,
             async {
@@ -77,10 +82,15 @@ async fn streaming_request_remains_writable_and_goaway_preserves_admitted_post()
                     panic!()
                 };
                 response.set_status(http::StatusCode::OK);
+                let observed = observe(&server);
                 server.goaway().await?;
+                let server = observed;
                 assert!(matches!(
-                    *server.uni.goaway.state.lock().unwrap(),
-                    GoawayState::Draining { boundary: 4, .. }
+                    *server.cursor.lock().unwrap(),
+                    StreamCursor {
+                        local: StreamView::Gone(4),
+                        ..
+                    }
                 ));
                 server::respond(response, send, server.qpack().clone(), &method).await?;
                 response_sent.notify_one();
@@ -93,10 +103,16 @@ async fn streaming_request_remains_writable_and_goaway_preserves_admitted_post()
         assert_eq!(response.unwrap().status(), http::StatusCode::OK);
         produced.unwrap();
         served.unwrap();
-        client.close(Error::H3_NO_ERROR);
+        wait_for_drain(client).await.unwrap();
     };
-    let (a, b, ()) = tokio::join!(client.closed(), server.closed(), work);
-    a.unwrap();
+    let (b, ()) = tokio::join!(
+        wait_for_transport(
+            &server_state.transport,
+            &server_state.qpack,
+            &server_state.bi
+        ),
+        work
+    );
     b.unwrap();
 }
 
@@ -136,10 +152,12 @@ async fn head_response_with_representation_content_length_roundtrips() {
         );
         received.unwrap();
         served.unwrap();
-        client.close(Error::H3_NO_ERROR);
+        wait_for_drain(client).await.unwrap();
     };
-    let (a, b, ()) = tokio::join!(client.closed(), server.closed(), work);
-    a.unwrap();
+    let (b, ()) = tokio::join!(
+        wait_for_transport(server.transport(), &server.qpack, &server.bi),
+        work
+    );
     b.unwrap();
 }
 
@@ -214,9 +232,11 @@ async fn messages_use_explicit_qpack_and_stream_owned_ids() {
         response.read_all(&mut body).await.unwrap();
         assert_eq!(&body, b"ok");
         assert_eq!(response.read(&mut [0; 1]).await.unwrap(), 0);
-        client.close(Error::H3_NO_ERROR);
+        wait_for_drain(client).await.unwrap();
     };
-    let (a, b, ()) = tokio::join!(client.closed(), server.closed(), work);
-    a.unwrap();
+    let (b, ()) = tokio::join!(
+        wait_for_transport(server.transport(), &server.qpack, &server.bi),
+        work
+    );
     b.unwrap();
 }

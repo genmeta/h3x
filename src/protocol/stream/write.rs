@@ -9,14 +9,15 @@ use std::{
 use tokio::io::AsyncWrite;
 
 use super::{StreamState, bi::BiStream};
-use crate::Error;
 #[cfg(test)]
 use crate::protocol::frame::Goaway;
+use crate::{ArcWndBuf, Error};
 
 /// Write handle for a stream owned by the connection.
 /// `R` is the paired transport reader; standalone writers use `()`.
 pub struct H3WriteStream<W, R = ()> {
     pub(super) stream: Arc<BiStream<R, W>>,
+    pub(super) stop_signal: Option<Pin<Box<dyn Future<Output = Error> + Send>>>,
 }
 
 impl<W> H3WriteStream<W> {
@@ -28,6 +29,7 @@ impl<W> H3WriteStream<W> {
                 StreamState::Idle(stream),
                 None,
             )),
+            stop_signal: None,
         }
     }
 }
@@ -41,60 +43,35 @@ impl<W, R> H3WriteStream<W, R> {
         self.stream.terminate_write(StreamState::Closed(error));
     }
 
-    /// Notify the message layer once if sending fails or is cancelled.
-    /// A completed send discards the handler; it cannot be cancelled by Drop.
-    pub(crate) fn on_error(&self, notify: impl FnOnce(Error) + Send + 'static) {
-        let result = {
-            let state = self.stream.send.lock().unwrap();
-            match state.result() {
-                Some(result) => result,
-                None => {
-                    *self.stream.send_error_handler.lock().unwrap() = Some(Box::new(notify));
-                    return;
-                }
-            }
-        };
-        if let Err(error) = result {
-            notify(error);
-        }
+    pub(crate) fn bind_body(&self, body: &ArcWndBuf) {
+        self.stream.write_body(body);
     }
 
     /// Attach an adapter's peer STOP_SENDING notification, independent of writes.
     /// The future must own its notification handle rather than borrow this stream.
-    /// Without a signal, peer stops are observed by the next write or shutdown.
-    pub fn with_stop_signal(self, stopped: impl Future<Output = Error> + Send + 'static) -> Self {
-        *self.stream.send_stopped.lock().unwrap() = Some(Box::pin(stopped));
-        self.stream.send_changed.notify_waiters();
+    /// The message's send future consumes it when polled, including while waiting
+    /// for body data. An unpolled send future does not consume STOP notifications.
+    pub fn with_stop_signal(
+        mut self,
+        stopped: impl Future<Output = Error> + Send + 'static,
+    ) -> Self {
+        self.stop_signal = Some(Box::pin(stopped));
         self
     }
 
-    /// Observe send termination without borrowing the writer or replacing its I/O waker.
-    pub(crate) fn stopped(&self) -> impl Future<Output = Error> + use<W, R> {
+    /// Move the optional STOP input into the one operation that will poll it.
+    pub(crate) fn stopped(&mut self) -> impl Future<Output = Error> + use<W, R> {
+        let mut stopped = self.stop_signal.take();
         let stream = Arc::clone(&self.stream);
-        async move {
-            loop {
-                let changed = stream.send_changed.notified();
-                tokio::pin!(changed);
-                changed.as_mut().enable();
-                if let Some(Err(error)) = stream.send.lock().unwrap().result() {
-                    return error;
-                }
-                tokio::select! {
-                    _ = &mut changed => {}
-                    error = poll_fn(|cx| {
-                        let mut signal = stream.send_stopped.lock().unwrap();
-                        let result = match signal.as_mut() {
-                            Some(signal) => signal.as_mut().poll(cx),
-                            None => Poll::Pending,
-                        };
-                        if result.is_ready() {
-                            *signal = None;
-                        }
-                        result
-                    }) => stream.terminate_write(StreamState::Closed(error)),
-                }
+        poll_fn(move |cx| {
+            if let Some(Err(error)) = stream.send.lock().unwrap().result() {
+                return Poll::Ready(error);
             }
-        }
+            match stopped.as_mut() {
+                Some(stopped) => stopped.as_mut().poll(cx),
+                None => Poll::Pending,
+            }
+        })
     }
 }
 
@@ -180,35 +157,6 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
-    }
-
-    #[tokio::test]
-    async fn error_handler_preserves_terminal_state() {
-        use tokio::io::AsyncWriteExt;
-
-        for already_failed in [false, true] {
-            let mut send = H3WriteStream::new(0, tokio::io::sink());
-            if already_failed {
-                send.reset(Error::H3_REQUEST_REJECTED);
-            }
-            let (notify, notified) = tokio::sync::oneshot::channel();
-            send.on_error(move |error| notify.send(error).unwrap());
-            send.reset(Error::H3_REQUEST_REJECTED);
-            send.reset(Error::H3_REQUEST_CANCELLED);
-            assert_eq!(
-                Error::from(send.flush().await.unwrap_err()),
-                Error::H3_REQUEST_REJECTED
-            );
-            drop(send);
-            assert_eq!(notified.await.unwrap(), Error::H3_REQUEST_REJECTED);
-        }
-
-        let mut send = H3WriteStream::new(0, tokio::io::sink());
-        send.shutdown().await.unwrap();
-        let (notify, notified) = tokio::sync::oneshot::channel();
-        send.on_error(move |error| notify.send(error).unwrap());
-        drop(send);
-        assert!(notified.await.is_err());
     }
 
     #[test]

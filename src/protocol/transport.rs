@@ -1,5 +1,6 @@
-use std::{future::Future, io, pin::Pin};
+use std::future::Future;
 
+use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{Error, Result};
@@ -16,31 +17,10 @@ use crate::{Error, Result};
 )]
 pub trait Transport: Send + Sync + 'static {
     /// Report FIN as a successful read of zero bytes and retain RESET metadata in I/O errors.
-    type Recv: AsyncRead + Unpin + Send + 'static;
-    type Send: AsyncWrite + Unpin + Send + 'static;
+    type Recv: AsyncRead + StopSending + Unpin + Send + 'static;
+    type Send: AsyncWrite + CancelStream + Unpin + Send + 'static;
 
     fn role(&self) -> Role;
-
-    fn stop(recv: &mut Self::Recv, error_code: u64);
-
-    fn cancel(send: &mut Self::Send, error_code: u64);
-
-    /// Optionally observe peer STOP_SENDING while an upload waits for body data.
-    /// Return an owned notification future. Without it, write/shutdown errors still
-    /// report peer stops, but an idle upload cannot observe them immediately.
-    fn send_stopped(
-        _send: &Self::Send,
-    ) -> Option<Pin<Box<dyn Future<Output = Error> + Send + 'static>>> {
-        None
-    }
-
-    /// Identify a peer RESET_STREAM from this adapter's receive error metadata.
-    /// Override this to let streams reset before their type is known be discarded locally.
-    /// Return false for connection failures and errors whose scope is unknown; an
-    /// `io::ErrorKind` alone may describe both a stream reset and a connection failure.
-    fn is_stream_reset(_error: &io::Error) -> bool {
-        false
-    }
 
     fn open_bi_stream(
         &self,

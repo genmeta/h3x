@@ -7,7 +7,7 @@ async fn write_bytes_request<W: AsyncWrite + Unpin + Send + 'static>(
     super::write_bytes_request(
         request,
         H3WriteStream::new(0, send),
-        Arc::new(Qpack::default()),
+        crate::protocol::qpack::tests::shared(),
     )?
     .await
 }
@@ -19,7 +19,7 @@ async fn write_streaming_request<W: AsyncWrite + Unpin + Send + 'static>(
     super::write_streaming_request(
         request,
         H3WriteStream::new(0, send),
-        Arc::new(Qpack::default()),
+        crate::protocol::qpack::tests::shared(),
     )?
     .await
 }

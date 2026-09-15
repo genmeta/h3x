@@ -9,7 +9,7 @@ use super::{
     qpack::Qpack,
     stream::H3ReadStream,
 };
-use crate::{Error, Result};
+use crate::{Error, Result, Transport};
 
 /// Content rules resolved from the message headers and request/response semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,11 +67,11 @@ impl BodyMode {
 
 /// Receive DATA into an application destination and validate trailing HEADERS.
 /// QPACK is used only to decode trailers. The destination is shut down at EOF.
-pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin, RW>(
+pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin, RW, T: Transport>(
     receive: &mut BufReader<H3ReadStream<R, RW>>,
     destination: &mut W,
     mode: BodyMode,
-    qpack: &Qpack,
+    qpack: &Qpack<T>,
 ) -> Result<()> {
     let mut remaining = mode.content_length();
     let mut trailers = false;
@@ -202,7 +202,7 @@ mod tests {
                         Some(content_length) => BodyMode::Length { content_length },
                         None => BodyMode::Infinity,
                     },
-                    &Qpack::default()
+                    &crate::protocol::qpack::tests::shared()
                 )
                 .await,
                 expected
@@ -216,7 +216,7 @@ mod tests {
                 &mut BufReader::new(H3ReadStream::new(0, &mut input)),
                 &mut body,
                 BodyMode::Infinity,
-                &Qpack::default()
+                &crate::protocol::qpack::tests::shared()
             )
             .await,
             Err(Error::H3_FRAME_UNEXPECTED)

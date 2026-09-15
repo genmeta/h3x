@@ -46,7 +46,7 @@ pub(crate) fn request_parts(fields: Vec<Field>) -> Result<RequestParts> {
     let scheme = pseudo_value(&pseudo, b":scheme");
     let authority = pseudo_value(&pseudo, b":authority");
     let path = pseudo_value(&pseudo, b":path");
-    validate_request_pseudo(&method, scheme, authority, path, &headers)?;
+    let authority = validate_request_pseudo(&method, scheme, authority, path, &headers)?;
 
     let mut request = Request::builder()
         .method(method.clone())
@@ -151,7 +151,7 @@ fn validate_request_pseudo(
     authority: Option<&[u8]>,
     path: Option<&[u8]>,
     headers: &HeaderMap,
-) -> Result<()> {
+) -> Result<Authority> {
     if method == Method::CONNECT {
         if scheme.is_some() || path.is_some() {
             return Err(Error::H3_MESSAGE_ERROR);
@@ -161,7 +161,7 @@ fn validate_request_pseudo(
         if authority.port().is_none() {
             return Err(Error::H3_MESSAGE_ERROR);
         }
-        return Ok(());
+        return Ok(authority);
     }
 
     required_utf8(scheme, ":scheme")?;
@@ -169,36 +169,33 @@ fn validate_request_pseudo(
     if path.is_empty() || (path != b"*" && !path.starts_with(b"/")) {
         return Err(Error::H3_MESSAGE_ERROR);
     }
-    let authority = authority.filter(|value| !value.is_empty());
-    let host = headers.get(HOST);
-    if authority.is_none() && host.is_none_or(HeaderValue::is_empty) {
-        return Err(Error::H3_MESSAGE_ERROR);
-    }
+    let host = headers.get(HOST).map(HeaderValue::as_bytes);
     if let (Some(authority), Some(host)) = (authority, host)
-        && authority != host.as_bytes()
+        && authority != host
     {
         return Err(Error::H3_MESSAGE_ERROR);
     }
-    Ok(())
+    required_utf8(authority.or(host), ":authority")?
+        .parse()
+        .map_err(message_error)
 }
 
 fn build_request_uri(
     method: &Method,
     scheme: Option<&[u8]>,
-    authority: Option<&[u8]>,
+    authority: Authority,
     path: Option<&[u8]>,
 ) -> Result<Uri> {
+    let builder = Uri::builder().authority(authority);
     if method == Method::CONNECT {
-        return Uri::try_from(required_bytes(authority, ":authority")?).map_err(message_error);
+        return builder.build().map_err(message_error);
     }
 
-    let mut builder = Uri::builder()
+    builder
         .scheme(required_utf8(scheme, ":scheme")?)
-        .path_and_query(required_utf8(path, ":path")?);
-    if let Some(authority) = authority {
-        builder = builder.authority(required_utf8(Some(authority), ":authority")?);
-    }
-    builder.build().map_err(message_error)
+        .path_and_query(required_utf8(path, ":path")?)
+        .build()
+        .map_err(message_error)
 }
 
 fn required_pseudo<'a>(pseudo: &'a [Field], name: &[u8]) -> Result<&'a [u8]> {
@@ -225,6 +222,146 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
+
+    fn field(name: &'static [u8], value: &'static [u8]) -> Field {
+        Field {
+            never_index: false,
+            name: Bytes::from_static(name),
+            value: Bytes::from_static(value),
+        }
+    }
+
+    fn request_fields(
+        scheme: &'static [u8],
+        authority: Option<&'static [u8]>,
+        host: Option<&'static [u8]>,
+    ) -> Vec<Field> {
+        let mut fields = vec![
+            field(b":method", b"GET"),
+            field(b":scheme", scheme),
+            field(b":path", b"/"),
+        ];
+        if let Some(authority) = authority {
+            fields.push(field(b":authority", authority));
+        }
+        if let Some(host) = host {
+            fields.push(field(b"host", host));
+        }
+        fields
+    }
+
+    #[test]
+    fn builds_request_uri_from_authority_or_host() {
+        for scheme in [b"http".as_slice(), b"https"] {
+            for value in [
+                b"example.com".as_slice(),
+                b"example.com:8443",
+                b"[2001:db8::1]:8443",
+            ] {
+                for (authority, host) in [
+                    (Some(value), None),
+                    (None, Some(value)),
+                    (Some(value), Some(value)),
+                ] {
+                    let request = request_parts(request_fields(scheme, authority, host))
+                        .unwrap_or_else(|error| {
+                            panic!("scheme={scheme:?}, authority={authority:?}, host={host:?}: {error:?}")
+                        });
+                    assert_eq!(
+                        request.uri.to_string(),
+                        format!(
+                            "{}://{}/",
+                            from_utf8(scheme).unwrap(),
+                            from_utf8(value).unwrap()
+                        )
+                    );
+                    assert_eq!(request.method, Method::GET);
+                    assert_eq!(request.version, Version::HTTP_3);
+                    assert_eq!(request.headers.get(HOST).map(HeaderValue::as_bytes), host);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_missing_empty_or_conflicting_request_authority() {
+        let empty = b"".as_slice();
+        let valid = b"example.com".as_slice();
+        for scheme in [b"http".as_slice(), b"https"] {
+            for (authority, host) in [
+                (None, None),
+                (Some(empty), None),
+                (None, Some(empty)),
+                (Some(empty), Some(empty)),
+                (Some(empty), Some(valid)),
+                (Some(valid), Some(empty)),
+                (Some(valid), Some(b"other.example.com".as_slice())),
+                (Some(valid), Some(b"example.com:443".as_slice())),
+            ] {
+                assert!(
+                    matches!(
+                        request_parts(request_fields(scheme, authority, host)),
+                        Err(Error::H3_MESSAGE_ERROR)
+                    ),
+                    "scheme={scheme:?}, authority={authority:?}, host={host:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_request_authority_or_host() {
+        for value in [
+            b"bad host".as_slice(),
+            b"example.com/path",
+            b"example.com?query",
+            b"example.com#fragment",
+            b"[::1",
+            b"\xff",
+        ] {
+            for (authority, host) in [
+                (Some(value), None),
+                (None, Some(value)),
+                (Some(value), Some(value)),
+            ] {
+                assert!(
+                    matches!(
+                        request_parts(request_fields(b"https", authority, host)),
+                        Err(Error::H3_MESSAGE_ERROR)
+                    ),
+                    "authority={authority:?}, host={host:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn connect_requires_authority_with_port_without_host_fallback() {
+        let request = request_parts(vec![
+            field(b":method", b"CONNECT"),
+            field(b":authority", b"example.com:443"),
+        ])
+        .unwrap();
+        assert_eq!(request.uri, "example.com:443");
+        assert_eq!(request.uri.scheme(), None);
+        assert_eq!(request.uri.path_and_query(), None);
+
+        for fields in [
+            vec![
+                field(b":method", b"CONNECT"),
+                field(b"host", b"example.com:443"),
+            ],
+            vec![
+                field(b":method", b"CONNECT"),
+                field(b":authority", b"example.com"),
+            ],
+        ] {
+            assert!(matches!(
+                request_parts(fields),
+                Err(Error::H3_MESSAGE_ERROR)
+            ));
+        }
+    }
 
     #[test]
     fn validates_request_response_and_content_length() {

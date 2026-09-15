@@ -1,31 +1,28 @@
-//! Shared QPACK and instruction I/O. Encoder/Decoder own their directional protocol state.
+//! Shared QPACK state. Encoder/Decoder own their directional protocol state.
 
 use std::{
-    collections::{HashSet, VecDeque},
     future::poll_fn,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     task::Poll,
 };
 
 use bytes::Bytes;
-use instruction::{DecoderInstruction, EncoderInstruction};
+use instruction::EncoderInstruction;
 use qbase::varint::VARINT_MAX;
-use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    sync::Notify,
-};
+use tokio::sync::mpsc;
 
 use super::frame;
-use crate::{Error, Result};
+use crate::{Error, Result, Transport};
 
 mod decoder;
 mod encoder;
 mod field;
-mod instruction;
+pub(super) mod instruction;
+mod string_literal;
 mod table;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use decoder::Decoder;
 use encoder::Encoder;
@@ -62,177 +59,185 @@ pub(crate) fn limits(settings: &frame::Settings) -> (Settings, u64) {
     )
 }
 
-/// Shared compression state only; no HTTP request lifecycle or decoded results.
-pub struct Qpack {
-    state: Mutex<State>,
-    encoder_ready: Notify,
-    decoder_ready: Notify,
-    closed: Notify,
-}
-
-struct State {
-    encoder: Encoder,
-    decoder: Decoder,
-    decoding: HashSet<u64>,
-    error: Option<Error>,
-    // Feedback can arrive while an encoder instruction is partially written.
-    writing: Option<VecDeque<DecoderInstruction>>,
+/// Directional compression resources and the transport they belong to.
+pub struct Qpack<T: Transport> {
+    pub(crate) transport: Arc<T>,
+    pub(super) encoder: Mutex<Result<Encoder>>,
+    pub(super) decoder: Mutex<Result<Decoder>>,
 }
 
 /// Release a decode registration if its future exits before normal cleanup.
-struct DecodeGuard<'a> {
-    qpack: &'a Qpack,
+struct DecodeGuard<'a, T: Transport> {
+    qpack: &'a Qpack<T>,
     stream_id: u64,
 }
 
-impl Drop for DecodeGuard<'_> {
+impl<T: Transport> Drop for DecodeGuard<'_, T> {
     fn drop(&mut self) {
-        let mut state = self.qpack.state.lock().unwrap();
-        // Completion or explicit cancellation already released this decode.
-        if !state.decoding.remove(&self.stream_id) {
-            return;
-        }
-        if state.error.is_some() {
-            state.decoder.finish(self.stream_id);
-        } else {
-            let _ = state.decoder.cancel_stream(self.stream_id);
-            self.qpack.decoder_ready.notify_one();
+        let wakes = {
+            let mut state = self.qpack.decoder.lock().unwrap();
+            let Ok(decoder) = state.as_mut() else {
+                return;
+            };
+            if !decoder.decoding.remove(&self.stream_id) {
+                return;
+            }
+            decoder.cancel_stream(self.stream_id)
+        };
+        match wakes {
+            Ok(wakes) => {
+                for wake in wakes {
+                    wake.wake();
+                }
+            }
+            Err(error) => self.qpack.on_error(error),
         }
     }
 }
 
-impl Qpack {
-    pub(crate) fn new(local: Settings, peer: Settings, max_blocked_bytes: usize) -> Result<Self> {
-        Ok(Self {
-            state: Mutex::new(State {
-                encoder: Encoder::new(peer)?,
-                decoder: Decoder::new(local, max_blocked_bytes)?,
-                decoding: HashSet::new(),
-                error: None,
-                writing: None,
-            }),
-            encoder_ready: Notify::new(),
-            decoder_ready: Notify::new(),
-            closed: Notify::new(),
-        })
+impl<T: Transport> Qpack<T> {
+    pub(crate) fn new(
+        transport: Arc<T>,
+        settings: &super::connection::Settings,
+        bi: Arc<super::stream::bi::BiStreams<T::Recv, T::Send>>,
+    ) -> Result<Arc<Self>> {
+        let (local, max_fields) = limits(&settings.local);
+        let (sender, receiver) = mpsc::channel(16);
+        let mut decoder = Decoder::new(local, frame::MAX_BUFFERED_FRAME_PAYLOAD)?;
+        decoder.max_field_section_size = max_fields;
+        let qpack = Arc::new(Self {
+            transport,
+            encoder: Mutex::new(Ok(Encoder::new(Settings::default(), sender)?)),
+            decoder: Mutex::new(Ok(decoder)),
+        });
+        tokio::spawn({
+            let (qpack, bi) = (qpack.clone(), bi.clone());
+            async move { qpack.send_encoder(receiver, &bi).await }
+        });
+        tokio::spawn({
+            let qpack = qpack.clone();
+            async move { qpack.send_decoder(&bi).await }
+        });
+        Ok(qpack)
     }
 
     pub(crate) fn configure(&self, peer: Settings, max_fields: u64) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        state.encoder.apply_peer_settings(peer)?;
-        state.encoder.max_field_section_size =
-            max_fields.min(super::frame::MAX_BUFFERED_FRAME_PAYLOAD as u64);
+        let mut state = self.encoder.lock().unwrap();
+        let encoder = state.as_mut().map_err(|error| *error)?;
+        encoder.apply_peer_settings(peer)?;
+        encoder.max_field_section_size = max_fields.min(frame::MAX_BUFFERED_FRAME_PAYLOAD as u64);
         if peer.max_table_capacity != 0 {
-            state
-                .encoder
-                .queue_instruction(EncoderInstruction::SetDynamicTableCapacity(
-                    peer.max_table_capacity
-                        .min(super::frame::MAX_BUFFERED_FRAME_PAYLOAD as u64),
-                ))?;
+            encoder.queue_instruction(EncoderInstruction::SetDynamicTableCapacity(
+                peer.max_table_capacity
+                    .min(frame::MAX_BUFFERED_FRAME_PAYLOAD as u64),
+            ))?;
         }
-        self.encoder_ready.notify_one();
         Ok(())
     }
 
-    pub(crate) fn local_limit(&self, limit: u64) {
-        self.state.lock().unwrap().decoder.max_field_section_size = limit;
-    }
-
     pub(crate) fn error(&self) -> Option<Error> {
-        self.state.lock().unwrap().error
+        self.encoder.lock().unwrap().as_ref().err().copied()
     }
 
-    pub(crate) fn close(&self, error: Error) {
-        let mut state = self.state.lock().unwrap();
-        if state.error.is_none() {
-            state.error = Some(error);
+    pub(crate) fn close(&self, error: Error) -> Error {
+        let (error, wakes) = {
+            let mut encoder = self.encoder.lock().unwrap();
+            let error = match *encoder {
+                Err(error) => error,
+                Ok(_) => {
+                    *encoder = Err(error);
+                    error
+                }
+            };
+            let mut decoder = self.decoder.lock().unwrap();
+            let wakes = match decoder.as_mut() {
+                Ok(decoder) => decoder.take_waiters(),
+                Err(_) => Vec::new(),
+            };
+            *decoder = Err(error);
+            (error, wakes)
+        };
+        for wake in wakes {
+            wake.wake();
         }
-        state.decoder.wake_all();
-        self.closed.notify_waiters();
-        self.encoder_ready.notify_one();
-        self.decoder_ready.notify_one();
-    }
-
-    pub(crate) async fn terminated(&self) -> Error {
-        loop {
-            let changed = self.closed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if let Some(error) = self.error() {
-                return error;
-            }
-            changed.await;
-        }
+        error
     }
 
     pub(crate) fn encode(&self, id: u64, fields: Vec<Field>) -> Result<Bytes> {
-        let mut state = self.state.lock().unwrap();
-        if let Some(error) = state.error {
-            return Err(error);
-        }
-        let result = state.encoder.encode(id, fields);
-        self.encoder_ready.notify_one();
-        result
-    }
-
-    pub(crate) async fn decode(&self, id: u64, payload: Bytes) -> Result<Vec<Field>> {
-        if id > qbase::varint::VARINT_MAX {
-            return Err(Error::H3_ID_ERROR);
-        }
-        let _guard = {
-            let mut state = self.state.lock().unwrap();
-            if let Some(error) = state.error {
-                return Err(error);
-            }
-            if !state.decoding.insert(id) {
-                return Err(Error::H3_REQUEST_CANCELLED);
-            }
-            DecodeGuard {
-                qpack: self,
-                stream_id: id,
-            }
+        let result = {
+            let mut state = self.encoder.lock().unwrap();
+            state.as_mut().map_err(|error| *error)?.encode(id, fields)
         };
-        let (offset, prefix) = {
-            let state = self.state.lock().unwrap();
-            state
-                .decoder
-                .read_prefix(&payload)
-                .map(|(rest, prefix)| (payload.len() - rest.len(), prefix))
-        }
-        .inspect_err(|error| self.close(*error))?;
-        let result = poll_fn(|cx| {
-            let mut state = self.state.lock().unwrap();
-            if let Some(error) = state.error {
-                return Poll::Ready(Err(error));
-            }
-            if !state.decoding.contains(&id) {
-                return Poll::Ready(Err(Error::H3_REQUEST_CANCELLED));
-            }
-            let result = state
-                .decoder
-                .poll_decode(id, prefix, &payload[offset..], cx);
-            if result.is_ready() {
-                state.decoding.remove(&id);
-                self.decoder_ready.notify_one();
-            }
-            result
-        })
-        .await;
         if let Err(error) = result {
             self.on_error(error);
         }
         result
     }
 
-    /// Cancel reception on this stream and wake a pending decode.
-    /// Call once when abandoning reception; dropping a pending decode future
-    /// already releases its wait and queues cancellation.
+    pub(crate) async fn decode(&self, id: u64, payload: Bytes) -> Result<Vec<Field>> {
+        let prefix = {
+            let mut state = self.decoder.lock().unwrap();
+            let decoder = state.as_mut().map_err(|error| *error)?;
+            if !decoder.decoding.insert(id) {
+                return Err(Error::H3_REQUEST_CANCELLED);
+            }
+            decoder
+                .read_prefix(&payload)
+                .map(|(rest, prefix)| (payload.len() - rest.len(), prefix))
+        };
+        let _guard = DecodeGuard {
+            qpack: self,
+            stream_id: id,
+        };
+        let (offset, prefix) = prefix.inspect_err(|error| self.on_error(*error))?;
+        poll_fn(|cx| {
+            let (result, wake) = {
+                let mut state = self.decoder.lock().unwrap();
+                let decoder = match state.as_mut() {
+                    Ok(decoder) => decoder,
+                    Err(error) => return Poll::Ready(Err(*error)),
+                };
+                if !decoder.decoding.contains(&id) {
+                    return Poll::Ready(Err(Error::H3_REQUEST_CANCELLED));
+                }
+                let result = decoder.poll_decode(id, prefix, &payload[offset..], cx);
+                if result.is_ready() {
+                    decoder.decoding.remove(&id);
+                }
+                (result, decoder.take_writer())
+            };
+            if let Some(wake) = wake {
+                wake.wake();
+            }
+            if let Poll::Ready(Err(error)) = result {
+                self.on_error(error);
+            }
+            result
+        })
+        .await
+    }
+
+    /// Cancel reception and synchronously submit any required QPACK feedback.
     pub fn cancel(&self, stream_id: u64) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        state.decoding.remove(&stream_id);
-        state.decoder.cancel_stream(stream_id)?;
-        self.decoder_ready.notify_one();
-        Ok(())
+        let wakes = {
+            let mut state = self.decoder.lock().unwrap();
+            state
+                .as_mut()
+                .map_err(|error| *error)?
+                .cancel_stream(stream_id)
+        };
+        match wakes {
+            Ok(wakes) => {
+                for wake in wakes {
+                    wake.wake();
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.on_error(error);
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn on_error(&self, error: Error) {
@@ -243,104 +248,8 @@ impl Qpack {
                 | Error::H3_REQUEST_INCOMPLETE
                 | Error::H3_MESSAGE_ERROR
         ) {
-            self.close(error);
+            let error = self.close(error);
+            let _ = self.transport.close(error.to_string(), error.as_u64());
         }
-    }
-
-    pub(crate) async fn receive_encoder<R: AsyncRead + Unpin>(&self, recv: &mut R) -> Result<()> {
-        loop {
-            let instruction = EncoderInstruction::read(recv).await?;
-            self.state
-                .lock()
-                .unwrap()
-                .decoder
-                .on_encoder_instruction(instruction)?;
-            self.decoder_ready.notify_one();
-        }
-    }
-
-    pub(crate) async fn receive_decoder<R: AsyncRead + Unpin>(&self, recv: &mut R) -> Result<()> {
-        loop {
-            let instruction = DecoderInstruction::read(recv).await?;
-            let mut state = self.state.lock().unwrap();
-            if let Some(feedback) = &mut state.writing {
-                if feedback.len()
-                    >= crate::protocol::frame::MAX_BUFFERED_FRAME_PAYLOAD
-                        / std::mem::size_of::<DecoderInstruction>()
-                {
-                    return Err(Error::H3_EXCESSIVE_LOAD);
-                }
-                feedback.push_back(instruction);
-            } else {
-                state.encoder.on_decoder_instruction(instruction)?;
-            }
-        }
-    }
-
-    pub(crate) async fn send_encoder<W: AsyncWrite + Unpin>(&self, send: &mut W) -> Result<()> {
-        send.write_all(&[2])
-            .await
-            .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-        loop {
-            let ready = self.encoder_ready.notified();
-            let next = {
-                let mut state = self.state.lock().unwrap();
-                if let Some(error) = state.error {
-                    return Err(error);
-                }
-                let next = state.encoder.next_instruction();
-                if next.is_some() {
-                    state.writing = Some(Default::default());
-                }
-                next
-            };
-            let Some(instruction) = next else {
-                ready.await;
-                continue;
-            };
-            send.write_all(&instruction.encode()?)
-                .await
-                .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-            send.flush()
-                .await
-                .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-            let mut state = self.state.lock().unwrap();
-            state.encoder.on_instruction_sent(&instruction)?;
-            for feedback in state.writing.take().unwrap() {
-                state.encoder.on_decoder_instruction(feedback)?;
-            }
-        }
-    }
-
-    pub(crate) async fn send_decoder<W: AsyncWrite + Unpin>(&self, send: &mut W) -> Result<()> {
-        send.write_all(&[3])
-            .await
-            .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-        loop {
-            let ready = self.decoder_ready.notified();
-            let next = {
-                let mut state = self.state.lock().unwrap();
-                if let Some(error) = state.error {
-                    return Err(error);
-                }
-                state.decoder.next_instruction()
-            };
-            let Some(instruction) = next else {
-                ready.await;
-                continue;
-            };
-            send.write_all(&instruction.encode()?)
-                .await
-                .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-            send.flush()
-                .await
-                .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
-        }
-    }
-}
-
-impl Default for Qpack {
-    fn default() -> Self {
-        Self::new(Settings::default(), Settings::default(), 0).unwrap()
     }
 }

@@ -1,5 +1,6 @@
 pub(crate) mod bi;
 pub(crate) mod control;
+pub(crate) mod qpack;
 pub(crate) mod read;
 pub(crate) mod uni;
 pub(crate) mod write;
@@ -11,7 +12,6 @@ use std::{
 };
 
 pub(crate) use read::H3ReadStream;
-pub(crate) use uni::UniStreams;
 pub(crate) use write::H3WriteStream;
 
 use crate::{Error, protocol::frame::Goaway};

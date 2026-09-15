@@ -3,14 +3,14 @@ use std::{
     task::{Context, Waker},
 };
 
-use instruction::EncoderInstruction;
+use instruction::{DecoderInstruction, EncoderInstruction};
 
 use super::*;
 
 #[tokio::test]
 async fn blocked_fields_live_in_future_and_resume_without_connection_results() {
     let qpack = Arc::new(
-        Qpack::new(
+        Codec::new(
             Settings {
                 max_table_capacity: 128,
                 blocked_streams: 1,
@@ -26,13 +26,12 @@ async fn blocked_fields_live_in_future_and_resume_without_connection_results() {
         let mut cx = Context::from_waker(Waker::noop());
         assert!(decode.as_mut().poll(&mut cx).is_pending());
         {
-            let mut state = qpack.state.lock().unwrap();
+            let mut resource = qpack.decoder.lock().unwrap();
+            let state = resource.as_mut().unwrap();
             state
-                .decoder
                 .on_encoder_instruction(EncoderInstruction::SetDynamicTableCapacity(128))
                 .unwrap();
             state
-                .decoder
                 .on_encoder_instruction(EncoderInstruction::InsertWithLiteralName {
                     name: Bytes::from_static(b"x"),
                     value: Bytes::from_static(b"y"),
@@ -42,15 +41,22 @@ async fn blocked_fields_live_in_future_and_resume_without_connection_results() {
         assert_eq!(decode.await.unwrap()[0].value, "y");
     }
     assert_eq!(
-        qpack.state.lock().unwrap().decoder.next_instruction(),
+        qpack
+            .decoder
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .next_instruction(),
         Some(DecoderInstruction::SectionAcknowledgment(0))
     );
     assert!(
         qpack
-            .state
+            .decoder
             .lock()
             .unwrap()
-            .decoder
+            .as_mut()
+            .unwrap()
             .next_instruction()
             .is_none()
     );
@@ -59,7 +65,7 @@ async fn blocked_fields_live_in_future_and_resume_without_connection_results() {
 #[tokio::test]
 async fn cancellation_releases_registration_and_close_wakes_decode() {
     let qpack = Arc::new(
-        Qpack::new(
+        Codec::new(
             Settings {
                 max_table_capacity: 128,
                 blocked_streams: 1,
@@ -81,15 +87,22 @@ async fn cancellation_releases_registration_and_close_wakes_decode() {
         assert_eq!(decode.await, Err(Error::H3_REQUEST_CANCELLED));
     }
     assert_eq!(
-        qpack.state.lock().unwrap().decoder.next_instruction(),
+        qpack
+            .decoder
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .next_instruction(),
         Some(DecoderInstruction::StreamCancellation(0))
     );
     assert!(
         qpack
-            .state
+            .decoder
             .lock()
             .unwrap()
-            .decoder
+            .as_mut()
+            .unwrap()
             .next_instruction()
             .is_none()
     );
@@ -102,15 +115,13 @@ async fn cancellation_releases_registration_and_close_wakes_decode() {
     .await;
     qpack.close(Error::H3_NO_ERROR);
     assert_eq!(decode.await, Err(Error::H3_NO_ERROR));
-    let mut state = qpack.state.lock().unwrap();
-    assert!(state.decoding.is_empty());
-    assert!(state.decoder.next_instruction().is_none());
+    assert!(qpack.decoder.lock().unwrap().is_err());
 }
 
 #[tokio::test]
 async fn abandoned_decode_releases_registration_and_blocked_budget() {
     let qpack = Arc::new(
-        Qpack::new(
+        Codec::new(
             Settings {
                 max_table_capacity: 128,
                 blocked_streams: 1,
@@ -124,43 +135,53 @@ async fn abandoned_decode_releases_registration_and_blocked_budget() {
     // An unpolled future never registered anything and needs no cancellation.
     drop(qpack.decode(0, Bytes::from_static(&[2, 0, 0x80])));
     {
-        let mut state = qpack.state.lock().unwrap();
+        let mut resource = qpack.decoder.lock().unwrap();
+        let state = resource.as_mut().unwrap();
         assert!(state.decoding.is_empty());
-        assert!(state.decoder.next_instruction().is_none());
+        assert!(state.next_instruction().is_none());
     }
     for (id, explicit_cancel) in [(0, false), (4, true), (8, false)] {
         let mut decode = Box::pin(qpack.decode(id, Bytes::from_static(&[2, 0, 0x80])));
         // Each decode consumes the only wait slot and the entire byte budget.
         assert!(decode.as_mut().poll(&mut cx).is_pending());
-        let ready = qpack.decoder_ready.notified();
-        tokio::pin!(ready);
-        assert!(ready.as_mut().poll(&mut cx).is_pending());
+        let wakes = Arc::new(Wakes::default());
+        let writer = Waker::from(wakes.clone());
+        assert!(
+            qpack
+                .decoder
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .poll_instruction(&mut Context::from_waker(&writer))
+                .is_pending()
+        );
         if explicit_cancel {
             qpack.cancel(id).unwrap();
         }
         drop(decode);
-        assert!(ready.as_mut().poll(&mut cx).is_ready());
+        assert!(wakes.0.load(std::sync::atomic::Ordering::SeqCst) > 0);
         assert_eq!(qpack.error(), None);
-        let mut state = qpack.state.lock().unwrap();
+        let mut resource = qpack.decoder.lock().unwrap();
+        let state = resource.as_mut().unwrap();
         assert!(state.decoding.is_empty());
         assert_eq!(
-            state.decoder.next_instruction(),
+            state.next_instruction(),
             Some(DecoderInstruction::StreamCancellation(id))
         );
-        assert!(state.decoder.next_instruction().is_none());
+        assert!(state.next_instruction().is_none());
     }
 
     let decode = qpack.decode(12, Bytes::from_static(&[2, 0, 0x80]));
     tokio::pin!(decode);
     assert!(decode.as_mut().poll(&mut cx).is_pending());
     {
-        let mut state = qpack.state.lock().unwrap();
+        let mut resource = qpack.decoder.lock().unwrap();
+        let state = resource.as_mut().unwrap();
         state
-            .decoder
             .on_encoder_instruction(EncoderInstruction::SetDynamicTableCapacity(128))
             .unwrap();
         state
-            .decoder
             .on_encoder_instruction(EncoderInstruction::InsertWithLiteralName {
                 name: Bytes::from_static(b"x"),
                 value: Bytes::from_static(b"y"),
@@ -168,18 +189,19 @@ async fn abandoned_decode_releases_registration_and_blocked_budget() {
             .unwrap();
     }
     assert_eq!(decode.await.unwrap()[0].value, "y");
-    let mut state = qpack.state.lock().unwrap();
+    let mut resource = qpack.decoder.lock().unwrap();
+    let state = resource.as_mut().unwrap();
     assert!(state.decoding.is_empty());
     assert_eq!(
-        state.decoder.next_instruction(),
+        state.next_instruction(),
         Some(DecoderInstruction::SectionAcknowledgment(12))
     );
-    assert!(state.decoder.next_instruction().is_none());
+    assert!(state.next_instruction().is_none());
 }
 
 #[tokio::test]
 async fn rejected_decode_does_not_cancel_existing_registration() {
-    let qpack = Qpack::new(
+    let qpack = Codec::new(
         Settings {
             max_table_capacity: 128,
             blocked_streams: 1,
@@ -198,27 +220,29 @@ async fn rejected_decode_does_not_cancel_existing_registration() {
     assert!(decode.as_mut().poll(&mut cx).is_pending());
     assert!(
         qpack
-            .state
+            .decoder
             .lock()
             .unwrap()
-            .decoder
+            .as_mut()
+            .unwrap()
             .next_instruction()
             .is_none()
     );
     drop(decode);
-    let mut state = qpack.state.lock().unwrap();
+    let mut resource = qpack.decoder.lock().unwrap();
+    let state = resource.as_mut().unwrap();
     assert!(state.decoding.is_empty());
     assert_eq!(
-        state.decoder.next_instruction(),
+        state.next_instruction(),
         Some(DecoderInstruction::StreamCancellation(0))
     );
-    assert!(state.decoder.next_instruction().is_none());
+    assert!(state.next_instruction().is_none());
 }
 
 #[tokio::test]
 async fn invalid_prefix_releases_registration_without_cancellation_feedback() {
     for payload in [&[][..], &[0][..], &[0, 0x80][..]] {
-        let qpack = Qpack::new(
+        let qpack = Codec::new(
             Settings {
                 max_table_capacity: 128,
                 blocked_streams: 1,
@@ -232,9 +256,7 @@ async fn invalid_prefix_releases_registration_without_cancellation_feedback() {
             Err(Error::QPACK_DECOMPRESSION_FAILED)
         );
         assert_eq!(qpack.error(), Some(Error::QPACK_DECOMPRESSION_FAILED));
-        let mut state = qpack.state.lock().unwrap();
-        assert!(state.decoding.is_empty());
-        assert!(state.decoder.next_instruction().is_none());
+        assert!(qpack.decoder.lock().unwrap().is_err());
     }
 }
 
@@ -249,7 +271,7 @@ async fn invalid_dynamic_references_and_amplification_remain_bounded() {
         &[0, 0, 0x50][..],
     ] {
         let qpack = Arc::new(
-            Qpack::new(
+            Codec::new(
                 Settings {
                     max_table_capacity: 128,
                     blocked_streams: 1,
@@ -260,14 +282,13 @@ async fn invalid_dynamic_references_and_amplification_remain_bounded() {
             .unwrap(),
         );
         {
-            let mut state = qpack.state.lock().unwrap();
+            let mut resource = qpack.decoder.lock().unwrap();
+            let state = resource.as_mut().unwrap();
             state
-                .decoder
                 .on_encoder_instruction(EncoderInstruction::SetDynamicTableCapacity(128))
                 .unwrap();
             for value in [b"one", b"two"] {
                 state
-                    .decoder
                     .on_encoder_instruction(EncoderInstruction::InsertWithLiteralName {
                         name: Bytes::from_static(b"x"),
                         value: Bytes::copy_from_slice(value),
@@ -288,7 +309,7 @@ async fn invalid_dynamic_references_and_amplification_remain_bounded() {
         Bytes::from_static(&[3, 0, 0x81, 0x80]),
     ] {
         let qpack = Arc::new(
-            Qpack::new(
+            Codec::new(
                 Settings {
                     max_table_capacity: 128,
                     blocked_streams: 1,
@@ -312,16 +333,16 @@ async fn field_size_limits_are_enforced_by_each_direction_at_the_exact_boundary(
         value: Bytes::from_static(b"y"),
         never_index: false,
     }];
-    let wire = Qpack::new(Settings::default(), Settings::default(), 0)
+    let wire = Codec::new(Settings::default(), Settings::default(), 0)
         .unwrap()
         .encode(0, fields.clone())
         .unwrap();
     for limit in [33, 34] {
         // name + value + 32 bytes of field overhead.
-        let encoder = Qpack::new(Settings::default(), Settings::default(), 0).unwrap();
+        let encoder = Codec::new(Settings::default(), Settings::default(), 0).unwrap();
         encoder.configure(Settings::default(), limit).unwrap();
         let encoded = encoder.encode(0, fields.clone());
-        let decoder = Arc::new(Qpack::new(Settings::default(), Settings::default(), 0).unwrap());
+        let decoder = Arc::new(Codec::new(Settings::default(), Settings::default(), 0).unwrap());
         decoder.local_limit(limit);
         let decoded = decoder.decode(0, wire.clone()).await;
         if limit == 33 {
@@ -345,9 +366,9 @@ async fn qpack_fields_preserve_frame_envelopes_and_ack_order() {
         max_table_capacity: 128,
         blocked_streams: 1,
     };
-    let sender = Arc::new(Qpack::new(Settings::default(), Settings::default(), 1024).unwrap());
+    let sender = Arc::new(Codec::new(Settings::default(), Settings::default(), 1024).unwrap());
     sender.configure(limits, 1024).unwrap();
-    let receiver = Arc::new(Qpack::new(limits, Settings::default(), 1024).unwrap());
+    let receiver = Arc::new(Codec::new(limits, Settings::default(), 1024).unwrap());
     let fields = vec![Field {
         name: Bytes::from_static(b"x-dynamic"),
         value: Bytes::from_static(b"value"),
@@ -405,42 +426,59 @@ async fn qpack_fields_preserve_frame_envelopes_and_ack_order() {
             })
             .await;
             // Deliver encoder instructions only after the full HEADERS frame has arrived.
-            let mut source = sender.state.lock().unwrap();
-            let mut target = receiver.state.lock().unwrap();
-            while let Some(instruction) = source.encoder.next_instruction() {
-                source.encoder.on_instruction_sent(&instruction).unwrap();
-                target.decoder.on_encoder_instruction(instruction).unwrap();
+            while let Ok(batch) = sender.instructions.lock().unwrap().try_recv() {
+                for instruction in batch {
+                    sender
+                        .encoder
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .on_instruction_sent(&instruction)
+                        .unwrap();
+                    receiver
+                        .decoder
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .on_encoder_instruction(instruction)
+                        .unwrap();
+                }
             }
         }
         assert_eq!(decode.await.unwrap(), fields);
         let feedback = receiver
-            .state
+            .decoder
             .lock()
             .unwrap()
-            .decoder
+            .as_mut()
+            .unwrap()
             .next_instruction()
             .unwrap();
         assert_eq!(feedback, DecoderInstruction::SectionAcknowledgment(0));
         sender
-            .state
+            .encoder
             .lock()
             .unwrap()
-            .encoder
+            .as_mut()
+            .unwrap()
             .on_decoder_instruction(feedback)
             .unwrap();
         assert!(
             receiver
-                .state
+                .decoder
                 .lock()
                 .unwrap()
-                .decoder
+                .as_mut()
+                .unwrap()
                 .next_instruction()
                 .is_none()
         );
     }
     // The same flow also supports a connection with no dynamic capacity.
     let frame = Frame::new(Headers {
-        field_section: Qpack::new(Settings::default(), Settings::default(), 0)
+        field_section: Codec::new(Settings::default(), Settings::default(), 0)
             .unwrap()
             .encode(0, fields.clone())
             .unwrap(),
@@ -448,10 +486,66 @@ async fn qpack_fields_preserve_frame_envelopes_and_ack_order() {
     .unwrap();
     assert_eq!(frame.payload.field_section[0], 0);
     assert_eq!(
-        Qpack::default()
+        Codec::default()
             .decode(0, frame.payload.field_section)
             .await
             .unwrap(),
         fields
     );
+}
+
+pub(crate) fn shared() -> Arc<Qpack<crate::test_support::TestTransport>> {
+    Qpack::new(
+        Arc::new(crate::test_support::TestTransport::default()),
+        &crate::Settings::default(),
+        Arc::new(crate::protocol::stream::bi::BiStreams::default()),
+    )
+    .unwrap()
+}
+
+struct Codec {
+    qpack: Qpack<crate::test_support::TestTransport>,
+    instructions: Mutex<mpsc::Receiver<Vec<EncoderInstruction>>>,
+}
+
+impl std::ops::Deref for Codec {
+    type Target = Qpack<crate::test_support::TestTransport>;
+    fn deref(&self) -> &Self::Target {
+        &self.qpack
+    }
+}
+
+impl Codec {
+    fn new(local: Settings, peer: Settings, max_blocked_bytes: usize) -> Result<Self> {
+        let (sender, receiver) = mpsc::channel(16);
+        Ok(Self {
+            qpack: Qpack {
+                transport: Arc::new(crate::test_support::TestTransport::default()),
+                encoder: Mutex::new(Ok(Encoder::new(peer, sender)?)),
+                decoder: Mutex::new(Ok(Decoder::new(local, max_blocked_bytes)?)),
+            },
+            instructions: Mutex::new(receiver),
+        })
+    }
+    fn local_limit(&self, limit: u64) {
+        self.decoder
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .max_field_section_size = limit;
+    }
+}
+impl Default for Codec {
+    fn default() -> Self {
+        Self::new(Settings::default(), Settings::default(), 0).unwrap()
+    }
+}
+
+#[derive(Default)]
+struct Wakes(std::sync::atomic::AtomicUsize);
+impl std::task::Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }

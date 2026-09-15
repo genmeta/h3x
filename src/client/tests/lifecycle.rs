@@ -1,6 +1,6 @@
 use std::{
     io::Cursor,
-    task::{Context, Waker},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -16,7 +16,9 @@ fn response_headers() -> Vec<u8> {
     let mut encoded = Vec::new();
     encoded.put_frame(
         &Frame::new(Headers {
-            field_section: Qpack::default().encode(0, response.fields()).unwrap(),
+            field_section: crate::protocol::qpack::tests::shared()
+                .encode(0, response.fields())
+                .unwrap(),
         })
         .unwrap(),
     );
@@ -33,7 +35,7 @@ async fn dropping_unpolled_upload_wakes_a_blocked_producer() {
     let sending = write_streaming_request(
         &producer,
         H3WriteStream::new(0, tokio::io::sink()),
-        Arc::new(Qpack::default()),
+        crate::protocol::qpack::tests::shared(),
     )
     .unwrap();
     let mut writing = Box::pin(producer.write(b"y"));
@@ -44,6 +46,34 @@ async fn dropping_unpolled_upload_wakes_a_blocked_producer() {
             .is_pending()
     );
     drop(sending);
+    assert_eq!(
+        timeout(Duration::from_secs(5), writing).await.unwrap(),
+        Err(Error::H3_REQUEST_CANCELLED)
+    );
+    assert_eq!(producer.finish().await, Err(Error::H3_REQUEST_CANCELLED));
+}
+
+#[tokio::test]
+async fn dropping_unpolled_request_cancels_its_bound_body() {
+    let message = Message::<Bytes>::post("https://example.com/upload")
+        .unwrap()
+        .with_body(ArcWndBuf::new(1));
+    let mut producer = Request::from(ArcMessage::from(message));
+    producer.write(b"x").await.unwrap();
+    let waiting = request(
+        producer.clone(),
+        H3ReadStream::new(0, tokio::io::empty()),
+        H3WriteStream::new(0, tokio::io::sink()),
+        crate::protocol::qpack::tests::shared(),
+    );
+    let mut writing = Box::pin(producer.write(b"y"));
+    assert!(
+        writing
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    drop(waiting);
     assert_eq!(
         timeout(Duration::from_secs(5), writing).await.unwrap(),
         Err(Error::H3_REQUEST_CANCELLED)
@@ -70,7 +100,7 @@ async fn cancelling_response_wait_drops_unfinished_uploads() {
                 outgoing,
                 H3ReadStream::new(0, recv),
                 H3WriteStream::new(0, send),
-                Arc::new(Qpack::default()),
+                crate::protocol::qpack::tests::shared(),
             ));
             assert!(
                 waiting
@@ -121,7 +151,7 @@ async fn early_response_keeps_both_body_modes_sending() {
                 outgoing,
                 H3ReadStream::new(0, Cursor::new(response_headers())),
                 H3WriteStream::new(0, send),
-                Arc::new(Qpack::default()),
+                crate::protocol::qpack::tests::shared(),
             )
             .await
             .unwrap();
@@ -160,7 +190,7 @@ async fn cancelling_response_wait_preserves_a_completed_upload() {
             producer.clone(),
             H3ReadStream::new(0, recv),
             H3WriteStream::new(0, send),
-            Arc::new(Qpack::default()),
+            crate::protocol::qpack::tests::shared(),
         ));
         assert!(
             waiting
@@ -237,7 +267,7 @@ async fn producer_fin_does_not_complete_transport_shutdown() {
                         polled: polled.clone(),
                     },
                 ),
-                Arc::new(Qpack::default()),
+                crate::protocol::qpack::tests::shared(),
             )
             .unwrap(),
         );
@@ -276,7 +306,7 @@ async fn idle_peer_stop_reaches_the_producer_without_discarding_response() {
             producer.clone(),
             H3ReadStream::new(0, recv),
             H3WriteStream::new(0, send).with_stop_signal(async move { stopped.await.unwrap() }),
-            Arc::new(Qpack::default()),
+            crate::protocol::qpack::tests::shared(),
         ));
         assert!(
             waiting
@@ -314,7 +344,7 @@ async fn last_unfinished_producer_stops_an_upload_waiting_on_network() {
             write_streaming_request(
                 &request,
                 H3WriteStream::new(0, send),
-                Arc::new(Qpack::default()),
+                crate::protocol::qpack::tests::shared(),
             )
             .unwrap(),
         );
@@ -346,7 +376,7 @@ async fn finished_producer_can_drop_while_upload_waits_on_network() {
             write_streaming_request(
                 &request,
                 H3WriteStream::new(0, send),
-                Arc::new(Qpack::default()),
+                crate::protocol::qpack::tests::shared(),
             )
             .unwrap(),
         );
@@ -378,7 +408,7 @@ async fn dropping_response_stops_a_receive_waiting_on_network() {
     timeout(Duration::from_secs(5), async {
         let mut message = Message::<Bytes>::default();
         message.set_status(StatusCode::OK);
-        let qpack = Arc::new(Qpack::default());
+        let qpack = crate::protocol::qpack::tests::shared();
         let mut headers = Vec::new();
         headers.put_frame(
             &Frame::new(Headers {
@@ -399,4 +429,73 @@ async fn dropping_response_stops_a_receive_waiting_on_network() {
     })
     .await
     .expect("dropping the response must stop its receive task");
+}
+
+#[test]
+fn cancelling_response_pump_publishes_an_error_without_returning() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let (mut response, _peer) = runtime.block_on(async {
+        let mut message = Message::<Bytes>::default();
+        message.set_status(StatusCode::OK);
+        let qpack = crate::protocol::qpack::tests::shared();
+        let mut headers = Vec::new();
+        headers.put_frame(
+            &Frame::new(Headers {
+                field_section: qpack.encode(0, message.fields()).unwrap(),
+            })
+            .unwrap(),
+        );
+        let (mut send, recv) = tokio::io::duplex(64);
+        send.write_all(&headers).await.unwrap();
+        let Response::Streaming(response) = read_response(H3ReadStream::new(0, recv), qpack, None)
+            .await
+            .unwrap()
+        else {
+            panic!("expected streaming response");
+        };
+        tokio::task::yield_now().await;
+        (response, send)
+    });
+    // Runtime shutdown drops the receive future without executing its error branch.
+    drop(runtime);
+    let mut bytes = [0];
+    let mut reading = Box::pin(response.read(&mut bytes));
+    assert_eq!(
+        reading
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(Error::H3_REQUEST_CANCELLED))
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_keeps_message_error_after_transport_eof() {
+    let mut message = Message::<Bytes>::default();
+    message.set_status(StatusCode::OK);
+    message.set_header(
+        http::header::CONTENT_LENGTH,
+        (frame::MAX_BUFFERED_FRAME_PAYLOAD + 1)
+            .to_string()
+            .parse()
+            .unwrap(),
+    );
+    let qpack = crate::protocol::qpack::tests::shared();
+    let mut encoded = Vec::new();
+    encoded.put_frame(
+        &Frame::new(Headers {
+            field_section: qpack.encode(0, message.fields()).unwrap(),
+        })
+        .unwrap(),
+    );
+    let Response::Streaming(mut response) =
+        read_response(H3ReadStream::new(0, Cursor::new(encoded)), qpack, None)
+            .await
+            .unwrap()
+    else {
+        panic!("expected streaming response");
+    };
+    assert_eq!(response.read(&mut [0]).await, Err(Error::H3_MESSAGE_ERROR));
+    assert_eq!(response.read(&mut [0]).await, Err(Error::H3_MESSAGE_ERROR));
 }

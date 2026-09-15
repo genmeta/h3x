@@ -1,32 +1,29 @@
 //! Connection ownership and GOAWAY dispatch for bidirectional streams.
 use std::{
     collections::HashMap,
-    future::Future,
     mem,
-    pin::Pin,
     sync::{Arc, Mutex},
 };
 
 use qbase::varint::VarInt;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 
 use super::{H3ReadStream, H3WriteStream, StreamState};
 use crate::{
-    Error, Result,
+    ArcWndBuf, Error, Result, Transport,
     protocol::{frame::Goaway, qpack::Qpack},
+    wnd_buf::WeakWndBuf,
 };
-
-type StopSignal = Pin<Box<dyn Future<Output = Error> + Send>>;
-type ErrorHandler = Box<dyn FnOnce(Error) + Send>;
 
 /// The connection and both application handles refer to this same stream.
 pub(crate) struct BiStream<R, W> {
     pub(super) id: u64,
     pub(super) recv: Mutex<StreamState<R>>,
     pub(super) send: Mutex<StreamState<W>>,
-    pub(super) send_changed: Notify,
-    pub(super) send_stopped: Mutex<Option<StopSignal>>,
-    pub(super) send_error_handler: Mutex<Option<ErrorHandler>>,
+    // Lock the corresponding stream state before accessing its body binding.
+    recv_body: Mutex<Option<WeakWndBuf>>,
+    send_body: Mutex<Option<WeakWndBuf>>,
+    // Both halves notify the existing request-drain waiter when they finish.
     finished: Option<Arc<Notify>>,
 }
 
@@ -41,54 +38,63 @@ impl<R, W> BiStream<R, W> {
             id,
             recv: Mutex::new(recv),
             send: Mutex::new(send),
-            send_changed: Notify::new(),
-            send_stopped: Mutex::new(None),
-            send_error_handler: Mutex::new(None),
+            recv_body: Mutex::new(None),
+            send_body: Mutex::new(None),
             finished,
         }
+    }
+
+    pub(super) fn read_body(&self, body: &ArcWndBuf) {
+        bind_body(&self.recv, &self.recv_body, body);
+    }
+
+    pub(super) fn write_body(&self, body: &ArcWndBuf) {
+        bind_body(&self.send, &self.send_body, body);
     }
 
     pub(super) fn terminate_read(&self, terminal: StreamState<R>) {
         let waker = {
             let mut state = self.recv.lock().unwrap();
-            if state.is_terminal() {
-                return;
-            }
             state.terminate(terminal)
         };
+        self.notify_read();
         if let Some(waker) = waker {
             waker.wake();
         }
-        self.notify_if_finished();
     }
 
     pub(super) fn terminate_write(&self, terminal: StreamState<W>) {
         let waker = {
             let mut state = self.send.lock().unwrap();
-            if state.is_terminal() {
-                return;
-            }
             state.terminate(terminal)
         };
+        self.notify_write();
         if let Some(waker) = waker {
             waker.wake();
         }
-        self.notify_write();
+    }
+
+    pub(super) fn notify_read(&self) {
+        let (result, body) = {
+            let state = self.recv.lock().unwrap();
+            let Some(result) = state.result() else {
+                return;
+            };
+            (result, self.recv_body.lock().unwrap().take())
+        };
+        notify_body(result, body);
+        self.notify_if_finished();
     }
 
     pub(super) fn notify_write(&self) {
-        let (result, notify) = {
+        let (result, body) = {
             let state = self.send.lock().unwrap();
             let Some(result) = state.result() else {
                 return;
             };
-            (result, self.send_error_handler.lock().unwrap().take())
+            (result, self.send_body.lock().unwrap().take())
         };
-        // A handler may wake application I/O; release the stream locks first.
-        if let (Err(error), Some(notify)) = (result, notify) {
-            notify(error);
-        }
-        self.send_changed.notify_waiters();
+        notify_body(result, body);
         self.notify_if_finished();
     }
 
@@ -112,37 +118,118 @@ impl<R, W> BiStream<R, W> {
     }
 }
 
-enum BiStreamsState {
-    Open,
-    Draining { cutoff: u64 },
-    Closed(Error),
+fn bind_body<T>(
+    state: &Mutex<StreamState<T>>,
+    binding: &Mutex<Option<WeakWndBuf>>,
+    body: &ArcWndBuf,
+) {
+    let result = {
+        let state = state.lock().unwrap();
+        match state.result() {
+            Some(result) => Some(result),
+            None => {
+                let weak = body.downgrade();
+                let mut binding = binding.lock().unwrap();
+                assert!(
+                    binding.as_ref().is_none_or(|bound| bound.ptr_eq(&weak)),
+                    "a stream direction can only bind one body"
+                );
+                *binding = Some(weak);
+                None
+            }
+        }
+    };
+    // set_error wakes body tasks, which may immediately access the stream again.
+    if let Some(Err(error)) = result {
+        body.set_error(error);
+    }
+}
+
+fn notify_body(result: Result<()>, body: Option<WeakWndBuf>) {
+    if let (Err(error), Some(body)) = (result, body)
+        && let Some(body) = ArcWndBuf::upgrade(&body)
+    {
+        body.set_error(error);
+    }
+}
+
+pub(crate) type Halves<R, W> = (H3WriteStream<W, R>, H3ReadStream<R, W>);
+
+struct Incoming<R, W> {
+    receiver: Option<mpsc::UnboundedReceiver<Result<Halves<R, W>>>>,
+    error: Error,
 }
 
 pub(crate) struct BiStreams<R, W> {
-    // When both locks are needed, hold state before locking streams.
-    state: Mutex<BiStreamsState>,
     streams: Mutex<HashMap<u64, Arc<BiStream<R, W>>>>,
     stream_finished: Arc<Notify>,
+    incoming: AsyncMutex<Incoming<R, W>>,
 }
 
 impl<R, W> Default for BiStreams<R, W> {
     fn default() -> Self {
-        Self {
-            state: Mutex::new(BiStreamsState::Open),
-            streams: Mutex::new(HashMap::new()),
-            stream_finished: Arc::new(Notify::new()),
-        }
+        Self::new().0
     }
 }
 
 impl<R, W> BiStreams<R, W> {
-    /// Wait for both halves of every admitted stream to finish or be cancelled.
-    /// The caller must stop admitting streams before starting this wait.
-    pub(crate) async fn drained(&self) {
+    pub(crate) fn new() -> (Self, mpsc::UnboundedSender<Result<Halves<R, W>>>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (
+            Self {
+                streams: Mutex::new(HashMap::new()),
+                stream_finished: Arc::new(Notify::new()),
+                incoming: AsyncMutex::new(Incoming {
+                    receiver: Some(receiver),
+                    error: Error::H3_REQUEST_CANCELLED,
+                }),
+            },
+            sender,
+        )
+    }
+
+    pub(crate) async fn accept(&self) -> Result<Halves<R, W>> {
+        let mut incoming = self.incoming.lock().await;
+        let result = match incoming.receiver.as_mut() {
+            Some(receiver) => receiver.recv().await,
+            None => None,
+        };
+        match result {
+            Some(Ok(stream)) => Ok(stream),
+            Some(Err(error)) => {
+                incoming.error = error;
+                Err(error)
+            }
+            None => Err(incoming.error),
+        }
+    }
+
+    pub(crate) fn release_incoming(&self) {
+        // An accept call borrows H3Connection, so it cannot overlap its Drop.
+        let receiver = self
+            .incoming
+            .try_lock()
+            .expect("connection has no accept borrower")
+            .receiver
+            .take();
+        drop(receiver);
+    }
+
+    pub(crate) fn running(&self) -> Vec<Arc<BiStream<R, W>>> {
+        self.streams.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Wait for the fixed set admitted when peer GOAWAY arrived.
+    pub(crate) async fn drained(&self, running: Vec<Arc<BiStream<R, W>>>) {
         loop {
             let finished = self.stream_finished.notified();
-            self.cleanup();
-            if self.streams.lock().unwrap().is_empty() {
+            tokio::pin!(finished);
+            finished.as_mut().enable();
+            if running.iter().all(|stream| {
+                stream.recv.lock().unwrap().is_terminal()
+                    && stream.send.lock().unwrap().is_terminal()
+            }) {
+                self.cleanup();
                 return;
             }
             finished.await;
@@ -157,23 +244,15 @@ impl<R, W> BiStreams<R, W> {
         });
     }
 
-    pub(crate) fn goaway(&self, id: u64, qpack: &Qpack) {
-        let streams: Vec<_> = {
-            let mut state = self.state.lock().unwrap();
-            let cutoff = match *state {
-                BiStreamsState::Open => id,
-                BiStreamsState::Draining { cutoff } => cutoff.min(id),
-                BiStreamsState::Closed(_) => return,
-            };
-            *state = BiStreamsState::Draining { cutoff };
-            self.streams
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(stream_id, _)| **stream_id >= id)
-                .map(|(_, stream)| Arc::clone(stream))
-                .collect()
-        };
+    pub(crate) fn goaway<T: Transport>(&self, id: u64, qpack: &Qpack<T>) {
+        let streams: Vec<_> = self
+            .streams
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(stream_id, _)| **stream_id % 4 == id % 4 && **stream_id >= id)
+            .map(|(_, stream)| Arc::clone(stream))
+            .collect();
         let goaway = Goaway {
             id: VarInt::try_from(id).unwrap(),
         };
@@ -185,17 +264,7 @@ impl<R, W> BiStreams<R, W> {
     }
 
     pub(crate) fn close(&self, error: Error) {
-        let (error, streams) = {
-            let mut state = self.state.lock().unwrap();
-            let error = match *state {
-                BiStreamsState::Closed(error) => error,
-                _ => {
-                    *state = BiStreamsState::Closed(error);
-                    error
-                }
-            };
-            (error, mem::take(&mut *self.streams.lock().unwrap()))
-        };
+        let streams = mem::take(&mut *self.streams.lock().unwrap());
         for stream in streams.into_values() {
             stream.close(error);
         }
@@ -208,18 +277,7 @@ impl<R, W> BiStreams<R, W> {
         send: W,
     ) -> Result<(H3WriteStream<W, R>, H3ReadStream<R, W>)> {
         self.cleanup();
-        let state = self.state.lock().unwrap();
-        match *state {
-            BiStreamsState::Closed(error) => return Err(error),
-            BiStreamsState::Draining { cutoff } if id >= cutoff => {
-                return Err(Error::H3_REQUEST_REJECTED);
-            }
-            _ => {}
-        }
         let mut streams = self.streams.lock().unwrap();
-        if streams.contains_key(&id) {
-            return Err(Error::H3_ID_ERROR);
-        }
         let stream = Arc::new(BiStream::new(
             id,
             StreamState::Idle(recv),
@@ -227,9 +285,11 @@ impl<R, W> BiStreams<R, W> {
             Some(Arc::clone(&self.stream_finished)),
         ));
         streams.insert(id, Arc::clone(&stream));
+        drop(streams);
         Ok((
             H3WriteStream {
                 stream: Arc::clone(&stream),
+                stop_signal: None,
             },
             H3ReadStream { stream },
         ))
