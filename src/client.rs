@@ -4,6 +4,7 @@ use std::future::{Future, IntoFuture};
 
 use bytes::Bytes;
 use http::StatusCode;
+use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::{
@@ -36,8 +37,8 @@ pub fn write_bytes_request<RS, WS>(
     qpack: ArcQpack,
 ) -> Result<impl IntoFuture<Output = Result<Response>, IntoFuture: Send> + Send>
 where
-    RS: AsyncRead + Unpin + Send + 'static,
-    WS: AsyncWrite + Unpin + Send + 'static,
+    RS: AsyncRead + StopSending + Unpin + Send + 'static,
+    WS: AsyncWrite + CancelStream + Unpin + Send + 'static,
 {
     use crate::ReadRequest;
     let method = request.method();
@@ -66,8 +67,8 @@ pub fn write_streaming_request<RS, WS>(
     qpack: ArcQpack,
 ) -> Result<impl IntoFuture<Output = Result<Response>, IntoFuture: Send> + Send>
 where
-    RS: AsyncRead + Unpin + Send + 'static,
-    WS: AsyncWrite + Unpin + Send + 'static,
+    RS: AsyncRead + StopSending + Unpin + Send + 'static,
+    WS: AsyncWrite + CancelStream + Unpin + Send + 'static,
 {
     use crate::ReadRequest;
     let method = request.method();
@@ -94,7 +95,7 @@ fn send_bytes_request<WS>(
     qpack: &ArcQpack,
 ) -> Result<impl Future<Output = Result<()>> + Send + use<WS>>
 where
-    WS: AsyncWrite + Unpin + Send + 'static,
+    WS: AsyncWrite + CancelStream + Unpin + Send + 'static,
 {
     let (fields, body) = {
         let head = req.message.head.lock().unwrap();
@@ -134,7 +135,7 @@ fn send_streaming_request<WS>(
     qpack: &ArcQpack,
 ) -> Result<impl Future<Output = Result<()>> + Send + use<WS>>
 where
-    WS: AsyncWrite + Unpin + Send + 'static,
+    WS: AsyncWrite + CancelStream + Unpin + Send + 'static,
 {
     let (head, mut body) = {
         let head = req.message.head.lock().unwrap().clone();
@@ -174,7 +175,7 @@ where
 }
 
 /// Reads ordinary responses; HEAD and CONNECT semantics require request-method input.
-async fn read_response<RS: AsyncRead + Unpin + Send + 'static>(
+async fn read_response<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
     rs: H3ReadStream<RS>,
     qpack: ArcQpack,
     method: Option<http::Method>,
@@ -226,6 +227,7 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static>(
     let (head, mode) = match result {
         Ok(value) => value,
         Err(error) => {
+            rs.get_ref().close(error.clone());
             if matches!(
                 error.code,
                 ErrorCode::H3_FRAME_ERROR | ErrorCode::H3_FRAME_UNEXPECTED

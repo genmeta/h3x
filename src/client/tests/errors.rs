@@ -44,8 +44,8 @@ async fn upload_failure_reaches_response_waiter_for_both_body_modes() {
             Duration::from_secs(1),
             request(
                 outgoing,
-                H3ReadStream::new(0, recv),
-                H3WriteStream::new(0, FailingWriter),
+                crate::test_support::read_stream(0, recv),
+                crate::test_support::write_stream(0, FailingWriter),
                 connection.qpack().clone(),
             ),
         )
@@ -80,8 +80,8 @@ async fn successful_upload_still_waits_for_response() {
             Duration::from_millis(100),
             request(
                 outgoing,
-                H3ReadStream::new(0, recv),
-                H3WriteStream::new(0, tokio::io::sink()),
+                crate::test_support::read_stream(0, recv),
+                crate::test_support::write_stream(0, tokio::io::sink()),
                 connection.qpack().clone(),
             ),
         )
@@ -134,14 +134,19 @@ async fn malformed_response_headers_and_both_trailer_paths_close_the_connection(
         wire.extend_from_slice(&[1, 4, 0, 0, 0xff, 0x24]);
         let error = if stage == "request trailers" {
             let request = crate::server::read_request(
-                H3ReadStream::new(0, Cursor::new(wire)),
+                crate::test_support::read_stream(0, Cursor::new(wire)),
                 connection.qpack().clone(),
             )
             .await
             .unwrap();
             request.into_body().collect().await.unwrap_err()
         } else {
-            match read_response(H3ReadStream::new(0, Cursor::new(wire)), qpack.clone(), None).await
+            match read_response(
+                crate::test_support::read_stream(0, Cursor::new(wire)),
+                qpack.clone(),
+                None,
+            )
+            .await
             {
                 Err(error) => error,
                 Ok(response) => response.into_body().collect().await.unwrap_err(),
@@ -165,10 +170,14 @@ async fn malformed_http_headers_leave_the_connection_usable() {
     let connection = crate::test_support::connection().await;
     let qpack = connection.qpack().clone();
     let wire = headers_frame(&qpack, vec![field(b"x-test", b"missing status")]);
-    let error = read_response(H3ReadStream::new(0, Cursor::new(wire)), qpack.clone(), None)
-        .await
-        .err()
-        .unwrap();
+    let error = read_response(
+        crate::test_support::read_stream(0, Cursor::new(wire)),
+        qpack.clone(),
+        None,
+    )
+    .await
+    .err()
+    .unwrap();
     assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
     tokio::task::yield_now().await;
     assert!(qpack.error().is_none());
@@ -216,7 +225,7 @@ async fn frame_errors_in_headers_bodies_and_trailers_close_the_connection() {
             }
             let error = if request {
                 match crate::server::read_request(
-                    H3ReadStream::new(0, Cursor::new(wire)),
+                    crate::test_support::read_stream(0, Cursor::new(wire)),
                     connection.qpack().clone(),
                 )
                 .await
@@ -225,8 +234,12 @@ async fn frame_errors_in_headers_bodies_and_trailers_close_the_connection() {
                     Ok(request) => request.into_body().collect().await.unwrap_err(),
                 }
             } else {
-                match read_response(H3ReadStream::new(0, Cursor::new(wire)), qpack.clone(), None)
-                    .await
+                match read_response(
+                    crate::test_support::read_stream(0, Cursor::new(wire)),
+                    qpack.clone(),
+                    None,
+                )
+                .await
                 {
                     Err(error) => error,
                     Ok(response) => response.into_body().collect().await.unwrap_err(),
@@ -272,7 +285,7 @@ async fn body_message_errors_leave_the_connection_usable() {
         let wire = headers_frame(&qpack, fields);
         let error = if request {
             crate::server::read_request(
-                H3ReadStream::new(0, Cursor::new(wire)),
+                crate::test_support::read_stream(0, Cursor::new(wire)),
                 connection.qpack().clone(),
             )
             .await
@@ -282,17 +295,64 @@ async fn body_message_errors_leave_the_connection_usable() {
             .await
             .unwrap_err()
         } else {
-            read_response(H3ReadStream::new(0, Cursor::new(wire)), qpack.clone(), None)
-                .await
-                .unwrap()
-                .into_body()
-                .collect()
-                .await
-                .unwrap_err()
+            read_response(
+                crate::test_support::read_stream(0, Cursor::new(wire)),
+                qpack.clone(),
+                None,
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap_err()
         };
         assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
         tokio::task::yield_now().await;
         assert!(qpack.error().is_none());
         assert!(qpack.encode(4, vec![field(b":status", b"200")]).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn malformed_response_stops_transport_with_message_error() {
+    use crate::test_support::TestStream;
+
+    for stage in ["headers", "body", "trailers"] {
+        let connection = crate::test_support::connection().await;
+        let qpack = connection.qpack().clone();
+        let fields = match stage {
+            "headers" => vec![field(b"x-test", b"missing status")],
+            "body" => vec![field(b":status", b"200"), field(b"content-length", b"1")],
+            _ => vec![field(b":status", b"200")],
+        };
+        let mut wire = headers_frame(&qpack, fields);
+        match stage {
+            "body" => {
+                wire.put_frame(&Frame::new(crate::protocol::frame::Data(2)).unwrap());
+                wire.extend_from_slice(b"xx");
+            }
+            "trailers" => wire.extend(headers_frame(&qpack, vec![field(b":status", b"200")])),
+            _ => {}
+        }
+        let (mut peer, recv) = duplex(4096);
+        peer.write_all(&wire).await.unwrap();
+        let recv = TestStream::new(recv);
+        let stopped = recv.stopped.clone();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            match read_response(H3ReadStream::new(0, recv), qpack.clone(), None).await {
+                Err(error) => error,
+                Ok(response) => response.into_body().collect().await.unwrap_err(),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR, "{stage}");
+        assert_eq!(
+            *stopped.lock().unwrap(),
+            [ErrorCode::H3_MESSAGE_ERROR.as_u64()],
+            "{stage}"
+        );
+        assert!(qpack.error().is_none());
     }
 }

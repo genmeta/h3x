@@ -75,7 +75,7 @@ fn respond<WS, R>(
     request_method: &Method,
 ) -> impl Future<Output = Result<()>>
 where
-    WS: AsyncWrite + Unpin,
+    WS: qrecovery::send::CancelStream + AsyncWrite + Unpin,
     R: Into<common::Response<Write>>,
 {
     let response = response.into();

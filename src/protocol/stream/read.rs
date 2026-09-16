@@ -5,18 +5,19 @@ use std::{
     task::{Context, Poll},
 };
 
+use qrecovery::recv::StopSending;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use super::{StreamState, StreamStatus};
 use crate::{Error, ErrorCode};
 
 /// Application-owned read direction, observed weakly by the connection.
-pub struct H3ReadStream<R> {
+pub struct H3ReadStream<R: StopSending> {
     id: u64,
     pub(super) state: Arc<Mutex<StreamState<R>>>,
 }
 
-impl<R> H3ReadStream<R> {
+impl<R: StopSending> H3ReadStream<R> {
     pub fn new(stream_id: u64, stream: R) -> Self {
         Self {
             id: stream_id,
@@ -25,7 +26,8 @@ impl<R> H3ReadStream<R> {
     }
 
     pub(crate) fn close(&self, error: Error) {
-        let wakers = self.state.lock().unwrap().close(error, |_| {});
+        let code = error.code.as_u64();
+        let wakers = self.state.lock().unwrap().close(error, |io| io.stop(code));
         for waker in wakers.into_iter().flatten() {
             waker.wake();
         }
@@ -36,7 +38,7 @@ impl<R> H3ReadStream<R> {
     }
 }
 
-impl<R: qrecovery::recv::StopSending> qrecovery::recv::StopSending for &H3ReadStream<R> {
+impl<R: StopSending> StopSending for &H3ReadStream<R> {
     fn stop(&mut self, error_code: u64) {
         let wakers = self.state.lock().unwrap().close(
             ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"),
@@ -48,13 +50,13 @@ impl<R: qrecovery::recv::StopSending> qrecovery::recv::StopSending for &H3ReadSt
     }
 }
 
-impl<R: qrecovery::recv::StopSending> qrecovery::recv::StopSending for H3ReadStream<R> {
+impl<R: StopSending> StopSending for H3ReadStream<R> {
     fn stop(&mut self, error_code: u64) {
         qrecovery::recv::StopSending::stop(&mut &*self, error_code);
     }
 }
 
-impl<R: AsyncRead + Unpin> AsyncRead for H3ReadStream<R> {
+impl<R: AsyncRead + StopSending + Unpin> AsyncRead for H3ReadStream<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -86,7 +88,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for H3ReadStream<R> {
     }
 }
 
-impl<R> Drop for H3ReadStream<R> {
+impl<R: StopSending> Drop for H3ReadStream<R> {
     fn drop(&mut self) {
         self.close(ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"));
     }

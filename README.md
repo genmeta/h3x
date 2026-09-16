@@ -27,6 +27,10 @@ Read and write handles own only their direction's state:
 through weak references. Dropping an application handle cancels its direction;
 connection references cannot keep transport halves alive. Draining waits directly
 on each direction's terminal state, with separate I/O and drain waiters.
+Custom receive/send types must implement `qrecovery::recv::StopSending` and
+`qrecovery::send::CancelStream`, respectively. HTTP/3 calls these explicitly with
+the protocol error code before releasing unfinished directions; it does not rely
+on the underlying transport's `Drop` implementation.
 
 Client request operations take `connection.qpack().clone()` and depend only on
 compression state. `connection.qpack()` exposes that state as `Qpack`, which has
@@ -63,8 +67,8 @@ failure. A response already ready takes priority; receiving it does not abort up
 ```rust,no_run
 # use h3x::{Body, WndBuf, W, ArcQpack, H3ReadStream, H3WriteStream, WriteRequest, Result, client};
 # async fn example<RS, WS>(rs: H3ReadStream<RS>, ws: H3WriteStream<WS>, qpack: ArcQpack) -> Result<()>
-# where RS: tokio::io::AsyncRead + Unpin + Send + 'static,
-# WS: tokio::io::AsyncWrite + Unpin + Send + 'static {
+# where RS: qrecovery::recv::StopSending + tokio::io::AsyncRead + Unpin + Send + 'static,
+# WS: qrecovery::send::CancelStream + tokio::io::AsyncWrite + Unpin + Send + 'static {
 let mut upload = Body::<WndBuf, W>::with_capacity(16 * 1024);
 let request = client::Request::post("https://example.com/upload")?
     .with_body(upload.clone());

@@ -4,6 +4,7 @@ use std::future::Future;
 
 use bytes::Bytes;
 use http::{Method, StatusCode};
+use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::{
@@ -24,7 +25,7 @@ pub type Request = crate::common::Request<Read>;
 pub type Response<B = Bytes> = crate::common::response::Response<Write, B>;
 
 /// Read an HTTP request using the receive stream's ID and shared QPACK state.
-pub async fn read_request<RS: AsyncRead + Unpin + Send + 'static>(
+pub async fn read_request<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
     rs: H3ReadStream<RS>,
     qpack: ArcQpack,
 ) -> Result<crate::common::Request<Read>> {
@@ -52,6 +53,7 @@ pub async fn read_request<RS: AsyncRead + Unpin + Send + 'static>(
     let (head, length) = match read_head {
         Ok(value) => value,
         Err(error) => {
+            rs.get_ref().close(error.clone());
             if !matches!(
                 error.code,
                 ErrorCode::H3_REQUEST_CANCELLED
@@ -76,7 +78,7 @@ pub async fn read_request<RS: AsyncRead + Unpin + Send + 'static>(
 }
 
 /// Send a buffered response. The method belongs to the original request.
-pub async fn write_bytes_response<WS: AsyncWrite + Unpin>(
+pub async fn write_bytes_response<WS: AsyncWrite + CancelStream + Unpin>(
     response: Response<Bytes>,
     mut ws: H3WriteStream<WS>,
     qpack: ArcQpack,
@@ -135,7 +137,7 @@ pub async fn write_bytes_response<WS: AsyncWrite + Unpin>(
 
 /// Send a streaming response. Keep a body producer until finish/reset and drive
 /// this future concurrently with production. Use reset to cancel the body explicitly.
-pub fn write_streaming_response<WS: AsyncWrite + Unpin>(
+pub fn write_streaming_response<WS: AsyncWrite + CancelStream + Unpin>(
     response: Response<ArcWndBuf>,
     mut ws: H3WriteStream<WS>,
     qpack: ArcQpack,

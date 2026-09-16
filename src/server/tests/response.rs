@@ -6,7 +6,7 @@ async fn write_bytes_response<W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     super::write_bytes_response(
         response,
-        H3WriteStream::new(0, send),
+        crate::test_support::write_stream(0, send),
         crate::test_support::connection().await.qpack().clone(),
         &Method::GET,
     )
@@ -19,7 +19,7 @@ async fn write_streaming_response<W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     super::write_streaming_response(
         response,
-        H3WriteStream::new(0, send),
+        crate::test_support::write_stream(0, send),
         crate::test_support::connection().await.qpack().clone(),
         &Method::GET,
     )
@@ -42,7 +42,7 @@ async fn respond_sends_head_response_without_data() {
         let mut encoded = Vec::new();
         super::respond(
             response,
-            H3WriteStream::new(4, &mut encoded),
+            crate::test_support::write_stream(4, &mut encoded),
             crate::test_support::connection().await.qpack().clone(),
             &Method::HEAD,
         )
@@ -90,7 +90,7 @@ async fn respond_rejects_length_mismatch_and_forbidden_body() {
             assert_eq!(
                 (super::respond(
                     response,
-                    H3WriteStream::new(4, &mut encoded),
+                    crate::test_support::write_stream(4, &mut encoded),
                     crate::test_support::connection().await.qpack().clone(),
                     &method,
                 )

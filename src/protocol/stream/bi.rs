@@ -7,6 +7,8 @@ use std::{
     task::Poll,
 };
 
+use qrecovery::{recv::StopSending, send::CancelStream};
+
 use super::{H3ReadStream, H3WriteStream, StreamState};
 use crate::{Error, ErrorCode, Result};
 
@@ -17,7 +19,7 @@ pub(crate) struct BiStream<R, W> {
     write: Weak<Mutex<StreamState<W>>>,
 }
 
-impl<R, W> BiStream<R, W> {
+impl<R: StopSending, W: CancelStream> BiStream<R, W> {
     async fn finished(&self) {
         poll_fn(|cx| {
             let read = self.read.upgrade().map_or(Poll::Ready(()), |state| {
@@ -37,13 +39,19 @@ impl<R, W> BiStream<R, W> {
 
     fn close(&self, error: Error) {
         if let Some(state) = self.read.upgrade() {
-            let wakers = state.lock().unwrap().close(error.clone(), |_| {});
+            let wakers = state
+                .lock()
+                .unwrap()
+                .close(error.clone(), |io| io.stop(error.code.as_u64()));
             for waker in wakers.into_iter().flatten() {
                 waker.wake();
             }
         }
         if let Some(state) = self.write.upgrade() {
-            let wakers = state.lock().unwrap().close(error.clone(), |_| {});
+            let wakers = state
+                .lock()
+                .unwrap()
+                .close(error.clone(), |io| io.cancel(error.code.as_u64()));
             for waker in wakers.into_iter().flatten() {
                 waker.wake();
             }
@@ -55,13 +63,13 @@ pub(crate) struct BiStreams<R, W> {
     streams: Mutex<HashMap<u64, Arc<BiStream<R, W>>>>,
 }
 
-impl<R, W> Default for BiStreams<R, W> {
+impl<R: StopSending, W: CancelStream> Default for BiStreams<R, W> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<R, W> BiStreams<R, W> {
+impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
     pub(crate) fn new() -> Self {
         Self {
             streams: Mutex::new(HashMap::new()),
@@ -137,7 +145,7 @@ impl<R, W> BiStreams<R, W> {
 }
 
 #[cfg(test)]
-impl<R, W> BiStreams<R, W> {
+impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
     pub(crate) fn len(&self) -> usize {
         self.streams.lock().unwrap().len()
     }
@@ -155,6 +163,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::*;
+    use crate::test_support::TestStream;
 
     #[tokio::test]
     async fn drain_waits_for_both_halves_and_remembers_early_completion() {
@@ -164,7 +173,11 @@ mod tests {
             for read_first in [false, true] {
                 let streams = BiStreams::new();
                 let (mut send, mut recv) = streams
-                    .insert(0, tokio::io::empty(), tokio::io::sink())
+                    .insert(
+                        0,
+                        TestStream::new(tokio::io::empty()),
+                        TestStream::new(tokio::io::sink()),
+                    )
                     .unwrap();
                 let mut draining = Box::pin(streams.drained());
                 let mut cx = Context::from_waker(Waker::noop());
@@ -199,7 +212,11 @@ mod tests {
     async fn close_wakes_a_pending_drain() {
         let streams = Arc::new(BiStreams::new());
         let (_send, _recv) = streams
-            .insert(0, tokio::io::empty(), tokio::io::sink())
+            .insert(
+                0,
+                TestStream::new(tokio::io::empty()),
+                TestStream::new(tokio::io::sink()),
+            )
             .unwrap();
         let draining = tokio::spawn({
             let streams = streams.clone();
@@ -261,7 +278,11 @@ mod tests {
         for read_first in [false, true] {
             let streams = BiStreams::new();
             let (send, recv) = streams
-                .insert(0, tokio::io::empty(), tokio::io::sink())
+                .insert(
+                    0,
+                    TestStream::new(tokio::io::empty()),
+                    TestStream::new(tokio::io::sink()),
+                )
                 .unwrap();
             let stream = streams.streams.lock().unwrap().get(&0).unwrap().clone();
             let mut draining = Box::pin(streams.drained());
@@ -308,7 +329,11 @@ mod tests {
     async fn releasing_connection_references_does_not_cancel_application_handles() {
         let streams = BiStreams::new();
         let (mut send, mut recv) = streams
-            .insert(0, std::io::Cursor::new(vec![7]), Vec::new())
+            .insert(
+                0,
+                TestStream::new(std::io::Cursor::new(vec![7])),
+                TestStream::new(Vec::new()),
+            )
             .unwrap();
         let weak = Arc::downgrade(streams.streams.lock().unwrap().get(&0).unwrap());
         drop(streams);
@@ -324,12 +349,20 @@ mod tests {
         fn assert_send<T: Send>(_: &T) {}
         let streams = BiStreams::new();
         let (send, _recv) = streams
-            .insert(0, std::rc::Rc::new(()), tokio::io::sink())
+            .insert(
+                0,
+                TestStream::new(std::rc::Rc::new(())),
+                TestStream::new(tokio::io::sink()),
+            )
             .unwrap();
         assert_send(&send);
         let streams = BiStreams::new();
         let (_send, recv) = streams
-            .insert(0, tokio::io::empty(), std::rc::Rc::new(()))
+            .insert(
+                0,
+                TestStream::new(tokio::io::empty()),
+                TestStream::new(std::rc::Rc::new(())),
+            )
             .unwrap();
         assert_send(&recv);
     }
@@ -359,7 +392,9 @@ mod tests {
             let streams = BiStreams::new();
             let (read, _read_peer) = tokio::io::duplex(1);
             let (write, _write_peer) = tokio::io::duplex(1);
-            let (mut send, mut recv) = streams.insert(0, read, write).unwrap();
+            let (mut send, mut recv) = streams
+                .insert(0, TestStream::new(read), TestStream::new(write))
+                .unwrap();
             // Fill the transport so the next write must wait.
             assert!(
                 Pin::new(&mut send)
@@ -422,7 +457,13 @@ mod tests {
             } else {
                 Box::new(tokio::io::sink())
             };
-            let (mut send, mut recv) = streams.insert(0, tokio::io::empty(), write).unwrap();
+            let (mut send, mut recv) = streams
+                .insert(
+                    0,
+                    TestStream::new(tokio::io::empty()),
+                    TestStream::new(write),
+                )
+                .unwrap();
             assert_eq!(recv.read(&mut [0]).await.unwrap(), 0);
             let wakes = Arc::new(Wakes::default());
             let waker = Waker::from(wakes.clone());
@@ -490,7 +531,11 @@ mod tests {
     async fn pending_shutdown_keeps_entry_and_failure_reaps_without_dropping_handles() {
         let streams = Arc::new(BiStreams::default());
         let (mut send, mut recv) = streams
-            .insert(0, tokio::io::empty(), FailingShutdown(false))
+            .insert(
+                0,
+                TestStream::new(tokio::io::empty()),
+                TestStream::new(FailingShutdown(false)),
+            )
             .unwrap();
         assert_eq!(recv.read(&mut [0]).await.unwrap(), 0);
         let mut cx = Context::from_waker(Waker::noop());

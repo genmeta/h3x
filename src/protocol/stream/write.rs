@@ -5,18 +5,19 @@ use std::{
     task::{Context, Poll},
 };
 
+use qrecovery::send::CancelStream;
 use tokio::io::AsyncWrite;
 
 use super::{StreamState, StreamStatus};
 use crate::{Error, ErrorCode};
 
 /// Application-owned write direction, observed weakly by the connection.
-pub struct H3WriteStream<W> {
+pub struct H3WriteStream<W: CancelStream> {
     id: u64,
     pub(super) state: Arc<Mutex<StreamState<W>>>,
 }
 
-impl<W> H3WriteStream<W> {
+impl<W: CancelStream> H3WriteStream<W> {
     pub fn new(stream_id: u64, stream: W) -> Self {
         Self {
             id: stream_id,
@@ -25,7 +26,12 @@ impl<W> H3WriteStream<W> {
     }
 
     pub(crate) fn cancel_with_error(&self, error: Error) {
-        let wakers = self.state.lock().unwrap().close(error, |_| {});
+        let code = error.code.as_u64();
+        let wakers = self
+            .state
+            .lock()
+            .unwrap()
+            .close(error, |io| io.cancel(code));
         for waker in wakers.into_iter().flatten() {
             waker.wake();
         }
@@ -36,7 +42,7 @@ impl<W> H3WriteStream<W> {
     }
 }
 
-impl<W: qrecovery::send::CancelStream> qrecovery::send::CancelStream for &H3WriteStream<W> {
+impl<W: CancelStream> CancelStream for &H3WriteStream<W> {
     fn cancel(&mut self, error_code: u64) {
         let wakers = self.state.lock().unwrap().close(
             ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"),
@@ -48,13 +54,13 @@ impl<W: qrecovery::send::CancelStream> qrecovery::send::CancelStream for &H3Writ
     }
 }
 
-impl<W: qrecovery::send::CancelStream> qrecovery::send::CancelStream for H3WriteStream<W> {
+impl<W: CancelStream> CancelStream for H3WriteStream<W> {
     fn cancel(&mut self, error_code: u64) {
         qrecovery::send::CancelStream::cancel(&mut &*self, error_code);
     }
 }
 
-impl<W: AsyncWrite + Unpin> H3WriteStream<W> {
+impl<W: AsyncWrite + CancelStream + Unpin> H3WriteStream<W> {
     fn poll_io<O>(
         &mut self,
         cx: &mut Context<'_>,
@@ -79,7 +85,7 @@ impl<W: AsyncWrite + Unpin> H3WriteStream<W> {
     }
 }
 
-impl<W: AsyncWrite + Unpin> AsyncWrite for H3WriteStream<W> {
+impl<W: AsyncWrite + CancelStream + Unpin> AsyncWrite for H3WriteStream<W> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -106,7 +112,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for H3WriteStream<W> {
     }
 }
 
-impl<W> Drop for H3WriteStream<W> {
+impl<W: CancelStream> Drop for H3WriteStream<W> {
     fn drop(&mut self) {
         self.cancel_with_error(ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"));
     }
@@ -123,7 +129,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{ErrorCode, protocol::stream::H3ReadStream};
+    use crate::ErrorCode;
     #[derive(Default)]
     struct Wakes(AtomicUsize);
 
@@ -139,7 +145,7 @@ mod tests {
         let waker = Waker::from(wakes.clone());
         let mut cx = Context::from_waker(&waker);
         let (recv, _peer) = tokio::io::duplex(1);
-        let mut recv = H3ReadStream::new(4, recv);
+        let mut recv = crate::test_support::read_stream(4, recv);
         let mut bytes = [0];
         let mut buf = tokio::io::ReadBuf::new(&mut bytes);
         use tokio::io::AsyncRead;
@@ -154,7 +160,7 @@ mod tests {
             panic!("closed receive stream must fail");
         };
         assert_eq!(ErrorCode::from(error), ErrorCode::H3_REQUEST_REJECTED);
-        let mut send = H3WriteStream::new(4, tokio::io::sink());
+        let mut send = crate::test_support::write_stream(4, tokio::io::sink());
         send.cancel_with_error(
             ErrorCode::H3_REQUEST_REJECTED.with_reason("test rejects the active request"),
         );
@@ -195,9 +201,10 @@ mod tests {
         for operation in 0..3 {
             let old = Arc::new(Wakes::default());
             let latest = Arc::new(Wakes::default());
-            let mut send = H3WriteStream::new(4, PendingWriter);
+            let mut send = crate::test_support::write_stream(4, PendingWriter);
             let poll =
-                |send: &mut H3WriteStream<PendingWriter>, cx: &mut Context<'_>| match operation {
+                |send: &mut H3WriteStream<crate::test_support::TestStream<PendingWriter>>,
+                 cx: &mut Context<'_>| match operation {
                     0 => Pin::new(send).poll_write(cx, b"x").map_ok(|_| ()),
                     1 => Pin::new(send).poll_flush(cx),
                     _ => Pin::new(send).poll_shutdown(cx),
@@ -227,9 +234,11 @@ mod tests {
     #[tokio::test]
     async fn stream_state_returns_to_idle_after_ready_io() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut recv = H3ReadStream::new(4, std::io::Cursor::new(vec![7]));
-        recv.state.lock().unwrap().status =
-            StreamStatus::Polling(std::io::Cursor::new(vec![7]), Waker::noop().clone());
+        let mut recv = crate::test_support::read_stream(4, std::io::Cursor::new(vec![7]));
+        recv.state.lock().unwrap().status = StreamStatus::Polling(
+            crate::test_support::TestStream::new(std::io::Cursor::new(vec![7])),
+            Waker::noop().clone(),
+        );
         let mut bytes = [0];
         recv.read_exact(&mut bytes).await.unwrap();
         assert_eq!(bytes, [7]);
@@ -245,9 +254,11 @@ mod tests {
                 .is_some_and(|error| error.code == ErrorCode::H3_REQUEST_REJECTED)
         ));
         assert_eq!(recv.stream_id(), 4);
-        let mut send = H3WriteStream::new(4, Vec::new());
-        send.state.lock().unwrap().status =
-            StreamStatus::Polling(Vec::new(), Waker::noop().clone());
+        let mut send = crate::test_support::write_stream(4, Vec::new());
+        send.state.lock().unwrap().status = StreamStatus::Polling(
+            crate::test_support::TestStream::new(Vec::new()),
+            Waker::noop().clone(),
+        );
         send.write_all(b"x").await.unwrap();
         assert!(matches!(
             send.state.lock().unwrap().status,

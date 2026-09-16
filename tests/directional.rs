@@ -8,8 +8,8 @@ use std::{
 
 use bytes::Bytes;
 use h3x::{
-    Body, ErrorCode, H3ReadStream, H3WriteStream, ReadRequest, ReadResponse, W, WndBuf,
-    WriteRequest, WriteResponse, client, server,
+    Body, ErrorCode, ReadRequest, ReadResponse, W, WndBuf, WriteRequest, WriteResponse, client,
+    server,
 };
 use http::{Method, StatusCode, header};
 use tokio::{
@@ -29,8 +29,8 @@ async fn directional_bodies_echo_with_backpressure() {
             .with_body(upload.clone());
         let receiving = client::write_streaming_request(
             request,
-            H3WriteStream::new(0, cs),
-            H3ReadStream::new(0, cr),
+            support::write_stream(0, cs),
+            support::read_stream(0, cr),
             connection.qpack().clone(),
         )
         .unwrap();
@@ -43,7 +43,7 @@ async fn directional_bodies_echo_with_backpressure() {
             },
             async {
                 let request =
-                    server::read_request(H3ReadStream::new(0, sr), connection.qpack().clone())
+                    server::read_request(support::read_stream(0, sr), connection.qpack().clone())
                         .await?;
                 let method = request.method();
                 let mut input = request.into_body();
@@ -53,7 +53,7 @@ async fn directional_bodies_echo_with_backpressure() {
                 let (sent, produced) = tokio::join!(
                     server::write_streaming_response(
                         response,
-                        H3WriteStream::new(0, ss),
+                        support::write_stream(0, ss),
                         connection.qpack().clone(),
                         &method
                     ),
@@ -93,7 +93,7 @@ async fn response_does_not_wait_for_upload_to_finish() {
     // HEAD carries a nonzero Content-Length but no DATA.
     server::write_bytes_response(
         response,
-        H3WriteStream::new(0, &mut encoded),
+        support::write_stream(0, &mut encoded),
         connection.qpack().clone(),
         &Method::HEAD,
     )
@@ -105,8 +105,8 @@ async fn response_does_not_wait_for_upload_to_finish() {
         .with_body(Body::<Bytes, W>::new(Bytes::new()));
     let receiving = client::write_bytes_request(
         request,
-        H3WriteStream::new(0, send),
-        H3ReadStream::new(0, std::io::Cursor::new(encoded)),
+        support::write_stream(0, send),
+        support::read_stream(0, std::io::Cursor::new(encoded)),
         connection.qpack().clone(),
     )
     .unwrap();
@@ -137,8 +137,8 @@ async fn dropping_response_future_preserves_upload() {
     let (send, mut peer) = duplex(1);
     let receiving = client::write_streaming_request(
         request,
-        H3WriteStream::new(0, send),
-        H3ReadStream::new(0, tokio::io::empty()),
+        support::write_stream(0, send),
+        support::read_stream(0, tokio::io::empty()),
         connection.qpack().clone(),
     )
     .unwrap();
@@ -171,8 +171,8 @@ async fn explicit_reset_wakes_producer_after_upload_is_dropped() {
         .with_body(producer.clone());
     let receiving = client::write_streaming_request(
         request,
-        H3WriteStream::new(0, tokio::io::sink()),
-        H3ReadStream::new(0, tokio::io::empty()),
+        support::write_stream(0, tokio::io::sink()),
+        support::read_stream(0, tokio::io::empty()),
         connection.qpack().clone(),
     )
     .unwrap();

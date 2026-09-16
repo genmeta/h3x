@@ -25,8 +25,8 @@ fn request<RS, WS, R>(
     qpack: ArcQpack,
 ) -> impl Future<Output = Result<Response>> + Send
 where
-    RS: AsyncRead + Unpin + Send + 'static,
-    WS: AsyncWrite + Unpin + Send + 'static,
+    RS: qrecovery::recv::StopSending + AsyncRead + Unpin + Send + 'static,
+    WS: qrecovery::send::CancelStream + AsyncWrite + Unpin + Send + 'static,
     R: Into<common::Request<Write>>,
 {
     match request.into() {

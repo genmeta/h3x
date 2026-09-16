@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use h3x::{
-    H3ReadStream, H3WriteStream, ReadRequest, ReadResponse, ReadStream, WriteBody, WriteRequest,
-    WriteResponse, WriteStream, client, server,
+    ReadRequest, ReadResponse, ReadStream, WriteBody, WriteRequest, WriteResponse, WriteStream,
+    client, server,
 };
 use http::{HeaderValue, StatusCode, header};
 use tokio::io::duplex;
@@ -78,8 +78,8 @@ async fn ordinary_headers_round_trip() {
             let (server_send, client_recv) = duplex(64);
             let (received, served) = tokio::join!(
                 async {
-                    let recv = H3ReadStream::new(0, client_recv);
-                    let send = H3WriteStream::new(0, client_send);
+                    let recv = support::read_stream(0, client_recv);
+                    let send = support::write_stream(0, client_send);
                     let qpack = connection.qpack().clone();
                     if buffered {
                         let request = request_headers(
@@ -99,7 +99,7 @@ async fn ordinary_headers_round_trip() {
                 },
                 async {
                     let request = server::read_request(
-                        H3ReadStream::new(0, server_recv),
+                        support::read_stream(0, server_recv),
                         connection.qpack().clone(),
                     )
                     .await?;
@@ -124,7 +124,7 @@ async fn ordinary_headers_round_trip() {
                         .set_header(header::SET_COOKIE, HeaderValue::from_static("old=1"))
                         .append_header(header::SET_COOKIE, HeaderValue::from_static("old=2"))
                         .set_header(header::SET_COOKIE, first_cookie);
-                    let send = H3WriteStream::new(0, server_send);
+                    let send = support::write_stream(0, server_send);
                     let qpack = connection.qpack().clone();
                     if buffered {
                         response

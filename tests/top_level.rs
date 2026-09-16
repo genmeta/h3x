@@ -2,8 +2,8 @@ mod support;
 
 use bytes::Bytes;
 use h3x::{
-    H3ReadStream, H3WriteStream, ReadRequest, ReadResponse, ReadStream, WriteBody, WriteRequest,
-    WriteResponse, WriteStream, client, server,
+    ReadRequest, ReadResponse, ReadStream, WriteBody, WriteRequest, WriteResponse, WriteStream,
+    client, server,
 };
 use http::{Method, StatusCode, header};
 use tokio::io::duplex;
@@ -22,15 +22,15 @@ async fn request_accept_and_respond() {
         async {
             let response = client::write_bytes_request(
                 request,
-                H3WriteStream::new(0, client_send),
-                H3ReadStream::new(0, client_recv),
+                support::write_stream(0, client_send),
+                support::read_stream(0, client_recv),
                 connection.qpack().clone(),
             )?;
             response.await
         },
         async {
             let request = server::read_request(
-                H3ReadStream::new(0, server_recv),
+                support::read_stream(0, server_recv),
                 connection.qpack().clone(),
             )
             .await?;
@@ -50,7 +50,7 @@ async fn request_accept_and_respond() {
                 .set_body(Bytes::copy_from_slice(&body));
             server::write_bytes_response(
                 response,
-                H3WriteStream::new(0, server_send),
+                support::write_stream(0, server_send),
                 connection.qpack().clone(),
                 &method,
             )
@@ -85,8 +85,8 @@ async fn streaming_echo() {
         async {
             let response = client::write_streaming_request(
                 request,
-                H3WriteStream::new(0, client_send),
-                H3ReadStream::new(0, client_recv),
+                support::write_stream(0, client_send),
+                support::read_stream(0, client_recv),
                 connection.qpack().clone(),
             )?;
             response.await
@@ -99,7 +99,7 @@ async fn streaming_echo() {
         },
         async {
             let request = server::read_request(
-                H3ReadStream::new(0, server_recv),
+                support::read_stream(0, server_recv),
                 connection.qpack().clone(),
             )
             .await?;
@@ -116,7 +116,7 @@ async fn streaming_echo() {
             let (sent, echoed) = tokio::join!(
                 server::write_streaming_response(
                     response,
-                    H3WriteStream::new(0, server_send),
+                    support::write_stream(0, server_send),
                     connection.qpack().clone(),
                     &method,
                 ),

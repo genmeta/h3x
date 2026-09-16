@@ -2,7 +2,7 @@ use super::*;
 
 async fn read_request<R: AsyncRead + Unpin + Send + 'static>(recv: R) -> Result<Request> {
     super::accept(
-        H3ReadStream::new(0, recv),
+        crate::test_support::read_stream(0, recv),
         crate::test_support::connection().await.qpack().clone(),
     )
     .await
@@ -270,4 +270,59 @@ async fn unknown_frames_do_not_hide_invalid_request_frames() {
         (request.read(&mut [0]).await).map_err(ErrorCode::from),
         Err(ErrorCode::H3_MESSAGE_ERROR)
     );
+}
+
+#[tokio::test]
+async fn malformed_request_stops_transport_with_message_error() {
+    use crate::test_support::TestStream;
+
+    for stage in ["headers", "body", "trailers"] {
+        let connection = crate::test_support::connection().await;
+        let mut wire = match stage {
+            "headers" => request_frames(b"", Some("invalid")),
+            "body" => request_frames(b"xx", Some("1")),
+            _ => request_frames(b"", None),
+        };
+        if stage == "trailers" {
+            let mut fields = Vec::new();
+            fields
+                .put_field_section(vec![qpack::Field {
+                    never_index: false,
+                    name: Bytes::from_static(b":method"),
+                    value: Bytes::from_static(b"GET"),
+                }])
+                .unwrap();
+            wire.put_frame(
+                &Frame::new(Headers {
+                    field_section: fields.into(),
+                })
+                .unwrap(),
+            );
+        }
+        let (mut peer, recv) = duplex(4096);
+        peer.write_all(&wire).await.unwrap();
+        // Keep the peer open: parsing must terminate QUIC without waiting for FIN/Drop.
+        let recv = TestStream::new(recv);
+        let stopped = recv.stopped.clone();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            match crate::server::read_request(
+                H3ReadStream::new(0, recv),
+                connection.qpack().clone(),
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(request) => request.into_body().collect().await.unwrap_err(),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR, "{stage}");
+        assert_eq!(
+            *stopped.lock().unwrap(),
+            [ErrorCode::H3_MESSAGE_ERROR.as_u64()],
+            "{stage}"
+        );
+        assert!(connection.qpack().error().is_none());
+    }
 }

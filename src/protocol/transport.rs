@@ -8,8 +8,9 @@ use crate::{Error, Result};
 
 /// One established QUIC connection, with stream-local cancellation supplied by its adapter.
 /// open/accept futures must leave any unreturned stream owned by the transport when cancelled.
-/// Dropping a returned half must cancel unfinished I/O; after EOF/FIN it must be harmless.
-/// Explicit stop/cancel must be idempotent with that Drop cleanup.
+/// HTTP/3 explicitly stops/cancels unfinished application-owned halves before dropping them.
+/// Stop/cancel must be harmless after EOF/FIN, reset, or connection termination.
+/// A terminal I/O error must mean the transport direction is already terminated.
 /// Connection termination must wake pending open/accept and stream I/O with an error,
 /// including when initiated by close. Adapters must preserve the terminal error and
 /// stream reset errors where available.

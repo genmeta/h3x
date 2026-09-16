@@ -114,3 +114,6 @@ impl<T: Unpin> StreamState<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod termination_tests;

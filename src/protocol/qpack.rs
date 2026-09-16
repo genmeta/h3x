@@ -512,7 +512,7 @@ pub(crate) mod tests {
         let connection = crate::test_support::connection().await;
         let qpack = connection.qpack();
         let result = crate::server::read_request(
-            crate::H3ReadStream::new(0, &b"\x01\x01\x00"[..]),
+            crate::test_support::read_stream(0, &b"\x01\x01\x00"[..]),
             connection.qpack().clone(),
         )
         .await;

@@ -10,7 +10,7 @@ async fn dropping_last_producer_does_not_finish_or_cancel_sending() {
     let buffer = response.message.body_stream();
     let mut sending = Box::pin(crate::server::write_streaming_response(
         response,
-        H3WriteStream::new(0, tokio::io::sink()),
+        crate::test_support::write_stream(0, tokio::io::sink()),
         crate::test_support::connection().await.qpack().clone(),
         &Method::GET,
     ));
@@ -43,7 +43,7 @@ async fn finished_response_producer_can_drop_before_or_during_send() {
         let mut encoded = Vec::new();
         let mut sending = Box::pin(super::respond(
             response,
-            H3WriteStream::new(0, &mut encoded),
+            crate::test_support::write_stream(0, &mut encoded),
             crate::test_support::connection().await.qpack().clone(),
             &Method::GET,
         ));
@@ -221,7 +221,7 @@ async fn explicit_stop_stops_pump_when_body_write_resumes() {
     let (mut send, recv) = duplex(64);
     send.write_all(&request_frames(b"", None)).await.unwrap();
     let request = super::accept(
-        H3ReadStream::new(4, recv),
+        crate::test_support::read_stream(4, recv),
         crate::test_support::connection().await.qpack().clone(),
     )
     .await
@@ -245,7 +245,7 @@ fn explicit_stop_cancels_body_after_request_pump_is_dropped() {
         let (mut send, recv) = duplex(64);
         send.write_all(&request_frames(b"", None)).await.unwrap();
         let Request::Streaming(request) = super::accept(
-            H3ReadStream::new(4, recv),
+            crate::test_support::read_stream(4, recv),
             crate::test_support::connection().await.qpack().clone(),
         )
         .await
@@ -313,7 +313,7 @@ async fn explicit_stop_stops_a_pump_blocked_on_full_window() {
         dropped: Some(dropped),
     };
     let request = crate::server::read_request(
-        H3ReadStream::new(0, reader),
+        crate::test_support::read_stream(0, reader),
         crate::test_support::connection().await.qpack().clone(),
     )
     .await
@@ -339,7 +339,7 @@ async fn dropping_received_body_does_not_stop_network_reads() {
         let (mut send, recv) = duplex(64);
         send.write_all(&request_frames(b"", None)).await.unwrap();
         let Request::Streaming(request) = crate::server::read_request(
-            H3ReadStream::new(0, recv),
+            crate::test_support::read_stream(0, recv),
             crate::test_support::connection().await.qpack().clone(),
         )
         .await
@@ -359,4 +359,42 @@ async fn dropping_received_body_does_not_stop_network_reads() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn explicit_body_stop_notifies_transport_while_network_or_window_is_blocked() {
+    use crate::test_support::TestStream;
+
+    for full in [false, true] {
+        let payload = if full {
+            vec![b'x'; frame::MAX_DATA_CHUNK * 2]
+        } else {
+            Vec::new()
+        };
+        let wire = request_frames(&payload, None);
+        let (mut peer, recv) = duplex(wire.len() + 1);
+        peer.write_all(&wire).await.unwrap();
+        let recv = TestStream::new(recv);
+        let stopped = recv.stopped.clone();
+        let request = crate::server::read_request(
+            H3ReadStream::new(0, recv),
+            crate::test_support::connection().await.qpack().clone(),
+        )
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+        assert!(stopped.lock().unwrap().is_empty());
+        request.into_body().stop().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while stopped.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *stopped.lock().unwrap(),
+            [ErrorCode::H3_REQUEST_CANCELLED.as_u64()]
+        );
+    }
 }

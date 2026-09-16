@@ -115,3 +115,69 @@ pub async fn connection() -> H3Connection<TestTransport> {
         .await
         .unwrap()
 }
+
+/// Codec I/O with observable QUIC termination, independent of its Drop behavior.
+#[allow(dead_code)]
+pub struct TestStream<T> {
+    pub io: T,
+    pub stopped: std::sync::Arc<Mutex<Vec<u64>>>,
+    pub cancelled: std::sync::Arc<Mutex<Vec<u64>>>,
+}
+
+impl<T> TestStream<T> {
+    pub fn new(io: T) -> Self {
+        Self {
+            io,
+            stopped: Default::default(),
+            cancelled: Default::default(),
+        }
+    }
+}
+
+impl<T> StopSending for TestStream<T> {
+    fn stop(&mut self, code: u64) {
+        self.stopped.lock().unwrap().push(code);
+    }
+}
+
+impl<T> CancelStream for TestStream<T> {
+    fn cancel(&mut self, code: u64) {
+        self.cancelled.lock().unwrap().push(code);
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for TestStream<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for TestStream<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
+#[allow(dead_code)]
+pub fn read_stream<T>(id: u64, io: T) -> h3x::H3ReadStream<TestStream<T>> {
+    h3x::H3ReadStream::new(id, TestStream::new(io))
+}
+
+#[allow(dead_code)]
+pub fn write_stream<T>(id: u64, io: T) -> h3x::H3WriteStream<TestStream<T>> {
+    h3x::H3WriteStream::new(id, TestStream::new(io))
+}

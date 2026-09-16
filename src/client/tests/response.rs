@@ -3,7 +3,12 @@ use crate::protocol::frame::Data;
 
 async fn read_response<R: AsyncRead + Unpin + Send + 'static>(recv: R) -> Result<Response> {
     let connection = crate::test_support::connection().await;
-    super::read_response(H3ReadStream::new(0, recv), connection.qpack().clone(), None).await
+    super::read_response(
+        crate::test_support::read_stream(0, recv),
+        connection.qpack().clone(),
+        None,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -50,7 +55,7 @@ async fn preserves_set_cookie_headers_through_message_roundtrip() {
         };
         let outgoing = crate::server::Response::from(response.message.test_direction());
         let mut reencoded = Vec::new();
-        let send = H3WriteStream::new(4, &mut reencoded);
+        let send = crate::test_support::write_stream(4, &mut reencoded);
         let qpack = crate::test_support::connection().await.qpack().clone();
         crate::server::write_streaming_response(outgoing, send, qpack, &Method::GET)
             .await

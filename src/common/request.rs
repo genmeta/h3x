@@ -268,8 +268,6 @@ mod tests {
             time::Duration,
         };
 
-        use crate::protocol::stream::{H3ReadStream, H3WriteStream};
-
         tokio::time::timeout(Duration::from_secs(5), async {
             for error in [ErrorCode::H3_REQUEST_CANCELLED, ErrorCode::H3_MESSAGE_ERROR] {
                 let mut request = Request::streaming_post("https://example.com/upload").unwrap();
@@ -297,8 +295,8 @@ mod tests {
                 } else {
                     let result = crate::client::write_streaming_request(
                         request,
-                        H3WriteStream::new(0, tokio::io::sink()),
-                        H3ReadStream::new(0, tokio::io::empty()),
+                        crate::test_support::write_stream(0, tokio::io::sink()),
+                        crate::test_support::read_stream(0, tokio::io::empty()),
                         crate::test_support::connection().await.qpack().clone(),
                     );
                     assert!(matches!(result, Err(actual) if actual.code == error));

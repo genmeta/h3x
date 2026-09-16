@@ -150,7 +150,7 @@ mod tests {
                 )))
             }
         }
-        let mut stream = crate::H3ReadStream::new(0, Truncated);
+        let mut stream = crate::test_support::read_stream(0, Truncated);
         let error = crate::protocol::frame::be_frame(&mut stream)
             .await
             .unwrap_err();
@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(Error::from(body.read(&mut [0]).await.unwrap_err()), error);
         assert_eq!(Error::from(body.write(b"x").await.unwrap_err()), error);
 
-        let mut stream = crate::H3WriteStream::new(0, tokio::io::sink());
+        let mut stream = crate::test_support::write_stream(0, tokio::io::sink());
         stream.cancel_with_error(error.clone());
         assert_eq!(Error::from(stream.write(b"x").await.unwrap_err()), error);
         assert_eq!(Error::from(stream.flush().await.unwrap_err()), error);
@@ -227,7 +227,7 @@ mod tests {
         ] {
             let expected = Error::from(cause);
             let mut stream =
-                crate::H3ReadStream::new(0, FailingReader(Some(expected.clone().into())));
+                crate::test_support::read_stream(0, FailingReader(Some(expected.clone().into())));
             for _ in 0..2 {
                 assert_eq!(
                     Error::from(stream.read(&mut [0]).await.unwrap_err()),

@@ -138,6 +138,18 @@ impl ArcWndBuf {
         }
     }
 
+    /// The receive pump is the window's sole writer, including while waiting on QUIC.
+    pub(crate) async fn wait_error(&self) -> Error {
+        std::future::poll_fn(|cx| match &mut *self.shared.lock().unwrap() {
+            Err(error) => Poll::Ready(error.clone()),
+            Ok(window) => {
+                window.write_waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
     fn poll_io<T>(
         &self,
         poll: impl FnOnce(Pin<&mut WndBuf>) -> Poll<io::Result<T>>,
