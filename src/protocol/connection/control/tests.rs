@@ -180,9 +180,9 @@ async fn local_field_limit_does_not_close_connection_but_receive_failure_does() 
         )
         .is_ok()
     );
-    connection.fail(
-        ErrorCode::H3_EXCESSIVE_LOAD
-            .with_reason("test closes the connection during stream processing"),
+    let _ = connection.transport.close(
+        "test closes the connection during stream processing".into(),
+        ErrorCode::H3_EXCESSIVE_LOAD.as_u64(),
     );
     tokio::task::yield_now().await;
     assert_eq!(ErrorCode::from(ended.await), ErrorCode::H3_EXCESSIVE_LOAD);
@@ -211,9 +211,9 @@ async fn protocol_failure_preserves_observed_transport_reason_and_closes_streams
     })
     .await
     .unwrap();
-    connection.fail(
-        ErrorCode::QPACK_DECOMPRESSION_FAILED
-            .with_reason("test closes the connection during stream processing"),
+    let _ = connection.transport.close(
+        "test closes the connection during stream processing".into(),
+        ErrorCode::QPACK_DECOMPRESSION_FAILED.as_u64(),
     );
     tokio::task::yield_now().await;
     assert_eq!(
@@ -281,7 +281,7 @@ async fn goaway_waits_for_admitted_streams_after_peer_goaway() {
     connection
         .cursor
         .receive_goaway(StreamId::new(Role::Client, Dir::Bi, 1));
-    connection.cursor.local_goaway().unwrap();
+    connection.cursor.local_goaway();
     tokio::task::yield_now().await;
     let mut closing = Box::pin(connection.clone().goaway());
     let mut cx = Context::from_waker(Waker::noop());
@@ -307,7 +307,7 @@ async fn transport_termination_wakes_goaway_waiting_for_peer() {
             .is_pending()
     );
     let error =
-        ErrorCode::H3_INTERNAL_ERROR.with_reason("transport terminated while awaiting peer");
+        ErrorCode::H3_INTERNAL_ERROR.reason("transport terminated while awaiting peer");
     connection
         .transport
         .close(error.reason.clone(), error.code.as_u64())

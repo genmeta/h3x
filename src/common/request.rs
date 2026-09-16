@@ -47,14 +47,14 @@ impl WriteBody for Request<Write, Bytes> {
     }
 }
 
-impl Request<Write, Bytes> {
-    pub fn body(mut self, body: Bytes) -> Self {
-        self.set_body(body);
-        self
-    }
-}
-
 impl Request<Write, ArcWndBuf> {
+    /// Construct a streaming CONNECT request without opening a connection.
+    /// `ws://` and `wss://` select WebSocket; authority-form targets use plain CONNECT.
+    /// Retain `body()` and wait for successful response headers before writing.
+    pub fn connect(url: &str) -> Result<Self> {
+        Self::streaming(url, Method::CONNECT)
+    }
+
     fn streaming(url: &str, method: Method) -> Result<Self> {
         let message = Message::new_request_with_body(
             url,
@@ -75,10 +75,6 @@ impl Request<Write, ArcWndBuf> {
 
     pub fn streaming_patch(url: &str) -> Result<Self> {
         Self::streaming(url, Method::PATCH)
-    }
-
-    pub fn streaming_connect(url: &str) -> Result<Self> {
-        Self::streaming(url, Method::CONNECT)
     }
 }
 
@@ -121,6 +117,9 @@ impl WriteStream for Request<Write, ArcWndBuf> {
 }
 
 impl<IO, B> ReadRequest for Request<IO, B> {
+    fn protocol(&self) -> Option<crate::Protocol> {
+        self.message.head.lock().unwrap().protocol()
+    }
     fn method(&self) -> Method {
         self.message.head.lock().unwrap().method()
     }
@@ -161,8 +160,8 @@ impl<IO, B: Clone> Request<IO, B> {
 
 impl<B: Clone> Request<Write, B> {
     /// Retain a body producer independently of the message being sent.
-    pub fn body_handle(&self) -> super::body::Body<B, Write> {
-        self.message.body_handle()
+    pub fn body(&self) -> super::body::Body<B, Write> {
+        self.message.body()
     }
 }
 
@@ -238,25 +237,14 @@ mod tests {
             ),
             (Request::streaming_put, Method::PUT),
             (Request::streaming_patch, Method::PATCH),
-            (Request::streaming_connect, Method::CONNECT),
         ] {
             let request = constructor("https://example.com/upload?q=1").unwrap();
             let head = request.message.head.lock().unwrap();
             assert_eq!(head.method(), method);
             assert_eq!(head.authority(), "example.com");
-            assert_eq!(
-                head.path(),
-                if method == Method::CONNECT {
-                    ""
-                } else {
-                    "/upload?q=1"
-                }
-            );
+            assert_eq!(head.path(), "/upload?q=1");
             assert!(constructor("/relative").is_err());
-            assert_eq!(
-                constructor("example.com:443").is_ok(),
-                method == Method::CONNECT
-            );
+            assert!(constructor("example.com:443").is_err());
         }
     }
 
@@ -314,7 +302,7 @@ mod tests {
         let mut writer = Request::<Write>::post("https://example.com/a?q=1")
             .unwrap()
             .header(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))
-            .body(Bytes::from_static(b"hello"));
+            .with_body(h3x::Body::new(Bytes::from_static(b"hello")));
         let reader = Request::<Read>::from(writer.message.test_direction());
         assert_eq!(reader.method(), Method::POST);
         assert_eq!(reader.authority(), "example.com");

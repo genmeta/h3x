@@ -21,37 +21,18 @@ impl Frame<CancelPush> {
     ) -> Result<Self> {
         if length.into_u64() > VarInt::MAX_SIZE as u64 {
             return Err(ErrorCode::H3_FRAME_ERROR
-                .with_reason("CANCEL_PUSH payload exceeds the maximum identifier size"));
+                .reason("CANCEL_PUSH payload exceeds the maximum identifier size"));
         }
         let mut payload = reader.take(length.into_u64());
         let id = be_varint(&mut payload)
             .await
-            .map_err(|error| {
-                let error = error
-                    .get_ref()
-                    .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
-                    .map_or(&error, std::sync::Arc::as_ref);
-                error
-                    .get_ref()
-                    .and_then(|error| error.downcast_ref::<crate::Error>())
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        let code = if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                            ErrorCode::H3_FRAME_ERROR
-                        } else {
-                            ErrorCode::H3_INTERNAL_ERROR
-                        };
-                        code.with_reason(error.to_string())
-                    })
-            })?
+            .map_err(crate::Error::from_frame_io)?
             .ok_or_else(|| {
                 ErrorCode::H3_FRAME_ERROR
-                    .with_reason("CANCEL_PUSH payload is missing a complete identifier")
+                    .reason("CANCEL_PUSH payload is missing a complete identifier")
             })?;
         if payload.limit() != 0 {
-            return Err(
-                ErrorCode::H3_FRAME_ERROR.with_reason("CANCEL_PUSH payload has trailing bytes")
-            );
+            return Err(ErrorCode::H3_FRAME_ERROR.reason("CANCEL_PUSH payload has trailing bytes"));
         }
         Ok(Self {
             length,

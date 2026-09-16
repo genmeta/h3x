@@ -126,8 +126,8 @@ impl<IO, B: Clone> Response<IO, B> {
 
 impl<B: Clone> Response<Write, B> {
     /// Retain a body producer independently of the message being sent.
-    pub fn body_handle(&self) -> super::body::Body<B, Write> {
-        self.message.body_handle()
+    pub fn body(&self) -> super::body::Body<B, Write> {
+        self.message.body()
     }
 }
 

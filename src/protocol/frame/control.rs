@@ -96,22 +96,9 @@ impl<B: BufMut> WriteControl for B {
 pub(crate) async fn be_control<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Control> {
     let ty = frame::be_varint(recv)
         .await
-        .map_err(|error| {
-            let error = error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
-                .map_or(&error, std::sync::Arc::as_ref);
-            error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<crate::Error>())
-                .cloned()
-                .unwrap_or_else(|| {
-                    let code = ErrorCode::H3_CLOSED_CRITICAL_STREAM;
-                    code.with_reason(error.to_string())
-                })
-        })?
+        .map_err(|error| crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM))?
         .ok_or_else(|| {
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("critical HTTP/3 stream closed")
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM.reason("critical HTTP/3 stream closed")
         })?;
     let known = match ty.into_u64() {
         4 => Some(FrameType::Settings),
@@ -120,51 +107,27 @@ pub(crate) async fn be_control<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Con
         13 => Some(FrameType::MaxPushId),
         0..=9 => {
             return Err(
-                ErrorCode::H3_FRAME_UNEXPECTED.with_reason("frame is not allowed in this context")
+                ErrorCode::H3_FRAME_UNEXPECTED.reason("frame is not allowed in this context")
             );
         }
         _ => None,
     };
     let length = frame::be_varint(recv)
         .await
-        .map_err(|error| {
-            let error = error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
-                .map_or(&error, std::sync::Arc::as_ref);
-            error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<crate::Error>())
-                .cloned()
-                .unwrap_or_else(|| {
-                    let code = ErrorCode::H3_CLOSED_CRITICAL_STREAM;
-                    code.with_reason(error.to_string())
-                })
-        })?
+        .map_err(|error| crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM))?
         .ok_or_else(|| {
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("critical HTTP/3 stream closed")
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM.reason("critical HTTP/3 stream closed")
         })?;
     let Some(known) = known else {
         return Ok(Control::Unknown { ty, length });
     };
     if length.into_u64() > frame::MAX_BUFFERED_FRAME_PAYLOAD as u64 {
-        return Err(ErrorCode::H3_EXCESSIVE_LOAD.with_reason("configured resource limit exceeded"));
+        return Err(ErrorCode::H3_EXCESSIVE_LOAD.reason("configured resource limit exceeded"));
     }
     let mut payload = vec![0; length.into_u64() as usize];
-    recv.read_exact(&mut payload).await.map_err(|error| {
-        let error = error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
-            .map_or(&error, std::sync::Arc::as_ref);
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<crate::Error>())
-            .cloned()
-            .unwrap_or_else(|| {
-                let code = ErrorCode::H3_CLOSED_CRITICAL_STREAM;
-                code.with_reason(error.to_string())
-            })
-    })?;
+    recv.read_exact(&mut payload)
+        .await
+        .map_err(|error| crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM))?;
     Ok(
         match frame::be_frame_payload(&mut payload.as_slice(), known, length).await? {
             H3Frame::Settings(frame) => Control::Settings(frame),

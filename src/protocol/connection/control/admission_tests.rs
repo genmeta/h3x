@@ -26,12 +26,20 @@ impl Transport for GatedTransport {
     }
     async fn open_bi(&self) -> Result<Option<(u64, (Reader, Writer))>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.ready.acquire().await.unwrap().forget();
+        tokio::select! {
+            biased;
+            error = self.base.terminated() => return Err(error),
+            permit = self.ready.acquire() => permit.unwrap().forget(),
+        }
         Ok(Some((0, (Reader, Writer))))
     }
     async fn accept_bi(&self) -> Result<(u64, (Reader, Writer))> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.ready.acquire().await.unwrap().forget();
+        tokio::select! {
+            biased;
+            error = self.base.terminated() => return Err(error),
+            permit = self.ready.acquire() => permit.unwrap().forget(),
+        }
         Ok((1, (Reader, Writer)))
     }
     async fn open_uni(&self) -> Result<Option<(u64, Writer)>> {
@@ -77,17 +85,23 @@ async fn pending_opens_cannot_register_after_goaway_or_close_even_after_drain() 
                 ErrorCode::H3_REQUEST_REJECTED
             }
             _ => {
-                connection.on_terminated(
-                    ErrorCode::H3_INTERNAL_ERROR
-                        .with_reason("test closes the connection during stream processing"),
-                );
+                connection
+                    .transport
+                    .close(
+                        "test closes the connection during stream processing".into(),
+                        ErrorCode::H3_INTERNAL_ERROR.as_u64(),
+                    )
+                    .unwrap();
                 ErrorCode::H3_INTERNAL_ERROR
             }
         };
         assert!(matches!(connection.open_bi().await, Err(e) if e.code == error));
-        assert_eq!(connection.transport.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            connection.transport.calls.load(Ordering::SeqCst),
+            if transition == 0 { 1 } else { 2 }
+        );
         if transition == 0 {
-            connection.cursor.local_goaway().unwrap();
+            connection.cursor.local_goaway();
         }
         connection
             .cursor
@@ -111,17 +125,23 @@ async fn pending_accepts_cannot_register_after_local_goaway_or_close() {
                 .is_pending()
         );
         let error = if closed {
-            connection.on_terminated(
-                ErrorCode::H3_INTERNAL_ERROR
-                    .with_reason("test closes the connection during stream processing"),
-            );
+            connection
+                .transport
+                .close(
+                    "test closes the connection during stream processing".into(),
+                    ErrorCode::H3_INTERNAL_ERROR.as_u64(),
+                )
+                .unwrap();
             ErrorCode::H3_INTERNAL_ERROR
         } else {
-            connection.cursor.local_goaway().unwrap();
+            connection.cursor.local_goaway();
             ErrorCode::H3_REQUEST_REJECTED
         };
         assert!(matches!(connection.accept_bi().await, Err(e) if e.code == error));
-        assert_eq!(connection.transport.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            connection.transport.calls.load(Ordering::SeqCst),
+            if closed { 2 } else { 1 }
+        );
         connection.transport.ready.add_permits(1);
         assert!(matches!(accepting.await, Err(e) if e.code == error));
         assert_eq!(connection.bi_streams.len(), 0);
@@ -146,7 +166,7 @@ async fn goaway_only_freezes_its_own_admission_direction() {
                 .is_pending()
         );
         if opening {
-            connection.cursor.local_goaway().unwrap();
+            connection.cursor.local_goaway();
         } else {
             connection
                 .cursor
@@ -175,7 +195,7 @@ async fn peer_goaway_preserves_admitted_streams_below_boundary() {
     let boundary = StreamId::new(Role::Client, Dir::Bi, 100);
     connection.cursor.receive_goaway(boundary);
     connection.bi_streams.goaway(u64::from(boundary));
-    connection.cursor.local_goaway().unwrap();
+    connection.cursor.local_goaway();
     let mut draining = Box::pin(connection.bi_streams.drained());
     assert!(
         draining

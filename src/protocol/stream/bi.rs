@@ -112,7 +112,7 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
             .collect();
         let rejected = streams.iter().map(|stream| stream.id).collect();
         for stream in streams {
-            stream.close(ErrorCode::H3_REQUEST_REJECTED.with_reason("request rejected"));
+            stream.close(ErrorCode::H3_REQUEST_REJECTED.reason("request rejected"));
         }
         self.cleanup();
         rejected
@@ -224,7 +224,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         assert!(!draining.is_finished());
-        streams.close(ErrorCode::H3_INTERNAL_ERROR.with_reason("test terminates an active stream"));
+        streams.close(ErrorCode::H3_INTERNAL_ERROR.reason("test terminates an active stream"));
         tokio::time::timeout(std::time::Duration::from_secs(1), draining)
             .await
             .unwrap()
@@ -255,7 +255,7 @@ mod tests {
         let read_code = Arc::new(AtomicU64::new(0));
         let write_code = Arc::new(AtomicU64::new(0));
         let streams = BiStreams::new();
-        let (mut send, mut recv) = streams
+        let (send, mut recv) = streams
             .insert(0, Recv(read_code.clone()), Send(write_code.clone()))
             .unwrap();
         let mut drained = Box::pin(streams.drained());
@@ -263,12 +263,15 @@ mod tests {
         assert!(drained.as_mut().poll(&mut cx).is_pending());
         recv.stop(123);
         assert!(drained.as_mut().poll(&mut cx).is_pending());
-        send.cancel(456);
+        (&send).cancel(ErrorCode::H3_MESSAGE_ERROR.as_u64());
         assert!(drained.as_mut().poll(&mut cx).is_ready());
         recv.stop(789);
-        send.cancel(789);
+        (&send).cancel(ErrorCode::H3_REQUEST_CANCELLED.as_u64());
         assert_eq!(read_code.load(Ordering::SeqCst), 123);
-        assert_eq!(write_code.load(Ordering::SeqCst), 456);
+        assert_eq!(
+            write_code.load(Ordering::SeqCst),
+            ErrorCode::H3_MESSAGE_ERROR.as_u64()
+        );
     }
 
     #[test]
@@ -431,7 +434,7 @@ mod tests {
                 }
             }
             streams.close(
-                ErrorCode::H3_INTERNAL_ERROR.with_reason("test terminates an active stream"),
+                ErrorCode::H3_INTERNAL_ERROR.reason("test terminates an active stream"),
             );
             assert_eq!(old_io.count(), 0);
             assert_eq!(old_drain.count(), 0);
@@ -521,7 +524,7 @@ mod tests {
                 Poll::Pending
             } else {
                 Poll::Ready(Err(ErrorCode::H3_REQUEST_REJECTED
-                    .with_reason("test peer rejects stream shutdown")
+                    .reason("test peer rejects stream shutdown")
                     .into()))
             }
         }

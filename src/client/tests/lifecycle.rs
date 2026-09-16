@@ -109,7 +109,7 @@ async fn dropping_response_wait_preserves_uploads() {
             } else {
                 Request::post("https://example.com/upload")
                     .unwrap()
-                    .body(Bytes::from_static(b"payload"))
+                    .with_body(h3x::Body::new(Bytes::from_static(b"payload")))
                     .into()
             };
             let (send, mut peer_recv) = tokio::io::duplex(1);
@@ -170,7 +170,7 @@ async fn early_response_keeps_both_body_modes_sending() {
             } else {
                 Request::post("https://example.com/upload")
                     .unwrap()
-                    .body(Bytes::from_static(b"payload"))
+                    .with_body(h3x::Body::new(Bytes::from_static(b"payload")))
                     .into()
             };
             let (send, mut recv) = tokio::io::duplex(1);
@@ -317,7 +317,7 @@ async fn producer_fin_does_not_complete_transport_shutdown() {
 }
 
 #[tokio::test]
-async fn write_failure_after_idle_body_ends_response_wait() {
+async fn write_failure_after_idle_body_notifies_producer_only() {
     timeout(Duration::from_secs(5), async {
         let mut producer = Request::streaming_post("https://example.com/upload").unwrap();
         let (send, mut peer_recv) = tokio::io::duplex(64);
@@ -348,16 +348,18 @@ async fn write_failure_after_idle_body_ends_response_wait() {
         );
         assert_eq!(producer.write(b"x").await, Ok(1));
         while producer.write(b"x").await.is_ok() {}
-        let error = waiting
-            .await
-            .err()
-            .expect("upload failure reaches the response waiter");
+        let error = producer.write(b"x").await.unwrap_err();
         assert_eq!(error.code, ErrorCode::H3_INTERNAL_ERROR);
-        assert_eq!(producer.write(b"x").await.unwrap_err(), error);
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         drop(peer_send);
     })
     .await
-    .expect("a failed upload must end the response wait");
+    .expect("a failed upload must notify the producer");
 }
 
 #[tokio::test]
@@ -553,4 +555,29 @@ async fn streaming_response_keeps_message_error_after_transport_eof() {
         (response.read(&mut [0]).await).map_err(ErrorCode::from),
         Err(ErrorCode::H3_MESSAGE_ERROR)
     );
+}
+
+#[tokio::test]
+async fn dropping_unpolled_connect_leaves_body_reset_explicit() {
+    for convenience in [false, true] {
+        let request = Request::connect("example.com:443").unwrap();
+        let mut body = request.body();
+        let connection = crate::test_support::connection().await;
+        let ws = crate::test_support::write_stream(0, tokio::io::sink());
+        let rs = crate::test_support::read_stream(0, tokio::io::empty());
+        if convenience {
+            drop(super::connect(request, ws, rs, connection.qpack().clone()));
+        } else {
+            drop(
+                super::write_streaming_request(request, ws, rs, connection.qpack().clone())
+                    .unwrap(),
+            );
+        }
+        assert_eq!(body.write(b"buffered").await.unwrap(), 8);
+        body.clone().reset().await.unwrap();
+        assert_eq!(
+            body.write(b"late").await.unwrap_err().code,
+            ErrorCode::H3_REQUEST_CANCELLED
+        );
+    }
 }

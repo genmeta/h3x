@@ -19,32 +19,14 @@ pub(crate) async fn be_push_promise_frame<T: AsyncRead + Unpin + ?Sized>(
     length: VarInt,
 ) -> Result<Frame<PushPromise>> {
     if length.into_u64() > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
-        return Err(ErrorCode::H3_EXCESSIVE_LOAD.with_reason("configured resource limit exceeded"));
+        return Err(ErrorCode::H3_EXCESSIVE_LOAD.reason("configured resource limit exceeded"));
     }
     let mut payload = reader.take(length.into_u64());
     let id = be_varint(&mut payload)
         .await
-        .map_err(|error| {
-            let error = error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
-                .map_or(&error, std::sync::Arc::as_ref);
-            error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<crate::Error>())
-                .cloned()
-                .unwrap_or_else(|| {
-                    let code = if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                        ErrorCode::H3_FRAME_ERROR
-                    } else {
-                        ErrorCode::H3_INTERNAL_ERROR
-                    };
-                    code.with_reason(error.to_string())
-                })
-        })?
+        .map_err(crate::Error::from_frame_io)?
         .ok_or_else(|| {
-            ErrorCode::H3_FRAME_ERROR
-                .with_reason("PUSH_PROMISE payload is missing a complete push ID")
+            ErrorCode::H3_FRAME_ERROR.reason("PUSH_PROMISE payload is missing a complete push ID")
         })?;
     let remaining = payload.limit();
     let fields = read_payload(&mut payload, remaining).await?;

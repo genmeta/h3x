@@ -40,12 +40,11 @@ async fn request_frames_and_errors() {
             Bytes::from_static(b"hello"),
         ),
         (Method::GET, "https://example.com/", Bytes::new()),
-        (Method::CONNECT, "example.com:443", Bytes::new()),
     ] {
         let req = Request::new(url, method.clone())
             .unwrap()
             .header(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))
-            .body(body.clone());
+            .with_body(crate::Body::new(body.clone()));
         // A tiny buffer forces partial writes and backpressure.
         let (writer, mut reader) = duplex(3);
         let (sent, received) = tokio::join!(write_bytes_request(&req, writer), async {
@@ -71,6 +70,14 @@ async fn request_frames_and_errors() {
             input = &input[body.len()..];
         }
         assert!(input.is_empty());
+    }
+    for url in ["example.com:443", "ws://example.com/chat"] {
+        let request = Request::<Bytes>::connect(url).unwrap();
+        assert!(
+            write_bytes_request(&request, tokio::io::sink())
+                .await
+                .is_err()
+        );
     }
     let req = Request::<Bytes>::get("https://example.com/")
         .unwrap()
