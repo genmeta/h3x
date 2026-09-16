@@ -125,28 +125,16 @@ impl Qpack {
 async fn drive<T: crate::Transport>(
     transport: std::sync::Arc<T>,
     write: impl AsyncFnOnce(&mut T::StreamWriter) -> Result<()>,
-) {
+) -> Result<()> {
     let writing = async {
-        let stream = transport.open_uni().await.and_then(|stream| {
-            stream.ok_or_else(|| {
-                ErrorCode::H3_STREAM_CREATION_ERROR.with_reason("unable to open QPACK stream")
-            })
-        });
-        match stream {
-            Ok((_, mut send)) => {
-                if let Err(error) = write(&mut send).await {
-                    // Keep the critical stream alive until transport close is requested.
-                    let _ = transport.close(error.reason.clone(), error.code.as_u64());
-                }
-            }
-            Err(error) => {
-                let _ = transport.close(error.reason.clone(), error.code.as_u64());
-            }
-        }
+        let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
+            ErrorCode::H3_STREAM_CREATION_ERROR.with_reason("unable to create the required stream")
+        })?;
+        write(&mut send).await
     };
     tokio::select! {
         biased;
-        _ = transport.terminated() => {},
-        _ = writing => {},
+        error = transport.terminated() => Err(error),
+        result = writing => result,
     }
 }

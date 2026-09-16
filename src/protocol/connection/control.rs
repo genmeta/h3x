@@ -1,43 +1,86 @@
 //! Peer unidirectional stream admission, dispatch, and task lifetime.
 use qbase::sid::{Dir, StreamId};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::H3Connection;
 use crate::{
-    ErrorCode, Result, Transport,
+    Error, ErrorCode, Result, Transport,
     protocol::{
         frame::{self, Control, Frame, StreamType, WriteControl as _, be_control},
         qpack,
     },
 };
 
+pub(super) async fn open_uni<T: Transport>(transport: &T) -> Result<T::StreamWriter> {
+    transport
+        .open_uni()
+        .await?
+        .map(|(_, send)| send)
+        .ok_or_else(|| {
+            ErrorCode::H3_STREAM_CREATION_ERROR.with_reason("unable to open control stream")
+        })
+}
+
+fn control_error(error: std::io::Error) -> Error {
+    let error = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
+        .map_or(&error, std::sync::Arc::as_ref);
+    error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<Error>())
+        .cloned()
+        .unwrap_or_else(|| ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason(error.to_string()))
+}
+
 impl<T: Transport> H3Connection<T> {
-    /// Errors while receiving a message have protocol-defined scope. Local
-    /// encoding and application send errors never enter this path.
-    pub(crate) async fn receive_error(&self, error: crate::Error) {
-        if !matches!(
-            error.code,
-            ErrorCode::H3_REQUEST_CANCELLED
-                | ErrorCode::H3_REQUEST_REJECTED
-                | ErrorCode::H3_REQUEST_INCOMPLETE
-                | ErrorCode::H3_MESSAGE_ERROR
-        ) {
-            self.fail(error).await;
+    pub(super) async fn send_settings(
+        self,
+        mut send: tokio::sync::OwnedMutexGuard<T::StreamWriter>,
+    ) {
+        let result = async {
+            let mut bytes = vec![StreamType::Control as u8];
+            bytes.put_control(&Control::Settings(Frame::new(self.settings.local.clone())?));
+            send.write_all(&bytes).await.map_err(control_error)?;
+            send.flush().await.map_err(control_error)
+        }
+        .await;
+        if let Err(error) = result {
+            self.fail(error);
         }
     }
 
-    pub(super) async fn accept_and_process_uni(self) {
-        loop {
-            match self.transport.accept_uni().await {
-                Ok((_, recv)) => {
-                    tokio::spawn(self.clone().receive(recv));
-                }
-                Err(error) => {
-                    self.close(error);
-                    return;
-                }
-            }
+    pub(super) async fn send_goaway(&self) -> Result<()> {
+        let id = self.cursor.local_goaway()?;
+        let mut send = self.cursor.control_stream.lock().await;
+        if let super::stream_cursor::Cursor::Closed(error) =
+            self.cursor.local.lock().unwrap().clone()
+        {
+            return Err(error);
         }
+        let mut bytes = Vec::new();
+        bytes.put_control(&Control::Goaway(Frame::new(frame::Goaway {
+            id: id.into(),
+        })?));
+        send.write_all(&bytes).await.map_err(control_error)?;
+        send.flush().await.map_err(control_error)
+    }
+
+    pub(super) async fn accept_and_process_uni(self) {
+        let error = loop {
+            tokio::select! {
+                biased;
+                error = self.transport.terminated() => break error,
+                accepted = self.transport.accept_uni() => match accepted {
+                    Ok((_, recv)) => { tokio::spawn(self.clone().receive(recv)); }
+                    Err(error) => {
+                        self.fail(error);
+                        break self.transport.terminated().await;
+                    }
+                },
+            }
+        };
+        self.on_terminated(error);
     }
 
     async fn receive(self, mut recv: T::StreamReader) {
@@ -54,109 +97,39 @@ impl<T: Transport> H3Connection<T> {
                 StreamType::QpackDecoder => self.qpack.receive_decoder(&mut recv).await,
             }
         };
-        let result = tokio::select! {
-            biased;
-            error = self.transport.terminated() => {
-                self.close(error);
-                return;
-            }
-            result = result => result,
-        };
+        // Transport termination wakes the pending read with its I/O error.
+        let result = result.await;
         // Retain the half until failure handling completes, including transport close.
         if let Err(error) = result {
-            self.fail(error).await;
+            self.fail(error);
         }
     }
 
-    pub(crate) fn close(&self, error: crate::Error) {
+    /// Apply the transport terminal reason and wake all H3-level waiters.
+    pub(crate) fn on_terminated(&self, error: Error) {
         let error = self.qpack.close(error);
         self.cursor.close(error.clone());
         self.bi_streams.close(error);
     }
 
-    pub(crate) async fn fail(&self, error: crate::Error) {
-        // Prefer an existing transport result over a new protocol error.
-        tokio::select! {
-            biased;
-            ended = self.transport.terminated() => self.close(ended),
-            _ = std::future::ready(()) => {
-                let error = self.qpack.close(error);
-                let _ = self.transport.close(error.reason.clone(), error.code.as_u64());
-                self.cursor.close(error.clone());
-                self.bi_streams.close(error);
-            },
-        }
+    /// Initiate transport termination; the accept task owns local cleanup.
+    pub(crate) fn fail(&self, error: Error) {
+        let _ = self
+            .transport
+            .close(error.reason.clone(), error.code.as_u64());
     }
 }
 
 impl<T: Transport> H3Connection<T> {
-    pub(super) async fn sync_settings_and_goaway(self) {
-        let mut send = match self.transport.open_uni().await {
-            Ok(Some((_, send))) => send,
-            Ok(None) => {
-                self.fail(
-                    ErrorCode::H3_STREAM_CREATION_ERROR
-                        .with_reason("unable to open required stream"),
-                )
-                .await;
-                return;
-            }
-            Err(error) => {
-                self.close(error);
-                return;
-            }
-        };
-        let result = tokio::select! {
-            biased;
-            error = self.transport.terminated() => {
-                self.close(error);
-                return;
-            }
-            result = async {
-                self.send_control(&mut send).await?;
-                self.cursor.peer_goaway().await?;
-                self.bi_streams.drained().await;
-                self.transport
-                    .close(ErrorCode::H3_NO_ERROR.to_string(), ErrorCode::H3_NO_ERROR.as_u64())
-            } => result,
-        };
-        if let Err(error) = result {
-            self.fail(error).await;
-            return;
-        }
-        // Keep the critical stream open after GOAWAY until transport termination.
-        let error = self.transport.terminated().await;
-        self.close(error);
-    }
-
-    async fn send_control(&self, send: &mut T::StreamWriter) -> Result<()> {
-        let mut bytes = vec![StreamType::Control as u8];
-        bytes.put_control(&Control::Settings(Frame::new(self.settings.local.clone())?));
-        async {
-            send.write_all(&bytes).await?;
-            send.flush().await
-        }
-        .await
-        .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("critical stream closed"))?;
-
-        let id = self.cursor.local_goaway().await?;
-        bytes.clear();
-        bytes.put_control(&Control::Goaway(Frame::new(frame::Goaway {
-            id: id.into(),
-        })?));
-        async {
-            send.write_all(&bytes).await?;
-            send.flush().await
-        }
-        .await
-        .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("critical stream closed"))?;
-        Ok(())
-    }
-
     async fn receive_control(&self, recv: &mut T::StreamReader) -> Result<()> {
         let settings = match be_control(recv).await {
             Ok(Control::Settings(frame)) => frame.payload,
             Err(error) if error.code != ErrorCode::H3_FRAME_UNEXPECTED => return Err(error),
+            Err(error) => {
+                return Err(ErrorCode::H3_MISSING_SETTINGS.with_reason(format!(
+                    "control stream did not start with SETTINGS: {error}"
+                )));
+            }
             _ => {
                 return Err(ErrorCode::H3_MISSING_SETTINGS
                     .with_reason("control stream did not start with SETTINGS"));
@@ -194,16 +167,33 @@ impl<T: Transport> H3Connection<T> {
                     );
                 }
                 Control::Unknown { length, .. } => {
-                    frame::skip_payload(recv, length.into_u64())
+                    let mut payload = (&mut *recv).take(length.into_u64());
+                    tokio::io::copy(&mut payload, &mut tokio::io::sink())
                         .await
-                        .map_err(|_| {
-                            ErrorCode::H3_CLOSED_CRITICAL_STREAM
-                                .with_reason("critical stream closed")
+                        .map_err(|error| {
+                            let error = error
+                                .get_ref()
+                                .and_then(|error| {
+                                    error.downcast_ref::<std::sync::Arc<std::io::Error>>()
+                                })
+                                .map_or(&error, std::sync::Arc::as_ref);
+                            error
+                                .get_ref()
+                                .and_then(|error| error.downcast_ref::<crate::Error>())
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    let code = ErrorCode::H3_CLOSED_CRITICAL_STREAM;
+                                    code.with_reason(error.to_string())
+                                })
                         })?;
+                    if payload.limit() != 0 {
+                        return Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM
+                            .with_reason("control stream ended while skipping an unknown frame"));
+                    }
                 }
                 _ => {
                     return Err(ErrorCode::H3_FRAME_UNEXPECTED
-                        .with_reason("frame is not allowed on the control stream"));
+                        .with_reason("frame is not allowed in this context"));
                 }
             }
         }
@@ -222,9 +212,111 @@ mod tests {
 
     use crate::{ErrorCode, Role, Transport, test_support};
 
+    struct RecordingWriter(tokio::io::DuplexStream);
+    impl tokio::io::AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.0).poll_write(cx, bytes)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+    impl qrecovery::send::CancelStream for RecordingWriter {
+        fn cancel(&mut self, _: u64) {}
+    }
+    struct RecordingTransport {
+        base: test_support::TestTransport,
+        send: std::sync::Mutex<Option<tokio::io::DuplexStream>>,
+    }
+    impl Transport for RecordingTransport {
+        type StreamReader = test_support::Reader;
+        type StreamWriter = RecordingWriter;
+        fn role(&self) -> Role {
+            Role::Client
+        }
+        async fn open_bi(
+            &self,
+        ) -> crate::Result<Option<(u64, (Self::StreamReader, Self::StreamWriter))>> {
+            Err(self.terminated().await)
+        }
+        async fn accept_bi(
+            &self,
+        ) -> crate::Result<(u64, (Self::StreamReader, Self::StreamWriter))> {
+            Err(self.terminated().await)
+        }
+        async fn open_uni(&self) -> crate::Result<Option<(u64, Self::StreamWriter)>> {
+            let send = self.send.lock().unwrap().take();
+            if let Some(send) = send {
+                return Ok(Some((2, RecordingWriter(send))));
+            }
+            Err(self.terminated().await)
+        }
+        async fn accept_uni(&self) -> crate::Result<(u64, Self::StreamReader)> {
+            self.base.accept_uni().await
+        }
+        fn close(&self, reason: String, code: u64) -> crate::Result<()> {
+            self.base.close(reason, code)
+        }
+        async fn terminated(&self) -> crate::Error {
+            self.base.terminated().await
+        }
+    }
+
+    #[tokio::test]
+    async fn background_settings_precedes_immediate_goaway() {
+        use crate::protocol::frame::{self, Control, StreamType};
+        let (send, mut recv) = tokio::io::duplex(1024);
+        let connection = crate::H3Connection::new(
+            RecordingTransport {
+                base: Default::default(),
+                send: std::sync::Mutex::new(Some(send)),
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let mut goaway = Box::pin(connection.send_goaway());
+        assert!(
+            goaway
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        tokio::time::timeout(Duration::from_secs(1), goaway)
+            .await
+            .unwrap()
+            .unwrap();
+        use tokio::io::AsyncReadExt;
+        assert_eq!(recv.read_u8().await.unwrap(), StreamType::Control as u8);
+        assert!(matches!(
+            frame::be_control(&mut recv).await.unwrap(),
+            Control::Settings(_)
+        ));
+        let Control::Goaway(frame) = frame::be_control(&mut recv).await.unwrap() else {
+            panic!("expected GOAWAY after SETTINGS");
+        };
+        assert_eq!(
+            StreamId::from(frame.payload.id),
+            StreamId::new(Role::Server, Dir::Bi, 0)
+        );
+    }
+
     #[tokio::test]
     async fn transport_close_releases_qpack_writers_waiting_for_instructions() {
-        let connection = test_support::connection();
+        let connection = test_support::connection().await;
         tokio::task::yield_now().await;
         connection
             .transport
@@ -252,7 +344,7 @@ mod tests {
                 stream::{H3ReadStream, H3WriteStream},
             },
         };
-        let connection = test_support::connection();
+        let connection = test_support::connection().await;
         connection
             .qpack
             .configure(qpack::Settings::default(), 256)
@@ -272,7 +364,7 @@ mod tests {
                 H3ReadStream::new(0, test_support::Reader),
                 connection.qpack().clone()
             ),
-            Err(crate::Error {
+            Err(h3x::Error {
                 code: ErrorCode::H3_EXCESSIVE_LOAD,
                 ..
             })
@@ -294,9 +386,11 @@ mod tests {
             )
             .is_ok()
         );
-        connection
-            .receive_error(ErrorCode::H3_EXCESSIVE_LOAD.with_reason("test closes the connection"))
-            .await;
+        connection.fail(
+            ErrorCode::H3_EXCESSIVE_LOAD
+                .with_reason("test closes the connection during stream processing"),
+        );
+        tokio::task::yield_now().await;
         assert_eq!(ErrorCode::from(ended.await), ErrorCode::H3_EXCESSIVE_LOAD);
         assert_eq!(
             (connection.qpack.error()).map(ErrorCode::from),
@@ -305,8 +399,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_failure_preserves_existing_transport_reason_and_closes_streams() {
-        let connection = test_support::connection();
+    async fn protocol_failure_preserves_observed_transport_reason_and_closes_streams() {
+        let connection = test_support::connection().await;
         let (mut send, _recv) = connection
             .bi_streams
             .insert(0, test_support::Reader, test_support::Writer)
@@ -315,9 +409,19 @@ mod tests {
             .transport
             .close(String::new(), ErrorCode::H3_INTERNAL_ERROR.as_u64())
             .unwrap();
-        connection
-            .fail(ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("test closes the connection"))
-            .await;
+        // Let the connection observe transport termination before a later protocol failure.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while connection.qpack.error().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        connection.fail(
+            ErrorCode::QPACK_DECOMPRESSION_FAILED
+                .with_reason("test closes the connection during stream processing"),
+        );
+        tokio::task::yield_now().await;
         assert_eq!(
             (connection.qpack.error()).map(ErrorCode::from),
             Some(ErrorCode::H3_INTERNAL_ERROR)
@@ -328,15 +432,12 @@ mod tests {
         );
         use tokio::io::AsyncWriteExt;
         let error = send.write_all(b"x").await.unwrap_err();
-        assert_eq!(
-            ErrorCode::from(ErrorCode::from(error)),
-            ErrorCode::H3_INTERNAL_ERROR
-        );
+        assert_eq!(ErrorCode::from(error), ErrorCode::H3_INTERNAL_ERROR);
     }
 
     #[tokio::test]
-    async fn cancelling_goaway_wait_keeps_control_drain_running() {
-        let connection = test_support::connection();
+    async fn goaway_waits_for_peer_before_closing() {
+        let connection = test_support::connection().await;
         let mut closing = Box::pin(connection.clone().goaway());
         assert!(
             closing
@@ -344,7 +445,6 @@ mod tests {
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
-        drop(closing);
         tokio::task::yield_now().await;
         let mut ended = Box::pin(connection.transport.terminated());
         assert!(
@@ -356,6 +456,17 @@ mod tests {
         connection
             .cursor
             .receive_goaway(StreamId::new(Role::Client, Dir::Bi, 0));
+        tokio::task::yield_now().await;
+        assert!(
+            ended
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        tokio::time::timeout(Duration::from_secs(1), closing)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             ErrorCode::from(
                 tokio::time::timeout(Duration::from_secs(1), ended)
@@ -364,12 +475,60 @@ mod tests {
             ),
             ErrorCode::H3_NO_ERROR
         );
-        assert!(connection.goaway().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn goaway_waits_for_admitted_streams_after_peer_goaway() {
+        let connection = test_support::connection().await;
+        let (send, recv) = connection
+            .bi_streams
+            .insert(0, test_support::Reader, test_support::Writer)
+            .unwrap();
+        connection
+            .cursor
+            .receive_goaway(StreamId::new(Role::Client, Dir::Bi, 1));
+        connection.cursor.local_goaway().unwrap();
+        tokio::task::yield_now().await;
+        let mut closing = Box::pin(connection.clone().goaway());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(closing.as_mut().poll(&mut cx).is_pending());
+        drop(send);
+        assert!(closing.as_mut().poll(&mut cx).is_pending());
+        drop(recv);
+        tokio::time::timeout(Duration::from_secs(1), closing)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_termination_wakes_goaway_waiting_for_peer() {
+        let connection = test_support::connection().await;
+        connection.send_goaway().await.unwrap();
+        let mut closing = Box::pin(connection.clone().goaway());
+        assert!(
+            closing
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let error =
+            ErrorCode::H3_INTERNAL_ERROR.with_reason("transport terminated while awaiting peer");
+        connection
+            .transport
+            .close(error.reason.clone(), error.code.as_u64())
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), closing)
+                .await
+                .unwrap(),
+            Err(error)
+        );
     }
 
     #[tokio::test]
     async fn goaway_reports_transport_failure() {
-        let connection = test_support::connection();
+        let connection = test_support::connection().await;
         connection
             .transport
             .close(String::new(), ErrorCode::H3_INTERNAL_ERROR.as_u64())
@@ -428,12 +587,12 @@ mod admission_tests {
         fn close(&self, reason: String, code: u64) -> Result<()> {
             self.base.close(reason, code)
         }
-        async fn terminated(&self) -> crate::Error {
+        async fn terminated(&self) -> h3x::Error {
             self.base.terminated().await
         }
     }
 
-    fn connection() -> H3Connection<GatedTransport> {
+    async fn connection() -> H3Connection<GatedTransport> {
         H3Connection::new(
             GatedTransport {
                 base: TestTransport::default(),
@@ -442,13 +601,14 @@ mod admission_tests {
             },
             Default::default(),
         )
+        .await
         .unwrap()
     }
 
     #[tokio::test]
     async fn pending_opens_cannot_register_after_goaway_or_close_even_after_drain() {
         for transition in 0..2 {
-            let connection = connection();
+            let connection = connection().await;
             let mut opening = Box::pin(connection.open_bi());
             let mut cx = Context::from_waker(Waker::noop());
             assert!(opening.as_mut().poll(&mut cx).is_pending());
@@ -461,15 +621,18 @@ mod admission_tests {
                     ErrorCode::H3_REQUEST_REJECTED
                 }
                 _ => {
-                    connection.close(
-                        ErrorCode::H3_INTERNAL_ERROR.with_reason("test closes the connection"),
+                    connection.on_terminated(
+                        ErrorCode::H3_INTERNAL_ERROR
+                            .with_reason("test closes the connection during stream processing"),
                     );
                     ErrorCode::H3_INTERNAL_ERROR
                 }
             };
             assert!(matches!(connection.open_bi().await, Err(e) if e.code == error));
             assert_eq!(connection.transport.calls.load(Ordering::SeqCst), 1);
-            connection.cursor.goaway().unwrap();
+            if transition == 0 {
+                connection.cursor.local_goaway().unwrap();
+            }
             connection
                 .cursor
                 .receive_goaway(StreamId::new(Role::Client, Dir::Bi, 0));
@@ -483,7 +646,7 @@ mod admission_tests {
     #[tokio::test]
     async fn pending_accepts_cannot_register_after_local_goaway_or_close() {
         for closed in [false, true] {
-            let connection = connection();
+            let connection = connection().await;
             let mut accepting = Box::pin(connection.accept_bi());
             assert!(
                 accepting
@@ -492,11 +655,13 @@ mod admission_tests {
                     .is_pending()
             );
             let error = if closed {
-                connection
-                    .close(ErrorCode::H3_INTERNAL_ERROR.with_reason("test closes the connection"));
+                connection.on_terminated(
+                    ErrorCode::H3_INTERNAL_ERROR
+                        .with_reason("test closes the connection during stream processing"),
+                );
                 ErrorCode::H3_INTERNAL_ERROR
             } else {
-                connection.cursor.goaway().unwrap();
+                connection.cursor.local_goaway().unwrap();
                 ErrorCode::H3_REQUEST_REJECTED
             };
             assert!(matches!(connection.accept_bi().await, Err(e) if e.code == error));
@@ -510,7 +675,7 @@ mod admission_tests {
     #[tokio::test]
     async fn goaway_only_freezes_its_own_admission_direction() {
         for opening in [false, true] {
-            let connection = connection();
+            let connection = connection().await;
             let mut pending = Box::pin(async {
                 if opening {
                     connection.open_bi().await
@@ -525,7 +690,7 @@ mod admission_tests {
                     .is_pending()
             );
             if opening {
-                connection.cursor.goaway().unwrap();
+                connection.cursor.local_goaway().unwrap();
             } else {
                 connection
                     .cursor
@@ -548,13 +713,13 @@ mod admission_tests {
 
     #[tokio::test]
     async fn peer_goaway_preserves_admitted_streams_below_boundary() {
-        let connection = connection();
+        let connection = connection().await;
         connection.transport.ready.add_permits(1);
         let (send, recv) = connection.open_bi().await.unwrap();
         let boundary = StreamId::new(Role::Client, Dir::Bi, 100);
         connection.cursor.receive_goaway(boundary);
         connection.bi_streams.goaway(u64::from(boundary));
-        connection.cursor.goaway().unwrap();
+        connection.cursor.local_goaway().unwrap();
         let mut draining = Box::pin(connection.bi_streams.drained());
         assert!(
             draining
@@ -598,7 +763,7 @@ mod qpack_writer_tests {
             _: &mut Context<'_>,
             bytes: &[u8],
         ) -> Poll<io::Result<usize>> {
-            if bytes == [self.0] {
+            if bytes.first() == Some(&self.0) {
                 Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
             } else {
                 Poll::Ready(Ok(bytes.len()))
@@ -640,40 +805,50 @@ mod qpack_writer_tests {
         fn close(&self, reason: String, code: u64) -> Result<()> {
             self.base.close(reason, code)
         }
-        async fn terminated(&self) -> crate::Error {
+        async fn terminated(&self) -> h3x::Error {
             self.base.terminated().await
         }
     }
 
     #[tokio::test]
-    async fn either_qpack_writer_failure_closes_admission_and_active_streams() {
-        for stream_type in [StreamType::QpackEncoder, StreamType::QpackDecoder] {
-            let connection = H3Connection::new(
-                FailingTransport {
-                    base: TestTransport::default(),
-                    stream_type: stream_type as u8,
-                },
-                Default::default(),
-            )
+    async fn settings_failure_closes_admission_and_active_streams() {
+        let stream_type = StreamType::Control;
+        let connection = H3Connection::new(
+            FailingTransport {
+                base: TestTransport::default(),
+                stream_type: stream_type as u8,
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let (mut send, _recv) = connection
+            .bi_streams
+            .insert(0, Reader, FailingWriter(255))
             .unwrap();
-            let (mut send, _recv) = connection
-                .bi_streams
-                .insert(0, Reader, FailingWriter(255))
-                .unwrap();
-            let error =
-                tokio::time::timeout(Duration::from_secs(1), connection.transport.terminated())
-                    .await
-                    .unwrap();
-            assert_eq!(error.code, ErrorCode::H3_CLOSED_CRITICAL_STREAM);
-            assert_eq!(connection.qpack.error(), Some(error.clone()));
-            assert_eq!(connection.open_bi().await.err(), Some(error.clone()));
-            assert_eq!(
-                ErrorCode::from(send.write_all(b"x").await.unwrap_err()),
-                error.code
-            );
-            // The connection-owned writer tasks release their connection handles.
-            tokio::task::yield_now().await;
-            assert_eq!(Arc::strong_count(&connection.transport), 1);
-        }
+        let error = tokio::time::timeout(Duration::from_secs(1), connection.transport.terminated())
+            .await
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::H3_CLOSED_CRITICAL_STREAM);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while connection.qpack.error().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(connection.qpack.error(), Some(error.clone()));
+        assert_eq!(
+            error.reason,
+            io::Error::from(io::ErrorKind::BrokenPipe).to_string()
+        );
+        assert_eq!(connection.open_bi().await.err(), Some(error.clone()));
+        assert_eq!(
+            ErrorCode::from(send.write_all(b"x").await.unwrap_err()),
+            error.code
+        );
+        // The connection-owned writer tasks release their connection handles.
+        tokio::task::yield_now().await;
+        assert_eq!(Arc::strong_count(&connection.transport), 1);
     }
 }

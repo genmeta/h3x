@@ -23,6 +23,7 @@ async fn response_headers() -> Vec<u8> {
     encoded.put_frame(
         &Frame::new(Headers {
             field_section: crate::test_support::connection()
+                .await
                 .qpack()
                 .encode(0, response_fields(&response))
                 .unwrap(),
@@ -42,7 +43,7 @@ async fn reset_wakes_a_blocked_producer_after_upload_is_dropped() {
     let sending = send_streaming_request(
         &producer,
         H3WriteStream::new(0, tokio::io::sink()),
-        crate::test_support::connection().qpack(),
+        crate::test_support::connection().await.qpack(),
     )
     .unwrap();
     let cancelling = producer.clone();
@@ -76,7 +77,7 @@ async fn reset_wakes_a_blocked_producer_after_request_is_dropped() {
         producer.clone(),
         H3ReadStream::new(0, tokio::io::empty()),
         H3WriteStream::new(0, tokio::io::sink()),
-        crate::test_support::connection().qpack().clone(),
+        crate::test_support::connection().await.qpack().clone(),
     );
     let cancelling = producer.clone();
     let mut writing = Box::pin(producer.write(b"y"));
@@ -117,7 +118,7 @@ async fn dropping_response_wait_preserves_uploads() {
                 outgoing,
                 H3ReadStream::new(0, recv),
                 H3WriteStream::new(0, send),
-                crate::test_support::connection().qpack().clone(),
+                crate::test_support::connection().await.qpack().clone(),
             ));
             assert!(
                 waiting
@@ -177,7 +178,7 @@ async fn early_response_keeps_both_body_modes_sending() {
                 outgoing,
                 H3ReadStream::new(0, Cursor::new(response_headers().await)),
                 H3WriteStream::new(0, send),
-                crate::test_support::connection().qpack().clone(),
+                crate::test_support::connection().await.qpack().clone(),
             )
             .await
             .unwrap();
@@ -216,7 +217,7 @@ async fn cancelling_response_wait_preserves_a_completed_upload() {
             producer.clone(),
             H3ReadStream::new(0, recv),
             H3WriteStream::new(0, send),
-            crate::test_support::connection().qpack().clone(),
+            crate::test_support::connection().await.qpack().clone(),
         ));
         assert!(
             waiting
@@ -293,7 +294,7 @@ async fn producer_fin_does_not_complete_transport_shutdown() {
                         polled: polled.clone(),
                     },
                 ),
-                crate::test_support::connection().qpack(),
+                crate::test_support::connection().await.qpack(),
             )
             .unwrap(),
         );
@@ -325,7 +326,7 @@ async fn write_failure_after_idle_body_ends_response_wait() {
             producer.clone(),
             H3ReadStream::new(0, recv),
             H3WriteStream::new(0, send),
-            crate::test_support::connection().qpack().clone(),
+            crate::test_support::connection().await.qpack().clone(),
         ));
         assert!(
             waiting
@@ -369,7 +370,7 @@ async fn explicit_reset_stops_upload_when_body_read_resumes() {
             send_streaming_request(
                 &request,
                 H3WriteStream::new(0, send),
-                crate::test_support::connection().qpack(),
+                crate::test_support::connection().await.qpack(),
             )
             .unwrap(),
         );
@@ -405,7 +406,7 @@ async fn finished_producer_can_drop_while_upload_waits_on_network() {
             send_streaming_request(
                 &request,
                 H3WriteStream::new(0, send),
-                crate::test_support::connection().qpack(),
+                crate::test_support::connection().await.qpack(),
             )
             .unwrap(),
         );
@@ -437,7 +438,7 @@ async fn explicit_stop_stops_receive_when_body_write_resumes() {
     timeout(Duration::from_secs(5), async {
         let mut message = Message::<headers::ResponseHead, Bytes>::default();
         message.set_status(StatusCode::OK);
-        let qpack = crate::test_support::connection();
+        let qpack = crate::test_support::connection().await;
         let mut headers = Vec::new();
         headers.put_frame(
             &Frame::new(Headers {
@@ -469,7 +470,7 @@ fn explicit_stop_cancels_body_after_response_pump_is_dropped() {
     let (response, _peer) = runtime.block_on(async {
         let mut message = Message::<headers::ResponseHead, Bytes>::default();
         message.set_status(StatusCode::OK);
-        let qpack = crate::test_support::connection();
+        let qpack = crate::test_support::connection().await;
         let mut headers = Vec::new();
         headers.put_frame(
             &Frame::new(Headers {
@@ -521,7 +522,7 @@ async fn streaming_response_keeps_message_error_after_transport_eof() {
             .parse()
             .unwrap(),
     );
-    let qpack = crate::test_support::connection();
+    let qpack = crate::test_support::connection().await;
     let mut encoded = Vec::new();
     encoded.put_frame(
         &Frame::new(Headers {

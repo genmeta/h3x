@@ -192,12 +192,12 @@ impl Decoder {
         &self,
         transport: std::sync::Arc<T>,
         instructions: Instructions,
-    ) -> impl Future<Output = ()> + Send + 'static + use<T> {
+    ) -> impl Future<Output = Result<()>> + Send + 'static + use<T> {
         async move {
             super::drive(transport, async move |send: &mut T::StreamWriter| {
                 Self::write(instructions, send).await
             })
-            .await;
+            .await
         }
     }
 

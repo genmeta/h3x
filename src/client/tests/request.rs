@@ -4,7 +4,7 @@ async fn write_bytes_request<W: AsyncWrite + Unpin + Send + 'static>(
     request: &Request<Bytes>,
     send: W,
 ) -> Result<()> {
-    let connection = crate::test_support::connection();
+    let connection = crate::test_support::connection().await;
     super::send_bytes_request(request, H3WriteStream::new(0, send), connection.qpack())?.await
 }
 
@@ -12,7 +12,7 @@ async fn write_streaming_request<W: AsyncWrite + Unpin + Send + 'static>(
     request: &Request<ArcWndBuf>,
     send: W,
 ) -> Result<()> {
-    let connection = crate::test_support::connection();
+    let connection = crate::test_support::connection().await;
     super::send_streaming_request(request, H3WriteStream::new(0, send), connection.qpack())?.await
 }
 

@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -26,6 +26,7 @@ struct Probe {
     live: AtomicUsize,
     closed: Mutex<Option<h3x::Error>>,
     ended: Notify,
+    readers: Mutex<Vec<Waker>>,
     dropped_before_close: AtomicBool,
 }
 
@@ -38,6 +39,13 @@ impl AsyncRead for Reader {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         self.1.read_tasks.lock().unwrap().insert(tokio::task::id());
+        // Model the Transport contract: termination wakes pending stream I/O.
+        let probe = self.1.clone();
+        let mut readers = probe.readers.lock().unwrap();
+        if let Some(error) = probe.closed.lock().unwrap().clone() {
+            return Poll::Ready(Err(error.into()));
+        }
+        readers.push(cx.waker().clone());
         Pin::new(&mut self.0).poll_read(cx, buf)
     }
 }
@@ -57,7 +65,7 @@ impl Drop for Reader {
     }
 }
 
-struct Writer(DuplexStream);
+struct Writer(tokio::io::Sink);
 impl AsyncWrite for Writer {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -74,9 +82,7 @@ impl AsyncWrite for Writer {
     }
 }
 impl CancelStream for Writer {
-    fn cancel(&mut self, _: u64) {
-        self.0 = duplex(1).0;
-    }
+    fn cancel(&mut self, _: u64) {}
 }
 
 struct Incoming {
@@ -97,7 +103,7 @@ impl Transport for Incoming {
         Err(self.terminated().await)
     }
     async fn open_uni(&self) -> Result<Option<(u64, Writer)>> {
-        Err(self.terminated().await)
+        Ok(Some((2, Writer(tokio::io::sink()))))
     }
     async fn accept_uni(&self) -> Result<(u64, Reader)> {
         self.probe
@@ -124,6 +130,9 @@ impl Transport for Incoming {
             .unwrap()
             .get_or_insert(error.with_reason(reason));
         self.probe.ended.notify_waiters();
+        for reader in self.probe.readers.lock().unwrap().drain(..) {
+            reader.wake();
+        }
         Ok(())
     }
     async fn terminated(&self) -> h3x::Error {
@@ -156,6 +165,7 @@ async fn setup(prefixes: &[&[u8]]) -> (H3Connection<Incoming>, Arc<Probe>, Vec<D
             },
             Default::default(),
         )
+        .await
         .unwrap(),
         probe,
         peers,
@@ -169,7 +179,7 @@ async fn bounded(work: impl Future<Output = ()>) {
 }
 
 #[tokio::test]
-async fn each_unidirectional_stream_has_a_task_and_transport_close_cancels_them() {
+async fn each_unidirectional_stream_has_a_task_and_transport_close_fails_reads() {
     let prefixes = vec![&[0x40][..]; 32];
     let (connection, probe, _peers) = setup(&prefixes).await;
     bounded(async {
@@ -190,6 +200,9 @@ async fn each_unidirectional_stream_has_a_task_and_transport_close_cancels_them(
     *probe.closed.lock().unwrap() =
         Some(ErrorCode::H3_NO_ERROR.with_reason("test transport finished"));
     probe.ended.notify_waiters();
+    for reader in probe.readers.lock().unwrap().drain(..) {
+        reader.wake();
+    }
     bounded(async {
         while probe.live.load(Ordering::SeqCst) != 0 {
             tokio::task::yield_now().await;

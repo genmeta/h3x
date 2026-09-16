@@ -71,7 +71,7 @@ fn assert_response_headers(response: &impl ReadResponse, buffered: bool) {
 
 #[tokio::test]
 async fn ordinary_headers_round_trip() {
-    let connection = support::connection();
+    let connection = support::connection().await;
     tokio::time::timeout(Duration::from_secs(5), async {
         for buffered in [true, false] {
             let (client_send, server_recv) = duplex(64);

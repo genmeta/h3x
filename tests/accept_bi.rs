@@ -50,7 +50,7 @@ impl Transport for DirectTransport {
     }
 }
 
-fn connection(
+async fn connection(
     ids: impl IntoIterator<Item = Result<u64>>,
 ) -> (H3Connection<DirectTransport>, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -60,7 +60,9 @@ fn connection(
         streams: Mutex::new(ids.into_iter().collect()),
     };
     (
-        H3Connection::new(transport, Default::default()).unwrap(),
+        H3Connection::new(transport, Default::default())
+            .await
+            .unwrap(),
         calls,
     )
 }
@@ -71,7 +73,8 @@ async fn application_drives_acceptance_and_receives_transport_errors() {
         Ok(1),
         Ok(5),
         Err(ErrorCode::H3_INTERNAL_ERROR.with_reason("test transport failed to accept a stream")),
-    ]);
+    ])
+    .await;
     tokio::task::yield_now().await;
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     for id in [1, 5] {
@@ -91,7 +94,7 @@ async fn application_drives_acceptance_and_receives_transport_errors() {
 
 #[tokio::test]
 async fn acceptance_checks_ids_and_local_goaway() {
-    let (connection, _) = connection([Ok(0), Ok(1), Ok(5)]);
+    let (connection, _) = connection([Ok(0), Ok(1), Ok(5)]).await;
     assert!(matches!(
         connection.accept_bi().await,
         Err(h3x::Error {

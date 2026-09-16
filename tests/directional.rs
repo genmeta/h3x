@@ -20,7 +20,7 @@ use tokio::{
 #[tokio::test]
 async fn directional_bodies_echo_with_backpressure() {
     timeout(Duration::from_secs(5), async {
-        let connection = support::connection();
+        let connection = support::connection().await;
         let (cs, sr) = duplex(7);
         let (ss, cr) = duplex(7);
         let mut upload = Body::<WndBuf, W>::with_capacity(3);
@@ -83,7 +83,7 @@ async fn directional_bodies_echo_with_backpressure() {
 
 #[tokio::test]
 async fn response_does_not_wait_for_upload_to_finish() {
-    let connection = support::connection();
+    let connection = support::connection().await;
     let mut encoded = Vec::new();
     let mut response = server::Response::default();
     response
@@ -128,7 +128,7 @@ async fn response_does_not_wait_for_upload_to_finish() {
 
 #[tokio::test]
 async fn dropping_response_future_preserves_upload() {
-    let connection = support::connection();
+    let connection = support::connection().await;
     let mut producer = Body::<WndBuf, W>::with_capacity(1);
     let request = client::Request::post("https://example.com/")
         .unwrap()
@@ -163,7 +163,7 @@ async fn dropping_response_future_preserves_upload() {
 
 #[tokio::test]
 async fn explicit_reset_wakes_producer_after_upload_is_dropped() {
-    let connection = support::connection();
+    let connection = support::connection().await;
     let mut producer = Body::<WndBuf, W>::with_capacity(1);
     let request = client::Request::post("https://example.com/")
         .unwrap()

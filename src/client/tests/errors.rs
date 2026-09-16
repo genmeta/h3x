@@ -29,7 +29,7 @@ impl AsyncWrite for FailingWriter {
 #[tokio::test]
 async fn upload_failure_reaches_response_waiter_for_both_body_modes() {
     for streaming in [false, true] {
-        let connection = crate::test_support::connection();
+        let connection = crate::test_support::connection().await;
         let (_peer, recv) = duplex(64); // Peer never sends a response.
         let outgoing: common::Request<Write> = if streaming {
             Request::streaming_post("https://example.com/upload")
@@ -65,7 +65,7 @@ async fn upload_failure_reaches_response_waiter_for_both_body_modes() {
 #[tokio::test]
 async fn successful_upload_still_waits_for_response() {
     for streaming in [false, true] {
-        let connection = crate::test_support::connection();
+        let connection = crate::test_support::connection().await;
         let (_peer, recv) = duplex(64);
         let outgoing: common::Request<Write> = if streaming {
             let mut request = Request::streaming_post("https://example.com/").unwrap();
@@ -113,8 +113,56 @@ fn field(name: &'static [u8], value: &'static [u8]) -> Field {
 }
 
 #[tokio::test]
+async fn malformed_response_headers_and_both_trailer_paths_close_the_connection() {
+    for stage in ["response headers", "response trailers", "request trailers"] {
+        let connection = crate::test_support::connection().await;
+        let qpack = connection.qpack().clone();
+        let mut wire = match stage {
+            "response headers" => Vec::new(),
+            "response trailers" => headers_frame(&qpack, vec![field(b":status", b"200")]),
+            _ => headers_frame(
+                &qpack,
+                vec![
+                    field(b":method", b"GET"),
+                    field(b":scheme", b"https"),
+                    field(b":authority", b"example.com"),
+                    field(b":path", b"/"),
+                ],
+            ),
+        };
+        // Indexed static field 99 is beyond the QPACK static table.
+        wire.extend_from_slice(&[1, 4, 0, 0, 0xff, 0x24]);
+        let error = if stage == "request trailers" {
+            let request = crate::server::read_request(
+                H3ReadStream::new(0, Cursor::new(wire)),
+                connection.clone(),
+            )
+            .await
+            .unwrap();
+            request.into_body().collect().await.unwrap_err()
+        } else {
+            match read_response(H3ReadStream::new(0, Cursor::new(wire)), qpack.clone(), None).await
+            {
+                Err(error) => error,
+                Ok(response) => response.into_body().collect().await.unwrap_err(),
+            }
+        };
+        assert_eq!(error.code, ErrorCode::QPACK_DECOMPRESSION_FAILED, "{stage}");
+        timeout(Duration::from_secs(1), async {
+            while qpack.error().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection-scoped decode failure must close the connection");
+        assert_eq!(qpack.error(), Some(error.clone()));
+        assert_eq!(connection.open_bi().await.err(), Some(error));
+    }
+}
+
+#[tokio::test]
 async fn malformed_http_headers_leave_the_connection_usable() {
-    let connection = crate::test_support::connection();
+    let connection = crate::test_support::connection().await;
     let qpack = connection.qpack().clone();
     let wire = headers_frame(&qpack, vec![field(b"x-test", b"missing status")]);
     let error = read_response(H3ReadStream::new(0, Cursor::new(wire)), qpack.clone(), None)

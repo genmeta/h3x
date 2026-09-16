@@ -6,7 +6,7 @@ use super::{
     qpack::{MAX_PENDING_INSTRUCTION, Qpack},
     stream::{H3ReadStream, H3WriteStream, bi::BiStreams},
 };
-use crate::{ErrorCode, Result, Transport};
+use crate::{Error, ErrorCode, Result, Transport};
 
 mod control;
 mod settings;
@@ -23,16 +23,21 @@ pub struct H3Connection<T: Transport> {
     transport: Arc<T>,
     settings: Arc<Settings>,
     qpack: Arc<Qpack>,
-    cursor: Arc<StreamCursor>,
+    cursor: Arc<StreamCursor<T::StreamWriter>>,
     bi_streams: Arc<BiStreams<T::StreamReader, T::StreamWriter>>,
 }
 
 impl<T: Transport> H3Connection<T> {
-    pub fn new(transport: T, settings: Settings) -> Result<Self> {
+    /// Open the control stream and start SETTINGS and connection tasks.
+    pub async fn new(transport: T, settings: Settings) -> Result<Self> {
         let transport = Arc::new(transport);
         let settings = Arc::new(settings);
         let bi = Arc::new(BiStreams::new());
         let qpack = Qpack::new(&settings)?;
+
+        let control_stream = control::open_uni(transport.as_ref()).await?;
+        let cursor = Arc::new(StreamCursor::new(transport.role(), control_stream));
+        let control_stream = cursor.control_stream.clone().lock_owned().await;
 
         let (tx, rx) = tokio::sync::mpsc::channel(MAX_PENDING_INSTRUCTION);
         qpack
@@ -46,7 +51,6 @@ impl<T: Transport> H3Connection<T> {
             .on_instruction(move |batch| tx.try_send(batch).map_err(instruction_send_error));
         tokio::spawn(qpack.decoder.sync(transport.clone(), rx));
 
-        let cursor = Arc::new(StreamCursor::new(transport.role()));
         let connection = Self {
             transport,
             settings,
@@ -55,7 +59,7 @@ impl<T: Transport> H3Connection<T> {
             bi_streams: bi,
         };
 
-        tokio::spawn(connection.clone().sync_settings_and_goaway());
+        tokio::spawn(connection.clone().send_settings(control_stream));
         tokio::spawn(connection.clone().accept_and_process_uni());
         Ok(connection)
     }
@@ -74,20 +78,30 @@ impl<T: Transport> H3Connection<T> {
         H3ReadStream<T::StreamReader>,
     )> {
         self.cursor.remote.lock().unwrap().not_goaway()?;
-        let (id, (recv, send)) = self.transport.open_bi().await?.ok_or(
-            ErrorCode::H3_STREAM_CREATION_ERROR.with_reason("unable to open required stream"),
-        )?;
+        let (id, (mut recv, mut send)) = self.transport.open_bi().await?.ok_or_else(|| {
+            ErrorCode::H3_STREAM_CREATION_ERROR
+                .with_reason("transport cannot open a bidirectional stream")
+        })?;
+        // Recheck after the await and hold admission through registration.
+        if let Err(error) = self.cursor.remote.lock().unwrap().not_goaway() {
+            recv.stop(error.code.as_u64());
+            send.cancel(error.code.as_u64());
+            return Err(error);
+        }
         self.bi_streams.insert(id, recv, send)
     }
 
     /// Consume this connection and exchange GOAWAY with the peer.
-    /// The control task writes GOAWAY, waits for the peer and admitted requests, then closes QUIC.
-    /// Waits for transport termination; H3_NO_ERROR is success.
-    /// Cancelling this wait does not cancel the triggered drain.
+    /// Wait for GOAWAY to be flushed, the peer GOAWAY, and admitted requests before closing QUIC.
+    /// This future is not cancellation-safe during GOAWAY writes; await it to completion.
     pub async fn goaway(self) -> Result<()> {
-        self.cursor.goaway()?;
-        self.transport.close("".to_string(), H3_NO_ERROR.as_u64())?;
-        Ok(())
+        if let Err(error) = self.send_goaway().await {
+            self.fail(error.clone());
+            return Err(error);
+        }
+        self.cursor.remote_goaway().await?;
+        self.bi_streams.drained().await;
+        self.transport.close(String::new(), H3_NO_ERROR.as_u64())
     }
 }
 
@@ -101,11 +115,16 @@ impl<T: Transport> H3Connection<T> {
         H3WriteStream<T::StreamWriter>,
         H3ReadStream<T::StreamReader>,
     )> {
+        self.cursor.local.lock().unwrap().not_goaway()?;
         let (id, (mut read, mut write)) = self.transport.accept_bi().await?;
         let stream_id = qbase::varint::VarInt::try_from(id)
             .map(qbase::sid::StreamId::from)
-            .map_err(|_| ErrorCode::H3_ID_ERROR.with_reason("invalid stream or push identifier"));
-        if let Err(error) = stream_id.and_then(|id| self.cursor.local.lock().unwrap().accept(id)) {
+            .map_err(|error| {
+                ErrorCode::H3_ID_ERROR
+                    .with_reason(format!("invalid stream or push identifier: {error}"))
+            });
+        let mut admission = self.cursor.local.lock().unwrap();
+        if let Err(error) = stream_id.and_then(|id| admission.accept(id)) {
             read.stop(ErrorCode::H3_REQUEST_REJECTED.as_u64());
             write.cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64());
             return Err(error);
@@ -128,15 +147,13 @@ impl<T: Transport> Clone for H3Connection<T> {
 }
 
 /// Channel producers run under QPACK state locks and must never block.
-pub(super) fn instruction_send_error<T>(
-    error: tokio::sync::mpsc::error::TrySendError<T>,
-) -> crate::Error {
+pub(super) fn instruction_send_error<T>(error: tokio::sync::mpsc::error::TrySendError<T>) -> Error {
     match error {
         tokio::sync::mpsc::error::TrySendError::Full(_) => {
             ErrorCode::H3_EXCESSIVE_LOAD.with_reason("QPACK instruction queue is full")
         }
         tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("critical stream closed")
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("QPACK instruction receiver is closed")
         }
     }
 }

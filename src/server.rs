@@ -56,7 +56,15 @@ pub async fn read_request<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
     let (head, length) = match read_head {
         Ok(value) => value,
         Err(error) => {
-            connection.receive_error(error.clone()).await;
+            if !matches!(
+                error.code,
+                ErrorCode::H3_REQUEST_CANCELLED
+                    | ErrorCode::H3_REQUEST_REJECTED
+                    | ErrorCode::H3_REQUEST_INCOMPLETE
+                    | ErrorCode::H3_MESSAGE_ERROR
+            ) {
+                connection.fail(error.clone());
+            }
             let _ = connection.qpack().cancel(stream_id);
             return Err(error);
         }

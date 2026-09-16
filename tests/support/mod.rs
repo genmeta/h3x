@@ -109,6 +109,8 @@ impl Transport for TestTransport {
 }
 
 #[allow(dead_code)] // This fixture is also included by the crate's codec unit tests.
-pub fn connection() -> H3Connection<TestTransport> {
-    H3Connection::new(TestTransport::default(), Default::default()).unwrap()
+pub async fn connection() -> H3Connection<TestTransport> {
+    H3Connection::new(TestTransport::default(), Default::default())
+        .await
+        .unwrap()
 }

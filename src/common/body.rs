@@ -396,7 +396,7 @@ mod tests {
                         Some(content_length) => BodyMode::Length { content_length },
                         None => BodyMode::Infinity,
                     },
-                    crate::test_support::connection().qpack()
+                    crate::test_support::connection().await.qpack()
                 )
                 .await)
                     .map_err(ErrorCode::from),
@@ -411,7 +411,7 @@ mod tests {
                 &mut BufReader::new(H3ReadStream::new(0, &mut input)),
                 &mut body,
                 BodyMode::Infinity,
-                crate::test_support::connection().qpack()
+                crate::test_support::connection().await.qpack()
             )
             .await)
                 .map_err(ErrorCode::from),

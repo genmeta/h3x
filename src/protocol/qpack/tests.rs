@@ -23,7 +23,7 @@ fn limits_use_protocol_defaults_and_explicit_settings() {
 
 #[tokio::test]
 async fn close_preserves_first_error_across_both_directions() {
-    let connection = crate::test_support::connection();
+    let connection = crate::test_support::connection().await;
     let qpack = connection.qpack();
     assert_eq!(
         ErrorCode::from(
@@ -60,37 +60,8 @@ async fn close_preserves_first_error_across_both_directions() {
 }
 
 #[tokio::test]
-async fn request_errors_leave_qpack_usable() {
-    let connection = crate::test_support::connection();
-    let qpack = connection.qpack();
-    for error in [
-        ErrorCode::H3_REQUEST_CANCELLED,
-        ErrorCode::H3_REQUEST_REJECTED,
-        ErrorCode::H3_REQUEST_INCOMPLETE,
-        ErrorCode::H3_MESSAGE_ERROR,
-    ] {
-        connection.receive_error(error.with_reason("test receives a stream-local message failure")).await;
-        assert_eq!(qpack.error(), None);
-        let payload = qpack
-            .encode(
-                0,
-                vec![Field {
-                    name: Bytes::from_static(b":method"),
-                    value: Bytes::from_static(b"GET"),
-                    never_index: false,
-                }],
-            )
-            .unwrap();
-        let fields = qpack.decode(0, payload).await.unwrap();
-        assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0].name, ":method");
-        assert_eq!(fields[0].value, "GET");
-    }
-}
-
-#[tokio::test]
 async fn malformed_field_section_closes_both_directions() {
-    let connection = crate::test_support::connection();
+    let connection = crate::test_support::connection().await;
     let qpack = connection.qpack();
     let result = crate::server::read_request(
         crate::H3ReadStream::new(0, &b"\x01\x01\x00"[..]),

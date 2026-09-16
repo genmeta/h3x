@@ -10,7 +10,7 @@ use tokio::io::duplex;
 
 #[tokio::test]
 async fn request_accept_and_respond() {
-    let connection = support::connection();
+    let connection = support::connection().await;
     let (client_send, server_recv) = duplex(64);
     let (server_send, client_recv) = duplex(64);
     let request = client::Request::post("https://example.com/echo")
@@ -69,7 +69,7 @@ async fn request_accept_and_respond() {
 
 #[tokio::test]
 async fn streaming_echo() {
-    let connection = support::connection();
+    let connection = support::connection().await;
     let (client_send, server_recv) = duplex(64);
     let (server_send, client_recv) = duplex(64);
 

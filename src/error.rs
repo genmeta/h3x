@@ -210,9 +210,9 @@ mod tests {
     async fn connection_failure_preserves_reason_in_qpack_and_transport() {
         use crate::Transport;
 
-        let connection = crate::test_support::connection();
+        let connection = crate::test_support::connection().await;
         let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("invalid dynamic reference");
-        connection.fail(error.clone()).await;
+        connection.fail(error.clone());
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while connection.qpack().error().is_none() {
                 tokio::task::yield_now().await;
