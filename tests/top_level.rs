@@ -2,8 +2,8 @@ mod support;
 
 use bytes::Bytes;
 use h3x::{
-    H3ReadStream, H3WriteStream, ReadBody, ReadRequest, ReadResponse, ReadStream, WriteBody,
-    WriteRequest, WriteResponse, WriteStream, client, server,
+    H3ReadStream, H3WriteStream, ReadRequest, ReadResponse, ReadStream, WriteBody, WriteRequest,
+    WriteResponse, WriteStream, client, server,
 };
 use http::{Method, StatusCode, header};
 use tokio::io::duplex;
@@ -35,14 +35,18 @@ async fn request_accept_and_respond() {
                 server::read_request(H3ReadStream::new(0, server_recv), connection.clone()).await?;
             assert_eq!(request.method(), Method::POST);
             let method = request.method();
-            let server::Request::Bytes(request) = request else {
-                panic!("expected buffered request")
+            let server::Request::Streaming(mut request) = request else {
+                panic!("incoming requests are always streaming")
             };
             assert_eq!(request.method(), Method::POST);
-            assert_eq!(request.body(), b"hello"[..]);
+            let mut body = [0; 5];
+            assert_eq!(request.read_all(&mut body).await?, body.len());
+            assert_eq!(&body, b"hello");
 
             let mut response = server::Response::default();
-            response.set_status(StatusCode::OK).set_body(request.body());
+            response
+                .set_status(StatusCode::OK)
+                .set_body(Bytes::copy_from_slice(&body));
             server::write_bytes_response(
                 response,
                 H3WriteStream::new(0, server_send),

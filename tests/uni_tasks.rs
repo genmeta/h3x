@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use h3x::{Error, H3Connection, Result, Role, Transport};
+use h3x::{ErrorCode, H3Connection, Result, Role, Transport};
 use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex},
@@ -24,7 +24,7 @@ struct Probe {
     accept_tasks: Mutex<HashSet<Id>>,
     read_tasks: Mutex<HashSet<Id>>,
     live: AtomicUsize,
-    closed: Mutex<Option<Error>>,
+    closed: Mutex<Option<ErrorCode>>,
     ended: Notify,
     dropped_before_close: AtomicBool,
 }
@@ -113,16 +113,16 @@ impl Transport for Incoming {
     }
     fn close(&self, _: String, code: u64) -> Result<()> {
         let error = match code {
-            0x100 => Error::H3_NO_ERROR,
-            0x103 => Error::H3_STREAM_CREATION_ERROR,
-            0x108 => Error::H3_ID_ERROR,
-            _ => Error::H3_INTERNAL_ERROR,
+            0x100 => ErrorCode::H3_NO_ERROR,
+            0x103 => ErrorCode::H3_STREAM_CREATION_ERROR,
+            0x108 => ErrorCode::H3_ID_ERROR,
+            _ => ErrorCode::H3_INTERNAL_ERROR,
         };
         self.probe.closed.lock().unwrap().get_or_insert(error);
         self.probe.ended.notify_waiters();
         Ok(())
     }
-    async fn terminated(&self) -> Error {
+    async fn terminated(&self) -> ErrorCode {
         loop {
             let changed = self.probe.ended.notified();
             if let Some(error) = *self.probe.closed.lock().unwrap() {
@@ -183,7 +183,7 @@ async fn each_unidirectional_stream_has_a_task_and_transport_close_cancels_them(
     );
     drop(connection);
     assert!(probe.closed.lock().unwrap().is_none());
-    *probe.closed.lock().unwrap() = Some(Error::H3_NO_ERROR);
+    *probe.closed.lock().unwrap() = Some(ErrorCode::H3_NO_ERROR);
     probe.ended.notify_waiters();
     bounded(async {
         while probe.live.load(Ordering::SeqCst) != 0 {
@@ -200,11 +200,11 @@ async fn stream_task_errors_close_before_dropping_receivers() {
     for (prefixes, expected) in [
         (
             vec![&[0x40][..], &[0, 4, 0, 7, 1, 1][..]],
-            Error::H3_ID_ERROR,
+            ErrorCode::H3_ID_ERROR,
         ),
-        (vec![&[0][..], &[0][..]], Error::H3_STREAM_CREATION_ERROR),
-        (vec![&[2][..], &[2][..]], Error::H3_STREAM_CREATION_ERROR),
-        (vec![&[3][..], &[3][..]], Error::H3_STREAM_CREATION_ERROR),
+        (vec![&[0][..], &[0][..]], ErrorCode::H3_STREAM_CREATION_ERROR),
+        (vec![&[2][..], &[2][..]], ErrorCode::H3_STREAM_CREATION_ERROR),
+        (vec![&[3][..], &[3][..]], ErrorCode::H3_STREAM_CREATION_ERROR),
     ] {
         let (connection, probe, _peers) = setup(&prefixes).await;
         bounded(async {

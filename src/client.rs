@@ -8,16 +8,16 @@ use http::StatusCode;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::{
-    ArcWndBuf, Error, Result, Transport,
+    ArcWndBuf, ErrorCode, Result, Transport,
     common::{
         self, Read, Write,
         body::{self, BodyMode},
-        message::{ArcMessage, Message, ReadBody, WriteResponse},
+        headers::{self, Write as _},
+        message::{ArcMessage, Message},
     },
     protocol::{
         connection::H3Connection,
         frame::{self, Data, Frame, H3Frame, Headers, Write as _, be_frame},
-        headers,
         stream::{H3ReadStream, H3WriteStream},
     },
 };
@@ -35,8 +35,11 @@ pub fn write_bytes_request<RS, WS, T: Transport>(
     request: Request<Bytes>,
     ws: H3WriteStream<WS>,
     rs: H3ReadStream<RS>,
+    // qpack
     connection: H3Connection<T>,
 ) -> Result<(
+    // IntoFuture, 只返回一个
+    // content-length 写完再返回
     impl Future<Output = Result<()>> + Send,
     impl Future<Output = Result<Response>> + Send,
 )>
@@ -46,8 +49,10 @@ where
 {
     use crate::ReadRequest;
     let method = request.method();
-    let sending = send_bytes_request(&request, ws, connection.clone())?;
-    Ok((sending, read_response(rs, connection, Some(method))))
+    Ok((
+        send_bytes_request(&request, ws, connection.clone())?,
+        read_response(rs, connection, Some(method)),
+    ))
 }
 
 /// Prepare a streaming upload and independent response future.
@@ -68,8 +73,11 @@ where
 {
     use crate::ReadRequest;
     let method = request.method();
-    let sending = send_streaming_request(&request, ws, connection.clone())?;
-    Ok((sending, read_response(rs, connection, Some(method))))
+
+    Ok((
+        send_streaming_request(&request, ws, connection.clone())?,
+        read_response(rs, connection, Some(method)),
+    ))
 }
 
 fn send_bytes_request<WS, T: Transport>(
@@ -81,18 +89,22 @@ where
     WS: AsyncWrite + Unpin + Send + 'static,
 {
     let (fields, body) = {
-        let message = req.message.0.lock().unwrap();
-        (message.fields(), message.body())
+        let head = req.message.head.lock().unwrap();
+        let body = req.message.body.lock().unwrap().storage.clone();
+        let mut fields = Vec::new();
+        fields.put_request(&head)?;
+        if headers::content_length(&head.headers)?.is_some_and(|length| length != body.len() as u64)
+        {
+            return Err(ErrorCode::H3_MESSAGE_ERROR);
+        }
+        (fields, body)
     };
-    let parts = headers::request_parts(fields.clone())?;
-    if headers::content_length(&parts.headers)?.is_some_and(|length| length != body.len() as u64) {
-        return Err(Error::H3_MESSAGE_ERROR);
-    }
     let headers = Frame::new(Headers {
         field_section: connection.qpack().encode(ws.stream_id(), fields)?,
     })?;
     Ok(async move {
         let result = async {
+            // 用 while 循环写 栈上 buffer
             let mut buf = Vec::new();
             buf.put_frame(&headers);
             ws.write_all(&buf).await?;
@@ -103,7 +115,7 @@ where
                 ws.write_all(&body).await?;
             }
             ws.shutdown().await?;
-            Ok::<_, Error>(())
+            Ok::<_, ErrorCode>(())
         }
         .await;
         if let Err(error) = result {
@@ -121,35 +133,39 @@ fn send_streaming_request<WS, T: Transport>(
 where
     WS: AsyncWrite + Unpin + Send + 'static,
 {
-    let (fields, mut body) = {
-        let message = req.message.0.lock().unwrap();
-        (message.fields(), message.body_stream())
+    let (head, mut body) = {
+        let head = req.message.head.lock().unwrap().clone();
+        let body = req.message.body_stream();
+        (head, body)
     };
     // Validate before sending so malformed requests fail synchronously and wake producers.
     let (headers, mode) = (|| {
-        let parts = headers::request_parts(fields.clone())?;
-        let mode = match headers::content_length(&parts.headers)? {
+        let mut fields = Vec::new();
+        fields.put_request(&head)?;
+        let mode = match headers::content_length(&head.headers)? {
             Some(content_length) => BodyMode::Length { content_length },
             None => BodyMode::Infinity,
         };
         let headers = Frame::new(Headers {
             field_section: connection.qpack().encode(ws.stream_id(), fields)?,
         })?;
-        Ok::<_, Error>((headers, mode))
+        Ok::<_, ErrorCode>((headers, mode))
     })()
     .inspect_err(|error| body.set_error(*error))?;
+    // 通过读写通知 error，不需要
     let cancellation = body.clone();
     Ok(async move {
         let result = tokio::select! {
             biased;
             error = cancellation.error() => Err(error),
             result = async {
+                // 循环写
                 let mut buf = Vec::new();
                 buf.put_frame(&headers);
                 ws.write_all(&buf).await?;
                 body::write_streaming_body(&mut body, &mut ws, mode).await?;
                 ws.shutdown().await?;
-                Ok::<_, Error>(())
+                Ok::<_, ErrorCode>(())
             } => result,
         };
         if let Err(error) = result {
@@ -169,44 +185,43 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
     let stream_id = rs.stream_id();
     let mut rs = BufReader::new(rs);
     let result = async {
-        let (parts, length) = loop {
+        let (head, length) = loop {
             let frame = match be_frame(&mut rs).await? {
                 H3Frame::Headers(frame) => frame,
                 H3Frame::Unknown { length, .. } => {
                     frame::skip_payload(&mut rs, length.into_u64()).await?;
                     continue;
                 }
-                _ => return Err(Error::H3_FRAME_UNEXPECTED),
+                _ => return Err(ErrorCode::H3_FRAME_UNEXPECTED),
             };
             let fields = connection
                 .qpack()
                 .decode(stream_id, frame.payload.field_section)
                 .await?;
-            let parts = headers::response_parts(fields)?;
-            let length = headers::content_length(&parts.headers)?;
-            if parts.status == StatusCode::SWITCHING_PROTOCOLS {
-                return Err(Error::H3_MESSAGE_ERROR);
+            let head = headers::be_response(fields)?;
+            let status = head.status()?;
+            let length = headers::content_length(&head.headers)?;
+            if status == StatusCode::SWITCHING_PROTOCOLS {
+                return Err(ErrorCode::H3_MESSAGE_ERROR);
             }
-            if (parts.status.is_informational() || parts.status == StatusCode::NO_CONTENT)
-                && length.is_some()
-            {
-                return Err(Error::H3_MESSAGE_ERROR);
+            if (status.is_informational() || status == StatusCode::NO_CONTENT) && length.is_some() {
+                return Err(ErrorCode::H3_MESSAGE_ERROR);
             }
-            if !parts.status.is_informational() {
-                break (parts, length);
+            if !status.is_informational() {
+                break (head, length);
             }
         };
         if method.as_ref() == Some(&http::Method::CONNECT)
-            && parts.status.is_success()
+            && head.status()?.is_success()
             && length.is_some()
         {
-            return Err(Error::H3_MESSAGE_ERROR);
+            return Err(ErrorCode::H3_MESSAGE_ERROR);
         }
-        let mode = BodyMode::resolve(&parts, method.as_ref())?;
-        Ok((parts, mode))
+        let mode = BodyMode::resolve(&head, method.as_ref())?;
+        Ok((head, mode))
     }
     .await;
-    let (parts, mode) = match result {
+    let (head, mode) = match result {
         Ok(value) => value,
         Err(error) => {
             let _ = connection.qpack().cancel(stream_id);
@@ -214,19 +229,10 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
             return Err(error);
         }
     };
-    let mut message = Message::<Bytes>::default();
-    message.set_status(parts.status);
-    for (name, value) in &parts.headers {
-        message.append_header(name.clone(), value.clone());
-    }
-    Ok(match body::receive(rs, mode, connection).await? {
-        common::Body::Bytes(body) => {
-            common::Response::Bytes(ArcMessage::from(message.with_body(body)).into())
-        }
-        common::Body::Streaming(body) => {
-            common::Response::Streaming(ArcMessage::from(message.with_body(body)).into())
-        }
-    })
+    let body = body::receive(rs, mode, connection);
+    Ok(common::Response::Streaming(
+        ArcMessage::from(Message::from_parts(head, body)).into(),
+    ))
 }
 
 #[cfg(test)]

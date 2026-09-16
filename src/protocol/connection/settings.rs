@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use qbase::varint::VarInt;
 
-use crate::{Error, Result, protocol::frame};
+use crate::{ErrorCode, Result, protocol::frame};
 
 /// Local advertised settings and the independently received peer settings.
 pub struct Settings {
@@ -21,7 +21,7 @@ impl Settings {
         if max_field_section_size > frame::MAX_BUFFERED_FRAME_PAYLOAD as u64
             || max_table_capacity > frame::MAX_BUFFERED_FRAME_PAYLOAD as u64
         {
-            return Err(Error::H3_SETTINGS_ERROR);
+            return Err(ErrorCode::H3_SETTINGS_ERROR);
         }
         let values = [
             (frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY, max_table_capacity),
@@ -35,7 +35,7 @@ impl Settings {
         .map(|(id, value)| {
             Ok((
                 VarInt::from_u32(id),
-                VarInt::try_from(value).map_err(|_| Error::H3_SETTINGS_ERROR)?,
+                VarInt::try_from(value).map_err(|_| ErrorCode::H3_SETTINGS_ERROR)?,
             ))
         })
         .collect::<Result<_>>()?;
@@ -86,7 +86,7 @@ mod tests {
         {
             assert!(matches!(
                 Settings::new(fields, capacity, blocked),
-                Err(Error::H3_SETTINGS_ERROR)
+                Err(ErrorCode::H3_SETTINGS_ERROR)
             ));
         }
     }

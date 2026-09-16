@@ -26,22 +26,22 @@ async fn close_preserves_first_error_across_both_directions() {
     let connection = crate::test_support::connection();
     let qpack = connection.qpack();
     assert_eq!(
-        qpack.close(Error::H3_INTERNAL_ERROR),
-        Error::H3_INTERNAL_ERROR
+        qpack.close(ErrorCode::H3_INTERNAL_ERROR),
+        ErrorCode::H3_INTERNAL_ERROR
     );
     assert_eq!(
-        qpack.close(Error::H3_EXCESSIVE_LOAD),
-        Error::H3_INTERNAL_ERROR
+        qpack.close(ErrorCode::H3_EXCESSIVE_LOAD),
+        ErrorCode::H3_INTERNAL_ERROR
     );
-    assert_eq!(qpack.encode(0, Vec::new()), Err(Error::H3_INTERNAL_ERROR));
+    assert_eq!(qpack.encode(0, Vec::new()), Err(ErrorCode::H3_INTERNAL_ERROR));
     assert_eq!(
         qpack.decode(0, Bytes::from_static(&[0, 0])).await,
-        Err(Error::H3_INTERNAL_ERROR)
+        Err(ErrorCode::H3_INTERNAL_ERROR)
     );
-    assert_eq!(qpack.cancel(0), Err(Error::H3_INTERNAL_ERROR));
+    assert_eq!(qpack.cancel(0), Err(ErrorCode::H3_INTERNAL_ERROR));
     assert_eq!(
         qpack.configure(Settings::default(), VARINT_MAX),
-        Err(Error::H3_INTERNAL_ERROR)
+        Err(ErrorCode::H3_INTERNAL_ERROR)
     );
 }
 
@@ -50,10 +50,10 @@ async fn request_errors_leave_qpack_usable() {
     let connection = crate::test_support::connection();
     let qpack = connection.qpack();
     for error in [
-        Error::H3_REQUEST_CANCELLED,
-        Error::H3_REQUEST_REJECTED,
-        Error::H3_REQUEST_INCOMPLETE,
-        Error::H3_MESSAGE_ERROR,
+        ErrorCode::H3_REQUEST_CANCELLED,
+        ErrorCode::H3_REQUEST_REJECTED,
+        ErrorCode::H3_REQUEST_INCOMPLETE,
+        ErrorCode::H3_MESSAGE_ERROR,
     ] {
         connection.receive_error(error).await;
         assert_eq!(qpack.error(), None);
@@ -83,15 +83,15 @@ async fn malformed_field_section_closes_both_directions() {
         connection.clone(),
     )
     .await;
-    assert!(matches!(result, Err(Error::QPACK_DECOMPRESSION_FAILED)));
-    assert_eq!(qpack.error(), Some(Error::QPACK_DECOMPRESSION_FAILED));
+    assert!(matches!(result, Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)));
+    assert_eq!(qpack.error(), Some(ErrorCode::QPACK_DECOMPRESSION_FAILED));
     assert_eq!(
         qpack.encode(4, Vec::new()),
-        Err(Error::QPACK_DECOMPRESSION_FAILED)
+        Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
     );
     assert_eq!(
         qpack.decode(4, Bytes::from_static(&[0, 0])).await,
-        Err(Error::QPACK_DECOMPRESSION_FAILED)
+        Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
     );
 }
 

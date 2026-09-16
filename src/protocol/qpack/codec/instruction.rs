@@ -7,7 +7,7 @@ use super::{
     integer::{WritePrefixedInteger, be_byte, be_prefixed_integer_with_first},
     string_literal::{WriteStringLiteral, be_string_literal, be_string_literal_with_first},
 };
-use crate::{Error, Result, protocol::frame::MAX_BUFFERED_FRAME_PAYLOAD};
+use crate::{ErrorCode, Result, protocol::frame::MAX_BUFFERED_FRAME_PAYLOAD};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EncoderInstruction {
@@ -50,10 +50,10 @@ impl<B: BufMut> WriteInstruction for B {
                 value,
             } => {
                 if *static_table && super::super::table::get(*index).is_none() {
-                    return Err(Error::QPACK_ENCODER_STREAM_ERROR);
+                    return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR);
                 }
                 if value.len() > MAX_BUFFERED_FRAME_PAYLOAD {
-                    return Err(Error::H3_EXCESSIVE_LOAD);
+                    return Err(ErrorCode::H3_EXCESSIVE_LOAD);
                 }
                 self.put_prefixed_integer(*index, 6, 0x80 | (u8::from(*static_table) << 6))
                     .and_then(|()| self.put_string_literal(value, 8, 0))
@@ -62,13 +62,13 @@ impl<B: BufMut> WriteInstruction for B {
                 if name.len() > MAX_BUFFERED_FRAME_PAYLOAD
                     || value.len() > MAX_BUFFERED_FRAME_PAYLOAD
                 {
-                    return Err(Error::H3_EXCESSIVE_LOAD);
+                    return Err(ErrorCode::H3_EXCESSIVE_LOAD);
                 }
                 self.put_string_literal(name, 6, 0x40)
                     .and_then(|()| self.put_string_literal(value, 8, 0))
             }
         };
-        result.map_err(|_| Error::QPACK_ENCODER_STREAM_ERROR)?;
+        result.map_err(|_| ErrorCode::QPACK_ENCODER_STREAM_ERROR)?;
         Ok(())
     }
 
@@ -77,12 +77,12 @@ impl<B: BufMut> WriteInstruction for B {
             DecoderInstruction::SectionAcknowledgment(id) => (id, 7, 0x80),
             DecoderInstruction::StreamCancellation(id) => (id, 6, 0x40),
             DecoderInstruction::InsertCountIncrement(0) => {
-                return Err(Error::QPACK_DECODER_STREAM_ERROR);
+                return Err(ErrorCode::QPACK_DECODER_STREAM_ERROR);
             }
             DecoderInstruction::InsertCountIncrement(count) => (count, 6, 0),
         };
         self.put_prefixed_integer(value, bits, high)
-            .map_err(|_| Error::QPACK_DECODER_STREAM_ERROR)?;
+            .map_err(|_| ErrorCode::QPACK_DECODER_STREAM_ERROR)?;
         Ok(())
     }
 }
@@ -94,11 +94,11 @@ pub(crate) async fn be_encoder_instruction<R: AsyncRead + Unpin + ?Sized>(
     let first = be_byte(reader).await?;
     if first & 0x80 != 0 {
         let index =
-            be_prefixed_integer_with_first(reader, first, 6, Error::QPACK_ENCODER_STREAM_ERROR)
+            be_prefixed_integer_with_first(reader, first, 6, ErrorCode::QPACK_ENCODER_STREAM_ERROR)
                 .await?;
         let static_table = first & 0x40 != 0;
         if static_table && super::super::table::get(index).is_none() {
-            return Err(Error::QPACK_ENCODER_STREAM_ERROR);
+            return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR);
         }
         let value = be_string_literal(reader, 8).await?;
         Ok(EncoderInstruction::InsertWithNameReference {
@@ -112,7 +112,7 @@ pub(crate) async fn be_encoder_instruction<R: AsyncRead + Unpin + ?Sized>(
         Ok(EncoderInstruction::InsertWithLiteralName { name, value })
     } else {
         let value =
-            be_prefixed_integer_with_first(reader, first, 5, Error::QPACK_ENCODER_STREAM_ERROR)
+            be_prefixed_integer_with_first(reader, first, 5, ErrorCode::QPACK_ENCODER_STREAM_ERROR)
                 .await?;
         Ok(if first & 0x20 != 0 {
             EncoderInstruction::SetDynamicTableCapacity(value)
@@ -129,7 +129,7 @@ pub(crate) async fn be_decoder_instruction<R: AsyncRead + Unpin + ?Sized>(
     let first = be_byte(reader).await?;
     let bits = if first & 0x80 != 0 { 7 } else { 6 };
     let value =
-        be_prefixed_integer_with_first(reader, first, bits, Error::QPACK_DECODER_STREAM_ERROR)
+        be_prefixed_integer_with_first(reader, first, bits, ErrorCode::QPACK_DECODER_STREAM_ERROR)
             .await?;
     if first & 0x80 != 0 {
         Ok(DecoderInstruction::SectionAcknowledgment(value))
@@ -138,7 +138,7 @@ pub(crate) async fn be_decoder_instruction<R: AsyncRead + Unpin + ?Sized>(
     } else if value != 0 {
         Ok(DecoderInstruction::InsertCountIncrement(value))
     } else {
-        Err(Error::QPACK_DECODER_STREAM_ERROR)
+        Err(ErrorCode::QPACK_DECODER_STREAM_ERROR)
     }
 }
 
@@ -193,7 +193,7 @@ mod tests {
             for end in 0..wire.len() {
                 assert_eq!(
                     be_encoder_instruction(&mut &wire[..end]).await,
-                    Err(Error::H3_CLOSED_CRITICAL_STREAM)
+                    Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
                 );
             }
         }
@@ -212,7 +212,7 @@ mod tests {
             for end in 0..wire.len() {
                 assert_eq!(
                     be_decoder_instruction(&mut &wire[..end]).await,
-                    Err(Error::H3_CLOSED_CRITICAL_STREAM)
+                    Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
                 );
             }
         }
@@ -253,7 +253,7 @@ mod tests {
         );
         assert_eq!(
             be_decoder_instruction(&mut &[0][..]).await,
-            Err(Error::QPACK_DECODER_STREAM_ERROR)
+            Err(ErrorCode::QPACK_DECODER_STREAM_ERROR)
         );
         assert!(
             Vec::new()
@@ -268,12 +268,12 @@ mod tests {
         for wire in [vec![0xff; 10], vec![0xff, 36], vec![0x61, 0xff, 0]] {
             assert_eq!(
                 be_encoder_instruction(&mut wire.as_slice()).await,
-                Err(Error::QPACK_ENCODER_STREAM_ERROR)
+                Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR)
             );
         }
         assert_eq!(
             be_decoder_instruction(&mut &[0xff; 10][..]).await,
-            Err(Error::QPACK_DECODER_STREAM_ERROR)
+            Err(ErrorCode::QPACK_DECODER_STREAM_ERROR)
         );
         let mut oversized = Vec::new();
         oversized
@@ -281,7 +281,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             be_encoder_instruction(&mut oversized.as_slice()).await,
-            Err(Error::H3_EXCESSIVE_LOAD)
+            Err(ErrorCode::H3_EXCESSIVE_LOAD)
         );
     }
 }

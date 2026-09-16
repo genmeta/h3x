@@ -4,7 +4,7 @@ use tokio::io::AsyncWriteExt;
 
 use super::H3Connection;
 use crate::{
-    Error, Result, Transport,
+    ErrorCode, Result, Transport,
     protocol::{
         frame::{self, Control, Frame, StreamType, WriteControl as _, be_control},
         qpack,
@@ -14,19 +14,19 @@ use crate::{
 impl<T: Transport> H3Connection<T> {
     /// Errors while receiving a message have protocol-defined scope. Local
     /// encoding and application send errors never enter this path.
-    pub(crate) async fn receive_error(&self, error: Error) {
+    pub(crate) async fn receive_error(&self, error: ErrorCode) {
         if !matches!(
             error,
-            Error::H3_REQUEST_CANCELLED
-                | Error::H3_REQUEST_REJECTED
-                | Error::H3_REQUEST_INCOMPLETE
-                | Error::H3_MESSAGE_ERROR
+            ErrorCode::H3_REQUEST_CANCELLED
+                | ErrorCode::H3_REQUEST_REJECTED
+                | ErrorCode::H3_REQUEST_INCOMPLETE
+                | ErrorCode::H3_MESSAGE_ERROR
         ) {
             self.fail(error).await;
         }
     }
 
-    pub(super) async fn send_qpack_encoder(
+    pub(super) async fn sync_qpack_encoder(
         self,
         instruction_source: qpack::encoder::InstructionSource,
     ) {
@@ -34,7 +34,7 @@ impl<T: Transport> H3Connection<T> {
             .transport
             .open_uni()
             .await
-            .and_then(|stream| stream.ok_or(Error::H3_STREAM_CREATION_ERROR));
+            .and_then(|stream| stream.ok_or(ErrorCode::H3_STREAM_CREATION_ERROR));
         match stream {
             Ok((_, mut send)) => {
                 if let Err(error) =
@@ -48,12 +48,12 @@ impl<T: Transport> H3Connection<T> {
         }
     }
 
-    pub(super) async fn send_qpack_decoder(self, feedback_source: qpack::decoder::Instructions) {
+    pub(super) async fn sync_qpack_decoder(self, feedback_source: qpack::decoder::Instructions) {
         let stream = self
             .transport
             .open_uni()
             .await
-            .and_then(|stream| stream.ok_or(Error::H3_STREAM_CREATION_ERROR));
+            .and_then(|stream| stream.ok_or(ErrorCode::H3_STREAM_CREATION_ERROR));
         match stream {
             Ok((_, mut send)) => {
                 if let Err(error) = qpack::decoder::Decoder::write(feedback_source, &mut send).await
@@ -66,7 +66,7 @@ impl<T: Transport> H3Connection<T> {
         }
     }
 
-    pub(super) async fn accept_uni(self) {
+    pub(super) async fn accept_and_process_uni(self) {
         loop {
             match self.transport.accept_uni().await {
                 Ok((_, recv)) => {
@@ -87,7 +87,7 @@ impl<T: Transport> H3Connection<T> {
             };
             match stream_type {
                 StreamType::Control => self.receive_control(&mut recv).await,
-                StreamType::Push => Err(Error::H3_ID_ERROR),
+                StreamType::Push => Err(ErrorCode::H3_ID_ERROR),
                 StreamType::QpackEncoder => self.qpack.receive_encoder(&mut recv).await,
                 StreamType::QpackDecoder => self.qpack.receive_decoder(&mut recv).await,
             }
@@ -106,13 +106,13 @@ impl<T: Transport> H3Connection<T> {
         }
     }
 
-    pub(crate) fn close(&self, error: Error) {
+    pub(crate) fn close(&self, error: ErrorCode) {
         let error = self.qpack.close(error);
         self.cursor.close(error);
         self.bi_streams.close(error);
     }
 
-    pub(crate) async fn fail(&self, error: Error) {
+    pub(crate) async fn fail(&self, error: ErrorCode) {
         // Prefer an existing transport result over a new protocol error.
         tokio::select! {
             biased;
@@ -128,11 +128,11 @@ impl<T: Transport> H3Connection<T> {
 }
 
 impl<T: Transport> H3Connection<T> {
-    pub(super) async fn send_uni(self) {
+    pub(super) async fn sync_settings_and_goaway(self) {
         let mut send = match self.transport.open_uni().await {
             Ok(Some((_, send))) => send,
             Ok(None) => {
-                self.fail(Error::H3_STREAM_CREATION_ERROR).await;
+                self.fail(ErrorCode::H3_STREAM_CREATION_ERROR).await;
                 return;
             }
             Err(error) => {
@@ -151,7 +151,7 @@ impl<T: Transport> H3Connection<T> {
                 self.cursor.peer_goaway().await?;
                 self.bi_streams.drained().await;
                 self.transport
-                    .close(Error::H3_NO_ERROR.to_string(), Error::H3_NO_ERROR.as_u64())
+                    .close(ErrorCode::H3_NO_ERROR.to_string(), ErrorCode::H3_NO_ERROR.as_u64())
             } => result,
         };
         if let Err(error) = result {
@@ -171,7 +171,7 @@ impl<T: Transport> H3Connection<T> {
             send.flush().await
         }
         .await
-        .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+        .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
 
         let id = self.cursor.local_goaway().await?;
         bytes.clear();
@@ -183,15 +183,15 @@ impl<T: Transport> H3Connection<T> {
             send.flush().await
         }
         .await
-        .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+        .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
         Ok(())
     }
 
     async fn receive_control(&self, recv: &mut T::StreamReader) -> Result<()> {
         let settings = match be_control(recv).await {
             Ok(Control::Settings(frame)) => frame.payload,
-            Err(error) if error != Error::H3_FRAME_UNEXPECTED => return Err(error),
-            _ => return Err(Error::H3_MISSING_SETTINGS),
+            Err(error) if error != ErrorCode::H3_FRAME_UNEXPECTED => return Err(error),
+            _ => return Err(ErrorCode::H3_MISSING_SETTINGS),
         };
         let (peer, max_fields) = qpack::limits(&settings);
         self.qpack.configure(peer, max_fields)?;
@@ -207,7 +207,7 @@ impl<T: Transport> H3Connection<T> {
                         || id.dir() != Dir::Bi
                         || last_goaway_id.is_some_and(|previous| id > previous)
                     {
-                        return Err(Error::H3_ID_ERROR);
+                        return Err(ErrorCode::H3_ID_ERROR);
                     }
                     last_goaway_id = Some(id);
                     // Freeze opens before scanning: registration uses the same lock.
@@ -218,14 +218,14 @@ impl<T: Transport> H3Connection<T> {
                 }
                 // Server push is not supported.
                 Control::MaxPushId(_) | Control::CancelPush(_) => {
-                    return Err(Error::H3_ID_ERROR);
+                    return Err(ErrorCode::H3_ID_ERROR);
                 }
                 Control::Unknown { length, .. } => {
                     frame::skip_payload(recv, length.into_u64())
                         .await
-                        .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+                        .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
                 }
-                _ => return Err(Error::H3_FRAME_UNEXPECTED),
+                _ => return Err(ErrorCode::H3_FRAME_UNEXPECTED),
             }
         }
     }
@@ -241,7 +241,7 @@ mod tests {
 
     use qbase::sid::{Dir, StreamId};
 
-    use crate::{Error, Role, Transport, test_support};
+    use crate::{ErrorCode, Role, Transport, test_support};
 
     #[tokio::test]
     async fn transport_close_releases_qpack_writers_waiting_for_instructions() {
@@ -249,7 +249,7 @@ mod tests {
         tokio::task::yield_now().await;
         connection
             .transport
-            .close(String::new(), Error::H3_NO_ERROR.as_u64())
+            .close(String::new(), ErrorCode::H3_NO_ERROR.as_u64())
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while std::sync::Arc::strong_count(&connection.transport) != 1 {
@@ -258,7 +258,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(connection.qpack.error(), Some(Error::H3_NO_ERROR));
+        assert_eq!(connection.qpack.error(), Some(ErrorCode::H3_NO_ERROR));
     }
 
     #[tokio::test]
@@ -290,7 +290,7 @@ mod tests {
                 H3ReadStream::new(0, test_support::Reader),
                 connection.clone()
             ),
-            Err(Error::H3_EXCESSIVE_LOAD)
+            Err(ErrorCode::H3_EXCESSIVE_LOAD)
         ));
         tokio::task::yield_now().await;
         let mut ended = Box::pin(connection.transport.terminated());
@@ -309,9 +309,9 @@ mod tests {
             )
             .is_ok()
         );
-        connection.receive_error(Error::H3_EXCESSIVE_LOAD).await;
-        assert_eq!(ended.await, Error::H3_EXCESSIVE_LOAD);
-        assert_eq!(connection.qpack.error(), Some(Error::H3_EXCESSIVE_LOAD));
+        connection.receive_error(ErrorCode::H3_EXCESSIVE_LOAD).await;
+        assert_eq!(ended.await, ErrorCode::H3_EXCESSIVE_LOAD);
+        assert_eq!(connection.qpack.error(), Some(ErrorCode::H3_EXCESSIVE_LOAD));
     }
 
     #[tokio::test]
@@ -323,17 +323,17 @@ mod tests {
             .unwrap();
         connection
             .transport
-            .close(String::new(), Error::H3_INTERNAL_ERROR.as_u64())
+            .close(String::new(), ErrorCode::H3_INTERNAL_ERROR.as_u64())
             .unwrap();
-        connection.fail(Error::QPACK_DECOMPRESSION_FAILED).await;
-        assert_eq!(connection.qpack.error(), Some(Error::H3_INTERNAL_ERROR));
+        connection.fail(ErrorCode::QPACK_DECOMPRESSION_FAILED).await;
+        assert_eq!(connection.qpack.error(), Some(ErrorCode::H3_INTERNAL_ERROR));
         assert_eq!(
             connection.open_bi().await.err(),
-            Some(Error::H3_INTERNAL_ERROR)
+            Some(ErrorCode::H3_INTERNAL_ERROR)
         );
         use tokio::io::AsyncWriteExt;
         let error = send.write_all(b"x").await.unwrap_err();
-        assert_eq!(Error::from(error), Error::H3_INTERNAL_ERROR);
+        assert_eq!(ErrorCode::from(error), ErrorCode::H3_INTERNAL_ERROR);
     }
 
     #[tokio::test]
@@ -362,7 +362,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), ended)
                 .await
                 .unwrap(),
-            Error::H3_NO_ERROR
+            ErrorCode::H3_NO_ERROR
         );
         assert!(connection.goaway().await.is_ok());
     }
@@ -372,9 +372,9 @@ mod tests {
         let connection = test_support::connection();
         connection
             .transport
-            .close(String::new(), Error::H3_INTERNAL_ERROR.as_u64())
+            .close(String::new(), ErrorCode::H3_INTERNAL_ERROR.as_u64())
             .unwrap();
-        assert_eq!(connection.goaway().await, Err(Error::H3_INTERNAL_ERROR));
+        assert_eq!(connection.goaway().await, Err(ErrorCode::H3_INTERNAL_ERROR));
     }
 }
 
@@ -390,7 +390,7 @@ mod admission_tests {
     use tokio::sync::Semaphore;
 
     use crate::{
-        Error, H3Connection, Result, Role, Transport,
+        ErrorCode, H3Connection, Result, Role, Transport,
         test_support::{Reader, TestTransport, Writer},
     };
 
@@ -425,7 +425,7 @@ mod admission_tests {
         fn close(&self, reason: String, code: u64) -> Result<()> {
             self.base.close(reason, code)
         }
-        async fn terminated(&self) -> Error {
+        async fn terminated(&self) -> ErrorCode {
             self.base.terminated().await
         }
     }
@@ -455,11 +455,11 @@ mod admission_tests {
                     connection
                         .cursor
                         .receive_goaway(StreamId::new(Role::Client, Dir::Bi, 100));
-                    Error::H3_REQUEST_REJECTED
+                    ErrorCode::H3_REQUEST_REJECTED
                 }
                 _ => {
-                    connection.close(Error::H3_INTERNAL_ERROR);
-                    Error::H3_INTERNAL_ERROR
+                    connection.close(ErrorCode::H3_INTERNAL_ERROR);
+                    ErrorCode::H3_INTERNAL_ERROR
                 }
             };
             assert!(matches!(connection.open_bi().await, Err(e) if e == error));
@@ -487,11 +487,11 @@ mod admission_tests {
                     .is_pending()
             );
             let error = if closed {
-                connection.close(Error::H3_INTERNAL_ERROR);
-                Error::H3_INTERNAL_ERROR
+                connection.close(ErrorCode::H3_INTERNAL_ERROR);
+                ErrorCode::H3_INTERNAL_ERROR
             } else {
                 connection.cursor.goaway().unwrap();
-                Error::H3_REQUEST_REJECTED
+                ErrorCode::H3_REQUEST_REJECTED
             };
             assert!(matches!(connection.accept_bi().await, Err(e) if e == error));
             assert_eq!(connection.transport.calls.load(Ordering::SeqCst), 1);
@@ -634,7 +634,7 @@ mod qpack_writer_tests {
         fn close(&self, reason: String, code: u64) -> Result<()> {
             self.base.close(reason, code)
         }
-        async fn terminated(&self) -> Error {
+        async fn terminated(&self) -> ErrorCode {
             self.base.terminated().await
         }
     }
@@ -658,10 +658,10 @@ mod qpack_writer_tests {
                 tokio::time::timeout(Duration::from_secs(1), connection.transport.terminated())
                     .await
                     .unwrap();
-            assert_eq!(error, Error::H3_CLOSED_CRITICAL_STREAM);
+            assert_eq!(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM);
             assert_eq!(connection.qpack.error(), Some(error));
             assert_eq!(connection.open_bi().await.err(), Some(error));
-            assert_eq!(Error::from(send.write_all(b"x").await.unwrap_err()), error);
+            assert_eq!(ErrorCode::from(send.write_all(b"x").await.unwrap_err()), error);
             // The connection-owned writer tasks release their connection handles.
             tokio::task::yield_now().await;
             assert_eq!(Arc::strong_count(&connection.transport), 1);

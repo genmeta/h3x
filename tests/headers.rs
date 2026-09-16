@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use h3x::{
-    H3ReadStream, H3WriteStream, ReadBody, ReadRequest, ReadResponse, ReadStream, WriteBody,
-    WriteRequest, WriteResponse, WriteStream, client, server,
+    H3ReadStream, H3WriteStream, ReadRequest, ReadResponse, ReadStream, WriteBody, WriteRequest,
+    WriteResponse, WriteStream, client, server,
 };
 use http::{HeaderValue, StatusCode, header};
 use tokio::io::duplex;
@@ -115,20 +115,13 @@ async fn ordinary_headers_round_trip() {
                             .await?;
                     assert_request_headers(&request, buffered);
                     let method = request.method();
-                    match request {
-                        server::Request::Bytes(request) => {
-                            assert!(buffered);
-                            assert_request_headers(&request, buffered);
-                            assert_eq!(request.body(), b"hello"[..]);
-                        }
-                        server::Request::Streaming(mut request) => {
-                            assert!(!buffered);
-                            assert_request_headers(&request, buffered);
-                            let mut body = [0; 6];
-                            assert_eq!(request.read_all(&mut body).await?, 5);
-                            assert_eq!(&body[..5], b"hello");
-                        }
-                    }
+                    let server::Request::Streaming(mut request) = request else {
+                        panic!("incoming requests are always streaming")
+                    };
+                    assert_request_headers(&request, buffered);
+                    let mut body = [0; 6];
+                    assert_eq!(request.read_all(&mut body).await?, 5);
+                    assert_eq!(&body[..5], b"hello");
 
                     let mut first_cookie = HeaderValue::from_static(COOKIES[0]);
                     first_cookie.set_sensitive(true);
@@ -172,20 +165,13 @@ async fn ordinary_headers_round_trip() {
             let response = received.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert_response_headers(&response, buffered);
-            match response {
-                client::Response::Bytes(response) => {
-                    assert!(buffered);
-                    assert_response_headers(&response, buffered);
-                    assert_eq!(response.body(), b"world"[..]);
-                }
-                client::Response::Streaming(mut response) => {
-                    assert!(!buffered);
-                    assert_response_headers(&response, buffered);
-                    let mut body = [0; 6];
-                    assert_eq!(response.read_all(&mut body).await.unwrap(), 5);
-                    assert_eq!(&body[..5], b"world");
-                }
-            }
+            let client::Response::Streaming(mut response) = response else {
+                panic!("incoming responses are always streaming")
+            };
+            assert_response_headers(&response, buffered);
+            let mut body = [0; 6];
+            assert_eq!(response.read_all(&mut body).await.unwrap(), 5);
+            assert_eq!(&body[..5], b"world");
         }
     })
     .await

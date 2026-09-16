@@ -10,7 +10,7 @@ use std::{
     task::{Context, Waker},
 };
 
-use h3x::{Error, H3Connection, Result, Role, Transport};
+use h3x::{ErrorCode, H3Connection, Result, Role, Transport};
 use support::{Reader, TestTransport, Writer};
 
 struct DirectTransport {
@@ -45,7 +45,7 @@ impl Transport for DirectTransport {
     fn close(&self, reason: String, code: u64) -> Result<()> {
         self.base.close(reason, code)
     }
-    async fn terminated(&self) -> Error {
+    async fn terminated(&self) -> ErrorCode {
         self.base.terminated().await
     }
 }
@@ -67,7 +67,7 @@ fn connection(
 
 #[tokio::test]
 async fn application_drives_acceptance_and_receives_transport_errors() {
-    let (connection, calls) = connection([Ok(1), Ok(5), Err(Error::H3_INTERNAL_ERROR)]);
+    let (connection, calls) = connection([Ok(1), Ok(5), Err(ErrorCode::H3_INTERNAL_ERROR)]);
     tokio::task::yield_now().await;
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     for id in [1, 5] {
@@ -77,7 +77,7 @@ async fn application_drives_acceptance_and_receives_transport_errors() {
     }
     assert!(matches!(
         connection.accept_bi().await,
-        Err(Error::H3_INTERNAL_ERROR)
+        Err(ErrorCode::H3_INTERNAL_ERROR)
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
@@ -87,7 +87,7 @@ async fn acceptance_checks_ids_and_local_goaway() {
     let (connection, _) = connection([Ok(0), Ok(1), Ok(5)]);
     assert!(matches!(
         connection.accept_bi().await,
-        Err(Error::H3_ID_ERROR)
+        Err(ErrorCode::H3_ID_ERROR)
     ));
     let (_write, _read) = connection.accept_bi().await.unwrap();
     let mut closing = Box::pin(connection.clone().goaway());
@@ -99,6 +99,6 @@ async fn acceptance_checks_ids_and_local_goaway() {
     );
     assert!(matches!(
         connection.accept_bi().await,
-        Err(Error::H3_REQUEST_REJECTED)
+        Err(ErrorCode::H3_REQUEST_REJECTED)
     ));
 }

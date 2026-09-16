@@ -3,20 +3,20 @@ use bytes::BufMut;
 use qbase::varint::VARINT_MAX;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::{Error, Result};
+use crate::{ErrorCode, Result};
 
 pub(super) async fn be_byte<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<u8> {
     reader
         .read_u8()
         .await
-        .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)
+        .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)
 }
 
 pub(super) async fn be_prefixed_integer_with_first<T: AsyncRead + Unpin + ?Sized>(
     reader: &mut T,
     first: u8,
     bits: u8,
-    error: Error,
+    error: ErrorCode,
 ) -> Result<u64> {
     let mut wire = [0u8; 10];
     wire[0] = first;
@@ -44,7 +44,7 @@ pub(super) async fn be_prefixed_integer_with_first<T: AsyncRead + Unpin + ?Sized
 pub(super) fn be_prefixed_integer(mut input: &[u8], prefix_bits: u8) -> Result<(&[u8], u64)> {
     let (&first, rest) = input
         .split_first()
-        .ok_or(Error::QPACK_DECOMPRESSION_FAILED)?;
+        .ok_or(ErrorCode::QPACK_DECOMPRESSION_FAILED)?;
     input = rest;
     let limit = (1u64 << prefix_bits) - 1;
     let mut value = u64::from(first) & limit;
@@ -54,17 +54,17 @@ pub(super) fn be_prefixed_integer(mut input: &[u8], prefix_bits: u8) -> Result<(
     for shift in (0..63).step_by(7) {
         let (&byte, rest) = input
             .split_first()
-            .ok_or(Error::QPACK_DECOMPRESSION_FAILED)?;
+            .ok_or(ErrorCode::QPACK_DECOMPRESSION_FAILED)?;
         input = rest;
         value = value
             .checked_add(u64::from(byte & 0x7f) << shift)
             .filter(|&value| value <= VARINT_MAX)
-            .ok_or(Error::QPACK_DECOMPRESSION_FAILED)?;
+            .ok_or(ErrorCode::QPACK_DECOMPRESSION_FAILED)?;
         if byte & 0x80 == 0 {
             return Ok((input, value));
         }
     }
-    Err(Error::QPACK_DECOMPRESSION_FAILED)
+    Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
 }
 
 /// Append a QPACK prefixed integer (not a QUIC varint).
@@ -80,7 +80,7 @@ impl<B: BufMut> WritePrefixedInteger for B {
         high_bits: u8,
     ) -> Result<()> {
         if value > VARINT_MAX {
-            return Err(Error::QPACK_DECOMPRESSION_FAILED);
+            return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED);
         }
         let limit = (1u64 << prefix_bits) - 1;
         if value < limit {
@@ -137,7 +137,7 @@ mod tests {
         let mut wire = vec![42];
         assert_eq!(
             wire.put_prefixed_integer(VARINT_MAX + 1, 5, 0),
-            Err(Error::QPACK_DECOMPRESSION_FAILED)
+            Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
         );
         assert_eq!(wire, [42]);
     }
@@ -155,7 +155,7 @@ mod tests {
                         &mut input,
                         wire[0],
                         bits,
-                        Error::QPACK_DECODER_STREAM_ERROR
+                        ErrorCode::QPACK_DECODER_STREAM_ERROR
                     )
                     .await,
                     Ok(value)
@@ -166,22 +166,22 @@ mod tests {
         for wire in [&[0x1f][..], &[0x1f, 0x80][..]] {
             assert_eq!(
                 be_prefixed_integer(wire, 5),
-                Err(Error::QPACK_DECOMPRESSION_FAILED)
+                Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
             );
             assert_eq!(
                 be_prefixed_integer_with_first(
                     &mut &wire[1..],
                     wire[0],
                     5,
-                    Error::QPACK_DECODER_STREAM_ERROR
+                    ErrorCode::QPACK_DECODER_STREAM_ERROR
                 )
                 .await,
-                Err(Error::H3_CLOSED_CRITICAL_STREAM)
+                Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
             );
         }
         for error in [
-            Error::QPACK_ENCODER_STREAM_ERROR,
-            Error::QPACK_DECODER_STREAM_ERROR,
+            ErrorCode::QPACK_ENCODER_STREAM_ERROR,
+            ErrorCode::QPACK_DECODER_STREAM_ERROR,
         ] {
             assert_eq!(
                 be_prefixed_integer_with_first(&mut &[0xff; 9][..], 0xff, 7, error).await,

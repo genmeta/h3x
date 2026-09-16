@@ -8,7 +8,7 @@ use std::{
 };
 
 use super::{H3ReadStream, H3WriteStream, StreamState};
-use crate::{Error, Result};
+use crate::{ErrorCode, Result};
 
 /// Observes application-owned directions without extending their lifetimes.
 pub(crate) struct BiStream<R, W> {
@@ -35,7 +35,7 @@ impl<R, W> BiStream<R, W> {
         .await
     }
 
-    fn close(&self, error: Error) {
+    fn close(&self, error: ErrorCode) {
         if let Some(state) = self.read.upgrade() {
             let wakers = state.lock().unwrap().close(error, |_| {});
             for waker in wakers.into_iter().flatten() {
@@ -104,13 +104,13 @@ impl<R, W> BiStreams<R, W> {
             .collect();
         let rejected = streams.iter().map(|stream| stream.id).collect();
         for stream in streams {
-            stream.close(Error::H3_REQUEST_REJECTED);
+            stream.close(ErrorCode::H3_REQUEST_REJECTED);
         }
         self.cleanup();
         rejected
     }
 
-    pub(crate) fn close(&self, error: Error) {
+    pub(crate) fn close(&self, error: ErrorCode) {
         let streams = mem::take(&mut *self.streams.lock().unwrap());
         for stream in streams.into_values() {
             stream.close(error);
@@ -207,7 +207,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         assert!(!draining.is_finished());
-        streams.close(Error::H3_INTERNAL_ERROR);
+        streams.close(ErrorCode::H3_INTERNAL_ERROR);
         tokio::time::timeout(std::time::Duration::from_secs(1), draining)
             .await
             .unwrap()
@@ -395,7 +395,7 @@ mod tests {
                     }
                 }
             }
-            streams.close(Error::H3_INTERNAL_ERROR);
+            streams.close(ErrorCode::H3_INTERNAL_ERROR);
             assert_eq!(old_io.count(), 0);
             assert_eq!(old_drain.count(), 0);
             assert!(latest_io.count() > 0);
@@ -441,8 +441,8 @@ mod tests {
                         .is_pending()
                 );
                 assert_eq!(
-                    Error::from(send.shutdown().await.unwrap_err()),
-                    Error::H3_REQUEST_REJECTED
+                    ErrorCode::from(send.shutdown().await.unwrap_err()),
+                    ErrorCode::H3_REQUEST_REJECTED
                 );
             } else {
                 send.shutdown().await.unwrap();
@@ -477,7 +477,7 @@ mod tests {
                 self.0 = true;
                 Poll::Pending
             } else {
-                Poll::Ready(Err(Error::H3_REQUEST_REJECTED.into()))
+                Poll::Ready(Err(ErrorCode::H3_REQUEST_REJECTED.into()))
             }
         }
     }
@@ -496,12 +496,12 @@ mod tests {
         let error = poll_fn(|cx| Pin::new(&mut send).poll_shutdown(cx))
             .await
             .unwrap_err();
-        assert_eq!(Error::from(error), Error::H3_REQUEST_REJECTED);
+        assert_eq!(ErrorCode::from(error), ErrorCode::H3_REQUEST_REJECTED);
         streams.cleanup();
         assert_eq!(streams.len(), 0);
         assert_eq!(
-            Error::from(send.flush().await.unwrap_err()),
-            Error::H3_REQUEST_REJECTED
+            ErrorCode::from(send.flush().await.unwrap_err()),
+            ErrorCode::H3_REQUEST_REJECTED
         );
         assert_eq!(recv.read(&mut [0]).await.unwrap(), 0);
     }

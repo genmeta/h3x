@@ -11,7 +11,7 @@ use super::{
     Field, Settings,
     codec::instruction::{DecoderInstruction, WriteInstruction, be_encoder_instruction},
 };
-use crate::{Error, Result, protocol::frame::StreamType};
+use crate::{ErrorCode, Result, protocol::frame::StreamType};
 
 mod state;
 use state::State;
@@ -76,7 +76,7 @@ impl Decoder {
         ))
     }
 
-    pub(super) fn close(&self, error: Error) {
+    pub(super) fn close(&self, error: ErrorCode) {
         let wakes = {
             let mut state = self.state.lock().unwrap();
             let wakes = match state.as_mut() {
@@ -94,13 +94,13 @@ impl Decoder {
 
     pub(super) async fn decode(&self, id: u64, payload: Bytes) -> Result<Vec<Field>> {
         if id > qbase::varint::VARINT_MAX {
-            return Err(Error::H3_INTERNAL_ERROR);
+            return Err(ErrorCode::H3_INTERNAL_ERROR);
         }
         let (offset, prefix) = {
             let mut state = self.state.lock().unwrap();
             let decoder = state.as_mut().map_err(|error| *error)?;
             if decoder.decoding_stream.contains(&id) {
-                return Err(Error::H3_REQUEST_CANCELLED);
+                return Err(ErrorCode::H3_REQUEST_CANCELLED);
             }
             let (rest, prefix) = decoder.read_prefix(&payload)?;
             let offset = payload.len() - rest.len();
@@ -118,7 +118,7 @@ impl Decoder {
                 Err(error) => return Poll::Ready(Err(*error)),
             };
             if !decoder.decoding_stream.contains(&id) {
-                return Poll::Ready(Err(Error::H3_REQUEST_CANCELLED));
+                return Poll::Ready(Err(ErrorCode::H3_REQUEST_CANCELLED));
             }
             let result = decoder.poll_decode(id, prefix, &payload[offset..], cx);
             if result.is_ready() {
@@ -167,7 +167,7 @@ impl Decoder {
         writer
             .write_all(&[StreamType::QpackDecoder as u8])
             .await
-            .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+            .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
         let mut buf = Vec::new();
         while let Some(instruction) = receiver.recv().await {
             buf.clear();
@@ -175,9 +175,9 @@ impl Decoder {
             writer
                 .write_all(&buf)
                 .await
-                .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+                .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
         }
-        Err(Error::H3_CLOSED_CRITICAL_STREAM)
+        Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
     }
 }
 
@@ -202,7 +202,7 @@ impl Decoder {
     ) -> Poll<Result<DecoderInstruction>> {
         receiver
             .poll_recv(cx)
-            .map(|instruction| instruction.ok_or(Error::H3_CLOSED_CRITICAL_STREAM))
+            .map(|instruction| instruction.ok_or(ErrorCode::H3_CLOSED_CRITICAL_STREAM))
     }
 
     pub(super) fn read_prefix<'a>(

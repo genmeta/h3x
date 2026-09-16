@@ -3,7 +3,7 @@ use std::io;
 use qbase::varint::VarInt;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::Error;
+use crate::ErrorCode;
 
 /// Preserve transport errors and return `None` on FIN, including a partial integer.
 /// Cancellation may consume part of the integer; keep polling the same future.
@@ -25,7 +25,7 @@ pub(crate) async fn be_varint<T: AsyncRead + Unpin + ?Sized>(
     }
     qbase::varint::be_varint(&encoded[..len])
         .map(|(_, value)| Some(value))
-        .map_err(|_| Error::H3_FRAME_ERROR.into())
+        .map_err(|_| ErrorCode::H3_FRAME_ERROR.into())
 }
 
 #[cfg(test)]

@@ -7,10 +7,16 @@ use std::{
 use tokio::{io::AsyncReadExt, time::timeout};
 
 use super::*;
-use crate::{ReadResponse, WriteRequest, WriteStream};
+use crate::{ReadResponse, WriteRequest, WriteResponse, WriteStream, protocol::qpack::Field};
+
+fn response_fields(message: &Message<headers::ResponseHead, Bytes>) -> Vec<Field> {
+    let mut fields = Vec::new();
+    fields.put_response(&message.head).unwrap();
+    fields
+}
 
 fn response_headers() -> Vec<u8> {
-    let mut response = Message::<Bytes>::default();
+    let mut response = Message::<headers::ResponseHead, Bytes>::default();
     response.set_status(StatusCode::OK);
     response.set_header(http::header::CONTENT_LENGTH, "0".parse().unwrap());
     let mut encoded = Vec::new();
@@ -18,7 +24,7 @@ fn response_headers() -> Vec<u8> {
         &Frame::new(Headers {
             field_section: crate::test_support::connection()
                 .qpack()
-                .encode(0, response.fields())
+                .encode(0, response_fields(&response))
                 .unwrap(),
         })
         .unwrap(),
@@ -28,7 +34,7 @@ fn response_headers() -> Vec<u8> {
 
 #[tokio::test]
 async fn reset_wakes_a_blocked_producer_after_upload_is_dropped() {
-    let message = Message::<Bytes>::post("https://example.com/upload")
+    let message = Message::<headers::RequestHead, Bytes>::post("https://example.com/upload")
         .unwrap()
         .with_body(crate::Body::from_storage(ArcWndBuf::new(1)));
     let mut producer = Request::from(ArcMessage::from(message));
@@ -51,14 +57,17 @@ async fn reset_wakes_a_blocked_producer_after_upload_is_dropped() {
     cancelling.reset().await.unwrap();
     assert_eq!(
         timeout(Duration::from_secs(5), writing).await.unwrap(),
-        Err(Error::H3_REQUEST_CANCELLED)
+        Err(ErrorCode::H3_REQUEST_CANCELLED)
     );
-    assert_eq!(producer.finish().await, Err(Error::H3_REQUEST_CANCELLED));
+    assert_eq!(
+        producer.finish().await,
+        Err(ErrorCode::H3_REQUEST_CANCELLED)
+    );
 }
 
 #[tokio::test]
 async fn reset_wakes_a_blocked_producer_after_request_is_dropped() {
-    let message = Message::<Bytes>::post("https://example.com/upload")
+    let message = Message::<headers::RequestHead, Bytes>::post("https://example.com/upload")
         .unwrap()
         .with_body(crate::Body::from_storage(ArcWndBuf::new(1)));
     let mut producer = Request::from(ArcMessage::from(message));
@@ -81,9 +90,12 @@ async fn reset_wakes_a_blocked_producer_after_request_is_dropped() {
     cancelling.reset().await.unwrap();
     assert_eq!(
         timeout(Duration::from_secs(5), writing).await.unwrap(),
-        Err(Error::H3_REQUEST_CANCELLED)
+        Err(ErrorCode::H3_REQUEST_CANCELLED)
     );
-    assert_eq!(producer.finish().await, Err(Error::H3_REQUEST_CANCELLED));
+    assert_eq!(
+        producer.finish().await,
+        Err(ErrorCode::H3_REQUEST_CANCELLED)
+    );
 }
 
 #[tokio::test]
@@ -122,8 +134,14 @@ async fn cancelling_response_wait_drops_unfinished_uploads() {
             drop(waiting);
             if streaming {
                 producer.clone().reset().await.unwrap();
-                assert_eq!(producer.write(b"x").await, Err(Error::H3_REQUEST_CANCELLED));
-                assert_eq!(producer.finish().await, Err(Error::H3_REQUEST_CANCELLED));
+                assert_eq!(
+                    producer.write(b"x").await,
+                    Err(ErrorCode::H3_REQUEST_CANCELLED)
+                );
+                assert_eq!(
+                    producer.finish().await,
+                    Err(ErrorCode::H3_REQUEST_CANCELLED)
+                );
             }
             let mut partial = Vec::new();
             peer_recv.read_to_end(&mut partial).await.unwrap();
@@ -332,7 +350,10 @@ async fn write_failure_after_idle_body_preserves_the_response() {
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
-        assert_eq!(producer.write(b"x").await, Err(Error::H3_INTERNAL_ERROR));
+        assert_eq!(
+            producer.write(b"x").await,
+            Err(ErrorCode::H3_INTERNAL_ERROR)
+        );
         peer_send.write_all(&response_headers()).await.unwrap();
         peer_send.shutdown().await.unwrap();
         assert_eq!(waiting.await.unwrap().status(), StatusCode::OK);
@@ -345,7 +366,7 @@ async fn write_failure_after_idle_body_preserves_the_response() {
 async fn explicit_reset_stops_an_upload_waiting_on_network() {
     timeout(Duration::from_secs(5), async {
         let request = Request::streaming_post("https://example.com/upload").unwrap();
-        let mut body = request.message.0.lock().unwrap().body_stream();
+        let mut body = request.message.body_stream();
         let (send, mut recv) = tokio::io::duplex(1);
         let sending = tokio::spawn(
             send_streaming_request(
@@ -362,10 +383,10 @@ async fn explicit_reset_stops_an_upload_waiting_on_network() {
 
         request.reset().await.unwrap();
         assert_eq!(
-            Error::from(body.read(&mut [0]).await.unwrap_err()),
-            Error::H3_REQUEST_CANCELLED
+            ErrorCode::from(body.read(&mut [0]).await.unwrap_err()),
+            ErrorCode::H3_REQUEST_CANCELLED
         );
-        assert_eq!(sending.await.unwrap(), Err(Error::H3_REQUEST_CANCELLED));
+        assert_eq!(sending.await.unwrap(), Err(ErrorCode::H3_REQUEST_CANCELLED));
         let mut partial = Vec::new();
         recv.read_to_end(&mut partial).await.unwrap();
         assert!(!partial.is_empty());
@@ -413,13 +434,13 @@ async fn finished_producer_can_drop_while_upload_waits_on_network() {
 #[tokio::test]
 async fn explicit_stop_stops_a_receive_waiting_on_network() {
     timeout(Duration::from_secs(5), async {
-        let mut message = Message::<Bytes>::default();
+        let mut message = Message::<headers::ResponseHead, Bytes>::default();
         message.set_status(StatusCode::OK);
         let qpack = crate::test_support::connection();
         let mut headers = Vec::new();
         headers.put_frame(
             &Frame::new(Headers {
-                field_section: qpack.qpack().encode(0, message.fields()).unwrap(),
+                field_section: qpack.qpack().encode(0, response_fields(&message)).unwrap(),
             })
             .unwrap(),
         );
@@ -444,13 +465,13 @@ fn explicit_stop_cancels_body_after_response_pump_is_dropped() {
         .build()
         .unwrap();
     let (response, _peer) = runtime.block_on(async {
-        let mut message = Message::<Bytes>::default();
+        let mut message = Message::<headers::ResponseHead, Bytes>::default();
         message.set_status(StatusCode::OK);
         let qpack = crate::test_support::connection();
         let mut headers = Vec::new();
         headers.put_frame(
             &Frame::new(Headers {
-                field_section: qpack.qpack().encode(0, message.fields()).unwrap(),
+                field_section: qpack.qpack().encode(0, response_fields(&message)).unwrap(),
             })
             .unwrap(),
         );
@@ -481,13 +502,13 @@ fn explicit_stop_cancels_body_after_response_pump_is_dropped() {
         reading
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(Err(Error::H3_REQUEST_CANCELLED))
+        Poll::Ready(Err(ErrorCode::H3_REQUEST_CANCELLED))
     );
 }
 
 #[tokio::test]
 async fn streaming_response_keeps_message_error_after_transport_eof() {
-    let mut message = Message::<Bytes>::default();
+    let mut message = Message::<headers::ResponseHead, Bytes>::default();
     message.set_status(StatusCode::OK);
     message.set_header(
         http::header::CONTENT_LENGTH,
@@ -500,7 +521,7 @@ async fn streaming_response_keeps_message_error_after_transport_eof() {
     let mut encoded = Vec::new();
     encoded.put_frame(
         &Frame::new(Headers {
-            field_section: qpack.qpack().encode(0, message.fields()).unwrap(),
+            field_section: qpack.qpack().encode(0, response_fields(&message)).unwrap(),
         })
         .unwrap(),
     );
@@ -511,6 +532,12 @@ async fn streaming_response_keeps_message_error_after_transport_eof() {
     else {
         panic!("expected streaming response");
     };
-    assert_eq!(response.read(&mut [0]).await, Err(Error::H3_MESSAGE_ERROR));
-    assert_eq!(response.read(&mut [0]).await, Err(Error::H3_MESSAGE_ERROR));
+    assert_eq!(
+        response.read(&mut [0]).await,
+        Err(ErrorCode::H3_MESSAGE_ERROR)
+    );
+    assert_eq!(
+        response.read(&mut [0]).await,
+        Err(ErrorCode::H3_MESSAGE_ERROR)
+    );
 }

@@ -5,6 +5,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use super::{
     Read, Write,
     body::Body,
+    headers::RequestHead,
     message::{
         ArcMessage, Message, ReadBody, ReadRequest, ReadStream, WriteBody, WriteRequest,
         WriteStream,
@@ -15,10 +16,10 @@ use crate::{ArcWndBuf, Result};
 const DEFAULT_STREAM_CAPACITY: usize = 16 * 1024;
 
 pub struct Request<IO, B = Bytes> {
-    pub(crate) message: ArcMessage<Body<B, IO>>,
+    pub(crate) message: ArcMessage<RequestHead, Body<B, IO>>,
 }
 
-/// Cloning shares the message and body stream.
+/// Cloning shares metadata and body storage.
 impl<B> Clone for Request<Write, B> {
     fn clone(&self) -> Self {
         Self {
@@ -27,21 +28,21 @@ impl<B> Clone for Request<Write, B> {
     }
 }
 
-impl<IO, B> From<ArcMessage<Body<B, IO>>> for Request<IO, B> {
-    fn from(message: ArcMessage<Body<B, IO>>) -> Self {
+impl<IO, B> From<ArcMessage<RequestHead, Body<B, IO>>> for Request<IO, B> {
+    fn from(message: ArcMessage<RequestHead, Body<B, IO>>) -> Self {
         Self { message }
     }
 }
 
 impl ReadBody for Request<Read, Bytes> {
     fn body(&self) -> Bytes {
-        ReadBody::body(&*self.message.0.lock().unwrap())
+        self.message.body.lock().unwrap().storage.clone()
     }
 }
 
 impl WriteBody for Request<Write, Bytes> {
     fn set_body(&mut self, body: Bytes) -> &mut Self {
-        self.message.0.lock().unwrap().set_body(body);
+        self.message.body.lock().unwrap().storage = body;
         self
     }
 }
@@ -55,7 +56,7 @@ impl Request<Write, Bytes> {
 
 impl Request<Write, ArcWndBuf> {
     fn streaming(url: &str, method: Method) -> Result<Self> {
-        let message = Message::new_with_body(
+        let message = Message::new_request_with_body(
             url,
             method,
             Body::<ArcWndBuf, Write>::new(DEFAULT_STREAM_CAPACITY),
@@ -84,7 +85,7 @@ impl Request<Write, ArcWndBuf> {
 impl<B> Request<Write, B> {
     /// Replace all existing values for this header name.
     pub fn header(self, key: HeaderName, value: HeaderValue) -> Self {
-        self.message.0.lock().unwrap().set_header(key, value);
+        self.message.head.lock().unwrap().headers.insert(key, value);
         self
     }
 }
@@ -121,29 +122,29 @@ impl WriteStream for Request<Write, ArcWndBuf> {
 
 impl<IO, B> ReadRequest for Request<IO, B> {
     fn method(&self) -> Method {
-        self.message.0.lock().unwrap().method()
+        self.message.head.lock().unwrap().method()
     }
 
     fn authority(&self) -> String {
-        self.message.0.lock().unwrap().authority()
+        self.message.head.lock().unwrap().authority()
     }
 
     fn path(&self) -> String {
-        self.message.0.lock().unwrap().path()
+        self.message.head.lock().unwrap().path()
     }
 
     fn scheme(&self) -> String {
-        self.message.0.lock().unwrap().scheme()
+        self.message.head.lock().unwrap().scheme()
     }
 
     fn headers(&self) -> HeaderMap {
-        ReadRequest::headers(&*self.message.0.lock().unwrap())
+        ReadRequest::headers(&*self.message.head.lock().unwrap())
     }
 }
 
 impl<B: Default> WriteRequest for Request<Write, B> {
     fn new(url: &str, method: Method) -> Result<Self> {
-        Ok(ArcMessage::from(Message::<Body<B, Write>>::new(url, method)?).into())
+        Ok(ArcMessage::from(Message::<RequestHead, Body<B, Write>>::new(url, method)?).into())
     }
 
     fn header(self, key: HeaderName, value: HeaderValue) -> Self {
@@ -178,7 +179,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Error,
+        ErrorCode,
         common::{
             message::{ReadResponse, WriteResponse},
             response::Response,
@@ -212,7 +213,7 @@ mod tests {
         use std::sync::Arc;
         for retain_clone in [false, true] {
             let request = crate::client::Request::streaming_post("https://example.com/").unwrap();
-            let message = Arc::downgrade(&request.message.0);
+            let message = Arc::downgrade(&request.message.head);
             let retained = retain_clone.then(|| request.clone());
             let mut body = request.into_body();
             assert_eq!(message.upgrade().is_some(), retain_clone);
@@ -240,11 +241,11 @@ mod tests {
             (Request::streaming_connect, Method::CONNECT),
         ] {
             let request = constructor("https://example.com/upload?q=1").unwrap();
-            let message = request.message.0.lock().unwrap();
-            assert_eq!(message.method(), method);
-            assert_eq!(message.authority(), "example.com");
+            let head = request.message.head.lock().unwrap();
+            assert_eq!(head.method(), method);
+            assert_eq!(head.authority(), "example.com");
             assert_eq!(
-                message.path(),
+                head.path(),
                 if method == Method::CONNECT {
                     ""
                 } else {
@@ -270,9 +271,9 @@ mod tests {
         use crate::protocol::stream::{H3ReadStream, H3WriteStream};
 
         tokio::time::timeout(Duration::from_secs(5), async {
-            for error in [Error::H3_REQUEST_CANCELLED, Error::H3_MESSAGE_ERROR] {
+            for error in [ErrorCode::H3_REQUEST_CANCELLED, ErrorCode::H3_MESSAGE_ERROR] {
                 let mut request = Request::streaming_post("https://example.com/upload").unwrap();
-                if error == Error::H3_MESSAGE_ERROR {
+                if error == ErrorCode::H3_MESSAGE_ERROR {
                     request =
                         request.header(header::CONTENT_LENGTH, HeaderValue::from_static("invalid"));
                 }
@@ -291,7 +292,7 @@ mod tests {
                         .poll(&mut Context::from_waker(Waker::noop()))
                         .is_pending()
                 );
-                if error == Error::H3_REQUEST_CANCELLED {
+                if error == ErrorCode::H3_REQUEST_CANCELLED {
                     request.reset().await.unwrap();
                 } else {
                     let result = crate::client::write_streaming_request(
@@ -325,12 +326,15 @@ mod tests {
         writer.set_body(Bytes::from_static(b"updated"));
         assert_eq!(reader.body(), Bytes::from_static(b"hello"));
         assert_eq!(
-            writer.message.0.lock().unwrap().body(),
+            writer.message.body.lock().unwrap().storage,
             Bytes::from_static(b"updated")
         );
         assert!(Request::<Write>::get("/relative").is_err());
 
-        let message = ArcMessage::from(Message::<Body<Bytes, Write>>::default());
+        let message = ArcMessage::from(Message::<
+            crate::common::headers::ResponseHead,
+            Body<Bytes, Write>,
+        >::default());
         let mut response = Response::<Write>::from(message.clone());
         response
             .set_status(StatusCode::CREATED)
@@ -344,8 +348,12 @@ mod tests {
             .header(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
         let mut writer = request.clone();
         assert!(std::sync::Arc::ptr_eq(
-            &request.message.0,
-            &writer.message.0
+            &request.message.head,
+            &writer.message.head
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &request.message.body,
+            &writer.message.body
         ));
         let mut reader = Request::<Read, _>::from(request.message.test_direction());
         assert_eq!(reader.method(), Method::POST);
@@ -353,10 +361,11 @@ mod tests {
         assert_eq!(
             reader
                 .message
-                .0
+                .head
                 .lock()
                 .unwrap()
-                .header(&header::CONTENT_TYPE)
+                .headers
+                .get(&header::CONTENT_TYPE)
                 .unwrap(),
             "text/plain"
         );
@@ -382,18 +391,19 @@ mod tests {
         writer.reset().await.unwrap();
         assert_eq!(
             reader.read(&mut buf).await.unwrap_err(),
-            Error::H3_REQUEST_CANCELLED
+            ErrorCode::H3_REQUEST_CANCELLED
         );
 
         let message = ArcMessage::from(
-            Message::<Bytes>::default().with_body(crate::Body::from_storage(ArcWndBuf::new(1))),
+            Message::<crate::common::headers::ResponseHead, Bytes>::default()
+                .with_body(crate::Body::from_storage(ArcWndBuf::new(1))),
         );
         let mut writer = Response::<Write, _>::from(message.clone());
         let reader = Response::<Read, _>::from(message.test_direction());
         reader.stop().await;
         assert_eq!(
             writer.write(b"x").await.unwrap_err(),
-            Error::H3_REQUEST_CANCELLED
+            ErrorCode::H3_REQUEST_CANCELLED
         );
     }
 }

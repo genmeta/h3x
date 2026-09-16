@@ -24,9 +24,9 @@ async fn write_streaming_request<W: AsyncWrite + Unpin + Send + 'static>(
     .await
 }
 
-fn be_request(input: &[u8]) -> Result<(&[u8], http::request::Parts)> {
+fn be_request(input: &[u8]) -> Result<(&[u8], headers::RequestHead)> {
     let (input, fields) = qpack::be_field_section(input)?;
-    Ok((input, headers::request_parts(fields)?))
+    Ok((input, headers::be_request(fields)?))
 }
 
 #[tokio::test]
@@ -76,7 +76,7 @@ async fn request_frames_and_errors() {
     let (writer, mut reader) = duplex(3);
     assert_eq!(
         write_bytes_request(&req, writer).await.unwrap_err(),
-        Error::H3_MESSAGE_ERROR
+        ErrorCode::H3_MESSAGE_ERROR
     );
     let mut output = Vec::new();
     reader.read_to_end(&mut output).await.unwrap();
@@ -86,7 +86,7 @@ async fn request_frames_and_errors() {
     drop(reader);
     assert_eq!(
         write_bytes_request(&req, writer).await.unwrap_err(),
-        Error::H3_INTERNAL_ERROR
+        ErrorCode::H3_INTERNAL_ERROR
     );
 }
 
@@ -100,7 +100,8 @@ async fn streaming_request_frames_and_errors() {
         (&b"hello"[..], Some("6"), false),
         (&b"hello"[..], Some("invalid"), false),
     ] {
-        let mut message = Message::<Bytes>::post("https://example.com/upload").unwrap();
+        let mut message =
+            Message::<headers::RequestHead, Bytes>::post("https://example.com/upload").unwrap();
         if let Some(length) = length {
             message.set_header(header::CONTENT_LENGTH, length.parse().unwrap());
         }
@@ -126,10 +127,10 @@ async fn streaming_request_frames_and_errors() {
             }
         );
         if !valid {
-            assert_eq!(sent.unwrap_err(), Error::H3_MESSAGE_ERROR);
+            assert_eq!(sent.unwrap_err(), ErrorCode::H3_MESSAGE_ERROR);
             assert_eq!(
                 producer.write(b"x").await.unwrap_err(),
-                Error::H3_MESSAGE_ERROR
+                ErrorCode::H3_MESSAGE_ERROR
             );
             continue;
         }
@@ -154,7 +155,7 @@ async fn streaming_request_frames_and_errors() {
         assert_eq!(decoded, body);
     }
     let req = Request::from(ArcMessage::from(
-        Message::<Bytes>::post("https://example.com/")
+        Message::<headers::RequestHead, Bytes>::post("https://example.com/")
             .unwrap()
             .with_body(crate::Body::from_storage(ArcWndBuf::new(1))),
     ));
@@ -165,6 +166,6 @@ async fn streaming_request_frames_and_errors() {
         producer.write(b"a").await?;
         producer.write(b"b").await
     });
-    assert_eq!(sent.unwrap_err(), Error::H3_INTERNAL_ERROR);
-    assert_eq!(produced.unwrap_err(), Error::H3_INTERNAL_ERROR);
+    assert_eq!(sent.unwrap_err(), ErrorCode::H3_INTERNAL_ERROR);
+    assert_eq!(produced.unwrap_err(), ErrorCode::H3_INTERNAL_ERROR);
 }

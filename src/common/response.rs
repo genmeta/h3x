@@ -5,6 +5,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use super::{
     Read, Write,
     body::Body,
+    headers::ResponseHead,
     message::{
         ArcMessage, ReadBody, ReadResponse, ReadStream, WriteBody, WriteResponse, WriteStream,
     },
@@ -12,7 +13,7 @@ use super::{
 use crate::{ArcWndBuf, Result};
 
 pub struct Response<IO, B = Bytes> {
-    pub(crate) message: ArcMessage<Body<B, IO>>,
+    pub(crate) message: ArcMessage<ResponseHead, Body<B, IO>>,
 }
 
 impl<B: Default> Default for Response<Write, B> {
@@ -23,7 +24,7 @@ impl<B: Default> Default for Response<Write, B> {
     }
 }
 
-/// Cloning shares the message and body stream.
+/// Cloning shares metadata and body storage.
 impl Clone for Response<Write, ArcWndBuf> {
     fn clone(&self) -> Self {
         Self {
@@ -32,21 +33,21 @@ impl Clone for Response<Write, ArcWndBuf> {
     }
 }
 
-impl<IO, B> From<ArcMessage<Body<B, IO>>> for Response<IO, B> {
-    fn from(message: ArcMessage<Body<B, IO>>) -> Self {
+impl<IO, B> From<ArcMessage<ResponseHead, Body<B, IO>>> for Response<IO, B> {
+    fn from(message: ArcMessage<ResponseHead, Body<B, IO>>) -> Self {
         Self { message }
     }
 }
 
 impl ReadBody for Response<Read, Bytes> {
     fn body(&self) -> Bytes {
-        ReadBody::body(&*self.message.0.lock().unwrap())
+        self.message.body.lock().unwrap().storage.clone()
     }
 }
 
 impl WriteBody for Response<Write, Bytes> {
     fn set_body(&mut self, body: Bytes) -> &mut Self {
-        self.message.0.lock().unwrap().set_body(body);
+        self.message.body.lock().unwrap().storage = body;
         self
     }
 }
@@ -91,27 +92,27 @@ impl WriteStream for Response<Write, ArcWndBuf> {
 
 impl<B> ReadResponse for Response<Read, B> {
     fn status(&self) -> StatusCode {
-        self.message.0.lock().unwrap().status()
+        ReadResponse::status(&*self.message.head.lock().unwrap())
     }
 
     fn headers(&self) -> HeaderMap {
-        ReadResponse::headers(&*self.message.0.lock().unwrap())
+        ReadResponse::headers(&*self.message.head.lock().unwrap())
     }
 }
 
 impl<B> WriteResponse for Response<Write, B> {
     fn set_status(&mut self, status: StatusCode) -> &mut Self {
-        self.message.0.lock().unwrap().set_status(status);
+        self.message.head.lock().unwrap().set_status(status);
         self
     }
 
     fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
-        self.message.0.lock().unwrap().set_header(name, value);
+        self.message.head.lock().unwrap().set_header(name, value);
         self
     }
 
     fn append_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
-        self.message.0.lock().unwrap().append_header(name, value);
+        self.message.head.lock().unwrap().append_header(name, value);
         self
     }
 }

@@ -1,13 +1,13 @@
 use std::{io::Cursor, sync::Arc};
 
-use http::{Method, header};
+use http::{HeaderValue, Method, header};
 use tokio::io::duplex;
 
 use super::*;
 use crate::{
     ReadStream,
     common::message::{
-        ReadRequest, ReadResponse, WriteBody, WriteRequest, WriteResponse, WriteStream,
+        ReadBody, ReadRequest, ReadResponse, WriteBody, WriteRequest, WriteResponse, WriteStream,
     },
     protocol::qpack::{self, WriteFieldSection},
 };
@@ -83,12 +83,10 @@ where
     async move {
         match response {
             common::Response::Bytes(response) => {
-                send_bytes_response(&response, send, &qpack, request_method).await
+                write_bytes_response(response, send, qpack, request_method).await
             }
             common::Response::Streaming(response) => {
-                let sending = prepare_streaming_response(&response, send, qpack, request_method);
-                drop(response);
-                sending.await
+                write_streaming_response(response, send, qpack, request_method).await
             }
         }
     }

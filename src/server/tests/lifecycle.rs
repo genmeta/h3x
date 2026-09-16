@@ -7,7 +7,7 @@ async fn dropping_last_producer_does_not_finish_or_cancel_sending() {
     response.set_status(StatusCode::OK);
     let response = response.streaming(1);
     let producer = response.body_handle();
-    let buffer = response.message.0.lock().unwrap().body_stream();
+    let buffer = response.message.body_stream();
     let mut sending = Box::pin(crate::server::write_streaming_response(
         response,
         H3WriteStream::new(0, tokio::io::sink()),
@@ -19,8 +19,8 @@ async fn dropping_last_producer_does_not_finish_or_cancel_sending() {
     drop(producer);
     assert!(sending.as_mut().poll(&mut cx).is_pending());
     // Only an explicit buffer error terminates the send operation.
-    buffer.set_error(Error::H3_REQUEST_CANCELLED);
-    assert_eq!(sending.await, Err(Error::H3_REQUEST_CANCELLED));
+    buffer.set_error(ErrorCode::H3_REQUEST_CANCELLED);
+    assert_eq!(sending.await, Err(ErrorCode::H3_REQUEST_CANCELLED));
 }
 
 #[tokio::test]
@@ -73,7 +73,7 @@ async fn finished_response_producer_can_drop_before_or_during_send() {
 
 #[tokio::test]
 async fn buffered_body_snapshots_and_shared_streams() {
-    let message = Message::<Bytes>::post("https://example.com/echo?q=1")
+    let message = Message::<headers::RequestHead, Bytes>::post("https://example.com/echo?q=1")
         .unwrap()
         .with_body(crate::Body::from_storage(Bytes::from_static(b"request")));
     let request = common::request::Request::<Read, _>::from(ArcMessage::from(message));
@@ -93,12 +93,13 @@ async fn buffered_body_snapshots_and_shared_streams() {
     assert_eq!(outgoing.status(), StatusCode::CREATED);
     assert_eq!(outgoing.body(), Bytes::from_static(b"request"));
 
-    let message =
-        Message::<Bytes>::default().with_body(crate::Body::from_storage(ArcWndBuf::new(2)));
+    let message = Message::<headers::RequestHead, Bytes>::get("https://example.com/")
+        .unwrap()
+        .with_body(crate::Body::from_storage(ArcWndBuf::new(2)));
     let mut request = common::request::Request::<Read, _>::from(ArcMessage::from(message));
     let mut incoming = common::request::Request::<Write, _>::from(request.message.test_direction());
-    let message =
-        Message::<Bytes>::default().with_body(crate::Body::from_storage(ArcWndBuf::new(2)));
+    let message = Message::<headers::ResponseHead, Bytes>::default()
+        .with_body(crate::Body::from_storage(ArcWndBuf::new(2)));
     let mut response = Response::from(ArcMessage::from(message));
     response.set_status(StatusCode::OK);
     let mut outgoing =
@@ -127,12 +128,12 @@ async fn buffered_body_snapshots_and_shared_streams() {
     request.stop().await;
     assert_eq!(
         incoming.write(b"x").await.unwrap_err(),
-        Error::H3_REQUEST_CANCELLED
+        ErrorCode::H3_REQUEST_CANCELLED
     );
     response.reset().await.unwrap();
     assert_eq!(
         outgoing.read(&mut [0]).await.unwrap_err(),
-        Error::H3_REQUEST_CANCELLED
+        ErrorCode::H3_REQUEST_CANCELLED
     );
 }
 
@@ -146,11 +147,11 @@ async fn streaming_response_termination_reaches_the_producer() {
 
     tokio::time::timeout(Duration::from_secs(5), async {
         for (error, started) in [
-            (Error::H3_REQUEST_CANCELLED, true),
-            (Error::H3_REQUEST_CANCELLED, false),
-            (Error::H3_REQUEST_REJECTED, true),
-            (Error::H3_INTERNAL_ERROR, true),
-            (Error::H3_INTERNAL_ERROR, false),
+            (ErrorCode::H3_REQUEST_CANCELLED, true),
+            (ErrorCode::H3_REQUEST_CANCELLED, false),
+            (ErrorCode::H3_REQUEST_REJECTED, true),
+            (ErrorCode::H3_INTERNAL_ERROR, true),
+            (ErrorCode::H3_INTERNAL_ERROR, false),
         ] {
             let mut response = Response::<Bytes>::default();
             response.set_status(StatusCode::OK);
@@ -171,11 +172,11 @@ async fn streaming_response_termination_reaches_the_producer() {
                         .is_pending()
                 );
             }
-            if error == Error::H3_REQUEST_CANCELLED {
+            if error == ErrorCode::H3_REQUEST_CANCELLED {
                 drop(sending);
                 producer.clone().reset().await.unwrap();
             } else {
-                if error == Error::H3_REQUEST_REJECTED {
+                if error == ErrorCode::H3_REQUEST_REJECTED {
                     for id in bi.goaway(0) {
                         qpack.qpack().cancel(id).unwrap();
                     }
@@ -251,7 +252,7 @@ fn explicit_stop_cancels_body_after_request_pump_is_dropped() {
         reading
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(Err(Error::H3_REQUEST_CANCELLED))
+        Poll::Ready(Err(ErrorCode::H3_REQUEST_CANCELLED))
     );
 }
 
@@ -325,14 +326,14 @@ async fn dropping_received_body_does_not_stop_network_reads() {
         .unwrap() else {
             panic!("expected stream");
         };
-        let mut buffer = request.message.0.lock().unwrap().body_stream();
+        let mut buffer = request.message.body_stream();
         drop(request.into_body());
         send.write_all(&[0, 1, b'x']).await.unwrap();
         let mut bytes = [0];
         buffer.read_exact(&mut bytes).await.unwrap();
         assert_eq!(bytes, *b"x");
         // Explicit cancellation cleans up the task; dropping Body did not do so.
-        buffer.set_error(Error::H3_REQUEST_CANCELLED);
+        buffer.set_error(ErrorCode::H3_REQUEST_CANCELLED);
     })
     .await
     .unwrap();

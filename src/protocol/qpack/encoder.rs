@@ -16,7 +16,7 @@ use super::{
         DecoderInstruction, EncoderInstruction, WriteInstruction, be_decoder_instruction,
     },
 };
-use crate::{Error, Result, protocol::frame::StreamType};
+use crate::{ErrorCode, Result, protocol::frame::StreamType};
 
 mod state;
 use state::State;
@@ -43,6 +43,8 @@ pub(in crate::protocol) struct InstructionSource {
     completed: Arc<AtomicU64>,
 }
 
+// on_instruction
+//
 pub(in crate::protocol) struct Encoder {
     state: Mutex<Result<State>>,
     completed: Arc<AtomicU64>,
@@ -74,11 +76,11 @@ impl Encoder {
     }
 
     #[cfg(test)]
-    pub(super) fn error(&self) -> Option<Error> {
+    pub(super) fn error(&self) -> Option<ErrorCode> {
         self.state.lock().unwrap().as_ref().err().copied()
     }
 
-    pub(super) fn close(&self, error: Error) -> Error {
+    pub(super) fn close(&self, error: ErrorCode) -> ErrorCode {
         let error = {
             let mut state = self.state.lock().unwrap();
             let error = state.as_ref().err().copied().unwrap_or(error);
@@ -126,7 +128,7 @@ impl Encoder {
         writer
             .write_all(&[StreamType::QpackEncoder as u8])
             .await
-            .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+            .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
         let mut buf = Vec::new();
         while let Some(batch) = instructions.recv().await {
             for (instruction, insert_count) in batch {
@@ -135,11 +137,11 @@ impl Encoder {
                 writer
                     .write_all(&buf)
                     .await
-                    .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+                    .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
                 completed.store(insert_count, Ordering::Release);
             }
         }
-        Err(Error::H3_CLOSED_CRITICAL_STREAM)
+        Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
     }
 }
 
@@ -218,7 +220,7 @@ mod tests {
         let (encoder, source) = queued_insert();
         assert_eq!(
             encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(0)),
-            Err(Error::QPACK_DECODER_STREAM_ERROR)
+            Err(ErrorCode::QPACK_DECODER_STREAM_ERROR)
         );
         let mut writer = Writer { fail: false };
         let mut writing = Box::pin(Encoder::write(source, &mut writer));
@@ -235,7 +237,7 @@ mod tests {
         );
         assert_eq!(
             encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(0)),
-            Err(Error::QPACK_DECODER_STREAM_ERROR)
+            Err(ErrorCode::QPACK_DECODER_STREAM_ERROR)
         );
     }
 
@@ -244,7 +246,7 @@ mod tests {
         let (encoder, source) = queued_insert();
         assert_eq!(
             Encoder::write(source, &mut Writer { fail: true }).await,
-            Err(Error::H3_CLOSED_CRITICAL_STREAM)
+            Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
         );
         assert_eq!(encoder.completed.load(Ordering::Acquire), 0);
     }

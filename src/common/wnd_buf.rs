@@ -126,7 +126,7 @@ impl ArcWndBuf {
         }
     }
 
-    pub(crate) fn set_error(&self, error: crate::Error) {
+    pub(crate) fn set_error(&self, error: crate::ErrorCode) {
         let (reader, writer, observer) = {
             let mut state = self.shared.lock().unwrap();
             let Ok(window) = &mut *state else {
@@ -152,7 +152,7 @@ impl ArcWndBuf {
     }
 
     /// Observe explicit reset/stop or I/O failure even while a pump waits on the network.
-    pub(crate) async fn error(&self) -> crate::Error {
+    pub(crate) async fn error(&self) -> crate::ErrorCode {
         poll_fn(|cx| match &mut *self.shared.lock().unwrap() {
             Ok(window) => {
                 window.error_waker = Some(cx.waker().clone());
@@ -383,8 +383,8 @@ mod tests {
                         .is_pending()
                 );
             }
-            reader.set_error(crate::Error::H3_REQUEST_CANCELLED);
-            writer.set_error(crate::Error::H3_INTERNAL_ERROR);
+            reader.set_error(crate::ErrorCode::H3_REQUEST_CANCELLED);
+            writer.set_error(crate::ErrorCode::H3_INTERNAL_ERROR);
             assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
             let results = [
                 Pin::new(&mut reader)
@@ -401,8 +401,8 @@ mod tests {
                     panic!("expected error")
                 };
                 assert_eq!(
-                    crate::Error::from(error),
-                    crate::Error::H3_REQUEST_CANCELLED
+                    crate::ErrorCode::from(error),
+                    crate::ErrorCode::H3_REQUEST_CANCELLED
                 );
             }
         }

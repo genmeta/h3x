@@ -14,7 +14,7 @@ use super::super::{
     should_never_index, table,
     table::DynamicTable,
 };
-use crate::{Error, Result, protocol::frame::MAX_BUFFERED_FRAME_PAYLOAD};
+use crate::{ErrorCode, Result, protocol::frame::MAX_BUFFERED_FRAME_PAYLOAD};
 
 /// Connection-scoped encoder; contains no transport handles or async operations.
 pub(super) struct State {
@@ -44,7 +44,7 @@ impl State {
         sender: mpsc::Sender<Vec<(EncoderInstruction, u64)>>,
     ) -> Result<Self> {
         if peer.blocked_streams > VARINT_MAX {
-            return Err(Error::H3_SETTINGS_ERROR);
+            return Err(ErrorCode::H3_SETTINGS_ERROR);
         }
         Ok(Self {
             table: DynamicTable::new(peer.max_table_capacity)?,
@@ -73,7 +73,7 @@ impl State {
         if peer.blocked_streams > VARINT_MAX
             || peer.blocked_streams < self.potentially_blocked_streams() as u64
         {
-            return Err(Error::H3_SETTINGS_ERROR);
+            return Err(ErrorCode::H3_SETTINGS_ERROR);
         }
         self.table.set_max_capacity(peer.max_table_capacity)?;
         self.max_blocked_streams = peer.blocked_streams;
@@ -87,7 +87,7 @@ impl State {
         fields: impl IntoIterator<Item = Field>,
     ) -> Result<Bytes> {
         if stream_id > VARINT_MAX {
-            return Err(Error::H3_INTERNAL_ERROR);
+            return Err(ErrorCode::H3_INTERNAL_ERROR);
         }
         let mut bounded = Vec::new();
         let mut size = 0usize;
@@ -97,7 +97,7 @@ impl State {
                 .and_then(|v| v.checked_add(field.value.len()))
                 .and_then(|v| v.checked_add(32))
                 .filter(|&v| v as u64 <= self.max_field_section_size)
-                .ok_or(Error::H3_EXCESSIVE_LOAD)?;
+                .ok_or(ErrorCode::H3_EXCESSIVE_LOAD)?;
             field.never_index |= should_never_index(&field.name);
             bounded.push(field);
         }
@@ -106,7 +106,7 @@ impl State {
             Ok(permit) => Some(permit),
             Err(mpsc::error::TrySendError::Full(_)) => None,
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err(Error::H3_CLOSED_CRITICAL_STREAM);
+                return Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM);
             }
         };
         let original_table = self.table.clone();
@@ -249,7 +249,7 @@ impl State {
             wire.put_field_line(&line)?;
         }
         if wire.len() > MAX_BUFFERED_FRAME_PAYLOAD {
-            return Err(Error::H3_EXCESSIVE_LOAD);
+            return Err(ErrorCode::H3_EXCESSIVE_LOAD);
         }
         if required_insert_count != 0 {
             self.unacked_sections_by_stream
@@ -270,8 +270,8 @@ impl State {
             .clone()
             .try_reserve_owned()
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => Error::H3_EXCESSIVE_LOAD,
-                mpsc::error::TrySendError::Closed(_) => Error::H3_CLOSED_CRITICAL_STREAM,
+                mpsc::error::TrySendError::Full(_) => ErrorCode::H3_EXCESSIVE_LOAD,
+                mpsc::error::TrySendError::Closed(_) => ErrorCode::H3_CLOSED_CRITICAL_STREAM,
             })?;
         let mut instructions = Vec::new();
         let queued = self.queue_update(instruction, &[], &mut instructions)?;
@@ -288,7 +288,7 @@ impl State {
         instructions: &mut Vec<(EncoderInstruction, u64)>,
     ) -> Result<bool> {
         if self.table.max_capacity() == 0 {
-            return Err(Error::QPACK_ENCODER_STREAM_ERROR);
+            return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR);
         }
         Vec::new().put_encoder_instruction(&instruction)?; // Validate wire limits before committing any table changes.
         // ponytail: preview on cloned table metadata; use an eviction plan if profiling warrants it.
@@ -315,10 +315,10 @@ impl State {
                 let sections = self
                     .unacked_sections_by_stream
                     .get_mut(&stream_id)
-                    .ok_or(Error::QPACK_DECODER_STREAM_ERROR)?;
-                let section = sections.front().ok_or(Error::QPACK_DECODER_STREAM_ERROR)?;
+                    .ok_or(ErrorCode::QPACK_DECODER_STREAM_ERROR)?;
+                let section = sections.front().ok_or(ErrorCode::QPACK_DECODER_STREAM_ERROR)?;
                 if section.required_insert_count > completed_insert_count {
-                    return Err(Error::QPACK_DECODER_STREAM_ERROR);
+                    return Err(ErrorCode::QPACK_DECODER_STREAM_ERROR);
                 }
                 self.known_received_count =
                     self.known_received_count.max(section.required_insert_count);
@@ -329,7 +329,7 @@ impl State {
             }
             DecoderInstruction::StreamCancellation(stream_id) => {
                 if stream_id > VARINT_MAX {
-                    return Err(Error::QPACK_DECODER_STREAM_ERROR);
+                    return Err(ErrorCode::QPACK_DECODER_STREAM_ERROR);
                 }
                 self.unacked_sections_by_stream.remove(&stream_id);
             }
@@ -338,7 +338,7 @@ impl State {
                     .known_received_count
                     .checked_add(increment)
                     .filter(|&count| increment != 0 && count <= completed_insert_count)
-                    .ok_or(Error::QPACK_DECODER_STREAM_ERROR)?;
+                    .ok_or(ErrorCode::QPACK_DECODER_STREAM_ERROR)?;
             }
         }
         Ok(())
@@ -531,7 +531,7 @@ mod tests {
         let mut encoder = Encoder::new(Settings::default(), sender).unwrap();
         assert_eq!(
             encoder.queue_instruction(EncoderInstruction::SetDynamicTableCapacity(0)),
-            Err(Error::QPACK_ENCODER_STREAM_ERROR)
+            Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR)
         );
         encoder
             .apply_peer_settings(Settings {
@@ -564,7 +564,7 @@ mod tests {
         ] {
             assert_eq!(
                 encoder.apply_peer_settings(peer),
-                Err(Error::H3_SETTINGS_ERROR)
+                Err(ErrorCode::H3_SETTINGS_ERROR)
             );
             assert_eq!(encoder.table.max_capacity(), 68);
             assert_eq!(encoder.table.insert_count(), 1);
@@ -594,7 +594,7 @@ mod tests {
         // Neither queueing nor handing instructions to the writer is a peer acknowledgement.
         assert_eq!(
             encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(0)),
-            Err(Error::QPACK_DECODER_STREAM_ERROR)
+            Err(ErrorCode::QPACK_DECODER_STREAM_ERROR)
         );
         assert_eq!(encoder.known_received_count, 0);
         updates(&mut encoder, &mut decoder, &mut receiver);
@@ -623,7 +623,7 @@ mod tests {
         ] {
             assert_eq!(
                 encoder.on_decoder_instruction(instruction),
-                Err(Error::QPACK_DECODER_STREAM_ERROR)
+                Err(ErrorCode::QPACK_DECODER_STREAM_ERROR)
             );
             assert_eq!(encoder.known_received_count, 2);
         }
@@ -730,7 +730,7 @@ mod tests {
         ] {
             assert_eq!(
                 encoder.queue_instruction(instruction),
-                Err(Error::QPACK_ENCODER_STREAM_ERROR)
+                Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR)
             );
             assert_eq!(receiver.len(), queued);
             assert_eq!(encoder.table.insert_count(), 2);
@@ -813,7 +813,7 @@ mod tests {
         drop(receiver);
         assert_eq!(
             encoder.encode(12, [field(b"z", b"c")]),
-            Err(Error::H3_CLOSED_CRITICAL_STREAM)
+            Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
         );
         assert_eq!(encoder.table.insert_count(), 1);
     }

@@ -8,7 +8,7 @@ use super::{
     EncodeSize, Frame, FrameType, GetFrameType, MAX_BUFFERED_FRAME_PAYLOAD, Write, WriteFrameType,
     varint::be_varint,
 };
-use crate::{Error, Result};
+use crate::{ErrorCode, Result};
 
 pub(crate) const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u32 = 0x01;
 pub(crate) const SETTINGS_MAX_FIELD_SECTION_SIZE: u32 = 0x06;
@@ -32,25 +32,25 @@ pub(crate) async fn be_setting_frame<T: AsyncRead + Unpin + ?Sized>(
     length: VarInt,
 ) -> Result<Frame<Settings>> {
     if length.into_u64() > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
-        return Err(Error::H3_EXCESSIVE_LOAD);
+        return Err(ErrorCode::H3_EXCESSIVE_LOAD);
     }
     let mut payload = reader.take(length.into_u64());
     let mut values = HashMap::new();
     while payload.limit() != 0 {
         let id = be_varint(&mut payload)
             .await?
-            .ok_or(Error::H3_FRAME_ERROR)?;
+            .ok_or(ErrorCode::H3_FRAME_ERROR)?;
         let value = be_varint(&mut payload)
             .await?
-            .ok_or(Error::H3_FRAME_ERROR)?;
+            .ok_or(ErrorCode::H3_FRAME_ERROR)?;
         if matches!(id.into_u64(), 0x02..=0x05) || (id.into_u64() == 0x08 && value.into_u64() > 1) {
-            return Err(Error::H3_SETTINGS_ERROR);
+            return Err(ErrorCode::H3_SETTINGS_ERROR);
         }
         match values.entry(id) {
             Entry::Vacant(entry) => {
                 entry.insert(value);
             }
-            Entry::Occupied(_) => return Err(Error::H3_SETTINGS_ERROR),
+            Entry::Occupied(_) => return Err(ErrorCode::H3_SETTINGS_ERROR),
         }
     }
     Ok(Frame {
@@ -119,7 +119,7 @@ mod tests {
         for id in 2..=5 {
             assert_eq!(
                 be_setting_frame(&mut &[id, 0][..], VarInt::from_u32(2)).await,
-                Err(Error::H3_SETTINGS_ERROR)
+                Err(ErrorCode::H3_SETTINGS_ERROR)
             );
         }
     }

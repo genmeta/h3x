@@ -5,7 +5,7 @@ use qrecovery::recv::StopSending;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{self as frame, Frame, FrameType, H3Frame, Write as _};
-use crate::{Error, Result};
+use crate::{ErrorCode, Result};
 
 /// Frames permitted on the HTTP/3 control stream (RFC 9114 section 7.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,7 +55,7 @@ pub(crate) async fn be_stream_type<R: AsyncRead + StopSending + Unpin + ?Sized>(
         Ok(Some(ty)) => match StreamType::try_from(ty) {
             Ok(ty) => Ok(Some(ty)),
             Err(_) => {
-                recv.stop(Error::H3_STREAM_CREATION_ERROR.as_u64());
+                recv.stop(ErrorCode::H3_STREAM_CREATION_ERROR.as_u64());
                 Ok(None)
             }
         },
@@ -67,7 +67,7 @@ pub(crate) async fn be_stream_type<R: AsyncRead + StopSending + Unpin + ?Sized>(
         {
             Ok(None)
         }
-        Err(error) => Err(Error::from(error)),
+        Err(error) => Err(ErrorCode::from(error)),
     }
 }
 
@@ -96,30 +96,30 @@ impl<B: BufMut> WriteControl for B {
 pub(crate) async fn be_control<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Control> {
     let ty = frame::be_varint(recv)
         .await
-        .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?
-        .ok_or(Error::H3_CLOSED_CRITICAL_STREAM)?;
+        .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?
+        .ok_or(ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
     let known = match ty.into_u64() {
         4 => Some(FrameType::Settings),
         3 => Some(FrameType::CancelPush),
         7 => Some(FrameType::Goaway),
         13 => Some(FrameType::MaxPushId),
-        0..=9 => return Err(Error::H3_FRAME_UNEXPECTED),
+        0..=9 => return Err(ErrorCode::H3_FRAME_UNEXPECTED),
         _ => None,
     };
     let length = frame::be_varint(recv)
         .await
-        .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?
-        .ok_or(Error::H3_CLOSED_CRITICAL_STREAM)?;
+        .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?
+        .ok_or(ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
     let Some(known) = known else {
         return Ok(Control::Unknown { ty, length });
     };
     if length.into_u64() > frame::MAX_BUFFERED_FRAME_PAYLOAD as u64 {
-        return Err(Error::H3_EXCESSIVE_LOAD);
+        return Err(ErrorCode::H3_EXCESSIVE_LOAD);
     }
     let mut payload = vec![0; length.into_u64() as usize];
     recv.read_exact(&mut payload)
         .await
-        .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+        .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
     Ok(
         match frame::be_frame_payload(&mut payload.as_slice(), known, length).await? {
             H3Frame::Settings(frame) => Control::Settings(frame),
@@ -162,7 +162,7 @@ mod tests {
         assert_eq!(be_stream_type(&mut unknown).await.unwrap(), None);
         assert_eq!(
             unknown.stopped,
-            Some(Error::H3_STREAM_CREATION_ERROR.as_u64())
+            Some(ErrorCode::H3_STREAM_CREATION_ERROR.as_u64())
         );
         assert_eq!(unknown.input, &[0xff]);
         for input in [&[][..], &[0x40][..], &[0xc0, 0][..]] {
@@ -218,20 +218,20 @@ mod tests {
         for partial in [&[][..], &[0x40][..], &[0xc0, 0, 0][..]] {
             assert_eq!(
                 be_control(&mut &partial[..]).await,
-                Err(Error::H3_CLOSED_CRITICAL_STREAM)
+                Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
             );
         }
         assert_eq!(
             be_control(&mut &[4, 0x40][..]).await,
-            Err(Error::H3_CLOSED_CRITICAL_STREAM)
+            Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
         );
         assert_eq!(
             be_control(&mut &[4, 1, 1][..]).await,
-            Err(Error::H3_FRAME_ERROR)
+            Err(ErrorCode::H3_FRAME_ERROR)
         );
         assert_eq!(
             be_control(&mut &[4, 2, 1][..]).await,
-            Err(Error::H3_CLOSED_CRITICAL_STREAM)
+            Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
         );
     }
 
@@ -241,7 +241,7 @@ mod tests {
         for ty in [0, 1, 2, 5, 6, 8, 9] {
             assert_eq!(
                 be_control(&mut &[ty, 0][..]).await,
-                Err(Error::H3_FRAME_UNEXPECTED)
+                Err(ErrorCode::H3_FRAME_UNEXPECTED)
             );
         }
         for ty in [3, 7, 13] {

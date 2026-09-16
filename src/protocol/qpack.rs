@@ -6,7 +6,7 @@ use bytes::Bytes;
 use qbase::varint::VARINT_MAX;
 
 use super::frame;
-use crate::{Error, Result};
+use crate::{ErrorCode, Result};
 
 mod codec;
 pub(super) mod decoder;
@@ -94,11 +94,11 @@ impl Qpack {
     }
 
     #[cfg(test)]
-    pub(crate) fn error(&self) -> Option<Error> {
+    pub(crate) fn error(&self) -> Option<ErrorCode> {
         self.encoder.error()
     }
 
-    pub(crate) fn close(&self, error: Error) -> Error {
+    pub(crate) fn close(&self, error: ErrorCode) -> ErrorCode {
         let error = self.encoder.close(error);
         self.decoder.close(error);
         error

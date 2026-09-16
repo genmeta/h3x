@@ -6,10 +6,14 @@ use crate::{
 };
 
 pub(crate) mod body;
+pub(crate) mod headers;
 pub mod message;
 pub(crate) mod request;
 pub(crate) mod response;
 pub mod wnd_buf;
+
+pub enum Read {}
+pub enum Write {}
 
 /// Body storage and direction are independent: IO is Read or Write.
 pub enum Body<IO> {
@@ -59,9 +63,6 @@ impl Body<Read> {
         }
     }
 }
-
-pub enum Read {}
-pub enum Write {}
 
 pub enum Request<IO> {
     Bytes(request::Request<IO, Bytes>),
@@ -118,10 +119,22 @@ impl WriteRequest for Request<Write> {
     fn header(self, key: http::HeaderName, value: http::HeaderValue) -> Self {
         match &self {
             Self::Bytes(request) => {
-                request.message.0.lock().unwrap().set_header(key, value);
+                request
+                    .message
+                    .head
+                    .lock()
+                    .unwrap()
+                    .headers
+                    .insert(key, value);
             }
             Self::Streaming(request) => {
-                request.message.0.lock().unwrap().set_header(key, value);
+                request
+                    .message
+                    .head
+                    .lock()
+                    .unwrap()
+                    .headers
+                    .insert(key, value);
             }
         }
         self
@@ -268,10 +281,11 @@ mod tests {
             assert_eq!(
                 streaming
                     .message
-                    .0
+                    .head
                     .lock()
                     .unwrap()
-                    .header(&header::CONTENT_TYPE)
+                    .headers
+                    .get(&header::CONTENT_TYPE)
                     .unwrap(),
                 "text/html"
             );
@@ -306,7 +320,7 @@ mod tests {
             HeaderValue::from_static("text/plain"),
         );
         assert_eq!(
-            message::Message::header(&request.message.0.lock().unwrap(), &header::ACCEPT).unwrap(),
+            request.message.head.lock().unwrap().headers[header::ACCEPT],
             "text/plain"
         );
     }

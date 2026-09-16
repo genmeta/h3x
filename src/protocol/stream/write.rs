@@ -8,7 +8,7 @@ use std::{
 use tokio::io::AsyncWrite;
 
 use super::{StreamState, StreamStatus};
-use crate::Error;
+use crate::ErrorCode;
 
 /// Application-owned write direction, observed weakly by the connection.
 pub struct H3WriteStream<W> {
@@ -24,7 +24,7 @@ impl<W> H3WriteStream<W> {
         }
     }
 
-    pub(crate) fn cancel_with_error(&self, error: Error) {
+    pub(crate) fn cancel_with_error(&self, error: ErrorCode) {
         let wakers = self.state.lock().unwrap().close(error, |_| {});
         for waker in wakers.into_iter().flatten() {
             waker.wake();
@@ -42,7 +42,7 @@ impl<W: qrecovery::send::CancelStream> qrecovery::send::CancelStream for &H3Writ
             .state
             .lock()
             .unwrap()
-            .close(Error::H3_REQUEST_CANCELLED, |io| io.cancel(error_code));
+            .close(ErrorCode::H3_REQUEST_CANCELLED, |io| io.cancel(error_code));
         for waker in wakers.into_iter().flatten() {
             waker.wake();
         }
@@ -109,7 +109,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for H3WriteStream<W> {
 
 impl<W> Drop for H3WriteStream<W> {
     fn drop(&mut self) {
-        self.cancel_with_error(Error::H3_REQUEST_CANCELLED);
+        self.cancel_with_error(ErrorCode::H3_REQUEST_CANCELLED);
     }
 }
 
@@ -124,7 +124,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{Error, protocol::stream::H3ReadStream};
+    use crate::{ErrorCode, protocol::stream::H3ReadStream};
     #[derive(Default)]
     struct Wakes(AtomicUsize);
 
@@ -149,20 +149,20 @@ mod tests {
                 .poll_read(&mut cx, &mut buf)
                 .is_pending()
         );
-        recv.close(Error::H3_REQUEST_REJECTED);
+        recv.close(ErrorCode::H3_REQUEST_REJECTED);
         assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
         assert!(
-            matches!(Pin::new(&mut recv).poll_read(&mut cx,&mut buf),Poll::Ready(Err(e)) if e.get_ref().and_then(|e|e.downcast_ref::<Error>())==Some(&Error::H3_REQUEST_REJECTED))
+            matches!(Pin::new(&mut recv).poll_read(&mut cx,&mut buf),Poll::Ready(Err(e)) if e.get_ref().and_then(|e|e.downcast_ref::<ErrorCode>())==Some(&ErrorCode::H3_REQUEST_REJECTED))
         );
         let mut send = H3WriteStream::new(4, tokio::io::sink());
-        send.cancel_with_error(Error::H3_REQUEST_REJECTED);
+        send.cancel_with_error(ErrorCode::H3_REQUEST_REJECTED);
         for result in [
             Pin::new(&mut send).poll_write(&mut cx, b"x").map_ok(|_| ()),
             Pin::new(&mut send).poll_flush(&mut cx),
             Pin::new(&mut send).poll_shutdown(&mut cx),
         ] {
             assert!(
-                matches!(result,Poll::Ready(Err(e)) if e.get_ref().and_then(|e|e.downcast_ref::<Error>())==Some(&Error::H3_REQUEST_REJECTED))
+                matches!(result,Poll::Ready(Err(e)) if e.get_ref().and_then(|e|e.downcast_ref::<ErrorCode>())==Some(&ErrorCode::H3_REQUEST_REJECTED))
             );
         }
     }
@@ -208,14 +208,14 @@ mod tests {
                     .is_pending()
                 );
             }
-            send.cancel_with_error(Error::H3_REQUEST_REJECTED);
+            send.cancel_with_error(ErrorCode::H3_REQUEST_REJECTED);
             assert_eq!(old.0.load(Ordering::SeqCst), 0);
             assert_eq!(latest.0.load(Ordering::SeqCst), 1);
             let Poll::Ready(Err(error)) = poll(&mut send, &mut Context::from_waker(Waker::noop()))
             else {
                 panic!()
             };
-            assert_eq!(Error::from(error), Error::H3_REQUEST_REJECTED);
+            assert_eq!(ErrorCode::from(error), ErrorCode::H3_REQUEST_REJECTED);
         }
     }
 
@@ -232,10 +232,10 @@ mod tests {
             recv.state.lock().unwrap().status,
             StreamStatus::Idle(_)
         ));
-        recv.close(Error::H3_REQUEST_REJECTED);
+        recv.close(ErrorCode::H3_REQUEST_REJECTED);
         assert!(matches!(
             recv.state.lock().unwrap().status,
-            StreamStatus::Closed(Error::H3_REQUEST_REJECTED)
+            StreamStatus::Closed(ErrorCode::H3_REQUEST_REJECTED)
         ));
         assert_eq!(recv.stream_id(), 4);
         let mut send = H3WriteStream::new(4, Vec::new());
@@ -252,7 +252,7 @@ mod tests {
             send.state.lock().unwrap().status,
             StreamStatus::Finished
         ));
-        send.cancel_with_error(Error::H3_REQUEST_REJECTED);
+        send.cancel_with_error(ErrorCode::H3_REQUEST_REJECTED);
         assert!(matches!(
             send.state.lock().unwrap().status,
             StreamStatus::Finished

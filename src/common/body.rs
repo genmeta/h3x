@@ -6,13 +6,12 @@ use bytes::Bytes;
 use http::{Method, StatusCode};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-use super::{Read, Write};
+use super::{Read, Write, headers, headers::ResponseHead};
 use crate::{
-    ArcWndBuf, Error, Result, Transport,
+    ArcWndBuf, ErrorCode, Result, Transport,
     protocol::{
         connection::H3Connection,
         frame::{self, Data, Frame, H3Frame, Write as _, be_frame},
-        headers,
         qpack::Qpack,
         stream::H3ReadStream,
     },
@@ -75,7 +74,7 @@ impl Body<ArcWndBuf, Write> {
     }
 
     pub async fn reset(self) -> Result<()> {
-        self.storage.set_error(Error::H3_REQUEST_CANCELLED);
+        self.storage.set_error(ErrorCode::H3_REQUEST_CANCELLED);
         Ok(())
     }
 }
@@ -102,7 +101,7 @@ impl Body<ArcWndBuf, Read> {
         Ok(self.storage.read(bytes).await?)
     }
     pub async fn stop(self) {
-        self.storage.set_error(Error::H3_REQUEST_CANCELLED);
+        self.storage.set_error(ErrorCode::H3_REQUEST_CANCELLED);
     }
     pub async fn collect(mut self) -> Result<Bytes> {
         let mut bytes = Vec::new();
@@ -111,27 +110,17 @@ impl Body<ArcWndBuf, Read> {
     }
 }
 
-/// Receive buffered bytes to completion, or return a window driven by a receive task.
-pub(crate) async fn receive<RS, T>(
+/// Return a body window immediately and drive DATA, trailers, and FIN in the background.
+pub(crate) fn receive<RS, T>(
     mut rs: BufReader<H3ReadStream<RS>>,
     mode: BodyMode,
     connection: H3Connection<T>,
-) -> Result<super::Body<Read>>
+) -> Body<ArcWndBuf, Read>
 where
     RS: AsyncRead + Unpin + Send + 'static,
     T: Transport,
 {
     let stream_id = rs.get_ref().stream_id();
-    if !mode.streaming() {
-        let mut bytes = Vec::new();
-        if let Err(error) = read_body(&mut rs, &mut bytes, mode, connection.qpack()).await {
-            let _ = connection.qpack().cancel(stream_id);
-            connection.receive_error(error).await;
-            return Err(error);
-        }
-        return Ok(super::Body::Bytes(Body::from_storage(Bytes::from(bytes))));
-    }
-
     let mut buffer = ArcWndBuf::new(frame::MAX_DATA_CHUNK);
     let body = Body::from_storage(buffer.clone());
     let cancellation = buffer.clone();
@@ -148,7 +137,7 @@ where
         }
         // read_body validates FIN/trailers and marks buffer EOF on success.
     });
-    Ok(super::Body::Streaming(body))
+    body
 }
 
 /// Content rules resolved from the message headers and request/response semantics.
@@ -161,36 +150,19 @@ pub(crate) enum BodyMode {
 
 impl BodyMode {
     /// Resolve body rules from final response headers and the request method.
-    pub(crate) fn resolve(
-        response: &http::response::Parts,
-        method: Option<&Method>,
-    ) -> Result<Self> {
+    pub(crate) fn resolve(response: &ResponseHead, method: Option<&Method>) -> Result<Self> {
         let content_length = headers::content_length(&response.headers)?;
+        let status = response.status()?;
         if method == Some(&Method::HEAD) {
             return Ok(Self::Forbidden);
         }
-        if matches!(
-            response.status,
-            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
-        ) {
+        if matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED) {
             return Ok(Self::Forbidden);
         }
         Ok(match content_length {
             Some(content_length) => Self::Length { content_length },
             None => Self::Infinity,
         })
-    }
-
-    /// Whether to receive the body as Streaming; otherwise use Bytes.
-    /// Unknown lengths and lengths exceeding the buffering limit use Streaming.
-    pub(crate) fn streaming(self) -> bool {
-        match self {
-            Self::Forbidden => false,
-            Self::Infinity => true,
-            Self::Length { content_length } => {
-                content_length > frame::MAX_BUFFERED_FRAME_PAYLOAD as u64
-            }
-        }
     }
 
     pub(crate) fn content_length(self) -> Option<u64> {
@@ -220,11 +192,11 @@ pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         match be_frame(receive).await? {
             H3Frame::Data(frame) => {
                 if trailers || mode.is_forbidden() {
-                    return Err(Error::H3_FRAME_UNEXPECTED);
+                    return Err(ErrorCode::H3_FRAME_UNEXPECTED);
                 }
                 let mut count = frame.length.into_u64();
                 if let Some(left) = &mut remaining {
-                    *left = left.checked_sub(count).ok_or(Error::H3_MESSAGE_ERROR)?;
+                    *left = left.checked_sub(count).ok_or(ErrorCode::H3_MESSAGE_ERROR)?;
                 }
                 while count != 0 {
                     let chunk = count.min(buf.len() as u64) as usize;
@@ -235,27 +207,27 @@ pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             }
             H3Frame::Headers(frame) => {
                 if trailers || mode.is_forbidden() {
-                    return Err(Error::H3_FRAME_UNEXPECTED);
+                    return Err(ErrorCode::H3_FRAME_UNEXPECTED);
                 }
                 if remaining.is_some_and(|left| left != 0) {
-                    return Err(Error::H3_MESSAGE_ERROR);
+                    return Err(ErrorCode::H3_MESSAGE_ERROR);
                 }
                 let fields = qpack
                     .decode(receive.get_ref().stream_id(), frame.payload.field_section)
                     .await?;
-                headers::trailer_fields(fields)?;
+                headers::be_trailers(fields)?;
                 trailers = true;
             }
             H3Frame::Unknown { length, .. } => {
                 frame::skip_payload(receive, length.into_u64()).await?;
             }
             _ => {
-                return Err(Error::H3_FRAME_UNEXPECTED);
+                return Err(ErrorCode::H3_FRAME_UNEXPECTED);
             }
         }
     }
     if remaining.is_some_and(|left| left != 0) {
-        return Err(Error::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR);
     }
     destination.shutdown().await?;
     Ok(())
@@ -273,13 +245,13 @@ pub(crate) async fn write_streaming_body<R: AsyncRead + Unpin, W: AsyncWrite + U
         let count = source.read(&mut buf).await?;
         sent = sent
             .checked_add(count as u64)
-            .ok_or(Error::H3_MESSAGE_ERROR)?;
+            .ok_or(ErrorCode::H3_MESSAGE_ERROR)?;
         match mode {
-            BodyMode::Forbidden if count != 0 => return Err(Error::H3_MESSAGE_ERROR),
+            BodyMode::Forbidden if count != 0 => return Err(ErrorCode::H3_MESSAGE_ERROR),
             BodyMode::Length { content_length }
                 if sent > content_length || (count == 0 && sent != content_length) =>
             {
-                return Err(Error::H3_MESSAGE_ERROR);
+                return Err(ErrorCode::H3_MESSAGE_ERROR);
             }
             _ => {}
         }
@@ -356,10 +328,10 @@ mod tests {
             (&[][..], None, Ok(())),
             (&[][..], Some(0), Ok(())),
             (&[0x21, 0][..], Some(0), Ok(())),
-            (&[][..], Some(1), Err(Error::H3_MESSAGE_ERROR)),
-            (trailers.as_slice(), None, Err(Error::H3_FRAME_UNEXPECTED)),
-            (&[0, 0][..], None, Err(Error::H3_FRAME_UNEXPECTED)),
-            (&[0x21, 0, 0, 0][..], None, Err(Error::H3_FRAME_UNEXPECTED)),
+            (&[][..], Some(1), Err(ErrorCode::H3_MESSAGE_ERROR)),
+            (trailers.as_slice(), None, Err(ErrorCode::H3_FRAME_UNEXPECTED)),
+            (&[0, 0][..], None, Err(ErrorCode::H3_FRAME_UNEXPECTED)),
+            (&[0x21, 0, 0, 0][..], None, Err(ErrorCode::H3_FRAME_UNEXPECTED)),
         ] {
             let encoded = [trailers.as_slice(), suffix].concat();
             let mut input = encoded.as_slice();
@@ -389,7 +361,7 @@ mod tests {
                 crate::test_support::connection().qpack()
             )
             .await,
-            Err(Error::H3_FRAME_UNEXPECTED)
+            Err(ErrorCode::H3_FRAME_UNEXPECTED)
         );
     }
 }

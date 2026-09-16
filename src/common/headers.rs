@@ -1,18 +1,40 @@
 use std::str::from_utf8;
 
+use bytes::Bytes;
 use http::{
-    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
+    HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
     header::{CONNECTION, CONTENT_LENGTH, COOKIE, HOST, TE, TRANSFER_ENCODING, UPGRADE},
-    request::Parts as RequestParts,
-    response::Parts as ResponseParts,
     uri::Authority,
 };
 
-use super::qpack::Field;
-use crate::{Error, Result};
+use crate::{ErrorCode, Result, protocol::qpack::Field};
 
-fn message_error<T>(_: T) -> Error {
-    Error::H3_MESSAGE_ERROR
+/// Validated request metadata. HTTP/3 pseudo-headers are represented by their
+/// typed HTTP equivalents; `headers` contains ordinary fields only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RequestHead {
+    pub(crate) method: Method,
+    pub(crate) uri: Uri,
+    pub(crate) headers: HeaderMap,
+}
+
+/// Response metadata. `status` is unset only while an outgoing response is
+/// being built; decoded responses always contain `:status`. `headers` contains
+/// ordinary fields only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResponseHead {
+    pub(crate) status: Option<StatusCode>,
+    pub(crate) headers: HeaderMap,
+}
+
+impl ResponseHead {
+    pub(crate) fn status(&self) -> Result<StatusCode> {
+        self.status.ok_or(ErrorCode::H3_MESSAGE_ERROR)
+    }
+}
+
+fn message_error<T>(_: T) -> ErrorCode {
+    ErrorCode::H3_MESSAGE_ERROR
 }
 
 pub(crate) fn content_length(headers: &HeaderMap) -> Result<Option<u64>> {
@@ -21,16 +43,17 @@ pub(crate) fn content_length(headers: &HeaderMap) -> Result<Option<u64>> {
         return Ok(None);
     };
     if values.next().is_some() {
-        return Err(Error::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR);
     }
     let value = value.to_str().map_err(message_error)?;
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(Error::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR);
     }
     value.parse::<u64>().map(Some).map_err(message_error)
 }
 
-pub(crate) fn request_parts(fields: Vec<Field>) -> Result<RequestParts> {
+/// Parse and validate an HTTP/3 request field section.
+pub(crate) fn be_request(fields: Vec<Field>) -> Result<RequestHead> {
     let ParsedFields { pseudo, headers } = parse_fields(fields)?;
     if pseudo.iter().any(|field| {
         !matches!(
@@ -38,7 +61,7 @@ pub(crate) fn request_parts(fields: Vec<Field>) -> Result<RequestParts> {
             b":method" | b":scheme" | b":authority" | b":path"
         )
     }) {
-        return Err(Error::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR);
     }
 
     let method =
@@ -48,38 +71,84 @@ pub(crate) fn request_parts(fields: Vec<Field>) -> Result<RequestParts> {
     let path = pseudo_value(&pseudo, b":path");
     let authority = validate_request_pseudo(&method, scheme, authority, path, &headers)?;
 
-    let mut request = Request::builder()
-        .method(method.clone())
-        .uri(build_request_uri(&method, scheme, authority, path)?)
-        .version(Version::HTTP_3)
-        .body(())
-        .map_err(message_error)?;
-    *request.headers_mut() = headers;
-    Ok(request.into_parts().0)
+    Ok(RequestHead {
+        uri: build_request_uri(&method, scheme, authority, path)?,
+        method,
+        headers,
+    })
 }
 
-pub(crate) fn response_parts(fields: Vec<Field>) -> Result<ResponseParts> {
+/// Parse and validate an HTTP/3 response field section.
+pub(crate) fn be_response(fields: Vec<Field>) -> Result<ResponseHead> {
     let ParsedFields { pseudo, headers } = parse_fields(fields)?;
     if pseudo.len() != 1 {
-        return Err(Error::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR);
     }
     let status =
         StatusCode::from_bytes(required_pseudo(&pseudo, b":status")?).map_err(message_error)?;
-    let mut response = Response::builder()
-        .status(status)
-        .version(Version::HTTP_3)
-        .body(())
-        .map_err(message_error)?;
-    *response.headers_mut() = headers;
-    Ok(response.into_parts().0)
+    Ok(ResponseHead {
+        status: Some(status),
+        headers,
+    })
 }
 
-pub(crate) fn trailer_fields(fields: Vec<Field>) -> Result<HeaderMap> {
+/// Parse and validate an HTTP/3 trailer field section.
+pub(crate) fn be_trailers(fields: Vec<Field>) -> Result<HeaderMap> {
     let ParsedFields { pseudo, headers } = parse_fields(fields)?;
     if !pseudo.is_empty() {
-        return Err(Error::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR);
     }
     Ok(headers)
+}
+
+/// Write typed HTTP metadata as QPACK input fields.
+pub(crate) trait Write {
+    /// Write one complete request field section into an empty field vector.
+    fn put_request(&mut self, head: &RequestHead) -> Result<()>;
+
+    /// Write one complete response field section into an empty field vector.
+    fn put_response(&mut self, head: &ResponseHead) -> Result<()>;
+}
+
+impl Write for Vec<Field> {
+    fn put_request(&mut self, head: &RequestHead) -> Result<()> {
+        require_empty(self)?;
+        validate_regular_headers(&head.headers)?;
+        let RequestPseudo {
+            scheme,
+            authority,
+            path,
+        } = request_pseudo(head)?;
+
+        self.reserve(4 + head.headers.len());
+        self.push(pseudo_field(b":method", head.method.as_str().as_bytes()));
+        if let Some(scheme) = scheme {
+            self.push(pseudo_field(b":scheme", scheme));
+        }
+        self.push(pseudo_field(b":authority", authority));
+        if let Some(path) = path {
+            self.push(pseudo_field(b":path", path));
+        }
+        put_regular_headers(self, &head.headers);
+        Ok(())
+    }
+
+    fn put_response(&mut self, head: &ResponseHead) -> Result<()> {
+        require_empty(self)?;
+        validate_regular_headers(&head.headers)?;
+        self.reserve(1 + head.headers.len());
+        self.push(pseudo_field(b":status", head.status()?.as_str().as_bytes()));
+        put_regular_headers(self, &head.headers);
+        Ok(())
+    }
+}
+
+fn require_empty(fields: &[Field]) -> Result<()> {
+    if fields.is_empty() {
+        Ok(())
+    } else {
+        Err(ErrorCode::H3_MESSAGE_ERROR)
+    }
 }
 
 struct ParsedFields {
@@ -95,13 +164,13 @@ fn parse_fields(fields: Vec<Field>) -> Result<ParsedFields> {
     for field in fields {
         if field.name.starts_with(b":") {
             if regular_seen {
-                return Err(Error::H3_MESSAGE_ERROR);
+                return Err(ErrorCode::H3_MESSAGE_ERROR);
             }
             if pseudo
                 .iter()
                 .any(|existing: &Field| existing.name == field.name)
             {
-                return Err(Error::H3_MESSAGE_ERROR);
+                return Err(ErrorCode::H3_MESSAGE_ERROR);
             }
             pseudo.push(field);
             continue;
@@ -137,12 +206,83 @@ fn validate_regular_field(name: &HeaderName, value: &HeaderValue) -> Result<()> 
     if matches!(name, &CONNECTION | &TRANSFER_ENCODING | &UPGRADE)
         || matches!(name.as_str(), "proxy-connection" | "keep-alive")
     {
-        return Err(Error::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR);
     }
     if name == TE && !value.as_bytes().eq_ignore_ascii_case(b"trailers") {
-        return Err(Error::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR);
     }
     Ok(())
+}
+
+fn validate_regular_headers(headers: &HeaderMap) -> Result<()> {
+    for (name, value) in headers {
+        validate_regular_field(name, value)?;
+    }
+    Ok(())
+}
+
+struct RequestPseudo<'a> {
+    scheme: Option<&'a [u8]>,
+    authority: &'a [u8],
+    path: Option<&'a [u8]>,
+}
+
+fn request_pseudo(head: &RequestHead) -> Result<RequestPseudo<'_>> {
+    let scheme = head.uri.scheme_str().map(str::as_bytes);
+    let authority = head.uri.authority().ok_or(ErrorCode::H3_MESSAGE_ERROR)?;
+    let authority = authority.as_str().as_bytes();
+    let path = head
+        .uri
+        .path_and_query()
+        .map(|value| value.as_str().as_bytes());
+
+    if head.method == Method::CONNECT {
+        if scheme.is_some() || path.is_some() {
+            return Err(ErrorCode::H3_MESSAGE_ERROR);
+        }
+        if head.uri.authority().unwrap().port().is_none() {
+            return Err(ErrorCode::H3_MESSAGE_ERROR);
+        }
+        return Ok(RequestPseudo {
+            scheme: None,
+            authority,
+            path: None,
+        });
+    }
+
+    let scheme = scheme.ok_or(ErrorCode::H3_MESSAGE_ERROR)?;
+    let path = path.ok_or(ErrorCode::H3_MESSAGE_ERROR)?;
+    if path.is_empty() || (path != b"*" && !path.starts_with(b"/")) {
+        return Err(ErrorCode::H3_MESSAGE_ERROR);
+    }
+    if head
+        .headers
+        .get(HOST)
+        .is_some_and(|host| host.as_bytes() != authority)
+    {
+        return Err(ErrorCode::H3_MESSAGE_ERROR);
+    }
+    Ok(RequestPseudo {
+        scheme: Some(scheme),
+        authority,
+        path: Some(path),
+    })
+}
+
+fn pseudo_field(name: &'static [u8], value: &[u8]) -> Field {
+    Field {
+        name: Bytes::from_static(name),
+        value: Bytes::copy_from_slice(value),
+        never_index: false,
+    }
+}
+
+fn put_regular_headers(fields: &mut Vec<Field>, headers: &HeaderMap) {
+    fields.extend(headers.iter().map(|(name, value)| Field {
+        name: Bytes::copy_from_slice(name.as_str().as_bytes()),
+        value: Bytes::copy_from_slice(value.as_bytes()),
+        never_index: value.is_sensitive(),
+    }));
 }
 
 fn validate_request_pseudo(
@@ -154,12 +294,12 @@ fn validate_request_pseudo(
 ) -> Result<Authority> {
     if method == Method::CONNECT {
         if scheme.is_some() || path.is_some() {
-            return Err(Error::H3_MESSAGE_ERROR);
+            return Err(ErrorCode::H3_MESSAGE_ERROR);
         }
         let authority = required_utf8(authority, ":authority")?;
         let authority: Authority = authority.parse().map_err(message_error)?;
         if authority.port().is_none() {
-            return Err(Error::H3_MESSAGE_ERROR);
+            return Err(ErrorCode::H3_MESSAGE_ERROR);
         }
         return Ok(authority);
     }
@@ -167,13 +307,13 @@ fn validate_request_pseudo(
     required_utf8(scheme, ":scheme")?;
     let path = required_bytes(path, ":path")?;
     if path.is_empty() || (path != b"*" && !path.starts_with(b"/")) {
-        return Err(Error::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR);
     }
     let host = headers.get(HOST).map(HeaderValue::as_bytes);
     if let (Some(authority), Some(host)) = (authority, host)
         && authority != host
     {
-        return Err(Error::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR);
     }
     required_utf8(authority.or(host), ":authority")?
         .parse()
@@ -199,7 +339,7 @@ fn build_request_uri(
 }
 
 fn required_pseudo<'a>(pseudo: &'a [Field], name: &[u8]) -> Result<&'a [u8]> {
-    pseudo_value(pseudo, name).ok_or(Error::H3_MESSAGE_ERROR)
+    pseudo_value(pseudo, name).ok_or(ErrorCode::H3_MESSAGE_ERROR)
 }
 
 fn pseudo_value<'a>(pseudo: &'a [Field], name: &[u8]) -> Option<&'a [u8]> {
@@ -210,7 +350,7 @@ fn pseudo_value<'a>(pseudo: &'a [Field], name: &[u8]) -> Option<&'a [u8]> {
 }
 
 fn required_bytes<'a>(value: Option<&'a [u8]>, _: &str) -> Result<&'a [u8]> {
-    value.ok_or(Error::H3_MESSAGE_ERROR)
+    value.ok_or(ErrorCode::H3_MESSAGE_ERROR)
 }
 
 fn required_utf8<'a>(value: Option<&'a [u8]>, name: &str) -> Result<&'a str> {
@@ -219,8 +359,6 @@ fn required_utf8<'a>(value: Option<&'a [u8]>, name: &str) -> Result<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
-
     use super::*;
 
     fn field(name: &'static [u8], value: &'static [u8]) -> Field {
@@ -251,6 +389,90 @@ mod tests {
     }
 
     #[test]
+    fn typed_heads_round_trip_through_fields() {
+        let request = be_request(vec![
+            field(b":method", b"POST"),
+            field(b":scheme", b"https"),
+            field(b":authority", b"example.com"),
+            field(b":path", b"/upload?q=1"),
+            field(b"content-type", b"application/octet-stream"),
+        ])
+        .unwrap();
+        let mut request_fields = Vec::new();
+        request_fields.put_request(&request).unwrap();
+        assert_eq!(
+            request_fields
+                .iter()
+                .map(|field| field.name.as_ref())
+                .collect::<Vec<_>>(),
+            [
+                b":method".as_slice(),
+                b":scheme",
+                b":authority",
+                b":path",
+                b"content-type",
+            ]
+        );
+        assert_eq!(be_request(request_fields).unwrap(), request);
+
+        let mut sensitive = HeaderValue::from_static("session=secret");
+        sensitive.set_sensitive(true);
+        let mut response = ResponseHead {
+            status: Some(StatusCode::CREATED),
+            headers: HeaderMap::new(),
+        };
+        response.headers.append("set-cookie", sensitive);
+        let mut response_fields = Vec::new();
+        response_fields.put_response(&response).unwrap();
+        assert_eq!(response_fields[0].name, ":status");
+        assert!(response_fields[1].never_index);
+        assert_eq!(be_response(response_fields).unwrap(), response);
+    }
+
+    #[test]
+    fn put_rejects_invalid_typed_heads_without_partial_output() {
+        let mut request = RequestHead {
+            method: Method::GET,
+            uri: "/relative".parse().unwrap(),
+            headers: HeaderMap::new(),
+        };
+        let mut fields = Vec::new();
+        assert!(matches!(
+            fields.put_request(&request),
+            Err(ErrorCode::H3_MESSAGE_ERROR)
+        ));
+        assert!(fields.is_empty());
+
+        request.uri = "https://example.com/".parse().unwrap();
+        request
+            .headers
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+        assert!(matches!(
+            fields.put_request(&request),
+            Err(ErrorCode::H3_MESSAGE_ERROR)
+        ));
+        assert!(fields.is_empty());
+
+        let response = ResponseHead::default();
+        assert!(matches!(
+            fields.put_response(&response),
+            Err(ErrorCode::H3_MESSAGE_ERROR)
+        ));
+        assert!(fields.is_empty());
+
+        fields.push(field(b"x-existing", b"value"));
+        let response = ResponseHead {
+            status: Some(StatusCode::OK),
+            headers: HeaderMap::new(),
+        };
+        assert!(matches!(
+            fields.put_response(&response),
+            Err(ErrorCode::H3_MESSAGE_ERROR)
+        ));
+        assert_eq!(fields.len(), 1);
+    }
+
+    #[test]
     fn builds_request_uri_from_authority_or_host() {
         for scheme in [b"http".as_slice(), b"https"] {
             for value in [
@@ -263,7 +485,7 @@ mod tests {
                     (None, Some(value)),
                     (Some(value), Some(value)),
                 ] {
-                    let request = request_parts(request_fields(scheme, authority, host))
+                    let request = be_request(request_fields(scheme, authority, host))
                         .unwrap_or_else(|error| {
                             panic!("scheme={scheme:?}, authority={authority:?}, host={host:?}: {error:?}")
                         });
@@ -276,7 +498,6 @@ mod tests {
                         )
                     );
                     assert_eq!(request.method, Method::GET);
-                    assert_eq!(request.version, Version::HTTP_3);
                     assert_eq!(request.headers.get(HOST).map(HeaderValue::as_bytes), host);
                 }
             }
@@ -300,8 +521,8 @@ mod tests {
             ] {
                 assert!(
                     matches!(
-                        request_parts(request_fields(scheme, authority, host)),
-                        Err(Error::H3_MESSAGE_ERROR)
+                        be_request(request_fields(scheme, authority, host)),
+                        Err(ErrorCode::H3_MESSAGE_ERROR)
                     ),
                     "scheme={scheme:?}, authority={authority:?}, host={host:?}"
                 );
@@ -326,8 +547,8 @@ mod tests {
             ] {
                 assert!(
                     matches!(
-                        request_parts(request_fields(b"https", authority, host)),
-                        Err(Error::H3_MESSAGE_ERROR)
+                        be_request(request_fields(b"https", authority, host)),
+                        Err(ErrorCode::H3_MESSAGE_ERROR)
                     ),
                     "authority={authority:?}, host={host:?}"
                 );
@@ -337,7 +558,7 @@ mod tests {
 
     #[test]
     fn connect_requires_authority_with_port_without_host_fallback() {
-        let request = request_parts(vec![
+        let request = be_request(vec![
             field(b":method", b"CONNECT"),
             field(b":authority", b"example.com:443"),
         ])
@@ -356,10 +577,7 @@ mod tests {
                 field(b":authority", b"example.com"),
             ],
         ] {
-            assert!(matches!(
-                request_parts(fields),
-                Err(Error::H3_MESSAGE_ERROR)
-            ));
+            assert!(matches!(be_request(fields), Err(ErrorCode::H3_MESSAGE_ERROR)));
         }
     }
 
@@ -387,14 +605,14 @@ mod tests {
                 value: Bytes::from_static(b"/"),
             },
         ];
-        assert_eq!(request_parts(request).unwrap().uri, "https://example.com/");
-        let response = response_parts(vec![Field {
+        assert_eq!(be_request(request).unwrap().uri, "https://example.com/");
+        let response = be_response(vec![Field {
             never_index: false,
             name: Bytes::from_static(b":status"),
             value: Bytes::from_static(b"200"),
         }])
         .unwrap();
-        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.status().unwrap(), StatusCode::OK);
 
         let mut headers = HeaderMap::new();
         assert_eq!(content_length(&headers).unwrap(), None);
@@ -403,13 +621,13 @@ mod tests {
         headers.append(CONTENT_LENGTH, "5".parse().unwrap());
         assert!(matches!(
             content_length(&headers),
-            Err(Error::H3_MESSAGE_ERROR)
+            Err(ErrorCode::H3_MESSAGE_ERROR)
         ));
 
         for value in ["5, 5", "5, 6", "", "+5", "-5", "5x", "18446744073709551616"] {
             headers.insert(CONTENT_LENGTH, value.parse().unwrap());
             assert!(
-                matches!(content_length(&headers), Err(Error::H3_MESSAGE_ERROR)),
+                matches!(content_length(&headers), Err(ErrorCode::H3_MESSAGE_ERROR)),
                 "{value:?}"
             );
         }

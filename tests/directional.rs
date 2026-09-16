@@ -8,7 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use h3x::{
-    Body, Error, H3ReadStream, H3WriteStream, ReadRequest, ReadResponse, W, WndBuf, WriteRequest,
+    Body, ErrorCode, H3ReadStream, H3WriteStream, ReadRequest, ReadResponse, W, WndBuf, WriteRequest,
     WriteResponse, client, server,
 };
 use http::{Method, StatusCode, header};
@@ -199,7 +199,7 @@ async fn explicit_reset_wakes_producer_after_upload_is_dropped() {
     cancelling.reset().await.unwrap();
     assert_eq!(
         timeout(Duration::from_secs(1), blocked).await.unwrap(),
-        Err(Error::H3_REQUEST_CANCELLED)
+        Err(ErrorCode::H3_REQUEST_CANCELLED)
     );
     drop(receiving);
 }

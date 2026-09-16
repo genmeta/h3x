@@ -3,7 +3,7 @@ use bytes::{BufMut, Bytes};
 use qbase::varint::{VarInt, WriteVarInt};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::{Error, Result};
+use crate::{ErrorCode, Result};
 
 mod cancel_push;
 mod control;
@@ -45,7 +45,7 @@ pub(crate) enum FrameType {
 }
 
 impl TryFrom<u64> for FrameType {
-    type Error = Error;
+    type Error = ErrorCode;
 
     /// Unknown extension types are skippable; HTTP/2-only types are forbidden
     /// (RFC 9114 sections 7.2.8 and 9).
@@ -58,10 +58,10 @@ impl TryFrom<u64> for FrameType {
             0x05 => Ok(Self::PushPromise),
             0x07 => Ok(Self::Goaway),
             0x0d => Ok(Self::MaxPushId),
-            0x02 | 0x06 | 0x08 | 0x09 => Err(Error::H3_FRAME_UNEXPECTED),
+            0x02 | 0x06 | 0x08 | 0x09 => Err(ErrorCode::H3_FRAME_UNEXPECTED),
             _ => VarInt::try_from(value)
                 .map(Self::Unknown)
-                .map_err(|_| Error::H3_FRAME_ERROR),
+                .map_err(|_| ErrorCode::H3_FRAME_ERROR),
         }
     }
 }
@@ -76,7 +76,7 @@ pub(crate) struct Frame<P: GetFrameType + EncodeSize> {
 impl<P: GetFrameType + EncodeSize> Frame<P> {
     pub(crate) fn new(payload: P) -> Result<Self> {
         let length =
-            VarInt::try_from(payload.encoding_size()).map_err(|_| Error::H3_FRAME_ERROR)?;
+            VarInt::try_from(payload.encoding_size()).map_err(|_| ErrorCode::H3_FRAME_ERROR)?;
         Ok(Self { length, payload })
     }
 }
@@ -128,10 +128,10 @@ impl GetFrameType for H3Frame {
 pub(crate) async fn be_frame<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<H3Frame> {
     let ty: FrameType = be_varint(reader)
         .await?
-        .ok_or(Error::H3_FRAME_ERROR)?
+        .ok_or(ErrorCode::H3_FRAME_ERROR)?
         .into_u64()
         .try_into()?;
-    let length = be_varint(reader).await?.ok_or(Error::H3_FRAME_ERROR)?;
+    let length = be_varint(reader).await?.ok_or(ErrorCode::H3_FRAME_ERROR)?;
     be_frame_payload(reader, ty, length).await
 }
 
@@ -143,7 +143,7 @@ pub(crate) async fn skip_payload<T: AsyncRead + Unpin + ?Sized>(
     let mut payload = reader.take(length);
     tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
     if payload.limit() != 0 {
-        return Err(Error::H3_FRAME_ERROR);
+        return Err(ErrorCode::H3_FRAME_ERROR);
     }
     Ok(())
 }
@@ -158,7 +158,7 @@ pub(crate) async fn be_frame_payload<T: AsyncRead + Unpin + ?Sized>(
     let frame = match ty {
         FrameType::Data => H3Frame::Data(Frame {
             length,
-            payload: Data(usize::try_from(length.into_u64()).map_err(|_| Error::H3_FRAME_ERROR)?),
+            payload: Data(usize::try_from(length.into_u64()).map_err(|_| ErrorCode::H3_FRAME_ERROR)?),
         }),
         FrameType::Headers => H3Frame::Headers(headers::be_headers_frame(reader, length).await?),
         FrameType::CancelPush => {
@@ -187,7 +187,7 @@ pub(crate) trait EncodeSize {
 
 async fn read_payload<T: AsyncRead + Unpin + ?Sized>(reader: &mut T, length: u64) -> Result<Bytes> {
     if length > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
-        return Err(Error::H3_EXCESSIVE_LOAD);
+        return Err(ErrorCode::H3_EXCESSIVE_LOAD);
     }
     let mut payload = vec![0; length as usize];
     reader.read_exact(&mut payload).await?;
@@ -337,7 +337,7 @@ mod tests {
                 );
                 assert_eq!(
                     be_frame(&mut reader).await.unwrap_err(),
-                    Error::H3_FRAME_ERROR
+                    ErrorCode::H3_FRAME_ERROR
                 );
             }
         }
@@ -356,7 +356,7 @@ mod tests {
             // The caller checks EOF; be_frame itself still reports an error.
             assert_eq!(
                 be_frame(&mut input).await.unwrap_err(),
-                Error::H3_FRAME_ERROR
+                ErrorCode::H3_FRAME_ERROR
             );
         }
 
@@ -394,7 +394,7 @@ mod tests {
                         Ok(_) => panic!("expected truncated frame"),
                     }
                 };
-                assert_eq!(error, Error::H3_FRAME_ERROR, "{encoded:x?}");
+                assert_eq!(error, ErrorCode::H3_FRAME_ERROR, "{encoded:x?}");
             }
         }
     }
@@ -481,7 +481,7 @@ mod tests {
                 encoded.extend_from_slice(payload);
                 assert_eq!(
                     be_frame(&mut encoded.as_slice()).await.unwrap_err(),
-                    Error::H3_FRAME_ERROR
+                    ErrorCode::H3_FRAME_ERROR
                 );
             }
         }
@@ -490,18 +490,18 @@ mod tests {
             encoded.put_varint(&VarInt::try_from(MAX_BUFFERED_FRAME_PAYLOAD + 1).unwrap());
             assert_eq!(
                 be_frame(&mut encoded.as_slice()).await.unwrap_err(),
-                Error::H3_EXCESSIVE_LOAD
+                ErrorCode::H3_EXCESSIVE_LOAD
             );
         }
         for ty in [2, 6, 8, 9] {
             assert_eq!(
                 be_frame(&mut &[ty][..]).await.unwrap_err(),
-                Error::H3_FRAME_UNEXPECTED
+                ErrorCode::H3_FRAME_UNEXPECTED
             );
         }
         assert_eq!(
             be_frame(&mut &[5, 0][..]).await.unwrap_err(),
-            Error::H3_FRAME_ERROR
+            ErrorCode::H3_FRAME_ERROR
         );
     }
 }

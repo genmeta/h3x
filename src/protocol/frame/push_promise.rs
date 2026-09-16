@@ -6,7 +6,7 @@ use super::{
     EncodeSize, Frame, FrameType, GetFrameType, MAX_BUFFERED_FRAME_PAYLOAD, Write, WriteFrameType,
     read_payload, varint::be_varint,
 };
-use crate::{Error, Result};
+use crate::{ErrorCode, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PushPromise {
@@ -19,12 +19,12 @@ pub(crate) async fn be_push_promise_frame<T: AsyncRead + Unpin + ?Sized>(
     length: VarInt,
 ) -> Result<Frame<PushPromise>> {
     if length.into_u64() > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
-        return Err(Error::H3_EXCESSIVE_LOAD);
+        return Err(ErrorCode::H3_EXCESSIVE_LOAD);
     }
     let mut payload = reader.take(length.into_u64());
     let id = be_varint(&mut payload)
         .await?
-        .ok_or(Error::H3_FRAME_ERROR)?;
+        .ok_or(ErrorCode::H3_FRAME_ERROR)?;
     let remaining = payload.limit();
     let fields = read_payload(&mut payload, remaining).await?;
     Ok(Frame {

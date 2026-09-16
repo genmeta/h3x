@@ -10,7 +10,7 @@ pub use common::message::{
     ReadBody, ReadRequest, ReadResponse, ReadStream, WriteBody, WriteRequest, WriteResponse,
     WriteStream,
 };
-pub use error::{Error, Result};
+pub use error::{ErrorCode, Result};
 pub use protocol::{
     connection::{H3Connection, Settings},
     frame::Goaway,
@@ -28,10 +28,6 @@ extern crate self as h3x;
 #[path = "../tests/support/mod.rs"]
 mod test_support;
 
-/// Incoming body enum, containing a directional Bytes or WndBuf body.
-pub type IncomingBody = common::Body<R>;
-/// Outgoing body enum, containing a directional Bytes or WndBuf body.
-pub type OutgoingBody = common::Body<W>;
 /// Shared body storage, also available under its original ArcWndBuf name.
 pub use common::wnd_buf::ArcWndBuf;
 pub use common::{Read as R, Write as W, body::Body, wnd_buf::ArcWndBuf as WndBuf};

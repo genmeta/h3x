@@ -7,7 +7,7 @@ use qbase::{
     varint::VarInt,
 };
 
-use crate::{Error, Result, Role};
+use crate::{ErrorCode, Result, Role};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Cursor {
@@ -15,7 +15,7 @@ pub(super) enum Cursor {
     Max(StreamId),
     /// Frozen GOAWAY boundary; no more streams are admitted.
     Gone(StreamId),
-    Closed(Error),
+    Closed(ErrorCode),
 }
 
 pub(crate) struct StreamCursor {
@@ -61,7 +61,7 @@ impl StreamCursor {
     }
 
     /// Freeze both directions before the connection clears the stream registry.
-    pub(super) fn close(&self, error: Error) {
+    pub(super) fn close(&self, error: ErrorCode) {
         self.local.lock().unwrap().close(error);
         self.remote.lock().unwrap().close(error);
     }
@@ -70,29 +70,29 @@ impl StreamCursor {
         self.local_goaway
             .clone()
             .await
-            .map_err(|_| Error::H3_INTERNAL_ERROR)?
-            .ok_or(Error::H3_INTERNAL_ERROR)
+            .map_err(|_| ErrorCode::H3_INTERNAL_ERROR)?
+            .ok_or(ErrorCode::H3_INTERNAL_ERROR)
     }
 
     pub(crate) async fn peer_goaway(&self) -> Result<StreamId> {
         self.remote_goaway
             .clone()
             .await
-            .map_err(|_| Error::H3_INTERNAL_ERROR)?
-            .ok_or(Error::H3_INTERNAL_ERROR)
+            .map_err(|_| ErrorCode::H3_INTERNAL_ERROR)?
+            .ok_or(ErrorCode::H3_INTERNAL_ERROR)
     }
 }
 
 impl Cursor {
-    pub(super) fn check_admission(&self) -> Result<()> {
+    pub(super) fn not_goaway(&self) -> Result<()> {
         match self {
             Self::Max(_) => Ok(()),
-            Self::Gone(_) => Err(Error::H3_REQUEST_REJECTED),
+            Self::Gone(_) => Err(ErrorCode::H3_REQUEST_REJECTED),
             Self::Closed(error) => Err(*error),
         }
     }
 
-    fn close(&mut self, error: Error) {
+    fn close(&mut self, error: ErrorCode) {
         if !matches!(self, Self::Closed(_)) {
             *self = Self::Closed(error);
         }
@@ -102,17 +102,17 @@ impl Cursor {
         match self {
             Self::Max(boundary) => {
                 if id.role() != boundary.role() || id.dir() != Dir::Bi {
-                    return Err(Error::H3_ID_ERROR);
+                    return Err(ErrorCode::H3_ID_ERROR);
                 }
                 if id >= *boundary {
                     // A GOAWAY boundary must still fit in a QUIC variable integer.
                     let next =
-                        VarInt::try_from(u64::from(id) + 4).map_err(|_| Error::H3_ID_ERROR)?;
+                        VarInt::try_from(u64::from(id) + 4).map_err(|_| ErrorCode::H3_ID_ERROR)?;
                     *boundary = StreamId::from(next);
                 }
                 Ok(())
             }
-            Self::Gone(_) => Err(Error::H3_REQUEST_REJECTED),
+            Self::Gone(_) => Err(ErrorCode::H3_REQUEST_REJECTED),
             Self::Closed(error) => Err(*error),
         }
     }

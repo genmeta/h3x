@@ -6,14 +6,15 @@ use super::{
     qpack::Qpack,
     stream::{H3ReadStream, H3WriteStream, bi::BiStreams},
 };
-use crate::{Error, Result, Transport};
+use crate::{ErrorCode, Result, Transport};
 
 mod control;
 mod settings;
 mod stream_cursor;
-
 pub use settings::Settings;
 pub(crate) use stream_cursor::StreamCursor;
+
+use crate::ErrorCode::H3_NO_ERROR;
 
 /// An HTTP/3 connection whose control and QPACK streams are driven automatically.
 /// Construct inside a Tokio runtime. Tasks run until the transport terminates.
@@ -27,12 +28,15 @@ pub struct H3Connection<T: Transport> {
 }
 
 impl<T: Transport> H3Connection<T> {
-    /// Start HTTP/3 using the supplied settings and the transport's endpoint role.
-    /// Panics if called outside a Tokio runtime.
     pub fn new(transport: T, settings: Settings) -> Result<Self> {
         let transport = Arc::new(transport);
         let settings = Arc::new(settings);
         let bi = Arc::new(BiStreams::new());
+        // 在这里创建 tx,rx
+        // qpack.encoder.on_instrction(|tx| (instrction){
+        //      tx.send(instrction)
+        // })
+        //  tokio::spawn(sync_qpack_encoder(transport,rx));
         let (qpack, instruction, feedback) = Qpack::new(&settings)?;
         let cursor = Arc::new(StreamCursor::new(transport.role()));
         let connection = Self {
@@ -42,10 +46,10 @@ impl<T: Transport> H3Connection<T> {
             cursor,
             bi_streams: bi,
         };
-        tokio::spawn(connection.clone().send_qpack_encoder(instruction));
-        tokio::spawn(connection.clone().send_qpack_decoder(feedback));
-        tokio::spawn(connection.clone().send_uni());
-        tokio::spawn(connection.clone().accept_uni());
+        tokio::spawn(connection.clone().sync_qpack_encoder(instruction));
+        tokio::spawn(connection.clone().sync_qpack_decoder(feedback));
+        tokio::spawn(connection.clone().sync_settings_and_goaway());
+        tokio::spawn(connection.clone().accept_and_process_uni());
         Ok(connection)
     }
 
@@ -62,19 +66,12 @@ impl<T: Transport> H3Connection<T> {
         H3WriteStream<T::StreamWriter>,
         H3ReadStream<T::StreamReader>,
     )> {
-        self.cursor.remote.lock().unwrap().check_admission()?;
-        let (id, (mut recv, mut send)) = self
+        self.cursor.remote.lock().unwrap().not_goaway()?;
+        let (id, (recv, send)) = self
             .transport
             .open_bi()
             .await?
-            .ok_or(Error::H3_STREAM_CREATION_ERROR)?;
-        let state = self.cursor.remote.lock().unwrap();
-        if let Err(error) = state.check_admission() {
-            drop(state);
-            recv.stop(Error::H3_REQUEST_REJECTED.as_u64());
-            send.cancel(Error::H3_REQUEST_REJECTED.as_u64());
-            return Err(error);
-        }
+            .ok_or(ErrorCode::H3_STREAM_CREATION_ERROR)?;
         self.bi_streams.insert(id, recv, send)
     }
 
@@ -84,10 +81,8 @@ impl<T: Transport> H3Connection<T> {
     /// Cancelling this wait does not cancel the triggered drain.
     pub async fn goaway(self) -> Result<()> {
         self.cursor.goaway()?;
-        match self.transport.terminated().await {
-            Error::H3_NO_ERROR => Ok(()),
-            error => Err(error),
-        }
+        self.transport.close("".to_string(), H3_NO_ERROR.as_u64())?;
+        Ok(())
     }
 }
 
@@ -101,16 +96,13 @@ impl<T: Transport> H3Connection<T> {
         H3WriteStream<T::StreamWriter>,
         H3ReadStream<T::StreamReader>,
     )> {
-        self.cursor.local.lock().unwrap().check_admission()?;
         let (id, (mut read, mut write)) = self.transport.accept_bi().await?;
-        let mut state = self.cursor.local.lock().unwrap();
         let stream_id = qbase::varint::VarInt::try_from(id)
             .map(qbase::sid::StreamId::from)
-            .map_err(|_| Error::H3_ID_ERROR);
-        if let Err(error) = stream_id.and_then(|id| state.accept(id)) {
-            drop(state);
-            read.stop(Error::H3_REQUEST_REJECTED.as_u64());
-            write.cancel(Error::H3_REQUEST_REJECTED.as_u64());
+            .map_err(|_| ErrorCode::H3_ID_ERROR);
+        if let Err(error) = stream_id.and_then(|id| self.cursor.local.lock().unwrap().accept(id)) {
+            read.stop(ErrorCode::H3_REQUEST_REJECTED.as_u64());
+            write.cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64());
             return Err(error);
         }
         // Keep admission and registration atomic with respect to local GOAWAY.

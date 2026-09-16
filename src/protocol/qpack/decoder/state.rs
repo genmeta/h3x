@@ -15,7 +15,7 @@ use super::super::{
     },
     table::DynamicTable,
 };
-use crate::{Error, Result, protocol::frame::MAX_BUFFERED_FRAME_PAYLOAD};
+use crate::{ErrorCode, Result, protocol::frame::MAX_BUFFERED_FRAME_PAYLOAD};
 
 pub(super) struct State {
     table: DynamicTable,
@@ -36,7 +36,7 @@ impl State {
         sender: mpsc::Sender<DecoderInstruction>,
     ) -> Result<Self> {
         if local.blocked_streams > VARINT_MAX {
-            return Err(Error::H3_SETTINGS_ERROR);
+            return Err(ErrorCode::H3_SETTINGS_ERROR);
         }
         Ok(Self {
             table: DynamicTable::new(local.max_table_capacity)?,
@@ -55,7 +55,7 @@ impl State {
         payload: &'a [u8],
     ) -> Result<(&'a [u8], FieldSectionPrefix)> {
         if payload.len() > MAX_BUFFERED_FRAME_PAYLOAD {
-            return Err(Error::H3_EXCESSIVE_LOAD);
+            return Err(ErrorCode::H3_EXCESSIVE_LOAD);
         }
         let (bytes, prefix) = be_field_section_prefix(
             payload,
@@ -63,7 +63,7 @@ impl State {
             self.table.insert_count(),
         )?;
         if prefix.required_insert_count != 0 && bytes.is_empty() {
-            return Err(Error::QPACK_DECOMPRESSION_FAILED);
+            return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED);
         }
         Ok((bytes, prefix))
     }
@@ -90,10 +90,10 @@ impl State {
 
         // Admit a newly blocked section within the advertised and local budgets.
         if self.waiting.len() as u64 >= self.max_blocked_streams {
-            return Poll::Ready(Err(Error::QPACK_DECOMPRESSION_FAILED));
+            return Poll::Ready(Err(ErrorCode::QPACK_DECOMPRESSION_FAILED));
         }
         if bytes.len() > self.max_blocked_bytes - self.blocked_bytes {
-            return Poll::Ready(Err(Error::H3_EXCESSIVE_LOAD));
+            return Poll::Ready(Err(ErrorCode::H3_EXCESSIVE_LOAD));
         }
         self.waiting.insert(
             id,
@@ -112,7 +112,7 @@ impl State {
         instruction: EncoderInstruction,
     ) -> Result<Vec<Waker>> {
         if self.table.max_capacity() == 0 {
-            return Err(Error::QPACK_ENCODER_STREAM_ERROR);
+            return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR);
         }
         let previous_count = self.table.insert_count();
         self.table.apply(instruction)?;
@@ -139,7 +139,7 @@ impl State {
 
     pub(super) fn cancel_stream(&mut self, id: u64) -> Result<Vec<Waker>> {
         if id > VARINT_MAX {
-            return Err(Error::H3_INTERNAL_ERROR);
+            return Err(ErrorCode::H3_INTERNAL_ERROR);
         }
         if self.table.max_capacity() != 0 {
             self.send_feedback(DecoderInstruction::StreamCancellation(id))?;
@@ -174,8 +174,8 @@ impl State {
         self.sender
             .try_send(instruction)
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => Error::H3_EXCESSIVE_LOAD,
-                mpsc::error::TrySendError::Closed(_) => Error::H3_CLOSED_CRITICAL_STREAM,
+                mpsc::error::TrySendError::Full(_) => ErrorCode::H3_EXCESSIVE_LOAD,
+                mpsc::error::TrySendError::Closed(_) => ErrorCode::H3_CLOSED_CRITICAL_STREAM,
             })
     }
 
@@ -198,12 +198,12 @@ impl State {
                 .and_then(|size| size.checked_add(field.value.len()))
                 .and_then(|size| size.checked_add(32))
                 .filter(|&size| size as u64 <= self.max_field_section_size)
-                .ok_or(Error::H3_EXCESSIVE_LOAD)?;
+                .ok_or(ErrorCode::H3_EXCESSIVE_LOAD)?;
             fields.push(field);
             input = rest;
         }
         if required_insert_count != prefix.required_insert_count {
-            return Err(Error::QPACK_DECOMPRESSION_FAILED);
+            return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED);
         }
         Ok(fields)
     }

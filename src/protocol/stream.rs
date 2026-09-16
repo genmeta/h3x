@@ -11,13 +11,13 @@ use std::{
 pub(crate) use read::H3ReadStream;
 pub(crate) use write::H3WriteStream;
 
-use crate::Error;
+use crate::ErrorCode;
 
 /// State of one transport half, independent of its application handle.
 enum StreamStatus<T> {
     Idle(T),
     Polling(T, Waker),
-    Closed(Error),
+    Closed(ErrorCode),
     Finished,
     Transition,
 }
@@ -53,7 +53,7 @@ impl<T> StreamState<T> {
     }
 
     // Return wakers so the caller can wake after releasing the state lock.
-    fn close(&mut self, error: Error, terminate: impl FnOnce(&mut T)) -> [Option<Waker>; 2] {
+    fn close(&mut self, error: ErrorCode, terminate: impl FnOnce(&mut T)) -> [Option<Waker>; 2] {
         let io_waker = if self.is_finished() {
             None
         } else {
@@ -89,9 +89,9 @@ impl<T: Unpin> StreamState<T> {
                         StreamStatus::Closed(
                             error
                                 .get_ref()
-                                .and_then(|source| source.downcast_ref::<Error>())
+                                .and_then(|source| source.downcast_ref::<ErrorCode>())
                                 .copied()
-                                .unwrap_or_else(|| Error::from(io::Error::from(error.kind()))),
+                                .unwrap_or_else(|| ErrorCode::from(io::Error::from(error.kind()))),
                         )
                     }
                     _ => StreamStatus::Idle(io),

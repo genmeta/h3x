@@ -6,7 +6,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use h3x::{Error, H3Connection, Result, Role, Transport};
+use h3x::{ErrorCode, H3Connection, Result, Role, Transport};
 use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -15,7 +15,7 @@ use tokio::{
 
 #[derive(Default)]
 pub struct TestTransport {
-    error: Mutex<Option<Error>>,
+    error: Mutex<Option<ErrorCode>>,
     ended: Notify,
 }
 
@@ -76,23 +76,23 @@ impl Transport for TestTransport {
     }
     fn close(&self, _: String, code: u64) -> Result<()> {
         let error = [
-            Error::H3_NO_ERROR,
-            Error::H3_INTERNAL_ERROR,
-            Error::H3_CLOSED_CRITICAL_STREAM,
-            Error::H3_EXCESSIVE_LOAD,
-            Error::H3_FRAME_UNEXPECTED,
-            Error::QPACK_DECOMPRESSION_FAILED,
-            Error::QPACK_ENCODER_STREAM_ERROR,
-            Error::QPACK_DECODER_STREAM_ERROR,
+            ErrorCode::H3_NO_ERROR,
+            ErrorCode::H3_INTERNAL_ERROR,
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM,
+            ErrorCode::H3_EXCESSIVE_LOAD,
+            ErrorCode::H3_FRAME_UNEXPECTED,
+            ErrorCode::QPACK_DECOMPRESSION_FAILED,
+            ErrorCode::QPACK_ENCODER_STREAM_ERROR,
+            ErrorCode::QPACK_DECODER_STREAM_ERROR,
         ]
         .into_iter()
         .find(|error| error.as_u64() == code)
-        .unwrap_or(Error::H3_INTERNAL_ERROR);
+        .unwrap_or(ErrorCode::H3_INTERNAL_ERROR);
         self.error.lock().unwrap().get_or_insert(error);
         self.ended.notify_waiters();
         Ok(())
     }
-    async fn terminated(&self) -> Error {
+    async fn terminated(&self) -> ErrorCode {
         loop {
             let ended = self.ended.notified();
             tokio::pin!(ended);
