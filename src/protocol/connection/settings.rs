@@ -1,16 +1,13 @@
-//! Local advertised settings and peer settings storage.
-
-use std::sync::Mutex;
+//! Local connection settings.
 
 use qbase::varint::VarInt;
 
 use crate::{ErrorCode, Result, protocol::frame};
 
-/// Local advertised settings and the independently received peer settings.
-pub struct Settings {
-    pub(crate) local: frame::Settings,
-    pub(crate) peer: Mutex<Option<frame::Settings>>,
-}
+/// Local settings advertised when constructing an HTTP/3 connection.
+/// Extended CONNECT support is always advertised.
+#[derive(Clone, Debug)]
+pub struct Settings(pub(crate) frame::Settings);
 
 impl Settings {
     pub fn new(
@@ -19,6 +16,7 @@ impl Settings {
         blocked_streams: u64,
     ) -> Result<Self> {
         let values = [
+            (frame::SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
             (frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY, max_table_capacity),
             (
                 frame::SETTINGS_MAX_FIELD_SECTION_SIZE,
@@ -31,17 +29,14 @@ impl Settings {
             Ok((
                 VarInt::from_u32(id),
                 VarInt::try_from(value).map_err(|error| {
-                    ErrorCode::H3_SETTINGS_ERROR.with_reason(format!(
+                    ErrorCode::H3_SETTINGS_ERROR.reason(format!(
                         "SETTINGS value exceeds the QUIC variable-integer range: {error}"
                     ))
                 })?,
             ))
         })
         .collect::<Result<_>>()?;
-        Ok(Self {
-            local: frame::Settings { values },
-            peer: Mutex::new(None),
-        })
+        Ok(Self(frame::Settings { values }))
     }
 }
 
@@ -64,22 +59,21 @@ mod tests {
         for (fields, capacity, blocked) in [(0, 0, 0), (max_fields, max_capacity, VARINT_MAX)] {
             let settings = Settings::new(fields, capacity, blocked).unwrap();
             assert_eq!(
-                settings
-                    .local
-                    .get(frame::SETTINGS_MAX_FIELD_SECTION_SIZE, 1),
+                settings.0.get(frame::SETTINGS_ENABLE_CONNECT_PROTOCOL, 0),
+                1
+            );
+            assert_eq!(
+                settings.0.get(frame::SETTINGS_MAX_FIELD_SECTION_SIZE, 1),
                 fields
             );
             assert_eq!(
-                settings
-                    .local
-                    .get(frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY, 1),
+                settings.0.get(frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY, 1),
                 capacity
             );
             assert_eq!(
-                settings.local.get(frame::SETTINGS_QPACK_BLOCKED_STREAMS, 1),
+                settings.0.get(frame::SETTINGS_QPACK_BLOCKED_STREAMS, 1),
                 blocked
             );
-            assert!(settings.peer.lock().unwrap().is_none());
         }
         for (fields, capacity, blocked) in [
             (max_fields + 1, 0, 0),

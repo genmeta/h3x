@@ -43,7 +43,7 @@ impl State {
     /// Pass default peer settings until SETTINGS arrives; all integer limits are 62-bit.
     pub(super) fn new(peer: Settings, on_instruction: super::OnInstruction) -> Result<Self> {
         if peer.blocked_streams > VARINT_MAX {
-            return Err(ErrorCode::H3_SETTINGS_ERROR.with_reason(
+            return Err(ErrorCode::H3_SETTINGS_ERROR.reason(
                 "QPACK blocked-stream limit exceeds the QUIC variable-integer range",
             ));
         }
@@ -73,7 +73,7 @@ impl State {
         if peer.blocked_streams > VARINT_MAX
             || peer.blocked_streams < self.potentially_blocked_streams() as u64
         {
-            return Err(ErrorCode::H3_SETTINGS_ERROR.with_reason(
+            return Err(ErrorCode::H3_SETTINGS_ERROR.reason(
                 "QPACK blocked-stream limit exceeds the QUIC variable-integer range",
             ));
         }
@@ -90,7 +90,7 @@ impl State {
     ) -> Result<Bytes> {
         if stream_id > VARINT_MAX {
             return Err(ErrorCode::H3_INTERNAL_ERROR
-                .with_reason("encoded stream ID exceeds the QUIC variable-integer range"));
+                .reason("encoded stream ID exceeds the QUIC variable-integer range"));
         }
         let mut bounded = Vec::new();
         let mut size = 0usize;
@@ -102,7 +102,7 @@ impl State {
                 .filter(|&v| v as u64 <= self.max_field_section_size)
                 .ok_or_else(|| {
                     ErrorCode::H3_EXCESSIVE_LOAD
-                        .with_reason("field section exceeds the peer size limit")
+                        .reason("field section exceeds the peer size limit")
                 })?;
             field.never_index |= should_never_index(&field.name);
             bounded.push(field);
@@ -268,7 +268,7 @@ impl State {
         }
         if wire.len() > MAX_BUFFERED_FRAME_PAYLOAD {
             return Err(ErrorCode::H3_EXCESSIVE_LOAD
-                .with_reason("encoded field section exceeds the buffer limit"));
+                .reason("encoded field section exceeds the buffer limit"));
         }
         if required_insert_count != 0 {
             self.unacked_sections_by_stream
@@ -302,7 +302,7 @@ impl State {
     ) -> Result<bool> {
         if self.table.max_capacity() == 0 {
             return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR
-                .with_reason("cannot update a dynamic table with zero maximum capacity"));
+                .reason("cannot update a dynamic table with zero maximum capacity"));
         }
         Vec::new().put_encoder_instruction(&instruction)?; // Validate wire limits before committing any table changes.
         // ponytail: preview on cloned table metadata; use an eviction plan if profiling warrants it.
@@ -331,14 +331,14 @@ impl State {
                     .get_mut(&stream_id)
                     .ok_or_else(|| {
                         ErrorCode::QPACK_DECODER_STREAM_ERROR
-                            .with_reason("acknowledgement refers to an unknown stream")
+                            .reason("acknowledgement refers to an unknown stream")
                     })?;
                 let section = sections.front().ok_or_else(|| {
                     ErrorCode::QPACK_DECODER_STREAM_ERROR
-                        .with_reason("acknowledgement has no outstanding field section")
+                        .reason("acknowledgement has no outstanding field section")
                 })?;
                 if section.required_insert_count > completed_insert_count {
-                    return Err(ErrorCode::QPACK_DECODER_STREAM_ERROR.with_reason(
+                    return Err(ErrorCode::QPACK_DECODER_STREAM_ERROR.reason(
                         "acknowledgement refers to inserts that have not been written",
                     ));
                 }
@@ -351,7 +351,7 @@ impl State {
             }
             DecoderInstruction::StreamCancellation(stream_id) => {
                 if stream_id > VARINT_MAX {
-                    return Err(ErrorCode::QPACK_DECODER_STREAM_ERROR.with_reason(
+                    return Err(ErrorCode::QPACK_DECODER_STREAM_ERROR.reason(
                         "cancelled stream ID exceeds the QUIC variable-integer range",
                     ));
                 }
@@ -362,7 +362,7 @@ impl State {
                     .known_received_count
                     .checked_add(increment)
                     .filter(|&count| increment != 0 && count <= completed_insert_count)
-                    .ok_or_else(|| ErrorCode::QPACK_DECODER_STREAM_ERROR.with_reason("insert-count increment is zero, overflows, or exceeds completed writes"))?;
+                    .ok_or_else(|| ErrorCode::QPACK_DECODER_STREAM_ERROR.reason("insert-count increment is zero, overflows, or exceeds completed writes"))?;
             }
         }
         Ok(())

@@ -31,8 +31,8 @@ pub(crate) use headers::Headers;
 pub(crate) use max_push_id::MaxPushId;
 pub(crate) use push_promise::PushPromise;
 pub(crate) use settings::{
-    SETTINGS_MAX_FIELD_SECTION_SIZE, SETTINGS_QPACK_BLOCKED_STREAMS,
-    SETTINGS_QPACK_MAX_TABLE_CAPACITY, Settings,
+    SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_MAX_FIELD_SECTION_SIZE,
+    SETTINGS_QPACK_BLOCKED_STREAMS, SETTINGS_QPACK_MAX_TABLE_CAPACITY, Settings,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,9 +62,9 @@ impl TryFrom<u64> for FrameType {
             0x07 => Ok(Self::Goaway),
             0x0d => Ok(Self::MaxPushId),
             0x02 | 0x06 | 0x08 | 0x09 => Err(ErrorCode::H3_FRAME_UNEXPECTED
-                .with_reason("HTTP/2-reserved frame type is forbidden in HTTP/3")),
+                .reason("HTTP/2-reserved frame type is forbidden in HTTP/3")),
             _ => VarInt::try_from(value).map(Self::Unknown).map_err(|error| {
-                ErrorCode::H3_FRAME_ERROR.with_reason(format!(
+                ErrorCode::H3_FRAME_ERROR.reason(format!(
                     "frame type exceeds the QUIC variable-integer range: {error}"
                 ))
             }),
@@ -82,7 +82,7 @@ pub(crate) struct Frame<P: GetFrameType + EncodeSize> {
 impl<P: GetFrameType + EncodeSize> Frame<P> {
     pub(crate) fn new(payload: P) -> Result<Self> {
         let length = VarInt::try_from(payload.encoding_size()).map_err(|error| {
-            ErrorCode::H3_FRAME_ERROR.with_reason(format!(
+            ErrorCode::H3_FRAME_ERROR.reason(format!(
                 "encoded frame length exceeds the QUIC variable-integer range: {error}"
             ))
         })?;
@@ -128,6 +128,19 @@ impl GetFrameType for H3Frame {
     }
 }
 
+/// Distinguish clean EOF before a frame from a truncated frame type or payload.
+pub(crate) async fn be_frame_or_eof<T: AsyncRead + Unpin + ?Sized>(
+    reader: &mut T,
+) -> Result<Option<H3Frame>> {
+    let mut first = [0];
+    if reader.read(&mut first).await? == 0 {
+        return Ok(None);
+    }
+    be_frame(&mut first.as_slice().chain(reader))
+        .await
+        .map(Some)
+}
+
 /// Read Type, Length, and one payload. DATA and unknown payload bytes remain in
 /// the reader and must be consumed before calling again. HEADERS/PUSH_PROMISE
 /// retain encoded QPACK bytes; after validating placement, pass the field section
@@ -135,53 +148,39 @@ impl GetFrameType for H3Frame {
 /// EOF (including a partial frame) is an error.
 /// Cancellation can consume a prefix; keep polling the same future.
 pub(crate) async fn be_frame<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<H3Frame> {
-    let ty: FrameType = be_varint(reader)
-        .await
-        .map_err(|error| {
-            let error = error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
-                .map_or(&error, std::sync::Arc::as_ref);
-            error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<crate::Error>())
-                .cloned()
-                .unwrap_or_else(|| {
-                    let code = if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                        ErrorCode::H3_FRAME_ERROR
-                    } else {
-                        ErrorCode::H3_INTERNAL_ERROR
-                    };
-                    code.with_reason(error.to_string())
-                })
-        })?
-        .ok_or_else(|| ErrorCode::H3_FRAME_ERROR.with_reason("frame is missing a complete type"))?
-        .into_u64()
-        .try_into()?;
-    let length = be_varint(reader)
-        .await
-        .map_err(|error| {
-            let error = error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
-                .map_or(&error, std::sync::Arc::as_ref);
-            error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<crate::Error>())
-                .cloned()
-                .unwrap_or_else(|| {
-                    let code = if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                        ErrorCode::H3_FRAME_ERROR
-                    } else {
-                        ErrorCode::H3_INTERNAL_ERROR
-                    };
-                    code.with_reason(error.to_string())
-                })
-        })?
-        .ok_or_else(|| {
-            ErrorCode::H3_FRAME_ERROR.with_reason("frame is missing a complete length")
-        })?;
+    let ty = read_frame_type(reader).await?;
+    let length = read_frame_length(reader).await?;
     be_frame_payload(reader, ty, length).await
+}
+
+/// CONNECT accepts DATA and unknown frames only. Reject other types before
+/// reading their length or payload, even if that payload never arrives.
+pub(crate) async fn be_data_frame<T: AsyncRead + Unpin + ?Sized>(
+    reader: &mut T,
+) -> Result<H3Frame> {
+    let ty = read_frame_type(reader).await?;
+    if !matches!(ty, FrameType::Data | FrameType::Unknown(_)) {
+        return Err(ErrorCode::H3_FRAME_UNEXPECTED
+            .reason("only DATA and unknown frames are allowed after CONNECT acceptance"));
+    }
+    let length = read_frame_length(reader).await?;
+    be_frame_payload(reader, ty, length).await
+}
+
+async fn read_frame_type<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<FrameType> {
+    let ty = be_varint(reader)
+        .await
+        .map_err(crate::Error::from_frame_io)?;
+    ty.ok_or_else(|| ErrorCode::H3_FRAME_ERROR.reason("frame is missing a complete type"))?
+        .into_u64()
+        .try_into()
+}
+
+async fn read_frame_length<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<VarInt> {
+    be_varint(reader)
+        .await
+        .map_err(crate::Error::from_frame_io)?
+        .ok_or_else(|| ErrorCode::H3_FRAME_ERROR.reason("frame is missing a complete length"))
 }
 
 /// Discard exactly `length` bytes without allocating a buffer of that size.
@@ -192,27 +191,10 @@ pub(crate) async fn skip_payload<T: AsyncRead + Unpin + ?Sized>(
     let mut payload = reader.take(length);
     tokio::io::copy(&mut payload, &mut tokio::io::sink())
         .await
-        .map_err(|error| {
-            let error = error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
-                .map_or(&error, std::sync::Arc::as_ref);
-            error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<crate::Error>())
-                .cloned()
-                .unwrap_or_else(|| {
-                    let code = if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                        ErrorCode::H3_FRAME_ERROR
-                    } else {
-                        ErrorCode::H3_INTERNAL_ERROR
-                    };
-                    code.with_reason(error.to_string())
-                })
-        })?;
+        .map_err(crate::Error::from_frame_io)?;
     if payload.limit() != 0 {
         return Err(
-            ErrorCode::H3_FRAME_ERROR.with_reason("frame payload ended before its declared length")
+            ErrorCode::H3_FRAME_ERROR.reason("frame payload ended before its declared length")
         );
     }
     Ok(())
@@ -230,7 +212,7 @@ pub(crate) async fn be_frame_payload<T: AsyncRead + Unpin + ?Sized>(
             length,
             payload: Data(usize::try_from(length.into_u64()).map_err(|error| {
                 ErrorCode::H3_FRAME_ERROR
-                    .with_reason(format!("DATA length does not fit in memory: {error}"))
+                    .reason(format!("DATA length does not fit in memory: {error}"))
             })?),
         }),
         FrameType::Headers => H3Frame::Headers(headers::be_headers_frame(reader, length).await?),
@@ -260,27 +242,13 @@ pub(crate) trait EncodeSize {
 
 async fn read_payload<T: AsyncRead + Unpin + ?Sized>(reader: &mut T, length: u64) -> Result<Bytes> {
     if length > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
-        return Err(ErrorCode::H3_EXCESSIVE_LOAD.with_reason("configured resource limit exceeded"));
+        return Err(ErrorCode::H3_EXCESSIVE_LOAD.reason("configured resource limit exceeded"));
     }
     let mut payload = vec![0; length as usize];
-    reader.read_exact(&mut payload).await.map_err(|error| {
-        let error = error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
-            .map_or(&error, std::sync::Arc::as_ref);
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<crate::Error>())
-            .cloned()
-            .unwrap_or_else(|| {
-                let code = if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                    ErrorCode::H3_FRAME_ERROR
-                } else {
-                    ErrorCode::H3_INTERNAL_ERROR
-                };
-                code.with_reason(error.to_string())
-            })
-    })?;
+    reader
+        .read_exact(&mut payload)
+        .await
+        .map_err(crate::Error::from_frame_io)?;
     Ok(payload.into())
 }
 

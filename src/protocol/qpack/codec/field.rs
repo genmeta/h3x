@@ -40,7 +40,7 @@ impl FieldSectionPrefix {
             .filter(|&absolute| absolute < self.required_insert_count)
             .ok_or_else(|| {
                 ErrorCode::QPACK_DECOMPRESSION_FAILED
-                    .with_reason("dynamic relative index is outside Required Insert Count")
+                    .reason("dynamic relative index is outside Required Insert Count")
             })
     }
 
@@ -51,7 +51,7 @@ impl FieldSectionPrefix {
             .filter(|&absolute| absolute < self.required_insert_count)
             .ok_or_else(|| {
                 ErrorCode::QPACK_DECOMPRESSION_FAILED
-                    .with_reason("post-Base index is outside Required Insert Count")
+                    .reason("post-Base index is outside Required Insert Count")
             })
     }
 }
@@ -116,7 +116,7 @@ impl FieldLine {
         let mut field = if let Some(absolute) = self.dynamic_index(prefix)? {
             table.get(absolute).cloned().ok_or_else(|| {
                 ErrorCode::QPACK_DECOMPRESSION_FAILED
-                    .with_reason("dynamic table entry is missing or has been evicted")
+                    .reason("dynamic table entry is missing or has been evicted")
             })?
         } else {
             let index = match self {
@@ -127,7 +127,7 @@ impl FieldLine {
             };
             let (name, value) = table::get(index).ok_or_else(|| {
                 ErrorCode::QPACK_DECOMPRESSION_FAILED
-                    .with_reason("static table index is out of range")
+                    .reason("static table index is out of range")
             })?;
             Field {
                 name: Bytes::from_static(name.as_bytes()),
@@ -170,14 +170,14 @@ impl<B: BufMut> WriteField for B {
             || prefix.base > VARINT_MAX
         {
             return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
-                .with_reason("field section prefix exceeds the QUIC variable-integer range"));
+                .reason("field section prefix exceeds the QUIC variable-integer range"));
         }
         let encoded_insert_count = if prefix.required_insert_count == 0 {
             0
         } else {
             let full_range = 2 * (max_capacity / 32);
             if full_range == 0 {
-                return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason(
+                return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED.reason(
                     "nonzero Required Insert Count with a table too small for entries",
                 ));
             }
@@ -235,7 +235,7 @@ pub(crate) fn be_field_section_prefix(
     insert_count: u64,
 ) -> Result<(&[u8], FieldSectionPrefix)> {
     if max_capacity > VARINT_MAX || insert_count > VARINT_MAX {
-        return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason(
+        return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED.reason(
             "table capacity or insert count exceeds the QUIC variable-integer range",
         ));
     }
@@ -248,28 +248,28 @@ pub(crate) fn be_field_section_prefix(
         let full_range = 2 * max_entries;
         if encoded_insert_count > full_range {
             return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
-                .with_reason("encoded Required Insert Count exceeds the table wrap range"));
+                .reason("encoded Required Insert Count exceeds the table wrap range"));
         }
         let max_value = insert_count + max_entries;
         let max_wrapped = (max_value / full_range) * full_range;
         let mut count = max_wrapped + encoded_insert_count - 1;
         if count > max_value {
             if count <= full_range {
-                return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason(
+                return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED.reason(
                     "Required Insert Count cannot be reconstructed from the table state",
                 ));
             }
             count -= full_range;
         }
         if count == 0 || count > VARINT_MAX {
-            return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason(
+            return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED.reason(
                 "reconstructed Required Insert Count is zero or exceeds the allowed range",
             ));
         }
         count
     };
     let sign = *input.first().ok_or_else(|| {
-        ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("field section is missing Delta Base")
+        ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("field section is missing Delta Base")
     })? & 0x80
         != 0;
     let (input, delta_base) = be_prefixed_integer(input, 7)?;
@@ -282,7 +282,7 @@ pub(crate) fn be_field_section_prefix(
     }
     .filter(|&base| base <= VARINT_MAX)
     .ok_or_else(|| {
-        ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("Delta Base produces an invalid Base")
+        ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("Delta Base produces an invalid Base")
     })?;
     Ok((
         input,
@@ -296,7 +296,7 @@ pub(crate) fn be_field_section_prefix(
 /// Parse one field-line representation and retain the unconsumed suffix.
 pub(crate) fn be_field_line(input: &[u8]) -> Result<(&[u8], FieldLine)> {
     let first = *input.first().ok_or_else(|| {
-        ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("field line is missing its first byte")
+        ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("field line is missing its first byte")
     })?;
     if first & 0x80 != 0 {
         let (input, index) = be_prefixed_integer(input, 6)?;

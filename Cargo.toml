@@ -20,4 +20,7 @@ qrecovery = { version = "0.6.2", path = "../dquic/qrecovery" }
 tokio = { version = "1", features = ["macros", "rt", "io-util", "sync"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "net"] }
+futures-util = { version = "0.3", features = ["sink"] }
+httparse = "1"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }

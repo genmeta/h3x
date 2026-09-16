@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
 
 use crate::{
@@ -11,6 +13,25 @@ pub mod message;
 pub(crate) mod request;
 pub(crate) mod response;
 pub mod wnd_buf;
+
+/// Validated, case-sensitive Extended CONNECT protocol token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Protocol(Arc<str>);
+impl Protocol {
+    pub fn new(name: &str) -> crate::Result<Self> {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c))
+        {
+            return Err(crate::ErrorCode::H3_MESSAGE_ERROR.reason("invalid CONNECT protocol token"));
+        }
+        Ok(Self(Arc::from(name)))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 pub enum Read {}
 pub enum Write {}
@@ -75,6 +96,13 @@ pub enum Response<IO> {
 }
 
 impl<IO> ReadRequest for Request<IO> {
+    fn protocol(&self) -> Option<crate::Protocol> {
+        match self {
+            Self::Bytes(r) => r.protocol(),
+            Self::Streaming(r) => r.protocol(),
+        }
+    }
+
     fn method(&self) -> http::Method {
         match self {
             Self::Bytes(request) => request.method(),

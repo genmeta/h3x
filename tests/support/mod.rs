@@ -92,7 +92,7 @@ impl Transport for TestTransport {
         self.error
             .lock()
             .unwrap()
-            .get_or_insert(error.with_reason(reason));
+            .get_or_insert(error.reason(reason));
         self.ended.notify_waiters();
         Ok(())
     }
@@ -116,10 +116,19 @@ pub async fn connection() -> H3Connection<TestTransport> {
         .unwrap()
 }
 
+/// A request writer whose flush waits until its peer sends STOP_SENDING.
+#[derive(Default)]
+pub struct StoppedFlush {
+    pub pending: Notify,
+    pub failed: Notify,
+    state: Mutex<(Option<u64>, Option<std::task::Waker>)>,
+}
+
 /// Codec I/O with observable QUIC termination, independent of its Drop behavior.
 #[allow(dead_code)]
 pub struct TestStream<T> {
     pub io: T,
+    pub stopped_flush: Option<std::sync::Arc<StoppedFlush>>,
     pub stopped: std::sync::Arc<Mutex<Vec<u64>>>,
     pub cancelled: std::sync::Arc<Mutex<Vec<u64>>>,
 }
@@ -128,6 +137,7 @@ impl<T> TestStream<T> {
     pub fn new(io: T) -> Self {
         Self {
             io,
+            stopped_flush: None,
             stopped: Default::default(),
             cancelled: Default::default(),
         }
@@ -137,6 +147,13 @@ impl<T> TestStream<T> {
 impl<T> StopSending for TestStream<T> {
     fn stop(&mut self, code: u64) {
         self.stopped.lock().unwrap().push(code);
+        if let Some(flush) = &self.stopped_flush {
+            let mut state = flush.state.lock().unwrap();
+            state.0 = Some(code);
+            if let Some(waker) = state.1.take() {
+                waker.wake();
+            }
+        }
     }
 }
 
@@ -165,7 +182,24 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TestStream<T> {
         Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+        let this = self.get_mut();
+        if let Some(flush) = &this.stopped_flush {
+            let mut state = flush.state.lock().unwrap();
+            if let Some(code) = state.0 {
+                flush.failed.notify_one();
+                return Poll::Ready(Err(qrecovery::streams::error::StreamError::Reset(
+                    qbase::frame::ResetStreamError::new(
+                        qbase::varint::VarInt::try_from(code).unwrap(),
+                        qbase::varint::VarInt::from_u32(0),
+                    ),
+                )
+                .into()));
+            }
+            state.1 = Some(cx.waker().clone());
+            flush.pending.notify_one();
+            return Poll::Pending;
+        }
+        Pin::new(&mut this.io).poll_flush(cx)
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().io).poll_shutdown(cx)

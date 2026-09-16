@@ -235,3 +235,36 @@ async fn response_content_length_and_streaming() {
         );
     }
 }
+
+#[tokio::test]
+async fn connect_head_leaves_data_unconsumed_and_ignores_success_length() {
+    use crate::protocol::frame::Data;
+    for status in [StatusCode::OK, StatusCode::CREATED, StatusCode::NO_CONTENT] {
+        let connection = crate::test_support::connection().await;
+        let mut head = headers::ResponseHead {
+            status: Some(status),
+            headers: http::HeaderMap::new(),
+        };
+        head.headers
+            .insert(header::CONTENT_LENGTH, "not-a-length".parse().unwrap());
+        let mut fields = Vec::new();
+        fields.put_response(&head).unwrap();
+        let mut bytes = Vec::new();
+        bytes.put_frame(
+            &Frame::new(Headers {
+                field_section: connection.qpack().encode(0, fields).unwrap(),
+            })
+            .unwrap(),
+        );
+        bytes.put_frame(&Frame::new(Data(3)).unwrap());
+        bytes.extend_from_slice(b"one");
+        let mut recv = crate::test_support::read_stream(0, Cursor::new(bytes));
+        let (head, mode) = super::read_head(&mut recv, connection.qpack(), Some(&Method::CONNECT))
+            .await
+            .unwrap();
+        assert_eq!(head.status().unwrap(), status);
+        let body = body::receive(recv, mode, connection.qpack().clone());
+        let bytes = body.collect().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"one");
+    }
+}

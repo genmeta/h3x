@@ -18,6 +18,18 @@ impl Error {
 
     /// Preserve embedded protocol errors, using `fallback` for plain I/O failures.
     pub(crate) fn from_io(error: io::Error, code: ErrorCode) -> Self {
+        Self::from_io_with(error, |_| code)
+    }
+
+    /// Frame truncation is a framing error; other plain I/O failures are internal.
+    pub(crate) fn from_frame_io(error: io::Error) -> Self {
+        Self::from_io_with(error, |kind| match kind {
+            io::ErrorKind::UnexpectedEof => ErrorCode::H3_FRAME_ERROR,
+            _ => ErrorCode::H3_INTERNAL_ERROR,
+        })
+    }
+
+    fn from_io_with(error: io::Error, fallback: impl FnOnce(io::ErrorKind) -> ErrorCode) -> Self {
         let error = error
             .get_ref()
             .and_then(|error| error.downcast_ref::<Arc<io::Error>>())
@@ -26,7 +38,7 @@ impl Error {
             .get_ref()
             .and_then(|error| error.downcast_ref::<Self>())
             .cloned()
-            .unwrap_or_else(|| code.with_reason(error.to_string()))
+            .unwrap_or_else(|| fallback(error.kind()).reason(error.to_string()))
     }
 }
 
@@ -76,7 +88,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Attach context explaining why this protocol error occurred.
-    pub fn with_reason(self, reason: impl Into<String>) -> Error {
+    pub fn reason(self, reason: impl Into<String>) -> Error {
         Error::new(self, reason)
     }
 
@@ -105,14 +117,14 @@ mod tests {
 
     #[test]
     fn io_conversion_uses_fallback_only_for_plain_io_errors() {
-        let original = ErrorCode::QPACK_DECODER_STREAM_ERROR.with_reason("invalid acknowledgment");
+        let original = ErrorCode::QPACK_DECODER_STREAM_ERROR.reason("invalid acknowledgment");
         for shared in [false, true] {
             for cause in [
                 io::Error::from(original.clone()),
                 io::Error::new(io::ErrorKind::BrokenPipe, "writer closed"),
             ] {
                 let expected = if cause.kind() == io::ErrorKind::BrokenPipe {
-                    ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("writer closed")
+                    ErrorCode::H3_CLOSED_CRITICAL_STREAM.reason("writer closed")
                 } else {
                     original.clone()
                 };
@@ -160,7 +172,7 @@ mod tests {
 
     #[test]
     fn io_conversion_preserves_code_and_reason() {
-        let error = ErrorCode::H3_MESSAGE_ERROR.with_reason("missing pseudo-header :status");
+        let error = ErrorCode::H3_MESSAGE_ERROR.reason("missing pseudo-header :status");
         let io_error = io::Error::from(error.clone());
         assert_eq!(Error::from(io_error), error);
         assert_eq!(ErrorCode::from(io::Error::from(error.clone())), error.code);
@@ -179,18 +191,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_error_reason_survives_shared_body_and_stream_io() {
+    async fn body_preserves_first_error_and_cancelled_stream_reports_cancellation() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let error = ErrorCode::H3_REQUEST_CANCELLED.with_reason("application cancelled upload");
+        let error = ErrorCode::H3_REQUEST_CANCELLED.reason("application cancelled upload");
         let mut body = crate::ArcWndBuf::new(8);
         body.on_error(error.clone());
-        body.on_error(ErrorCode::H3_INTERNAL_ERROR.with_reason("later failure"));
+        body.on_error(ErrorCode::H3_INTERNAL_ERROR.reason("later failure"));
         assert_eq!(Error::from(body.read(&mut [0]).await.unwrap_err()), error);
         assert_eq!(Error::from(body.write(b"x").await.unwrap_err()), error);
 
         let mut stream = crate::test_support::write_stream(0, tokio::io::sink());
-        stream.cancel_with_error(error.clone());
+        use qrecovery::send::CancelStream;
+
+        (&stream).cancel(error.code.as_u64());
+        let error = ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled");
         assert_eq!(Error::from(stream.write(b"x").await.unwrap_err()), error);
         assert_eq!(Error::from(stream.flush().await.unwrap_err()), error);
     }
@@ -223,7 +238,7 @@ mod tests {
                 io::ErrorKind::ConnectionReset,
                 "peer reset while reading headers",
             ),
-            io::Error::from(ErrorCode::H3_REQUEST_REJECTED.with_reason("peer rejected request")),
+            io::Error::from(ErrorCode::H3_REQUEST_REJECTED.reason("peer rejected request")),
         ] {
             let expected = Error::from(cause);
             let mut stream =
@@ -242,8 +257,10 @@ mod tests {
         use crate::Transport;
 
         let connection = crate::test_support::connection().await;
-        let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("invalid dynamic reference");
-        connection.fail(error.clone());
+        let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("invalid dynamic reference");
+        let _ = connection
+            .transport
+            .close(error.reason.clone(), error.code.as_u64());
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while connection.qpack().error().is_none() {
                 tokio::task::yield_now().await;
@@ -286,14 +303,14 @@ mod tests {
     #[test]
     fn preserves_rfc_error_through_io() {
         let error = ErrorCode::from(io::Error::from(
-            ErrorCode::H3_MESSAGE_ERROR.with_reason("invalid response headers"),
+            ErrorCode::H3_MESSAGE_ERROR.reason("invalid response headers"),
         ));
         assert_eq!(error, ErrorCode::H3_MESSAGE_ERROR);
         assert_eq!(error.as_u64(), 0x010e);
         assert_eq!(
             ErrorCode::from(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                ErrorCode::H3_REQUEST_REJECTED.with_reason("peer rejected the request")
+                ErrorCode::H3_REQUEST_REJECTED.reason("peer rejected the request")
             )),
             ErrorCode::H3_REQUEST_REJECTED,
         );
