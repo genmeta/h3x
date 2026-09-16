@@ -11,7 +11,7 @@ async fn dropping_last_producer_does_not_finish_or_cancel_sending() {
     let mut sending = Box::pin(crate::server::write_streaming_response(
         response,
         H3WriteStream::new(0, tokio::io::sink()),
-        crate::test_support::connection().await,
+        crate::test_support::connection().await.qpack().clone(),
         &Method::GET,
     ));
     let mut cx = Context::from_waker(Waker::noop());
@@ -44,7 +44,7 @@ async fn finished_response_producer_can_drop_before_or_during_send() {
         let mut sending = Box::pin(super::respond(
             response,
             H3WriteStream::new(0, &mut encoded),
-            crate::test_support::connection().await,
+            crate::test_support::connection().await.qpack().clone(),
             &Method::GET,
         ));
         if started {
@@ -168,7 +168,12 @@ async fn streaming_response_termination_reaches_the_producer() {
                 .insert(0, crate::test_support::Reader, crate::test_support::Writer)
                 .unwrap();
             drop(recv);
-            let mut sending = Box::pin(super::respond(response, send, qpack.clone(), &Method::GET));
+            let mut sending = Box::pin(super::respond(
+                response,
+                send,
+                qpack.qpack().clone(),
+                &Method::GET,
+            ));
             if started {
                 assert!(
                     sending
@@ -217,7 +222,7 @@ async fn explicit_stop_stops_pump_when_body_write_resumes() {
     send.write_all(&request_frames(b"", None)).await.unwrap();
     let request = super::accept(
         H3ReadStream::new(4, recv),
-        crate::test_support::connection().await,
+        crate::test_support::connection().await.qpack().clone(),
     )
     .await
     .unwrap();
@@ -241,7 +246,7 @@ fn explicit_stop_cancels_body_after_request_pump_is_dropped() {
         send.write_all(&request_frames(b"", None)).await.unwrap();
         let Request::Streaming(request) = super::accept(
             H3ReadStream::new(4, recv),
-            crate::test_support::connection().await,
+            crate::test_support::connection().await.qpack().clone(),
         )
         .await
         .unwrap() else {
@@ -309,7 +314,7 @@ async fn explicit_stop_stops_a_pump_blocked_on_full_window() {
     };
     let request = crate::server::read_request(
         H3ReadStream::new(0, reader),
-        crate::test_support::connection().await,
+        crate::test_support::connection().await.qpack().clone(),
     )
     .await
     .unwrap();
@@ -335,7 +340,7 @@ async fn dropping_received_body_does_not_stop_network_reads() {
         send.write_all(&request_frames(b"", None)).await.unwrap();
         let Request::Streaming(request) = crate::server::read_request(
             H3ReadStream::new(0, recv),
-            crate::test_support::connection().await,
+            crate::test_support::connection().await.qpack().clone(),
         )
         .await
         .unwrap() else {

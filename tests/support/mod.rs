@@ -81,6 +81,7 @@ impl Transport for TestTransport {
             ErrorCode::H3_CLOSED_CRITICAL_STREAM,
             ErrorCode::H3_EXCESSIVE_LOAD,
             ErrorCode::H3_FRAME_UNEXPECTED,
+            ErrorCode::H3_FRAME_ERROR,
             ErrorCode::QPACK_DECOMPRESSION_FAILED,
             ErrorCode::QPACK_ENCODER_STREAM_ERROR,
             ErrorCode::QPACK_DECODER_STREAM_ERROR,

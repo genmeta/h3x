@@ -14,7 +14,7 @@ pub use error::{Error, ErrorCode, Result};
 pub use protocol::{
     connection::{H3Connection, Settings},
     frame::Goaway,
-    qpack::Qpack,
+    qpack::{ArcQpack, Qpack},
     stream::{read::H3ReadStream, write::H3WriteStream},
     transport::{Role, Transport},
 };

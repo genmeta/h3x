@@ -2,11 +2,8 @@ use std::sync::Arc;
 
 use qrecovery::{recv::StopSending, send::CancelStream};
 
-use super::{
-    qpack::{MAX_PENDING_INSTRUCTION, Qpack},
-    stream::{H3ReadStream, H3WriteStream, bi::BiStreams},
-};
-use crate::{Error, ErrorCode, Result, Transport};
+use super::stream::{H3ReadStream, H3WriteStream, bi::BiStreams};
+use crate::{ErrorCode, Result, Transport, protocol::qpack::ArcQpack};
 
 mod control;
 mod settings;
@@ -22,7 +19,7 @@ use crate::ErrorCode::H3_NO_ERROR;
 pub struct H3Connection<T: Transport> {
     transport: Arc<T>,
     settings: Arc<Settings>,
-    qpack: Arc<Qpack>,
+    qpack: ArcQpack,
     cursor: Arc<StreamCursor<T::StreamWriter>>,
     bi_streams: Arc<BiStreams<T::StreamReader, T::StreamWriter>>,
 }
@@ -33,23 +30,22 @@ impl<T: Transport> H3Connection<T> {
         let transport = Arc::new(transport);
         let settings = Arc::new(settings);
         let bi = Arc::new(BiStreams::new());
-        let qpack = Qpack::new(&settings)?;
+        let (qpack, encoder_rx, decoder_rx) = ArcQpack::new(&settings, transport.clone())?;
 
         let control_stream = control::open_uni(transport.as_ref()).await?;
         let cursor = Arc::new(StreamCursor::new(transport.role(), control_stream));
         let control_stream = cursor.control_stream.clone().lock_owned().await;
 
-        let (tx, rx) = tokio::sync::mpsc::channel(MAX_PENDING_INSTRUCTION);
-        qpack
-            .encoder
-            .on_instruction(move |batch| tx.try_send(batch).map_err(instruction_send_error));
-        tokio::spawn(qpack.encoder.sync(transport.clone(), rx));
-
-        let (tx, rx) = tokio::sync::mpsc::channel(MAX_PENDING_INSTRUCTION);
-        qpack
-            .decoder
-            .on_instruction(move |batch| tx.try_send(batch).map_err(instruction_send_error));
-        tokio::spawn(qpack.decoder.sync(transport.clone(), rx));
+        tokio::spawn({
+            let qpack = qpack.clone();
+            let transport = transport.clone();
+            async move { qpack.sync_encoder(transport, encoder_rx).await }
+        });
+        tokio::spawn({
+            let qpack = qpack.clone();
+            let transport = transport.clone();
+            async move { qpack.sync_decoder(transport, decoder_rx).await }
+        });
 
         let connection = Self {
             transport,
@@ -65,7 +61,7 @@ impl<T: Transport> H3Connection<T> {
     }
 
     /// Compression state shared by messages on this connection.
-    pub fn qpack(&self) -> &Arc<Qpack> {
+    pub fn qpack(&self) -> &ArcQpack {
         &self.qpack
     }
 
@@ -142,18 +138,6 @@ impl<T: Transport> Clone for H3Connection<T> {
             qpack: self.qpack.clone(),
             cursor: self.cursor.clone(),
             bi_streams: self.bi_streams.clone(),
-        }
-    }
-}
-
-/// Channel producers run under QPACK state locks and must never block.
-pub(super) fn instruction_send_error<T>(error: tokio::sync::mpsc::error::TrySendError<T>) -> Error {
-    match error {
-        tokio::sync::mpsc::error::TrySendError::Full(_) => {
-            ErrorCode::H3_EXCESSIVE_LOAD.with_reason("QPACK instruction queue is full")
-        }
-        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("QPACK instruction receiver is closed")
         }
     }
 }

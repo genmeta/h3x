@@ -1,10 +1,6 @@
 //! Initiating requests and receiving authenticated responses.
 //! These roles apply per request, independently of the QUIC connection role.
-
-use std::{
-    future::{Future, IntoFuture},
-    sync::Arc,
-};
+use std::future::{Future, IntoFuture};
 
 use bytes::Bytes;
 use http::StatusCode;
@@ -20,7 +16,7 @@ use crate::{
     },
     protocol::{
         frame::{self, Frame, H3Frame, Headers, Write as _, be_frame},
-        qpack::Qpack,
+        qpack::ArcQpack,
         stream::{H3ReadStream, H3WriteStream},
     },
 };
@@ -37,7 +33,7 @@ pub fn write_bytes_request<RS, WS>(
     request: Request<Bytes>,
     ws: H3WriteStream<WS>,
     rs: H3ReadStream<RS>,
-    qpack: Arc<Qpack>,
+    qpack: ArcQpack,
 ) -> Result<impl IntoFuture<Output = Result<Response>, IntoFuture: Send> + Send>
 where
     RS: AsyncRead + Unpin + Send + 'static,
@@ -67,7 +63,7 @@ pub fn write_streaming_request<RS, WS>(
     request: Request<ArcWndBuf>,
     ws: H3WriteStream<WS>,
     rs: H3ReadStream<RS>,
-    qpack: Arc<Qpack>,
+    qpack: ArcQpack,
 ) -> Result<impl IntoFuture<Output = Result<Response>, IntoFuture: Send> + Send>
 where
     RS: AsyncRead + Unpin + Send + 'static,
@@ -95,7 +91,7 @@ where
 fn send_bytes_request<WS>(
     req: &Request<Bytes>,
     mut ws: H3WriteStream<WS>,
-    qpack: &Qpack,
+    qpack: &ArcQpack,
 ) -> Result<impl Future<Output = Result<()>> + Send + use<WS>>
 where
     WS: AsyncWrite + Unpin + Send + 'static,
@@ -135,7 +131,7 @@ where
 fn send_streaming_request<WS>(
     req: &Request<ArcWndBuf>,
     mut ws: H3WriteStream<WS>,
-    qpack: &Qpack,
+    qpack: &ArcQpack,
 ) -> Result<impl Future<Output = Result<()>> + Send + use<WS>>
 where
     WS: AsyncWrite + Unpin + Send + 'static,
@@ -180,7 +176,7 @@ where
 /// Reads ordinary responses; HEAD and CONNECT semantics require request-method input.
 async fn read_response<RS: AsyncRead + Unpin + Send + 'static>(
     rs: H3ReadStream<RS>,
-    qpack: Arc<Qpack>,
+    qpack: ArcQpack,
     method: Option<http::Method>,
 ) -> Result<crate::common::Response<Read>> {
     let stream_id = rs.stream_id();
@@ -230,6 +226,12 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static>(
     let (head, mode) = match result {
         Ok(value) => value,
         Err(error) => {
+            if matches!(
+                error.code,
+                ErrorCode::H3_FRAME_ERROR | ErrorCode::H3_FRAME_UNEXPECTED
+            ) {
+                qpack.on_error(error.clone());
+            }
             let _ = qpack.cancel(stream_id);
             return Err(error);
         }

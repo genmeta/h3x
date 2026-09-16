@@ -15,6 +15,19 @@ impl Error {
             reason: reason.into(),
         }
     }
+
+    /// Preserve embedded protocol errors, using `fallback` for plain I/O failures.
+    pub(crate) fn from_io(error: io::Error, code: ErrorCode) -> Self {
+        let error = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<Arc<io::Error>>())
+            .map_or(&error, Arc::as_ref);
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<Self>())
+            .cloned()
+            .unwrap_or_else(|| code.with_reason(error.to_string()))
+    }
 }
 
 impl From<Error> for ErrorCode {
@@ -25,15 +38,7 @@ impl From<Error> for ErrorCode {
 
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
-        let error = error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<Arc<io::Error>>())
-            .map_or(&error, Arc::as_ref);
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<Self>())
-            .cloned()
-            .unwrap_or_else(|| Self::new(ErrorCode::H3_INTERNAL_ERROR, error.to_string()))
+        Self::from_io(error, ErrorCode::H3_INTERNAL_ERROR)
     }
 }
 
@@ -97,6 +102,32 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn io_conversion_uses_fallback_only_for_plain_io_errors() {
+        let original = ErrorCode::QPACK_DECODER_STREAM_ERROR.with_reason("invalid acknowledgment");
+        for shared in [false, true] {
+            for cause in [
+                io::Error::from(original.clone()),
+                io::Error::new(io::ErrorKind::BrokenPipe, "writer closed"),
+            ] {
+                let expected = if cause.kind() == io::ErrorKind::BrokenPipe {
+                    ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("writer closed")
+                } else {
+                    original.clone()
+                };
+                let cause = if shared {
+                    io::Error::new(cause.kind(), Arc::new(cause))
+                } else {
+                    cause
+                };
+                assert_eq!(
+                    Error::from_io(cause, ErrorCode::H3_CLOSED_CRITICAL_STREAM),
+                    expected
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn frame_boundary_classifies_eof_after_stream_state_wrapping() {

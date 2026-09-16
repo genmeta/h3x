@@ -6,8 +6,6 @@ use super::{
     integer::{WritePrefixedInteger, be_prefixed_integer},
     string_literal::{WriteStringLiteral, be_string_literal_slice},
 };
-#[cfg(test)]
-use crate::protocol::qpack::should_never_index;
 use crate::{
     ErrorCode, Result,
     protocol::qpack::table::{self, DynamicTable},
@@ -351,59 +349,12 @@ pub(crate) fn be_field_line(input: &[u8]) -> Result<(&[u8], FieldLine)> {
 
 /// Append a field section without dynamic-table references.
 #[cfg(test)]
-pub(crate) trait WriteFieldSection: BufMut {
-    fn put_field_section(&mut self, fields: impl IntoIterator<Item = Field>) -> Result<()>;
-}
-
-#[cfg(test)]
-impl<B: BufMut> WriteFieldSection for B {
-    fn put_field_section(&mut self, fields: impl IntoIterator<Item = Field>) -> Result<()> {
-        self.put_slice(&[0, 0]); // Required Insert Count = 0, S = 0, Delta Base = 0.
-        for mut field in fields {
-            field.never_index |= should_never_index(&field.name);
-            if !field.never_index
-                && let Some(static_index) = table::find_index(&field.name, &field.value)
-            {
-                self.put_field_line(&FieldLine::Indexed {
-                    static_table: true,
-                    index: static_index as u64,
-                })?;
-                continue;
-            }
-            let line = if let Some(index) = table::find_name(&field.name) {
-                FieldLine::LiteralWithNameReference {
-                    never_index: field.never_index,
-                    static_table: true,
-                    index: index as u64,
-                    value: field.value,
-                }
-            } else {
-                FieldLine::Literal(field)
-            };
-            self.put_field_line(&line)?;
-        }
-        Ok(())
-    }
-}
-
-/// Parse a complete, bounded HEADERS payload without dynamic-table references.
-/// Success leaves no remaining input; use Decoder::decode for the stateful path.
-#[cfg(test)]
-pub(crate) fn be_field_section(input: &[u8]) -> Result<(&[u8], Vec<Field>)> {
-    let (mut input, prefix) = be_field_section_prefix(input, 0, 0)?;
-    let table = DynamicTable::default();
-    let mut fields = Vec::new();
-    while !input.is_empty() {
-        let (rest, line) = be_field_line(input)?;
-        fields.push(line.resolve(prefix, &table)?);
-        input = rest;
-    }
-    Ok((input, fields))
-}
+pub(crate) use tests::{WriteFieldSection, be_field_section};
 
 #[cfg(test)]
 mod tests {
     use super::{super::instruction::EncoderInstruction, *};
+    use crate::protocol::qpack::should_never_index;
 
     #[test]
     fn rfc_appendix_b_field_sections() {
@@ -794,5 +745,53 @@ mod tests {
         }
         assert_eq!(table::find_index(b"custom", b"GET"), None);
         assert_eq!(table::get(u64::MAX), None);
+    }
+
+    pub(crate) trait WriteFieldSection: BufMut {
+        fn put_field_section(&mut self, fields: impl IntoIterator<Item = Field>) -> Result<()>;
+    }
+
+    impl<B: BufMut> WriteFieldSection for B {
+        fn put_field_section(&mut self, fields: impl IntoIterator<Item = Field>) -> Result<()> {
+            self.put_slice(&[0, 0]); // Required Insert Count = 0, S = 0, Delta Base = 0.
+            for mut field in fields {
+                field.never_index |= should_never_index(&field.name);
+                if !field.never_index
+                    && let Some(static_index) = table::find_index(&field.name, &field.value)
+                {
+                    self.put_field_line(&FieldLine::Indexed {
+                        static_table: true,
+                        index: static_index as u64,
+                    })?;
+                    continue;
+                }
+                let line = if let Some(index) = table::find_name(&field.name) {
+                    FieldLine::LiteralWithNameReference {
+                        never_index: field.never_index,
+                        static_table: true,
+                        index: index as u64,
+                        value: field.value,
+                    }
+                } else {
+                    FieldLine::Literal(field)
+                };
+                self.put_field_line(&line)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Parse a complete, bounded HEADERS payload without dynamic-table references.
+    /// Success leaves no remaining input; use Decoder::decode for the stateful path.
+    pub(crate) fn be_field_section(input: &[u8]) -> Result<(&[u8], Vec<Field>)> {
+        let (mut input, prefix) = be_field_section_prefix(input, 0, 0)?;
+        let table = DynamicTable::default();
+        let mut fields = Vec::new();
+        while !input.is_empty() {
+            let (rest, line) = be_field_line(input)?;
+            fields.push(line.resolve(prefix, &table)?);
+            input = rest;
+        }
+        Ok((input, fields))
     }
 }

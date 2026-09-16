@@ -47,20 +47,10 @@ pub(super) async fn be_string_literal_with_first<T: AsyncRead + Unpin + ?Sized>(
             .with_reason("encoded string literal exceeds the buffer limit"));
     }
     let mut encoded = vec![0; length as usize];
-    reader.read_exact(&mut encoded).await.map_err(|error| {
-        let error = error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
-            .map_or(&error, std::sync::Arc::as_ref);
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<crate::Error>())
-            .cloned()
-            .unwrap_or_else(|| {
-                let code = ErrorCode::H3_CLOSED_CRITICAL_STREAM;
-                code.with_reason(error.to_string())
-            })
-    })?;
+    reader
+        .read_exact(&mut encoded)
+        .await
+        .map_err(|error| crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM))?;
     let value = if first & (1 << (prefix_bits - 1)) != 0 {
         decode_huffman(&encoded).map_err(|error| {
             ErrorCode::QPACK_ENCODER_STREAM_ERROR

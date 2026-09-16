@@ -68,10 +68,10 @@ use crate::common::message::ArcMessage;
 /// `request_method` must be the original request's method so HEAD responses can
 /// preserve `Content-Length` without sending a body.
 /// Applications finish or reset streaming bodies explicitly.
-fn respond<WS, R, T: Transport>(
+fn respond<WS, R>(
     response: R,
     send: H3WriteStream<WS>,
-    qpack: H3Connection<T>,
+    qpack: ArcQpack,
     request_method: &Method,
 ) -> impl Future<Output = Result<()>>
 where

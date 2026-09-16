@@ -8,7 +8,7 @@ use std::{
 use tokio::{io::AsyncWrite, time::timeout};
 
 use super::*;
-use crate::protocol::qpack::Field;
+use crate::protocol::qpack::{ArcQpack, Field};
 
 struct FailingWriter;
 impl AsyncWrite for FailingWriter {
@@ -93,7 +93,7 @@ async fn successful_upload_still_waits_for_response() {
     }
 }
 
-fn headers_frame(qpack: &Qpack, fields: Vec<Field>) -> Vec<u8> {
+fn headers_frame(qpack: &ArcQpack, fields: Vec<Field>) -> Vec<u8> {
     let mut wire = Vec::new();
     wire.put_frame(
         &Frame::new(Headers {
@@ -135,7 +135,7 @@ async fn malformed_response_headers_and_both_trailer_paths_close_the_connection(
         let error = if stage == "request trailers" {
             let request = crate::server::read_request(
                 H3ReadStream::new(0, Cursor::new(wire)),
-                connection.clone(),
+                connection.qpack().clone(),
             )
             .await
             .unwrap();
@@ -173,4 +173,126 @@ async fn malformed_http_headers_leave_the_connection_usable() {
     tokio::task::yield_now().await;
     assert!(qpack.error().is_none());
     assert!(qpack.encode(4, vec![field(b":status", b"200")]).is_ok());
+}
+
+#[tokio::test]
+async fn frame_errors_in_headers_bodies_and_trailers_close_the_connection() {
+    for stage in [
+        "response headers",
+        "request headers",
+        "response body",
+        "request body",
+        "response trailers",
+        "request trailers",
+    ] {
+        for code in [ErrorCode::H3_FRAME_ERROR, ErrorCode::H3_FRAME_UNEXPECTED] {
+            let connection = crate::test_support::connection().await;
+            let qpack = connection.qpack().clone();
+            let request = stage.starts_with("request");
+            let mut wire = if stage.ends_with("headers") {
+                Vec::new()
+            } else if request {
+                headers_frame(
+                    &qpack,
+                    vec![
+                        field(b":method", b"GET"),
+                        field(b":scheme", b"https"),
+                        field(b":authority", b"example.com"),
+                        field(b":path", b"/"),
+                    ],
+                )
+            } else {
+                headers_frame(&qpack, vec![field(b":status", b"200")])
+            };
+            if stage.ends_with("trailers") {
+                wire.extend(headers_frame(&qpack, vec![field(b"x-trailer", b"ok")]));
+            }
+            match code {
+                // A HEADERS payload truncated before its declared length.
+                ErrorCode::H3_FRAME_ERROR => wire.extend_from_slice(&[1, 2, 0]),
+                // DATA after trailers, or a forbidden HTTP/2 frame elsewhere.
+                _ if stage.ends_with("trailers") => wire.extend_from_slice(&[0, 0]),
+                _ => wire.extend_from_slice(&[2, 0]),
+            }
+            let error = if request {
+                match crate::server::read_request(
+                    H3ReadStream::new(0, Cursor::new(wire)),
+                    connection.qpack().clone(),
+                )
+                .await
+                {
+                    Err(error) => error,
+                    Ok(request) => request.into_body().collect().await.unwrap_err(),
+                }
+            } else {
+                match read_response(H3ReadStream::new(0, Cursor::new(wire)), qpack.clone(), None)
+                    .await
+                {
+                    Err(error) => error,
+                    Ok(response) => response.into_body().collect().await.unwrap_err(),
+                }
+            };
+            assert_eq!(error.code, code, "{stage}");
+            assert_eq!(
+                timeout(Duration::from_secs(1), connection.open_bi())
+                    .await
+                    .expect("frame error must terminate the transport")
+                    .err(),
+                Some(error.clone()),
+                "{stage}",
+            );
+            timeout(Duration::from_secs(1), async {
+                while qpack.error().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(qpack.error(), Some(error), "{stage}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn body_message_errors_leave_the_connection_usable() {
+    for request in [false, true] {
+        let connection = crate::test_support::connection().await;
+        let qpack = connection.qpack().clone();
+        let mut fields = if request {
+            vec![
+                field(b":method", b"GET"),
+                field(b":scheme", b"https"),
+                field(b":authority", b"example.com"),
+                field(b":path", b"/"),
+            ]
+        } else {
+            vec![field(b":status", b"200")]
+        };
+        fields.push(field(b"content-length", b"1"));
+        let wire = headers_frame(&qpack, fields);
+        let error = if request {
+            crate::server::read_request(
+                H3ReadStream::new(0, Cursor::new(wire)),
+                connection.qpack().clone(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap_err()
+        } else {
+            read_response(H3ReadStream::new(0, Cursor::new(wire)), qpack.clone(), None)
+                .await
+                .unwrap()
+                .into_body()
+                .collect()
+                .await
+                .unwrap_err()
+        };
+        assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
+        tokio::task::yield_now().await;
+        assert!(qpack.error().is_none());
+        assert!(qpack.encode(4, vec![field(b":status", b"200")]).is_ok());
+    }
 }

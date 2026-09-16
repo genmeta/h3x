@@ -29,8 +29,11 @@ async fn request_accept_and_respond() {
             response.await
         },
         async {
-            let request =
-                server::read_request(H3ReadStream::new(0, server_recv), connection.clone()).await?;
+            let request = server::read_request(
+                H3ReadStream::new(0, server_recv),
+                connection.qpack().clone(),
+            )
+            .await?;
             assert_eq!(request.method(), Method::POST);
             let method = request.method();
             let server::Request::Streaming(mut request) = request else {
@@ -48,7 +51,7 @@ async fn request_accept_and_respond() {
             server::write_bytes_response(
                 response,
                 H3WriteStream::new(0, server_send),
-                connection.clone(),
+                connection.qpack().clone(),
                 &method,
             )
             .await
@@ -95,8 +98,11 @@ async fn streaming_echo() {
             upload.finish().await
         },
         async {
-            let request =
-                server::read_request(H3ReadStream::new(0, server_recv), connection.clone()).await?;
+            let request = server::read_request(
+                H3ReadStream::new(0, server_recv),
+                connection.qpack().clone(),
+            )
+            .await?;
             let method = request.method();
             let server::Request::Streaming(mut request) = request else {
                 panic!("expected streaming request")
@@ -111,7 +117,7 @@ async fn streaming_echo() {
                 server::write_streaming_response(
                     response,
                     H3WriteStream::new(0, server_send),
-                    connection.clone(),
+                    connection.qpack().clone(),
                     &method,
                 ),
                 async {

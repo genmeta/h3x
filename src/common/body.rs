@@ -1,6 +1,5 @@
 //! Application body handles, incoming-body driving, and HTTP/3 body framing.
-
-use std::{marker::PhantomData, sync::Arc};
+use std::marker::PhantomData;
 
 use bytes::Bytes;
 use http::{Method, StatusCode};
@@ -11,7 +10,7 @@ use crate::{
     ArcWndBuf, ErrorCode, Result,
     protocol::{
         frame::{self, Data, Frame, H3Frame, Write as _, be_frame},
-        qpack::Qpack,
+        qpack::ArcQpack,
         stream::H3ReadStream,
     },
 };
@@ -109,7 +108,7 @@ impl Body<ArcWndBuf, Read> {
 pub(crate) fn receive<RS>(
     mut rs: BufReader<H3ReadStream<RS>>,
     mode: BodyMode,
-    qpack: Arc<Qpack>,
+    qpack: ArcQpack,
 ) -> Body<ArcWndBuf, Read>
 where
     RS: AsyncRead + Unpin + Send + 'static,
@@ -120,6 +119,12 @@ where
     tokio::spawn(async move {
         let result = read_body(&mut rs, &mut buffer, mode, &qpack).await;
         if let Err(error) = &result {
+            if matches!(
+                error.code,
+                ErrorCode::H3_FRAME_ERROR | ErrorCode::H3_FRAME_UNEXPECTED
+            ) {
+                qpack.on_error(error.clone());
+            }
             let _ = qpack.cancel(stream_id);
             buffer.on_error(error.clone());
         }
@@ -171,7 +176,7 @@ pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     read_stream: &mut BufReader<H3ReadStream<R>>,
     body: &mut W,
     mode: BodyMode,
-    qpack: &Qpack,
+    qpack: &ArcQpack,
 ) -> Result<()> {
     let mut remaining = mode.content_length();
     let mut trailers = false;

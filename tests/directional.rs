@@ -43,7 +43,8 @@ async fn directional_bodies_echo_with_backpressure() {
             },
             async {
                 let request =
-                    server::read_request(H3ReadStream::new(0, sr), connection.clone()).await?;
+                    server::read_request(H3ReadStream::new(0, sr), connection.qpack().clone())
+                        .await?;
                 let method = request.method();
                 let mut input = request.into_body();
                 let mut output = Body::<WndBuf, W>::with_capacity(2);
@@ -53,7 +54,7 @@ async fn directional_bodies_echo_with_backpressure() {
                     server::write_streaming_response(
                         response,
                         H3WriteStream::new(0, ss),
-                        connection.clone(),
+                        connection.qpack().clone(),
                         &method
                     ),
                     async {
@@ -93,7 +94,7 @@ async fn response_does_not_wait_for_upload_to_finish() {
     server::write_bytes_response(
         response,
         H3WriteStream::new(0, &mut encoded),
-        connection.clone(),
+        connection.qpack().clone(),
         &Method::HEAD,
     )
     .await

@@ -7,7 +7,7 @@ use super::*;
 use crate::{
     ReadStream,
     common::message::{ReadResponse, WriteRequest, WriteStream},
-    protocol::qpack::{self, WriteFieldSection},
+    protocol::qpack::{self, ArcQpack, WriteFieldSection},
 };
 
 mod errors;
@@ -22,7 +22,7 @@ fn request<RS, WS, R>(
     request: R,
     recv: H3ReadStream<RS>,
     send: H3WriteStream<WS>,
-    qpack: Arc<Qpack>,
+    qpack: ArcQpack,
 ) -> impl Future<Output = Result<Response>> + Send
 where
     RS: AsyncRead + Unpin + Send + 'static,

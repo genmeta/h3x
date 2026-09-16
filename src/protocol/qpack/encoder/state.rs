@@ -3,8 +3,6 @@ use std::collections::{HashMap, VecDeque};
 
 use bytes::Bytes;
 use qbase::varint::VARINT_MAX;
-#[cfg(test)]
-use tokio::sync::mpsc;
 
 use super::super::{
     Field, Settings,
@@ -413,6 +411,8 @@ impl State {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc;
+
     use super::*;
 
     struct Encoder {
@@ -441,7 +441,7 @@ mod tests {
                     Box::new(move |batch| {
                         sender
                             .try_send(batch)
-                            .map_err(crate::protocol::connection::instruction_send_error)
+                            .map_err(crate::protocol::qpack::instruction_send_error)
                     }),
                 )?,
                 sent_insert_count: 0,
@@ -464,6 +464,12 @@ mod tests {
         type Target = DecoderState;
         fn deref(&self) -> &DecoderState {
             &self.state
+        }
+    }
+
+    impl std::ops::DerefMut for Decoder {
+        fn deref_mut(&mut self) -> &mut DecoderState {
+            &mut self.state
         }
     }
 
@@ -566,7 +572,7 @@ mod tests {
             Box::new(move |batch| {
                 sender
                     .try_send(batch)
-                    .map_err(crate::protocol::connection::instruction_send_error)
+                    .map_err(crate::protocol::qpack::instruction_send_error)
             }),
         )
         .unwrap();

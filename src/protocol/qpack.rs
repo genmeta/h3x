@@ -1,20 +1,23 @@
 //! Compression state for the two independent QPACK directions.
 
-use std::sync::Arc;
+use std::{
+    future::poll_fn,
+    sync::{Arc, Mutex},
+    task::Poll,
+};
 
 use bytes::Bytes;
+use codec::instruction::{EncoderInstruction, WriteInstruction};
 use qbase::varint::VARINT_MAX;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use super::frame;
+use super::{frame, frame::StreamType};
 use crate::{Error, ErrorCode, Result};
 
 mod codec;
 pub(super) mod decoder;
 pub(super) mod encoder;
 mod table;
-
-#[cfg(test)]
-pub(crate) mod tests;
 
 pub(crate) use codec::field::Field;
 #[cfg(test)]
@@ -64,77 +67,538 @@ pub(crate) fn limits(settings: &frame::Settings) -> (Settings, u64) {
     )
 }
 
-/// Owns the outgoing encoder and incoming decoder state.
+/// Encoder and decoder share one lock and one terminal error.
 pub struct Qpack {
-    pub(super) encoder: Arc<Encoder>,
+    pub(super) encoder: Encoder,
     pub(super) decoder: Decoder,
+    on_failure: Option<Box<dyn FnOnce(Error) + Send>>,
 }
 
-impl Qpack {
-    pub(super) fn new(settings: &super::connection::Settings) -> Result<Arc<Self>> {
-        let (local, max_fields) = limits(&settings.local);
-        let encoder = Arc::new(Encoder::new(Settings::default())?);
-        let decoder = Decoder::new(local, MAX_BLOCKED_FIELD_SECTION_BYTES, max_fields)?;
-        Ok(Arc::new(Self { encoder, decoder }))
+#[derive(Clone)]
+pub struct ArcQpack(Arc<Mutex<Result<Qpack>>>);
+
+impl std::ops::Deref for ArcQpack {
+    type Target = Mutex<Result<Qpack>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ArcQpack {
+    /// Run a synchronous operation while holding the shared state lock.
+    pub(super) fn with_state<T>(&self, f: impl FnOnce(&mut Qpack) -> Result<T>) -> Result<T> {
+        let mut shared = self.lock().unwrap();
+        f(shared.as_mut().map_err(|error| error.clone())?)
     }
 
-    pub(super) async fn receive_encoder<R: tokio::io::AsyncRead + Unpin>(
-        &self,
-        recv: &mut R,
-    ) -> Result<()> {
-        self.decoder.receive(recv).await
-    }
-
-    pub(super) async fn receive_decoder<R: tokio::io::AsyncRead + Unpin>(
-        &self,
-        recv: &mut R,
-    ) -> Result<()> {
-        self.encoder.receive(recv).await
-    }
-
-    pub(crate) fn configure(&self, peer: Settings, max_fields: u64) -> Result<()> {
-        self.encoder.configure(peer, max_fields)
-    }
-
-    #[cfg(test)]
     pub(crate) fn error(&self) -> Option<Error> {
-        self.encoder.error()
+        self.lock().unwrap().as_ref().err().cloned()
     }
 
-    pub(crate) fn close(&self, error: Error) -> Error {
-        let error = self.encoder.close(error);
-        self.decoder.close(error.clone());
+    fn critical_stream_error(&self) -> Error {
+        self.error().unwrap_or_else(|| {
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("critical HTTP/3 stream closed")
+        })
+    }
+
+    /// Construct compression state with instruction queues and connection shutdown wired in.
+    pub(super) fn new<T: crate::Transport>(
+        settings: &super::connection::Settings,
+        transport: Arc<T>,
+    ) -> Result<(Self, encoder::Instructions, decoder::Instructions)> {
+        let (local, max_fields) = limits(&settings.local);
+        let mut encoder = Encoder::new(Settings::default())?;
+        let mut decoder = Decoder::new(local, MAX_BLOCKED_FIELD_SECTION_BYTES, max_fields)?;
+        let (encoder_tx, encoder_rx) = tokio::sync::mpsc::channel(MAX_PENDING_INSTRUCTION);
+        let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(MAX_PENDING_INSTRUCTION);
+        encoder.on_instruction(move |batch| {
+            encoder_tx.try_send(batch).map_err(instruction_send_error)
+        });
+        decoder.on_instruction(move |batch| {
+            decoder_tx.try_send(batch).map_err(instruction_send_error)
+        });
+        Ok((
+            Self(Arc::new(Mutex::new(Ok(Qpack {
+                encoder,
+                decoder,
+                on_failure: Some(Box::new(move |error| {
+                    let _ = transport.close(error.reason, error.code.as_u64());
+                })),
+            })))),
+            encoder_rx,
+            decoder_rx,
+        ))
+    }
+    pub(crate) fn configure(&self, peer: Settings, max_fields: u64) -> Result<()> {
+        self.with_state(|state| state.encoder.configure(peer, max_fields))
+    }
+
+    /// Atomically fail both directions, preserving the first error.
+    pub fn on_error(&self, error: Error) -> Error {
+        let mut qpack = {
+            let mut shared = self.lock().unwrap();
+            if let Err(error) = &*shared {
+                return error.clone();
+            }
+            let Ok(qpack) = std::mem::replace(&mut *shared, Err(error.clone())) else {
+                unreachable!()
+            };
+            qpack
+        };
+        let wakes = qpack.decoder.take_waiters();
+        // Closing the transport also interrupts pending stream creation and I/O.
+        if let Some(on_failure) = qpack.on_failure.take() {
+            on_failure(error.clone());
+        }
+        // Releasing callbacks closes the instruction queues. Wake outside the shared lock.
+        drop(qpack);
+        for wake in wakes {
+            wake.wake();
+        }
         error
     }
 
     pub(crate) fn encode(&self, id: u64, fields: Vec<Field>) -> Result<Bytes> {
-        self.encoder.encode(id, fields)
+        self.with_state(|state| state.encoder.encode(id, fields))
     }
 
     pub(crate) async fn decode(&self, id: u64, payload: Bytes) -> Result<Vec<Field>> {
-        self.decoder.decode(id, payload).await
+        let result = self.decode_fields(id, payload).await;
+        result.map_err(|error| {
+            if error.code == ErrorCode::QPACK_DECOMPRESSION_FAILED {
+                self.on_error(error)
+            } else {
+                error
+            }
+        })
     }
 
-    /// Cancel reception and synchronously submit any required QPACK feedback.
-    pub fn cancel(&self, stream_id: u64) -> Result<()> {
-        self.decoder.cancel(stream_id)
+    async fn decode_fields(&self, id: u64, payload: Bytes) -> Result<Vec<Field>> {
+        let (offset, prefix) = self.with_state(|state| state.decoder.begin_decode(id, &payload))?;
+        let _decoding = StreamDecoder {
+            qpack: self,
+            stream_id: id,
+        };
+        poll_fn(|cx| {
+            self.with_state(|state| {
+                Ok(state
+                    .decoder
+                    .poll_registered_decode(id, prefix, &payload[offset..], cx))
+            })
+            .unwrap_or_else(|error| Poll::Ready(Err(error)))
+        })
+        .await
+    }
+
+    pub fn cancel(&self, id: u64) -> Result<()> {
+        let wakes = self.with_state(|state| state.decoder.cancel(id))?;
+        for wake in wakes {
+            wake.wake();
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn receive_encoder<R: tokio::io::AsyncRead + Unpin>(
+        &self,
+        recv: &mut R,
+    ) -> Result<()> {
+        loop {
+            self.with_state(|_| Ok(()))?;
+            let instruction = codec::instruction::be_encoder_instruction(recv).await?;
+            let wakes =
+                self.with_state(|state| state.decoder.on_encoder_instruction(instruction))?;
+            for wake in wakes {
+                wake.wake();
+            }
+        }
+    }
+
+    pub(crate) async fn receive_decoder<R: tokio::io::AsyncRead + Unpin>(
+        &self,
+        recv: &mut R,
+    ) -> Result<()> {
+        loop {
+            self.with_state(|_| Ok(()))?;
+            let instruction = codec::instruction::be_decoder_instruction(recv).await?;
+            self.with_state(|state| state.encoder.on_decoder_instruction(instruction))?;
+        }
+    }
+
+    pub(crate) async fn write_encoder<W: AsyncWrite + Unpin>(
+        &self,
+        mut instructions: encoder::Instructions,
+        writer: &mut W,
+    ) -> Result<()> {
+        self.with_state(|_| Ok(()))?;
+        writer
+            .write_all(&[StreamType::QpackEncoder as u8])
+            .await
+            .map_err(|error| crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM))?;
+        let mut buf = Vec::new();
+        while let Some(batch) = instructions.recv().await {
+            self.with_state(|_| Ok(()))?;
+            for instruction in batch {
+                buf.clear();
+                buf.put_encoder_instruction(&instruction)?;
+                writer.write_all(&buf).await.map_err(|error| {
+                    crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM)
+                })?;
+                if !matches!(instruction, EncoderInstruction::SetDynamicTableCapacity(_)) {
+                    self.with_state(|state| {
+                        state.encoder.record_insert_written();
+                        Ok(())
+                    })?;
+                }
+            }
+        }
+        Err(self.critical_stream_error())
+    }
+
+    pub(crate) async fn write_decoder<W: AsyncWrite + Unpin>(
+        &self,
+        mut receiver: decoder::Instructions,
+        writer: &mut W,
+    ) -> Result<()> {
+        self.with_state(|_| Ok(()))?;
+        writer
+            .write_all(&[StreamType::QpackDecoder as u8])
+            .await
+            .map_err(|error| crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM))?;
+        let mut buf = Vec::new();
+        while let Some(batch) = receiver.recv().await {
+            self.with_state(|_| Ok(()))?;
+            for instruction in batch {
+                buf.clear();
+                buf.put_decoder_instruction(&instruction)?;
+                writer.write_all(&buf).await.map_err(|error| {
+                    crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM)
+                })?;
+            }
+        }
+        Err(self.critical_stream_error())
+    }
+
+    pub(crate) async fn sync_encoder<T: crate::Transport>(
+        &self,
+        transport: Arc<T>,
+        instructions: encoder::Instructions,
+    ) -> Result<()> {
+        tokio::select! {
+            biased;
+            error = transport.terminated() => Err(error),
+            result = async {
+                let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
+                    ErrorCode::H3_STREAM_CREATION_ERROR.with_reason("unable to create the required stream")
+                })?;
+                self.write_encoder(instructions, &mut send).await
+            } => result,
+        }
+        .map_err(|error| self.on_error(error))
+    }
+
+    pub(crate) async fn sync_decoder<T: crate::Transport>(
+        &self,
+        transport: Arc<T>,
+        instructions: decoder::Instructions,
+    ) -> Result<()> {
+        tokio::select! {
+            biased;
+            error = transport.terminated() => Err(error),
+            result = async {
+                let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
+                    ErrorCode::H3_STREAM_CREATION_ERROR.with_reason("unable to create the required stream")
+                })?;
+                self.write_decoder(instructions, &mut send).await
+            } => result,
+        }
+        .map_err(|error| self.on_error(error))
     }
 }
 
-/// Transport termination is propagated to QPACK and active streams by the accept task.
-async fn drive<T: crate::Transport>(
-    transport: std::sync::Arc<T>,
-    write: impl AsyncFnOnce(&mut T::StreamWriter) -> Result<()>,
-) -> Result<()> {
-    let writing = async {
-        let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
-            ErrorCode::H3_STREAM_CREATION_ERROR.with_reason("unable to create the required stream")
-        })?;
-        write(&mut send).await
-    };
-    tokio::select! {
-        biased;
-        error = transport.terminated() => Err(error),
-        result = writing => result,
+/// Only a registered decode owns cancellation; rejected and unpolled futures do not.
+struct StreamDecoder<'a> {
+    qpack: &'a ArcQpack,
+    stream_id: u64,
+}
+impl Drop for StreamDecoder<'_> {
+    fn drop(&mut self) {
+        let result = {
+            let mut shared = self.qpack.lock().unwrap();
+            let Ok(qpack) = &mut *shared else {
+                return;
+            };
+            qpack.decoder.cancel_registered(self.stream_id)
+        };
+        match result {
+            Ok(wakes) => {
+                for wake in wakes {
+                    wake.wake();
+                }
+            }
+            Err(error) => {
+                self.qpack.on_error(error);
+            }
+        }
+    }
+}
+
+/// Channel producers run under QPACK state locks and must never block.
+pub(super) fn instruction_send_error<T>(error: tokio::sync::mpsc::error::TrySendError<T>) -> Error {
+    match error {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => {
+            ErrorCode::H3_EXCESSIVE_LOAD.with_reason("QPACK instruction queue is full")
+        }
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("QPACK instruction receiver is closed")
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sync_tasks_preserve_transport_termination() {
+        use crate::{Transport, test_support::TestTransport};
+
+        for encoder in [true, false] {
+            let transport = Arc::new(TestTransport::default());
+            let (qpack, _encoder_rx, _decoder_rx) =
+                ArcQpack::new(&crate::Settings::default(), transport.clone()).unwrap();
+            let error = ErrorCode::H3_NO_ERROR.with_reason("peer closed the connection");
+            let (encoder_tx, encoder_rx) = tokio::sync::mpsc::channel(1);
+            let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(1);
+            let task = tokio::spawn({
+                let qpack = qpack.clone();
+                let transport = transport.clone();
+                async move {
+                    if encoder {
+                        qpack.sync_encoder(transport, encoder_rx).await
+                    } else {
+                        qpack.sync_decoder(transport, decoder_rx).await
+                    }
+                }
+            });
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+            transport
+                .close(error.reason.clone(), error.code.as_u64())
+                .unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result, Err(error.clone()));
+            assert_eq!(qpack.error(), Some(error));
+            drop((encoder_tx, decoder_tx));
+        }
+    }
+
+    #[tokio::test]
+    async fn qpack_failure_closes_transport_while_instruction_queues_remain_open() {
+        use crate::{Transport, test_support::TestTransport};
+
+        for encoder in [true, false] {
+            let transport = Arc::new(TestTransport::default());
+            let (qpack, _encoder_rx, _decoder_rx) =
+                ArcQpack::new(&crate::Settings::default(), transport.clone()).unwrap();
+            let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("invalid field section");
+            let (encoder_tx, encoder_rx) = tokio::sync::mpsc::channel(1);
+            let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(1);
+            let task = tokio::spawn({
+                let qpack = qpack.clone();
+                let transport = transport.clone();
+                async move {
+                    if encoder {
+                        qpack.sync_encoder(transport, encoder_rx).await
+                    } else {
+                        qpack.sync_decoder(transport, decoder_rx).await
+                    }
+                }
+            });
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+            qpack.on_error(error.clone());
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result, Err(error.clone()));
+            assert_eq!(transport.terminated().await, error.clone());
+            assert_eq!(qpack.error(), Some(error));
+            drop((encoder_tx, decoder_tx));
+        }
+    }
+
+    #[tokio::test]
+    async fn qpack_failure_closes_transport_without_sync_tasks() {
+        use crate::{Transport, test_support::TestTransport};
+
+        let transport = Arc::new(TestTransport::default());
+        let (qpack, _encoder_rx, _decoder_rx) =
+            ArcQpack::new(&crate::Settings::default(), transport.clone()).unwrap();
+        let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("invalid field section");
+        assert_eq!(qpack.on_error(error.clone()), error);
+        assert_eq!(
+            qpack.on_error(ErrorCode::H3_INTERNAL_ERROR.with_reason("later failure")),
+            error
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), transport.terminated())
+                .await
+                .unwrap(),
+            error
+        );
+    }
+
+    #[test]
+    fn limits_use_protocol_defaults_and_explicit_settings() {
+        assert_eq!(
+            limits(&frame::Settings::default()),
+            (Settings::default(), VARINT_MAX)
+        );
+        let settings = crate::Settings::new(1024, 128, 3).unwrap();
+        assert_eq!(
+            limits(&settings.local),
+            (
+                Settings {
+                    max_table_capacity: 128,
+                    blocked_streams: 3
+                },
+                1024
+            )
+        );
+        let settings = crate::Settings::new(0, 0, 0).unwrap();
+        assert_eq!(limits(&settings.local), (Settings::default(), 0));
+    }
+
+    #[tokio::test]
+    async fn on_error_preserves_first_error_across_both_directions() {
+        let connection = crate::test_support::connection().await;
+        let qpack = connection.qpack();
+        assert_eq!(
+            ErrorCode::from(qpack.on_error(
+                ErrorCode::H3_INTERNAL_ERROR.with_reason("test terminates compression state")
+            )),
+            ErrorCode::H3_INTERNAL_ERROR
+        );
+        assert_eq!(
+            ErrorCode::from(qpack.on_error(
+                ErrorCode::H3_EXCESSIVE_LOAD.with_reason("test terminates compression state")
+            )),
+            ErrorCode::H3_INTERNAL_ERROR
+        );
+        assert_eq!(
+            (qpack.encode(0, Vec::new())).map_err(ErrorCode::from),
+            Err(ErrorCode::H3_INTERNAL_ERROR)
+        );
+        assert_eq!(
+            (qpack.decode(0, Bytes::from_static(&[0, 0])).await).map_err(ErrorCode::from),
+            Err(ErrorCode::H3_INTERNAL_ERROR)
+        );
+        assert_eq!(
+            (qpack.cancel(0)).map_err(ErrorCode::from),
+            Err(ErrorCode::H3_INTERNAL_ERROR)
+        );
+        assert_eq!(
+            (qpack.configure(Settings::default(), VARINT_MAX)).map_err(ErrorCode::from),
+            Err(ErrorCode::H3_INTERNAL_ERROR)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_field_section_closes_both_directions() {
+        let connection = crate::test_support::connection().await;
+        let qpack = connection.qpack();
+        let result = crate::server::read_request(
+            crate::H3ReadStream::new(0, &b"\x01\x01\x00"[..]),
+            connection.qpack().clone(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(h3x::Error {
+                code: ErrorCode::QPACK_DECOMPRESSION_FAILED,
+                ..
+            })
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while qpack.error().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            (qpack.error()).map(ErrorCode::from),
+            Some(ErrorCode::QPACK_DECOMPRESSION_FAILED)
+        );
+        assert_eq!(
+            (qpack.encode(4, Vec::new())).map_err(ErrorCode::from),
+            Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
+        );
+        assert_eq!(
+            (qpack.decode(4, Bytes::from_static(&[0, 0])).await).map_err(ErrorCode::from),
+            Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
+        );
+    }
+
+    #[test]
+    fn construction_does_not_require_a_runtime() {
+        let (qpack, _encoder_rx, _decoder_rx) = ArcQpack::new(
+            &crate::Settings::default(),
+            Arc::new(crate::test_support::TestTransport::default()),
+        )
+        .unwrap();
+        assert!(qpack.encode(0, Vec::new()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn on_error_wakes_both_instruction_writers_and_blocked_decode_with_first_error() {
+        let (qpack, encoder_rx, decoder_rx) = ArcQpack::new(
+            &crate::Settings::new(1024, 128, 1).unwrap(),
+            Arc::new(crate::test_support::TestTransport::default()),
+        )
+        .unwrap();
+        let encoding = tokio::spawn({
+            let qpack = qpack.clone();
+            async move {
+                qpack
+                    .write_encoder(encoder_rx, &mut tokio::io::sink())
+                    .await
+            }
+        });
+        let feedback = tokio::spawn({
+            let qpack = qpack.clone();
+            async move {
+                qpack
+                    .write_decoder(decoder_rx, &mut tokio::io::sink())
+                    .await
+            }
+        });
+        let decoding = tokio::spawn({
+            let qpack = qpack.clone();
+            async move { qpack.decode(0, Bytes::from_static(&[2, 0, 0x80])).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!encoding.is_finished());
+        assert!(!feedback.is_finished());
+        assert!(!decoding.is_finished());
+        let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("invalid dynamic reference");
+        assert_eq!(qpack.on_error(error.clone()), error);
+        assert_eq!(
+            qpack.on_error(ErrorCode::H3_INTERNAL_ERROR.with_reason("later failure")),
+            error
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            assert_eq!(encoding.await.unwrap(), Err(error.clone()));
+            assert_eq!(feedback.await.unwrap(), Err(error.clone()));
+            assert_eq!(decoding.await.unwrap(), Err(error.clone()));
+        })
+        .await
+        .unwrap();
+        assert_eq!(qpack.encode(4, Vec::new()), Err(error.clone()));
+        assert_eq!(qpack.cancel(4), Err(error));
     }
 }

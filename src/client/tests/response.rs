@@ -51,7 +51,7 @@ async fn preserves_set_cookie_headers_through_message_roundtrip() {
         let outgoing = crate::server::Response::from(response.message.test_direction());
         let mut reencoded = Vec::new();
         let send = H3WriteStream::new(4, &mut reencoded);
-        let qpack = crate::test_support::connection().await;
+        let qpack = crate::test_support::connection().await.qpack().clone();
         crate::server::write_streaming_response(outgoing, send, qpack, &Method::GET)
             .await
             .unwrap();

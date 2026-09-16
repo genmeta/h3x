@@ -3,7 +3,7 @@ use super::*;
 async fn read_request<R: AsyncRead + Unpin + Send + 'static>(recv: R) -> Result<Request> {
     super::accept(
         H3ReadStream::new(0, recv),
-        crate::test_support::connection().await,
+        crate::test_support::connection().await.qpack().clone(),
     )
     .await
 }
