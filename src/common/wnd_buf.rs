@@ -1,5 +1,4 @@
 use std::{
-    future::poll_fn,
     io,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -17,7 +16,6 @@ pub(crate) struct WndBuf {
     len: usize,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
-    error_waker: Option<Waker>,
     fin: bool,
 }
 
@@ -32,7 +30,6 @@ impl WndBuf {
             len: 0,
             read_waker: None,
             write_waker: None,
-            error_waker: None,
             fin: false,
         }
     }
@@ -126,41 +123,17 @@ impl ArcWndBuf {
         }
     }
 
-    pub(crate) fn set_error(&self, error: crate::ErrorCode) {
-        let (reader, writer, observer) = {
-            let mut state = self.shared.lock().unwrap();
-            let Ok(window) = &mut *state else {
-                return;
-            };
-            let wakers = (
-                window.read_waker.take(),
-                window.write_waker.take(),
-                window.error_waker.take(),
-            );
-            *state = Err(error);
-            wakers
-        };
-        if let Some(waker) = reader {
-            waker.wake();
-        }
-        if let Some(waker) = writer {
-            waker.wake();
-        }
-        if let Some(waker) = observer {
-            waker.wake();
-        }
-    }
-
-    /// Observe explicit reset/stop or I/O failure even while a pump waits on the network.
-    pub(crate) async fn error(&self) -> crate::ErrorCode {
-        poll_fn(|cx| match &mut *self.shared.lock().unwrap() {
-            Ok(window) => {
-                window.error_waker = Some(cx.waker().clone());
-                Poll::Pending
+    pub(crate) fn on_error(&self, error: crate::ErrorCode) {
+        let mut state = self.shared.lock().unwrap();
+        if let Ok(window) = &mut *state {
+            if let Some(waker) = window.read_waker.take() {
+                waker.wake();
             }
-            Err(error) => Poll::Ready(*error),
-        })
-        .await
+            if let Some(waker) = window.write_waker.take() {
+                waker.wake();
+            }
+            *state = Err(error);
+        }
     }
 
     fn poll_io<T>(
@@ -383,8 +356,8 @@ mod tests {
                         .is_pending()
                 );
             }
-            reader.set_error(crate::ErrorCode::H3_REQUEST_CANCELLED);
-            writer.set_error(crate::ErrorCode::H3_INTERNAL_ERROR);
+            reader.on_error(crate::ErrorCode::H3_REQUEST_CANCELLED);
+            writer.on_error(crate::ErrorCode::H3_INTERNAL_ERROR);
             assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
             let results = [
                 Pin::new(&mut reader)

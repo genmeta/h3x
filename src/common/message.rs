@@ -438,13 +438,13 @@ impl<H: Clone, B> ArcMessage<H, B> {
 
 impl<H, B: Clone, IO> ArcMessage<H, Body<B, IO>> {
     pub(crate) fn body_handle(&self) -> Body<B, IO> {
-        Body::from_storage(self.body.lock().unwrap().storage.clone())
+        Body::new(self.body.lock().unwrap().storage.clone())
     }
 
     pub(crate) fn into_body(self) -> Body<B, IO> {
         match Arc::try_unwrap(self.body) {
             Ok(body) => body.into_inner().unwrap(),
-            Err(body) => Body::from_storage(body.lock().unwrap().storage.clone()),
+            Err(body) => Body::new(body.lock().unwrap().storage.clone()),
         }
     }
 
@@ -455,7 +455,7 @@ impl<H, B: Clone, IO> ArcMessage<H, Body<B, IO>> {
     {
         ArcMessage {
             head: Arc::new(Mutex::new(self.head.lock().unwrap().clone())),
-            body: Arc::new(Mutex::new(Body::from_storage(
+            body: Arc::new(Mutex::new(Body::new(
                 self.body.lock().unwrap().storage.clone(),
             ))),
         }

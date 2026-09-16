@@ -148,7 +148,7 @@ async fn writes_buffered_and_streaming_response_frames() {
     assert_eq!(input, b"hello");
 
     let message = Message::<headers::ResponseHead, Bytes>::default()
-        .with_body(crate::Body::from_storage(ArcWndBuf::new(2)));
+        .with_body(crate::Body::new(ArcWndBuf::new(2)));
     let mut response = Response::from(ArcMessage::from(message));
     response.set_status(StatusCode::OK);
     let mut producer = Response::from(response.message.clone());
@@ -193,7 +193,7 @@ async fn writes_buffered_and_streaming_response_frames() {
     assert!(output.is_empty());
 
     let message = Message::<headers::ResponseHead, Bytes>::default()
-        .with_body(crate::Body::from_storage(ArcWndBuf::new(1)));
+        .with_body(crate::Body::new(ArcWndBuf::new(1)));
     let mut response = Response::from(ArcMessage::from(message));
     response.set_status(StatusCode::OK);
     let mut producer = Response::from(response.message.clone());

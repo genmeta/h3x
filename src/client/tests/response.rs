@@ -1,13 +1,9 @@
 use super::*;
+use crate::protocol::frame::Data;
 
 async fn read_response<R: AsyncRead + Unpin + Send + 'static>(recv: R) -> Result<Response> {
     let connection = crate::test_support::connection();
-    super::read_response(
-        H3ReadStream::new(0, recv),
-        connection.qpack().clone(),
-        None,
-    )
-    .await
+    super::read_response(H3ReadStream::new(0, recv), connection.qpack().clone(), None).await
 }
 
 #[tokio::test]
@@ -205,7 +201,10 @@ async fn response_content_length_and_streaming() {
     else {
         panic!("incoming responses are always streaming")
     };
-    assert_eq!(response.read(&mut [0]).await, Err(ErrorCode::H3_FRAME_ERROR));
+    assert_eq!(
+        response.read(&mut [0]).await,
+        Err(ErrorCode::H3_FRAME_ERROR)
+    );
 
     for (suffix, expected) in [
         (&[2, 0][..], ErrorCode::H3_FRAME_UNEXPECTED),

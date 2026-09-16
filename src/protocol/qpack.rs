@@ -22,6 +22,12 @@ pub(crate) use codec::field::{WriteFieldSection, be_field_section};
 use decoder::Decoder;
 use encoder::Encoder;
 
+/// Maximum queued operation batches per QPACK direction. Producers never block.
+pub(super) const MAX_PENDING_INSTRUCTION: usize = 16;
+
+/// Aggregate field bytes retained while waiting for dynamic-table insertions.
+const MAX_BLOCKED_FIELD_SECTION_BYTES: usize = 64 * 1024;
+
 /// Local policy permitted by RFC 9204 section 7.1.3; not an RFC-mandated list.
 fn should_never_index(name: &[u8]) -> bool {
     matches!(
@@ -60,19 +66,16 @@ pub(crate) fn limits(settings: &frame::Settings) -> (Settings, u64) {
 
 /// Owns the outgoing encoder and incoming decoder state.
 pub struct Qpack {
-    encoder: Encoder,
-    decoder: Decoder,
+    pub(super) encoder: Arc<Encoder>,
+    pub(super) decoder: Decoder,
 }
 
 impl Qpack {
-    pub(super) fn new(
-        settings: &super::connection::Settings,
-    ) -> Result<(Arc<Self>, encoder::InstructionSource, decoder::Instructions)> {
+    pub(super) fn new(settings: &super::connection::Settings) -> Result<Arc<Self>> {
         let (local, max_fields) = limits(&settings.local);
-        let (encoder, instruction) = Encoder::new(Settings::default())?;
-        let (decoder, feedback) =
-            Decoder::new(local, frame::MAX_BUFFERED_FRAME_PAYLOAD, max_fields)?;
-        Ok((Arc::new(Self { encoder, decoder }), instruction, feedback))
+        let encoder = Arc::new(Encoder::new(Settings::default())?);
+        let decoder = Decoder::new(local, MAX_BLOCKED_FIELD_SECTION_BYTES, max_fields)?;
+        Ok(Arc::new(Self { encoder, decoder }))
     }
 
     pub(super) async fn receive_encoder<R: tokio::io::AsyncRead + Unpin>(
@@ -115,5 +118,34 @@ impl Qpack {
     /// Cancel reception and synchronously submit any required QPACK feedback.
     pub fn cancel(&self, stream_id: u64) -> Result<()> {
         self.decoder.cancel(stream_id)
+    }
+}
+
+/// Transport termination is propagated to QPACK and active streams by the accept task.
+async fn drive<T: crate::Transport>(
+    transport: std::sync::Arc<T>,
+    write: impl AsyncFnOnce(&mut T::StreamWriter) -> Result<()>,
+) {
+    let writing = async {
+        let stream = transport
+            .open_uni()
+            .await
+            .and_then(|stream| stream.ok_or(ErrorCode::H3_STREAM_CREATION_ERROR));
+        match stream {
+            Ok((_, mut send)) => {
+                if let Err(error) = write(&mut send).await {
+                    // Keep the critical stream alive until transport close is requested.
+                    let _ = transport.close(error.to_string(), error.as_u64());
+                }
+            }
+            Err(error) => {
+                let _ = transport.close(error.to_string(), error.as_u64());
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = transport.terminated() => {},
+        _ = writing => {},
     }
 }

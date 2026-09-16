@@ -108,7 +108,7 @@ async fn streaming_request_frames_and_errors() {
             message.set_header(header::CONTENT_LENGTH, length.parse().unwrap());
         }
         let req = Request::from(ArcMessage::from(
-            message.with_body(crate::Body::from_storage(ArcWndBuf::new(2))),
+            message.with_body(crate::Body::new(ArcWndBuf::new(2))),
         ));
         let mut producer = Request::from(req.message.clone());
         let (writer, mut reader) = duplex(3);
@@ -159,7 +159,7 @@ async fn streaming_request_frames_and_errors() {
     let req = Request::from(ArcMessage::from(
         Message::<headers::RequestHead, Bytes>::post("https://example.com/")
             .unwrap()
-            .with_body(crate::Body::from_storage(ArcWndBuf::new(1))),
+            .with_body(crate::Body::new(ArcWndBuf::new(1))),
     ));
     let mut producer = Request::from(req.message.clone());
     let (writer, reader) = duplex(1);

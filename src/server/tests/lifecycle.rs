@@ -19,7 +19,7 @@ async fn dropping_last_producer_does_not_finish_or_cancel_sending() {
     drop(producer);
     assert!(sending.as_mut().poll(&mut cx).is_pending());
     // Only an explicit buffer error terminates the send operation.
-    buffer.set_error(ErrorCode::H3_REQUEST_CANCELLED);
+    buffer.on_error(ErrorCode::H3_REQUEST_CANCELLED);
     assert_eq!(sending.await, Err(ErrorCode::H3_REQUEST_CANCELLED));
 }
 
@@ -75,7 +75,7 @@ async fn finished_response_producer_can_drop_before_or_during_send() {
 async fn buffered_body_snapshots_and_shared_streams() {
     let message = Message::<headers::RequestHead, Bytes>::post("https://example.com/echo?q=1")
         .unwrap()
-        .with_body(crate::Body::from_storage(Bytes::from_static(b"request")));
+        .with_body(crate::Body::new(Bytes::from_static(b"request")));
     let request = common::request::Request::<Read, _>::from(ArcMessage::from(message));
     let mut incoming = common::request::Request::<Write, _>::from(request.message.test_direction());
     incoming.set_body(Bytes::from_static(b"changed"));
@@ -95,11 +95,11 @@ async fn buffered_body_snapshots_and_shared_streams() {
 
     let message = Message::<headers::RequestHead, Bytes>::get("https://example.com/")
         .unwrap()
-        .with_body(crate::Body::from_storage(ArcWndBuf::new(2)));
+        .with_body(crate::Body::new(ArcWndBuf::new(2)));
     let mut request = common::request::Request::<Read, _>::from(ArcMessage::from(message));
     let mut incoming = common::request::Request::<Write, _>::from(request.message.test_direction());
     let message = Message::<headers::ResponseHead, Bytes>::default()
-        .with_body(crate::Body::from_storage(ArcWndBuf::new(2)));
+        .with_body(crate::Body::new(ArcWndBuf::new(2)));
     let mut response = Response::from(ArcMessage::from(message));
     response.set_status(StatusCode::OK);
     let mut outgoing =
@@ -199,7 +199,7 @@ async fn streaming_response_termination_reaches_the_producer() {
 }
 
 #[tokio::test]
-async fn explicit_stop_stops_a_pump_waiting_on_network() {
+async fn explicit_stop_stops_pump_when_body_write_resumes() {
     let (mut send, recv) = duplex(64);
     send.write_all(&request_frames(b"", None)).await.unwrap();
     let request = super::accept(
@@ -211,6 +211,7 @@ async fn explicit_stop_stops_a_pump_waiting_on_network() {
     assert!(matches!(&request, Request::Streaming(_)));
     tokio::task::yield_now().await; // Let the receive pump wait for another frame.
     request.into_body().stop().await;
+    send.write_all(&[0, 1, b'x']).await.unwrap();
     tokio::task::yield_now().await;
     assert!(send.write_all(b"x").await.is_err());
 }
@@ -332,8 +333,8 @@ async fn dropping_received_body_does_not_stop_network_reads() {
         let mut bytes = [0];
         buffer.read_exact(&mut bytes).await.unwrap();
         assert_eq!(bytes, *b"x");
-        // Explicit cancellation cleans up the task; dropping Body did not do so.
-        buffer.set_error(ErrorCode::H3_REQUEST_CANCELLED);
+        // Subsequent body I/O observes cancellation; dropping Body did not cancel it.
+        buffer.on_error(ErrorCode::H3_REQUEST_CANCELLED);
     })
     .await
     .unwrap();

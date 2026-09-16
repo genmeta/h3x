@@ -5,7 +5,6 @@ use std::{
 };
 
 use qbase::varint::VARINT_MAX;
-use tokio::sync::mpsc;
 
 use super::super::{
     Field, Settings,
@@ -24,7 +23,7 @@ pub(super) struct State {
     waiting: HashMap<u64, (u64, usize, Waker)>,
     blocked_bytes: usize,
     max_blocked_bytes: usize,
-    sender: mpsc::Sender<DecoderInstruction>,
+    pub(super) on_instruction: super::OnInstruction,
     pub(super) decoding_stream: HashSet<u64>,
 }
 
@@ -33,7 +32,7 @@ impl State {
         local: Settings,
         max_blocked_bytes: usize,
         max_fields: u64,
-        sender: mpsc::Sender<DecoderInstruction>,
+        on_instruction: super::OnInstruction,
     ) -> Result<Self> {
         if local.blocked_streams > VARINT_MAX {
             return Err(ErrorCode::H3_SETTINGS_ERROR);
@@ -45,7 +44,7 @@ impl State {
             waiting: HashMap::new(),
             blocked_bytes: 0,
             max_blocked_bytes,
-            sender,
+            on_instruction,
             decoding_stream: HashSet::new(),
         })
     }
@@ -171,12 +170,8 @@ impl State {
     /// connection instead of dropping an instruction or blocking under the
     /// decoder state lock.
     fn send_feedback(&self, instruction: DecoderInstruction) -> Result<()> {
-        self.sender
-            .try_send(instruction)
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ErrorCode::H3_EXCESSIVE_LOAD,
-                mpsc::error::TrySendError::Closed(_) => ErrorCode::H3_CLOSED_CRITICAL_STREAM,
-            })
+        // Each current decoder operation produces at most one feedback instruction.
+        (self.on_instruction)(vec![instruction])
     }
 
     /// Shared by immediate and resumed decoding: reject evicted/out-of-range references,

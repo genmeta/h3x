@@ -3,7 +3,7 @@ use std::sync::Arc;
 use qrecovery::{recv::StopSending, send::CancelStream};
 
 use super::{
-    qpack::Qpack,
+    qpack::{MAX_PENDING_INSTRUCTION, Qpack},
     stream::{H3ReadStream, H3WriteStream, bi::BiStreams},
 };
 use crate::{ErrorCode, Result, Transport};
@@ -32,12 +32,20 @@ impl<T: Transport> H3Connection<T> {
         let transport = Arc::new(transport);
         let settings = Arc::new(settings);
         let bi = Arc::new(BiStreams::new());
-        // 在这里创建 tx,rx
-        // qpack.encoder.on_instrction(|tx| (instrction){
-        //      tx.send(instrction)
-        // })
-        //  tokio::spawn(sync_qpack_encoder(transport,rx));
-        let (qpack, instruction, feedback) = Qpack::new(&settings)?;
+        let qpack = Qpack::new(&settings)?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(MAX_PENDING_INSTRUCTION);
+        qpack
+            .encoder
+            .on_instruction(move |batch| tx.try_send(batch).map_err(instruction_send_error));
+        tokio::spawn(qpack.encoder.sync(transport.clone(), rx));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(MAX_PENDING_INSTRUCTION);
+        qpack
+            .decoder
+            .on_instruction(move |batch| tx.try_send(batch).map_err(instruction_send_error));
+        tokio::spawn(qpack.decoder.sync(transport.clone(), rx));
+
         let cursor = Arc::new(StreamCursor::new(transport.role()));
         let connection = Self {
             transport,
@@ -46,8 +54,7 @@ impl<T: Transport> H3Connection<T> {
             cursor,
             bi_streams: bi,
         };
-        tokio::spawn(connection.clone().sync_qpack_encoder(instruction));
-        tokio::spawn(connection.clone().sync_qpack_decoder(feedback));
+
         tokio::spawn(connection.clone().sync_settings_and_goaway());
         tokio::spawn(connection.clone().accept_and_process_uni());
         Ok(connection)
@@ -119,5 +126,15 @@ impl<T: Transport> Clone for H3Connection<T> {
             cursor: self.cursor.clone(),
             bi_streams: self.bi_streams.clone(),
         }
+    }
+}
+
+/// Channel producers run under QPACK state locks and must never block.
+pub(super) fn instruction_send_error<T>(
+    error: tokio::sync::mpsc::error::TrySendError<T>,
+) -> ErrorCode {
+    match error {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => ErrorCode::H3_EXCESSIVE_LOAD,
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => ErrorCode::H3_CLOSED_CRITICAL_STREAM,
     }
 }

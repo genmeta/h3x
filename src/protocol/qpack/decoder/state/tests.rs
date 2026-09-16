@@ -10,8 +10,27 @@ use tokio::sync::mpsc;
 use crate::protocol::qpack::*;
 
 #[tokio::test]
+async fn feedback_writer_preserves_order_within_and_between_batches() {
+    let (tx, rx) = mpsc::channel(MAX_PENDING_INSTRUCTION);
+    tx.try_send(vec![
+        DecoderInstruction::InsertCountIncrement(1),
+        DecoderInstruction::SectionAcknowledgment(4),
+    ])
+    .unwrap();
+    tx.try_send(vec![DecoderInstruction::StreamCancellation(0)])
+        .unwrap();
+    drop(tx);
+    let mut wire = Vec::new();
+    assert_eq!(
+        Decoder::write(rx, &mut wire).await,
+        Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM),
+    );
+    assert_eq!(wire, [0x03, 0x01, 0x84, 0x40]);
+}
+
+#[tokio::test]
 async fn insertion_feedback_uses_the_queue_and_capacity_changes_emit_nothing() {
-    let (decoder, mut source) = Decoder::new(
+    let (decoder, mut source) = Decoder::with_channel(
         Settings {
             max_table_capacity: 128,
             blocked_streams: 1,
@@ -40,7 +59,7 @@ async fn insertion_feedback_uses_the_queue_and_capacity_changes_emit_nothing() {
     for _ in 0..2 {
         assert_eq!(
             Decoder::poll_feedback(&mut source, &mut cx),
-            Poll::Ready(Ok(DecoderInstruction::InsertCountIncrement(1)))
+            Poll::Ready(Ok(vec![DecoderInstruction::InsertCountIncrement(1)]))
         );
     }
     assert!(Decoder::poll_feedback(&mut source, &mut cx).is_pending());
@@ -53,7 +72,7 @@ async fn insertion_feedback_uses_the_queue_and_capacity_changes_emit_nothing() {
 
 #[tokio::test]
 async fn feedback_backlog_is_bounded_without_dropping_required_instructions() {
-    let (decoder, mut source) = Decoder::new(
+    let (decoder, mut source) = Decoder::with_channel(
         Settings {
             max_table_capacity: 128,
             blocked_streams: 1,
@@ -66,10 +85,10 @@ async fn feedback_backlog_is_bounded_without_dropping_required_instructions() {
         .on_encoder_instruction(EncoderInstruction::SetDynamicTableCapacity(128))
         .unwrap();
 
-    for id in 0..super::super::MAX_PENDING_FEEDBACK {
+    for id in 0..MAX_PENDING_INSTRUCTION {
         decoder.cancel(id as u64).unwrap();
     }
-    assert_eq!(source.len(), super::super::MAX_PENDING_FEEDBACK);
+    assert_eq!(source.len(), MAX_PENDING_INSTRUCTION);
     assert_eq!(
         decoder
             .state
@@ -83,7 +102,7 @@ async fn feedback_backlog_is_bounded_without_dropping_required_instructions() {
 
     assert_eq!(
         source.recv().await,
-        Some(DecoderInstruction::StreamCancellation(0))
+        Some(vec![DecoderInstruction::StreamCancellation(0)])
     );
     decoder
         .state
@@ -491,8 +510,10 @@ async fn qpack_fields_preserve_frame_envelopes_and_ack_order() {
             .await;
             // Deliver encoder instructions only after the full HEADERS frame has arrived.
             while let Ok(batch) = sender.instructions.lock().unwrap().try_recv() {
-                for (instruction, insert_count) in batch {
-                    sender.encoder.on_instruction_sent(insert_count).unwrap();
+                for instruction in batch {
+                    if !matches!(instruction, EncoderInstruction::SetDynamicTableCapacity(_)) {
+                        sender.encoder.record_insert_written();
+                    }
                     receiver
                         .decoder
                         .state
@@ -534,11 +555,11 @@ async fn qpack_fields_preserve_frame_envelopes_and_ack_order() {
     );
 }
 
-type Feedback = mpsc::Receiver<DecoderInstruction>;
+type Feedback = decoder::Instructions;
 
 struct Codec {
     qpack: Qpack,
-    instructions: Mutex<mpsc::Receiver<Vec<(EncoderInstruction, u64)>>>,
+    instructions: Mutex<mpsc::Receiver<Vec<EncoderInstruction>>>,
     feedback: Mutex<Feedback>,
 }
 
@@ -551,21 +572,25 @@ impl std::ops::Deref for Codec {
 
 impl Codec {
     fn new(local: Settings, peer: Settings, max_blocked_bytes: usize) -> Result<Self> {
-        let (encoder, instruction_source) = Encoder::new(peer)?;
-        let (decoder, feedback_source) = Decoder::new(
-            local,
-            max_blocked_bytes,
-            frame::MAX_BUFFERED_FRAME_PAYLOAD as u64,
-        )?;
+        let (encoder, instruction_source) = Encoder::with_channel(peer)?;
+        let (decoder, feedback_source) =
+            Decoder::with_channel(local, max_blocked_bytes, 64 * 1024)?;
         Ok(Self {
-            qpack: Qpack { encoder, decoder },
-            instructions: Mutex::new(instruction_source.instructions),
+            qpack: Qpack {
+                encoder: encoder.into(),
+                decoder,
+            },
+            instructions: Mutex::new(instruction_source),
             feedback: Mutex::new(feedback_source),
         })
     }
     fn poll_instruction(&self, cx: &mut Context<'_>) -> Poll<DecoderInstruction> {
         let mut feedback = self.feedback.lock().unwrap();
-        Decoder::poll_feedback(&mut feedback, cx).map(Result::unwrap)
+        Decoder::poll_feedback(&mut feedback, cx).map(|result| {
+            let mut batch = result.unwrap();
+            assert_eq!(batch.len(), 1);
+            batch.pop().unwrap()
+        })
     }
 
     fn next_instruction(&self) -> Option<DecoderInstruction> {

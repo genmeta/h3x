@@ -19,7 +19,7 @@ use crate::{
         message::{ArcMessage, Message},
     },
     protocol::{
-        frame::{self, Data, Frame, H3Frame, Headers, Write as _, be_frame},
+        frame::{self, Frame, H3Frame, Headers, Write as _, be_frame},
         qpack::Qpack,
         stream::{H3ReadStream, H3WriteStream},
     },
@@ -94,16 +94,10 @@ where
     })?;
     Ok(async move {
         let result = async {
-            // 用 while 循环写 栈上 buffer
             let mut buf = Vec::new();
             buf.put_frame(&headers);
             ws.write_all(&buf).await?;
-            if !body.is_empty() {
-                buf.clear();
-                buf.put_frame(&Frame::new(Data(body.len()))?);
-                ws.write_all(&buf).await?;
-                ws.write_all(&body).await?;
-            }
+            body::write_bytes_body(&body, &mut ws).await?;
             ws.shutdown().await?;
             Ok::<_, ErrorCode>(())
         }
@@ -141,26 +135,20 @@ where
         })?;
         Ok::<_, ErrorCode>((headers, mode))
     })()
-    .inspect_err(|error| body.set_error(*error))?;
-    // 通过读写通知 error，不需要
-    let cancellation = body.clone();
+    .inspect_err(|error| body.on_error(*error))?;
     Ok(async move {
-        let result = tokio::select! {
-            biased;
-            error = cancellation.error() => Err(error),
-            result = async {
-                // 循环写
-                let mut buf = Vec::new();
-                buf.put_frame(&headers);
-                ws.write_all(&buf).await?;
-                body::write_streaming_body(&mut body, &mut ws, mode).await?;
-                ws.shutdown().await?;
-                Ok::<_, ErrorCode>(())
-            } => result,
-        };
+        let result = async {
+            let mut buf = Vec::new();
+            buf.put_frame(&headers);
+            ws.write_all(&buf).await?;
+            body::write_streaming_body(&mut body, &mut ws, mode).await?;
+            ws.shutdown().await?;
+            Ok::<_, ErrorCode>(())
+        }
+        .await;
         if let Err(error) = result {
             ws.cancel_with_error(error);
-            body.set_error(error);
+            body.on_error(error);
         }
         result
     })

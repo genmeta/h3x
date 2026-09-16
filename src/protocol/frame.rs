@@ -17,8 +17,11 @@ mod varint;
 
 pub(crate) use varint::be_varint;
 
+/// Local per-buffer budget for HTTP/3 frame payloads and QPACK literals/field sections.
+/// DATA and unknown frame payloads are streamed without this size limit.
 pub(crate) const MAX_BUFFERED_FRAME_PAYLOAD: usize = 64 * 1024;
-pub(crate) const MAX_DATA_CHUNK: usize = 16 * 1024;
+// BufferReader DEFAULT_BUF_SIZE
+pub(crate) const MAX_DATA_CHUNK: usize = 8 * 1024;
 
 pub(crate) use cancel_push::CancelPush;
 pub(crate) use control::{Control, StreamType, WriteControl, be_control, be_stream_type};
@@ -158,7 +161,9 @@ pub(crate) async fn be_frame_payload<T: AsyncRead + Unpin + ?Sized>(
     let frame = match ty {
         FrameType::Data => H3Frame::Data(Frame {
             length,
-            payload: Data(usize::try_from(length.into_u64()).map_err(|_| ErrorCode::H3_FRAME_ERROR)?),
+            payload: Data(
+                usize::try_from(length.into_u64()).map_err(|_| ErrorCode::H3_FRAME_ERROR)?,
+            ),
         }),
         FrameType::Headers => H3Frame::Headers(headers::be_headers_frame(reader, length).await?),
         FrameType::CancelPush => {

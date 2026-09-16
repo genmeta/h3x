@@ -25,7 +25,7 @@ pub struct Body<B, IO> {
 }
 
 impl<B, IO> Body<B, IO> {
-    pub(crate) fn from_storage(storage: B) -> Self {
+    pub fn new(storage: B) -> Self {
         Self {
             storage,
             _io: PhantomData,
@@ -35,26 +35,20 @@ impl<B, IO> Body<B, IO> {
 
 impl<B: Default, IO> Default for Body<B, IO> {
     fn default() -> Self {
-        Self::from_storage(B::default())
+        Self::new(B::default())
     }
 }
 
 impl<B: Clone> Clone for Body<B, Write> {
     fn clone(&self) -> Self {
-        Self::from_storage(self.storage.clone())
-    }
-}
-
-impl Body<Bytes, Write> {
-    pub fn new(bytes: Bytes) -> Self {
-        Self::from_storage(bytes)
+        Self::new(self.storage.clone())
     }
 }
 
 impl Body<ArcWndBuf, Write> {
     /// Panics if capacity is zero. One producer may be writing at a time.
-    pub fn new(capacity: usize) -> Self {
-        Self::from_storage(ArcWndBuf::new(capacity))
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::new(ArcWndBuf::new(capacity))
     }
 
     pub async fn write(&mut self, bytes: impl AsRef<[u8]> + Send) -> Result<usize> {
@@ -73,7 +67,7 @@ impl Body<ArcWndBuf, Write> {
     }
 
     pub async fn reset(self) -> Result<()> {
-        self.storage.set_error(ErrorCode::H3_REQUEST_CANCELLED);
+        self.storage.on_error(ErrorCode::H3_REQUEST_CANCELLED);
         Ok(())
     }
 }
@@ -100,7 +94,7 @@ impl Body<ArcWndBuf, Read> {
         Ok(self.storage.read(bytes).await?)
     }
     pub async fn stop(self) {
-        self.storage.set_error(ErrorCode::H3_REQUEST_CANCELLED);
+        self.storage.on_error(ErrorCode::H3_REQUEST_CANCELLED);
     }
     pub async fn collect(mut self) -> Result<Bytes> {
         let mut bytes = Vec::new();
@@ -120,17 +114,12 @@ where
 {
     let stream_id = rs.get_ref().stream_id();
     let mut buffer = ArcWndBuf::new(frame::MAX_DATA_CHUNK);
-    let body = Body::from_storage(buffer.clone());
-    let cancellation = buffer.clone();
+    let body = Body::new(buffer.clone());
     tokio::spawn(async move {
-        let result = tokio::select! {
-            biased;
-            error = cancellation.error() => Err(error),
-            result = read_body(&mut rs, &mut buffer, mode, &qpack) => result,
-        };
+        let result = read_body(&mut rs, &mut buffer, mode, &qpack).await;
         if let Err(error) = result {
             let _ = qpack.cancel(stream_id);
-            buffer.set_error(error);
+            buffer.on_error(error);
         }
         // read_body validates FIN/trailers and marks buffer EOF on success.
     });
@@ -177,46 +166,41 @@ impl BodyMode {
 /// Receive DATA into an application destination and validate trailing HEADERS.
 /// QPACK is used only to decode trailers. The destination is shut down at EOF.
 pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    receive: &mut BufReader<H3ReadStream<R>>,
-    destination: &mut W,
+    read_stream: &mut BufReader<H3ReadStream<R>>,
+    body: &mut W,
     mode: BodyMode,
     qpack: &Qpack,
 ) -> Result<()> {
     let mut remaining = mode.content_length();
     let mut trailers = false;
-    let mut buf = vec![0; frame::MAX_DATA_CHUNK];
-    while !receive.fill_buf().await?.is_empty() {
-        match be_frame(receive).await? {
-            H3Frame::Data(frame) => {
-                if trailers || mode.is_forbidden() {
-                    return Err(ErrorCode::H3_FRAME_UNEXPECTED);
-                }
-                let mut count = frame.length.into_u64();
+    while !read_stream.fill_buf().await?.is_empty() {
+        match be_frame(read_stream).await? {
+            H3Frame::Data(frame) if !trailers && !mode.is_forbidden() => {
+                let count = frame.length.into_u64();
                 if let Some(left) = &mut remaining {
                     *left = left.checked_sub(count).ok_or(ErrorCode::H3_MESSAGE_ERROR)?;
                 }
-                while count != 0 {
-                    let chunk = count.min(buf.len() as u64) as usize;
-                    receive.read_exact(&mut buf[..chunk]).await?;
-                    destination.write_all(&buf[..chunk]).await?;
-                    count -= chunk as u64;
+                let mut payload = (&mut *read_stream).take(count);
+                tokio::io::copy_buf(&mut payload, body).await?;
+                if payload.limit() != 0 {
+                    return Err(ErrorCode::H3_FRAME_ERROR);
                 }
             }
-            H3Frame::Headers(frame) => {
-                if trailers || mode.is_forbidden() {
-                    return Err(ErrorCode::H3_FRAME_UNEXPECTED);
-                }
+            H3Frame::Headers(frame) if !trailers && !mode.is_forbidden() => {
                 if remaining.is_some_and(|left| left != 0) {
                     return Err(ErrorCode::H3_MESSAGE_ERROR);
                 }
                 let fields = qpack
-                    .decode(receive.get_ref().stream_id(), frame.payload.field_section)
+                    .decode(
+                        read_stream.get_ref().stream_id(),
+                        frame.payload.field_section,
+                    )
                     .await?;
                 headers::be_trailers(fields)?;
                 trailers = true;
             }
             H3Frame::Unknown { length, .. } => {
-                frame::skip_payload(receive, length.into_u64()).await?;
+                frame::skip_payload(read_stream, length.into_u64()).await?;
             }
             _ => {
                 return Err(ErrorCode::H3_FRAME_UNEXPECTED);
@@ -226,7 +210,24 @@ pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     if remaining.is_some_and(|left| left != 0) {
         return Err(ErrorCode::H3_MESSAGE_ERROR);
     }
-    destination.shutdown().await?;
+    body.shutdown().await?;
+    Ok(())
+}
+
+/// Write a nonempty buffered body as one DATA frame, leaving shutdown to the caller.
+pub(crate) async fn write_bytes_body<W: AsyncWrite + Unpin>(
+    body: &[u8],
+    send: &mut W,
+) -> Result<()> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    let mut head_buf = Vec::new();
+    head_buf.put_frame(&Frame::new(Data(body.len()))?);
+    send.write_all(&head_buf).await?;
+    for chunk in body.chunks(frame::MAX_DATA_CHUNK) {
+        send.write_all(chunk).await?;
+    }
     Ok(())
 }
 
@@ -271,6 +272,37 @@ mod tests {
         frame::Headers,
         qpack::{self, WriteFieldSection},
     };
+
+    #[tokio::test]
+    async fn bytes_body_writes_one_frame_and_skips_empty_body() {
+        for length in [0, 1, frame::MAX_DATA_CHUNK, frame::MAX_DATA_CHUNK + 1] {
+            let body = vec![42; length];
+            let (mut send, mut recv) = tokio::io::duplex(3);
+            let ((), received) = tokio::join!(
+                async {
+                    write_bytes_body(&body, &mut send).await.unwrap();
+                    // The body writer must leave the stream open.
+                    send.write_all(&[0x21, 0]).await.unwrap();
+                    send.shutdown().await.unwrap();
+                },
+                async {
+                    let mut encoded = Vec::new();
+                    recv.read_to_end(&mut encoded).await.unwrap();
+                    encoded
+                }
+            );
+            let mut input = received.as_slice();
+            if !body.is_empty() {
+                let H3Frame::Data(frame) = be_frame(&mut input).await.unwrap() else {
+                    panic!("expected DATA");
+                };
+                assert_eq!(frame.length.into_u64(), body.len() as u64);
+                assert_eq!(&input[..body.len()], body.as_slice());
+                input = &input[body.len()..];
+            }
+            assert_eq!(input, &[0x21, 0]);
+        }
+    }
 
     #[tokio::test]
     async fn streaming_body_leaves_shutdown_to_the_caller() {
@@ -326,9 +358,17 @@ mod tests {
             (&[][..], Some(0), Ok(())),
             (&[0x21, 0][..], Some(0), Ok(())),
             (&[][..], Some(1), Err(ErrorCode::H3_MESSAGE_ERROR)),
-            (trailers.as_slice(), None, Err(ErrorCode::H3_FRAME_UNEXPECTED)),
+            (
+                trailers.as_slice(),
+                None,
+                Err(ErrorCode::H3_FRAME_UNEXPECTED),
+            ),
             (&[0, 0][..], None, Err(ErrorCode::H3_FRAME_UNEXPECTED)),
-            (&[0x21, 0, 0, 0][..], None, Err(ErrorCode::H3_FRAME_UNEXPECTED)),
+            (
+                &[0x21, 0, 0, 0][..],
+                None,
+                Err(ErrorCode::H3_FRAME_UNEXPECTED),
+            ),
         ] {
             let encoded = [trailers.as_slice(), suffix].concat();
             let mut input = encoded.as_slice();

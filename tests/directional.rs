@@ -23,7 +23,7 @@ async fn directional_bodies_echo_with_backpressure() {
         let connection = support::connection();
         let (cs, sr) = duplex(7);
         let (ss, cr) = duplex(7);
-        let mut upload = Body::<WndBuf, W>::new(3);
+        let mut upload = Body::<WndBuf, W>::with_capacity(3);
         let request = client::Request::post("https://example.com/echo")
             .unwrap()
             .with_body(upload.clone());
@@ -46,7 +46,7 @@ async fn directional_bodies_echo_with_backpressure() {
                     server::read_request(H3ReadStream::new(0, sr), connection.clone()).await?;
                 let method = request.method();
                 let mut input = request.into_body();
-                let mut output = Body::<WndBuf, W>::new(2);
+                let mut output = Body::<WndBuf, W>::with_capacity(2);
                 let mut response = server::Response::default().with_body(output.clone());
                 response.set_status(StatusCode::OK);
                 let (sent, produced) = tokio::join!(
@@ -129,7 +129,7 @@ async fn response_does_not_wait_for_upload_to_finish() {
 #[tokio::test]
 async fn dropping_response_future_preserves_upload() {
     let connection = support::connection();
-    let mut producer = Body::<WndBuf, W>::new(1);
+    let mut producer = Body::<WndBuf, W>::with_capacity(1);
     let request = client::Request::post("https://example.com/")
         .unwrap()
         .with_body(producer.clone());
@@ -164,7 +164,7 @@ async fn dropping_response_future_preserves_upload() {
 #[tokio::test]
 async fn explicit_reset_wakes_producer_after_upload_is_dropped() {
     let connection = support::connection();
-    let mut producer = Body::<WndBuf, W>::new(1);
+    let mut producer = Body::<WndBuf, W>::with_capacity(1);
     let request = client::Request::post("https://example.com/")
         .unwrap()
         .with_body(producer.clone());

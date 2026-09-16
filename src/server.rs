@@ -136,38 +136,34 @@ pub fn write_streaming_response<WS: AsyncWrite + Unpin, T: Transport>(
         let body = response.message.body_stream();
         (head, body)
     };
-    let cancellation = body.clone();
     let request_method = request_method.clone();
     async move {
-        let result = tokio::select! {
-            biased;
-            error = cancellation.error() => Err(error),
-            result = async {
-                let mut fields = Vec::new();
-                fields.put_response(&head)?;
-                let status = head.status()?;
-                let length = headers::content_length(&head.headers)?;
-                if status.is_informational() {
-                    return Err(ErrorCode::H3_MESSAGE_ERROR);
-                }
-                if status == StatusCode::NO_CONTENT && length.is_some() {
-                    return Err(ErrorCode::H3_MESSAGE_ERROR);
-                }
-                let mode = BodyMode::resolve(&head, Some(&request_method))?;
-                let headers = Frame::new(Headers {
-                    field_section: connection.qpack().encode(ws.stream_id(), fields)?,
-                })?;
-                let mut buf = Vec::new();
-                buf.put_frame(&headers);
-                ws.write_all(&buf).await?;
-                body::write_streaming_body(&mut body, &mut ws, mode).await?;
-                ws.shutdown().await?;
-                Ok::<_, ErrorCode>(())
-            } => result,
-        };
+        let result = async {
+            let mut fields = Vec::new();
+            fields.put_response(&head)?;
+            let status = head.status()?;
+            let length = headers::content_length(&head.headers)?;
+            if status.is_informational() {
+                return Err(ErrorCode::H3_MESSAGE_ERROR);
+            }
+            if status == StatusCode::NO_CONTENT && length.is_some() {
+                return Err(ErrorCode::H3_MESSAGE_ERROR);
+            }
+            let mode = BodyMode::resolve(&head, Some(&request_method))?;
+            let headers = Frame::new(Headers {
+                field_section: connection.qpack().encode(ws.stream_id(), fields)?,
+            })?;
+            let mut buf = Vec::new();
+            buf.put_frame(&headers);
+            ws.write_all(&buf).await?;
+            body::write_streaming_body(&mut body, &mut ws, mode).await?;
+            ws.shutdown().await?;
+            Ok::<_, ErrorCode>(())
+        }
+        .await;
         if let Err(error) = result {
             ws.cancel_with_error(error);
-            body.set_error(error);
+            body.on_error(error);
         }
         result
     }

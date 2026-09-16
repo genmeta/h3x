@@ -16,14 +16,13 @@ use crate::{ErrorCode, Result, protocol::frame::StreamType};
 mod state;
 use state::State;
 
-/// Bound queued feedback independently of blocked field sections. Producers use
-/// `try_send`, so they never wait while holding the decoder state lock.
-const MAX_PENDING_FEEDBACK: usize = 1024;
+pub(in crate::protocol) type Batch = Vec<DecoderInstruction>;
+type OnInstruction = Box<dyn Fn(Batch) -> Result<()> + Send + Sync>;
 
 /// Insertions / decoded fields / cancellations -> feedback FIFO
 /// -> Decoder::write() -> decoder stream -> peer encoder.
 /// Enqueueing wakes the writer; increments precede dependent ACKs.
-pub(in crate::protocol) type Instructions = mpsc::Receiver<DecoderInstruction>;
+pub(in crate::protocol) type Instructions = mpsc::Receiver<Batch>;
 
 pub(in crate::protocol) struct Decoder {
     state: Mutex<Result<State>>,
@@ -61,19 +60,43 @@ impl Drop for StreamDecoder<'_> {
 }
 
 impl Decoder {
-    pub(super) fn new(
+    pub(super) fn new(local: Settings, max_blocked_bytes: usize, max_fields: u64) -> Result<Self> {
+        Ok(Self {
+            state: Mutex::new(Ok(State::new(
+                local,
+                max_blocked_bytes,
+                max_fields,
+                Box::new(|_| Err(ErrorCode::H3_INTERNAL_ERROR)),
+            )?)),
+        })
+    }
+
+    /// Called synchronously under the state lock; the callback must not reenter QPACK.
+    pub(in crate::protocol) fn on_instruction(
+        &self,
+        callback: impl Fn(Batch) -> Result<()> + Send + Sync + 'static,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("register before use")
+            .on_instruction = Box::new(callback);
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_channel(
         local: Settings,
         max_blocked_bytes: usize,
         max_fields: u64,
     ) -> Result<(Self, Instructions)> {
-        let (sender, receiver) = mpsc::channel(MAX_PENDING_FEEDBACK);
-        let state = State::new(local, max_blocked_bytes, max_fields, sender)?;
-        Ok((
-            Self {
-                state: Mutex::new(Ok(state)),
-            },
-            receiver,
-        ))
+        let decoder = Self::new(local, max_blocked_bytes, max_fields)?;
+        let (tx, rx) = mpsc::channel(super::MAX_PENDING_INSTRUCTION);
+        decoder.on_instruction(move |batch| {
+            tx.try_send(batch)
+                .map_err(crate::protocol::connection::instruction_send_error)
+        });
+        Ok((decoder, rx))
     }
 
     pub(super) fn close(&self, error: ErrorCode) {
@@ -160,6 +183,20 @@ impl Decoder {
         }
     }
 
+    /// The feedback writer only needs the receiver and transport.
+    pub(in crate::protocol) fn sync<T: crate::Transport>(
+        &self,
+        transport: std::sync::Arc<T>,
+        instructions: Instructions,
+    ) -> impl Future<Output = ()> + Send + 'static + use<T> {
+        async move {
+            super::drive(transport, async move |send: &mut T::StreamWriter| {
+                Self::write(instructions, send).await
+            })
+            .await;
+        }
+    }
+
     pub(in crate::protocol) async fn write<W: AsyncWrite + Unpin>(
         mut receiver: Instructions,
         writer: &mut W,
@@ -169,13 +206,15 @@ impl Decoder {
             .await
             .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
         let mut buf = Vec::new();
-        while let Some(instruction) = receiver.recv().await {
-            buf.clear();
-            buf.put_decoder_instruction(&instruction)?;
-            writer
-                .write_all(&buf)
-                .await
-                .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
+        while let Some(batch) = receiver.recv().await {
+            for instruction in batch {
+                buf.clear();
+                buf.put_decoder_instruction(&instruction)?;
+                writer
+                    .write_all(&buf)
+                    .await
+                    .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
+            }
         }
         Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
     }
@@ -199,7 +238,7 @@ impl Decoder {
     pub(super) fn poll_feedback(
         receiver: &mut Instructions,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<DecoderInstruction>> {
+    ) -> Poll<Result<Batch>> {
         receiver
             .poll_recv(cx)
             .map(|instruction| instruction.ok_or(ErrorCode::H3_CLOSED_CRITICAL_STREAM))

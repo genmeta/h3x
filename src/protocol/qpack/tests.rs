@@ -33,7 +33,10 @@ async fn close_preserves_first_error_across_both_directions() {
         qpack.close(ErrorCode::H3_EXCESSIVE_LOAD),
         ErrorCode::H3_INTERNAL_ERROR
     );
-    assert_eq!(qpack.encode(0, Vec::new()), Err(ErrorCode::H3_INTERNAL_ERROR));
+    assert_eq!(
+        qpack.encode(0, Vec::new()),
+        Err(ErrorCode::H3_INTERNAL_ERROR)
+    );
     assert_eq!(
         qpack.decode(0, Bytes::from_static(&[0, 0])).await,
         Err(ErrorCode::H3_INTERNAL_ERROR)
@@ -97,6 +100,6 @@ async fn malformed_field_section_closes_both_directions() {
 
 #[test]
 fn construction_does_not_require_a_runtime() {
-    let (qpack, _encoder, _decoder) = Qpack::new(&crate::Settings::default()).unwrap();
+    let qpack = Qpack::new(&crate::Settings::default()).unwrap();
     assert!(qpack.encode(0, Vec::new()).is_ok());
 }

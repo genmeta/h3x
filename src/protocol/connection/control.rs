@@ -26,46 +26,6 @@ impl<T: Transport> H3Connection<T> {
         }
     }
 
-    pub(super) async fn sync_qpack_encoder(
-        self,
-        instruction_source: qpack::encoder::InstructionSource,
-    ) {
-        let stream = self
-            .transport
-            .open_uni()
-            .await
-            .and_then(|stream| stream.ok_or(ErrorCode::H3_STREAM_CREATION_ERROR));
-        match stream {
-            Ok((_, mut send)) => {
-                if let Err(error) =
-                    qpack::encoder::Encoder::write(instruction_source, &mut send).await
-                {
-                    // Retain the critical stream until connection failure is handled.
-                    self.fail(error).await;
-                }
-            }
-            Err(error) => self.fail(error).await,
-        }
-    }
-
-    pub(super) async fn sync_qpack_decoder(self, feedback_source: qpack::decoder::Instructions) {
-        let stream = self
-            .transport
-            .open_uni()
-            .await
-            .and_then(|stream| stream.ok_or(ErrorCode::H3_STREAM_CREATION_ERROR));
-        match stream {
-            Ok((_, mut send)) => {
-                if let Err(error) = qpack::decoder::Decoder::write(feedback_source, &mut send).await
-                {
-                    // Retain the critical stream until connection failure is handled.
-                    self.fail(error).await;
-                }
-            }
-            Err(error) => self.fail(error).await,
-        }
-    }
-
     pub(super) async fn accept_and_process_uni(self) {
         loop {
             match self.transport.accept_uni().await {
@@ -661,7 +621,10 @@ mod qpack_writer_tests {
             assert_eq!(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM);
             assert_eq!(connection.qpack.error(), Some(error));
             assert_eq!(connection.open_bi().await.err(), Some(error));
-            assert_eq!(ErrorCode::from(send.write_all(b"x").await.unwrap_err()), error);
+            assert_eq!(
+                ErrorCode::from(send.write_all(b"x").await.unwrap_err()),
+                error
+            );
             // The connection-owned writer tasks release their connection handles.
             tokio::task::yield_now().await;
             assert_eq!(Arc::strong_count(&connection.transport), 1);

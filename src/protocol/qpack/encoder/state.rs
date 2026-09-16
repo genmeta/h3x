@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 
 use bytes::Bytes;
 use qbase::varint::VARINT_MAX;
+#[cfg(test)]
 use tokio::sync::mpsc;
 
 use super::super::{
@@ -16,6 +17,9 @@ use super::super::{
 };
 use crate::{ErrorCode, Result, protocol::frame::MAX_BUFFERED_FRAME_PAYLOAD};
 
+/// Budget for the estimated reference metadata retained until section ACKs arrive.
+const MAX_UNACKED_SECTION_METADATA_BYTES: usize = 64 * 1024;
+
 /// Connection-scoped encoder; contains no transport handles or async operations.
 pub(super) struct State {
     table: DynamicTable,
@@ -26,7 +30,7 @@ pub(super) struct State {
     /// Key: QUIC stream ID. Value: its unacknowledged sections in sending order.
     /// Only sections with RIC > 0 retain dynamic references.
     unacked_sections_by_stream: HashMap<u64, VecDeque<UnackedSection>>,
-    sender: mpsc::Sender<Vec<(EncoderInstruction, u64)>>,
+    pub(super) on_instruction: super::OnInstruction,
 }
 
 /// A Section ACK releases the oldest such record on its stream.
@@ -39,10 +43,7 @@ struct UnackedSection {
 impl State {
     /// Start with an empty table, capacity 0, KRC 0, and no outstanding references.
     /// Pass default peer settings until SETTINGS arrives; all integer limits are 62-bit.
-    pub(super) fn new(
-        peer: Settings,
-        sender: mpsc::Sender<Vec<(EncoderInstruction, u64)>>,
-    ) -> Result<Self> {
+    pub(super) fn new(peer: Settings, on_instruction: super::OnInstruction) -> Result<Self> {
         if peer.blocked_streams > VARINT_MAX {
             return Err(ErrorCode::H3_SETTINGS_ERROR);
         }
@@ -50,19 +51,18 @@ impl State {
             table: DynamicTable::new(peer.max_table_capacity)?,
             known_received_count: 0,
             max_blocked_streams: peer.blocked_streams,
-            max_field_section_size: MAX_BUFFERED_FRAME_PAYLOAD as u64,
+            max_field_section_size: VARINT_MAX,
             unacked_sections_by_stream: HashMap::new(),
-            sender,
+            on_instruction,
         })
     }
 
     pub(super) fn configure(&mut self, peer: Settings, max_fields: u64) -> Result<()> {
         self.apply_peer_settings(peer)?;
-        self.max_field_section_size = max_fields.min(MAX_BUFFERED_FRAME_PAYLOAD as u64);
+        self.max_field_section_size = max_fields;
         if peer.max_table_capacity != 0 {
             self.queue_instruction(EncoderInstruction::SetDynamicTableCapacity(
-                peer.max_table_capacity
-                    .min(MAX_BUFFERED_FRAME_PAYLOAD as u64),
+                peer.max_table_capacity,
             ))?;
         }
         Ok(())
@@ -102,27 +102,39 @@ impl State {
             bounded.push(field);
         }
         // Keep rollback local to this synchronous call; Bytes clones share string storage.
-        let permit = match self.sender.clone().try_reserve_owned() {
-            Ok(permit) => Some(permit),
-            Err(mpsc::error::TrySendError::Full(_)) => None,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM);
-            }
-        };
         let original_table = self.table.clone();
+        let original_sections = self
+            .unacked_sections_by_stream
+            .get(&stream_id)
+            .map_or(0, VecDeque::len);
         let mut instructions = Vec::new();
-        match self.encode_fields(stream_id, bounded, &mut instructions, permit.is_some()) {
-            Ok(wire) => {
+        let mut queue_full = false;
+        let result = self
+            .encode_fields(stream_id, bounded.clone(), &mut instructions, true)
+            .and_then(|wire| {
                 if !instructions.is_empty() {
-                    permit
-                        .expect("table updates reserve queue space first")
-                        .send(instructions);
+                    if let Err(error) = (self.on_instruction)(instructions) {
+                        queue_full = error == ErrorCode::H3_EXCESSIVE_LOAD;
+                        return Err(error);
+                    }
                 }
                 Ok(wire)
-            }
+            });
+        match result {
+            Ok(wire) => Ok(wire),
             Err(error) => {
                 self.table = original_table;
-                Err(error)
+                if let Some(sections) = self.unacked_sections_by_stream.get_mut(&stream_id) {
+                    sections.truncate(original_sections);
+                    if sections.is_empty() {
+                        self.unacked_sections_by_stream.remove(&stream_id);
+                    }
+                }
+                if queue_full {
+                    self.encode_fields(stream_id, bounded, &mut Vec::new(), false)
+                } else {
+                    Err(error)
+                }
             }
         }
     }
@@ -131,7 +143,7 @@ impl State {
         &mut self,
         stream_id: u64,
         fields: Vec<Field>,
-        instructions: &mut Vec<(EncoderInstruction, u64)>,
+        instructions: &mut Vec<EncoderInstruction>,
         queue_available: bool,
     ) -> Result<Bytes> {
         let base = self.table.insert_count();
@@ -144,8 +156,8 @@ impl State {
             .flatten()
             .map(|section| 32 + section.references.capacity() * 8)
             .sum();
-        let allow_dynamic =
-            queue_available && retained + 32 + fields.len() * 8 <= MAX_BUFFERED_FRAME_PAYLOAD;
+        let allow_dynamic = queue_available
+            && retained + 32 + fields.len() * 8 <= MAX_UNACKED_SECTION_METADATA_BYTES;
         for field in fields {
             if !field.never_index
                 && let Some(index) = table::find_index(&field.name, &field.value)
@@ -265,18 +277,12 @@ impl State {
 
     /// Commit and queue an update; Ok(false) means eviction is blocked by retained references.
     fn queue_instruction(&mut self, instruction: EncoderInstruction) -> Result<bool> {
-        let permit = self
-            .sender
-            .clone()
-            .try_reserve_owned()
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ErrorCode::H3_EXCESSIVE_LOAD,
-                mpsc::error::TrySendError::Closed(_) => ErrorCode::H3_CLOSED_CRITICAL_STREAM,
-            })?;
+        let original_table = self.table.clone();
         let mut instructions = Vec::new();
         let queued = self.queue_update(instruction, &[], &mut instructions)?;
-        if queued {
-            permit.send(instructions);
+        if queued && let Err(error) = (self.on_instruction)(instructions) {
+            self.table = original_table;
+            return Err(error);
         }
         Ok(queued)
     }
@@ -285,7 +291,7 @@ impl State {
         &mut self,
         instruction: EncoderInstruction,
         protected: &[u64],
-        instructions: &mut Vec<(EncoderInstruction, u64)>,
+        instructions: &mut Vec<EncoderInstruction>,
     ) -> Result<bool> {
         if self.table.max_capacity() == 0 {
             return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR);
@@ -300,7 +306,7 @@ impl State {
             }
         }
         self.table = next;
-        instructions.push((instruction, self.table.insert_count()));
+        instructions.push(instruction);
         Ok(true)
     }
 
@@ -316,7 +322,9 @@ impl State {
                     .unacked_sections_by_stream
                     .get_mut(&stream_id)
                     .ok_or(ErrorCode::QPACK_DECODER_STREAM_ERROR)?;
-                let section = sections.front().ok_or(ErrorCode::QPACK_DECODER_STREAM_ERROR)?;
+                let section = sections
+                    .front()
+                    .ok_or(ErrorCode::QPACK_DECODER_STREAM_ERROR)?;
                 if section.required_insert_count > completed_insert_count {
                     return Err(ErrorCode::QPACK_DECODER_STREAM_ERROR);
                 }
@@ -408,12 +416,16 @@ mod tests {
     }
 
     impl Encoder {
-        fn new(
-            peer: Settings,
-            sender: mpsc::Sender<Vec<(EncoderInstruction, u64)>>,
-        ) -> Result<Self> {
+        fn new(peer: Settings, sender: mpsc::Sender<Vec<EncoderInstruction>>) -> Result<Self> {
             Ok(Self {
-                state: State::new(peer, sender)?,
+                state: State::new(
+                    peer,
+                    Box::new(move |batch| {
+                        sender
+                            .try_send(batch)
+                            .map_err(crate::protocol::connection::instruction_send_error)
+                    }),
+                )?,
                 sent_insert_count: 0,
             })
         }
@@ -427,7 +439,7 @@ mod tests {
 
     struct Decoder {
         state: DecoderState,
-        receiver: mpsc::Receiver<DecoderInstruction>,
+        receiver: crate::protocol::qpack::decoder::Instructions,
     }
 
     impl std::ops::Deref for Decoder {
@@ -439,7 +451,8 @@ mod tests {
 
     impl Decoder {
         fn new(local: Settings, max_blocked_bytes: usize, max_fields: u64) -> Result<Self> {
-            let (state, feedback_source) = DecoderState::new(local, max_blocked_bytes, max_fields)?;
+            let (state, feedback_source) =
+                DecoderState::with_channel(local, max_blocked_bytes, max_fields)?;
             Ok(Self {
                 state,
                 receiver: feedback_source,
@@ -451,7 +464,11 @@ mod tests {
                 &mut self.receiver,
                 &mut std::task::Context::from_waker(std::task::Waker::noop()),
             ) {
-                std::task::Poll::Ready(result) => Some(result.unwrap()),
+                std::task::Poll::Ready(result) => {
+                    let mut batch = result.unwrap();
+                    assert_eq!(batch.len(), 1);
+                    batch.pop()
+                }
                 std::task::Poll::Pending => None,
             }
         }
@@ -468,23 +485,19 @@ mod tests {
     fn pair(
         capacity: u64,
         blocked_streams: u64,
-    ) -> (
-        Encoder,
-        Decoder,
-        mpsc::Receiver<Vec<(EncoderInstruction, u64)>>,
-    ) {
+    ) -> (Encoder, Decoder, mpsc::Receiver<Vec<EncoderInstruction>>) {
         let limits = Settings {
             max_table_capacity: capacity,
             blocked_streams,
         };
-        let (sender, receiver) = mpsc::channel(16);
+        let (sender, receiver) = mpsc::channel(crate::protocol::qpack::MAX_PENDING_INSTRUCTION);
         let mut encoder = Encoder::new(limits, sender).unwrap();
         encoder
             .queue_instruction(EncoderInstruction::SetDynamicTableCapacity(capacity))
             .unwrap();
         (
             encoder,
-            Decoder::new(limits, 1024, MAX_BUFFERED_FRAME_PAYLOAD as u64).unwrap(),
+            Decoder::new(limits, 1024, VARINT_MAX).unwrap(),
             receiver,
         )
     }
@@ -492,11 +505,13 @@ mod tests {
     fn updates(
         encoder: &mut Encoder,
         decoder: &mut Decoder,
-        receiver: &mut mpsc::Receiver<Vec<(EncoderInstruction, u64)>>,
+        receiver: &mut mpsc::Receiver<Vec<EncoderInstruction>>,
     ) {
         while let Ok(batch) = receiver.try_recv() {
-            for (instruction, insert_count) in batch {
-                encoder.sent_insert_count = insert_count;
+            for instruction in batch {
+                if !matches!(instruction, EncoderInstruction::SetDynamicTableCapacity(_)) {
+                    encoder.sent_insert_count += 1;
+                }
                 decoder.on_encoder_instruction(instruction).unwrap();
             }
         }
@@ -526,8 +541,39 @@ mod tests {
     }
 
     #[test]
+    fn configured_limits_can_exceed_the_buffer_budget() {
+        let (sender, _receiver) = mpsc::channel(crate::protocol::qpack::MAX_PENDING_INSTRUCTION);
+        let mut encoder = State::new(
+            Settings::default(),
+            Box::new(move |batch| {
+                sender
+                    .try_send(batch)
+                    .map_err(crate::protocol::connection::instruction_send_error)
+            }),
+        )
+        .unwrap();
+        let configured = 128 * 1024;
+        encoder
+            .configure(
+                Settings {
+                    max_table_capacity: configured,
+                    blocked_streams: 0,
+                },
+                configured,
+            )
+            .unwrap();
+        assert_eq!(encoder.max_field_section_size, configured);
+        // Static references compress a field section larger than the buffer budget.
+        let fields = vec![field(b":method", b"GET"); 2000];
+        assert!(encoder.encode(0, fields.clone()).is_ok());
+        encoder.max_field_section_size = 64 * 1024;
+        assert_eq!(encoder.encode(4, fields), Err(ErrorCode::H3_EXCESSIVE_LOAD));
+        assert_eq!(encoder.table.max_capacity(), configured);
+    }
+
+    #[test]
     fn settings_enable_dynamic_capacity_without_resetting_existing_state() {
-        let (sender, _receiver) = mpsc::channel(16);
+        let (sender, _receiver) = mpsc::channel(crate::protocol::qpack::MAX_PENDING_INSTRUCTION);
         let mut encoder = Encoder::new(Settings::default(), sender).unwrap();
         assert_eq!(
             encoder.queue_instruction(EncoderInstruction::SetDynamicTableCapacity(0)),
@@ -779,8 +825,24 @@ mod tests {
         let (_, prefix) =
             crate::protocol::qpack::codec::field::be_field_section_prefix(&last, 34, 1).unwrap();
         assert_eq!(prefix.required_insert_count, 0); // Falls back to literal at the local limit.
-        assert!(encoder.unacked_sections_by_stream[&4].len() * 40 <= MAX_BUFFERED_FRAME_PAYLOAD);
+        assert!(
+            encoder.unacked_sections_by_stream[&4].len() * 40 <= MAX_UNACKED_SECTION_METADATA_BYTES
+        );
     }
+    #[test]
+    fn rejected_instruction_callback_rolls_back_table_and_references() {
+        let (mut encoder, _decoder, mut receiver) = pair(68, 1);
+        while receiver.try_recv().is_ok() {}
+        drop(receiver);
+        let inserts = encoder.table.insert_count();
+        assert_eq!(
+            encoder.encode(0, [field(b"x", b"a")]),
+            Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
+        );
+        assert_eq!(encoder.table.insert_count(), inserts);
+        assert!(encoder.unacked_sections_by_stream.is_empty());
+    }
+
     #[test]
     fn full_encoder_channel_falls_back_without_committing_table_changes() {
         let limits = Settings {
@@ -789,7 +851,7 @@ mod tests {
         };
         let (sender, mut receiver) = mpsc::channel(1);
         let mut encoder = Encoder::new(limits, sender).unwrap();
-        let mut decoder = Decoder::new(limits, 1024, MAX_BUFFERED_FRAME_PAYLOAD as u64).unwrap();
+        let mut decoder = Decoder::new(limits, 1024, VARINT_MAX).unwrap();
         encoder
             .queue_instruction(EncoderInstruction::SetDynamicTableCapacity(68))
             .unwrap();

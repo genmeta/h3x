@@ -36,7 +36,7 @@ fn response_headers() -> Vec<u8> {
 async fn reset_wakes_a_blocked_producer_after_upload_is_dropped() {
     let message = Message::<headers::RequestHead, Bytes>::post("https://example.com/upload")
         .unwrap()
-        .with_body(crate::Body::from_storage(ArcWndBuf::new(1)));
+        .with_body(crate::Body::new(ArcWndBuf::new(1)));
     let mut producer = Request::from(ArcMessage::from(message));
     producer.write(b"x").await.unwrap();
     let sending = send_streaming_request(
@@ -69,7 +69,7 @@ async fn reset_wakes_a_blocked_producer_after_upload_is_dropped() {
 async fn reset_wakes_a_blocked_producer_after_request_is_dropped() {
     let message = Message::<headers::RequestHead, Bytes>::post("https://example.com/upload")
         .unwrap()
-        .with_body(crate::Body::from_storage(ArcWndBuf::new(1)));
+        .with_body(crate::Body::new(ArcWndBuf::new(1)));
     let mut producer = Request::from(ArcMessage::from(message));
     producer.write(b"x").await.unwrap();
     let waiting = request(
@@ -346,10 +346,7 @@ async fn write_failure_after_idle_body_preserves_the_response() {
                 .is_pending()
         );
         assert_eq!(producer.write(b"x").await, Ok(1));
-        assert_eq!(
-            producer.message.body_stream().error().await,
-            ErrorCode::H3_INTERNAL_ERROR
-        );
+        while producer.write(b"x").await.is_ok() {}
         assert!(
             waiting
                 .as_mut()
@@ -369,7 +366,7 @@ async fn write_failure_after_idle_body_preserves_the_response() {
 }
 
 #[tokio::test]
-async fn explicit_reset_stops_an_upload_waiting_on_network() {
+async fn explicit_reset_stops_upload_when_body_read_resumes() {
     timeout(Duration::from_secs(5), async {
         let request = Request::streaming_post("https://example.com/upload").unwrap();
         let mut body = request.message.body_stream();
@@ -392,13 +389,14 @@ async fn explicit_reset_stops_an_upload_waiting_on_network() {
             ErrorCode::from(body.read(&mut [0]).await.unwrap_err()),
             ErrorCode::H3_REQUEST_CANCELLED
         );
-        assert_eq!(sending.await.unwrap(), Err(ErrorCode::H3_REQUEST_CANCELLED));
+        assert!(!sending.is_finished());
         let mut partial = Vec::new();
         recv.read_to_end(&mut partial).await.unwrap();
         assert!(!partial.is_empty());
+        assert_eq!(sending.await.unwrap(), Err(ErrorCode::H3_REQUEST_CANCELLED));
     })
     .await
-    .expect("reset must wake the blocked upload");
+    .expect("reset must fail the upload when body reading resumes");
 }
 
 #[tokio::test]
@@ -438,7 +436,7 @@ async fn finished_producer_can_drop_while_upload_waits_on_network() {
 }
 
 #[tokio::test]
-async fn explicit_stop_stops_a_receive_waiting_on_network() {
+async fn explicit_stop_stops_receive_when_body_write_resumes() {
     timeout(Duration::from_secs(5), async {
         let mut message = Message::<headers::ResponseHead, Bytes>::default();
         message.set_status(StatusCode::OK);
@@ -458,6 +456,7 @@ async fn explicit_stop_stops_a_receive_waiting_on_network() {
         assert!(matches!(response, Response::Streaming(_)));
         tokio::task::yield_now().await;
         response.into_body().stop().await;
+        send.write_all(&[0, 1, b'x']).await.unwrap();
         tokio::task::yield_now().await;
         assert!(send.write_all(b"x").await.is_err());
     })
@@ -485,8 +484,8 @@ fn explicit_stop_cancels_body_after_response_pump_is_dropped() {
         send.write_all(&headers).await.unwrap();
         let Response::Streaming(response) =
             read_response(H3ReadStream::new(0, recv), qpack.qpack().clone(), None)
-            .await
-            .unwrap()
+                .await
+                .unwrap()
         else {
             panic!("expected streaming response");
         };
@@ -532,15 +531,13 @@ async fn streaming_response_keeps_message_error_after_transport_eof() {
         })
         .unwrap(),
     );
-    let Response::Streaming(mut response) =
-        read_response(
-            H3ReadStream::new(0, Cursor::new(encoded)),
-            qpack.qpack().clone(),
-            None,
-        )
-            .await
-            .unwrap()
-    else {
+    let Response::Streaming(mut response) = read_response(
+        H3ReadStream::new(0, Cursor::new(encoded)),
+        qpack.qpack().clone(),
+        None,
+    )
+    .await
+    .unwrap() else {
         panic!("expected streaming response");
     };
     assert_eq!(

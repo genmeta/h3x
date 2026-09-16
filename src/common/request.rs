@@ -59,7 +59,7 @@ impl Request<Write, ArcWndBuf> {
         let message = Message::new_request_with_body(
             url,
             method,
-            Body::<ArcWndBuf, Write>::new(DEFAULT_STREAM_CAPACITY),
+            Body::<ArcWndBuf, Write>::with_capacity(DEFAULT_STREAM_CAPACITY),
         )?;
         Ok(ArcMessage::from(message).into())
     }
@@ -205,7 +205,7 @@ mod tests {
             assert_eq!(second.headers()[header::CONTENT_TYPE], "application/json");
         }
         check(Body::<Bytes, Write>::new(Bytes::from_static(b"data")));
-        check(Body::<ArcWndBuf, Write>::new(1));
+        check(Body::<ArcWndBuf, Write>::with_capacity(1));
     }
 
     #[tokio::test]
@@ -396,7 +396,7 @@ mod tests {
 
         let message = ArcMessage::from(
             Message::<crate::common::headers::ResponseHead, Bytes>::default()
-                .with_body(crate::Body::from_storage(ArcWndBuf::new(1))),
+                .with_body(crate::Body::new(ArcWndBuf::new(1))),
         );
         let mut writer = Response::<Write, _>::from(message.clone());
         let reader = Response::<Read, _>::from(message.test_direction());

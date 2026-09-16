@@ -55,7 +55,7 @@ impl WriteBody for Response<Write, Bytes> {
 impl Response<Write, Bytes> {
     pub fn streaming(self, capacity: usize) -> Response<Write, ArcWndBuf> {
         self.message
-            .with_body(Body::<ArcWndBuf, Write>::new(capacity))
+            .with_body(Body::<ArcWndBuf, Write>::with_capacity(capacity))
             .into()
     }
 }

@@ -270,7 +270,7 @@ mod tests {
             let streaming: Request<Write> = request::Request::from(
                 request
                     .message
-                    .with_body(body::Body::<ArcWndBuf, Write>::new(1)),
+                    .with_body(body::Body::<ArcWndBuf, Write>::with_capacity(1)),
             )
             .into();
             let Request::Streaming(streaming) =
