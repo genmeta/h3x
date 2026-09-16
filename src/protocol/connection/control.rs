@@ -1,4 +1,9 @@
 //! Peer unidirectional stream admission, dispatch, and task lifetime.
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
+
 use qbase::sid::{Dir, StreamId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -67,12 +72,15 @@ impl<T: Transport> H3Connection<T> {
     }
 
     pub(super) async fn accept_and_process_uni(self) {
+        let peer_critical_streams = Arc::new(AtomicU8::new(0));
         let error = loop {
             tokio::select! {
                 biased;
                 error = self.transport.terminated() => break error,
                 accepted = self.transport.accept_uni() => match accepted {
-                    Ok((_, recv)) => { tokio::spawn(self.clone().receive(recv)); }
+                    Ok((_, recv)) => {
+                        tokio::spawn(self.clone().receive(recv, peer_critical_streams.clone()));
+                    }
                     Err(error) => {
                         self.fail(error);
                         break self.transport.terminated().await;
@@ -83,11 +91,23 @@ impl<T: Transport> H3Connection<T> {
         self.on_terminated(error);
     }
 
-    async fn receive(self, mut recv: T::StreamReader) {
+    async fn receive(self, mut recv: T::StreamReader, peer_critical_streams: Arc<AtomicU8>) {
         let result = async {
             let Some(stream_type) = frame::be_stream_type(&mut recv).await? else {
                 return Ok(());
             };
+            if matches!(
+                stream_type,
+                StreamType::Control | StreamType::QpackEncoder | StreamType::QpackDecoder
+            ) {
+                // Claim before reading any payload. Receive tasks share this atomic
+                // bitset for the connection's lifetime; claims are never released.
+                let bit = 1 << (stream_type as u8);
+                if peer_critical_streams.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+                    return Err(ErrorCode::H3_STREAM_CREATION_ERROR
+                        .with_reason(format!("duplicate peer {stream_type:?} stream")));
+                }
+            }
             match stream_type {
                 StreamType::Control => self.receive_control(&mut recv).await,
                 StreamType::Push => {

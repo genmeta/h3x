@@ -180,7 +180,10 @@ async fn bounded(work: impl Future<Output = ()>) {
 
 #[tokio::test]
 async fn each_unidirectional_stream_has_a_task_and_transport_close_fails_reads() {
-    let prefixes = vec![&[0x40][..]; 32];
+    let mut prefixes = vec![&[0x40][..]; 32];
+    // Incomplete type prefixes must not block admission, and each distinct
+    // critical stream type must be allowed on the same connection.
+    prefixes.extend([&[0][..], &[2][..], &[3][..]]);
     let (connection, probe, _peers) = setup(&prefixes).await;
     bounded(async {
         while probe.read_tasks.lock().unwrap().len() != prefixes.len() {
@@ -213,7 +216,6 @@ async fn each_unidirectional_stream_has_a_task_and_transport_close_fails_reads()
 }
 
 #[tokio::test]
-#[ignore = "Re-enable after adding duplicate unidirectional stream checks"]
 async fn stream_task_errors_close_before_dropping_receivers() {
     for (prefixes, expected) in [
         (
