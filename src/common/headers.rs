@@ -7,7 +7,7 @@ use http::{
     uri::Authority,
 };
 
-use crate::{ErrorCode, Result, protocol::qpack::Field};
+use crate::{Error, ErrorCode, Result, protocol::qpack::Field};
 
 /// Validated request metadata. HTTP/3 pseudo-headers are represented by their
 /// typed HTTP equivalents; `headers` contains ordinary fields only.
@@ -29,12 +29,13 @@ pub(crate) struct ResponseHead {
 
 impl ResponseHead {
     pub(crate) fn status(&self) -> Result<StatusCode> {
-        self.status.ok_or(ErrorCode::H3_MESSAGE_ERROR)
+        self.status
+            .ok_or_else(|| ErrorCode::H3_MESSAGE_ERROR.with_reason("response is missing :status"))
     }
 }
 
-fn message_error<T>(_: T) -> ErrorCode {
-    ErrorCode::H3_MESSAGE_ERROR
+fn message_error<T: std::error::Error + Send + Sync + 'static>(error: T) -> Error {
+    ErrorCode::H3_MESSAGE_ERROR.with_reason(format!("invalid HTTP field: {error}"))
 }
 
 pub(crate) fn content_length(headers: &HeaderMap) -> Result<Option<u64>> {
@@ -43,11 +44,13 @@ pub(crate) fn content_length(headers: &HeaderMap) -> Result<Option<u64>> {
         return Ok(None);
     };
     if values.next().is_some() {
-        return Err(ErrorCode::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR
+            .with_reason("multiple Content-Length fields are not allowed"));
     }
     let value = value.to_str().map_err(message_error)?;
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(ErrorCode::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR
+            .with_reason("Content-Length must contain only decimal digits"));
     }
     value.parse::<u64>().map(Some).map_err(message_error)
 }
@@ -61,7 +64,8 @@ pub(crate) fn be_request(fields: Vec<Field>) -> Result<RequestHead> {
             b":method" | b":scheme" | b":authority" | b":path"
         )
     }) {
-        return Err(ErrorCode::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR
+            .with_reason("request contains an unsupported pseudo-header"));
     }
 
     let method =
@@ -82,7 +86,8 @@ pub(crate) fn be_request(fields: Vec<Field>) -> Result<RequestHead> {
 pub(crate) fn be_response(fields: Vec<Field>) -> Result<ResponseHead> {
     let ParsedFields { pseudo, headers } = parse_fields(fields)?;
     if pseudo.len() != 1 {
-        return Err(ErrorCode::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR
+            .with_reason("response must contain exactly one :status pseudo-header"));
     }
     let status =
         StatusCode::from_bytes(required_pseudo(&pseudo, b":status")?).map_err(message_error)?;
@@ -96,7 +101,9 @@ pub(crate) fn be_response(fields: Vec<Field>) -> Result<ResponseHead> {
 pub(crate) fn be_trailers(fields: Vec<Field>) -> Result<HeaderMap> {
     let ParsedFields { pseudo, headers } = parse_fields(fields)?;
     if !pseudo.is_empty() {
-        return Err(ErrorCode::H3_MESSAGE_ERROR);
+        return Err(
+            ErrorCode::H3_MESSAGE_ERROR.with_reason("trailers must not contain pseudo-headers")
+        );
     }
     Ok(headers)
 }
@@ -147,7 +154,8 @@ fn require_empty(fields: &[Field]) -> Result<()> {
     if fields.is_empty() {
         Ok(())
     } else {
-        Err(ErrorCode::H3_MESSAGE_ERROR)
+        Err(ErrorCode::H3_MESSAGE_ERROR
+            .with_reason("field section output must be empty before encoding"))
     }
 }
 
@@ -164,13 +172,14 @@ fn parse_fields(fields: Vec<Field>) -> Result<ParsedFields> {
     for field in fields {
         if field.name.starts_with(b":") {
             if regular_seen {
-                return Err(ErrorCode::H3_MESSAGE_ERROR);
+                return Err(ErrorCode::H3_MESSAGE_ERROR
+                    .with_reason("pseudo-header appears after a regular header"));
             }
             if pseudo
                 .iter()
                 .any(|existing: &Field| existing.name == field.name)
             {
-                return Err(ErrorCode::H3_MESSAGE_ERROR);
+                return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason("duplicate pseudo-header"));
             }
             pseudo.push(field);
             continue;
@@ -206,10 +215,11 @@ fn validate_regular_field(name: &HeaderName, value: &HeaderValue) -> Result<()> 
     if matches!(name, &CONNECTION | &TRANSFER_ENCODING | &UPGRADE)
         || matches!(name.as_str(), "proxy-connection" | "keep-alive")
     {
-        return Err(ErrorCode::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR
+            .with_reason("connection-specific header is forbidden in HTTP/3"));
     }
     if name == TE && !value.as_bytes().eq_ignore_ascii_case(b"trailers") {
-        return Err(ErrorCode::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason("TE must have the value trailers"));
     }
     Ok(())
 }
@@ -229,7 +239,9 @@ struct RequestPseudo<'a> {
 
 fn request_pseudo(head: &RequestHead) -> Result<RequestPseudo<'_>> {
     let scheme = head.uri.scheme_str().map(str::as_bytes);
-    let authority = head.uri.authority().ok_or(ErrorCode::H3_MESSAGE_ERROR)?;
+    let authority = head.uri.authority().ok_or_else(|| {
+        ErrorCode::H3_MESSAGE_ERROR.with_reason("request URI is missing authority")
+    })?;
     let authority = authority.as_str().as_bytes();
     let path = head
         .uri
@@ -238,10 +250,13 @@ fn request_pseudo(head: &RequestHead) -> Result<RequestPseudo<'_>> {
 
     if head.method == Method::CONNECT {
         if scheme.is_some() || path.is_some() {
-            return Err(ErrorCode::H3_MESSAGE_ERROR);
+            return Err(ErrorCode::H3_MESSAGE_ERROR
+                .with_reason("CONNECT must not include :scheme or :path"));
         }
         if head.uri.authority().unwrap().port().is_none() {
-            return Err(ErrorCode::H3_MESSAGE_ERROR);
+            return Err(
+                ErrorCode::H3_MESSAGE_ERROR.with_reason("CONNECT authority is missing a port")
+            );
         }
         return Ok(RequestPseudo {
             scheme: None,
@@ -250,17 +265,23 @@ fn request_pseudo(head: &RequestHead) -> Result<RequestPseudo<'_>> {
         });
     }
 
-    let scheme = scheme.ok_or(ErrorCode::H3_MESSAGE_ERROR)?;
-    let path = path.ok_or(ErrorCode::H3_MESSAGE_ERROR)?;
+    let scheme = scheme
+        .ok_or_else(|| ErrorCode::H3_MESSAGE_ERROR.with_reason("request URI is missing scheme"))?;
+    let path =
+        path.ok_or_else(|| ErrorCode::H3_MESSAGE_ERROR.with_reason("request URI is missing path"))?;
     if path.is_empty() || (path != b"*" && !path.starts_with(b"/")) {
-        return Err(ErrorCode::H3_MESSAGE_ERROR);
+        return Err(
+            ErrorCode::H3_MESSAGE_ERROR.with_reason("request path must be * or start with /")
+        );
     }
     if head
         .headers
         .get(HOST)
         .is_some_and(|host| host.as_bytes() != authority)
     {
-        return Err(ErrorCode::H3_MESSAGE_ERROR);
+        return Err(
+            ErrorCode::H3_MESSAGE_ERROR.with_reason("Host does not match request authority")
+        );
     }
     Ok(RequestPseudo {
         scheme: Some(scheme),
@@ -294,12 +315,15 @@ fn validate_request_pseudo(
 ) -> Result<Authority> {
     if method == Method::CONNECT {
         if scheme.is_some() || path.is_some() {
-            return Err(ErrorCode::H3_MESSAGE_ERROR);
+            return Err(ErrorCode::H3_MESSAGE_ERROR
+                .with_reason("CONNECT must not include :scheme or :path"));
         }
         let authority = required_utf8(authority, ":authority")?;
         let authority: Authority = authority.parse().map_err(message_error)?;
         if authority.port().is_none() {
-            return Err(ErrorCode::H3_MESSAGE_ERROR);
+            return Err(
+                ErrorCode::H3_MESSAGE_ERROR.with_reason("CONNECT authority is missing a port")
+            );
         }
         return Ok(authority);
     }
@@ -307,13 +331,15 @@ fn validate_request_pseudo(
     required_utf8(scheme, ":scheme")?;
     let path = required_bytes(path, ":path")?;
     if path.is_empty() || (path != b"*" && !path.starts_with(b"/")) {
-        return Err(ErrorCode::H3_MESSAGE_ERROR);
+        return Err(
+            ErrorCode::H3_MESSAGE_ERROR.with_reason("request path must be * or start with /")
+        );
     }
     let host = headers.get(HOST).map(HeaderValue::as_bytes);
     if let (Some(authority), Some(host)) = (authority, host)
         && authority != host
     {
-        return Err(ErrorCode::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason("Host does not match :authority"));
     }
     required_utf8(authority.or(host), ":authority")?
         .parse()
@@ -339,7 +365,12 @@ fn build_request_uri(
 }
 
 fn required_pseudo<'a>(pseudo: &'a [Field], name: &[u8]) -> Result<&'a [u8]> {
-    pseudo_value(pseudo, name).ok_or(ErrorCode::H3_MESSAGE_ERROR)
+    pseudo_value(pseudo, name).ok_or_else(|| {
+        ErrorCode::H3_MESSAGE_ERROR.with_reason(format!(
+            "missing pseudo-header {}",
+            String::from_utf8_lossy(name)
+        ))
+    })
 }
 
 fn pseudo_value<'a>(pseudo: &'a [Field], name: &[u8]) -> Option<&'a [u8]> {
@@ -349,8 +380,10 @@ fn pseudo_value<'a>(pseudo: &'a [Field], name: &[u8]) -> Option<&'a [u8]> {
         .map(|field| field.value.as_ref())
 }
 
-fn required_bytes<'a>(value: Option<&'a [u8]>, _: &str) -> Result<&'a [u8]> {
-    value.ok_or(ErrorCode::H3_MESSAGE_ERROR)
+fn required_bytes<'a>(value: Option<&'a [u8]>, name: &str) -> Result<&'a [u8]> {
+    value.ok_or_else(|| {
+        ErrorCode::H3_MESSAGE_ERROR.with_reason(format!("missing pseudo-header {name}"))
+    })
 }
 
 fn required_utf8<'a>(value: Option<&'a [u8]>, name: &str) -> Result<&'a str> {
@@ -439,7 +472,10 @@ mod tests {
         let mut fields = Vec::new();
         assert!(matches!(
             fields.put_request(&request),
-            Err(ErrorCode::H3_MESSAGE_ERROR)
+            Err(h3x::Error {
+                code: ErrorCode::H3_MESSAGE_ERROR,
+                ..
+            })
         ));
         assert!(fields.is_empty());
 
@@ -449,14 +485,20 @@ mod tests {
             .insert(CONNECTION, HeaderValue::from_static("close"));
         assert!(matches!(
             fields.put_request(&request),
-            Err(ErrorCode::H3_MESSAGE_ERROR)
+            Err(h3x::Error {
+                code: ErrorCode::H3_MESSAGE_ERROR,
+                ..
+            })
         ));
         assert!(fields.is_empty());
 
         let response = ResponseHead::default();
         assert!(matches!(
             fields.put_response(&response),
-            Err(ErrorCode::H3_MESSAGE_ERROR)
+            Err(h3x::Error {
+                code: ErrorCode::H3_MESSAGE_ERROR,
+                ..
+            })
         ));
         assert!(fields.is_empty());
 
@@ -467,7 +509,10 @@ mod tests {
         };
         assert!(matches!(
             fields.put_response(&response),
-            Err(ErrorCode::H3_MESSAGE_ERROR)
+            Err(h3x::Error {
+                code: ErrorCode::H3_MESSAGE_ERROR,
+                ..
+            })
         ));
         assert_eq!(fields.len(), 1);
     }
@@ -522,7 +567,10 @@ mod tests {
                 assert!(
                     matches!(
                         be_request(request_fields(scheme, authority, host)),
-                        Err(ErrorCode::H3_MESSAGE_ERROR)
+                        Err(h3x::Error {
+                            code: ErrorCode::H3_MESSAGE_ERROR,
+                            ..
+                        })
                     ),
                     "scheme={scheme:?}, authority={authority:?}, host={host:?}"
                 );
@@ -548,7 +596,10 @@ mod tests {
                 assert!(
                     matches!(
                         be_request(request_fields(b"https", authority, host)),
-                        Err(ErrorCode::H3_MESSAGE_ERROR)
+                        Err(h3x::Error {
+                            code: ErrorCode::H3_MESSAGE_ERROR,
+                            ..
+                        })
                     ),
                     "authority={authority:?}, host={host:?}"
                 );
@@ -577,7 +628,13 @@ mod tests {
                 field(b":authority", b"example.com"),
             ],
         ] {
-            assert!(matches!(be_request(fields), Err(ErrorCode::H3_MESSAGE_ERROR)));
+            assert!(matches!(
+                be_request(fields),
+                Err(h3x::Error {
+                    code: ErrorCode::H3_MESSAGE_ERROR,
+                    ..
+                })
+            ));
         }
     }
 
@@ -621,13 +678,22 @@ mod tests {
         headers.append(CONTENT_LENGTH, "5".parse().unwrap());
         assert!(matches!(
             content_length(&headers),
-            Err(ErrorCode::H3_MESSAGE_ERROR)
+            Err(h3x::Error {
+                code: ErrorCode::H3_MESSAGE_ERROR,
+                ..
+            })
         ));
 
         for value in ["5, 5", "5, 6", "", "+5", "-5", "5x", "18446744073709551616"] {
             headers.insert(CONTENT_LENGTH, value.parse().unwrap());
             assert!(
-                matches!(content_length(&headers), Err(ErrorCode::H3_MESSAGE_ERROR)),
+                matches!(
+                    content_length(&headers),
+                    Err(h3x::Error {
+                        code: ErrorCode::H3_MESSAGE_ERROR,
+                        ..
+                    })
+                ),
                 "{value:?}"
             );
         }

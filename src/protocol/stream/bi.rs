@@ -8,7 +8,7 @@ use std::{
 };
 
 use super::{H3ReadStream, H3WriteStream, StreamState};
-use crate::{ErrorCode, Result};
+use crate::{Error, ErrorCode, Result};
 
 /// Observes application-owned directions without extending their lifetimes.
 pub(crate) struct BiStream<R, W> {
@@ -35,15 +35,15 @@ impl<R, W> BiStream<R, W> {
         .await
     }
 
-    fn close(&self, error: ErrorCode) {
+    fn close(&self, error: Error) {
         if let Some(state) = self.read.upgrade() {
-            let wakers = state.lock().unwrap().close(error, |_| {});
+            let wakers = state.lock().unwrap().close(error.clone(), |_| {});
             for waker in wakers.into_iter().flatten() {
                 waker.wake();
             }
         }
         if let Some(state) = self.write.upgrade() {
-            let wakers = state.lock().unwrap().close(error, |_| {});
+            let wakers = state.lock().unwrap().close(error.clone(), |_| {});
             for waker in wakers.into_iter().flatten() {
                 waker.wake();
             }
@@ -104,16 +104,16 @@ impl<R, W> BiStreams<R, W> {
             .collect();
         let rejected = streams.iter().map(|stream| stream.id).collect();
         for stream in streams {
-            stream.close(ErrorCode::H3_REQUEST_REJECTED);
+            stream.close(ErrorCode::H3_REQUEST_REJECTED.with_reason("request rejected"));
         }
         self.cleanup();
         rejected
     }
 
-    pub(crate) fn close(&self, error: ErrorCode) {
+    pub(crate) fn close(&self, error: Error) {
         let streams = mem::take(&mut *self.streams.lock().unwrap());
         for stream in streams.into_values() {
-            stream.close(error);
+            stream.close(error.clone());
         }
     }
 
@@ -207,7 +207,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         assert!(!draining.is_finished());
-        streams.close(ErrorCode::H3_INTERNAL_ERROR);
+        streams.close(ErrorCode::H3_INTERNAL_ERROR.with_reason("test terminates an active stream"));
         tokio::time::timeout(std::time::Duration::from_secs(1), draining)
             .await
             .unwrap()
@@ -395,7 +395,9 @@ mod tests {
                     }
                 }
             }
-            streams.close(ErrorCode::H3_INTERNAL_ERROR);
+            streams.close(
+                ErrorCode::H3_INTERNAL_ERROR.with_reason("test terminates an active stream"),
+            );
             assert_eq!(old_io.count(), 0);
             assert_eq!(old_drain.count(), 0);
             assert!(latest_io.count() > 0);
@@ -477,7 +479,9 @@ mod tests {
                 self.0 = true;
                 Poll::Pending
             } else {
-                Poll::Ready(Err(ErrorCode::H3_REQUEST_REJECTED.into()))
+                Poll::Ready(Err(ErrorCode::H3_REQUEST_REJECTED
+                    .with_reason("test peer rejects stream shutdown")
+                    .into()))
             }
         }
     }

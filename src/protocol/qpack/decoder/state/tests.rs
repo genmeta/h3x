@@ -22,7 +22,7 @@ async fn feedback_writer_preserves_order_within_and_between_batches() {
     drop(tx);
     let mut wire = Vec::new();
     assert_eq!(
-        Decoder::write(rx, &mut wire).await,
+        (Decoder::write(rx, &mut wire).await).map_err(ErrorCode::from),
         Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM),
     );
     assert_eq!(wire, [0x03, 0x01, 0x84, 0x40]);
@@ -63,9 +63,10 @@ async fn insertion_feedback_uses_the_queue_and_capacity_changes_emit_nothing() {
         );
     }
     assert!(Decoder::poll_feedback(&mut source, &mut cx).is_pending());
-    decoder.close(ErrorCode::H3_NO_ERROR);
+    decoder.close(ErrorCode::H3_NO_ERROR.with_reason("test closes the decoder while decoding"));
     assert_eq!(
-        Decoder::poll_feedback(&mut source, &mut cx),
+        (Decoder::poll_feedback(&mut source, &mut cx))
+            .map(|result| result.map_err(ErrorCode::from)),
         Poll::Ready(Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM))
     );
 }
@@ -90,13 +91,14 @@ async fn feedback_backlog_is_bounded_without_dropping_required_instructions() {
     }
     assert_eq!(source.len(), MAX_PENDING_INSTRUCTION);
     assert_eq!(
-        decoder
+        (decoder
             .state
             .lock()
             .unwrap()
             .as_ref()
             .unwrap()
-            .acknowledge(4096, 1),
+            .acknowledge(4096, 1))
+        .map_err(ErrorCode::from),
         Err(ErrorCode::H3_EXCESSIVE_LOAD)
     );
 
@@ -112,7 +114,10 @@ async fn feedback_backlog_is_bounded_without_dropping_required_instructions() {
         .unwrap()
         .acknowledge(4096, 1)
         .unwrap();
-    assert_eq!(decoder.cancel(4097), Err(ErrorCode::H3_EXCESSIVE_LOAD));
+    assert_eq!(
+        (decoder.cancel(4097)).map_err(ErrorCode::from),
+        Err(ErrorCode::H3_EXCESSIVE_LOAD)
+    );
 }
 
 #[tokio::test]
@@ -181,7 +186,10 @@ async fn cancellation_releases_registration_and_close_wakes_decode() {
         })
         .await;
         qpack.cancel(0).unwrap();
-        assert_eq!(decode.await, Err(ErrorCode::H3_REQUEST_CANCELLED));
+        assert_eq!(
+            (decode.await).map_err(ErrorCode::from),
+            Err(ErrorCode::H3_REQUEST_CANCELLED)
+        );
     }
     assert_eq!(
         qpack.next_instruction(),
@@ -195,8 +203,11 @@ async fn cancellation_releases_registration_and_close_wakes_decode() {
         Poll::Ready(())
     })
     .await;
-    qpack.close(ErrorCode::H3_NO_ERROR);
-    assert_eq!(decode.await, Err(ErrorCode::H3_NO_ERROR));
+    qpack.close(ErrorCode::H3_NO_ERROR.with_reason("test closes the decoder while decoding"));
+    assert_eq!(
+        (decode.await).map_err(ErrorCode::from),
+        Err(ErrorCode::H3_NO_ERROR)
+    );
     assert!(qpack.decoder.state.lock().unwrap().is_err());
 }
 
@@ -295,7 +306,7 @@ async fn rejected_decode_does_not_cancel_existing_registration() {
     let mut cx = Context::from_waker(Waker::noop());
     assert!(decode.as_mut().poll(&mut cx).is_pending());
     assert_eq!(
-        qpack.decode(0, Bytes::from_static(&[0, 0, 0xd1])).await,
+        (qpack.decode(0, Bytes::from_static(&[0, 0, 0xd1])).await).map_err(ErrorCode::from),
         Err(ErrorCode::H3_REQUEST_CANCELLED)
     );
     assert!(decode.as_mut().poll(&mut cx).is_pending());
@@ -324,7 +335,7 @@ async fn invalid_prefix_releases_registration_without_cancellation_feedback() {
         )
         .unwrap();
         assert_eq!(
-            qpack.decode(0, Bytes::copy_from_slice(payload)).await,
+            (qpack.decode(0, Bytes::copy_from_slice(payload)).await).map_err(ErrorCode::from),
             Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
         );
         assert_eq!(qpack.error(), None);
@@ -380,7 +391,7 @@ async fn invalid_dynamic_references_and_amplification_remain_bounded() {
             }
         }
         assert_eq!(
-            qpack.decode(0, Bytes::copy_from_slice(payload)).await,
+            (qpack.decode(0, Bytes::copy_from_slice(payload)).await).map_err(ErrorCode::from),
             Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
         );
     }
@@ -403,7 +414,7 @@ async fn invalid_dynamic_references_and_amplification_remain_bounded() {
             .unwrap(),
         );
         assert_eq!(
-            qpack.decode(0, payload).await,
+            (qpack.decode(0, payload).await).map_err(ErrorCode::from),
             Err(ErrorCode::H3_EXCESSIVE_LOAD)
         );
     }
@@ -429,8 +440,14 @@ async fn field_size_limits_are_enforced_by_each_direction_at_the_exact_boundary(
         decoder.local_limit(limit);
         let decoded = decoder.decode(0, wire.clone()).await;
         if limit == 33 {
-            assert_eq!(encoded, Err(ErrorCode::H3_EXCESSIVE_LOAD));
-            assert_eq!(decoded, Err(ErrorCode::H3_EXCESSIVE_LOAD));
+            assert_eq!(
+                (encoded).map_err(ErrorCode::from),
+                Err(ErrorCode::H3_EXCESSIVE_LOAD)
+            );
+            assert_eq!(
+                (decoded).map_err(ErrorCode::from),
+                Err(ErrorCode::H3_EXCESSIVE_LOAD)
+            );
         } else {
             assert_eq!(encoded.unwrap(), wire);
             assert_eq!(decoded.unwrap(), fields);

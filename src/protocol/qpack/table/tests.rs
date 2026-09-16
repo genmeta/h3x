@@ -9,7 +9,7 @@ fn capacity_insert_duplicate_and_eviction() {
     };
     assert_eq!(table.capacity, 0);
     assert_eq!(
-        table.apply(insert.clone()),
+        (table.apply(insert.clone())).map_err(ErrorCode::from),
         Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR)
     );
     table
@@ -32,11 +32,11 @@ fn capacity_insert_duplicate_and_eviction() {
     assert_eq!(table.get(2).unwrap().value, "z");
     assert_eq!((table.size, table.insert_count), (68, 3));
     assert_eq!(
-        table.apply(EncoderInstruction::Duplicate(2)),
+        (table.apply(EncoderInstruction::Duplicate(2))).map_err(ErrorCode::from),
         Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR)
     );
     assert_eq!(
-        table.apply(EncoderInstruction::SetDynamicTableCapacity(69)),
+        (table.apply(EncoderInstruction::SetDynamicTableCapacity(69))).map_err(ErrorCode::from),
         Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR)
     );
     assert_eq!(
@@ -101,7 +101,7 @@ fn rejected_updates_preserve_entries_and_capacity() {
         },
     ] {
         assert_eq!(
-            table.apply(instruction),
+            (table.apply(instruction)).map_err(ErrorCode::from),
             Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR)
         );
         assert_eq!(
@@ -112,7 +112,7 @@ fn rejected_updates_preserve_entries_and_capacity() {
     }
     for maximum in [67, VARINT_MAX + 1] {
         assert_eq!(
-            table.set_max_capacity(maximum),
+            (table.set_max_capacity(maximum)).map_err(ErrorCode::from),
             Err(ErrorCode::H3_SETTINGS_ERROR)
         );
         assert_eq!(table.max_capacity(), 68);
@@ -176,7 +176,7 @@ fn insertion_count_overflow_does_not_evict_existing_entry() {
         .unwrap();
     table.insert_count = VARINT_MAX;
     assert_eq!(
-        table.apply(EncoderInstruction::Duplicate(0)),
+        (table.apply(EncoderInstruction::Duplicate(0))).map_err(ErrorCode::from),
         Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR)
     );
     assert_eq!(table.insert_count(), VARINT_MAX);

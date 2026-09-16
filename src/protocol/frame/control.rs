@@ -5,7 +5,7 @@ use qrecovery::recv::StopSending;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{self as frame, Frame, FrameType, H3Frame, Write as _};
-use crate::{ErrorCode, Result};
+use crate::{Error, ErrorCode, Result};
 
 /// Frames permitted on the HTTP/3 control stream (RFC 9114 section 7.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,7 +67,7 @@ pub(crate) async fn be_stream_type<R: AsyncRead + StopSending + Unpin + ?Sized>(
         {
             Ok(None)
         }
-        Err(error) => Err(ErrorCode::from(error)),
+        Err(error) => Err(Error::from(error)),
     }
 }
 
@@ -96,30 +96,75 @@ impl<B: BufMut> WriteControl for B {
 pub(crate) async fn be_control<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Control> {
     let ty = frame::be_varint(recv)
         .await
-        .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?
-        .ok_or(ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
+        .map_err(|error| {
+            let error = error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
+                .map_or(&error, std::sync::Arc::as_ref);
+            error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<crate::Error>())
+                .cloned()
+                .unwrap_or_else(|| {
+                    let code = ErrorCode::H3_CLOSED_CRITICAL_STREAM;
+                    code.with_reason(error.to_string())
+                })
+        })?
+        .ok_or_else(|| {
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("critical HTTP/3 stream closed")
+        })?;
     let known = match ty.into_u64() {
         4 => Some(FrameType::Settings),
         3 => Some(FrameType::CancelPush),
         7 => Some(FrameType::Goaway),
         13 => Some(FrameType::MaxPushId),
-        0..=9 => return Err(ErrorCode::H3_FRAME_UNEXPECTED),
+        0..=9 => {
+            return Err(
+                ErrorCode::H3_FRAME_UNEXPECTED.with_reason("frame is not allowed in this context")
+            );
+        }
         _ => None,
     };
     let length = frame::be_varint(recv)
         .await
-        .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?
-        .ok_or(ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
+        .map_err(|error| {
+            let error = error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
+                .map_or(&error, std::sync::Arc::as_ref);
+            error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<crate::Error>())
+                .cloned()
+                .unwrap_or_else(|| {
+                    let code = ErrorCode::H3_CLOSED_CRITICAL_STREAM;
+                    code.with_reason(error.to_string())
+                })
+        })?
+        .ok_or_else(|| {
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("critical HTTP/3 stream closed")
+        })?;
     let Some(known) = known else {
         return Ok(Control::Unknown { ty, length });
     };
     if length.into_u64() > frame::MAX_BUFFERED_FRAME_PAYLOAD as u64 {
-        return Err(ErrorCode::H3_EXCESSIVE_LOAD);
+        return Err(ErrorCode::H3_EXCESSIVE_LOAD.with_reason("configured resource limit exceeded"));
     }
     let mut payload = vec![0; length.into_u64() as usize];
-    recv.read_exact(&mut payload)
-        .await
-        .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
+    recv.read_exact(&mut payload).await.map_err(|error| {
+        let error = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
+            .map_or(&error, std::sync::Arc::as_ref);
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<crate::Error>())
+            .cloned()
+            .unwrap_or_else(|| {
+                let code = ErrorCode::H3_CLOSED_CRITICAL_STREAM;
+                code.with_reason(error.to_string())
+            })
+    })?;
     Ok(
         match frame::be_frame_payload(&mut payload.as_slice(), known, length).await? {
             H3Frame::Settings(frame) => Control::Settings(frame),
@@ -217,20 +262,20 @@ mod tests {
     async fn shared_varints_preserve_critical_io_and_malformed_payload_errors() {
         for partial in [&[][..], &[0x40][..], &[0xc0, 0, 0][..]] {
             assert_eq!(
-                be_control(&mut &partial[..]).await,
+                (be_control(&mut &partial[..]).await).map_err(ErrorCode::from),
                 Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
             );
         }
         assert_eq!(
-            be_control(&mut &[4, 0x40][..]).await,
+            (be_control(&mut &[4, 0x40][..]).await).map_err(ErrorCode::from),
             Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
         );
         assert_eq!(
-            be_control(&mut &[4, 1, 1][..]).await,
+            (be_control(&mut &[4, 1, 1][..]).await).map_err(ErrorCode::from),
             Err(ErrorCode::H3_FRAME_ERROR)
         );
         assert_eq!(
-            be_control(&mut &[4, 2, 1][..]).await,
+            (be_control(&mut &[4, 2, 1][..]).await).map_err(ErrorCode::from),
             Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
         );
     }
@@ -240,7 +285,7 @@ mod tests {
         use qbase::varint::{VarInt, WriteVarInt};
         for ty in [0, 1, 2, 5, 6, 8, 9] {
             assert_eq!(
-                be_control(&mut &[ty, 0][..]).await,
+                (be_control(&mut &[ty, 0][..]).await).map_err(ErrorCode::from),
                 Err(ErrorCode::H3_FRAME_UNEXPECTED)
             );
         }

@@ -16,7 +16,7 @@ use super::{
         DecoderInstruction, EncoderInstruction, WriteInstruction, be_decoder_instruction,
     },
 };
-use crate::{ErrorCode, Result, protocol::frame::StreamType};
+use crate::{Error, ErrorCode, Result, protocol::frame::StreamType};
 
 mod state;
 use state::State;
@@ -36,7 +36,9 @@ impl Encoder {
         Ok(Self {
             state: Mutex::new(Ok(State::new(
                 peer,
-                Box::new(|_| Err(ErrorCode::H3_INTERNAL_ERROR)),
+                Box::new(
+                    |_| Err(ErrorCode::H3_INTERNAL_ERROR.with_reason("internal HTTP/3 error")),
+                ),
             )?)),
             completed: AtomicU64::new(0),
         })
@@ -77,20 +79,20 @@ impl Encoder {
             .lock()
             .unwrap()
             .as_mut()
-            .map_err(|error| *error)?
+            .map_err(|error| error.clone())?
             .configure(peer, max_fields)
     }
 
     #[cfg(test)]
-    pub(super) fn error(&self) -> Option<ErrorCode> {
-        self.state.lock().unwrap().as_ref().err().copied()
+    pub(super) fn error(&self) -> Option<Error> {
+        self.state.lock().unwrap().as_ref().err().cloned()
     }
 
-    pub(super) fn close(&self, error: ErrorCode) -> ErrorCode {
+    pub(super) fn close(&self, error: Error) -> Error {
         let error = {
             let mut state = self.state.lock().unwrap();
-            let error = state.as_ref().err().copied().unwrap_or(error);
-            *state = Err(error);
+            let error = state.as_ref().err().cloned().unwrap_or(error);
+            *state = Err(error.clone());
             error
         };
 
@@ -102,7 +104,7 @@ impl Encoder {
             .lock()
             .unwrap()
             .as_mut()
-            .map_err(|error| *error)?
+            .map_err(|error| error.clone())?
             .encode(id, fields)
     }
 
@@ -119,7 +121,7 @@ impl Encoder {
             .lock()
             .unwrap()
             .as_mut()
-            .map_err(|error| *error)?
+            .map_err(|error| error.clone())?
             .on_decoder_instruction(instruction, self.completed.load(Ordering::Acquire))
     }
 
@@ -146,22 +148,45 @@ impl Encoder {
         writer
             .write_all(&[StreamType::QpackEncoder as u8])
             .await
-            .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
+            .map_err(|error| {
+                let error = error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
+                    .map_or(&error, std::sync::Arc::as_ref);
+                error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<crate::Error>())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let code = ErrorCode::H3_CLOSED_CRITICAL_STREAM;
+                        code.with_reason(error.to_string())
+                    })
+            })?;
         let mut buf = Vec::new();
         while let Some(batch) = instructions.recv().await {
             for instruction in batch {
                 buf.clear();
                 buf.put_encoder_instruction(&instruction)?;
-                writer
-                    .write_all(&buf)
-                    .await
-                    .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
+                writer.write_all(&buf).await.map_err(|error| {
+                    let error = error
+                        .get_ref()
+                        .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
+                        .map_or(&error, std::sync::Arc::as_ref);
+                    error
+                        .get_ref()
+                        .and_then(|error| error.downcast_ref::<crate::Error>())
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            let code = ErrorCode::H3_CLOSED_CRITICAL_STREAM;
+                            code.with_reason(error.to_string())
+                        })
+                })?;
                 if !matches!(instruction, EncoderInstruction::SetDynamicTableCapacity(_)) {
                     self.completed.fetch_add(1, Ordering::Release);
                 }
             }
         }
-        Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
+        Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("critical HTTP/3 stream closed"))
     }
 }
 
@@ -227,7 +252,8 @@ mod tests {
     async fn completed_writes_allow_feedback_without_flushing() {
         let (encoder, source) = queued_insert();
         assert_eq!(
-            encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(0)),
+            (encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(0)))
+                .map_err(ErrorCode::from),
             Err(ErrorCode::QPACK_DECODER_STREAM_ERROR)
         );
         let mut writer = Writer { fail: false };
@@ -244,7 +270,8 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(0)),
+            (encoder.on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(0)))
+                .map_err(ErrorCode::from),
             Err(ErrorCode::QPACK_DECODER_STREAM_ERROR)
         );
     }
@@ -273,7 +300,7 @@ mod tests {
         .unwrap();
         drop(tx);
         assert_eq!(
-            encoder.write(rx, &mut Writer { fail: false }).await,
+            (encoder.write(rx, &mut Writer { fail: false }).await).map_err(ErrorCode::from),
             Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM),
         );
         assert_eq!(encoder.completed.load(Ordering::Acquire), 3);
@@ -283,7 +310,7 @@ mod tests {
     async fn failed_writes_do_not_advance_completion() {
         let (encoder, source) = queued_insert();
         assert_eq!(
-            encoder.write(source, &mut Writer { fail: true }).await,
+            (encoder.write(source, &mut Writer { fail: true }).await).map_err(ErrorCode::from),
             Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
         );
         assert_eq!(encoder.completed.load(Ordering::Acquire), 0);

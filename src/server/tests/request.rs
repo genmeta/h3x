@@ -123,7 +123,7 @@ async fn reads_buffered_and_streaming_request_frames() {
         panic!("incoming requests are always streaming")
     };
     assert_eq!(
-        request.read_all(&mut [0; 6]).await,
+        (request.read_all(&mut [0; 6]).await).map_err(ErrorCode::from),
         Err(ErrorCode::H3_MESSAGE_ERROR)
     );
     let mut encoded = request_frames(b"short", None);
@@ -134,7 +134,7 @@ async fn reads_buffered_and_streaming_request_frames() {
         panic!("expected streaming request")
     };
     assert_eq!(
-        request.read_all(&mut [0; 5]).await.unwrap_err(),
+        ErrorCode::from(request.read_all(&mut [0; 5]).await.unwrap_err()),
         ErrorCode::H3_FRAME_ERROR
     );
 }
@@ -231,7 +231,7 @@ async fn unknown_frames_do_not_hide_invalid_request_frames() {
             encoded.extend_from_slice(invalid);
             if before_headers {
                 assert_eq!(
-                    read_request(Cursor::new(encoded)).await.err().unwrap(),
+                    ErrorCode::from(read_request(Cursor::new(encoded)).await.err().unwrap()),
                     expected
                 );
             } else {
@@ -240,7 +240,10 @@ async fn unknown_frames_do_not_hide_invalid_request_frames() {
                 else {
                     panic!("incoming requests are always streaming")
                 };
-                assert_eq!(request.read(&mut [0]).await, Err(expected));
+                assert_eq!(
+                    (request.read(&mut [0]).await).map_err(ErrorCode::from),
+                    Err(expected)
+                );
             }
         }
     }
@@ -251,7 +254,7 @@ async fn unknown_frames_do_not_hide_invalid_request_frames() {
     ] {
         let encoded = [&[0x21, 0][..], suffix].concat();
         assert_eq!(
-            read_request(Cursor::new(encoded)).await.err().unwrap(),
+            ErrorCode::from(read_request(Cursor::new(encoded)).await.err().unwrap()),
             expected
         );
     }
@@ -260,5 +263,8 @@ async fn unknown_frames_do_not_hide_invalid_request_frames() {
     let Request::Streaming(mut request) = read_request(Cursor::new(encoded)).await.unwrap() else {
         panic!("incoming requests are always streaming")
     };
-    assert_eq!(request.read(&mut [0]).await, Err(ErrorCode::H3_MESSAGE_ERROR));
+    assert_eq!(
+        (request.read(&mut [0]).await).map_err(ErrorCode::from),
+        Err(ErrorCode::H3_MESSAGE_ERROR)
+    );
 }

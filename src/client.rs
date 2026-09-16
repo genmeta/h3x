@@ -11,7 +11,7 @@ use http::StatusCode;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::{
-    ArcWndBuf, ErrorCode, Result,
+    ArcWndBuf, Error, ErrorCode, Result,
     common::{
         self, Read, Write,
         body::{self, BodyMode},
@@ -45,8 +45,19 @@ where
 {
     use crate::ReadRequest;
     let method = request.method();
-    tokio::spawn(send_bytes_request(&request, ws, &qpack)?);
-    Ok(read_response(rs, qpack, Some(method)))
+    let sending = tokio::spawn(send_bytes_request(&request, ws, &qpack)?);
+    Ok(async move {
+        let mut response = std::pin::pin!(read_response(rs, qpack, Some(method)));
+        tokio::select! {
+            biased;
+            result = &mut response => result,
+            sent = sending => {
+                sent.map_err(|source| ErrorCode::H3_INTERNAL_ERROR
+                    .with_reason(format!("request upload task failed: {source}")))??;
+                response.await
+            }
+        }
+    })
 }
 
 /// Start a streaming request upload and return its response future.
@@ -65,9 +76,20 @@ where
     use crate::ReadRequest;
     let method = request.method();
 
-    let sending = send_streaming_request(&request, ws, &qpack)?;
-    tokio::spawn(sending);
-    Ok(read_response(rs, qpack, Some(method)))
+    let sending = tokio::spawn(send_streaming_request(&request, ws, &qpack)?);
+    Ok(async move {
+        let mut response = std::pin::pin!(read_response(rs, qpack, Some(method)));
+        // An early response leaves the spawned upload running independently.
+        tokio::select! {
+            biased;
+            result = &mut response => result,
+            sent = sending => {
+                sent.map_err(|source| ErrorCode::H3_INTERNAL_ERROR
+                    .with_reason(format!("request upload task failed: {source}")))??;
+                response.await
+            }
+        }
+    })
 }
 
 fn send_bytes_request<WS>(
@@ -85,7 +107,8 @@ where
         fields.put_request(&head)?;
         if headers::content_length(&head.headers)?.is_some_and(|length| length != body.len() as u64)
         {
-            return Err(ErrorCode::H3_MESSAGE_ERROR);
+            return Err(ErrorCode::H3_MESSAGE_ERROR
+                .with_reason("request body length does not match Content-Length"));
         }
         (fields, body)
     };
@@ -99,11 +122,11 @@ where
             ws.write_all(&buf).await?;
             body::write_bytes_body(&body, &mut ws).await?;
             ws.shutdown().await?;
-            Ok::<_, ErrorCode>(())
+            Ok::<_, Error>(())
         }
         .await;
-        if let Err(error) = result {
-            ws.cancel_with_error(error);
+        if let Err(error) = &result {
+            ws.cancel_with_error(error.clone());
         }
         result
     })
@@ -133,9 +156,9 @@ where
         let headers = Frame::new(Headers {
             field_section: qpack.encode(ws.stream_id(), fields)?,
         })?;
-        Ok::<_, ErrorCode>((headers, mode))
+        Ok::<_, Error>((headers, mode))
     })()
-    .inspect_err(|error| body.on_error(*error))?;
+    .inspect_err(|error| body.on_error(error.clone()))?;
     Ok(async move {
         let result = async {
             let mut buf = Vec::new();
@@ -143,12 +166,12 @@ where
             ws.write_all(&buf).await?;
             body::write_streaming_body(&mut body, &mut ws, mode).await?;
             ws.shutdown().await?;
-            Ok::<_, ErrorCode>(())
+            Ok::<_, Error>(())
         }
         .await;
-        if let Err(error) = result {
-            ws.cancel_with_error(error);
-            body.on_error(error);
+        if let Err(error) = &result {
+            ws.cancel_with_error(error.clone());
+            body.on_error(error.clone());
         }
         result
     })
@@ -170,17 +193,24 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static>(
                     frame::skip_payload(&mut rs, length.into_u64()).await?;
                     continue;
                 }
-                _ => return Err(ErrorCode::H3_FRAME_UNEXPECTED),
+                _ => {
+                    return Err(ErrorCode::H3_FRAME_UNEXPECTED
+                        .with_reason("expected response HEADERS before message body"));
+                }
             };
             let fields = qpack.decode(stream_id, frame.payload.field_section).await?;
             let head = headers::be_response(fields)?;
             let status = head.status()?;
             let length = headers::content_length(&head.headers)?;
             if status == StatusCode::SWITCHING_PROTOCOLS {
-                return Err(ErrorCode::H3_MESSAGE_ERROR);
+                return Err(
+                    ErrorCode::H3_MESSAGE_ERROR.with_reason("status 101 is forbidden in HTTP/3")
+                );
             }
             if (status.is_informational() || status == StatusCode::NO_CONTENT) && length.is_some() {
-                return Err(ErrorCode::H3_MESSAGE_ERROR);
+                return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason(
+                    "informational and 204 responses must not include Content-Length",
+                ));
             }
             if !status.is_informational() {
                 break (head, length);
@@ -190,7 +220,8 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static>(
             && head.status()?.is_success()
             && length.is_some()
         {
-            return Err(ErrorCode::H3_MESSAGE_ERROR);
+            return Err(ErrorCode::H3_MESSAGE_ERROR
+                .with_reason("successful CONNECT response must not include Content-Length"));
         }
         let mode = BodyMode::resolve(&head, method.as_ref())?;
         Ok((head, mode))

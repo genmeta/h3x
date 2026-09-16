@@ -30,7 +30,11 @@ impl Settings {
         .map(|(id, value)| {
             Ok((
                 VarInt::from_u32(id),
-                VarInt::try_from(value).map_err(|_| ErrorCode::H3_SETTINGS_ERROR)?,
+                VarInt::try_from(value).map_err(|error| {
+                    ErrorCode::H3_SETTINGS_ERROR.with_reason(format!(
+                        "SETTINGS value exceeds the QUIC variable-integer range: {error}"
+                    ))
+                })?,
             ))
         })
         .collect::<Result<_>>()?;
@@ -84,7 +88,10 @@ mod tests {
         ] {
             assert!(matches!(
                 Settings::new(fields, capacity, blocked),
-                Err(ErrorCode::H3_SETTINGS_ERROR)
+                Err(h3x::Error {
+                    code: ErrorCode::H3_SETTINGS_ERROR,
+                    ..
+                })
             ));
         }
     }

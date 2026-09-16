@@ -8,7 +8,7 @@ use std::{
 use tokio::io::{AsyncRead, ReadBuf};
 
 use super::{StreamState, StreamStatus};
-use crate::ErrorCode;
+use crate::{Error, ErrorCode};
 
 /// Application-owned read direction, observed weakly by the connection.
 pub struct H3ReadStream<R> {
@@ -24,7 +24,7 @@ impl<R> H3ReadStream<R> {
         }
     }
 
-    pub(crate) fn close(&self, error: ErrorCode) {
+    pub(crate) fn close(&self, error: Error) {
         let wakers = self.state.lock().unwrap().close(error, |_| {});
         for waker in wakers.into_iter().flatten() {
             waker.wake();
@@ -38,11 +38,10 @@ impl<R> H3ReadStream<R> {
 
 impl<R: qrecovery::recv::StopSending> qrecovery::recv::StopSending for &H3ReadStream<R> {
     fn stop(&mut self, error_code: u64) {
-        let wakers = self
-            .state
-            .lock()
-            .unwrap()
-            .close(ErrorCode::H3_REQUEST_CANCELLED, |io| io.stop(error_code));
+        let wakers = self.state.lock().unwrap().close(
+            ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"),
+            |io| io.stop(error_code),
+        );
         for waker in wakers.into_iter().flatten() {
             waker.wake();
         }
@@ -89,6 +88,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for H3ReadStream<R> {
 
 impl<R> Drop for H3ReadStream<R> {
     fn drop(&mut self) {
-        self.close(ErrorCode::H3_REQUEST_CANCELLED);
+        self.close(ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"));
     }
 }

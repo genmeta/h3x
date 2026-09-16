@@ -29,7 +29,8 @@ pub(super) struct DynamicTable {
 impl DynamicTable {
     pub(super) fn new(max_capacity: u64) -> Result<Self> {
         if max_capacity > VARINT_MAX {
-            return Err(ErrorCode::H3_SETTINGS_ERROR);
+            return Err(ErrorCode::H3_SETTINGS_ERROR
+                .with_reason("QPACK table capacity exceeds the QUIC variable-integer range"));
         }
         Ok(Self {
             max_capacity,
@@ -53,7 +54,9 @@ impl DynamicTable {
     /// Reject values outside 62 bits or below the current capacity.
     pub(super) fn set_max_capacity(&mut self, max_capacity: u64) -> Result<()> {
         if max_capacity > VARINT_MAX || max_capacity < self.capacity {
-            return Err(ErrorCode::H3_SETTINGS_ERROR);
+            return Err(ErrorCode::H3_SETTINGS_ERROR.with_reason(
+                "QPACK maximum capacity is out of range or below the current capacity",
+            ));
         }
         self.max_capacity = max_capacity;
         Ok(())
@@ -99,14 +102,18 @@ impl DynamicTable {
             .and_then(|v| v.checked_sub(1))
             .and_then(|id| self.get(id))
             .cloned()
-            .ok_or(ErrorCode::QPACK_ENCODER_STREAM_ERROR)
+            .ok_or_else(|| {
+                ErrorCode::QPACK_ENCODER_STREAM_ERROR
+                    .with_reason("dynamic table index is missing or has been evicted")
+            })
     }
 
     pub(super) fn apply(&mut self, instruction: EncoderInstruction) -> Result<()> {
         let entry = match instruction {
             EncoderInstruction::SetDynamicTableCapacity(capacity) => {
                 if capacity > self.max_capacity {
-                    return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR);
+                    return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR
+                        .with_reason("dynamic table capacity exceeds the advertised maximum"));
                 }
                 self.evict_to(capacity);
                 self.capacity = capacity;
@@ -125,7 +132,10 @@ impl DynamicTable {
                 let name = if is_static {
                     Bytes::from_static(
                         get(index)
-                            .ok_or(ErrorCode::QPACK_ENCODER_STREAM_ERROR)?
+                            .ok_or_else(|| {
+                                ErrorCode::QPACK_ENCODER_STREAM_ERROR
+                                    .with_reason("static name index is out of range")
+                            })?
                             .0
                             .as_bytes(),
                     )
@@ -142,7 +152,8 @@ impl DynamicTable {
         };
         let size = entry.name.len() as u64 + entry.value.len() as u64 + 32;
         if size > self.capacity || self.insert_count == VARINT_MAX {
-            return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR);
+            return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR
+                .with_reason("entry exceeds table capacity or insert count is exhausted"));
         }
         self.evict_to(self.capacity - size);
         self.entries.push_back(entry);

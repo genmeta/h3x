@@ -301,10 +301,10 @@ mod tests {
                         H3ReadStream::new(0, tokio::io::empty()),
                         crate::test_support::connection().qpack().clone(),
                     );
-                    assert!(matches!(result, Err(actual) if actual == error));
+                    assert!(matches!(result, Err(actual) if actual.code == error));
                 }
-                assert_eq!(waiting.await, Err(error));
-                assert_eq!(writer.finish().await, Err(error));
+                assert_eq!((waiting.await).map_err(ErrorCode::from), Err(error));
+                assert_eq!((writer.finish().await).map_err(ErrorCode::from), Err(error));
             }
         })
         .await
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(reader.read(&mut buf).await.unwrap(), 0);
         writer.reset().await.unwrap();
         assert_eq!(
-            reader.read(&mut buf).await.unwrap_err(),
+            ErrorCode::from(reader.read(&mut buf).await.unwrap_err()),
             ErrorCode::H3_REQUEST_CANCELLED
         );
 
@@ -402,7 +402,7 @@ mod tests {
         let reader = Response::<Read, _>::from(message.test_direction());
         reader.stop().await;
         assert_eq!(
-            writer.write(b"x").await.unwrap_err(),
+            ErrorCode::from(writer.write(b"x").await.unwrap_err()),
             ErrorCode::H3_REQUEST_CANCELLED
         );
     }

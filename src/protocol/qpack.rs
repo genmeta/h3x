@@ -6,7 +6,7 @@ use bytes::Bytes;
 use qbase::varint::VARINT_MAX;
 
 use super::frame;
-use crate::{ErrorCode, Result};
+use crate::{Error, ErrorCode, Result};
 
 mod codec;
 pub(super) mod decoder;
@@ -97,13 +97,13 @@ impl Qpack {
     }
 
     #[cfg(test)]
-    pub(crate) fn error(&self) -> Option<ErrorCode> {
+    pub(crate) fn error(&self) -> Option<Error> {
         self.encoder.error()
     }
 
-    pub(crate) fn close(&self, error: ErrorCode) -> ErrorCode {
+    pub(crate) fn close(&self, error: Error) -> Error {
         let error = self.encoder.close(error);
-        self.decoder.close(error);
+        self.decoder.close(error.clone());
         error
     }
 
@@ -127,19 +127,20 @@ async fn drive<T: crate::Transport>(
     write: impl AsyncFnOnce(&mut T::StreamWriter) -> Result<()>,
 ) {
     let writing = async {
-        let stream = transport
-            .open_uni()
-            .await
-            .and_then(|stream| stream.ok_or(ErrorCode::H3_STREAM_CREATION_ERROR));
+        let stream = transport.open_uni().await.and_then(|stream| {
+            stream.ok_or_else(|| {
+                ErrorCode::H3_STREAM_CREATION_ERROR.with_reason("unable to open QPACK stream")
+            })
+        });
         match stream {
             Ok((_, mut send)) => {
                 if let Err(error) = write(&mut send).await {
                     // Keep the critical stream alive until transport close is requested.
-                    let _ = transport.close(error.to_string(), error.as_u64());
+                    let _ = transport.close(error.reason.clone(), error.code.as_u64());
                 }
             }
             Err(error) => {
-                let _ = transport.close(error.to_string(), error.as_u64());
+                let _ = transport.close(error.reason.clone(), error.code.as_u64());
             }
         }
     };

@@ -149,7 +149,10 @@ async fn response_content_length_and_streaming() {
         if length == "invalid" {
             assert!(matches!(
                 read_response(Cursor::new(encoded)).await,
-                Err(ErrorCode::H3_MESSAGE_ERROR)
+                Err(h3x::Error {
+                    code: ErrorCode::H3_MESSAGE_ERROR,
+                    ..
+                })
             ));
             continue;
         }
@@ -159,7 +162,7 @@ async fn response_content_length_and_streaming() {
             panic!("incoming responses are always streaming")
         };
         assert_eq!(
-            response.read(&mut [0; 8]).await,
+            (response.read(&mut [0; 8]).await).map_err(ErrorCode::from),
             Err(ErrorCode::H3_MESSAGE_ERROR)
         );
     }
@@ -189,7 +192,7 @@ async fn response_content_length_and_streaming() {
     writer.write_all(&encoded).await.unwrap();
     writer.shutdown().await.unwrap();
     assert_eq!(
-        response.read(&mut [0; 5]).await.unwrap_err(),
+        ErrorCode::from(response.read(&mut [0; 5]).await.unwrap_err()),
         ErrorCode::H3_FRAME_ERROR
     );
 
@@ -202,7 +205,7 @@ async fn response_content_length_and_streaming() {
         panic!("incoming responses are always streaming")
     };
     assert_eq!(
-        response.read(&mut [0]).await,
+        (response.read(&mut [0]).await).map_err(ErrorCode::from),
         Err(ErrorCode::H3_FRAME_ERROR)
     );
 
@@ -219,6 +222,9 @@ async fn response_content_length_and_streaming() {
         else {
             panic!("expected streaming response")
         };
-        assert_eq!(response.read(&mut [0]).await.unwrap_err(), expected);
+        assert_eq!(
+            ErrorCode::from(response.read(&mut [0]).await.unwrap_err()),
+            expected
+        );
     }
 }

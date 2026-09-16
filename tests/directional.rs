@@ -193,7 +193,7 @@ async fn explicit_reset_wakes_producer_after_upload_is_dropped() {
     );
     cancelling.reset().await.unwrap();
     assert_eq!(
-        timeout(Duration::from_secs(1), blocked).await.unwrap(),
+        (timeout(Duration::from_secs(1), blocked).await.unwrap()).map_err(ErrorCode::from),
         Err(ErrorCode::H3_REQUEST_CANCELLED)
     );
 }

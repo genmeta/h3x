@@ -58,20 +58,26 @@ impl<H, B> Message<H, B> {
 
 impl<B> Message<RequestHead, B> {
     pub(crate) fn new_request_with_body(url: &str, method: Method, body: B) -> Result<Self> {
-        let uri: Uri = url.parse().map_err(|_| ErrorCode::H3_MESSAGE_ERROR)?;
+        let uri: Uri = url.parse().map_err(|error| {
+            ErrorCode::H3_MESSAGE_ERROR.with_reason(format!("invalid request URI: {error}"))
+        })?;
         // CONNECT also accepts an authority-form target such as example.com:443.
         let authority_form = method == Method::CONNECT
             && uri.scheme().is_none()
             && uri.authority().is_some()
             && uri.path_and_query().is_none();
         if !authority_form && (uri.scheme().is_none() || uri.authority().is_none()) {
-            return Err(ErrorCode::H3_MESSAGE_ERROR);
+            return Err(ErrorCode::H3_MESSAGE_ERROR
+                .with_reason("request URI requires scheme and authority"));
         }
         let uri = if method == Method::CONNECT {
             Uri::builder()
                 .authority(uri.authority().unwrap().clone())
                 .build()
-                .map_err(|_| ErrorCode::H3_MESSAGE_ERROR)?
+                .map_err(|error| {
+                    ErrorCode::H3_MESSAGE_ERROR
+                        .with_reason(format!("invalid CONNECT authority: {error}"))
+                })?
         } else {
             uri
         };

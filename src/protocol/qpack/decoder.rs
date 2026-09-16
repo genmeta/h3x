@@ -11,7 +11,7 @@ use super::{
     Field, Settings,
     codec::instruction::{DecoderInstruction, WriteInstruction, be_encoder_instruction},
 };
-use crate::{ErrorCode, Result, protocol::frame::StreamType};
+use crate::{Error, ErrorCode, Result, protocol::frame::StreamType};
 
 mod state;
 use state::State;
@@ -66,7 +66,9 @@ impl Decoder {
                 local,
                 max_blocked_bytes,
                 max_fields,
-                Box::new(|_| Err(ErrorCode::H3_INTERNAL_ERROR)),
+                Box::new(
+                    |_| Err(ErrorCode::H3_INTERNAL_ERROR.with_reason("internal HTTP/3 error")),
+                ),
             )?)),
         })
     }
@@ -99,7 +101,7 @@ impl Decoder {
         Ok((decoder, rx))
     }
 
-    pub(super) fn close(&self, error: ErrorCode) {
+    pub(super) fn close(&self, error: Error) {
         let wakes = {
             let mut state = self.state.lock().unwrap();
             let wakes = match state.as_mut() {
@@ -117,13 +119,13 @@ impl Decoder {
 
     pub(super) async fn decode(&self, id: u64, payload: Bytes) -> Result<Vec<Field>> {
         if id > qbase::varint::VARINT_MAX {
-            return Err(ErrorCode::H3_INTERNAL_ERROR);
+            return Err(ErrorCode::H3_INTERNAL_ERROR.with_reason("internal HTTP/3 error"));
         }
         let (offset, prefix) = {
             let mut state = self.state.lock().unwrap();
-            let decoder = state.as_mut().map_err(|error| *error)?;
+            let decoder = state.as_mut().map_err(|error| error.clone())?;
             if decoder.decoding_stream.contains(&id) {
-                return Err(ErrorCode::H3_REQUEST_CANCELLED);
+                return Err(ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"));
             }
             let (rest, prefix) = decoder.read_prefix(&payload)?;
             let offset = payload.len() - rest.len();
@@ -138,10 +140,12 @@ impl Decoder {
             let mut state = self.state.lock().unwrap();
             let decoder = match state.as_mut() {
                 Ok(decoder) => decoder,
-                Err(error) => return Poll::Ready(Err(*error)),
+                Err(error) => return Poll::Ready(Err(error.clone())),
             };
             if !decoder.decoding_stream.contains(&id) {
-                return Poll::Ready(Err(ErrorCode::H3_REQUEST_CANCELLED));
+                return Poll::Ready(Err(
+                    ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled")
+                ));
             }
             let result = decoder.poll_decode(id, prefix, &payload[offset..], cx);
             if result.is_ready() {
@@ -158,7 +162,7 @@ impl Decoder {
             .lock()
             .unwrap()
             .as_mut()
-            .map_err(|error| *error)?
+            .map_err(|error| error.clone())?
             .cancel_stream(id)?;
         for wake in wakes {
             wake.wake();
@@ -175,7 +179,7 @@ impl Decoder {
                 .lock()
                 .unwrap()
                 .as_mut()
-                .map_err(|error| *error)?
+                .map_err(|error| error.clone())?
                 .on_encoder_instruction(instruction)?;
             for wake in wakes {
                 wake.wake();
@@ -204,19 +208,42 @@ impl Decoder {
         writer
             .write_all(&[StreamType::QpackDecoder as u8])
             .await
-            .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
+            .map_err(|error| {
+                let error = error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
+                    .map_or(&error, std::sync::Arc::as_ref);
+                error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<crate::Error>())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let code = ErrorCode::H3_CLOSED_CRITICAL_STREAM;
+                        code.with_reason(error.to_string())
+                    })
+            })?;
         let mut buf = Vec::new();
         while let Some(batch) = receiver.recv().await {
             for instruction in batch {
                 buf.clear();
                 buf.put_decoder_instruction(&instruction)?;
-                writer
-                    .write_all(&buf)
-                    .await
-                    .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)?;
+                writer.write_all(&buf).await.map_err(|error| {
+                    let error = error
+                        .get_ref()
+                        .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
+                        .map_or(&error, std::sync::Arc::as_ref);
+                    error
+                        .get_ref()
+                        .and_then(|error| error.downcast_ref::<crate::Error>())
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            let code = ErrorCode::H3_CLOSED_CRITICAL_STREAM;
+                            code.with_reason(error.to_string())
+                        })
+                })?;
             }
         }
-        Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
+        Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("critical HTTP/3 stream closed"))
     }
 }
 
@@ -231,7 +258,7 @@ impl Decoder {
             .lock()
             .unwrap()
             .as_mut()
-            .map_err(|error| *error)?
+            .map_err(|error| error.clone())?
             .on_encoder_instruction(instruction)
     }
 
@@ -239,9 +266,11 @@ impl Decoder {
         receiver: &mut Instructions,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<Batch>> {
-        receiver
-            .poll_recv(cx)
-            .map(|instruction| instruction.ok_or(ErrorCode::H3_CLOSED_CRITICAL_STREAM))
+        receiver.poll_recv(cx).map(|instruction| {
+            instruction.ok_or_else(|| {
+                ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("critical HTTP/3 stream closed")
+            })
+        })
     }
 
     pub(super) fn read_prefix<'a>(
@@ -252,7 +281,7 @@ impl Decoder {
             .lock()
             .unwrap()
             .as_ref()
-            .map_err(|error| *error)?
+            .map_err(|error| error.clone())?
             .read_prefix(payload)
     }
 
@@ -267,7 +296,7 @@ impl Decoder {
             .lock()
             .unwrap()
             .as_mut()
-            .map_err(|error| *error)?
+            .map_err(|error| error.clone())?
             .poll_decode(id, prefix, bytes, cx)
     }
 }

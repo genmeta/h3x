@@ -74,11 +74,9 @@ impl<T: Transport> H3Connection<T> {
         H3ReadStream<T::StreamReader>,
     )> {
         self.cursor.remote.lock().unwrap().not_goaway()?;
-        let (id, (recv, send)) = self
-            .transport
-            .open_bi()
-            .await?
-            .ok_or(ErrorCode::H3_STREAM_CREATION_ERROR)?;
+        let (id, (recv, send)) = self.transport.open_bi().await?.ok_or(
+            ErrorCode::H3_STREAM_CREATION_ERROR.with_reason("unable to open required stream"),
+        )?;
         self.bi_streams.insert(id, recv, send)
     }
 
@@ -106,7 +104,7 @@ impl<T: Transport> H3Connection<T> {
         let (id, (mut read, mut write)) = self.transport.accept_bi().await?;
         let stream_id = qbase::varint::VarInt::try_from(id)
             .map(qbase::sid::StreamId::from)
-            .map_err(|_| ErrorCode::H3_ID_ERROR);
+            .map_err(|_| ErrorCode::H3_ID_ERROR.with_reason("invalid stream or push identifier"));
         if let Err(error) = stream_id.and_then(|id| self.cursor.local.lock().unwrap().accept(id)) {
             read.stop(ErrorCode::H3_REQUEST_REJECTED.as_u64());
             write.cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64());
@@ -132,9 +130,13 @@ impl<T: Transport> Clone for H3Connection<T> {
 /// Channel producers run under QPACK state locks and must never block.
 pub(super) fn instruction_send_error<T>(
     error: tokio::sync::mpsc::error::TrySendError<T>,
-) -> ErrorCode {
+) -> crate::Error {
     match error {
-        tokio::sync::mpsc::error::TrySendError::Full(_) => ErrorCode::H3_EXCESSIVE_LOAD,
-        tokio::sync::mpsc::error::TrySendError::Closed(_) => ErrorCode::H3_CLOSED_CRITICAL_STREAM,
+        tokio::sync::mpsc::error::TrySendError::Full(_) => {
+            ErrorCode::H3_EXCESSIVE_LOAD.with_reason("QPACK instruction queue is full")
+        }
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("critical stream closed")
+        }
     }
 }

@@ -9,13 +9,13 @@ use qbase::{
 
 use crate::{ErrorCode, Result, Role};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Cursor {
     /// Exclusive upper bound of admitted streams, initially the first peer stream.
     Max(StreamId),
     /// Frozen GOAWAY boundary; no more streams are admitted.
     Gone(StreamId),
-    Closed(ErrorCode),
+    Closed(crate::Error),
 }
 
 pub(crate) struct StreamCursor {
@@ -61,8 +61,8 @@ impl StreamCursor {
     }
 
     /// Freeze both directions before the connection clears the stream registry.
-    pub(super) fn close(&self, error: ErrorCode) {
-        self.local.lock().unwrap().close(error);
+    pub(super) fn close(&self, error: crate::Error) {
+        self.local.lock().unwrap().close(error.clone());
         self.remote.lock().unwrap().close(error);
     }
 
@@ -70,16 +70,20 @@ impl StreamCursor {
         self.local_goaway
             .clone()
             .await
-            .map_err(|_| ErrorCode::H3_INTERNAL_ERROR)?
-            .ok_or(ErrorCode::H3_INTERNAL_ERROR)
+            .map_err(|_| {
+                ErrorCode::H3_INTERNAL_ERROR.with_reason("connection state is unavailable")
+            })?
+            .ok_or(ErrorCode::H3_INTERNAL_ERROR.with_reason("connection state is unavailable"))
     }
 
     pub(crate) async fn peer_goaway(&self) -> Result<StreamId> {
         self.remote_goaway
             .clone()
             .await
-            .map_err(|_| ErrorCode::H3_INTERNAL_ERROR)?
-            .ok_or(ErrorCode::H3_INTERNAL_ERROR)
+            .map_err(|_| {
+                ErrorCode::H3_INTERNAL_ERROR.with_reason("connection state is unavailable")
+            })?
+            .ok_or(ErrorCode::H3_INTERNAL_ERROR.with_reason("connection state is unavailable"))
     }
 }
 
@@ -87,12 +91,13 @@ impl Cursor {
     pub(super) fn not_goaway(&self) -> Result<()> {
         match self {
             Self::Max(_) => Ok(()),
-            Self::Gone(_) => Err(ErrorCode::H3_REQUEST_REJECTED),
-            Self::Closed(error) => Err(*error),
+            Self::Gone(_) => Err(ErrorCode::H3_REQUEST_REJECTED
+                .with_reason("connection no longer accepts new streams")),
+            Self::Closed(error) => Err(error.clone()),
         }
     }
 
-    fn close(&mut self, error: ErrorCode) {
+    fn close(&mut self, error: crate::Error) {
         if !matches!(self, Self::Closed(_)) {
             *self = Self::Closed(error);
         }
@@ -102,18 +107,22 @@ impl Cursor {
         match self {
             Self::Max(boundary) => {
                 if id.role() != boundary.role() || id.dir() != Dir::Bi {
-                    return Err(ErrorCode::H3_ID_ERROR);
+                    return Err(
+                        ErrorCode::H3_ID_ERROR.with_reason("invalid stream or push identifier")
+                    );
                 }
                 if id >= *boundary {
                     // A GOAWAY boundary must still fit in a QUIC variable integer.
-                    let next =
-                        VarInt::try_from(u64::from(id) + 4).map_err(|_| ErrorCode::H3_ID_ERROR)?;
+                    let next = VarInt::try_from(u64::from(id) + 4).map_err(|_| {
+                        ErrorCode::H3_ID_ERROR.with_reason("invalid stream or push identifier")
+                    })?;
                     *boundary = StreamId::from(next);
                 }
                 Ok(())
             }
-            Self::Gone(_) => Err(ErrorCode::H3_REQUEST_REJECTED),
-            Self::Closed(error) => Err(*error),
+            Self::Gone(_) => Err(ErrorCode::H3_REQUEST_REJECTED
+                .with_reason("connection no longer accepts new streams")),
+            Self::Closed(error) => Err(error.clone()),
         }
     }
 }

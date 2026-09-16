@@ -24,7 +24,7 @@ struct Probe {
     accept_tasks: Mutex<HashSet<Id>>,
     read_tasks: Mutex<HashSet<Id>>,
     live: AtomicUsize,
-    closed: Mutex<Option<ErrorCode>>,
+    closed: Mutex<Option<h3x::Error>>,
     ended: Notify,
     dropped_before_close: AtomicBool,
 }
@@ -111,21 +111,25 @@ impl Transport for Incoming {
             None => Err(self.terminated().await),
         }
     }
-    fn close(&self, _: String, code: u64) -> Result<()> {
+    fn close(&self, reason: String, code: u64) -> Result<()> {
         let error = match code {
             0x100 => ErrorCode::H3_NO_ERROR,
             0x103 => ErrorCode::H3_STREAM_CREATION_ERROR,
             0x108 => ErrorCode::H3_ID_ERROR,
             _ => ErrorCode::H3_INTERNAL_ERROR,
         };
-        self.probe.closed.lock().unwrap().get_or_insert(error);
+        self.probe
+            .closed
+            .lock()
+            .unwrap()
+            .get_or_insert(error.with_reason(reason));
         self.probe.ended.notify_waiters();
         Ok(())
     }
-    async fn terminated(&self) -> ErrorCode {
+    async fn terminated(&self) -> h3x::Error {
         loop {
             let changed = self.probe.ended.notified();
-            if let Some(error) = *self.probe.closed.lock().unwrap() {
+            if let Some(error) = self.probe.closed.lock().unwrap().clone() {
                 return error;
             }
             changed.await;
@@ -183,7 +187,8 @@ async fn each_unidirectional_stream_has_a_task_and_transport_close_cancels_them(
     );
     drop(connection);
     assert!(probe.closed.lock().unwrap().is_none());
-    *probe.closed.lock().unwrap() = Some(ErrorCode::H3_NO_ERROR);
+    *probe.closed.lock().unwrap() =
+        Some(ErrorCode::H3_NO_ERROR.with_reason("test transport finished"));
     probe.ended.notify_waiters();
     bounded(async {
         while probe.live.load(Ordering::SeqCst) != 0 {
@@ -202,9 +207,18 @@ async fn stream_task_errors_close_before_dropping_receivers() {
             vec![&[0x40][..], &[0, 4, 0, 7, 1, 1][..]],
             ErrorCode::H3_ID_ERROR,
         ),
-        (vec![&[0][..], &[0][..]], ErrorCode::H3_STREAM_CREATION_ERROR),
-        (vec![&[2][..], &[2][..]], ErrorCode::H3_STREAM_CREATION_ERROR),
-        (vec![&[3][..], &[3][..]], ErrorCode::H3_STREAM_CREATION_ERROR),
+        (
+            vec![&[0][..], &[0][..]],
+            ErrorCode::H3_STREAM_CREATION_ERROR,
+        ),
+        (
+            vec![&[2][..], &[2][..]],
+            ErrorCode::H3_STREAM_CREATION_ERROR,
+        ),
+        (
+            vec![&[3][..], &[3][..]],
+            ErrorCode::H3_STREAM_CREATION_ERROR,
+        ),
     ] {
         let (connection, probe, _peers) = setup(&prefixes).await;
         bounded(async {
@@ -214,7 +228,15 @@ async fn stream_task_errors_close_before_dropping_receivers() {
         })
         .await;
         drop(connection);
-        assert_eq!(*probe.closed.lock().unwrap(), Some(expected));
+        assert_eq!(
+            probe
+                .closed
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|error| error.code),
+            Some(expected)
+        );
         assert!(!probe.dropped_before_close.load(Ordering::SeqCst));
     }
 }

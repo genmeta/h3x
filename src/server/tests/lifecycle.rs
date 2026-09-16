@@ -19,8 +19,13 @@ async fn dropping_last_producer_does_not_finish_or_cancel_sending() {
     drop(producer);
     assert!(sending.as_mut().poll(&mut cx).is_pending());
     // Only an explicit buffer error terminates the send operation.
-    buffer.on_error(ErrorCode::H3_REQUEST_CANCELLED);
-    assert_eq!(sending.await, Err(ErrorCode::H3_REQUEST_CANCELLED));
+    buffer.on_error(
+        ErrorCode::H3_REQUEST_CANCELLED.with_reason("test cancels the response producer"),
+    );
+    assert_eq!(
+        (sending.await).map_err(ErrorCode::from),
+        Err(ErrorCode::H3_REQUEST_CANCELLED)
+    );
 }
 
 #[tokio::test]
@@ -127,12 +132,12 @@ async fn buffered_body_snapshots_and_shared_streams() {
     );
     request.stop().await;
     assert_eq!(
-        incoming.write(b"x").await.unwrap_err(),
+        ErrorCode::from(incoming.write(b"x").await.unwrap_err()),
         ErrorCode::H3_REQUEST_CANCELLED
     );
     response.reset().await.unwrap();
     assert_eq!(
-        outgoing.read(&mut [0]).await.unwrap_err(),
+        ErrorCode::from(outgoing.read(&mut [0]).await.unwrap_err()),
         ErrorCode::H3_REQUEST_CANCELLED
     );
 }
@@ -181,17 +186,29 @@ async fn streaming_response_termination_reaches_the_producer() {
                         qpack.qpack().cancel(id).unwrap();
                     }
                 } else {
-                    qpack.fail(error).await;
+                    qpack
+                        .fail(
+                            error.with_reason(
+                                "test terminates the connection during response upload",
+                            ),
+                        )
+                        .await;
                     // These test writers are independent of the transport; apply
                     // the connection's stream closure before resuming body I/O.
-                    bi.close(error);
+                    bi.close(error.with_reason("test closes the stream during response upload"));
                 }
                 // Resume body I/O so the send operation observes the terminal stream.
                 producer.write(b"x").await.unwrap();
-                assert_eq!(sending.await, Err(error));
+                assert_eq!((sending.await).map_err(ErrorCode::from), Err(error));
             }
-            assert_eq!(producer.write(b"x").await, Err(error));
-            assert_eq!(producer.finish().await, Err(error));
+            assert_eq!(
+                (producer.write(b"x").await).map_err(ErrorCode::from),
+                Err(error)
+            );
+            assert_eq!(
+                (producer.finish().await).map_err(ErrorCode::from),
+                Err(error)
+            );
         }
     })
     .await
@@ -250,9 +267,10 @@ fn explicit_stop_cancels_body_after_request_pump_is_dropped() {
     let mut bytes = [0];
     let mut reading = Box::pin(crate::ReadStream::read(&mut remaining, &mut bytes));
     assert_eq!(
-        reading
+        (reading
             .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop())),
+            .poll(&mut Context::from_waker(Waker::noop())))
+        .map(|result| result.map_err(ErrorCode::from)),
         Poll::Ready(Err(ErrorCode::H3_REQUEST_CANCELLED))
     );
 }
@@ -334,7 +352,9 @@ async fn dropping_received_body_does_not_stop_network_reads() {
         buffer.read_exact(&mut bytes).await.unwrap();
         assert_eq!(bytes, *b"x");
         // Subsequent body I/O observes cancellation; dropping Body did not cancel it.
-        buffer.on_error(ErrorCode::H3_REQUEST_CANCELLED);
+        buffer.on_error(
+            ErrorCode::H3_REQUEST_CANCELLED.with_reason("test cancels the response producer"),
+        );
     })
     .await
     .unwrap();

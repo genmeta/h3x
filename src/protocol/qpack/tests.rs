@@ -26,24 +26,35 @@ async fn close_preserves_first_error_across_both_directions() {
     let connection = crate::test_support::connection();
     let qpack = connection.qpack();
     assert_eq!(
-        qpack.close(ErrorCode::H3_INTERNAL_ERROR),
+        ErrorCode::from(
+            qpack.close(
+                ErrorCode::H3_INTERNAL_ERROR.with_reason("test terminates compression state")
+            )
+        ),
         ErrorCode::H3_INTERNAL_ERROR
     );
     assert_eq!(
-        qpack.close(ErrorCode::H3_EXCESSIVE_LOAD),
+        ErrorCode::from(
+            qpack.close(
+                ErrorCode::H3_EXCESSIVE_LOAD.with_reason("test terminates compression state")
+            )
+        ),
         ErrorCode::H3_INTERNAL_ERROR
     );
     assert_eq!(
-        qpack.encode(0, Vec::new()),
+        (qpack.encode(0, Vec::new())).map_err(ErrorCode::from),
         Err(ErrorCode::H3_INTERNAL_ERROR)
     );
     assert_eq!(
-        qpack.decode(0, Bytes::from_static(&[0, 0])).await,
+        (qpack.decode(0, Bytes::from_static(&[0, 0])).await).map_err(ErrorCode::from),
         Err(ErrorCode::H3_INTERNAL_ERROR)
     );
-    assert_eq!(qpack.cancel(0), Err(ErrorCode::H3_INTERNAL_ERROR));
     assert_eq!(
-        qpack.configure(Settings::default(), VARINT_MAX),
+        (qpack.cancel(0)).map_err(ErrorCode::from),
+        Err(ErrorCode::H3_INTERNAL_ERROR)
+    );
+    assert_eq!(
+        (qpack.configure(Settings::default(), VARINT_MAX)).map_err(ErrorCode::from),
         Err(ErrorCode::H3_INTERNAL_ERROR)
     );
 }
@@ -58,7 +69,7 @@ async fn request_errors_leave_qpack_usable() {
         ErrorCode::H3_REQUEST_INCOMPLETE,
         ErrorCode::H3_MESSAGE_ERROR,
     ] {
-        connection.receive_error(error).await;
+        connection.receive_error(error.with_reason("test receives a stream-local message failure")).await;
         assert_eq!(qpack.error(), None);
         let payload = qpack
             .encode(
@@ -86,14 +97,30 @@ async fn malformed_field_section_closes_both_directions() {
         connection.clone(),
     )
     .await;
-    assert!(matches!(result, Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)));
-    assert_eq!(qpack.error(), Some(ErrorCode::QPACK_DECOMPRESSION_FAILED));
+    assert!(matches!(
+        result,
+        Err(h3x::Error {
+            code: ErrorCode::QPACK_DECOMPRESSION_FAILED,
+            ..
+        })
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while qpack.error().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(
-        qpack.encode(4, Vec::new()),
+        (qpack.error()).map(ErrorCode::from),
+        Some(ErrorCode::QPACK_DECOMPRESSION_FAILED)
+    );
+    assert_eq!(
+        (qpack.encode(4, Vec::new())).map_err(ErrorCode::from),
         Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
     );
     assert_eq!(
-        qpack.decode(4, Bytes::from_static(&[0, 0])).await,
+        (qpack.decode(4, Bytes::from_static(&[0, 0])).await).map_err(ErrorCode::from),
         Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
     );
 }

@@ -7,7 +7,7 @@ use http::{Method, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::{
-    ArcWndBuf, ErrorCode, Result, Transport,
+    ArcWndBuf, Error, ErrorCode, Result, Transport,
     common::{
         self, Read, Write,
         body::{self, BodyMode},
@@ -38,7 +38,10 @@ pub async fn read_request<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
                 H3Frame::Unknown { length, .. } => {
                     frame::skip_payload(&mut rs, length.into_u64()).await?;
                 }
-                _ => return Err(ErrorCode::H3_FRAME_UNEXPECTED),
+                _ => {
+                    return Err(ErrorCode::H3_FRAME_UNEXPECTED
+                        .with_reason("expected request HEADERS before message body"));
+                }
             }
         };
         let fields = connection
@@ -53,8 +56,8 @@ pub async fn read_request<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
     let (head, length) = match read_head {
         Ok(value) => value,
         Err(error) => {
+            connection.receive_error(error.clone()).await;
             let _ = connection.qpack().cancel(stream_id);
-            connection.receive_error(error).await;
             return Err(error);
         }
     };
@@ -83,22 +86,25 @@ pub async fn write_bytes_response<WS: AsyncWrite + Unpin, T: Transport>(
         let status = head.status()?;
         let length = headers::content_length(&head.headers)?;
         if status.is_informational() {
-            return Err(ErrorCode::H3_MESSAGE_ERROR);
+            return Err(ErrorCode::H3_MESSAGE_ERROR
+                .with_reason("a final response cannot use an informational status"));
         }
         if status == StatusCode::NO_CONTENT && length.is_some() {
-            return Err(ErrorCode::H3_MESSAGE_ERROR);
+            return Err(ErrorCode::H3_MESSAGE_ERROR
+                .with_reason("204 response must not include Content-Length"));
         }
         let mode = BodyMode::resolve(&head, Some(method))?;
         (fields, mode, body)
     };
     if mode.is_forbidden() && !body.is_empty() {
-        return Err(ErrorCode::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason("response semantics forbid a body"));
     }
     if mode
         .content_length()
         .is_some_and(|length| length != body.len() as u64)
     {
-        return Err(ErrorCode::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR
+            .with_reason("response body length does not match Content-Length"));
     }
     let headers = Frame::new(Headers {
         field_section: connection.qpack().encode(ws.stream_id(), fields)?,
@@ -114,11 +120,11 @@ pub async fn write_bytes_response<WS: AsyncWrite + Unpin, T: Transport>(
             ws.write_all(&body).await?;
         }
         ws.shutdown().await?;
-        Ok::<_, ErrorCode>(())
+        Ok::<_, Error>(())
     }
     .await;
-    if let Err(error) = result {
-        ws.cancel_with_error(error);
+    if let Err(error) = &result {
+        ws.cancel_with_error(error.clone());
     }
     result
 }
@@ -144,10 +150,12 @@ pub fn write_streaming_response<WS: AsyncWrite + Unpin, T: Transport>(
             let status = head.status()?;
             let length = headers::content_length(&head.headers)?;
             if status.is_informational() {
-                return Err(ErrorCode::H3_MESSAGE_ERROR);
+                return Err(ErrorCode::H3_MESSAGE_ERROR
+                    .with_reason("a final response cannot use an informational status"));
             }
             if status == StatusCode::NO_CONTENT && length.is_some() {
-                return Err(ErrorCode::H3_MESSAGE_ERROR);
+                return Err(ErrorCode::H3_MESSAGE_ERROR
+                    .with_reason("204 response must not include Content-Length"));
             }
             let mode = BodyMode::resolve(&head, Some(&request_method))?;
             let headers = Frame::new(Headers {
@@ -158,12 +166,12 @@ pub fn write_streaming_response<WS: AsyncWrite + Unpin, T: Transport>(
             ws.write_all(&buf).await?;
             body::write_streaming_body(&mut body, &mut ws, mode).await?;
             ws.shutdown().await?;
-            Ok::<_, ErrorCode>(())
+            Ok::<_, Error>(())
         }
         .await;
-        if let Err(error) = result {
-            ws.cancel_with_error(error);
-            body.on_error(error);
+        if let Err(error) = &result {
+            ws.cancel_with_error(error.clone());
+            body.on_error(error.clone());
         }
         result
     }

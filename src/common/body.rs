@@ -67,7 +67,8 @@ impl Body<ArcWndBuf, Write> {
     }
 
     pub async fn reset(self) -> Result<()> {
-        self.storage.on_error(ErrorCode::H3_REQUEST_CANCELLED);
+        self.storage
+            .on_error(ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"));
         Ok(())
     }
 }
@@ -94,7 +95,8 @@ impl Body<ArcWndBuf, Read> {
         Ok(self.storage.read(bytes).await?)
     }
     pub async fn stop(self) {
-        self.storage.on_error(ErrorCode::H3_REQUEST_CANCELLED);
+        self.storage
+            .on_error(ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"));
     }
     pub async fn collect(mut self) -> Result<Bytes> {
         let mut bytes = Vec::new();
@@ -117,9 +119,9 @@ where
     let body = Body::new(buffer.clone());
     tokio::spawn(async move {
         let result = read_body(&mut rs, &mut buffer, mode, &qpack).await;
-        if let Err(error) = result {
+        if let Err(error) = &result {
             let _ = qpack.cancel(stream_id);
-            buffer.on_error(error);
+            buffer.on_error(error.clone());
         }
         // read_body validates FIN/trailers and marks buffer EOF on success.
     });
@@ -178,17 +180,23 @@ pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             H3Frame::Data(frame) if !trailers && !mode.is_forbidden() => {
                 let count = frame.length.into_u64();
                 if let Some(left) = &mut remaining {
-                    *left = left.checked_sub(count).ok_or(ErrorCode::H3_MESSAGE_ERROR)?;
+                    *left = left.checked_sub(count).ok_or_else(|| {
+                        ErrorCode::H3_MESSAGE_ERROR
+                            .with_reason("DATA exceeds the remaining Content-Length")
+                    })?;
                 }
                 let mut payload = (&mut *read_stream).take(count);
                 tokio::io::copy_buf(&mut payload, body).await?;
                 if payload.limit() != 0 {
-                    return Err(ErrorCode::H3_FRAME_ERROR);
+                    return Err(ErrorCode::H3_FRAME_ERROR
+                        .with_reason("DATA payload ended before the declared frame length"));
                 }
             }
             H3Frame::Headers(frame) if !trailers && !mode.is_forbidden() => {
                 if remaining.is_some_and(|left| left != 0) {
-                    return Err(ErrorCode::H3_MESSAGE_ERROR);
+                    return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason(
+                        "trailers arrived before Content-Length bytes were received",
+                    ));
                 }
                 let fields = qpack
                     .decode(
@@ -203,12 +211,14 @@ pub(crate) async fn read_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 frame::skip_payload(read_stream, length.into_u64()).await?;
             }
             _ => {
-                return Err(ErrorCode::H3_FRAME_UNEXPECTED);
+                return Err(ErrorCode::H3_FRAME_UNEXPECTED
+                    .with_reason("frame is not allowed in the current body or trailer state"));
             }
         }
     }
     if remaining.is_some_and(|left| left != 0) {
-        return Err(ErrorCode::H3_MESSAGE_ERROR);
+        return Err(ErrorCode::H3_MESSAGE_ERROR
+            .with_reason("body ended before Content-Length bytes were received"));
     }
     body.shutdown().await?;
     Ok(())
@@ -241,15 +251,20 @@ pub(crate) async fn write_streaming_body<R: AsyncRead + Unpin, W: AsyncWrite + U
     let mut sent = 0u64;
     loop {
         let count = source.read(&mut buf).await?;
-        sent = sent
-            .checked_add(count as u64)
-            .ok_or(ErrorCode::H3_MESSAGE_ERROR)?;
+        sent = sent.checked_add(count as u64).ok_or_else(|| {
+            ErrorCode::H3_MESSAGE_ERROR.with_reason("sent body length overflowed u64")
+        })?;
         match mode {
-            BodyMode::Forbidden if count != 0 => return Err(ErrorCode::H3_MESSAGE_ERROR),
+            BodyMode::Forbidden if count != 0 => {
+                return Err(
+                    ErrorCode::H3_MESSAGE_ERROR.with_reason("response semantics forbid a body")
+                );
+            }
             BodyMode::Length { content_length }
                 if sent > content_length || (count == 0 && sent != content_length) =>
             {
-                return Err(ErrorCode::H3_MESSAGE_ERROR);
+                return Err(ErrorCode::H3_MESSAGE_ERROR
+                    .with_reason("streamed body length does not match Content-Length"));
             }
             _ => {}
         }
@@ -374,7 +389,7 @@ mod tests {
             let mut input = encoded.as_slice();
             let mut body = Vec::new();
             assert_eq!(
-                read_body(
+                (read_body(
                     &mut BufReader::new(H3ReadStream::new(0, &mut input)),
                     &mut body,
                     match length {
@@ -383,7 +398,8 @@ mod tests {
                     },
                     crate::test_support::connection().qpack()
                 )
-                .await,
+                .await)
+                    .map_err(ErrorCode::from),
                 expected
             );
             assert!(body.is_empty());
@@ -391,13 +407,14 @@ mod tests {
         let mut input = &[7, 1, 0][..]; // GOAWAY is forbidden in a message body.
         let mut body = Vec::new();
         assert_eq!(
-            read_body(
+            (read_body(
                 &mut BufReader::new(H3ReadStream::new(0, &mut input)),
                 &mut body,
                 BodyMode::Infinity,
                 crate::test_support::connection().qpack()
             )
-            .await,
+            .await)
+                .map_err(ErrorCode::from),
             Err(ErrorCode::H3_FRAME_UNEXPECTED)
         );
     }

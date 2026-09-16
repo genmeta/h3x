@@ -6,10 +6,20 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::{ErrorCode, Result};
 
 pub(super) async fn be_byte<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<u8> {
-    reader
-        .read_u8()
-        .await
-        .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM)
+    reader.read_u8().await.map_err(|error| {
+        let error = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
+            .map_or(&error, std::sync::Arc::as_ref);
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<crate::Error>())
+            .cloned()
+            .unwrap_or_else(|| {
+                let code = ErrorCode::H3_CLOSED_CRITICAL_STREAM;
+                code.with_reason(error.to_string())
+            })
+    })
 }
 
 pub(super) async fn be_prefixed_integer_with_first<T: AsyncRead + Unpin + ?Sized>(
@@ -25,7 +35,7 @@ pub(super) async fn be_prefixed_integer_with_first<T: AsyncRead + Unpin + ?Sized
     if first & mask == mask {
         loop {
             if len == wire.len() {
-                return Err(error);
+                return Err(error.with_reason("prefixed integer has too many continuation bytes"));
             }
             let byte = be_byte(reader).await?;
             wire[len] = byte;
@@ -37,14 +47,15 @@ pub(super) async fn be_prefixed_integer_with_first<T: AsyncRead + Unpin + ?Sized
     }
     be_prefixed_integer(&wire[..len], bits)
         .map(|(_, value)| value)
-        .map_err(|_| error)
+        .map_err(|cause| error.with_reason(format!("invalid instruction integer: {cause}")))
 }
 
 /// RFC 9204 section 4.1.1: decode a prefixed integer, limited to 62 bits.
 pub(super) fn be_prefixed_integer(mut input: &[u8], prefix_bits: u8) -> Result<(&[u8], u64)> {
-    let (&first, rest) = input
-        .split_first()
-        .ok_or(ErrorCode::QPACK_DECOMPRESSION_FAILED)?;
+    let (&first, rest) = input.split_first().ok_or_else(|| {
+        ErrorCode::QPACK_DECOMPRESSION_FAILED
+            .with_reason("prefixed integer is missing its first byte")
+    })?;
     input = rest;
     let limit = (1u64 << prefix_bits) - 1;
     let mut value = u64::from(first) & limit;
@@ -52,19 +63,23 @@ pub(super) fn be_prefixed_integer(mut input: &[u8], prefix_bits: u8) -> Result<(
         return Ok((input, value));
     }
     for shift in (0..63).step_by(7) {
-        let (&byte, rest) = input
-            .split_first()
-            .ok_or(ErrorCode::QPACK_DECOMPRESSION_FAILED)?;
+        let (&byte, rest) = input.split_first().ok_or_else(|| {
+            ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("prefixed integer is truncated")
+        })?;
         input = rest;
         value = value
             .checked_add(u64::from(byte & 0x7f) << shift)
             .filter(|&value| value <= VARINT_MAX)
-            .ok_or(ErrorCode::QPACK_DECOMPRESSION_FAILED)?;
+            .ok_or_else(|| {
+                ErrorCode::QPACK_DECOMPRESSION_FAILED
+                    .with_reason("prefixed integer exceeds the QUIC variable-integer range")
+            })?;
         if byte & 0x80 == 0 {
             return Ok((input, value));
         }
     }
-    Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
+    Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
+        .with_reason("prefixed integer has too many continuation bytes"))
 }
 
 /// Append a QPACK prefixed integer (not a QUIC varint).
@@ -80,7 +95,8 @@ impl<B: BufMut> WritePrefixedInteger for B {
         high_bits: u8,
     ) -> Result<()> {
         if value > VARINT_MAX {
-            return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED);
+            return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
+                .with_reason("invalid prefixed-integer width, value, or high bits"));
         }
         let limit = (1u64 << prefix_bits) - 1;
         if value < limit {
@@ -136,7 +152,7 @@ mod tests {
         }
         let mut wire = vec![42];
         assert_eq!(
-            wire.put_prefixed_integer(VARINT_MAX + 1, 5, 0),
+            (wire.put_prefixed_integer(VARINT_MAX + 1, 5, 0)).map_err(ErrorCode::from),
             Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
         );
         assert_eq!(wire, [42]);
@@ -165,17 +181,18 @@ mod tests {
         }
         for wire in [&[0x1f][..], &[0x1f, 0x80][..]] {
             assert_eq!(
-                be_prefixed_integer(wire, 5),
+                (be_prefixed_integer(wire, 5)).map_err(ErrorCode::from),
                 Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
             );
             assert_eq!(
-                be_prefixed_integer_with_first(
+                (be_prefixed_integer_with_first(
                     &mut &wire[1..],
                     wire[0],
                     5,
                     ErrorCode::QPACK_DECODER_STREAM_ERROR
                 )
-                .await,
+                .await)
+                    .map_err(ErrorCode::from),
                 Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
             );
         }
@@ -184,7 +201,8 @@ mod tests {
             ErrorCode::QPACK_DECODER_STREAM_ERROR,
         ] {
             assert_eq!(
-                be_prefixed_integer_with_first(&mut &[0xff; 9][..], 0xff, 7, error).await,
+                (be_prefixed_integer_with_first(&mut &[0xff; 9][..], 0xff, 7, error).await)
+                    .map_err(ErrorCode::from),
                 Err(error)
             );
         }

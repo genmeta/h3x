@@ -5,19 +5,20 @@ pub(crate) mod write;
 use std::{
     io, mem,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll, Waker},
 };
 
 pub(crate) use read::H3ReadStream;
 pub(crate) use write::H3WriteStream;
 
-use crate::ErrorCode;
+use crate::Error;
 
 /// State of one transport half, independent of its application handle.
 enum StreamStatus<T> {
     Idle(T),
     Polling(T, Waker),
-    Closed(ErrorCode),
+    Closed(Arc<io::Error>),
     Finished,
     Transition,
 }
@@ -53,14 +54,17 @@ impl<T> StreamState<T> {
     }
 
     // Return wakers so the caller can wake after releasing the state lock.
-    fn close(&mut self, error: ErrorCode, terminate: impl FnOnce(&mut T)) -> [Option<Waker>; 2] {
+    fn close(&mut self, error: Error, terminate: impl FnOnce(&mut T)) -> [Option<Waker>; 2] {
         let io_waker = if self.is_finished() {
             None
         } else {
             if let StreamStatus::Idle(io) | StreamStatus::Polling(io, _) = &mut self.status {
                 terminate(io);
             }
-            match mem::replace(&mut self.status, StreamStatus::Closed(error)) {
+            match mem::replace(
+                &mut self.status,
+                StreamStatus::Closed(Arc::new(error.into())),
+            ) {
                 StreamStatus::Polling(_, waker) => Some(waker),
                 _ => None,
             }
@@ -77,30 +81,30 @@ impl<T: Unpin> StreamState<T> {
     ) -> Poll<io::Result<O>> {
         match mem::replace(&mut self.status, StreamStatus::Transition) {
             StreamStatus::Idle(mut io) | StreamStatus::Polling(mut io, _) => {
-                let result = poll(Pin::new(&mut io), cx);
-                self.status = match &result {
-                    Poll::Pending => StreamStatus::Polling(io, cx.waker().clone()),
+                match poll(Pin::new(&mut io), cx) {
+                    Poll::Pending => {
+                        self.status = StreamStatus::Polling(io, cx.waker().clone());
+                        Poll::Pending
+                    }
                     Poll::Ready(Err(error))
                         if !matches!(
                             error.kind(),
                             io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
                         ) =>
                     {
-                        StreamStatus::Closed(
-                            error
-                                .get_ref()
-                                .and_then(|source| source.downcast_ref::<ErrorCode>())
-                                .copied()
-                                .unwrap_or_else(|| ErrorCode::from(io::Error::from(error.kind()))),
-                        )
+                        let error = Arc::new(error);
+                        self.status = StreamStatus::Closed(error.clone());
+                        Poll::Ready(Err(io::Error::new(error.kind(), error)))
                     }
-                    _ => StreamStatus::Idle(io),
-                };
-                result
+                    result => {
+                        self.status = StreamStatus::Idle(io);
+                        result
+                    }
+                }
             }
             StreamStatus::Closed(error) => {
-                self.status = StreamStatus::Closed(error);
-                Poll::Ready(Err(error.into()))
+                self.status = StreamStatus::Closed(error.clone());
+                Poll::Ready(Err(io::Error::new(error.kind(), error)))
             }
             StreamStatus::Finished => {
                 self.status = StreamStatus::Finished;

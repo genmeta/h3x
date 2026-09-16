@@ -87,19 +87,26 @@ async fn respond_rejects_length_mismatch_and_forbidden_body() {
             };
             let mut encoded = Vec::new();
             assert_eq!(
-                super::respond(
+                (super::respond(
                     response,
                     H3WriteStream::new(4, &mut encoded),
                     crate::test_support::connection(),
                     &method,
                 )
-                .await,
+                .await)
+                    .map_err(ErrorCode::from),
                 Err(ErrorCode::H3_MESSAGE_ERROR),
                 "method={method}, buffered={buffered}"
             );
             if let Some(mut producer) = producer {
-                assert_eq!(producer.write(b"x").await, Err(ErrorCode::H3_MESSAGE_ERROR));
-                assert_eq!(producer.finish().await, Err(ErrorCode::H3_MESSAGE_ERROR));
+                assert_eq!(
+                    (producer.write(b"x").await).map_err(ErrorCode::from),
+                    Err(ErrorCode::H3_MESSAGE_ERROR)
+                );
+                assert_eq!(
+                    (producer.finish().await).map_err(ErrorCode::from),
+                    Err(ErrorCode::H3_MESSAGE_ERROR)
+                );
             }
 
             // Streaming validation may follow HEADERS, but must precede DATA.
@@ -185,9 +192,11 @@ async fn writes_buffered_and_streaming_response_frames() {
     fixed_response.set_header(header::CONTENT_LENGTH, HeaderValue::from_static("1"));
     let mut output = Vec::new();
     assert_eq!(
-        write_bytes_response(fixed_response, &mut output)
-            .await
-            .unwrap_err(),
+        ErrorCode::from(
+            write_bytes_response(fixed_response, &mut output)
+                .await
+                .unwrap_err()
+        ),
         ErrorCode::H3_MESSAGE_ERROR
     );
     assert!(output.is_empty());
@@ -203,6 +212,12 @@ async fn writes_buffered_and_streaming_response_frames() {
         producer.write(b"a").await?;
         producer.write(b"b").await
     });
-    assert_eq!(sent.unwrap_err(), ErrorCode::H3_INTERNAL_ERROR);
-    assert_eq!(produced.unwrap_err(), ErrorCode::H3_INTERNAL_ERROR);
+    assert_eq!(
+        ErrorCode::from(sent.unwrap_err()),
+        ErrorCode::H3_INTERNAL_ERROR
+    );
+    assert_eq!(
+        ErrorCode::from(produced.unwrap_err()),
+        ErrorCode::H3_INTERNAL_ERROR
+    );
 }

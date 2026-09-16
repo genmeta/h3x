@@ -7,6 +7,8 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::Error;
+
 /// A bounded FIFO with one pending reader and one pending writer.
 #[derive(Debug)]
 pub(crate) struct WndBuf {
@@ -123,7 +125,7 @@ impl ArcWndBuf {
         }
     }
 
-    pub(crate) fn on_error(&self, error: crate::ErrorCode) {
+    pub(crate) fn on_error(&self, error: Error) {
         let mut state = self.shared.lock().unwrap();
         if let Ok(window) = &mut *state {
             if let Some(waker) = window.read_waker.take() {
@@ -142,7 +144,7 @@ impl ArcWndBuf {
     ) -> Poll<io::Result<T>> {
         match &mut *self.shared.lock().unwrap() {
             Ok(window) => poll(Pin::new(window)),
-            Err(error) => Poll::Ready(Err((*error).into())),
+            Err(error) => Poll::Ready(Err(error.clone().into())),
         }
     }
 }
@@ -356,8 +358,14 @@ mod tests {
                         .is_pending()
                 );
             }
-            reader.on_error(crate::ErrorCode::H3_REQUEST_CANCELLED);
-            writer.on_error(crate::ErrorCode::H3_INTERNAL_ERROR);
+            reader.on_error(
+                crate::ErrorCode::H3_REQUEST_CANCELLED
+                    .with_reason("test closes the shared body window"),
+            );
+            writer.on_error(
+                crate::ErrorCode::H3_INTERNAL_ERROR
+                    .with_reason("test closes the shared body window"),
+            );
             assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
             let results = [
                 Pin::new(&mut reader)

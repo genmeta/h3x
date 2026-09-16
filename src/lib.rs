@@ -10,7 +10,7 @@ pub use common::message::{
     ReadBody, ReadRequest, ReadResponse, ReadStream, WriteBody, WriteRequest, WriteResponse,
     WriteStream,
 };
-pub use error::{ErrorCode, Result};
+pub use error::{Error, ErrorCode, Result};
 pub use protocol::{
     connection::{H3Connection, Settings},
     frame::Goaway,

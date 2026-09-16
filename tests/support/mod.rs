@@ -15,7 +15,7 @@ use tokio::{
 
 #[derive(Default)]
 pub struct TestTransport {
-    error: Mutex<Option<ErrorCode>>,
+    error: Mutex<Option<h3x::Error>>,
     ended: Notify,
 }
 
@@ -66,7 +66,7 @@ impl Transport for TestTransport {
         Err(self.terminated().await)
     }
     async fn open_uni(&self) -> Result<Option<(u64, Writer)>> {
-        if let Some(error) = *self.error.lock().unwrap() {
+        if let Some(error) = self.error.lock().unwrap().clone() {
             return Err(error);
         }
         Ok(Some((2, Writer)))
@@ -74,7 +74,7 @@ impl Transport for TestTransport {
     async fn accept_uni(&self) -> Result<(u64, Reader)> {
         Err(self.terminated().await)
     }
-    fn close(&self, _: String, code: u64) -> Result<()> {
+    fn close(&self, reason: String, code: u64) -> Result<()> {
         let error = [
             ErrorCode::H3_NO_ERROR,
             ErrorCode::H3_INTERNAL_ERROR,
@@ -88,16 +88,19 @@ impl Transport for TestTransport {
         .into_iter()
         .find(|error| error.as_u64() == code)
         .unwrap_or(ErrorCode::H3_INTERNAL_ERROR);
-        self.error.lock().unwrap().get_or_insert(error);
+        self.error
+            .lock()
+            .unwrap()
+            .get_or_insert(error.with_reason(reason));
         self.ended.notify_waiters();
         Ok(())
     }
-    async fn terminated(&self) -> ErrorCode {
+    async fn terminated(&self) -> h3x::Error {
         loop {
             let ended = self.ended.notified();
             tokio::pin!(ended);
             ended.as_mut().enable();
-            if let Some(error) = *self.error.lock().unwrap() {
+            if let Some(error) = self.error.lock().unwrap().clone() {
                 return error;
             }
             ended.await;

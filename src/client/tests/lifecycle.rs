@@ -15,7 +15,7 @@ fn response_fields(message: &Message<headers::ResponseHead, Bytes>) -> Vec<Field
     fields
 }
 
-fn response_headers() -> Vec<u8> {
+async fn response_headers() -> Vec<u8> {
     let mut response = Message::<headers::ResponseHead, Bytes>::default();
     response.set_status(StatusCode::OK);
     response.set_header(http::header::CONTENT_LENGTH, "0".parse().unwrap());
@@ -56,11 +56,11 @@ async fn reset_wakes_a_blocked_producer_after_upload_is_dropped() {
     drop(sending);
     cancelling.reset().await.unwrap();
     assert_eq!(
-        timeout(Duration::from_secs(5), writing).await.unwrap(),
+        (timeout(Duration::from_secs(5), writing).await.unwrap()).map_err(ErrorCode::from),
         Err(ErrorCode::H3_REQUEST_CANCELLED)
     );
     assert_eq!(
-        producer.finish().await,
+        (producer.finish().await).map_err(ErrorCode::from),
         Err(ErrorCode::H3_REQUEST_CANCELLED)
     );
 }
@@ -89,11 +89,11 @@ async fn reset_wakes_a_blocked_producer_after_request_is_dropped() {
     drop(waiting);
     cancelling.reset().await.unwrap();
     assert_eq!(
-        timeout(Duration::from_secs(5), writing).await.unwrap(),
+        (timeout(Duration::from_secs(5), writing).await.unwrap()).map_err(ErrorCode::from),
         Err(ErrorCode::H3_REQUEST_CANCELLED)
     );
     assert_eq!(
-        producer.finish().await,
+        (producer.finish().await).map_err(ErrorCode::from),
         Err(ErrorCode::H3_REQUEST_CANCELLED)
     );
 }
@@ -135,11 +135,11 @@ async fn dropping_response_wait_preserves_uploads() {
             if streaming && !finished {
                 producer.clone().reset().await.unwrap();
                 assert_eq!(
-                    producer.write(b"x").await,
+                    (producer.write(b"x").await).map_err(ErrorCode::from),
                     Err(ErrorCode::H3_REQUEST_CANCELLED)
                 );
                 assert_eq!(
-                    producer.finish().await,
+                    (producer.finish().await).map_err(ErrorCode::from),
                     Err(ErrorCode::H3_REQUEST_CANCELLED)
                 );
             }
@@ -175,7 +175,7 @@ async fn early_response_keeps_both_body_modes_sending() {
             let (send, mut recv) = tokio::io::duplex(1);
             let response = request(
                 outgoing,
-                H3ReadStream::new(0, Cursor::new(response_headers())),
+                H3ReadStream::new(0, Cursor::new(response_headers().await)),
                 H3WriteStream::new(0, send),
                 crate::test_support::connection().qpack().clone(),
             )
@@ -316,11 +316,11 @@ async fn producer_fin_does_not_complete_transport_shutdown() {
 }
 
 #[tokio::test]
-async fn write_failure_after_idle_body_preserves_the_response() {
+async fn write_failure_after_idle_body_ends_response_wait() {
     timeout(Duration::from_secs(5), async {
         let mut producer = Request::streaming_post("https://example.com/upload").unwrap();
         let (send, mut peer_recv) = tokio::io::duplex(64);
-        let (mut peer_send, recv) = tokio::io::duplex(64);
+        let (peer_send, recv) = tokio::io::duplex(64);
         let mut waiting = Box::pin(request(
             producer.clone(),
             H3ReadStream::new(0, recv),
@@ -347,22 +347,16 @@ async fn write_failure_after_idle_body_preserves_the_response() {
         );
         assert_eq!(producer.write(b"x").await, Ok(1));
         while producer.write(b"x").await.is_ok() {}
-        assert!(
-            waiting
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-        assert_eq!(
-            producer.write(b"x").await,
-            Err(ErrorCode::H3_INTERNAL_ERROR)
-        );
-        peer_send.write_all(&response_headers()).await.unwrap();
-        peer_send.shutdown().await.unwrap();
-        assert_eq!(waiting.await.unwrap().status(), StatusCode::OK);
+        let error = waiting
+            .await
+            .err()
+            .expect("upload failure reaches the response waiter");
+        assert_eq!(error.code, ErrorCode::H3_INTERNAL_ERROR);
+        assert_eq!(producer.write(b"x").await.unwrap_err(), error);
+        drop(peer_send);
     })
     .await
-    .expect("a failed upload must still receive the peer's valid response");
+    .expect("a failed upload must end the response wait");
 }
 
 #[tokio::test]
@@ -393,7 +387,10 @@ async fn explicit_reset_stops_upload_when_body_read_resumes() {
         let mut partial = Vec::new();
         recv.read_to_end(&mut partial).await.unwrap();
         assert!(!partial.is_empty());
-        assert_eq!(sending.await.unwrap(), Err(ErrorCode::H3_REQUEST_CANCELLED));
+        assert_eq!(
+            (sending.await.unwrap()).map_err(ErrorCode::from),
+            Err(ErrorCode::H3_REQUEST_CANCELLED)
+        );
     })
     .await
     .expect("reset must fail the upload when body reading resumes");
@@ -505,9 +502,10 @@ fn explicit_stop_cancels_body_after_response_pump_is_dropped() {
     let mut bytes = [0];
     let mut reading = Box::pin(crate::ReadStream::read(&mut remaining, &mut bytes));
     assert_eq!(
-        reading
+        (reading
             .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop())),
+            .poll(&mut Context::from_waker(Waker::noop())))
+        .map(|result| result.map_err(ErrorCode::from)),
         Poll::Ready(Err(ErrorCode::H3_REQUEST_CANCELLED))
     );
 }
@@ -541,11 +539,11 @@ async fn streaming_response_keeps_message_error_after_transport_eof() {
         panic!("expected streaming response");
     };
     assert_eq!(
-        response.read(&mut [0]).await,
+        (response.read(&mut [0]).await).map_err(ErrorCode::from),
         Err(ErrorCode::H3_MESSAGE_ERROR)
     );
     assert_eq!(
-        response.read(&mut [0]).await,
+        (response.read(&mut [0]).await).map_err(ErrorCode::from),
         Err(ErrorCode::H3_MESSAGE_ERROR)
     );
 }
