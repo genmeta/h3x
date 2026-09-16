@@ -251,8 +251,8 @@ async fn unknown_frames_do_not_hide_invalid_request_frames() {
         }
     }
     for (suffix, expected) in [
-        (&[][..], ErrorCode::H3_FRAME_ERROR),
-        (&[0x21, 0][..], ErrorCode::H3_FRAME_ERROR),
+        (&[][..], ErrorCode::H3_REQUEST_INCOMPLETE),
+        (&[0x21, 0][..], ErrorCode::H3_REQUEST_INCOMPLETE),
         (&[0, 0][..], ErrorCode::H3_FRAME_UNEXPECTED),
     ] {
         let encoded = [&[0x21, 0][..], suffix].concat();
@@ -324,5 +324,20 @@ async fn malformed_request_stops_transport_with_message_error() {
             "{stage}"
         );
         assert!(connection.qpack().error().is_none());
+    }
+}
+
+#[tokio::test]
+async fn incomplete_request_does_not_fail_connection() {
+    for wire in [vec![], vec![0x21, 0]] {
+        let connection = crate::test_support::connection().await;
+        let recv = crate::test_support::read_stream(0, Cursor::new(wire));
+        let error = super::accept(recv, connection.qpack().clone())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::H3_REQUEST_INCOMPLETE);
+        assert!(connection.qpack().error().is_none());
+        assert!(connection.qpack().encode(4, Vec::new()).is_ok());
     }
 }

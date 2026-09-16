@@ -5,7 +5,7 @@ use std::future::Future;
 use bytes::Bytes;
 use http::{Method, StatusCode};
 use qrecovery::{recv::StopSending, send::CancelStream};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::{
     ArcQpack, ArcWndBuf, Error, ErrorCode, Result,
@@ -33,6 +33,10 @@ pub async fn read_request<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
     let mut rs = BufReader::new(rs);
     let read_head = async {
         let frame = loop {
+            if rs.fill_buf().await?.is_empty() {
+                return Err(ErrorCode::H3_REQUEST_INCOMPLETE
+                    .with_reason("request stream ended before request HEADERS"));
+            }
             match be_frame(&mut rs).await? {
                 H3Frame::Headers(frame) => break frame,
                 H3Frame::Unknown { length, .. } => {
