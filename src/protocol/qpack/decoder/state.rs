@@ -24,7 +24,7 @@ pub(super) struct State {
     waiting: HashMap<u64, (u64, usize, Waker)>,
     blocked_bytes: usize,
     max_blocked_bytes: usize,
-    sender: mpsc::UnboundedSender<DecoderInstruction>,
+    sender: mpsc::Sender<DecoderInstruction>,
     pub(super) decoding_stream: HashSet<u64>,
 }
 
@@ -33,7 +33,7 @@ impl State {
         local: Settings,
         max_blocked_bytes: usize,
         max_fields: u64,
-        sender: mpsc::UnboundedSender<DecoderInstruction>,
+        sender: mpsc::Sender<DecoderInstruction>,
     ) -> Result<Self> {
         if local.blocked_streams > VARINT_MAX {
             return Err(Error::H3_SETTINGS_ERROR);
@@ -120,9 +120,7 @@ impl State {
         if increment != 0 {
             // Queue progress before any ACK that can reference these insertions.
             // All producers hold the decoder state lock, preserving this wire order.
-            self.sender
-                .send(DecoderInstruction::InsertCountIncrement(increment))
-                .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+            self.send_feedback(DecoderInstruction::InsertCountIncrement(increment))?;
         }
         let wakes = self
             .waiting
@@ -144,9 +142,7 @@ impl State {
             return Err(Error::H3_INTERNAL_ERROR);
         }
         if self.table.max_capacity() != 0 {
-            self.sender
-                .send(DecoderInstruction::StreamCancellation(id))
-                .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+            self.send_feedback(DecoderInstruction::StreamCancellation(id))?;
         }
         self.decoding_stream.remove(&id);
         let mut wakes = Vec::new();
@@ -166,11 +162,21 @@ impl State {
 
     fn acknowledge(&self, stream_id: u64, required_insert_count: u64) -> Result<()> {
         if required_insert_count != 0 {
-            self.sender
-                .send(DecoderInstruction::SectionAcknowledgment(stream_id))
-                .map_err(|_| Error::H3_CLOSED_CRITICAL_STREAM)?;
+            self.send_feedback(DecoderInstruction::SectionAcknowledgment(stream_id))?;
         }
         Ok(())
+    }
+
+    /// Feedback is required for QPACK correctness, so overload fails the
+    /// connection instead of dropping an instruction or blocking under the
+    /// decoder state lock.
+    fn send_feedback(&self, instruction: DecoderInstruction) -> Result<()> {
+        self.sender
+            .try_send(instruction)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => Error::H3_EXCESSIVE_LOAD,
+                mpsc::error::TrySendError::Closed(_) => Error::H3_CLOSED_CRITICAL_STREAM,
+            })
     }
 
     /// Shared by immediate and resumed decoding: reject evicted/out-of-range references,

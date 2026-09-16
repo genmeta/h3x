@@ -16,10 +16,14 @@ use crate::{Error, Result, protocol::frame::StreamType};
 mod state;
 use state::State;
 
+/// Bound queued feedback independently of blocked field sections. Producers use
+/// `try_send`, so they never wait while holding the decoder state lock.
+const MAX_PENDING_FEEDBACK: usize = 1024;
+
 /// Insertions / decoded fields / cancellations -> feedback FIFO
 /// -> Decoder::write() -> decoder stream -> peer encoder.
 /// Enqueueing wakes the writer; increments precede dependent ACKs.
-pub(in crate::protocol) type Instructions = mpsc::UnboundedReceiver<DecoderInstruction>;
+pub(in crate::protocol) type Instructions = mpsc::Receiver<DecoderInstruction>;
 
 pub(in crate::protocol) struct Decoder {
     state: Mutex<Result<State>>,
@@ -62,7 +66,7 @@ impl Decoder {
         max_blocked_bytes: usize,
         max_fields: u64,
     ) -> Result<(Self, Instructions)> {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(MAX_PENDING_FEEDBACK);
         let state = State::new(local, max_blocked_bytes, max_fields, sender)?;
         Ok((
             Self {

@@ -427,7 +427,7 @@ mod tests {
 
     struct Decoder {
         state: DecoderState,
-        receiver: mpsc::UnboundedReceiver<DecoderInstruction>,
+        receiver: mpsc::Receiver<DecoderInstruction>,
     }
 
     impl std::ops::Deref for Decoder {

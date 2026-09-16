@@ -52,6 +52,51 @@ async fn insertion_feedback_uses_the_queue_and_capacity_changes_emit_nothing() {
 }
 
 #[tokio::test]
+async fn feedback_backlog_is_bounded_without_dropping_required_instructions() {
+    let (decoder, mut source) = Decoder::new(
+        Settings {
+            max_table_capacity: 128,
+            blocked_streams: 1,
+        },
+        128,
+        1024,
+    )
+    .unwrap();
+    decoder
+        .on_encoder_instruction(EncoderInstruction::SetDynamicTableCapacity(128))
+        .unwrap();
+
+    for id in 0..super::super::MAX_PENDING_FEEDBACK {
+        decoder.cancel(id as u64).unwrap();
+    }
+    assert_eq!(source.len(), super::super::MAX_PENDING_FEEDBACK);
+    assert_eq!(
+        decoder
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .acknowledge(4096, 1),
+        Err(Error::H3_EXCESSIVE_LOAD)
+    );
+
+    assert_eq!(
+        source.recv().await,
+        Some(DecoderInstruction::StreamCancellation(0))
+    );
+    decoder
+        .state
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .acknowledge(4096, 1)
+        .unwrap();
+    assert_eq!(decoder.cancel(4097), Err(Error::H3_EXCESSIVE_LOAD));
+}
+
+#[tokio::test]
 async fn blocked_fields_live_in_future_and_resume_without_connection_results() {
     let qpack = Arc::new(
         Codec::new(
@@ -489,7 +534,7 @@ async fn qpack_fields_preserve_frame_envelopes_and_ack_order() {
     );
 }
 
-type Feedback = mpsc::UnboundedReceiver<DecoderInstruction>;
+type Feedback = mpsc::Receiver<DecoderInstruction>;
 
 struct Codec {
     qpack: Qpack,
