@@ -58,7 +58,17 @@ impl<H, B> Message<H, B> {
 
 impl<B> Message<RequestHead, B> {
     pub(crate) fn new_request_with_body(url: &str, method: Method, body: B) -> Result<Self> {
-        let uri: Uri = url.parse().map_err(|error| {
+        if url.contains('#') {
+            return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason("URI fragments are forbidden"));
+        }
+        let websocket =
+            method == Method::CONNECT && (url.starts_with("ws://") || url.starts_with("wss://"));
+        let normalized = if websocket {
+            url.replacen("ws", "http", 1)
+        } else {
+            url.to_owned()
+        };
+        let uri: Uri = normalized.parse().map_err(|error| {
             ErrorCode::H3_MESSAGE_ERROR.with_reason(format!("invalid request URI: {error}"))
         })?;
         // CONNECT also accepts an authority-form target such as example.com:443.
@@ -70,7 +80,16 @@ impl<B> Message<RequestHead, B> {
             return Err(ErrorCode::H3_MESSAGE_ERROR
                 .with_reason("request URI requires scheme and authority"));
         }
-        let uri = if method == Method::CONNECT {
+        if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
+            return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason("userinfo is forbidden"));
+        }
+        let mut extensions = http::Extensions::new();
+        let mut headers = HeaderMap::new();
+        if websocket {
+            extensions.insert(crate::ext::Protocol::new("websocket")?);
+            headers.insert("sec-websocket-version", HeaderValue::from_static("13"));
+        }
+        let uri = if method == Method::CONNECT && !websocket {
             Uri::builder()
                 .authority(uri.authority().unwrap().clone())
                 .build()
@@ -85,7 +104,8 @@ impl<B> Message<RequestHead, B> {
             head: RequestHead {
                 method,
                 uri,
-                headers: HeaderMap::new(),
+                headers,
+                extensions,
             },
             body,
         })
@@ -178,6 +198,9 @@ pub trait WriteStream: Sized {
 
 /// Server-side view of request metadata.
 pub trait ReadRequest: Sized {
+    fn protocol(&self) -> Option<crate::ext::Protocol> {
+        None
+    }
     fn method(&self) -> Method;
 
     fn authority(&self) -> String;
@@ -239,6 +262,9 @@ impl<B: Default> WriteRequest for Message<RequestHead, B> {
 }
 
 impl ReadRequest for RequestHead {
+    fn protocol(&self) -> Option<crate::ext::Protocol> {
+        self.extensions.get().cloned()
+    }
     fn method(&self) -> Method {
         self.method.clone()
     }
@@ -267,6 +293,9 @@ impl ReadRequest for RequestHead {
 }
 
 impl<B> ReadRequest for Message<RequestHead, B> {
+    fn protocol(&self) -> Option<crate::ext::Protocol> {
+        self.head.protocol()
+    }
     fn method(&self) -> Method {
         self.head.method()
     }

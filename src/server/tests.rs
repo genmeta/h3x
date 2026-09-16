@@ -9,7 +9,10 @@ use crate::{
     common::message::{
         ReadBody, ReadRequest, ReadResponse, WriteBody, WriteRequest, WriteResponse, WriteStream,
     },
-    protocol::qpack::{self, WriteFieldSection},
+    protocol::{
+        frame::be_frame,
+        qpack::{self, WriteFieldSection},
+    },
 };
 
 mod lifecycle;

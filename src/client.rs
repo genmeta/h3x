@@ -5,7 +5,7 @@ use std::future::{Future, IntoFuture};
 use bytes::Bytes;
 use http::StatusCode;
 use qrecovery::{recv::StopSending, send::CancelStream};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     ArcWndBuf, Error, ErrorCode, Result,
@@ -100,6 +100,9 @@ where
     let (fields, body) = {
         let head = req.message.head.lock().unwrap();
         let body = req.message.body.lock().unwrap().storage.clone();
+        if head.method == http::Method::CONNECT {
+            return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason("use client::connect for CONNECT"));
+        }
         let mut fields = Vec::new();
         fields.put_request(&head)?;
         if headers::content_length(&head.headers)?.is_some_and(|length| length != body.len() as u64)
@@ -144,6 +147,9 @@ where
     };
     // Validate before sending so malformed requests fail synchronously and wake producers.
     let (headers, mode) = (|| {
+        if head.method == http::Method::CONNECT {
+            return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason("use client::connect for CONNECT"));
+        }
         let mut fields = Vec::new();
         fields.put_request(&head)?;
         let mode = match headers::content_length(&head.headers)? {
@@ -174,20 +180,18 @@ where
     })
 }
 
-/// Reads ordinary responses; HEAD and CONNECT semantics require request-method input.
-async fn read_response<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
-    rs: H3ReadStream<RS>,
-    qpack: ArcQpack,
-    method: Option<http::Method>,
-) -> Result<crate::common::Response<Read>> {
+async fn read_final_head<RS: AsyncRead + StopSending + Unpin>(
+    rs: &mut H3ReadStream<RS>,
+    qpack: &ArcQpack,
+    connect: bool,
+) -> Result<headers::ResponseHead> {
     let stream_id = rs.stream_id();
-    let mut rs = BufReader::new(rs);
     let result = async {
-        let (head, length) = loop {
-            let frame = match be_frame(&mut rs).await? {
+        loop {
+            let frame = match be_frame(rs).await? {
                 H3Frame::Headers(frame) => frame,
                 H3Frame::Unknown { length, .. } => {
-                    frame::skip_payload(&mut rs, length.into_u64()).await?;
+                    frame::skip_payload(rs, length.into_u64()).await?;
                     continue;
                 }
                 _ => {
@@ -198,6 +202,9 @@ async fn read_response<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
             let fields = qpack.decode(stream_id, frame.payload.field_section).await?;
             let head = headers::be_response(fields)?;
             let status = head.status()?;
+            if connect && status.is_success() {
+                return Ok(head);
+            }
             let length = headers::content_length(&head.headers)?;
             if status == StatusCode::SWITCHING_PROTOCOLS {
                 return Err(
@@ -210,9 +217,107 @@ async fn read_response<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
                 ));
             }
             if !status.is_informational() {
-                break (head, length);
+                return Ok(head);
             }
+        }
+    }
+    .await;
+    if let Err(error) = &result {
+        rs.close(error.clone());
+        if matches!(
+            error.code,
+            ErrorCode::H3_FRAME_ERROR | ErrorCode::H3_FRAME_UNEXPECTED
+        ) {
+            qpack.on_error(error.clone());
+        }
+        let _ = qpack.cancel(stream_id);
+    }
+    result
+}
+
+/// HTTP rejection is a response, not a transport failure.
+pub enum ConnectOutcome<S> {
+    Connected {
+        response: http::Response<()>,
+        tunnel: S,
+    },
+    Rejected(Response),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectError {
+    #[error("peer does not support Extended CONNECT")]
+    NotSupported,
+    #[error(transparent)]
+    H3(#[from] crate::Error),
+}
+
+/// Perform a CONNECT handshake on an existing connection. No application bytes
+/// are sent before successful response HEADERS. Cancellation drops both halves.
+pub async fn connect<T: crate::Transport>(
+    request: Request<Bytes>,
+    connection: &crate::H3Connection<T>,
+) -> std::result::Result<
+    ConnectOutcome<crate::Tunnel<T::StreamReader, T::StreamWriter>>,
+    ConnectError,
+> {
+    let head = request.message.head.lock().unwrap().clone();
+    if head.method != http::Method::CONNECT
+        || !request.message.body.lock().unwrap().storage.is_empty()
+        || head.headers.contains_key(http::header::CONTENT_LENGTH)
+    {
+        return Err(ErrorCode::H3_MESSAGE_ERROR
+            .with_reason("CONNECT requires an empty handshake without body framing")
+            .into());
+    }
+    let mut fields = Vec::new();
+    fields.put_request(&head)?;
+    if head.extensions.get::<crate::ext::Protocol>().is_some() {
+        let settings = tokio::select! {
+            settings = connection.peer_settings.received() => settings,
+            error = connection.transport.terminated() => return Err(error.into()),
         };
+        if settings.get(frame::SETTINGS_ENABLE_CONNECT_PROTOCOL, 0) != 1 {
+            return Err(ConnectError::NotSupported);
+        }
+    }
+    let (mut ws, rs) = connection.open_bi().await?;
+    let qpack = connection.qpack().clone();
+    let mut bytes = Vec::new();
+    bytes.put_frame(&Frame::new(Headers {
+        field_section: qpack.encode(ws.stream_id(), fields)?,
+    })?);
+    ws.write_all(&bytes).await.map_err(Error::from)?;
+    ws.flush().await.map_err(Error::from)?;
+    let mut recv = rs;
+    let head = read_final_head(&mut recv, &qpack, true).await?;
+    if head.status()?.is_success() {
+        let mut response = http::Response::new(());
+        *response.status_mut() = head.status()?;
+        *response.headers_mut() = head.headers;
+        Ok(ConnectOutcome::Connected {
+            response,
+            tunnel: crate::Tunnel::new(recv, ws, qpack),
+        })
+    } else {
+        let mode = BodyMode::resolve(&head, Some(&http::Method::CONNECT))?;
+        let body = body::receive(recv, mode, qpack);
+        Ok(ConnectOutcome::Rejected(common::Response::Streaming(
+            ArcMessage::from(Message::from_parts(head, body)).into(),
+        )))
+    }
+}
+
+/// Reads ordinary responses; HEAD and CONNECT semantics require request-method input.
+async fn read_response<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
+    mut rs: H3ReadStream<RS>,
+    qpack: ArcQpack,
+    method: Option<http::Method>,
+) -> Result<crate::common::Response<Read>> {
+    let stream_id = rs.stream_id();
+    let result = async {
+        let head = read_final_head(&mut rs, &qpack, false).await?;
+        let length = headers::content_length(&head.headers)?;
         if method.as_ref() == Some(&http::Method::CONNECT)
             && head.status()?.is_success()
             && length.is_some()
@@ -227,7 +332,7 @@ async fn read_response<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
     let (head, mode) = match result {
         Ok(value) => value,
         Err(error) => {
-            rs.get_ref().close(error.clone());
+            rs.close(error.clone());
             if matches!(
                 error.code,
                 ErrorCode::H3_FRAME_ERROR | ErrorCode::H3_FRAME_UNEXPECTED

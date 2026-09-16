@@ -57,8 +57,8 @@ or cancels the body.
 accepts a WndBuf body. Both take `(request, write_stream, read_stream, qpack)`,
 start the upload in an internal task, and return an
 `IntoFuture<Output = Result<Response>>`.
-The response future carries the request method automatically, including HEAD and
-CONNECT semantics. Uploads continue independently after an early response or after
+The response future carries the request method automatically, including HEAD
+semantics. CONNECT uses the dedicated handshake API described below. Uploads continue independently after an early response or after
 the response future is dropped. Use the body producer's `finish()` or `reset()` to
 terminate a streaming upload.
 If upload fails before a response is ready, the response future returns that
@@ -150,3 +150,86 @@ Beneath the hood of a standard QUIC connection, both endpoints have equal abilit
 > HTTP/3 does not use server-initiated bidirectional streams, though an extension could define a use for these streams. Clients MUST treat receipt of a server-initiated bidirectional stream as a connection error of type H3_STREAM_CREATION_ERROR unless such an extension has been negotiated.
 
 h3x uses exactly these server-initiated bidirectional streams so that the "server" can initiate requests to the "client."
+
+## CONNECT and WebSocket tunnels
+
+Extended CONNECT support is enabled and advertised automatically by both
+`Settings::default()` and `Settings::new(...)`; no opt-in is required.
+`Request::connect("ws://host/path")` and `Request::connect("wss://host/path")`
+construct WebSocket CONNECT requests, mapping their schemes to HTTP/HTTPS and
+setting `Sec-WebSocket-Version: 13`. They preserve the path and query and reject
+userinfo and fragments. `Request::connect("host:443")` constructs plain CONNECT.
+Construction does not dial a backend or open an HTTP/3 stream.
+
+```rust,no_run
+# use h3x::{client, H3Connection, Transport};
+# async fn connect<T: Transport>(connection: &H3Connection<T>) -> Result<(), Box<dyn std::error::Error>> {
+let request = client::Request::connect("wss://home.example/api/websocket")?;
+match client::connect(request, connection).await? {
+    client::ConnectOutcome::Connected { response, mut tunnel } => {
+        assert!(response.status().is_success());
+        // Drive tunnel with AsyncRead/AsyncWrite, or copy_bidirectional.
+        // Only send WebSocket frame bytes after the handshake succeeds.
+        tunnel.finish().await?;
+    }
+    client::ConnectOutcome::Rejected(response) => {
+        // Status, headers, and ordinary response body remain available.
+    }
+}
+# Ok(()) }
+```
+
+The client waits for peer SETTINGS before sending Extended CONNECT. Unsupported
+peers return `ConnectError::NotSupported` without closing the connection. Plain
+CONNECT requires no extension negotiation. A successful handshake returns after
+final 2xx HEADERS, without waiting for DATA or FIN. Handshake bodies must be empty.
+
+On the server, retain the read direction until the application chooses how to
+handle the request. `read_request_head` borrows the stream and returns an
+`http::Request<()>` containing metadata only. It reads exactly through the initial
+HEADERS, so no caller-side `BufReader` or connection-owning wrapper is needed:
+
+```rust,no_run
+# use h3x::{server, H3Connection, Transport};
+# async fn accept<T: Transport>(connection: H3Connection<T>) -> h3x::Result<()> {
+let (send, mut recv) = connection.accept_bi().await?;
+let head = server::read_request_head(&mut recv, connection.qpack()).await?;
+if head.method() == http::Method::CONNECT {
+    let protocol = head.extensions().get::<h3x::ext::Protocol>();
+    // Route and authorize here; finish any upstream handshake before accepting.
+    let tunnel = server::accept_connect(
+        http::Response::new(()), send, recv, connection.qpack().clone(), head.method(),
+    ).await?;
+    // Pass ownership of tunnel to application I/O or relay code.
+} else {
+    let request = server::read_request_body(head, recv, connection.qpack().clone())?;
+    // Use existing response writers with send and connection.qpack().clone().
+}
+# Ok(()) }
+```
+
+To reject CONNECT, drop the receive stream and use `write_bytes_response` or
+`write_streaming_response` with `Method::CONNECT` and a non-2xx status. Stopping
+reception leaves the response write direction usable. Ordinary request writers
+reject CONNECT, and ordinary response writers reject successful CONNECT; use
+`client::connect` / `server::accept_connect` instead. The existing
+`read_request(recv, qpack)` remains available for ordinary HTTP.
+
+`Tunnel` implements Tokio `AsyncRead` and `AsyncWrite`. It strips HTTP/3 DATA
+framing and preserves all payload bytes, including WebSocket masks, fragmentation,
+and negotiated compression. It has no body pump or background task. Accepted
+writes own at most 16 KiB of payload per pending frame; `flush()` drains it and
+flushes the transport. `finish()` / `shutdown()` drain and close only the send
+direction, while `abort()` discards pending data and cancels both directions.
+Dropping unfinished stream halves cancels them. Reads retain partial frame headers
+across cancellation, skip unknown frames with bounded memory, and preserve bytes
+following handshake HEADERS. The DATA reader holds `H3ReadStream` directly; stream parameters and tunnel
+members do not require a `BufReader` wrapper. Prohibited frames after acceptance produce a
+connection-level protocol error; ordinary tunnel cancellation stays stream-local.
+GOAWAY stops admission while existing tunnels remain registered for draining.
+
+This library provides the HTTP/3 capability only. Trusted backend routing,
+HTTP/1.1 Upgrade conversion, TLS dialing, subprotocol/extension validation, and
+relay timeouts belong to the proxy/application. No WebSocket message codec is
+included. See [RFC 9220](https://www.rfc-editor.org/rfc/rfc9220.html) and
+[RFC 9114](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.4).

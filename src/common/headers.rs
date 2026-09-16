@@ -11,8 +11,9 @@ use crate::{Error, ErrorCode, Result, protocol::qpack::Field};
 
 /// Validated request metadata. HTTP/3 pseudo-headers are represented by their
 /// typed HTTP equivalents; `headers` contains ordinary fields only.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct RequestHead {
+    pub(crate) extensions: http::Extensions,
     pub(crate) method: Method,
     pub(crate) uri: Uri,
     pub(crate) headers: HeaderMap,
@@ -61,7 +62,7 @@ pub(crate) fn be_request(fields: Vec<Field>) -> Result<RequestHead> {
     if pseudo.iter().any(|field| {
         !matches!(
             field.name.as_ref(),
-            b":method" | b":scheme" | b":authority" | b":path"
+            b":method" | b":scheme" | b":authority" | b":path" | b":protocol"
         )
     }) {
         return Err(ErrorCode::H3_MESSAGE_ERROR
@@ -73,10 +74,30 @@ pub(crate) fn be_request(fields: Vec<Field>) -> Result<RequestHead> {
     let scheme = pseudo_value(&pseudo, b":scheme");
     let authority = pseudo_value(&pseudo, b":authority");
     let path = pseudo_value(&pseudo, b":path");
-    let authority = validate_request_pseudo(&method, scheme, authority, path, &headers)?;
+    let mut extensions = http::Extensions::new();
+    let protocol = pseudo_value(&pseudo, b":protocol");
+    if let Some(protocol) = protocol {
+        if method != Method::CONNECT || authority.is_none() {
+            return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason("invalid Extended CONNECT"));
+        }
+        extensions.insert(crate::ext::Protocol::new(
+            from_utf8(protocol).map_err(message_error)?,
+        )?);
+    }
+    let semantic_method = if protocol.is_some() {
+        &Method::GET
+    } else {
+        &method
+    };
+    let authority = validate_request_pseudo(semantic_method, scheme, authority, path, &headers)?;
+    if authority.as_str().contains('@') {
+        return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason("userinfo is forbidden"));
+    }
+    let uri = build_request_uri(semantic_method, scheme, authority, path)?;
 
     Ok(RequestHead {
-        uri: build_request_uri(&method, scheme, authority, path)?,
+        uri,
+        extensions,
         method,
         headers,
     })
@@ -135,6 +156,9 @@ impl Write for Vec<Field> {
         self.push(pseudo_field(b":authority", authority));
         if let Some(path) = path {
             self.push(pseudo_field(b":path", path));
+        }
+        if let Some(protocol) = head.extensions.get::<crate::ext::Protocol>() {
+            self.push(pseudo_field(b":protocol", protocol.as_str().as_bytes()));
         }
         put_regular_headers(self, &head.headers);
         Ok(())
@@ -248,7 +272,14 @@ fn request_pseudo(head: &RequestHead) -> Result<RequestPseudo<'_>> {
         .path_and_query()
         .map(|value| value.as_str().as_bytes());
 
-    if head.method == Method::CONNECT {
+    let protocol = head.extensions.get::<crate::ext::Protocol>();
+    if protocol.is_some() && head.method != Method::CONNECT {
+        return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason(":protocol requires CONNECT"));
+    }
+    if authority.contains(&b'@') {
+        return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason("userinfo is forbidden"));
+    }
+    if head.method == Method::CONNECT && protocol.is_none() {
         if scheme.is_some() || path.is_some() {
             return Err(ErrorCode::H3_MESSAGE_ERROR
                 .with_reason("CONNECT must not include :scheme or :path"));
@@ -446,7 +477,10 @@ mod tests {
                 b"content-type",
             ]
         );
-        assert_eq!(be_request(request_fields).unwrap(), request);
+        let decoded = be_request(request_fields).unwrap();
+        assert_eq!(decoded.method, request.method);
+        assert_eq!(decoded.uri, request.uri);
+        assert_eq!(decoded.headers, request.headers);
 
         let mut sensitive = HeaderValue::from_static("session=secret");
         sensitive.set_sensitive(true);
@@ -465,6 +499,7 @@ mod tests {
     #[test]
     fn put_rejects_invalid_typed_heads_without_partial_output() {
         let mut request = RequestHead {
+            extensions: http::Extensions::new(),
             method: Method::GET,
             uri: "/relative".parse().unwrap(),
             headers: HeaderMap::new(),
@@ -697,5 +732,82 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+    use crate::{ReadRequest, client};
+
+    #[test]
+    fn websocket_urls_and_protocol_fields_round_trip() {
+        for (url, scheme, authority, path) in [
+            ("ws://example.com", "http", "example.com", "/"),
+            (
+                "wss://example.com/chat?q=%2F",
+                "https",
+                "example.com",
+                "/chat?q=%2F",
+            ),
+            ("ws://[::1]:8080/%2f?a=b", "http", "[::1]:8080", "/%2f?a=b"),
+        ] {
+            let request = client::Request::connect(url).unwrap();
+            assert_eq!(request.scheme(), scheme);
+            assert_eq!(request.authority(), authority);
+            assert_eq!(request.path(), path);
+            assert_eq!(request.protocol().unwrap().as_str(), "websocket");
+            assert_eq!(request.headers()["sec-websocket-version"], "13");
+            assert!(!request.headers().contains_key("sec-websocket-key"));
+            let head = request.message.head.lock().unwrap();
+            let mut fields = Vec::new();
+            fields.put_request(&head).unwrap();
+            let decoded = be_request(fields.clone()).unwrap();
+            assert_eq!(decoded.uri, head.uri);
+            assert_eq!(decoded.protocol(), head.protocol());
+            fields[0].value = Bytes::from_static(b"GET");
+            assert!(be_request(fields).is_err());
+        }
+        for url in [
+            "ws://user@example.com/",
+            "ws://example.com/#frag",
+            "wss:///",
+            "ws://[::1",
+        ] {
+            assert!(client::Request::connect(url).is_err(), "{url}");
+        }
+        let request = client::Request::connect("[::1]:443").unwrap();
+        assert!(request.protocol().is_none());
+        assert_eq!(request.path(), "");
+        for protocol in ["", "web socket", "websocket\r\n", "web/socket", "中文"] {
+            assert!(crate::ext::Protocol::new(protocol).is_err());
+        }
+    }
+
+    #[test]
+    fn extended_connect_requires_every_pseudo_header() {
+        let request = client::Request::connect("ws://example.com/").unwrap();
+        let mut fields = Vec::new();
+        fields
+            .put_request(&request.message.head.lock().unwrap())
+            .unwrap();
+        for name in [b":scheme".as_slice(), b":authority", b":path"] {
+            let mut missing = fields.clone();
+            missing.retain(|f| f.name.as_ref() != name);
+            assert!(be_request(missing).is_err());
+        }
+        let mut duplicate = fields.clone();
+        duplicate.insert(
+            0,
+            fields
+                .iter()
+                .find(|f| f.name == ":protocol")
+                .unwrap()
+                .clone(),
+        );
+        assert!(be_request(duplicate).is_err());
+        let mut head = request.message.head.lock().unwrap().clone();
+        head.method = Method::GET;
+        assert!(Vec::new().put_request(&head).is_err());
     }
 }

@@ -106,7 +106,7 @@ impl ArcQpack {
         settings: &super::connection::Settings,
         transport: Arc<T>,
     ) -> Result<(Self, encoder::Instructions, decoder::Instructions)> {
-        let (local, max_fields) = limits(&settings.local);
+        let (local, max_fields) = limits(&settings.0);
         let mut encoder = Encoder::new(Settings::default())?;
         let mut decoder = Decoder::new(local, MAX_BLOCKED_FIELD_SECTION_BYTES, max_fields)?;
         let (encoder_tx, encoder_rx) = tokio::sync::mpsc::channel(MAX_PENDING_INSTRUCTION);
@@ -460,7 +460,7 @@ pub(crate) mod tests {
         );
         let settings = crate::Settings::new(1024, 128, 3).unwrap();
         assert_eq!(
-            limits(&settings.local),
+            limits(&settings.0),
             (
                 Settings {
                     max_table_capacity: 128,
@@ -470,7 +470,7 @@ pub(crate) mod tests {
             )
         );
         let settings = crate::Settings::new(0, 0, 0).unwrap();
-        assert_eq!(limits(&settings.local), (Settings::default(), 0));
+        assert_eq!(limits(&settings.0), (Settings::default(), 0));
     }
 
     #[tokio::test]

@@ -1,6 +1,9 @@
 #![doc = include_str!("../README.md")]
 
 pub mod client;
+pub mod ext;
+pub mod tunnel;
+pub use tunnel::Tunnel;
 mod common;
 mod error;
 mod protocol;

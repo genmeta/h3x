@@ -45,7 +45,9 @@ impl<T: Transport> H3Connection<T> {
     ) {
         let result = async {
             let mut bytes = vec![StreamType::Control as u8];
-            bytes.put_control(&Control::Settings(Frame::new(self.settings.local.clone())?));
+            bytes.put_control(&Control::Settings(Frame::new(
+                self.local_settings.0.clone(),
+            )?));
             send.write_all(&bytes).await.map_err(control_error)?;
             send.flush().await.map_err(control_error)
         }
@@ -157,7 +159,7 @@ impl<T: Transport> H3Connection<T> {
         };
         let (peer, max_fields) = qpack::limits(&settings);
         self.qpack.configure(peer, max_fields)?;
-        *self.settings.peer.lock().unwrap() = Some(settings);
+        self.peer_settings.obtain(settings);
 
         let role = self.transport.role();
         let mut last_goaway_id = None;

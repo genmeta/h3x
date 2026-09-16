@@ -107,14 +107,14 @@ impl Body<ArcWndBuf, Read> {
 
 /// Return a body window immediately and drive DATA, trailers, and FIN in the background.
 pub(crate) fn receive<RS>(
-    mut rs: BufReader<H3ReadStream<RS>>,
+    mut rs: H3ReadStream<RS>,
     mode: BodyMode,
     qpack: ArcQpack,
 ) -> Body<ArcWndBuf, Read>
 where
     RS: AsyncRead + StopSending + Unpin + Send + 'static,
 {
-    let stream_id = rs.get_ref().stream_id();
+    let stream_id = rs.stream_id();
     let mut buffer = ArcWndBuf::new(frame::MAX_DATA_CHUNK);
     let body = Body::new(buffer.clone());
     tokio::spawn(async move {
@@ -125,7 +125,7 @@ where
             result = read_body(&mut rs, &mut buffer, mode, &qpack) => result,
         };
         if let Err(error) = &result {
-            rs.get_ref().close(error.clone());
+            rs.close(error.clone());
             if matches!(
                 error.code,
                 ErrorCode::H3_FRAME_ERROR | ErrorCode::H3_FRAME_UNEXPECTED
@@ -180,11 +180,14 @@ impl BodyMode {
 /// Receive DATA into an application destination and validate trailing HEADERS.
 /// QPACK is used only to decode trailers. The destination is shut down at EOF.
 pub(crate) async fn read_body<R: AsyncRead + StopSending + Unpin, W: AsyncWrite + Unpin>(
-    read_stream: &mut BufReader<H3ReadStream<R>>,
+    read_stream: &mut H3ReadStream<R>,
     body: &mut W,
     mode: BodyMode,
     qpack: &ArcQpack,
 ) -> Result<()> {
+    // Body reception owns buffering until FIN; callers pass the stream directly.
+    let mut reader = BufReader::new(read_stream);
+    let read_stream = &mut reader;
     let mut remaining = mode.content_length();
     let mut trailers = false;
     while !read_stream.fill_buf().await?.is_empty() {
@@ -402,7 +405,7 @@ mod tests {
             let mut body = Vec::new();
             assert_eq!(
                 (read_body(
-                    &mut BufReader::new(crate::test_support::read_stream(0, &mut input)),
+                    &mut crate::test_support::read_stream(0, &mut input),
                     &mut body,
                     match length {
                         Some(content_length) => BodyMode::Length { content_length },
@@ -420,7 +423,7 @@ mod tests {
         let mut body = Vec::new();
         assert_eq!(
             (read_body(
-                &mut BufReader::new(crate::test_support::read_stream(0, &mut input)),
+                &mut crate::test_support::read_stream(0, &mut input),
                 &mut body,
                 BodyMode::Infinity,
                 crate::test_support::connection().await.qpack()

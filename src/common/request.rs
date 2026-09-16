@@ -48,6 +48,13 @@ impl WriteBody for Request<Write, Bytes> {
 }
 
 impl Request<Write, Bytes> {
+    /// Construct an empty CONNECT handshake, without opening a connection.
+    /// `ws://` and `wss://` select the websocket protocol and map to http/https.
+    /// Authority-form targets (for example `example.com:443`) use plain CONNECT.
+    pub fn connect(url: &str) -> Result<Self> {
+        <Self as WriteRequest>::new(url, Method::CONNECT)
+    }
+
     pub fn body(mut self, body: Bytes) -> Self {
         self.set_body(body);
         self
@@ -121,6 +128,9 @@ impl WriteStream for Request<Write, ArcWndBuf> {
 }
 
 impl<IO, B> ReadRequest for Request<IO, B> {
+    fn protocol(&self) -> Option<crate::ext::Protocol> {
+        self.message.head.lock().unwrap().protocol()
+    }
     fn method(&self) -> Method {
         self.message.head.lock().unwrap().method()
     }

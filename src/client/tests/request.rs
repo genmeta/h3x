@@ -40,7 +40,6 @@ async fn request_frames_and_errors() {
             Bytes::from_static(b"hello"),
         ),
         (Method::GET, "https://example.com/", Bytes::new()),
-        (Method::CONNECT, "example.com:443", Bytes::new()),
     ] {
         let req = Request::new(url, method.clone())
             .unwrap()
@@ -71,6 +70,20 @@ async fn request_frames_and_errors() {
             input = &input[body.len()..];
         }
         assert!(input.is_empty());
+    }
+    for url in ["example.com:443", "ws://example.com/chat"] {
+        let request = Request::connect(url).unwrap();
+        assert!(
+            write_bytes_request(&request, tokio::io::sink())
+                .await
+                .is_err()
+        );
+        let request = Request::streaming_connect(url).unwrap();
+        assert!(
+            write_streaming_request(&request, tokio::io::sink())
+                .await
+                .is_err()
+        );
     }
     let req = Request::<Bytes>::get("https://example.com/")
         .unwrap()

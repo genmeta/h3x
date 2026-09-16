@@ -8,6 +8,7 @@ use crate::{ErrorCode, Result, Transport, protocol::qpack::ArcQpack};
 mod control;
 mod settings;
 mod stream_cursor;
+use settings::PeerSettings;
 pub use settings::Settings;
 pub(crate) use stream_cursor::StreamCursor;
 
@@ -17,8 +18,9 @@ use crate::ErrorCode::H3_NO_ERROR;
 /// Construct inside a Tokio runtime. Tasks run until the transport terminates.
 /// Only an explicit goaway() drains requests and closes the transport.
 pub struct H3Connection<T: Transport> {
-    transport: Arc<T>,
-    settings: Arc<Settings>,
+    pub(crate) transport: Arc<T>,
+    pub(crate) peer_settings: Arc<PeerSettings>,
+    local_settings: Arc<Settings>,
     qpack: ArcQpack,
     cursor: Arc<StreamCursor<T::StreamWriter>>,
     bi_streams: Arc<BiStreams<T::StreamReader, T::StreamWriter>>,
@@ -49,7 +51,8 @@ impl<T: Transport> H3Connection<T> {
 
         let connection = Self {
             transport,
-            settings,
+            local_settings: settings,
+            peer_settings: Arc::new(PeerSettings::default()),
             qpack,
             cursor,
             bi_streams: bi,
@@ -134,7 +137,8 @@ impl<T: Transport> Clone for H3Connection<T> {
     fn clone(&self) -> Self {
         Self {
             transport: self.transport.clone(),
-            settings: self.settings.clone(),
+            local_settings: self.local_settings.clone(),
+            peer_settings: self.peer_settings.clone(),
             qpack: self.qpack.clone(),
             cursor: self.cursor.clone(),
             bi_streams: self.bi_streams.clone(),

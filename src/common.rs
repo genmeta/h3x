@@ -75,6 +75,13 @@ pub enum Response<IO> {
 }
 
 impl<IO> ReadRequest for Request<IO> {
+    fn protocol(&self) -> Option<crate::ext::Protocol> {
+        match self {
+            Self::Bytes(r) => r.protocol(),
+            Self::Streaming(r) => r.protocol(),
+        }
+    }
+
     fn method(&self) -> http::Method {
         match self {
             Self::Bytes(request) => request.method(),

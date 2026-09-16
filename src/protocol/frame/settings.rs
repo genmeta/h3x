@@ -13,6 +13,7 @@ use crate::{ErrorCode, Result};
 pub(crate) const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u32 = 0x01;
 pub(crate) const SETTINGS_MAX_FIELD_SECTION_SIZE: u32 = 0x06;
 pub(crate) const SETTINGS_QPACK_BLOCKED_STREAMS: u32 = 0x07;
+pub(crate) const SETTINGS_ENABLE_CONNECT_PROTOCOL: u32 = 0x08;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Settings {

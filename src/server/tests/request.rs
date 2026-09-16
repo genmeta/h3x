@@ -341,3 +341,39 @@ async fn incomplete_request_does_not_fail_connection() {
         assert!(connection.qpack().encode(4, Vec::new()).is_ok());
     }
 }
+
+#[tokio::test]
+async fn head_only_reader_leaves_connect_data_unconsumed() {
+    use crate::protocol::frame::Data;
+    let connection = crate::test_support::connection().await;
+    let request = crate::client::Request::connect("ws://example.com/chat").unwrap();
+    let mut fields = Vec::new();
+    fields
+        .put_request(&request.message.head.lock().unwrap())
+        .unwrap();
+    let mut bytes = Vec::new();
+    bytes.put_frame(
+        &Frame::new(Headers {
+            field_section: connection.qpack().encode(0, fields).unwrap(),
+        })
+        .unwrap(),
+    );
+    bytes.put_frame(&Frame::new(Data(3)).unwrap());
+    bytes.extend_from_slice(b"abc");
+    let mut recv = crate::test_support::read_stream(0, std::io::Cursor::new(bytes));
+    let head = super::read_request_head(&mut recv, connection.qpack())
+        .await
+        .unwrap();
+    assert_eq!(head.method(), Method::CONNECT);
+    assert_eq!(head.version(), http::Version::HTTP_3);
+    let mut tunnel = crate::Tunnel::new(
+        recv,
+        crate::test_support::write_stream(0, tokio::io::sink()),
+        connection.qpack().clone(),
+    );
+    let mut output = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut tunnel, &mut output)
+        .await
+        .unwrap();
+    assert_eq!(output, b"abc");
+}

@@ -31,8 +31,8 @@ pub(crate) use headers::Headers;
 pub(crate) use max_push_id::MaxPushId;
 pub(crate) use push_promise::PushPromise;
 pub(crate) use settings::{
-    SETTINGS_MAX_FIELD_SECTION_SIZE, SETTINGS_QPACK_BLOCKED_STREAMS,
-    SETTINGS_QPACK_MAX_TABLE_CAPACITY, Settings,
+    SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_MAX_FIELD_SECTION_SIZE,
+    SETTINGS_QPACK_BLOCKED_STREAMS, SETTINGS_QPACK_MAX_TABLE_CAPACITY, Settings,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +128,19 @@ impl GetFrameType for H3Frame {
     }
 }
 
+/// Distinguish clean EOF before a frame from a truncated frame type or payload.
+pub(crate) async fn be_frame_or_eof<T: AsyncRead + Unpin + ?Sized>(
+    reader: &mut T,
+) -> Result<Option<H3Frame>> {
+    let mut first = [0];
+    if reader.read(&mut first).await? == 0 {
+        return Ok(None);
+    }
+    be_frame(&mut first.as_slice().chain(reader))
+        .await
+        .map(Some)
+}
+
 /// Read Type, Length, and one payload. DATA and unknown payload bytes remain in
 /// the reader and must be consumed before calling again. HEADERS/PUSH_PROMISE
 /// retain encoded QPACK bytes; after validating placement, pass the field section
@@ -135,26 +148,25 @@ impl GetFrameType for H3Frame {
 /// EOF (including a partial frame) is an error.
 /// Cancellation can consume a prefix; keep polling the same future.
 pub(crate) async fn be_frame<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<H3Frame> {
-    let ty: FrameType = be_varint(reader)
-        .await
-        .map_err(|error| {
-            let error = error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
-                .map_or(&error, std::sync::Arc::as_ref);
-            error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<crate::Error>())
-                .cloned()
-                .unwrap_or_else(|| {
-                    let code = if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                        ErrorCode::H3_FRAME_ERROR
-                    } else {
-                        ErrorCode::H3_INTERNAL_ERROR
-                    };
-                    code.with_reason(error.to_string())
-                })
-        })?
+    let ty = be_varint(reader).await.map_err(|error| {
+        let error = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
+            .map_or(&error, std::sync::Arc::as_ref);
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<crate::Error>())
+            .cloned()
+            .unwrap_or_else(|| {
+                let code = if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    ErrorCode::H3_FRAME_ERROR
+                } else {
+                    ErrorCode::H3_INTERNAL_ERROR
+                };
+                code.with_reason(error.to_string())
+            })
+    })?;
+    let ty: FrameType = ty
         .ok_or_else(|| ErrorCode::H3_FRAME_ERROR.with_reason("frame is missing a complete type"))?
         .into_u64()
         .try_into()?;
