@@ -42,7 +42,7 @@ async fn reset_wakes_a_blocked_producer_after_upload_is_dropped() {
     let sending = send_streaming_request(
         &producer,
         H3WriteStream::new(0, tokio::io::sink()),
-        crate::test_support::connection(),
+        crate::test_support::connection().qpack(),
     )
     .unwrap();
     let cancelling = producer.clone();
@@ -76,7 +76,7 @@ async fn reset_wakes_a_blocked_producer_after_request_is_dropped() {
         producer.clone(),
         H3ReadStream::new(0, tokio::io::empty()),
         H3WriteStream::new(0, tokio::io::sink()),
-        crate::test_support::connection(),
+        crate::test_support::connection().qpack().clone(),
     );
     let cancelling = producer.clone();
     let mut writing = Box::pin(producer.write(b"y"));
@@ -99,7 +99,7 @@ async fn reset_wakes_a_blocked_producer_after_request_is_dropped() {
 }
 
 #[tokio::test]
-async fn cancelling_response_wait_drops_unfinished_uploads() {
+async fn dropping_response_wait_preserves_uploads() {
     timeout(Duration::from_secs(5), async {
         for (streaming, finished) in [(false, false), (true, false), (true, true)] {
             let mut producer = Request::streaming_post("https://example.com/upload").unwrap();
@@ -117,7 +117,7 @@ async fn cancelling_response_wait_drops_unfinished_uploads() {
                 outgoing,
                 H3ReadStream::new(0, recv),
                 H3WriteStream::new(0, send),
-                crate::test_support::connection(),
+                crate::test_support::connection().qpack().clone(),
             ));
             assert!(
                 waiting
@@ -132,7 +132,7 @@ async fn cancelling_response_wait_drops_unfinished_uploads() {
                 }
             }
             drop(waiting);
-            if streaming {
+            if streaming && !finished {
                 producer.clone().reset().await.unwrap();
                 assert_eq!(
                     producer.write(b"x").await,
@@ -145,12 +145,14 @@ async fn cancelling_response_wait_drops_unfinished_uploads() {
             }
             let mut partial = Vec::new();
             peer_recv.read_to_end(&mut partial).await.unwrap();
-            assert!(partial.len() <= 1);
+            if !streaming || finished {
+                assert!(partial.ends_with(b"payload"));
+            }
             assert!(peer_send.write_all(b"x").await.is_err());
         }
     })
     .await
-    .expect("cancelling the response wait must release both transport halves");
+    .expect("dropping the response wait must preserve the internal upload task");
 }
 
 #[tokio::test]
@@ -175,7 +177,7 @@ async fn early_response_keeps_both_body_modes_sending() {
                 outgoing,
                 H3ReadStream::new(0, Cursor::new(response_headers())),
                 H3WriteStream::new(0, send),
-                crate::test_support::connection(),
+                crate::test_support::connection().qpack().clone(),
             )
             .await
             .unwrap();
@@ -214,7 +216,7 @@ async fn cancelling_response_wait_preserves_a_completed_upload() {
             producer.clone(),
             H3ReadStream::new(0, recv),
             H3WriteStream::new(0, send),
-            crate::test_support::connection(),
+            crate::test_support::connection().qpack().clone(),
         ));
         assert!(
             waiting
@@ -291,7 +293,7 @@ async fn producer_fin_does_not_complete_transport_shutdown() {
                         polled: polled.clone(),
                     },
                 ),
-                crate::test_support::connection(),
+                crate::test_support::connection().qpack(),
             )
             .unwrap(),
         );
@@ -323,7 +325,7 @@ async fn write_failure_after_idle_body_preserves_the_response() {
             producer.clone(),
             H3ReadStream::new(0, recv),
             H3WriteStream::new(0, send),
-            crate::test_support::connection(),
+            crate::test_support::connection().qpack().clone(),
         ));
         assert!(
             waiting
@@ -344,6 +346,10 @@ async fn write_failure_after_idle_body_preserves_the_response() {
                 .is_pending()
         );
         assert_eq!(producer.write(b"x").await, Ok(1));
+        assert_eq!(
+            producer.message.body_stream().error().await,
+            ErrorCode::H3_INTERNAL_ERROR
+        );
         assert!(
             waiting
                 .as_mut()
@@ -372,7 +378,7 @@ async fn explicit_reset_stops_an_upload_waiting_on_network() {
             send_streaming_request(
                 &request,
                 H3WriteStream::new(0, send),
-                crate::test_support::connection(),
+                crate::test_support::connection().qpack(),
             )
             .unwrap(),
         );
@@ -404,7 +410,7 @@ async fn finished_producer_can_drop_while_upload_waits_on_network() {
             send_streaming_request(
                 &request,
                 H3WriteStream::new(0, send),
-                crate::test_support::connection(),
+                crate::test_support::connection().qpack(),
             )
             .unwrap(),
         );
@@ -446,7 +452,7 @@ async fn explicit_stop_stops_a_receive_waiting_on_network() {
         );
         let (mut send, recv) = tokio::io::duplex(64);
         send.write_all(&headers).await.unwrap();
-        let response = read_response(H3ReadStream::new(0, recv), qpack, None)
+        let response = read_response(H3ReadStream::new(0, recv), qpack.qpack().clone(), None)
             .await
             .unwrap();
         assert!(matches!(response, Response::Streaming(_)));
@@ -477,7 +483,8 @@ fn explicit_stop_cancels_body_after_response_pump_is_dropped() {
         );
         let (mut send, recv) = tokio::io::duplex(64);
         send.write_all(&headers).await.unwrap();
-        let Response::Streaming(response) = read_response(H3ReadStream::new(0, recv), qpack, None)
+        let Response::Streaming(response) =
+            read_response(H3ReadStream::new(0, recv), qpack.qpack().clone(), None)
             .await
             .unwrap()
         else {
@@ -526,7 +533,11 @@ async fn streaming_response_keeps_message_error_after_transport_eof() {
         .unwrap(),
     );
     let Response::Streaming(mut response) =
-        read_response(H3ReadStream::new(0, Cursor::new(encoded)), qpack, None)
+        read_response(
+            H3ReadStream::new(0, Cursor::new(encoded)),
+            qpack.qpack().clone(),
+            None,
+        )
             .await
             .unwrap()
     else {

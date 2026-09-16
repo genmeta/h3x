@@ -1,6 +1,6 @@
 //! Application body handles, incoming-body driving, and HTTP/3 body framing.
 
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Arc};
 
 use bytes::Bytes;
 use http::{Method, StatusCode};
@@ -8,9 +8,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 
 use super::{Read, Write, headers, headers::ResponseHead};
 use crate::{
-    ArcWndBuf, ErrorCode, Result, Transport,
+    ArcWndBuf, ErrorCode, Result,
     protocol::{
-        connection::H3Connection,
         frame::{self, Data, Frame, H3Frame, Write as _, be_frame},
         qpack::Qpack,
         stream::H3ReadStream,
@@ -67,7 +66,7 @@ impl Body<ArcWndBuf, Write> {
         Ok(())
     }
 
-    /// Finish production. The send future must still drain data and finish the transport.
+    /// Finish production. The request's upload task still drains data and finishes the transport.
     pub async fn finish(&mut self) -> Result<()> {
         self.storage.shutdown().await?;
         Ok(())
@@ -111,14 +110,13 @@ impl Body<ArcWndBuf, Read> {
 }
 
 /// Return a body window immediately and drive DATA, trailers, and FIN in the background.
-pub(crate) fn receive<RS, T>(
+pub(crate) fn receive<RS>(
     mut rs: BufReader<H3ReadStream<RS>>,
     mode: BodyMode,
-    connection: H3Connection<T>,
+    qpack: Arc<Qpack>,
 ) -> Body<ArcWndBuf, Read>
 where
     RS: AsyncRead + Unpin + Send + 'static,
-    T: Transport,
 {
     let stream_id = rs.get_ref().stream_id();
     let mut buffer = ArcWndBuf::new(frame::MAX_DATA_CHUNK);
@@ -128,11 +126,10 @@ where
         let result = tokio::select! {
             biased;
             error = cancellation.error() => Err(error),
-            result = read_body(&mut rs, &mut buffer, mode, connection.qpack()) => result,
+            result = read_body(&mut rs, &mut buffer, mode, &qpack) => result,
         };
         if let Err(error) = result {
-            let _ = connection.qpack().cancel(stream_id);
-            connection.receive_error(error).await;
+            let _ = qpack.cancel(stream_id);
             buffer.set_error(error);
         }
         // read_body validates FIN/trailers and marks buffer EOF on success.

@@ -62,7 +62,7 @@ pub async fn read_request<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
         Some(content_length) => BodyMode::Length { content_length },
         None => BodyMode::Infinity,
     };
-    let body = body::receive(rs, mode, connection);
+    let body = body::receive(rs, mode, connection.qpack().clone());
     Ok(common::Request::Streaming(
         ArcMessage::from(Message::from_parts(head, body)).into(),
     ))

@@ -20,15 +20,13 @@ async fn request_accept_and_respond() {
 
     let (response, served) = tokio::join!(
         async {
-            let (sending, receiving) = client::write_bytes_request(
+            let response = client::write_bytes_request(
                 request,
                 H3WriteStream::new(0, client_send),
                 H3ReadStream::new(0, client_recv),
-                connection.clone(),
+                connection.qpack().clone(),
             )?;
-            let (sent, received) = tokio::join!(sending, receiving);
-            sent?;
-            received
+            response.await
         },
         async {
             let request =
@@ -82,15 +80,13 @@ async fn streaming_echo() {
 
     let (response, uploaded, served) = tokio::join!(
         async {
-            let (sending, receiving) = client::write_streaming_request(
+            let response = client::write_streaming_request(
                 request,
                 H3WriteStream::new(0, client_send),
                 H3ReadStream::new(0, client_recv),
-                connection.clone(),
+                connection.qpack().clone(),
             )?;
-            let (sent, received) = tokio::join!(sending, receiving);
-            sent?;
-            received
+            response.await
         },
         async {
             for sentence in sentences {

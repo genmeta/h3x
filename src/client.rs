@@ -1,14 +1,17 @@
 //! Initiating requests and receiving authenticated responses.
 //! These roles apply per request, independently of the QUIC connection role.
 
-use std::future::Future;
+use std::{
+    future::{Future, IntoFuture},
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use http::StatusCode;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::{
-    ArcWndBuf, ErrorCode, Result, Transport,
+    ArcWndBuf, ErrorCode, Result,
     common::{
         self, Read, Write,
         body::{self, BodyMode},
@@ -16,8 +19,8 @@ use crate::{
         message::{ArcMessage, Message},
     },
     protocol::{
-        connection::H3Connection,
         frame::{self, Data, Frame, H3Frame, Headers, Write as _, be_frame},
+        qpack::Qpack,
         stream::{H3ReadStream, H3WriteStream},
     },
 };
@@ -27,46 +30,34 @@ pub type Request<B = Bytes> = crate::common::request::Request<Write, B>;
 /// Incoming response selected by the peer's body framing.
 pub type Response = crate::common::Response<Read>;
 
-/// Prepare independent upload and response futures. Neither runs until polled.
-/// The response future carries the request method (including HEAD/CONNECT semantics).
-/// Dropping either future releases its transport direction; uploads are never detached.
-/// Body producers use reset explicitly to cancel or finish to signal EOF.
-pub fn write_bytes_request<RS, WS, T: Transport>(
+/// Start a buffered request upload and return its response future.
+/// The upload task continues independently if the response arrives early or this
+/// future is dropped. Upload failures cancel the write direction.
+pub fn write_bytes_request<RS, WS>(
     request: Request<Bytes>,
     ws: H3WriteStream<WS>,
     rs: H3ReadStream<RS>,
-    // qpack
-    connection: H3Connection<T>,
-) -> Result<(
-    // IntoFuture, 只返回一个
-    // content-length 写完再返回
-    impl Future<Output = Result<()>> + Send,
-    impl Future<Output = Result<Response>> + Send,
-)>
+    qpack: Arc<Qpack>,
+) -> Result<impl IntoFuture<Output = Result<Response>, IntoFuture: Send> + Send>
 where
     RS: AsyncRead + Unpin + Send + 'static,
     WS: AsyncWrite + Unpin + Send + 'static,
 {
     use crate::ReadRequest;
     let method = request.method();
-    Ok((
-        send_bytes_request(&request, ws, connection.clone())?,
-        read_response(rs, connection, Some(method)),
-    ))
+    tokio::spawn(send_bytes_request(&request, ws, &qpack)?);
+    Ok(read_response(rs, qpack, Some(method)))
 }
 
-/// Prepare a streaming upload and independent response future.
-/// Retain a producer (request clone or body handle) until finish/reset. Poll the
-/// upload concurrently with production and response reception to avoid backpressure deadlocks.
-pub fn write_streaming_request<RS, WS, T: Transport>(
+/// Start a streaming request upload and return its response future.
+/// Retain a producer (request clone or body handle) until finish/reset. The upload
+/// task drains body data independently of response reception.
+pub fn write_streaming_request<RS, WS>(
     request: Request<ArcWndBuf>,
     ws: H3WriteStream<WS>,
     rs: H3ReadStream<RS>,
-    connection: H3Connection<T>,
-) -> Result<(
-    impl Future<Output = Result<()>> + Send,
-    impl Future<Output = Result<Response>> + Send,
-)>
+    qpack: Arc<Qpack>,
+) -> Result<impl IntoFuture<Output = Result<Response>, IntoFuture: Send> + Send>
 where
     RS: AsyncRead + Unpin + Send + 'static,
     WS: AsyncWrite + Unpin + Send + 'static,
@@ -74,17 +65,16 @@ where
     use crate::ReadRequest;
     let method = request.method();
 
-    Ok((
-        send_streaming_request(&request, ws, connection.clone())?,
-        read_response(rs, connection, Some(method)),
-    ))
+    let sending = send_streaming_request(&request, ws, &qpack)?;
+    tokio::spawn(sending);
+    Ok(read_response(rs, qpack, Some(method)))
 }
 
-fn send_bytes_request<WS, T: Transport>(
+fn send_bytes_request<WS>(
     req: &Request<Bytes>,
     mut ws: H3WriteStream<WS>,
-    connection: H3Connection<T>,
-) -> Result<impl Future<Output = Result<()>> + Send + use<WS, T>>
+    qpack: &Qpack,
+) -> Result<impl Future<Output = Result<()>> + Send + use<WS>>
 where
     WS: AsyncWrite + Unpin + Send + 'static,
 {
@@ -100,7 +90,7 @@ where
         (fields, body)
     };
     let headers = Frame::new(Headers {
-        field_section: connection.qpack().encode(ws.stream_id(), fields)?,
+        field_section: qpack.encode(ws.stream_id(), fields)?,
     })?;
     Ok(async move {
         let result = async {
@@ -125,11 +115,11 @@ where
     })
 }
 
-fn send_streaming_request<WS, T: Transport>(
+fn send_streaming_request<WS>(
     req: &Request<ArcWndBuf>,
     mut ws: H3WriteStream<WS>,
-    connection: H3Connection<T>,
-) -> Result<impl Future<Output = Result<()>> + Send + use<WS, T>>
+    qpack: &Qpack,
+) -> Result<impl Future<Output = Result<()>> + Send + use<WS>>
 where
     WS: AsyncWrite + Unpin + Send + 'static,
 {
@@ -147,7 +137,7 @@ where
             None => BodyMode::Infinity,
         };
         let headers = Frame::new(Headers {
-            field_section: connection.qpack().encode(ws.stream_id(), fields)?,
+            field_section: qpack.encode(ws.stream_id(), fields)?,
         })?;
         Ok::<_, ErrorCode>((headers, mode))
     })()
@@ -177,9 +167,9 @@ where
 }
 
 /// Reads ordinary responses; HEAD and CONNECT semantics require request-method input.
-async fn read_response<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
+async fn read_response<RS: AsyncRead + Unpin + Send + 'static>(
     rs: H3ReadStream<RS>,
-    connection: H3Connection<T>,
+    qpack: Arc<Qpack>,
     method: Option<http::Method>,
 ) -> Result<crate::common::Response<Read>> {
     let stream_id = rs.stream_id();
@@ -194,10 +184,7 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
                 }
                 _ => return Err(ErrorCode::H3_FRAME_UNEXPECTED),
             };
-            let fields = connection
-                .qpack()
-                .decode(stream_id, frame.payload.field_section)
-                .await?;
+            let fields = qpack.decode(stream_id, frame.payload.field_section).await?;
             let head = headers::be_response(fields)?;
             let status = head.status()?;
             let length = headers::content_length(&head.headers)?;
@@ -224,12 +211,11 @@ async fn read_response<RS: AsyncRead + Unpin + Send + 'static, T: Transport>(
     let (head, mode) = match result {
         Ok(value) => value,
         Err(error) => {
-            let _ = connection.qpack().cancel(stream_id);
-            connection.receive_error(error).await;
+            let _ = qpack.cancel(stream_id);
             return Err(error);
         }
     };
-    let body = body::receive(rs, mode, connection);
+    let body = body::receive(rs, mode, qpack);
     Ok(common::Response::Streaming(
         ArcMessage::from(Message::from_parts(head, body)).into(),
     ))

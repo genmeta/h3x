@@ -288,7 +288,7 @@ mod tests {
                 oversized,
                 H3WriteStream::new(0, test_support::Writer),
                 H3ReadStream::new(0, test_support::Reader),
-                connection.clone()
+                connection.qpack().clone()
             ),
             Err(ErrorCode::H3_EXCESSIVE_LOAD)
         ));
@@ -305,7 +305,7 @@ mod tests {
                 request,
                 H3WriteStream::new(4, test_support::Writer),
                 H3ReadStream::new(4, test_support::Reader),
-                connection.clone()
+                connection.qpack().clone()
             )
             .is_ok()
         );

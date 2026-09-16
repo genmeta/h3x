@@ -80,33 +80,21 @@ async fn ordinary_headers_round_trip() {
                 async {
                     let recv = H3ReadStream::new(0, client_recv);
                     let send = H3WriteStream::new(0, client_send);
-                    let qpack = connection.clone();
+                    let qpack = connection.qpack().clone();
                     if buffered {
                         let request = request_headers(
                             client::Request::post("https://example.com/headers").unwrap(),
                         )
                         .header(header::CONTENT_LENGTH, HeaderValue::from_static("5"))
                         .body(Bytes::from_static(b"hello"));
-                        {
-                            let (sending, receiving) =
-                                client::write_bytes_request(request, send, recv, qpack)?;
-                            let (sent, received) = tokio::join!(sending, receiving);
-                            sent?;
-                            received
-                        }
+                        client::write_bytes_request(request, send, recv, qpack)?.await
                     } else {
                         let mut request = request_headers(
                             client::Request::streaming_post("https://example.com/headers").unwrap(),
                         );
                         request.write(b"hello").await?;
                         request.finish().await?;
-                        {
-                            let (sending, receiving) =
-                                client::write_streaming_request(request, send, recv, qpack)?;
-                            let (sent, received) = tokio::join!(sending, receiving);
-                            sent?;
-                            received
-                        }
+                        client::write_streaming_request(request, send, recv, qpack)?.await
                     }
                 },
                 async {

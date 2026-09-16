@@ -8,8 +8,8 @@ use std::{
 
 use bytes::Bytes;
 use h3x::{
-    Body, ErrorCode, H3ReadStream, H3WriteStream, ReadRequest, ReadResponse, W, WndBuf, WriteRequest,
-    WriteResponse, client, server,
+    Body, ErrorCode, H3ReadStream, H3WriteStream, ReadRequest, ReadResponse, W, WndBuf,
+    WriteRequest, WriteResponse, client, server,
 };
 use http::{Method, StatusCode, header};
 use tokio::{
@@ -27,16 +27,15 @@ async fn directional_bodies_echo_with_backpressure() {
         let request = client::Request::post("https://example.com/echo")
             .unwrap()
             .with_body(upload.clone());
-        let (sending, receiving) = client::write_streaming_request(
+        let receiving = client::write_streaming_request(
             request,
             H3WriteStream::new(0, cs),
             H3ReadStream::new(0, cr),
-            connection.clone(),
+            connection.qpack().clone(),
         )
         .unwrap();
         let payload = vec![b'x'; 128 * 1024];
-        let (sent, received, produced, served) = tokio::join!(
-            sending,
+        let (received, produced, served) = tokio::join!(
             async { receiving.await?.into_body().collect().await },
             async {
                 upload.write_all(&payload).await?;
@@ -73,8 +72,8 @@ async fn directional_bodies_echo_with_backpressure() {
             }
         );
         assert!(
-            sent.is_ok() && produced.is_ok() && served.is_ok(),
-            "send={sent:?}, produce={produced:?}, serve={served:?}, receive={received:?}"
+            produced.is_ok() && served.is_ok(),
+            "produce={produced:?}, serve={served:?}, receive={received:?}"
         );
         assert_eq!(received.unwrap(), payload);
     })
@@ -83,7 +82,7 @@ async fn directional_bodies_echo_with_backpressure() {
 }
 
 #[tokio::test]
-async fn response_does_not_need_upload_to_finish_or_even_start() {
+async fn response_does_not_wait_for_upload_to_finish() {
     let connection = support::connection();
     let mut encoded = Vec::new();
     let mut response = server::Response::default();
@@ -103,11 +102,11 @@ async fn response_does_not_need_upload_to_finish_or_even_start() {
     let request = client::Request::head("https://example.com/")
         .unwrap()
         .with_body(Body::<Bytes, W>::new(Bytes::new()));
-    let (sending, receiving) = client::write_bytes_request(
+    let receiving = client::write_bytes_request(
         request,
         H3WriteStream::new(0, send),
         H3ReadStream::new(0, std::io::Cursor::new(encoded)),
-        connection.clone(),
+        connection.qpack().clone(),
     )
     .unwrap();
     let response = timeout(Duration::from_secs(1), receiving)
@@ -116,17 +115,15 @@ async fn response_does_not_need_upload_to_finish_or_even_start() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.into_body().collect().await.unwrap().is_empty());
-    // The caller still owns the unpolled upload; response delivery spawned nothing.
+    // Upload starts in the background and may remain backpressured after delivery.
     let mut bytes = [0];
-    let mut reading = Box::pin(peer.read(&mut bytes));
-    assert!(
-        reading
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending()
+    assert_eq!(
+        timeout(Duration::from_secs(1), peer.read(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap(),
+        1
     );
-    drop(sending);
-    assert_eq!(reading.await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -137,17 +134,16 @@ async fn dropping_response_future_preserves_upload() {
         .unwrap()
         .with_body(producer.clone());
     let (send, mut peer) = duplex(1);
-    let (sending, receiving) = client::write_streaming_request(
+    let receiving = client::write_streaming_request(
         request,
         H3WriteStream::new(0, send),
         H3ReadStream::new(0, tokio::io::empty()),
-        connection.clone(),
+        connection.qpack().clone(),
     )
     .unwrap();
     drop(receiving);
     timeout(Duration::from_secs(2), async {
-        let (sent, produced, received) = tokio::join!(
-            sending,
+        let (produced, received) = tokio::join!(
             async {
                 producer.write_all(b"hello").await?;
                 producer.finish().await
@@ -158,7 +154,6 @@ async fn dropping_response_future_preserves_upload() {
                 bytes
             }
         );
-        sent.unwrap();
         produced.unwrap();
         assert!(!received.is_empty());
     })
@@ -173,11 +168,11 @@ async fn explicit_reset_wakes_producer_after_upload_is_dropped() {
     let request = client::Request::post("https://example.com/")
         .unwrap()
         .with_body(producer.clone());
-    let (sending, receiving) = client::write_streaming_request(
+    let receiving = client::write_streaming_request(
         request,
         H3WriteStream::new(0, tokio::io::sink()),
         H3ReadStream::new(0, tokio::io::empty()),
-        connection.clone(),
+        connection.qpack().clone(),
     )
     .unwrap();
     producer.write_all(b"x").await.unwrap();
@@ -189,7 +184,7 @@ async fn explicit_reset_wakes_producer_after_upload_is_dropped() {
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending()
     );
-    drop(sending);
+    drop(receiving);
     assert!(
         blocked
             .as_mut()
@@ -201,5 +196,4 @@ async fn explicit_reset_wakes_producer_after_upload_is_dropped() {
         timeout(Duration::from_secs(1), blocked).await.unwrap(),
         Err(ErrorCode::H3_REQUEST_CANCELLED)
     );
-    drop(receiving);
 }

@@ -299,7 +299,7 @@ mod tests {
                         request,
                         H3WriteStream::new(0, tokio::io::sink()),
                         H3ReadStream::new(0, tokio::io::empty()),
-                        crate::test_support::connection(),
+                        crate::test_support::connection().qpack().clone(),
                     );
                     assert!(matches!(result, Err(actual) if actual == error));
                 }

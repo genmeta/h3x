@@ -1,9 +1,10 @@
 use super::*;
 
 async fn read_response<R: AsyncRead + Unpin + Send + 'static>(recv: R) -> Result<Response> {
+    let connection = crate::test_support::connection();
     super::read_response(
         H3ReadStream::new(0, recv),
-        crate::test_support::connection(),
+        connection.qpack().clone(),
         None,
     )
     .await
