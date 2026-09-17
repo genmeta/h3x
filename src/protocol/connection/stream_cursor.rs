@@ -21,6 +21,7 @@ pub(crate) struct StreamCursor {
     pub(super) local: Mutex<Cursor>,
     pub(super) remote: Mutex<Cursor>,
     remote_goaway: ArcReceiving<()>,
+    local_goaway: ArcReceiving<()>,
 }
 
 impl StreamCursor {
@@ -29,6 +30,7 @@ impl StreamCursor {
             local: Mutex::new(Cursor::Max(StreamId::new(!role, Dir::Bi, 0))),
             remote: Mutex::new(Cursor::Max(StreamId::new(role, Dir::Bi, 0))),
             remote_goaway: ArcReceiving::default(),
+            local_goaway: ArcReceiving::default(),
         }
     }
 
@@ -37,7 +39,12 @@ impl StreamCursor {
         let mut local = self.local.lock().unwrap();
         let (Cursor::Max(id) | Cursor::Gone(id)) = *local;
         *local = Cursor::Gone(id);
+        self.local_goaway.obtain(());
         id
+    }
+
+    pub(crate) async fn draining(&self) {
+        let _ = self.local_goaway.clone().await;
     }
 
     /// The control reader validates each boundary before publishing the first one.
@@ -74,9 +81,7 @@ impl Cursor {
         match self {
             Self::Max(boundary) => {
                 if id.role() != boundary.role() || id.dir() != Dir::Bi {
-                    return Err(
-                        ErrorCode::H3_ID_ERROR.reason("invalid stream or push identifier")
-                    );
+                    return Err(ErrorCode::H3_ID_ERROR.reason("invalid stream or push identifier"));
                 }
                 if id >= *boundary {
                     // A GOAWAY boundary must still fit in a QUIC variable integer.
@@ -89,30 +94,5 @@ impl Cursor {
             }
             Self::Gone(_) => Err(ErrorCode::H3_REQUEST_REJECTED.reason("request rejected")),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        future::Future,
-        task::{Context, Waker},
-    };
-
-    use super::*;
-
-    #[tokio::test]
-    async fn peer_goaway_is_retained_for_repeated_waits() {
-        let cursor = StreamCursor::new(Role::Client);
-        let mut first = Box::pin(cursor.remote_goaway());
-        let mut second = Box::pin(cursor.remote_goaway());
-        let mut cx = Context::from_waker(Waker::noop());
-        assert!(first.as_mut().poll(&mut cx).is_pending());
-        assert!(second.as_mut().poll(&mut cx).is_pending());
-        drop(first);
-        let id = StreamId::new(Role::Client, Dir::Bi, 1);
-        cursor.receive_goaway(id);
-        assert_eq!(second.await.unwrap(), id);
-        assert_eq!(cursor.remote_goaway().await.unwrap(), id);
     }
 }

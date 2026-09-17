@@ -6,22 +6,28 @@ use std::{
 };
 
 use qrecovery::send::CancelStream;
-use tokio::io::AsyncWrite;
+use tokio::{io::AsyncWrite, sync::Notify};
 
-use super::{StreamState, StreamStatus};
+use super::{Goaway, H3Stream};
 use crate::ErrorCode;
 
 /// Application-owned write direction, observed weakly by the connection.
 pub struct H3WriteStream<W: CancelStream> {
     id: u64,
-    pub(super) state: Arc<Mutex<StreamState<W>>>,
+    pub(super) state: Arc<Mutex<Result<H3Stream<W>, Goaway>>>,
+    finished: Arc<Notify>,
 }
 
 impl<W: CancelStream> H3WriteStream<W> {
     pub fn new(stream_id: u64, stream: W) -> Self {
+        Self::new_observed(stream_id, stream, Arc::default())
+    }
+
+    pub(super) fn new_observed(stream_id: u64, stream: W, finished: Arc<Notify>) -> Self {
         Self {
             id: stream_id,
-            state: Arc::new(Mutex::new(StreamState::new(stream))),
+            state: Arc::new(Mutex::new(Ok(H3Stream::new(stream)))),
+            finished,
         }
     }
 
@@ -32,12 +38,16 @@ impl<W: CancelStream> H3WriteStream<W> {
 
 impl<W: CancelStream> CancelStream for &H3WriteStream<W> {
     fn cancel(&mut self, error_code: u64) {
-        let wakers = self.state.lock().unwrap().close(
-            ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled"),
-            |io| io.cancel(error_code),
-        );
-        for waker in wakers.into_iter().flatten() {
+        let mut state = self.state.lock().unwrap();
+        let was_finished = super::is_finished(&state);
+        let waker = super::terminate(&mut state, |io| io.cancel(error_code));
+        let finished = !was_finished && super::is_finished(&state);
+        drop(state);
+        if let Some(waker) = waker {
             waker.wake();
+        }
+        if finished {
+            self.finished.notify_waiters();
         }
     }
 }
@@ -50,18 +60,15 @@ impl<W: AsyncWrite + CancelStream + Unpin> H3WriteStream<W> {
         poll: impl FnOnce(Pin<&mut W>, &mut Context<'_>) -> Poll<io::Result<O>>,
     ) -> Poll<io::Result<O>> {
         let mut inner = self.state.lock().unwrap();
-        let result = inner.poll_io(cx, poll);
+        let was_finished = super::is_finished(&inner);
+        let result = super::poll_io(&mut *inner, cx, poll);
         if finish && matches!(result, Poll::Ready(Ok(_))) {
-            inner.status = StreamStatus::Finished;
+            super::finish(&mut *inner);
         }
-        let waker = if inner.is_finished() {
-            inner.finished_waker.take()
-        } else {
-            None
-        };
+        let finished = !was_finished && super::is_finished(&inner);
         drop(inner);
-        if let Some(waker) = waker {
-            waker.wake();
+        if finished {
+            self.finished.notify_waiters();
         }
         result
     }
@@ -78,17 +85,11 @@ impl<W: AsyncWrite + CancelStream + Unpin> AsyncWrite for H3WriteStream<W> {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if matches!(self.state.lock().unwrap().status, StreamStatus::Finished) {
-            return Poll::Ready(Ok(()));
-        }
         self.get_mut()
             .poll_io(cx, false, |send, cx| send.poll_flush(cx))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if matches!(self.state.lock().unwrap().status, StreamStatus::Finished) {
-            return Poll::Ready(Ok(()));
-        }
         self.get_mut()
             .poll_io(cx, true, |send, cx| send.poll_shutdown(cx))
     }
@@ -102,157 +103,171 @@ impl<W: CancelStream> Drop for H3WriteStream<W> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-        task::{Wake, Waker},
-    };
+    use bytes::Bytes;
+    use tokio::io::AsyncWriteExt;
 
     use super::*;
-    use crate::ErrorCode;
+    use crate::{
+        ArcQpack, Settings,
+        common::{request::WriteRequest as _, response::WriteResponse as _},
+    };
+
     #[derive(Default)]
-    struct Wakes(AtomicUsize);
+    struct Output(Vec<u8>);
 
-    impl Wake for Wakes {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
+    impl CancelStream for Output {
+        fn cancel(&mut self, _: u64) {}
     }
 
-    #[test]
-    fn rejection_wakes_pending_read_and_cancellation_errors_all_write_operations() {
-        let wakes = Arc::new(Wakes::default());
-        let waker = Waker::from(wakes.clone());
-        let mut cx = Context::from_waker(&waker);
-        let (recv, _peer) = tokio::io::duplex(1);
-        let mut recv = crate::test_support::read_stream(4, recv);
-        let mut bytes = [0];
-        let mut buf = tokio::io::ReadBuf::new(&mut bytes);
-        use tokio::io::AsyncRead;
-        assert!(
-            Pin::new(&mut recv)
-                .poll_read(&mut cx, &mut buf)
-                .is_pending()
-        );
-        recv.close(ErrorCode::H3_REQUEST_REJECTED.reason("test rejects the active request"));
-        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
-        let Poll::Ready(Err(error)) = Pin::new(&mut recv).poll_read(&mut cx, &mut buf) else {
-            panic!("closed receive stream must fail");
-        };
-        assert_eq!(ErrorCode::from(error), ErrorCode::H3_REQUEST_REJECTED);
-        let mut send = crate::test_support::write_stream(4, tokio::io::sink());
-        (&send).cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64());
-        for result in [
-            Pin::new(&mut send).poll_write(&mut cx, b"x").map_ok(|_| ()),
-            Pin::new(&mut send).poll_flush(&mut cx),
-            Pin::new(&mut send).poll_shutdown(&mut cx),
-        ] {
-            let Poll::Ready(Err(error)) = result else {
-                panic!("closed send stream must fail");
-            };
-            assert_eq!(ErrorCode::from(error), ErrorCode::H3_REQUEST_CANCELLED);
-        }
-    }
-
-    struct PendingWriter;
-
-    impl AsyncWrite for PendingWriter {
+    impl AsyncWrite for Output {
         fn poll_write(
-            self: Pin<&mut Self>,
+            mut self: Pin<&mut Self>,
             _: &mut Context<'_>,
-            _: &[u8],
+            buf: &[u8],
         ) -> Poll<io::Result<usize>> {
-            Poll::Pending
+            self.0.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
         }
 
         fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Pending
+            Poll::Ready(Ok(()))
         }
 
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Pending
+            Poll::Ready(Ok(()))
         }
     }
 
-    #[test]
-    fn pending_write_flush_and_shutdown_wake_the_latest_waiter() {
-        for operation in 0..3 {
-            let old = Arc::new(Wakes::default());
-            let latest = Arc::new(Wakes::default());
-            let mut send = crate::test_support::write_stream(4, PendingWriter);
-            let poll =
-                |send: &mut H3WriteStream<crate::test_support::TestStream<PendingWriter>>,
-                 cx: &mut Context<'_>| match operation {
-                    0 => Pin::new(send).poll_write(cx, b"x").map_ok(|_| ()),
-                    1 => Pin::new(send).poll_flush(cx),
-                    _ => Pin::new(send).poll_shutdown(cx),
-                };
-            for wakes in [&old, &latest] {
-                assert!(
-                    poll(
-                        &mut send,
-                        &mut Context::from_waker(&Waker::from(wakes.clone()))
-                    )
-                    .is_pending()
-                );
-            }
-            (&send).cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64());
-            assert_eq!(old.0.load(Ordering::SeqCst), 0);
-            assert_eq!(latest.0.load(Ordering::SeqCst), 1);
-            let Poll::Ready(Err(error)) = poll(&mut send, &mut Context::from_waker(Waker::noop()))
-            else {
-                panic!()
-            };
-            assert_eq!(ErrorCode::from(error), ErrorCode::H3_REQUEST_CANCELLED);
+    fn qpack() -> ArcQpack {
+        ArcQpack::new(&Settings::new(65536, 0, 0).unwrap()).unwrap()
+    }
+
+    fn bytes(ws: &H3WriteStream<Output>) -> Vec<u8> {
+        match ws.state.lock().unwrap().as_ref().unwrap() {
+            H3Stream::Idle(io) | H3Stream::Finished(io) | H3Stream::Polling(io, _) => io.0.clone(),
+            H3Stream::Transition => unreachable!(),
         }
     }
 
     #[tokio::test]
-    async fn stream_state_returns_to_idle_after_ready_io() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut recv = crate::test_support::read_stream(4, std::io::Cursor::new(vec![7]));
-        recv.state.lock().unwrap().status = StreamStatus::Polling(
-            crate::test_support::TestStream::new(std::io::Cursor::new(vec![7])),
-            Waker::noop().clone(),
-        );
-        let mut bytes = [0];
-        recv.read_exact(&mut bytes).await.unwrap();
-        assert_eq!(bytes, [7]);
-        assert!(matches!(
-            recv.state.lock().unwrap().status,
-            StreamStatus::Idle(_)
-        ));
-        recv.close(ErrorCode::H3_REQUEST_REJECTED.reason("test rejects the active request"));
-        assert!(matches!(
-            recv.state.lock().unwrap().status,
-            StreamStatus::Closed(ref error) if error.get_ref()
-                .and_then(|error| error.downcast_ref::<crate::Error>())
-                .is_some_and(|error| error.code == ErrorCode::H3_REQUEST_REJECTED)
-        ));
-        assert_eq!(recv.stream_id(), 4);
-        let mut send = crate::test_support::write_stream(4, Vec::new());
-        send.state.lock().unwrap().status = StreamStatus::Polling(
-            crate::test_support::TestStream::new(Vec::new()),
-            Waker::noop().clone(),
-        );
-        send.write_all(b"x").await.unwrap();
-        assert!(matches!(
-            send.state.lock().unwrap().status,
-            StreamStatus::Idle(_)
-        ));
-        send.flush().await.unwrap();
-        send.shutdown().await.unwrap();
-        assert!(matches!(
-            send.state.lock().unwrap().status,
-            StreamStatus::Finished
-        ));
-        (&send).cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64());
-        assert!(matches!(
-            send.state.lock().unwrap().status,
-            StreamStatus::Finished
-        ));
-        assert_eq!(send.stream_id(), 4);
+    async fn streaming_http_and_connect_share_body_completion() {
+        for (method, uri) in [
+            (http::Method::POST, "https://example.com/"),
+            (http::Method::CONNECT, "example.com:443"),
+        ] {
+            let mut producer = crate::ArcWndBuf::new(1024);
+            producer.write_all(b"abc").await.unwrap();
+            producer.shutdown().await.unwrap();
+            let request = http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(producer)
+                .unwrap()
+                .into();
+            let mut ws = H3WriteStream::new(0, Output::default());
+            let mode = ws.write_request_head(&request, &qpack()).await.unwrap();
+            ws.flush().await.unwrap();
+            let head = bytes(&ws);
+            ws.write_request_streaming_body(&request, mode)
+                .await
+                .unwrap();
+            let output = bytes(&ws);
+            assert_eq!(&output[..head.len()], head.as_slice());
+            assert_eq!(&output[head.len()..], b"\x00\x03abc");
+            assert!(matches!(
+                ws.state.lock().unwrap().as_ref().unwrap(),
+                H3Stream::Finished(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn unified_headers_support_streaming_connect() {
+        let request = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("example.com:443")
+            .body(crate::ArcWndBuf::new(1024))
+            .unwrap()
+            .into();
+        let mut ws = H3WriteStream::new(0, Output::default());
+        let mode = ws.write_request_head(&request, &qpack()).await.unwrap();
+        assert_eq!(mode, crate::common::body::ContentType::Connect);
+        assert!(!bytes(&ws).is_empty());
+
+        let response = http::Response::builder()
+            .status(200)
+            .body(crate::ArcWndBuf::new(1024))
+            .unwrap()
+            .into();
+        let mut ws = H3WriteStream::new(0, Output::default());
+        let mode = ws
+            .write_response_head(&response, &qpack(), &http::Method::CONNECT)
+            .await
+            .unwrap();
+        assert_eq!(mode, crate::common::body::ContentType::Connect);
+        assert!(!bytes(&ws).is_empty());
+    }
+
+    #[tokio::test]
+    async fn buffered_connect_still_writes_no_headers() {
+        let request = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("example.com:443")
+            .body(Bytes::new())
+            .unwrap()
+            .into();
+        let mut ws = H3WriteStream::new(0, Output::default());
+        let error = ws.write_request_head(&request, &qpack()).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
+        assert!(bytes(&ws).is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_buffered_request_writes_no_headers() {
+        let request = http::Request::builder()
+            .uri("https://example.com/")
+            .header("content-length", "4")
+            .body(Bytes::from_static(b"abc"))
+            .unwrap()
+            .into();
+        let mut ws = H3WriteStream::new(0, Output::default());
+        let error = ws.write_request_head(&request, &qpack()).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
+        assert!(bytes(&ws).is_empty());
+    }
+
+    #[tokio::test]
+    async fn forbidden_response_body_writes_no_headers() {
+        let response = http::Response::builder()
+            .status(204)
+            .body(Bytes::from_static(b"abc"))
+            .unwrap()
+            .into();
+        let mut ws = H3WriteStream::new(0, Output::default());
+        let error = ws
+            .write_response_head(&response, &qpack(), &http::Method::GET)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
+        assert!(bytes(&ws).is_empty());
+    }
+
+    #[tokio::test]
+    async fn buffered_request_sends_headers_then_data() {
+        let request = http::Request::builder()
+            .uri("https://example.com/")
+            .header("content-length", "3")
+            .body(Bytes::from_static(b"abc"))
+            .unwrap()
+            .into();
+        let mut ws = H3WriteStream::new(0, Output::default());
+        ws.write_request_head(&request, &qpack()).await.unwrap();
+        let head = bytes(&ws);
+        assert_eq!(head[0], 1); // HEADERS
+        ws.write_request_bytes_body(&request).await.unwrap();
+        ws.shutdown().await.unwrap();
+        let output = bytes(&ws);
+        assert_eq!(&output[..head.len()], head.as_slice());
+        assert_eq!(&output[head.len()..], b"\x00\x03abc"); // DATA
     }
 }

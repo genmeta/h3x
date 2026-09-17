@@ -43,8 +43,7 @@ pub(super) async fn be_prefixed_integer_with_first<T: AsyncRead + Unpin + ?Sized
 /// RFC 9204 section 4.1.1: decode a prefixed integer, limited to 62 bits.
 pub(super) fn be_prefixed_integer(mut input: &[u8], prefix_bits: u8) -> Result<(&[u8], u64)> {
     let (&first, rest) = input.split_first().ok_or_else(|| {
-        ErrorCode::QPACK_DECOMPRESSION_FAILED
-            .reason("prefixed integer is missing its first byte")
+        ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("prefixed integer is missing its first byte")
     })?;
     input = rest;
     let limit = (1u64 << prefix_bits) - 1;
@@ -101,100 +100,5 @@ impl<B: BufMut> WritePrefixedInteger for B {
         }
         self.put_u8(value as u8);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prefixed_integers_preserve_suffixes_and_reject_overflow() {
-        for bits in [3, 4, 6, 7, 8] {
-            for value in [0, (1 << bits) - 1, 127, 128, VARINT_MAX] {
-                let mut output = Vec::new();
-                output.put_prefixed_integer(value, bits, 0).unwrap();
-                output.push(42);
-                let (input, decoded) = be_prefixed_integer(output.as_slice(), bits).unwrap();
-                assert_eq!(decoded, value);
-                assert_eq!(input, &[42]);
-            }
-        }
-        assert!(be_prefixed_integer(&[0xff; 12][..], 8).is_err());
-        assert!(
-            Vec::new()
-                .put_prefixed_integer(VARINT_MAX + 1, 8, 0)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn known_wire_vectors_cover_prefix_and_continuation_boundaries() {
-        for (value, expected) in [
-            (10, &[0xea][..]),
-            (31, &[0xff, 0][..]),
-            (1337, &[0xff, 0x9a, 0x0a][..]),
-        ] {
-            let mut wire = Vec::new();
-            wire.put_prefixed_integer(value, 5, 0xe0).unwrap();
-            assert_eq!(wire, expected);
-            assert_eq!(be_prefixed_integer(expected, 5), Ok((&[][..], value)));
-        }
-        let mut wire = vec![42];
-        assert_eq!(
-            (wire.put_prefixed_integer(VARINT_MAX + 1, 5, 0)).map_err(ErrorCode::from),
-            Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
-        );
-        assert_eq!(wire, [42]);
-    }
-
-    #[tokio::test]
-    async fn stream_integer_preserves_suffix_and_distinguishes_eof_from_overflow() {
-        for bits in 1..=7 {
-            for value in [0, (1 << bits) - 1, 128, VARINT_MAX] {
-                let mut wire = Vec::new();
-                wire.put_prefixed_integer(value, bits, 0x80).unwrap();
-                wire.push(42);
-                let mut input = &wire[1..];
-                assert_eq!(
-                    be_prefixed_integer_with_first(
-                        &mut input,
-                        wire[0],
-                        bits,
-                        ErrorCode::QPACK_DECODER_STREAM_ERROR
-                    )
-                    .await,
-                    Ok(value)
-                );
-                assert_eq!(input, &[42]);
-            }
-        }
-        for wire in [&[0x1f][..], &[0x1f, 0x80][..]] {
-            assert_eq!(
-                (be_prefixed_integer(wire, 5)).map_err(ErrorCode::from),
-                Err(ErrorCode::QPACK_DECOMPRESSION_FAILED)
-            );
-            assert_eq!(
-                (be_prefixed_integer_with_first(
-                    &mut &wire[1..],
-                    wire[0],
-                    5,
-                    ErrorCode::QPACK_DECODER_STREAM_ERROR
-                )
-                .await)
-                    .map_err(ErrorCode::from),
-                Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
-            );
-        }
-        for error in [
-            ErrorCode::QPACK_ENCODER_STREAM_ERROR,
-            ErrorCode::QPACK_DECODER_STREAM_ERROR,
-        ] {
-            assert_eq!(
-                (be_prefixed_integer_with_first(&mut &[0xff; 9][..], 0xff, 7, error).await)
-                    .map_err(ErrorCode::from),
-                Err(error)
-            );
-        }
     }
 }

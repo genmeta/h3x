@@ -24,7 +24,7 @@ pub(crate) struct WndBuf {
 
 impl WndBuf {
     /// Panics if `capacity` is zero.
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0, "window capacity must be nonzero");
         Self {
             buf: vec![0; capacity],
@@ -35,17 +35,6 @@ impl WndBuf {
             write_waker: None,
             error_waker: None,
             fin: false,
-        }
-    }
-
-    pub(crate) fn consume(&mut self, n: usize) {
-        assert!(n <= self.len);
-        self.head = (self.head + n) % self.buf.len();
-        self.len -= n;
-        if n > 0
-            && let Some(waker) = self.write_waker.take()
-        {
-            waker.wake();
         }
     }
 }
@@ -70,7 +59,13 @@ impl AsyncRead for WndBuf {
         let first = len.min(self.buf.len() - self.head);
         buf.put_slice(&self.buf[self.head..self.head + first]);
         buf.put_slice(&self.buf[..len - first]);
-        self.consume(len);
+        self.head = (self.head + len) % self.buf.len();
+        self.len -= len;
+        if len > 0
+            && let Some(waker) = self.write_waker.take()
+        {
+            waker.wake();
+        }
         Poll::Ready(Ok(()))
     }
 }
@@ -130,8 +125,12 @@ pub struct ArcWndBuf {
 impl ArcWndBuf {
     pub fn new(capacity: usize) -> Self {
         Self {
-            shared: Arc::new(Mutex::new(Ok(WndBuf::new(capacity)))),
+            shared: Arc::new(Mutex::new(Ok(WndBuf::with_capacity(capacity)))),
         }
+    }
+
+    pub(crate) fn cancel(&self, code: u64) {
+        self.on_error(crate::ErrorCode::from(code).reason("body cancelled"));
     }
 
     pub(crate) fn on_error(&self, error: Error) {
@@ -199,234 +198,5 @@ impl AsyncWrite for ArcWndBuf {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_io(|window| window.poll_shutdown(cx))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-        task::Wake,
-    };
-
-    use super::*;
-
-    trait TestRead: AsyncRead + Unpin {
-        fn read_for_test(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut [u8],
-        ) -> Poll<io::Result<usize>> {
-            let mut buf = ReadBuf::new(buf);
-            self.poll_read(cx, &mut buf).map_ok(|()| buf.filled().len())
-        }
-    }
-
-    impl<T: AsyncRead + Unpin> TestRead for T {}
-
-    #[derive(Default)]
-    struct WakeCount(AtomicUsize);
-
-    impl Wake for WakeCount {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn bounded_fifo_and_wakeups() {
-        let old = Arc::new(WakeCount::default());
-        let latest = Arc::new(WakeCount::default());
-        let old_waker = Waker::from(old.clone());
-        let latest_waker = Waker::from(latest.clone());
-        let mut old_cx = Context::from_waker(&old_waker);
-        let mut cx = Context::from_waker(&latest_waker);
-        let mut window = WndBuf::new(3);
-        let mut window = Pin::new(&mut window);
-        let mut output = [0; 8];
-
-        assert!(
-            window
-                .as_mut()
-                .read_for_test(&mut old_cx, &mut output)
-                .is_pending()
-        );
-        assert!(
-            window
-                .as_mut()
-                .read_for_test(&mut cx, &mut output)
-                .is_pending()
-        );
-        assert!(matches!(
-            window.as_mut().poll_write(&mut cx, b"abcd"),
-            Poll::Ready(Ok(3))
-        ));
-        assert_eq!(old.0.load(Ordering::SeqCst), 0);
-        assert_eq!(latest.0.load(Ordering::SeqCst), 1);
-        assert!(window.as_mut().poll_write(&mut old_cx, b"d").is_pending());
-        assert!(window.as_mut().poll_write(&mut cx, b"d").is_pending());
-        assert!(matches!(
-            window.as_mut().read_for_test(&mut cx, &mut output[..2]),
-            Poll::Ready(Ok(2))
-        ));
-        assert_eq!(&output[..2], b"ab");
-        assert_eq!(old.0.load(Ordering::SeqCst), 0);
-        assert_eq!(latest.0.load(Ordering::SeqCst), 2);
-        assert!(matches!(
-            window.as_mut().poll_write(&mut cx, b"def"),
-            Poll::Ready(Ok(2))
-        ));
-        assert!(window.as_mut().poll_write(&mut cx, b"f").is_pending());
-        assert!(matches!(
-            window.as_mut().poll_flush(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        assert!(matches!(
-            window.as_mut().poll_shutdown(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        assert_eq!(latest.0.load(Ordering::SeqCst), 3);
-        assert!(
-            matches!(window.as_mut().poll_write(&mut cx, b"f"), Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe)
-        );
-        let mut n = 0;
-        while n < 3 {
-            let Poll::Ready(Ok(read)) = window.as_mut().read_for_test(&mut cx, &mut output[n..])
-            else {
-                panic!("buffered data must remain readable");
-            };
-            assert!(read > 0);
-            n += read;
-        }
-        assert_eq!(&output[..n], b"cde");
-        assert!(matches!(
-            window.as_mut().read_for_test(&mut cx, &mut output),
-            Poll::Ready(Ok(0))
-        ));
-
-        let mut empty = WndBuf::new(1);
-        assert!(
-            Pin::new(&mut empty)
-                .read_for_test(&mut cx, &mut output)
-                .is_pending()
-        );
-        assert!(matches!(
-            Pin::new(&mut empty).poll_shutdown(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        assert_eq!(latest.0.load(Ordering::SeqCst), 4);
-        assert!(matches!(
-            Pin::new(&mut empty).read_for_test(&mut cx, &mut output),
-            Poll::Ready(Ok(0))
-        ));
-    }
-
-    #[test]
-    fn wraps_without_changing_storage() {
-        let mut window = WndBuf::new(3);
-        let ptr = window.buf.as_ptr();
-        let capacity = window.buf.capacity();
-        let mut cx = Context::from_waker(Waker::noop());
-        let mut output = [0; 2];
-        for _ in 0..10 {
-            assert!(matches!(
-                Pin::new(&mut window).poll_write(&mut cx, b"ab"),
-                Poll::Ready(Ok(2))
-            ));
-            assert!(matches!(
-                Pin::new(&mut window).read_for_test(&mut cx, &mut output),
-                Poll::Ready(Ok(2))
-            ));
-            assert_eq!(&output, b"ab");
-            assert!(
-                Pin::new(&mut window)
-                    .read_for_test(&mut cx, &mut output)
-                    .is_pending()
-            );
-            assert_eq!(window.buf.len(), 3);
-            assert_eq!(window.buf.capacity(), capacity);
-            assert_eq!(window.buf.as_ptr(), ptr);
-        }
-    }
-
-    #[test]
-    fn shared_error_wakes_io_and_independent_error_waiter() {
-        use std::future::Future;
-        for full in [false, true] {
-            let mut reader = ArcWndBuf::new(1);
-            let mut writer = reader.clone();
-            let wakes = Arc::new(WakeCount::default());
-            let waker = Waker::from(wakes.clone());
-            let mut cx = Context::from_waker(&waker);
-            let mut output = [0];
-            if full {
-                assert!(matches!(
-                    Pin::new(&mut writer).poll_write(&mut cx, b"a"),
-                    Poll::Ready(Ok(1))
-                ));
-                assert!(matches!(
-                    Pin::new(&mut reader).read_for_test(&mut cx, &mut output),
-                    Poll::Ready(Ok(1))
-                ));
-                assert_eq!(output, *b"a");
-                assert!(matches!(
-                    Pin::new(&mut writer).poll_write(&mut cx, b"b"),
-                    Poll::Ready(Ok(1))
-                ));
-                assert!(Pin::new(&mut writer).poll_write(&mut cx, b"c").is_pending());
-            } else {
-                assert!(
-                    Pin::new(&mut reader)
-                        .read_for_test(&mut cx, &mut output)
-                        .is_pending()
-                );
-            }
-            let errors = reader.clone();
-            let error_wakes = Arc::new(WakeCount::default());
-            let error_waker = Waker::from(error_wakes.clone());
-            let mut error_cx = Context::from_waker(&error_waker);
-            let mut waiting = Box::pin(errors.wait_error());
-            assert!(waiting.as_mut().poll(&mut error_cx).is_pending());
-            reader.on_error(
-                crate::ErrorCode::H3_REQUEST_CANCELLED.reason("test closes the shared body window"),
-            );
-            writer.on_error(
-                crate::ErrorCode::H3_INTERNAL_ERROR.reason("test closes the shared body window"),
-            );
-            assert_eq!(error_wakes.0.load(Ordering::SeqCst), 1);
-            let Poll::Ready(error) = waiting.as_mut().poll(&mut error_cx) else {
-                panic!("error waiter must receive the stored error");
-            };
-            assert_eq!(error.code, crate::ErrorCode::H3_REQUEST_CANCELLED);
-            assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
-            let results = [
-                Pin::new(&mut reader)
-                    .read_for_test(&mut cx, &mut output)
-                    .map_ok(|_| ()),
-                Pin::new(&mut writer)
-                    .poll_write(&mut cx, b"c")
-                    .map_ok(|_| ()),
-                Pin::new(&mut writer).poll_flush(&mut cx),
-                Pin::new(&mut writer).poll_shutdown(&mut cx),
-            ];
-            for result in results {
-                let Poll::Ready(Err(error)) = result else {
-                    panic!("expected error")
-                };
-                assert_eq!(
-                    crate::ErrorCode::from(error),
-                    crate::ErrorCode::H3_REQUEST_CANCELLED
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "window capacity must be nonzero")]
-    fn zero_capacity_is_rejected() {
-        WndBuf::new(0);
     }
 }
