@@ -276,26 +276,6 @@ fn message_error<T: std::error::Error + Send + Sync + 'static>(error: T) -> Erro
     ErrorCode::H3_MESSAGE_ERROR.reason(format!("invalid HTTP field: {error}"))
 }
 
-pub(crate) trait WriteRequest {
-    fn put_request(&mut self, head: &RequestHead) -> Result<()>;
-}
-
-impl WriteRequest for Vec<Field> {
-    fn put_request(&mut self, head: &RequestHead) -> Result<()> {
-        head.encode(self)
-    }
-}
-
-pub(crate) trait WriteResponse {
-    fn put_response(&mut self, head: &ResponseHead) -> Result<()>;
-}
-
-impl WriteResponse for Vec<Field> {
-    fn put_response(&mut self, head: &ResponseHead) -> Result<()> {
-        head.encode(self)
-    }
-}
-
 fn validate_regular_field(name: &HeaderName, value: &HeaderValue) -> Result<()> {
     if matches!(name, &CONNECTION | &TRANSFER_ENCODING | &UPGRADE)
         || matches!(name.as_str(), "proxy-connection" | "keep-alive")

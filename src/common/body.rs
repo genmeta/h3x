@@ -251,7 +251,7 @@ impl Body<Write, ArcWndBuf> {
             if count == 0 {
                 return Ok(());
             }
-            write_data(&buf[..count], send).await?;
+            Body::<Write, _>::new(&buf[..count]).encode(send).await?;
             send.flush().await?;
         }
     }
@@ -287,8 +287,26 @@ pub(crate) enum ContentType {
 }
 
 impl ContentType {
+    /// Validate request metadata and resolve its body framing.
+    pub(crate) fn from_request(head: &head::RequestHead) -> Result<Self> {
+        let length = head.content_length()?;
+        Ok(if head.request_method() == Method::CONNECT {
+            if length.is_some() {
+                return Err(
+                    ErrorCode::H3_MESSAGE_ERROR.reason("CONNECT must not include Content-Length")
+                );
+            }
+            Self::Connect
+        } else {
+            match length {
+                Some(content_length) => Self::Length { content_length },
+                None => Self::Streaming,
+            }
+        })
+    }
+
     /// Validate an outgoing final response and resolve its body framing.
-    pub(crate) fn resolve(response: &ResponseHead, method: Option<&Method>) -> Result<Self> {
+    pub(crate) fn from_response(response: &ResponseHead, method: Option<&Method>) -> Result<Self> {
         let status = response.response_status()?;
         if status.is_informational() {
             return Err(ErrorCode::H3_MESSAGE_ERROR
@@ -312,8 +330,33 @@ impl ContentType {
         Ok(Self::from_parts(status, method, content_length))
     }
 
+    /// Resolve received response framing, including informational responses.
+    /// Successful CONNECT ignores Content-Length on reception.
+    pub(crate) fn from_received_response(
+        response: &ResponseHead,
+        method: Option<&Method>,
+    ) -> Result<Self> {
+        let status = response.response_status()?;
+        if status == StatusCode::SWITCHING_PROTOCOLS {
+            return Err(ErrorCode::H3_MESSAGE_ERROR.reason("status 101 is forbidden in HTTP/3"));
+        }
+        if method == Some(&Method::CONNECT) && status.is_success() {
+            return Ok(Self::Connect);
+        }
+        if (status.is_informational() || status == StatusCode::NO_CONTENT)
+            && response.headers.contains_key(http::header::CONTENT_LENGTH)
+        {
+            return Err(ErrorCode::H3_MESSAGE_ERROR
+                .reason("informational and 204 responses must not include Content-Length"));
+        }
+        if status.is_informational() {
+            return Ok(Self::NoContent);
+        }
+        Ok(Self::from_parts(status, method, response.content_length()?))
+    }
+
     /// Resolve ordinary body framing from already validated metadata.
-    pub(crate) fn from_parts(
+    fn from_parts(
         status: StatusCode,
         method: Option<&Method>,
         content_length: Option<u64>,
@@ -342,24 +385,20 @@ impl ContentType {
     }
 }
 
-/// Write a nonempty buffered body as one DATA frame, leaving shutdown to the caller.
-async fn write_data<W: AsyncWrite + Unpin>(body: &[u8], send: &mut W) -> Result<()> {
-    if body.is_empty() {
-        return Ok(());
-    }
-    let mut buf = Vec::new();
-    buf.put_frame(&Frame::new(Data(body.len()))?);
-    send.write_all(&buf).await?;
-    for chunk in body.chunks(frame::MAX_DATA_CHUNK) {
-        send.write_all(chunk).await?;
-    }
-    Ok(())
-}
-
-impl Body<Write, Bytes> {
-    /// Encode prepared bytes as DATA, leaving transport shutdown to the caller.
+impl<B: AsRef<[u8]>> Body<Write, B> {
+    /// Encode nonempty bytes as one DATA frame, leaving shutdown to the caller.
     pub(crate) async fn encode<W: AsyncWrite + Unpin>(&self, send: &mut W) -> Result<()> {
-        write_data(&self.storage, send).await
+        let body = self.storage.as_ref();
+        if body.is_empty() {
+            return Ok(());
+        }
+        let mut buf = Vec::new();
+        buf.put_frame(&Frame::new(Data(body.len()))?);
+        send.write_all(&buf).await?;
+        for chunk in body.chunks(frame::MAX_DATA_CHUNK) {
+            send.write_all(chunk).await?;
+        }
+        Ok(())
     }
 }
 
@@ -388,5 +427,26 @@ impl CancelStream for &Body<Write, ArcWndBuf> {
 impl CancelStream for Body<Write, ArcWndBuf> {
     fn cancel(&mut self, error_code: u64) {
         (&*self).cancel(error_code);
+    }
+}
+
+impl Body<Write, Bytes> {
+    /// Validate buffered content before sending HEADERS.
+    pub(crate) fn validate(&self, mode: ContentType) -> Result<()> {
+        if mode == ContentType::Connect {
+            return Err(ErrorCode::H3_MESSAGE_ERROR.reason("CONNECT requires a streaming body"));
+        }
+        if mode.is_forbidden() && !self.storage.is_empty() {
+            return Err(ErrorCode::H3_MESSAGE_ERROR.reason("message semantics forbid a body"));
+        }
+        if mode
+            .content_length()
+            .is_some_and(|length| length != self.storage.len() as u64)
+        {
+            return Err(
+                ErrorCode::H3_MESSAGE_ERROR.reason("body length does not match Content-Length")
+            );
+        }
+        Ok(())
     }
 }

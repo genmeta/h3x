@@ -131,22 +131,20 @@ preserves metadata and returns a directional `Body` handle.
 
 `write_bytes_request` accepts an existing Bytes body; `write_streaming_request`
 accepts a WndBuf body. Both take `(request, write_stream, read_stream, qpack)`,
-start the upload in an internal task, and return an
-`Future<Output = Result<Response>>`.
-Outgoing operations snapshot metadata and perform local validation when called.
-The request writers report validation errors in their outer `Result`; `connect`
-and response writers return them when their futures are awaited. Invalid streaming
-metadata also wakes retained producers immediately. Response writers and CONNECT
-handshakes start network I/O when polled; ordinary request uploads start in a task.
-The response future carries the request method automatically, including HEAD
-semantics. CONNECT requires `client::connect`, with handshake behavior
-described below. Ordinary uploads continue independently after an early response or after
+and return a `Result<impl Future<Output = Result<Response>>>`. Ordinary uploads
+start in an internal task; CONNECT starts when the response future is polled.
+Ordinary request uploads validate metadata in their upload task before sending
+HEADERS. Response writers and CONNECT handshakes validate when polled.
+Invalid streaming metadata wakes retained producers. The response future carries
+the request method automatically, including HEAD semantics.
+`write_streaming_request` handles CONNECT internally as described below. Ordinary uploads continue independently after an early response or after
 the response future is dropped. Use the body producer's `finish()` or `cancel(code)` to
 terminate a streaming upload.
-Upload failures cancel the write direction and notify streaming body producers;
+Ordinary upload failures cancel the write direction and notify streaming body producers;
 they do not fail the response future. Response reception continues independently,
 so callers should apply a timeout or cancel the response future when appropriate.
-Receiving a response does not abort upload.
+Receiving an ordinary response does not abort upload. CONNECT handshake failures
+notify the producer and fail the response future.
 
 Server entry points are `read_request(rs, qpack)`,
 `write_bytes_response(response, ws, qpack, &method)`, and
@@ -232,22 +230,17 @@ After acceptance, background tasks send and receive DATA through the same bounde
 buffers used for ordinary streaming HTTP. Extended CONNECT assumes peer support
 without waiting for peer SETTINGS. Dropping a pending handshake cancels both stream
 directions; explicitly cancel the retained body when abandoning the handshake.
-Rejection cancels production while
-preserving the response's status, headers, and body. `client::connect`
-returns the response on success and
-`ConnectError::Rejected(response)` for non-2xx responses.
+Rejection cancels production and returns the HTTP response, including its status,
+headers, and body.
 
 The server uses `read_request` for both ordinary HTTP and CONNECT, then branches
-on `request.method()`. For CONNECT, call `server::accept_connect` after routing,
-authorization, and any upstream handshake. It sends and flushes the streaming
-2xx response's HEADERS, starts sending body data in the background, and returns
-without waiting for the tunnel to end.
-
-`accept_connect` validates and snapshots response metadata when called. Validation
-and send failures cancel the write direction and wake the response producer;
-errors are returned by the future. The application controls reception independently:
-stop the request body when abandoning the exchange. Dropping a pending acceptance
-cancels sending; explicitly cancel the retained producer as well.
+on `request.method()`. After routing, authorization, and any upstream handshake,
+use `write_streaming_response` to send a 2xx response and tunnel data. It sends
+and flushes HEADERS before draining the body, and completes when sending ends.
+Drive this future concurrently with body production and request reception.
+Validation and send failures cancel the write direction, wake the producer, and
+are returned by the future. Stop the request body and cancel the retained producer
+when abandoning the exchange.
 
 `read_request_head` / `read_request_body` remain available for applications that
 need to defer body reception. To reject CONNECT, stop the request body and send a

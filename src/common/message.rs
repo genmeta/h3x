@@ -199,7 +199,7 @@ impl<H, B: Clone, IO> Message<H, Body<IO, B>> {
 }
 
 impl<H, IO> Message<H, Body<IO, crate::ArcWndBuf>> {
-    pub(crate) fn body_stream(&self) -> crate::ArcWndBuf {
+    pub(crate) fn body(&self) -> crate::ArcWndBuf {
         self.body.lock().unwrap().storage.clone()
     }
 }

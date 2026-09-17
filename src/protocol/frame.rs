@@ -134,7 +134,6 @@ impl GetFrameType for H3Frame {
 /// to Qpack::decode to resolve its fields.
 /// EOF (including a partial frame) is an error.
 /// Cancellation can consume a prefix; keep polling the same future.
-
 /// Return None at a frame boundary; a truncated type is a framing error.
 pub(crate) async fn be_frame_type<T: AsyncRead + Unpin + ?Sized>(
     reader: &mut T,
