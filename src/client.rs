@@ -126,7 +126,7 @@ where
         }
         .await;
         if let Err(error) = &result {
-            ws.cancel_with_error(error.clone());
+            (&ws).cancel(error.code.as_u64());
         }
         result
     })
@@ -173,7 +173,7 @@ where
         }
         .await;
         if let Err(error) = &result {
-            ws.cancel_with_error(error.clone());
+            (&ws).cancel(error.code.as_u64());
             body.on_error(error.clone());
         }
         result

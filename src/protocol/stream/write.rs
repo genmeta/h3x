@@ -9,7 +9,7 @@ use qrecovery::send::CancelStream;
 use tokio::io::AsyncWrite;
 
 use super::{StreamState, StreamStatus};
-use crate::{Error, ErrorCode};
+use crate::ErrorCode;
 
 /// Application-owned write direction, observed weakly by the connection.
 pub struct H3WriteStream<W: CancelStream> {
@@ -22,18 +22,6 @@ impl<W: CancelStream> H3WriteStream<W> {
         Self {
             id: stream_id,
             state: Arc::new(Mutex::new(StreamState::new(stream))),
-        }
-    }
-
-    pub(crate) fn cancel_with_error(&self, error: Error) {
-        let code = error.code.as_u64();
-        let wakers = self
-            .state
-            .lock()
-            .unwrap()
-            .close(error, |io| io.cancel(code));
-        for waker in wakers.into_iter().flatten() {
-            waker.wake();
         }
     }
 
@@ -51,12 +39,6 @@ impl<W: CancelStream> CancelStream for &H3WriteStream<W> {
         for waker in wakers.into_iter().flatten() {
             waker.wake();
         }
-    }
-}
-
-impl<W: CancelStream> CancelStream for H3WriteStream<W> {
-    fn cancel(&mut self, error_code: u64) {
-        qrecovery::send::CancelStream::cancel(&mut &*self, error_code);
     }
 }
 
@@ -114,7 +96,7 @@ impl<W: AsyncWrite + CancelStream + Unpin> AsyncWrite for H3WriteStream<W> {
 
 impl<W: CancelStream> Drop for H3WriteStream<W> {
     fn drop(&mut self) {
-        self.cancel_with_error(ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"));
+        (&*self).cancel(ErrorCode::H3_REQUEST_CANCELLED.as_u64());
     }
 }
 
@@ -140,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn goaway_wakes_pending_read_and_errors_all_write_operations() {
+    fn rejection_wakes_pending_read_and_cancellation_errors_all_write_operations() {
         let wakes = Arc::new(Wakes::default());
         let waker = Waker::from(wakes.clone());
         let mut cx = Context::from_waker(&waker);
@@ -161,9 +143,7 @@ mod tests {
         };
         assert_eq!(ErrorCode::from(error), ErrorCode::H3_REQUEST_REJECTED);
         let mut send = crate::test_support::write_stream(4, tokio::io::sink());
-        send.cancel_with_error(
-            ErrorCode::H3_REQUEST_REJECTED.with_reason("test rejects the active request"),
-        );
+        (&send).cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64());
         for result in [
             Pin::new(&mut send).poll_write(&mut cx, b"x").map_ok(|_| ()),
             Pin::new(&mut send).poll_flush(&mut cx),
@@ -172,7 +152,7 @@ mod tests {
             let Poll::Ready(Err(error)) = result else {
                 panic!("closed send stream must fail");
             };
-            assert_eq!(ErrorCode::from(error), ErrorCode::H3_REQUEST_REJECTED);
+            assert_eq!(ErrorCode::from(error), ErrorCode::H3_REQUEST_CANCELLED);
         }
     }
 
@@ -218,16 +198,14 @@ mod tests {
                     .is_pending()
                 );
             }
-            send.cancel_with_error(
-                ErrorCode::H3_REQUEST_REJECTED.with_reason("test rejects the active request"),
-            );
+            (&send).cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64());
             assert_eq!(old.0.load(Ordering::SeqCst), 0);
             assert_eq!(latest.0.load(Ordering::SeqCst), 1);
             let Poll::Ready(Err(error)) = poll(&mut send, &mut Context::from_waker(Waker::noop()))
             else {
                 panic!()
             };
-            assert_eq!(ErrorCode::from(error), ErrorCode::H3_REQUEST_REJECTED);
+            assert_eq!(ErrorCode::from(error), ErrorCode::H3_REQUEST_CANCELLED);
         }
     }
 
@@ -270,9 +248,7 @@ mod tests {
             send.state.lock().unwrap().status,
             StreamStatus::Finished
         ));
-        send.cancel_with_error(
-            ErrorCode::H3_REQUEST_REJECTED.with_reason("test rejects the active request"),
-        );
+        (&send).cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64());
         assert!(matches!(
             send.state.lock().unwrap().status,
             StreamStatus::Finished

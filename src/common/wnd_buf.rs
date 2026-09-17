@@ -35,6 +35,26 @@ impl WndBuf {
             fin: false,
         }
     }
+
+    pub(crate) fn remaining_capacity(&self) -> usize {
+        self.buf.len() - self.len
+    }
+
+    /// Contiguous readable bytes, retained until explicitly consumed.
+    pub(crate) fn chunk(&self) -> &[u8] {
+        &self.buf[self.head..self.head + self.len.min(self.buf.len() - self.head)]
+    }
+
+    pub(crate) fn consume(&mut self, n: usize) {
+        assert!(n <= self.len);
+        self.head = (self.head + n) % self.buf.len();
+        self.len -= n;
+        if n > 0 {
+            if let Some(waker) = self.write_waker.take() {
+                waker.wake();
+            }
+        }
+    }
 }
 
 impl AsyncRead for WndBuf {
@@ -57,11 +77,7 @@ impl AsyncRead for WndBuf {
         let first = len.min(self.buf.len() - self.head);
         buf.put_slice(&self.buf[self.head..self.head + first]);
         buf.put_slice(&self.buf[..len - first]);
-        self.head = (self.head + len) % self.buf.len();
-        self.len -= len;
-        if let Some(waker) = self.write_waker.take() {
-            waker.wake();
-        }
+        self.consume(len);
         Poll::Ready(Ok(()))
     }
 }

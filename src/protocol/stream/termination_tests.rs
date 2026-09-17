@@ -55,7 +55,7 @@ async fn dquic_queues_stop_and_reset_for_local_error_goaway_and_drop() {
         let code = match cause {
             "error" => {
                 recv.close(ErrorCode::H3_MESSAGE_ERROR.with_reason("invalid message"));
-                send.cancel_with_error(ErrorCode::H3_MESSAGE_ERROR.with_reason("invalid message"));
+                (&send).cancel(ErrorCode::H3_MESSAGE_ERROR.as_u64());
                 ErrorCode::H3_MESSAGE_ERROR
             }
             "goaway" => {
@@ -110,13 +110,13 @@ fn rejection_and_drop_terminate_each_direction_once() {
         let stopped = read.stopped.clone();
         let cancelled = write.cancelled.clone();
         let streams = BiStreams::new();
-        let (mut send, mut recv) = streams.insert(4, read, write).unwrap();
+        let (send, mut recv) = streams.insert(4, read, write).unwrap();
         let code = if reject {
             assert_eq!(streams.goaway(4), [4]);
             assert!(streams.goaway(4).is_empty());
             // Later explicit termination must not overwrite the rejection.
             recv.stop(ErrorCode::H3_REQUEST_CANCELLED.as_u64());
-            send.cancel(ErrorCode::H3_REQUEST_CANCELLED.as_u64());
+            (&send).cancel(ErrorCode::H3_REQUEST_CANCELLED.as_u64());
             ErrorCode::H3_REQUEST_REJECTED
         } else {
             ErrorCode::H3_REQUEST_CANCELLED
@@ -168,9 +168,9 @@ fn local_errors_preserve_the_first_transport_code() {
         let recv = H3ReadStream::new(0, read);
         let send = H3WriteStream::new(0, write);
         recv.close(code.with_reason("read error"));
-        send.cancel_with_error(code.with_reason("write error"));
+        (&send).cancel(code.as_u64());
         recv.close(ErrorCode::H3_INTERNAL_ERROR.with_reason("later error"));
-        send.cancel_with_error(ErrorCode::H3_INTERNAL_ERROR.with_reason("later error"));
+        (&send).cancel(ErrorCode::H3_INTERNAL_ERROR.as_u64());
         drop((recv, send));
         assert_eq!(*stopped.lock().unwrap(), [code.as_u64()]);
         assert_eq!(*cancelled.lock().unwrap(), [code.as_u64()]);

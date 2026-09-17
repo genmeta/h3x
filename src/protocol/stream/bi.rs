@@ -255,7 +255,7 @@ mod tests {
         let read_code = Arc::new(AtomicU64::new(0));
         let write_code = Arc::new(AtomicU64::new(0));
         let streams = BiStreams::new();
-        let (mut send, mut recv) = streams
+        let (send, mut recv) = streams
             .insert(0, Recv(read_code.clone()), Send(write_code.clone()))
             .unwrap();
         let mut drained = Box::pin(streams.drained());
@@ -263,12 +263,15 @@ mod tests {
         assert!(drained.as_mut().poll(&mut cx).is_pending());
         recv.stop(123);
         assert!(drained.as_mut().poll(&mut cx).is_pending());
-        send.cancel(456);
+        (&send).cancel(ErrorCode::H3_MESSAGE_ERROR.as_u64());
         assert!(drained.as_mut().poll(&mut cx).is_ready());
         recv.stop(789);
-        send.cancel(789);
+        (&send).cancel(ErrorCode::H3_REQUEST_CANCELLED.as_u64());
         assert_eq!(read_code.load(Ordering::SeqCst), 123);
-        assert_eq!(write_code.load(Ordering::SeqCst), 456);
+        assert_eq!(
+            write_code.load(Ordering::SeqCst),
+            ErrorCode::H3_MESSAGE_ERROR.as_u64()
+        );
     }
 
     #[test]

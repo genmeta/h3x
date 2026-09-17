@@ -179,7 +179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_error_reason_survives_shared_body_and_stream_io() {
+    async fn body_preserves_first_error_and_cancelled_stream_reports_cancellation() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let error = ErrorCode::H3_REQUEST_CANCELLED.with_reason("application cancelled upload");
@@ -190,7 +190,10 @@ mod tests {
         assert_eq!(Error::from(body.write(b"x").await.unwrap_err()), error);
 
         let mut stream = crate::test_support::write_stream(0, tokio::io::sink());
-        stream.cancel_with_error(error.clone());
+        use qrecovery::send::CancelStream;
+
+        (&stream).cancel(error.code.as_u64());
+        let error = ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled");
         assert_eq!(Error::from(stream.write(b"x").await.unwrap_err()), error);
         assert_eq!(Error::from(stream.flush().await.unwrap_err()), error);
     }

@@ -226,7 +226,7 @@ pub async fn write_bytes_response<WS: AsyncWrite + CancelStream + Unpin>(
     }
     .await;
     if let Err(error) = &result {
-        ws.cancel_with_error(error.clone());
+        (&ws).cancel(error.code.as_u64());
     }
     result
 }
@@ -276,7 +276,7 @@ pub fn write_streaming_response<WS: AsyncWrite + CancelStream + Unpin>(
         }
         .await;
         if let Err(error) = &result {
-            ws.cancel_with_error(error.clone());
+            (&ws).cancel(error.code.as_u64());
             body.on_error(error.clone());
         }
         result
