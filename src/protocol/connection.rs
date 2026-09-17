@@ -92,7 +92,9 @@ impl<T: Transport> H3Connection<T> {
     /// This future is not cancellation-safe during GOAWAY writes; await it to completion.
     pub async fn goaway(self) -> Result<()> {
         if let Err(error) = self.send_goaway().await {
-            self.fail(error.clone());
+            let _ = self
+                .transport
+                .close(error.reason.clone(), error.code.as_u64());
             return Err(error);
         }
         self.cursor.remote_goaway().await?;

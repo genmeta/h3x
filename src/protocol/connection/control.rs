@@ -53,7 +53,7 @@ impl<T: Transport> H3Connection<T> {
         }
         .await;
         if let Err(error) = result {
-            self.fail(error);
+            let _ = self.transport.close(error.reason, error.code.as_u64());
         }
     }
 
@@ -84,7 +84,7 @@ impl<T: Transport> H3Connection<T> {
                         tokio::spawn(self.clone().receive(recv, peer_critical_streams.clone()));
                     }
                     Err(error) => {
-                        self.fail(error);
+                        let _ = self.transport.close(error.reason, error.code.as_u64());
                         break self.transport.terminated().await;
                     }
                 },
@@ -123,7 +123,7 @@ impl<T: Transport> H3Connection<T> {
         let result = result.await;
         // Retain the half until failure handling completes, including transport close.
         if let Err(error) = result {
-            self.fail(error);
+            let _ = self.transport.close(error.reason, error.code.as_u64());
         }
     }
 
@@ -132,13 +132,6 @@ impl<T: Transport> H3Connection<T> {
         let error = self.qpack.on_error(error);
         self.cursor.close(error.clone());
         self.bi_streams.close(error);
-    }
-
-    /// Initiate transport termination; the accept task owns local cleanup.
-    pub(crate) fn fail(&self, error: Error) {
-        let _ = self
-            .transport
-            .close(error.reason.clone(), error.code.as_u64());
     }
 }
 

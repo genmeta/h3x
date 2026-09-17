@@ -191,8 +191,10 @@ async fn streaming_response_termination_reaches_the_producer() {
                         qpack.qpack().cancel(id).unwrap();
                     }
                 } else {
-                    qpack.fail(
-                        error.with_reason("test terminates the connection during response upload"),
+                    let _ = crate::Transport::close(
+                        qpack.transport.as_ref(),
+                        "test terminates the connection during response upload".into(),
+                        error.as_u64(),
                     );
                     // These test writers are independent of the transport; apply
                     // the connection's stream closure before resuming body I/O.

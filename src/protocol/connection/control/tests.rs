@@ -180,9 +180,9 @@ async fn local_field_limit_does_not_close_connection_but_receive_failure_does() 
         )
         .is_ok()
     );
-    connection.fail(
-        ErrorCode::H3_EXCESSIVE_LOAD
-            .with_reason("test closes the connection during stream processing"),
+    let _ = connection.transport.close(
+        "test closes the connection during stream processing".into(),
+        ErrorCode::H3_EXCESSIVE_LOAD.as_u64(),
     );
     tokio::task::yield_now().await;
     assert_eq!(ErrorCode::from(ended.await), ErrorCode::H3_EXCESSIVE_LOAD);
@@ -211,9 +211,9 @@ async fn protocol_failure_preserves_observed_transport_reason_and_closes_streams
     })
     .await
     .unwrap();
-    connection.fail(
-        ErrorCode::QPACK_DECOMPRESSION_FAILED
-            .with_reason("test closes the connection during stream processing"),
+    let _ = connection.transport.close(
+        "test closes the connection during stream processing".into(),
+        ErrorCode::QPACK_DECOMPRESSION_FAILED.as_u64(),
     );
     tokio::task::yield_now().await;
     assert_eq!(

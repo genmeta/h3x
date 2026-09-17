@@ -246,7 +246,9 @@ mod tests {
 
         let connection = crate::test_support::connection().await;
         let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("invalid dynamic reference");
-        connection.fail(error.clone());
+        let _ = connection
+            .transport
+            .close(error.reason.clone(), error.code.as_u64());
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while connection.qpack().error().is_none() {
                 tokio::task::yield_now().await;
