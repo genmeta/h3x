@@ -84,6 +84,8 @@ pub enum ErrorCode {
     QPACK_DECOMPRESSION_FAILED = 0x0200,
     QPACK_ENCODER_STREAM_ERROR = 0x0201,
     QPACK_DECODER_STREAM_ERROR = 0x0202,
+    /// An application error code not named by HTTP/3.
+    Other(u64),
 }
 
 impl ErrorCode {
@@ -93,13 +95,35 @@ impl ErrorCode {
     }
 
     pub const fn as_u64(self) -> u64 {
-        self as u64
+        match self {
+            Self::H3_NO_ERROR => 0x0100,
+            Self::H3_GENERAL_PROTOCOL_ERROR => 0x0101,
+            Self::H3_INTERNAL_ERROR => 0x0102,
+            Self::H3_STREAM_CREATION_ERROR => 0x0103,
+            Self::H3_CLOSED_CRITICAL_STREAM => 0x0104,
+            Self::H3_FRAME_UNEXPECTED => 0x0105,
+            Self::H3_FRAME_ERROR => 0x0106,
+            Self::H3_EXCESSIVE_LOAD => 0x0107,
+            Self::H3_ID_ERROR => 0x0108,
+            Self::H3_SETTINGS_ERROR => 0x0109,
+            Self::H3_MISSING_SETTINGS => 0x010a,
+            Self::H3_REQUEST_REJECTED => 0x010b,
+            Self::H3_REQUEST_CANCELLED => 0x010c,
+            Self::H3_REQUEST_INCOMPLETE => 0x010d,
+            Self::H3_MESSAGE_ERROR => 0x010e,
+            Self::H3_CONNECT_ERROR => 0x010f,
+            Self::H3_VERSION_FALLBACK => 0x0110,
+            Self::QPACK_DECOMPRESSION_FAILED => 0x0200,
+            Self::QPACK_ENCODER_STREAM_ERROR => 0x0201,
+            Self::QPACK_DECODER_STREAM_ERROR => 0x0202,
+            Self::Other(code) => code,
+        }
     }
 }
 
 impl fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?} (0x{:x})", *self as u64)
+        write!(f, "{self:?} (0x{:x})", self.as_u64())
     }
 }
 
@@ -110,3 +134,69 @@ impl From<io::Error> for ErrorCode {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Apply the message receive error boundary in a consistent order.
+/// QPACK temporarily carries connection failures to the connection task.
+pub(crate) fn receive_error<R: tokio::io::AsyncRead + qrecovery::recv::StopSending + Unpin>(
+    stream: &crate::protocol::stream::H3ReadStream<R>,
+    qpack: &crate::ArcQpack,
+    error: &Error,
+) {
+    use ErrorCode::*;
+    stream.close(error.clone());
+    let connection_error = match error.code {
+        Other(_)
+        | H3_NO_ERROR
+        | H3_REQUEST_REJECTED
+        | H3_REQUEST_CANCELLED
+        | H3_REQUEST_INCOMPLETE
+        | H3_MESSAGE_ERROR
+        | H3_CONNECT_ERROR
+        | H3_VERSION_FALLBACK => false,
+        H3_GENERAL_PROTOCOL_ERROR
+        | H3_INTERNAL_ERROR
+        | H3_STREAM_CREATION_ERROR
+        | H3_CLOSED_CRITICAL_STREAM
+        | H3_FRAME_UNEXPECTED
+        | H3_FRAME_ERROR
+        | H3_EXCESSIVE_LOAD
+        | H3_ID_ERROR
+        | H3_SETTINGS_ERROR
+        | H3_MISSING_SETTINGS
+        | QPACK_DECOMPRESSION_FAILED
+        | QPACK_ENCODER_STREAM_ERROR
+        | QPACK_DECODER_STREAM_ERROR => true,
+    };
+    if connection_error {
+        qpack.on_error(error.clone());
+    }
+    let _ = qpack.cancel(stream.stream_id());
+}
+
+impl From<u64> for ErrorCode {
+    fn from(code: u64) -> Self {
+        match code {
+            0x0100 => Self::H3_NO_ERROR,
+            0x0101 => Self::H3_GENERAL_PROTOCOL_ERROR,
+            0x0102 => Self::H3_INTERNAL_ERROR,
+            0x0103 => Self::H3_STREAM_CREATION_ERROR,
+            0x0104 => Self::H3_CLOSED_CRITICAL_STREAM,
+            0x0105 => Self::H3_FRAME_UNEXPECTED,
+            0x0106 => Self::H3_FRAME_ERROR,
+            0x0107 => Self::H3_EXCESSIVE_LOAD,
+            0x0108 => Self::H3_ID_ERROR,
+            0x0109 => Self::H3_SETTINGS_ERROR,
+            0x010a => Self::H3_MISSING_SETTINGS,
+            0x010b => Self::H3_REQUEST_REJECTED,
+            0x010c => Self::H3_REQUEST_CANCELLED,
+            0x010d => Self::H3_REQUEST_INCOMPLETE,
+            0x010e => Self::H3_MESSAGE_ERROR,
+            0x010f => Self::H3_CONNECT_ERROR,
+            0x0110 => Self::H3_VERSION_FALLBACK,
+            0x0200 => Self::QPACK_DECOMPRESSION_FAILED,
+            0x0201 => Self::QPACK_ENCODER_STREAM_ERROR,
+            0x0202 => Self::QPACK_DECODER_STREAM_ERROR,
+            code => Self::Other(code),
+        }
+    }
+}

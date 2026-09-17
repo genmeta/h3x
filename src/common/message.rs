@@ -1,37 +1,18 @@
-use std::{
-    io,
-    pin::Pin,
-    sync::{Arc, Mutex},
-    task::{Context, Poll},
-};
+use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 
 use super::{
-    Read, Write,
     body::Body,
     head::{RequestHead, ResponseHead},
 };
-use crate::Result;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 /// Metadata and body are shared independently so either can be accessed without
 /// taking a lock for the other. Construction does not start network or body work.
 pub(crate) struct Message<H, B> {
     pub(crate) head: Arc<Mutex<H>>,
     pub(crate) body: Arc<Mutex<B>>,
-}
-
-impl<H, B> Clone for Message<H, B> {
-    fn clone(&self) -> Self {
-        Self {
-            head: self.head.clone(),
-            body: self.body.clone(),
-        }
-    }
 }
 
 impl<H, B> Message<H, B> {
@@ -43,71 +24,10 @@ impl<H, B> Message<H, B> {
     }
 }
 
-/// Client-side request construction and headers.
-pub trait WriteRequest: Sized {
-    fn new(url: &str, method: Method) -> Result<Self>;
-
-    fn get(url: &str) -> Result<Self> {
-        Self::new(url, Method::GET)
-    }
-
-    fn head(url: &str) -> Result<Self> {
-        Self::new(url, Method::HEAD)
-    }
-
-    fn post(url: &str) -> Result<Self> {
-        Self::new(url, Method::POST)
-    }
-
-    fn put(url: &str) -> Result<Self> {
-        Self::new(url, Method::PUT)
-    }
-
-    fn delete(url: &str) -> Result<Self> {
-        Self::new(url, Method::DELETE)
-    }
-
-    fn connect(url: &str) -> Result<Self> {
-        Self::new(url, Method::CONNECT)
-    }
-
-    fn options(url: &str) -> Result<Self> {
-        Self::new(url, Method::OPTIONS)
-    }
-
-    fn trace(url: &str) -> Result<Self> {
-        Self::new(url, Method::TRACE)
-    }
-
-    fn patch(url: &str) -> Result<Self> {
-        Self::new(url, Method::PATCH)
-    }
-
-    /// Replace all existing values for this header name.
-    fn header(self, key: HeaderName, value: HeaderValue) -> Self;
-}
-
-pub trait WriteBody {
-    fn set_body(&mut self, body: Bytes) -> &mut Self;
-}
-
-#[async_trait]
-pub trait WriteStream: Sized {
-    async fn write<T: AsRef<[u8]> + Send>(&mut self, chunk: T) -> Result<usize>;
-
-    /// Close the producer. Buffered bytes remain readable and the send task
-    /// drains them before sending FIN; this does not wait for transport shutdown.
-    async fn finish(&mut self) -> Result<()>;
-
-    /// Cancel the body, discard buffered bytes, and wake pending operations.
-    async fn reset(self) -> Result<()>;
-}
-
-/// Server-side view of request metadata.
+/// Request metadata, available for both incoming and outgoing requests.
 pub trait ReadRequest: Sized {
-    fn protocol(&self) -> Option<crate::Protocol> {
-        None
-    }
+    fn protocol(&self) -> Option<std::sync::Arc<str>>;
+
     fn method(&self) -> Method;
 
     fn authority(&self) -> String;
@@ -122,6 +42,17 @@ pub trait ReadRequest: Sized {
     fn headers(&self) -> HeaderMap;
 }
 
+/// Outgoing request metadata. Set these before sending the request.
+pub trait WriteRequest {
+    fn set_method(&mut self, method: Method) -> &mut Self;
+
+    fn set_uri(&mut self, uri: Uri) -> &mut Self;
+
+    fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self;
+
+    fn append_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self;
+}
+
 /// Server-side response status and headers. Set these before sending the response.
 pub trait WriteResponse {
     fn set_status(&mut self, status: StatusCode) -> &mut Self;
@@ -133,7 +64,7 @@ pub trait WriteResponse {
     fn append_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self;
 }
 
-/// Client-side view of the response status and headers.
+/// Response metadata, available for both incoming and outgoing responses.
 pub trait ReadResponse {
     fn status(&self) -> StatusCode;
 
@@ -143,36 +74,8 @@ pub trait ReadResponse {
     fn headers(&self) -> HeaderMap;
 }
 
-#[async_trait]
-pub trait ReadStream: Sized {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
-
-    async fn read_all(&mut self, buf: &mut [u8]) -> Result<usize>;
-
-    /// Stop receiving, discard buffered bytes, and wake pending operations.
-    async fn stop(self);
-}
-
-pub trait ReadBody {
-    fn body(&self) -> Bytes;
-}
-
-impl<B: Default> WriteRequest for Message<RequestHead, B> {
-    fn new(url: &str, method: Method) -> Result<Self> {
-        Ok(Self::from_parts(
-            RequestHead::new(url, method)?,
-            B::default(),
-        ))
-    }
-
-    fn header(self, key: HeaderName, value: HeaderValue) -> Self {
-        self.head.lock().unwrap().headers.insert(key, value);
-        self
-    }
-}
-
 impl ReadRequest for RequestHead {
-    fn protocol(&self) -> Option<crate::Protocol> {
+    fn protocol(&self) -> Option<std::sync::Arc<str>> {
         self.request_protocol().cloned()
     }
 
@@ -207,9 +110,10 @@ impl ReadRequest for RequestHead {
 }
 
 impl<B> ReadRequest for Message<RequestHead, B> {
-    fn protocol(&self) -> Option<crate::Protocol> {
+    fn protocol(&self) -> Option<std::sync::Arc<str>> {
         ReadRequest::protocol(&*self.head.lock().unwrap())
     }
+
     fn method(&self) -> Method {
         self.head.lock().unwrap().method()
     }
@@ -285,63 +189,8 @@ impl<B> ReadResponse for Message<ResponseHead, B> {
     }
 }
 
-impl<H> WriteBody for Message<H, Bytes> {
-    fn set_body(&mut self, body: Bytes) -> &mut Self {
-        *self.body.lock().unwrap() = body;
-        self
-    }
-}
-
-impl<H> ReadBody for Message<H, Bytes> {
-    fn body(&self) -> Bytes {
-        self.body.lock().unwrap().clone()
-    }
-}
-
-// Standard I/O operates on body bytes; protocol framing lives in common::body.
-impl<H: Unpin, B: AsyncRead + Unpin> AsyncRead for Message<H, B> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut *self.body.lock().unwrap()).poll_read(cx, buf)
-    }
-}
-
-impl<H: Unpin, B: AsyncWrite + Unpin> AsyncWrite for Message<H, B> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut *self.body.lock().unwrap()).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut *self.body.lock().unwrap()).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut *self.body.lock().unwrap()).poll_shutdown(cx)
-    }
-}
-
-impl<H: Clone, B> Message<H, B> {
-    pub(crate) fn with_body<T>(&self, body: T) -> Message<H, T> {
-        Message {
-            head: Arc::new(Mutex::new(self.head.lock().unwrap().clone())),
-            body: Arc::new(Mutex::new(body)),
-        }
-    }
-}
-
-impl<H, B: Clone, IO> Message<H, Body<B, IO>> {
-    pub(crate) fn body(&self) -> Body<B, IO> {
-        Body::new(self.body.lock().unwrap().storage.clone())
-    }
-
-    pub(crate) fn into_body(self) -> Body<B, IO> {
+impl<H, B: Clone, IO> Message<H, Body<IO, B>> {
+    pub(crate) fn into_body(self) -> Body<IO, B> {
         match Arc::try_unwrap(self.body) {
             Ok(body) => body.into_inner().unwrap(),
             Err(body) => Body::new(body.lock().unwrap().storage.clone()),
@@ -349,60 +198,52 @@ impl<H, B: Clone, IO> Message<H, Body<B, IO>> {
     }
 }
 
-impl<H, IO> Message<H, Body<crate::ArcWndBuf, IO>> {
+impl<H, IO> Message<H, Body<IO, crate::ArcWndBuf>> {
     pub(crate) fn body_stream(&self) -> crate::ArcWndBuf {
         self.body.lock().unwrap().storage.clone()
     }
 }
 
-#[async_trait]
-impl<H: Send> ReadStream for Message<H, Body<crate::ArcWndBuf, Read>> {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.body().read(buf).await
+impl WriteRequest for RequestHead {
+    fn set_method(&mut self, method: Method) -> &mut Self {
+        self.pseudo.method = method;
+        self
     }
 
-    async fn read_all(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let mut body = self.body();
-        let mut count = 0;
-        while count < buf.len() {
-            let n = body.read(&mut buf[count..]).await?;
-            if n == 0 {
-                break;
-            }
-            count += n;
-        }
-        Ok(count)
+    fn set_uri(&mut self, uri: Uri) -> &mut Self {
+        self.pseudo.uri = uri;
+        self
     }
 
-    async fn stop(self) {
-        self.into_body().stop().await;
+    fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
+        self.headers.insert(name, value);
+        self
+    }
+
+    fn append_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
+        self.headers.append(name, value);
+        self
     }
 }
 
-#[async_trait]
-impl<H: Send> WriteStream for Message<H, Body<crate::ArcWndBuf, Write>> {
-    async fn write<T: AsRef<[u8]> + Send>(&mut self, chunk: T) -> Result<usize> {
-        self.body().write(chunk).await
+impl<B> WriteRequest for Message<RequestHead, B> {
+    fn set_method(&mut self, method: Method) -> &mut Self {
+        self.head.lock().unwrap().set_method(method);
+        self
     }
 
-    async fn finish(&mut self) -> Result<()> {
-        self.body().finish().await
+    fn set_uri(&mut self, uri: Uri) -> &mut Self {
+        self.head.lock().unwrap().set_uri(uri);
+        self
     }
 
-    async fn reset(self) -> Result<()> {
-        self.into_body().reset().await
+    fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
+        self.head.lock().unwrap().set_header(name, value);
+        self
     }
-}
 
-impl<H, IO> ReadBody for Message<H, Body<Bytes, IO>> {
-    fn body(&self) -> Bytes {
-        self.body.lock().unwrap().storage.clone()
-    }
-}
-
-impl<H> WriteBody for Message<H, Body<Bytes, Write>> {
-    fn set_body(&mut self, bytes: Bytes) -> &mut Self {
-        self.body.lock().unwrap().storage = bytes;
+    fn append_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
+        self.head.lock().unwrap().append_header(name, value);
         self
     }
 }

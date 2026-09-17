@@ -1,4 +1,4 @@
-use std::str::from_utf8;
+use std::{str::from_utf8, sync::Arc};
 
 use bytes::Bytes;
 use http::{
@@ -68,9 +68,9 @@ impl RequestHead {
             if method != Method::CONNECT || authority.is_none() {
                 return Err(ErrorCode::H3_MESSAGE_ERROR.reason("invalid Extended CONNECT"));
             }
-            Some(crate::Protocol::new(
-                from_utf8(protocol).map_err(message_error)?,
-            )?)
+            let protocol = from_utf8(protocol).map_err(message_error)?;
+            validate_protocol(protocol)?;
+            Some(Arc::<str>::from(protocol))
         } else {
             None
         };
@@ -141,7 +141,13 @@ impl RequestHead {
     pub(crate) fn encode(&self, fields: &mut Vec<Field>) -> Result<()> {
         let method = &self.pseudo.method;
         let uri = &self.pseudo.uri;
-        let protocol = self.pseudo.extensions.get::<crate::Protocol>();
+        let protocol = self.pseudo.extensions.get::<Arc<str>>();
+        if let Some(protocol) = protocol {
+            validate_protocol(protocol)?;
+            if method != Method::CONNECT {
+                return Err(ErrorCode::H3_MESSAGE_ERROR.reason("invalid Extended CONNECT"));
+            }
+        }
         let authority = uri.authority().unwrap().as_str().as_bytes();
 
         fields.reserve(5 + self.headers.len());
@@ -154,7 +160,7 @@ impl RequestHead {
             fields.push(pseudo_field(b":path", path.as_str().as_bytes()));
         }
         if let Some(protocol) = protocol {
-            fields.push(pseudo_field(b":protocol", protocol.as_str().as_bytes()));
+            fields.push(pseudo_field(b":protocol", protocol.as_bytes()));
         }
         self.put_headers(fields);
         Ok(())
@@ -172,7 +178,7 @@ impl RequestHead {
         &self.pseudo.extensions
     }
 
-    pub(crate) fn request_protocol(&self) -> Option<&crate::Protocol> {
+    pub(crate) fn request_protocol(&self) -> Option<&Arc<str>> {
         self.request_extensions().get()
     }
 }
@@ -200,29 +206,6 @@ impl ResponseHead {
         self.pseudo
             .status
             .ok_or_else(|| ErrorCode::H3_MESSAGE_ERROR.reason("response is missing :status"))
-    }
-}
-
-impl RequestHead {
-    pub(crate) fn from_request_parts(
-        method: Method,
-        uri: Uri,
-        headers: HeaderMap,
-        protocol: Option<crate::Protocol>,
-    ) -> Self {
-        let mut extensions = http::Extensions::new();
-        if let Some(protocol) = protocol {
-            extensions.insert(protocol);
-        }
-        Self {
-            pseudo: Request {
-                extensions,
-                method,
-                uri,
-                version: http::Version::HTTP_3,
-            },
-            headers,
-        }
     }
 }
 
@@ -452,4 +435,15 @@ impl DecodedFields {
     fn required_utf8(&self, name: &[u8]) -> Result<&str> {
         from_utf8(self.required(name)?).map_err(message_error)
     }
+}
+
+fn validate_protocol(protocol: &str) -> Result<()> {
+    if protocol.is_empty()
+        || !protocol
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c))
+    {
+        return Err(ErrorCode::H3_MESSAGE_ERROR.reason("invalid CONNECT protocol token"));
+    }
+    Ok(())
 }

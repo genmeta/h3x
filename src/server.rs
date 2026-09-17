@@ -11,7 +11,7 @@ use crate::{
     ArcQpack, ArcWndBuf, Error, ErrorCode, Result,
     common::{
         self, Read, Write,
-        body::{self, BodyMode},
+        body::{self, ContentType},
         head::{self, WriteResponse as _},
         message::Message,
     },
@@ -22,7 +22,7 @@ use crate::{
 };
 
 pub type Request = crate::common::Request<Read>;
-pub type Response<B = Bytes> = crate::common::response::Response<Write, B>;
+pub type Response<B> = crate::common::response::Response<Write, B>;
 
 /// Read an HTTP request using the receive stream's ID and shared QPACK state.
 pub async fn read_request<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
@@ -43,15 +43,15 @@ pub fn read_request_body<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
     let (parts, ()) = request.into_parts();
     let head = head::RequestHead::from(parts);
     let mode = request_body_mode(&head).inspect_err(|error| {
-        common::receive_error(&rs, &qpack, error);
+        crate::error::receive_error(&rs, &qpack, error);
     })?;
-    let body = body::receive(rs, mode, qpack);
+    let body = body::Body::<Read, ArcWndBuf>::receive(rs, mode, qpack);
     Ok(common::Request::Streaming(
         Message::from_parts(head, body).into(),
     ))
 }
 
-fn request_body_mode(head: &head::RequestHead) -> Result<BodyMode> {
+fn request_body_mode(head: &head::RequestHead) -> Result<ContentType> {
     let length = head.content_length()?;
     Ok(if head.request_method() == Method::CONNECT {
         if length.is_some() {
@@ -59,11 +59,11 @@ fn request_body_mode(head: &head::RequestHead) -> Result<BodyMode> {
                 ErrorCode::H3_MESSAGE_ERROR.reason("CONNECT must not include Content-Length")
             );
         }
-        BodyMode::Connect
+        ContentType::Connect
     } else {
         match length {
-            Some(content_length) => BodyMode::Length { content_length },
-            None => BodyMode::UnspecifiedLength,
+            Some(content_length) => ContentType::Length { content_length },
+            None => ContentType::Streaming,
         }
     })
 }
@@ -107,7 +107,7 @@ async fn read_head<RS: AsyncRead + StopSending + Unpin>(
     }
     .await;
     if let Err(error) = &result {
-        common::receive_error(rs, qpack, error);
+        crate::error::receive_error(rs, qpack, error);
     }
     result
 }
@@ -127,7 +127,7 @@ pub async fn read_request_head<RS: AsyncRead + StopSending + Unpin>(
 
 /// Accept a CONNECT request returned by `read_request` after application checks.
 /// The response must have a 2xx status without Content-Length. Retain
-/// `response.body()` to send tunnel bytes after acceptance.
+/// the outgoing body to send tunnel bytes after acceptance.
 ///
 /// Metadata is validated on creation. When polled, the future sends and flushes
 /// response HEADERS, starts the shared body sender, and returns without waiting
@@ -145,7 +145,7 @@ pub fn accept_connect<WS>(
 where
     WS: AsyncWrite + CancelStream + Unpin + Send + 'static,
 {
-    let mut producer = response.message.body_stream();
+    let producer = response.message.body_stream();
     let prepared = (|| {
         if crate::ReadRequest::method(request) != Method::CONNECT {
             return Err(ErrorCode::H3_MESSAGE_ERROR.reason("accept_connect requires CONNECT"));
@@ -153,7 +153,7 @@ where
         let response_head = response.message.head.lock().unwrap();
         let mut fields = Vec::new();
         fields.put_response(&response_head)?;
-        if BodyMode::resolve(&response_head, Some(&Method::CONNECT))? != BodyMode::Connect {
+        if ContentType::resolve(&response_head, Some(&Method::CONNECT))? != ContentType::Connect {
             return Err(
                 ErrorCode::H3_MESSAGE_ERROR.reason("accept_connect requires a 2xx response")
             );
@@ -192,7 +192,7 @@ where
                 biased;
                 error = cancellation.wait_error() => Err(error),
                 result = async {
-                    body::write_streaming_body(&mut producer, &mut ws, BodyMode::Connect).await?;
+                    body::Body::<Write, ArcWndBuf>::new(producer.clone()).encode(&mut ws, ContentType::Connect).await?;
                     ws.shutdown().await?;
                     Ok::<_, Error>(())
                 } => result,
@@ -221,8 +221,8 @@ pub fn write_bytes_response<WS: AsyncWrite + CancelStream + Unpin>(
             let body = response.message.body.lock().unwrap().storage.clone();
             let mut fields = Vec::new();
             fields.put_response(&head)?;
-            let mode = BodyMode::resolve(&head, Some(method))?;
-            if matches!(mode, BodyMode::Connect) {
+            let mode = ContentType::resolve(&head, Some(method))?;
+            if matches!(mode, ContentType::Connect) {
                 return Err(ErrorCode::H3_MESSAGE_ERROR
                     .reason("use write_streaming_response for successful CONNECT"));
             }
@@ -249,7 +249,7 @@ pub fn write_bytes_response<WS: AsyncWrite + CancelStream + Unpin>(
             let mut buf = Vec::new();
             buf.put_frame(&headers);
             ws.write_all(&buf).await?;
-            body::write_bytes_body(&body, &mut ws).await?;
+            body::Body::<Write, Bytes>::new(body).encode(&mut ws).await?;
             ws.shutdown().await?;
             Ok::<_, Error>(())
         }
@@ -272,11 +272,11 @@ pub fn write_streaming_response<WS: AsyncWrite + CancelStream + Unpin>(
     request_method: &Method,
 ) -> impl Future<Output = Result<()>> + use<WS> {
     let head = response.message.head.lock().unwrap().clone();
-    let mut body = response.message.body_stream();
+    let body = response.message.body_stream();
     let prepared = (|| {
         let mut fields = Vec::new();
         fields.put_response(&head)?;
-        let mode = BodyMode::resolve(&head, Some(request_method))?;
+        let mode = ContentType::resolve(&head, Some(request_method))?;
         Ok::<_, Error>((fields, mode))
     })()
     .inspect_err(|error| body.on_error(error.clone()));
@@ -291,7 +291,7 @@ pub fn write_streaming_response<WS: AsyncWrite + CancelStream + Unpin>(
             buf.put_frame(&headers);
             ws.write_all(&buf).await?;
             ws.flush().await?;
-            body::write_streaming_body(&mut body, &mut ws, mode).await?;
+            body::Body::<Write, ArcWndBuf>::new(body.clone()).encode(&mut ws, mode).await?;
             ws.shutdown().await?;
             Ok::<_, Error>(())
         };

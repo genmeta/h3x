@@ -129,6 +129,10 @@ impl ArcWndBuf {
         }
     }
 
+    pub(crate) fn cancel(&self, code: u64) {
+        self.on_error(crate::ErrorCode::from(code).reason("body cancelled"));
+    }
+
     pub(crate) fn on_error(&self, error: Error) {
         let mut state = self.shared.lock().unwrap();
         if let Ok(window) = &mut *state {

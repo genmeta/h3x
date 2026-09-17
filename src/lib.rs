@@ -7,10 +7,7 @@ pub mod pool;
 mod protocol;
 pub mod server;
 
-pub use common::message::{
-    ReadBody, ReadRequest, ReadResponse, ReadStream, WriteBody, WriteRequest, WriteResponse,
-    WriteStream,
-};
+pub use common::message::{ReadRequest, ReadResponse, WriteRequest, WriteResponse};
 pub use error::{Error, ErrorCode, Result};
 pub use pool::{Pool, PoolConfig, PoolError, PoolResult};
 pub use protocol::{
@@ -26,4 +23,4 @@ pub const ALPN: &[u8] = b"h3";
 
 /// Shared body storage, also available under its original ArcWndBuf name.
 pub use common::wnd_buf::ArcWndBuf;
-pub use common::{Protocol, Read as R, Write as W, body::Body, wnd_buf::ArcWndBuf as WndBuf};
+pub use common::{Read as R, Write as W, body::Body, wnd_buf::ArcWndBuf as WndBuf};
