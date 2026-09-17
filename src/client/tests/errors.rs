@@ -248,7 +248,13 @@ async fn frame_errors_in_headers_bodies_and_trailers_close_the_connection() {
                     Ok(response) => response.into_body().collect().await.unwrap_err(),
                 }
             };
-            assert_eq!(error.code, code, "{stage}");
+            // Placement takes precedence over a malformed second trailer payload.
+            let expected = if stage.ends_with("trailers") {
+                ErrorCode::H3_FRAME_UNEXPECTED
+            } else {
+                code
+            };
+            assert_eq!(error.code, expected, "{stage}");
             assert_eq!(
                 timeout(Duration::from_secs(1), connection.open_bi())
                     .await
@@ -461,4 +467,61 @@ async fn connect_local_write_failure_preserves_response_wait() {
         timeout(Duration::from_secs(1), response).await.unwrap(),
         Err(ConnectError::Rejected(_))
     ));
+}
+
+#[tokio::test]
+async fn misplaced_settings_are_rejected_before_payload_and_close_transport() {
+    use crate::Transport;
+
+    for request in [false, true] {
+        for in_body in [false, true] {
+            // Include malformed SETTINGS and a type alone, with the peer still open.
+            for invalid in [&[4, 2, 8, 2][..], &[4][..]] {
+                let connection = crate::test_support::connection().await;
+                let qpack = connection.qpack().clone();
+                let mut wire = if !in_body {
+                    Vec::new()
+                } else if request {
+                    headers_frame(
+                        &qpack,
+                        vec![
+                            field(b":method", b"GET"),
+                            field(b":scheme", b"https"),
+                            field(b":authority", b"example.com"),
+                            field(b":path", b"/"),
+                        ],
+                    )
+                } else {
+                    headers_frame(&qpack, vec![field(b":status", b"200")])
+                };
+                wire.extend_from_slice(invalid);
+                let (mut peer, recv) = duplex(256);
+                peer.write_all(&wire).await.unwrap();
+                let error = timeout(Duration::from_secs(1), async {
+                    let recv = crate::test_support::read_stream(0, recv);
+                    if request {
+                        match crate::server::read_request(recv, qpack.clone()).await {
+                            Err(error) => error,
+                            Ok(request) => request.into_body().collect().await.unwrap_err(),
+                        }
+                    } else {
+                        match read_response(recv, qpack.clone(), None).await {
+                            Err(error) => error,
+                            Ok(response) => response.into_body().collect().await.unwrap_err(),
+                        }
+                    }
+                })
+                .await
+                .expect("invalid frame placement must not wait for more bytes");
+                assert_eq!(error.code, ErrorCode::H3_FRAME_UNEXPECTED);
+                assert_eq!(
+                    timeout(Duration::from_secs(1), connection.transport.terminated())
+                        .await
+                        .unwrap(),
+                    error,
+                );
+                drop(peer);
+            }
+        }
+    }
 }

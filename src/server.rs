@@ -16,7 +16,7 @@ use crate::{
         message::{ArcMessage, Message},
     },
     protocol::{
-        frame::{self, Frame, H3Frame, Headers, Write as _},
+        frame::{self, Frame, FrameType, H3Frame, Headers, Write as _},
         stream::{H3ReadStream, H3WriteStream},
     },
 };
@@ -47,8 +47,18 @@ pub fn read_request_body<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
         headers: parts.headers,
         extensions: parts.extensions,
     };
+    let mode = request_body_mode(&head).inspect_err(|error| {
+        common::receive_error(&rs, &qpack, error);
+    })?;
+    let body = body::receive(rs, mode, qpack);
+    Ok(common::Request::Streaming(
+        ArcMessage::from(Message::from_parts(head, body)).into(),
+    ))
+}
+
+fn request_body_mode(head: &headers::RequestHead) -> Result<BodyMode> {
     let length = headers::content_length(&head.headers)?;
-    let mode = if head.method == Method::CONNECT {
+    Ok(if head.method == Method::CONNECT {
         if length.is_some() {
             return Err(
                 ErrorCode::H3_MESSAGE_ERROR.reason("CONNECT must not include Content-Length")
@@ -60,23 +70,24 @@ pub fn read_request_body<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
             Some(content_length) => BodyMode::Length { content_length },
             None => BodyMode::Infinity,
         }
-    };
-    let body = body::receive(rs, mode, qpack);
-    Ok(common::Request::Streaming(
-        ArcMessage::from(Message::from_parts(head, body)).into(),
-    ))
+    })
 }
 
 /// Skip unknown frames and require request HEADERS, distinguishing clean EOF.
 async fn be_headers_frame<R: AsyncRead + Unpin + ?Sized>(rs: &mut R) -> Result<Frame<Headers>> {
     loop {
-        match frame::be_frame_or_eof(rs).await? {
-            None => {
-                return Err(ErrorCode::H3_REQUEST_INCOMPLETE
-                    .reason("request stream ended before request HEADERS"));
-            }
-            Some(H3Frame::Headers(frame)) => return Ok(frame),
-            Some(H3Frame::Unknown { length, .. }) => {
+        let Some(ty) = frame::be_frame_type(rs).await? else {
+            return Err(ErrorCode::H3_REQUEST_INCOMPLETE
+                .reason("request stream ended before request HEADERS"));
+        };
+        if !matches!(ty, FrameType::Headers | FrameType::Unknown(_)) {
+            return Err(ErrorCode::H3_FRAME_UNEXPECTED
+                .reason("expected request HEADERS before message body"));
+        }
+        let length = frame::be_frame_length(rs).await?;
+        match frame::be_frame_payload(rs, ty, length).await? {
+            H3Frame::Headers(frame) => return Ok(frame),
+            H3Frame::Unknown { length, .. } => {
                 frame::skip_payload(rs, length.into_u64()).await?;
             }
             _ => {
@@ -96,22 +107,12 @@ async fn read_head<RS: AsyncRead + StopSending + Unpin>(
         let frame = be_headers_frame(rs).await?;
         let fields = qpack.decode(stream_id, frame.payload.field_section).await?;
         let head = headers::be_request(fields)?;
-        headers::content_length(&head.headers)?;
+        request_body_mode(&head)?;
         Ok(head)
     }
     .await;
     if let Err(error) = &result {
-        rs.close(error.clone());
-        if !matches!(
-            error.code,
-            ErrorCode::H3_REQUEST_CANCELLED
-                | ErrorCode::H3_REQUEST_REJECTED
-                | ErrorCode::H3_REQUEST_INCOMPLETE
-                | ErrorCode::H3_MESSAGE_ERROR
-        ) {
-            qpack.on_error(error.clone());
-        }
-        let _ = qpack.cancel(stream_id);
+        common::receive_error(rs, qpack, error);
     }
     result
 }

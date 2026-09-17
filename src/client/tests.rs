@@ -7,7 +7,10 @@ use super::*;
 use crate::{
     ReadStream,
     common::message::{ReadResponse, WriteRequest, WriteStream},
-    protocol::qpack::{self, ArcQpack, WriteFieldSection},
+    protocol::{
+        frame::be_frame,
+        qpack::{self, ArcQpack, WriteFieldSection},
+    },
 };
 
 mod errors;

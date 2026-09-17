@@ -176,3 +176,119 @@ fn local_errors_preserve_the_first_transport_code() {
         assert_eq!(*cancelled.lock().unwrap(), [code.as_u64()]);
     }
 }
+
+#[tokio::test]
+async fn connect_content_length_queues_message_error_stop_without_fin() {
+    use crate::protocol::{
+        frame::{Frame, Headers, Write as _},
+        qpack::{Field, WriteFieldSection},
+    };
+
+    // Test both the wire HEADERS path and caller-supplied metadata at the public body entry.
+    for read_head in [false, true] {
+        for length in ["0", "invalid"] {
+            let (transport, params, frames) = transport();
+            let (id, (read, write)) = transport.open_bi(&params).await.unwrap().unwrap();
+            let send = H3WriteStream::new(id.into(), write);
+            let connection = crate::test_support::connection().await;
+            let request = http::Request::builder()
+                .method(http::Method::CONNECT)
+                .uri("example.com:443")
+                .header(http::header::CONTENT_LENGTH, length)
+                .body(())
+                .unwrap();
+            let error = if read_head {
+                let mut section = Vec::new();
+                section
+                    .put_field_section(
+                        [
+                            (":method", "CONNECT"),
+                            (":authority", "example.com:443"),
+                            ("content-length", length),
+                        ]
+                        .into_iter()
+                        .map(|(name, value)| Field {
+                            name: bytes::Bytes::copy_from_slice(name.as_bytes()),
+                            value: bytes::Bytes::copy_from_slice(value.as_bytes()),
+                            never_index: false,
+                        }),
+                    )
+                    .unwrap();
+                let mut wire = Vec::new();
+                wire.put_frame(
+                    &Frame::new(Headers {
+                        field_section: section.into(),
+                    })
+                    .unwrap(),
+                );
+                let bytes = bytes::Bytes::from(wire);
+                transport
+                    .recv_data((qbase::frame::StreamFrame::new(id, 0, bytes.len()), bytes))
+                    .unwrap();
+                let mut recv = H3ReadStream::new(id.into(), read);
+                crate::server::read_request_head(&mut recv, connection.qpack())
+                    .await
+                    .err()
+                    .unwrap()
+            } else {
+                crate::server::read_request_body(
+                    request,
+                    H3ReadStream::new(id.into(), read),
+                    connection.qpack().clone(),
+                )
+                .err()
+                .unwrap()
+            };
+            assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
+            {
+                let recorded = frames.0.lock().unwrap();
+                assert_eq!(recorded.len(), 1);
+                assert!(matches!(recorded[0], StreamCtlFrame::StopSending(frame)
+                    if frame.stream_id() == id && frame.app_err_code() == error.code.as_u64()));
+            }
+            assert!(connection.qpack().error().is_none());
+            // A separate stream on the same connection still receives a valid request.
+            let (other_id, (other_read, other_write)) =
+                transport.open_bi(&params).await.unwrap().unwrap();
+            let other_send = H3WriteStream::new(other_id.into(), other_write);
+            let mut section = Vec::new();
+            section
+                .put_field_section(
+                    [
+                        (":method", "GET"),
+                        (":scheme", "https"),
+                        (":authority", "example.com"),
+                        (":path", "/"),
+                    ]
+                    .into_iter()
+                    .map(|(name, value)| Field {
+                        name: bytes::Bytes::copy_from_slice(name.as_bytes()),
+                        value: bytes::Bytes::copy_from_slice(value.as_bytes()),
+                        never_index: false,
+                    }),
+                )
+                .unwrap();
+            let mut wire = Vec::new();
+            wire.put_frame(
+                &Frame::new(Headers {
+                    field_section: section.into(),
+                })
+                .unwrap(),
+            );
+            let bytes = bytes::Bytes::from(wire);
+            transport
+                .recv_data((
+                    qbase::frame::StreamFrame::new(other_id, 0, bytes.len()),
+                    bytes,
+                ))
+                .unwrap();
+            let mut other_recv = H3ReadStream::new(other_id.into(), other_read);
+            let head = crate::server::read_request_head(&mut other_recv, connection.qpack())
+                .await
+                .unwrap();
+            assert_eq!(head.method(), http::Method::GET);
+            drop((other_recv, other_send));
+            drop(send);
+        }
+    }
+}

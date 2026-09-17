@@ -4,13 +4,15 @@ use std::marker::PhantomData;
 use bytes::Bytes;
 use http::{Method, StatusCode};
 use qrecovery::recv::StopSending;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use super::{Read, Write, headers, headers::ResponseHead};
+#[cfg(test)]
+use crate::protocol::frame::be_frame;
 use crate::{
     ArcWndBuf, ErrorCode, Result,
     protocol::{
-        frame::{self, Data, Frame, H3Frame, Write as _, be_frame},
+        frame::{self, Data, Frame, FrameType, H3Frame, Write as _},
         qpack::ArcQpack,
         stream::H3ReadStream,
     },
@@ -151,7 +153,6 @@ pub(crate) fn receive<RS>(
 where
     RS: AsyncRead + StopSending + Unpin + Send + 'static,
 {
-    let stream_id = rs.stream_id();
     let mut buffer = ArcWndBuf::new(frame::MAX_DATA_CHUNK);
     let body = Body::new(buffer.clone());
     tokio::spawn(async move {
@@ -162,14 +163,7 @@ where
             result = read_body(&mut rs, &mut buffer, mode, &qpack) => result,
         };
         if let Err(error) = &result {
-            rs.close(error.clone());
-            if matches!(
-                error.code,
-                ErrorCode::H3_FRAME_ERROR | ErrorCode::H3_FRAME_UNEXPECTED
-            ) {
-                qpack.on_error(error.clone());
-            }
-            let _ = qpack.cancel(stream_id);
+            super::receive_error(&rs, &qpack, error);
             buffer.on_error(error.clone());
         }
         // read_body validates FIN/trailers and marks buffer EOF on success.
@@ -259,19 +253,26 @@ pub(crate) async fn read_body<R: AsyncRead + StopSending + Unpin, W: AsyncWrite 
     let mut remaining = mode.content_length();
     let mut trailers = false;
     let mut frames = 0;
-    while !read_stream.fill_buf().await?.is_empty() {
+    while let Some(ty) = frame::be_frame_type(read_stream).await? {
         frames += 1;
         if frames == 64 {
             frames = 0;
             tokio::task::yield_now().await;
         }
-        let frame = if mode == BodyMode::Connect {
-            frame::be_data_frame(read_stream).await?
-        } else {
-            be_frame(read_stream).await?
+        let allowed = match ty {
+            FrameType::Unknown(_) => true,
+            FrameType::Data => !trailers && !mode.is_forbidden(),
+            FrameType::Headers => !trailers && !mode.is_forbidden() && mode != BodyMode::Connect,
+            _ => false,
         };
+        if !allowed {
+            return Err(ErrorCode::H3_FRAME_UNEXPECTED
+                .reason("frame is not allowed in the current body or trailer state"));
+        }
+        let length = frame::be_frame_length(read_stream).await?;
+        let frame = frame::be_frame_payload(read_stream, ty, length).await?;
         match frame {
-            H3Frame::Data(frame) if !trailers && !mode.is_forbidden() => {
+            H3Frame::Data(frame) => {
                 let count = frame.length.into_u64();
                 if let Some(left) = &mut remaining {
                     *left = left.checked_sub(count).ok_or_else(|| {
@@ -286,9 +287,7 @@ pub(crate) async fn read_body<R: AsyncRead + StopSending + Unpin, W: AsyncWrite 
                         .reason("DATA payload ended before the declared frame length"));
                 }
             }
-            H3Frame::Headers(frame)
-                if !trailers && !mode.is_forbidden() && mode != BodyMode::Connect =>
-            {
+            H3Frame::Headers(frame) => {
                 if remaining.is_some_and(|left| left != 0) {
                     return Err(ErrorCode::H3_MESSAGE_ERROR
                         .reason("trailers arrived before Content-Length bytes were received"));

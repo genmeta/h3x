@@ -14,6 +14,43 @@ pub(crate) mod request;
 pub(crate) mod response;
 pub mod wnd_buf;
 
+/// Apply the message receive error boundary in a consistent order.
+/// QPACK temporarily carries connection failures to the connection task.
+pub(crate) fn receive_error<R: tokio::io::AsyncRead + qrecovery::recv::StopSending + Unpin>(
+    stream: &crate::protocol::stream::H3ReadStream<R>,
+    qpack: &crate::ArcQpack,
+    error: &crate::Error,
+) {
+    use crate::ErrorCode::*;
+    stream.close(error.clone());
+    let connection_error = match error.code {
+        H3_NO_ERROR
+        | H3_REQUEST_REJECTED
+        | H3_REQUEST_CANCELLED
+        | H3_REQUEST_INCOMPLETE
+        | H3_MESSAGE_ERROR
+        | H3_CONNECT_ERROR
+        | H3_VERSION_FALLBACK => false,
+        H3_GENERAL_PROTOCOL_ERROR
+        | H3_INTERNAL_ERROR
+        | H3_STREAM_CREATION_ERROR
+        | H3_CLOSED_CRITICAL_STREAM
+        | H3_FRAME_UNEXPECTED
+        | H3_FRAME_ERROR
+        | H3_EXCESSIVE_LOAD
+        | H3_ID_ERROR
+        | H3_SETTINGS_ERROR
+        | H3_MISSING_SETTINGS
+        | QPACK_DECOMPRESSION_FAILED
+        | QPACK_ENCODER_STREAM_ERROR
+        | QPACK_DECODER_STREAM_ERROR => true,
+    };
+    if connection_error {
+        qpack.on_error(error.clone());
+    }
+    let _ = qpack.cancel(stream.stream_id());
+}
+
 /// Validated, case-sensitive Extended CONNECT protocol token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Protocol(Arc<str>);

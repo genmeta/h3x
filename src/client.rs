@@ -16,7 +16,7 @@ use crate::{
         message::{ArcMessage, Message},
     },
     protocol::{
-        frame::{self, Frame, H3Frame, Headers, Write as _, be_frame},
+        frame::{self, Frame, FrameType, H3Frame, Headers, Write as _},
         qpack::ArcQpack,
         stream::{H3ReadStream, H3WriteStream},
     },
@@ -175,7 +175,15 @@ where
 /// Skip unknown extension frames and require the next known frame to be HEADERS.
 async fn be_headers_frame<R: AsyncRead + Unpin + ?Sized>(rs: &mut R) -> Result<Frame<Headers>> {
     loop {
-        match be_frame(rs).await? {
+        let ty = frame::be_frame_type(rs).await?.ok_or_else(|| {
+            ErrorCode::H3_FRAME_ERROR.reason("response stream ended before response HEADERS")
+        })?;
+        if !matches!(ty, FrameType::Headers | FrameType::Unknown(_)) {
+            return Err(ErrorCode::H3_FRAME_UNEXPECTED
+                .reason("expected response HEADERS before message body"));
+        }
+        let length = frame::be_frame_length(rs).await?;
+        match frame::be_frame_payload(rs, ty, length).await? {
             H3Frame::Headers(frame) => return Ok(frame),
             H3Frame::Unknown { length, .. } => {
                 frame::skip_payload(rs, length.into_u64()).await?;
@@ -223,14 +231,7 @@ async fn read_head<RS: AsyncRead + StopSending + Unpin>(
     }
     .await;
     if let Err(error) = &result {
-        rs.close(error.clone());
-        if matches!(
-            error.code,
-            ErrorCode::H3_FRAME_ERROR | ErrorCode::H3_FRAME_UNEXPECTED
-        ) {
-            qpack.on_error(error.clone());
-        }
-        let _ = qpack.cancel(stream_id);
+        common::receive_error(rs, qpack, error);
     }
     result
 }

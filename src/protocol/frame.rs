@@ -128,55 +128,46 @@ impl GetFrameType for H3Frame {
     }
 }
 
-/// Distinguish clean EOF before a frame from a truncated frame type or payload.
-pub(crate) async fn be_frame_or_eof<T: AsyncRead + Unpin + ?Sized>(
-    reader: &mut T,
-) -> Result<Option<H3Frame>> {
-    let mut first = [0];
-    if reader.read(&mut first).await? == 0 {
-        return Ok(None);
-    }
-    be_frame(&mut first.as_slice().chain(reader))
-        .await
-        .map(Some)
-}
-
 /// Read Type, Length, and one payload. DATA and unknown payload bytes remain in
 /// the reader and must be consumed before calling again. HEADERS/PUSH_PROMISE
 /// retain encoded QPACK bytes; after validating placement, pass the field section
 /// to Qpack::decode to resolve its fields.
 /// EOF (including a partial frame) is an error.
 /// Cancellation can consume a prefix; keep polling the same future.
+#[cfg(test)]
 pub(crate) async fn be_frame<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<H3Frame> {
-    let ty = read_frame_type(reader).await?;
-    let length = read_frame_length(reader).await?;
+    let ty = be_frame_type(reader)
+        .await?
+        .ok_or_else(|| ErrorCode::H3_FRAME_ERROR.reason("frame is missing a complete type"))?;
+    let length = be_frame_length(reader).await?;
     be_frame_payload(reader, ty, length).await
 }
 
-/// CONNECT accepts DATA and unknown frames only. Reject other types before
-/// reading their length or payload, even if that payload never arrives.
-pub(crate) async fn be_data_frame<T: AsyncRead + Unpin + ?Sized>(
+/// Return None at a frame boundary; a truncated type is a framing error.
+pub(crate) async fn be_frame_type<T: AsyncRead + Unpin + ?Sized>(
     reader: &mut T,
-) -> Result<H3Frame> {
-    let ty = read_frame_type(reader).await?;
-    if !matches!(ty, FrameType::Data | FrameType::Unknown(_)) {
-        return Err(ErrorCode::H3_FRAME_UNEXPECTED
-            .reason("only DATA and unknown frames are allowed after CONNECT acceptance"));
+) -> Result<Option<FrameType>> {
+    let mut first = [0];
+    if reader
+        .read(&mut first)
+        .await
+        .map_err(crate::Error::from_frame_io)?
+        == 0
+    {
+        return Ok(None);
     }
-    let length = read_frame_length(reader).await?;
-    be_frame_payload(reader, ty, length).await
-}
-
-async fn read_frame_type<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<FrameType> {
-    let ty = be_varint(reader)
+    let ty = be_varint(&mut first.as_slice().chain(reader))
         .await
         .map_err(crate::Error::from_frame_io)?;
     ty.ok_or_else(|| ErrorCode::H3_FRAME_ERROR.reason("frame is missing a complete type"))?
         .into_u64()
         .try_into()
+        .map(Some)
 }
 
-async fn read_frame_length<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Result<VarInt> {
+pub(crate) async fn be_frame_length<T: AsyncRead + Unpin + ?Sized>(
+    reader: &mut T,
+) -> Result<VarInt> {
     be_varint(reader)
         .await
         .map_err(crate::Error::from_frame_io)?
