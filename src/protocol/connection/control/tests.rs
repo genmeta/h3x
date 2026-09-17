@@ -307,7 +307,7 @@ async fn transport_termination_wakes_goaway_waiting_for_peer() {
             .is_pending()
     );
     let error =
-        ErrorCode::H3_INTERNAL_ERROR.with_reason("transport terminated while awaiting peer");
+        ErrorCode::H3_INTERNAL_ERROR.reason("transport terminated while awaiting peer");
     connection
         .transport
         .close(error.reason.clone(), error.code.as_u64())

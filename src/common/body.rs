@@ -68,7 +68,7 @@ impl Body<ArcWndBuf, Write> {
 
     pub async fn reset(self) -> Result<()> {
         self.storage
-            .on_error(ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"));
+            .on_error(ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled"));
         Ok(())
     }
 }
@@ -96,12 +96,49 @@ impl Body<ArcWndBuf, Read> {
     }
     pub async fn stop(self) {
         self.storage
-            .on_error(ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"));
+            .on_error(ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled"));
     }
     pub async fn collect(mut self) -> Result<Bytes> {
         let mut bytes = Vec::new();
         self.storage.read_to_end(&mut bytes).await?;
         Ok(bytes.into())
+    }
+}
+
+// Directional bodies can be passed to Tokio copy helpers and application codecs.
+impl AsyncRead for Body<ArcWndBuf, Read> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        output: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().storage).poll_read(cx, output)
+    }
+}
+
+impl AsyncWrite for Body<ArcWndBuf, Write> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        input: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().storage).poll_write(cx, input)
+    }
+
+    /// Flush exposes bytes to the upload task; it does not await transport delivery.
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().storage).poll_flush(cx)
+    }
+
+    /// Finish production; the upload task drains the buffer before sending FIN.
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().storage).poll_shutdown(cx)
     }
 }
 
@@ -145,29 +182,60 @@ where
 pub(crate) enum BodyMode {
     Forbidden,
     Infinity,
-    Length { content_length: u64 },
+    /// CONNECT DATA has no Content-Length or trailing HEADERS.
+    Connect,
+    Length {
+        content_length: u64,
+    },
 }
 
 impl BodyMode {
-    /// Resolve body rules from final response headers and the request method.
+    /// Validate an outgoing final response and resolve its body framing.
     pub(crate) fn resolve(response: &ResponseHead, method: Option<&Method>) -> Result<Self> {
-        let content_length = headers::content_length(&response.headers)?;
         let status = response.status()?;
+        if status.is_informational() {
+            return Err(ErrorCode::H3_MESSAGE_ERROR
+                .reason("a final response cannot use an informational status"));
+        }
+        if method == Some(&Method::CONNECT) && status.is_success() {
+            if response.headers.contains_key(http::header::CONTENT_LENGTH) {
+                return Err(ErrorCode::H3_MESSAGE_ERROR
+                    .reason("successful CONNECT must not include Content-Length"));
+            }
+            return Ok(Self::Connect);
+        }
+        if status == StatusCode::NO_CONTENT
+            && response.headers.contains_key(http::header::CONTENT_LENGTH)
+        {
+            return Err(
+                ErrorCode::H3_MESSAGE_ERROR.reason("204 response must not include Content-Length")
+            );
+        }
+        let content_length = headers::content_length(&response.headers)?;
+        Ok(Self::from_parts(status, method, content_length))
+    }
+
+    /// Resolve ordinary body framing from already validated metadata.
+    pub(crate) fn from_parts(
+        status: StatusCode,
+        method: Option<&Method>,
+        content_length: Option<u64>,
+    ) -> Self {
         if method == Some(&Method::HEAD) {
-            return Ok(Self::Forbidden);
+            return Self::Forbidden;
         }
         if matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED) {
-            return Ok(Self::Forbidden);
+            return Self::Forbidden;
         }
-        Ok(match content_length {
+        match content_length {
             Some(content_length) => Self::Length { content_length },
             None => Self::Infinity,
-        })
+        }
     }
 
     pub(crate) fn content_length(self) -> Option<u64> {
         match self {
-            Self::Forbidden | Self::Infinity => None,
+            Self::Forbidden | Self::Infinity | Self::Connect => None,
             Self::Length { content_length } => Some(content_length),
         }
     }
@@ -190,28 +258,40 @@ pub(crate) async fn read_body<R: AsyncRead + StopSending + Unpin, W: AsyncWrite 
     let read_stream = &mut reader;
     let mut remaining = mode.content_length();
     let mut trailers = false;
+    let mut frames = 0;
     while !read_stream.fill_buf().await?.is_empty() {
-        match be_frame(read_stream).await? {
+        frames += 1;
+        if frames == 64 {
+            frames = 0;
+            tokio::task::yield_now().await;
+        }
+        let frame = if mode == BodyMode::Connect {
+            frame::be_data_frame(read_stream).await?
+        } else {
+            be_frame(read_stream).await?
+        };
+        match frame {
             H3Frame::Data(frame) if !trailers && !mode.is_forbidden() => {
                 let count = frame.length.into_u64();
                 if let Some(left) = &mut remaining {
                     *left = left.checked_sub(count).ok_or_else(|| {
                         ErrorCode::H3_MESSAGE_ERROR
-                            .with_reason("DATA exceeds the remaining Content-Length")
+                            .reason("DATA exceeds the remaining Content-Length")
                     })?;
                 }
                 let mut payload = (&mut *read_stream).take(count);
                 tokio::io::copy_buf(&mut payload, body).await?;
                 if payload.limit() != 0 {
                     return Err(ErrorCode::H3_FRAME_ERROR
-                        .with_reason("DATA payload ended before the declared frame length"));
+                        .reason("DATA payload ended before the declared frame length"));
                 }
             }
-            H3Frame::Headers(frame) if !trailers && !mode.is_forbidden() => {
+            H3Frame::Headers(frame)
+                if !trailers && !mode.is_forbidden() && mode != BodyMode::Connect =>
+            {
                 if remaining.is_some_and(|left| left != 0) {
-                    return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason(
-                        "trailers arrived before Content-Length bytes were received",
-                    ));
+                    return Err(ErrorCode::H3_MESSAGE_ERROR
+                        .reason("trailers arrived before Content-Length bytes were received"));
                 }
                 let fields = qpack
                     .decode(
@@ -227,13 +307,13 @@ pub(crate) async fn read_body<R: AsyncRead + StopSending + Unpin, W: AsyncWrite 
             }
             _ => {
                 return Err(ErrorCode::H3_FRAME_UNEXPECTED
-                    .with_reason("frame is not allowed in the current body or trailer state"));
+                    .reason("frame is not allowed in the current body or trailer state"));
             }
         }
     }
     if remaining.is_some_and(|left| left != 0) {
         return Err(ErrorCode::H3_MESSAGE_ERROR
-            .with_reason("body ended before Content-Length bytes were received"));
+            .reason("body ended before Content-Length bytes were received"));
     }
     body.shutdown().await?;
     Ok(())
@@ -266,20 +346,18 @@ pub(crate) async fn write_streaming_body<R: AsyncRead + Unpin, W: AsyncWrite + U
     let mut sent = 0u64;
     loop {
         let count = source.read(&mut buf).await?;
-        sent = sent.checked_add(count as u64).ok_or_else(|| {
-            ErrorCode::H3_MESSAGE_ERROR.with_reason("sent body length overflowed u64")
-        })?;
+        sent = sent
+            .checked_add(count as u64)
+            .ok_or_else(|| ErrorCode::H3_MESSAGE_ERROR.reason("sent body length overflowed u64"))?;
         match mode {
             BodyMode::Forbidden if count != 0 => {
-                return Err(
-                    ErrorCode::H3_MESSAGE_ERROR.with_reason("response semantics forbid a body")
-                );
+                return Err(ErrorCode::H3_MESSAGE_ERROR.reason("response semantics forbid a body"));
             }
             BodyMode::Length { content_length }
                 if sent > content_length || (count == 0 && sent != content_length) =>
             {
                 return Err(ErrorCode::H3_MESSAGE_ERROR
-                    .with_reason("streamed body length does not match Content-Length"));
+                    .reason("streamed body length does not match Content-Length"));
             }
             _ => {}
         }
@@ -290,6 +368,7 @@ pub(crate) async fn write_streaming_body<R: AsyncRead + Unpin, W: AsyncWrite + U
         frame.put_frame(&Frame::new(Data(count))?);
         send.write_all(&frame).await?;
         send.write_all(&buf[..count]).await?;
+        send.flush().await?;
     }
 }
 
@@ -434,3 +513,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "body/connect_tests.rs"]
+mod connect_tests;

@@ -54,7 +54,7 @@ async fn dquic_queues_stop_and_reset_for_local_error_goaway_and_drop() {
         let (send, recv) = streams.insert(id.into(), read, write).unwrap();
         let code = match cause {
             "error" => {
-                recv.close(ErrorCode::H3_MESSAGE_ERROR.with_reason("invalid message"));
+                recv.close(ErrorCode::H3_MESSAGE_ERROR.reason("invalid message"));
                 (&send).cancel(ErrorCode::H3_MESSAGE_ERROR.as_u64());
                 ErrorCode::H3_MESSAGE_ERROR
             }
@@ -167,9 +167,9 @@ fn local_errors_preserve_the_first_transport_code() {
         let cancelled = write.cancelled.clone();
         let recv = H3ReadStream::new(0, read);
         let send = H3WriteStream::new(0, write);
-        recv.close(code.with_reason("read error"));
+        recv.close(code.reason("read error"));
         (&send).cancel(code.as_u64());
-        recv.close(ErrorCode::H3_INTERNAL_ERROR.with_reason("later error"));
+        recv.close(ErrorCode::H3_INTERNAL_ERROR.reason("later error"));
         (&send).cancel(ErrorCode::H3_INTERNAL_ERROR.as_u64());
         drop((recv, send));
         assert_eq!(*stopped.lock().unwrap(), [code.as_u64()]);

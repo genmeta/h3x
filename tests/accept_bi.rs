@@ -72,7 +72,7 @@ async fn application_drives_acceptance_and_receives_transport_errors() {
     let (connection, calls) = connection([
         Ok(1),
         Ok(5),
-        Err(ErrorCode::H3_INTERNAL_ERROR.with_reason("test transport failed to accept a stream")),
+        Err(ErrorCode::H3_INTERNAL_ERROR.reason("test transport failed to accept a stream")),
     ])
     .await;
     tokio::task::yield_now().await;

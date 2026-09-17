@@ -47,21 +47,14 @@ impl WriteBody for Request<Write, Bytes> {
     }
 }
 
-impl Request<Write, Bytes> {
-    /// Construct an empty CONNECT handshake, without opening a connection.
-    /// `ws://` and `wss://` select the websocket protocol and map to http/https.
-    /// Authority-form targets (for example `example.com:443`) use plain CONNECT.
-    pub fn connect(url: &str) -> Result<Self> {
-        <Self as WriteRequest>::new(url, Method::CONNECT)
-    }
-
-    pub fn body(mut self, body: Bytes) -> Self {
-        self.set_body(body);
-        self
-    }
-}
-
 impl Request<Write, ArcWndBuf> {
+    /// Construct a streaming CONNECT request without opening a connection.
+    /// `ws://` and `wss://` select WebSocket; authority-form targets use plain CONNECT.
+    /// Retain `body()` and wait for successful response headers before writing.
+    pub fn connect(url: &str) -> Result<Self> {
+        Self::streaming(url, Method::CONNECT)
+    }
+
     fn streaming(url: &str, method: Method) -> Result<Self> {
         let message = Message::new_request_with_body(
             url,
@@ -124,7 +117,7 @@ impl WriteStream for Request<Write, ArcWndBuf> {
 }
 
 impl<IO, B> ReadRequest for Request<IO, B> {
-    fn protocol(&self) -> Option<crate::ext::Protocol> {
+    fn protocol(&self) -> Option<crate::Protocol> {
         self.message.head.lock().unwrap().protocol()
     }
     fn method(&self) -> Method {
@@ -167,8 +160,8 @@ impl<IO, B: Clone> Request<IO, B> {
 
 impl<B: Clone> Request<Write, B> {
     /// Retain a body producer independently of the message being sent.
-    pub fn body_handle(&self) -> super::body::Body<B, Write> {
-        self.message.body_handle()
+    pub fn body(&self) -> super::body::Body<B, Write> {
+        self.message.body()
     }
 }
 
@@ -309,7 +302,7 @@ mod tests {
         let mut writer = Request::<Write>::post("https://example.com/a?q=1")
             .unwrap()
             .header(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))
-            .body(Bytes::from_static(b"hello"));
+            .with_body(h3x::Body::new(Bytes::from_static(b"hello")));
         let reader = Request::<Read>::from(writer.message.test_direction());
         assert_eq!(reader.method(), Method::POST);
         assert_eq!(reader.authority(), "example.com");

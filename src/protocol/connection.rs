@@ -96,7 +96,7 @@ impl<T: Transport> H3Connection<T> {
         self.cursor.remote.lock().unwrap().not_goaway()?;
         let (id, (mut recv, mut send)) = self.transport.open_bi().await?.ok_or_else(|| {
             ErrorCode::H3_STREAM_CREATION_ERROR
-                .with_reason("transport cannot open a bidirectional stream")
+                .reason("transport cannot open a bidirectional stream")
         })?;
         // Keep admission and registration atomic with respect to peer GOAWAY.
         let cursor_remote = self.cursor.remote.lock().unwrap();
@@ -146,11 +146,10 @@ impl<T: Transport> H3Connection<T> {
         let stream_id = qbase::varint::VarInt::try_from(id)
             .map(qbase::sid::StreamId::from)
             .map_err(|error| {
-                ErrorCode::H3_ID_ERROR
-                    .with_reason(format!("invalid stream or push identifier: {error}"))
+                ErrorCode::H3_ID_ERROR.reason(format!("invalid stream or push identifier: {error}"))
             });
-        let mut admission = self.cursor.local.lock().unwrap();
-        if let Err(error) = stream_id.and_then(|id| admission.accept(id)) {
+        let mut local_cursor = self.cursor.local.lock().unwrap();
+        if let Err(error) = stream_id.and_then(|id| local_cursor.accept(id)) {
             read.stop(ErrorCode::H3_REQUEST_REJECTED.as_u64());
             write.cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64());
             return Err(error);
@@ -184,7 +183,7 @@ pub(super) async fn sync_encoder<T: crate::Transport>(
         error = transport.terminated() => Err(error),
         result = async {
             let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
-                ErrorCode::H3_STREAM_CREATION_ERROR.with_reason("unable to create the required stream")
+                ErrorCode::H3_STREAM_CREATION_ERROR.reason("unable to create the required stream")
             })?;
             qpack.write_encoder(instructions, &mut send).await
         } => result,
@@ -207,7 +206,7 @@ pub(super) async fn sync_decoder<T: crate::Transport>(
         error = transport.terminated() => Err(error),
         result = async {
             let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
-                ErrorCode::H3_STREAM_CREATION_ERROR.with_reason("unable to create the required stream")
+                ErrorCode::H3_STREAM_CREATION_ERROR.reason("unable to create the required stream")
             })?;
             qpack.write_decoder(instructions, &mut send).await
         } => result,

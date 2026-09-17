@@ -59,10 +59,10 @@ impl<H, B> Message<H, B> {
 impl<B> Message<RequestHead, B> {
     pub(crate) fn new_request_with_body(url: &str, method: Method, body: B) -> Result<Self> {
         if url.contains('#') {
-            return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason("URI fragments are forbidden"));
+            return Err(ErrorCode::H3_MESSAGE_ERROR.reason("URI fragments are forbidden"));
         }
         let mut uri: Uri = url.parse().map_err(|error| {
-            ErrorCode::H3_MESSAGE_ERROR.with_reason(format!("invalid request URI: {error}"))
+            ErrorCode::H3_MESSAGE_ERROR.reason(format!("invalid request URI: {error}"))
         })?;
         let websocket_scheme = if method == Method::CONNECT {
             match uri.scheme_str() {
@@ -80,7 +80,7 @@ impl<B> Message<RequestHead, B> {
             let mut parts = uri.into_parts();
             parts.scheme = Some(scheme);
             uri = Uri::from_parts(parts).map_err(|error| {
-                ErrorCode::H3_MESSAGE_ERROR.with_reason(format!("invalid request URI: {error}"))
+                ErrorCode::H3_MESSAGE_ERROR.reason(format!("invalid request URI: {error}"))
             })?;
         }
         // CONNECT also accepts an authority-form target such as example.com:443.
@@ -90,15 +90,15 @@ impl<B> Message<RequestHead, B> {
             && uri.path_and_query().is_none();
         if !authority_form && (uri.scheme().is_none() || uri.authority().is_none()) {
             return Err(ErrorCode::H3_MESSAGE_ERROR
-                .with_reason("request URI requires scheme and authority"));
+                .reason("request URI requires scheme and authority"));
         }
         if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
-            return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason("userinfo is forbidden"));
+            return Err(ErrorCode::H3_MESSAGE_ERROR.reason("userinfo is forbidden"));
         }
         let mut extensions = http::Extensions::new();
         let mut headers = HeaderMap::new();
         if websocket {
-            extensions.insert(crate::ext::Protocol::new("websocket")?);
+            extensions.insert(crate::Protocol::new("websocket")?);
             headers.insert("sec-websocket-version", HeaderValue::from_static("13"));
         }
         let uri = if method == Method::CONNECT && !websocket {
@@ -107,7 +107,7 @@ impl<B> Message<RequestHead, B> {
                 .build()
                 .map_err(|error| {
                     ErrorCode::H3_MESSAGE_ERROR
-                        .with_reason(format!("invalid CONNECT authority: {error}"))
+                        .reason(format!("invalid CONNECT authority: {error}"))
                 })?
         } else {
             uri
@@ -210,7 +210,7 @@ pub trait WriteStream: Sized {
 
 /// Server-side view of request metadata.
 pub trait ReadRequest: Sized {
-    fn protocol(&self) -> Option<crate::ext::Protocol> {
+    fn protocol(&self) -> Option<crate::Protocol> {
         None
     }
     fn method(&self) -> Method;
@@ -274,7 +274,7 @@ impl<B: Default> WriteRequest for Message<RequestHead, B> {
 }
 
 impl ReadRequest for RequestHead {
-    fn protocol(&self) -> Option<crate::ext::Protocol> {
+    fn protocol(&self) -> Option<crate::Protocol> {
         self.extensions.get().cloned()
     }
     fn method(&self) -> Method {
@@ -305,7 +305,7 @@ impl ReadRequest for RequestHead {
 }
 
 impl<B> ReadRequest for Message<RequestHead, B> {
-    fn protocol(&self) -> Option<crate::ext::Protocol> {
+    fn protocol(&self) -> Option<crate::Protocol> {
         self.head.protocol()
     }
     fn method(&self) -> Method {
@@ -484,7 +484,7 @@ impl<H: Clone, B> ArcMessage<H, B> {
 }
 
 impl<H, B: Clone, IO> ArcMessage<H, Body<B, IO>> {
-    pub(crate) fn body_handle(&self) -> Body<B, IO> {
+    pub(crate) fn body(&self) -> Body<B, IO> {
         Body::new(self.body.lock().unwrap().storage.clone())
     }
 
@@ -518,11 +518,11 @@ impl<H, IO> ArcMessage<H, Body<crate::ArcWndBuf, IO>> {
 #[async_trait]
 impl<H: Send> ReadStream for ArcMessage<H, Body<crate::ArcWndBuf, Read>> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.body_handle().read(buf).await
+        self.body().read(buf).await
     }
 
     async fn read_all(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let mut body = self.body_handle();
+        let mut body = self.body();
         let mut count = 0;
         while count < buf.len() {
             let n = body.read(&mut buf[count..]).await?;
@@ -542,11 +542,11 @@ impl<H: Send> ReadStream for ArcMessage<H, Body<crate::ArcWndBuf, Read>> {
 #[async_trait]
 impl<H: Send> WriteStream for ArcMessage<H, Body<crate::ArcWndBuf, Write>> {
     async fn write<T: AsRef<[u8]> + Send>(&mut self, chunk: T) -> Result<usize> {
-        self.body_handle().write(chunk).await
+        self.body().write(chunk).await
     }
 
     async fn finish(&mut self) -> Result<()> {
-        self.body_handle().finish().await
+        self.body().finish().await
     }
 
     async fn reset(self) -> Result<()> {

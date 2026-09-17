@@ -29,7 +29,7 @@ impl Settings {
             Ok((
                 VarInt::from_u32(id),
                 VarInt::try_from(value).map_err(|error| {
-                    ErrorCode::H3_SETTINGS_ERROR.with_reason(format!(
+                    ErrorCode::H3_SETTINGS_ERROR.reason(format!(
                         "SETTINGS value exceeds the QUIC variable-integer range: {error}"
                     ))
                 })?,

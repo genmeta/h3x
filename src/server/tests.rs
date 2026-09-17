@@ -1,6 +1,6 @@
 use std::{io::Cursor, sync::Arc};
 
-use http::{HeaderValue, Method, header};
+use http::{HeaderValue, Method, StatusCode, header};
 use tokio::io::duplex;
 
 use super::*;
@@ -10,7 +10,7 @@ use crate::{
         ReadBody, ReadRequest, ReadResponse, WriteBody, WriteRequest, WriteResponse, WriteStream,
     },
     protocol::{
-        frame::be_frame,
+        frame::{Data, be_frame},
         qpack::{self, WriteFieldSection},
     },
 };

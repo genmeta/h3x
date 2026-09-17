@@ -33,7 +33,7 @@ impl<W: CancelStream> H3WriteStream<W> {
 impl<W: CancelStream> CancelStream for &H3WriteStream<W> {
     fn cancel(&mut self, error_code: u64) {
         let wakers = self.state.lock().unwrap().close(
-            ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"),
+            ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled"),
             |io| io.cancel(error_code),
         );
         for waker in wakers.into_iter().flatten() {
@@ -136,7 +136,7 @@ mod tests {
                 .poll_read(&mut cx, &mut buf)
                 .is_pending()
         );
-        recv.close(ErrorCode::H3_REQUEST_REJECTED.with_reason("test rejects the active request"));
+        recv.close(ErrorCode::H3_REQUEST_REJECTED.reason("test rejects the active request"));
         assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
         let Poll::Ready(Err(error)) = Pin::new(&mut recv).poll_read(&mut cx, &mut buf) else {
             panic!("closed receive stream must fail");
@@ -224,7 +224,7 @@ mod tests {
             recv.state.lock().unwrap().status,
             StreamStatus::Idle(_)
         ));
-        recv.close(ErrorCode::H3_REQUEST_REJECTED.with_reason("test rejects the active request"));
+        recv.close(ErrorCode::H3_REQUEST_REJECTED.reason("test rejects the active request"));
         assert!(matches!(
             recv.state.lock().unwrap().status,
             StreamStatus::Closed(ref error) if error.get_ref()

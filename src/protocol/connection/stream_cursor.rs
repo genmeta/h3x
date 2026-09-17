@@ -56,7 +56,7 @@ impl StreamCursor {
                 Cursor::Max(_) => {}
             }
             self.remote_goaway.clone().await.map_err(|error| {
-                ErrorCode::H3_INTERNAL_ERROR.with_reason(format!("GOAWAY wait cancelled: {error}"))
+                ErrorCode::H3_INTERNAL_ERROR.reason(format!("GOAWAY wait cancelled: {error}"))
             })?;
         }
     }
@@ -66,7 +66,7 @@ impl Cursor {
     pub(super) fn not_goaway(&self) -> Result<()> {
         match self {
             Self::Max(_) => Ok(()),
-            Self::Gone(_) => Err(ErrorCode::H3_REQUEST_REJECTED.with_reason("request rejected")),
+            Self::Gone(_) => Err(ErrorCode::H3_REQUEST_REJECTED.reason("request rejected")),
         }
     }
 
@@ -75,19 +75,19 @@ impl Cursor {
             Self::Max(boundary) => {
                 if id.role() != boundary.role() || id.dir() != Dir::Bi {
                     return Err(
-                        ErrorCode::H3_ID_ERROR.with_reason("invalid stream or push identifier")
+                        ErrorCode::H3_ID_ERROR.reason("invalid stream or push identifier")
                     );
                 }
                 if id >= *boundary {
                     // A GOAWAY boundary must still fit in a QUIC variable integer.
                     let next = VarInt::try_from(u64::from(id) + 4).map_err(|_| {
-                        ErrorCode::H3_ID_ERROR.with_reason("invalid stream or push identifier")
+                        ErrorCode::H3_ID_ERROR.reason("invalid stream or push identifier")
                     })?;
                     *boundary = StreamId::from(next);
                 }
                 Ok(())
             }
-            Self::Gone(_) => Err(ErrorCode::H3_REQUEST_REJECTED.with_reason("request rejected")),
+            Self::Gone(_) => Err(ErrorCode::H3_REQUEST_REJECTED.reason("request rejected")),
         }
     }
 }

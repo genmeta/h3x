@@ -6,7 +6,7 @@ async fn dropping_last_producer_does_not_finish_or_cancel_sending() {
     let mut response = Response::<Bytes>::default();
     response.set_status(StatusCode::OK);
     let response = response.streaming(1);
-    let producer = response.body_handle();
+    let producer = response.body();
     let buffer = response.message.body_stream();
     let mut sending = Box::pin(crate::server::write_streaming_response(
         response,
@@ -20,7 +20,7 @@ async fn dropping_last_producer_does_not_finish_or_cancel_sending() {
     assert!(sending.as_mut().poll(&mut cx).is_pending());
     // Only an explicit buffer error terminates the send operation.
     buffer.on_error(
-        ErrorCode::H3_REQUEST_CANCELLED.with_reason("test cancels the response producer"),
+        ErrorCode::H3_REQUEST_CANCELLED.reason("test cancels the response producer"),
     );
     assert_eq!(
         (sending.await).map_err(ErrorCode::from),
@@ -198,7 +198,7 @@ async fn streaming_response_termination_reaches_the_producer() {
                     );
                     // These test writers are independent of the transport; apply
                     // the connection's stream closure before resuming body I/O.
-                    bi.close(error.with_reason("test closes the stream during response upload"));
+                    bi.close(error.reason("test closes the stream during response upload"));
                 }
                 // Resume body I/O so the send operation observes the terminal stream.
                 producer.write(b"x").await.unwrap();
@@ -356,7 +356,7 @@ async fn dropping_received_body_does_not_stop_network_reads() {
         assert_eq!(bytes, *b"x");
         // Subsequent body I/O observes cancellation; dropping Body did not cancel it.
         buffer.on_error(
-            ErrorCode::H3_REQUEST_CANCELLED.with_reason("test cancels the response producer"),
+            ErrorCode::H3_REQUEST_CANCELLED.reason("test cancels the response producer"),
         );
     })
     .await
@@ -398,5 +398,35 @@ async fn explicit_body_stop_notifies_transport_while_network_or_window_is_blocke
             *stopped.lock().unwrap(),
             [ErrorCode::H3_REQUEST_CANCELLED.as_u64()]
         );
+    }
+}
+
+#[tokio::test]
+async fn reset_wakes_response_writer_blocked_on_transport() {
+    for method in [Method::POST, Method::CONNECT] {
+        let mut response = Response::default().streaming(1);
+        response.set_status(StatusCode::OK);
+        let producer = response.body();
+        let connection = crate::test_support::connection().await;
+        let (send, _peer) = tokio::io::duplex(1);
+        let mut sending = Box::pin(super::write_streaming_response(
+            response,
+            crate::test_support::write_stream(0, send),
+            connection.qpack().clone(),
+            &method,
+        ));
+        use std::task::{Context, Waker};
+        assert!(
+            sending
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        producer.reset().await.unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), sending)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::H3_REQUEST_CANCELLED);
     }
 }

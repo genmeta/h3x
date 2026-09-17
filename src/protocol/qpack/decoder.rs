@@ -29,7 +29,7 @@ impl Decoder {
                 max_fields,
                 Box::new(|_| {
                     Err(ErrorCode::H3_INTERNAL_ERROR
-                        .with_reason("instruction callback is not registered"))
+                        .reason("instruction callback is not registered"))
                 }),
             )?,
         })
@@ -50,10 +50,10 @@ impl Decoder {
         payload: &[u8],
     ) -> Result<(usize, FieldSectionPrefix)> {
         if id > qbase::varint::VARINT_MAX {
-            return Err(ErrorCode::H3_INTERNAL_ERROR.with_reason("invalid stream ID"));
+            return Err(ErrorCode::H3_INTERNAL_ERROR.reason("invalid stream ID"));
         }
         if self.state.decoding_stream.contains(&id) {
-            return Err(ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"));
+            return Err(ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled"));
         }
         let (rest, prefix) = self.state.read_prefix(payload)?;
         let offset = payload.len() - rest.len();
@@ -69,7 +69,7 @@ impl Decoder {
     ) -> Poll<Result<Vec<Field>>> {
         if !self.state.decoding_stream.contains(&id) {
             return Poll::Ready(Err(
-                ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled")
+                ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled")
             ));
         }
         let result = self.state.poll_decode(id, prefix, payload, cx);
@@ -123,7 +123,7 @@ mod tests {
             receiver.poll_recv(cx).map(|instruction| {
                 instruction.ok_or_else(|| {
                     ErrorCode::H3_CLOSED_CRITICAL_STREAM
-                        .with_reason("critical HTTP/3 stream closed")
+                        .reason("critical HTTP/3 stream closed")
                 })
             })
         }

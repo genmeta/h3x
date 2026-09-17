@@ -58,20 +58,22 @@ accepts a WndBuf body. Both take `(request, write_stream, read_stream, qpack)`,
 start the upload in an internal task, and return an
 `IntoFuture<Output = Result<Response>>`.
 The response future carries the request method automatically, including HEAD
-semantics. CONNECT uses the dedicated handshake API described below. Uploads continue independently after an early response or after
+semantics. CONNECT uses the same streaming entry point, with handshake behavior
+described below. Ordinary uploads continue independently after an early response or after
 the response future is dropped. Use the body producer's `finish()` or `reset()` to
 terminate a streaming upload.
-If upload fails before a response is ready, the response future returns that
-failure. A response already ready takes priority; receiving it does not abort upload.
+Upload failures cancel the write direction and notify streaming body producers;
+they do not fail the response future. Response reception continues independently,
+so callers should apply a timeout or cancel the response future when appropriate.
+Receiving a response does not abort upload.
 
 ```rust,no_run
 # use h3x::{Body, WndBuf, W, ArcQpack, H3ReadStream, H3WriteStream, WriteRequest, Result, client};
 # async fn example<RS, WS>(rs: H3ReadStream<RS>, ws: H3WriteStream<WS>, qpack: ArcQpack) -> Result<()>
 # where RS: qrecovery::recv::StopSending + tokio::io::AsyncRead + Unpin + Send + 'static,
 # WS: qrecovery::send::CancelStream + tokio::io::AsyncWrite + Unpin + Send + 'static {
-let mut upload = Body::<WndBuf, W>::with_capacity(16 * 1024);
-let request = client::Request::post("https://example.com/upload")?
-    .with_body(upload.clone());
+let request = client::Request::streaming_post("https://example.com/upload")?;
+let mut upload = request.body();
 let response = client::write_streaming_request(request, ws, rs, qpack)?;
 
 let (received, produced) = tokio::join!(
@@ -94,7 +96,7 @@ original request before consuming it. Both writers finish their transport direct
 only after sending the body. Drive streaming production concurrently with writing.
 
 `Body<Bytes, W>` and `Body<WndBuf, W>` are outgoing bodies. `with_body` attaches a body;
-`body_handle` retains a producer independently of the outgoing message. Incoming
+`body()` retains a producer independently of the outgoing message. Incoming
 messages expose `into_body()`, with `read`, `collect`, and `stop` operations. Individual
 body variants have direction `R`; incoming body handles cannot write or finish.
 Existing message-level body access and streaming constructors remain available.
@@ -113,7 +115,8 @@ Content-Length alone does not finish reception: trailing frames and EOF are stil
 validated. Errors reach waiting readers through the buffer. Calling `stop` cancels
 the task even while it is waiting for network input or space. Dropping a Body does
 not signal EOF or cancellation.
-Small known-length bodies are collected as Bytes before the message is returned.
+Incoming bodies are returned as streaming handles after HEADERS, including bodies
+with a known Content-Length.
 
 Dropping the response future does not stop its internal upload task. Use `reset()`
 to cancel an outgoing body and wake blocked operations. A successful producer
@@ -161,73 +164,91 @@ setting `Sec-WebSocket-Version: 13`. They preserve the path and query and reject
 userinfo and fragments. `Request::connect("host:443")` constructs plain CONNECT.
 Construction does not dial a backend or open an HTTP/3 stream.
 
+CONNECT uses the same streaming body handles as ordinary requests and responses.
+`Request::connect` returns `Request<WndBuf>`. Retain `request.body()` before sending:
+
 ```rust,no_run
-# use h3x::{client, H3Connection, Transport};
+# use h3x::{client, ReadResponse, H3Connection, Transport};
 # async fn connect<T: Transport>(connection: &H3Connection<T>) -> Result<(), Box<dyn std::error::Error>> {
 let request = client::Request::connect("wss://home.example/api/websocket")?;
+let mut send = request.body();
 let (ws, rs) = connection.open_bi().await?;
-match client::connect(request, ws, rs, connection.qpack().clone()).await {
-    Ok((response, mut tunnel)) => {
-        assert!(response.status().is_success());
-        // Drive tunnel with AsyncRead/AsyncWrite, or copy_bidirectional.
-        // Only send WebSocket frame bytes after the handshake succeeds.
-        tunnel.finish().await?;
-    }
-    Err(client::ConnectError::Rejected(response)) => {
-        // Status, headers, and ordinary response body remain available.
-    }
-    Err(error) => return Err(error.into()),
+let response = client::write_streaming_request(
+    request, ws, rs, connection.qpack().clone(),
+)?.await?;
+if response.status().is_success() {
+    let mut recv = response.into_body();
+    // Exchange application bytes with send.write_all(...) and recv.read(...).
+    send.finish().await?; // The receive direction remains open.
+    recv.stop().await;
+} else {
+    let status = response.status();
+    let rejection = response.into_body().collect().await?;
 }
 # Ok(()) }
 ```
 
-`client::connect` takes an already opened stream and QPACK state. Extended CONNECT
-assumes peer support without checking or waiting for peer SETTINGS. A successful handshake returns after
-final 2xx HEADERS, without waiting for DATA or FIN. Handshake bodies must be empty.
+The CONNECT response future drives the handshake. No DATA is sent before final
+2xx HEADERS, even if the application has already queued bytes in the body window.
+After acceptance, background tasks send and receive DATA through the same bounded
+buffers used for ordinary streaming HTTP. Extended CONNECT assumes peer support
+without waiting for peer SETTINGS. Dropping a pending handshake cancels both stream
+directions; explicitly reset the retained body when abandoning the handshake.
+Rejection cancels production while
+preserving the response's status, headers, and body. `client::connect` is also
+available as a convenience: it returns the same response on success and
+`ConnectError::Rejected(response)` for non-2xx responses.
 
-On the server, retain the read direction until the application chooses how to
-handle the request. `read_request_head` borrows the stream and returns an
-`http::Request<()>` containing metadata only. It reads exactly through the initial
-HEADERS, so no caller-side `BufReader` or connection-owning wrapper is needed:
+The server reads CONNECT with `read_request` and accepts it by sending a streaming
+2xx response. Complete routing, authorization, and any upstream handshake before
+starting the response writer:
 
 ```rust,no_run
-# use h3x::{server, H3Connection, Transport};
+# use h3x::{server, ReadRequest, WriteResponse, H3Connection, Transport};
 # async fn accept<T: Transport>(connection: H3Connection<T>) -> h3x::Result<()> {
-let (send, mut recv) = connection.accept_bi().await?;
-let head = server::read_request_head(&mut recv, connection.qpack()).await?;
-if head.method() == http::Method::CONNECT {
-    let protocol = head.extensions().get::<h3x::ext::Protocol>();
-    // Route and authorize here; finish any upstream handshake before accepting.
-    let tunnel = server::accept_connect(
-        http::Response::new(()), send, recv, connection.qpack().clone(), head.method(),
-    ).await?;
-    // Pass ownership of tunnel to application I/O or relay code.
-} else {
-    let request = server::read_request_body(head, recv, connection.qpack().clone())?;
-    // Use existing response writers with send and connection.qpack().clone().
-}
+let (ws, rs) = connection.accept_bi().await?;
+let request = server::read_request(rs, connection.qpack().clone()).await?;
+let method = request.method();
+let mut recv = request.into_body();
+let mut response = server::Response::default();
+response.set_status(http::StatusCode::OK);
+let response = response.streaming(16 * 1024);
+let mut send = response.body();
+let writing = server::write_streaming_response(
+    response, ws, connection.qpack().clone(), &method,
+);
+let (sent, produced) = tokio::join!(writing, async {
+    let mut buf = [0; 4096];
+    loop {
+        let n = recv.read(&mut buf).await?;
+        if n == 0 { break; }
+        send.write_all(&buf[..n]).await?;
+    }
+    send.finish().await
+});
+sent?;
+produced?;
 # Ok(()) }
 ```
 
-To reject CONNECT, drop the receive stream and use `write_bytes_response` or
-`write_streaming_response` with `Method::CONNECT` and a non-2xx status. Stopping
-reception leaves the response write direction usable. Ordinary request writers
-reject CONNECT, and ordinary response writers reject successful CONNECT; use
-`client::connect` / `server::accept_connect` instead. The existing
-`read_request(recv, qpack)` remains available for ordinary HTTP.
+`read_request_head` and `read_request_body` remain available when the application
+needs to inspect headers before starting reception. To reject CONNECT, stop the
+request body and send a non-2xx response with either response writer.
+Successful responses must use the streaming writer and omit Content-Length.
 
-`Tunnel` implements Tokio `AsyncRead` and `AsyncWrite`. It strips HTTP/3 DATA
-framing and preserves all payload bytes, including WebSocket masks, fragmentation,
-and negotiated compression. It has no body pump or background task. Accepted
-writes own at most 16 KiB of payload per pending frame; `flush()` drains it and
-flushes the transport. `finish()` / `shutdown()` drain and close only the send
-direction, while `abort()` discards pending data and cancels both directions.
-Dropping unfinished stream halves cancels them. Reads retain partial frame headers
-across cancellation, skip unknown frames with bounded memory, and preserve bytes
-following handshake HEADERS. The DATA reader holds `H3ReadStream` directly; stream parameters and tunnel
-members do not require a `BufReader` wrapper. Prohibited frames after acceptance produce a
-connection-level protocol error; ordinary tunnel cancellation stays stream-local.
-GOAWAY stops admission while existing tunnels remain registered for draining.
+There is no separate `Tunnel` type. Outgoing `Body<WndBuf, W>` implements Tokio
+`AsyncWrite`; incoming `Body<WndBuf, R>` implements `AsyncRead`. Applications can
+relay the two directions independently or combine them for a duplex codec.
+`finish()` / `shutdown()` finish production; the sender drains buffered DATA and
+then sends FIN. `flush()` exposes buffered bytes to the sender without waiting
+for transport delivery. `reset()` cancels sending and `stop()` cancels receiving;
+dropping a body alone has no implicit cancellation behavior.
+
+CONNECT preserves all DATA payload bytes, including WebSocket masks,
+fragmentation, and negotiated compression. Unknown frames are skipped; trailing
+HEADERS and other prohibited frames produce a connection-level protocol error.
+Ordinary cancellation stays stream-local. GOAWAY stops admission while existing
+streams remain registered for draining until both directions finish or cancel.
 
 This library provides the HTTP/3 capability only. Trusted backend routing,
 HTTP/1.1 Upgrade conversion, TLS dialing, subprotocol/extension validation, and

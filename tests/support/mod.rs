@@ -92,7 +92,7 @@ impl Transport for TestTransport {
         self.error
             .lock()
             .unwrap()
-            .get_or_insert(error.with_reason(reason));
+            .get_or_insert(error.reason(reason));
         self.ended.notify_waiters();
         Ok(())
     }
@@ -121,7 +121,7 @@ pub async fn connection() -> H3Connection<TestTransport> {
 pub struct StoppedFlush {
     pub pending: Notify,
     pub failed: Notify,
-    state: Mutex<(bool, Option<std::task::Waker>)>,
+    state: Mutex<(Option<u64>, Option<std::task::Waker>)>,
 }
 
 /// Codec I/O with observable QUIC termination, independent of its Drop behavior.
@@ -149,7 +149,7 @@ impl<T> StopSending for TestStream<T> {
         self.stopped.lock().unwrap().push(code);
         if let Some(flush) = &self.stopped_flush {
             let mut state = flush.state.lock().unwrap();
-            state.0 = true;
+            state.0 = Some(code);
             if let Some(waker) = state.1.take() {
                 waker.wake();
             }
@@ -185,12 +185,15 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TestStream<T> {
         let this = self.get_mut();
         if let Some(flush) = &this.stopped_flush {
             let mut state = flush.state.lock().unwrap();
-            if state.0 {
+            if let Some(code) = state.0 {
                 flush.failed.notify_one();
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "STOP_SENDING",
-                )));
+                return Poll::Ready(Err(qrecovery::streams::error::StreamError::Reset(
+                    qbase::frame::ResetStreamError::new(
+                        qbase::varint::VarInt::try_from(code).unwrap(),
+                        qbase::varint::VarInt::from_u32(0),
+                    ),
+                )
+                .into()));
             }
             state.1 = Some(cx.waker().clone());
             flush.pending.notify_one();

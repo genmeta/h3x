@@ -112,7 +112,7 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
             .collect();
         let rejected = streams.iter().map(|stream| stream.id).collect();
         for stream in streams {
-            stream.close(ErrorCode::H3_REQUEST_REJECTED.with_reason("request rejected"));
+            stream.close(ErrorCode::H3_REQUEST_REJECTED.reason("request rejected"));
         }
         self.cleanup();
         rejected
@@ -224,7 +224,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         assert!(!draining.is_finished());
-        streams.close(ErrorCode::H3_INTERNAL_ERROR.with_reason("test terminates an active stream"));
+        streams.close(ErrorCode::H3_INTERNAL_ERROR.reason("test terminates an active stream"));
         tokio::time::timeout(std::time::Duration::from_secs(1), draining)
             .await
             .unwrap()
@@ -434,7 +434,7 @@ mod tests {
                 }
             }
             streams.close(
-                ErrorCode::H3_INTERNAL_ERROR.with_reason("test terminates an active stream"),
+                ErrorCode::H3_INTERNAL_ERROR.reason("test terminates an active stream"),
             );
             assert_eq!(old_io.count(), 0);
             assert_eq!(old_drain.count(), 0);
@@ -524,7 +524,7 @@ mod tests {
                 Poll::Pending
             } else {
                 Poll::Ready(Err(ErrorCode::H3_REQUEST_REJECTED
-                    .with_reason("test peer rejects stream shutdown")
+                    .reason("test peer rejects stream shutdown")
                     .into()))
             }
         }

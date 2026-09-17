@@ -106,19 +106,111 @@ async fn pair(capacity: usize) -> (H3Connection<MemoryTransport>, H3Connection<M
         H3Connection::new(b, Settings::default()).await.unwrap(),
     )
 }
+// WebSocket codecs require one duplex value. This application adapter only
+// combines directional bodies; HTTP/3 framing stays in the shared body pumps.
+struct Bodies {
+    recv: h3x::Body<h3x::WndBuf, h3x::R>,
+    send: h3x::Body<h3x::WndBuf, h3x::W>,
+}
+impl Bodies {
+    async fn finish(&mut self) -> Result<()> {
+        self.send.finish().await
+    }
+    async fn abort(self) {
+        self.send.reset().await.unwrap();
+        self.recv.stop().await;
+    }
+}
+impl tokio::io::AsyncRead for Bodies {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().recv).poll_read(cx, buf)
+    }
+}
+impl tokio::io::AsyncWrite for Bodies {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().send).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().send).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().send).poll_shutdown(cx)
+    }
+}
+
+async fn accept_connect(
+    response: http::Response<()>,
+    ws: h3x::H3WriteStream<W>,
+    rs: h3x::H3ReadStream<R>,
+    qpack: h3x::ArcQpack,
+    head: http::Request<()>,
+) -> Result<Bodies> {
+    let method = head.method().clone();
+    let server::Request::Streaming(request) = server::read_request_body(head, rs, qpack.clone())?
+    else {
+        unreachable!()
+    };
+    let mut outgoing = server::Response::default().streaming(16 * 1024);
+    outgoing.set_status(response.status());
+    for (name, value) in response.headers() {
+        outgoing.append_header(name.clone(), value.clone());
+    }
+    let send = outgoing.body();
+    tokio::spawn(server::write_streaming_response(
+        outgoing, ws, qpack, &method,
+    ));
+    Ok(Bodies {
+        recv: request.into_body(),
+        send,
+    })
+}
+
 // Stream allocation is separate from the handshake.
 async fn connect(
-    request: client::Request,
+    request: client::Request<h3x::WndBuf>,
     connection: &H3Connection<MemoryTransport>,
-) -> std::result::Result<(http::Response<()>, h3x::Tunnel<R, W>), client::ConnectError> {
+) -> std::result::Result<(http::Response<()>, Bodies), client::ConnectError> {
     let (ws, rs) = connection.open_bi().await?;
-    client::connect(request, ws, rs, connection.qpack().clone()).await
+    let send = request.body();
+    let response =
+        client::write_streaming_request(request, ws, rs, connection.qpack().clone())?.await?;
+    if !response.status().is_success() {
+        return Err(client::ConnectError::Rejected(response));
+    }
+    let mut head = http::Response::new(());
+    *head.status_mut() = response.status();
+    *head.headers_mut() = response.headers();
+    *head.version_mut() = http::Version::HTTP_3;
+    let client::Response::Streaming(response) = response else {
+        unreachable!()
+    };
+    Ok((
+        head,
+        Bodies {
+            recv: response.into_body(),
+            send,
+        },
+    ))
 }
 
 async fn tunnels(
     a: &H3Connection<MemoryTransport>,
     b: &H3Connection<MemoryTransport>,
-) -> (h3x::Tunnel<R, W>, h3x::Tunnel<R, W>) {
+) -> (Bodies, Bodies) {
     let (client, server) = tokio::join!(
         connect(
             client::Request::connect("wss://home.example/api/websocket?q=1").unwrap(),
@@ -130,7 +222,7 @@ async fn tunnels(
             assert_eq!(
                 request
                     .extensions()
-                    .get::<h3x::ext::Protocol>()
+                    .get::<h3x::Protocol>()
                     .unwrap()
                     .as_str(),
                 "websocket"
@@ -141,15 +233,9 @@ async fn tunnels(
                 "/api/websocket?q=1"
             );
             assert_eq!(request.headers()["sec-websocket-version"], "13");
-            server::accept_connect(
-                http::Response::new(()),
-                ws,
-                rs,
-                b.qpack().clone(),
-                request.method(),
-            )
-            .await
-            .unwrap()
+            accept_connect(http::Response::new(()), ws, rs, b.qpack().clone(), request)
+                .await
+                .unwrap()
         }
     );
     let (response, tunnel) = client.unwrap();
@@ -261,11 +347,10 @@ async fn rejection(stop_code: Option<ErrorCode>) {
 async fn cancelled_tunnel_does_not_disrupt_http_or_other_tunnels() {
     tokio::time::timeout(Duration::from_secs(3), async {
         let (a, b) = pair(1024).await;
-        let (mut cancelled, other) = tunnels(&a, &b).await;
+        let (cancelled, other) = tunnels(&a, &b).await;
         let (mut live, mut peer) = tunnels(&a, &b).await;
-        cancelled.abort();
-        drop(cancelled);
-        drop(other);
+        cancelled.abort().await;
+        other.abort().await;
         let ((), ()) = tokio::join!(
             async {
                 let (ws, rs) = a.open_bi().await.unwrap();
@@ -373,17 +458,15 @@ async fn cancelling_handshake_releases_both_directions() {
     let incoming = server::read_request_head(&mut rs, b.qpack()).await.unwrap();
     drop(handshake);
     // Our in-memory transport models cancellation by dropping owned halves.
+    let mut response = server::Response::default().streaming(16 * 1024);
+    response.set_status(http::StatusCode::OK);
+    response.body().finish().await.unwrap();
     assert!(
-        server::accept_connect(
-            http::Response::new(()),
-            ws,
-            rs,
-            b.qpack().clone(),
-            incoming.method()
-        )
-        .await
-        .is_err()
+        server::write_streaming_response(response, ws, b.qpack().clone(), incoming.method())
+            .await
+            .is_err()
     );
+    drop(rs);
     let (_ws, _rs) = a.open_bi().await.unwrap();
     let (_ws, _rs) = b.accept_bi().await.unwrap();
 }
@@ -412,15 +495,9 @@ async fn extended_connect_opens_streams_before_peer_settings() {
             let (ws, mut rs) = b.accept_bi().await.unwrap();
             let incoming = server::read_request_head(&mut rs, b.qpack()).await.unwrap();
             servers.push(
-                server::accept_connect(
-                    http::Response::new(()),
-                    ws,
-                    rs,
-                    b.qpack().clone(),
-                    incoming.method(),
-                )
-                .await
-                .unwrap(),
+                accept_connect(http::Response::new(()), ws, rs, b.qpack().clone(), incoming)
+                    .await
+                    .unwrap(),
             );
         }
         for task in clients {
@@ -439,14 +516,14 @@ async fn plain_connect_accepts_any_2xx() {
         async {
             let (ws, mut rs) = b.accept_bi().await.unwrap();
             let head = server::read_request_head(&mut rs, b.qpack()).await.unwrap();
-            assert!(head.extensions().get::<h3x::ext::Protocol>().is_none());
+            assert!(head.extensions().get::<h3x::Protocol>().is_none());
             assert_eq!(head.uri().authority().unwrap().as_str(), "example.com:443");
-            server::accept_connect(
+            accept_connect(
                 http::Response::builder().status(201).body(()).unwrap(),
                 ws,
                 rs,
                 b.qpack().clone(),
-                head.method(),
+                head,
             )
             .await
             .unwrap()
@@ -458,3 +535,128 @@ async fn plain_connect_accepts_any_2xx() {
 
 #[path = "connect/external_ws.rs"]
 mod external_ws;
+
+#[tokio::test]
+async fn streaming_connect_uses_body_handles_and_gates_queued_data() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for convenience in [false, true] {
+            let (a, b) = pair(3).await;
+            let request = client::Request::connect("example.com:443").unwrap();
+            let mut send = request.body();
+            // Queue data before the handshake. It must stay in the body window.
+            send.write_all(b"queued").await.unwrap();
+            let (ws, rs) = a.open_bi().await.unwrap();
+            let ((), ()) = tokio::join!(
+                async {
+                    let response = if convenience {
+                        client::connect(request, ws, rs, a.qpack().clone())
+                            .await
+                            .unwrap()
+                    } else {
+                        client::write_streaming_request(request, ws, rs, a.qpack().clone())
+                            .unwrap()
+                            .await
+                            .unwrap()
+                    };
+                    assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
+                    send.finish().await.unwrap();
+                    assert_eq!(
+                        response.into_body().collect().await.unwrap().as_ref(),
+                        b"reply"
+                    );
+                },
+                async {
+                    let (ws, rs) = b.accept_bi().await.unwrap();
+                    let request = server::read_request(rs, b.qpack().clone()).await.unwrap();
+                    let method = request.method();
+                    assert_eq!(method, http::Method::CONNECT);
+                    let mut recv = request.into_body();
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(20), recv.read(&mut [0]))
+                            .await
+                            .is_err()
+                    );
+                    let mut response = server::Response::default().streaming(3);
+                    // Any 2xx accepts CONNECT, including 204: DATA is still allowed.
+                    response.set_status(http::StatusCode::NO_CONTENT);
+                    let mut send = response.body();
+                    let (written, ()) = tokio::join!(
+                        server::write_streaming_response(response, ws, b.qpack().clone(), &method),
+                        async {
+                            assert_eq!(recv.collect().await.unwrap().as_ref(), b"queued");
+                            send.write_all(b"reply").await.unwrap();
+                            send.finish().await.unwrap();
+                        }
+                    );
+                    written.unwrap();
+                }
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn rejected_streaming_connect_wakes_a_full_producer() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let (a, b) = pair(3).await;
+        let request = client::Request::connect("example.com:443").unwrap();
+        let mut send = request.body();
+        send.write_all(&vec![1; 16 * 1024]).await.unwrap();
+        let (ws, rs) = a.open_bi().await.unwrap();
+        let (response, produced, ()) = tokio::join!(
+            async {
+                client::write_streaming_request(request, ws, rs, a.qpack().clone())
+                    .unwrap()
+                    .await
+                    .unwrap()
+            },
+            send.write_all(b"blocked"),
+            async {
+                let (ws, rs) = b.accept_bi().await.unwrap();
+                let request = server::read_request(rs, b.qpack().clone()).await.unwrap();
+                request.into_body().stop().await;
+                let mut response = server::Response::default();
+                response
+                    .set_status(http::StatusCode::FORBIDDEN)
+                    .set_body(Bytes::from_static(b"denied"));
+                server::write_bytes_response(
+                    response,
+                    ws,
+                    b.qpack().clone(),
+                    &http::Method::CONNECT,
+                )
+                .await
+                .unwrap();
+            }
+        );
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().as_ref(),
+            b"denied"
+        );
+        assert_eq!(produced.unwrap_err().code, ErrorCode::H3_REQUEST_CANCELLED);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn resetting_connect_body_cancels_a_pending_handshake() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let (a, b) = pair(3).await;
+        let request = client::Request::connect("example.com:443").unwrap();
+        let send = request.body();
+        let (ws, rs) = a.open_bi().await.unwrap();
+        let (result, ()) = tokio::join!(
+            client::connect(request, ws, rs, a.qpack().clone()),
+            async {
+                let (_ws, mut rs) = b.accept_bi().await.unwrap();
+                server::read_request_head(&mut rs, b.qpack()).await.unwrap();
+                send.reset().await.unwrap();
+            }
+        );
+        assert!(matches!(result, Err(client::ConnectError::H3(error)) if error.code == ErrorCode::H3_REQUEST_CANCELLED));
+    }).await.unwrap();
+}

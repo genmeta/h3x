@@ -18,6 +18,7 @@ pub(crate) struct WndBuf {
     len: usize,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
+    error_waker: Option<Waker>,
     fin: bool,
 }
 
@@ -32,27 +33,19 @@ impl WndBuf {
             len: 0,
             read_waker: None,
             write_waker: None,
+            error_waker: None,
             fin: false,
         }
-    }
-
-    pub(crate) fn remaining_capacity(&self) -> usize {
-        self.buf.len() - self.len
-    }
-
-    /// Contiguous readable bytes, retained until explicitly consumed.
-    pub(crate) fn chunk(&self) -> &[u8] {
-        &self.buf[self.head..self.head + self.len.min(self.buf.len() - self.head)]
     }
 
     pub(crate) fn consume(&mut self, n: usize) {
         assert!(n <= self.len);
         self.head = (self.head + n) % self.buf.len();
         self.len -= n;
-        if n > 0 {
-            if let Some(waker) = self.write_waker.take() {
-                waker.wake();
-            }
+        if n > 0
+            && let Some(waker) = self.write_waker.take()
+        {
+            waker.wake();
         }
     }
 }
@@ -150,16 +143,20 @@ impl ArcWndBuf {
             if let Some(waker) = window.write_waker.take() {
                 waker.wake();
             }
+            if let Some(waker) = window.error_waker.take() {
+                waker.wake();
+            }
             *state = Err(error);
         }
     }
 
-    /// The receive pump is the window's sole writer, including while waiting on QUIC.
+    /// One background pump waits for errors on each body window.
+    /// Keep its notification separate from application read/write readiness.
     pub(crate) async fn wait_error(&self) -> Error {
         std::future::poll_fn(|cx| match &mut *self.shared.lock().unwrap() {
             Err(error) => Poll::Ready(error.clone()),
             Ok(window) => {
-                window.write_waker = Some(cx.waker().clone());
+                window.error_waker = Some(cx.waker().clone());
                 Poll::Pending
             }
         })
@@ -356,7 +353,8 @@ mod tests {
     }
 
     #[test]
-    fn shared_error_wakes_reader_and_writer() {
+    fn shared_error_wakes_io_and_independent_error_waiter() {
+        use std::future::Future;
         for full in [false, true] {
             let mut reader = ArcWndBuf::new(1);
             let mut writer = reader.clone();
@@ -386,14 +384,23 @@ mod tests {
                         .is_pending()
                 );
             }
+            let errors = reader.clone();
+            let error_wakes = Arc::new(WakeCount::default());
+            let error_waker = Waker::from(error_wakes.clone());
+            let mut error_cx = Context::from_waker(&error_waker);
+            let mut waiting = Box::pin(errors.wait_error());
+            assert!(waiting.as_mut().poll(&mut error_cx).is_pending());
             reader.on_error(
-                crate::ErrorCode::H3_REQUEST_CANCELLED
-                    .with_reason("test closes the shared body window"),
+                crate::ErrorCode::H3_REQUEST_CANCELLED.reason("test closes the shared body window"),
             );
             writer.on_error(
-                crate::ErrorCode::H3_INTERNAL_ERROR
-                    .with_reason("test closes the shared body window"),
+                crate::ErrorCode::H3_INTERNAL_ERROR.reason("test closes the shared body window"),
             );
+            assert_eq!(error_wakes.0.load(Ordering::SeqCst), 1);
+            let Poll::Ready(error) = waiting.as_mut().poll(&mut error_cx) else {
+                panic!("error waiter must receive the stored error");
+            };
+            assert_eq!(error.code, crate::ErrorCode::H3_REQUEST_CANCELLED);
             assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
             let results = [
                 Pin::new(&mut reader)

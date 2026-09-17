@@ -35,7 +35,7 @@ impl State {
         on_instruction: super::OnInstruction,
     ) -> Result<Self> {
         if local.blocked_streams > VARINT_MAX {
-            return Err(ErrorCode::H3_SETTINGS_ERROR.with_reason(
+            return Err(ErrorCode::H3_SETTINGS_ERROR.reason(
                 "QPACK blocked-stream limit exceeds the QUIC variable-integer range",
             ));
         }
@@ -57,7 +57,7 @@ impl State {
     ) -> Result<(&'a [u8], FieldSectionPrefix)> {
         if payload.len() > MAX_BUFFERED_FRAME_PAYLOAD {
             return Err(ErrorCode::H3_EXCESSIVE_LOAD
-                .with_reason("encoded field section exceeds the buffer limit"));
+                .reason("encoded field section exceeds the buffer limit"));
         }
         let (bytes, prefix) = be_field_section_prefix(
             payload,
@@ -66,7 +66,7 @@ impl State {
         )?;
         if prefix.required_insert_count != 0 && bytes.is_empty() {
             return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
-                .with_reason("nonzero Required Insert Count in an empty field section"));
+                .reason("nonzero Required Insert Count in an empty field section"));
         }
         Ok((bytes, prefix))
     }
@@ -94,11 +94,11 @@ impl State {
         // Admit a newly blocked section within the advertised and local budgets.
         if self.waiting.len() as u64 >= self.max_blocked_streams {
             return Poll::Ready(Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
-                .with_reason("peer exceeded the advertised QPACK blocked-stream limit")));
+                .reason("peer exceeded the advertised QPACK blocked-stream limit")));
         }
         if bytes.len() > self.max_blocked_bytes - self.blocked_bytes {
             return Poll::Ready(Err(ErrorCode::H3_EXCESSIVE_LOAD
-                .with_reason("blocked field sections exceed the memory limit")));
+                .reason("blocked field sections exceed the memory limit")));
         }
         self.waiting.insert(
             id,
@@ -117,7 +117,7 @@ impl State {
         instruction: EncoderInstruction,
     ) -> Result<Vec<Waker>> {
         if self.table.max_capacity() == 0 {
-            return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR.with_reason(
+            return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR.reason(
                 "dynamic-table instruction received with zero maximum table capacity",
             ));
         }
@@ -147,7 +147,7 @@ impl State {
     pub(super) fn cancel_stream(&mut self, id: u64) -> Result<Vec<Waker>> {
         if id > VARINT_MAX {
             return Err(ErrorCode::H3_INTERNAL_ERROR
-                .with_reason("cancelled stream ID exceeds the QUIC variable-integer range"));
+                .reason("cancelled stream ID exceeds the QUIC variable-integer range"));
         }
         if self.table.max_capacity() != 0 {
             self.send_feedback(DecoderInstruction::StreamCancellation(id))?;
@@ -204,13 +204,13 @@ impl State {
                 .filter(|&size| size as u64 <= self.max_field_section_size)
                 .ok_or_else(|| {
                     ErrorCode::H3_EXCESSIVE_LOAD
-                        .with_reason("decoded field section exceeds the advertised size limit")
+                        .reason("decoded field section exceeds the advertised size limit")
                 })?;
             fields.push(field);
             input = rest;
         }
         if required_insert_count != prefix.required_insert_count {
-            return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason(
+            return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED.reason(
                 "Required Insert Count does not match the largest dynamic reference",
             ));
         }
@@ -416,7 +416,7 @@ mod tests {
         })
         .await;
         qpack
-            .on_error(ErrorCode::H3_NO_ERROR.with_reason("test closes the decoder while decoding"));
+            .on_error(ErrorCode::H3_NO_ERROR.reason("test closes the decoder while decoding"));
         assert_eq!(
             (decode.await).map_err(ErrorCode::from),
             Err(ErrorCode::H3_NO_ERROR)

@@ -41,7 +41,7 @@ impl<R: StopSending> H3ReadStream<R> {
 impl<R: StopSending> StopSending for &H3ReadStream<R> {
     fn stop(&mut self, error_code: u64) {
         let wakers = self.state.lock().unwrap().close(
-            ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"),
+            ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled"),
             |io| io.stop(error_code),
         );
         for waker in wakers.into_iter().flatten() {
@@ -90,6 +90,6 @@ impl<R: AsyncRead + StopSending + Unpin> AsyncRead for H3ReadStream<R> {
 
 impl<R: StopSending> Drop for H3ReadStream<R> {
     fn drop(&mut self) {
-        self.close(ErrorCode::H3_REQUEST_CANCELLED.with_reason("request cancelled"));
+        self.close(ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled"));
     }
 }

@@ -1,9 +1,6 @@
 #![doc = include_str!("../README.md")]
 
 pub mod client;
-pub mod ext;
-pub mod tunnel;
-pub use tunnel::Tunnel;
 mod common;
 mod error;
 mod protocol;
@@ -33,4 +30,4 @@ mod test_support;
 
 /// Shared body storage, also available under its original ArcWndBuf name.
 pub use common::wnd_buf::ArcWndBuf;
-pub use common::{Read as R, Write as W, body::Body, wnd_buf::ArcWndBuf as WndBuf};
+pub use common::{Protocol, Read as R, Write as W, body::Body, wnd_buf::ArcWndBuf as WndBuf};

@@ -153,7 +153,7 @@ async fn external_ws_echo() {
                     .unwrap();
                 assert_eq!(
                     head.extensions()
-                        .get::<h3x::ext::Protocol>()
+                        .get::<h3x::Protocol>()
                         .unwrap()
                         .as_str(),
                     "websocket"
@@ -161,10 +161,9 @@ async fn external_ws_echo() {
                 assert_eq!(head.headers()["sec-websocket-protocol"], "h3x-test");
                 // Backend comes from test configuration, not the request authority.
                 let (mut upstream, response) = upstream_handshake(addr).await;
-                let mut tunnel =
-                    server::accept_connect(response, send, recv, b.qpack().clone(), head.method())
-                        .await
-                        .unwrap();
+                let mut tunnel = accept_connect(response, send, recv, b.qpack().clone(), head)
+                    .await
+                    .unwrap();
                 let (sent, received) = io::copy_bidirectional(&mut tunnel, &mut upstream)
                     .await
                     .unwrap();
@@ -263,7 +262,7 @@ async fn external_ws_incoming() {
             for _ in 0..2 {
                 let (send, mut recv) = b.accept_bi().await.unwrap();
                 let head = server::read_request_head(&mut recv,b.qpack()).await.unwrap();
-                assert_eq!(head.extensions().get::<h3x::ext::Protocol>().unwrap().as_str(),"websocket");
+                assert_eq!(head.extensions().get::<h3x::Protocol>().unwrap().as_str(),"websocket");
                 assert_eq!(head.headers()["sec-websocket-protocol"],"h3x-test");
                 assert_eq!(head.headers()["origin"],"https://external.example");
                 assert!(!head.headers().contains_key("sec-websocket-key"));
@@ -276,7 +275,7 @@ async fn external_ws_incoming() {
                 }
                 assert_eq!(head.uri().path_and_query().unwrap().as_str(),"/echo?mode=reverse");
                 let response = http::Response::builder().status(200).header("sec-websocket-protocol","h3x-test").body(()).unwrap();
-                let tunnel = server::accept_connect(response,send,recv,b.qpack().clone(),head.method()).await.unwrap();
+                let tunnel = accept_connect(response,send,recv,b.qpack().clone(),head).await.unwrap();
                 let mut ws = WebSocketStream::from_raw_socket(tunnel,WsRole::Server,None).await;
                 ws.send(Message::Text("h3-ready".into())).await.unwrap();
                 let mut echoed = 0;

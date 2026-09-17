@@ -154,7 +154,7 @@ async fn qpack_failure_interrupts_pending_open_and_write_in_both_directions() {
         });
         tokio::task::yield_now().await;
         assert!(!task.is_finished());
-        let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("invalid field section");
+        let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("invalid field section");
         qpack.on_error(error.clone());
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), task)

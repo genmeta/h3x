@@ -16,7 +16,7 @@ async fn request_accept_and_respond() {
     let request = client::Request::post("https://example.com/echo")
         .unwrap()
         .header(header::CONTENT_LENGTH, "5".parse().unwrap())
-        .body(Bytes::from_static(b"hello"));
+        .with_body(h3x::Body::new(Bytes::from_static(b"hello")));
 
     let (response, served) = tokio::join!(
         async {

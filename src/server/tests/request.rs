@@ -366,14 +366,7 @@ async fn head_only_reader_leaves_connect_data_unconsumed() {
         .unwrap();
     assert_eq!(head.method(), Method::CONNECT);
     assert_eq!(head.version(), http::Version::HTTP_3);
-    let mut tunnel = crate::Tunnel::new(
-        recv,
-        crate::test_support::write_stream(0, tokio::io::sink()),
-        connection.qpack().clone(),
-    );
-    let mut output = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut tunnel, &mut output)
-        .await
-        .unwrap();
-    assert_eq!(output, b"abc");
+    let request = super::read_request_body(head, recv, connection.qpack().clone()).unwrap();
+    let output = request.into_body().collect().await.unwrap();
+    assert_eq!(output.as_ref(), b"abc");
 }

@@ -21,9 +21,7 @@ pub(super) async fn open_uni<T: Transport>(transport: &T) -> Result<T::StreamWri
         .open_uni()
         .await?
         .map(|(_, send)| send)
-        .ok_or_else(|| {
-            ErrorCode::H3_STREAM_CREATION_ERROR.with_reason("unable to open control stream")
-        })
+        .ok_or_else(|| ErrorCode::H3_STREAM_CREATION_ERROR.reason("unable to open control stream"))
 }
 
 fn control_error(error: std::io::Error) -> Error {
@@ -35,7 +33,7 @@ fn control_error(error: std::io::Error) -> Error {
         .get_ref()
         .and_then(|error| error.downcast_ref::<Error>())
         .cloned()
-        .unwrap_or_else(|| ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason(error.to_string()))
+        .unwrap_or_else(|| ErrorCode::H3_CLOSED_CRITICAL_STREAM.reason(error.to_string()))
 }
 
 impl<T: Transport> H3Connection<T> {
@@ -107,13 +105,13 @@ impl<T: Transport> H3Connection<T> {
                 let bit = 1 << (stream_type as u8);
                 if peer_critical_streams.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
                     return Err(ErrorCode::H3_STREAM_CREATION_ERROR
-                        .with_reason(format!("duplicate peer {stream_type:?} stream")));
+                        .reason(format!("duplicate peer {stream_type:?} stream")));
                 }
             }
             match stream_type {
                 StreamType::Control => self.receive_control(&mut recv).await,
                 StreamType::Push => {
-                    Err(ErrorCode::H3_ID_ERROR.with_reason("invalid stream or push identifier"))
+                    Err(ErrorCode::H3_ID_ERROR.reason("invalid stream or push identifier"))
                 }
                 StreamType::QpackEncoder => self.qpack.receive_encoder(&mut recv).await,
                 StreamType::QpackDecoder => self.qpack.receive_decoder(&mut recv).await,
@@ -145,13 +143,13 @@ impl<T: Transport> H3Connection<T> {
             Ok(Control::Settings(frame)) => frame.payload,
             Err(error) if error.code != ErrorCode::H3_FRAME_UNEXPECTED => return Err(error),
             Err(error) => {
-                return Err(ErrorCode::H3_MISSING_SETTINGS.with_reason(format!(
+                return Err(ErrorCode::H3_MISSING_SETTINGS.reason(format!(
                     "control stream did not start with SETTINGS: {error}"
                 )));
             }
             _ => {
                 return Err(ErrorCode::H3_MISSING_SETTINGS
-                    .with_reason("control stream did not start with SETTINGS"));
+                    .reason("control stream did not start with SETTINGS"));
             }
         };
         let (peer, max_fields) = qpack::limits(&settings);
@@ -168,7 +166,7 @@ impl<T: Transport> H3Connection<T> {
                         || last_goaway_id.is_some_and(|previous| id > previous)
                     {
                         return Err(
-                            ErrorCode::H3_ID_ERROR.with_reason("invalid stream or push identifier")
+                            ErrorCode::H3_ID_ERROR.reason("invalid stream or push identifier")
                         );
                     }
                     last_goaway_id = Some(id);
@@ -180,38 +178,23 @@ impl<T: Transport> H3Connection<T> {
                 }
                 // Server push is not supported.
                 Control::MaxPushId(_) | Control::CancelPush(_) => {
-                    return Err(
-                        ErrorCode::H3_ID_ERROR.with_reason("invalid stream or push identifier")
-                    );
+                    return Err(ErrorCode::H3_ID_ERROR.reason("invalid stream or push identifier"));
                 }
                 Control::Unknown { length, .. } => {
                     let mut payload = (&mut *recv).take(length.into_u64());
                     tokio::io::copy(&mut payload, &mut tokio::io::sink())
                         .await
                         .map_err(|error| {
-                            let error = error
-                                .get_ref()
-                                .and_then(|error| {
-                                    error.downcast_ref::<std::sync::Arc<std::io::Error>>()
-                                })
-                                .map_or(&error, std::sync::Arc::as_ref);
-                            error
-                                .get_ref()
-                                .and_then(|error| error.downcast_ref::<crate::Error>())
-                                .cloned()
-                                .unwrap_or_else(|| {
-                                    let code = ErrorCode::H3_CLOSED_CRITICAL_STREAM;
-                                    code.with_reason(error.to_string())
-                                })
+                            crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM)
                         })?;
                     if payload.limit() != 0 {
                         return Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM
-                            .with_reason("control stream ended while skipping an unknown frame"));
+                            .reason("control stream ended while skipping an unknown frame"));
                     }
                 }
                 _ => {
                     return Err(ErrorCode::H3_FRAME_UNEXPECTED
-                        .with_reason("frame is not allowed in this context"));
+                        .reason("frame is not allowed in this context"));
                 }
             }
         }

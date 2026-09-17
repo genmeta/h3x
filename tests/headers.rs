@@ -86,7 +86,7 @@ async fn ordinary_headers_round_trip() {
                             client::Request::post("https://example.com/headers").unwrap(),
                         )
                         .header(header::CONTENT_LENGTH, HeaderValue::from_static("5"))
-                        .body(Bytes::from_static(b"hello"));
+                        .with_body(h3x::Body::new(Bytes::from_static(b"hello")));
                         client::write_bytes_request(request, send, recv, qpack)?.await
                     } else {
                         let mut request = request_headers(

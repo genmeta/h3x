@@ -27,7 +27,7 @@ impl AsyncWrite for FailingWriter {
 }
 
 #[tokio::test]
-async fn upload_failure_reaches_response_waiter_for_both_body_modes() {
+async fn upload_failure_preserves_response_wait_for_both_body_modes() {
     for streaming in [false, true] {
         let connection = crate::test_support::connection().await;
         let (_peer, recv) = duplex(64); // Peer never sends a response.
@@ -40,24 +40,27 @@ async fn upload_failure_reaches_response_waiter_for_both_body_modes() {
                 .unwrap()
                 .into()
         };
-        let error = timeout(
-            Duration::from_secs(1),
-            request(
-                outgoing,
-                crate::test_support::read_stream(0, recv),
-                crate::test_support::write_stream(0, FailingWriter),
-                connection.qpack().clone(),
-            ),
-        )
-        .await
-        .expect("upload failure must wake response reception")
-        .err()
-        .unwrap();
-        assert_eq!(error.code, ErrorCode::H3_INTERNAL_ERROR);
-        assert_eq!(error.reason, "upload peer stopped reading");
+        let mut response = Box::pin(request(
+            outgoing,
+            crate::test_support::read_stream(0, recv),
+            crate::test_support::write_stream(0, FailingWriter),
+            connection.qpack().clone(),
+        ));
+        assert!(
+            timeout(Duration::from_millis(20), &mut response)
+                .await
+                .is_err()
+        );
         assert!(
             connection.qpack().error().is_none(),
             "local upload failures must not close the connection"
+        );
+        drop(_peer);
+        assert!(
+            timeout(Duration::from_secs(1), response)
+                .await
+                .unwrap()
+                .is_err()
         );
     }
 }
@@ -355,4 +358,107 @@ async fn malformed_response_stops_transport_with_message_error() {
         );
         assert!(qpack.error().is_none());
     }
+}
+
+struct TransportErrorWriter(qrecovery::streams::error::StreamError);
+impl AsyncWrite for TransportErrorWriter {
+    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(self.0.clone().into()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn upload_transport_errors_preserve_delayed_response() {
+    use qbase::varint::VarInt;
+    use qrecovery::streams::error::StreamError;
+    for connection_failure in [false, true] {
+        for mode in 0..3 {
+            let connection = crate::test_support::connection().await;
+            let (mut peer, recv) = duplex(256);
+            let outgoing: common::Request<Write> = match mode {
+                0 => Request::<Bytes>::get("https://example.com/")
+                    .unwrap()
+                    .into(),
+                1 => Request::streaming_post("https://example.com/")
+                    .unwrap()
+                    .into(),
+                _ => Request::connect("example.com:443").unwrap().into(),
+            };
+            let mut response = Box::pin(request(
+                outgoing,
+                crate::test_support::read_stream(0, recv),
+                crate::test_support::write_stream(
+                    0,
+                    TransportErrorWriter(if connection_failure {
+                        StreamError::Connection(
+                            qbase::error::AppError::new(
+                                VarInt::from_u32(0x102),
+                                "connection failed",
+                            )
+                            .into(),
+                        )
+                    } else {
+                        StreamError::Reset(qbase::frame::ResetStreamError::new(
+                            VarInt::from_u32(0x10c),
+                            VarInt::from_u32(0),
+                        ))
+                    }),
+                ),
+                connection.qpack().clone(),
+            ));
+            // Observe the send failure before making a response available.
+            assert!(
+                timeout(Duration::from_millis(20), &mut response)
+                    .await
+                    .is_err()
+            );
+            peer.write_all(&headers_frame(
+                connection.qpack(),
+                vec![field(b":status", b"403")],
+            ))
+            .await
+            .unwrap();
+            let response = timeout(Duration::from_secs(1), response)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                crate::ReadResponse::status(&response),
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn connect_local_write_failure_preserves_response_wait() {
+    let connection = crate::test_support::connection().await;
+    let (mut peer, recv) = duplex(256);
+    let mut response = Box::pin(super::super::connect(
+        Request::connect("example.com:443").unwrap(),
+        crate::test_support::write_stream(0, FailingWriter),
+        crate::test_support::read_stream(0, recv),
+        connection.qpack().clone(),
+    ));
+    assert!(
+        timeout(Duration::from_millis(20), &mut response)
+            .await
+            .is_err()
+    );
+    peer.write_all(&headers_frame(
+        connection.qpack(),
+        vec![field(b":status", b"403")],
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(1), response).await.unwrap(),
+        Err(ConnectError::Rejected(_))
+    ));
 }

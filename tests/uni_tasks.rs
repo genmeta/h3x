@@ -128,7 +128,7 @@ impl Transport for Incoming {
             .closed
             .lock()
             .unwrap()
-            .get_or_insert(error.with_reason(reason));
+            .get_or_insert(error.reason(reason));
         self.probe.ended.notify_waiters();
         for reader in self.probe.readers.lock().unwrap().drain(..) {
             reader.wake();
@@ -201,7 +201,7 @@ async fn each_unidirectional_stream_has_a_task_and_transport_close_fails_reads()
     drop(connection);
     assert!(probe.closed.lock().unwrap().is_none());
     *probe.closed.lock().unwrap() =
-        Some(ErrorCode::H3_NO_ERROR.with_reason("test transport finished"));
+        Some(ErrorCode::H3_NO_ERROR.reason("test transport finished"));
     probe.ended.notify_waiters();
     for reader in probe.readers.lock().unwrap().drain(..) {
         reader.wake();
@@ -269,7 +269,7 @@ async fn qpack_failure_closes_connection_and_cancels_pending_receivers() {
             })
             .await;
         }
-        let error = ErrorCode::H3_INTERNAL_ERROR.with_reason("QPACK failed independently of I/O");
+        let error = ErrorCode::H3_INTERNAL_ERROR.reason("QPACK failed independently of I/O");
         connection.qpack().on_error(error.clone());
         bounded(async {
             while probe.closed.lock().unwrap().is_none() {
@@ -281,7 +281,7 @@ async fn qpack_failure_closes_connection_and_cancels_pending_receivers() {
         assert_eq!(
             connection
                 .qpack()
-                .on_error(ErrorCode::H3_EXCESSIVE_LOAD.with_reason("later error")),
+                .on_error(ErrorCode::H3_EXCESSIVE_LOAD.reason("later error")),
             error
         );
         drop(connection);

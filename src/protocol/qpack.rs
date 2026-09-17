@@ -108,7 +108,7 @@ impl ArcQpack {
 
     fn critical_stream_error(&self) -> Error {
         self.error().unwrap_or_else(|| {
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("critical HTTP/3 stream closed")
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM.reason("critical HTTP/3 stream closed")
         })
     }
 
@@ -306,10 +306,10 @@ impl Drop for StreamDecoder<'_> {
 pub(super) fn instruction_send_error<T>(error: tokio::sync::mpsc::error::TrySendError<T>) -> Error {
     match error {
         tokio::sync::mpsc::error::TrySendError::Full(_) => {
-            ErrorCode::H3_EXCESSIVE_LOAD.with_reason("QPACK instruction queue is full")
+            ErrorCode::H3_EXCESSIVE_LOAD.reason("QPACK instruction queue is full")
         }
         tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM.with_reason("QPACK instruction receiver is closed")
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM.reason("QPACK instruction receiver is closed")
         }
     }
 }
@@ -325,7 +325,7 @@ pub(crate) mod tests {
         for encoder in [true, false] {
             let transport = Arc::new(TestTransport::default());
             let qpack = ArcQpack::new(&crate::Settings::default()).unwrap();
-            let error = ErrorCode::H3_NO_ERROR.with_reason("peer closed the connection");
+            let error = ErrorCode::H3_NO_ERROR.reason("peer closed the connection");
             let (encoder_tx, encoder_rx) = tokio::sync::mpsc::channel(1);
             let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(1);
             let task = tokio::spawn({
@@ -363,7 +363,7 @@ pub(crate) mod tests {
         for encoder in [true, false] {
             let transport = Arc::new(TestTransport::default());
             let qpack = ArcQpack::new(&crate::Settings::default()).unwrap();
-            let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("invalid field section");
+            let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("invalid field section");
             let (encoder_tx, encoder_rx) = tokio::sync::mpsc::channel(1);
             let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(1);
             let task = tokio::spawn({
@@ -407,10 +407,10 @@ pub(crate) mod tests {
         tokio::task::yield_now().await;
         assert!(!first.is_finished());
         assert!(!second.is_finished());
-        let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("invalid field section");
+        let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("invalid field section");
         assert_eq!(qpack.on_error(error.clone()), error);
         assert_eq!(
-            qpack.on_error(ErrorCode::H3_INTERNAL_ERROR.with_reason("later failure")),
+            qpack.on_error(ErrorCode::H3_INTERNAL_ERROR.reason("later failure")),
             error
         );
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -449,13 +449,13 @@ pub(crate) mod tests {
         let qpack = connection.qpack();
         assert_eq!(
             ErrorCode::from(qpack.on_error(
-                ErrorCode::H3_INTERNAL_ERROR.with_reason("test terminates compression state")
+                ErrorCode::H3_INTERNAL_ERROR.reason("test terminates compression state")
             )),
             ErrorCode::H3_INTERNAL_ERROR
         );
         assert_eq!(
             ErrorCode::from(qpack.on_error(
-                ErrorCode::H3_EXCESSIVE_LOAD.with_reason("test terminates compression state")
+                ErrorCode::H3_EXCESSIVE_LOAD.reason("test terminates compression state")
             )),
             ErrorCode::H3_INTERNAL_ERROR
         );
@@ -560,10 +560,10 @@ pub(crate) mod tests {
         assert!(!encoding.is_finished());
         assert!(!feedback.is_finished());
         assert!(!decoding.is_finished());
-        let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("invalid dynamic reference");
+        let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("invalid dynamic reference");
         assert_eq!(qpack.on_error(error.clone()), error);
         assert_eq!(
-            qpack.on_error(ErrorCode::H3_INTERNAL_ERROR.with_reason("later failure")),
+            qpack.on_error(ErrorCode::H3_INTERNAL_ERROR.reason("later failure")),
             error
         );
         tokio::time::timeout(std::time::Duration::from_secs(1), async {

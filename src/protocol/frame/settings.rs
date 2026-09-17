@@ -33,70 +33,31 @@ pub(crate) async fn be_setting_frame<T: AsyncRead + Unpin + ?Sized>(
     length: VarInt,
 ) -> Result<Frame<Settings>> {
     if length.into_u64() > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
-        return Err(ErrorCode::H3_EXCESSIVE_LOAD.with_reason("configured resource limit exceeded"));
+        return Err(ErrorCode::H3_EXCESSIVE_LOAD.reason("configured resource limit exceeded"));
     }
     let mut payload = reader.take(length.into_u64());
     let mut values = HashMap::new();
     while payload.limit() != 0 {
         let id = be_varint(&mut payload)
             .await
-            .map_err(|error| {
-                let error = error
-                    .get_ref()
-                    .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
-                    .map_or(&error, std::sync::Arc::as_ref);
-                error
-                    .get_ref()
-                    .and_then(|error| error.downcast_ref::<crate::Error>())
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        let code = if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                            ErrorCode::H3_FRAME_ERROR
-                        } else {
-                            ErrorCode::H3_INTERNAL_ERROR
-                        };
-                        code.with_reason(error.to_string())
-                    })
-            })?
+            .map_err(crate::Error::from_frame_io)?
             .ok_or_else(|| {
-                ErrorCode::H3_FRAME_ERROR.with_reason("SETTINGS payload is missing an identifier")
+                ErrorCode::H3_FRAME_ERROR.reason("SETTINGS payload is missing an identifier")
             })?;
         let value = be_varint(&mut payload)
             .await
-            .map_err(|error| {
-                let error = error
-                    .get_ref()
-                    .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
-                    .map_or(&error, std::sync::Arc::as_ref);
-                error
-                    .get_ref()
-                    .and_then(|error| error.downcast_ref::<crate::Error>())
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        let code = if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                            ErrorCode::H3_FRAME_ERROR
-                        } else {
-                            ErrorCode::H3_INTERNAL_ERROR
-                        };
-                        code.with_reason(error.to_string())
-                    })
-            })?
-            .ok_or_else(|| {
-                ErrorCode::H3_FRAME_ERROR.with_reason("SETTINGS identifier has no value")
-            })?;
+            .map_err(crate::Error::from_frame_io)?
+            .ok_or_else(|| ErrorCode::H3_FRAME_ERROR.reason("SETTINGS identifier has no value"))?;
         if matches!(id.into_u64(), 0x02..=0x05) || (id.into_u64() == 0x08 && value.into_u64() > 1) {
-            return Err(ErrorCode::H3_SETTINGS_ERROR.with_reason(
-                "reserved SETTINGS identifier or invalid ENABLE_CONNECT_PROTOCOL value",
-            ));
+            return Err(ErrorCode::H3_SETTINGS_ERROR
+                .reason("reserved SETTINGS identifier or invalid ENABLE_CONNECT_PROTOCOL value"));
         }
         match values.entry(id) {
             Entry::Vacant(entry) => {
                 entry.insert(value);
             }
             Entry::Occupied(_) => {
-                return Err(
-                    ErrorCode::H3_SETTINGS_ERROR.with_reason("duplicate SETTINGS identifier")
-                );
+                return Err(ErrorCode::H3_SETTINGS_ERROR.reason("duplicate SETTINGS identifier"));
             }
         }
     }

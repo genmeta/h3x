@@ -24,7 +24,7 @@ impl Encoder {
                 peer,
                 Box::new(|_| {
                     Err(ErrorCode::H3_INTERNAL_ERROR
-                        .with_reason("instruction callback is not registered"))
+                        .reason("instruction callback is not registered"))
                 }),
             )?,
             completed: 0,
