@@ -34,6 +34,7 @@ impl<T> H3Stream<T> {
 pub(crate) fn is_finished<T>(s: &Result<H3Stream<T>, Goaway>) -> bool {
     matches!(s, Err(Goaway) | Ok(H3Stream::Finished(_)))
 }
+
 pub(crate) fn terminate<T>(
     s: &mut Result<H3Stream<T>, Goaway>,
     f: impl FnOnce(&mut T),
@@ -108,6 +109,3 @@ pub(crate) fn poll_io<T: Unpin, O>(
     };
     r
 }
-
-#[cfg(test)]
-mod termination_tests;

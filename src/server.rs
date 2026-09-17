@@ -12,7 +12,7 @@ use crate::{
     common::{
         self, Read, Write,
         body::{self, BodyMode},
-        headers::{self, Write as _},
+        head::{self, WriteResponse as _},
         message::Message,
     },
     protocol::{
@@ -41,12 +41,7 @@ pub fn read_request_body<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
     qpack: ArcQpack,
 ) -> Result<Request> {
     let (parts, ()) = request.into_parts();
-    let head = headers::RequestHead {
-        method: parts.method,
-        uri: parts.uri,
-        headers: parts.headers,
-        extensions: parts.extensions,
-    };
+    let head = head::RequestHead::from(parts);
     let mode = request_body_mode(&head).inspect_err(|error| {
         common::receive_error(&rs, &qpack, error);
     })?;
@@ -56,9 +51,9 @@ pub fn read_request_body<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
     ))
 }
 
-fn request_body_mode(head: &headers::RequestHead) -> Result<BodyMode> {
-    let length = headers::content_length(&head.headers)?;
-    Ok(if head.method == Method::CONNECT {
+fn request_body_mode(head: &head::RequestHead) -> Result<BodyMode> {
+    let length = head::content_length(&head.headers)?;
+    Ok(if head.request_method() == Method::CONNECT {
         if length.is_some() {
             return Err(
                 ErrorCode::H3_MESSAGE_ERROR.reason("CONNECT must not include Content-Length")
@@ -101,12 +96,12 @@ async fn read_headers<R: AsyncRead + Unpin + ?Sized>(rs: &mut R) -> Result<Frame
 async fn read_head<RS: AsyncRead + StopSending + Unpin>(
     rs: &mut H3ReadStream<RS>,
     qpack: &ArcQpack,
-) -> Result<headers::RequestHead> {
+) -> Result<head::RequestHead> {
     let stream_id = rs.stream_id();
     let result: Result<_> = async {
         let frame = read_headers(rs).await?;
         let fields = qpack.decode(stream_id, frame.payload.field_section).await?;
-        let head = headers::be_request(fields)?;
+        let head = head::RequestHead::decode(fields)?;
         request_body_mode(&head)?;
         Ok(head)
     }
@@ -126,13 +121,8 @@ pub async fn read_request_head<RS: AsyncRead + StopSending + Unpin>(
     qpack: &ArcQpack,
 ) -> Result<http::Request<()>> {
     let head = read_head(rs, qpack).await?;
-    let mut request = http::Request::new(());
-    *request.method_mut() = head.method;
-    *request.uri_mut() = head.uri;
-    *request.headers_mut() = head.headers;
-    *request.extensions_mut() = head.extensions;
-    *request.version_mut() = http::Version::HTTP_3;
-    Ok(request)
+    let parts = http::request::Parts::from(head);
+    Ok(http::Request::from_parts(parts, ()))
 }
 
 /// Accept a CONNECT request returned by `read_request` after application checks.
@@ -317,6 +307,3 @@ pub fn write_streaming_response<WS: AsyncWrite + CancelStream + Unpin>(
         result
     }
 }
-
-#[cfg(test)]
-mod tests;

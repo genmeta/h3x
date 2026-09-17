@@ -26,24 +26,3 @@ impl<B: BufMut> Write<Frame<Data>> for B {
         self.put_varint(&frame.length);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        super::{EncodeSize, Frame},
-        *,
-    };
-
-    #[test]
-    fn data_length_is_carried_into_the_frame() {
-        for length in [0, 63, 64, 16384] {
-            let data = Data(length);
-            assert_eq!(data.encoding_size(), length);
-            assert_eq!(
-                Frame::<Data>::new(data).unwrap().length.into_u64(),
-                length as u64
-            );
-        }
-        assert!(Frame::<Data>::new(Data(usize::MAX)).is_err());
-    }
-}

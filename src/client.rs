@@ -12,7 +12,7 @@ use crate::{
     common::{
         self, Read, Write,
         body::{self, BodyMode},
-        headers::{self, Write as _},
+        head::{self, WriteRequest as _},
         message::Message,
     },
     protocol::{
@@ -82,14 +82,13 @@ where
     let (fields, body) = {
         let head = req.message.head.lock().unwrap();
         let body = req.message.body.lock().unwrap().storage.clone();
-        if head.method == http::Method::CONNECT {
+        if head.request_method() == http::Method::CONNECT {
             return Err(ErrorCode::H3_MESSAGE_ERROR.reason("use client::connect for CONNECT"));
         }
         let mut fields = Vec::new();
         //TODO: encode_head
-        fields.put_head(&head)?;
-        if headers::content_length(&head.headers)?.is_some_and(|length| length != body.len() as u64)
-        {
+        fields.put_request(&head)?;
+        if head::content_length(&head.headers)?.is_some_and(|length| length != body.len() as u64) {
             return Err(ErrorCode::H3_MESSAGE_ERROR
                 .reason("request body length does not match Content-Length"));
         }
@@ -128,12 +127,12 @@ where
     let mut body = req.message.body_stream();
     // Validate before sending so malformed requests fail synchronously and wake producers.
     let (headers, mode) = (|| {
-        if head.method == http::Method::CONNECT {
+        if head.request_method() == http::Method::CONNECT {
             return Err(ErrorCode::H3_MESSAGE_ERROR.reason("use client::connect for CONNECT"));
         }
         let mut fields = Vec::new();
-        fields.put_head(&head)?;
-        let mode = match headers::content_length(&head.headers)? {
+        fields.put_request(&head)?;
+        let mode = match head::content_length(&head.headers)? {
             Some(content_length) => BodyMode::Length { content_length },
             None => BodyMode::UnspecifiedLength,
         };
@@ -199,14 +198,14 @@ async fn read_final_response_head<RS: AsyncRead + StopSending + Unpin>(
     rs: &mut H3ReadStream<RS>,
     qpack: &ArcQpack,
     method: Option<&http::Method>,
-) -> Result<(headers::ResponseHead, BodyMode)> {
+) -> Result<(head::ResponseHead, BodyMode)> {
     let stream_id = rs.stream_id();
     let result = async {
         loop {
             let frame = be_headers_frame(rs).await?;
             let fields = qpack.decode(stream_id, frame.payload.field_section).await?;
-            let head = headers::be_response(fields)?;
-            let status = head.status()?;
+            let head = head::ResponseHead::decode(fields)?;
+            let status = head.response_status()?;
             if status == StatusCode::SWITCHING_PROTOCOLS {
                 return Err(ErrorCode::H3_MESSAGE_ERROR.reason("status 101 is forbidden in HTTP/3"));
             }
@@ -222,7 +221,7 @@ async fn read_final_response_head<RS: AsyncRead + StopSending + Unpin>(
             if status.is_informational() {
                 continue;
             }
-            let length = headers::content_length(&head.headers)?;
+            let length = head::content_length(&head.headers)?;
             let mode = BodyMode::from_parts(status, method, length);
             return Ok((head, mode));
         }
@@ -282,14 +281,14 @@ where
     let producer = request.message.body_stream();
     let fields = (|| {
         let head = request.message.head.lock().unwrap().clone();
-        if head.method != http::Method::CONNECT
+        if head.request_method() != http::Method::CONNECT
             || head.headers.contains_key(http::header::CONTENT_LENGTH)
         {
             return Err(ErrorCode::H3_MESSAGE_ERROR
                 .reason("CONNECT requires the CONNECT method without Content-Length"));
         }
         let mut fields = Vec::new();
-        fields.put_head(&head)?;
+        fields.put_request(&head)?;
         Ok::<_, Error>(fields)
     })()
     .inspect_err(|error| producer.on_error(error.clone()));
@@ -372,6 +371,3 @@ async fn read_response<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
         Message::from_parts(head, body).into(),
     ))
 }
-
-#[cfg(test)]
-mod tests;

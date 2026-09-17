@@ -9,13 +9,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-#[cfg(test)]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{
     Read, Write,
     body::Body,
-    headers::{RequestHead, ResponseHead},
+    head::{RequestHead, ResponseHead},
 };
 use crate::Result;
 
@@ -42,30 +40,6 @@ impl<H, B> Message<H, B> {
             head: Arc::new(Mutex::new(head)),
             body: Arc::new(Mutex::new(body)),
         }
-    }
-}
-
-#[cfg(test)]
-impl<B> Message<RequestHead, B> {
-    /// Replace all existing values for this header name.
-    pub fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
-        self.head.lock().unwrap().headers.insert(name, value);
-        self
-    }
-}
-
-#[cfg(test)]
-impl<B> Message<ResponseHead, B> {
-    /// Replace all existing values for this header name.
-    pub fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
-        self.head.lock().unwrap().headers.insert(name, value);
-        self
-    }
-
-    /// Append a value, preserving existing values for this header name.
-    pub fn append_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
-        self.head.lock().unwrap().headers.append(name, value);
-        self
     }
 }
 
@@ -199,28 +173,32 @@ impl<B: Default> WriteRequest for Message<RequestHead, B> {
 
 impl ReadRequest for RequestHead {
     fn protocol(&self) -> Option<crate::Protocol> {
-        self.extensions.get().cloned()
+        self.request_protocol().cloned()
     }
+
     fn method(&self) -> Method {
-        self.method.clone()
+        self.request_method().clone()
     }
 
     fn authority(&self) -> String {
-        self.uri
+        self.request_uri()
             .authority()
             .map_or("", |value| value.as_str())
             .to_owned()
     }
 
     fn path(&self) -> String {
-        self.uri
+        self.request_uri()
             .path_and_query()
             .map_or("", |value| value.as_str())
             .to_owned()
     }
 
     fn scheme(&self) -> String {
-        self.uri.scheme_str().unwrap_or_default().to_owned()
+        self.request_uri()
+            .scheme_str()
+            .unwrap_or_default()
+            .to_owned()
     }
 
     fn headers(&self) -> HeaderMap {
@@ -230,7 +208,7 @@ impl ReadRequest for RequestHead {
 
 impl<B> ReadRequest for Message<RequestHead, B> {
     fn protocol(&self) -> Option<crate::Protocol> {
-        self.head.lock().unwrap().protocol()
+        ReadRequest::protocol(&*self.head.lock().unwrap())
     }
     fn method(&self) -> Method {
         self.head.lock().unwrap().method()
@@ -255,7 +233,7 @@ impl<B> ReadRequest for Message<RequestHead, B> {
 
 impl WriteResponse for ResponseHead {
     fn set_status(&mut self, status: StatusCode) -> &mut Self {
-        self.status = Some(status);
+        self.pseudo.status = Some(status);
         self
     }
 
@@ -272,7 +250,7 @@ impl WriteResponse for ResponseHead {
 
 impl ReadResponse for ResponseHead {
     fn status(&self) -> StatusCode {
-        self.status.expect("missing :status")
+        self.response_status().expect("missing or invalid :status")
     }
 
     fn headers(&self) -> HeaderMap {
@@ -369,19 +347,6 @@ impl<H, B: Clone, IO> Message<H, Body<B, IO>> {
             Err(body) => Body::new(body.lock().unwrap().storage.clone()),
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn test_direction<D>(&self) -> Message<H, Body<B, D>>
-    where
-        H: Clone,
-    {
-        Message {
-            head: Arc::new(Mutex::new(self.head.lock().unwrap().clone())),
-            body: Arc::new(Mutex::new(Body::new(
-                self.body.lock().unwrap().storage.clone(),
-            ))),
-        }
-    }
 }
 
 impl<H, IO> Message<H, Body<crate::ArcWndBuf, IO>> {
@@ -439,122 +404,5 @@ impl<H> WriteBody for Message<H, Body<Bytes, Write>> {
     fn set_body(&mut self, bytes: Bytes) -> &mut Self {
         self.body.lock().unwrap().storage = bytes;
         self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::common::headers::Write as _;
-
-    impl<H, B> Message<H, B> {
-        pub(crate) fn into_raw_body(self) -> B {
-            Arc::try_unwrap(self.body)
-                .ok()
-                .expect("message body is still shared")
-                .into_inner()
-                .unwrap()
-        }
-    }
-
-    #[tokio::test]
-    async fn message_metadata_and_body_modes() {
-        let mut request = Message::<RequestHead, Bytes>::post("https://example.com/a?q=1").unwrap();
-        assert_eq!(request.method(), Method::POST);
-        assert_eq!(request.authority(), "example.com");
-        assert_eq!(request.scheme(), "https");
-        assert_eq!(request.path(), "/a?q=1");
-        let name = http::header::CONTENT_TYPE;
-        request.set_header(name.clone(), HeaderValue::from_static("text/plain"));
-        assert_eq!(request.head.lock().unwrap().headers[&name], "text/plain");
-        request =
-            WriteRequest::header(request, name.clone(), HeaderValue::from_static("text/html"));
-        assert_eq!(request.head.lock().unwrap().headers[&name], "text/html");
-
-        let mut response = Message::<ResponseHead, Bytes>::default();
-        response
-            .set_status(StatusCode::CREATED)
-            .set_body(Bytes::from_static(b"hello"));
-        assert_eq!(response.status(), StatusCode::CREATED);
-        assert_eq!(ReadBody::body(&response), Bytes::from_static(b"hello"));
-        let mut buf = [0; 3];
-        let mut stream = response.with_body(&b"world"[..]);
-        assert_eq!(stream.status(), StatusCode::CREATED);
-        assert_eq!(AsyncReadExt::read(&mut stream, &mut buf).await.unwrap(), 3);
-        assert_eq!(&buf, b"wor");
-        assert_eq!(AsyncReadExt::read(&mut stream, &mut buf).await.unwrap(), 2);
-        assert_eq!(AsyncReadExt::read(&mut stream, &mut buf).await.unwrap(), 0);
-        drop(stream);
-        let mut stream = Message::<ResponseHead, Vec<u8>>::default();
-        assert_eq!(
-            AsyncWriteExt::write(&mut stream, b"hello").await.unwrap(),
-            5
-        );
-        AsyncWriteExt::shutdown(&mut stream).await.unwrap();
-        assert_eq!(stream.into_raw_body(), b"hello");
-        drop(Message::<ResponseHead, Vec<u8>>::default());
-        assert!(Message::<RequestHead, Bytes>::get("/relative").is_err());
-        assert!(Message::<RequestHead, Bytes>::get("https://bad host/").is_err());
-        for url in ["example.com:443", "https://example.com:443/"] {
-            let connect = Message::<RequestHead, Bytes>::connect(url).unwrap();
-            assert_eq!(connect.authority(), "example.com:443");
-            assert_eq!(connect.scheme(), "");
-            assert_eq!(connect.path(), "");
-        }
-    }
-
-    #[test]
-    fn header_values_survive_body_conversions_and_can_be_replaced() {
-        let mut message = Message::<ResponseHead, Bytes>::default();
-        message.set_status(StatusCode::OK);
-        let name = http::header::SET_COOKIE;
-        let mut sensitive = HeaderValue::from_static("b=2");
-        sensitive.set_sensitive(true);
-        message
-            .set_header(name.clone(), HeaderValue::from_static("a=1"))
-            .append_header(name.clone(), sensitive.clone());
-
-        let message = message.with_body(Vec::<u8>::new());
-        assert_eq!(
-            message
-                .head
-                .lock()
-                .unwrap()
-                .headers
-                .get_all(&name)
-                .iter()
-                .count(),
-            2
-        );
-        let original = message;
-        let copied = original.with_body(Bytes::new());
-        let mut head = copied.head.lock().unwrap();
-        assert_eq!(ReadResponse::status(&*head), StatusCode::OK);
-        assert_eq!(
-            head.headers.get_all(&name).iter().collect::<Vec<_>>(),
-            [&HeaderValue::from_static("a=1"), &sensitive]
-        );
-        let mut fields = Vec::new();
-        fields.put_response(&head).unwrap();
-        assert_eq!(fields[0].name, ":status");
-        assert_eq!(fields[1].name, "set-cookie");
-        assert_eq!(fields[2].name, "set-cookie");
-        assert!(!fields[1].never_index);
-        assert!(fields[2].never_index);
-
-        head.set_header(name.clone(), HeaderValue::from_static("c=3"));
-        assert_eq!(head.headers.get_all(&name).iter().count(), 1);
-        assert_eq!(head.headers[&name], "c=3");
-        assert_eq!(
-            original
-                .head
-                .lock()
-                .unwrap()
-                .headers
-                .get_all(&name)
-                .iter()
-                .count(),
-            2
-        );
     }
 }

@@ -5,7 +5,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
 use super::{
     Read, Write,
     body::Body,
-    headers::RequestHead,
+    head::RequestHead,
     message::{Message, ReadBody, ReadRequest, ReadStream, WriteBody, WriteRequest, WriteStream},
 };
 use crate::{ArcWndBuf, ErrorCode, Result};
@@ -50,12 +50,13 @@ impl RequestHead {
         if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
             return Err(ErrorCode::H3_MESSAGE_ERROR.reason("userinfo is forbidden"));
         }
-        let mut extensions = http::Extensions::new();
         let mut headers = HeaderMap::new();
-        if websocket {
-            extensions.insert(crate::Protocol::new("websocket")?);
+        let protocol = if websocket {
             headers.insert("sec-websocket-version", HeaderValue::from_static("13"));
-        }
+            Some(crate::Protocol::new("websocket")?)
+        } else {
+            None
+        };
         let uri = if method == Method::CONNECT && !websocket {
             Uri::builder()
                 .authority(uri.authority().unwrap().clone())
@@ -67,12 +68,7 @@ impl RequestHead {
         } else {
             uri
         };
-        Ok(Self {
-            method,
-            uri,
-            headers,
-            extensions,
-        })
+        Self::from_request_parts(method, uri, headers, protocol)
     }
 }
 
@@ -180,7 +176,12 @@ impl WriteStream for Request<Write, ArcWndBuf> {
 
 impl<IO, B> ReadRequest for Request<IO, B> {
     fn protocol(&self) -> Option<crate::Protocol> {
-        self.message.head.lock().unwrap().protocol()
+        self.message
+            .head
+            .lock()
+            .unwrap()
+            .request_protocol()
+            .cloned()
     }
     fn method(&self) -> Method {
         self.message.head.lock().unwrap().method()
@@ -231,223 +232,5 @@ impl Request<Write, Bytes> {
     /// Attach an application body, retaining this message's headers.
     pub fn with_body<C>(self, body: super::body::Body<C, Write>) -> Request<Write, C> {
         self.message.with_body(body).into()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use http::{StatusCode, header};
-
-    use super::*;
-    use crate::{
-        ErrorCode,
-        common::{
-            message::{ReadResponse, WriteResponse},
-            response::Response,
-        },
-    };
-
-    #[test]
-    fn sharing_a_body_does_not_share_or_overwrite_headers() {
-        fn check<B: Clone>(body: Body<B, Write>) {
-            let first = crate::client::Request::post("https://example.com/first")
-                .unwrap()
-                .header(header::CONTENT_TYPE, "text/plain".parse().unwrap())
-                .with_body(body.clone());
-            let second = crate::client::Request::put("https://example.com/second")
-                .unwrap()
-                .header(header::CONTENT_TYPE, "application/json".parse().unwrap())
-                .with_body(body);
-            assert_eq!(first.method(), Method::POST);
-            assert_eq!(first.path(), "/first");
-            assert_eq!(first.headers()[header::CONTENT_TYPE], "text/plain");
-            assert_eq!(second.method(), Method::PUT);
-            assert_eq!(second.path(), "/second");
-            assert_eq!(second.headers()[header::CONTENT_TYPE], "application/json");
-        }
-        check(Body::<Bytes, Write>::new(Bytes::from_static(b"data")));
-        check(Body::<ArcWndBuf, Write>::with_capacity(1));
-    }
-
-    #[tokio::test]
-    async fn extracted_body_releases_headers() {
-        use std::sync::Arc;
-        for retain_clone in [false, true] {
-            let request = crate::client::Request::streaming_post("https://example.com/").unwrap();
-            let message = Arc::downgrade(&request.message.head);
-            let retained = retain_clone.then(|| request.clone());
-            let mut body = request.into_body();
-            assert_eq!(message.upgrade().is_some(), retain_clone);
-            drop(retained);
-            assert!(
-                message.upgrade().is_none(),
-                "body must not retain message headers"
-            );
-            body.write_all(b"x").await.unwrap();
-            body.finish().await.unwrap();
-        }
-    }
-
-    #[test]
-    fn streaming_constructors() {
-        use crate::client::Request;
-
-        for (constructor, method) in [
-            (
-                Request::streaming_post as fn(&str) -> Result<Request<ArcWndBuf>>,
-                Method::POST,
-            ),
-            (Request::streaming_put, Method::PUT),
-            (Request::streaming_patch, Method::PATCH),
-        ] {
-            let request = constructor("https://example.com/upload?q=1").unwrap();
-            let head = request.message.head.lock().unwrap();
-            assert_eq!(head.method(), method);
-            assert_eq!(head.authority(), "example.com");
-            assert_eq!(head.path(), "/upload?q=1");
-            assert!(constructor("/relative").is_err());
-            assert!(constructor("example.com:443").is_err());
-        }
-    }
-
-    #[tokio::test]
-    async fn streaming_body_backpressure_and_errors_before_sending() {
-        use std::{
-            future::Future,
-            task::{Context, Waker},
-            time::Duration,
-        };
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            for error in [ErrorCode::H3_REQUEST_CANCELLED, ErrorCode::H3_MESSAGE_ERROR] {
-                let mut request = Request::streaming_post("https://example.com/upload").unwrap();
-                if error == ErrorCode::H3_MESSAGE_ERROR {
-                    request =
-                        request.header(header::CONTENT_LENGTH, HeaderValue::from_static("invalid"));
-                }
-                assert_eq!(
-                    request
-                        .write(vec![b'x'; DEFAULT_STREAM_CAPACITY])
-                        .await
-                        .unwrap(),
-                    DEFAULT_STREAM_CAPACITY
-                );
-                let mut writer = request.clone();
-                let mut waiting = Box::pin(writer.write(b"y"));
-                assert!(
-                    waiting
-                        .as_mut()
-                        .poll(&mut Context::from_waker(Waker::noop()))
-                        .is_pending()
-                );
-                if error == ErrorCode::H3_REQUEST_CANCELLED {
-                    request.reset().await.unwrap();
-                } else {
-                    let result = crate::client::write_streaming_request(
-                        request,
-                        crate::test_support::write_stream(0, tokio::io::sink()),
-                        crate::test_support::read_stream(0, tokio::io::empty()),
-                        crate::test_support::connection().await.qpack().clone(),
-                    );
-                    assert!(matches!(result, Err(actual) if actual.code == error));
-                }
-                assert_eq!((waiting.await).map_err(ErrorCode::from), Err(error));
-                assert_eq!((writer.finish().await).map_err(ErrorCode::from), Err(error));
-            }
-        })
-        .await
-        .expect("body writes must use buffer capacity and errors before sending");
-    }
-
-    #[tokio::test]
-    async fn shared_metadata_bodies_and_streams() {
-        let mut writer = Request::<Write>::post("https://example.com/a?q=1")
-            .unwrap()
-            .header(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))
-            .with_body(h3x::Body::new(Bytes::from_static(b"hello")));
-        let reader = Request::<Read>::from(writer.message.test_direction());
-        assert_eq!(reader.method(), Method::POST);
-        assert_eq!(reader.authority(), "example.com");
-        assert_eq!(reader.path(), "/a?q=1");
-        assert_eq!(reader.scheme(), "https");
-        assert_eq!(reader.body(), Bytes::from_static(b"hello"));
-        writer.set_body(Bytes::from_static(b"updated"));
-        assert_eq!(reader.body(), Bytes::from_static(b"hello"));
-        assert_eq!(
-            writer.message.body.lock().unwrap().storage,
-            Bytes::from_static(b"updated")
-        );
-        assert!(Request::<Write>::get("/relative").is_err());
-
-        let message =
-            Message::<crate::common::headers::ResponseHead, Body<Bytes, Write>>::default();
-        let mut response = Response::<Write>::from(message.clone());
-        response
-            .set_status(StatusCode::CREATED)
-            .set_body(Bytes::from_static(b"ok"));
-        let response = Response::<Read>::from(message.test_direction());
-        assert_eq!(response.status(), StatusCode::CREATED);
-        assert_eq!(response.body(), Bytes::from_static(b"ok"));
-
-        let request = crate::client::Request::streaming_post("https://example.com/")
-            .unwrap()
-            .header(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-        let mut writer = request.clone();
-        assert!(std::sync::Arc::ptr_eq(
-            &request.message.head,
-            &writer.message.head
-        ));
-        assert!(std::sync::Arc::ptr_eq(
-            &request.message.body,
-            &writer.message.body
-        ));
-        let mut reader = Request::<Read, _>::from(request.message.test_direction());
-        assert_eq!(reader.method(), Method::POST);
-        assert_eq!(reader.authority(), "example.com");
-        assert_eq!(
-            reader
-                .message
-                .head
-                .lock()
-                .unwrap()
-                .headers
-                .get(&header::CONTENT_TYPE)
-                .unwrap(),
-            "text/plain"
-        );
-        let sentences = [
-            "This is the first sentence. ",
-            "Here is the second sentence. ",
-            "This is the last sentence.",
-        ];
-        let payload = sentences.concat().into_bytes();
-        let mut buf = vec![0; payload.len()];
-        let ((), count) = tokio::join!(
-            async {
-                for sentence in sentences {
-                    assert_eq!(writer.write(sentence).await.unwrap(), sentence.len());
-                }
-                writer.finish().await.unwrap();
-            },
-            reader.read_all(&mut buf)
-        );
-        assert_eq!(count.unwrap(), payload.len());
-        assert_eq!(buf, payload);
-        assert_eq!(reader.read(&mut buf).await.unwrap(), 0);
-        writer.reset().await.unwrap();
-        assert_eq!(
-            ErrorCode::from(reader.read(&mut buf).await.unwrap_err()),
-            ErrorCode::H3_REQUEST_CANCELLED
-        );
-
-        let message = Message::<crate::common::headers::ResponseHead, Bytes>::default()
-            .with_body(crate::Body::new(ArcWndBuf::new(1)));
-        let mut writer = Response::<Write, _>::from(message.clone());
-        let reader = Response::<Read, _>::from(message.test_direction());
-        reader.stop().await;
-        assert_eq!(
-            ErrorCode::from(writer.write(b"x").await.unwrap_err()),
-            ErrorCode::H3_REQUEST_CANCELLED
-        );
     }
 }

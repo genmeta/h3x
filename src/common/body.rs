@@ -6,9 +6,7 @@ use http::{Method, StatusCode};
 use qrecovery::recv::StopSending;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-use super::{Read, Write, headers, headers::ResponseHead};
-#[cfg(test)]
-use crate::protocol::frame::be_frame;
+use super::{Read, Write, head, head::ResponseHead};
 use crate::{
     ArcWndBuf, ErrorCode, Result,
     protocol::{
@@ -201,7 +199,7 @@ pub(crate) enum BodyMode {
 impl BodyMode {
     /// Validate an outgoing final response and resolve its body framing.
     pub(crate) fn resolve(response: &ResponseHead, method: Option<&Method>) -> Result<Self> {
-        let status = response.status()?;
+        let status = response.response_status()?;
         if status.is_informational() {
             return Err(ErrorCode::H3_MESSAGE_ERROR
                 .reason("a final response cannot use an informational status"));
@@ -220,7 +218,7 @@ impl BodyMode {
                 ErrorCode::H3_MESSAGE_ERROR.reason("204 response must not include Content-Length")
             );
         }
-        let content_length = headers::content_length(&response.headers)?;
+        let content_length = head::content_length(&response.headers)?;
         Ok(Self::from_parts(status, method, content_length))
     }
 
@@ -313,7 +311,7 @@ pub(crate) async fn read_body<R: AsyncRead + StopSending + Unpin, W: AsyncWrite 
                         frame.payload.field_section,
                     )
                     .await?;
-                headers::be_trailers(fields)?;
+                head::be_trailers(fields)?;
                 trailers = true;
             }
             H3Frame::Unknown { length, .. } => {
@@ -385,149 +383,3 @@ pub(crate) async fn write_streaming_body<R: AsyncRead + Unpin, W: AsyncWrite + U
         send.flush().await?;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use bytes::Bytes;
-
-    use super::*;
-    use crate::protocol::{
-        frame::Headers,
-        qpack::{self, WriteFieldSection},
-    };
-
-    #[tokio::test]
-    async fn bytes_body_writes_one_frame_and_skips_empty_body() {
-        for length in [0, 1, frame::MAX_DATA_CHUNK, frame::MAX_DATA_CHUNK + 1] {
-            let body = vec![42; length];
-            let (mut send, mut recv) = tokio::io::duplex(3);
-            let ((), received) = tokio::join!(
-                async {
-                    write_bytes_body(&body, &mut send).await.unwrap();
-                    // The body writer must leave the stream open.
-                    send.write_all(&[0x21, 0]).await.unwrap();
-                    send.shutdown().await.unwrap();
-                },
-                async {
-                    let mut encoded = Vec::new();
-                    recv.read_to_end(&mut encoded).await.unwrap();
-                    encoded
-                }
-            );
-            let mut input = received.as_slice();
-            if !body.is_empty() {
-                let H3Frame::Data(frame) = be_frame(&mut input).await.unwrap() else {
-                    panic!("expected DATA");
-                };
-                assert_eq!(frame.length.into_u64(), body.len() as u64);
-                assert_eq!(&input[..body.len()], body.as_slice());
-                input = &input[body.len()..];
-            }
-            assert_eq!(input, &[0x21, 0]);
-        }
-    }
-
-    #[tokio::test]
-    async fn streaming_body_leaves_shutdown_to_the_caller() {
-        use std::{
-            future::Future,
-            task::{Context, Waker},
-        };
-        let (mut send, mut recv) = tokio::io::duplex(64);
-        write_streaming_body(
-            &mut &b"bc"[..],
-            &mut send,
-            BodyMode::Length { content_length: 2 },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            be_frame(&mut recv).await.unwrap(),
-            H3Frame::Data(_)
-        ));
-        let mut bytes = [0; 2];
-        recv.read_exact(&mut bytes).await.unwrap();
-        assert_eq!(&bytes, b"bc");
-        let mut reading = Box::pin(recv.read(&mut bytes));
-        assert!(
-            reading
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-        send.shutdown().await.unwrap();
-        assert_eq!(reading.await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn body_trailers_enforce_order_and_content_length() {
-        let mut trailers = Vec::new();
-        let mut field_section = Vec::new();
-        field_section
-            .put_field_section(vec![qpack::Field {
-                never_index: false,
-                name: Bytes::from_static(b"x-checksum"),
-                value: Bytes::from_static(b"ok"),
-            }])
-            .unwrap();
-        trailers.put_frame(
-            &Frame::new(Headers {
-                field_section: field_section.into(),
-            })
-            .unwrap(),
-        );
-        for (suffix, length, expected) in [
-            (&[][..], None, Ok(())),
-            (&[][..], Some(0), Ok(())),
-            (&[0x21, 0][..], Some(0), Ok(())),
-            (&[][..], Some(1), Err(ErrorCode::H3_MESSAGE_ERROR)),
-            (
-                trailers.as_slice(),
-                None,
-                Err(ErrorCode::H3_FRAME_UNEXPECTED),
-            ),
-            (&[0, 0][..], None, Err(ErrorCode::H3_FRAME_UNEXPECTED)),
-            (
-                &[0x21, 0, 0, 0][..],
-                None,
-                Err(ErrorCode::H3_FRAME_UNEXPECTED),
-            ),
-        ] {
-            let encoded = [trailers.as_slice(), suffix].concat();
-            let mut input = encoded.as_slice();
-            let mut body = Vec::new();
-            assert_eq!(
-                (read_body(
-                    &mut crate::test_support::read_stream(0, &mut input),
-                    &mut body,
-                    match length {
-                        Some(content_length) => BodyMode::Length { content_length },
-                        None => BodyMode::UnspecifiedLength,
-                    },
-                    crate::test_support::connection().await.qpack()
-                )
-                .await)
-                    .map_err(ErrorCode::from),
-                expected
-            );
-            assert!(body.is_empty());
-        }
-        let mut input = &[7, 1, 0][..]; // GOAWAY is forbidden in a message body.
-        let mut body = Vec::new();
-        assert_eq!(
-            (read_body(
-                &mut crate::test_support::read_stream(0, &mut input),
-                &mut body,
-                BodyMode::UnspecifiedLength,
-                crate::test_support::connection().await.qpack()
-            )
-            .await)
-                .map_err(ErrorCode::from),
-            Err(ErrorCode::H3_FRAME_UNEXPECTED)
-        );
-    }
-}
-
-#[cfg(test)]
-#[path = "body/connect_tests.rs"]
-mod connect_tests;

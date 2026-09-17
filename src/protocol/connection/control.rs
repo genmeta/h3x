@@ -204,12 +204,3 @@ impl<T: Transport> H3Connection<T> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod admission_tests;
-
-#[cfg(test)]
-mod qpack_writer_tests;

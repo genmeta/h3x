@@ -5,7 +5,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use super::{
     Read, Write,
     body::Body,
-    headers::ResponseHead,
+    head::ResponseHead,
     message::{Message, ReadBody, ReadResponse, ReadStream, WriteBody, WriteResponse, WriteStream},
 };
 use crate::{ArcWndBuf, Result};
