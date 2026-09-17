@@ -43,9 +43,8 @@ impl State {
     /// Pass default peer settings until SETTINGS arrives; all integer limits are 62-bit.
     pub(super) fn new(peer: Settings, on_instruction: super::OnInstruction) -> Result<Self> {
         if peer.blocked_streams > VARINT_MAX {
-            return Err(ErrorCode::H3_SETTINGS_ERROR.reason(
-                "QPACK blocked-stream limit exceeds the QUIC variable-integer range",
-            ));
+            return Err(ErrorCode::H3_SETTINGS_ERROR
+                .reason("QPACK blocked-stream limit exceeds the QUIC variable-integer range"));
         }
         Ok(Self {
             table: DynamicTable::new(peer.max_table_capacity)?,
@@ -73,9 +72,8 @@ impl State {
         if peer.blocked_streams > VARINT_MAX
             || peer.blocked_streams < self.potentially_blocked_streams() as u64
         {
-            return Err(ErrorCode::H3_SETTINGS_ERROR.reason(
-                "QPACK blocked-stream limit exceeds the QUIC variable-integer range",
-            ));
+            return Err(ErrorCode::H3_SETTINGS_ERROR
+                .reason("QPACK blocked-stream limit exceeds the QUIC variable-integer range"));
         }
         self.table.set_max_capacity(peer.max_table_capacity)?;
         self.max_blocked_streams = peer.blocked_streams;
@@ -101,8 +99,7 @@ impl State {
                 .and_then(|v| v.checked_add(32))
                 .filter(|&v| v as u64 <= self.max_field_section_size)
                 .ok_or_else(|| {
-                    ErrorCode::H3_EXCESSIVE_LOAD
-                        .reason("field section exceeds the peer size limit")
+                    ErrorCode::H3_EXCESSIVE_LOAD.reason("field section exceeds the peer size limit")
                 })?;
             field.never_index |= should_never_index(&field.name);
             bounded.push(field);
@@ -118,11 +115,11 @@ impl State {
         let result = self
             .encode_fields(stream_id, bounded.clone(), &mut instructions, true)
             .and_then(|wire| {
-                if !instructions.is_empty() {
-                    if let Err(error) = (self.on_instruction)(instructions) {
-                        queue_full = error.code == ErrorCode::H3_EXCESSIVE_LOAD;
-                        return Err(error);
-                    }
+                if !instructions.is_empty()
+                    && let Err(error) = (self.on_instruction)(instructions)
+                {
+                    queue_full = error.code == ErrorCode::H3_EXCESSIVE_LOAD;
+                    return Err(error);
                 }
                 Ok(wire)
             });
@@ -338,9 +335,8 @@ impl State {
                         .reason("acknowledgement has no outstanding field section")
                 })?;
                 if section.required_insert_count > completed_insert_count {
-                    return Err(ErrorCode::QPACK_DECODER_STREAM_ERROR.reason(
-                        "acknowledgement refers to inserts that have not been written",
-                    ));
+                    return Err(ErrorCode::QPACK_DECODER_STREAM_ERROR
+                        .reason("acknowledgement refers to inserts that have not been written"));
                 }
                 self.known_received_count =
                     self.known_received_count.max(section.required_insert_count);
@@ -351,9 +347,8 @@ impl State {
             }
             DecoderInstruction::StreamCancellation(stream_id) => {
                 if stream_id > VARINT_MAX {
-                    return Err(ErrorCode::QPACK_DECODER_STREAM_ERROR.reason(
-                        "cancelled stream ID exceeds the QUIC variable-integer range",
-                    ));
+                    return Err(ErrorCode::QPACK_DECODER_STREAM_ERROR
+                        .reason("cancelled stream ID exceeds the QUIC variable-integer range"));
                 }
                 self.unacked_sections_by_stream.remove(&stream_id);
             }
