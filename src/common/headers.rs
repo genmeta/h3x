@@ -11,6 +11,7 @@ use crate::{Error, ErrorCode, Result, protocol::qpack::Field};
 
 /// Validated request metadata. HTTP/3 pseudo-headers are represented by their
 /// typed HTTP equivalents; `headers` contains ordinary fields only.
+///
 #[derive(Clone, Debug)]
 pub(crate) struct RequestHead {
     pub(crate) extensions: http::Extensions,
@@ -45,13 +46,15 @@ pub(crate) fn content_length(headers: &HeaderMap) -> Result<Option<u64>> {
         return Ok(None);
     };
     if values.next().is_some() {
-        return Err(ErrorCode::H3_MESSAGE_ERROR
-            .reason("multiple Content-Length fields are not allowed"));
+        return Err(
+            ErrorCode::H3_MESSAGE_ERROR.reason("multiple Content-Length fields are not allowed")
+        );
     }
     let value = value.to_str().map_err(message_error)?;
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(ErrorCode::H3_MESSAGE_ERROR
-            .reason("Content-Length must contain only decimal digits"));
+        return Err(
+            ErrorCode::H3_MESSAGE_ERROR.reason("Content-Length must contain only decimal digits")
+        );
     }
     value.parse::<u64>().map(Some).map_err(message_error)
 }
@@ -65,8 +68,9 @@ pub(crate) fn be_request(fields: Vec<Field>) -> Result<RequestHead> {
             b":method" | b":scheme" | b":authority" | b":path" | b":protocol"
         )
     }) {
-        return Err(ErrorCode::H3_MESSAGE_ERROR
-            .reason("request contains an unsupported pseudo-header"));
+        return Err(
+            ErrorCode::H3_MESSAGE_ERROR.reason("request contains an unsupported pseudo-header")
+        );
     }
 
     let method =
@@ -84,16 +88,12 @@ pub(crate) fn be_request(fields: Vec<Field>) -> Result<RequestHead> {
             from_utf8(protocol).map_err(message_error)?,
         )?);
     }
-    let semantic_method = if protocol.is_some() {
-        &Method::GET
-    } else {
-        &method
-    };
-    let authority = validate_request_pseudo(semantic_method, scheme, authority, path, &headers)?;
+    let plain_connect = method == Method::CONNECT && protocol.is_none();
+    let authority = validate_request_pseudo(plain_connect, scheme, authority, path, &headers)?;
     if authority.as_str().contains('@') {
         return Err(ErrorCode::H3_MESSAGE_ERROR.reason("userinfo is forbidden"));
     }
-    let uri = build_request_uri(semantic_method, scheme, authority, path)?;
+    let uri = build_request_uri(plain_connect, scheme, authority, path)?;
 
     Ok(RequestHead {
         uri,
@@ -122,24 +122,26 @@ pub(crate) fn be_response(fields: Vec<Field>) -> Result<ResponseHead> {
 pub(crate) fn be_trailers(fields: Vec<Field>) -> Result<HeaderMap> {
     let ParsedFields { pseudo, headers } = parse_fields(fields)?;
     if !pseudo.is_empty() {
-        return Err(
-            ErrorCode::H3_MESSAGE_ERROR.reason("trailers must not contain pseudo-headers")
-        );
+        return Err(ErrorCode::H3_MESSAGE_ERROR.reason("trailers must not contain pseudo-headers"));
     }
     Ok(headers)
 }
 
 /// Write typed HTTP metadata as QPACK input fields.
+/// EncodeRequestHead： EncodeHead 默认实现
+/// WriteResponseHead 分开
 pub(crate) trait Write {
     /// Write one complete request field section into an empty field vector.
-    fn put_request(&mut self, head: &RequestHead) -> Result<()>;
+    fn put_head(&mut self, head: &RequestHead) -> Result<()>;
 
     /// Write one complete response field section into an empty field vector.
     fn put_response(&mut self, head: &ResponseHead) -> Result<()>;
 }
 
 impl Write for Vec<Field> {
-    fn put_request(&mut self, head: &RequestHead) -> Result<()> {
+    // TODO: 用统一的 HEAD， Request 和 Response 不同的地方用 get 出来
+    // INTO http 定义的 head
+    fn put_head(&mut self, head: &RequestHead) -> Result<()> {
         require_empty(self)?;
         validate_regular_headers(&head.headers)?;
         let RequestPseudo {
@@ -239,8 +241,9 @@ fn validate_regular_field(name: &HeaderName, value: &HeaderValue) -> Result<()> 
     if matches!(name, &CONNECTION | &TRANSFER_ENCODING | &UPGRADE)
         || matches!(name.as_str(), "proxy-connection" | "keep-alive")
     {
-        return Err(ErrorCode::H3_MESSAGE_ERROR
-            .reason("connection-specific header is forbidden in HTTP/3"));
+        return Err(
+            ErrorCode::H3_MESSAGE_ERROR.reason("connection-specific header is forbidden in HTTP/3")
+        );
     }
     if name == TE && !value.as_bytes().eq_ignore_ascii_case(b"trailers") {
         return Err(ErrorCode::H3_MESSAGE_ERROR.reason("TE must have the value trailers"));
@@ -263,9 +266,10 @@ struct RequestPseudo<'a> {
 
 fn request_pseudo(head: &RequestHead) -> Result<RequestPseudo<'_>> {
     let scheme = head.uri.scheme_str().map(str::as_bytes);
-    let authority = head.uri.authority().ok_or_else(|| {
-        ErrorCode::H3_MESSAGE_ERROR.reason("request URI is missing authority")
-    })?;
+    let authority = head
+        .uri
+        .authority()
+        .ok_or_else(|| ErrorCode::H3_MESSAGE_ERROR.reason("request URI is missing authority"))?;
     let authority = authority.as_str().as_bytes();
     let path = head
         .uri
@@ -281,13 +285,12 @@ fn request_pseudo(head: &RequestHead) -> Result<RequestPseudo<'_>> {
     }
     if head.method == Method::CONNECT && protocol.is_none() {
         if scheme.is_some() || path.is_some() {
-            return Err(ErrorCode::H3_MESSAGE_ERROR
-                .reason("CONNECT must not include :scheme or :path"));
+            return Err(
+                ErrorCode::H3_MESSAGE_ERROR.reason("CONNECT must not include :scheme or :path")
+            );
         }
         if head.uri.authority().unwrap().port().is_none() {
-            return Err(
-                ErrorCode::H3_MESSAGE_ERROR.reason("CONNECT authority is missing a port")
-            );
+            return Err(ErrorCode::H3_MESSAGE_ERROR.reason("CONNECT authority is missing a port"));
         }
         return Ok(RequestPseudo {
             scheme: None,
@@ -301,18 +304,14 @@ fn request_pseudo(head: &RequestHead) -> Result<RequestPseudo<'_>> {
     let path =
         path.ok_or_else(|| ErrorCode::H3_MESSAGE_ERROR.reason("request URI is missing path"))?;
     if path.is_empty() || (path != b"*" && !path.starts_with(b"/")) {
-        return Err(
-            ErrorCode::H3_MESSAGE_ERROR.reason("request path must be * or start with /")
-        );
+        return Err(ErrorCode::H3_MESSAGE_ERROR.reason("request path must be * or start with /"));
     }
     if head
         .headers
         .get(HOST)
         .is_some_and(|host| host.as_bytes() != authority)
     {
-        return Err(
-            ErrorCode::H3_MESSAGE_ERROR.reason("Host does not match request authority")
-        );
+        return Err(ErrorCode::H3_MESSAGE_ERROR.reason("Host does not match request authority"));
     }
     Ok(RequestPseudo {
         scheme: Some(scheme),
@@ -338,23 +337,22 @@ fn put_regular_headers(fields: &mut Vec<Field>, headers: &HeaderMap) {
 }
 
 fn validate_request_pseudo(
-    method: &Method,
+    plain_connect: bool,
     scheme: Option<&[u8]>,
     authority: Option<&[u8]>,
     path: Option<&[u8]>,
     headers: &HeaderMap,
 ) -> Result<Authority> {
-    if method == Method::CONNECT {
+    if plain_connect {
         if scheme.is_some() || path.is_some() {
-            return Err(ErrorCode::H3_MESSAGE_ERROR
-                .reason("CONNECT must not include :scheme or :path"));
+            return Err(
+                ErrorCode::H3_MESSAGE_ERROR.reason("CONNECT must not include :scheme or :path")
+            );
         }
         let authority = required_utf8(authority, ":authority")?;
         let authority: Authority = authority.parse().map_err(message_error)?;
         if authority.port().is_none() {
-            return Err(
-                ErrorCode::H3_MESSAGE_ERROR.reason("CONNECT authority is missing a port")
-            );
+            return Err(ErrorCode::H3_MESSAGE_ERROR.reason("CONNECT authority is missing a port"));
         }
         return Ok(authority);
     }
@@ -362,9 +360,7 @@ fn validate_request_pseudo(
     required_utf8(scheme, ":scheme")?;
     let path = required_bytes(path, ":path")?;
     if path.is_empty() || (path != b"*" && !path.starts_with(b"/")) {
-        return Err(
-            ErrorCode::H3_MESSAGE_ERROR.reason("request path must be * or start with /")
-        );
+        return Err(ErrorCode::H3_MESSAGE_ERROR.reason("request path must be * or start with /"));
     }
     let host = headers.get(HOST).map(HeaderValue::as_bytes);
     if let (Some(authority), Some(host)) = (authority, host)
@@ -378,13 +374,13 @@ fn validate_request_pseudo(
 }
 
 fn build_request_uri(
-    method: &Method,
+    plain_connect: bool,
     scheme: Option<&[u8]>,
     authority: Authority,
     path: Option<&[u8]>,
 ) -> Result<Uri> {
     let builder = Uri::builder().authority(authority);
-    if method == Method::CONNECT {
+    if plain_connect {
         return builder.build().map_err(message_error);
     }
 
@@ -412,9 +408,7 @@ fn pseudo_value<'a>(pseudo: &'a [Field], name: &[u8]) -> Option<&'a [u8]> {
 }
 
 fn required_bytes<'a>(value: Option<&'a [u8]>, name: &str) -> Result<&'a [u8]> {
-    value.ok_or_else(|| {
-        ErrorCode::H3_MESSAGE_ERROR.reason(format!("missing pseudo-header {name}"))
-    })
+    value.ok_or_else(|| ErrorCode::H3_MESSAGE_ERROR.reason(format!("missing pseudo-header {name}")))
 }
 
 fn required_utf8<'a>(value: Option<&'a [u8]>, name: &str) -> Result<&'a str> {
@@ -463,7 +457,7 @@ mod tests {
         ])
         .unwrap();
         let mut request_fields = Vec::new();
-        request_fields.put_request(&request).unwrap();
+        request_fields.put_head(&request).unwrap();
         assert_eq!(
             request_fields
                 .iter()
@@ -506,7 +500,7 @@ mod tests {
         };
         let mut fields = Vec::new();
         assert!(matches!(
-            fields.put_request(&request),
+            fields.put_head(&request),
             Err(h3x::Error {
                 code: ErrorCode::H3_MESSAGE_ERROR,
                 ..
@@ -519,7 +513,7 @@ mod tests {
             .headers
             .insert(CONNECTION, HeaderValue::from_static("close"));
         assert!(matches!(
-            fields.put_request(&request),
+            fields.put_head(&request),
             Err(h3x::Error {
                 code: ErrorCode::H3_MESSAGE_ERROR,
                 ..
@@ -773,7 +767,7 @@ mod connect_tests {
             assert!(!request.headers().contains_key("sec-websocket-key"));
             let head = request.message.head.lock().unwrap();
             let mut fields = Vec::new();
-            fields.put_request(&head).unwrap();
+            fields.put_head(&head).unwrap();
             let decoded = be_request(fields.clone()).unwrap();
             assert_eq!(decoded.uri, head.uri);
             assert_eq!(decoded.protocol(), head.protocol());
@@ -801,7 +795,7 @@ mod connect_tests {
         let request = client::Request::connect("ws://example.com/").unwrap();
         let mut fields = Vec::new();
         fields
-            .put_request(&request.message.head.lock().unwrap())
+            .put_head(&request.message.head.lock().unwrap())
             .unwrap();
         for name in [b":scheme".as_slice(), b":authority", b":path"] {
             let mut missing = fields.clone();
@@ -820,6 +814,6 @@ mod connect_tests {
         assert!(be_request(duplicate).is_err());
         let mut head = request.message.head.lock().unwrap().clone();
         head.method = Method::GET;
-        assert!(Vec::new().put_request(&head).is_err());
+        assert!(Vec::new().put_head(&head).is_err());
     }
 }

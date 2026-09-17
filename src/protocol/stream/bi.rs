@@ -1,58 +1,62 @@
 //! Connection ownership and GOAWAY dispatch for bidirectional streams.
 use std::{
     collections::HashMap,
-    future::poll_fn,
     mem,
     sync::{Arc, Mutex, Weak},
-    task::Poll,
 };
 
 use qrecovery::{recv::StopSending, send::CancelStream};
+use tokio::sync::Notify;
 
-use super::{H3ReadStream, H3WriteStream, StreamState};
+use super::{Goaway, H3ReadStream, H3Stream, H3WriteStream};
 use crate::{Error, ErrorCode, Result};
 
 /// Observes application-owned directions without extending their lifetimes.
 pub(crate) struct BiStream<R, W> {
     id: u64,
-    read: Weak<Mutex<StreamState<R>>>,
-    write: Weak<Mutex<StreamState<W>>>,
+    read: Weak<Mutex<std::result::Result<H3Stream<R>, Goaway>>>,
+    write: Weak<Mutex<std::result::Result<H3Stream<W>, Goaway>>>,
 }
 
 impl<R: StopSending, W: CancelStream> BiStream<R, W> {
-    async fn finished(&self) {
-        poll_fn(|cx| {
-            let read = self.read.upgrade().map_or(Poll::Ready(()), |state| {
-                state.lock().unwrap().poll_finished(cx)
-            });
-            let write = self.write.upgrade().map_or(Poll::Ready(()), |state| {
-                state.lock().unwrap().poll_finished(cx)
-            });
-            if read.is_ready() && write.is_ready() {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        })
-        .await
-    }
-
-    fn close(&self, error: Error) {
-        if let Some(state) = self.read.upgrade() {
-            let wakers = state
+    fn is_finished(&self) -> bool {
+        self.read.upgrade().is_none_or(|state| {
+            state
                 .lock()
                 .unwrap()
-                .close(error.clone(), |io| io.stop(error.code.as_u64()));
-            for waker in wakers.into_iter().flatten() {
+                .as_ref()
+                .map_or(true, |s| matches!(s, super::H3Stream::Finished(_)))
+        }) && self.write.upgrade().is_none_or(|state| {
+            state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(true, |s| matches!(s, super::H3Stream::Finished(_)))
+        })
+    }
+
+    fn terminate(&self, code: u64, goaway: bool) {
+        if let Some(state) = self.read.upgrade() {
+            let mut state = state.lock().unwrap();
+            let waker = if goaway {
+                super::goaway(&mut state, |io| io.stop(code))
+            } else {
+                super::terminate(&mut state, |io| io.stop(code))
+            };
+            drop(state);
+            if let Some(waker) = waker {
                 waker.wake();
             }
         }
         if let Some(state) = self.write.upgrade() {
-            let wakers = state
-                .lock()
-                .unwrap()
-                .close(error.clone(), |io| io.cancel(error.code.as_u64()));
-            for waker in wakers.into_iter().flatten() {
+            let mut state = state.lock().unwrap();
+            let waker = if goaway {
+                super::goaway(&mut state, |io| io.cancel(code))
+            } else {
+                super::terminate(&mut state, |io| io.cancel(code))
+            };
+            drop(state);
+            if let Some(waker) = waker {
                 waker.wake();
             }
         }
@@ -61,6 +65,7 @@ impl<R: StopSending, W: CancelStream> BiStream<R, W> {
 
 pub(crate) struct BiStreams<R, W> {
     streams: Mutex<HashMap<u64, Arc<BiStream<R, W>>>>,
+    drain_notify: Arc<Notify>,
 }
 
 impl<R: StopSending, W: CancelStream> Default for BiStreams<R, W> {
@@ -73,32 +78,35 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
     pub(crate) fn new() -> Self {
         Self {
             streams: Mutex::new(HashMap::new()),
+            drain_notify: Arc::default(),
         }
     }
 
     /// Wait for the fixed set after both GOAWAY directions froze admission.
     /// The connection must freeze admission before calling this method.
-    /// Each direction keeps the latest drain waiter alongside its I/O waiter.
+    /// Completion is determined from the direction states.
+    // TODO: Connect direction completion to the shared drain notification.
     pub(crate) async fn drained(&self) {
         let running: Vec<_> = self.streams.lock().unwrap().values().cloned().collect();
-        for stream in running {
-            stream.finished().await;
+        loop {
+            let notified = self.drain_notify.notified();
+            tokio::pin!(notified);
+            // Register before inspecting states, so completion during the scan cannot be lost.
+            notified.as_mut().enable();
+            if running.iter().all(|stream| stream.is_finished()) {
+                break;
+            }
+            notified.await;
         }
         self.cleanup();
     }
 
     // Idle connections retain finished entries until the next insert or GOAWAY.
     pub(crate) fn cleanup(&self) {
-        self.streams.lock().unwrap().retain(|_, stream| {
-            !(stream
-                .read
-                .upgrade()
-                .is_none_or(|state| state.lock().unwrap().is_finished())
-                && stream
-                    .write
-                    .upgrade()
-                    .is_none_or(|state| state.lock().unwrap().is_finished()))
-        });
+        self.streams
+            .lock()
+            .unwrap()
+            .retain(|_, stream| !stream.is_finished());
     }
 
     pub(crate) fn goaway(&self, id: u64) -> Vec<u64> {
@@ -112,8 +120,9 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
             .collect();
         let rejected = streams.iter().map(|stream| stream.id).collect();
         for stream in streams {
-            stream.close(ErrorCode::H3_REQUEST_REJECTED.reason("request rejected"));
+            stream.terminate(ErrorCode::H3_REQUEST_REJECTED.as_u64(), true);
         }
+        self.drain_notify.notify_waiters();
         self.cleanup();
         rejected
     }
@@ -121,8 +130,9 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
     pub(crate) fn close(&self, error: Error) {
         let streams = mem::take(&mut *self.streams.lock().unwrap());
         for stream in streams.into_values() {
-            stream.close(error.clone());
+            stream.terminate(error.code.as_u64(), false);
         }
+        self.drain_notify.notify_waiters();
     }
 
     pub(crate) fn insert(
@@ -293,34 +303,38 @@ mod tests {
             assert!(draining.as_mut().poll(&mut cx).is_pending());
             if read_first {
                 drop(recv);
-                assert!(
-                    stream
-                        .read
-                        .upgrade()
-                        .is_none_or(|state| state.lock().unwrap().is_finished())
-                );
-                assert!(
-                    !stream
-                        .write
-                        .upgrade()
-                        .is_none_or(|state| state.lock().unwrap().is_finished())
-                );
+                assert!(stream.read.upgrade().is_none_or(|state| {
+                    state
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map_or(true, |s| matches!(s, super::H3Stream::Finished(_)))
+                }));
+                assert!(!stream.write.upgrade().is_none_or(|state| {
+                    state
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map_or(true, |s| matches!(s, super::H3Stream::Finished(_)))
+                }));
                 assert!(draining.as_mut().poll(&mut cx).is_pending());
                 drop(send);
             } else {
                 drop(send);
-                assert!(
-                    stream
-                        .write
-                        .upgrade()
-                        .is_none_or(|state| state.lock().unwrap().is_finished())
-                );
-                assert!(
-                    !stream
-                        .read
-                        .upgrade()
-                        .is_none_or(|state| state.lock().unwrap().is_finished())
-                );
+                assert!(stream.write.upgrade().is_none_or(|state| {
+                    state
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map_or(true, |s| matches!(s, super::H3Stream::Finished(_)))
+                }));
+                assert!(!stream.read.upgrade().is_none_or(|state| {
+                    state
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map_or(true, |s| matches!(s, super::H3Stream::Finished(_)))
+                }));
                 assert!(draining.as_mut().poll(&mut cx).is_pending());
                 drop(recv);
             }
@@ -433,9 +447,7 @@ mod tests {
                     }
                 }
             }
-            streams.close(
-                ErrorCode::H3_INTERNAL_ERROR.reason("test terminates an active stream"),
-            );
+            streams.close(ErrorCode::H3_INTERNAL_ERROR.reason("test terminates an active stream"));
             assert_eq!(old_io.count(), 0);
             assert_eq!(old_drain.count(), 0);
             assert!(latest_io.count() > 0);
@@ -447,6 +459,61 @@ mod tests {
                     .is_ready()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn shared_notification_wakes_all_drains_and_rechecks_every_stream() {
+        use std::future::Future;
+
+        let streams = BiStreams::new();
+        let (mut send0, mut recv0) = streams
+            .insert(
+                0,
+                TestStream::new(tokio::io::empty()),
+                TestStream::new(tokio::io::sink()),
+            )
+            .unwrap();
+        let (send4, recv4) = streams
+            .insert(
+                4,
+                TestStream::new(tokio::io::empty()),
+                TestStream::new(tokio::io::sink()),
+            )
+            .unwrap();
+        let mut first = Box::pin(streams.drained());
+        let mut second = Box::pin(streams.drained());
+        let first_wakes = Arc::new(Wakes::default());
+        let second_wakes = Arc::new(Wakes::default());
+        let first_waker = std::task::Waker::from(first_wakes.clone());
+        let second_waker = std::task::Waker::from(second_wakes.clone());
+        let mut first_cx = Context::from_waker(&first_waker);
+        let mut second_cx = Context::from_waker(&second_waker);
+        assert!(first.as_mut().poll(&mut first_cx).is_pending());
+        assert!(second.as_mut().poll(&mut second_cx).is_pending());
+
+        // Finishing one direction wakes both waiters, but does not complete either drain.
+        assert_eq!(recv0.read(&mut [0]).await.unwrap(), 0);
+        assert!(first_wakes.count() > 0);
+        assert!(second_wakes.count() > 0);
+        assert!(first.as_mut().poll(&mut first_cx).is_pending());
+        assert!(second.as_mut().poll(&mut second_cx).is_pending());
+        let before = (first_wakes.count(), second_wakes.count());
+
+        // GOAWAY removes another request from the registry while both drains hold snapshots.
+        assert_eq!(streams.goaway(4), [4]);
+        assert!(first_wakes.count() > before.0);
+        assert!(second_wakes.count() > before.1);
+        assert!(first.as_mut().poll(&mut first_cx).is_pending());
+        assert!(second.as_mut().poll(&mut second_cx).is_pending());
+        let before = (first_wakes.count(), second_wakes.count());
+
+        send0.shutdown().await.unwrap();
+        assert!(first_wakes.count() > before.0);
+        assert!(second_wakes.count() > before.1);
+        assert!(first.as_mut().poll(&mut first_cx).is_ready());
+        assert!(second.as_mut().poll(&mut second_cx).is_ready());
+        assert_eq!(streams.len(), 0);
+        drop((send4, recv4));
     }
 
     #[tokio::test]
@@ -551,10 +618,8 @@ mod tests {
         assert_eq!(ErrorCode::from(error), ErrorCode::H3_REQUEST_REJECTED);
         streams.cleanup();
         assert_eq!(streams.len(), 0);
-        assert_eq!(
-            ErrorCode::from(send.flush().await.unwrap_err()),
-            ErrorCode::H3_REQUEST_REJECTED
-        );
+        // The shutdown error is returned directly, not cached for later operations.
+        send.flush().await.unwrap();
         assert_eq!(recv.read(&mut [0]).await.unwrap(), 0);
     }
 }

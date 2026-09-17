@@ -1,6 +1,6 @@
 //! Initiating requests and receiving authenticated responses.
 //! These roles apply per request, independently of the QUIC connection role.
-use std::future::{Future, IntoFuture};
+use std::future::Future;
 
 use bytes::Bytes;
 use http::StatusCode;
@@ -31,12 +31,13 @@ pub type Response = crate::common::Response<Read>;
 /// The upload task continues independently if the response arrives early or this
 /// future is dropped. Upload failures cancel the write direction, but do not
 /// fail response reception. Callers control the response timeout.
+/// Metadata/body are snapshotted and validated before this function returns.
 pub fn write_bytes_request<RS, WS>(
     request: Request<Bytes>,
     ws: H3WriteStream<WS>,
     rs: H3ReadStream<RS>,
     qpack: ArcQpack,
-) -> Result<impl IntoFuture<Output = Result<Response>, IntoFuture: Send> + Send>
+) -> Result<impl Future<Output = Result<Response>> + Send>
 where
     RS: AsyncRead + StopSending + Unpin + Send + 'static,
     WS: AsyncWrite + CancelStream + Unpin + Send + 'static,
@@ -50,34 +51,24 @@ where
 /// Start a streaming request upload and return its response future.
 /// Retain a producer (request clone or body handle) until finish/reset. The upload
 /// task drains body data independently of response reception. Upload failures
-/// reach the producer, not the response future. CONNECT is driven
-/// by the returned future until acceptance, then starts the same body pumps.
-/// Dropping a pending CONNECT handshake cancels both stream directions.
-/// Reset the retained body explicitly when abandoning the handshake.
+/// reach the producer, not the response future. Use [`connect`] for CONNECT.
+/// Metadata is snapshotted and validated before returning.
 pub fn write_streaming_request<RS, WS>(
     request: Request<ArcWndBuf>,
     ws: H3WriteStream<WS>,
     rs: H3ReadStream<RS>,
     qpack: ArcQpack,
-) -> Result<std::pin::Pin<Box<dyn Future<Output = Result<Response>> + Send>>>
+) -> Result<impl Future<Output = Result<Response>> + Send>
 where
     RS: AsyncRead + StopSending + Unpin + Send + 'static,
     WS: AsyncWrite + CancelStream + Unpin + Send + 'static,
 {
     use crate::ReadRequest;
     let method = request.method();
-    if method == http::Method::CONNECT {
-        return Ok(Box::pin(async move {
-            // HTTP rejection is still a response for the ordinary request API.
-            match connect(request, ws, rs, qpack).await {
-                Ok(response) | Err(ConnectError::Rejected(response)) => Ok(response),
-                Err(ConnectError::H3(error)) => Err(error),
-            }
-        }));
-    }
-
+    // ws.write_request()
+    // rs.read_response()
     tokio::spawn(send_streaming_request(&request, ws, &qpack)?);
-    Ok(Box::pin(read_response(rs, qpack, Some(method))))
+    Ok(read_response(rs, qpack, Some(method)))
 }
 
 fn send_bytes_request<WS>(
@@ -95,7 +86,8 @@ where
             return Err(ErrorCode::H3_MESSAGE_ERROR.reason("use client::connect for CONNECT"));
         }
         let mut fields = Vec::new();
-        fields.put_request(&head)?;
+        //TODO: encode_head
+        fields.put_head(&head)?;
         if headers::content_length(&head.headers)?.is_some_and(|length| length != body.len() as u64)
         {
             return Err(ErrorCode::H3_MESSAGE_ERROR
@@ -123,7 +115,7 @@ where
     })
 }
 
-/// Send an ordinary streaming request; CONNECT is routed by the public entry point.
+/// Send an ordinary streaming request; CONNECT requires the dedicated handshake.
 fn send_streaming_request<WS>(
     req: &Request<ArcWndBuf>,
     mut ws: H3WriteStream<WS>,
@@ -136,11 +128,14 @@ where
     let mut body = req.message.body_stream();
     // Validate before sending so malformed requests fail synchronously and wake producers.
     let (headers, mode) = (|| {
+        if head.method == http::Method::CONNECT {
+            return Err(ErrorCode::H3_MESSAGE_ERROR.reason("use client::connect for CONNECT"));
+        }
         let mut fields = Vec::new();
-        fields.put_request(&head)?;
+        fields.put_head(&head)?;
         let mode = match headers::content_length(&head.headers)? {
             Some(content_length) => BodyMode::Length { content_length },
-            None => BodyMode::Infinity,
+            None => BodyMode::UnspecifiedLength,
         };
         let headers = Frame::new(Headers {
             field_section: qpack.encode(ws.stream_id(), fields)?,
@@ -197,7 +192,10 @@ async fn be_headers_frame<R: AsyncRead + Unpin + ?Sized>(rs: &mut R) -> Result<F
 }
 
 /// Read and validate final response HEADERS and resolve body framing once.
-async fn read_head<RS: AsyncRead + StopSending + Unpin>(
+/// ReadResponseHead trait
+/// ReadWriteHead
+/// rs.read_head(qpack, method);
+async fn read_final_response_head<RS: AsyncRead + StopSending + Unpin>(
     rs: &mut H3ReadStream<RS>,
     qpack: &ArcQpack,
     method: Option<&http::Method>,
@@ -236,6 +234,7 @@ async fn read_head<RS: AsyncRead + StopSending + Unpin>(
     result
 }
 
+// TODO: 放到 H3 error
 #[derive(thiserror::Error)]
 pub enum ConnectError {
     /// The peer rejected CONNECT; status, headers, and body remain available.
@@ -264,88 +263,101 @@ impl std::fmt::Debug for ConnectError {
 /// Extended CONNECT assumes peer support without checking peer SETTINGS.
 /// HTTP rejection returns [`ConnectError::Rejected`] with the complete response.
 /// Header send failures do not end response reception; callers control its timeout.
-pub async fn connect<RS, WS>(
+/// Metadata is snapshotted and validated on creation; validation errors wake the
+/// producer immediately and are returned by the future.
+/// TODO: write_connect_request
+///    内部函数传 response_type: Option<BodyMode>
+/// 和 streaming_request 合并
+///     内部函数判断 是否是 CONNECT
+pub fn connect<RS, WS>(
     request: Request<ArcWndBuf>,
     mut ws: H3WriteStream<WS>,
     rs: H3ReadStream<RS>,
     qpack: ArcQpack,
-) -> std::result::Result<Response, ConnectError>
+) -> impl Future<Output = std::result::Result<Response, ConnectError>> + Send
 where
     RS: AsyncRead + StopSending + Unpin + Send + 'static,
     WS: AsyncWrite + CancelStream + Unpin + Send + 'static,
 {
     let producer = request.message.body_stream();
-    let result = async move {
+    let fields = (|| {
         let head = request.message.head.lock().unwrap().clone();
         if head.method != http::Method::CONNECT
             || head.headers.contains_key(http::header::CONTENT_LENGTH)
         {
             return Err(ErrorCode::H3_MESSAGE_ERROR
-                .reason("CONNECT requires the CONNECT method without Content-Length")
-                .into());
+                .reason("CONNECT requires the CONNECT method without Content-Length"));
         }
         let mut fields = Vec::new();
-        fields.put_request(&head)?;
-        let mut bytes = Vec::new();
-        bytes.put_frame(&Frame::new(Headers {
-            field_section: qpack.encode(ws.stream_id(), fields)?,
-        })?);
-        let mut recv = rs;
-        let handshake = async {
-            let sending = async {
-                ws.write_all(&bytes).await?;
-                ws.flush().await
-            };
-            let receiving = read_head(&mut recv, &qpack, Some(&http::Method::CONNECT));
-            tokio::pin!(receiving);
-            tokio::select! {
-                head = &mut receiving => head,
-                // Sending and receiving fail independently.
-                _ = sending => receiving.await,
-            }
-        };
-        let cancellation = request.message.body_stream();
-        let (head, mode) = tokio::select! {
-            biased;
-            error = cancellation.wait_error() => return Err(error.into()),
-            head = handshake => head?,
-        };
-        if matches!(mode, BodyMode::Connect) {
-            let mut body = request.message.body_stream();
-            tokio::spawn(async move {
-                let cancellation = body.clone();
-                let result = tokio::select! {
-                    biased;
-                    error = cancellation.wait_error() => Err(error),
-                    result = async {
-                        body::write_streaming_body(&mut body, &mut ws, BodyMode::Connect).await?;
-                        ws.shutdown().await?;
-                        Ok::<_, Error>(())
-                    } => result,
+        fields.put_head(&head)?;
+        Ok::<_, Error>(fields)
+    })()
+    .inspect_err(|error| producer.on_error(error.clone()));
+    async move {
+        let fields = fields?;
+        let result = async {
+            let mut bytes = Vec::new();
+            bytes.put_frame(&Frame::new(Headers {
+                field_section: qpack.encode(ws.stream_id(), fields)?,
+            })?);
+            let mut recv = rs;
+            let handshake = async {
+                let sending = async {
+                    ws.write_all(&bytes).await?;
+                    ws.flush().await
                 };
-                if let Err(error) = result {
-                    (&ws).cancel(error.code.as_u64());
-                    body.on_error(error);
+                let receiving = read_final_response_head(&mut recv, &qpack, Some(&http::Method::CONNECT));
+                tokio::pin!(receiving);
+                tokio::select! {
+                    head = &mut receiving => head,
+                    // Sending and receiving fail independently.
+                    _ = sending => receiving.await,
                 }
-            });
+            };
+            let cancellation = request.message.body_stream();
+            let (head, mode) = tokio::select! {
+                biased;
+                error = cancellation.wait_error() => return Err(error),
+                head = handshake => head?,
+            };
+            if matches!(mode, BodyMode::Connect) {
+                let mut body = request.message.body_stream();
+                tokio::spawn(async move {
+                    let cancellation = body.clone();
+                    let result = tokio::select! {
+                        biased;
+                        error = cancellation.wait_error() => Err(error),
+                        result = async {
+                            body::write_streaming_body(&mut body, &mut ws, BodyMode::Connect).await?;
+                            ws.shutdown().await?;
+                            Ok::<_, Error>(())
+                        } => result,
+                    };
+                    if let Err(error) = result {
+                        (&ws).cancel(error.code.as_u64());
+                        body.on_error(error);
+                    }
+                });
+            }
+            let body = body::receive(recv, mode, qpack);
+            let response =
+                common::Response::Streaming(ArcMessage::from(Message::from_parts(head, body)).into());
+            if !matches!(mode, BodyMode::Connect) {
+                producer.on_error(ErrorCode::H3_REQUEST_CANCELLED.reason("CONNECT rejected"));
+            }
+            Ok(response)
         }
-        let body = body::receive(recv, mode, qpack);
-        let response =
-            common::Response::Streaming(ArcMessage::from(Message::from_parts(head, body)).into());
-        if matches!(mode, BodyMode::Connect) {
+        .await;
+        if let Err(error) = &result {
+            producer.on_error(error.clone());
+        }
+        let response = result?;
+        if crate::ReadResponse::status(&response).is_success() {
             Ok(response)
         } else {
             Err(ConnectError::Rejected(response))
         }
     }
-    .await;
-    if let Err(error) = &result {
-        producer.on_error(match error {
-            ConnectError::H3(error) => error.clone(),
-            ConnectError::Rejected(_) => ErrorCode::H3_REQUEST_CANCELLED.reason("CONNECT rejected"),
-        });
-    }
-    result
 }
 
 /// Reads ordinary responses; HEAD and CONNECT semantics require request-method input.
@@ -354,7 +366,7 @@ async fn read_response<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
     qpack: ArcQpack,
     method: Option<http::Method>,
 ) -> Result<Response> {
-    let (head, mode) = read_head(&mut rs, &qpack, method.as_ref()).await?;
+    let (head, mode) = read_final_response_head(&mut rs, &qpack, method.as_ref()).await?;
     let body = body::receive(rs, mode, qpack);
     Ok(common::Response::Streaming(
         ArcMessage::from(Message::from_parts(head, body)).into(),

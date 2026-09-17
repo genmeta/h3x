@@ -159,20 +159,17 @@ async fn accept_connect(
     qpack: h3x::ArcQpack,
     head: http::Request<()>,
 ) -> Result<Bodies> {
-    let method = head.method().clone();
-    let server::Request::Streaming(request) = server::read_request_body(head, rs, qpack.clone())?
-    else {
-        unreachable!()
-    };
     let mut outgoing = server::Response::default().streaming(16 * 1024);
     outgoing.set_status(response.status());
     for (name, value) in response.headers() {
         outgoing.append_header(name.clone(), value.clone());
     }
     let send = outgoing.body();
-    tokio::spawn(server::write_streaming_response(
-        outgoing, ws, qpack, &method,
-    ));
+    let request = server::read_request_body(head, rs, qpack.clone())?;
+    server::accept_connect(&request, outgoing, ws, qpack).await?;
+    let server::Request::Streaming(request) = request else {
+        unreachable!()
+    };
     Ok(Bodies {
         recv: request.into_body(),
         send,
@@ -186,11 +183,7 @@ async fn connect(
 ) -> std::result::Result<(http::Response<()>, Bodies), client::ConnectError> {
     let (ws, rs) = connection.open_bi().await?;
     let send = request.body();
-    let response =
-        client::write_streaming_request(request, ws, rs, connection.qpack().clone())?.await?;
-    if !response.status().is_success() {
-        return Err(client::ConnectError::Rejected(response));
-    }
+    let response = client::connect(request, ws, rs, connection.qpack().clone()).await?;
     let mut head = http::Response::new(());
     *head.status_mut() = response.status();
     *head.headers_mut() = response.headers();
@@ -217,25 +210,20 @@ async fn tunnels(
             a
         ),
         async {
-            let (ws, mut rs) = b.accept_bi().await.unwrap();
-            let request = server::read_request_head(&mut rs, b.qpack()).await.unwrap();
-            assert_eq!(
-                request
-                    .extensions()
-                    .get::<h3x::Protocol>()
-                    .unwrap()
-                    .as_str(),
-                "websocket"
-            );
-            assert_eq!(request.uri().scheme_str().unwrap(), "https");
-            assert_eq!(
-                request.uri().path_and_query().unwrap().as_str(),
-                "/api/websocket?q=1"
-            );
+            let (ws, rs) = b.accept_bi().await.unwrap();
+            let request = server::read_request(rs, b.qpack().clone()).await.unwrap();
+            assert_eq!(request.method(), http::Method::CONNECT);
+            assert_eq!(request.protocol().unwrap().as_str(), "websocket");
+            assert_eq!(request.scheme(), "https");
+            assert_eq!(request.path(), "/api/websocket?q=1");
             assert_eq!(request.headers()["sec-websocket-version"], "13");
-            accept_connect(http::Response::new(()), ws, rs, b.qpack().clone(), request)
-                .await
-                .unwrap()
+            let mut response = server::Response::default().streaming(16 * 1024);
+            response.set_status(http::StatusCode::OK);
+            let send = response.body();
+            server::accept_connect(&request, response, ws, b.qpack().clone()).await.unwrap();
+            let server::Request::Streaming(request) = request else { unreachable!() };
+            Bodies { recv: request.into_body(), send }
+
         }
     );
     let (response, tunnel) = client.unwrap();
@@ -539,59 +527,50 @@ mod external_ws;
 #[tokio::test]
 async fn streaming_connect_uses_body_handles_and_gates_queued_data() {
     tokio::time::timeout(Duration::from_secs(5), async {
-        for convenience in [false, true] {
-            let (a, b) = pair(3).await;
-            let request = client::Request::connect("example.com:443").unwrap();
-            let mut send = request.body();
-            // Queue data before the handshake. It must stay in the body window.
-            send.write_all(b"queued").await.unwrap();
-            let (ws, rs) = a.open_bi().await.unwrap();
-            let ((), ()) = tokio::join!(
-                async {
-                    let response = if convenience {
-                        client::connect(request, ws, rs, a.qpack().clone())
-                            .await
-                            .unwrap()
-                    } else {
-                        client::write_streaming_request(request, ws, rs, a.qpack().clone())
-                            .unwrap()
-                            .await
-                            .unwrap()
-                    };
-                    assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
-                    send.finish().await.unwrap();
-                    assert_eq!(
-                        response.into_body().collect().await.unwrap().as_ref(),
-                        b"reply"
-                    );
-                },
-                async {
-                    let (ws, rs) = b.accept_bi().await.unwrap();
-                    let request = server::read_request(rs, b.qpack().clone()).await.unwrap();
-                    let method = request.method();
-                    assert_eq!(method, http::Method::CONNECT);
-                    let mut recv = request.into_body();
-                    assert!(
-                        tokio::time::timeout(Duration::from_millis(20), recv.read(&mut [0]))
-                            .await
-                            .is_err()
-                    );
-                    let mut response = server::Response::default().streaming(3);
-                    // Any 2xx accepts CONNECT, including 204: DATA is still allowed.
-                    response.set_status(http::StatusCode::NO_CONTENT);
-                    let mut send = response.body();
-                    let (written, ()) = tokio::join!(
-                        server::write_streaming_response(response, ws, b.qpack().clone(), &method),
-                        async {
-                            assert_eq!(recv.collect().await.unwrap().as_ref(), b"queued");
-                            send.write_all(b"reply").await.unwrap();
-                            send.finish().await.unwrap();
-                        }
-                    );
-                    written.unwrap();
-                }
-            );
-        }
+        let (a, b) = pair(3).await;
+        let request = client::Request::connect("example.com:443").unwrap();
+        let mut send = request.body();
+        // Queue data before the handshake. It must stay in the body window.
+        send.write_all(b"queued").await.unwrap();
+        let (ws, rs) = a.open_bi().await.unwrap();
+        let ((), ()) = tokio::join!(
+            async {
+                let response = client::connect(request, ws, rs, a.qpack().clone())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
+                send.finish().await.unwrap();
+                assert_eq!(
+                    response.into_body().collect().await.unwrap().as_ref(),
+                    b"reply"
+                );
+            },
+            async {
+                let (ws, rs) = b.accept_bi().await.unwrap();
+                let request = server::read_request(rs, b.qpack().clone()).await.unwrap();
+                let method = request.method();
+                assert_eq!(method, http::Method::CONNECT);
+                let mut recv = request.into_body();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), recv.read(&mut [0]))
+                        .await
+                        .is_err()
+                );
+                let mut response = server::Response::default().streaming(3);
+                // Any 2xx accepts CONNECT, including 204: DATA is still allowed.
+                response.set_status(http::StatusCode::NO_CONTENT);
+                let mut send = response.body();
+                let (written, ()) = tokio::join!(
+                    server::write_streaming_response(response, ws, b.qpack().clone(), &method),
+                    async {
+                        assert_eq!(recv.collect().await.unwrap().as_ref(), b"queued");
+                        send.write_all(b"reply").await.unwrap();
+                        send.finish().await.unwrap();
+                    }
+                );
+                written.unwrap();
+            }
+        );
     })
     .await
     .unwrap();
@@ -607,10 +586,10 @@ async fn rejected_streaming_connect_wakes_a_full_producer() {
         let (ws, rs) = a.open_bi().await.unwrap();
         let (response, produced, ()) = tokio::join!(
             async {
-                client::write_streaming_request(request, ws, rs, a.qpack().clone())
-                    .unwrap()
-                    .await
-                    .unwrap()
+                match client::connect(request, ws, rs, a.qpack().clone()).await {
+                    Err(client::ConnectError::Rejected(response)) => response,
+                    _ => panic!("expected CONNECT rejection"),
+                }
             },
             send.write_all(b"blocked"),
             async {

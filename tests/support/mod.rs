@@ -20,7 +20,10 @@ pub struct TestTransport {
 }
 
 pub struct Reader;
-pub struct Writer;
+#[derive(Default)]
+pub struct Writer {
+    error: Option<h3x::Error>,
+}
 
 impl AsyncRead for Reader {
     fn poll_read(
@@ -40,17 +43,33 @@ impl AsyncWrite for Writer {
         _: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Poll::Ready(Ok(bytes.len()))
+        Poll::Ready(
+            self.error
+                .clone()
+                .map_or(Ok(bytes.len()), |error| Err(error.into())),
+        )
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+        Poll::Ready(self.error.clone().map_or(Ok(()), |error| Err(error.into())))
     }
     fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+        Poll::Ready(self.error.clone().map_or(Ok(()), |error| Err(error.into())))
     }
 }
 impl CancelStream for Writer {
-    fn cancel(&mut self, _: u64) {}
+    fn cancel(&mut self, code: u64) {
+        let code = [
+            ErrorCode::H3_INTERNAL_ERROR,
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM,
+            ErrorCode::H3_REQUEST_CANCELLED,
+            ErrorCode::H3_REQUEST_REJECTED,
+        ]
+        .into_iter()
+        .find(|value| value.as_u64() == code)
+        .unwrap();
+        self.error
+            .get_or_insert_with(|| code.reason("test transport writer cancelled"));
+    }
 }
 
 impl Transport for TestTransport {
@@ -69,7 +88,7 @@ impl Transport for TestTransport {
         if let Some(error) = self.error.lock().unwrap().clone() {
             return Err(error);
         }
-        Ok(Some((2, Writer)))
+        Ok(Some((2, Writer::default())))
     }
     async fn accept_uni(&self) -> Result<(u64, Reader)> {
         Err(self.terminated().await)

@@ -259,9 +259,10 @@ async fn connect_head_leaves_data_unconsumed_and_ignores_success_length() {
         bytes.put_frame(&Frame::new(Data(3)).unwrap());
         bytes.extend_from_slice(b"one");
         let mut recv = crate::test_support::read_stream(0, Cursor::new(bytes));
-        let (head, mode) = super::read_head(&mut recv, connection.qpack(), Some(&Method::CONNECT))
-            .await
-            .unwrap();
+        let (head, mode) =
+            super::read_final_response_head(&mut recv, connection.qpack(), Some(&Method::CONNECT))
+                .await
+                .unwrap();
         assert_eq!(head.status().unwrap(), status);
         let body = body::receive(recv, mode, connection.qpack().clone());
         let bytes = body.collect().await.unwrap();

@@ -19,9 +19,7 @@ async fn dropping_last_producer_does_not_finish_or_cancel_sending() {
     drop(producer);
     assert!(sending.as_mut().poll(&mut cx).is_pending());
     // Only an explicit buffer error terminates the send operation.
-    buffer.on_error(
-        ErrorCode::H3_REQUEST_CANCELLED.reason("test cancels the response producer"),
-    );
+    buffer.on_error(ErrorCode::H3_REQUEST_CANCELLED.reason("test cancels the response producer"));
     assert_eq!(
         (sending.await).map_err(ErrorCode::from),
         Err(ErrorCode::H3_REQUEST_CANCELLED)
@@ -165,7 +163,11 @@ async fn streaming_response_termination_reaches_the_producer() {
             let bi = Arc::new(crate::protocol::stream::bi::BiStreams::default());
             let qpack = crate::test_support::connection().await;
             let (send, recv) = bi
-                .insert(0, crate::test_support::Reader, crate::test_support::Writer)
+                .insert(
+                    0,
+                    crate::test_support::Reader,
+                    crate::test_support::Writer::default(),
+                )
                 .unwrap();
             drop(recv);
             let mut sending = Box::pin(super::respond(
@@ -355,9 +357,8 @@ async fn dropping_received_body_does_not_stop_network_reads() {
         buffer.read_exact(&mut bytes).await.unwrap();
         assert_eq!(bytes, *b"x");
         // Subsequent body I/O observes cancellation; dropping Body did not cancel it.
-        buffer.on_error(
-            ErrorCode::H3_REQUEST_CANCELLED.reason("test cancels the response producer"),
-        );
+        buffer
+            .on_error(ErrorCode::H3_REQUEST_CANCELLED.reason("test cancels the response producer"));
     })
     .await
     .unwrap();

@@ -33,16 +33,22 @@ where
     R: Into<common::Request<Write>>,
 {
     match request.into() {
-        common::Request::Bytes(request) => Box::pin(
-            write_bytes_request(request, send, recv, qpack)
-                .unwrap()
-                .into_future(),
-        )
-            as Pin<Box<dyn Future<Output = Result<Response>> + Send>>,
-        common::Request::Streaming(request) => Box::pin(
-            write_streaming_request(request, send, recv, qpack)
-                .unwrap()
-                .into_future(),
-        ),
+        common::Request::Bytes(request) => {
+            Box::pin(write_bytes_request(request, send, recv, qpack).unwrap())
+                as Pin<Box<dyn Future<Output = Result<Response>> + Send>>
+        }
+        common::Request::Streaming(request)
+            if crate::ReadRequest::method(&request) == Method::CONNECT =>
+        {
+            Box::pin(async move {
+                match connect(request, send, recv, qpack).await {
+                    Ok(response) | Err(ConnectError::Rejected(response)) => Ok(response),
+                    Err(ConnectError::H3(error)) => Err(error),
+                }
+            })
+        }
+        common::Request::Streaming(request) => {
+            Box::pin(write_streaming_request(request, send, recv, qpack).unwrap())
+        }
     }
 }

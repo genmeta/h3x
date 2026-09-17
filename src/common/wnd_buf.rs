@@ -24,7 +24,7 @@ pub(crate) struct WndBuf {
 
 impl WndBuf {
     /// Panics if `capacity` is zero.
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0, "window capacity must be nonzero");
         Self {
             buf: vec![0; capacity],
@@ -130,7 +130,7 @@ pub struct ArcWndBuf {
 impl ArcWndBuf {
     pub fn new(capacity: usize) -> Self {
         Self {
-            shared: Arc::new(Mutex::new(Ok(WndBuf::new(capacity)))),
+            shared: Arc::new(Mutex::new(Ok(WndBuf::with_capacity(capacity)))),
         }
     }
 
@@ -244,7 +244,7 @@ mod tests {
         let latest_waker = Waker::from(latest.clone());
         let mut old_cx = Context::from_waker(&old_waker);
         let mut cx = Context::from_waker(&latest_waker);
-        let mut window = WndBuf::new(3);
+        let mut window = WndBuf::with_capacity(3);
         let mut window = Pin::new(&mut window);
         let mut output = [0; 8];
 
@@ -307,7 +307,7 @@ mod tests {
             Poll::Ready(Ok(0))
         ));
 
-        let mut empty = WndBuf::new(1);
+        let mut empty = WndBuf::with_capacity(1);
         assert!(
             Pin::new(&mut empty)
                 .read_for_test(&mut cx, &mut output)
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn wraps_without_changing_storage() {
-        let mut window = WndBuf::new(3);
+        let mut window = WndBuf::with_capacity(3);
         let ptr = window.buf.as_ptr();
         let capacity = window.buf.capacity();
         let mut cx = Context::from_waker(Waker::noop());
@@ -427,6 +427,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "window capacity must be nonzero")]
     fn zero_capacity_is_rejected() {
-        WndBuf::new(0);
+        WndBuf::with_capacity(0);
     }
 }

@@ -154,7 +154,7 @@ async fn local_field_limit_does_not_close_connection_but_receive_failure_does() 
     assert!(matches!(
         client::write_bytes_request(
             oversized,
-            H3WriteStream::new(0, test_support::Writer),
+            H3WriteStream::new(0, test_support::Writer::default()),
             H3ReadStream::new(0, test_support::Reader),
             connection.qpack().clone()
         ),
@@ -174,7 +174,7 @@ async fn local_field_limit_does_not_close_connection_but_receive_failure_does() 
     assert!(
         client::write_bytes_request(
             request,
-            H3WriteStream::new(4, test_support::Writer),
+            H3WriteStream::new(4, test_support::Writer::default()),
             H3ReadStream::new(4, test_support::Reader),
             connection.qpack().clone()
         )
@@ -197,7 +197,7 @@ async fn protocol_failure_preserves_observed_transport_reason_and_closes_streams
     let connection = test_support::connection().await;
     let (mut send, _recv) = connection
         .bi_streams
-        .insert(0, test_support::Reader, test_support::Writer)
+        .insert(0, test_support::Reader, test_support::Writer::default())
         .unwrap();
     connection
         .transport
@@ -276,7 +276,7 @@ async fn goaway_waits_for_admitted_streams_after_peer_goaway() {
     let connection = test_support::connection().await;
     let (send, recv) = connection
         .bi_streams
-        .insert(0, test_support::Reader, test_support::Writer)
+        .insert(0, test_support::Reader, test_support::Writer::default())
         .unwrap();
     connection
         .cursor
@@ -306,8 +306,7 @@ async fn transport_termination_wakes_goaway_waiting_for_peer() {
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending()
     );
-    let error =
-        ErrorCode::H3_INTERNAL_ERROR.reason("transport terminated while awaiting peer");
+    let error = ErrorCode::H3_INTERNAL_ERROR.reason("transport terminated while awaiting peer");
     connection
         .transport
         .close(error.reason.clone(), error.code.as_u64())

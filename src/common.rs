@@ -100,6 +100,19 @@ impl<IO> From<body::Body<ArcWndBuf, IO>> for Body<IO> {
     }
 }
 
+impl tokio::io::AsyncRead for Body<Read> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        output: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Bytes(body) => std::pin::Pin::new(body).poll_read(cx, output),
+            Self::Streaming(body) => std::pin::Pin::new(body).poll_read(cx, output),
+        }
+    }
+}
+
 impl Body<Read> {
     pub async fn read(&mut self, bytes: &mut [u8]) -> crate::Result<usize> {
         match self {
@@ -423,5 +436,58 @@ mod tests {
                 ]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod body_io_tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn incoming_body_variants_work_with_tokio_copy_and_partial_reads() {
+        for streaming in [false, true] {
+            let mut producer = ArcWndBuf::new(2);
+            let mut body: Body<Read> = if streaming {
+                body::Body::new(producer.clone()).into()
+            } else {
+                body::Body::new(Bytes::from_static(b"hello")).into()
+            };
+            let receive = async {
+                // An empty read must not consume data or wait for the producer.
+                assert_eq!(AsyncReadExt::read(&mut body, &mut []).await.unwrap(), 0);
+                let mut first = [0; 1];
+                body.read_exact(&mut first).await.unwrap();
+                assert_eq!(&first, b"h");
+                let mut remaining = Vec::new();
+                assert_eq!(tokio::io::copy(&mut body, &mut remaining).await.unwrap(), 4);
+                assert_eq!(remaining, b"ello");
+                assert_eq!(AsyncReadExt::read(&mut body, &mut first).await.unwrap(), 0);
+            };
+            let produce = async {
+                if streaming {
+                    producer.write_all(b"hello").await.unwrap();
+                    producer.shutdown().await.unwrap();
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::join!(receive, produce);
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn incoming_body_async_read_preserves_stream_error() {
+        let window = ArcWndBuf::new(2);
+        let error = crate::ErrorCode::H3_MESSAGE_ERROR.reason("invalid trailers");
+        window.on_error(error.clone());
+        let mut body: Body<Read> = body::Body::new(window).into();
+        let actual = tokio::io::copy(&mut body, &mut tokio::io::sink())
+            .await
+            .unwrap_err();
+        assert_eq!(crate::Error::from(actual), error);
     }
 }

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, Method};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
 
 use super::{
     Read, Write,
@@ -11,7 +11,73 @@ use super::{
         WriteStream,
     },
 };
-use crate::{ArcWndBuf, Result};
+use crate::{ArcWndBuf, ErrorCode, Result};
+
+impl RequestHead {
+    pub(crate) fn new(url: &str, method: Method) -> Result<Self> {
+        if url.contains('#') {
+            return Err(ErrorCode::H3_MESSAGE_ERROR.reason("URI fragments are forbidden"));
+        }
+        let mut uri: Uri = url.parse().map_err(|error| {
+            ErrorCode::H3_MESSAGE_ERROR.reason(format!("invalid request URI: {error}"))
+        })?;
+        let websocket_scheme = if method == Method::CONNECT {
+            match uri.scheme_str() {
+                Some(scheme) if scheme.eq_ignore_ascii_case("ws") => Some(http::uri::Scheme::HTTP),
+                Some(scheme) if scheme.eq_ignore_ascii_case("wss") => {
+                    Some(http::uri::Scheme::HTTPS)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let websocket = websocket_scheme.is_some();
+        if let Some(scheme) = websocket_scheme {
+            let mut parts = uri.into_parts();
+            parts.scheme = Some(scheme);
+            uri = Uri::from_parts(parts).map_err(|error| {
+                ErrorCode::H3_MESSAGE_ERROR.reason(format!("invalid request URI: {error}"))
+            })?;
+        }
+        // CONNECT also accepts an authority-form target such as example.com:443.
+        let authority_form = method == Method::CONNECT
+            && uri.scheme().is_none()
+            && uri.authority().is_some()
+            && uri.path_and_query().is_none();
+        if !authority_form && (uri.scheme().is_none() || uri.authority().is_none()) {
+            return Err(
+                ErrorCode::H3_MESSAGE_ERROR.reason("request URI requires scheme and authority")
+            );
+        }
+        if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
+            return Err(ErrorCode::H3_MESSAGE_ERROR.reason("userinfo is forbidden"));
+        }
+        let mut extensions = http::Extensions::new();
+        let mut headers = HeaderMap::new();
+        if websocket {
+            extensions.insert(crate::Protocol::new("websocket")?);
+            headers.insert("sec-websocket-version", HeaderValue::from_static("13"));
+        }
+        let uri = if method == Method::CONNECT && !websocket {
+            Uri::builder()
+                .authority(uri.authority().unwrap().clone())
+                .build()
+                .map_err(|error| {
+                    ErrorCode::H3_MESSAGE_ERROR
+                        .reason(format!("invalid CONNECT authority: {error}"))
+                })?
+        } else {
+            uri
+        };
+        Ok(Self {
+            method,
+            uri,
+            headers,
+            extensions,
+        })
+    }
+}
 
 const DEFAULT_STREAM_CAPACITY: usize = 16 * 1024;
 
@@ -56,11 +122,10 @@ impl Request<Write, ArcWndBuf> {
     }
 
     fn streaming(url: &str, method: Method) -> Result<Self> {
-        let message = Message::new_request_with_body(
-            url,
-            method,
+        let message = Message::from_parts(
+            RequestHead::new(url, method)?,
             Body::<ArcWndBuf, Write>::with_capacity(DEFAULT_STREAM_CAPACITY),
-        )?;
+        );
         Ok(ArcMessage::from(message).into())
     }
 

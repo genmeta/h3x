@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn body_preserves_first_error_and_cancelled_stream_reports_cancellation() {
+    async fn body_preserves_first_error() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let error = ErrorCode::H3_REQUEST_CANCELLED.reason("application cancelled upload");
@@ -200,18 +200,10 @@ mod tests {
         body.on_error(ErrorCode::H3_INTERNAL_ERROR.reason("later failure"));
         assert_eq!(Error::from(body.read(&mut [0]).await.unwrap_err()), error);
         assert_eq!(Error::from(body.write(b"x").await.unwrap_err()), error);
-
-        let mut stream = crate::test_support::write_stream(0, tokio::io::sink());
-        use qrecovery::send::CancelStream;
-
-        (&stream).cancel(error.code.as_u64());
-        let error = ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled");
-        assert_eq!(Error::from(stream.write(b"x").await.unwrap_err()), error);
-        assert_eq!(Error::from(stream.flush().await.unwrap_err()), error);
     }
 
     #[tokio::test]
-    async fn stream_retains_original_io_reason_after_the_first_failure() {
+    async fn stream_returns_each_io_error_without_caching() {
         use std::{
             pin::Pin,
             task::{Context, Poll},
@@ -229,7 +221,7 @@ mod tests {
                 Poll::Ready(Err(self
                     .0
                     .take()
-                    .expect("failed stream must not be polled again")))
+                    .unwrap_or_else(|| io::Error::from_raw_os_error(5))))
             }
         }
 
@@ -243,12 +235,14 @@ mod tests {
             let expected = Error::from(cause);
             let mut stream =
                 crate::test_support::read_stream(0, FailingReader(Some(expected.clone().into())));
-            for _ in 0..2 {
-                assert_eq!(
-                    Error::from(stream.read(&mut [0]).await.unwrap_err()),
-                    expected
-                );
-            }
+            let error = stream.read(&mut [0]).await.unwrap_err();
+            assert!(error.get_ref().unwrap().is::<Error>());
+            assert_eq!(Error::from(error), expected);
+            // A subsequent read reaches the transport and preserves its OS error.
+            assert_eq!(
+                stream.read(&mut [0]).await.unwrap_err().raw_os_error(),
+                Some(5)
+            );
         }
     }
 

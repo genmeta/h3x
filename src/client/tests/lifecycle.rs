@@ -559,25 +559,81 @@ async fn streaming_response_keeps_message_error_after_transport_eof() {
 
 #[tokio::test]
 async fn dropping_unpolled_connect_leaves_body_reset_explicit() {
-    for convenience in [false, true] {
-        let request = Request::connect("example.com:443").unwrap();
-        let mut body = request.body();
-        let connection = crate::test_support::connection().await;
-        let ws = crate::test_support::write_stream(0, tokio::io::sink());
-        let rs = crate::test_support::read_stream(0, tokio::io::empty());
-        if convenience {
-            drop(super::connect(request, ws, rs, connection.qpack().clone()));
-        } else {
-            drop(
-                super::write_streaming_request(request, ws, rs, connection.qpack().clone())
-                    .unwrap(),
-            );
-        }
-        assert_eq!(body.write(b"buffered").await.unwrap(), 8);
-        body.clone().reset().await.unwrap();
-        assert_eq!(
-            body.write(b"late").await.unwrap_err().code,
-            ErrorCode::H3_REQUEST_CANCELLED
+    let request = Request::connect("example.com:443").unwrap();
+    let mut body = request.body();
+    let connection = crate::test_support::connection().await;
+    let ws = crate::test_support::write_stream(0, tokio::io::sink());
+    let rs = crate::test_support::read_stream(0, tokio::io::empty());
+    drop(super::connect(request, ws, rs, connection.qpack().clone()));
+    assert_eq!(body.write(b"buffered").await.unwrap(), 8);
+    body.clone().reset().await.unwrap();
+    assert_eq!(
+        body.write(b"late").await.unwrap_err().code,
+        ErrorCode::H3_REQUEST_CANCELLED
+    );
+}
+
+#[tokio::test]
+async fn connect_freezes_headers_before_polling_and_preserves_rejected_body() {
+    let connection = crate::test_support::connection().await;
+    let request = Request::connect("example.com:443")
+        .unwrap()
+        .header(header::ACCEPT, HeaderValue::from_static("text/plain"));
+    let retained = request.clone();
+    let mut producer = request.body();
+    let (send, mut peer_recv) = duplex(256);
+    let (mut peer_send, recv) = duplex(256);
+    let ws = crate::test_support::write_stream(0, send);
+    let rs = crate::test_support::read_stream(0, recv);
+    let future: Pin<Box<dyn Future<Output = Result<Response>> + Send>> = {
+        let future = super::connect(request, ws, rs, connection.qpack().clone());
+        Box::pin(async move {
+            match future.await {
+                Err(ConnectError::Rejected(response)) => Ok(response),
+                _ => panic!("CONNECT must report rejection"),
+            }
+        })
+    };
+    retained.header(header::ACCEPT, HeaderValue::from_static("text/html"));
+    let peer = async {
+        let H3Frame::Headers(frame) = be_frame(&mut peer_recv).await.unwrap() else {
+            panic!("expected request HEADERS");
+        };
+        let fields = connection
+            .qpack()
+            .decode(0, frame.payload.field_section)
+            .await
+            .unwrap();
+        let head = headers::be_request(fields).unwrap();
+        assert_eq!(head.headers[header::ACCEPT], "text/plain");
+        let mut fields = Vec::new();
+        fields
+            .put_response(&headers::ResponseHead {
+                status: Some(StatusCode::FORBIDDEN),
+                headers: Default::default(),
+            })
+            .unwrap();
+        let mut wire = Vec::new();
+        wire.put_frame(
+            &Frame::new(Headers {
+                field_section: connection.qpack().encode(0, fields).unwrap(),
+            })
+            .unwrap(),
         );
-    }
+        wire.extend_from_slice(&[0, 3, b'n', b'o', b'!']);
+        peer_send.write_all(&wire).await.unwrap();
+        peer_send.shutdown().await.unwrap();
+    };
+    let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::join!(future, peer)
+    })
+    .await
+    .unwrap();
+    let response = response.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.into_body().collect().await.unwrap(), "no!");
+    assert_eq!(
+        producer.write(b"late").await.unwrap_err().code,
+        ErrorCode::H3_REQUEST_CANCELLED
+    );
 }

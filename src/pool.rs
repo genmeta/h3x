@@ -112,7 +112,9 @@ struct PoolInner<K, T: Transport, E> {
 
 struct PoolState<K, T: Transport, E> {
     accepting: bool,
+
     connecting: HashMap<K, Arc<Connecting<T, E>>>,
+    // DashMap 重复 get 锁住 entry
     connections: HashMap<K, H3Connection<T>>,
     draining: HashMap<K, Vec<Draining<T>>>,
     active_builds: usize,
@@ -193,7 +195,7 @@ where
 
     /// Reuse or construct a connection. This does not retry or replay requests.
     pub async fn get(&self, key: &K) -> PoolResult<H3Connection<T>, E> {
-        let (record, creator) = {
+        let (record, new_connection) = {
             let mut state = self.inner.state.lock().unwrap();
             if !state.accepting {
                 return Err(PoolError::Closed);
@@ -215,7 +217,7 @@ where
                 (record, true)
             }
         };
-        if creator {
+        if new_connection {
             // Declare before the factory future so cancellation drops its resources
             // before decrementing active_builds (including panic during factory call).
             let _guard = BuildGuard {

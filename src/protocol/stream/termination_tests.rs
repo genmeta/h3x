@@ -292,3 +292,25 @@ async fn connect_content_length_queues_message_error_stop_without_fin() {
         }
     }
 }
+
+#[tokio::test]
+async fn cancelled_writer_returns_transport_reset_for_every_operation() {
+    let (transport, params, _frames) = transport();
+    let (id, (read, write)) = transport.open_bi(&params).await.unwrap().unwrap();
+    let _recv = H3ReadStream::new(id.into(), read);
+    let mut send = H3WriteStream::new(id.into(), write);
+    (&send).cancel(ErrorCode::H3_MESSAGE_ERROR.as_u64());
+    for error in [
+        send.write(b"x").await.unwrap_err(),
+        send.flush().await.unwrap_err(),
+        send.shutdown().await.unwrap_err(),
+    ] {
+        let Some(qrecovery::streams::error::StreamError::Reset(reset)) = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<qrecovery::streams::error::StreamError>())
+        else {
+            panic!("expected the original transport reset: {error}");
+        };
+        assert_eq!(reset.error_code(), ErrorCode::H3_MESSAGE_ERROR.as_u64());
+    }
+}

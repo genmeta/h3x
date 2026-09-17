@@ -525,3 +525,53 @@ async fn misplaced_settings_are_rejected_before_payload_and_close_transport() {
         }
     }
 }
+
+#[tokio::test]
+async fn streaming_request_validation_is_eager_for_http_and_connect() {
+    for kind in ["http", "connect", "convenience"] {
+        let connection = crate::test_support::connection().await;
+        let request = if kind == "http" {
+            Request::streaming_post("https://example.com/").unwrap()
+        } else {
+            Request::connect("example.com:443").unwrap()
+        }
+        .header(header::CONTENT_LENGTH, HeaderValue::from_static("invalid"));
+        let mut producer = request.body();
+        let ws = crate::test_support::write_stream(0, tokio::io::sink());
+        let rs = crate::test_support::read_stream(0, tokio::io::empty());
+        let error = if kind == "convenience" {
+            let future = super::super::connect(request, ws, rs, connection.qpack().clone());
+            assert_eq!(
+                producer.write(b"x").await.unwrap_err().code,
+                ErrorCode::H3_MESSAGE_ERROR
+            );
+            match future.await.err().unwrap() {
+                ConnectError::H3(error) => error,
+                _ => panic!("local validation must fail before handshake"),
+            }
+        } else {
+            super::super::write_streaming_request(request, ws, rs, connection.qpack().clone())
+                .err()
+                .unwrap()
+        };
+        assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
+        assert_eq!(producer.write(b"x").await.unwrap_err(), error);
+    }
+}
+
+#[tokio::test]
+async fn streaming_request_rejects_connect_without_starting_handshake() {
+    let connection = crate::test_support::connection().await;
+    let request = Request::connect("example.com:443").unwrap();
+    let mut producer = request.body();
+    let error = super::super::write_streaming_request(
+        request,
+        crate::test_support::write_stream(0, tokio::io::sink()),
+        crate::test_support::read_stream(0, tokio::io::empty()),
+        connection.qpack().clone(),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
+    assert_eq!(producer.write(b"x").await.unwrap_err(), error);
+}

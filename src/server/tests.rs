@@ -15,6 +15,7 @@ use crate::{
     },
 };
 
+mod connect;
 mod lifecycle;
 mod request;
 mod response;

@@ -5,114 +5,108 @@ pub(crate) mod write;
 use std::{
     io, mem,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll, Waker},
 };
 
 pub(crate) use read::H3ReadStream;
 pub(crate) use write::H3WriteStream;
 
-use crate::Error;
+use crate::ErrorCode;
+
+/// A GOAWAY boundary rejected this request; other errors come from transport I/O.
+#[derive(Debug)]
+pub(crate) struct Goaway;
 
 /// State of one transport half, independent of its application handle.
-enum StreamStatus<T> {
+pub(crate) enum H3Stream<T> {
     Idle(T),
     Polling(T, Waker),
-    Closed(Arc<io::Error>),
-    Finished,
+    Finished(T),
     Transition,
 }
 
-/// I/O state and completion waiter, protected by the owning direction's mutex.
-pub(crate) struct StreamState<T> {
-    status: StreamStatus<T>,
-    finished_waker: Option<Waker>,
-}
-
-impl<T> StreamState<T> {
+impl<T> H3Stream<T> {
     fn new(io: T) -> Self {
-        Self {
-            status: StreamStatus::Idle(io),
-            finished_waker: None,
-        }
-    }
-
-    fn is_finished(&self) -> bool {
-        matches!(
-            self.status,
-            StreamStatus::Closed(_) | StreamStatus::Finished
-        )
-    }
-
-    fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.is_finished() {
-            Poll::Ready(())
-        } else {
-            self.finished_waker = Some(cx.waker().clone());
-            Poll::Pending
-        }
-    }
-
-    // Return wakers so the caller can wake after releasing the state lock.
-    fn close(&mut self, error: Error, terminate: impl FnOnce(&mut T)) -> [Option<Waker>; 2] {
-        let io_waker = if self.is_finished() {
-            None
-        } else {
-            if let StreamStatus::Idle(io) | StreamStatus::Polling(io, _) = &mut self.status {
-                terminate(io);
-            }
-            match mem::replace(
-                &mut self.status,
-                StreamStatus::Closed(Arc::new(error.into())),
-            ) {
-                StreamStatus::Polling(_, waker) => Some(waker),
-                _ => None,
-            }
-        };
-        [io_waker, self.finished_waker.take()]
+        Self::Idle(io)
     }
 }
 
-impl<T: Unpin> StreamState<T> {
-    fn poll_io<O>(
-        &mut self,
-        cx: &mut Context<'_>,
-        poll: impl FnOnce(Pin<&mut T>, &mut Context<'_>) -> Poll<io::Result<O>>,
-    ) -> Poll<io::Result<O>> {
-        match mem::replace(&mut self.status, StreamStatus::Transition) {
-            StreamStatus::Idle(mut io) | StreamStatus::Polling(mut io, _) => {
-                match poll(Pin::new(&mut io), cx) {
-                    Poll::Pending => {
-                        self.status = StreamStatus::Polling(io, cx.waker().clone());
-                        Poll::Pending
-                    }
-                    Poll::Ready(Err(error))
-                        if !matches!(
-                            error.kind(),
-                            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                        ) =>
-                    {
-                        let error = Arc::new(error);
-                        self.status = StreamStatus::Closed(error.clone());
-                        Poll::Ready(Err(io::Error::new(error.kind(), error)))
-                    }
-                    result => {
-                        self.status = StreamStatus::Idle(io);
-                        result
-                    }
-                }
-            }
-            StreamStatus::Closed(error) => {
-                self.status = StreamStatus::Closed(error.clone());
-                Poll::Ready(Err(io::Error::new(error.kind(), error)))
-            }
-            StreamStatus::Finished => {
-                self.status = StreamStatus::Finished;
-                Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
-            }
-            StreamStatus::Transition => unreachable!(),
+pub(crate) fn is_finished<T>(s: &Result<H3Stream<T>, Goaway>) -> bool {
+    matches!(s, Err(Goaway) | Ok(H3Stream::Finished(_)))
+}
+pub(crate) fn terminate<T>(
+    s: &mut Result<H3Stream<T>, Goaway>,
+    f: impl FnOnce(&mut T),
+) -> Option<Waker> {
+    let Ok(stream) = s else { return None };
+    match mem::replace(stream, H3Stream::Transition) {
+        H3Stream::Idle(mut io) => {
+            f(&mut io);
+            *stream = H3Stream::Finished(io);
+            None
         }
+        H3Stream::Polling(mut io, w) => {
+            f(&mut io);
+            *stream = H3Stream::Finished(io);
+            Some(w)
+        }
+        x @ H3Stream::Finished(_) => {
+            *stream = x;
+            None
+        }
+        H3Stream::Transition => unreachable!(),
     }
+}
+pub(crate) fn goaway<T>(
+    s: &mut Result<H3Stream<T>, Goaway>,
+    f: impl FnOnce(&mut T),
+) -> Option<Waker> {
+    if is_finished(s) {
+        None
+    } else {
+        let w = terminate(s, f);
+        *s = Err(Goaway);
+        w
+    }
+}
+pub(crate) fn finish<T>(s: &mut Result<H3Stream<T>, Goaway>) {
+    if let Ok(stream) = s {
+        *stream = match mem::replace(stream, H3Stream::Transition) {
+            H3Stream::Idle(io) | H3Stream::Polling(io, _) | H3Stream::Finished(io) => {
+                H3Stream::Finished(io)
+            }
+            H3Stream::Transition => unreachable!(),
+        };
+    }
+}
+pub(crate) fn poll_io<T: Unpin, O>(
+    s: &mut Result<H3Stream<T>, Goaway>,
+    cx: &mut Context<'_>,
+    f: impl FnOnce(Pin<&mut T>, &mut Context<'_>) -> Poll<io::Result<O>>,
+) -> Poll<io::Result<O>> {
+    let stream = match s {
+        Ok(x) => x,
+        Err(Goaway) => {
+            return Poll::Ready(Err(ErrorCode::H3_REQUEST_REJECTED
+                .reason("request rejected by GOAWAY")
+                .into()));
+        }
+    };
+    let (mut io, finished) = match mem::replace(stream, H3Stream::Transition) {
+        H3Stream::Idle(io) | H3Stream::Polling(io, _) => (io, false),
+        H3Stream::Finished(io) => (io, true),
+        H3Stream::Transition => unreachable!(),
+    };
+    let r = f(Pin::new(&mut io), cx);
+    let failed = matches!(&r,Poll::Ready(Err(e)) if !matches!(e.kind(),io::ErrorKind::Interrupted|io::ErrorKind::WouldBlock));
+    *stream = if finished || failed {
+        H3Stream::Finished(io)
+    } else if r.is_pending() {
+        H3Stream::Polling(io, cx.waker().clone())
+    } else {
+        H3Stream::Idle(io)
+    };
+    r
 }
 
 #[cfg(test)]

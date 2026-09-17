@@ -396,7 +396,7 @@ ASYNC control_receive(recv):
     // 若 transport 提前终止，原读取 / 写入 / 流终态使这些等待退出。
 ```
 
-`running` 是这次排空 future 持有的请求流列表，取自现有 BiStreams 登记表；它不成为新的连接字段。停止接纳后出现的新流不会扩大本次排空范围。等待使用已有请求流终态及 BiStreams 等待机制，不新增 drain Notify 或收尾任务。
+`running` 是这次排空 future 持有的请求流列表，取自现有 BiStreams 登记表；它不成为新的连接字段。停止接纳后出现的新流不会扩大本次排空范围。等待检查已有请求流终态，由 `BiStreams` 统一持有一个排空 `Notify`，不新增收尾任务。
 
 ### goaway(self)：发起并等待交换
 
@@ -477,11 +477,15 @@ GOAWAY 只改变 cursor，不启动拒绝任务、不唤醒底层 accept。已�
 应用句柄 Drop 时直接取消本方向，因此不需要 `cancel_on_drop` 区分句柄用途。
 
 排空 future 直接检查两个方向的终态；弱引用已经失效也表示该方向结束。
-`StreamState` 只记录单向 I/O 状态，`Polling` 中的唤醒器属于应用 I/O 任务。
-读写句柄各自保存独立的 `finished_waker: Arc<Mutex<Option<Waker>>>`，连接仅保存弱引用。
-`BiStream::finished()` 持有状态锁检查终态并登记完成等待者，避免检查与登记之间丢失唤醒。
-完成、取消、GOAWAY 或连接关闭后取出完成等待者，在锁外唤醒；不引入 `Draining` 状态。
-两类等待者不能共用一个槽位，否则排空轮询会覆盖应用 I/O 的唤醒器。
+共享状态为 `Result<H3Stream<T>, Goaway>`，只有 GOAWAY 拒绝保存在 `Err` 中。
+`H3Stream` 保留 `Idle`、`Polling`、`Finished` 和临时 `Transition` 枚举；
+`Polling` 中的唤醒器属于应用 I/O 任务。`Finished(T)` 保留底层流，
+普通错误直接通过读写返回，不缓存首次错误，后续操作仍取得底层 I/O 的结果。
+`BiStreams` 统一持有一个 `Arc<Notify>`；读写句柄不持有通知引用，方向完成时的通知方式待定。
+`BiStreams::drained()` 先登记通知，再检查固定请求流集合中所有方向的终态；
+未全部结束时等待通知，醒来后重新检查，避免检查与等待之间丢失唤醒。
+目前 GOAWAY 或连接关闭后在状态锁外通知排空等待者；普通读写完成、取消和 Drop 的通知尚未接入，不引入 `Draining` 状态。
+应用 I/O 继续使用 `Polling` 内的 waker，不被排空等待覆盖。
 
 删除可选 STOP 通知输入及其构造接口。peer STOP/reset 通过底层
 write / flush / shutdown 的错误返回给发送操作。等待应用提供 body 数据期间

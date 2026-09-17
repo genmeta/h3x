@@ -92,14 +92,29 @@ impl Body<Bytes, Read> {
     }
 }
 
+impl AsyncRead for Body<Bytes, Read> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        output: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let storage = &mut self.get_mut().storage;
+        let count = output.remaining().min(storage.len());
+        output.put_slice(&storage.split_to(count));
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 impl Body<ArcWndBuf, Read> {
     pub async fn read(&mut self, bytes: &mut [u8]) -> Result<usize> {
         Ok(self.storage.read(bytes).await?)
     }
+
     pub async fn stop(self) {
         self.storage
             .on_error(ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled"));
     }
+
     pub async fn collect(mut self) -> Result<Bytes> {
         let mut bytes = Vec::new();
         self.storage.read_to_end(&mut bytes).await?;
@@ -175,7 +190,7 @@ where
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BodyMode {
     Forbidden,
-    Infinity,
+    UnspecifiedLength,
     /// CONNECT DATA has no Content-Length or trailing HEADERS.
     Connect,
     Length {
@@ -223,13 +238,13 @@ impl BodyMode {
         }
         match content_length {
             Some(content_length) => Self::Length { content_length },
-            None => Self::Infinity,
+            None => Self::UnspecifiedLength,
         }
     }
 
     pub(crate) fn content_length(self) -> Option<u64> {
         match self {
-            Self::Forbidden | Self::Infinity | Self::Connect => None,
+            Self::Forbidden | Self::UnspecifiedLength | Self::Connect => None,
             Self::Length { content_length } => Some(content_length),
         }
     }
@@ -326,9 +341,9 @@ pub(crate) async fn write_bytes_body<W: AsyncWrite + Unpin>(
     if body.is_empty() {
         return Ok(());
     }
-    let mut head_buf = Vec::new();
-    head_buf.put_frame(&Frame::new(Data(body.len()))?);
-    send.write_all(&head_buf).await?;
+    let mut buf = Vec::new();
+    buf.put_frame(&Frame::new(Data(body.len()))?);
+    send.write_all(&buf).await?;
     for chunk in body.chunks(frame::MAX_DATA_CHUNK) {
         send.write_all(chunk).await?;
     }
@@ -487,7 +502,7 @@ mod tests {
                     &mut body,
                     match length {
                         Some(content_length) => BodyMode::Length { content_length },
-                        None => BodyMode::Infinity,
+                        None => BodyMode::UnspecifiedLength,
                     },
                     crate::test_support::connection().await.qpack()
                 )
@@ -503,7 +518,7 @@ mod tests {
             (read_body(
                 &mut crate::test_support::read_stream(0, &mut input),
                 &mut body,
-                BodyMode::Infinity,
+                BodyMode::UnspecifiedLength,
                 crate::test_support::connection().await.qpack()
             )
             .await)

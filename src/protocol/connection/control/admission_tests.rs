@@ -31,7 +31,7 @@ impl Transport for GatedTransport {
             error = self.base.terminated() => return Err(error),
             permit = self.ready.acquire() => permit.unwrap().forget(),
         }
-        Ok(Some((0, (Reader, Writer))))
+        Ok(Some((0, (Reader, Writer::default()))))
     }
     async fn accept_bi(&self) -> Result<(u64, (Reader, Writer))> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -40,7 +40,7 @@ impl Transport for GatedTransport {
             error = self.base.terminated() => return Err(error),
             permit = self.ready.acquire() => permit.unwrap().forget(),
         }
-        Ok((1, (Reader, Writer)))
+        Ok((1, (Reader, Writer::default())))
     }
     async fn open_uni(&self) -> Result<Option<(u64, Writer)>> {
         self.base.open_uni().await

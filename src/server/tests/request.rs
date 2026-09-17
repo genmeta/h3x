@@ -55,7 +55,7 @@ async fn preserves_request_headers_through_message_roundtrip() {
         let fields = {
             let head = request.message.head.lock().unwrap();
             let mut fields = Vec::new();
-            fields.put_request(&head).unwrap();
+            fields.put_head(&head).unwrap();
             fields
         };
         let frame = Frame::new(Headers {
@@ -349,7 +349,7 @@ async fn head_only_reader_leaves_connect_data_unconsumed() {
     let request = crate::client::Request::connect("ws://example.com/chat").unwrap();
     let mut fields = Vec::new();
     fields
-        .put_request(&request.message.head.lock().unwrap())
+        .put_head(&request.message.head.lock().unwrap())
         .unwrap();
     let mut bytes = Vec::new();
     bytes.put_frame(

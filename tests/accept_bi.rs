@@ -32,7 +32,7 @@ impl Transport for DirectTransport {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let next = self.streams.lock().unwrap().pop_front();
         match next {
-            Some(id) => Ok((id?, (Reader, Writer))),
+            Some(id) => Ok((id?, (Reader, Writer::default()))),
             None => self.base.accept_bi().await,
         }
     }

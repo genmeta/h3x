@@ -222,3 +222,95 @@ async fn writes_buffered_and_streaming_response_frames() {
         ErrorCode::H3_INTERNAL_ERROR
     );
 }
+
+#[tokio::test]
+async fn response_writers_freeze_metadata_and_buffered_body_on_creation() {
+    for streaming in [false, true] {
+        let connection = crate::test_support::connection().await;
+        let mut response = Response::<Bytes>::default();
+        response.set_status(StatusCode::OK);
+        response.set_header(header::CONTENT_LENGTH, HeaderValue::from_static("3"));
+        let mut wire = Vec::new();
+        if streaming {
+            let response = response.streaming(16);
+            let mut retained = Response::from(response.message.clone());
+            let sending = super::write_streaming_response(
+                response,
+                crate::test_support::write_stream(0, &mut wire),
+                connection.qpack().clone(),
+                &Method::GET,
+            );
+            retained.set_status(StatusCode::NO_CONTENT);
+            retained.set_header(header::CONTENT_LENGTH, HeaderValue::from_static("invalid"));
+            retained.write(b"old").await.unwrap();
+            retained.finish().await.unwrap();
+            sending.await.unwrap();
+        } else {
+            response.set_body(Bytes::from_static(b"old"));
+            let mut retained = Response::from(response.message.clone());
+            let sending = super::write_bytes_response(
+                response,
+                crate::test_support::write_stream(0, &mut wire),
+                connection.qpack().clone(),
+                &Method::GET,
+            );
+            retained.set_status(StatusCode::NO_CONTENT);
+            retained.set_header(header::CONTENT_LENGTH, HeaderValue::from_static("invalid"));
+            retained.set_body(Bytes::from_static(b"new body"));
+            sending.await.unwrap();
+        }
+        let mut input = wire.as_slice();
+        let H3Frame::Headers(frame) = be_frame(&mut input).await.unwrap() else {
+            panic!("expected HEADERS");
+        };
+        let head = headers::be_response(
+            connection
+                .qpack()
+                .decode(0, frame.payload.field_section)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(head.status().unwrap(), StatusCode::OK);
+        assert_eq!(head.headers[header::CONTENT_LENGTH], "3");
+        assert!(matches!(
+            be_frame(&mut input).await.unwrap(),
+            H3Frame::Data(_)
+        ));
+        assert_eq!(input, b"old");
+    }
+}
+
+#[tokio::test]
+async fn response_validation_cannot_be_changed_after_operation_creation() {
+    for streaming in [false, true] {
+        let connection = crate::test_support::connection().await;
+        let response = Response::<Bytes>::default(); // Missing final status.
+        let ws = crate::test_support::write_stream(0, tokio::io::sink());
+        let error = if streaming {
+            let response = response.streaming(1);
+            let mut retained = Response::from(response.message.clone());
+            let mut producer = response.body();
+            let sending = super::write_streaming_response(
+                response,
+                ws,
+                connection.qpack().clone(),
+                &Method::GET,
+            );
+            retained.set_status(StatusCode::OK);
+            // The send future has not been polled.
+            assert_eq!(
+                producer.write(b"x").await.unwrap_err().code,
+                ErrorCode::H3_MESSAGE_ERROR
+            );
+            sending.await.unwrap_err()
+        } else {
+            let mut retained = Response::from(response.message.clone());
+            let sending =
+                super::write_bytes_response(response, ws, connection.qpack().clone(), &Method::GET);
+            retained.set_status(StatusCode::OK);
+            sending.await.unwrap_err()
+        };
+        assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
+    }
+}

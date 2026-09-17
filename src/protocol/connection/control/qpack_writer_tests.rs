@@ -15,13 +15,16 @@ use crate::{
     test_support::{Reader, TestTransport},
 };
 
-struct FailingWriter(u8);
+struct FailingWriter(u8, Option<crate::Error>);
 impl AsyncWrite for FailingWriter {
     fn poll_write(
         self: Pin<&mut Self>,
         _: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Some(error) = &self.1 {
+            return Poll::Ready(Err(error.clone().into()));
+        }
         if self.0 == 254 {
             return Poll::Pending;
         }
@@ -39,7 +42,11 @@ impl AsyncWrite for FailingWriter {
     }
 }
 impl CancelStream for FailingWriter {
-    fn cancel(&mut self, _: u64) {}
+    fn cancel(&mut self, code: u64) {
+        assert_eq!(code, ErrorCode::H3_CLOSED_CRITICAL_STREAM.as_u64());
+        self.1 =
+            Some(ErrorCode::H3_CLOSED_CRITICAL_STREAM.reason("test transport cancelled writer"));
+    }
 }
 
 struct FailingTransport {
@@ -62,7 +69,7 @@ impl Transport for FailingTransport {
         if self.stream_type == 253 {
             return std::future::pending().await;
         }
-        Ok(Some((2, FailingWriter(self.stream_type))))
+        Ok(Some((2, FailingWriter(self.stream_type, None))))
     }
     async fn accept_uni(&self) -> Result<(u64, Reader)> {
         Err(self.terminated().await)
@@ -102,7 +109,7 @@ async fn assert_writer_failure(stream_type: StreamType) {
     .unwrap();
     let (mut send, _recv) = connection
         .bi_streams
-        .insert(0, Reader, FailingWriter(255))
+        .insert(0, Reader, FailingWriter(255, None))
         .unwrap();
     let error = tokio::time::timeout(Duration::from_secs(1), connection.transport.terminated())
         .await
