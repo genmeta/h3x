@@ -149,10 +149,11 @@ messages expose `into_body()`, with `read`, `collect`, and `stop` operations. In
 body variants have direction `R`; incoming body handles cannot write or finish.
 Existing message-level body access and streaming constructors remain available.
 
-Messages own `Body<B, IO>` through `ArcMessage<Body<B, IO>>`. A body handle owns only
-its storage, so extracting it releases the message headers when no other message
-owner remains. Sharing a body between messages does not share or overwrite their
-headers. Body stores `B` directly: Bytes clones are independent snapshots, while
+`Message<H, Body<B, IO>>` stores its head and body in separate `Arc<Mutex<_>>`
+fields. A body handle owns only its storage, so extracting it releases the message
+headers when no other message owner remains. Sharing a body between messages does
+not share or overwrite their headers. Body stores `B` directly: Bytes clones are
+independent snapshots, while
 WndBuf clones share the buffer using its own synchronization. There is no outer
 lock or application-owner counter. `WndBuf` storage lives in `common::wnd_buf`.
 

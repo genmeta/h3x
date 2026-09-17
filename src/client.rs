@@ -13,7 +13,7 @@ use crate::{
         self, Read, Write,
         body::{self, BodyMode},
         headers::{self, Write as _},
-        message::{ArcMessage, Message},
+        message::Message,
     },
     protocol::{
         frame::{self, Frame, FrameType, H3Frame, Headers, Write as _},
@@ -341,7 +341,7 @@ where
             }
             let body = body::receive(recv, mode, qpack);
             let response =
-                common::Response::Streaming(ArcMessage::from(Message::from_parts(head, body)).into());
+                common::Response::Streaming(Message::from_parts(head, body).into());
             if !matches!(mode, BodyMode::Connect) {
                 producer.on_error(ErrorCode::H3_REQUEST_CANCELLED.reason("CONNECT rejected"));
             }
@@ -369,7 +369,7 @@ async fn read_response<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
     let (head, mode) = read_final_response_head(&mut rs, &qpack, method.as_ref()).await?;
     let body = body::receive(rs, mode, qpack);
     Ok(common::Response::Streaming(
-        ArcMessage::from(Message::from_parts(head, body)).into(),
+        Message::from_parts(head, body).into(),
     ))
 }
 

@@ -6,10 +6,7 @@ use super::{
     Read, Write,
     body::Body,
     headers::RequestHead,
-    message::{
-        ArcMessage, Message, ReadBody, ReadRequest, ReadStream, WriteBody, WriteRequest,
-        WriteStream,
-    },
+    message::{Message, ReadBody, ReadRequest, ReadStream, WriteBody, WriteRequest, WriteStream},
 };
 use crate::{ArcWndBuf, ErrorCode, Result};
 
@@ -82,7 +79,7 @@ impl RequestHead {
 const DEFAULT_STREAM_CAPACITY: usize = 16 * 1024;
 
 pub struct Request<IO, B = Bytes> {
-    pub(crate) message: ArcMessage<RequestHead, Body<B, IO>>,
+    pub(crate) message: Message<RequestHead, Body<B, IO>>,
 }
 
 /// Cloning shares metadata and body storage.
@@ -94,8 +91,8 @@ impl<B> Clone for Request<Write, B> {
     }
 }
 
-impl<IO, B> From<ArcMessage<RequestHead, Body<B, IO>>> for Request<IO, B> {
-    fn from(message: ArcMessage<RequestHead, Body<B, IO>>) -> Self {
+impl<IO, B> From<Message<RequestHead, Body<B, IO>>> for Request<IO, B> {
+    fn from(message: Message<RequestHead, Body<B, IO>>) -> Self {
         Self { message }
     }
 }
@@ -126,7 +123,7 @@ impl Request<Write, ArcWndBuf> {
             RequestHead::new(url, method)?,
             Body::<ArcWndBuf, Write>::with_capacity(DEFAULT_STREAM_CAPACITY),
         );
-        Ok(ArcMessage::from(message).into())
+        Ok(message.into())
     }
 
     /// Body writes may precede sending; a full buffer waits for the send task to drain it.
@@ -208,7 +205,7 @@ impl<IO, B> ReadRequest for Request<IO, B> {
 
 impl<B: Default> WriteRequest for Request<Write, B> {
     fn new(url: &str, method: Method) -> Result<Self> {
-        Ok(ArcMessage::from(Message::<RequestHead, Body<B, Write>>::new(url, method)?).into())
+        Ok(Message::<RequestHead, Body<B, Write>>::new(url, method)?.into())
     }
 
     fn header(self, key: HeaderName, value: HeaderValue) -> Self {
@@ -382,10 +379,8 @@ mod tests {
         );
         assert!(Request::<Write>::get("/relative").is_err());
 
-        let message = ArcMessage::from(Message::<
-            crate::common::headers::ResponseHead,
-            Body<Bytes, Write>,
-        >::default());
+        let message =
+            Message::<crate::common::headers::ResponseHead, Body<Bytes, Write>>::default();
         let mut response = Response::<Write>::from(message.clone());
         response
             .set_status(StatusCode::CREATED)
@@ -445,10 +440,8 @@ mod tests {
             ErrorCode::H3_REQUEST_CANCELLED
         );
 
-        let message = ArcMessage::from(
-            Message::<crate::common::headers::ResponseHead, Bytes>::default()
-                .with_body(crate::Body::new(ArcWndBuf::new(1))),
-        );
+        let message = Message::<crate::common::headers::ResponseHead, Bytes>::default()
+            .with_body(crate::Body::new(ArcWndBuf::new(1)));
         let mut writer = Response::<Write, _>::from(message.clone());
         let reader = Response::<Read, _>::from(message.test_direction());
         reader.stop().await;

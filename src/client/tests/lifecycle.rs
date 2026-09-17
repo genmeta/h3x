@@ -11,7 +11,7 @@ use crate::{ReadResponse, WriteRequest, WriteResponse, WriteStream, protocol::qp
 
 fn response_fields(message: &Message<headers::ResponseHead, Bytes>) -> Vec<Field> {
     let mut fields = Vec::new();
-    fields.put_response(&message.head).unwrap();
+    fields.put_response(&message.head.lock().unwrap()).unwrap();
     fields
 }
 
@@ -38,7 +38,7 @@ async fn reset_wakes_a_blocked_producer_after_upload_is_dropped() {
     let message = Message::<headers::RequestHead, Bytes>::post("https://example.com/upload")
         .unwrap()
         .with_body(crate::Body::new(ArcWndBuf::new(1)));
-    let mut producer = Request::from(ArcMessage::from(message));
+    let mut producer = Request::from(message);
     producer.write(b"x").await.unwrap();
     let sending = send_streaming_request(
         &producer,
@@ -71,7 +71,7 @@ async fn reset_wakes_a_blocked_producer_after_request_is_dropped() {
     let message = Message::<headers::RequestHead, Bytes>::post("https://example.com/upload")
         .unwrap()
         .with_body(crate::Body::new(ArcWndBuf::new(1)));
-    let mut producer = Request::from(ArcMessage::from(message));
+    let mut producer = Request::from(message);
     producer.write(b"x").await.unwrap();
     let waiting = request(
         producer.clone(),

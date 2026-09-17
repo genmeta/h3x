@@ -157,7 +157,7 @@ async fn writes_buffered_and_streaming_response_frames() {
 
     let message = Message::<headers::ResponseHead, Bytes>::default()
         .with_body(crate::Body::new(ArcWndBuf::new(2)));
-    let mut response = Response::from(ArcMessage::from(message));
+    let mut response = Response::from(message);
     response.set_status(StatusCode::OK);
     let mut producer = Response::from(response.message.clone());
     let mut encoded = Vec::new();
@@ -204,7 +204,7 @@ async fn writes_buffered_and_streaming_response_frames() {
 
     let message = Message::<headers::ResponseHead, Bytes>::default()
         .with_body(crate::Body::new(ArcWndBuf::new(1)));
-    let mut response = Response::from(ArcMessage::from(message));
+    let mut response = Response::from(message);
     response.set_status(StatusCode::OK);
     let mut producer = Response::from(response.message.clone());
     let (writer, reader) = duplex(1);

@@ -79,7 +79,7 @@ async fn buffered_body_snapshots_and_shared_streams() {
     let message = Message::<headers::RequestHead, Bytes>::post("https://example.com/echo?q=1")
         .unwrap()
         .with_body(crate::Body::new(Bytes::from_static(b"request")));
-    let request = common::request::Request::<Read, _>::from(ArcMessage::from(message));
+    let request = common::request::Request::<Read, _>::from(message);
     let mut incoming = common::request::Request::<Write, _>::from(request.message.test_direction());
     incoming.set_body(Bytes::from_static(b"changed"));
     assert_eq!(request.method(), Method::POST);
@@ -99,11 +99,11 @@ async fn buffered_body_snapshots_and_shared_streams() {
     let message = Message::<headers::RequestHead, Bytes>::get("https://example.com/")
         .unwrap()
         .with_body(crate::Body::new(ArcWndBuf::new(2)));
-    let mut request = common::request::Request::<Read, _>::from(ArcMessage::from(message));
+    let mut request = common::request::Request::<Read, _>::from(message);
     let mut incoming = common::request::Request::<Write, _>::from(request.message.test_direction());
     let message = Message::<headers::ResponseHead, Bytes>::default()
         .with_body(crate::Body::new(ArcWndBuf::new(2)));
-    let mut response = Response::from(ArcMessage::from(message));
+    let mut response = Response::from(message);
     response.set_status(StatusCode::OK);
     let mut outgoing =
         common::response::Response::<Read, _>::from(response.message.test_direction());

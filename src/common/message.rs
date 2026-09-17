@@ -8,7 +8,9 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+#[cfg(test)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{
     Read, Write,
@@ -17,15 +19,15 @@ use super::{
 };
 use crate::Result;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 /// Metadata and body are shared independently so either can be accessed without
-/// taking a lock for the other.
-pub(crate) struct ArcMessage<H, B> {
+/// taking a lock for the other. Construction does not start network or body work.
+pub(crate) struct Message<H, B> {
     pub(crate) head: Arc<Mutex<H>>,
     pub(crate) body: Arc<Mutex<B>>,
 }
 
-impl<H, B> Clone for ArcMessage<H, B> {
+impl<H, B> Clone for Message<H, B> {
     fn clone(&self) -> Self {
         Self {
             head: self.head.clone(),
@@ -34,25 +36,11 @@ impl<H, B> Clone for ArcMessage<H, B> {
     }
 }
 
-/// Client/server message parts before they are placed in independent shared slots.
-/// Construction does not start network or body work.
-/// 直接用 ArcMutex 包起来
-#[derive(Debug, Default)]
-pub(crate) struct Message<H, B> {
-    pub(crate) head: H,
-    body: B,
-}
-
 impl<H, B> Message<H, B> {
     pub(crate) fn from_parts(head: H, body: B) -> Self {
-        Self { head, body }
-    }
-
-    #[cfg(test)]
-    pub fn with_body<T>(self, body: T) -> Message<H, T> {
-        Message {
-            head: self.head,
-            body,
+        Self {
+            head: Arc::new(Mutex::new(head)),
+            body: Arc::new(Mutex::new(body)),
         }
     }
 }
@@ -61,7 +49,7 @@ impl<H, B> Message<H, B> {
 impl<B> Message<RequestHead, B> {
     /// Replace all existing values for this header name.
     pub fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
-        self.head.headers.insert(name, value);
+        self.head.lock().unwrap().headers.insert(name, value);
         self
     }
 }
@@ -70,13 +58,13 @@ impl<B> Message<RequestHead, B> {
 impl<B> Message<ResponseHead, B> {
     /// Replace all existing values for this header name.
     pub fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
-        self.head.headers.insert(name, value);
+        self.head.lock().unwrap().headers.insert(name, value);
         self
     }
 
     /// Append a value, preserving existing values for this header name.
     pub fn append_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
-        self.head.headers.append(name, value);
+        self.head.lock().unwrap().headers.append(name, value);
         self
     }
 }
@@ -203,8 +191,8 @@ impl<B: Default> WriteRequest for Message<RequestHead, B> {
         ))
     }
 
-    fn header(mut self, key: HeaderName, value: HeaderValue) -> Self {
-        self.head.headers.insert(key, value);
+    fn header(self, key: HeaderName, value: HeaderValue) -> Self {
+        self.head.lock().unwrap().headers.insert(key, value);
         self
     }
 }
@@ -242,26 +230,26 @@ impl ReadRequest for RequestHead {
 
 impl<B> ReadRequest for Message<RequestHead, B> {
     fn protocol(&self) -> Option<crate::Protocol> {
-        self.head.protocol()
+        self.head.lock().unwrap().protocol()
     }
     fn method(&self) -> Method {
-        self.head.method()
+        self.head.lock().unwrap().method()
     }
 
     fn authority(&self) -> String {
-        self.head.authority()
+        self.head.lock().unwrap().authority()
     }
 
     fn path(&self) -> String {
-        self.head.path()
+        self.head.lock().unwrap().path()
     }
 
     fn scheme(&self) -> String {
-        self.head.scheme()
+        self.head.lock().unwrap().scheme()
     }
 
     fn headers(&self) -> HeaderMap {
-        ReadRequest::headers(&self.head)
+        ReadRequest::headers(&*self.head.lock().unwrap())
     }
 }
 
@@ -294,41 +282,41 @@ impl ReadResponse for ResponseHead {
 
 impl<B> WriteResponse for Message<ResponseHead, B> {
     fn set_status(&mut self, status: StatusCode) -> &mut Self {
-        self.head.set_status(status);
+        self.head.lock().unwrap().set_status(status);
         self
     }
 
     fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
-        self.head.set_header(name, value);
+        self.head.lock().unwrap().set_header(name, value);
         self
     }
 
     fn append_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
-        self.head.append_header(name, value);
+        self.head.lock().unwrap().append_header(name, value);
         self
     }
 }
 
 impl<B> ReadResponse for Message<ResponseHead, B> {
     fn status(&self) -> StatusCode {
-        ReadResponse::status(&self.head)
+        ReadResponse::status(&*self.head.lock().unwrap())
     }
 
     fn headers(&self) -> HeaderMap {
-        ReadResponse::headers(&self.head)
+        ReadResponse::headers(&*self.head.lock().unwrap())
     }
 }
 
 impl<H> WriteBody for Message<H, Bytes> {
     fn set_body(&mut self, body: Bytes) -> &mut Self {
-        self.body = body;
+        *self.body.lock().unwrap() = body;
         self
     }
 }
 
 impl<H> ReadBody for Message<H, Bytes> {
     fn body(&self) -> Bytes {
-        self.body.clone()
+        self.body.lock().unwrap().clone()
     }
 }
 
@@ -339,7 +327,7 @@ impl<H: Unpin, B: AsyncRead + Unpin> AsyncRead for Message<H, B> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().body).poll_read(cx, buf)
+        Pin::new(&mut *self.body.lock().unwrap()).poll_read(cx, buf)
     }
 }
 
@@ -349,77 +337,28 @@ impl<H: Unpin, B: AsyncWrite + Unpin> AsyncWrite for Message<H, B> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().body).poll_write(cx, buf)
+        Pin::new(&mut *self.body.lock().unwrap()).poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().body).poll_flush(cx)
+        Pin::new(&mut *self.body.lock().unwrap()).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().body).poll_shutdown(cx)
+        Pin::new(&mut *self.body.lock().unwrap()).poll_shutdown(cx)
     }
 }
 
-#[async_trait]
-impl<H: Unpin + Send, B: AsyncWrite + Unpin + Send> WriteStream for Message<H, B> {
-    async fn write<T: AsRef<[u8]> + Send>(&mut self, chunk: T) -> Result<usize> {
-        Ok(AsyncWriteExt::write(self, chunk.as_ref()).await?)
-    }
-
-    async fn finish(&mut self) -> Result<()> {
-        Ok(AsyncWriteExt::shutdown(self).await?)
-    }
-
-    async fn reset(self) -> Result<()> {
-        drop(self);
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl<H: Unpin + Send, B: AsyncRead + Unpin + Send> ReadStream for Message<H, B> {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        Ok(AsyncReadExt::read(self, buf).await?)
-    }
-
-    /// Read until the buffer is full or EOF; a short buffer leaves data unread.
-    async fn read_all(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let mut count = 0;
-        while count < buf.len() {
-            let read = AsyncReadExt::read(self, &mut buf[count..]).await?;
-            if read == 0 {
-                break;
-            }
-            count += read;
-        }
-        Ok(count)
-    }
-
-    async fn stop(self) {
-        drop(self);
-    }
-}
-
-impl<H, B> From<Message<H, B>> for ArcMessage<H, B> {
-    fn from(message: Message<H, B>) -> Self {
-        Self {
-            head: Arc::new(Mutex::new(message.head)),
-            body: Arc::new(Mutex::new(message.body)),
-        }
-    }
-}
-
-impl<H: Clone, B> ArcMessage<H, B> {
-    pub(crate) fn with_body<T>(&self, body: T) -> ArcMessage<H, T> {
-        ArcMessage {
+impl<H: Clone, B> Message<H, B> {
+    pub(crate) fn with_body<T>(&self, body: T) -> Message<H, T> {
+        Message {
             head: Arc::new(Mutex::new(self.head.lock().unwrap().clone())),
             body: Arc::new(Mutex::new(body)),
         }
     }
 }
 
-impl<H, B: Clone, IO> ArcMessage<H, Body<B, IO>> {
+impl<H, B: Clone, IO> Message<H, Body<B, IO>> {
     pub(crate) fn body(&self) -> Body<B, IO> {
         Body::new(self.body.lock().unwrap().storage.clone())
     }
@@ -432,11 +371,11 @@ impl<H, B: Clone, IO> ArcMessage<H, Body<B, IO>> {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_direction<D>(&self) -> ArcMessage<H, Body<B, D>>
+    pub(crate) fn test_direction<D>(&self) -> Message<H, Body<B, D>>
     where
         H: Clone,
     {
-        ArcMessage {
+        Message {
             head: Arc::new(Mutex::new(self.head.lock().unwrap().clone())),
             body: Arc::new(Mutex::new(Body::new(
                 self.body.lock().unwrap().storage.clone(),
@@ -445,14 +384,14 @@ impl<H, B: Clone, IO> ArcMessage<H, Body<B, IO>> {
     }
 }
 
-impl<H, IO> ArcMessage<H, Body<crate::ArcWndBuf, IO>> {
+impl<H, IO> Message<H, Body<crate::ArcWndBuf, IO>> {
     pub(crate) fn body_stream(&self) -> crate::ArcWndBuf {
         self.body.lock().unwrap().storage.clone()
     }
 }
 
 #[async_trait]
-impl<H: Send> ReadStream for ArcMessage<H, Body<crate::ArcWndBuf, Read>> {
+impl<H: Send> ReadStream for Message<H, Body<crate::ArcWndBuf, Read>> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         self.body().read(buf).await
     }
@@ -476,7 +415,7 @@ impl<H: Send> ReadStream for ArcMessage<H, Body<crate::ArcWndBuf, Read>> {
 }
 
 #[async_trait]
-impl<H: Send> WriteStream for ArcMessage<H, Body<crate::ArcWndBuf, Write>> {
+impl<H: Send> WriteStream for Message<H, Body<crate::ArcWndBuf, Write>> {
     async fn write<T: AsRef<[u8]> + Send>(&mut self, chunk: T) -> Result<usize> {
         self.body().write(chunk).await
     }
@@ -492,13 +431,13 @@ impl<H: Send> WriteStream for ArcMessage<H, Body<crate::ArcWndBuf, Write>> {
 
 impl<H, IO> ReadBody for Message<H, Body<Bytes, IO>> {
     fn body(&self) -> Bytes {
-        self.body.storage.clone()
+        self.body.lock().unwrap().storage.clone()
     }
 }
 
 impl<H> WriteBody for Message<H, Body<Bytes, Write>> {
     fn set_body(&mut self, bytes: Bytes) -> &mut Self {
-        self.body.storage = bytes;
+        self.body.lock().unwrap().storage = bytes;
         self
     }
 }
@@ -509,8 +448,12 @@ mod tests {
     use crate::common::headers::Write as _;
 
     impl<H, B> Message<H, B> {
-        pub(crate) fn into_body(self) -> B {
-            self.body
+        pub(crate) fn into_raw_body(self) -> B {
+            Arc::try_unwrap(self.body)
+                .ok()
+                .expect("message body is still shared")
+                .into_inner()
+                .unwrap()
         }
     }
 
@@ -523,10 +466,10 @@ mod tests {
         assert_eq!(request.path(), "/a?q=1");
         let name = http::header::CONTENT_TYPE;
         request.set_header(name.clone(), HeaderValue::from_static("text/plain"));
-        assert_eq!(request.head.headers[&name], "text/plain");
+        assert_eq!(request.head.lock().unwrap().headers[&name], "text/plain");
         request =
             WriteRequest::header(request, name.clone(), HeaderValue::from_static("text/html"));
-        assert_eq!(request.head.headers[&name], "text/html");
+        assert_eq!(request.head.lock().unwrap().headers[&name], "text/html");
 
         let mut response = Message::<ResponseHead, Bytes>::default();
         response
@@ -537,19 +480,19 @@ mod tests {
         let mut buf = [0; 3];
         let mut stream = response.with_body(&b"world"[..]);
         assert_eq!(stream.status(), StatusCode::CREATED);
-        assert_eq!(stream.read_all(&mut buf).await.unwrap(), 3);
+        assert_eq!(AsyncReadExt::read(&mut stream, &mut buf).await.unwrap(), 3);
         assert_eq!(&buf, b"wor");
-        assert_eq!(stream.read_all(&mut buf).await.unwrap(), 2);
-        assert_eq!(stream.read_all(&mut buf).await.unwrap(), 0);
-        stream.stop().await;
+        assert_eq!(AsyncReadExt::read(&mut stream, &mut buf).await.unwrap(), 2);
+        assert_eq!(AsyncReadExt::read(&mut stream, &mut buf).await.unwrap(), 0);
+        drop(stream);
         let mut stream = Message::<ResponseHead, Vec<u8>>::default();
-        assert_eq!(WriteStream::write(&mut stream, b"hello").await.unwrap(), 5);
-        stream.finish().await.unwrap();
-        assert_eq!(stream.into_body(), b"hello");
-        Message::<ResponseHead, Vec<u8>>::default()
-            .reset()
-            .await
-            .unwrap();
+        assert_eq!(
+            AsyncWriteExt::write(&mut stream, b"hello").await.unwrap(),
+            5
+        );
+        AsyncWriteExt::shutdown(&mut stream).await.unwrap();
+        assert_eq!(stream.into_raw_body(), b"hello");
+        drop(Message::<ResponseHead, Vec<u8>>::default());
         assert!(Message::<RequestHead, Bytes>::get("/relative").is_err());
         assert!(Message::<RequestHead, Bytes>::get("https://bad host/").is_err());
         for url in ["example.com:443", "https://example.com:443/"] {
@@ -572,8 +515,18 @@ mod tests {
             .append_header(name.clone(), sensitive.clone());
 
         let message = message.with_body(Vec::<u8>::new());
-        assert_eq!(message.head.headers.get_all(&name).iter().count(), 2);
-        let original = ArcMessage::from(message);
+        assert_eq!(
+            message
+                .head
+                .lock()
+                .unwrap()
+                .headers
+                .get_all(&name)
+                .iter()
+                .count(),
+            2
+        );
+        let original = message;
         let copied = original.with_body(Bytes::new());
         let mut head = copied.head.lock().unwrap();
         assert_eq!(ReadResponse::status(&*head), StatusCode::OK);

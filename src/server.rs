@@ -13,7 +13,7 @@ use crate::{
         self, Read, Write,
         body::{self, BodyMode},
         headers::{self, Write as _},
-        message::{ArcMessage, Message},
+        message::Message,
     },
     protocol::{
         frame::{self, Frame, FrameType, H3Frame, Headers, Write as _},
@@ -52,7 +52,7 @@ pub fn read_request_body<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
     })?;
     let body = body::receive(rs, mode, qpack);
     Ok(common::Request::Streaming(
-        ArcMessage::from(Message::from_parts(head, body)).into(),
+        Message::from_parts(head, body).into(),
     ))
 }
 

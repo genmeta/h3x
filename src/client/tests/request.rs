@@ -114,9 +114,7 @@ async fn streaming_request_frames_and_errors() {
         if let Some(length) = length {
             message.set_header(header::CONTENT_LENGTH, length.parse().unwrap());
         }
-        let req = Request::from(ArcMessage::from(
-            message.with_body(crate::Body::new(ArcWndBuf::new(2))),
-        ));
+        let req = Request::from(message.with_body(crate::Body::new(ArcWndBuf::new(2))));
         let mut producer = Request::from(req.message.clone());
         let (writer, mut reader) = duplex(3);
         let (sent, produced, received) = tokio::join!(
@@ -166,11 +164,11 @@ async fn streaming_request_frames_and_errors() {
         }
         assert_eq!(decoded, body);
     }
-    let req = Request::from(ArcMessage::from(
+    let req = Request::from(
         Message::<headers::RequestHead, Bytes>::post("https://example.com/")
             .unwrap()
             .with_body(crate::Body::new(ArcWndBuf::new(1))),
-    ));
+    );
     let mut producer = Request::from(req.message.clone());
     let (writer, reader) = duplex(1);
     drop(reader);

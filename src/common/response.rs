@@ -6,20 +6,18 @@ use super::{
     Read, Write,
     body::Body,
     headers::ResponseHead,
-    message::{
-        ArcMessage, ReadBody, ReadResponse, ReadStream, WriteBody, WriteResponse, WriteStream,
-    },
+    message::{Message, ReadBody, ReadResponse, ReadStream, WriteBody, WriteResponse, WriteStream},
 };
 use crate::{ArcWndBuf, Result};
 
 pub struct Response<IO, B = Bytes> {
-    pub(crate) message: ArcMessage<ResponseHead, Body<B, IO>>,
+    pub(crate) message: Message<ResponseHead, Body<B, IO>>,
 }
 
 impl<B: Default> Default for Response<Write, B> {
     fn default() -> Self {
         Self {
-            message: ArcMessage::default(),
+            message: Message::default(),
         }
     }
 }
@@ -33,8 +31,8 @@ impl Clone for Response<Write, ArcWndBuf> {
     }
 }
 
-impl<IO, B> From<ArcMessage<ResponseHead, Body<B, IO>>> for Response<IO, B> {
-    fn from(message: ArcMessage<ResponseHead, Body<B, IO>>) -> Self {
+impl<IO, B> From<Message<ResponseHead, Body<B, IO>>> for Response<IO, B> {
+    fn from(message: Message<ResponseHead, Body<B, IO>>) -> Self {
         Self { message }
     }
 }

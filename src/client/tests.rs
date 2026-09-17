@@ -20,7 +20,6 @@ mod response;
 
 use std::pin::Pin;
 
-use crate::common::message::ArcMessage;
 fn request<RS, WS, R>(
     request: R,
     recv: H3ReadStream<RS>,

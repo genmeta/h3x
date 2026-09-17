@@ -63,7 +63,6 @@ fn request_frames(body: &[u8], length: Option<&'static str>) -> Vec<u8> {
 }
 
 use super::read_request as accept;
-use crate::common::message::ArcMessage;
 /// Send one response on the accepted request's matching send stream.
 ///
 /// For streaming responses, retain a producer clone until it finishes or resets
