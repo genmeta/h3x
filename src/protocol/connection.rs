@@ -18,18 +18,19 @@ use crate::ErrorCode::H3_NO_ERROR;
 
 /// An HTTP/3 connection whose control and QPACK streams are driven automatically.
 /// Construct inside a Tokio runtime. Tasks run until the transport terminates.
-/// Only an explicit goaway() drains requests and closes the transport.
+/// `goaway()` or a managing pool can drain requests and close the transport.
 pub struct H3Connection<T: Transport> {
     pub(crate) transport: Arc<T>,
     local_settings: Arc<Settings>,
     qpack: ArcQpack,
-    cursor: Arc<StreamCursor>,
+    pub(crate) cursor: Arc<StreamCursor>,
     control_stream: Arc<tokio::sync::Mutex<T::StreamWriter>>,
     bi_streams: Arc<BiStreams<T::StreamReader, T::StreamWriter>>,
 }
 
 impl<T: Transport> H3Connection<T> {
     /// Open the control stream and start SETTINGS and connection tasks.
+    /// On failure or cancellation, transport cleanup follows its own drop semantics.
     pub async fn new(transport: T, settings: Settings) -> Result<Self> {
         let transport = Arc::new(transport);
         let settings = Arc::new(settings);
@@ -48,7 +49,6 @@ impl<T: Transport> H3Connection<T> {
             });
             Ok(())
         })?;
-
         tokio::spawn({
             let qpack = qpack.clone();
             let transport = transport.clone();
@@ -108,9 +108,8 @@ impl<T: Transport> H3Connection<T> {
         self.bi_streams.insert(id, recv, send)
     }
 
-    /// Consume this connection and exchange GOAWAY with the peer.
-    /// Wait for GOAWAY to be flushed, the peer GOAWAY, and admitted requests before closing QUIC.
-    /// This future is not cancellation-safe during GOAWAY writes; await it to completion.
+    /// Exchange GOAWAY and wait for admitted requests before closing the transport.
+    /// This future is not cancellation-safe during GOAWAY writes; await completion.
     pub async fn goaway(self) -> Result<()> {
         if let Err(error) = self.send_goaway().await {
             let _ = self
@@ -128,6 +127,24 @@ impl<T: Transport> H3Connection<T> {
             } => result?,
         }
         self.transport.close(String::new(), H3_NO_ERROR.as_u64())
+    }
+
+    pub(crate) fn is_reusable(&self) -> bool {
+        self.cursor.local.lock().unwrap().not_goaway().is_ok()
+            && self.cursor.remote.lock().unwrap().not_goaway().is_ok()
+            && self.qpack.error().is_none()
+    }
+
+    pub(crate) async fn unusable(&self) {
+        if !self.is_reusable() {
+            return;
+        }
+        tokio::select! {
+            _ = self.cursor.draining() => {},
+            _ = self.cursor.remote_goaway() => {},
+            _ = self.transport.terminated() => {},
+            _ = self.qpack.failed() => {},
+        }
     }
 }
 

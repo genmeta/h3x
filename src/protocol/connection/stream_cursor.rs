@@ -21,6 +21,7 @@ pub(crate) struct StreamCursor {
     pub(super) local: Mutex<Cursor>,
     pub(super) remote: Mutex<Cursor>,
     remote_goaway: ArcReceiving<()>,
+    local_goaway: ArcReceiving<()>,
 }
 
 impl StreamCursor {
@@ -29,6 +30,7 @@ impl StreamCursor {
             local: Mutex::new(Cursor::Max(StreamId::new(!role, Dir::Bi, 0))),
             remote: Mutex::new(Cursor::Max(StreamId::new(role, Dir::Bi, 0))),
             remote_goaway: ArcReceiving::default(),
+            local_goaway: ArcReceiving::default(),
         }
     }
 
@@ -37,7 +39,12 @@ impl StreamCursor {
         let mut local = self.local.lock().unwrap();
         let (Cursor::Max(id) | Cursor::Gone(id)) = *local;
         *local = Cursor::Gone(id);
+        self.local_goaway.obtain(());
         id
+    }
+
+    pub(crate) async fn draining(&self) {
+        let _ = self.local_goaway.clone().await;
     }
 
     /// The control reader validates each boundary before publishing the first one.
@@ -74,9 +81,7 @@ impl Cursor {
         match self {
             Self::Max(boundary) => {
                 if id.role() != boundary.role() || id.dir() != Dir::Bi {
-                    return Err(
-                        ErrorCode::H3_ID_ERROR.reason("invalid stream or push identifier")
-                    );
+                    return Err(ErrorCode::H3_ID_ERROR.reason("invalid stream or push identifier"));
                 }
                 if id >= *boundary {
                     // A GOAWAY boundary must still fit in a QUIC variable integer.
@@ -100,6 +105,30 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn local_goaway_freezes_admission_and_retains_notification() {
+        let cursor = StreamCursor::new(Role::Client);
+        let mut waiting = Box::pin(cursor.draining());
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let boundary = cursor.local_goaway();
+        assert_eq!(cursor.local_goaway(), boundary);
+        assert!(cursor.local.lock().unwrap().not_goaway().is_err());
+        waiting.await;
+        cursor.draining().await;
+        // A local drain must still wait for an actual peer GOAWAY.
+        assert!(
+            Box::pin(cursor.remote_goaway())
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+    }
 
     #[tokio::test]
     async fn peer_goaway_is_retained_for_repeated_waits() {

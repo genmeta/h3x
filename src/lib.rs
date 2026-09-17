@@ -3,6 +3,7 @@
 pub mod client;
 mod common;
 mod error;
+pub mod pool;
 mod protocol;
 pub mod server;
 
@@ -11,6 +12,7 @@ pub use common::message::{
     WriteStream,
 };
 pub use error::{Error, ErrorCode, Result};
+pub use pool::{Pool, PoolConfig, PoolError, PoolResult};
 pub use protocol::{
     connection::{H3Connection, Settings},
     frame::Goaway,

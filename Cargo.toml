@@ -17,7 +17,7 @@ httlib-huffman = "0.3"
 thiserror = "2"
 qbase = { version = "0.6.4", path = "../dquic/qbase" }
 qrecovery = { version = "0.6.2", path = "../dquic/qrecovery" }
-tokio = { version = "1", features = ["macros", "rt", "io-util", "sync"] }
+tokio = { version = "1", features = ["macros", "rt", "io-util", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["time", "net"] }

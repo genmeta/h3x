@@ -38,11 +38,14 @@ no transport dependency. Connection initialization explicitly starts both
 QPACK writers; the connection owns critical-stream failures and transport termination.
 Local encoding errors, including oversized fields, fail only the current operation.
 
-`goaway(self).await` writes the local GOAWAY, waits for the peer GOAWAY and
-admitted requests to finish, then closes QUIC with `H3_NO_ERROR`. Control and
-QPACK remain available during this wait. Receiving a peer GOAWAY alone updates
-the peer boundary and rejects affected requests; it does not initiate local
-GOAWAY, draining, or transport closure.
+`goaway(self).await` stops accepting peer requests on every clone, writes the
+local GOAWAY, waits for the peer GOAWAY and admitted requests to finish, then
+closes QUIC with `H3_NO_ERROR` and applies the terminal state to H3 waiters.
+Await `goaway()` to completion: cancelling it during a GOAWAY write is not safe.
+Pool-managed draining continues independently of shutdown waiters. Control and
+QPACK remain available during draining. On a connection managed directly by the
+application, receiving a peer GOAWAY only updates the peer boundary and rejects
+affected requests. A managing `Pool` also retires and drains that connection.
 
 Peer STOP/reset errors are observed through transport write, flush, or shutdown.
 There is no independent STOP notification input while waiting for body data.
@@ -50,6 +53,41 @@ Applications finish or reset outgoing bodies and stop incoming bodies explicitly
 Stream termination wakes pending network I/O and connection drain waiters;
 tasks waiting for body data or buffer space resume when the application advances
 or cancels the body.
+
+## Connection Pool
+
+`Pool<K, T, E>` shares connections by a caller-defined key implementing
+`Clone + Eq + Hash + Send + Sync + 'static`. Equal keys must permit reuse of the
+same authenticated connection; keep credentials and connection configuration in
+the factory, and use a different key or `remove(&key)` when identity policy changes.
+
+`Pool::new(factory)` accepts an asynchronous `Fn(K)` returning
+`Result<H3Connection<T>, E>`. The factory must complete the QUIC handshake,
+authentication and ALPN `h3` verification before returning an initialized H3
+connection, and reclaim unreturned resources when cancelled. Do not return a
+connection already managed by another pool.
+
+- `get(&key).await` reuses a connection or merges concurrent calls into one
+  factory execution for that key. Different keys connect independently. Cancelling
+  the first caller cancels the shared build with `PoolError::BuildCancelled`;
+  cancelling another waiter does not affect the build.
+- `remove(&key)` revokes the current build or removes the current connection
+  from reuse and starts GOAWAY. Existing handles can still open streams until peer
+  GOAWAY or transport close. A replacement can connect while older generations
+  drain. Already admitted requests can finish without returning a handle to the pool.
+- Peer GOAWAY, local draining and connection failure trigger automatic retirement.
+  Each retired generation has its own deadline; expiration explicitly closes its
+  transport and waits for H3 cleanup.
+- `shutdown().await` permanently stops allocation and waits for cancelled builds
+  and managed connections to finish cleanup. Cancelling this waiter does not stop
+  shutdown. Dropping the last pool owner immediately closes remaining connections.
+
+`Pool::with_config(factory, PoolConfig { ... })` configures the whole-factory
+`connect_timeout` (default 10 seconds) and each connection's `drain_timeout`
+(default `Some(30 seconds)`, or `None` for unbounded draining). Build cancellation
+is cooperative: a revoked creator must be polled or dropped before shutdown can
+finish. The pool does not send or automatically retry requests; after `get`, use
+`connection.open_bi().await` and the normal request APIs.
 
 ## Request and Response I/O
 
