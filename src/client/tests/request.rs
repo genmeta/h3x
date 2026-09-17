@@ -78,7 +78,11 @@ async fn request_frames_and_errors() {
                 .await
                 .is_err()
         );
-        let request = Request::streaming_connect(url).unwrap();
+        let request = Request::from(ArcMessage::from(
+            Message::<headers::RequestHead, Bytes>::connect(url)
+                .unwrap()
+                .with_body(crate::Body::new(ArcWndBuf::new(1))),
+        ));
         assert!(
             write_streaming_request(&request, tokio::io::sink())
                 .await

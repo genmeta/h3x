@@ -69,9 +69,11 @@ impl<R: StopSending, W: AsyncWrite + CancelStream + Unpin> AsyncWrite for Tunnel
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.get_mut().send).poll_write(cx, input)
     }
+
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().send).poll_flush(cx)
     }
+
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().send).poll_shutdown(cx)
     }

@@ -745,6 +745,18 @@ mod connect_tests {
         for (url, scheme, authority, path) in [
             ("ws://example.com", "http", "example.com", "/"),
             (
+                "WS://localhost:8765/Api?Token=AbC",
+                "http",
+                "localhost:8765",
+                "/Api?Token=AbC",
+            ),
+            (
+                "WsS://example.com:443/Api?Token=AbC",
+                "https",
+                "example.com:443",
+                "/Api?Token=AbC",
+            ),
+            (
                 "wss://example.com/chat?q=%2F",
                 "https",
                 "example.com",

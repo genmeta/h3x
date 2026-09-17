@@ -90,11 +90,7 @@ async fn external_ws_echo() {
                         "sec-websocket-protocol".parse().unwrap(),
                         "h3x-test".parse().unwrap(),
                     );
-                let ConnectOutcome::Connected { response, tunnel } =
-                    client::connect(request, &a).await.unwrap()
-                else {
-                    panic!("CONNECT rejected")
-                };
+                let (response, tunnel) = connect(request, &a).await.unwrap();
                 assert_eq!(response.headers()["sec-websocket-protocol"], "h3x-test");
                 // The CONNECT handshake is complete; don't send an H1 Upgrade inside DATA.
                 let mut ws = WebSocketStream::from_raw_socket(tunnel, WsRole::Client, None).await;
@@ -236,8 +232,8 @@ async fn external_ws_incoming() {
                     request = request.header(name.parse().unwrap(), h1.headers()[name].clone());
                 }
                 // Do not send 101 until the H3 server accepts this request.
-                match client::connect(request, &a).await.unwrap() {
-                    ConnectOutcome::Connected {response, mut tunnel} => {
+                match connect(request, &a).await {
+                    Ok((response, mut tunnel)) => {
                         assert_eq!(response.headers()["sec-websocket-protocol"], "h3x-test");
                         upgrade.headers_mut().insert("sec-websocket-protocol", response.headers()["sec-websocket-protocol"].clone());
                         let mut bytes = Vec::new();
@@ -247,7 +243,7 @@ async fn external_ws_incoming() {
                         assert!(sent > 256*1024 && received > 256*1024);
                         println!("PASS external client raw relay: {sent} bytes to H3, {received} bytes from H3");
                     }
-                    ConnectOutcome::Rejected(response) => {
+                    Err(client::ConnectError::Rejected(response)) => {
                         assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
                         let status = response.status();
                         let body = response.into_body().collect().await.unwrap();
@@ -260,6 +256,7 @@ async fn external_ws_incoming() {
                         socket.shutdown().await.unwrap();
                         println!("PASS H3 403 propagated without sending 101");
                     }
+                    Err(error) => panic!("CONNECT failed: {error}"),
                 }
             }
         }, async {

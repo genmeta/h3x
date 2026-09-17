@@ -61,16 +61,28 @@ impl<B> Message<RequestHead, B> {
         if url.contains('#') {
             return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason("URI fragments are forbidden"));
         }
-        let websocket =
-            method == Method::CONNECT && (url.starts_with("ws://") || url.starts_with("wss://"));
-        let normalized = if websocket {
-            url.replacen("ws", "http", 1)
-        } else {
-            url.to_owned()
-        };
-        let uri: Uri = normalized.parse().map_err(|error| {
+        let mut uri: Uri = url.parse().map_err(|error| {
             ErrorCode::H3_MESSAGE_ERROR.with_reason(format!("invalid request URI: {error}"))
         })?;
+        let websocket_scheme = if method == Method::CONNECT {
+            match uri.scheme_str() {
+                Some(scheme) if scheme.eq_ignore_ascii_case("ws") => Some(http::uri::Scheme::HTTP),
+                Some(scheme) if scheme.eq_ignore_ascii_case("wss") => {
+                    Some(http::uri::Scheme::HTTPS)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let websocket = websocket_scheme.is_some();
+        if let Some(scheme) = websocket_scheme {
+            let mut parts = uri.into_parts();
+            parts.scheme = Some(scheme);
+            uri = Uri::from_parts(parts).map_err(|error| {
+                ErrorCode::H3_MESSAGE_ERROR.with_reason(format!("invalid request URI: {error}"))
+            })?;
+        }
         // CONNECT also accepts an authority-form target such as example.com:443.
         let authority_form = method == Method::CONNECT
             && uri.scheme().is_none()

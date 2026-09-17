@@ -1,9 +1,6 @@
-//! Local configuration and independently received peer settings.
-
-use std::sync::OnceLock;
+//! Local connection settings.
 
 use qbase::varint::VarInt;
-use tokio::sync::Notify;
 
 use crate::{ErrorCode, Result, protocol::frame};
 
@@ -11,34 +8,6 @@ use crate::{ErrorCode, Result, protocol::frame};
 /// Extended CONNECT support is always advertised.
 #[derive(Clone, Debug)]
 pub struct Settings(pub(crate) frame::Settings);
-
-/// Peer settings are published once and borrowed by every waiter.
-#[derive(Default)]
-pub(crate) struct PeerSettings {
-    value: OnceLock<frame::Settings>,
-    ready: Notify,
-}
-
-impl PeerSettings {
-    pub(super) fn obtain(&self, settings: frame::Settings) {
-        if self.value.set(settings).is_ok() {
-            self.ready.notify_waiters();
-        }
-    }
-
-    pub(crate) async fn received(&self) -> &frame::Settings {
-        loop {
-            let ready = self.ready.notified();
-            tokio::pin!(ready);
-            // Register before checking the value so publication cannot lose a wakeup.
-            ready.as_mut().enable();
-            if let Some(settings) = self.value.get() {
-                return settings;
-            }
-            ready.await;
-        }
-    }
-}
 
 impl Settings {
     pub fn new(
@@ -82,53 +51,6 @@ mod tests {
     use qbase::varint::VARINT_MAX;
 
     use super::*;
-
-    #[tokio::test]
-    async fn peer_settings_wake_all_waiters_after_cancellation() {
-        use std::{
-            future::Future,
-            sync::Arc,
-            task::{Context, Waker},
-            time::Duration,
-        };
-        let peer = Arc::new(PeerSettings::default());
-        let mut cancelled = Box::pin(peer.received());
-        assert!(
-            cancelled
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-        drop(cancelled);
-        let mut waiters = Vec::new();
-        for _ in 0..8 {
-            let peer = peer.clone();
-            waiters.push(tokio::spawn(async move {
-                let settings = peer.received().await;
-                assert!(std::ptr::eq(settings, peer.value.get().unwrap()));
-            }));
-        }
-        tokio::task::yield_now().await;
-        peer.obtain(frame::Settings::default());
-        tokio::time::timeout(Duration::from_secs(1), async {
-            for waiter in waiters {
-                waiter.await.unwrap();
-            }
-        })
-        .await
-        .unwrap();
-        assert!(std::ptr::eq(peer.received().await, peer.received().await));
-    }
-
-    #[tokio::test]
-    async fn peer_settings_arrive_before_waiters_and_cannot_be_overwritten() {
-        let peer = PeerSettings::default();
-        let expected = frame::Settings::default();
-        peer.obtain(expected.clone());
-        assert_eq!(peer.received().await, &expected);
-        peer.obtain(Settings::default().0);
-        assert_eq!(peer.received().await, &expected);
-    }
 
     #[test]
     fn settings_accept_limits_and_reject_unrepresentable_values() {

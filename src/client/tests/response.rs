@@ -259,7 +259,7 @@ async fn connect_head_leaves_data_unconsumed_and_ignores_success_length() {
         bytes.put_frame(&Frame::new(Data(3)).unwrap());
         bytes.extend_from_slice(b"one");
         let mut recv = crate::test_support::read_stream(0, Cursor::new(bytes));
-        let head = super::read_final_head(&mut recv, connection.qpack(), true)
+        let head = super::read_connect_head(&mut recv, connection.qpack())
             .await
             .unwrap();
         assert_eq!(head.status().unwrap(), status);

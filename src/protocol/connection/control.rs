@@ -159,7 +159,6 @@ impl<T: Transport> H3Connection<T> {
         };
         let (peer, max_fields) = qpack::limits(&settings);
         self.qpack.configure(peer, max_fields)?;
-        self.peer_settings.obtain(settings);
 
         let role = self.transport.role();
         let mut last_goaway_id = None;

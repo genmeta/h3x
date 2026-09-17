@@ -165,23 +165,24 @@ Construction does not dial a backend or open an HTTP/3 stream.
 # use h3x::{client, H3Connection, Transport};
 # async fn connect<T: Transport>(connection: &H3Connection<T>) -> Result<(), Box<dyn std::error::Error>> {
 let request = client::Request::connect("wss://home.example/api/websocket")?;
-match client::connect(request, connection).await? {
-    client::ConnectOutcome::Connected { response, mut tunnel } => {
+let (ws, rs) = connection.open_bi().await?;
+match client::connect(request, ws, rs, connection.qpack().clone()).await {
+    Ok((response, mut tunnel)) => {
         assert!(response.status().is_success());
         // Drive tunnel with AsyncRead/AsyncWrite, or copy_bidirectional.
         // Only send WebSocket frame bytes after the handshake succeeds.
         tunnel.finish().await?;
     }
-    client::ConnectOutcome::Rejected(response) => {
+    Err(client::ConnectError::Rejected(response)) => {
         // Status, headers, and ordinary response body remain available.
     }
+    Err(error) => return Err(error.into()),
 }
 # Ok(()) }
 ```
 
-The client waits for peer SETTINGS before sending Extended CONNECT. Unsupported
-peers return `ConnectError::NotSupported` without closing the connection. Plain
-CONNECT requires no extension negotiation. A successful handshake returns after
+`client::connect` takes an already opened stream and QPACK state. Extended CONNECT
+assumes peer support without checking or waiting for peer SETTINGS. A successful handshake returns after
 final 2xx HEADERS, without waiting for DATA or FIN. Handshake bodies must be empty.
 
 On the server, retain the read direction until the application chooses how to

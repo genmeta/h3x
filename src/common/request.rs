@@ -83,10 +83,6 @@ impl Request<Write, ArcWndBuf> {
     pub fn streaming_patch(url: &str) -> Result<Self> {
         Self::streaming(url, Method::PATCH)
     }
-
-    pub fn streaming_connect(url: &str) -> Result<Self> {
-        Self::streaming(url, Method::CONNECT)
-    }
 }
 
 impl<B> Request<Write, B> {
@@ -248,25 +244,14 @@ mod tests {
             ),
             (Request::streaming_put, Method::PUT),
             (Request::streaming_patch, Method::PATCH),
-            (Request::streaming_connect, Method::CONNECT),
         ] {
             let request = constructor("https://example.com/upload?q=1").unwrap();
             let head = request.message.head.lock().unwrap();
             assert_eq!(head.method(), method);
             assert_eq!(head.authority(), "example.com");
-            assert_eq!(
-                head.path(),
-                if method == Method::CONNECT {
-                    ""
-                } else {
-                    "/upload?q=1"
-                }
-            );
+            assert_eq!(head.path(), "/upload?q=1");
             assert!(constructor("/relative").is_err());
-            assert_eq!(
-                constructor("example.com:443").is_ok(),
-                method == Method::CONNECT
-            );
+            assert!(constructor("example.com:443").is_err());
         }
     }
 

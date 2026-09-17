@@ -180,10 +180,10 @@ where
     })
 }
 
-async fn read_final_head<RS: AsyncRead + StopSending + Unpin>(
+/// Read final response HEADERS, skipping informational responses.
+async fn read_head<RS: AsyncRead + StopSending + Unpin>(
     rs: &mut H3ReadStream<RS>,
     qpack: &ArcQpack,
-    connect: bool,
 ) -> Result<headers::ResponseHead> {
     let stream_id = rs.stream_id();
     let result = async {
@@ -202,22 +202,17 @@ async fn read_final_head<RS: AsyncRead + StopSending + Unpin>(
             let fields = qpack.decode(stream_id, frame.payload.field_section).await?;
             let head = headers::be_response(fields)?;
             let status = head.status()?;
-            if connect && status.is_success() {
-                return Ok(head);
-            }
-            let length = headers::content_length(&head.headers)?;
             if status == StatusCode::SWITCHING_PROTOCOLS {
                 return Err(
                     ErrorCode::H3_MESSAGE_ERROR.with_reason("status 101 is forbidden in HTTP/3")
                 );
             }
-            if (status.is_informational() || status == StatusCode::NO_CONTENT) && length.is_some() {
-                return Err(ErrorCode::H3_MESSAGE_ERROR.with_reason(
-                    "informational and 204 responses must not include Content-Length",
-                ));
-            }
             if !status.is_informational() {
                 return Ok(head);
+            }
+            if headers::content_length(&head.headers)?.is_some() {
+                return Err(ErrorCode::H3_MESSAGE_ERROR
+                    .with_reason("informational responses must not include Content-Length"));
             }
         }
     }
@@ -235,32 +230,56 @@ async fn read_final_head<RS: AsyncRead + StopSending + Unpin>(
     result
 }
 
-/// HTTP rejection is a response, not a transport failure.
-pub enum ConnectOutcome<S> {
-    Connected {
-        response: http::Response<()>,
-        tunnel: S,
-    },
-    Rejected(Response),
+/// Successful CONNECT responses ignore HTTP body framing fields.
+async fn read_connect_head<RS: AsyncRead + StopSending + Unpin>(
+    rs: &mut H3ReadStream<RS>,
+    qpack: &ArcQpack,
+) -> Result<headers::ResponseHead> {
+    let head = read_head(rs, qpack).await?;
+    if !head.status()?.is_success() {
+        headers::content_length(&head.headers).inspect_err(|error| {
+            rs.close(error.clone());
+            let _ = qpack.cancel(rs.stream_id());
+        })?;
+    }
+    Ok(head)
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum ConnectError {
-    #[error("peer does not support Extended CONNECT")]
-    NotSupported,
+    /// The peer rejected CONNECT; status, headers, and body remain available.
+    #[error("CONNECT rejected with status {}", crate::ReadResponse::status(.0))]
+    Rejected(Response),
     #[error(transparent)]
     H3(#[from] crate::Error),
 }
 
-/// Perform a CONNECT handshake on an existing connection. No application bytes
-/// are sent before successful response HEADERS. Cancellation drops both halves.
-pub async fn connect<T: crate::Transport>(
+impl std::fmt::Debug for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(response) => f
+                .debug_tuple("Rejected")
+                .field(&crate::ReadResponse::status(response))
+                .finish(),
+            Self::H3(error) => f.debug_tuple("H3").field(error).finish(),
+        }
+    }
+}
+
+/// Perform a CONNECT handshake on an open bidirectional stream. No application
+/// bytes are sent before successful response HEADERS. Cancellation drops both halves.
+/// Extended CONNECT assumes peer support without checking peer SETTINGS.
+/// HTTP rejection returns [`ConnectError::Rejected`] with the complete response.
+pub async fn connect<RS, WS>(
     request: Request<Bytes>,
-    connection: &crate::H3Connection<T>,
-) -> std::result::Result<
-    ConnectOutcome<crate::Tunnel<T::StreamReader, T::StreamWriter>>,
-    ConnectError,
-> {
+    mut ws: H3WriteStream<WS>,
+    rs: H3ReadStream<RS>,
+    qpack: ArcQpack,
+) -> std::result::Result<(http::Response<()>, crate::Tunnel<RS, WS>), ConnectError>
+where
+    RS: AsyncRead + StopSending + Unpin + Send + 'static,
+    WS: AsyncWrite + CancelStream + Unpin + Send + 'static,
+{
     let head = request.message.head.lock().unwrap().clone();
     if head.method != http::Method::CONNECT
         || !request.message.body.lock().unwrap().storage.is_empty()
@@ -272,37 +291,37 @@ pub async fn connect<T: crate::Transport>(
     }
     let mut fields = Vec::new();
     fields.put_request(&head)?;
-    if head.extensions.get::<crate::ext::Protocol>().is_some() {
-        let settings = tokio::select! {
-            settings = connection.peer_settings.received() => settings,
-            error = connection.transport.terminated() => return Err(error.into()),
-        };
-        if settings.get(frame::SETTINGS_ENABLE_CONNECT_PROTOCOL, 0) != 1 {
-            return Err(ConnectError::NotSupported);
-        }
-    }
-    let (mut ws, rs) = connection.open_bi().await?;
-    let qpack = connection.qpack().clone();
     let mut bytes = Vec::new();
     bytes.put_frame(&Frame::new(Headers {
         field_section: qpack.encode(ws.stream_id(), fields)?,
     })?);
-    ws.write_all(&bytes).await.map_err(Error::from)?;
-    ws.flush().await.map_err(Error::from)?;
     let mut recv = rs;
-    let head = read_final_head(&mut recv, &qpack, true).await?;
+    let head = {
+        let sending = async {
+            ws.write_all(&bytes).await?;
+            ws.flush().await
+        };
+        let receiving = read_connect_head(&mut recv, &qpack);
+        tokio::pin!(sending, receiving);
+        tokio::select! {
+            head = &mut receiving => head?,
+            _sent = &mut sending => {
+                // RFC 9114 permits STOP_SENDING alongside a complete response.
+                // A send failure must not discard that independent read direction.
+                receiving.await?
+            }
+        }
+    };
     if head.status()?.is_success() {
         let mut response = http::Response::new(());
         *response.status_mut() = head.status()?;
+        *response.version_mut() = http::Version::HTTP_3;
         *response.headers_mut() = head.headers;
-        Ok(ConnectOutcome::Connected {
-            response,
-            tunnel: crate::Tunnel::new(recv, ws, qpack),
-        })
+        Ok((response, crate::Tunnel::new(recv, ws, qpack)))
     } else {
         let mode = BodyMode::resolve(&head, Some(&http::Method::CONNECT))?;
         let body = body::receive(recv, mode, qpack);
-        Ok(ConnectOutcome::Rejected(common::Response::Streaming(
+        Err(ConnectError::Rejected(common::Response::Streaming(
             ArcMessage::from(Message::from_parts(head, body)).into(),
         )))
     }
@@ -316,8 +335,12 @@ async fn read_response<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
 ) -> Result<crate::common::Response<Read>> {
     let stream_id = rs.stream_id();
     let result = async {
-        let head = read_final_head(&mut rs, &qpack, false).await?;
+        let head = read_head(&mut rs, &qpack).await?;
         let length = headers::content_length(&head.headers)?;
+        if head.status()? == StatusCode::NO_CONTENT && length.is_some() {
+            return Err(ErrorCode::H3_MESSAGE_ERROR
+                .with_reason("204 responses must not include Content-Length"));
+        }
         if method.as_ref() == Some(&http::Method::CONNECT)
             && head.status()?.is_success()
             && length.is_some()

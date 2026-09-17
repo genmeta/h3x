@@ -10,9 +10,7 @@ use std::{
 use bytes::Bytes;
 use h3x::{
     ErrorCode, H3Connection, ReadRequest, ReadResponse, ReadStream, Result, Role, Settings,
-    Transport, WriteBody, WriteRequest, WriteResponse,
-    client::{self, ConnectOutcome},
-    server,
+    Transport, WriteBody, WriteRequest, WriteResponse, client, server,
 };
 use support::{TestStream, TestTransport};
 use tokio::{
@@ -31,6 +29,7 @@ struct MemoryTransport {
     uni_tx: mpsc::UnboundedSender<(u64, R)>,
     uni_rx: Mutex<mpsc::UnboundedReceiver<(u64, R)>>,
     capacity: usize,
+    stopped_flush: Option<Arc<support::StoppedFlush>>,
 }
 impl Transport for MemoryTransport {
     type StreamReader = R;
@@ -43,10 +42,12 @@ impl Transport for MemoryTransport {
         let (a, b) = io::duplex(self.capacity);
         let (ar, aw) = io::split(a);
         let (br, bw) = io::split(b);
-        self.bi_tx
-            .send((id, (TestStream::new(br), TestStream::new(bw))))
-            .unwrap();
-        Ok(Some((id, (TestStream::new(ar), TestStream::new(aw)))))
+        let mut br = TestStream::new(br);
+        let mut aw = TestStream::new(aw);
+        br.stopped_flush = self.stopped_flush.clone();
+        aw.stopped_flush = self.stopped_flush.clone();
+        self.bi_tx.send((id, (br, TestStream::new(bw)))).unwrap();
+        Ok(Some((id, (TestStream::new(ar), aw))))
     }
     async fn accept_bi(&self) -> Result<Bi> {
         tokio::select! { value = async { self.bi_rx.lock().await.recv().await } => Ok(value.unwrap()), error = self.terminated() => Err(error) }
@@ -83,6 +84,7 @@ fn transports(capacity: usize) -> (MemoryTransport, MemoryTransport) {
             uni_tx: bu,
             uni_rx: Mutex::new(aur),
             capacity,
+            stopped_flush: None,
         },
         MemoryTransport {
             base: Default::default(),
@@ -93,6 +95,7 @@ fn transports(capacity: usize) -> (MemoryTransport, MemoryTransport) {
             uni_tx: au,
             uni_rx: Mutex::new(bur),
             capacity,
+            stopped_flush: None,
         },
     )
 }
@@ -103,12 +106,21 @@ async fn pair(capacity: usize) -> (H3Connection<MemoryTransport>, H3Connection<M
         H3Connection::new(b, Settings::default()).await.unwrap(),
     )
 }
+// Stream allocation is separate from the handshake.
+async fn connect(
+    request: client::Request,
+    connection: &H3Connection<MemoryTransport>,
+) -> std::result::Result<(http::Response<()>, h3x::Tunnel<R, W>), client::ConnectError> {
+    let (ws, rs) = connection.open_bi().await?;
+    client::connect(request, ws, rs, connection.qpack().clone()).await
+}
+
 async fn tunnels(
     a: &H3Connection<MemoryTransport>,
     b: &H3Connection<MemoryTransport>,
 ) -> (h3x::Tunnel<R, W>, h3x::Tunnel<R, W>) {
     let (client, server) = tokio::join!(
-        client::connect(
+        connect(
             client::Request::connect("wss://home.example/api/websocket?q=1").unwrap(),
             a
         ),
@@ -140,10 +152,9 @@ async fn tunnels(
             .unwrap()
         }
     );
-    let ConnectOutcome::Connected { response, tunnel } = client.unwrap() else {
-        panic!()
-    };
+    let (response, tunnel) = client.unwrap();
     assert_eq!(response.status(), 200);
+    assert_eq!(response.version(), http::Version::HTTP_3);
     (tunnel, server)
 }
 #[tokio::test]
@@ -186,14 +197,28 @@ async fn tiny_buffers_duplex_flush_half_close_and_bounded_writes() {
 }
 #[tokio::test]
 async fn rejection_preserves_status_headers_and_body() {
-    let (a, b) = pair(3).await;
+    rejection(None).await;
+}
+
+#[tokio::test]
+async fn rejection_survives_stopped_pending_flush() {
+    for code in [ErrorCode::H3_NO_ERROR, ErrorCode::H3_REQUEST_CANCELLED] {
+        tokio::time::timeout(Duration::from_secs(5), rejection(Some(code)))
+            .await
+            .unwrap();
+    }
+}
+
+async fn rejection(stop_code: Option<ErrorCode>) {
+    let (mut a, b) = transports(3);
+    let flush = stop_code.map(|_| Arc::new(support::StoppedFlush::default()));
+    a.stopped_flush = flush.clone();
+    let a = H3Connection::new(a, Settings::default()).await.unwrap();
+    let b = H3Connection::new(b, Settings::default()).await.unwrap();
     let (result, ()) = tokio::join!(
         async {
-            let result =
-                client::connect(client::Request::connect("ws://home.example/").unwrap(), &a)
-                    .await
-                    .unwrap();
-            let ConnectOutcome::Rejected(response) = result else {
+            let result = connect(client::Request::connect("ws://home.example/").unwrap(), &a).await;
+            let Err(client::ConnectError::Rejected(response)) = result else {
                 panic!()
             };
             assert_eq!(response.status(), 403);
@@ -208,6 +233,17 @@ async fn rejection_preserves_status_headers_and_body() {
         async {
             let (ws, mut rs) = b.accept_bi().await.unwrap();
             server::read_request_head(&mut rs, b.qpack()).await.unwrap();
+            if let Some(flush) = &flush {
+                flush.pending.notified().await;
+            }
+            qrecovery::recv::StopSending::stop(
+                &mut rs,
+                stop_code.unwrap_or(ErrorCode::H3_NO_ERROR).as_u64(),
+            );
+            if let Some(flush) = &flush {
+                // Do not publish the response until the client observes the send error.
+                flush.failed.notified().await;
+            }
             drop(rs);
             let mut response = server::Response::default();
             response
@@ -220,77 +256,6 @@ async fn rejection_preserves_status_headers_and_body() {
         }
     );
     let () = result;
-}
-#[tokio::test]
-async fn delayed_settings_wakes_all_connects_and_unsupported_keeps_connection_usable() {
-    use std::{
-        future::Future,
-        task::{Context, Waker},
-    };
-    let (a, b) = transports(1024);
-    let probe = a.base.clone();
-    let a = H3Connection::new(a, Settings::default()).await.unwrap();
-    let mut waiting: Vec<_> = (0..8)
-        .map(|_| {
-            Box::pin(client::connect(
-                client::Request::connect("ws://example.com/").unwrap(),
-                &a,
-            ))
-        })
-        .collect();
-    for future in &mut waiting {
-        assert!(
-            future
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-    }
-    assert!(
-        b.bi_rx.lock().await.try_recv().is_err(),
-        "no stream before SETTINGS"
-    );
-    // A peer implementation that omits ENABLE_CONNECT_PROTOCOL.
-    let (_, mut control) = b.open_uni().await.unwrap().unwrap();
-    control.write_all(&[0, 4, 0]).await.unwrap(); // control stream, empty SETTINGS
-    control.flush().await.unwrap();
-    for future in waiting {
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(1), future)
-                .await
-                .unwrap(),
-            Err(client::ConnectError::NotSupported)
-        ));
-    }
-    let (_ws, _rs) = a.open_bi().await.unwrap();
-    let (_id, (_rs, _ws)) = b.accept_bi().await.unwrap();
-    probe
-        .close("done".into(), ErrorCode::H3_NO_ERROR.as_u64())
-        .unwrap();
-}
-#[tokio::test]
-async fn settings_wait_ends_on_connection_termination() {
-    use std::{
-        future::Future,
-        task::{Context, Waker},
-    };
-    let (a, _b) = transports(1024);
-    let probe = a.base.clone();
-    let a = H3Connection::new(a, Settings::default()).await.unwrap();
-    let mut future = Box::pin(client::connect(
-        client::Request::connect("ws://example.com/").unwrap(),
-        &a,
-    ));
-    assert!(
-        future
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending()
-    );
-    probe
-        .close("closed".into(), ErrorCode::H3_INTERNAL_ERROR.as_u64())
-        .unwrap();
-    assert!(matches!(future.await, Err(client::ConnectError::H3(_))));
 }
 #[tokio::test]
 async fn cancelled_tunnel_does_not_disrupt_http_or_other_tunnels() {
@@ -346,7 +311,7 @@ async fn goaway_keeps_established_tunnels_until_both_directions_finish() {
         // Drain the queued control work without releasing the application streams.
         for _ in 0..20 { tokio::task::yield_now().await; }
         assert!(!ac.is_finished()); assert!(!bc.is_finished());
-        assert!(matches!(client::connect(client::Request::connect("ws://example.com/").unwrap(),&a).await,Err(client::ConnectError::H3(e)) if e.code==ErrorCode::H3_REQUEST_REJECTED));
+        assert!(matches!(connect(client::Request::connect("ws://example.com/").unwrap(),&a).await,Err(client::ConnectError::H3(e)) if e.code==ErrorCode::H3_REQUEST_REJECTED));
         client.write_all(b"last").await.unwrap(); client.finish().await.unwrap();
         let mut bytes=Vec::new(); server.read_to_end(&mut bytes).await.unwrap(); assert_eq!(bytes,b"last");
         assert!(!ac.is_finished());
@@ -394,7 +359,7 @@ async fn cancelling_handshake_releases_both_directions() {
         task::{Context, Waker},
     };
     let (a, b) = pair(1024).await;
-    let mut handshake = Box::pin(client::connect(
+    let mut handshake = Box::pin(connect(
         client::Request::connect("example.com:443").unwrap(),
         &a,
     ));
@@ -424,7 +389,7 @@ async fn cancelling_handshake_releases_both_directions() {
 }
 
 #[tokio::test]
-async fn delayed_enabled_settings_releases_all_handshakes() {
+async fn extended_connect_opens_streams_before_peer_settings() {
     tokio::time::timeout(Duration::from_secs(3), async {
         let (a, b) = transports(1024);
         let a = H3Connection::new(a, Settings::default()).await.unwrap();
@@ -432,13 +397,15 @@ async fn delayed_enabled_settings_releases_all_handshakes() {
         for _ in 0..8 {
             let a = a.clone();
             clients.push(tokio::spawn(async move {
-                client::connect(client::Request::connect("ws://example.com/").unwrap(), &a)
+                connect(client::Request::connect("ws://example.com/").unwrap(), &a)
                     .await
                     .unwrap()
             }));
         }
-        tokio::task::yield_now().await;
-        assert!(b.bi_rx.lock().await.try_recv().is_err());
+        // The peer has not started HTTP/3 or sent SETTINGS yet.
+        while b.bi_rx.lock().await.len() < 8 {
+            tokio::task::yield_now().await;
+        }
         let b = H3Connection::new(b, Settings::default()).await.unwrap();
         let mut servers = Vec::new();
         for _ in 0..8 {
@@ -457,10 +424,7 @@ async fn delayed_enabled_settings_releases_all_handshakes() {
             );
         }
         for task in clients {
-            assert!(matches!(
-                task.await.unwrap(),
-                ConnectOutcome::Connected { .. }
-            ));
+            assert!(task.await.unwrap().0.status().is_success());
         }
     })
     .await
@@ -471,7 +435,7 @@ async fn delayed_enabled_settings_releases_all_handshakes() {
 async fn plain_connect_accepts_any_2xx() {
     let (a, b) = pair(1024).await;
     let (client, server) = tokio::join!(
-        client::connect(client::Request::connect("example.com:443").unwrap(), &a),
+        connect(client::Request::connect("example.com:443").unwrap(), &a),
         async {
             let (ws, mut rs) = b.accept_bi().await.unwrap();
             let head = server::read_request_head(&mut rs, b.qpack()).await.unwrap();
@@ -488,9 +452,7 @@ async fn plain_connect_accepts_any_2xx() {
             .unwrap()
         }
     );
-    assert!(
-        matches!(client.unwrap(),ConnectOutcome::Connected{response,..} if response.status()==201)
-    );
+    assert_eq!(client.unwrap().0.status(), 201);
     drop(server);
 }
 
