@@ -1,139 +1,248 @@
-use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use qrecovery::{recv::StopSending, send::CancelStream};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::{
     Read, Write,
-    body::Body,
-    headers::ResponseHead,
-    message::{
-        ArcMessage, ReadBody, ReadResponse, ReadStream, WriteBody, WriteResponse, WriteStream,
+    body::{Body, ContentType},
+    head,
+    head::ResponseHead,
+    message::{self, Message},
+};
+use crate::{
+    ArcQpack, ArcWndBuf, ErrorCode, Result,
+    protocol::{
+        frame::{self, Frame, FrameType, H3Frame, Headers, Write as _},
+        stream::{H3ReadStream, H3WriteStream},
     },
 };
-use crate::{ArcWndBuf, Result};
 
-pub struct Response<IO, B = Bytes> {
-    pub(crate) message: ArcMessage<ResponseHead, Body<B, IO>>,
+pub struct Response<IO, B> {
+    pub(crate) message: Message<ResponseHead, Body<IO, B>>,
 }
 
-impl<B: Default> Default for Response<Write, B> {
-    fn default() -> Self {
-        Self {
-            message: ArcMessage::default(),
-        }
-    }
-}
-
-/// Cloning shares metadata and body storage.
-impl Clone for Response<Write, ArcWndBuf> {
-    fn clone(&self) -> Self {
-        Self {
-            message: self.message.clone(),
-        }
-    }
-}
-
-impl<IO, B> From<ArcMessage<ResponseHead, Body<B, IO>>> for Response<IO, B> {
-    fn from(message: ArcMessage<ResponseHead, Body<B, IO>>) -> Self {
+impl<IO, B> From<Message<ResponseHead, Body<IO, B>>> for Response<IO, B> {
+    fn from(message: Message<ResponseHead, Body<IO, B>>) -> Self {
         Self { message }
     }
 }
 
-impl ReadBody for Response<Read, Bytes> {
-    fn body(&self) -> Bytes {
-        self.message.body.lock().unwrap().storage.clone()
-    }
-}
-
-impl WriteBody for Response<Write, Bytes> {
-    fn set_body(&mut self, body: Bytes) -> &mut Self {
-        self.message.body.lock().unwrap().storage = body;
-        self
-    }
-}
-
-impl Response<Write, Bytes> {
-    pub fn streaming(self, capacity: usize) -> Response<Write, ArcWndBuf> {
-        self.message
-            .with_body(Body::<ArcWndBuf, Write>::with_capacity(capacity))
-            .into()
-    }
-}
-
-#[async_trait]
-impl ReadStream for Response<Read, ArcWndBuf> {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.message.read(buf).await
-    }
-
-    async fn read_all(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.message.read_all(buf).await
-    }
-
-    async fn stop(self) {
-        self.message.stop().await;
-    }
-}
-
-#[async_trait]
-impl WriteStream for Response<Write, ArcWndBuf> {
-    async fn write<T: AsRef<[u8]> + Send>(&mut self, chunk: T) -> Result<usize> {
-        self.message.write(chunk).await
-    }
-
-    async fn finish(&mut self) -> Result<()> {
-        self.message.finish().await
-    }
-
-    async fn reset(self) -> Result<()> {
-        self.message.reset().await
-    }
-}
-
-impl<B> ReadResponse for Response<Read, B> {
+impl<IO, B> message::ReadResponse for Response<IO, B> {
     fn status(&self) -> StatusCode {
-        ReadResponse::status(&*self.message.head.lock().unwrap())
+        self.message.status()
     }
 
     fn headers(&self) -> HeaderMap {
-        ReadResponse::headers(&*self.message.head.lock().unwrap())
+        self.message.headers()
     }
 }
 
-impl<B> WriteResponse for Response<Write, B> {
+impl<B> message::WriteResponse for Response<Write, B> {
     fn set_status(&mut self, status: StatusCode) -> &mut Self {
-        self.message.head.lock().unwrap().set_status(status);
+        self.message.set_status(status);
         self
     }
 
     fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
-        self.message.head.lock().unwrap().set_header(name, value);
+        self.message.set_header(name, value);
         self
     }
 
     fn append_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
-        self.message.head.lock().unwrap().append_header(name, value);
+        self.message.append_header(name, value);
         self
     }
 }
 
 impl<IO, B: Clone> Response<IO, B> {
     /// Transfer application ownership to a directional body handle.
-    pub fn into_body(self) -> super::body::Body<B, IO> {
+    pub fn into_body(self) -> Body<IO, B> {
         self.message.into_body()
     }
 }
 
-impl<B: Clone> Response<Write, B> {
-    /// Retain a body producer independently of the message being sent.
-    pub fn body(&self) -> super::body::Body<B, Write> {
-        self.message.body()
+/// Construct an outgoing message using the standard HTTP builder and body storage.
+impl<B> From<http::Response<B>> for Response<Write, B> {
+    fn from(message: http::Response<B>) -> Self {
+        let (parts, body) = message.into_parts();
+        Message::from_parts(parts.into(), Body::new(body)).into()
     }
 }
 
-impl Response<Write, Bytes> {
-    /// Attach an application body, retaining this message's headers.
-    pub fn with_body<C>(self, body: super::body::Body<C, Write>) -> Response<Write, C> {
-        self.message.with_body(body).into()
+/// Preserve metadata and body direction when returning to the standard HTTP type.
+impl<IO, B: Clone> From<Response<IO, B>> for http::Response<Body<IO, B>> {
+    fn from(message: Response<IO, B>) -> Self {
+        let head = message.message.head.lock().unwrap().clone();
+        Self::from_parts(head.into(), message.into_body())
+    }
+}
+
+/// Skip unknown extension frames and require the next known frame to be HEADERS.
+async fn be_headers_frame<R: AsyncRead + Unpin + ?Sized>(rs: &mut R) -> Result<Frame<Headers>> {
+    loop {
+        let ty = frame::be_frame_type(rs).await?.ok_or_else(|| {
+            ErrorCode::H3_FRAME_ERROR.reason("response stream ended before response HEADERS")
+        })?;
+        if !matches!(ty, FrameType::Headers | FrameType::Unknown(_)) {
+            return Err(ErrorCode::H3_FRAME_UNEXPECTED
+                .reason("expected response HEADERS before message body"));
+        }
+        let length = frame::be_frame_length(rs).await?;
+        match frame::be_frame_payload(rs, ty, length).await? {
+            H3Frame::Headers(frame) => return Ok(frame),
+            H3Frame::Unknown { length, .. } => {
+                frame::skip_payload(rs, length.into_u64()).await?;
+            }
+            _ => {
+                return Err(ErrorCode::H3_FRAME_UNEXPECTED
+                    .reason("expected response HEADERS before message body"));
+            }
+        }
+    }
+}
+
+/// Validate and encode metadata before sending HEADERS. The caller owns FIN and cleanup.
+pub(crate) trait WriteResponse {
+    async fn write_response_head<B: Clone>(
+        &mut self,
+        response: &Response<Write, B>,
+        qpack: &ArcQpack,
+        method: &http::Method,
+    ) -> Result<ContentType>
+    where
+        Body<Write, B>: Into<super::Body<Write>>;
+
+    async fn write_response_bytes_body(&mut self, response: &Response<Write, Bytes>) -> Result<()>;
+
+    async fn write_response_streaming_body(
+        &mut self,
+        response: &Response<Write, ArcWndBuf>,
+        mode: ContentType,
+    ) -> Result<()>;
+}
+
+impl<B> Response<Write, B> {
+    fn encode_head(
+        &self,
+        stream_id: u64,
+        qpack: &ArcQpack,
+        method: &http::Method,
+    ) -> Result<(Vec<u8>, ContentType)>
+    where
+        B: Clone,
+        Body<Write, B>: Into<super::Body<Write>>,
+    {
+        let head = self.message.head.lock().unwrap();
+        let mode = ContentType::from_response(&head, Some(method))?;
+        if let super::Body::Bytes(body) = self.message.body.lock().unwrap().clone().into() {
+            body.validate(mode)?;
+        }
+        let mut fields = Vec::new();
+        head.encode(&mut fields)?;
+        let headers = Frame::new(Headers {
+            field_section: qpack.encode(stream_id, fields)?,
+        })?;
+        let mut bytes = Vec::new();
+        bytes.put_frame(&headers);
+        Ok((bytes, mode))
+    }
+}
+
+impl<W: AsyncWrite + CancelStream + Unpin> WriteResponse for H3WriteStream<W> {
+    async fn write_response_head<B: Clone>(
+        &mut self,
+        response: &Response<Write, B>,
+        qpack: &ArcQpack,
+        method: &http::Method,
+    ) -> Result<ContentType>
+    where
+        Body<Write, B>: Into<super::Body<Write>>,
+    {
+        let (bytes, mode) = response.encode_head(self.stream_id(), qpack, method)?;
+        self.write_all(&bytes).await?;
+        Ok(mode)
+    }
+
+    async fn write_response_bytes_body(&mut self, response: &Response<Write, Bytes>) -> Result<()> {
+        let body = response.message.body.lock().unwrap().clone();
+        body.encode(self).await
+    }
+
+    async fn write_response_streaming_body(
+        &mut self,
+        response: &Response<Write, ArcWndBuf>,
+        mode: ContentType,
+    ) -> Result<()> {
+        let mut body = response.message.body.lock().unwrap().clone();
+        body.encode(self, mode).await
+    }
+}
+
+pub(crate) trait ReadResponse: Sized {
+    async fn read_response_head(
+        &mut self,
+        qpack: &ArcQpack,
+        method: Option<&http::Method>,
+    ) -> Result<(head::ResponseHead, ContentType)>;
+
+    fn read_response_body(
+        self,
+        head: head::ResponseHead,
+        mode: ContentType,
+        qpack: ArcQpack,
+    ) -> super::Response<Read>;
+
+    async fn read_response(
+        self,
+        qpack: ArcQpack,
+        method: Option<http::Method>,
+    ) -> Result<super::Response<Read>>;
+}
+
+impl<R: AsyncRead + StopSending + Unpin + Send + 'static> ReadResponse for H3ReadStream<R> {
+    async fn read_response_head(
+        &mut self,
+        qpack: &ArcQpack,
+        method: Option<&http::Method>,
+    ) -> Result<(head::ResponseHead, ContentType)> {
+        let stream_id = self.stream_id();
+        let result = async {
+            loop {
+                let frame = be_headers_frame(self).await?;
+                let fields = qpack.decode(stream_id, frame.payload.field_section).await?;
+                let head = head::ResponseHead::decode(fields)?;
+                let status = head.response_status()?;
+                let mode = ContentType::from_received_response(&head, method)?;
+                if status.is_informational() {
+                    continue;
+                }
+                return Ok((head, mode));
+            }
+        }
+        .await;
+        if let Err(error) = &result {
+            crate::error::receive_error(self, qpack, error);
+        }
+        result
+    }
+
+    fn read_response_body(
+        self,
+        head: head::ResponseHead,
+        mode: ContentType,
+        qpack: ArcQpack,
+    ) -> super::Response<Read> {
+        let body = Body::<Read, ArcWndBuf>::receive(self, mode, qpack);
+        super::Response::Streaming(Message::from_parts(head, body).into())
+    }
+
+    async fn read_response(
+        mut self,
+        qpack: ArcQpack,
+        method: Option<http::Method>,
+    ) -> Result<super::Response<Read>> {
+        let (head, mode) = self.read_response_head(&qpack, method.as_ref()).await?;
+        Ok(self.read_response_body(head, mode, qpack))
     }
 }

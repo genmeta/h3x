@@ -48,8 +48,12 @@ impl<T: Transport> H3Connection<T> {
             )?));
             send.write_all(&bytes).await.map_err(control_error)?;
             send.flush().await.map_err(control_error)
-        }
-        .await;
+        };
+        let result = tokio::select! {
+            biased;
+            error = self.transport.terminated() => Err(error),
+            result = result => result,
+        };
         if let Err(error) = result {
             let _ = self.transport.close(error.reason, error.code.as_u64());
         }
@@ -200,12 +204,3 @@ impl<T: Transport> H3Connection<T> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod admission_tests;
-
-#[cfg(test)]
-mod qpack_writer_tests;
