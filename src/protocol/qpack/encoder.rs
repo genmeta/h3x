@@ -60,7 +60,6 @@ mod tests {
         future::Future,
         io,
         pin::Pin,
-        sync::{Arc, Mutex},
         task::{Context, Poll, Waker},
     };
 
@@ -69,11 +68,10 @@ mod tests {
     use super::*;
     use crate::protocol::qpack::{ArcQpack, Qpack};
     fn shared(encoder: Encoder) -> ArcQpack {
-        ArcQpack(Arc::new(Mutex::new(Ok(Qpack {
+        ArcQpack::from(Qpack {
             encoder,
             decoder: super::super::decoder::Decoder::new(Settings::default(), 0, u64::MAX).unwrap(),
-            on_failure: None,
-        }))))
+        })
     }
     fn feedback(qpack: &ArcQpack, instruction: DecoderInstruction) -> Result<()> {
         qpack

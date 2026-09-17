@@ -138,8 +138,7 @@ async fn qpack_failure_interrupts_pending_open_and_write_in_both_directions() {
             base: TestTransport::default(),
             stream_type,
         });
-        let (qpack, _encoder_rx, _decoder_rx) =
-            crate::protocol::qpack::ArcQpack::new(&Default::default(), transport.clone()).unwrap();
+        let qpack = crate::protocol::qpack::ArcQpack::new(&Default::default()).unwrap();
         let (encoder_tx, encoder_rx) = tokio::sync::mpsc::channel(1);
         let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn({
@@ -147,9 +146,9 @@ async fn qpack_failure_interrupts_pending_open_and_write_in_both_directions() {
             let transport = transport.clone();
             async move {
                 if encoder {
-                    qpack.sync_encoder(transport, encoder_rx).await
+                    crate::protocol::connection::sync_encoder(&qpack, transport, encoder_rx).await
                 } else {
-                    qpack.sync_decoder(transport, decoder_rx).await
+                    crate::protocol::connection::sync_decoder(&qpack, transport, decoder_rx).await
                 }
             }
         });

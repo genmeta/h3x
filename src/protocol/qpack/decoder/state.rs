@@ -244,14 +244,10 @@ mod tests {
         drop(tx);
         let mut wire = Vec::new();
         assert_eq!(
-            (ArcQpack::new(
-                &crate::Settings::default(),
-                Arc::new(crate::test_support::TestTransport::default()),
-            )
-            .unwrap()
-            .0
-            .write_decoder(rx, &mut wire)
-            .await)
+            (ArcQpack::new(&crate::Settings::default())
+                .unwrap()
+                .write_decoder(rx, &mut wire)
+                .await)
                 .map_err(ErrorCode::from),
             Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM),
         );
@@ -828,11 +824,7 @@ mod tests {
             let (decoder, feedback_source) =
                 Decoder::with_channel(local, max_blocked_bytes, 64 * 1024)?;
             Ok(Self {
-                qpack: ArcQpack(Arc::new(Mutex::new(Ok(Qpack {
-                    encoder,
-                    decoder,
-                    on_failure: None,
-                })))),
+                qpack: ArcQpack::from(Qpack { encoder, decoder }),
                 instructions: Mutex::new(instruction_source),
                 feedback: Mutex::new(feedback_source),
             })

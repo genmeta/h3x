@@ -255,3 +255,42 @@ async fn stream_task_errors_close_before_dropping_receivers() {
         assert!(!probe.dropped_before_close.load(Ordering::SeqCst));
     }
 }
+
+#[tokio::test]
+async fn qpack_failure_closes_connection_and_cancels_pending_receivers() {
+    for fail_before_tasks_start in [true, false] {
+        let prefixes = [&[0x40][..], &[0][..], &[2][..], &[3][..]];
+        let (connection, probe, _peers) = setup(&prefixes).await;
+        if !fail_before_tasks_start {
+            bounded(async {
+                while probe.read_tasks.lock().unwrap().len() != prefixes.len() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+        }
+        let error = ErrorCode::H3_INTERNAL_ERROR.with_reason("QPACK failed independently of I/O");
+        connection.qpack().on_error(error.clone());
+        bounded(async {
+            while probe.closed.lock().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert_eq!(*probe.closed.lock().unwrap(), Some(error.clone()));
+        assert_eq!(
+            connection
+                .qpack()
+                .on_error(ErrorCode::H3_EXCESSIVE_LOAD.with_reason("later error")),
+            error
+        );
+        drop(connection);
+        bounded(async {
+            while probe.live.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(!probe.dropped_before_close.load(Ordering::SeqCst));
+    }
+}

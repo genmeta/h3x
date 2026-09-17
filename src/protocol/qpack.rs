@@ -71,11 +71,22 @@ pub(crate) fn limits(settings: &frame::Settings) -> (Settings, u64) {
 pub struct Qpack {
     pub(super) encoder: Encoder,
     pub(super) decoder: Decoder,
-    on_failure: Option<Box<dyn FnOnce(Error) + Send>>,
 }
 
 #[derive(Clone)]
-pub struct ArcQpack(Arc<Mutex<Result<Qpack>>>);
+pub struct ArcQpack(
+    Arc<Mutex<Result<Qpack>>>,
+    tokio::sync::watch::Sender<Option<Error>>,
+);
+
+impl From<Qpack> for ArcQpack {
+    fn from(qpack: Qpack) -> Self {
+        Self(
+            Arc::new(Mutex::new(Ok(qpack))),
+            tokio::sync::watch::channel(None).0,
+        )
+    }
+}
 
 impl std::ops::Deref for ArcQpack {
     type Target = Mutex<Result<Qpack>>;
@@ -101,34 +112,28 @@ impl ArcQpack {
         })
     }
 
-    /// Construct compression state with instruction queues and connection shutdown wired in.
-    pub(super) fn new<T: crate::Transport>(
-        settings: &super::connection::Settings,
-        transport: Arc<T>,
-    ) -> Result<(Self, encoder::Instructions, decoder::Instructions)> {
+    /// Construct compression state. Register instruction callbacks before use.
+    pub(super) fn new(settings: &super::connection::Settings) -> Result<Self> {
         let (local, max_fields) = limits(&settings.0);
-        let mut encoder = Encoder::new(Settings::default())?;
-        let mut decoder = Decoder::new(local, MAX_BLOCKED_FIELD_SECTION_BYTES, max_fields)?;
-        let (encoder_tx, encoder_rx) = tokio::sync::mpsc::channel(MAX_PENDING_INSTRUCTION);
-        let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(MAX_PENDING_INSTRUCTION);
-        encoder.on_instruction(move |batch| {
-            encoder_tx.try_send(batch).map_err(instruction_send_error)
-        });
-        decoder.on_instruction(move |batch| {
-            decoder_tx.try_send(batch).map_err(instruction_send_error)
-        });
-        Ok((
-            Self(Arc::new(Mutex::new(Ok(Qpack {
-                encoder,
-                decoder,
-                on_failure: Some(Box::new(move |error| {
-                    let _ = transport.close(error.reason, error.code.as_u64());
-                })),
-            })))),
-            encoder_rx,
-            decoder_rx,
-        ))
+        Ok(Qpack {
+            encoder: Encoder::new(Settings::default())?,
+            decoder: Decoder::new(local, MAX_BLOCKED_FIELD_SECTION_BYTES, max_fields)?,
+        }
+        .into())
     }
+
+    /// Observe the first failure, including failures before subscription.
+    pub(crate) async fn failed(&self) -> Error {
+        let mut failure = self.1.subscribe();
+        failure
+            .wait_for(Option::is_some)
+            .await
+            .expect("QPACK retains the failure sender")
+            .as_ref()
+            .unwrap()
+            .clone()
+    }
+
     pub(crate) fn configure(&self, peer: Settings, max_fields: u64) -> Result<()> {
         self.with_state(|state| state.encoder.configure(peer, max_fields))
     }
@@ -146,10 +151,7 @@ impl ArcQpack {
             qpack
         };
         let wakes = qpack.decoder.take_waiters();
-        // Closing the transport also interrupts pending stream creation and I/O.
-        if let Some(on_failure) = qpack.on_failure.take() {
-            on_failure(error.clone());
-        }
+        self.1.send_replace(Some(error.clone()));
         // Releasing callbacks closes the instruction queues. Wake outside the shared lock.
         drop(qpack);
         for wake in wakes {
@@ -203,7 +205,6 @@ impl ArcQpack {
         recv: &mut R,
     ) -> Result<()> {
         loop {
-            self.with_state(|_| Ok(()))?;
             let instruction = codec::instruction::be_encoder_instruction(recv).await?;
             let wakes =
                 self.with_state(|state| state.decoder.on_encoder_instruction(instruction))?;
@@ -218,7 +219,6 @@ impl ArcQpack {
         recv: &mut R,
     ) -> Result<()> {
         loop {
-            self.with_state(|_| Ok(()))?;
             let instruction = codec::instruction::be_decoder_instruction(recv).await?;
             self.with_state(|state| state.encoder.on_decoder_instruction(instruction))?;
         }
@@ -229,14 +229,12 @@ impl ArcQpack {
         mut instructions: encoder::Instructions,
         writer: &mut W,
     ) -> Result<()> {
-        self.with_state(|_| Ok(()))?;
         writer
             .write_all(&[StreamType::QpackEncoder as u8])
             .await
             .map_err(|error| crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM))?;
         let mut buf = Vec::new();
         while let Some(batch) = instructions.recv().await {
-            self.with_state(|_| Ok(()))?;
             for instruction in batch {
                 buf.clear();
                 buf.put_encoder_instruction(&instruction)?;
@@ -259,14 +257,12 @@ impl ArcQpack {
         mut receiver: decoder::Instructions,
         writer: &mut W,
     ) -> Result<()> {
-        self.with_state(|_| Ok(()))?;
         writer
             .write_all(&[StreamType::QpackDecoder as u8])
             .await
             .map_err(|error| crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM))?;
         let mut buf = Vec::new();
         while let Some(batch) = receiver.recv().await {
-            self.with_state(|_| Ok(()))?;
             for instruction in batch {
                 buf.clear();
                 buf.put_decoder_instruction(&instruction)?;
@@ -276,42 +272,6 @@ impl ArcQpack {
             }
         }
         Err(self.critical_stream_error())
-    }
-
-    pub(crate) async fn sync_encoder<T: crate::Transport>(
-        &self,
-        transport: Arc<T>,
-        instructions: encoder::Instructions,
-    ) -> Result<()> {
-        tokio::select! {
-            biased;
-            error = transport.terminated() => Err(error),
-            result = async {
-                let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
-                    ErrorCode::H3_STREAM_CREATION_ERROR.with_reason("unable to create the required stream")
-                })?;
-                self.write_encoder(instructions, &mut send).await
-            } => result,
-        }
-        .map_err(|error| self.on_error(error))
-    }
-
-    pub(crate) async fn sync_decoder<T: crate::Transport>(
-        &self,
-        transport: Arc<T>,
-        instructions: decoder::Instructions,
-    ) -> Result<()> {
-        tokio::select! {
-            biased;
-            error = transport.terminated() => Err(error),
-            result = async {
-                let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
-                    ErrorCode::H3_STREAM_CREATION_ERROR.with_reason("unable to create the required stream")
-                })?;
-                self.write_decoder(instructions, &mut send).await
-            } => result,
-        }
-        .map_err(|error| self.on_error(error))
     }
 }
 
@@ -364,8 +324,7 @@ pub(crate) mod tests {
 
         for encoder in [true, false] {
             let transport = Arc::new(TestTransport::default());
-            let (qpack, _encoder_rx, _decoder_rx) =
-                ArcQpack::new(&crate::Settings::default(), transport.clone()).unwrap();
+            let qpack = ArcQpack::new(&crate::Settings::default()).unwrap();
             let error = ErrorCode::H3_NO_ERROR.with_reason("peer closed the connection");
             let (encoder_tx, encoder_rx) = tokio::sync::mpsc::channel(1);
             let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(1);
@@ -374,9 +333,11 @@ pub(crate) mod tests {
                 let transport = transport.clone();
                 async move {
                     if encoder {
-                        qpack.sync_encoder(transport, encoder_rx).await
+                        crate::protocol::connection::sync_encoder(&qpack, transport, encoder_rx)
+                            .await
                     } else {
-                        qpack.sync_decoder(transport, decoder_rx).await
+                        crate::protocol::connection::sync_decoder(&qpack, transport, decoder_rx)
+                            .await
                     }
                 }
             });
@@ -401,8 +362,7 @@ pub(crate) mod tests {
 
         for encoder in [true, false] {
             let transport = Arc::new(TestTransport::default());
-            let (qpack, _encoder_rx, _decoder_rx) =
-                ArcQpack::new(&crate::Settings::default(), transport.clone()).unwrap();
+            let qpack = ArcQpack::new(&crate::Settings::default()).unwrap();
             let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("invalid field section");
             let (encoder_tx, encoder_rx) = tokio::sync::mpsc::channel(1);
             let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(1);
@@ -411,9 +371,11 @@ pub(crate) mod tests {
                 let transport = transport.clone();
                 async move {
                     if encoder {
-                        qpack.sync_encoder(transport, encoder_rx).await
+                        crate::protocol::connection::sync_encoder(&qpack, transport, encoder_rx)
+                            .await
                     } else {
-                        qpack.sync_decoder(transport, decoder_rx).await
+                        crate::protocol::connection::sync_decoder(&qpack, transport, decoder_rx)
+                            .await
                     }
                 }
             });
@@ -432,24 +394,32 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn qpack_failure_closes_transport_without_sync_tasks() {
-        use crate::{Transport, test_support::TestTransport};
-
-        let transport = Arc::new(TestTransport::default());
-        let (qpack, _encoder_rx, _decoder_rx) =
-            ArcQpack::new(&crate::Settings::default(), transport.clone()).unwrap();
+    async fn failure_notifies_all_waiters_and_late_subscribers() {
+        let qpack = ArcQpack::new(&crate::Settings::default()).unwrap();
+        let first = tokio::spawn({
+            let qpack = qpack.clone();
+            async move { qpack.failed().await }
+        });
+        let second = tokio::spawn({
+            let qpack = qpack.clone();
+            async move { qpack.failed().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
         let error = ErrorCode::QPACK_DECOMPRESSION_FAILED.with_reason("invalid field section");
         assert_eq!(qpack.on_error(error.clone()), error);
         assert_eq!(
             qpack.on_error(ErrorCode::H3_INTERNAL_ERROR.with_reason("later failure")),
             error
         );
-        assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), transport.terminated())
-                .await
-                .unwrap(),
-            error
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            assert_eq!(first.await.unwrap(), error);
+            assert_eq!(second.await.unwrap(), error);
+            assert_eq!(qpack.failed().await, error);
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -546,21 +516,26 @@ pub(crate) mod tests {
 
     #[test]
     fn construction_does_not_require_a_runtime() {
-        let (qpack, _encoder_rx, _decoder_rx) = ArcQpack::new(
-            &crate::Settings::default(),
-            Arc::new(crate::test_support::TestTransport::default()),
-        )
-        .unwrap();
+        let qpack = ArcQpack::new(&crate::Settings::default()).unwrap();
         assert!(qpack.encode(0, Vec::new()).is_ok());
     }
 
     #[tokio::test]
     async fn on_error_wakes_both_instruction_writers_and_blocked_decode_with_first_error() {
-        let (qpack, encoder_rx, decoder_rx) = ArcQpack::new(
-            &crate::Settings::new(1024, 128, 1).unwrap(),
-            Arc::new(crate::test_support::TestTransport::default()),
-        )
-        .unwrap();
+        let qpack = ArcQpack::new(&crate::Settings::new(1024, 128, 1).unwrap()).unwrap();
+        let (encoder_tx, encoder_rx) = tokio::sync::mpsc::channel(MAX_PENDING_INSTRUCTION);
+        let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(MAX_PENDING_INSTRUCTION);
+        qpack
+            .with_state(|state| {
+                state.encoder.on_instruction(move |batch| {
+                    encoder_tx.try_send(batch).map_err(instruction_send_error)
+                });
+                state.decoder.on_instruction(move |batch| {
+                    decoder_tx.try_send(batch).map_err(instruction_send_error)
+                });
+                Ok(())
+            })
+            .unwrap();
         let encoding = tokio::spawn({
             let qpack = qpack.clone();
             async move {

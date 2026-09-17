@@ -281,7 +281,7 @@ async fn goaway_waits_for_admitted_streams_after_peer_goaway() {
     connection
         .cursor
         .receive_goaway(StreamId::new(Role::Client, Dir::Bi, 1));
-    connection.cursor.local_goaway().unwrap();
+    connection.cursor.local_goaway();
     tokio::task::yield_now().await;
     let mut closing = Box::pin(connection.clone().goaway());
     let mut cx = Context::from_waker(Waker::noop());

@@ -58,13 +58,8 @@ impl<T: Transport> H3Connection<T> {
     }
 
     pub(super) async fn send_goaway(&self) -> Result<()> {
-        let id = self.cursor.local_goaway()?;
-        let mut send = self.cursor.control_stream.lock().await;
-        if let super::stream_cursor::Cursor::Closed(error) =
-            self.cursor.local.lock().unwrap().clone()
-        {
-            return Err(error);
-        }
+        let id = self.cursor.local_goaway();
+        let mut send = self.control_stream.lock().await;
         let mut bytes = Vec::new();
         bytes.put_control(&Control::Goaway(Frame::new(frame::Goaway {
             id: id.into(),
@@ -78,6 +73,7 @@ impl<T: Transport> H3Connection<T> {
         let error = loop {
             tokio::select! {
                 biased;
+                error = self.qpack.failed() => break error,
                 error = self.transport.terminated() => break error,
                 accepted = self.transport.accept_uni() => match accepted {
                     Ok((_, recv)) => {
@@ -90,6 +86,10 @@ impl<T: Transport> H3Connection<T> {
                 },
             }
         };
+        let error = self.qpack.on_error(error);
+        let _ = self
+            .transport
+            .close(error.reason.clone(), error.code.as_u64());
         self.on_terminated(error);
     }
 
@@ -119,10 +119,15 @@ impl<T: Transport> H3Connection<T> {
                 StreamType::QpackDecoder => self.qpack.receive_decoder(&mut recv).await,
             }
         };
-        // Transport termination wakes the pending read with its I/O error.
-        let result = result.await;
+        let result = tokio::select! {
+            biased;
+            error = self.qpack.failed() => Err(error),
+            error = self.transport.terminated() => Err(error),
+            result = result => result,
+        };
         // Retain the half until failure handling completes, including transport close.
         if let Err(error) = result {
+            let error = self.qpack.on_error(error);
             let _ = self.transport.close(error.reason, error.code.as_u64());
         }
     }
@@ -130,7 +135,6 @@ impl<T: Transport> H3Connection<T> {
     /// Apply the transport terminal reason and wake all H3-level waiters.
     pub(crate) fn on_terminated(&self, error: Error) {
         let error = self.qpack.on_error(error);
-        self.cursor.close(error.clone());
         self.bi_streams.close(error);
     }
 }
