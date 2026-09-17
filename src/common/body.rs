@@ -218,7 +218,7 @@ impl BodyMode {
                 ErrorCode::H3_MESSAGE_ERROR.reason("204 response must not include Content-Length")
             );
         }
-        let content_length = head::content_length(&response.headers)?;
+        let content_length = response.content_length()?;
         Ok(Self::from_parts(status, method, content_length))
     }
 
@@ -311,7 +311,7 @@ pub(crate) async fn read_body<R: AsyncRead + StopSending + Unpin, W: AsyncWrite 
                         frame.payload.field_section,
                     )
                     .await?;
-                head::be_trailers(fields)?;
+                head::Trailers::decode(fields)?;
                 trailers = true;
             }
             H3Frame::Unknown { length, .. } => {

@@ -52,7 +52,7 @@ pub fn read_request_body<RS: AsyncRead + StopSending + Unpin + Send + 'static>(
 }
 
 fn request_body_mode(head: &head::RequestHead) -> Result<BodyMode> {
-    let length = head::content_length(&head.headers)?;
+    let length = head.content_length()?;
     Ok(if head.request_method() == Method::CONNECT {
         if length.is_some() {
             return Err(

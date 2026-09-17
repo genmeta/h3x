@@ -68,7 +68,7 @@ impl RequestHead {
         } else {
             uri
         };
-        Self::from_request_parts(method, uri, headers, protocol)
+        Ok(Self::from_request_parts(method, uri, headers, protocol))
     }
 }
 

@@ -88,7 +88,10 @@ where
         let mut fields = Vec::new();
         //TODO: encode_head
         fields.put_request(&head)?;
-        if head::content_length(&head.headers)?.is_some_and(|length| length != body.len() as u64) {
+        if head
+            .content_length()?
+            .is_some_and(|length| length != body.len() as u64)
+        {
             return Err(ErrorCode::H3_MESSAGE_ERROR
                 .reason("request body length does not match Content-Length"));
         }
@@ -132,7 +135,7 @@ where
         }
         let mut fields = Vec::new();
         fields.put_request(&head)?;
-        let mode = match head::content_length(&head.headers)? {
+        let mode = match head.content_length()? {
             Some(content_length) => BodyMode::Length { content_length },
             None => BodyMode::UnspecifiedLength,
         };
@@ -221,7 +224,7 @@ async fn read_final_response_head<RS: AsyncRead + StopSending + Unpin>(
             if status.is_informational() {
                 continue;
             }
-            let length = head::content_length(&head.headers)?;
+            let length = head.content_length()?;
             let mode = BodyMode::from_parts(status, method, length);
             return Ok((head, mode));
         }
