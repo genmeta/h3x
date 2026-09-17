@@ -85,7 +85,6 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
     /// Wait for the fixed set after both GOAWAY directions froze admission.
     /// The connection must freeze admission before calling this method.
     /// Completion is determined from the direction states.
-    // TODO: Connect direction completion to the shared drain notification.
     pub(crate) async fn drained(&self) {
         let running: Vec<_> = self.streams.lock().unwrap().values().cloned().collect();
         loop {
@@ -142,8 +141,8 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
         send: W,
     ) -> Result<(H3WriteStream<W>, H3ReadStream<R>)> {
         self.cleanup();
-        let read = H3ReadStream::new(id, recv);
-        let write = H3WriteStream::new(id, send);
+        let read = H3ReadStream::new_observed(id, recv, self.drain_notify.clone());
+        let write = H3WriteStream::new_observed(id, send, self.drain_notify.clone());
         let stream = Arc::new(BiStream {
             id,
             read: Arc::downgrade(&read.state),

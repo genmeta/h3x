@@ -99,21 +99,18 @@ impl<T: Transport> H3Connection<T> {
         H3ReadStream<T::StreamReader>,
     )> {
         self.cursor.remote.lock().unwrap().not_goaway()?;
-        {
-            // TODDO: 原子处理这两行
-            let (id, (mut recv, mut send)) = self.transport.open_bi().await?.ok_or_else(|| {
-                ErrorCode::H3_STREAM_CREATION_ERROR
-                    .reason("transport cannot open a bidirectional stream")
-            })?;
-            // Keep admission and registration atomic with respect to peer GOAWAY.
-            // let cursor_remote = self.cursor.remote.lock().unwrap();
-            // if let Err(error) = cursor_remote.not_goaway() {
-            //     recv.stop(error.code.as_u64());
-            //     send.cancel(error.code.as_u64());
-            //     return Err(error);
-            // }
-            self.bi_streams.insert(id, recv, send)
+        let (id, (mut recv, mut send)) = self.transport.open_bi().await?.ok_or_else(|| {
+            ErrorCode::H3_STREAM_CREATION_ERROR
+                .reason("transport cannot open a bidirectional stream")
+        })?;
+        // Keep admission and registration atomic with respect to peer GOAWAY.
+        let cursor_remote = self.cursor.remote.lock().unwrap();
+        if let Err(error) = cursor_remote.not_goaway() {
+            recv.stop(ErrorCode::H3_REQUEST_REJECTED.as_u64());
+            send.cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64());
+            return Err(error);
         }
+        self.bi_streams.insert(id, recv, send)
     }
 
     /// Exchange GOAWAY and wait for admitted requests before closing the transport.

@@ -27,8 +27,8 @@ Read and write handles own only their direction's state:
 through weak references. Dropping an application handle cancels its direction;
 connection references cannot keep transport halves alive. Draining waits directly
 on each direction's terminal state. `BiStreams` owns one shared drain notification.
-Direction completion notification is pending implementation; application I/O keeps
-its own waker.
+Every registered direction notifies it when normal I/O, explicit cancellation, or
+handle drop reaches a terminal state; application I/O keeps its own separate waker.
 Each direction stores `Result<H3Stream, Goaway>`: only GOAWAY rejection is retained
 as an HTTP/3 stream error. Other errors are returned directly by transport
 read, write, flush, or shutdown operations without being cached.
