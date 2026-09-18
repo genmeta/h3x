@@ -17,7 +17,13 @@ h3x is an HTTP/3 library implemented for [dquic](https://github.com/genmeta/dqui
 ## Connection Lifecycle
 
 Construct `H3Connection<T>` inside a Tokio runtime. Connection initialization starts
-the unidirectional stream accept task and the control and QPACK writers.
+the unidirectional stream accept task and control and QPACK writers.
+`control.sync_control_with(...)` opens and owns the local control stream, writes SETTINGS, then
+waits for the local admission boundary to freeze, then writes GOAWAY once.
+`Control` holds only local and peer settings. The stream view notifies shutdown
+waiters of the actual write result separately from freezing. The uni dispatcher calls
+`receive_control` with the peer reader and callbacks. Admission boundaries and
+stream registration remain protected by the same `BiStreams` lock.
 `accept_bi().await` directly accepts and registers a peer bidirectional stream,
 returning `(write, read)`. Applications drive request acceptance; there is no
 background bidirectional stream queue.
@@ -39,14 +45,15 @@ on the underlying transport's `Drop` implementation.
 
 Client request operations take `connection.qpack().clone()` and depend only on
 compression state. `connection.qpack()` exposes that state as `Qpack`, which has
-no transport dependency. Connection initialization explicitly starts both
+no stored transport dependency. Connection initialization explicitly starts both
 QPACK writers; the connection owns critical-stream failures and transport termination.
 Local encoding errors, including oversized fields, fail only the current operation.
 
 `goaway(self).await` stops accepting peer requests on every clone, writes the
 local GOAWAY, waits for the peer GOAWAY and admitted requests to finish, then
 closes QUIC with `H3_NO_ERROR` and applies the terminal state to H3 waiters.
-Await `goaway()` to completion: cancelling it during a GOAWAY write is not safe.
+Calling `goaway()` freezes admission immediately. Once frozen, GOAWAY sending continues in
+the control task if the caller is cancelled; await shutdown to finish draining.
 Pool-managed draining continues independently of shutdown waiters. Control and
 QPACK remain available during draining. On a connection managed directly by the
 application, receiving a peer GOAWAY only updates the peer boundary and rejects

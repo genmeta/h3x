@@ -94,6 +94,52 @@ impl std::ops::Deref for ArcQpack {
 }
 
 impl ArcQpack {
+    pub(super) async fn sync_encoder_with<T: crate::Transport>(
+        &self,
+        transport: Arc<T>,
+        instructions: encoder::Instructions,
+    ) -> Result<()> {
+        tokio::select! {
+        biased;
+        error = self.failed() => Err(error),
+        error = transport.terminated() => Err(error),
+        result = async {
+            let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
+                ErrorCode::H3_STREAM_CREATION_ERROR.reason("unable to create the required stream")
+            })?;
+            self.write_encoder(instructions, &mut send).await
+        } => result,
+    }
+    .map_err(|error| {
+        let error = self.on_error(error);
+        let _ = transport.close(error.reason.clone(), error.code.as_u64());
+        error
+    })
+    }
+
+    pub(super) async fn sync_decoder_with<T: crate::Transport>(
+        &self,
+        transport: Arc<T>,
+        instructions: decoder::Instructions,
+    ) -> Result<()> {
+        tokio::select! {
+        biased;
+        error = self.failed() => Err(error),
+        error = transport.terminated() => Err(error),
+        result = async {
+            let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
+                ErrorCode::H3_STREAM_CREATION_ERROR.reason("unable to create the required stream")
+            })?;
+            self.write_decoder(instructions, &mut send).await
+        } => result,
+    }
+    .map_err(|error| {
+        let error = self.on_error(error);
+        let _ = transport.close(error.reason.clone(), error.code.as_u64());
+        error
+    })
+    }
+
     /// Run a synchronous operation while holding the shared state lock.
     pub(super) fn with_state<T>(&self, f: impl FnOnce(&mut Qpack) -> Result<T>) -> Result<T> {
         let mut shared = self.lock().unwrap();

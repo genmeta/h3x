@@ -1,5 +1,6 @@
 pub(crate) mod bi;
 pub(crate) mod read;
+pub(crate) mod view;
 pub(crate) mod write;
 
 use std::{
@@ -70,6 +71,7 @@ pub(crate) fn goaway<T>(
         w
     }
 }
+
 pub(crate) fn finish<T>(s: &mut Result<H3Stream<T>, Goaway>) {
     if let Ok(stream) = s {
         *stream = match mem::replace(stream, H3Stream::Transition) {
@@ -80,6 +82,7 @@ pub(crate) fn finish<T>(s: &mut Result<H3Stream<T>, Goaway>) {
         };
     }
 }
+
 pub(crate) fn poll_io<T: Unpin, O>(
     s: &mut Result<H3Stream<T>, Goaway>,
     cx: &mut Context<'_>,

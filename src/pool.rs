@@ -330,14 +330,14 @@ where
             return false;
         };
         // Removing the entry under the pool lock retires each generation once.
-        connection.cursor.local_goaway();
+        let draining = connection.clone().goaway();
         tokio::spawn({
             let connection = connection.clone();
             async move {
                 tokio::select! {
                     biased;
                     _ = connection.transport.terminated() => {},
-                    result = connection.clone().goaway() => {
+                    result = draining => {
                         if let Err(error) = result {
                             let _ = connection.transport.close(error.reason, error.code.as_u64());
                         }
