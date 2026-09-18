@@ -17,18 +17,25 @@ h3x is an HTTP/3 library implemented for [dquic](https://github.com/genmeta/dqui
 ## Connection Lifecycle
 
 Construct `H3Connection<T>` inside a Tokio runtime. Connection initialization starts
-the unidirectional stream accept task and the control and QPACK writers.
+the unidirectional stream accept task and control and QPACK writers.
+`control.sync_control_with(...)` opens and owns the local control stream, writes SETTINGS, then
+waits for the local admission boundary to freeze, then writes GOAWAY once.
+`Control` holds only local and peer settings. The stream view notifies shutdown
+waiters of the actual write result separately from freezing. The uni dispatcher calls
+`receive_control` with the peer reader and callbacks. Admission boundaries and
+stream registration remain protected by the same `BiStreams` lock.
 `accept_bi().await` directly accepts and registers a peer bidirectional stream,
 returning `(write, read)`. Applications drive request acceptance; there is no
 background bidirectional stream queue.
 
 Read and write handles own only their direction's state:
-`H3ReadStream<R>` and `H3WriteStream<W>`. The connection observes those states
-through weak references. Dropping an application handle cancels its direction;
-connection references cannot keep transport halves alive. Draining waits directly
-on each direction's terminal state. `BiStreams` owns one shared drain notification.
-Every registered direction notifies it when normal I/O, explicit cancellation, or
-handle drop reaches a terminal state; application I/O keeps its own separate waker.
+`H3ReadStream<R>` and `H3WriteStream<W>`. The connection stores a registered handle for each direction, sharing its state
+with the application handle. Dropping an application handle cancels its direction
+and removes its registration. Read and write directions are registered independently in `BiStreams` and removed
+immediately by completion callbacks on terminal I/O, cancellation, or handle drop.
+Draining waits until both registries are empty. `BiStreams` owns the drain
+notification; application handles only carry a completion callback and keep
+their own separate I/O waker.
 Each direction stores `Result<H3Stream, Goaway>`: only GOAWAY rejection is retained
 as an HTTP/3 stream error. Other errors are returned directly by transport
 read, write, flush, or shutdown operations without being cached.
@@ -39,18 +46,18 @@ on the underlying transport's `Drop` implementation.
 
 Client request operations take `connection.qpack().clone()` and depend only on
 compression state. `connection.qpack()` exposes that state as `Qpack`, which has
-no transport dependency. Connection initialization explicitly starts both
+no stored transport dependency. Connection initialization explicitly starts both
 QPACK writers; the connection owns critical-stream failures and transport termination.
 Local encoding errors, including oversized fields, fail only the current operation.
 
 `goaway(self).await` stops accepting peer requests on every clone, writes the
 local GOAWAY, waits for the peer GOAWAY and admitted requests to finish, then
 closes QUIC with `H3_NO_ERROR` and applies the terminal state to H3 waiters.
-Await `goaway()` to completion: cancelling it during a GOAWAY write is not safe.
-Pool-managed draining continues independently of shutdown waiters. Control and
-QPACK remain available during draining. On a connection managed directly by the
+Calling `goaway()` freezes admission immediately. Once frozen, GOAWAY sending continues in
+the control task if the caller is cancelled; await shutdown to finish draining.
+Control and QPACK remain available during draining. On a connection managed directly by the
 application, receiving a peer GOAWAY only updates the peer boundary and rejects
-affected requests. A managing `Pool` also retires and drains that connection.
+affected requests. A managing `Pool` removes that connection from reuse.
 
 Peer STOP/reset errors are observed through transport write, flush, or shutdown.
 There is no independent STOP notification input while waiting for body data.
@@ -72,27 +79,22 @@ authentication and ALPN `h3` verification before returning an initialized H3
 connection, and reclaim unreturned resources when cancelled. Do not return a
 connection already managed by another pool.
 
-- `get(&key).await` reuses a connection or merges concurrent calls into one
-  factory execution for that key. Different keys connect independently. Cancelling
-  the first caller cancels the shared build with `PoolError::BuildCancelled`;
-  cancelling another waiter does not affect the build.
-- `remove(&key)` revokes the current build or removes the current connection
-  from reuse and starts GOAWAY. Existing handles can still open streams until peer
-  GOAWAY or transport close. A replacement can connect while older generations
-  drain. Already admitted requests can finish without returning a handle to the pool.
-- Peer GOAWAY, local draining and connection failure trigger automatic retirement.
-  Each retired generation has its own deadline; expiration explicitly closes its
-  transport and waits for H3 cleanup.
-- `shutdown().await` permanently stops allocation and waits for cancelled builds
-  and managed connections to finish cleanup. Cancelling this waiter does not stop
-  shutdown. Dropping the last pool owner immediately closes remaining connections.
+- `get(&key).await` reuses a connection or serializes construction for that key
+  using an asynchronous entry lock. Different keys connect independently.
+  Cancelling or failing construction allows the next waiter to try again.
+- `remove(&key)` removes the entry from reuse without sending GOAWAY or closing
+  the transport. Calls already holding the removed entry may still finish and
+  return its connection; they do not reinsert it or modify a replacement entry.
+- Local GOAWAY automatically removes the entry. The pool does not call `accept_bi`;
+  the component routing peer-initiated streams must own that receive loop and remove
+  the connection after a terminal accept error.
+  Removal is asynchronous; `get` may return the connection before its observer runs.
+  Existing handles and admitted requests remain owned by the application.
+- The pool has no shutdown or draining state. Dropping it releases cached handles
+  without forcibly closing transports; applications manage connection shutdown.
 
-`Pool::with_config(factory, PoolConfig { ... })` configures the whole-factory
-`connect_timeout` (default 10 seconds) and each connection's `drain_timeout`
-(default `Some(30 seconds)`, or `None` for unbounded draining). Build cancellation
-is cooperative: a revoked creator must be polled or dropped before shutdown can
-finish. The pool does not send or automatically retry requests; after `get`, use
-`connection.open_bi().await` and the normal request APIs.
+The factory controls connection timeouts, and `get` returns factory errors directly.
+The pool does not send or automatically retry requests; after `get`, use `connection.open_bi().await` and the normal request APIs.
 
 ## Request and Response I/O
 
@@ -104,21 +106,21 @@ accept a parsed `http::Uri` and `http::Method`; both writer traits support
 `set_header` and `append_header`.
 
 ```rust
-use bytes::Bytes;
-use h3x::{client, server, ReadRequest, ReadResponse, WriteRequest, WriteResponse};
+use h3x::ArcWndBuf;
+use h3x::{Request, Response, ReadRequest, ReadResponse, WriteRequest, WriteResponse};
 
-let mut request: client::Request<Bytes> = http::Request::builder()
+let mut request: Request = http::Request::builder()
     .method(http::Method::POST)
     .uri("https://example.com/upload")
     .version(http::Version::HTTP_3)
-    .body(Bytes::from_static(b"hello"))?
+    .body(ArcWndBuf::new(8192))?
     .into();
 request.set_method(http::Method::PUT);
 assert_eq!(request.method(), http::Method::PUT);
 
-let mut response: server::Response<Bytes> = http::Response::builder()
+let mut response: Response = http::Response::builder()
     .version(http::Version::HTTP_3)
-    .body(Bytes::new())?
+    .body(ArcWndBuf::new(8192))?
     .into();
 response.set_status(http::StatusCode::CREATED);
 assert_eq!(response.status(), http::StatusCode::CREATED);
@@ -127,68 +129,52 @@ assert_eq!(response.status(), http::StatusCode::CREATED);
 
 Use `WndBuf` as the builder's body for streaming messages and retain a clone of
 that buffer for production. Converting back to `http::Request` / `http::Response`
-preserves metadata and returns a directional `Body` handle.
+preserves metadata and the shared `ArcWndBuf` body.
 
-`write_bytes_request` accepts an existing Bytes body; `write_streaming_request`
-accepts a WndBuf body. Both take `(request, write_stream, read_stream, qpack)`,
-and return a `Result<impl Future<Output = Result<Response>>>`. Ordinary uploads
-start in an internal task; CONNECT starts when the response future is polled.
-Ordinary request uploads validate metadata in their upload task before sending
-HEADERS. Response writers and CONNECT handshakes validate when polled.
-Invalid streaming metadata wakes retained producers. The response future carries
-the request method automatically, including HEAD semantics.
-`write_streaming_request` handles CONNECT internally as described below. Ordinary uploads continue independently after an early response or after
-the response future is dropped. Use the body producer's `finish()` or `cancel(code)` to
-terminate a streaming upload.
-Ordinary upload failures cancel the write direction and notify streaming body producers;
-they do not fail the response future. Response reception continues independently,
-so callers should apply a timeout or cancel the response future when appropriate.
-Receiving an ordinary response does not abort upload. CONNECT handshake failures
-notify the producer and fail the response future.
+`ReadMeesage` and `WriteMessage` are the message I/O traits for both requests
+and responses. Both use `ArcWndBuf` for streaming, regardless of
+`Content-Length`. Import the traits and specify the incoming type:
 
-Server entry points are `read_request(rs, qpack)`,
-`write_bytes_response(response, ws, qpack, &method)`, and
-`write_streaming_response(response, ws, qpack, &method)`. Pass `connection.qpack().clone()` as `qpack`. Obtain `method` from the
-original request before consuming it. Both writers finish their transport direction
-only after sending the body. Drive streaming production concurrently with writing.
+```rust,ignore
+use h3x::{IncomingRequest, ReadMeesage, WriteMessage};
 
-`Body<IO, B>` uses the same direction-first parameter order as
-`Request<IO, B>` and `Response<IO, B>`:
+let request: IncomingRequest = rs.read_message(qpack.clone()).await?;
+ws.write_message(response, qpack).await?;
+```
 
-| Storage | Incoming | Outgoing |
-| --- | --- | --- |
-| Bytes | `Body<R, Bytes>`: read and collect | `Body<W, Bytes>`: prepared bytes |
-| Streaming | `Body<R, WndBuf>`: read, collect, stop | `Body<W, WndBuf>`: write, finish, cancel |
+Each write future encodes metadata, sends HEADERS and DATA, and finishes its
+transport direction. Drive writing, streaming production, and response reception
+concurrently. No upload task is started implicitly by `write_message`. Failures
+are returned directly and wake streaming producers with the same error.
 
-Application body handles, content rules, DATA framing, and the receive driver
-live together in `common::body`.
+`Message`, `Request`, and `Response` store an `ArcWndBuf` directly (also
+exported as `WndBuf`). Incoming messages use the same streaming body storage.
 
-Incoming messages expose `into_body()`, with `read`, `collect`, and `stop` operations. Individual
-body variants have direction `R`; incoming body handles cannot write or finish.
+```rust,ignore
+use tokio::io::AsyncReadExt;
 
-`Message<H, Body<IO, B>>` stores its head and body in separate `Arc<Mutex<_>>`
-fields. A body handle owns only its storage, so extracting it releases the message
-headers when no other message owner remains. Sharing a body between messages does
-not share or overwrite their headers. Body stores `B` directly: Bytes clones are
-independent snapshots, while
-WndBuf clones share the buffer using its own synchronization. There is no outer
-lock or application-owner counter. `WndBuf` storage lives in `common::wnd_buf`.
+let mut body: h3x::ArcWndBuf = response.into_body();
+let mut bytes = Vec::new();
+body.read_to_end(&mut bytes).await?;
+```
 
-For incoming WndBuf bodies, a shared receive task starts after headers are parsed.
+ArcWndBuf clones share the buffer.
+Use Tokio's `AsyncReadExt` / `AsyncWriteExt` directly with ArcWndBuf. Call
+`shutdown().await` on the producer to finish production. The polled write future
+drains the buffer and sends FIN. Use `stop(code)` or `cancel(code)` on the window
+to cancel reception or sending. Cloning or dropping a window does not implicitly
+finish or cancel it.
+
+For incoming ArcWndBuf bodies, a receive task starts after headers are parsed.
 A full window pauses network reads; consuming bytes resumes them. Valid transport
-EOF marks the buffer finished, leaving unread bytes available to the application.
-Content-Length alone does not finish reception: trailing frames and EOF are still
-validated. Errors reach waiting readers through the buffer. Calling `stop` cancels
-the task even while it is waiting for network input or space. Dropping a Body does
-not signal EOF or cancellation.
-Incoming bodies are returned as streaming handles after HEADERS, including bodies
-with a known Content-Length.
+EOF finishes the buffer, leaving unread bytes available. Errors reach waiting
+readers through the window, and cancellation wakes the receive task even while
+it is waiting for network input or space.
 
-Dropping the response future does not stop its internal upload task. Use `cancel(code)`
-to cancel an outgoing body and wake blocked operations. A successful producer
-`finish()` means no more data will be supplied; the internal task then drains the
-buffer and finishes the transport direction. Cloning or dropping Body adds no
-implicit finish/cancel/stop behavior.
+All incoming messages return after final HEADERS with an ArcWndBuf body.
+DATA, trailers, and FIN are processed by the receive task; subsequent errors
+are reported when reading the body. Content-Length does not select body storage.
+The sender still checks declared lengths while streaming.
 
 ## Errors
 
@@ -208,8 +194,8 @@ assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
 assert_eq!(Error::from(std::io::Error::from(error.clone())), error);
 ```
 
-Transport adapters return `Error` from `terminated()` and retain the supplied
-close reason. Construct failures with `Error::new(code, reason)` or
+Transport adapters report connection failures through open/accept and stream I/O,
+retaining the supplied close reason. Construct failures with `Error::new(code, reason)` or
 `code.with_reason(reason)`, supplying the context at the point of failure.
 
 ## Server-Initiated Requests
@@ -224,39 +210,25 @@ h3x uses exactly these server-initiated bidirectional streams so that the "serve
 
 Extended CONNECT support is enabled and advertised automatically by both
 `Settings::default()` and `Settings::new(...)`; no opt-in is required.
-The CONNECT response future drives the handshake. No DATA is sent before final
-2xx HEADERS, even if the application has already queued bytes in the body window.
-After acceptance, background tasks send and receive DATA through the same bounded
-buffers used for ordinary streaming HTTP. Extended CONNECT assumes peer support
-without waiting for peer SETTINGS. Dropping a pending handshake cancels both stream
-directions; explicitly cancel the retained body when abandoning the handshake.
-Rejection cancels production and returns the HTTP response, including its status,
-headers, and body.
+For CONNECT, drive `write_message` concurrently with response reception and keep
+the request body window empty until `read_message` returns a successful response.
+The writer flushes HEADERS before waiting for body data. The caller controls
+handshake acceptance, rejection, and cancellation; on rejection cancel the
+retained request body producer. Extended CONNECT assumes peer support without
+waiting for peer SETTINGS.
 
-The server uses `read_request` for both ordinary HTTP and CONNECT, then branches
-on `request.method()`. After routing, authorization, and any upstream handshake,
-use `write_streaming_response` to send a 2xx response and tunnel data. It sends
-and flushes HEADERS before draining the body, and completes when sending ends.
-Drive this future concurrently with body production and request reception.
-Validation and send failures cancel the write direction, wake the producer, and
-are returned by the future. Stop the request body and cancel the retained producer
-when abandoning the exchange.
+The server uses `read_message` for both ordinary HTTP and CONNECT and branches
+on `request.method()`. Send a 2xx response with `write_message` to accept a tunnel,
+passing `Some(Method::CONNECT)` and omitting Content-Length. Drive writing
+concurrently with body production and request reception. Stop the incoming body
+and cancel the retained producer when abandoning an exchange.
 
-`read_request_head` / `read_request_body` remain available for applications that
-need to defer body reception. To reject CONNECT, stop the request body and send a
-non-2xx response with either ordinary response writer. Successful CONNECT responses
-must omit Content-Length.
-
-There is no separate `Tunnel` type. Outgoing `Body<W, WndBuf>` implements Tokio
-`AsyncWrite`. Incoming bodies returned by `request.into_body()` and
-`response.into_body()` implement `AsyncRead` across both storage variants, so they
-can go directly into Tokio copy helpers or application codecs without matching
-`Bytes` versus `Streaming`. Applications can relay the two directions independently
-or combine them for a duplex codec.
-`finish()` / `shutdown()` finish production; the sender drains buffered DATA and
-then sends FIN. `flush()` exposes buffered bytes to the sender without waiting
-for transport delivery. `cancel(code)` cancels sending and `stop(code)` cancels receiving;
-dropping a body alone has no implicit cancellation behavior.
+There is no separate `Tunnel` type. Use `into_body()` to extract the ArcWndBuf. It implements Tokio `AsyncRead` and `AsyncWrite`, so
+the tunnel directions can use Tokio copy helpers or application codecs directly.
+`shutdown()` finishes production; the sender drains buffered DATA and sends FIN.
+`flush()` exposes buffered bytes without waiting for transport delivery.
+`cancel(code)` cancels sending and `stop(code)` cancels receiving; dropping a
+window alone has no implicit cancellation behavior.
 
 CONNECT preserves all DATA payload bytes, including WebSocket masks,
 fragmentation, and negotiated compression. Unknown frames are skipped; trailing
@@ -270,12 +242,14 @@ relay timeouts belong to the proxy/application. No WebSocket message codec is
 included. See [RFC 9220](https://www.rfc-editor.org/rfc/rfc9220.html) and
 [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.4).
 
-Body cancellation uses `qrecovery::recv::StopSending` and
+ArcWndBuf cancellation uses `qrecovery::recv::StopSending` and
 `qrecovery::send::CancelStream`: import the trait and call `stop(code)` on an
 incoming body or `cancel(code)` on an outgoing streaming body. Both are synchronous;
-the background task forwards the supplied code to the transport.
+the background task forwards the supplied code to the transport. Unknown codes
+are mapped to `H3_INTERNAL_ERROR`.
 
 Extended CONNECT stores `:protocol` as an `Arc<str>` in request extensions
 (`http::Request::builder().extension(Arc::<str>::from("websocket"))`).
-That extension type is reserved for `:protocol`; the token is validated when
-encoding and decoding request headers. `ReadRequest::protocol()` returns `Option<Arc<str>>`.
+That extension type is reserved for `:protocol`; the token is stored separately from ordinary fields. `ReadRequest::protocol()` returns `Option<Arc<str>>`.
+For WebSocket CONNECT requests, outgoing `ws://` and `wss://` URIs are normalized
+to the required `http://` and `https://` target schemes respectively.
