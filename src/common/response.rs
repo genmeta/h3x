@@ -207,7 +207,7 @@ impl<R: AsyncRead + StopSending + Unpin + Send + 'static> ReadResponse for H3Rea
         method: Option<&http::Method>,
     ) -> Result<(head::ResponseHead, ContentType)> {
         let stream_id = self.stream_id();
-        let result = async {
+        async {
             loop {
                 let frame = be_headers_frame(self).await?;
                 let fields = qpack.decode(stream_id, frame.payload.field_section).await?;
@@ -220,11 +220,8 @@ impl<R: AsyncRead + StopSending + Unpin + Send + 'static> ReadResponse for H3Rea
                 return Ok((head, mode));
             }
         }
-        .await;
-        if let Err(error) = &result {
-            crate::error::receive_error(self, qpack, error);
-        }
-        result
+        .await
+        .inspect_err(|error| crate::error::receive_error(self, qpack, error))
     }
 
     fn read_response_body(

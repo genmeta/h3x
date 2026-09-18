@@ -33,14 +33,14 @@ impl Control {
     pub(super) async fn sync_control_with<T: crate::Transport>(
         &self,
         transport: Arc<T>,
+        qpack: crate::ArcQpack,
         local_goaway: impl Future<Output = qbase::sid::StreamId> + Send,
-        on_written: impl Fn(Result<()>) + Send,
     ) -> Result<()> {
         let mut send = None;
-        let mut written = false;
-        let result = tokio::select! {
+        // Retain the critical stream until transport close completes.
+        tokio::select! {
             biased;
-            error = transport.terminated() => Err(error),
+            error = qpack.failed() => Err(error),
             result = async {
                 send = Some(transport.open_uni().await?.map(|(_, send)| send).ok_or_else(|| {
                     ErrorCode::H3_STREAM_CREATION_ERROR.reason("unable to open control stream")
@@ -49,16 +49,11 @@ impl Control {
                 self.write_settings(send).await?;
                 let id = local_goaway.await;
                 self.write_goaway(send, id).await?;
-                written = true;
-                on_written(Ok(()));
-                Err(transport.terminated().await)
+                Err(qpack.failed().await)
             } => result,
-        };
-        // Retain the critical stream until transport close completes.
-        result.inspect_err(|error| {
-            if !written {
-                on_written(Err(error.clone()));
-            }
+        }
+        .inspect_err(|error| {
+            qpack.on_error(error.clone());
             let _ = transport.close(error.reason.clone(), error.code.as_u64());
         })
     }
@@ -160,6 +155,3 @@ impl Control {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

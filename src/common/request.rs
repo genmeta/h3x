@@ -129,18 +129,15 @@ pub(crate) async fn read_head<RS: AsyncRead + StopSending + Unpin>(
     qpack: &ArcQpack,
 ) -> Result<head::RequestHead> {
     let stream_id = rs.stream_id();
-    let result: Result<_> = async {
+    async {
         let frame = read_headers(rs).await?;
         let fields = qpack.decode(stream_id, frame.payload.field_section).await?;
         let head = head::RequestHead::decode(fields)?;
         ContentType::from_request(&head)?;
-        Ok(head)
+        Ok::<_, Error>(head)
     }
-    .await;
-    if let Err(error) = &result {
-        crate::error::receive_error(rs, qpack, error);
-    }
-    result
+    .await
+    .inspect_err(|error| crate::error::receive_error(rs, qpack, error))
 }
 
 /// Write request HEADERS, body, and FIN; handle failures in the write direction.
@@ -210,17 +207,14 @@ impl<W: AsyncWrite + CancelStream + Unpin> WriteRequest for H3WriteStream<W> {
     where
         Self: Sized,
     {
-        let result = async {
+        async {
             self.write_request_head(&request, &qpack).await?;
             self.write_request_bytes_body(&request).await?;
             self.shutdown().await?;
             Ok::<_, Error>(())
         }
-        .await;
-        if let Err(error) = &result {
-            (&self).cancel(error.code.as_u64());
-        }
-        result
+        .await
+        .inspect_err(|error| (&self).cancel(error.code.as_u64()))
     }
 
     async fn write_streaming_request(
@@ -237,16 +231,15 @@ impl<W: AsyncWrite + CancelStream + Unpin> WriteRequest for H3WriteStream<W> {
             self.flush().await?;
             Ok(mode)
         };
-        let result = tokio::select! {
+        let mode = tokio::select! {
             biased;
             error = body.wait_error() => Err(error),
             result = sending => result,
-        };
-        if let Err(error) = &result {
+        }
+        .inspect_err(|error| {
             (&self).cancel(error.code.as_u64());
             body.on_error(error.clone());
-        }
-        let mode = result?;
+        })?;
         self.write_request_streaming_body(&request, mode).await
     }
 
@@ -280,16 +273,15 @@ impl<W: AsyncWrite + CancelStream + Unpin> WriteRequest for H3WriteStream<W> {
             self.shutdown().await?;
             Ok::<_, Error>(())
         };
-        let result = tokio::select! {
+        tokio::select! {
             biased;
             error = producer.wait_error() => Err(error),
             result = sending => result,
-        };
-        if let Err(error) = &result {
+        }
+        .inspect_err(|error| {
             (&*self).cancel(error.code.as_u64());
             producer.on_error(error.clone());
-        }
-        result
+        })
     }
 }
 
@@ -326,7 +318,7 @@ impl<R: AsyncRead + StopSending + Unpin + Send + 'static> ReadRequest for H3Read
     }
 
     async fn read_request(mut self, qpack: ArcQpack) -> Result<super::Request<Read>> {
-        let head = self.read_request_head(&qpack).await?;
-        self.read_request_body(head, qpack)
+        let head = ReadRequest::read_request_head(&mut self, &qpack).await?;
+        ReadRequest::read_request_body(self, head, qpack)
     }
 }

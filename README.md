@@ -54,10 +54,9 @@ local GOAWAY, waits for the peer GOAWAY and admitted requests to finish, then
 closes QUIC with `H3_NO_ERROR` and applies the terminal state to H3 waiters.
 Calling `goaway()` freezes admission immediately. Once frozen, GOAWAY sending continues in
 the control task if the caller is cancelled; await shutdown to finish draining.
-Pool-managed draining continues independently of shutdown waiters. Control and
-QPACK remain available during draining. On a connection managed directly by the
+Control and QPACK remain available during draining. On a connection managed directly by the
 application, receiving a peer GOAWAY only updates the peer boundary and rejects
-affected requests. A managing `Pool` also retires and drains that connection.
+affected requests. A managing `Pool` removes that connection from reuse.
 
 Peer STOP/reset errors are observed through transport write, flush, or shutdown.
 There is no independent STOP notification input while waiting for body data.
@@ -79,27 +78,20 @@ authentication and ALPN `h3` verification before returning an initialized H3
 connection, and reclaim unreturned resources when cancelled. Do not return a
 connection already managed by another pool.
 
-- `get(&key).await` reuses a connection or merges concurrent calls into one
-  factory execution for that key. Different keys connect independently. Cancelling
-  the first caller cancels the shared build with `PoolError::BuildCancelled`;
-  cancelling another waiter does not affect the build.
-- `remove(&key)` revokes the current build or removes the current connection
-  from reuse and starts GOAWAY. Existing handles can still open streams until peer
-  GOAWAY or transport close. A replacement can connect while older generations
-  drain. Already admitted requests can finish without returning a handle to the pool.
-- Peer GOAWAY, local draining and connection failure trigger automatic retirement.
-  Each retired generation has its own deadline; expiration explicitly closes its
-  transport and waits for H3 cleanup.
-- `shutdown().await` permanently stops allocation and waits for cancelled builds
-  and managed connections to finish cleanup. Cancelling this waiter does not stop
-  shutdown. Dropping the last pool owner immediately closes remaining connections.
+- `get(&key).await` reuses a connection or serializes construction for that key
+  using an asynchronous entry lock. Different keys connect independently.
+  Cancelling or failing construction allows the next waiter to try again.
+- `remove(&key)` removes the entry from reuse without sending GOAWAY or closing
+  the transport. Calls already holding the removed entry may still finish and
+  return its connection; they do not reinsert it or modify a replacement entry.
+- Peer GOAWAY, local GOAWAY and connection failure automatically remove the entry.
+  Removal is asynchronous; `get` may return the connection before its observer runs.
+  Existing handles and admitted requests remain owned by the application.
+- The pool has no shutdown or draining state. Dropping it releases cached handles
+  without forcibly closing transports; applications manage connection shutdown.
 
-`Pool::with_config(factory, PoolConfig { ... })` configures the whole-factory
-`connect_timeout` (default 10 seconds) and each connection's `drain_timeout`
-(default `Some(30 seconds)`, or `None` for unbounded draining). Build cancellation
-is cooperative: a revoked creator must be polled or dropped before shutdown can
-finish. The pool does not send or automatically retry requests; after `get`, use
-`connection.open_bi().await` and the normal request APIs.
+The factory controls connection timeouts, and `get` returns factory errors directly.
+The pool does not send or automatically retry requests; after `get`, use `connection.open_bi().await` and the normal request APIs.
 
 ## Request and Response I/O
 
@@ -112,9 +104,9 @@ accept a parsed `http::Uri` and `http::Method`; both writer traits support
 
 ```rust
 use bytes::Bytes;
-use h3x::{client, server, ReadRequest, ReadResponse, WriteRequest, WriteResponse};
+use h3x::{Request, Response, ReadRequest, ReadResponse, WriteRequest, WriteResponse};
 
-let mut request: client::Request<Bytes> = http::Request::builder()
+let mut request: Request<Bytes> = http::Request::builder()
     .method(http::Method::POST)
     .uri("https://example.com/upload")
     .version(http::Version::HTTP_3)
@@ -123,7 +115,7 @@ let mut request: client::Request<Bytes> = http::Request::builder()
 request.set_method(http::Method::PUT);
 assert_eq!(request.method(), http::Method::PUT);
 
-let mut response: server::Response<Bytes> = http::Response::builder()
+let mut response: Response<Bytes> = http::Response::builder()
     .version(http::Version::HTTP_3)
     .body(Bytes::new())?
     .into();
@@ -137,8 +129,9 @@ that buffer for production. Converting back to `http::Request` / `http::Response
 preserves metadata and returns a directional `Body` handle.
 
 `write_bytes_request` accepts an existing Bytes body; `write_streaming_request`
-accepts a WndBuf body. Both take `(request, write_stream, read_stream, qpack)`,
-and return a `Result<impl Future<Output = Result<Response>>>`. Ordinary uploads
+accepts a WndBuf body. Call `ws.write_bytes_request(request, rs, qpack)` or
+`ws.write_streaming_request(request, rs, qpack)`; both return a future yielding
+`Result<IncomingResponse>`. Ordinary uploads
 start in an internal task; CONNECT starts when the response future is polled.
 Ordinary request uploads validate metadata in their upload task before sending
 HEADERS. Response writers and CONNECT handshakes validate when polled.
@@ -153,9 +146,9 @@ so callers should apply a timeout or cancel the response future when appropriate
 Receiving an ordinary response does not abort upload. CONNECT handshake failures
 notify the producer and fail the response future.
 
-Server entry points are `read_request(rs, qpack)`,
-`write_bytes_response(response, ws, qpack, &method)`, and
-`write_streaming_response(response, ws, qpack, &method)`. Pass `connection.qpack().clone()` as `qpack`. Obtain `method` from the
+Receive with `rs.read_request(qpack)` (returning `IncomingRequest`), and send with
+`ws.write_bytes_response(response, qpack, &method)` or
+`ws.write_streaming_response(response, qpack, &method)`. Pass `connection.qpack().clone()` as `qpack`. Obtain `method` from the
 original request before consuming it. Both writers finish their transport direction
 only after sending the body. Drive streaming production concurrently with writing.
 
@@ -215,8 +208,8 @@ assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
 assert_eq!(Error::from(std::io::Error::from(error.clone())), error);
 ```
 
-Transport adapters return `Error` from `terminated()` and retain the supplied
-close reason. Construct failures with `Error::new(code, reason)` or
+Transport adapters report connection failures through open/accept and stream I/O,
+retaining the supplied close reason. Construct failures with `Error::new(code, reason)` or
 `code.with_reason(reason)`, supplying the context at the point of failure.
 
 ## Server-Initiated Requests

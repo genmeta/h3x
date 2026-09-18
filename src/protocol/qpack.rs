@@ -72,16 +72,13 @@ pub struct Qpack {
 }
 
 #[derive(Clone)]
-pub struct ArcQpack(
-    Arc<Mutex<Result<Qpack>>>,
-    tokio::sync::watch::Sender<Option<Error>>,
-);
+pub struct ArcQpack(Arc<Mutex<Result<Qpack>>>, tokio::sync::watch::Sender<()>);
 
 impl From<Qpack> for ArcQpack {
     fn from(qpack: Qpack) -> Self {
         Self(
             Arc::new(Mutex::new(Ok(qpack))),
-            tokio::sync::watch::channel(None).0,
+            tokio::sync::watch::channel(()).0,
         )
     }
 }
@@ -100,21 +97,20 @@ impl ArcQpack {
         instructions: encoder::Instructions,
     ) -> Result<()> {
         tokio::select! {
-        biased;
-        error = self.failed() => Err(error),
-        error = transport.terminated() => Err(error),
-        result = async {
-            let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
-                ErrorCode::H3_STREAM_CREATION_ERROR.reason("unable to create the required stream")
-            })?;
-            self.write_encoder(instructions, &mut send).await
-        } => result,
-    }
-    .map_err(|error| {
-        let error = self.on_error(error);
-        let _ = transport.close(error.reason.clone(), error.code.as_u64());
-        error
-    })
+            biased;
+            error = self.failed() => Err(error),
+            result = async {
+                let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
+                    ErrorCode::H3_STREAM_CREATION_ERROR.reason("unable to create the required stream")
+                })?;
+                self.write_encoder(instructions, &mut send).await
+            } => result,
+        }
+        .map_err(|error| {
+            let error = self.on_error(error);
+            let _ = transport.close(error.reason.clone(), error.code.as_u64());
+            error
+        })
     }
 
     pub(super) async fn sync_decoder_with<T: crate::Transport>(
@@ -123,21 +119,20 @@ impl ArcQpack {
         instructions: decoder::Instructions,
     ) -> Result<()> {
         tokio::select! {
-        biased;
-        error = self.failed() => Err(error),
-        error = transport.terminated() => Err(error),
-        result = async {
-            let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
-                ErrorCode::H3_STREAM_CREATION_ERROR.reason("unable to create the required stream")
-            })?;
-            self.write_decoder(instructions, &mut send).await
-        } => result,
-    }
-    .map_err(|error| {
-        let error = self.on_error(error);
-        let _ = transport.close(error.reason.clone(), error.code.as_u64());
-        error
-    })
+            biased;
+            error = self.failed() => Err(error),
+            result = async {
+                let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
+                    ErrorCode::H3_STREAM_CREATION_ERROR.reason("unable to create the required stream")
+                })?;
+                self.write_decoder(instructions, &mut send).await
+            } => result,
+        }
+        .map_err(|error| {
+            let error = self.on_error(error);
+            let _ = transport.close(error.reason.clone(), error.code.as_u64());
+            error
+        })
     }
 
     /// Run a synchronous operation while holding the shared state lock.
@@ -169,13 +164,15 @@ impl ArcQpack {
     /// Observe the first failure, including failures before subscription.
     pub(crate) async fn failed(&self) -> Error {
         let mut failure = self.1.subscribe();
-        failure
-            .wait_for(Option::is_some)
-            .await
-            .expect("QPACK retains the failure sender")
-            .as_ref()
-            .unwrap()
-            .clone()
+        loop {
+            if let Some(error) = self.error() {
+                return error;
+            }
+            failure
+                .changed()
+                .await
+                .expect("QPACK retains the failure sender");
+        }
     }
 
     pub(crate) fn configure(&self, peer: Settings, max_fields: u64) -> Result<()> {
@@ -195,7 +192,7 @@ impl ArcQpack {
             qpack
         };
         let wakes = qpack.decoder.take_waiters();
-        self.1.send_replace(Some(error.clone()));
+        self.1.send_replace(());
         // Releasing callbacks closes the instruction queues. Wake outside the shared lock.
         drop(qpack);
         for wake in wakes {
@@ -209,8 +206,7 @@ impl ArcQpack {
     }
 
     pub(crate) async fn decode(&self, id: u64, payload: Bytes) -> Result<Vec<Field>> {
-        let result = self.decode_fields(id, payload).await;
-        result.map_err(|error| {
+        self.decode_fields(id, payload).await.map_err(|error| {
             if error.code == ErrorCode::QPACK_DECOMPRESSION_FAILED {
                 self.on_error(error)
             } else {

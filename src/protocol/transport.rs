@@ -4,7 +4,7 @@ pub use qbase::role::Role;
 use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{Error, Result};
+use crate::Result;
 
 /// One established QUIC connection, with stream-local cancellation supplied by its adapter.
 /// open/accept futures must leave any unreturned stream owned by the transport when cancelled.
@@ -39,8 +39,4 @@ pub trait Transport: Send + Sync + 'static {
     fn accept_uni(&self) -> impl Future<Output = Result<(u64, Self::StreamReader)>> + Send;
 
     fn close(&self, reason: String, code: u64) -> Result<()>;
-
-    /// Return the terminal protocol code and transport-provided reason.
-    /// Graceful termination uses `ErrorCode::H3_NO_ERROR`.
-    fn terminated(&self) -> impl Future<Output = Error> + Send;
 }

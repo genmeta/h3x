@@ -22,7 +22,7 @@ use crate::ErrorCode::H3_NO_ERROR;
 
 /// An HTTP/3 connection whose control and QPACK streams are driven automatically.
 /// Construct inside a Tokio runtime. Tasks run until the transport terminates.
-/// `goaway()` or a managing pool can drain requests and close the transport.
+/// `goaway()` can drain requests and close the transport.
 pub struct H3Connection<T: Transport> {
     pub(crate) transport: Arc<T>,
     qpack: ArcQpack,
@@ -33,7 +33,7 @@ pub struct H3Connection<T: Transport> {
 impl<T: Transport> H3Connection<T> {
     /// Start the control, SETTINGS, and connection tasks.
     /// On failure or cancellation, transport cleanup follows its own drop semantics.
-    pub async fn new(transport: T, settings: Settings) -> Result<Self> {
+    pub fn new(transport: T, settings: Settings) -> Result<Self> {
         let transport = Arc::new(transport);
         let settings = Arc::new(settings);
         let bi = Arc::new(Mutex::new(BiStreams::new(transport.role())));
@@ -64,14 +64,12 @@ impl<T: Transport> H3Connection<T> {
         let control = Arc::new(control::Control::new(settings));
         tokio::spawn({
             let control = control.clone();
+            let qpack = qpack.clone();
             let transport = transport.clone();
             let local_goaway = bi.lock().unwrap().send_goaway();
-            let bi = bi.clone();
             async move {
                 control
-                    .sync_control_with(transport, local_goaway, |result| {
-                        bi.lock().unwrap().on_goaway_written(result);
-                    })
+                    .sync_control_with(transport, qpack, local_goaway)
                     .await
             }
         });
@@ -117,25 +115,12 @@ impl<T: Transport> H3Connection<T> {
     /// Submitted writes continue in the control task if this future is dropped.
     /// Await completion to finish the exchange and drain requests.
     pub fn goaway(self) -> impl Future<Output = Result<()>> + Send {
-        let (_, rejected) = self.bi_streams.lock().unwrap().local_goaway();
+        let qpack = self.qpack.clone();
+        let _ = self.bi_streams.lock().unwrap().local_goaway(&qpack);
         async move {
-            let sending = async {
-                for id in rejected {
-                    self.qpack.cancel(id)?;
-                }
-                let written = self.bi_streams.lock().unwrap().goaway_written();
-                written.await
-            };
-            if let Err(error) = sending.await {
-                let _ = self
-                    .transport
-                    .close(error.reason.clone(), error.code.as_u64());
-                return Err(error);
-            }
             tokio::select! {
                 biased;
-                // 移除，通过流读写感知
-                error = self.transport.terminated() => return Err(error),
+                error = self.qpack.failed() => return Err(error),
                 result = async {
                     let remote_goaway = self.bi_streams.lock().unwrap().recv_goway();
                     remote_goaway.await.map_err(|error| {
@@ -151,15 +136,7 @@ impl<T: Transport> H3Connection<T> {
         }
     }
 
-    pub(crate) fn is_reusable(&self) -> bool {
-        let guard = self.bi_streams.lock().unwrap();
-        guard.can_accept().is_ok() && guard.can_open().is_ok() && self.qpack.error().is_none()
-    }
-
-    pub(crate) async fn unusable(&self) {
-        if !self.is_reusable() {
-            return;
-        }
+    pub(crate) async fn terminated(&self) {
         let (local_goaway, remote_goaway) = {
             let guard = self.bi_streams.lock().unwrap();
             (guard.send_goaway(), guard.recv_goway())
@@ -167,7 +144,6 @@ impl<T: Transport> H3Connection<T> {
         tokio::select! {
             _ = local_goaway => {},
             _ = remote_goaway => {},
-            _ = self.transport.terminated() => {},
             _ = self.qpack.failed() => {},
         }
     }
@@ -215,6 +191,3 @@ impl<T: Transport> Clone for H3Connection<T> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

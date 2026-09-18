@@ -12,12 +12,15 @@ use tokio::{
 };
 
 use super::{Goaway, H3Stream};
-use crate::{Error, ErrorCode};
+use crate::{
+    ArcQpack, Error, ErrorCode,
+    common::{self, head},
+};
 
 /// Application-owned read direction, observed weakly by the connection.
 pub struct H3ReadStream<R: StopSending> {
-    id: u64,
     pub(super) state: Arc<Mutex<Result<H3Stream<R>, Goaway>>>,
+    id: u64,
     finished: Arc<Notify>,
 }
 
@@ -105,5 +108,37 @@ impl<R: AsyncRead + StopSending + Unpin> AsyncRead for H3ReadStream<R> {
 impl<R: StopSending> Drop for H3ReadStream<R> {
     fn drop(&mut self) {
         self.close(ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled"));
+    }
+}
+
+impl<R: AsyncRead + StopSending + Unpin + Send + 'static> H3ReadStream<R> {
+    /// Read an HTTP request using the receive stream's ID and shared QPACK state.
+    pub async fn read_request(self, qpack: ArcQpack) -> crate::Result<crate::IncomingRequest> {
+        crate::common::request::ReadRequest::read_request(self, qpack).await
+    }
+
+    /// Start body reception after read_request_head has consumed HEADERS.
+    /// `rs` and `qpack` must belong to the request whose metadata is supplied here.
+    pub fn read_request_body(
+        self,
+        request: http::Request<()>,
+        qpack: ArcQpack,
+    ) -> crate::Result<crate::IncomingRequest> {
+        let (parts, ()) = request.into_parts();
+        let head = head::RequestHead::from(parts);
+        crate::common::request::ReadRequest::read_request_body(self, head, qpack)
+    }
+
+    /// Read only initial HEADERS, leaving the receive direction with the caller.
+    /// No body task is started and no bytes beyond the field section are prefetched.
+    /// After success pass the same stream to read_request_body.
+    /// If this future is cancelled, discard the stream: a partial header may be consumed.
+    pub async fn read_request_head(
+        &mut self,
+        qpack: &ArcQpack,
+    ) -> crate::Result<http::Request<()>> {
+        let head = common::request::read_head(self, qpack).await?;
+        let parts = http::request::Parts::from(head);
+        Ok(http::Request::from_parts(parts, ()))
     }
 }

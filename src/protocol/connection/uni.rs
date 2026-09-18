@@ -17,15 +17,11 @@ impl<T: Transport> H3Connection<T> {
             tokio::select! {
                 biased;
                 error = self.qpack.failed() => break error,
-                error = self.transport.terminated() => break error,
                 accepted = self.transport.accept_uni() => match accepted {
                     Ok((_, recv)) => {
                         tokio::spawn(self.clone().receive(recv, peer_critical_streams.clone()));
                     }
-                    Err(error) => {
-                        let _ = self.transport.close(error.reason, error.code.as_u64());
-                        break self.transport.terminated().await;
-                    }
+                    Err(error) => break error,
                 },
             }
         };
@@ -64,11 +60,10 @@ impl<T: Transport> H3Connection<T> {
                                 self.qpack.configure(peer, max_fields)
                             },
                             |id| {
-                                let rejected = self.bi_streams.lock().unwrap().receive_goaway(id);
-                                for id in rejected {
-                                    self.qpack.cancel(id)?;
-                                }
-                                Ok(())
+                                self.bi_streams
+                                    .lock()
+                                    .unwrap()
+                                    .receive_goaway(id, self.qpack.clone())
                             },
                         )
                         .await
@@ -83,7 +78,6 @@ impl<T: Transport> H3Connection<T> {
         let result = tokio::select! {
             biased;
             error = self.qpack.failed() => Err(error),
-            error = self.transport.terminated() => Err(error),
             result = result => result,
         };
         // Retain the half until failure handling completes, including transport close.
@@ -93,7 +87,7 @@ impl<T: Transport> H3Connection<T> {
         }
     }
 
-    /// Apply the transport terminal reason and wake all H3-level waiters.
+    /// Apply the failure observed by stream I/O and wake H3-level waiters.
     pub(crate) fn on_terminated(&self, error: Error) {
         let error = self.qpack.on_error(error);
         self.bi_streams.lock().unwrap().close(error);

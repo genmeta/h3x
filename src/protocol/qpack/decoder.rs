@@ -81,12 +81,14 @@ impl Decoder {
     pub(super) fn cancel(&mut self, id: u64) -> Result<Vec<Waker>> {
         self.state.cancel_stream(id)
     }
+
     pub(super) fn cancel_registered(&mut self, id: u64) -> Result<Vec<Waker>> {
         if !self.state.decoding_stream.remove(&id) {
             return Ok(Vec::new());
         }
         self.state.cancel_stream(id)
     }
+
     pub(super) fn on_encoder_instruction(
         &mut self,
         instruction: EncoderInstruction,

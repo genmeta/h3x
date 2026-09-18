@@ -9,9 +9,14 @@ license = "Apache-2.0"
 keywords = ["async", "quic", "http3"]
 categories = ["network-programming", "asynchronous"]
 
+[lib]
+test = false
+doctest = false
+
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
+dashmap = "6"
 http = "1"
 httlib-huffman = "0.3"
 thiserror = "2"

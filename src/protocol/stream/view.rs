@@ -48,7 +48,6 @@ pub(crate) struct StreamView {
     local: Cursor,
     remote: Cursor,
     local_goaway: tokio::sync::watch::Sender<Option<StreamId>>,
-    local_goaway_written: tokio::sync::watch::Sender<Option<Result<()>>>,
     remote_goaway: ArcReceiving<()>,
 }
 
@@ -58,7 +57,6 @@ impl StreamView {
             local: Cursor::Max(StreamId::new(!role, Dir::Bi, 0)),
             remote: Cursor::Max(StreamId::new(role, Dir::Bi, 0)),
             local_goaway: tokio::sync::watch::channel(None).0,
-            local_goaway_written: tokio::sync::watch::channel(None).0,
             remote_goaway: ArcReceiving::default(),
         }
     }
@@ -104,81 +102,7 @@ impl StreamView {
         }
     }
 
-    pub(crate) fn goaway_written(&self) -> impl Future<Output = Result<()>> + use<> {
-        let mut notification = self.local_goaway_written.subscribe();
-        async move {
-            notification
-                .wait_for(Option::is_some)
-                .await
-                .map_err(|_| ErrorCode::H3_CLOSED_CRITICAL_STREAM.reason("control writer stopped"))?
-                .as_ref()
-                .unwrap()
-                .clone()
-        }
-    }
-
-    pub(crate) fn on_goaway_written(&self, result: Result<()>) {
-        self.local_goaway_written.send_if_modified(|written| {
-            if written.is_some() {
-                return false;
-            }
-            *written = Some(result.clone());
-            true
-        });
-    }
-
     pub(crate) fn remote_goaway_notification(&self) -> ArcReceiving<()> {
         self.remote_goaway.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn frozen_boundary_is_shared_with_writer_and_pool_observers() {
-        let mut view = StreamView::new(Role::Client);
-        let writer = view.local_goaway_notification();
-        let observer = view.local_goaway_notification();
-        let boundary = view.local_goaway();
-        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            tokio::join!(writer, observer)
-        })
-        .await
-        .unwrap();
-        assert_eq!(a, boundary);
-        assert_eq!(b, boundary);
-        assert_eq!(view.local_goaway_notification().await, boundary);
-        assert_eq!(view.local_goaway(), boundary);
-    }
-
-    #[tokio::test]
-    async fn freezing_does_not_complete_write_and_result_is_shared() {
-        let mut view = StreamView::new(Role::Client);
-        let first = view.goaway_written();
-        let second = view.goaway_written();
-        view.local_goaway();
-        let mut first = std::pin::pin!(first);
-        std::future::poll_fn(|cx| {
-            assert!(first.as_mut().poll(cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
-        view.on_goaway_written(Ok(()));
-        first.await.unwrap();
-        second.await.unwrap();
-        // Transport termination after a successful write cannot replace that result.
-        view.on_goaway_written(Err(ErrorCode::H3_INTERNAL_ERROR.reason("later close")));
-        view.goaway_written().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn failure_before_freezing_is_retained_for_shutdown_waiters() {
-        let view = StreamView::new(Role::Client);
-        view.on_goaway_written(Err(ErrorCode::H3_INTERNAL_ERROR.reason("open failed")));
-        let error = view.goaway_written().await.unwrap_err();
-        assert_eq!(error.code, ErrorCode::H3_INTERNAL_ERROR);
-        assert_eq!(error.reason, "open failed");
     }
 }
