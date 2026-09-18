@@ -18,7 +18,6 @@ pub(crate) struct WndBuf {
     len: usize,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
-    error_waker: Option<Waker>,
     fin: bool,
 }
 
@@ -33,7 +32,6 @@ impl WndBuf {
             len: 0,
             read_waker: None,
             write_waker: None,
-            error_waker: None,
             fin: false,
         }
     }
@@ -130,7 +128,11 @@ impl ArcWndBuf {
     }
 
     pub(crate) fn cancel(&self, code: u64) {
-        self.on_error(crate::ErrorCode::from(code).reason("body cancelled"));
+        self.on_error(
+            crate::ErrorCode::try_from(code)
+                .unwrap_or(crate::ErrorCode::H3_INTERNAL_ERROR)
+                .reason("body cancelled"),
+        );
     }
 
     pub(crate) fn on_error(&self, error: Error) {
@@ -142,24 +144,8 @@ impl ArcWndBuf {
             if let Some(waker) = window.write_waker.take() {
                 waker.wake();
             }
-            if let Some(waker) = window.error_waker.take() {
-                waker.wake();
-            }
             *state = Err(error);
         }
-    }
-
-    /// One background pump waits for errors on each body window.
-    /// Keep its notification separate from application read/write readiness.
-    pub(crate) async fn wait_error(&self) -> Error {
-        std::future::poll_fn(|cx| match &mut *self.shared.lock().unwrap() {
-            Err(error) => Poll::Ready(error.clone()),
-            Ok(window) => {
-                window.error_waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        })
-        .await
     }
 
     fn poll_io<T>(
@@ -198,5 +184,29 @@ impl AsyncWrite for ArcWndBuf {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_io(|window| window.poll_shutdown(cx))
+    }
+}
+
+impl qrecovery::recv::StopSending for &ArcWndBuf {
+    fn stop(&mut self, error_code: u64) {
+        ArcWndBuf::cancel(self, error_code);
+    }
+}
+
+impl qrecovery::recv::StopSending for ArcWndBuf {
+    fn stop(&mut self, error_code: u64) {
+        ArcWndBuf::cancel(self, error_code);
+    }
+}
+
+impl qrecovery::send::CancelStream for &ArcWndBuf {
+    fn cancel(&mut self, error_code: u64) {
+        ArcWndBuf::cancel(self, error_code);
+    }
+}
+
+impl qrecovery::send::CancelStream for ArcWndBuf {
+    fn cancel(&mut self, error_code: u64) {
+        ArcWndBuf::cancel(self, error_code);
     }
 }
