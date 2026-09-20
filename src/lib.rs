@@ -26,11 +26,6 @@ pub const ALPN: &[u8] = b"h3";
 
 /// Shared body storage, also available under its original ArcWndBuf name.
 pub use common::wnd_buf::ArcWndBuf;
-pub use common::{Read as R, Write as W, wnd_buf::ArcWndBuf as WndBuf};
-
-/// Outgoing request with a shared streaming body.
-pub type Request = common::request::Request<W>;
-/// Outgoing response with a shared streaming body.
-pub type Response = common::response::Response<W>;
-pub type IncomingRequest = common::request::Request<R>;
-pub type IncomingResponse = common::response::Response<R>;
+pub use common::{
+    Read as R, Write as W, request::Request, response::Response, wnd_buf::ArcWndBuf as WndBuf,
+};
