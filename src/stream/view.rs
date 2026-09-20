@@ -107,3 +107,51 @@ impl StreamView {
         self.remote_goaway.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn validates_ids_and_freezes_both_goaway_boundaries() {
+        let mut view = StreamView::new(Role::Client);
+        let wrong_role = StreamId::new(Role::Client, Dir::Bi, 0);
+        let wrong_direction = StreamId::new(Role::Server, Dir::Uni, 0);
+        assert_eq!(
+            view.accept(wrong_role).unwrap_err().code,
+            ErrorCode::H3_ID_ERROR
+        );
+        assert_eq!(
+            view.accept(wrong_direction).unwrap_err().code,
+            ErrorCode::H3_ID_ERROR
+        );
+
+        let largest_server_bi = StreamId::from(VarInt::try_from((1_u64 << 62) - 3).unwrap());
+        assert_eq!(
+            view.accept(largest_server_bi).unwrap_err().code,
+            ErrorCode::H3_ID_ERROR
+        );
+
+        let local = view.goaway();
+        assert_eq!(view.goaway(), local);
+        assert_eq!(
+            view.local_not_goaway().unwrap_err().code,
+            ErrorCode::H3_REQUEST_REJECTED
+        );
+        assert_eq!(
+            view.accept(StreamId::new(Role::Server, Dir::Bi, 0))
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_REQUEST_REJECTED
+        );
+        assert_eq!(view.send_goaway().await, local);
+
+        let remote = StreamId::new(Role::Client, Dir::Bi, 1);
+        view.on_goaway(remote);
+        view.recv_goway().await.unwrap();
+        assert_eq!(
+            view.remote_not_goway().unwrap_err().code,
+            ErrorCode::H3_REQUEST_REJECTED
+        );
+    }
+}

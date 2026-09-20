@@ -392,8 +392,138 @@ pub(super) fn instruction_send_error<T>(error: tokio::sync::mpsc::error::TrySend
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::{
+        io,
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll},
+    };
+
+    use codec::instruction::DecoderInstruction;
+    use qrecovery::{recv::StopSending, send::CancelStream};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
     use super::*;
+    use crate::{
+        Transport,
+        qpack::codec::field::{FieldLine, FieldSectionPrefix, WriteField},
+    };
+
+    pub(crate) fn qpack() -> ArcQpack {
+        ArcQpack::new(&super::super::connection::Settings::default()).unwrap()
+    }
+
+    #[derive(Default)]
+    pub(crate) struct TestIo;
+
+    struct FailingWriter;
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::other("write failed")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("flush failed")))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("shutdown failed")))
+        }
+    }
+
+    impl AsyncRead for TestIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for TestIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl StopSending for TestIo {
+        fn stop(&mut self, _: u64) {}
+    }
+
+    impl CancelStream for TestIo {
+        fn cancel(&mut self, _: u64) {}
+    }
+
+    pub(crate) struct TestTransport {
+        mode: u8,
+        closes: AtomicUsize,
+    }
+
+    impl TestTransport {
+        pub(crate) fn new(mode: u8) -> Self {
+            Self {
+                mode,
+                closes: AtomicUsize::new(0),
+            }
+        }
+
+        pub(crate) fn close_count(&self) -> usize {
+            self.closes.load(Ordering::SeqCst)
+        }
+    }
+
+    impl crate::Transport for TestTransport {
+        type StreamReader = TestIo;
+        type StreamWriter = TestIo;
+
+        fn role(&self) -> crate::Role {
+            crate::Role::Client
+        }
+
+        async fn open_bi(&self) -> Result<Option<(u64, (TestIo, TestIo))>> {
+            Ok(None)
+        }
+
+        async fn accept_bi(&self) -> Result<(u64, (TestIo, TestIo))> {
+            Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused"))
+        }
+
+        async fn open_uni(&self) -> Result<Option<(u64, TestIo)>> {
+            match self.mode {
+                0 => Ok(None),
+                1 => Ok(Some((2, TestIo))),
+                _ => Err(ErrorCode::H3_INTERNAL_ERROR.reason("open failed")),
+            }
+        }
+
+        async fn accept_uni(&self) -> Result<(u64, TestIo)> {
+            Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused"))
+        }
+
+        fn close(&self, _: String, _: u64) -> Result<()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     fn field(name: &'static [u8], value: &'static [u8], never_index: bool) -> Field {
         Field {
@@ -471,6 +601,301 @@ mod tests {
         assert_eq!(
             instruction_send_error(sender.try_send(3).unwrap_err()).code,
             ErrorCode::H3_CLOSED_CRITICAL_STREAM
+        );
+    }
+
+    #[test]
+    fn request_scoped_and_connection_scoped_errors_take_different_paths() {
+        for code in [
+            ErrorCode::H3_NO_ERROR,
+            ErrorCode::H3_REQUEST_REJECTED,
+            ErrorCode::H3_REQUEST_CANCELLED,
+            ErrorCode::H3_REQUEST_INCOMPLETE,
+            ErrorCode::H3_MESSAGE_ERROR,
+            ErrorCode::H3_CONNECT_ERROR,
+            ErrorCode::H3_VERSION_FALLBACK,
+        ] {
+            let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
+            qpack
+                .with_state(|state| {
+                    state.decoder.on_instruction(|_| Ok(()));
+                    Ok(())
+                })
+                .unwrap();
+            let error = code.reason("stream");
+            assert_eq!(qpack.on_error(0, error.clone()), error);
+            assert!(qpack.error().is_none());
+        }
+        for code in [
+            ErrorCode::H3_GENERAL_PROTOCOL_ERROR,
+            ErrorCode::H3_INTERNAL_ERROR,
+            ErrorCode::H3_STREAM_CREATION_ERROR,
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM,
+            ErrorCode::H3_FRAME_UNEXPECTED,
+            ErrorCode::H3_FRAME_ERROR,
+            ErrorCode::H3_EXCESSIVE_LOAD,
+            ErrorCode::H3_ID_ERROR,
+            ErrorCode::H3_SETTINGS_ERROR,
+            ErrorCode::H3_MISSING_SETTINGS,
+            ErrorCode::QPACK_DECOMPRESSION_FAILED,
+            ErrorCode::QPACK_ENCODER_STREAM_ERROR,
+            ErrorCode::QPACK_DECODER_STREAM_ERROR,
+        ] {
+            let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
+            let error = code.reason("connection");
+            assert_eq!(qpack.on_error(0, error.clone()), error);
+            assert_eq!(qpack.error(), Some(error));
+        }
+    }
+
+    #[tokio::test]
+    async fn instruction_writers_process_batches_and_report_critical_close() {
+        let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
+        let (encoder_tx, encoder_rx) = tokio::sync::mpsc::channel(2);
+        encoder_tx
+            .send(vec![
+                EncoderInstruction::SetDynamicTableCapacity(0),
+                EncoderInstruction::InsertWithLiteralName {
+                    name: Bytes::from_static(b"x"),
+                    value: Bytes::from_static(b"y"),
+                },
+            ])
+            .await
+            .unwrap();
+        drop(encoder_tx);
+        assert_eq!(
+            qpack
+                .write_encoder(encoder_rx, &mut tokio::io::sink())
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+        );
+
+        let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(2);
+        decoder_tx
+            .send(vec![
+                DecoderInstruction::SectionAcknowledgment(0),
+                DecoderInstruction::StreamCancellation(4),
+                DecoderInstruction::InsertCountIncrement(1),
+            ])
+            .await
+            .unwrap();
+        drop(decoder_tx);
+        assert_eq!(
+            qpack
+                .write_decoder(decoder_rx, &mut tokio::io::sink())
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+        );
+
+        let failed = ErrorCode::H3_INTERNAL_ERROR.reason("already failed");
+        qpack.on_connection_error(failed.clone());
+        let (_, encoder_rx) = tokio::sync::mpsc::channel(1);
+        assert_eq!(
+            qpack
+                .write_encoder(encoder_rx, &mut tokio::io::sink())
+                .await
+                .unwrap_err(),
+            failed
+        );
+    }
+
+    #[tokio::test]
+    async fn instruction_receivers_apply_valid_input_then_map_eof() {
+        let settings = super::super::connection::Settings::new(4096, 128, 1).unwrap();
+        let qpack = ArcQpack::new(&settings).unwrap();
+        let feedback = Arc::new(Mutex::new(Vec::new()));
+        let captured = feedback.clone();
+        qpack
+            .with_state(|state| {
+                state.decoder.on_instruction(move |batch| {
+                    captured.lock().unwrap().push(batch);
+                    Ok(())
+                });
+                Ok(())
+            })
+            .unwrap();
+
+        let mut encoder_wire = Vec::new();
+        encoder_wire
+            .put_encoder_instruction(&EncoderInstruction::SetDynamicTableCapacity(128))
+            .unwrap();
+        encoder_wire
+            .put_encoder_instruction(&EncoderInstruction::InsertWithLiteralName {
+                name: Bytes::from_static(b"x-received"),
+                value: Bytes::from_static(b"yes"),
+            })
+            .unwrap();
+        assert_eq!(
+            qpack
+                .receive_encoder(&mut encoder_wire.as_slice())
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+        );
+        assert!(matches!(
+            feedback.lock().unwrap()[0].as_slice(),
+            [DecoderInstruction::InsertCountIncrement(1)]
+        ));
+
+        let mut decoder_wire = Vec::new();
+        decoder_wire
+            .put_decoder_instruction(&DecoderInstruction::StreamCancellation(7))
+            .unwrap();
+        assert_eq!(
+            qpack
+                .receive_decoder(&mut decoder_wire.as_slice())
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_field_section_fails_qpack_connection() {
+        let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
+        let error = qpack
+            .decode(0, Bytes::from_static(&[0xff]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::QPACK_DECOMPRESSION_FAILED);
+        assert_eq!(qpack.error(), Some(error));
+    }
+
+    #[tokio::test]
+    async fn qpack_stream_sync_maps_open_failures_and_closes_transport() {
+        let smoke = TestTransport::new(0);
+        assert_eq!(smoke.role(), crate::Role::Client);
+        assert!(smoke.open_bi().await.unwrap().is_none());
+        assert!(smoke.accept_bi().await.is_err());
+        assert!(smoke.accept_uni().await.is_err());
+        let mut io = TestIo;
+        let mut byte = [0];
+        assert_eq!(
+            tokio::io::AsyncReadExt::read(&mut io, &mut byte)
+                .await
+                .unwrap(),
+            0
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut io, b"x")
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::flush(&mut io).await.unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut io).await.unwrap();
+        io.stop(1);
+        io.cancel(2);
+
+        for mode in [0, 1, 2] {
+            let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
+            let transport = Arc::new(TestTransport::new(mode));
+            let (_, encoder_rx) = tokio::sync::mpsc::channel(1);
+            assert!(
+                qpack
+                    .sync_encoder_with(transport.clone(), encoder_rx)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
+        }
+        for mode in [0, 1, 2] {
+            let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
+            let transport = Arc::new(TestTransport::new(mode));
+            let (_, decoder_rx) = tokio::sync::mpsc::channel(1);
+            assert!(
+                qpack
+                    .sync_decoder_with(transport.clone(), decoder_rx)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_cancel_waiters_and_writer_io_errors_are_propagated() {
+        let settings = super::super::connection::Settings::new(4096, 128, 1).unwrap();
+        let qpack = ArcQpack::new(&settings).unwrap();
+        qpack
+            .with_state(|state| {
+                state.decoder.on_instruction(|_| Ok(()));
+                state.encoder.on_instruction(|_| Ok(()));
+                Ok(())
+            })
+            .unwrap();
+        qpack
+            .configure(
+                Settings {
+                    max_table_capacity: 128,
+                    blocked_streams: 1,
+                },
+                4096,
+            )
+            .unwrap();
+
+        let mut wire = Vec::new();
+        wire.put_field_section_prefix(
+            &FieldSectionPrefix {
+                required_insert_count: 1,
+                base: 0,
+            },
+            128,
+        )
+        .unwrap();
+        wire.put_field_line(&FieldLine::IndexedPostBase { index: 0 })
+            .unwrap();
+        let decoding = {
+            let qpack = qpack.clone();
+            tokio::spawn(async move { qpack.decode(4, wire.into()).await })
+        };
+        tokio::task::yield_now().await;
+        qpack.cancel(4).unwrap();
+        assert_eq!(
+            decoding.await.unwrap().unwrap_err().code,
+            ErrorCode::H3_REQUEST_CANCELLED
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(tx);
+        assert_eq!(
+            qpack
+                .write_encoder(rx, &mut FailingWriter)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(tx);
+        assert_eq!(
+            qpack
+                .write_decoder(rx, &mut FailingWriter)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+        );
+        assert!(
+            tokio::io::AsyncWriteExt::flush(&mut FailingWriter)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::io::AsyncWriteExt::shutdown(&mut FailingWriter)
+                .await
+                .is_err()
+        );
+
+        let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
+        assert_eq!(
+            qpack
+                .on_error(0, ErrorCode::H3_NO_ERROR.reason("cancel"))
+                .code,
+            ErrorCode::H3_INTERNAL_ERROR
         );
     }
 }

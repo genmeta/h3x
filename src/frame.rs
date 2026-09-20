@@ -15,6 +15,9 @@ mod push_promise;
 mod settings;
 mod varint;
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) use varint::be_varint;
 
 /// Local per-buffer budget for HTTP/3 frame payloads and QPACK literals/field sections.

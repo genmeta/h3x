@@ -354,4 +354,47 @@ mod tests {
         assert_eq!(get(98), Some(("x-frame-options", "sameorigin")));
         assert_eq!(get(99), None);
     }
+
+    #[test]
+    fn rejects_invalid_capacities_and_references() {
+        let Err(error) = DynamicTable::new(VARINT_MAX + 1) else {
+            panic!("capacity beyond the variable-integer range must fail")
+        };
+        assert_eq!(error.code, ErrorCode::H3_SETTINGS_ERROR);
+
+        let mut table = DynamicTable::new(64).unwrap();
+        table
+            .apply(EncoderInstruction::SetDynamicTableCapacity(40))
+            .unwrap();
+        assert_eq!(
+            table.set_max_capacity(39).unwrap_err().code,
+            ErrorCode::H3_SETTINGS_ERROR
+        );
+        assert_eq!(
+            table.set_max_capacity(VARINT_MAX + 1).unwrap_err().code,
+            ErrorCode::H3_SETTINGS_ERROR
+        );
+        table.set_max_capacity(80).unwrap();
+        assert_eq!(table.max_capacity(), 80);
+
+        assert_eq!(
+            table
+                .apply(insert(b"too-large", b"value"))
+                .unwrap_err()
+                .code,
+            ErrorCode::QPACK_ENCODER_STREAM_ERROR
+        );
+        assert_eq!(
+            table
+                .apply(EncoderInstruction::InsertWithNameReference {
+                    static_table: true,
+                    index: 99,
+                    value: Bytes::new(),
+                })
+                .unwrap_err()
+                .code,
+            ErrorCode::QPACK_ENCODER_STREAM_ERROR
+        );
+        assert_eq!(get(u64::MAX), None);
+    }
 }

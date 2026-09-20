@@ -228,4 +228,50 @@ mod tests {
         assert_eq!(error.code, ErrorCode::QPACK_ENCODER_STREAM_ERROR);
         assert_eq!(wire, [0xaa]);
     }
+
+    #[tokio::test]
+    async fn instruction_limits_and_invalid_wire_values_are_rejected() {
+        let oversized = Bytes::from(vec![0; MAX_BUFFERED_FRAME_PAYLOAD + 1]);
+        for instruction in [
+            EncoderInstruction::InsertWithNameReference {
+                static_table: true,
+                index: 0,
+                value: oversized.clone(),
+            },
+            EncoderInstruction::InsertWithLiteralName {
+                name: oversized.clone(),
+                value: Bytes::new(),
+            },
+            EncoderInstruction::InsertWithLiteralName {
+                name: Bytes::new(),
+                value: oversized,
+            },
+            EncoderInstruction::SetDynamicTableCapacity(u64::MAX),
+        ] {
+            assert!(Vec::new().put_encoder_instruction(&instruction).is_err());
+        }
+        assert!(
+            Vec::new()
+                .put_decoder_instruction(&DecoderInstruction::StreamCancellation(u64::MAX))
+                .is_err()
+        );
+
+        let mut invalid_static = Vec::new();
+        invalid_static.put_prefixed_integer(99, 6, 0xc0).unwrap();
+        invalid_static.push(0);
+        assert_eq!(
+            be_encoder_instruction(&mut invalid_static.as_slice())
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::QPACK_ENCODER_STREAM_ERROR
+        );
+        assert_eq!(
+            be_decoder_instruction(&mut &[0][..])
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::QPACK_DECODER_STREAM_ERROR
+        );
+    }
 }

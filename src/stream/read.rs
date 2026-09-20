@@ -261,3 +261,170 @@ where
         Ok(Message::from_parts(head, consumer).into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
+
+    use bytes::Bytes;
+    use qbase::varint::{VarInt, WriteVarInt};
+    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+
+    use super::*;
+    use crate::frame::Write as _;
+
+    #[derive(Default)]
+    struct Io {
+        bytes: Vec<u8>,
+        offset: usize,
+        stops: Vec<u64>,
+    }
+
+    impl Io {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl AsyncRead for Io {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let count = (self.bytes.len() - self.offset).min(buf.remaining());
+            buf.put_slice(&self.bytes[self.offset..self.offset + count]);
+            self.offset += count;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl StopSending for Io {
+        fn stop(&mut self, code: u64) {
+            self.stops.push(code);
+        }
+    }
+
+    fn headers(bytes: &'static [u8]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        wire.put_frame(
+            &Frame::new(frame::Headers {
+                field_section: Bytes::from_static(bytes),
+            })
+            .unwrap(),
+        );
+        wire
+    }
+
+    #[tokio::test]
+    async fn header_and_next_frame_readers_skip_extensions_and_enforce_placement() {
+        let mut wire = Vec::new();
+        wire.put_varint(&VarInt::from_u32(42));
+        wire.put_varint(&VarInt::from_u32(2));
+        wire.extend_from_slice(b"xx");
+        wire.extend_from_slice(&headers(b"head"));
+        let mut stream = H3ReadStream::new(4, Io::new(wire));
+        assert_eq!(stream.stream_id(), 4);
+        assert_eq!(
+            stream
+                .read_headers_frame()
+                .await
+                .unwrap()
+                .unwrap()
+                .payload
+                .field_section,
+            Bytes::from_static(b"head")
+        );
+        assert!(stream.read_headers_frame().await.unwrap().is_none());
+
+        let mut stream = H3ReadStream::new(8, Io::new(vec![0, 1, b'x']));
+        let Some(NextFrame::Data(frame)) = stream.read_next_frame(false).await.unwrap() else {
+            panic!("expected DATA")
+        };
+        assert_eq!(frame.length.into_u64(), 1);
+        let mut payload = [0];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(payload, [b'x']);
+        assert!(stream.read_next_frame(false).await.unwrap().is_none());
+
+        let mut stream = H3ReadStream::new(12, Io::new(headers(b"trailers")));
+        assert!(matches!(
+            stream.read_next_frame(false).await.unwrap(),
+            Some(NextFrame::Trailer(_))
+        ));
+        assert!(stream.read_next_frame(true).await.unwrap().is_none());
+
+        let mut stream = H3ReadStream::new(16, Io::new(vec![0, 0]));
+        assert_eq!(
+            stream.read_headers_frame().await.unwrap_err().code,
+            ErrorCode::H3_FRAME_UNEXPECTED
+        );
+        let mut stream = H3ReadStream::new(20, Io::new(vec![7, 1, 0]));
+        assert_eq!(
+            stream.read_next_frame(false).await.err().unwrap().code,
+            ErrorCode::H3_FRAME_UNEXPECTED
+        );
+        let mut stream = H3ReadStream::new(24, Io::new(vec![0]));
+        assert_eq!(
+            stream.read_next_frame(true).await.err().unwrap().code,
+            ErrorCode::H3_FRAME_UNEXPECTED
+        );
+    }
+
+    #[tokio::test]
+    async fn read_completion_close_reject_and_stop_fire_finish_once() {
+        let completed = Arc::new(AtomicUsize::new(0));
+        let count = completed.clone();
+        let mut stream = H3ReadStream::new(0, Io::new(b"abc".to_vec()));
+        stream.on_finish(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        let _registered = stream.registered();
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"abc");
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        stream.close(ErrorCode::H3_INTERNAL_ERROR.reason("late"));
+        assert!(!stream.reject());
+        stream.stop(9);
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+
+        let completed = Arc::new(AtomicUsize::new(0));
+        let count = completed.clone();
+        let mut rejected = H3ReadStream::new(4, Io::default());
+        rejected.on_finish(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(rejected.reject());
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
+        let mut byte = [0];
+        let error = rejected.read(&mut byte).await.unwrap_err();
+        assert_eq!(
+            crate::Error::from(error).code,
+            ErrorCode::H3_REQUEST_REJECTED
+        );
+    }
+
+    #[tokio::test]
+    async fn read_message_rejects_a_stream_without_initial_headers() {
+        let stream = H3ReadStream::new(0, Io::default());
+        let result: crate::Result<crate::Request<crate::R>> =
+            stream.read_message(crate::qpack::tests::qpack()).await;
+        let Err(error) = result else {
+            panic!("a message without HEADERS must fail")
+        };
+        // The isolated QPACK fixture has no decoder-instruction callback, so
+        // cancelling this request is promoted to a connection-scoped error.
+        assert_eq!(error.code, ErrorCode::H3_INTERNAL_ERROR);
+    }
+}

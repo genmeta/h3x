@@ -423,3 +423,202 @@ pub trait ReadMeesage<P>: Sized {
 pub trait WriteMessage<P>: Sized {
     async fn write_message(self, message: P, qpack: ArcQpack) -> Result<()>;
 }
+
+#[cfg(test)]
+mod tests {
+    use http::header::{ACCEPT, CONTENT_TYPE};
+
+    use super::*;
+    use crate::{
+        common::{Read, Write, request::Request, response::Response},
+        connection::Settings,
+    };
+
+    fn body() -> ArcWndBuf {
+        ArcWndBuf::new(32)
+    }
+
+    #[test]
+    fn request_headers_and_http_parts_round_trip() {
+        let mut request = http::Request::builder()
+            .method(Method::POST)
+            .uri("wss://example.com:443/chat?q=1")
+            .header(CONTENT_TYPE, "text/plain")
+            .body(body())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert::<Arc<str>>(Arc::from("websocket"));
+
+        let mut request = Request::<Write>::from(request);
+        assert_eq!(request.method(), Method::POST);
+        assert_eq!(request.authority(), "example.com:443");
+        assert_eq!(request.path(), "/chat?q=1");
+        assert_eq!(request.scheme(), "wss");
+        assert_eq!(request.protocol().as_deref(), Some("websocket"));
+        assert_eq!(request.headers()[CONTENT_TYPE], "text/plain");
+
+        request
+            .set_method(Method::CONNECT)
+            .set_protocol("websocket")
+            .set_header(ACCEPT, HeaderValue::from_static("text/html"))
+            .append_header(ACCEPT, HeaderValue::from_static("application/json"));
+        assert_eq!(request.scheme(), "https");
+        request.set_uri("ws://other.example/socket".parse().unwrap());
+        assert_eq!(request.scheme(), "http");
+        assert_eq!(request.authority(), "other.example");
+
+        let standard: http::Request<ArcWndBuf> = request.into();
+        assert_eq!(standard.version(), http::Version::HTTP_3);
+        assert_eq!(standard.method(), Method::CONNECT);
+        assert_eq!(standard.uri(), "http://other.example/socket");
+        assert_eq!(
+            standard.extensions().get::<Arc<str>>().unwrap().as_ref(),
+            "websocket"
+        );
+        assert_eq!(standard.headers().get_all(ACCEPT).iter().count(), 2);
+
+        let wrapper =
+            Request::<Read>::from(Message::from_parts(standard.into_parts().0.into(), body()));
+        let _: ArcWndBuf = wrapper.into_body();
+    }
+
+    #[test]
+    fn response_headers_and_http_parts_round_trip() {
+        let standard = http::Response::builder()
+            .status(StatusCode::CREATED)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body())
+            .unwrap();
+        let mut response = Response::<Write>::from(standard);
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            ReadResponse::headers(&response)[CONTENT_TYPE],
+            "application/json"
+        );
+        response
+            .set_status(StatusCode::ACCEPTED)
+            .set_header(ACCEPT, HeaderValue::from_static("text/plain"))
+            .append_header(ACCEPT, HeaderValue::from_static("text/html"));
+
+        let standard: http::Response<ArcWndBuf> = response.into();
+        assert_eq!(standard.status(), StatusCode::ACCEPTED);
+        assert_eq!(standard.version(), http::Version::HTTP_3);
+        assert_eq!(standard.headers().get_all(ACCEPT).iter().count(), 2);
+        let wrapper =
+            Response::<Read>::from(Message::from_parts(standard.into_parts().0.into(), body()));
+        let _: ArcWndBuf = wrapper.into_body();
+    }
+
+    #[test]
+    fn direct_message_traits_delegate_to_headers() {
+        let mut message = Message::from_parts(Headers::default(), body());
+        message
+            .set_method(Method::PATCH)
+            .set_uri("https://example.test/a".parse().unwrap())
+            .set_protocol("custom");
+        WriteRequest::set_header(&mut message, CONTENT_TYPE, HeaderValue::from_static("a/b"));
+        WriteRequest::append_header(&mut message, CONTENT_TYPE, HeaderValue::from_static("c/d"));
+        assert_eq!(message.method(), Method::PATCH);
+        assert_eq!(message.authority(), "example.test");
+        assert_eq!(message.path(), "/a");
+        assert_eq!(message.scheme(), "https");
+        assert_eq!(message.protocol().as_deref(), Some("custom"));
+        assert_eq!(
+            ReadRequest::headers(&message)
+                .get_all(CONTENT_TYPE)
+                .iter()
+                .count(),
+            2
+        );
+
+        message.set_status(StatusCode::NO_CONTENT);
+        WriteResponse::set_header(&mut message, ACCEPT, HeaderValue::from_static("one"));
+        WriteResponse::append_header(&mut message, ACCEPT, HeaderValue::from_static("two"));
+        assert_eq!(message.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            ReadResponse::headers(&message)
+                .get_all(ACCEPT)
+                .iter()
+                .count(),
+            2
+        );
+        let _: ArcWndBuf = message.into_body();
+    }
+
+    #[tokio::test]
+    async fn header_qpack_codec_preserves_pseudo_regular_and_sensitive_fields() {
+        let qpack = ArcQpack::new(&Settings::default()).unwrap();
+        let mut headers = Headers::default();
+        headers.set_method(Method::GET);
+        headers.set_uri("https://example.test/path".parse().unwrap());
+        let mut sensitive = HeaderValue::from_static("secret");
+        sensitive.set_sensitive(true);
+        WriteRequest::set_header(&mut headers, http::header::AUTHORIZATION, sensitive);
+        WriteRequest::append_header(&mut headers, ACCEPT, HeaderValue::from_static("text/plain"));
+
+        let frame = headers.encode_headers(4, &qpack).unwrap();
+        let decoded = Headers::decode_headers(4, frame, &qpack).await.unwrap();
+        assert_eq!(decoded.method(), Method::GET);
+        assert_eq!(decoded.authority(), "example.test");
+        assert_eq!(decoded.path(), "/path");
+        assert!(decoded.header[http::header::AUTHORIZATION].is_sensitive());
+        assert_eq!(decoded.header[ACCEPT], "text/plain");
+    }
+
+    #[tokio::test]
+    async fn malformed_decoded_fields_and_response_status_are_message_errors() {
+        let qpack = ArcQpack::new(&Settings::default()).unwrap();
+        for fields in [
+            vec![Field {
+                name: Bytes::from_static(b":bad"),
+                value: Bytes::from_static(&[0xff]),
+                never_index: false,
+            }],
+            vec![Field {
+                name: Bytes::from_static(b"bad header"),
+                value: Bytes::from_static(b"value"),
+                never_index: false,
+            }],
+            vec![Field {
+                name: Bytes::from_static(b"x-test"),
+                value: Bytes::from_static(b"\n"),
+                never_index: false,
+            }],
+        ] {
+            let field_section = qpack.encode(8, fields).unwrap();
+            let error = Headers::decode_headers(
+                8,
+                Frame::new(frame::Headers { field_section }).unwrap(),
+                &qpack,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
+        }
+
+        let mut headers = Headers::default();
+        assert_eq!(
+            headers.response_status().unwrap_err().code,
+            ErrorCode::H3_MESSAGE_ERROR
+        );
+        headers
+            .pseduo_head
+            .insert(":status".into(), "invalid".into());
+        assert_eq!(
+            headers.response_status().unwrap_err().code,
+            ErrorCode::H3_MESSAGE_ERROR
+        );
+        headers.pseduo_head.insert(":status".into(), "204".into());
+        assert_eq!(headers.response_status().unwrap(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    fn pseudo_header_lists_are_role_specific() {
+        assert_eq!(
+            Request::<Read>::pesudo_headers(),
+            &[":method", ":scheme", ":authority", ":path", ":protocol"]
+        );
+        assert_eq!(Response::<Read>::pesudo_headers(), &[":status"]);
+    }
+}
