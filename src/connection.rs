@@ -346,14 +346,16 @@ mod tests {
         fn cancel(&mut self, _: u64) {}
     }
 
+    type BiStream = (u64, (Io, Io));
+
     struct TestTransport {
-        open: Mutex<Option<Option<(u64, (Io, Io))>>>,
-        accept: Mutex<Option<Result<(u64, (Io, Io))>>>,
+        open: Mutex<Option<Option<BiStream>>>,
+        accept: Mutex<Option<Result<BiStream>>>,
         closes: AtomicUsize,
     }
 
     impl TestTransport {
-        fn new(open: Option<(u64, (Io, Io))>, accept: Result<(u64, (Io, Io))>) -> Self {
+        fn new(open: Option<BiStream>, accept: Result<BiStream>) -> Self {
             Self {
                 open: Mutex::new(Some(open)),
                 accept: Mutex::new(Some(accept)),
