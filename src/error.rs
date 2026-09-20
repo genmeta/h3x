@@ -141,3 +141,30 @@ impl TryFrom<u64> for ErrorCode {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conversions_preserve_protocol_errors_and_cover_every_registered_code() {
+        let protocol = ErrorCode::H3_ID_ERROR.reason("id");
+        assert_eq!(ErrorCode::from(protocol.clone()), ErrorCode::H3_ID_ERROR);
+        assert_eq!(
+            ErrorCode::from(io::Error::other(protocol)),
+            ErrorCode::H3_ID_ERROR
+        );
+        assert_eq!(
+            Error::from_frame_io(io::Error::from(io::ErrorKind::UnexpectedEof)).code,
+            ErrorCode::H3_FRAME_ERROR
+        );
+        for code in 0x100..=0x110 {
+            assert_eq!(ErrorCode::try_from(code).unwrap().as_u64(), code);
+        }
+        for code in 0x200..=0x202 {
+            assert_eq!(ErrorCode::try_from(code).unwrap().as_u64(), code);
+        }
+        assert_eq!(ErrorCode::try_from(42), Err(42));
+        assert_eq!(ErrorCode::H3_NO_ERROR.to_string(), "H3_NO_ERROR (0x100)");
+    }
+}

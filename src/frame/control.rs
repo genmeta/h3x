@@ -4,8 +4,10 @@ use qbase::varint::{VarInt, WriteVarInt};
 use qrecovery::recv::StopSending;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::{self as frame, Frame, FrameType, H3Frame, Write as _};
-use crate::{Error, ErrorCode, Result};
+use crate::{
+    Error, ErrorCode, Result,
+    frame::{self, Frame, FrameType, H3Frame, Write as _},
+};
 
 /// Frames permitted on the HTTP/3 control stream (RFC 9114 section 7.2).
 #[derive(Clone, Debug, PartialEq, Eq)]

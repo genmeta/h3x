@@ -153,3 +153,236 @@ impl Control {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use qbase::varint::VarInt;
+
+    use super::*;
+
+    fn vi(value: u64) -> VarInt {
+        VarInt::try_from(value).unwrap()
+    }
+
+    fn settings_frame() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.put_control(&ControlFrame::Settings(
+            Frame::new(super::super::Settings::default().0).unwrap(),
+        ));
+        bytes
+    }
+
+    #[tokio::test]
+    async fn writes_settings_and_goaway_and_maps_closed_writer() {
+        let control = Control::new(Arc::new(super::super::Settings::default()));
+        control
+            .write_settings(&mut tokio::io::sink())
+            .await
+            .unwrap();
+        control
+            .write_goaway(&mut tokio::io::sink(), StreamId::from(vi(4)))
+            .await
+            .unwrap();
+
+        let (mut writer, reader) = tokio::io::duplex(1);
+        drop(reader);
+        assert_eq!(
+            control.write_settings(&mut writer).await.unwrap_err().code,
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+        );
+
+        let protocol = ErrorCode::H3_INTERNAL_ERROR.reason("embedded");
+        assert_eq!(
+            control_error(std::io::Error::other(protocol.clone())),
+            protocol
+        );
+        let wrapped = std::io::Error::other(Arc::new(std::io::Error::other(protocol.clone())));
+        assert_eq!(control_error(wrapped), protocol);
+    }
+
+    #[tokio::test]
+    async fn receive_control_accepts_settings_unknown_and_decreasing_goaway() {
+        let control = Control::new(Arc::new(super::super::Settings::default()));
+        let mut wire = settings_frame();
+        wire.put_control(&ControlFrame::Unknown {
+            ty: vi(42),
+            length: vi(3),
+        });
+        wire.extend_from_slice(b"ext");
+        for id in [8, 4] {
+            wire.put_control(&ControlFrame::Goaway(
+                Frame::new(frame::Goaway { id: vi(id) }).unwrap(),
+            ));
+        }
+        let seen_settings = Arc::new(Mutex::new(0));
+        let seen_goaway = Arc::new(Mutex::new(Vec::new()));
+        let settings_count = seen_settings.clone();
+        let goaway_ids = seen_goaway.clone();
+        let error = control
+            .receive_control(
+                &mut wire.as_slice(),
+                crate::Role::Client,
+                move |_| {
+                    *settings_count.lock().unwrap() += 1;
+                    Ok(())
+                },
+                move |id| {
+                    goaway_ids.lock().unwrap().push(u64::from(id));
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::H3_CLOSED_CRITICAL_STREAM);
+        assert_eq!(*seen_settings.lock().unwrap(), 1);
+        assert_eq!(*seen_goaway.lock().unwrap(), vec![8, 4]);
+    }
+
+    #[tokio::test]
+    async fn receive_control_rejects_missing_duplicate_and_invalid_frames() {
+        for wire in [vec![7, 1, 0], vec![0, 0], vec![42, 0]] {
+            let control = Control::new(Arc::new(super::super::Settings::default()));
+            assert_eq!(
+                control
+                    .receive_control(
+                        &mut wire.as_slice(),
+                        crate::Role::Client,
+                        |_| Ok(()),
+                        |_| Ok(()),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::H3_MISSING_SETTINGS
+            );
+        }
+
+        let control = Control::new(Arc::new(super::super::Settings::default()));
+        let wire = settings_frame();
+        assert_eq!(
+            control
+                .receive_control(
+                    &mut wire.as_slice(),
+                    crate::Role::Client,
+                    |_| Err(ErrorCode::H3_SETTINGS_ERROR.reason("callback")),
+                    |_| Ok(()),
+                )
+                .await
+                .unwrap_err()
+                .reason,
+            "callback"
+        );
+
+        let mut first = settings_frame();
+        first.put_control(&ControlFrame::Goaway(
+            Frame::new(frame::Goaway { id: vi(0) }).unwrap(),
+        ));
+        control
+            .receive_control(
+                &mut first.as_slice(),
+                crate::Role::Client,
+                |_| Ok(()),
+                |_| Err(ErrorCode::H3_ID_ERROR.reason("goaway callback")),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            control
+                .receive_control(
+                    &mut settings_frame().as_slice(),
+                    crate::Role::Client,
+                    |_| Ok(()),
+                    |_| Ok(()),
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_SETTINGS_ERROR
+        );
+
+        for invalid in [
+            ControlFrame::Goaway(Frame::new(frame::Goaway { id: vi(1) }).unwrap()),
+            ControlFrame::MaxPushId(Frame::new(frame::MaxPushId { push_id: vi(0) }).unwrap()),
+            ControlFrame::CancelPush(
+                Frame::new(frame::CancelPush {
+                    push_id: StreamId::from(vi(0)),
+                })
+                .unwrap(),
+            ),
+            ControlFrame::Settings(Frame::new(frame::Settings::default()).unwrap()),
+        ] {
+            let control = Control::new(Arc::new(super::super::Settings::default()));
+            let mut wire = settings_frame();
+            wire.put_control(&invalid);
+            assert!(
+                control
+                    .receive_control(
+                        &mut wire.as_slice(),
+                        crate::Role::Client,
+                        |_| Ok(()),
+                        |_| Ok(()),
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+
+        let control = Control::new(Arc::new(super::super::Settings::default()));
+        let mut truncated_unknown = settings_frame();
+        truncated_unknown.put_control(&ControlFrame::Unknown {
+            ty: vi(42),
+            length: vi(2),
+        });
+        truncated_unknown.push(1);
+        assert_eq!(
+            control
+                .receive_control(
+                    &mut truncated_unknown.as_slice(),
+                    crate::Role::Client,
+                    |_| Ok(()),
+                    |_| Ok(()),
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+        );
+    }
+
+    #[tokio::test]
+    async fn control_stream_sync_writes_until_qpack_failure_and_closes_transport() {
+        use crate::qpack::tests::TestTransport;
+
+        let control = Control::new(Arc::new(super::super::Settings::default()));
+        let qpack = crate::ArcQpack::new(&super::super::Settings::default()).unwrap();
+        let failer = qpack.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            failer.on_connection_error(ErrorCode::H3_INTERNAL_ERROR.reason("stop"));
+        });
+        let transport = Arc::new(TestTransport::new(1));
+        assert_eq!(
+            control
+                .sync_control_with(transport.clone(), qpack, async { StreamId::from(vi(0)) })
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_INTERNAL_ERROR
+        );
+        assert_eq!(transport.close_count(), 1);
+
+        let qpack = crate::ArcQpack::new(&super::super::Settings::default()).unwrap();
+        let transport = Arc::new(TestTransport::new(0));
+        assert_eq!(
+            control
+                .sync_control_with(transport.clone(), qpack, async { StreamId::from(vi(0)) })
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_STREAM_CREATION_ERROR
+        );
+        assert_eq!(transport.close_count(), 1);
+    }
+}

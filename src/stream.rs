@@ -113,3 +113,79 @@ pub(crate) fn poll_io<T: Unpin, O>(
     };
     r
 }
+
+#[cfg(test)]
+mod tests {
+    use std::task::{Context, Poll, Waker};
+
+    use super::*;
+
+    #[test]
+    fn stream_state_transitions_cover_idle_polling_finished_and_goaway() {
+        let mut idle = Ok(H3Stream::new(1));
+        assert!(!is_finished(&idle));
+        assert!(terminate(&mut idle, |io| *io += 1).is_none());
+        assert!(is_finished(&idle));
+        assert!(terminate(&mut idle, |_| panic!("finished I/O is untouched")).is_none());
+
+        let mut rejected: Result<H3Stream<i32>, Goaway> = Err(Goaway);
+        assert!(is_finished(&rejected));
+        assert!(terminate(&mut rejected, |_| {}).is_none());
+        assert!(goaway(&mut rejected, |_| {}).is_none());
+
+        let waker = Waker::noop().clone();
+        let mut polling = Ok(H3Stream::Polling(3, waker));
+        assert!(terminate(&mut polling, |io| *io += 1).is_some());
+        assert!(is_finished(&polling));
+
+        let mut active = Ok(H3Stream::new(5));
+        assert!(goaway(&mut active, |io| *io += 1).is_none());
+        assert!(matches!(active, Err(Goaway)));
+
+        let mut idle = Ok(H3Stream::new(7));
+        finish(&mut idle);
+        assert!(is_finished(&idle));
+        finish(&mut rejected);
+    }
+
+    #[test]
+    fn poll_io_retains_retryable_states_and_finishes_terminal_states() {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let mut state = Ok(H3Stream::new(1));
+        assert!(poll_io(&mut state, &mut cx, |_, _| Poll::<io::Result<()>>::Pending).is_pending());
+        assert!(matches!(state, Ok(H3Stream::Polling(_, _))));
+        assert!(poll_io(&mut state, &mut cx, |_, _| Poll::Ready(Ok(()))).is_ready());
+        assert!(matches!(state, Ok(H3Stream::Idle(_))));
+
+        assert!(
+            poll_io(&mut state, &mut cx, |_, _| {
+                Poll::<io::Result<()>>::Ready(Err(io::Error::from(io::ErrorKind::Interrupted)))
+            })
+            .is_ready()
+        );
+        assert!(matches!(state, Ok(H3Stream::Idle(_))));
+
+        assert!(
+            poll_io(&mut state, &mut cx, |_, _| {
+                Poll::<io::Result<()>>::Ready(Err(io::Error::other("fatal")))
+            })
+            .is_ready()
+        );
+        assert!(is_finished(&state));
+        assert!(poll_io(&mut state, &mut cx, |_, _| Poll::Ready(Ok(()))).is_ready());
+        assert!(is_finished(&state));
+
+        let mut rejected: Result<H3Stream<i32>, Goaway> = Err(Goaway);
+        let Poll::Ready(Err(error)) = poll_io(&mut rejected, &mut cx, |_, _| {
+            Poll::<io::Result<()>>::Pending
+        }) else {
+            panic!("GOAWAY must reject I/O")
+        };
+        assert_eq!(
+            crate::Error::from(error).code,
+            ErrorCode::H3_REQUEST_REJECTED
+        );
+    }
+}

@@ -325,3 +325,278 @@ mod state {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Arc, Mutex},
+        task::{Context, Poll, Waker},
+    };
+
+    use bytes::{Bytes, BytesMut};
+    use qbase::varint::VARINT_MAX;
+
+    use super::*;
+    use crate::qpack::codec::field::{FieldLine, WriteField};
+
+    fn settings(capacity: u64, blocked_streams: u64) -> Settings {
+        Settings {
+            max_table_capacity: capacity,
+            blocked_streams,
+        }
+    }
+
+    fn dynamic_wire(required_insert_count: u64, line: FieldLine) -> Vec<u8> {
+        let mut wire = Vec::new();
+        wire.put_field_section_prefix(
+            &FieldSectionPrefix {
+                required_insert_count,
+                base: 0,
+            },
+            128,
+        )
+        .unwrap();
+        wire.put_field_line(&line).unwrap();
+        wire
+    }
+
+    fn make_decoder(
+        blocked_streams: u64,
+        blocked_bytes: usize,
+        max_fields: u64,
+    ) -> (Decoder, Arc<Mutex<Vec<Batch>>>) {
+        let feedback = Arc::new(Mutex::new(Vec::new()));
+        let captured = feedback.clone();
+        let mut decoder =
+            Decoder::new(settings(128, blocked_streams), blocked_bytes, max_fields).unwrap();
+        decoder.on_instruction(move |batch| {
+            captured.lock().unwrap().push(batch);
+            Ok(())
+        });
+        decoder
+            .on_encoder_instruction(EncoderInstruction::SetDynamicTableCapacity(128))
+            .unwrap();
+        (decoder, feedback)
+    }
+
+    #[test]
+    fn blocked_decode_resumes_after_insert_and_emits_ordered_feedback() {
+        let (mut decoder, feedback) = make_decoder(2, 1024, 1024);
+        let wire = dynamic_wire(1, FieldLine::IndexedPostBase { index: 0 });
+        let (offset, prefix) = decoder.begin_decode(0, &wire).unwrap();
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            decoder.poll_registered_decode(0, prefix, &wire[offset..], &mut cx),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            decoder.poll_registered_decode(0, prefix, &wire[offset..], &mut cx),
+            Poll::Pending
+        ));
+
+        let wakes = decoder
+            .on_encoder_instruction(EncoderInstruction::InsertWithLiteralName {
+                name: Bytes::from_static(b"x-dynamic"),
+                value: Bytes::from_static(b"value"),
+            })
+            .unwrap();
+        assert_eq!(wakes.len(), 1);
+        let Poll::Ready(Ok(fields)) =
+            decoder.poll_registered_decode(0, prefix, &wire[offset..], &mut cx)
+        else {
+            panic!("inserted section should decode")
+        };
+        assert_eq!(fields[0].name, "x-dynamic");
+        assert_eq!(fields[0].value, "value");
+
+        let feedback = feedback.lock().unwrap();
+        assert!(matches!(
+            feedback[0].as_slice(),
+            [DecoderInstruction::InsertCountIncrement(1)]
+        ));
+        assert!(matches!(
+            feedback[1].as_slice(),
+            [DecoderInstruction::SectionAcknowledgment(0)]
+        ));
+    }
+
+    #[test]
+    fn cancellation_and_blocking_budgets_clean_up_waiters() {
+        let wire = dynamic_wire(1, FieldLine::IndexedPostBase { index: 0 });
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let (mut decoder, feedback) = make_decoder(1, 1024, 1024);
+        let (offset, prefix) = decoder.begin_decode(4, &wire).unwrap();
+        assert!(decoder.begin_decode(4, &wire).is_err());
+        assert!(
+            decoder
+                .poll_registered_decode(4, prefix, &wire[offset..], &mut cx)
+                .is_pending()
+        );
+        assert_eq!(decoder.cancel_registered(4).unwrap().len(), 1);
+        assert!(decoder.cancel_registered(4).unwrap().is_empty());
+        assert!(matches!(
+            feedback.lock().unwrap().last().unwrap().as_slice(),
+            [DecoderInstruction::StreamCancellation(4)]
+        ));
+        assert!(
+            decoder
+                .poll_registered_decode(4, prefix, &wire[offset..], &mut cx)
+                .is_ready()
+        );
+        assert_eq!(
+            decoder.cancel(VARINT_MAX + 1).unwrap_err().code,
+            ErrorCode::H3_INTERNAL_ERROR
+        );
+
+        let (mut no_stream_slots, _) = make_decoder(0, 1024, 1024);
+        let (offset, prefix) = no_stream_slots.begin_decode(8, &wire).unwrap();
+        let Poll::Ready(Err(error)) =
+            no_stream_slots.poll_registered_decode(8, prefix, &wire[offset..], &mut cx)
+        else {
+            panic!("blocked-stream limit must reject")
+        };
+        assert_eq!(error.code, ErrorCode::QPACK_DECOMPRESSION_FAILED);
+
+        let (mut no_bytes, _) = make_decoder(1, 0, 1024);
+        let (offset, prefix) = no_bytes.begin_decode(12, &wire).unwrap();
+        let Poll::Ready(Err(error)) =
+            no_bytes.poll_registered_decode(12, prefix, &wire[offset..], &mut cx)
+        else {
+            panic!("blocked-byte limit must reject")
+        };
+        assert_eq!(error.code, ErrorCode::H3_EXCESSIVE_LOAD);
+
+        let (mut waiting, _) = make_decoder(2, 1024, 1024);
+        for id in [16, 20] {
+            let (offset, prefix) = waiting.begin_decode(id, &wire).unwrap();
+            assert!(
+                waiting
+                    .poll_registered_decode(id, prefix, &wire[offset..], &mut cx)
+                    .is_pending()
+            );
+        }
+        assert_eq!(waiting.take_waiters().len(), 2);
+    }
+
+    #[test]
+    fn malformed_sections_settings_and_callback_errors_are_rejected() {
+        assert_eq!(
+            Decoder::new(settings(0, VARINT_MAX + 1), 0, 0)
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::H3_SETTINGS_ERROR
+        );
+        assert_eq!(
+            Decoder::new(settings(VARINT_MAX + 1, 0), 0, 0)
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::H3_SETTINGS_ERROR
+        );
+
+        let (mut decoder, _) = make_decoder(1, 1024, 50);
+        assert_eq!(
+            decoder
+                .begin_decode(VARINT_MAX + 1, &[0, 0])
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_INTERNAL_ERROR
+        );
+        assert_eq!(
+            decoder
+                .begin_decode(0, &vec![0; crate::frame::MAX_BUFFERED_FRAME_PAYLOAD + 1])
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_EXCESSIVE_LOAD
+        );
+
+        let mut empty_dynamic = Vec::new();
+        empty_dynamic
+            .put_field_section_prefix(
+                &FieldSectionPrefix {
+                    required_insert_count: 1,
+                    base: 0,
+                },
+                128,
+            )
+            .unwrap();
+        assert_eq!(
+            decoder.begin_decode(0, &empty_dynamic).unwrap_err().code,
+            ErrorCode::QPACK_DECOMPRESSION_FAILED
+        );
+
+        decoder
+            .on_encoder_instruction(EncoderInstruction::InsertWithLiteralName {
+                name: Bytes::from_static(b"x"),
+                value: Bytes::from_static(b"y"),
+            })
+            .unwrap();
+        let wire = dynamic_wire(
+            1,
+            FieldLine::Indexed {
+                static_table: true,
+                index: 17,
+            },
+        );
+        let (offset, prefix) = decoder.begin_decode(4, &wire).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        let Poll::Ready(Err(error)) =
+            decoder.poll_registered_decode(4, prefix, &wire[offset..], &mut cx)
+        else {
+            panic!("RIC mismatch must reject")
+        };
+        assert_eq!(error.code, ErrorCode::QPACK_DECOMPRESSION_FAILED);
+
+        let mut oversized = BytesMut::new();
+        oversized
+            .put_field_section_prefix(
+                &FieldSectionPrefix {
+                    required_insert_count: 0,
+                    base: 0,
+                },
+                128,
+            )
+            .unwrap();
+        oversized
+            .put_field_line(&FieldLine::Literal(Field {
+                name: Bytes::from_static(b"long-name"),
+                value: Bytes::from_static(b"long-value"),
+                never_index: false,
+            }))
+            .unwrap();
+        let (offset, prefix) = decoder.begin_decode(8, &oversized).unwrap();
+        let Poll::Ready(Err(error)) =
+            decoder.poll_registered_decode(8, prefix, &oversized[offset..], &mut cx)
+        else {
+            panic!("decoded size limit must reject")
+        };
+        assert_eq!(error.code, ErrorCode::H3_EXCESSIVE_LOAD);
+
+        let mut zero = Decoder::new(Settings::default(), 0, 0).unwrap();
+        assert_eq!(
+            zero.on_encoder_instruction(EncoderInstruction::SetDynamicTableCapacity(0))
+                .unwrap_err()
+                .code,
+            ErrorCode::QPACK_ENCODER_STREAM_ERROR
+        );
+
+        let (mut callback_error, _) = make_decoder(1, 1024, 1024);
+        callback_error.on_instruction(|_| {
+            Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM.reason("feedback closed"))
+        });
+        assert_eq!(
+            callback_error
+                .on_encoder_instruction(EncoderInstruction::InsertWithLiteralName {
+                    name: Bytes::from_static(b"a"),
+                    value: Bytes::from_static(b"b"),
+                })
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+        );
+    }
+}

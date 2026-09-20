@@ -274,3 +274,247 @@ impl<T: Transport> Clone for H3Connection<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        io,
+        pin::Pin,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
+
+    use qrecovery::{recv::StopSending, send::CancelStream};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Io {
+        bytes: VecDeque<u8>,
+    }
+
+    impl Io {
+        fn from(bytes: &[u8]) -> Self {
+            Self {
+                bytes: bytes.iter().copied().collect(),
+            }
+        }
+    }
+
+    impl AsyncRead for Io {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            while buf.remaining() > 0 {
+                let Some(byte) = self.bytes.pop_front() else {
+                    break;
+                };
+                buf.put_slice(&[byte]);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Io {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl StopSending for Io {
+        fn stop(&mut self, _: u64) {}
+    }
+
+    impl CancelStream for Io {
+        fn cancel(&mut self, _: u64) {}
+    }
+
+    struct TestTransport {
+        open: Mutex<Option<Option<(u64, (Io, Io))>>>,
+        accept: Mutex<Option<Result<(u64, (Io, Io))>>>,
+        closes: AtomicUsize,
+    }
+
+    impl TestTransport {
+        fn new(open: Option<(u64, (Io, Io))>, accept: Result<(u64, (Io, Io))>) -> Self {
+            Self {
+                open: Mutex::new(Some(open)),
+                accept: Mutex::new(Some(accept)),
+                closes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Transport for TestTransport {
+        type StreamReader = Io;
+        type StreamWriter = Io;
+
+        fn role(&self) -> crate::Role {
+            crate::Role::Client
+        }
+        async fn open_bi(&self) -> Result<Option<(u64, (Io, Io))>> {
+            Ok(self.open.lock().unwrap().take().unwrap())
+        }
+        async fn accept_bi(&self) -> Result<(u64, (Io, Io))> {
+            self.accept.lock().unwrap().take().unwrap()
+        }
+        async fn open_uni(&self) -> Result<Option<(u64, Io)>> {
+            Ok(None)
+        }
+        async fn accept_uni(&self) -> Result<(u64, Io)> {
+            Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused"))
+        }
+        fn close(&self, _: String, _: u64) -> Result<()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn connection(transport: TestTransport) -> H3Connection<TestTransport> {
+        let settings = Arc::new(Settings::default());
+        H3Connection {
+            transport: Arc::new(transport),
+            qpack: ArcQpack::new(&settings).unwrap(),
+            control: Arc::new(control::Control::new(settings)),
+            bi_streams: ArcBiStreams::new(crate::Role::Client),
+        }
+    }
+
+    #[tokio::test]
+    async fn bidirectional_admission_reports_transport_and_identifier_errors() {
+        let error = connection(TestTransport::new(
+            None,
+            Err(ErrorCode::H3_INTERNAL_ERROR.reason("accept failed")),
+        ))
+        .open_bi()
+        .await
+        .err()
+        .expect("opening an unavailable stream must fail");
+        assert_eq!(error.code, ErrorCode::H3_STREAM_CREATION_ERROR);
+
+        let invalid = (1_u64 << 62, (Io::default(), Io::default()));
+        let invalid_connection = connection(TestTransport::new(None, Ok(invalid)));
+        let error = invalid_connection
+            .accept_bi()
+            .await
+            .err()
+            .expect("accepting an invalid stream identifier must fail");
+        assert_eq!(error.code, ErrorCode::H3_ID_ERROR);
+
+        let opened = connection(TestTransport::new(
+            Some((0, (Io::default(), Io::default()))),
+            Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused")),
+        ));
+        assert!(opened.open_bi().await.is_ok());
+        let accepted = connection(TestTransport::new(
+            None,
+            Ok((1, (Io::default(), Io::default()))),
+        ));
+        assert!(accepted.accept_bi().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unidirectional_stream_types_and_duplicates_fail_the_connection() {
+        for bytes in [
+            &[][..],
+            &[1][..],
+            &[2][..],
+            &[3][..],
+            &[0][..],
+            &[0, 4, 0, 7, 1, 0][..],
+        ] {
+            let connection = connection(TestTransport::new(
+                None,
+                Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused")),
+            ));
+            connection
+                .clone()
+                .receive_uni(Io::from(bytes), Arc::new(AtomicU8::new(0)))
+                .await;
+            if !bytes.is_empty() {
+                assert!(connection.qpack().error().is_some());
+            }
+        }
+
+        let connection = connection(TestTransport::new(
+            None,
+            Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused")),
+        ));
+        connection
+            .clone()
+            .receive_uni(Io::from(&[0]), Arc::new(AtomicU8::new(1)))
+            .await;
+        assert_eq!(
+            connection.qpack().error().unwrap().code,
+            ErrorCode::H3_STREAM_CREATION_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn goaway_notifies_local_waiters_and_closes_after_peer_goaway() {
+        let connection = connection(TestTransport::new(
+            None,
+            Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused")),
+        ));
+        let local = connection.local_goaway();
+        let qpack = connection.qpack.clone();
+        connection
+            .bi_streams
+            .lock()
+            .unwrap()
+            .goaway(&qpack)
+            .unwrap();
+        local.await;
+
+        connection
+            .bi_streams
+            .lock()
+            .unwrap()
+            .on_goaway(
+                qbase::sid::StreamId::new(crate::Role::Client, qbase::sid::Dir::Bi, 0),
+                qpack,
+            )
+            .unwrap();
+        let transport = connection.transport.clone();
+        connection.goaway().await.unwrap();
+        assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn constructor_starts_critical_stream_tasks_and_io_supports_writes() {
+        let probe = TestTransport::new(None, Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused")));
+        assert_eq!(
+            probe.accept_uni().await.err().unwrap().code,
+            ErrorCode::H3_INTERNAL_ERROR
+        );
+        let connection = H3Connection::new(
+            TestTransport::new(None, Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused"))),
+            Settings::default(),
+        )
+        .unwrap();
+        tokio::task::yield_now().await;
+        assert!(connection.qpack().error().is_some());
+
+        let mut io = Io::default();
+        io.write_all(b"test").await.unwrap();
+        io.flush().await.unwrap();
+        io.shutdown().await.unwrap();
+    }
+}

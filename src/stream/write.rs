@@ -168,3 +168,103 @@ where
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
+
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct Io {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        cancels: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl AsyncWrite for Io {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl CancelStream for Io {
+        fn cancel(&mut self, code: u64) {
+            self.cancels.lock().unwrap().push(code);
+        }
+    }
+
+    #[tokio::test]
+    async fn write_flush_shutdown_and_cancel_transition_once() {
+        let io = Io::default();
+        let bytes = io.bytes.clone();
+        let cancels = io.cancels.clone();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let count = completed.clone();
+        let mut stream = H3WriteStream::new(4, io);
+        stream.on_finish(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        let _registered = stream.registered();
+        assert_eq!(stream.stream_id(), 4);
+        stream.write_all(b"hello").await.unwrap();
+        stream.flush().await.unwrap();
+        AsyncWriteExt::shutdown(&mut stream).await.unwrap();
+        assert_eq!(&*bytes.lock().unwrap(), b"hello");
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        (&stream).cancel(7);
+        assert!(cancels.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reject_and_explicit_cancel_report_expected_codes() {
+        let io = Io::default();
+        let cancels = io.cancels.clone();
+        let mut stream = H3WriteStream::new(8, io);
+        assert!(stream.reject());
+        assert!(!stream.reject());
+        assert_eq!(
+            &*cancels.lock().unwrap(),
+            &[ErrorCode::H3_REQUEST_REJECTED.as_u64()]
+        );
+        assert_eq!(
+            stream.write_all(b"x").await.unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+
+        let io = Io::default();
+        let cancels = io.cancels.clone();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let count = completed.clone();
+        let mut stream = H3WriteStream::new(12, io);
+        stream.on_finish(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        (&stream).cancel(9);
+        assert_eq!(&*cancels.lock().unwrap(), &[9]);
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        (&stream).cancel(10);
+        assert_eq!(&*cancels.lock().unwrap(), &[9]);
+    }
+}

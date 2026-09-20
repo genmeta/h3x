@@ -172,4 +172,101 @@ mod tests {
             ErrorCode::QPACK_DECOMPRESSION_FAILED
         );
     }
+
+    #[tokio::test]
+    async fn async_literals_validate_prefix_lengths_truncation_and_huffman() {
+        for prefix_bits in [1, 9] {
+            assert_eq!(
+                be_string_literal(&mut &[][..], prefix_bits)
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::QPACK_ENCODER_STREAM_ERROR
+            );
+            assert_eq!(
+                be_string_literal_with_first(&mut &[][..], 0, prefix_bits)
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::QPACK_ENCODER_STREAM_ERROR
+            );
+        }
+
+        let mut oversized = Vec::new();
+        oversized
+            .put_prefixed_integer(MAX_BUFFERED_FRAME_PAYLOAD as u64 + 1, 7, 0)
+            .unwrap();
+        let first = oversized.remove(0);
+        assert_eq!(
+            be_string_literal_with_first(&mut oversized.as_slice(), first, 8)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_EXCESSIVE_LOAD
+        );
+        assert_eq!(
+            be_string_literal(&mut &[2, b'a'][..], 8)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+        );
+
+        let mut huffman = Vec::new();
+        httlib_huffman::encode(b"hello", &mut huffman).unwrap();
+        let mut wire = Vec::new();
+        wire.put_prefixed_integer(huffman.len() as u64, 7, 0x80)
+            .unwrap();
+        wire.extend_from_slice(&huffman);
+        assert_eq!(
+            be_string_literal(&mut wire.as_slice(), 8).await.unwrap(),
+            Bytes::from_static(b"hello")
+        );
+        let (rest, value) = be_string_literal_slice(&wire, 8).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(value, Bytes::from_static(b"hello"));
+
+        assert_eq!(
+            be_string_literal(&mut &[0x81, 0xff][..], 8)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::QPACK_ENCODER_STREAM_ERROR
+        );
+        assert_eq!(
+            be_string_literal_slice(&[0x81, 0xff], 8).unwrap_err().code,
+            ErrorCode::QPACK_DECOMPRESSION_FAILED
+        );
+    }
+
+    #[tokio::test]
+    async fn huffman_expansion_respects_decoded_buffer_limit() {
+        let decoded = vec![b'0'; MAX_BUFFERED_FRAME_PAYLOAD + 1];
+        let mut huffman = Vec::new();
+        httlib_huffman::encode(&decoded, &mut huffman).unwrap();
+        assert!(huffman.len() <= MAX_BUFFERED_FRAME_PAYLOAD);
+        let mut wire = Vec::new();
+        wire.put_prefixed_integer(huffman.len() as u64, 7, 0x80)
+            .unwrap();
+        wire.extend_from_slice(&huffman);
+        assert_eq!(
+            be_string_literal(&mut wire.as_slice(), 8)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::H3_EXCESSIVE_LOAD
+        );
+    }
+
+    #[test]
+    fn buffered_literal_rejects_missing_or_invalid_prefix() {
+        assert_eq!(
+            be_string_literal_slice(&[], 8).unwrap_err().code,
+            ErrorCode::QPACK_DECOMPRESSION_FAILED
+        );
+        assert_eq!(
+            be_string_literal_slice(&[0], 1).unwrap_err().code,
+            ErrorCode::QPACK_DECOMPRESSION_FAILED
+        );
+    }
 }

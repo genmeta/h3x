@@ -346,6 +346,7 @@ pub(crate) fn be_field_line(input: &[u8]) -> Result<(&[u8], FieldLine)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qpack::codec::instruction::EncoderInstruction;
 
     #[test]
     fn every_field_line_representation_round_trips() {
@@ -437,6 +438,118 @@ mod tests {
         };
         assert_eq!(
             invalid.dynamic_index(prefix).unwrap_err().code,
+            ErrorCode::QPACK_DECOMPRESSION_FAILED
+        );
+    }
+
+    #[test]
+    fn field_resolution_rejects_missing_indices_and_preserves_post_base_values() {
+        let mut table = DynamicTable::new(128).unwrap();
+        table
+            .apply(EncoderInstruction::SetDynamicTableCapacity(128))
+            .unwrap();
+        table
+            .apply(EncoderInstruction::InsertWithLiteralName {
+                name: Bytes::from_static(b"dynamic"),
+                value: Bytes::from_static(b"old"),
+            })
+            .unwrap();
+        let prefix = FieldSectionPrefix {
+            required_insert_count: 1,
+            base: 0,
+        };
+        let field = FieldLine::LiteralWithPostBaseNameReference {
+            never_index: true,
+            index: 0,
+            value: Bytes::from_static(b"new"),
+        }
+        .resolve(prefix, &table)
+        .unwrap();
+        assert_eq!(field.name, "dynamic");
+        assert_eq!(field.value, "new");
+        assert!(field.never_index);
+
+        assert_eq!(
+            FieldLine::IndexedPostBase { index: 1 }
+                .dynamic_index(prefix)
+                .unwrap_err()
+                .code,
+            ErrorCode::QPACK_DECOMPRESSION_FAILED
+        );
+        assert_eq!(
+            FieldLine::IndexedPostBase { index: 0 }
+                .resolve(prefix, &DynamicTable::new(128).unwrap())
+                .unwrap_err()
+                .code,
+            ErrorCode::QPACK_DECOMPRESSION_FAILED
+        );
+        assert_eq!(
+            FieldLine::Indexed {
+                static_table: true,
+                index: 99,
+            }
+            .resolve(prefix, &table)
+            .unwrap_err()
+            .code,
+            ErrorCode::QPACK_DECOMPRESSION_FAILED
+        );
+    }
+
+    #[test]
+    fn malformed_prefixes_and_empty_field_lines_are_rejected() {
+        for (prefix, capacity) in [
+            (
+                FieldSectionPrefix {
+                    required_insert_count: VARINT_MAX + 1,
+                    base: 0,
+                },
+                128,
+            ),
+            (
+                FieldSectionPrefix {
+                    required_insert_count: 0,
+                    base: VARINT_MAX + 1,
+                },
+                128,
+            ),
+            (
+                FieldSectionPrefix {
+                    required_insert_count: 1,
+                    base: 0,
+                },
+                0,
+            ),
+        ] {
+            assert_eq!(
+                Vec::new()
+                    .put_field_section_prefix(&prefix, capacity)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::QPACK_DECOMPRESSION_FAILED
+            );
+        }
+        assert_eq!(
+            be_field_section_prefix(&[0, 0], VARINT_MAX + 1, 0)
+                .unwrap_err()
+                .code,
+            ErrorCode::QPACK_DECOMPRESSION_FAILED
+        );
+        assert_eq!(
+            be_field_section_prefix(&[0], 128, 0).unwrap_err().code,
+            ErrorCode::QPACK_DECOMPRESSION_FAILED
+        );
+        assert_eq!(
+            be_field_section_prefix(&[3, 0], 32, 0).unwrap_err().code,
+            ErrorCode::QPACK_DECOMPRESSION_FAILED
+        );
+        assert_eq!(
+            be_field_section_prefix(&[0, 0xff], 128, 0)
+                .unwrap_err()
+                .code,
+            ErrorCode::QPACK_DECOMPRESSION_FAILED
+        );
+        assert_eq!(
+            be_field_line(&[]).unwrap_err().code,
             ErrorCode::QPACK_DECOMPRESSION_FAILED
         );
     }
