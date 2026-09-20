@@ -107,9 +107,9 @@ accept a parsed `http::Uri` and `http::Method`; both writer traits support
 
 ```rust
 use h3x::ArcWndBuf;
-use h3x::{Request, Response, ReadRequest, ReadResponse, WriteRequest, WriteResponse};
+use h3x::{Request, Response, W, ReadRequest, ReadResponse, WriteRequest, WriteResponse};
 
-let mut request: Request = http::Request::builder()
+let mut request: Request<W> = http::Request::builder()
     .method(http::Method::POST)
     .uri("https://example.com/upload")
     .version(http::Version::HTTP_3)
@@ -118,7 +118,7 @@ let mut request: Request = http::Request::builder()
 request.set_method(http::Method::PUT);
 assert_eq!(request.method(), http::Method::PUT);
 
-let mut response: Response = http::Response::builder()
+let mut response: Response<W> = http::Response::builder()
     .version(http::Version::HTTP_3)
     .body(ArcWndBuf::new(8192))?
     .into();
@@ -136,9 +136,9 @@ and responses. Both use `ArcWndBuf` for streaming, regardless of
 `Content-Length`. Import the traits and specify the incoming type:
 
 ```rust,ignore
-use h3x::{IncomingRequest, ReadMeesage, WriteMessage};
+use h3x::{R, ReadMeesage, Request, WriteMessage};
 
-let request: IncomingRequest = rs.read_message(qpack.clone()).await?;
+let request: Request<R> = rs.read_message(qpack.clone()).await?;
 ws.write_message(response, qpack).await?;
 ```
 

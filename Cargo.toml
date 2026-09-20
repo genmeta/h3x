@@ -21,6 +21,6 @@ futures = "0.3"
 http = "1"
 httlib-huffman = "0.3"
 thiserror = "2"
-qbase = { version = "0.6.4", path = "../dquic/qbase" }
-qrecovery = { version = "0.6.2", path = "../dquic/qrecovery" }
+qbase = "0.6.4"
+qrecovery = "0.6.2"
 tokio = { version = "1", features = ["macros", "rt", "io-util", "sync", "time"] }

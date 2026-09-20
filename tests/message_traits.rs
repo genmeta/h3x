@@ -1,6 +1,6 @@
 mod support;
 
-use h3x::{ErrorCode, IncomingResponse, ReadMeesage, ReadResponse, Response, WndBuf, WriteMessage};
+use h3x::{ErrorCode, R, ReadMeesage, ReadResponse, Response, W, WndBuf, WriteMessage};
 use support::connection_pair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -29,7 +29,7 @@ fn headers(fields: &[(&str, &str)]) -> Vec<u8> {
     frame
 }
 
-async fn receive(wire: Vec<u8>) -> Result<IncomingResponse, h3x::Error> {
+async fn receive(wire: Vec<u8>) -> Result<Response<R>, h3x::Error> {
     let (client, server) = connection_pair();
     let (_request_writer, rs) = client.open_bi().await.unwrap();
     let (mut ws, _request_reader) = server.accept_bi().await.unwrap();
@@ -113,7 +113,7 @@ async fn outgoing_body_is_streamed_without_length_validation() {
         let (client, server) = connection_pair();
         let (_ws, rs) = client.open_bi().await.unwrap();
         let (ws, _rs) = server.accept_bi().await.unwrap();
-        let response: Response = http::Response::builder()
+        let response: Response<W> = http::Response::builder()
             .header("content-length", length)
             .body(finished_body(b"abc").await)
             .unwrap()
@@ -121,7 +121,7 @@ async fn outgoing_body_is_streamed_without_length_validation() {
         ws.write_message(response, server.qpack().clone())
             .await
             .unwrap();
-        let response: IncomingResponse = rs.read_message(client.qpack().clone()).await.unwrap();
+        let response: Response<R> = rs.read_message(client.qpack().clone()).await.unwrap();
         assert_eq!(collect(response.into_body()).await, "abc");
     }
 }
@@ -134,7 +134,7 @@ async fn oversized_streaming_body_allows_producer_to_finish() {
     let window = WndBuf::new(1);
     let mut producer = window.clone();
     producer.write_all(b"x").await.unwrap();
-    let response: Response = http::Response::builder()
+    let response: Response<W> = http::Response::builder()
         .header("content-length", "0")
         .body(window)
         .unwrap()
@@ -146,7 +146,7 @@ async fn oversized_streaming_body_allows_producer_to_finish() {
     };
     let (result, ()) = tokio::join!(writing, producing);
     result.unwrap();
-    let response: IncomingResponse = rs.read_message(client.qpack().clone()).await.unwrap();
+    let response: Response<R> = rs.read_message(client.qpack().clone()).await.unwrap();
     assert_eq!(collect(response.into_body()).await, "xy");
 }
 
@@ -190,7 +190,7 @@ async fn content_length_returns_body_before_data_arrives() {
     ws.write_all(&headers(&[(":status", "200"), ("content-length", "3")]))
         .await
         .unwrap();
-    let response: IncomingResponse = tokio::time::timeout(
+    let response: Response<R> = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         rs.read_message(client.qpack().clone()),
     )

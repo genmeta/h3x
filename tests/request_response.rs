@@ -3,8 +3,8 @@ mod support;
 use std::sync::Arc;
 
 use h3x::{
-    IncomingRequest, IncomingResponse, ReadMeesage, ReadRequest, ReadResponse, Request, Response,
-    WndBuf, WriteMessage, WriteRequest,
+    R, ReadMeesage, ReadRequest, ReadResponse, Request, Response, W, WndBuf, WriteMessage,
+    WriteRequest,
 };
 use http::{Method, StatusCode, header};
 use support::connection_pair;
@@ -18,7 +18,7 @@ async fn content_length_request_and_response() {
     // its response to the paired `ws`.
     let serving = tokio::spawn(async move {
         let (ws, rs) = server.accept_bi().await.unwrap();
-        let request: IncomingRequest = rs.read_message(server.qpack().clone()).await.unwrap();
+        let request: Request<R> = rs.read_message(server.qpack().clone()).await.unwrap();
         let method = request.method();
 
         assert_eq!(method, Method::POST);
@@ -26,7 +26,7 @@ async fn content_length_request_and_response() {
         let body = collect(request.into_body()).await;
         assert_eq!(body, "hello");
 
-        let response: Response = http::Response::builder()
+        let response: Response<W> = http::Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_LENGTH, "5")
             .body(finished_body(b"world").await)
@@ -40,7 +40,7 @@ async fn content_length_request_and_response() {
     // Client: open a request stream. `ws` sends the request and the paired `rs`
     // receives the response. Drive both message futures concurrently.
     let (ws, rs) = client.open_bi().await.unwrap();
-    let request: Request = http::Request::builder()
+    let request: Request<W> = http::Request::builder()
         .method(Method::POST)
         .uri("https://example.com/echo")
         .header(header::CONTENT_LENGTH, "5")
@@ -49,7 +49,7 @@ async fn content_length_request_and_response() {
         .into();
     let writing = ws.write_message(request, client.qpack().clone());
     let receiving = rs.read_message(client.qpack().clone());
-    let ((), response): ((), IncomingResponse) = tokio::try_join!(writing, receiving).unwrap();
+    let ((), response): ((), Response<R>) = tokio::try_join!(writing, receiving).unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(collect(response.into_body()).await, "world");
@@ -62,52 +62,59 @@ async fn streaming_request_and_response() {
 
     let serving = tokio::spawn(async move {
         let (ws, rs) = server.accept_bi().await.unwrap();
-        let request: IncomingRequest = rs.read_message(server.qpack().clone()).await.unwrap();
-        let method = request.method();
+        let request: Request<R> = rs.read_message(server.qpack().clone()).await.unwrap();
 
-        assert_eq!(method, Method::POST);
-        assert_eq!(collect(request.into_body()).await, "streamed request");
+        assert_eq!(request.method(), Method::POST);
+        assert_eq!(request.path(), "/early-response");
+        let request_body = request.into_body();
 
-        // A streaming writer drains the WndBuf while the producer fills it.
-        // Drive both futures concurrently, otherwise a bounded buffer can stall.
-        let response_window = WndBuf::new(4);
+        let response_window = WndBuf::new(1);
         let mut response_body = response_window.clone();
-        let response: Response = http::Response::builder()
+        let response: Response<W> = http::Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_LENGTH, "17")
+            .header(header::CONTENT_LENGTH, "5")
             .body(response_window)
             .unwrap()
             .into();
+
+        // Keep the handler's request-body read and response-body write in this
+        // task. `write_message` must send HEADERS while the body work waits for
+        // the client to start uploading only after it receives those HEADERS.
         let writing = ws.write_message(response, server.qpack().clone());
-        let producing = async move {
-            response_body.write_all(b"streamed response").await?;
+        let handling_body = async move {
+            assert_eq!(collect(request_body).await, "hello");
+            response_body.write_all(b"world").await?;
             response_body.shutdown().await.map_err(h3x::Error::from)
         };
-        tokio::try_join!(writing, producing).unwrap();
+        tokio::try_join!(writing, handling_body).unwrap();
     });
 
     let (ws, rs) = client.open_bi().await.unwrap();
-    let request_window = WndBuf::new(4);
+    let request_window = WndBuf::new(1);
     let mut request_body = request_window.clone();
-    let request: Request = http::Request::builder()
+    let request: Request<W> = http::Request::builder()
         .method(Method::POST)
-        .uri("https://example.com/upload")
-        .header(header::CONTENT_LENGTH, "16")
+        .uri("https://example.com/early-response")
+        .header(header::CONTENT_LENGTH, "5")
         .body(request_window)
         .unwrap()
         .into();
+    let uploading = tokio::spawn(ws.write_message(request, client.qpack().clone()));
 
-    let writing = ws.write_message(request, client.qpack().clone());
-    let receiving = rs.read_message(client.qpack().clone());
-    let producing = async move {
-        request_body.write_all(b"streamed request").await?;
-        request_body.shutdown().await.map_err(h3x::Error::from)
-    };
-    let ((), response, ()): ((), IncomingResponse, ()) =
-        tokio::try_join!(writing, receiving, producing).unwrap();
-
+    let response: Response<R> = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        rs.read_message(client.qpack().clone()),
+    )
+    .await
+    .expect("response HEADERS must arrive before the request body is produced")
+    .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(collect(response.into_body()).await, "streamed response");
+
+    request_body.write_all(b"hello").await.unwrap();
+    request_body.shutdown().await.unwrap();
+    assert_eq!(collect(response.into_body()).await, "world");
+
+    uploading.await.unwrap().unwrap();
     serving.await.unwrap();
 }
 
@@ -122,7 +129,7 @@ async fn websocket_over_extended_connect() {
 
     let serving = tokio::spawn(async move {
         let (ws, rs) = server.accept_bi().await.unwrap();
-        let request: IncomingRequest = rs.read_message(server.qpack().clone()).await.unwrap();
+        let request: Request<R> = rs.read_message(server.qpack().clone()).await.unwrap();
         let method = request.method();
 
         // RFC 9220 represents WebSocket as an extended CONNECT request.
@@ -137,7 +144,7 @@ async fn websocket_over_extended_connect() {
         // Content-Length. Sending its HEADERS accepts the tunnel.
         let response_window = WndBuf::new(4);
         let mut response_body = response_window.clone();
-        let response: Response = http::Response::builder()
+        let response: Response<W> = http::Response::builder()
             .status(StatusCode::OK)
             .header("sec-websocket-protocol", "chat")
             .body(response_window)
@@ -158,7 +165,7 @@ async fn websocket_over_extended_connect() {
     let (ws, rs) = client.open_bi().await.unwrap();
     let request_window = WndBuf::new(4);
     let mut request_body = request_window.clone();
-    let request: Request = http::Request::builder()
+    let request: Request<W> = http::Request::builder()
         .method(Method::CONNECT)
         .uri("wss://example.com/chat")
         .extension(Arc::<str>::from("websocket"))
@@ -169,7 +176,7 @@ async fn websocket_over_extended_connect() {
 
     // CONNECT data is held until the peer accepts with final 2xx HEADERS.
     let uploading = tokio::spawn(ws.write_message(request, client.qpack().clone()));
-    let response: IncomingResponse = rs.read_message(client.qpack().clone()).await.unwrap();
+    let response: Response<R> = rs.read_message(client.qpack().clone()).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["sec-websocket-protocol"], "chat");
     let mut response_body: WndBuf = response.into_body();
@@ -194,7 +201,7 @@ async fn websocket_over_extended_connect() {
 
 #[test]
 fn websocket_uri_schemes_are_normalized() {
-    fn request(uri: &str, protocol: &str) -> Request {
+    fn request(uri: &str, protocol: &str) -> Request<W> {
         http::Request::builder()
             .method(Method::CONNECT)
             .uri(uri)
@@ -232,7 +239,7 @@ fn websocket_uri_schemes_are_normalized() {
     request.set_uri("ws://example.com/other".parse().unwrap());
     assert_eq!(request.scheme(), "http");
 
-    let mut request: Request = http::Request::builder()
+    let mut request: Request<W> = http::Request::builder()
         .method(Method::GET)
         .uri("wss://example.com/chat")
         .extension(Arc::<str>::from("websocket"))
@@ -243,7 +250,7 @@ fn websocket_uri_schemes_are_normalized() {
     request.set_method(Method::CONNECT);
     assert_eq!(request.scheme(), "https");
 
-    let mut request: Request = http::Request::builder()
+    let mut request: Request<W> = http::Request::builder()
         .method(Method::CONNECT)
         .uri("wss://example.com/chat")
         .body(WndBuf::new(1))
@@ -271,7 +278,7 @@ async fn any_frame_after_trailers_is_rejected() {
             .unwrap();
         ws.write_all(suffix).await.unwrap();
         ws.shutdown().await.unwrap();
-        let response: IncomingResponse = rs.read_message(client.qpack().clone()).await.unwrap();
+        let response: Response<R> = rs.read_message(client.qpack().clone()).await.unwrap();
         let error = response
             .into_body()
             .read_to_end(&mut Vec::new())
@@ -294,7 +301,7 @@ async fn trailers_followed_by_fin_are_accepted() {
         .await
         .unwrap();
     ws.shutdown().await.unwrap();
-    let response: IncomingResponse = rs.read_message(client.qpack().clone()).await.unwrap();
+    let response: Response<R> = rs.read_message(client.qpack().clone()).await.unwrap();
     assert_eq!(
         response
             .into_body()
