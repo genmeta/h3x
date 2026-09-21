@@ -1,6 +1,6 @@
 mod support;
 
-use h3x::{ErrorCode, R, ReadResponse, Request, Response, W, WndBuf, WriteResponse};
+use h3x::{ErrorCode, R, ReadResponse, Request, Response, Trailers, W, WndBuf, WriteResponse};
 use qrecovery::{recv::StopSending, send::CancelStream};
 use support::connection_pair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -428,4 +428,97 @@ async fn directional_messages_expose_transport_cancellation() {
     response.cancel(ErrorCode::InternalError.as_u64());
     let error = response.write_all(b"x").await.unwrap_err();
     assert_eq!(h3x::Error::from(error).code, ErrorCode::InternalError);
+}
+
+#[tokio::test]
+async fn message_accessors_mutators_and_io_delegation() {
+    let mut request: Request<W> = http::Request::builder()
+        .uri("ws://example.com/initial")
+        .body(WndBuf::new(16))
+        .unwrap()
+        .into();
+    request
+        .set_protocol("websocket")
+        .set_method(http::Method::CONNECT)
+        .set_uri("wss://example.com/chat".parse().unwrap())
+        .set_header(
+            http::HeaderName::from_static("x-tag"),
+            http::HeaderValue::from_static("a"),
+        )
+        .append_header(
+            http::HeaderName::from_static("x-tag"),
+            http::HeaderValue::from_static("b"),
+        );
+    request
+        .set_trailer(
+            http::HeaderName::from_static("x-checksum"),
+            http::HeaderValue::from_static("one"),
+        )
+        .append_trailer(
+            http::HeaderName::from_static("x-checksum"),
+            http::HeaderValue::from_static("two"),
+        );
+    assert_eq!(request.uri(), "https://example.com/chat");
+    assert_eq!(request.protocol(), Some("websocket"));
+    assert_eq!(request.headers().get_all("x-tag").iter().count(), 2);
+    assert_eq!(request.trailers().get_all("x-checksum").iter().count(), 2);
+    let _ = request.body();
+
+    let mut request_clone = request.clone();
+    request_clone.write_all(b"request").await.unwrap();
+    request_clone.flush().await.unwrap();
+    request_clone.shutdown().await.unwrap();
+    let http_request: http::Request<WndBuf> = request.into();
+    let request: Request<W> = http_request.into();
+    assert_eq!(collect(request.into_body()).await, "request");
+
+    let mut response: Response<W> = http::Response::new(WndBuf::new(16)).into();
+    response
+        .set_status(http::StatusCode::CREATED)
+        .set_header(
+            http::HeaderName::from_static("x-tag"),
+            http::HeaderValue::from_static("a"),
+        )
+        .append_header(
+            http::HeaderName::from_static("x-tag"),
+            http::HeaderValue::from_static("b"),
+        );
+    response
+        .set_trailer(
+            http::HeaderName::from_static("x-checksum"),
+            http::HeaderValue::from_static("one"),
+        )
+        .append_trailer(
+            http::HeaderName::from_static("x-checksum"),
+            http::HeaderValue::from_static("two"),
+        );
+    assert_eq!(response.headers().get_all("x-tag").iter().count(), 2);
+    assert_eq!(response.trailers().get_all("x-checksum").iter().count(), 2);
+    let _ = response.body();
+
+    let mut response_clone = response.clone();
+    response_clone.write_all(b"response").await.unwrap();
+    response_clone.flush().await.unwrap();
+    response_clone.shutdown().await.unwrap();
+    let http_response: http::Response<WndBuf> = response.into();
+    let response: Response<W> = http_response.into();
+    assert_eq!(collect(response.into_body()).await, "response");
+
+    let trailers = Trailers::new();
+    assert!(trailers.is_empty());
+
+    let mut outgoing_request: Request<W> = http::Request::new(WndBuf::new(1)).into();
+    outgoing_request.cancel(ErrorCode::RequestCancelled.as_u64());
+    assert_eq!(
+        h3x::Error::from(outgoing_request.write_all(b"x").await.unwrap_err()).code,
+        ErrorCode::RequestCancelled
+    );
+
+    let mut incoming_response: Response<R> =
+        Response::from_parts(http::Response::new(()).into_parts().0, WndBuf::new(1));
+    incoming_response.stop(ErrorCode::RequestCancelled.as_u64());
+    assert_eq!(
+        h3x::Error::from(incoming_response.read(&mut [0]).await.unwrap_err()).code,
+        ErrorCode::RequestCancelled
+    );
 }

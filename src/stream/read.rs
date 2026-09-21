@@ -379,7 +379,7 @@ mod tests {
     use std::{
         pin::Pin,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll},
@@ -428,6 +428,40 @@ mod tests {
     }
 
     impl TransportError for Io {
+        fn map_error(error: io::Error) -> Error {
+            Error::from_stream_io(error)
+        }
+    }
+
+    struct PendingIo {
+        bytes: Vec<u8>,
+        offset: usize,
+        stops: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl AsyncRead for PendingIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.offset == self.bytes.len() {
+                return Poll::Pending;
+            }
+            let count = (self.bytes.len() - self.offset).min(buf.remaining());
+            buf.put_slice(&self.bytes[self.offset..self.offset + count]);
+            self.offset += count;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl StopSending for PendingIo {
+        fn stop(&mut self, code: u64) {
+            self.stops.lock().unwrap().push(code);
+        }
+    }
+
+    impl TransportError for PendingIo {
         fn map_error(error: io::Error) -> Error {
             Error::from_stream_io(error)
         }
@@ -523,6 +557,7 @@ mod tests {
             count.fetch_add(1, Ordering::SeqCst);
         });
         let _registered = stream.state.clone();
+        assert_eq!(stream.read(&mut []).await.unwrap(), 0);
         let mut out = Vec::new();
         stream.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, b"abc");
@@ -560,5 +595,46 @@ mod tests {
         };
         assert_eq!(error.code, ErrorCode::RequestIncomplete);
         assert_eq!(completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_request_body_stops_the_pending_transport_read() {
+        let qpack = crate::qpack::tests::qpack();
+        let field = |name: &'static [u8], value: &'static [u8]| crate::qpack::Field {
+            name: Bytes::from_static(name),
+            value: Bytes::from_static(value),
+            never_index: false,
+        };
+        let fields = vec![
+            field(b":method", b"GET"),
+            field(b":scheme", b"https"),
+            field(b":authority", b"example.com"),
+            field(b":path", b"/"),
+        ];
+        let field_section = qpack.encode(0, fields).unwrap();
+        let mut wire = Vec::new();
+        wire.put_frame(
+            &Frame::new(frame::Headers { field_section })
+                .expect("small literal headers fit in one frame"),
+        );
+        let stops = Arc::new(Mutex::new(Vec::new()));
+        let stream = H3ReadStream::new(
+            0,
+            PendingIo {
+                bytes: wire,
+                offset: 0,
+                stops: stops.clone(),
+            },
+        );
+        let mut request = stream.read_request(qpack).await.unwrap();
+        request.stop(ErrorCode::RequestCancelled.as_u64());
+        assert_eq!(
+            &*stops.lock().unwrap(),
+            &[ErrorCode::RequestCancelled.as_u64()]
+        );
+        assert_eq!(
+            Error::from(request.read(&mut [0]).await.unwrap_err()).code,
+            ErrorCode::RequestCancelled
+        );
     }
 }

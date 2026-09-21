@@ -462,4 +462,90 @@ mod tests {
         assert_eq!(response_shutdowns.load(Ordering::SeqCst), 1);
         assert_eq!(response_completed.load(Ordering::SeqCst), 1);
     }
+
+    #[tokio::test]
+    async fn body_cancellation_aborts_request_and_response_writers() {
+        let request_body = crate::ArcWndBuf::new(1);
+        let request_producer = request_body.clone();
+        let request: Request<crate::W> = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://example.com/upload")
+            .body(request_body)
+            .unwrap()
+            .into();
+        let request_io = Io::default();
+        let request_cancels = request_io.cancels.clone();
+        let request_writer = tokio::spawn(
+            H3WriteStream::new(0, request_io).write_request(request, crate::qpack::tests::qpack()),
+        );
+        tokio::task::yield_now().await;
+        request_producer.cancel(ErrorCode::RequestCancelled.as_u64());
+        assert_eq!(
+            request_writer.await.unwrap().unwrap_err().code,
+            ErrorCode::RequestCancelled
+        );
+        assert_eq!(
+            &*request_cancels.lock().unwrap(),
+            &[ErrorCode::RequestCancelled.as_u64()]
+        );
+
+        let response_body = crate::ArcWndBuf::new(1);
+        let response_producer = response_body.clone();
+        let response: Response<crate::W> = http::Response::new(response_body).into();
+        let response_io = Io::default();
+        let response_cancels = response_io.cancels.clone();
+        let response_writer = tokio::spawn(H3WriteStream::new(0, response_io).write_response(
+            response,
+            http::Method::GET,
+            crate::qpack::tests::qpack(),
+        ));
+        tokio::task::yield_now().await;
+        response_producer.cancel(ErrorCode::RequestCancelled.as_u64());
+        assert_eq!(
+            response_writer.await.unwrap().unwrap_err().code,
+            ErrorCode::RequestCancelled
+        );
+        assert_eq!(
+            &*response_cancels.lock().unwrap(),
+            &[ErrorCode::RequestCancelled.as_u64()]
+        );
+    }
+
+    #[tokio::test]
+    async fn qpack_failure_reaches_request_and_response_producers() {
+        let qpack = crate::qpack::tests::qpack();
+        qpack.on_connection_error(ErrorCode::InternalError.reason("qpack failed"));
+
+        let request_body = crate::ArcWndBuf::new(1);
+        let mut request_producer = request_body.clone();
+        let request: Request<crate::W> = http::Request::builder()
+            .uri("https://example.com/")
+            .body(request_body)
+            .unwrap()
+            .into();
+        let mut request_stream = H3WriteStream::new(0, Io::default());
+        request_stream.cancel(ErrorCode::NoError.as_u64());
+        let error = request_stream
+            .write_request(request, qpack.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InternalError);
+        assert_eq!(
+            Error::from(request_producer.write_all(b"x").await.unwrap_err()).code,
+            ErrorCode::InternalError
+        );
+
+        let response_body = crate::ArcWndBuf::new(1);
+        let mut response_producer = response_body.clone();
+        let response: Response<crate::W> = http::Response::new(response_body).into();
+        let error = H3WriteStream::new(0, Io::default())
+            .write_response(response, http::Method::GET, qpack)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InternalError);
+        assert_eq!(
+            Error::from(response_producer.write_all(b"x").await.unwrap_err()).code,
+            ErrorCode::InternalError
+        );
+    }
 }
