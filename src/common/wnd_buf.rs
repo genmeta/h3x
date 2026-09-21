@@ -114,15 +114,12 @@ impl AsyncWrite for WndBuf {
     }
 }
 
+type ErrorCb = Arc<Mutex<Option<Box<dyn FnOnce(Error) + Send>>>>;
 /// Shared window; the first error terminates both reading and writing.
 #[derive(Clone)]
 pub struct ArcWndBuf {
-    shared: Arc<Mutex<Shared>>,
-}
-
-struct Shared {
-    window: crate::Result<WndBuf>,
-    on_error: Option<Box<dyn FnOnce(Error) + Send>>,
+    window: Arc<Mutex<crate::Result<WndBuf>>>,
+    error_cb: ErrorCb,
 }
 
 impl std::fmt::Debug for ArcWndBuf {
@@ -134,24 +131,22 @@ impl std::fmt::Debug for ArcWndBuf {
 impl ArcWndBuf {
     pub fn new(capacity: usize) -> Self {
         Self {
-            shared: Arc::new(Mutex::new(Shared {
-                window: Ok(WndBuf::with_capacity(capacity)),
-                on_error: None,
-            })),
+            window: Arc::new(Mutex::new(Ok(WndBuf::with_capacity(capacity)))),
+            error_cb: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub(crate) fn on_error(&self, error: Error) {
-        let mut state = self.shared.lock().unwrap();
-        if let Ok(window) = &mut state.window {
+    pub(crate) fn error(&self, error: Error) {
+        let mut state = self.window.lock().unwrap();
+        if let Ok(window) = &mut *state {
             if let Some(waker) = window.read_waker.take() {
                 waker.wake();
             }
             if let Some(waker) = window.write_waker.take() {
                 waker.wake();
             }
-            state.window = Err(error.clone());
-            let callback = state.on_error.take();
+            *state = Err(error.clone());
+            let callback = self.error_cb.lock().unwrap().take();
             drop(state);
             if let Some(callback) = callback {
                 callback(error);
@@ -159,22 +154,23 @@ impl ArcWndBuf {
         }
     }
 
-    pub(crate) fn on_error_callback(&self, callback: impl FnOnce(Error) + Send + 'static) {
-        let mut state = self.shared.lock().unwrap();
-        if let Err(error) = &state.window {
+    pub(crate) fn on_error(&self, callback: impl FnOnce(Error) + Send + 'static) {
+        let state = self.window.lock().unwrap();
+        if let Err(error) = &*state {
             let error = error.clone();
             drop(state);
             callback(error);
         } else {
-            state.on_error = Some(Box::new(callback));
+            *self.error_cb.lock().unwrap() = Some(Box::new(callback));
         }
     }
 
     pub(crate) fn cancel(&self, code: u64) {
-        self.on_error(
+        self.error(
             crate::ErrorCode::try_from(code)
                 .unwrap_or(crate::ErrorCode::InternalError)
-                .reason("body cancelled"),
+                .reason("body cancelled")
+                .stream(),
         );
     }
 
@@ -182,7 +178,7 @@ impl ArcWndBuf {
         &self,
         poll: impl FnOnce(Pin<&mut WndBuf>) -> Poll<io::Result<T>>,
     ) -> Poll<io::Result<T>> {
-        match &mut self.shared.lock().unwrap().window {
+        match &mut *self.window.lock().unwrap() {
             Ok(window) => poll(Pin::new(window)),
             Err(error) => Poll::Ready(Err(error.clone().into())),
         }
@@ -252,7 +248,7 @@ mod tests {
     fn error_callback_observes_the_first_error_once() {
         let window = ArcWndBuf::new(1);
         let calls = Arc::new(AtomicUsize::new(0));
-        window.on_error_callback({
+        window.on_error({
             let calls = calls.clone();
             move |error| {
                 assert_eq!(error.code, ErrorCode::RequestCancelled);
@@ -269,7 +265,7 @@ mod tests {
         let window = ArcWndBuf::new(1);
         window.cancel(ErrorCode::RequestCancelled.as_u64());
         let calls = Arc::new(AtomicUsize::new(0));
-        window.on_error_callback({
+        window.on_error({
             let calls = calls.clone();
             move |_| {
                 calls.fetch_add(1, Ordering::SeqCst);

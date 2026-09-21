@@ -53,8 +53,8 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
         self.view.accept(id)
     }
 
-    pub(crate) fn send_goaway(&self) -> impl Future<Output = StreamId> + use<R, W> {
-        self.view.send_goaway()
+    pub(crate) fn local_goaway(&self) -> impl Future<Output = StreamId> + use<R, W> {
+        self.view.local_goaway()
     }
 
     pub(crate) fn recv_goway(&self) -> ArcReceiving<()> {
@@ -74,17 +74,18 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
             }
         }
         for id in rejected {
-            qpack.cancel(id)?;
+            qpack.cancel_decode(id)?;
         }
         self.try_wake();
         Ok(())
     }
 
     /// Freeze admission and cancel rejected requests without waiting for the write.
-    pub(crate) fn goaway(&mut self, qpack: &ArcQpack) -> Result<()> {
+    pub(crate) fn goaway(&mut self, qpack: &ArcQpack) -> Result<StreamId> {
         let id = self.view.goaway();
         self.drain.goaway();
-        self.reject_from(id.into(), qpack)
+        self.reject_from(id.into(), qpack)?;
+        Ok(id)
     }
 
     pub(crate) fn on_goaway(&mut self, id: StreamId, qpack: ArcQpack) -> Result<()> {
@@ -231,10 +232,10 @@ where
             let write = write.state.clone();
             let qpack = qpack.clone();
             move |code| {
-                if write.terminate(|io| io.cancel(code)) {
+                if code != ErrorCode::NoError.as_u64() && write.terminate(|io| io.cancel(code)) {
                     finish();
                 }
-                if let Err(error) = qpack.cancel(id) {
+                if let Err(error) = qpack.cancel_decode(id) {
                     qpack.on_connection_error(error);
                 }
             }
@@ -243,11 +244,13 @@ where
             let finish = read.finish_cb.clone();
             let read = read.state.clone();
             move |code| {
-                if read.terminate(|io| io.stop(code)) {
-                    finish();
-                }
-                if let Err(error) = qpack.cancel(id) {
-                    qpack.on_connection_error(error);
+                if code != ErrorCode::NoError.as_u64() {
+                    if read.terminate(|io| io.stop(code)) {
+                        finish();
+                    }
+                    if let Err(error) = qpack.cancel_decode(id) {
+                        qpack.on_connection_error(error);
+                    }
                 }
             }
         });

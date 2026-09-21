@@ -323,14 +323,9 @@ fn websocket_uri_schemes_are_normalized() {
 }
 
 #[tokio::test]
-async fn any_frame_after_trailers_is_rejected() {
+async fn known_frame_after_trailers_is_rejected() {
     // QPACK prefix followed by static :status = 200, then empty trailers.
-    for suffix in [
-        &b"\x00\x00"[..],
-        &b"\x01\x02\x00\x00"[..],
-        &b"\x21\x00"[..],
-        &b"\x21"[..],
-    ] {
+    for suffix in [&b"\x00\x00"[..], &b"\x01\x02\x00\x00"[..]] {
         let (client, server) = connection_pair();
         let (_ws, rs) = client.open_bi().await.unwrap();
         let (mut ws, _rs) = server.accept_bi().await.unwrap();
@@ -362,6 +357,30 @@ async fn trailers_followed_by_fin_are_accepted() {
     let (mut ws, _rs) = server.accept_bi().await.unwrap();
     // Unknown extension before trailers remains skippable.
     ws.write_all(b"\x01\x03\x00\x00\xd9\x21\x00\x01\x02\x00\x00")
+        .await
+        .unwrap();
+    ws.shutdown().await.unwrap();
+    let response: Response<R> = rs
+        .read_response(Method::GET, client.qpack().clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        response
+            .into_body()
+            .read_to_end(&mut Vec::new())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn unknown_frames_after_trailers_are_ignored() {
+    let (client, server) = connection_pair();
+    let (_ws, rs) = client.open_bi().await.unwrap();
+    let (mut ws, _rs) = server.accept_bi().await.unwrap();
+    // QPACK prefix, static :status = 200, empty trailers, then two extensions.
+    ws.write_all(b"\x01\x03\x00\x00\xd9\x01\x02\x00\x00\x21\x02ok\x22\x00")
         .await
         .unwrap();
     ws.shutdown().await.unwrap();

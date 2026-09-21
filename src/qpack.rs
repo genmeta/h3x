@@ -192,7 +192,7 @@ impl ArcQpack {
     /// Error scope is selected by the caller from the context in which the
     /// error occurred; an HTTP/3 error code alone does not determine it.
     pub fn on_stream_error(&self, id: u64, error: Error) -> Error {
-        if let Err(cancel_error) = self.cancel(id) {
+        if let Err(cancel_error) = self.cancel_decode(id) {
             return self.on_connection_error(cancel_error);
         }
         error.stream()
@@ -263,7 +263,7 @@ impl ArcQpack {
         .await
     }
 
-    pub fn cancel(&self, id: u64) -> Result<()> {
+    pub fn cancel_decode(&self, id: u64) -> Result<()> {
         let wakes = self.with_state(|state| state.decoder.cancel(id))?;
         for wake in wakes {
             wake.wake();
@@ -830,7 +830,7 @@ pub(crate) mod tests {
             tokio::spawn(async move { qpack.decode(4, wire.into()).await })
         };
         tokio::task::yield_now().await;
-        qpack.cancel(4).unwrap();
+        qpack.cancel_decode(4).unwrap();
         assert_eq!(
             decoding.await.unwrap().unwrap_err().code,
             ErrorCode::RequestCancelled

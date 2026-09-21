@@ -2,7 +2,8 @@ mod support;
 
 use std::time::Duration;
 
-use qrecovery::recv::StopSending;
+use h3x::ErrorCode;
+use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
@@ -55,6 +56,38 @@ async fn read_cancel_also_cancels_write_and_completes_drain() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn no_error_stop_allows_an_early_response() {
+    let (client, server) = support::connection_pair();
+    let (_cw, mut cr) = client.open_bi().await.unwrap();
+    let (mut sw, mut sr) = server.accept_bi().await.unwrap();
+
+    sr.stop(ErrorCode::NoError.as_u64());
+    sw.write_all(b"early response").await.unwrap();
+    sw.shutdown().await.unwrap();
+
+    let mut response = Vec::new();
+    cr.read_to_end(&mut response).await.unwrap();
+    assert_eq!(response, b"early response");
+}
+
+#[tokio::test]
+async fn no_error_cancel_allows_reading_the_response() {
+    let (client, server) = support::connection_pair();
+    let (cw, mut cr) = client.open_bi().await.unwrap();
+    let (mut sw, _sr) = server.accept_bi().await.unwrap();
+
+    (&cw).cancel(ErrorCode::NoError.as_u64());
+    sw.write_all(b"response after upload cancellation")
+        .await
+        .unwrap();
+    sw.shutdown().await.unwrap();
+
+    let mut response = Vec::new();
+    cr.read_to_end(&mut response).await.unwrap();
+    assert_eq!(response, b"response after upload cancellation");
 }
 
 #[tokio::test]

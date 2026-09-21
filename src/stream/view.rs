@@ -92,7 +92,7 @@ impl StreamView {
         self.remote_goaway.obtain(());
     }
 
-    pub(crate) fn send_goaway(&self) -> impl Future<Output = StreamId> + use<> {
+    pub(crate) fn local_goaway(&self) -> impl Future<Output = StreamId> + use<> {
         let mut notification = self.local_goaway.subscribe();
         async move {
             notification
@@ -144,7 +144,7 @@ mod tests {
                 .code,
             ErrorCode::RequestRejected
         );
-        assert_eq!(view.send_goaway().await, local);
+        assert_eq!(view.local_goaway().await, local);
 
         let remote = StreamId::new(Role::Client, Dir::Bi, 1);
         view.on_goaway(remote);
