@@ -9,7 +9,7 @@ pub(super) async fn be_byte<T: AsyncRead + Unpin + ?Sized>(reader: &mut T) -> Re
     reader
         .read_u8()
         .await
-        .map_err(|error| crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM))
+        .map_err(|error| crate::Error::from_io(error, ErrorCode::ClosedCriticalStream))
 }
 
 pub(super) async fn be_prefixed_integer_with_first<T: AsyncRead + Unpin + ?Sized>(
@@ -43,7 +43,7 @@ pub(super) async fn be_prefixed_integer_with_first<T: AsyncRead + Unpin + ?Sized
 /// RFC 9204 section 4.1.1: decode a prefixed integer, limited to 62 bits.
 pub(super) fn be_prefixed_integer(mut input: &[u8], prefix_bits: u8) -> Result<(&[u8], u64)> {
     let (&first, rest) = input.split_first().ok_or_else(|| {
-        ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("prefixed integer is missing its first byte")
+        ErrorCode::QpackDecompressionFailed.reason("prefixed integer is missing its first byte")
     })?;
     input = rest;
     let limit = (1u64 << prefix_bits) - 1;
@@ -53,21 +53,21 @@ pub(super) fn be_prefixed_integer(mut input: &[u8], prefix_bits: u8) -> Result<(
     }
     for shift in (0..63).step_by(7) {
         let (&byte, rest) = input.split_first().ok_or_else(|| {
-            ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("prefixed integer is truncated")
+            ErrorCode::QpackDecompressionFailed.reason("prefixed integer is truncated")
         })?;
         input = rest;
         value = value
             .checked_add(u64::from(byte & 0x7f) << shift)
             .filter(|&value| value <= VARINT_MAX)
             .ok_or_else(|| {
-                ErrorCode::QPACK_DECOMPRESSION_FAILED
+                ErrorCode::QpackDecompressionFailed
                     .reason("prefixed integer exceeds the QUIC variable-integer range")
             })?;
         if byte & 0x80 == 0 {
             return Ok((input, value));
         }
     }
-    Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
+    Err(ErrorCode::QpackDecompressionFailed
         .reason("prefixed integer has too many continuation bytes"))
 }
 
@@ -84,7 +84,7 @@ impl<B: BufMut> WritePrefixedInteger for B {
         high_bits: u8,
     ) -> Result<()> {
         if value > VARINT_MAX {
-            return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
+            return Err(ErrorCode::QpackDecompressionFailed
                 .reason("invalid prefixed-integer width, value, or high bits"));
         }
         let limit = (1u64 << prefix_bits) - 1;
@@ -137,11 +137,11 @@ mod tests {
     fn prefixed_integer_rejects_truncation_overflow_and_out_of_range_values() {
         assert_eq!(
             be_prefixed_integer(&[0x1f], 5).unwrap_err().code,
-            ErrorCode::QPACK_DECOMPRESSION_FAILED
+            ErrorCode::QpackDecompressionFailed
         );
         assert_eq!(
             be_prefixed_integer(&[0xff; 10], 8).unwrap_err().code,
-            ErrorCode::QPACK_DECOMPRESSION_FAILED
+            ErrorCode::QpackDecompressionFailed
         );
 
         let mut wire = Vec::new();
@@ -149,7 +149,7 @@ mod tests {
             wire.put_prefixed_integer(VARINT_MAX + 1, 8, 0)
                 .unwrap_err()
                 .code,
-            ErrorCode::QPACK_DECOMPRESSION_FAILED
+            ErrorCode::QpackDecompressionFailed
         );
         assert!(wire.is_empty());
     }

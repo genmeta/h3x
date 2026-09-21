@@ -21,7 +21,7 @@ mod control;
 mod settings;
 pub use settings::Settings;
 
-use crate::ErrorCode::H3_NO_ERROR;
+use crate::ErrorCode::NoError;
 
 /// An HTTP/3 connection whose control and QPACK streams are driven automatically.
 /// Construct inside a Tokio runtime. Tasks run until the transport terminates.
@@ -105,10 +105,12 @@ impl<T: Transport> H3Connection<T> {
             let mut guard = self.bi_streams.lock().unwrap();
             guard.remote_no_goway()?;
             let (id, (recv, send)) = ready!(opening.as_mut().poll(cx))?.ok_or_else(|| {
-                ErrorCode::H3_STREAM_CREATION_ERROR
+                ErrorCode::StreamCreationError
                     .reason("transport cannot open a bidirectional stream")
             })?;
-            let (read, write) = self.bi_streams.insert(&mut guard, id, recv, send);
+            let (read, write) =
+                self.bi_streams
+                    .insert(&mut guard, id, recv, send, self.qpack.clone());
             Poll::Ready(Ok((write, read)))
         })
         .await
@@ -128,14 +130,14 @@ impl<T: Transport> H3Connection<T> {
                 result = async {
                     let remote_goaway = self.bi_streams.lock().unwrap().recv_goway();
                     remote_goaway.await.map_err(|error| {
-                        ErrorCode::H3_INTERNAL_ERROR.reason(format!("GOAWAY wait cancelled: {error}"))
+                        ErrorCode::InternalError.reason(format!("GOAWAY wait cancelled: {error}"))
                     })?;
                     let drained = self.bi_streams.drain();
                     drained.await;
                     Ok::<_, crate::Error>(())
                 } => result?,
             }
-            self.transport.close(String::new(), H3_NO_ERROR.as_u64())
+            self.transport.close(String::new(), NoError.as_u64())
         }
     }
 
@@ -165,15 +167,16 @@ impl<T: Transport> H3Connection<T> {
             let stream_id = qbase::varint::VarInt::try_from(id)
                 .map(qbase::sid::StreamId::from)
                 .map_err(|error| {
-                    ErrorCode::H3_ID_ERROR
-                        .reason(format!("invalid stream or push identifier: {error}"))
+                    ErrorCode::IdError.reason(format!("invalid stream or push identifier: {error}"))
                 });
             if let Err(error) = stream_id.and_then(|id| guard.accept(id)) {
-                recv.stop(ErrorCode::H3_REQUEST_REJECTED.as_u64());
-                send.cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64());
+                recv.stop(ErrorCode::RequestRejected.as_u64());
+                send.cancel(ErrorCode::RequestRejected.as_u64());
                 return Poll::Ready(Err(error));
             }
-            let (read, write) = self.bi_streams.insert(&mut guard, id, recv, send);
+            let (read, write) =
+                self.bi_streams
+                    .insert(&mut guard, id, recv, send, self.qpack.clone());
             Poll::Ready(Ok((write, read)))
         })
         .await
@@ -215,7 +218,7 @@ impl<T: Transport> H3Connection<T> {
                 // bitset for the connection's lifetime; claims are never released.
                 let bit = 1 << (stream_type as u8);
                 if peer_critical_streams.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
-                    return Err(ErrorCode::H3_STREAM_CREATION_ERROR
+                    return Err(ErrorCode::StreamCreationError
                         .reason(format!("duplicate peer {stream_type:?} stream")));
                 }
             }
@@ -239,7 +242,7 @@ impl<T: Transport> H3Connection<T> {
                         .await
                 }
                 StreamType::Push => {
-                    Err(ErrorCode::H3_ID_ERROR.reason("invalid stream or push identifier"))
+                    Err(ErrorCode::IdError.reason("invalid stream or push identifier"))
                 }
                 StreamType::QpackEncoder => self.qpack.receive_encoder(&mut recv).await,
                 StreamType::QpackDecoder => self.qpack.receive_decoder(&mut recv).await,
@@ -253,7 +256,9 @@ impl<T: Transport> H3Connection<T> {
         // Retain the half until failure handling completes, including transport close.
         if let Err(error) = result {
             let error = self.qpack.on_connection_error(error);
-            let _ = self.transport.close(error.reason, error.code.as_u64());
+            let _ = self
+                .transport
+                .close(error.reason.clone(), error.code.as_u64());
         }
     }
 
@@ -346,6 +351,12 @@ mod tests {
         fn cancel(&mut self, _: u64) {}
     }
 
+    impl crate::TransportError for Io {
+        fn map_error(error: io::Error) -> crate::Error {
+            crate::Error::from_stream_io(error)
+        }
+    }
+
     type BiStream = (u64, (Io, Io));
 
     struct TestTransport {
@@ -381,7 +392,7 @@ mod tests {
             Ok(None)
         }
         async fn accept_uni(&self) -> Result<(u64, Io)> {
-            Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused"))
+            Err(ErrorCode::InternalError.reason("unused"))
         }
         fn close(&self, _: String, _: u64) -> Result<()> {
             self.closes.fetch_add(1, Ordering::SeqCst);
@@ -403,13 +414,13 @@ mod tests {
     async fn bidirectional_admission_reports_transport_and_identifier_errors() {
         let error = connection(TestTransport::new(
             None,
-            Err(ErrorCode::H3_INTERNAL_ERROR.reason("accept failed")),
+            Err(ErrorCode::InternalError.reason("accept failed")),
         ))
         .open_bi()
         .await
         .err()
         .expect("opening an unavailable stream must fail");
-        assert_eq!(error.code, ErrorCode::H3_STREAM_CREATION_ERROR);
+        assert_eq!(error.code, ErrorCode::StreamCreationError);
 
         let invalid = (1_u64 << 62, (Io::default(), Io::default()));
         let invalid_connection = connection(TestTransport::new(None, Ok(invalid)));
@@ -418,11 +429,11 @@ mod tests {
             .await
             .err()
             .expect("accepting an invalid stream identifier must fail");
-        assert_eq!(error.code, ErrorCode::H3_ID_ERROR);
+        assert_eq!(error.code, ErrorCode::IdError);
 
         let opened = connection(TestTransport::new(
             Some((0, (Io::default(), Io::default()))),
-            Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused")),
+            Err(ErrorCode::InternalError.reason("unused")),
         ));
         assert!(opened.open_bi().await.is_ok());
         let accepted = connection(TestTransport::new(
@@ -444,7 +455,7 @@ mod tests {
         ] {
             let connection = connection(TestTransport::new(
                 None,
-                Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused")),
+                Err(ErrorCode::InternalError.reason("unused")),
             ));
             connection
                 .clone()
@@ -457,7 +468,7 @@ mod tests {
 
         let connection = connection(TestTransport::new(
             None,
-            Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused")),
+            Err(ErrorCode::InternalError.reason("unused")),
         ));
         connection
             .clone()
@@ -465,7 +476,7 @@ mod tests {
             .await;
         assert_eq!(
             connection.qpack().error().unwrap().code,
-            ErrorCode::H3_STREAM_CREATION_ERROR
+            ErrorCode::StreamCreationError
         );
     }
 
@@ -473,7 +484,7 @@ mod tests {
     async fn goaway_notifies_local_waiters_and_closes_after_peer_goaway() {
         let connection = connection(TestTransport::new(
             None,
-            Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused")),
+            Err(ErrorCode::InternalError.reason("unused")),
         ));
         let local = connection.local_goaway();
         let qpack = connection.qpack.clone();
@@ -501,13 +512,13 @@ mod tests {
 
     #[tokio::test]
     async fn constructor_starts_critical_stream_tasks_and_io_supports_writes() {
-        let probe = TestTransport::new(None, Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused")));
+        let probe = TestTransport::new(None, Err(ErrorCode::InternalError.reason("unused")));
         assert_eq!(
             probe.accept_uni().await.err().unwrap().code,
-            ErrorCode::H3_INTERNAL_ERROR
+            ErrorCode::InternalError
         );
         let connection = H3Connection::new(
-            TestTransport::new(None, Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused"))),
+            TestTransport::new(None, Err(ErrorCode::InternalError.reason("unused"))),
             Settings::default(),
         )
         .unwrap();

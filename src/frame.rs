@@ -1,4 +1,6 @@
 //! HTTP/3 frames (RFC 9114 section 7.2). Stream placement is checked by the caller.
+use std::io;
+
 use bytes::{BufMut, Bytes};
 use qbase::varint::{VarInt, WriteVarInt};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -64,10 +66,10 @@ impl TryFrom<u64> for FrameType {
             0x05 => Ok(Self::PushPromise),
             0x07 => Ok(Self::Goaway),
             0x0d => Ok(Self::MaxPushId),
-            0x02 | 0x06 | 0x08 | 0x09 => Err(ErrorCode::H3_FRAME_UNEXPECTED
+            0x02 | 0x06 | 0x08 | 0x09 => Err(ErrorCode::FrameUnexpected
                 .reason("HTTP/2-reserved frame type is forbidden in HTTP/3")),
             _ => VarInt::try_from(value).map(Self::Unknown).map_err(|error| {
-                ErrorCode::H3_FRAME_ERROR.reason(format!(
+                ErrorCode::FrameError.reason(format!(
                     "frame type exceeds the QUIC variable-integer range: {error}"
                 ))
             }),
@@ -85,7 +87,7 @@ pub(crate) struct Frame<P: GetFrameType + EncodeSize> {
 impl<P: GetFrameType + EncodeSize> Frame<P> {
     pub(crate) fn new(payload: P) -> Result<Self> {
         let length = VarInt::try_from(payload.encoding_size()).map_err(|error| {
-            ErrorCode::H3_FRAME_ERROR.reason(format!(
+            ErrorCode::FrameError.reason(format!(
                 "encoded frame length exceeds the QUIC variable-integer range: {error}"
             ))
         })?;
@@ -140,47 +142,38 @@ impl GetFrameType for H3Frame {
 /// Return None at a frame boundary; a truncated type is a framing error.
 pub(crate) async fn be_frame_type<T: AsyncRead + Unpin + ?Sized>(
     reader: &mut T,
-) -> Result<Option<FrameType>> {
+) -> io::Result<Option<FrameType>> {
     let mut first = [0];
-    if reader
-        .read(&mut first)
-        .await
-        .map_err(crate::Error::from_frame_io)?
-        == 0
-    {
+    if reader.read(&mut first).await? == 0 {
         return Ok(None);
     }
-    let ty = be_varint(&mut first.as_slice().chain(reader))
-        .await
-        .map_err(crate::Error::from_frame_io)?;
-    ty.ok_or_else(|| ErrorCode::H3_FRAME_ERROR.reason("frame is missing a complete type"))?
+    let ty = be_varint(&mut first.as_slice().chain(reader)).await?;
+    ty.ok_or_else(|| ErrorCode::FrameError.reason("frame is missing a complete type"))?
         .into_u64()
         .try_into()
         .map(Some)
+        .map_err(io::Error::other)
 }
 
 pub(crate) async fn be_frame_length<T: AsyncRead + Unpin + ?Sized>(
     reader: &mut T,
-) -> Result<VarInt> {
-    be_varint(reader)
-        .await
-        .map_err(crate::Error::from_frame_io)?
-        .ok_or_else(|| ErrorCode::H3_FRAME_ERROR.reason("frame is missing a complete length"))
+) -> io::Result<VarInt> {
+    be_varint(reader).await?.ok_or_else(|| {
+        io::Error::other(ErrorCode::FrameError.reason("frame is missing a complete length"))
+    })
 }
 
 /// Discard exactly `length` bytes without allocating a buffer of that size.
 pub(crate) async fn skip_payload<T: AsyncRead + Unpin + ?Sized>(
     reader: &mut T,
     length: u64,
-) -> Result<()> {
+) -> io::Result<()> {
     let mut payload = reader.take(length);
-    tokio::io::copy(&mut payload, &mut tokio::io::sink())
-        .await
-        .map_err(crate::Error::from_frame_io)?;
+    tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
     if payload.limit() != 0 {
-        return Err(
-            ErrorCode::H3_FRAME_ERROR.reason("frame payload ended before its declared length")
-        );
+        return Err(ErrorCode::FrameError
+            .reason("frame payload ended before its declared length")
+            .into());
     }
     Ok(())
 }
@@ -191,13 +184,15 @@ pub(crate) async fn be_frame_payload<T: AsyncRead + Unpin + ?Sized>(
     reader: &mut T,
     ty: FrameType,
     length: VarInt,
-) -> Result<H3Frame> {
+) -> io::Result<H3Frame> {
     let frame = match ty {
         FrameType::Data => H3Frame::Data(Frame {
             length,
             payload: Data(usize::try_from(length.into_u64()).map_err(|error| {
-                ErrorCode::H3_FRAME_ERROR
-                    .reason(format!("DATA length does not fit in memory: {error}"))
+                io::Error::other(
+                    ErrorCode::FrameError
+                        .reason(format!("DATA length does not fit in memory: {error}")),
+                )
             })?),
         }),
         FrameType::Headers => H3Frame::Headers(headers::be_headers_frame(reader, length).await?),
@@ -225,15 +220,25 @@ pub(crate) trait EncodeSize {
     fn encoding_size(&self) -> usize;
 }
 
-async fn read_payload<T: AsyncRead + Unpin + ?Sized>(reader: &mut T, length: u64) -> Result<Bytes> {
+async fn read_payload<T: AsyncRead + Unpin + ?Sized>(
+    reader: &mut T,
+    length: u64,
+) -> io::Result<Bytes> {
     if length > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
-        return Err(ErrorCode::H3_EXCESSIVE_LOAD.reason("configured resource limit exceeded"));
+        return Err(ErrorCode::ExcessiveLoad
+            .reason("configured resource limit exceeded")
+            .into());
     }
     let mut payload = vec![0; length as usize];
-    reader
-        .read_exact(&mut payload)
-        .await
-        .map_err(crate::Error::from_frame_io)?;
+    reader.read_exact(&mut payload).await.map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::other(
+                ErrorCode::FrameError.reason("frame payload ended before its declared length"),
+            )
+        } else {
+            error
+        }
+    })?;
     Ok(payload.into())
 }
 

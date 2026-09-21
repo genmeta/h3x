@@ -2,7 +2,7 @@ mod support;
 
 use std::time::Duration;
 
-use qrecovery::{recv::StopSending, send::CancelStream};
+use qrecovery::recv::StopSending;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
@@ -37,19 +37,13 @@ async fn drain_waits_for_read_after_write_shutdown() {
 }
 
 #[tokio::test]
-async fn drain_waits_for_write_after_read_cancel() {
+async fn read_cancel_also_cancels_write_and_completes_drain() {
     let (client, server) = support::connection_pair();
-    let (cw, mut cr) = client.open_bi().await.unwrap();
+    let (_cw, mut cr) = client.open_bi().await.unwrap();
     let (sw, sr) = server.accept_bi().await.unwrap();
     cr.stop(0);
-    let mut drain = tokio::spawn(client.goaway());
+    let drain = tokio::spawn(client.goaway());
     let peer_drain = tokio::spawn(server.goaway());
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut drain)
-            .await
-            .is_err()
-    );
-    (&cw).cancel(0);
     drop((sw, sr));
     tokio::time::timeout(Duration::from_secs(1), drain)
         .await

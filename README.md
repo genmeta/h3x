@@ -30,12 +30,14 @@ background bidirectional stream queue.
 
 Read and write handles own only their direction's state:
 `H3ReadStream<R>` and `H3WriteStream<W>`. The connection stores a registered handle for each direction, sharing its state
-with the application handle. Dropping an application handle cancels its direction
-and removes its registration. Read and write directions are registered independently in `BiStreams` and removed
+with the application handle. Dropping an application handle removes its registration
+without explicitly cancelling transport I/O. Read and write directions are registered independently in `BiStreams` and removed
 immediately by completion callbacks on terminal I/O, cancellation, or handle drop.
 Draining waits until both registries are empty. `BiStreams` owns the drain
 notification; application handles only carry a completion callback and keep
 their own separate I/O waker.
+Explicitly cancelling either direction cancels its peer direction and the
+request's QPACK state.
 Each direction stores `Result<H3Stream, Goaway>`: only GOAWAY rejection is retained
 as an HTTP/3 stream error. Other errors are returned directly by transport
 read, write, flush, or shutdown operations without being cached.
@@ -129,6 +131,8 @@ Use `WndBuf` as the builder's body for streaming requests and responses. Before
 handing a value to its stream writer, clone `request.body()` or `response.body()`
 when another future will produce a streaming body. Converting back to
 `http::Request` / `http::Response` preserves metadata and the shared body.
+The public `into_parts` and `from_parts` methods transfer message metadata and
+body ownership without copying them, including through host adapters.
 
 The four protocol I/O traits live on the stream directions. Responses take the
 original request method so HEAD and CONNECT response semantics can be applied:
@@ -160,11 +164,43 @@ let mut bytes = Vec::new();
 response.read_to_end(&mut bytes).await?;
 ```
 
+Messages also contain shared `Trailers` storage. Outgoing `Request<W>` and
+`Response<W>` values can be cloned: their initial metadata is copied while the
+body and trailers remain shared. Set or append every outgoing trailer before
+shutting down the body. The stream writer drains DATA, reads the trailers after
+body EOF, sends a trailing HEADERS frame when they are non-empty, and then sends
+FIN.
+
+```rust,ignore
+let outgoing = request.clone();
+let writing = tokio::spawn(stream.write_request(outgoing, qpack));
+
+request.write_all(payload).await?;
+request.set_trailer(
+    http::HeaderName::from_static("x-checksum"),
+    http::HeaderValue::from_static("ok"),
+);
+request.shutdown().await?;
+writing.await??;
+```
+
+For incoming messages, drain the body to EOF before reading the synchronous
+trailer snapshot:
+
+```rust,ignore
+let mut bytes = Vec::new();
+response.read_to_end(&mut bytes).await?;
+let trailers = response.trailers();
+```
+
 ArcWndBuf clones share the buffer.
 Use Tokio's `AsyncReadExt` / `AsyncWriteExt` directly with ArcWndBuf. Call
 `shutdown().await` on the producer to finish production. The polled write future
 drains the buffer and sends FIN. Use `stop(code)` or `cancel(code)` on the window
-to cancel reception or sending. Cloning or dropping a window does not implicitly
+to cancel reception or sending. The directional messages expose the same
+operations: `Request<R>` / `Response<R>` implement `StopSending`, while
+`Request<W>` / `Response<W>` implement `CancelStream`. Host adapters should use
+the message-level operation. Cloning or dropping a window does not implicitly
 finish or cancel it.
 
 For incoming ArcWndBuf bodies, a receive task starts after headers are parsed.
@@ -247,8 +283,8 @@ included. See [RFC 9220](https://www.rfc-editor.org/rfc/rfc9220.html) and
 ArcWndBuf cancellation uses `qrecovery::recv::StopSending` and
 `qrecovery::send::CancelStream`: import the trait and call `stop(code)` on an
 incoming body or `cancel(code)` on an outgoing streaming body. Both are synchronous;
-the background task forwards the supplied code to the transport. Unknown codes
-are mapped to `H3_INTERNAL_ERROR`.
+the callback forwards the supplied code to both transport directions and cancels
+the request's QPACK state. Unknown codes are mapped to `InternalError`.
 
 Extended CONNECT stores `:protocol` as an `Arc<str>` in request extensions
 (`http::Request::builder().extension(Arc::<str>::from("websocket"))`).

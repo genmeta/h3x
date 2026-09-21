@@ -1,6 +1,7 @@
 use std::{
     io,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -10,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::ArcH3Stream;
 use crate::{
-    ArcQpack, Error, ErrorCode,
+    ArcQpack, Error, TransportError,
     common::{
         request::{Request, WriteRequest},
         response::{Response, WriteResponse},
@@ -22,7 +23,8 @@ use crate::{
 /// Application-owned write direction, sharing state with the connection registry.
 pub struct H3WriteStream<W: CancelStream> {
     pub(super) state: ArcH3Stream<W>,
-    finish_cb: Box<dyn Fn() + Send + Sync>,
+    pub(super) finish_cb: Arc<dyn Fn() + Send + Sync>,
+    cancel_cb: Arc<dyn Fn(u64) + Send + Sync>,
     id: u64,
 }
 
@@ -31,16 +33,17 @@ impl<W: CancelStream> H3WriteStream<W> {
         Self {
             state: ArcH3Stream::new(stream),
             id: stream_id,
-            finish_cb: Box::new(|| {}),
+            finish_cb: Arc::new(|| {}),
+            cancel_cb: Arc::new(|_| {}),
         }
     }
 
     pub(super) fn on_finish(&mut self, callback: impl Fn() + Send + Sync + 'static) {
-        self.finish_cb = Box::new(callback);
+        self.finish_cb = Arc::new(callback);
     }
 
-    pub(crate) fn shutdown(&self) {
-        (self.finish_cb)();
+    pub(super) fn on_cancel(&mut self, callback: impl Fn(u64) + Send + Sync + 'static) {
+        self.cancel_cb = Arc::new(callback);
     }
 
     pub fn stream_id(&self) -> u64 {
@@ -51,8 +54,15 @@ impl<W: CancelStream> H3WriteStream<W> {
 impl<W: CancelStream> CancelStream for &H3WriteStream<W> {
     fn cancel(&mut self, error_code: u64) {
         if self.state.terminate(|io| io.cancel(error_code)) {
-            H3WriteStream::shutdown(self);
+            (self.finish_cb)();
+            (self.cancel_cb)(error_code);
         }
+    }
+}
+
+impl<W: CancelStream> CancelStream for H3WriteStream<W> {
+    fn cancel(&mut self, error_code: u64) {
+        qrecovery::send::CancelStream::cancel(&mut &*self, error_code);
     }
 }
 
@@ -66,8 +76,10 @@ impl<W: AsyncWrite + CancelStream + Unpin> H3WriteStream<W> {
         let result = self.state.poll_io(cx, poll);
         let completed = finish && matches!(result, Poll::Ready(Ok(_)));
         let failed = matches!(&result, Poll::Ready(Err(error)) if !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock));
-        if (completed || failed) && self.state.finish() {
-            H3WriteStream::shutdown(self);
+        if completed || failed {
+            if self.state.finish() {
+                (self.finish_cb)();
+            }
         }
         result
     }
@@ -96,13 +108,15 @@ impl<W: AsyncWrite + CancelStream + Unpin> AsyncWrite for H3WriteStream<W> {
 
 impl<W: CancelStream> Drop for H3WriteStream<W> {
     fn drop(&mut self) {
-        (&*self).cancel(ErrorCode::H3_REQUEST_CANCELLED.as_u64());
+        if self.state.finish() {
+            (self.finish_cb)();
+        }
     }
 }
 
 impl<W> WriteRequest for H3WriteStream<W>
 where
-    W: AsyncWrite + CancelStream + Unpin + Send,
+    W: AsyncWrite + CancelStream + TransportError + Unpin + Send + 'static,
 {
     async fn write_request(
         mut self,
@@ -124,43 +138,71 @@ where
             value: Bytes::copy_from_slice(value.as_bytes()),
             never_index: value.is_sensitive(),
         }));
+        let trailers = request.trailers.clone();
         let mut body = request.body;
+        body.on_error_callback({
+            let state = self.state.clone();
+            let finish = self.finish_cb.clone();
+            let cancel = self.cancel_cb.clone();
+            move |error| {
+                if state.terminate(|io| io.cancel(error.code.as_u64())) {
+                    finish();
+                    cancel(error.code.as_u64());
+                }
+            }
+        });
         let producer = body.clone();
-        let sending = async {
-            let headers = Frame::new(frame::Headers {
-                field_section: qpack.encode(self.stream_id(), fields)?,
-            })?;
+        let result: crate::Result<()> = async {
+            let field_section = qpack.encode(self.stream_id(), fields)?;
+            let headers = Frame::new(frame::Headers { field_section }).map_err(Error::stream)?;
             let mut bytes = Vec::new();
             bytes.put_frame(&headers);
-            self.write_all(&bytes).await?;
+            self.write_all(&bytes).await.map_err(W::map_error)?;
 
             let mut buf = vec![0; frame::MAX_DATA_CHUNK];
             loop {
-                let count = body.read(&mut buf).await?;
+                let count = body
+                    .read(&mut buf)
+                    .await
+                    .map_err(Error::from)
+                    .map_err(Error::stream)?;
                 if count == 0 {
                     break;
                 }
                 bytes.clear();
-                bytes.put_frame(&Frame::new(Data(count))?);
-                self.write_all(&bytes).await?;
-                self.write_all(&buf[..count]).await?;
+                bytes.put_frame(&Frame::new(Data(count)).map_err(Error::stream)?);
+                self.write_all(&bytes).await.map_err(W::map_error)?;
+                self.write_all(&buf[..count]).await.map_err(W::map_error)?;
             }
-            AsyncWriteExt::shutdown(&mut self).await?;
+            let trailer_fields = trailers.fields();
+            if !trailer_fields.is_empty() {
+                bytes.clear();
+                let field_section = qpack.encode(self.stream_id(), trailer_fields)?;
+                bytes.put_frame(
+                    &Frame::new(frame::Headers { field_section }).map_err(Error::stream)?,
+                );
+                self.write_all(&bytes).await.map_err(W::map_error)?;
+            }
+            self.shutdown().await.map_err(W::map_error)?;
             Ok::<_, Error>(())
-        };
-        let result = sending.await.inspect_err(|error| {
-            (&self).cancel(error.code.as_u64());
-            producer.on_error(error.clone());
-            qpack.on_error(self.stream_id(), error.clone());
-        });
-        self.shutdown();
-        result
+        }
+        .await;
+        result.map_err(|failure| {
+            let failure = if failure.is_connection() {
+                qpack.on_connection_error(failure)
+            } else {
+                failure.stream()
+            };
+            self.cancel(failure.code.as_u64());
+            producer.on_error(failure.clone());
+            qpack.error().unwrap_or(failure)
+        })
     }
 }
 
 impl<W> WriteResponse for H3WriteStream<W>
 where
-    W: AsyncWrite + CancelStream + Unpin + Send,
+    W: AsyncWrite + CancelStream + TransportError + Unpin + Send + 'static,
 {
     async fn write_response(
         mut self,
@@ -186,39 +228,73 @@ where
             value: Bytes::copy_from_slice(value.as_bytes()),
             never_index: value.is_sensitive(),
         }));
+        let trailers = response.trailers.clone();
         let mut body = response.body;
+        body.on_error_callback({
+            let state = self.state.clone();
+            let finish = self.finish_cb.clone();
+            let cancel = self.cancel_cb.clone();
+            move |error| {
+                if state.terminate(|io| io.cancel(error.code.as_u64())) {
+                    finish();
+                    cancel(error.code.as_u64());
+                }
+            }
+        });
         let producer = body.clone();
-        let sending = async {
-            let headers = Frame::new(frame::Headers {
-                field_section: qpack.encode(self.stream_id(), fields)?,
-            })?;
+        let result: crate::Result<()> = async {
+            if !send_body {
+                body.shutdown()
+                    .await
+                    .map_err(Error::from)
+                    .map_err(Error::stream)?;
+            }
+            let field_section = qpack.encode(self.stream_id(), fields)?;
+            let headers = Frame::new(frame::Headers { field_section }).map_err(Error::stream)?;
             let mut bytes = Vec::new();
             bytes.put_frame(&headers);
-            self.write_all(&bytes).await?;
+            self.write_all(&bytes).await.map_err(W::map_error)?;
 
             if send_body {
                 let mut buf = vec![0; frame::MAX_DATA_CHUNK];
                 loop {
-                    let count = body.read(&mut buf).await?;
+                    let count = body
+                        .read(&mut buf)
+                        .await
+                        .map_err(Error::from)
+                        .map_err(Error::stream)?;
                     if count == 0 {
                         break;
                     }
                     bytes.clear();
-                    bytes.put_frame(&Frame::new(Data(count))?);
-                    self.write_all(&bytes).await?;
-                    self.write_all(&buf[..count]).await?;
+                    bytes.put_frame(&Frame::new(Data(count)).map_err(Error::stream)?);
+                    self.write_all(&bytes).await.map_err(W::map_error)?;
+                    self.write_all(&buf[..count]).await.map_err(W::map_error)?;
                 }
             }
-            AsyncWriteExt::shutdown(&mut self).await?;
+            let trailer_fields = trailers.fields();
+            if !trailer_fields.is_empty() {
+                bytes.clear();
+                let field_section = qpack.encode(self.stream_id(), trailer_fields)?;
+                bytes.put_frame(
+                    &Frame::new(frame::Headers { field_section }).map_err(Error::stream)?,
+                );
+                self.write_all(&bytes).await.map_err(W::map_error)?;
+            }
+            self.shutdown().await.map_err(W::map_error)?;
             Ok::<_, Error>(())
-        };
-        let result = sending.await.inspect_err(|error| {
-            (&self).cancel(error.code.as_u64());
-            producer.on_error(error.clone());
-            qpack.on_error(self.stream_id(), error.clone());
-        });
-        H3WriteStream::shutdown(&self);
-        result
+        }
+        .await;
+        result.map_err(|failure| {
+            let failure = if failure.is_connection() {
+                qpack.on_connection_error(failure)
+            } else {
+                failure.stream()
+            };
+            self.cancel(failure.code.as_u64());
+            producer.on_error(failure.clone());
+            qpack.error().unwrap_or(failure)
+        })
     }
 }
 
@@ -236,11 +312,13 @@ mod tests {
     use tokio::io::{AsyncWrite, AsyncWriteExt};
 
     use super::*;
+    use crate::ErrorCode;
 
     #[derive(Clone, Default)]
     struct Io {
         bytes: Arc<Mutex<Vec<u8>>>,
         cancels: Arc<Mutex<Vec<u64>>>,
+        shutdowns: Arc<AtomicUsize>,
     }
 
     impl AsyncWrite for Io {
@@ -258,6 +336,7 @@ mod tests {
         }
 
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
             Poll::Ready(Ok(()))
         }
     }
@@ -268,11 +347,18 @@ mod tests {
         }
     }
 
+    impl TransportError for Io {
+        fn map_error(error: io::Error) -> Error {
+            Error::from_stream_io(error)
+        }
+    }
+
     #[tokio::test]
-    async fn write_flush_shutdown_and_cancel_transition_once() {
+    async fn write_shutdown_notifies_finish_once() {
         let io = Io::default();
         let bytes = io.bytes.clone();
         let cancels = io.cancels.clone();
+        let shutdowns = io.shutdowns.clone();
         let completed = Arc::new(AtomicUsize::new(0));
         let count = completed.clone();
         let mut stream = H3WriteStream::new(4, io);
@@ -285,9 +371,11 @@ mod tests {
         stream.flush().await.unwrap();
         AsyncWriteExt::shutdown(&mut stream).await.unwrap();
         assert_eq!(&*bytes.lock().unwrap(), b"hello");
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
         assert_eq!(completed.load(Ordering::SeqCst), 1);
         (&stream).cancel(7);
         assert!(cancels.lock().unwrap().is_empty());
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -295,7 +383,7 @@ mod tests {
         fn reject<W: CancelStream>(stream: &H3WriteStream<W>) -> bool {
             stream
                 .state
-                .goaway(|io| io.cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64()))
+                .goaway(|io| io.cancel(ErrorCode::RequestRejected.as_u64()))
         }
 
         let io = Io::default();
@@ -305,7 +393,7 @@ mod tests {
         assert!(!reject(&stream));
         assert_eq!(
             &*cancels.lock().unwrap(),
-            &[ErrorCode::H3_REQUEST_REJECTED.as_u64()]
+            &[ErrorCode::RequestRejected.as_u64()]
         );
         assert_eq!(
             stream.write_all(b"x").await.unwrap_err().kind(),
@@ -325,5 +413,53 @@ mod tests {
         assert_eq!(completed.load(Ordering::SeqCst), 1);
         (&stream).cancel(10);
         assert_eq!(&*cancels.lock().unwrap(), &[9]);
+    }
+
+    #[tokio::test]
+    async fn message_writers_shutdown_the_underlying_send_stream() {
+        let mut request_body = crate::ArcWndBuf::new(1);
+        request_body.shutdown().await.unwrap();
+        let request: Request<crate::W> = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.com/")
+            .body(request_body)
+            .unwrap()
+            .into();
+        let request_io = Io::default();
+        let request_shutdowns = request_io.shutdowns.clone();
+        let request_completed = Arc::new(AtomicUsize::new(0));
+        let completed = request_completed.clone();
+        let shutdowns = request_shutdowns.clone();
+        let mut request_stream = H3WriteStream::new(0, request_io);
+        request_stream.on_finish(move || {
+            assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+            completed.fetch_add(1, Ordering::SeqCst);
+        });
+        request_stream
+            .write_request(request, crate::qpack::tests::qpack())
+            .await
+            .unwrap();
+        assert_eq!(request_shutdowns.load(Ordering::SeqCst), 1);
+        assert_eq!(request_completed.load(Ordering::SeqCst), 1);
+
+        let mut response_body = crate::ArcWndBuf::new(1);
+        response_body.shutdown().await.unwrap();
+        let response: Response<crate::W> = http::Response::new(response_body).into();
+        let response_io = Io::default();
+        let response_shutdowns = response_io.shutdowns.clone();
+        let response_completed = Arc::new(AtomicUsize::new(0));
+        let completed = response_completed.clone();
+        let shutdowns = response_shutdowns.clone();
+        let mut response_stream = H3WriteStream::new(0, response_io);
+        response_stream.on_finish(move || {
+            assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+            completed.fetch_add(1, Ordering::SeqCst);
+        });
+        response_stream
+            .write_response(response, http::Method::GET, crate::qpack::tests::qpack())
+            .await
+            .unwrap();
+        assert_eq!(response_shutdowns.load(Ordering::SeqCst), 1);
+        assert_eq!(response_completed.load(Ordering::SeqCst), 1);
     }
 }

@@ -8,9 +8,10 @@ use std::{
 };
 
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
+use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::{Read, Write};
+use super::{Read, Write, trailers::Trailers};
 use crate::{ArcQpack, ArcWndBuf, ErrorCode, Result, qpack::Field};
 
 /// An HTTP request and its shared streaming body.
@@ -18,16 +19,27 @@ use crate::{ArcQpack, ArcWndBuf, ErrorCode, Result, qpack::Field};
 pub struct Request<IO> {
     pub(crate) head: http::request::Parts,
     pub(crate) body: ArcWndBuf,
+    pub(crate) trailers: Trailers,
     _io: PhantomData<IO>,
 }
 
 impl<IO> Request<IO> {
-    pub(crate) fn from_parts(head: http::request::Parts, body: ArcWndBuf) -> Self {
+    /// Build a request from its metadata and shared streaming body.
+    pub fn from_parts(mut head: http::request::Parts, body: ArcWndBuf) -> Self {
+        let trailers = head.extensions.remove::<Trailers>().unwrap_or_default();
         Self {
             head,
             body,
+            trailers,
             _io: PhantomData,
         }
+    }
+
+    /// Split this request into its metadata and shared streaming body.
+    pub fn into_parts(self) -> (http::request::Parts, ArcWndBuf) {
+        let mut head = self.head;
+        head.extensions.insert(self.trailers);
+        (head, self.body)
     }
 
     pub fn method(&self) -> &Method {
@@ -87,6 +99,24 @@ impl<IO> Request<IO> {
     pub fn into_body(self) -> ArcWndBuf {
         self.body
     }
+
+    /// Return a snapshot of the trailer fields.
+    ///
+    /// Incoming trailers are complete after the body reaches EOF.
+    pub fn trailers(&self) -> HeaderMap {
+        self.trailers.headers()
+    }
+}
+
+impl Clone for Request<Write> {
+    fn clone(&self) -> Self {
+        Self {
+            head: self.head.clone(),
+            body: self.body.clone(),
+            trailers: self.trailers.clone(),
+            _io: PhantomData,
+        }
+    }
 }
 
 impl Request<Write> {
@@ -139,6 +169,22 @@ impl Request<Write> {
         self.head.headers.append(name, value);
         self
     }
+
+    /// Set an outgoing trailer field.
+    ///
+    /// All trailers must be set before the body is shut down.
+    pub fn set_trailer(&self, name: HeaderName, value: HeaderValue) -> &Self {
+        self.trailers.set(name, value);
+        self
+    }
+
+    /// Append an outgoing trailer field without replacing existing values.
+    ///
+    /// All trailers must be appended before the body is shut down.
+    pub fn append_trailer(&self, name: HeaderName, value: HeaderValue) -> &Self {
+        self.trailers.append(name, value);
+        self
+    }
 }
 
 impl Request<Read> {
@@ -153,67 +199,65 @@ impl Request<Read> {
         for field in fields {
             if !request.headers().is_empty() && field.name.starts_with(b":") {
                 return Err(
-                    ErrorCode::H3_MESSAGE_ERROR.reason("pseudo-header after regular header field")
+                    ErrorCode::MessageError.reason("pseudo-header after regular header field")
                 );
             }
             match field.name.as_ref() {
                 b":method" => {
                     let value = Method::from_bytes(&field.value)
-                        .map_err(|_| ErrorCode::H3_MESSAGE_ERROR.reason("invalid :method"))?;
+                        .map_err(|_| ErrorCode::MessageError.reason("invalid :method"))?;
                     if method.replace(value).is_some() {
-                        return Err(ErrorCode::H3_MESSAGE_ERROR.reason("duplicate :method"));
+                        return Err(ErrorCode::MessageError.reason("duplicate :method"));
                     }
                 }
                 b":scheme" => {
                     let value = std::str::from_utf8(&field.value)
-                        .map_err(|_| ErrorCode::H3_MESSAGE_ERROR.reason("invalid :scheme"))?
+                        .map_err(|_| ErrorCode::MessageError.reason("invalid :scheme"))?
                         .to_owned();
                     if scheme.replace(value).is_some() {
-                        return Err(ErrorCode::H3_MESSAGE_ERROR.reason("duplicate :scheme"));
+                        return Err(ErrorCode::MessageError.reason("duplicate :scheme"));
                     }
                 }
                 b":authority" => {
                     let value = std::str::from_utf8(&field.value)
-                        .map_err(|_| ErrorCode::H3_MESSAGE_ERROR.reason("invalid :authority"))?
+                        .map_err(|_| ErrorCode::MessageError.reason("invalid :authority"))?
                         .to_owned();
                     if authority.replace(value).is_some() {
-                        return Err(ErrorCode::H3_MESSAGE_ERROR.reason("duplicate :authority"));
+                        return Err(ErrorCode::MessageError.reason("duplicate :authority"));
                     }
                 }
                 b":path" => {
                     let value = std::str::from_utf8(&field.value)
-                        .map_err(|_| ErrorCode::H3_MESSAGE_ERROR.reason("invalid :path"))?
+                        .map_err(|_| ErrorCode::MessageError.reason("invalid :path"))?
                         .to_owned();
                     if path.replace(value).is_some() {
-                        return Err(ErrorCode::H3_MESSAGE_ERROR.reason("duplicate :path"));
+                        return Err(ErrorCode::MessageError.reason("duplicate :path"));
                     }
                 }
                 b":protocol" => {
                     let value = std::str::from_utf8(&field.value)
-                        .map_err(|_| ErrorCode::H3_MESSAGE_ERROR.reason("invalid :protocol"))?
+                        .map_err(|_| ErrorCode::MessageError.reason("invalid :protocol"))?
                         .to_owned();
                     if protocol.replace(value).is_some() {
-                        return Err(ErrorCode::H3_MESSAGE_ERROR.reason("duplicate :protocol"));
+                        return Err(ErrorCode::MessageError.reason("duplicate :protocol"));
                     }
                 }
                 name if name.starts_with(b":") => {
-                    return Err(
-                        ErrorCode::H3_MESSAGE_ERROR.reason("undefined request pseudo-header")
-                    );
+                    return Err(ErrorCode::MessageError.reason("undefined request pseudo-header"));
                 }
                 name => {
                     let name = HeaderName::from_lowercase(name)
-                        .map_err(|_| ErrorCode::H3_MESSAGE_ERROR.reason("invalid header name"))?;
+                        .map_err(|_| ErrorCode::MessageError.reason("invalid header name"))?;
                     let mut value = HeaderValue::from_bytes(&field.value)
-                        .map_err(|_| ErrorCode::H3_MESSAGE_ERROR.reason("invalid header value"))?;
+                        .map_err(|_| ErrorCode::MessageError.reason("invalid header value"))?;
                     value.set_sensitive(field.never_index);
                     request.headers_mut().append(name, value);
                 }
             }
         }
 
-        let method = method
-            .ok_or_else(|| ErrorCode::H3_MESSAGE_ERROR.reason("missing or invalid :method"))?;
+        let method =
+            method.ok_or_else(|| ErrorCode::MessageError.reason("missing or invalid :method"))?;
 
         let mut uri = Uri::builder();
         if let Some(scheme) = &scheme {
@@ -228,7 +272,7 @@ impl Request<Read> {
         *request.method_mut() = method;
         *request.uri_mut() = uri
             .build()
-            .map_err(|_| ErrorCode::H3_MESSAGE_ERROR.reason("invalid request URI"))?;
+            .map_err(|_| ErrorCode::MessageError.reason("invalid request URI"))?;
         *request.version_mut() = http::Version::HTTP_3;
         if let Some(protocol) = protocol {
             request.extensions_mut().insert(Arc::<str>::from(protocol));
@@ -241,9 +285,11 @@ impl From<http::Request<ArcWndBuf>> for Request<Write> {
     fn from(request: http::Request<ArcWndBuf>) -> Self {
         let (mut head, body) = request.into_parts();
         head.version = http::Version::HTTP_3;
+        let trailers = head.extensions.remove::<Trailers>().unwrap_or_default();
         let mut request = Self {
             head,
             body,
+            trailers,
             _io: PhantomData,
         };
         request.normalize_websocket_scheme();
@@ -253,7 +299,8 @@ impl From<http::Request<ArcWndBuf>> for Request<Write> {
 
 impl<IO> From<Request<IO>> for http::Request<ArcWndBuf> {
     fn from(request: Request<IO>) -> Self {
-        Self::from_parts(request.head, request.body)
+        let (head, body) = request.into_parts();
+        Self::from_parts(head, body)
     }
 }
 
@@ -282,6 +329,18 @@ impl AsyncWrite for Request<Write> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.body).poll_shutdown(cx)
+    }
+}
+
+impl StopSending for Request<Read> {
+    fn stop(&mut self, error_code: u64) {
+        self.body.stop(error_code);
+    }
+}
+
+impl CancelStream for Request<Write> {
+    fn cancel(&mut self, error_code: u64) {
+        self.body.cancel(error_code);
     }
 }
 
@@ -354,7 +413,7 @@ mod tests {
         ] {
             assert!(matches!(
                 parse(values),
-                Err(error) if error.code == ErrorCode::H3_MESSAGE_ERROR
+                Err(error) if error.code == ErrorCode::MessageError
             ));
         }
     }

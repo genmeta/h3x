@@ -64,12 +64,12 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
     fn reject_from(&mut self, id: u64, qpack: &ArcQpack) -> Result<()> {
         let mut rejected = HashSet::new();
         for (id, read) in remove_rejected(&mut self.reads, id) {
-            if read.goaway(|io| io.stop(ErrorCode::H3_REQUEST_REJECTED.as_u64())) {
+            if read.goaway(|io| io.stop(ErrorCode::RequestRejected.as_u64())) {
                 rejected.insert(id);
             }
         }
         for (id, write) in remove_rejected(&mut self.writes, id) {
-            if write.goaway(|io| io.cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64())) {
+            if write.goaway(|io| io.cancel(ErrorCode::RequestRejected.as_u64())) {
                 rejected.insert(id);
             }
         }
@@ -204,6 +204,7 @@ where
         id: u64,
         recv: R,
         send: W,
+        qpack: ArcQpack,
     ) -> (H3ReadStream<R>, H3WriteStream<W>) {
         let mut read = H3ReadStream::new(id, recv);
         let mut write = H3WriteStream::new(id, send);
@@ -223,6 +224,31 @@ where
                 let mut guard = bistreams.lock().unwrap();
                 guard.reads.remove(&id);
                 guard.try_wake();
+            }
+        });
+        read.on_cancel({
+            let finish = write.finish_cb.clone();
+            let write = write.state.clone();
+            let qpack = qpack.clone();
+            move |code| {
+                if write.terminate(|io| io.cancel(code)) {
+                    finish();
+                }
+                if let Err(error) = qpack.cancel(id) {
+                    qpack.on_connection_error(error);
+                }
+            }
+        });
+        write.on_cancel({
+            let finish = read.finish_cb.clone();
+            let read = read.state.clone();
+            move |code| {
+                if read.terminate(|io| io.stop(code)) {
+                    finish();
+                }
+                if let Err(error) = qpack.cancel(id) {
+                    qpack.on_connection_error(error);
+                }
             }
         });
         (read, write)

@@ -29,8 +29,7 @@ impl Decoder {
                 max_blocked_bytes,
                 max_fields,
                 Box::new(|_| {
-                    Err(ErrorCode::H3_INTERNAL_ERROR
-                        .reason("instruction callback is not registered"))
+                    Err(ErrorCode::InternalError.reason("instruction callback is not registered"))
                 }),
             )?,
         })
@@ -53,10 +52,14 @@ impl Decoder {
         payload: &[u8],
     ) -> Result<(usize, FieldSectionPrefix)> {
         if id > qbase::varint::VARINT_MAX {
-            return Err(ErrorCode::H3_INTERNAL_ERROR.reason("invalid stream ID"));
+            return Err(ErrorCode::InternalError
+                .reason("invalid stream ID")
+                .stream());
         }
         if self.state.decoding_stream.contains(&id) {
-            return Err(ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled"));
+            return Err(ErrorCode::RequestCancelled
+                .reason("request cancelled")
+                .stream());
         }
         let (rest, prefix) = self.state.read_prefix(payload)?;
         let offset = payload.len() - rest.len();
@@ -72,9 +75,9 @@ impl Decoder {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Vec<Field>>> {
         if !self.state.decoding_stream.contains(&id) {
-            return Poll::Ready(Err(
-                ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled")
-            ));
+            return Poll::Ready(Err(ErrorCode::RequestCancelled
+                .reason("request cancelled")
+                .stream()));
         }
         let result = self.state.poll_decode(id, prefix, payload, cx);
         if result.is_ready() {
@@ -119,7 +122,7 @@ mod state {
         },
         table::DynamicTable,
     };
-    use crate::{ErrorCode, Result, frame::MAX_BUFFERED_FRAME_PAYLOAD};
+    use crate::{Error, ErrorCode, Result, frame::MAX_BUFFERED_FRAME_PAYLOAD};
 
     pub(super) struct State {
         table: DynamicTable,
@@ -140,7 +143,7 @@ mod state {
             on_instruction: super::OnInstruction,
         ) -> Result<Self> {
             if local.blocked_streams > VARINT_MAX {
-                return Err(ErrorCode::H3_SETTINGS_ERROR
+                return Err(ErrorCode::SettingsError
                     .reason("QPACK blocked-stream limit exceeds the QUIC variable-integer range"));
             }
             Ok(Self {
@@ -160,17 +163,20 @@ mod state {
             payload: &'a [u8],
         ) -> Result<(&'a [u8], FieldSectionPrefix)> {
             if payload.len() > MAX_BUFFERED_FRAME_PAYLOAD {
-                return Err(ErrorCode::H3_EXCESSIVE_LOAD
-                    .reason("encoded field section exceeds the buffer limit"));
+                return Err(ErrorCode::ExcessiveLoad
+                    .reason("encoded field section exceeds the buffer limit")
+                    .stream());
             }
             let (bytes, prefix) = be_field_section_prefix(
                 payload,
                 self.table.max_capacity(),
                 self.table.insert_count(),
-            )?;
+            )
+            .map_err(Error::connection)?;
             if prefix.required_insert_count != 0 && bytes.is_empty() {
-                return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
-                    .reason("nonzero Required Insert Count in an empty field section"));
+                return Err(ErrorCode::QpackDecompressionFailed
+                    .reason("nonzero Required Insert Count in an empty field section")
+                    .connection());
             }
             Ok((bytes, prefix))
         }
@@ -185,7 +191,8 @@ mod state {
             if prefix.required_insert_count <= self.table.insert_count() {
                 self.finish(id);
                 let fields = self.decode_fields(prefix, bytes)?;
-                self.acknowledge(id, prefix.required_insert_count)?;
+                self.acknowledge(id, prefix.required_insert_count)
+                    .map_err(Error::connection)?;
                 return Poll::Ready(Ok(fields));
             }
 
@@ -197,12 +204,14 @@ mod state {
 
             // Admit a newly blocked section within the advertised and local budgets.
             if self.waiting.len() as u64 >= self.max_blocked_streams {
-                return Poll::Ready(Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
-                    .reason("peer exceeded the advertised QPACK blocked-stream limit")));
+                return Poll::Ready(Err(ErrorCode::QpackDecompressionFailed
+                    .reason("peer exceeded the advertised QPACK blocked-stream limit")
+                    .connection()));
             }
             if bytes.len() > self.max_blocked_bytes - self.blocked_bytes {
-                return Poll::Ready(Err(ErrorCode::H3_EXCESSIVE_LOAD
-                    .reason("blocked field sections exceed the memory limit")));
+                return Poll::Ready(Err(ErrorCode::ExcessiveLoad
+                    .reason("blocked field sections exceed the memory limit")
+                    .stream()));
             }
             self.waiting.insert(
                 id,
@@ -221,7 +230,7 @@ mod state {
             instruction: EncoderInstruction,
         ) -> Result<Vec<Waker>> {
             if self.table.max_capacity() == 0 {
-                return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR.reason(
+                return Err(ErrorCode::QpackEncoderStreamError.reason(
                     "dynamic-table instruction received with zero maximum table capacity",
                 ));
             }
@@ -250,7 +259,7 @@ mod state {
 
         pub(super) fn cancel_stream(&mut self, id: u64) -> Result<Vec<Waker>> {
             if id > VARINT_MAX {
-                return Err(ErrorCode::H3_INTERNAL_ERROR
+                return Err(ErrorCode::InternalError
                     .reason("cancelled stream ID exceeds the QUIC variable-integer range"));
             }
             if self.table.max_capacity() != 0 {
@@ -298,11 +307,13 @@ mod state {
             let mut required_insert_count = 0;
             let mut decoded_size = 0usize;
             while !input.is_empty() {
-                let (rest, line) = be_field_line(input)?;
-                if let Some(absolute) = line.dynamic_index(prefix)? {
+                let (rest, line) = be_field_line(input).map_err(Error::connection)?;
+                if let Some(absolute) = line.dynamic_index(prefix).map_err(Error::connection)? {
                     required_insert_count = required_insert_count.max(absolute + 1);
                 }
-                let field = line.resolve(prefix, &self.table)?;
+                let field = line
+                    .resolve(prefix, &self.table)
+                    .map_err(Error::connection)?;
                 // Use HTTP/3 field-section accounting (name + value + 32 per field) to bound
                 // both decompressed strings and field count, including repeated table indices.
                 decoded_size = decoded_size
@@ -311,15 +322,17 @@ mod state {
                     .and_then(|size| size.checked_add(32))
                     .filter(|&size| size as u64 <= self.max_field_section_size)
                     .ok_or_else(|| {
-                        ErrorCode::H3_EXCESSIVE_LOAD
+                        ErrorCode::ExcessiveLoad
                             .reason("decoded field section exceeds the advertised size limit")
+                            .stream()
                     })?;
                 fields.push(field);
                 input = rest;
             }
             if required_insert_count != prefix.required_insert_count {
-                return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
-                    .reason("Required Insert Count does not match the largest dynamic reference"));
+                return Err(ErrorCode::QpackDecompressionFailed
+                    .reason("Required Insert Count does not match the largest dynamic reference")
+                    .connection());
             }
             Ok(fields)
         }
@@ -448,7 +461,7 @@ mod tests {
         );
         assert_eq!(
             decoder.cancel(VARINT_MAX + 1).unwrap_err().code,
-            ErrorCode::H3_INTERNAL_ERROR
+            ErrorCode::InternalError
         );
 
         let (mut no_stream_slots, _) = make_decoder(0, 1024, 1024);
@@ -458,7 +471,7 @@ mod tests {
         else {
             panic!("blocked-stream limit must reject")
         };
-        assert_eq!(error.code, ErrorCode::QPACK_DECOMPRESSION_FAILED);
+        assert_eq!(error.code, ErrorCode::QpackDecompressionFailed);
 
         let (mut no_bytes, _) = make_decoder(1, 0, 1024);
         let (offset, prefix) = no_bytes.begin_decode(12, &wire).unwrap();
@@ -467,7 +480,7 @@ mod tests {
         else {
             panic!("blocked-byte limit must reject")
         };
-        assert_eq!(error.code, ErrorCode::H3_EXCESSIVE_LOAD);
+        assert_eq!(error.code, ErrorCode::ExcessiveLoad);
 
         let (mut waiting, _) = make_decoder(2, 1024, 1024);
         for id in [16, 20] {
@@ -488,14 +501,14 @@ mod tests {
                 .err()
                 .unwrap()
                 .code,
-            ErrorCode::H3_SETTINGS_ERROR
+            ErrorCode::SettingsError
         );
         assert_eq!(
             Decoder::new(settings(VARINT_MAX + 1, 0), 0, 0)
                 .err()
                 .unwrap()
                 .code,
-            ErrorCode::H3_SETTINGS_ERROR
+            ErrorCode::SettingsError
         );
 
         let (mut decoder, _) = make_decoder(1, 1024, 50);
@@ -504,14 +517,14 @@ mod tests {
                 .begin_decode(VARINT_MAX + 1, &[0, 0])
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_INTERNAL_ERROR
+            ErrorCode::InternalError
         );
         assert_eq!(
             decoder
                 .begin_decode(0, &vec![0; crate::frame::MAX_BUFFERED_FRAME_PAYLOAD + 1])
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_EXCESSIVE_LOAD
+            ErrorCode::ExcessiveLoad
         );
 
         let mut empty_dynamic = Vec::new();
@@ -526,7 +539,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             decoder.begin_decode(0, &empty_dynamic).unwrap_err().code,
-            ErrorCode::QPACK_DECOMPRESSION_FAILED
+            ErrorCode::QpackDecompressionFailed
         );
 
         decoder
@@ -549,7 +562,7 @@ mod tests {
         else {
             panic!("RIC mismatch must reject")
         };
-        assert_eq!(error.code, ErrorCode::QPACK_DECOMPRESSION_FAILED);
+        assert_eq!(error.code, ErrorCode::QpackDecompressionFailed);
 
         let mut oversized = BytesMut::new();
         oversized
@@ -574,20 +587,19 @@ mod tests {
         else {
             panic!("decoded size limit must reject")
         };
-        assert_eq!(error.code, ErrorCode::H3_EXCESSIVE_LOAD);
+        assert_eq!(error.code, ErrorCode::ExcessiveLoad);
 
         let mut zero = Decoder::new(Settings::default(), 0, 0).unwrap();
         assert_eq!(
             zero.on_encoder_instruction(EncoderInstruction::SetDynamicTableCapacity(0))
                 .unwrap_err()
                 .code,
-            ErrorCode::QPACK_ENCODER_STREAM_ERROR
+            ErrorCode::QpackEncoderStreamError
         );
 
         let (mut callback_error, _) = make_decoder(1, 1024, 1024);
-        callback_error.on_instruction(|_| {
-            Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM.reason("feedback closed"))
-        });
+        callback_error
+            .on_instruction(|_| Err(ErrorCode::ClosedCriticalStream.reason("feedback closed")));
         assert_eq!(
             callback_error
                 .on_encoder_instruction(EncoderInstruction::InsertWithLiteralName {
@@ -596,7 +608,7 @@ mod tests {
                 })
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+            ErrorCode::ClosedCriticalStream
         );
     }
 }

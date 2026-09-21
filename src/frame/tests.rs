@@ -15,11 +15,28 @@ fn vi(value: u64) -> VarInt {
     VarInt::try_from(value).unwrap()
 }
 
-fn assert_code(error: crate::Error, code: ErrorCode) {
+trait IntoTestError {
+    fn into_test_error(self) -> crate::Error;
+}
+
+impl IntoTestError for crate::Error {
+    fn into_test_error(self) -> crate::Error {
+        self
+    }
+}
+
+impl IntoTestError for io::Error {
+    fn into_test_error(self) -> crate::Error {
+        crate::Error::from_io(self, ErrorCode::InternalError)
+    }
+}
+
+fn assert_code(error: impl IntoTestError, code: ErrorCode) {
+    let error = error.into_test_error();
     assert_eq!(error.code, code, "{}", error.reason);
 }
 
-async fn decode(input: &mut &[u8]) -> Result<Option<H3Frame>> {
+async fn decode(input: &mut &[u8]) -> io::Result<Option<H3Frame>> {
     let Some(ty) = be_frame_type(input).await? else {
         return Ok(None);
     };
@@ -89,20 +106,20 @@ async fn frame_envelopes_reject_invalid_types_lengths_and_payloads() {
     for ty in [2, 6, 8, 9] {
         assert_code(
             FrameType::try_from(ty).unwrap_err(),
-            ErrorCode::H3_FRAME_UNEXPECTED,
+            ErrorCode::FrameUnexpected,
         );
     }
     assert_code(
         FrameType::try_from(1 << 62).unwrap_err(),
-        ErrorCode::H3_FRAME_ERROR,
+        ErrorCode::FrameError,
     );
     assert_code(
         be_frame_type(&mut &[0x40][..]).await.unwrap_err(),
-        ErrorCode::H3_FRAME_ERROR,
+        ErrorCode::FrameError,
     );
     assert_code(
         be_frame_length(&mut &[0x40][..]).await.unwrap_err(),
-        ErrorCode::H3_FRAME_ERROR,
+        ErrorCode::FrameError,
     );
 
     let too_large = vi(MAX_BUFFERED_FRAME_PAYLOAD as u64 + 1);
@@ -115,12 +132,12 @@ async fn frame_envelopes_reject_invalid_types_lengths_and_payloads() {
             be_frame_payload(&mut &[][..], ty, too_large)
                 .await
                 .unwrap_err(),
-            ErrorCode::H3_EXCESSIVE_LOAD,
+            ErrorCode::ExcessiveLoad,
         );
     }
     assert_code(
         skip_payload(&mut &[1, 2][..], 3).await.unwrap_err(),
-        ErrorCode::H3_FRAME_ERROR,
+        ErrorCode::FrameError,
     );
     let mut input = &[1, 2, 3, 4][..];
     skip_payload(&mut input, 3).await.unwrap();
@@ -153,19 +170,19 @@ async fn identifier_frames_reject_missing_trailing_and_oversized_payloads() {
                 be_frame_payload(&mut input, ty, vi(length))
                     .await
                     .unwrap_err(),
-                ErrorCode::H3_FRAME_ERROR,
+                ErrorCode::FrameError,
             );
         }
         assert_code(
             be_frame_payload(&mut &[][..], ty, vi(9)).await.unwrap_err(),
-            ErrorCode::H3_FRAME_ERROR,
+            ErrorCode::FrameError,
         );
     }
     assert_code(
         be_frame_payload(&mut &[0x40][..], FrameType::PushPromise, vi(1))
             .await
             .unwrap_err(),
-        ErrorCode::H3_FRAME_ERROR,
+        ErrorCode::FrameError,
     );
 }
 
@@ -175,7 +192,7 @@ async fn settings_validate_ids_values_duplicates_and_truncation() {
         be_frame_payload(&mut &[][..], FrameType::Settings, vi(1))
             .await
             .unwrap_err(),
-        ErrorCode::H3_FRAME_ERROR,
+        ErrorCode::FrameError,
     );
     for payload in [
         &[2, 0][..],
@@ -232,6 +249,12 @@ impl StopSending for StoppableReader {
     }
 }
 
+impl crate::TransportError for StoppableReader {
+    fn map_error(error: io::Error) -> crate::Error {
+        crate::Error::from_stream_io(error)
+    }
+}
+
 #[tokio::test]
 async fn stream_types_and_controls_cover_known_unknown_and_forbidden_values() {
     for (byte, expected) in [
@@ -254,7 +277,7 @@ async fn stream_types_and_controls_cover_known_unknown_and_forbidden_values() {
     assert_eq!(be_stream_type(&mut unknown).await.unwrap(), None);
     assert_eq!(
         unknown.stopped,
-        Some(ErrorCode::H3_STREAM_CREATION_ERROR.as_u64())
+        Some(ErrorCode::StreamCreationError.as_u64())
     );
     assert_eq!(
         be_stream_type(&mut StoppableReader::default())
@@ -314,7 +337,7 @@ async fn stream_types_and_controls_cover_known_unknown_and_forbidden_values() {
     oversized.put_varint(&vi(MAX_BUFFERED_FRAME_PAYLOAD as u64 + 1));
     assert_code(
         be_control(&mut oversized.as_slice()).await.unwrap_err(),
-        ErrorCode::H3_EXCESSIVE_LOAD,
+        ErrorCode::ExcessiveLoad,
     );
 }
 
@@ -334,18 +357,24 @@ impl StopSending for FailingReader {
     fn stop(&mut self, _: u64) {}
 }
 
+impl crate::TransportError for FailingReader {
+    fn map_error(error: io::Error) -> crate::Error {
+        crate::Error::from(error).connection()
+    }
+}
+
 #[tokio::test]
 async fn io_failures_are_mapped_by_decoder_context() {
     assert_code(
         be_frame_type(&mut FailingReader).await.unwrap_err(),
-        ErrorCode::H3_INTERNAL_ERROR,
+        ErrorCode::InternalError,
     );
     assert_code(
         be_stream_type(&mut FailingReader).await.unwrap_err(),
-        ErrorCode::H3_INTERNAL_ERROR,
+        ErrorCode::InternalError,
     );
     assert_code(
         be_control(&mut FailingReader).await.unwrap_err(),
-        ErrorCode::H3_CLOSED_CRITICAL_STREAM,
+        ErrorCode::ClosedCriticalStream,
     );
 }

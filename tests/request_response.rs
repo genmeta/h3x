@@ -118,6 +118,65 @@ async fn streaming_request_and_response() {
 }
 
 #[tokio::test]
+async fn request_and_response_trailers_are_shared_and_sent_after_body() {
+    let (client, server) = connection_pair();
+
+    let serving = tokio::spawn(async move {
+        let (ws, rs) = server.accept_bi().await.unwrap();
+        let mut request: Request<R> = rs.read_request(server.qpack().clone()).await.unwrap();
+        let method = request.method().clone();
+        let mut request_body = Vec::new();
+        request.read_to_end(&mut request_body).await.unwrap();
+        assert_eq!(request_body, b"hello");
+        assert_eq!(request.trailers().get_all("x-checksum").iter().count(), 2);
+
+        let mut response: Response<W> = http::Response::new(WndBuf::new(1)).into();
+        let outgoing = response.clone();
+        let writing = ws.write_response(outgoing, method, server.qpack().clone());
+        let producing = async {
+            response.write_all(b"world").await?;
+            response.set_trailer(
+                http::HeaderName::from_static("x-result"),
+                http::HeaderValue::from_static("ok"),
+            );
+            response.shutdown().await.map_err(h3x::Error::from)
+        };
+        tokio::try_join!(writing, producing).unwrap();
+    });
+
+    let (ws, rs) = client.open_bi().await.unwrap();
+    let mut request: Request<W> = http::Request::builder()
+        .method(Method::POST)
+        .uri("https://example.com/trailers")
+        .body(WndBuf::new(1))
+        .unwrap()
+        .into();
+    let outgoing = request.clone();
+    let writing = ws.write_request(outgoing, client.qpack().clone());
+    let producing = async {
+        request.write_all(b"hello").await?;
+        request
+            .set_trailer(
+                http::HeaderName::from_static("x-checksum"),
+                http::HeaderValue::from_static("a"),
+            )
+            .append_trailer(
+                http::HeaderName::from_static("x-checksum"),
+                http::HeaderValue::from_static("b"),
+            );
+        request.shutdown().await.map_err(h3x::Error::from)
+    };
+    let receiving = rs.read_response(Method::POST, client.qpack().clone());
+    let ((), (), mut response) = tokio::try_join!(writing, producing, receiving).unwrap();
+
+    let mut response_body = Vec::new();
+    response.read_to_end(&mut response_body).await.unwrap();
+    assert_eq!(response_body, b"world");
+    assert_eq!(response.trailers()["x-result"], "ok");
+    serving.await.unwrap();
+}
+
+#[tokio::test]
 async fn websocket_over_extended_connect() {
     // h3x transports WebSocket wire bytes without interpreting them. This is a
     // masked client text frame ("hi") and an unmasked server text frame ("ok").

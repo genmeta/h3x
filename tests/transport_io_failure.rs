@@ -6,8 +6,9 @@ use std::{
     time::Duration,
 };
 
-use h3x::{Error, ErrorCode, H3Connection, Result, Role, Settings, Transport};
-use qrecovery::{recv::StopSending, send::CancelStream};
+use h3x::{Error, ErrorCode, H3Connection, Result, Role, Settings, Transport, TransportError};
+use qbase::{error::AppError, frame::ResetStreamError, varint::VarInt};
+use qrecovery::{recv::StopSending, send::CancelStream, streams::error::StreamError};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::watch,
@@ -43,6 +44,12 @@ impl AsyncWrite for Writer {
     }
 }
 
+impl TransportError for Writer {
+    fn map_error(error: std::io::Error) -> Error {
+        map_dquic_error(error)
+    }
+}
+
 struct Reader;
 
 impl StopSending for Reader {
@@ -57,6 +64,62 @@ impl AsyncRead for Reader {
     ) -> Poll<std::io::Result<()>> {
         Poll::Pending
     }
+}
+
+impl TransportError for Reader {
+    fn map_error(error: std::io::Error) -> Error {
+        map_dquic_error(error)
+    }
+}
+
+// This belongs to the dquic adapter, not to h3x's protocol/error modules.
+fn map_dquic_error(error: std::io::Error) -> Error {
+    let mut source = error
+        .get_ref()
+        .map(|cause| cause as &(dyn std::error::Error + 'static));
+    while let Some(cause) = source {
+        if let Some(error) = cause.downcast_ref::<StreamError>() {
+            return match error {
+                StreamError::Connection(qbase::error::Error::App(error)) => {
+                    ErrorCode::try_from(error.error_code())
+                        .unwrap_or(ErrorCode::NoError)
+                        .reason(error.reason())
+                        .connection()
+                }
+                StreamError::Connection(error) => ErrorCode::InternalError
+                    .reason(error.to_string())
+                    .connection(),
+                StreamError::Reset(error) => ErrorCode::try_from(error.error_code())
+                    .unwrap_or(ErrorCode::NoError)
+                    .reason("peer reset the stream")
+                    .stream(),
+                StreamError::EosSent => ErrorCode::InternalError
+                    .reason("stream is already finished")
+                    .stream(),
+            };
+        }
+        source = cause.source();
+    }
+    Error::from_stream_io(error)
+}
+
+#[test]
+fn dquic_adapter_classifies_reset_and_connection_errors() {
+    let code = VarInt::try_from(ErrorCode::RequestCancelled.as_u64()).unwrap();
+    let reset = std::io::Error::from(StreamError::Reset(ResetStreamError::new(
+        code,
+        VarInt::from_u32(0),
+    )));
+    let reset = Reader::map_error(reset);
+    assert!(matches!(reset, Error::Stream(_)));
+    assert_eq!(reset.code, ErrorCode::RequestCancelled);
+
+    let connection = std::io::Error::from(StreamError::Connection(qbase::error::Error::App(
+        AppError::new(code, "connection closed"),
+    )));
+    let connection = Reader::map_error(connection);
+    assert!(matches!(connection, Error::Connection(_)));
+    assert_eq!(connection.code, ErrorCode::RequestCancelled);
 }
 
 struct IoFailureTransport {
@@ -122,7 +185,7 @@ async fn accept_error_wakes_goaway_and_idle_critical_writers() {
     .await
     .unwrap();
     let goaway = connection.clone().goaway();
-    let expected = ErrorCode::H3_INTERNAL_ERROR.reason("accept observed connection failure");
+    let expected = ErrorCode::InternalError.reason("accept observed connection failure");
     failure.send_replace(Some(expected.clone()));
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(1), goaway)

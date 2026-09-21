@@ -115,44 +115,74 @@ impl AsyncWrite for WndBuf {
 }
 
 /// Shared window; the first error terminates both reading and writing.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ArcWndBuf {
-    shared: Arc<Mutex<crate::Result<WndBuf>>>,
+    shared: Arc<Mutex<Shared>>,
+}
+
+struct Shared {
+    window: crate::Result<WndBuf>,
+    on_error: Option<Box<dyn FnOnce(Error) + Send>>,
+}
+
+impl std::fmt::Debug for ArcWndBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArcWndBuf").finish_non_exhaustive()
+    }
 }
 
 impl ArcWndBuf {
     pub fn new(capacity: usize) -> Self {
         Self {
-            shared: Arc::new(Mutex::new(Ok(WndBuf::with_capacity(capacity)))),
+            shared: Arc::new(Mutex::new(Shared {
+                window: Ok(WndBuf::with_capacity(capacity)),
+                on_error: None,
+            })),
         }
-    }
-
-    pub(crate) fn cancel(&self, code: u64) {
-        self.on_error(
-            crate::ErrorCode::try_from(code)
-                .unwrap_or(crate::ErrorCode::H3_INTERNAL_ERROR)
-                .reason("body cancelled"),
-        );
     }
 
     pub(crate) fn on_error(&self, error: Error) {
         let mut state = self.shared.lock().unwrap();
-        if let Ok(window) = &mut *state {
+        if let Ok(window) = &mut state.window {
             if let Some(waker) = window.read_waker.take() {
                 waker.wake();
             }
             if let Some(waker) = window.write_waker.take() {
                 waker.wake();
             }
-            *state = Err(error);
+            state.window = Err(error.clone());
+            let callback = state.on_error.take();
+            drop(state);
+            if let Some(callback) = callback {
+                callback(error);
+            }
         }
+    }
+
+    pub(crate) fn on_error_callback(&self, callback: impl FnOnce(Error) + Send + 'static) {
+        let mut state = self.shared.lock().unwrap();
+        if let Err(error) = &state.window {
+            let error = error.clone();
+            drop(state);
+            callback(error);
+        } else {
+            state.on_error = Some(Box::new(callback));
+        }
+    }
+
+    pub(crate) fn cancel(&self, code: u64) {
+        self.on_error(
+            crate::ErrorCode::try_from(code)
+                .unwrap_or(crate::ErrorCode::InternalError)
+                .reason("body cancelled"),
+        );
     }
 
     fn poll_io<T>(
         &self,
         poll: impl FnOnce(Pin<&mut WndBuf>) -> Poll<io::Result<T>>,
     ) -> Poll<io::Result<T>> {
-        match &mut *self.shared.lock().unwrap() {
+        match &mut self.shared.lock().unwrap().window {
             Ok(window) => poll(Pin::new(window)),
             Err(error) => Poll::Ready(Err(error.clone().into())),
         }
@@ -208,5 +238,43 @@ impl qrecovery::send::CancelStream for &ArcWndBuf {
 impl qrecovery::send::CancelStream for ArcWndBuf {
     fn cancel(&mut self, error_code: u64) {
         ArcWndBuf::cancel(self, error_code);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::ErrorCode;
+
+    #[test]
+    fn error_callback_observes_the_first_error_once() {
+        let window = ArcWndBuf::new(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        window.on_error_callback({
+            let calls = calls.clone();
+            move |error| {
+                assert_eq!(error.code, ErrorCode::RequestCancelled);
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        window.cancel(ErrorCode::RequestCancelled.as_u64());
+        window.cancel(ErrorCode::InternalError.as_u64());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn callback_registered_after_failure_runs_immediately() {
+        let window = ArcWndBuf::new(1);
+        window.cancel(ErrorCode::RequestCancelled.as_u64());
+        let calls = Arc::new(AtomicUsize::new(0));
+        window.on_error_callback({
+            let calls = calls.clone();
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

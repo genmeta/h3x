@@ -14,12 +14,12 @@ pub use common::{
     response::{ReadResponse, WriteResponse},
 };
 pub use connection::{H3Connection, Settings};
-pub use error::{Error, ErrorCode, Result};
+pub use error::{Error, ErrorCode, ErrorDetail, Result};
 pub use frame::Goaway;
 pub use pool::Pool;
 pub use qpack::{ArcQpack, Qpack};
 pub use stream::{read::H3ReadStream, write::H3WriteStream};
-pub use transport::{Role, Transport};
+pub use transport::{Role, Transport, TransportError};
 
 /// ALPN token used by HTTP/3.
 pub const ALPN: &[u8] = b"h3";
@@ -27,5 +27,6 @@ pub const ALPN: &[u8] = b"h3";
 /// Shared body storage, also available under its original ArcWndBuf name.
 pub use common::wnd_buf::ArcWndBuf;
 pub use common::{
-    Read as R, Write as W, request::Request, response::Response, wnd_buf::ArcWndBuf as WndBuf,
+    Read as R, Write as W, request::Request, response::Response, trailers::Trailers,
+    wnd_buf::ArcWndBuf as WndBuf,
 };

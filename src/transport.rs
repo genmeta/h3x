@@ -1,14 +1,23 @@
-use std::future::Future;
+use std::{future::Future, io};
 
 pub use qbase::role::Role;
 use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::Result;
+use crate::{Error, Result};
+
+/// A transport stream that can classify its own terminal I/O errors.
+///
+/// Implement this on an adapter-owned stream wrapper. In particular, a dquic
+/// adapter performs its qrecovery/qbase downcasts in this implementation,
+/// before the error enters the HTTP/3 protocol layer.
+pub trait TransportError {
+    fn map_error(error: io::Error) -> Error;
+}
 
 /// One established QUIC connection, with stream-local cancellation supplied by its adapter.
 /// open/accept futures must leave any unreturned stream owned by the transport when cancelled.
-/// HTTP/3 explicitly stops/cancels unfinished application-owned halves before dropping them.
+/// HTTP/3 explicitly stops/cancels unfinished halves on protocol or application cancellation.
 /// Stop/cancel must be harmless after EOF/FIN, reset, or connection termination.
 /// A terminal I/O error must mean the transport direction is already terminated.
 /// Connection termination must wake pending open/accept and stream I/O with an error,
@@ -17,12 +26,12 @@ use crate::Result;
 /// The endpoint role must remain fixed for the lifetime of the connection.
 #[expect(
     clippy::type_complexity,
-    reason = "Keep the agreed stream-ID and raw stream tuple interface, without adapter wrapper types"
+    reason = "Keep the agreed stream-ID and reader/writer tuple interface"
 )]
 pub trait Transport: Send + Sync + 'static {
     /// Report FIN as a successful read of zero bytes and retain RESET metadata in I/O errors.
-    type StreamReader: AsyncRead + StopSending + Unpin + Send + 'static;
-    type StreamWriter: AsyncWrite + CancelStream + Unpin + Send + 'static;
+    type StreamReader: AsyncRead + StopSending + TransportError + Unpin + Send + 'static;
+    type StreamWriter: AsyncWrite + CancelStream + TransportError + Unpin + Send + 'static;
 
     fn role(&self) -> Role;
 
