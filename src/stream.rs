@@ -6,6 +6,7 @@ pub(crate) mod write;
 use std::{
     io, mem,
     pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
 };
 
@@ -27,91 +28,129 @@ pub(crate) enum H3Stream<T> {
 }
 
 impl<T> H3Stream<T> {
-    fn new(io: T) -> Self {
-        Self::Idle(io)
+    fn is_finished(&self) -> bool {
+        matches!(self, Self::Finished(_))
     }
-}
 
-pub(crate) fn is_finished<T>(s: &Result<H3Stream<T>, Goaway>) -> bool {
-    matches!(s, Err(Goaway) | Ok(H3Stream::Finished(_)))
-}
-
-pub(crate) fn terminate<T>(
-    s: &mut Result<H3Stream<T>, Goaway>,
-    f: impl FnOnce(&mut T),
-) -> Option<Waker> {
-    let Ok(stream) = s else { return None };
-    match mem::replace(stream, H3Stream::Transition) {
-        H3Stream::Idle(mut io) => {
-            f(&mut io);
-            *stream = H3Stream::Finished(io);
-            None
-        }
-        H3Stream::Polling(mut io, w) => {
-            f(&mut io);
-            *stream = H3Stream::Finished(io);
-            Some(w)
-        }
-        x @ H3Stream::Finished(_) => {
-            *stream = x;
-            None
-        }
-        H3Stream::Transition => unreachable!(),
-    }
-}
-
-pub(crate) fn goaway<T>(
-    s: &mut Result<H3Stream<T>, Goaway>,
-    f: impl FnOnce(&mut T),
-) -> Option<Waker> {
-    if is_finished(s) {
-        None
-    } else {
-        let w = terminate(s, f);
-        *s = Err(Goaway);
-        w
-    }
-}
-
-pub(crate) fn finish<T>(s: &mut Result<H3Stream<T>, Goaway>) {
-    if let Ok(stream) = s {
-        *stream = match mem::replace(stream, H3Stream::Transition) {
-            H3Stream::Idle(io) | H3Stream::Polling(io, _) | H3Stream::Finished(io) => {
-                H3Stream::Finished(io)
+    fn terminate(&mut self, f: impl FnOnce(&mut T)) -> Option<Waker> {
+        match mem::replace(self, Self::Transition) {
+            Self::Idle(mut io) => {
+                f(&mut io);
+                *self = Self::Finished(io);
+                None
             }
-            H3Stream::Transition => unreachable!(),
+            Self::Polling(mut io, waker) => {
+                f(&mut io);
+                *self = Self::Finished(io);
+                Some(waker)
+            }
+            finished @ Self::Finished(_) => {
+                *self = finished;
+                None
+            }
+            Self::Transition => unreachable!(),
+        }
+    }
+
+    fn finish(&mut self) {
+        *self = match mem::replace(self, Self::Transition) {
+            Self::Idle(io) | Self::Polling(io, _) | Self::Finished(io) => Self::Finished(io),
+            Self::Transition => unreachable!(),
         };
     }
+
+    fn poll_io<O>(
+        &mut self,
+        cx: &mut Context<'_>,
+        f: impl FnOnce(Pin<&mut T>, &mut Context<'_>) -> Poll<io::Result<O>>,
+    ) -> Poll<io::Result<O>>
+    where
+        T: Unpin,
+    {
+        let (mut io, finished) = match mem::replace(self, Self::Transition) {
+            Self::Idle(io) | Self::Polling(io, _) => (io, false),
+            Self::Finished(io) => (io, true),
+            Self::Transition => unreachable!(),
+        };
+        let result = f(Pin::new(&mut io), cx);
+        *self = if finished {
+            Self::Finished(io)
+        } else if result.is_pending() {
+            Self::Polling(io, cx.waker().clone())
+        } else {
+            Self::Idle(io)
+        };
+        result
+    }
 }
 
-pub(crate) fn poll_io<T: Unpin, O>(
-    s: &mut Result<H3Stream<T>, Goaway>,
-    cx: &mut Context<'_>,
-    f: impl FnOnce(Pin<&mut T>, &mut Context<'_>) -> Poll<io::Result<O>>,
-) -> Poll<io::Result<O>> {
-    let stream = match s {
-        Ok(x) => x,
-        Err(Goaway) => {
-            return Poll::Ready(Err(ErrorCode::H3_REQUEST_REJECTED
-                .reason("request rejected by GOAWAY")
-                .into()));
+pub(crate) struct ArcH3Stream<T>(Arc<Mutex<Result<H3Stream<T>, Goaway>>>);
+
+impl<T> Clone for ArcH3Stream<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> ArcH3Stream<T> {
+    pub(crate) fn new(io: T) -> Self {
+        Self(Arc::new(Mutex::new(Ok(H3Stream::Idle(io)))))
+    }
+
+    pub(crate) fn terminate(&self, f: impl FnOnce(&mut T)) -> bool {
+        let mut state = self.0.lock().unwrap();
+        let (changed, waker) = match state.as_mut() {
+            Ok(stream) if !stream.is_finished() => (true, stream.terminate(f)),
+            _ => (false, None),
+        };
+        drop(state);
+        if let Some(waker) = waker {
+            waker.wake();
         }
-    };
-    let (mut io, finished) = match mem::replace(stream, H3Stream::Transition) {
-        H3Stream::Idle(io) | H3Stream::Polling(io, _) => (io, false),
-        H3Stream::Finished(io) => (io, true),
-        H3Stream::Transition => unreachable!(),
-    };
-    let r = f(Pin::new(&mut io), cx);
-    let failed = matches!(&r,Poll::Ready(Err(e)) if !matches!(e.kind(),io::ErrorKind::Interrupted|io::ErrorKind::WouldBlock));
-    *stream = if finished || failed {
-        H3Stream::Finished(io)
-    } else if r.is_pending() {
-        H3Stream::Polling(io, cx.waker().clone())
-    } else {
-        H3Stream::Idle(io)
-    };
-    r
+        changed
+    }
+
+    pub(crate) fn goaway(&self, f: impl FnOnce(&mut T)) -> bool {
+        let mut state = self.0.lock().unwrap();
+        let waker = match state.as_mut() {
+            Ok(stream) if !stream.is_finished() => stream.terminate(f),
+            _ => return false,
+        };
+        *state = Err(Goaway);
+        drop(state);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        true
+    }
+
+    pub(crate) fn finish(&self) -> bool {
+        let mut state = self.0.lock().unwrap();
+        match state.as_mut() {
+            Ok(stream) if !stream.is_finished() => {
+                stream.finish();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn poll_io<O>(
+        &self,
+        cx: &mut Context<'_>,
+        f: impl FnOnce(Pin<&mut T>, &mut Context<'_>) -> Poll<io::Result<O>>,
+    ) -> Poll<io::Result<O>>
+    where
+        T: Unpin,
+    {
+        let mut state = self.0.lock().unwrap();
+        match state.as_mut() {
+            Ok(stream) => stream.poll_io(cx, f),
+            Err(Goaway) => Poll::Ready(Err(ErrorCode::H3_REQUEST_REJECTED
+                .reason("request rejected by GOAWAY")
+                .into())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -122,30 +161,22 @@ mod tests {
 
     #[test]
     fn stream_state_transitions_cover_idle_polling_finished_and_goaway() {
-        let mut idle = Ok(H3Stream::new(1));
-        assert!(!is_finished(&idle));
-        assert!(terminate(&mut idle, |io| *io += 1).is_none());
-        assert!(is_finished(&idle));
-        assert!(terminate(&mut idle, |_| panic!("finished I/O is untouched")).is_none());
+        let idle = ArcH3Stream::new(1);
+        assert!(idle.terminate(|io| *io += 1));
+        assert!(!idle.terminate(|_| panic!("finished I/O is untouched")));
 
-        let mut rejected: Result<H3Stream<i32>, Goaway> = Err(Goaway);
-        assert!(is_finished(&rejected));
-        assert!(terminate(&mut rejected, |_| {}).is_none());
-        assert!(goaway(&mut rejected, |_| {}).is_none());
+        let rejected = ArcH3Stream::new(2);
+        assert!(rejected.goaway(|io| *io += 1));
+        assert!(!rejected.terminate(|_| {}));
+        assert!(!rejected.goaway(|_| {}));
 
         let waker = Waker::noop().clone();
-        let mut polling = Ok(H3Stream::Polling(3, waker));
-        assert!(terminate(&mut polling, |io| *io += 1).is_some());
-        assert!(is_finished(&polling));
+        let polling = ArcH3Stream(Arc::new(Mutex::new(Ok(H3Stream::Polling(3, waker)))));
+        assert!(polling.terminate(|io| *io += 1));
 
-        let mut active = Ok(H3Stream::new(5));
-        assert!(goaway(&mut active, |io| *io += 1).is_none());
-        assert!(matches!(active, Err(Goaway)));
-
-        let mut idle = Ok(H3Stream::new(7));
-        finish(&mut idle);
-        assert!(is_finished(&idle));
-        finish(&mut rejected);
+        let idle = ArcH3Stream::new(7);
+        assert!(idle.finish());
+        assert!(!idle.finish());
     }
 
     #[test]
@@ -153,34 +184,56 @@ mod tests {
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
 
-        let mut state = Ok(H3Stream::new(1));
-        assert!(poll_io(&mut state, &mut cx, |_, _| Poll::<io::Result<()>>::Pending).is_pending());
-        assert!(matches!(state, Ok(H3Stream::Polling(_, _))));
-        assert!(poll_io(&mut state, &mut cx, |_, _| Poll::Ready(Ok(()))).is_ready());
-        assert!(matches!(state, Ok(H3Stream::Idle(_))));
+        let state = ArcH3Stream::new(1);
+        assert!(
+            state
+                .poll_io(&mut cx, |_, _| Poll::<io::Result<()>>::Pending)
+                .is_pending()
+        );
+        assert!(matches!(
+            *state.0.lock().unwrap(),
+            Ok(H3Stream::Polling(_, _))
+        ));
+        assert!(
+            state
+                .poll_io(&mut cx, |_, _| Poll::Ready(Ok(())))
+                .is_ready()
+        );
+        assert!(matches!(*state.0.lock().unwrap(), Ok(H3Stream::Idle(_))));
 
         assert!(
-            poll_io(&mut state, &mut cx, |_, _| {
-                Poll::<io::Result<()>>::Ready(Err(io::Error::from(io::ErrorKind::Interrupted)))
-            })
-            .is_ready()
+            state
+                .poll_io(&mut cx, |_, _| {
+                    Poll::<io::Result<()>>::Ready(Err(io::Error::from(io::ErrorKind::Interrupted)))
+                })
+                .is_ready()
         );
-        assert!(matches!(state, Ok(H3Stream::Idle(_))));
+        assert!(matches!(*state.0.lock().unwrap(), Ok(H3Stream::Idle(_))));
 
         assert!(
-            poll_io(&mut state, &mut cx, |_, _| {
-                Poll::<io::Result<()>>::Ready(Err(io::Error::other("fatal")))
-            })
-            .is_ready()
+            state
+                .poll_io(&mut cx, |_, _| {
+                    Poll::<io::Result<()>>::Ready(Err(io::Error::other("fatal")))
+                })
+                .is_ready()
         );
-        assert!(is_finished(&state));
-        assert!(poll_io(&mut state, &mut cx, |_, _| Poll::Ready(Ok(()))).is_ready());
-        assert!(is_finished(&state));
+        assert!(matches!(*state.0.lock().unwrap(), Ok(H3Stream::Idle(_))));
+        assert!(state.finish());
+        assert!(
+            state
+                .poll_io(&mut cx, |_, _| Poll::Ready(Ok(())))
+                .is_ready()
+        );
+        assert!(matches!(
+            *state.0.lock().unwrap(),
+            Ok(H3Stream::Finished(_))
+        ));
 
-        let mut rejected: Result<H3Stream<i32>, Goaway> = Err(Goaway);
-        let Poll::Ready(Err(error)) = poll_io(&mut rejected, &mut cx, |_, _| {
-            Poll::<io::Result<()>>::Pending
-        }) else {
+        let rejected = ArcH3Stream::new(2);
+        rejected.goaway(|_| {});
+        let Poll::Ready(Err(error)) =
+            rejected.poll_io(&mut cx, |_, _| Poll::<io::Result<()>>::Pending)
+        else {
             panic!("GOAWAY must reject I/O")
         };
         assert_eq!(

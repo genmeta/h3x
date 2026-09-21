@@ -1,6 +1,6 @@
 mod support;
 
-use h3x::{ErrorCode, R, ReadMeesage, ReadResponse, Response, W, WndBuf, WriteMessage};
+use h3x::{ErrorCode, R, ReadResponse, Response, W, WndBuf, WriteResponse};
 use support::connection_pair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -35,7 +35,8 @@ async fn receive(wire: Vec<u8>) -> Result<Response<R>, h3x::Error> {
     let (mut ws, _request_reader) = server.accept_bi().await.unwrap();
     ws.write_all(&wire).await.unwrap();
     ws.shutdown().await.unwrap();
-    rs.read_message(client.qpack().clone()).await
+    rs.read_response(http::Method::GET, client.qpack().clone())
+        .await
 }
 
 #[tokio::test]
@@ -118,12 +119,37 @@ async fn outgoing_body_is_streamed_without_length_validation() {
             .body(finished_body(b"abc").await)
             .unwrap()
             .into();
-        ws.write_message(response, server.qpack().clone())
+        ws.write_response(response, http::Method::GET, server.qpack().clone())
             .await
             .unwrap();
-        let response: Response<R> = rs.read_message(client.qpack().clone()).await.unwrap();
+        let response: Response<R> = rs
+            .read_response(http::Method::GET, client.qpack().clone())
+            .await
+            .unwrap();
         assert_eq!(collect(response.into_body()).await, "abc");
     }
+}
+
+#[tokio::test]
+async fn head_response_omits_outgoing_body() {
+    let (client, server) = connection_pair();
+    let (_ws, rs) = client.open_bi().await.unwrap();
+    let (ws, _rs) = server.accept_bi().await.unwrap();
+    let response: Response<W> = http::Response::builder()
+        .body(finished_body(b"not sent").await)
+        .unwrap()
+        .into();
+
+    ws.write_response(response, http::Method::HEAD, server.qpack().clone())
+        .await
+        .unwrap();
+    let mut response = rs
+        .read_response(http::Method::HEAD, client.qpack().clone())
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    response.read_to_end(&mut bytes).await.unwrap();
+    assert!(bytes.is_empty());
 }
 
 #[tokio::test]
@@ -139,34 +165,41 @@ async fn oversized_streaming_body_allows_producer_to_finish() {
         .body(window)
         .unwrap()
         .into();
-    let writing = ws.write_message(response, server.qpack().clone());
+    let writing = ws.write_response(response, http::Method::GET, server.qpack().clone());
     let producing = async {
         producer.write_all(b"y").await.unwrap();
         producer.shutdown().await.unwrap();
     };
     let (result, ()) = tokio::join!(writing, producing);
     result.unwrap();
-    let response: Response<R> = rs.read_message(client.qpack().clone()).await.unwrap();
+    let response: Response<R> = rs
+        .read_response(http::Method::GET, client.qpack().clone())
+        .await
+        .unwrap();
     assert_eq!(collect(response.into_body()).await, "xy");
 }
 
 #[tokio::test]
-async fn headers_are_stored_without_protocol_validation() {
-    let wire = headers(&[
-        ("connection", "close"),
-        (":status", "201"),
-        (":status", "200"),
-        (":method", "GET"),
-        ("content-length", "0"),
-        ("x-tag", "a"),
-        ("x-tag", "b"),
-    ]);
+async fn repeated_regular_headers_are_preserved() {
+    let wire = headers(&[(":status", "200"), ("x-tag", "a"), ("x-tag", "b")]);
     let response = receive(wire).await.unwrap();
     assert_eq!(response.status(), http::StatusCode::OK);
-    let regular = response.headers();
-    assert_eq!(regular["connection"], "close");
-    assert_eq!(regular.get_all("x-tag").iter().count(), 2);
-    assert!(regular.get(":status").is_none());
+    assert_eq!(response.headers().get_all("x-tag").iter().count(), 2);
+}
+
+#[tokio::test]
+async fn malformed_response_pseudo_headers_are_rejected() {
+    for fields in [
+        vec![(":status", "201"), (":status", "200")],
+        vec![(":method", "GET"), (":status", "200")],
+        vec![("x-tag", "a"), (":status", "200")],
+    ] {
+        let error = match receive(headers(&fields)).await {
+            Ok(_) => panic!("malformed response was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
+    }
 }
 
 async fn finished_body(bytes: &[u8]) -> WndBuf {
@@ -192,7 +225,7 @@ async fn content_length_returns_body_before_data_arrives() {
         .unwrap();
     let response: Response<R> = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        rs.read_message(client.qpack().clone()),
+        rs.read_response(http::Method::GET, client.qpack().clone()),
     )
     .await
     .expect("headers must return without waiting for DATA or FIN")

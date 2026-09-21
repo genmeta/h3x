@@ -1,6 +1,6 @@
 //! Connection ownership and GOAWAY dispatch for bidirectional streams.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     mem,
     ops::Deref,
     pin::Pin,
@@ -15,14 +15,14 @@ use futures::task::AtomicWaker;
 use qbase::{ArcReceiving, sid::StreamId};
 use qrecovery::{recv::StopSending, send::CancelStream};
 
-use super::{H3ReadStream, H3WriteStream, view::StreamView};
-use crate::{ArcQpack, Error, Result, Role};
+use super::{ArcH3Stream, H3ReadStream, H3WriteStream, view::StreamView};
+use crate::{ArcQpack, Error, ErrorCode, Result, Role};
 
 /// Admission boundaries and registered streams share the connection's lock.
 pub(crate) struct BiStreams<R: StopSending, W: CancelStream> {
     view: StreamView,
-    reads: HashMap<u64, H3ReadStream<R>>,
-    writes: HashMap<u64, H3WriteStream<W>>,
+    reads: HashMap<u64, ArcH3Stream<R>>,
+    writes: HashMap<u64, ArcH3Stream<W>>,
     drain: ArcDrain,
 }
 
@@ -61,34 +61,35 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
         self.view.recv_goway()
     }
 
-    fn reject_from(&mut self, id: u64) -> Vec<u64> {
-        let mut rejected = Vec::new();
-        reject(&mut self.reads, id, H3ReadStream::reject, &mut rejected);
-        reject(&mut self.writes, id, H3WriteStream::reject, &mut rejected);
+    fn reject_from(&mut self, id: u64, qpack: &ArcQpack) -> Result<()> {
+        let mut rejected = HashSet::new();
+        for (id, read) in remove_rejected(&mut self.reads, id) {
+            if read.goaway(|io| io.stop(ErrorCode::H3_REQUEST_REJECTED.as_u64())) {
+                rejected.insert(id);
+            }
+        }
+        for (id, write) in remove_rejected(&mut self.writes, id) {
+            if write.goaway(|io| io.cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64())) {
+                rejected.insert(id);
+            }
+        }
+        for id in rejected {
+            qpack.cancel(id)?;
+        }
         self.try_wake();
-        rejected.sort_unstable();
-        rejected.dedup();
-        rejected
+        Ok(())
     }
 
     /// Freeze admission and cancel rejected requests without waiting for the write.
     pub(crate) fn goaway(&mut self, qpack: &ArcQpack) -> Result<()> {
         let id = self.view.goaway();
         self.drain.goaway();
-        let rejected = self.reject_from(id.into());
-        for id in rejected {
-            qpack.cancel(id)?
-        }
-        Ok(())
+        self.reject_from(id.into(), qpack)
     }
 
     pub(crate) fn on_goaway(&mut self, id: StreamId, qpack: ArcQpack) -> Result<()> {
         self.view.on_goaway(id);
-        let rejected = self.reject_from(id.into());
-        self.try_wake();
-        for id in rejected {
-            qpack.cancel(id)?
-        }
+        self.reject_from(id.into(), &qpack)?;
         Ok(())
     }
 
@@ -96,20 +97,12 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
         let reads = mem::take(&mut self.reads);
         let writes = mem::take(&mut self.writes);
         for read in reads.into_values() {
-            read.close(error.clone());
+            read.terminate(|io| io.stop(error.code.as_u64()));
         }
         for write in writes.into_values() {
-            (&write).cancel(error.code.as_u64());
+            write.terminate(|io| io.cancel(error.code.as_u64()));
         }
         self.try_wake();
-    }
-
-    pub(crate) fn read_streams(&mut self) -> &mut HashMap<u64, H3ReadStream<R>> {
-        &mut self.reads
-    }
-
-    pub(crate) fn write_streams(&mut self) -> &mut HashMap<u64, H3WriteStream<W>> {
-        &mut self.writes
     }
 }
 
@@ -214,13 +207,13 @@ where
     ) -> (H3ReadStream<R>, H3WriteStream<W>) {
         let mut read = H3ReadStream::new(id, recv);
         let mut write = H3WriteStream::new(id, send);
-        guard.reads.insert(id, read.registered());
-        guard.writes.insert(id, write.registered());
+        guard.reads.insert(id, read.state.clone());
+        guard.writes.insert(id, write.state.clone());
         write.on_finish({
             let bistreams = self.inner.clone();
             move || {
                 let mut guard = bistreams.lock().unwrap();
-                guard.write_streams().remove(&id);
+                guard.writes.remove(&id);
                 guard.try_wake();
             }
         });
@@ -228,7 +221,7 @@ where
             let bistreams = self.inner.clone();
             move || {
                 let mut guard = bistreams.lock().unwrap();
-                guard.read_streams().remove(&id);
+                guard.reads.remove(&id);
                 guard.try_wake();
             }
         });
@@ -236,28 +229,15 @@ where
     }
 }
 
-fn reject<T>(
-    directions: &mut HashMap<u64, T>,
-    boundary: u64,
-    reject: impl Fn(&T) -> bool,
-    rejected: &mut Vec<u64>,
-) {
-    // Release the registry lock before touching I/O state or waking application tasks.
-    let removed: Vec<_> = {
-        let ids: Vec<_> = directions
-            .keys()
-            .copied()
-            .filter(|id| id % 4 == boundary % 4 && *id >= boundary)
-            .collect();
-        ids.into_iter()
-            .filter_map(|id| directions.remove(&id).map(|stream| (id, stream)))
-            .collect()
-    };
-    for (id, stream) in removed {
-        if reject(&stream) {
-            rejected.push(id);
-        }
-    }
+fn remove_rejected<T>(streams: &mut HashMap<u64, T>, boundary: u64) -> Vec<(u64, T)> {
+    let ids: Vec<_> = streams
+        .keys()
+        .copied()
+        .filter(|id| id % 4 == boundary % 4 && *id >= boundary)
+        .collect();
+    ids.into_iter()
+        .filter_map(|id| streams.remove(&id).map(|stream| (id, stream)))
+        .collect()
 }
 
 #[cfg(test)]

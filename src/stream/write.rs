@@ -1,41 +1,36 @@
 use std::{
     io,
     pin::Pin,
-    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
+use bytes::Bytes;
 use qrecovery::send::CancelStream;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::{Goaway, H3Stream};
+use super::ArcH3Stream;
 use crate::{
-    ArcQpack, Error, ErrorCode, Result,
-    common::message::{Message, PesudoHeaders, WriteMessage},
+    ArcQpack, Error, ErrorCode,
+    common::{
+        request::{Request, WriteRequest},
+        response::{Response, WriteResponse},
+    },
     frame::{self, Data, Frame, Write as _},
+    qpack::Field,
 };
 
-/// Application-owned write direction, sharing state with its registered handle.
+/// Application-owned write direction, sharing state with the connection registry.
 pub struct H3WriteStream<W: CancelStream> {
+    pub(super) state: ArcH3Stream<W>,
     finish_cb: Box<dyn Fn() + Send + Sync>,
     id: u64,
-    pub(super) state: Arc<Mutex<std::result::Result<H3Stream<W>, Goaway>>>,
 }
 
 impl<W: CancelStream> H3WriteStream<W> {
     pub fn new(stream_id: u64, stream: W) -> Self {
         Self {
+            state: ArcH3Stream::new(stream),
             id: stream_id,
-            state: Arc::new(Mutex::new(Ok(H3Stream::new(stream)))),
-            finish_cb: Box::new(|| {}),
-        }
-    }
-
-    /// Registry handle: completion is reported by the application handle only.
-    pub(super) fn registered(&self) -> Self {
-        Self {
-            id: self.id,
-            state: self.state.clone(),
             finish_cb: Box::new(|| {}),
         }
     }
@@ -48,19 +43,6 @@ impl<W: CancelStream> H3WriteStream<W> {
         (self.finish_cb)();
     }
 
-    pub(super) fn reject(&self) -> bool {
-        let mut state = self.state.lock().unwrap();
-        let changed = !super::is_finished(&state);
-        let waker = super::goaway(&mut state, |io| {
-            io.cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64())
-        });
-        drop(state);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        changed
-    }
-
     pub fn stream_id(&self) -> u64 {
         self.id
     }
@@ -68,15 +50,7 @@ impl<W: CancelStream> H3WriteStream<W> {
 
 impl<W: CancelStream> CancelStream for &H3WriteStream<W> {
     fn cancel(&mut self, error_code: u64) {
-        let mut state = self.state.lock().unwrap();
-        let was_finished = super::is_finished(&state);
-        let waker = super::terminate(&mut state, |io| io.cancel(error_code));
-        let finished = !was_finished && super::is_finished(&state);
-        drop(state);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        if finished {
+        if self.state.terminate(|io| io.cancel(error_code)) {
             H3WriteStream::shutdown(self);
         }
     }
@@ -89,15 +63,10 @@ impl<W: AsyncWrite + CancelStream + Unpin> H3WriteStream<W> {
         finish: bool,
         poll: impl FnOnce(Pin<&mut W>, &mut Context<'_>) -> Poll<io::Result<O>>,
     ) -> Poll<io::Result<O>> {
-        let mut inner = self.state.lock().unwrap();
-        let was_finished = super::is_finished(&inner);
-        let result = super::poll_io(&mut *inner, cx, poll);
-        if finish && matches!(result, Poll::Ready(Ok(_))) {
-            super::finish(&mut *inner);
-        }
-        let finished = !was_finished && super::is_finished(&inner);
-        drop(inner);
-        if finished {
+        let result = self.state.poll_io(cx, poll);
+        let completed = finish && matches!(result, Poll::Ready(Ok(_)));
+        let failed = matches!(&result, Poll::Ready(Err(error)) if !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock));
+        if (completed || failed) && self.state.finish() {
             H3WriteStream::shutdown(self);
         }
         result
@@ -131,20 +100,40 @@ impl<W: CancelStream> Drop for H3WriteStream<W> {
     }
 }
 
-impl<W, P> WriteMessage<P> for H3WriteStream<W>
+impl<W> WriteRequest for H3WriteStream<W>
 where
-    W: AsyncWrite + CancelStream + Unpin,
-    P: PesudoHeaders + Into<Message>,
+    W: AsyncWrite + CancelStream + Unpin + Send,
 {
-    async fn write_message(mut self, message: P, qpack: ArcQpack) -> Result<()> {
-        let Message { head, body } = message.into();
-        let mut body = body;
+    async fn write_request(
+        mut self,
+        request: Request<crate::W>,
+        qpack: ArcQpack,
+    ) -> crate::Result<()> {
+        let mut fields = Vec::with_capacity(request.head.headers.len() + 5);
+        for (name, value) in request.pseudo_headers() {
+            if let Some(value) = value {
+                fields.push(Field {
+                    name: Bytes::from_static(name),
+                    value: Bytes::copy_from_slice(value.as_bytes()),
+                    never_index: false,
+                });
+            }
+        }
+        fields.extend(request.head.headers.iter().map(|(name, value)| Field {
+            name: Bytes::copy_from_slice(name.as_str().as_bytes()),
+            value: Bytes::copy_from_slice(value.as_bytes()),
+            never_index: value.is_sensitive(),
+        }));
+        let mut body = request.body;
         let producer = body.clone();
         let sending = async {
-            let headers = head.encode_headers(self.stream_id(), &qpack)?;
+            let headers = Frame::new(frame::Headers {
+                field_section: qpack.encode(self.stream_id(), fields)?,
+            })?;
             let mut bytes = Vec::new();
             bytes.put_frame(&headers);
             self.write_all(&bytes).await?;
+
             let mut buf = vec![0; frame::MAX_DATA_CHUNK];
             loop {
                 let count = body.read(&mut buf).await?;
@@ -164,6 +153,70 @@ where
             producer.on_error(error.clone());
             qpack.on_error(self.stream_id(), error.clone());
         });
+        self.shutdown();
+        result
+    }
+}
+
+impl<W> WriteResponse for H3WriteStream<W>
+where
+    W: AsyncWrite + CancelStream + Unpin + Send,
+{
+    async fn write_response(
+        mut self,
+        response: Response<crate::W>,
+        request_method: http::Method,
+        qpack: ArcQpack,
+    ) -> crate::Result<()> {
+        let send_body = request_method != http::Method::HEAD
+            && response.head.status != http::StatusCode::NO_CONTENT
+            && response.head.status != http::StatusCode::NOT_MODIFIED;
+        let mut fields = Vec::with_capacity(response.head.headers.len() + 1);
+        for (name, value) in response.pseudo_headers() {
+            if let Some(value) = value {
+                fields.push(Field {
+                    name: Bytes::from_static(name),
+                    value: Bytes::copy_from_slice(value.as_bytes()),
+                    never_index: false,
+                });
+            }
+        }
+        fields.extend(response.head.headers.iter().map(|(name, value)| Field {
+            name: Bytes::copy_from_slice(name.as_str().as_bytes()),
+            value: Bytes::copy_from_slice(value.as_bytes()),
+            never_index: value.is_sensitive(),
+        }));
+        let mut body = response.body;
+        let producer = body.clone();
+        let sending = async {
+            let headers = Frame::new(frame::Headers {
+                field_section: qpack.encode(self.stream_id(), fields)?,
+            })?;
+            let mut bytes = Vec::new();
+            bytes.put_frame(&headers);
+            self.write_all(&bytes).await?;
+
+            if send_body {
+                let mut buf = vec![0; frame::MAX_DATA_CHUNK];
+                loop {
+                    let count = body.read(&mut buf).await?;
+                    if count == 0 {
+                        break;
+                    }
+                    bytes.clear();
+                    bytes.put_frame(&Frame::new(Data(count))?);
+                    self.write_all(&bytes).await?;
+                    self.write_all(&buf[..count]).await?;
+                }
+            }
+            AsyncWriteExt::shutdown(&mut self).await?;
+            Ok::<_, Error>(())
+        };
+        let result = sending.await.inspect_err(|error| {
+            (&self).cancel(error.code.as_u64());
+            producer.on_error(error.clone());
+            qpack.on_error(self.stream_id(), error.clone());
+        });
         H3WriteStream::shutdown(&self);
         result
     }
@@ -174,7 +227,7 @@ mod tests {
     use std::{
         pin::Pin,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll},
@@ -226,7 +279,7 @@ mod tests {
         stream.on_finish(move || {
             count.fetch_add(1, Ordering::SeqCst);
         });
-        let _registered = stream.registered();
+        let _registered = stream.state.clone();
         assert_eq!(stream.stream_id(), 4);
         stream.write_all(b"hello").await.unwrap();
         stream.flush().await.unwrap();
@@ -239,11 +292,17 @@ mod tests {
 
     #[tokio::test]
     async fn reject_and_explicit_cancel_report_expected_codes() {
+        fn reject<W: CancelStream>(stream: &H3WriteStream<W>) -> bool {
+            stream
+                .state
+                .goaway(|io| io.cancel(ErrorCode::H3_REQUEST_REJECTED.as_u64()))
+        }
+
         let io = Io::default();
         let cancels = io.cancels.clone();
         let mut stream = H3WriteStream::new(8, io);
-        assert!(stream.reject());
-        assert!(!stream.reject());
+        assert!(reject(&stream));
+        assert!(!reject(&stream));
         assert_eq!(
             &*cancels.lock().unwrap(),
             &[ErrorCode::H3_REQUEST_REJECTED.as_u64()]

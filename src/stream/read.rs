@@ -1,24 +1,26 @@
 use std::{
     io,
     pin::Pin,
-    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
 use qrecovery::recv::StopSending;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
-use super::{Goaway, H3Stream};
+use super::ArcH3Stream;
 use crate::{
     ArcQpack, Error, ErrorCode,
-    common::message::{Headers, Message, PesudoHeaders, ReadMeesage},
+    common::{
+        request::{ReadRequest, Request},
+        response::{ReadResponse, Response},
+    },
     frame::{self, Frame, H3Frame},
 };
 
-/// Application-owned read direction, sharing state with its registered handle.
+/// Application-owned read direction, sharing state with the connection registry.
 pub struct H3ReadStream<R: StopSending> {
+    pub(super) state: ArcH3Stream<R>,
     finish_cb: Box<dyn Fn() + Send + Sync>,
-    pub(super) state: Arc<Mutex<std::result::Result<H3Stream<R>, Goaway>>>,
     id: u64,
 }
 
@@ -26,16 +28,7 @@ impl<R: StopSending> H3ReadStream<R> {
     pub fn new(stream_id: u64, stream: R) -> Self {
         Self {
             id: stream_id,
-            state: Arc::new(Mutex::new(Ok(H3Stream::new(stream)))),
-            finish_cb: Box::new(|| {}),
-        }
-    }
-
-    /// Registry handle: completion is reported by the application handle only.
-    pub(super) fn registered(&self) -> Self {
-        Self {
-            id: self.id,
-            state: self.state.clone(),
+            state: ArcH3Stream::new(stream),
             finish_cb: Box::new(|| {}),
         }
     }
@@ -49,31 +42,9 @@ impl<R: StopSending> H3ReadStream<R> {
     }
 
     pub(crate) fn close(&self, error: Error) {
-        let code = error.code.as_u64();
-        let mut state = self.state.lock().unwrap();
-        let was_finished = super::is_finished(&state);
-        let waker = super::terminate(&mut state, |io| io.stop(code));
-        let finished = !was_finished && super::is_finished(&state);
-        drop(state);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        if finished {
+        if self.state.terminate(|io| io.stop(error.code.as_u64())) {
             self.shutdown();
         }
-    }
-
-    pub(super) fn reject(&self) -> bool {
-        let mut state = self.state.lock().unwrap();
-        let changed = !super::is_finished(&state);
-        let waker = super::goaway(&mut state, |io| {
-            io.stop(ErrorCode::H3_REQUEST_REJECTED.as_u64())
-        });
-        drop(state);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        changed
     }
 
     pub fn stream_id(&self) -> u64 {
@@ -83,15 +54,7 @@ impl<R: StopSending> H3ReadStream<R> {
 
 impl<R: StopSending> StopSending for &H3ReadStream<R> {
     fn stop(&mut self, error_code: u64) {
-        let mut state = self.state.lock().unwrap();
-        let was_finished = super::is_finished(&state);
-        let waker = super::terminate(&mut state, |io| io.stop(error_code));
-        let finished = !was_finished && super::is_finished(&state);
-        drop(state);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        if finished {
+        if self.state.terminate(|io| io.stop(error_code)) {
             self.shutdown();
         }
     }
@@ -114,15 +77,10 @@ impl<R: AsyncRead + StopSending + Unpin> AsyncRead for H3ReadStream<R> {
             return Poll::Ready(Ok(()));
         }
         let before = buf.filled().len();
-        let mut inner = self.state.lock().unwrap();
-        let was_finished = super::is_finished(&inner);
-        let result = super::poll_io(&mut *inner, cx, |recv, cx| recv.poll_read(cx, buf));
-        if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() == before {
-            super::finish(&mut *inner);
-        }
-        let finished = !was_finished && super::is_finished(&inner);
-        drop(inner);
-        if finished {
+        let result = self.state.poll_io(cx, |recv, cx| recv.poll_read(cx, buf));
+        let eof = matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() == before;
+        let failed = matches!(&result, Poll::Ready(Err(error)) if !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock));
+        if (eof || failed) && self.state.finish() {
             self.shutdown();
         }
         result
@@ -196,26 +154,21 @@ impl<R: AsyncRead + StopSending + Unpin> H3ReadStream<R> {
     }
 }
 
-impl<R, P> ReadMeesage<P> for H3ReadStream<R>
+impl<R> ReadRequest for H3ReadStream<R>
 where
     R: AsyncRead + StopSending + Unpin + Send + 'static,
-    P: PesudoHeaders + From<Message>,
 {
-    async fn read_message(mut self, qpack: ArcQpack) -> crate::Result<P> {
-        let head = async {
-            loop {
-                let frame = self.read_headers_frame().await?.ok_or_else(|| {
-                    ErrorCode::H3_REQUEST_INCOMPLETE.reason("stream ended before final HEADERS")
-                })?;
-                let head = Headers::decode_headers(self.stream_id(), frame, &qpack).await?;
-                if P::pesudo_headers().contains(&":status")
-                    && head.response_status()?.is_informational()
-                {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                return Ok::<_, Error>(head);
-            }
+    async fn read_request(mut self, qpack: ArcQpack) -> crate::Result<Request<crate::R>> {
+        let mut body = crate::ArcWndBuf::new(frame::MAX_DATA_CHUNK);
+        let consumer = body.clone();
+        let request = async {
+            let frame = self.read_headers_frame().await?.ok_or_else(|| {
+                ErrorCode::H3_REQUEST_INCOMPLETE.reason("stream ended before request HEADERS")
+            })?;
+            let fields = qpack
+                .decode(self.stream_id(), frame.payload.field_section)
+                .await?;
+            Request::from_fields(fields, consumer)
         }
         .await
         .map_err(|error| {
@@ -224,8 +177,6 @@ where
             qpack.on_error(self.stream_id(), error)
         })?;
 
-        let mut body = crate::ArcWndBuf::new(frame::MAX_DATA_CHUNK);
-        let consumer = body.clone();
         tokio::spawn(async move {
             let result: crate::Result<()> = async {
                 let mut trailers = false;
@@ -241,9 +192,20 @@ where
                             }
                         }
                         NextFrame::Trailer(frame) => {
-                            qpack
+                            let fields = qpack
                                 .decode(self.stream_id(), frame.payload.field_section)
                                 .await?;
+                            for field in fields {
+                                if field.name.starts_with(b":") {
+                                    return Err(ErrorCode::H3_MESSAGE_ERROR
+                                        .reason("pseudo-header is not allowed in trailers"));
+                                }
+                                if field.name.iter().any(u8::is_ascii_uppercase) {
+                                    return Err(
+                                        ErrorCode::H3_MESSAGE_ERROR.reason("uppercase field name")
+                                    );
+                                }
+                            }
                             trailers = true;
                         }
                     }
@@ -258,7 +220,96 @@ where
             }
             self.shutdown();
         });
-        Ok(Message::from_parts(head, consumer).into())
+        Ok(request)
+    }
+}
+
+impl<R> ReadResponse for H3ReadStream<R>
+where
+    R: AsyncRead + StopSending + Unpin + Send + 'static,
+{
+    async fn read_response(
+        mut self,
+        request_method: http::Method,
+        qpack: ArcQpack,
+    ) -> crate::Result<Response<crate::R>> {
+        let mut body = crate::ArcWndBuf::new(frame::MAX_DATA_CHUNK);
+        let consumer = body.clone();
+        let response = async {
+            loop {
+                let frame = self.read_headers_frame().await?.ok_or_else(|| {
+                    ErrorCode::H3_REQUEST_INCOMPLETE
+                        .reason("stream ended before final response HEADERS")
+                })?;
+                let fields = qpack
+                    .decode(self.stream_id(), frame.payload.field_section)
+                    .await?;
+                let response = Response::from_fields(fields, consumer.clone())?;
+                if response.status().is_informational() {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                return Ok::<_, Error>(response);
+            }
+        }
+        .await
+        .map_err(|error| {
+            self.close(error.clone());
+            self.shutdown();
+            qpack.on_error(self.stream_id(), error)
+        })?;
+
+        let body_allowed = request_method != http::Method::HEAD
+            && response.status() != http::StatusCode::NO_CONTENT
+            && response.status() != http::StatusCode::NOT_MODIFIED;
+        tokio::spawn(async move {
+            let result: crate::Result<()> = async {
+                let mut trailers = false;
+                while let Some(frame) = self.read_next_frame(trailers).await? {
+                    match frame {
+                        NextFrame::Data(frame) => {
+                            if !body_allowed {
+                                return Err(ErrorCode::H3_MESSAGE_ERROR
+                                    .reason("DATA is not allowed for this response"));
+                            }
+                            let mut payload = (&mut self).take(frame.length.into_u64());
+                            tokio::io::copy(&mut payload, &mut body).await?;
+                            if payload.limit() != 0 {
+                                return Err(ErrorCode::H3_FRAME_ERROR.reason(
+                                    "DATA payload ended before the declared frame length",
+                                ));
+                            }
+                        }
+                        NextFrame::Trailer(frame) => {
+                            let fields = qpack
+                                .decode(self.stream_id(), frame.payload.field_section)
+                                .await?;
+                            for field in fields {
+                                if field.name.starts_with(b":") {
+                                    return Err(ErrorCode::H3_MESSAGE_ERROR
+                                        .reason("pseudo-header is not allowed in trailers"));
+                                }
+                                if field.name.iter().any(u8::is_ascii_uppercase) {
+                                    return Err(
+                                        ErrorCode::H3_MESSAGE_ERROR.reason("uppercase field name")
+                                    );
+                                }
+                            }
+                            trailers = true;
+                        }
+                    }
+                }
+                body.shutdown().await?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                self.close(error.clone());
+                body.on_error(qpack.on_error(self.stream_id(), error));
+            }
+            self.shutdown();
+        });
+        Ok(response)
     }
 }
 
@@ -383,19 +434,25 @@ mod tests {
 
     #[tokio::test]
     async fn read_completion_close_reject_and_stop_fire_finish_once() {
+        fn reject<R: StopSending>(stream: &H3ReadStream<R>) -> bool {
+            stream
+                .state
+                .goaway(|io| io.stop(ErrorCode::H3_REQUEST_REJECTED.as_u64()))
+        }
+
         let completed = Arc::new(AtomicUsize::new(0));
         let count = completed.clone();
         let mut stream = H3ReadStream::new(0, Io::new(b"abc".to_vec()));
         stream.on_finish(move || {
             count.fetch_add(1, Ordering::SeqCst);
         });
-        let _registered = stream.registered();
+        let _registered = stream.state.clone();
         let mut out = Vec::new();
         stream.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, b"abc");
         assert_eq!(completed.load(Ordering::SeqCst), 1);
         stream.close(ErrorCode::H3_INTERNAL_ERROR.reason("late"));
-        assert!(!stream.reject());
+        assert!(!reject(&stream));
         stream.stop(9);
         assert_eq!(completed.load(Ordering::SeqCst), 1);
 
@@ -405,7 +462,7 @@ mod tests {
         rejected.on_finish(move || {
             count.fetch_add(1, Ordering::SeqCst);
         });
-        assert!(rejected.reject());
+        assert!(reject(&rejected));
         assert_eq!(completed.load(Ordering::SeqCst), 0);
         let mut byte = [0];
         let error = rejected.read(&mut byte).await.unwrap_err();
@@ -416,10 +473,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_message_rejects_a_stream_without_initial_headers() {
+    async fn read_request_rejects_a_stream_without_initial_headers() {
         let stream = H3ReadStream::new(0, Io::default());
         let result: crate::Result<crate::Request<crate::R>> =
-            stream.read_message(crate::qpack::tests::qpack()).await;
+            stream.read_request(crate::qpack::tests::qpack()).await;
         let Err(error) = result else {
             panic!("a message without HEADERS must fail")
         };

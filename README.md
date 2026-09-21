@@ -99,15 +99,13 @@ The pool does not send or automatically retry requests; after `get`, use `connec
 ## Request and Response I/O
 
 Construct outgoing messages with `http::Request::builder()` and
-`http::Response::builder()`, then convert them with `.into()`. Both incoming and
-outgoing messages implement their `ReadRequest` / `ReadResponse` metadata trait;
-only outgoing messages implement `WriteRequest` / `WriteResponse`. Request setters
-accept a parsed `http::Uri` and `http::Method`; both writer traits support
-`set_header` and `append_header`.
+`http::Response::builder()`, then convert them with `.into()`. Request and
+response metadata is exposed through inherent methods. Outgoing values also have
+inherent setters; request setters accept a parsed `http::Uri` and `http::Method`.
 
 ```rust
 use h3x::ArcWndBuf;
-use h3x::{Request, Response, W, ReadRequest, ReadResponse, WriteRequest, WriteResponse};
+use h3x::{Request, Response, W};
 
 let mut request: Request<W> = http::Request::builder()
     .method(http::Method::POST)
@@ -127,35 +125,39 @@ assert_eq!(response.status(), http::StatusCode::CREATED);
 # Ok::<(), http::Error>(())
 ```
 
-Use `WndBuf` as the builder's body for streaming messages and retain a clone of
-that buffer for production. Converting back to `http::Request` / `http::Response`
-preserves metadata and the shared `ArcWndBuf` body.
+Use `WndBuf` as the builder's body for streaming requests and responses. Before
+handing a value to its stream writer, clone `request.body()` or `response.body()`
+when another future will produce a streaming body. Converting back to
+`http::Request` / `http::Response` preserves metadata and the shared body.
 
-`ReadMeesage` and `WriteMessage` are the message I/O traits for both requests
-and responses. Both use `ArcWndBuf` for streaming, regardless of
-`Content-Length`. Import the traits and specify the incoming type:
+The four protocol I/O traits live on the stream directions. Responses take the
+original request method so HEAD and CONNECT response semantics can be applied:
 
 ```rust,ignore
-use h3x::{R, ReadMeesage, Request, WriteMessage};
+use h3x::{ReadRequest, ReadResponse, WriteRequest, WriteResponse};
 
-let request: Request<R> = rs.read_message(qpack.clone()).await?;
-ws.write_message(response, qpack).await?;
+let incoming_request = rs.read_request(qpack.clone()).await?;
+let request_method = incoming_request.method().clone();
+ws.write_response(outgoing_response, request_method, qpack.clone()).await?;
+
+ws.write_request(outgoing_request, qpack.clone()).await?;
+let incoming_response = rs.read_response(method, qpack).await?;
 ```
 
 Each write future encodes metadata, sends HEADERS and DATA, and finishes its
 transport direction. Drive writing, streaming production, and response reception
-concurrently. No upload task is started implicitly by `write_message`. Failures
+concurrently. No upload task is started implicitly by a stream writer. Failures
 are returned directly and wake streaming producers with the same error.
 
-`Message`, `Request`, and `Response` store an `ArcWndBuf` directly (also
-exported as `WndBuf`). Incoming messages use the same streaming body storage.
+`Request` and `Response` store an `ArcWndBuf` directly (also exported as
+`WndBuf`). `Request<R>` and `Response<R>` implement Tokio `AsyncRead`;
+`Request<W>` and `Response<W>` implement Tokio `AsyncWrite`.
 
 ```rust,ignore
 use tokio::io::AsyncReadExt;
 
-let mut body: h3x::ArcWndBuf = response.into_body();
 let mut bytes = Vec::new();
-body.read_to_end(&mut bytes).await?;
+response.read_to_end(&mut bytes).await?;
 ```
 
 ArcWndBuf clones share the buffer.
@@ -210,16 +212,16 @@ h3x uses exactly these server-initiated bidirectional streams so that the "serve
 
 Extended CONNECT support is enabled and advertised automatically by both
 `Settings::default()` and `Settings::new(...)`; no opt-in is required.
-For CONNECT, drive `write_message` concurrently with response reception and keep
-the request body window empty until `read_message` returns a successful response.
+For CONNECT, drive `write_request` concurrently with response reception and keep
+the request body window empty until `read_response` returns a successful response.
 The writer flushes HEADERS before waiting for body data. The caller controls
 handshake acceptance, rejection, and cancellation; on rejection cancel the
 retained request body producer. Extended CONNECT assumes peer support without
 waiting for peer SETTINGS.
 
-The server uses `read_message` for both ordinary HTTP and CONNECT and branches
-on `request.method()`. Send a 2xx response with `write_message` to accept a tunnel,
-passing `Some(Method::CONNECT)` and omitting Content-Length. Drive writing
+The server uses `read_request` for both ordinary HTTP and CONNECT and branches
+on `request.method()`. Send a 2xx response with `write_response` to accept a tunnel,
+passing `Method::CONNECT` and omitting Content-Length. Drive writing
 concurrently with body production and request reception. Stop the incoming body
 and cancel the retained producer when abandoning an exchange.
 
